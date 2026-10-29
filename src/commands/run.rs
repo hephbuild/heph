@@ -271,12 +271,13 @@ impl RunApp {
     /// (R4): the tool's status as is, [`InvokeFailed`] for heph's own failure
     /// after resolution, and an ordinary error before it.
     ///
-    /// Signals (R9): the relay's listener forwards every signal heph receives
-    /// into the run, and the driver delivers it to the tool. Until the tool
-    /// is about to be spawned — deps building, the closure materializing —
-    /// Ctrl-C cancels as on any run. From the handover on, heph is
-    /// transparent until it exits: it cancels nothing, prints nothing, and
-    /// its diagnostic signal handlers stand down.
+    /// Signals (R9): until the tool is about to be spawned — deps building,
+    /// the closure materializing — heph is an ordinary run: Ctrl-C cancels,
+    /// TERM and HUP end it, SIGQUIT dumps diagnostics. The handover makes it
+    /// transparent until it exits (it cancels nothing, prints nothing, its
+    /// diagnostic handlers stand down) and installs the relay's listeners,
+    /// which forward every signal heph receives from then on into the run;
+    /// the driver delivers each to the tool.
     async fn invoke(
         self,
         ctx: AppContext,
@@ -284,14 +285,21 @@ impl RunApp {
         addr: crate::htaddr::Addr,
     ) -> anyhow::Result<Option<hcore::process::Exit>> {
         self.label.set(format!("Invoking {}", addr.format()));
-        let signals = bootstrap::spawn_signal_relay()?;
+        let (relay, signals) = bootstrap::signal_relay();
         let mut req = InvokeRequest::new(addr, self.caller.cwd, self.caller.env)
             .with_args(self.args.args)
             .with_shell(self.args.shell.is_some())
             .with_signals(signals)
             .with_dispositions(hcore::process::inherited_dispositions().to_vec())
-            .with_handover(crate::engine::driver::Handover::new(|| {
+            .with_handover(crate::engine::driver::Handover::new(move || {
+                // Transparent first: a Ctrl-C between the two must not
+                // cancel a run whose tool is about to own the terminal.
                 hcore::shutdown::hold_transparent().until_exit();
+                if let Err(error) = relay.install() {
+                    // The tool still runs; only signals sent to heph's own
+                    // pid stop reaching it (the terminal's reach it anyway).
+                    tracing::error!(error = ?error, "signal relay not installed");
+                }
             }));
         // Neither the TUI nor the stall notice may draw over the tool, with or
         // without a TUI: nothing progresses while it runs, which is what the

@@ -346,36 +346,60 @@ fn spawn_shutdown_handler(engine: Weak<engine::Engine>, mut rx: mpsc::UnboundedR
 
 /// The relay's listener (E17, R9): every signal in
 /// [`RELAYED_SIGNALS`](hexecrunner::foreground::RELAYED_SIGNALS) that reaches
-/// heph is forwarded, as is and unfiltered, into the returned receiver, which
-/// `Engine::invoke` hands to the driver that spawns an entrypoint. The driver
-/// decides what the terminal already delivered (R2) — only it knows the
-/// tool's pid.
+/// heph is forwarded, as is and unfiltered, into the receiver
+/// [`signal_relay`] returns, which `Engine::invoke` hands to the driver that
+/// spawns an entrypoint. The driver decides what the terminal already
+/// delivered (R2) — only it knows the tool's pid.
 ///
-/// Listening also means heph no longer dies of TERM, HUP, USR1 or USR2 for
-/// the rest of the process: it is transparent while the tool runs and exits
-/// with the tool's status once it ends. A signal that arrives before the
-/// tool exists waits in the channel and is delivered once it does. When the
-/// receiver is gone, each listener stops forwarding.
+/// Two halves with two lifetimes. The channel exists from the start of the
+/// invocation, so the request can carry its receiver; the listeners are
+/// installed only by [`SignalRelay::install`], which the run's handover calls
+/// right before the tool is spawned (N4a: the relay runs from the spawn).
+/// Before that heph is an ordinary run: TERM and HUP end it, Ctrl-C cancels,
+/// SIGQUIT dumps diagnostics and SIGUSR2 a profile — and nothing is queued
+/// for a tool that does not exist yet, so a QUIT sent to inspect a slow dep
+/// build cannot kill the tool later.
 ///
-/// Must be called from inside the runtime; the handlers are installed before
-/// it returns.
-pub fn spawn_signal_relay() -> anyhow::Result<engine::driver::SignalReceiver> {
-    use tokio::signal::unix::{SignalKind, signal};
+/// Once installed, heph no longer dies of TERM, HUP, USR1 or USR2 for the
+/// rest of the process (a tokio handler is never uninstalled): it is
+/// transparent while the tool runs and exits with the tool's status once it
+/// ends. When the receiver is gone, each listener stops forwarding.
+#[derive(Debug)]
+pub struct SignalRelay {
+    tx: engine::driver::SignalSender,
+}
 
+/// The relay's channel, its listeners not yet installed.
+pub fn signal_relay() -> (SignalRelay, engine::driver::SignalReceiver) {
     let (tx, rx) = engine::driver::signal_channel();
-    for &signo in &hexecrunner::foreground::RELAYED_SIGNALS {
-        let mut listener = signal(SignalKind::from_raw(signo))
-            .with_context(|| format!("listening for signal {signo} to relay it"))?;
-        let tx = tx.clone();
-        tokio::spawn(async move {
-            while listener.recv().await.is_some() {
-                if tx.send(engine::driver::Signal::from_raw(signo)).is_err() {
-                    return;
+    (SignalRelay { tx }, rx)
+}
+
+impl SignalRelay {
+    /// Install the listeners. Must be called on a thread inside the runtime
+    /// (the handover fires on one); every handler is installed before it
+    /// returns, so a signal is either before the relay or forwarded by it.
+    pub fn install(self) -> anyhow::Result<()> {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        // `signal` panics outside a runtime; make that an error instead.
+        let handle = tokio::runtime::Handle::try_current()
+            .context("installing the signal relay outside the runtime")?;
+        let _enter = handle.enter();
+        for &signo in &hexecrunner::foreground::RELAYED_SIGNALS {
+            let mut listener = signal(SignalKind::from_raw(signo))
+                .with_context(|| format!("listening for signal {signo} to relay it"))?;
+            let tx = self.tx.clone();
+            handle.spawn(async move {
+                while listener.recv().await.is_some() {
+                    if tx.send(engine::driver::Signal::from_raw(signo)).is_err() {
+                        return;
+                    }
                 }
-            }
-        });
+            });
+        }
+        Ok(())
     }
-    Ok(rx)
 }
 
 /// The second-Ctrl-C abort sequence, with the actual exit call taken as a
