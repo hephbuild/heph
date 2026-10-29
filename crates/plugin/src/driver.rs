@@ -1335,6 +1335,13 @@ pub struct Foreground {
     /// state, so it travels as data. Signals not listed are left as the
     /// spawn would leave them.
     pub dispositions: Vec<(Signal, Disposition)>,
+    /// The `RLIMIT_NOFILE` soft limit to set in the child before it execs: the
+    /// caller's, before heph raised its own (R8). Host state a plugin cannot
+    /// read, so it travels as data. `None` leaves the process's current limit.
+    pub nofile: Option<u64>,
+    /// The signals to block in the child before it execs: the caller's mask
+    /// (std clears it in every child otherwise). Host state, as above.
+    pub blocked: Vec<Signal>,
     /// Host-only: what the host does at the moment the terminal is handed to
     /// the program — after the inputs are materialized, right before the
     /// driver that spawns it is called. Fired at most once, by the managed
@@ -1348,8 +1355,20 @@ impl Foreground {
         Self {
             signals,
             dispositions,
+            nofile: None,
+            blocked: Vec::new(),
             handover: None,
         }
+    }
+
+    pub fn with_nofile(mut self, nofile: Option<u64>) -> Self {
+        self.nofile = nofile;
+        self
+    }
+
+    pub fn with_blocked(mut self, blocked: Vec<Signal>) -> Self {
+        self.blocked = blocked;
+        self
     }
 
     pub fn with_handover(mut self, handover: Handover) -> Self {

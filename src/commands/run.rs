@@ -291,6 +291,8 @@ impl RunApp {
             .with_shell(self.args.shell.is_some())
             .with_signals(signals)
             .with_dispositions(hcore::process::inherited_dispositions().to_vec())
+            .with_nofile(hcore::process::inherited_nofile())
+            .with_blocked(hcore::process::inherited_blocked().to_vec())
             .with_handover(crate::engine::driver::Handover::new(move || {
                 // Transparent first: a Ctrl-C between the two must not
                 // cancel a run whose tool is about to own the terminal.

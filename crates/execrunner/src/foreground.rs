@@ -55,6 +55,13 @@ pub struct ForegroundCommand {
     /// spawn applies itself (see [`spawn_foreground`]). The caller's, as the
     /// host recorded them at startup.
     pub dispositions: Vec<(Signal, Disposition)>,
+    /// The `RLIMIT_NOFILE` soft limit set in the child before it execs (capped
+    /// at the hard limit): the caller's, as the host recorded it. `None`
+    /// leaves the process's current limit.
+    pub nofile: Option<u64>,
+    /// The signals blocked in the child before it execs: the caller's mask.
+    /// std clears the mask in every child, so empty means "none blocked".
+    pub blocked: Vec<Signal>,
 }
 
 impl ForegroundCommand {
@@ -70,11 +77,23 @@ impl ForegroundCommand {
             env,
             cwd: cwd.into(),
             dispositions: Vec::new(),
+            nofile: None,
+            blocked: Vec::new(),
         }
     }
 
     pub fn with_dispositions(mut self, dispositions: Vec<(Signal, Disposition)>) -> Self {
         self.dispositions = dispositions;
+        self
+    }
+
+    pub fn with_nofile(mut self, nofile: Option<u64>) -> Self {
+        self.nofile = nofile;
+        self
+    }
+
+    pub fn with_blocked(mut self, blocked: Vec<Signal>) -> Self {
+        self.blocked = blocked;
         self
     }
 }
@@ -90,13 +109,11 @@ const RESET_TO_DEFAULT: [libc::c_int; 4] =
     [libc::SIGINT, libc::SIGQUIT, libc::SIGTTOU, libc::SIGTTIN];
 
 /// The `rlimit` to set in the child, computed in the parent so `pre_exec` only
-/// makes the syscall: the soft limit heph inherited
-/// ([`hcore::process::record_inherited`], at the top of `main`) rather than
-/// the one it raised (R8). `None` when nothing was recorded — a cdylib's own
-/// copy of the record is never set, so its foreground children keep the
-/// process's current limit — or when nothing would change.
-fn nofile_to_restore() -> Option<libc::rlimit> {
-    let recorded = hcore::process::inherited_nofile()?;
+/// makes the syscall: `recorded` is the soft limit the caller gave heph (the
+/// host records it at the top of `main` and sends it with the run, R8), not
+/// the one heph raised. `None` when none was sent or nothing would change.
+fn nofile_to_restore(recorded: Option<u64>) -> Option<libc::rlimit> {
+    let recorded: libc::rlim_t = recorded?;
     let mut now = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
@@ -123,23 +140,26 @@ fn nofile_to_restore() -> Option<libc::rlimit> {
 /// The child inherits fds 0–2 as heph has them (a closed one stays closed),
 /// does not `setsid`, and stays in heph's process group. In the child, before
 /// exec, it resets [`RESET_TO_DEFAULT`] to `SIG_DFL`, applies `cmd`'s
-/// dispositions, and restores the recorded `RLIMIT_NOFILE` soft limit
-/// ([`hcore::process::record_inherited`]). The pid is tracked with the process
+/// dispositions, installs its signal mask and sets its `RLIMIT_NOFILE` soft
+/// limit — the caller's, as the host recorded them
+/// ([`hcore::process::record_inherited`]) and sent them with the run. A cancel
+/// seen after the runner's prepare spawns nothing. The pid is tracked with the process
 /// supervisor (by pid, not pgid: the child leads no group), so a SIGKILLed heph
 /// does not orphan it.
 pub async fn spawn_foreground(
     runner: RunnerRef<'_>,
-    cmd: ForegroundCommand,
+    mut cmd: ForegroundCommand,
     path: &PathPolicy,
     ctoken: &(dyn Cancellable + Send + Sync),
 ) -> anyhow::Result<(std::io::Result<ForegroundChild>, SpawnedAs)> {
     // The runner seam rewrites a `proc_exec::Spec`; the stdio and group flags
     // here are never spawned through `proc_exec`, they only satisfy the type.
+    // What the runner rewrites moves into it; what the child restores stays.
     let mut spec = proc_exec::Spec {
-        program: cmd.program,
-        args: cmd.args,
-        env: cmd.env,
-        cwd: cmd.cwd,
+        program: std::mem::take(&mut cmd.program),
+        args: std::mem::take(&mut cmd.args),
+        env: std::mem::take(&mut cmd.env),
+        cwd: std::mem::take(&mut cmd.cwd),
         stdin: proc_exec::StdioSpec::Inherit,
         stdout: proc_exec::StdioSpec::Inherit,
         stderr: proc_exec::StdioSpec::Inherit,
@@ -147,17 +167,16 @@ pub async fn spawn_foreground(
         ctty: false,
     };
     crate::prepare(runner, &mut spec, path, ctoken).await?;
+    // The last point a cancel can still mean "the tool never ran": the runner's
+    // prepare can take a while, and nothing after this awaits.
+    if ctoken.is_cancelled() {
+        anyhow::bail!("cancelled");
+    }
     let spawned_as = SpawnedAs {
         program: spec.program.clone(),
         cwd: spec.cwd.clone(),
     };
-    let child = spawn_inherited(
-        &spec.program,
-        &spec.args,
-        &spec.env,
-        &spec.cwd,
-        &cmd.dispositions,
-    );
+    let child = spawn_inherited(&spec.program, &spec.args, &spec.env, &spec.cwd, &cmd);
     Ok((child, spawned_as))
 }
 
@@ -166,7 +185,7 @@ fn spawn_inherited(
     args: &[OsString],
     env: &[(OsString, OsString)],
     cwd: &Path,
-    dispositions: &[(Signal, Disposition)],
+    restore: &ForegroundCommand,
 ) -> std::io::Result<ForegroundChild> {
     use std::os::unix::process::CommandExt as _;
 
@@ -193,7 +212,7 @@ fn spawn_inherited(
     let handlers: Vec<(libc::c_int, libc::sighandler_t)> = RESET_TO_DEFAULT
         .iter()
         .map(|&sig| (sig, libc::SIG_DFL))
-        .chain(dispositions.iter().map(|(sig, d)| {
+        .chain(restore.dispositions.iter().map(|(sig, d)| {
             (
                 sig.as_raw(),
                 match d {
@@ -203,7 +222,8 @@ fn spawn_inherited(
             )
         }))
         .collect();
-    let nofile = nofile_to_restore();
+    let nofile = nofile_to_restore(restore.nofile);
+    let mask = hcore::process::mask_of(&restore.blocked);
     let pre_exec = move || {
         for &(sig, handler) in &handlers {
             // SAFETY: `signal(2)` is async-signal-safe, as the code between
@@ -211,6 +231,8 @@ fn spawn_inherited(
             // disposition as inherited, which is all a caller could do anyway.
             unsafe { libc::signal(sig, handler) };
         }
+        // std has just cleared the mask; put the caller's back.
+        hcore::process::set_mask_for_exec(&mask);
         if let Some(lim) = &nofile {
             // SAFETY: a plain syscall on a live `rlimit`; lowering the soft
             // limit (or keeping it under the hard one) is always permitted.
@@ -664,6 +686,75 @@ mod tests {
             .await
             .expect("wait");
         assert_eq!(exit, Exit::Signal(libc::SIGUSR1));
+    }
+
+    /// R8/D5: the open-file soft limit the run carries is the child's, not the
+    /// one heph raised; without one the child keeps the process's.
+    #[tokio::test]
+    async fn foreground_spawn_restores_nofile() {
+        let mut now = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: a valid resource and a pointer to a live `rlimit`.
+        let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut now) };
+        assert_eq!(rc, 0, "getrlimit");
+        // Below the current soft limit, so it differs from what the child
+        // would otherwise inherit.
+        let want = now.rlim_cur.min(1024) - 1;
+        let run = |nofile: Option<u64>, expect: u64| async move {
+            let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let script = format!("[ \"$(ulimit -n)\" = {expect} ] || exit 9; exit 0");
+            spawn(sh(&script).with_nofile(nofile))
+                .await
+                .wait(rx, &StdCancellationToken::new())
+                .await
+                .expect("wait")
+        };
+        assert_eq!(run(Some(want), want).await, Exit::Code(0), "restored");
+        assert_eq!(run(None, now.rlim_cur).await, Exit::Code(0), "untouched");
+    }
+
+    /// The caller's mask is the child's: std clears it in every child, and a
+    /// blocked SIGUSR1 sent to itself stays pending instead of killing it.
+    #[tokio::test]
+    async fn foreground_spawn_restores_signal_mask() {
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let cmd = sh("kill -USR1 $$; exit 6").with_blocked(vec![Signal::from_raw(libc::SIGUSR1)]);
+        let exit = spawn(cmd)
+            .await
+            .wait(rx, &StdCancellationToken::new())
+            .await
+            .expect("wait");
+        assert_eq!(exit, Exit::Code(6), "blocked: pending, not delivered");
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let exit = spawn(sh("kill -USR1 $$; exit 6"))
+            .await
+            .wait(rx, &StdCancellationToken::new())
+            .await
+            .expect("wait");
+        assert_eq!(exit, Exit::Signal(libc::SIGUSR1), "not blocked: delivered");
+    }
+
+    /// A cancel that lands before the spawn spawns nothing.
+    #[tokio::test]
+    async fn foreground_spawn_cancelled_before_spawn_spawns_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("ran");
+        let ctoken = StdCancellationToken::new();
+        ctoken.cancel();
+        let Err(err) = spawn_foreground(
+            RunnerRef::local(),
+            sh(&format!("touch '{}'", marker.display())),
+            &PathPolicy::default(),
+            &ctoken,
+        )
+        .await
+        else {
+            panic!("a cancelled spawn must fail");
+        };
+        assert!(format!("{err:#}").contains("cancelled"), "{err:#}");
+        assert!(!marker.exists(), "the program must never have run");
     }
 
     #[tokio::test]

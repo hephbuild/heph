@@ -212,6 +212,13 @@ message RunOptions {
   RunStdio stdio = 4;
   // Only with stdio = INHERIT: the dispositions the child execs with.
   repeated SignalDispositionEntry dispositions = 5;
+  // Only with stdio = INHERIT: the RLIMIT_NOFILE soft limit the child execs
+  // with (the caller's, before heph raised its own). Absent leaves the
+  // process's current limit.
+  uint64 nofile = 6;
+  // Only with stdio = INHERIT: the signals blocked in the child at exec (the
+  // caller's mask). OS-local numbers, as `dispositions`.
+  repeated int32 blocked_signals = 7;
 }
 
 message EnvList {

@@ -1425,8 +1425,8 @@ pub fn run_options_to_pb(
             target.addr.format()
         );
     }
-    let (stdio, dispositions) = match &o.stdio {
-        RunStdio::Captured => (pb::RunStdio::Captured, Vec::new()),
+    let (stdio, dispositions, nofile, blocked_signals) = match &o.stdio {
+        RunStdio::Captured => (pb::RunStdio::Captured, Vec::new(), None, Vec::new()),
         RunStdio::Inherit(fg) => (
             pb::RunStdio::Inherit,
             fg.dispositions
@@ -1440,6 +1440,8 @@ pub fn run_options_to_pb(
                     ..Default::default()
                 })
                 .collect(),
+            fg.nofile,
+            fg.blocked.iter().map(|s| s.as_raw()).collect(),
         ),
         other => bail!(
             "run stdio {other:?} has no wire form in ABI {}",
@@ -1473,6 +1475,8 @@ pub fn run_options_to_pb(
             .into(),
         stdio: Some(EnumValue::Known(stdio)),
         dispositions,
+        nofile,
+        blocked_signals,
         ..Default::default()
     }))
 }
@@ -1517,6 +1521,12 @@ pub fn run_options_from_pb(
             if !o.dispositions.is_empty() {
                 bail!("RunOptions.dispositions is set on a run whose stdio is not INHERIT");
             }
+            if o.nofile.is_some() {
+                bail!("RunOptions.nofile is set on a run whose stdio is not INHERIT");
+            }
+            if !o.blocked_signals.is_empty() {
+                bail!("RunOptions.blocked_signals is set on a run whose stdio is not INHERIT");
+            }
         }
         pb::RunStdio::Inherit => {
             let dispositions = o
@@ -1537,7 +1547,15 @@ pub fn run_options_from_pb(
                 .collect::<anyhow::Result<_>>()?;
             let (tx, rx) = hplugin::driver::signal_channel();
             signals = Some(tx);
-            opts = opts.with_stdio(RunStdio::Inherit(Foreground::new(rx, dispositions)));
+            let fg = Foreground::new(rx, dispositions)
+                .with_nofile(o.nofile)
+                .with_blocked(
+                    o.blocked_signals
+                        .into_iter()
+                        .map(Signal::from_raw)
+                        .collect(),
+                );
+            opts = opts.with_stdio(RunStdio::Inherit(fg));
         }
     }
     Ok((opts, signals))
@@ -2340,15 +2358,19 @@ mod tests {
             (Signal::from_raw(2), Disposition::Ignore),
             (Signal::from_raw(22), Disposition::Default),
         ];
-        let o = RunOptions::default().with_stdio(RunStdio::Inherit(Foreground::new(
-            host_rx,
-            dispositions.clone(),
-        )));
+        let blocked = vec![Signal::from_raw(10), Signal::from_raw(12)];
+        let o = RunOptions::default().with_stdio(RunStdio::Inherit(
+            Foreground::new(host_rx, dispositions.clone())
+                .with_nofile(Some(256))
+                .with_blocked(blocked.clone()),
+        ));
         let (back, tx) = options_round_trip(&o);
         let RunStdio::Inherit(mut fg) = back.stdio else {
             panic!("inherit did not survive: {:?}", back.stdio);
         };
         assert_eq!(fg.dispositions, dispositions);
+        assert_eq!(fg.nofile, Some(256), "the caller's open-file limit (D5)");
+        assert_eq!(fg.blocked, blocked, "the caller's signal mask");
         let tx = tx.expect("an inherit run gets a signal sender");
         tx.send(Signal::from_raw(15)).expect("send");
         drop(tx);
@@ -2392,7 +2414,7 @@ mod tests {
     /// The decoder refuses what it cannot honour, rather than guessing.
     #[test]
     fn run_options_decode_refuses_malformed() {
-        let cases: [(&str, pb::RunOptions); 4] = [
+        let cases: [(&str, pb::RunOptions); 6] = [
             (
                 "EnvVar.key",
                 pb::RunOptions {
@@ -2419,6 +2441,20 @@ mod tests {
                         disposition: Some(EnumValue::Known(pb::SignalDisposition::Ignore)),
                         ..Default::default()
                     }],
+                    ..Default::default()
+                },
+            ),
+            (
+                "RunOptions.nofile is set on a run whose stdio is not INHERIT",
+                pb::RunOptions {
+                    nofile: Some(256),
+                    ..Default::default()
+                },
+            ),
+            (
+                "RunOptions.blocked_signals is set on a run whose stdio is not INHERIT",
+                pb::RunOptions {
+                    blocked_signals: vec![10],
                     ..Default::default()
                 },
             ),

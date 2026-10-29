@@ -62,6 +62,11 @@ pub struct InvokeRequest {
     /// Dispositions the tool gets before it execs: what the caller recorded
     /// at startup.
     pub dispositions: Vec<(Signal, Disposition)>,
+    /// The open-file soft limit the tool execs with: what the caller recorded
+    /// at startup, before heph raised its own (R8). `None` leaves heph's.
+    pub nofile: Option<u64>,
+    /// The signals blocked in the tool at exec: the caller's recorded mask.
+    pub blocked: Vec<Signal>,
     /// Wraps the driver's run, as for a build: the CLI pauses its TUI here.
     /// The streams it hands in are ignored — the tool inherits heph's fds.
     pub wrapper: Option<InteractiveWrapper>,
@@ -83,9 +88,21 @@ impl InvokeRequest {
             shell: false,
             signals,
             dispositions: Vec::new(),
+            nofile: None,
+            blocked: Vec::new(),
             wrapper: None,
             handover: None,
         }
+    }
+
+    pub fn with_nofile(mut self, nofile: Option<u64>) -> Self {
+        self.nofile = nofile;
+        self
+    }
+
+    pub fn with_blocked(mut self, blocked: Vec<Signal>) -> Self {
+        self.blocked = blocked;
+        self
     }
 
     pub fn with_handover(mut self, handover: Handover) -> Self {
@@ -130,6 +147,8 @@ impl std::fmt::Debug for InvokeRequest {
             .field("env_keys", &env_keys)
             .field("shell", &self.shell)
             .field("dispositions", &self.dispositions)
+            .field("nofile", &self.nofile)
+            .field("blocked", &self.blocked)
             .field("wrapper", &self.wrapper.is_some())
             .field("handover", &self.handover.is_some())
             .finish_non_exhaustive()
@@ -431,7 +450,9 @@ impl Engine {
             OsString::from("HEPH_ROOT"),
             self.cfg.root.clone().into_os_string(),
         ));
-        let mut foreground = Foreground::new(req.signals, req.dispositions);
+        let mut foreground = Foreground::new(req.signals, req.dispositions)
+            .with_nofile(req.nofile)
+            .with_blocked(req.blocked);
         if let Some(handover) = req.handover {
             foreground = foreground.with_handover(handover);
         }

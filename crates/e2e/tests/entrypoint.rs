@@ -1518,6 +1518,10 @@ target(name = "broken", driver = "exec", entrypoint = True, deps = {"b": ":boom"
 struct ForegroundTool;
 
 const FOREGROUND_TOOL_SCRIPT: &str = r#"
+if [ -n "$HEPH_TEST_LIMITS" ]; then
+  { ulimit -n; kill -USR1 $$; echo survived; } > "$HEPH_TEST_LIMITS"
+  exit 0
+fi
 {
   echo "cwd=$(pwd -P)"
   echo "caller=$HEPH_TEST_CALLER"
@@ -1589,7 +1593,9 @@ impl heph::engine::driver_managed::ManagedDriver for ForegroundTool {
             options.base_env.unwrap_or_default(),
             options.cwd.unwrap_or(req.sandbox_pkg_dir),
         )
-        .with_dispositions(fg.dispositions);
+        .with_dispositions(fg.dispositions)
+        .with_blocked(fg.blocked)
+        .with_nofile(fg.nofile);
         let (child, _) =
             spawn_foreground(RunnerRef::local(), cmd, &PathPolicy::default(), ctoken).await?;
         let exit = child
@@ -1688,5 +1694,70 @@ async fn cdylib_entrypoint_runs() -> anyhow::Result<()> {
         .context("the tool exits once TERM reaches it")??;
     assert_eq!(exited(outcome), Exit::Code(7), "the trap's exit code");
     assert_eq!(read(&cwd.join("waits.term"))?, "got-term\n");
+    Ok(())
+}
+
+/// An open-file limit below heph's own, as a caller's `ulimit -n` would be.
+fn lowered_nofile() -> u64 {
+    let mut now = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: a valid resource and a pointer to a live `rlimit`.
+    let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut now) };
+    assert_eq!(rc, 0, "getrlimit");
+    now.rlim_cur.min(1024) - 1
+}
+
+/// R8/D5: the caller's open-file soft limit and signal mask reach the tool —
+/// heph's raised limit and std's cleared mask do not — for a builtin driver
+/// and for a plugin driver across the stable-ABI seam alike (both travel on
+/// the run's `Foreground`). The blocked SIGUSR1 the tool sends itself stays
+/// pending, so it lives on to say so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn entrypoint_restores_callers_nofile_and_mask() -> anyhow::Result<()> {
+    let nofile = lowered_nofile();
+    let usr1 = hplugin::driver::Signal::from_raw(libc::SIGUSR1);
+    let want = format!("{nofile}\nsurvived\n");
+
+    // Builtin: exec's bash.
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "app",
+        r#"
+target(name = "ep", driver = "bash", entrypoint = True,
+       run = "{ ulimit -n; kill -USR1 $$; echo survived; } > \"$HEPH_TEST_OUT\"")
+"#,
+    );
+    let out = ws.dir.path().join("builtin.txt");
+    let req = request("//app:ep", ws.dir.path(), &[], &out)?
+        .with_nofile(Some(nofile))
+        .with_blocked(vec![usr1]);
+    assert_eq!(exited(invoke(&ws.engine, req).await), Exit::Code(0));
+    assert_eq!(read(&out)?, want, "builtin");
+
+    // Across the seam.
+    let ws = WorkspaceBuilder::new()?
+        .with_provider(|init| {
+            Box::new(pluginbuildfile::Provider::new(
+                init.root.to_path_buf(),
+                init.runtime.clone(),
+                Arc::clone(&init.functions),
+            ))
+        })
+        .with_plugin("fgtool", |init| {
+            behind_the_seam(&init.root, "fgtool", ForegroundTool)
+        })
+        .build()?;
+    ws.write_build_file("app", r#"target(name = "tool", driver = "fgtool")"#);
+    let caller = tempfile::tempdir()?;
+    let out = caller.path().join("seam.txt");
+    let mut env = caller_env(&out);
+    env.push(("HEPH_TEST_LIMITS".into(), out.as_os_str().to_owned()));
+    let req = InvokeRequest::new(parse_addr("//app:tool")?, caller.path(), env)
+        .with_nofile(Some(nofile))
+        .with_blocked(vec![usr1]);
+    assert_eq!(exited(invoke(&ws.engine, req).await), Exit::Code(0));
+    assert_eq!(read(&out)?, want, "across the seam");
     Ok(())
 }

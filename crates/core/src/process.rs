@@ -90,25 +90,55 @@ struct Inherited {
     dispositions: Vec<(Signal, Disposition)>,
     /// The soft `RLIMIT_NOFILE`, or `None` when it could not be read.
     nofile: Option<libc::rlim_t>,
+    /// The signals blocked in the calling thread's mask (the caller's: `execve`
+    /// keeps the mask, and nothing in heph changes it before `main`).
+    blocked: Vec<Signal>,
 }
 
 static INHERITED: std::sync::OnceLock<Inherited> = std::sync::OnceLock::new();
 
-/// Record the signal dispositions and the open-file soft limit this process
-/// inherited, so a program heph runs in the caller's terminal gets them back
-/// (N4, R8) rather than heph's own.
+/// SIGPIPE's disposition as the caller gave it, noted before Rust's runtime
+/// ignores it: 0 not noted, 1 default, 2 ignored. See [`note_inherited_sigpipe`].
+static INHERITED_SIGPIPE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Note SIGPIPE's disposition before std's runtime setup sets it to `SIG_IGN`.
 ///
-/// Call once at the very top of `main`, before anything ignores, handles or
-/// raises them; a later call keeps the first record. SIGPIPE is always
-/// recorded as [`Disposition::Default`]: Rust ignores it before `main` runs,
-/// so what the caller gave is unknowable, and std resets it for every child
-/// anyway (accepted limit X6) — a tool under `| head` dies as it should.
+/// For a binary's pre-`main` constructor (an `.init_array` /
+/// `__mod_init_func` entry), which the loader runs before std's `lang_start`
+/// ignores SIGPIPE. Only queries the disposition and stores an atomic, so it
+/// is sound that early. Without it (a library, a test binary) SIGPIPE is
+/// recorded as [`Disposition::Default`].
+pub fn note_inherited_sigpipe() {
+    let noted = if is_ignored(libc::SIGPIPE) { 2 } else { 1 };
+    INHERITED_SIGPIPE.store(noted, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Every signal number the mask could hold, for reading it back as a list.
+#[cfg(target_os = "linux")]
+const MAX_SIGNAL: libc::c_int = 64;
+#[cfg(target_os = "macos")]
+const MAX_SIGNAL: libc::c_int = 31;
+
+/// Record the signal dispositions, the signal mask and the open-file soft
+/// limit this process inherited, so a program heph runs in the caller's
+/// terminal gets them back (N4, R8) rather than heph's own.
+///
+/// Call once at the very top of `main`, on the main thread, before anything
+/// ignores, handles or raises them; a later call keeps the first record.
+/// SIGPIPE is whatever [`note_inherited_sigpipe`] saw before `main` — Rust
+/// ignores it before `main` runs — and [`Disposition::Default`] if nothing
+/// noted it.
 pub fn record_inherited() {
     INHERITED.get_or_init(|| {
         let dispositions = RECORDED_SIGNALS
             .iter()
             .map(|&sig| {
-                let disposition = if sig != libc::SIGPIPE && is_ignored(sig) {
+                let ignored = if sig == libc::SIGPIPE {
+                    INHERITED_SIGPIPE.load(std::sync::atomic::Ordering::Relaxed) == 2
+                } else {
+                    is_ignored(sig)
+                };
+                let disposition = if ignored {
                     Disposition::Ignore
                 } else {
                     Disposition::Default
@@ -126,8 +156,48 @@ pub fn record_inherited() {
         Inherited {
             dispositions,
             nofile,
+            blocked: current_mask(),
         }
     });
+}
+
+/// The calling thread's blocked signals.
+fn current_mask() -> Vec<Signal> {
+    // SAFETY: an all-zero `sigset_t` is a valid out-parameter.
+    let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
+    // SAFETY: a null new set only queries; `set` is live and writable.
+    if unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut set) } != 0 {
+        return Vec::new();
+    }
+    (1..=MAX_SIGNAL)
+        // SAFETY: `set` was filled in above; an out-of-range number is 0 or -1.
+        .filter(|&sig| unsafe { libc::sigismember(&set, sig) } == 1)
+        .map(Signal::from_raw)
+        .collect()
+}
+
+/// A signal mask holding exactly `blocked`, built in the parent so a
+/// `pre_exec` only has to install it ([`set_mask_for_exec`]).
+pub fn mask_of(blocked: &[Signal]) -> libc::sigset_t {
+    // SAFETY: an all-zero `sigset_t` is valid storage for `sigemptyset`.
+    let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `set` is live and writable.
+    unsafe { libc::sigemptyset(&mut set) };
+    for sig in blocked {
+        // SAFETY: as above; an invalid number is refused with EINVAL, leaving
+        // the set as it was.
+        unsafe { libc::sigaddset(&mut set, sig.as_raw()) };
+    }
+    set
+}
+
+/// Install `mask` as the calling thread's signal mask. Async-signal-safe and
+/// allocation-free: fit for a `pre_exec` (std clears the mask in every child
+/// before its `pre_exec` closures run, so this is what puts the caller's back).
+pub fn set_mask_for_exec(mask: &libc::sigset_t) {
+    // SAFETY: `mask` is a live, initialized set; a failure leaves the mask as
+    // it was, which is all a caller could do anyway.
+    unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, mask, std::ptr::null_mut()) };
 }
 
 /// Whether `sig` is currently `SIG_IGN`. Reads the disposition without
@@ -151,8 +221,14 @@ pub fn inherited_nofile() -> Option<libc::rlim_t> {
     INHERITED.get()?.nofile
 }
 
-/// Put back what [`record_inherited`] recorded — every recorded disposition
-/// and the open-file soft limit — in *this* process, right before it replaces
+/// The signals [`record_inherited`] saw blocked; empty when nothing was
+/// recorded.
+pub fn inherited_blocked() -> &'static [Signal] {
+    INHERITED.get().map_or(&[], |i| i.blocked.as_slice())
+}
+
+/// Put back what [`record_inherited`] recorded — every recorded disposition,
+/// the signal mask and the open-file soft limit — in *this* process, right before it replaces
 /// itself with `execve` (the self-upgrade). The new image then records what
 /// the caller gave, not what this one changed (R8). Allocates nothing and
 /// calls only async-signal-safe functions, so it is fit for a `pre_exec`.
@@ -169,6 +245,7 @@ pub fn restore_inherited_for_exec() {
         // SAFETY: `signal(2)` with a default or ignore disposition.
         unsafe { libc::signal(sig.as_raw(), handler) };
     }
+    set_mask_for_exec(&mask_of(&inherited.blocked));
     if let Some(cur) = inherited.nofile {
         let mut lim = libc::rlimit {
             rlim_cur: 0,
@@ -203,8 +280,19 @@ mod tests {
             return;
         }
         let exe = std::env::current_exe().expect("current_exe");
-        // `nohup`-like: the child starts with SIGINT and SIGTTOU ignored.
-        let out = std::process::Command::new("/bin/sh")
+        use std::os::unix::process::CommandExt as _;
+        // `nohup`-like: the child starts with SIGINT and SIGTTOU ignored, and
+        // with SIGUSR1 blocked (`sh` and `exec` keep the mask).
+        let mut cmd = std::process::Command::new("/bin/sh");
+        let mask = mask_of(&[Signal::from_raw(libc::SIGUSR1)]);
+        // SAFETY: only installs a mask built before the fork.
+        unsafe {
+            cmd.pre_exec(move || {
+                set_mask_for_exec(&mask);
+                Ok(())
+            })
+        };
+        let out = cmd
             .args(["-c", "trap '' INT TTOU; exec \"$0\" \"$@\""])
             .arg(exe)
             .args([
@@ -246,6 +334,11 @@ mod tests {
         assert_eq!(get(libc::SIGPIPE), Some(Disposition::Default), "X6");
         assert_eq!(inherited_dispositions().len(), RECORDED_SIGNALS.len());
         assert!(inherited_nofile().is_some());
+        assert_eq!(
+            inherited_blocked(),
+            &[Signal::from_raw(libc::SIGUSR1)],
+            "the caller's mask"
+        );
 
         // What heph does after the record: ignore TTIN, handle-or-default INT.
         // SAFETY: this re-executed process runs only this test.
@@ -263,6 +356,12 @@ mod tests {
         assert!(is_ignored(libc::SIGINT), "INT back to ignored");
         assert!(!is_ignored(libc::SIGTTIN), "TTIN back to default");
         assert!(is_ignored(libc::SIGTTOU), "TTOU stays ignored");
+
+        // A mask changed after the record is put back too.
+        set_mask_for_exec(&mask_of(&[]));
+        assert!(current_mask().is_empty());
+        restore_inherited_for_exec();
+        assert_eq!(current_mask(), [Signal::from_raw(libc::SIGUSR1)]);
     }
 
     #[test]

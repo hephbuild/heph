@@ -1761,6 +1761,7 @@ dependencies = [
  "futures",
  "heph",
  "hex",
+ "libc",
  "plugin",
  "plugin-abi",
  "plugin-devenv",
