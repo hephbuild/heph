@@ -221,6 +221,13 @@ pub struct Engine {
     pub(crate) hooks: Vec<Arc<dyn SDKHook>>,
 
     pub requests: Mutex<HashMap<String, Weak<RequestState>>>,
+    /// Every live request's cancellation token, by request id, for
+    /// [`cancel_all_requests`](Engine::cancel_all_requests). Not read through
+    /// `requests`: that holds the *root* `RequestState`, which the command
+    /// drops when it returns, while its data — and the work riding on it, a
+    /// remote upload holding a child state — lives on to the exit-time drain.
+    /// Removed when the data drops.
+    pub(crate) request_ctokens: Mutex<HashMap<String, hcore::hasync::StdCancellationToken>>,
     /// Every exec runner this host knows, by name: `local`, `wrap`, `session`.
     ///
     /// Builtins only. A plugin that wants agent mode does not implement a
@@ -737,6 +744,7 @@ impl Engine {
             drivers_by_name: HashMap::new(),
             hooks: vec![],
             requests: Mutex::new(HashMap::new()),
+            request_ctokens: Mutex::new(HashMap::new()),
             exec_runners: Arc::new({
                 let mut registry = hexecrunner::registry::RunnerRegistry::with_builtins();
                 registry
@@ -820,14 +828,16 @@ impl Engine {
 
     /// Cancel every in-flight request's cancellation token. Used to broadcast
     /// graceful shutdown (e.g. on SIGINT). Idempotent.
+    ///
+    /// Reaches every request whose data is alive, including one whose root
+    /// state the command already dropped while background work (a remote
+    /// upload) still rides a child of it — what the exit-time drain waits on.
     pub fn cancel_all_requests(&self) {
-        let Ok(requests) = self.requests.lock() else {
+        let Ok(tokens) = self.request_ctokens.lock() else {
             return;
         };
-        for weak in requests.values() {
-            if let Some(rs) = weak.upgrade() {
-                rs.ctoken().cancel();
-            }
+        for ctoken in tokens.values() {
+            ctoken.cancel();
         }
     }
 
