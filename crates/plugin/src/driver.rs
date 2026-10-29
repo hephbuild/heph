@@ -1395,6 +1395,18 @@ impl Foreground {
     }
 }
 
+impl hcore::process::CallerState for Foreground {
+    fn dispositions(&self) -> &[(Signal, Disposition)] {
+        &self.dispositions
+    }
+    fn nofile(&self) -> Option<u64> {
+        self.nofile
+    }
+    fn blocked(&self) -> &[Signal] {
+        &self.blocked
+    }
+}
+
 /// A one-shot hook the host runs when a run in the caller's terminal is about
 /// to spawn its program ([`Foreground::handover`]): the binary stops treating
 /// Ctrl-C as "cancel" from that moment, while everything before it — deps,

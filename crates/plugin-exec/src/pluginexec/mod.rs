@@ -2316,9 +2316,7 @@ impl Driver {
                 env_pairs,
                 cwd,
             )
-            .with_dispositions(fg.dispositions)
-            .with_nofile(fg.nofile)
-            .with_blocked(fg.blocked);
+            .with_foreground(&fg);
             let (spawned, spawned_as) =
                 hexecrunner::foreground::spawn_foreground(runner_ref, cmd, &path_policy, ctoken)
                     .await?;

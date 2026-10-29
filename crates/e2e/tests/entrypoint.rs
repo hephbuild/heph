@@ -1593,9 +1593,7 @@ impl heph::engine::driver_managed::ManagedDriver for ForegroundTool {
             options.base_env.unwrap_or_default(),
             options.cwd.unwrap_or(req.sandbox_pkg_dir),
         )
-        .with_dispositions(fg.dispositions)
-        .with_blocked(fg.blocked)
-        .with_nofile(fg.nofile);
+        .with_foreground(&fg);
         let (child, _) =
             spawn_foreground(RunnerRef::local(), cmd, &PathPolicy::default(), ctoken).await?;
         let exit = child

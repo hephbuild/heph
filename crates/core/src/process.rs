@@ -95,6 +95,20 @@ pub enum Disposition {
     Ignore,
 }
 
+/// The caller's state a program run in its terminal gets back: what the host
+/// recorded at startup and sends with the run (the driver contract's
+/// `Foreground` implements it), and what the foreground spawn restores in the
+/// child (`ForegroundCommand::with_foreground`). A trait here, in the leaf
+/// crate, because neither of those two crates depends on the other.
+pub trait CallerState {
+    /// Dispositions to set in the child before it execs.
+    fn dispositions(&self) -> &[(Signal, Disposition)];
+    /// The `RLIMIT_NOFILE` soft limit to set; `None` leaves the process's.
+    fn nofile(&self) -> Option<u64>;
+    /// The signals to block in the child.
+    fn blocked(&self) -> &[Signal];
+}
+
 /// The signals whose inherited disposition heph records: every signal heph
 /// itself changes (TTOU/TTIN ignored at startup, INT/QUIT/USR1/USR2 handled,
 /// the relay's TERM/HUP/WINCH), plus PIPE (see [`record_inherited`]).

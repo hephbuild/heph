@@ -3157,12 +3157,22 @@ impl Engine {
                 let contended = contend_for_write(
                     || engine.result_lock().try_write(addr, hashin),
                     || engine.result_lock().lock_target(addr, ctoken),
+                    // A probe failure ends the wait as a "hit" carrying the
+                    // error, so it surfaces with its own context rather than
+                    // under the lock-acquire one the notice wrapper adds.
                     || async move {
                         let read = engine.result_lock().read(addr, hashin, ctoken).await?;
-                        Ok(engine
-                            .probe_cache_manifest(rs_ref, def, opts)
-                            .await?
-                            .map(|manifest| (manifest, read)))
+                        Ok(
+                            match engine
+                                .probe_cache_manifest(rs_ref, def, opts)
+                                .await
+                                .with_context(|| format!("probing the local cache for {addr}"))
+                            {
+                                Ok(Some(manifest)) => Some(Ok((manifest, read))),
+                                Ok(None) => None,
+                                Err(e) => Some(Err(e)),
+                            },
+                        )
                     },
                     ctoken,
                 );
@@ -3171,7 +3181,8 @@ impl Engine {
                     .await?
                 {
                     Contended::Won(write) => write,
-                    Contended::Hit((manifest, read)) => {
+                    Contended::Hit(Err(e)) => return Err(e),
+                    Contended::Hit(Ok((manifest, read))) => {
                         // Branch A, reached late.
                         let (slot, read) = GuardSlot::new(
                             addr,

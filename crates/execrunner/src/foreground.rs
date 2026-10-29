@@ -82,6 +82,16 @@ impl ForegroundCommand {
         }
     }
 
+    /// Everything of the caller's the run carries — dispositions, open-file
+    /// limit, signal mask — in one call: `.with_foreground(&fg)` with the
+    /// run's `Foreground`. The way a driver should set them, so a field
+    /// added later is not one it forgets to pass on.
+    pub fn with_foreground(self, fg: &impl hcore::process::CallerState) -> Self {
+        self.with_dispositions(fg.dispositions().to_vec())
+            .with_nofile(fg.nofile())
+            .with_blocked(fg.blocked().to_vec())
+    }
+
     pub fn with_dispositions(mut self, dispositions: Vec<(Signal, Disposition)>) -> Self {
         self.dispositions = dispositions;
         self

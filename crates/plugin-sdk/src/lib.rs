@@ -17,17 +17,15 @@ pub use hplugin::{driver, eresult, function, hook, provider};
 /// Running a program in the caller's terminal, for a driver that honours
 /// `RunStdio::Inherit` (an entrypoint's run). The same spawn exec uses:
 /// inherited fds 0–2, the caller's dispositions, signal mask and open-file
-/// limit restored (all three travel on the run's `Foreground`: pass them on),
-/// the pid tracked with the host's supervisor, and the run's signals relayed by
-/// [`ForegroundChild::wait`](foreground::ForegroundChild::wait) without ever
-/// signalling a reaped pid.
+/// limit restored (they travel on the run's `Foreground`: pass them on with
+/// [`with_foreground`](foreground::ForegroundCommand::with_foreground), not
+/// field by field), the pid tracked with the host's supervisor, and the run's
+/// signals relayed by [`ForegroundChild::wait`](foreground::ForegroundChild::wait)
+/// without ever signalling a reaped pid.
 ///
 /// ```ignore
 /// let RunStdio::Inherit(fg) = std::mem::take(&mut req.options.stdio) else { … };
-/// let cmd = ForegroundCommand::new(program, args, env, cwd)
-///     .with_dispositions(fg.dispositions)
-///     .with_blocked(fg.blocked)
-///     .with_nofile(fg.nofile);
+/// let cmd = ForegroundCommand::new(program, args, env, cwd).with_foreground(&fg);
 /// let (child, _) = spawn_foreground(RunnerRef::local(), cmd, &PathPolicy::default(), ctoken).await?;
 /// let exit = child?.wait(fg.signals, ctoken).await?;
 /// ```
