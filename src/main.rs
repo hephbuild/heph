@@ -64,6 +64,13 @@ fn main() -> ExitCode {
     // subcommands: its argv and its stdin belong to the *calling tool* — Docker
     // appends `get`, git appends `get`/`store`/`erase`, and both write a request
     // on stdin — so parsing it as flags would misread somebody else's protocol.
+    // Once, while this process is still single-threaded, so every later fork
+    // from any thread — the runner agent's, telemetry's, a build's, an
+    // entrypoint's — copies a settled libSystem state (`hproc::fork_safety`;
+    // a no-op on Linux). The spawns that call it themselves keep doing so for
+    // the processes that never run this `main` (tests, embedders).
+    hproc::fork_safety::prime();
+
     // It also must not pull in logging or the TUI: it is a callback running
     // inside another tool, and anything it writes to stdout is that tool's
     // document.
