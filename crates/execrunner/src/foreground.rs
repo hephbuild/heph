@@ -373,10 +373,13 @@ impl ForegroundChild {
 impl Drop for ForegroundChild {
     fn drop(&mut self) {
         // Reached unwaited only when `wait`'s future was dropped, or the child
-        // was never waited. `try_wait` reaps a finished child; a live one is
-        // still unreaped, so its pid is its own and killing it is safe.
-        if matches!(self.child.try_wait(), Ok(None)) {
+        // was never waited. Nothing has reaped it (only `wait` does), so its
+        // pid is still its own — a zombie at worst — and killing it is safe.
+        // Then untrack, then reap, as in `wait`: once reaped the pid can be
+        // reused, and the supervisor must never hold a pid that is not ours.
+        if self.track.is_some() || matches!(self.child.try_wait(), Ok(None)) {
             drop(self.child.kill());
+            drop(self.track.take());
             drop(self.child.wait());
         }
     }
@@ -816,7 +819,10 @@ mod tests {
             return;
         }
         let exe = std::env::current_exe().expect("current_exe");
-        for attempt in 0..30 {
+        // The race is macOS's (libSystem's atfork handler); Linux has none, so
+        // one attempt there keeps the spawn path covered without 30 re-execs.
+        let attempts = if cfg!(target_os = "macos") { 30 } else { 1 };
+        for attempt in 0..attempts {
             let out = std::process::Command::new(&exe)
                 .args([
                     "--exact",

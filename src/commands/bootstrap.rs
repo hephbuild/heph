@@ -323,11 +323,11 @@ fn spawn_shutdown_handler(engine: Weak<engine::Engine>, mut rx: mpsc::UnboundedR
     tokio::spawn(async move {
         let mut presses = 0usize;
         while rx.recv().await.is_some() {
-            // Queued before an entrypoint was handed the terminal, read after:
-            // the press is the tool's now, and heph prints nothing (R9).
-            if hcore::shutdown::is_transparent() {
-                continue;
-            }
+            // Gated at trigger time, not here: a press accepted before an
+            // entrypoint was handed the terminal happened before its tool
+            // existed, so it is heph's — a cancel, which the spawn's own
+            // check then honours — even when this task reads it just after
+            // the handover. Dropping it here would lose that Ctrl-C.
             presses += 1;
             if presses == 1 {
                 tracing::warn!(

@@ -219,12 +219,7 @@ fn sweep(path: &std::path::Path) {
     // Opt-in, and deliberately *before* the inventory: the backtrace half is the
     // half that can wedge the process (module docs), so if it does, the reader
     // still gets a file whose contents show how far it got.
-    let n = if BACKTRACES.load(Ordering::Relaxed) {
-        let handler = on_dump_signal as extern "C" fn(libc::c_int);
-        // SAFETY: installed before any thread is signalled below.
-        unsafe {
-            libc::signal(DUMP_SIGNAL, handler as libc::sighandler_t);
-        }
+    let n = if BACKTRACES.load(Ordering::Relaxed) && install_dump_handler() {
         sweep_threads()
     } else {
         0
@@ -458,6 +453,36 @@ fn os_tid() -> i64 {
 #[cfg(not(target_os = "linux"))]
 fn os_tid() -> i64 {
     -1
+}
+
+/// Install [`on_dump_signal`] for [`DUMP_SIGNAL`], once, and only over the
+/// default disposition: a handler someone else installed — the entrypoint
+/// relay's listener for SIGUSR1 — is never replaced, which would leave the
+/// tool's SIGUSR1s to land here. `false` when the signal is not ours to use
+/// (the sweep then dumps no per-thread stacks).
+fn install_dump_handler() -> bool {
+    static INSTALLED: AtomicBool = AtomicBool::new(false);
+    if INSTALLED.load(Ordering::Acquire) {
+        return true;
+    }
+    if hcore::shutdown::is_transparent() {
+        return false;
+    }
+    // SAFETY: an all-zero `sigaction` is a valid out-parameter.
+    let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
+    // SAFETY: a null new action only queries; `old` is live and writable.
+    if unsafe { libc::sigaction(DUMP_SIGNAL, std::ptr::null(), &mut old) } != 0
+        || old.sa_sigaction != libc::SIG_DFL
+    {
+        return false;
+    }
+    let handler = on_dump_signal as extern "C" fn(libc::c_int);
+    // SAFETY: installed before any thread is signalled by the sweep.
+    unsafe {
+        libc::signal(DUMP_SIGNAL, handler as libc::sighandler_t);
+    }
+    INSTALLED.store(true, Ordering::Release);
+    true
 }
 
 extern "C" fn on_dump_signal(_sig: libc::c_int) {

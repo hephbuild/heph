@@ -273,10 +273,20 @@ pub use hcore::process::Exit;
 /// points into the plugin's world and its `status` text is folded into the
 /// message. This keeps the message byte-identical to what an older host prints
 /// from the same frame, and the status readable through [`process_exit`].
+///
+/// `#[non_exhaustive]`: built with [`RemoteProcessFailed::new`] outside this
+/// crate, so a later field is not a source break.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RemoteProcessFailed {
     pub message: String,
     pub exit: Exit,
+}
+
+impl RemoteProcessFailed {
+    pub fn new(message: String, exit: Exit) -> Self {
+        Self { message, exit }
+    }
 }
 
 impl fmt::Display for RemoteProcessFailed {

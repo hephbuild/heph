@@ -66,8 +66,9 @@ static TRANSPARENT: AtomicUsize = AtomicUsize::new(0);
 
 /// While held, heph is *transparent*: a program it handed the terminal to (an
 /// entrypoint, E8/N4a) owns every signal, and heph acts on none of them. The
-/// shutdown trigger drops every press, a press already queued is dropped by
-/// its consumer, and the diagnostic handlers (`SIGQUIT` dump, `SIGUSR1`
+/// shutdown trigger drops every press (one it accepted before the hold was
+/// taken still cancels: it was pressed before the program existed), and the
+/// diagnostic handlers (`SIGQUIT` dump, `SIGUSR1`
 /// per-thread backtraces, `SIGUSR2` profile dump) do nothing.
 ///
 /// Refcounted, so two invocations in one process never end each other's

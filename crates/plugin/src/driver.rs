@@ -638,6 +638,14 @@ pub mod targetdef {
         /// field decodes to `None`, so it is never an entrypoint and never
         /// receives [`RunOptions`](super::RunOptions). Skipped when `None`, so
         /// `inspect def --json` of every other target is unchanged.
+        ///
+        /// Concurrency (N10): an entrypoint's `run` may be called many times
+        /// at once for the same addr — two terminals running the same tool —
+        /// each with a `sandbox_dir` of its own, and with no execute lock
+        /// around it. A declaring driver keeps per-run state inside that
+        /// `sandbox_dir`; anything it keys by addr outside it (a fixed scratch
+        /// path, a pid file, a per-addr lock held for the run) breaks
+        /// concurrent invocations.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub entrypoint: Option<Entrypoint>,
         pub pty: bool,
@@ -1220,7 +1228,13 @@ pub struct RunRequest<'a, 'io> {
     /// [`TargetDef::entrypoint`](targetdef::TargetDef::entrypoint) set) ever
     /// gets a non-default value (N6/N9): such a run is uncached and no one's
     /// input, so a driver may honour these without asking what they do to a
-    /// cache key. They are never hashed.
+    /// cache key. They are never hashed. Such a run may be one of several in
+    /// flight for the same addr, each in its own `sandbox_dir` (see
+    /// [`TargetDef::entrypoint`](targetdef::TargetDef::entrypoint)).
+    ///
+    /// Under [`RunStdio::Inherit`], a managed driver's `run` is called after
+    /// the host fired the [`Handover`]; a plain driver's, right after the
+    /// engine fired it.
     pub options: RunOptions,
 }
 
@@ -1279,10 +1293,14 @@ impl RunOptions {
     /// Every field at its default: a build's run. What a def that declared no
     /// entrypoint must always be sent (N9).
     pub fn is_default(&self) -> bool {
-        self.cwd.is_none()
-            && self.base_env.is_none()
-            && self.args.is_none()
-            && matches!(self.stdio, RunStdio::Captured)
+        // Destructured, so a new field cannot be forgotten here (N9 rests on it).
+        let Self {
+            cwd,
+            base_env,
+            args,
+            stdio,
+        } = self;
+        cwd.is_none() && base_env.is_none() && args.is_none() && matches!(stdio, RunStdio::Captured)
     }
 }
 

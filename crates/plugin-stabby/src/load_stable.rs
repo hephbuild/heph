@@ -580,7 +580,7 @@ fn drain_run(
             // process's exit, readable through `hplugin::error::process_exit`.
             Some(pb::run_out_frame::Msg::Error(e)) => match convert::exit_from_pb(frame.exit) {
                 Some(exit) => {
-                    return Err(hplugin::error::RemoteProcessFailed { message: e, exit }.into());
+                    return Err(hplugin::error::RemoteProcessFailed::new(e, exit).into());
                 }
                 None => anyhow::bail!("{e}"),
             },

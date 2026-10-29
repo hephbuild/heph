@@ -2424,9 +2424,14 @@ impl Driver {
         // ones it takes only TERM and HUP (a `timeout` or a closed terminal
         // ending heph), delivered to the session's group. Everything else is
         // the user's to type into the shell. Stopped as soon as the wait
-        // returns; a signal racing the reap in between can reach only an
-        // exited group (ESRCH), since the session's pgid is not reused while
-        // a sibling of the shell holds it.
+        // returns. Between the reap inside that wait and the abort there is a
+        // window: while any process of the session's group lives the pgid
+        // cannot be reused and a late TERM reaches it (or ESRCH once it is
+        // empty), but once the group is empty the number can in principle be
+        // handed to a new group in that window. Accepted: it needs a TERM or
+        // HUP to arrive in the microseconds after the shell exits and a pid
+        // wrap onto exactly that number; the foreground spawn closes it with
+        // `waitid(WNOWAIT)`, which `proc_exec`'s wait does not offer.
         let shell_relay = shell_signals.map(|mut signals| {
             let pgid = handle.pid();
             tokio::spawn(async move {
