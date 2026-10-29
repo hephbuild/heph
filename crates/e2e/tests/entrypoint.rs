@@ -1160,9 +1160,11 @@ target(name = "cancel", driver = "exec", entrypoint = True,
 
 /// An invocation lays out its closure as a build does (R29, replacing R1):
 /// a `read_only_deps` dep is symlinked from the shared stage, a transitive
-/// tool is hardlinked from it, and an ordinary dep is a copy in the invocation's
+/// tool is linked from it (a hardlink; an APFS clone on macOS, see
+/// `stage::share_file`), and an ordinary dep is a copy in the invocation's
 /// sandbox. The first two lines are resolved paths; the third names the stage
-/// file the tool is the same inode as.
+/// file the tool is the same inode as (Linux) or a clone of (macOS: same bytes,
+/// and the stage entry exists only because the tool was staged).
 #[tokio::test]
 async fn entrypoint_closure_is_staged_like_a_build() -> anyhow::Result<()> {
     let ws = Workspace::new();
@@ -1181,7 +1183,7 @@ target(name = "carrier", driver = "bash", run = "printf c > $OUT", out = "c",
 target(name = "ep", driver = "bash", entrypoint = True,
        deps = {{"d": "//tools:data", "r": "//ro:data", "c": ":carrier"}},
        read_only_deps = ["r"], env = {{"STAGE": "{}"}},
-       run = "exec > \"$HEPH_TEST_OUT\"; realpath \"$SRC_D\" \"$SRC_R\"; t=$(command -v mytool); for s in \"$STAGE\"/*/*/mytool \"$STAGE\"/*/*/*/mytool; do [ \"$t\" -ef \"$s\" ] && echo \"same inode as $s\"; done; true")
+       run = "exec > \"$HEPH_TEST_OUT\"; realpath \"$SRC_D\" \"$SRC_R\"; t=$(command -v mytool); for s in \"$STAGE\"/*/*/mytool \"$STAGE\"/*/*/*/mytool; do if [ \"$t\" -ef \"$s\" ]; then echo \"same inode as $s\"; elif cmp -s \"$t\" \"$s\"; then echo \"same bytes as $s\"; fi; done; true")
 "#,
             stage.display()
         ),
@@ -1199,9 +1201,14 @@ target(name = "ep", driver = "bash", entrypoint = True,
         read_only.contains("/stage/"),
         "a read-only dep is symlinked: {got}"
     );
+    let linked = if cfg!(target_os = "macos") {
+        "same bytes as "
+    } else {
+        "same inode as "
+    };
     assert!(
-        tool.starts_with("same inode as "),
-        "a tool is hardlinked: {got}"
+        tool.starts_with(linked),
+        "a tool is linked from the stage ({linked:?}): {got}"
     );
     Ok(())
 }

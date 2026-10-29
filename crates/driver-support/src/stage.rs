@@ -5,8 +5,9 @@
 //! (tools, hermetic SDKs, …) that copy is pure waste: the same artifact is
 //! unpacked once per consuming target. Staging hoists that work out — an
 //! artifact is materialized **once** into a content-addressed, read-only stage
-//! dir under `<home>/stage/`, and every consumer gets cheap hardlinks into its
-//! sandbox instead of a fresh byte-for-byte copy. This is the common-
+//! dir under `<home>/stage/`, and every consumer gets cheap links into its
+//! sandbox (a subtree symlink, or per file a hardlink — an APFS clone on
+//! macOS) instead of a fresh byte-for-byte copy. This is the common-
 //! subexpression elimination the FUSE path gets for free via its in-memory
 //! union filesystem.
 //!
@@ -648,9 +649,10 @@ fn link_tree(
     Ok(())
 }
 
-/// Materialize one staged entry at `dst`: hardlink a regular file, or recreate
-/// a symlink (copying its target). Replaces any existing entry at `dst` so
-/// inputs sharing a `link_root` can overwrite each other's identical bytes.
+/// Materialize one staged entry at `dst`: a regular file through
+/// [`share_file`], or a symlink recreated (copying its target). Replaces any
+/// existing entry at `dst` so inputs sharing a `link_root` can overwrite each
+/// other's identical bytes.
 #[cfg(unix)]
 fn link_one(staged: &Path, dst: &Path, is_symlink: bool) -> anyhow::Result<()> {
     let attempt = || -> std::io::Result<()> {
@@ -658,7 +660,7 @@ fn link_one(staged: &Path, dst: &Path, is_symlink: bool) -> anyhow::Result<()> {
             let target = std::fs::read_link(staged)?;
             std::os::unix::fs::symlink(target, dst)
         } else {
-            std::fs::hard_link(staged, dst)
+            share_file(staged, dst)
         }
     };
     match attempt() {
@@ -669,6 +671,48 @@ fn link_one(staged: &Path, dst: &Path, is_symlink: bool) -> anyhow::Result<()> {
         }
         Err(e) => Err(e).with_context(|| format!("link {:?} -> {:?}", dst, staged)),
     }
+}
+
+/// Put a regular file with `staged`'s bytes and mode at `dst` without copying
+/// data: a hardlink, or on macOS an APFS clone.
+///
+/// Why macOS clones: an APFS hardlink costs ~0.25 ms (it rewrites the inode
+/// into a sibling-linked one and updates its link count), and every sandbox
+/// links the *same* staged inodes, so concurrent runs serialize on them — 16
+/// parallel invocations linking one 100-file tool spent ~3.5 ms per link, and
+/// unlinking them at teardown was ~5x a plain file. `clonefile(2)` makes a new
+/// inode sharing the data blocks copy-on-write: ~0.08 ms, with nothing shared
+/// to contend on. The sandbox sees the same thing either way — a regular file
+/// with the staged bytes, mode and mtime at the same path — and a clone is
+/// also immune to a target that `chmod`s its input writable and edits it,
+/// which through a hardlink would edit the stage entry. A filesystem without
+/// clones (`ENOTSUP`, e.g. HFS+) falls back to the hardlink.
+///
+/// Linux keeps the hardlink: `link(2)` there is a cheap directory-entry insert,
+/// and `FICLONE` exists only on btrfs/XFS.
+#[cfg(target_os = "macos")]
+fn share_file(staged: &Path, dst: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let to_c = |p: &Path| {
+        std::ffi::CString::new(p.as_os_str().as_bytes())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+    };
+    let (src_c, dst_c) = (to_c(staged)?, to_c(dst)?);
+    // SAFETY: both pointers are NUL-terminated strings owned by `src_c` and
+    // `dst_c`, which outlive the call; `clonefile` only reads them.
+    if unsafe { libc::clonefile(src_c.as_ptr(), dst_c.as_ptr(), 0) } == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::ENOTSUP | libc::EXDEV) => std::fs::hard_link(staged, dst),
+        _ => Err(err),
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn share_file(staged: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::hard_link(staged, dst)
 }
 
 #[cfg(not(unix))]
@@ -1079,6 +1123,56 @@ pub(crate) mod tests {
             stage.join("k").join("tree1").join("goroot/bin/go").exists(),
             "staged copy survives teardown"
         );
+    }
+
+    /// A per-file input's sandbox file is a regular file carrying the staged
+    /// bytes and mode however it was placed (hardlink on Linux, APFS clone on
+    /// macOS), and relinking over a present one — a second input sharing the
+    /// root — replaces it. On macOS the clone is its own inode, so a target
+    /// that makes its input writable and edits it cannot reach the stage.
+    #[tokio::test]
+    async fn per_file_input_is_a_regular_file_with_the_staged_bytes_and_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let stage = tmp.path().join("stage");
+        let link = tmp.path().join("ws");
+        let c = content("tool1", &[("tools/bin/node", "NODE", true)]);
+
+        for _ in 0..2 {
+            stage_and_link(&c, &stage, "nodejs24", &link, None, &[], true, &ct())
+                .await
+                .expect("per-file stage");
+        }
+
+        let placed = link.join("tools/bin/node");
+        let staged = stage.join("nodejs24/tool1/tools/bin/node");
+        let md = std::fs::symlink_metadata(&placed).expect("lstat placed");
+        assert!(md.file_type().is_file(), "placed must be a regular file");
+        assert_eq!(std::fs::read_to_string(&placed).expect("read"), "NODE");
+        let staged_md = std::fs::metadata(&staged).expect("stat staged");
+        assert_eq!(
+            md.permissions().mode() & 0o7777,
+            staged_md.permissions().mode() & 0o7777,
+            "placed file keeps the staged (read-only, executable) mode"
+        );
+
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            assert_ne!(
+                md.ino(),
+                staged_md.ino(),
+                "macOS places a clone, not a link"
+            );
+            std::fs::set_permissions(&placed, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod placed");
+            std::fs::write(&placed, "EDITED").expect("edit placed");
+            assert_eq!(
+                std::fs::read_to_string(&staged).expect("read staged"),
+                "NODE",
+                "editing the sandbox file must not reach the stage entry"
+            );
+        }
     }
 
     #[tokio::test]
