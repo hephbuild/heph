@@ -986,6 +986,30 @@ jobs:
       # launch with the dylib absent. `support_check` finds no macfuse.fs and
       # reports Unavailable, so FUSE mount tests skip. Linux exercises the real
       # pure-Rust FUSE path.
+      #
+      # Compiled and run as two steps so the local kache store can be dropped
+      # in between (next step). `--no-run` reaches all three of `tst`'s passes.
+      - name: Compile tests
+        shell: devenv shell bash -- -e {0}
+        run: tst --no-run
+
+      # The tests need the disk the store is holding. On ext4 kache copies
+      # rather than reflinks, and its store has been seen to end a compile at
+      # 45-57 GiB of physical blobs behind a 10 GiB logical size: evicted
+      # entries leave their blobs behind. `plugingo-e2e` then fills the rest of
+      # the root disk unpacking Go toolchains, and the job fails with ENOSPC.
+      # Nothing reads the store again in this job: `target/` is complete, and
+      # the stop drains the uploads first. The log stays for the drain step.
+      - name: Free the local kache store (linux)
+        if: matrix.os == 'linux'
+        shell: devenv shell bash -- -e {0}
+        run: |
+          kache stats
+          kache daemon stop || true
+          kache purge </dev/null || true
+          find "$HOME/.cache/kache" -mindepth 1 -maxdepth 1 ! -name '*.log' -exec rm -rf {} +
+          df -h /
+
       - name: Test
         shell: devenv shell bash -- -e {0}
         env:
