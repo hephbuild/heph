@@ -32,10 +32,11 @@ use std::sync::Arc;
 pub const READ_ONLY_ANNOTATION: &str = "read_only";
 
 /// Input annotation (value `"true"`) forcing per-file staging: the artifact is
-/// hardlinked file-by-file and the list records every file, instead of the
-/// default whole-subtree directory symlink. Set by producers whose consumer
-/// reads the per-input list to enumerate individual files (e.g. exec `tools`,
-/// which flattens each tool file into a `bin/` dir by basename). Without it an
+/// linked file-by-file (see `share_file`) and the list records every file,
+/// instead of the default whole-subtree directory symlink. Set by producers
+/// whose consumer reads the per-input list to enumerate individual files (e.g.
+/// exec `tools`, which flattens each tool file into a `bin/` dir by basename).
+/// Without it an
 /// unfiltered read-only input is exposed as one directory symlink and the list
 /// records only that subtree root — which a per-file consumer cannot use.
 pub const STAGE_PER_FILE_ANNOTATION: &str = "stage_per_file";
@@ -56,9 +57,9 @@ fn sanitize_component(key: &str) -> String {
 ///
 /// `key_prefix` is a debug-only path segment (typically the source addr); the
 /// real cache key is the artifact's content hash, so two producers emitting
-/// identical bytes share one stage entry. `list_path`/`filters` mirror
-/// [`unpack`]: absolute paths of linked files are appended to the list file,
-/// and a non-empty `filters` restricts the exposed set to those exact relative
+/// identical bytes share one stage entry. `list`/`filters` mirror [`unpack`]:
+/// absolute paths of linked files are appended to the list file, and a
+/// non-empty `filters` restricts the exposed set to those exact relative
 /// paths. `filters` is an owned slice (not a closure) so the future stays
 /// `Send` across the lock-acquire await.
 ///
@@ -85,7 +86,7 @@ pub async fn stage_and_link(
     stage_root: &Path,
     key_prefix: &str,
     link_root: &Path,
-    list_path: Option<&Path>,
+    list: Option<&mut ListFile>,
     filters: &[String],
     per_file: bool,
     ctoken: &(dyn Cancellable + Send + Sync),
@@ -95,7 +96,7 @@ pub async fn stage_and_link(
         stage_root,
         key_prefix,
         link_root,
-        list_path,
+        list,
         filters,
         per_file,
         ctoken,
@@ -113,7 +114,7 @@ async fn stage_and_link_with_hook(
     stage_root: &Path,
     key_prefix: &str,
     link_root: &Path,
-    list_path: Option<&Path>,
+    list: Option<&mut ListFile>,
     filters: &[String],
     per_file: bool,
     ctoken: &(dyn Cancellable + Send + Sync),
@@ -124,10 +125,12 @@ async fn stage_and_link_with_hook(
         .with_context(|| format!("hashout for staging ({key_prefix})"))?;
     if hashout.is_empty() {
         // No stable key → nothing to dedup on; behave like the copy path.
+        // Its own append handle on the list interleaves safely with `list`'s:
+        // both append whole writes with `O_APPEND`, nothing is buffered.
         crate::driver_managed::unpack_blocking(
             Arc::clone(content),
             link_root.to_path_buf(),
-            list_path.map(Path::to_path_buf),
+            list.map(|l| l.path().to_path_buf()),
             filters.to_vec(),
         )
         .await
@@ -160,10 +163,15 @@ async fn stage_and_link_with_hook(
     // offloading if a filtered input ever got large — the exec `tools` shape it
     // serves is a handful of files.
     if !filters.is_empty() || per_file {
-        link_tree(&entry, link_root, list_path, filters)
+        let files = StagedFiles {
+            entry: &entry,
+            list: files_list_path(&group_dir, &hashout),
+            ident: hold.ident,
+        };
+        link_tree(&files, link_root, list, filters)
             .with_context(|| format!("link staged {:?} into {:?}", entry, link_root))?;
     } else {
-        link_symlinked(&entry, link_root, list_path)
+        link_symlinked(&entry, link_root, list)
             .with_context(|| format!("symlink staged {:?} into {:?}", entry, link_root))?;
     }
     Ok(Some(hold))
@@ -267,6 +275,9 @@ const HOLD_ATTEMPTS: usize = 8;
 #[derive(Debug)]
 pub struct StageHold {
     path: PathBuf,
+    /// The held entry directory's identity, read under the hold; keys the
+    /// cached file list (see [`files_list_path`]).
+    ident: Option<EntryIdent>,
     _guard: hlock::hlock::FReadGuard,
 }
 
@@ -302,13 +313,46 @@ async fn try_hold(
         .read(ctoken)
         .await
         .with_context(|| format!("hold stage entry {:?}", entry))?;
-    if group_dir.join(format!("{key}.ready")).exists() && entry.is_dir() {
-        Ok(Some(StageHold {
+    if !group_dir.join(format!("{key}.ready")).exists() {
+        return Ok(None);
+    }
+    match std::fs::metadata(&entry) {
+        Ok(md) if md.is_dir() => Ok(Some(StageHold {
+            ident: EntryIdent::of(&md),
             path: entry,
             _guard: guard,
-        }))
-    } else {
-        Ok(None)
+        })),
+        _ => Ok(None),
+    }
+}
+
+/// Which materialization of a stage entry a cached file list describes: the
+/// entry directory's device, inode and change time. A `clear_stage` followed by
+/// a re-materialization makes a new directory, so a list written for the old
+/// one stops matching instead of being trusted for a tree it never saw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EntryIdent {
+    dev: u64,
+    ino: u64,
+    ctime: i64,
+    ctime_nsec: i64,
+}
+
+impl EntryIdent {
+    #[cfg(unix)]
+    fn of(md: &std::fs::Metadata) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt as _;
+        Some(Self {
+            dev: md.dev(),
+            ino: md.ino(),
+            ctime: md.ctime(),
+            ctime_nsec: md.ctime_nsec(),
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn of(_md: &std::fs::Metadata) -> Option<Self> {
+        None
     }
 }
 
@@ -325,40 +369,87 @@ async fn try_hold(
 /// created under the real `@heph/go` without hitting the read-only stage.
 ///
 /// Symlink targets are absolute paths into the persistent read-only stage, so
-/// they outlive the sandbox and teardown just unlinks them. `list_path`, when
+/// they outlive the sandbox and teardown just unlinks them. `list`, when
 /// present, records each created symlink (not every file behind it).
 #[cfg(unix)]
-fn link_symlinked(entry: &Path, link_root: &Path, list_path: Option<&Path>) -> anyhow::Result<()> {
-    use std::io::Write as _;
-
+fn link_symlinked(
+    entry: &Path,
+    link_root: &Path,
+    list: Option<&mut ListFile>,
+) -> anyhow::Result<()> {
     std::fs::create_dir_all(link_root)
         .with_context(|| format!("create link root {:?}", link_root))?;
-    let mut list = match list_path {
-        Some(p) => Some(std::io::BufWriter::new(
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(p)
-                .with_context(|| format!("open list file {:?} (append)", p))?,
-        )),
-        None => None,
-    };
+    let mut listed = list.as_ref().map(|_| Vec::new());
     // `link_root` is a real (shared) directory: merge each staged child into it.
-    merge_dir(entry, link_root, &mut list)?;
-    if let Some(mut l) = list {
-        l.flush().with_context(|| "flush stage list file")?;
+    merge_dir(entry, link_root, &mut listed)?;
+    if let (Some(list), Some(listed)) = (list, listed) {
+        list.append(&listed)?;
     }
     Ok(())
+}
+
+/// An input's list file (`list/input_<origin_id>.list`), opened for append on
+/// first use and kept open while consecutive inputs share it.
+///
+/// Every output of a multi-output tool is its own input with its own stage
+/// entry, all appending to the one list of their shared origin: opening and
+/// closing it per entry was two of the handful of syscalls each one cost. The
+/// caller keeps one of these and swaps it when the path changes
+/// ([`ListFile::reuse`]), so at most one list is open at a time however many
+/// inputs a run has.
+///
+/// Writes are whole and unbuffered, so lines land in call order and interleave
+/// safely with any other `O_APPEND` writer of the same file (the copy path's
+/// `unpack`).
+#[derive(Debug)]
+pub struct ListFile {
+    path: PathBuf,
+    file: Option<std::fs::File>,
+}
+
+impl ListFile {
+    /// A list at `path`, not yet opened (or created).
+    pub fn new(path: PathBuf) -> Self {
+        Self { path, file: None }
+    }
+
+    /// The `ListFile` in `slot` for `path`: the one already there if it is for
+    /// `path`, else a fresh one replacing (and closing) it.
+    pub fn reuse<'s>(slot: &'s mut Option<ListFile>, path: &Path) -> &'s mut ListFile {
+        if slot.as_ref().is_none_or(|l| l.path != path) {
+            *slot = None;
+        }
+        slot.get_or_insert_with(|| ListFile::new(path.to_path_buf()))
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Append `bytes`, creating the file on first use even when `bytes` is
+    /// empty: a consumer opens every input's list, and an empty one is how it
+    /// learns the input placed no files.
+    fn append(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+        use std::io::Write as _;
+        let file = match &mut self.file {
+            Some(f) => f,
+            None => self.file.insert(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&self.path)
+                    .with_context(|| format!("open list file {:?} (append)", self.path))?,
+            ),
+        };
+        file.write_all(bytes)
+            .with_context(|| format!("append to stage list file {:?}", self.path))
+    }
 }
 
 /// `dst` is a real directory shared with other inputs; place each child of the
 /// staged `src` directory into it.
 #[cfg(unix)]
-fn merge_dir(
-    src: &Path,
-    dst: &Path,
-    list: &mut Option<std::io::BufWriter<std::fs::File>>,
-) -> anyhow::Result<()> {
+fn merge_dir(src: &Path, dst: &Path, list: &mut Option<Vec<u8>>) -> anyhow::Result<()> {
     std::fs::create_dir_all(dst).with_context(|| format!("create real dir {:?}", dst))?;
     for ent in std::fs::read_dir(src).with_context(|| format!("read staged dir {:?}", src))? {
         let ent = ent.with_context(|| format!("read entry under {:?}", src))?;
@@ -373,11 +464,7 @@ fn merge_dir(
 /// and recurse on a shared single-child prefix, merge into an existing real dir,
 /// or skip an identical existing symlink.
 #[cfg(unix)]
-fn place_entry(
-    src: &Path,
-    dst: &Path,
-    list: &mut Option<std::io::BufWriter<std::fs::File>>,
-) -> anyhow::Result<()> {
+fn place_entry(src: &Path, dst: &Path, list: &mut Option<Vec<u8>>) -> anyhow::Result<()> {
     use std::io::Write as _;
 
     let src_is_dir = std::fs::metadata(src).map(|m| m.is_dir()).unwrap_or(false);
@@ -556,7 +643,7 @@ fn single_child_dir(dir: &Path) -> anyhow::Result<Option<PathBuf>> {
 fn link_symlinked(
     _entry: &Path,
     _link_root: &Path,
-    _list_path: Option<&Path>,
+    _list: Option<&mut ListFile>,
 ) -> anyhow::Result<()> {
     anyhow::bail!("read-only input staging is only supported on unix")
 }
@@ -587,20 +674,207 @@ fn materialize(content: &dyn Content, entry: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Replicate the directory structure of `entry` inside `link_root`,
-/// **hardlinking** every staged file into place so the consumer sees a plain
-/// regular file (no symlink resolution, sharing the staged inode and its
-/// read-only mode). Staged symlinks are recreated as symlinks — a hardlink to
-/// a symlink has inconsistent cross-platform semantics. Directories are created
-/// as real dirs so multiple inputs can merge into a shared `link_root`. The
-/// stage and the sandbox both live under `<home>`, i.e. one filesystem, so
-/// `hard_link` never hits `EXDEV`. Parents are visited before children
-/// (walkdir's default order) so each link's parent dir already exists.
+/// One held stage entry as [`link_tree`] reads it: the tree, where its cached
+/// file list lives, and the identity that list must carry to be trusted.
+struct StagedFiles<'a> {
+    entry: &'a Path,
+    list: PathBuf,
+    ident: Option<EntryIdent>,
+}
+
+/// The kind of one node in a staged tree, as the per-file layout needs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NodeKind {
+    Dir,
+    File,
+    Symlink,
+}
+
+impl NodeKind {
+    fn tag(self) -> u8 {
+        match self {
+            Self::Dir => b'd',
+            Self::File => b'f',
+            Self::Symlink => b'l',
+        }
+    }
+
+    fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            b'd' => Some(Self::Dir),
+            b'f' => Some(Self::File),
+            b'l' => Some(Self::Symlink),
+            _ => None,
+        }
+    }
+}
+
+/// The sidecar caching an entry's file list: `<group>/<hash>.files`, next to
+/// its `.ready` and `.lock`.
+///
+/// A per-file input (exec `tools`) relinks the whole entry into every sandbox,
+/// and walking the read-only tree to learn its shape — an `opendir`, a
+/// `getdirentries` and a `close` per directory — cost as much as the links
+/// themselves. The tree is immutable once `.ready` is written, so the first
+/// per-file consumer records it and later ones read one file instead.
+///
+/// Compatible in both directions with entries that have none: a binary that
+/// predates the sidecar never reads it (and a `clear_stage` from one leaves it
+/// behind, which the identity check then rejects), and an entry without one is
+/// walked and gets one.
+fn files_list_path(group_dir: &Path, hashout: &str) -> PathBuf {
+    group_dir.join(format!("{hashout}.files"))
+}
+
+/// First line of a cached file list; the version is bumped if the record
+/// format ever changes, and a list with any other header is walked over.
+const FILES_LIST_MAGIC: &str = "heph-stage-files v1";
+
+/// Serialize `nodes` for `ident`: a header line naming the entry directory's
+/// identity, then one `<tag><relative path>\0` record per node in walk order
+/// (parents before children). NUL is the one byte a path cannot hold.
+#[cfg(unix)]
+fn encode_files_list(ident: EntryIdent, nodes: &[(NodeKind, PathBuf)]) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let mut out = format!(
+        "{FILES_LIST_MAGIC} {} {} {} {}\n",
+        ident.dev, ident.ino, ident.ctime, ident.ctime_nsec
+    )
+    .into_bytes();
+    for (kind, rel) in nodes {
+        out.push(kind.tag());
+        out.extend_from_slice(rel.as_os_str().as_bytes());
+        out.push(0);
+    }
+    out
+}
+
+/// Parse a cached file list, or `None` when it is not one for `ident` — a
+/// different header or version, another materialization's identity, or a
+/// malformed record. `None` only ever means "walk the tree instead".
+#[cfg(unix)]
+fn decode_files_list(bytes: &[u8], ident: EntryIdent) -> Option<Vec<(NodeKind, PathBuf)>> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let nl = bytes.iter().position(|&b| b == b'\n')?;
+    let (header, rest) = bytes.split_at(nl);
+    let expected = format!(
+        "{FILES_LIST_MAGIC} {} {} {} {}",
+        ident.dev, ident.ino, ident.ctime, ident.ctime_nsec
+    );
+    if header != expected.as_bytes() {
+        return None;
+    }
+    let body = rest.get(1..)?;
+    if body.is_empty() {
+        return Some(Vec::new());
+    }
+    // Every record ends in NUL, so a well-formed body does too; a list cut
+    // short anywhere fails here or in the record check below.
+    let body = body.strip_suffix(&[0])?;
+    body.split(|&b| b == 0)
+        .map(|rec| {
+            let (&tag, path) = rec.split_first()?;
+            let kind = NodeKind::from_tag(tag)?;
+            let rel = Path::new(std::ffi::OsStr::from_bytes(path));
+            // Only a plain relative path below the entry: anything that could
+            // name a place outside it is not a list this code wrote.
+            let plain = !path.is_empty()
+                && rel
+                    .components()
+                    .all(|c| matches!(c, std::path::Component::Normal(_)));
+            plain.then(|| (kind, rel.to_path_buf()))
+        })
+        .collect()
+}
+
+/// Walk `entry` (parents before children, symlinks not followed) into the
+/// per-file layout's node list.
+#[cfg(unix)]
+fn walk_staged(entry: &Path) -> anyhow::Result<Vec<(NodeKind, PathBuf)>> {
+    let mut nodes = Vec::new();
+    for ent in walkdir::WalkDir::new(entry) {
+        let ent = ent.with_context(|| format!("walk staged tree {:?}", entry))?;
+        let rel = match ent.path().strip_prefix(entry) {
+            Ok(r) if r.as_os_str().is_empty() => continue, // the root itself
+            Ok(r) => r.to_path_buf(),
+            Err(e) => return Err(e).with_context(|| format!("strip {:?}", ent.path())),
+        };
+        let ft = ent.file_type();
+        let kind = if ft.is_dir() {
+            NodeKind::Dir
+        } else if ft.is_symlink() {
+            NodeKind::Symlink
+        } else {
+            NodeKind::File
+        };
+        nodes.push((kind, rel));
+    }
+    Ok(nodes)
+}
+
+/// The held entry's nodes: from its cached file list when that list belongs to
+/// this materialization, else by walking the tree — then cached for the next
+/// consumer.
+///
+/// The write is best-effort and atomic (a unique temp, then `rename`), so a
+/// reader sees a whole list or none, and two consumers writing at once write
+/// the same bytes. It happens under the shared hold, which keeps `clear_stage`
+/// (exclusive) from removing the entry meanwhile.
+#[cfg(unix)]
+fn staged_nodes(files: &StagedFiles<'_>) -> anyhow::Result<Vec<(NodeKind, PathBuf)>> {
+    let Some(ident) = files.ident else {
+        return walk_staged(files.entry);
+    };
+    match std::fs::read(&files.list) {
+        Ok(bytes) => {
+            if let Some(nodes) = decode_files_list(&bytes, ident) {
+                return Ok(nodes);
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            tracing::debug!(error = %e, path = %files.list.display(), "read cached stage file list");
+        }
+    }
+    let nodes = walk_staged(files.entry)?;
+    if let Err(e) = write_files_list(&files.list, &encode_files_list(ident, &nodes)) {
+        tracing::debug!(error = %format!("{e:#}"), path = %files.list.display(), "cache stage file list");
+    }
+    Ok(nodes)
+}
+
+/// Write `bytes` to `path` through a temp file unique to this process and call.
+#[cfg(unix)]
+fn write_files_list(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".tmp-{}-{seq}", std::process::id()));
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, bytes).with_context(|| format!("write {:?}", tmp))?;
+    std::fs::rename(&tmp, path).with_context(|| {
+        // Best-effort: the temp is ours alone, nothing else will remove it.
+        drop(std::fs::remove_file(&tmp));
+        format!("rename {:?} -> {:?}", tmp, path)
+    })
+}
+
+/// Replicate the directory structure of the held entry inside `link_root`,
+/// placing every staged file with [`share_file`] (a hardlink, or an APFS clone
+/// on macOS) so the consumer sees a plain regular file with the staged bytes
+/// and read-only mode — no symlink resolution. Staged symlinks are recreated as
+/// symlinks — a hardlink to a symlink has inconsistent cross-platform
+/// semantics. Directories are created as real dirs so multiple inputs can merge
+/// into a shared `link_root`. The stage and the sandbox both live under
+/// `<home>`, i.e. one filesystem, so a link never hits `EXDEV`. Parents come
+/// before children (walk order, and the cached list keeps it) so each link's
+/// parent dir already exists. The list file gets every placed path in that
+/// order, in one append.
 #[cfg(unix)]
 fn link_tree(
-    entry: &Path,
+    files: &StagedFiles<'_>,
     link_root: &Path,
-    list_path: Option<&Path>,
+    list: Option<&mut ListFile>,
     filters: &[String],
 ) -> anyhow::Result<()> {
     use std::io::Write as _;
@@ -608,29 +882,14 @@ fn link_tree(
     std::fs::create_dir_all(link_root)
         .with_context(|| format!("create link root {:?}", link_root))?;
 
-    let mut list = match list_path {
-        Some(p) => Some(std::io::BufWriter::new(
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(p)
-                .with_context(|| format!("open list file {:?} (append)", p))?,
-        )),
-        None => None,
-    };
-
-    // Compiled once, outside the walk.
+    let nodes = staged_nodes(files)?;
+    // Compiled once, outside the loop.
     let filters = hcore::hartifactcontent::PathFilter::new(filters);
+    let mut listed: Vec<u8> = Vec::new();
 
-    for ent in walkdir::WalkDir::new(entry) {
-        let ent = ent.with_context(|| format!("walk staged tree {:?}", entry))?;
-        let rel = match ent.path().strip_prefix(entry) {
-            Ok(r) if r.as_os_str().is_empty() => continue, // the root itself
-            Ok(r) => r,
-            Err(e) => return Err(e).with_context(|| format!("strip {:?}", ent.path())),
-        };
+    for (kind, rel) in &nodes {
         let dst = link_root.join(rel);
-        if ent.file_type().is_dir() {
+        if *kind == NodeKind::Dir {
             std::fs::create_dir_all(&dst)
                 .with_context(|| format!("create linked dir {:?}", dst))?;
             continue;
@@ -638,13 +897,17 @@ fn link_tree(
         if !filters.matches(rel) {
             continue;
         }
+        let staged = files.entry.join(rel);
         // A prior input may have linked the same relative path into a shared
         // root; the staged bytes are identical, so replace it.
-        link_one(ent.path(), &dst, ent.file_type().is_symlink())
-            .with_context(|| format!("link {:?} -> {:?}", dst, ent.path()))?;
-        if let Some(list) = list.as_mut() {
-            writeln!(list, "{}", dst.display()).with_context(|| "append to stage list file")?;
-        }
+        link_one(&staged, &dst, *kind == NodeKind::Symlink)
+            .with_context(|| format!("link {:?} -> {:?}", dst, staged))?;
+        writeln!(listed, "{}", dst.display()).with_context(|| "append to stage list buffer")?;
+    }
+
+    // Appended (so created) even when nothing was placed; see `ListFile::append`.
+    if let Some(list) = list {
+        list.append(&listed)?;
     }
     Ok(())
 }
@@ -717,9 +980,9 @@ fn share_file(staged: &Path, dst: &Path) -> std::io::Result<()> {
 
 #[cfg(not(unix))]
 fn link_tree(
-    _entry: &Path,
+    _files: &StagedFiles<'_>,
     _link_root: &Path,
-    _list_path: Option<&Path>,
+    _list: Option<&mut ListFile>,
     _filters: &[String],
 ) -> anyhow::Result<()> {
     anyhow::bail!("read-only input staging is only supported on unix")
@@ -808,6 +1071,15 @@ pub fn clear_stage(stage_root: &Path) -> (usize, u64) {
                     tracing::warn!(error = %e, path = %ready.display(), "clear_stage: remove ready");
                     continue;
                 }
+            }
+            // The cached file list describes this materialization only. Left
+            // behind it would be harmless (its identity no longer matches the
+            // next one), just litter.
+            let files = files_list_path(&gpath, &hash);
+            if let Err(e) = std::fs::remove_file(&files)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(error = %e, path = %files.display(), "clear_stage: remove file list");
             }
             #[cfg(all(test, unix))]
             tests::clear_stage_step(&entry_dir);
@@ -1175,6 +1447,258 @@ pub(crate) mod tests {
         }
     }
 
+    /// Stage a two-file tool per-file into `ws` and return the files list path
+    /// for it, so a test can inspect or tamper with the cached list between
+    /// consumers.
+    async fn stage_two_file_tool(tmp: &Path, ws: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let stage = tmp.join("stage");
+        let link = tmp.join(ws);
+        let list = tmp.join(format!("{ws}.list"));
+        let c = content(
+            "tool1",
+            &[
+                ("tools/bin/node", "NODE", true),
+                ("tools/bin/npm", "NPM", true),
+            ],
+        );
+        let mut lf = ListFile::new(list.clone());
+        stage_and_link(
+            &c,
+            &stage,
+            "nodejs24",
+            &link,
+            Some(&mut lf),
+            &[],
+            true,
+            &ct(),
+        )
+        .await
+        .expect("per-file stage");
+        (stage.join("nodejs24/tool1.files"), link, list)
+    }
+
+    fn listed(list: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_to_string(list)
+            .expect("read list")
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// The first per-file consumer caches the entry's file list; later ones
+    /// read it instead of walking the tree. Proven by editing the cached list
+    /// (keeping its header): the next consumer places exactly what it names.
+    #[tokio::test]
+    async fn per_file_consumers_reuse_the_cached_file_list() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (files, link1, list1) = stage_two_file_tool(tmp.path(), "ws1").await;
+        assert_eq!(
+            listed(&list1),
+            vec![
+                link1.join("tools/bin/node").display().to_string(),
+                link1.join("tools/bin/npm").display().to_string(),
+            ]
+        );
+        let cached = std::fs::read(&files).expect("first consumer caches the list");
+
+        // Drop the `npm` record, keep everything else byte for byte.
+        let npm_rec: &[u8] = b"ftools/bin/npm\0";
+        let at = cached
+            .windows(npm_rec.len())
+            .position(|w| w == npm_rec)
+            .expect("npm record in the cached list");
+        let mut edited = cached.clone();
+        edited.drain(at..at + npm_rec.len());
+        std::fs::write(&files, &edited).expect("edit cached list");
+
+        let (_, link2, list2) = stage_two_file_tool(tmp.path(), "ws2").await;
+        assert_eq!(
+            listed(&list2),
+            vec![link2.join("tools/bin/node").display().to_string()],
+            "the second consumer must take its files from the cached list"
+        );
+        assert!(!link2.join("tools/bin/npm").exists());
+    }
+
+    /// A cached list that is not this materialization's — another identity in
+    /// its header (an entry cleared and re-made), another version, or bytes
+    /// that do not parse — is walked over and replaced, never trusted.
+    #[tokio::test]
+    async fn an_unusable_cached_file_list_is_walked_over_and_replaced() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (files, _, _) = stage_two_file_tool(tmp.path(), "ws0").await;
+        let good = std::fs::read(&files).expect("cached list");
+
+        let stale_identity = format!("{FILES_LIST_MAGIC} 0 0 0 0\nftools/bin/node\0").into_bytes();
+        let other_version = b"heph-stage-files v0 1 2 3 4\nftools/bin/node\0".to_vec();
+        let mut truncated = good.clone();
+        truncated.pop(); // the last record's NUL
+        let cases: [(&str, Vec<u8>); 4] = [
+            ("stale identity", stale_identity),
+            ("other version", other_version),
+            ("truncated", truncated),
+            ("garbage", b"\xff\xfe not a list".to_vec()),
+        ];
+        for (i, (what, bytes)) in cases.into_iter().enumerate() {
+            std::fs::write(&files, &bytes).expect("plant list");
+            let (_, link, list) = stage_two_file_tool(tmp.path(), &format!("ws{}", i + 1)).await;
+            assert_eq!(
+                listed(&list),
+                vec![
+                    link.join("tools/bin/node").display().to_string(),
+                    link.join("tools/bin/npm").display().to_string(),
+                ],
+                "{what}: both files placed from a walk"
+            );
+            assert_eq!(
+                std::fs::read(&files).expect("list rewritten"),
+                good,
+                "{what}: the list is replaced by a correct one"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn decode_files_list_rejects_what_it_did_not_write() {
+        let ident = EntryIdent {
+            dev: 1,
+            ino: 2,
+            ctime: 3,
+            ctime_nsec: 4,
+        };
+        let head = format!("{FILES_LIST_MAGIC} 1 2 3 4\n");
+        let ok = |body: &[u8]| {
+            let mut b = head.clone().into_bytes();
+            b.extend_from_slice(body);
+            decode_files_list(&b, ident)
+        };
+        assert_eq!(ok(b""), Some(Vec::new()), "an empty tree");
+        assert_eq!(
+            ok(b"dx\0fx/a\0lx/b\0"),
+            Some(vec![
+                (NodeKind::Dir, PathBuf::from("x")),
+                (NodeKind::File, PathBuf::from("x/a")),
+                (NodeKind::Symlink, PathBuf::from("x/b")),
+            ])
+        );
+        assert_eq!(
+            ok("fx/caf\u{e9} \n\0".as_bytes()),
+            Some(vec![(NodeKind::File, PathBuf::from("x/caf\u{e9} \n"))]),
+            "non-ASCII and a newline inside a name survive"
+        );
+        for (what, body) in [
+            ("parent component", &b"f../escape\0"[..]),
+            ("absolute path", b"f/etc/passwd\0"),
+            ("dot component", b"f./a\0"),
+            ("empty path", b"f\0"),
+            ("empty record", b"fa\0\0"),
+            ("unknown tag", b"xa\0"),
+            ("no trailing NUL", b"fa"),
+        ] {
+            assert_eq!(ok(body), None, "{what} must be rejected");
+        }
+        let near_miss = format!("{FILES_LIST_MAGIC} 1 2 3 40\nfa\0");
+        assert_eq!(
+            decode_files_list(near_miss.as_bytes(), ident),
+            None,
+            "an identity that only shares a prefix is another identity"
+        );
+        assert_eq!(decode_files_list(b"", ident), None, "no header");
+    }
+
+    /// Inputs that share a list share one open `ListFile`: every entry's files
+    /// land in it in call order, interleaved correctly with another appender of
+    /// the same file (the copy path's `unpack`), and a list for another path
+    /// replaces it rather than writing there.
+    #[tokio::test]
+    async fn a_reused_list_file_records_every_input_in_order() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let stage = tmp.path().join("stage");
+        let link = tmp.path().join("ws");
+        let list = tmp.path().join("input_7.list");
+        let other = tmp.path().join("input_8.list");
+        let a = content("ha", &[("x/a", "A", true)]);
+        let b = content("hb", &[("x/b", "B", true)]);
+        let c = content("hc", &[("x/c", "C", true)]);
+
+        let mut slot: Option<ListFile> = None;
+        stage_and_link(
+            &a,
+            &stage,
+            "t",
+            &link,
+            Some(ListFile::reuse(&mut slot, &list)),
+            &[],
+            true,
+            &ct(),
+        )
+        .await
+        .expect("stage a");
+        assert!(slot.as_ref().is_some_and(|l| l.file.is_some()), "kept open");
+        // Another writer appends between two staged inputs.
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&list)
+                .expect("open");
+            writeln!(f, "{}", link.join("x/copied").display()).expect("append");
+        }
+        stage_and_link(
+            &b,
+            &stage,
+            "t",
+            &link,
+            Some(ListFile::reuse(&mut slot, &list)),
+            &[],
+            true,
+            &ct(),
+        )
+        .await
+        .expect("stage b");
+        stage_and_link(
+            &c,
+            &stage,
+            "t",
+            &link,
+            Some(ListFile::reuse(&mut slot, &other)),
+            &[],
+            true,
+            &ct(),
+        )
+        .await
+        .expect("stage c");
+        assert_eq!(slot.as_ref().map(ListFile::path), Some(other.as_path()));
+
+        let lines = |p: &Path| -> Vec<String> {
+            std::fs::read_to_string(p)
+                .expect("read")
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        };
+        assert_eq!(
+            lines(&list),
+            ["x/a", "x/copied", "x/b"]
+                .map(|f| link.join(f).display().to_string())
+                .to_vec()
+        );
+        assert_eq!(lines(&other), vec![link.join("x/c").display().to_string()]);
+    }
+
+    #[tokio::test]
+    async fn clear_stage_removes_the_cached_file_list() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (files, _, _) = stage_two_file_tool(tmp.path(), "ws").await;
+        assert!(files.exists());
+        let (removed, _) = clear_stage(&tmp.path().join("stage"));
+        assert_eq!(removed, 1);
+        assert!(!files.exists(), "the list goes with its entry");
+    }
+
     #[tokio::test]
     async fn per_file_input_lists_each_file_not_the_subtree_root() {
         // `per_file` (exec tools) must hardlink each file and record every file
@@ -1193,9 +1717,19 @@ pub(crate) mod tests {
             ],
         );
 
-        stage_and_link(&c, &stage, "nodejs24", &link, Some(&list), &[], true, &ct())
-            .await
-            .expect("per-file stage");
+        let mut lf = ListFile::new(list.clone());
+        stage_and_link(
+            &c,
+            &stage,
+            "nodejs24",
+            &link,
+            Some(&mut lf),
+            &[],
+            true,
+            &ct(),
+        )
+        .await
+        .expect("per-file stage");
 
         // Each file is a real (hardlinked) file, not a directory symlink.
         for f in ["tools/bin/node", "tools/bin/npm"] {
@@ -1463,7 +1997,8 @@ pub(crate) mod tests {
                 ("tools/bin/npm", "NPM", true),
             ],
         );
-        stage_and_link(&b, &stage, "t", &link, Some(&list_b), &[], false, &ct())
+        let mut lf = ListFile::new(list_b.clone());
+        stage_and_link(&b, &stage, "t", &link, Some(&mut lf), &[], false, &ct())
             .await
             .expect("second must merge, not collide");
 
@@ -1529,7 +2064,8 @@ pub(crate) mod tests {
         let list = tmp.path().join("input.list");
         let c = content("a1", &[("x.txt", "x", false)]);
 
-        stage_and_link(&c, &stage, "k", &link, Some(&list), &[], false, &ct())
+        let mut lf = ListFile::new(list.clone());
+        stage_and_link(&c, &stage, "k", &link, Some(&mut lf), &[], false, &ct())
             .await
             .expect("stage");
 

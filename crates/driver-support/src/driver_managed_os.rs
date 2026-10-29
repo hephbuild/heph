@@ -74,6 +74,9 @@ impl ManagedDriverOs {
 
         let mut inputs: Vec<ManagedRunInput> = Vec::new();
         let mut holds: Vec<crate::stage::StageHold> = Vec::new();
+        // The list the last staged input appended to, still open: a
+        // multi-output tool's inputs are adjacent and share one.
+        let mut open_list: Option<crate::stage::ListFile> = None;
         for (unpack_root, group) in groups {
             fs::create_dir_all(&unpack_root)
                 .with_context(|| format!("create unpack root {:?}", unpack_root))?;
@@ -86,7 +89,9 @@ impl ManagedDriverOs {
                             stage_dir,
                             &input.source_addr.format(),
                             unpack_root.as_path(),
-                            list_path.as_deref(),
+                            list_path
+                                .as_deref()
+                                .map(|p| crate::stage::ListFile::reuse(&mut open_list, p)),
                             &input.filters,
                             crate::stage::is_per_file(&input.annotations),
                             ctoken,
