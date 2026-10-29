@@ -31,8 +31,13 @@ a multi-target selection: it is invoked on its own, by address.
 Refused on an entrypoint, each with what to do instead: `out`, `cache`,
 `codegen`, `support_files`, `read_only_deps`, `pass_env`, `runtime_pass_env`,
 `runtime_env`, `runner`. An `exec` argv element naming `$SRC_x`, `$TOOL_x` or
-`$OUT` is refused too: exec has no shell to expand it. Use
-`${src://<pkg>:<name>}`, or `driver = "bash"`.
+`$OUT` is refused too — even inside `["sh", "-c", "…"]`: exec passes its argv
+as written, and heph cannot tell a variable meant for a shell you start from
+literal text handed to the program. Use `${src://<pkg>:<name>}` for a dep's
+path, or `driver = "bash"`, where the shell expands `$SRC_x` (single-quote a
+literal `$`, as in awk's `'$OUT'`).
+
+Entrypoints always run on the OS sandbox: `fuse.enabled` is ignored for them.
 
 ## What the tool sees
 
@@ -47,8 +52,10 @@ Refused on an entrypoint, each with what to do instead: `out`, `cache`,
   invocations of the same target run concurrently, each in its own sandbox,
   which is removed when the tool exits.
 - **Terminal and signals**: the tool inherits heph's stdin, stdout and stderr,
-  and the signal dispositions heph itself inherited (under `nohup`, SIGINT stays
-  ignored). The open-file limit is yours, not heph's raised one.
+  and the signal dispositions and signal mask heph itself inherited (under
+  `nohup`, SIGINT stays ignored; under `trap '' PIPE`, SIGPIPE stays ignored).
+  The open-file limit is yours, not heph's raised one — for every driver,
+  plugin drivers included.
 
 ## Exit status
 
@@ -74,11 +81,22 @@ transparent: every signal is the tool's, and heph acts on none of them.
   runner stopping the job — is forwarded to the tool once: TERM, HUP, INT, QUIT,
   USR1, USR2 and WINCH. heph then exits with the tool's status, so `timeout`
   leaves no tool behind.
+- Two limits of sharing the terminal's process group:
+  - While heph is the terminal's foreground job, a `kill -INT`, `-QUIT` or
+    `-HUP` sent to heph's pid from elsewhere is dropped: heph cannot tell it
+    from the terminal's own, which has already reached the tool. TERM, USR1
+    and USR2 always arrive.
+  - A signal sent to the whole group (`kill -TERM -<pgid>`, `kill 0` from a
+    script in it) reaches the tool directly *and* through heph, so it may
+    arrive twice.
 - A tool that traps INT and QUIT and keeps running can still be stopped with
   `kill -9 <heph pid>`: heph's supervisor then kills and reaps the tool.
 
 Before the tool starts — dependencies building, the closure being copied —
-Ctrl-C cancels the run as it does any build.
+heph is an ordinary run: Ctrl-C cancels it, TERM and HUP end it, SIGQUIT
+writes its diagnostic dump, as for any command. Nothing sent then is held for
+the tool. While the TUI has stepped aside, copying a large closure prints
+nothing; it is still heph's, and Ctrl-C still cancels it.
 
 ## What will it run?
 
@@ -88,7 +106,10 @@ parameters. `show` prints the command `run` would execute, with the arguments
 quoted; `run` runs it (`run --port 5000` replaces the arguments for that call);
 `exit 3` leaves the shell and heph exits 3.
 
-`heph inspect def //web:dev` shows `"runs_as": "exec, entrypoint (uncached)"`.
+`heph inspect def //web:dev` shows `"runs_as": "exec, entrypoint (uncached)"`,
+a line for people. A script or an agent reads `target_def.entrypoint` from the
+same output instead: `{"accepts_args": true, "workdir": "caller"}`, absent
+for a target that is not an entrypoint.
 
 ## Plugins
 

@@ -156,10 +156,13 @@ pub(crate) fn refuse_literal_closure_vars(
     for (i, word) in run.iter().enumerate() {
         if let Some(var) = literal_closure_var(word.raw()) {
             anyhow::bail!(
-                "`run[{i}]` of {addr}, an entrypoint `exec` target, names `{var}`, which exec \
-                 cannot expand: there is no shell, so the program would receive the text \
-                 {var:?} itself. Use `${{src://<pkg>:<name>}}` for a dep's path, or \
-                 `driver = \"bash\"` to have a shell expand `$SRC_<group>`"
+                "`run[{i}]` of {addr}, an entrypoint `exec` target, names `{var}`. exec passes \
+                 its argv as written, with no shell of its own, and heph cannot tell a `{var}` \
+                 meant for a shell you start (`sh -c`) from literal text handed to the \
+                 program — so it is refused even inside `sh -c`. Use \
+                 `${{src://<pkg>:<name>}}` for a dep's path, or `driver = \"bash\"`, where \
+                 the shell expands `$SRC_<group>` (single-quote a literal, as in awk's \
+                 '$OUT')"
             );
         }
     }

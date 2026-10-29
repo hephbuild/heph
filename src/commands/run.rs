@@ -135,9 +135,12 @@ pub struct RunArgs {
     /// cancelled it before the program started; 1 when the target could not
     /// be resolved at all. Nothing but the program writes to stdout.
     ///
-    /// While the program runs, every signal is the program's: Ctrl-C,
-    /// Ctrl-\ and signals sent to the run's own pid reach it once, and the
-    /// run acts on none of them. A program that traps INT and QUIT is
+    /// Until the program starts, the run is like any other: Ctrl-C cancels
+    /// it, TERM and HUP end it. While the program runs, every signal is the
+    /// program's: Ctrl-C, Ctrl-\ and signals sent to the run's own pid reach
+    /// it once (a `kill -INT` of the pid while the run owns the terminal is
+    /// taken for the terminal's own; see docs/ENTRYPOINTS.md), and the run
+    /// acts on none of them. A program that traps INT and QUIT is
     /// stopped with `kill -9` on the run's pid; its supervisor then reaps
     /// the program. `--shell` opens a shell with the same command ready:
     /// `show` prints what `run` would execute.

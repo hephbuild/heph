@@ -28,7 +28,8 @@ pub struct Args {
 struct DefView<'a> {
     /// How `heph run` treats the target, when it is not built like the rest:
     /// `exec, entrypoint (uncached)` (R20). Omitted for an ordinary target, so
-    /// its output is unchanged.
+    /// its output is unchanged. A string for humans: a program keys on
+    /// `target_def.entrypoint` (`accepts_args`, `workdir`) instead.
     #[serde(skip_serializing_if = "Option::is_none")]
     runs_as: Option<String>,
     target_def: &'a TargetDef,
@@ -133,6 +134,13 @@ mod tests {
             applied_transitive: None,
         })?;
         assert_eq!(ep["runs_as"], "exec, entrypoint (uncached)");
+        // The machine-readable form agents key on: whether it takes args and
+        // where it runs.
+        assert_eq!(
+            ep["target_def"]["entrypoint"],
+            serde_json::json!({"accepts_args": false, "workdir": "caller"}),
+            "{ep}"
+        );
         Ok(())
     }
 }
