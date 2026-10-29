@@ -131,9 +131,17 @@ impl InvokeSandbox {
             let owner = match claim(&dir) {
                 Ok(owner) => owner,
                 // A sweeper took the fresh `.owner-pending` for a crash's
-                // leftover in the instant before we locked it, and is removing
-                // the directory: take another name.
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                // leftover in the instant before we locked it: it is removing
+                // the directory (`WouldBlock`), or already has, under the open
+                // or the rename (`NotFound`). Take another name.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::NotFound
+                    ) =>
+                {
+                    continue;
+                }
                 Err(e) => {
                     // Ours, and nobody else's yet: leave nothing behind.
                     drop(hcore::fsutil::remove_dir_all(&dir));
@@ -452,6 +460,42 @@ mod tests {
         sbx.teardown()?;
         assert!(!parent.join("fresh").exists(), "teardown removes it");
         Ok(())
+    }
+
+    /// A sweeper running while invocations create their sandboxes never fails
+    /// a create: whether it took the fresh `.owner-pending` before the creator
+    /// locked it (`WouldBlock`) or had already removed the directory
+    /// (`NotFound` from the open or the rename), the creator takes another
+    /// name. 16 concurrent invocations hit the second case about 1 in 120.
+    #[test]
+    fn create_survives_a_concurrent_sweep() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let parent = tmp.path().join("p");
+        std::fs::create_dir_all(&parent)?;
+        let done = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| -> anyhow::Result<()> {
+            s.spawn(|| {
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    sweep(&parent);
+                }
+            });
+            let creators: Vec<_> = (0..8)
+                .map(|_| {
+                    s.spawn(|| -> anyhow::Result<()> {
+                        for _ in 0..300 {
+                            InvokeSandbox::create(&parent, None)?.teardown()?;
+                        }
+                        Ok(())
+                    })
+                })
+                .collect();
+            let results: Vec<_> = creators.into_iter().map(|h| h.join()).collect();
+            done.store(true, std::sync::atomic::Ordering::Relaxed);
+            for r in results {
+                r.map_err(|p| anyhow::anyhow!("creator panicked: {p:?}"))??;
+            }
+            Ok(())
+        })
     }
 
     /// The env var under which the test re-execs itself as a lock holder.
