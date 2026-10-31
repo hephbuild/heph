@@ -199,6 +199,13 @@ impl RawTerminal {
     pub fn restore(&self) {
         restore_in_foreground(self.fd, &self.original);
     }
+
+    /// [`restore`](Self::restore), as a closure with a life of its own: for a
+    /// path that runs no destructor. It needs nothing but the terminal.
+    pub fn restorer(&self) -> impl Fn() + Send + Sync + 'static {
+        let (fd, original) = (self.fd, self.original);
+        move || restore_in_foreground(fd, &original)
+    }
 }
 
 fn restore_in_foreground(fd: RawFd, original: &libc::termios) {
