@@ -592,6 +592,20 @@ fn self_sigstop_suspends_and_resumes() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// heph leading its session, as under `ssh -t host heph run //x` or `tmux new
+/// heph …`: the parent is not in the session, so no shell there could resume a
+/// stopped heph, and it must not stop. The tool carries on.
+#[test]
+fn self_stop_as_session_leader_continues_the_tool() -> anyhow::Result<()> {
+    let dist = Dist::locate();
+    let ws = workspace()?;
+    let mut pty = Pty::spawn(&dist, ws.root(), &["run", "//app:stopper"], &[]);
+    pty.wait_for("about-to-stop", DEADLINE);
+    pty.wait_for("resumed-after-fg", SHORT);
+    assert_eq!(pty.wait_exit(SHORT), Ended::Code(4), "{}", pty.seen());
+    Ok(())
+}
+
 /// The tool dies while heph is stopped and cannot reap it. On `fg` the continue
 /// finds nobody and no error comes of it, and the status is the tool's.
 #[test]
