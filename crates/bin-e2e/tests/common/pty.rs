@@ -27,7 +27,7 @@ pub const ROWS: u16 = 40;
 pub const COLS: u16 = 140;
 const POLL: Duration = Duration::from_millis(20);
 /// How long the reader blocks before looking whether the terminal was closed.
-const READER_TICK_US: i32 = 50_000;
+const READER_TICK_US: libc::suseconds_t = 50_000;
 
 /// How the child ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
