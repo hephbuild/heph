@@ -1357,6 +1357,9 @@ fn pull_run_start(req: &DynItemStream) -> Result<(String, pb::ManagedRunRequest)
         Some(pb::run_in_frame::Msg::Signal(signo)) => {
             anyhow::bail!("run: the first frame is a signal ({signo}), not a start frame")
         }
+        Some(pb::run_in_frame::Msg::Cont(_)) => {
+            anyhow::bail!("run: the first frame is a continue, not a start frame")
+        }
         None => anyhow::bail!("run: the first frame is empty, not a start frame"),
     }
 }
@@ -1377,9 +1380,10 @@ async fn run_bidi(
     // A run in the caller's terminal keeps reading the request stream for the
     // signals the host relays. Only that run: a captured one has nothing more to
     // read, and drops the stream here.
-    if let Some(signals) = start.signals.take() {
-        spawn_signal_reader(req, signals);
+    if let Some(signals) = start.channels.signals.take() {
+        spawn_signal_reader(req, signals, start.channels.continues.take());
     }
+    let stops = start.channels.stops.take();
     // The run shells out via the reactor — execute on the cdylib's own runtime,
     // feeding RunOutFrames into a channel the host drains. (Live stdin/stdout will
     // ride `req` / the channel later; today only the terminal result is sent.)
@@ -1388,9 +1392,26 @@ async fn run_bidi(
     let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
     hcore::hmemoizer::spawn_on_with_cycle_ctx(cdylib_runtime().handle(), async move {
         let guard = cancels.enter(&request_id);
+        // The tool's stops ride the response stream too, on a run with a PTY.
+        // A task of its own: `run_once` holds the run's whole lifetime.
+        let stop_forward = stops.map(|mut stops| {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                while stops.recv().await.is_some() {
+                    let frame = pb::RunOutFrame {
+                        msg: Some(pb::run_out_frame::Msg::Stopped(true)),
+                        ..Default::default()
+                    };
+                    drop(tx.send(frame.encode_to_vec()).await);
+                }
+            })
+        });
         // `tx` carries both the live output frames and the terminal one, in that
         // order, so the host sees the log before the result that ends the stream.
         let out = run_once(driver, request_id, start, &tx, guard.token()).await;
+        if let Some(stop_forward) = stop_forward {
+            stop_forward.abort();
+        }
         // Host gone => receiver dropped; ignore send failure.
         drop(tx.send(out.encode_to_vec()).await);
     });
@@ -1406,18 +1427,27 @@ async fn run_bidi(
 /// the stream, which a host does only after it read the run's terminal frame
 /// (N11) — and an older host does right after `start`. Either way the end drops
 /// the sender, which the driver reads as "no more signals", never a cancel. The
-/// run's terminal frame never waits on this thread.
-fn spawn_signal_reader(req: DynItemStream, signals: hplugin::driver::SignalSender) {
+/// run's terminal frame never waits on this thread. On a PTY run it carries each
+/// `RunInFrame.cont` into [`PtyStdio::continues`](hplugin::driver::PtyStdio::continues).
+fn spawn_signal_reader(
+    req: DynItemStream,
+    signals: hplugin::driver::SignalSender,
+    continues: Option<hplugin::driver::ContinueSender>,
+) {
     let spawned = std::thread::Builder::new()
         .name("heph-run-signals".to_string())
-        .spawn(move || read_signal_frames(&req, &signals));
+        .spawn(move || read_signal_frames(&req, &signals, continues.as_ref()));
     if let Err(e) = spawned {
         // The run still goes ahead; it only loses the relay.
         tracing::warn!(error = %e, "could not start the run's signal reader; signals sent to heph will not reach the tool");
     }
 }
 
-fn read_signal_frames(req: &DynItemStream, signals: &hplugin::driver::SignalSender) {
+fn read_signal_frames(
+    req: &DynItemStream,
+    signals: &hplugin::driver::SignalSender,
+    continues: Option<&hplugin::driver::ContinueSender>,
+) {
     loop {
         let bytes = req.next();
         if bytes.is_empty() {
@@ -1439,6 +1469,11 @@ fn read_signal_frames(req: &DynItemStream, signals: &hplugin::driver::SignalSend
                     .is_err()
                 {
                     return;
+                }
+            }
+            Some(pb::run_in_frame::Msg::Cont(_)) => {
+                if let Some(continues) = continues {
+                    let _forwarded = continues.send(());
                 }
             }
             // Live stdin is not wired; an inherited run reads the terminal itself.
@@ -1549,18 +1584,22 @@ struct RunStart {
     deferred: std::collections::BTreeMap<String, hplugin::driver::DeferredValue>,
     /// The run's caller-side options; default for every build.
     options: hplugin::driver::RunOptions,
-    /// Feeds `options`' signal receiver, for a run in the caller's terminal.
-    signals: Option<hplugin::driver::SignalSender>,
+    /// What the run's streams feed, for a run in the caller's terminal.
+    channels: convert::RunChannels,
 }
 
 impl RunStart {
     fn from_pb(req: pb::ManagedRunRequest) -> Result<Self> {
         let path = |v: Option<String>, field| required(v, field).map(PathBuf::from);
-        let (options, signals) = convert::run_options_from_pb(req.options.into_option())
-            .context("decoding the run's options")?;
+        // A cdylib shares the host's process, so a PTY slave's number is good.
+        let (options, channels) = convert::run_options_from_pb(
+            req.options.into_option(),
+            convert::FdScope::SharedProcess,
+        )
+        .context("decoding the run's options")?;
         Ok(Self {
             options,
-            signals,
+            channels,
             shell: req.shell.unwrap_or(false),
             target: convert::target_def_from_pb(required_msg(
                 req.target,

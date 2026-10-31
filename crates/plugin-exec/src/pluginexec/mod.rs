@@ -1,6 +1,5 @@
 mod entrypoint_mode;
 mod filterenv;
-mod pty;
 pub mod redact;
 mod spec;
 
@@ -827,71 +826,56 @@ fn decode_runner(opts: &hplugin::config::Options) -> anyhow::Result<Option<Strin
     Ok(runner.filter(|r| !r.is_empty()))
 }
 
-/// RAII guard that restores the parent terminal's cooked mode when dropped.
-struct RawModeGuard;
-
-impl Drop for RawModeGuard {
-    fn drop(&mut self) {
-        _ = crossterm::terminal::disable_raw_mode();
-    }
-}
-
-async fn tee_stream(
-    source: Option<impl tokio::io::AsyncRead + Unpin>,
-    log: Arc<std::sync::Mutex<std::fs::File>>,
+/// The output half of a build target's `--shell`: copies the PTY to the
+/// terminal with no log and no redaction (R22), and applies each live window
+/// size to the master, where the kernel signals the tool.
+async fn pty_session_output(
+    mut source: impl tokio::io::AsyncRead + Unpin,
     mut sink: Option<&mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin)>,
     addr: &str,
-    stream: &str,
     bytes_read: &std::sync::atomic::AtomicUsize,
-    // `None` for every target that declares no credentials, which is nearly all
-    // of them — so the scrubbing path costs one null check.
-    needles: Option<Arc<redact::Needles>>,
+    mut resize: Option<(hplugin::driver::WinSizeReceiver, std::os::fd::OwnedFd)>,
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let Some(mut source) = source else { return };
     let mut buf = vec![0u8; 8192];
-    let mut lost = SinkLoss::default();
-    let mut redactor = needles.map(redact::Redactor::new);
+    let mut dropped_bytes = 0usize;
+    let mut first_loss: Option<std::io::Error> = None;
     loop {
-        match source.read(&mut buf).await {
-            Ok(0) => {
-                // Flush whatever the redactor held back across the last read
-                // boundary, or the tail of the output disappears.
-                flush_redacted(&mut redactor, &log, &mut sink, &mut lost).await;
-                break;
+        let read = tokio::select! {
+            changed = async { resize.as_mut()?.0.changed().await.ok() }, if resize.is_some() => {
+                match (changed, &mut resize) {
+                    (Some(()), Some((winsize, master))) => {
+                        let size = *winsize.borrow_and_update();
+                        if let Err(error) = hproc::pty::set_winsize(master, size) {
+                            tracing::debug!(addr, %error, "pluginexec: could not resize the pty");
+                        }
+                    }
+                    // The wrapper is gone: the size is final.
+                    _ => resize = None,
+                }
+                continue;
             }
+            read = source.read(&mut buf) => read,
+        };
+        match read {
+            Ok(0) => break,
             Err(error) => {
                 tracing::warn!(
                     addr,
-                    stream,
                     %error,
                     bytes_read = bytes_read.load(std::sync::atomic::Ordering::Relaxed),
-                    "pluginexec: error draining child output; log tail may be truncated"
+                    "pluginexec: the session's output stopped early"
                 );
-                // Flush before leaving, or a read error costs the log the
-                // redactor's held-back tail on top of whatever the read lost.
-                flush_redacted(&mut redactor, &log, &mut sink, &mut lost).await;
                 break;
             }
             Ok(n) => {
                 bytes_read.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
-                #[expect(
-                    clippy::indexing_slicing,
-                    reason = "n guaranteed <= buf.len() by AsyncRead contract"
-                )]
-                let slice = &buf[..n];
-                // Scrubbed BEFORE the log write, not after: `log.txt` is packed
-                // into the cache as an artifact and lifted into the failure
-                // event, so a token that reaches it has already escaped.
-                let scrubbed = redactor.as_mut().map(|r| r.push(slice));
-                let slice: &[u8] = scrubbed.as_deref().unwrap_or(slice);
-                if slice.is_empty() {
-                    continue;
-                }
-                if let Ok(mut g) = log.lock() {
-                    drop(g.write_all(slice));
-                }
-                if let Some(ref mut out) = sink {
+                if let Some(out) = sink.as_mut() {
+                    #[expect(
+                        clippy::indexing_slicing,
+                        reason = "n guaranteed <= buf.len() by AsyncRead contract"
+                    )]
+                    let slice = &buf[..n];
                     let wrote = out.write_all(slice).await;
                     // Flush immediately so interactive shells see each byte
                     // appear as it's typed (tokio::io::stdout is line-buffered
@@ -900,14 +884,25 @@ async fn tee_stream(
                     // `tokio::io::stdout` buffers, so a rejected write usually
                     // surfaces at the flush rather than at `write_all` — take
                     // whichever failed.
-                    if let Err(e) = wrote.and(flushed) {
-                        lost.record(slice.len(), e);
+                    if let Err(error) = wrote.and(flushed) {
+                        dropped_bytes = dropped_bytes.saturating_add(n);
+                        first_loss.get_or_insert(error);
                     }
                 }
             }
         }
     }
-    lost.finish(addr, stream);
+    // Not `SinkLoss`: there is no log.txt to send the reader to. See it for why
+    // this is said at all.
+    if let Some(error) = first_loss {
+        tracing::warn!(
+            addr,
+            dropped_bytes,
+            %error,
+            "heph could not write some of this session's output to the terminal, so at \
+             least this many bytes of it were not shown"
+        );
+    }
 }
 
 /// Write a redactor's held-back tail to the log and the sink.
@@ -1187,7 +1182,7 @@ impl SinkCost {
 /// / `EVFILT_WRITE` wake reliability is fine on macOS.
 async fn pump_stdin_pty(
     mut src: &mut (dyn tokio::io::AsyncRead + Send + Sync + Unpin),
-    mut sink: pty::AsyncPty,
+    mut sink: hproc::pty::AsyncPty,
     cancel: tokio::sync::oneshot::Receiver<()>,
 ) {
     use tokio::io::AsyncWriteExt;
@@ -2169,11 +2164,14 @@ impl Driver {
                 .collect(),
         };
 
-        // Created for every run: in the caller's terminal nothing is teed, so
-        // it stays empty, and the run still reports one log artifact (E6).
+        // Created for a captured run only. Nothing is teed from a run on the
+        // caller's terminal, inherited or on a PTY, and a `--shell` is
+        // interactive: no log, no redaction, and so no artifact (R22).
+        let writes_log = !shell && matches!(options.stdio, hplugin::driver::RunStdio::Captured);
         let output_log_path = req.sandbox_dir.join("log.txt");
-        let output_log =
-            std::fs::File::create(&output_log_path).with_context(|| "create log file")?;
+        let output_log = writes_log
+            .then(|| std::fs::File::create(&output_log_path).with_context(|| "create log file"))
+            .transpose()?;
 
         // run is guaranteed non-empty by the bail! above, so [0] and [1..] are safe
         let (program, args) = {
@@ -2274,16 +2272,18 @@ impl Driver {
             }
         };
 
-        // The caller's own terminal: inherited fds 0–2, no PTY, no tee, no
-        // session of its own (E6). `--shell` keeps its PTY whatever the stdio,
-        // since a shell is always on a terminal; it takes only the relay's
-        // signals, below (Open 7).
-        let (inherit, shell_signals) = match options.stdio {
-            hplugin::driver::RunStdio::Inherit(fg) if shell => (None, Some(fg.signals)),
+        // The caller's own terminal, on heph's fds or on the PTY the host owns
+        // and pumps. Either way nothing is teed and the driver only spawns and
+        // waits (E6).
+        let (foreground, on_pty) = match options.stdio {
+            hplugin::driver::RunStdio::Captured => (None, None),
             hplugin::driver::RunStdio::Inherit(fg) => (Some(fg), None),
-            _ => (None, None),
+            hplugin::driver::RunStdio::Pty(p) => {
+                (Some(p.foreground), Some((p.slave, p.stops, p.continues)))
+            }
+            other => anyhow::bail!("the exec driver cannot run stdio {other:?}"),
         };
-        if let Some(fg) = inherit {
+        if let Some(fg) = foreground {
             drop(output_log);
             hcore::hmemoizer::set_phase("pluginexec:spawn");
             let cmd = hexecrunner::foreground::ForegroundCommand::new(
@@ -2293,15 +2293,24 @@ impl Driver {
                 cwd,
             )
             .with_foreground(&fg);
+            let (cmd, pty_channels) = match on_pty {
+                Some((slave, stops, continues)) => {
+                    (cmd.with_slave(slave), Some((stops, continues)))
+                }
+                None => (cmd, None),
+            };
             let (spawned, spawned_as) =
                 hexecrunner::foreground::spawn_foreground(runner_ref, cmd, &path_policy, ctoken)
                     .await?;
             let child = spawned.map_err(|e| spawn_error(e, &spawned_as))?;
             hcore::hmemoizer::set_phase("pluginexec:wait_subprocess");
-            let exit = child
-                .wait(fg.signals, ctoken)
-                .await
-                .context("wait for child process")?;
+            let exit = match pty_channels {
+                Some((stops, continues)) => {
+                    child.wait_pty(fg.signals, stops, continues, ctoken).await
+                }
+                None => child.wait(fg.signals, ctoken).await,
+            }
+            .context("wait for child process")?;
             if ctoken.is_cancelled() {
                 anyhow::bail!("cancelled");
             }
@@ -2315,17 +2324,23 @@ impl Driver {
                 }
                 .into());
             }
-            return log_response(&output_log_path);
+            return if writes_log {
+                log_response(&output_log_path)
+            } else {
+                Ok(ManagedRunResponse { artifacts: vec![] })
+            };
         }
-        let output_log_file = Arc::new(std::sync::Mutex::new(output_log));
+        // A build target's `--shell` has no log: `output_log` is `None` there,
+        // and the PTY arm below reads nothing but the terminal.
+        let output_log_file = output_log.map(|f| Arc::new(std::sync::Mutex::new(f)));
 
         // Shell mode runs the child attached to a freshly-allocated PTY so bash
         // sees a real terminal and runs interactively. The parent forwards
-        // stdin/stdout via the PTY master through the same tee paths used by
-        // the non-shell case (`tee_stream` on AsyncPty for PTY; `tee_output`
+        // stdin/stdout via the PTY master, unteed and unredacted: the shell is
+        // the user's own session (R22). The non-shell case tees (`tee_output`
         // on the merged OutputReader for piped stdio).
         let pty_pair = if shell {
-            Some(pty::open_pty().context("openpty")?)
+            Some(hproc::pty::open_pty().context("openpty")?)
         } else {
             None
         };
@@ -2333,13 +2348,16 @@ impl Driver {
         let spec = if let Some((master, slave)) = &pty_pair {
             // Inherit the parent's terminal size so bash can wrap and place the
             // prompt correctly. Falls back to 80x24 if the parent has no tty.
-            let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-            pty::set_winsize(master, rows, cols).context("set pty winsize")?;
+            let size = hproc::pty::caller_winsize().unwrap_or((24, 80));
+            hproc::pty::set_winsize(master, size).context("set pty winsize")?;
 
             // Copy the parent's line discipline (ICRNL/ONLCR/etc.) onto the
             // slave so bash sees a standard cooked terminal. Must run BEFORE
             // we put the parent into raw mode below.
-            pty::inherit_termios(slave).context("copy parent termios to pty slave")?;
+            // With no terminal to copy from, the PTY's own defaults are as good.
+            if let Err(error) = hproc::pty::inherit_termios(slave) {
+                tracing::debug!(%error, "no terminal to copy termios from");
+            }
 
             let stdin_fd = slave.try_clone().context("dup pty slave for stdin")?;
             let stdout_fd = slave.try_clone().context("dup pty slave for stdout")?;
@@ -2393,31 +2411,6 @@ impl Driver {
         let (spawned, spawned_as) =
             hexecrunner::spawn_io_with_path(runner_ref, spec, &path_policy, ctoken).await?;
         let mut handle = spawned.map_err(|e| spawn_error(e, &spawned_as))?;
-        // Open 7: a `--shell` session runs in its own session on its PTY, so
-        // the terminal's signals never reach heph's group; of the relayed
-        // ones it takes only TERM and HUP (a `timeout` or a closed terminal
-        // ending heph), delivered to the session's group. Everything else is
-        // the user's to type into the shell. Stopped as soon as the wait
-        // returns. Between the reap inside that wait and the abort there is a
-        // window: while any process of the session's group lives the pgid
-        // cannot be reused and a late TERM reaches it (or ESRCH once it is
-        // empty), but once the group is empty the number can in principle be
-        // handed to a new group in that window. Accepted: it needs a TERM or
-        // HUP to arrive in the microseconds after the shell exits and a pid
-        // wrap onto exactly that number; the foreground spawn closes it with
-        // `waitid(WNOWAIT)`, which `proc_exec`'s wait does not offer.
-        let shell_relay = shell_signals.map(|mut signals| {
-            let pgid = handle.pid();
-            tokio::spawn(async move {
-                while let Some(sig) = signals.recv().await {
-                    let raw = sig.as_raw();
-                    if raw == libc::SIGTERM || raw == libc::SIGHUP {
-                        // SAFETY: signalling the group this run spawned.
-                        unsafe { libc::killpg(pgid, raw) };
-                    }
-                }
-            })
-        });
 
         // Drop the parent's copy of the slave so the master sees EOF when the
         // child exits.
@@ -2425,11 +2418,12 @@ impl Driver {
 
         // Put the parent terminal into raw mode so keystrokes are forwarded
         // byte-by-byte to the child PTY without local echo or line buffering.
-        // The child's PTY slave owns line discipline and echo.
-        let _raw_guard = if shell {
-            crossterm::terminal::enable_raw_mode()
+        // The child's PTY slave owns line discipline and echo. Only from the
+        // foreground, where the guard's restore can undo it.
+        let _raw_guard = if shell && hproc::pty::is_foreground(libc::STDIN_FILENO) {
+            hproc::pty::RawTerminal::capture(libc::STDIN_FILENO)
                 .ok()
-                .map(|()| RawModeGuard)
+                .filter(|raw| raw.enter().is_ok())
         } else {
             None
         };
@@ -2450,10 +2444,12 @@ impl Driver {
         // bounds the drain, a child that is simultaneously ignoring >64 KiB
         // of stdin and producing more than the drain bound would deadlock:
         // we would be blocked writing its stdin while it blocks writing its
-        // stdout. Unreachable as wired — pipe-mode stdin exists only for
-        // interactive runs, where the source is a tty relay measured in
-        // keystrokes — but it is the reason a future non-tty stdin source
-        // needs its own task, not another `join!` arm.
+        // stdout. Pipe-mode stdin is reached only by a plain build whose fd 0
+        // is a terminal: a `--shell` is on a PTY, and a piped fd 0 is never
+        // passed to a build (`heph run`'s wrapper). So the source is what a
+        // person types or pastes, and only a paste past 64 KiB into a child
+        // doing the above can get here. It is the reason a future non-tty
+        // stdin source needs its own task, not another `join!` arm.
         enum IoFutures<'r> {
             Pty {
                 stdin: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'r>>,
@@ -2475,18 +2471,24 @@ impl Driver {
 
         let io_futures: IoFutures<'_> = if let Some(master) = pty_master {
             let read_fd = master.try_clone().context("dup pty master for read")?;
-            let reader = pty::AsyncPty::new(read_fd).context("async pty reader")?;
-            let writer = pty::AsyncPty::new(master).context("async pty writer")?;
+            // A third handle on the master, for resizes alone: the writer below
+            // moves into a pump that may finish early.
+            let resize = rreq
+                .winsize
+                .map(|winsize| {
+                    let fd = master.try_clone().context("dup pty master for resize")?;
+                    anyhow::Ok((winsize, fd))
+                })
+                .transpose()?;
+            let reader = hproc::pty::AsyncPty::new(read_fd).context("async pty reader")?;
+            let writer = hproc::pty::AsyncPty::new(master).context("async pty writer")?;
 
-            let log_for_out = Arc::clone(&output_log_file);
-            let stdout_fut = Box::pin(tee_stream(
-                Some(reader),
-                log_for_out,
+            let stdout_fut = Box::pin(pty_session_output(
+                reader,
                 rreq.stdout,
                 &addr_str,
-                "pty",
                 &stdout_bytes,
-                needles.clone(),
+                resize,
             ));
 
             let stdin_fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> =
@@ -2503,7 +2505,9 @@ impl Driver {
         } else {
             let stdin_pump = handle.take_stdin();
             let output_reader = handle.take_output();
-            let log_for_out = Arc::clone(&output_log_file);
+            let log_for_out = output_log_file
+                .clone()
+                .context("a captured run has a log file")?;
             let output_fut = Box::pin(tee_output(
                 output_reader,
                 log_for_out,
@@ -2567,7 +2571,7 @@ impl Driver {
                                     addr = addr_str.as_str(),
                                     pty_bytes,
                                     waited_ms = waited.as_millis(),
-                                    "pluginexec: post-wait output drain timed out; log tail may be truncated"
+                                    "pluginexec: post-wait output drain timed out; the session's last output may be missing"
                                 );
                             } else {
                                 tracing::debug!(
@@ -2629,9 +2633,6 @@ impl Driver {
             }
         };
 
-        if let Some(relay) = shell_relay {
-            relay.abort();
-        }
         hcore::hmemoizer::set_phase("pluginexec:post_wait_status_check");
         // Cancellation takes precedence over whatever the wait task returned
         // (`wait_or_cancel` surfaces an io error on cancel) so we preserve the
@@ -2646,10 +2647,15 @@ impl Driver {
             // Carry a lazy handle to the log file rather than its bytes; the
             // diagnostic reads only the last N lines (the request's `--log-lines`)
             // at classification time. The file outlives the read — a failed
-            // target's sandbox is reclaimed only at its next run.
-            let log: std::sync::Arc<dyn hcore::hartifactcontent::Content> = std::sync::Arc::new(
-                hcore::hartifactcontent::FileContent::new(output_log_path.clone()),
-            );
+            // target's sandbox is reclaimed only at its next run. A `--shell`
+            // session wrote none, and printed everything it had to say.
+            let log: std::sync::Arc<dyn hcore::hartifactcontent::Content> = if writes_log {
+                std::sync::Arc::new(hcore::hartifactcontent::FileContent::new(
+                    output_log_path.clone(),
+                ))
+            } else {
+                std::sync::Arc::new(EmptyLog)
+            };
             return Err(hplugin::error::ProcessFailed {
                 status: status.to_string(),
                 log,
@@ -2659,7 +2665,11 @@ impl Driver {
         }
         hcore::hmemoizer::set_phase("pluginexec:post_wait_done");
 
-        log_response(&output_log_path)
+        if writes_log {
+            log_response(&output_log_path)
+        } else {
+            Ok(ManagedRunResponse { artifacts: vec![] })
+        }
     }
 }
 
@@ -2833,7 +2843,7 @@ mod tests {
         (tracing::subscriber::set_default(subscriber), captured)
     }
 
-    /// `AsyncRead` double that always fails — `tee_stream`'s real IO error
+    /// `AsyncRead` double that always fails — `pty_session_output`'s real IO error
     /// path (as opposed to clean `Ok(0)` EOF) has no other way to reach it,
     /// since a real pipe/PTY essentially never produces a read error in a
     /// controlled test.
@@ -2847,11 +2857,6 @@ mod tests {
         ) -> std::task::Poll<std::io::Result<()>> {
             std::task::Poll::Ready(Err(std::io::Error::other("synthetic read failure")))
         }
-    }
-
-    fn log_file(dir: &tempfile::TempDir) -> Arc<std::sync::Mutex<std::fs::File>> {
-        let file = std::fs::File::create(dir.path().join("log.txt")).expect("create log file");
-        Arc::new(std::sync::Mutex::new(file))
     }
 
     /// `AsyncWrite` double that swallows writes and then refuses to flush with
@@ -2897,19 +2902,16 @@ mod tests {
     /// terminal — with nothing logged, and the two records silently disagreeing.
     /// A user's only symptom was output that stopped mid-stream.
     #[tokio::test]
-    async fn tee_stream_reports_output_the_sink_refused() {
+    async fn pty_session_reports_output_the_sink_refused() {
         let (guard, log) = capture_tracing();
-        let tmp = tempfile::tempdir().expect("tempdir");
         let bytes_read = std::sync::atomic::AtomicUsize::new(0);
         let payload = vec![b'x'; 4096];
         let mut sink = WouldBlockSink;
 
-        tee_stream(
-            Some(&payload[..]),
-            log_file(&tmp),
+        pty_session_output(
+            &payload[..],
             Some(&mut sink),
             "//pkg:target",
-            "pty",
             &bytes_read,
             None,
         )
@@ -2918,7 +2920,7 @@ mod tests {
 
         let text = log.text();
         assert!(
-            text.contains("could not write some of this target's output"),
+            text.contains("could not write some of this session's output"),
             "the refused output was not reported: {text}"
         );
         assert!(text.contains("//pkg:target"), "missing addr field: {text}");
@@ -2935,30 +2937,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tee_stream_logs_real_io_errors() {
+    async fn pty_session_logs_real_io_errors() {
         let (guard, log) = capture_tracing();
-        let tmp = tempfile::tempdir().expect("tempdir");
         let bytes_read = std::sync::atomic::AtomicUsize::new(0);
 
-        tee_stream(
-            Some(FailingReader),
-            log_file(&tmp),
-            None,
-            "//pkg:target",
-            "stdout",
-            &bytes_read,
-            None,
-        )
-        .await;
+        pty_session_output(FailingReader, None, "//pkg:target", &bytes_read, None).await;
         drop(guard);
 
         let text = log.text();
         assert!(
-            text.contains("error draining child output"),
+            text.contains("the session's output stopped early"),
             "missing diagnostic: {text}"
         );
         assert!(text.contains("//pkg:target"), "missing addr field: {text}");
-        assert!(text.contains("stdout"), "missing stream field: {text}");
         assert!(
             text.contains("synthetic read failure"),
             "missing underlying error: {text}"

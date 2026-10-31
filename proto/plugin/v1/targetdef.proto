@@ -124,6 +124,9 @@ enum EntrypointWorkdir {
 message Entrypoint {
   bool accepts_args = 1;
   EntrypointWorkdir workdir = 2;
+  // The driver can spawn on a PTY slave (RUN_STDIO_PTY; since 0.17.2). Absent
+  // means no: such a run inherits the caller's fds. Read before any dep builds.
+  bool offers_pty = 3;
 }
 
 // ---- Run outputs (driver -> host). Mirrors outputartifact::OutputArtifact.

@@ -424,9 +424,10 @@ async fn exec_run_inherited_stdio() -> anyhow::Result<()> {
         kv("A", "from-caller"),
     ];
 
-    // Success: the options apply, and the log artifact is an empty file.
+    // Success: the options apply, and nothing was teed, so there is no log: no
+    // file in the sandbox and no artifact.
     let (_tx, stdio) = inherit();
-    let (ran, _sbx) = run_opts(
+    let (ran, sbx) = run_opts(
         &exec,
         &sh("{ pwd -P; printf %s \"$A\"; } > \"$REPORT\""),
         RunOptions::default()
@@ -440,13 +441,11 @@ async fn exec_run_inherited_stdio() -> anyhow::Result<()> {
         std::fs::read_to_string(&report)?,
         format!("{}\nfrom-caller", canonical(out.path()))
     );
-    let [log] = res.artifacts.as_slice() else {
-        panic!("one log artifact: {:?}", res.artifacts.len());
-    };
-    let outputartifact::Content::File(file) = &log.content else {
-        panic!("a file artifact");
-    };
-    assert_eq!(std::fs::metadata(file.source_path.as_str())?.len(), 0);
+    assert_eq!(res.artifacts.len(), 0, "no log artifact");
+    assert!(
+        !sbx.dir.join("log.txt").exists(),
+        "an inherited run has no log file"
+    );
 
     // A code and a signal come back as data, with an empty log.
     for (script, want) in [

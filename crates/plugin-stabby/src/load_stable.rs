@@ -541,6 +541,9 @@ fn decode_list_package_item(b: &[u8]) -> anyhow::Result<ListPackageResponse> {
 enum Chunk {
     Stdout(Vec<u8>),
     Stderr(Vec<u8>),
+    /// Not a chunk: the tool stopped itself (`RunOutFrame.stopped`). On the same
+    /// channel so it arrives in order with the output before it.
+    Stopped,
 }
 
 /// Drain a bidi `run` response stream to its terminal result, forwarding the
@@ -591,6 +594,9 @@ fn drain_run(
             }
             Some(pb::run_out_frame::Msg::StderrChunk(b)) => {
                 drop(chunks.send(Chunk::Stderr(b)));
+            }
+            Some(pb::run_out_frame::Msg::Stopped(_)) => {
+                drop(chunks.send(Chunk::Stopped));
             }
             None => {}
         }
@@ -1022,9 +1028,21 @@ impl StableRemoteManagedDriver {
         let options = convert::run_options_to_pb(req.request.target, &req.request.options)?;
         // The relay's receiving end, for a run in the caller's terminal: its
         // signals become `RunInFrame.signal` on the request stream.
-        let signals = match std::mem::take(&mut req.request.options.stdio) {
-            RunStdio::Inherit(fg) => Some(fg.signals),
-            _ => None,
+        // A run on a PTY also has its stops and continues, and the slave's
+        // ownership leaves with the message: held here until right before
+        // `invoke_bidi`, so anything that bails first closes it.
+        let (signals, pty) = match std::mem::take(&mut req.request.options.stdio) {
+            RunStdio::Captured => (None, None),
+            RunStdio::Inherit(fg) => (Some(fg.signals), None),
+            RunStdio::Pty(p) => (
+                Some(p.foreground.signals),
+                Some((p.slave, p.stops, p.continues)),
+            ),
+            other => anyhow::bail!("run stdio {other:?} cannot cross the plugin seam"),
+        };
+        let (slave, stops, continues) = match pty {
+            Some((slave, stops, continues)) => (Some(slave), Some(stops), Some(continues)),
+            None => (None, None, None),
         };
         let pmrr = pb::ManagedRunRequest {
             options: options.into(),
@@ -1071,6 +1089,14 @@ impl StableRemoteManagedDriver {
                 .send(in_frame)
                 .context("queueing the run's start frame")?;
         }
+        // The move the message promised: nothing between here and the call can
+        // bail, and from here the plugin's decoder owns it. One that fails before
+        // decoding the options (a start frame it cannot read, a method it does not
+        // know) answers with an error and never takes the number, so the slave
+        // stays open until heph exits: one fd, and a drain that ends at its limit
+        // rather than at EOF. Closing it here could double-close against a plugin
+        // that did decode it, which is the worse failure.
+        let _moved = slave.map(std::os::fd::IntoRawFd::into_raw_fd);
         let resp_stream = self
             .inner
             .invoke_bidi(
@@ -1099,6 +1125,12 @@ impl StableRemoteManagedDriver {
                 let (sink, bytes) = match chunk {
                     Chunk::Stdout(b) => (stdout.as_deref_mut(), b),
                     Chunk::Stderr(b) => (stderr.as_deref_mut(), b),
+                    Chunk::Stopped => {
+                        if let Some(stops) = &stops {
+                            let _reported = stops.send(());
+                        }
+                        continue;
+                    }
                 };
                 if let Some(w) = sink {
                     drop(w.write_all(&bytes).await);
@@ -1116,17 +1148,38 @@ impl StableRemoteManagedDriver {
         // the host's relay closes: the stream must stay open until the terminal
         // frame, so only the select below ending may drop it.
         let relay = async move {
-            if let Some(mut signals) = signals {
-                while let Some(sig) = signals.recv().await {
-                    let frame = pb::RunInFrame {
-                        msg: Some(pb::run_in_frame::Msg::Signal(sig.as_raw())),
-                        ..Default::default()
+            let mut signals = signals;
+            let mut continues = continues;
+            loop {
+                let msg = tokio::select! {
+                    sig = async { signals.as_mut()?.recv().await }, if signals.is_some() => {
+                        match sig {
+                            Some(sig) => pb::run_in_frame::Msg::Signal(sig.as_raw()),
+                            None => {
+                                signals = None;
+                                continue;
+                            }
+                        }
                     }
-                    .encode_to_vec();
-                    // The plugin dropped its end: nothing more is read.
-                    if in_tx.send(frame).is_err() {
-                        break;
+                    cont = async { continues.as_mut()?.recv().await }, if continues.is_some() => {
+                        match cont {
+                            Some(()) => pb::run_in_frame::Msg::Cont(true),
+                            None => {
+                                continues = None;
+                                continue;
+                            }
+                        }
                     }
+                    else => break,
+                };
+                let frame = pb::RunInFrame {
+                    msg: Some(msg),
+                    ..Default::default()
+                }
+                .encode_to_vec();
+                // The plugin dropped its end: nothing more is read.
+                if in_tx.send(frame).is_err() {
+                    break;
                 }
             }
             std::future::pending::<std::convert::Infallible>().await

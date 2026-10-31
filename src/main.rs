@@ -121,15 +121,17 @@ fn main() -> ExitCode {
     // own short-lived engine on demand.
     clap_complete::CompleteEnv::with_factory(Cli::command).complete();
 
-    // Ignore SIGTTOU/SIGTTIN so terminal-control syscalls (tcsetattr,
-    // tcgetattr, tcsetpgrp …) from a background process group fail with
-    // EIO instead of stopping the process. Test subprocesses can move the
-    // foreground process group off heph3 (e.g. Go test runners that grab
-    // the terminal) and exit without restoring; the next TUI raw-mode
-    // toggle in `crossterm::terminal::enable_raw_mode` would otherwise
-    // freeze the entire process (observed as a deadlock — every thread
-    // stopped, tokio runtime appears hung). With these signals ignored,
-    // the call returns an error that the TUI can surface.
+    // Ignore SIGTTOU/SIGTTIN so terminal-control syscalls from a background
+    // process group do not stop the process. With SIGTTOU ignored, `tcsetattr`
+    // and `tcsetpgrp` from the background *succeed*, so whoever changes the
+    // terminal's settings checks that it is the foreground first
+    // (`hproc::pty::is_foreground`). With SIGTTIN ignored, a read of the
+    // terminal fails with EIO. Test subprocesses can move the foreground process
+    // group off heph3 (e.g. Go test runners that grab the terminal) and exit
+    // without restoring; the next TUI raw-mode toggle in
+    // `crossterm::terminal::enable_raw_mode` would otherwise freeze the entire
+    // process (observed as a deadlock — every thread stopped, tokio runtime
+    // appears hung).
     // SAFETY: signal(2) at process startup, before any thread spawns.
     unsafe {
         libc::signal(libc::SIGTTOU, libc::SIG_IGN);
@@ -144,7 +146,10 @@ fn main() -> ExitCode {
     // exhausted almost immediately on a wide build.
     heph::fdlimit::raise_open_file_limit();
 
-    let sink = log::init();
+    // Before the logger, which `run --raw` silences. A soft parse rather than a
+    // look through argv: after `--`, `--raw` is the tool's.
+    let soft_match = Cli::command().try_get_matches();
+    let sink = log::init(raw_requested(&soft_match));
     heph::tui::panic::install(sink.clone());
 
     // Self-upgrade BEFORE matching the command. A workspace can pin a newer heph
@@ -160,7 +165,6 @@ fn main() -> ExitCode {
     // positively recognizes a real, non-`version` command: `version` must work
     // outside a workspace, and an unrecognized command (the forward-compat case)
     // falls through so the real parse can emit clap's canonical diagnostic.
-    let soft_match = Cli::command().try_get_matches();
     match heph::selfupdate::maybe_self_upgrade() {
         Ok(()) => {}
         Err(heph::selfupdate::SelfUpgradeError::NoConfig) if no_config_tolerable(&soft_match) => {}
@@ -423,6 +427,13 @@ fn parse_supervisor_args() -> Option<i32> {
 /// prints the build string, `gen-docs` emits the CLI reference from clap.
 const NO_CONFIG_COMMANDS: &[&str] = &["version", "gen-docs"];
 
+fn raw_requested(soft_match: &Result<clap::ArgMatches, clap::Error>) -> bool {
+    soft_match.as_ref().is_ok_and(|m| {
+        m.subcommand_matches("run")
+            .is_some_and(|run| run.get_flag("raw"))
+    })
+}
+
 /// Whether a `NoConfig` (not-in-a-workspace) self-upgrade result may be tolerated
 /// for this invocation, decided from a soft pre-parse of the CLI args.
 ///
@@ -502,6 +513,15 @@ mod tests {
         // A binary that merely *contains* an applet name is not one.
         assert_eq!(split(&["/usr/local/bin/cp-helper", "x"]), None);
         assert_eq!(split(&["/usr/local/bin/heph", "cp", "x"]), None);
+    }
+
+    #[test]
+    fn raw_after_the_separator_is_the_tools() {
+        // What follows `--` is the tool's argument: it must not quiet heph's log.
+        assert!(raw_requested(&soft(&["heph", "run", "//x", "--raw"])));
+        assert!(!raw_requested(&soft(&[
+            "heph", "run", "//x", "--", "--raw"
+        ])));
     }
 
     #[test]
