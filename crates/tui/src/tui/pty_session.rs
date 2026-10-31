@@ -346,7 +346,8 @@ impl Pump {
             let parent_alive = unsafe { libc::getppid() } == self.parent;
             let resumable = terminal_alive(terminal.fd)
                 && parent_alive
-                && parent_in_session()
+                // SAFETY: no preconditions.
+                && parent_in_session(unsafe { libc::getppid() })
                 && leads_own_group();
             if !resumable || self.dying.settled().await {
                 // Not going raw, and neither reading a terminal that a stopped
@@ -389,10 +390,13 @@ impl Pump {
 /// Whether heph's parent is in heph's session. A job-control shell always is, so
 /// without it (`ssh -t host heph run //x`, `tmux new heph …`, heph leading the
 /// session or otherwise orphaned) a stopped heph has nobody to resume it. An
-/// error counts as no.
-fn parent_in_session() -> bool {
-    // SAFETY: no preconditions.
-    let parent = unsafe { libc::getppid() };
+/// error counts as no, and so does parent 0: `getppid` returns it when the parent
+/// is in another PID namespace (`docker exec -it`, `kubectl exec -it`), and
+/// `getsid(0)` would then answer for heph itself, which always matches.
+fn parent_in_session(parent: libc::pid_t) -> bool {
+    if parent <= 0 {
+        return false;
+    }
     // SAFETY: no preconditions; a pid `getsid` may not ask about is an error.
     let parent_session = unsafe { libc::getsid(parent) };
     // SAFETY: as above.
@@ -609,6 +613,18 @@ mod tests {
     use std::io::Write as _;
     use std::os::fd::AsRawFd as _;
     use tokio::io::{DuplexStream, duplex};
+
+    /// Parent 0 is what a parent in another PID namespace reads as: without the
+    /// guard `getsid(0)` is heph's own session, and heph would stop itself with
+    /// nobody to resume it.
+    #[test]
+    fn parent_in_another_pid_namespace_is_not_in_session() {
+        assert!(!parent_in_session(0));
+        assert!(!parent_in_session(-1));
+        // SAFETY: no preconditions.
+        let me = unsafe { libc::getpid() };
+        assert!(parent_in_session(me), "heph's own session matches itself");
+    }
     use tokio::time::{sleep, timeout};
 
     /// Far beyond anything a test should wait for, so that a bounded elapsed time
