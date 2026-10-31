@@ -2419,8 +2419,9 @@ impl Driver {
 
         // Put the parent terminal into raw mode so keystrokes are forwarded
         // byte-by-byte to the child PTY without local echo or line buffering.
-        // The child's PTY slave owns line discipline and echo.
-        let _raw_guard = if shell {
+        // The child's PTY slave owns line discipline and echo. Only from the
+        // foreground, where the guard's restore can undo it.
+        let _raw_guard = if shell && hproc::pty::is_foreground(libc::STDIN_FILENO) {
             hproc::pty::RawTerminal::capture(libc::STDIN_FILENO)
                 .ok()
                 .filter(|raw| raw.enter().is_ok())

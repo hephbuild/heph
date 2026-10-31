@@ -150,9 +150,9 @@ pub fn terminal_alive(fd: RawFd) -> bool {
 }
 
 /// The caller's terminal, and what it looked like before heph touched it. The
-/// one owner of its raw mode: restored on drop, so every exit that unwinds puts
-/// it back, and always from the termios captured here, so a second stop can
-/// never restore the raw one.
+/// one owner of its raw mode: restored on drop, so every exit that unwinds in
+/// the foreground puts it back, and always from the termios captured here, so a
+/// second stop can never restore the raw one.
 #[derive(Debug)]
 pub struct RawTerminal {
     fd: RawFd,
@@ -191,11 +191,20 @@ impl RawTerminal {
         Ok(())
     }
 
-    /// Put the original termios back. Idempotent; a terminal that has gone is
-    /// an error nobody can act on, so it is ignored.
+    /// Put the original termios back, if heph is the terminal's foreground job.
+    /// In the background the terminal is the shell's: SIGTTOU is ignored, so a
+    /// `tcsetattr` would succeed and overwrite the shell's settings. A no-op
+    /// there, which also covers a terminal that has gone; harmless to repeat in
+    /// the foreground.
     pub fn restore(&self) {
+        restore_in_foreground(self.fd, &self.original);
+    }
+}
+
+fn restore_in_foreground(fd: RawFd, original: &libc::termios) {
+    if is_foreground(fd) {
         // SAFETY: tcsetattr only reads `original`; a bad fd is an error return.
-        unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.original) };
+        unsafe { libc::tcsetattr(fd, libc::TCSANOW, original) };
     }
 }
 
@@ -357,34 +366,109 @@ mod tests {
         assert_eq!(unsafe { libc::isatty(slave.as_raw_fd()) }, 1);
     }
 
-    /// A second enter and restore are computed from the captured termios, so
-    /// a restore after a re-entered raw mode is still the caller's.
-    #[test]
-    fn raw_terminal_restores_what_it_captured() {
-        let (_master, slave) = open_pty().expect("open_pty");
-        let read = |fd: RawFd| {
-            // SAFETY: termios is POD.
-            let mut t: libc::termios = unsafe { std::mem::zeroed() };
-            // SAFETY: a live fd and a live out-parameter.
-            assert_eq!(unsafe { libc::tcgetattr(fd, &mut t) }, 0);
-            t
+    /// The settings a restore is judged on. PENDIN is the line discipline's
+    /// state, not a setting: BSD sets it itself when ICANON comes back on, to
+    /// re-scan what is queued.
+    fn settings(fd: RawFd) -> Option<(libc::tcflag_t, libc::tcflag_t)> {
+        // SAFETY: termios is POD.
+        let mut t: libc::termios = unsafe { std::mem::zeroed() };
+        // SAFETY: a bad fd is an error return; the out-parameter is live.
+        (unsafe { libc::tcgetattr(fd, &mut t) } == 0)
+            .then_some((t.c_lflag & !libc::PENDIN, t.c_oflag))
+    }
+
+    /// Runs after `fork` in a child of a multi-threaded test binary, so it makes
+    /// syscalls and nothing else: no allocation, no panic. 0 means all held.
+    ///
+    /// # Safety
+    ///
+    /// `fd` is a terminal that no session controls.
+    unsafe fn restore_scenarios(fd: RawFd) -> libc::c_int {
+        // SAFETY: the session this makes is only this process.
+        if unsafe { libc::setsid() } < 0 {
+            return 10;
+        }
+        // SAFETY: the caller's terminal, which this session then controls.
+        if unsafe { libc::ioctl(fd, libc::TIOCSCTTY as _, 0) } != 0 {
+            return 10;
+        }
+        // SAFETY: no preconditions, and this process is the test's own child.
+        unsafe { libc::signal(libc::SIGTTOU, libc::SIG_IGN) };
+        let before = settings(fd);
+        let Ok(raw) = RawTerminal::capture(fd) else {
+            return 11;
         };
-        let fd = slave.as_raw_fd();
-        let before = read(fd);
-        let raw = RawTerminal::capture(fd).expect("capture");
-        raw.enter().expect("enter");
-        assert_eq!(read(fd).c_lflag & libc::ICANON, 0, "raw");
+        // A second enter and restore are computed from the captured termios, so
+        // a restore after a re-entered raw mode is still the caller's.
+        if raw.enter().is_err() || settings(fd).is_none_or(|(l, _)| l & libc::ICANON != 0) {
+            return 12;
+        }
         raw.restore();
-        raw.enter().expect("enter again");
+        if raw.enter().is_err() {
+            return 13;
+        }
         drop(raw);
-        let after = read(fd);
-        // PENDIN is the line discipline's state, not a setting: BSD sets it
-        // itself when ICANON comes back on, to re-scan what is queued.
-        assert_eq!(
-            after.c_lflag & !libc::PENDIN,
-            before.c_lflag & !libc::PENDIN
-        );
-        assert_eq!(after.c_oflag, before.c_oflag);
+        if settings(fd) != before {
+            return 14;
+        }
+
+        // SAFETY: the grandchild goes on making only syscalls.
+        match unsafe { libc::fork() } {
+            -1 => 15,
+            0 => {
+                // In a group of its own the process is a background job of the
+                // terminal, whose `tcsetattr` succeeds with SIGTTOU ignored.
+                // SAFETY: no preconditions.
+                if unsafe { libc::setpgid(0, 0) } != 0 {
+                    // SAFETY: no preconditions.
+                    unsafe { libc::_exit(16) };
+                }
+                let Ok(raw) = RawTerminal::capture(fd) else {
+                    // SAFETY: no preconditions.
+                    unsafe { libc::_exit(17) };
+                };
+                if raw.enter().is_err() {
+                    // SAFETY: no preconditions.
+                    unsafe { libc::_exit(18) };
+                }
+                let shells = settings(fd);
+                raw.restore();
+                let kept = settings(fd) == shells;
+                // SAFETY: no preconditions.
+                unsafe { libc::_exit(if kept { 0 } else { 19 }) }
+            }
+            grandchild => {
+                let mut status = 0;
+                // SAFETY: our child, and a live out-parameter.
+                if unsafe { libc::waitpid(grandchild, &mut status, 0) } < 0 {
+                    return 20;
+                }
+                libc::WEXITSTATUS(status)
+            }
+        }
+    }
+
+    /// The foreground job gets back what it captured, and a background one
+    /// leaves the terminal alone, as it is the shell's by then. `is_foreground`
+    /// asks about the controlling terminal, so these run in a session of their
+    /// own.
+    #[test]
+    fn raw_terminal_restores_only_in_the_foreground() {
+        let (_master, slave) = open_pty().expect("open_pty");
+        // SAFETY: the child makes only syscalls, and leaves through `_exit`.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork");
+        if child == 0 {
+            // SAFETY: a fresh pty that no session controls.
+            let code = unsafe { restore_scenarios(slave.as_raw_fd()) };
+            // SAFETY: no preconditions.
+            unsafe { libc::_exit(code) };
+        }
+        let mut status = 0;
+        // SAFETY: our child, and a live out-parameter.
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFEXITED(status), "status {status}");
+        assert_eq!(libc::WEXITSTATUS(status), 0, "the step that failed");
     }
 
     /// What a stop's "read until EAGAIN" rests on: nothing there is `WouldBlock`

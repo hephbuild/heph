@@ -712,20 +712,10 @@ fn resize_while_stopped_seen_once() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `bg` cannot run the tool, whose terminal only a foreground heph can serve:
-/// heph wakes, sees it is not the foreground and stops again, and the tool never
-/// wakes. `fg` then resumes both and the output arrives.
-#[test]
-fn bg_leaves_tool_stopped_until_fg() -> anyhow::Result<()> {
-    let dist = Dist::locate();
-    let ws = workspace()?;
-    let mut pty = Pty::shell(&dist, ws.root(), &[]);
-    let (heph, tool) = stopped_under_a_shell(&mut pty, r#""$HEPH" run //app:stopper"#);
-
-    pty.type_line("bg");
-    pty.wait_prompt();
-    // The shell saw heph go through running and stop again, which `ps` alone
-    // could not tell from heph never having woken.
+/// Ask the shell until it says its job stopped again, after a `bg`. The shell saw
+/// heph go through running and stop again, which `ps` alone could not tell from
+/// heph never having woken.
+fn job_stops_again(pty: &mut Pty) {
     let started = std::time::Instant::now();
     let mut asked = 0;
     loop {
@@ -739,7 +729,7 @@ fn bg_leaves_tool_stopped_until_fg() -> anyhow::Result<()> {
             .rsplit_once(typed.as_str())
             .map_or("", |(_, answer)| answer);
         if answer.contains("Stopped") {
-            break;
+            return;
         }
         assert!(
             started.elapsed() < SHORT,
@@ -747,10 +737,36 @@ fn bg_leaves_tool_stopped_until_fg() -> anyhow::Result<()> {
             pty.screen()
         );
     }
+}
+
+/// `bg` cannot run the tool, whose terminal only a foreground heph can serve:
+/// heph wakes, sees it is not the foreground and stops again, and the tool never
+/// wakes. `fg` then resumes both and the output arrives.
+///
+/// The terminal is the shell's by then. A setting it made after heph captured
+/// the terminal survives heph waking in the background, where `tcsetattr` would
+/// succeed with SIGTTOU ignored.
+#[test]
+fn bg_leaves_tool_stopped_until_fg() -> anyhow::Result<()> {
+    let dist = Dist::locate();
+    let ws = workspace()?;
+    let mut pty = Pty::shell(&dist, ws.root(), &[]);
+    let (heph, tool) = stopped_under_a_shell(&mut pty, r#""$HEPH" run //app:stopper"#);
+
+    let captured = pty.termios();
+    pty.type_line("/bin/stty -iexten");
+    pty.wait_prompt();
+    let shells = pty.termios();
+    assert_ne!(shells, captured, "the shell's setting did not take");
+
+    pty.type_line("bg");
+    pty.wait_prompt();
+    job_stops_again(&mut pty);
     assert!(common::is_stopped(heph), "{}", common::proc_state(heph));
     assert!(common::is_stopped(tool), "{}", common::proc_state(tool));
     let seen = pty.seen();
     assert!(!seen.contains("resumed-after-fg"), "the tool ran\n{seen}");
+    assert_eq!(pty.termios(), shells, "heph overwrote the shell's termios");
 
     pty.type_line("fg");
     pty.wait_for("resumed-after-fg", SHORT);
