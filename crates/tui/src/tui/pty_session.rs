@@ -672,7 +672,8 @@ mod tests {
 
     /// A non-zero exit and a failure to spawn both reach `finish` the same way,
     /// and neither may wait out the limit: the slave closed, so EOF is immediate.
-    /// The terminal comes back too, or a failed run wrecks the shell.
+    /// That the terminal comes back is `default_run_restores_the_terminal`'s: a
+    /// restore needs the foreground of a controlling terminal, and this has none.
     #[tokio::test]
     async fn pty_run_error_before_spawn_ends_pump() {
         let (terminal, terminal_slave) = open_pty().expect("a terminal to take over");
@@ -681,12 +682,9 @@ mod tests {
             let mut t: libc::termios = unsafe { std::mem::zeroed() };
             // SAFETY: a live fd and a live out-parameter.
             assert_eq!(unsafe { libc::tcgetattr(fd, &mut t) }, 0);
-            // PENDIN is the line discipline's state, set by BSD itself when
-            // ICANON comes back on.
-            t.c_lflag & !libc::PENDIN
+            t.c_lflag
         };
         let fd = terminal_slave.as_raw_fd();
-        let before = lflag(fd);
 
         let (sink, _out) = duplex(1024);
         let (session, ends) = PtySession::start_with(Options {
@@ -700,7 +698,6 @@ mod tests {
         let started = Instant::now();
         session.finish().await;
         assert!(started.elapsed() < LONG_LIMIT / 2, "waited for the limit");
-        assert_eq!(lflag(fd), before, "the terminal was not restored");
         drop(terminal);
     }
 

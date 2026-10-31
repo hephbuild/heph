@@ -121,15 +121,17 @@ fn main() -> ExitCode {
     // own short-lived engine on demand.
     clap_complete::CompleteEnv::with_factory(Cli::command).complete();
 
-    // Ignore SIGTTOU/SIGTTIN so terminal-control syscalls (tcsetattr,
-    // tcgetattr, tcsetpgrp …) from a background process group fail with
-    // EIO instead of stopping the process. Test subprocesses can move the
-    // foreground process group off heph3 (e.g. Go test runners that grab
-    // the terminal) and exit without restoring; the next TUI raw-mode
-    // toggle in `crossterm::terminal::enable_raw_mode` would otherwise
-    // freeze the entire process (observed as a deadlock — every thread
-    // stopped, tokio runtime appears hung). With these signals ignored,
-    // the call returns an error that the TUI can surface.
+    // Ignore SIGTTOU/SIGTTIN so terminal-control syscalls from a background
+    // process group do not stop the process. With SIGTTOU ignored, `tcsetattr`
+    // and `tcsetpgrp` from the background *succeed*, so whoever changes the
+    // terminal's settings checks that it is the foreground first
+    // (`hproc::pty::is_foreground`). With SIGTTIN ignored, a read of the
+    // terminal fails with EIO. Test subprocesses can move the foreground process
+    // group off heph3 (e.g. Go test runners that grab the terminal) and exit
+    // without restoring; the next TUI raw-mode toggle in
+    // `crossterm::terminal::enable_raw_mode` would otherwise freeze the entire
+    // process (observed as a deadlock — every thread stopped, tokio runtime
+    // appears hung).
     // SAFETY: signal(2) at process startup, before any thread spawns.
     unsafe {
         libc::signal(libc::SIGTTOU, libc::SIG_IGN);
