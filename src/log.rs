@@ -5,7 +5,11 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::tui::log_sink::{LogSink, MakeLogSink};
 
-pub fn init() -> LogSink {
+/// Install the subscriber. `quiet` is `heph run --raw`, whose stderr carries only
+/// failures: it lowers the default to `warn`, and `HEPH_LOG` still has the last
+/// word. The filter is fixed here, so the views need no quiet form of their own:
+/// `info!` is all they print on a healthy run.
+pub fn init(quiet: bool) -> LogSink {
     let sink = LogSink::new_direct();
 
     // fuser is chatty at info!/warn! during mount lifecycle. Cap it at
@@ -19,9 +23,11 @@ pub fn init() -> LogSink {
     // some other Rust tool in the same shell does not reconfigure heph.
     const LOG_ENV: &str = "HEPH_LOG";
     const DEFAULT_FILTER: &str = "info,fuser=error,object_store=warn";
+    const QUIET_FILTER: &str = "warn,fuser=error";
+    let default_filter = if quiet { QUIET_FILTER } else { DEFAULT_FILTER };
     let (filter, directives) = match EnvFilter::try_from_env(LOG_ENV) {
         Ok(filter) => (filter, std::env::var(LOG_ENV).unwrap_or_default()),
-        Err(_) => (EnvFilter::new(DEFAULT_FILTER), DEFAULT_FILTER.to_string()),
+        Err(_) => (EnvFilter::new(default_filter), default_filter.to_string()),
     };
     // Plugins get the same filter, so they drop what this subscriber would before
     // paying to forward it across the seam.

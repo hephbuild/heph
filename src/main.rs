@@ -144,7 +144,10 @@ fn main() -> ExitCode {
     // exhausted almost immediately on a wide build.
     heph::fdlimit::raise_open_file_limit();
 
-    let sink = log::init();
+    // Before the logger, which `run --raw` silences. A soft parse rather than a
+    // look through argv: after `--`, `--raw` is the tool's.
+    let soft_match = Cli::command().try_get_matches();
+    let sink = log::init(raw_requested(&soft_match));
     heph::tui::panic::install(sink.clone());
 
     // Self-upgrade BEFORE matching the command. A workspace can pin a newer heph
@@ -160,7 +163,6 @@ fn main() -> ExitCode {
     // positively recognizes a real, non-`version` command: `version` must work
     // outside a workspace, and an unrecognized command (the forward-compat case)
     // falls through so the real parse can emit clap's canonical diagnostic.
-    let soft_match = Cli::command().try_get_matches();
     match heph::selfupdate::maybe_self_upgrade() {
         Ok(()) => {}
         Err(heph::selfupdate::SelfUpgradeError::NoConfig) if no_config_tolerable(&soft_match) => {}
@@ -431,6 +433,13 @@ const NO_CONFIG_COMMANDS: &[&str] = &["version", "gen-docs"];
 /// (the `Err` case — a workspace pin may add it) falls through to the real parse,
 /// which surfaces clap's canonical error. Any other recognized command
 /// legitimately needs a workspace, so its `NoConfig` stays fatal.
+fn raw_requested(soft_match: &Result<clap::ArgMatches, clap::Error>) -> bool {
+    soft_match.as_ref().is_ok_and(|m| {
+        m.subcommand_matches("run")
+            .is_some_and(|run| run.get_flag("raw"))
+    })
+}
+
 fn no_config_tolerable(soft_match: &Result<clap::ArgMatches, clap::Error>) -> bool {
     match soft_match {
         Ok(m) => m

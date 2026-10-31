@@ -306,6 +306,56 @@ fn announce_mode(mode: TerminalMode, reason: ModeReason) {
     }
 }
 
+/// What a build target's run does with the terminal. The rule for entrypoints
+/// is [`choose_mode`]; none of this crosses the plugin seam for `--raw`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BuildDisplay {
+    /// Output is captured, under the TUI or the plain progress lines.
+    Captured,
+    /// `--raw`: no TUI, the action's output printed plainly.
+    Raw,
+    /// `--shell`: a shell in the sandbox, on the driver's own PTY.
+    Shell,
+}
+
+fn build_display(raw: bool, shell: bool) -> BuildDisplay {
+    if raw {
+        BuildDisplay::Raw
+    } else if shell {
+        BuildDisplay::Shell
+    } else {
+        BuildDisplay::Captured
+    }
+}
+
+/// A build target's `--raw`: the action's output goes to `streams`, through the
+/// driver's tee, so it is what `log.txt` holds, redaction included. It never
+/// passes stdin: the action reads /dev/null, or `printf A | heph run //x --raw`
+/// and `printf B | …` would share a hashin and B would get A's outputs.
+pub fn plain_output_wrapper<O, E>(
+    streams: impl Fn() -> (O, E) + Send + Sync + 'static,
+) -> InteractiveWrapper
+where
+    O: tokio::io::AsyncWrite + Send + Sync + Unpin + 'static,
+    E: tokio::io::AsyncWrite + Send + Sync + Unpin + 'static,
+{
+    use tokio::io::AsyncWriteExt as _;
+    Arc::new(move |inner| {
+        let (mut stdout, mut stderr) = streams();
+        Box::pin(async move {
+            let result = inner(None, Some(&mut stdout), Some(&mut stderr), None).await;
+            // A reader that went away (`| head -1`) is no failure of the run.
+            if let Err(error) = stdout.flush().await {
+                tracing::debug!(%error, "flushing stdout");
+            }
+            if let Err(error) = stderr.flush().await {
+                tracing::debug!(%error, "flushing stderr");
+            }
+            result
+        })
+    })
+}
+
 /// The caller's window size as it changes, for a build target's `--shell`, whose
 /// PTY is the driver's. Stops with the wrapper that holds it.
 struct WinsizeWatch {
@@ -629,7 +679,12 @@ impl App for RunApp {
     }
 
     async fn run(self, ctx: AppContext) -> anyhow::Result<Option<hcore::process::Exit>> {
-        let interactive: Option<InteractiveWrapper> = if ctx.interactive() {
+        let display = build_display(self.args.raw, self.args.shell.is_some());
+        let interactive: Option<InteractiveWrapper> = if display == BuildDisplay::Raw {
+            Some(plain_output_wrapper(|| {
+                (tokio::io::stdout(), tokio::io::stderr())
+            }))
+        } else if ctx.interactive() {
             let pauser = ctx.pauser();
             // Who owns Ctrl-C while the target holds the terminal. `--shell` puts
             // the user at a live shell inside the sandbox, and its keystrokes —
@@ -637,7 +692,7 @@ impl App for RunApp {
             // suppressed for its duration. A plain run is the opposite: nothing is
             // reading the keyboard, the terminal is merely on loan for the target's
             // output, and Ctrl-C must still cancel the run.
-            let pause_for = if self.args.shell.is_some() {
+            let pause_for = if display == BuildDisplay::Shell {
                 tui::PauseFor::Input
             } else {
                 tui::PauseFor::Output
@@ -899,6 +954,7 @@ async fn execute_async(args: RunArgs, sink: LogSink, global: GlobalOptions) -> a
     refuse_misplaced_tool_args(&args, &base_pkg)?;
     let m = resolve_matcher(&args.expr, &args.arg1, &args.arg2, &base_pkg, false)?;
     let (engine, shutdown) = bootstrap::new_engine()?;
+    let raw = args.raw;
     let app = RunApp {
         args,
         engine: std::sync::Arc::clone(&engine),
@@ -910,7 +966,7 @@ async fn execute_async(args: RunArgs, sink: LogSink, global: GlobalOptions) -> a
         approval: tui::ApprovalCenter::new(),
         label: SharedLabel::new(String::new()),
     };
-    let interactive = tui::should_use_tui(global.no_tui);
+    let interactive = tui::should_use_tui(global.no_tui || raw);
 
     // Stall watchdog. Registered before the run so it observes the whole stream.
     //
@@ -1175,6 +1231,12 @@ mod tests {
                 "{name}",
             );
         }
+
+        // A build target has no mode: only its display moves, on the flags alone.
+        // `--raw --shell` never reaches it (`refuse_raw_with_shell`).
+        assert_eq!(build_display(false, false), BuildDisplay::Captured);
+        assert_eq!(build_display(true, false), BuildDisplay::Raw);
+        assert_eq!(build_display(false, true), BuildDisplay::Shell);
     }
 
     /// Everything [`announce_mode`] logs at debug level and above, targets shown.
