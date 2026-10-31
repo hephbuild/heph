@@ -6,6 +6,7 @@ pub mod log_sink;
 pub mod panic;
 pub mod paused;
 pub mod progress;
+pub mod pty_session;
 pub mod stderr_backend;
 pub mod stdout_buffer;
 pub mod tty;
@@ -20,6 +21,7 @@ pub use progress::{
     BuildHeader, BuildState, CiProgressView, CountScope, GcCiView, GcHeader, HeaderItem,
     MIN_PROGRESS_ROWS, ProgressHeader, TuiProgressView, ViewMode, human_bytes, rows_for_height,
 };
+pub use pty_session::{PtyEnds, PtySession};
 pub use stdout_buffer::BufferedStdout;
 
 pub fn should_use_tui(force_off: bool) -> bool {
