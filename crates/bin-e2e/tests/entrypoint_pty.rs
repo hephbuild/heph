@@ -627,6 +627,23 @@ fn tool_dies_while_heph_stopped() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A wrapper sharing heph's group, as `make` or `/bin/sh -c 'heph …; echo after'`
+/// is, never stops with it, so the shell would never see a stop and the prompt
+/// would never come back. heph does not stop, and the wrapper carries on.
+#[test]
+fn self_stop_under_a_wrapper_continues_the_tool() -> anyhow::Result<()> {
+    let dist = Dist::locate();
+    let ws = workspace()?;
+    let mut pty = Pty::shell(&dist, ws.root(), &[]);
+    pty.type_line(r#"/bin/sh -c '"$HEPH" run //app:stopper; echo "after=$?="'"#);
+    pty.wait_for("about-to-stop", DEADLINE);
+    pty.wait_for("resumed-after-fg", SHORT);
+    pty.wait_for("after=4=", SHORT);
+    pty.wait_prompt();
+    assert!(pty.termios().is_cooked(), "{:?}", pty.termios());
+    Ok(())
+}
+
 /// Each stop hands back the termios the caller had, the second one included: a
 /// stop that captured the terminal again would capture the raw one. This shell
 /// does not reset the terminal when a job stops, as an interactive one does.

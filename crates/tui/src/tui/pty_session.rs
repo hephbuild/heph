@@ -316,9 +316,9 @@ impl Pump {
 
     /// Stop until heph is the foreground again, or skip it when nobody could ever
     /// resume heph: the terminal closed, the parent shell exited, no shell above
-    /// heph shares its session, or it was told to die. The checks also guard the
-    /// first stop, as a HUP-trapping tool can survive a closed terminal and then
-    /// stop.
+    /// heph shares its session, a wrapper shares its group, or it was told to die.
+    /// The checks also guard the first stop, as a HUP-trapping tool can survive a
+    /// closed terminal and then stop.
     async fn stop_and_resume(&mut self) {
         let Some(terminal) = &self.terminal else {
             return;
@@ -326,7 +326,10 @@ impl Pump {
         loop {
             // SAFETY: no preconditions.
             let parent_alive = unsafe { libc::getppid() } == self.parent;
-            let resumable = terminal_alive(terminal.fd) && parent_alive && parent_in_session();
+            let resumable = terminal_alive(terminal.fd)
+                && parent_alive
+                && parent_in_session()
+                && leads_own_group();
             if !resumable || self.dying.settled().await {
                 // Not going raw, and neither reading a terminal that a stopped
                 // heph may have lost.
@@ -376,6 +379,16 @@ fn parent_in_session() -> bool {
     let parent_session = unsafe { libc::getsid(parent) };
     // SAFETY: as above.
     parent_session >= 0 && parent_session == unsafe { libc::getsid(0) }
+}
+
+/// Whether heph is its group's leader, as a shell's job is. Otherwise a wrapper
+/// shares the group (`/bin/sh -c 'heph run //x; echo after'`, `make`) and does
+/// not stop with heph, so the shell never sees a stop and its prompt never comes.
+fn leads_own_group() -> bool {
+    // SAFETY: no preconditions.
+    let group = unsafe { libc::getpgrp() };
+    // SAFETY: no preconditions.
+    group == unsafe { libc::getpid() }
 }
 
 /// Stdin to the master.
