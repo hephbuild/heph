@@ -528,8 +528,8 @@ elsewhere.
 
 ## Redaction
 
-Declared credential values are scrubbed from a target's output **at the tee**,
-before any byte reaches `log.txt`. Redacting at render would be too late: the
+Declared credential values are scrubbed from a captured target's output **at the
+tee**, before any byte reaches `log.txt`. Redacting at render would be too late: the
 captured log is packed into the cache as an artifact and lifted into the failure
 event, the JSON output and the CI report.
 
@@ -551,8 +551,13 @@ It is best-effort by construction, and that is stated rather than hidden:
   answer there is not to.
 
 Ordinary output is never held back: the scrubber retains only a tail that is
-genuinely a partial match, so a `--shell` prompt still appears immediately and a
-streaming `terraform apply` still streams.
+genuinely a partial match, so a streaming `terraform apply` still streams.
+
+**An interactive run is neither scrubbed nor logged.** That is every entrypoint
+run and a build target's `--shell`. The tool or shell runs in your terminal, so
+one that prints a credential shows it, and `env` in a `--shell` shows the tokens
+it holds, in clear. A build target's `heph run --raw` is captured as usual, and
+so is redacted.
 
 ## The security boundary
 

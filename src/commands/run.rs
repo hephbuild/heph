@@ -99,6 +99,9 @@ pub struct RunArgs {
     /// dependencies of the run, and dependencies are not interactive. Shell
     /// into the member you want instead. Likewise for a multi-target selection,
     /// which names no single target at all.
+    ///
+    /// The session is neither logged nor redacted, so `env` in it shows any
+    /// credentials the target declares.
     #[arg(long = "shell", num_args = 0..=1, require_equals = true, default_missing_value = "", value_name = "TARGET",)]
     pub shell: Option<String>,
     /// Print output artifacts to stdout
@@ -126,7 +129,7 @@ pub struct RunArgs {
     ///
     /// On an entrypoint, the program runs on your terminal's own fds rather than
     /// on heph's PTY, with no byte passing through heph. That is what gives it
-    /// real Ctrl-Z and exact terminal behaviour, at the cost of a signal limit:
+    /// real Ctrl-Z and exact terminal behaviour, at the cost of two signal limits:
     /// see docs/ENTRYPOINTS.md. On a build target it changes only the display:
     /// the action's output is printed plainly, redacted as in `log.txt`, the
     /// action reads no stdin, and capture, runners and the cache are unchanged,
@@ -138,11 +141,12 @@ pub struct RunArgs {
     /// is the program's, flags included (`heph run //t:go -- --version`).
     ///
     /// An entrypoint runs in your directory, with your environment, and the run
-    /// ends as the program does. When stdin, stdout and stderr are all your
-    /// terminal, it runs on a PTY of heph's: the keyboard and the screen are
-    /// pumped through heph, and Ctrl-Z does nothing on a plain tool, since the
-    /// kernel discards it. A tool that stops itself stops heph too, which gives
-    /// your shell its prompt back; `bg` then leaves the tool stopped until `fg`.
+    /// ends as the program does. Its output is not redacted. When stdin, stdout
+    /// and stderr are all your terminal and the run is its foreground job, it
+    /// runs on a PTY of heph's: heph pumps the keyboard and the screen, and
+    /// Ctrl-Z does nothing on a plain tool, since the kernel discards it. A tool
+    /// that stops itself stops heph too, which gives your shell its prompt back;
+    /// the tool shows as stopped after `bg`, so run `fg`.
     /// Otherwise, or with `--raw`, it inherits heph's fds. Exit status:
     /// the program's own code, unchanged (0 included); killed by a signal,
     /// and the run dies of the same signal; 125 when the run failed before
