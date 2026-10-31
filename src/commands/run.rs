@@ -122,12 +122,28 @@ pub struct RunArgs {
     /// diagnostic box. The full log is always saved as the `log.txt` artifact.
     #[arg(long = "log-lines", value_name = "N", default_value_t = 10)]
     pub log_lines: usize,
+    /// Print only what the target prints: no TUI, no progress, stderr only for failures
+    ///
+    /// On an entrypoint, the program runs on your terminal's own fds rather than
+    /// on heph's PTY, with no byte passing through heph. That is what gives it
+    /// real Ctrl-Z and exact terminal behaviour, at the cost of a signal limit:
+    /// see docs/ENTRYPOINTS.md. On a build target it changes only the display:
+    /// the action's output is printed plainly, redacted as in `log.txt`, the
+    /// action reads no stdin, and capture, runners and the cache are unchanged,
+    /// so a cache hit prints nothing. Refused with `--shell`.
+    #[arg(long = "raw")]
+    pub raw: bool,
     /// Arguments for an entrypoint (`entrypoint = True`) that declares `args = True`,
     /// after `--`: appended to its command, verbatim. Everything after `--`
     /// is the program's, flags included (`heph run //t:go -- --version`).
     ///
-    /// An entrypoint runs in your terminal, in your directory, with your
-    /// environment, and the run ends as the program does. Exit status:
+    /// An entrypoint runs in your directory, with your environment, and the run
+    /// ends as the program does. When stdin, stdout and stderr are all your
+    /// terminal, it runs on a PTY of heph's: the keyboard and the screen are
+    /// pumped through heph, and Ctrl-Z does nothing on a plain tool, since the
+    /// kernel discards it. A tool that stops itself stops heph too, which gives
+    /// your shell its prompt back; `bg` then leaves the tool stopped until `fg`.
+    /// Otherwise, or with `--raw`, it inherits heph's fds. Exit status:
     /// the program's own code, unchanged (0 included); killed by a signal,
     /// and the run dies of the same signal; 125 when the run failed before
     /// the program started (a dependency, a refused argument, the closure,
@@ -144,10 +160,188 @@ pub struct RunArgs {
     /// what the run is still finishing (cache uploads); the exit status stays
     /// the program's. A program that traps INT and QUIT is
     /// stopped with `kill -9` on the run's pid; its supervisor then reaps
-    /// the program. `--shell` opens a shell with the same command ready:
-    /// `show` prints what `run` would execute.
+    /// the program. `--shell` opens a shell with the same command ready, always
+    /// on a PTY of heph's: `show` prints what `run` would execute.
     #[arg(last = true, value_name = "ARGS")]
     pub args: Vec<OsString>,
+}
+
+/// How an entrypoint run reaches the terminal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalMode {
+    /// On a PTY of heph's, which pumps it to and from the caller's terminal.
+    Pty,
+    /// On heph's own fds.
+    Inherit,
+}
+
+impl TerminalMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pty => "pty",
+            Self::Inherit => "inherit",
+        }
+    }
+}
+
+/// Why an entrypoint run took its [`TerminalMode`]: the `reason` on the
+/// `entrypoint_mode` event, which is how "which mode am I in?" gets answered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModeReason {
+    Default,
+    Flag,
+    Fd0NotTty,
+    Fd1NotTty,
+    Fd2NotTty,
+    NotForeground,
+    PluginNoPty,
+    Shell,
+}
+
+impl ModeReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Flag => "flag",
+            Self::Fd0NotTty => "fd0_not_tty",
+            Self::Fd1NotTty => "fd1_not_tty",
+            Self::Fd2NotTty => "fd2_not_tty",
+            Self::NotForeground => "not_foreground",
+            Self::PluginNoPty => "plugin_no_pty",
+            Self::Shell => "shell",
+        }
+    }
+}
+
+/// What the mode of an entrypoint run depends on.
+#[derive(Clone, Copy, Debug)]
+struct ModeFacts {
+    raw: bool,
+    shell: bool,
+    /// Whether fds 0, 1 and 2 are ttys.
+    ttys: [bool; 3],
+    /// Whether heph is the foreground job of the terminal on fd 0.
+    foreground: bool,
+    /// Whether the driver that spawns offered the PTY.
+    offered: bool,
+}
+
+impl ModeFacts {
+    /// Read off the process at the handover.
+    fn probe(raw: bool, shell: bool, offered: bool) -> Self {
+        use std::io::IsTerminal as _;
+        Self {
+            raw,
+            shell,
+            ttys: [
+                io::stdin().is_terminal(),
+                io::stdout().is_terminal(),
+                io::stderr().is_terminal(),
+            ],
+            foreground: hproc::pty::is_foreground(libc::STDIN_FILENO),
+            offered,
+        }
+    }
+}
+
+const RAW_WITH_SHELL: &str = "`--raw` and `--shell` cannot be combined: `--raw` keeps heph off the \
+     terminal, and a shell needs heph's PTY; drop one of them";
+
+/// `--raw` with `--shell`, refused before anything builds.
+pub fn refuse_raw_with_shell(raw: bool, shell: bool) -> anyhow::Result<()> {
+    anyhow::ensure!(!(raw && shell), RAW_WITH_SHELL);
+    Ok(())
+}
+
+/// The mode of an entrypoint run, in the order the docs state it. `Err` is a
+/// combination with no mode at all.
+fn choose_mode(facts: &ModeFacts) -> anyhow::Result<(TerminalMode, ModeReason)> {
+    refuse_raw_with_shell(facts.raw, facts.shell)?;
+    if facts.raw {
+        return Ok((TerminalMode::Inherit, ModeReason::Flag));
+    }
+    if facts.shell {
+        // `Engine::invoke` refuses this first, with the driver's name; a slave
+        // must still never reach a driver that did not offer to take it.
+        anyhow::ensure!(
+            facts.offered,
+            "`--shell` runs on a PTY, and the driver that spawns does not offer one"
+        );
+        return Ok((TerminalMode::Pty, ModeReason::Shell));
+    }
+    let [fd0, fd1, fd2] = facts.ttys;
+    let inherit = |reason| Ok((TerminalMode::Inherit, reason));
+    if !fd0 {
+        return inherit(ModeReason::Fd0NotTty);
+    }
+    if !fd1 {
+        return inherit(ModeReason::Fd1NotTty);
+    }
+    if !fd2 {
+        return inherit(ModeReason::Fd2NotTty);
+    }
+    if !facts.foreground {
+        return inherit(ModeReason::NotForeground);
+    }
+    if !facts.offered {
+        return inherit(ModeReason::PluginNoPty);
+    }
+    Ok((TerminalMode::Pty, ModeReason::Default))
+}
+
+/// Report the mode chosen: a `debug!` under its own target, so the default
+/// filter renders nothing and `2>&1 | jq` stays clean, and a `warn!` only for a
+/// run that wanted the PTY and could not have it.
+fn announce_mode(mode: TerminalMode, reason: ModeReason) {
+    tracing::debug!(
+        target: "entrypoint_mode",
+        mode = mode.as_str(),
+        reason = reason.as_str(),
+        "entrypoint_mode"
+    );
+    if reason == ModeReason::PluginNoPty {
+        tracing::warn!(
+            "the driver of this entrypoint offers no PTY; it runs on heph's own fds instead"
+        );
+    }
+}
+
+/// The caller's window size as it changes, for a build target's `--shell`, whose
+/// PTY is the driver's. Stops with the wrapper that holds it.
+struct WinsizeWatch {
+    sizes: crate::engine::driver::WinSizeReceiver,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl WinsizeWatch {
+    /// `None` with no terminal to follow, or no way to hear from it: the shell
+    /// then keeps the size it started with.
+    fn start() -> Option<Self> {
+        let initial = hproc::pty::caller_winsize()?;
+        let mut winch =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change()) {
+                Ok(winch) => winch,
+                Err(error) => {
+                    tracing::warn!(%error, "not following window size changes");
+                    return None;
+                }
+            };
+        let (tx, sizes) = tokio::sync::watch::channel(initial);
+        let task = tokio::spawn(async move {
+            while winch.recv().await.is_some() {
+                if let Some(size) = hproc::pty::caller_winsize() {
+                    tx.send_replace(size);
+                }
+            }
+        });
+        Some(Self { sizes, task })
+    }
+}
+
+impl Drop for WinsizeWatch {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 /// The program an entrypoint ran ended without success: heph exits as it did,
@@ -302,6 +496,11 @@ impl RunApp {
         // `tool_exited` once the tool is done.
         let held: Arc<std::sync::Mutex<Option<hcore::shutdown::TransparencyGuard>>> =
             Arc::default();
+        // The pump, when the handover chose the PTY: started there, finished by
+        // the wrapper below once the run returned.
+        let session: Arc<std::sync::Mutex<Option<tui::PtySession>>> = Arc::default();
+        let raw = self.args.raw;
+        let shell = self.args.shell.is_some();
         let mut req = InvokeRequest::new(addr, self.caller.cwd, self.caller.env)
             .with_args(self.args.args)
             .with_shell(self.args.shell.is_some())
@@ -309,9 +508,14 @@ impl RunApp {
             .with_dispositions(hcore::process::inherited_dispositions().to_vec())
             .with_nofile(hcore::process::inherited_nofile())
             .with_blocked(hcore::process::inherited_blocked().to_vec())
-            .with_handover(crate::engine::driver::Handover::new({
+            .with_handover(crate::engine::driver::Handover::deciding({
                 let held = Arc::clone(&held);
-                move || {
+                let session = Arc::clone(&session);
+                move |offered| {
+                    let (mode, reason) = choose_mode(&ModeFacts::probe(raw, shell, offered))?;
+                    // First: `Direct` is a synchronous stderr write, so the line
+                    // precedes raw mode with no flush.
+                    announce_mode(mode, reason);
                     // Transparent first: a Ctrl-C between the two must not
                     // cancel a run whose tool is about to own the terminal.
                     let guard = hcore::shutdown::hold_transparent();
@@ -321,6 +525,17 @@ impl RunApp {
                         // pid stop reaching it (the terminal's reach it anyway).
                         tracing::error!(error = ?error, "signal relay not installed");
                     }
+                    if mode != TerminalMode::Pty {
+                        return Ok(None);
+                    }
+                    let (pump, ends) =
+                        tui::PtySession::start().context("starting the PTY session")?;
+                    *session.lock().unwrap_or_else(|e| e.into_inner()) = Some(pump);
+                    Ok(Some(crate::engine::driver::PtyHandover {
+                        slave: ends.slave,
+                        stops: ends.stops,
+                        continues: ends.continues,
+                    }))
                 }
             }));
         // Neither the TUI nor the stall notice may draw over the tool, with or
@@ -330,36 +545,26 @@ impl RunApp {
         // Ctrl-C there must still cancel. From the handover the transparency
         // hold owns Ctrl-C, for a `--shell` session as much as for a tool.
         //
-        // A tool inherits heph's own fds, so no stream is handed in — except
-        // to a `--shell` session, which runs on a PTY of its own and is
-        // relayed to and from the terminal through them.
+        // A tool has heph's own fds or the PTY the handover picked, so no stream
+        // is handed in, whichever it was.
         let pauser = ctx.interactive().then(|| ctx.pauser());
-        let shell = self.args.shell.is_some();
         let pause: InteractiveWrapper = Arc::new(move |inner| {
             let pauser = pauser.clone();
+            let session = Arc::clone(&session);
             Box::pin(async move {
                 let _guard = match &pauser {
                     Some(p) => Some(p.pause_for(tui::PauseFor::Output).await),
                     None => None,
                 };
                 let _quiet = hengine::engine::diag::global().suppress_stall();
-                if !shell {
-                    return inner(None, None, None, None).await;
+                let result = inner(None, None, None, None).await;
+                // Before `_guard` resumes the TUI, and before any error renders:
+                // this leaves the terminal cooked again, whatever the run returned.
+                let pump = session.lock().unwrap_or_else(|e| e.into_inner()).take();
+                if let Some(pump) = pump {
+                    pump.finish().await;
                 }
-                // As for a build's `--shell`: `TtyReader`, not tokio's stdin,
-                // whose blocking read could not be cancelled at exit.
-                let mut stdin = tui::tty::TtyReader::from_stdin().ok();
-                let mut stdout = tokio::io::stdout();
-                let mut stderr = tokio::io::stderr();
-                inner(
-                    stdin
-                        .as_mut()
-                        .map(|s| s as &mut (dyn tokio::io::AsyncRead + Send + Sync + Unpin)),
-                    Some(&mut stdout),
-                    Some(&mut stderr),
-                    None,
-                )
-                .await
+                result
             })
         });
         req = req.with_wrapper(pause);
@@ -462,13 +667,17 @@ impl App for RunApp {
                     let mut stdin = tui::tty::TtyReader::from_stdin().ok();
                     let mut stdout = tokio::io::stdout();
                     let mut stderr = tokio::io::stderr();
+                    // A `--shell`'s PTY is the driver's, so the size travels to it.
+                    let winsize = (pause_for == tui::PauseFor::Input)
+                        .then(WinsizeWatch::start)
+                        .flatten();
                     inner(
                         stdin
                             .as_mut()
                             .map(|s| s as &mut (dyn tokio::io::AsyncRead + Send + Sync + Unpin)),
                         Some(&mut stdout),
                         Some(&mut stderr),
-                        None,
+                        winsize.as_ref().map(|w| w.sizes.clone()),
                     )
                     .await
                 })
@@ -678,6 +887,7 @@ pub fn execute(args: &RunArgs, sink: LogSink, global: &GlobalOptions) -> anyhow:
 }
 
 async fn execute_async(args: RunArgs, sink: LogSink, global: GlobalOptions) -> anyhow::Result<()> {
+    refuse_raw_with_shell(args.raw, args.shell.is_some())?;
     // Raw, before anything else reads either: what an entrypoint runs with.
     // Not the engine's memoized cwd — the caller's cwd may be outside the
     // workspace, and an entrypoint runs there.
@@ -858,6 +1068,222 @@ mod tests {
             .expect("an unknown flag");
         let rendered = err.render().to_string();
         assert!(rendered.contains("-- --verbose-tool"), "{rendered}");
+    }
+
+    fn facts(
+        raw: bool,
+        shell: bool,
+        ttys: [bool; 3],
+        foreground: bool,
+        offered: bool,
+    ) -> ModeFacts {
+        ModeFacts {
+            raw,
+            shell,
+            ttys,
+            foreground,
+            offered,
+        }
+    }
+
+    /// The rule of the mode, written out independently of `choose_mode`'s order
+    /// of early returns: `None` is a refusal.
+    fn expected(f: &ModeFacts) -> Option<(TerminalMode, ModeReason)> {
+        use ModeReason as R;
+        use TerminalMode::{Inherit, Pty};
+        Some(match f {
+            ModeFacts {
+                raw: true,
+                shell: true,
+                ..
+            } => return None,
+            ModeFacts { raw: true, .. } => (Inherit, R::Flag),
+            ModeFacts {
+                shell: true,
+                offered: false,
+                ..
+            } => return None,
+            ModeFacts { shell: true, .. } => (Pty, R::Shell),
+            ModeFacts {
+                ttys: [false, _, _],
+                ..
+            } => (Inherit, R::Fd0NotTty),
+            ModeFacts {
+                ttys: [_, false, _],
+                ..
+            } => (Inherit, R::Fd1NotTty),
+            ModeFacts {
+                ttys: [_, _, false],
+                ..
+            } => (Inherit, R::Fd2NotTty),
+            ModeFacts {
+                foreground: false, ..
+            } => (Inherit, R::NotForeground),
+            ModeFacts { offered: false, .. } => (Inherit, R::PluginNoPty),
+            _ => (Pty, R::Default),
+        })
+    }
+
+    const BOOLS: [bool; 2] = [false, true];
+
+    /// {`--raw`, `--shell`, neither} (and both, refused) × tty or not on each of
+    /// fds 0, 1, 2 × foreground or not × offered or not, for an entrypoint and
+    /// for a build target.
+    #[test]
+    fn mode_choice_table() {
+        let mut rows = 0;
+        for raw in BOOLS {
+            for shell in BOOLS {
+                for fd0 in BOOLS {
+                    for fd1 in BOOLS {
+                        for fd2 in BOOLS {
+                            for foreground in BOOLS {
+                                for offered in BOOLS {
+                                    let f = facts(raw, shell, [fd0, fd1, fd2], foreground, offered);
+                                    assert_eq!(choose_mode(&f).ok(), expected(&f), "{f:?}");
+                                    rows += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(rows, 4 * 8 * 2 * 2);
+
+        // The named rows: each inherits, on any partial redirect.
+        for (name, ttys, reason) in [
+            (
+                "stdin tty, stdout a file",
+                [true, false, true],
+                ModeReason::Fd1NotTty,
+            ),
+            (
+                "stdout tty, stdin a file",
+                [false, true, true],
+                ModeReason::Fd0NotTty,
+            ),
+            (
+                "only stderr redirected",
+                [true, true, false],
+                ModeReason::Fd2NotTty,
+            ),
+        ] {
+            assert_eq!(
+                choose_mode(&facts(false, false, ttys, true, true)).ok(),
+                Some((TerminalMode::Inherit, reason)),
+                "{name}",
+            );
+        }
+    }
+
+    /// Everything [`announce_mode`] logs at debug level and above, targets shown.
+    fn captured_log(f: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl io::Write for Buf {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        String::from_utf8(buf.0.lock().expect("log buffer").clone()).expect("utf-8 log")
+    }
+
+    #[test]
+    fn entrypoint_mode_event_reasons() {
+        let on_a_terminal = [true, true, true];
+        for (f, mode, reason) in [
+            (
+                facts(false, false, on_a_terminal, true, true),
+                "pty",
+                "default",
+            ),
+            (
+                facts(true, false, on_a_terminal, true, true),
+                "inherit",
+                "flag",
+            ),
+            (
+                facts(false, false, [false, true, true], true, true),
+                "inherit",
+                "fd0_not_tty",
+            ),
+            (
+                facts(false, false, [true, false, true], true, true),
+                "inherit",
+                "fd1_not_tty",
+            ),
+            (
+                facts(false, false, [true, true, false], true, true),
+                "inherit",
+                "fd2_not_tty",
+            ),
+            (
+                facts(false, false, on_a_terminal, false, true),
+                "inherit",
+                "not_foreground",
+            ),
+            (
+                facts(false, false, on_a_terminal, true, false),
+                "inherit",
+                "plugin_no_pty",
+            ),
+            (
+                facts(false, true, [false, false, false], false, true),
+                "pty",
+                "shell",
+            ),
+        ] {
+            let (m, r) = choose_mode(&f).expect("a mode");
+            let log = captured_log(|| announce_mode(m, r));
+            assert!(
+                log.contains("DEBUG entrypoint_mode:")
+                    && log.contains(&format!("mode=\"{mode}\""))
+                    && log.contains(&format!("reason=\"{reason}\"")),
+                "{f:?}: {log}"
+            );
+        }
+    }
+
+    /// The host's half; the engine's, that `offered` reflects the driver that
+    /// spawns, is the test of this name in `crates/e2e/tests/entrypoint.rs`.
+    #[test]
+    fn pty_fallback_warns_when_plugin_offers_none() {
+        let on_a_terminal = [true, true, true];
+        let (mode, reason) =
+            choose_mode(&facts(false, false, on_a_terminal, true, false)).expect("falls back");
+        assert_eq!(mode, TerminalMode::Inherit);
+        let log = captured_log(|| announce_mode(mode, reason));
+        assert!(
+            log.contains("WARN") && log.contains("offers no PTY"),
+            "{log}"
+        );
+
+        // Nothing to warn of when the PTY was never in question.
+        let (mode, reason) = choose_mode(&facts(false, false, [false, true, true], true, false))
+            .expect("a redirected run inherits");
+        let log = captured_log(|| announce_mode(mode, reason));
+        assert!(!log.contains("WARN"), "{log}");
+
+        // `--shell` has no inherited form.
+        let err = choose_mode(&facts(false, true, on_a_terminal, true, false))
+            .expect_err("nothing to fall back to");
+        assert!(format!("{err:#}").contains("does not offer"), "{err:#}");
     }
 
     /// Non-UTF-8 args reach the tool byte for byte.
