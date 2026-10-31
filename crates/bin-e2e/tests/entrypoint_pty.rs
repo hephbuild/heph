@@ -775,6 +775,33 @@ fn bg_leaves_tool_stopped_until_fg() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `kill -STOP <heph>` under a tool that keeps running, then `bg`: a read of the
+/// terminal from the background fails, which is no end of stdin. heph stops until
+/// it is the foreground again, and after `fg` the keyboard still works.
+#[test]
+fn stop_bg_fg_keeps_the_keyboard() -> anyhow::Result<()> {
+    let dist = Dist::locate();
+    let ws = workspace()?;
+    let mut pty = Pty::shell(&dist, ws.root(), &[]);
+    pty.type_line(r#""$HEPH" run //app:reader"#);
+    pty.wait_for("read-ready", DEADLINE);
+    let heph = pty.number_after("heph-pid-");
+
+    common::signal(heph, libc::SIGSTOP);
+    pty.wait_prompt();
+    pty.type_line("bg");
+    pty.wait_prompt();
+    job_stops_again(&mut pty);
+
+    pty.type_line("fg");
+    pty.type_line("typed-after-fg");
+    pty.wait_for("line-[typed-after-fg]", SHORT);
+    pty.type_line("quit");
+    pty.wait_prompt();
+    assert_eq!(pty.last_status(), 5, "{}", pty.seen());
+    Ok(())
+}
+
 /// A TERM to a stopped heph waits like any signal to a stopped process: the
 /// shell's echo proves the window passed with heph still stopped and silent.
 /// After `fg` it is forwarded, once; the USR1 behind it is the barrier.
