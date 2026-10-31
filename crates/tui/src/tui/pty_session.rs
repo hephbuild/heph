@@ -12,8 +12,11 @@
 //! failed before spawning closed the slave, so its drain ends at once.
 //!
 //! Memory stays fixed: one reused buffer per direction, and a direction does not
-//! read until it has written and flushed what it holds, so a slow fd 1 backs up
-//! into the PTY and from there into the tool.
+//! read until it has written what it holds, so a slow fd 1 backs up into the PTY
+//! and from there into the tool. Output flushes when the master has nothing more
+//! to read, since a flush is a trip to the blocking pool and the next write
+//! carries the bytes along anyway; and before a stop and throughout the drain,
+//! where nothing may be left behind.
 //!
 //! Each direction advances by one `step`, whose every await is a single
 //! cancel-safe primitive, because `select!` drops the losing branches.
@@ -36,7 +39,10 @@ use tokio::task::JoinHandle;
 
 use super::tty::TtyReader;
 
+/// Stdin is a keyboard, or at worst a paste.
 const BUF_SIZE: usize = 8 * 1024;
+/// Output can be a flood, and each write of it is a trip to the blocking pool.
+const OUTPUT_BUF_SIZE: usize = 64 * 1024;
 /// How much a stop reads from the master before stopping regardless, so a tool
 /// that keeps writing (another process in its group) cannot delay the stop.
 const STOP_READ_BOUND: usize = 64 * 1024;
@@ -168,7 +174,7 @@ impl PtySession {
             output: Output {
                 reader,
                 sink: options.sink,
-                buf: Box::new([0; BUF_SIZE]),
+                buf: Box::new([0; OUTPUT_BUF_SIZE]),
                 pos: 0,
                 len: 0,
                 flush_owed: false,
@@ -452,7 +458,7 @@ impl Input {
 struct Output {
     reader: AsyncPty,
     sink: Box<dyn AsyncWrite + Send + Unpin>,
-    buf: Box<[u8; BUF_SIZE]>,
+    buf: Box<[u8; OUTPUT_BUF_SIZE]>,
     pos: usize,
     len: usize,
     flush_owed: bool,
@@ -472,7 +478,29 @@ impl Output {
         self.pos < self.len || self.flush_owed
     }
 
+    /// One step while the tool runs: a flush waits for as long as the master has
+    /// more, and is immediate once it has none, so a prompt is not held back.
     async fn step(&mut self) {
+        if self.flush_owed && self.pos >= self.len && !self.eof && self.read_ahead() {
+            return;
+        }
+        self.step_flushing().await;
+    }
+
+    /// Whether a non-blocking read of the master found anything to account for.
+    fn read_ahead(&mut self) -> bool {
+        let now = self.reader.read_now(self.buf.as_mut_slice());
+        if matches!(&now, Err(e) if e.kind() == io::ErrorKind::WouldBlock) {
+            return false;
+        }
+        self.took(now);
+        true
+    }
+
+    /// One step that flushes as soon as all it holds is written. Bounded paths
+    /// take this: a tool that keeps writing would otherwise put the flush off past
+    /// the end of the bound.
+    async fn step_flushing(&mut self) {
         if let Some(pending) = self.buf.get(self.pos..self.len).filter(|p| !p.is_empty()) {
             if self.sink_dead {
                 self.dropped += pending.len() as u64;
@@ -538,7 +566,7 @@ impl Output {
     /// Run to the end of output: the master closed and all of it reached fd 1.
     async fn drain(&mut self) {
         while !self.eof || self.holds_data() {
-            self.step().await;
+            self.step_flushing().await;
         }
     }
 
@@ -550,7 +578,7 @@ impl Output {
             let mut read = 0;
             loop {
                 while self.holds_data() {
-                    self.step().await;
+                    self.step_flushing().await;
                 }
                 if self.eof || read >= STOP_READ_BOUND {
                     return;
@@ -586,9 +614,9 @@ mod tests {
     /// Far beyond anything a test should wait for, so that a bounded elapsed time
     /// proves the drain ended by itself and not at the limit.
     const LONG_LIMIT: Duration = Duration::from_secs(60);
-    /// The most that a stalled sink may let in: the PTY's own queues and our
-    /// buffers. Tens of KiB in practice, on both OSes.
-    const STALL_BOUND: usize = 512 * 1024;
+    /// The most that a stalled sink may let in: the output buffer, and the PTY's
+    /// own queues, which are tens of KiB on both OSes.
+    const STALL_BOUND: usize = OUTPUT_BUF_SIZE + 64 * 1024;
 
     fn options(sink: DuplexStream, limit: Duration) -> Options {
         Options {
@@ -720,6 +748,144 @@ mod tests {
         session.finish().await;
         assert!(started.elapsed() < LONG_LIMIT / 2, "waited for the limit");
         drop(terminal);
+    }
+
+    /// A line-buffered fd 1 in miniature: what it was written shows only once
+    /// flushed, which is how `tokio::io::stdout` treats a line with no newline yet.
+    struct FlushedSink {
+        unflushed: Vec<u8>,
+        shown: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl AsyncWrite for FlushedSink {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            self.unflushed.extend_from_slice(buf);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            let unflushed = std::mem::take(&mut self.unflushed);
+            self.shown.lock().expect("lock").extend(unflushed);
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    fn flushed_sink() -> (
+        Box<dyn AsyncWrite + Send + Unpin>,
+        std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    ) {
+        let shown = std::sync::Arc::default();
+        let sink = FlushedSink {
+            unflushed: Vec::new(),
+            shown: std::sync::Arc::clone(&shown),
+        };
+        (Box::new(sink), shown)
+    }
+
+    /// A prompt has no newline and nothing follows it. With the master idle, the
+    /// flush has to come by itself, with the slave still open and the run going.
+    #[tokio::test]
+    async fn an_idle_master_flushes_at_once() {
+        let (sink, shown) = flushed_sink();
+        let (session, ends) = PtySession::start_with(Options {
+            sink,
+            stdin: None,
+            terminal: None,
+            limit: LONG_LIMIT,
+        })
+        .expect("start the session");
+        let mut slave = std::fs::File::from(ends.slave);
+        slave.write_all(b"prompt> ").expect("write");
+        timeout(Duration::from_secs(30), async {
+            while shown.lock().expect("lock").as_slice() != b"prompt> " {
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the prompt reaches fd 1 with the tool still running");
+        drop(slave);
+        session.finish().await;
+    }
+
+    /// A drain cut at the limit, the slave still open: what it read has reached
+    /// fd 1 by the time the session ends, ahead of the terminal coming back.
+    #[tokio::test]
+    async fn a_cut_drain_leaves_nothing_unflushed() {
+        let (sink, shown) = flushed_sink();
+        let (session, ends) = PtySession::start_with(Options {
+            sink,
+            stdin: None,
+            terminal: None,
+            limit: Duration::from_millis(200),
+        })
+        .expect("start the session");
+        let mut slave = std::fs::File::from(ends.slave);
+        slave.write_all(b"no newline").expect("write");
+        session.finish().await;
+        assert_eq!(shown.lock().expect("lock").as_slice(), b"no newline");
+        drop(slave);
+    }
+
+    /// A tool that never pauses must neither put off a stop nor the flush ahead of
+    /// it: the settle reads a bounded amount, then flushes, whatever is still
+    /// arriving.
+    #[tokio::test]
+    async fn a_stop_flushes_under_a_tool_that_keeps_writing() {
+        let (_terminal, terminal_slave) = open_pty().expect("a terminal to take over");
+        let (sink, shown) = flushed_sink();
+        let (session, mut ends) = PtySession::start_with(Options {
+            sink,
+            stdin: None,
+            terminal: Some(terminal_slave.as_raw_fd()),
+            limit: LONG_LIMIT,
+        })
+        .expect("start the session");
+        let mut slave = std::fs::File::from(ends.slave);
+        let writing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (first_write, wrote) = oneshot::channel();
+        let writer = std::thread::spawn({
+            let writing = std::sync::Arc::clone(&writing);
+            move || {
+                let mut first_write = Some(first_write);
+                while writing.load(std::sync::atomic::Ordering::Relaxed) {
+                    if slave.write_all(&[b'x'; 4096]).is_err() {
+                        break;
+                    }
+                    if let Some(first_write) = first_write.take() {
+                        first_write.send(()).expect("the test is waiting");
+                    }
+                }
+            }
+        });
+        // Or the stop can be answered with nothing yet written to flush.
+        wrote.await.expect("the writer wrote");
+        ends.stops.send(()).expect("send the stop");
+        timeout(Duration::from_secs(30), ends.continues.recv())
+            .await
+            .expect("the tool is continued, however much it writes")
+            .expect("the pump is still there");
+        assert!(
+            !shown.lock().expect("lock").is_empty(),
+            "the stop did not flush"
+        );
+        writing.store(false, std::sync::atomic::Ordering::Relaxed);
+        // Blocking would keep the pump from the read the writer is waiting on.
+        tokio::task::spawn_blocking(move || writer.join().expect("the writer ends"))
+            .await
+            .expect("join the writer");
+        session.finish().await;
     }
 
     /// A tool's background job keeps the slave open: the drain stops at the limit.
