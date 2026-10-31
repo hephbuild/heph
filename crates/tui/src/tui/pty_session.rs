@@ -315,9 +315,10 @@ impl Pump {
     }
 
     /// Stop until heph is the foreground again, or skip it when nobody could ever
-    /// resume heph: the terminal closed, the parent shell exited, or it was told
-    /// to die. The checks also guard the first stop, as a HUP-trapping tool can
-    /// survive a closed terminal and then stop.
+    /// resume heph: the terminal closed, the parent shell exited, no shell above
+    /// heph shares its session, or it was told to die. The checks also guard the
+    /// first stop, as a HUP-trapping tool can survive a closed terminal and then
+    /// stop.
     async fn stop_and_resume(&mut self) {
         let Some(terminal) = &self.terminal else {
             return;
@@ -325,7 +326,7 @@ impl Pump {
         loop {
             // SAFETY: no preconditions.
             let parent_alive = unsafe { libc::getppid() } == self.parent;
-            let resumable = terminal_alive(terminal.fd) && parent_alive;
+            let resumable = terminal_alive(terminal.fd) && parent_alive && parent_in_session();
             if !resumable || self.dying.settled().await {
                 // Not going raw, and neither reading a terminal that a stopped
                 // heph may have lost.
@@ -362,6 +363,19 @@ impl Pump {
             tracing::debug!(%error, "could not copy the window size to the PTY");
         }
     }
+}
+
+/// Whether heph's parent is in heph's session. A job-control shell always is, so
+/// without it (`ssh -t host heph run //x`, `tmux new heph …`, heph leading the
+/// session or otherwise orphaned) a stopped heph has nobody to resume it. An
+/// error counts as no.
+fn parent_in_session() -> bool {
+    // SAFETY: no preconditions.
+    let parent = unsafe { libc::getppid() };
+    // SAFETY: no preconditions; a pid `getsid` may not ask about is an error.
+    let parent_session = unsafe { libc::getsid(parent) };
+    // SAFETY: as above.
+    parent_session >= 0 && parent_session == unsafe { libc::getsid(0) }
 }
 
 /// Stdin to the master.
