@@ -104,16 +104,21 @@ checked in this order, and the first that holds wins:
 | `inherit` | `fd0_not_tty` | stdin is not a terminal. |
 | `inherit` | `fd1_not_tty` | stdout is not a terminal. |
 | `inherit` | `fd2_not_tty` | stderr is not a terminal. |
-| `inherit` | `not_foreground` | heph is not the foreground job of the terminal on stdin: `heph run //x &`, `timeout 5 heph run //x`. |
+| `inherit` | `not_foreground` | heph is not the foreground job of the terminal on stdin: `heph run //x &`, or `timeout 5 heph run //x` in a script. |
 | `inherit` | `plugin_no_pty` | The target's driver offers no PTY. heph also warns. |
 | `pty` | `default` | None of the above. |
 
 Asking can change the answer. The line goes to stderr, so capturing it with
 `2>file` makes the run `fd2_not_tty`. Read it on the terminal.
 
-A background job or a backgrounding wrapper such as `timeout` also loses the TUI,
-for any `heph` command. With no TUI to prompt in, the approval handler refuses an
+A background job or a backgrounding wrapper also loses the TUI, for any `heph`
+command. With no TUI to prompt in, the approval handler refuses an
 `approval`-gated target rather than prompting; `--auto-approve` lets it through.
+
+`timeout` is such a wrapper only sometimes, because it puts itself in a process
+group of its own. In a script, that group is not the terminal's foreground, so the
+run inherits. At an interactive shell, job control has already made `timeout` the
+leader of the foreground job, so heph stays in the foreground and takes the PTY.
 
 ### Ctrl-Z
 
