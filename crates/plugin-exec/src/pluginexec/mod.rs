@@ -2444,10 +2444,12 @@ impl Driver {
         // bounds the drain, a child that is simultaneously ignoring >64 KiB
         // of stdin and producing more than the drain bound would deadlock:
         // we would be blocked writing its stdin while it blocks writing its
-        // stdout. Unreachable as wired — pipe-mode stdin exists only for
-        // interactive runs, where the source is a tty relay measured in
-        // keystrokes — but it is the reason a future non-tty stdin source
-        // needs its own task, not another `join!` arm.
+        // stdout. Pipe-mode stdin is reached only by a plain build whose fd 0
+        // is a terminal: a `--shell` is on a PTY, and a piped fd 0 is never
+        // passed to a build (`heph run`'s wrapper). So the source is what a
+        // person types or pastes, and only a paste past 64 KiB into a child
+        // doing the above can get here. It is the reason a future non-tty
+        // stdin source needs its own task, not another `join!` arm.
         enum IoFutures<'r> {
             Pty {
                 stdin: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'r>>,

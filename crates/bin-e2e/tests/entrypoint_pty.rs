@@ -1420,3 +1420,61 @@ fn raw_build_target_gets_no_stdin() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// What the cache holds for `//app:stdin_action`, asked with nothing on stdin.
+fn cached_stdin_action(dist: &Dist, ws: &Workspace) -> anyhow::Result<String> {
+    use std::process::Stdio;
+
+    let child = ws
+        .cmd(
+            dist,
+            &["--no-tui", "run", "//app:stdin_action", "--cat-out"],
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let out = common::wait_output(child, common::RUN_DEADLINE)?;
+    assert!(out.status.success(), "{}", common::describe(&out));
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// A plain build under the TUI, so stderr is a terminal and the run is not
+/// `--raw`, with fd 0 piped or a file. Stdin is no input of the cache key, so an
+/// action must not see it: the run that came second would get the first one's
+/// artifact. Only a terminal's keystrokes still reach a build, a hole reserved
+/// for the person typing them.
+#[test]
+fn piped_stdin_does_not_reach_a_cached_build() -> anyhow::Result<()> {
+    let dist = Dist::locate();
+
+    let ws = workspace()?;
+    for piped in ["A", "B"] {
+        let command = format!(r#"printf {piped} | "$HEPH" run //app:stdin_action"#);
+        let (pty, status) = run_held(&dist, &ws, &command, &[], |_| {});
+        assert_eq!(status, 0, "{}", pty.seen());
+        assert!(
+            !pty.seen().contains(&format!("saw=[{piped}]")),
+            "the pipe reached the action\n{}",
+            pty.seen()
+        );
+        assert_eq!(
+            cached_stdin_action(&dist, &ws)?,
+            "saw=[]\n",
+            "piped {piped}"
+        );
+    }
+
+    let ws = workspace()?;
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join("stdin");
+    std::fs::write(&file, b"F")?;
+    let command = format!(
+        r#""$HEPH" run //app:stdin_action < "{}""#,
+        file.to_string_lossy()
+    );
+    let (pty, status) = run_held(&dist, &ws, &command, &[], |_| {});
+    assert_eq!(status, 0, "{}", pty.seen());
+    assert_eq!(cached_stdin_action(&dist, &ws)?, "saw=[]\n", "from a file");
+    Ok(())
+}

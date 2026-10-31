@@ -704,6 +704,8 @@ impl App for RunApp {
             Some(Arc::new(move |inner| {
                 let pauser = pauser.clone();
                 Box::pin(async move {
+                    use std::io::IsTerminal as _;
+
                     let _guard = pauser.pause_for(pause_for).await;
                     // A `--shell` target parks a person at a prompt: nothing
                     // opens, closes or moves bytes for as long as they think,
@@ -723,7 +725,16 @@ impl App for RunApp {
                     // until the user produces another keystroke. TtyReader
                     // also works on macOS PTY-slave fds where mio's AsyncFd
                     // rejects the registration with EINVAL.
-                    let mut stdin = tui::tty::TtyReader::from_stdin().ok();
+                    //
+                    // A plain build gets stdin only from a terminal. Stdin is no
+                    // input of the cache key, so a pipe or a file reaching the
+                    // action would put its bytes in the artifact the next run,
+                    // with other bytes, gets from the cache. Typed keystrokes
+                    // stay as they are: that hole is reserved for the user.
+                    let mut stdin = (pause_for == tui::PauseFor::Input
+                        || io::stdin().is_terminal())
+                    .then(tui::tty::TtyReader::from_stdin)
+                    .and_then(Result::ok);
                     let mut stdout = tokio::io::stdout();
                     let mut stderr = tokio::io::stderr();
                     // A `--shell`'s PTY is the driver's, so the size travels to it.
