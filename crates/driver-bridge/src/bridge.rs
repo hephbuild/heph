@@ -113,7 +113,7 @@ impl Driver for ManagedDriverBridge {
         req: RunRequest<'a, 'io>,
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<RunResponse> {
-        let pick = self.pick(&req.inputs)?;
+        let pick = self.pick(&req)?;
         htelemetry::telemetry::record_sandbox(matches!(pick, Pick::Fuse));
         match pick {
             Pick::Os => self.os.run_inner(req, ctoken, false).await,
@@ -129,7 +129,7 @@ impl Driver for ManagedDriverBridge {
         req: RunRequest<'a, 'io>,
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<RunResponse> {
-        let pick = self.pick(&req.inputs)?;
+        let pick = self.pick(&req)?;
         htelemetry::telemetry::record_sandbox(matches!(pick, Pick::Fuse));
         // An interactive sandbox shell was actually entered (not just `--shell`
         // requested then errored upstream).
@@ -152,7 +152,18 @@ enum Pick {
 impl ManagedDriverBridge {
     /// Decides os vs fuse based on `FuseConfig` and (auto only) input
     /// walk. Errors when `enabled=true` but no FUSE mount available.
-    fn pick(&self, inputs: &[RunInput]) -> anyhow::Result<Pick> {
+    ///
+    /// An entrypoint's run is always the OS copy, whatever the config (Open
+    /// 8): its sandbox is a unique per-invocation directory the engine
+    /// creates, owns through a lock file inside it and removes itself, while
+    /// the FUSE runner redirects `sandbox_dir` into its upper side and owns
+    /// that teardown. Its read-only inputs are linked from the stage exactly
+    /// as a build's are (R29).
+    fn pick(&self, req: &RunRequest<'_, '_>) -> anyhow::Result<Pick> {
+        if req.target.entrypoint.is_some() {
+            return Ok(Pick::Os);
+        }
+        let inputs: &[RunInput] = &req.inputs;
         match self.cfg {
             FuseMode::Off => Ok(Pick::Os),
             FuseMode::On => {
@@ -191,7 +202,7 @@ mod shell_fallback_tests {
     use std::fs;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    struct NoShellDriver;
+    pub(super) struct NoShellDriver;
 
     #[async_trait]
     impl ManagedDriver for NoShellDriver {
@@ -253,16 +264,8 @@ mod shell_fallback_tests {
             self.parse_called.store(true, Ordering::SeqCst);
             Ok(ParseResponse {
                 target_def: TargetDef {
-                    addr: Default::default(),
-                    labels: vec![],
                     raw_def: Arc::new("recorded-shell-def".to_string()),
-                    inputs: vec![],
-                    outputs: vec![],
-                    support_files: vec![],
-                    cache: hplugin::driver::targetdef::CacheConfig::off(),
-                    pty: false,
-                    hash: vec![],
-                    transparent: false,
+                    ..Default::default()
                 },
             })
         }
@@ -324,33 +327,10 @@ mod shell_fallback_tests {
         let sandbox = tmp.path().join("sandbox");
         fs::create_dir_all(&sandbox)?;
 
-        let target_def = TargetDef {
-            addr: Default::default(),
-            labels: vec![],
-            raw_def: Arc::new(()),
-            inputs: vec![],
-            outputs: vec![],
-            support_files: vec![],
-            cache: hplugin::driver::targetdef::CacheConfig::off(),
-            pty: false,
-            hash: vec![],
-            transparent: false,
-        };
+        let target_def = TargetDef::default();
         let request_id = "shell-fallback-test".to_string();
-        let req = RunRequest {
-            request_id: &request_id,
-            target: &target_def,
-            tree_root_path: tmp.path().to_path_buf(),
-            inputs: vec![],
-            hashin: "",
-            stdin: None,
-            stdout: None,
-            stderr: None,
-            sandbox_dir: sandbox.clone(),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        };
+        let mut req = RunRequest::new(&request_id, &target_def, sandbox.clone());
+        req.tree_root_path = tmp.path().to_path_buf();
 
         bridge.run_shell(req, &ctoken).await?;
 
@@ -363,5 +343,42 @@ mod shell_fallback_tests {
             "fallback driver's run_shell must be called",
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod pick_tests {
+    use super::*;
+    use hplugin::driver::targetdef::{Entrypoint, TargetDef, Workdir};
+
+    /// An entrypoint's run never goes through FUSE, even with `fuse.enabled`
+    /// forced on: its sandbox is the engine's own per-invocation directory
+    /// (Open 8). A build with the same config still asks for FUSE.
+    #[test]
+    fn entrypoint_always_picks_the_os_runner() {
+        let fallback = Arc::new(ShellFallback {
+            driver: Arc::new(shell_fallback_tests::NoShellDriver),
+            spec_template: Arc::new(hplugin::provider::TargetSpec::default()),
+        });
+        let bridge = ManagedDriverBridge::new(
+            Box::new(shell_fallback_tests::NoShellDriver),
+            fallback,
+            FuseMode::On,
+            PathBuf::from("/nonexistent-home"),
+            None,
+        );
+        let id = "pick".to_string();
+        let build = TargetDef::default();
+        let req = RunRequest::new(&id, &build, "/nonexistent-sandbox");
+        assert!(
+            bridge.pick(&req).is_err(),
+            "a build with fuse forced on and no mount is refused"
+        );
+        let entrypoint = TargetDef {
+            entrypoint: Some(Entrypoint::new(false, Workdir::Caller)),
+            ..Default::default()
+        };
+        let req = RunRequest::new(&id, &entrypoint, "/nonexistent-sandbox");
+        assert!(matches!(bridge.pick(&req), Ok(Pick::Os)));
     }
 }

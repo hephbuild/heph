@@ -763,6 +763,7 @@ mod tests {
         ProcessFailed {
             status: "exit status: 1".to_string(),
             log: Arc::new(hcore::hartifactcontent::FileContent::new("/dev/null")),
+            exit: None,
         }
     }
 

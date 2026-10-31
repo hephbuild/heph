@@ -39,7 +39,7 @@ use hplugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
     ParseResponse, RunRequest, RunResponse, outputartifact,
     targetdef::{
-        CacheConfig, Input, InputMode, Output, TargetDef,
+        Input, InputMode, Output, TargetDef,
         path::{CodegenMode, Content as PathContent, Path},
     },
 };
@@ -221,15 +221,13 @@ impl hplugin::driver::Driver for Driver {
                 raw_def: Arc::new(GroupDef { transform }),
                 inputs,
                 outputs,
-                support_files: vec![],
-                // Off in both modes, for different reasons: an aggregate group
-                // has nothing of its own to cache, and a relocating one owns no
-                // bytes — its artifacts borrow its deps'. See `is_passthrough`
-                // in the engine.
-                cache: CacheConfig::off(),
-                pty: false,
                 hash,
                 transparent: !relocating,
+                // `cache` stays at the default, off, in both modes, for different
+                // reasons: an aggregate group has nothing of its own to cache,
+                // and a relocating one owns no bytes — its artifacts borrow its
+                // deps'. See `is_passthrough` in the engine.
+                ..Default::default()
             },
         })
     }
@@ -715,25 +713,11 @@ mod tests {
             })
             .collect();
 
-        Driver
-            .run(
-                RunRequest {
-                    request_id: &"test".to_string(),
-                    target: def,
-                    tree_root_path: Default::default(),
-                    inputs,
-                    hashin: "hashin",
-                    stdin: None,
-                    stdout: None,
-                    stderr: None,
-                    sandbox_dir: Default::default(),
-                    scratch: vec![],
-                    credentials: vec![],
-                    deferred: Default::default(),
-                },
-                &ctoken(),
-            )
-            .await
+        let request_id = "test".to_string();
+        let mut req = RunRequest::new(&request_id, def, std::path::PathBuf::new());
+        req.inputs = inputs;
+        req.hashin = "hashin";
+        Driver.run(req, &ctoken()).await
     }
 
     /// `RunResponse` has no `Debug`, so `expect_err` is unavailable.

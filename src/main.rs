@@ -15,6 +15,22 @@ mod pprof_dump;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// SIGPIPE as the caller gave it, read before `main`: std's runtime setup
+/// ignores SIGPIPE before calling `main`, so `record_inherited` alone could
+/// never tell an inherited ignore (`trap '' PIPE`) from heph's own. The
+/// loader runs this entry (glibc's `.init_array`, dyld's `__mod_init_func`)
+/// before std's `lang_start`. It only reads the disposition and stores an
+/// atomic, which is sound before std is initialized.
+#[used]
+#[cfg_attr(target_os = "linux", unsafe(link_section = ".init_array"))]
+#[cfg_attr(target_os = "macos", unsafe(link_section = "__DATA,__mod_init_func"))]
+static NOTE_INHERITED_SIGPIPE: extern "C" fn() = {
+    extern "C" fn note() {
+        hcore::process::note_inherited_sigpipe();
+    }
+    note
+};
+
 #[derive(Parser)]
 #[command(name = "heph")]
 #[command(about = "An efficient build system", long_about = None)]
@@ -40,6 +56,20 @@ fn main() -> ExitCode {
     if let Some(fd) = parse_supervisor_args() {
         heph::process_supervisor::run_supervisor_main(fd);
     }
+
+    // What the caller gave this process — signal dispositions and the
+    // open-file limit — before anything below changes them (the TTOU/TTIN
+    // ignore, the INT/QUIT/USR handlers, the raised limit). An entrypoint gets
+    // them back (N4, R8). The self-upgrade restores them before its `execv`,
+    // so the pinned binary records the caller's too.
+    hcore::process::record_inherited();
+
+    // Once, while this process is still single-threaded, so every later fork
+    // from any thread — the runner agent's, telemetry's, a build's, an
+    // entrypoint's — copies a settled libSystem state (`hproc::fork_safety`;
+    // a no-op on Linux). The spawns that call it themselves keep doing so for
+    // the processes that never run this `main` (tests, embedders).
+    hproc::fork_safety::prime();
 
     // The two exec-runner subcommands, dispatched here for the same reason:
     // they must not pull in logging, a runtime, clap or the TUI. Unlike
@@ -195,8 +225,35 @@ fn main() -> ExitCode {
     };
 
     let exec_result = cli.command.execute(sink, &cli.global);
+    // An entrypoint's program ended without success: heph exits as it did.
+    // Nothing to render — the program said what it had to say.
+    let tool_exit = exec_result
+        .as_ref()
+        .err()
+        .and_then(|e| e.downcast_ref::<commands::run::ToolExit>())
+        .map(|t| t.0);
     let result = match &exec_result {
         Ok(_) => ExitCode::SUCCESS,
+        Err(_) if tool_exit.is_some() => match tool_exit {
+            // A wait status carries 0–255, so the conversion never falls back.
+            Some(hcore::process::Exit::Code(code)) => {
+                ExitCode::from(u8::try_from(code).unwrap_or(1))
+            }
+            // Re-raised below, once everything else on the way out has run.
+            _ => ExitCode::FAILURE,
+        },
+        // heph's own failure after the target resolved to an entrypoint (or
+        // a Ctrl-C before its tool started): its box, and 125 (or 130), so it
+        // is never read as the tool's status (R4).
+        Err(e) if e.downcast_ref::<commands::run::InvokeFailed>().is_some() => {
+            let failed = e.downcast_ref::<commands::run::InvokeFailed>();
+            if let Some(f) = failed
+                && !heph::commands::errors::render_anyhow(&f.error)
+            {
+                error!(error = %format!("{:#}", f.error), "Failed");
+            }
+            ExitCode::from(failed.map_or(1, |f| f.code))
+        }
         Err(e) => {
             // Render a graphical diagnostic if the error chain carries one
             // (Starlark/Go diagnostics from single-error commands). The TUI is
@@ -229,6 +286,12 @@ fn main() -> ExitCode {
     // Flush the final (filtered) report and stop the watcher.
     if let Some(watcher) = pprof_watcher {
         watcher.shutdown();
+    }
+
+    // Die of the signal that killed the program, rather than exit 128+N: a
+    // shell treats "killed by SIGINT" and "exited 130" differently.
+    if let Some(hcore::process::Exit::Signal(sig)) = tool_exit {
+        hexecrunner::foreground::reraise(sig);
     }
 
     result

@@ -242,10 +242,17 @@ impl std::error::Error for UpstreamFailed {}
 /// file persists in the sandbox until the target's next run, so the handle stays
 /// readable through end-of-run rendering. Surfaced as the `source` of a
 /// [`TargetFailure`].
+///
+/// `status` is the human text (std's `ExitStatus` display, which is not a
+/// contract and must never be parsed); `exit` is the same status as data, for
+/// a caller that mirrors it (an entrypoint's code becomes heph's exit code, its
+/// signal is re-raised). `None` when the driver did not report one — every
+/// driver before the field existed, and a failure that is not a child's exit.
 #[derive(Debug, Clone)]
 pub struct ProcessFailed {
     pub status: String,
     pub log: Arc<dyn Content>,
+    pub exit: Option<Exit>,
 }
 
 impl fmt::Display for ProcessFailed {
@@ -255,6 +262,54 @@ impl fmt::Display for ProcessFailed {
 }
 
 impl std::error::Error for ProcessFailed {}
+
+pub use hcore::process::Exit;
+
+/// A run failure that crossed the plugin seam with a structured exit status
+/// ([`ProcessFailed::exit`] on the plugin's side).
+///
+/// The wire carries the failure as its rendered message plus the status, so
+/// the host cannot rebuild the plugin's [`ProcessFailed`] — its log handle
+/// points into the plugin's world and its `status` text is folded into the
+/// message. This keeps the message byte-identical to what an older host prints
+/// from the same frame, and the status readable through [`process_exit`].
+///
+/// `#[non_exhaustive]`: built with [`RemoteProcessFailed::new`] outside this
+/// crate, so a later field is not a source break.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct RemoteProcessFailed {
+    pub message: String,
+    pub exit: Exit,
+}
+
+impl RemoteProcessFailed {
+    pub fn new(message: String, exit: Exit) -> Self {
+        Self { message, exit }
+    }
+}
+
+impl fmt::Display for RemoteProcessFailed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RemoteProcessFailed {}
+
+/// The structured exit status anywhere in `err`'s chain: a [`ProcessFailed`]
+/// from an in-process driver, or a [`RemoteProcessFailed`] from a cdylib.
+/// `None` when no process exit is behind the failure, or the driver that
+/// produced it predates [`ProcessFailed::exit`].
+pub fn process_exit(err: &anyhow::Error) -> Option<Exit> {
+    err.chain().find_map(|e| {
+        if let Some(pf) = e.downcast_ref::<ProcessFailed>() {
+            pf.exit
+        } else {
+            e.downcast_ref::<RemoteProcessFailed>().map(|r| r.exit)
+        }
+    })
+}
 
 /// The rich, human-facing diagnostic for a genuinely-failing target. Recorded
 /// once per addr in the per-request failure registry and rendered (custom, see
@@ -365,6 +420,46 @@ pub fn last_n_lines_with_start(s: &str, n: usize) -> (String, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// E5: the status is data next to an unchanged message.
+    #[test]
+    fn process_failed_exit_is_structured() {
+        let log: Arc<dyn Content> =
+            Arc::new(hcore::hartifactcontent::FileContent::new("/dev/null"));
+        for (status, exit) in [
+            ("exit status: 3", Some(Exit::Code(3))),
+            ("signal: 15 (SIGTERM)", Some(Exit::Signal(15))),
+            ("exit status: 1", None),
+        ] {
+            let pf = ProcessFailed {
+                status: status.to_string(),
+                log: Arc::clone(&log),
+                exit,
+            };
+            // Byte-identical to the message before the field existed.
+            assert_eq!(
+                pf.to_string(),
+                format!("process exited with status: {status}")
+            );
+            let wrapped = anyhow::Error::new(pf)
+                .context("driver run")
+                .context("execute //pkg:a");
+            assert_eq!(process_exit(&wrapped), exit, "{status}");
+        }
+
+        let remote = anyhow::Error::new(RemoteProcessFailed {
+            message: "running //p:t: process exited with status: exit status: 3".to_string(),
+            exit: Exit::Code(3),
+        })
+        .context("driver run");
+        assert_eq!(process_exit(&remote), Some(Exit::Code(3)));
+        assert_eq!(
+            format!("{:#}", remote),
+            "driver run: running //p:t: process exited with status: exit status: 3",
+            "the remote failure renders as its message, nothing added"
+        );
+        assert_eq!(process_exit(&anyhow::anyhow!("boom")), None);
+    }
 
     #[test]
     fn last_n_lines_empty() {

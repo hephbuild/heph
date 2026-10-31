@@ -1,3 +1,4 @@
+mod entrypoint_mode;
 mod filterenv;
 mod pty;
 pub mod redact;
@@ -78,7 +79,7 @@ pub struct Driver {
     run_is_deferrable: bool,
 }
 
-#[derive(Clone, serde::Serialize)]
+#[derive(Clone, Default, serde::Serialize)]
 struct TargetDef {
     /// The command, still holding any `${read://…}` an author wrote.
     ///
@@ -124,6 +125,12 @@ struct TargetDef {
     /// address would prevent. Keeping it out also means every target that names
     /// no runner hashes byte-identically to before this field existed.
     pub runner: Option<TargetAddr>,
+    /// `entrypoint = True`: the target is invoked in the caller's world rather
+    /// than built (see [`entrypoint_mode`]). `None` for every other target, and
+    /// then absent from both the hash and the serialized def, so no existing
+    /// exec or bash def moves (pinned by `exec_def_hash_golden_populated`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entrypoint: Option<entrypoint_mode::EntrypointMode>,
 }
 
 impl Hash for TargetDef {
@@ -139,6 +146,12 @@ impl Hash for TargetDef {
         self.env.hash(state);
         self.pass_env.hash(state);
         // runtime_pass_env and runtime_env intentionally excluded
+        // Only when set: a target without the flag hashes exactly as before
+        // the flag existed. With it, `run` and `env` above plus these.
+        if let Some(mode) = &self.entrypoint {
+            "entrypoint".hash(state);
+            mode.hash(state);
+        }
     }
 }
 
@@ -208,6 +221,192 @@ fn sorted_by_group(m: HashMap<String, Vec<String>>) -> Vec<(String, Vec<String>)
     v
 }
 
+// ---- Parse helpers ----
+//
+// Their output is pinned by `exec_def_hash_golden_populated`.
+
+/// The inputs a `{group: [addr]}` dep attribute declares, ordered by group.
+///
+/// Sorted, not `HashMap` order: this is the order of `def.inputs`, and the
+/// transitive collector numbers each merged sandbox by an input's *position*
+/// in that list — a number that ends up in the merged dep/tool ids, and so in
+/// the def hash. Left in map order, a target with two or more dep groups hashes
+/// differently in every process and never hits its cache.
+pub(crate) fn build_dep_inputs(
+    pkg: &hmodel::htpkg::PkgBuf,
+    deps: HashMap<String, Vec<String>>,
+    origin_prefix: &str,
+    hashed: bool,
+    runtime: bool,
+    read_only_groups: &std::collections::HashSet<String>,
+) -> anyhow::Result<Vec<(String, Input)>> {
+    let mut out = Vec::new();
+    for (k, v) in sorted_by_group(deps) {
+        let read_only = read_only_groups.contains(&k);
+        for (i, v) in v.into_iter().enumerate() {
+            let annotations = if read_only {
+                BTreeMap::from([(
+                    hdriver_support::stage::READ_ONLY_ANNOTATION.to_string(),
+                    "true".to_string(),
+                )])
+            } else {
+                BTreeMap::new()
+            };
+            out.push((
+                k.clone(),
+                Input {
+                    r#ref: TargetAddr::parse(&v, pkg)?,
+                    mode: InputMode::Standard,
+                    origin_id: format!("{}|{}|{}", origin_prefix, k, i),
+                    annotations,
+                    hashed,
+                    runtime,
+                },
+            ));
+        }
+    }
+    Ok(out)
+}
+
+/// The inputs a `tools` attribute declares, ordered by group.
+pub(crate) fn build_tool_inputs(
+    pkg: &hmodel::htpkg::PkgBuf,
+    tools: HashMap<String, Vec<String>>,
+) -> anyhow::Result<Vec<(String, Input)>> {
+    let mut out = Vec::new();
+    for (k, v) in sorted_by_group(tools) {
+        for (i, v) in v.into_iter().enumerate() {
+            out.push((
+                k.clone(),
+                Input {
+                    r#ref: TargetAddr::parse(&v, pkg)?,
+                    mode: InputMode::Tool,
+                    origin_id: format!("tool|{}|{}", k, i),
+                    annotations: BTreeMap::from([("unpack_root".to_string(), "tools".to_string())]),
+                    hashed: true,
+                    runtime: true,
+                },
+            ));
+        }
+    }
+    Ok(out)
+}
+
+/// `(group, input)` pairs, grouped in order.
+pub(crate) fn grouped(inputs: &[(String, Input)]) -> BTreeMap<String, Vec<Input>> {
+    let mut out: BTreeMap<String, Vec<Input>> = BTreeMap::new();
+    for (group, input) in inputs {
+        out.entry(group.clone()).or_default().push(input.clone());
+    }
+    out
+}
+
+/// Fold a transitive closure's tools and deps into a def: every one joins
+/// `inputs`, and the runtime ones are wired into their groups. Env is the
+/// caller's to fold, because the two drivers place it differently.
+pub(crate) fn fold_transitive_inputs(
+    sandbox: &hplugin::driver::sandbox::Sandbox,
+    inputs: &mut Vec<Input>,
+    tool_groups: &mut BTreeMap<String, Vec<Input>>,
+    dep_groups: &mut BTreeMap<String, Vec<Input>>,
+    runtime_dep_groups: &mut BTreeMap<String, Vec<Input>>,
+) {
+    for tool in &sandbox.tools {
+        // Tools are consumed read-only (executables on PATH, never mutated by
+        // the target), so let the OS sandbox runner stage them once into the
+        // shared stage dir and link them in rather than copying every tool
+        // into every sandbox. `stage_per_file` forces the per-file link path:
+        // the tool consumer reads each input's file list and flattens every
+        // tool file into a `bin/` dir by basename, so it needs individual
+        // files listed — not the single subtree-root symlink the default
+        // staging emits.
+        let annotations = BTreeMap::from([
+            ("unpack_root".to_string(), "tools".to_string()),
+            (
+                hdriver_support::stage::READ_ONLY_ANNOTATION.to_string(),
+                "true".to_string(),
+            ),
+            (
+                hdriver_support::stage::STAGE_PER_FILE_ANNOTATION.to_string(),
+                "true".to_string(),
+            ),
+        ]);
+        let input = Input {
+            r#ref: tool.r#ref.clone(),
+            mode: InputMode::Tool,
+            origin_id: tool.id.clone(),
+            annotations,
+            hashed: tool.hash,
+            runtime: true,
+        };
+        tool_groups
+            .entry(tool.group.clone())
+            .or_default()
+            .push(input.clone());
+        inputs.push(input);
+    }
+    for dep in &sandbox.deps {
+        let input = Input {
+            r#ref: dep.r#ref.clone(),
+            mode: InputMode::Standard,
+            origin_id: dep.id.clone(),
+            annotations: BTreeMap::new(),
+            hashed: dep.hash,
+            runtime: dep.runtime,
+        };
+        // Route into runtime wiring only when the dep is meant to be available
+        // at runtime. Hash-only transitive deps still need to appear in
+        // `inputs` so the engine resolves them (and folds their hashout into a
+        // hashin), but they must not be wired into SRC_*/LIST_*.
+        if dep.runtime {
+            let target_map = if dep.hash {
+                &mut *dep_groups
+            } else {
+                &mut *runtime_dep_groups
+            };
+            target_map
+                .entry(dep.group.clone())
+                .or_default()
+                .push(input.clone());
+        }
+        inputs.push(input);
+    }
+}
+
+/// `SRC`/`SRC_<GROUP>` for a dep group.
+pub(crate) fn src_key(group: &str) -> String {
+    if group.is_empty() {
+        "SRC".to_string()
+    } else {
+        format!("SRC_{}", env_key_segment(group))
+    }
+}
+
+/// `TOOL`/`TOOL_<GROUP>` for a tool group.
+pub(crate) fn tool_key(group: &str) -> String {
+    if group.is_empty() {
+        "TOOL".to_string()
+    } else {
+        format!("TOOL_{}", env_key_segment(group))
+    }
+}
+
+/// Hashed and runtime-only dep groups merged so each group ends up with a
+/// single `SRC_*` covering both: `deps` first, `runtime_deps` after.
+pub(crate) fn merged_dep_groups<'d>(
+    dep_groups: &'d BTreeMap<String, Vec<Input>>,
+    runtime_dep_groups: &'d BTreeMap<String, Vec<Input>>,
+) -> BTreeMap<&'d str, Vec<&'d Input>> {
+    let mut merged: BTreeMap<&str, Vec<&Input>> = BTreeMap::new();
+    for (group, inputs) in dep_groups.iter().chain(runtime_dep_groups) {
+        merged
+            .entry(group.as_str())
+            .or_default()
+            .extend(inputs.iter());
+    }
+    merged
+}
+
 fn render_shell_init(run: &[String]) -> anyhow::Result<String> {
     let cmds = (!run.is_empty()).then(|| run.join("\n"));
 
@@ -232,8 +431,46 @@ fn render_shell_init(run: &[String]) -> anyhow::Result<String> {
         .context("compile init.sh template")?;
     env.get_template("init.sh")
         .context("load init.sh template")?
-        .render(minijinja::context! { cmds, lines => minijinja::value::Serde(lines) })
+        .render(minijinja::context! {
+            args_mode => false,
+            cmds,
+            lines => minijinja::value::Serde(lines),
+        })
         .context("render init.sh template")
+}
+
+/// `init.sh` in args mode, for the `--shell` of a run that accepts args
+/// (`RunOptions.args.is_some()`, even when empty; E11): one command line —
+/// exec's resolved argv, or bash's invocation of the script — each word
+/// quoted, followed by the args: the caller's (bash's positional parameters,
+/// kept in `__heph_args`), or a helper's own when it is given any. One line,
+/// so `run`, `xrun`, `show` and `showl` and no `runN`. Same template as
+/// exec's, its own branch, so the render without args does not move.
+pub(crate) fn render_args_shell_init(argv: &[String]) -> anyhow::Result<String> {
+    let cmds = argv
+        .iter()
+        .map(|w| bash_squote(w))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let display = bash_squote(&cmds);
+    let mut env = minijinja::Environment::new();
+    env.add_template("init.sh", SHELL_INIT_SH)
+        .context("compile init.sh template")?;
+    env.get_template("init.sh")
+        .context("load init.sh template")?
+        .render(minijinja::context! { args_mode => true, cmds, display })
+        .context("render init.sh template")
+}
+
+/// `program` on the `PATH` heph itself was launched with, for a shell heph
+/// starts on the target's behalf. See [`Driver::resolve_shell`].
+pub(crate) fn resolve_on_host_path(program: &str, driver: &str) -> anyhow::Result<PathBuf> {
+    which::which(program).with_context(|| {
+        format!(
+            "the {driver} driver needs `{program}` and could not find it on the PATH heph was \
+             launched with"
+        )
+    })
 }
 
 fn bash_args_shell(sandbox_dir: &std::path::Path, run: &[String]) -> anyhow::Result<Vec<String>> {
@@ -285,11 +522,21 @@ pub fn bash_args_public(
 
     if !termargs.is_empty() {
         // https://unix.stackexchange.com/a/144519
-        // We push "bash" as a placeholder for $0 before appending termargs
-        args.push("bash".to_string());
+        // `-c` takes "bash" as a placeholder for $0 before the termargs; a
+        // script file is its own $0, so they follow it directly.
+        if bash_takes_dollar0(cmd) {
+            args.push("bash".to_string());
+        }
         args.extend(termargs);
     }
     Ok(args)
+}
+
+/// Whether [`bash_args_public`] runs `cmd` inline with `-c`, where positional
+/// args need a `$0` placeholder ahead of them, rather than from a spilled
+/// script file, which is its own `$0`.
+fn bash_takes_dollar0(cmd: &str) -> bool {
+    cmd.len() <= BASH_C_INLINE_MAX
 }
 
 impl Driver {
@@ -483,12 +730,10 @@ impl Driver {
             out.extend_from_slice(rest);
             return Ok(out);
         }
-        let found = which::which(program).with_context(|| {
-            format!(
-                "the {} driver needs `{program}` and could not find it on the PATH heph was                  launched with. A target's own PATH deliberately has no host directories on it,                  so the shell is resolved here instead.",
-                self.name,
-            )
-        })?;
+        let found = resolve_on_host_path(program, &self.name).context(
+            "a target's own PATH deliberately has no host directories on it, so the shell is \
+             resolved on heph's instead",
+        )?;
         let found = self.shell_path.get_or_init(|| found);
         let mut out = vec![found.to_string_lossy().into_owned()];
         out.extend_from_slice(rest);
@@ -515,6 +760,8 @@ impl Driver {
         // in, or a heph upgrade that changes `cp` would keep serving
         // artifacts the old one built. Hashed only when the toolbox is on,
         // so a workspace that leaves it off keeps every key it has today.
+        // An entrypoint gets the toolbox too (behind the caller's PATH), so
+        // its never-cached def says so like any other.
         if let Some(version) = self.coreutils_version() {
             "coreutils".hash(&mut h);
             version.hash(&mut h);
@@ -1090,7 +1337,45 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
         req: ParseRequest,
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ParseResponse> {
-        let spec = spec::TargetSpec::from(&req.target_spec.config)?;
+        // `entrypoint = True`, read off the raw config before the spec parse,
+        // because what is refused depends on it.
+        let wants_entrypoint = match req.target_spec.config.get("entrypoint") {
+            None | Some(hcore::htvalue::Value::Bool(false)) => false,
+            Some(hcore::htvalue::Value::Bool(true)) => true,
+            Some(other) => anyhow::bail!(
+                "`entrypoint` on {}, a `{}` target, must be `True` or `False`, got {other:?}",
+                req.target_spec.addr.format(),
+                self.name,
+            ),
+        };
+        let spec = if wants_entrypoint {
+            let addr = req.target_spec.addr.format();
+            entrypoint_mode::refuse_fields(&req.target_spec.config, &addr, &self.name)?;
+            let spec = spec::TargetSpec::from(&req.target_spec.config)
+                .with_context(|| format!("the entrypoint `{}` target {addr}", self.name))?;
+            // exec has no shell to expand `$SRC_x` in its argv (R19); bash
+            // expands it natively.
+            if !self.wraps_in_shell {
+                entrypoint_mode::refuse_literal_closure_vars(&spec.run, &addr)?;
+            }
+            spec
+        } else {
+            // `args` and `workdir` shape an invocation; without the flag there
+            // is none. Refused by name, saying where they belong.
+            for field in entrypoint_mode::ENTRYPOINT_ONLY_FIELDS {
+                if req.target_spec.config.contains_key(*field) {
+                    anyhow::bail!(
+                        "`{field}` is only accepted with `entrypoint = True`; {} is a `{}` \
+                         target built in a sandbox, not invoked in the caller's world. Add \
+                         `entrypoint = True` to invoke it with `heph run`, or drop `{field}`",
+                        req.target_spec.addr.format(),
+                        self.name,
+                    );
+                }
+            }
+            spec::TargetSpec::from(&req.target_spec.config)?
+        };
+        let is_entrypoint = spec.entrypoint;
         // Belt and braces with the host's whole-driver gate: the host refuses a
         // reference for a driver whose schema says no, and this catches the same
         // mistake if a driver is ever constructed outside that path. Named at the
@@ -1115,69 +1400,26 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
         let read_only_groups: std::collections::HashSet<String> =
             spec.read_only_deps.iter().cloned().collect();
 
-        let build_dep_inputs = |deps: HashMap<String, Vec<String>>,
-                                origin_prefix: &'static str,
-                                hashed: bool,
-                                runtime: bool|
-         -> anyhow::Result<Vec<(String, Input)>> {
-            let read_only_groups = &read_only_groups;
-            // Sorted, not `HashMap` order: this is the order of `def.inputs`,
-            // and the transitive collector numbers each merged sandbox by an
-            // input's *position* in that list — a number that ends up in the
-            // merged dep/tool ids, and so in this target's def hash. Left in
-            // map order, a target with two or more dep groups hashes
-            // differently in every process and never hits its cache.
-            sorted_by_group(deps)
-                .into_iter()
-                .flat_map(|(k, v)| {
-                    let pkg = pkg.clone();
-                    let read_only = read_only_groups.contains(&k);
-                    v.into_iter().enumerate().map(
-                        move |(i, v)| -> anyhow::Result<(String, Input)> {
-                            let annotations = if read_only {
-                                BTreeMap::from([(
-                                    hdriver_support::stage::READ_ONLY_ANNOTATION.to_string(),
-                                    "true".to_string(),
-                                )])
-                            } else {
-                                BTreeMap::new()
-                            };
-                            Ok((
-                                k.parse()?,
-                                Input {
-                                    r#ref: TargetAddr::parse(&v, &pkg)?,
-                                    mode: InputMode::Standard,
-                                    origin_id: format!("{}|{}|{}", origin_prefix, k, i),
-                                    annotations,
-                                    hashed,
-                                    runtime,
-                                },
-                            ))
-                        },
-                    )
-                })
-                .collect::<anyhow::Result<Vec<_>>>()
-        };
+        let dep_inputs = build_dep_inputs(&pkg, spec.deps, "dep", true, true, &read_only_groups)?;
+        let hash_dep_inputs = build_dep_inputs(
+            &pkg,
+            spec.hash_deps,
+            "hash_dep",
+            true,
+            false,
+            &read_only_groups,
+        )?;
+        let runtime_dep_inputs = build_dep_inputs(
+            &pkg,
+            spec.runtime_deps,
+            "runtime_dep",
+            false,
+            true,
+            &read_only_groups,
+        )?;
 
-        let dep_inputs = build_dep_inputs(spec.deps, "dep", true, true)?;
-        let hash_dep_inputs = build_dep_inputs(spec.hash_deps, "hash_dep", true, false)?;
-        let runtime_dep_inputs = build_dep_inputs(spec.runtime_deps, "runtime_dep", false, true)?;
-
-        let mut dep_group_inputs: BTreeMap<String, Vec<Input>> = BTreeMap::new();
-        for (group, input) in &dep_inputs {
-            dep_group_inputs
-                .entry(group.clone())
-                .or_default()
-                .push(input.clone());
-        }
-
-        let mut runtime_dep_group_inputs: BTreeMap<String, Vec<Input>> = BTreeMap::new();
-        for (group, input) in &runtime_dep_inputs {
-            runtime_dep_group_inputs
-                .entry(group.clone())
-                .or_default()
-                .push(input.clone());
-        }
+        let dep_group_inputs = grouped(&dep_inputs);
+        let runtime_dep_group_inputs = grouped(&runtime_dep_inputs);
 
         // Scratch references. `hashed: false, runtime: false` is the one
         // combination nothing else uses, and it is exactly right: a scratch
@@ -1221,38 +1463,8 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
         // than scratch's; see `credential::inputs`.
         let credential_inputs = hdriver_support::credential::inputs(&spec.credentials, &pkg)?;
 
-        let tool_inputs = sorted_by_group(spec.tools)
-            .into_iter()
-            .flat_map(|(k, v)| {
-                let pkg = pkg.clone();
-                v.into_iter()
-                    .enumerate()
-                    .map(move |(i, v)| -> anyhow::Result<(String, Input)> {
-                        Ok((
-                            k.parse()?,
-                            Input {
-                                r#ref: TargetAddr::parse(&v, &pkg)?,
-                                mode: InputMode::Tool,
-                                origin_id: format!("tool|{}|{}", k, i),
-                                annotations: BTreeMap::from([(
-                                    "unpack_root".to_string(),
-                                    "tools".to_string(),
-                                )]),
-                                hashed: true,
-                                runtime: true,
-                            },
-                        ))
-                    })
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-
-        let mut tool_group_inputs: BTreeMap<String, Vec<Input>> = BTreeMap::new();
-        for (group, input) in &tool_inputs {
-            tool_group_inputs
-                .entry(group.clone())
-                .or_default()
-                .push(input.clone());
-        }
+        let tool_inputs = build_tool_inputs(&pkg, spec.tools)?;
+        let tool_group_inputs = grouped(&tool_inputs);
 
         // `"*"` is a wildcard: pass through every host env var. Snapshotted at
         // parse time and hashed like any other pass_env (so the input hash
@@ -1290,8 +1502,12 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
         // Per-target field wins, then the driver's workspace-wide default.
         // `"local"` is the explicit opt-out — the one value that is not an
         // address, so a per-package override of a workspace default can be
-        // spelled without inventing a second knob.
-        let (runner_spec, from_default) = if spec.runner.is_empty() {
+        // spelled without inventing a second knob. An entrypoint takes neither:
+        // `runner` was refused above, and the default is for sandboxed
+        // targets (D24).
+        let (runner_spec, from_default) = if is_entrypoint {
+            (None, true)
+        } else if spec.runner.is_empty() {
             (self.default_runner.as_deref(), true)
         } else {
             (Some(spec.runner.as_str()), false)
@@ -1352,11 +1568,26 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
             runtime_pass_env: spec.runtime_pass_env,
             runtime_env: spec.runtime_env,
             runner: runner.clone(),
+            entrypoint: is_entrypoint.then_some(entrypoint_mode::EntrypointMode {
+                args: spec.args,
+                workdir: spec.workdir,
+            }),
         };
 
         let hash = self.def_hash(&def, || {
             format!("exec_def_{}", req.target_spec.addr.format())
         });
+        let engine_entrypoint = def
+            .entrypoint
+            .as_ref()
+            .map(entrypoint_mode::EntrypointMode::engine_attribute);
+        // Never cached. The engine forces this again from the def's
+        // `entrypoint` (D43); saying it here too keeps `inspect def` honest.
+        let cache = if is_entrypoint {
+            hplugin::driver::targetdef::CacheConfig::off()
+        } else {
+            spec.cache.into()
+        };
 
         let outputs = def
             .outputs
@@ -1384,10 +1615,11 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
                     .collect(),
                 outputs,
                 support_files,
-                cache: spec.cache.into(),
+                cache,
+                entrypoint: engine_entrypoint,
                 pty: true,
                 hash,
-                transparent: false,
+                ..Default::default()
             },
         })
     }
@@ -1399,65 +1631,20 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
     ) -> anyhow::Result<ApplyTransitiveResponse> {
         let mut def = req.target_def.clone();
         let mut xdef = def.def::<TargetDef>().clone();
-        for tool in req.sandbox.tools {
-            let input = Input {
-                r#ref: tool.r#ref.clone(),
-                mode: InputMode::Tool,
-                origin_id: tool.id.clone(),
-                // Tools are consumed read-only (executables on PATH, never
-                // mutated by the target), so let the OS sandbox runner stage
-                // them once into the shared stage dir and link them in rather
-                // than copying every tool into every sandbox. `stage_per_file`
-                // forces the per-file link path: the tool consumer below reads
-                // each input's file list and flattens every tool file into a
-                // `bin/` dir by basename, so it needs individual files listed —
-                // not the single subtree-root symlink the default staging emits.
-                annotations: BTreeMap::from([
-                    ("unpack_root".to_string(), "tools".to_string()),
-                    (
-                        hdriver_support::stage::READ_ONLY_ANNOTATION.to_string(),
-                        "true".to_string(),
-                    ),
-                    (
-                        hdriver_support::stage::STAGE_PER_FILE_ANNOTATION.to_string(),
-                        "true".to_string(),
-                    ),
-                ]),
-                hashed: tool.hash,
-                runtime: true,
-            };
-            xdef.tool_group_inputs
-                .entry(tool.group)
-                .or_default()
-                .push(input.clone());
-            def.inputs.push(input);
-        }
-        for dep in req.sandbox.deps {
-            let input = Input {
-                r#ref: dep.r#ref.clone(),
-                mode: InputMode::Standard,
-                origin_id: dep.id.clone(),
-                annotations: BTreeMap::new(),
-                hashed: dep.hash,
-                runtime: dep.runtime,
-            };
-            // Route into runtime wiring only when the dep is meant to be
-            // available at runtime. Hash-only transitive deps still need to
-            // appear in `def.inputs` so the engine resolves them and folds
-            // their hashout into hashin, but they must not be wired into
-            // SRC_*/LIST_*.
-            if dep.runtime {
-                let target_map = if dep.hash {
-                    &mut xdef.dep_group_inputs
-                } else {
-                    &mut xdef.runtime_dep_group_inputs
-                };
-                target_map.entry(dep.group).or_default().push(input.clone());
-            }
-            def.inputs.push(input);
-        }
+        let is_entrypoint = xdef.entrypoint.is_some();
+        fold_transitive_inputs(
+            &req.sandbox,
+            &mut def.inputs,
+            &mut xdef.tool_group_inputs,
+            &mut xdef.dep_group_inputs,
+            &mut xdef.runtime_dep_group_inputs,
+        );
         for (name, env) in req.sandbox.env {
             match env.value {
+                // An entrypoint runs with the caller's whole environment as
+                // its base: a passed variable is there, or the caller did not
+                // set it.
+                EnvValue::Pass if is_entrypoint => {}
                 EnvValue::Pass => {
                     if env.hash {
                         if let Ok(value) = std::env::var(&name) {
@@ -1524,6 +1711,41 @@ impl Driver {
         }
     }
 
+    /// The `--shell` argv of a run that accepts args (E11): an interactive
+    /// bash whose rcfile is `init.sh` in args mode and whose positional
+    /// parameters are the caller's args (appended by the caller after `--`).
+    /// `init.sh`'s one command line is what the run itself would execute:
+    /// exec's argv, or bash's invocation of the script with its `$0`.
+    fn args_mode_shell(
+        &self,
+        sandbox_dir: &std::path::Path,
+        run: &[String],
+        local: bool,
+    ) -> anyhow::Result<Vec<String>> {
+        let mut words = (self.wrap_run)(sandbox_dir, run)?;
+        if words.is_empty() {
+            anyhow::bail!("`run` is empty")
+        }
+        if local && self.wraps_in_shell {
+            words = self.resolve_shell(words)?;
+        }
+        if self.wraps_in_shell && bash_takes_dollar0(&run.join("\n")) {
+            words.push("bash".to_string());
+        }
+        let init = sandbox_dir.join("init.sh");
+        std::fs::write(&init, render_args_shell_init(&words)?)
+            .with_context(|| format!("write the shell init file {}", init.display()))?;
+        Ok(vec![
+            "bash".to_string(),
+            "--noprofile".to_string(),
+            "--rcfile".to_string(),
+            init.to_string_lossy().into_owned(),
+            "-i".to_string(),
+            "-s".to_string(),
+            "--".to_string(),
+        ])
+    }
+
     async fn run_inner<'a, 'io>(
         &self,
         req: ManagedRunRequest<'a, 'io>,
@@ -1531,7 +1753,11 @@ impl Driver {
         shell: bool,
     ) -> anyhow::Result<ManagedRunResponse> {
         hcore::hmemoizer::set_phase("pluginexec:sandbox_setup");
-        let rreq = req.request;
+        let mut rreq = req.request;
+        // The caller's side of the run (cwd, base env, args, stdio). Default
+        // for every build; honoured field by field below, never by asking what
+        // kind of target this is (N8).
+        let options = std::mem::take(&mut rreq.options);
         let def = rreq.target.def::<TargetDef>();
 
         // Resolved here, by the host's map, and nowhere else — a driver that
@@ -1542,8 +1768,27 @@ impl Driver {
             .iter()
             .map(|d| rreq.resolve(d).map(str::to_string))
             .collect::<anyhow::Result<_>>()?;
+        // A run that accepts args gets them appended to the command; bash's
+        // inline `-c` form needs a `$0` first so they land in `"$@"`. In
+        // `--shell` they are the shell's positional parameters instead, and
+        // its `run` appends them (E11).
+        let caller_args: Vec<OsString> = match &options.args {
+            None => Vec::new(),
+            Some(args)
+                if !shell
+                    && self.wraps_in_shell
+                    && bash_takes_dollar0(&resolved_run.join("\n")) =>
+            {
+                std::iter::once(OsString::from("bash"))
+                    .chain(args.iter().cloned())
+                    .collect()
+            }
+            Some(args) => args.clone(),
+        };
         let run = {
-            let wrapped = if shell {
+            let wrapped = if shell && options.args.is_some() {
+                self.args_mode_shell(&rreq.sandbox_dir, &resolved_run, def.runner.is_none())?
+            } else if shell {
                 (self.wrap_run_shell)(&rreq.sandbox_dir, &resolved_run)?
             } else {
                 (self.wrap_run)(&rreq.sandbox_dir, &resolved_run)?
@@ -1578,7 +1823,11 @@ impl Driver {
         // an undeclared host binary is reaching outside its cache key, and the
         // failure should say so rather than silently succeed on one machine.
         // `path:` names directories back for a workspace that needs them.
-        if def.runner.is_none() && !self.search_path.is_empty() {
+        //
+        // A run with a base env (the caller's) takes its `PATH` from there
+        // instead: the target's tools still lead and the builtins still trail
+        // it, composed by `hexecrunner` below.
+        if def.runner.is_none() && !self.search_path.is_empty() && options.base_env.is_none() {
             env.insert("PATH".to_string(), self.search_path.join(":"));
         }
         env.insert(
@@ -1635,26 +1884,11 @@ impl Driver {
         // `deps` come first to preserve their established input ordering;
         // `runtime_deps` (also `runtime=true` transitives with `hash=false`)
         // append after.
-        let mut merged_dep_groups: BTreeMap<&str, Vec<&Input>> = BTreeMap::new();
-        for (group, inputs) in &def.dep_group_inputs {
-            merged_dep_groups
-                .entry(group.as_str())
-                .or_default()
-                .extend(inputs.iter());
-        }
-        for (group, inputs) in &def.runtime_dep_group_inputs {
-            merged_dep_groups
-                .entry(group.as_str())
-                .or_default()
-                .extend(inputs.iter());
-        }
+        let merged_dep_groups =
+            merged_dep_groups(&def.dep_group_inputs, &def.runtime_dep_group_inputs);
 
         for (group, inputs) in &merged_dep_groups {
-            let src_key = if group.is_empty() {
-                "SRC".to_string()
-            } else {
-                format!("SRC_{}", env_key_segment(group))
-            };
+            let src_key = src_key(group);
 
             let mut list_f = {
                 let path = req
@@ -1733,11 +1967,7 @@ impl Driver {
             let mut linked: std::collections::HashSet<std::ffi::OsString> =
                 std::collections::HashSet::new();
             for (group, inputs) in &def.tool_group_inputs {
-                let tool_key = if group.is_empty() {
-                    "TOOL".to_string()
-                } else {
-                    format!("TOOL_{}", env_key_segment(group))
-                };
+                let tool_key = tool_key(group);
                 // Per-group dedup for $TOOL_<G> values. `linked` is process-wide
                 // (avoids EEXIST on symlink); `group_seen` is per-group so each
                 // TOOL_<G> reflects that group's references without duplicates
@@ -1939,21 +2169,11 @@ impl Driver {
                 .collect(),
         };
 
+        // Created for every run: in the caller's terminal nothing is teed, so
+        // it stays empty, and the run still reports one log artifact (E6).
         let output_log_path = req.sandbox_dir.join("log.txt");
         let output_log =
             std::fs::File::create(&output_log_path).with_context(|| "create log file")?;
-        let output_log_file = Arc::new(std::sync::Mutex::new(output_log));
-
-        // Shell mode runs the child attached to a freshly-allocated PTY so bash
-        // sees a real terminal and runs interactively. The parent forwards
-        // stdin/stdout via the PTY master through the same tee paths used by
-        // the non-shell case (`tee_stream` on AsyncPty for PTY; `tee_output`
-        // on the merged OutputReader for piped stdio).
-        let pty_pair = if shell {
-            Some(pty::open_pty().context("openpty")?)
-        } else {
-            None
-        };
 
         // run is guaranteed non-empty by the bail! above, so [0] and [1..] are safe
         let (program, args) = {
@@ -1964,7 +2184,7 @@ impl Driver {
             (run[0].clone(), run[1..].to_vec())
         };
 
-        let args_os: Vec<OsString> = args.iter().map(OsString::from).collect();
+        let args_os: Vec<OsString> = args.iter().map(OsString::from).chain(caller_args).collect();
 
         // execve caps total argv+envp at ARG_MAX and each entry at MAX_ARG_STRLEN.
         // Drop overlong entries and evict longest until under the limit.
@@ -1978,10 +2198,137 @@ impl Driver {
         // file would keep the credential on Linux and drop it on macOS, then run
         // unauthenticated or against whatever ambient identity the host had.
         let env_vec = filterenv::filter_long_env(env_vec, &argv_for_filter, &credential_env_names)?;
-        let env_pairs: Vec<(OsString, OsString)> = env_vec
-            .into_iter()
-            .map(|(k, v)| (OsString::from(k), OsString::from(v)))
-            .collect();
+        // The run's own layers sit on the caller's base env, which is neither
+        // filtered nor converted: it reaches the process byte for byte (E6).
+        let has_base_env = options.base_env.is_some();
+        let env_pairs = layer_env(options.base_env.unwrap_or_default(), env_vec);
+        let spawn_size = SpawnSize::of(&program, &args_os, &env_pairs);
+
+        let cwd = match options.cwd {
+            Some(cwd) => {
+                // Checked here so a deleted or mistyped directory is named as
+                // such; `chdir` failing in the child surfaces as a bare ENOENT
+                // that reads like a missing program.
+                anyhow::ensure!(
+                    cwd.is_dir(),
+                    "the run's working directory {cwd:?} does not exist or is not a directory \
+                     (was it deleted, or is it on an unmounted volume?); run from an existing \
+                     directory"
+                );
+                cwd
+            }
+            None => req.sandbox_pkg_dir.clone(),
+        };
+
+        // The runner was resolved at parse and is already a hashed input, so
+        // the host's lookup here is a memoizer hit.
+        let runner_ref = match &def.runner {
+            Some(target) => RunnerRef::target(rreq.request_id, &target.r#ref),
+            None => RunnerRef::local(),
+        };
+        // Formatted only on the error path. The spawn error stays a typed
+        // `io::Error` so the NotFound and E2BIG arms can say what was
+        // configured — and `spawned_as` carries the program that was
+        // *actually* executed, which under a runner is the wrapper rather than
+        // the target's own command.
+        let spawn_error = |e: std::io::Error, spawned_as: &hexecrunner::SpawnedAs| {
+            let program = run.first().map_or("", String::as_str);
+            // Under a runner the program that failed to exec is the wrapper,
+            // not the target's command — say which, or the message sends the
+            // reader looking for the wrong binary.
+            let via = match &def.runner {
+                Some(target) => format!(
+                    " (via exec runner {}, which spawned {:?})",
+                    target.r#ref.format(),
+                    spawned_as.program,
+                ),
+                None => String::new(),
+            };
+            if e.raw_os_error() == Some(libc::E2BIG) {
+                anyhow::anyhow!(
+                    "spawn child process {program:?}{via}: its arguments and environment are \
+                     larger than this system accepts (E2BIG: {spawn_size}). Pass fewer or \
+                     shorter arguments, or unset large environment variables{caller}",
+                    caller = if has_base_env {
+                        "; the caller's own environment is passed through unfiltered"
+                    } else {
+                        ""
+                    },
+                )
+            } else if e.kind() == std::io::ErrorKind::NotFound && has_base_env {
+                anyhow::anyhow!(
+                    "spawn child process {program:?}{via}: {e} — not found on the run's PATH \
+                     (the target's tools, then the caller's PATH, then heph's builtin \
+                     utilities). Declare it as a tool, call it by absolute path, or put it on \
+                     your PATH. Also check that the working directory {cwd:?} exists.",
+                    cwd = spawned_as.cwd,
+                )
+            } else if e.kind() == std::io::ErrorKind::NotFound {
+                anyhow::anyhow!(
+                    "spawn child process {program:?}{via}: {e} — not found on the target's PATH ({path}). A target sees only what it declares as a tool plus heph's builtin utilities; the host's directories are deliberately not there, so a program on your interactive PATH is still missing here. Declare it as a tool, call it by absolute path, or name the directories back with the driver's `path` option in .hephconfig. Also check that the working directory {cwd:?} exists.",
+                    path = self.sandbox_path_display(),
+                    cwd = spawned_as.cwd,
+                )
+            } else {
+                anyhow::Error::new(e).context(format!("spawn child process {program:?}{via}"))
+            }
+        };
+
+        // The caller's own terminal: inherited fds 0–2, no PTY, no tee, no
+        // session of its own (E6). `--shell` keeps its PTY whatever the stdio,
+        // since a shell is always on a terminal; it takes only the relay's
+        // signals, below (Open 7).
+        let (inherit, shell_signals) = match options.stdio {
+            hplugin::driver::RunStdio::Inherit(fg) if shell => (None, Some(fg.signals)),
+            hplugin::driver::RunStdio::Inherit(fg) => (Some(fg), None),
+            _ => (None, None),
+        };
+        if let Some(fg) = inherit {
+            drop(output_log);
+            hcore::hmemoizer::set_phase("pluginexec:spawn");
+            let cmd = hexecrunner::foreground::ForegroundCommand::new(
+                PathBuf::from(program),
+                args_os,
+                env_pairs,
+                cwd,
+            )
+            .with_foreground(&fg);
+            let (spawned, spawned_as) =
+                hexecrunner::foreground::spawn_foreground(runner_ref, cmd, &path_policy, ctoken)
+                    .await?;
+            let child = spawned.map_err(|e| spawn_error(e, &spawned_as))?;
+            hcore::hmemoizer::set_phase("pluginexec:wait_subprocess");
+            let exit = child
+                .wait(fg.signals, ctoken)
+                .await
+                .context("wait for child process")?;
+            if ctoken.is_cancelled() {
+                anyhow::bail!("cancelled");
+            }
+            if exit != hplugin::error::Exit::Code(0) {
+                // Nothing was captured: the log is empty, never a handle into
+                // a sandbox that is about to be removed (R22).
+                return Err(hplugin::error::ProcessFailed {
+                    status: exit_display(exit),
+                    log: Arc::new(EmptyLog),
+                    exit: Some(exit),
+                }
+                .into());
+            }
+            return log_response(&output_log_path);
+        }
+        let output_log_file = Arc::new(std::sync::Mutex::new(output_log));
+
+        // Shell mode runs the child attached to a freshly-allocated PTY so bash
+        // sees a real terminal and runs interactively. The parent forwards
+        // stdin/stdout via the PTY master through the same tee paths used by
+        // the non-shell case (`tee_stream` on AsyncPty for PTY; `tee_output`
+        // on the merged OutputReader for piped stdio).
+        let pty_pair = if shell {
+            Some(pty::open_pty().context("openpty")?)
+        } else {
+            None
+        };
 
         let spec = if let Some((master, slave)) = &pty_pair {
             // Inherit the parent's terminal size so bash can wrap and place the
@@ -2004,7 +2351,7 @@ impl Driver {
                 program: PathBuf::from(program),
                 args: args_os,
                 env: env_pairs,
-                cwd: req.sandbox_pkg_dir.clone(),
+                cwd: cwd.clone(),
                 stdin: proc_exec::StdioSpec::Fd(stdin_fd),
                 stdout: proc_exec::StdioSpec::Fd(stdout_fd),
                 stderr: proc_exec::StdioSpec::Fd(stderr_fd),
@@ -2033,7 +2380,7 @@ impl Driver {
                 program: PathBuf::from(program),
                 args: args_os,
                 env: env_pairs,
-                cwd: req.sandbox_pkg_dir.clone(),
+                cwd: cwd.clone(),
                 stdin,
                 stdout: proc_exec::StdioSpec::Piped,
                 stderr: proc_exec::StdioSpec::Piped,
@@ -2043,45 +2390,34 @@ impl Driver {
         };
 
         hcore::hmemoizer::set_phase("pluginexec:spawn");
-        // Program/PATH/cwd are only formatted here, on the error path — `run`
-        // and `req` are still fully owned locals at this point (only cloned
-        // versions of their fields were moved into `spec` above), so no work
-        // happens on the far more common spawn-succeeds path.
-        // The runner was resolved at parse and is already a hashed input, so
-        // the host's lookup here is a memoizer hit. The spawn error stays a
-        // typed `io::Error` so the NotFound arm below can still render the
-        // sandbox-PATH diagnostic — and `spawned_as` carries the program that
-        // was *actually* executed, which under a runner is the wrapper rather
-        // than the target's own command.
-        let runner_ref = match &def.runner {
-            Some(target) => RunnerRef::target(rreq.request_id, &target.r#ref),
-            None => RunnerRef::local(),
-        };
         let (spawned, spawned_as) =
             hexecrunner::spawn_io_with_path(runner_ref, spec, &path_policy, ctoken).await?;
-        let mut handle = spawned.map_err(|e| {
-            let program = run.first().map_or("", String::as_str);
-            // Under a runner the program that failed to exec is the wrapper,
-            // not the target's command — say which, or the message sends the
-            // reader looking for the wrong binary.
-            let via = match &def.runner {
-                Some(target) => format!(
-                    " (via exec runner {}, which spawned {:?})",
-                    target.r#ref.format(),
-                    spawned_as.program,
-                ),
-                None => String::new(),
-            };
-            if e.kind() == std::io::ErrorKind::NotFound {
-                anyhow::anyhow!(
-                    "spawn child process {program:?}{via}: {e} — not found on the target's PATH ({path}). A target sees only what it declares as a tool plus heph's builtin utilities; the host's directories are deliberately not there, so a program on your interactive PATH is still missing here. Declare it as a tool, call it by absolute path, or name the directories back with the driver's `path` option in .hephconfig. Also check that the working directory {cwd:?} exists.",
-                    path = self.sandbox_path_display(),
-                    cwd = req.sandbox_pkg_dir,
-                )
-            } else {
-                anyhow::Error::new(e).context(format!("spawn child process {program:?}{via}"))
-            }
-        })?;
+        let mut handle = spawned.map_err(|e| spawn_error(e, &spawned_as))?;
+        // Open 7: a `--shell` session runs in its own session on its PTY, so
+        // the terminal's signals never reach heph's group; of the relayed
+        // ones it takes only TERM and HUP (a `timeout` or a closed terminal
+        // ending heph), delivered to the session's group. Everything else is
+        // the user's to type into the shell. Stopped as soon as the wait
+        // returns. Between the reap inside that wait and the abort there is a
+        // window: while any process of the session's group lives the pgid
+        // cannot be reused and a late TERM reaches it (or ESRCH once it is
+        // empty), but once the group is empty the number can in principle be
+        // handed to a new group in that window. Accepted: it needs a TERM or
+        // HUP to arrive in the microseconds after the shell exits and a pid
+        // wrap onto exactly that number; the foreground spawn closes it with
+        // `waitid(WNOWAIT)`, which `proc_exec`'s wait does not offer.
+        let shell_relay = shell_signals.map(|mut signals| {
+            let pgid = handle.pid();
+            tokio::spawn(async move {
+                while let Some(sig) = signals.recv().await {
+                    let raw = sig.as_raw();
+                    if raw == libc::SIGTERM || raw == libc::SIGHUP {
+                        // SAFETY: signalling the group this run spawned.
+                        unsafe { libc::killpg(pgid, raw) };
+                    }
+                }
+            })
+        });
 
         // Drop the parent's copy of the slave so the master sees EOF when the
         // child exits.
@@ -2293,6 +2629,9 @@ impl Driver {
             }
         };
 
+        if let Some(relay) = shell_relay {
+            relay.abort();
+        }
         hcore::hmemoizer::set_phase("pluginexec:post_wait_status_check");
         // Cancellation takes precedence over whatever the wait task returned
         // (`wait_or_cancel` surfaces an io error on cancel) so we preserve the
@@ -2314,30 +2653,127 @@ impl Driver {
             return Err(hplugin::error::ProcessFailed {
                 status: status.to_string(),
                 log,
+                exit: hplugin::error::Exit::from_std(status),
             }
             .into());
         }
         hcore::hmemoizer::set_phase("pluginexec:post_wait_done");
 
-        Ok(ManagedRunResponse {
-            artifacts: vec![outputartifact::OutputArtifact {
-                group: "".to_string(),
-                name: "log.txt".to_string(),
-                r#type: outputartifact::Type::Log,
-                content: outputartifact::Content::File(outputartifact::ContentFile {
-                    source_path: output_log_path
-                        .to_str()
-                        .ok_or_else(|| anyhow::anyhow!("log path is not valid UTF-8"))?
-                        .parse()?,
-                    out_path: "log.txt".to_string(),
-                    x: false,
-                    // Log lives in the sandbox (cleaned after caching): never
-                    // passthrough — it must be packed into the cache.
-                    passthrough: false,
-                }),
-                hashout: "".to_string(),
-            }],
-        })
+        log_response(&output_log_path)
+    }
+}
+
+/// A run's response: its one `log.txt` artifact.
+fn log_response(output_log_path: &std::path::Path) -> anyhow::Result<ManagedRunResponse> {
+    Ok(ManagedRunResponse {
+        artifacts: vec![outputartifact::OutputArtifact {
+            group: "".to_string(),
+            name: "log.txt".to_string(),
+            r#type: outputartifact::Type::Log,
+            content: outputartifact::Content::File(outputartifact::ContentFile {
+                source_path: output_log_path
+                    .to_str()
+                    .ok_or_else(|| anyhow::anyhow!("log path is not valid UTF-8"))?
+                    .parse()?,
+                out_path: "log.txt".to_string(),
+                x: false,
+                // Log lives in the sandbox (cleaned after caching): never
+                // passthrough — it must be packed into the cache.
+                passthrough: false,
+            }),
+            hashout: "".to_string(),
+        }],
+    })
+}
+
+/// `ProcessFailed.status` for an [`Exit`](hplugin::error::Exit): the same
+/// words std's `ExitStatus` display uses for the common cases.
+fn exit_display(exit: hplugin::error::Exit) -> String {
+    match exit {
+        hplugin::error::Exit::Code(code) => format!("exit status: {code}"),
+        hplugin::error::Exit::Signal(sig) => format!("signal: {sig}"),
+    }
+}
+
+/// The log of a run in the caller's terminal: nothing was captured (R22).
+/// Never a handle into the run's sandbox, which is removed when it ends.
+struct EmptyLog;
+
+impl hcore::hartifactcontent::Content for EmptyLog {
+    fn reader(&self) -> anyhow::Result<Box<dyn std::io::Read>> {
+        Ok(Box::new(std::io::empty()))
+    }
+
+    fn walk(
+        &self,
+    ) -> anyhow::Result<
+        Box<dyn Iterator<Item = anyhow::Result<hcore::hartifactcontent::WalkEntry>> + '_>,
+    > {
+        Ok(Box::new(std::iter::empty()))
+    }
+
+    fn hashout(&self) -> anyhow::Result<String> {
+        Ok(String::new())
+    }
+
+    fn byte_size(&self) -> Option<u64> {
+        Some(0)
+    }
+}
+
+/// The run's environment: the caller's `base` at the bottom, the run's own
+/// `layers` on top (they win on a duplicate key). In `base`, a later duplicate
+/// wins, as `execve` consumers resolve one; its order and bytes are kept.
+fn layer_env(
+    base: Vec<(OsString, OsString)>,
+    layers: Vec<(String, String)>,
+) -> Vec<(OsString, OsString)> {
+    let mut out: Vec<(OsString, OsString)> = Vec::with_capacity(base.len() + layers.len());
+    let mut index: HashMap<OsString, usize> = HashMap::with_capacity(base.len() + layers.len());
+    let entries = base.into_iter().chain(
+        layers
+            .into_iter()
+            .map(|(k, v)| (OsString::from(k), OsString::from(v))),
+    );
+    for (k, v) in entries {
+        match index.get(&k) {
+            Some(&i) => {
+                if let Some(slot) = out.get_mut(i) {
+                    slot.1 = v;
+                }
+            }
+            None => {
+                index.insert(k.clone(), out.len());
+                out.push((k, v));
+            }
+        }
+    }
+    out
+}
+
+/// What a spawn hands `execve`, for an E2BIG message.
+#[derive(Clone, Copy)]
+struct SpawnSize {
+    argv_bytes: usize,
+    env_bytes: usize,
+}
+
+impl SpawnSize {
+    fn of(program: &str, args: &[OsString], env: &[(OsString, OsString)]) -> Self {
+        Self {
+            argv_bytes: program.len() + 1 + args.iter().map(|a| a.len() + 1).sum::<usize>(),
+            env_bytes: env.iter().map(|(k, v)| k.len() + v.len() + 2).sum(),
+        }
+    }
+}
+
+impl std::fmt::Display for SpawnSize {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} bytes of arguments and {} bytes of environment",
+            self.argv_bytes, self.env_bytes
+        )
     }
 }
 
@@ -2353,6 +2789,10 @@ mod tests {
     use hplugin::driver::Deferred as D;
     use hplugin::driver::RunRequest;
     use hplugin::driver::targetdef::CacheConfig;
+
+    /// `RunOptions` (cwd, base env, args, inherited stdio) and `--shell`'s args
+    /// mode.
+    mod run_options;
 
     /// Captures `tracing` events emitted on the calling OS thread while the
     /// returned guard is alive. `#[tokio::test]`'s default `current_thread`
@@ -2582,53 +3022,22 @@ mod tests {
         let ctoken = StdCancellationToken::new();
 
         let target_def = EngineTargetDef {
-            addr: Addr::default(),
-            labels: vec![],
             raw_def: Arc::new(TargetDef {
-                runner: None,
                 run: vec![
                     D::new("sh".to_string()),
                     D::new("-c".to_string()),
                     D::new("sleep 5 & echo boom >&2; exit 3".to_string()),
                 ],
-                dep_group_inputs: BTreeMap::new(),
-                runtime_dep_group_inputs: BTreeMap::new(),
-                env: BTreeMap::new(),
-                tool_group_inputs: BTreeMap::new(),
-                pass_env: BTreeMap::new(),
-                runtime_pass_env: vec![],
-                runtime_env: HashMap::new(),
-                outputs: BTreeMap::new(),
-                support_files: vec![],
+                ..Default::default()
             }),
-            inputs: vec![],
-            outputs: vec![],
-            support_files: vec![],
             cache: CacheConfig::on(true),
-            // Pipes, not a PTY: the PTY path shares one fd for both streams
-            // and is not where the std build's targets run.
-            pty: false,
-            hash: vec![],
-            transparent: false,
+            ..Default::default()
         };
 
         let request_id = "test-request".to_string();
         let tmp = tempfile::tempdir()?;
 
-        let req = RunRequest {
-            request_id: &request_id,
-            target: &target_def,
-            tree_root_path: "".to_string().into(),
-            inputs: vec![],
-            hashin: "",
-            stdin: None,
-            stdout: None,
-            stderr: None,
-            sandbox_dir: tmp.path().to_path_buf(),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        };
+        let req = RunRequest::new(&request_id, &target_def, tmp.path());
 
         let res = tokio::time::timeout(
             proc_exec::DRAIN_DEADLINE * 20,
@@ -2908,54 +3317,48 @@ mod tests {
         assert!(!out.contains("{{"), "template tokens left: {out}");
     }
 
+    /// The exec/bash `init.sh`, byte for byte: the entrypoint's shell renders
+    /// from the same template, and must not move a byte of this one. Pinned as
+    /// a digest of the whole render, with and without commands.
+    #[test]
+    fn exec_shell_init_is_byte_identical() {
+        let digest = |run: &[String]| {
+            let mut h = Xxh3Default::new();
+            std::hash::Hasher::write(&mut h, render_shell_init(run).expect("render").as_bytes());
+            format!("{:016x}", std::hash::Hasher::finish(&h))
+        };
+        let with = digest(&[
+            "echo 'it''s' \"$HOME\"".to_string(),
+            "ls -la\nmore".to_string(),
+        ]);
+        let without = digest(&[]);
+        assert_eq!(
+            (with.as_str(), without.as_str()),
+            ("50a976451839979a", "212c40f66956e0eb")
+        );
+    }
+
     #[tokio::test]
     async fn test_run_echo_hello() -> anyhow::Result<()> {
         let driver = Driver::new_exec();
         let ctoken = StdCancellationToken::new();
 
         let target_def = EngineTargetDef {
-            addr: Addr::default(),
-            labels: vec![],
             raw_def: Arc::new(TargetDef {
-                runner: None,
                 run: vec![D::new("echo".to_string()), D::new("hello".to_string())],
-                dep_group_inputs: BTreeMap::new(),
-                runtime_dep_group_inputs: BTreeMap::new(),
-                env: BTreeMap::new(),
-                tool_group_inputs: BTreeMap::new(),
-                pass_env: BTreeMap::new(),
-                runtime_pass_env: vec![],
-                runtime_env: HashMap::new(),
-                outputs: BTreeMap::new(),
-                support_files: vec![],
+                ..Default::default()
             }),
-            inputs: vec![],
-            outputs: vec![],
-            support_files: vec![],
             cache: CacheConfig::on(true),
             pty: true,
-            hash: vec![],
-            transparent: false,
+            ..Default::default()
         };
 
         let mut stdout = Vec::new();
         let request_id = "test-request".to_string();
         let tmp = tempfile::tempdir()?;
 
-        let req = RunRequest {
-            request_id: &request_id,
-            target: &target_def,
-            tree_root_path: "".to_string().into(),
-            inputs: vec![],
-            hashin: "",
-            stdin: None,
-            stdout: Some(&mut stdout),
-            stderr: None,
-            sandbox_dir: tmp.path().to_path_buf(),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        };
+        let mut req = RunRequest::new(&request_id, &target_def, tmp.path());
+        req.stdout = Some(&mut stdout);
 
         let _res = driver.run(make_req(req), &ctoken).await?;
 
@@ -2983,47 +3386,19 @@ mod tests {
         let ctoken = StdCancellationToken::new();
 
         let target_def = EngineTargetDef {
-            addr: Addr::default(),
-            labels: vec![],
             raw_def: Arc::new(TargetDef {
-                runner: None,
                 run: vec![D::new("definitely-not-a-real-binary-xyz".to_string())],
-                dep_group_inputs: BTreeMap::new(),
-                runtime_dep_group_inputs: BTreeMap::new(),
-                env: BTreeMap::new(),
-                tool_group_inputs: BTreeMap::new(),
-                pass_env: BTreeMap::new(),
-                runtime_pass_env: vec![],
-                runtime_env: HashMap::new(),
-                outputs: BTreeMap::new(),
-                support_files: vec![],
+                ..Default::default()
             }),
-            inputs: vec![],
-            outputs: vec![],
-            support_files: vec![],
             cache: CacheConfig::on(true),
             pty: true,
-            hash: vec![],
-            transparent: false,
+            ..Default::default()
         };
 
         let request_id = "test-request".to_string();
         let tmp = tempfile::tempdir()?;
 
-        let req = RunRequest {
-            request_id: &request_id,
-            target: &target_def,
-            tree_root_path: "".to_string().into(),
-            inputs: vec![],
-            hashin: "",
-            stdin: None,
-            stdout: None,
-            stderr: None,
-            sandbox_dir: tmp.path().to_path_buf(),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        };
+        let req = RunRequest::new(&request_id, &target_def, tmp.path());
 
         let res = driver.run(make_req(req), &ctoken).await;
         let Err(err) = res else {
@@ -3055,28 +3430,13 @@ mod tests {
         let ctoken = StdCancellationToken::new();
 
         let target_def = EngineTargetDef {
-            addr: Addr::default(),
-            labels: vec![],
             raw_def: Arc::new(TargetDef {
-                runner: None,
                 run: vec![D::new("cat".to_string())],
-                dep_group_inputs: BTreeMap::new(),
-                runtime_dep_group_inputs: BTreeMap::new(),
-                env: BTreeMap::new(),
-                tool_group_inputs: BTreeMap::new(),
-                pass_env: BTreeMap::new(),
-                runtime_pass_env: vec![],
-                runtime_env: HashMap::new(),
-                outputs: BTreeMap::new(),
-                support_files: vec![],
+                ..Default::default()
             }),
-            inputs: vec![],
-            outputs: vec![],
-            support_files: vec![],
             cache: CacheConfig::on(true),
             pty: true,
-            hash: vec![],
-            transparent: false,
+            ..Default::default()
         };
 
         let mut stdin = std::io::Cursor::new(b"test data");
@@ -3084,20 +3444,9 @@ mod tests {
         let request_id = "test-request".to_string();
         let tmp = tempfile::tempdir()?;
 
-        let req = RunRequest {
-            request_id: &request_id,
-            target: &target_def,
-            tree_root_path: "".to_string().into(),
-            inputs: vec![],
-            hashin: "",
-            stdin: Some(&mut stdin),
-            stdout: Some(&mut stdout),
-            stderr: None,
-            sandbox_dir: tmp.path().to_path_buf(),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        };
+        let mut req = RunRequest::new(&request_id, &target_def, tmp.path());
+        req.stdin = Some(&mut stdin);
+        req.stdout = Some(&mut stdout);
 
         // Use a timeout to detect the hang
         let _res = tokio::time::timeout(
@@ -3118,28 +3467,13 @@ mod tests {
         let ctoken = StdCancellationToken::new();
 
         let target_def = EngineTargetDef {
-            addr: Addr::default(),
-            labels: vec![],
             raw_def: Arc::new(TargetDef {
-                runner: None,
                 run: vec![D::new("cat".to_string())],
-                dep_group_inputs: BTreeMap::new(),
-                runtime_dep_group_inputs: BTreeMap::new(),
-                env: BTreeMap::new(),
-                tool_group_inputs: BTreeMap::new(),
-                pass_env: BTreeMap::new(),
-                runtime_pass_env: vec![],
-                runtime_env: HashMap::new(),
-                outputs: BTreeMap::new(),
-                support_files: vec![],
+                ..Default::default()
             }),
-            inputs: vec![],
-            outputs: vec![],
-            support_files: vec![],
             cache: CacheConfig::on(true),
             pty: true,
-            hash: vec![],
-            transparent: false,
+            ..Default::default()
         };
 
         let request_id = "test-request".to_string();
@@ -3148,20 +3482,8 @@ mod tests {
         // Use a pipe that will never resolve to simulate a hang
         let (mut reader, _writer) = io::duplex(64);
 
-        let req = RunRequest {
-            request_id: &request_id,
-            target: &target_def,
-            tree_root_path: "".to_string().into(),
-            inputs: vec![],
-            hashin: "",
-            stdin: Some(&mut reader),
-            stdout: None,
-            stderr: None,
-            sandbox_dir: tmp.path().to_path_buf(),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        };
+        let mut req = RunRequest::new(&request_id, &target_def, tmp.path());
+        req.stdin = Some(&mut reader);
 
         let run_fut = driver.run(make_req(req), &ctoken);
 
@@ -3191,48 +3513,19 @@ mod tests {
         let ctoken = StdCancellationToken::new();
 
         let target_def = EngineTargetDef {
-            addr: Addr::default(),
-            labels: vec![],
             raw_def: Arc::new(TargetDef {
-                runner: None,
                 // Ignore SIGINT and hang, forcing the grace → SIGKILL path.
                 run: vec![D::new("trap '' INT; sleep 30".to_string())],
-                dep_group_inputs: BTreeMap::new(),
-                runtime_dep_group_inputs: BTreeMap::new(),
-                env: BTreeMap::new(),
-                tool_group_inputs: BTreeMap::new(),
-                pass_env: BTreeMap::new(),
-                runtime_pass_env: vec![],
-                runtime_env: HashMap::new(),
-                outputs: BTreeMap::new(),
-                support_files: vec![],
+                ..Default::default()
             }),
-            inputs: vec![],
-            outputs: vec![],
-            support_files: vec![],
             cache: CacheConfig::on(true),
-            pty: false,
-            hash: vec![],
-            transparent: false,
+            ..Default::default()
         };
 
         let request_id = "test-request".to_string();
         let tmp = tempfile::tempdir()?;
 
-        let req = RunRequest {
-            request_id: &request_id,
-            target: &target_def,
-            tree_root_path: "".to_string().into(),
-            inputs: vec![],
-            hashin: "",
-            stdin: None,
-            stdout: None,
-            stderr: None,
-            sandbox_dir: tmp.path().to_path_buf(),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        };
+        let req = RunRequest::new(&request_id, &target_def, tmp.path());
 
         let run_fut = driver.run(make_req(req), &ctoken);
 
@@ -3261,50 +3554,22 @@ mod tests {
         // a draining stdout pump the child would block on write forever.
         let payload_bytes: usize = 256 * 1024;
         let target_def = EngineTargetDef {
-            addr: Addr::default(),
-            labels: vec![],
             raw_def: Arc::new(TargetDef {
-                runner: None,
                 run: vec![D::new(format!(
                     "head -c {payload_bytes} /dev/urandom | base64"
                 ))],
-                dep_group_inputs: BTreeMap::new(),
-                runtime_dep_group_inputs: BTreeMap::new(),
-                env: BTreeMap::new(),
-                tool_group_inputs: BTreeMap::new(),
-                pass_env: BTreeMap::new(),
-                runtime_pass_env: vec![],
-                runtime_env: HashMap::new(),
-                outputs: BTreeMap::new(),
-                support_files: vec![],
+                ..Default::default()
             }),
-            inputs: vec![],
-            outputs: vec![],
-            support_files: vec![],
             cache: CacheConfig::on(true),
-            pty: false,
-            hash: vec![],
-            transparent: false,
+            ..Default::default()
         };
 
         let mut stdout = Vec::new();
         let request_id = "test-request".to_string();
         let tmp = tempfile::tempdir()?;
 
-        let req = RunRequest {
-            request_id: &request_id,
-            target: &target_def,
-            tree_root_path: "".to_string().into(),
-            inputs: vec![],
-            hashin: "",
-            stdin: None,
-            stdout: Some(&mut stdout),
-            stderr: None,
-            sandbox_dir: tmp.path().to_path_buf(),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        };
+        let mut req = RunRequest::new(&request_id, &target_def, tmp.path());
+        req.stdout = Some(&mut stdout);
 
         let res = tokio::time::timeout(
             std::time::Duration::from_secs(10),
@@ -3436,31 +3701,15 @@ mod tests {
         let driver = Driver::new_bash().with_host_path();
         let ctoken = StdCancellationToken::new();
         let target_def = EngineTargetDef {
-            addr: Addr::default(),
-            labels: vec![],
             raw_def: Arc::new(TargetDef {
-                runner: None,
                 run: vec![D::new(
                     "echo out-first; echo err-first >&2; sleep 1; echo out-last; echo err-last >&2"
                         .to_string(),
                 )],
-                dep_group_inputs: BTreeMap::new(),
-                runtime_dep_group_inputs: BTreeMap::new(),
-                env: BTreeMap::new(),
-                tool_group_inputs: BTreeMap::new(),
-                pass_env: BTreeMap::new(),
-                runtime_pass_env: vec![],
-                runtime_env: HashMap::new(),
-                outputs: BTreeMap::new(),
-                support_files: vec![],
+                ..Default::default()
             }),
-            inputs: vec![],
-            outputs: vec![],
-            support_files: vec![],
             cache: CacheConfig::on(true),
-            pty: false,
-            hash: vec![],
-            transparent: false,
+            ..Default::default()
         };
 
         let out_sink = TimedSink::default();
@@ -3470,20 +3719,9 @@ mod tests {
         let request_id = "test-request".to_string();
         let tmp = tempfile::tempdir()?;
 
-        let req = RunRequest {
-            request_id: &request_id,
-            target: &target_def,
-            tree_root_path: "".to_string().into(),
-            inputs: vec![],
-            hashin: "",
-            stdin: None,
-            stdout: Some(&mut out_handle),
-            stderr: Some(&mut err_handle),
-            sandbox_dir: tmp.path().to_path_buf(),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        };
+        let mut req = RunRequest::new(&request_id, &target_def, tmp.path());
+        req.stdout = Some(&mut out_handle);
+        req.stderr = Some(&mut err_handle);
 
         tokio::time::timeout(MIDDLE * 10, driver.run(make_req(req), &ctoken))
             .await
@@ -3525,49 +3763,20 @@ mod tests {
         let driver = Driver::new_bash().with_host_path();
         let ctoken = StdCancellationToken::new();
         let target_def = EngineTargetDef {
-            addr: Addr::default(),
-            labels: vec![],
             raw_def: Arc::new(TargetDef {
-                runner: None,
                 run: vec![D::new(
                     "echo a; sleep 0.3; echo b >&2; sleep 0.3; echo c; sleep 0.3; echo d >&2"
                         .to_string(),
                 )],
-                dep_group_inputs: BTreeMap::new(),
-                runtime_dep_group_inputs: BTreeMap::new(),
-                env: BTreeMap::new(),
-                tool_group_inputs: BTreeMap::new(),
-                pass_env: BTreeMap::new(),
-                runtime_pass_env: vec![],
-                runtime_env: HashMap::new(),
-                outputs: BTreeMap::new(),
-                support_files: vec![],
+                ..Default::default()
             }),
-            inputs: vec![],
-            outputs: vec![],
-            support_files: vec![],
             cache: CacheConfig::on(true),
-            pty: false,
-            hash: vec![],
-            transparent: false,
+            ..Default::default()
         };
 
         let request_id = "test-request".to_string();
         let tmp = tempfile::tempdir()?;
-        let req = RunRequest {
-            request_id: &request_id,
-            target: &target_def,
-            tree_root_path: "".to_string().into(),
-            inputs: vec![],
-            hashin: "",
-            stdin: None,
-            stdout: None,
-            stderr: None,
-            sandbox_dir: tmp.path().to_path_buf(),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        };
+        let req = RunRequest::new(&request_id, &target_def, tmp.path());
 
         driver.run(make_req(req), &ctoken).await?;
 
@@ -3595,10 +3804,7 @@ mod tests {
         let driver = Driver::new_bash().with_host_path();
         let ctoken = StdCancellationToken::new();
         let target_def = EngineTargetDef {
-            addr: Addr::default(),
-            labels: vec![],
             raw_def: Arc::new(TargetDef {
-                runner: None,
                 // Interleaved rather than sequential so both drains are live
                 // at once and each can stall the other. No pipeline: the
                 // wrapper runs under `pipefail`, and a producer killed by
@@ -3607,23 +3813,10 @@ mod tests {
                 run: vec![D::new(format!(
                     "head -c {PER_STREAM} /dev/zero & head -c {PER_STREAM} /dev/zero >&2; wait"
                 ))],
-                dep_group_inputs: BTreeMap::new(),
-                runtime_dep_group_inputs: BTreeMap::new(),
-                env: BTreeMap::new(),
-                tool_group_inputs: BTreeMap::new(),
-                pass_env: BTreeMap::new(),
-                runtime_pass_env: vec![],
-                runtime_env: HashMap::new(),
-                outputs: BTreeMap::new(),
-                support_files: vec![],
+                ..Default::default()
             }),
-            inputs: vec![],
-            outputs: vec![],
-            support_files: vec![],
             cache: CacheConfig::on(true),
-            pty: false,
-            hash: vec![],
-            transparent: false,
+            ..Default::default()
         };
 
         let mut stdout = Vec::new();
@@ -3631,20 +3824,9 @@ mod tests {
         let request_id = "test-request".to_string();
         let tmp = tempfile::tempdir()?;
 
-        let req = RunRequest {
-            request_id: &request_id,
-            target: &target_def,
-            tree_root_path: "".to_string().into(),
-            inputs: vec![],
-            hashin: "",
-            stdin: None,
-            stdout: Some(&mut stdout),
-            stderr: Some(&mut stderr),
-            sandbox_dir: tmp.path().to_path_buf(),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        };
+        let mut req = RunRequest::new(&request_id, &target_def, tmp.path());
+        req.stdout = Some(&mut stdout);
+        req.stderr = Some(&mut stderr);
 
         tokio::time::timeout(
             std::time::Duration::from_secs(60),
@@ -3752,10 +3934,7 @@ mod tests {
         let driver = Driver::new_bash().with_host_path();
         let ctoken = StdCancellationToken::new();
         let target_def = EngineTargetDef {
-            addr: Addr::default(),
-            labels: vec![],
             raw_def: Arc::new(TargetDef {
-                runner: None,
                 // `wc -c`'s count goes to a *file*, not stdout: stdout is
                 // deliberately paced slower than the child can produce (see
                 // `PacedSink` below) so its trailing bytes are subject to a
@@ -3766,23 +3945,10 @@ mod tests {
                 run: vec![D::new(format!(
                     "head -c {OUT_BYTES} /dev/zero; wc -c > stdin_byte_count.txt"
                 ))],
-                dep_group_inputs: BTreeMap::new(),
-                runtime_dep_group_inputs: BTreeMap::new(),
-                env: BTreeMap::new(),
-                tool_group_inputs: BTreeMap::new(),
-                pass_env: BTreeMap::new(),
-                runtime_pass_env: vec![],
-                runtime_env: HashMap::new(),
-                outputs: BTreeMap::new(),
-                support_files: vec![],
+                ..Default::default()
             }),
-            inputs: vec![],
-            outputs: vec![],
-            support_files: vec![],
             cache: CacheConfig::on(true),
-            pty: false,
-            hash: vec![],
-            transparent: false,
+            ..Default::default()
         };
 
         let mut stdin = std::io::Cursor::new(vec![b'x'; STDIN_BYTES]);
@@ -3790,20 +3956,9 @@ mod tests {
         let request_id = "test-request".to_string();
         let tmp = tempfile::tempdir()?;
 
-        let req = RunRequest {
-            request_id: &request_id,
-            target: &target_def,
-            tree_root_path: "".to_string().into(),
-            inputs: vec![],
-            hashin: "",
-            stdin: Some(&mut stdin),
-            stdout: Some(&mut stdout),
-            stderr: None,
-            sandbox_dir: tmp.path().to_path_buf(),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        };
+        let mut req = RunRequest::new(&request_id, &target_def, tmp.path());
+        req.stdin = Some(&mut stdin);
+        req.stdout = Some(&mut stdout);
 
         tokio::time::timeout(
             std::time::Duration::from_secs(60),
@@ -3865,46 +4020,22 @@ mod tests {
         let driver = Driver::new_bash().with_host_path();
         let ctoken = StdCancellationToken::new();
         let target_def = EngineTargetDef {
-            addr: Addr::default(),
-            labels: vec![],
             raw_def: Arc::new(TargetDef {
-                runner: None,
                 run: vec![D::new(run_cmd.to_string())],
-                dep_group_inputs: BTreeMap::new(),
-                runtime_dep_group_inputs: BTreeMap::new(),
-                env: BTreeMap::new(),
-                tool_group_inputs: BTreeMap::new(),
                 pass_env,
                 runtime_pass_env,
                 runtime_env,
-                outputs: BTreeMap::new(),
-                support_files: vec![],
+                ..Default::default()
             }),
-            inputs: vec![],
-            outputs: vec![],
-            support_files: vec![],
             cache: CacheConfig::on(true),
             pty: true,
-            hash: vec![],
-            transparent: false,
+            ..Default::default()
         };
         let mut stdout = Vec::new();
         let request_id = "test".to_string();
         let tmp = tempfile::tempdir()?;
-        let req = RunRequest {
-            request_id: &request_id,
-            target: &target_def,
-            tree_root_path: "".to_string().into(),
-            inputs: vec![],
-            hashin: "",
-            stdin: None,
-            stdout: Some(&mut stdout),
-            stderr: None,
-            sandbox_dir: tmp.path().to_path_buf(),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        };
+        let mut req = RunRequest::new(&request_id, &target_def, tmp.path());
+        req.stdout = Some(&mut stdout);
         driver.run(make_req(req), &ctoken).await?;
         Ok(String::from_utf8(stdout)?.trim().to_string())
     }
@@ -4189,16 +4320,7 @@ mod tests {
         use std::hash::{Hash as _, Hasher as _};
         let def = TargetDef {
             run: vec![D::new("sh".to_string()), D::new("-c".to_string())],
-            dep_group_inputs: BTreeMap::new(),
-            runtime_dep_group_inputs: BTreeMap::new(),
-            tool_group_inputs: BTreeMap::new(),
-            outputs: BTreeMap::new(),
-            support_files: vec![],
-            env: BTreeMap::new(),
-            pass_env: BTreeMap::new(),
-            runtime_pass_env: vec![],
-            runtime_env: HashMap::new(),
-            runner: None,
+            ..Default::default()
         };
         let mut h = Xxh3Default::new();
         def.hash(&mut h);
@@ -4220,6 +4342,307 @@ mod tests {
         ]
         .hash(&mut b);
         assert_eq!(a.finish(), b.finish());
+    }
+
+    /// A fully populated exec spec — every hashed field set — at a fixed address.
+    fn golden_populated_config() -> HashMap<String, hcore::htvalue::Value> {
+        use hcore::htvalue::Value;
+        let s = |v: &str| Value::String(v.to_string());
+        let list = |vs: &[&str]| Value::List(vs.iter().map(|v| s(v)).collect());
+        HashMap::from([
+            (
+                "run".to_string(),
+                list(&["$SRC_sdk/bin/go", "build", "./..."]),
+            ),
+            (
+                "deps".to_string(),
+                Value::Map(HashMap::from([
+                    ("sdk".to_string(), s("//tools/go:sdk")),
+                    ("srcs".to_string(), list(&["//app:a", "//app:b"])),
+                ])),
+            ),
+            ("hash_deps".to_string(), list(&["//app:hashed"])),
+            ("runtime_deps".to_string(), list(&["//app:rt"])),
+            (
+                "tools".to_string(),
+                Value::Map(HashMap::from([
+                    ("cc".to_string(), s("//toolchain:gcc")),
+                    ("".to_string(), list(&["//tools:jq", "//tools:yq"])),
+                ])),
+            ),
+            (
+                "env".to_string(),
+                Value::Map(HashMap::from([
+                    ("GOROOT".to_string(), s("$SRC_sdk")),
+                    ("CGO_ENABLED".to_string(), s("0")),
+                ])),
+            ),
+            (
+                "out".to_string(),
+                Value::Map(HashMap::from([
+                    ("bin".to_string(), s("bin/app")),
+                    ("".to_string(), s("gen/")),
+                ])),
+            ),
+            ("support_files".to_string(), list(&["testdata/*.json"])),
+            ("runner".to_string(), s("//tools/devenv:runner")),
+            // Named but unset, so the golden does not depend on the host env;
+            // a set `pass_env` reaches the hash through the transitive literal
+            // below instead.
+            (
+                "pass_env".to_string(),
+                list(&["HEPH_GOLDEN_SURELY_UNSET_VARIABLE"]),
+            ),
+        ])
+    }
+
+    /// The transitive closure `apply_transitive` folds in: a tool, a hashed
+    /// runtime dep, a runtime-only dep, a hash-only dep, and hashed and unhashed
+    /// env in both forms.
+    fn golden_transitive_sandbox() -> hplugin::driver::sandbox::Sandbox {
+        use hplugin::driver::sandbox::{Dep, Env, EnvValue, Mode, Sandbox, Tool};
+        let pkg = hmodel::htpkg::PkgBuf::from("");
+        let addr = |a: &str| TargetAddr::parse(a, &pkg).expect("golden addr");
+        let mut sb = Sandbox::default();
+        sb.push_tool(Tool {
+            r#ref: addr("//tools/node:node"),
+            group: "node".to_string(),
+            hash: true,
+            id: "_transitive_x_0_tool_t0".to_string(),
+        });
+        for (i, (a, runtime, hash)) in [
+            ("//lib:mods", true, true),
+            ("//lib:rt_only", true, false),
+            ("//lib:hash_only", false, true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            sb.push_dep(Dep {
+                r#ref: addr(a),
+                mode: Mode::None,
+                group: "lib".to_string(),
+                runtime,
+                hash,
+                id: format!("_transitive_x_0_dep_d{i}"),
+            });
+        }
+        let env = |value: EnvValue, hash: bool| Env {
+            value,
+            hash,
+            append: false,
+            append_prefix: String::new(),
+        };
+        sb.env.insert(
+            "NODE_OPTIONS".to_string(),
+            env(EnvValue::Literal("--no-deprecation".to_string()), true),
+        );
+        sb.env.insert(
+            "NODE_RT".to_string(),
+            env(EnvValue::Literal("rt".to_string()), false),
+        );
+        sb.env.insert(
+            "HEPH_GOLDEN_SURELY_UNSET_PASS".to_string(),
+            env(EnvValue::Pass, true),
+        );
+        sb
+    }
+
+    /// D47: the exec def hash of a *populated* spec, before and after
+    /// `apply_transitive`, pinned byte for byte, together with the shape of the
+    /// def and its inputs.
+    ///
+    /// `the_def_hash_of_a_reference_free_run_is_pinned` covers an empty def
+    /// only; this one covers every hashed field, so refactoring `parse` and
+    /// `apply_transitive` into helpers shared with `exec.entrypoint` cannot move
+    /// an exec def hash unseen. Update only alongside a deliberate
+    /// `EXEC_DEF_FORMAT_VERSION` bump.
+    #[tokio::test]
+    async fn exec_def_hash_golden_populated() -> anyhow::Result<()> {
+        let ctoken = StdCancellationToken::new();
+        let addr = parse_addr("//app:golden")?;
+        let mut report = String::new();
+        for (label, driver) in [
+            ("exec", Driver::new_exec()),
+            (
+                "exec+coreutils",
+                Driver::new_exec()
+                    .with_coreutils_enabled_for_test()
+                    .with_coreutils(7, Arc::new(|| Ok(PathBuf::from("/unused")))),
+            ),
+            ("bash", Driver::new_bash()),
+        ] {
+            let parsed = driver
+                .parse(
+                    hplugin::driver::ParseRequest {
+                        request_id: "golden".to_string(),
+                        target_spec: Arc::new(hplugin::provider::TargetSpec {
+                            addr: addr.clone(),
+                            driver: driver.name.clone(),
+                            config: golden_populated_config(),
+                            ..Default::default()
+                        }),
+                    },
+                    &ctoken,
+                )
+                .await?
+                .target_def;
+            // The input list is the same for every driver here; listing it once
+            // keeps the golden readable.
+            let describe = |stage: &str, d: &hplugin::driver::targetdef::TargetDef| {
+                let inputs = if label == "exec" {
+                    d.inputs
+                        .iter()
+                        .map(|i| {
+                            format!(
+                                "  {} {} hashed={} runtime={} {:?}\n",
+                                i.origin_id, i.r#ref, i.hashed, i.runtime, i.annotations
+                            )
+                        })
+                        .collect::<String>()
+                } else {
+                    String::new()
+                };
+                format!(
+                    "{label} {stage}: {}\n{inputs}",
+                    String::from_utf8_lossy(&d.hash)
+                )
+            };
+            report.push_str(&describe("parse", &parsed));
+            let applied = driver
+                .apply_transitive(
+                    hplugin::driver::ApplyTransitiveRequest {
+                        request_id: "golden".to_string(),
+                        target_def: parsed,
+                        sandbox: golden_transitive_sandbox(),
+                    },
+                    &ctoken,
+                )
+                .await?
+                .target_def;
+            report.push_str(&describe("apply_transitive", &applied));
+        }
+        assert_eq!(
+            report, EXEC_DEF_GOLDEN_POPULATED,
+            "an exec/bash def hash or input list moved:\n{report}"
+        );
+        Ok(())
+    }
+
+    const EXEC_DEF_GOLDEN_POPULATED: &str = r#"exec parse: 61dea7f3aa15aa34
+  dep|sdk|0 //tools/go:sdk hashed=true runtime=true {}
+  dep|srcs|0 //app:a hashed=true runtime=true {}
+  dep|srcs|1 //app:b hashed=true runtime=true {}
+  hash_dep||0 //app:hashed hashed=true runtime=false {}
+  runtime_dep||0 //app:rt hashed=false runtime=true {}
+  tool||0 //tools:jq hashed=true runtime=true {"unpack_root": "tools"}
+  tool||1 //tools:yq hashed=true runtime=true {"unpack_root": "tools"}
+  tool|cc|0 //toolchain:gcc hashed=true runtime=true {"unpack_root": "tools"}
+  runner //tools/devenv:runner hashed=true runtime=false {}
+exec apply_transitive: 26a90abee4625d43
+  dep|sdk|0 //tools/go:sdk hashed=true runtime=true {}
+  dep|srcs|0 //app:a hashed=true runtime=true {}
+  dep|srcs|1 //app:b hashed=true runtime=true {}
+  hash_dep||0 //app:hashed hashed=true runtime=false {}
+  runtime_dep||0 //app:rt hashed=false runtime=true {}
+  tool||0 //tools:jq hashed=true runtime=true {"unpack_root": "tools"}
+  tool||1 //tools:yq hashed=true runtime=true {"unpack_root": "tools"}
+  tool|cc|0 //toolchain:gcc hashed=true runtime=true {"unpack_root": "tools"}
+  runner //tools/devenv:runner hashed=true runtime=false {}
+  _transitive_x_0_tool_t0 //tools/node:node hashed=true runtime=true {"read_only": "true", "stage_per_file": "true", "unpack_root": "tools"}
+  _transitive_x_0_dep_d0 //lib:mods hashed=true runtime=true {}
+  _transitive_x_0_dep_d1 //lib:rt_only hashed=false runtime=true {}
+  _transitive_x_0_dep_d2 //lib:hash_only hashed=true runtime=false {}
+exec+coreutils parse: cfde72931f33cb07
+exec+coreutils apply_transitive: da2388103db4f305
+bash parse: 61dea7f3aa15aa34
+bash apply_transitive: 26a90abee4625d43
+"#;
+
+    /// `entrypoint = False` is no flag at all: the golden's exec and bash def
+    /// hashes, and a serialized def without any entrypoint key. With the flag,
+    /// the hash moves with the flag itself and with each of `run`, `env`,
+    /// `workdir` and `args`.
+    #[tokio::test]
+    async fn exec_def_hash_flag_on_differs() -> anyhow::Result<()> {
+        use hcore::htvalue::Value;
+        let ctoken = StdCancellationToken::new();
+        let parse = |driver: Driver, config: HashMap<String, Value>| {
+            let ctoken = &ctoken;
+            async move {
+                driver
+                    .parse(
+                        hplugin::driver::ParseRequest {
+                            request_id: "golden".to_string(),
+                            target_spec: Arc::new(hplugin::provider::TargetSpec {
+                                addr: parse_addr("//app:golden")?,
+                                driver: driver.name.clone(),
+                                config,
+                                ..Default::default()
+                            }),
+                        },
+                        ctoken,
+                    )
+                    .await
+                    .map(|r| r.target_def)
+            }
+        };
+
+        for driver in [Driver::new_exec, Driver::new_bash] {
+            let mut config = golden_populated_config();
+            config.insert("entrypoint".to_string(), Value::Bool(false));
+            let def = parse(driver(), config).await?;
+            assert_eq!(String::from_utf8_lossy(&def.hash), "61dea7f3aa15aa34");
+            assert!(def.entrypoint.is_none());
+            let json = serde_json::to_string(&def)?;
+            assert!(!json.contains("entrypoint"), "{json}");
+            assert!(!json.contains("workdir"), "{json}");
+            assert!(!json.contains("\"args\""), "{json}");
+        }
+
+        let s = |v: &str| Value::String(v.to_string());
+        let base = || {
+            HashMap::from([
+                ("run".to_string(), Value::List(vec![s("go")])),
+                ("entrypoint".to_string(), Value::Bool(true)),
+            ])
+        };
+        for driver in [Driver::new_exec, Driver::new_bash] {
+            let on = parse(driver(), base()).await?.hash;
+            let mut off_config = base();
+            off_config.remove("entrypoint");
+            assert_ne!(
+                on,
+                parse(driver(), off_config).await?.hash,
+                "the flag moves the def hash"
+            );
+            for (field, value) in [
+                ("run", Value::List(vec![s("gofmt")])),
+                (
+                    "env",
+                    Value::Map(HashMap::from([("A".to_string(), s("1"))])),
+                ),
+                ("workdir", s("root")),
+                ("workdir", s("sandbox")),
+                ("args", Value::Bool(true)),
+            ] {
+                let mut config = base();
+                config.insert(field.to_string(), value);
+                assert_ne!(
+                    on,
+                    parse(driver(), config).await?.hash,
+                    "{field} must move the def hash"
+                );
+            }
+            let mut config = base();
+            config.insert("workdir".to_string(), s("caller"));
+            assert_eq!(
+                on,
+                parse(driver(), config).await?.hash,
+                "the default workdir is \"caller\""
+            );
+        }
+        Ok(())
     }
 
     /// A repeated reference would mount one directory twice and set one variable
@@ -4920,14 +5343,8 @@ mod tests {
 
     fn make_tool_target_def(run: Vec<String>, origin_id: &str, group: &str) -> EngineTargetDef {
         EngineTargetDef {
-            addr: Addr::default(),
-            labels: vec![],
             raw_def: Arc::new(TargetDef {
-                runner: None,
                 run: run.into_iter().map(D::new).collect(),
-                dep_group_inputs: BTreeMap::new(),
-                runtime_dep_group_inputs: BTreeMap::new(),
-                env: BTreeMap::new(),
                 tool_group_inputs: BTreeMap::from([(
                     group.to_string(),
                     vec![Input {
@@ -4942,19 +5359,11 @@ mod tests {
                         runtime: true,
                     }],
                 )]),
-                pass_env: BTreeMap::new(),
-                runtime_pass_env: vec![],
-                runtime_env: HashMap::new(),
-                outputs: BTreeMap::new(),
-                support_files: vec![],
+                ..Default::default()
             }),
-            inputs: vec![],
-            outputs: vec![],
-            support_files: vec![],
             cache: CacheConfig::on(true),
             pty: true,
-            hash: vec![],
-            transparent: false,
+            ..Default::default()
         }
     }
 
@@ -4971,20 +5380,7 @@ mod tests {
         let target_def = make_tool_target_def(vec!["mytool".to_string()], origin_id, "");
 
         let request_id = "test".to_string();
-        let req = RunRequest {
-            request_id: &request_id,
-            target: &target_def,
-            tree_root_path: "".to_string().into(),
-            inputs: vec![],
-            hashin: "",
-            stdin: None,
-            stdout: None,
-            stderr: None,
-            sandbox_dir: tmp.path().to_path_buf(),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        };
+        let req = RunRequest::new(&request_id, &target_def, tmp.path());
         driver
             .run(
                 ManagedRunRequest {
@@ -5020,20 +5416,8 @@ mod tests {
 
         let mut stdout = Vec::new();
         let request_id = "test".to_string();
-        let req = RunRequest {
-            request_id: &request_id,
-            target: &target_def,
-            tree_root_path: "".to_string().into(),
-            inputs: vec![],
-            hashin: "",
-            stdin: None,
-            stdout: Some(&mut stdout),
-            stderr: None,
-            sandbox_dir: tmp.path().to_path_buf(),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        };
+        let mut req = RunRequest::new(&request_id, &target_def, tmp.path());
+        req.stdout = Some(&mut stdout);
         driver
             .run(
                 ManagedRunRequest {
@@ -5063,14 +5447,8 @@ mod tests {
 
         let existing_path = "/usr/bin:/bin";
         let target_def = EngineTargetDef {
-            addr: Addr::default(),
-            labels: vec![],
             raw_def: Arc::new(TargetDef {
-                runner: None,
                 run: vec![D::new("echo $PATH".to_string())],
-                dep_group_inputs: BTreeMap::new(),
-                runtime_dep_group_inputs: BTreeMap::new(),
-                env: BTreeMap::new(),
                 tool_group_inputs: BTreeMap::from([(
                     "".to_string(),
                     vec![Input {
@@ -5086,36 +5464,17 @@ mod tests {
                     }],
                 )]),
                 pass_env: BTreeMap::from([("PATH".to_string(), existing_path.to_string())]),
-                runtime_pass_env: vec![],
-                runtime_env: HashMap::new(),
-                outputs: BTreeMap::new(),
-                support_files: vec![],
+                ..Default::default()
             }),
-            inputs: vec![],
-            outputs: vec![],
-            support_files: vec![],
             cache: CacheConfig::on(true),
             pty: true,
-            hash: vec![],
-            transparent: false,
+            ..Default::default()
         };
 
         let mut stdout = Vec::new();
         let request_id = "test".to_string();
-        let req = RunRequest {
-            request_id: &request_id,
-            target: &target_def,
-            tree_root_path: "".to_string().into(),
-            inputs: vec![],
-            hashin: "",
-            stdin: None,
-            stdout: Some(&mut stdout),
-            stderr: None,
-            sandbox_dir: tmp.path().to_path_buf(),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        };
+        let mut req = RunRequest::new(&request_id, &target_def, tmp.path());
+        req.stdout = Some(&mut stdout);
         driver
             .run(
                 ManagedRunRequest {
@@ -5216,13 +5575,8 @@ mod tests {
                 "consumer".to_string(),
                 BTreeMap::new(),
             ),
-            labels: vec![],
             raw_def: Arc::new(TargetDef {
-                runner: None,
                 run: vec![D::new("true".to_string())],
-                dep_group_inputs: BTreeMap::new(),
-                runtime_dep_group_inputs: BTreeMap::new(),
-                env: BTreeMap::new(),
                 tool_group_inputs: BTreeMap::from([(
                     "".to_string(),
                     vec![Input {
@@ -5237,19 +5591,10 @@ mod tests {
                         runtime: true,
                     }],
                 )]),
-                pass_env: BTreeMap::new(),
-                runtime_pass_env: vec![],
-                runtime_env: HashMap::new(),
-                outputs: BTreeMap::new(),
-                support_files: vec![],
+                ..Default::default()
             }),
-            inputs: vec![],
-            outputs: vec![],
-            support_files: vec![],
             cache: CacheConfig::on(true),
-            pty: false,
-            hash: vec![],
-            transparent: false,
+            ..Default::default()
         };
 
         let sandbox = tmp.path().join("sandbox");
@@ -5261,20 +5606,10 @@ mod tests {
         );
 
         let request_id = "test".to_string();
-        let req = RunRequest {
-            request_id: &request_id,
-            target: &target_def,
-            tree_root_path: tmp.path().to_path_buf(),
-            inputs: artifacts,
-            hashin: "h",
-            stdin: None,
-            stdout: None,
-            stderr: None,
-            sandbox_dir: sandbox.clone(),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        };
+        let mut req = RunRequest::new(&request_id, &target_def, sandbox.clone());
+        req.tree_root_path = tmp.path().to_path_buf();
+        req.inputs = artifacts;
+        req.hashin = "h";
 
         os.run_inner(req, &ctoken, false).await?;
 
@@ -5360,20 +5695,7 @@ mod tests {
         let target_def = make_tool_target_def(vec!["true".to_string()], origin_id, "");
 
         let request_id = "test".to_string();
-        let req = RunRequest {
-            request_id: &request_id,
-            target: &target_def,
-            tree_root_path: "".to_string().into(),
-            inputs: vec![],
-            hashin: "",
-            stdin: None,
-            stdout: None,
-            stderr: None,
-            sandbox_dir: tmp.path().to_path_buf(),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        };
+        let req = RunRequest::new(&request_id, &target_def, tmp.path());
         driver
             .run(
                 ManagedRunRequest {
@@ -5412,45 +5734,17 @@ mod tests {
         let tmp = tempfile::tempdir()?;
 
         let target_def = EngineTargetDef {
-            addr: Addr::default(),
-            labels: vec![],
             raw_def: Arc::new(TargetDef {
-                runner: None,
                 run: vec![D::new("true".to_string())],
-                dep_group_inputs: BTreeMap::new(),
-                runtime_dep_group_inputs: BTreeMap::new(),
-                env: BTreeMap::new(),
-                tool_group_inputs: BTreeMap::new(),
-                pass_env: BTreeMap::new(),
-                runtime_pass_env: vec![],
-                runtime_env: HashMap::new(),
-                outputs: BTreeMap::new(),
-                support_files: vec![],
+                ..Default::default()
             }),
-            inputs: vec![],
-            outputs: vec![],
-            support_files: vec![],
             cache: CacheConfig::on(true),
             pty: true,
-            hash: vec![],
-            transparent: false,
+            ..Default::default()
         };
 
         let request_id = "test".to_string();
-        let req = RunRequest {
-            request_id: &request_id,
-            target: &target_def,
-            tree_root_path: "".to_string().into(),
-            inputs: vec![],
-            hashin: "",
-            stdin: None,
-            stdout: None,
-            stderr: None,
-            sandbox_dir: tmp.path().to_path_buf(),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        };
+        let req = RunRequest::new(&request_id, &target_def, tmp.path());
         driver.run(make_req(req), &ctoken).await?;
 
         assert!(
@@ -5481,14 +5775,8 @@ mod tests {
         let mi_b = make_tool_managed_input("tool|b|0", &tool_b, tmp.path())?;
 
         let target_def = EngineTargetDef {
-            addr: Addr::default(),
-            labels: vec![],
             raw_def: Arc::new(TargetDef {
-                runner: None,
                 run: vec![D::new("true".to_string())],
-                dep_group_inputs: BTreeMap::new(),
-                runtime_dep_group_inputs: BTreeMap::new(),
-                env: BTreeMap::new(),
                 tool_group_inputs: BTreeMap::from([(
                     "".to_string(),
                     vec![
@@ -5510,36 +5798,15 @@ mod tests {
                         },
                     ],
                 )]),
-                pass_env: BTreeMap::new(),
-                runtime_pass_env: vec![],
-                runtime_env: HashMap::new(),
-                outputs: BTreeMap::new(),
-                support_files: vec![],
+                ..Default::default()
             }),
-            inputs: vec![],
-            outputs: vec![],
-            support_files: vec![],
             cache: CacheConfig::on(true),
             pty: true,
-            hash: vec![],
-            transparent: false,
+            ..Default::default()
         };
 
         let request_id = "test".to_string();
-        let req = RunRequest {
-            request_id: &request_id,
-            target: &target_def,
-            tree_root_path: "".to_string().into(),
-            inputs: vec![],
-            hashin: "",
-            stdin: None,
-            stdout: None,
-            stderr: None,
-            sandbox_dir: tmp.path().to_path_buf(),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        };
+        let req = RunRequest::new(&request_id, &target_def, tmp.path());
         driver
             .run(
                 ManagedRunRequest {
@@ -5583,14 +5850,8 @@ mod tests {
         let mi_b = make_tool_managed_input_with_source("tool|g2|0", &tool_path, tmp.path(), src)?;
 
         let target_def = EngineTargetDef {
-            addr: Addr::default(),
-            labels: vec![],
             raw_def: Arc::new(TargetDef {
-                runner: None,
                 run: vec![D::new("true".to_string())],
-                dep_group_inputs: BTreeMap::new(),
-                runtime_dep_group_inputs: BTreeMap::new(),
-                env: BTreeMap::new(),
                 tool_group_inputs: BTreeMap::from([
                     (
                         "g1".to_string(),
@@ -5615,36 +5876,15 @@ mod tests {
                         }],
                     ),
                 ]),
-                pass_env: BTreeMap::new(),
-                runtime_pass_env: vec![],
-                runtime_env: HashMap::new(),
-                outputs: BTreeMap::new(),
-                support_files: vec![],
+                ..Default::default()
             }),
-            inputs: vec![],
-            outputs: vec![],
-            support_files: vec![],
             cache: CacheConfig::on(true),
             pty: true,
-            hash: vec![],
-            transparent: false,
+            ..Default::default()
         };
 
         let request_id = "test".to_string();
-        let req = RunRequest {
-            request_id: &request_id,
-            target: &target_def,
-            tree_root_path: "".to_string().into(),
-            inputs: vec![],
-            hashin: "",
-            stdin: None,
-            stdout: None,
-            stderr: None,
-            sandbox_dir: tmp.path().to_path_buf(),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        };
+        let req = RunRequest::new(&request_id, &target_def, tmp.path());
         driver
             .run(
                 ManagedRunRequest {
@@ -5671,22 +5911,10 @@ mod tests {
         let ctoken = StdCancellationToken::new();
 
         let target_def = EngineTargetDef {
-            addr: Addr::default(),
-            labels: vec![],
             raw_def: Arc::new(TargetDef {
-                runner: None,
                 run: vec![D::new("true".to_string())],
-                dep_group_inputs: BTreeMap::new(),
-                runtime_dep_group_inputs: BTreeMap::new(),
-                env: BTreeMap::new(),
-                tool_group_inputs: BTreeMap::new(),
-                pass_env: BTreeMap::new(),
-                runtime_pass_env: vec![],
-                runtime_env: HashMap::new(),
-                outputs: BTreeMap::new(),
-                support_files: vec![],
+                ..Default::default()
             }),
-            inputs: vec![],
             outputs: vec![
                 Output {
                     group: "file".to_string(),
@@ -5713,30 +5941,15 @@ mod tests {
                     }],
                 },
             ],
-            support_files: vec![],
             cache: CacheConfig::on(true),
             pty: true,
-            hash: vec![],
-            transparent: false,
+            ..Default::default()
         };
 
         let request_id = "test".to_string();
         let tmp = tempfile::tempdir()?;
 
-        let req = RunRequest {
-            request_id: &request_id,
-            target: &target_def,
-            tree_root_path: "".to_string().into(),
-            inputs: vec![],
-            hashin: "",
-            stdin: None,
-            stdout: None,
-            stderr: None,
-            sandbox_dir: tmp.path().to_path_buf(),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        };
+        let req = RunRequest::new(&request_id, &target_def, tmp.path());
 
         driver.run(make_req(req), &ctoken).await?;
 
@@ -6010,45 +6223,18 @@ mod tests {
         let tmp = tempfile::tempdir()?;
 
         let target_def = EngineTargetDef {
-            addr: Addr::default(),
-            labels: vec![],
             raw_def: Arc::new(TargetDef {
-                runner: None,
                 run: vec![D::new("echo $PATH".to_string())],
-                dep_group_inputs: BTreeMap::new(),
-                runtime_dep_group_inputs: BTreeMap::new(),
-                env: BTreeMap::new(),
-                tool_group_inputs: BTreeMap::new(),
-                pass_env: BTreeMap::new(),
-                runtime_pass_env: vec![],
-                runtime_env: HashMap::new(),
-                outputs: BTreeMap::new(),
-                support_files: vec![],
+                ..Default::default()
             }),
-            inputs: vec![],
-            outputs: vec![],
-            support_files: vec![],
             cache: CacheConfig::on(true),
             pty: true,
-            hash: vec![],
-            transparent: false,
+            ..Default::default()
         };
         let mut stdout = Vec::new();
         let request_id = "test".to_string();
-        let req = RunRequest {
-            request_id: &request_id,
-            target: &target_def,
-            tree_root_path: "".to_string().into(),
-            inputs: vec![],
-            hashin: "",
-            stdin: None,
-            stdout: Some(&mut stdout),
-            stderr: None,
-            sandbox_dir: tmp.path().to_path_buf(),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        };
+        let mut req = RunRequest::new(&request_id, &target_def, tmp.path());
+        req.stdout = Some(&mut stdout);
         driver
             .run(
                 ManagedRunRequest {
@@ -6105,14 +6291,8 @@ mod tests {
         let managed_input = make_tool_managed_input(origin_id, &tool_path, tmp.path())?;
 
         let target_def = EngineTargetDef {
-            addr: Addr::default(),
-            labels: vec![],
             raw_def: Arc::new(TargetDef {
-                runner: None,
                 run: vec![D::new("echo $PATH".to_string())],
-                dep_group_inputs: BTreeMap::new(),
-                runtime_dep_group_inputs: BTreeMap::new(),
-                env: BTreeMap::new(),
                 tool_group_inputs: BTreeMap::from([(
                     "".to_string(),
                     vec![Input {
@@ -6128,36 +6308,17 @@ mod tests {
                     }],
                 )]),
                 pass_env: BTreeMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]),
-                runtime_pass_env: vec![],
-                runtime_env: HashMap::new(),
-                outputs: BTreeMap::new(),
-                support_files: vec![],
+                ..Default::default()
             }),
-            inputs: vec![],
-            outputs: vec![],
-            support_files: vec![],
             cache: CacheConfig::on(true),
             pty: true,
-            hash: vec![],
-            transparent: false,
+            ..Default::default()
         };
 
         let mut stdout = Vec::new();
         let request_id = "test".to_string();
-        let req = RunRequest {
-            request_id: &request_id,
-            target: &target_def,
-            tree_root_path: "".to_string().into(),
-            inputs: vec![],
-            hashin: "",
-            stdin: None,
-            stdout: Some(&mut stdout),
-            stderr: None,
-            sandbox_dir: tmp.path().to_path_buf(),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        };
+        let mut req = RunRequest::new(&request_id, &target_def, tmp.path());
+        req.stdout = Some(&mut stdout);
         driver
             .run(
                 ManagedRunRequest {

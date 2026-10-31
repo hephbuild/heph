@@ -321,19 +321,132 @@ fn spawn_sigint_producer(trigger: ShutdownTrigger) {
 /// points already running on a `bootstrap::block_on` runtime.
 fn spawn_shutdown_handler(engine: Weak<engine::Engine>, mut rx: mpsc::UnboundedReceiver<()>) {
     tokio::spawn(async move {
-        if rx.recv().await.is_none() {
-            return;
+        let mut presses = 0usize;
+        while rx.recv().await.is_some() {
+            // Gated at trigger time, not here: a press accepted before an
+            // entrypoint was handed the terminal happened before its tool
+            // existed, so it is heph's — a cancel, which the spawn's own
+            // check then honours — even when this task reads it just after
+            // the handover. Dropping it here would lose that Ctrl-C.
+            //
+            // After an entrypoint's tool exited (R27), a press cancels what heph
+            // is still finishing — uploads, cleanup — and nothing else: no
+            // message, no hard abort, and the exit status stays the tool's.
+            if hcore::shutdown::is_after_tool() {
+                if let Some(e) = engine.upgrade() {
+                    e.cancel_all_requests();
+                }
+                continue;
+            }
+            presses += 1;
+            if presses == 1 {
+                tracing::warn!(
+                    "ctrl-c received, cancelling in-flight work (press ctrl-c again to abort)"
+                );
+                if let Some(e) = engine.upgrade() {
+                    e.cancel_all_requests();
+                }
+            } else {
+                tracing::error!("second ctrl-c, aborting");
+                hard_abort(|code| std::process::exit(code));
+            }
         }
-        tracing::warn!("ctrl-c received, cancelling in-flight work (press ctrl-c again to abort)");
-        if let Some(e) = engine.upgrade() {
-            e.cancel_all_requests();
-        }
-        if rx.recv().await.is_none() {
-            return;
-        }
-        tracing::error!("second ctrl-c, aborting");
-        hard_abort(|code| std::process::exit(code));
     });
+}
+
+/// The relay's listener (E17, R9): every signal in
+/// [`RELAYED_SIGNALS`](hexecrunner::foreground::RELAYED_SIGNALS) that reaches
+/// heph is forwarded, as is and unfiltered, into the receiver
+/// [`signal_relay`] returns, which `Engine::invoke` hands to the driver that
+/// spawns an entrypoint. The driver decides what the terminal already
+/// delivered (R2) — only it knows the tool's pid.
+///
+/// Two halves with two lifetimes. The channel exists from the start of the
+/// invocation, so the request can carry its receiver; the listeners are
+/// installed only by [`SignalRelay::install`], which the run's handover calls
+/// right before the tool is spawned (N4a: the relay runs from the spawn).
+/// Before that heph is an ordinary run: TERM and HUP end it, Ctrl-C cancels,
+/// SIGQUIT dumps diagnostics and SIGUSR2 a profile — and nothing is queued
+/// for a tool that does not exist yet, so a QUIT sent to inspect a slow dep
+/// build cannot kill the tool later.
+///
+/// Once installed, heph no longer dies of TERM, HUP, USR1 or USR2 for the
+/// rest of the process (a tokio handler is never uninstalled), so the
+/// listeners stay and change what they do when the tool exits (R27): from
+/// [`hcore::shutdown::tool_exited`] on — once no other invocation's tool still
+/// runs — they forward nothing, and a TERM or HUP calls `after_tool`, which
+/// cancels what heph is still finishing (uploads, cleanup) so it exits
+/// promptly, with the tool's status. Ctrl-C reaches the same cancel through
+/// the shutdown trigger.
+pub struct SignalRelay {
+    tx: engine::driver::SignalSender,
+    after_tool: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl std::fmt::Debug for SignalRelay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignalRelay").finish_non_exhaustive()
+    }
+}
+
+/// The relay's channel, its listeners not yet installed. `after_tool` is
+/// what a TERM or HUP does once the tool has exited.
+pub fn signal_relay(
+    after_tool: impl Fn() + Send + Sync + 'static,
+) -> (SignalRelay, engine::driver::SignalReceiver) {
+    let (tx, rx) = engine::driver::signal_channel();
+    (
+        SignalRelay {
+            tx,
+            after_tool: Arc::new(after_tool),
+        },
+        rx,
+    )
+}
+
+impl SignalRelay {
+    /// Install the listeners. Must be called on a thread inside the runtime
+    /// (the handover fires on one).
+    ///
+    /// tokio arms the OS handler inside `signal()` before the listener it
+    /// returns is subscribed, so a signal landing in that instant — a few
+    /// microseconds per signal, once per invocation — is lost rather than
+    /// relayed. Accepted: arming every handler up front would swallow TERM
+    /// and HUP before the handover, which is worse.
+    pub fn install(self) -> anyhow::Result<()> {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        // `signal` panics outside a runtime; make that an error instead.
+        let handle = tokio::runtime::Handle::try_current()
+            .context("installing the signal relay outside the runtime")?;
+        let _enter = handle.enter();
+        let listeners = hexecrunner::foreground::RELAYED_SIGNALS
+            .iter()
+            .map(|&signo| {
+                signal(SignalKind::from_raw(signo))
+                    .map(|l| (signo, l))
+                    .with_context(|| format!("listening for signal {signo} to relay it"))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        for (signo, mut listener) in listeners {
+            let tx = self.tx.clone();
+            let after_tool = Arc::clone(&self.after_tool);
+            handle.spawn(async move {
+                while listener.recv().await.is_some() {
+                    if hcore::shutdown::is_after_tool() && !hcore::shutdown::is_transparent() {
+                        if signo == libc::SIGTERM || signo == libc::SIGHUP {
+                            after_tool();
+                        }
+                        continue;
+                    }
+                    // A closed receiver: this invocation's tool is gone, and
+                    // there is nothing to forward to.
+                    let _forwarded = tx.send(engine::driver::Signal::from_raw(signo));
+                }
+            });
+        }
+        Ok(())
+    }
 }
 
 /// The second-Ctrl-C abort sequence, with the actual exit call taken as a

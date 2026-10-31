@@ -178,11 +178,9 @@ impl ManagedDriver for GoTestmainDriver {
                 raw_def: Arc::new(def),
                 inputs,
                 outputs,
-                support_files: vec![],
                 cache: CacheConfig::on(true),
-                pty: false,
                 hash,
-                transparent: false,
+                ..Default::default()
             },
         })
     }

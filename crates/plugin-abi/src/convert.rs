@@ -28,7 +28,9 @@ use hmodel::htmatcher::{ListedFacts, Matcher};
 use hmodel::htpkg::PkgBuf;
 use hplugin::driver::TargetAddr;
 use hplugin::driver::sandbox::{Dep, Env, EnvValue, Mode, Sandbox, Tool};
-use hplugin::driver::targetdef::{RawDef, RawDefBytes};
+use hplugin::driver::targetdef::{Entrypoint, RawDef, RawDefBytes, Workdir};
+use hplugin::driver::{Disposition, Foreground, RunOptions, RunStdio, Signal, SignalSender};
+use hplugin::error::Exit;
 use hplugin::function::{DeclaredState, DeclaredTarget, FnArgs, FnOutcome};
 use hplugin::provider::{Approval, State, TargetSpec};
 use std::collections::BTreeMap;
@@ -527,9 +529,15 @@ pub struct CreateConfig {
     /// The plugin's `options:` map, read with `hplugin::config::decode_opt`
     /// exactly as an in-process plugin reads its own.
     pub options: BTreeMap<String, serde_yaml::Value>,
+    /// What the loading host understands beyond the ABI floor. A plugin on an
+    /// older host decodes all of it as "no".
+    pub host_capabilities: HostCapabilities,
 }
 
 impl CreateConfig {
+    /// A config from **this** host, so it advertises this build's
+    /// [`HostCapabilities::current`]. Override with
+    /// [`with_host_capabilities`](Self::with_host_capabilities) to model another.
     pub fn new(
         root: impl Into<std::path::PathBuf>,
         home: impl Into<std::path::PathBuf>,
@@ -541,7 +549,37 @@ impl CreateConfig {
             home: home.into(),
             name: name.into(),
             options,
+            host_capabilities: HostCapabilities::current(),
         }
+    }
+
+    pub fn with_host_capabilities(mut self, caps: HostCapabilities) -> Self {
+        self.host_capabilities = caps;
+        self
+    }
+}
+
+/// Host capability bits handed to a plugin at create (`CreateConfig`). Each is
+/// `false` unless the host said so: a bit an older host never sends is "no".
+///
+/// `#[non_exhaustive]`: built with [`Default`] (nothing) or [`current`](Self::current).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct HostCapabilities {
+    /// The host honours `TargetDef.entrypoint` (since 0.17.1): it never caches
+    /// such a def, sends its run `RunOptions` and relays signals to it.
+    pub entrypoints: bool,
+}
+
+impl HostCapabilities {
+    /// Everything this build of the host supports.
+    pub fn current() -> Self {
+        Self { entrypoints: true }
+    }
+
+    pub fn with_entrypoints(mut self, on: bool) -> Self {
+        self.entrypoints = on;
+        self
     }
 }
 
@@ -551,6 +589,11 @@ pub fn create_config_to_pb(c: &CreateConfig) -> pb::CreateConfig {
         home: Some(c.home.to_string_lossy().into_owned()),
         options: options_to_pb_map(&c.options),
         name: Some(c.name.clone()),
+        host_capabilities: pb::HostCapabilities {
+            entrypoints: Some(c.host_capabilities.entrypoints),
+            ..Default::default()
+        }
+        .into(),
         ..Default::default()
     }
 }
@@ -565,6 +608,14 @@ pub fn create_config_from_bytes(bytes: &[u8]) -> anyhow::Result<CreateConfig> {
         home: required(c.home, "CreateConfig.home")?.into(),
         name: required(c.name, "CreateConfig.name")?,
         options: options_from_pb_map(c.options).context("decoding CreateConfig.options")?,
+        // Absent (an older host) is no capability at all.
+        host_capabilities: c
+            .host_capabilities
+            .into_option()
+            .map(|h| HostCapabilities {
+                entrypoints: h.entrypoints.unwrap_or_default(),
+            })
+            .unwrap_or_default(),
     })
 }
 
@@ -1309,8 +1360,226 @@ pub fn target_def_to_pb(td: &TargetDef) -> anyhow::Result<pb::TargetDef> {
         pty: Some(td.pty),
         hash: Some(td.hash.clone()),
         transparent: Some(td.transparent),
+        entrypoint: td.entrypoint.as_ref().map(entrypoint_to_pb).into(),
         ..Default::default()
     })
+}
+
+fn entrypoint_to_pb(e: &Entrypoint) -> pb::Entrypoint {
+    pb::Entrypoint {
+        accepts_args: Some(e.accepts_args),
+        workdir: Some(EnumValue::Known(match e.workdir {
+            Workdir::Caller => pb::EntrypointWorkdir::Caller,
+            Workdir::Root => pb::EntrypointWorkdir::Root,
+            Workdir::Sandbox => pb::EntrypointWorkdir::Sandbox,
+        })),
+        ..Default::default()
+    }
+}
+
+/// `workdir` is required and must be one this build knows: an entrypoint run
+/// in a directory its driver did not ask for is worse than refused.
+fn entrypoint_from_pb(e: pb::Entrypoint) -> anyhow::Result<Entrypoint> {
+    let workdir = match required_enum(e.workdir, "Entrypoint.workdir")? {
+        pb::EntrypointWorkdir::Caller => Workdir::Caller,
+        pb::EntrypointWorkdir::Root => Workdir::Root,
+        pb::EntrypointWorkdir::Sandbox => Workdir::Sandbox,
+        pb::EntrypointWorkdir::Unspecified => bail!("field Entrypoint.workdir is unspecified"),
+    };
+    Ok(Entrypoint::new(e.accepts_args.unwrap_or_default(), workdir))
+}
+
+// ---- RunOptions / ExitStatus (entrypoint runs, since 0.17.1) ----
+
+fn os_bytes(s: &std::ffi::OsStr) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt as _;
+    s.as_bytes().to_vec()
+}
+
+fn os_string(b: Vec<u8>) -> std::ffi::OsString {
+    use std::os::unix::ffi::OsStringExt as _;
+    std::ffi::OsString::from_vec(b)
+}
+
+/// The wire form of a run's options, or `None` for the default (which is
+/// sent as absence).
+///
+/// N9 at the seam: a non-default value for a def that declared no entrypoint
+/// is refused rather than sent. Such a def may come from a plugin that predates
+/// the field and would run it as a build; and N6 says no build ever gets one,
+/// so reaching here with one is a host bug.
+///
+/// [`Foreground::signals`](hplugin::driver::Foreground::signals) is not part of
+/// the message: signals ride the run's request stream as `RunInFrame.signal`.
+pub fn run_options_to_pb(
+    target: &TargetDef,
+    o: &RunOptions,
+) -> anyhow::Result<Option<pb::RunOptions>> {
+    if o.is_default() {
+        return Ok(None);
+    }
+    if target.entrypoint.is_none() {
+        bail!(
+            "{} declared no entrypoint, but its run was given caller options ({o:?}); only an \
+             entrypoint's run is, so this is a bug in heph",
+            target.addr.format()
+        );
+    }
+    let (stdio, dispositions, nofile, blocked_signals) = match &o.stdio {
+        RunStdio::Captured => (pb::RunStdio::Captured, Vec::new(), None, Vec::new()),
+        RunStdio::Inherit(fg) => (
+            pb::RunStdio::Inherit,
+            fg.dispositions
+                .iter()
+                .map(|(sig, d)| pb::SignalDispositionEntry {
+                    signo: Some(sig.as_raw()),
+                    disposition: Some(EnumValue::Known(match d {
+                        Disposition::Default => pb::SignalDisposition::Default,
+                        Disposition::Ignore => pb::SignalDisposition::Ignore,
+                    })),
+                    ..Default::default()
+                })
+                .collect(),
+            fg.nofile,
+            fg.blocked.iter().map(|s| s.as_raw()).collect(),
+        ),
+        other => bail!(
+            "run stdio {other:?} has no wire form in ABI {}",
+            crate::ABI_SEMVER
+        ),
+    };
+    Ok(Some(pb::RunOptions {
+        cwd: o.cwd.as_deref().map(|p| os_bytes(p.as_os_str())),
+        base_env: o
+            .base_env
+            .as_ref()
+            .map(|env| pb::EnvList {
+                vars: env
+                    .iter()
+                    .map(|(k, v)| pb::EnvVar {
+                        key: Some(os_bytes(k)),
+                        value: Some(os_bytes(v)),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            })
+            .into(),
+        args: o
+            .args
+            .as_ref()
+            .map(|args| pb::ArgList {
+                args: args.iter().map(|a| os_bytes(a)).collect(),
+                ..Default::default()
+            })
+            .into(),
+        stdio: Some(EnumValue::Known(stdio)),
+        dispositions,
+        nofile,
+        blocked_signals,
+        ..Default::default()
+    }))
+}
+
+/// Decode a run's options. Absent is the default. Under `INHERIT`, the
+/// returned sender feeds [`Foreground::signals`]: the receiver pushes each
+/// `RunInFrame.signal` into it, and drops it when the request stream ends —
+/// which the driver reads as "no more signals", not as a cancel.
+pub fn run_options_from_pb(
+    o: Option<pb::RunOptions>,
+) -> anyhow::Result<(RunOptions, Option<SignalSender>)> {
+    let Some(o) = o else {
+        return Ok((RunOptions::default(), None));
+    };
+    let mut opts = RunOptions::default();
+    if let Some(cwd) = o.cwd {
+        opts = opts.with_cwd(std::path::PathBuf::from(os_string(cwd)));
+    }
+    if let Some(env) = o.base_env.into_option() {
+        opts = opts.with_base_env(
+            env.vars
+                .into_iter()
+                .map(|v| {
+                    Ok((
+                        os_string(required(v.key, "EnvVar.key")?),
+                        os_string(v.value.unwrap_or_default()),
+                    ))
+                })
+                .collect::<anyhow::Result<_>>()?,
+        );
+    }
+    if let Some(args) = o.args.into_option() {
+        opts = opts.with_args(args.args.into_iter().map(os_string).collect());
+    }
+    let stdio = match o.stdio {
+        None => pb::RunStdio::Captured,
+        Some(v) => known_enum(v, "RunOptions.stdio")?,
+    };
+    let mut signals = None;
+    match stdio {
+        pb::RunStdio::Captured | pb::RunStdio::Unspecified => {
+            if !o.dispositions.is_empty() {
+                bail!("RunOptions.dispositions is set on a run whose stdio is not INHERIT");
+            }
+            if o.nofile.is_some() {
+                bail!("RunOptions.nofile is set on a run whose stdio is not INHERIT");
+            }
+            if !o.blocked_signals.is_empty() {
+                bail!("RunOptions.blocked_signals is set on a run whose stdio is not INHERIT");
+            }
+        }
+        pb::RunStdio::Inherit => {
+            let dispositions = o
+                .dispositions
+                .into_iter()
+                .map(|d| {
+                    let sig = Signal::from_raw(required(d.signo, "SignalDispositionEntry.signo")?);
+                    let disp =
+                        match required_enum(d.disposition, "SignalDispositionEntry.disposition")? {
+                            pb::SignalDisposition::Default => Disposition::Default,
+                            pb::SignalDisposition::Ignore => Disposition::Ignore,
+                            pb::SignalDisposition::Unspecified => {
+                                bail!("field SignalDispositionEntry.disposition is unspecified")
+                            }
+                        };
+                    Ok((sig, disp))
+                })
+                .collect::<anyhow::Result<_>>()?;
+            let (tx, rx) = hplugin::driver::signal_channel();
+            signals = Some(tx);
+            let fg = Foreground::new(rx, dispositions)
+                .with_nofile(o.nofile)
+                .with_blocked(
+                    o.blocked_signals
+                        .into_iter()
+                        .map(Signal::from_raw)
+                        .collect(),
+                );
+            opts = opts.with_stdio(RunStdio::Inherit(fg));
+        }
+    }
+    Ok((opts, signals))
+}
+
+pub fn exit_to_pb(e: Exit) -> pb::ExitStatus {
+    pb::ExitStatus {
+        status: Some(match e {
+            Exit::Code(c) => pb::exit_status::Status::Code(c),
+            Exit::Signal(s) => pb::exit_status::Status::Signal(s),
+        }),
+        ..Default::default()
+    }
+}
+
+/// Absent — every older plugin, and every failure that is not a process exit
+/// — is `None`.
+pub fn exit_from_pb(
+    e: buffa::MessageField<pb::ExitStatus, buffa::Inline<pb::ExitStatus>>,
+) -> Option<Exit> {
+    match e.into_option()?.status? {
+        pb::exit_status::Status::Code(c) => Some(Exit::Code(c)),
+        pb::exit_status::Status::Signal(s) => Some(Exit::Signal(s)),
+    }
 }
 
 /// `addr`, `raw_def`, `cache` and `hash` are required; `pty` and `transparent`
@@ -1336,6 +1605,12 @@ pub fn target_def_from_pb(td: pb::TargetDef) -> anyhow::Result<TargetDef> {
             pty: td.pty.unwrap_or_default(),
             hash: required(td.hash, "TargetDef.hash")?,
             transparent: td.transparent.unwrap_or_default(),
+            // Absent — what every plugin before 0.17.1 sends — is not one.
+            entrypoint: td
+                .entrypoint
+                .into_option()
+                .map(entrypoint_from_pb)
+                .transpose()?,
             addr: addr.clone(),
         })
     })();
@@ -1932,6 +2207,7 @@ mod tests {
             home: "/ws/.heph".into(),
             name: "go".to_string(),
             options: BTreeMap::from([("k".to_string(), serde_yaml::Value::Bool(true))]),
+            host_capabilities: HostCapabilities::current(),
         };
         let bytes = create_config_to_pb(&full).encode_to_vec();
         assert_eq!(create_config_from_bytes(&bytes).expect("decode"), full);
@@ -1962,6 +2238,270 @@ mod tests {
                 .root,
             std::path::PathBuf::new()
         );
+    }
+
+    /// R3/R23: this host advertises entrypoints; a config from an older host —
+    /// no `host_capabilities` at all, or the message without the bit — decodes
+    /// to "no", and a host that says no is heard as no.
+    #[test]
+    fn create_config_without_the_entrypoint_bit_decodes_to_no() {
+        let cfg = CreateConfig::new("/ws", "/ws/.heph", "go", BTreeMap::new());
+        assert!(cfg.host_capabilities.entrypoints, "this host has the bit");
+        let decoded =
+            create_config_from_bytes(&create_config_to_pb(&cfg).encode_to_vec()).expect("decode");
+        assert!(decoded.host_capabilities.entrypoints);
+
+        let mut old = create_config_to_pb(&cfg);
+        old.host_capabilities = Default::default();
+        assert_eq!(
+            create_config_from_bytes(&old.encode_to_vec())
+                .expect("decode")
+                .host_capabilities,
+            HostCapabilities::default(),
+            "an older host sends no capabilities: every bit is no"
+        );
+
+        let mut no_bit = create_config_to_pb(&cfg);
+        no_bit.host_capabilities = pb::HostCapabilities::default().into();
+        assert!(
+            !create_config_from_bytes(&no_bit.encode_to_vec())
+                .expect("decode")
+                .host_capabilities
+                .entrypoints
+        );
+
+        let said_no = cfg.with_host_capabilities(HostCapabilities::default());
+        assert!(
+            !create_config_from_bytes(&create_config_to_pb(&said_no).encode_to_vec())
+                .expect("decode")
+                .host_capabilities
+                .entrypoints
+        );
+    }
+
+    fn entrypoint_def() -> TargetDef {
+        TargetDef {
+            entrypoint: Some(hplugin::driver::targetdef::Entrypoint::new(
+                true,
+                hplugin::driver::targetdef::Workdir::Caller,
+            )),
+            ..full_target_def()
+        }
+    }
+
+    fn os(b: &[u8]) -> std::ffi::OsString {
+        use std::os::unix::ffi::OsStringExt as _;
+        std::ffi::OsString::from_vec(b.to_vec())
+    }
+
+    /// Encode, cross as bytes, decode.
+    fn options_round_trip(o: &RunOptions) -> (RunOptions, Option<SignalSender>) {
+        let wire = run_options_to_pb(&entrypoint_def(), o)
+            .expect("encode")
+            .map(|m| via_bytes(&m));
+        run_options_from_pb(wire).expect("decode")
+    }
+
+    /// E19/N9: every option survives the wire losslessly — non-UTF-8 env keys,
+    /// values, args and cwd, an explicitly empty env, `None` vs empty args, and
+    /// the inherit mode with its dispositions; signals ride the stream, so the
+    /// decoder hands back the sender that feeds the receiver it built.
+    #[test]
+    fn run_options_round_trip_abi() {
+        // Default is absence on the wire, and decodes back to default.
+        assert!(
+            run_options_to_pb(&entrypoint_def(), &RunOptions::default())
+                .expect("encode")
+                .is_none()
+        );
+        let (back, tx) = run_options_from_pb(None).expect("decode");
+        assert!(back.is_default());
+        assert!(tx.is_none());
+
+        let env = vec![
+            (os(b"PATH"), os(b"/usr/bin")),
+            (os(b"K\xff"), os(b"v\xfe\x00tail")),
+            (os(b"EMPTY"), os(b"")),
+            // Duplicate keys keep their order; the consumer resolves them.
+            (os(b"PATH"), os(b"/second")),
+        ];
+        let args = vec![os(b""), os(b"a b"), os(b"-x"), os(b"\xc3\xa9"), os(b"\xff")];
+        let o = RunOptions::default()
+            .with_cwd(std::path::PathBuf::from(os(b"/w/\xffdir")))
+            .with_base_env(env.clone())
+            .with_args(args.clone());
+        let (back, tx) = options_round_trip(&o);
+        assert_eq!(back.cwd, o.cwd);
+        assert_eq!(back.base_env, Some(env));
+        assert_eq!(back.args, Some(args));
+        assert!(matches!(back.stdio, RunStdio::Captured));
+        assert!(tx.is_none(), "a captured run gets no signals");
+
+        // None vs empty: both present-ness and emptiness survive.
+        for (base_env, args) in [
+            (None, Some(vec![])),
+            (Some(vec![]), None),
+            (Some(vec![]), Some(vec![])),
+        ] {
+            let mut o = RunOptions::default();
+            o.base_env = base_env.clone();
+            o.args = args.clone();
+            let (back, _) = options_round_trip(&o);
+            assert_eq!(back.base_env, base_env);
+            assert_eq!(back.args, args);
+        }
+
+        // Inherit, with dispositions, and a signal fed through the sender
+        // reaches the receiver the driver gets.
+        let (_host_tx, host_rx) = hplugin::driver::signal_channel();
+        let dispositions = vec![
+            (Signal::from_raw(2), Disposition::Ignore),
+            (Signal::from_raw(22), Disposition::Default),
+        ];
+        let blocked = vec![Signal::from_raw(10), Signal::from_raw(12)];
+        let o = RunOptions::default().with_stdio(RunStdio::Inherit(
+            Foreground::new(host_rx, dispositions.clone())
+                .with_nofile(Some(256))
+                .with_blocked(blocked.clone()),
+        ));
+        let (back, tx) = options_round_trip(&o);
+        let RunStdio::Inherit(mut fg) = back.stdio else {
+            panic!("inherit did not survive: {:?}", back.stdio);
+        };
+        assert_eq!(fg.dispositions, dispositions);
+        assert_eq!(fg.nofile, Some(256), "the caller's open-file limit (D5)");
+        assert_eq!(fg.blocked, blocked, "the caller's signal mask");
+        let tx = tx.expect("an inherit run gets a signal sender");
+        tx.send(Signal::from_raw(15)).expect("send");
+        drop(tx);
+        assert_eq!(fg.signals.try_recv().ok(), Some(Signal::from_raw(15)));
+        assert!(
+            fg.signals.try_recv().is_err(),
+            "the sender's drop closes the relay"
+        );
+    }
+
+    /// N9 at the seam: a def that declared no entrypoint — every def from a
+    /// plugin that predates the field — is never sent options; the host refuses
+    /// to encode them rather than have an old plugin run a build in the caller's
+    /// world. A default value still crosses as nothing.
+    #[test]
+    fn old_plugin_defs_never_receive_options() {
+        let plain = full_target_def();
+        assert!(plain.entrypoint.is_none());
+        assert!(
+            run_options_to_pb(&plain, &RunOptions::default())
+                .expect("default is fine")
+                .is_none()
+        );
+        for o in [
+            RunOptions::default().with_cwd("/w"),
+            RunOptions::default().with_base_env(vec![]),
+            RunOptions::default().with_args(vec![]),
+            RunOptions::default().with_stdio(RunStdio::Inherit(Foreground::new(
+                hplugin::driver::signal_channel().1,
+                vec![],
+            ))),
+        ] {
+            let err = run_options_to_pb(&plain, &o).expect_err("refused");
+            assert!(
+                format!("{err:#}").contains("declared no entrypoint"),
+                "{err:#}"
+            );
+        }
+    }
+
+    /// The decoder refuses what it cannot honour, rather than guessing.
+    #[test]
+    fn run_options_decode_refuses_malformed() {
+        let cases: [(&str, pb::RunOptions); 6] = [
+            (
+                "EnvVar.key",
+                pb::RunOptions {
+                    base_env: pb::EnvList {
+                        vars: vec![pb::EnvVar::default()],
+                        ..Default::default()
+                    }
+                    .into(),
+                    ..Default::default()
+                },
+            ),
+            (
+                "RunOptions.stdio",
+                pb::RunOptions {
+                    stdio: Some(EnumValue::Unknown(9)),
+                    ..Default::default()
+                },
+            ),
+            (
+                "not INHERIT",
+                pb::RunOptions {
+                    dispositions: vec![pb::SignalDispositionEntry {
+                        signo: Some(2),
+                        disposition: Some(EnumValue::Known(pb::SignalDisposition::Ignore)),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ),
+            (
+                "RunOptions.nofile is set on a run whose stdio is not INHERIT",
+                pb::RunOptions {
+                    nofile: Some(256),
+                    ..Default::default()
+                },
+            ),
+            (
+                "RunOptions.blocked_signals is set on a run whose stdio is not INHERIT",
+                pb::RunOptions {
+                    blocked_signals: vec![10],
+                    ..Default::default()
+                },
+            ),
+            (
+                "SignalDispositionEntry.disposition",
+                pb::RunOptions {
+                    stdio: Some(EnumValue::Known(pb::RunStdio::Inherit)),
+                    dispositions: vec![pb::SignalDispositionEntry {
+                        signo: Some(2),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ),
+        ];
+        for (needle, wire) in cases {
+            let err = run_options_from_pb(Some(via_bytes(&wire))).expect_err(needle);
+            assert!(format!("{err:#}").contains(needle), "{needle}: {err:#}");
+        }
+    }
+
+    /// E19: a code and a signal survive the wire; absent — an older plugin, or
+    /// a failure that is not a process exit — is `None`.
+    #[test]
+    fn exit_status_round_trips_abi() {
+        for e in [
+            Exit::Code(0),
+            Exit::Code(3),
+            Exit::Code(-1),
+            Exit::Code(255),
+            Exit::Signal(15),
+            Exit::Signal(9),
+        ] {
+            let frame = pb::RunOutFrame {
+                msg: Some(pb::run_out_frame::Msg::Error("boom".to_string())),
+                exit: exit_to_pb(e).into(),
+                ..Default::default()
+            };
+            assert_eq!(exit_from_pb(via_bytes(&frame).exit), Some(e));
+        }
+        let old = pb::RunOutFrame {
+            msg: Some(pb::run_out_frame::Msg::Error("boom".to_string())),
+            ..Default::default()
+        };
+        assert_eq!(exit_from_pb(via_bytes(&old).exit), None);
+        // Present but empty (a status kind this build does not know) is None too.
+        assert_eq!(exit_from_pb(pb::ExitStatus::default().into()), None);
     }
 
     #[test]
@@ -2322,7 +2862,47 @@ nested: { a: 1, b: [x, y] }
             pty: true,
             hash: vec![0xde, 0xad, 0, 1],
             transparent: true,
+            ..Default::default()
         }
+    }
+
+    /// E19/N9: the attribute crosses the seam both ways, every workdir, and a
+    /// def that declares none — every def from a plugin that predates the field
+    /// — puts nothing on the wire and decodes to `None`.
+    #[test]
+    fn entrypoint_round_trips_abi() {
+        use hplugin::driver::targetdef::{Entrypoint, Workdir};
+        for accepts_args in [false, true] {
+            for workdir in [Workdir::Caller, Workdir::Root, Workdir::Sandbox] {
+                let mut td = full_target_def();
+                td.entrypoint = Some(Entrypoint::new(accepts_args, workdir));
+                let back = target_def_from_pb(via_bytes(&target_def_to_pb(&td).expect("encode")))
+                    .expect("decode");
+                assert_eq!(back.entrypoint, td.entrypoint);
+            }
+        }
+
+        let wire = full_target_def_pb();
+        assert!(
+            wire.entrypoint.is_unset(),
+            "no entrypoint puts nothing on the wire"
+        );
+        let back = target_def_from_pb(via_bytes(&wire)).expect("decode");
+        assert_eq!(back.entrypoint, None, "absent decodes to None");
+
+        // A present message whose workdir an older peer cannot name is refused,
+        // not run somewhere else.
+        let mut wire = full_target_def_pb();
+        wire.entrypoint = pb::Entrypoint {
+            accepts_args: Some(false),
+            workdir: Some(buffa::EnumValue::Unknown(99)),
+            ..Default::default()
+        }
+        .into();
+        let err = target_def_from_pb(via_bytes(&wire))
+            .err()
+            .expect("unknown workdir is refused");
+        assert!(format!("{err:#}").contains("Entrypoint.workdir"), "{err:#}");
     }
 
     fn full_target_def_pb() -> pb::TargetDef {

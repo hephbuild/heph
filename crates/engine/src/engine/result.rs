@@ -38,7 +38,71 @@ use tokio::task::JoinSet;
 /// How long to block on the per-addr result lock before surfacing a "waiting on
 /// lock" notice (with the holder's pid) to the progress stream. The notice is
 /// purely informational; the wait itself continues until acquired or cancelled.
+#[cfg(not(test))]
 const RESULT_LOCK_NOTICE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Shortened under `cfg(test)`, as `SCRATCH_LOCK_NOTICE` is, so the announced
+/// path is testable without a five-second sleep per row.
+#[cfg(test)]
+const RESULT_LOCK_NOTICE: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The first and the longest pause of a contended miss's retry
+/// ([`contend_for_write`]), before jitter.
+const CONTEND_BACKOFF_MIN: std::time::Duration = std::time::Duration::from_millis(5);
+const CONTEND_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// How a contended miss ([`contend_for_write`]) ended.
+enum Contended<W, H> {
+    /// This caller holds the write lock: it builds.
+    Won(W),
+    /// Someone else built it meanwhile: share their hit.
+    Hit(H),
+}
+
+/// A miss whose write lock was taken: wait for the target's gateway (free
+/// once any build of it ends) — never for the readers a blocking `write`
+/// queues behind — then re-probe under a read and share a hit; still a miss,
+/// take the write lock if it is free now (the winner failed, or the holder was
+/// a passing prober), else back off, with jitter, and go round again.
+///
+/// Every wait is cancellable: the gateway and the read through their own
+/// token, the backoff here. Generic over the three steps so each arm can be
+/// driven in a test.
+async fn contend_for_write<W, G, H, GF, PF>(
+    mut try_write: impl FnMut() -> anyhow::Result<Option<W>>,
+    mut gateway: impl FnMut() -> GF,
+    mut probe: impl FnMut() -> PF,
+    ctoken: &(dyn hcore::hasync::Cancellable + Send + Sync),
+) -> anyhow::Result<Contended<W, H>>
+where
+    GF: Future<Output = anyhow::Result<G>>,
+    PF: Future<Output = anyhow::Result<Option<H>>>,
+{
+    let mut backoff = CONTEND_BACKOFF_MIN;
+    loop {
+        drop(gateway().await?);
+        if let Some(hit) = probe().await? {
+            return Ok(Contended::Hit(hit));
+        }
+        if let Some(write) = try_write()? {
+            return Ok(Contended::Won(write));
+        }
+        tokio::select! {
+            () = ctoken.cancelled() => {
+                return Err(anyhow::Error::new(hplugin::error::CancelledError));
+            }
+            () = tokio::time::sleep(jittered(backoff)) => {}
+        }
+        backoff = (backoff * 2).min(CONTEND_BACKOFF_MAX);
+    }
+}
+
+/// `d` scaled by a random factor in [0.5, 1.5), so waiters that lost the same
+/// race do not retry in lockstep.
+fn jittered(d: std::time::Duration) -> std::time::Duration {
+    let per_mille = (uuid::Uuid::new_v4().as_u128() % 1000) as u32;
+    d * (500 + per_mille) / 1000
+}
 
 /// The boxed future produced by `#[async_recursion]` for `result_addr_impl`.
 type BoxedResultFuture<'a> =
@@ -2073,6 +2137,9 @@ impl Engine {
         let mut cancelled = rs.ctoken().cancelled();
         // Whether the loop ended because the walk did, rather than by breaking.
         let mut walk_finished = false;
+        // How many matched addrs were admitted: the selection's size once the
+        // walk finished, which an entrypoint's refusal names (R18).
+        let mut admitted = 0usize;
         loop {
             let Some(next) = matched_rx.recv().await else {
                 walk_finished = true;
@@ -2135,12 +2202,18 @@ impl Engine {
             if fatal.is_some() {
                 break;
             }
+            admitted += 1;
             hcore::hmemoizer::join_set_spawn(
                 &mut set,
                 enclose!((self => engine, rs, opts, addr, outputs) async move {
                     // Released when this task ends, however it ends.
                     let _permit = permit;
-                    let r = engine.result_addr(rs, &addr, outputs, &opts).await;
+                    // An entrypoint is invoked on its own, never as one of a
+                    // selection — refused before any of it builds (I8).
+                    let r = match engine.refuse_entrypoint_in_selection(&rs, &addr).await {
+                        Ok(()) => engine.result_addr(rs, &addr, outputs, &opts).await,
+                        Err(e) => Err(e),
+                    };
                     (addr, r)
                 }),
             );
@@ -2201,6 +2274,14 @@ impl Engine {
 
         while let Some(joined) = set.join_next().await {
             Self::classify_joined(joined, fail_fast, &rs, &mut ok, &mut errors, &mut fatal);
+        }
+
+        // Only a finished walk knows the selection's size.
+        if walk_finished {
+            for (_, e) in &mut errors {
+                let taken = std::mem::replace(e, anyhow::anyhow!("taken"));
+                *e = crate::engine::invoke::EntrypointNotBuildable::name_selection(taken, admitted);
+            }
         }
 
         if let Some(e) = fatal {
@@ -3050,14 +3131,78 @@ impl Engine {
             return Err(HashUnknownError { addr: addr.clone() }.into());
         }
         drop(read);
-        let write = self
-            .acquire_with_notice(
-                &rs,
-                addr,
-                Some(hashin),
-                self.result_lock().write(addr, hashin, ctoken),
-            )
-            .await?;
+        // The write lock, without queueing behind readers of a revision that
+        // has become a hit since the probe. A blocking `write` waits for every
+        // reader to drain, and a reader may be a long-running consumer riding
+        // the entry a concurrent builder just produced — an entrypoint's tool
+        // holds its closure's reads for its whole run — so a miss that lost
+        // the race to build would wait for that consumer to exit rather than
+        // share the result (N10). Instead: try; when taken, wait for the
+        // target's gateway (free once any build of it is done), re-probe
+        // under a read, and share a hit; a miss still contended was a passing
+        // prober's read (or the winner failed), so try again, backing off.
+        //
+        // The whole contended wait is one notice, whichever arm it is in —
+        // the gateway, the read, or the backoff — so a target held by another
+        // process or request is announced once after `RESULT_LOCK_NOTICE`,
+        // with the holder where it is known, and cleared when the wait ends.
+        let write = match self
+            .result_lock()
+            .try_write(addr, hashin)
+            .with_context(|| format!("acquiring result lock for {addr}"))?
+        {
+            Some(write) => write,
+            None => {
+                let (engine, rs_ref) = (&*self, &rs);
+                let contended = contend_for_write(
+                    || engine.result_lock().try_write(addr, hashin),
+                    || engine.result_lock().lock_target(addr, ctoken),
+                    // A probe failure ends the wait as a "hit" carrying the
+                    // error, so it surfaces with its own context rather than
+                    // under the lock-acquire one the notice wrapper adds.
+                    || async move {
+                        let read = engine.result_lock().read(addr, hashin, ctoken).await?;
+                        Ok(
+                            match engine
+                                .probe_cache_manifest(rs_ref, def, opts)
+                                .await
+                                .with_context(|| format!("probing the local cache for {addr}"))
+                            {
+                                Ok(Some(manifest)) => Some(Ok((manifest, read))),
+                                Ok(None) => None,
+                                Err(e) => Some(Err(e)),
+                            },
+                        )
+                    },
+                    ctoken,
+                );
+                match self
+                    .acquire_with_notice(&rs, addr, Some(hashin), contended)
+                    .await?
+                {
+                    Contended::Won(write) => write,
+                    Contended::Hit(Err(e)) => return Err(e),
+                    Contended::Hit(Ok((manifest, read))) => {
+                        // Branch A, reached late.
+                        let (slot, read) = GuardSlot::new(
+                            addr,
+                            hashin,
+                            Resolved::Hit(Arc::clone(&manifest)),
+                            read,
+                        );
+                        return Ok((
+                            Arc::new(LockedResolution {
+                                guard: Some(slot),
+                                executed: None,
+                                manifest: Some(manifest),
+                                remote: RemoteCell::new(),
+                            }),
+                            Some(read),
+                        ));
+                    }
+                }
+            }
+        };
 
         // Re-check (manifest level) under the write lock: covers the drop window
         // above and any writer that produced the artifacts while we waited. The
@@ -4249,6 +4394,12 @@ impl Engine {
             None
         };
 
+        // The entrypoint attribute is the parse's (R13): carried across
+        // `apply_transitive` — a driver, or a plugin across the ABI, that does
+        // not echo it back must not turn an entrypoint into a buildable,
+        // cacheable target — and a transitive form that names a different one
+        // is refused rather than believed.
+        let parsed_entrypoint = def.entrypoint;
         let mut def = match &all_transitive {
             Some(sb) if !sb.empty() => {
                 let res = driver
@@ -4264,7 +4415,17 @@ impl Engine {
                     .await
                     .with_context(|| "apply transitive")?;
 
-                res.target_def
+                let mut transitive = res.target_def;
+                match (parsed_entrypoint, transitive.entrypoint) {
+                    (parsed, Some(after)) if parsed != Some(after) => anyhow::bail!(
+                        "{addr}: driver `{}` changed the target's entrypoint attribute when \
+                         applying transitive deps ({parsed:?} at parse, {after:?} after); an \
+                         entrypoint is decided by `parse` alone",
+                        spec.driver
+                    ),
+                    _ => transitive.entrypoint = parsed_entrypoint,
+                }
+                transitive
             }
             _ => def,
         };
@@ -4287,6 +4448,15 @@ impl Engine {
             })
         {
             def.cache.history = def.cache.history.saturating_mul(2);
+        }
+
+        // An entrypoint is never cached, whatever its driver's parse said and
+        // whatever default reached it. Forced here, from the def's attribute,
+        // because every cache decision downstream reads `def.cache` before
+        // anything executes — a zero-output remote "hit" must never make
+        // `go test` a no-op (I6, D43).
+        if def.entrypoint.is_some() {
+            def.cache = crate::engine::driver::targetdef::CacheConfig::off();
         }
 
         if def.hash.is_empty() {
@@ -8838,6 +9008,7 @@ mod tests {
         let e = anyhow::Error::new(ProcessFailed {
             status: "exit status: 1".to_string(),
             log: Arc::new(hcore::hartifactcontent::FileContent::new(&log_path)),
+            exit: None,
         })
         .context("driver run")
         .context("execute //pkg:a");
@@ -8875,6 +9046,7 @@ mod tests {
         let e = anyhow::Error::new(ProcessFailed {
             status: "exit status: 1".to_string(),
             log: Arc::new(hcore::hartifactcontent::FileContent::new(&log_path)),
+            exit: None,
         })
         .context("execute //pkg:a");
 
@@ -9519,9 +9691,6 @@ mod tests {
             Ok(ParseResponse {
                 target_def: TargetDef {
                     addr: req.target_spec.addr.clone(),
-                    labels: vec![],
-                    raw_def: SArc::new(()),
-                    inputs: vec![],
                     outputs: self
                         .outputs
                         .iter()
@@ -9530,11 +9699,9 @@ mod tests {
                             paths: vec![],
                         })
                         .collect(),
-                    support_files: vec![],
                     cache: CacheConfig::on(false),
-                    pty: false,
                     hash: vec![1, 2, 3, 4],
-                    transparent: false,
+                    ..Default::default()
                 },
             })
         }
@@ -11736,7 +11903,6 @@ mod tests {
                     } else {
                         vec![]
                     },
-                    raw_def: SArc::new(()),
                     inputs,
                     outputs: if transparent {
                         vec![]
@@ -11746,15 +11912,14 @@ mod tests {
                             paths: vec![],
                         }]
                     },
-                    support_files: vec![],
                     cache: if transparent {
                         CacheConfig::off()
                     } else {
                         CacheConfig::on(false)
                     },
-                    pty: false,
                     hash: req.target_spec.addr.format().into_bytes(),
                     transparent,
+                    ..Default::default()
                 },
             })
         }
@@ -11777,6 +11942,7 @@ mod tests {
                 return Err(anyhow::Error::new(crate::engine::error::ProcessFailed {
                     status: "exit status: 1".to_string(),
                     log: SArc::new(hcore::hartifactcontent::FileContent::new(&self.log_path)),
+                    exit: None,
                 })
                 .context("driver run"));
             }
@@ -12541,9 +12707,6 @@ mod tests {
             let def = LinkedTargetDef {
                 target: Arc::new(TargetDef {
                     addr: hmodel::htaddr::parse_addr("//pkg:gen")?,
-                    labels: Vec::new(),
-                    raw_def: Arc::new(()),
-                    inputs: Vec::new(),
                     outputs: vec![crate::engine::driver::targetdef::Output {
                         group: "out".to_string(),
                         paths: vec![path::Path {
@@ -12552,11 +12715,8 @@ mod tests {
                             collect: false,
                         }],
                     }],
-                    support_files: Vec::new(),
                     cache: crate::engine::driver::targetdef::CacheConfig::on(false),
-                    pty: false,
-                    hash: Vec::new(),
-                    transparent: false,
+                    ..Default::default()
                 }),
                 inputs: Vec::new(),
             };
@@ -13320,5 +13480,248 @@ mod tests {
             assert!(states.is_err(), "states_under answered with a partial set");
             Ok(())
         }
+    }
+}
+
+/// The contended-miss loop (D1, N10): each arm, and that the whole wait is
+/// announced once whichever arm it spends its time in.
+#[cfg(test)]
+mod contend_tests {
+    use super::*;
+    use crate::engine::event::BuildEventKind;
+    use hcore::hasync::StdCancellationToken;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    #[derive(Default)]
+    struct Rec {
+        seen: parking_lot::Mutex<Vec<BuildEventKind>>,
+    }
+
+    impl crate::engine::hook::Hook for Rec {
+        fn name(&self) -> String {
+            "rec".into()
+        }
+        fn on_event(&self, ev: &hcore::events::BuildEvent) {
+            self.seen.lock().push(ev.kind.clone());
+        }
+        fn on_close(&self) {}
+    }
+
+    fn recording_engine(root: &std::path::Path) -> (Arc<Engine>, Arc<Rec>) {
+        let mut e = Engine::new(crate::engine::Config {
+            parallelism: None,
+            ..crate::engine::Config::for_tests(root)
+        })
+        .expect("engine");
+        let rec = Arc::new(Rec::default());
+        e.register_hook(Arc::clone(&rec) as Arc<dyn crate::engine::hook::Hook>)
+            .expect("register hook");
+        (Arc::new(e), rec)
+    }
+
+    /// The winner failed: its build ends (the gateway frees), the re-probe
+    /// still misses, and this caller takes the write lock and builds.
+    #[tokio::test]
+    async fn contended_miss_wins_when_the_winner_failed() {
+        let (tries, probes) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let ct = StdCancellationToken::new();
+        let out = contend_for_write(
+            || {
+                tries.fetch_add(1, Ordering::SeqCst);
+                Ok(Some("write"))
+            },
+            || async { anyhow::Ok(()) },
+            || async {
+                probes.fetch_add(1, Ordering::SeqCst);
+                anyhow::Ok(None::<()>)
+            },
+            &ct,
+        )
+        .await
+        .expect("contend");
+        assert!(matches!(out, Contended::Won("write")));
+        assert_eq!(probes.load(Ordering::SeqCst), 1, "re-probed once");
+        assert_eq!(tries.load(Ordering::SeqCst), 1, "then took the lock");
+    }
+
+    /// Someone built it meanwhile: the late hit is shared, and the write lock
+    /// is never tried.
+    #[tokio::test]
+    async fn contended_miss_shares_a_late_hit() {
+        let tries = AtomicUsize::new(0);
+        let ct = StdCancellationToken::new();
+        let out = contend_for_write(
+            || {
+                tries.fetch_add(1, Ordering::SeqCst);
+                Ok(Some(()))
+            },
+            || async { anyhow::Ok(()) },
+            || async { anyhow::Ok(Some("hit")) },
+            &ct,
+        )
+        .await
+        .expect("contend");
+        assert!(matches!(out, Contended::Hit("hit")));
+        assert_eq!(tries.load(Ordering::SeqCst), 0);
+    }
+
+    /// The backoff arm: the write lock stays taken (a passing prober's read)
+    /// for a few rounds, the caller backs off between them — growing, and
+    /// jittered — and wins once it frees.
+    #[tokio::test]
+    async fn contended_miss_backs_off_until_free() {
+        let (tries, gateways) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let ct = StdCancellationToken::new();
+        let started = std::time::Instant::now();
+        let out = contend_for_write(
+            || Ok((tries.fetch_add(1, Ordering::SeqCst) >= 3).then_some("write")),
+            || async {
+                gateways.fetch_add(1, Ordering::SeqCst);
+                anyhow::Ok(())
+            },
+            || async { anyhow::Ok(None::<()>) },
+            &ct,
+        )
+        .await
+        .expect("contend");
+        assert!(matches!(out, Contended::Won("write")));
+        assert_eq!(tries.load(Ordering::SeqCst), 4);
+        assert_eq!(gateways.load(Ordering::SeqCst), 4, "the gateway each round");
+        // Three backoffs of at least half of 5, 10 and 20ms.
+        assert!(started.elapsed() >= Duration::from_micros(17_500));
+    }
+
+    /// A cancel during the backoff sleep ends the wait at once, as a
+    /// cancellation.
+    #[tokio::test]
+    async fn contended_miss_cancelled_in_backoff() {
+        let ct = StdCancellationToken::new();
+        let canceller = {
+            let ct = ct.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                ct.cancel();
+            })
+        };
+        let out = tokio::time::timeout(
+            Duration::from_secs(10),
+            contend_for_write(
+                || Ok(None::<()>),
+                || async { anyhow::Ok(()) },
+                || async { anyhow::Ok(None::<()>) },
+                &ct,
+            ),
+        )
+        .await
+        .expect("a cancel must end the backoff");
+        let Err(err) = out else {
+            panic!("a cancelled wait must fail");
+        };
+        assert!(
+            err.downcast_ref::<hplugin::error::CancelledError>()
+                .is_some(),
+            "{err:#}"
+        );
+        canceller.await.expect("canceller");
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Arm {
+        Gateway,
+        Probe,
+        Backoff,
+    }
+
+    /// Diagnosability (D1): a contended wait that outlasts the notice
+    /// threshold is announced — one `ResultLockWaitStart` for the addr, then
+    /// one `ResultLockWaitEnd` once it ends — whether it waits on the
+    /// gateway, on the read and re-probe, or loops in the backoff. A wait
+    /// under the threshold says nothing.
+    #[tokio::test]
+    async fn contended_wait_is_announced_in_every_arm() {
+        let _rt = crate::engine::test_rt_enter();
+        let slow = RESULT_LOCK_NOTICE * 4;
+        for arm in [Arm::Gateway, Arm::Probe, Arm::Backoff] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let (engine, rec) = recording_engine(tmp.path());
+            let rs = engine.new_state_with_events(true, None);
+            let addr = hmodel::htaddr::parse_addr("//app:dep").expect("addr");
+            let ct = StdCancellationToken::new();
+            let started = std::time::Instant::now();
+            let wait = contend_for_write(
+                || {
+                    // Backoff: taken until the wait has outlasted the notice.
+                    let free = !matches!(arm, Arm::Backoff) || started.elapsed() >= slow;
+                    Ok(free.then_some("write"))
+                },
+                || async move {
+                    if matches!(arm, Arm::Gateway) {
+                        tokio::time::sleep(slow).await;
+                    }
+                    anyhow::Ok(())
+                },
+                || async move {
+                    if matches!(arm, Arm::Probe) {
+                        tokio::time::sleep(slow).await;
+                    }
+                    anyhow::Ok(None::<()>)
+                },
+                &ct,
+            );
+            let out = engine
+                .acquire_with_notice(&rs, &addr, Some("h"), wait)
+                .await
+                .expect("contend");
+            assert!(matches!(out, Contended::Won("write")), "{arm:?}");
+            drop(rs);
+
+            let seen = rec.seen.lock().clone();
+            let starts = seen
+                .iter()
+                .filter(|k| {
+                    matches!(k, BuildEventKind::ResultLockWaitStart { addr, .. } if addr == "//app:dep")
+                })
+                .count();
+            let ends: Vec<usize> = seen
+                .iter()
+                .enumerate()
+                .filter(|(_, k)| {
+                    matches!(k, BuildEventKind::ResultLockWaitEnd { addr } if addr == "//app:dep")
+                })
+                .map(|(i, _)| i)
+                .collect();
+            let start_at = seen
+                .iter()
+                .position(|k| matches!(k, BuildEventKind::ResultLockWaitStart { .. }));
+            assert_eq!(starts, 1, "{arm:?}: announced once\n{seen:?}");
+            assert_eq!(ends.len(), 1, "{arm:?}: cleared once\n{seen:?}");
+            assert!(start_at < ends.first().copied(), "{arm:?}: start, then end");
+        }
+
+        // Under the threshold: silent.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (engine, rec) = recording_engine(tmp.path());
+        let rs = engine.new_state_with_events(true, None);
+        let addr = hmodel::htaddr::parse_addr("//app:dep").expect("addr");
+        let ct = StdCancellationToken::new();
+        let wait = contend_for_write(
+            || Ok(Some(())),
+            || async { anyhow::Ok(()) },
+            || async { anyhow::Ok(None::<()>) },
+            &ct,
+        );
+        engine
+            .acquire_with_notice(&rs, &addr, Some("h"), wait)
+            .await
+            .expect("contend");
+        drop(rs);
+        assert!(
+            !rec.seen
+                .lock()
+                .iter()
+                .any(|k| matches!(k, BuildEventKind::ResultLockWaitStart { .. })),
+            "a short wait is not announced"
+        );
     }
 }

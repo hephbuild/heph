@@ -147,6 +147,10 @@ pub async fn invoke_inner<'a, 'io>(
     // participates and no plugin ships its own copy of the rule.
     complete_deferred(&mut req, &inputs)
         .with_context(|| format!("deferred `${{src://…}}` for {}", req.target.addr.format()))?;
+    // Everything heph does before the program exists is done: a run in the
+    // caller's terminal is handed over from here (the binary stops reading
+    // Ctrl-C as "cancel"). Host-side, so it covers a cdylib driver too.
+    req.options.fire_handover();
     let mreq = ManagedRunRequest {
         sandbox_dir,
         sandbox_ws_dir: ws_dir,
@@ -238,21 +242,7 @@ async fn run_shell_fallback<'a, 'io>(
         sandbox_pkg_dir,
         inputs,
     } = mreq;
-    let RunRequest {
-        request_id,
-        target,
-        tree_root_path,
-        inputs: run_inputs,
-        hashin,
-        stdin,
-        stdout,
-        stderr,
-        sandbox_dir: req_sandbox_dir,
-        scratch,
-        credentials,
-        deferred,
-    } = request;
-
+    let target = request.target;
     let mut synthetic = (*shell_fallback.spec_template).clone();
     synthetic.addr = target.addr.clone();
 
@@ -260,7 +250,7 @@ async fn run_shell_fallback<'a, 'io>(
         .driver
         .parse(
             ParseRequest {
-                request_id: request_id.clone(),
+                request_id: request.request_id.clone(),
                 target_spec: Arc::new(synthetic),
             },
             ctoken,
@@ -275,20 +265,9 @@ async fn run_shell_fallback<'a, 'io>(
     let mut new_target = target.clone();
     new_target.raw_def = parse_resp.target_def.raw_def;
 
-    let new_req = RunRequest {
-        request_id,
-        target: &new_target,
-        tree_root_path,
-        inputs: run_inputs,
-        hashin,
-        stdin,
-        stdout,
-        stderr,
-        sandbox_dir: req_sandbox_dir,
-        scratch,
-        credentials,
-        deferred,
-    };
+    // Everything but the def moves across, stdio and run options included:
+    // `with_target` names every field, so a new one cannot be dropped here.
+    let new_req = request.with_target(&new_target);
     let new_mreq = ManagedRunRequest {
         request: new_req,
         sandbox_dir,

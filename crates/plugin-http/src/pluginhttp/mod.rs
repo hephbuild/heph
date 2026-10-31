@@ -152,7 +152,6 @@ impl ManagedDriver for Driver {
                 raw_def: Arc::new(def),
                 // No inputs: the bytes come from the network, not from other
                 // targets or the host filesystem.
-                inputs: vec![],
                 outputs: vec![Output {
                     group: String::new(),
                     paths: vec![Path {
@@ -161,11 +160,9 @@ impl ManagedDriver for Driver {
                         collect: true,
                     }],
                 }],
-                support_files: vec![],
                 cache: spec.cache.into(),
-                pty: false,
                 hash,
-                transparent: false,
+                ..Default::default()
             },
         })
     }

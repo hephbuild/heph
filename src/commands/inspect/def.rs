@@ -26,8 +26,21 @@ pub struct Args {
 
 #[derive(Serialize)]
 struct DefView<'a> {
+    /// How `heph run` treats the target, when it is not built like the rest:
+    /// `exec, entrypoint (uncached)` (R20). Omitted for an ordinary target, so
+    /// its output is unchanged. A string for humans: a program keys on
+    /// `target_def.entrypoint` (`accepts_args`, `workdir`) instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runs_as: Option<String>,
     target_def: &'a TargetDef,
     applied_transitive: Option<&'a Sandbox>,
+}
+
+/// `<driver>, entrypoint (uncached)` for an entrypoint; `None` otherwise.
+fn runs_as(driver: &str, def: &TargetDef) -> Option<String> {
+    def.entrypoint
+        .as_ref()
+        .map(|_| format!("{driver}, entrypoint (uncached)"))
 }
 
 struct DefApp {
@@ -67,6 +80,7 @@ impl App for DefApp {
         };
         crate::commands::errors::finalize!(ctx, rs, res, def => {
             let view = DefView {
+                runs_as: runs_as(&def.driver, &def.target_def),
                 target_def: &def.target_def,
                 applied_transitive: def.applied_transitive.as_ref(),
             };
@@ -94,4 +108,39 @@ async fn execute_async(args: Args, sink: LogSink, global: GlobalOptions) -> anyh
     };
     let interactive = tui::should_use_tui(global.no_tui);
     tui::run_app(app, sink, interactive, shutdown).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::driver::targetdef::{Entrypoint, Workdir};
+
+    /// An entrypoint says how it runs; an ordinary target's view is unchanged
+    /// (the field is omitted, not null).
+    #[test]
+    fn def_view_says_an_entrypoint_runs_uncached() -> anyhow::Result<()> {
+        let mut def = TargetDef::default();
+        let plain = serde_json::to_value(DefView {
+            runs_as: runs_as("exec", &def),
+            target_def: &def,
+            applied_transitive: None,
+        })?;
+        assert!(plain.get("runs_as").is_none(), "{plain}");
+
+        def.entrypoint = Some(Entrypoint::new(false, Workdir::Caller));
+        let ep = serde_json::to_value(DefView {
+            runs_as: runs_as("exec", &def),
+            target_def: &def,
+            applied_transitive: None,
+        })?;
+        assert_eq!(ep["runs_as"], "exec, entrypoint (uncached)");
+        // The machine-readable form agents key on: whether it takes args and
+        // where it runs.
+        assert_eq!(
+            ep["target_def"]["entrypoint"],
+            serde_json::json!({"accepts_args": false, "workdir": "caller"}),
+            "{ep}"
+        );
+        Ok(())
+    }
 }

@@ -91,6 +91,28 @@ pub(crate) struct TargetSpec {
     /// before. The runner is a hashed dependency, so changing it changes this
     /// target's cache key.
     pub runner: String,
+    /// Make this target an entrypoint: `heph run` invokes it in the caller's
+    /// world — their cwd (or the workspace root), their environment, their
+    /// terminal — instead of building it. Never cached and never an input.
+    /// `deps`, `hash_deps`, `runtime_deps`, `read_only_deps`, `tools`, `env`,
+    /// `credentials` and `run` keep their meaning: the closure is laid out as
+    /// for a build, in a sandbox of the invocation's own removed when it
+    /// exits, and `$SRC_<group>`, `$TOOL_<group>` and `$WORKSPACE_ROOT` name
+    /// paths inside it (`$HEPH_ROOT` is the real workspace root). What only a
+    /// build uses is refused: `out`, `cache`, `codegen`, `support_files`, the
+    /// `*_env` fields, `runner`, and `scratch` outside `workdir = "sandbox"`. An `exec`
+    /// argv cannot name `$SRC_<group>` (there is no shell): use
+    /// `${src://pkg:name}`, or `driver = "bash"`.
+    pub entrypoint: bool,
+    /// With `entrypoint = True`: append the caller's arguments
+    /// (`heph run //x -- a b`) to the command (`"$@"` for `bash`). Without it,
+    /// trailing arguments are refused before anything builds.
+    pub args: bool,
+    /// With `entrypoint = True`: where the program runs, `"caller"` (the
+    /// caller's cwd, the default), `"root"` (the workspace root) or
+    /// `"sandbox"` (the invocation's own sandbox package dir, as a build runs;
+    /// nothing written there survives the run).
+    pub workdir: super::entrypoint_mode::Workdir,
 }
 
 #[cfg(test)]
@@ -132,6 +154,9 @@ mod tests {
             "runtime_env",
             "runner",
             "credentials",
+            "entrypoint",
+            "args",
+            "workdir",
         ] {
             assert!(by_name.contains_key(key), "schema missing field `{key}`");
         }

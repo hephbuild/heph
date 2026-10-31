@@ -198,6 +198,10 @@ pub struct Engine {
     /// memory and never touch the SQLite WAL; entries over the per-entry cap
     /// spill to `local_cache`. See [`LocalCacheTmp`].
     pub(crate) local_cache_tmp: Arc<dyn LocalCache>,
+    /// The durable tier's sqlite store, also inside `local_cache`, kept by its
+    /// concrete type so [`Engine::invoke`] can drain its write-behind queue
+    /// before an entrypoint's tool starts (D43).
+    pub(crate) sqlite_writes: Arc<LocalCacheSQLite>,
     /// The brake on the durable sqlite tier's writer thread, for
     /// [`hold_local_cache_writes`](Self::hold_local_cache_writes).
     #[cfg(any(test, feature = "test-support"))]
@@ -217,6 +221,13 @@ pub struct Engine {
     pub(crate) hooks: Vec<Arc<dyn SDKHook>>,
 
     pub requests: Mutex<HashMap<String, Weak<RequestState>>>,
+    /// Every live request's cancellation token, by request id, for
+    /// [`cancel_all_requests`](Engine::cancel_all_requests). Not read through
+    /// `requests`: that holds the *root* `RequestState`, which the command
+    /// drops when it returns, while its data — and the work riding on it, a
+    /// remote upload holding a child state — lives on to the exit-time drain.
+    /// Removed when the data drops.
+    pub(crate) request_ctokens: Mutex<HashMap<String, hcore::hasync::StdCancellationToken>>,
     /// Every exec runner this host knows, by name: `local`, `wrap`, `session`.
     ///
     /// Builtins only. A plugin that wants agent mode does not implement a
@@ -585,6 +596,11 @@ pub struct Provider {
 pub struct Driver {
     pub name: String,
     pub driver: Box<dyn SDKDriver>,
+    /// Registered as a managed driver: wrapped in the sandbox layer, which
+    /// materializes the inputs inside `run` and fires a terminal run's
+    /// handover itself, right before the inner driver spawns
+    /// (`RunOptions::fire_handover`). For a plain driver the engine fires it.
+    pub managed: bool,
 }
 
 /// Create the home if needed and make it ignore itself: a `<home>/.gitignore`
@@ -634,7 +650,8 @@ impl Engine {
         )?;
         #[cfg(any(test, feature = "test-support"))]
         let sqlite_writer_gate = sqlite.writer_gate();
-        let sqlite: Arc<dyn LocalCache> = Arc::new(sqlite);
+        let sqlite_writes = Arc::new(sqlite);
+        let sqlite: Arc<dyn LocalCache> = sqlite_writes.clone();
         // Durable tier: manifests + small/medium blobs in sqlite, large blobs
         // spilled to plain files. The mem tier (below) fronts both.
         let blobs = Arc::new(crate::engine::local_cache_fs::LocalCacheFS::new(
@@ -717,6 +734,7 @@ impl Engine {
             runtime: runtime.clone(),
             local_cache,
             local_cache_tmp,
+            sqlite_writes,
             #[cfg(any(test, feature = "test-support"))]
             sqlite_writer_gate,
             walker,
@@ -726,6 +744,7 @@ impl Engine {
             drivers_by_name: HashMap::new(),
             hooks: vec![],
             requests: Mutex::new(HashMap::new()),
+            request_ctokens: Mutex::new(HashMap::new()),
             exec_runners: Arc::new({
                 let mut registry = hexecrunner::registry::RunnerRegistry::with_builtins();
                 registry
@@ -809,14 +828,16 @@ impl Engine {
 
     /// Cancel every in-flight request's cancellation token. Used to broadcast
     /// graceful shutdown (e.g. on SIGINT). Idempotent.
+    ///
+    /// Reaches every request whose data is alive, including one whose root
+    /// state the command already dropped while background work (a remote
+    /// upload) still rides a child of it — what the exit-time drain waits on.
     pub fn cancel_all_requests(&self) {
-        let Ok(requests) = self.requests.lock() else {
+        let Ok(tokens) = self.request_ctokens.lock() else {
             return;
         };
-        for weak in requests.values() {
-            if let Some(rs) = weak.upgrade() {
-                rs.ctoken().cancel();
-            }
+        for ctoken in tokens.values() {
+            ctoken.cancel();
         }
     }
 
@@ -1005,9 +1026,9 @@ impl Engine {
 
         let mut resolved: Vec<Arc<Driver>> = Vec::with_capacity(drivers.len());
         for driver in drivers {
-            let driver: Box<dyn SDKDriver> = match driver {
-                PluginDriver::Plain(d) => d,
-                PluginDriver::Managed(m) => Box::new(self.new_managed_driver(m)),
+            let (driver, managed): (Box<dyn SDKDriver>, bool) = match driver {
+                PluginDriver::Plain(d) => (d, false),
+                PluginDriver::Managed(m) => (Box::new(self.new_managed_driver(m)), true),
             };
             let local = driver
                 .config(driver::ConfigRequest {})
@@ -1020,7 +1041,11 @@ impl Engine {
                      plugin its own local name (at most one may omit it)"
                 );
             }
-            resolved.push(Arc::new(Driver { name: full, driver }));
+            resolved.push(Arc::new(Driver {
+                name: full,
+                driver,
+                managed,
+            }));
         }
 
         // Plugin names are unique and a component name always starts with its

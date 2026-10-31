@@ -329,7 +329,6 @@ impl ManagedDriver for Driver {
                 addr: addr.clone(),
                 labels: req.target_spec.labels.clone(),
                 raw_def: Arc::new(PlatformDef { builder }),
-                inputs: vec![],
                 outputs: vec![Output {
                     group: String::new(),
                     paths: vec![OutPath {
@@ -338,12 +337,10 @@ impl ManagedDriver for Driver {
                         collect: true,
                     }],
                 }],
-                support_files: vec![],
                 // Local yes, remote never — see the module header.
                 cache: CacheConfig::on(false),
-                pty: false,
                 hash,
-                transparent: false,
+                ..Default::default()
             },
         })
     }

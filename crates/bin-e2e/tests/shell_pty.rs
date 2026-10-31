@@ -670,6 +670,102 @@ fn echo_marker_prints_the_marker_without_typing_it() {
     );
 }
 
+/// The invocation sandboxes of `//pkg:tool` under the workspace's home: the
+/// one a running `--shell` session's `init.sh` lives in.
+fn entrypoint_shell_dirs(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    std::fs::read_dir(root.join(".heph/sandbox/pkg/__invoke/tool"))
+        .map(|rd| rd.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default()
+}
+
+/// `heph run --shell` on an entrypoint (D13): an interactive bash in
+/// the program's world, whose `run` is the program's argv plus the caller's
+/// args — `a b` and the empty string intact — or a helper's own args when it
+/// is given any. Ctrl-C at the prompt is the shell's, not heph's; the shell's
+/// exit status is heph's; the terminal is left as it was found and the init
+/// file is gone.
+#[test]
+fn entrypoint_shell_pty() {
+    let dist = Dist::locate();
+    let ws = common::Workspace::new().expect("workspace");
+    ws.write(
+        "pkg/BUILD",
+        "target(name = \"tool\", driver = \"exec\", entrypoint = True, args = True,\n\
+         run = [\"/bin/sh\", \"-c\", \"printf '<%s>' \\\"$@\\\"; echo\", \"tool\"])\n",
+    )
+    .expect("write BUILD");
+
+    let mut session = ShellSession::spawn(
+        &dist,
+        ws.root(),
+        &["run", "--shell", "//pkg:tool", "--", "a b", ""],
+    );
+    session.ready();
+    assert_eq!(
+        entrypoint_shell_dirs(ws.root()).len(),
+        1,
+        "the init file lives in the invocation's sandbox while the shell runs"
+    );
+
+    // `run` with no args: the program's argv plus the caller's.
+    session.send_str("run\n");
+    session.wait_for("<a b><>", Duration::from_secs(10));
+    session.wait_for(PROMPT, Duration::from_secs(10));
+
+    // `run x`: its own args, not the originals. The line ends right after it.
+    session.send_str("run override\n");
+    session.wait_for("<override>\r\n", Duration::from_secs(10));
+    session.wait_for(PROMPT, Duration::from_secs(10));
+
+    // `show`: what `run` would execute, args shell-quoted — "what will it
+    // run" (R20). The typed `'q r'` is not the printed `q\ r`.
+    session.send_str("show 'q r'\n");
+    session.wait_for(r"q\ r", Duration::from_secs(10));
+    session.wait_for(PROMPT, Duration::from_secs(10));
+
+    // Ctrl-C at the prompt reaches the shell, not heph.
+    session.send(b"\x03");
+    session.wait_for(PROMPT, Duration::from_secs(10));
+    let (alive_cmd, alive_marker) = echo_marker("still-", "here");
+    session.send_str(&format!("{alive_cmd}\n"));
+    session.wait_for(&alive_marker, Duration::from_secs(10));
+    session.wait_for(PROMPT, Duration::from_secs(10));
+
+    session.send_str("exit 3\n");
+    let started = Instant::now();
+    let code = loop {
+        match session.child.try_wait().expect("wait on pty child") {
+            Some(status) => break status.exit_code(),
+            None => {
+                assert!(
+                    started.elapsed() < DEADLINE,
+                    "heph did not exit after `exit 3`\n{}",
+                    session.output_lossy()
+                );
+                std::thread::sleep(POLL);
+            }
+        }
+    };
+    assert_eq!(
+        code,
+        3,
+        "the shell's status is heph's\n{}",
+        session.output_lossy()
+    );
+
+    let mut screen = vt100::Parser::new(40, 140, 0);
+    screen.process(&session.output_snapshot());
+    assert!(
+        !screen.screen().alternate_screen(),
+        "left the alternate screen on"
+    );
+    assert!(!screen.screen().hide_cursor(), "left the cursor hidden");
+    assert!(
+        entrypoint_shell_dirs(ws.root()).is_empty(),
+        "the invocation's sandbox (and its init file) outlived the shell"
+    );
+}
+
 /// [`SET_PROMPT`]'s contract, in both directions — the same two halves as
 /// `echo_marker_prints_the_marker_without_typing_it`, for the line `ready`
 /// syncs on.
