@@ -4,7 +4,7 @@
 //! heph's stdin, stdout and stderr (no pipe, no tee, no new session), runs in
 //! the cwd and with the env it is handed, and its exit status is reported as a
 //! structured [`Exit`]. A driver reaches it through [`spawn_foreground`] when a
-//! run asks for `RunStdio::Inherit`; exec's `Inherit` arm is the first caller,
+//! run asks for `RunStdio::Inherit` or `RunStdio::Pty`; exec's arm is the first caller,
 //! and the plugin SDK re-exports this module so a third-party driver gets the
 //! same terminal and signal behaviour.
 //!
@@ -23,11 +23,22 @@
 //!
 //! Every subprocess goes through this crate; this is where that holds for the
 //! ones heph runs in the foreground.
+//!
+//! # On a PTY the host owns
+//!
+//! A command given a slave ([`ForegroundCommand::with_slave`]) runs in a session
+//! of its own with that slave as its fds 0–2 and controlling terminal. The
+//! kernel's terminal signals come from the PTY then, so none of the shared-group
+//! limits above apply: every relayed signal goes to the tool's group with
+//! `killpg`, exactly once, and [`ForegroundChild::wait_pty`] reports the tool's
+//! stops, since nobody else can wake a tool that stopped itself in an orphaned
+//! group.
 
 use crate::{PathPolicy, RunnerRef, SpawnedAs};
 use hcore::hasync::Cancellable;
 use hproc::proc_exec;
 use std::ffi::OsString;
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 
 pub use hcore::process::{Disposition, Exit, Signal};
@@ -37,11 +48,18 @@ pub use hcore::process::{Disposition, Exit, Signal};
 /// never a cancel.
 pub type SignalReceiver = tokio::sync::mpsc::UnboundedReceiver<Signal>;
 
+/// Tells the host the tool stopped: the driver contract's `StopSender`.
+pub type StopSender = tokio::sync::mpsc::UnboundedSender<()>;
+/// The host's "continue the tool's group": the driver contract's
+/// `ContinueReceiver`.
+pub type ContinueReceiver = tokio::sync::mpsc::UnboundedReceiver<()>;
+
 /// A program to run in the caller's terminal.
 ///
 /// `#[non_exhaustive]`: built with [`ForegroundCommand::new`] and the `with_*`
 /// setters, so a later field is not a source break for a third-party driver.
-#[derive(Debug, Clone)]
+/// Not `Clone`: it can own a PTY slave, which moves exactly once.
+#[derive(Debug)]
 #[non_exhaustive]
 pub struct ForegroundCommand {
     /// `argv[0]`. Without a `/` it is looked up on the `PATH` in `env` (after
@@ -62,6 +80,9 @@ pub struct ForegroundCommand {
     /// The signals blocked in the child before it execs: the caller's mask.
     /// std clears the mask in every child, so empty means "none blocked".
     pub blocked: Vec<Signal>,
+    /// Run on this PTY slave rather than heph's fds. [`spawn_foreground`]
+    /// consumes it, closing heph's copy before it returns, however it returns.
+    pub slave: Option<OwnedFd>,
 }
 
 impl ForegroundCommand {
@@ -79,7 +100,14 @@ impl ForegroundCommand {
             dispositions: Vec::new(),
             nofile: None,
             blocked: Vec::new(),
+            slave: None,
         }
+    }
+
+    /// Run on `slave`, in a session of its own: see the module docs.
+    pub fn with_slave(mut self, slave: OwnedFd) -> Self {
+        self.slave = Some(slave);
+        self
     }
 
     /// Everything of the caller's the run carries — dispositions, open-file
@@ -156,6 +184,11 @@ fn nofile_to_restore(recorded: Option<u64>) -> Option<libc::rlimit> {
 /// seen after the runner's prepare spawns nothing. The pid is tracked with the process
 /// supervisor (by pid, not pgid: the child leads no group), so a SIGKILLed heph
 /// does not orphan it.
+///
+/// With a slave ([`ForegroundCommand::with_slave`]) the child's fds 0–2 are that
+/// slave instead, it `setsid`s and takes the slave as its controlling terminal,
+/// and it is tracked by the group it now leads. Everything else above holds. A
+/// failure of those two calls surfaces as the spawn's own error.
 pub async fn spawn_foreground(
     runner: RunnerRef<'_>,
     mut cmd: ForegroundCommand,
@@ -186,7 +219,8 @@ pub async fn spawn_foreground(
         program: spec.program.clone(),
         cwd: spec.cwd.clone(),
     };
-    let child = spawn_inherited(&spec.program, &spec.args, &spec.env, &spec.cwd, &cmd);
+    let slave = cmd.slave.take();
+    let child = spawn_inherited(&spec.program, &spec.args, &spec.env, &spec.cwd, &cmd, slave);
     Ok((child, spawned_as))
 }
 
@@ -196,6 +230,7 @@ fn spawn_inherited(
     env: &[(OsString, OsString)],
     cwd: &Path,
     restore: &ForegroundCommand,
+    slave: Option<OwnedFd>,
 ) -> std::io::Result<ForegroundChild> {
     use std::os::unix::process::CommandExt as _;
 
@@ -212,10 +247,23 @@ fn spawn_inherited(
     cmd.args(args)
         .env_clear()
         .envs(env.iter().map(|(k, v)| (k, v)))
-        .current_dir(cwd)
-        .stdin(std::process::Stdio::inherit())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit());
+        .current_dir(cwd);
+    // Moved out of `restore`, so this function is what closes heph's copy. `cmd`
+    // holds the three clones until it drops, on return: past that the tool's
+    // are the only ones, and the master sees EOF when it exits.
+    let on_pty = slave.is_some();
+    match slave {
+        Some(slave) => {
+            let stdin = slave.try_clone()?;
+            let stdout = slave.try_clone()?;
+            cmd.stdin(stdin).stdout(stdout).stderr(slave);
+        }
+        None => {
+            cmd.stdin(std::process::Stdio::inherit())
+                .stdout(std::process::Stdio::inherit())
+                .stderr(std::process::Stdio::inherit());
+        }
+    }
 
     // Everything the child needs is computed here, in the parent: the closure
     // below runs between fork and exec and must not allocate (R8).
@@ -235,6 +283,20 @@ fn spawn_inherited(
     let nofile = nofile_to_restore(restore.nofile);
     let mask = hcore::process::mask_of(&restore.blocked);
     let pre_exec = move || {
+        if on_pty {
+            // std has already dup'd the slave onto fds 0–2. A controlling
+            // terminal is only ever acquired by a session leader, so `setsid`
+            // comes first, and the slave's `O_NOCTTY` makes the ioctl explicit
+            // on both OSes.
+            // SAFETY: `setsid` and `ioctl` are async-signal-safe.
+            if unsafe { libc::setsid() } < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: as above; fd 0 is the slave.
+            if unsafe { libc::ioctl(0, libc::TIOCSCTTY as _, 0) } < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
         for &(sig, handler) in &handlers {
             // SAFETY: `signal(2)` is async-signal-safe, as the code between
             // fork and exec must be. A failure (an invalid number) leaves the
@@ -267,7 +329,11 @@ fn spawn_inherited(
     let track = i32::try_from(child.id())
         .ok()
         .and_then(hproc::process_supervisor::register_child);
-    Ok(ForegroundChild { child, track })
+    Ok(ForegroundChild {
+        child,
+        track,
+        on_pty,
+    })
 }
 
 /// A program running in the caller's terminal. Wait for it with
@@ -276,6 +342,14 @@ fn spawn_inherited(
 pub struct ForegroundChild {
     child: std::process::Child,
     track: Option<hproc::process_supervisor::TrackGuard>,
+    /// On a PTY, in a session and group of its own: its pid is that group's id.
+    on_pty: bool,
+}
+
+/// What the observer thread saw of the child.
+enum Observed {
+    Stopped,
+    Exited(std::io::Result<()>),
 }
 
 impl ForegroundChild {
@@ -300,18 +374,47 @@ impl ForegroundChild {
     /// has started (heph is transparent while it runs); this is the hard
     /// stop for a host going down.
     pub async fn wait(
+        self,
+        signals: SignalReceiver,
+        ctoken: &(dyn Cancellable + Send + Sync),
+    ) -> std::io::Result<Exit> {
+        self.wait_observing(signals, None, ctoken).await
+    }
+
+    /// [`wait`](Self::wait) for a child spawned on a PTY. Also reports each
+    /// stop of the tool on `stops`, and continues the tool's group for each
+    /// message on `continues`, right here so it can never hit a reaped group.
+    /// Its signals and SIGKILL go to the group.
+    pub async fn wait_pty(
+        self,
+        signals: SignalReceiver,
+        stops: StopSender,
+        continues: ContinueReceiver,
+        ctoken: &(dyn Cancellable + Send + Sync),
+    ) -> std::io::Result<Exit> {
+        self.wait_observing(signals, Some((stops, continues)), ctoken)
+            .await
+    }
+
+    async fn wait_observing(
         mut self,
         mut signals: SignalReceiver,
+        pty: Option<(StopSender, ContinueReceiver)>,
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> std::io::Result<Exit> {
         let pid = self.pid()?;
-        let (exited_tx, mut exited) = tokio::sync::oneshot::channel();
+        let (stops, mut continues) = match pty {
+            Some((stops, continues)) => (Some(stops), Some(continues)),
+            None => (None, None),
+        };
+        let report_stops = stops.is_some();
+        let (observed_tx, mut observed_rx) = tokio::sync::mpsc::unbounded_channel();
         // A plain thread rather than `spawn_blocking`: this also runs inside a
         // plugin cdylib, whose runtime has no blocking pool to rely on. One
         // thread per foreground run, which is one per `heph run`.
         std::thread::Builder::new()
             .name("heph-fg-wait".to_string())
-            .spawn(move || drop(exited_tx.send(observe_exit(pid))))?;
+            .spawn(move || observe(pid, report_stops, &observed_tx))?;
 
         let mut signals_open = true;
         let mut killed = false;
@@ -320,16 +423,37 @@ impl ForegroundChild {
             tokio::select! {
                 // Exit first: once it is observed, nothing more is sent.
                 biased;
-                observed = &mut exited => break observed,
+                observed = observed_rx.recv() => match observed {
+                    Some(Observed::Exited(res)) => break Some(res),
+                    Some(Observed::Stopped) => {
+                        if let Some(stops) = &stops {
+                            // A host that went away has nothing to answer with,
+                            // and the wait goes on regardless.
+                            let _reported = stops.send(());
+                        }
+                    }
+                    None => break None,
+                },
+                cont = async { continues.as_mut()?.recv().await }, if continues.is_some() => {
+                    match cont {
+                        Some(()) => self.continue_group(),
+                        None => continues = None,
+                    }
+                }
                 sig = signals.recv(), if signals_open => match sig {
                     Some(sig) => self.relay(sig),
                     None => signals_open = false,
                 },
                 () = &mut cancelled, if !killed => {
                     killed = true;
-                    // SAFETY: the child is not reaped (only this function
-                    // reaps it, below), so its pid is still its own.
-                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                    if self.on_pty {
+                        // SAFETY: not reaped, and it leads this group.
+                        unsafe { libc::killpg(pid, libc::SIGKILL) };
+                    } else {
+                        // SAFETY: the child is not reaped (only this function
+                        // reaps it, below), so its pid is still its own.
+                        unsafe { libc::kill(pid, libc::SIGKILL) };
+                    }
                 }
             }
         };
@@ -337,9 +461,9 @@ impl ForegroundChild {
         drop(signals);
         drop(self.track.take());
         match observed {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(e),
-            Err(_) => return Err(std::io::Error::other("exit observer thread vanished")),
+            Some(Ok(())) => {}
+            Some(Err(e)) => return Err(e),
+            None => return Err(std::io::Error::other("exit observer thread vanished")),
         }
         // A zombie by now, so this returns at once.
         let status = self.child.wait()?;
@@ -358,6 +482,26 @@ impl ForegroundChild {
     /// already did.
     fn relay(&self, sig: Signal) {
         let Ok(pid) = self.pid() else { return };
+        if self.on_pty {
+            // A resize is the kernel's to deliver, once the host copied the new
+            // size to the PTY: relaying it too would make two, one possibly
+            // before the size changed. Nothing else is skipped: the terminal
+            // cannot have delivered what it generates to another session.
+            if sig.as_raw() == libc::SIGWINCH {
+                return;
+            }
+            // SAFETY: the child is not reaped yet (see `wait`), and it leads
+            // this group, so the number cannot have been reused.
+            if unsafe { libc::killpg(pid, sig.as_raw()) } != 0 {
+                tracing::debug!(
+                    signo = sig.as_raw(),
+                    pid,
+                    error = %std::io::Error::last_os_error(),
+                    "relay: killpg failed"
+                );
+            }
+            return;
+        }
         if !should_relay(sig, &RelayContext::probe(pid)) {
             tracing::debug!(
                 signo = sig.as_raw(),
@@ -378,6 +522,14 @@ impl ForegroundChild {
             );
         }
     }
+
+    /// Wake the tool's group after the host resumed. ESRCH (a tool that died
+    /// while heph was stopped) is fine: its exit is what `wait` observes next.
+    fn continue_group(&self) {
+        let Ok(pid) = self.pid() else { return };
+        // SAFETY: as in `relay`: not reaped yet, and it leads the group.
+        unsafe { libc::killpg(pid, libc::SIGCONT) };
+    }
 }
 
 impl Drop for ForegroundChild {
@@ -388,6 +540,12 @@ impl Drop for ForegroundChild {
         // Then untrack, then reap, as in `wait`: once reaped the pid can be
         // reused, and the supervisor must never hold a pid that is not ours.
         if self.track.is_some() || matches!(self.child.try_wait(), Ok(None)) {
+            if self.on_pty
+                && let Ok(pid) = self.pid()
+            {
+                // SAFETY: as above; it leads this group.
+                unsafe { libc::killpg(pid, libc::SIGKILL) };
+            }
             drop(self.child.kill());
             drop(self.track.take());
             drop(self.child.wait());
@@ -395,23 +553,48 @@ impl Drop for ForegroundChild {
     }
 }
 
-/// Block until `pid` has exited, without reaping it.
-fn observe_exit(pid: libc::pid_t) -> std::io::Result<()> {
-    loop {
+/// Report what becomes of `pid` until it exits, without reaping it. Stops only
+/// when `report_stops`.
+///
+/// `WNOWAIT` leaves a stop to be reported again, which would spin, so a stop is
+/// consumed with a second `waitid(WSTOPPED | WNOHANG)`. That one cannot reap:
+/// `WEXITED` is not in its flags, so a tool that died in between stays a zombie
+/// for the next turn to see.
+fn observe(
+    pid: libc::pid_t,
+    report_stops: bool,
+    out: &tokio::sync::mpsc::UnboundedSender<Observed>,
+) {
+    #[expect(clippy::cast_sign_loss, reason = "pid is a live child's, so positive")]
+    let id = pid as libc::id_t;
+    let flags = if report_stops {
+        libc::WEXITED | libc::WSTOPPED | libc::WNOWAIT
+    } else {
+        libc::WEXITED | libc::WNOWAIT
+    };
+    let result = loop {
         // SAFETY: zeroed `siginfo_t` is a valid out-parameter.
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        #[expect(clippy::cast_sign_loss, reason = "pid is a live child's, so positive")]
-        let id = pid as libc::id_t;
         // SAFETY: a valid idtype/id pair and a live, writable `siginfo_t`.
-        let rc = unsafe { libc::waitid(libc::P_PID, id, &mut info, libc::WEXITED | libc::WNOWAIT) };
-        if rc == 0 {
-            return Ok(());
+        let rc = unsafe { libc::waitid(libc::P_PID, id, &mut info, flags) };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break Err(err);
         }
-        let err = std::io::Error::last_os_error();
-        if err.kind() != std::io::ErrorKind::Interrupted {
-            return Err(err);
+        if !report_stops || info.si_code != libc::CLD_STOPPED {
+            break Ok(());
         }
-    }
+        // SAFETY: as above.
+        unsafe { libc::waitid(libc::P_PID, id, &mut info, libc::WSTOPPED | libc::WNOHANG) };
+        if out.send(Observed::Stopped).is_err() {
+            return;
+        }
+    };
+    // Receiver dropped only if the wait's future was dropped.
+    drop(out.send(Observed::Exited(result)));
 }
 
 /// The signals a relay forwards to a foreground child (E17).

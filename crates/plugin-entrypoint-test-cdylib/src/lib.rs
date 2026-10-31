@@ -78,7 +78,7 @@ impl ManagedDriver for Tool {
         Ok(ParseResponse {
             target_def: TargetDef {
                 addr: req.target_spec.addr.clone(),
-                entrypoint: Some(Entrypoint::new(true, Workdir::Caller)),
+                entrypoint: Some(Entrypoint::new(true, Workdir::Caller).with_pty()),
                 hash: b"entrypoint-test-tool".to_vec(),
                 ..Default::default()
             },
@@ -101,8 +101,10 @@ impl ManagedDriver for Tool {
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ManagedRunResponse> {
         let options = req.request.options;
-        let RunStdio::Inherit(fg) = options.stdio else {
-            anyhow::bail!("an entrypoint run is in the caller's terminal");
+        let (fg, on_pty) = match options.stdio {
+            RunStdio::Inherit(fg) => (fg, None),
+            RunStdio::Pty(p) => (p.foreground, Some((p.slave, p.stops, p.continues))),
+            _ => anyhow::bail!("an entrypoint run is in the caller's terminal"),
         };
         let mut args: Vec<OsString> = vec!["-c".into(), SCRIPT.into(), "sh".into()];
         args.extend(options.args.unwrap_or_default());
@@ -113,14 +115,19 @@ impl ManagedDriver for Tool {
             options.cwd.unwrap_or(req.sandbox_pkg_dir),
         )
         .with_foreground(&fg);
+        let (cmd, channels) = match on_pty {
+            Some((slave, stops, continues)) => (cmd.with_slave(slave), Some((stops, continues))),
+            None => (cmd, None),
+        };
         let (child, _) = spawn_foreground(RunnerRef::local(), cmd, &PathPolicy::default(), ctoken)
             .await
             .context("spawn the tool")?;
-        let exit = child
-            .context("spawn the tool")?
-            .wait(fg.signals, ctoken)
-            .await
-            .context("wait for the tool")?;
+        let child = child.context("spawn the tool")?;
+        let exit = match channels {
+            Some((stops, continues)) => child.wait_pty(fg.signals, stops, continues, ctoken).await,
+            None => child.wait(fg.signals, ctoken).await,
+        }
+        .context("wait for the tool")?;
         if exit == Exit::Code(0) {
             return Ok(ManagedRunResponse { artifacts: vec![] });
         }
