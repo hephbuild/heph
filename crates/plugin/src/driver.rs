@@ -576,6 +576,9 @@ pub mod targetdef {
     ///
     /// `#[non_exhaustive]`: built with [`Entrypoint::new`] outside this crate,
     /// so a later field is not a source break for every declaring driver.
+    // `Hash` covers `offers_pty`, which is no part of what a driver may hash: it
+    // says what the driver's code can do, not what the target is. A def hash takes
+    // the fields it means, by name, and never this whole struct.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
     #[non_exhaustive]
     pub struct Entrypoint {
