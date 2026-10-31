@@ -588,7 +588,22 @@ fn observe(
             break Ok(());
         }
         // SAFETY: as above.
-        unsafe { libc::waitid(libc::P_PID, id, &mut info, libc::WSTOPPED | libc::WNOHANG) };
+        let mut consumed: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                id,
+                &mut consumed,
+                libc::WSTOPPED | libc::WNOHANG,
+            )
+        };
+        // A pid of 0 is nothing to consume: the tool was continued in between,
+        // so the stop that was reported is over and answering it would stop heph.
+        // SAFETY: the field is valid for what `waitid` writes, and zero otherwise.
+        if rc != 0 || unsafe { consumed.si_pid() } == 0 {
+            continue;
+        }
         if out.send(Observed::Stopped).is_err() {
             return;
         }
