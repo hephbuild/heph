@@ -2411,14 +2411,19 @@ mod tests {
         (back, channels.signals)
     }
 
-    /// An open descriptor at a number no parallel test will reuse while this
-    /// one looks at it: `fcntl(F_GETFD)` is how these tests observe a close.
+    /// An open descriptor at a number used once in this test binary:
+    /// `fcntl(F_GETFD)` is how these tests observe a close, and a fixed floor
+    /// hands one test the number another just closed. Then a test wraps a
+    /// descriptor it does not own, and Rust aborts the whole binary on the
+    /// double close (seen on `linux/amd64` CI).
     fn high_fd() -> std::os::fd::RawFd {
+        static NEXT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(700);
+        let want = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (r, w) = std::os::unix::net::UnixStream::pair().expect("pair");
         drop(w);
         // SAFETY: duplicating a live fd above the range anything else uses.
-        let fd = unsafe { libc::fcntl(r.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 700) };
-        assert!(fd >= 700, "dup: {}", std::io::Error::last_os_error());
+        let fd = unsafe { libc::fcntl(r.as_raw_fd(), libc::F_DUPFD_CLOEXEC, want) };
+        assert_eq!(fd, want, "dup: {}", std::io::Error::last_os_error());
         fd
     }
 
