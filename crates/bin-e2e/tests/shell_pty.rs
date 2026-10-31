@@ -295,10 +295,19 @@ impl ShellSession {
     /// this the moment our own keystrokes come back. Build such markers with
     /// [`echo_marker`], which keeps the literal out of the command line.
     fn wait_for(&mut self, needle: &str, timeout: Duration) {
+        assert!(
+            self.try_wait_for(needle, timeout),
+            "never saw {needle:?} within {timeout:?}\n--- captured ---\n{}",
+            self.output_lossy(),
+        );
+    }
+
+    /// [`Self::wait_for`], reporting a timeout instead of panicking.
+    fn try_wait_for(&mut self, needle: &str, timeout: Duration) -> bool {
         let started = Instant::now();
         let needle = needle.as_bytes();
         if needle.is_empty() {
-            return;
+            return true;
         }
         // Where the next poll starts searching. Distinct from `cursor`, which
         // only moves on a match: this advances every poll to the end of what has
@@ -322,18 +331,38 @@ impl ShellSession {
                 match scan_once(&buf, needle, scan_from) {
                     Scan::Found { end } => {
                         self.cursor = end;
-                        return;
+                        return true;
                     }
                     Scan::Resume { from } => scan_from = from,
                 }
             }
+            if started.elapsed() >= timeout {
+                return false;
+            }
+            std::thread::sleep(POLL);
+        }
+    }
+
+    /// Ctrl-C [`FOLLOWING_TOOL`] until its shell shows a fresh prompt.
+    ///
+    /// One Ctrl-C is not enough to rely on: a bash in a `sleep` loop with an `INT`
+    /// trap sometimes runs on, the loop alive and `^C` the last thing on the
+    /// terminal. That is bash, not heph: it
+    /// reproduces on a bare PTY with no heph involved (bash 3.2 and 5.3, 2-3% of
+    /// attempts with the Ctrl-C's timing spread over one nap), and a second
+    /// Ctrl-C ends the loop. A heph that drops every Ctrl-C still fails this.
+    fn interrupt_to_prompt(&mut self) {
+        let started = Instant::now();
+        loop {
+            self.send(b"\x03");
+            if self.try_wait_for(PROMPT, Duration::from_secs(2)) {
+                return;
+            }
             assert!(
-                started.elapsed() < timeout,
-                "never saw {:?} within {timeout:?}\n--- captured ---\n{}",
-                String::from_utf8_lossy(needle),
+                started.elapsed() < DEADLINE,
+                "no {PROMPT:?} after repeated Ctrl-C within {DEADLINE:?}\n--- captured ---\n{}",
                 self.output_lossy(),
             );
-            std::thread::sleep(POLL);
         }
     }
 
@@ -781,6 +810,10 @@ fn entrypoint_shell_pty() {
 /// What the `run` helper executes in the two tests below: it reports the wrap
 /// runner's env, echoes a typed line, then reports each window size from its
 /// WINCH trap until a Ctrl-C ends it.
+///
+/// This loop can lose a Ctrl-C, which is why [`ShellSession::interrupt_to_prompt`]
+/// exists. Don't "fix" it with `sleep & wait`: that hangs too, with the macOS
+/// `/bin/bash` 3.2 spinning on the CPU.
 const FOLLOWING_TOOL: &str = r#"driver = "bash", cache = False, run = """
 echo "runner-mark-[${XR_MARK:-none}]"
 echo "read-""ready"
@@ -805,8 +838,7 @@ fn tool_follows_the_terminal(session: &mut ShellSession, mark: &str) {
     session.wait_for("size-ready", DEADLINE);
     session.resize(30, 100);
     session.wait_for("resized-to-30 100-end", DEADLINE);
-    session.send(b"\x03");
-    session.wait_for(PROMPT, DEADLINE);
+    session.interrupt_to_prompt();
     session.send_str("exit\n");
     let (exited, _, success) = session.wait_exit(DEADLINE);
     assert!(
