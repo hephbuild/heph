@@ -154,6 +154,7 @@ impl PtySession {
         let pump = Pump {
             input: Input {
                 stdin: options.stdin,
+                terminal: options.terminal,
                 writer,
                 buf: Box::new([0; BUF_SIZE]),
                 pos: 0,
@@ -272,7 +273,11 @@ impl Pump {
                 Some(()) = self.dying.term.recv() => self.dying.seen = true,
                 Some(()) = self.dying.hup.recv() => self.dying.seen = true,
                 Some(()) = self.winch.recv(), if self.terminal.is_some() => self.sync_size(),
-                () = self.input.step() => {}
+                in_background = self.input.step() => {
+                    if in_background {
+                        self.answer_stop().await;
+                    }
+                }
                 () = self.output.step() => {
                     // Nobody has the slave open, so nobody can read this. It also
                     // narrows the window for eating a keystroke meant for the shell.
@@ -395,6 +400,8 @@ fn leads_own_group() -> bool {
 struct Input {
     /// `None` once stdin has ended, failed or must no longer be read.
     stdin: Option<Box<dyn AsyncRead + Send + Unpin>>,
+    /// The terminal heph owns, whose read fails while heph is in its background.
+    terminal: Option<RawFd>,
     writer: AsyncPty,
     buf: Box<[u8; BUF_SIZE]>,
     pos: usize,
@@ -402,7 +409,10 @@ struct Input {
 }
 
 impl Input {
-    async fn step(&mut self) {
+    /// `true` when a read of the terminal failed because heph is in its
+    /// background (`kill -STOP <heph>`, `bg`). That is no end of stdin: the
+    /// keyboard comes back with `fg`, so the caller goes through the stop path.
+    async fn step(&mut self) -> bool {
         let Some(stdin) = self.stdin.as_mut() else {
             return std::future::pending().await;
         };
@@ -412,6 +422,9 @@ impl Input {
                 written.map(|n| self.pos += n).map(|()| true)
             } else {
                 let read = stdin.read(self.buf.as_mut_slice()).await;
+                if read.is_err() && self.terminal.is_some_and(|fd| !is_foreground(fd)) {
+                    return true;
+                }
                 read.map(|n| {
                     self.pos = 0;
                     self.len = n;
@@ -424,6 +437,7 @@ impl Input {
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Ok(false) | Err(_) => self.stdin = None,
         }
+        false
     }
 }
 
