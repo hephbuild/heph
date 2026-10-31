@@ -2416,8 +2416,11 @@ mod tests {
     /// hands one test the number another just closed. Then a test wraps a
     /// descriptor it does not own, and Rust aborts the whole binary on the
     /// double close (seen on `linux/amd64` CI).
+    ///
+    /// The floor sits below 256, an interactive macOS shell's soft limit, and
+    /// above what these tests have open.
     fn high_fd() -> std::os::fd::RawFd {
-        static NEXT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(700);
+        static NEXT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(200);
         let want = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (r, w) = std::os::unix::net::UnixStream::pair().expect("pair");
         drop(w);

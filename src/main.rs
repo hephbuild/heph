@@ -427,6 +427,13 @@ fn parse_supervisor_args() -> Option<i32> {
 /// prints the build string, `gen-docs` emits the CLI reference from clap.
 const NO_CONFIG_COMMANDS: &[&str] = &["version", "gen-docs"];
 
+fn raw_requested(soft_match: &Result<clap::ArgMatches, clap::Error>) -> bool {
+    soft_match.as_ref().is_ok_and(|m| {
+        m.subcommand_matches("run")
+            .is_some_and(|run| run.get_flag("raw"))
+    })
+}
+
 /// Whether a `NoConfig` (not-in-a-workspace) self-upgrade result may be tolerated
 /// for this invocation, decided from a soft pre-parse of the CLI args.
 ///
@@ -435,13 +442,6 @@ const NO_CONFIG_COMMANDS: &[&str] = &["version", "gen-docs"];
 /// (the `Err` case — a workspace pin may add it) falls through to the real parse,
 /// which surfaces clap's canonical error. Any other recognized command
 /// legitimately needs a workspace, so its `NoConfig` stays fatal.
-fn raw_requested(soft_match: &Result<clap::ArgMatches, clap::Error>) -> bool {
-    soft_match.as_ref().is_ok_and(|m| {
-        m.subcommand_matches("run")
-            .is_some_and(|run| run.get_flag("raw"))
-    })
-}
-
 fn no_config_tolerable(soft_match: &Result<clap::ArgMatches, clap::Error>) -> bool {
     match soft_match {
         Ok(m) => m
@@ -513,6 +513,15 @@ mod tests {
         // A binary that merely *contains* an applet name is not one.
         assert_eq!(split(&["/usr/local/bin/cp-helper", "x"]), None);
         assert_eq!(split(&["/usr/local/bin/heph", "cp", "x"]), None);
+    }
+
+    #[test]
+    fn raw_after_the_separator_is_the_tools() {
+        // What follows `--` is the tool's argument: it must not quiet heph's log.
+        assert!(raw_requested(&soft(&["heph", "run", "//x", "--raw"])));
+        assert!(!raw_requested(&soft(&[
+            "heph", "run", "//x", "--", "--raw"
+        ])));
     }
 
     #[test]
