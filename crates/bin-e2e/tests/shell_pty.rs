@@ -167,7 +167,7 @@ struct ShellSession {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     captured: Arc<Mutex<Vec<u8>>>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
-    _master: Box<dyn portable_pty::MasterPty + Send>,
+    master: Box<dyn portable_pty::MasterPty + Send>,
     /// Byte offset into `captured` that the last successful `wait_for` has
     /// already accounted for. See `wait_for` for why this exists.
     cursor: usize,
@@ -240,7 +240,7 @@ impl ShellSession {
             writer,
             captured,
             child,
-            _master: pair.master,
+            master: pair.master,
             cursor: 0,
         }
     }
@@ -253,6 +253,18 @@ impl ShellSession {
 
     fn send_str(&mut self, s: &str) {
         self.send(s.as_bytes());
+    }
+
+    /// Resize the caller's window, as dragging a terminal's edge does.
+    fn resize(&self, rows: u16, cols: u16) {
+        self.master
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("resize the pty");
     }
 
     fn output_snapshot(&self) -> Vec<u8> {
@@ -764,6 +776,93 @@ fn entrypoint_shell_pty() {
         entrypoint_shell_dirs(ws.root()).is_empty(),
         "the invocation's sandbox (and its init file) outlived the shell"
     );
+}
+
+/// What the `run` helper executes in the two tests below: it reports the wrap
+/// runner's env, echoes a typed line, then reports each window size from its
+/// WINCH trap until a Ctrl-C ends it.
+const FOLLOWING_TOOL: &str = r#"driver = "bash", cache = False, run = """
+echo "runner-mark-[${XR_MARK:-none}]"
+echo "read-""ready"
+read -r line
+echo "typed-[$line]"
+trap 'echo "resized-to-$(/bin/stty size)-end"' WINCH
+trap 'exit 0' INT
+echo "size-""ready"
+while true; do sleep 0.05 || true; done
+""""#;
+
+/// A `--shell` session at its prompt runs [`FOLLOWING_TOOL`]: typed stdin and a
+/// live resize both reach it, the trap's marker being the barrier and the size
+/// it reads the new one. The shell then exits cleanly.
+fn tool_follows_the_terminal(session: &mut ShellSession, mark: &str) {
+    session.ready();
+    session.send_str("run\n");
+    session.wait_for(&format!("runner-mark-[{mark}]"), DEADLINE);
+    session.wait_for("read-ready", DEADLINE);
+    session.send_str("hello-tool\n");
+    session.wait_for("typed-[hello-tool]", DEADLINE);
+    session.wait_for("size-ready", DEADLINE);
+    session.resize(30, 100);
+    session.wait_for("resized-to-30 100-end", DEADLINE);
+    session.send(b"\x03");
+    session.wait_for(PROMPT, DEADLINE);
+    session.send_str("exit\n");
+    let (exited, _, success) = session.wait_exit(DEADLINE);
+    assert!(
+        exited && success,
+        "exited={exited} success={success}\n{}",
+        session.output_lossy()
+    );
+}
+
+/// `--shell` on a build target under a wrap runner, today's local-process kind:
+/// `/usr/bin/env` is all it needs, so a missing prerequisite fails rather than
+/// skips. The runner's env reaching the tool shows the wrap really happened; it
+/// names `PATH` because a runner supplies the environment its targets run in,
+/// and the shell comes from there rather than from heph's own `PATH`.
+#[test]
+fn local_runner_shell_keeps_working() {
+    let dist = Dist::locate();
+    let ws = common::Workspace::new().expect("workspace");
+    ws.write(
+        "pkg/BUILD",
+        &format!(
+            r#"
+target(
+    name = "runner",
+    driver = "bash",
+    run = """cat > $OUT <<'JSON'
+{{"version": 1, "fingerprint": "fp-1", "runner": "wrap",
+ "config": {{"prefix": ["/usr/bin/env"],
+             "env": {{"XR_MARK": "wrapped", "PATH": "/usr/local/bin:/usr/bin:/bin"}}}}}}
+JSON""",
+    out = "runner.json",
+)
+target(name = "tool", runner = "//pkg:runner", {FOLLOWING_TOOL})
+"#
+        ),
+    )
+    .expect("write BUILD");
+
+    let mut session = ShellSession::spawn(&dist, ws.root(), &["run", "--shell", "//pkg:tool"]);
+    tool_follows_the_terminal(&mut session, "wrapped");
+}
+
+/// The same with no runner at all: a resize while the shell runs reaches the
+/// tool through the driver's PTY.
+#[test]
+fn build_target_shell_forwards_resize() {
+    let dist = Dist::locate();
+    let ws = common::Workspace::new().expect("workspace");
+    ws.write(
+        "pkg/BUILD",
+        &format!("target(name = \"tool\", {FOLLOWING_TOOL})\n"),
+    )
+    .expect("write BUILD");
+
+    let mut session = ShellSession::spawn(&dist, ws.root(), &["run", "--shell", "//pkg:tool"]);
+    tool_follows_the_terminal(&mut session, "none");
 }
 
 /// [`SET_PROMPT`]'s contract, in both directions — the same two halves as

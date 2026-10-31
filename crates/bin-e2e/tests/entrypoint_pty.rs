@@ -1216,8 +1216,20 @@ fn every_line_arrived(pty: &Pty) {
     let start = text
         .find("line-000001")
         .expect("the first line went missing");
+    let tail = text.get(start..).unwrap_or_default();
+    // Once a PTY slave's queue fills, XNU emits `\r\r\n` every 4095 bytes. That
+    // was measured on a plain PTY with no heph involved, so on macOS `\r+\n` is
+    // one line ending. These tests prove nothing is lost, which still holds.
+    // Linux keeps the exact `\r\n`, so a real double translation fails there.
+    let lines: Vec<&str> = if cfg!(target_os = "macos") {
+        tail.split('\n')
+            .map(|line| line.trim_end_matches('\r'))
+            .collect()
+    } else {
+        tail.split("\r\n").collect()
+    };
     let mut next = 1;
-    for line in text.get(start..).unwrap_or_default().split("\r\n") {
+    for line in lines {
         let Some(number) = line.strip_prefix("line-") else {
             continue;
         };

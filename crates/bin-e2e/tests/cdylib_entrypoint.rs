@@ -126,3 +126,74 @@ fn cdylib_entrypoint_runs() -> anyhow::Result<()> {
     assert!(pty.cursor_visible(), "cursor left hidden\n{}", pty.screen());
     Ok(())
 }
+
+/// What the tool wrote to `$HEPH_TEST_OUT` and the device `tty` named to it, in
+/// one mode of `heph run //app:tool`, which must exit 42.
+fn tool_terminal(
+    dist: &Dist,
+    caller: &Path,
+    args: &[&str],
+) -> anyhow::Result<(String, std::path::PathBuf, std::path::PathBuf)> {
+    let out = caller.join("out");
+    let out_s = out.to_string_lossy().into_owned();
+    let mut pty = Pty::spawn(dist, caller, args, &[("HEPH_TEST_OUT", &out_s)]);
+    // Before the exit, which closes the terminal.
+    let callers = pty.tty_name();
+    assert_eq!(pty.wait_exit(DEADLINE), Ended::Code(42), "{}", pty.seen());
+    let device = read(&caller.join("out.tty"))?;
+    Ok((read(&out)?, device.trim_end().into(), callers))
+}
+
+/// The default run: the cdylib driver receives the PTY slave across the seam,
+/// so the tool has a terminal on all three fds and it is not the caller's.
+#[test]
+fn cdylib_entrypoint_default_run_gets_slave() -> anyhow::Result<()> {
+    let dist = Dist::locate();
+    let (_ws, caller) = workspace(&dist)?;
+    let (seen, device, callers) = tool_terminal(&dist, &caller, &["run", "//app:tool"])?;
+    assert!(seen.contains("tty=yes\n"), "{seen}");
+    assert_ne!(device, callers, "the tool is on the caller's terminal");
+    Ok(())
+}
+
+/// `--raw`: no slave. The tool inherits heph's fds, the caller's terminal itself.
+#[test]
+fn cdylib_raw_inherits_fds() -> anyhow::Result<()> {
+    let dist = Dist::locate();
+    let (_ws, caller) = workspace(&dist)?;
+    let (seen, device, callers) = tool_terminal(&dist, &caller, &["run", "//app:tool", "--raw"])?;
+    assert!(seen.contains("tty=yes\n"), "{seen}");
+    assert_eq!(device, callers, "the tool is not on the caller's terminal");
+    Ok(())
+}
+
+/// The stop and continue frames over the seam: a cdylib's tool that stops itself
+/// stops heph, which gives the shell its prompt back, and `fg` resumes both.
+#[test]
+fn cdylib_tool_stopped_resumes_on_fg() -> anyhow::Result<()> {
+    let dist = Dist::locate();
+    let (_ws, caller) = workspace(&dist)?;
+    let out = caller.join("out");
+    let out_s = out.to_string_lossy().into_owned();
+    let mut pty = Pty::shell(
+        &dist,
+        &caller,
+        &[("HEPH_TEST_OUT", &out_s), ("HEPH_TEST_MODE", "stop")],
+    );
+    pty.type_line(r#""$HEPH" run //app:tool"#);
+    pty.wait_prompt();
+    let (heph, tool) = (pty.number_after("heph-pid-"), pty.number_after("tool-pid-"));
+    common::wait_until("heph to be stopped", Duration::from_secs(30), || {
+        common::is_stopped(heph)
+    });
+    assert!(common::is_stopped(tool), "{}", pty.screen());
+
+    pty.type_line("fg");
+    pty.wait_for("resumed-after-fg", Duration::from_secs(30));
+    pty.wait_prompt();
+    assert_eq!(pty.last_status(), 4, "{}", pty.seen());
+    for pid in [heph, tool] {
+        assert!(!common::alive(pid), "{pid} outlived the run");
+    }
+    Ok(())
+}
