@@ -165,7 +165,13 @@ pub struct RunArgs {
     /// the program's. A program that traps INT and QUIT is
     /// stopped with `kill -9` on the run's pid; its supervisor then reaps
     /// the program. `--shell` opens a shell with the same command ready, always
-    /// on a PTY of heph's: `show` prints what `run` would execute.
+    /// on a PTY of heph's: `show` prints what `run` would execute. A `--shell`'s
+    /// output is neither logged nor redacted.
+    ///
+    /// To see which of the two a run took and why, set
+    /// `HEPH_LOG=entrypoint_mode=debug`, with `--raw` as well; see "Which mode am
+    /// I in?" in docs/ENTRYPOINTS.md. On a PTY of heph's, your terminal stays raw
+    /// if the run dies without a chance to restore it: after `kill -9`, run `reset`.
     #[arg(last = true, value_name = "ARGS")]
     pub args: Vec<OsString>,
 }
