@@ -54,6 +54,7 @@ impl EntrypointMode {
                 Workdir::Sandbox => EngineWorkdir::Sandbox,
             },
         )
+        .with_pty()
     }
 }
 

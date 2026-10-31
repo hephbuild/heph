@@ -344,7 +344,7 @@ impl RunApp {
                 };
                 let _quiet = hengine::engine::diag::global().suppress_stall();
                 if !shell {
-                    return inner(None, None, None).await;
+                    return inner(None, None, None, None).await;
                 }
                 // As for a build's `--shell`: `TtyReader`, not tokio's stdin,
                 // whose blocking read could not be cancelled at exit.
@@ -357,6 +357,7 @@ impl RunApp {
                         .map(|s| s as &mut (dyn tokio::io::AsyncRead + Send + Sync + Unpin)),
                     Some(&mut stdout),
                     Some(&mut stderr),
+                    None,
                 )
                 .await
             })
@@ -467,6 +468,7 @@ impl App for RunApp {
                             .map(|s| s as &mut (dyn tokio::io::AsyncRead + Send + Sync + Unpin)),
                         Some(&mut stdout),
                         Some(&mut stderr),
+                        None,
                     )
                     .await
                 })

@@ -29,6 +29,12 @@ pub use hplugin::{driver, eresult, function, hook, provider};
 /// let (child, _) = spawn_foreground(RunnerRef::local(), cmd, &PathPolicy::default(), ctoken).await?;
 /// let exit = child?.wait(fg.signals, ctoken).await?;
 /// ```
+///
+/// A driver that declares [`Entrypoint::with_pty`](driver::targetdef::Entrypoint::with_pty)
+/// also gets `RunStdio::Pty` on a default run: the same spawn with
+/// [`with_slave`](foreground::ForegroundCommand::with_slave), and
+/// [`wait_pty`](foreground::ForegroundChild::wait_pty) in place of `wait`. Without
+/// that bit the run stays `Inherit`.
 pub mod foreground {
     pub use hexecrunner::foreground::{
         ForegroundChild, ForegroundCommand, RelayContext, should_relay, spawn_foreground,
