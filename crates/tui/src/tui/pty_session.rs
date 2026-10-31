@@ -804,10 +804,10 @@ mod tests {
         }
     }
 
-    fn flushed_sink() -> (
-        Box<dyn AsyncWrite + Send + Unpin>,
-        std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
-    ) {
+    type BoxedSink = Box<dyn AsyncWrite + Send + Unpin>;
+    type Shown = std::sync::Arc<std::sync::Mutex<Vec<u8>>>;
+
+    fn flushed_sink() -> (BoxedSink, Shown) {
         let (sink, shown, _) = counting_sink(Duration::ZERO);
         (sink, shown)
     }
@@ -815,8 +815,8 @@ mod tests {
     fn counting_sink(
         write_delay: Duration,
     ) -> (
-        Box<dyn AsyncWrite + Send + Unpin>,
-        std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        BoxedSink,
+        Shown,
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
     ) {
         let shown = std::sync::Arc::default();
