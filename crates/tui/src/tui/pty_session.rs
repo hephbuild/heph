@@ -48,6 +48,9 @@ const SIGNAL_SETTLE: Duration = Duration::from_millis(10);
 /// proves the drain is bounded needs a limit it can tell from a clean exit, and
 /// bin-e2e reaches the binary through nothing else. Not a user setting.
 const DRAIN_LIMIT_ENV: &str = "HEPH_PTY_DRAIN_MS";
+/// **Test-only.** Fails the opening of the PTY, because nothing else can: a test
+/// has no way of running a host out of PTYs, and that failure must stay loud.
+const OPEN_FAILS_ENV: &str = "HEPH_PTY_OPEN_FAILS";
 
 /// What the run takes from a [`PtySession`]. The slave moves to the tool, and
 /// keeping no copy of it here is what lets the master reach EOF.
@@ -85,6 +88,10 @@ impl PtySession {
     ///
     /// Registers process-lifetime SIGTSTP, SIGWINCH, SIGTERM and SIGHUP handlers.
     pub fn start() -> anyhow::Result<(Self, PtyEnds)> {
+        anyhow::ensure!(
+            std::env::var_os(OPEN_FAILS_ENV).is_none(),
+            "opening a PTY for the tool: failed by {OPEN_FAILS_ENV}"
+        );
         let stdin_is_terminal = io::stdin().is_terminal();
         let foreground = stdin_is_terminal && is_foreground(libc::STDIN_FILENO);
         let stdin = if stdin_is_terminal && !foreground {

@@ -304,6 +304,21 @@ pub fn alive(pid: i32) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
+/// `ps`'s state letters for `pid` (`T` is stopped, `Z` a zombie), or nothing once
+/// it has gone. One spelling on Linux and macOS, which share no `/proc`.
+pub fn proc_state(pid: i32) -> String {
+    let out = Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .expect("ps is a prerequisite of this suite");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Whether `pid` is stopped.
+pub fn is_stopped(pid: i32) -> bool {
+    proc_state(pid).starts_with('T')
+}
+
 /// Poll `cond` until it holds, or panic naming `what`.
 pub fn wait_until(what: &str, timeout: std::time::Duration, mut cond: impl FnMut() -> bool) {
     let started = std::time::Instant::now();
