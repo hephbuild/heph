@@ -87,6 +87,9 @@ two signal limits, under [Signals while the tool runs](#inherited-mode).
 Without `--raw`, pipes and files stay byte-exact, because a redirected run
 inherits them. In the PTY mode, the tool's stdout and stderr share the PTY.
 
+On macOS a PTY may emit `\r\r\n` about every 4 KiB of long output. It renders the
+same; use `--raw` when you need the exact bytes.
+
 ### Which mode am I in?
 
 ```sh
@@ -94,8 +97,9 @@ HEPH_LOG=entrypoint_mode=debug heph run //x
 ```
 
 heph prints one line to stderr before the tool starts, with the `mode` and the
-`reason`. By default it prints nothing, so `2>&1 | jq` stays clean. These are
-checked in this order, and the first that holds wins:
+`reason`. By default it prints nothing, so `2>&1 | jq` stays clean. `--raw` lowers
+the log default to `warn`, so seeing the mode there still takes `HEPH_LOG`. These
+are checked in this order, and the first that holds wins:
 
 | `mode` | `reason` | When |
 |---|---|---|
@@ -138,6 +142,10 @@ the terminal raw again, copies the window size and continues the tool.
   shell's.
 - While it is stopped, a signal sent to heph stays pending until `fg`. Only
   `kill -9` acts.
+- **A tool that stops itself keeps running when no shell could resume heph.** heph
+  then does not stop, and continues the tool. That is the case when heph leads its
+  session or has no shell above it there (`ssh -t`, `tmux`), and when a wrapper
+  shares its process group (`sh -c 'heph run //x; echo after'`, `make`).
 
 ### After `kill -9`, run `reset`
 
@@ -145,7 +153,13 @@ Nothing in heph runs after SIGKILL, so in the PTY mode your terminal stays raw
 until you run `reset`. heph's supervisor still kills the tool. In the inherited
 mode the terminal is untouched.
 
+A fatal signal to heph itself, such as SIGSEGV or SIGBUS, is the same: nothing
+restores the terminal, and `reset` is the answer there as well.
+
 ### Output after the tool exits
+
+A background job's output after the tool exits is cut with a warning on Linux, and
+lost with no warning on macOS; use `--raw` if it matters.
 
 In the PTY mode, once the tool has exited, heph copies what is left on the PTY to
 the screen, for at most 500ms. A background job the tool left behind can hold the
