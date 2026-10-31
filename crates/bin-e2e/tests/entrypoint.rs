@@ -88,7 +88,11 @@ fn args_on_an_unresolved_target_report_the_real_error() -> anyhow::Result<()> {
     assert_eq!(out.status.code(), bare.status.code(), "{}", describe(&out));
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(!err.contains("is not one"), "{}", describe(&out));
-    assert!(err.contains("`out`"), "the def's own error: {}", describe(&out));
+    assert!(
+        err.contains("`out`"),
+        "the def's own error: {}",
+        describe(&out)
+    );
 
     let out = ws.run(&dist, &["run", "//plain:built", "--", "a"])?;
     assert!(!out.status.success(), "{}", describe(&out));
