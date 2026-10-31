@@ -771,6 +771,9 @@ mod tests {
     struct FlushedSink {
         unflushed: Vec<u8>,
         shown: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        flushes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        /// How long a write holds the pump, as a terminal that is drawing does.
+        write_delay: Duration,
     }
 
     impl AsyncWrite for FlushedSink {
@@ -779,6 +782,7 @@ mod tests {
             _: &mut std::task::Context<'_>,
             buf: &[u8],
         ) -> std::task::Poll<io::Result<usize>> {
+            std::thread::sleep(self.write_delay);
             self.unflushed.extend_from_slice(buf);
             std::task::Poll::Ready(Ok(buf.len()))
         }
@@ -786,6 +790,8 @@ mod tests {
             mut self: std::pin::Pin<&mut Self>,
             _: &mut std::task::Context<'_>,
         ) -> std::task::Poll<io::Result<()>> {
+            self.flushes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let unflushed = std::mem::take(&mut self.unflushed);
             self.shown.lock().expect("lock").extend(unflushed);
             std::task::Poll::Ready(Ok(()))
@@ -802,12 +808,70 @@ mod tests {
         Box<dyn AsyncWrite + Send + Unpin>,
         std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
     ) {
+        let (sink, shown, _) = counting_sink(Duration::ZERO);
+        (sink, shown)
+    }
+
+    fn counting_sink(
+        write_delay: Duration,
+    ) -> (
+        Box<dyn AsyncWrite + Send + Unpin>,
+        std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
         let shown = std::sync::Arc::default();
+        let flushes = std::sync::Arc::default();
         let sink = FlushedSink {
             unflushed: Vec::new(),
             shown: std::sync::Arc::clone(&shown),
+            flushes: std::sync::Arc::clone(&flushes),
+            write_delay,
         };
-        (Box::new(sink), shown)
+        (Box::new(sink), shown, flushes)
+    }
+
+    /// A flush is a trip to the blocking pool, so a tool that keeps writing must not
+    /// pay for one per chunk. The sink's delay gives the tool the time to keep the
+    /// master's queue from running dry, which is what a flush waits on.
+    #[tokio::test]
+    async fn a_burst_flushes_far_less_than_once_per_chunk() {
+        const CHUNKS: usize = 256;
+        const CHUNK: usize = 4096;
+
+        let (sink, shown, flushes) = counting_sink(Duration::from_millis(1));
+        let (session, ends) = PtySession::start_with(Options {
+            sink,
+            stdin: None,
+            terminal: None,
+            limit: LONG_LIMIT,
+        })
+        .expect("start the session");
+        let mut slave = std::fs::File::from(ends.slave);
+        let writer = std::thread::spawn(move || {
+            for _ in 0..CHUNKS {
+                slave.write_all(&[b'x'; CHUNK]).expect("write");
+            }
+            // Open until read, since macOS discards what is unread on a close.
+            slave
+        });
+        timeout(Duration::from_secs(120), async {
+            while shown.lock().expect("lock").len() < CHUNKS * CHUNK {
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the burst reaches fd 1");
+
+        let flushes = flushes.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            flushes < CHUNKS / 4,
+            "{flushes} flushes for a burst of {CHUNKS} chunks"
+        );
+        let slave = tokio::task::spawn_blocking(move || writer.join().expect("the writer ends"))
+            .await
+            .expect("join the writer");
+        drop(slave);
+        session.finish().await;
     }
 
     /// A prompt has no newline and nothing follows it. With the master idle, the

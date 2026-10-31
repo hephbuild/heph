@@ -144,8 +144,10 @@ the terminal raw again, copies the window size and continues the tool.
   `kill -9` acts.
 - **A tool that stops itself keeps running when no shell could resume heph.** heph
   then does not stop, and continues the tool. That is the case when heph leads its
-  session or has no shell above it there (`ssh -t`, `tmux`), and when a wrapper
-  shares its process group (`sh -c 'heph run //x; echo after'`, `make`).
+  session or has no shell above it there (`ssh -t host heph run …`,
+  `tmux new heph …`), when a wrapper shares its process group
+  (`sh -c 'heph run //x; echo after'`, `make`), and when the terminal closed or
+  the parent exited.
 
 ### After `kill -9`, run `reset`
 

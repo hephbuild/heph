@@ -347,10 +347,11 @@ impl ShellSession {
     ///
     /// One Ctrl-C is not enough to rely on: a bash in a `sleep` loop with an `INT`
     /// trap sometimes runs on, the loop alive and `^C` the last thing on the
-    /// terminal. That is bash, not heph: it
-    /// reproduces on a bare PTY with no heph involved (bash 3.2 and 5.3, 2-3% of
-    /// attempts with the Ctrl-C's timing spread over one nap), and a second
-    /// Ctrl-C ends the loop. A heph that drops every Ctrl-C still fails this.
+    /// terminal. That is bash, not heph. Measured with the Ctrl-C's timing jittered
+    /// over one nap, on a bare PTY with no heph involved, bash lost 19 of 800; with
+    /// this resend, 1000 of 1000 runs pass. A heph that drops every Ctrl-C still
+    /// fails this, and `default_run_ctrl_c_reaches_the_tool` in `entrypoint_pty.rs`
+    /// keeps the single-shot check.
     fn interrupt_to_prompt(&mut self) {
         let started = Instant::now();
         loop {
