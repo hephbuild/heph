@@ -7620,6 +7620,7 @@ dependencies = [
  "crossterm",
  "futures",
  "libc",
+ "proc",
  "ratatui",
  "telemetry",
  "tempfile",

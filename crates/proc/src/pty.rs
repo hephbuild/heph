@@ -239,6 +239,30 @@ impl AsyncPty {
         let inner = unsafe { AsyncFd::register_with_interest(fd, interest) }?;
         Ok(Self { inner })
     }
+
+    /// One read that never waits, for a caller that must know what is there
+    /// *now*: `WouldBlock` means nothing is, and `Ok(0)` that the slave closed.
+    /// A poll of the `AsyncRead` side cannot answer that, because the reactor's
+    /// readiness is cached and can report `Pending` with data available.
+    pub fn read_now(&self, buf: &mut [u8]) -> io::Result<usize> {
+        read_master(self.as_raw_fd(), buf)
+    }
+}
+
+/// A read of a PTY master. It returns EIO (not EOF) on Linux when the slave
+/// closes, which is translated to a clean EOF so readers terminate.
+fn read_master(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
+    // SAFETY: the caller holds `fd` open; `buf` is writable for its length.
+    let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+    if n >= 0 {
+        return Ok(n.cast_unsigned());
+    }
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::EIO) {
+        Ok(0)
+    } else {
+        Err(err)
+    }
 }
 
 impl AsRawFd for AsyncPty {
@@ -260,22 +284,7 @@ impl AsyncRead for AsyncPty {
                 Poll::Pending => return Poll::Pending,
             };
             let res = guard.try_io(|inner| {
-                let fd = inner.get_ref().as_raw_fd();
-                let unfilled = buf.initialize_unfilled();
-                // SAFETY: fd is valid (held by AsyncFd); buf points to writable bytes.
-                let n = unsafe { libc::read(fd, unfilled.as_mut_ptr().cast(), unfilled.len()) };
-                if n < 0 {
-                    let err = io::Error::last_os_error();
-                    // PTY masters return EIO (not EOF) when the slave closes;
-                    // translate to a clean EOF so readers terminate.
-                    if err.raw_os_error() == Some(libc::EIO) {
-                        Ok(0usize)
-                    } else {
-                        Err(err)
-                    }
-                } else {
-                    Ok(n.cast_unsigned())
-                }
+                read_master(inner.get_ref().as_raw_fd(), buf.initialize_unfilled())
             });
             match res {
                 Ok(Ok(n)) => {
@@ -369,8 +378,32 @@ mod tests {
         raw.enter().expect("enter again");
         drop(raw);
         let after = read(fd);
-        assert_eq!(after.c_lflag, before.c_lflag);
+        // PENDIN is the line discipline's state, not a setting: BSD sets it
+        // itself when ICANON comes back on, to re-scan what is queued.
+        assert_eq!(
+            after.c_lflag & !libc::PENDIN,
+            before.c_lflag & !libc::PENDIN
+        );
         assert_eq!(after.c_oflag, before.c_oflag);
+    }
+
+    /// What a stop's "read until EAGAIN" rests on: nothing there is `WouldBlock`
+    /// rather than a wait, and a closed slave is 0 on both OSes (EIO on Linux).
+    #[tokio::test]
+    async fn read_now_tells_empty_from_closed() {
+        let (master, slave) = open_pty().expect("open_pty");
+        let master = AsyncPty::new(master).expect("register");
+        let mut buf = [0u8; 8];
+        let empty = master.read_now(&mut buf).expect_err("nothing written yet");
+        assert_eq!(empty.kind(), io::ErrorKind::WouldBlock);
+
+        let mut writer = std::fs::File::from(slave);
+        io::Write::write_all(&mut writer, b"x").expect("write");
+        let n = master.read_now(&mut buf).expect("one byte is waiting");
+        assert_eq!((n, buf[0]), (1, b'x'));
+
+        drop(writer);
+        assert_eq!(master.read_now(&mut buf).expect("closed"), 0);
     }
 
     #[test]
