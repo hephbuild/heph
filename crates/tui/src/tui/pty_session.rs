@@ -144,7 +144,12 @@ impl PtySession {
             .map(|fd| -> anyhow::Result<Terminal> {
                 let raw = RawTerminal::capture(fd).context("reading the terminal's settings")?;
                 raw.enter().context("making the terminal raw")?;
-                Ok(Terminal { raw, fd })
+                let restore_scope = hcore::shutdown::scoped_terminal_restore(raw.restorer());
+                Ok(Terminal {
+                    raw,
+                    fd,
+                    _restore_scope: restore_scope,
+                })
             })
             .transpose()?;
 
@@ -226,6 +231,8 @@ fn drain_limit() -> Duration {
 struct Terminal {
     raw: RawTerminal,
     fd: RawFd,
+    /// For what skips `raw`'s `Drop`: a hard abort, and a panic that aborts.
+    _restore_scope: hcore::shutdown::TerminalRestoreScope,
 }
 
 /// Whether heph was told to die, which a stop must not sleep through.
