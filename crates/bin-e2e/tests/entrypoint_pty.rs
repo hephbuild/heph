@@ -418,6 +418,11 @@ fn entrypoint_kill_under_a_terminal() -> anyhow::Result<()> {
     pty.send(&[0x03]);
     pty.wait_for("got-int-2", Duration::from_secs(20));
     assert_eq!(pty.wait_exit(DEADLINE), Ended::Code(7), "{}", pty.seen());
+    assert!(
+        !pty.seen().contains("got-term-3"),
+        "two TERMs sent, three delivered\n{}",
+        pty.seen()
+    );
     assert!(pty.cursor_visible(), "cursor left hidden\n{}", pty.screen());
     Ok(())
 }
@@ -841,7 +846,9 @@ fn term_while_stopped_pending_until_fg() -> anyhow::Result<()> {
 /// line, printed by the pump of a heph still running. On macOS the tool's exit,
 /// as the session leader, revokes the PTY: the master reads EOF within
 /// milliseconds and the child's writes fail with EIO (measured), so heph is
-/// leaving, or gone, when the signal arrives.
+/// leaving, or gone, when the signal arrives. So macOS proves that a late TSTP
+/// costs nothing (the status stands, no `Stopped`, no wait), and cannot prove that
+/// the signal landed inside a drain.
 #[test]
 fn stop_during_drain_is_ignored() -> anyhow::Result<()> {
     const LIMIT: Duration = Duration::from_secs(20);
@@ -870,7 +877,6 @@ fn stop_during_drain_is_ignored() -> anyhow::Result<()> {
     // SAFETY: a plain syscall on integers.
     unsafe { libc::kill(heph, libc::SIGTSTP) };
     if cfg!(target_os = "linux") {
-        pty.wait_for("tick-", SHORT);
         assert!(running(daemon), "the child died\n{}", pty.seen());
         std::fs::write(&go, b"")?;
         pty.wait_for("late-barrier", SHORT);
@@ -1275,8 +1281,14 @@ fn default_run_drain_is_bounded() -> anyhow::Result<()> {
             "heph left after {elapsed:?}\n{}",
             pty.seen()
         );
+        // The child ticks throughout, so the drain moved bytes: 0 would be a count
+        // that stopped counting.
         let seen = pty.seen();
-        assert!(seen.contains("bytes_drained"), "no warning\n{seen}");
+        let counted = seen
+            .split("bytes_drained=")
+            .skip(1)
+            .any(|rest| rest.starts_with(|c: char| ('1'..='9').contains(&c)));
+        assert!(counted, "no warning with a byte count\n{seen}");
     }
     Ok(())
 }
@@ -1293,9 +1305,16 @@ fn every_line_arrived(pty: &Pty) {
     let tail = text.get(start..).unwrap_or_default();
     // Once a PTY slave's queue fills, XNU emits `\r\r\n` every 4095 bytes. That
     // was measured on a plain PTY with no heph involved, so on macOS `\r+\n` is
-    // one line ending. These tests prove nothing is lost, which still holds.
-    // Linux keeps the exact `\r\n`, so a real double translation fails there.
+    // one line ending, up to that rate: a real double translation, on every line,
+    // is far past it. Linux keeps the exact `\r\n`, so it fails there by itself.
     let lines: Vec<&str> = if cfg!(target_os = "macos") {
+        let doubled = tail.matches("\r\r\n").count();
+        let allowed = tail.len() / 4095 + 1;
+        assert!(
+            doubled <= allowed,
+            "{doubled} doubled line endings in {} bytes, over the {allowed} XNU emits",
+            tail.len()
+        );
         tail.split('\n')
             .map(|line| line.trim_end_matches('\r'))
             .collect()
