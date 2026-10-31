@@ -237,7 +237,7 @@ fn drain_limit() -> Duration {
 struct Terminal {
     raw: RawTerminal,
     fd: RawFd,
-    /// For what skips `raw`'s `Drop`: a hard abort, and a panic that aborts.
+    /// For what skips `raw`'s `Drop` and runs the registered restore: a hard abort.
     _restore_scope: hcore::shutdown::TerminalRestoreScope,
 }
 

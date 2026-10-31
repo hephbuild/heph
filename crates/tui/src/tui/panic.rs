@@ -21,8 +21,10 @@ pub fn install(sink: LogSink) {
 
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        // A tool's PTY session, whose raw mode is not crossterm's to undo.
-        hcore::shutdown::restore_terminal_on_panic();
+        // A tool's PTY session is not restored here. This hook also fires for a
+        // panic tokio catches, which would leave the terminal cooked under a live
+        // tool. An uncaught panic unwinds into `RawTerminal`'s `Drop` instead, and
+        // a panic that aborts leaves the terminal raw until `reset`.
         drop(disable_raw_mode());
         drop(execute!(io::stderr(), crossterm::cursor::Show));
         sink.switch_to_direct();

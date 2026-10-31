@@ -156,6 +156,9 @@ mode the terminal is untouched.
 A fatal signal to heph itself, such as SIGSEGV or SIGBUS, is the same: nothing
 restores the terminal, and `reset` is the answer there as well.
 
+So is a panic that aborts, such as one across the plugin seam. An ordinary panic
+unwinds, and that restores the terminal.
+
 ### Output after the tool exits
 
 A background job's output after the tool exits is cut with a warning on Linux, and

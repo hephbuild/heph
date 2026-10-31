@@ -131,46 +131,30 @@ type RestoreFn = Arc<dyn Fn() + Send + Sync>;
 /// must be self-contained: no crossterm (whose own raw-mode mutex it may
 /// already be holding), no writes when nothing was ever recorded (a
 /// redirected/non-tty run never registers one).
-static TERMINAL_RESTORE: Mutex<Option<Registered>> = Mutex::new(None);
-
-#[derive(Clone)]
-struct Registered {
-    restore: RestoreFn,
-    /// Whether a panic runs it too. The TUI's says "aborted (second Ctrl-C)", and
-    /// the panic hook has its own way of restoring what the TUI did.
-    on_panic: bool,
-}
+static TERMINAL_RESTORE: Mutex<Option<RestoreFn>> = Mutex::new(None);
 
 /// Register the closure the hard-abort path calls to restore the terminal.
 /// Call once raw mode is entered, with a closure that already captured
 /// whatever state (e.g. the pre-raw-mode `termios`) it needs to restore.
 pub fn set_terminal_restore(f: impl Fn() + Send + Sync + 'static) {
-    *TERMINAL_RESTORE.lock().unwrap_or_else(|e| e.into_inner()) = Some(Registered {
-        restore: Arc::new(f),
-        on_panic: false,
-    });
+    *TERMINAL_RESTORE.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(f));
 }
 
 /// Register a closure for the time a raw-mode session sits inside another one
-/// (a tool's PTY while the TUI has stepped aside), for the hard-abort path and
-/// for [`restore_terminal_on_panic`]. Dropping the returned scope puts back
-/// whatever was registered before.
+/// (a tool's PTY while the TUI has stepped aside), for the hard-abort path.
+/// Dropping the returned scope puts back whatever was registered before.
 #[must_use = "dropping the scope ends the registration"]
 pub fn scoped_terminal_restore(f: impl Fn() + Send + Sync + 'static) -> TerminalRestoreScope {
-    let registered = Registered {
-        restore: Arc::new(f),
-        on_panic: true,
-    };
     let previous = TERMINAL_RESTORE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .replace(registered);
+        .replace(Arc::new(f));
     TerminalRestoreScope { previous }
 }
 
 /// See [`scoped_terminal_restore`].
 pub struct TerminalRestoreScope {
-    previous: Option<Registered>,
+    previous: Option<RestoreFn>,
 }
 
 impl std::fmt::Debug for TerminalRestoreScope {
@@ -183,19 +167,6 @@ impl std::fmt::Debug for TerminalRestoreScope {
 impl Drop for TerminalRestoreScope {
     fn drop(&mut self) {
         *TERMINAL_RESTORE.lock().unwrap_or_else(|e| e.into_inner()) = self.previous.take();
-    }
-}
-
-/// For the panic hook: run the registered closure if a scope registered it. A
-/// panic can skip the `Drop` of what is raw, as an abort does, so this is what is
-/// left to put the terminal back.
-pub fn restore_terminal_on_panic() {
-    let registered = TERMINAL_RESTORE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
-    if let Some(registered) = registered.filter(|r| r.on_panic) {
-        (registered.restore)();
     }
 }
 
@@ -220,7 +191,7 @@ pub fn restore_terminal() {
         .unwrap_or_else(|e| e.into_inner())
         .clone();
     if let Some(f) = f {
-        (f.restore)();
+        f();
     }
 }
 
@@ -275,11 +246,10 @@ mod tests {
         assert!(rx.try_recv().is_ok(), "heph's again once no tool runs");
     }
 
-    /// While a scope holds it, the abort and a panic run its closure. Afterwards
-    /// the TUI's is back for the abort, and a panic never runs that one, since it
-    /// says "aborted (second Ctrl-C)".
+    /// While a scope holds it, the abort runs its closure. Afterwards the TUI's
+    /// is back for the abort.
     #[test]
-    fn scoped_restore_puts_the_previous_back_and_alone_runs_on_panic() {
+    fn scoped_restore_puts_the_previous_back() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let counter = || {
             let calls = Arc::new(AtomicUsize::new(0));
@@ -292,20 +262,16 @@ mod tests {
         let (session, session_restore) = counter();
 
         set_terminal_restore(tui_restore);
-        restore_terminal_on_panic();
-        assert_eq!(tui.load(Ordering::SeqCst), 0, "a panic ran the TUI's");
 
         let scope = scoped_terminal_restore(session_restore);
-        restore_terminal_on_panic();
-        assert_eq!(session.load(Ordering::SeqCst), 1, "a panic");
         restore_terminal();
-        assert_eq!(session.load(Ordering::SeqCst), 2, "the abort");
+        assert_eq!(session.load(Ordering::SeqCst), 1, "the abort");
         assert_eq!(tui.load(Ordering::SeqCst), 0, "shadowed by the scope");
 
         drop(scope);
         restore_terminal();
         assert_eq!(tui.load(Ordering::SeqCst), 1, "the TUI's is back");
-        assert_eq!(session.load(Ordering::SeqCst), 2, "the scope is over");
+        assert_eq!(session.load(Ordering::SeqCst), 1, "the scope is over");
         clear_terminal_restore();
     }
 
