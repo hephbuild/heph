@@ -117,7 +117,9 @@ fn entrypoint_ctrl_c_goes_to_tool() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Signals sent with `kill` while heph is the terminal's foreground (R2):
+/// Signals sent with `kill` under `--raw` while heph is the terminal's foreground
+/// (R2), where the tool shares heph's group. A default run has its own session,
+/// so none of this applies to it:
 /// - a TERM to heph's pid is relayed, exactly once;
 /// - an INT to heph's pid is dropped (X5): in the shared group it cannot be
 ///   told apart from the terminal's own, which already reached the tool;
@@ -130,7 +132,7 @@ fn entrypoint_ctrl_c_goes_to_tool() -> anyhow::Result<()> {
 fn entrypoint_kill_under_a_terminal() -> anyhow::Result<()> {
     let dist = Dist::locate();
     let ws = workspace()?;
-    let mut pty = Pty::spawn(&dist, ws.root(), &["run", "//app:trapper"], &[]);
+    let mut pty = Pty::spawn(&dist, ws.root(), &["run", "//app:trapper", "--raw"], &[]);
     pty.wait_for("trap-ready", DEADLINE);
 
     common::signal(pty.pid(), libc::SIGTERM);

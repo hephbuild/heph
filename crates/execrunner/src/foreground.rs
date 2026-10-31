@@ -942,6 +942,67 @@ mod tests {
         assert_eq!(exit, Exit::Signal(libc::SIGUSR1), "not blocked: delivered");
     }
 
+    /// On a slave the tool is a session leader whose controlling tty is that PTY,
+    /// and it still gets the caller's dispositions, mask and open-file limit,
+    /// which the extra steps in `pre_exec` must not lose.
+    #[tokio::test]
+    async fn spawn_foreground_on_a_slave() {
+        let mut now = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: a valid resource and a pointer to a live `rlimit`.
+        let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut now) };
+        assert_eq!(rc, 0, "getrlimit");
+        let want = now.rlim_cur.min(1024) - 1;
+
+        // Held open so that the slave does not hang up under the tool.
+        let (master, slave) = hproc::pty::open_pty().expect("open_pty");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let answers = dir.path().join("answers");
+        // `/dev/tty` opens only with a controlling tty, and `tty` names the fd's:
+        // both answers go to a file, since the size of the PTY's buffer is not
+        // what this tests. An ignored signal stays ignored through `sh`; USR1 is
+        // blocked, so it stays pending rather than killing the tool.
+        let script = format!(
+            r#"
+            {{ : < /dev/tty; }} 2>/dev/null || exit 3
+            [ "$(ulimit -n)" = {want} ] || exit 4
+            kill -TERM $$
+            kill -USR1 $$
+            tty > '{answers}'
+            exit 6
+            "#,
+            answers = answers.display(),
+        );
+        let cmd = sh(&script)
+            .with_slave(slave)
+            .with_nofile(Some(want))
+            .with_blocked(vec![Signal::from_raw(libc::SIGUSR1)])
+            .with_dispositions(vec![(Signal::from_raw(libc::SIGTERM), Disposition::Ignore)]);
+        let child = spawn(cmd).await;
+        let pid = libc::pid_t::try_from(child.id()).expect("a pid");
+
+        // SAFETY: no preconditions; the unreaped child's pid stays valid.
+        let sid = unsafe { libc::getsid(pid) };
+        assert_eq!(sid, pid, "the tool leads its own session");
+        // SAFETY: no preconditions.
+        let ours = unsafe { libc::getsid(0) };
+        assert_ne!(sid, ours, "not heph's session");
+
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (stops, _stopped) = tokio::sync::mpsc::unbounded_channel();
+        let (_continue, continues) = tokio::sync::mpsc::unbounded_channel();
+        let exit = child
+            .wait_pty(rx, stops, continues, &StdCancellationToken::new())
+            .await
+            .expect("wait");
+        assert_eq!(exit, Exit::Code(6));
+        let name = std::fs::read_to_string(&answers).expect("the tool's answers");
+        assert!(name.starts_with("/dev/"), "stdin is the slave: {name}");
+        drop(master);
+    }
+
     /// A cancel that lands before the spawn spawns nothing.
     #[tokio::test]
     async fn foreground_spawn_cancelled_before_spawn_spawns_nothing() {

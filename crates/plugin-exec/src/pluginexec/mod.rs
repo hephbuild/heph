@@ -2355,7 +2355,10 @@ impl Driver {
             // Copy the parent's line discipline (ICRNL/ONLCR/etc.) onto the
             // slave so bash sees a standard cooked terminal. Must run BEFORE
             // we put the parent into raw mode below.
-            hproc::pty::inherit_termios(slave).context("copy parent termios to pty slave")?;
+            // With no terminal to copy from, the PTY's own defaults are as good.
+            if let Err(error) = hproc::pty::inherit_termios(slave) {
+                tracing::debug!(%error, "no terminal to copy termios from");
+            }
 
             let stdin_fd = slave.try_clone().context("dup pty slave for stdin")?;
             let stdout_fd = slave.try_clone().context("dup pty slave for stdout")?;
