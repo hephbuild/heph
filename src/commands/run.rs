@@ -512,12 +512,22 @@ impl App for RunApp {
 
         // An entrypoint is invoked, not built: it takes its own path from here.
         // An unresolvable address falls through, so the build path reports it
-        // the way it reports any other.
-        if let Matcher::Addr(addr) = &self.matcher
-            && matches!(self.engine.is_entrypoint(&rs, addr).await, Ok(true))
-        {
-            let addr = addr.clone();
-            return self.invoke(ctx, rs, addr).await;
+        // the way it reports any other. With args nothing will build, and it
+        // is not known to be anything but unresolved: report that error here,
+        // rather than saying a target nobody could read is not an entrypoint.
+        if let Matcher::Addr(addr) = &self.matcher {
+            match self.engine.is_entrypoint(&rs, addr).await {
+                Ok(true) => {
+                    let addr = addr.clone();
+                    return self.invoke(ctx, rs, addr).await;
+                }
+                Err(e) if !self.args.args.is_empty() => {
+                    let res: anyhow::Result<()> = Err(e);
+                    crate::commands::errors::finalize!(ctx, rs, res)?;
+                    return Ok(None);
+                }
+                Ok(false) | Err(_) => {}
+            }
         }
         if !self.args.args.is_empty() {
             anyhow::bail!(

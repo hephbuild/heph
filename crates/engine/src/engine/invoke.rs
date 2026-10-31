@@ -458,7 +458,7 @@ impl Engine {
             Workdir::Sandbox => None,
         };
         let args = entrypoint.accepts_args.then_some(req.args);
-        tracing::info!(
+        tracing::debug!(
             addr = %addr,
             args = ?args,
             cwd = ?cwd,

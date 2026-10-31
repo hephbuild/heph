@@ -61,6 +61,42 @@ fn via_shell(ws: &Workspace, dist: &Dist, setup: &str, args: &[&str]) -> std::pr
     cmd
 }
 
+/// Arguments on a target whose def does not resolve report why it does not,
+/// exactly as a run without arguments does: "not an entrypoint" is only ever
+/// said of a target that resolved and is not one.
+#[test]
+fn args_on_an_unresolved_target_report_the_real_error() -> anyhow::Result<()> {
+    let dist = Dist::locate();
+    let ws = workspace()?;
+    ws.write(
+        "bad/BUILD",
+        r#"target(name = "broken", driver = "bash", entrypoint = True, run = "true", out = "o")
+"#,
+    )?;
+    ws.write(
+        "plain/BUILD",
+        r#"target(name = "built", driver = "bash", run = "true")
+"#,
+    )?;
+
+    let bare = ws.run(&dist, &["run", "//bad:broken"])?;
+    assert!(!bare.status.success(), "{}", describe(&bare));
+    let bare_err = String::from_utf8_lossy(&bare.stderr).into_owned();
+    assert!(bare_err.contains("`out`"), "{}", describe(&bare));
+
+    let out = ws.run(&dist, &["run", "//bad:broken", "--", "a"])?;
+    assert_eq!(out.status.code(), bare.status.code(), "{}", describe(&out));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!err.contains("is not one"), "{}", describe(&out));
+    assert!(err.contains("`out`"), "the def's own error: {}", describe(&out));
+
+    let out = ws.run(&dist, &["run", "//plain:built", "--", "a"])?;
+    assert!(!out.status.success(), "{}", describe(&out));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("is not one"), "{}", describe(&out));
+    Ok(())
+}
+
 /// The program's exit code is heph's, unchanged.
 #[test]
 fn entrypoint_exit_code_passes_through() -> anyhow::Result<()> {
