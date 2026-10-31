@@ -928,6 +928,7 @@ fn redirected_run_is_byte_exact() -> anyhow::Result<()> {
 "$HEPH" run //app:bytes > "$D/file"
 "$HEPH" run //app:bytes | cat > "$D/pipe"
 "$HEPH" run //app:copy < "$D/in" > "$D/stdin"
+cat "$D/in" | "$HEPH" run //app:copy > "$D/piped"
 echo "all-""redirected"
 "#,
         &[("D", &dir.path().to_string_lossy())],
@@ -940,6 +941,12 @@ echo "all-""redirected"
         std::fs::read(dir.path().join("stdin"))?,
         input,
         "<\n{}",
+        pty.seen()
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("piped"))?,
+        input,
+        "piped stdin\n{}",
         pty.seen()
     );
     Ok(())
