@@ -2164,11 +2164,10 @@ impl Driver {
                 .collect(),
         };
 
-        // Created for a captured run, and for an inherited one, where nothing is
-        // teed so it stays empty, and the run still reports one log artifact
-        // (E6). A session on a PTY, a `--shell` or a default entrypoint run, is
+        // Created for a captured run only. Nothing is teed from a run on the
+        // caller's terminal, inherited or on a PTY, and a `--shell` is
         // interactive: no log, no redaction, and so no artifact (R22).
-        let writes_log = !shell && !matches!(options.stdio, hplugin::driver::RunStdio::Pty(_));
+        let writes_log = !shell && matches!(options.stdio, hplugin::driver::RunStdio::Captured);
         let output_log_path = req.sandbox_dir.join("log.txt");
         let output_log = writes_log
             .then(|| std::fs::File::create(&output_log_path).with_context(|| "create log file"))
@@ -2572,7 +2571,7 @@ impl Driver {
                                     addr = addr_str.as_str(),
                                     pty_bytes,
                                     waited_ms = waited.as_millis(),
-                                    "pluginexec: post-wait output drain timed out; log tail may be truncated"
+                                    "pluginexec: post-wait output drain timed out; the session's last output may be missing"
                                 );
                             } else {
                                 tracing::debug!(
