@@ -162,13 +162,15 @@ target(name = "daemon", driver = "bash", entrypoint = True, run = """
   n=0
   while [ ! -e "$HEPH_E2E_GO" ] && [ "$n" -lt 3000 ]; do
     n=$((n+1))
-    echo "tick-$n"
+    echo "tick-$n" || true
     sleep 0.02
   done
-  echo "late-""barrier"
+  echo "late-""barrier" || true
 ) &
+while [ ! -s "$HEPH_E2E_PIDFILE" ]; do sleep 0.01; done
 echo "tool-pid-$$."
 echo "heph-pid-$PPID."
+echo "daemon-""ready"
 exit 5
 """)
 target(name = "hupstop", driver = "bash", entrypoint = True, run = """
@@ -270,6 +272,21 @@ echo "after-run=$?="; read -r _
         pty.screen()
     );
     (pty, status)
+}
+
+/// How far past the drain limit heph may exit: what it still does on the way out,
+/// on a shared CI runner. The child would hold the PTY for a minute.
+const DRAIN_MARGIN: Duration = Duration::from_secs(10);
+
+/// `//app:daemon`'s child, which the tool waited for before exiting.
+fn daemon_pid(pidfile: &std::path::Path) -> anyhow::Result<i32> {
+    Ok(std::fs::read_to_string(pidfile)?.trim().parse()?)
+}
+
+/// Whether `pid` is running: a zombie has already died.
+fn running(pid: i32) -> bool {
+    let state = common::proc_state(pid);
+    !state.is_empty() && !state.starts_with('Z')
 }
 
 /// A shell at its prompt with `//app:<target>` stopped under it, having stopped
@@ -743,37 +760,61 @@ fn term_while_stopped_pending_until_fg() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The tool has gone and a child of its holds the PTY open, so heph is draining.
-/// A SIGTSTP then stops nothing: the child's next line is the barrier, printed
-/// by the pump of a heph still running, and the shell saw no stop at all.
+/// The tool has gone and a child of its still holds the PTY. A SIGTSTP then stops
+/// nothing, and the shell sees no stop at all.
+///
+/// Only Linux has a drain window to send it in, whose barrier is the child's next
+/// line, printed by the pump of a heph still running. On macOS the tool's exit,
+/// as the session leader, revokes the PTY: the master reads EOF within
+/// milliseconds and the child's writes fail with EIO (measured), so heph is
+/// leaving, or gone, when the signal arrives.
 #[test]
-#[ignore = "macOS revokes the slave when the tool, its session leader, exits: heph left in \
-            23ms with the child alive, so no drain window exists. For the user to decide."]
 fn stop_during_drain_is_ignored() -> anyhow::Result<()> {
+    const LIMIT: Duration = Duration::from_secs(20);
     let dist = Dist::locate();
     let ws = workspace()?;
     let dir = tempfile::tempdir()?;
     let (pidfile, go) = (dir.path().join("pid"), dir.path().join("go"));
+    let limit = LIMIT.as_millis().to_string();
     let mut pty = Pty::shell(
         &dist,
         ws.root(),
         &[
             ("HEPH_E2E_PIDFILE", &pidfile.to_string_lossy()),
             ("HEPH_E2E_GO", &go.to_string_lossy()),
-            ("HEPH_PTY_DRAIN_MS", "20000"),
+            ("HEPH_PTY_DRAIN_MS", &limit),
         ],
     );
     pty.type_line(r#""$HEPH" run //app:daemon"#);
-    pty.wait_for("tick-1", DEADLINE);
+    pty.wait_for("daemon-ready", DEADLINE);
     let (heph, tool) = (pty.number_after("heph-pid-"), pty.number_after("tool-pid-"));
+    let daemon = daemon_pid(&pidfile)?;
     common::wait_until("the tool to be gone", SHORT, || !common::alive(tool));
+    let gone = std::time::Instant::now();
 
-    common::signal(heph, libc::SIGTSTP);
-    std::fs::write(&go, b"")?;
-    pty.wait_for("late-barrier", SHORT);
-    assert!(!common::is_stopped(heph), "{}", common::proc_state(heph));
+    // Not `common::signal`: on macOS heph may have left already.
+    // SAFETY: a plain syscall on integers.
+    unsafe { libc::kill(heph, libc::SIGTSTP) };
+    if cfg!(target_os = "linux") {
+        pty.wait_for("tick-", SHORT);
+        assert!(running(daemon), "the child died\n{}", pty.seen());
+        std::fs::write(&go, b"")?;
+        pty.wait_for("late-barrier", SHORT);
+        assert!(!common::is_stopped(heph), "{}", common::proc_state(heph));
+    }
 
     pty.wait_prompt();
+    let elapsed = gone.elapsed();
+    if !cfg!(target_os = "linux") {
+        let alive_at_exit = running(daemon);
+        std::fs::write(&go, b"")?;
+        assert!(alive_at_exit, "the child died first\n{}", pty.seen());
+    }
+    assert!(
+        elapsed < LIMIT + DRAIN_MARGIN,
+        "heph left after {elapsed:?}\n{}",
+        pty.seen()
+    );
     assert_eq!(pty.last_status(), 5, "{}", pty.seen());
     let seen = pty.seen();
     assert_eq!(
@@ -1112,11 +1153,14 @@ fn relay_reaches_the_foreground_group() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A child that outlives the tool keeps the PTY open, and heph waits for it only
-/// up to the limit, then says what it cut. The child is still there at exit.
+/// A child that outlives the tool never holds heph past the limit, and is still
+/// there at exit.
+///
+/// Only on Linux does it keep the PTY open, so that heph waits out the limit and
+/// says what it cut. On macOS the tool's exit, as the session leader, revokes the
+/// PTY: the master reads EOF within milliseconds with the child alive and its
+/// writes failing with EIO (measured), so nothing is drained and nothing warns.
 #[test]
-#[ignore = "macOS revokes the slave when the tool, its session leader, exits: heph left in \
-            23ms with the child alive, so the limit is never reached. For the user to decide."]
 fn default_run_drain_is_bounded() -> anyhow::Result<()> {
     const LIMIT: Duration = Duration::from_millis(1500);
     let dist = Dist::locate();
@@ -1134,26 +1178,32 @@ fn default_run_drain_is_bounded() -> anyhow::Result<()> {
             ("HEPH_PTY_DRAIN_MS", &limit),
         ],
     );
-    pty.wait_for("tick-1", DEADLINE);
+    pty.wait_for("daemon-ready", DEADLINE);
     let tool = pty.number_after("tool-pid-");
     common::wait_until("the tool to be gone", SHORT, || !common::alive(tool));
     let gone = std::time::Instant::now();
     assert_eq!(pty.wait_exit(DEADLINE), Ended::Code(5), "{}", pty.seen());
     let elapsed = gone.elapsed();
 
-    let daemon: i32 = std::fs::read_to_string(&pidfile)?.trim().parse()?;
-    let alive_at_exit = common::alive(daemon);
+    let alive_at_exit = running(daemon_pid(&pidfile)?);
     std::fs::write(&go, b"")?;
     assert!(alive_at_exit, "the child died first\n{}", pty.seen());
-    // The limit starts as the run returns, a moment before the tool's pid could
-    // be seen gone.
     assert!(
-        elapsed + Duration::from_millis(200) >= LIMIT,
+        elapsed < LIMIT + DRAIN_MARGIN,
         "heph left after {elapsed:?}\n{}",
         pty.seen()
     );
-    let seen = pty.seen();
-    assert!(seen.contains("bytes_drained"), "no warning\n{seen}");
+    if cfg!(target_os = "linux") {
+        // The limit starts as the run returns, a moment before the tool's pid
+        // could be seen gone.
+        assert!(
+            elapsed + Duration::from_millis(200) >= LIMIT,
+            "heph left after {elapsed:?}\n{}",
+            pty.seen()
+        );
+        let seen = pty.seen();
+        assert!(seen.contains("bytes_drained"), "no warning\n{seen}");
+    }
     Ok(())
 }
 

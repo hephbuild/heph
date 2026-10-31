@@ -159,6 +159,10 @@ the tool's output was cut: its PTY was still open at the drain limit
 The warning carries `bytes_drained` and `limit_ms`. Whatever that job writes
 afterwards is lost.
 
+On macOS the job cannot hold the PTY open. The tool leads the PTY's session, and
+its exit revokes the PTY: heph sees the end of output at once and does not warn,
+and the job keeps running with its writes to the PTY failing with EIO.
+
 ## From a script or an agent
 
 ```sh
