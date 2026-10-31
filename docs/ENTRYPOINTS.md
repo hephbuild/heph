@@ -55,11 +55,122 @@ Entrypoints always run on the OS sandbox: `fuse.enabled` is ignored for them.
   so a write to one stays in the sandbox; on Linux they are hardlinks, and
   `read_only_deps` is a directory symlink on both.) Two invocations of the same target run concurrently, each in
   its own sandbox, which is removed when the tool exits.
-- **Terminal and signals**: the tool inherits heph's stdin, stdout and stderr,
-  and the signal dispositions and signal mask heph itself inherited (under
-  `nohup`, SIGINT stays ignored; under `trap '' PIPE`, SIGPIPE stays ignored).
-  The open-file limit is yours, not heph's raised one — for every driver,
-  plugin drivers included.
+- **Signal state and limits**: in every mode, the signal dispositions and signal
+  mask heph itself inherited (under `nohup`, SIGINT stays ignored; under
+  `trap '' PIPE`, SIGPIPE stays ignored). The open-file limit is yours, not
+  heph's raised one — for every driver, plugin drivers included.
+- **Parent**: `$PPID` and `ps` show heph as the tool's parent, in every mode.
+- **Terminal**: depends on the mode, below.
+
+**Credentials are not redacted.** A tool that prints a credential prints it in
+clear, in every mode, and nothing logs the run's output. The scrubbing described
+in [`CREDENTIALS.md`](CREDENTIALS.md#redaction) applies to captured builds only.
+
+### The two modes
+
+A run on your terminal takes the **PTY** mode. `--raw`, or any of stdin, stdout
+and stderr not being a terminal, or heph not being the terminal's foreground job,
+takes the **inherited** mode.
+
+| | PTY (the default on a terminal) | Inherited |
+|---|---|---|
+| TUI | While dependencies build, then paused for the tool | None with `--raw`; otherwise as for any run, then paused for the tool |
+| Tool's stdio | A PTY heph owns, as fds 0–2; heph copies the keyboard to it and its output to fd 1 | Your fds. No byte passes through heph |
+| Process | A session of its own, with the PTY as its controlling terminal | heph's process group |
+| Ctrl-C, Ctrl-\ | The PTY signals the tool's foreground group | The kernel signals the shared group |
+| Ctrl-Z | A plain tool does not stop (see [below](#ctrl-z)) | Stops; `fg` resumes |
+| Window resize | heph copies the size to the PTY | The kernel delivers it |
+
+Use `--raw` when a tool needs real Ctrl-Z or your terminal's own fds. It costs
+two signal limits, under [Signals while the tool runs](#inherited-mode).
+
+Without `--raw`, pipes and files stay byte-exact, because a redirected run
+inherits them. In the PTY mode, the tool's stdout and stderr share the PTY.
+
+### Which mode am I in?
+
+```sh
+HEPH_LOG=entrypoint_mode=debug heph run //x
+```
+
+heph prints one line to stderr before the tool starts, with the `mode` and the
+`reason`. By default it prints nothing, so `2>&1 | jq` stays clean. These are
+checked in this order, and the first that holds wins:
+
+| `mode` | `reason` | When |
+|---|---|---|
+| `inherit` | `flag` | `--raw` was passed. |
+| `pty` | `shell` | `--shell` was passed. |
+| `inherit` | `fd0_not_tty` | stdin is not a terminal. |
+| `inherit` | `fd1_not_tty` | stdout is not a terminal. |
+| `inherit` | `fd2_not_tty` | stderr is not a terminal. |
+| `inherit` | `not_foreground` | heph is not the foreground job of the terminal on stdin: `heph run //x &`, `timeout 5 heph run //x`. |
+| `inherit` | `plugin_no_pty` | The target's driver offers no PTY. heph also warns. |
+| `pty` | `default` | None of the above. |
+
+Asking can change the answer. The line goes to stderr, so capturing it with
+`2>file` makes the run `fd2_not_tty`. Read it on the terminal.
+
+A background job or a backgrounding wrapper such as `timeout` also loses the TUI,
+for any `heph` command. With no TUI to prompt in, the approval handler refuses an
+`approval`-gated target rather than prompting; `--auto-approve` lets it through.
+
+### Ctrl-Z
+
+**With `--raw`**, and in any inherited run in the foreground, Ctrl-Z stops the
+tool and heph together, and `fg` resumes them, as for a tool run by hand.
+
+**In the PTY mode**, Ctrl-Z does nothing to a plain tool. The tool's process group
+is orphaned, so the kernel discards the stop. A tool that handles SIGTSTP still
+sees it.
+
+A tool that sends itself SIGSTOP does suspend. heph flushes the tool's output,
+restores your terminal and stops too, so your shell's prompt returns. `fg` makes
+the terminal raw again, copies the window size and continues the tool.
+
+- **The tool shows as stopped after `bg`; run `fg`.** heph stops again until it is
+  the foreground job, because a raw terminal from the background breaks your
+  shell's.
+- While it is stopped, a signal sent to heph stays pending until `fg`. Only
+  `kill -9` acts.
+
+### After `kill -9`, run `reset`
+
+Nothing in heph runs after SIGKILL, so in the PTY mode your terminal stays raw
+until you run `reset`. heph's supervisor still kills the tool. In the inherited
+mode the terminal is untouched.
+
+### Output after the tool exits
+
+In the PTY mode, once the tool has exited, heph copies what is left on the PTY to
+the screen, for at most 500ms. A background job the tool left behind can hold the
+PTY open past that. The run then ends at the limit, with the tool's status, and
+heph warns:
+
+```
+the tool's output was cut: its PTY was still open at the drain limit
+```
+
+The warning carries `bytes_drained` and `limit_ms`. Whatever that job writes
+afterwards is lost.
+
+## From a script or an agent
+
+```sh
+heph run //web:dev --raw -- --port 4000
+```
+
+stdout carries only the tool's bytes, stderr only failures, and no TUI starts.
+The exit status is the one below. An agent's stdio is usually not a terminal, so
+it would inherit without the flag too; `--raw` also drops the progress, and holds
+on a terminal as well.
+
+With no TUI, an `approval`-gated target in the closure is refused unless you pass
+`--auto-approve`. `run` has no `--json`.
+
+On a build target, `--raw` only changes the display: the action's output is
+printed plainly, redacted as in `log.txt`, the action reads no stdin, and capture,
+runners and the cache are unchanged. A cache hit prints nothing.
 
 ## Exit status
 
@@ -70,6 +181,10 @@ Entrypoints always run on the OS sandbox: `fuse.enabled` is ignored for them.
 | `125` | heph failed after the target resolved to an entrypoint, before the tool ran: a dependency failed to build, an argument was refused, the closure could not be materialized, a credential could not be obtained, or the program could not be started (not found, not executable). The error is shown. |
 | `130` | Ctrl-C cancelled the run before the tool started, while its dependencies were building. |
 | `1` | The target could not be resolved at all (a typo, a broken BUILD file, not an entrypoint). |
+
+The table holds in every mode. The number alone does not say who failed, since a
+tool can exit `1` or `125` itself: a failure of heph's also prints an error to
+stderr.
 
 heph writes nothing to stdout during an invocation; its progress goes to
 stderr.
@@ -84,8 +199,26 @@ uploading the freshly built dependencies to a remote cache. Signals are heph's
 again then: Ctrl-C, TERM or HUP cancel what is left and heph exits at once,
 still with the tool's status, and without printing a cancellation.
 
+In every mode, a tool that traps INT and QUIT and keeps running can still be
+stopped with `kill -9 <heph pid>`: heph's supervisor then kills and reaps the
+tool. A second Ctrl-C is not special.
+
+### PTY mode
+
+- Ctrl-C and Ctrl-\ pass through heph as bytes, and the PTY signals the tool's
+  foreground group.
+- A signal sent to heph's own pid or to its whole group — TERM, HUP, INT, QUIT,
+  USR1 or USR2 — reaches the tool's group once, with no limits. So
+  `kill -INT <heph pid>` reaches the foreground work of
+  `bash -c 'sleep 100; …'`. heph then exits with the tool's status. A job in a
+  group of its own, under `bash -i`, is not reached.
+- A resize reaches the tool once: heph copies the size to the PTY, and the kernel
+  signals the tool.
+
+### Inherited mode
+
 - Ctrl-C, Ctrl-\ and Ctrl-Z come from the terminal straight to the tool, which
-  shares heph's process group. A second Ctrl-C is not special.
+  shares heph's process group.
 - A signal sent to heph's own pid — `kill <pid>`, `timeout 10 heph run …`, a CI
   runner stopping the job — is forwarded to the tool once: TERM, HUP, INT, QUIT,
   USR1, USR2 and WINCH. heph then exits with the tool's status, so `timeout`
@@ -97,9 +230,9 @@ still with the tool's status, and without printing a cancellation.
     and USR2 always arrive.
   - A signal sent to the whole group (`kill -TERM -<pgid>`, `kill 0` from a
     script in it) reaches the tool directly *and* through heph, so it may
-    arrive twice.
-- A tool that traps INT and QUIT and keeps running can still be stopped with
-  `kill -9 <heph pid>`: heph's supervisor then kills and reaps the tool.
+    arrive twice. The HUP of a terminal that closed may too.
+
+### Before the tool starts
 
 Before the tool starts — dependencies building, the closure being laid out —
 heph is an ordinary run: Ctrl-C cancels it, TERM and HUP end it, SIGQUIT
@@ -115,6 +248,16 @@ parameters. `show` prints the command `run` would execute, with the arguments
 quoted; `run` runs it (`run --port 5000` replaces the arguments for that call);
 `exit 3` leaves the shell and heph exits 3.
 
+`--shell` always runs on heph's PTY, whatever the fds are. Its output is not
+logged or redacted, so `env` there shows your credentials. With no terminal, heph
+goes neither raw nor stops itself. A driver with a shell of its own that offers no
+PTY is refused before anything builds. `--raw` is refused with it, also before
+anything builds:
+
+```
+`--raw` and `--shell` cannot be combined: `--raw` keeps heph off the terminal, and a shell needs heph's PTY; drop one of them
+```
+
 `heph inspect def //web:dev` shows `"runs_as": "exec, entrypoint (uncached)"`,
 a line for people. A script or an agent reads `target_def.entrypoint` from the
 same output instead: `{"accepts_args": true, "workdir": "caller"}`, absent
@@ -125,5 +268,7 @@ for a target that is not an entrypoint.
 Any driver can declare an entrypoint: its `parse` sets
 `TargetDef.entrypoint`, and its ordinary `run` honours the generic
 `RunOptions` the engine sends (cwd, base environment, args, the caller's
-terminal and the relayed signals). A cdylib plugin declares one only on a host
+terminal and the relayed signals). A driver that can spawn on heph's PTY offers it
+with `Entrypoint::with_pty`; without that, a default run inherits and `--shell`
+is refused. A cdylib plugin declares one only on a host
 that advertises the entrypoint capability; the SDK refuses it otherwise.
