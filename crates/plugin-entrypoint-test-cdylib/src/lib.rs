@@ -12,10 +12,12 @@
 //!
 //! The script reads its instructions from the caller's environment:
 //! - writes what it saw (cwd, `HEPH_TEST_CALLER`, `HEPH_ROOT`, whether fds 0–2
-//!   are a tty, its args) to `$HEPH_TEST_OUT`, then
+//!   are a tty, its args) to `$HEPH_TEST_OUT`, and the device `tty` names to
+//!   `$HEPH_TEST_OUT.tty`, then
 //! - exits 42, or with `HEPH_TEST_MODE=wait` counts each TERM into
 //!   `$HEPH_TEST_OUT.term`, prints `trap-ready`, and exits 7 once
-//!   `$HEPH_TEST_OUT.stop` exists.
+//!   `$HEPH_TEST_OUT.stop` exists, or with `HEPH_TEST_MODE=stop` prints its and
+//!   its parent's pids, stops itself, and exits 4 once continued.
 
 use anyhow::Context as _;
 use hcore::hasync::Cancellable;
@@ -47,6 +49,14 @@ if [ -t 0 ] && [ -t 1 ] && [ -t 2 ]; then tty=yes; fi
   echo "tty=$tty"
   for a in "$@"; do echo "arg=[$a]"; done
 } > "$HEPH_TEST_OUT"
+/usr/bin/tty > "$HEPH_TEST_OUT.tty"
+if [ "$HEPH_TEST_MODE" = stop ]; then
+  echo "tool-pid-$$."
+  echo "heph-pid-$PPID."
+  kill -STOP $$
+  echo "resumed-""after-fg"
+  exit 4
+fi
 if [ "$HEPH_TEST_MODE" = wait ]; then
   trap 'echo got-term >> "$HEPH_TEST_OUT.term"' TERM
   echo "trap-""ready"
