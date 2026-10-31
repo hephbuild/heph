@@ -1089,8 +1089,13 @@ impl StableRemoteManagedDriver {
                 .send(in_frame)
                 .context("queueing the run's start frame")?;
         }
-        // The move the message promised: the plugin's decoder closes it now,
-        // decoding it once. Nothing between here and the call can bail.
+        // The move the message promised: nothing between here and the call can
+        // bail, and from here the plugin's decoder owns it. One that fails before
+        // decoding the options (a start frame it cannot read, a method it does not
+        // know) answers with an error and never takes the number, so the slave
+        // stays open until heph exits: one fd, and a drain that ends at its limit
+        // rather than at EOF. Closing it here could double-close against a plugin
+        // that did decode it, which is the worse failure.
         let _moved = slave.map(std::os::fd::IntoRawFd::into_raw_fd);
         let resp_stream = self
             .inner
