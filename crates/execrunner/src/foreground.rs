@@ -267,6 +267,11 @@ fn spawn_inherited(
     let track = i32::try_from(child.id())
         .ok()
         .and_then(hproc::process_supervisor::register_child);
+    tracing::debug!(
+        pid = child.id(),
+        tracked = track.is_some(),
+        "foreground child spawned"
+    );
     Ok(ForegroundChild { child, track })
 }
 

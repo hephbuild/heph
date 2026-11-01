@@ -542,14 +542,29 @@ exec sleep 30
             .unwrap_or_default()
     };
     let pid_file = ws.root().join("hold.pid");
+    let log_file = ws.root().join("heph.log");
     let mut child = ws
         .cmd(&dist, &["run", "//app:hold"])
         .env("HEPH_E2E_PID", &pid_file)
+        .env("HEPH_LOG", "info,execrunner=debug")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(std::fs::File::create(&log_file)?)
         .spawn()?;
     let tool = read_pid(&pid_file);
+    // The pid file only proves the tool started. A SIGKILL between its spawn
+    // and `register_child` orphans it: an accepted race, documented at the top
+    // of `process_supervisor/mod.rs`, and not what this test is about. So kill
+    // heph only once its log says the tool is tracked.
+    let tracked = format!("pid={tool} tracked=true");
+    common::wait_until(
+        "heph to track the tool with the supervisor",
+        Duration::from_secs(20),
+        || {
+            std::fs::read_to_string(&log_file)
+                .is_ok_and(|log| log.lines().any(|line| line.ends_with(&tracked)))
+        },
+    );
     let left = sandboxes();
     assert_eq!(left.len(), 1, "one live invocation: {left:?}");
     common::signal(i32::try_from(child.id())?, libc::SIGKILL);
