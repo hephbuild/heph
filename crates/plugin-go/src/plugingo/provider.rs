@@ -878,6 +878,7 @@ const RUNNER_AWARE_DRIVERS: &[&str] = &[
     "exec",
     "go.golist",
     "go.compile",
+    "go.download",
     "go.lint",
     "go.format",
     "go.format_check",

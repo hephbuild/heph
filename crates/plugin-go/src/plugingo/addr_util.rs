@@ -411,25 +411,19 @@ pub fn go_goroot_prelude(go_version: &str) -> Vec<String> {
 /// [`go_goroot_prelude`] plus a sandbox-local `GOCACHE` so the build cache is
 /// neither read from nor written to the host.
 ///
-/// Not for glob/tree-output targets (the download target's `**/*` would capture
-/// the cache dir) — those use [`go_goroot_prelude`] directly.
+/// Not for glob/tree-output targets (a `**/*` output would capture the cache dir)
+/// — those use [`go_goroot_prelude`] directly.
 pub fn go_run_prelude(go_version: &str) -> Vec<String> {
     let mut p = go_goroot_prelude(go_version);
     p.push("export GOCACHE=\"$PWD/.heph-gocache\"".to_string());
     p
 }
 
-/// Hashed `env` map shared by Go compile/link targets: disable cgo, pin the
-/// toolchain to the (hermetic) local SDK, and ignore any workspace `go.work`.
-/// GOOS/GOARCH stay in `runtime_env` (the target addr's factor args already key
-/// the cache per platform).
-pub fn go_build_env() -> Value {
-    build_env("0")
-}
-
-/// [`go_build_env`] for a target that builds under a concrete factor set: same
-/// map, but `CGO_ENABLED` follows the factors — `1` for a race build off darwin,
-/// which needs cgo to pull in `runtime/race` (see
+/// Hashed `env` map shared by Go compile/link targets: pin the toolchain to the
+/// (hermetic) local SDK and ignore any workspace `go.work`. GOOS/GOARCH stay in
+/// `runtime_env` (the target addr's factor args already key the cache per
+/// platform). `CGO_ENABLED` follows the factors — `1` for a race build off
+/// darwin, which needs cgo to pull in `runtime/race` (see
 /// [`crate::plugingo::factors::cgo_required`]), `0` for everything else.
 pub fn go_build_env_for(factors: &crate::plugingo::factors::Factors) -> Value {
     build_env(factors.cgo_enabled_value())

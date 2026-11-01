@@ -411,6 +411,9 @@ fn make_workspace_ordered_runner(
             .with_managed_driver(Box::new(
                 plugingo::GoCompileDriver::new().with_default_runner(r.clone()),
             ))
+            .with_managed_driver(Box::new(
+                plugingo::GoDownloadDriver::new().with_default_runner(r.clone()),
+            ))
             .with_managed_driver(Box::new(plugingo::GoTestmainDriver))
             .with_managed_driver(Box::new(
                 plugingo::GoLintDriver::new().with_default_runner(r.clone()),

@@ -239,15 +239,46 @@ async fn test_thirdparty_asm_build_lib_compiles() -> anyhow::Result<()> {
         }
         Err(e) => {
             let msg = format!("{e:?}").to_lowercase();
-            let networky = msg.contains("download")
-                || msg.contains("go mod")
-                || msg.contains("dial")
+            // Not "download": the failing target's own address contains it, so
+            // that word skipped every failure of the download target itself.
+            let networky = msg.contains("dial")
                 || msg.contains("lookup")
                 || msg.contains("connection")
                 || msg.contains("proxy")
                 || msg.contains("timeout");
             if networky {
                 eprintln!("skipping thirdparty asm e2e (module download unavailable): {e:?}");
+            } else {
+                return Err(e);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A module download through the hermetic SDK: the configuration in which the
+/// target once failed with `awk: command not found`, because a real build has no
+/// host directories on `PATH`. Needs the SDK and the module, so an unreachable
+/// network skips; any other failure fails.
+#[tokio::test]
+async fn test_thirdparty_download_with_hermetic_sdk() -> anyhow::Result<()> {
+    let dir = fixture("thirdparty_asm")?;
+    let ws = make_workspace_hermetic(dir)?;
+    let download = "//@heph/go/thirdparty/github.com/klauspost/cpuid/v2@v2.2.5:download";
+    match ws.run(download).await {
+        Ok(result) => {
+            assert!(
+                !artifact_paths(&result).is_empty(),
+                "download should expose the module's files"
+            );
+        }
+        Err(e) => {
+            let msg = format!("{e:?}").to_lowercase();
+            let networky = ["dial", "lookup", "connection", "timeout"]
+                .iter()
+                .any(|needle| msg.contains(needle));
+            if networky {
+                eprintln!("skipping hermetic download e2e (network unavailable): {e:?}");
             } else {
                 return Err(e);
             }

@@ -11,8 +11,8 @@
 
 use hdriver_support::driver_managed::ManagedDriver;
 use hplugin_go::plugingo::{
-    GoCompileDriver, GoFormatCheckDriver, GoFormatDriver, GoGolistDriver, GoLintDriver,
-    GoLintFixDriver, GoLintGateDriver, GoTestmainDriver, GoToolchainDriver, Provider,
+    GoCompileDriver, GoDownloadDriver, GoFormatCheckDriver, GoFormatDriver, GoGolistDriver,
+    GoLintDriver, GoLintFixDriver, GoLintGateDriver, GoTestmainDriver, GoToolchainDriver, Provider,
 };
 use plugin_sdk::stabby::abi::{
     DynFunctionRegistry, DynLogSink, DynRunnerHost, DynSupervisor, NamedDriver, PluginComponents,
@@ -155,6 +155,12 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
     drivers.push(NamedDriver {
         name: "compile".into(),
         driver: make_dyn_managed_driver(compile),
+    });
+    let download: Arc<dyn ManagedDriver> =
+        Arc::new(GoDownloadDriver::new().with_default_runner(go_runner.clone()));
+    drivers.push(NamedDriver {
+        name: "download".into(),
+        driver: make_dyn_managed_driver(download),
     });
     let testmain: Arc<dyn ManagedDriver> = Arc::new(GoTestmainDriver);
     drivers.push(NamedDriver {
