@@ -381,7 +381,10 @@ jobs:
   build:
     name: Build ${{ matrix.os }}/${{ matrix.arch }}
     runs-on: ${{ matrix.runs-on }}
-    timeout-minutes: 30
+    # A backstop for a hung job, not a budget: a cold cache (a PR whose
+    # `kache-pr/v2` objects expired) took 18-19 min on linux and over 30 on
+    # darwin, and that has to fit with room to spare.
+    timeout-minutes: 90
     needs: [gen, govet, prerelease_create]
     # heph-bench's only consumer on a PR is `perfbench`, which runs only with
     # the `ci/perf-test` label, so an unlabelled PR skips one of the build's
@@ -974,7 +977,8 @@ jobs:
   lint:
     name: Lint ${{ matrix.os }}/${{ matrix.arch }}
     runs-on: ${{ matrix.runs-on }}
-    timeout-minutes: 30
+    # A backstop for a hung job, not a budget: cold, darwin took 15 min.
+    timeout-minutes: 45
     needs: gen
     strategy:
       fail-fast: false
