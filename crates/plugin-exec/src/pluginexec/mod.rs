@@ -21,6 +21,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, Write};
+use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io;
@@ -479,11 +480,58 @@ fn bash_args_shell(sandbox_dir: &std::path::Path, run: &[String]) -> anyhow::Res
 
     Ok(bash_args(
         vec!["-i".to_string()],
-        vec![
-            "--rcfile".to_string(),
-            init_path.to_string_lossy().into_owned(),
-        ],
+        vec!["--norc".to_string()],
     ))
+}
+
+/// The caller's `PROMPT_COMMAND`, while heph's own holds that name. `init.sh`
+/// puts it back and unsets this.
+const CALLER_PROMPT_COMMAND_ENV: &str = "__HEPH_PROMPT_COMMAND";
+
+/// What bash runs just before a `--shell`'s first prompt: `init.sh`, in the
+/// interactive shell itself, so its `"$@"` is the shell's.
+///
+/// A failed source goes on to a session with no helpers, so it says so. `init.sh`
+/// clears this variable on its first lines; if it was never read, nothing has, and
+/// the failure path does, or this runs before every prompt and reaches every child.
+/// Built from bytes because a sandbox path need not be UTF-8.
+fn shell_prompt_command(init: &std::path::Path) -> OsString {
+    let mut out = b". '".to_vec();
+    for &b in init.as_os_str().as_bytes() {
+        if b == b'\'' {
+            out.extend_from_slice(b"'\\''");
+        } else {
+            out.push(b);
+        }
+    }
+    out.extend_from_slice(
+        format!(
+            "' || {{ echo \"heph: the shell's setup failed to load (status $?), so its helpers \
+             may be missing\" >&2; [ -z \"${{{CALLER_PROMPT_COMMAND_ENV}+x}}\" ] || {{ \
+             PROMPT_COMMAND=${CALLER_PROMPT_COMMAND_ENV}; unset {CALLER_PROMPT_COMMAND_ENV}; \
+             [ -n \"$PROMPT_COMMAND\" ] || unset PROMPT_COMMAND; }}; }}"
+        )
+        .as_bytes(),
+    );
+    OsString::from_vec(out)
+}
+
+/// The environment only a `--shell`'s bash needs, on top of the finished one.
+///
+/// After the size filter, which must not be able to evict the variable that
+/// starts the session, and after the base env, whose `PROMPT_COMMAND` is the
+/// caller's. Nothing here is on the def, so none of it reaches a hash.
+fn add_shell_env(env: &mut Vec<(OsString, OsString)>, init: &std::path::Path) {
+    let caller = env
+        .iter()
+        .find(|(k, _)| k == "PROMPT_COMMAND")
+        .map_or_else(OsString::new, |(_, v)| v.clone());
+    // Apple's bash checks this before the first prompt, so `init.sh` is too late.
+    let silence = "BASH_SILENCE_DEPRECATION_WARNING";
+    env.retain(|(k, _)| k != "PROMPT_COMMAND" && k != CALLER_PROMPT_COMMAND_ENV && k != silence);
+    env.push((CALLER_PROMPT_COMMAND_ENV.into(), caller));
+    env.push(("PROMPT_COMMAND".into(), shell_prompt_command(init)));
+    env.push((silence.into(), "1".into()));
 }
 
 /// Threshold above which the bash command body is spilled to a script file
@@ -1707,8 +1755,9 @@ impl Driver {
     }
 
     /// The `--shell` argv of a run that accepts args (E11): an interactive
-    /// bash whose rcfile is `init.sh` in args mode and whose positional
-    /// parameters are the caller's args (appended by the caller after `--`).
+    /// bash reading no config, with `init.sh` in args mode written for
+    /// [`add_shell_env`] to start, and whose positional parameters are the
+    /// caller's args (appended by the caller after `--`).
     /// `init.sh`'s one command line is what the run itself would execute:
     /// exec's argv, or bash's invocation of the script with its `$0`.
     fn args_mode_shell(
@@ -1733,8 +1782,7 @@ impl Driver {
         Ok(vec![
             "bash".to_string(),
             "--noprofile".to_string(),
-            "--rcfile".to_string(),
-            init.to_string_lossy().into_owned(),
+            "--norc".to_string(),
             "-i".to_string(),
             "-s".to_string(),
             "--".to_string(),
@@ -2199,7 +2247,10 @@ impl Driver {
         // The run's own layers sit on the caller's base env, which is neither
         // filtered nor converted: it reaches the process byte for byte (E6).
         let has_base_env = options.base_env.is_some();
-        let env_pairs = layer_env(options.base_env.unwrap_or_default(), env_vec);
+        let mut env_pairs = layer_env(options.base_env.unwrap_or_default(), env_vec);
+        if shell {
+            add_shell_env(&mut env_pairs, &rreq.sandbox_dir.join("init.sh"));
+        }
         let spawn_size = SpawnSize::of(&program, &args_os, &env_pairs);
 
         let cwd = match options.cwd {
@@ -3325,7 +3376,7 @@ mod tests {
         let without = digest(&[]);
         assert_eq!(
             (with.as_str(), without.as_str()),
-            ("50a976451839979a", "212c40f66956e0eb")
+            ("14a552b786b826c4", "d43dffadc812866d")
         );
     }
 

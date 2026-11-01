@@ -1,6 +1,14 @@
+# Run from PROMPT_COMMAND, by a bash started with --norc, just before its first
+# prompt. That PROMPT_COMMAND was heph's, so it goes first; the caller's, if any,
+# came in under a private name.
+if [ -n "${__HEPH_PROMPT_COMMAND-}" ]; then
+  PROMPT_COMMAND=$__HEPH_PROMPT_COMMAND
+else
+  unset PROMPT_COMMAND
+fi
+unset __HEPH_PROMPT_COMMAND
 set -uEo pipefail
 export PS1='$ '
-export BASH_SILENCE_DEPRECATION_WARNING=1
 
 __heph_render_banner() {
   # Color codes via ANSI-C quoting ($'…' interprets \e regardless of echo/xpg
@@ -23,13 +31,9 @@ echo "=========== Help ==========="
 echo 'Shell mode, to exit; run exit or ctrl-d'
 {% if args_mode %}
 # The caller's args are this shell's positional parameters, copied at top level
-# because run and xrun are functions with their own "$@". An interactive bash
-# binds them only after reading its rcfile, so they are taken again just before
-# the first prompt, which then steps aside for any PROMPT_COMMAND of the
-# caller's. (`${1+"$@"}`: bash 3.2's `set -u` trips on a bare "$@".)
+# because run and xrun are functions with their own "$@".
+# (`${1+"$@"}`: bash 3.2's `set -u` trips on a bare "$@".)
 __heph_args=(${1+"$@"})
-__heph_prompt_command=${PROMPT_COMMAND-}
-PROMPT_COMMAND='__heph_args=(${1+"$@"}); PROMPT_COMMAND=$__heph_prompt_command; showl'
 # Each helper runs the command with its own args when given any, the ones
 # `heph run` was given otherwise. A bare call always means the originals.
 # (The `+` form keeps an empty array from tripping `set -u` on bash 3.2.)
@@ -60,6 +64,7 @@ echo "show [args…]  : Prints the command, args shell-quoted"
 echo "showl [args…] : Same with line numbers"
 echo ''
 echo "============ Run ==========="
+showl
 {% elif cmds %}
 # Commands as an array (one element per line) so the runN helpers can replay a
 # prefix without re-emitting every line
@@ -110,3 +115,6 @@ echo "============ Run ==========="
 showl
 {% endif %}
 echo ''
+# This prompt's turn of the caller's PROMPT_COMMAND, which bash will not run on
+# its own: it is running this file instead. Its failure is not this file's.
+if [ -n "${PROMPT_COMMAND-}" ]; then eval "$PROMPT_COMMAND" || :; fi

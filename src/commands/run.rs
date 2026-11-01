@@ -100,6 +100,9 @@ pub struct RunArgs {
     /// into the member you want instead. Likewise for a multi-target selection,
     /// which names no single target at all.
     ///
+    /// The shell opens where the tool would run, and reads no system or personal
+    /// bash config, so your aliases and prompt setup are absent.
+    ///
     /// The session is neither logged nor redacted, so `env` in it shows any
     /// credentials the target declares.
     #[arg(long = "shell", num_args = 0..=1, require_equals = true, default_missing_value = "", value_name = "TARGET",)]

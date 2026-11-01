@@ -180,6 +180,19 @@ impl ShellSession {
     /// real terminal would (the inline TUI viewport blocks on one during its
     /// own setup on the outer terminal, before shell mode takes over).
     fn spawn(dist: &Dist, cwd: &std::path::Path, args: &[&str]) -> Self {
+        let home = tempfile::tempdir().expect("home tempdir");
+        Self::spawn_with(dist, cwd, args, home.path(), None)
+    }
+
+    /// [`Self::spawn`] with the caller's `HOME` and `PROMPT_COMMAND` chosen,
+    /// the latter removed when `None` so a test host's cannot leak in.
+    fn spawn_with(
+        dist: &Dist,
+        cwd: &std::path::Path,
+        args: &[&str],
+        home: &std::path::Path,
+        prompt_command: Option<&str>,
+    ) -> Self {
         const ROWS: u16 = 40;
         const COLS: u16 = 140;
 
@@ -192,13 +205,16 @@ impl ShellSession {
             })
             .expect("open pty");
 
-        let home = tempfile::tempdir().expect("home tempdir");
         let mut cmd = CommandBuilder::new(dist.heph());
         for arg in args {
             cmd.arg(arg);
         }
         cmd.cwd(cwd);
-        cmd.env("HOME", home.path());
+        cmd.env("HOME", home);
+        match prompt_command {
+            Some(value) => cmd.env("PROMPT_COMMAND", value),
+            None => cmd.env_remove("PROMPT_COMMAND"),
+        }
         cmd.env("HEPH_CWD", cwd);
         cmd.env("HEPH_NO_SELF_UPDATE", "1");
         cmd.env("HEPH_DISABLE_TELEMETRY", "1");
@@ -806,6 +822,104 @@ fn entrypoint_shell_pty() {
         entrypoint_shell_dirs(ws.root()).is_empty(),
         "the invocation's sandbox (and its init file) outlived the shell"
     );
+}
+
+/// An entrypoint and a build target that passes `PROMPT_COMMAND` through.
+const PROMPT_COMMAND_BUILD: &str = "target(name = \"tool\", driver = \"exec\", entrypoint = True, \
+     args = True, run = [\"/bin/sh\", \"-c\", \"printf '<%s>' \\\"$@\\\"; echo\", \"tool\"])\n\
+     target(name = \"built\", driver = \"bash\", run = \"true\", cache = False, \
+     runtime_pass_env = [\"PROMPT_COMMAND\"])\n";
+
+/// A caller's `PROMPT_COMMAND` is back once the session is up, in an entrypoint's
+/// shell and a build target's, having run on every prompt from the first. heph's
+/// own is gone, its private variable reaches neither the shell nor a child, and
+/// the banner and `showl` printed once each.
+#[test]
+fn shell_keeps_the_callers_prompt_command() {
+    let dist = Dist::locate();
+    let ws = common::Workspace::new().expect("workspace");
+    ws.write("pkg/BUILD", PROMPT_COMMAND_BUILD)
+        .expect("write BUILD");
+    let home = tempfile::tempdir().expect("home tempdir");
+    for (args, value, want) in [
+        (
+            &["run", "--shell", "//pkg:tool", "--", "a b"][..],
+            Some("heph_pc=x${heph_pc-}"),
+            // The first prompt, and the one after `ready`'s line.
+            "pc=[heph_pc=x${heph_pc-}] ran=[xx] private=[gone] children=[0]",
+        ),
+        (
+            &["run", "--shell", "//pkg:built"][..],
+            Some("heph_pc=x${heph_pc-}"),
+            "pc=[heph_pc=x${heph_pc-}] ran=[xx] private=[gone] children=[0]",
+        ),
+        (
+            &["run", "--shell", "//pkg:tool"][..],
+            None,
+            "pc=[gone] ran=[] private=[gone] children=[0]",
+        ),
+    ] {
+        let mut session = ShellSession::spawn_with(&dist, ws.root(), args, home.path(), value);
+        session.ready();
+        session.send_str(
+            "echo \"pc=[${PROMPT_COMMAND-gone}] ran=[${heph_pc-}] \
+             private=[${__HEPH_PROMPT_COMMAND-gone}] \
+             children=[$(/usr/bin/env | /usr/bin/grep -c __HEPH_)]\"\n",
+        );
+        session.wait_for(want, DEADLINE);
+        session.wait_for(PROMPT, DEADLINE);
+
+        let out = session.output_lossy();
+        assert_eq!(out.matches("Shell mode, to exit").count(), 1, "{out}");
+        assert_eq!(out.matches("1 │ ").count(), 1, "{out}");
+        assert!(!out.contains("heph: the shell's setup"), "{out}");
+        // Apple's bash says this at startup unless the variable is in its
+        // environment already; init.sh is too late to set it.
+        assert!(!out.contains("default interactive shell"), "{out}");
+
+        session.send_str("exit\n");
+        let (exited, _, success) = session.wait_exit(DEADLINE);
+        assert!(exited && success, "{}", session.output_lossy());
+    }
+}
+
+/// A `.bashrc` or profile of the caller's does not run: the shell stays where the
+/// tool would run and sets nothing of theirs.
+///
+/// **This does not prove the bug it sits beside.** The bug is a *system* rc, a
+/// path compiled into bash (`/etc/bash.bashrc` on Debian), which a test cannot
+/// replace without writing `/etc`, and `--rcfile` already kept `~/.bashrc` out, so
+/// this was green before the fix too. It guards the rest of `--norc`'s job.
+/// `shell_argv_reads_no_config` pins the flags; the system rc itself was measured
+/// by hand in a Debian container.
+#[test]
+fn shell_reads_no_personal_bash_config() {
+    let dist = Dist::locate();
+    let ws = common::Workspace::new().expect("workspace");
+    ws.write("pkg/BUILD", PROMPT_COMMAND_BUILD)
+        .expect("write BUILD");
+    let home = tempfile::tempdir().expect("home tempdir");
+    for rc in [".bashrc", ".bash_profile", ".bash_login", ".profile"] {
+        std::fs::write(home.path().join(rc), "cd /; export HEPH_RC_RAN=1\n").expect("write rc");
+    }
+    let mut session = ShellSession::spawn_with(
+        &dist,
+        ws.root(),
+        &["run", "--shell", "//pkg:tool"],
+        home.path(),
+        None,
+    );
+    session.ready();
+    session.send_str("echo \"rc=[${HEPH_RC_RAN-none}] pwd=[$(/bin/pwd)]\"\n");
+    let root = std::fs::canonicalize(ws.root()).expect("canonicalize");
+    session.wait_for(
+        &format!("rc=[none] pwd=[{}]", root.display()),
+        Duration::from_secs(10),
+    );
+    session.wait_for(PROMPT, DEADLINE);
+    session.send_str("exit\n");
+    let (exited, _, success) = session.wait_exit(DEADLINE);
+    assert!(exited && success, "{}", session.output_lossy());
 }
 
 /// What the `run` helper executes in the two tests below: it reports the wrap

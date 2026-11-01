@@ -7,7 +7,6 @@
 use super::*;
 use hplugin::driver::{CredentialMount, Foreground, RunOptions, RunStdio, Signal};
 use std::ffi::OsStr;
-use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 
 /// A sandbox laid out as the managed layer lays it out:
 /// `<root>/sbx`, `<root>/sbx/ws`, `<root>/sbx/ws/pkg`.
@@ -521,8 +520,7 @@ fn bashes() -> Vec<String> {
     found
 }
 
-/// Source `init` with `args` as the positional parameters, as the interactive
-/// shell's rcfile sees them, then run `snippet`.
+/// Source `init` with `args` as the positional parameters, then run `snippet`.
 fn in_shell(
     bash: &str,
     init: &std::path::Path,
@@ -559,9 +557,8 @@ fn args_mode_init(dir: &std::path::Path) -> Vec<String> {
         .expect("args mode")
 }
 
-/// `args: None` renders `init.sh` byte for byte as before the option existed,
-/// `runN` included, for exec and bash (E11): the digests are the render's
-/// before args mode existed.
+/// `args: None` renders the same `init.sh` through each driver's wrapper,
+/// `runN` included, for exec and bash (E11), pinned by digest.
 #[test]
 fn shell_init_without_args_is_unchanged() {
     let digest = |text: &str| {
@@ -575,11 +572,11 @@ fn shell_init_without_args_is_unchanged() {
     ];
     assert_eq!(
         digest(&render_shell_init(&run).expect("render")),
-        "50a976451839979a"
+        "14a552b786b826c4"
     );
     assert_eq!(
         digest(&render_shell_init(&[]).expect("render")),
-        "212c40f66956e0eb"
+        "d43dffadc812866d"
     );
 
     // What `run_shell` writes without args: the same render, through each
@@ -710,10 +707,10 @@ fn shell_init_args_exact() {
             "{bash}: set -u, no args; {err}"
         );
 
-        // The real shape: an interactive bash reading the file as its rcfile,
-        // the args as its positional parameters, the commands on stdin, and a
-        // multi-line PROMPT_COMMAND of the caller's restored after the first
-        // prompt. Its own status is the session's.
+        // The real shape: an interactive bash reading the file from
+        // PROMPT_COMMAND, the args as its positional parameters, the commands
+        // on stdin, and a multi-line PROMPT_COMMAND of the caller's restored.
+        // Its own status is the session's.
         let argv = args_mode_init(dir.path());
         let (program, rest) = argv.split_first().expect("argv");
         assert_eq!(program, "bash");
@@ -722,7 +719,10 @@ fn shell_init_args_exact() {
             .args(rest)
             .args(&given)
             .env_clear()
-            .env("PROMPT_COMMAND", "__caller_pc=1\n__caller_pc2=2")
+            .envs(shell_env(
+                &[("PROMPT_COMMAND", "__caller_pc=1\n__caller_pc2=2")],
+                &init,
+            ))
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
@@ -754,4 +754,234 @@ fn shell_init_args_exact() {
             "{bash}: `exit 3` is the session's status"
         );
     }
+}
+
+/// `caller` as the finished environment, with what only a `--shell` adds.
+fn shell_env(caller: &[(&str, &str)], init: &std::path::Path) -> Vec<(OsString, OsString)> {
+    let mut env: Vec<(OsString, OsString)> = caller.iter().map(|(k, v)| kv(k, v)).collect();
+    add_shell_env(&mut env, init);
+    env
+}
+
+/// Everything an interactive `bash` with `argv` printed, given one typed line.
+/// Returns stdout, stderr and the exit code.
+fn interactive(
+    bash: &str,
+    argv: &[String],
+    args: &[&str],
+    env: &[(OsString, OsString)],
+    typed: &str,
+) -> (String, String, Option<i32>) {
+    use std::io::Write as _;
+    let (_, rest) = argv.split_first().expect("argv");
+    let mut child = std::process::Command::new(bash)
+        .args(rest)
+        .args(args)
+        .env_clear()
+        .envs(env.iter().map(|(k, v)| (k, v)))
+        // `showl` needs a `cat`, and a nix bash's default `PATH` has none.
+        .env("PATH", "/usr/bin:/bin")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn interactive bash");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(format!("{typed}\n").as_bytes())
+        .expect("type");
+    let done = child.wait_with_output().expect("wait");
+    (
+        String::from_utf8_lossy(&done.stdout).into_owned(),
+        String::from_utf8_lossy(&done.stderr).into_owned(),
+        done.status.code(),
+    )
+}
+
+/// What a line typed at the prompt reports about the variables `init.sh` owns:
+/// their values in the shell, then how many of them a child inherits.
+const REPORT: &str = "echo BEGIN; printf '[%s][%s]\\n' \"${PROMPT_COMMAND-unset}\" \
+    \"${__HEPH_PROMPT_COMMAND-unset}\"; /usr/bin/env | /usr/bin/grep -c PROMPT_COMMAND; exit 3";
+
+/// `--shell` reads no bash config at all, in every mode: `--norc` is what keeps
+/// a Debian bash's compiled-in `/etc/bash.bashrc` out, which `--rcfile` does not.
+#[test]
+fn shell_argv_reads_no_config() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let run = ["true".to_string()];
+    let argvs = [
+        (Driver::new_exec().wrap_run_shell)(dir.path(), &run).expect("exec"),
+        (Driver::new_bash().wrap_run_shell)(dir.path(), &run).expect("bash"),
+        args_mode_init(dir.path()),
+    ];
+    for argv in &argvs {
+        let at = |flag: &str| argv.iter().position(|a| a == flag);
+        let interactive = at("-i").unwrap_or_else(|| panic!("no -i: {argv:?}"));
+        for flag in ["--norc", "--noprofile"] {
+            // A long option after a short one is not read as an option at all.
+            assert!(
+                at(flag).is_some_and(|i| i < interactive),
+                "{flag} ahead of -i: {argv:?}"
+            );
+        }
+        assert_eq!(at("--rcfile"), None, "{argv:?}");
+        assert!(
+            !argv.iter().any(|a| a.contains("init.sh")),
+            "init.sh travels in the environment: {argv:?}"
+        );
+    }
+    assert!(dir.path().join("init.sh").is_file());
+}
+
+/// The init path reaches `PROMPT_COMMAND` exactly, quoted for bash byte by byte,
+/// and the caller's value moves aside rather than being lost.
+#[test]
+fn shell_env_carries_the_init_path_and_the_callers_prompt_command() {
+    let get = |env: &[(OsString, OsString)], key: &str| {
+        env.iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_bytes().to_vec())
+    };
+
+    let init = std::path::Path::new(OsStr::from_bytes(b"/sbx/a b'c\xff/init.sh"));
+    let env = shell_env(&[("KEEP", "1"), ("PROMPT_COMMAND", "mine")], init);
+    let pc = get(&env, "PROMPT_COMMAND").expect("PROMPT_COMMAND");
+    let want: &[u8] = b". '/sbx/a b'\\''c\xff/init.sh' || ";
+    assert!(pc.starts_with(want), "{}", String::from_utf8_lossy(&pc));
+    assert_eq!(
+        get(&env, "__HEPH_PROMPT_COMMAND").as_deref(),
+        Some(&b"mine"[..])
+    );
+    assert_eq!(get(&env, "KEEP").as_deref(), Some(&b"1"[..]));
+    assert_eq!(
+        env.iter().filter(|(k, _)| k == "PROMPT_COMMAND").count(),
+        1,
+        "one PROMPT_COMMAND: {env:?}"
+    );
+
+    let env = shell_env(&[], init);
+    assert_eq!(
+        get(&env, "__HEPH_PROMPT_COMMAND").as_deref(),
+        Some(&b""[..])
+    );
+}
+
+/// The whole mechanism in a real interactive bash, on each one we can find:
+/// `init.sh` runs before the first prompt, once, in order, from a path needing
+/// quoting. `"$@"` is the caller's, `PROMPT_COMMAND` is gone or the caller's
+/// again, and the private variable reaches nothing.
+#[test]
+fn shell_init_runs_from_prompt_command() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let dir = root.path().join("a b'c");
+    std::fs::create_dir(&dir).expect("mkdir");
+    let init = dir.join("init.sh");
+    for bash in &bashes() {
+        for args_mode in [false, true] {
+            let argv = if args_mode {
+                args_mode_init(&dir)
+            } else {
+                (Driver::new_bash().wrap_run_shell)(&dir, &["echo the-command".to_string()])
+                    .expect("wrap")
+            };
+            let args: &[&str] = if args_mode { &["a b", ""] } else { &[] };
+            let what = format!("{bash} args_mode={args_mode}");
+
+            let env = shell_env(&[], &init);
+            let (out, err, code) = interactive(bash, &argv, args, &env, REPORT);
+            let after = out.split("BEGIN\n").nth(1).unwrap_or_default();
+            assert_eq!(after, "[unset][unset]\n0\n", "{what}: {out}\n{err}");
+            assert_eq!(code, Some(3), "{what}: {err}");
+            assert!(!err.contains("heph:"), "{what}: {err}");
+            let order: Vec<_> = ["Shell mode, to exit", "=== Run ===", "1 │", "BEGIN"]
+                .iter()
+                .map(|needle| {
+                    assert_eq!(out.matches(needle).count(), 1, "{what}: {needle}: {out}");
+                    out.find(needle)
+                })
+                .collect();
+            assert!(order.is_sorted(), "{what}: {order:?}\n{out}");
+
+            // A caller's `PROMPT_COMMAND` is back, still exported as it was, and
+            // has had the first prompt's turn: bash would only run it from the
+            // second, and the typed line is read at the first.
+            let env = shell_env(&[("PROMPT_COMMAND", "__c=x${__c-}")], &init);
+            let (out, err, _) = interactive(
+                bash,
+                &argv,
+                args,
+                &env,
+                &REPORT.replace("echo BEGIN", "echo BEGIN \"<${__c-}>\""),
+            );
+            let after = out.split("BEGIN ").nth(1).unwrap_or_default();
+            assert_eq!(
+                after, "<x>\n[__c=x${__c-}][unset]\n1\n",
+                "{what}: {out}\n{err}"
+            );
+
+            if args_mode {
+                let env = shell_env(&[], &init);
+                let (out, err, _) = interactive(
+                    bash,
+                    &argv,
+                    args,
+                    &env,
+                    "echo BEGIN; printf '<%s>' \"$@\"; echo; run; exit",
+                );
+                let after = out.split("BEGIN\n").nth(1).unwrap_or_default();
+                assert_eq!(after, "<a b><>\n<a b><>", "{what}: {out}\n{err}");
+            }
+        }
+    }
+}
+
+/// A source that fails says so once, and the session is still usable, with
+/// `PROMPT_COMMAND` no longer heph's: both when the file was never read and when
+/// it stopped partway (the command lines are the target's, and can fail to parse).
+#[test]
+fn shell_init_failure_says_so_and_clears_prompt_command() {
+    const SAID: &str = "heph: the shell's setup failed to load";
+    let dir = tempfile::tempdir().expect("tempdir");
+    let init = dir.path().join("init.sh");
+    let argv =
+        (Driver::new_bash().wrap_run_shell)(dir.path(), &["if".to_string()]).expect("render");
+    let missing = dir.path().join("missing.sh");
+    for bash in &bashes() {
+        for path in [&missing, &init] {
+            for (caller, want) in [
+                (&[][..], "[unset][unset]\n0\n"),
+                (&[("PROMPT_COMMAND", ":")][..], "[:][unset]\n1\n"),
+            ] {
+                let what = format!("{bash} {path:?} {caller:?}");
+                let env = shell_env(caller, path);
+                let (out, err, code) = interactive(bash, &argv, &[], &env, REPORT);
+                assert_eq!(err.matches(SAID).count(), 1, "{what}: {err}");
+                let after = out.split("BEGIN\n").nth(1).unwrap_or_default();
+                assert_eq!(after, want, "{what}: {out}\n{err}");
+                assert_eq!(code, Some(3), "{what}: {err}");
+            }
+        }
+    }
+}
+
+/// Only a `--shell` gets any of this: a plain run sees the caller's
+/// `PROMPT_COMMAND` where it was, and none of the shell's variables.
+#[tokio::test]
+async fn shell_env_stays_out_of_a_plain_run() {
+    let exec = Driver::new_exec();
+    let def = sh(
+        "printf '[%s][%s][%s]' \"${PROMPT_COMMAND-unset}\" \"${__HEPH_PROMPT_COMMAND-unset}\" \
+         \"${BASH_SILENCE_DEPRECATION_WARNING-unset}\"",
+    );
+    let (ran, _sbx) = run_opts(&exec, &def, RunOptions::default()).await;
+    assert_eq!(ran.ok(), "[unset][unset][unset]");
+    let (ran, _sbx) = run_opts(
+        &exec,
+        &def,
+        RunOptions::default().with_base_env(vec![kv("PROMPT_COMMAND", "mine")]),
+    )
+    .await;
+    assert_eq!(ran.ok(), "[mine][unset][unset]");
 }

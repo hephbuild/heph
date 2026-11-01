@@ -276,6 +276,9 @@ parameters. `show` prints the command `run` would execute, with the arguments
 quoted; `run` runs it (`run --port 5000` replaces the arguments for that call);
 `exit 3` leaves the shell and heph exits 3.
 
+The shell reads no system or personal bash config, so your aliases and prompt
+setup are absent, and nothing in them can move it from where the tool would run.
+
 `--shell` always runs on heph's PTY, whatever the fds are. Its output is not
 logged or redacted, so `env` there shows your credentials. With no terminal, heph
 goes neither raw nor stops itself. A driver with a shell of its own that offers no
