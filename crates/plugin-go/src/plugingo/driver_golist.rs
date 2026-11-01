@@ -1,3 +1,4 @@
+use crate::plugingo::module_fetch::{add_fetch_env, is_settled_package_error};
 use crate::plugingo::pkg_analysis::{
     GoPackage, encode_go_package, encode_package_addrs, resolve_package_addrs,
 };
@@ -154,7 +155,9 @@ struct GoGolistDef {
 /// work could carry empty `EmbedFiles` for a now-resolvable embed, surfacing as
 /// `compute embedcfg: //go:embed pattern(s) matched no files` until evicted.
 /// v17: `firstparty` joined the def, changing every golist target's def hash.
-const GO_GOLIST_FORMAT_VERSION: u32 = 17;
+/// v18: a failed module fetch fails the target. It used to be cached as a package
+/// with no Go files, and those entries must not outlive the fix.
+const GO_GOLIST_FORMAT_VERSION: u32 = 18;
 
 /// The environment `go list` runs under.
 ///
@@ -198,31 +201,41 @@ fn golist_env(
     if !def.goexperiment.is_empty() {
         env.insert("GOEXPERIMENT".to_string(), def.goexperiment.join(","));
     }
-    for name in MODULE_FETCH_PASS_ENV {
+    add_fetch_env(&mut env, &host);
+    for name in GOLIST_ONLY_PASS_ENV {
         if let Some(v) = host(name) {
             env.insert(name.to_string(), v);
         }
     }
     // Non-hermetic toolchains: the `go` subprocess (or a hostbin/nix wrapper)
     // may need PATH — to locate ancillary tools, or for the wrapper itself.
-    // Hermetic mode deliberately omits it to stay PATH-independent.
-    if !matches!(
+    //
+    // A hermetic toolchain needs it only to reach `git`: resolving a module's
+    // packages can fetch that module directly. A stdlib listing fetches nothing and
+    // stays PATH-independent. With `CGO_ENABLED` pinned and no `-compiled`, `go
+    // list` runs no compiler, so all `PATH` can change is whether a fetch succeeds,
+    // and `check_package_resolved` fails the target when one doesn't. A runner
+    // brings its own `PATH`.
+    let hermetic = matches!(
         crate::plugingo::toolchain::classify(&def.go_version),
         crate::plugingo::toolchain::Toolchain::Hermetic(_)
-    ) && let Some(v) = host("PATH")
+    );
+    let reads_modules = def.firstparty || def.thirdparty_download_addr.is_some();
+    if def.runner.is_none()
+        && (!hermetic || reads_modules)
+        && let Some(v) = host("PATH")
     {
         env.insert("PATH".to_string(), v);
     }
     env
 }
 
-/// Host environment `go list` is allowed to see.
+/// Host environment `go list` is allowed to see: this and what `add_fetch_env` adds.
 ///
 /// Every entry decides **where module bytes come from**, never *what* is built:
-/// thirdparty metadata listing still consults the host module cache and proxy,
-/// and those bytes are content-addressed and `go.sum`-verified, so a different
-/// proxy cannot produce a different answer. First-party and stdlib reads stay
-/// fully hermetic via the staged SDK.
+/// a listing that reads modules still consults the host module cache and proxy,
+/// and those bytes are `go.sum`-verified, so a different proxy cannot produce a
+/// different answer. A stdlib listing stays fully hermetic via the staged SDK.
 ///
 /// That rule is what makes the passthrough safe, because **none of these reach
 /// any hash** — not `GoGolistDef`'s, not the shared `GOCACHE` key. A variable
@@ -233,14 +246,7 @@ fn golist_env(
 /// `-mod=vendor`, `-tags=…`, `-buildvcs=…` — flags that change which files
 /// `go list` selects and what it reports. It is gone. Nothing goes back on this
 /// list unless it only answers "where do the bytes come from".
-const MODULE_FETCH_PASS_ENV: &[&str] = &[
-    "GOPATH",
-    "GOMODCACHE",
-    "HOME",
-    "GONOSUMDB",
-    "GOPRIVATE",
-    "GOPROXY",
-];
+const GOLIST_ONLY_PASS_ENV: &[&str] = &["GOMODCACHE"];
 
 impl Hash for GoGolistDef {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -578,6 +584,7 @@ impl ManagedDriver for GoGolistDriver {
         let pkg = pkgs.into_iter().next().ok_or_else(|| {
             anyhow::anyhow!("go list returned no entry matching {}", def.import_path)
         })?;
+        check_package_resolved(def, &pkg, &output.stderr)?;
 
         let package_bin = encode_go_package(&pkg).context("encode package.bin")?;
         std::fs::write(req.sandbox_pkg_dir.join("package.bin"), &package_bin)
@@ -638,6 +645,39 @@ impl ManagedDriver for GoGolistDriver {
             .context("write package_addrs.bin")?;
 
         Ok(ManagedRunResponse { artifacts: vec![] })
+    }
+}
+
+/// Fail the target when `go list -e` could not resolve a package, rather than cache
+/// its error as a package with no Go files. See [`is_settled_package_error`].
+///
+/// First-party too: a required module whose path is a prefix of a first-party
+/// package gets fetched to rule out an ambiguous import, so a failed fetch comes
+/// back with no Go files even though the sources are staged.
+fn check_package_resolved(
+    def: &GoGolistDef,
+    pkg: &GoPackage,
+    stderr: &[u8],
+) -> Result<(), crate::plugingo::errors::GoListError> {
+    match &pkg.error {
+        Some(error)
+            if (def.firstparty || def.thirdparty_download_addr.is_some())
+                && pkg.go_files.is_empty()
+                && !is_settled_package_error(&error.err) =>
+        {
+            Err(crate::plugingo::errors::GoListError {
+                import_path: def.import_path.clone(),
+                stderr_tail: format!(
+                    "{}\n{}\ngo could not resolve this package. To reproduce, run `go list {}` \
+                     in this module, in the same shell. A private module needs GOPRIVATE, `git` \
+                     on PATH and working credentials: see docs/GO_MODULES.md.",
+                    error.err,
+                    hplugin::error::last_n_lines(&String::from_utf8_lossy(stderr), 10),
+                    def.import_path
+                ),
+            })
+        }
+        _ => Ok(()),
     }
 }
 
@@ -1183,27 +1223,67 @@ mod tests {
         assert_eq!(
             passed,
             [
+                "GIT_ASKPASS",
+                "GIT_CONFIG_GLOBAL",
+                "GIT_SSH",
+                "GIT_SSH_COMMAND",
+                "GIT_SSL_CAINFO",
+                "GOAUTH",
+                "GOINSECURE",
                 "GOMODCACHE",
+                "GONOPROXY",
                 "GONOSUMDB",
                 "GOPATH",
                 "GOPRIVATE",
                 "GOPROXY",
-                "HOME"
+                "GOSUMDB",
+                "GOVCS",
+                "HOME",
+                "HTTPS_PROXY",
+                "HTTP_PROXY",
+                "NETRC",
+                "NIX_SSL_CERT_FILE",
+                "NO_PROXY",
+                "PATH",
+                "SSH_AUTH_SOCK",
+                "SSL_CERT_DIR",
+                "SSL_CERT_FILE",
+                "XDG_CONFIG_HOME",
+                "http_proxy",
+                "https_proxy",
+                "no_proxy",
             ],
             "only where-the-bytes-come-from may cross this boundary"
         );
     }
 
-    /// A hermetic toolchain must not see `PATH` — it resolves `go` from the
-    /// staged SDK, and a `PATH` leak is how a host tool silently substitutes for
-    /// a pinned one.
+    /// A hermetic listing that reads modules can run `git`, which it finds on
+    /// `PATH`. One that cannot fetch has no reason to see the host's directories,
+    /// and under a runner the runner's `PATH` is the one that counts.
     #[test]
-    fn a_hermetic_toolchain_gets_no_path() {
+    fn a_hermetic_toolchain_gets_path_only_to_fetch_modules() {
         let mut def = def_with(false, vec![]);
         def.go_version = "1.27.0".to_string();
+        def.firstparty = false;
+        def.thirdparty_download_addr = None;
+        assert!(
+            !env_for(&def, everything_set).contains_key("PATH"),
+            "stdlib"
+        );
+
+        def.firstparty = true;
+        assert!(env_for(&def, everything_set).contains_key("PATH"));
+        def.firstparty = false;
+        def.thirdparty_download_addr = Some("//m:download".to_string());
+        assert!(env_for(&def, everything_set).contains_key("PATH"));
+
+        let runner = TargetAddr::parse("//r:runner", &hmodel::htpkg::PkgBuf::from("")).unwrap();
+        def.runner = Some(runner.clone());
         assert!(!env_for(&def, everything_set).contains_key("PATH"));
 
         // A host toolchain does need it: `go` itself is found there.
+        def.runner = None;
+        def.thirdparty_download_addr = None;
         def.go_version = "host".to_string();
         assert_eq!(
             env_for(&def, everything_set)
@@ -1211,6 +1291,49 @@ mod tests {
                 .map(String::as_str),
             Some("host-PATH")
         );
+
+        // Under a runner, the same rule for every toolchain.
+        def.runner = Some(runner);
+        assert!(!env_for(&def, everything_set).contains_key("PATH"));
+    }
+
+    #[test]
+    fn a_listing_that_could_not_resolve_its_package_fails() {
+        let pkg = |err: &str, go_files: Vec<String>| GoPackage {
+            error: Some(crate::plugingo::pkg_analysis::GoPackageError {
+                err: err.to_string(),
+            }),
+            go_files,
+            ..Default::default()
+        };
+        let mut def = def_with(false, vec![]);
+        def.firstparty = false;
+        def.thirdparty_download_addr = Some("//m:download".to_string());
+        let unreachable = "a.b/c@v1: no secure protocol found for repository";
+
+        let err = check_package_resolved(&def, &pkg(unreachable, vec![]), b"missing Git command")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(unreachable), "{err}");
+        assert!(err.contains("missing Git command"), "{err}");
+
+        // An answer about the module's contents stays a package with no Go files.
+        let empty = pkg("build constraints exclude all Go files in /m", vec![]);
+        assert!(check_package_resolved(&def, &empty, b"").is_ok());
+        // Files were listed, so the package was resolved.
+        assert!(
+            check_package_resolved(&def, &pkg(unreachable, vec!["a.go".to_string()]), b"").is_ok()
+        );
+
+        // A first-party listing can lose its package to a failed fetch too.
+        def.thirdparty_download_addr = None;
+        def.firstparty = true;
+        assert!(check_package_resolved(&def, &pkg(unreachable, vec![]), b"").is_err());
+        assert!(check_package_resolved(&def, &empty, b"").is_ok());
+
+        // A stdlib listing fetches nothing.
+        def.firstparty = false;
+        assert!(check_package_resolved(&def, &pkg(unreachable, vec![]), b"").is_ok());
     }
 
     /// `CGO_ENABLED` is pinned rather than autodetected, because autodetection
@@ -1232,7 +1355,8 @@ mod tests {
     #[test]
     fn an_unset_host_variable_is_absent_rather_than_empty() {
         let env = env_for(&def_with(false, vec![]), |_| None);
-        for name in MODULE_FETCH_PASS_ENV {
+        let fetch = crate::plugingo::module_fetch::FETCH_ACCESS_ENV;
+        for name in fetch.iter().chain(GOLIST_ONLY_PASS_ENV) {
             assert!(!env.contains_key(*name), "{name} must be absent, not empty");
         }
         // The pinned values are still there.
@@ -1286,7 +1410,7 @@ mod tests {
     /// Pinned pre-`race` value of `def_hash(def_with(false, vec![]))`. Update it
     /// only alongside a deliberate `GO_GOLIST_FORMAT_VERSION` bump — a change
     /// here means every cached listing is being thrown away.
-    const NON_RACE_GOLIST_HASH: u64 = 642058481220411298;
+    const NON_RACE_GOLIST_HASH: u64 = 12427067391495276547;
 
     fn def_hash(def: &GoGolistDef) -> u64 {
         use std::hash::{Hash, Hasher};

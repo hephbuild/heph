@@ -7,8 +7,8 @@ mod common;
 
 use anyhow::Context as _;
 use common::{
-    artifact_paths, fixture, make_workspace, make_workspace_hermetic, make_workspace_host,
-    require_go,
+    HERMETIC_GO, artifact_paths, fixture, make_workspace, make_workspace_hermetic,
+    make_workspace_host, require_go,
 };
 
 #[tokio::test]
@@ -239,15 +239,55 @@ async fn test_thirdparty_asm_build_lib_compiles() -> anyhow::Result<()> {
         }
         Err(e) => {
             let msg = format!("{e:?}").to_lowercase();
-            let networky = msg.contains("download")
-                || msg.contains("go mod")
-                || msg.contains("dial")
+            // Not "download": the failing target's own address contains it, so
+            // that word skipped every failure of the download target itself.
+            let networky = msg.contains("dial")
                 || msg.contains("lookup")
                 || msg.contains("connection")
                 || msg.contains("proxy")
                 || msg.contains("timeout");
             if networky {
                 eprintln!("skipping thirdparty asm e2e (module download unavailable): {e:?}");
+            } else {
+                return Err(e);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A module download through the hermetic SDK, with real `go` and a real scratch
+/// module cache. Needs the network twice. A failure to get the SDK skips, and a
+/// failure of `go mod download` skips only on a network error; any other failure
+/// fails.
+#[tokio::test]
+async fn test_thirdparty_download_with_hermetic_sdk() -> anyhow::Result<()> {
+    let dir = fixture("thirdparty_asm")?;
+    let ws = make_workspace_hermetic(dir)?;
+    let sdk = format!("//@heph/go/toolchain/{HERMETIC_GO}:go");
+    if let Err(e) = ws.run(&sdk).await {
+        eprintln!("skipping hermetic download e2e (SDK unavailable): {e:?}");
+        return Ok(());
+    }
+    let download = "//@heph/go/thirdparty/github.com/klauspost/cpuid/v2@v2.2.5:download";
+    match ws.run(download).await {
+        Ok(result) => {
+            let paths = artifact_paths(&result);
+            for file in ["go.mod", "cpuid.go"] {
+                assert!(
+                    paths.iter().any(|p| p.ends_with(file)),
+                    "download should expose the module's {file}: {paths:?}"
+                );
+            }
+            assert!(!paths.iter().any(|p| p.ends_with("mod.json")), "{paths:?}");
+        }
+        Err(e) => {
+            let msg = format!("{e:?}").to_lowercase();
+            let networky = ["dial", "lookup", "connection", "timeout", "tls"]
+                .iter()
+                .any(|needle| msg.contains(needle));
+            if networky {
+                eprintln!("skipping hermetic download e2e (network unavailable): {e:?}");
             } else {
                 return Err(e);
             }

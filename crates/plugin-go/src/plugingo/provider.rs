@@ -82,8 +82,9 @@ pub struct Config {
     pub cctool: String,
     /// Exec runner every generated Go target runs its tooling under — the
     /// plugin's `runner:` option. Reaches the `go_*` drivers as their default,
-    /// and the **bash** targets this provider generates (the std install, the
-    /// thirdparty download) as their `runner` field.
+    /// and the targets this provider generates with a driver that has no such
+    /// default (the bash std install, the thirdparty download) as their `runner`
+    /// field.
     ///
     /// Both halves are needed. A `gotool = "host"` build under a runner where
     /// only the compile drivers followed it compiles packages with the
@@ -878,6 +879,7 @@ const RUNNER_AWARE_DRIVERS: &[&str] = &[
     "exec",
     "go.golist",
     "go.compile",
+    "go.download",
     "go.lint",
     "go.format",
     "go.format_check",
@@ -6114,6 +6116,17 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     async fn a_generated_bash_target_gets_the_runner() {
         let inner = provider_with_runner(Some("//tools/devenv:runner"));
         let mut spec = spec_with("bash", &[]);
+        inner.apply_runner(&mut spec);
+        assert_eq!(
+            spec.config.get("runner"),
+            Some(&Value::String("//tools/devenv:runner".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_generated_go_download_target_gets_the_runner() {
+        let inner = provider_with_runner(Some("//tools/devenv:runner"));
+        let mut spec = spec_with("go.download", &[]);
         inner.apply_runner(&mut spec);
         assert_eq!(
             spec.config.get("runner"),

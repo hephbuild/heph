@@ -100,6 +100,10 @@ is poking around, a session with no `ls` on `PATH` would be useless, and it
 builds nothing and reaches no cache key — so the argument for keeping the host
 out does not apply to it.
 
+A Go module fetch also gets the host's directories, because `go` has to find `git`
+and `git` has to find `ssh` and credential helpers. See
+[Fetching Go modules](GO_MODULES.md).
+
 A runner supplies the environment its targets run in, `PATH` included — the
 driver's search path is not injected under one, for the same reason the host's
 directories are not injected locally. A `wrap` runner that names no `PATH` gives

@@ -413,8 +413,20 @@ fn entrypoint_kill_under_a_terminal() -> anyhow::Result<()> {
     );
 
     // heph leads the PTY's session, so its group is its pid.
+    //
+    // The kernel's delivery and the relay's arrive close together, so the count
+    // after this is 2 if the shell coalesced them and 3 if it didn't. No one line
+    // is certain: bash can re-enter a trap between its two commands, and then both
+    // runs print the final count, `got-term-3` twice with no `got-term-2`.
     common::signal(-pty.pid(), libc::SIGTERM);
-    pty.wait_for("got-term-2", Duration::from_secs(20));
+    common::wait_until(
+        "the group TERM to reach the tool",
+        Duration::from_secs(20),
+        || {
+            let seen = pty.seen();
+            seen.contains("got-term-2") || seen.contains("got-term-3")
+        },
+    );
 
     pty.send(&[0x03]);
     pty.wait_for("got-int-1", Duration::from_secs(20));
@@ -422,8 +434,8 @@ fn entrypoint_kill_under_a_terminal() -> anyhow::Result<()> {
     pty.wait_for("got-int-2", Duration::from_secs(20));
     assert_eq!(pty.wait_exit(DEADLINE), Ended::Code(7), "{}", pty.seen());
     assert!(
-        !pty.seen().contains("got-term-3"),
-        "two TERMs sent, three delivered\n{}",
+        !pty.seen().contains("got-term-4"),
+        "the first TERM once, the group TERM at most twice: four is one too many\n{}",
         pty.seen()
     );
     assert!(pty.cursor_visible(), "cursor left hidden\n{}", pty.screen());

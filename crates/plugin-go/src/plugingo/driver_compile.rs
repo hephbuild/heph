@@ -887,7 +887,7 @@ impl GoCompileDriver {
 /// stdout, so a stderr-only message can come back blank — useless. Include both
 /// (labelled, last 20 lines each) and fall back to an explicit marker when both
 /// are empty, so the error always says something actionable.
-fn go_failure_detail(stdout: &str, stderr: &str) -> String {
+pub(crate) fn go_failure_detail(stdout: &str, stderr: &str) -> String {
     let stderr_tail = hplugin::error::last_n_lines(stderr.trim(), 20);
     let stdout_tail = hplugin::error::last_n_lines(stdout.trim(), 20);
     let mut detail = String::new();
