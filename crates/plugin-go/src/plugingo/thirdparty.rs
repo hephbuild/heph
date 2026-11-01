@@ -29,8 +29,12 @@ pub fn build_download_spec(
     go_version: &str,
 ) -> TargetSpec {
     let mod_at_ver = format!("{module}@{version}");
-    // Multi-line bash. `awk` parses `Dir` out of the JSON `go mod download`
-    // emits. The stub go.mod blocks Go from reading the project go.mod.
+    // Multi-line bash. The stub go.mod blocks Go from reading the project go.mod.
+    //
+    // `Dir` is parsed out of the JSON `go mod download` emits with `read`, a
+    // shell builtin. This used to be `awk`, which heph does not ship and which
+    // is not on a target's `PATH` (`docs/COREUTILS.md`), so it worked only where
+    // a test harness or `path:` put the host's directories back.
     //
     // A plain `cp -R`, with no platform branch. This used to pick `cp -RX` on
     // Darwin — BSD `cp` copies xattrs (`com.apple.quarantine` on Go's mod cache
@@ -59,7 +63,12 @@ pub fn build_download_spec(
         "printf 'module heph_ignore\\n' > go.mod".to_string(),
         format!("\"$GO\" mod download -modcacherw -json '{mod_at_ver}' > mod.json"),
         "rm go.mod".to_string(),
-        "MOD_DIR=$(awk -F'\"' '/\"Dir\": / { print $4 }' mod.json)".to_string(),
+        // One compound statement — keep its lines in a single entry.
+        "MOD_DIR=\n\
+         while IFS='\"' read -r _ key _ value _; do\n\
+           if [ \"$key\" = Dir ]; then MOD_DIR=$value; break; fi\n\
+         done < mod.json"
+            .to_string(),
         // One compound statement — keep its lines in a single entry.
         "if [ -z \"$MOD_DIR\" ]; then\n\
            echo 'go mod download produced no Dir' >&2\n\
@@ -328,6 +337,117 @@ mod tests {
             !run.contains("uname"),
             "the OS does not determine the `cp` dialect once a runner supplies \
              the environment: {run}"
+        );
+    }
+
+    /// Run the hermetic download recipe with real bash, the way the driver does,
+    /// on a `PATH` holding only a fake `go` and the builtin utilities it needs.
+    ///
+    /// The test workspaces build with `with_host_path()`, so a recipe calling a
+    /// host-only tool passes every one of them and then fails with `command not
+    /// found` in a real build, where the host's directories are not on `PATH`.
+    struct DownloadRun {
+        status: std::process::ExitStatus,
+        stderr: String,
+        sandbox: std::path::PathBuf,
+        _dir: tempfile::TempDir,
+    }
+
+    /// `json` is what the fake `go mod download -json` prints; `{MOD_DIR}` in it
+    /// stands for the module's directory, whose name contains a space.
+    fn run_download_recipe(json: &str) -> DownloadRun {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+
+        let mod_dir = root.join("mod cache/logr@v1.4.2");
+        std::fs::create_dir_all(mod_dir.join("sub")).expect("mkdir module");
+        std::fs::write(mod_dir.join("sub/logr.go"), "package logr\n").expect("write module");
+
+        let goroot_bin = root
+            .join("ws")
+            .join(crate::plugingo::toolchain::staged_goroot(V))
+            .join("bin");
+        std::fs::create_dir_all(&goroot_bin).expect("mkdir goroot");
+        let go = goroot_bin.join("go");
+        std::fs::write(&go, "#!/bin/sh\nprintf '%s\\n' \"$FAKE_GO_JSON\"\n").expect("write go");
+        std::fs::set_permissions(&go, std::fs::Permissions::from_mode(0o755)).expect("chmod go");
+
+        // Every name here is a builtin applet: nothing else is guaranteed to be
+        // on a target's `PATH`. A recipe that needs one more belongs here only
+        // if `crates/coreutils` ships it.
+        let tools = root.join("tools");
+        std::fs::create_dir(&tools).expect("mkdir tools");
+        for tool in ["cat", "chmod", "cp", "rm"] {
+            symlink(host_tool(tool), tools.join(tool)).expect("symlink tool");
+        }
+
+        let sandbox = root.join("ws/pkg");
+        std::fs::create_dir_all(&sandbox).expect("mkdir sandbox");
+
+        let spec = build_download_spec(download_addr(), "github.com/go-logr/logr", "v1.4.2", V);
+        let output = std::process::Command::new(host_tool("bash"))
+            .args(["--noprofile", "--norc", "-e", "-o", "pipefail", "-c"])
+            .arg(run_str(&spec))
+            .current_dir(&sandbox)
+            .env_clear()
+            .env("PATH", &tools)
+            .env("WORKSPACE_ROOT", root.join("ws"))
+            .env(
+                "FAKE_GO_JSON",
+                json.replace("{MOD_DIR}", mod_dir.to_str().expect("utf8 path")),
+            )
+            .output()
+            .expect("spawn bash");
+
+        DownloadRun {
+            status: output.status,
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            sandbox,
+            _dir: dir,
+        }
+    }
+
+    fn host_tool(name: &str) -> std::path::PathBuf {
+        let path = std::env::var_os("PATH").expect("PATH");
+        std::env::split_paths(&path)
+            .map(|dir| dir.join(name))
+            .find(|candidate| candidate.is_file())
+            .unwrap_or_else(|| panic!("{name} is not on PATH"))
+    }
+
+    #[test]
+    fn test_download_recipe_copies_the_module_with_only_builtin_tools() {
+        // The shape `go mod download -json` prints. `GoMod` precedes `Dir` and
+        // mentions the word, so matching anything looser than the key picks the
+        // wrong path.
+        let run = run_download_recipe(
+            "{\n\t\"Path\": \"github.com/go-logr/logr\",\n\t\"Version\": \"v1.4.2\",\n\t\
+             \"GoMod\": \"/nowhere/Dir/logr.mod\",\n\t\"Dir\": \"{MOD_DIR}\",\n\t\
+             \"Sum\": \"h1:abc=\"\n}",
+        );
+        assert!(run.status.success(), "{:?}: {}", run.status, run.stderr);
+        assert_eq!(
+            std::fs::read_to_string(run.sandbox.join("sub/logr.go")).expect("copied module"),
+            "package logr\n"
+        );
+        for scaffolding in ["go.mod", "mod.json"] {
+            assert!(
+                !run.sandbox.join(scaffolding).exists(),
+                "{scaffolding} would be collected by `out = \"**/*\"`"
+            );
+        }
+    }
+
+    #[test]
+    fn test_download_recipe_fails_when_go_reports_no_dir() {
+        let run = run_download_recipe("{\n\t\"Path\": \"github.com/go-logr/logr\"\n}");
+        assert_eq!(run.status.code(), Some(1), "{}", run.stderr);
+        assert!(
+            run.stderr.contains("go mod download produced no Dir"),
+            "{}",
+            run.stderr
         );
     }
 
