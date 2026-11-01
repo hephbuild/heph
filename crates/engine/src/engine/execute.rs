@@ -42,6 +42,15 @@ impl Engine {
             .get(&spec.driver)
             .ok_or_else(|| anyhow::anyhow!("driver not found: {}", spec.driver))
             .cloned()?;
+        // The backstop for a direct `result_addr` on an entrypoint: it runs
+        // only through `Engine::invoke`, never in a sandbox (D30, I8).
+        if def.target.entrypoint.is_some() {
+            return Err(crate::engine::invoke::EntrypointNotBuildable {
+                addr: addr.clone(),
+                selected: None,
+            }
+            .into());
+        }
 
         hcore::hmemoizer::set_phase("execute:inputs_result_exec");
         let deps_result = self
@@ -187,91 +196,29 @@ impl Engine {
                 );
 
                 // Everything fallible between the claim and the run response
-                // lives in this block, so an `Err` — a failing target above
-                // all — can be told apart from a drop: the error leaves the
-                // sandbox for diagnostics, the drop reclaims it.
-                let run = async {
-                    // Stale cleanup only — the driver bridge owns the create
-                    // step because it may redirect this path into a FUSE mount
-                    // (v2 single-mount mode). Creating here would waste an
-                    // inode + leave an orphan empty dir when the bridge picks
-                    // the FUSE side.
-                    //
-                    // Queued with this run's claim: if this future is cancelled
-                    // at the await below (the production wedge's phase), the
-                    // job still runs eventually — and by then a successor may
-                    // own the path, in which case the job declines rather than
-                    // deleting the successor's live sandbox.
-                    hcore::hmemoizer::set_phase("execute:sandbox_remove");
-                    sync_fs_op_on_thread(enclose!(
-                        (sandbox_dir) move ||
-                            crate::engine::sandbox_cleaner::generation::remove_stale(
-                                &sandbox_dir,
-                                sandbox_generation,
-                            )
-                    ))
+                // lives in the shared block, so an `Err` — a failing target
+                // above all — can be told apart from a drop: the error leaves
+                // the sandbox for diagnostics, the drop reclaims it.
+                let run = self
+                    .run_in_sandbox(
+                        &rs,
+                        addr,
+                        SandboxLease::per_addr(&sandbox_teardown),
+                        SandboxRun {
+                            driver,
+                            target: Arc::clone(&def.target),
+                            inputs: deps_result,
+                            hashin: hashin.to_owned(),
+                            scratch: scratch_mounts,
+                            credentials: resolved_credentials,
+                            deferred,
+                            wrapper: exec_wrapper,
+                            shell,
+                            options: crate::engine::driver::RunOptions::default(),
+                        },
+                    )
                     .await
-                    .with_context(|| {
-                        format!("remove stale sandbox dir {}", sandbox_dir.display())
-                    })?;
-
-                    // Presented *inside* the sandbox claim, so the files land
-                    // under a directory this run owns and the teardown below
-                    // deletes them whatever the outcome — including the failure
-                    // path, which deliberately keeps the rest of the sandbox for
-                    // diagnostics. The log tail is what makes that useful, not
-                    // the token.
-                    let (credential_mounts, _credential_teardown) = self
-                        .acquire_and_present(&rs, addr, &sandbox_dir, &resolved_credentials)
-                        .await
-                        .with_context(|| format!("credentials for {addr}"))?;
-                    let exec_wrapper: InteractiveWrapper = exec_wrapper.unwrap_or_else(|| {
-                        Arc::new(|inner: InteractiveInner| {
-                            Box::pin(async move { inner(None, None, None).await })
-                        })
-                    });
-
-                    let (tx, rx) = tokio::sync::oneshot::channel::<RunResponse>();
-
-                    let hashin = hashin.to_owned();
-
-                    let inner: InteractiveInner = Box::new(enclose!(
-                        (driver, def, rs, self => engine, sandbox_dir, scratch_mounts, credential_mounts, deferred)
-                        move |stdin, stdout, stderr| {
-                            Box::pin(async move {
-                                let req = RunRequest {
-                                    request_id: rs.request_id(),
-                                    target: &def.target,
-                                    tree_root_path: engine.cfg.root.clone(),
-                                    inputs: deps_result,
-                                    hashin: &hashin,
-                                    stdin,
-                                    stdout,
-                                    stderr,
-                                    sandbox_dir,
-                                    scratch: scratch_mounts,
-                                    credentials: credential_mounts,
-                                    deferred,
-                                };
-                                let res = if shell {
-                                    driver.driver.run_shell(req, rs.ctoken()).await?
-                                } else {
-                                    driver.driver.run(req, rs.ctoken()).await?
-                                };
-                                drop(tx.send(res));
-                                Ok(())
-                            })
-                        }
-                    ));
-
-                    hcore::hmemoizer::set_phase("execute:driver_run");
-                    exec_wrapper(inner).await.with_context(|| "run")?;
-
-                    hcore::hmemoizer::set_phase("execute:oneshot_rx");
-                    rx.await
-                        .map_err(|_recv_err| anyhow::anyhow!("wrapper never invoked inner"))
-                }
-                .await;
+                    .and_then(|ran| ran.context("run"));
 
                 let res = match run {
                     Ok(res) => res,
@@ -313,7 +260,120 @@ impl Engine {
         res.map(|(artifacts, teardown, guards)| (artifacts, teardown, guards, execute_guard))
     }
 
-    async fn inputs_result_exec(
+    /// The one sandbox block every run goes through, a build's
+    /// ([`execute`](Self::execute)) and an invocation's
+    /// ([`invoke`](Self::invoke)) alike (R12, E7): prepare the leased
+    /// directory, present the credentials into it, assemble the
+    /// [`RunRequest`] and call the driver's `run` or `run_shell` through the
+    /// interactive wrapper.
+    ///
+    /// Two results, apart: the outer `Err` is heph's own failure around the
+    /// run (preparing the sandbox, credentials, the wrapper); the inner one is
+    /// the driver's `run` itself. An invocation reads a process exit off the
+    /// inner one only, so a dep's or a credential source's `ProcessFailed`
+    /// further out can never pass for the tool's own exit.
+    ///
+    /// The lease decides what "prepare" means; resolving it after the run —
+    /// keep for diagnostics, reclaim, complete — stays with the caller, which
+    /// owns it ([`SandboxTeardown`](crate::engine::sandbox_cleaner::SandboxTeardown)
+    /// or [`InvokeSandbox`](crate::engine::invoke_sandbox::InvokeSandbox)).
+    pub(crate) async fn run_in_sandbox(
+        self: &Arc<Self>,
+        rs: &Arc<RequestState>,
+        addr: &Addr,
+        lease: SandboxLease<'_>,
+        run: SandboxRun,
+    ) -> anyhow::Result<anyhow::Result<RunResponse>> {
+        let SandboxRun {
+            driver,
+            target,
+            inputs,
+            hashin,
+            scratch,
+            credentials,
+            deferred,
+            wrapper,
+            shell,
+            options,
+        } = run;
+        // N6/N9: only an entrypoint's run is ever sent anything but the
+        // default options, whichever path assembled them.
+        if !options.is_default() && target.entrypoint.is_none() {
+            anyhow::bail!(
+                "{addr}: run options are only sent to an entrypoint (`entrypoint = True`); this \
+                 is a bug in heph"
+            );
+        }
+        let sandbox_dir = lease.dir().to_path_buf();
+
+        hcore::hmemoizer::set_phase("execute:sandbox_remove");
+        lease.prepare().await?;
+
+        // Presented *inside* the sandbox lease, so the files land under a
+        // directory this run owns and its teardown deletes them whatever the
+        // outcome — including a build's failure path, which deliberately keeps
+        // the rest of the sandbox for diagnostics. The log tail is what makes
+        // that useful, not the token.
+        let (credential_mounts, _credential_teardown) = self
+            .acquire_and_present(rs, addr, &sandbox_dir, &credentials)
+            .await
+            .with_context(|| format!("credentials for {addr}"))?;
+        let exec_wrapper: InteractiveWrapper = wrapper.unwrap_or_else(|| {
+            Arc::new(|inner: InteractiveInner| {
+                Box::pin(async move { inner(None, None, None).await })
+            })
+        });
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<anyhow::Result<RunResponse>>();
+        // Under `Inherit` the process has heph's own fds: there is nothing to
+        // copy, so whatever the wrapper hands in is not passed on — except to
+        // a shell, which runs on a PTY of its own and ignores `stdio`: the
+        // streams are how the terminal reaches that PTY.
+        let inherit =
+            !shell && matches!(options.stdio, crate::engine::driver::RunStdio::Inherit(_));
+
+        let inner: InteractiveInner = Box::new(enclose!(
+            (rs, self => engine, sandbox_dir)
+            move |stdin, stdout, stderr| {
+                Box::pin(async move {
+                    let mut req = RunRequest::new(rs.request_id(), &target, sandbox_dir);
+                    req.tree_root_path = engine.cfg.root.clone();
+                    req.inputs = inputs;
+                    req.hashin = &hashin;
+                    if !inherit {
+                        req.stdin = stdin;
+                        req.stdout = stdout;
+                        req.stderr = stderr;
+                    }
+                    req.scratch = scratch;
+                    req.credentials = credential_mounts;
+                    req.deferred = deferred;
+                    req.options = options;
+                    // A plain driver spawns straight from `run`; a managed
+                    // one materializes first and its layer fires it.
+                    if !driver.managed {
+                        req.options.fire_handover();
+                    }
+                    let res = if shell {
+                        driver.driver.run_shell(req, rs.ctoken()).await
+                    } else {
+                        driver.driver.run(req, rs.ctoken()).await
+                    };
+                    drop(tx.send(res));
+                    Ok(())
+                })
+            }
+        ));
+
+        hcore::hmemoizer::set_phase("execute:driver_run");
+        exec_wrapper(inner).await.with_context(|| "run")?;
+
+        hcore::hmemoizer::set_phase("execute:oneshot_rx");
+        rx.await
+            .map_err(|_recv_err| anyhow::anyhow!("wrapper never invoked inner"))
+    }
+
+    pub(crate) async fn inputs_result_exec(
         self: Arc<Self>,
         rc: Arc<RequestState>,
         inputs: &[LinkedTargetDefInput],
@@ -357,6 +417,84 @@ impl Engine {
         let results = crate::engine::fanout::join_all_failable(futs, fail_fast).await?;
         Ok(results.into_iter().flatten().collect())
     }
+}
+
+/// Whose sandbox directory a run is in, which decides how it is prepared
+/// (R12). Borrowed: the caller owns the lease itself — a build's
+/// [`SandboxTeardown`](crate::engine::sandbox_cleaner::SandboxTeardown), an
+/// invocation's [`InvokeSandbox`](crate::engine::invoke_sandbox::InvokeSandbox)
+/// — and resolves it after the run.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum SandboxLease<'l> {
+    /// A build's per-address directory, reused run after run and ordered
+    /// against a predecessor's stragglers by its generation claim. Prepared
+    /// by a generation-checked stale removal; on failure the owner keeps the
+    /// tree for the failure diagnostic, on a drop it reclaims it.
+    PerAddr {
+        dir: &'l std::path::Path,
+        generation: u64,
+    },
+    /// An invocation's own directory, created empty and exclusively, held
+    /// through its `.owner` lock. Nothing to prepare; the owner removes it,
+    /// synchronously, on every exit.
+    Invocation { dir: &'l std::path::Path },
+}
+
+impl<'l> SandboxLease<'l> {
+    pub(crate) fn per_addr(teardown: &'l crate::engine::sandbox_cleaner::SandboxTeardown) -> Self {
+        Self::PerAddr {
+            dir: teardown.dir(),
+            generation: teardown.generation(),
+        }
+    }
+
+    pub(crate) fn invocation(sandbox: &'l crate::engine::invoke_sandbox::InvokeSandbox) -> Self {
+        Self::Invocation { dir: sandbox.dir() }
+    }
+
+    fn dir(&self) -> &'l std::path::Path {
+        match *self {
+            Self::PerAddr { dir, .. } | Self::Invocation { dir } => dir,
+        }
+    }
+
+    async fn prepare(&self) -> anyhow::Result<()> {
+        match *self {
+            Self::PerAddr { dir, generation } => {
+                // Stale cleanup only — the driver bridge owns the create step
+                // because it may redirect this path into a FUSE mount (v2
+                // single-mount mode). Creating here would waste an inode and
+                // leave an orphan empty dir when the bridge picks the FUSE side.
+                //
+                // Queued with this run's claim: if this future is cancelled at
+                // the await below (the production wedge's phase), the job still
+                // runs eventually — and by then a successor may own the path,
+                // in which case the job declines rather than deleting the
+                // successor's live sandbox.
+                let owned = dir.to_path_buf();
+                sync_fs_op_on_thread(move || {
+                    crate::engine::sandbox_cleaner::generation::remove_stale(&owned, generation)
+                })
+                .await
+                .with_context(|| format!("remove stale sandbox dir {}", dir.display()))
+            }
+            Self::Invocation { .. } => Ok(()),
+        }
+    }
+}
+
+/// Everything [`Engine::run_in_sandbox`] needs besides the lease.
+pub(crate) struct SandboxRun {
+    pub driver: Arc<crate::engine::engine::Driver>,
+    pub target: Arc<crate::engine::driver::targetdef::TargetDef>,
+    pub inputs: Vec<RunInput>,
+    pub hashin: String,
+    pub scratch: Vec<crate::engine::driver::ScratchMount>,
+    pub credentials: Vec<crate::engine::ResolvedCredential>,
+    pub deferred: std::collections::BTreeMap<String, crate::engine::driver::DeferredValue>,
+    pub wrapper: Option<InteractiveWrapper>,
+    pub shell: bool,
+    pub options: crate::engine::driver::RunOptions,
 }
 
 /// Run a synchronous `std::fs` operation through `hcore::blocking::run`.

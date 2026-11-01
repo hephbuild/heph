@@ -1990,15 +1990,8 @@ mod tests {
     fn linked_def(addr: &Addr) -> LinkedTargetDef {
         let target = Arc::new(TargetDef {
             addr: addr.clone(),
-            labels: Vec::new(),
-            raw_def: Arc::new(()),
-            inputs: Vec::new(),
-            outputs: Vec::new(),
-            support_files: Vec::new(),
             cache: CacheConfig::on(false),
-            pty: false,
-            hash: Vec::new(),
-            transparent: false,
+            ..Default::default()
         });
         LinkedTargetDef {
             target,

@@ -142,15 +142,9 @@ mod tests {
     fn ext_def(driver: &str, hash: Vec<u8>) -> ExtendedTargetDef {
         let target_def = Arc::new(TargetDef {
             addr: Addr::new(PkgBuf::from("pkg"), "tgt".to_string(), BTreeMap::new()),
-            labels: Vec::new(),
-            raw_def: Arc::new(()),
-            inputs: Vec::new(),
-            outputs: Vec::new(),
-            support_files: Vec::new(),
             cache: CacheConfig::on(true),
-            pty: false,
             hash,
-            transparent: false,
+            ..Default::default()
         });
         ExtendedTargetDef {
             target_def,

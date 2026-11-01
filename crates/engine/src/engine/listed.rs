@@ -365,8 +365,8 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::driver::targetdef::Output;
     use crate::engine::driver::targetdef::path::{CodegenMode, Content, Path};
-    use crate::engine::driver::targetdef::{CacheConfig, Output};
     use crate::engine::matcher_spec::match_spec;
     use crate::engine::matcher_target::match_target;
     use hmodel::htpkg::PkgBuf;
@@ -402,8 +402,6 @@ mod tests {
         let def = TargetDef {
             addr,
             labels: spec.labels.clone(),
-            raw_def: Arc::new(()),
-            inputs: vec![],
             outputs: vec![Output {
                 group: "out".to_string(),
                 paths: vec![Path {
@@ -416,11 +414,7 @@ mod tests {
                     collect: false,
                 }],
             }],
-            support_files: vec![],
-            cache: CacheConfig::off(),
-            pty: false,
-            hash: vec![],
-            transparent: false,
+            ..Default::default()
         };
         (spec, def)
     }

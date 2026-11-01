@@ -50,6 +50,16 @@ message CreateConfig {
   // namespace and the prefix of its components' names. Informational — for a
   // plugin that wants it in messages; the binary reports no name of its own.
   string name = 4;
+  // What this host understands beyond ABI_SEMVER's floor (since 0.17.1).
+  // Absent, and every absent bit, means "no": an older host sends none.
+  HostCapabilities host_capabilities = 5;
+}
+
+message HostCapabilities {
+  // The host honours TargetDef.entrypoint: it never caches such a def, sends it
+  // RunOptions and relays signals to its run. A plugin on a host without it
+  // must refuse to declare an entrypoint rather than have it built and cached.
+  bool entrypoints = 1;
 }
 
 // The host's log filter, handed to a plugin (`heph_plugin_set_log_filter`) so it

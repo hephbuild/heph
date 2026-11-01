@@ -6,6 +6,20 @@ use std::path::PathBuf;
 
 use crate::process_supervisor::protocol::Msg;
 
+/// Signals the sidecar ignores: everything a terminal or a process-group
+/// `kill` sends that would otherwise end or stop it.
+const IGNORED_SIGNALS: [libc::c_int; 9] = [
+    libc::SIGINT,
+    libc::SIGQUIT,
+    libc::SIGHUP,
+    libc::SIGTERM,
+    libc::SIGTSTP,
+    libc::SIGTTIN,
+    libc::SIGTTOU,
+    libc::SIGUSR1,
+    libc::SIGUSR2,
+];
+
 /// Supervisor entry point. Reads `TRACK`/`UNTRACK`/`FUSEROOT` lines from
 /// `ipc_fd` until EOF (parent process died) or read error, then:
 ///   1. SIGKILLs every tracked process group (so no surviving child holds
@@ -19,6 +33,18 @@ pub fn run_supervisor_main(ipc_fd: i32) -> ! {
     // SAFETY: signal(2) at startup before any threads exist — safe on unix.
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
+    // The sidecar shares heph's process group, so every signal sent to the
+    // group — the terminal's Ctrl-C, Ctrl-\, Ctrl-Z and hangup, or a
+    // `kill -<pgid>` — reaches it too. Its only job is to outlive heph, and it
+    // ends when heph's end of the socket closes; dying of the user's Ctrl-C
+    // while heph hands the terminal to an entrypoint (which keeps running)
+    // would leave nothing to reap the tool if heph is then SIGKILLed.
+    for sig in IGNORED_SIGNALS {
+        // SAFETY: signal(2) at startup, before any thread exists.
+        unsafe {
+            libc::signal(sig, libc::SIG_IGN);
+        }
     }
 
     // SAFETY: ipc_fd was inherited from the parent across exec as the child

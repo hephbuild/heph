@@ -462,21 +462,11 @@ pub(crate) mod testfake {
             });
         }
 
+        let mut request = RunRequest::new(request_id, def, sandbox.dir.path());
+        request.tree_root_path = sandbox.ws.clone();
+        request.hashin = hashin;
         ManagedRunRequest {
-            request: RunRequest {
-                request_id,
-                target: def,
-                tree_root_path: sandbox.ws.clone(),
-                inputs: vec![],
-                hashin,
-                stdin: None,
-                stdout: None,
-                stderr: None,
-                sandbox_dir: sandbox.dir.path().to_path_buf(),
-                scratch: vec![],
-                credentials: vec![],
-                deferred: Default::default(),
-            },
+            request,
             sandbox_dir: sandbox.dir.path().to_path_buf(),
             sandbox_ws_dir: sandbox.ws.clone(),
             sandbox_pkg_dir: sandbox.pkg.clone(),

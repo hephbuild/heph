@@ -444,11 +444,9 @@ impl ManagedDriver for GoCompileDriver {
                 raw_def: Arc::new(def),
                 inputs: inputs.into_iter().chain([gocache_input]).collect(),
                 outputs,
-                support_files: vec![],
                 cache: CacheConfig::on(true),
-                pty: false,
                 hash,
-                transparent: false,
+                ..Default::default()
             },
         })
     }

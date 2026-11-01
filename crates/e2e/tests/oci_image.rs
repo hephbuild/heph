@@ -136,6 +136,26 @@ target(
 )
 "#;
 
+/// `oci.image`'s own `entrypoint = [...]` is that driver's config, not the
+/// engine's entrypoint attribute: the def is not an entrypoint, keeps its
+/// cache, and the image builds as before, reproducibly.
+#[tokio::test]
+async fn oci_image_entrypoint_unaffected() -> anyhow::Result<()> {
+    let ws = workspace();
+    ws.write_build_file("app", BUILD);
+    let addr = heph::htaddr::parse_addr("//app:img")?;
+    let def = std::sync::Arc::clone(&ws.engine)
+        .get_def(ws.engine.new_state(), &addr)
+        .await?;
+    assert!(def.target_def.entrypoint.is_none(), "not an entrypoint");
+    assert!(def.target_def.cache.enabled, "still cached");
+
+    let first = htestkit::artifact_bytes(&*ws.run("//app:img").await?);
+    let second = htestkit::artifact_bytes(&*ws.run("//app:img").await?);
+    assert_eq!(first, second, "the same image both times");
+    Ok(())
+}
+
 /// The whole path, with no docker anywhere: two layers assembled into an image
 /// whose layout reads back with the config the BUILD file asked for.
 #[tokio::test]

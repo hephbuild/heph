@@ -105,6 +105,25 @@ message TargetDef {
   bool pty = 8;
   bytes hash = 9;
   bool transparent = 10;
+  // Present only when the driver declared the target an entrypoint (since
+  // 0.17.1). Absent means "not an entrypoint" — what every older plugin sends —
+  // and a def without it is never sent RunOptions.
+  Entrypoint entrypoint = 11;
+}
+
+// Where an entrypoint runs. Mirrors driver::targetdef::Workdir.
+enum EntrypointWorkdir {
+  ENTRYPOINT_WORKDIR_UNSPECIFIED = 0;
+  ENTRYPOINT_WORKDIR_CALLER = 1;
+  ENTRYPOINT_WORKDIR_ROOT = 2;
+  ENTRYPOINT_WORKDIR_SANDBOX = 3;
+}
+
+// Mirrors driver::targetdef::Entrypoint. `workdir` is required; `accepts_args`
+// is off unless said.
+message Entrypoint {
+  bool accepts_args = 1;
+  EntrypointWorkdir workdir = 2;
 }
 
 // ---- Run outputs (driver -> host). Mirrors outputartifact::OutputArtifact.

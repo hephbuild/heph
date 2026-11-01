@@ -473,10 +473,22 @@ mod imp {
     /// only if `execv` fails.
     pub(super) fn exec_into(binary: &Path) -> anyhow::Result<()> {
         let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
-        let err = std::process::Command::new(binary)
-            .args(&args)
-            .env(UPGRADED_ENV, "1")
-            .exec();
+        let mut cmd = std::process::Command::new(binary);
+        cmd.args(&args).env(UPGRADED_ENV, "1");
+        // By here `main` has ignored SIGTTOU/SIGTTIN and raised the open-file
+        // limit. Put back what this process inherited, so the pinned binary
+        // records the caller's dispositions and limit, not ours — an
+        // entrypoint it runs gets them (R8). Should the exec fail, heph exits
+        // on the error anyway.
+        // SAFETY: `exec` runs this in this process right before `execve`; it
+        // allocates nothing and makes only `signal`/`setrlimit` calls.
+        unsafe {
+            cmd.pre_exec(|| {
+                hcore::process::restore_inherited_for_exec();
+                Ok(())
+            });
+        }
+        let err = cmd.exec();
         Err(err).with_context(|| format!("exec into {}", binary.display()))
     }
 

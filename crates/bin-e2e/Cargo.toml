@@ -22,3 +22,5 @@ hex = "0.4"
 # parsed screen is the only way to test it that isn't asserting on raw bytes.
 portable-pty = "0.9"
 vt100 = "0.17"
+# Signals sent at heph's pid, and whether a tool's pid is still alive.
+libc = "0.2"

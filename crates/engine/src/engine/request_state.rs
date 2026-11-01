@@ -1144,10 +1144,13 @@ impl Drop for RequestStateData {
         for hook in &self.hooks {
             hook.on_close();
         }
-        if let Some(engine) = self.engine.upgrade()
-            && let Ok(mut requests) = engine.requests.lock()
-        {
-            requests.remove(&self.request_id);
+        if let Some(engine) = self.engine.upgrade() {
+            if let Ok(mut requests) = engine.requests.lock() {
+                requests.remove(&self.request_id);
+            }
+            if let Ok(mut tokens) = engine.request_ctokens.lock() {
+                tokens.remove(&self.request_id);
+            }
         }
     }
 }
@@ -1342,6 +1345,9 @@ impl Engine {
             tracked: Mutex::new(FxHashSet::default()),
         });
 
+        if let Ok(mut tokens) = self.request_ctokens.lock() {
+            tokens.insert(request_id.clone(), data.ctoken.clone());
+        }
         if let Ok(mut requests) = self.requests.lock() {
             requests.insert(request_id, Arc::downgrade(&state));
         }
@@ -1910,6 +1916,37 @@ mod tests {
         engine.cancel_all_requests();
         assert!(rs.ctoken().is_cancelled());
 
+        Ok(())
+    }
+
+    /// The exit-time drain (R27): the command returned and dropped its root
+    /// state, but a remote upload still rides a child of it. A Ctrl-C then
+    /// must still reach that upload's token, or heph waits out the upload's
+    /// deadline. The token entry goes with the data, not with the root.
+    #[tokio::test]
+    async fn cancel_all_requests_reaches_work_outliving_the_root_state() -> anyhow::Result<()> {
+        let (_tmp, engine) = test_engine()?;
+        let rs = engine.new_state();
+        let id = rs.request_id().to_string();
+        let child = rs.with_parent(hmodel::htaddr::parse_addr("//app:dep")?);
+        drop(rs);
+        assert!(!child.ctoken().is_cancelled());
+
+        engine.cancel_all_requests();
+        assert!(
+            child.ctoken().is_cancelled(),
+            "the child's work is cancelled"
+        );
+
+        drop(child);
+        assert!(
+            !engine
+                .request_ctokens
+                .lock()
+                .map_err(|_poisoned| anyhow::anyhow!("poisoned"))?
+                .contains_key(&id),
+            "the token goes with the data"
+        );
         Ok(())
     }
 

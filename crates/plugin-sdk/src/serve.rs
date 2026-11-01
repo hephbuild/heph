@@ -1116,6 +1116,14 @@ where
     }
 }
 
+/// A def a guest driver returned, encoded for the host — refused if it declares
+/// an entrypoint the host cannot honour (R3), so an old host never builds and
+/// caches one.
+fn def_to_wire(def: &hplugin::driver::targetdef::TargetDef) -> Result<pb::TargetDef> {
+    crate::capabilities::check_def(crate::capabilities::host_capabilities(), def)?;
+    convert::target_def_to_pb(def)
+}
+
 async fn driver_parse(
     driver: Arc<dyn ManagedDriver>,
     req: pb::ParseRequest,
@@ -1138,7 +1146,7 @@ async fn driver_parse(
     let guard = cancels.enter(&preq.request_id);
     on_plugin_runtime(guard, move |guard| async move {
         match driver.parse(preq, guard.token()).await {
-            Ok(resp) => match convert::target_def_to_pb(&resp.target_def) {
+            Ok(resp) => match def_to_wire(&resp.target_def) {
                 Ok(td) => Body::from(pb::ParseResponse {
                     target_def: td.into(),
                     ..Default::default()
@@ -1178,7 +1186,7 @@ async fn driver_apply_transitive(
     let guard = cancels.enter(&areq.request_id);
     on_plugin_runtime(guard, move |guard| async move {
         match driver.apply_transitive(areq, guard.token()).await {
-            Ok(resp) => match convert::target_def_to_pb(&resp.target_def) {
+            Ok(resp) => match def_to_wire(&resp.target_def) {
                 Ok(td) => Body::from(pb::ApplyTransitiveResponse {
                     target_def: td.into(),
                     ..Default::default()
@@ -1346,6 +1354,9 @@ fn pull_run_start(req: &DynItemStream) -> Result<(String, pb::ManagedRunRequest)
         Some(pb::run_in_frame::Msg::StdinClose(_)) => {
             anyhow::bail!("run: the first frame is a stdin close, not a start frame")
         }
+        Some(pb::run_in_frame::Msg::Signal(signo)) => {
+            anyhow::bail!("run: the first frame is a signal ({signo}), not a start frame")
+        }
         None => anyhow::bail!("run: the first frame is empty, not a start frame"),
     }
 }
@@ -1359,6 +1370,16 @@ async fn run_bidi(
         Ok(s) => s,
         Err(e) => return run_error_stream(err_message(&e)),
     };
+    let mut start = match RunStart::from_pb(start) {
+        Ok(s) => s,
+        Err(e) => return run_error_stream(err_message(&e)),
+    };
+    // A run in the caller's terminal keeps reading the request stream for the
+    // signals the host relays. Only that run: a captured one has nothing more to
+    // read, and drops the stream here.
+    if let Some(signals) = start.signals.take() {
+        spawn_signal_reader(req, signals);
+    }
     // The run shells out via the reactor — execute on the cdylib's own runtime,
     // feeding RunOutFrames into a channel the host drains. (Live stdin/stdout will
     // ride `req` / the channel later; today only the terminal result is sent.)
@@ -1374,6 +1395,71 @@ async fn run_bidi(
         drop(tx.send(out.encode_to_vec()).await);
     });
     make_channel_item_stream(rx)
+}
+
+/// Feed every `RunInFrame.signal` on the rest of the request stream into the
+/// run's [`Foreground::signals`](hplugin::driver::Foreground::signals), until
+/// the stream ends.
+///
+/// The stream's `next` blocks, so this is its own thread, not a task: a task
+/// would park a runtime worker for the whole run. It ends when the host ends
+/// the stream, which a host does only after it read the run's terminal frame
+/// (N11) — and an older host does right after `start`. Either way the end drops
+/// the sender, which the driver reads as "no more signals", never a cancel. The
+/// run's terminal frame never waits on this thread.
+fn spawn_signal_reader(req: DynItemStream, signals: hplugin::driver::SignalSender) {
+    let spawned = std::thread::Builder::new()
+        .name("heph-run-signals".to_string())
+        .spawn(move || read_signal_frames(&req, &signals));
+    if let Err(e) = spawned {
+        // The run still goes ahead; it only loses the relay.
+        tracing::warn!(error = %e, "could not start the run's signal reader; signals sent to heph will not reach the tool");
+    }
+}
+
+fn read_signal_frames(req: &DynItemStream, signals: &hplugin::driver::SignalSender) {
+    loop {
+        let bytes = req.next();
+        if bytes.is_empty() {
+            return;
+        }
+        let frame = match decode_req::<pb::RunInFrame>(&bytes[..], "a run request frame") {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!(error = %e, "dropping an undecodable run request frame");
+                continue;
+            }
+        };
+        match frame.msg {
+            Some(pb::run_in_frame::Msg::Signal(signo)) => {
+                // The driver dropped its receiver: its child is gone, and
+                // nothing left on the stream is for it.
+                if signals
+                    .send(hplugin::driver::Signal::from_raw(signo))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            // Live stdin is not wired; an inherited run reads the terminal itself.
+            Some(pb::run_in_frame::Msg::StdinChunk(_) | pb::run_in_frame::Msg::StdinClose(_)) => {}
+            Some(pb::run_in_frame::Msg::Start(_)) => {
+                tracing::warn!("ignoring a second start frame on a run's request stream");
+            }
+            None => {}
+        }
+    }
+}
+
+/// A run's terminal failure frame: the message, plus the process's exit status
+/// when the failure is one ([`hplugin::error::ProcessFailed::exit`]). `error`
+/// stays the terminal frame, so an older host still reports the message.
+fn run_out_failure(e: &anyhow::Error) -> pb::RunOutFrame {
+    let mut frame = run_out_err(err_message(e));
+    if let Some(exit) = hplugin::error::process_exit(e) {
+        frame.exit = convert::exit_to_pb(exit).into();
+    }
+    frame
 }
 
 /// An `AsyncWrite` that turns everything written to it into `RunOutFrame`s on the
@@ -1461,12 +1547,20 @@ struct RunStart {
     credentials: Vec<hplugin::driver::CredentialMount>,
     scratch: Vec<hplugin::driver::ScratchMount>,
     deferred: std::collections::BTreeMap<String, hplugin::driver::DeferredValue>,
+    /// The run's caller-side options; default for every build.
+    options: hplugin::driver::RunOptions,
+    /// Feeds `options`' signal receiver, for a run in the caller's terminal.
+    signals: Option<hplugin::driver::SignalSender>,
 }
 
 impl RunStart {
     fn from_pb(req: pb::ManagedRunRequest) -> Result<Self> {
         let path = |v: Option<String>, field| required(v, field).map(PathBuf::from);
+        let (options, signals) = convert::run_options_from_pb(req.options.into_option())
+            .context("decoding the run's options")?;
         Ok(Self {
+            options,
+            signals,
             shell: req.shell.unwrap_or(false),
             target: convert::target_def_from_pb(required_msg(
                 req.target,
@@ -1512,14 +1606,10 @@ impl RunStart {
 async fn run_once(
     driver: Arc<dyn ManagedDriver>,
     request_id: String,
-    req: pb::ManagedRunRequest,
+    start: RunStart,
     out: &tokio::sync::mpsc::Sender<Vec<u8>>,
     ct: &StdCancellationToken,
 ) -> pb::RunOutFrame {
-    let start = match RunStart::from_pb(req) {
-        Ok(s) => s,
-        Err(e) => return run_out_err(err_message(&e)),
-    };
     // `shell` selects run_shell over run; it rides the request.
     let shell = start.shell;
     // The run request and the managed layer each own a handle on the same
@@ -1530,20 +1620,20 @@ async fn run_once(
     // made a cdylib driver's build log disappear.
     let mut stdout_sink = FrameSink::new(out, false);
     let mut stderr_sink = FrameSink::new(out, true);
-    let rr = RunRequest {
-        request_id: &request_id,
-        target: &start.target,
-        tree_root_path: start.tree_root_path,
-        inputs: run_inputs,
-        hashin: start.hashin.as_str(),
-        stdin: None,
-        stdout: Some(&mut stdout_sink),
-        stderr: Some(&mut stderr_sink),
-        sandbox_dir: start.sandbox_dir.clone(),
-        scratch: start.scratch,
-        credentials: start.credentials,
-        deferred: start.deferred,
-    };
+    let mut rr = RunRequest::new(&request_id, &start.target, start.sandbox_dir.clone());
+    rr.tree_root_path = start.tree_root_path;
+    rr.inputs = run_inputs;
+    rr.hashin = start.hashin.as_str();
+    // A run in the caller's terminal has no output to carry: the process
+    // writes to the fds it inherited.
+    if matches!(start.options.stdio, hplugin::driver::RunStdio::Captured) {
+        rr.stdout = Some(&mut stdout_sink);
+        rr.stderr = Some(&mut stderr_sink);
+    }
+    rr.scratch = start.scratch;
+    rr.credentials = start.credentials;
+    rr.deferred = start.deferred;
+    rr.options = start.options;
     let mrr = ManagedRunRequest {
         request: rr,
         sandbox_dir: start.sandbox_dir,
@@ -1572,7 +1662,7 @@ async fn run_once(
             },
             Err(e) => run_out_err(err_message(&e)),
         },
-        Err(e) => run_out_err(err_message(&e)),
+        Err(e) => run_out_failure(&e),
     }
 }
 
@@ -1904,6 +1994,20 @@ mod tests {
         }
     }
 
+    /// `run_once` from the wire request, decoding it as `run_bidi` does.
+    async fn run_once_wire(
+        driver: Arc<dyn ManagedDriver>,
+        request_id: String,
+        req: pb::ManagedRunRequest,
+        out: &tokio::sync::mpsc::Sender<Vec<u8>>,
+        ct: &StdCancellationToken,
+    ) -> pb::RunOutFrame {
+        match RunStart::from_pb(req) {
+            Ok(start) => run_once(driver, request_id, start, out, ct).await,
+            Err(e) => run_out_err(err_message(&e)),
+        }
+    }
+
     fn start_frame(req: pb::ManagedRunRequest) -> Vec<u8> {
         pb::RunInFrame {
             msg: Some(pb::run_in_frame::Msg::from(req)),
@@ -1957,7 +2061,7 @@ mod tests {
         }
         let mut req = wire_run(wire_target());
         req.sandbox_dir = None;
-        let frame = futures::executor::block_on(run_once(
+        let frame = futures::executor::block_on(run_once_wire(
             Arc::new(Unreached) as Arc<dyn ManagedDriver>,
             "r".into(),
             req,
@@ -2488,7 +2592,7 @@ mod tests {
         // the driver. The output channel goes nowhere here: this test is about
         // the terminal error frame, not about live output.
         let (out_tx, _out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
-        let frame = futures::executor::block_on(run_once(
+        let frame = futures::executor::block_on(run_once_wire(
             Arc::new(FailDriver) as Arc<dyn ManagedDriver>,
             "r".into(),
             wire_run(wire_target()),
@@ -3309,6 +3413,130 @@ mod tests {
     }
 
     // A managed driver's config schema survives the round trip (LSP kwargs).
+    /// E19 through the real seam (host proxy → stable ABI → SDK guest): an
+    /// entrypoint run's options reach a cdylib driver, a signal the host queued
+    /// before the run reaches its receiver over the live request stream (R5),
+    /// and the driver's structured exit status comes back beside its unchanged
+    /// message. A def without an entrypoint is never sent options (N9).
+    #[test]
+    fn entrypoint_run_crosses_the_seam() {
+        use hdriver_support::driver_managed::{ManagedRunRequest, ManagedRunResponse};
+        use hplugin::driver::targetdef::{Entrypoint, Workdir};
+        use hplugin::driver::{Foreground, RunOptions, RunStdio, Signal};
+        use hplugin::error::{Exit, ProcessFailed, process_exit};
+        use hplugin_stabby::load_stable::StableRemoteManagedDriver;
+
+        struct SignalDriver;
+        #[async_trait::async_trait]
+        impl ManagedDriver for SignalDriver {
+            fn config(
+                &self,
+                _req: hplugin::driver::ConfigRequest,
+            ) -> Result<hplugin::driver::ConfigResponse> {
+                Ok(hplugin::driver::ConfigResponse {
+                    name: "sigdrv".into(),
+                })
+            }
+            fn schema(&self) -> hplugin::driver::DriverSchema {
+                hplugin::driver::DriverSchema::default()
+            }
+            async fn parse(
+                &self,
+                _req: hplugin::driver::ParseRequest,
+                _ct: &(dyn Cancellable + Send + Sync),
+            ) -> Result<hplugin::driver::ParseResponse> {
+                anyhow::bail!("unused")
+            }
+            async fn apply_transitive(
+                &self,
+                _req: hplugin::driver::ApplyTransitiveRequest,
+                _ct: &(dyn Cancellable + Send + Sync),
+            ) -> Result<hplugin::driver::ApplyTransitiveResponse> {
+                anyhow::bail!("unused")
+            }
+            async fn run<'a, 'io>(
+                &self,
+                req: ManagedRunRequest<'a, 'io>,
+                _ct: &(dyn Cancellable + Send + Sync),
+            ) -> Result<ManagedRunResponse> {
+                let r = req.request;
+                anyhow::ensure!(
+                    r.stdout.is_none() && r.stderr.is_none(),
+                    "inherit has no sinks"
+                );
+                anyhow::ensure!(
+                    r.options.cwd.as_deref() == Some(std::path::Path::new("/caller")),
+                    "cwd: {:?}",
+                    r.options.cwd
+                );
+                anyhow::ensure!(
+                    r.options.args == Some(vec!["a b".into()]),
+                    "args: {:?}",
+                    r.options.args
+                );
+                let RunStdio::Inherit(mut fg) = r.options.stdio else {
+                    anyhow::bail!("stdio: {:?}", r.options.stdio);
+                };
+                let sig = fg.signals.recv().await.context("the relay closed empty")?;
+                Err(ProcessFailed {
+                    status: format!("signal: {}", sig.as_raw()),
+                    log: Arc::new(hcore::hartifactcontent::FileContent::new("/dev/null")),
+                    exit: Some(Exit::Signal(sig.as_raw())),
+                }
+                .into())
+            }
+        }
+
+        let dynd = make_dyn_managed_driver(Arc::new(SignalDriver) as Arc<dyn ManagedDriver>);
+        let host = StableRemoteManagedDriver::new(dynd, "sigdrv").expect("load");
+        let ct = StdCancellationToken::new();
+        let id = "r".to_string();
+        let mreq = |request| ManagedRunRequest {
+            request,
+            sandbox_dir: "/sb".into(),
+            sandbox_ws_dir: "/sb/ws".into(),
+            sandbox_pkg_dir: "/sb/ws/p".into(),
+            inputs: vec![],
+        };
+
+        let mut target = convert::target_def_from_pb(wire_target()).expect("def");
+        target.entrypoint = Some(Entrypoint::new(true, Workdir::Caller));
+        let (tx, rx) = hplugin::driver::signal_channel();
+        // Queued before the run exists: it waits in the stream for the driver.
+        tx.send(Signal::from_raw(15)).expect("queue");
+        let mut rr = RunRequest::new(&id, &target, "/sb");
+        rr.hashin = "h";
+        rr.options = RunOptions::default()
+            .with_cwd("/caller")
+            .with_args(vec!["a b".into()])
+            .with_stdio(RunStdio::Inherit(Foreground::new(rx, vec![])));
+        let err = match futures::executor::block_on(host.run(mreq(rr), &ct)) {
+            Ok(_) => panic!("the driver fails with the signal it received"),
+            Err(e) => e,
+        };
+        assert_eq!(process_exit(&err), Some(Exit::Signal(15)), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("process exited with status: signal: 15"),
+            "{err:#}"
+        );
+        drop(tx);
+
+        // N9: the same options for a def that declared no entrypoint are
+        // refused at the seam, before the plugin sees anything.
+        let plain = convert::target_def_from_pb(wire_target()).expect("def");
+        let mut rr = RunRequest::new(&id, &plain, "/sb");
+        rr.hashin = "h";
+        rr.options = RunOptions::default().with_cwd("/caller");
+        let err = match futures::executor::block_on(host.run(mreq(rr), &ct)) {
+            Ok(_) => panic!("options for a plain def are refused"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err:#}").contains("declared no entrypoint"),
+            "{err:#}"
+        );
+    }
+
     #[test]
     fn driver_schema_roundtrip() {
         use hdriver_support::driver_managed::{ManagedRunRequest, ManagedRunResponse};

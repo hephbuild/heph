@@ -14,6 +14,30 @@
 /// Re-export of the author-facing contract so a plugin depends only on the SDK.
 pub use hplugin::{driver, eresult, function, hook, provider};
 
+/// Running a program in the caller's terminal, for a driver that honours
+/// `RunStdio::Inherit` (an entrypoint's run). The same spawn exec uses:
+/// inherited fds 0–2, the caller's dispositions, signal mask and open-file
+/// limit restored (they travel on the run's `Foreground`: pass them on with
+/// [`with_foreground`](foreground::ForegroundCommand::with_foreground), not
+/// field by field), the pid tracked with the host's supervisor, and the run's
+/// signals relayed by [`ForegroundChild::wait`](foreground::ForegroundChild::wait)
+/// without ever signalling a reaped pid.
+///
+/// ```ignore
+/// let RunStdio::Inherit(fg) = std::mem::take(&mut req.options.stdio) else { … };
+/// let cmd = ForegroundCommand::new(program, args, env, cwd).with_foreground(&fg);
+/// let (child, _) = spawn_foreground(RunnerRef::local(), cmd, &PathPolicy::default(), ctoken).await?;
+/// let exit = child?.wait(fg.signals, ctoken).await?;
+/// ```
+pub mod foreground {
+    pub use hexecrunner::foreground::{
+        ForegroundChild, ForegroundCommand, RelayContext, should_relay, spawn_foreground,
+    };
+    pub use hexecrunner::{PathPolicy, RunnerRef, SpawnedAs};
+}
+
+#[cfg(feature = "stabby")]
+mod capabilities;
 #[cfg(feature = "stabby")]
 mod guest;
 #[cfg(feature = "stabby")]
@@ -46,11 +70,12 @@ pub mod stabby {
     pub use crate::supervisor::{install_supervisor, supervisor_sink};
 
     /// The cdylib create-entry config, and its decoder from the bytes the host
-    /// hands `heph_plugin_create`. `root`, `home` and `name` are required; the
-    /// `options` map is the plugin's `options:`, which authors read via
-    /// [`hplugin::config::decode_opt`], exactly as in-process plugins do. The
-    /// wire form stays inside the SDK.
-    pub use plugin_abi::convert::{CreateConfig, create_config_from_bytes};
+    /// hands `heph_plugin_create` — which also records the host's capabilities
+    /// for this plugin ([`host_capabilities`]).
+    pub use crate::capabilities::{
+        create_config_from_bytes, host_capabilities, require_entrypoint_support,
+    };
+    pub use plugin_abi::convert::{CreateConfig, HostCapabilities};
 
     /// The ABI version this transport builds against.
     pub use plugin_abi::ABI_SEMVER;

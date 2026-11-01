@@ -21,7 +21,46 @@ __heph_render_banner
 echo ''
 echo "=========== Help ==========="
 echo 'Shell mode, to exit; run exit or ctrl-d'
-{% if cmds %}
+{% if args_mode %}
+# The caller's args are this shell's positional parameters, copied at top level
+# because run and xrun are functions with their own "$@". An interactive bash
+# binds them only after reading its rcfile, so they are taken again just before
+# the first prompt, which then steps aside for any PROMPT_COMMAND of the
+# caller's. (`${1+"$@"}`: bash 3.2's `set -u` trips on a bare "$@".)
+__heph_args=(${1+"$@"})
+__heph_prompt_command=${PROMPT_COMMAND-}
+PROMPT_COMMAND='__heph_args=(${1+"$@"}); PROMPT_COMMAND=$__heph_prompt_command; showl'
+# Each helper runs the command with its own args when given any, the ones
+# `heph run` was given otherwise. A bare call always means the originals.
+# (The `+` form keeps an empty array from tripping `set -u` on bash 3.2.)
+run() (
+  set -euo pipefail
+  if [ "$#" -gt 0 ]; then __heph_a=("$@"); else __heph_a=(${__heph_args[@]+"${__heph_args[@]}"}); fi
+  {{ cmds }} ${__heph_a[@]+"${__heph_a[@]}"}
+)
+xrun() (
+  set -euo pipefail
+  if [ "$#" -gt 0 ]; then __heph_a=("$@"); else __heph_a=(${__heph_args[@]+"${__heph_args[@]}"}); fi
+  set -x
+  {{ cmds }} ${__heph_a[@]+"${__heph_a[@]}"}
+)
+show() {
+  printf '%s' {{ display }}
+  if [ "$#" -gt 0 ]; then printf ' %q' "$@"; elif [ -n "${__heph_args[*]+set}" ]; then printf ' %q' "${__heph_args[@]}"; fi
+  echo
+}
+showl() {
+  printf '1 │ '
+  show "$@"
+}
+
+echo "run [args…]   : Runs the command; args, when given, replace the ones heph run got"
+echo "xrun [args…]  : Same with trace"
+echo "show [args…]  : Prints the command, args shell-quoted"
+echo "showl [args…] : Same with line numbers"
+echo ''
+echo "============ Run ==========="
+{% elif cmds %}
 # Commands as an array (one element per line) so the runN helpers can replay a
 # prefix without re-emitting every line
 __heph_cmds=(

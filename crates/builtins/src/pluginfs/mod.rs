@@ -11,7 +11,7 @@ use hplugin::driver::{
     ParseResponse, RunRequest, RunResponse,
     outputartifact::{Content, ContentFile, OutputArtifact, Type},
     targetdef::{
-        CacheConfig, Output, TargetDef,
+        Output, TargetDef,
         path::{CodegenMode, Content as PathContent, Path},
     },
 };
@@ -1055,13 +1055,9 @@ impl hplugin::driver::Driver for Driver {
                 addr: req.target_spec.addr.clone(),
                 labels: req.target_spec.labels.clone(),
                 raw_def: Arc::new(def),
-                inputs: vec![],
                 outputs,
-                support_files: vec![],
-                cache: CacheConfig::off(),
-                pty: false,
                 hash,
-                transparent: false,
+                ..Default::default()
             },
         })
     }
@@ -1546,22 +1542,12 @@ mod tests {
         target: &'a TargetDef,
         request_id: &'a String,
         root: std::path::PathBuf,
-        hashin: &'a String,
+        hashin: &'a str,
     ) -> RunRequest<'a, 'static> {
-        RunRequest {
-            request_id,
-            target,
-            tree_root_path: root.clone(),
-            inputs: vec![],
-            hashin,
-            stdin: None,
-            stdout: None,
-            stderr: None,
-            sandbox_dir: root,
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        }
+        let mut req = RunRequest::new(request_id, target, root.clone());
+        req.tree_root_path = root;
+        req.hashin = hashin;
+        req
     }
 
     #[tokio::test]

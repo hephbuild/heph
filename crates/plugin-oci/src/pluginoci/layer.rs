@@ -365,11 +365,9 @@ impl ManagedDriver for Driver {
                         collect: true,
                     }],
                 }],
-                support_files: vec![],
                 cache: spec.cache.into(),
-                pty: false,
                 hash,
-                transparent: false,
+                ..Default::default()
             },
         })
     }

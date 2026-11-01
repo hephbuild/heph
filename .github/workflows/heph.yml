@@ -390,6 +390,11 @@ jobs:
           PLUGIN_GHA_NAME="heph-gha-plugin_${{ matrix.os }}_${{ matrix.arch }}.$ext"
           PLUGIN_OCI_NAME="heph-oci-plugin_${{ matrix.os }}_${{ matrix.arch }}.$ext"
           PLUGIN_DEVENV_NAME="heph-devenv-plugin_${{ matrix.os }}_${{ matrix.arch }}.$ext"
+          # A test fixture for `bin_e2e` (an entrypoint driver behind a real
+          # dlopen), NEVER a release asset. Named `test-*`, not `heph-*`, so
+          # `upload_artifacts`' `heph*` download pattern (everything it
+          # publishes) and perf.yml's never match it; only `bin_e2e` downloads it.
+          TEST_ENTRYPOINT_NAME="test-entrypoint-plugin_${{ matrix.os }}_${{ matrix.arch }}.$ext"
           # heph-bench: the perf-regression harness (`perfbench` job). Publishing
           # it as a release asset alongside `heph` itself means that job never
           # builds anything to compare a PR against its baseline — both the
@@ -408,6 +413,7 @@ jobs:
           echo "plugin_gha_name=$PLUGIN_GHA_NAME" >> $GITHUB_OUTPUT
           echo "plugin_oci_name=$PLUGIN_OCI_NAME" >> $GITHUB_OUTPUT
           echo "plugin_devenv_name=$PLUGIN_DEVENV_NAME" >> $GITHUB_OUTPUT
+          echo "test_entrypoint_name=$TEST_ENTRYPOINT_NAME" >> $GITHUB_OUTPUT
           echo "bench_bin_name=$BENCH_BIN_NAME" >> $GITHUB_OUTPUT
           echo "debug_bin_name=$DEBUG_BIN_NAME" >> $GITHUB_OUTPUT
           OUT="target/${{ matrix.target }}/release"
@@ -438,13 +444,14 @@ jobs:
           # costs nothing extra). `heph-bench` links the same `heph` lib crate, so
           # adding it here is marginal — the expensive part (engine + deps) is
           # already being compiled for `heph` itself.
-          TARGETS="--bin heph --bin heph-bench --lib -p heph -p plugin-go-cdylib -p plugin-gha-cdylib -p plugin-oci-cdylib -p plugin-devenv-cdylib -p bench"
+          TARGETS="--bin heph --bin heph-bench --lib -p heph -p plugin-go-cdylib -p plugin-gha-cdylib -p plugin-oci-cdylib -p plugin-devenv-cdylib -p plugin-entrypoint-test-cdylib -p bench"
           if [ "${{ matrix.os }}" = "darwin" ]; then
             cargo build --release --locked --target ${{ matrix.target }} $TARGETS
             lib="$OUT/libplugin_go_cdylib.dylib"
             gha_lib="$OUT/libplugin_gha_cdylib.dylib"
             oci_lib="$OUT/libplugin_oci_cdylib.dylib"
             devenv_lib="$OUT/libplugin_devenv_cdylib.dylib"
+            test_entrypoint_lib="$OUT/libplugin_entrypoint_test_cdylib.dylib"
             # The nix toolchain hard-links libiconv against its /nix/store path,
             # which is absent on user machines (dyld aborts at launch). Rewrite
             # those load commands to the OS /usr/lib copies — for every artifact.
@@ -454,18 +461,21 @@ jobs:
             bash scripts/macos-portable.sh "$gha_lib"
             bash scripts/macos-portable.sh "$oci_lib"
             bash scripts/macos-portable.sh "$devenv_lib"
+            bash scripts/macos-portable.sh "$test_entrypoint_lib"
           else
             cargo zigbuild --release --locked --target ${{ matrix.target }} $TARGETS
             lib="$OUT/libplugin_go_cdylib.so"
             gha_lib="$OUT/libplugin_gha_cdylib.so"
             oci_lib="$OUT/libplugin_oci_cdylib.so"
             devenv_lib="$OUT/libplugin_devenv_cdylib.so"
+            test_entrypoint_lib="$OUT/libplugin_entrypoint_test_cdylib.so"
           fi
           cp "$OUT/heph-bench" $BENCH_BIN_NAME
           cp "$lib" $PLUGIN_GO_NAME
           cp "$gha_lib" $PLUGIN_GHA_NAME
           cp "$oci_lib" $PLUGIN_OCI_NAME
           cp "$devenv_lib" $PLUGIN_DEVENV_NAME
+          cp "$test_entrypoint_lib" $TEST_ENTRYPOINT_NAME
 
           # The build version, stamped into every artifact below rather than
           # compiled in. Deliberately a plain shell variable and NOT exported:
@@ -485,7 +495,7 @@ jobs:
           # cdylib would resolve the wrong address at runtime.
           for artifact in \
             $BENCH_BIN_NAME $PLUGIN_GO_NAME $PLUGIN_GHA_NAME $PLUGIN_OCI_NAME \
-            $PLUGIN_DEVENV_NAME
+            $PLUGIN_DEVENV_NAME $TEST_ENTRYPOINT_NAME
           do
             bash scripts/patch-slot.sh "$artifact" "version=$VERSION"
           done
@@ -569,14 +579,14 @@ jobs:
           DEBUG_BIN_NAME: "heph_debug_${{ matrix.os }}_${{ matrix.arch }}"
           EXPECTED_VERSION: "${{needs.gen.outputs.version}}"
 
-      # Six independent uploads of files already sitting on disk: none reads
+      # Eight independent uploads of files already sitting on disk: none reads
       # another's result, so they go up concurrently rather than one after the
       # other. `parallel:` rather than `background: true` on each, because it
       # waits at the end of the block — which is what keeps the drain step below
       # genuinely last (see its comment). Backgrounded uploads would be free to
       # still be running underneath it.
       #
-      # Six is under the ten-concurrent-background-step cap, so none of them
+      # Eight is under the ten-concurrent-background-step cap, so none of them
       # queues behind another.
       - parallel:
           - name: Upload artifact
@@ -620,6 +630,14 @@ jobs:
             with:
               name: ${{steps.build.outputs.plugin_devenv_name}}
               path: ${{steps.build.outputs.plugin_devenv_name}}
+
+          # bin_e2e's fixture; `test-*`, so the Pre-release never sees it.
+          - name: Upload entrypoint test plugin artifact
+            uses: actions/upload-artifact@v7
+            with:
+              name: ${{steps.build.outputs.test_entrypoint_name}}
+              path: ${{steps.build.outputs.test_entrypoint_name}}
+              retention-days: 1
 
       # Last, deliberately. This is the only job with steps after its compile,
       # and the drain must not sit in front of them: it would still be correct
@@ -1180,6 +1198,15 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           pattern: heph*_${{ matrix.os }}_${{ matrix.arch }}*
+          path: dist
+          merge-multiple: true
+
+      # The test-only cdylibs (`test-*-plugin_<os>_<arch>.{so,dylib}`): built and
+      # uploaded by `build` for this job alone, never published.
+      - name: Download test fixtures
+        uses: actions/download-artifact@v8
+        with:
+          pattern: test-*_${{ matrix.os }}_${{ matrix.arch }}*
           path: dist
           merge-multiple: true
 

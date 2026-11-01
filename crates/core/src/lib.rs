@@ -27,6 +27,7 @@ pub mod htplatform;
 pub mod htvalue;
 pub mod paths;
 pub mod pending;
+pub mod process;
 pub mod shutdown;
 pub mod template;
 pub mod units;

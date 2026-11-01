@@ -38,6 +38,7 @@
 
 pub mod agent;
 pub mod config;
+pub mod foreground;
 pub mod registry;
 pub mod session;
 pub mod wire;

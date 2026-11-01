@@ -338,6 +338,16 @@ impl SandboxTeardown {
         }
     }
 
+    /// The claimed sandbox directory.
+    pub fn dir(&self) -> &std::path::Path {
+        &self.dir
+    }
+
+    /// The generation this run [`generation::claim`]ed the directory at.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     /// Hand over the bridge's cleanup closure once the run has responded.
     pub fn set_job(&mut self, job: Option<SandboxCleanupJob>) {
         self.job = job;

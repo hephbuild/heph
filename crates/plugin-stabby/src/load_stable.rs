@@ -24,7 +24,7 @@ use hdriver_support::driver_managed::{
 use hmodel::htpkg::PkgBuf;
 use hplugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest as DriverConfigRequest,
-    ConfigResponse as DriverConfigResponse, DriverSchema, ParseRequest, ParseResponse,
+    ConfigResponse as DriverConfigResponse, DriverSchema, ParseRequest, ParseResponse, RunStdio,
     inputartifact,
 };
 use hplugin::function::{FnArgs, FnCallContext, FnOutcome, FunctionSlot, PluginFn, PluginFnDef};
@@ -537,28 +537,6 @@ fn decode_list_package_item(b: &[u8]) -> anyhow::Result<ListPackageResponse> {
     })
 }
 
-/// Host-side request stream: yields a fixed sequence of pre-encoded items (today a
-/// single `RunInFrame{start}`; live stdin would push more), empty == end.
-struct HostItemStream {
-    items: std::sync::Mutex<std::vec::IntoIter<Vec<u8>>>,
-}
-
-impl StableItemStream for HostItemStream {
-    extern "C" fn next(&self) -> stabby::vec::Vec<u8> {
-        let mut items = self.items.lock().unwrap_or_else(|e| e.into_inner());
-        match items.next() {
-            Some(b) => stabby::vec::Vec::from(b.as_slice()),
-            None => stabby::vec::Vec::new(),
-        }
-    }
-}
-
-fn host_item_stream(items: Vec<Vec<u8>>) -> DynItemStream {
-    dynify(stabby::boxed::Box::new(HostItemStream {
-        items: std::sync::Mutex::new(items.into_iter()),
-    }))
-}
-
 /// Which of the target's two streams a forwarded chunk belongs to.
 enum Chunk {
     Stdout(Vec<u8>),
@@ -597,7 +575,15 @@ fn drain_run(
                         .collect::<anyhow::Result<_>>()?,
                 });
             }
-            Some(pb::run_out_frame::Msg::Error(e)) => anyhow::bail!("{e}"),
+            // The message is the plugin's whole rendered chain, unchanged; a
+            // structured exit status rides beside it when the failure is a
+            // process's exit, readable through `hplugin::error::process_exit`.
+            Some(pb::run_out_frame::Msg::Error(e)) => match convert::exit_from_pb(frame.exit) {
+                Some(exit) => {
+                    return Err(hplugin::error::RemoteProcessFailed::new(e, exit).into());
+                }
+                None => anyhow::bail!("{e}"),
+            },
             // A dropped receiver means the caller stopped reading; keep draining
             // so the run still reaches its result.
             Some(pb::run_out_frame::Msg::StdoutChunk(b)) => {
@@ -1030,7 +1016,18 @@ impl StableRemoteManagedDriver {
     ) -> anyhow::Result<ManagedRunResponse> {
         let request_id = req.request.request_id.clone();
         let deferred = convert::deferred_to_pb(&req.request.deferred)?;
+        // N9 is enforced here, at the seam: options for a def that declared no
+        // entrypoint are refused rather than sent (the engine is the sender and
+        // never should; a plugin that predates them would run a build with them).
+        let options = convert::run_options_to_pb(req.request.target, &req.request.options)?;
+        // The relay's receiving end, for a run in the caller's terminal: its
+        // signals become `RunInFrame.signal` on the request stream.
+        let signals = match std::mem::take(&mut req.request.options.stdio) {
+            RunStdio::Inherit(fg) => Some(fg.signals),
+            _ => None,
+        };
         let pmrr = pb::ManagedRunRequest {
+            options: options.into(),
             request_id: Some(req.request.request_id.clone()),
             target: convert::target_def_to_pb(req.request.target)?.into(),
             tree_root_path: Some(req.request.tree_root_path.to_string_lossy().into_owned()),
@@ -1063,11 +1060,22 @@ impl StableRemoteManagedDriver {
             ..Default::default()
         }
         .encode_to_vec();
+        // The request stream is live (N11): `in_tx` is held until the run's
+        // terminal frame has been read — by the relay below, or by this frame
+        // for a run that has none — and only its drop ends the stream. A plugin
+        // never waits for that end before answering.
+        let (in_tx, in_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        {
+            use anyhow::Context as _;
+            in_tx
+                .send(in_frame)
+                .context("queueing the run's start frame")?;
+        }
         let resp_stream = self
             .inner
             .invoke_bidi(
                 pb::DriverMethod::Run as u32,
-                host_item_stream(vec![in_frame]),
+                host_channel_item_stream(in_rx),
             )
             .await;
         // The response stream's `next` blocks (on subprocess output), so drain it on
@@ -1104,16 +1112,39 @@ impl StableRemoteManagedDriver {
             std::future::pending::<std::convert::Infallible>().await
         };
 
+        // Forward each relayed signal as a frame. Parks, holding `in_tx`, once
+        // the host's relay closes: the stream must stay open until the terminal
+        // frame, so only the select below ending may drop it.
+        let relay = async move {
+            if let Some(mut signals) = signals {
+                while let Some(sig) = signals.recv().await {
+                    let frame = pb::RunInFrame {
+                        msg: Some(pb::run_in_frame::Msg::Signal(sig.as_raw())),
+                        ..Default::default()
+                    }
+                    .encode_to_vec();
+                    // The plugin dropped its end: nothing more is read.
+                    if in_tx.send(frame).is_err() {
+                        break;
+                    }
+                }
+            }
+            std::future::pending::<std::convert::Infallible>().await
+        };
+
         let result = {
-            futures::pin_mut!(pump);
+            let background = futures::future::join(pump, relay);
+            futures::pin_mut!(background);
             let run = await_with_cancel(ct, driver_cancel(&self.inner, &request_id), rx);
             futures::pin_mut!(run);
-            // `pump` never completes; the run's terminal result ends the select.
-            match futures::future::select(run, pump).await {
+            // `pump` and `relay` never complete; the run's terminal result ends
+            // the select, which drops `relay` and with it `in_tx`, ending the
+            // request stream after the terminal frame (N11).
+            match futures::future::select(run, background).await {
                 futures::future::Either::Left((out, _)) => out,
-                // `pump` resolves to `Infallible`, so this arm is uninhabited:
+                // Both resolve to `Infallible`, so this arm is uninhabited:
                 // only the run's terminal result can win the select.
-                futures::future::Either::Right((never, _)) => match never {},
+                futures::future::Either::Right(((never, _), _)) => match never {},
             }
         };
         match result {

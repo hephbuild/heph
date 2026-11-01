@@ -571,6 +571,50 @@ pub mod targetdef {
         }
     }
 
+    /// What an entrypoint target declares to the engine: the one thing the
+    /// engine needs to know about it beyond the def ([`TargetDef::entrypoint`]).
+    ///
+    /// `#[non_exhaustive]`: built with [`Entrypoint::new`] outside this crate,
+    /// so a later field is not a source break for every declaring driver.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+    #[non_exhaustive]
+    pub struct Entrypoint {
+        /// The target takes the caller's trailing args (`heph run //x -- a b`).
+        /// When `false`, the engine refuses any arg before a dep builds; when
+        /// `true`, the run gets `RunOptions.args = Some(..)`, even when empty.
+        pub accepts_args: bool,
+        /// Where the tool runs.
+        pub workdir: Workdir,
+    }
+
+    impl Entrypoint {
+        pub fn new(accepts_args: bool, workdir: Workdir) -> Self {
+            Self {
+                accepts_args,
+                workdir,
+            }
+        }
+    }
+
+    /// An entrypoint's working directory, resolved by the engine into
+    /// `RunOptions.cwd`.
+    ///
+    /// Deliberately exhaustive: drivers only construct it, and the host's
+    /// matches (the engine's cwd resolution, the ABI converter) must break at
+    /// compile time when a mode is added, rather than fall into a wildcard.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum Workdir {
+        /// The caller's cwd, captured raw at startup. May be outside the
+        /// workspace.
+        #[default]
+        Caller,
+        /// The real workspace root.
+        Root,
+        /// The invocation's own sandbox package dir, as a build would run in.
+        Sandbox,
+    }
+
     #[derive(Clone, Serialize)]
     pub struct TargetDef {
         pub addr: Addr,
@@ -581,10 +625,53 @@ pub mod targetdef {
         pub outputs: Vec<Output>,
         pub support_files: Vec<path::Path>,
         pub cache: CacheConfig,
+        /// `Some` when the target is an entrypoint (`entrypoint = True` on
+        /// exec/bash, or any driver's equivalent): it is *invoked* in the
+        /// caller's world, never built. The engine reads this, not the
+        /// driver's name: it forces `cache` off, refuses the target as anyone's
+        /// input or as one of a selection, refuses undeclared args before any
+        /// dep builds, and resolves the run's cwd from
+        /// [`workdir`](Entrypoint::workdir).
+        ///
+        /// Set by the declaring driver's `parse`. It crosses the plugin ABI
+        /// (`pb::TargetDef.entrypoint`); a def from a plugin that predates the
+        /// field decodes to `None`, so it is never an entrypoint and never
+        /// receives [`RunOptions`](super::RunOptions). Skipped when `None`, so
+        /// `inspect def --json` of every other target is unchanged.
+        ///
+        /// Concurrency (N10): an entrypoint's `run` may be called many times
+        /// at once for the same addr — two terminals running the same tool —
+        /// each with a `sandbox_dir` of its own, and with no execute lock
+        /// around it. A declaring driver keeps per-run state inside that
+        /// `sandbox_dir`; anything it keys by addr outside it (a fixed scratch
+        /// path, a pid file, a per-addr lock held for the run) breaks
+        /// concurrent invocations.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub entrypoint: Option<Entrypoint>,
         pub pty: bool,
         #[serde(serialize_with = "serialize_hash")]
         pub hash: Vec<u8>,
         pub transparent: bool,
+    }
+
+    /// For tests and struct-update syntax (`..Default::default()`); `raw_def` is
+    /// a unit placeholder, caching is off.
+    impl Default for TargetDef {
+        fn default() -> Self {
+            Self {
+                addr: Addr::default(),
+                labels: Vec::new(),
+                raw_def: Arc::new(()),
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                support_files: Vec::new(),
+                cache: CacheConfig::off(),
+                entrypoint: None,
+                pty: false,
+                hash: Vec::new(),
+                transparent: false,
+            }
+        }
     }
 
     impl TargetDef {
@@ -645,15 +732,8 @@ pub mod targetdef {
         fn td(raw: Arc<dyn RawDef>) -> TargetDef {
             TargetDef {
                 addr: Addr::new(PkgBuf::from("//x"), "y".to_string(), Default::default()),
-                labels: vec![],
                 raw_def: raw,
-                inputs: vec![],
-                outputs: vec![],
-                support_files: vec![],
-                cache: CacheConfig::off(),
-                pty: false,
-                hash: vec![],
-                transparent: false,
+                ..Default::default()
             }
         }
 
@@ -1116,6 +1196,9 @@ pub struct CredentialMount {
 /// than left for someone to discover in a log.
 pub const REDACT_MIN_LEN: usize = 8;
 
+/// One run of a target. `#[non_exhaustive]`: built with [`RunRequest::new`]
+/// and field assignment outside this crate.
+#[non_exhaustive]
 pub struct RunRequest<'a, 'io> {
     pub request_id: &'a String,
     pub target: &'a targetdef::TargetDef,
@@ -1138,6 +1221,240 @@ pub struct RunRequest<'a, 'io> {
     /// driver that reached in here would have to know that a field with no
     /// reference in it has no entry, and that an entry may not be finished yet.
     pub deferred: std::collections::BTreeMap<String, DeferredValue>,
+    /// How the run meets the caller's world: cwd, environment, args, stdio.
+    /// [`Default`] (every build) is today's sandboxed, captured run.
+    ///
+    /// Only an entrypoint's run (a def with
+    /// [`TargetDef::entrypoint`](targetdef::TargetDef::entrypoint) set) ever
+    /// gets a non-default value (N6/N9): such a run is uncached and no one's
+    /// input, so a driver may honour these without asking what they do to a
+    /// cache key. They are never hashed. Such a run may be one of several in
+    /// flight for the same addr, each in its own `sandbox_dir` (see
+    /// [`TargetDef::entrypoint`](targetdef::TargetDef::entrypoint)).
+    ///
+    /// Under [`RunStdio::Inherit`], a managed driver's `run` is called after
+    /// the host fired the [`Handover`]; a plain driver's, right after the
+    /// engine fired it.
+    pub options: RunOptions,
+}
+
+/// The parts of a run that come from the caller rather than the def.
+///
+/// Generic: nothing here says "entrypoint". A driver honours each field it
+/// supports (exec honours all of them) and the engine is the only sender.
+///
+/// Not `Clone`: [`RunStdio::Inherit`] owns the signal receiver, which moves into
+/// the driver's spawn. `Debug` is hand-written and prints `base_env` keys only —
+/// the caller's environment holds secrets.
+///
+/// `#[non_exhaustive]`: built with [`Default`] and the `with_*` setters, so a
+/// later option is not a source break for every sender.
+#[derive(Default)]
+#[non_exhaustive]
+pub struct RunOptions {
+    /// Run in this directory instead of the sandbox package dir.
+    pub cwd: Option<PathBuf>,
+    /// The bottom layer of the run's environment, under the target's own env
+    /// (which wins on a duplicate key). Raw `OsString`s, unfiltered: a
+    /// non-UTF-8 or very long value reaches the process as the caller had it.
+    /// `None` keeps the driver's own base (exec builds from empty); `Some(vec![])`
+    /// is an explicitly empty base. Order is the caller's; on a duplicate key
+    /// the later one wins, as `execve` consumers resolve it.
+    pub base_env: Option<Vec<(std::ffi::OsString, std::ffi::OsString)>>,
+    /// The caller's trailing args, appended to the command. `None` means the
+    /// run takes no args; `Some(vec![])` means it accepts args and none were
+    /// given (`--shell` keys its args mode on this, not on emptiness).
+    pub args: Option<Vec<std::ffi::OsString>>,
+    /// Captured (the default) or the caller's own terminal.
+    pub stdio: RunStdio,
+}
+
+impl RunOptions {
+    pub fn with_cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
+        self.cwd = Some(cwd.into());
+        self
+    }
+
+    pub fn with_base_env(mut self, env: Vec<(std::ffi::OsString, std::ffi::OsString)>) -> Self {
+        self.base_env = Some(env);
+        self
+    }
+
+    pub fn with_args(mut self, args: Vec<std::ffi::OsString>) -> Self {
+        self.args = Some(args);
+        self
+    }
+
+    pub fn with_stdio(mut self, stdio: RunStdio) -> Self {
+        self.stdio = stdio;
+        self
+    }
+
+    /// Every field at its default: a build's run. What a def that declared no
+    /// entrypoint must always be sent (N9).
+    pub fn is_default(&self) -> bool {
+        // Destructured, so a new field cannot be forgotten here (N9 rests on it).
+        let Self {
+            cwd,
+            base_env,
+            args,
+            stdio,
+        } = self;
+        cwd.is_none() && base_env.is_none() && args.is_none() && matches!(stdio, RunStdio::Captured)
+    }
+}
+
+impl std::fmt::Debug for RunOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Keys only: a value is the caller's, and may be a token.
+        let base_env_keys = self
+            .base_env
+            .as_ref()
+            .map(|env| env.iter().map(|(k, _)| k).collect::<Vec<_>>());
+        f.debug_struct("RunOptions")
+            .field("cwd", &self.cwd)
+            .field("base_env_keys", &base_env_keys)
+            .field("args", &self.args)
+            .field("stdio", &self.stdio)
+            .finish()
+    }
+}
+
+/// Where a run's stdio goes.
+#[derive(Debug, Default)]
+#[non_exhaustive]
+pub enum RunStdio {
+    /// Today's behaviour: the driver captures output (pipes or its own PTY,
+    /// teed into the log) and copies it to the request's `stdout`/`stderr`.
+    #[default]
+    Captured,
+    /// The process inherits heph's own fds 0–2 and its terminal, in heph's
+    /// process group, with no tee and no new session. The request's `stdin`,
+    /// `stdout` and `stderr` are `None`: there is nothing to copy.
+    Inherit(Foreground),
+}
+
+/// What a run in the caller's terminal needs beyond its fds.
+///
+/// `#[non_exhaustive]`: built with [`Foreground::new`].
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct Foreground {
+    /// Signals the host relays to the process while it runs. The driver that
+    /// spawned it delivers each with `kill(pid, signo)`, selecting over this
+    /// and the child's exit in one task so it never signals a reaped pid. A
+    /// signal sent before the spawn waits here until the child exists; one
+    /// left when the child exits is dropped. A closed channel means "no more
+    /// signals", never a cancel.
+    pub signals: SignalReceiver,
+    /// Signal dispositions to set in the child before it execs, so it keeps
+    /// the caller's (a `nohup`'d SIGINT stays ignored). The host recorded
+    /// them at startup, before changing any; a plugin cannot read that host
+    /// state, so it travels as data. Signals not listed are left as the
+    /// spawn would leave them.
+    pub dispositions: Vec<(Signal, Disposition)>,
+    /// The `RLIMIT_NOFILE` soft limit to set in the child before it execs: the
+    /// caller's, before heph raised its own (R8). Host state a plugin cannot
+    /// read, so it travels as data. `None` leaves the process's current limit.
+    pub nofile: Option<u64>,
+    /// The signals to block in the child before it execs: the caller's mask
+    /// (std clears it in every child otherwise). Host state, as above.
+    pub blocked: Vec<Signal>,
+    /// Host-only: what the host does at the moment the terminal is handed to
+    /// the program — after the inputs are materialized, right before the
+    /// driver that spawns it is called. Fired at most once, by the managed
+    /// layer for a managed driver and by the engine for any other. Never
+    /// crosses the plugin seam. See [`Handover`].
+    pub handover: Option<Handover>,
+}
+
+impl Foreground {
+    pub fn new(signals: SignalReceiver, dispositions: Vec<(Signal, Disposition)>) -> Self {
+        Self {
+            signals,
+            dispositions,
+            nofile: None,
+            blocked: Vec::new(),
+            handover: None,
+        }
+    }
+
+    pub fn with_nofile(mut self, nofile: Option<u64>) -> Self {
+        self.nofile = nofile;
+        self
+    }
+
+    pub fn with_blocked(mut self, blocked: Vec<Signal>) -> Self {
+        self.blocked = blocked;
+        self
+    }
+
+    pub fn with_handover(mut self, handover: Handover) -> Self {
+        self.handover = Some(handover);
+        self
+    }
+}
+
+impl hcore::process::CallerState for Foreground {
+    fn dispositions(&self) -> &[(Signal, Disposition)] {
+        &self.dispositions
+    }
+    fn nofile(&self) -> Option<u64> {
+        self.nofile
+    }
+    fn blocked(&self) -> &[Signal] {
+        &self.blocked
+    }
+}
+
+/// A one-shot hook the host runs when a run in the caller's terminal is about
+/// to spawn its program ([`Foreground::handover`]): the binary stops treating
+/// Ctrl-C as "cancel" from that moment, while everything before it — deps,
+/// materializing the closure — stays cancellable (R9).
+pub struct Handover(Box<dyn FnOnce() + Send + Sync>);
+
+impl Handover {
+    pub fn new(f: impl FnOnce() + Send + Sync + 'static) -> Self {
+        Self(Box::new(f))
+    }
+
+    /// Run the hook.
+    pub fn fire(self) {
+        (self.0)();
+    }
+}
+
+impl std::fmt::Debug for Handover {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Handover")
+    }
+}
+
+impl RunOptions {
+    /// Fire the [`Foreground::handover`] hook, if this run has one that has
+    /// not fired yet. Called by whoever hands the request to the driver that
+    /// spawns the program.
+    pub fn fire_handover(&mut self) {
+        if let RunStdio::Inherit(fg) = &mut self.stdio
+            && let Some(h) = fg.handover.take()
+        {
+            h.fire();
+        }
+    }
+}
+
+pub use hcore::process::{Disposition, Signal};
+
+/// The receiving end of a run's signal relay ([`Foreground::signals`]).
+/// Unbounded: the sender is a signal listener that must never block, and a
+/// burst of signals is a handful of integers.
+pub type SignalReceiver = tokio::sync::mpsc::UnboundedReceiver<Signal>;
+/// The host's end of [`SignalReceiver`].
+pub type SignalSender = tokio::sync::mpsc::UnboundedSender<Signal>;
+
+/// A fresh relay channel for [`Foreground::signals`].
+pub fn signal_channel() -> (SignalSender, SignalReceiver) {
+    tokio::sync::mpsc::unbounded_channel()
 }
 
 /// A deferred field, before or after the sandbox exists.
@@ -1171,6 +1488,58 @@ pub enum DeferredValue {
 }
 
 impl<'a, 'io> RunRequest<'a, 'io> {
+    /// A request with no inputs, no stdio, no mounts and default
+    /// [`RunOptions`]; a sender sets the rest by assigning the public fields.
+    ///
+    /// `RunRequest` is `#[non_exhaustive]`, so outside this crate this is the
+    /// only way to build one, and a later field is not a source break.
+    pub fn new(
+        request_id: &'a String,
+        target: &'a targetdef::TargetDef,
+        sandbox_dir: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            request_id,
+            target,
+            tree_root_path: PathBuf::new(),
+            inputs: Vec::new(),
+            hashin: "",
+            stdin: None,
+            stdout: None,
+            stderr: None,
+            sandbox_dir: sandbox_dir.into(),
+            scratch: Vec::new(),
+            credentials: Vec::new(),
+            deferred: std::collections::BTreeMap::new(),
+            options: RunOptions::default(),
+        }
+    }
+
+    /// The same request against another def — every other field, the
+    /// stdio and the options included, moves across unchanged. For a layer
+    /// that re-parses the target with a different driver (the shell fallback)
+    /// without having to name, and so silently drop, a field.
+    pub fn with_target<'b>(self, target: &'b targetdef::TargetDef) -> RunRequest<'b, 'io>
+    where
+        'a: 'b,
+    {
+        RunRequest {
+            request_id: self.request_id,
+            target,
+            tree_root_path: self.tree_root_path,
+            inputs: self.inputs,
+            hashin: self.hashin,
+            stdin: self.stdin,
+            stdout: self.stdout,
+            stderr: self.stderr,
+            sandbox_dir: self.sandbox_dir,
+            scratch: self.scratch,
+            credentials: self.credentials,
+            deferred: self.deferred,
+            options: self.options,
+        }
+    }
+
     /// The value of a deferred field.
     ///
     /// Takes `&self`, which is what makes it reachable only at run — using an
@@ -1219,34 +1588,15 @@ mod resolve_tests {
         target: &'a targetdef::TargetDef,
         deferred: BTreeMap<String, DeferredValue>,
     ) -> RunRequest<'a, 'static> {
-        RunRequest {
-            request_id: id,
-            target,
-            tree_root_path: Default::default(),
-            inputs: vec![],
-            hashin: "",
-            stdin: None,
-            stdout: None,
-            stderr: None,
-            sandbox_dir: Default::default(),
-            scratch: vec![],
-            credentials: vec![],
-            deferred,
-        }
+        let mut r = RunRequest::new(id, target, PathBuf::new());
+        r.deferred = deferred;
+        r
     }
 
     fn target() -> targetdef::TargetDef {
         targetdef::TargetDef {
-            addr: Default::default(),
-            labels: vec![],
-            raw_def: std::sync::Arc::new(()),
-            inputs: vec![],
-            outputs: vec![],
-            support_files: vec![],
             cache: targetdef::CacheConfig::on(false),
-            pty: false,
-            hash: vec![],
-            transparent: false,
+            ..Default::default()
         }
     }
 

@@ -619,6 +619,8 @@ fn spawn_with(spec: Spec, capacity: DrainCapacity) -> io::Result<Handle> {
     // in between would leave it unreaped (it starts lazily; see
     // `process_supervisor::init`).
     super::ensure_supervisor_for(&program)?;
+    // A `pre_exec` closure makes this a `fork`: see `fork_safety`.
+    crate::fork_safety::prime();
     let mut child = cmd.spawn()?;
     let pid = child.id() as i32;
 

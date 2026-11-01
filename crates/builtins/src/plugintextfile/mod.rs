@@ -6,7 +6,7 @@ use hplugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
     ParseResponse, RunRequest, RunResponse, outputartifact,
     targetdef::{
-        CacheConfig, Output, TargetDef,
+        Output, TargetDef,
         path::{CodegenMode, Content, Path},
     },
 };
@@ -86,7 +86,6 @@ impl hplugin::driver::Driver for Driver {
                     out: out.clone(),
                     executable,
                 }),
-                inputs: vec![],
                 outputs: vec![Output {
                     group: "".to_string(),
                     paths: vec![Path {
@@ -95,11 +94,8 @@ impl hplugin::driver::Driver for Driver {
                         collect: false,
                     }],
                 }],
-                support_files: vec![],
-                cache: CacheConfig::off(),
-                pty: false,
                 hash,
-                transparent: false,
+                ..Default::default()
             },
         })
     }
@@ -188,22 +184,12 @@ mod tests {
         target: &'a TargetDef,
         request_id: &'a String,
         sandbox_dir: &std::path::Path,
-        hashin: &'a String,
+        hashin: &'a str,
     ) -> RunRequest<'a, 'static> {
-        RunRequest {
-            request_id,
-            target,
-            tree_root_path: sandbox_dir.to_path_buf(),
-            inputs: vec![],
-            hashin,
-            stdin: None,
-            stdout: None,
-            stderr: None,
-            sandbox_dir: sandbox_dir.to_path_buf(),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        }
+        let mut req = RunRequest::new(request_id, target, sandbox_dir);
+        req.tree_root_path = sandbox_dir.to_path_buf();
+        req.hashin = hashin;
+        req
     }
 
     fn basic_config(text: &str, out: &str) -> HashMap<String, Value> {

@@ -2,7 +2,7 @@
 //! TUI's Ctrl+C handler. Lives here (the lowest crate) so the TUI can hold a
 //! `ShutdownTrigger` without depending on the bin's bootstrap module.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
@@ -37,7 +37,7 @@ impl ShutdownTrigger {
     }
 
     pub fn trigger(&self) {
-        if self.suppressed.load(Ordering::Acquire) {
+        if self.suppressed.load(Ordering::Acquire) || is_transparent() {
             return;
         }
         _ = self.tx.send(());
@@ -59,6 +59,67 @@ impl SuppressionHandle {
     pub fn set(&self, suppressed: bool) {
         self.flag.store(suppressed, Ordering::Release);
     }
+}
+
+/// How many [`TransparencyGuard`]s are alive in this process.
+static TRANSPARENT: AtomicUsize = AtomicUsize::new(0);
+
+/// While held, heph is *transparent*: a program it handed the terminal to (an
+/// entrypoint, E8/N4a) owns every signal, and heph acts on none of them. The
+/// shutdown trigger drops every press (one it accepted before the hold was
+/// taken still cancels: it was pressed before the program existed), and the
+/// diagnostic handlers (`SIGQUIT` dump, `SIGUSR1`
+/// per-thread backtraces, `SIGUSR2` profile dump) do nothing.
+///
+/// Refcounted, so two invocations in one process never end each other's
+/// transparency: it lasts while any guard is alive. Taken right before the
+/// program is forked — before that, Ctrl-C cancels as on any run — and
+/// handed back to [`tool_exited`] once the program exits, after which a
+/// signal is heph's again but changes nothing about how heph exits (R27).
+#[derive(Debug)]
+#[must_use = "transparency ends when the guard drops"]
+pub struct TransparencyGuard(());
+
+/// Become transparent until the returned guard drops (see
+/// [`TransparencyGuard`]).
+pub fn hold_transparent() -> TransparencyGuard {
+    TRANSPARENT.fetch_add(1, Ordering::AcqRel);
+    TransparencyGuard(())
+}
+
+/// Whether any [`TransparencyGuard`] is alive. One atomic load, so it is safe
+/// to call from a signal handler.
+pub fn is_transparent() -> bool {
+    TRANSPARENT.load(Ordering::Acquire) > 0
+}
+
+impl Drop for TransparencyGuard {
+    fn drop(&mut self) {
+        TRANSPARENT.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Set once a program heph handed the terminal to has exited (R27).
+static AFTER_TOOL: AtomicBool = AtomicBool::new(false);
+
+/// The program heph handed the terminal to has exited: end this invocation's
+/// transparency (`guard`), and from now on, once no other program holds it,
+/// heph is finishing up on the program's behalf — uploads, cleanup — and
+/// exits with the program's status whatever happens.
+///
+/// Signals are heph's again (R27): Ctrl-C, TERM and HUP cancel what is
+/// left, so heph exits promptly. Only one thing of R9 survives: such a late
+/// signal prints nothing and never changes the exit status (no cancellation
+/// box, no 130, no hard abort). Read with [`is_after_tool`].
+pub fn tool_exited(guard: TransparencyGuard) {
+    AFTER_TOOL.store(true, Ordering::Release);
+    drop(guard);
+}
+
+/// Whether a program heph handed the terminal to has exited
+/// ([`tool_exited`]). One atomic load: signal-handler safe.
+pub fn is_after_tool() -> bool {
+    AFTER_TOOL.load(Ordering::Acquire)
 }
 
 type RestoreFn = Arc<dyn Fn() + Send + Sync>;
@@ -112,6 +173,48 @@ mod tests {
     // Serialized: TERMINAL_RESTORE is a process-global static, so concurrent
     // test runs on the same binary would stomp each other's registration.
     static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Two holders never end each other's transparency, and a press while
+    /// either is held is dropped — the case a single bool got wrong: the
+    /// first invocation to finish cleared it under the second.
+    #[test]
+    fn transparency_is_refcounted_and_drops_presses() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (trigger, mut rx) = ShutdownTrigger::new();
+        assert!(!is_transparent());
+
+        let first = hold_transparent();
+        let second = hold_transparent();
+        drop(first);
+        assert!(is_transparent(), "the second holder still holds");
+        trigger.trigger();
+        assert!(rx.try_recv().is_err(), "a press while held is dropped");
+
+        drop(second);
+        assert!(!is_transparent());
+        trigger.trigger();
+        assert!(rx.try_recv().is_ok(), "presses count again once released");
+    }
+
+    /// R27: one tool exiting ends only its own transparency — a press is
+    /// still dropped while another invocation's tool runs — and once none
+    /// runs, presses reach heph again, which now knows a tool has exited.
+    #[test]
+    fn tool_exited_ends_only_its_own_transparency() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (trigger, mut rx) = ShutdownTrigger::new();
+        let first = hold_transparent();
+        let second = hold_transparent();
+        tool_exited(first);
+        assert!(is_after_tool());
+        assert!(is_transparent(), "the other tool still runs");
+        trigger.trigger();
+        assert!(rx.try_recv().is_err(), "its press is the tool's");
+        tool_exited(second);
+        assert!(!is_transparent());
+        trigger.trigger();
+        assert!(rx.try_recv().is_ok(), "heph's again once no tool runs");
+    }
 
     #[test]
     fn restore_terminal_is_noop_when_nothing_registered() {

@@ -383,3 +383,54 @@ fn the_pull_request_trigger_is_unfiltered() {
          Skip stacked PRs in the `gate` job instead:\n{trigger}"
     );
 }
+
+/// A test-only cdylib (`crates/plugin-entrypoint-test-cdylib`) is built and
+/// uploaded by `build` for `bin_e2e`, and must never become a release asset.
+/// The exclusion is by name: it is uploaded as `test-*`, and everything that
+/// publishes or measures artifacts downloads `heph*`. A fixture renamed
+/// `heph-*`, or a download pattern widened past `heph`, would ship it silently
+/// in every Pre-release.
+#[test]
+fn test_fixtures_are_never_published() {
+    let workflow = workflow();
+    let jobs = workflow_jobs(&workflow);
+    let build = jobs
+        .iter()
+        .find(|(id, _)| *id == "build")
+        .map(|(_, body)| without_comments(body))
+        .expect("`heph.yml` has a `build` job");
+    let fixture = build
+        .lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix("TEST_ENTRYPOINT_NAME="))
+        .expect("`build` names the entrypoint test cdylib");
+    assert!(
+        fixture.trim_matches('"').starts_with("test-"),
+        "the test cdylib is uploaded as {fixture}; anything not `test-*` can \
+         match the release's `heph*` pattern"
+    );
+
+    let perf = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/perf.yml"),
+    )
+    .expect("read .github/workflows/perf.yml");
+    let mut publishing = jobs
+        .iter()
+        .filter(|(id, _)| *id != "bin_e2e")
+        .map(|(id, body)| (format!("heph.yml {id}"), without_comments(body)))
+        .collect::<Vec<_>>();
+    publishing.push(("perf.yml".to_owned(), without_comments(&perf)));
+    for (job, body) in publishing {
+        for line in body.lines().map(str::trim) {
+            let Some(pattern) = line.strip_prefix("pattern:") else {
+                continue;
+            };
+            assert!(
+                pattern.trim().trim_matches('"').starts_with("heph"),
+                "{job} downloads `{}`, which is not limited to `heph*` and so \
+                 can pick up the test-only cdylib",
+                pattern.trim()
+            );
+        }
+    }
+}

@@ -187,7 +187,6 @@ mod tests {
     use crate::engine::driver::targetdef::path::Path;
     use hmodel::htaddr::Addr;
     use std::collections::BTreeMap;
-    use std::sync::Arc;
 
     fn addr(pkg: &str, name: &str) -> Addr {
         Addr::new(PkgBuf::from(pkg), name.to_string(), BTreeMap::new())
@@ -229,14 +228,7 @@ mod tests {
         TargetDef {
             addr: addr(pkg, name),
             labels: labels.iter().map(|s| s.to_string()).collect(),
-            raw_def: Arc::new(()),
-            inputs: vec![],
-            outputs: vec![],
-            support_files: vec![],
-            cache: crate::engine::driver::targetdef::CacheConfig::off(),
-            pty: false,
-            hash: vec![],
-            transparent: false,
+            ..Default::default()
         }
     }
 
@@ -370,18 +362,11 @@ mod tests {
         use crate::engine::driver::targetdef::Output;
         TargetDef {
             addr: addr(pkg, name),
-            labels: vec![],
-            raw_def: Arc::new(()),
-            inputs: vec![],
             outputs: vec![Output {
                 group: "out".to_string(),
                 paths,
             }],
-            support_files: vec![],
-            cache: crate::engine::driver::targetdef::CacheConfig::off(),
-            pty: false,
-            hash: vec![],
-            transparent: false,
+            ..Default::default()
         }
     }
 

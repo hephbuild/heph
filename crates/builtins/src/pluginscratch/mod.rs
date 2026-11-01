@@ -24,8 +24,7 @@ use hcore::hasync::Cancellable;
 use hcore::htvalue::signature::ParamType;
 use hplugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
-    ParseResponse, RunRequest, RunResponse,
-    targetdef::{CacheConfig, TargetDef},
+    ParseResponse, RunRequest, RunResponse, targetdef::TargetDef,
 };
 use hplugin::htspec::Spec;
 use std::sync::Arc;
@@ -303,16 +302,12 @@ impl hplugin::driver::Driver for Driver {
                 addr: req.target_spec.addr.clone(),
                 labels: req.target_spec.labels.clone(),
                 raw_def: Arc::new(def),
-                inputs: vec![],
-                outputs: vec![],
-                support_files: vec![],
-                // Never cached as a target: there is nothing to cache. The
-                // directory it names is managed by the engine's scratch store,
-                // which is a different thing with a different lifetime.
-                cache: CacheConfig::off(),
-                pty: false,
                 hash,
-                transparent: false,
+                // Never cached as a target (the default `CacheConfig::off()`):
+                // there is nothing to cache. The directory it names is managed
+                // by the engine's scratch store, which is a different thing
+                // with a different lifetime.
+                ..Default::default()
             },
         })
     }
@@ -639,20 +634,10 @@ mod tests {
         let def = parse_def(&[("path", s("c"))], "gocache")
             .await
             .expect("parse");
-        let req = RunRequest {
-            request_id: &"t".to_string(),
-            target: &def,
-            tree_root_path: std::path::PathBuf::from("/"),
-            inputs: vec![],
-            hashin: "h",
-            stdin: None,
-            stdout: None,
-            stderr: None,
-            sandbox_dir: std::path::PathBuf::from("/tmp"),
-            scratch: vec![],
-            credentials: vec![],
-            deferred: Default::default(),
-        };
+        let request_id = "t".to_string();
+        let mut req = RunRequest::new(&request_id, &def, "/tmp");
+        req.tree_root_path = std::path::PathBuf::from("/");
+        req.hashin = "h";
         let res = Driver
             .run(req, &ctoken())
             .await

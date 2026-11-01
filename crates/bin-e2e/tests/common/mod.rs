@@ -27,6 +27,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use tempfile::TempDir;
 
+pub mod pty;
+
 /// Env var naming the staged artifact directory.
 ///
 /// Set by the `e2e` devenv script, which is the only supported entrypoint —
@@ -71,6 +73,13 @@ impl Dist {
     /// `<dist>/heph-go-plugin.<ext>`.
     pub fn plugin(&self, name: &str) -> PathBuf {
         self.root.join(format!("heph-{name}-plugin.{DYLIB_EXT}"))
+    }
+
+    /// Path to a test-only plugin cdylib, built and staged with the shipped
+    /// ones but never published, e.g. `test_plugin("entrypoint")` →
+    /// `<dist>/test-entrypoint-plugin.<ext>`.
+    pub fn test_plugin(&self, name: &str) -> PathBuf {
+        self.root.join(format!("test-{name}-plugin.{DYLIB_EXT}"))
     }
 }
 
@@ -136,11 +145,47 @@ impl Workspace {
 
     /// Run to completion with both streams captured (so stderr is *not* a tty
     /// and the CI line renderer is selected).
+    ///
+    /// Bounded by [`RUN_DEADLINE`]: a hung heph is killed and the test fails
+    /// naming the command, instead of stalling the suite until CI's timeout.
     pub fn run(&self, dist: &Dist, args: &[&str]) -> Result<Output> {
-        self.cmd(dist, args)
+        let child = self
+            .cmd(dist, args)
             .stdin(Stdio::null())
-            .output()
-            .with_context(|| format!("spawn heph {}", args.join(" ")))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("spawn heph {}", args.join(" ")))?;
+        wait_output(child, RUN_DEADLINE).with_context(|| format!("heph {}", args.join(" ")))
+    }
+}
+
+/// How long any one heph run may take before the suite kills it: generous for
+/// a release binary building a dependency on a shared CI runner.
+pub const RUN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// `wait_with_output`, bounded: past `timeout` the child is SIGKILLed (its
+/// supervisor then reaps whatever it ran) and this is an error carrying what
+/// it printed so far.
+pub fn wait_output(child: std::process::Child, timeout: std::time::Duration) -> Result<Output> {
+    let pid = i32::try_from(child.id()).context("pid")?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        // The receiver gone means the caller already gave up on it.
+        drop(tx.send(child.wait_with_output()));
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(out) => out.context("wait for heph"),
+        Err(_) => {
+            // SAFETY: a plain syscall on integers; the waiter thread still
+            // owns the child, so the pid cannot have been reaped and reused.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            let out = rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .map(|o| o.map(|o| describe(&o)).unwrap_or_default())
+                .unwrap_or_default();
+            anyhow::bail!("still running after {timeout:?}; killed\n{out}")
+        }
     }
 }
 
@@ -239,6 +284,36 @@ pub fn take_dsr_queries(tail: &mut Vec<u8>) -> usize {
         tail.drain(..excess);
     }
     queries
+}
+
+/// Send `sig` to `pid`.
+pub fn signal(pid: i32, sig: i32) {
+    // SAFETY: a plain syscall on integers.
+    let rc = unsafe { libc::kill(pid, sig) };
+    assert_eq!(
+        rc,
+        0,
+        "kill({pid}, {sig}): {}",
+        std::io::Error::last_os_error()
+    );
+}
+
+/// Whether `pid` still exists (a zombie counts).
+pub fn alive(pid: i32) -> bool {
+    // SAFETY: signal 0 only checks that the pid exists.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// Poll `cond` until it holds, or panic naming `what`.
+pub fn wait_until(what: &str, timeout: std::time::Duration, mut cond: impl FnMut() -> bool) {
+    let started = std::time::Instant::now();
+    while !cond() {
+        assert!(
+            started.elapsed() < timeout,
+            "timed out after {timeout:?} waiting for {what}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 /// Host os/arch in the published-artifact spelling heph's manifest resolver
