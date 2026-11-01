@@ -109,8 +109,15 @@ impl Hash for GoDownloadDef {
 
 /// Host environment `go mod download` may see.
 ///
-/// These say where module bytes come from and how to reach them, and those bytes
-/// are verified against the checksum database, so none of them reach a hash.
+/// These say where module bytes come from and how to reach them, and none of them
+/// reach a hash.
+///
+/// **Accepted exemption: `module@version` is a name, not a content identity.** The
+/// stub go.mod has no go.sum, so the checksum database is the only check on the
+/// bytes, and `GOSUMDB=off` or `GONOSUMDB` here turns it off: two proxies serving
+/// different bytes for one version then share a key, and a tampered tree in a warm
+/// module cache is returned as is. The bash recipe had the same hole. Closing it
+/// means carrying go.sum's `h1:` into the def hash and checking the tree against it.
 ///
 /// `GOMODCACHE` is deliberately absent: the module cache is heph's scratch.
 const MODULE_FETCH_PASS_ENV: &[&str] = &[
@@ -120,9 +127,7 @@ const MODULE_FETCH_PASS_ENV: &[&str] = &[
     "GOPROXY",
     "GONOSUMDB",
     "GOSUMDB",
-    "GOFLAGS",
     "GOPRIVATE",
-    "GONOSUMCHECK",
     "GOINSECURE",
 ];
 
@@ -130,6 +135,7 @@ const MODULE_FETCH_PASS_ENV: &[&str] = &[
 /// describe an environment without mutating the process's own.
 fn download_env(
     go_version: &str,
+    has_runner: bool,
     goroot: &Path,
     gomodcache: &Path,
     host: impl Fn(&str) -> Option<String>,
@@ -141,11 +147,14 @@ fn download_env(
         }
     }
     // A non-hermetic `go` may be a wrapper that needs `PATH`. A hermetic one is
-    // PATH-independent, and the host's directories stay out.
-    if !matches!(
-        crate::plugingo::toolchain::classify(go_version),
-        crate::plugingo::toolchain::Toolchain::Hermetic(_)
-    ) && let Some(v) = host("PATH")
+    // PATH-independent, and the host's directories stay out. A runner supplies its
+    // own `PATH`: the host's would bring host tools into its environment.
+    if !has_runner
+        && !matches!(
+            crate::plugingo::toolchain::classify(go_version),
+            crate::plugingo::toolchain::Toolchain::Hermetic(_)
+        )
+        && let Some(v) = host("PATH")
     {
         env.insert("PATH".to_string(), v);
     }
@@ -160,38 +169,98 @@ fn download_env(
     env
 }
 
-/// The module directory out of `go mod download -json`'s stdout.
-fn parse_module_dir(stdout: &[u8]) -> anyhow::Result<PathBuf> {
+/// The module directory out of `go mod download -json`'s stdout, refusing an answer
+/// that is not the module the cache key names.
+///
+/// `@latest` or a branch name resolves to whatever is newest today, which would be
+/// cached forever under the key of the name.
+fn parse_module_dir(
+    stdout: &[u8],
+    module: &str,
+    version: &str,
+    gomodcache: &Path,
+) -> anyhow::Result<PathBuf> {
     #[derive(serde::Deserialize)]
     struct ModuleDownload {
+        #[serde(rename = "Path")]
+        path: Option<String>,
+        #[serde(rename = "Version")]
+        version: Option<String>,
         #[serde(rename = "Dir")]
         dir: Option<String>,
     }
 
-    let parsed: ModuleDownload = serde_json::from_slice(stdout).with_context(|| {
-        format!(
-            "parse `go mod download -json` output: {}",
-            String::from_utf8_lossy(stdout)
-        )
-    })?;
-    match parsed.dir {
-        Some(dir) if !dir.is_empty() => Ok(PathBuf::from(dir)),
-        _ => anyhow::bail!(
-            "go mod download produced no Dir: {}",
-            String::from_utf8_lossy(stdout)
-        ),
-    }
+    let raw = || String::from_utf8_lossy(stdout);
+    let parsed: ModuleDownload = serde_json::from_slice(stdout)
+        .with_context(|| format!("parse `go mod download -json` output: {}", raw()))?;
+    anyhow::ensure!(
+        parsed.path.as_deref() == Some(module) && parsed.version.as_deref() == Some(version),
+        "go mod download of {module}@{version} returned a different module: {}. Name an exact \
+         module version, not a query such as `latest` or a branch.",
+        raw()
+    );
+    let dir = match parsed.dir {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => anyhow::bail!("go mod download produced no Dir: {}", raw()),
+    };
+    // This process reads the tree, so a path outside the cache heph handed `go`
+    // would copy whatever the host has there.
+    anyhow::ensure!(
+        dir.starts_with(gomodcache),
+        "go mod download put {module}@{version} at {}, outside GOMODCACHE {}",
+        dir.display(),
+        gomodcache.display()
+    );
+    Ok(dir)
+}
+
+/// Which fetch variables heph passed to `go`, for a failure message. Names only: a
+/// `GOPROXY` URL can carry credentials.
+fn passed_env_note(env: &HashMap<String, String>) -> String {
+    let set: Vec<&str> = MODULE_FETCH_PASS_ENV
+        .iter()
+        .copied()
+        .filter(|name| env.contains_key(*name))
+        .collect();
+    format!(
+        "heph passes only these variables from its own environment to go: {}. Set here: {}.",
+        MODULE_FETCH_PASS_ENV.join(", "),
+        if set.is_empty() {
+            "none".to_string()
+        } else {
+            set.join(", ")
+        }
+    )
+}
+
+/// One `go mod download` to run.
+struct ModuleFetch<'a> {
+    go_bin: &'a Path,
+    module: &'a str,
+    version: &'a str,
+    env: &'a HashMap<String, String>,
+    gomodcache: &'a Path,
+    /// Outside the directory outputs are collected from, so the stub go.mod can
+    /// never end up in an artifact.
+    cwd: &'a Path,
 }
 
 /// Run `go mod download` for one module and return the directory `go` put it in.
 async fn fetch_module(
-    go_bin: &Path,
-    mod_at_ver: &str,
-    env: &HashMap<String, String>,
-    cwd: &Path,
+    fetch: ModuleFetch<'_>,
     runner: hexecrunner::RunnerRef<'_>,
     ctoken: &(dyn Cancellable + Send + Sync),
 ) -> anyhow::Result<PathBuf> {
+    let ModuleFetch {
+        go_bin,
+        module,
+        version,
+        env,
+        gomodcache,
+        cwd,
+    } = fetch;
+    let mod_at_ver = format!("{module}@{version}");
+
     // Without a go.mod here, Go would walk up and read one above the sandbox.
     let stub = cwd.join("go.mod");
     std::fs::write(&stub, "module heph_ignore\n")
@@ -199,7 +268,7 @@ async fn fetch_module(
 
     let spec = proc_exec::Spec {
         program: go_bin.to_path_buf(),
-        args: ["mod", "download", "-modcacherw", "-json", mod_at_ver]
+        args: ["mod", "download", "-modcacherw", "-json", &mod_at_ver]
             .iter()
             .map(OsString::from)
             .collect(),
@@ -211,7 +280,9 @@ async fn fetch_module(
         stdin: proc_exec::StdioSpec::Null,
         stdout: proc_exec::StdioSpec::Piped,
         stderr: proc_exec::StdioSpec::Piped,
-        setsid: false,
+        // setsid: in direct mode `go` forks `git` and friends; the supervisor's
+        // killpg needs the whole group, or a cancel orphans them in the module cache.
+        setsid: true,
         ctty: false,
     };
     let output = hexecrunner::output(runner, spec, ctoken)
@@ -219,31 +290,35 @@ async fn fetch_module(
         .with_context(|| format!("wait for go mod download {mod_at_ver}"))?;
     if !output.status.success() {
         anyhow::bail!(
-            "go mod download {mod_at_ver} failed ({}):\n{}",
+            "go mod download {mod_at_ver} failed ({}):\n{}\n{}",
             output.status,
             crate::plugingo::driver_compile::go_failure_detail(
                 &String::from_utf8_lossy(&output.stdout),
                 &String::from_utf8_lossy(&output.stderr),
-            )
+            ),
+            passed_env_note(env)
         );
     }
 
-    // Removed before the copy: the module's own go.mod belongs at this path.
-    std::fs::remove_file(&stub).with_context(|| format!("remove stub {}", stub.display()))?;
-    parse_module_dir(&output.stdout)
+    parse_module_dir(&output.stdout, module, version, gomodcache)
 }
 
 /// Copy a module tree, leaving every file owner-writable.
 ///
 /// Go's module cache files are read-only even under `-modcacherw`, which only
-/// covers directories.
+/// covers directories. Go's module zips hold only directories and regular files,
+/// so anything else is refused.
 ///
 /// File contents go through `io::copy` rather than `std::fs::copy`, which on
-/// macOS also copies xattrs (`com.apple.quarantine` on Go's cache files), and a
-/// FUSE overlay rejects xattr writes with EPERM.
-fn copy_module(src: &Path, dst: &Path) -> anyhow::Result<()> {
+/// macOS also copies xattrs (`com.apple.quarantine` on Go's cache files).
+fn copy_module(
+    src: &Path,
+    dst: &Path,
+    ctoken: &(dyn Cancellable + Send + Sync),
+) -> anyhow::Result<()> {
     let entries = std::fs::read_dir(src).with_context(|| format!("read {}", src.display()))?;
     for entry in entries {
+        anyhow::ensure!(!ctoken.is_cancelled(), "module copy cancelled");
         let entry = entry.with_context(|| format!("read entry of {}", src.display()))?;
         let from = entry.path();
         let to = dst.join(entry.file_name());
@@ -253,12 +328,9 @@ fn copy_module(src: &Path, dst: &Path) -> anyhow::Result<()> {
 
         if file_type.is_dir() {
             std::fs::create_dir_all(&to).with_context(|| format!("mkdir {}", to.display()))?;
-            copy_module(&from, &to)?;
-        } else if file_type.is_symlink() {
-            let target = std::fs::read_link(&from)
-                .with_context(|| format!("readlink {}", from.display()))?;
-            std::os::unix::fs::symlink(&target, &to)
-                .with_context(|| format!("symlink {}", to.display()))?;
+            copy_module(&from, &to, ctoken)?;
+        } else if !file_type.is_file() {
+            anyhow::bail!("{} is not a regular file or directory", from.display());
         } else {
             let mut reader =
                 std::fs::File::open(&from).with_context(|| format!("open {}", from.display()))?;
@@ -437,27 +509,42 @@ impl ManagedDriver for GoDownloadDriver {
                  empty one rather than none",
             )?;
 
-        let env = download_env(&def.go_version, &goroot, &gomodcache, |n| {
-            std::env::var(n).ok()
-        });
-        let mod_at_ver = format!("{}@{}", def.module, def.version);
+        let env = download_env(
+            &def.go_version,
+            def.runner.is_some(),
+            &goroot,
+            &gomodcache,
+            |n| std::env::var(n).ok(),
+        );
         let module_dir = fetch_module(
-            &go_bin,
-            &mod_at_ver,
-            &env,
-            &req.sandbox_pkg_dir,
+            ModuleFetch {
+                go_bin: &go_bin,
+                module: &def.module,
+                version: &def.version,
+                env: &env,
+                gomodcache: &gomodcache,
+                cwd: &req.sandbox_dir,
+            },
             runner,
             ctoken,
         )
         .await?;
 
-        let pkg_dir = req.sandbox_pkg_dir.clone();
-        tokio::task::spawn_blocking(
-            enclose!((module_dir) move || copy_module(&module_dir, &pkg_dir)),
-        )
+        // A cold build copies every module at once: the bounded pool, not bare
+        // `spawn_blocking`.
+        let cancel = ctoken.clone_arc();
+        hcore::blocking::run(enclose!(
+            (module_dir, req.sandbox_pkg_dir => pkg_dir) move || copy_module(&module_dir, &pkg_dir, &*cancel)
+        ))
         .await
-        .context("join module copy")?
-        .with_context(|| format!("copy {mod_at_ver} from {}", module_dir.display()))?;
+        .with_context(|| {
+            format!(
+                "copy {}@{} from {}",
+                def.module,
+                def.version,
+                module_dir.display()
+            )
+        })?;
 
         Ok(ManagedRunResponse { artifacts: vec![] })
     }
@@ -474,6 +561,10 @@ mod tests {
 
     fn no_host(_: &str) -> Option<String> {
         None
+    }
+
+    fn not_cancelled() -> hcore::hasync::StdCancellationToken {
+        hcore::hasync::StdCancellationToken::new()
     }
 
     fn spec(module: &str, version: &str) -> TargetSpec {
@@ -601,6 +692,16 @@ mod tests {
         assert_eq!(base, hash("gopkg.in/yaml.v2", "v2.4.0").await);
         assert_ne!(base, hash("gopkg.in/yaml.v3", "v2.4.0").await);
         assert_ne!(base, hash("gopkg.in/yaml.v2", "v2.4.1").await);
+
+        let mut other_go = spec("gopkg.in/yaml.v2", "v2.4.0");
+        other_go
+            .config
+            .insert("go_version".to_string(), Value::String("1.0.0".to_string()));
+        let other = parse_def(&GoDownloadDriver::new(), other_go)
+            .await
+            .unwrap()
+            .hash;
+        assert_ne!(base, other, "go_version is part of the key");
     }
 
     #[tokio::test]
@@ -621,6 +722,7 @@ mod tests {
         let host = |n: &str| Some(format!("host-{n}"));
         let env = download_env(
             DEFAULT_GO_VERSION,
+            false,
             Path::new("/goroot"),
             Path::new("/scratch"),
             host,
@@ -635,17 +737,27 @@ mod tests {
     }
 
     #[test]
-    fn host_toolchain_env_gets_the_host_path() {
-        let env = download_env(HOST, Path::new("/g"), Path::new("/s"), |n| {
-            Some(format!("host-{n}"))
-        });
-        assert_eq!(env["PATH"], "host-PATH");
+    fn non_hermetic_env_gets_the_host_path_unless_a_runner_supplies_one() {
+        for go_version in [HOST, "//tools:go"] {
+            let env = |has_runner| {
+                download_env(
+                    go_version,
+                    has_runner,
+                    Path::new("/g"),
+                    Path::new("/s"),
+                    |n| Some(format!("host-{n}")),
+                )
+            };
+            assert_eq!(env(false)["PATH"], "host-PATH", "{go_version}");
+            assert!(!env(true).contains_key("PATH"), "{go_version}");
+        }
     }
 
     #[test]
     fn env_pins_the_toolchain_whatever_the_host_says() {
         let env = download_env(
             DEFAULT_GO_VERSION,
+            false,
             Path::new("/g"),
             Path::new("/s"),
             no_host,
@@ -660,35 +772,67 @@ mod tests {
     #[test]
     fn parse_module_dir_table() {
         // The shape `go mod download -json` prints. `GoMod` mentions `Dir`.
-        let real = "{\n\t\"Path\": \"a.b/c\",\n\t\"GoMod\": \"/x/Dir/c.mod\",\n\t\
-                    \"Dir\": \"/cache/a.b/c@v1\",\n\t\"Sum\": \"h1:x=\"\n}\n";
-        let cases: &[(&str, &str, Option<&str>)] = &[
-            ("real output", real, Some("/cache/a.b/c@v1")),
+        let real = "{\n\t\"Path\": \"a.b/c\",\n\t\"Version\": \"v1\",\n\t\
+                    \"GoMod\": \"/cache/Dir/c.mod\",\n\t\"Dir\": \"/cache/a.b/c@v1\",\n\t\
+                    \"Sum\": \"h1:x=\"\n}\n";
+        let with_dir = |dir: &str| format!(r#"{{"Path":"a.b/c","Version":"v1",{dir}}}"#);
+        let escaped_amp = format!("\"Dir\":\"/cache/a{}0026b\"", "\\u");
+        let cases: Vec<(&str, String, Option<&str>)> = vec![
+            ("real output", real.to_string(), Some("/cache/a.b/c@v1")),
             (
                 "go escapes & in JSON",
-                r#"{"Dir":"/a&b/c"}"#,
-                Some("/a&b/c"),
+                with_dir(&escaped_amp),
+                Some("/cache/a&b"),
             ),
             (
-                r#"a quote in the path"#,
-                r#"{"Dir":"/a\"b/c"}"#,
-                Some("/a\"b/c"),
+                "a quote in the path",
+                with_dir(r#""Dir":"/cache/a\"b""#),
+                Some("/cache/a\"b"),
             ),
-            ("a space in the path", r#"{"Dir":"/a b/c"}"#, Some("/a b/c")),
-            ("non-ASCII path", r#"{"Dir":"/é/c"}"#, Some("/é/c")),
+            (
+                "a space in the path",
+                with_dir(r#""Dir":"/cache/a b""#),
+                Some("/cache/a b"),
+            ),
+            (
+                "non-ASCII path",
+                with_dir(r#""Dir":"/cache/é""#),
+                Some("/cache/é"),
+            ),
             (
                 "the key only in a value",
-                r#"{"Error":"\"Dir\": /x"}"#,
+                with_dir(r#""Error":"\"Dir\": /cache/x""#),
                 None,
             ),
-            ("near-miss key", r#"{"DirX":"/x"}"#, None),
-            ("no Dir", r#"{"Path":"a.b/c"}"#, None),
-            ("empty Dir", r#"{"Dir":""}"#, None),
-            ("empty output", "", None),
-            ("not JSON", "go: downloading a.b/c v1", None),
+            ("near-miss key", with_dir(r#""DirX":"/cache/x""#), None),
+            ("no Dir", with_dir(r#""Sum":"h1:x=""#), None),
+            ("empty Dir", with_dir(r#""Dir":"""#), None),
+            ("empty output", String::new(), None),
+            ("not JSON", "go: downloading a.b/c v1".to_string(), None),
+            ("outside the cache", with_dir(r#""Dir":"/etc""#), None),
+            (
+                "near-miss cache prefix",
+                with_dir(r#""Dir":"/cache-other/c""#),
+                None,
+            ),
+            (
+                "`latest` resolved to another version",
+                r#"{"Path":"a.b/c","Version":"v2","Dir":"/cache/c"}"#.to_string(),
+                None,
+            ),
+            (
+                "another module",
+                r#"{"Path":"a.b/d","Version":"v1","Dir":"/cache/d"}"#.to_string(),
+                None,
+            ),
+            (
+                "no version",
+                r#"{"Path":"a.b/c","Dir":"/cache/c"}"#.to_string(),
+                None,
+            ),
         ];
         for (name, input, want) in cases {
-            let got = parse_module_dir(input.as_bytes());
+            let got = parse_module_dir(input.as_bytes(), "a.b/c", "v1", Path::new("/cache"));
             match want {
                 Some(want) => assert_eq!(got.unwrap(), Path::new(want), "{name}"),
                 None => assert!(got.is_err(), "{name}: {got:?}"),
@@ -715,9 +859,8 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(src.join("tool.sh"), std::fs::Permissions::from_mode(0o555))
             .unwrap();
-        std::os::unix::fs::symlink("sub/deep/a.go", src.join("link")).unwrap();
 
-        copy_module(&src, &dst).unwrap();
+        copy_module(&src, &dst, &not_cancelled()).unwrap();
 
         assert_eq!(
             std::fs::read_to_string(dst.join(".gitignore")).unwrap(),
@@ -734,17 +877,42 @@ mod tests {
             "read-only source, writable copy"
         );
         assert_eq!(mode("tool.sh"), 0o700, "the executable bit survives");
-        assert_eq!(
-            std::fs::read_link(dst.join("link")).unwrap(),
-            Path::new("sub/deep/a.go")
-        );
     }
 
     #[test]
     fn copy_module_reports_a_missing_source() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let err = copy_module(&dir.path().join("absent"), dir.path()).unwrap_err();
+        let err =
+            copy_module(&dir.path().join("absent"), dir.path(), &not_cancelled()).unwrap_err();
         assert!(format!("{err:#}").contains("absent"), "{err:#}");
+    }
+
+    #[test]
+    fn copy_module_refuses_a_symlink() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::create_dir(&dst).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", src.join("link")).unwrap();
+        let err = copy_module(&src, &dst, &not_cancelled()).unwrap_err();
+        assert!(format!("{err:#}").contains("link"), "{err:#}");
+        assert!(!dst.join("link").exists());
+    }
+
+    #[test]
+    fn copy_module_stops_when_cancelled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::create_dir(&dst).unwrap();
+        std::fs::write(src.join("a.go"), "package a\n").unwrap();
+        let ct = hcore::hasync::StdCancellationToken::new();
+        ct.cancel();
+        let err = copy_module(&src, &dst, &ct).unwrap_err();
+        assert!(format!("{err:#}").contains("cancelled"), "{err:#}");
+        assert!(!dst.join("a.go").exists());
     }
 
     // ---- fetch_module ----
@@ -761,11 +929,16 @@ mod tests {
 
     async fn fetch(go: &Path, cwd: &Path) -> anyhow::Result<PathBuf> {
         let ct = hcore::hasync::StdCancellationToken::new();
+        let env = HashMap::from([("GOPROXY".to_string(), "https://secret@proxy".to_string())]);
         fetch_module(
-            go,
-            "a.b/c@v1",
-            &HashMap::new(),
-            cwd,
+            ModuleFetch {
+                go_bin: go,
+                module: "a.b/c",
+                version: "v1",
+                env: &env,
+                gomodcache: Path::new("/cache"),
+                cwd,
+            },
             hexecrunner::RunnerRef::local(),
             &ct,
         )
@@ -773,7 +946,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_module_runs_go_behind_a_stub_and_removes_it() {
+    async fn fetch_module_runs_go_behind_a_stub() {
         let dir = tempfile::tempdir().expect("tempdir");
         let cwd = dir.path().join("cwd");
         std::fs::create_dir(&cwd).unwrap();
@@ -781,14 +954,10 @@ mod tests {
             dir.path(),
             r#"[ -f go.mod ] || { printf 'no stub' >&2; exit 2; }
 [ "$*" = "mod download -modcacherw -json a.b/c@v1" ] || { printf 'args: %s' "$*" >&2; exit 3; }
-printf '{"Dir":"/cache/c@v1"}\n'"#,
+printf '{"Path":"a.b/c","Version":"v1","Dir":"/cache/c@v1"}\n'"#,
         );
         let got = fetch(&go, &cwd).await.unwrap();
         assert_eq!(got, Path::new("/cache/c@v1"));
-        assert!(
-            !cwd.join("go.mod").exists(),
-            "`out = **/*` would collect the stub"
-        );
     }
 
     #[tokio::test]
@@ -805,12 +974,17 @@ exit 1"#,
         assert!(msg.contains("a.b/c@v1"), "{msg}");
         assert!(msg.contains("unknown revision v1"), "{msg}");
         assert!(msg.contains("dial tcp: refused"), "{msg}");
+        assert!(msg.contains("Set here: GOPROXY."), "{msg}");
+        assert!(
+            !msg.contains("secret"),
+            "a proxy URL can hold credentials: {msg}"
+        );
     }
 
     #[tokio::test]
     async fn fetch_module_fails_when_go_reports_no_dir() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let go = fake_go(dir.path(), r#"printf '{"Path":"a.b/c"}\n'"#);
+        let go = fake_go(dir.path(), r#"printf '{"Path":"a.b/c","Version":"v1"}\n'"#);
         let err = fetch(&go, dir.path()).await.unwrap_err();
         assert!(
             format!("{err:#}").contains("go mod download produced no Dir"),

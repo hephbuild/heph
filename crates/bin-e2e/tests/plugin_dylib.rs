@@ -783,6 +783,7 @@ fn shipped_names_match_the_name_map() {
                 ("go.golist", "go_golist"),
                 ("go.toolchain", "go_toolchain"),
                 ("go.compile", "go_compile"),
+                ("go.download", "go_download"),
                 ("go.testmain", "go_testmain"),
                 ("go.lint", "go_lint"),
                 ("go.lint_gate", "go_lint_gate"),

@@ -7,8 +7,8 @@ mod common;
 
 use anyhow::Context as _;
 use common::{
-    artifact_paths, fixture, make_workspace, make_workspace_hermetic, make_workspace_host,
-    require_go,
+    HERMETIC_GO, artifact_paths, fixture, make_workspace, make_workspace_hermetic,
+    make_workspace_host, require_go,
 };
 
 #[tokio::test]
@@ -256,25 +256,34 @@ async fn test_thirdparty_asm_build_lib_compiles() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A module download through the hermetic SDK: the configuration in which the
-/// target once failed with `awk: command not found`, because a real build has no
-/// host directories on `PATH`. Needs the SDK and the module, so an unreachable
-/// network skips; any other failure fails.
+/// A module download through the hermetic SDK, with real `go` and a real scratch
+/// module cache. Needs the network twice. A failure to get the SDK skips, and a
+/// failure of `go mod download` skips only on a network error; any other failure
+/// fails.
 #[tokio::test]
 async fn test_thirdparty_download_with_hermetic_sdk() -> anyhow::Result<()> {
     let dir = fixture("thirdparty_asm")?;
     let ws = make_workspace_hermetic(dir)?;
+    let sdk = format!("//@heph/go/toolchain/{HERMETIC_GO}:go");
+    if let Err(e) = ws.run(&sdk).await {
+        eprintln!("skipping hermetic download e2e (SDK unavailable): {e:?}");
+        return Ok(());
+    }
     let download = "//@heph/go/thirdparty/github.com/klauspost/cpuid/v2@v2.2.5:download";
     match ws.run(download).await {
         Ok(result) => {
-            assert!(
-                !artifact_paths(&result).is_empty(),
-                "download should expose the module's files"
-            );
+            let paths = artifact_paths(&result);
+            for file in ["go.mod", "cpuid.go"] {
+                assert!(
+                    paths.iter().any(|p| p.ends_with(file)),
+                    "download should expose the module's {file}: {paths:?}"
+                );
+            }
+            assert!(!paths.iter().any(|p| p.ends_with("mod.json")), "{paths:?}");
         }
         Err(e) => {
             let msg = format!("{e:?}").to_lowercase();
-            let networky = ["dial", "lookup", "connection", "timeout"]
+            let networky = ["dial", "lookup", "connection", "timeout", "tls"]
                 .iter()
                 .any(|needle| msg.contains(needle));
             if networky {
