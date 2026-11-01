@@ -6,7 +6,7 @@
 //! the compiled binary and a valid config — heavier than a unit test. They are
 //! `#[ignore]`d by default (the formatter's behavior is covered env-free by the
 //! `xstarlark-fmt` golden tests and the `plugin-buildfile` unit tests); run them
-//! explicitly with `cargo test -p heph --test build_fmt_cli -- --ignored`.
+//! explicitly with `cargo test -p heph --test root build_fmt_cli:: -- --ignored`.
 
 use std::io::Write;
 use std::path::PathBuf;

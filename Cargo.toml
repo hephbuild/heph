@@ -13,6 +13,23 @@ members = ["gen/proto", "crates/e2e", "crates/bin-e2e", "crates/testkit", "crate
 # Bump both together.
 buffa = "=0.9.2"
 
+# Line tables for workspace crates, none for dependencies. Backtraces and panic
+# locations keep file:line; what goes is variable and type info, which only a
+# debugger reads. Full DWARF made every test binary — ~130 of them, each linking
+# all of heph — several times larger: it dominated link time in CI, the kache
+# blobs each job uploads and restores, and the disk the Linux test job ran out
+# of. `[profile.test]` inherits all of this.
+#
+# For a debugger: `CARGO_PROFILE_DEV_DEBUG=full cargo build` restores full
+# debuginfo for the *workspace* crates only. Dependencies need
+# `--config 'profile.dev.package."*".debug=true'` as well, because the
+# per-package override below wins over the profile-wide setting.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 [profile.profiling]
 inherits = "release"
 debug = true

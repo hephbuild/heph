@@ -40,10 +40,27 @@ rustflags = ["--cfg", "tokio_unstable", "-Cforce-frame-pointers=yes"]
 # address as "no hint", and libunwind scans the section for it.
 # `-fuse-ld=heph` runs `ld64.heph` from the devenv shell, which picks ld-prime
 # when Xcode or the Command Line Tools provide it — it links in about half
-# lld's time — and nix's lld otherwise. `tests/darwin_linker.rs` fails if a
+# lld's time — and nix's lld otherwise. `tests/root/darwin_linker.rs` fails if a
 # darwin test binary is linked by ld64.
 #
 # `target.<triple>.rustflags` replaces `build.rustflags` rather than adding to
 # it, so the flags above are repeated.
 [target.aarch64-apple-darwin]
 rustflags = ["--cfg", "tokio_unstable", "-Cforce-frame-pointers=yes", "-Clink-arg=-fuse-ld=heph"]
+
+# Link aarch64 Linux builds with lld, not GNU ld.
+#
+# rustc already links x86_64-unknown-linux-gnu with its bundled lld (the default
+# since Rust 1.90), but aarch64-unknown-linux-gnu still goes through the C
+# compiler's default, GNU ld (bfd). The test job on the linux/arm64 runner
+# links ~130 debug test binaries, and its compile phase took 15 minutes against
+# 9 on linux/amd64 for the same work. `heph-aarch64-linux-cc` is the devenv
+# shell's C compiler with `-fuse-ld=lld` and nix's lld on its search path
+# (`devenv.nix`).
+#
+# This is a `linker`, not a rustflag, so it does not reach the release build:
+# `cargo zigbuild` sets
+# `CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER` to its own zig wrapper, and
+# the environment wins over this file.
+[target.aarch64-unknown-linux-gnu]
+linker = "heph-aarch64-linux-cc"

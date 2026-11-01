@@ -4,7 +4,7 @@ An **exec runner** decides *where* a target's command actually runs: on this
 host as before, inside a `devenv shell`, inside a container.
 
 Every subprocess heph spawns goes through one seam (`hexecrunner`). A driver no
-longer reaches into `hproc::proc_exec` directly — `tests/execrunner_gate.rs`
+longer reaches into `hproc::proc_exec` directly — `tests/root/execrunner_gate.rs`
 fails the build if one starts to — so a target can be moved into another
 environment without every driver growing its own idea of how.
 

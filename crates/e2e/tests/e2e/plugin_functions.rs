@@ -8,7 +8,7 @@
 //! plugin or function that does not exist says, and that moving functions
 //! from providers to plugins re-keyed nothing.
 
-mod common;
+use crate::common;
 
 use common::Workspace;
 use hcore::htvalue::Value;

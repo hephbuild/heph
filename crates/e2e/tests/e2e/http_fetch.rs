@@ -4,7 +4,7 @@
     reason = "restriction/style lints scoped to production code; tests are exempt"
 )]
 
-mod common;
+use crate::common;
 
 use common::Workspace;
 use std::io::{Read as _, Write as _};

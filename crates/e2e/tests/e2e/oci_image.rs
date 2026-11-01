@@ -19,8 +19,6 @@
 //! *only* a config attribute re-keys, and that the layout the driver wrote
 //! reads back as an image.
 
-mod common;
-
 use hplugin_oci::pluginoci;
 use htestkit::WorkspaceBuilder;
 use std::collections::HashMap;
