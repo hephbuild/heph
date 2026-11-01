@@ -1,6 +1,6 @@
 //! The `exec`/`bash`/`sh` managed drivers: run a target's command in the
 //! sandbox the managed-driver bridge materializes. Depends on the contract +
-//! `heph-driver-support`; isolates the PTY / minijinja / crossterm surface.
+//! `heph-driver-support`; isolates the PTY / minijinja surface.
 #![cfg_attr(
     test,
     expect(

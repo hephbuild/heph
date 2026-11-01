@@ -108,6 +108,10 @@ impl Driver for ManagedDriverBridge {
         self.os.driver.apply_transitive(req, ctoken).await
     }
 
+    fn supports_shell(&self) -> bool {
+        self.os.driver.supports_shell()
+    }
+
     async fn run<'a, 'io>(
         &self,
         req: RunRequest<'a, 'io>,

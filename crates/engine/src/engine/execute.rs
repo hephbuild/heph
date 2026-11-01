@@ -320,21 +320,20 @@ impl Engine {
             .with_context(|| format!("credentials for {addr}"))?;
         let exec_wrapper: InteractiveWrapper = wrapper.unwrap_or_else(|| {
             Arc::new(|inner: InteractiveInner| {
-                Box::pin(async move { inner(None, None, None).await })
+                Box::pin(async move { inner(None, None, None, None).await })
             })
         });
 
         let (tx, rx) = tokio::sync::oneshot::channel::<anyhow::Result<RunResponse>>();
-        // Under `Inherit` the process has heph's own fds: there is nothing to
-        // copy, so whatever the wrapper hands in is not passed on — except to
-        // a shell, which runs on a PTY of its own and ignores `stdio`: the
-        // streams are how the terminal reaches that PTY.
-        let inherit =
-            !shell && matches!(options.stdio, crate::engine::driver::RunStdio::Inherit(_));
+        // A run in the caller's terminal has heph's own fds or the host's PTY,
+        // whichever the handover picks: there is nothing to copy, so whatever
+        // the wrapper hands in is not passed on, a `--shell` entrypoint's
+        // included.
+        let inherit = matches!(options.stdio, crate::engine::driver::RunStdio::Inherit(_));
 
         let inner: InteractiveInner = Box::new(enclose!(
             (rs, self => engine, sandbox_dir)
-            move |stdin, stdout, stderr| {
+            move |stdin, stdout, stderr, winsize| {
                 Box::pin(async move {
                     let mut req = RunRequest::new(rs.request_id(), &target, sandbox_dir);
                     req.tree_root_path = engine.cfg.root.clone();
@@ -344,6 +343,7 @@ impl Engine {
                         req.stdin = stdin;
                         req.stdout = stdout;
                         req.stderr = stderr;
+                        req.winsize = winsize;
                     }
                     req.scratch = scratch;
                     req.credentials = credential_mounts;
@@ -352,7 +352,7 @@ impl Engine {
                     // A plain driver spawns straight from `run`; a managed
                     // one materializes first and its layer fires it.
                     if !driver.managed {
-                        req.options.fire_handover();
+                        req.options.fire_handover().context("handing over the terminal")?;
                     }
                     let res = if shell {
                         driver.driver.run_shell(req, rs.ctoken()).await

@@ -361,6 +361,18 @@ impl Engine {
             .get(&spec.driver)
             .with_context(|| format!("driver not found: {}", spec.driver))?
             .clone();
+        // Before anything builds or the terminal goes raw. The gate is on the
+        // driver that actually spawns: a managed driver with no shell of its own
+        // hands `--shell` to the host's exec fallback, which takes a slave
+        // whether or not the driver offered it.
+        let pty_offered = entrypoint.offers_pty || (req.shell && !driver.driver.supports_shell());
+        if req.shell && !pty_offered {
+            anyhow::bail!(
+                "{addr}: `--shell` runs on a PTY, and the driver {} does not offer one; run it \
+                 without `--shell`",
+                driver.name,
+            );
+        }
 
         // The closure. Expanding the inputs is what refuses an entrypoint
         // among them (N2); linking selects the runtime ones and their outputs.
@@ -476,7 +488,8 @@ impl Engine {
         ));
         let mut foreground = Foreground::new(req.signals, req.dispositions)
             .with_nofile(req.nofile)
-            .with_blocked(req.blocked);
+            .with_blocked(req.blocked)
+            .with_pty_offered(pty_offered);
         if let Some(handover) = req.handover {
             foreground = foreground.with_handover(handover);
         }

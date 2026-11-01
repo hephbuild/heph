@@ -29,11 +29,15 @@ use hmodel::htpkg::PkgBuf;
 use hplugin::driver::TargetAddr;
 use hplugin::driver::sandbox::{Dep, Env, EnvValue, Mode, Sandbox, Tool};
 use hplugin::driver::targetdef::{Entrypoint, RawDef, RawDefBytes, Workdir};
-use hplugin::driver::{Disposition, Foreground, RunOptions, RunStdio, Signal, SignalSender};
+use hplugin::driver::{
+    ContinueSender, Disposition, Foreground, PtyStdio, RunOptions, RunStdio, Signal, SignalSender,
+    StopReceiver,
+};
 use hplugin::error::Exit;
 use hplugin::function::{DeclaredState, DeclaredTarget, FnArgs, FnOutcome};
 use hplugin::provider::{Approval, State, TargetSpec};
 use std::collections::BTreeMap;
+use std::os::fd::AsRawFd as _;
 use std::sync::Arc;
 
 // ---- Presence helpers ----
@@ -1373,6 +1377,7 @@ fn entrypoint_to_pb(e: &Entrypoint) -> pb::Entrypoint {
             Workdir::Root => pb::EntrypointWorkdir::Root,
             Workdir::Sandbox => pb::EntrypointWorkdir::Sandbox,
         })),
+        offers_pty: Some(e.offers_pty),
         ..Default::default()
     }
 }
@@ -1386,7 +1391,13 @@ fn entrypoint_from_pb(e: pb::Entrypoint) -> anyhow::Result<Entrypoint> {
         pb::EntrypointWorkdir::Sandbox => Workdir::Sandbox,
         pb::EntrypointWorkdir::Unspecified => bail!("field Entrypoint.workdir is unspecified"),
     };
-    Ok(Entrypoint::new(e.accepts_args.unwrap_or_default(), workdir))
+    let entrypoint = Entrypoint::new(e.accepts_args.unwrap_or_default(), workdir);
+    // Absent is no: a plugin that predates the bit never gets a PTY.
+    Ok(if e.offers_pty.unwrap_or_default() {
+        entrypoint.with_pty()
+    } else {
+        entrypoint
+    })
 }
 
 // ---- RunOptions / ExitStatus (entrypoint runs, since 0.17.1) ----
@@ -1411,6 +1422,11 @@ fn os_string(b: Vec<u8>) -> std::ffi::OsString {
 ///
 /// [`Foreground::signals`](hplugin::driver::Foreground::signals) is not part of
 /// the message: signals ride the run's request stream as `RunInFrame.signal`.
+///
+/// A [`RunStdio::Pty`] is sent only to a def that offered it, and its message
+/// carries the slave's number while `o` still owns the descriptor: the sender
+/// gives ownership up with `into_raw_fd` right before the message leaves, so a
+/// cancel before then closes it rather than leaking it.
 pub fn run_options_to_pb(
     target: &TargetDef,
     o: &RunOptions,
@@ -1425,10 +1441,8 @@ pub fn run_options_to_pb(
             target.addr.format()
         );
     }
-    let (stdio, dispositions, nofile, blocked_signals) = match &o.stdio {
-        RunStdio::Captured => (pb::RunStdio::Captured, Vec::new(), None, Vec::new()),
-        RunStdio::Inherit(fg) => (
-            pb::RunStdio::Inherit,
+    let foreground_to_pb = |fg: &Foreground| {
+        (
             fg.dispositions
                 .iter()
                 .map(|(sig, d)| pb::SignalDispositionEntry {
@@ -1442,13 +1456,32 @@ pub fn run_options_to_pb(
                 .collect(),
             fg.nofile,
             fg.blocked.iter().map(|s| s.as_raw()).collect(),
-        ),
+        )
+    };
+    let (stdio, pty_slave_fd, (dispositions, nofile, blocked_signals)) = match &o.stdio {
+        RunStdio::Captured => (pb::RunStdio::Captured, None, (Vec::new(), None, Vec::new())),
+        RunStdio::Inherit(fg) => (pb::RunStdio::Inherit, None, foreground_to_pb(fg)),
+        RunStdio::Pty(p) => {
+            if !target.entrypoint.is_some_and(|e| e.offers_pty) {
+                bail!(
+                    "{}'s driver did not offer a PTY, but its run was given one; the host \
+                     checks that before anything builds, so this is a bug in heph",
+                    target.addr.format()
+                );
+            }
+            (
+                pb::RunStdio::Pty,
+                Some(p.slave.as_raw_fd()),
+                foreground_to_pb(&p.foreground),
+            )
+        }
         other => bail!(
             "run stdio {other:?} has no wire form in ABI {}",
             crate::ABI_SEMVER
         ),
     };
     Ok(Some(pb::RunOptions {
+        pty_slave_fd,
         cwd: o.cwd.as_deref().map(|p| os_bytes(p.as_os_str())),
         base_env: o
             .base_env
@@ -1481,16 +1514,74 @@ pub fn run_options_to_pb(
     }))
 }
 
-/// Decode a run's options. Absent is the default. Under `INHERIT`, the
-/// returned sender feeds [`Foreground::signals`]: the receiver pushes each
-/// `RunInFrame.signal` into it, and drops it when the request stream ends —
-/// which the driver reads as "no more signals", not as a cancel.
+/// The live half of a decoded run: what the request and response streams feed.
+/// All `None` for a captured run.
+#[derive(Debug, Default)]
+pub struct RunChannels {
+    /// Feeds [`Foreground::signals`]: the receiver pushes each
+    /// `RunInFrame.signal` into it, and drops it when the request stream ends —
+    /// which the driver reads as "no more signals", not as a cancel.
+    pub signals: Option<SignalSender>,
+    /// Feeds [`PtyStdio::continues`](hplugin::driver::PtyStdio::continues), from
+    /// each `RunInFrame.cont`.
+    pub continues: Option<ContinueSender>,
+    /// Fed by [`PtyStdio::stops`](hplugin::driver::PtyStdio::stops); each
+    /// becomes a `RunOutFrame.stopped`.
+    pub stops: Option<StopReceiver>,
+}
+
+/// Whether the two ends of a transport share one process, which is what makes
+/// a file descriptor number in a message mean anything. A transport that does
+/// not refuses `RUN_STDIO_PTY`; the plan for one is `SCM_RIGHTS`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FdScope {
+    SharedProcess,
+    OtherProcess,
+}
+
+/// Take ownership of `RunOptions.pty_slave_fd`.
+///
+/// The order is the contract. A number below 3 is refused before anything can
+/// wrap it, or the refusal would close heph's own stdio. A number that fails
+/// `F_GETFD` is never wrapped. Everything else is wrapped here, before any other
+/// check of the message can bail, so a later bail closes it. Decoded exactly
+/// once per message.
+fn take_pty_slave(fd: i32, scope: FdScope) -> anyhow::Result<std::os::fd::OwnedFd> {
+    if scope != FdScope::SharedProcess {
+        bail!(
+            "RunOptions.pty_slave_fd is a file descriptor of the sending process, and this \
+             transport does not share it"
+        );
+    }
+    if fd < 3 {
+        bail!("RunOptions.pty_slave_fd is {fd}, which is not a PTY slave the host handed over");
+    }
+    // SAFETY: F_GETFD reads the flags of a number that may or may not be open;
+    // an unopened one is an error return.
+    if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("RunOptions.pty_slave_fd {fd} is not an open descriptor"));
+    }
+    // SAFETY: the message moved ownership of this open descriptor to us (see the
+    // field's contract in driver.proto), and this function runs once per
+    // message, so nothing else closes it.
+    Ok(unsafe { std::os::fd::FromRawFd::from_raw_fd(fd) })
+}
+
+/// Decode a run's options. Absent is the default. See [`RunChannels`] for what
+/// the run's streams feed, and [`FdScope`] for `RUN_STDIO_PTY`.
 pub fn run_options_from_pb(
     o: Option<pb::RunOptions>,
-) -> anyhow::Result<(RunOptions, Option<SignalSender>)> {
+    scope: FdScope,
+) -> anyhow::Result<(RunOptions, RunChannels)> {
     let Some(o) = o else {
-        return Ok((RunOptions::default(), None));
+        return Ok((RunOptions::default(), RunChannels::default()));
     };
+    // First: from here every bail below closes it.
+    let slave = o
+        .pty_slave_fd
+        .map(|fd| take_pty_slave(fd, scope))
+        .transpose()?;
     let mut opts = RunOptions::default();
     if let Some(cwd) = o.cwd {
         opts = opts.with_cwd(std::path::PathBuf::from(os_string(cwd)));
@@ -1515,20 +1606,25 @@ pub fn run_options_from_pb(
         None => pb::RunStdio::Captured,
         Some(v) => known_enum(v, "RunOptions.stdio")?,
     };
-    let mut signals = None;
+    if slave.is_some() && !matches!(stdio, pb::RunStdio::Pty) {
+        bail!("RunOptions.pty_slave_fd is set on a run whose stdio is not PTY");
+    }
+    let mut channels = RunChannels::default();
     match stdio {
         pb::RunStdio::Captured | pb::RunStdio::Unspecified => {
             if !o.dispositions.is_empty() {
-                bail!("RunOptions.dispositions is set on a run whose stdio is not INHERIT");
+                bail!("RunOptions.dispositions is set on a run whose stdio is not INHERIT or PTY");
             }
             if o.nofile.is_some() {
-                bail!("RunOptions.nofile is set on a run whose stdio is not INHERIT");
+                bail!("RunOptions.nofile is set on a run whose stdio is not INHERIT or PTY");
             }
             if !o.blocked_signals.is_empty() {
-                bail!("RunOptions.blocked_signals is set on a run whose stdio is not INHERIT");
+                bail!(
+                    "RunOptions.blocked_signals is set on a run whose stdio is not INHERIT or PTY"
+                );
             }
         }
-        pb::RunStdio::Inherit => {
+        pb::RunStdio::Inherit | pb::RunStdio::Pty => {
             let dispositions = o
                 .dispositions
                 .into_iter()
@@ -1546,7 +1642,7 @@ pub fn run_options_from_pb(
                 })
                 .collect::<anyhow::Result<_>>()?;
             let (tx, rx) = hplugin::driver::signal_channel();
-            signals = Some(tx);
+            channels.signals = Some(tx);
             let fg = Foreground::new(rx, dispositions)
                 .with_nofile(o.nofile)
                 .with_blocked(
@@ -1555,10 +1651,22 @@ pub fn run_options_from_pb(
                         .map(Signal::from_raw)
                         .collect(),
                 );
-            opts = opts.with_stdio(RunStdio::Inherit(fg));
+            opts = opts.with_stdio(match (stdio, slave) {
+                (pb::RunStdio::Pty, Some(slave)) => {
+                    let (stop_tx, stop_rx) = hplugin::driver::stop_channel();
+                    let (cont_tx, cont_rx) = hplugin::driver::continue_channel();
+                    channels.stops = Some(stop_rx);
+                    channels.continues = Some(cont_tx);
+                    RunStdio::Pty(PtyStdio::new(fg, slave, stop_tx, cont_rx))
+                }
+                (pb::RunStdio::Pty, None) => {
+                    bail!("field RunOptions.pty_slave_fd is required with stdio = PTY")
+                }
+                _ => RunStdio::Inherit(fg),
+            });
         }
     }
-    Ok((opts, signals))
+    Ok((opts, channels))
 }
 
 pub fn exit_to_pb(e: Exit) -> pb::ExitStatus {
@@ -2299,7 +2407,214 @@ mod tests {
         let wire = run_options_to_pb(&entrypoint_def(), o)
             .expect("encode")
             .map(|m| via_bytes(&m));
-        run_options_from_pb(wire).expect("decode")
+        let (back, channels) = run_options_from_pb(wire, FdScope::SharedProcess).expect("decode");
+        (back, channels.signals)
+    }
+
+    /// An open descriptor at a number used once in this test binary:
+    /// `fcntl(F_GETFD)` is how these tests observe a close, and a fixed floor
+    /// hands one test the number another just closed. Then a test wraps a
+    /// descriptor it does not own, and Rust aborts the whole binary on the
+    /// double close (seen on `linux/amd64` CI).
+    ///
+    /// The floor sits below 256, an interactive macOS shell's soft limit, and
+    /// above what these tests have open.
+    fn high_fd() -> std::os::fd::RawFd {
+        static NEXT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(200);
+        let want = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (r, w) = std::os::unix::net::UnixStream::pair().expect("pair");
+        drop(w);
+        // SAFETY: duplicating a live fd above the range anything else uses.
+        let fd = unsafe { libc::fcntl(r.as_raw_fd(), libc::F_DUPFD_CLOEXEC, want) };
+        assert_eq!(fd, want, "dup: {}", std::io::Error::last_os_error());
+        fd
+    }
+
+    fn is_open(fd: std::os::fd::RawFd) -> bool {
+        // SAFETY: a query on a number; unopened is an error return.
+        unsafe { libc::fcntl(fd, libc::F_GETFD) >= 0 }
+    }
+
+    fn pty_def() -> TargetDef {
+        let mut def = entrypoint_def();
+        def.entrypoint = def.entrypoint.map(Entrypoint::with_pty);
+        def
+    }
+
+    fn pty_options(slave: std::os::fd::OwnedFd) -> RunOptions {
+        RunOptions::default().with_stdio(RunStdio::Pty(PtyStdio::new(
+            Foreground::new(
+                hplugin::driver::signal_channel().1,
+                vec![(Signal::from_raw(2), Disposition::Ignore)],
+            )
+            .with_nofile(Some(64))
+            .with_blocked(vec![Signal::from_raw(10)]),
+            slave,
+            hplugin::driver::stop_channel().0,
+            hplugin::driver::continue_channel().1,
+        )))
+    }
+
+    /// The PTY variant survives the wire with everything an `Inherit` carries
+    /// and the slave's ownership moved, and the channels the stream frames feed
+    /// come back with it.
+    #[test]
+    fn run_stdio_pty_round_trip() {
+        let fd = high_fd();
+        // SAFETY: `high_fd` handed us this descriptor.
+        let slave = unsafe { std::os::fd::FromRawFd::from_raw_fd(fd) };
+        let o = pty_options(slave);
+        let wire = run_options_to_pb(&pty_def(), &o)
+            .expect("encode")
+            .map(|m| via_bytes(&m));
+        // What the sender does right before the message leaves.
+        let RunStdio::Pty(p) = o.stdio else {
+            panic!("pty");
+        };
+        assert_eq!(std::os::fd::IntoRawFd::into_raw_fd(p.slave), fd);
+        let (back, channels) = run_options_from_pb(wire, FdScope::SharedProcess).expect("decode");
+        let RunStdio::Pty(mut p) = back.stdio else {
+            panic!("pty did not survive: {:?}", back.stdio);
+        };
+        assert_eq!(p.slave.as_raw_fd(), fd);
+        assert_eq!(p.foreground.nofile, Some(64));
+        assert_eq!(p.foreground.blocked, vec![Signal::from_raw(10)]);
+        assert_eq!(
+            p.foreground.dispositions,
+            vec![(Signal::from_raw(2), Disposition::Ignore)]
+        );
+        channels
+            .continues
+            .expect("continues")
+            .send(())
+            .expect("send");
+        p.continues.try_recv().expect("a continue");
+        p.stops.send(()).expect("send");
+        channels.stops.expect("stops").try_recv().expect("a stop");
+        drop(p);
+        assert!(!is_open(fd), "the decoded end owns the slave");
+    }
+
+    fn pty_wire(fd: Option<i32>) -> pb::RunOptions {
+        pb::RunOptions {
+            stdio: Some(EnumValue::Known(pb::RunStdio::Pty)),
+            pty_slave_fd: fd,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn slave_without_pty_refused() {
+        let fd = high_fd();
+        let wire = pb::RunOptions {
+            stdio: Some(EnumValue::Known(pb::RunStdio::Inherit)),
+            pty_slave_fd: Some(fd),
+            ..Default::default()
+        };
+        let err = run_options_from_pb(Some(via_bytes(&wire)), FdScope::SharedProcess)
+            .expect_err("refused");
+        assert!(format!("{err:#}").contains("not PTY"), "{err:#}");
+        assert!(!is_open(fd), "the refusal closes what it was handed");
+
+        let err = run_options_from_pb(Some(via_bytes(&pty_wire(None))), FdScope::SharedProcess)
+            .expect_err("PTY needs its slave");
+        assert!(format!("{err:#}").contains("is required"), "{err:#}");
+    }
+
+    #[test]
+    fn closed_slave_fd_refused() {
+        let fd = high_fd();
+        // SAFETY: ours, and closed here on purpose.
+        unsafe { libc::close(fd) };
+        let err = run_options_from_pb(Some(via_bytes(&pty_wire(Some(fd)))), FdScope::SharedProcess)
+            .expect_err("refused");
+        assert!(
+            format!("{err:#}").contains("not an open descriptor"),
+            "{err:#}"
+        );
+    }
+
+    /// An old peer sees `RUN_STDIO_PTY` as an unknown enum value, and refuses it
+    /// rather than running it as captured with the keyboard split between two
+    /// readers. The same path this build takes for a later variant.
+    #[test]
+    fn old_peer_refuses_pty_via_known_enum() {
+        let wire = pb::RunOptions {
+            stdio: Some(EnumValue::Unknown(99)),
+            ..Default::default()
+        };
+        let err = run_options_from_pb(Some(via_bytes(&wire)), FdScope::SharedProcess)
+            .expect_err("refused");
+        assert!(format!("{err:#}").contains("RunOptions.stdio"), "{err:#}");
+    }
+
+    /// A def that did not offer the PTY is never sent one, and the bit defaults
+    /// off across the wire.
+    #[test]
+    fn no_offer_gate_refuses_pty() {
+        let fd = high_fd();
+        // SAFETY: `high_fd` handed us this descriptor.
+        let o = pty_options(unsafe { std::os::fd::FromRawFd::from_raw_fd(fd) });
+        let err = run_options_to_pb(&entrypoint_def(), &o).expect_err("refused");
+        assert!(
+            format!("{err:#}").contains("did not offer a PTY"),
+            "{err:#}"
+        );
+        run_options_to_pb(&pty_def(), &o).expect("a def that offered it");
+        assert!(!Entrypoint::new(true, Workdir::Caller).offers_pty);
+        let wire = via_bytes(&entrypoint_to_pb(
+            &Entrypoint::new(true, Workdir::Caller).with_pty(),
+        ));
+        assert!(entrypoint_from_pb(wire).expect("decode").offers_pty);
+        let absent = pb::Entrypoint {
+            workdir: Some(EnumValue::Known(pb::EntrypointWorkdir::Caller)),
+            ..Default::default()
+        };
+        assert!(!entrypoint_from_pb(absent).expect("decode").offers_pty);
+    }
+
+    /// Every way a decode can bail after the slave is taken closes it, and a
+    /// number below 3 is refused without closing heph's stdio.
+    #[test]
+    fn refused_decode_closes_the_slave() {
+        let fd = high_fd();
+        let wire = pb::RunOptions {
+            pty_slave_fd: Some(fd),
+            stdio: Some(EnumValue::Known(pb::RunStdio::Pty)),
+            base_env: pb::EnvList {
+                vars: vec![pb::EnvVar::default()],
+                ..Default::default()
+            }
+            .into(),
+            ..Default::default()
+        };
+        run_options_from_pb(Some(via_bytes(&wire)), FdScope::SharedProcess)
+            .expect_err("a malformed env");
+        assert!(!is_open(fd), "a later bail closes it");
+
+        // Unwrapped, so the test's own stdio stays open if this regresses into
+        // a close: `is_open` then fails rather than the runner going quiet.
+        for low in [0, 1, 2, -1] {
+            let err = run_options_from_pb(
+                Some(via_bytes(&pty_wire(Some(low)))),
+                FdScope::SharedProcess,
+            )
+            .expect_err("refused");
+            assert!(format!("{err:#}").contains("not a PTY slave"), "{err:#}");
+        }
+        assert!(is_open(0) && is_open(1) && is_open(2));
+    }
+
+    /// The fd number is OS-local to one process.
+    #[test]
+    fn other_process_transport_refuses_the_fd() {
+        let fd = high_fd();
+        let err = run_options_from_pb(Some(via_bytes(&pty_wire(Some(fd)))), FdScope::OtherProcess)
+            .expect_err("refused");
+        assert!(format!("{err:#}").contains("does not share"), "{err:#}");
+        assert!(is_open(fd), "not ours to close");
+        // SAFETY: still ours.
+        unsafe { libc::close(fd) };
     }
 
     /// E19/N9: every option survives the wire losslessly — non-UTF-8 env keys,
@@ -2314,9 +2629,9 @@ mod tests {
                 .expect("encode")
                 .is_none()
         );
-        let (back, tx) = run_options_from_pb(None).expect("decode");
+        let (back, channels) = run_options_from_pb(None, FdScope::SharedProcess).expect("decode");
         assert!(back.is_default());
-        assert!(tx.is_none());
+        assert!(channels.signals.is_none());
 
         let env = vec![
             (os(b"PATH"), os(b"/usr/bin")),
@@ -2471,7 +2786,8 @@ mod tests {
             ),
         ];
         for (needle, wire) in cases {
-            let err = run_options_from_pb(Some(via_bytes(&wire))).expect_err(needle);
+            let err = run_options_from_pb(Some(via_bytes(&wire)), FdScope::SharedProcess)
+                .expect_err(needle);
             assert!(format!("{err:#}").contains(needle), "{needle}: {err:#}");
         }
     }

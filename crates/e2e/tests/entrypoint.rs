@@ -610,6 +610,8 @@ struct SeenOptions {
 /// records the options the engine sent.
 struct RecordingEntrypoint {
     seen: Arc<std::sync::Mutex<Option<SeenOptions>>>,
+    /// Leave `--shell` to the host's exec fallback, as a cdylib driver does.
+    no_shell: bool,
 }
 
 #[async_trait::async_trait]
@@ -682,6 +684,9 @@ impl hplugin::driver::Driver for RecordingEntrypoint {
             sandbox_guards: vec![],
         })
     }
+    fn supports_shell(&self) -> bool {
+        !self.no_shell
+    }
     async fn run_shell<'a, 'io>(
         &self,
         _req: hplugin::driver::RunRequest<'a, 'io>,
@@ -713,6 +718,7 @@ async fn entrypoint_runs_through_driver_run_with_options() -> anyhow::Result<()>
             Ok(
                 PluginParts::default().with_driver(Box::new(RecordingEntrypoint {
                     seen: Arc::clone(&driver_seen),
+                    no_shell: false,
                 })),
             )
         })
@@ -1981,5 +1987,97 @@ target(name = "top", driver = "bash", deps = {{"d": ":dep"}}, out = "t",
         "one announced wait on the dep: {kinds:?}"
     );
     assert_eq!(read(&built)?, "x\n", "the dep was shared, not rebuilt");
+    Ok(())
+}
+
+fn recording_workspace(no_shell: bool) -> anyhow::Result<htestkit::Workspace> {
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let ws = WorkspaceBuilder::new()?
+        .with_provider(|init| {
+            Box::new(pluginbuildfile::Provider::new(
+                init.root.to_path_buf(),
+                init.runtime.clone(),
+                Arc::clone(&init.functions),
+            ))
+        })
+        .with_plugin("recording", move |_| {
+            Ok(
+                PluginParts::default().with_driver(Box::new(RecordingEntrypoint {
+                    seen: Arc::clone(&seen),
+                    no_shell,
+                })),
+            )
+        })
+        .build()?;
+    ws.write_build_file("app", r#"target(name = "ep", driver = "recording")"#);
+    Ok(ws)
+}
+
+/// What the handover is told about the driver that will spawn, which is what
+/// the host falls back on; the host's half is the test of this name in
+/// `src/commands/run.rs`.
+fn offered_recorder(offered: &Arc<std::sync::Mutex<Vec<bool>>>) -> hplugin::driver::Handover {
+    let offered = Arc::clone(offered);
+    hplugin::driver::Handover::deciding(move |o| {
+        offered.lock().expect("offered").push(o);
+        Ok(None)
+    })
+}
+
+/// Decision 12, from the driver that spawns: one with no PTY bit gets a default
+/// run inherited and has its `--shell` refused before the handover; one that
+/// leaves `--shell` to the host's exec fallback has it offered whatever its bit
+/// says, since that fallback takes a slave.
+#[tokio::test]
+async fn pty_fallback_warns_when_plugin_offers_none() -> anyhow::Result<()> {
+    let elsewhere = tempfile::tempdir()?;
+    let out = elsewhere.path().join("out");
+    let offered = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let ws = recording_workspace(false)?;
+    let exit = exited(
+        invoke(
+            &ws.engine,
+            request("//app:ep", elsewhere.path(), &[], &out)?
+                .with_handover(offered_recorder(&offered)),
+        )
+        .await,
+    );
+    assert_eq!(exit, Exit::Code(0));
+    assert_eq!(*offered.lock().expect("offered"), [false], "default run");
+
+    offered.lock().expect("offered").clear();
+    let refused = invoke(
+        &ws.engine,
+        request("//app:ep", elsewhere.path(), &[], &out)?
+            .with_shell(true)
+            .with_handover(offered_recorder(&offered)),
+    )
+    .await;
+    let msg = match refused {
+        Ok(InvokeOutcome::Failed(e)) | Err(e) => format!("{e:#}"),
+        Ok(other) => panic!("`--shell` with no PTY must be refused, got {other:?}"),
+    };
+    assert!(msg.contains("does not offer one"), "{msg}");
+    assert!(
+        offered.lock().expect("offered").is_empty(),
+        "never handed over"
+    );
+
+    let ws = recording_workspace(true)?;
+    let reached = failed(
+        invoke(
+            &ws.engine,
+            request("//app:ep", elsewhere.path(), &[], &out)?
+                .with_shell(true)
+                .with_handover(offered_recorder(&offered)),
+        )
+        .await,
+    );
+    assert!(
+        format!("{reached:#}").contains("not a shell test"),
+        "reached the spawn: {reached:#}"
+    );
+    assert_eq!(*offered.lock().expect("offered"), [true], "the host's exec");
     Ok(())
 }

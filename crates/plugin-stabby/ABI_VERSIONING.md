@@ -227,6 +227,13 @@ skipped in silence.
 
 ## History of breaks
 
+- **0.17.2** (additive patch) — a run on the host's PTY. `RUN_STDIO_PTY` (3),
+  `RunOptions.pty_slave_fd` (8, a descriptor whose ownership moves with the
+  message, so it is decoded once and only by a transport sharing the host's
+  process), `Entrypoint.offers_pty` (3), and the run frames `RunInFrame.cont` (5)
+  and `RunOutFrame.stopped` (6). A driver offers a PTY by setting the bit, so an
+  older plugin is never sent a slave and its run inherits, with a warning.
+  `MIN_PLUGIN_ABI` stays 0.17.0; no plugin must be rebuilt.
 - **0.17.1** (additive patch) — entrypoints. `TargetDef.entrypoint` (11),
   `ManagedRunRequest.options` (14, sent only for a def that declared an
   entrypoint), `RunInFrame.signal` (4, an OS-local signo), `RunOutFrame.exit`

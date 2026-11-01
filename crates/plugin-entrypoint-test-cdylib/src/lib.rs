@@ -12,10 +12,12 @@
 //!
 //! The script reads its instructions from the caller's environment:
 //! - writes what it saw (cwd, `HEPH_TEST_CALLER`, `HEPH_ROOT`, whether fds 0–2
-//!   are a tty, its args) to `$HEPH_TEST_OUT`, then
+//!   are a tty, its args) to `$HEPH_TEST_OUT`, and the device `tty` names to
+//!   `$HEPH_TEST_OUT.tty`, then
 //! - exits 42, or with `HEPH_TEST_MODE=wait` counts each TERM into
 //!   `$HEPH_TEST_OUT.term`, prints `trap-ready`, and exits 7 once
-//!   `$HEPH_TEST_OUT.stop` exists.
+//!   `$HEPH_TEST_OUT.stop` exists, or with `HEPH_TEST_MODE=stop` prints its and
+//!   its parent's pids, stops itself, and exits 4 once continued.
 
 use anyhow::Context as _;
 use hcore::hasync::Cancellable;
@@ -47,6 +49,14 @@ if [ -t 0 ] && [ -t 1 ] && [ -t 2 ]; then tty=yes; fi
   echo "tty=$tty"
   for a in "$@"; do echo "arg=[$a]"; done
 } > "$HEPH_TEST_OUT"
+/usr/bin/tty > "$HEPH_TEST_OUT.tty"
+if [ "$HEPH_TEST_MODE" = stop ]; then
+  echo "tool-pid-$$."
+  echo "heph-pid-$PPID."
+  kill -STOP $$
+  echo "resumed-""after-fg"
+  exit 4
+fi
 if [ "$HEPH_TEST_MODE" = wait ]; then
   trap 'echo got-term >> "$HEPH_TEST_OUT.term"' TERM
   echo "trap-""ready"
@@ -78,7 +88,7 @@ impl ManagedDriver for Tool {
         Ok(ParseResponse {
             target_def: TargetDef {
                 addr: req.target_spec.addr.clone(),
-                entrypoint: Some(Entrypoint::new(true, Workdir::Caller)),
+                entrypoint: Some(Entrypoint::new(true, Workdir::Caller).with_pty()),
                 hash: b"entrypoint-test-tool".to_vec(),
                 ..Default::default()
             },
@@ -101,8 +111,10 @@ impl ManagedDriver for Tool {
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ManagedRunResponse> {
         let options = req.request.options;
-        let RunStdio::Inherit(fg) = options.stdio else {
-            anyhow::bail!("an entrypoint run is in the caller's terminal");
+        let (fg, on_pty) = match options.stdio {
+            RunStdio::Inherit(fg) => (fg, None),
+            RunStdio::Pty(p) => (p.foreground, Some((p.slave, p.stops, p.continues))),
+            _ => anyhow::bail!("an entrypoint run is in the caller's terminal"),
         };
         let mut args: Vec<OsString> = vec!["-c".into(), SCRIPT.into(), "sh".into()];
         args.extend(options.args.unwrap_or_default());
@@ -113,14 +125,19 @@ impl ManagedDriver for Tool {
             options.cwd.unwrap_or(req.sandbox_pkg_dir),
         )
         .with_foreground(&fg);
+        let (cmd, channels) = match on_pty {
+            Some((slave, stops, continues)) => (cmd.with_slave(slave), Some((stops, continues))),
+            None => (cmd, None),
+        };
         let (child, _) = spawn_foreground(RunnerRef::local(), cmd, &PathPolicy::default(), ctoken)
             .await
             .context("spawn the tool")?;
-        let exit = child
-            .context("spawn the tool")?
-            .wait(fg.signals, ctoken)
-            .await
-            .context("wait for the tool")?;
+        let child = child.context("spawn the tool")?;
+        let exit = match channels {
+            Some((stops, continues)) => child.wait_pty(fg.signals, stops, continues, ctoken).await,
+            None => child.wait(fg.signals, ctoken).await,
+        }
+        .context("wait for the tool")?;
         if exit == Exit::Code(0) {
             return Ok(ManagedRunResponse { artifacts: vec![] });
         }

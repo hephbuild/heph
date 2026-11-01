@@ -576,6 +576,9 @@ pub mod targetdef {
     ///
     /// `#[non_exhaustive]`: built with [`Entrypoint::new`] outside this crate,
     /// so a later field is not a source break for every declaring driver.
+    // `Hash` covers `offers_pty`, which is no part of what a driver may hash: it
+    // says what the driver's code can do, not what the target is. A def hash takes
+    // the fields it means, by name, and never this whole struct.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
     #[non_exhaustive]
     pub struct Entrypoint {
@@ -585,6 +588,13 @@ pub mod targetdef {
         pub accepts_args: bool,
         /// Where the tool runs.
         pub workdir: Workdir,
+        /// This driver can spawn the tool on a PTY slave the host opened
+        /// ([`RunStdio::Pty`](super::RunStdio::Pty)). Off unless the driver
+        /// says so, and never turned on for it: a driver's wildcard arm on
+        /// `RunStdio` must not read `Pty` as `Captured`. Without it a default
+        /// run inherits the caller's fds. Not in `inspect`'s output.
+        #[serde(skip)]
+        pub offers_pty: bool,
     }
 
     impl Entrypoint {
@@ -592,7 +602,14 @@ pub mod targetdef {
             Self {
                 accepts_args,
                 workdir,
+                offers_pty: false,
             }
+        }
+
+        /// Offer the PTY path ([`Entrypoint::offers_pty`]).
+        pub fn with_pty(mut self) -> Self {
+            self.offers_pty = true;
+            self
         }
     }
 
@@ -1234,8 +1251,13 @@ pub struct RunRequest<'a, 'io> {
     ///
     /// Under [`RunStdio::Inherit`], a managed driver's `run` is called after
     /// the host fired the [`Handover`]; a plain driver's, right after the
-    /// engine fired it.
+    /// engine fired it. The hook may turn it into [`RunStdio::Pty`].
     pub options: RunOptions,
+    /// Live window sizes of the terminal behind a build target's `--shell`.
+    /// A driver with its own PTY master copies each onto it, and the kernel
+    /// signals the tool. In-process only: it never crosses the plugin seam,
+    /// and `None` means the size is fixed.
+    pub winsize: Option<WinSizeReceiver>,
 }
 
 /// The parts of a run that come from the caller rather than the def.
@@ -1332,7 +1354,65 @@ pub enum RunStdio {
     /// process group, with no tee and no new session. The request's `stdin`,
     /// `stdout` and `stderr` are `None`: there is nothing to copy.
     Inherit(Foreground),
+    /// The process runs on a PTY the host owns: fds 0–2 are the slave, in a
+    /// session of its own with the slave as controlling terminal. The host
+    /// pumps the master, so the request's streams are `None` here too. The only
+    /// way to get one is the [`Handover`] turning an `Inherit` into it, for a
+    /// def whose driver offered it ([`targetdef::Entrypoint::offers_pty`]).
+    Pty(PtyStdio),
 }
+
+/// A run on a host-owned PTY ([`RunStdio::Pty`]).
+///
+/// `#[non_exhaustive]`: built by [`RunOptions::fire_handover`] and the plugin
+/// seam's decoder. Pass it to `hexecrunner`'s foreground spawn and wait, which
+/// spawn onto the slave and report stops.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct PtyStdio {
+    /// Everything of the caller's the run carries, and its signal relay.
+    pub foreground: Foreground,
+    /// The slave end. Moves once: the spawn consumes and closes it, and a
+    /// driver that drops it unspawned gives the master EOF, ending the pump.
+    /// Holding a copy past the spawn would keep the master from ever seeing
+    /// EOF. Valid only in this process.
+    pub slave: std::os::fd::OwnedFd,
+    /// Tells the host the tool stopped itself. Each send asks the host to
+    /// restore the terminal and suspend; a continue comes back on `continues`.
+    pub stops: StopSender,
+    /// The host resumed: continue the tool's group.
+    pub continues: ContinueReceiver,
+}
+
+impl PtyStdio {
+    pub fn new(
+        foreground: Foreground,
+        slave: std::os::fd::OwnedFd,
+        stops: StopSender,
+        continues: ContinueReceiver,
+    ) -> Self {
+        Self {
+            foreground,
+            slave,
+            stops,
+            continues,
+        }
+    }
+}
+
+/// See [`PtyStdio::stops`].
+pub type StopSender = tokio::sync::mpsc::UnboundedSender<()>;
+/// The host's end of [`StopSender`].
+pub type StopReceiver = tokio::sync::mpsc::UnboundedReceiver<()>;
+/// See [`PtyStdio::continues`].
+pub type ContinueReceiver = tokio::sync::mpsc::UnboundedReceiver<()>;
+/// The host's end of [`ContinueReceiver`].
+pub type ContinueSender = tokio::sync::mpsc::UnboundedSender<()>;
+
+/// A window size, `(rows, cols)`: see [`RunRequest::winsize`].
+pub type WinSize = (u16, u16);
+/// See [`RunRequest::winsize`].
+pub type WinSizeReceiver = tokio::sync::watch::Receiver<WinSize>;
 
 /// What a run in the caller's terminal needs beyond its fds.
 ///
@@ -1366,6 +1446,10 @@ pub struct Foreground {
     /// layer for a managed driver and by the engine for any other. Never
     /// crosses the plugin seam. See [`Handover`].
     pub handover: Option<Handover>,
+    /// Host-only: whether the driver that will spawn can take a PTY slave,
+    /// which the engine worked out before anything built. Handed to the
+    /// [`Handover`], which decides the run's mode. Never crosses the seam.
+    pub pty_offered: bool,
 }
 
 impl Foreground {
@@ -1376,7 +1460,13 @@ impl Foreground {
             nofile: None,
             blocked: Vec::new(),
             handover: None,
+            pty_offered: false,
         }
+    }
+
+    pub fn with_pty_offered(mut self, offered: bool) -> Self {
+        self.pty_offered = offered;
+        self
     }
 
     pub fn with_nofile(mut self, nofile: Option<u64>) -> Self {
@@ -1410,17 +1500,43 @@ impl hcore::process::CallerState for Foreground {
 /// A one-shot hook the host runs when a run in the caller's terminal is about
 /// to spawn its program ([`Foreground::handover`]): the binary stops treating
 /// Ctrl-C as "cancel" from that moment, while everything before it — deps,
-/// materializing the closure — stays cancellable (R9).
-pub struct Handover(Box<dyn FnOnce() + Send + Sync>);
+/// materializing the closure — stays cancellable (R9). It is also where the
+/// host decides the run's terminal mode: it may open a PTY and hand back the
+/// slave, which turns the run's `Inherit` into a [`RunStdio::Pty`]. That
+/// decision is made here and not when the options are assembled, so a `Pty`
+/// can never skip the transparency and the relay.
+pub struct Handover(Box<HandoverFn>);
+
+type HandoverFn = dyn FnOnce(bool) -> anyhow::Result<Option<PtyHandover>> + Send + Sync;
+
+/// What a [`Handover`] that chose the PTY path gives the run.
+#[derive(Debug)]
+pub struct PtyHandover {
+    pub slave: std::os::fd::OwnedFd,
+    pub stops: StopSender,
+    pub continues: ContinueReceiver,
+}
 
 impl Handover {
+    /// A hook with no say in the run's mode: the run stays inherited.
     pub fn new(f: impl FnOnce() + Send + Sync + 'static) -> Self {
+        Self(Box::new(move |_offered| {
+            f();
+            Ok(None)
+        }))
+    }
+
+    /// A hook that decides the run's mode. It gets whether the driver that
+    /// will spawn offered the PTY ([`Foreground::pty_offered`]).
+    pub fn deciding(
+        f: impl FnOnce(bool) -> anyhow::Result<Option<PtyHandover>> + Send + Sync + 'static,
+    ) -> Self {
         Self(Box::new(f))
     }
 
     /// Run the hook.
-    pub fn fire(self) {
-        (self.0)();
+    pub fn fire(self, pty_offered: bool) -> anyhow::Result<Option<PtyHandover>> {
+        (self.0)(pty_offered)
     }
 }
 
@@ -1433,13 +1549,27 @@ impl std::fmt::Debug for Handover {
 impl RunOptions {
     /// Fire the [`Foreground::handover`] hook, if this run has one that has
     /// not fired yet. Called by whoever hands the request to the driver that
-    /// spawns the program.
-    pub fn fire_handover(&mut self) {
-        if let RunStdio::Inherit(fg) = &mut self.stdio
-            && let Some(h) = fg.handover.take()
-        {
-            h.fire();
+    /// spawns the program. `Err` is a host failure with nothing spawned (a PTY
+    /// that could not be opened), which fails the run loudly.
+    pub fn fire_handover(&mut self) -> anyhow::Result<()> {
+        let RunStdio::Inherit(fg) = &mut self.stdio else {
+            return Ok(());
+        };
+        let Some(h) = fg.handover.take() else {
+            return Ok(());
+        };
+        let Some(pty) = h.fire(fg.pty_offered)? else {
+            return Ok(());
+        };
+        if let RunStdio::Inherit(foreground) = std::mem::take(&mut self.stdio) {
+            self.stdio = RunStdio::Pty(PtyStdio::new(
+                foreground,
+                pty.slave,
+                pty.stops,
+                pty.continues,
+            ));
         }
+        Ok(())
     }
 }
 
@@ -1454,6 +1584,16 @@ pub type SignalSender = tokio::sync::mpsc::UnboundedSender<Signal>;
 
 /// A fresh relay channel for [`Foreground::signals`].
 pub fn signal_channel() -> (SignalSender, SignalReceiver) {
+    tokio::sync::mpsc::unbounded_channel()
+}
+
+/// A fresh channel for [`PtyStdio::stops`].
+pub fn stop_channel() -> (StopSender, StopReceiver) {
+    tokio::sync::mpsc::unbounded_channel()
+}
+
+/// A fresh channel for [`PtyStdio::continues`].
+pub fn continue_channel() -> (ContinueSender, ContinueReceiver) {
     tokio::sync::mpsc::unbounded_channel()
 }
 
@@ -1512,6 +1652,7 @@ impl<'a, 'io> RunRequest<'a, 'io> {
             credentials: Vec::new(),
             deferred: std::collections::BTreeMap::new(),
             options: RunOptions::default(),
+            winsize: None,
         }
     }
 
@@ -1537,6 +1678,7 @@ impl<'a, 'io> RunRequest<'a, 'io> {
             credentials: self.credentials,
             deferred: self.deferred,
             options: self.options,
+            winsize: self.winsize,
         }
     }
 
@@ -1853,6 +1995,13 @@ pub trait Driver: Send + Sync {
         req: RunRequest<'a, 'io>,
         ctoken: &(dyn hasync::Cancellable + Send + Sync),
     ) -> anyhow::Result<RunResponse>;
+    /// Whether [`run_shell`](Self::run_shell) is this driver's own. False for a
+    /// managed driver that leaves `--shell` to the host's exec fallback, which
+    /// is what spawns then, and which can take a PTY slave whatever the driver
+    /// itself offered.
+    fn supports_shell(&self) -> bool {
+        true
+    }
     async fn run_shell<'a, 'io>(
         &self,
         req: RunRequest<'a, 'io>,

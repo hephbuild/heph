@@ -1,4 +1,8 @@
-//! Scrubbing credential material out of a target's output, at the tee.
+//! Scrubbing credential material out of a captured target's output, at the tee.
+//!
+//! An interactive run has no tee, so none of this applies to it: every entrypoint
+//! run and a build target's `--shell` go unscrubbed and unlogged, and `env` in such
+//! a shell prints the tokens it holds. See `docs/CREDENTIALS.md`, "Redaction".
 //!
 //! # Why here and not at render
 //!

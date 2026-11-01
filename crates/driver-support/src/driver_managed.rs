@@ -150,7 +150,9 @@ pub async fn invoke_inner<'a, 'io>(
     // Everything heph does before the program exists is done: a run in the
     // caller's terminal is handed over from here (the binary stops reading
     // Ctrl-C as "cancel"). Host-side, so it covers a cdylib driver too.
-    req.options.fire_handover();
+    req.options
+        .fire_handover()
+        .context("handing over the terminal")?;
     let mreq = ManagedRunRequest {
         sandbox_dir,
         sandbox_ws_dir: ws_dir,

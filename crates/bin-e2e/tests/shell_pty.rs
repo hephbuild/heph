@@ -167,7 +167,7 @@ struct ShellSession {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     captured: Arc<Mutex<Vec<u8>>>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
-    _master: Box<dyn portable_pty::MasterPty + Send>,
+    master: Box<dyn portable_pty::MasterPty + Send>,
     /// Byte offset into `captured` that the last successful `wait_for` has
     /// already accounted for. See `wait_for` for why this exists.
     cursor: usize,
@@ -180,6 +180,19 @@ impl ShellSession {
     /// real terminal would (the inline TUI viewport blocks on one during its
     /// own setup on the outer terminal, before shell mode takes over).
     fn spawn(dist: &Dist, cwd: &std::path::Path, args: &[&str]) -> Self {
+        let home = tempfile::tempdir().expect("home tempdir");
+        Self::spawn_with(dist, cwd, args, home.path(), None)
+    }
+
+    /// [`Self::spawn`] with the caller's `HOME` and `PROMPT_COMMAND` chosen,
+    /// the latter removed when `None` so a test host's cannot leak in.
+    fn spawn_with(
+        dist: &Dist,
+        cwd: &std::path::Path,
+        args: &[&str],
+        home: &std::path::Path,
+        prompt_command: Option<&str>,
+    ) -> Self {
         const ROWS: u16 = 40;
         const COLS: u16 = 140;
 
@@ -192,13 +205,16 @@ impl ShellSession {
             })
             .expect("open pty");
 
-        let home = tempfile::tempdir().expect("home tempdir");
         let mut cmd = CommandBuilder::new(dist.heph());
         for arg in args {
             cmd.arg(arg);
         }
         cmd.cwd(cwd);
-        cmd.env("HOME", home.path());
+        cmd.env("HOME", home);
+        match prompt_command {
+            Some(value) => cmd.env("PROMPT_COMMAND", value),
+            None => cmd.env_remove("PROMPT_COMMAND"),
+        }
         cmd.env("HEPH_CWD", cwd);
         cmd.env("HEPH_NO_SELF_UPDATE", "1");
         cmd.env("HEPH_DISABLE_TELEMETRY", "1");
@@ -240,7 +256,7 @@ impl ShellSession {
             writer,
             captured,
             child,
-            _master: pair.master,
+            master: pair.master,
             cursor: 0,
         }
     }
@@ -253,6 +269,18 @@ impl ShellSession {
 
     fn send_str(&mut self, s: &str) {
         self.send(s.as_bytes());
+    }
+
+    /// Resize the caller's window, as dragging a terminal's edge does.
+    fn resize(&self, rows: u16, cols: u16) {
+        self.master
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("resize the pty");
     }
 
     fn output_snapshot(&self) -> Vec<u8> {
@@ -283,10 +311,19 @@ impl ShellSession {
     /// this the moment our own keystrokes come back. Build such markers with
     /// [`echo_marker`], which keeps the literal out of the command line.
     fn wait_for(&mut self, needle: &str, timeout: Duration) {
+        assert!(
+            self.try_wait_for(needle, timeout),
+            "never saw {needle:?} within {timeout:?}\n--- captured ---\n{}",
+            self.output_lossy(),
+        );
+    }
+
+    /// [`Self::wait_for`], reporting a timeout instead of panicking.
+    fn try_wait_for(&mut self, needle: &str, timeout: Duration) -> bool {
         let started = Instant::now();
         let needle = needle.as_bytes();
         if needle.is_empty() {
-            return;
+            return true;
         }
         // Where the next poll starts searching. Distinct from `cursor`, which
         // only moves on a match: this advances every poll to the end of what has
@@ -310,18 +347,39 @@ impl ShellSession {
                 match scan_once(&buf, needle, scan_from) {
                     Scan::Found { end } => {
                         self.cursor = end;
-                        return;
+                        return true;
                     }
                     Scan::Resume { from } => scan_from = from,
                 }
             }
+            if started.elapsed() >= timeout {
+                return false;
+            }
+            std::thread::sleep(POLL);
+        }
+    }
+
+    /// Ctrl-C [`FOLLOWING_TOOL`] until its shell shows a fresh prompt.
+    ///
+    /// One Ctrl-C is not enough to rely on: a bash in a `sleep` loop with an `INT`
+    /// trap sometimes runs on, the loop alive and `^C` the last thing on the
+    /// terminal. That is bash, not heph. Measured with the Ctrl-C's timing jittered
+    /// over one nap, on a bare PTY with no heph involved, bash lost 19 of 800; with
+    /// this resend, 1000 of 1000 runs pass. A heph that drops every Ctrl-C still
+    /// fails this, and `default_run_ctrl_c_reaches_the_tool` in `entrypoint_pty.rs`
+    /// keeps the single-shot check.
+    fn interrupt_to_prompt(&mut self) {
+        let started = Instant::now();
+        loop {
+            self.send(b"\x03");
+            if self.try_wait_for(PROMPT, Duration::from_secs(2)) {
+                return;
+            }
             assert!(
-                started.elapsed() < timeout,
-                "never saw {:?} within {timeout:?}\n--- captured ---\n{}",
-                String::from_utf8_lossy(needle),
+                started.elapsed() < DEADLINE,
+                "no {PROMPT:?} after repeated Ctrl-C within {DEADLINE:?}\n--- captured ---\n{}",
                 self.output_lossy(),
             );
-            std::thread::sleep(POLL);
         }
     }
 
@@ -764,6 +822,194 @@ fn entrypoint_shell_pty() {
         entrypoint_shell_dirs(ws.root()).is_empty(),
         "the invocation's sandbox (and its init file) outlived the shell"
     );
+}
+
+/// An entrypoint and a build target that passes `PROMPT_COMMAND` through.
+const PROMPT_COMMAND_BUILD: &str = "target(name = \"tool\", driver = \"exec\", entrypoint = True, \
+     args = True, run = [\"/bin/sh\", \"-c\", \"printf '<%s>' \\\"$@\\\"; echo\", \"tool\"])\n\
+     target(name = \"built\", driver = \"bash\", run = \"true\", cache = False, \
+     runtime_pass_env = [\"PROMPT_COMMAND\"])\n";
+
+/// A caller's `PROMPT_COMMAND` is back once the session is up, in an entrypoint's
+/// shell and a build target's, having run on every prompt from the first. heph's
+/// own is gone, its private variable reaches neither the shell nor a child, and
+/// the banner and `showl` printed once each.
+#[test]
+fn shell_keeps_the_callers_prompt_command() {
+    let dist = Dist::locate();
+    let ws = common::Workspace::new().expect("workspace");
+    ws.write("pkg/BUILD", PROMPT_COMMAND_BUILD)
+        .expect("write BUILD");
+    let home = tempfile::tempdir().expect("home tempdir");
+    for (args, value, want) in [
+        (
+            &["run", "--shell", "//pkg:tool", "--", "a b"][..],
+            Some("heph_pc=x${heph_pc-}"),
+            // The first prompt, and the one after `ready`'s line.
+            "pc=[heph_pc=x${heph_pc-}] ran=[xx] private=[gone] children=[0]",
+        ),
+        (
+            &["run", "--shell", "//pkg:built"][..],
+            Some("heph_pc=x${heph_pc-}"),
+            "pc=[heph_pc=x${heph_pc-}] ran=[xx] private=[gone] children=[0]",
+        ),
+        (
+            &["run", "--shell", "//pkg:tool"][..],
+            None,
+            "pc=[gone] ran=[] private=[gone] children=[0]",
+        ),
+    ] {
+        let mut session = ShellSession::spawn_with(&dist, ws.root(), args, home.path(), value);
+        session.ready();
+        session.send_str(
+            "echo \"pc=[${PROMPT_COMMAND-gone}] ran=[${heph_pc-}] \
+             private=[${__HEPH_PROMPT_COMMAND-gone}] \
+             children=[$(/usr/bin/env | /usr/bin/grep -c __HEPH_)]\"\n",
+        );
+        session.wait_for(want, DEADLINE);
+        session.wait_for(PROMPT, DEADLINE);
+
+        let out = session.output_lossy();
+        assert_eq!(out.matches("Shell mode, to exit").count(), 1, "{out}");
+        assert_eq!(out.matches("1 │ ").count(), 1, "{out}");
+        assert!(!out.contains("heph: the shell's setup"), "{out}");
+        // Apple's bash says this at startup unless the variable is in its
+        // environment already; init.sh is too late to set it.
+        assert!(!out.contains("default interactive shell"), "{out}");
+
+        session.send_str("exit\n");
+        let (exited, _, success) = session.wait_exit(DEADLINE);
+        assert!(exited && success, "{}", session.output_lossy());
+    }
+}
+
+/// A `.bashrc` or profile of the caller's does not run: the shell stays where the
+/// tool would run and sets nothing of theirs.
+///
+/// **This does not prove the bug it sits beside.** The bug is a *system* rc, a
+/// path compiled into bash (`/etc/bash.bashrc` on Debian), which a test cannot
+/// replace without writing `/etc`, and `--rcfile` already kept `~/.bashrc` out, so
+/// this was green before the fix too. It guards the rest of `--norc`'s job.
+/// `shell_argv_reads_no_config` pins the flags; the system rc itself was measured
+/// by hand in a Debian container.
+#[test]
+fn shell_reads_no_personal_bash_config() {
+    let dist = Dist::locate();
+    let ws = common::Workspace::new().expect("workspace");
+    ws.write("pkg/BUILD", PROMPT_COMMAND_BUILD)
+        .expect("write BUILD");
+    let home = tempfile::tempdir().expect("home tempdir");
+    for rc in [".bashrc", ".bash_profile", ".bash_login", ".profile"] {
+        std::fs::write(home.path().join(rc), "cd /; export HEPH_RC_RAN=1\n").expect("write rc");
+    }
+    let mut session = ShellSession::spawn_with(
+        &dist,
+        ws.root(),
+        &["run", "--shell", "//pkg:tool"],
+        home.path(),
+        None,
+    );
+    session.ready();
+    session.send_str("echo \"rc=[${HEPH_RC_RAN-none}] pwd=[$(/bin/pwd)]\"\n");
+    let root = std::fs::canonicalize(ws.root()).expect("canonicalize");
+    session.wait_for(
+        &format!("rc=[none] pwd=[{}]", root.display()),
+        Duration::from_secs(10),
+    );
+    session.wait_for(PROMPT, DEADLINE);
+    session.send_str("exit\n");
+    let (exited, _, success) = session.wait_exit(DEADLINE);
+    assert!(exited && success, "{}", session.output_lossy());
+}
+
+/// What the `run` helper executes in the two tests below: it reports the wrap
+/// runner's env, echoes a typed line, then reports each window size from its
+/// WINCH trap until a Ctrl-C ends it.
+///
+/// This loop can lose a Ctrl-C, which is why [`ShellSession::interrupt_to_prompt`]
+/// exists. Don't "fix" it with `sleep & wait`: that hangs too, with the macOS
+/// `/bin/bash` 3.2 spinning on the CPU.
+const FOLLOWING_TOOL: &str = r#"driver = "bash", cache = False, run = """
+echo "runner-mark-[${XR_MARK:-none}]"
+echo "read-""ready"
+read -r line
+echo "typed-[$line]"
+trap 'echo "resized-to-$(/bin/stty size)-end"' WINCH
+trap 'exit 0' INT
+echo "size-""ready"
+while true; do sleep 0.05 || true; done
+""""#;
+
+/// A `--shell` session at its prompt runs [`FOLLOWING_TOOL`]: typed stdin and a
+/// live resize both reach it, the trap's marker being the barrier and the size
+/// it reads the new one. The shell then exits cleanly.
+fn tool_follows_the_terminal(session: &mut ShellSession, mark: &str) {
+    session.ready();
+    session.send_str("run\n");
+    session.wait_for(&format!("runner-mark-[{mark}]"), DEADLINE);
+    session.wait_for("read-ready", DEADLINE);
+    session.send_str("hello-tool\n");
+    session.wait_for("typed-[hello-tool]", DEADLINE);
+    session.wait_for("size-ready", DEADLINE);
+    session.resize(30, 100);
+    session.wait_for("resized-to-30 100-end", DEADLINE);
+    session.interrupt_to_prompt();
+    session.send_str("exit\n");
+    let (exited, _, success) = session.wait_exit(DEADLINE);
+    assert!(
+        exited && success,
+        "exited={exited} success={success}\n{}",
+        session.output_lossy()
+    );
+}
+
+/// `--shell` on a build target under a wrap runner, today's local-process kind:
+/// `/usr/bin/env` is all it needs, so a missing prerequisite fails rather than
+/// skips. The runner's env reaching the tool shows the wrap really happened; it
+/// names `PATH` because a runner supplies the environment its targets run in,
+/// and the shell comes from there rather than from heph's own `PATH`.
+#[test]
+fn local_runner_shell_keeps_working() {
+    let dist = Dist::locate();
+    let ws = common::Workspace::new().expect("workspace");
+    ws.write(
+        "pkg/BUILD",
+        &format!(
+            r#"
+target(
+    name = "runner",
+    driver = "bash",
+    run = """cat > $OUT <<'JSON'
+{{"version": 1, "fingerprint": "fp-1", "runner": "wrap",
+ "config": {{"prefix": ["/usr/bin/env"],
+             "env": {{"XR_MARK": "wrapped", "PATH": "/usr/local/bin:/usr/bin:/bin"}}}}}}
+JSON""",
+    out = "runner.json",
+)
+target(name = "tool", runner = "//pkg:runner", {FOLLOWING_TOOL})
+"#
+        ),
+    )
+    .expect("write BUILD");
+
+    let mut session = ShellSession::spawn(&dist, ws.root(), &["run", "--shell", "//pkg:tool"]);
+    tool_follows_the_terminal(&mut session, "wrapped");
+}
+
+/// The same with no runner at all: a resize while the shell runs reaches the
+/// tool through the driver's PTY.
+#[test]
+fn build_target_shell_forwards_resize() {
+    let dist = Dist::locate();
+    let ws = common::Workspace::new().expect("workspace");
+    ws.write(
+        "pkg/BUILD",
+        &format!("target(name = \"tool\", {FOLLOWING_TOOL})\n"),
+    )
+    .expect("write BUILD");
+
+    let mut session = ShellSession::spawn(&dist, ws.root(), &["run", "--shell", "//pkg:tool"]);
+    tool_follows_the_terminal(&mut session, "none");
 }
 
 /// [`SET_PROMPT`]'s contract, in both directions — the same two halves as

@@ -140,6 +140,36 @@ pub fn set_terminal_restore(f: impl Fn() + Send + Sync + 'static) {
     *TERMINAL_RESTORE.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(f));
 }
 
+/// Register a closure for the time a raw-mode session sits inside another one
+/// (a tool's PTY while the TUI has stepped aside), for the hard-abort path.
+/// Dropping the returned scope puts back whatever was registered before.
+#[must_use = "dropping the scope ends the registration"]
+pub fn scoped_terminal_restore(f: impl Fn() + Send + Sync + 'static) -> TerminalRestoreScope {
+    let previous = TERMINAL_RESTORE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .replace(Arc::new(f));
+    TerminalRestoreScope { previous }
+}
+
+/// See [`scoped_terminal_restore`].
+pub struct TerminalRestoreScope {
+    previous: Option<RestoreFn>,
+}
+
+impl std::fmt::Debug for TerminalRestoreScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TerminalRestoreScope")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for TerminalRestoreScope {
+    fn drop(&mut self) {
+        *TERMINAL_RESTORE.lock().unwrap_or_else(|e| e.into_inner()) = self.previous.take();
+    }
+}
+
 /// Forget the registered closure — call once the session has torn itself
 /// down normally, so a later abort in some other (non-interactive) run
 /// doesn't fire a stale restore.
@@ -214,6 +244,35 @@ mod tests {
         assert!(!is_transparent());
         trigger.trigger();
         assert!(rx.try_recv().is_ok(), "heph's again once no tool runs");
+    }
+
+    /// While a scope holds it, the abort runs its closure. Afterwards the TUI's
+    /// is back for the abort.
+    #[test]
+    fn scoped_restore_puts_the_previous_back() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let counter = || {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let bump = Arc::clone(&calls);
+            (calls, move || {
+                bump.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+        let (tui, tui_restore) = counter();
+        let (session, session_restore) = counter();
+
+        set_terminal_restore(tui_restore);
+
+        let scope = scoped_terminal_restore(session_restore);
+        restore_terminal();
+        assert_eq!(session.load(Ordering::SeqCst), 1, "the abort");
+        assert_eq!(tui.load(Ordering::SeqCst), 0, "shadowed by the scope");
+
+        drop(scope);
+        restore_terminal();
+        assert_eq!(tui.load(Ordering::SeqCst), 1, "the TUI's is back");
+        assert_eq!(session.load(Ordering::SeqCst), 1, "the scope is over");
+        clear_terminal_restore();
     }
 
     #[test]

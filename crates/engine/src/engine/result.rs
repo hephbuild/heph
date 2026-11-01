@@ -987,6 +987,9 @@ pub type InteractiveInner = Box<
             Option<&'io mut (dyn tokio::io::AsyncRead + Send + Sync + Unpin)>,
             Option<&'io mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin)>,
             Option<&'io mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin)>,
+            // Live window sizes, for a build target's `--shell` (see
+            // `RunRequest::winsize`). In-process only.
+            Option<crate::engine::driver::WinSizeReceiver>,
         ) -> futures::future::BoxFuture<'io, anyhow::Result<()>>
         + Send,
 >;
@@ -11825,7 +11828,7 @@ mod tests {
                 let live = probe.live.fetch_add(1, Ordering::SeqCst) + 1;
                 probe.max_live.fetch_max(live, Ordering::SeqCst);
                 tokio::time::sleep(Duration::from_millis(50)).await;
-                let res = inner(None, None, None).await;
+                let res = inner(None, None, None, None).await;
                 probe.live.fetch_sub(1, Ordering::SeqCst);
                 res
             })
