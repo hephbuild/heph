@@ -13,6 +13,7 @@ mod gen_testmain;
 pub mod gocache;
 mod govet;
 mod listed;
+mod module_fetch;
 mod pkg_analysis;
 mod provider;
 mod target_bin;

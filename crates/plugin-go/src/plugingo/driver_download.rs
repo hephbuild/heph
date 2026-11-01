@@ -5,13 +5,17 @@
 //! `TargetAddr` filters; the engine unpacks only the requested entries into the
 //! consumer's sandbox at their package-relative paths.
 //!
-//! The only subprocess is `go`, so the target needs nothing else on `PATH`.
+//! `go` is the only subprocess this driver starts. `go` starts `git` itself for a
+//! module it fetches directly (`GOPRIVATE`, `GOPROXY=direct`), which is the one
+//! reason a fetch sees the host's `PATH`, whichever toolchain it uses. See
+//! `docs/GO_MODULES.md`.
 //!
 //! The module directory `go` reports sits under `GOMODCACHE`, heph's scratch slot,
 //! and is read from this process. That holds under a runner too: a runner must
 //! share heph's home at the same path, or no scratch would work under it
 //! (`docs/EXEC_RUNNERS.md`, "Containers").
 
+use crate::plugingo::module_fetch::FETCH_ACCESS_ENV;
 use anyhow::Context;
 use async_trait::async_trait;
 use enclose::enclose;
@@ -107,55 +111,40 @@ impl Hash for GoDownloadDef {
     }
 }
 
-/// Host environment `go mod download` may see.
-///
-/// These say where module bytes come from and how to reach them, and none of them
-/// reach a hash.
+/// Host environment `go mod download` may see: [`FETCH_ACCESS_ENV`] and this.
 ///
 /// **Accepted exemption: `module@version` is a name, not a content identity.** The
 /// stub go.mod has no go.sum, so the checksum database is the only check on the
-/// bytes, and `GOSUMDB=off` or `GONOSUMDB` here turns it off: two proxies serving
-/// different bytes for one version then share a key, and a tampered tree in a warm
-/// module cache is returned as is. The bash recipe had the same hole. Closing it
-/// means carrying go.sum's `h1:` into the def hash and checking the tree against it.
+/// bytes, and `GOPRIVATE`, `GONOSUMDB` or `GOSUMDB=off` turn it off for the modules
+/// they cover: two sources serving different bytes for one version then share a
+/// key, and a tampered tree in a warm module cache is returned as is. The bash
+/// recipe had the same hole. Closing it means carrying go.sum's `h1:` into the def
+/// hash and checking the tree against it.
 ///
 /// `GOMODCACHE` is deliberately absent: the module cache is heph's scratch.
-const MODULE_FETCH_PASS_ENV: &[&str] = &[
-    "HOME",
-    "GOPATH",
-    "GOCACHE",
-    "GOPROXY",
-    "GONOSUMDB",
-    "GOSUMDB",
-    "GOPRIVATE",
-    "GOINSECURE",
-];
+const DOWNLOAD_ONLY_PASS_ENV: &[&str] = &["GOCACHE"];
 
 /// `host` looks a variable up in the host environment. Injected so a test can
 /// describe an environment without mutating the process's own.
 fn download_env(
-    go_version: &str,
     has_runner: bool,
     goroot: &Path,
     gomodcache: &Path,
     host: impl Fn(&str) -> Option<String>,
 ) -> HashMap<String, String> {
     let mut env: HashMap<String, String> = HashMap::new();
-    for name in MODULE_FETCH_PASS_ENV {
+    for name in FETCH_ACCESS_ENV.iter().chain(DOWNLOAD_ONLY_PASS_ENV) {
         if let Some(v) = host(name) {
             env.insert((*name).to_string(), v);
         }
     }
-    // A non-hermetic `go` may be a wrapper that needs `PATH`. A hermetic one is
-    // PATH-independent, and the host's directories stay out. A runner supplies its
-    // own `PATH`: the host's would bring host tools into its environment.
-    if !has_runner
-        && !matches!(
-            crate::plugingo::toolchain::classify(go_version),
-            crate::plugingo::toolchain::Toolchain::Hermetic(_)
-        )
-        && let Some(v) = host("PATH")
-    {
+    // Every toolchain: a hermetic `go` is found by path, but it finds `git`, and
+    // `git` finds `ssh` and credential helpers, here. Tool versions cannot change
+    // what a fetch means, since module bytes are named by module@version and the
+    // zip `go` builds from a tag is defined by the module's h1 hash. A runner
+    // supplies its own `PATH`: the host's would bring host tools into its
+    // environment.
+    if !has_runner && let Some(v) = host("PATH") {
         env.insert("PATH".to_string(), v);
     }
     env.insert("GOROOT".to_string(), goroot.to_string_lossy().into_owned());
@@ -217,14 +206,15 @@ fn parse_module_dir(
 /// Which fetch variables heph passed to `go`, for a failure message. Names only: a
 /// `GOPROXY` URL can carry credentials.
 fn passed_env_note(env: &HashMap<String, String>) -> String {
-    let set: Vec<&str> = MODULE_FETCH_PASS_ENV
+    let set: Vec<&str> = FETCH_ACCESS_ENV
         .iter()
+        .chain(DOWNLOAD_ONLY_PASS_ENV)
         .copied()
         .filter(|name| env.contains_key(*name))
         .collect();
     format!(
-        "heph passes only these variables from its own environment to go: {}. Set here: {}.",
-        MODULE_FETCH_PASS_ENV.join(", "),
+        "heph passes a fixed list of variables from its own environment to go \
+         (docs/GO_MODULES.md). Set here: {}.",
         if set.is_empty() {
             "none".to_string()
         } else {
@@ -509,13 +499,9 @@ impl ManagedDriver for GoDownloadDriver {
                  empty one rather than none",
             )?;
 
-        let env = download_env(
-            &def.go_version,
-            def.runner.is_some(),
-            &goroot,
-            &gomodcache,
-            |n| std::env::var(n).ok(),
-        );
+        let env = download_env(def.runner.is_some(), &goroot, &gomodcache, |n| {
+            std::env::var(n).ok()
+        });
         let module_dir = fetch_module(
             ModuleFetch {
                 go_bin: &go_bin,
@@ -553,7 +539,7 @@ impl ManagedDriver for GoDownloadDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plugingo::toolchain::{DEFAULT_GO_VERSION, HOST};
+    use crate::plugingo::toolchain::DEFAULT_GO_VERSION;
     use hcore::htvalue::Value;
     use hmodel::htaddr::Addr;
     use hmodel::htpkg::PkgBuf;
@@ -718,50 +704,38 @@ mod tests {
     // ---- env ----
 
     #[test]
-    fn hermetic_env_keeps_the_host_path_and_modcache_out() {
+    fn env_passes_what_a_private_fetch_needs_and_keeps_the_modcache_out() {
         let host = |n: &str| Some(format!("host-{n}"));
-        let env = download_env(
-            DEFAULT_GO_VERSION,
-            false,
-            Path::new("/goroot"),
-            Path::new("/scratch"),
-            host,
-        );
-        assert!(!env.contains_key("PATH"), "{env:?}");
+        let env = download_env(false, Path::new("/goroot"), Path::new("/scratch"), host);
         assert_eq!(env["GOMODCACHE"], "/scratch", "the scratch wins");
         assert_eq!(env["GOROOT"], "/goroot");
-        assert_eq!(
-            env["GOPROXY"], "host-GOPROXY",
-            "network config is the user's"
-        );
+        for name in [
+            "GOPROXY",
+            "GOPRIVATE",
+            "GONOPROXY",
+            "HOME",
+            "SSH_AUTH_SOCK",
+            "GIT_SSH_COMMAND",
+        ] {
+            assert_eq!(env[name], format!("host-{name}"), "{name}");
+        }
+        assert!(!env.contains_key("GOFLAGS"), "{env:?}");
     }
 
     #[test]
-    fn non_hermetic_env_gets_the_host_path_unless_a_runner_supplies_one() {
-        for go_version in [HOST, "//tools:go"] {
-            let env = |has_runner| {
-                download_env(
-                    go_version,
-                    has_runner,
-                    Path::new("/g"),
-                    Path::new("/s"),
-                    |n| Some(format!("host-{n}")),
-                )
-            };
-            assert_eq!(env(false)["PATH"], "host-PATH", "{go_version}");
-            assert!(!env(true).contains_key("PATH"), "{go_version}");
-        }
+    fn env_gets_the_host_path_unless_a_runner_supplies_one() {
+        let env = |has_runner| {
+            download_env(has_runner, Path::new("/g"), Path::new("/s"), |n| {
+                Some(format!("host-{n}"))
+            })
+        };
+        assert_eq!(env(false)["PATH"], "host-PATH");
+        assert!(!env(true).contains_key("PATH"));
     }
 
     #[test]
     fn env_pins_the_toolchain_whatever_the_host_says() {
-        let env = download_env(
-            DEFAULT_GO_VERSION,
-            false,
-            Path::new("/g"),
-            Path::new("/s"),
-            no_host,
-        );
+        let env = download_env(false, Path::new("/g"), Path::new("/s"), no_host);
         assert_eq!(env["GOTOOLCHAIN"], "local");
         assert_eq!(env["GOWORK"], "off");
         assert_eq!(env["CGO_ENABLED"], "0");
