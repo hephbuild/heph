@@ -15,7 +15,7 @@
 //! share heph's home at the same path, or no scratch would work under it
 //! (`docs/EXEC_RUNNERS.md`, "Containers").
 
-use crate::plugingo::module_fetch::FETCH_ACCESS_ENV;
+use crate::plugingo::module_fetch::{FETCH_ACCESS_ENV, add_fetch_env};
 use anyhow::Context;
 use async_trait::async_trait;
 use enclose::enclose;
@@ -133,17 +133,17 @@ fn download_env(
     host: impl Fn(&str) -> Option<String>,
 ) -> HashMap<String, String> {
     let mut env: HashMap<String, String> = HashMap::new();
-    for name in FETCH_ACCESS_ENV.iter().chain(DOWNLOAD_ONLY_PASS_ENV) {
+    add_fetch_env(&mut env, &host);
+    for name in DOWNLOAD_ONLY_PASS_ENV {
         if let Some(v) = host(name) {
             env.insert((*name).to_string(), v);
         }
     }
     // Every toolchain: a hermetic `go` is found by path, but it finds `git`, and
-    // `git` finds `ssh` and credential helpers, here. Tool versions cannot change
-    // what a fetch means, since module bytes are named by module@version and the
-    // zip `go` builds from a tag is defined by the module's h1 hash. A runner
-    // supplies its own `PATH`: the host's would bring host tools into its
-    // environment.
+    // `git` finds `ssh` and credential helpers, here. The exemption above covers
+    // this: nothing checks a private module's bytes, so `git` and its config (an
+    // LFS filter, for one) decide them under the same key. A runner supplies its
+    // own `PATH`: the host's would bring host tools into its environment.
     if !has_runner && let Some(v) = host("PATH") {
         env.insert("PATH".to_string(), v);
     }
@@ -402,8 +402,8 @@ impl ManagedDriver for GoDownloadDriver {
         )?;
         inputs.extend(runner_input);
 
-        // The shared module cache: unhashed, because the bytes `go` hands back are
-        // checksum-verified whether the cache was warm or cold.
+        // The shared module cache: unhashed, because a warm and a cold cache hand
+        // back the same bytes. See the exemption on `DOWNLOAD_ONLY_PASS_ENV`.
         inputs.push(Input {
             r#ref: TargetAddr {
                 r#ref: crate::plugingo::gocache::modcache_addr(),
