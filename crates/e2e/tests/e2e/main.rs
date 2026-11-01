@@ -5,8 +5,9 @@
 //! dominated build time and disk. They are modules of one harness now; select a
 //! file with a name filter: `cargo test -p e2e --test e2e clean::`.
 //!
-//! Not every file belongs here. `credential.rs`, `oci_credential.rs` and
-//! `deferred.rs` stay separate binaries under `tests/` because they call
+//! Not every file belongs here. `credential.rs`, `oci_credential.rs`,
+//! `deferred.rs`, `entrypoint.rs` and `run_terminal.rs` stay separate binaries
+//! under `tests/` because they call
 //! `std::env::set_var`, and libtest runs a binary's tests as threads of one
 //! process: a variable one test sets would be visible to every other test in
 //! here while it is set. The root crate's `every_test_file_is_compiled` checks

@@ -414,9 +414,10 @@ fn test_fixtures_are_never_published() {
         Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/perf.yml"),
     )
     .expect("read .github/workflows/perf.yml");
+    // `go_e2e_count` downloads only the shards' test counts, never a build.
     let mut publishing = jobs
         .iter()
-        .filter(|(id, _)| *id != "bin_e2e")
+        .filter(|(id, _)| !["bin_e2e", "go_e2e_count"].contains(id))
         .map(|(id, body)| (format!("heph.yml {id}"), without_comments(body)))
         .collect::<Vec<_>>();
     publishing.push(("perf.yml".to_owned(), without_comments(&perf)));

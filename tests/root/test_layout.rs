@@ -41,7 +41,13 @@ const LAYOUTS: &[Layout] = &[
     Layout {
         tests_dir: "crates/e2e/tests",
         aggregated: "e2e",
-        separate: &["credential.rs", "oci_credential.rs", "deferred.rs"],
+        separate: &[
+            "credential.rs",
+            "oci_credential.rs",
+            "deferred.rs",
+            "entrypoint.rs",
+            "run_terminal.rs",
+        ],
         support: &["common"],
     },
 ];
