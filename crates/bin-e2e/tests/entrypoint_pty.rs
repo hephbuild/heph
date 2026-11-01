@@ -98,6 +98,9 @@ echo "second-""resume"
 exit 3
 """)
 target(name = "stopped_counter", driver = "bash", entrypoint = True, run = """
+# The signal under test lands as the resumed tool writes, and bash's handlers
+# don't restart: `echo` then fails with EINTR, which `-e` makes the tool's exit.
+set +e
 w=0
 trap 'w=$((w+1)); echo "winch-$w-$(/bin/stty size)-end"' WINCH
 t=0
