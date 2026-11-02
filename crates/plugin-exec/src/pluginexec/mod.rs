@@ -539,6 +539,10 @@ fn add_shell_env(env: &mut Vec<(OsString, OsString)>, init: &std::path::Path) {
 /// for tall generated scripts.
 const BASH_C_INLINE_MAX: usize = 500;
 
+/// The shell a wrapped command runs in, and the name it answers to on a
+/// target's `PATH` (see [`Driver::shell_bin_dir`]).
+const SHELL_PROGRAM: &str = "bash";
+
 pub fn bash_args_public(
     sandbox_dir: &std::path::Path,
     cmd: &str,
@@ -785,6 +789,43 @@ impl Driver {
         let mut out = vec![found.to_string_lossy().into_owned()];
         out.extend_from_slice(rest);
         Ok(out)
+    }
+
+    /// A sandbox directory holding only the shell this driver spawned the
+    /// target with, for the target's `PATH` — or `None` when the shell was not
+    /// resolved here (`exec` outside `--shell`, or a target under a runner,
+    /// whose environment supplies its own).
+    ///
+    /// The recipe runs inside that shell already, so a nested `bash` (a
+    /// `bash -c`, a `#!/usr/bin/env bash` script) reaches the very binary
+    /// running it and nothing else: the host's other directories stay off
+    /// `PATH`. It goes in the suffix, behind the target's tools and the
+    /// environment (ahead of the builtins, which have no `bash`), so a target
+    /// that declares its own `bash` gets that one.
+    fn shell_bin_dir(
+        &self,
+        sandbox_dir: &std::path::Path,
+        resolved_here: bool,
+    ) -> anyhow::Result<Option<PathBuf>> {
+        if !resolved_here {
+            return Ok(None);
+        }
+        let Some(shell) = self.shell_path.get() else {
+            return Ok(None);
+        };
+        let dir = sandbox_dir.join("shell-bin");
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("create the shell bin dir {}", dir.display()))?;
+        let link = dir.join(SHELL_PROGRAM);
+        match std::os::unix::fs::symlink(shell, &link) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("link {} to {}", link.display(), shell.display()));
+            }
+        }
+        Ok(Some(dir))
     }
 
     /// The toolbox identity that reaches a target's cache key, or `None` when it
@@ -2198,6 +2239,10 @@ impl Driver {
         // a host path holding symlinks into a host-platform binary, and a
         // container's filesystem is not this one.
         let coreutils_dir = self.coreutils_dir()?;
+        let shell_dir = self.shell_bin_dir(
+            &req.sandbox_dir,
+            def.runner.is_none() && (self.wraps_in_shell || shell),
+        )?;
         let path_policy = hexecrunner::PathPolicy {
             prefix: credential_path_prefix
                 .into_iter()
@@ -2206,9 +2251,12 @@ impl Driver {
             // No fallback. It carried `/usr/local/bin:/usr/bin:/bin` to the seam
             // for a local spawn, which is precisely what this change removes.
             fallback: None,
-            suffix: coreutils_dir
-                .map(|d| d.as_os_str().to_os_string())
+            // The shell the target already runs in, then the builtins: the
+            // builtins stay last, and neither names a program the other has.
+            suffix: shell_dir
+                .map(PathBuf::into_os_string)
                 .into_iter()
+                .chain(coreutils_dir.map(|d| d.as_os_str().to_os_string()))
                 .collect(),
         };
 
@@ -6307,9 +6355,73 @@ bash apply_transitive: 26a90abee4625d43
             .expect("enabled")
             .to_string_lossy()
             .into_owned();
+        let shell_dir = tmp.path().join("shell-bin");
         assert_eq!(
-            path_out, shims,
-            "a target that declares nothing sees only the builtins"
+            path_out,
+            format!("{}:{shims}", shell_dir.display()),
+            "a target that declares nothing sees only the builtins and its own shell"
+        );
+        Ok(())
+    }
+
+    /// The recipe already runs in bash, so `bash` inside it must resolve —
+    /// to that same binary — even though the host's directories are off its
+    /// `PATH`. Before the fix this printed `bash: bash: command not found`.
+    #[tokio::test]
+    async fn a_bash_target_can_call_bash() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let driver = Driver::new_bash()
+            .with_coreutils_enabled_for_test()
+            .with_coreutils(1, fake_shims(home.path()));
+        let ctoken = StdCancellationToken::new();
+        let tmp = tempfile::tempdir()?;
+
+        let target_def = EngineTargetDef {
+            raw_def: Arc::new(TargetDef {
+                run: vec![D::new(
+                    "bash -c 'echo \"nested:$BASH\"'; command -v bash".to_string(),
+                )],
+                ..Default::default()
+            }),
+            cache: CacheConfig::on(true),
+            pty: true,
+            ..Default::default()
+        };
+        let mut stdout = Vec::new();
+        let request_id = "test".to_string();
+        let mut req = RunRequest::new(&request_id, &target_def, tmp.path());
+        req.stdout = Some(&mut stdout);
+        driver
+            .run(
+                ManagedRunRequest {
+                    sandbox_dir: tmp.path().to_path_buf(),
+                    sandbox_ws_dir: tmp.path().to_path_buf(),
+                    sandbox_pkg_dir: tmp.path().to_path_buf(),
+                    request: req,
+                    inputs: vec![],
+                },
+                &ctoken,
+            )
+            .await?;
+
+        let out = String::from_utf8(stdout)?;
+        let mut lines = out.lines();
+        let nested = lines.next().unwrap_or_default();
+        let found = lines.next().unwrap_or_default();
+        assert_eq!(
+            found,
+            tmp.path().join("shell-bin").join("bash").to_string_lossy(),
+            "`bash` resolves through the sandbox's shell dir; got: {out}"
+        );
+        let outer = driver.shell_path.get().expect("resolved for the spawn");
+        assert_eq!(
+            std::fs::canonicalize(found)?,
+            std::fs::canonicalize(outer)?,
+            "and it is the shell the target runs in"
+        );
+        assert!(
+            nested.starts_with("nested:/"),
+            "the nested bash ran; got: {out}"
         );
         Ok(())
     }
