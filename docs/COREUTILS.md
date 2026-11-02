@@ -90,7 +90,10 @@ heph's `PATH` does not exist inside it, so the shell has to come from the
 environment the target actually runs in — which is what naming a runner asks
 for. An absolute program spawns fine regardless of the
 child's `PATH`, so the shell starts and the recipe inside it still cannot reach
-an undeclared host binary. That must never extend to the `exec` driver's
+an undeclared host binary. The recipe can still call `bash` itself (`bash -c`,
+a `#!/usr/bin/env bash` script): the driver links that same shell, and only
+it, into a sandbox directory on the target's `PATH`, after the environment and
+ahead of the builtins, so a declared `bash` still wins. That must never extend to the `exec` driver's
 `argv[0]`, which *is* the target's command: resolving that ambiently would hand
 back the whole hole this closes.
 
