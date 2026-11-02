@@ -792,9 +792,11 @@ impl Driver {
     }
 
     /// A sandbox directory holding only the shell this driver spawned the
-    /// target with, for the target's `PATH` — or `None` when the shell was not
-    /// resolved here (`exec` outside `--shell`, or a target under a runner,
-    /// whose environment supplies its own).
+    /// target with, for the target's `PATH` — or `None` unless this is the
+    /// `bash` driver spawning locally. Not `exec`, even under `--shell` where
+    /// heph does wrap it in bash: the recipe there is the target's own argv,
+    /// which never ran in a shell. Not under a runner, whose environment
+    /// supplies its own.
     ///
     /// The recipe runs inside that shell already, so a nested `bash` (a
     /// `bash -c`, a `#!/usr/bin/env bash` script) reaches the very binary
@@ -2241,7 +2243,7 @@ impl Driver {
         let coreutils_dir = self.coreutils_dir()?;
         let shell_dir = self.shell_bin_dir(
             &req.sandbox_dir,
-            def.runner.is_none() && (self.wraps_in_shell || shell),
+            def.runner.is_none() && self.wraps_in_shell,
         )?;
         let path_policy = hexecrunner::PathPolicy {
             prefix: credential_path_prefix
