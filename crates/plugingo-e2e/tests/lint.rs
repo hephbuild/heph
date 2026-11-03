@@ -49,13 +49,36 @@ async fn test_format_check_execs_the_downloaded_govet() -> anyhow::Result<()> {
     Ok(())
 }
 
+// The tests below lint with heph-govet built from this tree: they test the
+// driver and the tool together, and the pinned release is a different tool. It
+// was against the release that `_lint-analyze` stayed green while every package
+// importing the standard library failed with the shipped heph-govet ("no package
+// vetx file for \"fmt\""), from the x/tools bump until the fix in #530.
+
+/// A leaf package importing only the standard library, which heph never lints and
+/// so has no facts for: unitchecker still needs a vetx file for `fmt` to type-check.
+#[tokio::test]
+async fn test_lint_package_importing_stdlib() -> anyhow::Result<()> {
+    require_go!();
+    let ws = common::make_workspace_tree_govet(common::fixture("with_dep")?)?;
+
+    let result = ws.run("//lib:_lint-analyze@v=host").await?;
+
+    let paths = common::artifact_paths(&result);
+    assert!(
+        paths.iter().any(|p| p.ends_with("lint.facts")),
+        "analyze must produce facts, got {paths:?}"
+    );
+    Ok(())
+}
+
 /// A dependent package: its dep's facts feed the analysis. A package that exports
 /// no facts writes a **zero-byte** `lint.facts` (x/tools `Set.Encode` returns nil),
 /// and consuming that must be a no-op, not a decode failure.
 #[tokio::test]
 async fn test_lint_consumes_a_deps_empty_facts() -> anyhow::Result<()> {
     require_go!();
-    let ws = common::make_workspace_host(common::fixture("with_dep")?)?;
+    let ws = common::make_workspace_tree_govet(common::fixture("with_dep")?)?;
 
     // cmd imports lib, so lib's facts are wired into cmd's analysis.
     let result = ws.run("//cmd:_lint-analyze@v=host").await?;
@@ -75,7 +98,7 @@ async fn test_lint_consumes_a_deps_empty_facts() -> anyhow::Result<()> {
 #[tokio::test]
 async fn test_lint_package_importing_unsafe() -> anyhow::Result<()> {
     require_go!();
-    let ws = common::make_workspace_host(common::fixture("lint_unsafe")?)?;
+    let ws = common::make_workspace_tree_govet(common::fixture("lint_unsafe")?)?;
 
     let result = ws.run("//mem:_lint-analyze@v=host").await?;
 

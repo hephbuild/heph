@@ -306,6 +306,14 @@ pub fn make_workspace_host(dir: TempDir) -> anyhow::Result<Workspace> {
     make_workspace(dir)
 }
 
+/// [`make_workspace`], linting with heph-govet built from **this tree** rather
+/// than the pinned [`GOVET_RELEASE`]. A test of what the lint driver and the
+/// tool do together uses this: against the release it tests the driver against
+/// a binary that no longer matches it.
+pub fn make_workspace_tree_govet(dir: TempDir) -> anyhow::Result<Workspace> {
+    make_workspace_ordered_runner(dir, false, true, &[], HOST_GO, None, Govet::Tree)
+}
+
 /// Build the workspace against the pinned **hermetic** Go SDK ([`HERMETIC_GO`]) —
 /// downloaded and staged, with std compiled from source. Expensive (disk + time),
 /// so reserve it for the *select few* tests that must prove the hermetic
@@ -324,13 +332,82 @@ pub fn govet_addr() -> String {
     format!("//@heph/go/govet/{GOVET_RELEASE}:heph-govet")
 }
 
+/// Which heph-govet a workspace lints with.
+#[derive(Debug, Clone, Copy)]
+enum Govet {
+    /// [`GOVET_RELEASE`], downloaded through `http_fetch`, as a real workspace does.
+    /// Only the download path itself is worth testing against it: it is frozen, so
+    /// the lint driver tested against it is not tested against the tool it ships
+    /// with.
+    Release,
+    /// `tools/heph-govet` built from this tree (see [`tree_govet_bin`]).
+    Tree,
+}
+
+/// Static target that stages the tree-built heph-govet. It carries the host
+/// `goos`/`goarch` args because the provider adds them to a `govet` addr that has
+/// none (the release download templates its URL over them), and an addr with args
+/// is used as is.
+fn tree_govet_addr() -> String {
+    format!(
+        "//@heph/bin:heph-govet@goarch={},goos={}",
+        hcore::htplatform::arch(),
+        hcore::htplatform::os()
+    )
+}
+
+/// `tools/heph-govet` built from this tree, once per test process.
+///
+/// Built into the shared `CARGO_TARGET_TMPDIR` and renamed into place, so test
+/// processes running at once (nextest runs one per test) each publish a complete
+/// binary and a reader never sees a partial one. Always rebuilt rather than
+/// reused: a binary left by another tree would be the stale tool this exists to
+/// avoid, and Go's build cache makes the rebuild a link step.
+fn tree_govet_bin() -> anyhow::Result<&'static str> {
+    static BIN: std::sync::OnceLock<Result<String, String>> = std::sync::OnceLock::new();
+    BIN.get_or_init(|| build_tree_govet().map_err(|e| format!("{e:#}")))
+        .as_deref()
+        .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+fn build_tree_govet() -> anyhow::Result<String> {
+    // Runtime first, as `testdata` does: CI runs this suite from a nextest archive
+    // on another runner, where `--workspace-remap` sets the env var.
+    let src = std::env::var_os("CARGO_MANIFEST_DIR")
+        .map_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")), PathBuf::from)
+        .join("../../tools/heph-govet");
+    let dir = std::env::var_os("CARGO_TARGET_TMPDIR")
+        .map_or_else(|| PathBuf::from(env!("CARGO_TARGET_TMPDIR")), PathBuf::from);
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let tmp = dir.join(format!("heph-govet.{}", std::process::id()));
+    let out = std::process::Command::new("go")
+        .args(["build", "-trimpath", "-o"])
+        .arg(&tmp)
+        .arg(".")
+        .current_dir(&src)
+        .env("CGO_ENABLED", "0")
+        .output()
+        .with_context(|| format!("run go build in {}", src.display()))?;
+    anyhow::ensure!(
+        out.status.success(),
+        "go build of {} failed ({}):\n{}",
+        src.display(),
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let bin = dir.join("heph-govet");
+    std::fs::rename(&tmp, &bin)
+        .with_context(|| format!("move {} to {}", tmp.display(), bin.display()))?;
+    Ok(bin.to_string_lossy().into_owned())
+}
+
 /// Like [`make_workspace`] but with `fs.skip` entries, mirroring a config file's
 /// `fs: { skip: [...] }`. Used to reproduce a codegen target whose generated Go
 /// package lives under a skipped subtree (e.g. a generated `gen/**` tree).
 /// Host toolchain (`gotool = "host"`), with every Go tool defaulting to the
 /// exec runner at `runner`. See [`make_workspace_ordered_runner`].
 pub fn make_workspace_host_under_runner(dir: TempDir, runner: &str) -> anyhow::Result<Workspace> {
-    make_workspace_ordered_runner(dir, true, true, &[], HOST_GO, Some(runner))
+    make_workspace_ordered_runner(dir, true, true, &[], HOST_GO, Some(runner), Govet::Release)
 }
 
 pub fn make_workspace_fs_skip(dir: TempDir, skip: &[&str]) -> anyhow::Result<Workspace> {
@@ -359,7 +436,15 @@ fn make_workspace_ordered(
     fs_skip: &[&str],
     gotool: &str,
 ) -> anyhow::Result<Workspace> {
-    make_workspace_ordered_runner(dir, go_first, foreign_name_guard, fs_skip, gotool, None)
+    make_workspace_ordered_runner(
+        dir,
+        go_first,
+        foreign_name_guard,
+        fs_skip,
+        gotool,
+        None,
+        Govet::Release,
+    )
 }
 
 /// A workspace whose Go **tool** drivers default to `runner` — the plugin's
@@ -375,7 +460,18 @@ fn make_workspace_ordered_runner(
     fs_skip: &[&str],
     gotool: &str,
     runner: Option<&str>,
+    govet: Govet,
 ) -> anyhow::Result<Workspace> {
+    // Built here, not by a target: the sandbox has no HOME, so no GOCACHE, and a
+    // cold `go build` there would recompile x/tools for every test.
+    let tree_govet = match govet {
+        Govet::Release => None,
+        Govet::Tree => Some(tree_govet_bin()?),
+    };
+    let govet_opt = match govet {
+        Govet::Release => govet_addr(),
+        Govet::Tree => tree_govet_addr(),
+    };
     let runner = runner.map(str::to_string);
     let provider_runner = runner.clone();
     let gotool = gotool.to_string();
@@ -398,7 +494,7 @@ fn make_workspace_ordered_runner(
                 foreign_name_guard,
                 sdk_checksums: sdk_checksums_for(&gotool),
                 go_version: gotool,
-                govet: govet_addr(),
+                govet: govet_opt,
                 // The bash half of the runner: the std install and the
                 // thirdparty download invoke `go` too, and a build whose
                 // compile drivers moved into the environment while these
@@ -473,6 +569,21 @@ fn make_workspace_ordered_runner(
                         "printf '#!/bin/sh\\nexec \"{cc_bin}\" \"$@\"\\n' > cc\nchmod +x cc"
                     )),
                     out: std::collections::HashMap::from([(String::new(), vec!["cc".to_string()])]),
+                    codegen: None,
+                    deps: Default::default(),
+                    labels: vec![],
+                    ..Default::default()
+                });
+            }
+            if let Some(bin) = tree_govet {
+                targets.push(pluginstatictarget::Target {
+                    addr: tree_govet_addr(),
+                    driver: "bash".to_string(),
+                    run: Some(format!("cp -p \"{bin}\" heph-govet")),
+                    out: std::collections::HashMap::from([(
+                        String::new(),
+                        vec!["heph-govet".to_string()],
+                    )]),
                     codegen: None,
                     deps: Default::default(),
                     labels: vec![],
