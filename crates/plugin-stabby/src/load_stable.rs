@@ -580,27 +580,12 @@ fn drain_run(
             }
             // The message is the plugin's whole rendered chain, unchanged; a
             // structured exit status rides with it when the failure is a
-            // process's exit, readable through `hplugin::error::process_exit`.
+            // process's exit, readable through `hplugin::error::process_exit`,
+            // and its artifacts (the log) as the same `FailureArtifacts` the
+            // plugin attached. The plugin shares this process, so their paths
+            // are ours.
             Some(pb::run_out_frame::Msg::Failure(f)) => {
-                let pb::RunFailure {
-                    message,
-                    exit,
-                    log_path,
-                    ..
-                } = *f;
-                let message = message.unwrap_or_default();
-                let Some(exit) = convert::exit_from_pb(exit) else {
-                    anyhow::bail!("{message}");
-                };
-                let mut failed = hplugin::error::RemoteProcessFailed::new(message, exit);
-                // The plugin shares this process, so its path is ours. The
-                // engine reads it when it records the failure.
-                if let Some(path) = log_path.filter(|p| !p.is_empty()) {
-                    failed = failed.with_log(std::sync::Arc::new(
-                        hcore::hartifactcontent::FileContent::new(path),
-                    ));
-                }
-                return Err(failed.into());
+                return Err(convert::run_failure_from_pb(*f));
             }
             // A dropped receiver means the caller stopped reading; keep draining
             // so the run still reaches its result.

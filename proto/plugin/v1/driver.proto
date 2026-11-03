@@ -323,16 +323,18 @@ message RunInFrame {
 // A run's terminal failure (since 0.18.0, replacing `string error = 4` and the
 // out-of-oneof `ExitStatus exit = 5`).
 message RunFailure {
+  reserved 3; // `string log_path`, never released
   // The plugin's whole rendered error chain.
   string message = 1;
   // The structured status of the process whose exit is the failure. Absent
   // when the failure is not a process's exit.
   ExitStatus exit = 2;
-  // The file holding that process's output, which the host renders the tail
-  // of in the failure diagnostic. A path in the host's filesystem — a plugin
-  // shares the host's process — normally the target's `log.txt` in its
-  // sandbox. Absent = none.
-  string log_path = 3;
+  // What the failed run left behind for the failure diagnostic — normally its
+  // `log.txt` (type LOG), whose tail the host renders. Any failure may carry
+  // them, with or without an exit. A path in one is in the host's filesystem:
+  // a plugin shares the host's process. The host drops one it cannot decode
+  // and keeps the message and exit.
+  repeated OutputArtifactRef artifacts = 4;
 }
 
 message RunOutFrame {

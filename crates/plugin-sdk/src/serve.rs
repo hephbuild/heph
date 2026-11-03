@@ -301,8 +301,11 @@ fn err_body(message: String) -> Body {
 /// string, so a bare `to_string()` would silently drop every underlying cause
 /// (e.g. `compute embedcfg` without the `//go:embed pattern(s) matched no
 /// files: …` that explains it).
+///
+/// A frame that renders empty — a [`hplugin::error::FailureArtifacts`] context —
+/// is skipped, so it never leaves a `: :` in the message.
 fn err_message(e: &anyhow::Error) -> String {
-    format!("{e:#}")
+    hcore::hmemoizer::chain_message(e)
 }
 
 fn is_cycle(e: &anyhow::Error) -> bool {
@@ -1494,22 +1497,10 @@ fn read_signal_frames(
 }
 
 /// A run's terminal failure frame: the message, plus the process's exit status
-/// and the path of its log when the failure is a process's exit
-/// ([`hplugin::error::ProcessFailed`]).
+/// when the failure is a process's exit ([`hplugin::error::ProcessFailed`]) and
+/// the [`hplugin::error::FailureArtifacts`] riding the error, whatever it is.
 fn run_out_failure(e: &anyhow::Error) -> pb::RunOutFrame {
-    let mut failure = pb::RunFailure {
-        message: Some(err_message(e)),
-        ..Default::default()
-    };
-    if let Some(exit) = hplugin::error::process_exit(e) {
-        failure.exit = convert::exit_to_pb(exit).into();
-        // The log only means something beside an exit: it is the output of the
-        // process whose exit failed the run.
-        if let Some(path) = hplugin::error::process_log(e).and_then(|l| l.file_path()) {
-            failure.log_path = Some(path.to_string_lossy().into_owned());
-        }
-    }
-    run_out_failure_frame(failure)
+    run_out_failure_frame(convert::run_failure_to_pb(e, err_message(e)))
 }
 
 /// An `AsyncWrite` that turns everything written to it into `RunOutFrame`s on the
@@ -3537,6 +3528,14 @@ mod tests {
                     "cwd: {:?}",
                     r.options.cwd
                 );
+                let log = hplugin::error::log_file_artifact(&self.0).context("utf-8 log path")?;
+                // Any failure carries its artifacts, not only a process's exit.
+                if r.options.args == Some(vec!["no exit".into()]) {
+                    return Err(hplugin::error::with_failure_artifacts(
+                        anyhow::anyhow!("setup failed"),
+                        vec![log],
+                    ));
+                }
                 anyhow::ensure!(
                     r.options.args == Some(vec!["a b".into()]),
                     "args: {:?}",
@@ -3546,12 +3545,14 @@ mod tests {
                     anyhow::bail!("stdio: {:?}", r.options.stdio);
                 };
                 let sig = fg.signals.recv().await.context("the relay closed empty")?;
-                Err(ProcessFailed {
-                    status: format!("signal: {}", sig.as_raw()),
-                    log: Arc::new(hcore::hartifactcontent::FileContent::new(self.0.clone())),
-                    exit: Some(Exit::Signal(sig.as_raw())),
-                }
-                .into())
+                Err(hplugin::error::with_failure_artifacts(
+                    ProcessFailed::new(
+                        format!("signal: {}", sig.as_raw()),
+                        Some(Exit::Signal(sig.as_raw())),
+                    )
+                    .into(),
+                    vec![log],
+                ))
             }
         }
 
@@ -3585,18 +3586,42 @@ mod tests {
             Err(e) => e,
         };
         assert_eq!(process_exit(&err), Some(Exit::Signal(15)), "{err:#}");
-        // The log crosses as its path (0.17.3), so the host's failure box can
-        // render its tail as it does for an in-process `ProcessFailed`.
-        assert_eq!(
-            hplugin::error::process_log(&err).and_then(|l| l.file_path()),
-            Some(log_path.clone()),
-            "{err:#}"
-        );
+        // The log crosses as the same artifact (0.18.0), path and type, so the
+        // host's failure box renders its tail as for an in-process driver.
+        let crossed_log = |err: &anyhow::Error| {
+            let log = hplugin::error::failure_log(err).expect("the log crossed");
+            assert_eq!(log.name, "log.txt");
+            assert_eq!(log.r#type, hplugin::driver::outputartifact::Type::Log);
+            match &log.content {
+                hplugin::driver::outputartifact::Content::File(f) => {
+                    std::path::PathBuf::from(&f.source_path)
+                }
+                _ => std::path::PathBuf::new(),
+            }
+        };
+        assert_eq!(crossed_log(&err), log_path, "{err:#}");
+        let msg = hcore::hmemoizer::chain_message(&err);
         assert!(
-            format!("{err:#}").contains("process exited with status: signal: 15"),
-            "{err:#}"
+            msg.contains("process exited with status: signal: 15") && !msg.contains(": :"),
+            "{msg}"
         );
         drop(tx);
+
+        // A failure with no exit carries its artifacts across just the same.
+        let (_tx, rx) = hplugin::driver::signal_channel();
+        let mut rr = RunRequest::new(&id, &target, "/sb");
+        rr.hashin = "h";
+        rr.options = RunOptions::default()
+            .with_cwd("/caller")
+            .with_args(vec!["no exit".into()])
+            .with_stdio(RunStdio::Inherit(Foreground::new(rx, vec![])));
+        let err = match futures::executor::block_on(host.run(mreq(rr), &ct)) {
+            Ok(_) => panic!("the driver fails"),
+            Err(e) => e,
+        };
+        assert_eq!(process_exit(&err), None, "{err:#}");
+        assert_eq!(crossed_log(&err), log_path, "{err:#}");
+        assert_eq!(hcore::hmemoizer::chain_message(&err), "setup failed");
 
         // N9: the same options for a def that declared no entrypoint are
         // refused at the seam, before the plugin sees anything.

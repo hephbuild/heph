@@ -46,7 +46,6 @@ use plugin_sdk::stabby::{
     named_managed_driver,
 };
 use std::ffi::OsString;
-use std::sync::Arc;
 
 const SCRIPT: &str = r#"
 tty=no
@@ -150,12 +149,7 @@ impl ManagedDriver for Tool {
         if exit == Exit::Code(0) {
             return Ok(ManagedRunResponse { artifacts: vec![] });
         }
-        Err(hplugin::error::ProcessFailed {
-            status: format!("{exit:?}"),
-            log: Arc::new(hcore::hartifactcontent::FileContent::new("/dev/null")),
-            exit: Some(exit),
-        }
-        .into())
+        Err(hplugin::error::ProcessFailed::new(format!("{exit:?}"), Some(exit)).into())
     }
 }
 

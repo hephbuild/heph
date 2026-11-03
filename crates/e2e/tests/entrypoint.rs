@@ -1816,12 +1816,7 @@ impl heph::engine::driver_managed::ManagedDriver for ForegroundTool {
         if exit == Exit::Code(0) {
             return Ok(heph::engine::driver_managed::ManagedRunResponse { artifacts: vec![] });
         }
-        Err(hplugin::error::ProcessFailed {
-            status: format!("{exit:?}"),
-            log: Arc::new(hcore::hartifactcontent::FileContent::new("/dev/null")),
-            exit: Some(exit),
-        }
-        .into())
+        Err(hplugin::error::ProcessFailed::new(format!("{exit:?}"), Some(exit)).into())
     }
 }
 

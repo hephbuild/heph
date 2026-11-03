@@ -16,9 +16,14 @@ use crate::tui::color::stderr_color_enabled as color_enabled;
 /// merely restate the target address (engine boundaries like `execute //addr`,
 /// already shown in the title) and joining the rest the way anyhow's `{:#}`
 /// would. If every frame mentions the addr (e.g. a bare `target not found`), the
-/// whole chain is kept.
+/// whole chain is kept. A frame that renders empty (a failure's artifacts riding
+/// the chain) is no cause and is skipped.
 fn cause_chain(source: &anyhow::Error, addr: &str) -> String {
-    let frames: Vec<String> = source.chain().map(|c| c.to_string()).collect();
+    let frames: Vec<String> = source
+        .chain()
+        .map(|c| c.to_string())
+        .filter(|f| !f.is_empty())
+        .collect();
     let start = frames.iter().position(|f| !f.contains(addr)).unwrap_or(0);
     frames.get(start..).unwrap_or(&[]).join(": ")
 }
@@ -740,7 +745,11 @@ fn render_anyhow_to_string(e: &anyhow::Error, color: bool) -> Option<String> {
         render_diff_box(&mut out, &fc.diff, color);
         return Some(out);
     }
-    let frames: Vec<String> = e.chain().map(|c| c.to_string()).collect();
+    let frames: Vec<String> = e
+        .chain()
+        .map(|c| c.to_string())
+        .filter(|f| !f.is_empty())
+        .collect();
     let top = frames.first()?;
     let mut out = format!("× {top}\n");
     let rest = frames.get(1..).unwrap_or(&[]);
@@ -757,14 +766,10 @@ mod tests {
     use anyhow::Context as _;
     use std::sync::Arc;
 
-    /// A `ProcessFailed` whose log handle is never read (tests that only exercise
-    /// the cause chain / rendering, not log extraction).
+    /// A `ProcessFailed` for tests that only exercise the cause chain /
+    /// rendering, not log extraction.
     fn dummy_process_failed() -> ProcessFailed {
-        ProcessFailed {
-            status: "exit status: 1".to_string(),
-            log: Arc::new(hcore::hartifactcontent::FileContent::new("/dev/null")),
-            exit: None,
-        }
+        ProcessFailed::new("exit status: 1", None)
     }
 
     #[test]

@@ -228,11 +228,14 @@ skipped in silence.
 ## History of breaks
 
 - **0.18.0** (break) — a run's terminal failure is one `RunFailure` in
-  `RunOutFrame`'s oneof (7): the message, the exit status and the path of the
-  failed process's log. It replaces `string error` (4) and the out-of-oneof
-  `ExitStatus exit` (5), both now reserved. The host attaches the log to
-  `RemoteProcessFailed`, so a cdylib driver's failure box shows the log tail as
-  an in-process `ProcessFailed` does. A 0.17 peer would see no terminal frame
+  `RunOutFrame`'s oneof (7): the message, the exit status and the failure's
+  `artifacts` (4, `OutputArtifactRef`s — normally the run's `log.txt`). It
+  replaces `string error` (4) and the out-of-oneof `ExitStatus exit` (5), both
+  now reserved. Any failure may carry artifacts, with or without an exit. The
+  host rebuilds them as the same `FailureArtifacts` context the plugin
+  attached, so a cdylib driver's failure box shows the log tail as an
+  in-process driver's does; an artifact that does not decode is dropped and the
+  message and exit are kept. A 0.17 peer would see no terminal frame
   on a failure, so `MIN_PLUGIN_ABI` rises to 0.18.0: every plugin must be
   rebuilt.
 - **0.17.4** (additive patch) — target resources. `TargetDef.resources` (12,

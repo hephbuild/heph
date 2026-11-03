@@ -33,12 +33,15 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// additive minors, and there was no version check to read them.
 ///
 /// 0.18.0 (a break): a run's terminal failure is one `RunFailure` in
-/// `RunOutFrame`'s oneof (7) — message, exit status and the failed process's
-/// log path together — replacing `string error` (4) and the out-of-oneof
-/// `ExitStatus exit` (5), both reserved. The log path lets a cdylib driver's
-/// failure render its log tail the way an in-process `ProcessFailed` does. A
-/// 0.17 peer would read a failure as a stream with no terminal frame, so
-/// `MIN_PLUGIN_ABI` rises to 0.18.0 and every plugin must be rebuilt.
+/// `RunOutFrame`'s oneof (7) — message, exit status and the failure's
+/// `artifacts` (4) together — replacing `string error` (4) and the out-of-oneof
+/// `ExitStatus exit` (5), both reserved. `artifacts` carries what the failed
+/// run left behind (normally its `log.txt`, type LOG), with or without an exit,
+/// so a cdylib driver's failure renders its log tail the way an in-process
+/// driver's does; the host decodes them leniently, dropping one that does not
+/// decode and keeping the message and exit. A 0.17 peer would read a failure as
+/// a stream with no terminal frame, so `MIN_PLUGIN_ABI` rises to 0.18.0 and
+/// every plugin must be rebuilt.
 ///
 /// 0.17.4 (additive, a patch): target resources. `TargetDef.resources` (12,
 /// `map<string, string>`) — the pools a def reserves while it runs, each amount

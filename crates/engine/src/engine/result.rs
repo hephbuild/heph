@@ -3,7 +3,7 @@ use crate::engine::discovery::{Discovery, InProvider};
 use crate::engine::driver::targetdef::{Input, TargetDef};
 use crate::engine::driver::{ApplyTransitiveRequest, ParseRequest, outputartifact};
 use crate::engine::error::{
-    CancelledError, CycleError, HashUnknownError, MultiError, ProcessFailed, RevisionChangedError,
+    CancelledError, CycleError, HashUnknownError, MultiError, RevisionChangedError,
     ShellNeedsSingleTarget, TargetFailure, TargetNotFoundError, UpstreamFailed,
 };
 use crate::engine::provider::{
@@ -1577,20 +1577,17 @@ fn classify_failure(
     UpstreamFailed { root: addr.clone() }.into()
 }
 
-/// Read the last `n` lines of a `ProcessFailed`'s log (anywhere in the chain) so
-/// the recorded `TargetFailure` can surface them in its diagnostic, tagged with
-/// the real starting line number. Best-effort: a log file that can't be read
-/// (e.g. already reclaimed) yields no tail rather than masking the failure.
+/// Read the last `n` lines of the failure's `Log` artifact (its
+/// `FailureArtifacts`, anywhere in the chain) so the recorded `TargetFailure`
+/// can surface them in its diagnostic, tagged with the real starting line
+/// number. Best-effort: a log file that can't be read (e.g. already reclaimed)
+/// yields no tail rather than masking the failure.
 fn extract_log_tail(e: &anyhow::Error, n: usize) -> Option<hplugin::error::LogTail> {
+    use hcore::hartifactcontent::Content as _;
     use std::io::Read as _;
-    // A `ProcessFailed` from an in-process driver, or a cdylib's
-    // `RemoteProcessFailed` that sent its log's path.
-    let log = match downcast_chain_ref::<ProcessFailed>(e) {
-        Some(pf) => pf.log.clone(),
-        None => downcast_chain_ref::<hplugin::error::RemoteProcessFailed>(e)?
-            .log
-            .clone()?,
-    };
+    // From an in-process driver, or rebuilt by the host from a cdylib's
+    // `RunFailure.artifacts`: the same context either way.
+    let log = hplugin::error::failure_log(e)?;
     // Lossy: a tool's output is not guaranteed UTF-8, and one stray byte must
     // not cost the whole tail.
     let mut bytes = Vec::new();
@@ -9174,8 +9171,7 @@ mod tests {
         // depend on spawning a real subprocess (the lib harness can't; the e2e
         // suite covers the live path). `last_n_lines` itself is unit-tested in
         // `engine::error`.
-        use crate::engine::error::{ProcessFailed, UpstreamFailed};
-        use std::sync::Arc;
+        use crate::engine::error::UpstreamFailed;
 
         let engine = engine_with(vec![static_target("//pkg:a", &[], &[])])?;
         let rs = engine.new_state();
@@ -9187,13 +9183,9 @@ mod tests {
         let full: String = (1..=12).map(|i| format!("line{i}\n")).collect();
         std::fs::write(&log_path, &full)?;
 
-        let e = anyhow::Error::new(ProcessFailed {
-            status: "exit status: 1".to_string(),
-            log: Arc::new(hcore::hartifactcontent::FileContent::new(&log_path)),
-            exit: None,
-        })
-        .context("driver run")
-        .context("execute //pkg:a");
+        let e = process_failed_with_log(&log_path)
+            .context("driver run")
+            .context("execute //pkg:a");
 
         let out = classify_failure(&rs, &addr, false, e);
         // Own failure → cheap marker propagated upward.
@@ -9214,9 +9206,6 @@ mod tests {
     async fn classify_drops_log_tail_for_interactive_targets() -> anyhow::Result<()> {
         // Interactive targets stream their output live to the user's terminal, so
         // the captured log tail must NOT be re-rendered in the failure box.
-        use crate::engine::error::ProcessFailed;
-        use std::sync::Arc;
-
         let engine = engine_with(vec![static_target("//pkg:a", &[], &[])])?;
         let rs = engine.new_state();
         let addr = hmodel::htaddr::parse_addr("//pkg:a")?;
@@ -9225,12 +9214,7 @@ mod tests {
         let log_path = dir.path().join("log.txt");
         std::fs::write(&log_path, "line9\nline10\n")?;
 
-        let e = anyhow::Error::new(ProcessFailed {
-            status: "exit status: 1".to_string(),
-            log: Arc::new(hcore::hartifactcontent::FileContent::new(&log_path)),
-            exit: None,
-        })
-        .context("execute //pkg:a");
+        let e = process_failed_with_log(&log_path).context("execute //pkg:a");
 
         let _ = classify_failure(&rs, &addr, true, e);
         let recorded = rs.get_failure(&addr).expect("failure must be recorded");
@@ -9238,13 +9222,21 @@ mod tests {
         Ok(())
     }
 
+    /// A `ProcessFailed` with the run log at `path` attached, as a driver
+    /// returns it.
+    fn process_failed_with_log(path: &std::path::Path) -> anyhow::Error {
+        hplugin::error::with_failure_artifacts(
+            crate::engine::error::ProcessFailed::new("exit status: 1", None).into(),
+            vec![hplugin::error::log_file_artifact(path).expect("utf-8 path")],
+        )
+    }
+
     #[tokio::test]
     async fn classify_reads_the_log_tail_of_a_remote_process_failure() -> anyhow::Result<()> {
         // A cdylib driver's failure crosses the seam as a `RemoteProcessFailed`
-        // carrying its log's path; the box renders that log's tail exactly as
-        // for an in-process `ProcessFailed`, even with non-UTF-8 bytes in it.
-        use std::sync::Arc;
-
+        // with its log artifact rebuilt beside it; the box renders that log's
+        // tail exactly as for an in-process `ProcessFailed`, even with non-UTF-8
+        // bytes in it.
         let engine = engine_with(vec![static_target("//pkg:a", &[], &[])])?;
         let rs = engine.new_state();
         let addr = hmodel::htaddr::parse_addr("//pkg:a")?;
@@ -9253,22 +9245,59 @@ mod tests {
         let log_path = dir.path().join("log.txt");
         std::fs::write(&log_path, b"#1 building\n\xff\nERROR: failed to solve\n")?;
 
-        let e = anyhow::Error::new(
-            hplugin::error::RemoteProcessFailed::new(
+        let e = hplugin::error::with_failure_artifacts(
+            anyhow::Error::new(hplugin::error::RemoteProcessFailed::new(
                 "docker buildx build failed: process exited with status: exit status: 1".into(),
                 hplugin::error::Exit::Code(1),
-            )
-            .with_log(Arc::new(hcore::hartifactcontent::FileContent::new(
-                &log_path,
-            ))),
+            )),
+            vec![hplugin::error::log_file_artifact(&log_path).expect("utf-8 path")],
         )
         .context("driver run");
 
         let _ = classify_failure(&rs, &addr, false, e);
         let recorded = rs.get_failure(&addr).expect("failure must be recorded");
         let tail = recorded.log_tail.as_ref().expect("the remote log's tail");
-        assert!(tail.text.contains("ERROR: failed to solve"), "{tail:?}");
-        assert!(tail.text.contains("#1 building"), "{tail:?}");
+        assert_eq!(
+            tail.text, "#1 building\n\u{fffd}\nERROR: failed to solve",
+            "the stray byte is replaced, the tail kept"
+        );
+        assert_eq!(tail.start_line, 1);
+        Ok(())
+    }
+
+    /// The failure's artifacts are found under the layers the engine puts on
+    /// an error on its way up: contexts, and a memoizer's shared wrapper (an
+    /// `Arc` with more than one holder), more than once.
+    #[tokio::test]
+    async fn failure_artifacts_found_through_memoizer_wrapper() -> anyhow::Result<()> {
+        let engine = engine_with(vec![static_target("//pkg:a", &[], &[])])?;
+        let rs = engine.new_state();
+        let addr = hmodel::htaddr::parse_addr("//pkg:a")?;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log_path = dir.path().join("log.txt");
+        std::fs::write(&log_path, "the tool said why\n")?;
+
+        let inner = Arc::new(process_failed_with_log(&log_path).context("driver run"));
+        let once = hcore::hmemoizer::unwrap_arc_err(Arc::clone(&inner)).context("execute //pkg:a");
+        let outer = Arc::new(once);
+        let e = hcore::hmemoizer::unwrap_arc_err(Arc::clone(&outer)).context("result //pkg:a");
+        // Not findable by a plain chain walk: the reason for the accessor.
+        assert!(
+            e.chain()
+                .find_map(|c| c.downcast_ref::<hplugin::error::FailureArtifacts>())
+                .is_none()
+        );
+        assert!(hplugin::error::failure_artifacts(&e).is_some());
+        assert!(!hcore::hmemoizer::chain_message(&e).contains(": :"));
+
+        let _ = classify_failure(&rs, &addr, false, e);
+        let recorded = rs.get_failure(&addr).expect("failure must be recorded");
+        let tail = recorded
+            .log_tail
+            .as_ref()
+            .expect("the tail, through the wrappers");
+        assert_eq!(tail.text, "the tool said why");
         Ok(())
     }
 
@@ -12155,11 +12184,10 @@ mod tests {
         ) -> anyhow::Result<RunResponse> {
             self.runs.fetch_add(1, Ordering::SeqCst);
             if req.target.labels.iter().any(|l| l == FAIL_LABEL) {
-                return Err(anyhow::Error::new(crate::engine::error::ProcessFailed {
-                    status: "exit status: 1".to_string(),
-                    log: SArc::new(hcore::hartifactcontent::FileContent::new(&self.log_path)),
-                    exit: None,
-                })
+                return Err(hplugin::error::with_failure_artifacts(
+                    crate::engine::error::ProcessFailed::new("exit status: 1", None).into(),
+                    vec![hplugin::error::log_file_artifact(&self.log_path).expect("utf-8 path")],
+                )
                 .context("driver run"));
             }
             Ok(RunResponse {
