@@ -117,6 +117,15 @@ impl ResourcePool {
         self.main.capacity.get(idx).copied()
     }
 
+    /// Every named pool and its capacity, in name order (the light lane is not
+    /// a named pool).
+    pub fn capacities(&self) -> impl Iterator<Item = (&PoolName, u64)> {
+        self.main
+            .names
+            .iter()
+            .zip(self.main.capacity.iter().copied())
+    }
+
     /// The light lane's capacity.
     pub fn light_capacity(&self) -> u64 {
         self.light.capacity.first().copied().unwrap_or(0)

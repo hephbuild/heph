@@ -814,6 +814,7 @@ mod tests {
                 max_workers: 64,
                 fail_fast: false,
                 scratch_disabled: false,
+                resources: Default::default(),
             },
         ));
         t.apply(&ev(
@@ -864,6 +865,8 @@ mod tests {
                     addr: format!("//pkg{}:running{i}", i % 50),
                     driver: "exec".into(),
                     cache: false,
+                    declared: None,
+                    reserved: None,
                 },
             ));
         }
@@ -1060,6 +1063,8 @@ mod tests {
                 addr: "//a:slow".into(),
                 driver: "exec".into(),
                 cache: false,
+                declared: None,
+                reserved: None,
             },
         ));
         t.apply(&ev(
@@ -1221,6 +1226,7 @@ mod tests {
                 max_workers: 64,
                 fail_fast: true,
                 scratch_disabled: false,
+                resources: Default::default(),
             },
         ));
         let md = render_live(&t, &ctx("heph run //...", 9_000), COMMENT_LIMIT);
@@ -1248,6 +1254,8 @@ mod tests {
                     addr: format!("//services/api:image{i}"),
                     driver: "exec".into(),
                     cache: false,
+                    declared: None,
+                    reserved: None,
                 },
             ));
         }
@@ -1275,6 +1283,7 @@ mod tests {
                 max_workers: 64,
                 fail_fast: false,
                 scratch_disabled: false,
+                resources: Default::default(),
             },
         ));
         println!("\n===== LIVE, healthy =====\n");
@@ -1386,6 +1395,7 @@ mod tests {
                 max_workers: 64,
                 fail_fast: false,
                 scratch_disabled: true,
+                resources: Default::default(),
             },
         ));
         t.apply(&ev(

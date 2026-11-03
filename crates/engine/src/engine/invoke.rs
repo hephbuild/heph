@@ -523,6 +523,13 @@ impl Engine {
                     wrapper: req.wrapper,
                     shell: req.shell,
                     options,
+                    // An entrypoint reserves nothing (it runs in the caller's
+                    // terminal, one at a time) and is told the whole cpu
+                    // capacity.
+                    allotment: Some(hplugin::driver::Allotment::from_granted(
+                        self.pools.cpu_capacity(),
+                        None,
+                    )),
                 },
             )
             .await;

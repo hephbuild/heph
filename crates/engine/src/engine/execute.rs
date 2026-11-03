@@ -125,9 +125,10 @@ impl Engine {
         // deps — prevents the classic diamond deadlock where mid-nodes hold
         // capacity while waiting for a leaf that also needs some.
         hcore::hmemoizer::set_phase("execute:semaphore_acquire");
-        let _reservation = self.admit(addr, &def.target.resources).await?;
+        let reservation = self.admit(&rs, addr, &def.target.resources).await?;
         // Counted once the reservation is actually in hand.
         let _running = crate::engine::diag::RunningPermit::new();
+        let allotment = allotment_of(&reservation, &def.target.resources);
 
         let addr_str = addr.format();
         // Telemetry: per-target execute wall time. This path runs only on a real
@@ -135,11 +136,13 @@ impl Engine {
         let exec_started = std::time::Instant::now();
         let res = crate::engine::event::emit_scope(
             &rs,
-            crate::engine::event::BuildEventKind::ExecuteStart {
-                addr: addr_str.clone(),
-                driver: driver.name.clone(),
-                cache: def.target.cache.enabled,
-            },
+            execute_start(
+                addr_str.clone(),
+                driver.name.clone(),
+                def.target.cache.enabled,
+                &def.target.resources,
+                &reservation,
+            ),
             move |error| crate::engine::event::BuildEventKind::ExecuteEnd {
                 addr: addr_str,
                 error: error.map(crate::engine::event::ErrorDetail::into_message),
@@ -205,6 +208,7 @@ impl Engine {
                             wrapper: exec_wrapper,
                             shell,
                             options: crate::engine::driver::RunOptions::default(),
+                            allotment: Some(allotment),
                         },
                     )
                     .await
@@ -285,6 +289,7 @@ impl Engine {
             wrapper,
             shell,
             options,
+            allotment,
         } = run;
         // N6/N9: only an entrypoint's run is ever sent anything but the
         // default options, whichever path assembled them.
@@ -339,6 +344,7 @@ impl Engine {
                     req.credentials = credential_mounts;
                     req.deferred = deferred;
                     req.options = options;
+                    req.allotment = allotment;
                     // A plain driver spawns straight from `run`; a managed
                     // one materializes first and its layer fires it.
                     if !driver.managed {
@@ -417,13 +423,14 @@ impl Engine {
     /// dropping this future mid-wait leaves the queue (`resource_pool`'s module
     /// docs give the contract).
     ///
-    /// Seam for the admission-wait events (`AdmissionWaitStart/End`): between
-    /// `acquire` and its `await`, `acquire.wait_info()` is what the target
-    /// waits for (`None` when it was granted on arrival); a notice past
-    /// `RESULT_LOCK_NOTICE` wraps that await the way `acquire_with_notice`
-    /// wraps a lock.
+    /// A wait that outlasts the notice threshold (`admission_notice`, the
+    /// result lock's) is announced as `AdmissionWaitStart`, paired with
+    /// `AdmissionWaitEnd` on grant or cancellation, the way
+    /// `acquire_with_notice` announces a lock wait. A grant within the
+    /// threshold announces nothing.
     pub(crate) async fn admit(
         &self,
+        rs: &Arc<RequestState>,
         addr: &Addr,
         resources: &hplugin::driver::Resources,
     ) -> anyhow::Result<crate::engine::resource_pool::Reservation> {
@@ -440,7 +447,28 @@ impl Engine {
         let acquire = pool
             .acquire(resources)
             .map_err(|err| anyhow::anyhow!("{addr} {err}"))?;
-        let reservation = acquire.await.with_context(|| format!("admitting {addr}"))?;
+        tokio::pin!(acquire);
+        let granted: anyhow::Result<_> =
+            match tokio::time::timeout(self.admission_notice, &mut acquire).await {
+                Ok(granted) => granted.map_err(Into::into),
+                Err(_elapsed) => match acquire.wait_info() {
+                    // Granted between the timeout and here: nothing to announce.
+                    None => (&mut acquire).await.map_err(Into::into),
+                    Some(info) => {
+                        let addr_str = addr.format();
+                        crate::engine::event::emit_scope(
+                            rs,
+                            admission_wait_start(addr_str.clone(), &info),
+                            move |_| crate::engine::event::BuildEventKind::AdmissionWaitEnd {
+                                addr: addr_str,
+                            },
+                            async { (&mut acquire).await.map_err(Into::into) },
+                        )
+                        .await
+                    }
+                },
+            };
+        let reservation = granted.with_context(|| format!("admitting {addr}"))?;
         tracing::debug!(
             addr = %addr,
             light = reservation.is_light(),
@@ -536,6 +564,74 @@ pub(crate) struct SandboxRun {
     pub wrapper: Option<InteractiveWrapper>,
     pub shell: bool,
     pub options: crate::engine::driver::RunOptions,
+    /// What the run is told it may use (`RunRequest.allotment`): a build's
+    /// reservation, an invocation's full cpu capacity.
+    pub allotment: Option<hplugin::driver::Allotment>,
+}
+
+/// The `AdmissionWaitStart` event for a queued request: the first pool it does
+/// not fit in, or — fitting everywhere but queued behind others — the first it
+/// needs.
+fn admission_wait_start(
+    addr: String,
+    info: &crate::engine::resource_pool::WaitInfo,
+) -> crate::engine::event::BuildEventKind {
+    let pool = info
+        .pools
+        .iter()
+        .find(|p| p.need > p.free)
+        .or_else(|| info.pools.first());
+    crate::engine::event::BuildEventKind::AdmissionWaitStart {
+        addr,
+        pool: pool.map_or_else(String::new, |p| p.pool.as_str().to_owned()),
+        need: pool.map_or(0, |p| p.need),
+        free: pool.map_or(0, |p| p.free),
+        ahead: u64::try_from(info.ahead).unwrap_or(u64::MAX),
+    }
+}
+
+/// What a run is told of its reservation: the granted cpu in whole CPUs
+/// (rounded up, at least 1, so a light-lane grant is told 1), and the granted
+/// memory only when the target declared some.
+pub(crate) fn allotment_of(
+    reservation: &crate::engine::resource_pool::Reservation,
+    declared: &hplugin::driver::Resources,
+) -> hplugin::driver::Allotment {
+    use hplugin::provider::PoolName;
+    let memory = declared
+        .declared(PoolName::MEMORY)
+        .is_some_and(|m| m > 0)
+        .then(|| reservation.amount(PoolName::MEMORY));
+    hplugin::driver::Allotment::from_granted(reservation.amount(PoolName::CPU), memory)
+}
+
+/// The `ExecuteStart` event: what the target declared (only its declared
+/// keys) and what it was granted, after clamping. `reserved` always carries
+/// `cpu`, 0 on a light-lane grant.
+pub(crate) fn execute_start(
+    addr: String,
+    driver: String,
+    cache: bool,
+    declared: &hplugin::driver::Resources,
+    reservation: &crate::engine::resource_pool::Reservation,
+) -> crate::engine::event::BuildEventKind {
+    use hplugin::provider::PoolName;
+    let declared = declared
+        .iter()
+        .map(|(p, n)| (p.as_str().to_owned(), n))
+        .collect();
+    let mut reserved: std::collections::BTreeMap<String, u64> = reservation
+        .iter()
+        .map(|(p, n)| (p.as_str().to_owned(), n))
+        .collect();
+    reserved.entry(PoolName::CPU.to_owned()).or_insert(0);
+    crate::engine::event::BuildEventKind::ExecuteStart {
+        addr,
+        driver,
+        cache,
+        declared: Some(declared),
+        reserved: Some(reserved),
+    }
 }
 
 /// Run a synchronous `std::fs` operation through `hcore::blocking::run`.
@@ -549,4 +645,89 @@ where
     T: Send + 'static,
 {
     hcore::blocking::run(f).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::event::BuildEventKind;
+    use crate::engine::resource_pool::ResourcePool;
+    use futures::FutureExt as _;
+    use hplugin::driver::Resources;
+    use hplugin::provider::PoolName;
+
+    const CPU: u64 = Resources::MICROS_PER_CPU;
+
+    fn req(pairs: &[(&str, u64)]) -> Resources {
+        Resources::try_from_pairs(pairs.iter().map(|&(n, a)| (n.to_string(), a)))
+            .expect("resources")
+    }
+
+    fn grant(caps: &[(&str, u64)], r: &Resources) -> crate::engine::resource_pool::Reservation {
+        ResourcePool::new(
+            caps.iter()
+                .map(|&(n, c)| (PoolName::try_from(n).expect("pool"), c)),
+        )
+        .acquire(r)
+        .expect("acquire")
+        .now_or_never()
+        .expect("granted at once")
+        .expect("granted")
+    }
+
+    /// D8: 16 CPUs declared on a 4-CPU pool announces `declared: 16` and
+    /// `reserved: 4`, the clamped grant.
+    #[test]
+    fn execute_start_reserved_is_the_granted_amount() {
+        let declared = req(&[("cpu", 16 * CPU)]);
+        let r = grant(&[("cpu", 4 * CPU), ("memory", 1 << 30)], &declared);
+        let ev = execute_start("//p:t".into(), "exec".into(), true, &declared, &r);
+        let BuildEventKind::ExecuteStart {
+            declared, reserved, ..
+        } = ev
+        else {
+            panic!("wrong variant: {ev:?}");
+        };
+        assert_eq!(
+            declared,
+            Some(std::collections::BTreeMap::from([("cpu".into(), 16 * CPU)]))
+        );
+        assert_eq!(
+            reserved,
+            Some(std::collections::BTreeMap::from([("cpu".into(), 4 * CPU)]))
+        );
+    }
+
+    /// A zero-cost target holds a light-lane slot: `reserved` still carries
+    /// `cpu` (0), and the run is told one CPU.
+    #[test]
+    fn a_light_grant_reserves_zero_cpu_and_is_told_one() {
+        let declared = req(&[("cpu", 0)]);
+        let r = grant(&[("cpu", 4 * CPU)], &declared);
+        let BuildEventKind::ExecuteStart { reserved, .. } =
+            execute_start("//p:t".into(), "exec".into(), true, &declared, &r)
+        else {
+            panic!("wrong variant");
+        };
+        assert_eq!(
+            reserved,
+            Some(std::collections::BTreeMap::from([("cpu".into(), 0)]))
+        );
+        let a = allotment_of(&r, &declared);
+        assert_eq!((a.cpu.get(), a.memory_bytes), (1, None));
+    }
+
+    /// The allotment rounds the granted cpu up to whole CPUs and carries the
+    /// granted memory only when memory was declared.
+    #[test]
+    fn allotment_is_the_grant_in_whole_cpus_and_declared_memory() {
+        let caps = [("cpu", 4 * CPU), ("memory", 4 << 30)];
+        let declared = req(&[("cpu", 2_500_000), ("memory", 8 << 30)]);
+        let a = allotment_of(&grant(&caps, &declared), &declared);
+        assert_eq!((a.cpu.get(), a.memory_bytes), (3, Some(4 << 30)));
+
+        let undeclared = req(&[]);
+        let a = allotment_of(&grant(&caps, &undeclared), &undeclared);
+        assert_eq!((a.cpu.get(), a.memory_bytes), (1, None));
+    }
 }

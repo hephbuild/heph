@@ -258,6 +258,10 @@ pub struct Engine {
     /// clean loops): `2 × parallelism`, independent of the `cpu` capacity, so
     /// `-j 1` does not serialise them.
     pub(crate) fan_out: usize,
+    /// How long an admission waits before it is announced
+    /// (`AdmissionWaitStart`): the result-lock notice threshold, settable in
+    /// tests only ([`Engine::set_admission_notice`]).
+    pub(crate) admission_notice: std::time::Duration,
 
     /// YAML-selected builtins, by plugin name; consumed when applied.
     pub(crate) plugin_factories: HashMap<String, PluginFactory>,
@@ -645,6 +649,24 @@ impl Engine {
         self.pools.built().map(|p| p.snapshot())
     }
 
+    /// Every named pool's capacity, in the pool's unit, as `RequestConfig`
+    /// announces it. Builds the pool (and so reads the host's memory) on the
+    /// first call.
+    pub(crate) fn pool_capacities(&self) -> std::collections::BTreeMap<String, u64> {
+        self.pools
+            .get()
+            .capacities()
+            .map(|(p, c)| (p.as_str().to_owned(), c))
+            .collect()
+    }
+
+    /// Lower the admission-wait notice threshold, so a test can see
+    /// `AdmissionWaitStart/End` without waiting the production five seconds.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_admission_notice(&mut self, after: std::time::Duration) {
+        self.admission_notice = after;
+    }
+
     pub fn new(cfg: Config) -> anyhow::Result<Engine> {
         let home = cfg.home_dir.clone();
         ensure_home(&home)?;
@@ -787,6 +809,10 @@ impl Engine {
                     move || cpu_free_cpus(&pools)
                 };
                 crate::engine::diag::global().register_worker_pool(max_workers, free.clone());
+                crate::engine::diag::global().register_pools({
+                    let pools = Arc::clone(&pools);
+                    move || pools.built().map(|p| p.snapshot())
+                });
                 crate::engine::diag::global()
                     .limiter("workers")
                     .attach_gauge(free);
@@ -794,6 +820,7 @@ impl Engine {
             },
             max_workers,
             fan_out,
+            admission_notice: crate::engine::result::RESULT_LOCK_NOTICE,
             plugin_factories: HashMap::new(),
             plugins: HashMap::new(),
             fuse,

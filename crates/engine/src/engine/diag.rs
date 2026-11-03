@@ -331,7 +331,13 @@ pub struct DiagState {
     /// Reads the pool's *current* free permits. Sampled while a report is being
     /// rendered, never on the acquire path.
     workers_free: std::sync::OnceLock<Box<dyn Fn() -> usize + Send + Sync>>,
+    /// Reads the admission pools at this instant (`None` before the first
+    /// admission built them). Sampled while a report is being rendered.
+    pools: std::sync::OnceLock<PoolReader>,
 }
+
+type PoolReader =
+    Box<dyn Fn() -> Option<crate::engine::resource_pool::ResourceSnapshot> + Send + Sync>;
 
 /// Marks a worker permit as held by a *running* target for as long as it lives.
 ///
@@ -400,7 +406,25 @@ impl DiagState {
             workers_running: AtomicI64::new(0),
             workers_capacity: AtomicU64::new(0),
             workers_free: std::sync::OnceLock::new(),
+            pools: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Register a live reader of the admission pools. Idempotent; the first
+    /// registration wins.
+    pub fn register_pools(
+        &self,
+        read: impl Fn() -> Option<crate::engine::resource_pool::ResourceSnapshot>
+        + Send
+        + Sync
+        + 'static,
+    ) {
+        drop(self.pools.set(Box::new(read)));
+    }
+
+    /// The admission pools now, when registered and built.
+    pub fn pools(&self) -> Option<crate::engine::resource_pool::ResourceSnapshot> {
+        self.pools.get().and_then(|read| read())
     }
 
     /// Register the worker pool: its permit count, and a live reader of its free
@@ -781,6 +805,7 @@ impl DiagState {
             lock_waits: self.lock_waits(now_ms),
             scratch_waits: self.scratch_waits(now_ms),
             workers: self.worker_permits(),
+            pools: self.pools(),
             delta: None,
             stuck: Vec::new(),
         })
@@ -837,6 +862,8 @@ pub struct StallReport {
     pub delta: Option<StallDelta>,
     /// Worker-permit accounting, when the pool has been registered.
     pub workers: Option<WorkerPermits>,
+    /// The admission pools, once an admission has built them.
+    pub pools: Option<crate::engine::resource_pool::ResourceSnapshot>,
     /// Incomplete memoizer cells. Filled in by [`Watchdog`] after `evaluate`,
     /// which stays pure — see its docs.
     pub stuck: Vec<hcore::hmemoizer::StuckCell>,
@@ -1048,6 +1075,63 @@ fn signed(n: i64) -> String {
 ///
 /// The text is a diagnostic, not an interface. Nothing should parse it — that is
 /// what the machine-readable surface is for.
+/// The admission pools' lines of the report: per lane, each pool's
+/// held/capacity and the queue length, then what the head waits for and for
+/// how long. A strict-FIFO head that does not fit idles everything behind it,
+/// so its unmet need is the line that explains a slow build.
+fn render_pools(p: &crate::engine::resource_pool::ResourceSnapshot, now: Instant) -> String {
+    use hcore::events::display_amount;
+    let mut out = String::new();
+    for (label, lane) in [("pools", &p.main), ("light", &p.light)] {
+        // The light lane is noise while nothing uses it.
+        if label == "light" && lane.queued == 0 && lane.pools.iter().all(|s| s.held == 0) {
+            continue;
+        }
+        let held: Vec<String> = lane
+            .pools
+            .iter()
+            .map(|s| {
+                let pool = s.pool.as_str();
+                format!(
+                    "{pool} {}/{}",
+                    display_amount(pool, s.held),
+                    display_amount(pool, s.capacity)
+                )
+            })
+            .collect();
+        out.push_str(&format!(
+            "  {label:<12} {}; {} queued\n",
+            held.join(", "),
+            lane.queued
+        ));
+        if let Some(head) = &lane.head {
+            let unmet: Vec<String> = head
+                .unmet
+                .iter()
+                .map(|n| {
+                    let pool = n.pool.as_str();
+                    format!(
+                        "{pool} {} ({} free)",
+                        display_amount(pool, n.need),
+                        display_amount(pool, n.free)
+                    )
+                })
+                .collect();
+            let unmet = if unmet.is_empty() {
+                "nothing unmet".to_owned()
+            } else {
+                unmet.join(", ")
+            };
+            out.push_str(&format!(
+                "  {:<12} waits for {unmet} for {}\n",
+                "head",
+                secs(now.saturating_duration_since(head.since))
+            ));
+        }
+    }
+    out
+}
+
 pub fn render_stall(r: &StallReport) -> String {
     let mut out = String::new();
     // The build, on the first line, always. Every one of these reports is read
@@ -1105,6 +1189,10 @@ pub fn render_stall(r: &StallReport) -> String {
             out.push_str(&format!(", {} unaccounted", w.unaccounted()));
         }
         out.push('\n');
+    }
+
+    if let Some(p) = &r.pools {
+        out.push_str(&render_pools(p, Instant::now()));
     }
 
     if let Some((n, oldest, pid)) = r.lock_waits {
@@ -1496,6 +1584,64 @@ mod tests {
 
     const T: Duration = Duration::from_secs(60);
 
+    /// D8: the report prints each pool's held/capacity and the queue length,
+    /// then the head's unmet need and how long it has waited; an idle light
+    /// lane is left out.
+    #[test]
+    fn report_lists_pools_and_the_head_wait() {
+        use crate::engine::resource_pool::{
+            HeadSnapshot, LaneSnapshot, PoolNeed, PoolSnapshot, ResourceSnapshot,
+        };
+        use hplugin::provider::PoolName;
+        let name = |s: &str| PoolName::try_from(s).expect("pool name");
+        let cpu = 1_000_000;
+        let now = Instant::now();
+        let since = now.checked_sub(Duration::from_secs(41)).expect("41s ago");
+        let snap = ResourceSnapshot {
+            main: LaneSnapshot {
+                pools: vec![
+                    PoolSnapshot {
+                        pool: name("cpu"),
+                        capacity: 8 * cpu,
+                        free: 2 * cpu,
+                        held: 6 * cpu,
+                    },
+                    PoolSnapshot {
+                        pool: name("memory"),
+                        capacity: 16 << 30,
+                        free: 14 << 30,
+                        held: 2 << 30,
+                    },
+                ],
+                queued: 7,
+                head: Some(HeadSnapshot {
+                    unmet: vec![PoolNeed {
+                        pool: name("cpu"),
+                        need: 4 * cpu,
+                        free: 2 * cpu,
+                    }],
+                    since,
+                }),
+            },
+            light: LaneSnapshot {
+                pools: vec![PoolSnapshot {
+                    pool: name("light"),
+                    capacity: 64,
+                    free: 64,
+                    held: 0,
+                }],
+                queued: 0,
+                head: None,
+            },
+        };
+        let text = render_pools(&snap, now);
+        assert_eq!(
+            text,
+            "  pools        cpu 6/8, memory 2.0 GiB/16.0 GiB; 7 queued\n  \
+             head         waits for cpu 4 (2 free) for 41s\n",
+        );
+    }
+
     /// A `--shell` target owning the terminal must not read as a stall.
     ///
     /// A person at a prompt opens no spans, closes none and moves no bytes —
@@ -1697,6 +1843,8 @@ mod tests {
             addr: "//a:b".into(),
             driver: "bash".into(),
             cache: true,
+            declared: None,
+            reserved: None,
         }));
         hook.on_event(&ev(BuildEventKind::ScratchLockWaitStart {
             addr: "//c:d".into(),

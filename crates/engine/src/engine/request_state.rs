@@ -960,7 +960,15 @@ impl RequestState {
     /// Emit the `RequestConfig` announcement at most once per request. Safe to
     /// call from every top-level entry point (`result`, `result_addr`); only the
     /// first call emits, so dep recursion never re-announces.
-    pub fn announce_request_config(&self, count: usize, scratch_disabled: bool) {
+    ///
+    /// `count` is the cpu capacity in CPUs; `resources` every pool's capacity,
+    /// called only by the announcing call.
+    pub fn announce_request_config(
+        &self,
+        count: usize,
+        scratch_disabled: bool,
+        resources: impl FnOnce() -> std::collections::BTreeMap<String, u64>,
+    ) {
         if !self
             .data
             .workers_announced
@@ -970,6 +978,7 @@ impl RequestState {
                 max_workers: count,
                 fail_fast: self.data.fail_fast,
                 scratch_disabled,
+                resources: resources(),
             });
         }
     }

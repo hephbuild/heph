@@ -764,6 +764,58 @@ pub struct BuildState {
     /// blocked for three minutes between them is the whole reason the build was
     /// slow, and by the time anyone reads the summary every wait has ended.
     scratch_wait_totals: HashMap<String, (u64, u64)>,
+    /// The `memory` capacity announced by `RequestConfig`, for the `mem`
+    /// segment. `None` from a host that announces no pools.
+    memory_capacity: Option<u64>,
+    /// What each running target reserved, by addr, between its
+    /// `ExecuteStart` and `ExecuteEnd`: the key that makes a repeated Start
+    /// count once and an unpaired End subtract nothing.
+    running_reserved: HashMap<String, Held>,
+    /// The sum of `running_reserved`, kept at Start/End so the header reads
+    /// it without walking anything.
+    held: Held,
+    /// How many running targets reserved memory; the `mem` segment shows
+    /// only while one does.
+    memory_holders: usize,
+    /// Targets whose admission has waited past the notice threshold, by
+    /// addr. Added on `AdmissionWaitStart`, removed on `AdmissionWaitEnd`.
+    admission_waits: HashMap<String, AdmissionWait>,
+}
+
+/// What a running target holds of the cpu and memory pools.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Held {
+    /// Micro-CPUs.
+    cpu: u64,
+    /// Bytes.
+    memory: u64,
+}
+
+impl Held {
+    /// From an `ExecuteStart`'s `reserved`; a frame without it (an older
+    /// host) counts as one CPU, which is what such a host reserved.
+    fn of(reserved: Option<&std::collections::BTreeMap<String, u64>>) -> Self {
+        match reserved {
+            None => Self {
+                cpu: hcore::capacity::MICROS_PER_CPU,
+                memory: 0,
+            },
+            Some(r) => Self {
+                cpu: r.get(hcore::capacity::CPU).copied().unwrap_or(0),
+                memory: r.get(hcore::capacity::MEMORY).copied().unwrap_or(0),
+            },
+        }
+    }
+}
+
+/// One target's announced admission wait.
+#[derive(Debug, Clone)]
+struct AdmissionWait {
+    pool: String,
+    need: u64,
+    free: u64,
+    ahead: u64,
+    since_ms: u64,
 }
 
 /// Every blocked wait on one cache, collapsed for a single row.
@@ -892,9 +944,12 @@ impl BuildState {
         }
         match &ev.kind {
             BuildEventKind::RequestConfig {
-                max_workers: count, ..
+                max_workers: count,
+                resources,
+                ..
             } => {
                 self.max_workers = Some(*count);
+                self.memory_capacity = resources.get(hcore::capacity::MEMORY).copied();
             }
             BuildEventKind::Matched { addrs, complete } => {
                 self.matched_seen = true;
@@ -971,11 +1026,49 @@ impl BuildState {
             // same addr as both cached and executed, which would let "executed + cached"
             // exceed the number of targets — and, on an offline run over a
             // remote-mirrored cache, report a full rebuild as "N cached".
-            BuildEventKind::ExecuteStart { addr, .. } => self.retract_cache_hit(addr),
-            BuildEventKind::ExecuteEnd { error, .. } => {
+            BuildEventKind::ExecuteStart { addr, reserved, .. } => {
+                self.retract_cache_hit(addr);
+                let held = Held::of(reserved.as_ref());
+                // A repeated Start replaces, rather than adds to, what the
+                // addr holds.
+                if let Some(prev) = self.running_reserved.insert(addr.clone(), held) {
+                    self.release(prev);
+                }
+                self.held.cpu = self.held.cpu.saturating_add(held.cpu);
+                self.held.memory = self.held.memory.saturating_add(held.memory);
+                if held.memory > 0 {
+                    self.memory_holders += 1;
+                }
+            }
+            BuildEventKind::ExecuteEnd { addr, error } => {
                 if error.is_none() {
                     self.executed += 1;
                 }
+                // An End with no Start releases nothing.
+                if let Some(held) = self.running_reserved.remove(addr) {
+                    self.release(held);
+                }
+            }
+            BuildEventKind::AdmissionWaitStart {
+                addr,
+                pool,
+                need,
+                free,
+                ahead,
+            } => {
+                self.admission_waits.insert(
+                    addr.clone(),
+                    AdmissionWait {
+                        pool: pool.clone(),
+                        need: *need,
+                        free: *free,
+                        ahead: *ahead,
+                        since_ms: ev.at_unix_ms,
+                    },
+                );
+            }
+            BuildEventKind::AdmissionWaitEnd { addr } => {
+                self.admission_waits.remove(addr);
             }
             BuildEventKind::LocalCacheHit { addr } => {
                 self.local_hits += 1;
@@ -1356,6 +1449,61 @@ impl BuildState {
         self.max_workers
     }
 
+    /// Take a finished target's reservation off the running sums. Saturating:
+    /// a sum can never go below zero, whatever order the events came in.
+    fn release(&mut self, held: Held) {
+        self.held.cpu = self.held.cpu.saturating_sub(held.cpu);
+        self.held.memory = self.held.memory.saturating_sub(held.memory);
+        if held.memory > 0 {
+            self.memory_holders = self.memory_holders.saturating_sub(1);
+        }
+    }
+
+    /// The cpu the running targets hold, in CPUs (rounded up). Kept at
+    /// `ExecuteStart`/`ExecuteEnd`; reading it walks nothing.
+    pub fn busy_cpus(&self) -> usize {
+        usize::try_from(self.held.cpu.div_ceil(hcore::capacity::MICROS_PER_CPU))
+            .unwrap_or(usize::MAX)
+    }
+
+    /// `mem <held>/<capacity>`, only while some running target reserved
+    /// memory and the capacity was announced.
+    pub fn memory_segment(&self) -> Option<String> {
+        if self.memory_holders == 0 {
+            return None;
+        }
+        let cap = self.memory_capacity?;
+        Some(format!(
+            "mem {}/{}",
+            hcore::units::human_bytes(self.held.memory),
+            hcore::units::human_bytes(cap)
+        ))
+    }
+
+    /// Rows for targets whose admission has waited past the notice
+    /// threshold: `⧗ //a:b waits for cpu 4 (2 free, 6 ahead, 41s)`. What was
+    /// free and ahead is as of the notice. Sorted by addr so the order is
+    /// stable across frames.
+    pub fn admission_wait_lines(&self, now_ms: u64) -> Vec<Line<'static>> {
+        let mut waits: Vec<(&String, &AdmissionWait)> = self.admission_waits.iter().collect();
+        waits.sort_by(|a, b| a.0.cmp(b.0));
+        waits
+            .into_iter()
+            .map(|(addr, w)| {
+                let waited = human_elapsed(now_ms.saturating_sub(w.since_ms));
+                Line::from(Span::styled(
+                    format!(
+                        "  ⧗ {}",
+                        hcore::events::admission_wait_text(
+                            addr, &w.pool, w.need, w.free, w.ahead, &waited
+                        )
+                    ),
+                    Style::default().fg(Color::Yellow),
+                ))
+            })
+            .collect()
+    }
+
     /// Milliseconds since the first observed event, given the caller's wall
     /// clock. `0` before any event has been seen.
     pub fn elapsed_ms(&self, now_ms: u64) -> u64 {
@@ -1422,6 +1570,7 @@ impl BuildState {
     pub fn body_lines(&self, now_ms: u64) -> Vec<Line<'static>> {
         let mut body = self.lock_wait_lines();
         body.extend(self.scratch_wait_lines(now_ms));
+        body.extend(self.admission_wait_lines(now_ms));
         body.extend(self.slow_rows(now_ms));
         body
     }
@@ -1640,9 +1789,14 @@ impl ProgressHeader for BuildHeader {
             // The failed count is a tab into the failed-targets view.
             HeaderItem::tab(ViewMode::Failed, failed),
         ];
-        let workers = worker_spans(core.max_workers().unwrap_or(0), core.busy_workers());
+        // The cells are CPUs of the cpu pool, filled by what the running
+        // targets reserved (a running sum, not a walk over the targets).
+        let workers = worker_spans(core.max_workers().unwrap_or(0), core.busy_cpus());
         if !workers.is_empty() {
             items.push(HeaderItem::Text(workers));
+        }
+        if let Some(mem) = core.memory_segment() {
+            items.push(HeaderItem::Text(vec![Span::raw(mem)]));
         }
         items
     }
@@ -2466,8 +2620,22 @@ impl CIAppView for CiProgressView {
                 addr,
                 driver,
                 cache: true,
+                ..
             } => {
                 tracing::info!("running {addr} [{driver}]");
+            }
+            BuildEventKind::AdmissionWaitStart {
+                addr,
+                pool,
+                need,
+                free,
+                ahead,
+            } => {
+                let waited = human_elapsed(0);
+                tracing::info!(
+                    "⧗ {}",
+                    hcore::events::admission_wait_text(addr, pool, *need, *free, *ahead, &waited)
+                );
             }
             BuildEventKind::ResultLockWaitStart {
                 addr,
@@ -2678,7 +2846,125 @@ mod tests {
             addr: addr.into(),
             driver: "exec".into(),
             cache: true,
+            declared: None,
+            reserved: None,
         }
+    }
+
+    fn execute_start_reserving(addr: &str, reserved: &[(&str, u64)]) -> BuildEventKind {
+        BuildEventKind::ExecuteStart {
+            addr: addr.into(),
+            driver: "exec".into(),
+            cache: true,
+            declared: None,
+            reserved: Some(reserved.iter().map(|&(p, n)| (p.into(), n)).collect()),
+        }
+    }
+
+    const CPU: u64 = hcore::capacity::MICROS_PER_CPU;
+
+    #[test]
+    fn busy_cpu_tracks_start_and_end() {
+        let mut s = BuildState::new();
+        s.apply(&ev(
+            0,
+            execute_start_reserving("//a:x", &[("cpu", 3 * CPU)]),
+        ));
+        s.apply(&ev(
+            0,
+            execute_start_reserving("//a:y", &[("cpu", CPU / 2)]),
+        ));
+        assert_eq!(s.busy_cpus(), 4, "3 + 0.5 rounds up");
+        s.apply(&ev(1, execute_end("//a:x")));
+        assert_eq!(s.busy_cpus(), 1);
+        s.apply(&ev(2, execute_end("//a:y")));
+        assert_eq!(s.busy_cpus(), 0);
+    }
+
+    #[test]
+    fn an_unpaired_end_saturates() {
+        let mut s = BuildState::new();
+        s.apply(&ev(0, execute_start_reserving("//a:x", &[("cpu", CPU)])));
+        s.apply(&ev(1, execute_end("//a:never-started")));
+        assert_eq!(s.busy_cpus(), 1, "an End with no Start releases nothing");
+        s.apply(&ev(2, execute_end("//a:x")));
+        s.apply(&ev(3, execute_end("//a:x")));
+        assert_eq!(s.busy_cpus(), 0);
+    }
+
+    #[test]
+    fn a_double_start_counts_once() {
+        let mut s = BuildState::new();
+        s.apply(&ev(
+            0,
+            execute_start_reserving("//a:x", &[("cpu", 2 * CPU)]),
+        ));
+        s.apply(&ev(
+            1,
+            execute_start_reserving("//a:x", &[("cpu", 2 * CPU)]),
+        ));
+        assert_eq!(s.busy_cpus(), 2);
+        s.apply(&ev(2, execute_end("//a:x")));
+        assert_eq!(s.busy_cpus(), 0);
+    }
+
+    #[test]
+    fn frames_without_reserved_count_as_one() {
+        let mut s = BuildState::new();
+        s.apply(&ev(0, execute_start("//a:x")));
+        s.apply(&ev(0, execute_start("//a:y")));
+        assert_eq!(s.busy_cpus(), 2);
+    }
+
+    #[test]
+    fn memory_segment_shows_only_while_memory_is_held() {
+        let mut s = BuildState::new();
+        s.apply(&ev(
+            0,
+            BuildEventKind::RequestConfig {
+                max_workers: 4,
+                fail_fast: false,
+                scratch_disabled: false,
+                resources: [("cpu".into(), 4 * CPU), ("memory".into(), 16 << 30)].into(),
+            },
+        ));
+        s.apply(&ev(0, execute_start("//a:x")));
+        assert_eq!(s.memory_segment(), None);
+        s.apply(&ev(
+            0,
+            execute_start_reserving("//a:y", &[("cpu", CPU), ("memory", 2 << 30)]),
+        ));
+        assert_eq!(s.memory_segment().as_deref(), Some("mem 2.0 GiB/16.0 GiB"));
+        s.apply(&ev(1, execute_end("//a:y")));
+        assert_eq!(s.memory_segment(), None);
+    }
+
+    #[test]
+    fn admission_wait_row_names_the_pool_and_the_queue() {
+        let mut s = BuildState::new();
+        s.apply(&ev(
+            1_000,
+            BuildEventKind::AdmissionWaitStart {
+                addr: "//a:b".into(),
+                pool: "cpu".into(),
+                need: 4 * CPU,
+                free: 2 * CPU,
+                ahead: 6,
+            },
+        ));
+        let text: String = s.admission_wait_lines(42_000)[0]
+            .spans
+            .iter()
+            .map(|sp| sp.content.as_ref())
+            .collect();
+        assert_eq!(text, "  ⧗ //a:b waits for cpu 4 (2 free, 6 ahead, 41s)");
+        s.apply(&ev(
+            43_000,
+            BuildEventKind::AdmissionWaitEnd {
+                addr: "//a:b".into(),
+            },
+        ));
+        assert!(s.admission_wait_lines(43_000).is_empty());
     }
     fn execute_end(addr: &str) -> BuildEventKind {
         BuildEventKind::ExecuteEnd {
@@ -3349,6 +3635,7 @@ mod tests {
             max_workers: count,
             fail_fast: false,
             scratch_disabled: false,
+            resources: Default::default(),
         }
     }
 

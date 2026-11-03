@@ -39,12 +39,12 @@ use tokio::task::JoinSet;
 /// lock" notice (with the holder's pid) to the progress stream. The notice is
 /// purely informational; the wait itself continues until acquired or cancelled.
 #[cfg(not(test))]
-const RESULT_LOCK_NOTICE: std::time::Duration = std::time::Duration::from_secs(5);
+pub(crate) const RESULT_LOCK_NOTICE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Shortened under `cfg(test)`, as `SCRATCH_LOCK_NOTICE` is, so the announced
 /// path is testable without a five-second sleep per row.
 #[cfg(test)]
-const RESULT_LOCK_NOTICE: std::time::Duration = std::time::Duration::from_millis(50);
+pub(crate) const RESULT_LOCK_NOTICE: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// The first and the longest pause of a contended miss's retry
 /// ([`contend_for_write`]), before jitter.
@@ -1661,7 +1661,7 @@ impl Engine {
         // Announce worker capacity once per request. Covers the single-target
         // entry (`run` of one addr) that bypasses `Engine::result`; the once-guard
         // makes the dep recursion below a no-op.
-        rs.announce_request_config(self.max_workers, opts.no_scratch);
+        rs.announce_request_config(self.max_workers, opts.no_scratch, || self.pool_capacities());
 
         // Single-target entry (`run` of one addr, which bypasses `Engine::result`):
         // claim the matched stream and emit the set-of-one as already-complete
@@ -2014,7 +2014,7 @@ impl Engine {
 
         // Announce worker capacity up front so the client can paint a fixed
         // worker-slot indicator before any execute lands.
-        rs.announce_request_config(self.max_workers, opts.no_scratch);
+        rs.announce_request_config(self.max_workers, opts.no_scratch, || self.pool_capacities());
 
         let fail_fast = rs.fail_fast();
         let mut set: JoinSet<(Addr, anyhow::Result<Arc<EResult>>)> = JoinSet::new();
@@ -9292,7 +9292,7 @@ mod tests {
         assert!(
             events.iter().any(|e| matches!(
                 &e.kind,
-                BuildEventKind::ExecuteStart { addr, driver, cache }
+                BuildEventKind::ExecuteStart { addr, driver, cache, .. }
                     if addr == "//pkg:a" && driver == "exec" && *cache
             )),
             "expected ExecuteStart{{driver:exec, cache:true}}, got {events:?}"

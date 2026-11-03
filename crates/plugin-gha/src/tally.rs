@@ -290,6 +290,8 @@ impl Tally {
                 max_workers,
                 fail_fast,
                 scratch_disabled,
+                // Pool capacities; the report does not render them yet.
+                resources: _,
             } => {
                 self.max_workers = *max_workers;
                 self.fail_fast = *fail_fast;
@@ -434,6 +436,9 @@ impl Tally {
             }
             BuildEventKind::ResultLockWaitEnd { addr } => {
                 self.lock_waits.remove(addr.as_str());
+            }
+            // TODO(resources unit 4b): the report's `⧗` admission-wait row.
+            BuildEventKind::AdmissionWaitStart { .. } | BuildEventKind::AdmissionWaitEnd { .. } => {
             }
 
             BuildEventKind::ScratchLockWaitStart { addr, scratch, .. } => {
@@ -846,6 +851,8 @@ mod tests {
                 addr: addr.into(),
                 driver: "exec".into(),
                 cache: false,
+                declared: None,
+                reserved: None,
             },
         ));
         t.apply(&ev(
@@ -950,6 +957,8 @@ mod tests {
                 addr: "//a:x".into(),
                 driver: "exec".into(),
                 cache: false,
+                declared: None,
+                reserved: None,
             },
         ));
         assert_eq!(t.counters().cached(), 0, "hit retracted off its counter");
@@ -980,6 +989,8 @@ mod tests {
                 addr: "//a:x".into(),
                 driver: "exec".into(),
                 cache: false,
+                declared: None,
+                reserved: None,
             },
         ));
         t.apply(&ev(
@@ -1053,6 +1064,8 @@ mod tests {
                     addr: format!("//a:t{i}"),
                     driver: "exec".into(),
                     cache: false,
+                    declared: None,
+                    reserved: None,
                 },
             ));
         }
@@ -1464,6 +1477,7 @@ mod tests {
                 max_workers: 16,
                 fail_fast: false,
                 scratch_disabled: false,
+                resources: Default::default(),
             },
         ));
         t.apply(&ev(

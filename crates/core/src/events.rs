@@ -42,6 +42,45 @@
 //! `scripts/abi-check.sh` watches this file and will flag changes for review.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+/// An amount of a pool, as a person reads it: `cpu` in CPUs (`4`, `0.5`),
+/// `memory` in binary units (`2.0 GiB`), anything else a bare count. Shared
+/// by every renderer of the admission events.
+pub fn display_amount(pool: &str, amount: u64) -> String {
+    match pool {
+        crate::capacity::CPU => {
+            let per = crate::capacity::MICROS_PER_CPU;
+            let (whole, frac) = (amount / per, amount % per);
+            if frac == 0 {
+                whole.to_string()
+            } else {
+                let digits = format!("{frac:06}");
+                format!("{whole}.{}", digits.trim_end_matches('0'))
+            }
+        }
+        crate::capacity::MEMORY => crate::units::human_bytes(amount),
+        _ => amount.to_string(),
+    }
+}
+
+/// The text of an admission-wait row, after its `⧗`:
+/// `//a:b waits for cpu 4 (2 free, 6 ahead, 41s)`. `waited` is the elapsed
+/// time as the renderer spells it.
+pub fn admission_wait_text(
+    addr: &str,
+    pool: &str,
+    need: u64,
+    free: u64,
+    ahead: u64,
+    waited: &str,
+) -> String {
+    format!(
+        "{addr} waits for {pool} {} ({} free, {ahead} ahead, {waited})",
+        display_amount(pool, need),
+        display_amount(pool, free)
+    )
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuildEvent {
@@ -63,9 +102,9 @@ pub enum BuildEventKind {
     /// are wired up, whether they are read-only) belongs here rather than in new
     /// variants.
     RequestConfig {
-        /// The maximum number of targets that can execute concurrently (the
-        /// `result` semaphore size). Lets a client render a fixed worker-slot
-        /// indicator.
+        /// The cpu capacity, in CPUs (rounded up): how many CPUs the running
+        /// targets may reserve at once. Lets a client render a fixed
+        /// worker-slot indicator. Equal to `resources["cpu"]` in whole CPUs.
         max_workers: usize,
         /// Whether this request stops at the first target failure.
         ///
@@ -96,6 +135,11 @@ pub enum BuildEventKind {
         /// "scratch was off", which is both wrong and alarming.
         #[serde(default)]
         scratch_disabled: bool,
+        /// Every admission pool and its capacity, in the pool's unit (`cpu` in
+        /// micro-CPUs, `memory` in bytes, a custom pool a count). Empty from a
+        /// host that predates resources.
+        #[serde(default)]
+        resources: BTreeMap<String, u64>,
     },
     /// Incremental notice of matched top-level targets. `addrs` are newly
     /// matched addresses to add to the set; `complete` is false while the
@@ -153,6 +197,17 @@ pub enum BuildEventKind {
         addr: String,
         driver: String,
         cache: bool,
+        /// What the target declared (`resources` on its def), per pool in the
+        /// pool's unit; only the declared keys. `None` from a host that
+        /// predates resources.
+        #[serde(default)]
+        declared: Option<BTreeMap<String, u64>>,
+        /// What the engine granted, after clamping to each pool's capacity.
+        /// Always carries `cpu` (0 for a zero-cost target, which holds a
+        /// light-lane slot instead). `None` from a host that predates
+        /// resources: such a target counts as one CPU.
+        #[serde(default)]
+        reserved: Option<BTreeMap<String, u64>>,
     },
     ExecuteEnd {
         addr: String,
@@ -193,6 +248,27 @@ pub enum BuildEventKind {
     },
     /// The execute-lock wait ended (lock acquired or the wait was cancelled).
     ResultLockWaitEnd {
+        addr: String,
+    },
+    /// A target's admission has waited past the notice threshold for what it
+    /// reserves to fit. Names the first pool it does not fit in (or, when it
+    /// fits everywhere but waits behind others, the first it needs), as of the
+    /// moment the notice fired. Paired one-to-one with `AdmissionWaitEnd`
+    /// (granted or cancelled). Nothing is emitted for a wait shorter than the
+    /// threshold.
+    AdmissionWaitStart {
+        addr: String,
+        /// The pool waited on (`cpu`, `memory`, a custom pool, or `light`).
+        pool: String,
+        /// What the target needs of `pool`, in the pool's unit.
+        need: u64,
+        /// What `pool` had free when the notice fired.
+        free: u64,
+        /// How many requests were queued ahead of it.
+        ahead: u64,
+    },
+    /// The admission wait ended (granted, or the wait was cancelled).
+    AdmissionWaitEnd {
         addr: String,
     },
     /// Acquiring a scratch slot has been blocked past the notice threshold.
@@ -457,6 +533,72 @@ mod tests {
             ),
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    /// `RequestConfig` from a host predating resources announces no pools.
+    #[test]
+    fn an_old_request_config_has_no_pools() {
+        let old = r#"{"at_unix_ms":1,"kind":{"type":"RequestConfig","max_workers":8,
+            "fail_fast":false,"scratch_disabled":false}}"#;
+        let ev: BuildEvent = serde_json::from_str(old).expect("old frame must decode");
+        match ev.kind {
+            BuildEventKind::RequestConfig {
+                max_workers,
+                resources,
+                ..
+            } => {
+                assert_eq!(max_workers, 8);
+                assert!(resources.is_empty(), "{resources:?}");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// `ExecuteStart` from a host predating resources declared and reserved
+    /// nothing — `None`, which a consumer counts as one CPU — and a new frame
+    /// round-trips both maps.
+    #[test]
+    fn an_old_execute_start_reserved_nothing() {
+        let old = r#"{"at_unix_ms":1,"kind":{"type":"ExecuteStart","addr":"//a:x",
+            "driver":"exec","cache":true}}"#;
+        let ev: BuildEvent = serde_json::from_str(old).expect("old frame must decode");
+        match ev.kind {
+            BuildEventKind::ExecuteStart {
+                declared, reserved, ..
+            } => {
+                assert_eq!(declared, None);
+                assert_eq!(reserved, None);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        let new = BuildEvent {
+            at_unix_ms: 2,
+            kind: BuildEventKind::ExecuteStart {
+                addr: "//a:x".into(),
+                driver: "exec".into(),
+                cache: true,
+                declared: Some(BTreeMap::from([("cpu".into(), 16_000_000)])),
+                reserved: Some(BTreeMap::from([("cpu".into(), 4_000_000)])),
+            },
+        };
+        let back: BuildEvent =
+            serde_json::from_str(&serde_json::to_string(&new).expect("encode")).expect("decode");
+        match back.kind {
+            BuildEventKind::ExecuteStart { reserved, .. } => {
+                assert_eq!(reserved, Some(BTreeMap::from([("cpu".into(), 4_000_000)])));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn amounts_display_in_the_pools_unit() {
+        assert_eq!(display_amount("cpu", 4_000_000), "4");
+        assert_eq!(display_amount("cpu", 500_000), "0.5");
+        assert_eq!(display_amount("cpu", 10), "0.00001");
+        assert_eq!(display_amount("memory", 2 << 30), "2.0 GiB");
+        assert_eq!(display_amount("gpu", 2), "2");
     }
 
     /// The scratch spans decode with their detail fields absent — the shape an
