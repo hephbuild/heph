@@ -85,6 +85,7 @@ pub use hdriver_bridge::driver_managed_fuse;
 pub use hdriver_support::driver_managed;
 pub use hdriver_support::driver_managed_os;
 mod execute;
+pub mod failure_slot;
 pub mod invoke;
 pub use invoke::{InvokeOutcome, InvokeRequest};
 pub(crate) mod invoke_sandbox;

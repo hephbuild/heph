@@ -1565,36 +1565,28 @@ fn classify_failure(
     // the rich diagnostic once (first-writer-wins) and propagate a cheap marker.
     // Interactive targets stream their output straight to the user's terminal as
     // they run, so the captured log tail is redundant — drop it from the box.
-    let log_tail = if interactive {
+    let log = if interactive {
         None
     } else {
-        extract_log_tail(&e, rs.log_tail_lines())
+        failure_slot_log(&e)
     };
+    let log_tail = log.as_ref().and_then(|l| l.tail().ok());
     rs.record_failure(
         addr.clone(),
-        Arc::new(TargetFailure::new(addr.clone(), log_tail, e)),
+        Arc::new(TargetFailure::new(addr.clone(), log_tail, e).with_log(log)),
     );
     UpstreamFailed { root: addr.clone() }.into()
 }
 
-/// Read the last `n` lines of the failure's `Log` artifact (its
-/// `FailureArtifacts`, anywhere in the chain) so the recorded `TargetFailure`
-/// can surface them in its diagnostic, tagged with the real starting line
-/// number. Best-effort: a log file that can't be read (e.g. already reclaimed)
-/// yields no tail rather than masking the failure.
-fn extract_log_tail(e: &anyhow::Error, n: usize) -> Option<hplugin::error::LogTail> {
-    use hcore::hartifactcontent::Content as _;
-    use std::io::Read as _;
-    // From an in-process driver, or rebuilt by the host from a cdylib's
-    // `RunFailure.artifacts`: the same context either way.
-    let log = hplugin::error::failure_log(e)?;
-    // Lossy: a tool's output is not guaranteed UTF-8, and one stray byte must
-    // not cost the whole tail.
-    let mut bytes = Vec::new();
-    log.reader().ok()?.read_to_end(&mut bytes).ok()?;
-    let buf = String::from_utf8_lossy(&bytes);
-    let (text, start_line) = hplugin::error::last_n_lines_with_start(&buf, n);
-    Some(hplugin::error::LogTail { text, start_line })
+/// The log `execute` kept for this failure: its [`FailureSlot`] on the chain,
+/// put there once per run however many callers classify it. The driver's own
+/// `Log` artifact is never read here — the slot is the copy.
+///
+/// [`FailureSlot`]: crate::engine::failure_slot::FailureSlot
+fn failure_slot_log(e: &anyhow::Error) -> Option<hplugin::error::FailureLog> {
+    downcast_chain_ref::<crate::engine::failure_slot::FailureSlot>(e)?
+        .log
+        .clone()
 }
 
 /// At the outermost `result_addr` frame (the directly-requested target, with no
@@ -3235,6 +3227,9 @@ impl Engine {
             // Where its blobs live is left unresolved: a caller that needs bytes
             // and hasn't got them forces the cell, and one that only needs
             // hashouts never does.
+            //
+            // The target resolved: its last failure is stale. Under the read.
+            self.failure_slots.clear(addr).await;
             let (slot, read) =
                 GuardSlot::new(addr, hashin, Resolved::Hit(Arc::clone(&manifest)), read);
             return Ok((
@@ -3314,6 +3309,7 @@ impl Engine {
                     Contended::Hit(Err(e)) => return Err(e),
                     Contended::Hit(Ok((manifest, read))) => {
                         // Branch A, reached late.
+                        self.failure_slots.clear(addr).await;
                         let (slot, read) = GuardSlot::new(
                             addr,
                             hashin,
@@ -3433,6 +3429,12 @@ impl Engine {
                 }
             }
         };
+
+        // A hit after all (the re-check, or the remote): the last failure is
+        // stale. Under the write lock. An execute cleared it itself.
+        if executed.is_none() {
+            self.failure_slots.clear(addr).await;
+        }
 
         // Downgrade to an upgradable read, then take a plain read while still
         // holding the gateway (gap-free — no writer can delete what we just
@@ -9183,8 +9185,9 @@ mod tests {
         let full: String = (1..=12).map(|i| format!("line{i}\n")).collect();
         std::fs::write(&log_path, &full)?;
 
-        let e = process_failed_with_log(&log_path)
-            .context("driver run")
+        let e = process_failed_with_log(&log_path).context("driver run");
+        let e = slotted(&engine, &rs, &addr, dir.path(), e)
+            .await
             .context("execute //pkg:a");
 
         let out = classify_failure(&rs, &addr, false, e);
@@ -9214,7 +9217,15 @@ mod tests {
         let log_path = dir.path().join("log.txt");
         std::fs::write(&log_path, "line9\nline10\n")?;
 
-        let e = process_failed_with_log(&log_path).context("execute //pkg:a");
+        let e = slotted(
+            &engine,
+            &rs,
+            &addr,
+            dir.path(),
+            process_failed_with_log(&log_path),
+        )
+        .await
+        .context("execute //pkg:a");
 
         let _ = classify_failure(&rs, &addr, true, e);
         let recorded = rs.get_failure(&addr).expect("failure must be recorded");
@@ -9229,6 +9240,71 @@ mod tests {
             crate::engine::error::ProcessFailed::new("exit status: 1", None).into(),
             vec![hplugin::error::log_file_artifact(path).expect("utf-8 path")],
         )
+    }
+
+    /// `e` as `execute`'s failure arm leaves it: its log kept in `addr`'s slot,
+    /// and the slot on the chain. `sandbox` is where the log may be.
+    async fn slotted(
+        engine: &Engine,
+        rs: &RequestState,
+        addr: &Addr,
+        sandbox: &std::path::Path,
+        e: anyhow::Error,
+    ) -> anyhow::Error {
+        let slot = engine
+            .failure_slots
+            .fill(crate::engine::failure_slot::Fill {
+                addr,
+                hashin: "h",
+                roots: vec![sandbox.to_path_buf()],
+                err: &e,
+                lines: rs.log_tail_lines(),
+                material: false,
+            })
+            .await;
+        e.context(slot)
+    }
+
+    /// `classify_failure` reads the slot's copy, not the driver's file: once
+    /// the slot is filled, the driver's log can change or go and the tail
+    /// stays what the run wrote. With no slot on the chain there is no tail,
+    /// whatever `Log` artifact the error carries.
+    #[tokio::test]
+    async fn classify_reads_failure_slot_log() -> anyhow::Result<()> {
+        let engine = engine_with(vec![static_target("//pkg:a", &[], &[])])?;
+        let rs = engine.new_state();
+        let addr = hmodel::htaddr::parse_addr("//pkg:a")?;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log_path = dir.path().join("log.txt");
+        std::fs::write(&log_path, "what the run wrote\n")?;
+
+        let e = slotted(
+            &engine,
+            &rs,
+            &addr,
+            dir.path(),
+            process_failed_with_log(&log_path),
+        )
+        .await;
+        std::fs::write(&log_path, "rewritten later\n")?;
+        let _ = classify_failure(&rs, &addr, false, e);
+        let recorded = rs.get_failure(&addr).expect("recorded");
+        assert_eq!(
+            recorded.log_tail.as_ref().map(|t| t.text.as_str()),
+            Some("what the run wrote")
+        );
+        let path = recorded
+            .log
+            .as_ref()
+            .and_then(|l| l.path())
+            .expect("slot path");
+        assert!(path.starts_with(engine.home.join("failures")), "{path:?}");
+
+        let rs = engine.new_state();
+        let _ = classify_failure(&rs, &addr, false, process_failed_with_log(&log_path));
+        let recorded = rs.get_failure(&addr).expect("recorded");
+        assert!(recorded.log_tail.is_none() && recorded.log.is_none());
+        Ok(())
     }
 
     #[tokio::test]
@@ -9253,6 +9329,7 @@ mod tests {
             vec![hplugin::error::log_file_artifact(&log_path).expect("utf-8 path")],
         )
         .context("driver run");
+        let e = slotted(&engine, &rs, &addr, dir.path(), e).await;
 
         let _ = classify_failure(&rs, &addr, false, e);
         let recorded = rs.get_failure(&addr).expect("failure must be recorded");
@@ -9278,7 +9355,8 @@ mod tests {
         let log_path = dir.path().join("log.txt");
         std::fs::write(&log_path, "the tool said why\n")?;
 
-        let inner = Arc::new(process_failed_with_log(&log_path).context("driver run"));
+        let inner = process_failed_with_log(&log_path).context("driver run");
+        let inner = Arc::new(slotted(&engine, &rs, &addr, dir.path(), inner).await);
         let once = hcore::hmemoizer::unwrap_arc_err(Arc::clone(&inner)).context("execute //pkg:a");
         let outer = Arc::new(once);
         let e = hcore::hmemoizer::unwrap_arc_err(Arc::clone(&outer)).context("result //pkg:a");
@@ -12184,9 +12262,13 @@ mod tests {
         ) -> anyhow::Result<RunResponse> {
             self.runs.fetch_add(1, Ordering::SeqCst);
             if req.target.labels.iter().any(|l| l == FAIL_LABEL) {
+                // In the sandbox, where the engine reads a log from.
+                std::fs::create_dir_all(&req.sandbox_dir)?;
+                let log = req.sandbox_dir.join("log.txt");
+                std::fs::copy(&self.log_path, &log)?;
                 return Err(hplugin::error::with_failure_artifacts(
                     crate::engine::error::ProcessFailed::new("exit status: 1", None).into(),
-                    vec![hplugin::error::log_file_artifact(&self.log_path).expect("utf-8 path")],
+                    vec![hplugin::error::log_file_artifact(&log).expect("utf-8 path")],
                 )
                 .context("driver run"));
             }

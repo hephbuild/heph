@@ -476,6 +476,10 @@ pub struct TargetFailure {
     /// as the `log.txt` artifact), with the real starting line number so the box
     /// renders true file positions. Rendered as a framed `log` box.
     pub log_tail: Option<LogTail>,
+    /// The log `log_tail` was read from: the engine's copy in the target's
+    /// failure slot (open, with its path for the box's `full log:` footer), or
+    /// the tail in memory when no copy is kept.
+    pub log: Option<FailureLog>,
     pub source: std::sync::Arc<anyhow::Error>,
 }
 
@@ -484,8 +488,15 @@ impl TargetFailure {
         Self {
             addr,
             log_tail,
+            log: None,
             source: std::sync::Arc::new(source),
         }
+    }
+
+    /// The same failure with the log its tail came from.
+    pub fn with_log(mut self, log: Option<FailureLog>) -> Self {
+        self.log = log;
+        self
     }
 }
 
@@ -565,6 +576,194 @@ pub fn last_n_lines_with_start(s: &str, n: usize) -> (String, usize) {
     let start = lines.len().saturating_sub(n);
     let text = lines.get(start..).unwrap_or(&[]).join("\n");
     (text, start + 1)
+}
+
+/// How much of a log [`read_tail_at`] reads per backward step.
+const TAIL_CHUNK: u64 = 8 * 1024;
+
+/// How much of the part before the tail [`read_tail_at`] reads per step to
+/// count its lines.
+const COUNT_CHUNK: usize = 64 * 1024;
+
+/// The last `n` lines of a log of `len` bytes, read through `read_at` (a
+/// positional read: `read_at(buf, offset)`), with the same text and start
+/// line [`last_n_lines_with_start`] gives for the whole log, lossily decoded.
+///
+/// Seek-based: it reads backwards from the end in [`TAIL_CHUNK`] steps until
+/// it holds `n` line breaks, so only the tail is ever held in memory. The
+/// start line still needs the number of lines before the tail, which is
+/// counted in [`COUNT_CHUNK`] reads that are never kept — constant memory,
+/// one pass over the head of the file.
+pub fn read_tail_at(
+    len: u64,
+    mut read_at: impl FnMut(&mut [u8], u64) -> std::io::Result<usize>,
+    n: usize,
+) -> std::io::Result<LogTail> {
+    let (cut, window) = tail_window(len, &mut read_at, n)?;
+    let mut prefix_lines = 0usize;
+    let mut buf = vec![0u8; COUNT_CHUNK];
+    let mut off = 0u64;
+    while off < cut {
+        let want = usize::try_from((cut - off).min(COUNT_CHUNK as u64)).unwrap_or(COUNT_CHUNK);
+        let got = buf.get_mut(..want).unwrap_or_default();
+        read_exact_at(&mut read_at, got, off)?;
+        prefix_lines += got.iter().filter(|&&b| b == b'\n').count();
+        off += want as u64;
+    }
+    if n == 0 {
+        // No lines shown; the "next" line is one past the last, which an
+        // unterminated last line counts as.
+        let mut last = [0u8; 1];
+        let open = len > 0 && {
+            read_exact_at(&mut read_at, &mut last, len - 1)?;
+            last != *b"\n"
+        };
+        return Ok(LogTail {
+            text: String::new(),
+            start_line: prefix_lines + usize::from(open) + 1,
+        });
+    }
+    let text = String::from_utf8_lossy(&window);
+    let (text, local_start) = last_n_lines_with_start(&text, n);
+    Ok(LogTail {
+        text,
+        start_line: prefix_lines + local_start,
+    })
+}
+
+/// The backward half of [`read_tail_at`]: the offset the tail starts at (just
+/// past a line break, or 0) and the bytes from there to `len`.
+pub fn tail_window(
+    len: u64,
+    read_at: &mut impl FnMut(&mut [u8], u64) -> std::io::Result<usize>,
+    n: usize,
+) -> std::io::Result<(u64, Vec<u8>)> {
+    if n == 0 {
+        return Ok((len, Vec::new()));
+    }
+    let mut window: Vec<u8> = Vec::new();
+    let mut start = len;
+    loop {
+        // A line break that ends the log closes its last line rather than
+        // starting another, as `str::lines` has it.
+        let trailing = usize::from(window.last() == Some(&b'\n'));
+        let body = window.get(..window.len() - trailing).unwrap_or_default();
+        // The n-th break from the end precedes the first line of the tail.
+        if let Some((i, _)) = body
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|&(_, &b)| b == b'\n')
+            .nth(n - 1)
+        {
+            let tail = window.split_off(i + 1);
+            return Ok((start + i as u64 + 1, tail));
+        }
+        if start == 0 {
+            return Ok((0, window));
+        }
+        let take = start.min(TAIL_CHUNK);
+        let off = start - take;
+        let mut chunk = vec![0u8; usize::try_from(take).unwrap_or(0)];
+        read_exact_at(read_at, &mut chunk, off)?;
+        chunk.extend_from_slice(&window);
+        window = chunk;
+        start = off;
+    }
+}
+
+fn read_exact_at(
+    read_at: &mut impl FnMut(&mut [u8], u64) -> std::io::Result<usize>,
+    mut buf: &mut [u8],
+    mut off: u64,
+) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        match read_at(buf, off) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "log shrank while its tail was read",
+                ));
+            }
+            Ok(k) => {
+                buf = buf.get_mut(k..).unwrap_or_default();
+                off += k as u64;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// A failed run's log as the diagnostic holds it: the engine's copy in the
+/// target's failure slot, kept **open** so a later rerun replacing the slot
+/// cannot swap the log this run's box shows; or, for a target whose log may
+/// not be kept on disk (its outputs are credential material) or whose copy
+/// could not be made, the tail already read into memory.
+#[derive(Clone)]
+pub struct FailureLog {
+    path: Option<std::path::PathBuf>,
+    source: FailureLogSource,
+    lines: usize,
+}
+
+#[derive(Clone)]
+enum FailureLogSource {
+    Open(std::sync::Arc<std::fs::File>),
+    Tail(LogTail),
+}
+
+impl fmt::Debug for FailureLog {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self.source {
+            FailureLogSource::Open(_) => "open",
+            FailureLogSource::Tail(_) => "tail",
+        };
+        f.debug_struct("FailureLog")
+            .field("path", &self.path)
+            .field("source", &kind)
+            .finish()
+    }
+}
+
+impl FailureLog {
+    /// The slot's log at `path`, through `file` opened on it; its tail is the
+    /// last `lines` lines.
+    pub fn open(path: std::path::PathBuf, file: std::fs::File, lines: usize) -> Self {
+        Self {
+            path: Some(path),
+            source: FailureLogSource::Open(std::sync::Arc::new(file)),
+            lines,
+        }
+    }
+
+    /// A tail with no file behind it.
+    pub fn in_memory(tail: LogTail) -> Self {
+        Self {
+            path: None,
+            source: FailureLogSource::Tail(tail),
+            lines: 0,
+        }
+    }
+
+    /// Where the full log is, when there is one on disk.
+    pub fn path(&self) -> Option<&std::path::Path> {
+        self.path.as_deref()
+    }
+
+    /// The last lines of the log, read from the open file (seek-based, see
+    /// [`read_tail_at`]) or the tail held in memory.
+    pub fn tail(&self) -> std::io::Result<LogTail> {
+        match &self.source {
+            FailureLogSource::Tail(t) => Ok(t.clone()),
+            FailureLogSource::Open(file) => {
+                use std::os::unix::fs::FileExt as _;
+                let len = file.metadata()?.len();
+                read_tail_at(len, |buf, off| file.read_at(buf, off), self.lines)
+            }
+        }
+    }
 }
 
 #[cfg(test)]

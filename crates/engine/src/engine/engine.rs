@@ -274,6 +274,10 @@ pub struct Engine {
     /// construction (or `None` when unsupported in Auto mode).
     pub(crate) fuse: Arc<EngineFuse>,
 
+    /// Each target's last failure log, under `<home>/failures/`. Diagnostics
+    /// only — see [`crate::engine::failure_slot`].
+    pub(crate) failure_slots: crate::engine::failure_slot::FailureSlots,
+
     /// Guards the execute phase so at most one execute runs per target addr at
     /// a time (cross-process with the filesystem backend, in-process with mem).
     pub(crate) result_lock: ResultLock,
@@ -829,6 +833,7 @@ impl Engine {
             plugin_factories: HashMap::new(),
             plugins: HashMap::new(),
             fuse,
+            failure_slots: crate::engine::failure_slot::FailureSlots::new(&home),
             result_lock,
             scratch_lock,
             credential_cache: Default::default(),
@@ -997,6 +1002,11 @@ impl Engine {
             runtime: self.runtime.clone(),
             functions: Arc::clone(&self.function_slot),
         }
+    }
+
+    /// The targets' last-failure slots under `<home>/failures/`.
+    pub fn failure_slots(&self) -> &crate::engine::failure_slot::FailureSlots {
+        &self.failure_slots
     }
 
     /// This engine's function slot — what a cdylib's registry handle resolves
