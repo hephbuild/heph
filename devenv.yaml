@@ -6,3 +6,7 @@ inputs:
     inputs:
       nixpkgs:
         follows: nixpkgs
+  # Go alone, from upstream nixpkgs, so the Go version moves without re-resolving
+  # the rest of the shell (see `go` in devenv.nix).
+  nixpkgs-go:
+    url: github:NixOS/nixpkgs/nixpkgs-unstable

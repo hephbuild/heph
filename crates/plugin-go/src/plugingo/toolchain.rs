@@ -64,7 +64,11 @@ use xxhash_rust::xxh3::Xxh3Default;
 /// be supplied via the provider's optional `checksums` config option (see
 /// [`checksum_key`]) to enforce verification; there is no built-in checksum
 /// table, and an absent entry downloads unverified.
-pub const DEFAULT_GO_VERSION: &str = "1.27.0";
+///
+/// Kept equal to the devenv shell's Go and to `tools/heph-govet/go.mod`: Go
+/// 1.27.2 changed the export data format, so heph-govet must be built with a Go
+/// at least as new as the one that compiled the archives it reads.
+pub const DEFAULT_GO_VERSION: &str = "1.27.3";
 
 /// Frozen Go version the def-hash **golden** tests build their canonical defs
 /// from. Deliberately *not* [`DEFAULT_GO_VERSION`]: those goldens exist to catch

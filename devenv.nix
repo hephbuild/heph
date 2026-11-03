@@ -1,6 +1,17 @@
 { pkgs, lib, config, inputs, ... }:
 
 let
+  # Go's own nixpkgs (see `go` under `packages`). The exact patch is asserted,
+  # not just the minor: Go 1.27.2 changed the export data format, and
+  # heph-govet must be built with a Go at least as new as the one that compiled
+  # what it reads. `devenv update nixpkgs-go` that moves Go fails here until the
+  # pins below move with it.
+  goPkgs = import inputs.nixpkgs-go { system = pkgs.stdenv.system; };
+  go =
+    assert lib.assertMsg (goPkgs.go_1_27.version == "1.27.3")
+      "nixpkgs-go has go ${goPkgs.go_1_27.version}, but heph pins 1.27.3: move DEFAULT_GO_VERSION (crates/plugin-go/src/plugingo/toolchain.rs), the hermetic checksums in crates/plugingo-e2e/tests/common/mod.rs and the repo's go.mod files with it";
+    goPkgs.go_1_27;
+
   # kache — the `RUSTC_WRAPPER` (see `env.RUSTC_WRAPPER` below). Not in nixpkgs,
   # and the upstream flake builds it from source against a pinned toolchain,
   # which would land in the devenv shell's critical path on every cold CI
@@ -171,7 +182,13 @@ in
     #
     # A `gotool = "<version>"` workspace downloads its own hermetic SDK and is
     # unaffected by this; only the `host` toolchain reads it.
-    pkgs.go
+    #
+    # Pinned to exactly 1.27.3, the same as `DEFAULT_GO_VERSION` and the repo's
+    # own go.mod files, from its own input (`nixpkgs-go` in devenv.yaml): the
+    # shell's nixpkgs had no 1.27, and bumping it re-resolves everything else.
+    # `GOTOOLCHAIN=local` below makes a go.mod that needs a newer Go fail
+    # instead of downloading one.
+    go
     pkgs.buf
     (buffaPlugin "protoc-gen-buffa" buffaAsset.gen)
     (buffaPlugin "protoc-gen-buffa-packaging" buffaAsset.packaging)
@@ -256,6 +273,11 @@ in
   # `KACHE_S3_SECRET_KEY`, and run `kache daemon start` — the remote is inert
   # without the daemon.
   env.RUSTC_WRAPPER = "kache-rustc";
+
+  # Use the shell's Go, always. With the default (`auto`), a go.mod that asks for
+  # a newer Go silently downloads that toolchain into the module cache — so the
+  # Go a build ran with depended on the network and on which module it was in.
+  env.GOTOOLCHAIN = "local";
 
   # Cache linked `bin` and `--test` executables on macOS too, not just Linux.
   #
