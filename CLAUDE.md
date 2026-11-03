@@ -165,6 +165,20 @@ Read `docs/COREUTILS.md` before touching it. The one thing to know going in:
 is on, so bumping it invalidates every exec target in every workspace — a
 release-gated decision, not a routine one.
 
+### Target resources
+
+A target declares `resources = {"cpu": 2, "memory": "4G", "docker": 1}`
+(default: 1 cpu); the engine admits executes in strict FIFO order so the sum
+of what runs fits each pool's capacity (`.hephconfig` `resources:`, `-j`,
+`--resource`, `HEPH_RESOURCE_<NAME>`), and tells the target what it got
+(`HEPH_CPUS`, `HEPH_MEMORY_BYTES`, `${resource:cpu}`).
+
+Read `docs/RESOURCES.md` before touching it. The one thing to know going in:
+nothing about resources reaches any hash — the declaration is driver config
+kept off every def hash, the allotment is runtime-only — so **a target's
+outputs must not depend on its allotment**, and a driver that folds its raw
+config map into its def hash breaks that silently.
+
 ### The `template` driver
 
 `template(name, src, out, vars)` renders a declared template with declared

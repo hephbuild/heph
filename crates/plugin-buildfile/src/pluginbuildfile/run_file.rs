@@ -950,7 +950,10 @@ fn capture_provenance(eval: &Evaluator) -> Vec<ProvenanceFrame> {
 /// The driver-independent keyword arguments the `target()` builtin always
 /// accepts, for BUILD-file LSP completion. Kept next to the `target()` builtin
 /// (below) so the two don't drift. Driver-specific config args come from the
-/// driver's own schema and are merged in by the LSP.
+/// driver's own schema and are merged in by the LSP — `resources` among them:
+/// it is driver config (a driver whose schema derives from `Spec` lists it),
+/// not a field of `target()`, so it is not listed here, where it would also be
+/// offered on the drivers that refuse it.
 pub(crate) fn target_base_fields() -> Vec<hplugin::driver::DriverField> {
     use hplugin::driver::DriverField;
     let f = |name: &str, ty: ParamType, doc: &str, required: bool| DriverField {
@@ -1005,6 +1008,13 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
     /// the provider's `defaultDriver` when omitted). `labels` and `transitive`
     /// (sandbox `deps`/`tools`/`env`) are recognized; every other keyword argument
     /// becomes driver-specific config. Returns the target's `//pkg:name` address.
+    ///
+    /// One config key the builtin drivers that run something read:
+    /// `resources`, what the target
+    /// reserves from the engine's pools while it runs, e.g.
+    /// `resources = {"cpu": 2, "memory": "4G"}` (default: 1 cpu). It is driver
+    /// config, not a keyword of `target()`: it reaches the driver untouched and
+    /// never a hash. See `docs/RESOURCES.md`.
     fn target<'v>(
         eval: &mut Evaluator<'v, '_, '_>,
         args: &Arguments<'v, '_>,
