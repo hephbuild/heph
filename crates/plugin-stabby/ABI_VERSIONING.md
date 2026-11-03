@@ -227,6 +227,11 @@ skipped in silence.
 
 ## History of breaks
 
+- **0.17.3** (additive patch) — `EntrypointWorkdir.TREE_PACKAGE` (4): an
+  entrypoint run in its package's dir in the real tree. `ROOT` (2) is renamed
+  `TREE_ROOT`, same number, so the wire is unchanged. A def carrying the new
+  value sent to an older host is refused at decode (`Entrypoint.workdir` must be
+  one the build knows), never run elsewhere. `MIN_PLUGIN_ABI` stays 0.17.0.
 - **0.17.2** (additive patch) — a run on the host's PTY. `RUN_STDIO_PTY` (3),
   `RunOptions.pty_slave_fd` (8, a descriptor whose ownership moves with the
   message, so it is decoded once and only by a transport sharing the host's

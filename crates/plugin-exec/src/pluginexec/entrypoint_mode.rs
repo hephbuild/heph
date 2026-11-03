@@ -25,11 +25,13 @@ pub enum Workdir {
     /// The caller's cwd, captured raw at startup. May be outside the workspace.
     #[default]
     Caller,
-    /// The workspace root.
-    Root,
+    /// The workspace root, in the real tree.
+    TreeRoot,
     /// The invocation's own sandbox package dir, as a build runs in. Nothing
     /// written there survives the run.
     Sandbox,
+    /// The target's package dir, in the real tree (not the sandbox).
+    TreePackage,
 }
 
 /// What `entrypoint = True` adds to an exec def. Present only with the flag,
@@ -50,8 +52,9 @@ impl EntrypointMode {
             self.args,
             match self.workdir {
                 Workdir::Caller => EngineWorkdir::Caller,
-                Workdir::Root => EngineWorkdir::Root,
+                Workdir::TreeRoot => EngineWorkdir::TreeRoot,
                 Workdir::Sandbox => EngineWorkdir::Sandbox,
+                Workdir::TreePackage => EngineWorkdir::TreePackage,
             },
         )
         .with_pty()
@@ -301,14 +304,31 @@ mod tests {
                 vec![
                     flag(),
                     ("scratch", Value::List(vec![s("//c:gocache")])),
-                    ("workdir", s("root")),
+                    ("workdir", s("tree_root")),
+                ],
+                &["`scratch`", "workdir = \"sandbox\""],
+            ),
+            (
+                vec![
+                    flag(),
+                    ("scratch", Value::List(vec![s("//c:gocache")])),
+                    ("workdir", s("tree_package")),
                 ],
                 &["`scratch`", "workdir = \"sandbox\""],
             ),
             (
                 vec![flag(), ("workdir", s("nonsense"))],
-                &["workdir", "nonsense", "caller", "root", "sandbox"],
+                &[
+                    "workdir",
+                    "nonsense",
+                    "caller",
+                    "tree_root",
+                    "tree_package",
+                    "sandbox",
+                ],
             ),
+            // The old spelling is gone, not an alias.
+            (vec![flag(), ("workdir", s("root"))], &["workdir", "root"]),
             (vec![flag(), ("workdir", Value::Bool(true))], &["workdir"]),
             (vec![flag(), ("args", s("yes"))], &["args"]),
             (vec![flag(), ("unknown_field", s("x"))], &["unknown_field"]),
@@ -381,7 +401,8 @@ mod tests {
                 ("workdir", s("sandbox")),
             ],
             vec![flag(), ("workdir", s("caller"))],
-            vec![flag(), ("workdir", s("root"))],
+            vec![flag(), ("workdir", s("tree_root"))],
+            vec![flag(), ("workdir", s("tree_package"))],
             vec![flag(), ("args", Value::Bool(false))],
             vec![
                 flag(),
@@ -434,7 +455,14 @@ mod tests {
                     vec![("args", Value::Bool(true))],
                     (true, EngineWorkdir::Caller),
                 ),
-                (vec![("workdir", s("root"))], (false, EngineWorkdir::Root)),
+                (
+                    vec![("workdir", s("tree_root"))],
+                    (false, EngineWorkdir::TreeRoot),
+                ),
+                (
+                    vec![("workdir", s("tree_package"))],
+                    (false, EngineWorkdir::TreePackage),
+                ),
                 (
                     vec![("workdir", s("sandbox")), ("args", Value::Bool(true))],
                     (true, EngineWorkdir::Sandbox),

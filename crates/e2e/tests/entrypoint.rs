@@ -279,13 +279,23 @@ target(name = "sh", driver = "bash", entrypoint = True, args = True,
 }
 
 /// `workdir = "caller"` is the caller's cwd, nested or outside the workspace;
-/// `"root"` the workspace root; `"sandbox"` the invocation's own sandbox
-/// package dir. `scratch` is accepted only in sandbox mode (E21).
+/// `"tree_root"` the workspace root; `"tree_package"` the target's package dir
+/// in the real tree (the root itself for the root package); `"sandbox"` the
+/// invocation's own sandbox package dir. `scratch` is accepted only in sandbox
+/// mode (E21).
 #[tokio::test]
 async fn workdir_modes() -> anyhow::Result<()> {
     let ws = Workspace::new();
     ws.write_build_file(
-        "build",
+        "",
+        r#"
+target(name = "top", driver = "exec", entrypoint = True, workdir = "tree_package",
+       run = ["/bin/sh", "-c", "{ pwd; echo $HEPH_TEST_CALLER; } > \"$HEPH_TEST_OUT\""])
+"#,
+    );
+    // Not `build`: on a case-insensitive filesystem that is the root's `BUILD`.
+    ws.write_build_file(
+        "cachedir",
         r#"target(name = "c", driver = "scratch", env = "MYCACHE")"#,
     );
     ws.write_build_file(
@@ -293,14 +303,16 @@ async fn workdir_modes() -> anyhow::Result<()> {
         r#"
 target(name = "caller", driver = "exec", entrypoint = True,
        run = ["/bin/sh", "-c", "{ pwd; echo $HEPH_TEST_CALLER; } > \"$HEPH_TEST_OUT\""])
-target(name = "root", driver = "exec", entrypoint = True, workdir = "root",
+target(name = "root", driver = "exec", entrypoint = True, workdir = "tree_root",
+       run = ["/bin/sh", "-c", "{ pwd; echo $HEPH_TEST_CALLER; } > \"$HEPH_TEST_OUT\""])
+target(name = "pkg", driver = "exec", entrypoint = True, workdir = "tree_package",
        run = ["/bin/sh", "-c", "{ pwd; echo $HEPH_TEST_CALLER; } > \"$HEPH_TEST_OUT\""])
 target(name = "sbx", driver = "exec", entrypoint = True, workdir = "sandbox",
        run = ["/bin/sh", "-c", "{ pwd -P; echo $HEPH_TEST_CALLER; } > \"$HEPH_TEST_OUT\""])
-target(name = "scr_caller", driver = "exec", entrypoint = True, scratch = ["//build:c"],
+target(name = "scr_caller", driver = "exec", entrypoint = True, scratch = ["//cachedir:c"],
        run = ["true"])
 target(name = "scr_sandbox", driver = "exec", entrypoint = True, workdir = "sandbox",
-       scratch = ["//build:c"],
+       scratch = ["//cachedir:c"],
        run = ["/bin/sh", "-c", "printf '%s' \"$MYCACHE\" > \"$HEPH_TEST_OUT\""])
 "#,
     );
@@ -322,6 +334,13 @@ target(name = "scr_sandbox", driver = "exec", entrypoint = True, workdir = "sand
             outside.path().to_path_buf(),
             Some(root.clone()),
         ),
+        ("//app:pkg", nested.clone(), Some(root.join("app"))),
+        (
+            "//app:pkg",
+            outside.path().to_path_buf(),
+            Some(root.join("app")),
+        ),
+        ("//:top", nested.clone(), Some(root.clone())),
         ("//app:sbx", nested.clone(), None),
     ] {
         let exit = exited(invoke(&ws.engine, request(addr, &cwd, &[], &out)?).await);
@@ -638,7 +657,7 @@ impl hplugin::driver::Driver for RecordingEntrypoint {
                 cache: hplugin::driver::targetdef::CacheConfig::on(true),
                 entrypoint: Some(hplugin::driver::targetdef::Entrypoint::new(
                     false,
-                    hplugin::driver::targetdef::Workdir::Root,
+                    hplugin::driver::targetdef::Workdir::TreeRoot,
                 )),
                 hash: b"recording".to_vec(),
                 ..Default::default()
@@ -915,7 +934,7 @@ async fn entrypoint_survives_apply_transitive() -> anyhow::Result<()> {
             |e| {
                 *e = Some(hplugin::driver::targetdef::Entrypoint::new(
                     true,
-                    hplugin::driver::targetdef::Workdir::Root,
+                    hplugin::driver::targetdef::Workdir::TreeRoot,
                 ))
             },
             Err("changed the target's entrypoint attribute"),

@@ -26,7 +26,7 @@ a multi-target selection: it is invoked on its own, by address.
 |---|---|---|
 | `entrypoint` | `False` | Run the target in the caller's world instead of building it. |
 | `args` | `False` | Append the arguments after `--` to the command (`"$@"` in `bash`). Without it, arguments are refused before anything builds. |
-| `workdir` | `"caller"` | Where the command runs: `"caller"` (the directory you ran `heph` from, which may be outside the workspace), `"root"` (the workspace root), or `"sandbox"` (the invocation's own sandbox, as a build runs). Nothing written in the sandbox survives the run, so `"sandbox"` suits tools that read the closure or print, not ones that act on your tree. `scratch` is accepted only with `"sandbox"`. |
+| `workdir` | `"caller"` | Where the command runs: `"caller"` (the directory you ran `heph` from, which may be outside the workspace), `"tree_root"` (the workspace root, in your tree), `"tree_package"` (the directory of the package the target is declared in, in your tree), or `"sandbox"` (the invocation's own sandbox, as a build runs). Nothing written in the sandbox survives the run, so `"sandbox"` suits tools that read the closure or print, not ones that act on your tree. `scratch` is accepted only with `"sandbox"`. |
 
 Refused on an entrypoint, each with what to do instead: `out`, `cache`,
 `codegen`, `support_files`, `pass_env`, `runtime_pass_env`,

@@ -627,9 +627,11 @@ pub mod targetdef {
         #[default]
         Caller,
         /// The real workspace root.
-        Root,
+        TreeRoot,
         /// The invocation's own sandbox package dir, as a build would run in.
         Sandbox,
+        /// The target's package dir in the real tree (not the sandbox).
+        TreePackage,
     }
 
     #[derive(Clone, Serialize)]

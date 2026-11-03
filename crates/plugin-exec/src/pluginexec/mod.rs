@@ -4714,7 +4714,8 @@ bash apply_transitive: 26a90abee4625d43
                     "env",
                     Value::Map(HashMap::from([("A".to_string(), s("1"))])),
                 ),
-                ("workdir", s("root")),
+                ("workdir", s("tree_root")),
+                ("workdir", s("tree_package")),
                 ("workdir", s("sandbox")),
                 ("args", Value::Bool(true)),
             ] {
