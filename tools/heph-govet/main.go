@@ -49,6 +49,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"golang.org/x/tools/go/analysis/unitchecker"
 )
@@ -103,6 +104,16 @@ func main() {
 		fatal(err.Error())
 	}
 	analyzers = wrapAnalyzers(analyzers, linterOf, sup)
+
+	// unitchecker reads every direct import's types from its vetx file; give the
+	// imports heph has no facts for (stdlib, unlinted modules) one. See vetx.go.
+	if last := len(os.Args) - 1; last > 0 && strings.HasSuffix(os.Args[last], ".cfg") {
+		cfgPath, err := withVetxForEveryImport(os.Args[last])
+		if err != nil {
+			fatal(err.Error())
+		}
+		os.Args[last] = cfgPath
+	}
 
 	unitchecker.Main(analyzers...)
 }
