@@ -12,6 +12,7 @@
 //! *different* output. An output that stays identical across runs therefore
 //! proves the result came from a cache, not a fresh execution.
 
+use heph::engine::event::{BuildEvent, BuildEventKind};
 use heph::engine::{Config, Engine, HomeDir, OutputMatcher, RemoteCacheDef, ResultOptions};
 use heph::htaddr::parse_addr;
 use heph::{pluginbuildfile, pluginexec};
@@ -55,8 +56,14 @@ fn build_engine(root: &Path, remote_uri: &str) -> Arc<Engine> {
 /// reaches zero). Without this the upload could still be in flight when the
 /// caller inspects the remote.
 async fn run_drain(engine: &Arc<Engine>, addr: &str) -> String {
+    run_drain_events(engine, addr).await.0
+}
+
+/// [`run_drain`], also returning every build event the request emitted.
+async fn run_drain_events(engine: &Arc<Engine>, addr: &str) -> (String, Vec<BuildEvent>) {
     let addr = parse_addr(addr).expect("parse addr");
-    let rs = engine.new_state();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let rs = engine.new_state_with_events(false, Some(tx));
     let result = engine
         .clone()
         .result_addr(
@@ -80,7 +87,24 @@ async fn run_drain(engine: &Arc<Engine>, addr: &str) -> String {
         assert!(Instant::now() < deadline, "background upload never drained");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    artifact_string(&result)
+    let mut events = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        events.push(ev);
+    }
+    (artifact_string(&result), events)
+}
+
+/// Every addr a `ResultStart` or `ExecuteStart` event names.
+fn touched_addrs(events: &[BuildEvent]) -> Vec<&str> {
+    events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            BuildEventKind::ResultStart { addr } | BuildEventKind::ExecuteStart { addr, .. } => {
+                Some(addr.as_str())
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// Count the objects (files) under a `file://` cache directory.
@@ -288,5 +312,83 @@ async fn output_is_nondeterministic_without_cache() {
     assert_ne!(
         first, second,
         "without a cache, a fresh run must re-execute and produce a different output"
+    );
+}
+
+/// An input with `hashed: false, runtime: true` (here a `runtime_deps` glob, the
+/// shape `_golist` gives its header-read files) is honoured end to end:
+///
+/// - **staged**: the consumer's command reads its bytes;
+/// - **not hashed**: editing those bytes leaves the consumer's key unchanged, so
+///   the next run is a cache hit serving the old output;
+/// - **not resolved on a remote hit**: with the local cache gone, the remote
+///   serves the consumer, and the unhashed input is never even computed, let
+///   alone staged — no event names it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unhashed_runtime_input_is_staged_but_not_keyed() {
+    let root = tempfile::tempdir().expect("root tempdir");
+    let remote = tempfile::tempdir().expect("remote tempdir");
+    let remote_uri = format!("file://{}", remote.path().display());
+
+    std::fs::create_dir_all(root.path().join("pkg/data")).expect("mkdir pkg/data");
+    std::fs::write(root.path().join("pkg/data/a.h"), "v1").expect("write data");
+    std::fs::write(
+        root.path().join("pkg").join("BUILD"),
+        r#"
+target(
+    name = "t",
+    driver = "bash",
+    runtime_deps = {"data": [glob("data/*")]},
+    out = "out.txt",
+    run = 'cat $SRC_DATA > $OUT',
+)
+"#,
+    )
+    .expect("write BUILD");
+    let fs_input = |events: &[BuildEvent]| -> Vec<String> {
+        touched_addrs(events)
+            .into_iter()
+            .filter(|a| a.starts_with("//@heph/fs:"))
+            .map(str::to_owned)
+            .collect()
+    };
+
+    // Staged: the command read the unhashed input's bytes.
+    let cold = build_engine(root.path(), &remote_uri);
+    let (out_cold, events) = run_drain_events(&cold, "//pkg:t").await;
+    assert_eq!(out_cold, "v1", "the runtime input must be staged");
+    assert!(
+        !fs_input(&events).is_empty(),
+        "control: an executing run resolves the runtime input, so its absence below means something"
+    );
+    drop(cold);
+
+    // Not hashed: new bytes, same key → served from the cache, not re-run.
+    std::fs::write(root.path().join("pkg/data/a.h"), "v2, longer").expect("rewrite data");
+    let warm = build_engine(root.path(), &remote_uri);
+    let out_edit = run_drain(&warm, "//pkg:t").await;
+    assert_eq!(
+        out_edit, "v1",
+        "an unhashed input's bytes must not reach the consumer's key"
+    );
+    drop(warm);
+
+    // Remote hit: nothing local, the remote serves the old output, and the
+    // runtime input is neither resolved nor staged.
+    std::fs::remove_dir_all(HomeDir::for_tests(root.path()).join("cache")).expect("rm local cache");
+    let pulled = build_engine(root.path(), &remote_uri);
+    let (out_remote, events) = run_drain_events(&pulled, "//pkg:t").await;
+    assert_eq!(out_remote, "v1", "the remote must serve the cached output");
+    assert!(
+        !events.iter().any(|e| matches!(
+            &e.kind,
+            BuildEventKind::ExecuteStart { addr, .. } if addr == "//pkg:t"
+        )),
+        "a remote hit must not execute the consumer"
+    );
+    assert_eq!(
+        fs_input(&events),
+        Vec::<String>::new(),
+        "a remote hit must not resolve (or stage) an unhashed runtime input"
     );
 }

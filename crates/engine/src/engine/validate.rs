@@ -55,9 +55,10 @@ fn path_components(p: &str) -> std::str::Split<'_, char> {
 /// be flagged. Two fs-provider inputs (e.g. a broad `glob` and a specific `file`,
 /// or two globs) may legitimately cover the same path — the fs provider only
 /// exposes existing source, it never materializes or overwrites — so their
-/// overlap is a normal dependency pattern, allowed by exception.
+/// overlap is a normal dependency pattern, allowed by exception — within one fs
+/// mode only (a names-only glob exposes empty placeholders, not the source).
 fn overlap_exempt(a: &Addr, b: &Addr) -> bool {
-    pluginfs::is_fs_addr(a) && pluginfs::is_fs_addr(b)
+    pluginfs::fs_overlap_is_benign(a, b)
 }
 
 impl Engine {

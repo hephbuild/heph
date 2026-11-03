@@ -9,7 +9,7 @@ use hmodel::htpkg::PkgBuf;
 use hplugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
     ParseResponse, RunRequest, RunResponse,
-    outputartifact::{Content, ContentFile, OutputArtifact, Type},
+    outputartifact::{Content, ContentFile, ContentRaw, OutputArtifact, Type},
     targetdef::{
         Output, TargetDef,
         path::{CodegenMode, Content as PathContent, Path},
@@ -143,6 +143,54 @@ pub fn names_glob_addr(pattern: &str, exclude: &[&str]) -> Addr {
 const GLOB_MODE_ARG: &str = "m";
 /// [`GLOB_MODE_ARG`] value for a names-only glob.
 const GLOB_MODE_NAMES: &str = "names";
+
+/// Domain tag of a names-only glob: leads its def hash, and fills the content
+/// slot of each entry's [`hwalk::glob_entry_hashout`]. Not a hex digest, so a
+/// names entry's hashout can never equal a content entry's for the same path.
+const FS_NAMES_TAG: &str = "fs_names";
+
+/// How a glob's entries are hashed and staged.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+enum GlobMode {
+    /// Today's glob: each entry is the workspace file, hashed by its bytes and
+    /// exec bit, staged by passthrough.
+    #[default]
+    Content,
+    /// Each entry is hashed by its relative path alone and staged as an empty,
+    /// non-executable placeholder ([`names_glob_addr`]).
+    Names,
+}
+
+impl GlobMode {
+    fn is_content(&self) -> bool {
+        *self == GlobMode::Content
+    }
+
+    /// Parses the `m` addr arg: absent is [`GlobMode::Content`], `names` is
+    /// [`GlobMode::Names`], anything else is an error — a typo must not fall
+    /// back to content hashing, nor a newer mode to an older one.
+    fn parse(m: Option<&str>) -> anyhow::Result<Self> {
+        match m {
+            None => Ok(GlobMode::Content),
+            Some(GLOB_MODE_NAMES) => Ok(GlobMode::Names),
+            Some(other) => anyhow::bail!(
+                "unknown fs glob mode {GLOB_MODE_ARG}={other:?} (expected {GLOB_MODE_ARG}={GLOB_MODE_NAMES:?} or no {GLOB_MODE_ARG})"
+            ),
+        }
+    }
+}
+
+/// Whether two fs-provider addrs that claim the same sandbox path are certain to
+/// provide the same bytes there, so the overlap is benign.
+///
+/// Two content-mode fs targets (a `file` and a `glob`, or two globs) both expose
+/// the workspace file itself. A names-only glob stages an empty placeholder, so
+/// its overlap with a content target would put a placeholder over real bytes (or
+/// the reverse) depending on staging order: that is a collision, not an overlap.
+/// Two names globs both stage the empty placeholder, so they agree.
+pub fn fs_overlap_is_benign(a: &Addr, b: &Addr) -> bool {
+    is_fs_addr(a) && is_fs_addr(b) && a.args.get(GLOB_MODE_ARG) == b.args.get(GLOB_MODE_ARG)
+}
 
 /// Returns `true` if `addr` refers to a single-file fs target.
 pub fn is_file_addr(addr: &Addr) -> bool {
@@ -362,7 +410,7 @@ impl PluginFn for GlobFn {
         // No user excludes, so `request_id` is irrelevant (the built-in exclude
         // path is taken). Reuses the driver's compiled glob + walk verbatim.
         let compiled = compile_glob(&self.skip, "heph.fs.glob", &resolved, &[])?;
-        let artifacts = walk_glob(&self.walker, ctx.root, &compiled)?;
+        let artifacts = walk_glob(&self.walker, ctx.root, &compiled, GlobMode::Content)?;
 
         let pkg_prefix = (!ctx.pkg.is_empty()).then(|| std::path::Path::new(ctx.pkg));
 
@@ -726,6 +774,9 @@ enum FsDef {
     Glob {
         pattern: String,
         exclude: Vec<String>,
+        /// Omitted for content mode so a content glob serializes as before.
+        #[serde(skip_serializing_if = "GlobMode::is_content")]
+        mode: GlobMode,
         #[serde(skip)]
         compiled: Arc<CompiledGlob>,
     },
@@ -769,15 +820,25 @@ fn compile_glob(
 /// is applied here — the walker itself is consumer-agnostic. Starts at the
 /// pattern's literal prefix so a rooted pattern (`a/b/**/*`) scans only
 /// `<root>/a/b`, not the whole tree.
+///
+/// `mode` changes only what an entry that survives every filter becomes (see
+/// [`emit_glob_file`]); the walk and its filters are the same for both modes.
 fn walk_glob(
     walker: &CachedWalker,
     root: &std::path::Path,
     compiled: &CompiledGlob,
+    mode: GlobMode,
 ) -> anyhow::Result<Vec<OutputArtifact>> {
     let walk_root = if compiled.prefix.is_empty() {
         root.to_path_buf()
     } else {
         root.join(&compiled.prefix)
+    };
+    let emit = GlobEmitter {
+        walker,
+        root,
+        compiled,
+        mode,
     };
 
     let mut artifacts = vec![];
@@ -817,10 +878,7 @@ fn walk_glob(
                     ) {
                         // A symlink-to-dir is rejected by `file_hash` (which follows
                         // and errors on a dir), matching the old walk.
-                        emit_glob_file(
-                            walker,
-                            root,
-                            compiled,
+                        emit.file(
                             &abs,
                             entry.kind == hwalk::EntryKind::Symlink,
                             dir_in_heph,
@@ -832,83 +890,119 @@ fn walk_glob(
         }
         // A fully-literal pattern names one path with no walk above it, so there
         // is no parent answer to carry: resolve it in full.
-        Ok(_) => emit_glob_file(
-            walker,
-            root,
-            compiled,
-            &walk_root,
-            true,
-            false,
-            &mut artifacts,
-        )?,
+        Ok(_) => emit.file(&walk_root, true, false, &mut artifacts)?,
         Err(_) => {} // missing walk root ⇒ empty match
     }
 
     Ok(artifacts)
 }
 
-/// If `abs` matches the glob (and isn't excluded or a codegen output), hash it
-/// via the walker and push its artifact onto `out`.
-fn emit_glob_file(
-    walker: &CachedWalker,
-    root: &std::path::Path,
-    compiled: &CompiledGlob,
-    abs: &std::path::Path,
-    is_symlink: bool,
-    parent_in_heph: bool,
-    out: &mut Vec<OutputArtifact>,
-) -> anyhow::Result<()> {
-    use wax::Program as _;
+/// One glob walk's fixed context, shared by every entry it emits.
+struct GlobEmitter<'a> {
+    walker: &'a CachedWalker,
+    root: &'a std::path::Path,
+    compiled: &'a CompiledGlob,
+    mode: GlobMode,
+}
 
-    let Ok(rel) = abs.strip_prefix(root) else {
-        return Ok(());
-    };
-    // Include on a pattern match, drop on an exclude match.
-    if !compiled.glob.is_match(rel) || compiled.not.is_match(rel) {
-        return Ok(());
+impl GlobEmitter<'_> {
+    /// If `abs` matches the glob (and isn't excluded or a codegen output), push
+    /// its artifact onto `out`: in content mode the workspace file, hashed via
+    /// the walker; in names mode an empty placeholder hashed by its path.
+    ///
+    /// Every filter runs before the mode is consulted, so a names glob drops
+    /// exactly the entries a content glob over the same pattern drops.
+    fn file(
+        &self,
+        abs: &std::path::Path,
+        is_symlink: bool,
+        parent_in_heph: bool,
+        out: &mut Vec<OutputArtifact>,
+    ) -> anyhow::Result<()> {
+        use wax::Program as _;
+
+        let Ok(rel) = abs.strip_prefix(self.root) else {
+            return Ok(());
+        };
+        // Include on a pattern match, drop on an exclude match.
+        if !self.compiled.glob.is_match(rel) || self.compiled.not.is_match(rel) {
+            return Ok(());
+        }
+        // Skip net-new codegen outputs stamped back into the tree — sourcing them
+        // here would double-source the generated content. Same for paths resolving
+        // into a `.heph*` dir: they are engine-internal artifacts, not raw source.
+        let name = abs.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        if has_codegen_xattr(abs)
+            || entry_resolves_into_heph_dir(abs, name, is_symlink, parent_in_heph)
+        {
+            return Ok(());
+        }
+        let Some(rel_str) = rel.to_str() else {
+            anyhow::bail!("glob entry path is not valid UTF-8: {}", rel.display());
+        };
+        // `out_path` is root-relative and `/`-separated on every supported (Unix)
+        // target, so the bound hashout is the same on Linux and macOS.
+        let out_path = rel_str.to_string();
+        let name = rel_str.replace('/', "_");
+
+        let (content, hashout) = match self.mode {
+            GlobMode::Content => {
+                // Hash via the walker (follows symlinks). A symlink-to-dir or a
+                // dangling/vanished link errors here → skip.
+                let fh = match self.walker.file_hash(abs) {
+                    Ok(fh) => fh,
+                    Err(_) => return Ok(()),
+                };
+                let Some(source_path) = abs.to_str().map(str::to_owned) else {
+                    anyhow::bail!("glob entry path is not valid UTF-8: {}", abs.display());
+                };
+                // Path-bound, not the bare content hash: the glob addr carries
+                // only the pattern, so this is the only place the entry's path
+                // reaches a consumer's `hashin` (see `hwalk::glob_entry_hashout`).
+                let hashout = hwalk::glob_entry_hashout(&out_path, &fh.hashout);
+                let content = Content::File(ContentFile {
+                    source_path,
+                    out_path,
+                    x: fh.exec,
+                    // Workspace source file: durable for the build, so the engine
+                    // can reference it by path instead of tar-packing it into the
+                    // cache.
+                    passthrough: true,
+                });
+                (content, hashout)
+            }
+            GlobMode::Names => {
+                // Only a regular file, after following links, is an entry: a
+                // dangling link, a link to a directory, a FIFO or a device is
+                // not. `metadata` follows; one stat, no read — the bytes are
+                // never opened, so nothing about them can reach the key.
+                if !std::fs::metadata(abs).is_ok_and(|m| m.is_file()) {
+                    return Ok(());
+                }
+                // The mode tag fills the content slot of the entry formula: the
+                // hashout covers the path and nothing else (not the exec bit,
+                // which the placeholder does not carry either).
+                let hashout = hwalk::glob_entry_hashout(&out_path, FS_NAMES_TAG);
+                // An empty placeholder, never a passthrough: a passthrough is
+                // re-verified against the hashout as it is read, and this
+                // hashout is not a function of the bytes.
+                let content = Content::Raw(ContentRaw {
+                    data: Vec::new(),
+                    path: out_path,
+                    x: false,
+                });
+                (content, hashout)
+            }
+        };
+        out.push(OutputArtifact {
+            group: String::new(),
+            name,
+            r#type: Type::Output,
+            content,
+            hashout,
+        });
+        Ok(())
     }
-    // Skip net-new codegen outputs stamped back into the tree — sourcing them
-    // here would double-source the generated content. Same for paths resolving
-    // into a `.heph*` dir: they are engine-internal artifacts, not raw source.
-    let name = abs.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-    if has_codegen_xattr(abs) || entry_resolves_into_heph_dir(abs, name, is_symlink, parent_in_heph)
-    {
-        return Ok(());
-    }
-    let Some(rel_str) = rel.to_str() else {
-        anyhow::bail!("glob entry path is not valid UTF-8: {}", rel.display());
-    };
-    // Hash via the walker (follows symlinks). A symlink-to-dir or a
-    // dangling/vanished link errors here → skip.
-    let fh = match walker.file_hash(abs) {
-        Ok(fh) => fh,
-        Err(_) => return Ok(()),
-    };
-    let Some(source_path) = abs.to_str().map(str::to_owned) else {
-        anyhow::bail!("glob entry path is not valid UTF-8: {}", abs.display());
-    };
-    // `out_path` is root-relative and `/`-separated on every supported (Unix)
-    // target, so the bound hashout is the same on Linux and macOS.
-    let out_path = rel_str.to_string();
-    // Path-bound, not the bare content hash: the glob addr carries only the
-    // pattern, so this is the only place the entry's path reaches a
-    // consumer's `hashin` (see `hwalk::glob_entry_hashout`).
-    let hashout = hwalk::glob_entry_hashout(&out_path, &fh.hashout);
-    out.push(OutputArtifact {
-        group: String::new(),
-        name: rel_str.replace('/', "_"),
-        r#type: Type::Output,
-        content: Content::File(ContentFile {
-            source_path,
-            out_path,
-            x: fh.exec,
-            // Workspace source file: durable for the build, so the engine can
-            // reference it by path instead of tar-packing it into the cache.
-            passthrough: true,
-        }),
-        hashout,
-    });
-    Ok(())
 }
 
 /// Returns the glob walk artifacts for `(root, pattern, exclude)`, memoized
@@ -921,13 +1015,25 @@ fn cached_glob_walk(
     root: &std::path::Path,
     pattern: &str,
     exclude: &[String],
+    mode: GlobMode,
     compiled: &CompiledGlob,
 ) -> anyhow::Result<Arc<Vec<OutputArtifact>>> {
     let mut sorted: Vec<&str> = exclude.iter().map(String::as_str).collect();
     sorted.sort_unstable();
     // `root` is part of the key: the same pattern walked under a different tree
-    // root yields different artifacts (and source paths).
-    let key = format!("{}\0{}\0{}", root.display(), pattern, sorted.join("\u{1}"));
+    // root yields different artifacts (and source paths). So is the mode: a
+    // names walk and a content walk of the same pattern yield different
+    // artifacts, and one request may hold both.
+    let mode_key = match mode {
+        GlobMode::Content => "",
+        GlobMode::Names => FS_NAMES_TAG,
+    };
+    let key = format!(
+        "{}\0{}\0{}\0{mode_key}",
+        root.display(),
+        pattern,
+        sorted.join("\u{1}")
+    );
 
     if let Some(a) = glob_result_cache()
         .read()
@@ -937,7 +1043,7 @@ fn cached_glob_walk(
         return Ok(a.clone());
     }
 
-    let artifacts = Arc::new(walk_glob(walker, root, compiled)?);
+    let artifacts = Arc::new(walk_glob(walker, root, compiled, mode)?);
 
     Ok(glob_result_cache()
         .write()
@@ -946,6 +1052,39 @@ fn cached_glob_walk(
         .entry(key)
         .or_insert(artifacts)
         .clone())
+}
+
+/// The def hash of a glob target.
+///
+/// Content mode keeps its historical encoding byte for byte — tag, pattern and
+/// excludes concatenated undelimited — so every existing glob consumer keeps its
+/// key (`fs_glob_def_hash_pinned`). Names mode is new, so it gets a distinct
+/// leading tag and a delimited encoding: each field is length-prefixed, so no
+/// `(pattern, exclude)` pair re-splits into another with the same bytes.
+fn glob_def_hash(mode: GlobMode, pattern: &str, exclude: &[String]) -> Vec<u8> {
+    let mut h = Xxh3::new();
+    match mode {
+        GlobMode::Content => {
+            h.update(b"fs_glob");
+            h.update(pattern.as_bytes());
+            for e in exclude {
+                h.update(e.as_bytes());
+            }
+        }
+        GlobMode::Names => {
+            let field = |h: &mut Xxh3, s: &str| {
+                h.update(&(s.len() as u64).to_le_bytes());
+                h.update(s.as_bytes());
+            };
+            field(&mut h, FS_NAMES_TAG);
+            field(&mut h, pattern);
+            h.update(&(exclude.len() as u64).to_le_bytes());
+            for e in exclude {
+                field(&mut h, e);
+            }
+        }
+    }
+    format!("{:x}", h.digest()).into_bytes()
 }
 
 pub struct Driver {
@@ -984,6 +1123,11 @@ struct FsSpec {
     /// Comma-separated glob patterns to exclude (glob mode only).
     #[spec(ty = ParamType::String)]
     e: Option<String>,
+    /// Glob hashing/staging mode (glob mode only): absent hashes and stages
+    /// each file's content; `names` hashes each entry by its path alone and
+    /// stages an empty placeholder.
+    #[spec(ty = ParamType::String)]
+    m: Option<String>,
 }
 
 #[async_trait]
@@ -1016,6 +1160,7 @@ impl hplugin::driver::Driver for Driver {
             .transpose()
             .context("normalizing fs glob pattern")?;
         let exclude_raw = spec.e.unwrap_or_default();
+        let mode = GlobMode::parse(spec.m.as_deref()).context("parse fs config")?;
 
         // "e" arg is comma-separated glob patterns.
         let exclude: Vec<String> = if exclude_raw.is_empty() {
@@ -1026,6 +1171,10 @@ impl hplugin::driver::Driver for Driver {
 
         let (def, outputs, hash) = match (file_path, glob_pattern) {
             (Some(path), _) => {
+                anyhow::ensure!(
+                    mode.is_content(),
+                    "fs config: '{GLOB_MODE_ARG}' applies to a glob ('p'), not a file ('f')"
+                );
                 let mut h = Xxh3::new();
                 h.update(b"fs_file");
                 h.update(path.as_bytes());
@@ -1043,13 +1192,7 @@ impl hplugin::driver::Driver for Driver {
                 (def, outputs, hash)
             }
             (None, Some(pattern)) => {
-                let mut h = Xxh3::new();
-                h.update(b"fs_glob");
-                h.update(pattern.as_bytes());
-                for e in &exclude {
-                    h.update(e.as_bytes());
-                }
-                let hash = format!("{:x}", h.digest()).into_bytes();
+                let hash = glob_def_hash(mode, &pattern, &exclude);
 
                 let compiled = Arc::new(compile_glob(
                     &self.skip,
@@ -1060,6 +1203,7 @@ impl hplugin::driver::Driver for Driver {
                 let def = FsDef::Glob {
                     pattern: pattern.clone(),
                     exclude,
+                    mode,
                     compiled,
                 };
                 let outputs = vec![Output {
@@ -1164,17 +1308,19 @@ impl hplugin::driver::Driver for Driver {
             FsDef::Glob {
                 pattern,
                 exclude,
+                mode,
                 compiled,
             } => {
                 // Within a request the tree is immutable, so the walk result for
-                // this `(root, pattern, excludes)` is memoized — repeat calls
-                // skip even the walker round-trips.
+                // this `(root, pattern, excludes, mode)` is memoized — repeat
+                // calls skip even the walker round-trips.
                 let artifacts = cached_glob_walk(
                     &self.walker,
                     req.request_id,
                     root,
                     pattern,
                     exclude,
+                    *mode,
                     compiled,
                 )?;
 
@@ -1857,7 +2003,7 @@ mod tests {
         let compiled = compile_glob(&skip, "t", "**/*.rs", &[]).unwrap();
         let walker = CachedWalker::disabled();
 
-        let arts = walk_glob(&walker, root, &compiled).unwrap();
+        let arts = walk_glob(&walker, root, &compiled, GlobMode::Content).unwrap();
         let mut names: Vec<_> = arts.iter().map(|a| a.name.clone()).collect();
         names.sort();
         assert_eq!(names, vec!["a.rs".to_string(), "sub_b.rs".to_string()]);
@@ -1866,7 +2012,7 @@ mod tests {
         // A codegen-stamped file drops out of a re-walk.
         #[cfg(unix)]
         if xattr::set(root.join("a.rs"), CODEGEN_XATTR, b"//gen:it").is_ok() {
-            let arts = walk_glob(&walker, root, &compiled).unwrap();
+            let arts = walk_glob(&walker, root, &compiled, GlobMode::Content).unwrap();
             assert_eq!(arts.len(), 1, "codegen-stamped a.rs is excluded");
         }
     }
@@ -1901,7 +2047,7 @@ mod tests {
         let compiled = compile_glob(&skip, "t", "**/*.rs", &[]).unwrap();
         let walker = CachedWalker::disabled();
 
-        let arts = walk_glob(&walker, root, &compiled).unwrap();
+        let arts = walk_glob(&walker, root, &compiled, GlobMode::Content).unwrap();
         let mut names: Vec<_> = arts.iter().map(|a| a.name.clone()).collect();
         names.sort();
         assert_eq!(
@@ -1928,7 +2074,7 @@ mod tests {
         let compiled = compile_glob(&skip, "t", "**/*.rs", &[]).unwrap();
         let walker = CachedWalker::disabled();
 
-        let arts = walk_glob(&walker, root, &compiled).unwrap();
+        let arts = walk_glob(&walker, root, &compiled, GlobMode::Content).unwrap();
         let names: Vec<_> = arts.iter().map(|a| a.name.clone()).collect();
         assert_eq!(
             names,
@@ -1960,7 +2106,12 @@ mod tests {
 
         let skip = Arc::new(Ignore::new(&[], &[]).unwrap());
         let compiled = compile_glob(&skip, "t", "**/*.rs", &[]).unwrap();
-        let res = walk_glob(&CachedWalker::disabled(), root, &compiled);
+        let res = walk_glob(
+            &CachedWalker::disabled(),
+            root,
+            &compiled,
+            GlobMode::Content,
+        );
         fs::set_permissions(&heph, fs::Permissions::from_mode(0o755)).unwrap();
 
         let names: Vec<_> = res
@@ -2120,7 +2271,7 @@ mod tests {
         let compiled = compile_glob(&skip, "t", "pkg/*.go", &[]).unwrap();
         let walker = CachedWalker::disabled();
         let walk = || -> Vec<(String, String)> {
-            let mut v: Vec<_> = walk_glob(&walker, root, &compiled)
+            let mut v: Vec<_> = walk_glob(&walker, root, &compiled, GlobMode::Content)
                 .unwrap()
                 .into_iter()
                 .map(|a| (a.name, a.hashout))
@@ -3217,6 +3368,465 @@ mod tests {
         // …and a plain file underneath it, via the link.
         assert!(resolves_into_heph_dir(
             &gen_link.join("some").join("file.txt")
+        ));
+    }
+
+    // ─── Names-only glob mode ──────────────────────────────────────────────
+
+    /// A fresh, unmemoized walk of `pattern` in `mode`, as sorted
+    /// `(out_path, hashout)` pairs.
+    fn walk_mode(root: &std::path::Path, pattern: &str, mode: GlobMode) -> Vec<(String, String)> {
+        let skip = Arc::new(Ignore::new(&[], &[]).unwrap());
+        let compiled = compile_glob(&skip, "t", pattern, &[]).unwrap();
+        let mut v: Vec<(String, String)> =
+            walk_glob(&CachedWalker::disabled(), root, &compiled, mode)
+                .unwrap()
+                .into_iter()
+                .map(|a| {
+                    let path = match &a.content {
+                        Content::File(f) => f.out_path.clone(),
+                        Content::Raw(r) => r.path.clone(),
+                        _ => panic!("unexpected glob artifact content"),
+                    };
+                    (path, a.hashout)
+                })
+                .collect();
+        v.sort();
+        v
+    }
+
+    fn names_config(pattern: &str) -> std::collections::HashMap<String, Value> {
+        std::collections::HashMap::from([
+            ("p".to_string(), Value::String(pattern.to_string())),
+            (
+                GLOB_MODE_ARG.to_string(),
+                Value::String(GLOB_MODE_NAMES.to_string()),
+            ),
+        ])
+    }
+
+    /// Parses `config` and runs it under `request_id` over `root`.
+    async fn run_fs(
+        driver: &Driver,
+        config: std::collections::HashMap<String, Value>,
+        root: &std::path::Path,
+        request_id: &str,
+    ) -> Vec<OutputArtifact> {
+        let parse_res = driver
+            .parse(make_parse_req(config), &ctoken())
+            .await
+            .unwrap();
+        let request_id = request_id.to_string();
+        let hashin = String::new();
+        let req = make_run_req(
+            &parse_res.target_def,
+            &request_id,
+            root.to_path_buf(),
+            &hashin,
+        );
+        driver.run(req, &ctoken()).await.unwrap().artifacts
+    }
+
+    fn names_of(artifacts: &[OutputArtifact]) -> Vec<String> {
+        let mut v: Vec<String> = artifacts.iter().map(|a| a.name.clone()).collect();
+        v.sort();
+        v
+    }
+
+    /// T1: editing a file's bytes (including emptying it, or growing it) moves
+    /// no names hashout, while the content glob over the same tree does move.
+    #[test]
+    fn names_glob_hashout_ignores_content() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir(root.join("pkg")).unwrap();
+        fs::write(root.join("pkg/embed.txt"), b"v1").unwrap();
+        fs::write(root.join("pkg/README"), b"hello").unwrap();
+
+        let names = walk_mode(root, "pkg/**/*", GlobMode::Names);
+        let content = walk_mode(root, "pkg/**/*", GlobMode::Content);
+        assert_eq!(names.len(), 2);
+
+        fs::write(root.join("pkg/embed.txt"), b"v2, longer").unwrap();
+        fs::write(root.join("pkg/README"), b"").unwrap();
+
+        assert_eq!(
+            names,
+            walk_mode(root, "pkg/**/*", GlobMode::Names),
+            "a names hashout must not see a file's bytes"
+        );
+        assert_ne!(
+            content,
+            walk_mode(root, "pkg/**/*", GlobMode::Content),
+            "control: the content glob does see them"
+        );
+        // The entry formula over the mode tag and the path, nothing else.
+        assert_eq!(
+            names,
+            vec![
+                (
+                    "pkg/README".to_string(),
+                    hwalk::glob_entry_hashout("pkg/README", FS_NAMES_TAG)
+                ),
+                (
+                    "pkg/embed.txt".to_string(),
+                    hwalk::glob_entry_hashout("pkg/embed.txt", FS_NAMES_TAG)
+                ),
+            ]
+        );
+    }
+
+    /// T2: adding, removing and renaming a file each change the set of names
+    /// hashouts a consumer folds (sorted, as `hashin` folds them).
+    #[test]
+    fn names_glob_hashout_moves_on_add_remove_rename() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("pkg/sub")).unwrap();
+        fs::write(root.join("pkg/a.txt"), b"a").unwrap();
+        fs::write(root.join("pkg/sub/b.txt"), b"b").unwrap();
+        let hashouts = |root: &std::path::Path| -> Vec<String> {
+            let mut h: Vec<String> = walk_mode(root, "pkg/**/*", GlobMode::Names)
+                .into_iter()
+                .map(|(_, h)| h)
+                .collect();
+            h.sort();
+            h
+        };
+
+        let base = hashouts(root);
+        assert_eq!(base, hashouts(root), "stable over an unchanged tree");
+
+        fs::write(root.join("pkg/c.txt"), b"").unwrap();
+        let added = hashouts(root);
+        assert_ne!(base, added, "add");
+
+        fs::remove_file(root.join("pkg/c.txt")).unwrap();
+        assert_eq!(base, hashouts(root), "back to the base set");
+        fs::remove_file(root.join("pkg/sub/b.txt")).unwrap();
+        assert_ne!(base, hashouts(root), "remove");
+
+        fs::write(root.join("pkg/sub/b.txt"), b"b").unwrap();
+        fs::rename(root.join("pkg/a.txt"), root.join("pkg/a_linux.txt")).unwrap();
+        assert_ne!(base, hashouts(root), "rename in place");
+
+        fs::rename(root.join("pkg/a_linux.txt"), root.join("pkg/sub/a.txt")).unwrap();
+        assert_ne!(base, hashouts(root), "move to another directory");
+    }
+
+    /// T3: a chmod moves no names hashout (`go list` cannot observe the exec
+    /// bit), and the placeholder is never executable.
+    #[cfg(unix)]
+    #[test]
+    fn names_glob_hashout_ignores_exec_bit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        let f = root.join("run.sh");
+        fs::write(&f, b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o644)).unwrap();
+        let before = walk_mode(root, "*", GlobMode::Names);
+        let content_before = walk_mode(root, "*", GlobMode::Content);
+
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(before, walk_mode(root, "*", GlobMode::Names));
+        assert_ne!(
+            content_before,
+            walk_mode(root, "*", GlobMode::Content),
+            "control: the content glob does fold the exec bit"
+        );
+
+        let skip = Arc::new(Ignore::new(&[], &[]).unwrap());
+        let compiled = compile_glob(&skip, "t", "*", &[]).unwrap();
+        let arts = walk_glob(&CachedWalker::disabled(), root, &compiled, GlobMode::Names).unwrap();
+        assert!(
+            matches!(&arts[..], [OutputArtifact { content: Content::Raw(r), .. }] if !r.x),
+            "an executable file's placeholder is staged non-executable"
+        );
+    }
+
+    /// T4: through the driver (`m=names` parsed from config), every entry is an
+    /// empty `Raw` at its root-relative path, `x=false` — never a passthrough
+    /// `File`, whose read is re-verified against a content hash this hashout is
+    /// not.
+    #[tokio::test]
+    async fn names_glob_stages_empty_placeholders() {
+        let driver = Driver::default();
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("pkg/static")).unwrap();
+        fs::write(root.join("pkg/static/index.html"), b"<html>").unwrap();
+        fs::write(root.join("pkg/data.bin"), vec![7u8; 4096]).unwrap();
+
+        let arts = run_fs(
+            &driver,
+            names_config("pkg/**/*"),
+            root,
+            "test-names-placeholders",
+        )
+        .await;
+        assert_eq!(arts.len(), 2);
+        for a in &arts {
+            let Content::Raw(raw) = &a.content else {
+                panic!("names entry {} must be Content::Raw", a.name);
+            };
+            assert!(raw.data.is_empty(), "{}: placeholder is empty", a.name);
+            assert!(!raw.x, "{}: placeholder is not executable", a.name);
+            assert_eq!(
+                a.hashout,
+                hwalk::glob_entry_hashout(&raw.path, FS_NAMES_TAG)
+            );
+            assert!(matches!(a.r#type, Type::Output));
+            assert!(a.group.is_empty());
+        }
+        let mut paths: Vec<&str> = arts
+            .iter()
+            .filter_map(|a| match &a.content {
+                Content::Raw(r) => Some(r.path.as_str()),
+                _ => None,
+            })
+            .collect();
+        paths.sort_unstable();
+        assert_eq!(paths, vec!["pkg/data.bin", "pkg/static/index.html"]);
+        // Named exactly as a content glob names the same entries.
+        assert_eq!(
+            names_of(&arts),
+            vec![
+                "pkg_data.bin".to_string(),
+                "pkg_static_index.html".to_string()
+            ]
+        );
+    }
+
+    /// T5: only a regular file, after following links, is a names entry. A
+    /// dangling link, a link to a directory, a FIFO, a link to a FIFO and a
+    /// link to a device are skipped; a link to a regular file is kept, under
+    /// the link's own path.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn names_glob_skips_non_regular() {
+        use std::os::unix::fs::symlink;
+
+        let driver = Driver::default();
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("real.txt"), b"real").unwrap();
+        fs::create_dir(root.join("sub")).unwrap();
+        symlink(root.join("real.txt"), root.join("link.txt")).unwrap();
+        symlink(root.join("sub"), root.join("dirlink.txt")).unwrap();
+        symlink(root.join("missing"), root.join("dangling.txt")).unwrap();
+        symlink("/dev/null", root.join("dev.txt")).unwrap();
+        let mkfifo = std::process::Command::new("mkfifo")
+            .arg(root.join("fifo.txt"))
+            .status()
+            .expect("run mkfifo");
+        assert!(mkfifo.success(), "mkfifo failed");
+        symlink(root.join("fifo.txt"), root.join("fifolink.txt")).unwrap();
+
+        let arts = run_fs(
+            &driver,
+            names_config("*.txt"),
+            root,
+            "test-names-non-regular",
+        )
+        .await;
+        assert_eq!(
+            names_of(&arts),
+            vec!["link.txt".to_string(), "real.txt".to_string()]
+        );
+    }
+
+    /// T5: names mode keeps the content walk's source filters — a stamped
+    /// codegen output, a file under a `.heph*` dir, a link into one, the
+    /// engine's skip set and a user exclude are all dropped, exactly as the
+    /// content glob over the same tree drops them.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn names_glob_skips_codegen_and_heph() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("plain.rs"), b"plain").unwrap();
+        fs::write(root.join("excluded.rs"), b"x").unwrap();
+        let cache = root.join(".heph3").join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        fs::write(cache.join("blob.rs"), b"generated").unwrap();
+        symlink(cache.join("blob.rs"), root.join("linked.rs")).unwrap();
+        fs::create_dir(root.join("skipped")).unwrap();
+        fs::write(root.join("skipped/in_skip.rs"), b"x").unwrap();
+        let stamped = root.join("gen.rs");
+        fs::write(&stamped, b"generated").unwrap();
+        // A filesystem without user xattrs (some tmpfs) cannot hold the stamp;
+        // the rest of the filters are still checked.
+        let can_stamp = stamp_codegen(&stamped);
+
+        let driver = Driver::new(
+            Arc::new(Ignore::new(&[], &["skipped/**".to_string()]).unwrap()),
+            Arc::new(CachedWalker::disabled()),
+        );
+        let config = |mode: Option<&str>| {
+            let mut c = std::collections::HashMap::from([
+                ("p".to_string(), Value::String("**/*.rs".to_string())),
+                ("e".to_string(), Value::String("excluded.rs".to_string())),
+            ]);
+            if let Some(m) = mode {
+                c.insert(GLOB_MODE_ARG.to_string(), Value::String(m.to_string()));
+            }
+            c
+        };
+        let names = run_fs(
+            &driver,
+            config(Some(GLOB_MODE_NAMES)),
+            root,
+            "test-names-filters",
+        )
+        .await;
+        let content = run_fs(&driver, config(None), root, "test-names-filters").await;
+
+        let mut expected = vec!["plain.rs".to_string()];
+        if !can_stamp {
+            expected.push("gen.rs".to_string());
+            expected.sort();
+        }
+        assert_eq!(names_of(&names), expected);
+        assert_eq!(
+            names_of(&names),
+            names_of(&content),
+            "both modes keep the same entries"
+        );
+    }
+
+    /// T5b: one request, the same pattern and excludes in both modes — the
+    /// per-request walk memo must not hand one mode the other's artifacts.
+    #[tokio::test]
+    async fn names_and_content_globs_do_not_share_memo() {
+        let driver = Driver::default();
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("a.txt"), b"a").unwrap();
+        let request_id = "test-names-content-memo";
+
+        let content_cfg = std::collections::HashMap::from([(
+            "p".to_string(),
+            Value::String("*.txt".to_string()),
+        )]);
+        for (first, second) in [
+            (content_cfg.clone(), names_config("*.txt")),
+            (names_config("*.txt"), content_cfg.clone()),
+        ] {
+            let request_id = format!("{request_id}-{}", first.len());
+            let a = run_fs(&driver, first, root, &request_id).await;
+            let b = run_fs(&driver, second, root, &request_id).await;
+            let kinds = |arts: &[OutputArtifact]| -> Vec<&'static str> {
+                arts.iter()
+                    .map(|a| match a.content {
+                        Content::File(_) => "file",
+                        Content::Raw(_) => "raw",
+                        _ => "other",
+                    })
+                    .collect()
+            };
+            assert_ne!(kinds(&a), kinds(&b), "each mode gets its own walk");
+            assert_ne!(a[0].hashout, b[0].hashout);
+        }
+    }
+
+    /// T5c: today's content glob def hash, byte for byte. A change here moves the
+    /// key of every glob consumer in every workspace.
+    #[tokio::test]
+    async fn fs_glob_def_hash_pinned() {
+        let driver = Driver::default();
+        let config = std::collections::HashMap::from([
+            ("p".to_string(), Value::String("pkg/**/*".to_string())),
+            (
+                "e".to_string(),
+                Value::String("**/*.go,**/go.mod".to_string()),
+            ),
+        ]);
+        let def = driver
+            .parse(make_parse_req(config), &ctoken())
+            .await
+            .unwrap()
+            .target_def;
+        assert_eq!(String::from_utf8(def.hash).unwrap(), "b1d5664b5ef676b3");
+
+        let config = std::collections::HashMap::from([(
+            "p".to_string(),
+            Value::String("*.txt".to_string()),
+        )]);
+        let def = driver
+            .parse(make_parse_req(config), &ctoken())
+            .await
+            .unwrap()
+            .target_def;
+        assert_eq!(String::from_utf8(def.hash).unwrap(), "6ae58d7309311d61");
+    }
+
+    /// T5c: a names glob's def hash differs from the content glob's over the
+    /// same pattern and excludes, and its delimited encoding keeps
+    /// `(pattern, exclude)` splits apart (the content encoding does not).
+    #[test]
+    fn names_def_hash_differs() {
+        let s = |v: &[&str]| v.iter().map(|e| e.to_string()).collect::<Vec<_>>();
+        assert_ne!(
+            glob_def_hash(GlobMode::Names, "*.txt", &[]),
+            glob_def_hash(GlobMode::Content, "*.txt", &[])
+        );
+        assert_ne!(
+            glob_def_hash(GlobMode::Names, "a", &s(&["bc"])),
+            glob_def_hash(GlobMode::Names, "ab", &s(&["c"]))
+        );
+        assert_ne!(
+            glob_def_hash(GlobMode::Names, "a", &s(&["b", "c"])),
+            glob_def_hash(GlobMode::Names, "a", &s(&["bc"]))
+        );
+        assert_eq!(
+            glob_def_hash(GlobMode::Names, "a", &s(&["b"])),
+            glob_def_hash(GlobMode::Names, "a", &s(&["b"]))
+        );
+    }
+
+    /// `m` accepts `names` or nothing; any other value, or `m` on a file target,
+    /// fails the parse rather than falling back to content hashing.
+    #[tokio::test]
+    async fn fs_unknown_glob_mode_errors() {
+        let driver = Driver::default();
+        for (key, value, mode) in [
+            ("p", "*.txt", "Names"),
+            ("p", "*.txt", "content"),
+            ("p", "*.txt", ""),
+            ("f", "a.txt", "names"),
+        ] {
+            let config = std::collections::HashMap::from([
+                (key.to_string(), Value::String(value.to_string())),
+                (GLOB_MODE_ARG.to_string(), Value::String(mode.to_string())),
+            ]);
+            let err = driver
+                .parse(make_parse_req(config), &ctoken())
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{key}={value} m={mode:?} must fail"));
+            assert!(format!("{err:#}").contains(GLOB_MODE_ARG), "{err:#}");
+        }
+    }
+
+    /// A content glob, a names glob and a file over the same path: only the
+    /// same-mode pairs are a benign overlap.
+    #[test]
+    fn fs_overlap_is_benign_within_one_mode() {
+        let content = glob_addr("pkg/**/*", &[]);
+        let names = names_glob_addr("pkg/**/*", &["**/*.go"]);
+        let names2 = names_glob_addr("pkg/*", &[]);
+        let file = file_addr("pkg/a.txt");
+        assert!(fs_overlap_is_benign(&content, &file));
+        assert!(fs_overlap_is_benign(&names, &names2));
+        assert!(!fs_overlap_is_benign(&names, &content));
+        assert!(!fs_overlap_is_benign(&file, &names));
+        assert!(!fs_overlap_is_benign(
+            &content,
+            &parse_addr("//pkg:gen").unwrap()
         ));
     }
 }

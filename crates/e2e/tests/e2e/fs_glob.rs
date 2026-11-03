@@ -92,3 +92,52 @@ async fn swapping_two_globbed_files_contents_reruns_the_consumer() -> anyhow::Re
     );
     Ok(())
 }
+
+/// A names-only glob (`m=names`, reachable from Rust as
+/// `pluginfs::names_glob_addr`) through the real engine and sandbox: each
+/// entry is staged as an empty, non-executable placeholder at its path; editing
+/// a file's bytes leaves the consumer cached, while renaming one re-runs it.
+#[tokio::test]
+async fn names_glob_stages_placeholders_and_keys_on_names_only() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_file("pkg/src/a.txt", "one");
+    ws.write_file("pkg/src/b.txt", "three");
+    ws.write_build_file(
+        "pkg",
+        r#"
+target(
+    name = "t",
+    driver = "bash",
+    deps = {"src": ["//@heph/fs:glob@p=pkg/src/*,m=names"]},
+    out = "out.txt",
+    run = 'for f in $SRC_SRC; do echo "$(basename $f) size=$(wc -c < $f | tr -d " ") x=$(test -x $f && echo y || echo n) $RANDOM"; done | sort > $OUT',
+)
+"#,
+    );
+    let strip_random = |s: &str| -> String {
+        s.lines()
+            .map(|l| l.rsplit_once(' ').map_or(l, |(head, _)| head))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let first = run_fresh(&ws).await?;
+    assert_eq!(
+        strip_random(&first),
+        "a.txt size=0 x=n\nb.txt size=0 x=n",
+        "names entries are staged as empty, non-executable placeholders"
+    );
+
+    ws.write_file("pkg/src/a.txt", "a much longer body");
+    let edited = run_fresh(&ws).await?;
+    assert_eq!(
+        edited, first,
+        "editing a file's bytes must not move a names glob consumer's key"
+    );
+
+    let src = common::root(&ws).join("pkg/src");
+    std::fs::rename(src.join("a.txt"), src.join("c.txt"))?;
+    let renamed = run_fresh(&ws).await?;
+    assert_eq!(strip_random(&renamed), "b.txt size=0 x=n\nc.txt size=0 x=n");
+    Ok(())
+}
