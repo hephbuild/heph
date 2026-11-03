@@ -139,8 +139,9 @@ pub struct FileHash {
     pub hashout: String,
 }
 
-/// Identity of one `fs` glob entry: its workspace-relative `out_path`
-/// (`/`-separated) bound to its [`file_hashout`].
+/// Identity of one sourced `fs` file — an `@heph/fs:file` artifact or one
+/// `@heph/fs:glob` entry: its workspace-relative `out_path` (`/`-separated)
+/// bound to its [`file_hashout`].
 ///
 /// A consumer's `hashin` folds the *sorted* hashouts of its inputs and nothing
 /// else about them — no names, no paths. A glob addr names only its pattern, so
@@ -149,12 +150,16 @@ pub struct FileHash {
 /// result computed for another tree. Binding the path here is the only place it
 /// can reach the key.
 ///
+/// `fs:file` uses the same form even though its addr already names the path:
+/// one file has one hashout whichever way it was sourced, so `file("a.go")` and
+/// a `glob("a.go")` that matches only it produce the same artifact identity.
+///
 /// The tag keeps this domain apart from any other xxh3 of a string; the NUL
 /// separators cannot occur in a path or in a hex digest, so `(path, hash)` pairs
 /// cannot be re-split into another pair with the same input bytes.
-pub fn glob_entry_hashout(out_path: &str, content_hashout: &str) -> String {
+pub fn fs_entry_hashout(out_path: &str, content_hashout: &str) -> String {
     let mut h = Xxh3::new();
-    h.update(b"fs_glob_entry\0");
+    h.update(b"fs_entry\0");
     h.update(out_path.as_bytes());
     h.update(b"\0");
     h.update(content_hashout.as_bytes());

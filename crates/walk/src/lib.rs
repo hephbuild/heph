@@ -34,7 +34,7 @@ use wax::{Any, Glob, Program as _};
 pub mod cached_walker;
 pub mod migrate_lock;
 pub use cached_walker::{
-    CachedWalker, DirEntry, DirListing, EntryKind, FileHash, file_hashout, glob_entry_hashout,
+    CachedWalker, DirEntry, DirListing, EntryKind, FileHash, file_hashout, fs_entry_hashout,
 };
 
 /// Directory + glob ignore rules for a filesystem walk. See the module docs.

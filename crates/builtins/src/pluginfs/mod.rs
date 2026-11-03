@@ -872,8 +872,8 @@ fn emit_glob_file(
     let out_path = rel_str.to_string();
     // Path-bound, not the bare content hash: the glob addr carries only the
     // pattern, so this is the only place the entry's path reaches a
-    // consumer's `hashin` (see `hwalk::glob_entry_hashout`).
-    let hashout = hwalk::glob_entry_hashout(&out_path, &fh.hashout);
+    // consumer's `hashin` (see `hwalk::fs_entry_hashout`).
+    let hashout = hwalk::fs_entry_hashout(&out_path, &fh.hashout);
     out.push(OutputArtifact {
         group: String::new(),
         name: rel_str.replace('/', "_"),
@@ -1122,6 +1122,11 @@ impl hplugin::driver::Driver for Driver {
                     .unwrap_or(path.as_str())
                     .to_string();
 
+                // Bound to the path exactly as a glob entry is, so this file
+                // has one hashout whether it was sourced by `file()` or by a
+                // `glob()` that matched it (see `hwalk::fs_entry_hashout`).
+                let hashout = hwalk::fs_entry_hashout(path, &fh.hashout);
+
                 Ok(RunResponse {
                     artifacts: vec![OutputArtifact {
                         group: "".to_string(),
@@ -1135,7 +1140,7 @@ impl hplugin::driver::Driver for Driver {
                             // engine references it by path instead of tar-packing it.
                             passthrough: true,
                         }),
-                        hashout: fh.hashout.clone(),
+                        hashout,
                     }],
                     ..Default::default()
                 })
@@ -1745,6 +1750,54 @@ mod tests {
         }
     }
 
+    /// One file has one hashout however it was sourced: `fs:file` binds its
+    /// path into the hashout exactly as a glob entry does, so `file("pkg/a.go")`
+    /// and a `glob()` matching only that file emit the same hashout — and it is
+    /// the path-bound form, not the bare content hash, so the same bytes at
+    /// another path hash differently.
+    #[tokio::test]
+    async fn test_file_and_single_file_glob_share_a_hashout() {
+        let driver = Driver::default();
+        let tmp = tempdir().unwrap();
+        fs::create_dir(tmp.path().join("pkg")).unwrap();
+        fs::write(tmp.path().join("pkg/a.go"), b"package a\n").unwrap();
+        fs::write(tmp.path().join("pkg/b.go"), b"package a\n").unwrap();
+
+        let run = |key: &'static str, val: &'static str| {
+            let config = std::collections::HashMap::from([(
+                key.to_string(),
+                Value::String(val.to_string()),
+            )]);
+            let driver = &driver;
+            let root = tmp.path().to_path_buf();
+            async move {
+                let parse_res = driver
+                    .parse(make_parse_req(config), &ctoken())
+                    .await
+                    .unwrap();
+                let request_id = "test".to_string();
+                let hashin = String::new();
+                let req = make_run_req(&parse_res.target_def, &request_id, root, &hashin);
+                let res = driver.run(req, &ctoken()).await.unwrap();
+                assert_eq!(res.artifacts.len(), 1, "{key}={val}");
+                res.artifacts[0].hashout.clone()
+            }
+        };
+
+        let file = run("f", "pkg/a.go").await;
+        assert_eq!(file, run("p", "pkg/a.go").await, "glob of the same file");
+        assert_eq!(file, run("p", "pkg/a.*").await, "glob matching only it");
+
+        let content = file_hashout(&tmp.path().join("pkg/a.go"), false).unwrap();
+        assert_eq!(file, hwalk::fs_entry_hashout("pkg/a.go", &content));
+        assert_ne!(file, content, "not the bare content hash");
+        assert_ne!(
+            file,
+            run("f", "pkg/b.go").await,
+            "same bytes at another path"
+        );
+    }
+
     #[tokio::test]
     async fn test_driver_run_file_missing_errors() {
         let driver = Driver::default();
@@ -2075,11 +2128,11 @@ mod tests {
         let real = file_hashout(&root.join("real.txt"), false).unwrap();
         assert_eq!(
             by_name["link.txt"],
-            hwalk::glob_entry_hashout("link.txt", &real)
+            hwalk::fs_entry_hashout("link.txt", &real)
         );
         assert_eq!(
             by_name["real.txt"],
-            hwalk::glob_entry_hashout("real.txt", &real)
+            hwalk::fs_entry_hashout("real.txt", &real)
         );
     }
 
@@ -2087,7 +2140,7 @@ mod tests {
     /// `hashin` (the glob addr names just the pattern). It must move when a
     /// file is renamed with its bytes kept, and when two files swap contents;
     /// stay stable across runs over an unchanged tree; and not be the bare
-    /// content hash (or `fs:file`'s, which is that hash, would collide with it).
+    /// content hash.
     #[test]
     fn test_glob_entry_hashout_binds_the_path() {
         let tmp = tempdir().unwrap();
@@ -2121,7 +2174,7 @@ mod tests {
             first[0],
             (
                 "pkg_a.go".to_string(),
-                hwalk::glob_entry_hashout("pkg/a.go", &a_content)
+                hwalk::fs_entry_hashout("pkg/a.go", &a_content)
             )
         );
         assert_ne!(first[0].1, a_content, "not the bare content hash");
