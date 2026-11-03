@@ -2430,14 +2430,11 @@ impl Driver {
                 anyhow::bail!("cancelled");
             }
             if exit != hplugin::error::Exit::Code(0) {
-                // Nothing was captured: the log is empty, never a handle into
+                // Nothing was captured: no log artifact, never a handle into
                 // a sandbox that is about to be removed (R22).
-                return Err(hplugin::error::ProcessFailed {
-                    status: exit_display(exit),
-                    log: Arc::new(EmptyLog),
-                    exit: Some(exit),
-                }
-                .into());
+                return Err(
+                    hplugin::error::ProcessFailed::new(exit_display(exit), Some(exit)).into(),
+                );
             }
             return if writes_log {
                 log_response(&output_log_path)
@@ -2759,24 +2756,19 @@ impl Driver {
             .context("wait task panicked")?
             .context("wait for child process")?;
         if !status.success() {
-            // Carry a lazy handle to the log file rather than its bytes; the
-            // diagnostic reads only the last N lines (the request's `--log-lines`)
-            // at classification time. The file outlives the read — a failed
-            // target's sandbox is reclaimed only at its next run. A `--shell`
-            // session wrote none, and printed everything it had to say.
-            let log: std::sync::Arc<dyn hcore::hartifactcontent::Content> = if writes_log {
-                std::sync::Arc::new(hcore::hartifactcontent::FileContent::new(
-                    output_log_path.clone(),
-                ))
+            // Attach the log file as a `Log` artifact rather than its bytes;
+            // the diagnostic reads only the last N lines (the request's
+            // `--log-lines`) at classification time. The file outlives the
+            // read — a failed target's sandbox is reclaimed only at its next
+            // run. A `--shell` session wrote none, and printed everything it
+            // had to say.
+            let failed = anyhow::Error::new(hplugin::error::ProcessFailed::from_status(status));
+            let log = if writes_log {
+                log_response(&output_log_path)?.artifacts
             } else {
-                std::sync::Arc::new(EmptyLog)
+                vec![]
             };
-            return Err(hplugin::error::ProcessFailed {
-                status: status.to_string(),
-                log,
-                exit: hplugin::error::Exit::from_std(status),
-            }
-            .into());
+            return Err(hplugin::error::with_failure_artifacts(failed, log));
         }
         hcore::hmemoizer::set_phase("pluginexec:post_wait_done");
 
@@ -2817,32 +2809,6 @@ fn exit_display(exit: hplugin::error::Exit) -> String {
     match exit {
         hplugin::error::Exit::Code(code) => format!("exit status: {code}"),
         hplugin::error::Exit::Signal(sig) => format!("signal: {sig}"),
-    }
-}
-
-/// The log of a run in the caller's terminal: nothing was captured (R22).
-/// Never a handle into the run's sandbox, which is removed when it ends.
-struct EmptyLog;
-
-impl hcore::hartifactcontent::Content for EmptyLog {
-    fn reader(&self) -> anyhow::Result<Box<dyn std::io::Read>> {
-        Ok(Box::new(std::io::empty()))
-    }
-
-    fn walk(
-        &self,
-    ) -> anyhow::Result<
-        Box<dyn Iterator<Item = anyhow::Result<hcore::hartifactcontent::WalkEntry>> + '_>,
-    > {
-        Ok(Box::new(std::iter::empty()))
-    }
-
-    fn hashout(&self) -> anyhow::Result<String> {
-        Ok(String::new())
-    }
-
-    fn byte_size(&self) -> Option<u64> {
-        Some(0)
     }
 }
 

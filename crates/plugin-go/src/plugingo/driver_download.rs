@@ -289,12 +289,10 @@ async fn fetch_module(
         // network's complaints on stderr) goes to the target's log, whose tail
         // the failure box renders. The message keeps heph's own hint.
         return Err(
-            anyhow::Error::new(hplugin::error::ProcessFailed::from_output(log, &output)).context(
-                format!(
-                    "go mod download {mod_at_ver} failed. {}",
-                    passed_env_note(env)
-                ),
-            ),
+            hplugin::error::ProcessFailed::from_output(log, &output).context(format!(
+                "go mod download {mod_at_ver} failed. {}",
+                passed_env_note(env)
+            )),
         );
     }
 
@@ -991,7 +989,8 @@ printf 'dial tcp: refused\n' >&2
 exit 1"#,
         );
         let err = fetch(&go, dir.path()).await.unwrap_err();
-        let msg = format!("{err:#}");
+        let msg = hcore::hmemoizer::chain_message(&err);
+        assert!(!msg.contains(": :"), "an empty frame rendered: {msg}");
         assert!(msg.contains("a.b/c@v1"), "{msg}");
         assert!(msg.contains("Set here: GOPROXY."), "{msg}");
         // What go said is the failure's log, not pasted into the message.
@@ -1003,11 +1002,11 @@ exit 1"#,
         let log = std::fs::read_to_string(dir.path().join("log.txt")).expect("log.txt");
         assert!(log.contains("unknown revision v1"), "{log}");
         assert!(log.contains("dial tcp: refused"), "{log}");
+        let artifact = hplugin::error::failure_log(&err).expect("the failure carries the log");
         assert!(
-            hplugin::error::process_log(&err)
-                .and_then(|l| l.file_path())
-                .is_some(),
-            "the failure carries the log"
+            matches!(&artifact.content, hplugin::driver::outputartifact::Content::File(f)
+                if std::path::Path::new(&f.source_path) == dir.path().join("log.txt")),
+            "the log is the target's log.txt"
         );
         assert!(
             !msg.contains("secret"),

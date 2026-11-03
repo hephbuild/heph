@@ -123,9 +123,9 @@ pub(crate) struct ToolIo<'io> {
     /// live path and are `None` outside an interactive run, so without this a
     /// `docker buildx build` printed its whole progress log nowhere at all.
     log: Option<std::sync::Mutex<std::fs::File>>,
-    /// Where `log` lives: what a failure hands the engine (as
-    /// [`hplugin::error::ProcessFailed::log`]) so the failure box renders the
-    /// tool's output as the target's log, rather than the error pasting it.
+    /// Where `log` lives: what a failure hands the engine (as its `Log`
+    /// [`hplugin::error::FailureArtifacts`] entry) so the failure box renders
+    /// the tool's output as the target's log, rather than the error pasting it.
     log_path: PathBuf,
 }
 
@@ -1494,28 +1494,29 @@ pub(crate) async fn run_tool(
         } else {
             tail
         };
+        // The tool's output is in the target's log, returned as the failure's
+        // `Log` artifact, which the failure box renders the tail of — the same
+        // shape an `exec` target's failure has. Pasting it into the message as
+        // well printed BuildKit's whole progress inline with the error. Only a
+        // log that could not be opened (or named) leaves the message as the one
+        // place the output survives.
+        let log = io
+            .log
+            .as_ref()
+            .and_then(|_| hplugin::error::log_file_artifact(&io.log_path));
         let failed = ToolFailed {
             what,
             status: status.to_string(),
             tail: tail.trim_end().to_string(),
-            logged: io.log.is_some(),
+            logged: log.is_some(),
         };
-        // The tool's output is in the target's log, which the failure box
-        // renders the tail of — the same shape an `exec` target's failure has.
-        // Pasting it into the message as well printed BuildKit's whole progress
-        // inline with the error. Only a log that could not be opened leaves the
-        // message as the one place the output survives.
-        if !failed.logged {
+        let Some(log) = log else {
             return Err(anyhow::Error::msg(failed));
-        }
-        let log: Arc<dyn hcore::hartifactcontent::Content> = Arc::new(
-            hcore::hartifactcontent::FileContent::new(io.log_path.clone()),
-        );
-        return Err(anyhow::Error::new(hplugin::error::ProcessFailed {
-            status: status.to_string(),
-            log,
-            exit: hplugin::error::Exit::from_std(status),
-        })
+        };
+        return Err(hplugin::error::with_failure_artifacts(
+            anyhow::Error::new(hplugin::error::ProcessFailed::from_status(status)),
+            vec![log],
+        )
         .context(failed));
     }
 
@@ -1549,9 +1550,10 @@ impl std::fmt::Display for ToolFailed {
 /// The text a failure hint matches on: the message, plus the tool's output tail
 /// that a logged [`ToolFailed`] keeps out of it.
 fn failure_text(e: &anyhow::Error) -> String {
+    let msg = hcore::hmemoizer::chain_message(e);
     match e.downcast_ref::<ToolFailed>() {
-        Some(t) if t.logged => format!("{e:#}\n{}", t.tail),
-        _ => format!("{e:#}"),
+        Some(t) if t.logged => format!("{msg}\n{}", t.tail),
+        _ => msg,
     }
 }
 
@@ -2970,23 +2972,23 @@ exit 0
             .await
             .err()
             .expect("a failing build must error");
-        let msg = format!("{err:#}");
+        let msg = hcore::hmemoizer::chain_message(&err);
         assert!(
             !msg.contains("failed to solve"),
             "output pasted inline: {msg}"
         );
+        assert!(!msg.contains(": :"), "an empty frame rendered: {msg}");
         assert!(msg.contains("docker buildx build failed"), "got: {msg}");
         assert_eq!(
             hplugin::error::process_exit(&err),
             Some(hplugin::error::Exit::Code(1)),
             "{msg}"
         );
+        let artifact = hplugin::error::failure_log(&err).expect("the failure carries the log");
+        assert_eq!(artifact.name, "log.txt");
         let mut log = String::new();
         std::io::Read::read_to_string(
-            &mut hplugin::error::process_log(&err)
-                .expect("the failure carries the log")
-                .reader()
-                .expect("open log"),
+            &mut hcore::hartifactcontent::Content::reader(artifact).expect("open log"),
             &mut log,
         )
         .expect("read log");

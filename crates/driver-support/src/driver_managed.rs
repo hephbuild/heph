@@ -58,8 +58,8 @@ pub struct ManagedRunResponse {
 }
 
 /// For a driver that captures its tool's output whole instead of streaming it:
-/// when the run failed with a process log, copy that log to the run's live
-/// stderr.
+/// when the run failed with a `Log` artifact on the error
+/// ([`hplugin::error::failure_log`]), copy that log to the run's live stderr.
 ///
 /// An interactive run (a target named at a terminal) has its live sinks set,
 /// and the engine leaves the log tail out of the failure box there because it
@@ -71,17 +71,20 @@ pub async fn echo_failure_log(req: &mut RunRequest<'_, '_>, e: &anyhow::Error) {
     let Some(stderr) = req.stderr.as_deref_mut() else {
         return;
     };
-    let Some(log) = hplugin::error::process_log(e) else {
+    let Some(log) = hplugin::error::failure_log(e).cloned() else {
         return;
     };
-    let mut bytes = Vec::new();
-    if log
-        .reader()
-        .and_then(|mut r| io::Read::read_to_end(&mut r, &mut bytes).map_err(Into::into))
-        .is_err()
-    {
+    // The log is a file: read it off the async path.
+    let read = hcore::blocking::run(move || -> anyhow::Result<Vec<u8>> {
+        use hcore::hartifactcontent::Content as _;
+        let mut bytes = Vec::new();
+        io::Read::read_to_end(&mut log.reader()?, &mut bytes)?;
+        Ok(bytes)
+    })
+    .await;
+    let Ok(bytes) = read else {
         return;
-    }
+    };
     // Best-effort: a sink that went away must not mask the failure itself.
     drop(stderr.write_all(&bytes).await);
     drop(stderr.flush().await);
@@ -881,10 +884,8 @@ mod echo_failure_log_tests {
             .args(["-c", "echo 'x.go:3:1: expected declaration' >&2; exit 2"])
             .output()
             .expect("run sh");
-        anyhow::Error::new(hplugin::error::ProcessFailed::from_output(
-            log_path, &output,
-        ))
-        .context("heph-govet -format failed")
+        hplugin::error::ProcessFailed::from_output(log_path, &output)
+            .context("heph-govet -format failed")
     }
 
     /// An interactive run (live sinks set) gets the captured tool's output on
@@ -906,16 +907,28 @@ mod echo_failure_log_tests {
         );
     }
 
-    /// Outside an interactive run there is nowhere to echo to.
+    /// Outside an interactive run there is nowhere to echo to: nothing is
+    /// written, not even to a stdout sink a non-interactive run may have.
     #[tokio::test]
-    async fn does_nothing_without_a_sink() {
+    async fn no_echo_when_not_interactive() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let e = failed(&tmp.path().join("log.txt"));
         let target = hplugin::driver::targetdef::TargetDef::default();
         let id = "t".to_string();
+        let mut out: Vec<u8> = Vec::new();
         let mut req = RunRequest::new(&id, &target, tmp.path());
+        req.stdout = Some(&mut out);
         echo_failure_log(&mut req, &e).await;
         assert!(req.stderr.is_none());
+        drop(req);
+        assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
+        // And a failure with no log echoes nothing, even with a sink.
+        let mut sink: Vec<u8> = Vec::new();
+        let mut req = RunRequest::new(&id, &target, tmp.path());
+        req.stderr = Some(&mut sink);
+        echo_failure_log(&mut req, &anyhow::anyhow!("no log")).await;
+        drop(req);
+        assert!(sink.is_empty());
     }
 }
 

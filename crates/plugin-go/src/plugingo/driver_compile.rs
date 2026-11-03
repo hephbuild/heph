@@ -901,10 +901,8 @@ impl GoCompileDriver {
             // Both streams go to the target's log, which the failure box renders
             // the tail of — `go tool` writes diagnostics to stderr, but some
             // failures print on stdout. Not pasted into the message.
-            return Err(
-                anyhow::Error::new(hplugin::error::ProcessFailed::from_output(log, &output))
-                    .context(format!("go {step} failed")),
-            );
+            return Err(hplugin::error::ProcessFailed::from_output(log, &output)
+                .context(format!("go {step} failed")));
         }
         Ok(())
     }

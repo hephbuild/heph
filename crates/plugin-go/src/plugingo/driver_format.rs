@@ -110,11 +110,8 @@ async fn govet_failed(
     output: &std::process::Output,
     what: &'static str,
 ) -> anyhow::Error {
-    let e = anyhow::Error::new(hplugin::error::ProcessFailed::from_output(
-        &req.sandbox_dir.join("log.txt"),
-        output,
-    ))
-    .context(what);
+    let e = hplugin::error::ProcessFailed::from_output(&req.sandbox_dir.join("log.txt"), output)
+        .context(what);
     hdriver_support::driver_managed::echo_failure_log(&mut req.request, &e).await;
     e
 }

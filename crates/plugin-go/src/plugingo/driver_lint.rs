@@ -576,10 +576,8 @@ impl GoLintDriver {
         if !output.status.success() {
             // The tool's output goes to the target's log, whose tail the
             // failure box renders, rather than into the message.
-            return Err(
-                anyhow::Error::new(hplugin::error::ProcessFailed::from_output(log, &output))
-                    .context("heph-govet failed"),
-            );
+            return Err(hplugin::error::ProcessFailed::from_output(log, &output)
+                .context("heph-govet failed"));
         }
         Ok(output.stdout)
     }
