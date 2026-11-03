@@ -1259,7 +1259,7 @@ impl Resources {
     /// The most pools one target may name.
     pub const MAX_POOLS: usize = 16;
     /// Micro-CPUs in one CPU: the `cpu` pool's unit.
-    pub const MICROS_PER_CPU: u64 = 1_000_000;
+    pub const MICROS_PER_CPU: u64 = hcore::capacity::MICROS_PER_CPU;
     /// What a target that declares no `cpu` reserves: one CPU.
     pub const DEFAULT_CPU_MICROS: u64 = Self::MICROS_PER_CPU;
 

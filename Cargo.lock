@@ -923,6 +923,7 @@ name = "config"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "core",
  "memoize",
  "serde",
  "serde_yaml",

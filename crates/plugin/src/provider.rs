@@ -122,11 +122,11 @@ pub struct PoolName(String);
 
 impl PoolName {
     /// The longest a pool name may be.
-    pub const MAX_LEN: usize = 64;
+    pub const MAX_LEN: usize = hcore::capacity::MAX_POOL_NAME_LEN;
     /// The CPU pool, in micro-CPUs.
-    pub const CPU: &'static str = "cpu";
+    pub const CPU: &'static str = hcore::capacity::CPU;
     /// The memory pool, in bytes.
-    pub const MEMORY: &'static str = "memory";
+    pub const MEMORY: &'static str = hcore::capacity::MEMORY;
 
     /// The `cpu` pool.
     pub fn cpu() -> Self {
@@ -144,10 +144,7 @@ impl PoolName {
 
     /// Whether `s` is a well-formed pool name, without allocating.
     pub fn is_valid(s: &str) -> bool {
-        let mut bytes = s.bytes();
-        matches!(bytes.next(), Some(b'a'..=b'z'))
-            && s.len() <= Self::MAX_LEN
-            && bytes.all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_'))
+        hcore::capacity::is_pool_name(s)
     }
 }
 

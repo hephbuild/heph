@@ -16,6 +16,7 @@
 )]
 
 pub mod blocking;
+pub mod capacity;
 pub mod debug_hash;
 pub mod defer;
 pub mod events;

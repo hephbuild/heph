@@ -81,6 +81,82 @@ pub struct ConfigYaml {
     pub caches: BTreeMap<String, RemoteCacheConfigPatch>,
     #[serde(default)]
     pub telemetry: Option<TelemetryConfig>,
+    /// Resource-pool capacities, one entry per pool: `cpu: 8` (CPUs, or
+    /// `50%` of the core count), `memory: 24G` (or a percentage of the memory
+    /// this process may use), `docker: 2` (a custom pool's count). `0` declares
+    /// a pool whose capacity each run sets (`--resource gpu=<n>` or
+    /// `HEPH_RESOURCE_GPU=<n>`). A profile overrides per pool.
+    #[serde(default)]
+    pub resources: ResourcesConfig,
+}
+
+/// `resources:` in `.hephconfig`: pool name to [`Capacity`](hcore::capacity::Capacity).
+///
+/// Names and amounts are checked while parsing, so a typo fails the config
+/// load rather than the first target that reaches the pool.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ResourcesConfig(pub BTreeMap<String, hcore::capacity::Capacity>);
+
+impl<'de> Deserialize<'de> for ResourcesConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = ResourcesConfig;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a map of pool name to capacity, e.g. {cpu: 8, memory: 24G}")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                use serde::de::Error as _;
+                let mut out = BTreeMap::new();
+                while let Some(name) = map.next_key::<String>()? {
+                    if !hcore::capacity::is_pool_name(&name) {
+                        return Err(A::Error::custom(format!(
+                            "resources: {name:?} is not a valid pool name: a lowercase ASCII \
+                             letter followed by at most {} lowercase letters, digits or `_`",
+                            hcore::capacity::MAX_POOL_NAME_LEN - 1
+                        )));
+                    }
+                    let raw: CapacityValue = map
+                        .next_value()
+                        .map_err(|e| A::Error::custom(format!("resources.{name}: {e}")))?;
+                    let text = match raw {
+                        CapacityValue::Int(n) => n.to_string(),
+                        CapacityValue::Text(s) => s,
+                    };
+                    let cap = hcore::capacity::Capacity::parse(
+                        &name,
+                        &text,
+                        hcore::capacity::Zero::Allowed,
+                    )
+                    .map_err(|e| A::Error::custom(format!("resources.{name}: {e:#}")))?;
+                    if out.insert(name.clone(), cap).is_some() {
+                        return Err(A::Error::custom(format!(
+                            "resources: pool {name} is given twice"
+                        )));
+                    }
+                }
+                Ok(ResourcesConfig(out))
+            }
+        }
+        d.deserialize_map(Visitor)
+    }
+}
+
+/// One capacity as YAML spells it: a non-negative int, or a string (a memory
+/// size or a percentage).
+#[derive(Deserialize)]
+#[serde(
+    untagged,
+    expecting = "a non-negative whole number or a string such as \"24G\" or \"50%\""
+)]
+enum CapacityValue {
+    Int(u64),
+    Text(String),
 }
 
 /// One resolved named remote cache: `caches: { name: { uri, read, write } }`.
@@ -307,6 +383,9 @@ impl ConfigYaml {
         for (name, patch) in other.caches {
             self.caches.entry(name).or_default().merge(patch);
         }
+        // Resources merge per pool: a profile that sets `cpu` keeps the base's
+        // other pools.
+        self.resources.0.extend(other.resources.0);
 
         merge_plugins(&mut self.plugins, other.plugins);
     }
@@ -1616,5 +1695,97 @@ plugins:
         let err = serde_yaml::from_str::<ConfigYaml>("plugins:\n  - bogus: x\n")
             .expect_err("must reject");
         assert!(err.to_string().contains("bogus"), "{err}");
+    }
+
+    fn resources(yaml: &str) -> anyhow::Result<BTreeMap<String, hcore::capacity::Capacity>> {
+        Ok(serde_yaml::from_str::<ConfigYaml>(yaml)?.resources.0)
+    }
+
+    #[test]
+    fn resources_config_parse_table() {
+        use hcore::capacity::Capacity::Amount;
+        const CPU: u64 = hcore::capacity::MICROS_PER_CPU;
+        let ok: &[(&str, &str, hcore::capacity::Capacity)] = &[
+            // 0 is "this pool exists; the run sets it", for any pool.
+            ("resources: {cpu: 0}", "cpu", Amount(0)),
+            ("resources: {gpu: 0}", "gpu", Amount(0)),
+            ("resources: {cpu: 8}", "cpu", Amount(8 * CPU)),
+            ("resources: {memory: 32G}", "memory", Amount(32 << 30)),
+            ("resources: {memory: \"32G\"}", "memory", Amount(32 << 30)),
+            ("resources: {memory: 4096}", "memory", Amount(4096)),
+            ("resources: {gpu: 2}", "gpu", Amount(2)),
+        ];
+        for (yaml, pool, want) in ok {
+            let got = resources(yaml).unwrap_or_else(|e| panic!("{yaml}: {e:#}"));
+            assert_eq!(got.get(*pool), Some(want), "{yaml}");
+        }
+        assert!(resources("homeDir: .h\n").unwrap().is_empty());
+
+        let err: &[(&str, &str)] = &[
+            ("resources: {cpu: all}", "cpu"),
+            ("resources: {cpu: -1}", "cpu"),
+            ("resources: {gpu: -1}", "gpu"),
+            ("resources: {cpu: 1.5}", "cpu"),
+            ("resources: {cpu: true}", "cpu"),
+            ("resources: {memory: \"4 G\"}", "memory"),
+            ("resources: {cpu: 1, cpu: 2}", "twice"),
+            ("resources:\n  cpu: 1\n  cpu: 2\n", "cpu"),
+            ("resources: {Cpu: 1}", "pool name"),
+            ("resources: {\"gpu \": 1}", "pool name"),
+            ("resources: {cpu: 4294967296}", "cpu"),
+            ("resources: [cpu]", "map"),
+        ];
+        for (yaml, needle) in err {
+            let e = resources(yaml).expect_err(yaml);
+            assert!(format!("{e:#}").contains(needle), "{yaml}: {e:#}");
+        }
+    }
+
+    #[test]
+    fn resources_merge_per_pool_across_profiles() {
+        use hcore::capacity::Capacity::Amount;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(
+            root.join(".hephconfig"),
+            "resources:\n  cpu: 8\n  memory: 24G\n  docker: 2\n",
+        )
+        .expect("write base");
+        std::fs::write(root.join("ci.hephconfig"), "resources:\n  cpu: 4\n").expect("write ci");
+
+        let cfg = load_with_profiles(root, &["ci"]).expect("load");
+        let r = cfg.resources.0;
+        assert_eq!(
+            r.get("cpu"),
+            Some(&Amount(4 * hcore::capacity::MICROS_PER_CPU))
+        );
+        assert_eq!(r.get("memory"), Some(&Amount(24 << 30)));
+        assert_eq!(r.get("docker"), Some(&Amount(2)));
+    }
+
+    /// The config half of `percent_capacity_parse_table` (the CLI half is in
+    /// `src/commands/global.rs`; both go through `hcore::capacity`).
+    #[test]
+    fn percent_capacity_parse_table() {
+        use hcore::capacity::Capacity::Percent;
+        let r = resources("resources: {cpu: 50%, memory: 75%}").expect("parse");
+        assert_eq!(r.get("cpu"), Some(&Percent(50)));
+        assert_eq!(r.get("memory"), Some(&Percent(75)));
+        assert_eq!(
+            resources("resources: {cpu: 150%}")
+                .expect("overcommit")
+                .get("cpu"),
+            Some(&Percent(150))
+        );
+        for bad in [
+            "resources: {cpu: 0%}",
+            "resources: {cpu: -50%}",
+            "resources: {cpu: \"50 %\"}",
+            "resources: {cpu: \"%\"}",
+            "resources: {cpu: 50%%}",
+            "resources: {gpu: 50%}",
+        ] {
+            resources(bad).expect_err(bad);
+        }
     }
 }
