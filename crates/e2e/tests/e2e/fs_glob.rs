@@ -141,3 +141,125 @@ target(
     assert_eq!(strip_random(&renamed), "b.txt size=0 x=n\nc.txt size=0 x=n");
     Ok(())
 }
+
+/// [`run_fresh`], also returning every build event the request emitted.
+async fn run_fresh_events(
+    ws: &Workspace,
+) -> anyhow::Result<(String, Vec<heph::engine::event::BuildEvent>)> {
+    let engine = ws.reopen()?;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let rs = engine.new_state_with_events(false, Some(tx));
+    let addr = parse_addr("//pkg:t")?;
+    let res = engine
+        .clone()
+        .result_addr(rs, &addr, OutputMatcher::All, &ResultOptions::default())
+        .await?;
+    let mut events = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        events.push(ev);
+    }
+    Ok((common::artifact_string(&res), events))
+}
+
+/// A consumer that lists each staged entry's path relative to `pkg/src`.
+const NAMES_PATHS_BUILD: &str = r#"
+target(
+    name = "t",
+    driver = "bash",
+    deps = {"src": ["//@heph/fs:glob@p=pkg/src/**/*,m=names"]},
+    out = "out.txt",
+    run = 'for f in $SRC_SRC; do echo "${f#*pkg/src/}"; done | sort > $OUT',
+)
+"#;
+
+/// A names glob's placeholders are owned, in-memory bytes on the uncached path:
+/// they are handed to the consumer as they are, never packed into the tmp
+/// store. Packing them cost a tar job and a store insert per entry on every
+/// run, a consumer's cache hit included, since the glob itself always re-runs.
+#[tokio::test]
+async fn names_glob_never_writes_the_tmp_store() -> anyhow::Result<()> {
+    use heph::engine::event::BuildEventKind;
+
+    let ws = Workspace::new();
+    ws.write_file("pkg/src/a.txt", "one");
+    ws.write_file("pkg/src/b.txt", "two");
+    ws.write_build_file("pkg", NAMES_PATHS_BUILD);
+
+    let glob_writes = |events: &[heph::engine::event::BuildEvent]| -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                BuildEventKind::LocalCacheWriteStart { addr } if addr.contains("@heph/fs") => {
+                    Some(addr.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    };
+
+    let (cold, cold_events) = run_fresh_events(&ws).await?;
+    assert_eq!(cold, "a.txt\nb.txt\n");
+    assert_eq!(glob_writes(&cold_events), Vec::<String>::new(), "cold run");
+
+    let (warm, warm_events) = run_fresh_events(&ws).await?;
+    assert_eq!(warm, cold);
+    assert_eq!(glob_writes(&warm_events), Vec::<String>::new(), "warm run");
+    Ok(())
+}
+
+/// `a_b.txt` and `a/b.txt` are distinct entries; flattening `/` to `_` in the
+/// artifact name must not merge or reject them.
+#[tokio::test]
+async fn names_glob_stages_entries_whose_flattened_names_collide() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_file("pkg/src/a_b.txt", "one");
+    ws.write_file("pkg/src/a/b.txt", "two");
+    ws.write_build_file("pkg", NAMES_PATHS_BUILD);
+
+    let out = run_fresh(&ws).await?;
+    assert_eq!(out, "a/b.txt\na_b.txt\n");
+    Ok(())
+}
+
+/// The staging-collision exemption for two fs deps holds within one fs mode
+/// only, and it recognizes the mode exactly as the fs provider spells it: addrs
+/// built by `pluginfs::glob_addr` / `pluginfs::names_glob_addr` over the same
+/// file collide, while two content addrs over it do not.
+#[tokio::test]
+async fn names_and_content_globs_over_one_file_collide() -> anyhow::Result<()> {
+    use heph::pluginfs::{glob_addr, names_glob_addr};
+
+    let build = |a: &str, b: &str| {
+        format!(
+            r#"
+target(
+    name = "t",
+    driver = "bash",
+    deps = {{"a": ["{a}"], "b": ["{b}"]}},
+    out = "out.txt",
+    run = 'cat pkg/src/a.txt > $OUT',
+)
+"#
+        )
+    };
+    let content = glob_addr("pkg/src/*", &[]).format();
+    let content2 = glob_addr("pkg/src/*.txt", &[]).format();
+    let names = names_glob_addr("pkg/src/*", &[]).format();
+
+    let ws = Workspace::new();
+    ws.write_file("pkg/src/a.txt", "one");
+
+    ws.write_build_file("pkg", &build(&content, &content2));
+    assert_eq!(run_fresh(&ws).await?, "one", "two content globs agree");
+
+    ws.write_build_file("pkg", &build(&content, &names));
+    let err = run_fresh(&ws)
+        .await
+        .expect_err("a names placeholder over a content file must collide");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("collision") && msg.contains("m=names"),
+        "the error names the collision and the names glob: {msg}"
+    );
+    Ok(())
+}
