@@ -155,12 +155,24 @@ struct GoGolistDef {
 /// A `go list` failure, with one more line when content-blind placeholders were
 /// staged: if `go list` ever needed the bytes of a non-Go file outside the
 /// header-read set, that is where it would fail, and the addr is what to report.
+///
+/// The line starts with `note: ` on a line of its own, so a script (or an
+/// agent) can find it without parsing the stderr above it.
 fn golist_failure(def: &GoGolistDef, stderr_tail: String) -> crate::plugingo::errors::GoListError {
     let stderr_tail = match &def.content_blind {
-        Some(addr) => format!(
-            "{stderr_tail}\nnote: non-Go files were staged content-blind (empty placeholders, from \
-             {addr}); if go list needed their bytes, report this addr as a heph bug"
-        ),
+        Some(addr) => {
+            let pkg = if def.import_path.is_empty() {
+                "this package"
+            } else {
+                def.import_path.as_str()
+            };
+            format!(
+                "{stderr_tail}\nnote: heph staged the non-Go files of {pkg} outside the C/asm \
+                 header set as empty placeholders ({addr}), so go list saw their names but not \
+                 their bytes. If this failure is about one of them, it is a heph bug: report it \
+                 with this message. There is no option to stage them with content."
+            )
+        }
         None => stderr_tail,
     };
     crate::plugingo::errors::GoListError {
@@ -1117,6 +1129,56 @@ mod tests {
         assert!(inputs.iter().any(|i| i.origin_id == "dep|srcfiles|0"));
     }
 
+    /// The non-Go lanes' flags, pinned: the header-read files are staged but
+    /// unhashed, the header target hashed but never staged, the names glob
+    /// hashed and staged. Neither header lane gets the source map (an embedded
+    /// header-read file must route to its own `fs:file` addr). And the names
+    /// glob's addr reaches the def, for the D9 hint.
+    #[tokio::test]
+    async fn test_parse_nongo_lane_flags_and_content_blind() {
+        use crate::plugingo::target_golist::{GROUP_HEADER_SRCS, GROUP_HEADERS, GROUP_NAMES};
+
+        let names = crate::plugingo::nongo_lanes::names_glob_addr("mylib").format();
+        let header_srcs = crate::plugingo::nongo_lanes::header_read_glob_addr("mylib").format();
+        let headers = crate::plugingo::nongo_lanes::headers_addr("mylib").format();
+        let ct = noop_ctoken();
+        let req = make_parse_request(
+            "mylib",
+            "example.com/mylib",
+            vec![
+                (GROUP_NAMES, vec![names.as_str()]),
+                (GROUP_HEADER_SRCS, vec![header_srcs.as_str()]),
+                (GROUP_HEADERS, vec![headers.as_str()]),
+                ("srcfiles", vec!["//mylib:_go_src"]),
+            ],
+        );
+        let resp = driver().parse(req, &ct).await.unwrap();
+        let flags = |group: &str| {
+            let input = resp
+                .target_def
+                .inputs
+                .iter()
+                .find(|i| i.origin_id == format!("dep|{group}|0"))
+                .unwrap_or_else(|| panic!("{group} input present"));
+            (input.hashed, input.runtime, input.annotations.clone())
+        };
+        let none = std::collections::BTreeMap::new();
+        assert_eq!(flags(GROUP_HEADER_SRCS), (false, true, none.clone()));
+        assert_eq!(flags(GROUP_HEADERS), (true, false, none.clone()));
+        let (hashed, runtime, annotations) = flags(GROUP_NAMES);
+        assert!(hashed && runtime, "the names glob is hashed and staged");
+        assert!(
+            annotations
+                .contains_key(hdriver_support::driver_managed::SOURCE_MAP_ANNOTATION),
+            "the names glob keeps the source map, like any source dep"
+        );
+        assert_eq!(
+            resp.target_def.def::<GoGolistDef>().content_blind.as_deref(),
+            Some(names.as_str()),
+            "the names glob's addr reaches the def"
+        );
+    }
+
     // Regression: dep groups came from a HashMap, so dep_inputs Vec order varied
     // across runs, making def.hash unstable and breaking the local cache for
     // go_golist targets. Order must now be sorted by group name.
@@ -1221,7 +1283,10 @@ mod tests {
         let hinted = golist_failure(&def, "boom".to_string()).to_string();
         assert!(hinted.contains("boom"), "{hinted}");
         let last = hinted.lines().last().unwrap_or_default();
-        assert!(last.contains("content-blind"), "{hinted}");
+        assert!(last.starts_with("note: "), "a stable prefix on its own line: {hinted}");
+        assert!(last.contains("example.com/mylib"), "names the package: {hinted}");
+        assert!(last.contains("empty placeholders"), "{hinted}");
+        assert!(last.contains("report it"), "says what to do: {hinted}");
         assert!(
             last.contains("//@heph/fs:glob@m=names,p=pkg/**/*"),
             "{hinted}"

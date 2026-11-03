@@ -190,13 +190,19 @@ fn scan(src: &mut impl BufRead, mut out: Vec<u8>, pending: Vec<u8>) -> std::io::
 /// its (empty) entry: adding or removing one must move the key.
 ///
 /// A file that cannot be read fails the whole target, naming it: silently
-/// leaving it out would hand `_golist` a key that misses it.
-pub fn build_headers_tar(ws_dir: &std::path::Path, rels: &[String]) -> anyhow::Result<Vec<u8>> {
+/// leaving it out would hand `_golist` a key that misses it. `cancel` is
+/// checked before each file, so a cancelled build stops between files.
+pub fn build_headers_tar(
+    ws_dir: &std::path::Path,
+    rels: &[String],
+    cancel: &dyn Cancellable,
+) -> anyhow::Result<Vec<u8>> {
     let mut sorted: Vec<&String> = rels.iter().collect();
     sorted.sort_unstable();
     sorted.dedup();
     let mut builder = tar::Builder::new(Vec::new());
     for rel in sorted {
+        anyhow::ensure!(!cancel.is_cancelled(), "go.headers: cancelled");
         let path = ws_dir.join(rel);
         let file = std::fs::File::open(&path)
             .with_context(|| format!("go.headers: open header-read file {rel}"))?;
@@ -218,6 +224,28 @@ pub fn build_headers_tar(ws_dir: &std::path::Path, rels: &[String]) -> anyhow::R
         .context("go.headers: finish the header tar")
 }
 
+/// The ws-relative paths listed in a staged input's list file.
+fn staged_rels(
+    list_path: &std::path::Path,
+    unpack_root: &std::path::Path,
+) -> anyhow::Result<Vec<String>> {
+    let listed = std::fs::read_to_string(list_path)
+        .with_context(|| format!("read staged file list {list_path:?}"))?;
+    listed
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|line| {
+            let rel = std::path::Path::new(line)
+                .strip_prefix(unpack_root)
+                .with_context(|| format!("staged file {line} is outside {unpack_root:?}"))?;
+            let rel = rel
+                .to_str()
+                .with_context(|| format!("staged path is not UTF-8: {}", rel.display()))?;
+            Ok(rel.to_string())
+        })
+        .collect()
+}
+
 /// Config of a `go.headers` target (provider-generated, see
 /// [`crate::plugingo::nongo_lanes::headers_spec`]).
 #[derive(Spec)]
@@ -234,9 +262,17 @@ struct GoHeadersDef {
 
 impl Hash for GoHeadersDef {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        GO_HEADERS_FORMAT_VERSION.hash(state);
         self.src.hash(state);
     }
+}
+
+/// The def hash of a header target: the extractor format `version` (always
+/// [`GO_HEADERS_FORMAT_VERSION`] outside tests), then the def.
+fn def_hash(addr: &hmodel::htaddr::Addr, def: &GoHeadersDef, version: u32) -> Vec<u8> {
+    let mut h = DebugHasher::new(Xxh3Default::new(), || format!("go_headers_{}", addr.format()));
+    version.hash(&mut h);
+    def.hash(&mut h);
+    format!("{:x}", h.finish()).into_bytes()
 }
 
 pub struct GoHeadersDriver;
@@ -271,13 +307,7 @@ impl ManagedDriver for GoHeadersDriver {
             runtime: true,
         };
         let def = GoHeadersDef { src: spec.src };
-        let hash = {
-            let mut h = DebugHasher::new(Xxh3Default::new(), || {
-                format!("go_headers_{}", req.target_spec.addr.format())
-            });
-            def.hash(&mut h);
-            format!("{:x}", h.finish()).into_bytes()
-        };
+        let hash = def_hash(&req.target_spec.addr, &def, GO_HEADERS_FORMAT_VERSION);
         let out_path = if pkg.as_str().is_empty() {
             crate::plugingo::nongo_lanes::HEADERS_OUT.to_string()
         } else {
@@ -322,37 +352,40 @@ impl ManagedDriver for GoHeadersDriver {
     async fn run<'a, 'io>(
         &self,
         req: ManagedRunRequest<'a, 'io>,
-        _ctoken: &(dyn Cancellable + Send + Sync),
+        ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ManagedRunResponse> {
-        // No header-read file at all stages nothing; the tar is then empty.
-        let mut rels: Vec<String> = Vec::new();
-        for input in req
+        // Every artifact of the glob is its own input, and all of them append
+        // to one shared list file — so the first input's list is the whole
+        // list (as `staged_path` reads it). No header-read file at all stages
+        // nothing; the tar is then empty.
+        let staged = req
             .inputs
             .iter()
-            .filter(|m| m.input.origin_id == SRC_ORIGIN)
-        {
-            let list_path = input.require_list_path()?;
-            let listed = std::fs::read_to_string(list_path)
-                .with_context(|| format!("read staged file list {list_path:?}"))?;
-            for line in listed.lines().filter(|l| !l.is_empty()) {
-                let rel = std::path::Path::new(line)
-                    .strip_prefix(&input.unpack_root)
-                    .with_context(|| {
-                        format!("staged file {line} is outside {:?}", input.unpack_root)
-                    })?;
-                let rel = rel
-                    .to_str()
-                    .with_context(|| format!("staged path is not UTF-8: {}", rel.display()))?;
-                rels.push(rel.to_string());
-            }
-        }
-        let tar = build_headers_tar(&req.sandbox_ws_dir, &rels)?;
-        std::fs::create_dir_all(&req.sandbox_pkg_dir)
-            .with_context(|| format!("create {:?}", req.sandbox_pkg_dir))?;
-        let out = req
-            .sandbox_pkg_dir
-            .join(crate::plugingo::nongo_lanes::HEADERS_OUT);
-        std::fs::write(&out, tar).with_context(|| format!("write {out:?}"))?;
+            .find(|m| m.input.origin_id == SRC_ORIGIN)
+            .map(|m| {
+                anyhow::Ok((
+                    m.require_list_path()?.to_path_buf(),
+                    m.unpack_root.clone(),
+                ))
+            })
+            .transpose()?;
+        let cancel = ctoken.clone_arc();
+        let ws_dir = req.sandbox_ws_dir.clone();
+        let pkg_dir = req.sandbox_pkg_dir.clone();
+        // The list read, every header read and the write are file IO: the
+        // bounded blocking pool, never a runtime worker.
+        hcore::blocking::run(move || {
+            let rels = match staged {
+                Some((list_path, unpack_root)) => staged_rels(&list_path, &unpack_root)?,
+                None => Vec::new(),
+            };
+            let tar = build_headers_tar(&ws_dir, &rels, &*cancel)?;
+            std::fs::create_dir_all(&pkg_dir).with_context(|| format!("create {pkg_dir:?}"))?;
+            let out = pkg_dir.join(crate::plugingo::nongo_lanes::HEADERS_OUT);
+            std::fs::write(&out, tar).with_context(|| format!("write {out:?}"))?;
+            anyhow::Ok(())
+        })
+        .await?;
         Ok(ManagedRunResponse { artifacts: vec![] })
     }
 }
@@ -365,6 +398,12 @@ mod tests {
 
     fn extract(input: &[u8]) -> Vec<u8> {
         extract_go_build_header(input).expect("in-memory read cannot fail")
+    }
+
+    /// [`super::build_headers_tar`] for a build that is never cancelled. Shadows
+    /// the glob import, so the tests below read as calls of the real thing.
+    fn build_headers_tar(ws_dir: &std::path::Path, rels: &[String]) -> anyhow::Result<Vec<u8>> {
+        super::build_headers_tar(ws_dir, rels, &hcore::hasync::StdCancellationToken::new())
     }
 
     /// T13: the extractor on the adversarial table. The expected value is what
@@ -443,6 +482,22 @@ mod tests {
                 String::from_utf8_lossy(input)
             );
         }
+
+        // What the extractor returns on this corpus, pinned next to the format
+        // version that keys every cached header tar. A change to the extractor
+        // that moves this digest must bump `GO_HEADERS_FORMAT_VERSION` (and
+        // update both here); otherwise the old-shape tars are still served.
+        let mut h = xxhash_rust::xxh3::Xxh3Default::new();
+        for (_, input, _) in cases {
+            let out = extract(input);
+            h.update(&(out.len() as u64).to_le_bytes());
+            h.update(&out);
+        }
+        assert_eq!(
+            (GO_HEADERS_FORMAT_VERSION, format!("{:016x}", h.digest())),
+            (1, "b7b582633246510f".to_string()),
+            "the extractor's output moved: bump GO_HEADERS_FORMAT_VERSION and re-pin"
+        );
     }
 
     /// The table again with a one-byte chunk, so every byte is a read boundary
@@ -670,5 +725,34 @@ mod tests {
             def.hash, other.target_def.hash,
             "the input glob keys the def"
         );
+
+        // The parsed def is keyed on the current format version, and a bump
+        // moves it.
+        let raw = GoHeadersDef {
+            src: crate::plugingo::nongo_lanes::header_read_glob_addr("pkg").format(),
+        };
+        assert_eq!(
+            def.hash,
+            def_hash(&def.addr, &raw, GO_HEADERS_FORMAT_VERSION),
+            "parse keys the def on GO_HEADERS_FORMAT_VERSION"
+        );
+        assert_ne!(
+            def.hash,
+            def_hash(&def.addr, &raw, GO_HEADERS_FORMAT_VERSION + 1),
+            "bumping the extractor format version moves the def hash"
+        );
+    }
+
+    /// The run's file IO stops at the next file once the build is cancelled.
+    #[test]
+    fn header_tar_stops_when_cancelled() {
+        let ws = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(ws.path().join("pkg")).expect("mkdir");
+        std::fs::write(ws.path().join("pkg/a.c"), b"int").expect("write");
+        let ct = hcore::hasync::StdCancellationToken::new();
+        ct.cancel();
+        let err = super::build_headers_tar(ws.path(), &["pkg/a.c".to_string()], &ct)
+            .expect_err("a cancelled build stops");
+        assert!(format!("{err:#}").contains("cancelled"), "{err:#}");
     }
 }
