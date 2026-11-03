@@ -124,6 +124,26 @@ pub fn glob_addr(pattern: &str, exclude: &[&str]) -> Addr {
     Addr::new(PkgBuf::from(PKG), "glob".to_string(), args)
 }
 
+/// Returns the `Addr` for a names-only glob fs target: the same walk as
+/// [`glob_addr`], but each entry is hashed by its relative path alone and staged
+/// as an empty placeholder, so editing a file's bytes moves no key. For
+/// consumers that read only the file *names* (`go list` resolving `//go:embed`).
+pub fn names_glob_addr(pattern: &str, exclude: &[&str]) -> Addr {
+    let mut args = BTreeMap::from([
+        ("p".to_string(), pattern.to_string()),
+        (GLOB_MODE_ARG.to_string(), GLOB_MODE_NAMES.to_string()),
+    ]);
+    if !exclude.is_empty() {
+        args.insert("e".to_string(), exclude.join(","));
+    }
+    Addr::new(PkgBuf::from(PKG), "glob".to_string(), args)
+}
+
+/// Glob addr arg selecting the hashing/staging mode; absent = content.
+const GLOB_MODE_ARG: &str = "m";
+/// [`GLOB_MODE_ARG`] value for a names-only glob.
+const GLOB_MODE_NAMES: &str = "names";
+
 /// Returns `true` if `addr` refers to a single-file fs target.
 pub fn is_file_addr(addr: &Addr) -> bool {
     addr.package.as_str() == PKG && addr.name == "file"
