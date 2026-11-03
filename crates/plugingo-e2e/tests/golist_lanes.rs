@@ -506,16 +506,20 @@ async fn t9b_editing_a_body_below_its_header_keeps_golist() -> anyhow::Result<()
     Ok(())
 }
 
-/// T9c: renaming `y.c` to `y_windows.c`, same bytes, takes it out of a
-/// non-windows listing. The header tar names each file, so the key moves.
+/// T9c: renaming `y.c` to `y_windows.c`, and then `x.s` to `x_windows.s`, same
+/// bytes, each takes the file out of a non-windows listing. The header tar
+/// names each file, so the key moves. The `.s` half reads `SFiles` from
+/// `_golist`'s own output.
 #[tokio::test]
 async fn t9c_renaming_into_another_goos_relists() -> anyhow::Result<()> {
     require_go!();
     let body = "int y(void) { return 1; }\n";
-    let dir = asm_pkg(&[("asm/y.c", body)])?;
+    let s = "TEXT ·f(SB),$0\n\tRET\n";
+    let dir = asm_pkg(&[("asm/y.c", body), ("asm/x.s", s)])?;
     let ws = make_workspace(dir)?;
-    golist(&ws, "asm").await?;
+    let (pkg, _) = golist(&ws, "asm").await?;
     assert_eq!(cgo_c_files(ws.dir.path(), "asm")?, vec!["y.c"]);
+    assert_eq!(pkg.s_files, vec!["x.s"]);
 
     rename(ws.dir.path(), "asm/y.c", "asm/y_windows.c")?;
     let ws = reopen(ws)?;
@@ -524,6 +528,16 @@ async fn t9c_renaming_into_another_goos_relists() -> anyhow::Result<()> {
     assert!(
         cgo_c_files(ws.dir.path(), "asm")?.is_empty(),
         "y_windows.c is not built on this host"
+    );
+
+    rename(ws.dir.path(), "asm/x.s", "asm/x_windows.s")?;
+    let ws = reopen(ws)?;
+    let (pkg, ev) = golist(&ws, "asm").await?;
+    ev.assert_executed("asm", "_golist", "a header-read .s file was renamed");
+    assert!(
+        pkg.s_files.is_empty(),
+        "x_windows.s is not built on this host: {:?}",
+        pkg.s_files
     );
     Ok(())
 }

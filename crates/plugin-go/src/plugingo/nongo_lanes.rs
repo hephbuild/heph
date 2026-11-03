@@ -338,6 +338,86 @@ mod tests {
         }
     }
 
+    /// Every regular file under `dir`, as a `/`-separated path relative to it,
+    /// spelled as the filesystem lists it (the fs driver matches listed names).
+    fn listed_files(dir: &std::path::Path) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for entry in std::fs::read_dir(&d).expect("read_dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                let rel = path.strip_prefix(dir).expect("under dir");
+                let rel: Vec<&str> = rel
+                    .components()
+                    .map(|c| c.as_os_str().to_str().expect("utf-8 name"))
+                    .collect();
+                out.push(rel.join("/"));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// T11b on a real directory: files created on disk — so a case-insensitive
+    /// or normalizing filesystem (APFS) spells the names it lists — each land in
+    /// exactly the lane `go/build` puts them in. Stems are distinct, since `a.S`
+    /// and `a.s` cannot coexist on a case-insensitive volume.
+    #[test]
+    fn lanes_partition_files_listed_from_disk() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pkg_dir = tmp.path().join("pkg");
+        let cases: &[(&str, NonGoLane)] = &[
+            ("a.S", NonGoLane::HeaderRead),
+            ("b.C", NonGoLane::Names),
+            ("\u{fc}.c", NonGoLane::HeaderRead),
+            ("d.c", NonGoLane::HeaderRead),
+            ("e.s", NonGoLane::HeaderRead),
+            ("_f.c", NonGoLane::Names),
+            (".g.s", NonGoLane::Names),
+            ("sub/h.c", NonGoLane::Names),
+            ("README.md", NonGoLane::Names),
+        ];
+        for (name, _) in cases {
+            let p = pkg_dir.join(name);
+            std::fs::create_dir_all(p.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&p, "// header\n").expect("write");
+        }
+        let listed = listed_files(tmp.path());
+        assert_eq!(
+            listed.len(),
+            cases.len(),
+            "every file is listed: {listed:?}"
+        );
+
+        let names = Lane::of(&names_glob_addr("pkg"));
+        let header = Lane::of(&header_read_glob_addr("pkg"));
+        for path in &listed {
+            let in_names = names.matches(path);
+            let in_header = header.matches(path);
+            assert!(
+                in_names != in_header,
+                "{path:?} must be in exactly one lane (names={in_names}, header={in_header})"
+            );
+            let got = if in_header {
+                NonGoLane::HeaderRead
+            } else {
+                NonGoLane::Names
+            };
+            let rel = path.strip_prefix("pkg/").expect("under pkg");
+            assert_eq!(got, classify_non_go(rel), "{path:?}: glob vs classifier");
+            // APFS and ext4 both preserve the spelling a name was created with.
+            let want = cases
+                .iter()
+                .find(|(name, _)| *name == rel)
+                .map(|(_, lane)| *lane);
+            assert_eq!(Some(got), want, "{path:?}");
+        }
+    }
+
     /// A nested package's header-read lane is its own directory only, and its
     /// names lane its own subtree only: a sibling package's files are on neither.
     #[test]
