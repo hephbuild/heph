@@ -30,33 +30,118 @@
 //! The header keeps a leading UTF-8 BOM (it was read), and is otherwise exactly
 //! `info.header`: when the reader stopped cleanly, the byte that told it to stop
 //! is not part of it.
+//!
+//! The same [`ImportReader`] serves the C/asm-family files, whose view is what
+//! `readComments` reads ([`extract_go_build_header`]): one port of Go's
+//! `importReader`, not two.
+//!
+//! # Scope of the trust rule
+//!
+//! `_golist` keys a `.go` file on this view, not on its bytes, on the rule that
+//! `go list`, as `driver_golist` invokes it, learns nothing else of the file.
+//! That rule is a property of the Go toolchain's source, so it holds for the
+//! versions it was checked against: Go
+//! [`crate::plugingo::nongo_lanes::GO_HEADER_RULES_VERIFIED_AGAINST`]. It is
+//! applied to every Go version (no version gate); on each Go bump, re-check
+//! `go/build/read.go` (`readGoInfo`, `readComments`) and `cmd/go`'s module index
+//! (`internal/modindex`, which caches the same reads) before moving that
+//! constant. A field or flag added to `go list`'s invocation
+//! (`driver_golist::GOLIST_JSON_FIELDS`) can break it too.
 
 use std::io::{BufRead, Read};
 
 /// How much of a file is read per `read` call. Without an `"embed"` import the
 /// extractor stops at the end of the imports, so it reads at most the header
 /// plus one chunk of any file.
-const READ_CHUNK: usize = 4096;
+pub(crate) const READ_CHUNK: usize = 4096;
+
+/// The UTF-8 byte-order mark `go/build` skips at the start of a file.
+const BOM: [u8; 3] = [0xef, 0xbb, 0xbf];
 
 /// See the module docs.
 pub fn extract_go_view(r: impl Read) -> std::io::Result<Vec<u8>> {
     extract_with_chunk(r, READ_CHUNK)
 }
 
+/// The prefix of a C/asm-family file that `go/build` reads: the bytes
+/// `readComments` (`$GOROOT/src/go/build/read.go`) consumes, verbatim — a
+/// leading UTF-8 BOM, then whitespace, `;`, `//` and `/* */` comments, up to and
+/// including the first byte that ends them (the first code byte, the byte after
+/// a stray `/`, a NUL and the byte after it). Everything `go/build` concludes
+/// about the file (its build constraints, and whether reading it failed) is a
+/// function of these bytes, so hashing them is hashing what `go list` saw.
+///
+/// Streams: reads at most the returned length plus one [`READ_CHUNK`], however
+/// large the file. An I/O error is returned, not folded into the prefix.
+pub fn extract_go_build_header(r: impl Read) -> std::io::Result<Vec<u8>> {
+    extract_comments_with_chunk(r, READ_CHUNK)
+}
+
+/// [`extract_go_build_header`] with a given read size: `readComments` is
+/// `peekByte(true)` once, keeping every byte it read.
+pub(crate) fn extract_comments_with_chunk(r: impl Read, chunk: usize) -> std::io::Result<Vec<u8>> {
+    let mut src = std::io::BufReader::with_capacity(chunk, r);
+    let (bom, pending) = take_bom(&mut src)?;
+    let mut rd = ImportReader::new(&mut src, pending);
+    rd.peek_byte(true)?;
+    let mut out = Vec::with_capacity(BOM.len() + rd.buf.len());
+    if bom {
+        out.extend_from_slice(&BOM);
+    }
+    out.append(&mut rd.buf);
+    Ok(out)
+}
+
+/// `newImportReader`'s BOM step: a leading UTF-8 BOM is discarded before
+/// scanning (it is still part of what was read, so callers keep it in their
+/// output). Returns whether there was one, and the bytes read ahead that turned
+/// out not to be one — the start of the scan.
+fn take_bom(src: &mut impl BufRead) -> std::io::Result<(bool, Vec<u8>)> {
+    let lead = src.fill_buf()?;
+    if lead.starts_with(&BOM) {
+        src.consume(BOM.len());
+        return Ok((true, Vec::new()));
+    }
+    if lead.len() < BOM.len() && BOM.starts_with(lead) && !lead.is_empty() {
+        // A short read that could still be a BOM: settle it byte by byte.
+        let mut peeked = Vec::with_capacity(BOM.len());
+        while peeked.len() < BOM.len() {
+            let Some(b) = next_src_byte(src)? else { break };
+            peeked.push(b);
+            if !BOM.starts_with(&peeked) {
+                break;
+            }
+        }
+        if peeked == BOM {
+            return Ok((true, Vec::new()));
+        }
+        return Ok((false, peeked));
+    }
+    Ok((false, Vec::new()))
+}
+
+/// One byte from `src`, `None` at EOF.
+fn next_src_byte(src: &mut impl BufRead) -> std::io::Result<Option<u8>> {
+    let buf = loop {
+        match src.fill_buf() {
+            Ok(b) => break b,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    };
+    let Some(&b) = buf.first() else {
+        return Ok(None);
+    };
+    src.consume(1);
+    Ok(Some(b))
+}
+
 fn extract_with_chunk(r: impl Read, chunk: usize) -> std::io::Result<Vec<u8>> {
     let mut src = std::io::BufReader::with_capacity(chunk, r);
-    let (bom, pending) = crate::plugingo::driver_headers::take_bom(&mut src)?;
-    let mut rd = ImportReader {
-        src: &mut src,
-        pending: pending.into_iter(),
-        buf: Vec::new(),
-        peek: 0,
-        err: Stop::None,
-        eof: false,
-        has_embed: false,
-    };
+    let (bom, pending) = take_bom(&mut src)?;
+    let mut rd = ImportReader::new(&mut src, pending);
     rd.read_go_info()?;
-    let bom: &[u8] = if bom { &[0xef, 0xbb, 0xbf] } else { &[] };
+    let bom: &[u8] = if bom { &BOM } else { &[] };
 
     let mut out = Vec::new();
     match rd.err {
@@ -135,7 +220,19 @@ fn is_ident(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80
 }
 
-impl<R: BufRead> ImportReader<'_, R> {
+impl<'a, R: BufRead> ImportReader<'a, R> {
+    fn new(src: &'a mut R, pending: Vec<u8>) -> Self {
+        Self {
+            src,
+            pending: pending.into_iter(),
+            buf: Vec::new(),
+            peek: 0,
+            err: Stop::None,
+            eof: false,
+            has_embed: false,
+        }
+    }
+
     fn syntax_error(&mut self) {
         if self.err == Stop::None {
             self.err = Stop::Syntax;
@@ -146,7 +243,7 @@ impl<R: BufRead> ImportReader<'_, R> {
     fn read_byte(&mut self) -> std::io::Result<u8> {
         let next = match self.pending.next() {
             Some(b) => Some(b),
-            None => crate::plugingo::driver_headers::next_byte(self.src)?,
+            None => next_src_byte(self.src)?,
         };
         match next {
             Some(c) => {
@@ -360,6 +457,9 @@ struct ViewComment<'a> {
 fn view_comments(src: &[u8]) -> Vec<ViewComment<'_>> {
     let mut out = Vec::new();
     // `Scanner.next`: a UTF-16 BOM at the start consumes the whole input.
+    // Unreachable from `extract_with_chunk` (comments are scanned only after a
+    // clean header, which starts with `package`); kept so this stays a faithful
+    // port should another caller appear.
     if matches!(src, [0xff, 0xfe, ..] | [0xfe, 0xff, ..]) {
         return out;
     }
@@ -425,9 +525,16 @@ fn view_comments(src: &[u8]) -> Vec<ViewComment<'_>> {
 /// (`scanComment` strips them before `readGoInfo` tests the prefix), or a
 /// possible `//line` / `/*line` directive (tested on the bytes either way).
 fn is_view_comment(text: &[u8]) -> bool {
-    let stripped: Vec<u8> = text.iter().copied().filter(|&b| b != b'\r').collect();
-    let line_dir = |t: &[u8]| t.get(2..).is_some_and(|r| r.starts_with(b"line "));
-    stripped.starts_with(b"//go:embed") || line_dir(text) || line_dir(&stripped)
+    starts_with_without_cr(text, 0, b"//go:embed")
+        || text.get(2..).is_some_and(|r| r.starts_with(b"line "))
+        || starts_with_without_cr(text, 2, b"line ")
+}
+
+/// Whether `text` with its `\r`s removed, then its first `skip` bytes, starts
+/// with `prefix` — without building the stripped copy.
+fn starts_with_without_cr(text: &[u8], skip: usize, prefix: &[u8]) -> bool {
+    let mut rest = text.iter().copied().filter(|&b| b != b'\r').skip(skip);
+    prefix.iter().all(|&p| rest.next() == Some(p))
 }
 
 /// `scanString` / `scanRune` from just after the opening `quote`: the index

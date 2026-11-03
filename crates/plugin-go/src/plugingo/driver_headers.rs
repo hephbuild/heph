@@ -30,7 +30,6 @@ use hplugin::driver::{
 };
 use hplugin::htspec::Spec;
 use std::hash::{Hash, Hasher};
-use std::io::{BufRead, Read};
 use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3Default;
 
@@ -39,10 +38,6 @@ use xxhash_rust::xxh3::Xxh3Default;
 /// v2: `.go` files joined the tar, as their go/build view.
 pub const GO_HEADERS_FORMAT_VERSION: u32 = 2;
 
-/// How much of a file is read per `read` call. The extractor stops at the end of
-/// the prefix, so it reads at most the prefix plus one chunk of any file.
-const READ_CHUNK: usize = 4096;
-
 /// Origin id of the header-read glob input.
 const SRC_ORIGIN: &str = "dep|src|0";
 /// Origin id of the `.go` glob input.
@@ -50,157 +45,7 @@ const GO_SRC_ORIGIN: &str = "dep|gosrc|0";
 /// Origin id prefix of the codegen inputs, one per `go_gen` addr.
 const GEN_ORIGIN_PREFIX: &str = "dep|gogen|";
 
-/// The UTF-8 byte-order mark `go/build` skips at the start of a file.
-const BOM: [u8; 3] = [0xef, 0xbb, 0xbf];
-
-/// The prefix of a C/asm-family file that `go/build` reads: the bytes
-/// `readComments` (`$GOROOT/src/go/build/read.go`) consumes, verbatim — a
-/// leading UTF-8 BOM, then whitespace, `;`, `//` and `/* */` comments, up to and
-/// including the first byte that ends them (the first code byte, the byte after
-/// a stray `/`, a NUL and the byte after it). Everything `go/build` concludes
-/// about the file (its build constraints, and whether reading it failed) is a
-/// function of these bytes, so hashing them is hashing what `go list` saw.
-///
-/// Streams: reads at most the returned length plus one [`READ_CHUNK`], however
-/// large the file. An I/O error is returned, not folded into the prefix.
-pub fn extract_go_build_header(r: impl Read) -> std::io::Result<Vec<u8>> {
-    extract_with_chunk(r, READ_CHUNK)
-}
-
-fn extract_with_chunk(r: impl Read, chunk: usize) -> std::io::Result<Vec<u8>> {
-    let mut src = std::io::BufReader::with_capacity(chunk, r);
-    let mut out = Vec::new();
-    let (bom, pending) = take_bom(&mut src)?;
-    if bom {
-        out.extend_from_slice(&BOM);
-    }
-    scan(&mut src, out, pending)
-}
-
-/// `newImportReader`'s BOM step: a leading UTF-8 BOM is discarded before
-/// scanning (it is still part of what was read, so callers keep it in their
-/// output). Returns whether there was one, and the bytes read ahead that turned
-/// out not to be one — the start of the scan.
-pub(crate) fn take_bom(src: &mut impl BufRead) -> std::io::Result<(bool, Vec<u8>)> {
-    let lead = src.fill_buf()?;
-    if lead.starts_with(&BOM) {
-        src.consume(BOM.len());
-        return Ok((true, Vec::new()));
-    }
-    if lead.len() < BOM.len() && BOM.starts_with(lead) && !lead.is_empty() {
-        // A short read that could still be a BOM: settle it byte by byte.
-        let mut peeked = Vec::with_capacity(BOM.len());
-        while peeked.len() < BOM.len() {
-            let Some(b) = next_byte(src)? else { break };
-            peeked.push(b);
-            if !BOM.starts_with(&peeked) {
-                break;
-            }
-        }
-        if peeked == BOM {
-            return Ok((true, Vec::new()));
-        }
-        return Ok((false, peeked));
-    }
-    Ok((false, Vec::new()))
-}
-
-/// One byte from `src`, `None` at EOF.
-pub(crate) fn next_byte(src: &mut impl BufRead) -> std::io::Result<Option<u8>> {
-    let buf = loop {
-        match src.fill_buf() {
-            Ok(b) => break b,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
-        }
-    };
-    let Some(&b) = buf.first() else {
-        return Ok(None);
-    };
-    src.consume(1);
-    Ok(Some(b))
-}
-
-/// `importReader` reduced to what `readComments` uses. `err` folds Go's
-/// `errSyntax` and `errNUL`: both stop the scan, and which one it was is
-/// recoverable from the bytes.
-struct Scanner<'a, R> {
-    src: &'a mut R,
-    /// Bytes read ahead of `src` (a would-be BOM that was not one).
-    pending: std::vec::IntoIter<u8>,
-    buf: Vec<u8>,
-    err: bool,
-    eof: bool,
-}
-
-impl<R: BufRead> Scanner<'_, R> {
-    /// `importReader.readByte`: read one byte, record it, flag NUL and EOF.
-    /// Reads even after `err` is set, exactly as Go's does.
-    fn read_byte(&mut self) -> std::io::Result<u8> {
-        let next = match self.pending.next() {
-            Some(b) => Some(b),
-            None => next_byte(self.src)?,
-        };
-        match next {
-            Some(c) => {
-                self.buf.push(c);
-                if c == 0 {
-                    self.err = true;
-                }
-                Ok(c)
-            }
-            None => {
-                self.eof = true;
-                Ok(0)
-            }
-        }
-    }
-}
-
-/// `readComments`: `peekByte(true)` once, keeping every byte it read.
-fn scan(src: &mut impl BufRead, mut out: Vec<u8>, pending: Vec<u8>) -> std::io::Result<Vec<u8>> {
-    let mut r = Scanner {
-        src,
-        pending: pending.into_iter(),
-        buf: Vec::new(),
-        err: false,
-        eof: false,
-    };
-    let mut c = r.read_byte()?;
-    while !r.err && !r.eof {
-        match c {
-            b' ' | b'\x0c' | b'\t' | b'\r' | b'\n' | b';' => {
-                c = r.read_byte()?;
-                continue;
-            }
-            b'/' => {
-                c = r.read_byte()?;
-                if c == b'/' {
-                    while c != b'\n' && !r.err && !r.eof {
-                        c = r.read_byte()?;
-                    }
-                } else if c == b'*' {
-                    let mut c1 = 0u8;
-                    while (c != b'*' || c1 != b'/') && !r.err {
-                        if r.eof {
-                            r.err = true;
-                        }
-                        c = c1;
-                        c1 = r.read_byte()?;
-                    }
-                } else {
-                    r.err = true;
-                }
-                c = r.read_byte()?;
-                continue;
-            }
-            _ => {}
-        }
-        break;
-    }
-    out.append(&mut r.buf);
-    Ok(out)
-}
+pub use crate::plugingo::go_view::extract_go_build_header;
 
 /// Which lane staged a file of the header tar.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -531,8 +376,10 @@ impl ManagedDriver for GoHeadersDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugingo::go_view::{READ_CHUNK, extract_comments_with_chunk as extract_with_chunk};
     use hcore::htvalue::Value;
     use std::collections::HashMap;
+    use std::io::Read;
 
     fn extract(input: &[u8]) -> Vec<u8> {
         extract_go_build_header(input).expect("in-memory read cannot fail")
