@@ -719,7 +719,7 @@ where
 /// registered (`enable`) *before* the `done`/`poison` check, so a publish
 /// landing between the check and the await is observed — `notify_waiters`
 /// stores nothing for late registrants, making this ordering load-bearing
-/// (same discipline as the engine's `WorkerPool` acquire loop).
+/// (same discipline as the engine's former `WorkerPool` acquire loop).
 #[expect(
     clippy::panic,
     reason = "a poisoned cell has no value and never will; the panic is typed \
@@ -1284,7 +1284,7 @@ mod tests {
     /// inside one poll, and a black-box test cannot force a publish into it
     /// (mutation-tested: the inverted ordering still passes here). That
     /// ordering is proven by review against the documented discipline (see
-    /// `wait_done`'s comment and the `WorkerPool::acquire` pattern it copies);
+    /// `wait_done`'s comment and the former `WorkerPool::acquire` pattern it copied);
     /// what this test freezes is the end-to-end join/publish path staying
     /// live under churn.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

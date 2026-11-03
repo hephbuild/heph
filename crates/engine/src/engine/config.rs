@@ -6,6 +6,7 @@
 //! [`ConfigYaml::resolve`]. Everything downstream of [`resolve`](ConfigYaml::resolve)
 //! sees a fully-populated [`Config`] and never has to reason about defaults.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -127,6 +128,12 @@ pub struct Config {
     ///
     /// [`ListedFactsTrust`]: crate::engine::listed::ListedFactsTrust
     pub listed_facts_trust: crate::engine::listed::ListedFactsTrust,
+    /// Resource-pool capacities as written: the config file's `resources:`,
+    /// with the run's overrides (`--resource`, `-j`, `HEPH_RESOURCE_<NAME>`)
+    /// laid over it by the front end. A pool absent here takes the engine's
+    /// default (`cpu` the parallelism, `memory` the host's, a custom pool none);
+    /// a percentage is of that default. Resolved in `Engine::new`.
+    pub resources: BTreeMap<hplugin::provider::PoolName, hcore::capacity::Capacity>,
 }
 
 /// Resolved scratch-lineage policy. The config's `${git:branch}` is already
@@ -178,6 +185,7 @@ impl Config {
             remote_caches: Vec::new(),
             scratch: ScratchOptions::default(),
             listed_facts_trust: Default::default(),
+            resources: BTreeMap::new(),
         }
     }
 
@@ -309,6 +317,16 @@ impl ConfigYamlExt for ConfigYaml {
                     region: c.region,
                 })
                 .collect(),
+            resources: self
+                .resources
+                .0
+                .iter()
+                .map(|(name, cap)| {
+                    let pool = hplugin::provider::PoolName::try_from(name.as_str())
+                        .with_context(|| format!("resources.{name} in the config file"))?;
+                    Ok((pool, *cap))
+                })
+                .collect::<anyhow::Result<_>>()?,
         })
     }
 }

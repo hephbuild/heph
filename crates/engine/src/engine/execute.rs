@@ -121,22 +121,12 @@ impl Engine {
             )
             .await?;
 
-        // Acquire semaphore AFTER dep resolution so no permit is held while waiting for
-        // deps — prevents the classic diamond deadlock where mid-nodes hold permits while
-        // waiting for a leaf that also needs a permit.
+        // Admission AFTER dep resolution so nothing is reserved while waiting for
+        // deps — prevents the classic diamond deadlock where mid-nodes hold
+        // capacity while waiting for a leaf that also needs some.
         hcore::hmemoizer::set_phase("execute:semaphore_acquire");
-        let pool = Arc::clone(&self.result_permits);
-        // Observed *before* the acquire, so the stamp times the wait rather than
-        // its end. This queue is invisible everywhere else: the permit is taken
-        // after dep resolution but before `ExecuteStart`, so a target parked here
-        // has no open `execute` span and shows only as an open `result`.
-        let d = crate::engine::diag::global();
-        d.limiter("workers").observe(pool.available(), d.now_ms());
-        // Fair queue — see `worker_pool`'s module docs for the contract: a
-        // waiter dropped mid-wait leaves the queue, and a permit assigned to
-        // a since-aborted waiter returns on its `Acquire` drop.
-        let _permit = pool.acquire().await.context("worker pool closed")?;
-        // Counted once the permit is actually in hand.
+        let _reservation = self.admit(addr, &def.target.resources).await?;
+        // Counted once the reservation is actually in hand.
         let _running = crate::engine::diag::RunningPermit::new();
 
         let addr_str = addr.format();
@@ -416,6 +406,57 @@ impl Engine {
 
         let results = crate::engine::fanout::join_all_failable(futs, fail_fast).await?;
         Ok(results.into_iter().flatten().collect())
+    }
+
+    /// Reserve what `addr` declares (`resources`; an undeclared `cpu` is one
+    /// CPU, an all-zero request one light-lane slot) from the engine's pools,
+    /// parking in FIFO order until it fits. A pool whose capacity is 0 fails
+    /// the target here, before it runs, naming the override that would set it.
+    ///
+    /// The reservation is held until the run ends and returns itself on drop;
+    /// dropping this future mid-wait leaves the queue (`resource_pool`'s module
+    /// docs give the contract).
+    ///
+    /// Seam for the admission-wait events (`AdmissionWaitStart/End`): between
+    /// `acquire` and its `await`, `acquire.wait_info()` is what the target
+    /// waits for (`None` when it was granted on arrival); a notice past
+    /// `RESULT_LOCK_NOTICE` wraps that await the way `acquire_with_notice`
+    /// wraps a lock.
+    pub(crate) async fn admit(
+        &self,
+        addr: &Addr,
+        resources: &hplugin::driver::Resources,
+    ) -> anyhow::Result<crate::engine::resource_pool::Reservation> {
+        let pool = self.pools.get();
+        // Observed *before* the acquire, so the stamp times the wait rather than
+        // its end. This queue is invisible everywhere else: admission happens
+        // after dep resolution but before `ExecuteStart`, so a target parked
+        // here has no open `execute` span and shows only as an open `result`.
+        let d = crate::engine::diag::global();
+        d.limiter("workers").observe(
+            crate::engine::engine::cpu_free_cpus(&self.pools),
+            d.now_ms(),
+        );
+        let acquire = pool
+            .acquire(resources)
+            .map_err(|err| anyhow::anyhow!("{addr} {err}"))?;
+        let reservation = acquire.await.with_context(|| format!("admitting {addr}"))?;
+        tracing::debug!(
+            addr = %addr,
+            light = reservation.is_light(),
+            granted = ?reservation.iter().collect::<Vec<_>>(),
+            "admitted"
+        );
+        // Once per addr per request: `execute` is memoised per addr.
+        if reservation.clamped() {
+            tracing::info!(
+                addr = %addr,
+                declared = ?resources,
+                granted = ?reservation.iter().collect::<Vec<_>>(),
+                "reservation clamped to the pool's capacity; the target runs alone in it"
+            );
+        }
+        Ok(reservation)
     }
 }
 

@@ -619,7 +619,7 @@ impl Engine {
             ..GcStats::default()
         };
 
-        let limit = self.max_workers.max(1);
+        let limit = self.fan_out.max(1);
         let mut set: JoinSet<(Addr, Result<TargetOutcome>)> = JoinSet::new();
         for (addr, decision) in decisions {
             let (Decision::Orphan | Decision::Trim(_)) = decision else {
@@ -699,7 +699,7 @@ impl Engine {
             }
         };
 
-        let limit = self.max_workers.max(1);
+        let limit = self.fan_out.max(1);
         let mut set: JoinSet<(Addr, Decision)> = JoinSet::new();
         let mut decisions: Vec<(Addr, Decision)> = Vec::new();
 
@@ -816,7 +816,7 @@ impl Engine {
 
         // Everything below deletes, and `LocalCache::delete` parks the calling
         // thread until the sqlite writer thread commits its batch. `gc_apply` is a
-        // plain `tokio::spawn`ed task and phase 2 runs `max_workers` of them at
+        // plain `tokio::spawn`ed task and phase 2 runs `fan_out` of them at
         // once, so parking here parks that many runtime workers on a batch commit —
         // taking the reactor, the timer wheel and the TUI with them. Onto the
         // blocking pool, where parking a thread is the contract. The write guard

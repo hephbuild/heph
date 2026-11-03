@@ -183,6 +183,105 @@ impl ResourcePool {
     }
 }
 
+/// Every pool's capacity, from what the config and the run wrote (`specs`)
+/// over the engine's defaults: `cpu` is `parallelism` CPUs, `memory` the
+/// host's ([`hcore::sysres::host_memory_bytes`], read through `host_memory`
+/// only when the memory capacity needs it), a custom pool only what was
+/// written. A percentage is of the default; a custom pool has none, which the
+/// parser already refused.
+pub fn resolve_capacities(
+    specs: &BTreeMap<PoolName, hcore::capacity::Capacity>,
+    parallelism: usize,
+    host_memory: impl FnOnce() -> u64,
+) -> Vec<(PoolName, u64)> {
+    let cpu_default = u64::try_from(parallelism)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(Resources::MICROS_PER_CPU);
+    let cpu = specs
+        .get(PoolName::CPU)
+        .map_or(cpu_default, |c| c.resolve(PoolName::CPU, || cpu_default));
+    let memory = match specs.get(PoolName::MEMORY) {
+        Some(c) => c.resolve(PoolName::MEMORY, host_memory),
+        None => host_memory(),
+    };
+    let custom = specs
+        .iter()
+        .filter(|(p, _)| p.as_str() != PoolName::CPU && p.as_str() != PoolName::MEMORY)
+        .map(|(p, c)| (p.clone(), c.resolve(p.as_str(), || 0)));
+    [(PoolName::cpu(), cpu), (PoolName::memory(), memory)]
+        .into_iter()
+        .chain(custom)
+        .collect()
+}
+
+/// The engine's [`ResourcePool`], built on first use.
+///
+/// The pool needs every capacity at construction, and the `memory` default is
+/// a host read (cgroup files on Linux, a sysctl on macOS) that a `heph query`
+/// should never pay for. So everything that needs no host read — the `cpu`
+/// capacity, the set of pool names — is resolved at `Engine::new`, and the pool
+/// itself on the first admission.
+#[derive(Debug)]
+pub struct EnginePools {
+    specs: BTreeMap<PoolName, hcore::capacity::Capacity>,
+    parallelism: usize,
+    cpu: u64,
+    pool: std::sync::OnceLock<Arc<ResourcePool>>,
+}
+
+impl EnginePools {
+    pub fn new(specs: BTreeMap<PoolName, hcore::capacity::Capacity>, parallelism: usize) -> Self {
+        let cpu = resolve_capacities(&specs, parallelism, || 0)
+            .first()
+            .map_or(0, |&(_, c)| c);
+        Self {
+            specs,
+            parallelism,
+            cpu,
+            pool: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// The `cpu` capacity, in micro-CPUs.
+    pub fn cpu_capacity(&self) -> u64 {
+        self.cpu
+    }
+
+    /// Whether `name` is a pool: `cpu`, `memory`, or one the config or the run
+    /// named (even at capacity 0).
+    pub fn is_pool(&self, name: &str) -> bool {
+        name == PoolName::CPU || name == PoolName::MEMORY || self.specs.contains_key(name)
+    }
+
+    /// Every pool name, in name order.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        let builtin = [PoolName::CPU, PoolName::MEMORY]
+            .into_iter()
+            .filter(|n| !self.specs.contains_key(*n));
+        let mut all: Vec<&str> = builtin
+            .chain(self.specs.keys().map(PoolName::as_str))
+            .collect();
+        all.sort_unstable();
+        all.into_iter()
+    }
+
+    /// The pool, built (and the host memory read) on the first call.
+    pub fn get(&self) -> &Arc<ResourcePool> {
+        self.pool.get_or_init(|| {
+            ResourcePool::new(resolve_capacities(
+                &self.specs,
+                self.parallelism,
+                hcore::sysres::host_memory_bytes,
+            ))
+        })
+    }
+
+    /// The pool if an admission has built it.
+    pub fn built(&self) -> Option<&Arc<ResourcePool>> {
+        self.pool.get()
+    }
+}
+
 /// One FIFO over a fixed set of pools. The main lane holds every named pool;
 /// the light lane holds one.
 #[derive(Debug)]
