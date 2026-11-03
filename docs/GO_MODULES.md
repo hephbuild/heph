@@ -127,11 +127,23 @@ Non-Go files reach `_golist` in one of two lanes:
 - **Everything else** in the package's subtree is staged as an empty placeholder
   and keyed on its path alone.
 
-Two cases keep hashing content:
+**Generated files** (the outputs of a `go_src`-labelled target, or of a target
+named in `go_codegen_deps`) are staged whole and keyed through the same header
+target, by the target that produced them and:
 
-- **A vendored module** (one with `vendor/modules.txt`) keeps every file, `.go`
-  included, content-hashed, because `go list` reads `vendor/modules.txt`.
-- **The codegen lanes** (files produced by another target) stay content-hashed.
+- for a generated `.go` file, its go/build view, as for a checked-in one. A
+  generator whose output changes only below the imports re-runs itself and the
+  compile, not `_golist`; one that changes an import, a constraint or an embed
+  pattern, or writes a new file, re-runs `_golist`.
+- for any other generated file, its whole content. Changing a generated asset
+  re-runs `_golist`.
+
+A path that both a checked-in file and a generator produce, or that two
+generators produce, fails the header target instead of keying only one of them.
+
+**A vendored module** (one with `vendor/modules.txt`) keeps every file, `.go`
+and generated files included, content-hashed, because `go list` reads
+`vendor/modules.txt`.
 
 The names lane is an fs glob with `m=names`. You can name one in a BUILD file by
 its raw addr, but it's only valid for a consumer that reads nothing but names: the
