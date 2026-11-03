@@ -2145,6 +2145,23 @@ impl Driver {
             }
         }
 
+        // The allotment (`HEPH_CPUS`, `HEPH_MEMORY_BYTES` when memory was
+        // declared): a host-provided runtime value like `WORKSPACE_ROOT` and the
+        // scratch dirs, never hashed (U5) — a target's outputs must not depend
+        // on it. After the passthroughs, so a nested heph run under
+        // `pass_env`/`runtime_pass_env = ["*"]` sees its own allotment rather
+        // than its parent's; but the target's own `env` and `runtime_env` win,
+        // as an author who sets the name means it. `env` was inserted above,
+        // before the passthroughs, so it is skipped by name here rather than
+        // moved, which would change what a passthrough overrides today.
+        if let Some(a) = &rreq.allotment {
+            for (k, v) in a.env() {
+                if !def.env.contains_key(k) && !def.runtime_env.contains_key(k) {
+                    env.insert(k.to_string(), v);
+                }
+            }
+        }
+
         for (k, v) in &def.runtime_env {
             env.insert(k.clone(), rreq.resolve(v)?.to_string());
         }
@@ -4207,6 +4224,98 @@ mod tests {
         )
         .await?;
         assert_eq!(out, "absent");
+        Ok(())
+    }
+
+    /// Run `def`'s command under `allotment`; its trimmed stdout.
+    async fn run_allotted(
+        def: TargetDef,
+        allotment: Option<hplugin::driver::Allotment>,
+    ) -> anyhow::Result<String> {
+        let driver = Driver::new_bash().with_host_path();
+        let target_def = EngineTargetDef {
+            raw_def: Arc::new(def),
+            cache: CacheConfig::on(true),
+            pty: true,
+            ..Default::default()
+        };
+        let mut stdout = Vec::new();
+        let request_id = "test".to_string();
+        let tmp = tempfile::tempdir()?;
+        let mut req = RunRequest::new(&request_id, &target_def, tmp.path());
+        req.stdout = Some(&mut stdout);
+        req.allotment = allotment;
+        driver
+            .run(make_req(req), &StdCancellationToken::new())
+            .await?;
+        Ok(String::from_utf8(stdout)?.trim().to_string())
+    }
+
+    fn allot(cpu: u32, memory_bytes: Option<u64>) -> Option<hplugin::driver::Allotment> {
+        Some(hplugin::driver::Allotment {
+            cpu: std::num::NonZeroU32::new(cpu)?,
+            memory_bytes,
+        })
+    }
+
+    /// A nested heph: the parent's `HEPH_CPUS` is in the host env, and a
+    /// wildcard passthrough (hashed or not) must not hand it to the child over
+    /// the child's own allotment.
+    #[tokio::test]
+    async fn wildcard_pass_env_does_not_override_the_allotment() -> anyhow::Result<()> {
+        unsafe {
+            std::env::set_var("HEPH_CPUS", "99");
+        }
+        let show = "echo cpus=$HEPH_CPUS";
+        let runtime = TargetDef {
+            run: vec![D::new(show)],
+            runtime_pass_env: vec!["*".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(run_allotted(runtime, allot(2, None)).await?, "cpus=2");
+        // `pass_env = ["*"]` is resolved at parse into the hashed map.
+        let hashed = TargetDef {
+            run: vec![D::new(show)],
+            pass_env: std::env::vars().collect(),
+            ..Default::default()
+        };
+        assert_eq!(run_allotted(hashed, allot(2, None)).await?, "cpus=2");
+        Ok(())
+    }
+
+    /// The order the env is layered in: allotment over passthroughs, the
+    /// target's own `env`/`runtime_env` over the allotment; memory only when
+    /// granted; no allotment, nothing set.
+    #[tokio::test]
+    async fn allotment_env_layering() -> anyhow::Result<()> {
+        let show = "echo \"${HEPH_CPUS-}|${HEPH_MEMORY_BYTES-unset}\"";
+        let def = |env: &[(&str, &str)], rt: &[(&str, &str)]| TargetDef {
+            run: vec![D::new(show)],
+            env: env
+                .iter()
+                .map(|(k, v)| (k.to_string(), D::new(*v)))
+                .collect(),
+            runtime_env: rt
+                .iter()
+                .map(|(k, v)| (k.to_string(), D::new(*v)))
+                .collect(),
+            ..Default::default()
+        };
+        assert_eq!(
+            run_allotted(def(&[], &[]), allot(3, Some(64))).await?,
+            "3|64"
+        );
+        assert_eq!(
+            run_allotted(def(&[], &[]), allot(3, None)).await?,
+            "3|unset"
+        );
+        let user_wins = def(&[("HEPH_CPUS", "7")], &[("HEPH_MEMORY_BYTES", "8")]);
+        assert_eq!(run_allotted(user_wins, allot(3, Some(64))).await?, "7|8");
+        assert_eq!(
+            run_allotted(def(&[], &[]), None).await?,
+            "|unset",
+            "told nothing, nothing set"
+        );
         Ok(())
     }
 

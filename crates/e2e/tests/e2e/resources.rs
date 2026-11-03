@@ -86,14 +86,15 @@ fn write_build(root: &Path, pkg: &str, content: &str) {
     std::fs::write(dir.join("BUILD"), content).expect("write BUILD");
 }
 
-/// A bash target that waits for `gate` to exist, then writes its output.
+/// A bash target that waits for `gate` to exist, then writes its name and the
+/// `HEPH_CPUS` it was told.
 fn gated(name: &str, gate: &Path, resources: &str) -> String {
     format!(
         r#"
 target(
     name = "{name}",
     driver = "bash",
-    run = "while [ ! -e '{gate}' ]; do sleep 0.02; done; echo {name} > $OUT",
+    run = "while [ ! -e '{gate}' ]; do sleep 0.02; done; echo {name} $HEPH_CPUS > $OUT",
     out = "{name}.txt",
     resources = {resources},
 )
@@ -366,11 +367,8 @@ async fn two_light_targets_do_overlap() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `cpu: 16` on a 4-cpu pool is clamped to the whole pool: it runs, and runs
-/// alone (a `cpu: 1` target queues behind it).
-///
-/// The spec row's second half, that the target is told `HEPH_CPUS=4`, belongs
-/// to the allotment env (unit 5) and is asserted there.
+/// `cpu: 16` on a 4-cpu pool is clamped to the whole pool: it runs, runs
+/// alone (a `cpu: 1` target queues behind it), and is told `HEPH_CPUS=4`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn oversize_declaration_runs_alone() -> anyhow::Result<()> {
     let ws = tempfile::tempdir()?;
@@ -397,6 +395,114 @@ async fn oversize_declaration_runs_alone() -> anyhow::Result<()> {
         ],
         "the oversize target runs alone"
     );
+    assert_eq!(output(&engine, "//p:big").await?, "big 4", "told the clamp");
+    assert_eq!(output(&engine, "//p:small").await?, "small 1");
+    Ok(())
+}
+
+/// The single output of `addr`, trimmed (a cache hit if it already ran).
+async fn output(engine: &Arc<Engine>, addr: &str) -> anyhow::Result<String> {
+    let r = Arc::clone(engine)
+        .result_addr(
+            engine.new_state(),
+            &parse_addr(addr)?,
+            OutputMatcher::All,
+            &ResultOptions::default(),
+        )
+        .await?;
+    Ok(crate::common::artifact_string(&r).trim().to_string())
+}
+
+/// The `hashin` of `addr` on `engine`.
+async fn hashin(engine: &Arc<Engine>, addr: &str) -> anyhow::Result<String> {
+    Ok(Arc::clone(engine)
+        .meta(engine.new_state(), &parse_addr(addr)?)
+        .await?
+        .hashin
+        .clone())
+}
+
+/// Every `HEPH_*` the target sees, one `K=V` per line, sorted.
+const SHOW_HEPH_ENV: &str = "env | grep '^HEPH_' | sort > $OUT";
+
+/// D7: a `cpu: 3` target is told `HEPH_CPUS=3`, and heph sets no other
+/// `HEPH_*` name — no memory, since it declared none.
+#[tokio::test]
+async fn target_sees_its_allotment() -> anyhow::Result<()> {
+    let ws = tempfile::tempdir()?;
+    write_build(
+        ws.path(),
+        "p",
+        &format!(
+            r#"target(name = "t", driver = "bash", run = "{SHOW_HEPH_ENV}", out = "t.txt", resources = {{"cpu": 3}})"#
+        ),
+    );
+    let engine = engine(ws.path(), caps(&[("cpu", 4 * MICROS)]))?;
+    assert_eq!(output(&engine, "//p:t").await?, "HEPH_CPUS=3");
+    Ok(())
+}
+
+/// `HEPH_MEMORY_BYTES` is the declared memory, in bytes, and only when memory
+/// was declared.
+#[tokio::test]
+async fn target_sees_its_memory_allotment() -> anyhow::Result<()> {
+    let ws = tempfile::tempdir()?;
+    write_build(
+        ws.path(),
+        "p",
+        &format!(
+            r#"
+target(name = "mem", driver = "bash", run = "{SHOW_HEPH_ENV}", out = "mem.txt", resources = {{"memory": "1G"}})
+target(name = "nomem", driver = "bash", run = "{SHOW_HEPH_ENV}", out = "nomem.txt")
+"#
+        ),
+    );
+    let engine = engine(ws.path(), caps(&[("cpu", 4 * MICROS), ("memory", 2 << 30)]))?;
+    assert_eq!(
+        output(&engine, "//p:mem").await?,
+        format!("HEPH_CPUS=1\nHEPH_MEMORY_BYTES={}", 1u64 << 30)
+    );
+    assert_eq!(output(&engine, "//p:nomem").await?, "HEPH_CPUS=1");
+    Ok(())
+}
+
+/// The target's own `env` wins over the allotment.
+#[tokio::test]
+async fn user_env_overrides_allotment_env() -> anyhow::Result<()> {
+    let ws = tempfile::tempdir()?;
+    write_build(
+        ws.path(),
+        "p",
+        r#"target(name = "t", driver = "bash", run = "echo $HEPH_CPUS > $OUT", out = "t.txt", env = {"HEPH_CPUS": "7"}, resources = {"cpu": 3})"#,
+    );
+    let engine = engine(ws.path(), caps(&[("cpu", 4 * MICROS)]))?;
+    assert_eq!(output(&engine, "//p:t").await?, "7");
+    Ok(())
+}
+
+/// U5: the allotment never reaches the key. A `cpu: 4` target built under
+/// capacity 1 (told 1), then under capacity 4: the same `hashin`, and the
+/// second run is served the first's output.
+#[tokio::test]
+async fn jobs_flag_does_not_move_the_cache_key() -> anyhow::Result<()> {
+    let ws = tempfile::tempdir()?;
+    write_build(
+        ws.path(),
+        "p",
+        r#"target(name = "t", driver = "bash", run = "echo $HEPH_CPUS > $OUT", out = "t.txt", resources = {"cpu": 4})"#,
+    );
+    let one = engine(ws.path(), caps(&[("cpu", MICROS)]))?;
+    let (res, events) = build_events(&one, &["//p:t"]).await;
+    res?;
+    assert_eq!(starts(&events), vec!["//p:t"]);
+    let before = hashin(&one, "//p:t").await?;
+
+    let four = engine(ws.path(), caps(&[("cpu", 4 * MICROS)]))?;
+    let (res, events) = build_events(&four, &["//p:t"]).await;
+    res?;
+    assert!(starts(&events).is_empty(), "{:?}", starts(&events));
+    assert_eq!(before, hashin(&four, "//p:t").await?);
+    assert_eq!(output(&four, "//p:t").await?, "1", "run 1's output");
     Ok(())
 }
 

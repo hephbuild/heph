@@ -67,6 +67,38 @@ target(
     Ok(())
 }
 
+/// The allotment env reaches a runner-wrapped command:
+/// the runner composes the environment, it does not replace heph's part of it.
+#[tokio::test]
+async fn allotment_passes_through_a_runner() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    let mut build = runner_target(
+        "runner",
+        r#"{"version": 1, "fingerprint": "fp-1", "runner": "wrap",
+ "config": {"prefix": ["/usr/bin/env", "XR_PREFIX=yes"], "env": {"XR_MARK": "wrapped"}}}"#,
+    );
+    build.push_str(
+        r#"
+target(
+    name = "consumer",
+    driver = "bash",
+    run = "echo \"$XR_MARK cpus=$HEPH_CPUS\" > $OUT",
+    out = "result.txt",
+    runner = "//xr:runner",
+)
+"#,
+    );
+    ws.write_build_file("xr", &build);
+
+    let content = common::artifact_string(&*ws.run("//xr:consumer").await?);
+    assert_eq!(
+        content.trim(),
+        "wrapped cpus=1",
+        "a default target costs one cpu"
+    );
+    Ok(())
+}
+
 /// The runner is a hash dep: hashed, so it keys the cache — and *not* runtime,
 /// so nothing about it is materialized where the target can see it.
 #[tokio::test]

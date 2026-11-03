@@ -918,6 +918,38 @@ target(
     Ok(())
 }
 
+/// The exec half of D6/D7: a `bash` entrypoint's command sees `HEPH_CPUS` =
+/// the cpu capacity, over the caller's own `HEPH_CPUS`; no memory was
+/// granted, so none is set.
+#[tokio::test]
+async fn bash_entrypoint_sees_the_capacity_in_its_env() -> anyhow::Result<()> {
+    let ws = WorkspaceBuilder::new()?
+        .with_parallelism(3)
+        .with_provider(|init| {
+            Box::new(pluginbuildfile::Provider::new(
+                init.root.to_path_buf(),
+                init.runtime.clone(),
+                Arc::clone(&init.functions),
+            ))
+        })
+        .with_managed_driver(Box::new(pluginexec::Driver::new_bash().with_host_path()))
+        .build()?;
+    ws.write_build_file(
+        "app",
+        r#"
+target(name = "ep", driver = "bash", entrypoint = True,
+       run = ["echo \"$HEPH_CPUS ${HEPH_MEMORY_BYTES-none}\" > \"$HEPH_TEST_OUT\""])
+"#,
+    );
+    let elsewhere = tempfile::tempdir()?;
+    let out = elsewhere.path().join("out");
+    let mut req = request("//app:ep", elsewhere.path(), &[], &out)?;
+    req.env.push(("HEPH_CPUS".into(), "99".into()));
+    assert_eq!(exited(invoke(&ws.engine, req).await), Exit::Code(0));
+    assert_eq!(read(&out)?.trim(), "3 none");
+    Ok(())
+}
+
 /// An entrypoint that declares `resources` is refused at def time, before
 /// anything runs (D6; the message rows are `entrypoint_parse_refusals`).
 #[tokio::test]
