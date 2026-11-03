@@ -427,9 +427,12 @@ impl Engine {
             () = self.sqlite_writes.drain_queued_writes() => {}
         }
 
+        // An entrypoint reserves nothing (it runs in the caller's terminal, one
+        // at a time) and is told the whole cpu capacity.
+        let allotment = hplugin::driver::Allotment::from_granted(self.pools.cpu_capacity(), None);
         let deferred_refs = self.deferred_refs(&spec.spec, &spec.driver)?;
         let deferred = self
-            .resolve_deferred(rs, &target, &deferred_refs)
+            .resolve_deferred(rs, &target, &deferred_refs, Some(&allotment))
             .await
             .with_context(|| format!("resolve deferred values for {addr}"))?;
         let resolved_scratch = self
@@ -523,13 +526,7 @@ impl Engine {
                     wrapper: req.wrapper,
                     shell: req.shell,
                     options,
-                    // An entrypoint reserves nothing (it runs in the caller's
-                    // terminal, one at a time) and is told the whole cpu
-                    // capacity.
-                    allotment: Some(hplugin::driver::Allotment::from_granted(
-                        self.pools.cpu_capacity(),
-                        None,
-                    )),
+                    allotment: Some(allotment),
                 },
             )
             .await;

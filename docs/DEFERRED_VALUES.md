@@ -134,6 +134,20 @@ there is nothing to remember there either.
 |---|---|---|---|
 | `${read://pkg:name}` | contents of the producer's single output, surrounding whitespace trimmed | `(hashed, not staged)` | no |
 | `${src://pkg:name}` | the sandbox path of the producer's single file | `(hashed, staged)` | **no** |
+| `${resource:cpu}`, `${resource:memory}` | this run's allotment: whole CPUs (`HEPH_CPUS`), bytes of memory (`HEPH_MEMORY_BYTES`) | none | **yes** — resolved with the dependent's allotment |
+
+**`${resource:…}` names no target**, so it has no `//`, adds no edge and never
+reaches `hashin`: the def hash covers the reference text, and an artifact built
+under `-j 8` serves a run under `-j 1`. It is substituted at run — by the host
+for a target's own config (in one pass with any `${read:}` or `${src:}` beside
+it), and by `RunRequest::resolve` for a transitive `env` value a dependency
+handed down, which is the one place a reference may ride `transitive`. Every
+`${resource:…}` is claimed whatever follows the colon, so `${resource:cpus}`,
+`${resource:CPU}` and bash's `${resource:offset}` are parse errors naming the two
+valid names (custom pools are not exposed); `${resources:cpu}` and a bare
+`${resource}` are someone else's. `${resource:memory}` on a target that declares
+no memory, and a run told no allotment at all, fail the run naming the target
+rather than substituting an empty string.
 
 Either may name an output group — `${src://tools:cli\|bin}` — exactly as a dep
 does, which is how you narrow a producer that emits more than one file.

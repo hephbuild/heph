@@ -1544,6 +1544,42 @@ impl Allotment {
                 .map(|m| (Self::MEMORY_BYTES_ENV, m.to_string())),
         )
     }
+
+    /// The value of `${resource:<name>}` for the run `target` was granted
+    /// `allotment`: the same text as `HEPH_CPUS` / `HEPH_MEMORY_BYTES`.
+    ///
+    /// The one resolver, for every site that substitutes one (the host's own
+    /// config pass, the managed layer's `${src:}` pass, and
+    /// [`RunRequest::resolve`] for a transitive value). Errors rather than
+    /// substituting nothing: `${resource:memory}` on a target that declared no
+    /// memory, and a run that was told no allotment at all, which only a heph
+    /// bug produces.
+    pub fn reference(
+        allotment: Option<&Self>,
+        name: &str,
+        target: &impl std::fmt::Display,
+    ) -> anyhow::Result<String> {
+        let Some(a) = allotment else {
+            anyhow::bail!(
+                "{target}: `${{resource:{name}}}` is substituted from the run's allotment, and \
+                 this run was told none — a bug in heph rather than in the BUILD file"
+            );
+        };
+        match name {
+            "cpu" => Ok(a.cpu.to_string()),
+            "memory" => a.memory_bytes.map(|m| m.to_string()).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{target}: `${{resource:memory}}` has no value, because the target declares \
+                     no memory. Declare it with `resources = {{\"memory\": \"2G\"}}`, or drop the \
+                     reference"
+                )
+            }),
+            other => anyhow::bail!(
+                "{target}: `${{resource:{other}}}` names no resource; `${{resource:…}}` takes \
+                 `cpu` or `memory`"
+            ),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2117,9 +2153,20 @@ impl<'a, 'io> RunRequest<'a, 'io> {
     ///
     /// A field with no reference in it resolves to its own text, so a driver never
     /// branches on whether the author used one.
-    pub fn resolve<'r, 'd: 'r>(&'r self, d: &'d Deferred<String>) -> anyhow::Result<&'r str> {
+    ///
+    /// A field the host has no entry for but whose only heph references are
+    /// `${resource:…}` is substituted here, from [`allotment`](Self::allotment):
+    /// that is a transitive `env` value a dependency handed down, which the
+    /// host's walk over the target's *own* config never saw. It needs no edge
+    /// and no producer, so nothing is lost by finishing it this late, and it is
+    /// resolved with the allotment of the run that reads it — the dependent's.
+    pub fn resolve<'r, 'd: 'r>(
+        &'r self,
+        d: &'d Deferred<String>,
+    ) -> anyhow::Result<std::borrow::Cow<'r, str>> {
+        use hcore::template::RESOURCE_KIND;
         match self.deferred.get(d.raw()) {
-            Some(DeferredValue::Ready(v)) => return Ok(v),
+            Some(DeferredValue::Ready(v)) => return Ok(std::borrow::Cow::Borrowed(v)),
             // Only reachable if a request skipped the managed-driver layer that
             // completes these. Distinguishable from "never deferred" precisely
             // because the entry is here, which is why the two states share a map.
@@ -2139,13 +2186,21 @@ impl<'a, 'io> RunRequest<'a, 'io> {
         // construct passes straight through, because heph does not own them and a
         // deferrable field must still accept a command that uses one.
         if hcore::template::has_deferred_ref(d.raw()) {
+            if hcore::template::only_resource_refs(d.raw()) {
+                let allotment = self.allotment.as_ref();
+                return hcore::template::substitute(d.raw(), &[RESOURCE_KIND], |r| {
+                    hcore::template::check_resource_name(r)?;
+                    Allotment::reference(allotment, r.arg, &self.target.addr)
+                })
+                .map(std::borrow::Cow::Owned);
+            }
             anyhow::bail!(
                 "the host did not resolve {:?} — a deferred field's value is filled in before the \
                  run, so this is a bug in heph rather than in the BUILD file",
                 d.raw()
             );
         }
-        Ok(d.raw())
+        Ok(std::borrow::Cow::Borrowed(d.raw()))
     }
 }
 #[cfg(test)]
@@ -2230,6 +2285,42 @@ mod resolve_tests {
             .resolve(&Deferred::new("${read://a:b}"))
             .expect_err("must not be swallowed");
         assert!(format!("{err:#}").contains("did not resolve"), "{err:#}");
+    }
+
+    /// A transitive value the host never saw: a resource-only field is
+    /// finished from the request's own allotment; a `read` beside it is still
+    /// the host's.
+    #[test]
+    fn resolve_finishes_a_resource_only_field_from_the_allotment() {
+        let (id, t) = ("r".to_string(), target());
+        let mut r = req(&id, &t, BTreeMap::new());
+        r.allotment = Some(Allotment::from_granted(3_000_000, None));
+        assert_eq!(
+            r.resolve(&Deferred::new("-j${resource:cpu} ${FOO:-d}"))
+                .expect("resolved"),
+            "-j3 ${FOO:-d}"
+        );
+        let err = r
+            .resolve(&Deferred::new("${resource:memory}"))
+            .expect_err("undeclared memory");
+        assert!(format!("{err:#}").contains("declares no memory"), "{err:#}");
+        let err = r
+            .resolve(&Deferred::new("${resource:cpu} ${read://a:b}"))
+            .expect_err("mixed is the host's");
+        assert!(format!("{err:#}").contains("did not resolve"), "{err:#}");
+
+        r.allotment = Some(Allotment::from_granted(1, Some(1024)));
+        assert_eq!(
+            r.resolve(&Deferred::new("${resource:cpu}:${resource:memory}"))
+                .expect("both"),
+            "1:1024"
+        );
+
+        r.allotment = None;
+        let err = r
+            .resolve(&Deferred::new("${resource:cpu}"))
+            .expect_err("no allotment");
+        assert!(format!("{err:#}").contains("told none"), "{err:#}");
     }
 }
 

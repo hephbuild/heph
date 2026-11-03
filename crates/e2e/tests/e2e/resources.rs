@@ -1108,3 +1108,91 @@ target(name = "b", driver = "bash", run = "echo b > $OUT", out = "b.txt", deps =
     assert!(line.contains("INFO") && line.contains("//p:big"), "{line}");
     Ok(())
 }
+
+/// D7: `${resource:cpu}` in an `env` value is substituted at run with the
+/// run's whole CPUs, while the def hash covers the reference text — so the
+/// key does not move with the capacity the run was granted.
+#[tokio::test]
+async fn reference_in_env_is_hashed_as_text_and_expanded_at_run() -> anyhow::Result<()> {
+    let ws = tempfile::tempdir()?;
+    write_build(
+        ws.path(),
+        "p",
+        r#"target(name = "t", driver = "bash", run = "echo $MAKEFLAGS > $OUT", out = "t.txt", env = {"MAKEFLAGS": "-j${resource:cpu}"}, resources = {"cpu": 3})"#,
+    );
+    let four = engine(ws.path(), caps(&[("cpu", 4 * MICROS)]))?;
+    assert_eq!(output(&four, "//p:t").await?, "-j3");
+    let one = engine(ws.path(), caps(&[("cpu", MICROS)]))?;
+    assert_eq!(hashin(&four, "//p:t").await?, hashin(&one, "//p:t").await?);
+    Ok(())
+}
+
+/// A dependency's transitive `env` may carry the reference too, and it is
+/// resolved with the *dependent's* allotment, not the dependency's.
+#[tokio::test]
+async fn reference_in_transitive_env_reaches_dependents() -> anyhow::Result<()> {
+    let ws = tempfile::tempdir()?;
+    write_build(
+        ws.path(),
+        "p",
+        r#"
+target(name = "tool", driver = "bash", run = "echo x > $OUT", out = "tool.txt",
+       transitive = {"env": {"MAKEFLAGS": "-j${resource:cpu}"}})
+target(name = "c", driver = "bash", run = "echo $MAKEFLAGS > $OUT", out = "c.txt",
+       deps = ["//p:tool"], resources = {"cpu": 2})
+"#,
+    );
+    let four = engine(ws.path(), caps(&[("cpu", 4 * MICROS)]))?;
+    assert_eq!(output(&four, "//p:c").await?, "-j2");
+    let one = engine(ws.path(), caps(&[("cpu", MICROS)]))?;
+    assert_eq!(hashin(&four, "//p:c").await?, hashin(&one, "//p:c").await?);
+    Ok(())
+}
+
+/// A name that is not `cpu` or `memory` is refused when the def is built,
+/// naming the target, the field and the names that exist.
+#[tokio::test]
+async fn unknown_reference_is_a_parse_error() -> anyhow::Result<()> {
+    let ws = tempfile::tempdir()?;
+    write_build(
+        ws.path(),
+        "p",
+        r#"target(name = "t", driver = "bash", run = "echo $X > $OUT", out = "t.txt", env = {"X": "${resource:nope}"})"#,
+    );
+    let engine = engine(ws.path(), caps(&[("cpu", 4 * MICROS)]))?;
+    let err = Arc::clone(&engine)
+        .get_def(engine.new_state(), &parse_addr("//p:t")?)
+        .await
+        .err()
+        .expect("an unknown resource fails the def");
+    let msg = format!("{err:#}");
+    for want in [
+        "//p:t",
+        "`${resource:nope}` names no resource",
+        "`${resource:cpu}` or `${resource:memory}`",
+    ] {
+        assert!(msg.contains(want), "{want}: {msg}");
+    }
+    Ok(())
+}
+
+/// A value naming a `${src://…}` is finished by the managed layer once the
+/// artifact is staged; a `${resource:…}` beside it is substituted in that same
+/// pass, from the same allotment.
+#[tokio::test]
+async fn reference_beside_a_src_reference_is_substituted_in_one_pass() -> anyhow::Result<()> {
+    let ws = tempfile::tempdir()?;
+    write_build(
+        ws.path(),
+        "p",
+        r#"
+target(name = "cfg", driver = "bash", run = "echo c > $OUT", out = "cfg.txt")
+target(name = "t", driver = "bash", out = "t.txt", resources = {"cpu": 2},
+       env = {"X": "${src://p:cfg}:${resource:cpu}"},
+       run = 'test -f "${X%:*}" && echo "${X##*:}" > $OUT')
+"#,
+    );
+    let engine = engine(ws.path(), caps(&[("cpu", 4 * MICROS)]))?;
+    assert_eq!(output(&engine, "//p:t").await?, "2");
+    Ok(())
+}

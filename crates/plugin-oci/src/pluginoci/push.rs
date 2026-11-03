@@ -306,7 +306,7 @@ impl ManagedDriver for Driver {
             .request
             .resolve(&def.dest)
             .context("resolve oci_push `ref`")?;
-        let dest = render_ref(def.dest.raw(), dest, || {
+        let dest = render_ref(def.dest.raw(), &dest, || {
             dep_input(&req, IMAGE_ORIGIN)?
                 .input
                 .artifact

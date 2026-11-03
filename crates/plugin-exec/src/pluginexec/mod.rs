@@ -1743,11 +1743,23 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
                         xdef.runtime_pass_env.push(name);
                     }
                 }
+                // `${resource:…}` needs no edge, so it may ride a transitive
+                // value: kept as text (the def hash covers the reference, never
+                // the number) in a deferred map, and finished by `resolve` at run
+                // from the *dependent's* allotment.
+                EnvValue::Literal(v) if hcore::template::only_resource_refs(&v) => {
+                    let d = hplugin::driver::Deferred::new(v);
+                    if env.hash {
+                        xdef.env.insert(name, d);
+                    } else {
+                        xdef.runtime_env.insert(name, d);
+                    }
+                }
                 EnvValue::Literal(v) => {
                     // The host's walk covers the target's own config, not what a
-                    // dep hands down, so a reference here has no edge: it would
-                    // reach the process as text, or `resolve` would call it a heph
-                    // bug. Refuse it as the author's instead.
+                    // dep hands down, so a `read`/`src` reference here has no
+                    // edge: it would reach the process as text, or `resolve`
+                    // would call it a heph bug. Refuse it as the author's instead.
                     hplugin::htspec::reject_deferred_reference(&v)
                         .with_context(|| format!("transitive `env.{name}`"))?;
                     if env.hash {
@@ -1855,7 +1867,7 @@ impl Driver {
         let resolved_run: Vec<String> = def
             .run
             .iter()
-            .map(|d| rreq.resolve(d).map(str::to_string))
+            .map(|d| rreq.resolve(d).map(std::borrow::Cow::into_owned))
             .collect::<anyhow::Result<_>>()?;
         // A run that accepts args gets them appended to the command; bash's
         // inline `-c` form needs a `$0` first so they land in `"$@"`. In

@@ -938,7 +938,8 @@ async fn bash_entrypoint_sees_the_capacity_in_its_env() -> anyhow::Result<()> {
         "app",
         r#"
 target(name = "ep", driver = "bash", entrypoint = True,
-       run = ["echo \"$HEPH_CPUS ${HEPH_MEMORY_BYTES-none}\" > \"$HEPH_TEST_OUT\""])
+       env = {"EP_JOBS": "-j${resource:cpu}"},
+       run = ["echo \"$HEPH_CPUS ${HEPH_MEMORY_BYTES-none} $EP_JOBS\" > \"$HEPH_TEST_OUT\""])
 "#,
     );
     let elsewhere = tempfile::tempdir()?;
@@ -946,7 +947,7 @@ target(name = "ep", driver = "bash", entrypoint = True,
     let mut req = request("//app:ep", elsewhere.path(), &[], &out)?;
     req.env.push(("HEPH_CPUS".into(), "99".into()));
     assert_eq!(exited(invoke(&ws.engine, req).await), Exit::Code(0));
-    assert_eq!(read(&out)?.trim(), "3 none");
+    assert_eq!(read(&out)?.trim(), "3 none -j3");
     Ok(())
 }
 

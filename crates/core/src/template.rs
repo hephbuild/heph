@@ -68,17 +68,50 @@ const DOLLAR: &str = "$";
 /// literal.
 ///
 /// `read` is a producer's *contents*; `src` is the sandbox *path* of its
-/// artifact. There is deliberately no `env`: `${env:NAME}` is legal bash
+/// artifact; `resource` is a share of the run's allotment. There is deliberately no `env`: `${env:NAME}` is legal bash
 /// (`${var:offset}`) and a template form several tools use, and the value it
 /// would have carried composes from a `pass_env` producer plus `${read:}` with
 /// better provenance. See `docs/DEFERRED_VALUES.md`.
-pub const DEFERRED_KINDS: &[&str] = &[READ_KIND, SRC_KIND];
+pub const DEFERRED_KINDS: &[&str] = &[READ_KIND, SRC_KIND, RESOURCE_KIND];
 
 /// The contents of a producer's single output.
 pub const READ_KIND: &str = "read";
 
 /// The sandbox path of a producer's artifact.
 pub const SRC_KIND: &str = "src";
+
+/// A share of the run's allotment: `${resource:cpu}`, `${resource:memory}`.
+///
+/// The one kind whose argument is not an address, so [`claims`] takes every
+/// `${resource:…}` whatever follows the colon — including bash's
+/// `${resource:offset}` substring form, a cost accepted so that a typo such as
+/// `${resource:cpus}` is a parse error naming [`RESOURCE_NAMES`] rather than a
+/// literal that reaches the tool. `${resources:…}` and a bare `${resource}` are
+/// somebody else's and left alone.
+pub const RESOURCE_KIND: &str = "resource";
+
+/// The names `${resource:…}` takes: whole CPUs of the run's allotment, and the
+/// bytes of memory it was granted. Custom pools are deliberately not exposed.
+pub const RESOURCE_NAMES: &[&str] = &["cpu", "memory"];
+
+/// Refuse a `${resource:…}` whose name is not one of [`RESOURCE_NAMES`].
+///
+/// Exact and case-sensitive: `${resource:CPU}`, `${resource:}`,
+/// `${resource:cpu:-1}` and `${resource://cpu}` are all refused.
+pub fn check_resource_name(r: &Ref<'_>) -> anyhow::Result<()> {
+    if RESOURCE_NAMES.contains(&r.arg) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "`{}` names no resource: `${{resource:…}}` takes {} (custom pools are not exposed)",
+        r.raw,
+        RESOURCE_NAMES
+            .iter()
+            .map(|n| format!("`${{resource:{n}}}`"))
+            .collect::<Vec<_>>()
+            .join(" or ")
+    )
+}
 
 /// Whether a `${kind:arg}` whose kind heph owns is *this* `${…}`.
 ///
@@ -103,8 +136,14 @@ pub const SRC_KIND: &str = "src";
 /// ordinary field, the engine walk that collects the edges, and the substitution
 /// that fills them in. Two answers to "is this heph's?" is the silent
 /// misclassification this module exists to prevent.
+///
+/// [`RESOURCE_KIND`] is the exception: it names no target, so it is claimed
+/// whatever its argument, and the name is checked by [`check_resource_name`].
 pub fn claims(kind: Option<&str>, arg: &str, kinds: &[&str]) -> bool {
-    kind.is_some_and(|k| kinds.contains(&k)) && arg.starts_with("//")
+    let Some(k) = kind.filter(|k| kinds.contains(k)) else {
+        return false;
+    };
+    k == RESOURCE_KIND || arg.starts_with("//")
 }
 
 /// The first `${kind:…}` in `s` whose kind is in `kinds`.
@@ -136,6 +175,30 @@ pub fn has_deferred_ref(s: &str) -> bool {
         Piece::Ref(r) => claims(r.kind, r.arg, DEFERRED_KINDS),
         Piece::Text(_) | Piece::Escape => false,
     })
+}
+
+/// Whether `s` carries a reference heph owns and every one of them is a
+/// `${resource:…}` — the one kind that needs no edge, and so can be finished at
+/// run from the run's allotment wherever the text came from.
+pub fn only_resource_refs(s: &str) -> bool {
+    if !has_ref(s) {
+        return false;
+    }
+    let Ok(pieces) = parse(s) else {
+        return false;
+    };
+    let mut any = false;
+    for p in &pieces {
+        if let Piece::Ref(r) = p
+            && claims(r.kind, r.arg, DEFERRED_KINDS)
+        {
+            if r.kind != Some(RESOURCE_KIND) {
+                return false;
+            }
+            any = true;
+        }
+    }
+    any
 }
 
 /// The first reference heph owns in `s`, if any.
@@ -457,6 +520,81 @@ mod tests {
         assert!(parse("sed 's/${/X/'").is_err());
         assert!(!has_deferred_ref("sed 's/${/X/'"));
         assert!(first_deferred_ref("sed 's/${/X/'").is_none());
+    }
+
+    /// `${resource:…}` is claimed whatever its argument, so a typo reaches the
+    /// name check instead of the tool; anything that is not exactly that kind
+    /// stays somebody else's.
+    #[test]
+    fn resource_references_adversarial() {
+        let first = |s: &str| first_deferred_ref(s).map(|r| r.raw.to_string());
+        let named = |s: &str| {
+            let r = first_deferred_ref(s).expect("claimed");
+            check_resource_name(&r).is_ok()
+        };
+        // Claimed, and a valid name.
+        assert!(named("${resource:cpu}"));
+        assert!(named("${resource:memory}"));
+        assert!(named("-j${resource:cpu}"));
+        // Claimed, and refused by name — each a typo or a bash form.
+        for bad in [
+            "${resource:cpus}",
+            "${resource:}",
+            "${resource:CPU}",
+            "${resource:cpu:-1}",
+            "${resource://cpu}",
+            "${resource:cpü}",
+            "${resource: cpu}",
+        ] {
+            assert!(has_deferred_ref(bad), "{bad} must be claimed");
+            assert!(!named(bad), "{bad} must be refused");
+            let r = first_deferred_ref(bad).expect("claimed");
+            let msg = format!("{:#}", check_resource_name(&r).unwrap_err());
+            assert!(
+                msg.contains("${resource:cpu}") && msg.contains("${resource:memory}"),
+                "{msg}"
+            );
+        }
+        // Not this kind: left alone.
+        for other in [
+            "${resources:cpu}",
+            "${resource}",
+            "${Resource:cpu}",
+            "$${resource:cpu}",
+        ] {
+            assert!(!has_deferred_ref(other), "{other}");
+        }
+        // Two in one value, and mixed with `read`.
+        let s = "${resource:cpu}/${resource:memory} ${read://a:b}";
+        let kinds: Vec<_> = parse(s)
+            .unwrap()
+            .into_iter()
+            .filter_map(|p| match p {
+                Piece::Ref(r) if claims(r.kind, r.arg, DEFERRED_KINDS) => {
+                    Some(r.kind.unwrap_or_default().to_string())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(kinds, ["resource", "resource", "read"]);
+        let out = substitute(s, &[RESOURCE_KIND, READ_KIND], |r| {
+            Ok(match r.arg {
+                "cpu" => "3".to_string(),
+                "memory" => "1024".to_string(),
+                _ => "V".to_string(),
+            })
+        })
+        .unwrap();
+        assert_eq!(out, "3/1024 V");
+        // Unterminated and nested are tokenizer errors, as for every kind.
+        assert!(parse("-j${resource:cpu").is_err());
+        assert!(first("-j${resource:cpu").is_none());
+        assert!(parse("${resource:${resource:cpu}}").is_err());
+        // Non-ASCII around a reference is just text.
+        assert_eq!(
+            first("ü${resource:cpu}ß").as_deref(),
+            Some("${resource:cpu}")
+        );
     }
 
     #[test]

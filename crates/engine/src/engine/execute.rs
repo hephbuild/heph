@@ -95,8 +95,10 @@ impl Engine {
         // reading their bytes. Inside `execute`, so a cache hit resolves nothing.
         hcore::hmemoizer::set_phase("execute:deferred_resolve");
         let deferred_refs = self.deferred_refs(spec, &spec.driver)?;
-        let deferred = self
-            .resolve_deferred(&rs, &def.target, &deferred_refs)
+        // Read now, substituted after admission: `${resource:…}` is this run's
+        // allotment, which exists only once the reservation does.
+        let deferred_reads = self
+            .read_deferred(&rs, &def.target, &deferred_refs)
             .await
             .with_context(|| format!("resolve deferred values for {addr}"))?;
 
@@ -129,6 +131,13 @@ impl Engine {
         // Counted once the reservation is actually in hand.
         let _running = crate::engine::diag::RunningPermit::new();
         let allotment = allotment_of(&reservation, &def.target.resources);
+        let deferred = Self::render_deferred(
+            &def.target,
+            &deferred_refs,
+            &deferred_reads,
+            Some(&allotment),
+        )
+        .with_context(|| format!("resolve deferred values for {addr}"))?;
 
         let addr_str = addr.format();
         // Telemetry: per-target execute wall time. This path runs only on a real

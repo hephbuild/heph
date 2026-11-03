@@ -82,8 +82,9 @@ async fn allotment_passes_through_a_runner() -> anyhow::Result<()> {
 target(
     name = "consumer",
     driver = "bash",
-    run = "echo \"$XR_MARK cpus=$HEPH_CPUS\" > $OUT",
+    run = "echo \"$XR_MARK cpus=$HEPH_CPUS ref=$XR_JOBS\" > $OUT",
     out = "result.txt",
+    env = {"XR_JOBS": "-j${resource:cpu}"},
     runner = "//xr:runner",
 )
 "#,
@@ -93,7 +94,7 @@ target(
     let content = common::artifact_string(&*ws.run("//xr:consumer").await?);
     assert_eq!(
         content.trim(),
-        "wrapped cpus=1",
+        "wrapped cpus=1 ref=-j1",
         "a default target costs one cpu"
     );
     Ok(())

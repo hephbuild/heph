@@ -290,6 +290,8 @@ fn complete_deferred(
     req: &mut RunRequest<'_, '_>,
     inputs: &[ManagedRunInput],
 ) -> anyhow::Result<()> {
+    let allotment = req.allotment;
+    let addr = &req.target.addr;
     for (raw, slot) in req.deferred.iter_mut() {
         let DeferredValue::NeedsSandbox { reads, srcs } = slot else {
             continue;
@@ -298,6 +300,11 @@ fn complete_deferred(
             raw,
             hcore::template::DEFERRED_KINDS,
             |r| -> anyhow::Result<String> {
+                // Not an address: this run's allotment, the same one the host
+                // substitutes into a field that needs no sandbox.
+                if r.kind == Some(hcore::template::RESOURCE_KIND) {
+                    return hplugin::driver::Allotment::reference(allotment.as_ref(), r.arg, addr);
+                }
                 // The host keyed both maps by the address exactly as the author
                 // wrote it, so no re-parse and no normalization happens here.
                 if let Some(v) = reads.get(r.arg) {
