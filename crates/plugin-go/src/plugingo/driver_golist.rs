@@ -145,6 +145,28 @@ struct GoGolistDef {
     /// see `plugingo::runner`: it reaches the cache key through the hashout of
     /// the input `parse` emits, exactly as a `hash_dep` does.
     runner: Option<TargetAddr>,
+    /// The names-only glob whose files were staged as empty placeholders, if
+    /// any — named in a failure (D9). Absent from `Hash`: it is one of
+    /// `dep_inputs`, which are hashed.
+    #[serde(default)]
+    content_blind: Option<String>,
+}
+
+/// A `go list` failure, with one more line when content-blind placeholders were
+/// staged: if `go list` ever needed the bytes of a non-Go file outside the
+/// header-read set, that is where it would fail, and the addr is what to report.
+fn golist_failure(def: &GoGolistDef, stderr_tail: String) -> crate::plugingo::errors::GoListError {
+    let stderr_tail = match &def.content_blind {
+        Some(addr) => format!(
+            "{stderr_tail}\nnote: non-Go files were staged content-blind (empty placeholders, from \
+             {addr}); if go list needed their bytes, report this addr as a heph bug"
+        ),
+        None => stderr_tail,
+    };
+    crate::plugingo::errors::GoListError {
+        import_path: def.import_path.clone(),
+        stderr_tail,
+    }
 }
 
 /// Bump to invalidate every cached `_golist` artifact whenever the driver's
@@ -311,7 +333,19 @@ impl ManagedDriver for GoGolistDriver {
             // std `src/`) per package. Source deps keep the source-map
             // annotation so golist can map codegen output back to its target.
             let is_sdk = group.as_str() == crate::plugingo::addr_util::GO_SDK_DEP_GROUP;
-            let annotations = if is_sdk {
+            // The header-read lanes (see `nongo_lanes`): the real files are
+            // staged for `go list` but stay out of the key, and the header target
+            // stands in for them in the key without being staged. Neither opts
+            // into the source map: an embedded header-read file must route to its
+            // own `fs:file` addr, never to the header extract.
+            let (hashed, runtime) = match group.as_str() {
+                crate::plugingo::target_golist::GROUP_HEADER_SRCS => (false, true),
+                crate::plugingo::target_golist::GROUP_HEADERS => (true, false),
+                _ => (true, true),
+            };
+            let annotations = if !hashed || !runtime {
+                std::collections::BTreeMap::new()
+            } else if is_sdk {
                 std::collections::BTreeMap::from([(
                     hdriver_support::stage::READ_ONLY_ANNOTATION.to_string(),
                     "true".to_string(),
@@ -329,8 +363,8 @@ impl ManagedDriver for GoGolistDriver {
                     mode: InputMode::Standard,
                     origin_id: format!("dep|{group}|{i}"),
                     annotations: annotations.clone(),
-                    hashed: true,
-                    runtime: true,
+                    hashed,
+                    runtime,
                 });
             }
         }
@@ -374,7 +408,11 @@ impl ManagedDriver for GoGolistDriver {
             runtime: false,
         };
 
+        let content_blind = dep_strings
+            .get(crate::plugingo::target_golist::GROUP_NAMES)
+            .and_then(|v| v.first().cloned());
         let def = GoGolistDef {
+            content_blind,
             runner,
             import_path: spec.import_path,
             goos: spec.goos,
@@ -557,11 +595,7 @@ impl ManagedDriver for GoGolistDriver {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(crate::plugingo::errors::GoListError {
-                import_path: def.import_path.clone(),
-                stderr_tail: hplugin::error::last_n_lines(&stderr, 10),
-            }
-            .into());
+            return Err(golist_failure(def, hplugin::error::last_n_lines(&stderr, 10)).into());
         }
 
         // Parse once, normalize Dir on the struct, then serialize package.bin and
@@ -665,9 +699,9 @@ fn check_package_resolved(
                 && pkg.go_files.is_empty()
                 && !is_settled_package_error(&error.err) =>
         {
-            Err(crate::plugingo::errors::GoListError {
-                import_path: def.import_path.clone(),
-                stderr_tail: format!(
+            Err(golist_failure(
+                def,
+                format!(
                     "{}\n{}\ngo could not resolve this package. To reproduce, run `go list {}` \
                      in this module, in the same shell. A private module needs GOPRIVATE, `git` \
                      on PATH and working credentials: see docs/GO_MODULES.md.",
@@ -675,7 +709,7 @@ fn check_package_resolved(
                     hplugin::error::last_n_lines(&String::from_utf8_lossy(stderr), 10),
                     def.import_path
                 ),
-            })
+            ))
         }
         _ => Ok(()),
     }
@@ -1172,7 +1206,79 @@ mod tests {
             dep_inputs: vec![],
             thirdparty_download_addr: None,
             firstparty: true,
+            content_blind: None,
         }
+    }
+
+    /// T16 (D9): a failed listing with placeholders staged says so, naming the
+    /// names-only addr; one without placeholders carries no such line.
+    #[test]
+    fn a_failure_with_placeholders_staged_names_the_content_blind_addr() {
+        let mut def = def_with(false, vec![]);
+        let plain = golist_failure(&def, "boom".to_string());
+        assert!(!plain.to_string().contains("content-blind"), "{plain}");
+        def.content_blind = Some("//@heph/fs:glob@m=names,p=pkg/**/*".to_string());
+        let hinted = golist_failure(&def, "boom".to_string()).to_string();
+        assert!(hinted.contains("boom"), "{hinted}");
+        let last = hinted.lines().last().unwrap_or_default();
+        assert!(last.contains("content-blind"), "{hinted}");
+        assert!(
+            last.contains("//@heph/fs:glob@m=names,p=pkg/**/*"),
+            "{hinted}"
+        );
+    }
+
+    /// T18 (I2's trust): `go list` reads a header-read file no further than its
+    /// `readComments` prefix only because nothing on its command line asks for
+    /// more. Pin the whole argv: no `-compiled`, `-export`, `-deps`, `-find` or
+    /// cgo processing, and the field set unchanged. Adding such a flag means
+    /// moving the header-read files to a hashed lane first.
+    #[test]
+    fn golist_argv_reads_no_more_than_headers() {
+        let def = def_with(true, vec!["integration".to_string()]);
+        assert_eq!(
+            golist_args(&def),
+            [
+                "list",
+                GOLIST_JSON_FIELDS,
+                "-e",
+                "-test",
+                "-tags=integration",
+                "example.com/mylib"
+            ]
+        );
+        let plain = golist_args(&def_with(false, vec![]));
+        assert_eq!(
+            plain,
+            ["list", GOLIST_JSON_FIELDS, "-e", "example.com/mylib"]
+        );
+        for flag in ["-compiled", "-export", "-cgo", "-deps", "-find"] {
+            assert!(
+                !golist_args(&def).iter().any(|a| a.starts_with(flag)),
+                "{flag} must not reach go list"
+            );
+        }
+        assert!(
+            !GOLIST_JSON_FIELDS.contains("CompiledGoFiles"),
+            "a compiled-files field makes go list run cgo"
+        );
+    }
+
+    /// T18, env: `CGO_ENABLED` is pinned as before and a host `GOFLAGS` (which
+    /// could carry `-compiled`-like behaviour or `-mod=`) never reaches go list.
+    #[test]
+    fn golist_env_pins_cgo_and_strips_goflags() {
+        let env = golist_env(
+            &def_with(false, vec![]),
+            std::path::Path::new("/goroot"),
+            std::path::Path::new("/gocache"),
+            everything_set,
+        );
+        assert!(!env.contains_key("GOFLAGS"), "{env:?}");
+        assert_eq!(
+            env.get("CGO_ENABLED").map(String::as_str),
+            Some(crate::plugingo::factors::cgo_enabled_value("linux", false))
+        );
     }
 
     /// A host environment where every variable heph has ever passed through is

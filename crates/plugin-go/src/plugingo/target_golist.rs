@@ -5,6 +5,31 @@ use hmodel::htaddr::Addr;
 use hplugin::provider::TargetSpec;
 use std::collections::HashMap;
 
+/// Dep group of the names-only lane: placeholders, hashed by path. Its own group
+/// so the driver knows content-blind files were staged (the D9 hint).
+pub const GROUP_NAMES: &str = "nongo_names";
+/// Dep group of the header-read files themselves: staged for `go list` to read,
+/// `hashed: false` — [`GROUP_HEADERS`] stands in for them in the key.
+pub const GROUP_HEADER_SRCS: &str = "headersrcs";
+/// Dep group of the header target: `hashed: true, runtime: false`, and no
+/// source-map annotation, so an embedded header-read file still routes to its
+/// own `fs:file` addr downstream.
+pub const GROUP_HEADERS: &str = "headers";
+
+/// `_golist`'s non-Go inputs, by lane (see [`crate::plugingo::nongo_lanes`]).
+#[derive(Debug, Default)]
+pub struct NonGoLanes {
+    /// Content-hashed, staged: the codegen lanes, plus — for a vendored module
+    /// only — today's whole content lane.
+    pub srcfiles: Vec<String>,
+    /// The names-only glob ([`GROUP_NAMES`]); `None` for a vendored module.
+    pub names: Option<String>,
+    /// The header-read content glob ([`GROUP_HEADER_SRCS`]).
+    pub header_srcs: Option<String>,
+    /// The header target over that same glob ([`GROUP_HEADERS`]).
+    pub headers: Option<String>,
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "all parameters are required, no natural grouping"
@@ -18,24 +43,33 @@ pub fn build_spec_firstparty(
     go_mod_addr: &Addr,
     go_src_addr: &Addr,
     go_src_query_addr: Option<&Addr>,
-    non_go_src_addrs: &[String],
+    non_go: &NonGoLanes,
     has_test_files: bool,
 ) -> anyhow::Result<TargetSpec> {
     let mut srcfiles: Vec<String> = vec![go_src_addr.format()];
     if let Some(q) = go_src_query_addr {
         srcfiles.push(q.format());
     }
-    srcfiles.extend_from_slice(non_go_src_addrs);
+    srcfiles.extend_from_slice(&non_go.srcfiles);
+    let modfiles = [go_mod_addr.format()];
+    let mut groups: Vec<(&str, &[String])> =
+        vec![("modfiles", &modfiles[..]), ("srcfiles", &srcfiles)];
+    for (group, lane) in [
+        (GROUP_NAMES, &non_go.names),
+        (GROUP_HEADER_SRCS, &non_go.header_srcs),
+        (GROUP_HEADERS, &non_go.headers),
+    ] {
+        if let Some(lane) = lane {
+            groups.push((group, std::slice::from_ref(lane)));
+        }
+    }
     let mut spec = build_spec_inner(
         addr,
         import_path,
         factors,
         go_version,
         go_module,
-        &[
-            ("modfiles", &[go_mod_addr.format()][..]),
-            ("srcfiles", &srcfiles),
-        ],
+        &groups,
         // `-test` is what resolves TestEmbedFiles/XTestEmbedFiles and the test
         // import sets. A package with no `_test.go` on disk has none of those,
         // so the flag would only buy `go list` a second (test-variant) package
@@ -254,7 +288,7 @@ mod tests {
             &go_mod_addr(),
             &go_src_addr(),
             None,
-            &[],
+            &NonGoLanes::default(),
             false,
         )
         .expect("spec");
@@ -286,7 +320,7 @@ mod tests {
             &go_mod_addr(),
             &go_src_addr(),
             None,
-            &[],
+            &NonGoLanes::default(),
             true,
         )
         .unwrap();
@@ -304,7 +338,7 @@ mod tests {
             &go_mod_addr(),
             &go_src_addr(),
             None,
-            &[],
+            &NonGoLanes::default(),
             true,
         )
         .unwrap();
@@ -327,7 +361,7 @@ mod tests {
             &go_mod_addr(),
             &go_src_addr(),
             None,
-            &[],
+            &NonGoLanes::default(),
             true,
         )
         .unwrap();
@@ -351,7 +385,7 @@ mod tests {
             &go_mod_addr(),
             &go_src_addr(),
             None,
-            &[],
+            &NonGoLanes::default(),
             true,
         )
         .unwrap();
@@ -437,7 +471,7 @@ mod tests {
                 &go_mod_addr(),
                 &go_src_addr(),
                 None,
-                &[],
+                &NonGoLanes::default(),
                 has_tests,
             )
             .unwrap();
@@ -460,7 +494,7 @@ mod tests {
             &go_mod_addr(),
             &go_src_addr(),
             None,
-            &[],
+            &NonGoLanes::default(),
             true,
         )
         .unwrap();
@@ -486,7 +520,7 @@ mod tests {
             &go_mod_addr(),
             &go_src_addr(),
             None,
-            &[],
+            &NonGoLanes::default(),
             true,
         )
         .unwrap();
@@ -506,7 +540,7 @@ mod tests {
             &go_mod_addr(),
             &go_src_addr(),
             None,
-            &[],
+            &NonGoLanes::default(),
             true,
         )
         .unwrap();

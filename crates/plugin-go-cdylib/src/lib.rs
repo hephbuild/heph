@@ -12,7 +12,8 @@
 use hdriver_support::driver_managed::ManagedDriver;
 use hplugin_go::plugingo::{
     GoCompileDriver, GoDownloadDriver, GoFormatCheckDriver, GoFormatDriver, GoGolistDriver,
-    GoLintDriver, GoLintFixDriver, GoLintGateDriver, GoTestmainDriver, GoToolchainDriver, Provider,
+    GoHeadersDriver, GoLintDriver, GoLintFixDriver, GoLintGateDriver, GoTestmainDriver,
+    GoToolchainDriver, Provider,
 };
 use plugin_sdk::stabby::abi::{
     DynFunctionRegistry, DynLogSink, DynRunnerHost, DynSupervisor, NamedDriver, PluginComponents,
@@ -161,6 +162,12 @@ fn build(cfg: &[u8]) -> anyhow::Result<PluginComponents> {
     drivers.push(NamedDriver {
         name: "download".into(),
         driver: make_dyn_managed_driver(download),
+    });
+    // `_golist`'s hashed view of its C/asm-family files (`go.headers`).
+    let headers: Arc<dyn ManagedDriver> = Arc::new(GoHeadersDriver);
+    drivers.push(NamedDriver {
+        name: "headers".into(),
+        driver: make_dyn_managed_driver(headers),
     });
     let testmain: Arc<dyn ManagedDriver> = Arc::new(GoTestmainDriver);
     drivers.push(NamedDriver {
