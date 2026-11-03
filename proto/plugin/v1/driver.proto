@@ -320,24 +320,30 @@ message RunInFrame {
     bool cont = 5;
   }
 }
+// A run's terminal failure (since 0.18.0, replacing `string error = 4` and the
+// out-of-oneof `ExitStatus exit = 5`).
+message RunFailure {
+  // The plugin's whole rendered error chain.
+  string message = 1;
+  // The structured status of the process whose exit is the failure. Absent
+  // when the failure is not a process's exit.
+  ExitStatus exit = 2;
+  // The file holding that process's output, which the host renders the tail
+  // of in the failure diagnostic. A path in the host's filesystem — a plugin
+  // shares the host's process — normally the target's `log.txt` in its
+  // sandbox. Absent = none.
+  string log_path = 3;
+}
+
 message RunOutFrame {
+  reserved 4, 5; // `string error`, `ExitStatus exit` before 0.18.0
   oneof msg {
     bytes stdout_chunk = 1;
     bytes stderr_chunk = 2;
     ManagedRunResponse response = 3; // terminal: artifacts
-    string error = 4;                // terminal: failure message
+    RunFailure failure = 7;          // terminal: the run failed
     // The tool stopped itself: the host restores the terminal and suspends
     // (since 0.17.2; value ignored). Only on a run with stdio = PTY.
     bool stopped = 6;
   }
-  // Only beside `error` (since 0.17.1): the structured status of the process
-  // whose exit is the failure. Outside the oneof so that `error` stays the one
-  // terminal failure frame, and an older host still reads the message.
-  ExitStatus exit = 5;
-  // Only beside `error` and `exit` (since 0.17.3): the file holding the failed
-  // process's output, which the host renders the tail of in the failure
-  // diagnostic. A path in the host's filesystem — a plugin shares the host's
-  // process — normally the target's `log.txt` in its sandbox. Absent = none;
-  // an older host ignores it and shows only `error`.
-  string log_path = 7;
 }

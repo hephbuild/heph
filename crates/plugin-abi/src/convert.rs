@@ -2848,18 +2848,18 @@ mod tests {
             Exit::Signal(15),
             Exit::Signal(9),
         ] {
-            let frame = pb::RunOutFrame {
-                msg: Some(pb::run_out_frame::Msg::Error("boom".to_string())),
+            let failure = pb::RunFailure {
+                message: Some("boom".to_string()),
                 exit: exit_to_pb(e).into(),
                 ..Default::default()
             };
-            assert_eq!(exit_from_pb(via_bytes(&frame).exit), Some(e));
+            assert_eq!(exit_from_pb(via_bytes(&failure).exit), Some(e));
         }
-        let old = pb::RunOutFrame {
-            msg: Some(pb::run_out_frame::Msg::Error("boom".to_string())),
+        let no_exit = pb::RunFailure {
+            message: Some("boom".to_string()),
             ..Default::default()
         };
-        assert_eq!(exit_from_pb(via_bytes(&old).exit), None);
+        assert_eq!(exit_from_pb(via_bytes(&no_exit).exit), None);
         // Present but empty (a status kind this build does not know) is None too.
         assert_eq!(exit_from_pb(pb::ExitStatus::default().into()), None);
     }

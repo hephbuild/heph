@@ -268,12 +268,11 @@ pub use hcore::process::Exit;
 /// A run failure that crossed the plugin seam with a structured exit status
 /// ([`ProcessFailed::exit`] on the plugin's side).
 ///
-/// The wire carries the failure as its rendered message plus the status, so
-/// the host cannot rebuild the plugin's [`ProcessFailed`] — its `status` text
-/// is folded into the message, and its log arrives only as a path (since
-/// 0.17.3, when the log is a file). This keeps the message byte-identical to
-/// what an older host prints from the same frame, and the status readable
-/// through [`process_exit`].
+/// The wire carries the failure (`RunFailure`) as its rendered message, the
+/// status and the log's path, so the host does not rebuild the plugin's
+/// [`ProcessFailed`]: its `status` text is already folded into the message,
+/// which is shown unchanged, and its log arrives only as a path (when it is a
+/// file). The status stays readable through [`process_exit`].
 ///
 /// `#[non_exhaustive]`: built with [`RemoteProcessFailed::new`] outside this
 /// crate, so a later field is not a source break.

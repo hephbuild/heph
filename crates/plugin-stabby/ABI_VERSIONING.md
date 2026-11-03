@@ -12,7 +12,7 @@ in order:
    reads the same whatever layout either side has. The host reads it before
    calling anything else in the plugin and accepts exactly the versions
    matching the caret requirement `^MIN_PLUGIN_ABI` (`crates/plugin-abi/src/lib.rs`;
-   pre-1.0, `^0.17.0` = `>=0.17.0, <0.18.0`), compared as semver. A plugin
+   pre-1.0, `^0.18.0` = `>=0.18.0, <0.19.0`), compared as semver. A plugin
    without the symbol predates 0.17.0 and is refused the same way. A plugin
    from a **later minor** is unsupported and refused: the host cannot know
    what that break changed. A later *patch* loads.
@@ -227,6 +227,14 @@ skipped in silence.
 
 ## History of breaks
 
+- **0.18.0** (break) — a run's terminal failure is one `RunFailure` in
+  `RunOutFrame`'s oneof (7): the message, the exit status and the path of the
+  failed process's log. It replaces `string error` (4) and the out-of-oneof
+  `ExitStatus exit` (5), both now reserved. The host attaches the log to
+  `RemoteProcessFailed`, so a cdylib driver's failure box shows the log tail as
+  an in-process `ProcessFailed` does. A 0.17 peer would see no terminal frame
+  on a failure, so `MIN_PLUGIN_ABI` rises to 0.18.0: every plugin must be
+  rebuilt.
 - **0.17.4** (additive patch) — target resources. `TargetDef.resources` (12,
   `map<string, string>`): the pools a def reserves, each amount as written in
   its pool's unit (only declared pools present, empty means one cpu; a

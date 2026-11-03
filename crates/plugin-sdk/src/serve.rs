@@ -1322,13 +1322,20 @@ fn make_channel_item_stream(rx: tokio::sync::mpsc::Receiver<Vec<u8>>) -> DynItem
 }
 
 fn run_out_err(msg: String) -> pb::RunOutFrame {
+    run_out_failure_frame(pb::RunFailure {
+        message: Some(msg),
+        ..Default::default()
+    })
+}
+
+fn run_out_failure_frame(failure: pb::RunFailure) -> pb::RunOutFrame {
     pb::RunOutFrame {
-        msg: Some(pb::run_out_frame::Msg::Error(msg)),
+        msg: Some(pb::run_out_frame::Msg::Failure(Box::new(failure))),
         ..Default::default()
     }
 }
 
-/// A run response stream that fails immediately (one `RunOutFrame{error}`).
+/// A run response stream that fails immediately (one `RunOutFrame{failure}`).
 fn run_error_stream(msg: String) -> DynItemStream {
     make_item_stream(Box::new(std::iter::once(run_out_err(msg).encode_to_vec())))
 }
@@ -1487,19 +1494,22 @@ fn read_signal_frames(
 }
 
 /// A run's terminal failure frame: the message, plus the process's exit status
-/// when the failure is one ([`hplugin::error::ProcessFailed::exit`]). `error`
-/// stays the terminal frame, so an older host still reports the message.
+/// and the path of its log when the failure is a process's exit
+/// ([`hplugin::error::ProcessFailed`]).
 fn run_out_failure(e: &anyhow::Error) -> pb::RunOutFrame {
-    let mut frame = run_out_err(err_message(e));
+    let mut failure = pb::RunFailure {
+        message: Some(err_message(e)),
+        ..Default::default()
+    };
     if let Some(exit) = hplugin::error::process_exit(e) {
-        frame.exit = convert::exit_to_pb(exit).into();
+        failure.exit = convert::exit_to_pb(exit).into();
         // The log only means something beside an exit: it is the output of the
         // process whose exit failed the run.
         if let Some(path) = hplugin::error::process_log(e).and_then(|l| l.file_path()) {
-            frame.log_path = Some(path.to_string_lossy().into_owned());
+            failure.log_path = Some(path.to_string_lossy().into_owned());
         }
     }
-    frame
+    run_out_failure_frame(failure)
 }
 
 /// An `AsyncWrite` that turns everything written to it into `RunOutFrame`s on the
@@ -2118,10 +2128,13 @@ mod tests {
             &StdCancellationToken::new(),
         ));
         match frame.msg {
-            Some(pb::run_out_frame::Msg::Error(msg)) => assert!(
-                msg.contains("missing field ManagedRunRequest.sandbox_dir"),
-                "{msg}"
-            ),
+            Some(pb::run_out_frame::Msg::Failure(f)) => {
+                let msg = f.message.unwrap_or_default();
+                assert!(
+                    msg.contains("missing field ManagedRunRequest.sandbox_dir"),
+                    "{msg}"
+                );
+            }
             other => panic!("expected an error frame, got {other:?}"),
         }
     }
@@ -2649,7 +2662,8 @@ mod tests {
             &StdCancellationToken::new(),
         ));
         match frame.msg {
-            Some(pb::run_out_frame::Msg::Error(msg)) => {
+            Some(pb::run_out_frame::Msg::Failure(f)) => {
+                let msg = f.message.unwrap_or_default();
                 assert!(
                     msg.contains("compute embedcfg"),
                     "top context present: {msg}"
@@ -2732,12 +2746,13 @@ mod tests {
 
         assert_eq!(frames.len(), 1, "exactly one terminal RunOutFrame then end");
         let frame = pb::RunOutFrame::decode_from_slice(&frames[0][..]).expect("decode RunOutFrame");
-        // A terminal frame (Response or Error) — proves the request was consumed and
+        // A terminal frame (Response or Failure) — proves the request was consumed and
         // the run task's output crossed the response stream; the plumbing is the point.
         assert!(
             matches!(
                 frame.msg,
-                Some(pb::run_out_frame::Msg::Response(_)) | Some(pb::run_out_frame::Msg::Error(_))
+                Some(pb::run_out_frame::Msg::Response(_))
+                    | Some(pb::run_out_frame::Msg::Failure(_))
             ),
             "expected a terminal RunOutFrame, got {:?}",
             frame.msg
@@ -2820,8 +2835,8 @@ mod tests {
 
         let frame = pb::RunOutFrame::decode_from_slice(&frames[0][..]).expect("decode RunOutFrame");
         let msg = match frame.msg {
-            Some(pb::run_out_frame::Msg::Error(e)) => e,
-            other => panic!("expected an Error frame, got {other:?}"),
+            Some(pb::run_out_frame::Msg::Failure(f)) => f.message.unwrap_or_default(),
+            other => panic!("expected a Failure frame, got {other:?}"),
         };
         // Both the outermost context AND the underlying cause must be present.
         assert!(

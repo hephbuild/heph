@@ -114,7 +114,7 @@ fn plugin_abi_version(lib: &libloading::Library) -> Option<String> {
 }
 
 /// The plugin ABI versions this host loads: `^MIN_PLUGIN_ABI`. Pre-1.0 that is
-/// one minor's lane (`^0.17.0` = `>=0.17.0, <0.18.0`): a patch is additive, so
+/// one minor's lane (`^0.18.0` = `>=0.18.0, <0.19.0`): a patch is additive, so
 /// a plugin a few patches newer or older than the host loads; a minor is a
 /// break, which raises `MIN_PLUGIN_ABI` to the new `x.y.0`.
 pub fn accepted_plugin_abi() -> anyhow::Result<semver::VersionReq> {
@@ -579,22 +579,29 @@ fn drain_run(
                 });
             }
             // The message is the plugin's whole rendered chain, unchanged; a
-            // structured exit status rides beside it when the failure is a
+            // structured exit status rides with it when the failure is a
             // process's exit, readable through `hplugin::error::process_exit`.
-            Some(pb::run_out_frame::Msg::Error(e)) => match convert::exit_from_pb(frame.exit) {
-                Some(exit) => {
-                    let mut failed = hplugin::error::RemoteProcessFailed::new(e, exit);
-                    // The plugin shares this process, so its path is ours. The
-                    // engine reads it when it records the failure.
-                    if let Some(path) = frame.log_path.filter(|p| !p.is_empty()) {
-                        failed = failed.with_log(std::sync::Arc::new(
-                            hcore::hartifactcontent::FileContent::new(path),
-                        ));
-                    }
-                    return Err(failed.into());
+            Some(pb::run_out_frame::Msg::Failure(f)) => {
+                let pb::RunFailure {
+                    message,
+                    exit,
+                    log_path,
+                    ..
+                } = *f;
+                let message = message.unwrap_or_default();
+                let Some(exit) = convert::exit_from_pb(exit) else {
+                    anyhow::bail!("{message}");
+                };
+                let mut failed = hplugin::error::RemoteProcessFailed::new(message, exit);
+                // The plugin shares this process, so its path is ours. The
+                // engine reads it when it records the failure.
+                if let Some(path) = log_path.filter(|p| !p.is_empty()) {
+                    failed = failed.with_log(std::sync::Arc::new(
+                        hcore::hartifactcontent::FileContent::new(path),
+                    ));
                 }
-                None => anyhow::bail!("{e}"),
-            },
+                return Err(failed.into());
+            }
             // A dropped receiver means the caller stopped reading; keep draining
             // so the run still reaches its result.
             Some(pb::run_out_frame::Msg::StdoutChunk(b)) => {
