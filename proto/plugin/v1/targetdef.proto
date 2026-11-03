@@ -115,8 +115,11 @@ message TargetDef {
 enum EntrypointWorkdir {
   ENTRYPOINT_WORKDIR_UNSPECIFIED = 0;
   ENTRYPOINT_WORKDIR_CALLER = 1;
-  ENTRYPOINT_WORKDIR_ROOT = 2;
+  // The real workspace root. Was ENTRYPOINT_WORKDIR_ROOT; same number.
+  ENTRYPOINT_WORKDIR_TREE_ROOT = 2;
   ENTRYPOINT_WORKDIR_SANDBOX = 3;
+  // The target's package dir in the real tree (since 0.17.3).
+  ENTRYPOINT_WORKDIR_TREE_PACKAGE = 4;
 }
 
 // Mirrors driver::targetdef::Entrypoint. `workdir` is required; `accepts_args`
