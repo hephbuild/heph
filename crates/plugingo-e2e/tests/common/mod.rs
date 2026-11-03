@@ -146,22 +146,22 @@ const HERMETIC_GO_CHECKSUMS: &[(&str, &str, &str)] = &[
     (
         "linux",
         "amd64",
-        "675c26c449cbb18fc24b74650de1eabbae6e16f64326fd85a283fb3b58280685",
+        "65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40",
     ),
     (
         "linux",
         "arm64",
-        "51798d2c42d0e1c6ed7fd9f48728b4193abac9e8aad6dbac2fe96a81f5909bda",
+        "a06e99309dbcbdca1a8ccd2282c3ee146e55930886e26b4f1193269587165f49",
     ),
     (
         "darwin",
         "amd64",
-        "d3314e25496e4381d71a5c51d2907e7af655d199f6780b549f015bd85fef4986",
+        "b6f8e931e4ab497fcde6da8ae4499a58f9d258e55c8a80824a516eae5950a750",
     ),
     (
         "darwin",
         "arm64",
-        "90493b3bbd5e10f91d12153198bf1994fd756399b4fec93b49b0c6e2acdeeb3e",
+        "dd3908cf20959d798c1e06ebe5b72213f0505ce01373b40ce3110975a6cd99c2",
     ),
 ];
 
@@ -325,6 +325,11 @@ pub fn make_workspace_hermetic(dir: TempDir) -> anyhow::Result<Workspace> {
 /// A published heph release whose `heph-govet_<goos>_<goarch>` assets the lint
 /// suite downloads (via the built-in `http_fetch` driver, as a real workspace
 /// does). Pinned rather than "latest" so the fetch is reproducible.
+///
+/// Only the download path is tested against it, on a package that reads no
+/// archive: this release is built with go1.26, whose `go/types` cannot read the
+/// export data of the shell's Go. Lint behavior is tested with the tree's
+/// heph-govet ([`make_workspace_tree_govet`]).
 pub const GOVET_RELEASE: &str = "v1.0.0-alpha-build.177.721+g21169b25";
 
 /// The `govet` provider option pointing at [`GOVET_RELEASE`]'s download target.

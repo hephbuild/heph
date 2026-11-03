@@ -1,6 +1,6 @@
 module github.com/heph/tools/heph-govet
 
-go 1.27.0
+go 1.27.3
 
 require (
 	github.com/golangci/gofmt v0.0.0-20260820135601-e84e05053792

@@ -15,13 +15,19 @@ use common::require_go;
 /// denied"): nothing below the `_lint-analyze` target's own `run` was at fault — the bits
 /// on the staged file are right — so the failure can only be reproduced by
 /// actually exec'ing it, which is what this does.
+///
+/// The package imports only `unsafe`, so the release reads no archive. That keeps
+/// the test about the download: the pinned release is a frozen tool, and what it
+/// can read of the shell's Go (an older `go/types` panics on a newer export
+/// format, as Go 1.27.2's was) or of the driver's cfg is no longer what ships.
+/// The tests below cover that, with the tree's heph-govet.
 #[tokio::test]
 async fn test_lint_execs_the_downloaded_govet() -> anyhow::Result<()> {
     require_go!();
-    let ws = common::make_workspace_host(common::fixture("with_dep")?)?;
+    let ws = common::make_workspace_host(common::fixture("lint_unsafe")?)?;
 
     // `_lint-analyze` is the analyze unit: it runs heph-govet and writes facts + report.
-    let result = ws.run("//lib:_lint-analyze@v=host").await?;
+    let result = ws.run("//mem:_lint-analyze@v=host").await?;
 
     let paths = common::artifact_paths(&result);
     assert!(
