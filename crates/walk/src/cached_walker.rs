@@ -139,6 +139,28 @@ pub struct FileHash {
     pub hashout: String,
 }
 
+/// Identity of one `fs` glob entry: its workspace-relative `out_path`
+/// (`/`-separated) bound to its [`file_hashout`].
+///
+/// A consumer's `hashin` folds the *sorted* hashouts of its inputs and nothing
+/// else about them — no names, no paths. A glob addr names only its pattern, so
+/// with a bare content hash per entry, renaming a matched file (same bytes) or
+/// swapping two files' contents left the consumer's key unchanged and served a
+/// result computed for another tree. Binding the path here is the only place it
+/// can reach the key.
+///
+/// The tag keeps this domain apart from any other xxh3 of a string; the NUL
+/// separators cannot occur in a path or in a hex digest, so `(path, hash)` pairs
+/// cannot be re-split into another pair with the same input bytes.
+pub fn glob_entry_hashout(out_path: &str, content_hashout: &str) -> String {
+    let mut h = Xxh3::new();
+    h.update(b"fs_glob_entry\0");
+    h.update(out_path.as_bytes());
+    h.update(b"\0");
+    h.update(content_hashout.as_bytes());
+    format!("{:x}", h.digest())
+}
+
 /// Content identity for a sourced file: a hash of its bytes plus the executable
 /// marker. Deliberately ignores size and mtime — only the content and the `x`
 /// bit determine the artifact, so a file rewritten with identical bytes (new

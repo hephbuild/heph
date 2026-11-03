@@ -27,6 +27,7 @@ mod engine_core;
 mod engine_sanity;
 mod execrunner;
 mod force;
+mod fs_glob;
 mod group;
 mod group_relocate;
 mod home_dir;
