@@ -85,15 +85,32 @@ fn split_filters(rest: &str) -> Vec<String> {
     out
 }
 
+/// Byte offset of the `[` that opens a trailing filter suffix: the last `[`
+/// outside a quoted arg value. A quoted value may hold a `[` of its own — an fs
+/// glob's character class, `e="[!_.]*.c"` — and that one is part of the addr.
+/// Addr quoting has no escapes (`htaddr::parse`), so a `"` always toggles.
+fn filter_bracket(v: &str) -> Option<usize> {
+    let mut quoted = false;
+    let mut last = None;
+    for (i, b) in v.bytes().enumerate() {
+        match b {
+            b'"' => quoted = !quoted,
+            b'[' if !quoted => last = Some(i),
+            _ => {}
+        }
+    }
+    last
+}
+
 impl TargetAddr {
     pub fn parse(v: &str, base: &PkgBuf) -> anyhow::Result<Self> {
         // Strip optional trailing [filter1,filter2] suffix.
-        // bracket is a byte offset from rfind; '[' is ASCII so split_at is always on a char boundary.
-        let (v, filters) = if let Some(bracket) = v.rfind('[') {
+        // bracket is a byte offset of an ASCII '[', so split_at is always on a char boundary.
+        let (v, filters) = if let Some(bracket) = filter_bracket(v) {
             let (addr_part, bracket_part) = v.split_at(bracket);
             let rest = bracket_part
                 .strip_prefix('[')
-                .expect("split_at(rfind('[')) guarantees '['");
+                .expect("split_at(filter_bracket) guarantees '['");
             let rest = rest
                 .strip_suffix(']')
                 .ok_or_else(|| anyhow::anyhow!("unclosed '[' in target addr: {v}"))?;
@@ -150,6 +167,29 @@ mod tests {
         let t = TargetAddr::parse("//foo:bar[a.go,b.go]", &base()).unwrap();
         assert!(t.output.is_none());
         assert_eq!(t.filters, vec!["a.go", "b.go"]);
+    }
+
+    /// A `[` inside a quoted arg is the addr's, not a filter suffix: the
+    /// names lane of a Go package excludes `[!_.]*.c`, and every `_golist` that
+    /// depended on it failed to parse.
+    #[test]
+    fn parse_bracket_inside_quoted_arg_is_not_a_filter() {
+        let v = r#"//@heph/fs:glob@e="**/*.go,[!_.]*.c",m=names,p=**/*"#;
+        let t = TargetAddr::parse(v, &base()).unwrap();
+        assert!(t.filters.is_empty());
+        assert!(t.output.is_none());
+        assert_eq!(
+            t.r#ref.args.get("e").map(String::as_str),
+            Some("**/*.go,[!_.]*.c")
+        );
+
+        // ...and a real filter suffix after such an arg is still one.
+        let t = TargetAddr::parse(&format!("{v}[a.c]"), &base()).unwrap();
+        assert_eq!(t.filters, vec!["a.c"]);
+        assert_eq!(
+            t.r#ref.args.get("e").map(String::as_str),
+            Some("**/*.go,[!_.]*.c")
+        );
     }
 
     #[test]
