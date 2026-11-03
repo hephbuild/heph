@@ -356,9 +356,10 @@ impl ManagedDriver for GoLintDriver {
 
     async fn run<'a, 'io>(
         &self,
-        req: ManagedRunRequest<'a, 'io>,
+        mut req: ManagedRunRequest<'a, 'io>,
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ManagedRunResponse> {
+        let res: anyhow::Result<ManagedRunResponse> = async {
         let def = req.request.target.def_de::<GoLintDef>();
         let pkg_dir = &req.sandbox_pkg_dir;
 
@@ -459,6 +460,7 @@ impl ManagedDriver for GoLintDriver {
                 ],
                 &env,
                 pkg_dir,
+                &req.sandbox_dir.join("log.txt"),
                 super::runner::runner_ref(req.request.request_id, def.runner.as_ref()),
                 ctoken,
             )
@@ -479,6 +481,13 @@ impl ManagedDriver for GoLintDriver {
         }
 
         Ok(ManagedRunResponse { artifacts: vec![] })
+        }
+        .await;
+        // heph-govet's output is captured, not streamed: see `echo_failure_log`.
+        if let Err(e) = &res {
+            hdriver_support::driver_managed::echo_failure_log(&mut req.request, e).await;
+        }
+        res
     }
 }
 
@@ -531,12 +540,18 @@ impl GoLintDriver {
     /// Run `heph-govet`, returning captured stdout (the `-json` report). A
     /// non-zero exit means the tool itself failed (bad cfg, type-check error) —
     /// findings do NOT fail here, `-json` makes the tool exit 0 for those.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one private helper threading a single `heph-govet` invocation; \
+                  grouping these into a struct would only move the argument list"
+    )]
     async fn exec_govet(
         &self,
         govet_bin: &std::path::Path,
         args: Vec<OsString>,
         env: &HashMap<String, String>,
         cwd: &std::path::Path,
+        log: &std::path::Path,
         runner: hexecrunner::RunnerRef<'_>,
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<Vec<u8>> {
@@ -559,13 +574,11 @@ impl GoLintDriver {
             .await
             .context("wait for heph-govet")?;
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            anyhow::bail!(
-                "heph-govet failed ({}):\nstderr:\n{}\nstdout:\n{}",
-                output.status,
-                hplugin::error::last_n_lines(stderr.trim(), 20),
-                hplugin::error::last_n_lines(stdout.trim(), 20),
+            // The tool's output goes to the target's log, whose tail the
+            // failure box renders, rather than into the message.
+            return Err(
+                anyhow::Error::new(hplugin::error::ProcessFailed::from_output(log, &output))
+                    .context("heph-govet failed"),
             );
         }
         Ok(output.stdout)

@@ -236,6 +236,8 @@ struct ModuleFetch<'a> {
     /// Outside the directory outputs are collected from, so the stub go.mod can
     /// never end up in an artifact.
     cwd: &'a Path,
+    /// The target's `log.txt`: where a failed download's output goes.
+    log: &'a Path,
 }
 
 /// Run `go mod download` for one module and return the directory `go` put it in.
@@ -251,6 +253,7 @@ async fn fetch_module(
         env,
         gomodcache,
         cwd,
+        log,
     } = fetch;
     let mod_at_ver = format!("{module}@{version}");
 
@@ -282,14 +285,16 @@ async fn fetch_module(
         .await
         .with_context(|| format!("wait for go mod download {mod_at_ver}"))?;
     if !output.status.success() {
-        anyhow::bail!(
-            "go mod download {mod_at_ver} failed ({}):\n{}\n{}",
-            output.status,
-            crate::plugingo::driver_compile::go_failure_detail(
-                &String::from_utf8_lossy(&output.stdout),
-                &String::from_utf8_lossy(&output.stderr),
+        // What go said (the `-json` record's `Error` on stdout, `git`'s and the
+        // network's complaints on stderr) goes to the target's log, whose tail
+        // the failure box renders. The message keeps heph's own hint.
+        return Err(
+            anyhow::Error::new(hplugin::error::ProcessFailed::from_output(log, &output)).context(
+                format!(
+                    "go mod download {mod_at_ver} failed. {}",
+                    passed_env_note(env)
+                ),
             ),
-            passed_env_note(env)
         );
     }
 
@@ -480,9 +485,10 @@ impl ManagedDriver for GoDownloadDriver {
 
     async fn run<'a, 'io>(
         &self,
-        req: ManagedRunRequest<'a, 'io>,
+        mut req: ManagedRunRequest<'a, 'io>,
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ManagedRunResponse> {
+        let res: anyhow::Result<ManagedRunResponse> = async {
         let def = req.request.target.def_de::<GoDownloadDef>();
         let runner =
             crate::plugingo::runner::runner_ref(req.request.request_id, def.runner.as_ref());
@@ -520,6 +526,7 @@ impl ManagedDriver for GoDownloadDriver {
                 env: &env,
                 gomodcache: &gomodcache,
                 cwd: &req.sandbox_dir,
+                log: &req.sandbox_dir.join("log.txt"),
             },
             runner,
             ctoken,
@@ -543,6 +550,14 @@ impl ManagedDriver for GoDownloadDriver {
         })?;
 
         Ok(ManagedRunResponse { artifacts: vec![] })
+        }
+        .await;
+        // `go mod download`'s output is captured, not streamed: see
+        // `echo_failure_log`.
+        if let Err(e) = &res {
+            hdriver_support::driver_managed::echo_failure_log(&mut req.request, e).await;
+        }
+        res
     }
 }
 
@@ -943,6 +958,7 @@ mod tests {
                 env: &env,
                 gomodcache: Path::new("/cache"),
                 cwd,
+                log: &cwd.join("log.txt"),
             },
             hexecrunner::RunnerRef::local(),
             &ct,
@@ -977,9 +993,22 @@ exit 1"#,
         let err = fetch(&go, dir.path()).await.unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("a.b/c@v1"), "{msg}");
-        assert!(msg.contains("unknown revision v1"), "{msg}");
-        assert!(msg.contains("dial tcp: refused"), "{msg}");
         assert!(msg.contains("Set here: GOPROXY."), "{msg}");
+        // What go said is the failure's log, not pasted into the message.
+        assert!(!msg.contains("unknown revision v1"), "{msg}");
+        assert_eq!(
+            hplugin::error::process_exit(&err),
+            Some(hplugin::error::Exit::Code(1))
+        );
+        let log = std::fs::read_to_string(dir.path().join("log.txt")).expect("log.txt");
+        assert!(log.contains("unknown revision v1"), "{log}");
+        assert!(log.contains("dial tcp: refused"), "{log}");
+        assert!(
+            hplugin::error::process_log(&err)
+                .and_then(|l| l.file_path())
+                .is_some(),
+            "the failure carries the log"
+        );
         assert!(
             !msg.contains("secret"),
             "a proxy URL can hold credentials: {msg}"
