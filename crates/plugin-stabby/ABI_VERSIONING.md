@@ -227,6 +227,16 @@ skipped in silence.
 
 ## History of breaks
 
+- **0.17.4** (additive patch) — target resources. `TargetDef.resources` (12,
+  `map<string, uint64>`): the pools a def reserves (`cpu` micro-CPUs, `memory`
+  bytes, custom pools a count; only declared pools present, empty means one cpu).
+  `ManagedRunRequest.allotment` (15, `Allotment { cpu, memory_bytes }`): what the
+  host reserved, told to the target as `HEPH_CPUS` / `HEPH_MEMORY_BYTES`; absent
+  means "told nothing". A 0.17.3 plugin's defs reserve one cpu and it ignores the
+  allotment; a 0.17.4 plugin on a 0.17.3 host loses its `resources` at decode and
+  is told nothing. Neither field is hashed. `TargetDef` struct literals in SDK
+  code need the new field (a source break, not a wire break). `MIN_PLUGIN_ABI`
+  stays 0.17.0.
 - **0.17.3** (additive patch) — `EntrypointWorkdir.TREE_PACKAGE` (4): an
   entrypoint run in its package's dir in the real tree. `ROOT` (2) is renamed
   `TREE_ROOT`, same number, so the wire is unchanged. A def carrying the new

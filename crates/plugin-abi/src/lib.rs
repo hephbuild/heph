@@ -32,6 +32,20 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// the new `x.y.0`. The 0.14.0 and 0.15.0 entries below predate it — they were
 /// additive minors, and there was no version check to read them.
 ///
+/// 0.17.4 (additive, a patch): target resources. `TargetDef.resources` (12,
+/// `map<string, uint64>`) — the pools a def reserves while it runs (`cpu` in
+/// micro-CPUs, `memory` in bytes, a custom pool a count), only declared pools
+/// present; `ManagedRunRequest.allotment` (15, message `Allotment { cpu,
+/// memory_bytes }`) — what the host reserved, which the driver tells the target
+/// as `HEPH_CPUS` / `HEPH_MEMORY_BYTES`. The skew, both ways: a 0.17.3 plugin
+/// sends no `resources`, so its defs decode empty and reserve one cpu, and
+/// ignores `allotment`; a 0.17.4 plugin on a 0.17.3 host has its `resources`
+/// dropped at decode (every def costs one cpu there, a custom-pool exclusion is
+/// lost) and is sent no `allotment`, which means "told nothing" — it sets no
+/// allotment env. Neither is hashed. No plugin must be rebuilt; the SDK's Rust
+/// source does change (`TargetDef` gains a field and is not `#[non_exhaustive]`,
+/// so a struct literal without `..Default::default()` stops compiling).
+///
 /// 0.17.3 (additive, a patch): `EntrypointWorkdir.TREE_PACKAGE` (4), the
 /// target's package dir in the real tree; `ROOT` (2) is renamed `TREE_ROOT` at
 /// the same number. An older host refuses a def carrying the new value at
@@ -217,7 +231,7 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// 0.3.0: `PluginComponents` gained a `hooks` field (a layout change to the
 /// create-entry struct) for the Hook plugin kind — a hard break, so every plugin
 /// must be rebuilt against this ABI.
-pub const ABI_SEMVER: &str = "0.17.3";
+pub const ABI_SEMVER: &str = "0.17.4";
 
 /// The start of the ABI lane this host loads: a plugin is accepted iff its
 /// version matches the caret requirement `^MIN_PLUGIN_ABI` — pre-1.0, one
@@ -234,7 +248,7 @@ pub const MIN_PLUGIN_ABI: &str = "0.17.0";
 
 /// [`ABI_SEMVER`], NUL-terminated: what a plugin's `heph_plugin_abi_semver`
 /// entry returns a pointer to. Bumped with it; a test holds the two equal.
-pub const ABI_SEMVER_C: &std::ffi::CStr = c"0.17.3";
+pub const ABI_SEMVER_C: &std::ffi::CStr = c"0.17.4";
 
 /// Decode a wire message from a trusted peer.
 ///

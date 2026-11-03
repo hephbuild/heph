@@ -198,6 +198,18 @@ message ManagedRunRequest {
   // build's sandboxed, captured run. The host sends it only for a def that
   // declared an entrypoint, so a plugin that predates it never receives one.
   RunOptions options = 14;
+  // What the host reserved for this run (since 0.17.4). Absent means "told
+  // nothing" — what every older host sends — and the driver sets no allotment
+  // env.
+  Allotment allotment = 15;
+}
+
+// Mirrors driver::Allotment (since 0.17.4): the share of the machine a run was
+// granted. `cpu` is whole CPUs, at least 1; `memory_bytes` is present only when
+// the target declared memory.
+message Allotment {
+  uint32 cpu = 1;
+  uint64 memory_bytes = 2;
 }
 
 // Mirrors driver::RunOptions. Every field is absent unless set, and absence is

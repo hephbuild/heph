@@ -108,6 +108,90 @@ pub struct TargetSpec {
     pub approval: Approval,
 }
 
+/// The name of a resource pool a target reserves from (`cpu`, `memory`, or a
+/// custom pool such as `docker`): `[a-z][a-z0-9_]{0,63}`.
+///
+/// The one check of that syntax, shared by the BUILD-file parser
+/// ([`Resources::from_config`](crate::driver::Resources::from_config)), the
+/// config parser and the wire decoder, so a name one of them accepts is never
+/// refused by another. Built only through [`TryFrom`], so holding one is proof
+/// the name is well-formed.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct PoolName(String);
+
+impl PoolName {
+    /// The longest a pool name may be.
+    pub const MAX_LEN: usize = 64;
+    /// The CPU pool, in micro-CPUs.
+    pub const CPU: &'static str = "cpu";
+    /// The memory pool, in bytes.
+    pub const MEMORY: &'static str = "memory";
+
+    /// The `cpu` pool.
+    pub fn cpu() -> Self {
+        Self(Self::CPU.to_string())
+    }
+
+    /// The `memory` pool.
+    pub fn memory() -> Self {
+        Self(Self::MEMORY.to_string())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Whether `s` is a well-formed pool name, without allocating.
+    pub fn is_valid(s: &str) -> bool {
+        let mut bytes = s.bytes();
+        matches!(bytes.next(), Some(b'a'..=b'z'))
+            && s.len() <= Self::MAX_LEN
+            && bytes.all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_'))
+    }
+}
+
+impl TryFrom<String> for PoolName {
+    type Error = anyhow::Error;
+
+    fn try_from(s: String) -> anyhow::Result<Self> {
+        if Self::is_valid(&s) {
+            return Ok(Self(s));
+        }
+        anyhow::bail!(
+            "{s:?} is not a valid pool name: a pool name is a lowercase ASCII letter followed by \
+             at most {} lowercase letters, digits or `_`",
+            Self::MAX_LEN - 1
+        )
+    }
+}
+
+impl TryFrom<&str> for PoolName {
+    type Error = anyhow::Error;
+
+    fn try_from(s: &str) -> anyhow::Result<Self> {
+        Self::try_from(s.to_string())
+    }
+}
+
+impl From<PoolName> for String {
+    fn from(p: PoolName) -> Self {
+        p.0
+    }
+}
+
+impl std::fmt::Display for PoolName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::borrow::Borrow<str> for PoolName {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
 pub trait ProviderExecutor: Send + Sync {
     /// Resolve a target's result.
     ///

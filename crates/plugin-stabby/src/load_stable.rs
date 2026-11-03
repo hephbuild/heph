@@ -1069,6 +1069,12 @@ impl StableRemoteManagedDriver {
                 .map(convert::credential_mount_to_pb)
                 .collect(),
             deferred,
+            allotment: req
+                .request
+                .allotment
+                .as_ref()
+                .map(convert::allotment_to_pb)
+                .into(),
             ..Default::default()
         };
         // `run` is bidi: the request stream carries the run request (RunInFrame),

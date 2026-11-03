@@ -29,6 +29,41 @@ pub fn parse_size(s: &str) -> anyhow::Result<u64> {
         .ok_or_else(|| anyhow::anyhow!("size {s:?} overflows"))
 }
 
+/// Parse a memory amount (`4G`, `4GiB`, `4096M`, `4096`) into bytes: the one
+/// parser behind a target's `resources.memory` and a config file's memory
+/// capacity, so `4G` means the same thing in a BUILD file and in `.hephconfig`.
+///
+/// Stricter than [`parse_size`] on purpose: an amount is ASCII digits followed
+/// immediately by an optional binary unit (`K`, `M`, `G`, `T`, each optionally
+/// followed by `B` or `iB`, any case; `B` or nothing is bytes). No whitespace
+/// anywhere, no sign, no fraction, no exponent, no `_` separator, no non-ASCII
+/// digit — each is a typo more often than a meaning, and a reservation that
+/// silently read as something else is worse than one refused.
+pub fn parse_memory_size(s: &str) -> anyhow::Result<u64> {
+    let digits = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let (num, unit) = s.split_at(digits);
+    if num.is_empty() {
+        anyhow::bail!(
+            "memory amount {s:?} must start with an ASCII digit; write e.g. \"4G\", \"512M\" or \"1024\""
+        );
+    }
+    let n: u64 = num
+        .parse()
+        .with_context(|| format!("memory amount {s:?} is too large"))?;
+    let mult: u64 = match unit.to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "k" | "kb" | "kib" => 1 << 10,
+        "m" | "mb" | "mib" => 1 << 20,
+        "g" | "gb" | "gib" => 1 << 30,
+        "t" | "tb" | "tib" => 1 << 40,
+        _ => anyhow::bail!(
+            "memory amount {s:?} has an unknown unit {unit:?}; use K, M, G or T right after the digits (e.g. \"4G\")"
+        ),
+    };
+    n.checked_mul(mult)
+        .ok_or_else(|| anyhow::anyhow!("memory amount {s:?} overflows 64 bits of bytes"))
+}
+
 /// Format a byte count the way a person reads one (`512 B`, `3.4 KiB`,
 /// `1.2 GiB`).
 ///
@@ -125,6 +160,49 @@ mod tests {
     #[test]
     fn parse_size_does_not_overflow_silently() {
         assert!(parse_size("99999999999999999999TiB").is_err());
+    }
+
+    #[test]
+    fn memory_size_parse_table() {
+        const G: u64 = 1 << 30;
+        let ok: &[(&str, u64)] = &[
+            ("4G", 4 * G),
+            ("4g", 4 * G),
+            ("4GiB", 4 * G),
+            ("4GB", 4 * G),
+            ("4096M", 4 * G),
+            ("4096", 4096),
+            ("0", 0),
+            ("17179869183G", 17_179_869_183 * G),
+        ];
+        for (s, want) in ok {
+            assert_eq!(
+                parse_memory_size(s).unwrap_or_else(|e| panic!("{s:?}: {e:#}")),
+                *want,
+                "{s:?}"
+            );
+        }
+        let err: &[&str] = &[
+            "4 G",
+            "",
+            "G",
+            "4GG",
+            "-4G",
+            "+4G",
+            "4.5G",
+            "1_000",
+            "4e3",
+            "4G\n",
+            " 4G",
+            "\u{FF14}G",    // fullwidth 4
+            "4\u{00A0}G",   // NBSP
+            "\u{0664}G",    // Arabic-Indic 4
+            "17179869184G", // the checked_mul edge: 2^34 GiB = 2^64
+            "99999999999999999999G",
+        ];
+        for s in err {
+            assert!(parse_memory_size(s).is_err(), "{s:?} must be refused");
+        }
     }
 }
 

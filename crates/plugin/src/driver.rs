@@ -1,9 +1,13 @@
+use anyhow::Context as _;
 use async_trait::async_trait;
 use hcore::hasync;
+use hcore::htvalue::Value;
 use hmodel::htaddr;
 use hmodel::htaddr::Addr;
 use hmodel::htpkg::PkgBuf;
+use itertools::Itertools as _;
 use serde::{Deserialize, Deserializer, Serialize};
+use std::collections::HashMap;
 use std::fmt::Display;
 use std::path::PathBuf;
 
@@ -671,6 +675,19 @@ pub mod targetdef {
         #[serde(serialize_with = "serialize_hash")]
         pub hash: Vec<u8>,
         pub transparent: bool,
+        /// What the target reserves from the engine's pools while it runs:
+        /// only the pools it declared, defaults applied by
+        /// [`Resources::amount`](super::Resources::amount).
+        ///
+        /// Set by the driver's `parse` from the `resources` config key through
+        /// [`Resources::from_config`](super::Resources::from_config). **Never
+        /// part of a def hash**: a target's outputs must not depend on what it
+        /// reserved. Crosses the plugin ABI as `pb::TargetDef.resources`
+        /// (since 0.17.4); a def from an older plugin decodes empty. Skipped
+        /// when empty, so `inspect def --json` of every other target is
+        /// unchanged.
+        #[serde(skip_serializing_if = "super::Resources::is_empty")]
+        pub resources: super::Resources,
     }
 
     /// For tests and struct-update syntax (`..Default::default()`); `raw_def` is
@@ -689,6 +706,7 @@ pub mod targetdef {
                 pty: false,
                 hash: Vec::new(),
                 transparent: false,
+                resources: super::Resources::default(),
             }
         }
     }
@@ -1215,6 +1233,389 @@ pub struct CredentialMount {
 /// than left for someone to discover in a log.
 pub const REDACT_MIN_LEN: usize = 8;
 
+/// What a target reserves from the engine's resource pools while it runs.
+///
+/// Holds only the pools the target **declared**; [`amount`](Self::amount)
+/// applies the defaults (`cpu` one CPU, every other pool nothing). Units:
+/// `cpu` is micro-CPUs ([`MICROS_PER_CPU`](Self::MICROS_PER_CPU) per CPU),
+/// `memory` bytes, a custom pool a count.
+///
+/// A driver builds it with [`from_config`](Self::from_config) in its `parse`
+/// and sets [`TargetDef::resources`](targetdef::TargetDef::resources). It is
+/// never hashed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Resources(std::collections::BTreeMap<crate::provider::PoolName, u64>);
+
+/// `2^53`: an `f64` holds every integer up to here exactly, and none above it
+/// reliably. `starlark_to_rust` turns an int that does not fit an `i32`
+/// into a float, so a float that is an exact integer up to here is read as
+/// that integer.
+const MAX_EXACT_INT_FLOAT: f64 = 9_007_199_254_740_992.0;
+
+impl Resources {
+    /// The `target()` config key a declaration rides on.
+    pub const CONFIG_KEY: &'static str = "resources";
+    /// The most pools one target may name.
+    pub const MAX_POOLS: usize = 16;
+    /// Micro-CPUs in one CPU: the `cpu` pool's unit.
+    pub const MICROS_PER_CPU: u64 = 1_000_000;
+    /// What a target that declares no `cpu` reserves: one CPU.
+    pub const DEFAULT_CPU_MICROS: u64 = Self::MICROS_PER_CPU;
+
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Parse the `resources` key of a target's config. Absent or `None` is
+    /// no declaration.
+    ///
+    /// The only parser of the key. Errors describe the value, not the target:
+    /// the caller (the driver's `parse`) adds which target it was.
+    pub fn from_config(config: &HashMap<String, Value>) -> anyhow::Result<Self> {
+        match config.get(Self::CONFIG_KEY) {
+            None => Ok(Self::default()),
+            Some(v) => Self::from_value(v),
+        }
+    }
+
+    /// Parse a `resources` value: `None`, or a dict of pool name to amount.
+    ///
+    /// - `cpu`: a number ≥ 0, in steps of 0.000001 CPU (rounded to the nearest
+    ///   step); a value above 0 and below one step is refused.
+    /// - `memory`: a whole number of bytes, or a size string
+    ///   ([`parse_memory_size`](hcore::units::parse_memory_size)).
+    /// - any other pool: a whole number ≥ 0.
+    ///
+    /// A float that is an exact integer up to 2^53 counts as that integer,
+    /// because the BUILD-file bridge hands an int that does not fit 32 bits
+    /// over as a float.
+    pub fn from_value(v: &Value) -> anyhow::Result<Self> {
+        let map = match v {
+            Value::Null() => return Ok(Self::default()),
+            Value::Map(m) => m,
+            other => anyhow::bail!(
+                "`resources` must be a dict of pool name to amount, e.g. {{\"cpu\": 2}}; got {}",
+                value_kind(other)
+            ),
+        };
+        if map.len() > Self::MAX_POOLS {
+            anyhow::bail!(
+                "`resources` names {} pools; at most {} are allowed",
+                map.len(),
+                Self::MAX_POOLS
+            );
+        }
+        let mut out = std::collections::BTreeMap::new();
+        // Sorted, so the error for a dict with two bad keys is always the same one.
+        for (k, v) in map.iter().sorted_by(|a, b| a.0.cmp(b.0)) {
+            let pool = crate::provider::PoolName::try_from(k.as_str())
+                .with_context(|| format!("in `resources` key {k:?}"))?;
+            let amount = match pool.as_str() {
+                crate::provider::PoolName::CPU => parse_cpu_micros(v),
+                crate::provider::PoolName::MEMORY => parse_memory_bytes(v),
+                _ => parse_whole(v),
+            }
+            .with_context(|| format!("in `resources.{pool}`"))?;
+            out.insert(pool, amount);
+        }
+        Ok(Self(out))
+    }
+
+    /// Build from wire pairs (`pb::TargetDef.resources`), checking every name
+    /// and the pool count as [`from_value`](Self::from_value) does.
+    pub fn try_from_pairs(pairs: impl IntoIterator<Item = (String, u64)>) -> anyhow::Result<Self> {
+        let mut out = Self::default();
+        for (k, v) in pairs {
+            out.insert(crate::provider::PoolName::try_from(k)?, v)?;
+        }
+        Ok(out)
+    }
+
+    /// Declare `amount` of `pool`, replacing an earlier declaration of it.
+    /// Fails when it would be the [`MAX_POOLS`](Self::MAX_POOLS)+1th pool.
+    pub fn insert(
+        &mut self,
+        pool: crate::provider::PoolName,
+        amount: u64,
+    ) -> anyhow::Result<Option<u64>> {
+        if self.0.len() >= Self::MAX_POOLS && !self.0.contains_key(&pool) {
+            anyhow::bail!(
+                "cannot declare pool {pool}: a target names at most {} pools",
+                Self::MAX_POOLS
+            );
+        }
+        Ok(self.0.insert(pool, amount))
+    }
+
+    /// Whether nothing was declared (the target reserves the defaults).
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// How many pools were declared.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// The declared amount of `pool`, `None` when undeclared.
+    pub fn declared(&self, pool: &str) -> Option<u64> {
+        self.0.get(pool).copied()
+    }
+
+    /// What the target reserves from `pool`: the declared amount, else the
+    /// default — [`DEFAULT_CPU_MICROS`](Self::DEFAULT_CPU_MICROS) for `cpu`,
+    /// 0 for every other pool.
+    pub fn amount(&self, pool: &str) -> u64 {
+        match self.declared(pool) {
+            Some(n) => n,
+            None if pool == crate::provider::PoolName::CPU => Self::DEFAULT_CPU_MICROS,
+            None => 0,
+        }
+    }
+
+    /// The declared pools, in name order.
+    pub fn iter(&self) -> impl Iterator<Item = (&crate::provider::PoolName, u64)> {
+        self.0.iter().map(|(k, v)| (k, *v))
+    }
+}
+
+fn value_kind(v: &Value) -> &'static str {
+    match v {
+        Value::String(_) => "a string",
+        Value::Bool(_) => "a bool",
+        Value::Float(_) => "a float",
+        Value::Int(_) | Value::Uint(_) => "an int",
+        Value::Null() => "None",
+        Value::Map(_) => "a dict",
+        Value::List(_) => "a list",
+    }
+}
+
+/// A float that is an exact non-negative integer an `f64` represents without
+/// loss, as that integer.
+fn exact_int_float(f: f64) -> Option<u64> {
+    (f.is_finite() && f >= 0.0 && f.fract() == 0.0 && f <= MAX_EXACT_INT_FLOAT)
+        .then(|| integral_f64_to_u64(f))
+}
+
+/// `f` as a `u64`, for an `f` the caller has checked is finite, integral,
+/// non-negative and below 2^64.
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "callers check f is non-negative, integral and below 2^64"
+)]
+fn integral_f64_to_u64(f: f64) -> u64 {
+    f as u64
+}
+
+fn check_float(f: f64) -> anyhow::Result<()> {
+    if !f.is_finite() {
+        anyhow::bail!("{f} is not a finite number");
+    }
+    if f < 0.0 {
+        anyhow::bail!("{f} is negative; an amount is at least 0");
+    }
+    if f.fract() == 0.0 && f > MAX_EXACT_INT_FLOAT {
+        anyhow::bail!("{f} is too large: whole amounts above 2**53 cannot be represented exactly");
+    }
+    Ok(())
+}
+
+/// A whole number ≥ 0: an int, or a float that is exactly one.
+fn parse_whole(v: &Value) -> anyhow::Result<u64> {
+    match v {
+        Value::Int(i) => {
+            u64::try_from(*i).with_context(|| format!("{i} is negative; an amount is at least 0"))
+        }
+        Value::Uint(u) => Ok(*u),
+        Value::Float(f) => {
+            check_float(*f)?;
+            exact_int_float(*f).ok_or_else(|| anyhow::anyhow!("{f} is not a whole number"))
+        }
+        other => anyhow::bail!("expected a whole number, got {}", value_kind(other)),
+    }
+}
+
+fn parse_cpu_micros(v: &Value) -> anyhow::Result<u64> {
+    let overflow = || anyhow::anyhow!("{} CPUs is too large", display_number(v));
+    let f = match v {
+        Value::Int(_) | Value::Uint(_) => {
+            return parse_whole(v)?
+                .checked_mul(Resources::MICROS_PER_CPU)
+                .ok_or_else(overflow);
+        }
+        Value::Float(f) => *f,
+        other => anyhow::bail!(
+            "expected a number of CPUs (e.g. 2 or 0.5), got {}",
+            value_kind(other)
+        ),
+    };
+    check_float(f)?;
+    if let Some(n) = exact_int_float(f) {
+        return n
+            .checked_mul(Resources::MICROS_PER_CPU)
+            .ok_or_else(overflow);
+    }
+    if f < 0.000_001 {
+        anyhow::bail!("{f} CPUs is below the smallest step, 0.000001; use 0 to reserve no CPU");
+    }
+    let micros = (f * Resources::MICROS_PER_CPU as f64).round();
+    // `u64::MAX as f64` rounds to 2^64: anything at or above does not fit.
+    if micros >= u64::MAX as f64 {
+        return Err(overflow());
+    }
+    Ok(integral_f64_to_u64(micros))
+}
+
+fn parse_memory_bytes(v: &Value) -> anyhow::Result<u64> {
+    match v {
+        Value::String(s) => hcore::units::parse_memory_size(s),
+        Value::Int(_) | Value::Uint(_) | Value::Float(_) => parse_whole(v)
+            .context("memory is a whole number of bytes or a size string such as \"4G\""),
+        other => anyhow::bail!(
+            "expected a number of bytes or a size string such as \"4G\", got {}",
+            value_kind(other)
+        ),
+    }
+}
+
+fn display_number(v: &Value) -> String {
+    match v {
+        Value::Int(i) => i.to_string(),
+        Value::Uint(u) => u.to_string(),
+        Value::Float(f) => f.to_string(),
+        other => value_kind(other).to_string(),
+    }
+}
+
+/// The share of the machine the engine granted one run, as the target is told
+/// it (`HEPH_CPUS`, `HEPH_MEMORY_BYTES`).
+///
+/// Advisory: heph reports it, nothing enforces it. A target's outputs must not
+/// depend on it, and it never reaches a hash. Crosses the plugin ABI as
+/// `pb::ManagedRunRequest.allotment` (since 0.17.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Allotment {
+    /// Whole CPUs: the granted micro-CPUs rounded up, at least 1.
+    pub cpu: std::num::NonZeroU32,
+    /// Bytes of memory, present only when the target declared memory.
+    pub memory_bytes: Option<u64>,
+}
+
+impl Allotment {
+    /// The env var carrying [`cpu`](Self::cpu).
+    pub const CPUS_ENV: &'static str = "HEPH_CPUS";
+    /// The env var carrying [`memory_bytes`](Self::memory_bytes).
+    pub const MEMORY_BYTES_ENV: &'static str = "HEPH_MEMORY_BYTES";
+
+    /// From what the pool granted: `cpu_micros` rounded up to whole CPUs, at
+    /// least 1 (a `cpu: 0` target is told 1), saturating at `u32::MAX`.
+    pub fn from_granted(cpu_micros: u64, memory_bytes: Option<u64>) -> Self {
+        let cpus = cpu_micros.div_ceil(Resources::MICROS_PER_CPU);
+        let cpu = std::num::NonZeroU32::new(u32::try_from(cpus).unwrap_or(u32::MAX))
+            .unwrap_or(std::num::NonZeroU32::MIN);
+        Self { cpu, memory_bytes }
+    }
+
+    /// The environment the target is told its allotment through: `HEPH_CPUS`
+    /// always, `HEPH_MEMORY_BYTES` when memory was granted.
+    pub fn env(&self) -> impl Iterator<Item = (&'static str, String)> + use<> {
+        std::iter::once((Self::CPUS_ENV, self.cpu.to_string())).chain(
+            self.memory_bytes
+                .map(|m| (Self::MEMORY_BYTES_ENV, m.to_string())),
+        )
+    }
+}
+
+#[cfg(test)]
+mod resources_tests {
+    use super::*;
+
+    fn res(v: Value) -> anyhow::Result<Resources> {
+        Resources::from_config(&HashMap::from([(Resources::CONFIG_KEY.to_string(), v)]))
+    }
+
+    fn one(pool: &str, v: Value) -> anyhow::Result<u64> {
+        let r = res(Value::Map(HashMap::from([(pool.to_string(), v)])))?;
+        Ok(r.declared(pool).expect("declared"))
+    }
+
+    /// `starlark_to_rust` hands `2**31` and up over as floats.
+    #[test]
+    fn integral_floats_parse_as_ints() {
+        for p in [31, 40, 53] {
+            let f = 2f64.powi(p);
+            let n = 1u64 << p;
+            assert_eq!(one("memory", Value::Float(f)).unwrap(), n, "memory 2**{p}");
+            assert_eq!(one("docker", Value::Float(f)).unwrap(), n, "docker 2**{p}");
+        }
+        assert_eq!(
+            one("cpu", Value::Float(2f64.powi(40))).unwrap(),
+            (1u64 << 40) * 1_000_000
+        );
+        // 2**53 + 1 has no f64; the next float above 2**53 is 2**53 + 2, and
+        // everything above 2**53 is refused because it may not be what was
+        // written.
+        let above = 2f64.powi(53) + 2.0;
+        assert!(one("memory", Value::Float(above)).is_err());
+        assert!(one("docker", Value::Float(above)).is_err());
+        assert!(one("cpu", Value::Float(2f64.powi(64))).is_err());
+        // A fraction is refused outside `cpu`.
+        assert!(one("memory", Value::Float(1.5)).is_err());
+        assert!(one("docker", Value::Float(1.5)).is_err());
+        assert_eq!(one("cpu", Value::Float(1.5)).unwrap(), 1_500_000);
+    }
+
+    #[test]
+    fn absent_and_none_are_no_declaration() {
+        assert!(Resources::from_config(&HashMap::new()).unwrap().is_empty());
+        assert!(res(Value::Null()).unwrap().is_empty());
+        let r = Resources::default();
+        assert_eq!(r.amount("cpu"), Resources::DEFAULT_CPU_MICROS);
+        assert_eq!(r.amount("memory"), 0);
+        assert_eq!(r.amount("docker"), 0);
+    }
+
+    #[test]
+    fn errors_name_the_pool_not_the_target() {
+        let err = format!("{:#}", one("cpu", Value::Int(-1)).unwrap_err());
+        assert!(err.contains("resources.cpu"), "{err}");
+        assert!(err.contains("negative"), "{err}");
+    }
+
+    #[test]
+    fn wire_pairs_are_checked() {
+        assert!(Resources::try_from_pairs([("Cpu".to_string(), 1)]).is_err());
+        let many = (0..17).map(|i| (format!("p{i}"), 1));
+        assert!(Resources::try_from_pairs(many).is_err());
+        let r = Resources::try_from_pairs([("cpu".to_string(), 5)]).unwrap();
+        assert_eq!(r.amount("cpu"), 5);
+    }
+
+    #[test]
+    fn allotment_rounds_up_with_a_floor_of_one_and_renders_env() {
+        assert_eq!(Allotment::from_granted(0, None).cpu.get(), 1);
+        assert_eq!(Allotment::from_granted(10, None).cpu.get(), 1);
+        assert_eq!(Allotment::from_granted(1_000_000, None).cpu.get(), 1);
+        assert_eq!(Allotment::from_granted(1_000_001, None).cpu.get(), 2);
+        assert_eq!(Allotment::from_granted(u64::MAX, None).cpu.get(), u32::MAX);
+
+        let env: Vec<_> = Allotment::from_granted(3_000_000, None).env().collect();
+        assert_eq!(env, vec![("HEPH_CPUS", "3".to_string())]);
+        let env: Vec<_> = Allotment::from_granted(2_500_000, Some(4 << 30))
+            .env()
+            .collect();
+        assert_eq!(
+            env,
+            vec![
+                ("HEPH_CPUS", "3".to_string()),
+                ("HEPH_MEMORY_BYTES", "4294967296".to_string()),
+            ]
+        );
+    }
+}
+
 /// One run of a target. `#[non_exhaustive]`: built with [`RunRequest::new`]
 /// and field assignment outside this crate.
 #[non_exhaustive]
@@ -1260,6 +1661,11 @@ pub struct RunRequest<'a, 'io> {
     /// signals the tool. In-process only: it never crosses the plugin seam,
     /// and `None` means the size is fixed.
     pub winsize: Option<WinSizeReceiver>,
+    /// What the engine reserved for this run, to tell the target
+    /// ([`Allotment::env`]). `None` means "told nothing": the driver sets no
+    /// allotment env. Never hashed. Crosses the plugin seam as
+    /// `ManagedRunRequest.allotment` (since 0.17.4).
+    pub allotment: Option<Allotment>,
 }
 
 /// The parts of a run that come from the caller rather than the def.
@@ -1655,6 +2061,7 @@ impl<'a, 'io> RunRequest<'a, 'io> {
             deferred: std::collections::BTreeMap::new(),
             options: RunOptions::default(),
             winsize: None,
+            allotment: None,
         }
     }
 
@@ -1681,6 +2088,7 @@ impl<'a, 'io> RunRequest<'a, 'io> {
             deferred: self.deferred,
             options: self.options,
             winsize: self.winsize,
+            allotment: self.allotment,
         }
     }
 

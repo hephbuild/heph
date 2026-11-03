@@ -881,10 +881,20 @@ fn starlark_to_rust(v: &Value) -> anyhow::Result<htvalue::Value> {
     }
 
     if let Some(d) = DictRef::from_value(*v) {
+        // A non-string key is refused rather than dropped: dropping it turned
+        // `{1: 4}` into `{}`, which every consumer then read as "nothing said".
         let map = d
             .iter()
-            .filter_map(|(k, val)| k.unpack_str().map(|s| (s.to_string(), val)))
-            .map(|(k, val)| Ok((k, starlark_to_rust(&val)?)))
+            .map(|(k, val)| {
+                let Some(k) = k.unpack_str() else {
+                    anyhow::bail!(
+                        "dict key {} is a {}; config dict keys must be strings",
+                        k,
+                        k.get_type()
+                    );
+                };
+                Ok((k.to_string(), starlark_to_rust(&val)?))
+            })
             .collect::<anyhow::Result<_>>()?;
         return Ok(htvalue::Value::Map(map));
     }
@@ -3024,6 +3034,113 @@ target(
         let err =
             run_pkg_blocking(&provider, pkg_name).expect_err("expected BUILD evaluation to fail");
         format!("{err:#}")
+    }
+
+    /// `resources` as a BUILD file writes it, through `target()`'s
+    /// `starlark_to_rust` and into the SDK helper a driver's `parse` calls.
+    #[test]
+    fn resources_parse_table() {
+        use hplugin::driver::Resources;
+
+        #[derive(Debug, PartialEq)]
+        enum Want {
+            Fails,
+            Empty,
+            Parses,
+            Pool(&'static str, u64),
+        }
+        use Want::*;
+        const M: u64 = 1_000_000;
+        const G: u64 = 1 << 30;
+
+        let key64 = format!("\"{}\"", "a".repeat(64));
+        let key65 = format!("\"{}\"", "a".repeat(65));
+        let pools = |n: usize| {
+            let body = (0..n)
+                .map(|i| format!("\"p{i}\": 1"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{{{body}}}")
+        };
+        let rows: Vec<(String, Want)> = [
+            (r#"{"cpu": 2}"#, Pool("cpu", 2 * M)),
+            (r#"{"cpu": 0}"#, Pool("cpu", 0)),
+            (r#"{"cpu": -1}"#, Fails),
+            (r#"{"cpu": 1.5}"#, Pool("cpu", 1_500_000)),
+            (r#"{"cpu": 0.5}"#, Pool("cpu", 500_000)),
+            (r#"{"cpu": 0.3}"#, Pool("cpu", 300_000)),
+            (r#"{"cpu": 0.00001}"#, Pool("cpu", 10)),
+            (r#"{"cpu": 0.0000005}"#, Fails),
+            (r#"{"cpu": -0.5}"#, Fails),
+            (r#"{"cpu": "2"}"#, Fails),
+            (r#"{"cpu": True}"#, Fails),
+            (r#"{"cpu": None}"#, Fails),
+            (r#"{"cpu": {"n": 1}}"#, Fails),
+            (r#"{"cpu": 2147483648}"#, Pool("cpu", (1 << 31) * M)),
+            (r#"{"cpu": 1099511627776}"#, Pool("cpu", (1 << 40) * M)),
+            (r#"{"cpu": 18446744073709551616}"#, Fails),
+            (r#"{"cpu": float("nan")}"#, Fails),
+            (r#"{"cpu": float("inf")}"#, Fails),
+            (r#"{"cpu": 1e30}"#, Fails),
+            (r#"{1: 4}"#, Fails),
+            (r#"{None: 1}"#, Fails),
+            (r#"{"Memory": 1}"#, Fails),
+            (r#"{"cpu ": 1}"#, Fails),
+            (r#"{"": 1}"#, Fails),
+            (r#"{"gpu": 1}"#, Pool("gpu", 1)),
+            (r#"{}"#, Empty),
+            (r#"None"#, Empty),
+            (r#"True"#, Fails),
+            (r#"[1]"#, Fails),
+            // Memory, through the same parser `.hephconfig` uses.
+            (r#"{"memory": "4G"}"#, Pool("memory", 4 * G)),
+            (r#"{"memory": "4g"}"#, Pool("memory", 4 * G)),
+            (r#"{"memory": "4GiB"}"#, Pool("memory", 4 * G)),
+            (r#"{"memory": "4GB"}"#, Pool("memory", 4 * G)),
+            (r#"{"memory": "4096M"}"#, Pool("memory", 4 * G)),
+            (r#"{"memory": "4096"}"#, Pool("memory", 4096)),
+            (r#"{"memory": 4096}"#, Pool("memory", 4096)),
+            (r#"{"memory": 4294967296}"#, Pool("memory", 4 * G)),
+            (r#"{"memory": 0}"#, Pool("memory", 0)),
+            (r#"{"memory": 1.5}"#, Fails),
+            (r#"{"memory": "4 G"}"#, Fails),
+            (r#"{"memory": "4.5G"}"#, Fails),
+            (r#"{"memory": "4G\n"}"#, Fails),
+            (r#"{"memory": "17179869184G"}"#, Fails),
+        ]
+        .into_iter()
+        .map(|(e, w)| (e.to_string(), w))
+        .chain([
+            (format!("{{{key64}: 1}}"), Parses),
+            (format!("{{{key65}: 1}}"), Fails),
+            (pools(16), Parses),
+            (pools(17), Fails),
+        ])
+        .collect();
+
+        for (expr, want) in rows {
+            let tmp_dir = tempdir().unwrap();
+            let pkg_path = tmp_dir.path().join("mypkg");
+            fs::create_dir_all(&pkg_path).unwrap();
+            fs::write(
+                pkg_path.join("BUILD"),
+                format!("target(name = \"t\", driver = \"d\", resources = {expr})"),
+            )
+            .unwrap();
+            let provider = make_provider(&tmp_dir);
+            let got = run_pkg_blocking(&provider, "mypkg")
+                .and_then(|r| Resources::from_config(&r.targets[0].config));
+            match (&want, got) {
+                (Fails, Err(_)) => {}
+                (Fails, Ok(r)) => panic!("{expr}: want an error, got {r:?}"),
+                (_, Err(e)) => panic!("{expr}: want {want:?}, got error {e:#}"),
+                (Empty, Ok(r)) => assert!(r.is_empty(), "{expr}: {r:?}"),
+                (Parses, Ok(_)) => {}
+                (Pool(p, n), Ok(r)) => {
+                    assert_eq!(r.declared(p), Some(*n), "{expr}: {r:?}")
+                }
+            }
+        }
     }
 
     #[test]
