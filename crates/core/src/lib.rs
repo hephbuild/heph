@@ -29,6 +29,7 @@ pub mod paths;
 pub mod pending;
 pub mod process;
 pub mod shutdown;
+pub mod sysres;
 pub mod template;
 pub mod units;
 pub mod version;

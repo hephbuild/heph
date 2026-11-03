@@ -105,6 +105,7 @@ mod link;
 mod matcher_spec;
 pub mod matcher_target;
 mod meta;
+pub mod resource_pool;
 pub mod sandbox_cleaner;
 pub mod scratch;
 pub mod scratch_remote;
