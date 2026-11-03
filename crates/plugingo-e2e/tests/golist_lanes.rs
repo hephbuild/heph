@@ -1211,6 +1211,206 @@ async fn g6_a_vendored_module_relists_on_a_go_body_edit() -> anyhow::Result<()> 
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// G8–G12: generated files reach `_golist` through the header target
+// ---------------------------------------------------------------------------
+
+const GEN_LIB_GO: &str = "package lib\n\nfunc F() string { return G() }\n";
+const GEN_GO: &str = "package lib\n\nimport \"fmt\"\n\nfunc G() string { return fmt.Sprint(1) }\n";
+
+/// A `bash` codegen target `name` in a BUILD file writing each `(out, contents)`.
+/// `go_src` labels it for the `go_src` query; without it, only a
+/// `go_codegen_deps` entry reaches it.
+fn gen_target(name: &str, outs: &[(&str, &str)], go_src: bool) -> String {
+    let mut run = Vec::new();
+    for (out, contents) in outs {
+        run.push(format!("mkdir -p $(dirname {out:?}) && : > {out:?}"));
+        for line in contents.lines() {
+            // Single-quoted: bash keeps tabs, `"` and `\` as they are.
+            let line = line.replace('\'', "'\\''");
+            run.push(format!("printf '%s\\n' '{line}' >> {out:?}"));
+        }
+    }
+    let outs: Vec<&str> = outs.iter().map(|(o, _)| *o).collect();
+    let labels = if go_src { "[\"go_src\"]" } else { "[]" };
+    format!(
+        "target(\n    name = {name:?},\n    driver = \"bash\",\n    run = {run:?},\n    \
+         out = {outs:?},\n    labels = {labels},\n    codegen = \"copy\",\n)\n"
+    )
+}
+
+/// The root module with `lib/lib.go` and a `go_src`-labelled generator in
+/// `lib/BUILD` writing `outs`.
+fn gen_pkg(outs: &[(&str, &str)]) -> anyhow::Result<tempfile::TempDir> {
+    tree(&[
+        ("go.mod", GO_MOD),
+        ("lib/lib.go", GEN_LIB_GO),
+        ("lib/BUILD", &gen_target("gen", outs, true)),
+    ])
+}
+
+/// Rewrite `lib/BUILD`'s generator to write `outs`. The BUILD file itself is a
+/// non-Go file of the package, keyed by name only: the key moves only through
+/// what the generator now writes.
+fn regen(root: &Path, outs: &[(&str, &str)]) -> anyhow::Result<()> {
+    write(root, "lib/BUILD", &gen_target("gen", outs, true))
+}
+
+/// G8: a generated `.go` file's function body changes, its imports do not: the
+/// generator and the header target re-run, `_golist` is a hit, and the compile
+/// re-runs on the new bytes.
+#[tokio::test]
+async fn g8_a_generated_go_body_edit_keeps_golist_and_recompiles() -> anyhow::Result<()> {
+    require_go!();
+    let ws = make_workspace(gen_pkg(&[("gen.go", GEN_GO)])?)?;
+    let (_, ev) = run(&ws, "//lib:build_lib@v=host").await?;
+    ev.assert_executed("lib", "gen", "first build");
+
+    regen(
+        ws.dir.path(),
+        &[("gen.go", &GEN_GO.replace("Sprint(1)", "Sprint(2)"))],
+    )?;
+    let ws = reopen(ws)?;
+    let (_, ev) = run(&ws, "//lib:build_lib@v=host").await?;
+    ev.assert_executed("lib", "gen", "the generator changed");
+    ev.assert_executed("@heph/go/headers/lib", "headers", "gen.go changed");
+    ev.assert_hit("lib", "_golist", "only a generated body changed");
+    ev.assert_executed("lib", "build_lib", "the compile reads the whole file");
+    Ok(())
+}
+
+/// G9: a generated `.go` file gains an import: `_golist` re-runs and lists it.
+#[tokio::test]
+async fn g9_a_generated_go_import_relists() -> anyhow::Result<()> {
+    require_go!();
+    let ws = make_workspace(gen_pkg(&[("gen.go", GEN_GO)])?)?;
+    let (pkg, _) = golist(&ws, "lib").await?;
+    assert_eq!(pkg.imports, vec!["fmt"]);
+
+    regen(
+        ws.dir.path(),
+        &[(
+            "gen.go",
+            &GEN_GO
+                .replace("import \"fmt\"", "import (\n\t\"fmt\"\n\t\"strings\"\n)")
+                .replace("fmt.Sprint(1)", "strings.ToUpper(fmt.Sprint(1))"),
+        )],
+    )?;
+    let ws = reopen(ws)?;
+    let (pkg, ev) = golist(&ws, "lib").await?;
+    ev.assert_executed("lib", "_golist", "a generated file gained an import");
+    assert_eq!(pkg.imports, vec!["fmt", "strings"]);
+    Ok(())
+}
+
+/// G10: the generator writes a second `.go` file: `_golist` re-runs and lists it.
+#[tokio::test]
+async fn g10_a_new_generated_go_file_relists() -> anyhow::Result<()> {
+    require_go!();
+    let ws = make_workspace(gen_pkg(&[("gen.go", GEN_GO)])?)?;
+    let (pkg, _) = golist(&ws, "lib").await?;
+    assert_eq!(pkg.go_files, vec!["gen.go", "lib.go"]);
+
+    regen(
+        ws.dir.path(),
+        &[
+            ("gen.go", GEN_GO),
+            ("gen2.go", "package lib\n\nfunc H() {}\n"),
+        ],
+    )?;
+    let ws = reopen(ws)?;
+    let (pkg, ev) = golist(&ws, "lib").await?;
+    ev.assert_executed("lib", "_golist", "the generator added a .go file");
+    assert_eq!(pkg.go_files, vec!["gen.go", "gen2.go", "lib.go"]);
+    Ok(())
+}
+
+/// G11 (E1 kept): a generated non-Go file's content changes, nothing else does:
+/// `_golist` re-runs, because a generated non-Go file is keyed by its whole
+/// content.
+#[tokio::test]
+async fn g11_a_generated_non_go_content_edit_relists() -> anyhow::Result<()> {
+    require_go!();
+    let ws = make_workspace(gen_pkg(&[("gen.go", GEN_GO), ("data.txt", "one")])?)?;
+    golist(&ws, "lib").await?;
+
+    regen(ws.dir.path(), &[("gen.go", GEN_GO), ("data.txt", "two")])?;
+    let ws = reopen(ws)?;
+    let (_, ev) = golist(&ws, "lib").await?;
+    ev.assert_executed("@heph/go/headers/lib", "headers", "data.txt changed");
+    ev.assert_executed(
+        "lib",
+        "_golist",
+        "a generated non-Go file is keyed by content",
+    );
+    Ok(())
+}
+
+/// G12: the `go_codegen_deps` lane — a generator with no `go_src` label, named
+/// from the root package's `provider_state` — is keyed the same way: a body edit
+/// keeps `_golist`, an import re-lists.
+#[tokio::test]
+async fn g12_a_go_codegen_deps_generator_is_keyed_by_go_view() -> anyhow::Result<()> {
+    require_go!();
+    let build = |src: &str| gen_target("gen", &[("gen.go", src)], false);
+    let dir = tree(&[
+        ("go.mod", GO_MOD),
+        (
+            "BUILD",
+            "provider_state(provider = \"go\", go_codegen_deps = [\"//lib:gen\"])\n",
+        ),
+        ("lib/lib.go", GEN_LIB_GO),
+        ("lib/BUILD", &build(GEN_GO)),
+    ])?;
+    let ws = make_workspace(dir)?;
+    let (pkg, _) = golist(&ws, "lib").await?;
+    assert_eq!(pkg.go_files, vec!["gen.go", "lib.go"]);
+
+    write(
+        ws.dir.path(),
+        "lib/BUILD",
+        &build(&GEN_GO.replace("Sprint(1)", "Sprint(2)")),
+    )?;
+    let ws = reopen(ws)?;
+    let (_, ev) = golist(&ws, "lib").await?;
+    ev.assert_executed("lib", "gen", "the generator changed");
+    ev.assert_hit("lib", "_golist", "only a generated body changed");
+
+    write(
+        ws.dir.path(),
+        "lib/BUILD",
+        &build(&GEN_GO.replace("import \"fmt\"", "import (\n\t\"fmt\"\n\t_ \"strings\"\n)")),
+    )?;
+    let ws = reopen(ws)?;
+    let (pkg, ev) = golist(&ws, "lib").await?;
+    ev.assert_executed("lib", "_golist", "a generated file gained an import");
+    assert_eq!(pkg.imports, vec!["fmt", "strings"]);
+    Ok(())
+}
+
+/// I3: a checked-in `.go` file and a generator output at the same path fail the
+/// build rather than key only one of them. The engine's sandbox collision check
+/// catches it in the header target before `build_headers_tar` would; either
+/// error names the path.
+#[tokio::test]
+async fn g13_a_checked_in_file_shadowing_a_generated_one_fails() -> anyhow::Result<()> {
+    require_go!();
+    let dir = gen_pkg(&[("gen.go", GEN_GO)])?;
+    write(dir.path(), "lib/gen.go", GEN_GO)?;
+    let ws = make_workspace(dir)?;
+    let err = golist(&ws, "lib")
+        .await
+        .err()
+        .context("a path staged by two lanes must fail")?;
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("lib/gen.go")
+            && (msg.contains("staged by two lanes") || msg.contains("output collision")),
+        "unexpected error: {msg}"
+    );
+    Ok(())
+}
+
 /// `go/build`'s view of every package directory of a tree: for each, the
 /// `ImportDir` result as JSON (with `-test` files and positions), and the bytes
 /// each `.go` file read, through a one-byte reader.
