@@ -334,4 +334,10 @@ message RunOutFrame {
   // whose exit is the failure. Outside the oneof so that `error` stays the one
   // terminal failure frame, and an older host still reads the message.
   ExitStatus exit = 5;
+  // Only beside `error` and `exit` (since 0.17.3): the file holding the failed
+  // process's output, which the host renders the tail of in the failure
+  // diagnostic. A path in the host's filesystem — a plugin shares the host's
+  // process — normally the target's `log.txt` in its sandbox. Absent = none;
+  // an older host ignores it and shows only `error`.
+  string log_path = 7;
 }

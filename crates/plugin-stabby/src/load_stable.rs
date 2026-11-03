@@ -583,7 +583,15 @@ fn drain_run(
             // process's exit, readable through `hplugin::error::process_exit`.
             Some(pb::run_out_frame::Msg::Error(e)) => match convert::exit_from_pb(frame.exit) {
                 Some(exit) => {
-                    return Err(hplugin::error::RemoteProcessFailed::new(e, exit).into());
+                    let mut failed = hplugin::error::RemoteProcessFailed::new(e, exit);
+                    // The plugin shares this process, so its path is ours. The
+                    // engine reads it when it records the failure.
+                    if let Some(path) = frame.log_path.filter(|p| !p.is_empty()) {
+                        failed = failed.with_log(std::sync::Arc::new(
+                            hcore::hartifactcontent::FileContent::new(path),
+                        ));
+                    }
+                    return Err(failed.into());
                 }
                 None => anyhow::bail!("{e}"),
             },

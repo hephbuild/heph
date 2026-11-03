@@ -57,6 +57,36 @@ pub struct ManagedRunResponse {
     pub artifacts: Vec<outputartifact::OutputArtifact>,
 }
 
+/// For a driver that captures its tool's output whole instead of streaming it:
+/// when the run failed with a process log, copy that log to the run's live
+/// stderr.
+///
+/// An interactive run (a target named at a terminal) has its live sinks set,
+/// and the engine leaves the log tail out of the failure box there because it
+/// assumes the output was already printed as it ran. A captured tool printed
+/// nothing, so without this the user sees the failure and none of its output.
+/// Outside an interactive run there is no sink and this does nothing.
+pub async fn echo_failure_log(req: &mut RunRequest<'_, '_>, e: &anyhow::Error) {
+    use tokio::io::AsyncWriteExt as _;
+    let Some(stderr) = req.stderr.as_deref_mut() else {
+        return;
+    };
+    let Some(log) = hplugin::error::process_log(e) else {
+        return;
+    };
+    let mut bytes = Vec::new();
+    if log
+        .reader()
+        .and_then(|mut r| io::Read::read_to_end(&mut r, &mut bytes).map_err(Into::into))
+        .is_err()
+    {
+        return;
+    }
+    // Best-effort: a sink that went away must not mask the failure itself.
+    drop(stderr.write_all(&bytes).await);
+    drop(stderr.flush().await);
+}
+
 #[async_trait]
 pub trait ManagedDriver: Send + Sync {
     fn config(&self, req: ConfigRequest) -> anyhow::Result<ConfigResponse>;
@@ -840,6 +870,53 @@ fn pack_to_artifact_tar(
     tar.pack(&mut hw).with_context(|| "pack")?;
 
     Ok((tarpath, format!("{:x}", hw.hasher.digest())))
+}
+
+#[cfg(test)]
+mod echo_failure_log_tests {
+    use super::*;
+
+    fn failed(log_path: &Path) -> anyhow::Error {
+        let output = std::process::Command::new("sh")
+            .args(["-c", "echo 'x.go:3:1: expected declaration' >&2; exit 2"])
+            .output()
+            .expect("run sh");
+        anyhow::Error::new(hplugin::error::ProcessFailed::from_output(
+            log_path, &output,
+        ))
+        .context("heph-govet -format failed")
+    }
+
+    /// An interactive run (live sinks set) gets the captured tool's output on
+    /// its stderr, since the engine leaves the tail out of the box there.
+    #[tokio::test]
+    async fn echoes_the_log_to_an_interactive_runs_stderr() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let e = failed(&tmp.path().join("log.txt"));
+        let target = hplugin::driver::targetdef::TargetDef::default();
+        let id = "t".to_string();
+        let mut sink: Vec<u8> = Vec::new();
+        let mut req = RunRequest::new(&id, &target, tmp.path());
+        req.stderr = Some(&mut sink);
+        echo_failure_log(&mut req, &e).await;
+        drop(req);
+        assert_eq!(
+            String::from_utf8_lossy(&sink),
+            "x.go:3:1: expected declaration\n"
+        );
+    }
+
+    /// Outside an interactive run there is nowhere to echo to.
+    #[tokio::test]
+    async fn does_nothing_without_a_sink() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let e = failed(&tmp.path().join("log.txt"));
+        let target = hplugin::driver::targetdef::TargetDef::default();
+        let id = "t".to_string();
+        let mut req = RunRequest::new(&id, &target, tmp.path());
+        echo_failure_log(&mut req, &e).await;
+        assert!(req.stderr.is_none());
+    }
 }
 
 #[cfg(test)]

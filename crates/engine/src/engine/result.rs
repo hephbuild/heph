@@ -1583,9 +1583,19 @@ fn classify_failure(
 /// (e.g. already reclaimed) yields no tail rather than masking the failure.
 fn extract_log_tail(e: &anyhow::Error, n: usize) -> Option<hplugin::error::LogTail> {
     use std::io::Read as _;
-    let pf = downcast_chain_ref::<ProcessFailed>(e)?;
-    let mut buf = String::new();
-    pf.log.reader().ok()?.read_to_string(&mut buf).ok()?;
+    // A `ProcessFailed` from an in-process driver, or a cdylib's
+    // `RemoteProcessFailed` that sent its log's path.
+    let log = match downcast_chain_ref::<ProcessFailed>(e) {
+        Some(pf) => pf.log.clone(),
+        None => downcast_chain_ref::<hplugin::error::RemoteProcessFailed>(e)?
+            .log
+            .clone()?,
+    };
+    // Lossy: a tool's output is not guaranteed UTF-8, and one stray byte must
+    // not cost the whole tail.
+    let mut bytes = Vec::new();
+    log.reader().ok()?.read_to_end(&mut bytes).ok()?;
+    let buf = String::from_utf8_lossy(&bytes);
     let (text, start_line) = hplugin::error::last_n_lines_with_start(&buf, n);
     Some(hplugin::error::LogTail { text, start_line })
 }
@@ -9225,6 +9235,40 @@ mod tests {
         let _ = classify_failure(&rs, &addr, true, e);
         let recorded = rs.get_failure(&addr).expect("failure must be recorded");
         assert_eq!(recorded.log_tail, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn classify_reads_the_log_tail_of_a_remote_process_failure() -> anyhow::Result<()> {
+        // A cdylib driver's failure crosses the seam as a `RemoteProcessFailed`
+        // carrying its log's path; the box renders that log's tail exactly as
+        // for an in-process `ProcessFailed`, even with non-UTF-8 bytes in it.
+        use std::sync::Arc;
+
+        let engine = engine_with(vec![static_target("//pkg:a", &[], &[])])?;
+        let rs = engine.new_state();
+        let addr = hmodel::htaddr::parse_addr("//pkg:a")?;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log_path = dir.path().join("log.txt");
+        std::fs::write(&log_path, b"#1 building\n\xff\nERROR: failed to solve\n")?;
+
+        let e = anyhow::Error::new(
+            hplugin::error::RemoteProcessFailed::new(
+                "docker buildx build failed: process exited with status: exit status: 1".into(),
+                hplugin::error::Exit::Code(1),
+            )
+            .with_log(Arc::new(hcore::hartifactcontent::FileContent::new(
+                &log_path,
+            ))),
+        )
+        .context("driver run");
+
+        let _ = classify_failure(&rs, &addr, false, e);
+        let recorded = rs.get_failure(&addr).expect("failure must be recorded");
+        let tail = recorded.log_tail.as_ref().expect("the remote log's tail");
+        assert!(tail.text.contains("ERROR: failed to solve"), "{tail:?}");
+        assert!(tail.text.contains("#1 building"), "{tail:?}");
         Ok(())
     }
 

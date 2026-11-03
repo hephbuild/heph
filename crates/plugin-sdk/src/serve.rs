@@ -1493,6 +1493,11 @@ fn run_out_failure(e: &anyhow::Error) -> pb::RunOutFrame {
     let mut frame = run_out_err(err_message(e));
     if let Some(exit) = hplugin::error::process_exit(e) {
         frame.exit = convert::exit_to_pb(exit).into();
+        // The log only means something beside an exit: it is the output of the
+        // process whose exit failed the run.
+        if let Some(path) = hplugin::error::process_log(e).and_then(|l| l.file_path()) {
+            frame.log_path = Some(path.to_string_lossy().into_owned());
+        }
     }
     frame
 }
@@ -3470,7 +3475,11 @@ mod tests {
         use hplugin::error::{Exit, ProcessFailed, process_exit};
         use hplugin_stabby::load_stable::StableRemoteManagedDriver;
 
-        struct SignalDriver;
+        let log_dir = tempfile::tempdir().expect("tempdir");
+        let log_path = log_dir.path().join("log.txt");
+        std::fs::write(&log_path, "the tool's output\n").expect("write log");
+
+        struct SignalDriver(std::path::PathBuf);
         #[async_trait::async_trait]
         impl ManagedDriver for SignalDriver {
             fn config(
@@ -3524,14 +3533,16 @@ mod tests {
                 let sig = fg.signals.recv().await.context("the relay closed empty")?;
                 Err(ProcessFailed {
                     status: format!("signal: {}", sig.as_raw()),
-                    log: Arc::new(hcore::hartifactcontent::FileContent::new("/dev/null")),
+                    log: Arc::new(hcore::hartifactcontent::FileContent::new(self.0.clone())),
                     exit: Some(Exit::Signal(sig.as_raw())),
                 }
                 .into())
             }
         }
 
-        let dynd = make_dyn_managed_driver(Arc::new(SignalDriver) as Arc<dyn ManagedDriver>);
+        let dynd = make_dyn_managed_driver(
+            Arc::new(SignalDriver(log_path.clone())) as Arc<dyn ManagedDriver>
+        );
         let host = StableRemoteManagedDriver::new(dynd, "sigdrv").expect("load");
         let ct = StdCancellationToken::new();
         let id = "r".to_string();
@@ -3559,6 +3570,13 @@ mod tests {
             Err(e) => e,
         };
         assert_eq!(process_exit(&err), Some(Exit::Signal(15)), "{err:#}");
+        // The log crosses as its path (0.17.3), so the host's failure box can
+        // render its tail as it does for an in-process `ProcessFailed`.
+        assert_eq!(
+            hplugin::error::process_log(&err).and_then(|l| l.file_path()),
+            Some(log_path.clone()),
+            "{err:#}"
+        );
         assert!(
             format!("{err:#}").contains("process exited with status: signal: 15"),
             "{err:#}"

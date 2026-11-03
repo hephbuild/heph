@@ -269,10 +269,11 @@ pub use hcore::process::Exit;
 /// ([`ProcessFailed::exit`] on the plugin's side).
 ///
 /// The wire carries the failure as its rendered message plus the status, so
-/// the host cannot rebuild the plugin's [`ProcessFailed`] — its log handle
-/// points into the plugin's world and its `status` text is folded into the
-/// message. This keeps the message byte-identical to what an older host prints
-/// from the same frame, and the status readable through [`process_exit`].
+/// the host cannot rebuild the plugin's [`ProcessFailed`] — its `status` text
+/// is folded into the message, and its log arrives only as a path (since
+/// 0.17.3, when the log is a file). This keeps the message byte-identical to
+/// what an older host prints from the same frame, and the status readable
+/// through [`process_exit`].
 ///
 /// `#[non_exhaustive]`: built with [`RemoteProcessFailed::new`] outside this
 /// crate, so a later field is not a source break.
@@ -281,12 +282,98 @@ pub use hcore::process::Exit;
 pub struct RemoteProcessFailed {
     pub message: String,
     pub exit: Exit,
+    /// The failed process's log, when the plugin sent its path (since 0.17.3):
+    /// what the failure diagnostic renders the tail of, as for an in-process
+    /// [`ProcessFailed::log`].
+    pub log: Option<Arc<dyn Content>>,
 }
 
 impl RemoteProcessFailed {
     pub fn new(message: String, exit: Exit) -> Self {
-        Self { message, exit }
+        Self {
+            message,
+            exit,
+            log: None,
+        }
     }
+
+    #[must_use]
+    pub fn with_log(mut self, log: Arc<dyn Content>) -> Self {
+        self.log = Some(log);
+        self
+    }
+}
+
+impl ProcessFailed {
+    /// The failure of a child whose output was captured whole rather than
+    /// streamed: appends its stdout then stderr to `log_path` (the target's
+    /// `log.txt`) and returns the failure carrying that log, so the output is
+    /// rendered as the target's log tail instead of being pasted into the
+    /// message.
+    ///
+    /// The log is best-effort: if it cannot be written the output is held in
+    /// memory and rendered from there. That fallback has no path, so it does
+    /// not cross the cdylib seam — only an in-process driver renders it.
+    pub fn from_output(log_path: &std::path::Path, output: &std::process::Output) -> Self {
+        use std::io::Write as _;
+        let written = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+            .and_then(|mut f| {
+                f.write_all(&output.stdout)?;
+                f.write_all(&output.stderr)
+            });
+        let log: Arc<dyn Content> = match written {
+            Ok(()) => Arc::new(hcore::hartifactcontent::FileContent::new(log_path)),
+            Err(_) => {
+                let mut bytes = output.stdout.clone();
+                bytes.extend_from_slice(&output.stderr);
+                Arc::new(BytesLog(bytes))
+            }
+        };
+        ProcessFailed {
+            status: output.status.to_string(),
+            log,
+            exit: Exit::from_std(output.status),
+        }
+    }
+}
+
+/// A log held in memory: [`ProcessFailed::from_output`]'s fallback when the
+/// log file cannot be written.
+#[derive(Debug)]
+struct BytesLog(Vec<u8>);
+
+impl Content for BytesLog {
+    fn reader(&self) -> anyhow::Result<Box<dyn std::io::Read>> {
+        Ok(Box::new(std::io::Cursor::new(self.0.clone())))
+    }
+
+    fn walk(
+        &self,
+    ) -> anyhow::Result<
+        Box<dyn Iterator<Item = anyhow::Result<hcore::hartifactcontent::WalkEntry>> + '_>,
+    > {
+        Ok(Box::new(std::iter::empty()))
+    }
+
+    fn hashout(&self) -> anyhow::Result<String> {
+        Ok(String::new())
+    }
+}
+
+/// The failed process's log anywhere in `err`'s chain: a [`ProcessFailed`]'s,
+/// or a [`RemoteProcessFailed`]'s when the plugin sent one.
+pub fn process_log(err: &anyhow::Error) -> Option<Arc<dyn Content>> {
+    err.chain().find_map(|e| {
+        if let Some(pf) = e.downcast_ref::<ProcessFailed>() {
+            Some(pf.log.clone())
+        } else {
+            e.downcast_ref::<RemoteProcessFailed>()
+                .and_then(|r| r.log.clone())
+        }
+    })
 }
 
 impl fmt::Display for RemoteProcessFailed {
@@ -421,6 +508,45 @@ pub fn last_n_lines_with_start(s: &str, n: usize) -> (String, usize) {
 mod tests {
     use super::*;
 
+    /// A captured child's failure lands in the log (appended, both streams),
+    /// and the error carries that log and the exit — not the output itself.
+    #[test]
+    fn from_output_writes_the_log_and_carries_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log_path = dir.path().join("log.txt");
+        std::fs::write(&log_path, "earlier step\n").expect("seed log");
+        let output = std::process::Command::new("sh")
+            .args(["-c", "echo on-stdout; echo on-stderr >&2; exit 3"])
+            .output()
+            .expect("run sh");
+
+        let pf = ProcessFailed::from_output(&log_path, &output);
+        assert_eq!(pf.exit, Some(Exit::Code(3)));
+        assert!(!pf.to_string().contains("on-stderr"), "{pf}");
+        let log = std::fs::read_to_string(&log_path).expect("read log");
+        assert_eq!(log, "earlier step\non-stdout\non-stderr\n");
+        let err = anyhow::Error::new(pf).context("go compile failed");
+        assert_eq!(
+            process_log(&err).and_then(|l| l.file_path()),
+            Some(log_path.clone())
+        );
+    }
+
+    /// A log that cannot be written does not lose the output.
+    #[test]
+    fn from_output_keeps_the_output_when_the_log_cannot_be_written() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let output = std::process::Command::new("sh")
+            .args(["-c", "echo kept >&2; exit 1"])
+            .output()
+            .expect("run sh");
+        let pf = ProcessFailed::from_output(&dir.path().join("missing/log.txt"), &output);
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut pf.log.reader().expect("reader"), &mut text)
+            .expect("read");
+        assert_eq!(text, "kept\n");
+    }
+
     /// E5: the status is data next to an unchanged message.
     #[test]
     fn process_failed_exit_is_structured() {
@@ -447,10 +573,10 @@ mod tests {
             assert_eq!(process_exit(&wrapped), exit, "{status}");
         }
 
-        let remote = anyhow::Error::new(RemoteProcessFailed {
-            message: "running //p:t: process exited with status: exit status: 3".to_string(),
-            exit: Exit::Code(3),
-        })
+        let remote = anyhow::Error::new(RemoteProcessFailed::new(
+            "running //p:t: process exited with status: exit status: 3".to_string(),
+            Exit::Code(3),
+        ))
         .context("driver run");
         assert_eq!(process_exit(&remote), Some(Exit::Code(3)));
         assert_eq!(
