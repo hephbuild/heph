@@ -42,6 +42,9 @@ pub use driver_testmain::GoTestmainDriver;
 pub use nongo_lanes::{
     GO_HEADER_READ_EXTS, GO_HEADER_RULES_VERIFIED_AGAINST, NonGoLane, classify_non_go,
 };
+// `_golist`'s `package.bin`, for the plugingo-e2e tests that assert what `go list`
+// reported (`EmbedFiles`, `SFiles`, the package error) after a workspace edit.
+pub use pkg_analysis::{GoPackage, decode_go_package};
 pub use provider::{Config, Provider};
 // `DEFAULT_GO_VERSION` / `HOST` / `checksum_key` are re-exported for the
 // `plugingo-e2e` harness: it must pin the same toolchain this provider does and
