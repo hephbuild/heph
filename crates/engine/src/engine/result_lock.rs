@@ -355,6 +355,21 @@ impl ResultLock {
         }
     }
 
+    /// Non-blocking [`lock_execute`](ResultLock::lock_execute). `Ok(None)` while
+    /// a run of `addr` holds it, in any process. For `heph tool gc`, which must
+    /// not remove a failure slot a run is about to clear or fill.
+    pub fn try_lock_execute(&self, addr: &Addr) -> Result<Option<ExecuteGuard>> {
+        match self {
+            ResultLock::Fs { locks, .. } => {
+                Ok(locks.executes.try_lock(addr.clone())?.map(ExecuteGuard::Fs))
+            }
+            ResultLock::Mem(locks) => Ok(locks
+                .executes
+                .try_lock(addr.clone())?
+                .map(ExecuteGuard::Mem)),
+        }
+    }
+
     /// Acquire a plain shared read guard on revision `(addr, hashin)`. Cheap and
     /// fully concurrent — the hot-path guard taken optimistically before a cache
     /// lookup and attached to the returned artifacts. Takes the revision lock

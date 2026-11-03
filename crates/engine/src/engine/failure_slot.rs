@@ -470,10 +470,33 @@ fn fill_slot(
 /// The manifest of the slot at `dir`, if it is complete, of a version this
 /// heph reads, and for `addr`. Anything else reads as no slot.
 pub fn read_manifest(dir: &Path, addr: &Addr) -> Option<SlotManifest> {
+    read_any_manifest(dir).filter(|m| m.addr == addr.format())
+}
+
+/// The manifest of the slot at `dir`, if it is complete and of a version this
+/// heph reads, whichever address it names. What `heph tool gc` reads a slot
+/// it found by listing with.
+pub(crate) fn read_any_manifest(dir: &Path) -> Option<SlotManifest> {
     let bytes = std::fs::read(dir.join(MANIFEST)).ok()?;
     let m: SlotManifest = serde_json::from_slice(&bytes).ok()?;
-    (m.version == MANIFEST_VERSION && m.addr == addr.format() && dir.join(LOG).is_file())
-        .then_some(m)
+    (m.version == MANIFEST_VERSION && dir.join(LOG).is_file()).then_some(m)
+}
+
+/// Write a complete slot for `addr` under `root` by hand, as a fill would
+/// leave it. For tests outside this module.
+#[cfg(test)]
+pub(crate) fn write_test_slot(root: &Path, addr: &Addr, failed_at: u64, log: &[u8]) -> PathBuf {
+    let dir = root.join(addr_key(addr));
+    std::fs::create_dir_all(&dir).expect("mkdir slot");
+    std::fs::write(dir.join(LOG), log).expect("write log");
+    let m = SlotManifest {
+        version: MANIFEST_VERSION,
+        addr: addr.format(),
+        hashin: "h".into(),
+        failed_at,
+    };
+    std::fs::write(dir.join(MANIFEST), serde_json::to_vec(&m).expect("json")).expect("manifest");
+    dir
 }
 
 /// The slot names under `root`; temporaries are not slots.

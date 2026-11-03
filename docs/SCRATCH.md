@@ -260,6 +260,16 @@ path collides with nothing, because empty means *no path*, not the root.
   ever built; the sweep collects the merged and abandoned ones.
 - **`heph tool scratch rm`** — always safe, by the contract.
 
+The same `heph tool gc` sweeps **failure logs**, which are not scratch but have
+the same problem: nothing else removes them. A failed run copies its log to
+`<home>/failures/<addr-key>/` (`log.txt`, plus a `manifest.json` naming the
+address and when it failed), and the next run or cache hit of that target clears
+it. gc removes a log whose target no longer exists, one older than
+`--failure-max-age-days` (default 7; `0` removes every one), and leftovers with
+no valid manifest or an abandoned `.tmp-` directory older than a minute. A
+target whose provider errors keeps its log, and one being run is skipped. The
+summary ends with `· N failure logs, X freed`.
+
 ## Surfaces
 
 ```sh
