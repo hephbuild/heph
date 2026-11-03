@@ -3627,10 +3627,7 @@ mod tests {
             };
             assert!(raw.data.is_empty(), "{}: placeholder is empty", a.name);
             assert!(!raw.x, "{}: placeholder is not executable", a.name);
-            assert_eq!(
-                a.hashout,
-                hwalk::fs_entry_hashout(&raw.path, FS_NAMES_TAG)
-            );
+            assert_eq!(a.hashout, hwalk::fs_entry_hashout(&raw.path, FS_NAMES_TAG));
             assert!(matches!(a.r#type, Type::Output));
             assert!(a.group.is_empty());
         }
