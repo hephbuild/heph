@@ -2982,13 +2982,10 @@ impl ProviderInner {
                 );
                 // Use a pluginfs glob directly instead of _go_src: _go_src spec
                 // generation calls executor.result(_golist), which would deadlock.
+                // Staged unhashed beside the header target that hashes the
+                // files' go/build view — unless the module is vendored.
                 let pkg = addr.package.as_str();
-                let src_glob = if pkg.is_empty() {
-                    "*.go".to_string()
-                } else {
-                    format!("{}/*.go", pkg)
-                };
-                let go_src_glob_addr = pluginfs::glob_addr(&src_glob, &[]);
+                let go_src_glob_addr = nongo_lanes::go_src_glob_addr(pkg);
                 // Non-Go src tree + go_src codegen query + go_codegen_deps — needed
                 // so `go list` can resolve //go:embed patterns into EmbedFiles, and
                 // shared with the downstream `embed` target.

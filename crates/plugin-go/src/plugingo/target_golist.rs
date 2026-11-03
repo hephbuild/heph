@@ -15,6 +15,11 @@ pub const GROUP_HEADER_SRCS: &str = "headersrcs";
 /// source-map annotation, so an embedded header-read file still routes to its
 /// own `fs:file` addr downstream.
 pub const GROUP_HEADERS: &str = "headers";
+/// Dep group of the package's own `.go` files when [`GROUP_HEADERS`] covers
+/// them: staged whole for `go list`, `hashed: false` — the header target hashes
+/// their go/build view instead. No source-map annotation: a `.go` file of the
+/// glob maps to its own `fs:file` addr either way.
+pub const GROUP_GO_SRCS: &str = "gosrcs";
 
 /// `_golist`'s non-Go inputs, by lane (see [`crate::plugingo::nongo_lanes`]).
 #[derive(Debug, Default)]
@@ -46,7 +51,14 @@ pub fn build_spec_firstparty(
     non_go: &NonGoLanes,
     has_test_files: bool,
 ) -> anyhow::Result<TargetSpec> {
-    let mut srcfiles: Vec<String> = vec![go_src_addr.format()];
+    // The `.go` glob is content-blind exactly when the header target is there
+    // to hash its go/build view (a non-vendored module); otherwise its content
+    // keys the listing, as every input's did before.
+    let go_src = [go_src_addr.format()];
+    let mut srcfiles: Vec<String> = Vec::new();
+    if non_go.headers.is_none() {
+        srcfiles.extend_from_slice(&go_src);
+    }
     if let Some(q) = go_src_query_addr {
         srcfiles.push(q.format());
     }
@@ -54,6 +66,9 @@ pub fn build_spec_firstparty(
     let modfiles = [go_mod_addr.format()];
     let mut groups: Vec<(&str, &[String])> =
         vec![("modfiles", &modfiles[..]), ("srcfiles", &srcfiles)];
+    if non_go.headers.is_some() {
+        groups.push((GROUP_GO_SRCS, &go_src));
+    }
     for (group, lane) in [
         (GROUP_NAMES, &non_go.names),
         (GROUP_HEADER_SRCS, &non_go.header_srcs),

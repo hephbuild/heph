@@ -97,10 +97,23 @@ nothing.
 
 ## What re-runs `_golist`
 
-`go list` reads a package's `.go` files whole, but of every other file it reads at
-most a name and a leading comment block. `_golist`'s key follows that, so editing a
-non-Go file's bytes (an embedded asset, a README, a `testdata` file, the body of a
-`.c`) no longer re-runs it. Adding, removing or renaming a non-Go file still does.
+`go list` reads only part of most files: of a `.go` file, the header and, if the
+file imports `"embed"`, its `//go:embed` lines; of every other file, at most a
+name and a leading comment block. `_golist`'s key follows that, so editing a
+function body (in a `.go` or `_test.go` file) or a non-Go file's bytes (an
+embedded asset, a README, a `testdata` file, the body of a `.c`) doesn't re-run
+it. Adding, removing or renaming a file still does.
+
+The package's own **`.go` files**, `_test.go` included, are staged whole, and the
+key covers each file's name and what `go/build` reads of it, through the same
+`//@heph/go/headers/<pkg>:headers` target as the header-read files below. That is
+the header — leading comments, build constraints and `//go:` directives, the
+package clause, the imports with their doc comments (the cgo preamble) — plus,
+for a file that imports `"embed"`, every `//go:embed` and `//line` comment and
+where it sits. Changing an import, a constraint, the preamble or an embed pattern
+re-runs `_golist`. Editing code below the imports doesn't, except in a file that
+imports `"embed"`, where an edit that moves a `//go:embed` line to another line
+does (`go list` reports that position when a pattern matches nothing).
 
 Non-Go files reach `_golist` in one of two lanes:
 
@@ -116,8 +129,8 @@ Non-Go files reach `_golist` in one of two lanes:
 
 Two cases keep hashing content:
 
-- **A vendored module** (one with `vendor/modules.txt`) keeps every non-Go file
-  content-hashed, because `go list` reads `vendor/modules.txt`.
+- **A vendored module** (one with `vendor/modules.txt`) keeps every file, `.go`
+  included, content-hashed, because `go list` reads `vendor/modules.txt`.
 - **The codegen lanes** (files produced by another target) stay content-hashed.
 
 The names lane is an fs glob with `m=names`. You can name one in a BUILD file by

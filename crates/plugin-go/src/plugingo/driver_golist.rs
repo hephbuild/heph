@@ -350,8 +350,11 @@ impl ManagedDriver for GoGolistDriver {
             // stands in for them in the key without being staged. Neither opts
             // into the source map: an embedded header-read file must route to its
             // own `fs:file` addr, never to the header extract.
+            // The package's `.go` files go the same way: staged whole, keyed
+            // through their go/build view in the header target.
             let (hashed, runtime) = match group.as_str() {
-                crate::plugingo::target_golist::GROUP_HEADER_SRCS => (false, true),
+                crate::plugingo::target_golist::GROUP_HEADER_SRCS
+                | crate::plugingo::target_golist::GROUP_GO_SRCS => (false, true),
                 crate::plugingo::target_golist::GROUP_HEADERS => (true, false),
                 _ => (true, true),
             };

@@ -13,7 +13,9 @@
 //!   staged `hashed: false, runtime: true` so `go list` reads the real files.
 //! - **headers**: the provider-owned header target over that *same* glob addr
 //!   ([`headers_addr`]), `hashed: true, runtime: false`: what the header-read
-//!   files contribute to the key is exactly the bytes `go/build` reads.
+//!   files contribute to the key is exactly the bytes `go/build` reads. It also
+//!   covers the package's `.go` files ([`go_src_glob_addr`]), by their go/build
+//!   view (`crate::plugingo::go_view`), which `_golist` then stages unhashed too.
 //!
 //! Every pattern below is rendered from [`GO_HEADER_READ_EXTS`] and
 //! [`GO_NEVER_OPENED_PREFIXES`], so the lanes partition the files by
@@ -115,6 +117,17 @@ pub fn header_read_glob_addr(pkg: &str) -> Addr {
     pluginfs::glob_addr(&pattern, &excludes)
 }
 
+/// The `.go` files of `pkg`'s own directory, as a content glob (`_test.go`
+/// included: `go list -test` reads them the same way).
+///
+/// The **one** builder of this addr, for the same reason as
+/// [`header_read_glob_addr`]: `_golist` stages it unhashed (a non-vendored
+/// module) and the header target hashes the go/build view of the very files it
+/// lists.
+pub fn go_src_glob_addr(pkg: &str) -> Addr {
+    pluginfs::glob_addr(&format!("{}*.go", dir_prefix(pkg)), &[])
+}
+
 /// Excludes every lane-less file shares: the `.go` sources (their own lane) and
 /// the module files (the `_go_mod` lane delivers them; staging them twice is an
 /// output collision).
@@ -198,14 +211,20 @@ pub fn pkg_from_headers_pkg(hpkg: &str) -> Option<&str> {
     rest.strip_prefix('/').filter(|p| !p.is_empty())
 }
 
-/// Spec of the header target of `pkg`. Its one input is
-/// [`header_read_glob_addr`]; it is derived from the package path alone, so
-/// answering it reads nothing from disk.
+/// Spec of the header target of `pkg`. Its inputs are
+/// [`header_read_glob_addr`] and [`go_src_glob_addr`]; it is derived from the
+/// package path alone, so answering it reads nothing from disk.
 pub fn headers_spec(addr: Addr, pkg: &str) -> TargetSpec {
-    let config = HashMap::from([(
-        "src".to_string(),
-        Value::String(header_read_glob_addr(pkg).format()),
-    )]);
+    let config = HashMap::from([
+        (
+            "src".to_string(),
+            Value::String(header_read_glob_addr(pkg).format()),
+        ),
+        (
+            "go_src".to_string(),
+            Value::String(go_src_glob_addr(pkg).format()),
+        ),
+    ]);
     TargetSpec {
         addr,
         driver: crate::plugingo::listed::DRIVER_HEADERS.to_string(),
@@ -329,11 +348,26 @@ mod tests {
                 };
                 assert_eq!(got, *want, "{path:?}");
             }
-            // Never a non-Go file: on no lane at all.
-            for not_non_go in ["a.go", "a_test.go", "go.mod", "go.sum", "sub/go.mod"] {
+            let go = Lane::of(&go_src_glob_addr(pkg));
+            for (name, _) in T12 {
+                let path = format!("{}{name}", dir_prefix(pkg));
+                assert!(!go.matches(&path), "{path:?} is not a .go file");
+            }
+            // Never a non-Go file: on no non-Go lane at all; a `.go` file of the
+            // package directory is on the go lane alone.
+            for (not_non_go, on_go_lane) in [
+                ("a.go", true),
+                ("a_test.go", true),
+                ("a_linux_test.go", true),
+                ("go.mod", false),
+                ("go.sum", false),
+                ("sub/go.mod", false),
+                ("sub/b.go", false),
+            ] {
                 let path = format!("{}{not_non_go}", dir_prefix(pkg));
                 assert!(!names.matches(&path), "{path:?} is not a non-Go file");
                 assert!(!header.matches(&path), "{path:?} is not a non-Go file");
+                assert_eq!(go.matches(&path), on_go_lane, "{path:?} on the go lane");
             }
         }
     }
@@ -470,6 +504,10 @@ mod tests {
         assert_eq!(
             spec.config.get("src"),
             Some(&Value::String(header_read_glob_addr("pkg").format()))
+        );
+        assert_eq!(
+            spec.config.get("go_src"),
+            Some(&Value::String(go_src_glob_addr("pkg").format()))
         );
         assert_eq!(spec.driver, crate::plugingo::listed::DRIVER_HEADERS);
     }

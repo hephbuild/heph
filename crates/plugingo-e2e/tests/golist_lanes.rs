@@ -1061,3 +1061,395 @@ async fn t19_body_mutations_leave_go_list_byte_identical() -> anyhow::Result<()>
     assert_eq!(pkg_error(&after), pkg_error(&before));
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// G1–G6: `.go` files reach `_golist` through their go/build view
+// ---------------------------------------------------------------------------
+
+const LIB_GO: &str = "package lib\n\nimport \"fmt\"\n\nfunc F() string { return fmt.Sprint(1) }\n";
+const LIB_TEST_GO: &str =
+    "package lib\n\nimport \"testing\"\n\nfunc TestF(t *testing.T) { _ = F() }\n";
+
+fn lib_pkg() -> anyhow::Result<tempfile::TempDir> {
+    tree(&[
+        ("go.mod", GO_MOD),
+        ("lib/lib.go", LIB_GO),
+        ("lib/lib_test.go", LIB_TEST_GO),
+    ])
+}
+
+/// G1: a function-body edit in a `.go` file keeps `_golist` a hit, and the
+/// compile re-runs on the new bytes.
+#[tokio::test]
+async fn g1_a_go_body_edit_keeps_golist_and_recompiles() -> anyhow::Result<()> {
+    require_go!();
+    let ws = make_workspace(lib_pkg()?)?;
+    run(&ws, "//lib:build_lib@v=host").await?;
+
+    write(
+        ws.dir.path(),
+        "lib/lib.go",
+        &LIB_GO.replace("Sprint(1)", "Sprint(2)"),
+    )?;
+    let ws = reopen(ws)?;
+    let (_, ev) = run(&ws, "//lib:build_lib@v=host").await?;
+    ev.assert_executed("@heph/go/headers/lib", "headers", "lib.go changed");
+    ev.assert_hit("lib", "_golist", "only a body changed");
+    ev.assert_executed("lib", "build_lib", "the compile reads the whole file");
+    Ok(())
+}
+
+/// G2: the same for a `_test.go` body: `go list -test` full-parses it only for
+/// the synthetic test main, which `_golist` drops.
+#[tokio::test]
+async fn g2_a_test_go_body_edit_keeps_golist() -> anyhow::Result<()> {
+    require_go!();
+    let ws = make_workspace(lib_pkg()?)?;
+    golist(&ws, "lib").await?;
+
+    write(
+        ws.dir.path(),
+        "lib/lib_test.go",
+        &LIB_TEST_GO.replace("_ = F()", "if F() == \"\" { t.Fatal() }"),
+    )?;
+    let ws = reopen(ws)?;
+    let (_, ev) = golist(&ws, "lib").await?;
+    ev.assert_executed("@heph/go/headers/lib", "headers", "lib_test.go changed");
+    ev.assert_hit("lib", "_golist", "only a test body changed");
+    Ok(())
+}
+
+/// G3: adding an import re-lists, and the new import is reported.
+#[tokio::test]
+async fn g3_adding_an_import_relists() -> anyhow::Result<()> {
+    require_go!();
+    let ws = make_workspace(lib_pkg()?)?;
+    let (pkg, _) = golist(&ws, "lib").await?;
+    assert_eq!(pkg.imports, vec!["fmt"]);
+
+    write(
+        ws.dir.path(),
+        "lib/lib.go",
+        &LIB_GO
+            .replace("import \"fmt\"", "import (\n\t\"fmt\"\n\t\"strings\"\n)")
+            .replace("fmt.Sprint(1)", "strings.ToUpper(fmt.Sprint(1))"),
+    )?;
+    let ws = reopen(ws)?;
+    let (pkg, ev) = golist(&ws, "lib").await?;
+    ev.assert_executed("lib", "_golist", "an import was added");
+    assert_eq!(pkg.imports, vec!["fmt", "strings"]);
+    Ok(())
+}
+
+/// G4: adding a `//go:embed` pattern below the imports re-lists, and the new
+/// file is embedded.
+#[tokio::test]
+async fn g4_adding_an_embed_pattern_relists() -> anyhow::Result<()> {
+    require_go!();
+    let src = "package lib\n\nimport _ \"embed\"\n\nvar x = 1\n\n//go:embed a.txt\nvar a string\n";
+    let dir = tree(&[
+        ("go.mod", GO_MOD),
+        ("lib/lib.go", src),
+        ("lib/a.txt", "a"),
+        ("lib/b.txt", "b"),
+    ])?;
+    let ws = make_workspace(dir)?;
+    let (pkg, _) = golist(&ws, "lib").await?;
+    assert_eq!(pkg.embed_patterns, vec!["a.txt"]);
+
+    write(
+        ws.dir.path(),
+        "lib/lib.go",
+        &format!("{src}\n//go:embed b.txt\nvar b string\n"),
+    )?;
+    let ws = reopen(ws)?;
+    let (pkg, ev) = golist(&ws, "lib").await?;
+    ev.assert_executed("lib", "_golist", "an embed pattern was added");
+    assert_eq!(pkg.embed_patterns, vec!["a.txt", "b.txt"]);
+    Ok(())
+}
+
+/// G5: flipping a `.go` file's build constraint re-lists, and the file leaves
+/// `GoFiles`.
+#[tokio::test]
+async fn g5_flipping_a_go_build_constraint_relists() -> anyhow::Result<()> {
+    require_go!();
+    let dir = tree(&[
+        ("go.mod", GO_MOD),
+        ("lib/lib.go", LIB_GO),
+        ("lib/extra.go", "package lib\n\nfunc G() {}\n"),
+    ])?;
+    let ws = make_workspace(dir)?;
+    let (pkg, _) = golist(&ws, "lib").await?;
+    assert_eq!(pkg.go_files, vec!["extra.go", "lib.go"]);
+
+    write(
+        ws.dir.path(),
+        "lib/extra.go",
+        "//go:build ignore\n\npackage lib\n\nfunc G() {}\n",
+    )?;
+    let ws = reopen(ws)?;
+    let (pkg, ev) = golist(&ws, "lib").await?;
+    ev.assert_executed("lib", "_golist", "extra.go gained an ignore constraint");
+    assert_eq!(pkg.go_files, vec!["lib.go"]);
+    Ok(())
+}
+
+/// G6: in a vendored module the `.go` files stay content-hashed, so a body
+/// edit re-lists.
+#[tokio::test]
+async fn g6_a_vendored_module_relists_on_a_go_body_edit() -> anyhow::Result<()> {
+    require_go!();
+    let dir = tree_owned(&vendored_module("", "example.com/vend", "1.21"))?;
+    let ws = make_workspace(dir)?;
+    golist(&ws, "").await?;
+
+    write(ws.dir.path(), "lib.go", "package lib\n\nfunc F() {}\n")?;
+    let ws = reopen(ws)?;
+    let (_, ev) = golist(&ws, "").await?;
+    ev.assert_executed("", "_golist", "a vendored module keeps the content lane");
+    Ok(())
+}
+
+/// `go/build`'s view of every package directory of a tree: for each, the
+/// `ImportDir` result as JSON (with `-test` files and positions), and the bytes
+/// each `.go` file read, through a one-byte reader.
+const GO_VIEW_PROBE: &str = r#"package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"go/build"
+	"io"
+	"os"
+	"path/filepath"
+)
+
+type oneByte struct {
+	f *os.File
+	n *int
+}
+
+func (r *oneByte) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	n, err := r.f.Read(p[:1])
+	*r.n += n
+	return n, err
+}
+
+func (r *oneByte) Close() error { return r.f.Close() }
+
+func main() {
+	root := os.Args[1]
+	ents, err := os.ReadDir(root)
+	if err != nil {
+		panic(err)
+	}
+	for _, e := range ents {
+		dir := filepath.Join(root, e.Name())
+		read := map[string]*int{}
+		ctxt := build.Default
+		ctxt.CgoEnabled = true
+		ctxt.OpenFile = func(p string) (io.ReadCloser, error) {
+			f, err := os.Open(p)
+			if err != nil {
+				return nil, err
+			}
+			n := new(int)
+			read[filepath.Base(p)] = n
+			return &oneByte{f: f, n: n}, nil
+		}
+		pkg, err := ctxt.ImportDir(dir, 0)
+		msg := ""
+		if err != nil {
+			msg = err.Error()
+		}
+		counts := map[string]int{}
+		for k, v := range read {
+			counts[k] = *v
+		}
+		pkg.Dir = ""
+		view, _ := json.Marshal(struct {
+			Pkg *build.Package
+			Err string
+		}{pkg, msg})
+		reads := ""
+		for k, v := range counts {
+			reads += fmt.Sprintf("%s=%d,", k, v)
+		}
+		fmt.Printf("%s\t%s\t%s\n", e.Name(), view, reads)
+	}
+}
+"#;
+
+/// The G7 corpus: `.go` files of every header and embed shape, each in its own
+/// package directory, as (dir, file, contents).
+fn g7_corpus() -> Vec<(&'static str, &'static str, String)> {
+    let body = "\nfunc F() int { return 1 }\n";
+    vec![
+        ("plain", "a.go", format!("package p\n{body}")),
+        (
+            "imports",
+            "a.go",
+            format!(
+                "package p\n\nimport (\n\t\"fmt\"\n\tx \"os\"\n)\n\nvar _ = fmt.Sprint\nvar _ = x.Args\n{body}"
+            ),
+        ),
+        (
+            "constraint",
+            "a.go",
+            format!("//go:build linux || darwin\n\npackage p\n{body}"),
+        ),
+        (
+            "ignored",
+            "a.go",
+            format!("//go:build ignore\n\npackage p\n{body}"),
+        ),
+        (
+            "late_tag",
+            "a.go",
+            format!("package p\n//go:build ignore\n{body}"),
+        ),
+        ("bom", "a.go", format!("\u{feff}package p\n{body}")),
+        (
+            "crlf",
+            "a.go",
+            format!("package p\r\n\r\nimport \"fmt\"\r\n\r\nvar _ = fmt.Sprint\r\n{body}"),
+        ),
+        (
+            "cgo",
+            "a.go",
+            format!(
+                "package p\n\n// #cgo LDFLAGS: -lm\n// #include <math.h>\nimport \"C\"\n{body}"
+            ),
+        ),
+        (
+            "directive",
+            "a.go",
+            format!("//go:debug panicnil=1\n\npackage p\n{body}"),
+        ),
+        (
+            "embed",
+            "a.go",
+            format!(
+                "package p\n\nimport _ \"embed\"\n\nvar s = \"//go:embed not_this\"\n\n//go:embed a.txt\nvar a string\n{body}"
+            ),
+        ),
+        (
+            "embed_line",
+            "a.go",
+            format!(
+                "package p\n\nimport _ \"embed\"\n\n//line x.go:100\n//go:embed missing.txt\nvar a string\n{body}"
+            ),
+        ),
+        (
+            "test_file",
+            "a_test.go",
+            format!("package p\n\nimport \"testing\"\n\nfunc TestF(t *testing.T) {{}}\n{body}"),
+        ),
+        (
+            "nonascii",
+            "a.go",
+            format!("// héllo\npackage p\n\nimport ü \"fmt\"\n\nvar _ = ü.Sprint\n{body}"),
+        ),
+    ]
+}
+
+/// G7: the `.go` view extractor holds to the real `go/build`: on every Go the
+/// suite pins, replacing a file's body with one that leaves the extract
+/// unchanged leaves `ImportDir`'s whole result (imports, positions, embeds,
+/// constraints, cgo directives, errors) identical — and without an embed
+/// import, `go/build` reads no further than the header.
+#[tokio::test]
+async fn g7_the_go_view_extractor_matches_go_build() -> anyhow::Result<()> {
+    require_go!();
+    let corpus = g7_corpus();
+    let tmp = tempfile::tempdir()?;
+    let root = tmp.path().join("tree");
+    let mutated: Vec<String> = corpus
+        .iter()
+        .map(|(_, _, src)| {
+            src.replace("return 1", "return 2 + 2\n\t// more\n")
+                .replace("\nfunc F", "\nfunc G() {}\n\nfunc F")
+        })
+        .collect();
+    for ((dir, file, src), m) in corpus.iter().zip(&mutated) {
+        assert_eq!(
+            plugingo::extract_go_view(src.as_bytes())?,
+            plugingo::extract_go_view(m.as_bytes())?,
+            "{dir}: the mutation must keep the extract"
+        );
+        write(&root, &format!("{dir}/{file}"), src)?;
+        write(&root, &format!("{dir}/a.txt"), "a")?;
+    }
+
+    for toolchain in go_toolchains() {
+        let tc = toolchain.as_deref();
+        let bdir = tempfile::tempdir()?;
+        write(bdir.path(), "go.mod", "module probe\n\ngo 1.21\n")?;
+        write(bdir.path(), "main.go", GO_VIEW_PROBE)?;
+        let bin = bdir.path().join("probe");
+        let out = go_cmd(tc)
+            .args(["build", "-o"])
+            .arg(&bin)
+            .arg(".")
+            .current_dir(bdir.path())
+            .output()
+            .context("go build the probe")?;
+        anyhow::ensure!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // dir -> (go/build's view, bytes read per file)
+        let probe = || -> anyhow::Result<BTreeMap<String, (String, String)>> {
+            let out = std::process::Command::new(&bin).arg(&root).output()?;
+            anyhow::ensure!(out.status.success(), "probe: {out:?}");
+            Ok(String::from_utf8(out.stdout)?
+                .lines()
+                .filter_map(|l| {
+                    let mut f = l.splitn(3, '\t');
+                    Some((f.next()?, f.next()?, f.next()?))
+                })
+                .map(|(a, b, c)| (a.to_string(), (b.to_string(), c.to_string())))
+                .collect())
+        };
+        for ((dir, file, src), _) in corpus.iter().zip(&mutated) {
+            write(&root, &format!("{dir}/{file}"), src)?;
+        }
+        let before = probe()?;
+        for ((dir, file, _), m) in corpus.iter().zip(&mutated) {
+            write(&root, &format!("{dir}/{file}"), m)?;
+        }
+        let after = probe()?;
+        assert_eq!(before.len(), corpus.len(), "{tc:?}: every package probed");
+        for (dir, (view, _)) in &before {
+            assert_eq!(
+                after.get(dir).map(|(v, _)| v),
+                Some(view),
+                "{tc:?} {dir}: go/build's view changed with only the body edited"
+            );
+        }
+        // Without an embed import, go/build stops inside the first lines: it
+        // never reads the body.
+        for (dir, file, src) in &corpus {
+            if src.contains("\"embed\"") {
+                continue;
+            }
+            let n: usize = before[*dir]
+                .1
+                .split(',')
+                .find_map(|kv| kv.strip_prefix(&format!("{file}=")))
+                .context("the file was read")?
+                .parse()?;
+            assert!(
+                n < src.len(),
+                "{tc:?} {dir}: go/build read {n} of {} bytes",
+                src.len()
+            );
+        }
+    }
+    Ok(())
+}
