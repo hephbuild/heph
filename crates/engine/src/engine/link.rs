@@ -19,6 +19,38 @@ pub struct LinkedTargetDef {
     pub inputs: Vec<LinkedTargetDefInput>,
 }
 
+/// The output groups a target rewrites in place — the ones a dependent may not
+/// consume.
+///
+/// A `codegen = "in_place"` output *is* a tracked source file. It stays visible to
+/// `glob()`/`file()` (it must: it is what the transform reads), and unlike a
+/// `copy` output there is no provenance stamp that could hide it — hiding it would
+/// delete the source. So if a dependent could also take those bytes as artifacts,
+/// the same file would reach it by two paths that disagree whenever the transform
+/// has run but the write-back has not, and heph's "one producer per file" rule
+/// would have no way to arbitrate.
+///
+/// Suppressing the artifact leaves the tree as the single producer and costs the
+/// dependent nothing: after the write-back the tree holds exactly the transformed
+/// bytes, so reading it through `glob()` yields what the artifact would have. The
+/// edge itself keeps working — the target is still resolved (so the transform
+/// runs) and still folds its hashout into the dependent's `hashin`, because
+/// `inputs_result_meta` reads hashouts with `OutputMatcher::None` and never went
+/// through this list.
+pub(crate) fn in_place_groups(def: &TargetDef) -> Vec<String> {
+    use crate::engine::driver::targetdef::path::CodegenMode;
+
+    def.outputs
+        .iter()
+        .filter(|o| {
+            o.paths
+                .iter()
+                .any(|p| matches!(p.codegen_tree, CodegenMode::InPlace))
+        })
+        .map(|o| o.group.clone())
+        .collect()
+}
+
 impl Engine {
     pub async fn link(
         self: Arc<Self>,
@@ -41,9 +73,29 @@ impl Engine {
                     if !input_def.outputs.iter().any(|output| &output.group == output_name) {
                         anyhow::bail!("Output '{output_name}' not found in target '{}'", input.r#ref.r#ref)
                     }
+                    if in_place_groups(&input_def).contains(output_name) {
+                        anyhow::bail!(
+                            "'{}' output '{output_name}' is `codegen = \"in_place\"`: those are \
+                             tracked source files, not artifacts a dependent can consume. Read \
+                             them from the tree with glob()/file(); keep the dep if you need the \
+                             transform to run.",
+                            input.r#ref.r#ref,
+                        )
+                    }
                     vec![output_name.clone()]
                 } else {
-                    input_def.output_names()
+                    // An unqualified dep on a target with in_place outputs takes
+                    // everything *except* those: the transform still runs (the
+                    // edge is resolved, and the write-back lands it in the tree),
+                    // but its files reach the dependent the way every other source
+                    // does — through the tree — instead of arriving a second time
+                    // as artifacts. See `in_place_groups`.
+                    let in_place = in_place_groups(&input_def);
+                    input_def
+                        .output_names()
+                        .into_iter()
+                        .filter(|g| !in_place.contains(g))
+                        .collect()
                 };
 
                 if input.mode == InputMode::Tool {
