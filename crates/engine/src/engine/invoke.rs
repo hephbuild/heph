@@ -466,7 +466,11 @@ impl Engine {
 
         let cwd = match entrypoint.workdir {
             Workdir::Caller => Some(req.cwd.clone()),
-            Workdir::Root => Some(self.cfg.root.clone()),
+            Workdir::TreeRoot => Some(self.cfg.root.clone()),
+            Workdir::TreePackage => Some(match addr.package.as_str() {
+                "" => self.cfg.root.clone(),
+                pkg => self.cfg.root.join(pkg),
+            }),
             Workdir::Sandbox => None,
         };
         let args = entrypoint.accepts_args.then_some(req.args);

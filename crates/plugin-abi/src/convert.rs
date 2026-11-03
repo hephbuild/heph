@@ -1374,8 +1374,9 @@ fn entrypoint_to_pb(e: &Entrypoint) -> pb::Entrypoint {
         accepts_args: Some(e.accepts_args),
         workdir: Some(EnumValue::Known(match e.workdir {
             Workdir::Caller => pb::EntrypointWorkdir::Caller,
-            Workdir::Root => pb::EntrypointWorkdir::Root,
+            Workdir::TreeRoot => pb::EntrypointWorkdir::TreeRoot,
             Workdir::Sandbox => pb::EntrypointWorkdir::Sandbox,
+            Workdir::TreePackage => pb::EntrypointWorkdir::TreePackage,
         })),
         offers_pty: Some(e.offers_pty),
         ..Default::default()
@@ -1387,8 +1388,9 @@ fn entrypoint_to_pb(e: &Entrypoint) -> pb::Entrypoint {
 fn entrypoint_from_pb(e: pb::Entrypoint) -> anyhow::Result<Entrypoint> {
     let workdir = match required_enum(e.workdir, "Entrypoint.workdir")? {
         pb::EntrypointWorkdir::Caller => Workdir::Caller,
-        pb::EntrypointWorkdir::Root => Workdir::Root,
+        pb::EntrypointWorkdir::TreeRoot => Workdir::TreeRoot,
         pb::EntrypointWorkdir::Sandbox => Workdir::Sandbox,
+        pb::EntrypointWorkdir::TreePackage => Workdir::TreePackage,
         pb::EntrypointWorkdir::Unspecified => bail!("field Entrypoint.workdir is unspecified"),
     };
     let entrypoint = Entrypoint::new(e.accepts_args.unwrap_or_default(), workdir);
@@ -3189,7 +3191,12 @@ nested: { a: 1, b: [x, y] }
     fn entrypoint_round_trips_abi() {
         use hplugin::driver::targetdef::{Entrypoint, Workdir};
         for accepts_args in [false, true] {
-            for workdir in [Workdir::Caller, Workdir::Root, Workdir::Sandbox] {
+            for workdir in [
+                Workdir::Caller,
+                Workdir::TreeRoot,
+                Workdir::Sandbox,
+                Workdir::TreePackage,
+            ] {
                 let mut td = full_target_def();
                 td.entrypoint = Some(Entrypoint::new(accepts_args, workdir));
                 let back = target_def_from_pb(via_bytes(&target_def_to_pb(&td).expect("encode")))

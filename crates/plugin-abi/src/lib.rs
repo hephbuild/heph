@@ -32,6 +32,11 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// the new `x.y.0`. The 0.14.0 and 0.15.0 entries below predate it — they were
 /// additive minors, and there was no version check to read them.
 ///
+/// 0.17.3 (additive, a patch): `EntrypointWorkdir.TREE_PACKAGE` (4), the
+/// target's package dir in the real tree; `ROOT` (2) is renamed `TREE_ROOT` at
+/// the same number. An older host refuses a def carrying the new value at
+/// decode rather than running it somewhere else.
+///
 /// 0.17.2 (additive, a patch): a run on the host's PTY. `RUN_STDIO_PTY`,
 /// `RunOptions.pty_slave_fd`, `Entrypoint.offers_pty`, and the `stopped` and
 /// `cont` run frames. A driver offers it by setting the bit, so an old plugin is
@@ -212,7 +217,7 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// 0.3.0: `PluginComponents` gained a `hooks` field (a layout change to the
 /// create-entry struct) for the Hook plugin kind — a hard break, so every plugin
 /// must be rebuilt against this ABI.
-pub const ABI_SEMVER: &str = "0.17.2";
+pub const ABI_SEMVER: &str = "0.17.3";
 
 /// The start of the ABI lane this host loads: a plugin is accepted iff its
 /// version matches the caret requirement `^MIN_PLUGIN_ABI` — pre-1.0, one
@@ -229,7 +234,7 @@ pub const MIN_PLUGIN_ABI: &str = "0.17.0";
 
 /// [`ABI_SEMVER`], NUL-terminated: what a plugin's `heph_plugin_abi_semver`
 /// entry returns a pointer to. Bumped with it; a test holds the two equal.
-pub const ABI_SEMVER_C: &std::ffi::CStr = c"0.17.2";
+pub const ABI_SEMVER_C: &std::ffi::CStr = c"0.17.3";
 
 /// Decode a wire message from a trusted peer.
 ///
