@@ -47,6 +47,8 @@ const READ_CHUNK: usize = 4096;
 const SRC_ORIGIN: &str = "dep|src|0";
 /// Origin id of the `.go` glob input.
 const GO_SRC_ORIGIN: &str = "dep|gosrc|0";
+/// Origin id prefix of the codegen inputs, one per `go_gen` addr.
+const GEN_ORIGIN_PREFIX: &str = "dep|gogen|";
 
 /// The UTF-8 byte-order mark `go/build` skips at the start of a file.
 const BOM: [u8; 3] = [0xef, 0xbb, 0xbf];
@@ -200,33 +202,85 @@ fn scan(src: &mut impl BufRead, mut out: Vec<u8>, pending: Vec<u8>) -> std::io::
     Ok(out)
 }
 
-/// One tar entry per file, sorted by path: the [`extract_go_build_header`] of
-/// `ws_dir/<rel>` under `rel`, or for a `.go` file its
-/// [`crate::plugingo::go_view::extract_go_view`]. Mode, owner and mtime are fixed, so equal inputs
-/// give byte-equal tars on every host. A file with an empty prefix still gets
-/// its (empty) entry: adding or removing one must move the key.
+/// Which lane staged a file of the header tar.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Lane {
+    /// A checked-in file of the package directory (the header-read or `.go`
+    /// glob).
+    Source,
+    /// A codegen output, with the addr of the target that produced it.
+    Generated(String),
+}
+
+/// What a generated file's tar entry holds: the producer, then the `.go` view or
+/// the content digest. The producer is there because `_golist` maps each
+/// generated file to it (its source map), so a file moving between producers —
+/// or between a generator and the tree — must move the key even when its bytes
+/// do not.
+fn generated_entry(producer: &str, rel: &str, file: std::fs::File) -> std::io::Result<Vec<u8>> {
+    let mut out = producer.as_bytes().to_vec();
+    out.push(b'\n');
+    if rel.ends_with(".go") {
+        out.push(b'V');
+        out.extend(crate::plugingo::go_view::extract_go_view(file)?);
+    } else {
+        // Every generated non-Go file is keyed by its whole content (E1): it is
+        // staged in the same artifact as the `.go` files, so no glob splits it
+        // off, and a digest keeps a large bundle out of the tar.
+        let mut h = xxhash_rust::xxh3::Xxh3Default::new();
+        std::io::copy(&mut std::io::BufReader::new(file), &mut h)?;
+        out.push(b'C');
+        out.extend_from_slice(&h.digest128().to_le_bytes());
+    }
+    Ok(out)
+}
+
+/// One tar entry per file, sorted by path: for a [`Lane::Source`] file the
+/// [`extract_go_build_header`] of `ws_dir/<rel>` under `rel`, or for a `.go`
+/// file its [`crate::plugingo::go_view::extract_go_view`]; for a
+/// [`Lane::Generated`] one, [`generated_entry`]. Mode, owner and mtime are
+/// fixed, so equal inputs give byte-equal tars on every host. A file with an
+/// empty prefix still gets its (empty) entry: adding or removing one must move
+/// the key.
 ///
-/// A file that cannot be read fails the whole target, naming it: silently
-/// leaving it out would hand `_golist` a key that misses it. `cancel` is
-/// checked before each file, so a cancelled build stops between files.
+/// A path staged by two lanes, or by two producers, fails the target naming
+/// both (I3): one entry would key only one of them. The same `(rel, lane)` twice
+/// is one file (a codegen target reached through both the query and
+/// `go_codegen_deps`). A file that cannot be read fails the whole target,
+/// naming it: silently leaving it out would hand `_golist` a key that misses it.
+/// `cancel` is checked before each file, so a cancelled build stops between
+/// files.
 pub fn build_headers_tar(
     ws_dir: &std::path::Path,
-    rels: &[String],
+    files: &[(String, Lane)],
     cancel: &dyn Cancellable,
 ) -> anyhow::Result<Vec<u8>> {
-    let mut sorted: Vec<&String> = rels.iter().collect();
+    let mut sorted: Vec<&(String, Lane)> = files.iter().collect();
     sorted.sort_unstable();
     sorted.dedup();
+    if let Some((a, b)) = sorted
+        .iter()
+        .zip(sorted.iter().skip(1))
+        .find(|(a, b)| a.0 == b.0)
+    {
+        anyhow::bail!(
+            "go.headers: {} is staged by two lanes ({:?} and {:?}); a file reaches `_golist` \
+             through exactly one",
+            a.0,
+            a.1,
+            b.1
+        );
+    }
     let mut builder = tar::Builder::new(Vec::new());
-    for rel in sorted {
+    for (rel, lane) in sorted {
         anyhow::ensure!(!cancel.is_cancelled(), "go.headers: cancelled");
         let path = ws_dir.join(rel);
         let file = std::fs::File::open(&path)
             .with_context(|| format!("go.headers: open header-read file {rel}"))?;
-        let header_bytes = if rel.ends_with(".go") {
-            crate::plugingo::go_view::extract_go_view(file)
-        } else {
-            extract_go_build_header(file)
+        let header_bytes = match lane {
+            Lane::Generated(producer) => generated_entry(producer, rel, file),
+            Lane::Source if rel.ends_with(".go") => crate::plugingo::go_view::extract_go_view(file),
+            Lane::Source => extract_go_build_header(file),
         }
         .with_context(|| format!("go.headers: read the go/build header of {rel}"))?;
         let mut h = tar::Header::new_gnu();
@@ -277,18 +331,24 @@ struct GoHeadersSpec {
     /// The package's `.go` glob, whose files' go/build views are extracted.
     #[spec(required)]
     go_src: String,
+    /// The codegen addrs `_golist` stages unhashed (its `gensrcs` group):
+    /// their `.go` outputs by go/build view, everything else by content.
+    go_gen: Vec<String>,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct GoHeadersDef {
     src: String,
     go_src: String,
+    /// Sorted and deduplicated: the set, not the order it was declared in.
+    go_gen: Vec<String>,
 }
 
 impl Hash for GoHeadersDef {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.src.hash(state);
         self.go_src.hash(state);
+        self.go_gen.hash(state);
     }
 }
 
@@ -336,13 +396,20 @@ impl ManagedDriver for GoHeadersDriver {
                 runtime: true,
             })
         };
-        let inputs = vec![
+        let mut go_gen = spec.go_gen;
+        go_gen.sort_unstable();
+        go_gen.dedup();
+        let mut inputs = vec![
             input(&spec.src, SRC_ORIGIN)?,
             input(&spec.go_src, GO_SRC_ORIGIN)?,
         ];
+        for (i, addr) in go_gen.iter().enumerate() {
+            inputs.push(input(addr, &format!("{GEN_ORIGIN_PREFIX}{i}"))?);
+        }
         let def = GoHeadersDef {
             src: spec.src,
             go_src: spec.go_src,
+            go_gen,
         };
         let hash = def_hash(&req.target_spec.addr, &def, GO_HEADERS_FORMAT_VERSION);
         let out_path = if pkg.as_str().is_empty() {
@@ -400,17 +467,57 @@ impl ManagedDriver for GoHeadersDriver {
             .filter_map(|origin| req.inputs.iter().find(|m| m.input.origin_id == *origin))
             .map(|m| anyhow::Ok((m.require_list_path()?.to_path_buf(), m.unpack_root.clone())))
             .collect::<anyhow::Result<_>>()?;
+        // A codegen input is one artifact of one producer each (a query expands
+        // to one input per member, all under its origin), and the producer is
+        // part of the entry — so these are walked per artifact, as the source
+        // map is, not through the shared list file.
+        let generated: Vec<_> = req
+            .inputs
+            .iter()
+            .filter(|m| m.input.origin_id.starts_with(GEN_ORIGIN_PREFIX))
+            .map(|m| {
+                (
+                    m.input.source_addr.format(),
+                    Arc::clone(&m.input.artifact.content),
+                    m.input.filters.clone(),
+                    m.unpack_root.clone(),
+                )
+            })
+            .collect();
         let cancel = ctoken.clone_arc();
         let ws_dir = req.sandbox_ws_dir.clone();
         let pkg_dir = req.sandbox_pkg_dir.clone();
         // The list read, every header read and the write are file IO: the
         // bounded blocking pool, never a runtime worker.
         hcore::blocking::run(move || {
-            let mut rels = Vec::new();
+            let mut files = Vec::new();
             for (list_path, unpack_root) in &staged {
-                rels.extend(staged_rels(list_path, unpack_root)?);
+                files.extend(
+                    staged_rels(list_path, unpack_root)?
+                        .into_iter()
+                        .map(|rel| (rel, Lane::Source)),
+                );
             }
-            let tar = build_headers_tar(&ws_dir, &rels, &*cancel)?;
+            for (producer, content, filters, unpack_root) in &generated {
+                anyhow::ensure!(
+                    *unpack_root == ws_dir,
+                    "go.headers: {producer} is staged outside the workspace root"
+                );
+                let filters = hcore::hartifactcontent::PathFilter::new(filters);
+                for rel in content
+                    .entry_paths()
+                    .with_context(|| format!("go.headers: list the outputs of {producer}"))?
+                {
+                    if !filters.matches(&rel) {
+                        continue;
+                    }
+                    let rel = rel.to_str().with_context(|| {
+                        format!("go.headers: path is not UTF-8: {}", rel.display())
+                    })?;
+                    files.push((rel.to_string(), Lane::Generated(producer.clone())));
+                }
+            }
+            let tar = build_headers_tar(&ws_dir, &files, &*cancel)?;
             std::fs::create_dir_all(&pkg_dir).with_context(|| format!("create {pkg_dir:?}"))?;
             let out = pkg_dir.join(crate::plugingo::nongo_lanes::HEADERS_OUT);
             std::fs::write(&out, tar).with_context(|| format!("write {out:?}"))?;
@@ -433,8 +540,114 @@ mod tests {
 
     /// [`super::build_headers_tar`] for a build that is never cancelled. Shadows
     /// the glob import, so the tests below read as calls of the real thing.
+    /// Every file on the [`Lane::Source`] lane.
     fn build_headers_tar(ws_dir: &std::path::Path, rels: &[String]) -> anyhow::Result<Vec<u8>> {
-        super::build_headers_tar(ws_dir, rels, &hcore::hasync::StdCancellationToken::new())
+        let files: Vec<_> = rels.iter().map(|r| (r.clone(), Lane::Source)).collect();
+        tar_of(ws_dir, &files)
+    }
+
+    fn tar_of(ws_dir: &std::path::Path, files: &[(String, Lane)]) -> anyhow::Result<Vec<u8>> {
+        super::build_headers_tar(ws_dir, files, &hcore::hasync::StdCancellationToken::new())
+    }
+
+    fn generated(producer: &str) -> Lane {
+        Lane::Generated(producer.to_string())
+    }
+
+    /// Generated files: a `.go` keyed by its go/build view (a body edit keeps the
+    /// tar, an import moves it), every other file by its whole content, and the
+    /// producer in both — the same bytes from another producer, or from the
+    /// tree, are another key.
+    #[test]
+    fn generated_files_key_by_view_content_and_producer() {
+        let ws = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(ws.path().join("pkg")).expect("mkdir");
+        let w = |rel: &str, s: &str| std::fs::write(ws.path().join(rel), s).expect("write");
+        let files = vec![
+            ("pkg/gen.go".to_string(), generated("//gen:a")),
+            ("pkg/gen.txt".to_string(), generated("//gen:a")),
+        ];
+        let tar = || tar_of(ws.path(), &files).expect("tar");
+        w("pkg/gen.go", "package pkg\n\nfunc F() int { return 1 }\n");
+        w("pkg/gen.txt", "one");
+        let base = tar();
+
+        w("pkg/gen.go", "package pkg\n\nfunc F() int { return 2 }\n");
+        assert_eq!(tar(), base, "a generated body edit keeps the key");
+        w(
+            "pkg/gen.go",
+            "package pkg\n\nimport \"fmt\"\n\nfunc F() int { return 2 }\n",
+        );
+        let imported = tar();
+        assert_ne!(imported, base, "a generated import moves the key");
+
+        w("pkg/gen.txt", "two");
+        assert_ne!(
+            tar(),
+            imported,
+            "a generated non-Go edit moves the key (E1)"
+        );
+
+        let other = vec![
+            ("pkg/gen.go".to_string(), generated("//gen:b")),
+            ("pkg/gen.txt".to_string(), generated("//gen:a")),
+        ];
+        let from_tree = vec![
+            ("pkg/gen.go".to_string(), Lane::Source),
+            ("pkg/gen.txt".to_string(), generated("//gen:a")),
+        ];
+        let now = tar();
+        assert_ne!(
+            tar_of(ws.path(), &other).expect("tar"),
+            now,
+            "another producer"
+        );
+        assert_ne!(
+            tar_of(ws.path(), &from_tree).expect("tar"),
+            now,
+            "the tree instead of a generator"
+        );
+    }
+
+    /// I3: a path staged by two lanes, or by two producers, fails the target
+    /// naming it; the same producer reached twice is one file.
+    #[test]
+    fn a_path_in_two_lanes_fails() {
+        let ws = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(ws.path().join("pkg")).expect("mkdir");
+        std::fs::write(ws.path().join("pkg/x.go"), "package pkg\n").expect("write");
+        let rel = "pkg/x.go".to_string();
+        for (what, files) in [
+            (
+                "source and generated",
+                vec![
+                    (rel.clone(), Lane::Source),
+                    (rel.clone(), generated("//g:a")),
+                ],
+            ),
+            (
+                "two producers",
+                vec![
+                    (rel.clone(), generated("//g:a")),
+                    (rel.clone(), generated("//g:b")),
+                ],
+            ),
+        ] {
+            let err = tar_of(ws.path(), &files).expect_err(what);
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("pkg/x.go") && msg.contains("two lanes"),
+                "{what}: {msg}"
+            );
+        }
+        let twice = vec![
+            (rel.clone(), generated("//g:a")),
+            (rel.clone(), generated("//g:a")),
+        ];
+        assert_eq!(
+            tar_of(ws.path(), &twice).expect("one producer twice is one file"),
+            tar_of(ws.path(), &twice[..1]).expect("tar"),
+        );
     }
 
     /// T13: the extractor on the adversarial table. The expected value is what
@@ -715,8 +928,8 @@ mod tests {
     /// the extractor version and its input glob.
     #[tokio::test]
     async fn header_target_is_cached_locally_only() {
-        let addr = crate::plugingo::nongo_lanes::headers_addr("pkg");
-        let spec = crate::plugingo::nongo_lanes::headers_spec(addr, "pkg");
+        let addr = crate::plugingo::nongo_lanes::headers_addr("pkg", None, &[]);
+        let spec = crate::plugingo::nongo_lanes::headers_spec(addr, "pkg", &[]);
         let resp = GoHeadersDriver
             .parse(
                 ParseRequest {
@@ -730,7 +943,7 @@ mod tests {
         let def = resp.target_def;
         assert!(def.cache.enabled, "cached");
         assert!(!def.cache.remote_enabled, "never remote");
-        assert_eq!(def.inputs.len(), 2);
+        assert_eq!(def.inputs.len(), 2, "no codegen, no codegen input");
         assert!(def.inputs.iter().all(|i| i.hashed && i.runtime));
         assert_eq!(
             def.inputs[0].r#ref.r#ref,
@@ -772,6 +985,7 @@ mod tests {
         let raw = GoHeadersDef {
             src: crate::plugingo::nongo_lanes::header_read_glob_addr("pkg").format(),
             go_src: crate::plugingo::nongo_lanes::go_src_glob_addr("pkg").format(),
+            go_gen: Vec::new(),
         };
         assert_eq!(
             def.hash,
@@ -785,6 +999,43 @@ mod tests {
         );
     }
 
+    /// The codegen addrs are hashed (and staged) inputs of the header target, and
+    /// key its def as a set: the same addrs in another order are the same def,
+    /// one more is another.
+    #[tokio::test]
+    async fn header_target_takes_the_codegen_addrs_as_hashed_inputs() {
+        let parse = |go_gen: &[&str]| {
+            let go_gen: Vec<String> = go_gen.iter().map(|s| s.to_string()).collect();
+            let addr = crate::plugingo::nongo_lanes::headers_addr("pkg", None, &[]);
+            let spec = crate::plugingo::nongo_lanes::headers_spec(addr, "pkg", &go_gen);
+            async move {
+                GoHeadersDriver
+                    .parse(
+                        ParseRequest {
+                            request_id: String::new(),
+                            target_spec: Arc::new(spec),
+                        },
+                        &hcore::hasync::StdCancellationToken::new(),
+                    )
+                    .await
+                    .expect("parse")
+                    .target_def
+            }
+        };
+        let def = parse(&["//gen:b", "//gen:a"]).await;
+        let gen_inputs: Vec<_> = def
+            .inputs
+            .iter()
+            .filter(|i| i.origin_id.starts_with(GEN_ORIGIN_PREFIX))
+            .collect();
+        let refs: Vec<String> = gen_inputs.iter().map(|i| i.r#ref.r#ref.format()).collect();
+        assert_eq!(refs, ["//gen:a", "//gen:b"], "sorted");
+        assert!(gen_inputs.iter().all(|i| i.hashed && i.runtime));
+        assert_eq!(def.hash, parse(&["//gen:a", "//gen:b"]).await.hash);
+        assert_ne!(def.hash, parse(&["//gen:a"]).await.hash);
+        assert_ne!(def.hash, parse(&[]).await.hash);
+    }
+
     /// The run's file IO stops at the next file once the build is cancelled.
     #[test]
     fn header_tar_stops_when_cancelled() {
@@ -793,8 +1044,9 @@ mod tests {
         std::fs::write(ws.path().join("pkg/a.c"), b"int").expect("write");
         let ct = hcore::hasync::StdCancellationToken::new();
         ct.cancel();
-        let err = super::build_headers_tar(ws.path(), &["pkg/a.c".to_string()], &ct)
-            .expect_err("a cancelled build stops");
+        let err =
+            super::build_headers_tar(ws.path(), &[("pkg/a.c".to_string(), Lane::Source)], &ct)
+                .expect_err("a cancelled build stops");
         assert!(format!("{err:#}").contains("cancelled"), "{err:#}");
     }
 }

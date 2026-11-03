@@ -624,6 +624,30 @@ mod tests {
                 String::from_utf8_lossy(input)
             );
         }
+
+        // What the extractor returns on this corpus plus an embed file, pinned
+        // next to the format version that keys every cached header tar (as the
+        // C/asm extractor's `extractor_adversarial_table` is). A change that
+        // moves this digest must bump `GO_HEADERS_FORMAT_VERSION` (and update
+        // both here, and there); otherwise old-shape tars are still served.
+        let mut h = xxhash_rust::xxh3::Xxh3Default::new();
+        let corpus = cases
+            .iter()
+            .map(|(_, input, _)| *input)
+            .chain([EMBED_FILE.as_bytes()]);
+        for input in corpus {
+            let out = view(input);
+            h.update(&(out.len() as u64).to_le_bytes());
+            h.update(&out);
+        }
+        assert_eq!(
+            (
+                crate::plugingo::driver_headers::GO_HEADERS_FORMAT_VERSION,
+                format!("{:016x}", h.digest())
+            ),
+            (2, "74fe229785b0c2c8".to_string()),
+            "the .go view extractor's output moved: bump GO_HEADERS_FORMAT_VERSION and re-pin"
+        );
     }
 
     /// Embed directives are found the way `go/scanner` finds comments: never

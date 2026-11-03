@@ -20,13 +20,21 @@ pub const GROUP_HEADERS: &str = "headers";
 /// their go/build view instead. No source-map annotation: a `.go` file of the
 /// glob maps to its own `fs:file` addr either way.
 pub const GROUP_GO_SRCS: &str = "gosrcs";
+/// Dep group of the codegen lanes when [`GROUP_HEADERS`] covers them: staged for
+/// `go list`, `hashed: false` — the header target hashes the go/build view of
+/// each generated `.go` file and the whole content of every other generated
+/// file. **Keeps** the source-map annotation: it is how `_golist` maps a
+/// generated file back to the target that produced it.
+pub const GROUP_GEN_SRCS: &str = "gensrcs";
 
 /// `_golist`'s non-Go inputs, by lane (see [`crate::plugingo::nongo_lanes`]).
 #[derive(Debug, Default)]
 pub struct NonGoLanes {
-    /// Content-hashed, staged: the codegen lanes, plus — for a vendored module
-    /// only — today's whole content lane.
+    /// Content-hashed, staged: for a vendored module only, today's whole
+    /// content lane, codegen included.
     pub srcfiles: Vec<String>,
+    /// The codegen lanes ([`GROUP_GEN_SRCS`]) of a non-vendored module.
+    pub codegen: Vec<String>,
     /// The names-only glob ([`GROUP_NAMES`]); `None` for a vendored module.
     pub names: Option<String>,
     /// The header-read content glob ([`GROUP_HEADER_SRCS`]).
@@ -68,6 +76,14 @@ pub fn build_spec_firstparty(
         vec![("modfiles", &modfiles[..]), ("srcfiles", &srcfiles)];
     if non_go.headers.is_some() {
         groups.push((GROUP_GO_SRCS, &go_src));
+    }
+    if !non_go.codegen.is_empty() {
+        // Unhashed here is sound only because the header target hashes them.
+        anyhow::ensure!(
+            non_go.headers.is_some(),
+            "codegen lanes staged unhashed with no header target to key them"
+        );
+        groups.push((GROUP_GEN_SRCS, &non_go.codegen));
     }
     for (group, lane) in [
         (GROUP_NAMES, &non_go.names),

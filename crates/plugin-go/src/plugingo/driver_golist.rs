@@ -352,13 +352,18 @@ impl ManagedDriver for GoGolistDriver {
             // own `fs:file` addr, never to the header extract.
             // The package's `.go` files go the same way: staged whole, keyed
             // through their go/build view in the header target.
+            // Generated files go that way too, but keep the source map: it is
+            // how a generated file routes to its producer downstream.
             let (hashed, runtime) = match group.as_str() {
                 crate::plugingo::target_golist::GROUP_HEADER_SRCS
-                | crate::plugingo::target_golist::GROUP_GO_SRCS => (false, true),
+                | crate::plugingo::target_golist::GROUP_GO_SRCS
+                | crate::plugingo::target_golist::GROUP_GEN_SRCS => (false, true),
                 crate::plugingo::target_golist::GROUP_HEADERS => (true, false),
                 _ => (true, true),
             };
-            let annotations = if !hashed || !runtime {
+            let source_mapped = group.as_str() == crate::plugingo::target_golist::GROUP_GEN_SRCS
+                || (hashed && runtime);
+            let annotations = if !source_mapped {
                 std::collections::BTreeMap::new()
             } else if is_sdk {
                 std::collections::BTreeMap::from([(
@@ -1139,11 +1144,14 @@ mod tests {
     /// glob's addr reaches the def, for the D9 hint.
     #[tokio::test]
     async fn test_parse_nongo_lane_flags_and_content_blind() {
-        use crate::plugingo::target_golist::{GROUP_HEADER_SRCS, GROUP_HEADERS, GROUP_NAMES};
+        use crate::plugingo::target_golist::{
+            GROUP_GEN_SRCS, GROUP_GO_SRCS, GROUP_HEADER_SRCS, GROUP_HEADERS, GROUP_NAMES,
+        };
 
         let names = crate::plugingo::nongo_lanes::names_glob_addr("mylib").format();
         let header_srcs = crate::plugingo::nongo_lanes::header_read_glob_addr("mylib").format();
-        let headers = crate::plugingo::nongo_lanes::headers_addr("mylib").format();
+        let go_srcs = crate::plugingo::nongo_lanes::go_src_glob_addr("mylib").format();
+        let headers = crate::plugingo::nongo_lanes::headers_addr("mylib", None, &[]).format();
         let ct = noop_ctoken();
         let req = make_parse_request(
             "mylib",
@@ -1151,6 +1159,8 @@ mod tests {
             vec![
                 (GROUP_NAMES, vec![names.as_str()]),
                 (GROUP_HEADER_SRCS, vec![header_srcs.as_str()]),
+                (GROUP_GO_SRCS, vec![go_srcs.as_str()]),
+                (GROUP_GEN_SRCS, vec!["//mylib:gen"]),
                 (GROUP_HEADERS, vec![headers.as_str()]),
                 ("srcfiles", vec!["//mylib:_go_src"]),
             ],
@@ -1167,7 +1177,21 @@ mod tests {
         };
         let none = std::collections::BTreeMap::new();
         assert_eq!(flags(GROUP_HEADER_SRCS), (false, true, none.clone()));
+        assert_eq!(
+            flags(GROUP_GO_SRCS),
+            (false, true, none.clone()),
+            "the package's .go files are staged unhashed, no source map"
+        );
         assert_eq!(flags(GROUP_HEADERS), (true, false, none.clone()));
+        let source_map = std::collections::BTreeMap::from([(
+            hdriver_support::driver_managed::SOURCE_MAP_ANNOTATION.to_string(),
+            "true".to_string(),
+        )]);
+        assert_eq!(
+            flags(GROUP_GEN_SRCS),
+            (false, true, source_map),
+            "generated files are staged unhashed and keep the source map"
+        );
         let (hashed, runtime, annotations) = flags(GROUP_NAMES);
         assert!(hashed && runtime, "the names glob is hashed and staged");
         assert!(

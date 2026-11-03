@@ -186,19 +186,62 @@ pub const HEADERS_NAME: &str = "headers";
 /// The header target's single output file.
 pub const HEADERS_OUT: &str = "headers.tar";
 
+/// Header-target arg: the package of the `go_codegen_root` state that scopes the
+/// consumer's `go_src` query. Absent when none is declared.
+pub const GEN_ROOT_ARG: &str = "gen_root";
+/// Header-target arg: the consumer's `go_codegen_deps`, absolute, `\n`-joined
+/// and hex-encoded — an addr arg has no escapes, and a dep is an addr that may
+/// itself carry `"`, `[…]` or `,`. Absent when there are none.
+pub const GEN_DEPS_ARG: &str = "gen_deps";
+
 /// The header target of `pkg`. Variant-free: `go/build` reads the same prefix
 /// whatever the GOOS/GOARCH/tags, and `_golist` decides what it means.
-pub fn headers_addr(pkg: &str) -> Addr {
+///
+/// `gen_root` and `gen_deps` are what the consumer read of its codegen states
+/// (see `provider::compute_pkg_src_addrs`). They ride in the args because the
+/// header target's own `get` sees only the states of `@heph/…`'s ancestry, not
+/// the package's; a package with neither keeps the bare addr.
+pub fn headers_addr(pkg: &str, gen_root: Option<&str>, gen_deps: &[String]) -> Addr {
     let hpkg = if pkg.is_empty() {
         HEADERS_PKG_PREFIX.to_string()
     } else {
         format!("{HEADERS_PKG_PREFIX}/{pkg}")
     };
-    Addr::new(
-        PkgBuf::from(hpkg),
-        HEADERS_NAME.to_string(),
-        Default::default(),
-    )
+    let mut args = std::collections::BTreeMap::new();
+    if let Some(root) = gen_root {
+        args.insert(GEN_ROOT_ARG.to_string(), root.to_string());
+    }
+    if !gen_deps.is_empty() {
+        args.insert(GEN_DEPS_ARG.to_string(), hex::encode(gen_deps.join("\n")));
+    }
+    Addr::new(PkgBuf::from(hpkg), HEADERS_NAME.to_string(), args)
+}
+
+/// The `(gen_root, gen_deps)` a header addr carries — the inverse of
+/// [`headers_addr`]. An arg it does not know fails: a header target answered
+/// with some of its inputs ignored would key `_golist` on less than it stages.
+pub fn headers_codegen_args(addr: &Addr) -> anyhow::Result<(Option<String>, Vec<String>)> {
+    use anyhow::Context as _;
+    if let Some(k) = addr
+        .args
+        .keys()
+        .find(|k| k.as_str() != GEN_ROOT_ARG && k.as_str() != GEN_DEPS_ARG)
+    {
+        anyhow::bail!("{}: unknown arg `{k}`", addr.format());
+    }
+    let deps = match addr.args.get(GEN_DEPS_ARG) {
+        Some(h) => {
+            let raw = hex::decode(h)
+                .with_context(|| format!("{}: decode `{GEN_DEPS_ARG}`", addr.format()))?;
+            String::from_utf8(raw)
+                .with_context(|| format!("{}: `{GEN_DEPS_ARG}` is not UTF-8", addr.format()))?
+                .split('\n')
+                .map(str::to_string)
+                .collect()
+        }
+        None => Vec::new(),
+    };
+    Ok((addr.args.get(GEN_ROOT_ARG).cloned(), deps))
 }
 
 /// The Go package a header-target package stands for, or `None` if `hpkg` is not
@@ -212,10 +255,11 @@ pub fn pkg_from_headers_pkg(hpkg: &str) -> Option<&str> {
 }
 
 /// Spec of the header target of `pkg`. Its inputs are
-/// [`header_read_glob_addr`] and [`go_src_glob_addr`]; it is derived from the
-/// package path alone, so answering it reads nothing from disk.
-pub fn headers_spec(addr: Addr, pkg: &str) -> TargetSpec {
-    let config = HashMap::from([
+/// [`header_read_glob_addr`], [`go_src_glob_addr`] and the codegen addrs
+/// `go_gen` (`provider::codegen_addrs`, from the addr's args); it is derived from
+/// the addr alone, so answering it reads nothing from disk.
+pub fn headers_spec(addr: Addr, pkg: &str, go_gen: &[String]) -> TargetSpec {
+    let mut config = HashMap::from([
         (
             "src".to_string(),
             Value::String(header_read_glob_addr(pkg).format()),
@@ -225,6 +269,12 @@ pub fn headers_spec(addr: Addr, pkg: &str) -> TargetSpec {
             Value::String(go_src_glob_addr(pkg).format()),
         ),
     ]);
+    if !go_gen.is_empty() {
+        config.insert(
+            "go_gen".to_string(),
+            Value::List(go_gen.iter().cloned().map(Value::String).collect()),
+        );
+    }
     TargetSpec {
         addr,
         driver: crate::plugingo::listed::DRIVER_HEADERS.to_string(),
@@ -481,26 +531,56 @@ mod tests {
     #[test]
     fn headers_addr_round_trips() {
         for pkg in ["", "pkg", "a/b/c"] {
-            let addr = headers_addr(pkg);
+            let addr = headers_addr(pkg, None, &[]);
             assert_eq!(addr.name, HEADERS_NAME);
             assert_eq!(pkg_from_headers_pkg(addr.package.as_str()), Some(pkg));
             assert!(addr.args.is_empty(), "variant-free: {addr}");
         }
         assert_eq!(
-            headers_addr("pkg").format(),
+            headers_addr("pkg", None, &[]).format(),
             "//@heph/go/headers/pkg:headers"
         );
-        assert_eq!(headers_addr("").format(), "//@heph/go/headers:headers");
+        assert_eq!(
+            headers_addr("", None, &[]).format(),
+            "//@heph/go/headers:headers"
+        );
         assert_eq!(pkg_from_headers_pkg("@heph/go/headersx"), None);
         assert_eq!(pkg_from_headers_pkg("@heph/go/headers/"), None);
         assert_eq!(pkg_from_headers_pkg("pkg"), None);
+    }
+
+    /// The codegen config a header addr carries survives a format/parse round
+    /// trip, including deps that are addrs with quotes, filters and commas — and
+    /// an arg the header target does not know is refused.
+    #[test]
+    fn headers_addr_carries_the_codegen_config() {
+        let deps = vec![
+            "//gen:a".to_string(),
+            "//gen:b@x=\"1,2\"|out[a.go,{b,c}.go]".to_string(),
+        ];
+        for root in [None, Some(""), Some("a/b")] {
+            let addr = headers_addr("pkg", root, &deps);
+            let parsed = hmodel::htaddr::parse_addr(&addr.format()).expect("parse");
+            assert_eq!(parsed, addr, "round trip: {addr}");
+            let (got_root, got_deps) = headers_codegen_args(&parsed).expect("args");
+            assert_eq!(got_root.as_deref(), root);
+            assert_eq!(got_deps, deps);
+        }
+        let mut bad = headers_addr("pkg", None, &[]).args.clone();
+        bad.insert("v".to_string(), "host".to_string());
+        let bad = Addr::new(
+            PkgBuf::from("@heph/go/headers/pkg"),
+            HEADERS_NAME.to_string(),
+            bad,
+        );
+        assert!(headers_codegen_args(&bad).is_err());
     }
 
     /// B2: the header target's input is the exact glob addr `_golist` stages
     /// unhashed — one string, so one walk and one memoized artifact.
     #[test]
     fn header_target_reads_the_glob_golist_stages() {
-        let spec = headers_spec(headers_addr("pkg"), "pkg");
+        let spec = headers_spec(headers_addr("pkg", None, &[]), "pkg", &[]);
         assert_eq!(
             spec.config.get("src"),
             Some(&Value::String(header_read_glob_addr("pkg").format()))
