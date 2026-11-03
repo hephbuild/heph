@@ -11,6 +11,7 @@ mod embed;
 pub(crate) mod errors;
 mod factors;
 mod gen_testmain;
+mod go_view;
 pub mod gocache;
 mod govet;
 mod listed;
@@ -37,6 +38,9 @@ pub use driver_golist::GoGolistDriver;
 pub use driver_headers::{GoHeadersDriver, extract_go_build_header};
 pub use driver_lint::{GoLintDriver, GoLintFixDriver, GoLintGateDriver};
 pub use driver_testmain::GoTestmainDriver;
+// Public for the plugingo-e2e differential too, which holds it to `go/build`'s
+// `readGoInfo` on `.go` files.
+pub use go_view::extract_go_view;
 // The D4 rules, for the plugingo-e2e differentials (per-extension body
 // mutation, extractor vs `go/build`) to iterate over the same set.
 pub use nongo_lanes::{

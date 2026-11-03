@@ -1,13 +1,18 @@
-//! `go.headers`: the bytes `go/build` reads of each header-read file, as one tar.
+//! `go.headers`: the bytes `go/build` reads of each file `go list` opens, as one
+//! tar.
 //!
 //! `go list` opens a C/asm-family file in the package directory only to read its
 //! leading comment block (`go/build.readComments`), where the build constraints
-//! live. This driver extracts exactly that prefix from every file of
-//! [`crate::plugingo::nongo_lanes::header_read_glob_addr`] and writes them, one
+//! live; and a `.go` file only for its go/build view (`readGoInfo`: the header
+//! through the imports, plus the `//go:embed` comments of a file importing
+//! `"embed"`, see [`crate::plugingo::go_view`]). This driver extracts exactly
+//! that from every file of [`crate::plugingo::nongo_lanes::header_read_glob_addr`]
+//! and [`crate::plugingo::nongo_lanes::go_src_glob_addr`] and writes them, one
 //! entry per file under its ws-relative path, into a deterministic tar.
 //! `_golist` depends on it `hashed: true, runtime: false`: editing the body of a
-//! `.c` below its header leaves this output — and so `_golist`'s key —
-//! unchanged, while a new constraint, an added file or a rename moves it.
+//! `.c` below its header, or a function body of a `.go` file, leaves this
+//! output — and so `_golist`'s key — unchanged, while a new constraint or
+//! import, an added file or a rename moves it.
 //!
 //! Cached locally only. Its output is a pure function of its input, and cheap to
 //! recompute, so the remote cache would only carry bytes back and forth.
@@ -31,7 +36,8 @@ use xxhash_rust::xxh3::Xxh3Default;
 
 /// Bump whenever the extractor or the tar layout changes: it is in the def hash,
 /// so every cached header tar is recomputed rather than served in the old shape.
-pub const GO_HEADERS_FORMAT_VERSION: u32 = 1;
+/// v2: `.go` files joined the tar, as their go/build view.
+pub const GO_HEADERS_FORMAT_VERSION: u32 = 2;
 
 /// How much of a file is read per `read` call. The extractor stops at the end of
 /// the prefix, so it reads at most the prefix plus one chunk of any file.
@@ -39,6 +45,8 @@ const READ_CHUNK: usize = 4096;
 
 /// Origin id of the header-read glob input.
 const SRC_ORIGIN: &str = "dep|src|0";
+/// Origin id of the `.go` glob input.
+const GO_SRC_ORIGIN: &str = "dep|gosrc|0";
 
 /// The UTF-8 byte-order mark `go/build` skips at the start of a file.
 const BOM: [u8; 3] = [0xef, 0xbb, 0xbf];
@@ -60,35 +68,43 @@ pub fn extract_go_build_header(r: impl Read) -> std::io::Result<Vec<u8>> {
 fn extract_with_chunk(r: impl Read, chunk: usize) -> std::io::Result<Vec<u8>> {
     let mut src = std::io::BufReader::with_capacity(chunk, r);
     let mut out = Vec::new();
+    let (bom, pending) = take_bom(&mut src)?;
+    if bom {
+        out.extend_from_slice(&BOM);
+    }
+    scan(&mut src, out, pending)
+}
 
-    // `newImportReader`: a leading BOM is discarded before scanning. It is still
-    // part of what was read, so it stays in the prefix.
+/// `newImportReader`'s BOM step: a leading UTF-8 BOM is discarded before
+/// scanning (it is still part of what was read, so callers keep it in their
+/// output). Returns whether there was one, and the bytes read ahead that turned
+/// out not to be one — the start of the scan.
+pub(crate) fn take_bom(src: &mut impl BufRead) -> std::io::Result<(bool, Vec<u8>)> {
     let lead = src.fill_buf()?;
     if lead.starts_with(&BOM) {
-        out.extend_from_slice(&BOM);
         src.consume(BOM.len());
-    } else if lead.len() < BOM.len() && BOM.starts_with(lead) && !lead.is_empty() {
+        return Ok((true, Vec::new()));
+    }
+    if lead.len() < BOM.len() && BOM.starts_with(lead) && !lead.is_empty() {
         // A short read that could still be a BOM: settle it byte by byte.
         let mut peeked = Vec::with_capacity(BOM.len());
         while peeked.len() < BOM.len() {
-            let Some(b) = next_byte(&mut src)? else { break };
+            let Some(b) = next_byte(src)? else { break };
             peeked.push(b);
             if !BOM.starts_with(&peeked) {
                 break;
             }
         }
         if peeked == BOM {
-            out.extend_from_slice(&BOM);
-        } else {
-            // Not a BOM: those bytes are the start of the scan.
-            return scan(&mut src, out, peeked);
+            return Ok((true, Vec::new()));
         }
+        return Ok((false, peeked));
     }
-    scan(&mut src, out, Vec::new())
+    Ok((false, Vec::new()))
 }
 
 /// One byte from `src`, `None` at EOF.
-fn next_byte(src: &mut impl BufRead) -> std::io::Result<Option<u8>> {
+pub(crate) fn next_byte(src: &mut impl BufRead) -> std::io::Result<Option<u8>> {
     let buf = loop {
         match src.fill_buf() {
             Ok(b) => break b,
@@ -185,7 +201,8 @@ fn scan(src: &mut impl BufRead, mut out: Vec<u8>, pending: Vec<u8>) -> std::io::
 }
 
 /// One tar entry per file, sorted by path: the [`extract_go_build_header`] of
-/// `ws_dir/<rel>` under `rel`. Mode, owner and mtime are fixed, so equal inputs
+/// `ws_dir/<rel>` under `rel`, or for a `.go` file its
+/// [`crate::plugingo::go_view::extract_go_view`]. Mode, owner and mtime are fixed, so equal inputs
 /// give byte-equal tars on every host. A file with an empty prefix still gets
 /// its (empty) entry: adding or removing one must move the key.
 ///
@@ -206,8 +223,12 @@ pub fn build_headers_tar(
         let path = ws_dir.join(rel);
         let file = std::fs::File::open(&path)
             .with_context(|| format!("go.headers: open header-read file {rel}"))?;
-        let header_bytes = extract_go_build_header(file)
-            .with_context(|| format!("go.headers: read the go/build header of {rel}"))?;
+        let header_bytes = if rel.ends_with(".go") {
+            crate::plugingo::go_view::extract_go_view(file)
+        } else {
+            extract_go_build_header(file)
+        }
+        .with_context(|| format!("go.headers: read the go/build header of {rel}"))?;
         let mut h = tar::Header::new_gnu();
         h.set_entry_type(tar::EntryType::Regular);
         h.set_mode(0o644);
@@ -253,16 +274,21 @@ struct GoHeadersSpec {
     /// The header-read content glob whose files are extracted.
     #[spec(required)]
     src: String,
+    /// The package's `.go` glob, whose files' go/build views are extracted.
+    #[spec(required)]
+    go_src: String,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct GoHeadersDef {
     src: String,
+    go_src: String,
 }
 
 impl Hash for GoHeadersDef {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.src.hash(state);
+        self.go_src.hash(state);
     }
 }
 
@@ -299,16 +325,25 @@ impl ManagedDriver for GoHeadersDriver {
         let pkg = req.target_spec.addr.package.clone();
         let spec =
             GoHeadersSpec::from(&req.target_spec.config).context("parse go.headers config")?;
-        let input = Input {
-            r#ref: TargetAddr::parse(&spec.src, &pkg)
-                .with_context(|| format!("parse go.headers src {}", spec.src))?,
-            mode: InputMode::Standard,
-            origin_id: SRC_ORIGIN.to_string(),
-            annotations: std::collections::BTreeMap::new(),
-            hashed: true,
-            runtime: true,
+        let input = |addr: &str, origin: &str| {
+            anyhow::Ok(Input {
+                r#ref: TargetAddr::parse(addr, &pkg)
+                    .with_context(|| format!("parse go.headers input {addr}"))?,
+                mode: InputMode::Standard,
+                origin_id: origin.to_string(),
+                annotations: std::collections::BTreeMap::new(),
+                hashed: true,
+                runtime: true,
+            })
         };
-        let def = GoHeadersDef { src: spec.src };
+        let inputs = vec![
+            input(&spec.src, SRC_ORIGIN)?,
+            input(&spec.go_src, GO_SRC_ORIGIN)?,
+        ];
+        let def = GoHeadersDef {
+            src: spec.src,
+            go_src: spec.go_src,
+        };
         let hash = def_hash(&req.target_spec.addr, &def, GO_HEADERS_FORMAT_VERSION);
         let out_path = if pkg.as_str().is_empty() {
             crate::plugingo::nongo_lanes::HEADERS_OUT.to_string()
@@ -324,7 +359,7 @@ impl ManagedDriver for GoHeadersDriver {
                 addr: req.target_spec.addr.clone(),
                 labels: req.target_spec.labels.clone(),
                 raw_def: Arc::new(def),
-                inputs: vec![input],
+                inputs,
                 outputs: vec![Output {
                     group: String::new(),
                     paths: vec![Path {
@@ -356,26 +391,25 @@ impl ManagedDriver for GoHeadersDriver {
         req: ManagedRunRequest<'a, 'io>,
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ManagedRunResponse> {
-        // Every artifact of the glob is its own input, and all of them append
-        // to one shared list file — so the first input's list is the whole
-        // list (as `staged_path` reads it). No header-read file at all stages
-        // nothing; the tar is then empty.
-        let staged = req
-            .inputs
+        // Every artifact of a glob is its own input, and all of them append to
+        // one shared list file per origin — so the first input's list is the
+        // whole list of that glob (as `staged_path` reads it). A glob matching
+        // no file stages nothing; with neither, the tar is empty.
+        let staged: Vec<_> = [SRC_ORIGIN, GO_SRC_ORIGIN]
             .iter()
-            .find(|m| m.input.origin_id == SRC_ORIGIN)
+            .filter_map(|origin| req.inputs.iter().find(|m| m.input.origin_id == *origin))
             .map(|m| anyhow::Ok((m.require_list_path()?.to_path_buf(), m.unpack_root.clone())))
-            .transpose()?;
+            .collect::<anyhow::Result<_>>()?;
         let cancel = ctoken.clone_arc();
         let ws_dir = req.sandbox_ws_dir.clone();
         let pkg_dir = req.sandbox_pkg_dir.clone();
         // The list read, every header read and the write are file IO: the
         // bounded blocking pool, never a runtime worker.
         hcore::blocking::run(move || {
-            let rels = match staged {
-                Some((list_path, unpack_root)) => staged_rels(&list_path, &unpack_root)?,
-                None => Vec::new(),
-            };
+            let mut rels = Vec::new();
+            for (list_path, unpack_root) in &staged {
+                rels.extend(staged_rels(list_path, unpack_root)?);
+            }
             let tar = build_headers_tar(&ws_dir, &rels, &*cancel)?;
             std::fs::create_dir_all(&pkg_dir).with_context(|| format!("create {pkg_dir:?}"))?;
             let out = pkg_dir.join(crate::plugingo::nongo_lanes::HEADERS_OUT);
@@ -492,7 +526,7 @@ mod tests {
         }
         assert_eq!(
             (GO_HEADERS_FORMAT_VERSION, format!("{:016x}", h.digest())),
-            (1, "b7b582633246510f".to_string()),
+            (2, "b7b582633246510f".to_string()),
             "the extractor's output moved: bump GO_HEADERS_FORMAT_VERSION and re-pin"
         );
     }
@@ -696,18 +730,28 @@ mod tests {
         let def = resp.target_def;
         assert!(def.cache.enabled, "cached");
         assert!(!def.cache.remote_enabled, "never remote");
-        assert_eq!(def.inputs.len(), 1);
-        assert!(def.inputs[0].hashed && def.inputs[0].runtime);
+        assert_eq!(def.inputs.len(), 2);
+        assert!(def.inputs.iter().all(|i| i.hashed && i.runtime));
         assert_eq!(
             def.inputs[0].r#ref.r#ref,
             crate::plugingo::nongo_lanes::header_read_glob_addr("pkg")
         );
+        assert_eq!(
+            def.inputs[1].r#ref.r#ref,
+            crate::plugingo::nongo_lanes::go_src_glob_addr("pkg")
+        );
 
         let mut other = spec;
-        other.config = HashMap::from([(
-            "src".to_string(),
-            Value::String(crate::plugingo::nongo_lanes::header_read_glob_addr("qq").format()),
-        )]);
+        other.config = HashMap::from([
+            (
+                "src".to_string(),
+                Value::String(crate::plugingo::nongo_lanes::header_read_glob_addr("qq").format()),
+            ),
+            (
+                "go_src".to_string(),
+                Value::String(crate::plugingo::nongo_lanes::go_src_glob_addr("pkg").format()),
+            ),
+        ]);
         let other = GoHeadersDriver
             .parse(
                 ParseRequest {
@@ -727,6 +771,7 @@ mod tests {
         // moves it.
         let raw = GoHeadersDef {
             src: crate::plugingo::nongo_lanes::header_read_glob_addr("pkg").format(),
+            go_src: crate::plugingo::nongo_lanes::go_src_glob_addr("pkg").format(),
         };
         assert_eq!(
             def.hash,
