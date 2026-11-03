@@ -207,6 +207,26 @@ fn listed_facts_kill_switch(v: Option<&std::ffi::OsStr>) -> bool {
             .any(|off| s.eq_ignore_ascii_case(off)))
 }
 
+/// The command line's pool capacities (`-j`, `--resource`), set once by
+/// `main` after the parse, read by every [`new_engine`].
+///
+/// Process-global rather than an argument: `new_engine` has ~40 callers, most
+/// of which never see the global options, and every engine this process
+/// builds runs the one command the user typed — so they all get its flags,
+/// the way `diag::install` gives them all `--diag-backtrace`. Unset (tests,
+/// the completion engines) means "no flags".
+static RESOURCE_FLAGS: std::sync::OnceLock<super::global::ResourceSpecs> =
+    std::sync::OnceLock::new();
+
+/// Record the command line's pool capacities for every engine this process
+/// builds. Called once, from `main`; a second call keeps the first.
+pub fn set_resource_flags(flags: super::global::ResourceSpecs) {
+    // A second set would be a second command line, which a process never has.
+    if RESOURCE_FLAGS.set(flags).is_err() {
+        tracing::debug!("resource flags already set; keeping the first");
+    }
+}
+
 pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     let root = match engine::get_root() {
         Ok(r) => r,
@@ -233,6 +253,17 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     // only split keys that are equal.
     config.listed_facts_trust = engine::listed::ListedFactsTrust::from_kill_switch(
         listed_facts_kill_switch(std::env::var_os("HEPH_NO_LISTED_FACTS").as_deref()),
+    );
+
+    // Pool capacities: flag over `HEPH_RESOURCE_<NAME>` over the config file;
+    // the engine supplies the default for a pool none of them names. Read here,
+    // like the kill switch above, so the engine never looks at the environment.
+    let env = super::global::env_resource_overrides(std::env::vars_os())
+        .context("reading HEPH_RESOURCE_<NAME>")?;
+    super::global::layer_resources(
+        &mut config.resources,
+        env,
+        RESOURCE_FLAGS.get().unwrap_or(&Default::default()),
     );
 
     // Captured before `config` is moved into the engine: the nix driver's state
