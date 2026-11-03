@@ -49,10 +49,23 @@ fn caps(caps: &[(&str, u64)]) -> BTreeMap<PoolName, Capacity> {
 /// the given pool capacities. Called again over the same root, it is the next
 /// `heph` invocation: same on-disk cache, fresh in-memory state.
 fn engine(root: &Path, resources: BTreeMap<PoolName, Capacity>) -> anyhow::Result<Arc<Engine>> {
+    engine_with_notice(root, resources, None)
+}
+
+/// [`engine`] with the admission-wait notice threshold set to `notice`
+/// (`None` keeps the production one). Set before the engine is shared.
+fn engine_with_notice(
+    root: &Path,
+    resources: BTreeMap<PoolName, Capacity>,
+    notice: Option<Duration>,
+) -> anyhow::Result<Arc<Engine>> {
     let mut e = Engine::new(Config {
         resources,
         ..Config::for_tests(root.to_path_buf())
     })?;
+    if let Some(notice) = notice {
+        e.set_admission_notice(notice);
+    }
     let r = root.to_path_buf();
     e.register_provider(move |init| {
         Box::new(pluginbuildfile::Provider::new(
@@ -711,5 +724,281 @@ async fn validate_reports_an_unknown_pool() -> anyhow::Result<()> {
         ),
         "{err}"
     );
+    Ok(())
+}
+
+/// `(declared, reserved)` of `addr`'s `ExecuteStart`.
+type Announced = (Option<BTreeMap<String, u64>>, Option<BTreeMap<String, u64>>);
+
+fn announced(events: &[BuildEvent], addr: &str) -> Option<Announced> {
+    events.iter().find_map(|e| match &e.kind {
+        BuildEventKind::ExecuteStart {
+            addr: a,
+            declared,
+            reserved,
+            ..
+        } if a == addr => Some((declared.clone(), reserved.clone())),
+        _ => None,
+    })
+}
+
+/// D8: `RequestConfig` announces every pool's capacity (and `max_workers`,
+/// the cpu capacity in CPUs); `ExecuteStart` carries what the target declared
+/// and what it was granted — clamped to the pool, and `cpu: 1` for a target
+/// that declares nothing.
+#[tokio::test]
+async fn request_config_announces_pools_and_execute_start_reserved() -> anyhow::Result<()> {
+    let ws = tempfile::tempdir()?;
+    write_build(
+        ws.path(),
+        "p",
+        r#"
+target(name = "big", driver = "bash", run = "echo big > $OUT", out = "big.txt", resources = {"cpu": 16})
+target(name = "plain", driver = "bash", run = "echo plain > $OUT", out = "plain.txt")
+"#,
+    );
+    let engine = engine(
+        ws.path(),
+        caps(&[("cpu", 4 * MICROS), ("memory", 8 << 30), ("docker", 2)]),
+    )?;
+    let (res, events) = build_events(&engine, &["//p:big", "//p:plain"]).await;
+    res?;
+
+    let configs: Vec<_> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            BuildEventKind::RequestConfig {
+                max_workers,
+                resources,
+                ..
+            } => Some((*max_workers, resources.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        configs,
+        vec![(
+            4,
+            BTreeMap::from([
+                ("cpu".to_string(), 4 * MICROS),
+                ("docker".to_string(), 2),
+                ("memory".to_string(), 8 << 30),
+            ])
+        )],
+        "one RequestConfig, every pool's capacity"
+    );
+
+    assert_eq!(
+        announced(&events, "//p:big"),
+        Some((
+            Some(BTreeMap::from([("cpu".to_string(), 16 * MICROS)])),
+            Some(BTreeMap::from([("cpu".to_string(), 4 * MICROS)])),
+        )),
+        "declared as written, reserved clamped to the pool"
+    );
+    assert_eq!(
+        announced(&events, "//p:plain"),
+        Some((
+            Some(BTreeMap::new()),
+            Some(BTreeMap::from([("cpu".to_string(), MICROS)])),
+        )),
+        "nothing declared, one cpu reserved"
+    );
+    Ok(())
+}
+
+/// An `AdmissionWaitStart`: `(addr, pool, need, free, ahead)`.
+type WaitStart = (String, String, u64, u64, u64);
+
+/// The admission-wait events of a stream: each Start, and the addrs of the
+/// Ends.
+fn admission_waits(events: &[BuildEvent]) -> (Vec<WaitStart>, Vec<String>) {
+    let mut starts = Vec::new();
+    let mut ends = Vec::new();
+    for e in events {
+        match &e.kind {
+            BuildEventKind::AdmissionWaitStart {
+                addr,
+                pool,
+                need,
+                free,
+                ahead,
+            } => starts.push((addr.clone(), pool.clone(), *need, *free, *ahead)),
+            BuildEventKind::AdmissionWaitEnd { addr } => ends.push(addr.clone()),
+            _ => {}
+        }
+    }
+    (starts, ends)
+}
+
+/// D8: a wait past the notice threshold is announced as
+/// `AdmissionWaitStart { pool, need, free, ahead }`, paired with an
+/// `AdmissionWaitEnd` before the target's `ExecuteStart`. Three `cpu: 1`
+/// targets on a 1-cpu pool: one runs, the other two wait, the second of them
+/// behind the first. An uncontended run announces nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admission_wait_is_announced_past_the_notice_threshold() -> anyhow::Result<()> {
+    let ws = tempfile::tempdir()?;
+    let gates = tempfile::tempdir()?;
+    let gate = gates.path().join("open");
+    write_build(
+        ws.path(),
+        "p",
+        &format!(
+            "{}{}{}",
+            gated("a", &gate, r#"{"cpu": 1}"#),
+            gated("b", &gate, r#"{"cpu": 1}"#),
+            gated("c", &gate, r#"{"cpu": 1}"#)
+        ),
+    );
+    let engine = engine_with_notice(
+        ws.path(),
+        caps(&[("cpu", MICROS)]),
+        Some(Duration::from_millis(50)),
+    )?;
+
+    let (tx, mut rx): (_, EventReceiver) = tokio::sync::mpsc::unbounded_channel();
+    let task = tokio::spawn(build(
+        Arc::clone(&engine),
+        ["//p:a", "//p:b", "//p:c"].map(String::from).to_vec(),
+        Some(tx),
+    ));
+    let mut events = Vec::new();
+    let start = Instant::now();
+    // Both waiters announced while the gate is closed.
+    while admission_waits(&events).0.len() < 2 && !task.is_finished() && start.elapsed() < DEADLINE
+    {
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let (gated_starts, _) = admission_waits(&events);
+    let started_while_gated = starts(&events).len();
+    std::fs::write(&gate, "")?;
+    tokio::time::timeout(DEADLINE, task).await???;
+    while let Ok(ev) = rx.try_recv() {
+        events.push(ev);
+    }
+
+    assert_eq!(
+        started_while_gated, 1,
+        "one target ran while the gate was shut"
+    );
+    let mut seen: Vec<(String, u64, u64, u64)> = gated_starts
+        .iter()
+        .map(|(_, pool, need, free, ahead)| (pool.clone(), *need, *free, *ahead))
+        .collect();
+    seen.sort();
+    assert_eq!(
+        seen,
+        vec![
+            ("cpu".to_string(), MICROS, 0, 0),
+            ("cpu".to_string(), MICROS, 0, 1),
+        ],
+        "the head waits with nothing ahead, the next behind it: {gated_starts:?}"
+    );
+
+    let (all_starts, mut ends) = admission_waits(&events);
+    let mut waited: Vec<String> = all_starts.into_iter().map(|s| s.0).collect();
+    waited.sort();
+    ends.sort();
+    assert_eq!(waited, ends, "every Start has its End");
+    for addr in &waited {
+        let pos =
+            |want: &dyn Fn(&BuildEventKind) -> bool| events.iter().position(|e| want(&e.kind));
+        let end = pos(&|k| matches!(k, BuildEventKind::AdmissionWaitEnd { addr: a } if a == addr));
+        let exec = pos(&|k| matches!(k, BuildEventKind::ExecuteStart { addr: a, .. } if a == addr));
+        assert!(
+            end.is_some() && end < exec,
+            "{addr}: the wait ends before the execute starts ({end:?}, {exec:?})"
+        );
+    }
+
+    // Uncontended: room for everything, nothing announced.
+    let ws = tempfile::tempdir()?;
+    write_build(
+        ws.path(),
+        "p",
+        r#"
+target(name = "x", driver = "bash", run = "echo x > $OUT", out = "x.txt", resources = {"cpu": 1})
+target(name = "y", driver = "bash", run = "echo y > $OUT", out = "y.txt", resources = {"cpu": 1})
+"#,
+    );
+    let engine = engine_with_notice(
+        ws.path(),
+        caps(&[("cpu", 4 * MICROS)]),
+        Some(Duration::from_millis(50)),
+    )?;
+    let (res, events) = build_events(&engine, &["//p:x", "//p:y"]).await;
+    res?;
+    assert_eq!(
+        admission_waits(&events),
+        (vec![], vec![]),
+        "an uncontended run announces no wait"
+    );
+    Ok(())
+}
+
+/// A `MakeWriter` into a shared buffer, for capturing log lines in-test.
+#[derive(Clone, Default)]
+struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .map_err(|e| std::io::Error::other(e.to_string()))?
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// D8: the clamp is logged at `info` once per addr per request, however many
+/// dependents reach the clamped target. A current-thread runtime, so the
+/// thread-local subscriber sees every engine task.
+#[tokio::test]
+async fn clamp_is_logged_once_per_addr_per_request() -> anyhow::Result<()> {
+    use tracing_subscriber::util::SubscriberInitExt as _;
+    let ws = tempfile::tempdir()?;
+    write_build(
+        ws.path(),
+        "p",
+        r#"
+target(name = "big", driver = "bash", run = "echo big > $OUT", out = "big.txt", resources = {"cpu": 16})
+target(name = "a", driver = "bash", run = "echo a > $OUT", out = "a.txt", deps = ["//p:big"])
+target(name = "b", driver = "bash", run = "echo b > $OUT", out = "b.txt", deps = ["//p:big"])
+"#,
+    );
+    let engine = engine(ws.path(), caps(&[("cpu", 4 * MICROS)]))?;
+    let log = Captured::default();
+    let writer = log.clone();
+    let res = {
+        // A second live dispatcher, held for the test. With only one,
+        // tracing-core caches a callsite's interest from whichever thread
+        // registers it first, and under `cargo test` that is often another
+        // test's thread with no subscriber: the clamp line would be cached as
+        // "never" and lost here. With two, interest comes from every live
+        // dispatcher. (nextest runs each test alone in a process.)
+        let _second = tracing_subscriber::registry().set_default();
+        let _guard = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing_subscriber::filter::LevelFilter::INFO)
+            .set_default();
+        build_events(&engine, &["//p:a", "//p:b"]).await.0
+    };
+    res?;
+    let text = String::from_utf8(log.0.lock().expect("log buffer").clone())?;
+    let clamps: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("reservation clamped"))
+        .collect();
+    assert_eq!(clamps.len(), 1, "one clamp line: {text}");
+    let line = clamps.first().copied().unwrap_or_default();
+    assert!(line.contains("INFO") && line.contains("//p:big"), "{line}");
     Ok(())
 }

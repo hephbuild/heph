@@ -1778,6 +1778,7 @@ dependencies = [
  "tempfile",
  "testkit",
  "tokio",
+ "tracing-subscriber",
 ]
 
 [[package]]

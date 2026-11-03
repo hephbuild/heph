@@ -307,6 +307,7 @@ pub(crate) fn render_live(t: &Tally, ctx: &RenderCtx<'_>, budget: usize) -> Stri
 
     push_scratch(&mut b, t);
     push_lock_waits(&mut b, t, ctx);
+    push_admission_waits(&mut b, t, ctx);
     push_running_longest(&mut b, t, ctx);
 
     if c.roots_total > 0 {
@@ -514,6 +515,27 @@ fn push_lock_waits(b: &mut Budgeted, t: &Tally, ctx: &RenderCtx<'_>) {
             holder,
             fmt_duration(ctx.now_ms.saturating_sub(w.since_ms))
         );
+        if !b.push(&row) {
+            break;
+        }
+    }
+}
+
+/// Targets waiting for their resources to fit, as the TUI's `⧗` rows:
+/// `⧗ //a:b waits for cpu 4 (2 free, 6 ahead, 41s)`. The engine announces only
+/// waits past its notice threshold, so every open one is shown (up to the cap).
+fn push_admission_waits(b: &mut Budgeted, t: &Tally, ctx: &RenderCtx<'_>) {
+    let (waits, total) = t.admission_waits(LIVE_LOCK_ROWS);
+    if waits.is_empty() {
+        return;
+    }
+    b.push(&format!(
+        "\n{} target{} waiting for resources:\n\n",
+        fmt_count(total),
+        if total == 1 { "" } else { "s" }
+    ));
+    for w in &waits {
+        let row = format!("- ⧗ {}\n", w.text(ctx.now_ms));
         if !b.push(&row) {
             break;
         }
@@ -1188,6 +1210,35 @@ mod tests {
         let md = render_live(&t, &ctx("heph run //...", 600_000), COMMENT_LIMIT);
         assert!(md.contains("waiting on the result lock"), "{md}");
         assert!(md.contains("pid 4412"), "{md}");
+    }
+
+    #[test]
+    fn admission_waits_are_surfaced_as_wait_rows() {
+        let mut t = build(100, 0, 0);
+        t.apply(&ev(
+            559_000,
+            BuildEventKind::AdmissionWaitStart {
+                addr: "//a:b".into(),
+                pool: "cpu".into(),
+                need: 4_000_000,
+                free: 2_000_000,
+                ahead: 6,
+            },
+        ));
+        let md = render_live(&t, &ctx("heph run //...", 600_000), COMMENT_LIMIT);
+        assert!(md.contains("1 target waiting for resources"), "{md}");
+        assert!(
+            md.contains("- ⧗ //a:b waits for cpu 4 (2 free, 6 ahead, 41s)\n"),
+            "{md}"
+        );
+        t.apply(&ev(
+            600_000,
+            BuildEventKind::AdmissionWaitEnd {
+                addr: "//a:b".into(),
+            },
+        ));
+        let md = render_live(&t, &ctx("heph run //...", 600_000), COMMENT_LIMIT);
+        assert!(!md.contains("waiting for resources"), "{md}");
     }
 
     #[test]

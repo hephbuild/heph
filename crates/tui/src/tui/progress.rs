@@ -2583,6 +2583,37 @@ pub(crate) fn prepare_note(
     Some(Note { text, warn })
 }
 
+/// The CI log's lines for an admission wait, read against `state` *before*
+/// `ev` is folded into it. A log line cannot tick, so the wait is two lines:
+/// the notice, without an elapsed time (it would always read `0s`), and the
+/// end, with how long it waited past the notice, from the Start/End pair. An
+/// End with no Start says nothing.
+fn admission_ci_line(state: &BuildState, ev: &BuildEvent) -> Option<String> {
+    use hcore::events::display_amount;
+    match &ev.kind {
+        BuildEventKind::AdmissionWaitStart {
+            addr,
+            pool,
+            need,
+            free,
+            ahead,
+        } => Some(format!(
+            "⧗ {addr} waits for {pool} {} ({} free, {ahead} ahead)",
+            display_amount(pool, *need),
+            display_amount(pool, *free)
+        )),
+        BuildEventKind::AdmissionWaitEnd { addr } => state.admission_waits.get(addr).map(|w| {
+            let waited = human_elapsed(ev.at_unix_ms.saturating_sub(w.since_ms));
+            format!(
+                "⧗ {addr} done waiting for {}, {} more",
+                w.pool,
+                waited.trim()
+            )
+        }),
+        _ => None,
+    }
+}
+
 /// The paved-road [`CIAppView`]: a one-line label header, a concise per-execute
 /// line, and a final one-line summary plus per-error lines — all through the
 /// log sink. Used by every command's `ci_view`.
@@ -2624,18 +2655,10 @@ impl CIAppView for CiProgressView {
             } => {
                 tracing::info!("running {addr} [{driver}]");
             }
-            BuildEventKind::AdmissionWaitStart {
-                addr,
-                pool,
-                need,
-                free,
-                ahead,
-            } => {
-                let waited = human_elapsed(0);
-                tracing::info!(
-                    "⧗ {}",
-                    hcore::events::admission_wait_text(addr, pool, *need, *free, *ahead, &waited)
-                );
+            BuildEventKind::AdmissionWaitStart { .. } | BuildEventKind::AdmissionWaitEnd { .. } => {
+                if let Some(line) = admission_ci_line(&self.core.state, ev) {
+                    tracing::info!("{line}");
+                }
             }
             BuildEventKind::ResultLockWaitStart {
                 addr,
@@ -3765,6 +3788,44 @@ mod tests {
         // The failing ResultEnd bumps the errored counter; the message itself is
         // not retained — rich diagnostics come from the failure registry.
         assert_eq!(v.core.state.errored, 1);
+    }
+
+    /// The CI log's admission wait: the notice carries no elapsed time (it
+    /// used to print a constant `0s`), the end carries it from the pair.
+    #[test]
+    fn ci_view_admission_wait_lines_time_the_wait_from_its_pair() {
+        let mut v = CiProgressView::new("Running");
+        let start = ev(
+            1_000,
+            BuildEventKind::AdmissionWaitStart {
+                addr: "//a:b".into(),
+                pool: "cpu".into(),
+                need: 4_000_000,
+                free: 2_000_000,
+                ahead: 6,
+            },
+        );
+        assert_eq!(
+            admission_ci_line(&v.core.state, &start).as_deref(),
+            Some("⧗ //a:b waits for cpu 4 (2 free, 6 ahead)")
+        );
+        v.apply(&start);
+        let end = ev(
+            42_000,
+            BuildEventKind::AdmissionWaitEnd {
+                addr: "//a:b".into(),
+            },
+        );
+        assert_eq!(
+            admission_ci_line(&v.core.state, &end).as_deref(),
+            Some("⧗ //a:b done waiting for cpu, 41s more")
+        );
+        v.apply(&end);
+        assert_eq!(
+            admission_ci_line(&v.core.state, &end),
+            None,
+            "an End with no Start says nothing"
+        );
     }
 
     #[test]
