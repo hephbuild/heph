@@ -493,7 +493,11 @@ fn find_packages_sync(
             hwalk::EntryKind::Dir => {
                 let entry_path = path.join(&entry.name);
                 let rel = entry_path.strip_prefix(root).unwrap_or(&entry_path);
-                if skip.prune_dir(&entry_path, rel) {
+                // `@heph` at the root is heph's providers' package space; a
+                // BUILD file under it is never read, so it lists no package.
+                if skip.prune_dir(&entry_path, rel)
+                    || rel.to_str().is_some_and(is_reserved_package)
+                {
                     continue;
                 }
                 find_packages_sync(walker, &entry_path, root, patterns, skip, packages)?;
@@ -536,6 +540,21 @@ fn find_packages_sync(
 
 impl Provider {}
 
+/// The package root heph's own providers address their targets under
+/// (`//@heph/fs`, `//@heph/go/headers/<pkg>`, the Go toolchain targets…).
+const RESERVED_PACKAGE_ROOT: &str = "@heph";
+
+/// Whether `pkg` is `@heph` or a package under it. A BUILD file there is never
+/// read: a target it defined could answer an addr a provider-owned target
+/// owns, depending on which provider is asked first — so one could, for
+/// instance, stand in for `//@heph/go/headers/<pkg>:headers` and silently drop
+/// the C/asm headers it hashes from a `_golist` key. Refused as `NotFound` (not
+/// an error), which is what lets the owning provider answer.
+fn is_reserved_package(pkg: &str) -> bool {
+    pkg.strip_prefix(RESERVED_PACKAGE_ROOT)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
 impl EProvider for Provider {
     fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
         Ok(ConfigResponse {
@@ -551,10 +570,12 @@ impl EProvider for Provider {
     {
         Box::pin(async move {
             // A package inside a skipped subtree lists nothing — matching what the
-            // package walk would have surfaced.
-            if self
-                .skip
-                .try_prunes_package(&self.root, std::path::Path::new(req.package.as_str()))?
+            // package walk would have surfaced. Nor does one under `@heph`
+            // (`is_reserved_package`).
+            if is_reserved_package(req.package.as_str())
+                || self
+                    .skip
+                    .try_prunes_package(&self.root, std::path::Path::new(req.package.as_str()))?
             {
                 return Ok(Box::new(std::iter::empty())
                     as Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>);
@@ -643,11 +664,13 @@ impl EProvider for Provider {
             // A target inside a skipped subtree does not resolve — including one
             // under a `.heph*` dir, a name reserved for heph's own state. A plain
             // `NotFound` rather than an error naming the reason: `NotFound` is
-            // what lets the next provider answer the address.
-            if self
-                .skip
-                .try_prunes_package(&self.root, std::path::Path::new(req.addr.package.as_str()))
-                .map_err(GetError::Other)?
+            // what lets the next provider answer the address. A package under
+            // `@heph` is a provider's, never a BUILD file's (`is_reserved_package`).
+            if is_reserved_package(req.addr.package.as_str())
+                || self
+                    .skip
+                    .try_prunes_package(&self.root, std::path::Path::new(req.addr.package.as_str()))
+                    .map_err(GetError::Other)?
             {
                 return Err(NotFound);
             }
@@ -691,6 +714,10 @@ impl EProvider for Provider {
         _ctoken: &'a (dyn Cancellable + Send + Sync),
     ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
         Box::pin(async move {
+            // No BUILD file is read under `@heph`, so it declares no state there.
+            if is_reserved_package(req.package.as_str()) {
+                return Ok(ProbeResponse { states: Vec::new() });
+            }
             let res = self.run_pkg(req.package.as_str()).await?;
 
             Ok(ProbeResponse {
@@ -1364,6 +1391,81 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(listed.count(), 0);
+    }
+
+    /// A BUILD file under `@heph` is never read: `get`, `list` and `probe`
+    /// answer as if it were absent, and the package walk does not surface it —
+    /// so it cannot stand in for a provider-owned target such as
+    /// `//@heph/go/headers/<pkg>:headers`. A near-miss name (`@hephx`) is an
+    /// ordinary package.
+    #[tokio::test]
+    async fn packages_under_heph_are_never_read() {
+        let tmp_dir = tempdir().unwrap();
+        let root = tmp_dir.path();
+        for pkg in ["@heph", "@heph/go/headers/pkg", "@hephx"] {
+            let dir = root.join(pkg);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                dir.join("BUILD"),
+                r#"
+target(name = "headers", driver = "d")
+provider_state(provider = "p", k = "v")
+"#,
+            )
+            .unwrap();
+        }
+        let provider = Provider {
+            root: root.to_path_buf(),
+            ..Provider::default()
+        };
+        let ctoken = StdCancellationToken::new();
+
+        for pkg in ["@heph", "@heph/go/headers/pkg"] {
+            let got = provider.get(get_req(pkg, "headers"), &ctoken).await;
+            assert!(matches!(got, Err(NotFound)), "get {pkg}");
+
+            let listed = provider
+                .list(
+                    ListRequest {
+                        request_id: "test".to_string(),
+                        package: PkgBuf::from(pkg),
+                        states: vec![],
+                        executor: std::sync::Arc::new(hplugin::provider::NoopExecutor),
+                    },
+                    &ctoken,
+                )
+                .await
+                .unwrap();
+            assert_eq!(listed.count(), 0, "list {pkg}");
+
+            let probed = provider
+                .probe(
+                    ProbeRequest {
+                        request_id: "test".to_string(),
+                        package: PkgBuf::from(pkg),
+                    },
+                    &ctoken,
+                )
+                .await
+                .unwrap();
+            assert!(probed.states.is_empty(), "probe {pkg}");
+        }
+
+        let got = provider.get(get_req("@hephx", "headers"), &ctoken).await;
+        assert!(got.is_ok(), "a near-miss name is an ordinary package");
+
+        let listed: Vec<String> = provider
+            .list_packages(
+                ListPackagesRequest {
+                    prefix: PkgBuf::from(""),
+                },
+                &ctoken,
+            )
+            .await
+            .unwrap()
+            .map(|r| r.unwrap().pkg.to_string())
+            .collect();
+        assert_eq!(listed, vec![String::new(), "@hephx".to_string()]);
     }
 
     #[tokio::test]

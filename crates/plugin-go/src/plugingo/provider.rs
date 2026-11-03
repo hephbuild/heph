@@ -1949,8 +1949,9 @@ impl ProviderInner {
         }
 
         // The header target of a package's C/asm-family files:
-        // `//@heph/go/headers/<pkg>:headers`. Provider-owned (no BUILD file can
-        // define an `@heph/…` target, so none can stand in for `_golist`'s only
+        // `//@heph/go/headers/<pkg>:headers`. Provider-owned (the buildfile
+        // provider never reads a BUILD file under `@heph/…` — its
+        // `is_reserved_package` — so none can stand in for `_golist`'s only
         // hashed view of those files), variant-free, never listed, and derived
         // from the package path alone — answering it reads nothing from disk.
         if addr.name == nongo_lanes::HEADERS_NAME

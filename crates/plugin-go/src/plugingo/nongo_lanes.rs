@@ -36,9 +36,13 @@ use std::collections::HashMap;
 /// `readComments`, and only when it is directly in the package directory: a
 /// file in a subdirectory belongs to another package, or to none.
 ///
-/// Verified against [`GO_HEADER_RULES_VERIFIED_AGAINST`]. A Go release that adds
-/// an extension here (or starts reading a file further than `readComments`) must
-/// move that file to a hashed lane, or `_golist` under-hashes.
+/// Verified against [`GO_HEADER_RULES_VERIFIED_AGAINST`]. The two ways a Go
+/// release can move this differ in cost. One that adds an extension misreads
+/// consistently: such a file stays in the names lane, staged empty, so `go list`
+/// sees no header in it on every run — a wrong listing, but never a stale hit.
+/// One that reads a header-read file further than `readComments` under-hashes:
+/// the file is staged whole, its key covers only the extracted header, and an
+/// edit past the header would be served a stale `_golist`.
 pub const GO_HEADER_READ_EXTS: &[&str] = &[
     "c", "cc", "cxx", "cpp", "m", "h", "hh", "hpp", "hxx", "f", "F", "for", "f90", "s", "S", "sx",
     "swig", "swigcxx",
@@ -145,10 +149,13 @@ pub fn content_glob_addr(pkg: &str) -> Addr {
 }
 
 /// Whether the module rooted at `module_root` vendors its dependencies. Such a
-/// module keeps the content lane: `go list` reads `vendor/modules.txt` (and Go
-/// turns on `-mod=vendor` by itself when it exists), so a names-only placeholder
-/// for it would break the listing. A stat on every call — never memoized, so
-/// adding or removing `vendor/` is seen on the next run.
+/// module keeps the content lane: Go turns on `-mod=vendor` by itself when the
+/// module has a `vendor/` directory, and `go list` then reads
+/// `vendor/modules.txt`, so a names-only placeholder for it would break the
+/// listing. Keying on `modules.txt` rather than the directory diverges from Go
+/// in no case that lists: a `vendor/` without it fails `go list` ("inconsistent
+/// vendoring") in either lane. A stat on every call — never memoized, so adding
+/// or removing `vendor/` is seen on the next run.
 pub fn vendored_module(module_root: &std::path::Path) -> bool {
     module_root.join("vendor").join("modules.txt").is_file()
 }
@@ -156,9 +163,10 @@ pub fn vendored_module(module_root: &std::path::Path) -> bool {
 /// Provider package of the header targets. `//@heph/go/headers/<pkg>:headers`
 /// for package `<pkg>`, `//@heph/go/headers:headers` for the root package.
 ///
-/// Provider-owned on purpose: no BUILD file can define a target in `@heph/…`, so
-/// a user target can never stand in for `_golist`'s only hashed view of the
-/// header-read files.
+/// Provider-owned on purpose: the buildfile provider never reads a BUILD file
+/// under `@heph/…` (its `is_reserved_package`, pinned by
+/// `packages_under_heph_are_never_read`), so a user target can never stand in
+/// for `_golist`'s only hashed view of the header-read files.
 pub const HEADERS_PKG_PREFIX: &str = "@heph/go/headers";
 /// Target name of a header target.
 pub const HEADERS_NAME: &str = "headers";
