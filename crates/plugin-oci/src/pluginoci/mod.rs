@@ -245,6 +245,28 @@ fn dep_files(req: &ManagedRunRequest<'_, '_>, origin_id: &str) -> anyhow::Result
         .map(PathBuf::from)
         .collect())
 }
+
+/// Each Dep input's `origin_id`, once, in input order.
+///
+/// A dep that produces several artifacts (a `group` produces one per file)
+/// reaches the driver as several inputs sharing one origin, while its `.list`
+/// file, the one [`dep_files`] reads, covers the whole origin. So a loop that
+/// calls `dep_files` per *input* sees every file once per artifact. Loop over
+/// this instead.
+fn dep_origins<'r>(req: &'r ManagedRunRequest<'_, '_>) -> impl Iterator<Item = &'r str> {
+    let mut seen = std::collections::HashSet::new();
+    req.inputs
+        .iter()
+        .filter(|m| {
+            matches!(
+                m.input.artifact.r#type,
+                hplugin::driver::inputartifact::Type::Dep
+            )
+        })
+        .map(|m| m.input.origin_id.as_str())
+        .filter(move |o| seen.insert(*o))
+}
+
 /// Absolute path of the OCI layout a dep materialized — a layout *directory*,
 /// or the single archive file that is the other shape this plugin writes.
 ///

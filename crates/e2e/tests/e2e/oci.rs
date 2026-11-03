@@ -297,6 +297,44 @@ target(
     Ok(())
 }
 
+/// A `group` dep reaches the driver as one input artifact per file, all under
+/// the same origin, while the file list is per origin. Reading that list once
+/// per artifact named every file N times — N² entries, which at ~140 files
+/// overran the kernel's 128 KiB single-argument limit and docker failed to
+/// start with `Argument list too long`.
+#[tokio::test]
+async fn test_docker_build_src_arg_names_each_file_of_a_group_once() -> anyhow::Result<()> {
+    let fake = Fake::new();
+    let ws = workspace_with_fake(&fake);
+    ws.write_build_file(
+        "app",
+        r#"
+target(name = "dockerfile", driver = "bash", run = "echo 'FROM scratch' > $OUT", out = "Dockerfile")
+target(name = "a", driver = "bash", run = "echo a > $OUT", out = "a.txt")
+target(name = "b", driver = "bash", run = "echo b > $OUT", out = "b.txt")
+target(name = "c", driver = "bash", run = "echo c > $OUT", out = "c.txt")
+target(name = "files", driver = "group", deps = [":a", ":b", ":c"])
+target(
+    name = "img",
+    driver = "oci.docker_build",
+    context = {"": [":dockerfile"], "files": [":files"]},
+)
+"#,
+    );
+
+    ws.run("//app:img").await?;
+    let build = fake
+        .calls()
+        .into_iter()
+        .find(|c| c.contains("buildx build"))
+        .expect("a buildx build call");
+    assert!(
+        build.contains("--build-arg SRC_FILES=app/a.txt app/b.txt app/c.txt /"),
+        "SRC_FILES must name each of the group's files exactly once, got: {build}"
+    );
+    Ok(())
+}
+
 /// `dockerfile = ":target"` is the whole point of addressing it: the generated
 /// Dockerfile is a dep, so it is staged and hashed without appearing in
 /// `context` and without the BUILD file spelling where it lands.
