@@ -148,7 +148,7 @@ jobs:
       # plugin downloads at target-build time.
       - uses: actions/setup-go@v7
         with:
-          go-version: "1.25"
+          go-version-file: tools/gorepogen/go.mod
           cache: false
 
       # PR: the merge-base with the target branch. Push (to master): the
