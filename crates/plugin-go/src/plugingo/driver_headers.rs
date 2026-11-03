@@ -269,7 +269,9 @@ impl Hash for GoHeadersDef {
 /// The def hash of a header target: the extractor format `version` (always
 /// [`GO_HEADERS_FORMAT_VERSION`] outside tests), then the def.
 fn def_hash(addr: &hmodel::htaddr::Addr, def: &GoHeadersDef, version: u32) -> Vec<u8> {
-    let mut h = DebugHasher::new(Xxh3Default::new(), || format!("go_headers_{}", addr.format()));
+    let mut h = DebugHasher::new(Xxh3Default::new(), || {
+        format!("go_headers_{}", addr.format())
+    });
     version.hash(&mut h);
     def.hash(&mut h);
     format!("{:x}", h.finish()).into_bytes()
@@ -362,12 +364,7 @@ impl ManagedDriver for GoHeadersDriver {
             .inputs
             .iter()
             .find(|m| m.input.origin_id == SRC_ORIGIN)
-            .map(|m| {
-                anyhow::Ok((
-                    m.require_list_path()?.to_path_buf(),
-                    m.unpack_root.clone(),
-                ))
-            })
+            .map(|m| anyhow::Ok((m.require_list_path()?.to_path_buf(), m.unpack_root.clone())))
             .transpose()?;
         let cancel = ctoken.clone_arc();
         let ws_dir = req.sandbox_ws_dir.clone();

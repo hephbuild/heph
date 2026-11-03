@@ -1168,12 +1168,14 @@ mod tests {
         let (hashed, runtime, annotations) = flags(GROUP_NAMES);
         assert!(hashed && runtime, "the names glob is hashed and staged");
         assert!(
-            annotations
-                .contains_key(hdriver_support::driver_managed::SOURCE_MAP_ANNOTATION),
+            annotations.contains_key(hdriver_support::driver_managed::SOURCE_MAP_ANNOTATION),
             "the names glob keeps the source map, like any source dep"
         );
         assert_eq!(
-            resp.target_def.def::<GoGolistDef>().content_blind.as_deref(),
+            resp.target_def
+                .def::<GoGolistDef>()
+                .content_blind
+                .as_deref(),
             Some(names.as_str()),
             "the names glob's addr reaches the def"
         );
@@ -1283,8 +1285,14 @@ mod tests {
         let hinted = golist_failure(&def, "boom".to_string()).to_string();
         assert!(hinted.contains("boom"), "{hinted}");
         let last = hinted.lines().last().unwrap_or_default();
-        assert!(last.starts_with("note: "), "a stable prefix on its own line: {hinted}");
-        assert!(last.contains("example.com/mylib"), "names the package: {hinted}");
+        assert!(
+            last.starts_with("note: "),
+            "a stable prefix on its own line: {hinted}"
+        );
+        assert!(
+            last.contains("example.com/mylib"),
+            "names the package: {hinted}"
+        );
         assert!(last.contains("empty placeholders"), "{hinted}");
         assert!(last.contains("report it"), "says what to do: {hinted}");
         assert!(

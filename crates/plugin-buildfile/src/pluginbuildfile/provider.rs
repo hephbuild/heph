@@ -495,8 +495,7 @@ fn find_packages_sync(
                 let rel = entry_path.strip_prefix(root).unwrap_or(&entry_path);
                 // `@heph` at the root is heph's providers' package space; a
                 // BUILD file under it is never read, so it lists no package.
-                if skip.prune_dir(&entry_path, rel)
-                    || rel.to_str().is_some_and(is_reserved_package)
+                if skip.prune_dir(&entry_path, rel) || rel.to_str().is_some_and(is_reserved_package)
                 {
                     continue;
                 }
