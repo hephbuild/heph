@@ -29,7 +29,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 use xxhash_rust::xxh3::Xxh3;
 
-const PKG: &str = "@heph/fs";
+const PKG: &str = hmodel::htfs::PKG;
 pub const DRIVER_NAME: &str = "fs";
 
 /// Extended-attribute name stamped on net-new codegen files written back to the
@@ -140,7 +140,7 @@ pub fn names_glob_addr(pattern: &str, exclude: &[&str]) -> Addr {
 }
 
 /// Glob addr arg selecting the hashing/staging mode; absent = content.
-const GLOB_MODE_ARG: &str = "m";
+const GLOB_MODE_ARG: &str = hmodel::htfs::GLOB_MODE_ARG;
 /// [`GLOB_MODE_ARG`] value for a names-only glob.
 const GLOB_MODE_NAMES: &str = "names";
 
@@ -180,18 +180,6 @@ impl GlobMode {
     }
 }
 
-/// Whether two fs-provider addrs that claim the same sandbox path are certain to
-/// provide the same bytes there, so the overlap is benign.
-///
-/// Two content-mode fs targets (a `file` and a `glob`, or two globs) both expose
-/// the workspace file itself. A names-only glob stages an empty placeholder, so
-/// its overlap with a content target would put a placeholder over real bytes (or
-/// the reverse) depending on staging order: that is a collision, not an overlap.
-/// Two names globs both stage the empty placeholder, so they agree.
-pub fn fs_overlap_is_benign(a: &Addr, b: &Addr) -> bool {
-    is_fs_addr(a) && is_fs_addr(b) && a.args.get(GLOB_MODE_ARG) == b.args.get(GLOB_MODE_ARG)
-}
-
 /// Returns `true` if `addr` refers to a single-file fs target.
 pub fn is_file_addr(addr: &Addr) -> bool {
     addr.package.as_str() == PKG && addr.name == "file"
@@ -202,11 +190,11 @@ pub fn is_glob_addr(addr: &Addr) -> bool {
     addr.package.as_str() == PKG && addr.name == "glob"
 }
 
-/// Returns `true` if `addr` is any fs-provider target (e.g. `file`/`glob`), i.e.
-/// it lives in the fs provider's package.
-pub fn is_fs_addr(addr: &Addr) -> bool {
-    addr.package.as_str() == PKG
-}
+/// `is_fs_addr`: any fs-provider target (e.g. `file`/`glob`), i.e. one in the fs
+/// provider's package. `fs_overlap_is_benign`: whether two fs addrs claiming one
+/// sandbox path stage the same bytes there. Both are defined in `hmodel::htfs`,
+/// which the sandbox staging in `driver-support` reads too.
+pub use hmodel::htfs::{fs_overlap_is_benign, is_fs_addr};
 
 // ─── Provider ────────────────────────────────────────────────────────────────
 
@@ -822,7 +810,7 @@ fn compile_glob(
 /// `<root>/a/b`, not the whole tree.
 ///
 /// `mode` changes only what an entry that survives every filter becomes (see
-/// [`emit_glob_file`]); the walk and its filters are the same for both modes.
+/// [`GlobEmitter::file`]); the walk and its filters are the same for both modes.
 fn walk_glob(
     walker: &CachedWalker,
     root: &std::path::Path,
@@ -910,8 +898,13 @@ impl GlobEmitter<'_> {
     /// its artifact onto `out`: in content mode the workspace file, hashed via
     /// the walker; in names mode an empty placeholder hashed by its path.
     ///
-    /// Every filter runs before the mode is consulted, so a names glob drops
-    /// exactly the entries a content glob over the same pattern drops.
+    /// Every path filter (pattern, excludes, codegen xattr, `.heph*`) runs
+    /// before the mode is consulted, so both modes apply the same ones. Where
+    /// they can differ is the last check, on what a link resolves to: content
+    /// mode drops an entry its hash fails on (a dangling link, a link to a
+    /// directory), names mode one that does not resolve to a regular file (the
+    /// same two, plus a link to a FIFO or a device, which content mode would
+    /// try to read).
     fn file(
         &self,
         abs: &std::path::Path,
@@ -974,18 +967,23 @@ impl GlobEmitter<'_> {
             GlobMode::Names => {
                 // Only a regular file, after following links, is an entry: a
                 // dangling link, a link to a directory, a FIFO or a device is
-                // not. `metadata` follows; one stat, no read — the bytes are
-                // never opened, so nothing about them can reach the key.
-                if !std::fs::metadata(abs).is_ok_and(|m| m.is_file()) {
+                // not. The listing already typed a non-link entry (the walk
+                // hands only `File` and `Symlink` entries here), so only a link
+                // — or a literal pattern's root, which arrives untyped as one —
+                // pays a `metadata` (which follows). No read either way: the
+                // bytes are never opened, so nothing about them reaches the key.
+                if is_symlink && !std::fs::metadata(abs).is_ok_and(|m| m.is_file()) {
                     return Ok(());
                 }
                 // The mode tag fills the content slot of the entry formula: the
                 // hashout covers the path and nothing else (not the exec bit,
                 // which the placeholder does not carry either).
                 let hashout = hwalk::glob_entry_hashout(&out_path, FS_NAMES_TAG);
-                // An empty placeholder, never a passthrough: a passthrough is
-                // re-verified against the hashout as it is read, and this
-                // hashout is not a function of the bytes.
+                // An empty placeholder as owned raw bytes, not a flagged
+                // `ContentFile`: a file passthrough is re-verified against the
+                // hashout as it is read, and this hashout is not a function of
+                // the bytes. The engine hands a raw artifact of an uncached
+                // target straight to the consumer, unverified and unpacked.
                 let content = Content::Raw(ContentRaw {
                     data: Vec::new(),
                     path: out_path,
@@ -1125,7 +1123,10 @@ struct FsSpec {
     e: Option<String>,
     /// Glob hashing/staging mode (glob mode only): absent hashes and stages
     /// each file's content; `names` hashes each entry by its path alone and
-    /// stages an empty placeholder.
+    /// stages an empty placeholder. Reachable from a BUILD file by raw addr
+    /// (`//@heph/fs:glob@p=…,m=names`), but only for a consumer that reads the
+    /// file *names*: the bytes are neither hashed nor staged (each entry is an
+    /// empty file), so editing them never re-runs the consumer.
     #[spec(ty = ParamType::String)]
     m: Option<String>,
 }
@@ -3687,6 +3688,13 @@ mod tests {
 
         let mut expected = vec!["plain.rs".to_string()];
         if !can_stamp {
+            // Said out loud, so a run that never checked the codegen filter is
+            // not read as one that did.
+            eprintln!(
+                "names_glob_skips_codegen_and_heph: SKIPPING the codegen-xattr assertion: \
+                 the filesystem under {} does not persist user xattrs",
+                root.display()
+            );
             expected.push("gen.rs".to_string());
             expected.sort();
         }

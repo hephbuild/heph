@@ -601,11 +601,9 @@ pub fn detect_output_collisions(groups: &BTreeMap<PathBuf, Vec<RunInput>>) -> an
                         // involving a non-fs producer is still a hard error, and
                         // so is one between two fs modes: a names-only glob
                         // stages an empty placeholder, which must never land on
-                        // (or under) a content file's path.
-                        if is_fs_source(existing)
-                            && is_fs_source(producer)
-                            && fs_mode(existing) == fs_mode(producer)
-                        {
+                        // (or under) a content file's path. The rule is the fs
+                        // provider's own (`hmodel::htfs`).
+                        if hmodel::htfs::fs_overlap_is_benign(existing, producer) {
                             continue;
                         }
                         anyhow::bail!(
@@ -679,24 +677,6 @@ pub async fn detect_output_collisions_blocking(
         anyhow::Ok(groups)
     })
     .await
-}
-
-/// The fs provider's package. Its `file`/`glob` targets only expose existing
-/// workspace source (never materialize), so two of them claiming the same
-/// sandbox path provide identical bytes — a benign overlap. Kept as a literal to
-/// avoid a `driver-support` → `builtins` dependency (would cycle); mirrors
-/// `hbuiltins::pluginfs::is_fs_addr`.
-const FS_PROVIDER_PKG: &str = "@heph/fs";
-
-fn is_fs_source(addr: &Addr) -> bool {
-    addr.package.as_str() == FS_PROVIDER_PKG
-}
-
-/// An fs addr's staging mode: its `m` arg, absent for content. Two fs sources
-/// provide identical bytes only within one mode — a names-only glob stages empty
-/// placeholders. Mirrors `hbuiltins::pluginfs::fs_overlap_is_benign`.
-fn fs_mode(addr: &Addr) -> Option<&str> {
-    addr.args.get("m").map(String::as_str)
 }
 
 // ---------------------------------------------------------------------

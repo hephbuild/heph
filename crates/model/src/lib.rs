@@ -14,6 +14,7 @@
 )]
 
 pub mod htaddr;
+pub mod htfs;
 pub mod htlabel;
 pub mod htmatcher;
 pub mod htpkg;
