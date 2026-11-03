@@ -867,19 +867,26 @@ fn emit_glob_file(
     let Some(source_path) = abs.to_str().map(str::to_owned) else {
         anyhow::bail!("glob entry path is not valid UTF-8: {}", abs.display());
     };
+    // `out_path` is root-relative and `/`-separated on every supported (Unix)
+    // target, so the bound hashout is the same on Linux and macOS.
+    let out_path = rel_str.to_string();
+    // Path-bound, not the bare content hash: the glob addr carries only the
+    // pattern, so this is the only place the entry's path reaches a
+    // consumer's `hashin` (see `hwalk::glob_entry_hashout`).
+    let hashout = hwalk::glob_entry_hashout(&out_path, &fh.hashout);
     out.push(OutputArtifact {
         group: String::new(),
         name: rel_str.replace('/', "_"),
         r#type: Type::Output,
         content: Content::File(ContentFile {
             source_path,
-            out_path: rel_str.to_string(),
+            out_path,
             x: fh.exec,
             // Workspace source file: durable for the build, so the engine can
             // reference it by path instead of tar-packing it into the cache.
             passthrough: true,
         }),
-        hashout: fh.hashout.clone(),
+        hashout,
     });
     Ok(())
 }
@@ -2062,9 +2069,75 @@ mod tests {
             !by_name.contains_key("dangling.txt"),
             "a dangling symlink must be skipped"
         );
-        // Exec marker + content both come from the followed target, so the link
-        // hashes the same as the file it points at (NOT the symlink's own mode).
-        assert_eq!(by_name["link.txt"], by_name["real.txt"]);
+        // Exec marker + content both come from the followed target (NOT the
+        // symlink's own mode); the entry's hashout binds that content hash to
+        // the link's own path.
+        let real = file_hashout(&root.join("real.txt"), false).unwrap();
+        assert_eq!(
+            by_name["link.txt"],
+            hwalk::glob_entry_hashout("link.txt", &real)
+        );
+        assert_eq!(
+            by_name["real.txt"],
+            hwalk::glob_entry_hashout("real.txt", &real)
+        );
+    }
+
+    /// A glob entry's hashout is the only place its path reaches a consumer's
+    /// `hashin` (the glob addr names just the pattern). It must move when a
+    /// file is renamed with its bytes kept, and when two files swap contents;
+    /// stay stable across runs over an unchanged tree; and not be the bare
+    /// content hash (or `fs:file`'s, which is that hash, would collide with it).
+    #[test]
+    fn test_glob_entry_hashout_binds_the_path() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir(root.join("pkg")).unwrap();
+        fs::write(root.join("pkg/a.go"), b"package a\n").unwrap();
+        fs::write(root.join("pkg/b.go"), b"package b\n").unwrap();
+
+        let skip = Arc::new(Ignore::new(&[], &[]).unwrap());
+        let compiled = compile_glob(&skip, "t", "pkg/*.go", &[]).unwrap();
+        let walker = CachedWalker::disabled();
+        let walk = || -> Vec<(String, String)> {
+            let mut v: Vec<_> = walk_glob(&walker, root, &compiled)
+                .unwrap()
+                .into_iter()
+                .map(|a| (a.name, a.hashout))
+                .collect();
+            v.sort();
+            v
+        };
+        let sorted_hashouts = |v: &[(String, String)]| {
+            let mut h: Vec<String> = v.iter().map(|(_, h)| h.clone()).collect();
+            h.sort();
+            h
+        };
+
+        let first = walk();
+        assert_eq!(first, walk(), "stable across runs over an unchanged tree");
+        let a_content = file_hashout(&root.join("pkg/a.go"), false).unwrap();
+        assert_eq!(
+            first[0],
+            (
+                "pkg_a.go".to_string(),
+                hwalk::glob_entry_hashout("pkg/a.go", &a_content)
+            )
+        );
+        assert_ne!(first[0].1, a_content, "not the bare content hash");
+
+        // Rename, bytes kept: the content-hash multiset is unchanged, the
+        // entry hashouts are not.
+        fs::rename(root.join("pkg/a.go"), root.join("pkg/a_darwin.go")).unwrap();
+        let renamed = walk();
+        assert_ne!(sorted_hashouts(&first), sorted_hashouts(&renamed));
+
+        // Swap two files' contents.
+        fs::rename(root.join("pkg/a_darwin.go"), root.join("pkg/a.go")).unwrap();
+        fs::write(root.join("pkg/a.go"), b"package b\n").unwrap();
+        fs::write(root.join("pkg/b.go"), b"package a\n").unwrap();
+        let swapped = walk();
+        assert_ne!(sorted_hashouts(&first), sorted_hashouts(&swapped));
     }
 
     #[tokio::test]
