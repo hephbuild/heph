@@ -639,6 +639,12 @@ fn ensure_home(home: &Path) -> anyhow::Result<()> {
 }
 
 impl Engine {
+    /// The resource pool at this instant: per pool held/free/capacity and the
+    /// queue. `None` before the first admission has built the pool.
+    pub fn resource_snapshot(&self) -> Option<crate::engine::resource_pool::ResourceSnapshot> {
+        self.pools.built().map(|p| p.snapshot())
+    }
+
     pub fn new(cfg: Config) -> anyhow::Result<Engine> {
         let home = cfg.home_dir.clone();
         ensure_home(&home)?;

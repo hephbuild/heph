@@ -43,5 +43,6 @@ mod plugin_fn_declarations;
 mod plugin_functions;
 mod query;
 mod remote_cache;
+mod resources;
 mod scratch;
 mod tool_env;

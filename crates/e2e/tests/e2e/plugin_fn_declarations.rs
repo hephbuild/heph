@@ -181,3 +181,92 @@ async fn declarations_absorbed_across_a_plugin_hop() -> anyhow::Result<()> {
     assert_eq!(htestkit::artifact_string(&result).trim(), "generated");
     Ok(())
 }
+
+/// `heph.heavy.rule(name = …)`: declares a `bash` target whose config carries
+/// `resources`, the second place a declaration is written (after `target()`).
+struct HeavyFn {
+    resources: Value,
+}
+
+#[async_trait::async_trait]
+impl PluginFn for HeavyFn {
+    async fn call(&self, ctx: &FnCallContext<'_>, args: FnArgs) -> anyhow::Result<FnOutcome> {
+        let Some(Value::String(name)) = args.named.get("name").cloned() else {
+            anyhow::bail!("rule: `name` must be a string");
+        };
+        let addr = format!("//{}:{}", ctx.pkg, name);
+        let mut outcome = FnOutcome::from(Value::String(addr));
+        outcome.declare_target(DeclaredTarget {
+            name,
+            driver: "bash".to_string(),
+            config: [
+                (
+                    "run".to_string(),
+                    Value::String("echo heavy > $OUT".to_string()),
+                ),
+                ("out".to_string(), Value::String("heavy.txt".to_string())),
+                ("resources".to_string(), self.resources.clone()),
+            ]
+            .into(),
+            ..Default::default()
+        });
+        Ok(outcome)
+    }
+}
+
+fn heavy_workspace(resources: Value) -> anyhow::Result<htestkit::Workspace> {
+    let ws = workspace(
+        htestkit::WorkspaceBuilder::new()?.with_plugin("heavy", move |_| {
+            Ok(PluginParts::default().with_functions(behind_the_abi(
+                "heavy",
+                vec![rule_def(Arc::new(HeavyFn { resources }))],
+            )?))
+        }),
+    )?;
+    ws.write_build_file("p", r#"heavy = heph.heavy.rule(name = "heavy")"#);
+    Ok(ws)
+}
+
+/// A declaration's `resources` crosses the function seam with the rest of its
+/// config and lands on the def, as `target()`'s does; and the target builds.
+#[tokio::test]
+async fn declared_target_carries_resources() -> anyhow::Result<()> {
+    let ws = heavy_workspace(Value::Map(
+        [
+            ("cpu".to_string(), Value::Int(2)),
+            ("memory".to_string(), Value::String("1G".to_string())),
+        ]
+        .into(),
+    ))?;
+    let rs = ws.engine.new_state();
+    let def = Arc::clone(&ws.engine)
+        .get_def(rs, &heph::htaddr::parse_addr("//p:heavy")?)
+        .await?;
+    assert_eq!(def.target_def.resources.declared("cpu"), Some(2_000_000));
+    assert_eq!(def.target_def.resources.declared("memory"), Some(1 << 30));
+    let result = ws.run("//p:heavy").await?;
+    assert_eq!(htestkit::artifact_string(&result).trim(), "heavy");
+    Ok(())
+}
+
+/// A pool name the SDK helper refuses fails the declared target's def, naming
+/// the target and the bad name, as it does for `target()`.
+#[tokio::test]
+async fn declared_target_with_a_bad_pool_name_is_refused() -> anyhow::Result<()> {
+    let ws = heavy_workspace(Value::Map(
+        [("Docker-Pool".to_string(), Value::Int(1))].into(),
+    ))?;
+    let rs = ws.engine.new_state();
+    let err = Arc::clone(&ws.engine)
+        .get_def(rs, &heph::htaddr::parse_addr("//p:heavy")?)
+        .await
+        .err()
+        .expect("a bad pool name is refused");
+    let err = format!("{err:#}");
+    assert!(err.contains("//p:heavy"), "names the target: {err}");
+    assert!(
+        err.contains(r#""Docker-Pool" is not a valid pool name"#),
+        "names the pool: {err}"
+    );
+    Ok(())
+}
