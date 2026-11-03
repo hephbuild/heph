@@ -74,6 +74,11 @@ const REFUSED_FIELDS: &[(&str, &str)] = &[
     ),
     ("cache", "an entrypoint is never cached. Drop `cache`"),
     (
+        "resources",
+        "an entrypoint reserves nothing: it runs one at a time in your world and is told the \
+         whole `cpu` capacity. Drop `resources`",
+    ),
+    (
         "codegen",
         "an entrypoint has no outputs to write back. Drop `codegen`, or make the generator a \
          build target with `codegen`",
@@ -265,6 +270,21 @@ mod tests {
             (
                 vec![flag(), ("cache", Value::Bool(true))],
                 &["`cache`", "never cached", "Drop"],
+            ),
+            (
+                vec![
+                    flag(),
+                    (
+                        "resources",
+                        Value::Map([("cpu".to_string(), Value::Int(2))].into()),
+                    ),
+                ],
+                &[
+                    "`resources`",
+                    "//tools:go",
+                    "reserves nothing",
+                    "Drop `resources`",
+                ],
             ),
             (
                 vec![flag(), ("codegen", s("copy"))],

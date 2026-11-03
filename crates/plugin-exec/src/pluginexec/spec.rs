@@ -113,6 +113,10 @@ pub(crate) struct TargetSpec {
     /// `"sandbox"` (the invocation's own sandbox package dir, as a build runs;
     /// nothing written there survives the run).
     pub workdir: super::entrypoint_mode::Workdir,
+    /// What the target reserves from the resource pools while it runs, e.g.
+    /// `{"cpu": 2, "memory": "4G"}`. Defaults to 1 cpu. Never hashed: moved
+    /// onto the engine's def, never into exec's own. Refused on an entrypoint.
+    pub resources: hplugin::driver::Resources,
 }
 
 #[cfg(test)]

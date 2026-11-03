@@ -79,6 +79,9 @@ struct NixSpec {
     /// Nix system (e.g. `aarch64-darwin`); defaults to the host.
     #[spec(ty = ParamType::String)]
     system: Option<String>,
+    /// What the target reserves from the resource pools while it runs, e.g.
+    /// `{"cpu": 2}`. Defaults to 1 cpu. Never hashed.
+    resources: hplugin::driver::Resources,
 }
 
 /// Map host (ARCH, OS) to nix system triple. Unknown combos bail loudly so
@@ -320,6 +323,7 @@ impl ManagedDriver for Driver {
                 // consumers would not have those paths realized.
                 cache: CacheConfig::on(false),
                 hash,
+                resources: spec.resources,
                 ..Default::default()
             },
         })

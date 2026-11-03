@@ -1,3 +1,4 @@
+use anyhow::Context as _;
 use async_trait::async_trait;
 use futures::future::BoxFuture;
 use hcore::hasync::Cancellable;
@@ -129,6 +130,9 @@ impl hplugin::driver::Driver for Driver {
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ParseResponse> {
         let bin_name = req.target_spec.addr.name.clone();
+        // The only key this driver reads; never hashed.
+        let resources = hplugin::driver::Resources::from_config(&req.target_spec.config)
+            .with_context(|| format!("hostbin {}", req.target_spec.addr.format()))?;
 
         let mut h = Xxh3::new();
         h.update(bin_name.as_bytes());
@@ -150,6 +154,7 @@ impl hplugin::driver::Driver for Driver {
                     }],
                 }],
                 hash,
+                resources,
                 ..Default::default()
             },
         })

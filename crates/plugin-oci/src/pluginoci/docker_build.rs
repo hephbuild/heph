@@ -359,6 +359,9 @@ struct DockerBuildSpec {
     /// remote cache. `cache = False` disables both; the dict form
     /// `{enabled, remote, history}` toggles them independently.
     cache: TargetSpecCache,
+    /// What the target reserves from the resource pools while it runs, e.g.
+    /// `{"cpu": 2}`. Defaults to 1 cpu. Never hashed.
+    resources: hplugin::driver::Resources,
 }
 
 /// Where the build's Dockerfile comes from.
@@ -1079,6 +1082,7 @@ impl ManagedDriver for Driver {
                 ],
                 cache: spec.cache.into(),
                 hash,
+                resources: spec.resources,
                 ..Default::default()
             },
         })

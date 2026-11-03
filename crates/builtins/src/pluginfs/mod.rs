@@ -964,6 +964,9 @@ struct FsSpec {
     /// Comma-separated glob patterns to exclude (glob mode only).
     #[spec(ty = ParamType::String)]
     e: Option<String>,
+    /// What the target reserves from the resource pools while it runs.
+    /// Defaults to 0.00001 cpu. Never hashed.
+    resources: hplugin::driver::Resources,
 }
 
 #[async_trait]
@@ -1064,6 +1067,10 @@ impl hplugin::driver::Driver for Driver {
                 raw_def: Arc::new(def),
                 outputs,
                 hash,
+                // Not in `hash` above: a declaration moves no key.
+                resources: spec
+                    .resources
+                    .with_default_cpu(hplugin::driver::Resources::VIEW_CPU_MICROS),
                 ..Default::default()
             },
         })
@@ -1649,6 +1656,44 @@ mod tests {
             msg.contains("invalid exclude pattern"),
             "unexpected error: {msg}"
         );
+    }
+
+    /// An undeclared fs target costs 10 micro-CPUs (D3); a declaration replaces
+    /// that `cpu`, keeps its other pools, and moves no def hash (U5).
+    #[tokio::test]
+    async fn resources_default_light_and_declared_unhashed() {
+        let parse = |extra: Option<Value>| async move {
+            let mut config = std::collections::HashMap::from([(
+                "f".to_string(),
+                Value::String("src/main.rs".to_string()),
+            )]);
+            if let Some(r) = extra {
+                config.insert("resources".to_string(), r);
+            }
+            Driver::default()
+                .parse(make_parse_req(config), &ctoken())
+                .await
+                .unwrap()
+                .target_def
+        };
+        let plain = parse(None).await;
+        assert_eq!(
+            plain.resources.declared("cpu"),
+            Some(hplugin::driver::Resources::VIEW_CPU_MICROS)
+        );
+        let gpu_only = parse(Some(Value::Map(
+            [("gpu".to_string(), Value::Int(1))].into(),
+        )))
+        .await;
+        assert_eq!(gpu_only.resources.declared("cpu"), Some(10));
+        assert_eq!(gpu_only.resources.declared("gpu"), Some(1));
+        let heavy = parse(Some(Value::Map(
+            [("cpu".to_string(), Value::Int(2))].into(),
+        )))
+        .await;
+        assert_eq!(heavy.resources.declared("cpu"), Some(2_000_000));
+        assert_eq!(heavy.hash, plain.hash);
+        assert_eq!(gpu_only.hash, plain.hash);
     }
 
     #[tokio::test]

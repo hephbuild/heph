@@ -72,6 +72,9 @@ struct GroupSpec {
     /// path; it cannot be combined with `strip_prefix`/`prefix`. A dict maps exact
     /// emitted paths to destinations.
     rename: Rename,
+    /// What the target reserves from the resource pools while it runs, e.g.
+    /// `{"cpu": 2}`. Defaults to 0.00001 cpu. Never hashed.
+    resources: hplugin::driver::Resources,
 }
 
 impl GroupSpec {
@@ -222,6 +225,10 @@ impl hplugin::driver::Driver for Driver {
                 inputs,
                 outputs,
                 hash,
+                // Not in `hash` above: a declaration moves no key.
+                resources: spec
+                    .resources
+                    .with_default_cpu(hplugin::driver::Resources::VIEW_CPU_MICROS),
                 transparent: !relocating,
                 // `cache` stays at the default, off, in both modes, for different
                 // reasons: an aggregate group has nothing of its own to cache,
@@ -562,6 +569,24 @@ mod tests {
             def.hash, expected,
             "an aggregate group's def hash must not move when transforms exist"
         );
+    }
+
+    /// An undeclared group costs 10 micro-CPUs (D3); a declared `cpu` replaces
+    /// it, and neither moves the def hash (U5).
+    #[tokio::test]
+    async fn resources_default_light_and_declared_unhashed() {
+        let plain = parse_group(&[]).await;
+        assert_eq!(
+            plain.resources.declared("cpu"),
+            Some(hplugin::driver::Resources::VIEW_CPU_MICROS)
+        );
+        let declared = parse_group(&[(
+            "resources",
+            Value::Map([("cpu".to_string(), Value::Int(0))].into()),
+        )])
+        .await;
+        assert_eq!(declared.resources.declared("cpu"), Some(0));
+        assert_eq!(declared.hash, plain.hash);
     }
 
     /// A transform makes the group a real target: it can no longer be inlined,

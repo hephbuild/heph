@@ -149,6 +149,9 @@ struct GoLintSpec {
     /// `"local"`, spawns here as before. A hashed dependency, so changing the
     /// environment re-keys this target.
     runner: String,
+    /// What the target reserves from the resource pools while it runs, e.g.
+    /// `{"cpu": 2}`. Defaults to 1 cpu. Never hashed.
+    resources: hplugin::driver::Resources,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -335,6 +338,7 @@ impl ManagedDriver for GoLintDriver {
                 outputs,
                 cache: CacheConfig::on(true),
                 hash,
+                resources: spec.resources,
                 ..Default::default()
             },
         })
@@ -597,6 +601,9 @@ struct GoLintGateSpec {
     /// Dependencies, grouped by name → list of target addresses. The `report`
     /// group carries the analyze target's `lint-report.json` output.
     deps: HashMap<String, Vec<String>>,
+    /// What the target reserves from the resource pools while it runs, e.g.
+    /// `{"cpu": 2}`. Defaults to 1 cpu. Never hashed.
+    resources: hplugin::driver::Resources,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -792,6 +799,7 @@ impl ManagedDriver for GoLintGateDriver {
                 inputs,
                 cache: CacheConfig::on(true),
                 hash,
+                resources: spec.resources,
                 ..Default::default()
             },
         })
@@ -1067,6 +1075,9 @@ struct GoLintFixSpec {
     /// Declared outputs, grouped by name → list of package-relative paths (the
     /// `.go` files, written back in place).
     out: HashMap<String, Vec<String>>,
+    /// What the target reserves from the resource pools while it runs, e.g.
+    /// `{"cpu": 2}`. Defaults to 1 cpu. Never hashed.
+    resources: hplugin::driver::Resources,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -1166,6 +1177,7 @@ impl ManagedDriver for GoLintFixDriver {
                 outputs,
                 cache: CacheConfig::on(true),
                 hash,
+                resources: spec.resources,
                 ..Default::default()
             },
         })

@@ -1097,4 +1097,106 @@ mod tests {
             AcquireError::ZeroCapacity { pool: name("cpu") }
         );
     }
+
+    /// A parse request for `//p:<driver>` on `driver`: `config`, plus
+    /// `resources` when declared.
+    fn parse_req(
+        driver: &str,
+        config: &[(&str, hcore::htvalue::Value)],
+        resources: Option<&hcore::htvalue::Value>,
+    ) -> hplugin::driver::ParseRequest {
+        let mut config: std::collections::HashMap<_, _> = config
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.clone()))
+            .collect();
+        if let Some(r) = resources {
+            config.insert(Resources::CONFIG_KEY.to_string(), r.clone());
+        }
+        hplugin::driver::ParseRequest {
+            request_id: "t".to_string(),
+            target_spec: Arc::new(hplugin::provider::TargetSpec {
+                addr: hmodel::htaddr::parse_addr(&format!("//p:{driver}")).unwrap(),
+                driver: driver.to_string(),
+                config,
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// The resources on the def of a target of each driver the spec names
+    /// (`exec`, `template`, `fs`, `group`), parsed by the real in-tree drivers
+    /// with `resources` set to `declared`.
+    async fn driver_defs(
+        declared: Option<hcore::htvalue::Value>,
+    ) -> Vec<(&'static str, Resources)> {
+        use hcore::htvalue::Value;
+        use hdriver_support::driver_managed::ManagedDriver as _;
+        use hplugin::driver::Driver as _;
+        let s = |v: &str| Value::String(v.to_string());
+        let d = declared.as_ref();
+        let ct = hcore::hasync::StdCancellationToken::new();
+        let exec = hplugin_exec::pluginexec::Driver::new_exec()
+            .parse(parse_req("exec", &[("run", s("true"))], d), &ct)
+            .await;
+        let template = hbuiltins::plugintemplate::Driver
+            .parse(parse_req("template", &[("src", s(":t.j2"))], d), &ct)
+            .await;
+        let fs = hbuiltins::pluginfs::Driver::default()
+            .parse(parse_req("fs", &[("f", s("a.txt"))], d), &ct)
+            .await;
+        let group = hbuiltins::plugingroup::Driver
+            .parse(
+                parse_req("group", &[("deps", Value::List(vec![s(":a")]))], d),
+                &ct,
+            )
+            .await;
+        [
+            ("exec", exec),
+            ("template", template),
+            ("fs", fs),
+            ("group", group),
+        ]
+        .into_iter()
+        .map(|(name, res)| {
+            let def = res.unwrap_or_else(|e| panic!("parse {name}: {e:#}"));
+            (name, def.target_def.resources)
+        })
+        .collect()
+    }
+
+    /// D3: a def that says nothing reserves 1 cpu (exec, template), except
+    /// `fs` and `group`, which put 10 micro-CPUs on their defs.
+    #[tokio::test]
+    async fn a_def_without_resources_costs_one_cpu() {
+        let p = pool(&[("cpu", 4 * CPU)]);
+        for (driver, resources) in driver_defs(None).await {
+            let want = match driver {
+                "fs" | "group" => Resources::VIEW_CPU_MICROS,
+                _ => CPU,
+            };
+            assert_eq!(resources.amount("cpu"), want, "{driver}");
+            let r = now(&p, &resources);
+            assert!(!r.is_light(), "{driver}");
+            assert_eq!(r.amount("cpu"), want, "{driver}");
+        }
+    }
+
+    /// D3, D5: a declared `cpu` replaces every driver's default, and `cpu: 0`
+    /// takes the light lane, reserving nothing from `cpu`.
+    #[tokio::test]
+    async fn declared_resources_override_the_default() {
+        use hcore::htvalue::Value;
+        let cpu = |v: Value| Some(Value::Map([("cpu".to_string(), v)].into()));
+        let p = pool(&[("cpu", 4 * CPU)]);
+        for (driver, resources) in driver_defs(cpu(Value::Int(2))).await {
+            let r = now(&p, &resources);
+            assert_eq!(r.amount("cpu"), 2 * CPU, "{driver}");
+        }
+        for (driver, resources) in driver_defs(cpu(Value::Int(0))).await {
+            assert_eq!(resources.declared("cpu"), Some(0), "{driver}");
+            let r = now(&p, &resources);
+            assert!(r.is_light(), "{driver}: cpu 0 is the light lane");
+            assert_eq!(free(&p, "cpu"), 4 * CPU, "{driver}: holds no cpu");
+        }
+    }
 }

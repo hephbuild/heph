@@ -1262,6 +1262,10 @@ impl Resources {
     pub const MICROS_PER_CPU: u64 = hcore::capacity::MICROS_PER_CPU;
     /// What a target that declares no `cpu` reserves: one CPU.
     pub const DEFAULT_CPU_MICROS: u64 = Self::MICROS_PER_CPU;
+    /// What an `fs` or `group` target reserves when it declares no `cpu`:
+    /// 0.00001 CPU, so they still queue through the `cpu` pool in FIFO order
+    /// but 100,000 of them fit in one CPU.
+    pub const VIEW_CPU_MICROS: u64 = 10;
 
     pub fn new() -> Self {
         Self::default()
@@ -1346,6 +1350,20 @@ impl Resources {
             );
         }
         Ok(self.0.insert(pool, amount))
+    }
+
+    /// `self`, with `cpu` set to `micros` when the target declared no `cpu`.
+    /// Every other declared pool is kept.
+    ///
+    /// For a driver whose targets cost less than the engine's default (`fs`
+    /// and `group`). A declaration that already names
+    /// [`MAX_POOLS`](Self::MAX_POOLS) other pools has no room for `cpu` and
+    /// keeps the engine's default.
+    pub fn with_default_cpu(mut self, micros: u64) -> Self {
+        if self.declared(crate::provider::PoolName::CPU).is_none() && self.len() < Self::MAX_POOLS {
+            self.0.insert(crate::provider::PoolName::cpu(), micros);
+        }
+        self
     }
 
     /// Whether nothing was declared (the target reserves the defaults).

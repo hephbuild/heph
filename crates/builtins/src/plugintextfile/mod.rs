@@ -28,6 +28,9 @@ struct TextFileSpec {
     out: Option<String>,
     /// Mark the written file executable.
     executable: bool,
+    /// What the target reserves from the resource pools while it runs, e.g.
+    /// `{"cpu": 2}`. Defaults to 1 cpu. Never hashed.
+    resources: hplugin::driver::Resources,
 }
 
 #[derive(serde::Serialize)]
@@ -95,6 +98,7 @@ impl hplugin::driver::Driver for Driver {
                     }],
                 }],
                 hash,
+                resources: spec.resources,
                 ..Default::default()
             },
         })

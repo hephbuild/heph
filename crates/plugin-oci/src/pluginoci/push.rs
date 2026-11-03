@@ -73,6 +73,9 @@ struct OciPushSpec {
     /// target that sets neither this nor `credentials` pushes anonymously.
     /// Not combinable with `credentials`.
     ambient_credentials: bool,
+    /// What the target reserves from the resource pools while it runs, e.g.
+    /// `{"cpu": 2}`. Defaults to 1 cpu. Never hashed.
+    resources: hplugin::driver::Resources,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -276,6 +279,7 @@ impl ManagedDriver for Driver {
                 // An action with an external side effect: never cached (the
                 // default `CacheConfig::off()`), always runs.
                 hash,
+                resources: spec.resources,
                 ..Default::default()
             },
         })

@@ -1705,6 +1705,9 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
                 entrypoint: engine_entrypoint,
                 pty: true,
                 hash,
+                // On the engine's def only, never on exec's `TargetDef`, so
+                // `Hash for TargetDef` cannot reach it (U5).
+                resources: spec.resources,
                 ..Default::default()
             },
         })
@@ -4618,6 +4621,65 @@ mod tests {
             report, EXEC_DEF_GOLDEN_POPULATED,
             "an exec/bash def hash or input list moved:\n{report}"
         );
+        Ok(())
+    }
+
+    /// U5: a declared `resources` reaches the engine's def and moves neither
+    /// the parse nor the `apply_transitive` def hash of the golden config.
+    #[tokio::test]
+    async fn declared_resources_reach_the_def_and_not_the_hash() -> anyhow::Result<()> {
+        use hcore::htvalue::Value;
+        let ctoken = StdCancellationToken::new();
+        let driver = Driver::new_exec();
+        let parse = |config: HashMap<String, Value>| {
+            let driver = &driver;
+            let ctoken = &ctoken;
+            async move {
+                let parsed = driver
+                    .parse(
+                        hplugin::driver::ParseRequest {
+                            request_id: "res".to_string(),
+                            target_spec: Arc::new(hplugin::provider::TargetSpec {
+                                addr: parse_addr("//app:golden")?,
+                                driver: driver.name.clone(),
+                                config,
+                                ..Default::default()
+                            }),
+                        },
+                        ctoken,
+                    )
+                    .await?
+                    .target_def;
+                let applied = driver
+                    .apply_transitive(
+                        hplugin::driver::ApplyTransitiveRequest {
+                            request_id: "res".to_string(),
+                            target_def: parsed.clone(),
+                            sandbox: golden_transitive_sandbox(),
+                        },
+                        ctoken,
+                    )
+                    .await?
+                    .target_def;
+                anyhow::Ok((parsed, applied))
+            }
+        };
+        let (plain, plain_applied) = parse(golden_populated_config()).await?;
+        assert!(plain.resources.is_empty(), "undeclared: the engine default");
+        let mut config = golden_populated_config();
+        config.insert(
+            "resources".to_string(),
+            Value::Map(HashMap::from([
+                ("cpu".to_string(), Value::Float(1.5)),
+                ("memory".to_string(), Value::String("4G".to_string())),
+            ])),
+        );
+        let (declared, declared_applied) = parse(config).await?;
+        assert_eq!(declared.resources.declared("cpu"), Some(1_500_000));
+        assert_eq!(declared.resources.declared("memory"), Some(4 << 30));
+        assert_eq!(declared_applied.resources, declared.resources);
+        assert_eq!(declared.hash, plain.hash);
+        assert_eq!(declared_applied.hash, plain_applied.hash);
         Ok(())
     }
 

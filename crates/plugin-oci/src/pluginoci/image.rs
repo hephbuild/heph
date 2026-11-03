@@ -150,6 +150,9 @@ struct OciImageSpec {
     out: Option<String>,
     /// Caching for the built image. Defaults to on for both tiers.
     cache: TargetSpecCache,
+    /// What the target reserves from the resource pools while it runs, e.g.
+    /// `{"cpu": 2}`. Defaults to 1 cpu. Never hashed.
+    resources: hplugin::driver::Resources,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -615,6 +618,7 @@ impl ManagedDriver for Driver {
                 ],
                 cache: spec.cache.into(),
                 hash,
+                resources: spec.resources,
                 ..Default::default()
             },
         })

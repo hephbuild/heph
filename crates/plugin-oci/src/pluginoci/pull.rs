@@ -117,6 +117,9 @@ struct OciPullSpec {
     /// Caching for the pulled archive. Defaults to on for both tiers. A pull is
     /// content-addressed only when the ref is digest-pinned.
     cache: TargetSpecCache,
+    /// What the target reserves from the resource pools while it runs, e.g.
+    /// `{"cpu": 2}`. Defaults to 1 cpu. Never hashed.
+    resources: hplugin::driver::Resources,
 }
 
 /// Which instance(s) of a manifest list a pull takes.
@@ -324,6 +327,7 @@ impl ManagedDriver for Driver {
                 }],
                 cache,
                 hash,
+                resources: spec.resources,
                 ..Default::default()
             },
         })
