@@ -671,11 +671,10 @@ impl Engine {
         let home = cfg.home_dir.clone();
         ensure_home(&home)?;
 
-        let parallelism = cfg.parallelism.unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1)
-        });
+        // `cfg.parallelism` is an embedder's override (tests size the engine
+        // with it; the CLI leaves it unset): a run's choice, like `-j`. The
+        // host's number is `host_cpus`, which `heph.core.resource("cpu")` reports.
+        let parallelism = cfg.parallelism.unwrap_or_else(hcore::sysres::host_cpus);
 
         let sqlite = LocalCacheSQLite::with_pipe_limit(
             home.join("cache").join("cache.db"),

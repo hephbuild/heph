@@ -20,6 +20,19 @@ use std::sync::OnceLock;
 /// Where cgroup filesystems are mounted on Linux.
 pub const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 
+/// The CPUs this process may use: the engine's default `parallelism`, and so
+/// the `cpu` pool's default capacity, and what `heph.core.resource("cpu")`
+/// reports. `available_parallelism` (cgroup- and affinity-aware on Linux),
+/// falling back to 1 when it cannot be read.
+///
+/// The host's number, never a run's: `-j` and `--resource cpu=` set the pool's
+/// capacity over it and leave this alone.
+pub fn host_cpus() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
 /// The memory this process may use, in bytes: the `memory` pool's default
 /// capacity. Read once per process and cached.
 ///

@@ -1225,6 +1225,34 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
     }
 }
 
+/// A host capacity `heph.core.resource` reports, in the pool's BUILD-file unit.
+#[derive(Debug, PartialEq)]
+enum HostAmount {
+    Cores(f64),
+    Bytes(u64),
+}
+
+/// `heph.core.resource(name)`: the same host reads the engine's default `cpu`
+/// and `memory` capacities come from, so the value and the pool agree on an
+/// unconfigured run. Only those two pools have a host value.
+fn host_resource(name: &str) -> anyhow::Result<HostAmount> {
+    use hplugin::provider::PoolName;
+    match name {
+        PoolName::CPU => {
+            #[expect(clippy::cast_precision_loss, reason = "a core count is far below 2^53")]
+            let cpu = hcore::sysres::host_cpus() as f64;
+            Ok(HostAmount::Cores(cpu))
+        }
+        PoolName::MEMORY => Ok(HostAmount::Bytes(hcore::sysres::host_memory_bytes())),
+        other => anyhow::bail!(
+            "heph.core.resource: {other:?} has no host capacity; valid names are \"{}\" and \"{}\" \
+             (a custom pool's capacity comes from .hephconfig or --resource, not the host)",
+            PoolName::CPU,
+            PoolName::MEMORY,
+        ),
+    }
+}
+
 #[starlark_module]
 fn heph_core_module(builder: &mut GlobalsBuilder) {
     /// Host operating system in canonical (Go/OCI) naming, e.g. `linux`, `darwin`.
@@ -1250,12 +1278,33 @@ fn heph_core_module(builder: &mut GlobalsBuilder) {
     /// The number of CPUs available to the process, falling back to 1 when the
     /// host count can't be determined.
     fn num_cpu() -> starlark::Result<i32> {
-        let n = std::thread::available_parallelism()
-            .map(|p| p.get())
-            .unwrap_or(1);
-        // `available_parallelism` returns a `usize`; clamp into Starlark's `i32`
+        let n = hcore::sysres::host_cpus();
+        // `host_cpus` returns a `usize`; clamp into Starlark's `i32`
         // so an implausibly large host count can't overflow.
         Ok(i32::try_from(n).unwrap_or(i32::MAX))
+    }
+
+    /// One pool's host capacity as the engine reads it: `resource("cpu")` is
+    /// the CPUs this process may use, a float in cores (the engine's default
+    /// parallelism); `resource("memory")` the memory it may use, an int in
+    /// bytes (the cgroup limit on Linux when one is set, else physical memory).
+    /// The host's numbers, not this run's: `-j` and `--resource` leave them
+    /// alone. A custom pool has no host value, so any other name is an error.
+    ///
+    /// Meant for `resources = {"cpu": heph.core.resource("cpu")}` (one target
+    /// at the machine's full width) or a fraction of it: `resources` stays out
+    /// of every def hash. Any other use (an `env` value, an argument, a file's
+    /// contents) puts a per-machine number into driver config and so into the
+    /// def hash of every consumer, and `heph validate` cannot catch it.
+    fn resource<'v>(
+        eval: &mut Evaluator<'v, '_, '_>,
+        #[starlark(require = pos)] name: &str,
+    ) -> starlark::Result<Value<'v>> {
+        let heap = eval.heap();
+        match host_resource(name).map_err(starlark::Error::new_other)? {
+            HostAmount::Cores(c) => Ok(heap.alloc(c)),
+            HostAmount::Bytes(b) => Ok(heap.alloc(b)),
+        }
     }
 
     /// The package currently being evaluated.
@@ -3809,6 +3858,53 @@ target(
             // it's a positive integer.
             Some(htvalue::Value::Int(i)) => assert!(*i >= 1, "num_cpu should be >= 1, got {i}"),
             other => panic!("expected num_cpu int, got {other:?}"),
+        }
+    }
+
+    /// D14: each value is the host read the engine's default capacity comes
+    /// from, and it lands in a target's `resources` as a declaration the SDK
+    /// helper accepts (memory over 2^31 included).
+    #[test]
+    fn core_resource_matches_the_engine_host_reads() {
+        let content = r#"
+cpu = heph.core.resource("cpu")
+memory = heph.core.resource("memory")
+target(name = "t", driver = "d", cpu = cpu, memory = memory, resources = {"cpu": cpu, "memory": memory})
+"#;
+        let config = run_target_config(content);
+        let cpus = hcore::sysres::host_cpus();
+        let memory = hcore::sysres::host_memory_bytes();
+        match config.get("cpu") {
+            Some(htvalue::Value::Float(f)) => assert_eq!(*f, cpus as f64),
+            other => panic!("cpu should be a float, got {other:?}"),
+        }
+        match config.get("memory") {
+            Some(htvalue::Value::Int(i)) => assert_eq!(u64::try_from(*i).ok(), Some(memory)),
+            Some(htvalue::Value::Float(f)) => assert_eq!(*f, memory as f64),
+            other => panic!("memory should be a number, got {other:?}"),
+        }
+        let declared = hplugin::driver::Resources::from_config(&config).expect("valid resources");
+        assert_eq!(
+            declared.declared("cpu"),
+            Some(cpus as u64 * hplugin::driver::Resources::MICROS_PER_CPU)
+        );
+        assert_eq!(declared.declared("memory"), Some(memory));
+    }
+
+    /// A custom pool has no host value: the error names the name asked for
+    /// and the two that are valid, and a near-miss of a real one is refused
+    /// rather than matched.
+    #[test]
+    fn core_resource_unknown_name_names_the_valid_ones() {
+        for name in ["docker", "cpus", "CPU", ""] {
+            let err = run_target_config_err(&format!(
+                r#"target(name = "t", driver = "d", n = heph.core.resource("{name}"))"#
+            ));
+            assert!(err.contains(&format!("{name:?}")), "{name:?}: {err}");
+            assert!(
+                err.contains(r#""cpu""#) && err.contains(r#""memory""#),
+                "{name:?}: {err}"
+            );
         }
     }
 

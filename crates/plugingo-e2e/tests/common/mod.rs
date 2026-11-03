@@ -467,6 +467,41 @@ fn make_workspace_ordered_runner(
     runner: Option<&str>,
     govet: Govet,
 ) -> anyhow::Result<Workspace> {
+    workspace_builder(
+        dir,
+        go_first,
+        foreign_name_guard,
+        fs_skip,
+        gotool,
+        runner,
+        govet,
+    )?
+    .build()
+    .context("build plugingo workspace")
+}
+
+/// [`make_workspace`] on an engine `parallelism` wide, which is also its `cpu`
+/// pool's capacity — what `-j <parallelism>` gives a run.
+pub fn make_workspace_with_parallelism(
+    dir: TempDir,
+    parallelism: usize,
+) -> anyhow::Result<Workspace> {
+    workspace_builder(dir, false, true, &[], HOST_GO, None, Govet::Release)?
+        .with_parallelism(parallelism)
+        .build()
+        .context("build plugingo workspace")
+}
+
+/// The builder behind [`make_workspace_ordered_runner`], before `build`.
+fn workspace_builder(
+    dir: TempDir,
+    go_first: bool,
+    foreign_name_guard: bool,
+    fs_skip: &[&str],
+    gotool: &str,
+    runner: Option<&str>,
+    govet: Govet,
+) -> anyhow::Result<WorkspaceBuilder> {
     // Built here, not by a target: the sandbox has no HOME, so no GOCACHE, and a
     // cold `go build` there would recompile x/tools for every test.
     let tree_govet = match govet {
@@ -602,13 +637,13 @@ fn make_workspace_ordered_runner(
         b = b.with_plugin("go", go);
     }
 
-    b.with_managed_driver(Box::new(pluginexec::Driver::new_bash().with_host_path()))
-        .with_managed_driver(Box::new(pluginexec::Driver::new_exec().with_host_path()))
-        .with_plugin("devenv", |_| {
-            Ok(PluginParts::default()
-                .with_managed_driver(Box::new(hplugin_devenv::plugindevenv::Driver::new())))
-        })
-        .with_managed_driver(Box::new(pluginhttp::Driver))
-        .build()
-        .context("build plugingo workspace")
+    Ok(
+        b.with_managed_driver(Box::new(pluginexec::Driver::new_bash().with_host_path()))
+            .with_managed_driver(Box::new(pluginexec::Driver::new_exec().with_host_path()))
+            .with_plugin("devenv", |_| {
+                Ok(PluginParts::default()
+                    .with_managed_driver(Box::new(hplugin_devenv::plugindevenv::Driver::new())))
+            })
+            .with_managed_driver(Box::new(pluginhttp::Driver)),
+    )
 }

@@ -660,6 +660,14 @@ impl Provider {
                             ("runtime_pass_env", ParamType::list(ParamType::String)),
                             ("pre_run", ParamType::list(ParamType::String)),
                             ("runner", ParamType::String),
+                            (
+                                "resources",
+                                ParamType::map(ParamType::union(vec![
+                                    ParamType::Int,
+                                    ParamType::Float,
+                                    ParamType::String,
+                                ])),
+                            ),
                         ]),
                     ]),
                     "Test settings for this package. `test = False` skips its tests, \
@@ -674,7 +682,12 @@ impl Provider {
                      names an exec-runner target so the tests run inside a described \
                      environment — a devenv shell or a container — instead of on the \
                      bare host. The runner is a hashed dependency, so changing the \
-                     environment re-keys every test under it. By default applies \
+                     environment re-keys every test under it. `resources` (the \
+                     same map as `target()`'s, e.g. `{\"cpu\": 4, \"memory\": \"2G\"}`) \
+                     is what each run target reserves from the engine's pools while \
+                     its test binary runs — compiles, links and `build_test` keep the \
+                     default; it moves no cache key, and states combine per pool, the \
+                     deepest declaration winning. By default applies \
                      only to this package; set `recursive = True` to apply to \
                      descendant packages too.",
                 ),
@@ -1505,6 +1518,7 @@ const TEST_STATE_KEYS: &[&str] = &[
     "runtime_pass_env",
     "pre_run",
     "runner",
+    "resources",
 ];
 
 /// Whether a state opts its per-package config into descendant packages via
@@ -1591,8 +1605,35 @@ fn pick_test_env(states: &[State], addr_pkg: &str) -> anyhow::Result<target_test
         {
             out.runner = Some(runner.clone());
         }
+        if let Some(v) = test_map.get(hplugin::driver::Resources::CONFIG_KEY) {
+            // Per pool, deeper wins: a deeper map lays its pools over the
+            // shallower ones. Anything but two maps is the deeper value as
+            // written, so a bad shape still reaches `check_test_resources`.
+            out.resources = match (out.resources.take(), v) {
+                (Some(Value::Map(mut acc)), Value::Map(deeper)) => {
+                    acc.extend(deeper.iter().map(|(k, v)| (k.clone(), v.clone())));
+                    Some(Value::Map(acc))
+                }
+                _ => Some(v.clone()),
+            };
+        }
     }
     Ok(out)
+}
+
+/// Check the run target's merged `test.resources` with the SDK's parser,
+/// naming the run target, so a bad declaration fails at `get` rather than at
+/// exec's `parse` with no hint that a go `provider_state` wrote it.
+fn check_test_resources(test_env: &target_test::TestEnv, addr: &Addr) -> anyhow::Result<()> {
+    if let Some(v) = &test_env.resources {
+        hplugin::driver::Resources::from_value(v).with_context(|| {
+            format!(
+                "{}: go provider_state `test.resources` does not parse",
+                addr.format()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 /// Keys accepted inside a `link = {...}` go provider_state map. Rejects typos /
@@ -2884,6 +2925,7 @@ impl ProviderInner {
                 let data_query_addr = go_test_data_query_addr(addr.package.as_str());
                 let test_env =
                     pick_test_env(&req.states, addr.package.as_str()).map_err(GetError::Other)?;
+                check_test_resources(&test_env, addr).map_err(GetError::Other)?;
                 let spec = target_test::test_spec(
                     addr.clone(),
                     build_test_addr,
@@ -2903,6 +2945,7 @@ impl ProviderInner {
                 let data_query_addr = go_test_data_query_addr(addr.package.as_str());
                 let test_env =
                     pick_test_env(&req.states, addr.package.as_str()).map_err(GetError::Other)?;
+                check_test_resources(&test_env, addr).map_err(GetError::Other)?;
                 let spec = target_test::test_spec(
                     addr.clone(),
                     build_xtest_addr,
@@ -7704,6 +7747,180 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         )];
         let err = pick_test_env(&states, "foo").expect_err("typo must be rejected");
         assert!(format!("{err:#}").contains("runnr"), "{err:#}");
+    }
+
+    /// A go `provider_state` carrying `test.resources`, recursive or not.
+    fn state_with_test_resources(
+        pkg: &str,
+        recursive: bool,
+        resources: Vec<(&str, Value)>,
+    ) -> State {
+        let mut s = state_with_test_map(
+            pkg,
+            vec![(
+                "resources",
+                Value::Map(
+                    resources
+                        .into_iter()
+                        .map(|(k, v)| (k.to_string(), v))
+                        .collect(),
+                ),
+            )],
+        );
+        if recursive {
+            s.state.insert("recursive".to_string(), Value::Bool(true));
+        }
+        s
+    }
+
+    /// The spec's resources after exec's own `parse` moved them onto the def.
+    async fn def_resources(spec: hplugin::provider::TargetSpec) -> hplugin::driver::Resources {
+        use hdriver_support::driver_managed::ManagedDriver as _;
+        use hplugin::driver::ParseRequest;
+        hplugin_exec::pluginexec::Driver::new_exec()
+            .parse(
+                ParseRequest {
+                    request_id: "test".to_string(),
+                    target_spec: Arc::new(spec),
+                },
+                &StdCancellationToken::new(),
+            )
+            .await
+            .expect("exec parses the run target")
+            .target_def
+            .resources
+    }
+
+    /// D15: a recursive `test.resources` reaches a descendant's run targets
+    /// (`test`, and `test_race`, the same target built with the race detector)
+    /// on the def; the build of the test binary keeps the default; a deeper
+    /// state overrides one pool and keeps the rest; a bad amount fails at `get`
+    /// naming the run target.
+    #[tokio::test]
+    async fn go_test_state_resources_reach_the_run_targets() {
+        require_go!();
+        let sandbox = copy_fixture("with_test");
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
+        const MICROS: u64 = hplugin::driver::Resources::MICROS_PER_CPU;
+
+        let root_only = vec![
+            host_variant_state(),
+            state_with_test_resources(
+                "",
+                true,
+                vec![
+                    ("cpu", Value::Int(4)),
+                    ("memory", Value::String("1G".into())),
+                ],
+            ),
+        ];
+        for name in ["test", "test_race"] {
+            let spec = provider_get_with_states(&p, make_addr("pkg", name), root_only.clone())
+                .await
+                .unwrap()
+                .target_spec;
+            assert_eq!(spec.driver, "exec", "{name}");
+            let r = def_resources(spec).await;
+            assert_eq!(r.declared("cpu"), Some(4 * MICROS), "{name}");
+            assert_eq!(r.declared("memory"), Some(1 << 30), "{name}");
+        }
+        let build_test =
+            provider_get_with_states(&p, make_addr("pkg", "build_test"), root_only.clone())
+                .await
+                .unwrap()
+                .target_spec;
+        assert!(
+            !build_test.config.contains_key("resources"),
+            "build_test keeps the default cost: {:?}",
+            build_test.config.get("resources")
+        );
+
+        // The package's own state overrides `memory`; `cpu` comes from the root.
+        let mut deeper = root_only.clone();
+        deeper.push(state_with_test_resources(
+            "pkg",
+            false,
+            vec![("memory", Value::String("2G".into()))],
+        ));
+        let spec = provider_get_with_states(&p, make_addr("pkg", "test"), deeper)
+            .await
+            .unwrap()
+            .target_spec;
+        let r = def_resources(spec).await;
+        assert_eq!(r.declared("cpu"), Some(4 * MICROS));
+        assert_eq!(r.declared("memory"), Some(2 << 30));
+
+        let bad = vec![
+            host_variant_state(),
+            state_with_test_resources("pkg", false, vec![("cpu", Value::Int(-1))]),
+        ];
+        let err = match provider_get_with_states(&p, make_addr("pkg", "test"), bad).await {
+            Ok(r) => panic!("cpu -1 must fail, got {:?}", r.target_spec.config),
+            Err(GetError::Other(e)) => format!("{e:#}"),
+            Err(e) => panic!("expected a parse error, got {e:?}"),
+        };
+        assert!(err.contains("//pkg:test"), "names the run target: {err}");
+        assert!(err.contains("resources.cpu"), "names the pool: {err}");
+    }
+
+    /// D7/U7: heph sets neither `GOMAXPROCS` nor `GOMEMLIMIT` on anything the
+    /// Go provider generates — a Go process sizes itself from the host, and no
+    /// Go def hash moves. Covers every spec a test package resolves to and the
+    /// in-process Go drivers' env, which comes from `go_build_env_for`.
+    #[tokio::test]
+    async fn go_targets_set_no_gomaxprocs_or_gomemlimit() {
+        require_go!();
+        let sandbox = copy_fixture("with_test");
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
+        let resources = vec![
+            host_variant_state(),
+            state_with_test_resources(
+                "",
+                true,
+                vec![
+                    ("cpu", Value::Int(4)),
+                    ("memory", Value::String("1G".into())),
+                ],
+            ),
+        ];
+        let mut seen = 0;
+        for name in [
+            "build_lib",
+            "build_test_lib",
+            "build_testmain_lib",
+            "build_test",
+            "test",
+            "test_race",
+            "_golist",
+        ] {
+            let Ok(resp) =
+                provider_get_with_states(&p, make_addr("pkg", name), resources.clone()).await
+            else {
+                continue;
+            };
+            seen += 1;
+            let text = format!("{:?}", resp.target_spec.config);
+            for knob in ["GOMAXPROCS", "GOMEMLIMIT"] {
+                assert!(!text.contains(knob), "{name} carries {knob}: {text}");
+            }
+        }
+        assert!(seen >= 4, "most of the package's targets resolved ({seen})");
+        for race in [false, true] {
+            let factors = Factors {
+                race,
+                ..Default::default()
+            };
+            let env = format!(
+                "{:?}",
+                crate::plugingo::addr_util::go_build_env_for(&factors)
+            );
+            for knob in ["GOMAXPROCS", "GOMEMLIMIT"] {
+                assert!(
+                    !env.contains(knob),
+                    "the Go build env carries {knob}: {env}"
+                );
+            }
+        }
     }
 
     #[test]
