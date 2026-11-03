@@ -103,7 +103,8 @@ use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3Default;
 
 use super::{
-    ImageFormat, basename, dep_files, dep_single_file, is_addr, normalize_platform, ws_path,
+    ImageFormat, basename, dep_files, dep_origins, dep_single_file, is_addr, normalize_platform,
+    ws_path,
 };
 
 /// The user-facing output streams a driver relays its tool's output to.
@@ -424,12 +425,12 @@ fn link_platform_contexts(
         let seg = platform_segment(platform);
         let root = req.sandbox_dir.join(format!("exec_{seg}_{group}"));
         let dest_root = context_dir.join(PLATFORM_CTX_PREFIX).join(platform);
-        for m in &req.inputs {
-            let prefix = format!("context_by_platform|{seg}|{group}|");
-            if !m.input.origin_id.starts_with(&prefix) {
+        let prefix = format!("context_by_platform|{seg}|{group}|");
+        for origin in dep_origins(req) {
+            if !origin.starts_with(&prefix) {
                 continue;
             }
-            for path in dep_files(req, &m.input.origin_id)? {
+            for path in dep_files(req, origin)? {
                 let rel = path.strip_prefix(&root).unwrap_or(&path);
                 let dest = dest_root.join(rel);
                 if let Some(parent) = dest.parent() {
@@ -1521,8 +1522,8 @@ fn resolve_src_args(
     // same paths everywhere — one target built two ways, the usual case — so
     // disagreement is an error rather than a silently platform-dependent arg.
     let mut by_platform_group: BTreeMap<String, BTreeMap<String, Vec<String>>> = BTreeMap::new();
-    for m in &req.inputs {
-        if let Some(rest) = m.input.origin_id.strip_prefix("context_by_platform|") {
+    for origin in dep_origins(req) {
+        if let Some(rest) = origin.strip_prefix("context_by_platform|") {
             // `context_by_platform|<platform>|<group>|<index>`; the platform
             // itself contains `/` but never `|`.
             let mut parts = rest.splitn(2, '|');
@@ -1533,7 +1534,7 @@ fn resolve_src_args(
                 continue;
             };
             let root = req.sandbox_dir.join(format!("exec_{platform}_{group}"));
-            for path in dep_files(req, &m.input.origin_id)? {
+            for path in dep_files(req, origin)? {
                 let rel = path.strip_prefix(&root).unwrap_or(&path);
                 by_platform_group
                     .entry(group.to_string())
@@ -1544,14 +1545,14 @@ fn resolve_src_args(
             }
             continue;
         }
-        let Some(rest) = m.input.origin_id.strip_prefix("context|") else {
+        let Some(rest) = origin.strip_prefix("context|") else {
             continue;
         };
         // origin_id is `context|<group>|<index>`; the group may itself be empty.
         let Some((group, _)) = rest.rsplit_once('|') else {
             continue;
         };
-        for path in dep_files(req, &m.input.origin_id)? {
+        for path in dep_files(req, origin)? {
             let rel = path.strip_prefix(context_dir).unwrap_or(&path);
             by_group
                 .entry(group.to_string())
