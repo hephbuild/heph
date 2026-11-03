@@ -377,9 +377,11 @@ impl ManagedDriver for GoLintDriver {
             import_map.insert(ip.clone(), ip.clone());
 
             // Facts are optional: stdlib (or any not-yet-linted) deps have no
-            // facts group. unitchecker treats a missing PackageVetx entry as
-            // "no facts", which is correct — those analyzers degrade to
-            // intra-package for that one dependency only.
+            // facts group. unitchecker (x/tools ≥ v0.50) reads an import's types
+            // from its vetx file too, so heph-govet stands in a types-only, no-facts
+            // vetx file for each such import, built from its archive above (see
+            // tools/heph-govet/vetx.go). Analyzers degrade to intra-package for that
+            // one dependency only.
             let facts_group = import_path_to_facts_group(ip);
             if let Ok(facts) = self.single_staged_path(&req, &facts_group) {
                 // unitchecker gob-decodes whatever this points at, so a wrong file
