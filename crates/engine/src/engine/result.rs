@@ -729,9 +729,10 @@ struct PassthroughContent {
     source_path: String,
     out_path: String,
     x: bool,
-    /// Hashout recorded when the target was hashed — the bare content hash, or
-    /// for a glob entry that hash bound to `out_path`; the just-read bytes must
-    /// still produce it (see [`VerifyingReader`]).
+    /// Hashout recorded when the target was hashed — for an `fs` source file
+    /// the content hash bound to `out_path`, or a bare content hash from any
+    /// other passthrough producer; the just-read bytes must still produce it
+    /// (see [`VerifyingReader`]).
     expected: String,
 }
 
@@ -798,10 +799,11 @@ impl Content for PassthroughContent {
 /// marker byte. `passthrough_reader_matches_file_hashout` pins the two together
 /// so they cannot silently drift.
 ///
-/// The recorded hashout takes one of two forms, and both are accepted: the bare
-/// content hash (`@heph/fs:file`, whose path is in its addr) or that hash bound
-/// to the entry's `out_path` by [`hwalk::glob_entry_hashout`] (`@heph/fs:glob`,
-/// whose addr carries only the pattern). Accepting either does not weaken the
+/// The recorded hashout takes one of two forms, and both are accepted: the
+/// content hash bound to the artifact's `out_path` by [`hwalk::fs_entry_hashout`]
+/// (what `@heph/fs:file` and `@heph/fs:glob` both record), or the bare content
+/// hash (`passthrough` is a plugin-ABI field, so another driver may set it with
+/// an unbound hash). Accepting either does not weaken the
 /// check: both forms are a function of the bytes just read, so modified bytes
 /// miss both — matching one by accident is an xxh3 collision, the same odds the
 /// single-form check already rested on. `ContentFile` carries no field saying
@@ -813,7 +815,7 @@ struct VerifyingReader {
     x: bool,
     expected: String,
     source_path: String,
-    /// The artifact's `out_path`, for the path-bound (glob entry) form.
+    /// The artifact's `out_path`, for the path-bound (`fs` source file) form.
     out_path: String,
     verified: bool,
 }
@@ -830,7 +832,7 @@ impl std::io::Read for VerifyingReader {
                 self.hasher.update(&[self.x as u8]);
                 let got = format!("{:x}", self.hasher.digest());
                 if got != self.expected
-                    && hwalk::glob_entry_hashout(&self.out_path, &got) != self.expected
+                    && hwalk::fs_entry_hashout(&self.out_path, &got) != self.expected
                 {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -4981,12 +4983,13 @@ mod tests {
         assert!(msg.contains("go.mod"), "msg names the file: {msg}");
     }
 
-    /// A glob entry records its hashout bound to its `out_path`
-    /// ([`hwalk::glob_entry_hashout`]), not the bare content hash. The verifier
-    /// must accept that form for unmodified bytes and still reject it once the
-    /// file changes after hashing — and must not accept it bound to another path.
+    /// An `fs` source file (`fs:file` or a glob entry) records its hashout bound
+    /// to its `out_path` ([`hwalk::fs_entry_hashout`]), not the bare content
+    /// hash. The verifier must accept that form for unmodified bytes and still
+    /// reject it once the file changes after hashing — and must not accept it
+    /// bound to another path.
     #[tokio::test]
-    async fn passthrough_verifies_a_path_bound_glob_entry_hashout() {
+    async fn passthrough_verifies_a_path_bound_fs_entry_hashout() {
         let dir = tempdir().expect("tempdir");
         let source_path = dir.path().join("a.go");
         std::fs::write(&source_path, b"package a\n").expect("write");
@@ -5004,7 +5007,7 @@ mod tests {
             std::io::Read::read_to_end(&mut pc.reader().expect("reader"), &mut sink).map(|_| ())
         };
 
-        let bound = hwalk::glob_entry_hashout("pkg/a.go", &content);
+        let bound = hwalk::fs_entry_hashout("pkg/a.go", &content);
         read("pkg/a.go", &bound).expect("unmodified glob entry verifies");
         read("pkg/b.go", &bound).expect_err("bound to another path must not verify");
 
