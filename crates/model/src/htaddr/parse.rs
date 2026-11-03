@@ -43,6 +43,9 @@ fn bare_value(i: &str) -> R<'_, &str> {
     take_till1(|c: char| matches!(c, ',' | ' ' | '|' | '"')).parse(i)
 }
 
+/// No escapes: a value ends at the next `"`. `filter_bracket` in
+/// `crates/plugin/src/driver.rs` relies on this to find a filter suffix; an
+/// escape added here must be added there too.
 fn quoted_value(i: &str) -> R<'_, &str> {
     delimited(nchar('"'), take_till(|c| c == '"'), nchar('"')).parse(i)
 }

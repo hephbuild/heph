@@ -94,3 +94,32 @@ That has two consequences:
 A private module is fetched twice on a cold build: `go list` fetches it into your own
 module cache, and `go.download` fetches it again into heph's. Warm builds fetch
 nothing.
+
+## What re-runs `_golist`
+
+`go list` reads a package's `.go` files whole, but of every other file it reads at
+most a name and a leading comment block. `_golist`'s key follows that, so editing a
+non-Go file's bytes (an embedded asset, a README, a `testdata` file, the body of a
+`.c`) no longer re-runs it. Adding, removing or renaming a non-Go file still does.
+
+Non-Go files reach `_golist` in one of two lanes:
+
+- **Header-read files** are the package's own-directory files ending in `.c .cc .cxx
+  .cpp .m .h .hh .hpp .hxx .f .F .for .f90 .s .S .sx .swig .swigcxx` whose name
+  doesn't start with `_` or `.`. `go list` reads their build constraints, so they're
+  staged whole, and the key covers each file's name and header (everything up to
+  the first line of code) through `//@heph/go/headers/<pkg>:headers`. That target
+  is cached locally only. Editing a `//go:build` line re-runs `_golist`, and
+  editing the code below it doesn't.
+- **Everything else** in the package's subtree is staged as an empty placeholder
+  and keyed on its path alone.
+
+Two cases keep hashing content:
+
+- **A vendored module** (one with `vendor/modules.txt`) keeps every non-Go file
+  content-hashed, because `go list` reads `vendor/modules.txt`.
+- **The codegen lanes** (files produced by another target) stay content-hashed.
+
+The names lane is an fs glob with `m=names`. You can name one in a BUILD file by
+its raw addr, but it's only valid for a consumer that reads nothing but names: the
+placeholders are empty and their bytes aren't part of any key.

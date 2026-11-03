@@ -88,7 +88,11 @@ fn split_filters(rest: &str) -> Vec<String> {
 /// Byte offset of the `[` that opens a trailing filter suffix: the last `[`
 /// outside a quoted arg value. A quoted value may hold a `[` of its own — an fs
 /// glob's character class, `e="[!_.]*.c"` — and that one is part of the addr.
-/// Addr quoting has no escapes (`htaddr::parse`), so a `"` always toggles.
+/// A `"` always toggles because addr quoting has no escapes: the addr parser's
+/// `quoted_value` (`crates/model/src/htaddr/parse.rs`) ends a value at the next
+/// `"`, whatever precedes it. If that parser ever learns an escape (`\"`), this
+/// scan must learn the same one, or a filter suffix after an escaped quote is
+/// read as part of the addr.
 fn filter_bracket(v: &str) -> Option<usize> {
     let mut quoted = false;
     let mut last = None;
