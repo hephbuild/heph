@@ -43,6 +43,9 @@ pub(crate) const DRIVER_LINT_GATE: &str = "go.lint_gate";
 pub(crate) const DRIVER_FORMAT: &str = "go.format";
 /// `format-check`.
 pub(crate) const DRIVER_FORMAT_CHECK: &str = "go.format_check";
+/// The provider-owned header target `_golist` hashes its C/asm files through
+/// (never listed: see `nongo_lanes::headers_addr`).
+pub(crate) const DRIVER_HEADERS: &str = "go.headers";
 
 pub(crate) fn owned(labels: &[&str]) -> Vec<String> {
     labels.iter().map(|l| (*l).to_string()).collect()
