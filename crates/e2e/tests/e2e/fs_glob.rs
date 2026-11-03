@@ -237,7 +237,7 @@ target(
     driver = "bash",
     deps = {{"a": ["{a}"], "b": ["{b}"]}},
     out = "out.txt",
-    run = 'cat pkg/src/a.txt > $OUT',
+    run = 'cat $SRC_A > $OUT',
 )
 "#
         )
