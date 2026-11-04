@@ -1245,7 +1245,16 @@ pub const REDACT_MIN_LEN: usize = 8;
 /// never hashed.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct Resources(std::collections::BTreeMap<crate::provider::PoolName, u64>);
+pub struct Resources {
+    declared: std::collections::BTreeMap<crate::provider::PoolName, u64>,
+    /// What an undeclared `cpu` costs, when the driver lowered it
+    /// ([`with_default_cpu`](Self::with_default_cpu)); `None` is
+    /// [`DEFAULT_CPU_MICROS`](Self::DEFAULT_CPU_MICROS). Not a declaration:
+    /// not serialised, never hashed, and an `Option` so the most numerous defs
+    /// (`fs`, `group`) carry no map node for it.
+    #[serde(skip)]
+    default_cpu: Option<u64>,
+}
 
 /// `2^53`: an `f64` holds every integer up to here exactly, and none above it
 /// reliably. `starlark_to_rust` turns an int that does not fit an `i32`
@@ -1323,7 +1332,10 @@ impl Resources {
             .with_context(|| format!("in `resources.{pool}`"))?;
             out.insert(pool, amount);
         }
-        Ok(Self(out))
+        Ok(Self {
+            declared: out,
+            default_cpu: None,
+        })
     }
 
     /// Build from wire pairs (`pb::TargetDef.resources`), checking every name
@@ -1343,58 +1355,71 @@ impl Resources {
         pool: crate::provider::PoolName,
         amount: u64,
     ) -> anyhow::Result<Option<u64>> {
-        if self.0.len() >= Self::MAX_POOLS && !self.0.contains_key(&pool) {
+        if self.declared.len() >= Self::MAX_POOLS && !self.declared.contains_key(&pool) {
             anyhow::bail!(
                 "cannot declare pool {pool}: a target names at most {} pools",
                 Self::MAX_POOLS
             );
         }
-        Ok(self.0.insert(pool, amount))
+        Ok(self.declared.insert(pool, amount))
     }
 
-    /// `self`, with `cpu` set to `micros` when the target declared no `cpu`.
-    /// Every other declared pool is kept.
+    /// `self`, with an undeclared `cpu` costing `micros` instead of
+    /// [`DEFAULT_CPU_MICROS`](Self::DEFAULT_CPU_MICROS). A declared `cpu`
+    /// still wins. Allocates nothing and declares nothing: `is_empty` and
+    /// `iter` are unchanged, and the def serialises as before.
     ///
     /// For a driver whose targets cost less than the engine's default (`fs`
-    /// and `group`). A declaration that already names
-    /// [`MAX_POOLS`](Self::MAX_POOLS) other pools has no room for `cpu` and
-    /// keeps the engine's default.
+    /// and `group`). Across the plugin ABI it has no field of its own, so the
+    /// encoder sends it as a declared `cpu` (see `plugin-abi`'s
+    /// `target_def_to_pb`): a cdylib driver that sets it gets the same
+    /// admission, at the cost of the def then showing a declaration.
     pub fn with_default_cpu(mut self, micros: u64) -> Self {
-        if self.declared(crate::provider::PoolName::CPU).is_none() && self.len() < Self::MAX_POOLS {
-            self.0.insert(crate::provider::PoolName::cpu(), micros);
-        }
+        self.default_cpu = Some(micros);
         self
+    }
+
+    /// What an undeclared `cpu` costs this target: the driver's
+    /// [`with_default_cpu`](Self::with_default_cpu), else
+    /// [`DEFAULT_CPU_MICROS`](Self::DEFAULT_CPU_MICROS).
+    pub fn default_cpu(&self) -> u64 {
+        self.default_cpu.unwrap_or(Self::DEFAULT_CPU_MICROS)
+    }
+
+    /// The driver-lowered default, `None` when the engine's applies.
+    pub fn lowered_default_cpu(&self) -> Option<u64> {
+        self.default_cpu
     }
 
     /// Whether nothing was declared (the target reserves the defaults).
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.declared.is_empty()
     }
 
     /// How many pools were declared.
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.declared.len()
     }
 
     /// The declared amount of `pool`, `None` when undeclared.
     pub fn declared(&self, pool: &str) -> Option<u64> {
-        self.0.get(pool).copied()
+        self.declared.get(pool).copied()
     }
 
     /// What the target reserves from `pool`: the declared amount, else the
-    /// default — [`DEFAULT_CPU_MICROS`](Self::DEFAULT_CPU_MICROS) for `cpu`,
-    /// 0 for every other pool.
+    /// default — [`default_cpu`](Self::default_cpu) for `cpu`, 0 for every
+    /// other pool.
     pub fn amount(&self, pool: &str) -> u64 {
         match self.declared(pool) {
             Some(n) => n,
-            None if pool == crate::provider::PoolName::CPU => Self::DEFAULT_CPU_MICROS,
+            None if pool == crate::provider::PoolName::CPU => self.default_cpu(),
             None => 0,
         }
     }
 
     /// The declared pools, in name order.
     pub fn iter(&self) -> impl Iterator<Item = (&crate::provider::PoolName, u64)> {
-        self.0.iter().map(|(k, v)| (k, *v))
+        self.declared.iter().map(|(k, v)| (k, *v))
     }
 }
 
@@ -1629,6 +1654,23 @@ mod resources_tests {
         assert_eq!(r.amount("cpu"), Resources::DEFAULT_CPU_MICROS);
         assert_eq!(r.amount("memory"), 0);
         assert_eq!(r.amount("docker"), 0);
+    }
+
+    /// A lowered default changes what an undeclared `cpu` costs and nothing
+    /// else: still empty, still serialised as `{}`, and a declaration wins.
+    #[test]
+    fn a_lowered_default_cpu_is_not_a_declaration() {
+        let r = Resources::default().with_default_cpu(Resources::VIEW_CPU_MICROS);
+        assert!(r.is_empty());
+        assert_eq!(r.declared("cpu"), None);
+        assert_eq!(r.amount("cpu"), Resources::VIEW_CPU_MICROS);
+        assert_eq!(r.amount("memory"), 0);
+        assert_eq!(serde_json::to_string(&r).unwrap(), "{}");
+
+        let declared = res(Value::Map([("cpu".to_string(), Value::Int(2))].into()))
+            .unwrap()
+            .with_default_cpu(Resources::VIEW_CPU_MICROS);
+        assert_eq!(declared.amount("cpu"), 2 * Resources::MICROS_PER_CPU);
     }
 
     #[test]

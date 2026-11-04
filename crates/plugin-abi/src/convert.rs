@@ -1352,6 +1352,23 @@ pub fn credential_mount_from_pb(
     })
 }
 
+/// The declared pools, plus a driver-lowered `cpu` default
+/// ([`Resources::with_default_cpu`]) as a declared `cpu`: the wire has no field
+/// for the default, and dropping it would admit the target at one CPU. A
+/// declaration already at [`Resources::MAX_POOLS`] has no room for it and
+/// keeps the engine's default, since the decoder refuses a 17th pool.
+fn resources_to_pb(r: &Resources) -> buffa::__private::HashMap<String, u64> {
+    let lowered = (r.declared(hplugin::provider::PoolName::CPU).is_none()
+        && r.len() < Resources::MAX_POOLS)
+        .then(|| r.lowered_default_cpu())
+        .flatten()
+        .map(|n| (hplugin::provider::PoolName::CPU.to_owned(), n));
+    r.iter()
+        .map(|(pool, n)| (pool.to_string(), n))
+        .chain(lowered)
+        .collect()
+}
+
 pub fn target_def_to_pb(td: &TargetDef) -> anyhow::Result<pb::TargetDef> {
     Ok(pb::TargetDef {
         addr: addr_to_pb(&td.addr).into(),
@@ -1365,11 +1382,7 @@ pub fn target_def_to_pb(td: &TargetDef) -> anyhow::Result<pb::TargetDef> {
         hash: Some(td.hash.clone()),
         transparent: Some(td.transparent),
         entrypoint: td.entrypoint.as_ref().map(entrypoint_to_pb).into(),
-        resources: td
-            .resources
-            .iter()
-            .map(|(pool, n)| (pool.to_string(), n))
-            .collect(),
+        resources: resources_to_pb(&td.resources),
         ..Default::default()
     })
 }
@@ -3305,6 +3318,31 @@ nested: { a: 1, b: [x, y] }
             format!("{err:#}").contains("TargetDef.resources"),
             "{err:#}"
         );
+    }
+
+    /// A cdylib `fs`-like driver's lowered default is not lost at the seam: it
+    /// arrives as a declared `cpu`, so the host admits it at the same cost.
+    #[test]
+    fn lowered_default_cpu_crosses_as_a_declaration() {
+        let mut td = full_target_def();
+        td.resources = Resources::default().with_default_cpu(Resources::VIEW_CPU_MICROS);
+        assert!(td.resources.is_empty());
+        let back =
+            target_def_from_pb(via_bytes(&target_def_to_pb(&td).expect("encode"))).expect("decode");
+        assert_eq!(
+            back.resources.declared("cpu"),
+            Some(Resources::VIEW_CPU_MICROS)
+        );
+
+        // A declared `cpu` wins over the default on the wire too.
+        let mut declared = Resources::default();
+        declared
+            .insert(hplugin::provider::PoolName::cpu(), 3)
+            .unwrap();
+        td.resources = declared.with_default_cpu(Resources::VIEW_CPU_MICROS);
+        let back =
+            target_def_from_pb(via_bytes(&target_def_to_pb(&td).expect("encode"))).expect("decode");
+        assert_eq!(back.resources.declared("cpu"), Some(3));
     }
 
     #[test]

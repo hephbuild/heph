@@ -1678,14 +1678,15 @@ mod tests {
         };
         let plain = parse(None).await;
         assert_eq!(
-            plain.resources.declared("cpu"),
-            Some(hplugin::driver::Resources::VIEW_CPU_MICROS)
+            plain.resources.amount("cpu"),
+            hplugin::driver::Resources::VIEW_CPU_MICROS
         );
+        assert!(plain.resources.is_empty(), "the default is no declaration");
         let gpu_only = parse(Some(Value::Map(
             [("gpu".to_string(), Value::Int(1))].into(),
         )))
         .await;
-        assert_eq!(gpu_only.resources.declared("cpu"), Some(10));
+        assert_eq!(gpu_only.resources.amount("cpu"), 10);
         assert_eq!(gpu_only.resources.declared("gpu"), Some(1));
         let heavy = parse(Some(Value::Map(
             [("cpu".to_string(), Value::Int(2))].into(),

@@ -73,7 +73,9 @@ struct GroupSpec {
     /// emitted paths to destinations.
     rename: Rename,
     /// What the target reserves from the resource pools while it runs, e.g.
-    /// `{"cpu": 2}`. Defaults to 0.00001 cpu. Never hashed.
+    /// `{"cpu": 2}`. Defaults to 0.00001 cpu. Never hashed. Only a group that
+    /// executes (a relocating one) reserves it: an aggregate group is spliced
+    /// into its consumers and never reaches admission.
     resources: hplugin::driver::Resources,
 }
 
@@ -577,9 +579,10 @@ mod tests {
     async fn resources_default_light_and_declared_unhashed() {
         let plain = parse_group(&[]).await;
         assert_eq!(
-            plain.resources.declared("cpu"),
-            Some(hplugin::driver::Resources::VIEW_CPU_MICROS)
+            plain.resources.amount("cpu"),
+            hplugin::driver::Resources::VIEW_CPU_MICROS
         );
+        assert!(plain.resources.is_empty(), "the default is no declaration");
         let declared = parse_group(&[(
             "resources",
             Value::Map([("cpu".to_string(), Value::Int(0))].into()),

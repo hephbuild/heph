@@ -1082,16 +1082,22 @@ fn signed(n: i64) -> String {
 fn render_pools(p: &crate::engine::resource_pool::ResourceSnapshot, now: Instant) -> String {
     use hcore::events::display_amount;
     let mut out = String::new();
-    for (label, lane) in [("pools", &p.main), ("light", &p.light)] {
+    // The light lane's one pool is shown as `slots` under a `zero-cost` label:
+    // its internal name is `light`, which a user may also give a pool of their
+    // own, and the two must not read the same.
+    for (label, lane, light) in [("pools", &p.main, false), ("zero-cost", &p.light, true)] {
         // The light lane is noise while nothing uses it.
-        if label == "light" && lane.queued == 0 && lane.pools.iter().all(|s| s.held == 0) {
+        if light && lane.queued == 0 && lane.pools.iter().all(|s| s.held == 0) {
             continue;
+        }
+        fn shown(light: bool, name: &hplugin::provider::PoolName) -> &str {
+            if light { "slots" } else { name.as_str() }
         }
         let held: Vec<String> = lane
             .pools
             .iter()
             .map(|s| {
-                let pool = s.pool.as_str();
+                let pool = shown(light, &s.pool);
                 format!(
                     "{pool} {}/{}",
                     display_amount(pool, s.held),
@@ -1109,7 +1115,7 @@ fn render_pools(p: &crate::engine::resource_pool::ResourceSnapshot, now: Instant
                 .unmet
                 .iter()
                 .map(|n| {
-                    let pool = n.pool.as_str();
+                    let pool = shown(light, &n.pool);
                     format!(
                         "{pool} {} ({} free)",
                         display_amount(pool, n.need),
@@ -1639,6 +1645,28 @@ mod tests {
             text,
             "  pools        cpu 6/8, memory 2.0 GiB/16.0 GiB; 7 queued\n  \
              head         waits for cpu 4 (2 free) for 41s\n",
+        );
+
+        // A busy light lane beside a user pool that is also named `light`:
+        // the lane reads as `zero-cost`/`slots`, the user's pool as itself.
+        let mut snap = snap;
+        snap.main.pools.push(PoolSnapshot {
+            pool: name("light"),
+            capacity: 2,
+            free: 1,
+            held: 1,
+        });
+        snap.light.pools[0].held = 64;
+        snap.light.pools[0].free = 0;
+        snap.light.queued = 3;
+        let text = render_pools(&snap, now);
+        assert!(
+            text.contains("memory 2.0 GiB/16.0 GiB, light 1/2; 7 queued"),
+            "{text}"
+        );
+        assert!(
+            text.contains("  zero-cost    slots 64/64; 3 queued\n"),
+            "{text}"
         );
     }
 

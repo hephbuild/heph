@@ -81,7 +81,9 @@ pub enum AcquireError {
     Closed,
 }
 
-/// The name of the light lane's one pool.
+/// The name of the light lane's one pool. A user may name a pool `light` too:
+/// the lane is a separate [`Lane`], so the two never share a grant, and the
+/// in-flight report shows this one as `zero-cost`/`slots`.
 const LIGHT: &str = "light";
 
 /// Admits targets against per-pool capacities. See the module docs.
@@ -170,7 +172,7 @@ impl ResourcePool {
         let default_cpu = request
             .declared(PoolName::CPU)
             .is_none()
-            .then_some((&lane.cpu_name, Resources::DEFAULT_CPU_MICROS));
+            .then(|| (&lane.cpu_name, request.default_cpu()));
         let mut need = Vec::with_capacity(request.len().saturating_add(1));
         let mut clamped = false;
         for (pool, amount) in request.iter().chain(default_cpu) {
@@ -241,8 +243,9 @@ pub struct EnginePools {
 impl EnginePools {
     pub fn new(specs: BTreeMap<PoolName, hcore::capacity::Capacity>, parallelism: usize) -> Self {
         let cpu = resolve_capacities(&specs, parallelism, || 0)
-            .first()
-            .map_or(0, |&(_, c)| c);
+            .into_iter()
+            .find_map(|(p, c)| (p.as_str() == PoolName::CPU).then_some(c))
+            .unwrap_or(0);
         Self {
             specs,
             parallelism,
@@ -590,17 +593,21 @@ impl Future for Acquire {
     type Output = Result<Reservation, AcquireError>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match &mut self.state {
-            AcquireState::Ready(r) => Poll::Ready(r.take().ok_or(AcquireError::Closed)),
+        let res = match &mut self.state {
+            AcquireState::Ready(r) => return Poll::Ready(r.take().ok_or(AcquireError::Closed)),
             AcquireState::Waiting { guard, rx } => match Pin::new(rx).poll(cx) {
-                Poll::Pending => Poll::Pending,
+                Poll::Pending => return Poll::Pending,
                 Poll::Ready(res) => {
                     // Granted (or the sender is gone): nothing left to remove.
                     guard.armed = false;
-                    Poll::Ready(res.map_err(|_closed| AcquireError::Closed))
+                    res.map_err(|_closed| AcquireError::Closed)
                 }
             },
-        }
+        };
+        // Fused: a completed receiver must not be polled again (it panics), so
+        // a poll after this one answers `Closed` from `Ready(None)`.
+        self.state = AcquireState::Ready(None);
+        Poll::Ready(res)
     }
 }
 
@@ -793,10 +800,46 @@ mod tests {
     fn fractional_requests_pack_into_the_pool() {
         let p = pool(&[("cpu", CPU)]);
         let quarter = req(&[("cpu", CPU / 4)]);
-        let four: Vec<_> = (0..4).map(|_| now(&p, &quarter)).collect();
+        let mut four: Vec<_> = (0..4).map(|_| now(&p, &quarter)).collect();
         let mut fifth = queued(&p, &quarter);
-        drop(four.into_iter().next());
-        assert!(granted(&mut fifth).is_some());
+        drop(four.pop());
+        assert_eq!(four.len(), 3, "exactly one released");
+        let _fifth = granted(&mut fifth).expect("one release admits the fifth");
+        assert_eq!(free(&p, "cpu"), 0, "three held plus the fifth");
+    }
+
+    /// A queued `Acquire` polled again after its grant answers `Closed`
+    /// rather than polling a spent receiver (which panics).
+    #[test]
+    fn a_resolved_acquire_is_fused() {
+        let p = pool(&[("cpu", CPU)]);
+        let held = now(&p, &req(&[]));
+        let mut waiting = queued(&p, &req(&[]));
+        drop(held);
+        let grant = granted(&mut waiting).expect("granted on release");
+        assert!(matches!(
+            (&mut waiting).now_or_never(),
+            Some(Err(AcquireError::Closed))
+        ));
+        drop(grant);
+        assert_eq!(free(&p, "cpu"), CPU);
+    }
+
+    /// The light lane is bounded at its capacity: `cap` grants are taken at
+    /// once, the next waits, and one release admits it.
+    #[test]
+    fn the_light_lane_queues_past_its_capacity() {
+        let p = pool(&[("cpu", CPU)]);
+        let cap = p.light_capacity();
+        assert_eq!(cap, 64, "max(8 × 1, 64)");
+        let zero = req(&[("cpu", 0)]);
+        let mut held: Vec<_> = (0..cap).map(|_| now(&p, &zero)).collect();
+        assert!(held.iter().all(Reservation::is_light));
+        let mut next = queued(&p, &zero);
+        assert_eq!(p.snapshot().light.queued, 1);
+        drop(held.pop());
+        assert!(granted(&mut next).unwrap().is_light());
+        assert_eq!(free(&p, "cpu"), CPU, "the light lane never touches cpu");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -815,7 +858,14 @@ mod tests {
                 assert_eq!(r.amount("cpu"), 0);
                 let n = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                 peak.fetch_max(n, Ordering::SeqCst);
-                tokio::task::yield_now().await;
+                // Hold the grant until the lane fills, so the bound is
+                // reached rather than merely not exceeded (bounded wait).
+                for _ in 0..1_000 {
+                    if peak.load(Ordering::SeqCst) >= usize::try_from(cap).unwrap() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
                 in_flight.fetch_sub(1, Ordering::SeqCst);
                 drop(r);
             });
@@ -828,7 +878,7 @@ mod tests {
         .await
         .expect("light waiters starved");
         let peak = u64::try_from(peak.load(Ordering::SeqCst)).unwrap();
-        assert!(peak <= cap, "peak {peak} over the light capacity {cap}");
+        assert_eq!(peak, cap, "the lane filled exactly to its capacity");
         assert_eq!(free(&p, "cpu"), CPU, "the light lane never touches cpu");
         assert_eq!(p.snapshot().light.pools[0].free, cap);
     }
@@ -1174,7 +1224,7 @@ mod tests {
     }
 
     /// D3: a def that says nothing reserves 1 cpu (exec, template), except
-    /// `fs` and `group`, which put 10 micro-CPUs on their defs.
+    /// `fs` and `group`, which lower their default to 10 micro-CPUs.
     #[tokio::test]
     async fn a_def_without_resources_costs_one_cpu() {
         let p = pool(&[("cpu", 4 * CPU)]);
