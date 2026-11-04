@@ -863,6 +863,140 @@ mod tests {
         }
     }
 
+    const EMBED_HEAD: &str = "package p\nimport \"embed\"\n";
+
+    /// Rune literals end where `go/scanner` ends them, so a quote or backslash
+    /// inside one does not swallow the directive after it.
+    #[test]
+    fn rune_literals_do_not_hide_a_directive() {
+        for rune in ["'\"'", "'\\\\'", "'\\x41'", "'\\''", "'ሴ'", "'\\u1234'"] {
+            let src = format!("{EMBED_HEAD}var r = {rune}\n//go:embed x\nvar s string\n");
+            assert_eq!(
+                embeds(src.as_bytes()),
+                vec![(4, 1, "//go:embed x".to_string())],
+                "{rune}"
+            );
+        }
+    }
+
+    /// A block comment ends at its first `*/` (no nesting): the line comment
+    /// after it is a real directive.
+    #[test]
+    fn block_comments_do_not_nest() {
+        let src = format!("{EMBED_HEAD}/* /* */ //go:embed x\nvar s string\n");
+        assert_eq!(
+            embeds(src.as_bytes()),
+            vec![(3, 10, "//go:embed x".to_string())]
+        );
+    }
+
+    /// A literal or block comment left open at EOF ends the scan: no panic, and
+    /// the directive inside it is not one.
+    #[test]
+    fn unterminated_tokens_at_eof() {
+        for tail in [
+            "var s = \"abc //go:embed x",
+            "var s = `abc\n//go:embed x\n",
+            // After a decl: right after the imports the import reader would
+            // read it as header space, and hit EOF in it (a syntax error).
+            "var x int\n/* //go:embed x\n",
+            "var r = '\\",
+            "var s = \"\\x",
+            "var x = 1 /",
+        ] {
+            let src = format!("{EMBED_HEAD}{tail}");
+            assert_eq!(embeds(src.as_bytes()), vec![], "{tail:?}");
+        }
+    }
+
+    /// The header keeps the BOM, the positions do not count it (`readGoInfo`
+    /// scans the buffer after it).
+    #[test]
+    fn bom_with_embed() {
+        let src = format!("\u{feff}{EMBED_FILE}");
+        let v = view(src.as_bytes());
+        let hlen = u64::from_le_bytes(v[1..9].try_into().unwrap()) as usize;
+        assert!(
+            v[9..9 + hlen].starts_with(b"\xef\xbb\xbfpackage p"),
+            "{v:?}"
+        );
+        assert_eq!(
+            embeds(src.as_bytes()),
+            vec![(5, 1, "//go:embed a.txt".to_string())]
+        );
+    }
+
+    /// A NUL past the imports of an embed-importing file is an illegal
+    /// character to `go/scanner`, which scans on: a directive after it counts.
+    #[test]
+    fn nul_in_the_body_of_an_embed_file() {
+        let src = format!("{EMBED_HEAD}var x = 1\0\n//go:embed x\nvar s string\n");
+        assert_eq!(
+            embeds(src.as_bytes()),
+            vec![(4, 1, "//go:embed x".to_string())]
+        );
+    }
+
+    /// A UTF-16 BOM is no package clause: a header syntax error, the whole file.
+    #[test]
+    fn utf16_bom_is_a_header_syntax_error() {
+        for bom in [&b"\xff\xfe"[..], b"\xfe\xff"] {
+            let mut src = bom.to_vec();
+            src.extend_from_slice(EMBED_FILE.as_bytes());
+            assert_eq!(view(&src), header(b'W', &src));
+        }
+    }
+
+    /// An unterminated block comment in the header is a syntax error: the whole
+    /// file, so a body edit then moves the view (go/parser reads it all).
+    #[test]
+    fn unterminated_block_comment_in_the_header_takes_the_whole_file() {
+        let src = b"package p\n/* never closed\nfunc f() {}\n";
+        assert_eq!(view(src), header(b'W', src));
+    }
+
+    /// Columns are bytes, as in `token.Position`: a directive after non-ASCII on
+    /// its line sits at its byte offset.
+    #[test]
+    fn columns_count_bytes() {
+        let line = "var s = \"é\" //go:embed x";
+        let src = format!("{EMBED_HEAD}{line}\n");
+        let col = line.find("//go:embed").unwrap() + 1;
+        assert_eq!(col, 14, "é is two bytes");
+        assert_eq!(
+            embeds(src.as_bytes()),
+            vec![(3, col, "//go:embed x".to_string())]
+        );
+    }
+
+    /// CRLF: a `\r` is a byte of the line, not a line break; the comment keeps
+    /// its raw bytes.
+    #[test]
+    fn crlf_positions() {
+        let src = "package p\r\nimport \"embed\"\r\n\r\n  //go:embed a\r\nvar f embed.FS\r\n";
+        assert_eq!(
+            embeds(src.as_bytes()),
+            vec![(4, 3, "//go:embed a\r".to_string())]
+        );
+    }
+
+    /// Large files: an embed file's directive past many chunks is found with its
+    /// line; a header syntax error takes every byte.
+    #[test]
+    fn large_embed_and_whole_files() {
+        let filler = "func f() { _ = \"//go:embed nope\" }\n".repeat(30_000);
+        let src = format!("{EMBED_FILE}{filler}//go:embed late\nvar t string\n");
+        let e = embeds(src.as_bytes());
+        assert_eq!(
+            e.last(),
+            Some(&(7 + 30_000, 1, "//go:embed late".to_string()))
+        );
+        assert_eq!(e.len(), 2);
+
+        let src = format!("package p\nimport fmt\n{filler}");
+        assert_eq!(view(src.as_bytes()), header(b'W', src.as_bytes()));
+    }
+
     /// Without an embed import, only the header (plus one chunk) is read of a
     /// large file.
     #[test]

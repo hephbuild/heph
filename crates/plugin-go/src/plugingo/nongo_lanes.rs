@@ -613,6 +613,50 @@ mod tests {
         assert!(headers_codegen_args(&bad).is_err());
     }
 
+    fn headers_with_deps_arg(raw: &str) -> Addr {
+        Addr::new(
+            PkgBuf::from("@heph/go/headers/pkg"),
+            HEADERS_NAME.to_string(),
+            std::collections::BTreeMap::from([(GEN_DEPS_ARG.to_string(), raw.to_string())]),
+        )
+    }
+
+    /// A `gen_deps` that does not decode fails loudly, naming the consuming
+    /// package rather than the hex: odd length, a non-hex digit, and bytes that
+    /// are not UTF-8 once decoded.
+    #[test]
+    fn malformed_gen_deps_fail_naming_the_package() {
+        for (what, raw, want) in [
+            ("odd length", "abc", "is not hex"),
+            ("non-hex digit", "zz", "is not hex"),
+            ("not UTF-8", "ff00", "is not UTF-8"),
+        ] {
+            let err = headers_codegen_args(&headers_with_deps_arg(raw)).expect_err(what);
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("the header target of //pkg") && msg.contains(want),
+                "{what}: {msg}"
+            );
+        }
+    }
+
+    /// An error names a header target with its codegen config decoded; an addr
+    /// whose args do not decode is shown as it is.
+    #[test]
+    fn describe_headers_addr_decodes_the_args() {
+        let deps = vec!["//gen:a".to_string(), "//gen:b".to_string()];
+        assert_eq!(
+            describe_headers_addr(&headers_addr("pkg", Some("app"), &deps)),
+            "the header target of //pkg, go_codegen_root //app, go_codegen_deps [//gen:a, //gen:b]"
+        );
+        assert_eq!(
+            describe_headers_addr(&headers_addr("pkg", None, &[])),
+            "the header target of //pkg"
+        );
+        let bad = headers_with_deps_arg("zz");
+        assert_eq!(describe_headers_addr(&bad), bad.format());
+    }
+
     /// B2: the header target's input is the exact glob addr `_golist` stages
     /// unhashed — one string, so one walk and one memoized artifact.
     #[test]

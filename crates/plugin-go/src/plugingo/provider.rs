@@ -8707,6 +8707,34 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         }
     }
 
+    /// A header addr whose args do not decode is an error from `get`, not a
+    /// header target answered with fewer inputs than `_golist` stages.
+    #[tokio::test]
+    async fn header_get_with_malformed_args_fails_loudly() {
+        let sandbox = tempfile::tempdir().expect("tempdir");
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
+        for (k, v) in [
+            (nongo_lanes::GEN_DEPS_ARG, "zz"),
+            (nongo_lanes::GEN_DEPS_ARG, "ff00"),
+            ("v", "host"),
+        ] {
+            let addr = Addr::new(
+                PkgBuf::from("@heph/go/headers/pkg"),
+                nongo_lanes::HEADERS_NAME.to_string(),
+                std::collections::BTreeMap::from([(k.to_string(), v.to_string())]),
+            );
+            let err = provider_get(&p, addr)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{k}={v} must fail"));
+            let GetError::Other(err) = err else {
+                panic!("{k}={v}: not an Other error: {err:?}");
+            };
+            let msg = format!("{err:#}");
+            assert!(msg.contains("the header target of //pkg"), "{k}={v}: {msg}");
+        }
+    }
+
     /// The header target hashes exactly the codegen addrs `_golist` stages
     /// unhashed: the codegen config `_golist` read from its states reaches the
     /// header target through the addr, and the two lists agree.
