@@ -34,7 +34,7 @@ use xxhash_rust::xxh3::Xxh3Default;
 /// compile or cgo run such as `-export` or `-compiled`, or anything parsing past
 /// the imports) makes that an under-hash: re-check the rule in `go_view`'s docs
 /// first.
-const GOLIST_JSON_FIELDS: &str = "-json=Dir,ImportPath,Name,GoFiles,SFiles,HFiles,TestGoFiles,XTestGoFiles,EmbedPatterns,EmbedFiles,TestEmbedPatterns,TestEmbedFiles,XTestEmbedPatterns,XTestEmbedFiles,Imports,TestImports,XTestImports,Standard,Module,Match,Incomplete,Error";
+pub const GOLIST_JSON_FIELDS: &str = "-json=Dir,ImportPath,Name,GoFiles,SFiles,HFiles,TestGoFiles,XTestGoFiles,EmbedPatterns,EmbedFiles,TestEmbedPatterns,TestEmbedFiles,XTestEmbedPatterns,XTestEmbedFiles,Imports,TestImports,XTestImports,Standard,Module,Match,Incomplete,Error";
 
 pub struct GoGolistDriver {
     /// Default exec runner for this driver's tool, from the plugin's `runner:`

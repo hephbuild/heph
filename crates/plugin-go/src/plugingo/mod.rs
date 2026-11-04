@@ -32,7 +32,9 @@ mod variant;
 pub use driver_compile::GoCompileDriver;
 pub use driver_download::GoDownloadDriver;
 pub use driver_format::{GoFormatCheckDriver, GoFormatDriver};
-pub use driver_golist::GoGolistDriver;
+// `GOLIST_JSON_FIELDS` is public for the plugingo-e2e differential that runs
+// `go list` exactly as `_golist` does.
+pub use driver_golist::{GOLIST_JSON_FIELDS, GoGolistDriver};
 // `extract_go_build_header` is public for the plugingo-e2e differential test,
 // which holds it to the real `go/build` on every supported Go.
 pub use driver_headers::{GoHeadersDriver, extract_go_build_header};

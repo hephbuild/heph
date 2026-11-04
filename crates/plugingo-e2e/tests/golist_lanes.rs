@@ -1062,6 +1062,123 @@ async fn t19_body_mutations_leave_go_list_byte_identical() -> anyhow::Result<()>
     Ok(())
 }
 
+/// The entry of a `go list -json` stream whose `ImportPath` is `import_path`,
+/// verbatim — what `_golist` keeps of it (it drops the synthetic `-test`
+/// variants: `p.test`, `p [p.test]`, `p_test [p.test]`).
+fn golist_entry(stream: &[u8], import_path: &str) -> anyhow::Result<String> {
+    let text = std::str::from_utf8(stream)?;
+    let want = format!("\t\"ImportPath\": \"{import_path}\",");
+    let mut found = Vec::new();
+    let mut cur = String::new();
+    for line in text.split_inclusive('\n') {
+        cur.push_str(line);
+        if line == "}\n" {
+            if cur.lines().any(|l| l == want) {
+                found.push(std::mem::take(&mut cur));
+            }
+            cur.clear();
+        }
+    }
+    anyhow::ensure!(found.len() == 1, "{import_path}: {found:?} in {text}");
+    Ok(found.remove(0))
+}
+
+/// G14: the `.go` analogue of T19. For each body mutation that would mean
+/// something to the parser, cgo, the constraint parser or embed, `go list` run
+/// as `_golist` runs it (its fields, `-e -test`) reports a byte-identical entry
+/// for the package, under both `CGO_ENABLED` values and on every Go the suite
+/// pins — and the extract does not move. Through heph, `_golist` stays a hit.
+///
+/// The synthetic `p.test` entry is not held to this, and it does change: `-test`
+/// parses the `_test.go` files whole to find the test functions, so a syntax
+/// error in a test body shows up in its `Error`. `_golist` never keeps it.
+#[tokio::test]
+async fn g14_go_body_mutations_leave_go_list_byte_identical() -> anyhow::Result<()> {
+    require_go!();
+    const IMPORT_PATH: &str = "example.com/lanes/lib";
+    let dir = lib_pkg()?;
+    let ws = make_workspace(dir)?;
+    let (before, _) = golist(&ws, "lib").await?;
+
+    let list = |toolchain: Option<&str>, cgo: &str| -> anyhow::Result<String> {
+        let out = go_cmd(toolchain)
+            .args([
+                "list",
+                plugingo::GOLIST_JSON_FIELDS,
+                "-e",
+                "-test",
+                IMPORT_PATH,
+            ])
+            .env("CGO_ENABLED", cgo)
+            .current_dir(ws.dir.path())
+            .output()
+            .context("go list")?;
+        anyhow::ensure!(
+            out.status.success(),
+            "go list ({toolchain:?}, CGO_ENABLED={cgo}): {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        golist_entry(&out.stdout, IMPORT_PATH)
+    };
+    let mut lists = Vec::new();
+    for toolchain in go_toolchains() {
+        for cgo in ["0", "1"] {
+            lists.push((toolchain.clone(), cgo, list(toolchain.as_deref(), cgo)?));
+        }
+    }
+
+    let mutations: &[(&str, &str, &str)] = &[
+        (
+            "a syntax error in a _test.go body",
+            "lib/lib_test.go",
+            "\nfunc broken( {\n",
+        ),
+        ("a late import \"C\"", "lib/lib.go", "\nimport \"C\"\n"),
+        ("a late //go:build", "lib/lib.go", "\n//go:build ignore\n"),
+        (
+            "//go:embed without an embed import",
+            "lib/lib.go",
+            "\n//go:embed nothere\nvar s string\n",
+        ),
+    ];
+    let base = |rel: &str| {
+        if rel.ends_with("_test.go") {
+            LIB_TEST_GO
+        } else {
+            LIB_GO
+        }
+    };
+    for (what, rel, tail) in mutations {
+        let mutated = format!("{}{tail}", base(rel));
+        assert_eq!(
+            plugingo::extract_go_view(base(rel).as_bytes())?,
+            plugingo::extract_go_view(mutated.as_bytes())?,
+            "{what}: the extract must not move"
+        );
+        write(ws.dir.path(), rel, &mutated)?;
+        for (toolchain, cgo, want) in &lists {
+            let got = list(toolchain.as_deref(), cgo)?;
+            assert!(
+                got == *want,
+                "{what} ({toolchain:?}, CGO_ENABLED={cgo}): go list changed:\n\
+                 before: {want}\nafter: {got}"
+            );
+        }
+        write(ws.dir.path(), rel, base(rel))?;
+    }
+
+    for (_, rel, tail) in mutations {
+        let cur = std::fs::read_to_string(ws.dir.path().join(rel))?;
+        write(ws.dir.path(), rel, &format!("{cur}{tail}"))?;
+    }
+    let ws = reopen(ws)?;
+    let (after, ev) = golist(&ws, "lib").await?;
+    ev.assert_executed("@heph/go/headers/lib", "headers", "every body changed");
+    ev.assert_hit("lib", "_golist", "no view changed");
+    assert_eq!(pkg_error(&after), pkg_error(&before));
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // G1–G6: `.go` files reach `_golist` through their go/build view
 // ---------------------------------------------------------------------------
