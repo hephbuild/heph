@@ -1600,8 +1600,7 @@ impl Allotment {
     /// to names that are no pool — `r`'s own text, untouched.
     ///
     /// The one resolver, for every site that substitutes one (the host's own
-    /// config pass, the managed layer's `${src:}` pass, and
-    /// [`RunRequest::resolve`] for a transitive value). A run that was told no
+    /// config pass and the managed layer's `${src:}` pass). A run that was told no
     /// allotment at all is an error, which only a heph bug produces.
     pub fn reference(
         allotment: Option<&Self>,
@@ -2307,18 +2306,10 @@ impl<'a, 'io> RunRequest<'a, 'io> {
     ///
     /// A field with no reference in it resolves to its own text, so a driver never
     /// branches on whether the author used one.
-    ///
-    /// A field the host has no entry for but whose only heph references are
-    /// `${resource:…}` is substituted here, from [`allotment`](Self::allotment):
-    /// that is a transitive `env` value a dependency handed down, which the
-    /// host's walk over the target's *own* config never saw. It needs no edge
-    /// and no producer, so nothing is lost by finishing it this late, and it is
-    /// resolved with the allotment of the run that reads it — the dependent's.
     pub fn resolve<'r, 'd: 'r>(
         &'r self,
         d: &'d Deferred<String>,
     ) -> anyhow::Result<std::borrow::Cow<'r, str>> {
-        use hcore::template::RESOURCE_KIND;
         match self.deferred.get(d.raw()) {
             Some(DeferredValue::Ready(v)) => return Ok(std::borrow::Cow::Borrowed(v)),
             // Only reachable if a request skipped the managed-driver layer that
@@ -2340,13 +2331,6 @@ impl<'a, 'io> RunRequest<'a, 'io> {
         // construct passes straight through, because heph does not own them and a
         // deferrable field must still accept a command that uses one.
         if hcore::template::has_deferred_ref(d.raw()) {
-            if hcore::template::only_resource_refs(d.raw()) {
-                let allotment = self.allotment.as_ref();
-                return hcore::template::substitute(d.raw(), &[RESOURCE_KIND], |r| {
-                    Allotment::reference(allotment, r, &self.target.addr)
-                })
-                .map(std::borrow::Cow::Owned);
-            }
             anyhow::bail!(
                 "the host did not resolve {:?} — a deferred field's value is filled in before the \
                  run, so this is a bug in heph rather than in the BUILD file",
@@ -2438,50 +2422,6 @@ mod resolve_tests {
             .resolve(&Deferred::new("${read://a:b}"))
             .expect_err("must not be swallowed");
         assert!(format!("{err:#}").contains("did not resolve"), "{err:#}");
-    }
-
-    /// A transitive value the host never saw: a resource-only field is
-    /// finished from the request's own allotment; a `read` beside it is still
-    /// the host's.
-    #[test]
-    fn resolve_finishes_a_resource_only_field_from_the_allotment() {
-        let (id, t) = ("r".to_string(), target());
-        let mut r = req(&id, &t, BTreeMap::new());
-        r.allotment = Some(Allotment::new([("cpu".to_string(), "3".to_string())]));
-        assert_eq!(
-            r.resolve(&Deferred::new("-j${resource:cpu} ${FOO:-d}"))
-                .expect("resolved"),
-            "-j3 ${FOO:-d}"
-        );
-        // A pool the run was granted none of is left as written.
-        assert_eq!(
-            r.resolve(&Deferred::new("${resource:memory}"))
-                .expect("passes through"),
-            "${resource:memory}"
-        );
-        let err = r
-            .resolve(&Deferred::new("${resource:cpu} ${read://a:b}"))
-            .expect_err("mixed is the host's");
-        assert!(format!("{err:#}").contains("did not resolve"), "{err:#}");
-
-        r.allotment = Some(Allotment::new([
-            ("cpu".to_string(), "1".to_string()),
-            ("memory".to_string(), "1024".to_string()),
-            ("gpu".to_string(), "2".to_string()),
-        ]));
-        assert_eq!(
-            r.resolve(&Deferred::new(
-                "${resource:cpu}:${resource:memory}:${resource:gpu}"
-            ))
-            .expect("all"),
-            "1:1024:2"
-        );
-
-        r.allotment = None;
-        let err = r
-            .resolve(&Deferred::new("${resource:cpu}"))
-            .expect_err("no allotment");
-        assert!(format!("{err:#}").contains("told none"), "{err:#}");
     }
 }
 

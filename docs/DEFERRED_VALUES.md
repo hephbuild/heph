@@ -134,15 +134,14 @@ there is nothing to remember there either.
 |---|---|---|---|
 | `${read://pkg:name}` | contents of the producer's single output, surrounding whitespace trimmed | `(hashed, not staged)` | no |
 | `${src://pkg:name}` | the sandbox path of the producer's single file | `(hashed, staged)` | **no** |
-| `${resource:<pool>}` — any configured pool; in any deferrable field or a transitive `env` | this run's allotment of the pool, rendered by its unit: `cpu` whole CPUs rounded up, `bytes` and `count` the integer | none | **yes** — resolved with the dependent's allotment |
+| `${resource:<pool>}` — any configured pool; in any deferrable field | this run's allotment of the pool, rendered by its unit: `cpu` whole CPUs rounded up, `bytes` and `count` the integer | none | **no** |
 
 **`${resource:…}` names no target**, so it has no `//`, adds no edge and never
 reaches `hashin`: the def hash covers the reference text, and an artifact built
-under `-j 8` serves a run under `-j 1`. It is substituted at run — by the host
-for a target's own `env` / `runtime_env` (in one pass with any `${read:}` or
-`${src:}` beside it), and by `RunRequest::resolve` for a transitive `env` value
-a dependency handed down, which is the one place a reference may ride
-`transitive`. It is the only way a target learns its allotment: heph exports
+under `-j 8` serves a run under `-j 1`. It is substituted at run by the host,
+for a target's own config (in one pass with any `${read:}` or `${src:}` beside
+it). Like the other kinds it may not ride `transitive`: a dependency's
+transitive `env` takes no reference. It is the only way a target learns its allotment: heph exports
 nothing of it to the environment. A target whose outputs then depend on the
 number is not reproducible, and saying so with `cache = False` is the author's.
 
@@ -151,8 +150,7 @@ heph claims a `${resource:<arg>}` whose argument is pool-shaped
 names a configured pool the target reserves: `${resource:cpus}` (no such pool)
 is an error with a did-you-mean and the `--resource cpus=<n>` route, and
 `${resource:memory}` with no `memory` in its `resources` (or with
-`memory: 0`) is an error naming the fix. A dependency's transitive `env` is
-held to the dependent's reservation by the same check. Only an argument that
+`memory: 0`) is an error naming the fix. Only an argument that
 is not pool-shaped — `${resource:CPU}`, `${resource:-x}`, `${resource:2}` —
 is left as written, like every construct heph does not own; so are
 `${resources:cpu}` and a bare `${resource}`. Bash's `${resource:offset}` is
@@ -413,8 +411,9 @@ stays out of the def hash as before, but its reference is the same hashed edge a
 anywhere else, so a runtime-only variable fed by `${read:}` still moves the key
 when the producer's content does — "runtime only" describes the literal, not a
 computed value. An `env` handed down through a dep's `transitive` is never
-resolved (the walk covers the target's own config), so a reference there is
-refused at `apply_transitive`.
+resolved (the walk covers the target's own config), so a reference of any kind
+there — `${read:}`, `${src:}` or `${resource:}` — is refused at
+`apply_transitive`, naming ``transitive `env.<name>` ``.
 
 **Does not ship yet:** `heph.core.read()` as a Starlark function, which is
 discoverability rather than capability; `inspect deps` "via" lines and

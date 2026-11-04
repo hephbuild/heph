@@ -2558,8 +2558,8 @@ impl Engine {
     /// included.
     ///
     /// `refs` are `(path, text)` pairs: the config's references
-    /// ([`deferred_refs`](Self::deferred_refs)) and the transitive env values
-    /// a dependency hands down, empty for almost every target.
+    /// ([`deferred_refs`](Self::deferred_refs)). A dependency's transitive env
+    /// takes no reference at all; the driver refuses one in `apply_transitive`.
     pub(crate) fn validate_resource_refs<'a>(
         &self,
         addr: &Addr,
@@ -2568,8 +2568,7 @@ impl Engine {
     ) -> anyhow::Result<()> {
         for (path, raw) in refs {
             // Already tokenized once by the collector; a parse failure here
-            // cannot happen for a config ref, and a transitive value that
-            // does not tokenize is no reference (`has_deferred_ref`).
+            // cannot happen for a config ref.
             let Ok(pieces) = hcore::template::parse(raw) else {
                 continue;
             };
@@ -4643,30 +4642,6 @@ impl Engine {
                 .map(|r| (r.path.as_str(), r.raw.as_str())),
             &def.demand,
         )?;
-        // A dependency's transitive `env` is finished at run from *this*
-        // target's allotment, so it is held to this target's reservation too.
-        // The host's config walk never sees it; the merged sandbox does.
-        if let Some(sb) = &all_transitive {
-            let mut refs: Vec<(String, &str)> = sb
-                .env
-                .iter()
-                .filter_map(|(name, e)| match &e.value {
-                    hplugin::driver::sandbox::EnvValue::Literal(v)
-                        if hcore::template::has_deferred_ref(v) =>
-                    {
-                        Some((format!("transitive env.{name}"), v.as_str()))
-                    }
-                    _ => None,
-                })
-                .collect();
-            // The env is a map: sort so the first refusal is deterministic.
-            refs.sort_unstable();
-            self.validate_resource_refs(
-                addr,
-                refs.iter().map(|(p, v)| (p.as_str(), *v)),
-                &def.demand,
-            )?;
-        }
 
         Ok(Arc::new(ExtendedTargetDef {
             target_def: Arc::new(def),

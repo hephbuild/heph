@@ -1338,34 +1338,53 @@ async fn reference_in_env_is_hashed_as_text_and_expanded_at_run() -> anyhow::Res
     write_build(
         ws.path(),
         "p",
-        r#"target(name = "t", driver = "bash", run = "echo $MAKEFLAGS > $OUT", out = "t.txt", env = {"MAKEFLAGS": "-j${resource:cpu}"}, resources = {"cpu": 3})"#,
+        r#"target(name = "t", driver = "bash", run = "echo $MAKEFLAGS/$RT > $OUT", out = "t.txt", env = {"MAKEFLAGS": "-j${resource:cpu}"}, runtime_env = {"RT": "rt${resource:cpu}"}, resources = {"cpu": 3})"#,
     );
     let four = engine(ws.path(), caps(&[("cpu", 4 * MICROS)]))?;
-    assert_eq!(output(&four, "//p:t").await?, "-j3");
+    assert_eq!(output(&four, "//p:t").await?, "-j3/rt3");
     let one = engine(ws.path(), caps(&[("cpu", MICROS)]))?;
     assert_eq!(hashin(&four, "//p:t").await?, hashin(&one, "//p:t").await?);
     Ok(())
 }
 
-/// A dependency's transitive `env` may carry the reference too, and it is
-/// resolved with the *dependent's* allotment, not the dependency's.
+/// A dependency's transitive `env` takes no deferred reference of any kind —
+/// `${resource:}` included: it is the dependent's link error, naming the
+/// variable, never text that reaches the process.
 #[tokio::test]
-async fn reference_in_transitive_env_reaches_dependents() -> anyhow::Result<()> {
+async fn deferred_reference_in_transitive_env_is_refused() -> anyhow::Result<()> {
     let ws = tempfile::tempdir()?;
     write_build(
         ws.path(),
         "p",
         r#"
-target(name = "tool", driver = "bash", run = "echo x > $OUT", out = "tool.txt",
+target(name = "src", driver = "bash", run = "echo x > $OUT", out = "s.txt")
+target(name = "res", driver = "bash", run = "echo x > $OUT", out = "r.txt",
        transitive = {"env": {"MAKEFLAGS": "-j${resource:cpu}"}})
-target(name = "c", driver = "bash", run = "echo $MAKEFLAGS > $OUT", out = "c.txt",
-       deps = ["//p:tool"], resources = {"cpu": 2})
+target(name = "rd", driver = "bash", run = "echo x > $OUT", out = "rd.txt",
+       transitive = {"env": {"R": "${read://p:src}"}})
+target(name = "sr", driver = "bash", run = "echo x > $OUT", out = "sr.txt",
+       transitive = {"env": {"S": "${src://p:src}"}})
+target(name = "c_res", driver = "bash", run = "echo x > $OUT", out = "c1.txt",
+       deps = ["//p:res"], resources = {"cpu": 2})
+target(name = "c_rd", driver = "bash", run = "echo x > $OUT", out = "c2.txt", deps = ["//p:rd"])
+target(name = "c_sr", driver = "bash", run = "echo x > $OUT", out = "c3.txt", deps = ["//p:sr"])
 "#,
     );
-    let four = engine(ws.path(), caps(&[("cpu", 4 * MICROS)]))?;
-    assert_eq!(output(&four, "//p:c").await?, "-j2");
-    let one = engine(ws.path(), caps(&[("cpu", MICROS)]))?;
-    assert_eq!(hashin(&four, "//p:c").await?, hashin(&one, "//p:c").await?);
+    let engine = engine(ws.path(), caps(&[("cpu", 4 * MICROS)]))?;
+    for (addr, name, reference) in [
+        ("//p:c_res", "MAKEFLAGS", "${resource:cpu}"),
+        ("//p:c_rd", "R", "${read://p:src}"),
+        ("//p:c_sr", "S", "${src://p:src}"),
+    ] {
+        assert_has(
+            &link_error(&engine, addr).await?,
+            &[
+                &format!("transitive `env.{name}`"),
+                reference,
+                "does not accept one",
+            ],
+        );
+    }
     Ok(())
 }
 
@@ -1385,45 +1404,6 @@ async fn non_pool_shaped_resource_reference_passes_through() -> anyhow::Result<(
         output(&engine, "//p:t").await?,
         "${resource:CPU} ${resource:-x} ${resource:1gpu} 2"
     );
-    Ok(())
-}
-
-/// A dependency's transitive `env` is finished from the *dependent's*
-/// allotment, so it is held to the dependent's reservation at link: a pool
-/// the dependent does not reserve, or one that is not configured, is the
-/// dependent's link error, never literal text at run.
-#[tokio::test]
-async fn transitive_env_reference_is_held_to_the_dependents_reservation() -> anyhow::Result<()> {
-    let ws = tempfile::tempdir()?;
-    write_build(
-        ws.path(),
-        "p",
-        r#"
-target(name = "tool", driver = "bash", run = "echo x > $OUT", out = "tool.txt",
-       transitive = {"env": {"G": "${resource:gpu}"}})
-target(name = "typo", driver = "bash", run = "echo x > $OUT", out = "typo.txt",
-       transitive = {"env": {"G": "${resource:gpus}"}})
-target(name = "bare", driver = "bash", run = "echo $G > $OUT", out = "b.txt", deps = ["//p:tool"])
-target(name = "held", driver = "bash", run = "echo $G > $OUT", out = "h.txt", deps = ["//p:tool"],
-       resources = {"gpu": 1})
-target(name = "typoed", driver = "bash", run = "echo $G > $OUT", out = "t.txt", deps = ["//p:typo"],
-       resources = {"gpu": 1})
-"#,
-    );
-    let engine = engine(ws.path(), caps(&[("cpu", 4 * MICROS), ("gpu", 2)]))?;
-    assert_has(
-        &link_error(&engine, "//p:bare").await?,
-        &["//p:bare", "transitive env.G", "reserves no gpu"],
-    );
-    assert_has(
-        &link_error(&engine, "//p:typoed").await?,
-        &[
-            "//p:typoed",
-            "transitive env.G",
-            "gpus is not a pool (did you mean gpu?)",
-        ],
-    );
-    assert_eq!(output(&engine, "//p:held").await?, "1");
     Ok(())
 }
 

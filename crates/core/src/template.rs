@@ -159,30 +159,6 @@ pub fn has_deferred_ref(s: &str) -> bool {
     })
 }
 
-/// Whether `s` carries a reference heph owns and every one of them is a
-/// `${resource:…}` — the one kind that needs no edge, and so can be finished at
-/// run from the run's allotment wherever the text came from.
-pub fn only_resource_refs(s: &str) -> bool {
-    if !has_ref(s) {
-        return false;
-    }
-    let Ok(pieces) = parse(s) else {
-        return false;
-    };
-    let mut any = false;
-    for p in &pieces {
-        if let Piece::Ref(r) = p
-            && claims(r.kind, r.arg, DEFERRED_KINDS)
-        {
-            if r.kind != Some(RESOURCE_KIND) {
-                return false;
-            }
-            any = true;
-        }
-    }
-    any
-}
-
 /// The first reference heph owns in `s`, if any.
 pub fn first_deferred_ref(s: &str) -> Option<Ref<'_>> {
     first_ref_of(s, DEFERRED_KINDS)
@@ -514,7 +490,6 @@ mod tests {
         // Claimed: an exact name.
         assert_eq!(first("${resource:cpu}").as_deref(), Some("${resource:cpu}"));
         assert!(has_deferred_ref("${resource:memory}"));
-        assert!(only_resource_refs("-j${resource:cpu}"));
         // Any pool name is claimed, a custom one or one no engine knows.
         assert!(has_deferred_ref("${resource:gpu}"));
         assert!(has_deferred_ref("${resource:cpus}"));
@@ -536,7 +511,6 @@ mod tests {
             "$${resource:cpu}",
         ] {
             assert!(!has_deferred_ref(other), "{other}");
-            assert!(!only_resource_refs(other), "{other}");
             let mixed = format!("{other} ${{resource:cpu}}");
             let out = substitute(&mixed, &[RESOURCE_KIND], |_| Ok("3".to_string())).unwrap();
             assert_eq!(out, format!("{other} 3"), "{mixed}");

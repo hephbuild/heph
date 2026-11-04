@@ -195,12 +195,14 @@ target(
 
 It is substituted at run with the pool's granted amount, rendered by its
 unit: `cpu` in whole CPUs rounded up and at least 1 (a `cpu: 0.5` or `cpu: 0`
-target is told 1), `bytes` and `count` as the integer. A transitive `env`
-value resolves with the *dependent's* allotment. The def hash covers the
+target is told 1), `bytes` and `count` as the integer. The def hash covers the
 reference text, so the mapping never moves a key.
 
-- **Any deferrable field takes one**: `env`, `runtime_env`, a transitive
-  `env`, a `run` line, a `template` var, an `oci` push `dest`. Outside `env`
+- **Any deferrable field takes one**: `env`, `runtime_env`, a `run` line, a
+  `template` var, an `oci` push `dest`. A dependency's transitive `env` takes
+  none: `transitive = {"env": {"MAKEFLAGS": "-j${resource:cpu}"}}` is the
+  dependent's link error (``transitive `env.MAKEFLAGS` ``), like a `${read:}`
+  or `${src:}` there. Outside `env`
   the number can end up in an output, and then that output is per-machine
   (a `template` rendering `${resource:cpu}` writes a different file on an
   8-core and a 16-core host, with the same cache key). That is the author's
@@ -222,9 +224,7 @@ reference text, so the mapping never moves a key.
   //p:t: `env.X` reads ${resource:cpus}, but cpus is not a pool (did you mean cpu?): add resources: {cpus: <n>} to .hephconfig, or --resource cpus=<n> for one run (known: cpu, memory)
   ```
 
-  Pool-shaped is the pool-name grammar, `[a-z][a-z0-9_]{0,63}`. The same two
-  checks hold a dependency's transitive `env` to the dependent's reservation,
-  over the merged sandbox env.
+  Pool-shaped is the pool-name grammar, `[a-z][a-z0-9_]{0,63}`.
 - **Only text that is not pool-shaped passes through untouched**, like any
   `${…}` heph does not own: `${resource:CPU}`, `${resource:-x}`,
   `${resource:2}`. Bash's substring form with a lowercase variable
