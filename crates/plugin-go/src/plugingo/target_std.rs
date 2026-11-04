@@ -175,9 +175,19 @@ pub fn install_spec(
     }
 }
 
+/// Dep group (and `read_only_deps` entry) of a std `build_lib`'s `install` dep.
+pub const STD_INSTALL_DEP_GROUP: &str = "install";
+
 /// Build the `@heph/go/std/<import>:build_lib` target: extract a single
 /// precompiled archive from the `install` output. Mirrors `v1`'s `stdLibBuild` —
-/// pure `mv`, no Go invocation, so it carries no SDK dep.
+/// a single file copy, no Go invocation, so it carries no SDK dep.
+///
+/// The `install` dep is the whole `pkg/<os>_<arch>/` tree (~200 MB) and each
+/// `build_lib` reads one archive of it, so it is staged read-only: materialized
+/// once in the shared stage and linked into every sandbox, instead of unpacked
+/// in full per sandbox. The archive is therefore `cp`'d, not `mv`'d — a move
+/// would act on the stage (or a link into it), and the output must be a
+/// regular file the target owns.
 pub fn build_spec(
     addr: Addr,
     import_path: &str,
@@ -189,12 +199,12 @@ pub fn build_spec(
 
     let run = vec![
         // The install target's `pkg` output is staged at this stable path.
-        format!("mv \"$WORKSPACE_ROOT/{STD_PKG}/{subdir}/{import_path}.a\" \"{out_file}\""),
+        format!("cp \"$WORKSPACE_ROOT/{STD_PKG}/{subdir}/{import_path}.a\" \"{out_file}\""),
     ];
 
     let mut deps: HashMap<String, Value> = HashMap::new();
     deps.insert(
-        "install".to_string(),
+        STD_INSTALL_DEP_GROUP.to_string(),
         Value::List(vec![Value::String(format!(
             "{}|pkg",
             install_addr(vref).format()
@@ -204,6 +214,10 @@ pub fn build_spec(
     let mut config: HashMap<String, Value> = HashMap::new();
     config.insert("run".to_string(), to_run_value(run));
     config.insert("deps".to_string(), Value::Map(deps));
+    config.insert(
+        "read_only_deps".to_string(),
+        Value::List(vec![Value::String(STD_INSTALL_DEP_GROUP.to_string())]),
+    );
     config.insert(
         "out".to_string(),
         Value::Map(HashMap::from([(
@@ -386,9 +400,37 @@ mod tests {
         let run = run_str(&spec);
         assert!(
             run.contains("@heph/go/std/goroot/pkg/linux_amd64/fmt.a"),
-            "build_lib must mv the archive from the install output: {run}"
+            "build_lib must copy the archive from the install output: {run}"
         );
         assert_eq!(spec.driver, "bash");
+    }
+
+    /// The `install` dep is the whole ~200 MB `pkg/<os>_<arch>/` tree. Unpacked
+    /// per sandbox, a dozen concurrent `build_lib`s held ~5.5 GB; staged
+    /// read-only it is materialized once and linked in. A read-only stage
+    /// cannot be moved out of, so the archive must be copied.
+    #[test]
+    fn test_build_lib_stages_install_read_only_and_copies_out_of_it() {
+        let spec = build_spec(build_lib_addr(), "fmt", &test_factors(), &test_vref());
+        let read_only = match spec.config.get("read_only_deps") {
+            Some(Value::List(v)) => v,
+            other => panic!("build_lib must set read_only_deps: {other:?}"),
+        };
+        assert!(
+            read_only
+                .iter()
+                .any(|v| matches!(v, Value::String(s) if s == STD_INSTALL_DEP_GROUP)),
+            "the install dep must be read-only: {read_only:?}"
+        );
+        let run = run_str(&spec);
+        assert!(
+            run.lines().all(|l| !l.trim_start().starts_with("mv ")),
+            "build_lib must not mv out of the read-only install stage: {run}"
+        );
+        assert!(
+            run.trim_start().starts_with("cp "),
+            "build_lib copies the archive into its own output: {run}"
+        );
     }
 
     #[test]
@@ -410,7 +452,7 @@ mod tests {
 
     #[test]
     fn test_build_lib_carries_no_sdk_dep() {
-        // build_lib is a pure mv; pulling the whole SDK in would be wasteful.
+        // build_lib is a pure copy; pulling the whole SDK in would be wasteful.
         let spec = build_spec(build_lib_addr(), "fmt", &test_factors(), &test_vref());
         let deps = match spec.config.get("deps").unwrap() {
             Value::Map(m) => m,
