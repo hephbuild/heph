@@ -1352,27 +1352,37 @@ pub fn credential_mount_from_pb(
     })
 }
 
-/// The declared pools as written, plus a driver-lowered `cpu` default
-/// ([`Resources::with_default_cpu`]) as a declared `cpu` in the `cpu` unit's
-/// exact text: the wire has no field for the default, and dropping it would
-/// admit the target at one CPU. A declaration already at
-/// [`Resources::MAX_POOLS`] has no room for it and keeps the engine's default,
-/// since the decoder refuses a 17th pool.
+/// The declared pools as written. Empty for nearly every def, which costs
+/// nothing on the wire.
 fn resources_to_pb(r: &Resources) -> buffa::__private::HashMap<String, String> {
-    let lowered = (r.declared(hplugin::provider::PoolName::CPU).is_none()
-        && r.len() < Resources::MAX_POOLS)
-        .then(|| r.lowered_default_cpu())
-        .flatten()
-        .map(|n| {
-            (
-                hplugin::provider::PoolName::CPU.to_owned(),
-                hcore::capacity::Unit::Cpu.canonical(n),
-            )
-        });
     r.iter()
         .map(|(pool, n)| (pool.to_string(), n.to_owned()))
-        .chain(lowered)
         .collect()
+}
+
+/// A driver-lowered `cpu` default ([`Resources::with_default_cpu`]) in the
+/// `cpu` unit's exact text, `None` when the engine's applies. Sent beside the
+/// declarations, never as one: a declared `cpu` would cost an IO driver's
+/// def the empty fast path and show in `inspect def` as written by nobody.
+fn default_cpu_to_pb(r: &Resources) -> Option<String> {
+    r.lowered_default_cpu()
+        .map(|n| hcore::capacity::Unit::Cpu.canonical(n))
+}
+
+/// The decoded declarations with the wire's lowered default, if any.
+fn resources_from_pb(
+    declared: buffa::__private::HashMap<String, String>,
+    default_cpu: Option<String>,
+) -> anyhow::Result<Resources> {
+    let r = Resources::try_from_pairs(declared).context("decoding TargetDef.resources")?;
+    Ok(match default_cpu {
+        None => r,
+        Some(text) => r.with_default_cpu(
+            hcore::capacity::Unit::Cpu
+                .parse(&text)
+                .context("decoding TargetDef.default_cpu")?,
+        ),
+    })
 }
 
 pub fn target_def_to_pb(td: &TargetDef) -> anyhow::Result<pb::TargetDef> {
@@ -1389,6 +1399,7 @@ pub fn target_def_to_pb(td: &TargetDef) -> anyhow::Result<pb::TargetDef> {
         transparent: Some(td.transparent),
         entrypoint: td.entrypoint.as_ref().map(entrypoint_to_pb).into(),
         resources: resources_to_pb(&td.resources),
+        default_cpu: default_cpu_to_pb(&td.resources),
         ..Default::default()
     })
 }
@@ -1774,8 +1785,7 @@ pub fn target_def_from_pb(td: pb::TargetDef) -> anyhow::Result<TargetDef> {
                 .transpose()?,
             // Absent — what every plugin before 0.17.4 sends — is empty: the
             // def says nothing and reserves the defaults.
-            resources: Resources::try_from_pairs(td.resources)
-                .context("decoding TargetDef.resources")?,
+            resources: resources_from_pb(td.resources, td.default_cpu)?,
             // The engine parses `resources` into this when it links the def.
             demand: Default::default(),
             addr: addr.clone(),
@@ -3337,25 +3347,32 @@ nested: { a: 1, b: [x, y] }
         );
     }
 
-    /// A cdylib `fs`-like driver's lowered default is not lost at the seam: it
-    /// arrives as a declared `cpu`, so the host admits it at the same cost.
+    /// A cdylib `fs`-like driver's lowered default is not lost at the seam,
+    /// and is not turned into a declaration: it rides `default_cpu`, so the
+    /// host's def keeps an empty `resources` (the fast path, and nothing
+    /// phantom in `inspect def`) and admits it at the same cost.
     #[test]
-    fn lowered_default_cpu_crosses_as_a_declaration() {
+    fn lowered_default_cpu_crosses_beside_the_declarations() {
         let mut td = full_target_def();
-        td.resources = Resources::default().with_default_cpu(Resources::VIEW_CPU_MICROS);
-        assert!(td.resources.is_empty());
-        let back =
-            target_def_from_pb(via_bytes(&target_def_to_pb(&td).expect("encode"))).expect("decode");
-        // Written exactly in the `cpu` unit, so the host parses it back to
-        // the same micro-CPUs.
-        assert_eq!(back.resources.declared("cpu"), Some("0.00001"));
-        let unit = |_: &str| Some(hcore::capacity::Unit::Cpu);
+        for micros in [Resources::VIEW_CPU_MICROS, Resources::IO_CPU_MICROS] {
+            td.resources = Resources::default().with_default_cpu(micros);
+            let wire = target_def_to_pb(&td).expect("encode");
+            assert!(wire.resources.is_empty(), "no declared cpu on the wire");
+            let back = target_def_from_pb(via_bytes(&wire)).expect("decode");
+            assert!(back.resources.is_empty(), "nothing declared");
+            assert_eq!(back.resources.lowered_default_cpu(), Some(micros));
+        }
         assert_eq!(
-            back.resources.parse(unit).expect("parse").amount("cpu"),
-            Resources::VIEW_CPU_MICROS
+            target_def_to_pb(&td)
+                .expect("encode")
+                .default_cpu
+                .as_deref(),
+            Some("0.1"),
+            "written exactly in the `cpu` unit"
         );
 
-        // A declared `cpu` wins over the default on the wire too.
+        // The default rides beside a declaration that leaves `cpu` out, and
+        // a declared `cpu` still wins at admission.
         let mut declared = Resources::default();
         declared
             .insert(hplugin::provider::PoolName::cpu(), "3".to_owned())
@@ -3364,6 +3381,26 @@ nested: { a: 1, b: [x, y] }
         let back =
             target_def_from_pb(via_bytes(&target_def_to_pb(&td).expect("encode"))).expect("decode");
         assert_eq!(back.resources.declared("cpu"), Some("3"));
+        let unit = |_: &str| Some(hcore::capacity::Unit::Cpu);
+        assert_eq!(
+            back.resources.parse(unit).expect("parse").amount("cpu"),
+            3 * Resources::MICROS_PER_CPU
+        );
+
+        // No lowered default, no field.
+        td.resources = Resources::default();
+        assert_eq!(target_def_to_pb(&td).expect("encode").default_cpu, None);
+
+        // A malformed default is refused, naming the field.
+        let mut wire = full_target_def_pb();
+        wire.default_cpu = Some("lots".to_owned());
+        let err = target_def_from_pb(via_bytes(&wire))
+            .err()
+            .expect("bad default is refused");
+        assert!(
+            format!("{err:#}").contains("TargetDef.default_cpu"),
+            "{err:#}"
+        );
     }
 
     #[test]

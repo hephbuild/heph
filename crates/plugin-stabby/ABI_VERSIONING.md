@@ -230,7 +230,9 @@ skipped in silence.
 - **0.17.4** (additive patch) — target resources. `TargetDef.resources` (12,
   `map<string, string>`): the pools a def reserves, each amount as written in
   its pool's unit (only declared pools present, empty means one cpu).
-  `ManagedRunRequest.allotment` (15, `map<string, string>`): each pool the host
+  `TargetDef.default_cpu` (13, `string`, explicit presence): what an undeclared `cpu`
+  costs when the driver lowered it (`"0.1"`, `"0.00001"`), never a
+  declaration; absent means one cpu. `ManagedRunRequest.allotment` (15, `map<string, string>`): each pool the host
   granted, rendered by its unit, which `${resource:<pool>}` substitutes; absent
   means "told nothing". A 0.17.3 plugin's defs reserve one cpu and it ignores the
   allotment; a 0.17.4 plugin on a 0.17.3 host loses its `resources` at decode and

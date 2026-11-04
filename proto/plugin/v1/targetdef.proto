@@ -115,6 +115,12 @@ message TargetDef {
   // present; empty and absent are the same and mean "the def says nothing"
   // (one cpu). Never hashed.
   map<string, string> resources = 12;
+  // What an undeclared `cpu` costs, when the driver lowered it below one CPU
+  // (since 0.17.4): the `cpu` unit's exact text (`"0.1"`, `"0.00001"`). Not a
+  // declaration, so it never appears in `resources` and a def that declares
+  // nothing keeps an empty map. Absent means the host's default (one cpu);
+  // ignored when `resources` declares `cpu`. Never hashed.
+  string default_cpu = 13;
 }
 
 // Where an entrypoint runs. Mirrors driver::targetdef::Workdir.

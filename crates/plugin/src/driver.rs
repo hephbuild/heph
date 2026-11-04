@@ -1402,10 +1402,10 @@ impl Resources {
     /// `iter` are unchanged, and the def serialises as before.
     ///
     /// For a driver whose targets cost less than the engine's default (`fs`
-    /// and `group`). Across the plugin ABI it has no field of its own, so the
-    /// encoder sends it as a declared `cpu` (see `plugin-abi`'s
-    /// `target_def_to_pb`): a cdylib driver that sets it gets the same
-    /// admission, at the cost of the def then showing a declaration.
+    /// and `group`, and the IO-bound drivers). Across the plugin ABI it rides
+    /// `TargetDef.default_cpu`, beside the declarations and never as one, so
+    /// a cdylib driver that sets it gets the same admission and an empty
+    /// `resources` on the host.
     pub fn with_default_cpu(mut self, micros: u64) -> Self {
         self.default_cpu = Some(micros);
         self
