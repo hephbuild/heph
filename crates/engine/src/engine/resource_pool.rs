@@ -186,13 +186,23 @@ impl ResourcePool {
     /// sent but never observed.
     pub fn acquire(self: &Arc<Self>, request: &Demand) -> Result<Acquire, AcquireError> {
         let (need, clamped) = self.resolve(request)?;
-        let lane = if need.is_empty() {
-            &self.light
-        } else {
-            &self.main
-        };
-        let need = if need.is_empty() { vec![(0, 1)] } else { need };
-        Ok(lane.enqueue(need.into_boxed_slice(), clamped))
+        let bounded = need
+            .iter()
+            .any(|&(idx, _)| matches!(self.main.capacity.get(idx), Some(Limit::Bounded(_))));
+        if bounded {
+            return Ok(self.main.enqueue(need.into_boxed_slice(), clamped));
+        }
+        // Nothing on a bounded pool: the light lane bounds how many run, and
+        // any unbounded amounts ride along, counted as held in the main lane
+        // from the grant (they always fit, so they never wait there).
+        let mut acquire = self.light.enqueue(Box::new([(0, 1)]), clamped);
+        if !need.is_empty() {
+            acquire.riding = Some(Riding {
+                lane: Arc::clone(&self.main),
+                granted: need.into_boxed_slice(),
+            });
+        }
+        Ok(acquire)
     }
 
     /// Per pool held/free/capacity, queue lengths, and what the head of each
@@ -350,6 +360,32 @@ impl EnginePools {
         all.into_iter()
     }
 
+    /// The pool whose name is nearest `name` by edit distance, when it is
+    /// near enough to be a typo (at most 2 edits, and fewer than `name` has
+    /// bytes), for a "did you mean" hint. Ties go to the first in name order.
+    pub fn closest(&self, name: &str) -> Option<&str> {
+        self.names()
+            .map(|p| (strsim::levenshtein(name, p), p))
+            .filter(|(d, _)| *d <= 2 && *d < name.len())
+            .min_by_key(|(d, _)| *d)
+            .map(|(_, p)| p)
+    }
+
+    /// The error tail for a pool that is not configured: a "did you mean"
+    /// when one is near, then how to declare it (`declare`, the
+    /// `.hephconfig` entry) and the one-off route, then the known pools.
+    pub fn unknown_hint(&self, name: &str, declare: &str) -> String {
+        let near = self
+            .closest(name)
+            .map(|p| format!(" (did you mean {p}?)"))
+            .unwrap_or_default();
+        format!(
+            "{name} is not a pool{near}: add resources: {{{name}: {declare}}} to .hephconfig, or \
+             --resource {name}=<n> for one run (known: {})",
+            self.names().collect::<Vec<_>>().join(", ")
+        )
+    }
+
     /// The pool, built (and the host memory read) on the first call.
     pub fn get(&self) -> &Arc<ResourcePool> {
         self.pool.get_or_init(|| {
@@ -443,7 +479,9 @@ impl Lane {
                     granted: need,
                     clamped,
                     armed: true,
+                    riding: None,
                 })),
+                riding: None,
             };
         }
         let seq = st.next_seq;
@@ -471,6 +509,7 @@ impl Lane {
                 },
                 rx,
             },
+            riding: None,
         }
     }
 
@@ -489,17 +528,18 @@ impl Lane {
                 granted: waiter.need,
                 clamped: waiter.clamped,
                 armed: true,
+                riding: None,
             };
             if let Err(mut unobserved) = waiter.tx.send(reservation) {
                 unobserved.armed = false;
-                give(&mut st.held, &unobserved.granted);
+                give(&self.capacity, &mut st.held, &unobserved.granted);
             }
         }
     }
 
     fn release(self: &Arc<Self>, granted: &[(usize, u64)]) {
         let mut st = self.state.lock();
-        give(&mut st.held, granted);
+        give(&self.capacity, &mut st.held, granted);
         self.grant_chain(&mut st);
     }
 
@@ -590,15 +630,33 @@ fn take(held: &mut [u64], need: &[(usize, u64)]) {
     }
 }
 
-/// Return a grant, never below nothing held.
-fn give(held: &mut [u64], granted: &[(usize, u64)]) {
+/// Return a grant, never below nothing held. An unbounded pool's held count
+/// saturates in [`take`], so releasing below 0 there is expected after a
+/// saturation and not reported.
+fn give(capacity: &[Limit], held: &mut [u64], granted: &[(usize, u64)]) {
     for &(idx, n) in granted {
         if let Some(h) = held.get_mut(idx) {
             *h = h.checked_sub(n).unwrap_or_else(|| {
-                tracing::error!(pool = idx, "resource pool released more than it granted");
+                if !matches!(capacity.get(idx), Some(Limit::Unbounded)) {
+                    tracing::error!(pool = idx, "resource pool released more than it granted");
+                }
                 0
             });
         }
+    }
+}
+
+/// Unbounded main-lane amounts carried by a light-lane grant: counted as
+/// held in `lane` from the grant until the reservation drops.
+#[derive(Debug)]
+struct Riding {
+    lane: Arc<Lane>,
+    granted: Box<[(usize, u64)]>,
+}
+
+impl Riding {
+    fn take(&self) {
+        take(&mut self.lane.state.lock().held, &self.granted);
     }
 }
 
@@ -611,6 +669,8 @@ pub struct Reservation {
     /// False only for a grant handed back by a failed send, whose amounts the
     /// chain re-added itself.
     armed: bool,
+    /// On a light-lane grant, the unbounded named pools it also holds.
+    riding: Option<Riding>,
 }
 
 impl Reservation {
@@ -624,29 +684,34 @@ impl Reservation {
         self.lane.light
     }
 
-    /// The granted amount of a named pool; 0 for a pool not reserved (and for
-    /// every named pool on a light-lane grant).
+    /// The granted amount of a named pool; 0 for a pool not reserved (and, on
+    /// a light-lane grant, for every bounded pool).
     pub fn amount(&self, pool: &str) -> u64 {
-        if self.is_light() {
-            return 0;
-        }
         self.iter()
             .find_map(|(p, n)| (p.as_str() == pool).then_some(n))
             .unwrap_or(0)
     }
 
-    /// The granted amounts of named pools (nothing on a light-lane grant).
+    /// The granted amounts of named pools: on a light-lane grant, only the
+    /// unbounded ones riding along.
     pub fn iter(&self) -> impl Iterator<Item = (&PoolName, u64)> {
-        let light = self.is_light();
-        self.granted
+        let (lane, granted): (&Lane, &[(usize, u64)]) = match (&self.riding, self.is_light()) {
+            (Some(r), _) => (&r.lane, &r.granted),
+            (None, true) => (&self.lane, &[]),
+            (None, false) => (&self.lane, &self.granted),
+        };
+        granted
             .iter()
-            .filter(move |_| !light)
-            .filter_map(|&(idx, n)| Some((self.lane.names.get(idx)?, n)))
+            .filter_map(move |&(idx, n)| Some((lane.names.get(idx)?, n)))
     }
 }
 
 impl Drop for Reservation {
     fn drop(&mut self) {
+        if let Some(r) = self.riding.take() {
+            // Unbounded amounts: returning them can admit nobody.
+            give(&r.lane.capacity, &mut r.lane.state.lock().held, &r.granted);
+        }
         if self.armed {
             self.lane.release(&self.granted);
         }
@@ -658,6 +723,8 @@ impl Drop for Reservation {
 #[derive(Debug)]
 pub struct Acquire {
     state: AcquireState,
+    /// Unbounded amounts a light-lane request carries, taken at the grant.
+    riding: Option<Riding>,
 }
 
 #[derive(Debug)]
@@ -686,20 +753,29 @@ impl Future for Acquire {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let res = match &mut self.state {
-            AcquireState::Ready(r) => return Poll::Ready(r.take().ok_or(AcquireError::Closed)),
+            AcquireState::Ready(r) => r.take().ok_or(AcquireError::Closed),
             AcquireState::Waiting { guard, rx } => match Pin::new(rx).poll(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(res) => {
                     // Granted (or the sender is gone): nothing left to remove.
                     guard.armed = false;
+                    // Fused: a completed receiver must not be polled again (it
+                    // panics), so a poll after this one answers `Closed` from
+                    // `Ready(None)`.
+                    self.state = AcquireState::Ready(None);
                     res.map_err(|_closed| AcquireError::Closed)
                 }
             },
         };
-        // Fused: a completed receiver must not be polled again (it panics), so
-        // a poll after this one answers `Closed` from `Ready(None)`.
-        self.state = AcquireState::Ready(None);
-        Poll::Ready(res)
+        // The riders are taken with the grant the caller observes, so a grant
+        // that is never observed never counts them.
+        Poll::Ready(res.map(|mut r| {
+            if let Some(riding) = self.riding.take() {
+                riding.take();
+                r.riding = Some(riding);
+            }
+            r
+        }))
     }
 }
 
@@ -1392,6 +1468,43 @@ mod tests {
         assert_eq!(tokens.free(), None);
         drop((a, b));
         assert_eq!(p.snapshot().main.queued, 0);
+    }
+
+    /// A request that needs nothing of a bounded pool (`cpu: 0` beside an
+    /// unbounded pool only) takes the light lane, so its concurrency is
+    /// bounded, while its unbounded amounts are granted and counted as held
+    /// in their pool from the grant until the release.
+    #[test]
+    fn unbounded_only_requests_take_the_light_lane_and_keep_their_amounts() {
+        let p = ResourcePool::new([
+            (name("cpu"), Limit::Bounded(CPU)),
+            (name("tokens"), Limit::Unbounded),
+        ]);
+        let tokens_held = |p: &ResourcePool| {
+            p.snapshot()
+                .main
+                .pools
+                .iter()
+                .find(|s| s.pool == name("tokens"))
+                .map(|s| s.held)
+        };
+        let r = req(&[("cpu", 0), ("tokens", 5)]);
+        let cap = p.light_capacity();
+        let mut held: Vec<_> = (0..cap).map(|_| now(&p, &r)).collect();
+        assert!(held.iter().all(Reservation::is_light));
+        assert_eq!(held[0].amount("tokens"), 5);
+        assert_eq!(held[0].amount("cpu"), 0);
+        assert_eq!(tokens_held(&p), Some(5 * cap));
+        let mut next = queued(&p, &r);
+        assert_eq!(p.snapshot().light.queued, 1, "bounded by the light lane");
+        assert_eq!(tokens_held(&p), Some(5 * cap), "a waiter holds nothing");
+        drop(held.pop());
+        let got = granted(&mut next).unwrap();
+        assert!(got.is_light());
+        assert_eq!(tokens_held(&p), Some(5 * cap));
+        drop((got, held));
+        assert_eq!(tokens_held(&p), Some(0));
+        assert_eq!(free(&p, "cpu"), CPU, "the light lane never touches cpu");
     }
 
     /// No value: a custom pool is unbounded, `cpu`/`memory` keep their
