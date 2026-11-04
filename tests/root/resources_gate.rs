@@ -114,6 +114,83 @@ fn the_exemptions_are_current() {
     }
 }
 
+/// Go's runtime knobs heph must never set (U7, D7): a Go process sizes itself
+/// from the host, and a workspace that wants it tighter maps the knob itself
+/// with `${resource:cpu}`.
+const GO_KNOBS: &[&str] = &["GOMAXPROCS", "GOMEMLIMIT"];
+
+/// The Go knobs `code` names as a string literal outside a comment: what a
+/// generated spec, a prelude or an in-process driver's env would need to set
+/// one. Prose in doc comments does not count.
+fn sets_a_go_knob(code: &str) -> Vec<&'static str> {
+    GO_KNOBS
+        .iter()
+        .copied()
+        .filter(|knob| {
+            code.lines().any(|line| {
+                let code = line.split_once("//").map_or(line, |(code, _)| code);
+                code.contains(&format!("\"{knob}")) || code.contains(&format!("{knob}="))
+            })
+        })
+        .collect()
+}
+
+/// Covers what the plugin-go unit test cannot: the in-process Go drivers
+/// (`go.compile`, `go.golist`, `go.lint`, `go.format`, …) build their env
+/// inside `run`, where no spec or def shows it.
+#[test]
+fn nothing_sets_gomaxprocs_or_gomemlimit() {
+    let root = repo_root();
+    let manifest = std::fs::read_to_string(root.join("Cargo.toml")).expect("read root Cargo.toml");
+    let members = workspace_members(&manifest);
+    let mut scanned = 0usize;
+    let mut offenders = Vec::new();
+    for member in &members {
+        let mut files = Vec::new();
+        rust_files(&root.join(member).join("src"), &mut files);
+        for file in files {
+            let Ok(text) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            scanned += 1;
+            let knobs = sets_a_go_knob(non_test(&text));
+            if !knobs.is_empty() {
+                let rel = file
+                    .strip_prefix(&root)
+                    .unwrap_or(&file)
+                    .display()
+                    .to_string();
+                offenders.push(format!("{rel}: {}", knobs.join(", ")));
+            }
+        }
+    }
+    assert!(scanned > 100, "scanned only {scanned} files");
+    assert!(
+        offenders.is_empty(),
+        "heph sets neither GOMAXPROCS nor GOMEMLIMIT (docs/RESOURCES.md, U7), but these \
+         name one in non-test code:\n  {}",
+        offenders.join("\n  ")
+    );
+}
+
+#[test]
+fn sets_a_go_knob_reads_code_not_prose() {
+    assert_eq!(
+        sets_a_go_knob(r#"    env.insert("GOMAXPROCS".into(), n.to_string());"#),
+        ["GOMAXPROCS"]
+    );
+    assert_eq!(
+        sets_a_go_knob(r#"    let s = "GOMEMLIMIT=2GiB";"#),
+        ["GOMEMLIMIT"]
+    );
+    assert_eq!(
+        sets_a_go_knob("    run = \"GOMAXPROCS=4 go test\","),
+        ["GOMAXPROCS"]
+    );
+    assert!(sets_a_go_knob("    /// heph sets no `GOMAXPROCS`").is_empty());
+    assert!(sets_a_go_knob("    // GOMAXPROCS is the host's").is_empty());
+}
+
 #[test]
 fn sets_resources_reads_fields_not_prose() {
     assert!(sets_resources("    resources: spec.resources,\n"));
