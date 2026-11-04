@@ -223,9 +223,10 @@ pub struct GlobalOptions {
     pub auto_approve: bool,
     /// CPUs the run may reserve at once, not a target count
     ///
-    /// The `cpu` pool's capacity for this run: whole CPUs, or a percentage of
-    /// the default (`-j 50%`). Each target reserves what its `resources`
-    /// declares (one CPU unless it says otherwise), and targets wait until
+    /// The `cpu` pool's capacity for this run: CPUs (`-j 8`, `-j 2.5`), or a
+    /// percentage of the default (`-j 50%`). Each target reserves what its
+    /// `resources` declares (by default one CPU, 0.1 for IO-bound drivers
+    /// such as `http`), and targets wait until
     /// their reservation fits. The same as `--resource cpu=<N>`; giving both
     /// is an error. Default: the config's `resources.cpu`, else the
     /// engine's parallelism. The model is in `docs/RESOURCES.md`.

@@ -1,63 +1,84 @@
 # Target resources
 
 A target says what it costs to run; the engine admits targets so that the sum
-of what is running fits the machine, and tells each target what it got.
+of what is running fits the machine, and a target that wants to know what it
+got asks for it by name.
 
 ```python
 target(
     name = "build",
     driver = "bash",
-    run = "make -j$HEPH_CPUS",
+    run = "make",
+    env = {"MAKEFLAGS": "-j${resource:cpu}"},
     resources = {"cpu": 4, "memory": "8G"},
 )
 ```
 
 **`-j N` now means CPUs, not targets.** `-j 8` lets the run reserve 8 CPUs at
-once: eight targets that declare nothing (each costs 1), or two that declare
-`cpu: 4`. The default is the core count, where it used to be `2 × cores`
-target slots — see [Compatibility](#compatibility).
+once: eight targets that reserve 1 CPU each, two that declare `cpu: 4`, or
+eighty downloads at 0.1 each. The default is the core count, where it used to
+be `2 × cores` target slots; see [Compatibility](#compatibility).
 
 heph **tells**, it does not police. Nothing kills, throttles or pins a process
-that uses more than it reserved (no cgroups, `ulimit` or affinity), and no
-resource value reaches any hash.
+that uses more than it reserved (no cgroups, `ulimit` or affinity), heph
+exports nothing to a target's environment, and no resource value reaches any
+hash.
 
-## The model
+## Declaring what a target costs
 
-A **pool** is a named capacity. Three kinds:
+`resources` on `target()` is a dict of pool name to amount:
 
-| Pool | Unit | Default capacity |
+```python
+resources = {"cpu": 0.5, "memory": "2G", "docker": 1}
+```
+
+An amount is a number or a string, read in **its pool's unit** when the def
+is linked (the unit lives in the config, which a driver never sees):
+
+| Unit | Written as | Example |
 |---|---|---|
-| `cpu` | CPUs; held as micro-CPUs (10⁻⁶ CPU) | the engine's parallelism (the core count) |
-| `memory` | bytes | the memory this process may use: on Linux the cgroup limit when one is set (v2 `memory.max`, v1 `memory.limit_in_bytes`, capped at physical memory), else physical memory; on macOS physical memory |
-| a custom pool (`docker`, `gpu`, …) | a count | none: 0 until the config or a run gives it one |
+| `cpu` | a decimal ≥ 0 in steps of 0.000001, rounded half up; a value above 0 and below one step is an error | `4`, `0.5`, `"0.25"` |
+| `bytes` | a whole number of bytes, or digits followed at once by `K`, `M`, `G` or `T` (optionally `B` or `iB`, any case), binary throughout: `4G` is 4·2³⁰ | `"8G"`, `"4096M"`, `"4GiB"`, `1024` |
+| `count` | a whole number | `1`, `"2"` |
 
-The `memory` default differs by platform on purpose: cgroup-aware on Linux,
-physical memory on macOS. A target that declares `memory` can therefore wait
-in a Linux CI container (limited to, say, 8G) where it ran at once on a 32G
-laptop; set `resources: {memory: …}` to make the two agree.
+No spaces, signs, exponents or separators. The `cpu` pool's unit is `cpu`, the
+`memory` pool's is `bytes`, and a custom pool's is whatever the config gives
+it (`count` unless it says otherwise). A target names at most 16 pools; pool
+names are `[a-z][a-z0-9_]{0,63}`.
 
-Pool names are `[a-z][a-z0-9_]{0,63}`; a target names at most 16.
+A pool that is not configured is an error when the def is linked, which
+`heph validate` reports too:
 
-A target reserves from pools with `resources`, a dict of pool to amount:
+```
+//p:t declares resources.docker, but docker is not a pool: add resources: {docker: <n>} to .hephconfig (known: cpu, memory)
+```
 
-- `cpu`: a number ≥ 0, integer or decimal in steps of 0.000001
-  (`0.5` is two per core), rounded to the nearest step; a value above 0 and
-  below one step is an error.
-- `memory`: a whole number of bytes or a size string: `"4G"`, `"4g"`,
-  `"4GiB"`, `"4GB"`, `"4096M"`, `"4096"` (binary units throughout; `4G` is
-  4·2³⁰). No spaces, decimals, signs or separators.
-- a custom pool: a whole number ≥ 0.
+A wrong shape (not a dict, a non-string key, a list as an amount) fails the
+driver's `parse` with the target named; an amount its unit refuses fails at
+link, naming the target, the pool and its unit (`docker: 0.5` on a `count`
+pool: `"0.5" is not a count`).
 
-Non-string keys and any other value shape are errors that fail the driver's
-`parse` with the target named.
+`resources` is **ordinary driver config**, not a keyword of `target()`: it
+rides the target's config to the driver's `parse`, which moves it onto the def
+as written (`Resources::from_config`). That is how a BUILD file, a plugin
+function's declared target and a provider all reach it the same way. Every
+builtin driver that runs something reads it; `scratch` and `credential`
+declarations run nothing and refuse it, and an `exec`/`bash` entrypoint
+refuses it at parse (an entrypoint reserves nothing, see
+[Admission](#admission)).
 
-**Defaults.** A target that declares no `cpu` reserves **1 CPU**, whatever its
-driver, including a def from a plugin built before resources existed. Two
-exceptions: `fs` targets and *relocating* `group`s reserve 0.00001 CPU (10
-micro-CPUs) unless they declare their own, so they still queue through the
-`cpu` pool in order but 100,000 of them fit in one CPU. An aggregate `group`
-(no transform) never executes, so whatever it declares reserves nothing.
-Undeclared `memory` and custom pools count as 0.
+### What a target costs when it declares nothing
+
+| Driver | Undeclared `cpu` costs |
+|---|---|
+| any driver not below, including `exec`, `bash`, `docker_build`, the runners, and a def from a plugin built before resources existed | 1 |
+| `http`; OCI `pull`, `push`, `load`, `layer`, `index`, `image`; `go.download` | 0.1: IO-bound, so ten downloads share one CPU |
+| `fs`, a *relocating* `group` | 0.00001: they still queue through the `cpu` pool in order, but 100,000 fit in one CPU |
+| an aggregate `group` (no transform) | nothing, whatever it declares: it never executes |
+
+A declared `cpu` always wins. Undeclared `memory` and custom pools cost 0.
+The cdylib drivers (OCI, Go) send their lowered default across the plugin ABI
+as a declared `cpu`, so on the host their defs show it as a declaration.
 
 **The light lane.** A target that asks for 0 of everything (`cpu: 0` and
 nothing else) takes one slot of a separate `light` lane instead, whose
@@ -65,129 +86,79 @@ capacity is `max(8 × cpu capacity in CPUs, 64)`. It never waits behind `cpu`
 requests, and the number of concurrent executes stays bounded. `cpu: 0` with
 `memory: "8G"` still queues on memory.
 
-`resources` is **ordinary driver config**, not a keyword of `target()`: it
-rides the target's config to the driver's `parse`, which moves it onto the def
-with the SDK helper (`Resources::from_config`). That is how a BUILD file, a
-plugin function's declared target and a provider all reach it the same way.
-Every builtin driver that runs something reads it; `scratch` and `credential`
-declarations run nothing and refuse it, and an `exec`/`bash` entrypoint
-refuses it at parse (an entrypoint reserves nothing, see below).
+## Configuring pools
 
-## Capacities
-
-In `.hephconfig`, one entry per pool:
+`cpu` and `memory` always exist. Any other pool is declared in `.hephconfig`,
+one entry per pool, either in full or as a shorthand:
 
 ```yaml
 resources:
-  cpu: 8          # or 50%: a percentage of the engine's default
-  memory: 24G     # or 75%
-  docker: 2
-  gpu: 0          # the pool exists; the run sets its capacity
+  cpu: 8                                   # shorthand: CPUs, or 50% of the default
+  memory: 24G                              # shorthand: a size, or 75%
+  docker: 2                                # shorthand: a count
+  scratch_disk: {unit: bytes, value: 64G}  # full: a custom pool in another unit
+  tokens: {unit: count}                    # no value: unbounded
+  gpu: 0                                   # 0: the run sets it
 ```
+
+- **`{unit, value}`**: `unit` is `count`, `cpu` or `bytes`; `value` is an
+  amount in it. A builtin's unit is fixed: `cpu: {unit: bytes}` is an error.
+- **Shorthand**: the amount alone, in the pool's default unit (`cpu` for
+  `cpu`, `bytes` for `memory`, `count` for anything else).
+- **No value**: a custom pool is **unbounded**: every request is granted at
+  once and nothing is clamped, but what is held is still counted and shown.
+  `cpu` and `memory` without a value keep their defaults.
+- **`0`**: "this pool exists; the caller sets its capacity per run". BUILD
+  files naming it validate on every machine, and a run that reaches a target
+  needing it fails at admission, before the target runs:
+
+  ```
+  //p:t acquires gpu, but pool gpu has capacity 0 and must be set: --resource gpu=<n>, HEPH_RESOURCE_GPU=<n> or resources: {gpu: <n>} in .hephconfig
+  ```
+
+**Defaults.** `cpu` is the engine's parallelism (the core count). `memory` is
+the memory this process may use: on Linux the cgroup limit when one is set
+(v2 `memory.max`, v1 `memory.limit_in_bytes`, capped at physical memory), else
+physical memory; on macOS physical memory. When the host's memory cannot be
+read at all, `memory` is unbounded rather than an invented number. The
+difference between platforms is on purpose: a target that declares `memory`
+can wait in a Linux CI container limited to 8G where it ran at once on a 32G
+laptop. Set `resources: {memory: …}` to make the two agree.
+
+**Percentages** (`cpu: 50%`, `memory: 75%`, and the same on the command line)
+are of the builtin's default and exist only for `cpu` and `memory`: a custom
+pool has no default to take one of. cpu rounds to the nearest micro-CPU,
+memory floors to bytes, over 100% is an overcommit by choice, and `0%` is an
+error.
 
 `resources:` merges **per pool** across `HEPH_PROFILES`: a profile that sets
-`cpu` keeps the base's other pools.
+`cpu` keeps the base's other pools, and one that sets only a pool's `value`
+keeps the base's `unit`. A pool's unit cannot change across profiles; a
+profile that tries is an error naming both.
 
-A capacity of **`0` in the config** means "this pool exists; the caller sets
-its capacity per run". BUILD files naming it validate on every machine, and a
-run that reaches a target needing it fails at admission, before the target
-runs:
+### Per-run overrides
 
-```
-//p:t acquires gpu, but pool gpu has capacity 0 and must be set: --resource gpu=<n>, HEPH_RESOURCE_GPU=<n> or resources: {gpu: <n>} in .hephconfig
-```
-
-A pool that is not declared at all is an error when the def is linked, which
-`heph validate` reports too:
-
-```
-//p:t declares resources.docker, but docker is not a pool: add resources: {docker: <n>} to .hephconfig (known: cpu, memory)
-```
-
-Per-run overrides, each at least 1:
-
-- `--resource <name>=<n>`, global and repeatable.
+- `--resource <name>=<n>`, global and repeatable, once per pool.
 - `HEPH_RESOURCE_<NAME>=<n>` in heph's own environment (`<NAME>` is
   lowercased into the pool name). A malformed one is an error naming the
   variable, never ignored.
 - `-j N` / `--jobs N` is `--resource cpu=N`: CPUs the run may reserve at once,
   **not** a target count. Giving both `-j` and `--resource cpu=` is an error.
 
-`cpu` and `memory` also take a percentage of the engine's default in all three
-places (`-j 50%`, `--resource memory=75%`, `cpu: 50%`): cpu rounds to the
-nearest micro-CPU, memory floors to bytes, over 100% is an overcommit by
-choice; `0%` and a percentage on a custom pool (no default to take it of) are
-errors.
-
-Precedence: flag, then environment, then config, then the engine's default
-(which exists only for `cpu` and `memory`).
+Each is parsed in the pool's configured unit and must be above 0. An
+override of a pool the config does not declare declares it for this run, in
+its default unit (`--resource gpu=2` is a `count` pool of 2). Precedence: flag, then environment, then config, then
+the default.
 
 `-j` sizes the `cpu` pool only. The engine's own fan-outs (cache pipes, gc and
 clean loops) keep following its parallelism, and `-j 1` serialises neither
 them nor `cpu: 0` targets.
 
-## Admission
+## Reading the allotment
 
-Each execute reserves its amounts in every pool it names before it runs and
-releases them when the run ends (the cache write after it is outside the
-reservation).
-
-- **Strict FIFO.** The head of the queue waits until every pool it needs fits
-  at once, and nothing behind it is admitted while it waits. No starvation,
-  deterministic, at the cost of idle capacity while a large request waits.
-- **Atomic.** A grant covers every pool or none.
-- **Clamped.** A request above a pool's capacity is reduced to the capacity:
-  `cpu: 16` on 4 waits for an empty pool, runs alone and is told 4. The clamp
-  is logged at `info` once per target per request and carried on the event
-  (`declared` vs `reserved`); the TUI row and the CI `running` line show it
-  as `cpu 16→4`.
-
-`ExecuteStart.queued_ms` is how long each admitted run waited, so a short
-wait (under the notice threshold below) is still answerable from the stream.
-
-**Seeing it.** A wait that outlasts the notice threshold (5 s) is announced as
-`AdmissionWaitStart` / `AdmissionWaitEnd { addr, pool, need, free, ahead }`
-and rendered as a row in the TUI and the GitHub Actions report:
-
-```
-⧗ //a:b waits for cpu 4 (2 free, 6 ahead, 41s)
-```
-
-`RequestConfig` announces each pool's capacity, and `ExecuteStart` carries the
-`declared` and `reserved` amounts. The in-flight report (SIGQUIT) prints each
-pool's held/capacity, the queue length and what the head waits for and for how
-long.
-
-**Entrypoints** (`heph run` of an entrypoint target) reserve nothing and are
-told the full `cpu` capacity: they run in the caller's terminal, one at a time.
-
-## What a target sees
-
-The allotment reaches the driver as `RunRequest.allotment` (across the plugin
-ABI as `ManagedRunRequest.allotment`, since 0.17.4). The `exec` and `bash`
-drivers export it:
-
-| Variable | Value |
-|---|---|
-| `HEPH_CPUS` | whole CPUs: the granted amount rounded up, at least 1 (a `cpu: 0` target is told 1) |
-| `HEPH_MEMORY_BYTES` | bytes, only when the target declared `memory` |
-
-They are inserted after the `pass_env` / `runtime_pass_env` wildcard
-passthroughs, so a nested heph sees its own allotment rather than its
-parent's, and a target's own `env` / `runtime_env` entry of the same name wins.
-They pass through an exec runner like the rest of the environment. Drivers that
-spawn nothing ignore the allotment.
-
-heph exports **only its own names**. Mapping them onto a tool is the author's,
-through a `${resource:cpu}` / `${resource:memory}` deferred value in an `env`,
-`runtime_env` or transitive `env` value (see `docs/DEFERRED_VALUES.md`). Those
-are the only fields that take one: anywhere else (a `run` line, a `template`
-var, an `oci` push `dest`, a credential presentation) the number could reach
-an output and make its hashout per-machine, so heph refuses it when the def
-is built. It is substituted at run with the same text as
-`HEPH_CPUS` / `HEPH_MEMORY_BYTES`; a transitive value resolves with the
-*dependent's* allotment. The def hash covers the reference text, so the mapping
-never moves a key:
+heph exports **nothing** to a target's environment. A target that wants its
+allotment names it with a `${resource:<pool>}` deferred value (see
+`docs/DEFERRED_VALUES.md`), and maps it onto the tool itself:
 
 ```python
 target(
@@ -207,24 +178,84 @@ target(
 )
 ```
 
-In a bash `run`, `$HEPH_CPUS` is ordinary shell expansion of the exported
-variable. `${resource:memory}` on a target that declared no memory is an
-error, not an empty string. Only the two exact names are heph's:
-`${resource:cpus}`, `${resource:-x}` and any other `${resource:…}` pass
-through untouched, like any `${…}` heph does not own (custom pools are not
-exposed).
+It is substituted at run with the pool's granted amount, rendered by its
+unit: `cpu` in whole CPUs rounded up and at least 1 (a `cpu: 0.5` or `cpu: 0`
+target is told 1), `bytes` and `count` as the integer. A transitive `env`
+value resolves with the *dependent's* allotment. The def hash covers the
+reference text, so the mapping never moves a key.
+
+- **Any deferrable field takes one**: `env`, `runtime_env`, a transitive
+  `env`, a `run` line, a `template` var, an `oci` push `dest`. Outside `env`
+  the number can end up in an output, and then that output is per-machine
+  (a `template` rendering `${resource:cpu}` writes a different file on an
+  8-core and a 16-core host, with the same cache key). That is the author's
+  to avoid; see [Hashing](#hashing-and-the-contract).
+- **A configured pool the target does not reserve is a link error**
+  (`cpu` is always reserved):
+
+  ```
+  //p:t: `env.MEM` reads ${resource:memory}, but the target reserves no memory: add resources = {"memory": <amount>} to it
+  ```
+
+- **Anything else passes through untouched**, like any `${…}` heph does not
+  own: `${resource:cpus}` (no such pool), `${resource:CPU}`, `${resource:-x}`,
+  bash's `${resource:offset}`.
+
+**Entrypoints** (`heph run` of an entrypoint target) reserve nothing: they run
+in the caller's terminal, one at a time, and `${resource:cpu}` is the whole
+`cpu` capacity.
 
 **Go.** heph sets neither `GOMAXPROCS` nor `GOMEMLIMIT`, for any generated Go
 target or Go driver: a Go process sizes itself from the host as before, and
 the pool bounds how many run at once. A workspace that wants it tighter maps
 `GOMAXPROCS` itself with `${resource:cpu}`.
 
+## Admission
+
+Each execute reserves its amounts in every pool it names before it runs and
+releases them when the run ends (the cache write after it is outside the
+reservation).
+
+- **Strict FIFO.** The head of the queue waits until every pool it needs fits
+  at once, and nothing behind it is admitted while it waits. No starvation,
+  deterministic, at the cost of idle capacity while a large request waits.
+- **Atomic.** A grant covers every pool or none, so a target never holds its
+  CPUs while it waits for memory.
+- **Clamped.** A request above a pool's capacity is reduced to the capacity:
+  `cpu: 16` on 4 waits for an empty pool, runs alone and is told 4. The clamp
+  is logged at `info` once per target per request and carried on the event
+  (`declared` vs `reserved`). An unbounded pool never clamps.
+
+**Seeing it.** Every surface renders each pool in its own unit (`cpu` in
+CPUs, `bytes` human-sized, `count` as an integer), from the `units` that
+`RequestConfig` announces beside each pool's capacity:
+
+- The TUI header shows `cpu` as worker cells and every other pool that
+  something holds as `<pool> <held>/<capacity>` (an unbounded one as just
+  `<pool> <held>`, e.g. `tokens 5`).
+- A clamped run's TUI row, CI `running` line and GitHub Actions report entry
+  say so: `[cpu 16→4]`, `[scratch_disk 8.0 GiB→4.0 GiB]`.
+- A wait that outlasts the notice threshold (5 s) is announced as
+  `AdmissionWaitStart` / `AdmissionWaitEnd { addr, pool, need, free, ahead }`
+  and rendered as a row in the TUI and the GitHub Actions report:
+
+  ```
+  ⧗ //a:b waits for cpu 4 (2 free, 6 ahead, 41s)
+  ```
+
+- `ExecuteStart` carries the `declared` and `reserved` amounts and
+  `queued_ms`, how long the run waited, so a wait under the threshold is
+  still answerable from the event stream.
+- The in-flight report (SIGQUIT) prints each pool's held/capacity in its
+  unit, the queue length, and what the head waits for and for how long.
+
 ## Sizing a declaration
 
 `heph.core.resource("cpu")` returns the host's CPU capacity as a float (cores)
 and `heph.core.resource("memory")` the host's memory in bytes as an int, as the
 engine reads them (cgroup-aware). It is the **host's** value, not this run's
-pool: `-j` and `--resource` do not change it. Custom pools have no host value.
+pool: `-j` and `--resource` do not change it. A custom pool has no host value,
+so any other name is an error.
 
 ```python
 target(name = "link", ..., resources = {"cpu": heph.core.resource("cpu")})       # full width
@@ -249,19 +280,23 @@ States combine shallow to deep: per pool, the deepest declaration wins.
 
 **Nothing about resources reaches any hash.** The declaration is kept off every
 driver's def hash (exec's `Hash for TargetDef` skips it as it skips
-`runtime_env`), and the allotment env is runtime-only. Changing `resources`, or
-running under another `-j`, keeps the cache hit.
+`runtime_env`), and the allotment is substituted at run only. Changing
+`resources`, running under another `-j`, or reconfiguring a pool keeps the
+cache hit.
 
 The contract that follows: **a target's outputs must not depend on its
-allotment.** An artifact built under `HEPH_CPUS=8` is served to a run that
-would have been told 1. Use the allotment to size parallelism, never to
-choose content.
+allotment.** An artifact built when `${resource:cpu}` was 8 is served to a run
+that would have been told 1. Use the allotment to size parallelism, never to
+choose content; a target that cannot help it says so with `cache = False`.
 
 A **custom pool serialises access to an external thing** (a docker daemon, a
-GPU, a licence server): `docker: 1` means one target at a time talks to it.
-The thing itself stays an **undeclared input**: the pool says nothing about
-what it is or what state it is in, and a target whose output depends on it is
-no more hermetic for holding the pool.
+GPU, a licence server): `docker: 1` in the config means one target at a time
+talks to it. The thing itself stays an **undeclared input**: the pool says
+nothing about what it is or what state it is in, and a target whose output
+depends on it is no more hermetic for holding the pool.
+
+**Nothing is enforced.** A reservation is a promise the target makes, not a
+limit heph applies: a `cpu: 1` target that spawns 32 threads gets 32 threads.
 
 ## Compatibility
 
@@ -277,6 +312,11 @@ change (plugin ABI 0.17.3 → 0.17.4, patch, lane `^0.17.0`):
   CPUs. A workspace whose targets declare nothing runs half as many at once
   as before by default; `-j 200%` (or `resources: {cpu: 200%}`) restores
   the old concurrency.
+- **The wire.** `TargetDef.resources` (12) and `ManagedRunRequest.allotment`
+  (15) are both `map<string, string>`, new in 0.17.4: the def carries each
+  declared amount as written (`"0.5"`, `"2G"`), which the host parses in the
+  pool's unit at link; the allotment carries every granted pool (`cpu`
+  always) rendered by its unit, which is what `${resource:<pool>}` becomes.
 - **Source break for third-party SDK code.** `TargetDef` gains a field and is
   not `#[non_exhaustive]`, so a `TargetDef { … }` literal without
   `..Default::default()` stops compiling at rebuild. `RunRequest` is
@@ -288,18 +328,14 @@ change (plugin ABI 0.17.3 → 0.17.4, patch, lane `^0.17.0`):
   up — no longer the worker-slot count. A reader comparing it across versions
   sees it halve by default, and differ under `-j 50%` or a fractional
   capacity.
-- **Every `exec`/`bash` target now sees `HEPH_CPUS`** (`1` for a target that
-  declares nothing). Nothing reaches a key through it, but an output that
-  captures its own environment — a runner whose fingerprint hashes `env` —
-  changes once, so its consumers miss once on upgrade.
 - **Non-string dict keys in BUILD config are an error.** `env = {1: "x"}` or
   any config dict with a non-string key used to drop the entry silently; it
   now fails naming the key.
 - **Old plugin, new host.** A 0.17.3 cdylib sends no `resources` (its targets
-  cost 1 CPU) and ignores the allotment (its tools are told nothing).
+  cost 1 CPU) and ignores the allotment.
 - **New plugin, old host.** A 0.17.3 host ignores a new plugin's `resources`:
   every declaration, BUILD-written or generated, costs one worker there, and a
-  custom-pool exclusion is lost silently. A plugin on an old host is told no
-  allotment and sets no env.
+  custom-pool exclusion is lost silently. A plugin on an old host is sent an
+  empty allotment, so a `${resource:…}` reference fails its run.
 - **`.hephconfig`.** `resources:` is refused loudly by an older heph
   (`ConfigYaml` denies unknown fields).

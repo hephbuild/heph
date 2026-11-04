@@ -146,11 +146,10 @@ a dependency handed down, which is the one place a reference may ride
 nothing of it to the environment. A target whose outputs then depend on the
 number is not reproducible, and saying so with `cache = False` is the author's.
 
-Only configured pool names are claimed. Any other `${resource:…}` —
-`${resource:cpus}`, `${resource:CPU}`, `${resource:-x}`, bash's
-`${resource:offset}` — is not heph's and passes through untouched, like every
-construct heph does not own; so do `${resources:cpu}` and a bare
-`${resource}`. A reference to a configured pool the target does not reserve
+Only a configured pool is replaced. Any other `${resource:…}` —
+`${resource:cpus}` (no such pool), `${resource:CPU}`, `${resource:-x}`, bash's
+`${resource:offset}` — is left as written, like every construct heph does
+not own; so are `${resources:cpu}` and a bare `${resource}`. A reference to a configured pool the target does not reserve
 (`${resource:memory}` with no `memory` in its `resources`) is refused when the
 target is linked; a run told no allotment at all fails naming the target
 rather than substituting an empty string.

@@ -168,7 +168,8 @@ release-gated decision, not a routine one.
 ### Target resources
 
 A target declares `resources = {"cpu": 2, "memory": "4G", "docker": 1}`
-(default: 1 cpu); the engine admits executes in strict FIFO order so the sum
+(an undeclared `cpu` costs 1, 0.1 for the IO-bound `http`/OCI/`go.download`
+drivers, 0.00001 for `fs`/`group`); the engine admits executes in strict FIFO order so the sum
 of what runs fits each pool's capacity (`.hephconfig` `resources:`, `-j`,
 `--resource`, `HEPH_RESOURCE_<NAME>`). A target reads what it got only by
 naming it, `${resource:<pool>}`; heph exports nothing to its environment.
