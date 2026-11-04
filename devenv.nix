@@ -308,6 +308,15 @@ in
      components = [ "rustc" "cargo" "clippy" "rustfmt" "rust-analyzer" "llvm-tools" ];
      targets = [ "x86_64-apple-darwin" "aarch64-apple-darwin" ]
        ++ lib.optionals pkgs.stdenv.isLinux [ "x86_64-unknown-linux-gnu" "aarch64-unknown-linux-gnu" ];
+     # devenv defaults this on for Linux (since 2026-10-22). Keep it off; it
+     # breaks every link and fights the linkers `.cargo/config.toml` picks:
+     # - It exports NIX_LD_USE_RESPONSE_FILE=1 shell-wide. rust-overlay's
+     #   `gcc-ld/ld.lld` is nixpkgs's ld-wrapper.sh with `@mktemp@`/`@rm@`
+     #   left unsubstituted, and that variable is what steers it into the
+     #   branch using them: "ld.lld: line 280: @mktemp@: command not found".
+     # - It sets CARGO_TARGET_<host>_LINKER, which overrides the linker that
+     #   `.cargo/config.toml` names for aarch64 Linux.
+     clangLinker.enable = false;
    };
 
   # https://devenv.sh/processes/
