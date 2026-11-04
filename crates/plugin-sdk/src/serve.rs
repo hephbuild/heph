@@ -301,8 +301,11 @@ fn err_body(message: String) -> Body {
 /// string, so a bare `to_string()` would silently drop every underlying cause
 /// (e.g. `compute embedcfg` without the `//go:embed pattern(s) matched no
 /// files: …` that explains it).
+///
+/// A frame that renders empty — a [`hplugin::error::FailureArtifacts`] context —
+/// is skipped, so it never leaves a `: :` in the message.
 fn err_message(e: &anyhow::Error) -> String {
-    format!("{e:#}")
+    hcore::hmemoizer::chain_message(e)
 }
 
 fn is_cycle(e: &anyhow::Error) -> bool {
@@ -1322,13 +1325,20 @@ fn make_channel_item_stream(rx: tokio::sync::mpsc::Receiver<Vec<u8>>) -> DynItem
 }
 
 fn run_out_err(msg: String) -> pb::RunOutFrame {
+    run_out_failure_frame(pb::RunFailure {
+        message: Some(msg),
+        ..Default::default()
+    })
+}
+
+fn run_out_failure_frame(failure: pb::RunFailure) -> pb::RunOutFrame {
     pb::RunOutFrame {
-        msg: Some(pb::run_out_frame::Msg::Error(msg)),
+        msg: Some(pb::run_out_frame::Msg::Failure(Box::new(failure))),
         ..Default::default()
     }
 }
 
-/// A run response stream that fails immediately (one `RunOutFrame{error}`).
+/// A run response stream that fails immediately (one `RunOutFrame{failure}`).
 fn run_error_stream(msg: String) -> DynItemStream {
     make_item_stream(Box::new(std::iter::once(run_out_err(msg).encode_to_vec())))
 }
@@ -1487,14 +1497,10 @@ fn read_signal_frames(
 }
 
 /// A run's terminal failure frame: the message, plus the process's exit status
-/// when the failure is one ([`hplugin::error::ProcessFailed::exit`]). `error`
-/// stays the terminal frame, so an older host still reports the message.
+/// when the failure is a process's exit ([`hplugin::error::ProcessFailed`]) and
+/// the [`hplugin::error::FailureArtifacts`] riding the error, whatever it is.
 fn run_out_failure(e: &anyhow::Error) -> pb::RunOutFrame {
-    let mut frame = run_out_err(err_message(e));
-    if let Some(exit) = hplugin::error::process_exit(e) {
-        frame.exit = convert::exit_to_pb(exit).into();
-    }
-    frame
+    run_out_failure_frame(convert::run_failure_to_pb(e, err_message(e)))
 }
 
 /// An `AsyncWrite` that turns everything written to it into `RunOutFrame`s on the
@@ -2113,10 +2119,13 @@ mod tests {
             &StdCancellationToken::new(),
         ));
         match frame.msg {
-            Some(pb::run_out_frame::Msg::Error(msg)) => assert!(
-                msg.contains("missing field ManagedRunRequest.sandbox_dir"),
-                "{msg}"
-            ),
+            Some(pb::run_out_frame::Msg::Failure(f)) => {
+                let msg = f.message.unwrap_or_default();
+                assert!(
+                    msg.contains("missing field ManagedRunRequest.sandbox_dir"),
+                    "{msg}"
+                );
+            }
             other => panic!("expected an error frame, got {other:?}"),
         }
     }
@@ -2644,7 +2653,8 @@ mod tests {
             &StdCancellationToken::new(),
         ));
         match frame.msg {
-            Some(pb::run_out_frame::Msg::Error(msg)) => {
+            Some(pb::run_out_frame::Msg::Failure(f)) => {
+                let msg = f.message.unwrap_or_default();
                 assert!(
                     msg.contains("compute embedcfg"),
                     "top context present: {msg}"
@@ -2727,12 +2737,13 @@ mod tests {
 
         assert_eq!(frames.len(), 1, "exactly one terminal RunOutFrame then end");
         let frame = pb::RunOutFrame::decode_from_slice(&frames[0][..]).expect("decode RunOutFrame");
-        // A terminal frame (Response or Error) — proves the request was consumed and
+        // A terminal frame (Response or Failure) — proves the request was consumed and
         // the run task's output crossed the response stream; the plumbing is the point.
         assert!(
             matches!(
                 frame.msg,
-                Some(pb::run_out_frame::Msg::Response(_)) | Some(pb::run_out_frame::Msg::Error(_))
+                Some(pb::run_out_frame::Msg::Response(_))
+                    | Some(pb::run_out_frame::Msg::Failure(_))
             ),
             "expected a terminal RunOutFrame, got {:?}",
             frame.msg
@@ -2815,8 +2826,8 @@ mod tests {
 
         let frame = pb::RunOutFrame::decode_from_slice(&frames[0][..]).expect("decode RunOutFrame");
         let msg = match frame.msg {
-            Some(pb::run_out_frame::Msg::Error(e)) => e,
-            other => panic!("expected an Error frame, got {other:?}"),
+            Some(pb::run_out_frame::Msg::Failure(f)) => f.message.unwrap_or_default(),
+            other => panic!("expected a Failure frame, got {other:?}"),
         };
         // Both the outermost context AND the underlying cause must be present.
         assert!(
@@ -3470,7 +3481,11 @@ mod tests {
         use hplugin::error::{Exit, ProcessFailed, process_exit};
         use hplugin_stabby::load_stable::StableRemoteManagedDriver;
 
-        struct SignalDriver;
+        let log_dir = tempfile::tempdir().expect("tempdir");
+        let log_path = log_dir.path().join("log.txt");
+        std::fs::write(&log_path, "the tool's output\n").expect("write log");
+
+        struct SignalDriver(std::path::PathBuf);
         #[async_trait::async_trait]
         impl ManagedDriver for SignalDriver {
             fn config(
@@ -3513,6 +3528,14 @@ mod tests {
                     "cwd: {:?}",
                     r.options.cwd
                 );
+                let log = hplugin::error::log_file_artifact(&self.0).context("utf-8 log path")?;
+                // Any failure carries its artifacts, not only a process's exit.
+                if r.options.args == Some(vec!["no exit".into()]) {
+                    return Err(hplugin::error::with_failure_artifacts(
+                        anyhow::anyhow!("setup failed"),
+                        vec![log],
+                    ));
+                }
                 anyhow::ensure!(
                     r.options.args == Some(vec!["a b".into()]),
                     "args: {:?}",
@@ -3522,16 +3545,20 @@ mod tests {
                     anyhow::bail!("stdio: {:?}", r.options.stdio);
                 };
                 let sig = fg.signals.recv().await.context("the relay closed empty")?;
-                Err(ProcessFailed {
-                    status: format!("signal: {}", sig.as_raw()),
-                    log: Arc::new(hcore::hartifactcontent::FileContent::new("/dev/null")),
-                    exit: Some(Exit::Signal(sig.as_raw())),
-                }
-                .into())
+                Err(hplugin::error::with_failure_artifacts(
+                    ProcessFailed::new(
+                        format!("signal: {}", sig.as_raw()),
+                        Some(Exit::Signal(sig.as_raw())),
+                    )
+                    .into(),
+                    vec![log],
+                ))
             }
         }
 
-        let dynd = make_dyn_managed_driver(Arc::new(SignalDriver) as Arc<dyn ManagedDriver>);
+        let dynd = make_dyn_managed_driver(
+            Arc::new(SignalDriver(log_path.clone())) as Arc<dyn ManagedDriver>
+        );
         let host = StableRemoteManagedDriver::new(dynd, "sigdrv").expect("load");
         let ct = StdCancellationToken::new();
         let id = "r".to_string();
@@ -3559,11 +3586,42 @@ mod tests {
             Err(e) => e,
         };
         assert_eq!(process_exit(&err), Some(Exit::Signal(15)), "{err:#}");
+        // The log crosses as the same artifact (0.18.0), path and type, so the
+        // host's failure box renders its tail as for an in-process driver.
+        let crossed_log = |err: &anyhow::Error| {
+            let log = hplugin::error::failure_log(err).expect("the log crossed");
+            assert_eq!(log.name, "log.txt");
+            assert_eq!(log.r#type, hplugin::driver::outputartifact::Type::Log);
+            match &log.content {
+                hplugin::driver::outputartifact::Content::File(f) => {
+                    std::path::PathBuf::from(&f.source_path)
+                }
+                _ => std::path::PathBuf::new(),
+            }
+        };
+        assert_eq!(crossed_log(&err), log_path, "{err:#}");
+        let msg = hcore::hmemoizer::chain_message(&err);
         assert!(
-            format!("{err:#}").contains("process exited with status: signal: 15"),
-            "{err:#}"
+            msg.contains("process exited with status: signal: 15") && !msg.contains(": :"),
+            "{msg}"
         );
         drop(tx);
+
+        // A failure with no exit carries its artifacts across just the same.
+        let (_tx, rx) = hplugin::driver::signal_channel();
+        let mut rr = RunRequest::new(&id, &target, "/sb");
+        rr.hashin = "h";
+        rr.options = RunOptions::default()
+            .with_cwd("/caller")
+            .with_args(vec!["no exit".into()])
+            .with_stdio(RunStdio::Inherit(Foreground::new(rx, vec![])));
+        let err = match futures::executor::block_on(host.run(mreq(rr), &ct)) {
+            Ok(_) => panic!("the driver fails"),
+            Err(e) => e,
+        };
+        assert_eq!(process_exit(&err), None, "{err:#}");
+        assert_eq!(crossed_log(&err), log_path, "{err:#}");
+        assert_eq!(hcore::hmemoizer::chain_message(&err), "setup failed");
 
         // N9: the same options for a def that declared no entrypoint are
         // refused at the seam, before the plugin sees anything.

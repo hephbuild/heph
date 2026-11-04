@@ -1175,7 +1175,7 @@ impl BuildState {
             // GC progress is tracked by GcHeader, not the build counters. The
             // elapsed-clock anchor at the top of `apply` still runs, so the
             // clock works during a gc sweep.
-            BuildEventKind::GcTargetSwept { .. } => {}
+            BuildEventKind::GcTargetSwept { .. } | BuildEventKind::GcFailureLogsSwept { .. } => {}
             // Emitted once at the end, after the live view; the command prints
             // its own "incomplete selection" block.
             BuildEventKind::SelectionIncomplete { .. } => {}
@@ -1912,6 +1912,10 @@ pub struct GcHeader {
     targets: usize,
     revisions_removed: usize,
     bytes_removed: u64,
+    /// Failure logs removed and their bytes, once a
+    /// [`BuildEventKind::GcFailureLogsSwept`] arrives. `None` for a sweep that
+    /// has none (`heph tool clean`), whose summary keeps its old shape.
+    failure_logs: Option<(usize, u64)>,
 }
 
 impl GcHeader {
@@ -1921,28 +1925,46 @@ impl GcHeader {
             targets: 0,
             revisions_removed: 0,
             bytes_removed: 0,
+            failure_logs: None,
         }
     }
 
     fn segment(&self) -> String {
-        format!(
+        let mut s = format!(
             "{} targets · {} freed",
             self.targets,
             human_bytes(self.bytes_removed),
-        )
+        );
+        if let Some((n, bytes)) = self.failure_logs {
+            s.push_str(&format!(
+                " · {n} failure logs, {} freed",
+                human_bytes(bytes)
+            ));
+        }
+        s
     }
 }
 
 impl ProgressHeader for GcHeader {
     fn apply(&mut self, ev: &BuildEvent) {
-        if let BuildEventKind::GcTargetSwept {
-            revisions_removed,
-            bytes_removed,
-        } = &ev.kind
-        {
-            self.targets += 1;
-            self.revisions_removed += revisions_removed;
-            self.bytes_removed = self.bytes_removed.saturating_add(*bytes_removed);
+        match &ev.kind {
+            BuildEventKind::GcTargetSwept {
+                revisions_removed,
+                bytes_removed,
+            } => {
+                self.targets += 1;
+                self.revisions_removed += revisions_removed;
+                self.bytes_removed = self.bytes_removed.saturating_add(*bytes_removed);
+            }
+            BuildEventKind::GcFailureLogsSwept {
+                removed,
+                bytes_removed,
+            } => {
+                let (n, bytes) = self.failure_logs.get_or_insert((0, 0));
+                *n += removed;
+                *bytes = bytes.saturating_add(*bytes_removed);
+            }
+            _ => {}
         }
     }
 
@@ -1955,7 +1977,7 @@ impl ProgressHeader for GcHeader {
     }
 
     fn last_render(&self, _core: &BuildState, _scope: CountScope) -> String {
-        if self.targets > 0 {
+        if self.targets > 0 || self.failure_logs.is_some_and(|(n, _)| n > 0) {
             self.segment()
         } else {
             String::new()
@@ -4186,6 +4208,38 @@ mod tests {
         assert!(seg.contains("1.0 KiB"), "{seg}");
         assert_eq!(h.label(), "GC");
         assert!(!h.last_render(&core, CountScope::Matched).is_empty());
+    }
+
+    /// The failure-log sweep is appended after the unchanged revision segment,
+    /// and a sweep without one (`clean`) keeps the old text exactly.
+    #[test]
+    fn gc_header_appends_failure_logs() {
+        let core = BuildState::new();
+        let mut h = GcHeader::new("GC");
+        h.apply(&ev(0, gc_swept(2, 1024)));
+        let before = header_text(&h.header(&core, CountScope::Matched));
+        assert_eq!(before, "1 targets · 1.0 KiB freed");
+
+        h.apply(&ev(
+            1,
+            BuildEventKind::GcFailureLogsSwept {
+                removed: 3,
+                bytes_removed: 2048,
+            },
+        ));
+        let after = header_text(&h.header(&core, CountScope::Matched));
+        assert_eq!(after, format!("{before} · 3 failure logs, 2.0 KiB freed"));
+
+        // Only failure logs removed: still worth a final line.
+        let mut only = GcHeader::new("GC");
+        only.apply(&ev(
+            0,
+            BuildEventKind::GcFailureLogsSwept {
+                removed: 1,
+                bytes_removed: 5,
+            },
+        ));
+        assert!(!only.last_render(&core, CountScope::Matched).is_empty());
     }
 
     #[test]

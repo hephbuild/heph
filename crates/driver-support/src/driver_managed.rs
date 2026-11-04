@@ -57,6 +57,39 @@ pub struct ManagedRunResponse {
     pub artifacts: Vec<outputartifact::OutputArtifact>,
 }
 
+/// For a driver that captures its tool's output whole instead of streaming it:
+/// when the run failed with a `Log` artifact on the error
+/// ([`hplugin::error::failure_log`]), copy that log to the run's live stderr.
+///
+/// An interactive run (a target named at a terminal) has its live sinks set,
+/// and the engine leaves the log tail out of the failure box there because it
+/// assumes the output was already printed as it ran. A captured tool printed
+/// nothing, so without this the user sees the failure and none of its output.
+/// Outside an interactive run there is no sink and this does nothing.
+pub async fn echo_failure_log(req: &mut RunRequest<'_, '_>, e: &anyhow::Error) {
+    use tokio::io::AsyncWriteExt as _;
+    let Some(stderr) = req.stderr.as_deref_mut() else {
+        return;
+    };
+    let Some(log) = hplugin::error::failure_log(e).cloned() else {
+        return;
+    };
+    // The log is a file: read it off the async path.
+    let read = hcore::blocking::run(move || -> anyhow::Result<Vec<u8>> {
+        use hcore::hartifactcontent::Content as _;
+        let mut bytes = Vec::new();
+        io::Read::read_to_end(&mut log.reader()?, &mut bytes)?;
+        Ok(bytes)
+    })
+    .await;
+    let Ok(bytes) = read else {
+        return;
+    };
+    // Best-effort: a sink that went away must not mask the failure itself.
+    drop(stderr.write_all(&bytes).await);
+    drop(stderr.flush().await);
+}
+
 #[async_trait]
 pub trait ManagedDriver: Send + Sync {
     fn config(&self, req: ConfigRequest) -> anyhow::Result<ConfigResponse>;
@@ -840,6 +873,63 @@ fn pack_to_artifact_tar(
     tar.pack(&mut hw).with_context(|| "pack")?;
 
     Ok((tarpath, format!("{:x}", hw.hasher.digest())))
+}
+
+#[cfg(test)]
+mod echo_failure_log_tests {
+    use super::*;
+
+    fn failed(log_path: &Path) -> anyhow::Error {
+        let output = std::process::Command::new("sh")
+            .args(["-c", "echo 'x.go:3:1: expected declaration' >&2; exit 2"])
+            .output()
+            .expect("run sh");
+        hplugin::error::ProcessFailed::from_output(log_path, &output)
+            .context("heph-govet -format failed")
+    }
+
+    /// An interactive run (live sinks set) gets the captured tool's output on
+    /// its stderr, since the engine leaves the tail out of the box there.
+    #[tokio::test]
+    async fn echoes_the_log_to_an_interactive_runs_stderr() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let e = failed(&tmp.path().join("log.txt"));
+        let target = hplugin::driver::targetdef::TargetDef::default();
+        let id = "t".to_string();
+        let mut sink: Vec<u8> = Vec::new();
+        let mut req = RunRequest::new(&id, &target, tmp.path());
+        req.stderr = Some(&mut sink);
+        echo_failure_log(&mut req, &e).await;
+        drop(req);
+        assert_eq!(
+            String::from_utf8_lossy(&sink),
+            "x.go:3:1: expected declaration\n"
+        );
+    }
+
+    /// Outside an interactive run there is nowhere to echo to: nothing is
+    /// written, not even to a stdout sink a non-interactive run may have.
+    #[tokio::test]
+    async fn no_echo_when_not_interactive() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let e = failed(&tmp.path().join("log.txt"));
+        let target = hplugin::driver::targetdef::TargetDef::default();
+        let id = "t".to_string();
+        let mut out: Vec<u8> = Vec::new();
+        let mut req = RunRequest::new(&id, &target, tmp.path());
+        req.stdout = Some(&mut out);
+        echo_failure_log(&mut req, &e).await;
+        assert!(req.stderr.is_none());
+        drop(req);
+        assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
+        // And a failure with no log echoes nothing, even with a sink.
+        let mut sink: Vec<u8> = Vec::new();
+        let mut req = RunRequest::new(&id, &target, tmp.path());
+        req.stderr = Some(&mut sink);
+        echo_failure_log(&mut req, &anyhow::anyhow!("no log")).await;
+        drop(req);
+        assert!(sink.is_empty());
+    }
 }
 
 #[cfg(test)]

@@ -20,6 +20,15 @@ pub struct GcArgs {
     /// Drop scratch caches untouched for longer than this many days.
     #[arg(long = "scratch-max-age-days", value_name = "DAYS")]
     pub scratch_max_age_days: Option<u64>,
+    /// Drop a target's last-failure log (`<home>/failures/`) older than this
+    /// many days. `0` drops every failure log. Logs of targets that no longer
+    /// exist are dropped whatever their age.
+    #[arg(
+        long = "failure-max-age-days",
+        value_name = "DAYS",
+        default_value_t = 7
+    )]
+    pub failure_max_age_days: u64,
 }
 
 struct GcApp {
@@ -30,6 +39,8 @@ struct GcApp {
     /// Drop a scratch cache untouched for longer than this. `None` never ages
     /// one out.
     scratch_max_age: Option<std::time::Duration>,
+    /// Drop a failure log older than this; zero drops every one.
+    failure_max_age: std::time::Duration,
 }
 
 #[async_trait]
@@ -53,6 +64,16 @@ impl App for GcApp {
             .engine
             .new_state_with_events(self.fail_fast, ctx.event_sender());
         let res = self.engine.clone().gc_all(rs.clone()).await;
+
+        // Last-failure logs: nothing but this sweep removes the slot of a
+        // target that is never built again. Never fatal; the progress view
+        // appends its count to the summary.
+        let failures = self
+            .engine
+            .clone()
+            .gc_failure_slots(&rs, self.failure_max_age)
+            .await;
+        tracing::debug!(?failures, "swept failure slots");
 
         // Scratch caches are swept here too, because nothing else bounds them:
         // they are keyed by a declaration rather than by an input hash, so there
@@ -103,6 +124,9 @@ async fn execute_async(_args: GcArgs, sink: LogSink, global: GlobalOptions) -> a
         scratch_max_age: _args
             .scratch_max_age_days
             .map(|d| std::time::Duration::from_secs(d * 24 * 60 * 60)),
+        failure_max_age: std::time::Duration::from_secs(
+            _args.failure_max_age_days.saturating_mul(24 * 60 * 60),
+        ),
     };
     let interactive = tui::should_use_tui(global.no_tui);
     tui::run_app(app, sink, interactive, shutdown).await

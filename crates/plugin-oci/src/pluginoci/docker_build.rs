@@ -123,6 +123,10 @@ pub(crate) struct ToolIo<'io> {
     /// live path and are `None` outside an interactive run, so without this a
     /// `docker buildx build` printed its whole progress log nowhere at all.
     log: Option<std::sync::Mutex<std::fs::File>>,
+    /// Where `log` lives: what a failure hands the engine (as its `Log`
+    /// [`hplugin::error::FailureArtifacts`] entry) so the failure box renders
+    /// the tool's output as the target's log, rather than the error pasting it.
+    log_path: PathBuf,
 }
 
 /// The three places a tool's output goes: the user's live stdout/stderr (absent
@@ -143,10 +147,11 @@ impl<'io> ToolIo<'io> {
         // Appended, not truncated: one run may shell out several times
         // (`oci_push` does load → tag → push → rmi) and each one's output
         // belongs to the same target's log.
+        let log_path = req.sandbox_dir.join("log.txt");
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(req.sandbox_dir.join("log.txt"))
+            .open(&log_path)
             .map_err(|e| {
                 // Losing the log must not fail the build; say so once and carry
                 // on with whatever live sinks exist.
@@ -158,6 +163,7 @@ impl<'io> ToolIo<'io> {
             stdout: req.stdout.take(),
             stderr: req.stderr.take(),
             log,
+            log_path,
         }
     }
 
@@ -169,6 +175,7 @@ impl<'io> ToolIo<'io> {
             stdout,
             stderr,
             log,
+            log_path: _,
         } = self;
         (stdout.as_deref_mut(), stderr.as_deref_mut(), log.as_ref())
     }
@@ -1197,11 +1204,12 @@ impl ManagedDriver for Driver {
 
 /// Turn a `docker buildx build` failure into one the user can act on.
 ///
-/// BuildKit's own message is kept — it is usually the specific one — and the
-/// heph-side remedy is layered on top for the two failures whose fix lives in
+/// BuildKit's own message stays in the target's log — it is usually the
+/// specific one, and the failure box shows it — and the heph-side remedy is
+/// layered on top for the two failures whose fix lives in
 /// the BUILD file rather than in the Dockerfile.
 fn build_error_hint(e: anyhow::Error, def: &DockerBuildDef, addr: &str) -> anyhow::Error {
-    let text = format!("{e:#}");
+    let text = failure_text(&e);
 
     // The `docker` driver (a plain daemon builder without the containerd image
     // store) has no file exporters at all: it can only load or push into the
@@ -1486,11 +1494,67 @@ pub(crate) async fn run_tool(
         } else {
             tail
         };
-        anyhow::bail!("{what} failed ({status}): {}", tail.trim_end());
+        // The tool's output is in the target's log, returned as the failure's
+        // `Log` artifact, which the failure box renders the tail of — the same
+        // shape an `exec` target's failure has. Pasting it into the message as
+        // well printed BuildKit's whole progress inline with the error. Only a
+        // log that could not be opened (or named) leaves the message as the one
+        // place the output survives.
+        let log = io
+            .log
+            .as_ref()
+            .and_then(|_| hplugin::error::log_file_artifact(&io.log_path));
+        let failed = ToolFailed {
+            what,
+            status: status.to_string(),
+            tail: tail.trim_end().to_string(),
+            logged: log.is_some(),
+        };
+        let Some(log) = log else {
+            return Err(anyhow::Error::msg(failed));
+        };
+        return Err(hplugin::error::with_failure_artifacts(
+            anyhow::Error::new(hplugin::error::ProcessFailed::from_status(status)),
+            vec![log],
+        )
+        .context(failed));
     }
 
     let captured = captured.into_inner().unwrap_or_default();
     Ok(String::from_utf8_lossy(&captured).into_owned())
+}
+
+/// A host tool exited non-zero. Its output is in the target's log; the tail is
+/// kept here, out of the message, so [`build_error_hint`] can still recognise
+/// BuildKit's failure without the error reprinting the log.
+#[derive(Debug)]
+pub(crate) struct ToolFailed {
+    what: &'static str,
+    status: String,
+    tail: String,
+    /// The output reached the target's log. When it did not, the message is
+    /// the only place it survives, so the tail is printed.
+    logged: bool,
+}
+
+impl std::fmt::Display for ToolFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.logged {
+            write!(f, "{} failed", self.what)
+        } else {
+            write!(f, "{} failed ({}): {}", self.what, self.status, self.tail)
+        }
+    }
+}
+
+/// The text a failure hint matches on: the message, plus the tool's output tail
+/// that a logged [`ToolFailed`] keeps out of it.
+fn failure_text(e: &anyhow::Error) -> String {
+    let msg = hcore::hmemoizer::chain_message(e);
+    match e.downcast_ref::<ToolFailed>() {
+        Some(t) if t.logged => format!("{msg}\n{}", t.tail),
+        _ => msg,
+    }
 }
 
 /// Turn the bare `No such file or directory` a missing tool produces into
@@ -2848,8 +2912,6 @@ exit 0
         );
     }
 
-    /// A non-zero exit surfaces the tool's own stderr — the user needs the
-    /// BuildKit message, not just "exit status 1".
     /// The builder's progress has to land in the target's `log.txt`: that file is
     /// what the engine collects, what the failure box renders a tail of, and what
     /// `heph log` serves. The live `stdout`/`stderr` sinks are `None` outside an
@@ -2888,8 +2950,12 @@ exit 0
         );
     }
 
+    /// A non-zero exit is a `ProcessFailed` over the target's log: the BuildKit
+    /// message reaches the user as the failure's log tail, the same shape an
+    /// `exec` target's failure has — not pasted into the error message, which
+    /// printed the whole build progress inline with it.
     #[tokio::test]
-    async fn run_surfaces_stderr_on_failure() {
+    async fn run_failure_carries_the_log_not_the_output() {
         let sbx = Sandbox::new("app");
         std::fs::write(sbx.pkg.join("Dockerfile"), "FROM scratch\n").expect("dockerfile");
         let resp = parse_in(&sbx, "//app:img", cfg(&[ctx()])).await;
@@ -2906,8 +2972,27 @@ exit 0
             .await
             .err()
             .expect("a failing build must error");
-        let msg = format!("{err:#}");
-        assert!(msg.contains("failed to solve"), "got: {msg}");
+        let msg = hcore::hmemoizer::chain_message(&err);
+        assert!(
+            !msg.contains("failed to solve"),
+            "output pasted inline: {msg}"
+        );
+        assert!(!msg.contains(": :"), "an empty frame rendered: {msg}");
+        assert!(msg.contains("docker buildx build failed"), "got: {msg}");
+        assert_eq!(
+            hplugin::error::process_exit(&err),
+            Some(hplugin::error::Exit::Code(1)),
+            "{msg}"
+        );
+        let artifact = hplugin::error::failure_log(&err).expect("the failure carries the log");
+        assert_eq!(artifact.name, "log.txt");
+        let mut log = String::new();
+        std::io::Read::read_to_string(
+            &mut hcore::hartifactcontent::Content::reader(artifact).expect("open log"),
+            &mut log,
+        )
+        .expect("read log");
+        assert!(log.contains("failed to solve"), "log: {log:?}");
     }
 
     /// The plain `docker` driver has no file exporters, so a `docker_build` build
@@ -2935,8 +3020,9 @@ exit 0
         let msg = format!("{err:#}");
         assert!(msg.contains("docker buildx create"), "got: {msg}");
         assert!(msg.contains("builder ="), "got: {msg}");
-        // BuildKit's own message stays in the chain.
-        assert!(msg.contains("exporter is not supported"), "got: {msg}");
+        // BuildKit's own message is in the target's log, not pasted into the
+        // error: the hint is recognised from the tail the error keeps aside.
+        assert!(!msg.contains("exporter is not supported"), "got: {msg}");
     }
 
     #[tokio::test]

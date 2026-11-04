@@ -123,6 +123,11 @@ impl Engine {
             )
             .await?;
 
+        // This target resolves again: its last failure no longer describes it.
+        // Under the execute lock, before the sandbox exists, so a failure of
+        // this run fills a slot nothing clears behind it.
+        self.failure_slots.clear(addr).await;
+
         // Admission AFTER dep resolution so nothing is reserved while waiting for
         // deps — prevents the classic diamond deadlock where mid-nodes hold
         // capacity while waiting for a leaf that also needs some.
@@ -231,13 +236,30 @@ impl Engine {
                 let res = match run {
                     Ok(res) => res,
                     Err(err) => {
-                        // The target failed. Its sandbox *is* the diagnostic —
-                        // the failure paragraph reads the process's last log
-                        // lines from it lazily, at render time — so nothing may
-                        // be queued against it, or the diagnostic races its own
-                        // cleanup and a failing target reports an exit status
-                        // with no output. The tree survives until this target's
-                        // next run, whose `remove_stale` reclaims it.
+                        // The target failed. Keep its log in the failure slot
+                        // (or, for material, its tail in memory) before anything
+                        // is done to the sandbox it lives in. Here, under the
+                        // execute lock, once per run — not per caller.
+                        // A cancelled run did not fail: nothing to keep.
+                        let err = if hplugin::error::is_cancelled(&err) {
+                            err
+                        } else {
+                            let slot = self
+                                .failure_slots
+                                .fill(crate::engine::failure_slot::Fill {
+                                    addr,
+                                    hashin,
+                                    roots: self.sandbox_roots(&sandbox_dir),
+                                    err: &err,
+                                    lines: rs.log_tail_lines(),
+                                    material: outputs_are_material,
+                                })
+                                .await;
+                            err.context(slot)
+                        };
+                        // The sandbox is kept for diagnostics: nothing may be
+                        // queued against it. The tree survives until this
+                        // target's next run, whose `remove_stale` reclaims it.
                         //
                         // Unless the outputs are material, in which case the
                         // diagnostic is not worth the secret it would leave on
@@ -266,6 +288,20 @@ impl Engine {
         .await;
         htelemetry::telemetry::record_execute_ms(exec_started.elapsed().as_millis() as u64);
         res.map(|(artifacts, teardown, guards)| (artifacts, teardown, guards, execute_guard))
+    }
+
+    /// Where a run in `sandbox_dir` can have written its log: the directory
+    /// itself and, when FUSE is mounted, the mount-side and backing-side
+    /// directories the bridge redirects it to.
+    fn sandbox_roots(&self, sandbox_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut roots = vec![sandbox_dir.to_path_buf()];
+        if self.fuse.mount.is_some()
+            && let Ok(rel) = sandbox_dir.strip_prefix(self.home.join("sandbox"))
+        {
+            roots.push(self.fuse.lower.join(rel));
+            roots.push(self.fuse.upper.join(rel));
+        }
+        roots
     }
 
     /// The one sandbox block every run goes through, a build's

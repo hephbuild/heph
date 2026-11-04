@@ -16,9 +16,14 @@ use crate::tui::color::stderr_color_enabled as color_enabled;
 /// merely restate the target address (engine boundaries like `execute //addr`,
 /// already shown in the title) and joining the rest the way anyhow's `{:#}`
 /// would. If every frame mentions the addr (e.g. a bare `target not found`), the
-/// whole chain is kept.
+/// whole chain is kept. A frame that renders empty (a failure's artifacts riding
+/// the chain) is no cause and is skipped.
 fn cause_chain(source: &anyhow::Error, addr: &str) -> String {
-    let frames: Vec<String> = source.chain().map(|c| c.to_string()).collect();
+    let frames: Vec<String> = source
+        .chain()
+        .map(|c| c.to_string())
+        .filter(|f| !f.is_empty())
+        .collect();
     let start = frames.iter().position(|f| !f.contains(addr)).unwrap_or(0);
     frames.get(start..).unwrap_or(&[]).join(": ")
 }
@@ -137,15 +142,24 @@ fn render_target_failure(f: &TargetFailure, color: bool) -> String {
         };
         out.push_str(&format!("{arrow} {cause}\n"));
     }
-    if let Some(log) = &f.log_tail {
+    // The tail is read from the slot's log through the handle the engine kept
+    // open, so a rerun replacing the slot meanwhile cannot swap this run's box.
+    let tail = match &f.log {
+        Some(log) => log.tail().ok().or_else(|| f.log_tail.clone()),
+        None => f.log_tail.clone(),
+    };
+    if let Some(log) = &tail {
         render_log_box(&mut out, &log.text, log.start_line, color);
+    }
+    if let Some(path) = f.log.as_ref().and_then(|l| l.path()) {
+        out.push_str(&format!("  full log: {}\n", path.display()));
     }
     out
 }
 
 /// Render each recorded target failure, separated by a blank line. Pure, so the
 /// exact bytes the user sees are assertable without capturing stderr.
-fn render_failures_to_string(failures: &[Arc<TargetFailure>], color: bool) -> String {
+pub fn render_failures_to_string(failures: &[Arc<TargetFailure>], color: bool) -> String {
     let mut out = String::new();
     for (i, f) in failures.iter().enumerate() {
         if i > 0 {
@@ -740,7 +754,11 @@ fn render_anyhow_to_string(e: &anyhow::Error, color: bool) -> Option<String> {
         render_diff_box(&mut out, &fc.diff, color);
         return Some(out);
     }
-    let frames: Vec<String> = e.chain().map(|c| c.to_string()).collect();
+    let frames: Vec<String> = e
+        .chain()
+        .map(|c| c.to_string())
+        .filter(|f| !f.is_empty())
+        .collect();
     let top = frames.first()?;
     let mut out = format!("× {top}\n");
     let rest = frames.get(1..).unwrap_or(&[]);
@@ -757,14 +775,10 @@ mod tests {
     use anyhow::Context as _;
     use std::sync::Arc;
 
-    /// A `ProcessFailed` whose log handle is never read (tests that only exercise
-    /// the cause chain / rendering, not log extraction).
+    /// A `ProcessFailed` for tests that only exercise the cause chain /
+    /// rendering, not log extraction.
     fn dummy_process_failed() -> ProcessFailed {
-        ProcessFailed {
-            status: "exit status: 1".to_string(),
-            log: Arc::new(hcore::hartifactcontent::FileContent::new("/dev/null")),
-            exit: None,
-        }
+        ProcessFailed::new("exit status: 1", None)
     }
 
     #[test]
@@ -1259,6 +1273,34 @@ mod tests {
         assert_eq!(e.to_string(), "cancelled");
         assert!(!ran);
         Ok(())
+    }
+
+    /// The box reads the slot's log through the handle opened at fill time,
+    /// not by path: a rerun replacing the slot after this run failed changes
+    /// nothing in this run's box. The footer names the slot's log.
+    #[test]
+    fn failure_box_reads_open_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.txt");
+        std::fs::write(&path, "first\nthis run's line\n").unwrap();
+        let log = crate::engine::error::FailureLog::open(
+            path.clone(),
+            std::fs::File::open(&path).unwrap(),
+            10,
+        );
+        // A concurrent rerun replaces the slot's file.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, "another run's line\n").unwrap();
+
+        let addr = crate::htaddr::parse_addr("//p:a").unwrap();
+        let f = TargetFailure::new(addr, None, anyhow::anyhow!("boom")).with_log(Some(log));
+        let rendered = render_target_failure(&f, false);
+        assert!(rendered.contains("2 │ this run's line"), "{rendered}");
+        assert!(!rendered.contains("another run"), "{rendered}");
+        assert!(
+            rendered.ends_with(&format!("  full log: {}\n", path.display())),
+            "{rendered}"
+        );
     }
 
     #[test]

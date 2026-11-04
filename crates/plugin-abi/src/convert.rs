@@ -1728,6 +1728,68 @@ pub fn exit_from_pb(
     }
 }
 
+/// A run's failure as the wire carries it: `message` (the plugin's whole
+/// rendered chain), plus the process exit and the
+/// [`FailureArtifacts`](hplugin::error::FailureArtifacts) riding `err`. Any
+/// error may carry artifacts, with or without an exit. One that cannot cross
+/// (a host-only view) is left out: the message still says what failed.
+pub fn run_failure_to_pb(err: &anyhow::Error, message: String) -> pb::RunFailure {
+    let mut failure = pb::RunFailure {
+        message: Some(message),
+        ..Default::default()
+    };
+    if let Some(exit) = hplugin::error::process_exit(err) {
+        failure.exit = exit_to_pb(exit).into();
+    }
+    if let Some(fa) = hplugin::error::failure_artifacts(err) {
+        failure.artifacts = fa
+            .0
+            .iter()
+            .filter_map(|a| match output_artifact_to_pb(a) {
+                Ok(pb) => Some(pb),
+                Err(e) => {
+                    tracing::debug!(artifact = %a.name, error = %format!("{e:#}"), "failure artifact cannot cross the plugin ABI; dropped");
+                    None
+                }
+            })
+            .collect();
+    }
+    failure
+}
+
+/// The host's error for a `RunFailure`: a
+/// [`RemoteProcessFailed`](hplugin::error::RemoteProcessFailed) when it carries
+/// an exit, a plain message otherwise, with its artifacts rebuilt as the same
+/// [`FailureArtifacts`](hplugin::error::FailureArtifacts) context.
+///
+/// Lenient on the artifacts, as nowhere else on the wire: this is the failure
+/// path, and an artifact that does not decode must not cost the message that
+/// says what failed. It is dropped with a `debug!`; message and exit are kept.
+pub fn run_failure_from_pb(failure: pb::RunFailure) -> anyhow::Error {
+    let pb::RunFailure {
+        message,
+        exit,
+        artifacts,
+        ..
+    } = failure;
+    let message = message.unwrap_or_default();
+    let err = match exit_from_pb(exit) {
+        Some(exit) => anyhow::Error::new(hplugin::error::RemoteProcessFailed::new(message, exit)),
+        None => anyhow::Error::msg(message),
+    };
+    let artifacts = artifacts
+        .into_iter()
+        .filter_map(|a| match output_artifact_from_pb(a) {
+            Ok(a) => Some(a),
+            Err(e) => {
+                tracing::debug!(error = %format!("{e:#}"), "undecodable failure artifact dropped");
+                None
+            }
+        })
+        .collect();
+    hplugin::error::with_failure_artifacts(err, artifacts)
+}
+
 /// `addr`, `raw_def`, `cache` and `hash` are required; `pty` and `transparent`
 /// are off unless said.
 pub fn target_def_from_pb(td: pb::TargetDef) -> anyhow::Result<TargetDef> {
@@ -2848,20 +2910,62 @@ mod tests {
             Exit::Signal(15),
             Exit::Signal(9),
         ] {
-            let frame = pb::RunOutFrame {
-                msg: Some(pb::run_out_frame::Msg::Error("boom".to_string())),
+            let failure = pb::RunFailure {
+                message: Some("boom".to_string()),
                 exit: exit_to_pb(e).into(),
                 ..Default::default()
             };
-            assert_eq!(exit_from_pb(via_bytes(&frame).exit), Some(e));
+            assert_eq!(exit_from_pb(via_bytes(&failure).exit), Some(e));
         }
-        let old = pb::RunOutFrame {
-            msg: Some(pb::run_out_frame::Msg::Error("boom".to_string())),
+        let no_exit = pb::RunFailure {
+            message: Some("boom".to_string()),
             ..Default::default()
         };
-        assert_eq!(exit_from_pb(via_bytes(&old).exit), None);
+        assert_eq!(exit_from_pb(via_bytes(&no_exit).exit), None);
         // Present but empty (a status kind this build does not know) is None too.
         assert_eq!(exit_from_pb(pb::ExitStatus::default().into()), None);
+    }
+
+    /// An artifact that does not decode is dropped on the failure path; the
+    /// message, the exit and the artifacts that do decode are kept.
+    #[test]
+    fn run_failure_with_bad_artifact_keeps_message() {
+        let good = output_artifact_to_pb(&OutputArtifact {
+            group: String::new(),
+            name: "log.txt".to_string(),
+            r#type: OaType::Log,
+            content: OaContent::File(ContentFile {
+                source_path: "/sandbox/log.txt".to_string(),
+                out_path: "log.txt".to_string(),
+                x: false,
+                passthrough: false,
+            }),
+            hashout: String::new(),
+        })
+        .expect("encode");
+        // No `name`, no `content`: what a newer or broken peer may send.
+        let bad = pb::OutputArtifactRef::default();
+        for exit in [Some(Exit::Code(2)), None] {
+            let mut failure = pb::RunFailure {
+                message: Some("running //p:t: boom".to_string()),
+                artifacts: vec![bad.clone(), good.clone()],
+                ..Default::default()
+            };
+            if let Some(exit) = exit {
+                failure.exit = exit_to_pb(exit).into();
+            }
+            let err = run_failure_from_pb(via_bytes(&failure));
+            assert_eq!(
+                hcore::hmemoizer::chain_message(&err),
+                "running //p:t: boom",
+                "{exit:?}"
+            );
+            assert_eq!(hplugin::error::process_exit(&err), exit);
+            let fa = hplugin::error::failure_artifacts(&err).expect("the good one is kept");
+            let names: Vec<(&str, &OaType)> =
+                fa.0.iter().map(|a| (a.name.as_str(), &a.r#type)).collect();
+            assert_eq!(names, [("log.txt", &OaType::Log)], "{exit:?}");
+        }
     }
 
     #[test]

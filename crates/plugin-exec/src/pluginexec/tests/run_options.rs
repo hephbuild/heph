@@ -446,7 +446,7 @@ async fn exec_run_inherited_stdio() -> anyhow::Result<()> {
         "an inherited run has no log file"
     );
 
-    // A code and a signal come back as data, with an empty log.
+    // A code and a signal come back as data, with no log.
     for (script, want) in [
         ("exit 3", hplugin::error::Exit::Code(3)),
         ("kill -TERM $$", hplugin::error::Exit::Signal(libc::SIGTERM)),
@@ -459,10 +459,10 @@ async fn exec_run_inherited_stdio() -> anyhow::Result<()> {
             .downcast_ref::<hplugin::error::ProcessFailed>()
             .expect("a ProcessFailed");
         assert_eq!(pf.exit, Some(want), "{script}");
-        let mut log = String::new();
-        std::io::Read::read_to_string(&mut pf.log.reader()?, &mut log)?;
-        assert!(log.is_empty(), "{script}: {log:?}");
-        assert_eq!(pf.log.file_path(), None, "{script}: never a sandbox handle");
+        assert!(
+            hplugin::error::failure_artifacts(&err).is_none(),
+            "{script}: never a sandbox handle"
+        );
     }
 
     // A signal relayed before the spawn is delivered once the tool exists.

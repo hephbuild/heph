@@ -434,6 +434,15 @@ pub enum BuildEventKind {
         revisions_removed: usize,
         bytes_removed: u64,
     },
+    /// `heph tool gc` swept `<home>/failures/`: how many last-failure slots it
+    /// removed and the bytes they held. Emitted once per sweep. An older
+    /// consumer reads it as [`BuildEventKind::Unknown`].
+    GcFailureLogsSwept {
+        #[serde(default)]
+        removed: usize,
+        #[serde(default)]
+        bytes_removed: u64,
+    },
     /// An event kind this build of the consumer does not know.
     ///
     /// **Load-bearing for cross-version safety, not a placeholder.** Events ride
@@ -701,6 +710,31 @@ mod tests {
             }
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    /// `GcTargetSwept` keeps its shape, and `GcFailureLogsSwept` decodes with
+    /// its fields absent.
+    #[test]
+    fn gc_event_old_frame_decodes() {
+        let old = r#"{"at_unix_ms":1,"kind":{"type":"GcTargetSwept",
+            "revisions_removed":2,"bytes_removed":8}}"#;
+        let ev: BuildEvent = serde_json::from_str(old).expect("old frame must decode");
+        assert!(matches!(
+            ev.kind,
+            BuildEventKind::GcTargetSwept {
+                revisions_removed: 2,
+                bytes_removed: 8
+            }
+        ));
+        let bare = r#"{"at_unix_ms":1,"kind":{"type":"GcFailureLogsSwept"}}"#;
+        let ev: BuildEvent = serde_json::from_str(bare).expect("bare frame must decode");
+        assert!(matches!(
+            ev.kind,
+            BuildEventKind::GcFailureLogsSwept {
+                removed: 0,
+                bytes_removed: 0
+            }
+        ));
     }
 
     /// A frame from a host *newer* than this build: it carries fields this build

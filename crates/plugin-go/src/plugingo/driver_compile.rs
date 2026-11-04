@@ -467,210 +467,129 @@ impl ManagedDriver for GoCompileDriver {
 
     async fn run<'a, 'io>(
         &self,
-        req: ManagedRunRequest<'a, 'io>,
+        mut req: ManagedRunRequest<'a, 'io>,
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ManagedRunResponse> {
-        let def = req.request.target.def_de::<GoCompileDef>();
-        let pkg_dir = &req.sandbox_pkg_dir;
-        let ws_root = req.sandbox_ws_dir.to_string_lossy().into_owned();
+        let res: anyhow::Result<ManagedRunResponse> = async {
+            let def = req.request.target.def_de::<GoCompileDef>();
+            let pkg_dir = &req.sandbox_pkg_dir;
+            let log = req.sandbox_dir.join("log.txt");
+            let ws_root = req.sandbox_ws_dir.to_string_lossy().into_owned();
 
-        // GOROOT / go binary for the selected toolchain — host, target-ref, or
-        // hermetic staged SDK (mirrors go_golist, see `resolve_toolchain_go`).
-        use crate::plugingo::toolchain::Toolchain;
-        let runner = super::runner::runner_ref(req.request.request_id, def.runner.as_ref());
-        let (goroot, go_bin) = crate::plugingo::toolchain::resolve_toolchain_go(
-            &def.go_version,
-            &req.inputs,
-            &req.sandbox_ws_dir,
-            "go.compile",
-            runner,
-            &self.host_go,
-            ctoken,
-        )
-        .await?;
-
-        // Resolved and locked by the host from this target's scratch reference,
-        // always — `--no-scratch` supplies an empty mount rather than none, so
-        // there is nothing to fall back to and nothing to guess.
-        let gocache = req
-            .request
-            .scratch
-            .iter()
-            .find(|m| m.env == "GOCACHE")
-            .map(|m| m.dir.clone())
-            .context(
-                "no GOCACHE scratch mount: the host resolves and locks one for every \
-                 target that references the shared cache, and `--no-scratch` supplies an \
-                 empty one rather than none",
-            )?;
-
-        let mut env: HashMap<String, String> = HashMap::new();
-        env.insert("GOOS".to_string(), def.goos.clone());
-        env.insert("GOARCH".to_string(), def.goarch.clone());
-        env.insert("GOROOT".to_string(), goroot.to_string_lossy().into_owned());
-        env.insert(
-            "GOCACHE".to_string(),
-            gocache.to_string_lossy().into_owned(),
-        );
-        env.insert("GOTOOLCHAIN".to_string(), "local".to_string());
-        env.insert("GOWORK".to_string(), "off".to_string());
-        // `1` only for a race build off darwin, matching the golist and link
-        // sandboxes — see `factors::cgo_required`. The archives this driver
-        // produces are pure Go either way; the setting exists so `go tool
-        // compile`'s view of the build config matches everyone else's.
-        env.insert(
-            "CGO_ENABLED".to_string(),
-            crate::plugingo::factors::cgo_enabled_value(&def.goos, def.race).to_string(),
-        );
-        if !def.goexperiment.is_empty() {
-            env.insert("GOEXPERIMENT".to_string(), def.goexperiment.join(","));
-        }
-        // Non-hermetic toolchains (host, or a hostbin/nix target wrapper) may need
-        // PATH; hermetic mode omits it to stay PATH-independent.
-        if !matches!(
-            crate::plugingo::toolchain::classify(&def.go_version),
-            Toolchain::Hermetic(_)
-        ) && let Ok(v) = std::env::var("PATH")
-        {
-            env.insert("PATH".to_string(), v);
-        }
-
-        // 1. importcfg: one `packagefile <import>=<archive>` per transitive lib,
-        //    sorted by import path (matches the old write_importcfg_script).
-        let mut import_paths = def.import_paths.clone();
-        import_paths.sort();
-        let mut importcfg = String::new();
-        for ip in &import_paths {
-            let group = crate::plugingo::addr_util::import_path_to_dep_group(ip);
-            let archive = self
-                .single_staged_path(&req, &group)
-                .with_context(|| format!("locate staged archive for lib {ip}"))?;
-            importcfg.push_str(&format!("packagefile {ip}={archive}\n"));
-        }
-        let importcfg_path = pkg_dir.join("importcfg");
-        std::fs::write(&importcfg_path, &importcfg).context("write importcfg")?;
-
-        // 2. sources response file: every staged `.go` source in the default group.
-        let src_paths = self.group_staged_paths(&req, "");
-        let rsp_path = pkg_dir.join("gofiles.rsp");
-        std::fs::write(&rsp_path, src_paths.join("\n")).context("write sources response file")?;
-
-        // 3. embedcfg (optional): patterns from go list ∪ go_embed_src resolution.
-        let has_embed = if let Some(variant) = def.embed_variant {
-            let embedcfg = self
-                .compute_embedcfg(&req, def, variant)
-                .context("compute embedcfg")?;
-            std::fs::write(pkg_dir.join("embedcfg"), embedcfg).context("write embedcfg")?;
-            true
-        } else {
-            false
-        };
-
-        let has_asm = !def.s_files.is_empty();
-        // `-shared` iff the link is PIE — cmd/go couples them the same way, and a
-        // mismatch is a link failure, not a slower binary. A race build on linux
-        // already had its buildmode forced to `exe` at variant resolution
-        // (`BuildMode::for_race`), so it lands here as a plain archive — matching
-        // the stdlib `go install -race` produced for that mode.
-        let shared: Option<&str> = def.buildmode.needs_shared().then_some("-shared");
-        let trimpath = format!("-trimpath={ws_root}");
-        let goinc = format!("{}/pkg/include", goroot.to_string_lossy());
-
-        let run_go =
-            |args: Vec<String>| -> Vec<OsString> { args.into_iter().map(OsString::from).collect() };
-
-        // Every `go tool` step below runs under the target's exec runner, so a
-        // compile configured to happen inside an environment happens there for
-        // asm and pack too, not only for the compile itself.
-
-        // 4. asm step 0+1: seed go_asm.h, then -gensymabis → symabis.
-        if has_asm {
-            std::fs::write(pkg_dir.join("go_asm.h"), b"").context("seed go_asm.h")?;
-            let mut args = vec![
-                "tool".to_string(),
-                "asm".to_string(),
-                "-p".to_string(),
-                def.p_flag.clone(),
-                trimpath.clone(),
-                "-I".to_string(),
-                ".".to_string(),
-                "-I".to_string(),
-                goinc.clone(),
-                "-D".to_string(),
-                format!("GOOS_{}", def.goos),
-                "-D".to_string(),
-                format!("GOARCH_{}", def.goarch),
-            ];
-            args.extend(shared.map(str::to_string));
-            args.extend([
-                "-gensymabis".to_string(),
-                "-o".to_string(),
-                "symabis".to_string(),
-            ]);
-            for s in &def.s_files {
-                args.push(format!("./{s}"));
-            }
-            self.exec_go(
-                &go_bin,
-                run_go(args),
-                &env,
-                pkg_dir,
+            // GOROOT / go binary for the selected toolchain — host, target-ref, or
+            // hermetic staged SDK (mirrors go_golist, see `resolve_toolchain_go`).
+            use crate::plugingo::toolchain::Toolchain;
+            let runner = super::runner::runner_ref(req.request.request_id, def.runner.as_ref());
+            let (goroot, go_bin) = crate::plugingo::toolchain::resolve_toolchain_go(
+                &def.go_version,
+                &req.inputs,
+                &req.sandbox_ws_dir,
+                "go.compile",
                 runner,
+                &self.host_go,
                 ctoken,
-                "asm -gensymabis",
             )
             .await?;
-        }
 
-        // 5. compile.
-        let mut cargs = vec![
-            "tool".to_string(),
-            "compile".to_string(),
-            "-p".to_string(),
-            def.p_flag.clone(),
-            trimpath.clone(),
-            "-pack".to_string(),
-            "-importcfg".to_string(),
-            importcfg_path.to_string_lossy().into_owned(),
-        ];
-        // Race instrumentation. Before the variant gcflags so a variant can still
-        // override it if it ever needs to, and so the flag order matches what
-        // `go build -race` itself emits.
-        if def.race {
-            cargs.push("-race".to_string());
-        }
-        // Variant gcflags — raw `go tool compile` flags (what `-gcflags` forwards),
-        // in declared order, before the source responses.
-        cargs.extend(def.gcflags.iter().cloned());
-        if has_asm {
-            cargs.push("-symabis".to_string());
-            cargs.push("symabis".to_string());
-            cargs.push("-asmhdr".to_string());
-            cargs.push("go_asm.h".to_string());
-        }
-        if has_embed {
-            cargs.push("-embedcfg".to_string());
-            cargs.push("embedcfg".to_string());
-        }
-        cargs.extend(shared.map(str::to_string));
-        cargs.push("-o".to_string());
-        cargs.push(def.out_file.clone());
-        cargs.push(format!("@{}", rsp_path.to_string_lossy()));
-        self.exec_go(
-            &go_bin,
-            run_go(cargs),
-            &env,
-            pkg_dir,
-            runner,
-            ctoken,
-            "compile",
-        )
-        .await?;
+            // Resolved and locked by the host from this target's scratch reference,
+            // always — `--no-scratch` supplies an empty mount rather than none, so
+            // there is nothing to fall back to and nothing to guess.
+            let gocache = req
+                .request
+                .scratch
+                .iter()
+                .find(|m| m.env == "GOCACHE")
+                .map(|m| m.dir.clone())
+                .context(
+                    "no GOCACHE scratch mount: the host resolves and locks one for every \
+                 target that references the shared cache, and `--no-scratch` supplies an \
+                 empty one rather than none",
+                )?;
 
-        // 6. asm step 3+4: assemble each .s, then pack into the archive.
-        if has_asm {
-            for s in &def.s_files {
-                let obj = format!("{}.o", s.trim_end_matches(".s"));
+            let mut env: HashMap<String, String> = HashMap::new();
+            env.insert("GOOS".to_string(), def.goos.clone());
+            env.insert("GOARCH".to_string(), def.goarch.clone());
+            env.insert("GOROOT".to_string(), goroot.to_string_lossy().into_owned());
+            env.insert(
+                "GOCACHE".to_string(),
+                gocache.to_string_lossy().into_owned(),
+            );
+            env.insert("GOTOOLCHAIN".to_string(), "local".to_string());
+            env.insert("GOWORK".to_string(), "off".to_string());
+            // `1` only for a race build off darwin, matching the golist and link
+            // sandboxes — see `factors::cgo_required`. The archives this driver
+            // produces are pure Go either way; the setting exists so `go tool
+            // compile`'s view of the build config matches everyone else's.
+            env.insert(
+                "CGO_ENABLED".to_string(),
+                crate::plugingo::factors::cgo_enabled_value(&def.goos, def.race).to_string(),
+            );
+            if !def.goexperiment.is_empty() {
+                env.insert("GOEXPERIMENT".to_string(), def.goexperiment.join(","));
+            }
+            // Non-hermetic toolchains (host, or a hostbin/nix target wrapper) may need
+            // PATH; hermetic mode omits it to stay PATH-independent.
+            if !matches!(
+                crate::plugingo::toolchain::classify(&def.go_version),
+                Toolchain::Hermetic(_)
+            ) && let Ok(v) = std::env::var("PATH")
+            {
+                env.insert("PATH".to_string(), v);
+            }
+
+            // 1. importcfg: one `packagefile <import>=<archive>` per transitive lib,
+            //    sorted by import path (matches the old write_importcfg_script).
+            let mut import_paths = def.import_paths.clone();
+            import_paths.sort();
+            let mut importcfg = String::new();
+            for ip in &import_paths {
+                let group = crate::plugingo::addr_util::import_path_to_dep_group(ip);
+                let archive = self
+                    .single_staged_path(&req, &group)
+                    .with_context(|| format!("locate staged archive for lib {ip}"))?;
+                importcfg.push_str(&format!("packagefile {ip}={archive}\n"));
+            }
+            let importcfg_path = pkg_dir.join("importcfg");
+            std::fs::write(&importcfg_path, &importcfg).context("write importcfg")?;
+
+            // 2. sources response file: every staged `.go` source in the default group.
+            let src_paths = self.group_staged_paths(&req, "");
+            let rsp_path = pkg_dir.join("gofiles.rsp");
+            std::fs::write(&rsp_path, src_paths.join("\n"))
+                .context("write sources response file")?;
+
+            // 3. embedcfg (optional): patterns from go list ∪ go_embed_src resolution.
+            let has_embed = if let Some(variant) = def.embed_variant {
+                let embedcfg = self
+                    .compute_embedcfg(&req, def, variant)
+                    .context("compute embedcfg")?;
+                std::fs::write(pkg_dir.join("embedcfg"), embedcfg).context("write embedcfg")?;
+                true
+            } else {
+                false
+            };
+
+            let has_asm = !def.s_files.is_empty();
+            // `-shared` iff the link is PIE — cmd/go couples them the same way, and a
+            // mismatch is a link failure, not a slower binary. A race build on linux
+            // already had its buildmode forced to `exe` at variant resolution
+            // (`BuildMode::for_race`), so it lands here as a plain archive — matching
+            // the stdlib `go install -race` produced for that mode.
+            let shared: Option<&str> = def.buildmode.needs_shared().then_some("-shared");
+            let trimpath = format!("-trimpath={ws_root}");
+            let goinc = format!("{}/pkg/include", goroot.to_string_lossy());
+
+            let run_go = |args: Vec<String>| -> Vec<OsString> {
+                args.into_iter().map(OsString::from).collect()
+            };
+
+            // Every `go tool` step below runs under the target's exec runner, so a
+            // compile configured to happen inside an environment happens there for
+            // asm and pack too, not only for the compile itself.
+
+            // 4. asm step 0+1: seed go_asm.h, then -gensymabis → symabis.
+            if has_asm {
+                std::fs::write(pkg_dir.join("go_asm.h"), b"").context("seed go_asm.h")?;
                 let mut args = vec![
                     "tool".to_string(),
                     "asm".to_string(),
@@ -687,32 +606,136 @@ impl ManagedDriver for GoCompileDriver {
                     format!("GOARCH_{}", def.goarch),
                 ];
                 args.extend(shared.map(str::to_string));
-                args.extend(["-o".to_string(), obj, format!("./{s}")]);
-                self.exec_go(&go_bin, run_go(args), &env, pkg_dir, runner, ctoken, "asm")
-                    .await?;
+                args.extend([
+                    "-gensymabis".to_string(),
+                    "-o".to_string(),
+                    "symabis".to_string(),
+                ]);
+                for s in &def.s_files {
+                    args.push(format!("./{s}"));
+                }
+                self.exec_go(
+                    &go_bin,
+                    run_go(args),
+                    &env,
+                    pkg_dir,
+                    &log,
+                    runner,
+                    ctoken,
+                    "asm -gensymabis",
+                )
+                .await?;
             }
-            let mut pargs = vec![
+
+            // 5. compile.
+            let mut cargs = vec![
                 "tool".to_string(),
-                "pack".to_string(),
-                "r".to_string(),
-                def.out_file.clone(),
+                "compile".to_string(),
+                "-p".to_string(),
+                def.p_flag.clone(),
+                trimpath.clone(),
+                "-pack".to_string(),
+                "-importcfg".to_string(),
+                importcfg_path.to_string_lossy().into_owned(),
             ];
-            for s in &def.s_files {
-                pargs.push(format!("{}.o", s.trim_end_matches(".s")));
+            // Race instrumentation. Before the variant gcflags so a variant can still
+            // override it if it ever needs to, and so the flag order matches what
+            // `go build -race` itself emits.
+            if def.race {
+                cargs.push("-race".to_string());
             }
+            // Variant gcflags — raw `go tool compile` flags (what `-gcflags` forwards),
+            // in declared order, before the source responses.
+            cargs.extend(def.gcflags.iter().cloned());
+            if has_asm {
+                cargs.push("-symabis".to_string());
+                cargs.push("symabis".to_string());
+                cargs.push("-asmhdr".to_string());
+                cargs.push("go_asm.h".to_string());
+            }
+            if has_embed {
+                cargs.push("-embedcfg".to_string());
+                cargs.push("embedcfg".to_string());
+            }
+            cargs.extend(shared.map(str::to_string));
+            cargs.push("-o".to_string());
+            cargs.push(def.out_file.clone());
+            cargs.push(format!("@{}", rsp_path.to_string_lossy()));
             self.exec_go(
                 &go_bin,
-                run_go(pargs),
+                run_go(cargs),
                 &env,
                 pkg_dir,
+                &log,
                 runner,
                 ctoken,
-                "pack",
+                "compile",
             )
             .await?;
-        }
 
-        Ok(ManagedRunResponse { artifacts: vec![] })
+            // 6. asm step 3+4: assemble each .s, then pack into the archive.
+            if has_asm {
+                for s in &def.s_files {
+                    let obj = format!("{}.o", s.trim_end_matches(".s"));
+                    let mut args = vec![
+                        "tool".to_string(),
+                        "asm".to_string(),
+                        "-p".to_string(),
+                        def.p_flag.clone(),
+                        trimpath.clone(),
+                        "-I".to_string(),
+                        ".".to_string(),
+                        "-I".to_string(),
+                        goinc.clone(),
+                        "-D".to_string(),
+                        format!("GOOS_{}", def.goos),
+                        "-D".to_string(),
+                        format!("GOARCH_{}", def.goarch),
+                    ];
+                    args.extend(shared.map(str::to_string));
+                    args.extend(["-o".to_string(), obj, format!("./{s}")]);
+                    self.exec_go(
+                        &go_bin,
+                        run_go(args),
+                        &env,
+                        pkg_dir,
+                        &log,
+                        runner,
+                        ctoken,
+                        "asm",
+                    )
+                    .await?;
+                }
+                let mut pargs = vec![
+                    "tool".to_string(),
+                    "pack".to_string(),
+                    "r".to_string(),
+                    def.out_file.clone(),
+                ];
+                for s in &def.s_files {
+                    pargs.push(format!("{}.o", s.trim_end_matches(".s")));
+                }
+                self.exec_go(
+                    &go_bin,
+                    run_go(pargs),
+                    &env,
+                    pkg_dir,
+                    &log,
+                    runner,
+                    ctoken,
+                    "pack",
+                )
+                .await?;
+            }
+
+            Ok(ManagedRunResponse { artifacts: vec![] })
+        }
+        .await;
+        // `go tool` output is captured, not streamed: see `echo_failure_log`.
+        if let Err(e) = &res {
+            hdriver_support::driver_managed::echo_failure_log(&mut req.request, e).await;
+        }
+        res
     }
 }
 
@@ -851,6 +874,7 @@ impl GoCompileDriver {
         args: Vec<OsString>,
         env: &HashMap<String, String>,
         cwd: &std::path::Path,
+        log: &std::path::Path,
         runner: hexecrunner::RunnerRef<'_>,
         ctoken: &(dyn Cancellable + Send + Sync),
         step: &str,
@@ -874,42 +898,13 @@ impl GoCompileDriver {
             .await
             .with_context(|| format!("wait for go {step}"))?;
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            anyhow::bail!(
-                "go {step} failed ({}):\n{}",
-                output.status,
-                go_failure_detail(&stdout, &stderr)
-            );
+            // Both streams go to the target's log, which the failure box renders
+            // the tail of — `go tool` writes diagnostics to stderr, but some
+            // failures print on stdout. Not pasted into the message.
+            return Err(hplugin::error::ProcessFailed::from_output(log, &output)
+                .context(format!("go {step} failed")));
         }
         Ok(())
-    }
-}
-
-/// Build the human-readable detail for a failed `go` invocation. `go tool` writes
-/// diagnostics to stderr, but some failures (and the `go` wrapper itself) print on
-/// stdout, so a stderr-only message can come back blank — useless. Include both
-/// (labelled, last 20 lines each) and fall back to an explicit marker when both
-/// are empty, so the error always says something actionable.
-pub(crate) fn go_failure_detail(stdout: &str, stderr: &str) -> String {
-    let stderr_tail = hplugin::error::last_n_lines(stderr.trim(), 20);
-    let stdout_tail = hplugin::error::last_n_lines(stdout.trim(), 20);
-    let mut detail = String::new();
-    if !stderr_tail.is_empty() {
-        detail.push_str("stderr:\n");
-        detail.push_str(&stderr_tail);
-    }
-    if !stdout_tail.is_empty() {
-        if !detail.is_empty() {
-            detail.push('\n');
-        }
-        detail.push_str("stdout:\n");
-        detail.push_str(&stdout_tail);
-    }
-    if detail.is_empty() {
-        "<no output on stdout or stderr>".to_string()
-    } else {
-        detail
     }
 }
 
@@ -1082,26 +1077,6 @@ mod driver_tests {
     use hmodel::htpkg::PkgBuf;
 
     const V: &str = crate::plugingo::toolchain::DEFAULT_GO_VERSION;
-
-    // A failed `go` invocation must never report a blank body. Regression: the
-    // message only included stderr, so a failure that printed on stdout (or
-    // nowhere) surfaced as `go compile failed:` with nothing after it.
-    #[test]
-    fn go_failure_detail_surfaces_each_stream() {
-        // stderr only
-        let d = go_failure_detail("", "boom on stderr");
-        assert!(d.contains("stderr:") && d.contains("boom on stderr"), "{d}");
-        assert!(!d.contains("stdout:"), "{d}");
-        // stdout only — must not come back blank
-        let d = go_failure_detail("boom on stdout", "");
-        assert!(d.contains("stdout:") && d.contains("boom on stdout"), "{d}");
-        // both streams present
-        let d = go_failure_detail("out msg", "err msg");
-        assert!(d.contains("out msg") && d.contains("err msg"), "{d}");
-        // neither — explicit marker, never empty
-        let d = go_failure_detail("", "   \n  ");
-        assert_eq!(d, "<no output on stdout or stderr>");
-    }
 
     fn factors() -> Factors {
         Factors {

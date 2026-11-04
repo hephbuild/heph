@@ -27,6 +27,7 @@ mod discovery;
 mod engine_core;
 mod engine_sanity;
 mod execrunner;
+mod failure_slot;
 mod force;
 mod fs_glob;
 mod group;

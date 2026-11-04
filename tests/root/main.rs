@@ -24,6 +24,7 @@ mod build_fmt_cli;
 mod ci_gate;
 mod darwin_linker;
 mod execrunner_gate;
+mod gc_cli;
 mod lint_gate;
 mod lsp_lifecycle;
 mod resources_gate;

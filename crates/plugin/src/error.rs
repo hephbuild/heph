@@ -1,7 +1,8 @@
-use hcore::hartifactcontent::Content;
+use crate::driver::outputartifact::{
+    Content as OaContent, ContentFile, ContentRaw, OutputArtifact, Type as ArtifactType,
+};
 use hmodel::htaddr::Addr;
 use std::fmt;
-use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct TargetNotFoundError {
@@ -235,23 +236,24 @@ impl fmt::Display for UpstreamFailed {
 
 impl std::error::Error for UpstreamFailed {}
 
-/// A target's own process exited non-zero. Carries the exit status string and a
-/// lazy [`Content`] handle to the full process log, rather than the log bytes:
-/// the diagnostic reads only the last N lines on demand (see
-/// [`last_n_lines_with_start`]), where N is the request's `--log-lines`. The log
-/// file persists in the sandbox until the target's next run, so the handle stays
-/// readable through end-of-run rendering. Surfaced as the `source` of a
-/// [`TargetFailure`].
+/// A target's own process exited non-zero. Carries the exit status only: the
+/// process's log rides the same error as a [`FailureArtifacts`] context (see
+/// [`ProcessFailed::from_output`] and [`with_failure_artifacts`]), which the
+/// diagnostic reads the last N lines of on demand. Surfaced as the `source` of
+/// a [`TargetFailure`].
 ///
 /// `status` is the human text (std's `ExitStatus` display, which is not a
 /// contract and must never be parsed); `exit` is the same status as data, for
 /// a caller that mirrors it (an entrypoint's code becomes heph's exit code, its
 /// signal is re-raised). `None` when the driver did not report one — every
 /// driver before the field existed, and a failure that is not a child's exit.
+///
+/// `#[non_exhaustive]`: built with [`ProcessFailed::new`] outside this crate,
+/// so a later field is not a source break.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ProcessFailed {
     pub status: String,
-    pub log: Arc<dyn Content>,
     pub exit: Option<Exit>,
 }
 
@@ -268,11 +270,12 @@ pub use hcore::process::Exit;
 /// A run failure that crossed the plugin seam with a structured exit status
 /// ([`ProcessFailed::exit`] on the plugin's side).
 ///
-/// The wire carries the failure as its rendered message plus the status, so
-/// the host cannot rebuild the plugin's [`ProcessFailed`] — its log handle
-/// points into the plugin's world and its `status` text is folded into the
-/// message. This keeps the message byte-identical to what an older host prints
-/// from the same frame, and the status readable through [`process_exit`].
+/// The wire carries the failure (`RunFailure`) as its rendered message, the
+/// status and the failure's artifacts, so the host does not rebuild the
+/// plugin's [`ProcessFailed`]: its `status` text is already folded into the
+/// message, which is shown unchanged. The artifacts are rebuilt as the same
+/// [`FailureArtifacts`] context they were on the plugin's side. The status
+/// stays readable through [`process_exit`].
 ///
 /// `#[non_exhaustive]`: built with [`RemoteProcessFailed::new`] outside this
 /// crate, so a later field is not a source break.
@@ -287,6 +290,153 @@ impl RemoteProcessFailed {
     pub fn new(message: String, exit: Exit) -> Self {
         Self { message, exit }
     }
+}
+
+impl ProcessFailed {
+    pub fn new(status: impl Into<String>, exit: Option<Exit>) -> Self {
+        Self {
+            status: status.into(),
+            exit,
+        }
+    }
+
+    /// The failure of a child that exited with `status`.
+    pub fn from_status(status: std::process::ExitStatus) -> Self {
+        Self::new(status.to_string(), Exit::from_std(status))
+    }
+
+    /// The failure of a child whose output was captured whole rather than
+    /// streamed: appends its stdout then stderr to `log_path` (the target's
+    /// `log.txt`) and returns the failure with that log attached as a `Log`
+    /// [`FailureArtifacts`] entry, so the output is rendered as the target's
+    /// log tail instead of being pasted into the message.
+    ///
+    /// The log is best-effort: if it cannot be written, the output is attached
+    /// inline (`Content::Raw`) instead, so it is not lost.
+    pub fn from_output(log_path: &std::path::Path, output: &std::process::Output) -> anyhow::Error {
+        use std::io::Write as _;
+        let written = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+            .and_then(|mut f| {
+                f.write_all(&output.stdout)?;
+                f.write_all(&output.stderr)
+            });
+        let log = match written.ok().and_then(|()| log_file_artifact(log_path)) {
+            Some(log) => log,
+            None => {
+                let mut data = Vec::with_capacity(output.stdout.len() + output.stderr.len());
+                data.extend_from_slice(&output.stdout);
+                data.extend_from_slice(&output.stderr);
+                log_artifact(OaContent::Raw(ContentRaw {
+                    data,
+                    path: LOG_NAME.to_string(),
+                    x: false,
+                }))
+            }
+        };
+        with_failure_artifacts(
+            anyhow::Error::new(Self::from_status(output.status)),
+            vec![log],
+        )
+    }
+}
+
+/// The name a run's log artifact has: the target's `log.txt`.
+const LOG_NAME: &str = "log.txt";
+
+fn log_artifact(content: OaContent) -> OutputArtifact {
+    OutputArtifact {
+        group: String::new(),
+        name: LOG_NAME.to_string(),
+        r#type: ArtifactType::Log,
+        content,
+        hashout: String::new(),
+    }
+}
+
+/// The `Log` artifact for the run log at `path` (normally `<sandbox>/log.txt`),
+/// for a driver to attach to its failure with [`with_failure_artifacts`].
+/// `None` when the path is not UTF-8, which an artifact cannot name.
+pub fn log_file_artifact(path: &std::path::Path) -> Option<OutputArtifact> {
+    Some(log_artifact(OaContent::File(ContentFile {
+        source_path: path.to_str()?.to_string(),
+        out_path: LOG_NAME.to_string(),
+        x: false,
+        // The log lives in the sandbox: never a durable workspace file.
+        passthrough: false,
+    })))
+}
+
+/// What a failed run left behind for the diagnostic — normally its `Log`
+/// artifact — riding the error as a context.
+///
+/// Data, not a cause: its `Display` is empty, and every renderer of a chain
+/// (`hcore::hmemoizer::write_chain`, the CLI's cause chain) skips an empty
+/// frame. Attach it with [`with_failure_artifacts`] and read it with
+/// [`failure_artifacts`]; a plain `err.chain().find_map(downcast_ref)` never
+/// finds a context.
+pub struct FailureArtifacts(pub Vec<OutputArtifact>);
+
+impl fmt::Debug for FailureArtifacts {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list()
+            .entries(
+                self.0
+                    .iter()
+                    .map(|a| (a.group.as_str(), a.name.as_str(), &a.r#type)),
+            )
+            .finish()
+    }
+}
+
+impl fmt::Display for FailureArtifacts {
+    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Ok(())
+    }
+}
+
+impl std::error::Error for FailureArtifacts {}
+
+/// Attach `artifacts` to `err` as a [`FailureArtifacts`] context.
+///
+/// Merges with the artifacts already on the chain: one with the same path
+/// (`group` and `name`) as a new one is replaced — the outermost attachment is
+/// authoritative — and the rest are kept after the new ones.
+pub fn with_failure_artifacts(err: anyhow::Error, artifacts: Vec<OutputArtifact>) -> anyhow::Error {
+    if artifacts.is_empty() {
+        return err;
+    }
+    let mut merged = artifacts;
+    if let Some(prev) = failure_artifacts(&err) {
+        let kept: Vec<OutputArtifact> = prev
+            .0
+            .iter()
+            .filter(|p| {
+                !merged
+                    .iter()
+                    .any(|m| m.group == p.group && m.name == p.name)
+            })
+            .cloned()
+            .collect();
+        merged.extend(kept);
+    }
+    err.context(FailureArtifacts(merged))
+}
+
+/// The outermost [`FailureArtifacts`] on `err`'s chain, through memoizer
+/// wrappers too — which, by [`with_failure_artifacts`]'s merge, holds them all.
+pub fn failure_artifacts(err: &anyhow::Error) -> Option<&FailureArtifacts> {
+    hcore::hmemoizer::downcast_chain_ref::<FailureArtifacts>(err)
+}
+
+/// The failure's `Log` artifact, if it carries one.
+pub fn failure_log(err: &anyhow::Error) -> Option<&OutputArtifact> {
+    failure_artifacts(err)?
+        .0
+        .iter()
+        .find(|a| a.r#type == ArtifactType::Log)
 }
 
 impl fmt::Display for RemoteProcessFailed {
@@ -326,6 +476,10 @@ pub struct TargetFailure {
     /// as the `log.txt` artifact), with the real starting line number so the box
     /// renders true file positions. Rendered as a framed `log` box.
     pub log_tail: Option<LogTail>,
+    /// The log `log_tail` was read from: the engine's copy in the target's
+    /// failure slot (open, with its path for the box's `full log:` footer), or
+    /// the tail in memory when no copy is kept.
+    pub log: Option<FailureLog>,
     pub source: std::sync::Arc<anyhow::Error>,
 }
 
@@ -334,8 +488,15 @@ impl TargetFailure {
         Self {
             addr,
             log_tail,
+            log: None,
             source: std::sync::Arc::new(source),
         }
+    }
+
+    /// The same failure with the log its tail came from.
+    pub fn with_log(mut self, log: Option<FailureLog>) -> Self {
+        self.log = log;
+        self
     }
 }
 
@@ -417,25 +578,326 @@ pub fn last_n_lines_with_start(s: &str, n: usize) -> (String, usize) {
     (text, start + 1)
 }
 
+/// How much of a log [`read_tail_at`] reads per backward step.
+const TAIL_CHUNK: u64 = 8 * 1024;
+
+/// How much of the part before the tail [`read_tail_at`] reads per step to
+/// count its lines.
+const COUNT_CHUNK: usize = 64 * 1024;
+
+/// The last `n` lines of a log of `len` bytes, read through `read_at` (a
+/// positional read: `read_at(buf, offset)`), with the same text and start
+/// line [`last_n_lines_with_start`] gives for the whole log, lossily decoded.
+///
+/// Seek-based: it reads backwards from the end in [`TAIL_CHUNK`] steps until
+/// it holds `n` line breaks, so only the tail is ever held in memory. The
+/// start line still needs the number of lines before the tail, which is
+/// counted in [`COUNT_CHUNK`] reads that are never kept — constant memory,
+/// one pass over the head of the file.
+pub fn read_tail_at(
+    len: u64,
+    mut read_at: impl FnMut(&mut [u8], u64) -> std::io::Result<usize>,
+    n: usize,
+) -> std::io::Result<LogTail> {
+    let (cut, window) = tail_window(len, &mut read_at, n)?;
+    let mut prefix_lines = 0usize;
+    let mut buf = vec![0u8; COUNT_CHUNK];
+    let mut off = 0u64;
+    while off < cut {
+        let want = usize::try_from((cut - off).min(COUNT_CHUNK as u64)).unwrap_or(COUNT_CHUNK);
+        let got = buf.get_mut(..want).unwrap_or_default();
+        read_exact_at(&mut read_at, got, off)?;
+        prefix_lines += got.iter().filter(|&&b| b == b'\n').count();
+        off += want as u64;
+    }
+    if n == 0 {
+        // No lines shown; the "next" line is one past the last, which an
+        // unterminated last line counts as.
+        let mut last = [0u8; 1];
+        let open = len > 0 && {
+            read_exact_at(&mut read_at, &mut last, len - 1)?;
+            last != *b"\n"
+        };
+        return Ok(LogTail {
+            text: String::new(),
+            start_line: prefix_lines + usize::from(open) + 1,
+        });
+    }
+    let text = String::from_utf8_lossy(&window);
+    let (text, local_start) = last_n_lines_with_start(&text, n);
+    Ok(LogTail {
+        text,
+        start_line: prefix_lines + local_start,
+    })
+}
+
+/// The backward half of [`read_tail_at`]: the offset the tail starts at (just
+/// past a line break, or 0) and the bytes from there to `len`.
+pub fn tail_window(
+    len: u64,
+    read_at: &mut impl FnMut(&mut [u8], u64) -> std::io::Result<usize>,
+    n: usize,
+) -> std::io::Result<(u64, Vec<u8>)> {
+    if n == 0 {
+        return Ok((len, Vec::new()));
+    }
+    let mut window: Vec<u8> = Vec::new();
+    let mut start = len;
+    loop {
+        // A line break that ends the log closes its last line rather than
+        // starting another, as `str::lines` has it.
+        let trailing = usize::from(window.last() == Some(&b'\n'));
+        let body = window.get(..window.len() - trailing).unwrap_or_default();
+        // The n-th break from the end precedes the first line of the tail.
+        if let Some((i, _)) = body
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|&(_, &b)| b == b'\n')
+            .nth(n - 1)
+        {
+            let tail = window.split_off(i + 1);
+            return Ok((start + i as u64 + 1, tail));
+        }
+        if start == 0 {
+            return Ok((0, window));
+        }
+        let take = start.min(TAIL_CHUNK);
+        let off = start - take;
+        let mut chunk = vec![0u8; usize::try_from(take).unwrap_or(0)];
+        read_exact_at(read_at, &mut chunk, off)?;
+        chunk.extend_from_slice(&window);
+        window = chunk;
+        start = off;
+    }
+}
+
+fn read_exact_at(
+    read_at: &mut impl FnMut(&mut [u8], u64) -> std::io::Result<usize>,
+    mut buf: &mut [u8],
+    mut off: u64,
+) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        match read_at(buf, off) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "log shrank while its tail was read",
+                ));
+            }
+            Ok(k) => {
+                buf = buf.get_mut(k..).unwrap_or_default();
+                off += k as u64;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// A failed run's log as the diagnostic holds it: the engine's copy in the
+/// target's failure slot, kept **open** so a later rerun replacing the slot
+/// cannot swap the log this run's box shows; or, for a target whose log may
+/// not be kept on disk (its outputs are credential material) or whose copy
+/// could not be made, the tail already read into memory.
+#[derive(Clone)]
+pub struct FailureLog {
+    path: Option<std::path::PathBuf>,
+    source: FailureLogSource,
+    lines: usize,
+}
+
+#[derive(Clone)]
+enum FailureLogSource {
+    Open(std::sync::Arc<std::fs::File>),
+    Tail(LogTail),
+}
+
+impl fmt::Debug for FailureLog {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self.source {
+            FailureLogSource::Open(_) => "open",
+            FailureLogSource::Tail(_) => "tail",
+        };
+        f.debug_struct("FailureLog")
+            .field("path", &self.path)
+            .field("source", &kind)
+            .finish()
+    }
+}
+
+impl FailureLog {
+    /// The slot's log at `path`, through `file` opened on it; its tail is the
+    /// last `lines` lines.
+    pub fn open(path: std::path::PathBuf, file: std::fs::File, lines: usize) -> Self {
+        Self {
+            path: Some(path),
+            source: FailureLogSource::Open(std::sync::Arc::new(file)),
+            lines,
+        }
+    }
+
+    /// A tail with no file behind it.
+    pub fn in_memory(tail: LogTail) -> Self {
+        Self {
+            path: None,
+            source: FailureLogSource::Tail(tail),
+            lines: 0,
+        }
+    }
+
+    /// Where the full log is, when there is one on disk.
+    pub fn path(&self) -> Option<&std::path::Path> {
+        self.path.as_deref()
+    }
+
+    /// The last lines of the log, read from the open file (seek-based, see
+    /// [`read_tail_at`]) or the tail held in memory.
+    pub fn tail(&self) -> std::io::Result<LogTail> {
+        match &self.source {
+            FailureLogSource::Tail(t) => Ok(t.clone()),
+            FailureLogSource::Open(file) => {
+                use std::os::unix::fs::FileExt as _;
+                let len = file.metadata()?.len();
+                read_tail_at(len, |buf, off| file.read_at(buf, off), self.lines)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// A captured child's failure lands in the log (appended, both streams),
+    /// and the error carries that log and the exit — not the output itself.
+    #[test]
+    fn from_output_writes_the_log_and_carries_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log_path = dir.path().join("log.txt");
+        std::fs::write(&log_path, "earlier step\n").expect("seed log");
+        let output = std::process::Command::new("sh")
+            .args(["-c", "echo on-stdout; echo on-stderr >&2; exit 3"])
+            .output()
+            .expect("run sh");
+
+        let err = ProcessFailed::from_output(&log_path, &output).context("go compile failed");
+        assert_eq!(process_exit(&err), Some(Exit::Code(3)));
+        assert_eq!(
+            hcore::hmemoizer::chain_message(&err),
+            "go compile failed: process exited with status: exit status: 3"
+        );
+        let log = std::fs::read_to_string(&log_path).expect("read log");
+        assert_eq!(log, "earlier step\non-stdout\non-stderr\n");
+        let artifact = failure_log(&err).expect("a log artifact");
+        assert_eq!(artifact.name, "log.txt");
+        assert!(
+            matches!(&artifact.content, OaContent::File(f)
+                if f.source_path == log_path.to_str().expect("utf-8")),
+            "the log is the file"
+        );
+    }
+
+    /// A log that cannot be written does not lose the output.
+    #[test]
+    fn from_output_keeps_the_output_when_the_log_cannot_be_written() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let output = std::process::Command::new("sh")
+            .args(["-c", "echo kept >&2; exit 1"])
+            .output()
+            .expect("run sh");
+        let err = ProcessFailed::from_output(&dir.path().join("missing/log.txt"), &output);
+        let log = failure_log(&err).expect("a log artifact");
+        assert!(matches!(log.content, OaContent::Raw(_)), "inline fallback");
+        let mut text = String::new();
+        std::io::Read::read_to_string(
+            &mut hcore::hartifactcontent::Content::reader(log).expect("reader"),
+            &mut text,
+        )
+        .expect("read");
+        assert_eq!(text, "kept\n");
+    }
+
+    fn raw(name: &str, data: &str) -> OutputArtifact {
+        OutputArtifact {
+            group: String::new(),
+            name: name.to_string(),
+            r#type: ArtifactType::Log,
+            content: OaContent::Raw(ContentRaw {
+                data: data.as_bytes().to_vec(),
+                path: name.to_string(),
+                x: false,
+            }),
+            hashout: String::new(),
+        }
+    }
+
+    fn data(a: &OutputArtifact) -> &[u8] {
+        match &a.content {
+            OaContent::Raw(r) => &r.data,
+            _ => &[],
+        }
+    }
+
+    /// A `FailureArtifacts` frame renders as nothing: no `: :` in any message,
+    /// wherever it sits in the chain, and through a memoizer's shared wrapper.
+    #[test]
+    fn empty_context_not_rendered() {
+        let inner = with_failure_artifacts(
+            anyhow::Error::new(ProcessFailed::new("exit status: 1", Some(Exit::Code(1)))),
+            vec![raw("log.txt", "x")],
+        )
+        .context("go compile failed");
+        let outer = with_failure_artifacts(inner, vec![raw("other.txt", "y")]).context("run");
+        let want = "run: go compile failed: process exited with status: exit status: 1";
+        assert_eq!(hcore::hmemoizer::chain_message(&outer), want);
+
+        let arc = std::sync::Arc::new(outer);
+        let shared =
+            hcore::hmemoizer::unwrap_arc_err(std::sync::Arc::clone(&arc)).context("execute //p:t");
+        assert_eq!(
+            hcore::hmemoizer::chain_message(&shared),
+            format!("execute //p:t: {want}")
+        );
+        // Outermost, with nothing above it: skipped, no separator invented.
+        let bare = with_failure_artifacts(anyhow::anyhow!("boom"), vec![raw("log.txt", "x")]);
+        assert_eq!(hcore::hmemoizer::chain_message(&bare), "boom");
+    }
+
+    /// Attaching twice merges: the outer attachment wins a path both name,
+    /// the inner one's other artifacts are kept, and the accessor finds the
+    /// merged set through contexts and a memoizer wrapper.
+    #[test]
+    fn with_failure_artifacts_merges() {
+        let inner = with_failure_artifacts(
+            anyhow::anyhow!("boom"),
+            vec![raw("log.txt", "inner"), raw("trace.txt", "t")],
+        )
+        .context("step");
+        let outer = with_failure_artifacts(inner, vec![raw("log.txt", "outer")]);
+        let arc = std::sync::Arc::new(outer);
+        let shared =
+            hcore::hmemoizer::unwrap_arc_err(std::sync::Arc::clone(&arc)).context("execute");
+        let got = failure_artifacts(&shared).expect("found");
+        let names: Vec<&str> = got.0.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["log.txt", "trace.txt"]);
+        assert_eq!(data(failure_log(&shared).expect("log")), b"outer");
+        assert!(failure_artifacts(&anyhow::anyhow!("none")).is_none());
+        // Nothing to attach adds no frame.
+        let untouched = with_failure_artifacts(anyhow::anyhow!("plain"), vec![]);
+        assert!(failure_artifacts(&untouched).is_none());
+    }
+
     /// E5: the status is data next to an unchanged message.
     #[test]
     fn process_failed_exit_is_structured() {
-        let log: Arc<dyn Content> =
-            Arc::new(hcore::hartifactcontent::FileContent::new("/dev/null"));
         for (status, exit) in [
             ("exit status: 3", Some(Exit::Code(3))),
             ("signal: 15 (SIGTERM)", Some(Exit::Signal(15))),
             ("exit status: 1", None),
         ] {
-            let pf = ProcessFailed {
-                status: status.to_string(),
-                log: Arc::clone(&log),
-                exit,
-            };
+            let pf = ProcessFailed::new(status, exit);
             // Byte-identical to the message before the field existed.
             assert_eq!(
                 pf.to_string(),
@@ -447,10 +909,10 @@ mod tests {
             assert_eq!(process_exit(&wrapped), exit, "{status}");
         }
 
-        let remote = anyhow::Error::new(RemoteProcessFailed {
-            message: "running //p:t: process exited with status: exit status: 3".to_string(),
-            exit: Exit::Code(3),
-        })
+        let remote = anyhow::Error::new(RemoteProcessFailed::new(
+            "running //p:t: process exited with status: exit status: 3".to_string(),
+            Exit::Code(3),
+        ))
         .context("driver run");
         assert_eq!(process_exit(&remote), Some(Exit::Code(3)));
         assert_eq!(

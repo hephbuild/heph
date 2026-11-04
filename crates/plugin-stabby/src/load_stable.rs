@@ -114,7 +114,7 @@ fn plugin_abi_version(lib: &libloading::Library) -> Option<String> {
 }
 
 /// The plugin ABI versions this host loads: `^MIN_PLUGIN_ABI`. Pre-1.0 that is
-/// one minor's lane (`^0.17.0` = `>=0.17.0, <0.18.0`): a patch is additive, so
+/// one minor's lane (`^0.18.0` = `>=0.18.0, <0.19.0`): a patch is additive, so
 /// a plugin a few patches newer or older than the host loads; a minor is a
 /// break, which raises `MIN_PLUGIN_ABI` to the new `x.y.0`.
 pub fn accepted_plugin_abi() -> anyhow::Result<semver::VersionReq> {
@@ -579,14 +579,14 @@ fn drain_run(
                 });
             }
             // The message is the plugin's whole rendered chain, unchanged; a
-            // structured exit status rides beside it when the failure is a
-            // process's exit, readable through `hplugin::error::process_exit`.
-            Some(pb::run_out_frame::Msg::Error(e)) => match convert::exit_from_pb(frame.exit) {
-                Some(exit) => {
-                    return Err(hplugin::error::RemoteProcessFailed::new(e, exit).into());
-                }
-                None => anyhow::bail!("{e}"),
-            },
+            // structured exit status rides with it when the failure is a
+            // process's exit, readable through `hplugin::error::process_exit`,
+            // and its artifacts (the log) as the same `FailureArtifacts` the
+            // plugin attached. The plugin shares this process, so their paths
+            // are ours.
+            Some(pb::run_out_frame::Msg::Failure(f)) => {
+                return Err(convert::run_failure_from_pb(*f));
+            }
             // A dropped receiver means the caller stopped reading; keep draining
             // so the run still reaches its result.
             Some(pb::run_out_frame::Msg::StdoutChunk(b)) => {

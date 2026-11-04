@@ -419,8 +419,43 @@ impl fmt::Display for SharedAnyhow {
         // (non-alternate), which would otherwise stop at the top of the inner
         // error and drop nested causes. We have no source(), so this is the
         // only place the inner chain gets rendered.
-        write!(f, "{:#}", self.0)
+        write_chain(f, &self.0)
     }
+}
+
+/// Write `e`'s cause chain as anyhow's alternate `{:#}` does — each frame's
+/// `Display`, joined with `": "` — but skipping a frame that renders empty.
+///
+/// A frame with an empty `Display` is data riding the chain (a context carrying
+/// a failure's artifacts), not a cause; `{:#}` would render it as a stray `: :`.
+pub fn write_chain(f: &mut dyn fmt::Write, e: &anyhow::Error) -> fmt::Result {
+    use fmt::Write as _;
+    let mut first = true;
+    let mut frame = String::new();
+    for cause in e.chain() {
+        frame.clear();
+        write!(frame, "{cause}")?;
+        if frame.is_empty() {
+            continue;
+        }
+        if !first {
+            f.write_str(": ")?;
+        }
+        first = false;
+        f.write_str(&frame)?;
+    }
+    Ok(())
+}
+
+/// [`write_chain`] into a `String`.
+pub fn chain_message(e: &anyhow::Error) -> String {
+    struct Chain<'a>(&'a anyhow::Error);
+    impl fmt::Display for Chain<'_> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write_chain(f, self.0)
+        }
+    }
+    Chain(e).to_string()
 }
 
 impl std::error::Error for SharedAnyhow {

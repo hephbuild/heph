@@ -50,7 +50,9 @@ impl ErrorDetail {
     pub fn from_error(e: &anyhow::Error) -> Self {
         use hplugin::error::{ProcessFailed, TargetFailure, UpstreamFailed};
         let mut d = Self {
-            message: format!("{e:#}"),
+            // Not `{e:#}`: a failure's artifacts ride the chain as an
+            // empty-`Display` frame, which that would render as `: :`.
+            message: hcore::hmemoizer::chain_message(e),
             ..Self::default()
         };
         for cause in e.chain() {

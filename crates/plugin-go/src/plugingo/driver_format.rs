@@ -72,8 +72,8 @@ fn arg_file(pkg_dir: &std::path::Path, files: &[String]) -> anyhow::Result<OsStr
     Ok(arg)
 }
 
-/// Run `heph-govet` with `args`, returning (exit code or None-if-signal, stdout,
-/// stderr). Never fails on a non-zero exit — the caller interprets the code.
+/// Run `heph-govet` with `args`, returning its whole output. Never fails on a
+/// non-zero exit — the caller interprets the code.
 async fn exec_govet(
     bin: &str,
     args: Vec<OsString>,
@@ -81,7 +81,7 @@ async fn exec_govet(
     cwd: &std::path::Path,
     runner: hexecrunner::RunnerRef<'_>,
     ctoken: &(dyn Cancellable + Send + Sync),
-) -> anyhow::Result<(Option<i32>, Vec<u8>, Vec<u8>)> {
+) -> anyhow::Result<std::process::Output> {
     let env_pairs: Vec<(OsString, OsString)> = env
         .iter()
         .map(|(k, v)| (OsString::from(k), OsString::from(v)))
@@ -97,10 +97,23 @@ async fn exec_govet(
         setsid: false,
         ctty: false,
     };
-    let output = hexecrunner::output(runner, spec, ctoken)
+    hexecrunner::output(runner, spec, ctoken)
         .await
-        .context("wait for heph-govet -format")?;
-    Ok((output.status.code(), output.stdout, output.stderr))
+        .context("wait for heph-govet -format")
+}
+
+/// `heph-govet` itself failed: its output goes to the target's log, whose tail
+/// the failure box renders, rather than into the message — and to the live
+/// stderr of an interactive run, since it was captured rather than streamed.
+async fn govet_failed(
+    req: &mut ManagedRunRequest<'_, '_>,
+    output: &std::process::Output,
+    what: &'static str,
+) -> anyhow::Error {
+    let e = hplugin::error::ProcessFailed::from_output(&req.sandbox_dir.join("log.txt"), output)
+        .context(what);
+    hdriver_support::driver_managed::echo_failure_log(&mut req.request, &e).await;
+    e
 }
 
 /// Shared config for both format drivers.
@@ -308,7 +321,7 @@ impl ManagedDriver for GoFormatDriver {
 
     async fn run<'a, 'io>(
         &self,
-        req: ManagedRunRequest<'a, 'io>,
+        mut req: ManagedRunRequest<'a, 'io>,
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ManagedRunResponse> {
         let pkg_dir = &req.sandbox_pkg_dir;
@@ -321,12 +334,9 @@ impl ManagedDriver for GoFormatDriver {
         }
         let args = vec![OsString::from("-format"), arg_file(pkg_dir, &files)?];
 
-        let (code, _stdout, stderr) = exec_govet(&bin, args, &env, pkg_dir, runner, ctoken).await?;
-        if code != Some(0) {
-            anyhow::bail!(
-                "heph-govet -format failed ({code:?}):\n{}",
-                hplugin::error::last_n_lines(String::from_utf8_lossy(&stderr).trim(), 20)
-            );
+        let output = exec_govet(&bin, args, &env, pkg_dir, runner, ctoken).await?;
+        if !output.status.success() {
+            return Err(govet_failed(&mut req, &output, "heph-govet -format failed").await);
         }
         // The rewritten sources are collected from the declared in_place outputs.
         Ok(ManagedRunResponse { artifacts: vec![] })
@@ -434,7 +444,7 @@ impl ManagedDriver for GoFormatCheckDriver {
 
     async fn run<'a, 'io>(
         &self,
-        req: ManagedRunRequest<'a, 'io>,
+        mut req: ManagedRunRequest<'a, 'io>,
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ManagedRunResponse> {
         let pkg_dir = &req.sandbox_pkg_dir;
@@ -451,12 +461,13 @@ impl ManagedDriver for GoFormatCheckDriver {
             arg_file(pkg_dir, &files)?,
         ];
 
-        let (code, stdout, stderr) = exec_govet(&bin, args, &env, pkg_dir, runner, ctoken).await?;
-        match code {
+        let output = exec_govet(&bin, args, &env, pkg_dir, runner, ctoken).await?;
+        let stdout = &output.stdout;
+        match output.status.code() {
             Some(0) => Ok(ManagedRunResponse { artifacts: vec![] }),
             // Exit 1 = files need formatting; the tool prints them to stdout.
             Some(1) => {
-                let list = String::from_utf8_lossy(&stdout);
+                let list = String::from_utf8_lossy(stdout);
                 let files: Vec<&str> = list.lines().filter(|l| !l.is_empty()).collect();
                 anyhow::bail!(
                     "{} file(s) need formatting (run the `format` target):\n{}",
@@ -468,10 +479,7 @@ impl ManagedDriver for GoFormatCheckDriver {
                         .join("\n")
                 );
             }
-            other => anyhow::bail!(
-                "heph-govet -format -check failed ({other:?}):\n{}",
-                hplugin::error::last_n_lines(String::from_utf8_lossy(&stderr).trim(), 20)
-            ),
+            _ => Err(govet_failed(&mut req, &output, "heph-govet -format -check failed").await),
         }
     }
 }
