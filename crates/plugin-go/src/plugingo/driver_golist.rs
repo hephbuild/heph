@@ -26,6 +26,14 @@ use xxhash_rust::xxh3::Xxh3Default;
 /// rather than inlined so the shape stays in one place: the field set is part of
 /// what a shared `GOCACHE` entry is keyed by, so two call sites that drifted
 /// apart would quietly stop sharing cache entries.
+///
+/// **Adding a field or a flag can break the `.go` trust rule.** `_golist` keys a
+/// first-party `.go` file on its go/build view only
+/// ([`crate::plugingo::go_view`]), on the rule that `go list` as invoked here
+/// reads nothing else of it. A field or flag that needs more of the file (a
+/// compile or cgo run such as `-export` or `-compiled`, or anything parsing past
+/// the imports) makes that an under-hash: re-check the rule in `go_view`'s docs
+/// first.
 const GOLIST_JSON_FIELDS: &str = "-json=Dir,ImportPath,Name,GoFiles,SFiles,HFiles,TestGoFiles,XTestGoFiles,EmbedPatterns,EmbedFiles,TestEmbedPatterns,TestEmbedFiles,XTestEmbedPatterns,XTestEmbedFiles,Imports,TestImports,XTestImports,Standard,Module,Match,Incomplete,Error";
 
 pub struct GoGolistDriver {
@@ -553,7 +561,8 @@ impl ManagedDriver for GoGolistDriver {
         // A first-party directory with no `.go` file staged into it cannot be a
         // Go package — a Go package needs at least one `.go` file, and every
         // source that could make it one (checked-in *and* codegen output, via
-        // the `srcfiles` deps) is already materialized here. So `go list` can
+        // the `gosrcs`/`gensrcs` deps, or a vendored module's `srcfiles`) is
+        // already materialized here. So `go list` can
         // only come back with the "no Go files" error the provider maps to
         // NotFound, and spawning it to learn that is pure cost.
         //
@@ -738,7 +747,8 @@ fn check_package_resolved(
 /// Whether `dir` directly contains a file ending in `.go`.
 ///
 /// Non-recursive on purpose: a Go package is exactly one directory, and the
-/// `srcfiles` glob that stages sources is `<pkg>/*.go` for the same reason. A
+/// glob that stages its sources (`nongo_lanes::go_src_glob_addr`) is
+/// `<pkg>/*.go` for the same reason. A
 /// subdirectory's sources belong to a different package with its own `_golist`.
 /// `*_test.go` counts — a directory holding only tests is still a package.
 ///

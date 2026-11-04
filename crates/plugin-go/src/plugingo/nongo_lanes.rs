@@ -59,6 +59,13 @@ pub const GO_NEVER_OPENED_PREFIXES: &[char] = &['_', '.'];
 /// ([`crate::plugingo::driver_headers`]) were checked against. A test fails when
 /// the pinned default toolchain moves without this moving with it: re-read
 /// `matchFile`, `fileListForExt` and `readComments` in the new release first.
+///
+/// It is also the scope of the `.go` trust rule
+/// ([`crate::plugingo::go_view`]): `_golist` keys a `.go` file on its go/build
+/// view for **every** Go version a workspace selects, not only this one — no
+/// version gate (a user decision). On each bump, re-read `readGoInfo` in
+/// `go/build/read.go` and the reads `cmd/go/internal/modindex` caches before
+/// moving this constant.
 pub const GO_HEADER_RULES_VERIFIED_AGAINST: &str = "1.27.3";
 
 /// Which `_golist` lane a non-Go file belongs to.
@@ -124,6 +131,11 @@ pub fn header_read_glob_addr(pkg: &str) -> Addr {
 /// [`header_read_glob_addr`]: `_golist` stages it unhashed (a non-vendored
 /// module) and the header target hashes the go/build view of the very files it
 /// lists.
+///
+/// `_x.go` and `.x.go` stay in, although `matchFile` never opens them
+/// ([`GO_NEVER_OPENED_PREFIXES`]): their view is hashed for nothing, so editing
+/// one re-lists — an over-hash, never a stale hit, and not worth a second glob
+/// shape for a file Go itself ignores.
 pub fn go_src_glob_addr(pkg: &str) -> Addr {
     pluginfs::glob_addr(&format!("{}*.go", dir_prefix(pkg)), &[])
 }
@@ -222,19 +234,24 @@ pub fn headers_addr(pkg: &str, gen_root: Option<&str>, gen_deps: &[String]) -> A
 /// with some of its inputs ignored would key `_golist` on less than it stages.
 pub fn headers_codegen_args(addr: &Addr) -> anyhow::Result<(Option<String>, Vec<String>)> {
     use anyhow::Context as _;
+    // Named by its package, not by the addr: the addr's `gen_deps` is hex.
+    let owner = || match pkg_from_headers_pkg(addr.package.as_str()) {
+        Some(pkg) => format!("the header target of //{pkg}"),
+        None => format!("header target {}", addr.package.as_str()),
+    };
     if let Some(k) = addr
         .args
         .keys()
         .find(|k| k.as_str() != GEN_ROOT_ARG && k.as_str() != GEN_DEPS_ARG)
     {
-        anyhow::bail!("{}: unknown arg `{k}`", addr.format());
+        anyhow::bail!("{}: unknown arg `{k}`", owner());
     }
     let deps = match addr.args.get(GEN_DEPS_ARG) {
         Some(h) => {
             let raw = hex::decode(h)
-                .with_context(|| format!("{}: decode `{GEN_DEPS_ARG}`", addr.format()))?;
+                .with_context(|| format!("{}: `{GEN_DEPS_ARG}` is not hex: {h}", owner()))?;
             String::from_utf8(raw)
-                .with_context(|| format!("{}: `{GEN_DEPS_ARG}` is not UTF-8", addr.format()))?
+                .with_context(|| format!("{}: `{GEN_DEPS_ARG}` is not UTF-8", owner()))?
                 .split('\n')
                 .map(str::to_string)
                 .collect()
@@ -242,6 +259,26 @@ pub fn headers_codegen_args(addr: &Addr) -> anyhow::Result<(Option<String>, Vec<
         None => Vec::new(),
     };
     Ok((addr.args.get(GEN_ROOT_ARG).cloned(), deps))
+}
+
+/// A header addr in plain words, its codegen args decoded — what an error names
+/// instead of the hex `gen_deps`. Falls back to the addr itself when it is not
+/// one, or its args do not decode.
+pub fn describe_headers_addr(addr: &Addr) -> String {
+    let (Some(pkg), Ok((root, deps))) = (
+        pkg_from_headers_pkg(addr.package.as_str()),
+        headers_codegen_args(addr),
+    ) else {
+        return addr.format();
+    };
+    let mut s = format!("the header target of //{pkg}");
+    if let Some(root) = root {
+        s.push_str(&format!(", go_codegen_root //{root}"));
+    }
+    if !deps.is_empty() {
+        s.push_str(&format!(", go_codegen_deps [{}]", deps.join(", ")));
+    }
+    s
 }
 
 /// The Go package a header-target package stands for, or `None` if `hpkg` is not

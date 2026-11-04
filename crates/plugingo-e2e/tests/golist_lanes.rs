@@ -1405,7 +1405,8 @@ async fn g13_a_checked_in_file_shadowing_a_generated_one_fails() -> anyhow::Resu
     let msg = format!("{err:#}");
     assert!(
         msg.contains("lib/gen.go")
-            && (msg.contains("staged by two lanes") || msg.contains("output collision")),
+            && (msg.contains("is both checked in and produced by")
+                || msg.contains("output collision")),
         "unexpected error: {msg}"
     );
     Ok(())
