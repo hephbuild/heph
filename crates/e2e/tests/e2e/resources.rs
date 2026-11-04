@@ -767,6 +767,68 @@ target(name = "g", driver = "group", deps = ["//p:leaf"], prefix = "moved", reso
         ],
         "g waited for a's cpu"
     );
+    // Told nothing: a group spawns nothing, so its allotment reaches no env
+    // and its output is the dep's bytes, unchanged.
+    assert_eq!(output(&engine, "//p:g").await?, "leaf");
+    Ok(())
+}
+
+/// An aggregate group (no `prefix`) is spliced into its consumers and never
+/// executes, so its `resources` reserve nothing: one that names a pool at
+/// capacity 0 — which admission would refuse — still builds, and never starts.
+#[tokio::test]
+async fn aggregate_group_resources_reserve_nothing() -> anyhow::Result<()> {
+    let ws = tempfile::tempdir()?;
+    write_build(
+        ws.path(),
+        "p",
+        r#"
+target(name = "leaf", driver = "bash", run = "echo leaf > $OUT", out = "leaf.txt")
+target(name = "g", driver = "group", deps = ["//p:leaf"], resources = {"docker": 1})
+"#,
+    );
+    let engine = engine(ws.path(), caps(&[("cpu", MICROS), ("docker", 0)]))?;
+    let def = Arc::clone(&engine)
+        .get_def(engine.new_state(), &parse_addr("//p:g")?)
+        .await?;
+    assert_eq!(def.target_def.resources.declared("docker"), Some(1));
+    let (res, events) = build_events(&engine, &["//p:g"]).await;
+    res?;
+    assert_eq!(starts(&events), vec!["//p:leaf"], "g never executes");
+    assert_eq!(output(&engine, "//p:g").await?, "leaf");
+    Ok(())
+}
+
+/// `${resource:memory}` with no memory declared is refused when the def is
+/// linked — so after a declaration is dropped, a cache hit cannot hide it —
+/// and a declaration lets it through.
+#[tokio::test]
+async fn memory_reference_without_memory_is_a_def_time_error() -> anyhow::Result<()> {
+    let ws = tempfile::tempdir()?;
+    write_build(
+        ws.path(),
+        "p",
+        r#"
+target(name = "bad", driver = "bash", run = "echo $M > $OUT", out = "b.txt", env = {"M": "${resource:memory}"})
+target(name = "zero", driver = "bash", run = "echo $M > $OUT", out = "z.txt", env = {"M": "${resource:memory}"}, resources = {"memory": 0})
+target(name = "cpu_only", driver = "bash", run = "echo $M > $OUT", out = "c.txt", env = {"M": "${resource:cpu}"})
+target(name = "ok", driver = "bash", run = "echo $M > $OUT", out = "o.txt", env = {"M": "${resource:memory}"}, resources = {"memory": "1K"})
+"#,
+    );
+    let engine = engine(ws.path(), caps(&[("cpu", MICROS), ("memory", 1 << 20)]))?;
+    for name in ["bad", "zero"] {
+        let err = Arc::clone(&engine)
+            .get_def(engine.new_state(), &parse_addr(&format!("//p:{name}"))?)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{name}: refused at link"));
+        let msg = format!("{err:#}");
+        assert!(msg.contains(&format!("//p:{name}")), "{msg}");
+        assert!(msg.contains("declares no memory"), "{msg}");
+        assert!(msg.contains("env.M"), "{msg}");
+    }
+    assert_eq!(output(&engine, "//p:cpu_only").await?, "1");
+    assert_eq!(output(&engine, "//p:ok").await?, "1024");
     Ok(())
 }
 

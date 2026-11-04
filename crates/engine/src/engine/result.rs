@@ -2510,7 +2510,8 @@ impl Engine {
         addr: &Addr,
         resources: &hplugin::driver::Resources,
     ) -> anyhow::Result<()> {
-        // Nearly every def declares nothing; the warm path pays one branch.
+        // Nearly every def declares nothing (an `fs`/`group` default is not a
+        // declaration); the warm path pays one branch.
         if resources.is_empty() {
             return Ok(());
         }
@@ -2521,6 +2522,39 @@ impl Engine {
             anyhow::bail!(
                 "{addr} declares resources.{pool}, but {pool} is not a pool: add resources: {{{pool}: <n>}} to .hephconfig (known: {})",
                 self.pools.names().collect::<Vec<_>>().join(", ")
+            );
+        }
+        Ok(())
+    }
+
+    /// Refuse a `${resource:memory}` in the target's config when it declares
+    /// no memory above 0: there is no grant to substitute. The run would fail
+    /// the same way, but only on a miss; here it fails on every path, a cache
+    /// hit and `heph validate` included. `refs` are the config's references
+    /// ([`deferred_refs`](Self::deferred_refs)), empty for almost every target.
+    pub(crate) fn validate_resource_refs(
+        addr: &Addr,
+        refs: &[crate::engine::deferred::DeferredRef],
+        resources: &hplugin::driver::Resources,
+    ) -> anyhow::Result<()> {
+        use hplugin::provider::PoolName;
+        if refs.is_empty() || resources.declared(PoolName::MEMORY).is_some_and(|m| m > 0) {
+            return Ok(());
+        }
+        let names_memory = |raw: &str| {
+            hcore::template::parse(raw).is_ok_and(|pieces| {
+                pieces.iter().any(|p| {
+                    matches!(p, hcore::template::Piece::Ref(r)
+                        if r.kind == Some(crate::engine::deferred::RESOURCE)
+                            && r.arg == PoolName::MEMORY)
+                })
+            })
+        };
+        if let Some(r) = refs.iter().find(|r| names_memory(&r.raw)) {
+            anyhow::bail!(
+                "{addr}: `{}` reads ${{resource:memory}}, but the target declares no memory: \
+                 add resources = {{\"memory\": \"<size>\"}} to it",
+                r.path
             );
         }
         Ok(())
@@ -4551,6 +4585,7 @@ impl Engine {
         // Same seam for `resources`: a pool the engine does not have fails at
         // definition time, on every path, and so in `heph validate`.
         self.validate_resources(addr, &def.resources)?;
+        Self::validate_resource_refs(addr, &deferred_refs, &def.resources)?;
 
         Ok(Arc::new(ExtendedTargetDef {
             target_def: Arc::new(def),
