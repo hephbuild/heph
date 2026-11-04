@@ -66,7 +66,9 @@ struct HttpFetchSpec {
     /// `cache = {"remote": False}` keeps the fetch local-only).
     cache: TargetSpecCache,
     /// What the target reserves from the resource pools while it runs, e.g.
-    /// `{"cpu": 2}`. Defaults to 1 cpu. Never hashed.
+    /// `{"cpu": 2}`. A fetch waits on the network, so an undeclared `cpu`
+    /// costs 0.1 ([`Resources::IO_CPU_MICROS`](hplugin::driver::Resources::IO_CPU_MICROS)).
+    /// Never hashed.
     resources: hplugin::driver::Resources,
 }
 
@@ -165,7 +167,10 @@ impl ManagedDriver for Driver {
                 }],
                 cache: spec.cache.into(),
                 hash,
-                resources: spec.resources,
+                // Not in `hash` above: a declaration moves no key.
+                resources: spec
+                    .resources
+                    .with_default_cpu(hplugin::driver::Resources::IO_CPU_MICROS),
                 ..Default::default()
             },
         })
@@ -489,6 +494,35 @@ mod tests {
         // Nothing to name the file after → the target must say `out`.
         assert_eq!(file_name_of("https://x/y/"), None);
         assert_eq!(file_name_of("https://x"), None);
+    }
+
+    /// An undeclared fetch costs 0.1 cpu; a declared `cpu` replaces it, and
+    /// neither moves the def hash.
+    #[tokio::test]
+    async fn resources_default_to_a_tenth_of_a_cpu_and_are_unhashed() {
+        let parse = |resources: Option<Value>| async move {
+            let mut config = HashMap::from([(
+                "url".to_string(),
+                Value::String("https://x/tool.bin".to_string()),
+            )]);
+            if let Some(r) = resources {
+                config.insert("resources".to_string(), r);
+            }
+            Driver
+                .parse(parse_req("//t:fetch", config), &StdCancellationToken::new())
+                .await
+                .expect("parse")
+                .target_def
+        };
+        let plain = parse(None).await;
+        assert_eq!(plain.resources.default_cpu(), 100_000);
+        assert!(plain.resources.is_empty(), "the default is no declaration");
+        let heavy = parse(Some(Value::Map(
+            [("cpu".to_string(), Value::Int(2))].into(),
+        )))
+        .await;
+        assert_eq!(heavy.resources.declared("cpu"), Some("2"));
+        assert_eq!(heavy.hash, plain.hash);
     }
 
     /// `out` defaults to the URL's last segment — the name the server serves the

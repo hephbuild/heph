@@ -151,7 +151,7 @@ struct OciImageSpec {
     /// Caching for the built image. Defaults to on for both tiers.
     cache: TargetSpecCache,
     /// What the target reserves from the resource pools while it runs, e.g.
-    /// `{"cpu": 2}`. Defaults to 1 cpu. Never hashed.
+    /// `{"cpu": 2}`. IO-bound: an undeclared `cpu` costs 0.1. Never hashed.
     resources: hplugin::driver::Resources,
 }
 
@@ -618,7 +618,9 @@ impl ManagedDriver for Driver {
                 ],
                 cache: spec.cache.into(),
                 hash,
-                resources: spec.resources,
+                resources: spec
+                    .resources
+                    .with_default_cpu(hplugin::driver::Resources::IO_CPU_MICROS),
                 ..Default::default()
             },
         })

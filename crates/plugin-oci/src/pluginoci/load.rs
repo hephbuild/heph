@@ -127,7 +127,7 @@ struct OciLoadSpec {
     #[spec(ty = hcore::htvalue::signature::ParamType::String)]
     platform: Option<String>,
     /// What the target reserves from the resource pools while it runs, e.g.
-    /// `{"cpu": 2}`. Defaults to 1 cpu. Never hashed.
+    /// `{"cpu": 2}`. IO-bound: an undeclared `cpu` costs 0.1. Never hashed.
     resources: hplugin::driver::Resources,
 }
 
@@ -427,7 +427,9 @@ impl ManagedDriver for Driver {
                     }],
                 }],
                 hash,
-                resources: spec.resources,
+                resources: spec
+                    .resources
+                    .with_default_cpu(hplugin::driver::Resources::IO_CPU_MICROS),
                 ..Default::default()
             },
         })

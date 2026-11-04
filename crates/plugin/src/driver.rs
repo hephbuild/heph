@@ -1283,6 +1283,11 @@ impl Resources {
     /// 0.00001 CPU, so they still queue through the `cpu` pool in FIFO order
     /// but 100,000 of them fit in one CPU.
     pub const VIEW_CPU_MICROS: u64 = 10;
+    /// What a target of an IO-bound driver (`http`, OCI's pull, push, load,
+    /// layer, index and image, `go.download`) reserves when it declares no
+    /// `cpu`: 0.1 CPU, so ten downloads share one CPU instead of each taking
+    /// a whole one while it waits on the network.
+    pub const IO_CPU_MICROS: u64 = Self::MICROS_PER_CPU / 10;
 
     pub fn new() -> Self {
         Self::default()
