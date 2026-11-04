@@ -16,7 +16,7 @@
 //! interleave in stream order. `two_light_targets_do_overlap` is the positive
 //! control: the same probe sees the overlap when the pool has room for both.
 
-use hcore::capacity::Capacity;
+use hcore::capacity::{Capacity, PoolSpec, Unit};
 use heph::engine::event::{BuildEvent, BuildEventKind, EventReceiver};
 use heph::engine::resource_pool::ResourceSnapshot;
 use heph::engine::{Config, Engine, OutputMatcher, ResultOptions};
@@ -32,23 +32,27 @@ use std::time::{Duration, Instant};
 const MICROS: u64 = 1_000_000;
 const DEADLINE: Duration = Duration::from_secs(60);
 
-/// `(pool, capacity)` as `Config.resources` holds it: micro-CPUs for `cpu`,
-/// bytes for `memory`, a count for a custom pool.
-fn caps(caps: &[(&str, u64)]) -> BTreeMap<PoolName, Capacity> {
+/// `(pool, capacity)` as `Config.resources` holds it, each pool in its
+/// default unit: micro-CPUs for `cpu`, bytes for `memory`, a count for a
+/// custom pool.
+fn caps(caps: &[(&str, u64)]) -> BTreeMap<PoolName, PoolSpec> {
     caps.iter()
         .map(|&(p, c)| {
             (
                 PoolName::try_from(p.to_string()).expect("pool name"),
-                Capacity::Amount(c),
+                PoolSpec {
+                    unit: Unit::default_for(p),
+                    capacity: Some(Capacity::Amount(c)),
+                },
             )
         })
         .collect()
 }
 
 /// An engine over `root` with the buildfile provider and the bash driver, and
-/// the given pool capacities. Called again over the same root, it is the next
-/// `heph` invocation: same on-disk cache, fresh in-memory state.
-fn engine(root: &Path, resources: BTreeMap<PoolName, Capacity>) -> anyhow::Result<Arc<Engine>> {
+/// the given pools. Called again over the same root, it is the next `heph`
+/// invocation: same on-disk cache, fresh in-memory state.
+fn engine(root: &Path, resources: BTreeMap<PoolName, PoolSpec>) -> anyhow::Result<Arc<Engine>> {
     engine_with_notice(root, resources, None)
 }
 
@@ -56,7 +60,7 @@ fn engine(root: &Path, resources: BTreeMap<PoolName, Capacity>) -> anyhow::Resul
 /// (`None` keeps the production one). Set before the engine is shared.
 fn engine_with_notice(
     root: &Path,
-    resources: BTreeMap<PoolName, Capacity>,
+    resources: BTreeMap<PoolName, PoolSpec>,
     notice: Option<Duration>,
 ) -> anyhow::Result<Arc<Engine>> {
     let mut e = Engine::new(Config {
@@ -87,15 +91,16 @@ fn write_build(root: &Path, pkg: &str, content: &str) {
 }
 
 /// A bash target that waits for `gate` to exist, then writes its name and the
-/// `HEPH_CPUS` it was told.
+/// `${resource:cpu}` it was told.
 fn gated(name: &str, gate: &Path, resources: &str) -> String {
     format!(
         r#"
 target(
     name = "{name}",
     driver = "bash",
-    run = "while [ ! -e '{gate}' ]; do sleep 0.02; done; echo {name} $HEPH_CPUS > $OUT",
+    run = "while [ ! -e '{gate}' ]; do sleep 0.02; done; echo {name} $N > $OUT",
     out = "{name}.txt",
+    env = {{"N": "${{resource:cpu}}"}},
     resources = {resources},
 )
 "#,
@@ -367,8 +372,48 @@ async fn two_light_targets_do_overlap() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A custom pool declared with no value is unbounded: two targets each
+/// reserving far more of it than any bounded pool would hold run at once (the
+/// probe and its positive control above), each holding its whole, unclamped
+/// declaration.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unbounded_custom_pool_admits_concurrently() -> anyhow::Result<()> {
+    let ws = tempfile::tempdir()?;
+    let gates = tempfile::tempdir()?;
+    let gate = gates.path().join("open");
+    let res = r#"{"cpu": 1, "gpu": 1000}"#;
+    write_build(
+        ws.path(),
+        "p",
+        &format!("{}{}", gated("a", &gate, res), gated("b", &gate, res)),
+    );
+    let mut pools = caps(&[("cpu", 4 * MICROS)]);
+    pools.insert(
+        PoolName::try_from("gpu".to_string())?,
+        PoolSpec {
+            unit: Unit::Count,
+            capacity: None,
+        },
+    );
+    let engine = engine(ws.path(), pools)?;
+    let p = probe(&engine, &["//p:a", "//p:b"], &gate, |snap, started| {
+        started == 2 && snap.main.queued == 0
+    })
+    .await?;
+    assert_eq!(held(&p.snapshot, "gpu"), 2000, "{:?}", p.snapshot);
+    let trace = execute_trace(&p.events);
+    assert_eq!(trace.len(), 4, "{trace:?}");
+    assert!(
+        trace
+            .get(..2)
+            .is_some_and(|t| t.iter().all(|(k, _)| *k == "start")),
+        "both must start before either ends: {trace:?}"
+    );
+    Ok(())
+}
+
 /// `cpu: 16` on a 4-cpu pool is clamped to the whole pool: it runs, runs
-/// alone (a `cpu: 1` target queues behind it), and is told `HEPH_CPUS=4`.
+/// alone (a `cpu: 1` target queues behind it), and its `${resource:cpu}` is 4.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn oversize_declaration_runs_alone() -> anyhow::Result<()> {
     let ws = tempfile::tempdir()?;
@@ -422,61 +467,87 @@ async fn hashin(engine: &Arc<Engine>, addr: &str) -> anyhow::Result<String> {
         .clone())
 }
 
-/// Every `HEPH_*` the target sees, one `K=V` per line, sorted.
-const SHOW_HEPH_ENV: &str = "env | grep '^HEPH_' | sort > $OUT";
-
-/// D7: a `cpu: 3` target is told `HEPH_CPUS=3`, and heph sets no other
-/// `HEPH_*` name — no memory, since it declared none.
+/// D7: a `cpu: 3` target's `${resource:cpu}` is 3, and a target that
+/// declares nothing is told the 1 cpu it was granted.
 #[tokio::test]
 async fn target_sees_its_allotment() -> anyhow::Result<()> {
     let ws = tempfile::tempdir()?;
     write_build(
         ws.path(),
         "p",
-        &format!(
-            r#"target(name = "t", driver = "bash", run = "{SHOW_HEPH_ENV}", out = "t.txt", resources = {{"cpu": 3}})"#
-        ),
+        r#"
+target(name = "t", driver = "bash", run = "echo $N > $OUT", out = "t.txt", env = {"N": "${resource:cpu}"}, resources = {"cpu": 3})
+target(name = "plain", driver = "bash", run = "echo $N > $OUT", out = "p.txt", env = {"N": "${resource:cpu}"})
+"#,
     );
     let engine = engine(ws.path(), caps(&[("cpu", 4 * MICROS)]))?;
-    assert_eq!(output(&engine, "//p:t").await?, "HEPH_CPUS=3");
+    assert_eq!(output(&engine, "//p:t").await?, "3");
+    assert_eq!(output(&engine, "//p:plain").await?, "1");
     Ok(())
 }
 
-/// `HEPH_MEMORY_BYTES` is the declared memory, in bytes, and only when memory
-/// was declared.
+/// `${resource:memory}` is the declared memory, in bytes.
 #[tokio::test]
 async fn target_sees_its_memory_allotment() -> anyhow::Result<()> {
     let ws = tempfile::tempdir()?;
     write_build(
         ws.path(),
         "p",
-        &format!(
-            r#"
-target(name = "mem", driver = "bash", run = "{SHOW_HEPH_ENV}", out = "mem.txt", resources = {{"memory": "1G"}})
-target(name = "nomem", driver = "bash", run = "{SHOW_HEPH_ENV}", out = "nomem.txt")
-"#
-        ),
+        r#"target(name = "mem", driver = "bash", run = "echo $M > $OUT", out = "mem.txt", env = {"M": "${resource:memory}"}, resources = {"memory": "1G"})"#,
     );
     let engine = engine(ws.path(), caps(&[("cpu", 4 * MICROS), ("memory", 2 << 30)]))?;
-    assert_eq!(
-        output(&engine, "//p:mem").await?,
-        format!("HEPH_CPUS=1\nHEPH_MEMORY_BYTES={}", 1u64 << 30)
-    );
-    assert_eq!(output(&engine, "//p:nomem").await?, "HEPH_CPUS=1");
+    assert_eq!(output(&engine, "//p:mem").await?, (1u64 << 30).to_string());
     Ok(())
 }
 
-/// The target's own `env` wins over the allotment.
+/// `${resource:gpu}` on a custom count pool is the declared count, in any
+/// deferrable field (here `env` and the `run` text itself).
 #[tokio::test]
-async fn user_env_overrides_allotment_env() -> anyhow::Result<()> {
+async fn custom_pool_allotment_renders() -> anyhow::Result<()> {
     let ws = tempfile::tempdir()?;
     write_build(
         ws.path(),
         "p",
-        r#"target(name = "t", driver = "bash", run = "echo $HEPH_CPUS > $OUT", out = "t.txt", env = {"HEPH_CPUS": "7"}, resources = {"cpu": 3})"#,
+        r#"target(name = "t", driver = "bash", run = "echo $G ${resource:gpu} > $OUT", out = "t.txt", env = {"G": "${resource:gpu}"}, resources = {"gpu": 2})"#,
     );
-    let engine = engine(ws.path(), caps(&[("cpu", 4 * MICROS)]))?;
-    assert_eq!(output(&engine, "//p:t").await?, "7");
+    let engine = engine(ws.path(), caps(&[("cpu", 4 * MICROS), ("gpu", 3)]))?;
+    assert_eq!(output(&engine, "//p:t").await?, "2 2");
+    Ok(())
+}
+
+/// A `${resource:<pool>}` naming a pool the engine has but the target does
+/// not reserve is refused when the def is linked, naming the field and the
+/// fix; reserving it lets it through. A name that is no pool passes as
+/// written.
+#[tokio::test]
+async fn reference_to_an_unreserved_pool_is_refused_at_link() -> anyhow::Result<()> {
+    let ws = tempfile::tempdir()?;
+    write_build(
+        ws.path(),
+        "p",
+        r#"
+target(name = "bad", driver = "bash", run = "echo $G > $OUT", out = "b.txt", env = {"G": "${resource:gpu}"})
+target(name = "ok", driver = "bash", run = "echo $G > $OUT", out = "o.txt", env = {"G": "${resource:gpu}"}, resources = {"gpu": 1})
+target(name = "other", driver = "bash", run = "echo \"$G\" > $OUT", out = "x.txt", env = {"G": "${resource:tpu}"})
+"#,
+    );
+    let engine = engine(ws.path(), caps(&[("cpu", MICROS), ("gpu", 1)]))?;
+    let err = Arc::clone(&engine)
+        .get_def(engine.new_state(), &parse_addr("//p:bad")?)
+        .await
+        .err()
+        .map(|e| format!("{e:#}"))
+        .unwrap_or_else(|| panic!("//p:bad: refused at link"));
+    for needle in [
+        "//p:bad",
+        "env.G",
+        "reserves no gpu",
+        r#"add resources = {"gpu": <amount>}"#,
+    ] {
+        assert!(err.contains(needle), "missing {needle:?} in {err}");
+    }
+    assert_eq!(output(&engine, "//p:ok").await?, "1");
+    assert_eq!(output(&engine, "//p:other").await?, "${resource:tpu}");
     Ok(())
 }
 
@@ -489,7 +560,7 @@ async fn jobs_flag_does_not_move_the_cache_key() -> anyhow::Result<()> {
     write_build(
         ws.path(),
         "p",
-        r#"target(name = "t", driver = "bash", run = "echo $HEPH_CPUS > $OUT", out = "t.txt", resources = {"cpu": 4})"#,
+        r#"target(name = "t", driver = "bash", run = "echo $N > $OUT", out = "t.txt", env = {"N": "${resource:cpu}"}, resources = {"cpu": 4})"#,
     );
     let one = engine(ws.path(), caps(&[("cpu", MICROS)]))?;
     let (res, events) = build_events(&one, &["//p:t"]).await;
@@ -704,7 +775,7 @@ async fn changing_resources_keeps_the_cache_hit() -> anyhow::Result<()> {
         .get_def(second.new_state(), &addr)
         .await?;
     assert_eq!(
-        def.target_def.resources.declared("cpu"),
+        def.target_def.demand.declared("cpu"),
         Some(2 * MICROS),
         "the edit reached the def"
     );
@@ -749,7 +820,7 @@ target(name = "g", driver = "group", deps = ["//p:leaf"], prefix = "moved", reso
     let def = Arc::clone(&engine)
         .get_def(engine.new_state(), &parse_addr("//p:g")?)
         .await?;
-    assert_eq!(def.target_def.resources.declared("cpu"), Some(2 * MICROS));
+    assert_eq!(def.target_def.demand.declared("cpu"), Some(2 * MICROS));
 
     // `a` first, so `g` is the one that waits.
     let trace: Vec<_> = first_then_second(&engine, "//p:a", MICROS, "//p:g", &gate)
@@ -791,7 +862,7 @@ target(name = "g", driver = "group", deps = ["//p:leaf"], resources = {"docker":
     let def = Arc::clone(&engine)
         .get_def(engine.new_state(), &parse_addr("//p:g")?)
         .await?;
-    assert_eq!(def.target_def.resources.declared("docker"), Some(1));
+    assert_eq!(def.target_def.demand.declared("docker"), Some(1));
     let (res, events) = build_events(&engine, &["//p:g"]).await;
     res?;
     assert_eq!(starts(&events), vec!["//p:leaf"], "g never executes");
@@ -824,7 +895,7 @@ target(name = "ok", driver = "bash", run = "echo $M > $OUT", out = "o.txt", env 
             .unwrap_or_else(|| panic!("{name}: refused at link"));
         let msg = format!("{err:#}");
         assert!(msg.contains(&format!("//p:{name}")), "{msg}");
-        assert!(msg.contains("declares no memory"), "{msg}");
+        assert!(msg.contains("reserves no memory"), "{msg}");
         assert!(msg.contains("env.M"), "{msg}");
     }
     assert_eq!(output(&engine, "//p:cpu_only").await?, "1");
@@ -832,8 +903,8 @@ target(name = "ok", driver = "bash", run = "echo $M > $OUT", out = "o.txt", env 
     Ok(())
 }
 
-/// D11: `heph inspect def` serialises the def, and `resources` is on it in its
-/// units; a target that declares nothing prints no key.
+/// D11: `heph inspect def` serialises the def, and `resources` is on it as
+/// written; a target that declares nothing prints no key.
 #[tokio::test]
 async fn inspect_def_prints_resources() -> anyhow::Result<()> {
     let ws = tempfile::tempdir()?;
@@ -852,7 +923,7 @@ target(name = "plain", driver = "bash", run = "echo t > $OUT", out = "t.txt")
     let json = serde_json::to_value(&*def.target_def)?;
     assert_eq!(
         json.get("resources"),
-        Some(&serde_json::json!({"cpu": 500_000, "docker": 1, "memory": 1u64 << 30})),
+        Some(&serde_json::json!({"cpu": "0.5", "docker": "1", "memory": "1G"})),
         "{json}"
     );
     let plain = Arc::clone(&engine)
@@ -948,9 +1019,9 @@ target(name = "plain", driver = "bash", run = "echo plain > $OUT", out = "plain.
         vec![(
             4,
             BTreeMap::from([
-                ("cpu".to_string(), 4 * MICROS),
-                ("docker".to_string(), 2),
-                ("memory".to_string(), 8 << 30),
+                ("cpu".to_string(), Some(4 * MICROS)),
+                ("docker".to_string(), Some(2)),
+                ("memory".to_string(), Some(8 << 30)),
             ])
         )],
         "one RequestConfig, every pool's capacity"

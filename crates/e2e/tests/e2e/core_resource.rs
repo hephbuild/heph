@@ -8,7 +8,7 @@
 //! whatever this run's pools are, and a target that declares the whole of it
 //! is clamped to the run's `cpu` pool like any oversize declaration.
 
-use hcore::capacity::Capacity;
+use hcore::capacity::{Capacity, PoolSpec, Unit};
 use hcore::htvalue::Value;
 use heph::engine::event::{BuildEvent, BuildEventKind};
 use heph::engine::{Config, Engine, OutputMatcher, ResultOptions};
@@ -26,8 +26,16 @@ const MICROS: u64 = 1_000_000;
 /// `jobs` is what `-j N` resolves to (`--resource cpu=N`), and also sizes the
 /// engine's own `parallelism`, so neither knob can leak into the value.
 fn engine(root: &Path, jobs: Option<u64>) -> anyhow::Result<Arc<Engine>> {
-    let resources: BTreeMap<PoolName, Capacity> = jobs
-        .map(|n| (PoolName::cpu(), Capacity::Amount(n * MICROS)))
+    let resources: BTreeMap<PoolName, PoolSpec> = jobs
+        .map(|n| {
+            (
+                PoolName::cpu(),
+                PoolSpec {
+                    unit: Unit::Cpu,
+                    capacity: Some(Capacity::Amount(n * MICROS)),
+                },
+            )
+        })
         .into_iter()
         .collect();
     let mut e = Engine::new(Config {

@@ -242,8 +242,8 @@ async fn declared_target_carries_resources() -> anyhow::Result<()> {
     let def = Arc::clone(&ws.engine)
         .get_def(rs, &heph::htaddr::parse_addr("//p:heavy")?)
         .await?;
-    assert_eq!(def.target_def.resources.declared("cpu"), Some(2_000_000));
-    assert_eq!(def.target_def.resources.declared("memory"), Some(1 << 30));
+    assert_eq!(def.target_def.demand.declared("cpu"), Some(2_000_000));
+    assert_eq!(def.target_def.demand.declared("memory"), Some(1 << 30));
     let result = ws.run("//p:heavy").await?;
     assert_eq!(htestkit::artifact_string(&result).trim(), "heavy");
     Ok(())

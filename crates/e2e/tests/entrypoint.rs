@@ -909,20 +909,20 @@ target(
         .context("run was called")?;
     assert_eq!(
         seen.allotment,
-        Some(hplugin::driver::Allotment {
-            cpu: std::num::NonZeroU32::new(3).context("3")?,
-            memory_bytes: None,
-        }),
+        Some(hplugin::driver::Allotment::new([(
+            "cpu".to_string(),
+            "3".to_string()
+        )])),
         "told the whole cpu capacity, no memory"
     );
     Ok(())
 }
 
-/// The exec half of D6/D7: a `bash` entrypoint's command sees `HEPH_CPUS` =
-/// the cpu capacity, over the caller's own `HEPH_CPUS`; no memory was
-/// granted, so none is set.
+/// The exec half of D6/D7: a `bash` entrypoint's `${resource:cpu}` is the cpu
+/// capacity, and the caller's own environment reaches the command as it was
+/// (heph exports nothing of its own, so the caller's `HEPH_CPUS` is untouched).
 #[tokio::test]
-async fn bash_entrypoint_sees_the_capacity_in_its_env() -> anyhow::Result<()> {
+async fn bash_entrypoint_sees_the_capacity_through_a_reference() -> anyhow::Result<()> {
     let ws = WorkspaceBuilder::new()?
         .with_parallelism(3)
         .with_provider(|init| {
@@ -939,7 +939,7 @@ async fn bash_entrypoint_sees_the_capacity_in_its_env() -> anyhow::Result<()> {
         r#"
 target(name = "ep", driver = "bash", entrypoint = True,
        env = {"EP_JOBS": "-j${resource:cpu}"},
-       run = ["echo \"$HEPH_CPUS ${HEPH_MEMORY_BYTES-none} $EP_JOBS\" > \"$HEPH_TEST_OUT\""])
+       run = ["echo \"$HEPH_CPUS $EP_JOBS\" > \"$HEPH_TEST_OUT\""])
 "#,
     );
     let elsewhere = tempfile::tempdir()?;
@@ -947,7 +947,7 @@ target(name = "ep", driver = "bash", entrypoint = True,
     let mut req = request("//app:ep", elsewhere.path(), &[], &out)?;
     req.env.push(("HEPH_CPUS".into(), "99".into()));
     assert_eq!(exited(invoke(&ws.engine, req).await), Exit::Code(0));
-    assert_eq!(read(&out)?.trim(), "3 none -j3");
+    assert_eq!(read(&out)?.trim(), "99 -j3");
     Ok(())
 }
 

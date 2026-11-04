@@ -314,12 +314,11 @@ async fn a_reference_in_template_vars_renders_the_producers_bytes() -> anyhow::R
     Ok(())
 }
 
-/// `${resource:…}` is an `env` / `runtime_env` value's only: written into a
-/// `template` var, the allotment would land in the rendered file and make its
-/// hashout per-machine, so it is refused when the def is built. An unknown
-/// name there is not heph's and renders as written.
+/// `${resource:…}` is substituted in any deferrable field, a `template` var
+/// included: the rendered file holds the run's allotment (the default 1 cpu).
+/// An unknown name there is not heph's and renders as written.
 #[tokio::test]
-async fn a_resource_reference_in_template_vars_is_refused() -> anyhow::Result<()> {
+async fn a_resource_reference_in_template_vars_renders() -> anyhow::Result<()> {
     let ws = Workspace::new();
     ws.write_file("app/conf.j2", "jobs: {{ jobs }}\n");
     ws.write_build_file(
@@ -331,13 +330,9 @@ target(name = "other", driver = "template", src = file("conf.j2"), out = "other"
        vars = {"jobs": "${resource:cpus}"})
 "#,
     );
-    let err = expect_err(ws.run("//app:conf").await, "a resource in a var is refused");
-    let msg = format!("{err:#}");
-    assert!(msg.contains("//app:conf"), "{msg}");
-    assert!(
-        msg.contains("`${resource:cpu}` in `vars.jobs`")
-            && msg.contains("only accepted in an `env` or `runtime_env`"),
-        "{msg}"
+    assert_eq!(
+        common::artifact_string(&*ws.run("//app:conf").await?),
+        "jobs: 1\n"
     );
     assert_eq!(
         common::artifact_string(&*ws.run("//app:other").await?),

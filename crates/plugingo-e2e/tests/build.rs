@@ -390,12 +390,12 @@ async fn test_embed_generated_in_subpackage_of_the_embedder() -> anyhow::Result<
 }
 
 /// D7/D15 end to end: a Go test whose package declares `test = {"resources":
-/// {"cpu": 2}}`, run on a 2-cpu pool, is told `HEPH_CPUS=2`, and heph leaves
-/// `GOMAXPROCS` alone, so the binary still sizes itself from the host. The
-/// assertions live in the Go test: the target passes only if both hold, and it
-/// prints both so a failure's log tail shows what it saw.
+/// {"cpu": 2}, "env": {"N": "${resource:cpu}"}}`, run on a 2-cpu pool, sees
+/// `N=2`, and heph leaves `GOMAXPROCS` alone, so the binary still sizes itself
+/// from the host. The assertions live in the Go test: the target passes only
+/// if both hold, and it prints both so a failure's log tail shows what it saw.
 #[tokio::test]
-async fn go_test_sees_heph_cpus_and_host_gomaxprocs() -> anyhow::Result<()> {
+async fn go_test_sees_resource_cpu_and_host_gomaxprocs() -> anyhow::Result<()> {
     require_go!();
     let dir = tempfile::tempdir()?;
     let root = dir.path();
@@ -413,9 +413,9 @@ import (
 )
 
 func TestAllotment(t *testing.T) {
-	t.Logf("HEPH_CPUS=%s GOMAXPROCS=%d NumCPU=%d", os.Getenv("HEPH_CPUS"), runtime.GOMAXPROCS(0), runtime.NumCPU())
-	if got := os.Getenv("HEPH_CPUS"); got != "2" {
-		t.Fatalf("HEPH_CPUS = %q, want \"2\"", got)
+	t.Logf("N=%s GOMAXPROCS=%d NumCPU=%d", os.Getenv("N"), runtime.GOMAXPROCS(0), runtime.NumCPU())
+	if got := os.Getenv("N"); got != "2" {
+		t.Fatalf("N = %q, want \"2\"", got)
 	}
 	if runtime.GOMAXPROCS(0) != runtime.NumCPU() {
 		t.Fatalf("GOMAXPROCS = %d, want NumCPU %d: heph must not set it", runtime.GOMAXPROCS(0), runtime.NumCPU())
@@ -425,11 +425,11 @@ func TestAllotment(t *testing.T) {
     )?;
     std::fs::write(
         root.join("p/BUILD"),
-        r#"provider_state(provider = "go", test = {"resources": {"cpu": 2}})"#,
+        r#"provider_state(provider = "go", test = {"resources": {"cpu": 2}, "env": {"N": "${resource:cpu}"}})"#,
     )?;
     let ws = common::make_workspace_with_parallelism(dir, 2)?;
     ws.run("//p:test@v=host")
         .await
-        .context("the Go test checks HEPH_CPUS and GOMAXPROCS itself")?;
+        .context("the Go test checks N and GOMAXPROCS itself")?;
     Ok(())
 }
