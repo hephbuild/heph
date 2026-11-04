@@ -198,6 +198,13 @@ message ManagedRunRequest {
   // build's sandboxed, captured run. The host sends it only for a def that
   // declared an entrypoint, so a plugin that predates it never receives one.
   RunOptions options = 14;
+  // What the host reserved for this run (since 0.17.4), mirroring
+  // driver::Allotment: every pool the run was granted some of (`cpu` always),
+  // by pool name, each amount rendered by its pool's unit (whole CPUs, bytes,
+  // a count) — the text a `${resource:<pool>}` becomes. Empty means "told
+  // nothing", what every older host sends; a run that then resolves a
+  // `${resource:}` reference fails.
+  map<string, string> allotment = 15;
 }
 
 // Mirrors driver::RunOptions. Every field is absent unless set, and absence is

@@ -149,6 +149,37 @@ pub(crate) struct RootFailure {
     pub blocked_by_pkg: FxHashMap<Box<str>, usize>,
 }
 
+/// A target whose admission has waited past the notice threshold for what it
+/// reserves to fit. `free` and `ahead` are as of the notice.
+#[derive(Debug, Clone)]
+pub(crate) struct AdmissionWait {
+    pub addr: String,
+    pub pool: String,
+    /// `pool`'s unit, as announced when the wait started.
+    pub unit: hcore::capacity::Unit,
+    pub need: u64,
+    pub free: u64,
+    pub ahead: u64,
+    pub since_ms: u64,
+}
+
+impl AdmissionWait {
+    /// `//a:b waits for cpu 4 (2 free, 6 ahead, 41s)`, the TUI's row text.
+    pub(crate) fn text(&self, now_ms: u64) -> String {
+        hcore::events::admission_wait_text(
+            &self.addr,
+            &self.pool,
+            self.unit,
+            self.need,
+            self.free,
+            self.ahead,
+            &hcore::units::human_duration(std::time::Duration::from_millis(
+                now_ms.saturating_sub(self.since_ms),
+            )),
+        )
+    }
+}
+
 /// A target waiting on the per-addr result lock — the "is it stuck?" signal.
 #[derive(Debug, Clone)]
 pub(crate) struct LockWait {
@@ -203,6 +234,10 @@ pub(crate) struct Tally {
     /// Targets currently waiting on the result lock. Bounded by concurrency.
     lock_waits: FxHashMap<Box<str>, LockWait>,
 
+    /// Targets currently waiting for admission past the notice threshold.
+    /// Bounded by the admission queue.
+    admission_waits: FxHashMap<Box<str>, AdmissionWait>,
+
     /// In-flight background cache uploads, rendered as one aggregate row rather
     /// than thousands of per-target ones. See [`Phase::is_background`].
     background_ops: usize,
@@ -222,6 +257,9 @@ pub(crate) struct Tally {
     misses_by_pkg: FxHashMap<Box<str>, usize>,
 
     max_workers: usize,
+    /// Each pool's unit name, from `RequestConfig`, so a wait row shows its
+    /// amounts the way the pool's are written.
+    pool_units: std::collections::BTreeMap<String, String>,
     /// Whether this invocation stops at the first failure. Reported by the
     /// engine, never inferred here — see `BuildEventKind::RequestConfig`.
     fail_fast: bool,
@@ -290,8 +328,12 @@ impl Tally {
                 max_workers,
                 fail_fast,
                 scratch_disabled,
+                // Pool capacities; the report does not render them yet.
+                resources: _,
+                units,
             } => {
                 self.max_workers = *max_workers;
+                self.pool_units.clone_from(units);
                 self.fail_fast = *fail_fast;
                 self.scratch_disabled = *scratch_disabled;
             }
@@ -335,6 +377,10 @@ impl Tally {
             BuildEventKind::ExecuteStart { addr, driver, .. } => {
                 let at = ev.at_unix_ms;
                 self.ensure(addr, at);
+                // A target that executes is no longer waiting at admission. The
+                // engine sends `AdmissionWaitEnd` first; this keeps a lost End
+                // from leaving a stale `⧗` row in the live comment.
+                self.admission_waits.remove(addr.as_str());
                 let mut retract = None;
                 if let Some(rec) = self.live.get_mut(addr.as_str()) {
                     rec.phase = Some((Phase::Execute, at));
@@ -434,6 +480,29 @@ impl Tally {
             }
             BuildEventKind::ResultLockWaitEnd { addr } => {
                 self.lock_waits.remove(addr.as_str());
+            }
+            BuildEventKind::AdmissionWaitStart {
+                addr,
+                pool,
+                need,
+                free,
+                ahead,
+            } => {
+                self.admission_waits.insert(
+                    addr.as_str().into(),
+                    AdmissionWait {
+                        addr: addr.clone(),
+                        pool: pool.clone(),
+                        unit: hcore::events::unit_of(&self.pool_units, pool),
+                        need: *need,
+                        free: *free,
+                        ahead: *ahead,
+                        since_ms: ev.at_unix_ms,
+                    },
+                );
+            }
+            BuildEventKind::AdmissionWaitEnd { addr } => {
+                self.admission_waits.remove(addr.as_str());
             }
 
             BuildEventKind::ScratchLockWaitStart { addr, scratch, .. } => {
@@ -759,6 +828,16 @@ impl Tally {
         (rows, total)
     }
 
+    /// Open admission waits, longest first (then by addr, so the order is
+    /// stable across renders), capped at `limit`, with the total count. Every
+    /// one is already past the engine's notice threshold.
+    pub(crate) fn admission_waits(&self, limit: usize) -> (Vec<AdmissionWait>, usize) {
+        let mut all: Vec<&AdmissionWait> = self.admission_waits.values().collect();
+        let total = all.len();
+        all.sort_by(|a, b| (a.since_ms, &a.addr).cmp(&(b.since_ms, &b.addr)));
+        (all.into_iter().take(limit).cloned().collect(), total)
+    }
+
     /// Lock waits past `threshold_ms`, longest first, capped at `limit`.
     pub(crate) fn lock_waits(
         &self,
@@ -846,6 +925,9 @@ mod tests {
                 addr: addr.into(),
                 driver: "exec".into(),
                 cache: false,
+                declared: None,
+                reserved: None,
+                queued_ms: None,
             },
         ));
         t.apply(&ev(
@@ -950,6 +1032,9 @@ mod tests {
                 addr: "//a:x".into(),
                 driver: "exec".into(),
                 cache: false,
+                declared: None,
+                reserved: None,
+                queued_ms: None,
             },
         ));
         assert_eq!(t.counters().cached(), 0, "hit retracted off its counter");
@@ -980,6 +1065,9 @@ mod tests {
                 addr: "//a:x".into(),
                 driver: "exec".into(),
                 cache: false,
+                declared: None,
+                reserved: None,
+                queued_ms: None,
             },
         ));
         t.apply(&ev(
@@ -1053,6 +1141,9 @@ mod tests {
                     addr: format!("//a:t{i}"),
                     driver: "exec".into(),
                     cache: false,
+                    declared: None,
+                    reserved: None,
+                    queued_ms: None,
                 },
             ));
         }
@@ -1349,6 +1440,81 @@ mod tests {
     }
 
     #[test]
+    fn admission_waits_render_as_the_tui_row_and_clear_on_end() {
+        let mut t = Tally::default();
+        let start = |addr: &str, need: u64| BuildEventKind::AdmissionWaitStart {
+            addr: addr.into(),
+            pool: "cpu".into(),
+            need,
+            free: 2_000_000,
+            ahead: 6,
+        };
+        t.apply(&ev(1_000, start("//a:b", 4_000_000)));
+        t.apply(&ev(5_000, start("//a:c", 500_000)));
+        let (waits, total) = t.admission_waits(5);
+        assert_eq!(total, 2);
+        let rows: Vec<String> = waits.iter().map(|w| w.text(42_000)).collect();
+        assert_eq!(
+            rows,
+            [
+                "//a:b waits for cpu 4 (2 free, 6 ahead, 41s)",
+                "//a:c waits for cpu 0.5 (2 free, 6 ahead, 37s)",
+            ],
+            "longest first"
+        );
+        assert_eq!(t.admission_waits(1).0.len(), 1, "capped");
+        assert_eq!(t.admission_waits(1).1, 2, "the total is uncapped");
+        t.apply(&ev(
+            42_000,
+            BuildEventKind::AdmissionWaitEnd {
+                addr: "//a:b".into(),
+            },
+        ));
+        // An End with no Start is ignored.
+        t.apply(&ev(
+            42_000,
+            BuildEventKind::AdmissionWaitEnd {
+                addr: "//a:zz".into(),
+            },
+        ));
+        let (waits, total) = t.admission_waits(5);
+        assert_eq!(total, 1, "cleared on end");
+        assert_eq!(waits.first().map(|w| w.addr.as_str()), Some("//a:c"));
+    }
+
+    /// A wait on a custom pool reads in the unit `RequestConfig` announced
+    /// for it.
+    #[test]
+    fn an_admission_wait_on_a_custom_pool_reads_in_its_unit() {
+        let mut t = Tally::default();
+        t.apply(&ev(
+            0,
+            BuildEventKind::RequestConfig {
+                max_workers: 4,
+                fail_fast: false,
+                scratch_disabled: false,
+                resources: [("scratch_disk".into(), Some(8 << 30))].into(),
+                units: [("scratch_disk".into(), "bytes".into())].into(),
+            },
+        ));
+        t.apply(&ev(
+            1_000,
+            BuildEventKind::AdmissionWaitStart {
+                addr: "//a:b".into(),
+                pool: "scratch_disk".into(),
+                need: 4 << 30,
+                free: 1 << 30,
+                ahead: 0,
+            },
+        ));
+        let (waits, _) = t.admission_waits(5);
+        assert_eq!(
+            waits.iter().map(|w| w.text(2_000)).collect::<Vec<_>>(),
+            ["//a:b waits for scratch_disk 4.0 GiB (1.0 GiB free, 0 ahead, 1s)"]
+        );
+    }
+
+    #[test]
     fn status_settles_when_the_stream_closes() {
         let mut t = Tally::default();
         // A matched transparent group emits no `ResultEnd`, so `done == total`
@@ -1464,6 +1630,8 @@ mod tests {
                 max_workers: 16,
                 fail_fast: false,
                 scratch_disabled: false,
+                resources: Default::default(),
+                units: Default::default(),
             },
         ));
         t.apply(&ev(

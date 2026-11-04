@@ -65,6 +65,11 @@ struct HttpFetchSpec {
     /// `{enabled, remote, history}` toggles them independently (e.g.
     /// `cache = {"remote": False}` keeps the fetch local-only).
     cache: TargetSpecCache,
+    /// What the target reserves from the resource pools while it runs, e.g.
+    /// `{"cpu": 2}`. A fetch waits on the network, so the driver advertises
+    /// `cpu` 0.1 ([`Resources::IO_CPU`](hplugin::driver::Resources::IO_CPU))
+    /// when the target declares none. Never hashed.
+    resources: hplugin::driver::Resources,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -162,6 +167,14 @@ impl ManagedDriver for Driver {
                 }],
                 cache: spec.cache.into(),
                 hash,
+                // Not in `hash` above: a declaration moves no key.
+                resources: spec
+                    .resources
+                    .advertise(
+                        hplugin::provider::PoolName::cpu(),
+                        hplugin::driver::Resources::IO_CPU,
+                    )
+                    .context("http resources")?,
                 ..Default::default()
             },
         })
@@ -485,6 +498,34 @@ mod tests {
         // Nothing to name the file after → the target must say `out`.
         assert_eq!(file_name_of("https://x/y/"), None);
         assert_eq!(file_name_of("https://x"), None);
+    }
+
+    /// A fetch that declares no `cpu` advertises 0.1; a declared `cpu` replaces it, and
+    /// neither moves the def hash.
+    #[tokio::test]
+    async fn resources_default_to_a_tenth_of_a_cpu_and_are_unhashed() {
+        let parse = |resources: Option<Value>| async move {
+            let mut config = HashMap::from([(
+                "url".to_string(),
+                Value::String("https://x/tool.bin".to_string()),
+            )]);
+            if let Some(r) = resources {
+                config.insert("resources".to_string(), r);
+            }
+            Driver
+                .parse(parse_req("//t:fetch", config), &StdCancellationToken::new())
+                .await
+                .expect("parse")
+                .target_def
+        };
+        let plain = parse(None).await;
+        assert_eq!(plain.resources.declared("cpu"), Some("0.1"));
+        let heavy = parse(Some(Value::Map(
+            [("cpu".to_string(), Value::Int(2))].into(),
+        )))
+        .await;
+        assert_eq!(heavy.resources.declared("cpu"), Some("2"));
+        assert_eq!(heavy.hash, plain.hash);
     }
 
     /// `out` defaults to the URL's last segment — the name the server serves the

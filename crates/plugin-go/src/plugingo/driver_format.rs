@@ -119,6 +119,9 @@ struct GoFormatSpec {
     /// `"local"`, spawns here as before. A hashed dependency, so changing the
     /// environment re-keys this target.
     runner: String,
+    /// What the target reserves from the resource pools while it runs, e.g.
+    /// `{"cpu": 2}`. Defaults to 1 cpu. Never hashed.
+    resources: hplugin::driver::Resources,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -287,6 +290,7 @@ impl ManagedDriver for GoFormatDriver {
                 outputs,
                 cache: CacheConfig::on(true),
                 hash,
+                resources: spec.resources,
                 ..Default::default()
             },
         })
@@ -412,6 +416,7 @@ impl ManagedDriver for GoFormatCheckDriver {
                 inputs,
                 cache: CacheConfig::on(true),
                 hash,
+                resources: spec.resources,
                 ..Default::default()
             },
         })

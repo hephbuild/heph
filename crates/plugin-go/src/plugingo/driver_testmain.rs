@@ -42,6 +42,9 @@ struct GoTestmainSpec {
     mode: TestmainMode,
     /// Declared outputs, grouped by name → list of output paths.
     out: HashMap<String, Vec<String>>,
+    /// What the target reserves from the resource pools while it runs, e.g.
+    /// `{"cpu": 2}`. Defaults to 1 cpu. Never hashed.
+    resources: hplugin::driver::Resources,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -180,6 +183,7 @@ impl ManagedDriver for GoTestmainDriver {
                 outputs,
                 cache: CacheConfig::on(true),
                 hash,
+                resources: spec.resources,
                 ..Default::default()
             },
         })

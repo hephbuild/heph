@@ -246,12 +246,22 @@ pub struct Engine {
     /// Captured once at construction — the engine is handed its runtime, the
     /// memoizers never discover one at spawn time.
     pub(crate) runtime: tokio::runtime::Handle,
-    pub(crate) result_permits: Arc<crate::engine::worker_pool::WorkerPool>,
-    /// Maximum concurrent executes (the `result_permits` capacity). Cached
-    /// here so it can be announced to clients via a `RequestConfig` build event
-    /// without reaching into the semaphore (whose live `available_permits` only
-    /// reflects the *free* count, not the configured max).
+    /// Execute admission: a target runs once what it reserves fits every pool
+    /// it names. Built on first admission (see [`EnginePools`]).
+    ///
+    /// [`EnginePools`]: crate::engine::resource_pool::EnginePools
+    pub(crate) pools: Arc<crate::engine::resource_pool::EnginePools>,
+    /// The `cpu` capacity, in CPUs (rounded up), announced to clients as the
+    /// `RequestConfig` build event's `max_workers`.
     pub(crate) max_workers: usize,
+    /// How wide the engine's own fan-outs run (top-level spawns, the gc and
+    /// clean loops): `2 × parallelism`, independent of the `cpu` capacity, so
+    /// `-j 1` does not serialise them.
+    pub(crate) fan_out: usize,
+    /// How long an admission waits before it is announced
+    /// (`AdmissionWaitStart`): the result-lock notice threshold, settable in
+    /// tests only ([`Engine::set_admission_notice`]).
+    pub(crate) admission_notice: std::time::Duration,
 
     /// YAML-selected builtins, by plugin name; consumed when applied.
     pub(crate) plugin_factories: HashMap<String, PluginFactory>,
@@ -633,15 +643,44 @@ fn ensure_home(home: &Path) -> anyhow::Result<()> {
 }
 
 impl Engine {
+    /// The resource pool at this instant: per pool held/free/capacity and the
+    /// queue. `None` before the first admission has built the pool.
+    pub fn resource_snapshot(&self) -> Option<crate::engine::resource_pool::ResourceSnapshot> {
+        self.pools.snapshot()
+    }
+
+    /// Every named pool's capacity, in the pool's unit's base, and its unit's
+    /// name, as `RequestConfig` announces them: `None` for an unbounded pool.
+    /// Builds the pool (and so reads the host's memory) on the first call.
+    pub(crate) fn pool_announcement(&self) -> crate::engine::request_state::PoolAnnouncement {
+        let mut ann = crate::engine::request_state::PoolAnnouncement::default();
+        for (p, c) in self.pools.get().capacities() {
+            let unit = self
+                .pools
+                .unit(p.as_str())
+                .unwrap_or_else(|| hcore::capacity::Unit::default_for(p.as_str()));
+            ann.capacities.insert(p.as_str().to_owned(), c.bounded());
+            ann.units
+                .insert(p.as_str().to_owned(), unit.name().to_owned());
+        }
+        ann
+    }
+
+    /// Lower the admission-wait notice threshold, so a test can see
+    /// `AdmissionWaitStart/End` without waiting the production five seconds.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_admission_notice(&mut self, after: std::time::Duration) {
+        self.admission_notice = after;
+    }
+
     pub fn new(cfg: Config) -> anyhow::Result<Engine> {
         let home = cfg.home_dir.clone();
         ensure_home(&home)?;
 
-        let parallelism = cfg.parallelism.unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1)
-        });
+        // `cfg.parallelism` is an embedder's override (tests size the engine
+        // with it; the CLI leaves it unset): a run's choice, like `-j`. The
+        // host's number is `host_cpus`, which `heph.core.resource("cpu")` reports.
+        let parallelism = cfg.parallelism.unwrap_or_else(hcore::sysres::host_cpus);
 
         let sqlite = LocalCacheSQLite::with_pipe_limit(
             home.join("cache").join("cache.db"),
@@ -719,7 +758,19 @@ impl Engine {
             &home.join("cache").join("fswalk.db"),
         ));
 
-        let max_workers = 2 * parallelism;
+        // D12: the cpu capacity comes from the same `parallelism` as everything
+        // else here; memory is read on the first admission (`EnginePools`).
+        let fan_out = 2 * parallelism;
+        let pools = Arc::new(crate::engine::resource_pool::EnginePools::new(
+            cfg.resources.clone(),
+            parallelism,
+        ));
+        let max_workers = usize::try_from(
+            pools
+                .cpu_capacity()
+                .div_ceil(hplugin::driver::Resources::MICROS_PER_CPU),
+        )
+        .unwrap_or(usize::MAX);
 
         // Fails loudly here rather than at first request: every request's
         // memoizers spawn on this handle, and an engine constructed off-runtime
@@ -752,23 +803,29 @@ impl Engine {
                     .context("register the builtin session exec runner")?;
                 registry
             }),
-            result_permits: {
-                let pool = crate::engine::worker_pool::WorkerPool::new(max_workers);
-                // Two readers of the same pool, for two different lines: the
-                // permit accounting (`N max, N free, N running`) and the
+            pools: {
+                // Two readers of the cpu pool, in CPUs, for two different lines:
+                // the permit accounting (`N max, N free, N running`) and the
                 // `workers` limiter's saturation age. Both must sample when the
-                // report is rendered, not at the last acquire.
+                // report is rendered, not at the last acquire; before the first
+                // admission builds the pool, all of it is free.
                 let free = {
-                    let pool = Arc::clone(&pool);
-                    move || pool.available()
+                    let pools = Arc::clone(&pools);
+                    move || cpu_free_cpus(&pools)
                 };
                 crate::engine::diag::global().register_worker_pool(max_workers, free.clone());
+                crate::engine::diag::global().register_pools({
+                    let pools = Arc::clone(&pools);
+                    move || pools.snapshot()
+                });
                 crate::engine::diag::global()
                     .limiter("workers")
                     .attach_gauge(free);
-                pool
+                pools
             },
             max_workers,
+            fan_out,
+            admission_notice: crate::engine::result::RESULT_LOCK_NOTICE,
             plugin_factories: HashMap::new(),
             plugins: HashMap::new(),
             fuse,
@@ -1354,9 +1411,50 @@ impl hplugin::lsp::LspEngine for Engine {
     }
 }
 
+/// The free `cpu` capacity in whole CPUs, for the diag gauges; all of it
+/// before the first admission has built the pool.
+pub(crate) fn cpu_free_cpus(pools: &crate::engine::resource_pool::EnginePools) -> usize {
+    let micros = pools
+        .built()
+        .and_then(|p| p.available(hplugin::provider::PoolName::CPU))
+        .unwrap_or_else(|| pools.cpu_capacity());
+    usize::try_from(micros / hplugin::driver::Resources::MICROS_PER_CPU).unwrap_or(usize::MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// D12: the cpu capacity is the engine's `parallelism` CPUs (not today's
+    /// `2 × parallelism` slots), read once beside `max_workers`; the engine's
+    /// own fan-outs keep `2 × parallelism`.
+    #[test]
+    fn cpu_capacity_defaults_to_the_engines_parallelism() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _rt = crate::engine::test_rt_enter();
+        let engine = Engine::new(Config {
+            parallelism: Some(4),
+            ..Config::for_tests(dir.path())
+        })
+        .expect("engine");
+        assert_eq!(
+            engine.pools.cpu_capacity(),
+            4 * hplugin::driver::Resources::MICROS_PER_CPU
+        );
+        assert_eq!(engine.max_workers, 4);
+        assert_eq!(engine.fan_out, 8);
+        // Nothing has been admitted, so the memory read has not happened yet.
+        assert!(engine.pools.built().is_none());
+        assert_eq!(
+            engine
+                .pools
+                .get()
+                .capacity(hplugin::provider::PoolName::CPU),
+            Some(crate::engine::resource_pool::Limit::Bounded(
+                4 * hplugin::driver::Resources::MICROS_PER_CPU
+            ))
+        );
+    }
 
     #[test]
     fn the_home_ignores_itself() {

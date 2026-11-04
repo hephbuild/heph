@@ -7,12 +7,13 @@
 //! process split. Rendering callers pass their own `now_ms` wall clock.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 
 use crate::tui::app::{CIAppView, TUIAppView};
+use hcore::capacity::Unit;
 use hcore::events::{BuildEvent, BuildEventKind};
 
 /// Floor on the pinned viewport row count. The viewport targets one third of the
@@ -427,8 +428,9 @@ fn art_lines(now_ms: u64, width: usize, rows: usize) -> Vec<Line<'static>> {
 /// Which body the TUI viewport is showing. The default view is the live
 /// slow-target / lock-wait breakdown; the list views each mirror one header
 /// counter — [`ViewMode::Done`] the completed count, [`ViewMode::Matched`] the
-/// matched total, [`ViewMode::Cached`] the cached count, [`ViewMode::Failed`]
-/// the failed count. `Tab` cycles through `[Default]` plus one entry per
+/// matched total, [`ViewMode::Cached`] the cached count, [`ViewMode::Waiting`]
+/// the admission-wait count, [`ViewMode::Failed`] the failed count. `Tab`
+/// cycles through `[Default]` plus one entry per
 /// tab-bound header segment the header model exposes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewMode {
@@ -443,6 +445,9 @@ pub enum ViewMode {
     Matched,
     /// The list of targets that hit cache. Mirrors the header's cached count.
     Cached,
+    /// The targets held at admission past the notice threshold, each as its
+    /// `⧗` row. They are shown here and nowhere else until the wait ends.
+    Waiting,
     /// The list of failed targets.
     Failed,
 }
@@ -764,6 +769,66 @@ pub struct BuildState {
     /// blocked for three minutes between them is the whole reason the build was
     /// slow, and by the time anyone reads the summary every wait has ended.
     scratch_wait_totals: HashMap<String, (u64, u64)>,
+    /// Every pool: its unit and capacity as `RequestConfig` announced them,
+    /// and what the running targets hold of it. `held` is the sum of
+    /// `running_reserved`, kept at Start/End so the header reads it without
+    /// walking the targets. A pool a target reserves that was never announced
+    /// (a host that announces no pools) is added with its default unit and no
+    /// capacity.
+    pools: BTreeMap<String, PoolView>,
+    /// What each running target reserved, by addr, between its
+    /// `ExecuteStart` and `ExecuteEnd`: the key that makes a repeated Start
+    /// count once and an unpaired End subtract nothing.
+    running_reserved: HashMap<String, BTreeMap<String, u64>>,
+    /// Targets whose admission has waited past the notice threshold, by
+    /// addr. Added on `AdmissionWaitStart`, removed on `AdmissionWaitEnd`.
+    admission_waits: HashMap<String, AdmissionWait>,
+    /// Running targets granted less than they declared, by addr, as the
+    /// `cpu 16→4` their row shows. Set at `ExecuteStart`, cleared at
+    /// `ExecuteEnd`; a target that got what it asked for is not here.
+    clamped: HashMap<String, String>,
+}
+
+/// One pool as the header shows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PoolView {
+    unit: Unit,
+    /// `None`: unbounded, or never announced.
+    capacity: Option<u64>,
+    /// What the running targets hold, in the unit's base.
+    held: u64,
+}
+
+impl PoolView {
+    fn of(pool: &str) -> Self {
+        Self {
+            unit: Unit::default_for(pool),
+            capacity: None,
+            held: 0,
+        }
+    }
+}
+
+/// What an `ExecuteStart` reserved; a frame without `reserved` (an older
+/// host) counts as one CPU, which is what such a host reserved.
+fn reserved_of(reserved: Option<&BTreeMap<String, u64>>) -> BTreeMap<String, u64> {
+    match reserved {
+        None => BTreeMap::from([(
+            hcore::capacity::CPU.to_owned(),
+            hcore::capacity::MICROS_PER_CPU,
+        )]),
+        Some(r) => r.clone(),
+    }
+}
+
+/// One target's announced admission wait.
+#[derive(Debug, Clone)]
+struct AdmissionWait {
+    pool: String,
+    need: u64,
+    free: u64,
+    ahead: u64,
+    since_ms: u64,
 }
 
 /// Every blocked wait on one cache, collapsed for a single row.
@@ -809,6 +874,9 @@ pub struct Counts {
     pub total: Option<String>,
     /// Cache hits in scope, e.g. `"3 cached"`.
     pub cached: String,
+    /// Targets held at admission right now, e.g. `"2 waiting"`. Live-only: a
+    /// finished run has nothing waiting, so the final summary leaves it out.
+    pub waiting: String,
     /// Failures, e.g. `"0 failed"`.
     pub failed: String,
 }
@@ -892,9 +960,18 @@ impl BuildState {
         }
         match &ev.kind {
             BuildEventKind::RequestConfig {
-                max_workers: count, ..
+                max_workers: count,
+                resources,
+                units,
+                ..
             } => {
                 self.max_workers = Some(*count);
+                for (pool, &capacity) in resources {
+                    let view = self.pool_mut(pool);
+                    view.unit = hcore::events::unit_of(units, pool);
+                    // An unbounded pool has no capacity to show a share of.
+                    view.capacity = capacity;
+                }
             }
             BuildEventKind::Matched { addrs, complete } => {
                 self.matched_seen = true;
@@ -971,11 +1048,68 @@ impl BuildState {
             // same addr as both cached and executed, which would let "executed + cached"
             // exceed the number of targets — and, on an offline run over a
             // remote-mirrored cache, report a full rebuild as "N cached".
-            BuildEventKind::ExecuteStart { addr, .. } => self.retract_cache_hit(addr),
-            BuildEventKind::ExecuteEnd { error, .. } => {
+            BuildEventKind::ExecuteStart {
+                addr,
+                declared,
+                reserved,
+                ..
+            } => {
+                self.retract_cache_hit(addr);
+                // A target that runs is no longer waiting. The engine sends
+                // `AdmissionWaitEnd` first; this keeps a lost End from leaving
+                // the row in the Waiting tab for the rest of the run.
+                self.admission_waits.remove(addr);
+                match hcore::events::clamp_text(declared.as_ref(), reserved.as_ref(), |p| {
+                    self.unit_of(p)
+                }) {
+                    Some(clamp) => {
+                        self.clamped.insert(addr.clone(), clamp);
+                    }
+                    None => {
+                        self.clamped.remove(addr);
+                    }
+                }
+                let held = reserved_of(reserved.as_ref());
+                for (pool, &amount) in &held {
+                    let view = self.pool_mut(pool);
+                    view.held = view.held.saturating_add(amount);
+                }
+                // A repeated Start replaces, rather than adds to, what the
+                // addr holds.
+                if let Some(prev) = self.running_reserved.insert(addr.clone(), held) {
+                    self.release(&prev);
+                }
+            }
+            BuildEventKind::ExecuteEnd { addr, error } => {
                 if error.is_none() {
                     self.executed += 1;
                 }
+                // An End with no Start releases nothing.
+                if let Some(held) = self.running_reserved.remove(addr) {
+                    self.release(&held);
+                }
+                self.clamped.remove(addr);
+            }
+            BuildEventKind::AdmissionWaitStart {
+                addr,
+                pool,
+                need,
+                free,
+                ahead,
+            } => {
+                self.admission_waits.insert(
+                    addr.clone(),
+                    AdmissionWait {
+                        pool: pool.clone(),
+                        need: *need,
+                        free: *free,
+                        ahead: *ahead,
+                        since_ms: ev.at_unix_ms,
+                    },
+                );
+            }
+            BuildEventKind::AdmissionWaitEnd { addr } => {
+                self.admission_waits.remove(addr);
             }
             BuildEventKind::LocalCacheHit { addr } => {
                 self.local_hits += 1;
@@ -1188,6 +1322,7 @@ impl BuildState {
             done,
             total,
             cached: format!("{} cached", self.cached_count(scope)),
+            waiting: format!("{} waiting", self.admission_waits.len()),
             failed: format!("{} failed", self.errored),
         }
     }
@@ -1356,6 +1491,94 @@ impl BuildState {
         self.max_workers
     }
 
+    /// Take a finished target's reservation off the running sums. Saturating:
+    /// a sum can never go below zero, whatever order the events came in.
+    fn release(&mut self, held: &BTreeMap<String, u64>) {
+        for (pool, &amount) in held {
+            if let Some(view) = self.pools.get_mut(pool) {
+                view.held = view.held.saturating_sub(amount);
+            }
+        }
+    }
+
+    /// Pool `pool`'s entry, added with its default unit and no capacity when
+    /// it was never announced.
+    fn pool_mut(&mut self, pool: &str) -> &mut PoolView {
+        self.pools
+            .entry(pool.to_owned())
+            .or_insert_with(|| PoolView::of(pool))
+    }
+
+    /// Pool `pool`'s unit: as announced, else its default.
+    fn unit_of(&self, pool: &str) -> Unit {
+        self.pools
+            .get(pool)
+            .map_or_else(|| Unit::default_for(pool), |v| v.unit)
+    }
+
+    /// The cpu the running targets hold, in CPUs (rounded up). Kept at
+    /// `ExecuteStart`/`ExecuteEnd`; reading it walks nothing.
+    pub fn busy_cpus(&self) -> usize {
+        let held = self.pools.get(hcore::capacity::CPU).map_or(0, |v| v.held);
+        usize::try_from(held.div_ceil(hcore::capacity::MICROS_PER_CPU)).unwrap_or(usize::MAX)
+    }
+
+    /// One `<pool> <held>/<capacity>` segment per pool other than `cpu`
+    /// (which the worker cells show) that a running target holds some of,
+    /// in name order and in the pool's unit: `memory 2.0 GiB/16.0 GiB`,
+    /// `gpu 1/2`. An unbounded pool has no capacity: `tokens 5`. Walks the
+    /// pools, never the targets.
+    pub fn pool_segments(&self) -> impl Iterator<Item = String> + '_ {
+        self.pools
+            .iter()
+            .filter(|(pool, v)| pool.as_str() != hcore::capacity::CPU && v.held > 0)
+            .map(|(pool, v)| {
+                let held = hcore::events::display_amount(v.unit, v.held);
+                match v.capacity {
+                    Some(cap) => format!(
+                        "{pool} {held}/{}",
+                        hcore::events::display_amount(v.unit, cap)
+                    ),
+                    None => format!("{pool} {held}"),
+                }
+            })
+    }
+
+    /// Rows for targets whose admission has waited past the notice
+    /// threshold: `⧗ //a:b waits for cpu 4 (2 free, 6 ahead, 41s)`. What was
+    /// free and ahead is as of the notice. Sorted by addr so the order is
+    /// stable across frames. The body of the [`ViewMode::Waiting`] tab, thinned
+    /// by the `/` filter like the other list tabs.
+    pub fn admission_wait_lines(&self, now_ms: u64, filter: &str) -> Vec<Line<'static>> {
+        let mut waits: Vec<(&String, &AdmissionWait)> = self
+            .admission_waits
+            .iter()
+            .filter(|(addr, _)| addr_matches(addr, filter))
+            .collect();
+        waits.sort_by(|a, b| a.0.cmp(b.0));
+        waits
+            .into_iter()
+            .map(|(addr, w)| {
+                let waited = human_elapsed(now_ms.saturating_sub(w.since_ms));
+                Line::from(Span::styled(
+                    format!(
+                        "  ⧗ {}",
+                        hcore::events::admission_wait_text(
+                            addr,
+                            &w.pool,
+                            self.unit_of(&w.pool),
+                            w.need,
+                            w.free,
+                            w.ahead,
+                            &waited
+                        )
+                    ),
+                    Style::default().fg(Color::Yellow),
+                ))
+            })
+            .collect()
+    }
+
     /// Milliseconds since the first observed event, given the caller's wall
     /// clock. `0` before any event has been seen.
     pub fn elapsed_ms(&self, now_ms: u64) -> u64 {
@@ -1403,7 +1626,8 @@ impl BuildState {
 
     /// The long-running ("slow") target rows, one per slow target and uncollapsed:
     /// `addr (icon Ns)…` — one `(icon Ns)` group per op the target passed through
-    /// or is in.
+    /// or is in — then `[cpu 16→4]` when the target was granted less than it
+    /// declared, so a clamp is visible without `-v`.
     fn slow_rows(&self, now_ms: u64) -> Vec<Line<'static>> {
         self.long_running(now_ms, LONG_RUNNING_THRESHOLD_MS)
             .into_iter()
@@ -1412,13 +1636,17 @@ impl BuildState {
                     .iter()
                     .map(|(op, ms)| format!(" ({} {}s)", op.icon(), ms / 1000))
                     .collect();
-                Line::from(format!("  {addr}{groups}"))
+                match self.clamped.get(&addr) {
+                    Some(clamp) => Line::from(format!("  {addr}{groups} [{clamp}]")),
+                    None => Line::from(format!("  {addr}{groups}")),
+                }
             })
             .collect()
     }
 
     /// The full body: wait notices first (they take priority), then every
     /// slow-target row. Uncollapsed — the caller windows it to the available rows.
+    /// Admission waits are not here: they live in the [`ViewMode::Waiting`] tab.
     pub fn body_lines(&self, now_ms: u64) -> Vec<Line<'static>> {
         let mut body = self.lock_wait_lines();
         body.extend(self.scratch_wait_lines(now_ms));
@@ -1617,6 +1845,7 @@ impl ProgressHeader for BuildHeader {
             done,
             total,
             cached,
+            waiting,
             failed,
         } = core.counts(scope);
         // The done segment `X / Y done` splits into two independent tabs: `X`
@@ -1637,13 +1866,21 @@ impl ProgressHeader for BuildHeader {
             HeaderItem::Split(done_parts),
             // The cached count is a tab into the cached-targets view.
             HeaderItem::tab(ViewMode::Cached, cached),
+            // The waiting count is a tab into the admission-wait view.
+            HeaderItem::tab(ViewMode::Waiting, waiting),
             // The failed count is a tab into the failed-targets view.
             HeaderItem::tab(ViewMode::Failed, failed),
         ];
-        let workers = worker_spans(core.max_workers().unwrap_or(0), core.busy_workers());
+        // The cells are CPUs of the cpu pool, filled by what the running
+        // targets reserved (a running sum, not a walk over the targets).
+        let workers = worker_spans(core.max_workers().unwrap_or(0), core.busy_cpus());
         if !workers.is_empty() {
             items.push(HeaderItem::Text(workers));
         }
+        items.extend(
+            core.pool_segments()
+                .map(|seg| HeaderItem::Text(vec![Span::raw(seg)])),
+        );
         items
     }
 
@@ -1991,7 +2228,7 @@ impl TuiProgressView {
     }
 
     /// The rounded top border:
-    /// `╭─ 1m05s · D / N done · N cached · N failed · <workers> ──────╮`.
+    /// `╭─ 1m05s · D / N done · N cached · N waiting · N failed · <workers> ──╮`.
     /// The leading field is the elapsed-time clock. "done" shows matched progress
     /// `done / total` (total prefixed `~` while the matcher is still resolving),
     /// falling back to the executed count before any match streams. The "running"
@@ -2217,7 +2454,7 @@ impl TUIAppView for TuiProgressView {
     /// Layout (top to bottom), a rounded box sized to `height` rows (one third of
     /// the terminal, see [`rows_for_height`]), with a dim help row pinned beneath:
     /// ```text
-    /// ╭─ 1m05s · D / N done · N cached · N failed ──────────── <workers> ─╮
+    /// ╭─ 1m05s · D / N done · N cached · N waiting · N failed ── <workers> ─╮
     ///   <slow rows + lock waits, scrollable>
     /// ╰─── <label> ───────────────────────────────────────────────────────╯
     ///   ↑/↓ scroll
@@ -2248,6 +2485,8 @@ impl TUIAppView for TuiProgressView {
             ViewMode::Done => Body::Rows(self.state.done_rows(self.scope.get(), filter)),
             ViewMode::Matched => Body::Rows(self.state.matched_rows(filter)),
             ViewMode::Cached => Body::Rows(self.state.cached_rows(self.scope.get(), filter)),
+            // Bounded by what is queued right now, like the live body.
+            ViewMode::Waiting => Body::Lines(self.state.admission_wait_lines(now_ms, filter)),
             ViewMode::Failed => Body::Rows(self.state.failed_rows(filter)),
         };
         let total = body.len();
@@ -2284,6 +2523,13 @@ impl TUIAppView for TuiProgressView {
                 // Cached view with nothing cached: a dim placeholder.
                 ViewMode::Cached => lines.push(Line::from(Span::styled(
                     "  no cached targets",
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM),
+                ))),
+                // Waiting view with nothing held at admission: a dim placeholder.
+                ViewMode::Waiting => lines.push(Line::from(Span::styled(
+                    "  no waiting targets",
                     Style::default()
                         .fg(Color::DarkGray)
                         .add_modifier(Modifier::DIM),
@@ -2466,9 +2712,18 @@ impl CIAppView for CiProgressView {
                 addr,
                 driver,
                 cache: true,
-            } => {
-                tracing::info!("running {addr} [{driver}]");
-            }
+                declared,
+                reserved,
+                ..
+            } => match hcore::events::clamp_text(declared.as_ref(), reserved.as_ref(), |p| {
+                self.core.state.unit_of(p)
+            }) {
+                Some(clamp) => tracing::info!("running {addr} [{driver}] ({clamp})"),
+                None => tracing::info!("running {addr} [{driver}]"),
+            },
+            // Admission waits stay off the CI log: a line per wait is noise
+            // on a busy build, and the live views (the TUI's waiting tab, the
+            // GHA live report) show them as they happen.
             BuildEventKind::ResultLockWaitStart {
                 addr,
                 holder_pid,
@@ -2678,7 +2933,370 @@ mod tests {
             addr: addr.into(),
             driver: "exec".into(),
             cache: true,
+            declared: None,
+            reserved: None,
+            queued_ms: None,
         }
+    }
+
+    fn execute_start_reserving(addr: &str, reserved: &[(&str, u64)]) -> BuildEventKind {
+        BuildEventKind::ExecuteStart {
+            addr: addr.into(),
+            driver: "exec".into(),
+            cache: true,
+            declared: None,
+            reserved: Some(reserved.iter().map(|&(p, n)| (p.into(), n)).collect()),
+            queued_ms: None,
+        }
+    }
+
+    const CPU: u64 = hcore::capacity::MICROS_PER_CPU;
+
+    /// A target granted less than it declared shows `[cpu 16→4]` on its row
+    /// without `-v`; one granted in full shows nothing, and the note goes
+    /// with the run.
+    #[test]
+    fn a_clamped_target_row_shows_declared_to_reserved() {
+        let start = |addr: &str, declared: u64, reserved: u64| BuildEventKind::ExecuteStart {
+            addr: addr.into(),
+            driver: "exec".into(),
+            cache: true,
+            declared: Some([("cpu".into(), declared)].into()),
+            reserved: Some([("cpu".into(), reserved)].into()),
+            queued_ms: Some(0),
+        };
+        let mut s = BuildState::new();
+        s.apply(&ev(0, start("//p:big", 16 * CPU, 4 * CPU)));
+        s.apply(&ev(0, start("//p:fits", 2 * CPU, 2 * CPU)));
+        let rows: Vec<String> = s.slow_rows(9_000).iter().map(|l| format!("{l}")).collect();
+        let big = rows
+            .iter()
+            .find(|r| r.contains("//p:big"))
+            .expect("big row");
+        assert!(big.ends_with("[cpu 16→4]"), "{big}");
+        let fits = rows
+            .iter()
+            .find(|r| r.contains("//p:fits"))
+            .expect("fits row");
+        assert!(!fits.contains('→'), "{fits}");
+        s.apply(&ev(9_000, execute_end("//p:big")));
+        assert!(s.clamped.is_empty());
+        assert_eq!(
+            hcore::events::clamp_text(
+                Some(&[("cpu".into(), CPU / 2), ("memory".into(), 1 << 30)].into()),
+                Some(&[("cpu".into(), CPU / 4), ("memory".into(), 1 << 30)].into()),
+                Unit::default_for,
+            )
+            .as_deref(),
+            Some("cpu 0.5→0.25")
+        );
+    }
+
+    /// A clamp on a custom pool reads in the unit `RequestConfig` announced
+    /// for it, not as a bare count.
+    #[test]
+    fn a_clamp_on_a_custom_pool_reads_in_its_unit() {
+        let mut s = BuildState::new();
+        s.apply(&ev(
+            0,
+            BuildEventKind::RequestConfig {
+                max_workers: 4,
+                fail_fast: false,
+                scratch_disabled: false,
+                resources: [("scratch_disk".into(), Some(4 << 30))].into(),
+                units: [("scratch_disk".into(), "bytes".into())].into(),
+            },
+        ));
+        s.apply(&ev(
+            1,
+            BuildEventKind::ExecuteStart {
+                addr: "//p:big".into(),
+                driver: "exec".into(),
+                cache: true,
+                declared: Some([("scratch_disk".into(), 8 << 30)].into()),
+                reserved: Some([("cpu".into(), CPU), ("scratch_disk".into(), 4 << 30)].into()),
+                queued_ms: None,
+            },
+        ));
+        assert_eq!(
+            s.clamped.get("//p:big").map(String::as_str),
+            Some("scratch_disk 8.0 GiB→4.0 GiB")
+        );
+    }
+
+    #[test]
+    fn busy_cpu_tracks_start_and_end() {
+        let mut s = BuildState::new();
+        s.apply(&ev(
+            0,
+            execute_start_reserving("//a:x", &[("cpu", 3 * CPU)]),
+        ));
+        s.apply(&ev(
+            0,
+            execute_start_reserving("//a:y", &[("cpu", CPU / 2)]),
+        ));
+        assert_eq!(s.busy_cpus(), 4, "3 + 0.5 rounds up");
+        s.apply(&ev(1, execute_end("//a:x")));
+        assert_eq!(s.busy_cpus(), 1);
+        s.apply(&ev(2, execute_end("//a:y")));
+        assert_eq!(s.busy_cpus(), 0);
+    }
+
+    #[test]
+    fn an_unpaired_end_saturates() {
+        let mut s = BuildState::new();
+        s.apply(&ev(0, execute_start_reserving("//a:x", &[("cpu", CPU)])));
+        s.apply(&ev(1, execute_end("//a:never-started")));
+        assert_eq!(s.busy_cpus(), 1, "an End with no Start releases nothing");
+        s.apply(&ev(2, execute_end("//a:x")));
+        s.apply(&ev(3, execute_end("//a:x")));
+        assert_eq!(s.busy_cpus(), 0);
+    }
+
+    #[test]
+    fn a_double_start_counts_once() {
+        let mut s = BuildState::new();
+        s.apply(&ev(
+            0,
+            execute_start_reserving("//a:x", &[("cpu", 2 * CPU)]),
+        ));
+        s.apply(&ev(
+            1,
+            execute_start_reserving("//a:x", &[("cpu", 2 * CPU)]),
+        ));
+        assert_eq!(s.busy_cpus(), 2);
+        s.apply(&ev(2, execute_end("//a:x")));
+        assert_eq!(s.busy_cpus(), 0);
+    }
+
+    #[test]
+    fn frames_without_reserved_count_as_one() {
+        let mut s = BuildState::new();
+        s.apply(&ev(0, execute_start("//a:x")));
+        s.apply(&ev(0, execute_start("//a:y")));
+        assert_eq!(s.busy_cpus(), 2);
+    }
+
+    /// Every pool but `cpu` shows only while some running target holds it,
+    /// in its announced unit; an unbounded pool shows no capacity; a pool
+    /// that was never announced still shows what is held of it.
+    #[test]
+    fn pool_segments_show_each_held_pool_in_its_unit() {
+        let mut s = BuildState::new();
+        s.apply(&ev(
+            0,
+            BuildEventKind::RequestConfig {
+                max_workers: 4,
+                fail_fast: false,
+                scratch_disabled: false,
+                resources: [
+                    ("cpu".into(), Some(4 * CPU)),
+                    ("gpu".into(), Some(2)),
+                    ("memory".into(), Some(16 << 30)),
+                    ("tokens".into(), None),
+                ]
+                .into(),
+                units: [
+                    ("cpu".into(), "cpu".into()),
+                    ("gpu".into(), "count".into()),
+                    ("memory".into(), "bytes".into()),
+                    ("tokens".into(), "count".into()),
+                ]
+                .into(),
+            },
+        ));
+        let segments = |s: &BuildState| s.pool_segments().collect::<Vec<_>>();
+        s.apply(&ev(0, execute_start("//a:x")));
+        assert!(segments(&s).is_empty(), "cpu is the worker cells");
+        s.apply(&ev(
+            0,
+            execute_start_reserving("//a:y", &[("cpu", CPU), ("memory", 2 << 30)]),
+        ));
+        assert_eq!(segments(&s), ["memory 2.0 GiB/16.0 GiB"]);
+        s.apply(&ev(
+            0,
+            execute_start_reserving("//a:z", &[("cpu", CPU), ("gpu", 1), ("tokens", 5)]),
+        ));
+        assert_eq!(
+            segments(&s),
+            ["gpu 1/2", "memory 2.0 GiB/16.0 GiB", "tokens 5"]
+        );
+        s.apply(&ev(1, execute_end("//a:y")));
+        assert_eq!(segments(&s), ["gpu 1/2", "tokens 5"]);
+        s.apply(&ev(
+            1,
+            execute_start_reserving("//a:w", &[("cpu", CPU), ("licenses", 3)]),
+        ));
+        assert_eq!(segments(&s), ["gpu 1/2", "licenses 3", "tokens 5"]);
+        s.apply(&ev(2, execute_end("//a:z")));
+        s.apply(&ev(2, execute_end("//a:w")));
+        assert!(segments(&s).is_empty(), "{:?}", segments(&s));
+    }
+
+    /// The per-pool sum holds under what an event stream can do: two holders
+    /// of one non-cpu pool add up and release separately, a repeated Start
+    /// replaces what the addr held instead of adding to it, and an End with
+    /// no Start (or a second End) releases nothing.
+    #[test]
+    fn pool_sums_survive_shared_holders_repeats_and_unpaired_ends() {
+        let mut s = BuildState::new();
+        s.apply(&ev(
+            0,
+            BuildEventKind::RequestConfig {
+                max_workers: 4,
+                fail_fast: false,
+                scratch_disabled: false,
+                resources: [("cpu".into(), Some(4 * CPU)), ("gpu".into(), Some(4))].into(),
+                units: [("cpu".into(), "cpu".into()), ("gpu".into(), "count".into())].into(),
+            },
+        ));
+        let segments = |s: &BuildState| s.pool_segments().collect::<Vec<_>>();
+        let gpu = |n: u64| [("cpu", CPU), ("gpu", n)];
+
+        // Two holders of gpu.
+        s.apply(&ev(0, execute_start_reserving("//a:x", &gpu(1))));
+        s.apply(&ev(0, execute_start_reserving("//a:y", &gpu(2))));
+        assert_eq!(segments(&s), ["gpu 3/4"]);
+        assert_eq!(s.busy_cpus(), 2);
+
+        // A repeated Start for //a:x replaces its 1 with 1, not 2.
+        s.apply(&ev(1, execute_start_reserving("//a:x", &gpu(1))));
+        assert_eq!(segments(&s), ["gpu 3/4"], "a repeated Start replaces");
+        assert_eq!(s.busy_cpus(), 2);
+
+        // An End for an addr that never started releases nothing.
+        s.apply(&ev(1, execute_end("//a:never")));
+        assert_eq!(segments(&s), ["gpu 3/4"], "an unpaired End");
+
+        s.apply(&ev(2, execute_end("//a:y")));
+        assert_eq!(segments(&s), ["gpu 1/4"]);
+        // A second End for //a:y is unpaired too.
+        s.apply(&ev(2, execute_end("//a:y")));
+        assert_eq!(segments(&s), ["gpu 1/4"], "a second End");
+
+        s.apply(&ev(3, execute_end("//a:x")));
+        assert!(segments(&s).is_empty(), "{:?}", segments(&s));
+        assert_eq!(s.busy_cpus(), 0);
+    }
+
+    #[test]
+    fn admission_wait_row_names_the_pool_and_the_queue() {
+        let mut s = BuildState::new();
+        s.apply(&ev(
+            1_000,
+            BuildEventKind::AdmissionWaitStart {
+                addr: "//a:b".into(),
+                pool: "cpu".into(),
+                need: 4 * CPU,
+                free: 2 * CPU,
+                ahead: 6,
+            },
+        ));
+        let text: String = s.admission_wait_lines(42_000, "")[0]
+            .spans
+            .iter()
+            .map(|sp| sp.content.as_ref())
+            .collect();
+        assert_eq!(text, "  ⧗ //a:b waits for cpu 4 (2 free, 6 ahead, 41s)");
+        s.apply(&ev(
+            43_000,
+            BuildEventKind::AdmissionWaitEnd {
+                addr: "//a:b".into(),
+            },
+        ));
+        assert!(s.admission_wait_lines(43_000, "").is_empty());
+    }
+
+    fn admission_wait_start(addr: &str) -> BuildEventKind {
+        BuildEventKind::AdmissionWaitStart {
+            addr: addr.into(),
+            pool: "cpu".into(),
+            need: 4 * CPU,
+            free: 2 * CPU,
+            ahead: 6,
+        }
+    }
+
+    /// The rendered frame as one string per line.
+    fn frame(v: &TuiProgressView, now_ms: u64) -> Vec<String> {
+        v.render("⠋", now_ms, 100, 10)
+            .iter()
+            .map(|l| format!("{l}"))
+            .collect()
+    }
+
+    #[test]
+    fn a_waiting_target_moves_to_the_waiting_tab_and_back() {
+        let mut v = TuiProgressView::new("L");
+        v.apply(&ev(1_000, admission_wait_start("//a:b")));
+
+        // The live body no longer carries the row…
+        assert_eq!(v.view.get(), ViewMode::Default);
+        let live = frame(&v, 42_000).join("\n");
+        assert!(!live.contains("//a:b"), "{live}");
+        assert!(live.contains("1 waiting"), "{live}");
+
+        // …the Waiting tab does, with pool, need, free, ahead and elapsed.
+        v.view.set(ViewMode::Waiting);
+        let waiting = frame(&v, 42_000);
+        assert!(
+            waiting
+                .iter()
+                .any(|l| l == "  ⧗ //a:b waits for cpu 4 (2 free, 6 ahead, 41s)"),
+            "{waiting:#?}"
+        );
+        // The `/` filter thins it like the other list tabs.
+        "zzz".clone_into(&mut v.search_query.borrow_mut());
+        let filtered = frame(&v, 42_000).join("\n");
+        assert!(filtered.contains("no targets match \"zzz\""), "{filtered}");
+        v.search_query.borrow_mut().clear();
+
+        // Granted: it leaves Waiting and shows where a running target shows.
+        v.apply(&ev(
+            43_000,
+            BuildEventKind::AdmissionWaitEnd {
+                addr: "//a:b".into(),
+            },
+        ));
+        v.apply(&ev(43_000, execute_start("//a:b")));
+        let waiting = frame(&v, 50_000).join("\n");
+        assert!(!waiting.contains("//a:b"), "{waiting}");
+        assert!(waiting.contains("no waiting targets"), "{waiting}");
+        assert!(waiting.contains("0 waiting"), "{waiting}");
+        v.view.set(ViewMode::Default);
+        let live = frame(&v, 50_000).join("\n");
+        assert!(live.contains("//a:b (▶ 7s)"), "{live}");
+    }
+
+    #[test]
+    fn execute_start_ends_an_admission_wait_without_its_end() {
+        let mut s = BuildState::new();
+        s.apply(&ev(1_000, admission_wait_start("//a:b")));
+        s.apply(&ev(1_000, admission_wait_start("//a:c")));
+        assert_eq!(s.counts(CountScope::Matched).waiting, "2 waiting");
+        s.apply(&ev(2_000, execute_start("//a:b")));
+        assert_eq!(s.counts(CountScope::Matched).waiting, "1 waiting");
+        let rows: Vec<String> = s
+            .admission_wait_lines(3_000, "")
+            .iter()
+            .map(|l| format!("{l}"))
+            .collect();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(rows[0].contains("//a:c"), "{rows:?}");
+    }
+
+    #[test]
+    fn the_waiting_tab_sits_left_of_failed() {
+        let v = TuiProgressView::new("L");
+        let modes = v.view_modes();
+        let at = |m: ViewMode| modes.iter().position(|&x| x == m).expect("mode present");
+        assert_eq!(at(ViewMode::Waiting) + 1, at(ViewMode::Failed), "{modes:?}");
+        assert_eq!(at(ViewMode::Cached) + 1, at(ViewMode::Waiting), "{modes:?}");
+        let header = format!("{}", v.header_line(0, 100));
+        assert!(
+            header.contains("0 cached · 0 waiting · 0 failed"),
+            "{header}"
+        );
     }
     fn execute_end(addr: &str) -> BuildEventKind {
         BuildEventKind::ExecuteEnd {
@@ -3349,6 +3967,8 @@ mod tests {
             max_workers: count,
             fail_fast: false,
             scratch_disabled: false,
+            resources: Default::default(),
+            units: Default::default(),
         }
     }
 
@@ -3478,6 +4098,62 @@ mod tests {
         // The failing ResultEnd bumps the errored counter; the message itself is
         // not retained — rich diagnostics come from the failure registry.
         assert_eq!(v.core.state.errored, 1);
+    }
+
+    /// What the CI view logs for `events`, captured from its `tracing` lines.
+    fn ci_view_log(events: &[BuildEvent]) -> String {
+        #[derive(Clone, Default)]
+        struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let sink = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || sink.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let mut v = CiProgressView::new("Running");
+            for e in events {
+                v.apply(e);
+            }
+        });
+        let bytes = buf.0.lock().expect("log buffer").clone();
+        String::from_utf8(bytes).expect("utf-8 log")
+    }
+
+    /// Admission waits stay off the CI log; the execute that follows still
+    /// logs, which also proves the capture sees the view's lines.
+    #[test]
+    fn ci_view_logs_nothing_for_an_admission_wait() {
+        let log = ci_view_log(&[
+            ev(1_000, admission_wait_start("//a:b")),
+            ev(
+                42_000,
+                BuildEventKind::AdmissionWaitEnd {
+                    addr: "//a:b".into(),
+                },
+            ),
+        ]);
+        assert_eq!(log, "", "an admission wait logged: {log}");
+
+        let log = ci_view_log(&[
+            ev(1_000, admission_wait_start("//a:b")),
+            ev(2_000, execute_start("//a:b")),
+        ]);
+        assert!(!log.contains('⧗'), "{log}");
+        assert!(log.contains("running //a:b [exec]"), "{log}");
     }
 
     #[test]
@@ -3733,11 +4409,12 @@ mod tests {
         assert_eq!(cached, "2 cached", "all cached");
     }
 
-    /// The three count fields as the split header renders them, in header order.
+    /// The three count fields as the split header renders them, in header order
+    /// (item 2, the live-only waiting count, is not in the summary).
     fn header_count_fields(s: &BuildState, scope: CountScope) -> (String, String, String) {
         let items = BuildHeader::new("L").header(s, scope);
         let text = |i: usize| header_text(&items[i..=i]);
-        (text(0), text(1), text(2))
+        (text(0), text(1), text(3))
     }
 
     /// Shorthand for a `(done, cached, failed)` golden.
@@ -4117,9 +4794,10 @@ mod tests {
     }
 
     #[test]
-    fn tab_cycles_default_done_matched_cached_failed_and_back() {
+    fn tab_cycles_default_done_matched_cached_waiting_failed_and_back() {
         let mut v = TuiProgressView::new("L");
         v.apply(&ev(0, execute_start("//slow:x")));
+        v.apply(&ev(0, admission_wait_start("//a:queued")));
         v.apply(&ev(1, matched(&["//a:ok", "//a:pending"], true)));
         v.apply(&ev(2, result_start("//a:ok")));
         v.apply(&ev(3, local_cache_hit("//a:ok")));
@@ -4157,6 +4835,13 @@ mod tests {
         let cached_body = body(&v);
         assert!(cached_body.contains("//a:ok"), "{cached_body}");
         assert!(!cached_body.contains("//a:pending"), "{cached_body}");
+
+        // Tab → waiting view: shows the target held at admission.
+        v.tab(true);
+        assert_eq!(v.view.get(), ViewMode::Waiting);
+        let waiting_body = body(&v);
+        assert!(waiting_body.contains("⧗ //a:queued"), "{waiting_body}");
+        assert!(!waiting_body.contains("//slow:x"), "{waiting_body}");
 
         // Tab → failed view: shows the failed target.
         v.tab(true);
@@ -4381,16 +5066,18 @@ mod tests {
     fn shift_tab_cycles_backwards() {
         let mut v = TuiProgressView::new("L");
         // A matched event gives the `X / Y done` denominator, so the Matched tab
-        // is present and all five modes exist.
+        // is present and all six modes exist.
         v.apply(&ev(0, matched(&["//a:ok"], true)));
         v.apply(&ev(1, result_start("//a:bad")));
         v.apply(&ev(2, result_end("//a:bad", Some("boom".into()))));
 
-        // Five modes (Default, Done, Matched, Cached, Failed): backward from
-        // Default wraps to the last (Failed), then steps back to Default.
+        // Six modes (Default, Done, Matched, Cached, Waiting, Failed): backward
+        // from Default wraps to the last (Failed), then steps back to Default.
         assert_eq!(v.view.get(), ViewMode::Default);
         v.tab(false);
         assert_eq!(v.view.get(), ViewMode::Failed);
+        v.tab(false);
+        assert_eq!(v.view.get(), ViewMode::Waiting);
         v.tab(false);
         assert_eq!(v.view.get(), ViewMode::Cached);
         v.tab(false);

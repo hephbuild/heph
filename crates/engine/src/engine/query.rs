@@ -679,7 +679,7 @@ impl Engine {
         discovery: Discovery,
     ) -> impl Stream<Item = anyhow::Result<Addr>> + 'a {
         let gaps = discovery.gaps().cloned();
-        let limit = Self::top_level_spawn_limit(self.max_workers);
+        let limit = Self::top_level_spawn_limit(self.fan_out);
         Arc::clone(&self)
             .query(rs.clone(), m, discovery)
             .map_ok(move |addr| Arc::clone(&self).confirm_exists(rs.clone(), gaps.clone(), addr))

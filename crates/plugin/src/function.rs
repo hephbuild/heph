@@ -34,7 +34,9 @@ use std::sync::{Arc, OnceLock, Weak};
 /// - the arguments, [`FnCallContext::pkg`] and [`FnCallContext::root`];
 /// - the plugin's identity, its YAML `options:` and what the host handed it at
 ///   construction (`root`, `skip_dirs`, `skip_globs`);
-/// - the host OS and arch;
+/// - the host OS and arch, and the host's capacity (the CPUs and memory this
+///   process may use, as `heph.core.resource(name)` reports them — never a run's
+///   `-j` or `--resource`);
 /// - for a function documented as tree-reading (`heph.fs.glob`,
 ///   `heph.fs.parent`), the workspace tree under `root` as the plugin's walker
 ///   sees it.

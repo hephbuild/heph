@@ -68,17 +68,29 @@ const DOLLAR: &str = "$";
 /// literal.
 ///
 /// `read` is a producer's *contents*; `src` is the sandbox *path* of its
-/// artifact. There is deliberately no `env`: `${env:NAME}` is legal bash
+/// artifact; `resource` is a share of the run's allotment. There is deliberately no `env`: `${env:NAME}` is legal bash
 /// (`${var:offset}`) and a template form several tools use, and the value it
 /// would have carried composes from a `pass_env` producer plus `${read:}` with
 /// better provenance. See `docs/DEFERRED_VALUES.md`.
-pub const DEFERRED_KINDS: &[&str] = &[READ_KIND, SRC_KIND];
+pub const DEFERRED_KINDS: &[&str] = &[READ_KIND, SRC_KIND, RESOURCE_KIND];
 
 /// The contents of a producer's single output.
 pub const READ_KIND: &str = "read";
 
 /// The sandbox path of a producer's artifact.
 pub const SRC_KIND: &str = "src";
+
+/// A share of the run's allotment: `${resource:<pool>}`, any pool.
+///
+/// The one kind whose argument is not an address, so [`claims`] takes a
+/// `${resource:…}` only when the argument is a well-formed pool name
+/// ([`is_pool_name`](crate::capacity::is_pool_name)). Any other spelling —
+/// `${resource:-x}`, `${resource:CPU}`, `${resource:2}` — is somebody else's
+/// text and passes through untouched, like every construct heph does not own.
+/// A claimed name that is no pool the engine knows is refused when the def is
+/// linked (bash's `${resource:offset}` substring form is claimed, so it is
+/// refused too). `${resources:…}` and a bare `${resource}` are left alone.
+pub const RESOURCE_KIND: &str = "resource";
 
 /// Whether a `${kind:arg}` whose kind heph owns is *this* `${…}`.
 ///
@@ -103,8 +115,17 @@ pub const SRC_KIND: &str = "src";
 /// ordinary field, the engine walk that collects the edges, and the substitution
 /// that fills them in. Two answers to "is this heph's?" is the silent
 /// misclassification this module exists to prevent.
+///
+/// [`RESOURCE_KIND`] is the exception: it names no target, so its discriminator
+/// is the pool-name syntax, and nothing else is claimed.
 pub fn claims(kind: Option<&str>, arg: &str, kinds: &[&str]) -> bool {
-    kind.is_some_and(|k| kinds.contains(&k)) && arg.starts_with("//")
+    let Some(k) = kind.filter(|k| kinds.contains(k)) else {
+        return false;
+    };
+    if k == RESOURCE_KIND {
+        return crate::capacity::is_pool_name(arg);
+    }
+    arg.starts_with("//")
 }
 
 /// The first `${kind:…}` in `s` whose kind is in `kinds`.
@@ -277,9 +298,11 @@ pub fn substitute(
     mut resolve: impl FnMut(&Ref<'_>) -> anyhow::Result<String>,
 ) -> anyhow::Result<String> {
     let pieces = parse(s)?;
+    // `claims`, not the kind alone: `${resource:cpus}` or `${read:-x}` beside a
+    // real reference is somebody else's text and is reproduced, not resolved.
     if !pieces
         .iter()
-        .any(|p| matches!(p, Piece::Ref(r) if r.kind.is_some_and(|k| want.contains(&k))))
+        .any(|p| matches!(p, Piece::Ref(r) if claims(r.kind, r.arg, want)))
     {
         return Ok(s.to_string());
     }
@@ -289,7 +312,7 @@ pub fn substitute(
             Piece::Text(t) => out.push_str(t),
             // Verbatim: not heph's escape here.
             Piece::Escape => out.push_str("$$"),
-            Piece::Ref(r) if r.kind.is_some_and(|k| want.contains(&k)) => {
+            Piece::Ref(r) if claims(r.kind, r.arg, want) => {
                 out.push_str(&resolve(r)?);
             }
             Piece::Ref(r) => out.push_str(r.raw),
@@ -457,6 +480,72 @@ mod tests {
         assert!(parse("sed 's/${/X/'").is_err());
         assert!(!has_deferred_ref("sed 's/${/X/'"));
         assert!(first_deferred_ref("sed 's/${/X/'").is_none());
+    }
+
+    /// `${resource:…}` is claimed only for an exact name; every other spelling —
+    /// a typo, a bash form, another kind — is somebody else's text.
+    #[test]
+    fn resource_references_adversarial() {
+        let first = |s: &str| first_deferred_ref(s).map(|r| r.raw.to_string());
+        // Claimed: an exact name.
+        assert_eq!(first("${resource:cpu}").as_deref(), Some("${resource:cpu}"));
+        assert!(has_deferred_ref("${resource:memory}"));
+        // Any pool name is claimed, a custom one or one no engine knows.
+        assert!(has_deferred_ref("${resource:gpu}"));
+        assert!(has_deferred_ref("${resource:cpus}"));
+        // Not claimed — not a pool name, a bash form, another kind — and
+        // reproduced verbatim by `substitute`, even beside a claimed one.
+        for other in [
+            "${resource:}",
+            "${resource:1gpu}",
+            "${resource:a-b}",
+            "${resource:CPU}",
+            "${resource:cpu:-1}",
+            "${resource:-x}",
+            "${resource://cpu}",
+            "${resource:cpü}",
+            "${resource: cpu}",
+            "${resources:cpu}",
+            "${resource}",
+            "${Resource:cpu}",
+            "$${resource:cpu}",
+        ] {
+            assert!(!has_deferred_ref(other), "{other}");
+            let mixed = format!("{other} ${{resource:cpu}}");
+            let out = substitute(&mixed, &[RESOURCE_KIND], |_| Ok("3".to_string())).unwrap();
+            assert_eq!(out, format!("{other} 3"), "{mixed}");
+        }
+        // Two in one value, and mixed with `read`.
+        let s = "${resource:cpu}/${resource:memory} ${read://a:b}";
+        let kinds: Vec<_> = parse(s)
+            .unwrap()
+            .into_iter()
+            .filter_map(|p| match p {
+                Piece::Ref(r) if claims(r.kind, r.arg, DEFERRED_KINDS) => {
+                    Some(r.kind.unwrap_or_default().to_string())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(kinds, ["resource", "resource", "read"]);
+        let out = substitute(s, &[RESOURCE_KIND, READ_KIND], |r| {
+            Ok(match r.arg {
+                "cpu" => "3".to_string(),
+                "memory" => "1024".to_string(),
+                _ => "V".to_string(),
+            })
+        })
+        .unwrap();
+        assert_eq!(out, "3/1024 V");
+        // Unterminated and nested are tokenizer errors, as for every kind.
+        assert!(parse("-j${resource:cpu").is_err());
+        assert!(first("-j${resource:cpu").is_none());
+        assert!(parse("${resource:${resource:cpu}}").is_err());
+        // Non-ASCII around a reference is just text.
+        assert_eq!(
+            first("ü${resource:cpu}ß").as_deref(),
+            Some("${resource:cpu}")
+        );
     }
 
     #[test]

@@ -158,6 +158,9 @@ struct GoCompileSpec {
     /// `"local"`, spawns here as before. A hashed dependency, so changing the
     /// environment re-keys this target.
     runner: String,
+    /// What the target reserves from the resource pools while it runs, e.g.
+    /// `{"cpu": 2}`. Defaults to 1 cpu. Never hashed.
+    resources: hplugin::driver::Resources,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -446,6 +449,7 @@ impl ManagedDriver for GoCompileDriver {
                 outputs,
                 cache: CacheConfig::on(true),
                 hash,
+                resources: spec.resources,
                 ..Default::default()
             },
         })
@@ -1317,6 +1321,21 @@ mod driver_tests {
             exe.hash, pie.hash,
             "exe and pie archives must not share a cache key"
         );
+    }
+
+    // U5: a declared `resources` lands on the def and keys nothing.
+    #[tokio::test]
+    async fn declared_resources_reach_the_def_and_not_the_hash() {
+        let plain = parse_def(spec_with_buildmode(BuildMode::Exe)).await;
+        assert!(plain.resources.is_empty(), "undeclared: the engine default");
+        let mut spec = spec_with_buildmode(BuildMode::Exe);
+        spec.config.insert(
+            "resources".to_string(),
+            Value::Map(HashMap::from([("cpu".to_string(), Value::Int(4))])),
+        );
+        let declared = parse_def(spec).await;
+        assert_eq!(declared.resources.declared("cpu"), Some("4"));
+        assert_eq!(declared.hash, plain.hash);
     }
 
     // An unparseable buildmode must fail the parse rather than quietly linking a

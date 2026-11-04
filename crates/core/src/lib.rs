@@ -16,6 +16,7 @@
 )]
 
 pub mod blocking;
+pub mod capacity;
 pub mod debug_hash;
 pub mod defer;
 pub mod events;
@@ -29,6 +30,7 @@ pub mod paths;
 pub mod pending;
 pub mod process;
 pub mod shutdown;
+pub mod sysres;
 pub mod template;
 pub mod units;
 pub mod version;

@@ -19,7 +19,7 @@
 
 use std::path::{Path, PathBuf};
 
-fn repo_root() -> PathBuf {
+pub(crate) fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()
 }
 
@@ -39,7 +39,7 @@ const SPAWN_ALLOWED: &[&str] = &["crates/execrunner"];
 /// Read from the manifest rather than hardcoded, for the same reason
 /// `lint_gate.rs` does it: a copy of the list would stop covering exactly the
 /// crates this test exists to catch — the new ones.
-fn workspace_members(manifest: &str) -> Vec<String> {
+pub(crate) fn workspace_members(manifest: &str) -> Vec<String> {
     let after = manifest
         .split_once("members = [")
         .map(|(_, rest)| rest)
@@ -55,7 +55,7 @@ fn workspace_members(manifest: &str) -> Vec<String> {
 }
 
 /// Every `.rs` file under `dir`, recursively.
-fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+pub(crate) fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };

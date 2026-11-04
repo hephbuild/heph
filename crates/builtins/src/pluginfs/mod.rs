@@ -891,41 +891,97 @@ fn emit_glob_file(
     Ok(())
 }
 
-/// Returns the glob walk artifacts for `(root, pattern, exclude)`, memoized
-/// within `request_id` (the tree is immutable mid-request, so repeat calls reuse
-/// the assembled list). Cross-run reuse of readdir + file hashes happens inside
-/// the shared [`CachedWalker`].
-fn cached_glob_walk(
-    walker: &CachedWalker,
-    request_id: &str,
-    root: &std::path::Path,
-    pattern: &str,
-    exclude: &[String],
-    compiled: &CompiledGlob,
-) -> anyhow::Result<Arc<Vec<OutputArtifact>>> {
+/// The per-request memo key of a glob walk over `(root, pattern, exclude)`.
+fn glob_walk_key(root: &std::path::Path, pattern: &str, exclude: &[String]) -> String {
     let mut sorted: Vec<&str> = exclude.iter().map(String::as_str).collect();
     sorted.sort_unstable();
     // `root` is part of the key: the same pattern walked under a different tree
     // root yields different artifacts (and source paths).
-    let key = format!("{}\0{}\0{}", root.display(), pattern, sorted.join("\u{1}"));
+    format!("{}\0{}\0{}", root.display(), pattern, sorted.join("\u{1}"))
+}
 
-    if let Some(a) = glob_result_cache()
+/// The glob walk artifacts memoized under `key` within `request_id` (the tree
+/// is immutable mid-request, so repeat calls reuse the assembled list).
+/// Cross-run reuse of readdir + file hashes happens inside the shared
+/// [`CachedWalker`].
+fn memoized_glob_walk(request_id: &str, key: &str) -> Option<Arc<Vec<OutputArtifact>>> {
+    glob_result_cache()
         .read()
         .get(request_id)
-        .and_then(|m| m.get(&key))
-    {
-        return Ok(a.clone());
-    }
+        .and_then(|m| m.get(key))
+        .cloned()
+}
 
-    let artifacts = Arc::new(walk_glob(walker, root, compiled)?);
-
-    Ok(glob_result_cache()
+/// Memoizes `artifacts` under `key` within `request_id`. A concurrent walk of
+/// the same key that landed first wins, so every caller sees one list.
+fn memoize_glob_walk(
+    request_id: &str,
+    key: String,
+    artifacts: Vec<OutputArtifact>,
+) -> Arc<Vec<OutputArtifact>> {
+    glob_result_cache()
         .write()
         .entry(request_id.to_owned())
         .or_default()
         .entry(key)
-        .or_insert(artifacts)
-        .clone())
+        .or_insert_with(|| Arc::new(artifacts))
+        .clone()
+}
+
+/// The single artifact of `file(path)` under `root`, or none for a codegen
+/// output or a path into a `.heph*` dir. Synchronous: a stat and, on a walker
+/// miss, a full read and hash.
+fn file_artifacts(
+    walker: &CachedWalker,
+    root: &std::path::Path,
+    path: &str,
+) -> anyhow::Result<Vec<OutputArtifact>> {
+    let abs = root.join(path);
+
+    // A file() over a net-new codegen output (stamped back into the
+    // tree) resolves to nothing — the generated content must only be
+    // sourced from its generator, never re-read as raw source. A path
+    // resolving into a `.heph*` dir (engine-internal artifact) is
+    // skipped the same way.
+    if has_codegen_xattr(&abs) || resolves_into_heph_dir(&abs) {
+        return Ok(vec![]);
+    }
+
+    // Content hash + exec bit via the shared walker (cross-run cached).
+    let fh = walker
+        .file_hash(&abs)
+        .with_context(|| format!("hash file '{}'", abs.display()))?;
+
+    let source_path = abs
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("file path is not valid UTF-8: {}", abs.display()))?
+        .to_string();
+
+    let name = std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(path)
+        .to_string();
+
+    // Bound to the path exactly as a glob entry is, so this file
+    // has one hashout whether it was sourced by `file()` or by a
+    // `glob()` that matched it (see `hwalk::fs_entry_hashout`).
+    let hashout = hwalk::fs_entry_hashout(path, &fh.hashout);
+
+    Ok(vec![OutputArtifact {
+        group: "".to_string(),
+        name,
+        r#type: Type::Output,
+        content: Content::File(ContentFile {
+            source_path,
+            out_path: path.to_string(),
+            x: fh.exec,
+            // Workspace source file: durable for the build, so the
+            // engine references it by path instead of tar-packing it.
+            passthrough: true,
+        }),
+        hashout,
+    }])
 }
 
 pub struct Driver {
@@ -964,6 +1020,9 @@ struct FsSpec {
     /// Comma-separated glob patterns to exclude (glob mode only).
     #[spec(ty = ParamType::String)]
     e: Option<String>,
+    /// What the target reserves from the resource pools while it runs.
+    /// Defaults to 0 cpu: it reserves nothing. Never hashed.
+    resources: hplugin::driver::Resources,
 }
 
 #[async_trait]
@@ -1064,6 +1123,14 @@ impl hplugin::driver::Driver for Driver {
                 raw_def: Arc::new(def),
                 outputs,
                 hash,
+                // Not in `hash` above: a declaration moves no key.
+                resources: spec
+                    .resources
+                    .advertise(
+                        hplugin::provider::PoolName::cpu(),
+                        hplugin::driver::Resources::VIEW_CPU,
+                    )
+                    .context("fs resources")?,
                 ..Default::default()
             },
         })
@@ -1087,61 +1154,25 @@ impl hplugin::driver::Driver for Driver {
         let def = req.target.def::<FsDef>();
         let root = &req.tree_root_path;
 
+        // The stat, `read_dir` and hash below are synchronous filesystem work:
+        // run inline, each would park a runtime worker for its whole duration,
+        // and fs targets reserve no cpu, so enough concurrent ones would park
+        // every worker and stall the reactor (#180). They run on the bounded
+        // blocking pool instead. Neither the walker (parking_lot mutexes, an
+        // r2d2 sqlite pool) nor the walk awaits or waits on another
+        // `hcore::blocking` job, so nothing here nests.
+        let root = root.to_path_buf();
         match def {
             FsDef::File { path } => {
-                let abs = root.join(path);
-
-                // A file() over a net-new codegen output (stamped back into the
-                // tree) resolves to nothing — the generated content must only be
-                // sourced from its generator, never re-read as raw source. A path
-                // resolving into a `.heph*` dir (engine-internal artifact) is
-                // skipped the same way.
-                if has_codegen_xattr(&abs) || resolves_into_heph_dir(&abs) {
-                    return Ok(RunResponse {
-                        artifacts: vec![],
-                        ..Default::default()
-                    });
-                }
-
-                // Content hash + exec bit via the shared walker (cross-run cached).
-                let fh = self
-                    .walker
-                    .file_hash(&abs)
-                    .with_context(|| format!("hash file '{}'", abs.display()))?;
-
-                let source_path = abs
-                    .to_str()
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("file path is not valid UTF-8: {}", abs.display())
-                    })?
-                    .to_string();
-
-                let name = std::path::Path::new(path)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(path.as_str())
-                    .to_string();
-
-                // Bound to the path exactly as a glob entry is, so this file
-                // has one hashout whether it was sourced by `file()` or by a
-                // `glob()` that matched it (see `hwalk::fs_entry_hashout`).
-                let hashout = hwalk::fs_entry_hashout(path, &fh.hashout);
+                let path = path.clone();
+                let artifacts =
+                    hcore::blocking::run(enclose::enclose!((self.walker => walker) move || {
+                        file_artifacts(&walker, &root, &path)
+                    }))
+                    .await?;
 
                 Ok(RunResponse {
-                    artifacts: vec![OutputArtifact {
-                        group: "".to_string(),
-                        name,
-                        r#type: Type::Output,
-                        content: Content::File(ContentFile {
-                            source_path,
-                            out_path: path.clone(),
-                            x: fh.exec,
-                            // Workspace source file: durable for the build, so the
-                            // engine references it by path instead of tar-packing it.
-                            passthrough: true,
-                        }),
-                        hashout,
-                    }],
+                    artifacts,
                     ..Default::default()
                 })
             }
@@ -1153,15 +1184,20 @@ impl hplugin::driver::Driver for Driver {
             } => {
                 // Within a request the tree is immutable, so the walk result for
                 // this `(root, pattern, excludes)` is memoized — repeat calls
-                // skip even the walker round-trips.
-                let artifacts = cached_glob_walk(
-                    &self.walker,
-                    req.request_id,
-                    root,
-                    pattern,
-                    exclude,
-                    compiled,
-                )?;
+                // skip even the walker round-trips, and the hop to the pool.
+                let key = glob_walk_key(&root, pattern, exclude);
+                let artifacts = match memoized_glob_walk(req.request_id, &key) {
+                    Some(artifacts) => artifacts,
+                    None => {
+                        let walked = hcore::blocking::run(
+                            enclose::enclose!((self.walker => walker, compiled) move || {
+                                walk_glob(&walker, &root, &compiled)
+                            }),
+                        )
+                        .await?;
+                        memoize_glob_walk(req.request_id, key, walked)
+                    }
+                };
 
                 Ok(RunResponse {
                     artifacts: (*artifacts).clone(),
@@ -1654,6 +1690,43 @@ mod tests {
             msg.contains("invalid exclude pattern"),
             "unexpected error: {msg}"
         );
+    }
+
+    /// An fs target that declares no `cpu` advertises 0 CPU (D3); a
+    /// declaration replaces that `cpu`, keeps its other pools, and moves no
+    /// def hash (U5).
+    #[tokio::test]
+    async fn resources_default_light_and_declared_unhashed() {
+        let parse = |extra: Option<Value>| async move {
+            let mut config = std::collections::HashMap::from([(
+                "f".to_string(),
+                Value::String("src/main.rs".to_string()),
+            )]);
+            if let Some(r) = extra {
+                config.insert("resources".to_string(), r);
+            }
+            Driver::default()
+                .parse(make_parse_req(config), &ctoken())
+                .await
+                .unwrap()
+                .target_def
+        };
+        let plain = parse(None).await;
+        assert_eq!(plain.resources.declared("cpu"), Some("0"));
+        assert_eq!(plain.resources.len(), 1);
+        let gpu_only = parse(Some(Value::Map(
+            [("gpu".to_string(), Value::Int(1))].into(),
+        )))
+        .await;
+        assert_eq!(gpu_only.resources.declared("cpu"), Some("0"));
+        assert_eq!(gpu_only.resources.declared("gpu"), Some("1"));
+        let heavy = parse(Some(Value::Map(
+            [("cpu".to_string(), Value::Int(2))].into(),
+        )))
+        .await;
+        assert_eq!(heavy.resources.declared("cpu"), Some("2"));
+        assert_eq!(heavy.hash, plain.hash);
+        assert_eq!(gpu_only.hash, plain.hash);
     }
 
     #[tokio::test]
@@ -3251,5 +3324,102 @@ mod tests {
         assert!(resolves_into_heph_dir(
             &gen_link.join("some").join("file.txt")
         ));
+    }
+
+    /// A glob walk runs on the blocking pool, not on the runtime worker: on a
+    /// one-thread runtime, a 1ms heartbeat keeps ticking while the walk is
+    /// stuck hashing a file.
+    #[tokio::test(flavor = "current_thread")]
+    async fn glob_walk_does_not_park_the_runtime_worker() {
+        assert_run_leaves_the_worker_free(
+            "p",
+            "*.txt",
+            "glob_walk_does_not_park_the_runtime_worker",
+        )
+        .await;
+    }
+
+    /// Same for `file()`: its stat and hash run on the blocking pool too.
+    #[tokio::test(flavor = "current_thread")]
+    async fn file_hash_does_not_park_the_runtime_worker() {
+        assert_run_leaves_the_worker_free(
+            "f",
+            "slow.txt",
+            "file_hash_does_not_park_the_runtime_worker",
+        )
+        .await;
+    }
+
+    /// Runs an fs target whose one match, `slow.txt`, is a symlink to a FIFO,
+    /// alongside a 1ms heartbeat, and asserts the heartbeat never stalls. The
+    /// FIFO makes hashing block in `open` until a writer thread shows up
+    /// `STALL` later — a run of a known, deterministic duration with no huge
+    /// tree on disk. Inline on the only worker, the heartbeat stalls for all
+    /// of it.
+    async fn assert_run_leaves_the_worker_free(key: &str, val: &str, request_id: &str) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        const STALL: Duration = Duration::from_millis(300);
+
+        let tmp = tempdir().unwrap();
+        let fifo = tmp.path().join("slow.fifo");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "mkfifo failed");
+        std::os::unix::fs::symlink(&fifo, tmp.path().join("slow.txt")).unwrap();
+
+        let driver = Driver::default();
+        let config =
+            std::collections::HashMap::from([(key.to_string(), Value::String(val.to_string()))]);
+        let parse_res = driver
+            .parse(make_parse_req(config), &ctoken())
+            .await
+            .unwrap();
+        // The walk memo is process-wide, keyed by request: a key of its own
+        // keeps another test's walk from answering this one.
+        let request_id = request_id.to_string();
+        let hashin = String::new();
+        let req = make_run_req(
+            &parse_res.target_def,
+            &request_id,
+            tmp.path().to_path_buf(),
+            &hashin,
+        );
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let heartbeat = tokio::spawn(enclose::enclose!((stop) async move {
+            let mut max_gap = Duration::ZERO;
+            let mut last = Instant::now();
+            while !stop.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                let now = Instant::now();
+                max_gap = max_gap.max(now - last);
+                last = now;
+            }
+            max_gap
+        }));
+        // Let the heartbeat start ticking before the walk can take the thread.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let writer = std::thread::spawn(enclose::enclose!((fifo) move || {
+            std::thread::sleep(STALL);
+            fs::write(&fifo, b"slow\n").expect("write fifo");
+        }));
+        let started = Instant::now();
+        let res = driver.run(req, &ctoken()).await.unwrap();
+        let walk = started.elapsed();
+        stop.store(true, Ordering::Release);
+        let max_gap = heartbeat.await.unwrap();
+        writer.join().unwrap();
+
+        assert_eq!(res.artifacts.len(), 1, "the FIFO link is the one match");
+        assert!(walk >= STALL, "the run must wait on the writer: {walk:?}");
+        assert!(
+            max_gap < STALL / 3,
+            "heartbeat stalled {max_gap:?} during a {walk:?} run"
+        );
     }
 }

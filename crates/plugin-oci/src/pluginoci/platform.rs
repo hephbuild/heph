@@ -307,6 +307,9 @@ impl ManagedDriver for Driver {
     ) -> anyhow::Result<ParseResponse> {
         let addr = &req.target_spec.addr;
         let builder = addr.args.get(BUILDER_ARG).cloned();
+        // Never hashed.
+        let resources = hplugin::driver::Resources::from_config(&req.target_spec.config)
+            .with_context(|| format!("oci builder platform {}", addr.format()))?;
 
         // The env is read here, not in `run`: it is an *input*, and hashing it is
         // what makes switching daemon or builder re-probe instead of serving the
@@ -340,6 +343,7 @@ impl ManagedDriver for Driver {
                 // Local yes, remote never — see the module header.
                 cache: CacheConfig::on(false),
                 hash,
+                resources,
                 ..Default::default()
             },
         })

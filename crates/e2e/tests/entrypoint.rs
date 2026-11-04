@@ -622,6 +622,8 @@ struct SeenOptions {
     sandbox_dir: PathBuf,
     /// The handover was still unfired when the run reached the driver.
     handover_pending: bool,
+    /// What the run request told the driver it may use.
+    allotment: Option<hplugin::driver::Allotment>,
 }
 
 /// A plain driver whose def is an entrypoint that says "cache me" — the shape
@@ -695,6 +697,7 @@ impl hplugin::driver::Driver for RecordingEntrypoint {
                 &o.stdio,
                 hplugin::driver::RunStdio::Inherit(fg) if fg.handover.is_some()
             ),
+            allotment: req.allotment,
         });
         anyhow::ensure!(req.sandbox_dir.is_dir(), "the sandbox exists for the run");
         Ok(hplugin::driver::RunResponse {
@@ -796,6 +799,176 @@ async fn entrypoint_runs_through_driver_run_with_options() -> anyhow::Result<()>
     assert!(
         !seen.handover_pending,
         "a plain driver spawns from `run`, so the engine fired the handover before it"
+    );
+    Ok(())
+}
+
+/// An entrypoint reserves nothing and is told the whole cpu capacity (D6):
+/// with a build holding every CPU of the pool, the invocation still runs, and
+/// its run request carries `cpu` = the capacity and no memory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn entrypoint_is_told_the_capacity_and_reserves_nothing() -> anyhow::Result<()> {
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let driver_seen = Arc::clone(&seen);
+    let ws = WorkspaceBuilder::new()?
+        .with_parallelism(3)
+        .with_provider(|init| {
+            Box::new(pluginbuildfile::Provider::new(
+                init.root.to_path_buf(),
+                init.runtime.clone(),
+                Arc::clone(&init.functions),
+            ))
+        })
+        .with_managed_driver(Box::new(pluginexec::Driver::new_bash().with_host_path()))
+        .with_plugin("recording", move |_| {
+            Ok(
+                PluginParts::default().with_driver(Box::new(RecordingEntrypoint {
+                    seen: Arc::clone(&driver_seen),
+                    no_shell: false,
+                })),
+            )
+        })
+        .build()?;
+    let gates = tempfile::tempdir()?;
+    let gate = gates.path().join("open");
+    ws.write_build_file(
+        "app",
+        &format!(
+            r#"
+target(name = "ep", driver = "recording")
+target(
+    name = "hog",
+    driver = "bash",
+    run = "while [ ! -e '{gate}' ]; do sleep 0.02; done; echo hog > $OUT",
+    out = "hog.txt",
+    resources = {{"cpu": 3}},
+)
+"#,
+            gate = gate.display()
+        ),
+    );
+
+    let engine = Arc::clone(&ws.engine);
+    let hog = tokio::spawn(async move {
+        Arc::clone(&engine)
+            .result(
+                engine.new_state(),
+                &heph::htmatcher::Matcher::Addr(parse_addr("//app:hog")?),
+                OutputMatcher::All,
+                &ResultOptions::default(),
+            )
+            .await
+            .map(drop)
+    });
+    let held = |e: &Engine| {
+        e.resource_snapshot().map_or(0, |s| {
+            s.main
+                .pools
+                .iter()
+                .find(|p| p.pool.as_str() == "cpu")
+                .map_or(0, |p| p.held)
+        })
+    };
+    let admitted = wait_for("the hog to hold every cpu", || {
+        held(&ws.engine) == 3_000_000
+    })
+    .await;
+
+    let elsewhere = tempfile::tempdir()?;
+    let out = elsewhere.path().join("out");
+    let invoked = if admitted.is_ok() {
+        Some(
+            tokio::time::timeout(
+                Duration::from_secs(120),
+                invoke(
+                    &ws.engine,
+                    request("//app:ep", elsewhere.path(), &[], &out)?,
+                ),
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+    let still_held = held(&ws.engine);
+    // Open the gate whatever happened, so a failure never leaves the hog
+    // blocked.
+    std::fs::write(&gate, "")?;
+    tokio::time::timeout(Duration::from_secs(120), hog).await???;
+    admitted?;
+    let invoked = invoked
+        .context("not invoked")?
+        .context("the entrypoint waited behind the full pool: it reserved something")?;
+    assert_eq!(exited(invoked), Exit::Code(0));
+    assert_eq!(still_held, 3_000_000, "the hog held the pool throughout");
+
+    let seen = seen
+        .lock()
+        .expect("seen")
+        .clone()
+        .context("run was called")?;
+    assert_eq!(
+        seen.allotment,
+        Some(hplugin::driver::Allotment::new([(
+            "cpu".to_string(),
+            "3".to_string()
+        )])),
+        "told the whole cpu capacity, no memory"
+    );
+    Ok(())
+}
+
+/// The exec half of D6/D7: a `bash` entrypoint's `${resource:cpu}` is the cpu
+/// capacity, and the caller's own environment reaches the command as it was
+/// (heph exports nothing of its own, so the caller's `HEPH_CPUS` is untouched).
+#[tokio::test]
+async fn bash_entrypoint_sees_the_capacity_through_a_reference() -> anyhow::Result<()> {
+    let ws = WorkspaceBuilder::new()?
+        .with_parallelism(3)
+        .with_provider(|init| {
+            Box::new(pluginbuildfile::Provider::new(
+                init.root.to_path_buf(),
+                init.runtime.clone(),
+                Arc::clone(&init.functions),
+            ))
+        })
+        .with_managed_driver(Box::new(pluginexec::Driver::new_bash().with_host_path()))
+        .build()?;
+    ws.write_build_file(
+        "app",
+        r#"
+target(name = "ep", driver = "bash", entrypoint = True,
+       env = {"EP_JOBS": "-j${resource:cpu}"},
+       run = ["echo \"$HEPH_CPUS $EP_JOBS\" > \"$HEPH_TEST_OUT\""])
+"#,
+    );
+    let elsewhere = tempfile::tempdir()?;
+    let out = elsewhere.path().join("out");
+    let mut req = request("//app:ep", elsewhere.path(), &[], &out)?;
+    req.env.push(("HEPH_CPUS".into(), "99".into()));
+    assert_eq!(exited(invoke(&ws.engine, req).await), Exit::Code(0));
+    assert_eq!(read(&out)?.trim(), "99 -j3");
+    Ok(())
+}
+
+/// An entrypoint that declares `resources` is refused at def time, before
+/// anything runs (D6; the message rows are `entrypoint_parse_refusals`).
+#[tokio::test]
+async fn entrypoint_declaring_resources_is_refused() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "app",
+        r#"target(name = "ep", driver = "exec", entrypoint = True, run = ["/bin/true"], resources = {"cpu": 2})"#,
+    );
+    let out = ws.dir.path().join("out");
+    let err = match invoke(&ws.engine, request("//app:ep", ws.dir.path(), &[], &out)?).await {
+        Err(e) => e,
+        Ok(other) => panic!("expected a refusal before resolution, got {other:?}"),
+    };
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("`resources`") && msg.contains("reserves nothing"),
+        "{msg}"
     );
     Ok(())
 }

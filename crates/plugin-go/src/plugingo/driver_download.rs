@@ -86,6 +86,9 @@ struct GoDownloadSpec {
     /// Absent, or the literal `"local"`, spawns here. A hashed dependency, so
     /// changing the environment re-keys this target.
     runner: String,
+    /// What the target reserves from the resource pools while it runs, e.g.
+    /// `{"cpu": 2}`. IO-bound: an undeclared `cpu` costs 0.1. Never hashed.
+    resources: hplugin::driver::Resources,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -453,6 +456,13 @@ impl ManagedDriver for GoDownloadDriver {
                 }],
                 cache: CacheConfig::on(true),
                 hash,
+                resources: spec
+                    .resources
+                    .advertise(
+                        hplugin::provider::PoolName::cpu(),
+                        hplugin::driver::Resources::IO_CPU,
+                    )
+                    .context("go.download resources")?,
                 ..Default::default()
             },
         })
@@ -688,6 +698,27 @@ mod tests {
             .unwrap()
             .hash;
         assert_ne!(base, other, "go_version is part of the key");
+    }
+
+    /// A download waits on the network: the driver advertises `cpu` 0.1, a
+    /// declared one replaces it, and neither moves the def hash.
+    #[tokio::test]
+    async fn parse_defaults_resources_to_a_tenth_of_a_cpu_unhashed() {
+        let plain = parse_def(&GoDownloadDriver::new(), spec("gopkg.in/yaml.v2", "v2.4.0"))
+            .await
+            .unwrap();
+        assert_eq!(
+            plain.resources.declared("cpu"),
+            Some(hplugin::driver::Resources::IO_CPU)
+        );
+        let mut declared = spec("gopkg.in/yaml.v2", "v2.4.0");
+        declared.config.insert(
+            "resources".to_string(),
+            Value::Map(HashMap::from([("cpu".to_string(), Value::Int(2))])),
+        );
+        let heavy = parse_def(&GoDownloadDriver::new(), declared).await.unwrap();
+        assert_eq!(heavy.resources.declared("cpu"), Some("2"));
+        assert_eq!(heavy.hash, plain.hash);
     }
 
     #[tokio::test]

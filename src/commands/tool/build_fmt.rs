@@ -189,7 +189,7 @@ async fn execute_async(args: Args, sink: LogSink, global: GlobalOptions) -> anyh
         Some(s) => htpkg::parse(&s, &get_cwp()?)?,
         None => Matcher::PackagePrefix(PkgBuf::from("")),
     };
-    let (engine, shutdown) = bootstrap::new_engine()?;
+    let (engine, shutdown) = bootstrap::new_engine(&global)?;
     let app = BuildFmtApp {
         engine,
         matcher,

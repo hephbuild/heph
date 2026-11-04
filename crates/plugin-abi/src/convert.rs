@@ -30,8 +30,8 @@ use hplugin::driver::TargetAddr;
 use hplugin::driver::sandbox::{Dep, Env, EnvValue, Mode, Sandbox, Tool};
 use hplugin::driver::targetdef::{Entrypoint, RawDef, RawDefBytes, Workdir};
 use hplugin::driver::{
-    ContinueSender, Disposition, Foreground, PtyStdio, RunOptions, RunStdio, Signal, SignalSender,
-    StopReceiver,
+    Allotment, ContinueSender, Disposition, Foreground, PtyStdio, Resources, RunOptions, RunStdio,
+    Signal, SignalSender, StopReceiver,
 };
 use hplugin::error::Exit;
 use hplugin::function::{DeclaredState, DeclaredTarget, FnArgs, FnOutcome};
@@ -1352,6 +1352,14 @@ pub fn credential_mount_from_pb(
     })
 }
 
+/// The declared pools as written. Empty for nearly every def, which costs
+/// nothing on the wire.
+fn resources_to_pb(r: &Resources) -> buffa::__private::HashMap<String, String> {
+    r.iter()
+        .map(|(pool, n)| (pool.to_string(), n.to_owned()))
+        .collect()
+}
+
 pub fn target_def_to_pb(td: &TargetDef) -> anyhow::Result<pb::TargetDef> {
     Ok(pb::TargetDef {
         addr: addr_to_pb(&td.addr).into(),
@@ -1365,8 +1373,36 @@ pub fn target_def_to_pb(td: &TargetDef) -> anyhow::Result<pb::TargetDef> {
         hash: Some(td.hash.clone()),
         transparent: Some(td.transparent),
         entrypoint: td.entrypoint.as_ref().map(entrypoint_to_pb).into(),
+        resources: resources_to_pb(&td.resources),
         ..Default::default()
     })
+}
+
+/// The wire form of a run's allotment (since 0.17.4): pool name to rendered
+/// amount.
+pub fn allotment_to_pb(a: &Allotment) -> buffa::__private::HashMap<String, String> {
+    a.iter()
+        .map(|(pool, amount)| (pool.to_owned(), amount.to_owned()))
+        .collect()
+}
+
+/// Empty — what every host before 0.17.4 sends — is "told nothing". A
+/// non-empty map must name `cpu`, which every allotment carries, and only
+/// pool names: anything else is a malformed sender, not a default.
+pub fn allotment_from_pb(
+    a: buffa::__private::HashMap<String, String>,
+) -> anyhow::Result<Option<Allotment>> {
+    if a.is_empty() {
+        return Ok(None);
+    }
+    if !a.contains_key(hplugin::provider::PoolName::CPU) {
+        anyhow::bail!("field ManagedRunRequest.allotment has no `cpu`; every allotment names it");
+    }
+    for pool in a.keys() {
+        hplugin::provider::PoolName::try_from(pool.as_str())
+            .context("decoding ManagedRunRequest.allotment")?;
+    }
+    Ok(Some(Allotment::new(a)))
 }
 
 fn entrypoint_to_pb(e: &Entrypoint) -> pb::Entrypoint {
@@ -1721,6 +1757,12 @@ pub fn target_def_from_pb(td: pb::TargetDef) -> anyhow::Result<TargetDef> {
                 .into_option()
                 .map(entrypoint_from_pb)
                 .transpose()?,
+            // Absent — what every plugin before 0.17.4 sends — is empty: the
+            // def says nothing and reserves the defaults.
+            resources: Resources::try_from_pairs(td.resources)
+                .context("decoding TargetDef.resources")?,
+            // The engine parses `resources` into this when it links the def.
+            demand: Default::default(),
             addr: addr.clone(),
         })
     })();
@@ -3248,6 +3290,128 @@ nested: { a: 1, b: [x, y] }
         );
         assert_eq!(back.hash, vec![0xde, 0xad, 0, 1]);
         assert!(!back.inputs[1].hashed && !back.inputs[2].runtime);
+    }
+
+    #[test]
+    fn target_def_resources_round_trip() {
+        let mut td = full_target_def();
+        for (pool, n) in [("cpu", "2.5"), ("memory", "4G"), ("docker", "1")] {
+            td.resources
+                .insert(
+                    hplugin::provider::PoolName::try_from(pool).unwrap(),
+                    n.to_owned(),
+                )
+                .unwrap();
+        }
+        let wire = target_def_to_pb(&td).expect("encode");
+        assert_eq!(wire.resources.len(), 3);
+        let back = target_def_from_pb(via_bytes(&wire)).expect("decode");
+        assert_eq!(back.resources, td.resources);
+        assert_eq!(back.resources.declared("memory"), Some("4G"), "as written");
+
+        // A pool name the parser would refuse is refused on the wire too.
+        let mut wire = full_target_def_pb();
+        wire.resources
+            .insert("Not A Pool".to_string(), "1".to_owned());
+        let err = target_def_from_pb(via_bytes(&wire))
+            .err()
+            .expect("bad pool name is refused");
+        assert!(
+            format!("{err:#}").contains("TargetDef.resources"),
+            "{err:#}"
+        );
+    }
+
+    /// A cdylib driver's advertised cost is an ordinary `resources` entry, so
+    /// it crosses the seam as written and admits at the same cost on the host.
+    #[test]
+    fn an_advertised_cpu_crosses_as_a_declaration() {
+        let mut td = full_target_def();
+        for (text, micros) in [
+            (Resources::VIEW_CPU, 0),
+            (Resources::IO_CPU, Resources::MICROS_PER_CPU / 10),
+        ] {
+            td.resources = Resources::default()
+                .advertise(hplugin::provider::PoolName::cpu(), text)
+                .expect("advertise");
+            let wire = target_def_to_pb(&td).expect("encode");
+            assert_eq!(wire.resources.get("cpu").map(String::as_str), Some(text));
+            let back = target_def_from_pb(via_bytes(&wire)).expect("decode");
+            assert_eq!(back.resources, td.resources);
+            let unit = |_: &str| Some(hcore::capacity::Unit::Cpu);
+            assert_eq!(
+                back.resources.parse(unit).expect("parse").amount("cpu"),
+                micros
+            );
+        }
+    }
+
+    #[test]
+    fn absent_resources_decode_to_empty() {
+        let wire = full_target_def_pb();
+        assert!(wire.resources.is_empty(), "nothing declared, nothing sent");
+        let back = target_def_from_pb(via_bytes(&wire)).expect("decode");
+        assert!(back.resources.is_empty());
+    }
+
+    /// The bytes a 0.17.3 plugin sends for a minimal def (addr, raw_def, cache,
+    /// hash), frozen: a 0.17.4 host decodes them, with no resources.
+    #[test]
+    fn golden_0_17_3_def_bytes_decode() {
+        // `TargetDef { addr: addr("//p", "t"), raw_def: {"n":1}, cache off,
+        // hash: abcd }` as 0.17.3 encodes it (fields 1, 3, 7, 8, 9, 10; no 12).
+        const GOLDEN: &[u8] = &[
+            0x0a, 0x17, 0x0a, 0x03, 0x2f, 0x2f, 0x70, 0x12, 0x01, 0x74, 0x1a, 0x0d, 0x0a, 0x04,
+            0x67, 0x6f, 0x6f, 0x73, 0x12, 0x05, 0x6c, 0x69, 0x6e, 0x75, 0x78, 0x1a, 0x0b, 0x10,
+            0x01, 0x1a, 0x07, 0x7b, 0x22, 0x6e, 0x22, 0x3a, 0x31, 0x7d, 0x3a, 0x06, 0x08, 0x00,
+            0x10, 0x00, 0x18, 0x00, 0x40, 0x00, 0x4a, 0x02, 0xab, 0xcd, 0x50, 0x00,
+        ];
+        let back =
+            target_def_from_pb(crate::decode(GOLDEN).expect("decode bytes")).expect("decode def");
+        assert_eq!(back.addr, addr("//p", "t"));
+        assert_eq!(back.hash, vec![0xab, 0xcd]);
+        assert!(back.resources.is_empty());
+    }
+
+    #[test]
+    fn managed_run_request_allotment_round_trip() {
+        let pairs = |p: &[(&str, &str)]| {
+            Allotment::new(p.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())))
+        };
+        for a in [
+            pairs(&[("cpu", "3")]),
+            pairs(&[("cpu", "1"), ("memory", "4294967296"), ("gpu", "2")]),
+        ] {
+            let wire = pb::ManagedRunRequest {
+                allotment: allotment_to_pb(&a),
+                ..Default::default()
+            };
+            let back = via_bytes(&wire);
+            assert_eq!(allotment_from_pb(back.allotment).expect("decode"), Some(a));
+        }
+
+        // A non-empty allotment with no cpu, or a key that is no pool name, is
+        // a malformed sender.
+        for bad in [
+            pairs(&[("gpu", "1")]),
+            pairs(&[("cpu", "1"), ("Not A Pool", "1")]),
+        ] {
+            let wire = pb::ManagedRunRequest {
+                allotment: allotment_to_pb(&bad),
+                ..Default::default()
+            };
+            assert!(
+                allotment_from_pb(via_bytes(&wire).allotment).is_err(),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn absent_allotment_decodes_to_none() {
+        let back = via_bytes(&pb::ManagedRunRequest::default());
+        assert!(back.allotment.is_empty());
+        assert_eq!(allotment_from_pb(back.allotment).expect("decode"), None);
     }
 
     /// buffa's default decode budget (32 MiB of elements, charged at their

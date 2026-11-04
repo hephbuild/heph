@@ -184,6 +184,9 @@ pub(crate) struct TargetSpec {
     /// Host environment variables `devenv` may see, hashed at parse.
     /// Defaults to the set devenv needs to reach the nix store and the network.
     pub pass_env: Vec<String>,
+    /// What the target reserves from the resource pools while it runs, e.g.
+    /// `{"cpu": 2}`. Defaults to 1 cpu. Never hashed.
+    pub resources: hplugin::driver::Resources,
 }
 
 /// What `run` needs, and what the def hash is taken over.
@@ -344,6 +347,7 @@ impl ManagedDriver for Driver {
                 // mix-up the fingerprint exists to prevent.
                 cache: CacheConfig::on(false),
                 hash,
+                resources: spec.resources,
                 ..Default::default()
             },
         })

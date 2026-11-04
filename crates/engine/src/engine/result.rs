@@ -39,12 +39,12 @@ use tokio::task::JoinSet;
 /// lock" notice (with the holder's pid) to the progress stream. The notice is
 /// purely informational; the wait itself continues until acquired or cancelled.
 #[cfg(not(test))]
-const RESULT_LOCK_NOTICE: std::time::Duration = std::time::Duration::from_secs(5);
+pub(crate) const RESULT_LOCK_NOTICE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Shortened under `cfg(test)`, as `SCRATCH_LOCK_NOTICE` is, so the announced
 /// path is testable without a five-second sleep per row.
 #[cfg(test)]
-const RESULT_LOCK_NOTICE: std::time::Duration = std::time::Duration::from_millis(50);
+pub(crate) const RESULT_LOCK_NOTICE: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// The first and the longest pause of a contended miss's retry
 /// ([`contend_for_write`]), before jitter.
@@ -1663,7 +1663,9 @@ impl Engine {
         // Announce worker capacity once per request. Covers the single-target
         // entry (`run` of one addr) that bypasses `Engine::result`; the once-guard
         // makes the dep recursion below a no-op.
-        rs.announce_request_config(self.max_workers, opts.no_scratch);
+        rs.announce_request_config(self.max_workers, opts.no_scratch, || {
+            self.pool_announcement()
+        });
 
         // Single-target entry (`run` of one addr, which bypasses `Engine::result`):
         // claim the matched stream and emit the set-of-one as already-complete
@@ -1908,8 +1910,8 @@ impl Engine {
     /// a read guard rides on the artifact and lives as long as anything holds
     /// it, so this bounds the rate of acquisition and not the count. What it
     /// bounds is live *task* state, blocking-queue depth, and waker churn.
-    pub(crate) fn top_level_spawn_limit(max_workers: usize) -> usize {
-        max_workers.saturating_mul(8).clamp(16, 2048)
+    pub(crate) fn top_level_spawn_limit(fan_out: usize) -> usize {
+        fan_out.saturating_mul(8).clamp(16, 2048)
     }
 
     /// Fold one finished top-level task into the batch's outcome.
@@ -2016,7 +2018,9 @@ impl Engine {
 
         // Announce worker capacity up front so the client can paint a fixed
         // worker-slot indicator before any execute lands.
-        rs.announce_request_config(self.max_workers, opts.no_scratch);
+        rs.announce_request_config(self.max_workers, opts.no_scratch, || {
+            self.pool_announcement()
+        });
 
         let fail_fast = rs.fail_fast();
         let mut set: JoinSet<(Addr, anyhow::Result<Arc<EResult>>)> = JoinSet::new();
@@ -2063,7 +2067,7 @@ impl Engine {
         // is dropped on completion, so the permit and the state machine are
         // released together.
         let spawn_limit = Arc::new(tokio::sync::Semaphore::new(Self::top_level_spawn_limit(
-            self.max_workers,
+            self.fan_out,
         )));
 
         // The walk runs in its own task feeding a bounded channel, rather than
@@ -2082,7 +2086,7 @@ impl Engine {
         // The channel is what keeps admission bounded regardless: the walk may
         // run ahead, but only by its capacity.
         let (matched_tx, mut matched_rx) = tokio::sync::mpsc::channel::<anyhow::Result<Addr>>(
-            Self::top_level_spawn_limit(self.max_workers),
+            Self::top_level_spawn_limit(self.fan_out),
         );
         // `spawn_with_cycle_ctx`, not bare `tokio::spawn`: the walk calls
         // `Memoizer::once` (packages, `probe_segments`, the `MatchShrug`
@@ -2093,7 +2097,7 @@ impl Engine {
             hcore::hmemoizer::spawn_with_cycle_ctx(enclose!((self => engine, rs, owns_matched) {
                 let matcher = matcher.clone();
                 let discovery = opts.discovery.clone();
-                let confirm_limit = Self::top_level_spawn_limit(engine.max_workers);
+                let confirm_limit = Self::top_level_spawn_limit(engine.fan_out);
                 async move {
                     let gaps = discovery.gaps().cloned();
                     // A match selected on its listed labels comes out of the walk
@@ -2501,6 +2505,104 @@ impl Engine {
                 .with_context(|| format!("acquiring result lock for {addr}"))
             }
         }
+    }
+
+    /// Parse the def's `resources` against the engine's pools into the
+    /// [`Demand`](hplugin::driver::Demand) admission reads: every declared pool
+    /// must be one the engine has, and each amount is parsed in its pool's
+    /// unit. Called from `get_def_inner` beside
+    /// [`validate_approval`](Self::validate_approval), so a bad declaration
+    /// fails at definition time, on every path. A pool at capacity 0 exists (a
+    /// run sets it), so it passes here and fails only at admission.
+    pub(crate) fn validate_resources(
+        &self,
+        addr: &Addr,
+        resources: &hplugin::driver::Resources,
+    ) -> anyhow::Result<hplugin::driver::Demand> {
+        // A def that declares nothing pays one branch and no allocation.
+        if resources.is_empty() {
+            return Ok(hplugin::driver::Demand::default());
+        }
+        if let Some((pool, amount)) = resources
+            .iter()
+            .find(|(p, _)| !self.pools.is_pool(p.as_str()))
+        {
+            // The entry to add, in the unit the amount is written in: a
+            // shorthand is a count, so `"8G"` needs `{unit: bytes, …}` spelled.
+            use hcore::capacity::Unit;
+            let declare = [Unit::Count, Unit::Bytes, Unit::Cpu]
+                .into_iter()
+                .find(|u| u.parse(amount).is_ok())
+                .filter(|u| *u != Unit::Count)
+                .map_or_else(
+                    || "<n>".to_string(),
+                    |u| format!("{{unit: {}, value: <n>}}", u.name()),
+                );
+            anyhow::bail!(
+                "{addr} declares resources.{pool}, but {}",
+                self.pools.unknown_hint(pool.as_str(), &declare)
+            );
+        }
+        resources
+            .parse(|pool| self.pools.unit(pool))
+            .with_context(|| format!("{addr} declares resources"))
+    }
+
+    /// Refuse a `${resource:<pool>}` that has no grant to substitute: one
+    /// whose name is pool-shaped (`[a-z][a-z0-9_]{0,63}`) but no configured
+    /// pool, with a "did you mean" hint, and one naming a pool the target does
+    /// not reserve (`cpu` is always reserved). A reference whose argument is
+    /// not pool-shaped (`${resource:CPU}`, bash's `${resource:-x}`) is not
+    /// heph's and passes untouched. The run could not do better, and only on
+    /// a miss; here it fails on every path, a cache hit and `heph validate`
+    /// included.
+    ///
+    /// `refs` are `(path, text)` pairs: the config's references
+    /// ([`deferred_refs`](Self::deferred_refs)). A dependency's transitive env
+    /// takes no reference at all; the driver refuses one in `apply_transitive`.
+    pub(crate) fn validate_resource_refs<'a>(
+        &self,
+        addr: &Addr,
+        refs: impl IntoIterator<Item = (&'a str, &'a str)>,
+        demand: &hplugin::driver::Demand,
+    ) -> anyhow::Result<()> {
+        for (path, raw) in refs {
+            // Already tokenized once by the collector; a parse failure here
+            // cannot happen for a config ref.
+            let Ok(pieces) = hcore::template::parse(raw) else {
+                continue;
+            };
+            for p in &pieces {
+                let hcore::template::Piece::Ref(t) = p else {
+                    continue;
+                };
+                if !hcore::template::claims(t.kind, t.arg, &[crate::engine::deferred::RESOURCE]) {
+                    continue;
+                }
+                let pool = t.arg;
+                if !self.pools.is_pool(pool) {
+                    anyhow::bail!(
+                        "{addr}: `{path}` reads ${{resource:{pool}}}, but {}",
+                        self.pools.unknown_hint(pool, "<n>")
+                    );
+                }
+                if !demand.reserves(pool) {
+                    let fix = if demand.declared(pool).is_some() {
+                        format!(
+                            "declares {pool}: 0, so it reserves none: declare an amount above 0"
+                        )
+                    } else {
+                        format!(
+                            "reserves no {pool}: add resources = {{\"{pool}\": <amount>}} to it"
+                        )
+                    };
+                    anyhow::bail!(
+                        "{addr}: `{path}` reads ${{resource:{pool}}}, but the target {fix}"
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Thin per-`(outputs, is_top)` wrapper over [`resolve_locked`]. The lock
@@ -4421,8 +4523,12 @@ impl Engine {
         // cacheable target — and a transitive form that names a different one
         // is refused rather than believed.
         let parsed_entrypoint = def.entrypoint;
+        // `resources` likewise: what a target reserves is its config's, and a
+        // driver that rebuilds its def in `apply_transitive` (a cdylib across
+        // the ABI) must not drop the declaration or its lowered default.
         let mut def = match &all_transitive {
             Some(sb) if !sb.empty() => {
+                let parsed_resources = def.resources.clone();
                 let res = driver
                     .driver
                     .apply_transitive(
@@ -4446,6 +4552,7 @@ impl Engine {
                     ),
                     _ => transitive.entrypoint = parsed_entrypoint,
                 }
+                transitive.resources = parsed_resources;
                 transitive
             }
             _ => def,
@@ -4525,6 +4632,16 @@ impl Engine {
         // non-existent input group fails fast and identically on every path.
         Self::validate_approval(&spec, addr, def.inputs.iter().map(|i| i.origin_id.as_str()))
             .with_context(|| "approval")?;
+        // Same seam for `resources`: a pool the engine does not have fails at
+        // definition time, on every path, and so in `heph validate`.
+        def.demand = self.validate_resources(addr, &def.resources)?;
+        self.validate_resource_refs(
+            addr,
+            deferred_refs
+                .iter()
+                .map(|r| (r.path.as_str(), r.raw.as_str())),
+            &def.demand,
+        )?;
 
         Ok(Arc::new(ExtendedTargetDef {
             target_def: Arc::new(def),
@@ -7626,7 +7743,7 @@ mod tests {
             parallelism: Some(1),
             ..Config::for_tests(root.path())
         })?;
-        let limit = Engine::top_level_spawn_limit(engine.max_workers);
+        let limit = Engine::top_level_spawn_limit(engine.fan_out);
         let targets: Vec<_> = (0..limit + 50)
             .map(|i| static_target(&format!("//pkg:t{i}"), &[], &[]))
             .collect();
@@ -7716,12 +7833,12 @@ mod tests {
     /// test in this file uses two or three targets, so none of them would notice.
     #[tokio::test]
     async fn a_selection_larger_than_the_limit_resolves_every_target() -> anyhow::Result<()> {
-        let (engine, _root) = engine_with_parallelism(1, |max_workers| {
-            (0..Engine::top_level_spawn_limit(max_workers) + 50)
+        let (engine, _root) = engine_with_parallelism(1, |fan_out| {
+            (0..Engine::top_level_spawn_limit(fan_out) + 50)
                 .map(|i| static_target(&format!("//pkg:t{i}"), &[], &[]))
                 .collect()
         })?;
-        let expected = Engine::top_level_spawn_limit(engine.max_workers) + 50;
+        let expected = Engine::top_level_spawn_limit(engine.fan_out) + 50;
 
         let rs = engine.new_state();
         let res = tokio::time::timeout(
@@ -7757,16 +7874,16 @@ mod tests {
     #[tokio::test]
     async fn matched_targets_depending_on_a_late_matched_target_do_not_deadlock()
     -> anyhow::Result<()> {
-        let (engine, _root) = engine_with_parallelism(1, |max_workers| {
+        let (engine, _root) = engine_with_parallelism(1, |fan_out| {
             // `zzz` sorts last, so the walk yields it after every dependent.
             let mut targets = vec![static_target("//pkg:zzz", &[], &[])];
             targets.extend(
-                (0..Engine::top_level_spawn_limit(max_workers) + 50)
+                (0..Engine::top_level_spawn_limit(fan_out) + 50)
                     .map(|i| static_target(&format!("//pkg:t{i}"), &[], &["//pkg:zzz"])),
             );
             targets
         })?;
-        let expected = Engine::top_level_spawn_limit(engine.max_workers) + 51;
+        let expected = Engine::top_level_spawn_limit(engine.fan_out) + 51;
 
         let rs = engine.new_state();
         let res = tokio::time::timeout(
@@ -9180,7 +9297,7 @@ mod tests {
     }
 
     /// [`engine_with_home`] with an explicit `parallelism`, and targets built
-    /// from the resulting `max_workers` — so a test can size a selection against
+    /// from the resulting `fan_out` — so a test can size a selection against
     /// [`Engine::top_level_spawn_limit`] without hardcoding the machine.
     fn engine_with_parallelism(
         parallelism: usize,
@@ -9194,7 +9311,7 @@ mod tests {
         engine.register_managed_driver(|_| {
             Box::new(hplugin_exec::pluginexec::Driver::new_exec().with_host_path())
         })?;
-        let provider = pluginstatictarget::Provider::new(targets(engine.max_workers))?;
+        let provider = pluginstatictarget::Provider::new(targets(engine.fan_out))?;
         engine.register_provider(move |_| Box::new(provider))?;
         Ok((Arc::new(engine), root))
     }
@@ -9267,7 +9384,7 @@ mod tests {
         assert!(
             events.iter().any(|e| matches!(
                 &e.kind,
-                BuildEventKind::ExecuteStart { addr, driver, cache }
+                BuildEventKind::ExecuteStart { addr, driver, cache, .. }
                     if addr == "//pkg:a" && driver == "exec" && *cache
             )),
             "expected ExecuteStart{{driver:exec, cache:true}}, got {events:?}"

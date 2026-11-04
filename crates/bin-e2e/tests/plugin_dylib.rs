@@ -1020,3 +1020,55 @@ fn a_plugin_from_another_abi_is_refused() {
         "a newer patch is in the lane: {stderr}"
     );
 }
+
+/// **The release binary hands a real cdylib driver its allotment.**
+///
+/// The allotment rides `ManagedRunRequest.allotment` (field 15, since 0.17.4)
+/// from the host's run request, through the stabby seam, into the cdylib's own
+/// managed layer. `convert.rs`'s round-trip proves the encoding; only a real
+/// `dlopen` proves the host fills the field and the plugin's copy of the SDK
+/// reads it. The test cdylib's `allot` driver writes what it was told into its
+/// output (each granted pool as `<pool>=<amount>`, or `told-nothing`).
+///
+/// Two rows under `-j 2`: `cpu: 2` with `memory: "1G"` is told both; `cpu: 16`
+/// is clamped to the capacity and told 2, and no memory since it reserved
+/// none.
+#[test]
+fn allotment_crosses_the_plugin_seam() {
+    let dist = Dist::locate();
+    let ws = Workspace::new().expect("workspace");
+    let dylib = dist.test_plugin("entrypoint");
+    assert!(dylib.is_file(), "missing {}", dylib.display());
+    let manifest = ws.root().join("test-entrypoint-plugin.json");
+    let sum = sha256_file(&dylib).expect("hash test cdylib");
+    write_manifest(&manifest, "entrypoint_test", &dylib, Some(&sum)).expect("write manifest");
+    ws.config(&format!("{BASE_CONFIG}  - path: {}\n", manifest.display()))
+        .expect("write config");
+    ws.write(
+        "app/BUILD",
+        concat!(
+            "target(name = \"wide\", driver = \"entrypoint_test.allot\", ",
+            "resources = {\"cpu\": 2, \"memory\": \"1G\"})\n",
+            "target(name = \"clamped\", driver = \"entrypoint_test.allot\", ",
+            "resources = {\"cpu\": 16})\n",
+        ),
+    )
+    .expect("write BUILD");
+
+    for (addr, want) in [
+        ("//app:wide", "cpu=2 memory=1073741824"),
+        ("//app:clamped", "cpu=2"),
+    ] {
+        let out = ws
+            .run(&dist, &["-j", "2", "run", addr, "--cat-out"])
+            .expect("run");
+        assert!(out.status.success(), "{addr}: {}", describe(&out));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(
+            stdout.trim(),
+            want,
+            "{addr}: the cdylib driver was not handed the run's allotment: {}",
+            describe(&out)
+        );
+    }
+}

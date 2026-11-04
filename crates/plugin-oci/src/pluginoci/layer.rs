@@ -105,6 +105,9 @@ struct OciLayerSpec {
     mode: Option<String>,
     /// Caching for the layer tar. Defaults to on for both tiers.
     cache: TargetSpecCache,
+    /// What the target reserves from the resource pools while it runs, e.g.
+    /// `{"cpu": 2}`. IO-bound: an undeclared `cpu` costs 0.1. Never hashed.
+    resources: hplugin::driver::Resources,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -367,6 +370,13 @@ impl ManagedDriver for Driver {
                 }],
                 cache: spec.cache.into(),
                 hash,
+                resources: spec
+                    .resources
+                    .advertise(
+                        hplugin::provider::PoolName::cpu(),
+                        hplugin::driver::Resources::IO_CPU,
+                    )
+                    .context("oci.layer resources")?,
                 ..Default::default()
             },
         })

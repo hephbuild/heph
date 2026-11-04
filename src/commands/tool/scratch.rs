@@ -129,18 +129,26 @@ impl ScratchArgs {
     /// and build nothing.
     pub fn execute(&self, sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
         match &self.command {
-            ScratchCommands::Ls => bootstrap::block_on(ls())?,
+            ScratchCommands::Ls => bootstrap::block_on(ls(global))?,
             ScratchCommands::Head { addr } => {
                 bootstrap::block_on(head(addr.clone(), sink, global.clone()))?
             }
-            ScratchCommands::Path { addr } => bootstrap::block_on(path(addr))?,
-            ScratchCommands::Rm { addr, all } => bootstrap::block_on(rm(addr.as_deref(), *all))?,
+            ScratchCommands::Path { addr } => bootstrap::block_on(path(addr, global))?,
+            ScratchCommands::Rm { addr, all } => {
+                bootstrap::block_on(rm(addr.as_deref(), *all, global))?
+            }
             ScratchCommands::Push {
                 addr,
                 all,
                 force,
                 producer,
-            } => bootstrap::block_on(push(addr.as_deref(), *all, *force, producer.clone()))?,
+            } => bootstrap::block_on(push(
+                addr.as_deref(),
+                *all,
+                *force,
+                producer.clone(),
+                global,
+            ))?,
             ScratchCommands::Pull { addr, all } => {
                 if *all == addr.is_some() {
                     anyhow::bail!("pass either an address or --all, not both or neither");
@@ -188,8 +196,8 @@ fn describe(slot: &SlotEntry) -> (String, String) {
     }
 }
 
-async fn ls() -> anyhow::Result<()> {
-    let (engine, _shutdown) = bootstrap::new_engine()?;
+async fn ls(global: &GlobalOptions) -> anyhow::Result<()> {
+    let (engine, _shutdown) = bootstrap::new_engine(global)?;
     let mut slots = engine.scratch_slots()?;
     if slots.is_empty() {
         println!("No scratch caches in this workspace.");
@@ -268,7 +276,7 @@ fn local_trace(
 }
 
 async fn head(addr: String, sink: LogSink, global: GlobalOptions) -> anyhow::Result<()> {
-    let (engine, shutdown) = bootstrap::new_engine()?;
+    let (engine, shutdown) = bootstrap::new_engine(&global)?;
     let label = format!("Resolving scratch {addr}");
     run_with_progress(
         label,
@@ -450,8 +458,8 @@ async fn head_trace(
     Ok(())
 }
 
-async fn path(addr: &str) -> anyhow::Result<()> {
-    let (engine, _shutdown) = bootstrap::new_engine()?;
+async fn path(addr: &str, global: &GlobalOptions) -> anyhow::Result<()> {
+    let (engine, _shutdown) = bootstrap::new_engine(global)?;
     let slots = engine.scratch_slots()?;
     let found = slots
         .iter()
@@ -470,11 +478,11 @@ async fn path(addr: &str) -> anyhow::Result<()> {
     }
 }
 
-async fn rm(addr: Option<&str>, all: bool) -> anyhow::Result<()> {
+async fn rm(addr: Option<&str>, all: bool, global: &GlobalOptions) -> anyhow::Result<()> {
     if all == addr.is_some() {
         anyhow::bail!("pass either an address or --all, not both or neither");
     }
-    let (engine, _shutdown) = bootstrap::new_engine()?;
+    let (engine, _shutdown) = bootstrap::new_engine(global)?;
     let (removed, freed) = engine.scratch_remove(addr)?;
     if removed == 0 {
         println!("Nothing to remove.");
@@ -511,8 +519,14 @@ fn select(
         .collect())
 }
 
-async fn push(addr: Option<&str>, all: bool, force: bool, producer: String) -> anyhow::Result<()> {
-    let (engine, _shutdown) = bootstrap::new_engine()?;
+async fn push(
+    addr: Option<&str>,
+    all: bool,
+    force: bool,
+    producer: String,
+    global: &GlobalOptions,
+) -> anyhow::Result<()> {
+    let (engine, _shutdown) = bootstrap::new_engine(global)?;
     let selected = select(engine.scratch_slots()?, addr, all)?;
     if selected.is_empty() {
         println!("Nothing to publish.");
@@ -601,7 +615,7 @@ async fn declared_scratches(
 
 /// The caller has checked that exactly one of `addr` and `--all` was given.
 async fn pull(addr: Option<String>, sink: LogSink, global: GlobalOptions) -> anyhow::Result<()> {
-    let (engine, shutdown) = bootstrap::new_engine()?;
+    let (engine, shutdown) = bootstrap::new_engine(&global)?;
     let label = match &addr {
         Some(a) => format!("Fetching scratch {a}"),
         None => "Fetching scratch caches".to_string(),

@@ -81,6 +81,197 @@ pub struct ConfigYaml {
     pub caches: BTreeMap<String, RemoteCacheConfigPatch>,
     #[serde(default)]
     pub telemetry: Option<TelemetryConfig>,
+    /// Resource pools, one entry per pool: `{unit: <count|cpu|bytes>, value:
+    /// <amount>}`, or the amount alone for `cpu` (CPUs, or `50%` of the
+    /// parallelism), `memory` (a size, or a percentage of the memory this
+    /// process may use) and a `count` pool (`docker: 2`). A pool with no value
+    /// is unbounded; `0` declares a pool whose capacity each run sets
+    /// (`--resource gpu=<n>` or `HEPH_RESOURCE_GPU=<n>`). A profile overrides
+    /// per pool; a pool's unit cannot change across profiles.
+    #[serde(default)]
+    pub resources: ResourcesConfig,
+}
+
+/// `resources:` in `.hephconfig`: pool name to its [`PoolDecl`], as written.
+///
+/// Names, units and the shape are checked while parsing; a value is checked
+/// against its unit there too when the file itself fixes the unit (a builtin,
+/// or `unit:` written), and always by [`resolve`](Self::resolve) once the
+/// profiles are merged, so a typo fails the config load rather than the first
+/// target that reaches the pool.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ResourcesConfig(pub BTreeMap<String, PoolDecl>);
+
+/// One pool of `resources:` as one file writes it.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PoolDecl {
+    /// `None`: not written here (the shorthand, or `{value: …}`).
+    pub unit: Option<hcore::capacity::Unit>,
+    /// The value as text, `None` when not written (an unbounded pool).
+    pub value: Option<String>,
+}
+
+impl ResourcesConfig {
+    /// Refuse `other` changing the unit of a pool `self` declares. A pool
+    /// `self` wrote without a unit has its default one (`slots: 2` is a
+    /// `count` pool), so a later `{unit: bytes}` changes it; a later value
+    /// without a unit keeps whatever `self` has.
+    pub fn check_merge(&self, other: &Self) -> anyhow::Result<()> {
+        for (name, decl) in &other.0 {
+            let base = self.0.get(name).map(|d| {
+                d.unit
+                    .unwrap_or_else(|| hcore::capacity::Unit::default_for(name))
+            });
+            if let (Some(a), Some(b)) = (base, decl.unit)
+                && a != b
+            {
+                anyhow::bail!(
+                    "resources.{name}: unit {b} here, but {a} in an earlier config file: a \
+                     pool's unit cannot change across profiles"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Lay `other` over `self` per pool and per field: a profile that sets
+    /// only `value` keeps the base's `unit`. Unit conflicts are
+    /// [`check_merge`](Self::check_merge)'s.
+    pub fn merge(&mut self, other: Self) {
+        for (name, decl) in other.0 {
+            let base = self.0.entry(name).or_default();
+            base.unit = decl.unit.or(base.unit);
+            if decl.value.is_some() {
+                base.value = decl.value;
+            }
+        }
+    }
+
+    /// Every pool with its unit and capacity: a missing unit is the pool's
+    /// default (a builtin's own, else `count`), each value parsed in it.
+    pub fn resolve(&self) -> anyhow::Result<BTreeMap<String, hcore::capacity::PoolSpec>> {
+        self.0
+            .iter()
+            .map(|(name, d)| {
+                let spec =
+                    hcore::capacity::PoolSpec::from_written(name, d.unit, d.value.as_deref())
+                        .with_context(|| format!("resources.{name}"))?;
+                Ok((name.clone(), spec))
+            })
+            .collect()
+    }
+}
+
+impl<'de> Deserialize<'de> for ResourcesConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = ResourcesConfig;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(
+                    "a map of pool name to declaration, e.g. {cpu: 8, memory: 24G, gpu: {unit: count, value: 2}}",
+                )
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                use serde::de::Error as _;
+                let mut out = BTreeMap::new();
+                while let Some(name) = map.next_key::<String>()? {
+                    if !hcore::capacity::is_pool_name(&name) {
+                        return Err(A::Error::custom(format!(
+                            "resources: {name:?} is not a valid pool name: a lowercase ASCII \
+                             letter followed by at most {} lowercase letters, digits or `_`",
+                            hcore::capacity::MAX_POOL_NAME_LEN - 1
+                        )));
+                    }
+                    let raw: PoolValue = map
+                        .next_value()
+                        .map_err(|e| A::Error::custom(format!("resources.{name}: {e}")))?;
+                    let decl = raw
+                        .into_decl(&name)
+                        .map_err(|e| A::Error::custom(format!("resources.{name}: {e:#}")))?;
+                    if out.insert(name.clone(), decl).is_some() {
+                        return Err(A::Error::custom(format!(
+                            "resources: pool {name} is given twice"
+                        )));
+                    }
+                }
+                Ok(ResourcesConfig(out))
+            }
+        }
+        d.deserialize_map(Visitor)
+    }
+}
+
+/// One pool as YAML spells it: the amount alone, or `{unit, value}`.
+#[derive(Deserialize)]
+#[serde(
+    untagged,
+    expecting = "an amount (2, 0.5, \"24G\", \"50%\") or {unit: <count|cpu|bytes>, value: <amount>}"
+)]
+enum PoolValue {
+    Scalar(Scalar),
+    Full(FullDecl),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FullDecl {
+    #[serde(default)]
+    unit: Option<String>,
+    #[serde(default)]
+    value: Option<Scalar>,
+}
+
+/// An amount as YAML spells it: an int, a decimal, or a string.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Scalar {
+    Int(u64),
+    Float(f64),
+    Text(String),
+}
+
+impl Scalar {
+    fn into_text(self) -> String {
+        match self {
+            Self::Int(n) => n.to_string(),
+            // `Display` for `f64` never uses an exponent.
+            Self::Float(f) => f.to_string(),
+            Self::Text(s) => s,
+        }
+    }
+}
+
+impl PoolValue {
+    fn into_decl(self, name: &str) -> anyhow::Result<PoolDecl> {
+        let (unit, value) = match self {
+            Self::Scalar(s) => (None, Some(s.into_text())),
+            Self::Full(FullDecl { unit, value }) => {
+                let unit = unit
+                    .map(|u| {
+                        hcore::capacity::Unit::from_name(&u).ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "unknown unit {u:?}: one of {}",
+                                hcore::capacity::Unit::ALL.map(|u| u.name()).join(", ")
+                            )
+                        })
+                    })
+                    .transpose()?;
+                (unit, value.map(Scalar::into_text))
+            }
+        };
+        // Checked now when this file fixes the unit; a shorthand custom pool's
+        // unit may come from another file, so `resolve` checks it.
+        if unit.is_some() || hcore::capacity::Unit::of_builtin(name).is_some() {
+            hcore::capacity::PoolSpec::from_written(name, unit, value.as_deref())?;
+        }
+        Ok(PoolDecl { unit, value })
+    }
 }
 
 /// One resolved named remote cache: `caches: { name: { uri, read, write } }`.
@@ -270,6 +461,14 @@ impl ConfigYaml {
     /// key (each cache's fields are patched individually, so a profile can flip
     /// `read`/`write` while inheriting the base `uri`), and `plugins` merge by
     /// identity (matching entry replaced, new ones appended in order).
+    /// [`merge`](Self::merge), refusing an overlay that changes a resource
+    /// pool's unit. What the profile loader uses.
+    pub fn try_merge(&mut self, other: ConfigYaml) -> anyhow::Result<()> {
+        self.resources.check_merge(&other.resources)?;
+        self.merge(other);
+        Ok(())
+    }
+
     pub fn merge(&mut self, other: ConfigYaml) {
         if other.version.is_some() {
             self.version = other.version;
@@ -307,6 +506,9 @@ impl ConfigYaml {
         for (name, patch) in other.caches {
             self.caches.entry(name).or_default().merge(patch);
         }
+        // Resources merge per pool and field: a profile that sets `cpu` keeps
+        // the base's other pools. Unit conflicts are refused by `try_merge`.
+        self.resources.merge(other.resources);
 
         merge_plugins(&mut self.plugins, other.plugins);
     }
@@ -649,7 +851,7 @@ pub fn load_from_root(root: &Path) -> anyhow::Result<ConfigYaml> {
 /// Core of [`load_from_root`], with the profile list passed in so it can be
 /// exercised without touching the process environment.
 fn load_with_profiles(root: &Path, profiles: &[impl AsRef<str>]) -> anyhow::Result<ConfigYaml> {
-    load_layered(root, profiles, ConfigYaml::merge)
+    load_layered(root, profiles, ConfigYaml::try_merge)
 }
 
 /// The version pin alone, parsed **leniently**: every other key — known,
@@ -711,7 +913,10 @@ impl VersionPin {
 /// use [`profiles_from_env`]) so the self-upgrade path that depends on it stays
 /// testable without touching the process environment.
 pub fn load_version_pin(root: &Path, profiles: &[impl AsRef<str>]) -> anyhow::Result<VersionPin> {
-    load_layered(root, profiles, VersionPin::merge)
+    load_layered(root, profiles, |pin, overlay| {
+        pin.merge(overlay);
+        Ok(())
+    })
 }
 
 /// The base-file + profile layering shared by the full config loader and the
@@ -721,7 +926,7 @@ pub fn load_version_pin(root: &Path, profiles: &[impl AsRef<str>]) -> anyhow::Re
 fn load_layered<T: serde::de::DeserializeOwned + Default>(
     root: &Path,
     profiles: &[impl AsRef<str>],
-    merge: fn(&mut T, T),
+    merge: fn(&mut T, T) -> anyhow::Result<()>,
 ) -> anyhow::Result<T> {
     let base_name = config_file_name_at(root);
     let mut cfg: T = load_file(&root.join(base_name))?;
@@ -733,7 +938,7 @@ fn load_layered<T: serde::de::DeserializeOwned + Default>(
         tracing::debug!(profile, file = %file_name, "applying config profile");
         let overlay: T = load_file(&root.join(&file_name))
             .with_context(|| format!("loading config profile {file_name}"))?;
-        merge(&mut cfg, overlay);
+        merge(&mut cfg, overlay).with_context(|| format!("applying config profile {file_name}"))?;
     }
     Ok(cfg)
 }
@@ -1616,5 +1821,233 @@ plugins:
         let err = serde_yaml::from_str::<ConfigYaml>("plugins:\n  - bogus: x\n")
             .expect_err("must reject");
         assert!(err.to_string().contains("bogus"), "{err}");
+    }
+
+    fn resources(yaml: &str) -> anyhow::Result<BTreeMap<String, hcore::capacity::PoolSpec>> {
+        serde_yaml::from_str::<ConfigYaml>(yaml)?
+            .resources
+            .resolve()
+    }
+
+    fn capacity(
+        r: &BTreeMap<String, hcore::capacity::PoolSpec>,
+        pool: &str,
+    ) -> Option<hcore::capacity::Capacity> {
+        r.get(pool).and_then(|s| s.capacity)
+    }
+
+    /// Every shape `resources:` takes: the shorthand, `{unit, value}`, a unit
+    /// alone (unbounded), and the refusals.
+    #[test]
+    fn resources_config_parse_table() {
+        use hcore::capacity::Capacity::Amount;
+        use hcore::capacity::Unit;
+        const CPU: u64 = hcore::capacity::MICROS_PER_CPU;
+        let ok: &[(&str, &str, Unit, Option<hcore::capacity::Capacity>)] = &[
+            // 0 is "this pool exists; the run sets it", for any pool.
+            ("resources: {cpu: 0}", "cpu", Unit::Cpu, Some(Amount(0))),
+            ("resources: {gpu: 0}", "gpu", Unit::Count, Some(Amount(0))),
+            (
+                "resources: {cpu: 8}",
+                "cpu",
+                Unit::Cpu,
+                Some(Amount(8 * CPU)),
+            ),
+            (
+                "resources: {cpu: 1.5}",
+                "cpu",
+                Unit::Cpu,
+                Some(Amount(CPU * 3 / 2)),
+            ),
+            (
+                "resources: {memory: 32G}",
+                "memory",
+                Unit::Bytes,
+                Some(Amount(32 << 30)),
+            ),
+            (
+                "resources: {memory: \"32G\"}",
+                "memory",
+                Unit::Bytes,
+                Some(Amount(32 << 30)),
+            ),
+            (
+                "resources: {memory: 4096}",
+                "memory",
+                Unit::Bytes,
+                Some(Amount(4096)),
+            ),
+            ("resources: {gpu: 2}", "gpu", Unit::Count, Some(Amount(2))),
+            // The full form, in any unit for a custom pool.
+            (
+                "resources: {gpu: {unit: count, value: 2}}",
+                "gpu",
+                Unit::Count,
+                Some(Amount(2)),
+            ),
+            (
+                "resources: {vram: {unit: bytes, value: 24G}}",
+                "vram",
+                Unit::Bytes,
+                Some(Amount(24 << 30)),
+            ),
+            (
+                "resources: {slots: {unit: cpu, value: 0.5}}",
+                "slots",
+                Unit::Cpu,
+                Some(Amount(CPU / 2)),
+            ),
+            (
+                "resources: {cpu: {unit: cpu, value: 4}}",
+                "cpu",
+                Unit::Cpu,
+                Some(Amount(4 * CPU)),
+            ),
+            (
+                "resources: {gpu: {value: 3}}",
+                "gpu",
+                Unit::Count,
+                Some(Amount(3)),
+            ),
+            // No value: unbounded.
+            ("resources: {gpu: {unit: count}}", "gpu", Unit::Count, None),
+            (
+                "resources: {vram: {unit: bytes}}",
+                "vram",
+                Unit::Bytes,
+                None,
+            ),
+            ("resources: {gpu: {}}", "gpu", Unit::Count, None),
+        ];
+        for (yaml, pool, unit, want) in ok {
+            let got = resources(yaml).unwrap_or_else(|e| panic!("{yaml}: {e:#}"));
+            let spec = got
+                .get(*pool)
+                .unwrap_or_else(|| panic!("{yaml}: no {pool}"));
+            assert_eq!((spec.unit, spec.capacity), (*unit, *want), "{yaml}");
+        }
+        assert!(resources("homeDir: .h\n").unwrap().is_empty());
+
+        let err: &[(&str, &str)] = &[
+            ("resources: {cpu: all}", "cpu"),
+            ("resources: {cpu: -1}", "cpu"),
+            ("resources: {gpu: -1}", "gpu"),
+            ("resources: {gpu: 1.5}", "gpu"),
+            ("resources: {cpu: true}", "cpu"),
+            ("resources: {memory: \"4 G\"}", "memory"),
+            ("resources: {cpu: 1, cpu: 2}", "twice"),
+            ("resources:\n  cpu: 1\n  cpu: 2\n", "cpu"),
+            ("resources: {Cpu: 1}", "pool name"),
+            ("resources: {\"gpu \": 1}", "pool name"),
+            ("resources: [cpu]", "map"),
+            ("resources: {gpu: {unit: gpus, value: 1}}", "unknown unit"),
+            ("resources: {gpu: {unit: count, value: 24G}}", "gpu"),
+            ("resources: {gpu: {unit: count, valu: 1}}", "gpu"),
+            ("resources: {cpu: {unit: count, value: 2}}", "builtin"),
+            ("resources: {memory: {unit: cpu}}", "builtin"),
+        ];
+        for (yaml, needle) in err {
+            let e = resources(yaml).expect_err(yaml);
+            assert!(format!("{e:#}").contains(needle), "{yaml}: {e:#}");
+        }
+    }
+
+    #[test]
+    fn resources_merge_per_pool_across_profiles() {
+        use hcore::capacity::Capacity::Amount;
+        use hcore::capacity::Unit;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(
+            root.join(".hephconfig"),
+            "resources:\n  cpu: 8\n  memory: 24G\n  docker: 2\n  slots: {unit: cpu, value: 2}\n",
+        )
+        .expect("write base");
+        // A profile's shorthand value keeps the base's unit.
+        std::fs::write(
+            root.join("ci.hephconfig"),
+            "resources:\n  cpu: 4\n  slots: 0.5\n",
+        )
+        .expect("write ci");
+
+        let cfg = load_with_profiles(root, &["ci"]).expect("load");
+        let r = cfg.resources.resolve().expect("resolve");
+        assert_eq!(
+            capacity(&r, "cpu"),
+            Some(Amount(4 * hcore::capacity::MICROS_PER_CPU))
+        );
+        assert_eq!(capacity(&r, "memory"), Some(Amount(24 << 30)));
+        assert_eq!(capacity(&r, "docker"), Some(Amount(2)));
+        let slots = r.get("slots").expect("slots");
+        assert_eq!(slots.unit, Unit::Cpu);
+        assert_eq!(slots.capacity, Some(Amount(500_000)));
+    }
+
+    /// A pool's unit is fixed by the first file that writes it, a default
+    /// unit included: `slots: 2` is a `count` pool, as if written.
+    #[test]
+    fn resources_unit_cannot_change_across_profiles() {
+        // (base, profile, refused)
+        let rows: &[(&str, &str, bool)] = &[
+            (
+                "slots: {unit: cpu, value: 2}",
+                "slots: {unit: count, value: 2}",
+                true,
+            ),
+            ("slots: 2", "slots: {unit: bytes}", true),
+            ("slots: {value: 2}", "slots: {unit: cpu, value: 1}", true),
+            ("memory: 8G", "memory: {unit: bytes, value: 4G}", false),
+            ("slots: 2", "slots: {unit: count, value: 3}", false),
+            ("slots: {unit: bytes, value: 2G}", "slots: 4G", false),
+        ];
+        for (base, profile, refused) in rows {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let root = dir.path();
+            std::fs::write(root.join(".hephconfig"), format!("resources:\n  {base}\n"))
+                .expect("write base");
+            std::fs::write(
+                root.join("ci.hephconfig"),
+                format!("resources:\n  {profile}\n"),
+            )
+            .expect("write ci");
+            let got = load_with_profiles(root, &["ci"]);
+            if *refused {
+                let msg = format!("{:#}", got.expect_err(profile));
+                assert!(msg.contains("cannot change"), "{base} + {profile}: {msg}");
+            } else {
+                let cfg = got.unwrap_or_else(|e| panic!("{base} + {profile}: {e:#}"));
+                cfg.resources
+                    .resolve()
+                    .unwrap_or_else(|e| panic!("{base} + {profile}: {e:#}"));
+            }
+        }
+    }
+
+    /// The config half of `percent_capacity_parse_table` (the CLI half is in
+    /// `src/commands/global.rs`; both go through `hcore::capacity`).
+    #[test]
+    fn percent_capacity_parse_table() {
+        use hcore::capacity::Capacity::Percent;
+        let r = resources("resources: {cpu: 50%, memory: 75%}").expect("parse");
+        assert_eq!(capacity(&r, "cpu"), Some(Percent(50)));
+        assert_eq!(capacity(&r, "memory"), Some(Percent(75)));
+        assert_eq!(
+            capacity(
+                &resources("resources: {cpu: 150%}").expect("overcommit"),
+                "cpu"
+            ),
+            Some(Percent(150))
+        );
+        for bad in [
+            "resources: {cpu: 0%}",
+            "resources: {cpu: -50%}",
+            "resources: {cpu: \"50 %\"}",
+            "resources: {cpu: \"%\"}",
+            "resources: {cpu: 50%%}",
+            "resources: {gpu: 50%}",
+            "resources: {vram: {unit: bytes, value: 50%}}",
+        ] {
+            resources(bad).expect_err(bad);
+        }
     }
 }

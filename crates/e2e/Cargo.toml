@@ -33,6 +33,9 @@ hplugin-go = { package = "plugin-go", path = "../plugin-go" }
 hcore = { package = "core", path = "../core" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] }
 futures = "0.3"
+# `resources::clamp_is_logged_once_per_addr_per_request` captures the engine's
+# `info` line with a thread-local subscriber.
+tracing-subscriber = "0.3"
 anyhow = "1"
 tempfile = "3"
 libc = "0.2"

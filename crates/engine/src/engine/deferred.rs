@@ -84,6 +84,14 @@ pub use hcore::template::READ_KIND as READ;
 /// it landed — under FUSE the sandbox root is redirected after the host set it.
 pub use hcore::template::SRC_KIND as SRC;
 
+/// A share of the run's *allotment* (`${resource:cpu}`, `${resource:memory}`).
+///
+/// Names no producer, so it adds no edge and nothing to `hashin`: the def hash
+/// covers the reference text and never the number, which is what lets an
+/// artifact built under one allotment serve a run under another. Substituted at
+/// run from the allotment of the run that reads it.
+pub use hcore::template::RESOURCE_KIND as RESOURCE;
+
 /// The largest a deferred value may be.
 ///
 /// A value is one line — a role ARN, an image tag, a registry host. The cap is
@@ -236,6 +244,7 @@ fn parse_refs(s: &str, pkg: &PkgBuf, path: &str) -> anyhow::Result<Option<Deferr
         return Ok(None);
     }
     let mut producers = Vec::new();
+    let mut names_resource = false;
     for piece in hcore::template::parse(s).with_context(|| format!("in `{path}`"))? {
         let hcore::template::Piece::Ref(r) = piece else {
             continue;
@@ -248,6 +257,15 @@ fn parse_refs(s: &str, pkg: &PkgBuf, path: &str) -> anyhow::Result<Option<Deferr
         }
         let kind = match r.kind {
             Some(SRC) => SRC,
+            // The run's allotment: no producer, so no edge. Accepted in every
+            // deferrable field; whether it names a pool the target reserves is
+            // checked at link against the engine's pools
+            // (`validate_resource_refs`), and a name that is no pool is left
+            // as written at run.
+            Some(RESOURCE) => {
+                names_resource = true;
+                continue;
+            }
             _ => READ,
         };
         // `TargetAddr::parse`, not a bare address parse: `|group` and `[filters]`
@@ -261,7 +279,7 @@ fn parse_refs(s: &str, pkg: &PkgBuf, path: &str) -> anyhow::Result<Option<Deferr
         })?;
         producers.push(Producer { kind, addr });
     }
-    if producers.is_empty() {
+    if producers.is_empty() && !names_resource {
         return Ok(None);
     }
     Ok(Some(DeferredRef {
@@ -391,16 +409,48 @@ impl Engine {
     /// Runs inside `execute`, so a cache hit resolves nothing — and the producers
     /// have already been built, because they are `hashed` inputs that `hashin`
     /// waited on. What is left here is reading bytes.
+    ///
+    /// [`read_deferred`](Self::read_deferred) then [`render_deferred`], for a
+    /// caller that has its allotment before it reads.
     pub(crate) async fn resolve_deferred(
         self: &Arc<Self>,
         rs: &Arc<RequestState>,
         def: &TargetDef,
         refs: &[DeferredRef],
+        allotment: Option<&hplugin::driver::Allotment>,
     ) -> anyhow::Result<BTreeMap<String, DeferredValue>> {
+        let by_addr = self.read_deferred(rs, def, refs).await?;
+        Self::render_deferred(def, refs, &by_addr, allotment)
+    }
+
+    /// The bytes every `${read://…}` on a def names, keyed by address.
+    ///
+    /// The half of resolution that reads producers, and so the half `execute`
+    /// runs *before* admission: nothing is reserved while a value is read.
+    pub(crate) async fn read_deferred(
+        self: &Arc<Self>,
+        rs: &Arc<RequestState>,
+        def: &TargetDef,
+        refs: &[DeferredRef],
+    ) -> anyhow::Result<BTreeMap<String, String>> {
         if refs.is_empty() {
             return Ok(BTreeMap::new());
         }
-        let by_addr = self.deferred_values(rs, refs, &def.addr).await?;
+        self.deferred_values(rs, refs, &def.addr).await
+    }
+
+    /// Every reference on a def substituted, ready for `RunRequest.deferred`.
+    ///
+    /// The half of resolution that needs the run's allotment, so `execute`
+    /// calls it once the reservation is in hand. One pass per field over the
+    /// author's text: a field mixing `${read://…}` and `${resource:…}` is
+    /// substituted at once, and a producer's bytes are never re-scanned.
+    pub(crate) fn render_deferred(
+        def: &TargetDef,
+        refs: &[DeferredRef],
+        by_addr: &BTreeMap<String, String>,
+        allotment: Option<&hplugin::driver::Allotment>,
+    ) -> anyhow::Result<BTreeMap<String, DeferredValue>> {
         let mut values: BTreeMap<String, DeferredValue> = BTreeMap::new();
         for r in refs {
             // A field naming a `${src://…}` cannot be finished here: the path
@@ -443,7 +493,11 @@ impl Engine {
             //
             // Single-pass, over pieces of the *input*, so a producer whose output
             // contains `${` is never re-interpreted.
-            let rendered = hcore::template::substitute(&r.raw, &[READ], |t| {
+            let rendered = hcore::template::substitute(&r.raw, &[READ, RESOURCE], |t| {
+                if t.kind == Some(RESOURCE) {
+                    return hplugin::driver::Allotment::reference(allotment, t, &def.addr)
+                        .with_context(|| format!("`{}` in `{}`", r.raw, r.path));
+                }
                 let addr = TargetAddr::parse(t.arg, &def.addr.package)?;
                 by_addr
                     .get(&addr.to_string())
@@ -934,5 +988,151 @@ mod tests {
         }
         let paths: Vec<&str> = first.iter().map(|r| r.path.as_str()).collect();
         assert_eq!(paths, vec!["a", "m", "z"]);
+    }
+
+    /// `{field: {"X": v}}` — one value of an env-shaped map.
+    fn env_cfg(field: &str, v: &str) -> HashMap<String, Value> {
+        cfg(&[(field, Value::Map(HashMap::from([("X".to_string(), s(v))])))])
+    }
+
+    /// `${resource:<pool name>}` is collected (so the link check and the run see
+    /// it) but names no producer, so it adds no edge; an argument that is not a
+    /// well-formed pool name is somebody else's text, collected as nothing.
+    #[test]
+    fn a_resource_reference_is_collected_without_an_edge() {
+        let refs = collect(&env_cfg("env", "-j${resource:cpu}"), &pkg()).expect("collect");
+        assert_eq!(refs.len(), 1);
+        assert!(refs[0].producers.is_empty());
+        assert!(inputs_for(&refs).is_empty(), "no producer, no edge");
+        assert!(!refs[0].needs_sandbox());
+
+        // Two in one value, and beside a `read`: one field, one edge.
+        let refs = collect(
+            &env_cfg(
+                "runtime_env",
+                "${resource:cpu}/${resource:memory}@${read://infra:x}",
+            ),
+            &pkg(),
+        )
+        .expect("collect");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].producers.len(), 1);
+        assert_eq!(inputs_for(&refs).len(), 1);
+
+        // Any well-formed pool name is claimed, known to the engine or not:
+        // which ones are pools is the engine's, checked at link.
+        for claimed in ["${resource:cpus}", "${resource:nope}", "${resource:gpu}"] {
+            let refs = collect(&env_cfg("env", claimed), &pkg()).expect(claimed);
+            assert_eq!(refs.len(), 1, "{claimed}");
+            assert!(refs[0].producers.is_empty(), "{claimed}");
+        }
+        for other in [
+            "${resource:}",
+            "${resource:CPU}",
+            "${resource:cpu:-1}",
+            "${resource:-x}",
+            "${resource://cpu}",
+            "${resource:ćpu}",
+            "${resources:cpu}",
+            "${resource}",
+            "$${resource:cpu}",
+        ] {
+            assert!(
+                collect(&env_cfg("env", other), &pkg())
+                    .expect("passes through")
+                    .is_empty(),
+                "{other}"
+            );
+            assert!(
+                collect(&cfg(&[("vars", s(other))]), &pkg())
+                    .expect("passes through")
+                    .is_empty(),
+                "{other}"
+            );
+        }
+        // Unterminated and nested fail in the tokenizer, naming the field.
+        for broken in ["-j${resource:cpu", "${X:-${resource:cpu}}"] {
+            let err = collect(&env_cfg("env", broken), &pkg()).expect_err(broken);
+            assert!(format!("{err:#}").contains("`env.X`"), "{err:#}");
+        }
+    }
+
+    /// `${resource:…}` is accepted in every deferrable field, not only the env
+    /// maps: the engine gates nothing by field name.
+    #[test]
+    fn a_resource_reference_is_collected_in_any_field() {
+        for (field, v) in [
+            (
+                "vars",
+                Value::Map(HashMap::from([("N".to_string(), s("${resource:cpu}"))])),
+            ),
+            ("dest", s("reg/x:${resource:memory}")),
+            ("run", Value::List(vec![s("make -j${resource:cpu}")])),
+            ("env", s("${resource:cpu}")),
+            (
+                "sources",
+                Value::List(vec![Value::Map(HashMap::from([(
+                    "present".to_string(),
+                    Value::Map(HashMap::from([(
+                        "env".to_string(),
+                        Value::Map(HashMap::from([("N".to_string(), s("${resource:cpu}"))])),
+                    )])),
+                )]))]),
+            ),
+        ] {
+            let refs = collect(&cfg(&[(field, v)]), &pkg()).expect(field);
+            assert_eq!(refs.len(), 1, "{field}");
+            assert!(refs[0].producers.is_empty(), "{field}: no edge");
+        }
+    }
+
+    #[test]
+    fn a_resource_reference_renders_from_the_allotment() {
+        use hplugin::driver::Allotment;
+        let def = TargetDef {
+            addr: hmodel::htaddr::parse_addr("//auth:t").expect("addr"),
+            ..Default::default()
+        };
+        let refs = collect(
+            &cfg(&[(
+                "env",
+                Value::Map(HashMap::from([
+                    ("a".to_string(), s("-j${resource:cpu} ${FOO:-d} $$")),
+                    ("b".to_string(), s("${read://infra:x}:${resource:cpu}")),
+                    ("m".to_string(), s("${resource:memory}")),
+                ])),
+            )]),
+            &pkg(),
+        )
+        .expect("collect");
+        let by_addr = BTreeMap::from([("//infra:x".to_string(), "${resource:cpu}".to_string())]);
+        let three = Allotment::new([
+            ("cpu".to_string(), "3".to_string()),
+            ("memory".to_string(), "4096".to_string()),
+        ]);
+        let out = Engine::render_deferred(&def, &refs, &by_addr, Some(&three)).expect("render");
+        let ready = |k: &str| match out.get(k) {
+            Some(DeferredValue::Ready(v)) => v.clone(),
+            other => panic!("{k}: {other:?}"),
+        };
+        assert_eq!(ready("-j${resource:cpu} ${FOO:-d} $$"), "-j3 ${FOO:-d} $$");
+        // Single pass: a producer whose bytes look like a reference stays text.
+        assert_eq!(
+            ready("${read://infra:x}:${resource:cpu}"),
+            "${resource:cpu}:3"
+        );
+        assert_eq!(ready("${resource:memory}"), "4096");
+
+        // A pool the run was granted none of is left as written (the link
+        // check refuses it for a known pool before any run).
+        let no_mem = Allotment::new([("cpu".to_string(), "1".to_string())]);
+        let out = Engine::render_deferred(&def, &refs, &by_addr, Some(&no_mem)).expect("render");
+        assert!(
+            matches!(out.get("${resource:memory}"), Some(DeferredValue::Ready(v)) if v == "${resource:memory}")
+        );
+
+        // No allotment at all: heph's bug, said so.
+        let err = Engine::render_deferred(&def, &refs, &by_addr, None).expect_err("no allotment");
+        assert!(format!("{err:#}").contains("bug in heph"), "{err:#}");
     }
 }

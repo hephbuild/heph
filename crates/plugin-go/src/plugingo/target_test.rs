@@ -32,6 +32,14 @@ pub struct TestEnv {
     /// mechanism. It is a hashed dependency there, so changing the environment
     /// re-keys the test.
     pub runner: Option<String>,
+    /// What the run target reserves from the engine's pools, as the
+    /// `resources` value of `target()`: the applicable states merged per pool,
+    /// shallow to deep. Raw here; the provider checks its shape with
+    /// [`hplugin::driver::Resources::from_value`] against the run target's
+    /// addr before it reaches a spec, and exec's `parse` moves it onto the def,
+    /// where no hash sees it. Only the run targets carry it: compiles, links and
+    /// `build_test` keep the default.
+    pub resources: Option<Value>,
 }
 
 /// Shared `go_compile` builder for the test/xtest/testmain lib compiles.
@@ -346,6 +354,12 @@ pub fn test_spec(
     // test target in every workspace, for a feature nobody enabled.
     if let Some(runner) = &test_env.runner {
         config.insert("runner".to_string(), Value::String(runner.clone()));
+    }
+    if let Some(resources) = &test_env.resources {
+        config.insert(
+            hplugin::driver::Resources::CONFIG_KEY.to_string(),
+            resources.clone(),
+        );
     }
 
     // A race target deliberately does NOT carry the generic `test`/`go-test`
@@ -886,6 +900,7 @@ mod tests {
             pass_env: vec!["HOME".to_string()],
             runtime_pass_env: vec!["PATH".to_string()],
             pre_run: Vec::new(),
+            resources: None,
         };
         let spec = test_spec(
             mk_addr("mypkg", "test"),

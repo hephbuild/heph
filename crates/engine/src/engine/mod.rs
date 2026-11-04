@@ -105,12 +105,12 @@ mod link;
 mod matcher_spec;
 pub mod matcher_target;
 mod meta;
+pub mod resource_pool;
 pub mod sandbox_cleaner;
 pub mod scratch;
 pub mod scratch_remote;
 pub mod scratch_store;
 pub mod validate;
-pub mod worker_pool;
 
 /// Shared runtime for sync tests that construct an [`Engine`]: `Engine::new`
 /// captures the ambient tokio runtime for its request memoizers, so a plain

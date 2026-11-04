@@ -95,8 +95,10 @@ impl Engine {
         // reading their bytes. Inside `execute`, so a cache hit resolves nothing.
         hcore::hmemoizer::set_phase("execute:deferred_resolve");
         let deferred_refs = self.deferred_refs(spec, &spec.driver)?;
-        let deferred = self
-            .resolve_deferred(&rs, &def.target, &deferred_refs)
+        // Read now, substituted after admission: `${resource:…}` is this run's
+        // allotment, which exists only once the reservation does.
+        let deferred_reads = self
+            .read_deferred(&rs, &def.target, &deferred_refs)
             .await
             .with_context(|| format!("resolve deferred values for {addr}"))?;
 
@@ -121,23 +123,25 @@ impl Engine {
             )
             .await?;
 
-        // Acquire semaphore AFTER dep resolution so no permit is held while waiting for
-        // deps — prevents the classic diamond deadlock where mid-nodes hold permits while
-        // waiting for a leaf that also needs a permit.
+        // Admission AFTER dep resolution so nothing is reserved while waiting for
+        // deps — prevents the classic diamond deadlock where mid-nodes hold
+        // capacity while waiting for a leaf that also needs some.
         hcore::hmemoizer::set_phase("execute:semaphore_acquire");
-        let pool = Arc::clone(&self.result_permits);
-        // Observed *before* the acquire, so the stamp times the wait rather than
-        // its end. This queue is invisible everywhere else: the permit is taken
-        // after dep resolution but before `ExecuteStart`, so a target parked here
-        // has no open `execute` span and shows only as an open `result`.
-        let d = crate::engine::diag::global();
-        d.limiter("workers").observe(pool.available(), d.now_ms());
-        // Fair queue — see `worker_pool`'s module docs for the contract: a
-        // waiter dropped mid-wait leaves the queue, and a permit assigned to
-        // a since-aborted waiter returns on its `Acquire` drop.
-        let _permit = pool.acquire().await.context("worker pool closed")?;
-        // Counted once the permit is actually in hand.
+        let admit_started = std::time::Instant::now();
+        let reservation = self.admit(&rs, addr, &def.target.demand).await?;
+        // On `ExecuteStart`, so a wait under the notice threshold (which
+        // announces nothing) is still answerable from the stream.
+        let queued_ms = u64::try_from(admit_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        // Counted once the reservation is actually in hand.
         let _running = crate::engine::diag::RunningPermit::new();
+        let allotment = allotment_of(&reservation, |pool| self.pools.unit(pool));
+        let deferred = Self::render_deferred(
+            &def.target,
+            &deferred_refs,
+            &deferred_reads,
+            Some(&allotment),
+        )
+        .with_context(|| format!("resolve deferred values for {addr}"))?;
 
         let addr_str = addr.format();
         // Telemetry: per-target execute wall time. This path runs only on a real
@@ -145,11 +149,14 @@ impl Engine {
         let exec_started = std::time::Instant::now();
         let res = crate::engine::event::emit_scope(
             &rs,
-            crate::engine::event::BuildEventKind::ExecuteStart {
-                addr: addr_str.clone(),
-                driver: driver.name.clone(),
-                cache: def.target.cache.enabled,
-            },
+            execute_start(
+                addr_str.clone(),
+                driver.name.clone(),
+                def.target.cache.enabled,
+                &def.target.demand,
+                &reservation,
+                queued_ms,
+            ),
             move |error| crate::engine::event::BuildEventKind::ExecuteEnd {
                 addr: addr_str,
                 error: error.map(crate::engine::event::ErrorDetail::into_message),
@@ -215,6 +222,7 @@ impl Engine {
                             wrapper: exec_wrapper,
                             shell,
                             options: crate::engine::driver::RunOptions::default(),
+                            allotment: Some(allotment),
                         },
                     )
                     .await
@@ -295,6 +303,7 @@ impl Engine {
             wrapper,
             shell,
             options,
+            allotment,
         } = run;
         // N6/N9: only an entrypoint's run is ever sent anything but the
         // default options, whichever path assembled them.
@@ -349,6 +358,7 @@ impl Engine {
                     req.credentials = credential_mounts;
                     req.deferred = deferred;
                     req.options = options;
+                    req.allotment = allotment;
                     // A plain driver spawns straight from `run`; a managed
                     // one materializes first and its layer fires it.
                     if !driver.managed {
@@ -416,6 +426,78 @@ impl Engine {
 
         let results = crate::engine::fanout::join_all_failable(futs, fail_fast).await?;
         Ok(results.into_iter().flatten().collect())
+    }
+
+    /// Reserve what `addr` declares (`resources`; an undeclared `cpu` is one
+    /// CPU) from the engine's pools, parking in FIFO order until it fits; a
+    /// request needing nothing of a bounded pool is granted at once. A pool whose capacity is 0 fails
+    /// the target here, before it runs, naming the override that would set it.
+    ///
+    /// The reservation is held until the run ends and returns itself on drop;
+    /// dropping this future mid-wait leaves the queue (`resource_pool`'s module
+    /// docs give the contract).
+    ///
+    /// A wait that outlasts the notice threshold (`admission_notice`, the
+    /// result lock's) is announced as `AdmissionWaitStart`, paired with
+    /// `AdmissionWaitEnd` on grant or cancellation, the way
+    /// `acquire_with_notice` announces a lock wait. A grant within the
+    /// threshold announces nothing.
+    pub(crate) async fn admit(
+        &self,
+        rs: &Arc<RequestState>,
+        addr: &Addr,
+        resources: &hplugin::driver::Demand,
+    ) -> anyhow::Result<crate::engine::resource_pool::Reservation> {
+        let pool = self.pools.get();
+        // Observed *before* the acquire, so the stamp times the wait rather than
+        // its end. This queue is invisible everywhere else: admission happens
+        // after dep resolution but before `ExecuteStart`, so a target parked
+        // here has no open `execute` span and shows only as an open `result`.
+        let d = crate::engine::diag::global();
+        d.limiter("workers").observe(
+            crate::engine::engine::cpu_free_cpus(&self.pools),
+            d.now_ms(),
+        );
+        let acquire = pool
+            .acquire(resources)
+            .map_err(|err| anyhow::anyhow!("{addr} {err}"))?;
+        tokio::pin!(acquire);
+        let granted: anyhow::Result<_> =
+            match tokio::time::timeout(self.admission_notice, &mut acquire).await {
+                Ok(granted) => granted.map_err(Into::into),
+                Err(_elapsed) => match acquire.wait_info() {
+                    // Granted between the timeout and here: nothing to announce.
+                    None => (&mut acquire).await.map_err(Into::into),
+                    Some(info) => {
+                        let addr_str = addr.format();
+                        crate::engine::event::emit_scope(
+                            rs,
+                            admission_wait_start(addr_str.clone(), &info),
+                            move |_| crate::engine::event::BuildEventKind::AdmissionWaitEnd {
+                                addr: addr_str,
+                            },
+                            async { (&mut acquire).await.map_err(Into::into) },
+                        )
+                        .await
+                    }
+                },
+            };
+        let reservation = granted.with_context(|| format!("admitting {addr}"))?;
+        tracing::debug!(
+            addr = %addr,
+            granted = ?reservation.iter().collect::<Vec<_>>(),
+            "admitted"
+        );
+        // Once per addr per request: `execute` is memoised per addr.
+        if reservation.clamped() {
+            tracing::info!(
+                addr = %addr,
+                declared = ?resources,
+                granted = ?reservation.iter().collect::<Vec<_>>(),
+                "reservation clamped to the pool's capacity; the target runs alone in it"
+            );
+        }
+        Ok(reservation)
     }
 }
 
@@ -495,6 +577,113 @@ pub(crate) struct SandboxRun {
     pub wrapper: Option<InteractiveWrapper>,
     pub shell: bool,
     pub options: crate::engine::driver::RunOptions,
+    /// What the run is told it may use (`RunRequest.allotment`): a build's
+    /// reservation, an invocation's full cpu capacity.
+    pub allotment: Option<hplugin::driver::Allotment>,
+}
+
+/// The `AdmissionWaitStart` event for a queued request: the first pool it does
+/// not fit in, or — fitting everywhere but queued behind others — the first it
+/// needs.
+fn admission_wait_start(
+    addr: String,
+    info: &crate::engine::resource_pool::WaitInfo,
+) -> crate::engine::event::BuildEventKind {
+    // An unbounded pool (`free: None`) never holds a request back, so it is
+    // named only when every pool the request needs is unbounded.
+    let pool = info
+        .pools
+        .iter()
+        .find(|p| p.free.is_some_and(|f| p.need > f))
+        .or_else(|| info.pools.iter().find(|p| p.free.is_some()))
+        .or_else(|| info.pools.first());
+    crate::engine::event::BuildEventKind::AdmissionWaitStart {
+        addr,
+        pool: pool.map_or_else(String::new, |p| p.pool.as_str().to_owned()),
+        need: pool.map_or(0, |p| p.need),
+        free: pool.map_or(0, |p| p.free.unwrap_or(u64::MAX)),
+        ahead: u64::try_from(info.ahead).unwrap_or(u64::MAX),
+    }
+}
+
+/// What a run is told of its reservation: `cpu` always, in whole CPUs
+/// (rounded up, at least 1, so a zero-cost grant is told 1), and every other
+/// pool it was granted more than 0 of, each rendered by its pool's unit
+/// (`unit_of`, the engine's pools).
+pub(crate) fn allotment_of(
+    reservation: &crate::engine::resource_pool::Reservation,
+    unit_of: impl Fn(&str) -> Option<hcore::capacity::Unit>,
+) -> hplugin::driver::Allotment {
+    use hcore::capacity::Unit;
+    use hplugin::provider::PoolName;
+    let cpu = (
+        PoolName::CPU.to_owned(),
+        Unit::Cpu.render(reservation.amount(PoolName::CPU).max(1)),
+    );
+    let rest = reservation
+        .iter()
+        .filter(|(p, n)| p.as_str() != PoolName::CPU && *n > 0)
+        .map(|(p, n)| {
+            let unit = unit_of(p.as_str()).unwrap_or_else(|| Unit::default_for(p.as_str()));
+            (p.as_str().to_owned(), unit.render(n))
+        });
+    hplugin::driver::Allotment::new(std::iter::once(cpu).chain(rest))
+}
+
+/// What an entrypoint run is told, having reserved nothing: `cpu` is the
+/// whole `cpu_capacity` (in whole CPUs, at least 1), and every other pool its
+/// declared amount when above 0, rendered by the pool's unit.
+pub(crate) fn entrypoint_allotment(
+    cpu_capacity: u64,
+    demand: &hplugin::driver::Demand,
+    unit_of: impl Fn(&str) -> Option<hcore::capacity::Unit>,
+) -> hplugin::driver::Allotment {
+    use hcore::capacity::Unit;
+    use hplugin::provider::PoolName;
+    let cpu = (
+        PoolName::CPU.to_owned(),
+        Unit::Cpu.render(cpu_capacity.max(1)),
+    );
+    let rest = demand
+        .iter()
+        .filter(|(p, n)| p.as_str() != PoolName::CPU && *n > 0)
+        .map(|(p, n)| {
+            let unit = unit_of(p.as_str()).unwrap_or_else(|| Unit::default_for(p.as_str()));
+            (p.as_str().to_owned(), unit.render(n))
+        });
+    hplugin::driver::Allotment::new(std::iter::once(cpu).chain(rest))
+}
+
+/// The `ExecuteStart` event: what the target declared (only its declared
+/// keys, in each pool's unit's base) and what it was granted, after
+/// clamping, and how long admission took. `reserved` always carries `cpu`, 0
+/// on a zero-cost grant.
+pub(crate) fn execute_start(
+    addr: String,
+    driver: String,
+    cache: bool,
+    declared: &hplugin::driver::Demand,
+    reservation: &crate::engine::resource_pool::Reservation,
+    queued_ms: u64,
+) -> crate::engine::event::BuildEventKind {
+    use hplugin::provider::PoolName;
+    let declared = declared
+        .iter()
+        .map(|(p, n)| (p.as_str().to_owned(), n))
+        .collect();
+    let mut reserved: std::collections::BTreeMap<String, u64> = reservation
+        .iter()
+        .map(|(p, n)| (p.as_str().to_owned(), n))
+        .collect();
+    reserved.entry(PoolName::CPU.to_owned()).or_insert(0);
+    crate::engine::event::BuildEventKind::ExecuteStart {
+        addr,
+        driver,
+        cache,
+        declared: Some(declared),
+        reserved: Some(reserved),
+        queued_ms: Some(queued_ms),
+    }
 }
 
 /// Run a synchronous `std::fs` operation through `hcore::blocking::run`.
@@ -508,4 +697,130 @@ where
     T: Send + 'static,
 {
     hcore::blocking::run(f).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::event::BuildEventKind;
+    use crate::engine::resource_pool::Limit;
+    use crate::engine::resource_pool::ResourcePool;
+    use futures::FutureExt as _;
+    use hcore::capacity::Unit;
+    use hplugin::driver::{Demand, Resources};
+    use hplugin::provider::PoolName;
+
+    const CPU: u64 = Resources::MICROS_PER_CPU;
+
+    fn req(pairs: &[(&str, u64)]) -> Demand {
+        Demand::try_from_pairs(pairs.iter().map(|&(n, a)| (n.to_string(), a))).expect("demand")
+    }
+
+    fn grant(caps: &[(&str, Limit)], r: &Demand) -> crate::engine::resource_pool::Reservation {
+        ResourcePool::new(
+            caps.iter()
+                .map(|&(n, c)| (PoolName::try_from(n).expect("pool"), c)),
+        )
+        .acquire(r)
+        .expect("acquire")
+        .now_or_never()
+        .expect("granted at once")
+        .expect("granted")
+    }
+
+    /// D8: 16 CPUs declared on a 4-CPU pool announces `declared: 16` and
+    /// `reserved: 4`, the clamped grant.
+    #[test]
+    fn execute_start_reserved_is_the_granted_amount() {
+        let declared = req(&[("cpu", 16 * CPU)]);
+        let r = grant(
+            &[
+                ("cpu", Limit::Bounded(4 * CPU)),
+                ("memory", Limit::Bounded(1 << 30)),
+            ],
+            &declared,
+        );
+        let ev = execute_start("//p:t".into(), "exec".into(), true, &declared, &r, 7);
+        let BuildEventKind::ExecuteStart {
+            declared,
+            reserved,
+            queued_ms,
+            ..
+        } = ev
+        else {
+            panic!("wrong variant: {ev:?}");
+        };
+        assert_eq!(queued_ms, Some(7));
+        assert_eq!(
+            declared,
+            Some(std::collections::BTreeMap::from([("cpu".into(), 16 * CPU)]))
+        );
+        assert_eq!(
+            reserved,
+            Some(std::collections::BTreeMap::from([("cpu".into(), 4 * CPU)]))
+        );
+    }
+
+    /// A zero-cost target reserves nothing: `reserved` still carries `cpu`
+    /// (0), and the run is told one CPU.
+    #[test]
+    fn a_zero_cost_grant_reserves_zero_cpu_and_is_told_one() {
+        let declared = req(&[("cpu", 0)]);
+        let r = grant(&[("cpu", Limit::Bounded(4 * CPU))], &declared);
+        let BuildEventKind::ExecuteStart { reserved, .. } =
+            execute_start("//p:t".into(), "exec".into(), true, &declared, &r, 0)
+        else {
+            panic!("wrong variant");
+        };
+        assert_eq!(
+            reserved,
+            Some(std::collections::BTreeMap::from([("cpu".into(), 0)]))
+        );
+        let a = allotment_of(&r, Unit::of_builtin);
+        assert_eq!(a.iter().collect::<Vec<_>>(), [("cpu", "1")]);
+    }
+
+    fn units(pool: &str) -> Option<Unit> {
+        match pool {
+            "gpu" => Some(Unit::Count),
+            "scratch" => Some(Unit::Bytes),
+            p => Unit::of_builtin(p),
+        }
+    }
+
+    /// The allotment rounds the granted cpu up to whole CPUs and carries every
+    /// other pool granted more than 0, each rendered by its unit — custom pools
+    /// included.
+    #[test]
+    fn allotment_is_every_granted_pool_rendered_by_its_unit() {
+        let caps = [
+            ("cpu", Limit::Bounded(4 * CPU)),
+            ("gpu", Limit::Bounded(2)),
+            ("memory", Limit::Bounded(4 << 30)),
+            ("scratch", Limit::Unbounded),
+        ];
+        let declared = req(&[
+            ("cpu", 2_500_000),
+            ("gpu", 1),
+            ("memory", 8 << 30),
+            ("scratch", 3 << 40),
+        ]);
+        let a = allotment_of(&grant(&caps, &declared), units);
+        assert_eq!(
+            a.iter().collect::<Vec<_>>(),
+            [
+                ("cpu", "3"),
+                ("gpu", "1"),
+                ("memory", "4294967296"),
+                ("scratch", "3298534883328"),
+            ],
+            "memory clamped to 4 GiB; the unbounded pool carries what was declared"
+        );
+
+        // Nothing declared: cpu alone; a pool declared at 0 is not granted.
+        for undeclared in [req(&[]), req(&[("gpu", 0)])] {
+            let a = allotment_of(&grant(&caps, &undeclared), units);
+            assert_eq!(a.iter().collect::<Vec<_>>(), [("cpu", "1")]);
+        }
+    }
 }

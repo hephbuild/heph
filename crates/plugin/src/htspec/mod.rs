@@ -122,6 +122,28 @@ impl FromSpecValue for String {
     }
 }
 
+/// The shared `resources` attribute: a `{pool: amount}` dict, parsed by the one
+/// SDK parser ([`Resources::from_value`](crate::driver::Resources::from_value)).
+/// A driver config carries it as a `resources: Resources` field and moves it
+/// onto [`TargetDef::resources`](crate::driver::targetdef::TargetDef::resources);
+/// it must never reach a def hash.
+impl FromSpecValue for crate::driver::Resources {
+    fn from_spec_value(v: &Value) -> anyhow::Result<Self> {
+        Self::from_value(v)
+    }
+
+    fn spec_param_type() -> ParamType {
+        ParamType::union(vec![
+            ParamType::map(ParamType::union(vec![
+                ParamType::Int,
+                ParamType::Float,
+                ParamType::String,
+            ])),
+            ParamType::Null,
+        ])
+    }
+}
+
 /// Any decodable type becomes optional for free: absent or null is `None`.
 ///
 /// Blanket rather than one impl per `Option<T>`, so a nested config struct can

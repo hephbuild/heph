@@ -51,6 +51,9 @@ struct TemplateSpec {
     vars: Option<BTreeMap<String, Deferred<String>>>,
     /// Mark the rendered file executable.
     executable: bool,
+    /// What the target reserves from the resource pools while it runs, e.g.
+    /// `{"cpu": 2}`. Defaults to 1 cpu. Never hashed.
+    resources: hplugin::driver::Resources,
 }
 
 #[derive(serde::Serialize)]
@@ -163,6 +166,8 @@ impl hplugin::driver::Driver for Driver {
                     }],
                 }],
                 hash,
+                // Not in `hash` above: a declaration moves no key.
+                resources: spec.resources,
                 ..Default::default()
             },
         })
@@ -437,6 +442,28 @@ mod tests {
             err.contains("${read://"),
             "points at the alternative: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn declared_resources_reach_the_def_and_not_the_hash() {
+        let plain = parse("//pkg:conf", config(&[("src", s(":conf.j2"))]))
+            .await
+            .expect("parse");
+        assert!(plain.resources.is_empty(), "undeclared: the engine default");
+        let declared = parse(
+            "//pkg:conf",
+            config(&[
+                ("src", s(":conf.j2")),
+                (
+                    "resources",
+                    Value::Map([("cpu".to_string(), Value::Int(2))].into()),
+                ),
+            ]),
+        )
+        .await
+        .expect("parse");
+        assert_eq!(declared.resources.declared("cpu"), Some("2"));
+        assert_eq!(declared.hash, plain.hash);
     }
 
     #[tokio::test]

@@ -388,3 +388,48 @@ async fn test_embed_generated_in_subpackage_of_the_embedder() -> anyhow::Result<
     );
     Ok(())
 }
+
+/// D7/D15 end to end: a Go test whose package declares `test = {"resources":
+/// {"cpu": 2}, "env": {"N": "${resource:cpu}"}}`, run on a 2-cpu pool, sees
+/// `N=2`, and heph leaves `GOMAXPROCS` alone, so the binary still sizes itself
+/// from the host. The assertions live in the Go test: the target passes only
+/// if both hold, and it prints both so a failure's log tail shows what it saw.
+#[tokio::test]
+async fn go_test_sees_resource_cpu_and_host_gomaxprocs() -> anyhow::Result<()> {
+    require_go!();
+    let dir = tempfile::tempdir()?;
+    let root = dir.path();
+    std::fs::write(root.join("go.mod"), "module example.com/cpus\n\ngo 1.21\n")?;
+    std::fs::create_dir_all(root.join("p"))?;
+    std::fs::write(root.join("p/p.go"), "package p\n")?;
+    std::fs::write(
+        root.join("p/p_test.go"),
+        r#"package p
+
+import (
+	"os"
+	"runtime"
+	"testing"
+)
+
+func TestAllotment(t *testing.T) {
+	t.Logf("N=%s GOMAXPROCS=%d NumCPU=%d", os.Getenv("N"), runtime.GOMAXPROCS(0), runtime.NumCPU())
+	if got := os.Getenv("N"); got != "2" {
+		t.Fatalf("N = %q, want \"2\"", got)
+	}
+	if runtime.GOMAXPROCS(0) != runtime.NumCPU() {
+		t.Fatalf("GOMAXPROCS = %d, want NumCPU %d: heph must not set it", runtime.GOMAXPROCS(0), runtime.NumCPU())
+	}
+}
+"#,
+    )?;
+    std::fs::write(
+        root.join("p/BUILD"),
+        r#"provider_state(provider = "go", test = {"resources": {"cpu": 2}, "env": {"N": "${resource:cpu}"}})"#,
+    )?;
+    let ws = common::make_workspace_with_parallelism(dir, 2)?;
+    ws.run("//p:test@v=host")
+        .await
+        .context("the Go test checks N and GOMAXPROCS itself")?;
+    Ok(())
+}

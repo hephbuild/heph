@@ -22,7 +22,7 @@ pub struct Args {
     json: bool,
 }
 
-pub fn execute(args: &Args, _sink: LogSink, _global: &GlobalOptions) -> anyhow::Result<()> {
+pub fn execute(args: &Args, _sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
     if let Some(target) = &args.explain {
         let out = crate::pluginbuildfile::lsp_explain(target, args.json)?;
         println!("{out}");
@@ -37,6 +37,6 @@ pub fn execute(args: &Args, _sink: LogSink, _global: &GlobalOptions) -> anyhow::
         .build()
         .context("building tokio runtime for build-lsp")?;
     let _guard = runtime.enter();
-    let (engine, _shutdown) = bootstrap::new_engine()?;
+    let (engine, _shutdown) = bootstrap::new_engine(global)?;
     crate::pluginbuildfile::serve_stdio(engine)
 }

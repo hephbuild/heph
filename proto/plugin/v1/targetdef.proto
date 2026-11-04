@@ -109,6 +109,13 @@ message TargetDef {
   // 0.17.1). Absent means "not an entrypoint" — what every older plugin sends —
   // and a def without it is never sent RunOptions.
   Entrypoint entrypoint = 11;
+  // The pools the target reserves while it runs, by pool name (since 0.17.4).
+  // Each amount is the text the target wrote (`"0.5"`, `"2G"`, `"1"`); the host
+  // parses it in its pool's unit when it links the def. Only declared pools are
+  // present — a driver advertising its targets' cost (`fs`'s `cpu: "0"`)
+  // sends it here like any declaration; empty and absent are the same and
+  // mean "the def says nothing" (one cpu). Never hashed.
+  map<string, string> resources = 12;
 }
 
 // Where an entrypoint runs. Mirrors driver::targetdef::Workdir.

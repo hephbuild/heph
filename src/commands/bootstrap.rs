@@ -207,7 +207,64 @@ fn listed_facts_kill_switch(v: Option<&std::ffi::OsStr>) -> bool {
             .any(|off| s.eq_ignore_ascii_case(off)))
 }
 
-pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
+/// Build the engine for one command. `global` is the command line's global
+/// options; the engine reads its pool overrides (`-j`, `--resource`) from it.
+pub fn new_engine(
+    global: &super::GlobalOptions,
+) -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
+    new_engine_with(global, BadEnv::Refuse)
+}
+
+/// The engine for a caller with no command line of its own: shell
+/// completion and the credential helpers, which a shell or another tool runs
+/// and which execute no target. A malformed `HEPH_RESOURCE_<NAME>` is ignored
+/// with a warning there rather than breaking `<TAB>` or `git push`; the next
+/// real command still refuses it.
+pub fn new_helper_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
+    new_engine_with(&super::GlobalOptions::default(), BadEnv::Ignore)
+}
+
+/// What a malformed `HEPH_RESOURCE_<NAME>` does to engine construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BadEnv {
+    Refuse,
+    Ignore,
+}
+
+/// Lay `vars`' `HEPH_RESOURCE_<NAME>` and `global`'s flags over `pools`. With
+/// [`BadEnv::Ignore`], an environment layer that does not parse is dropped
+/// whole (with a warning) and the flags alone are applied.
+fn apply_run_overrides(
+    pools: &mut std::collections::BTreeMap<hplugin::provider::PoolName, hcore::capacity::PoolSpec>,
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    global: &super::GlobalOptions,
+    bad_env: BadEnv,
+) -> anyhow::Result<()> {
+    let flags = global.resource_overrides()?;
+    let layered = super::global::env_resource_overrides(vars)
+        .context("reading HEPH_RESOURCE_<NAME>")
+        .and_then(|env| {
+            let mut with_env = pools.clone();
+            super::global::apply_resource_overrides(&mut with_env, env, &flags)
+                .context("applying the run's resource overrides")?;
+            Ok(with_env)
+        });
+    match (layered, bad_env) {
+        (Ok(with_env), _) => *pools = with_env,
+        (Err(e), BadEnv::Refuse) => return Err(e),
+        (Err(e), BadEnv::Ignore) => {
+            tracing::warn!(error = %format!("{e:#}"), "ignoring HEPH_RESOURCE_<NAME>");
+            super::global::apply_resource_overrides(pools, Default::default(), &flags)
+                .context("applying the run's resource overrides")?;
+        }
+    }
+    Ok(())
+}
+
+fn new_engine_with(
+    global: &super::GlobalOptions,
+    bad_env: BadEnv,
+) -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     let root = match engine::get_root() {
         Ok(r) => r,
         Err(inner) => anyhow::bail!("Error: {}", inner),
@@ -234,6 +291,12 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     config.listed_facts_trust = engine::listed::ListedFactsTrust::from_kill_switch(
         listed_facts_kill_switch(std::env::var_os("HEPH_NO_LISTED_FACTS").as_deref()),
     );
+
+    // Pool capacities: flag over `HEPH_RESOURCE_<NAME>` over the config file;
+    // the engine supplies the default for a pool none of them names. Read here,
+    // like the kill switch above, so the engine never looks at the environment.
+    // Parsed against the config's units, which is why they wait until now.
+    apply_run_overrides(&mut config.resources, std::env::vars_os(), global, bad_env)?;
 
     // Captured before `config` is moved into the engine: the nix driver's state
     // dir hangs off `home_dir`, and telemetry reports the remote-cache backend
@@ -485,6 +548,51 @@ mod tests {
             assert!(
                 listed_facts_kill_switch(Some(OsStr::from_bytes(b"\xff"))),
                 "non-UTF-8"
+            );
+        }
+    }
+
+    /// A malformed `HEPH_RESOURCE_<NAME>` fails a command but is ignored,
+    /// whole, by the helper engines (completion, credential helpers); a good
+    /// one applies either way.
+    #[test]
+    fn bad_resource_env_is_ignored_only_by_helpers() {
+        use hcore::capacity::Capacity;
+        let vars = |pairs: &[(&str, &str)]| -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).into(), (*v).into()))
+                .collect()
+        };
+        let global = super::super::GlobalOptions::default();
+        let gpu = || hplugin::provider::PoolName::try_from("gpu".to_string()).expect("pool");
+        for bad in [
+            &[("HEPH_RESOURCE_GPU", "abc")][..],
+            &[("HEPH_RESOURCE_1GPU", "1")],
+            &[("HEPH_RESOURCE_GPU", "2"), ("HEPH_RESOURCE_CPU", "lots")],
+        ] {
+            let mut pools = Default::default();
+            assert!(
+                apply_run_overrides(&mut pools, vars(bad), &global, BadEnv::Refuse).is_err(),
+                "{bad:?}"
+            );
+            let mut pools = Default::default();
+            apply_run_overrides(&mut pools, vars(bad), &global, BadEnv::Ignore)
+                .unwrap_or_else(|e| panic!("{bad:?}: {e:#}"));
+            assert!(pools.is_empty(), "{bad:?}: the whole layer is dropped");
+        }
+        for bad_env in [BadEnv::Refuse, BadEnv::Ignore] {
+            let mut pools = Default::default();
+            apply_run_overrides(
+                &mut pools,
+                vars(&[("HEPH_RESOURCE_GPU", "2")]),
+                &global,
+                bad_env,
+            )
+            .expect("good env");
+            assert_eq!(
+                pools.get(&gpu()).and_then(|s| s.capacity),
+                Some(Capacity::Amount(2))
             );
         }
     }

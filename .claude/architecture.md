@@ -32,7 +32,7 @@ Targets are **isolated** and **side-effect-free**:
 - **Isolation** — each target runs inside a sandbox. It sees only its declared inputs; no ambient filesystem access, no implicit dependencies.
 - **No side effects** — targets must not write outside their declared output paths.
 - **Automatic hashing** — content hash of all declared inputs computed before execution. Hash match = cache hit, skip execution.
-- **Reproducibility** — same inputs must always produce same outputs. No timestamps, random seeds, or host-specific paths in outputs.
+- **Reproducibility** — same inputs must always produce same outputs. No timestamps, random seeds, or host-specific paths in outputs, and a target's outputs must not depend on its allotment (what `${resource:<pool>}` is substituted with; see `docs/RESOURCES.md`).
 
 When implementing a new `Driver`:
 1. Declare every file, env var, and tool version the target reads as an input.

@@ -881,10 +881,20 @@ fn starlark_to_rust(v: &Value) -> anyhow::Result<htvalue::Value> {
     }
 
     if let Some(d) = DictRef::from_value(*v) {
+        // A non-string key is refused rather than dropped: dropping it turned
+        // `{1: 4}` into `{}`, which every consumer then read as "nothing said".
         let map = d
             .iter()
-            .filter_map(|(k, val)| k.unpack_str().map(|s| (s.to_string(), val)))
-            .map(|(k, val)| Ok((k, starlark_to_rust(&val)?)))
+            .map(|(k, val)| {
+                let Some(k) = k.unpack_str() else {
+                    anyhow::bail!(
+                        "dict key {} is a {}; config dict keys must be strings",
+                        k,
+                        k.get_type()
+                    );
+                };
+                Ok((k.to_string(), starlark_to_rust(&val)?))
+            })
             .collect::<anyhow::Result<_>>()?;
         return Ok(htvalue::Value::Map(map));
     }
@@ -940,7 +950,10 @@ fn capture_provenance(eval: &Evaluator) -> Vec<ProvenanceFrame> {
 /// The driver-independent keyword arguments the `target()` builtin always
 /// accepts, for BUILD-file LSP completion. Kept next to the `target()` builtin
 /// (below) so the two don't drift. Driver-specific config args come from the
-/// driver's own schema and are merged in by the LSP.
+/// driver's own schema and are merged in by the LSP — `resources` among them:
+/// it is driver config (a driver whose schema derives from `Spec` lists it),
+/// not a field of `target()`, so it is not listed here, where it would also be
+/// offered on the drivers that refuse it.
 pub(crate) fn target_base_fields() -> Vec<hplugin::driver::DriverField> {
     use hplugin::driver::DriverField;
     let f = |name: &str, ty: ParamType, doc: &str, required: bool| DriverField {
@@ -995,6 +1008,13 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
     /// the provider's `defaultDriver` when omitted). `labels` and `transitive`
     /// (sandbox `deps`/`tools`/`env`) are recognized; every other keyword argument
     /// becomes driver-specific config. Returns the target's `//pkg:name` address.
+    ///
+    /// One config key the builtin drivers that run something read:
+    /// `resources`, what the target
+    /// reserves from the engine's pools while it runs, e.g.
+    /// `resources = {"cpu": 2, "memory": "4G"}` (default: 1 cpu). It is driver
+    /// config, not a keyword of `target()`: it reaches the driver untouched and
+    /// never a hash. See `docs/RESOURCES.md`.
     fn target<'v>(
         eval: &mut Evaluator<'v, '_, '_>,
         args: &Arguments<'v, '_>,
@@ -1205,6 +1225,34 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
     }
 }
 
+/// A host capacity `heph.core.resource` reports, in the pool's BUILD-file unit.
+#[derive(Debug, PartialEq)]
+enum HostAmount {
+    Cores(f64),
+    Bytes(u64),
+}
+
+/// `heph.core.resource(name)`: the same host reads the engine's default `cpu`
+/// and `memory` capacities come from, so the value and the pool agree on an
+/// unconfigured run. Only those two pools have a host value.
+fn host_resource(name: &str) -> anyhow::Result<HostAmount> {
+    use hplugin::provider::PoolName;
+    match name {
+        PoolName::CPU => {
+            #[expect(clippy::cast_precision_loss, reason = "a core count is far below 2^53")]
+            let cpu = hcore::sysres::host_cpus() as f64;
+            Ok(HostAmount::Cores(cpu))
+        }
+        PoolName::MEMORY => Ok(HostAmount::Bytes(hcore::sysres::host_memory_bytes())),
+        other => anyhow::bail!(
+            "heph.core.resource: {other:?} has no host capacity; valid names are \"{}\" and \"{}\" \
+             (a custom pool's capacity comes from .hephconfig or --resource, not the host)",
+            PoolName::CPU,
+            PoolName::MEMORY,
+        ),
+    }
+}
+
 #[starlark_module]
 fn heph_core_module(builder: &mut GlobalsBuilder) {
     /// Host operating system in canonical (Go/OCI) naming, e.g. `linux`, `darwin`.
@@ -1230,12 +1278,33 @@ fn heph_core_module(builder: &mut GlobalsBuilder) {
     /// The number of CPUs available to the process, falling back to 1 when the
     /// host count can't be determined.
     fn num_cpu() -> starlark::Result<i32> {
-        let n = std::thread::available_parallelism()
-            .map(|p| p.get())
-            .unwrap_or(1);
-        // `available_parallelism` returns a `usize`; clamp into Starlark's `i32`
+        let n = hcore::sysres::host_cpus();
+        // `host_cpus` returns a `usize`; clamp into Starlark's `i32`
         // so an implausibly large host count can't overflow.
         Ok(i32::try_from(n).unwrap_or(i32::MAX))
+    }
+
+    /// One pool's host capacity as the engine reads it: `resource("cpu")` is
+    /// the CPUs this process may use, a float in cores (the engine's default
+    /// parallelism); `resource("memory")` the memory it may use, an int in
+    /// bytes (the cgroup limit on Linux when one is set, else physical memory).
+    /// The host's numbers, not this run's: `-j` and `--resource` leave them
+    /// alone. A custom pool has no host value, so any other name is an error.
+    ///
+    /// Meant for `resources = {"cpu": heph.core.resource("cpu")}` (one target
+    /// at the machine's full width) or a fraction of it: `resources` stays out
+    /// of every def hash. Any other use (an `env` value, an argument, a file's
+    /// contents) puts a per-machine number into driver config and so into the
+    /// def hash of every consumer, and `heph validate` cannot catch it.
+    fn resource<'v>(
+        eval: &mut Evaluator<'v, '_, '_>,
+        #[starlark(require = pos)] name: &str,
+    ) -> starlark::Result<Value<'v>> {
+        let heap = eval.heap();
+        match host_resource(name).map_err(starlark::Error::new_other)? {
+            HostAmount::Cores(c) => Ok(heap.alloc(c)),
+            HostAmount::Bytes(b) => Ok(heap.alloc(b)),
+        }
     }
 
     /// The package currently being evaluated.
@@ -3026,6 +3095,142 @@ target(
         format!("{err:#}")
     }
 
+    /// `resources` as a BUILD file writes it, through `target()`'s
+    /// `starlark_to_rust` and into the SDK helper a driver's `parse` calls.
+    #[test]
+    fn resources_parse_table() {
+        use hplugin::driver::Resources;
+
+        #[derive(Debug, PartialEq)]
+        enum Want {
+            Fails,
+            BridgeRefuses(&'static str),
+            Empty,
+            Parses,
+            Pool(&'static str, u64),
+        }
+        use Want::*;
+        const M: u64 = 1_000_000;
+        const G: u64 = 1 << 30;
+
+        let key64 = format!("\"{}\"", "a".repeat(64));
+        let key65 = format!("\"{}\"", "a".repeat(65));
+        let pools = |n: usize| {
+            let body = (0..n)
+                .map(|i| format!("\"p{i}\": 1"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{{{body}}}")
+        };
+        let rows: Vec<(String, Want)> = [
+            (r#"{"cpu": 2}"#, Pool("cpu", 2 * M)),
+            (r#"{"cpu": 0}"#, Pool("cpu", 0)),
+            (r#"{"cpu": -1}"#, Fails),
+            (r#"{"cpu": 1.5}"#, Pool("cpu", 1_500_000)),
+            (r#"{"cpu": 0.5}"#, Pool("cpu", 500_000)),
+            (r#"{"cpu": 0.3}"#, Pool("cpu", 300_000)),
+            (r#"{"cpu": 0.00001}"#, Pool("cpu", 10)),
+            // Rounded half up to the micro-CPU; below half a step is refused.
+            (r#"{"cpu": 0.0000005}"#, Pool("cpu", 1)),
+            (r#"{"cpu": 0.0000004}"#, Fails),
+            (r#"{"cpu": -0.5}"#, Fails),
+            // A string is the amount as written, in the pool's unit.
+            (r#"{"cpu": "2"}"#, Pool("cpu", 2 * M)),
+            (r#"{"cpu": "0.5"}"#, Pool("cpu", 500_000)),
+            (r#"{"cpu": "2G"}"#, Fails),
+            (r#"{"gpu": "1.5"}"#, Fails),
+            (r#"{"cpu": True}"#, Fails),
+            (r#"{"cpu": None}"#, Fails),
+            (r#"{"cpu": {"n": 1}}"#, Fails),
+            (r#"{"cpu": 2147483648}"#, Pool("cpu", (1 << 31) * M)),
+            (r#"{"cpu": 1099511627776}"#, Pool("cpu", (1 << 40) * M)),
+            (r#"{"cpu": 18446744073709551616}"#, Fails),
+            (r#"{"cpu": float("nan")}"#, Fails),
+            (r#"{"cpu": float("inf")}"#, Fails),
+            (r#"{"cpu": 1e30}"#, Fails),
+            (
+                r#"{1: 4}"#,
+                BridgeRefuses("config dict keys must be strings"),
+            ),
+            (
+                r#"{None: 1}"#,
+                BridgeRefuses("config dict keys must be strings"),
+            ),
+            (r#"{"Memory": 1}"#, Fails),
+            (r#"{"cpu ": 1}"#, Fails),
+            (r#"{"": 1}"#, Fails),
+            (r#"{"gpu": 1}"#, Pool("gpu", 1)),
+            (r#"{}"#, Empty),
+            (r#"None"#, Empty),
+            (r#"True"#, Fails),
+            (r#"[1]"#, Fails),
+            // Memory, through the same parser `.hephconfig` uses.
+            (r#"{"memory": "4G"}"#, Pool("memory", 4 * G)),
+            (r#"{"memory": "4g"}"#, Pool("memory", 4 * G)),
+            (r#"{"memory": "4GiB"}"#, Pool("memory", 4 * G)),
+            (r#"{"memory": "4GB"}"#, Pool("memory", 4 * G)),
+            (r#"{"memory": "4096M"}"#, Pool("memory", 4 * G)),
+            (r#"{"memory": "4096"}"#, Pool("memory", 4096)),
+            (r#"{"memory": 4096}"#, Pool("memory", 4096)),
+            (r#"{"memory": 4294967296}"#, Pool("memory", 4 * G)),
+            (r#"{"memory": 0}"#, Pool("memory", 0)),
+            (r#"{"memory": 1.5}"#, Fails),
+            (r#"{"memory": "4 G"}"#, Fails),
+            (r#"{"memory": "4.5G"}"#, Fails),
+            (r#"{"memory": "4G\n"}"#, Fails),
+            (r#"{"memory": "17179869184G"}"#, Fails),
+        ]
+        .into_iter()
+        .map(|(e, w)| (e.to_string(), w))
+        .chain([
+            (format!("{{{key64}: 1}}"), Parses),
+            (format!("{{{key65}: 1}}"), Fails),
+            (pools(16), Parses),
+            (pools(17), Fails),
+        ])
+        .collect();
+
+        for (expr, want) in rows {
+            let tmp_dir = tempdir().unwrap();
+            let pkg_path = tmp_dir.path().join("mypkg");
+            fs::create_dir_all(&pkg_path).unwrap();
+            fs::write(
+                pkg_path.join("BUILD"),
+                format!("target(name = \"t\", driver = \"d\", resources = {expr})"),
+            )
+            .unwrap();
+            let provider = make_provider(&tmp_dir);
+            let evaluated = run_pkg_blocking(&provider, "mypkg");
+            // The BUILD bridge refuses a few values before the parser sees
+            // them; the expected message is named, since an eval traceback
+            // quotes the source line and so always "mentions" `resources`.
+            if let BridgeRefuses(want) = want {
+                let msg = format!("{:#}", evaluated.expect_err("the bridge refuses it"));
+                assert!(msg.contains(want), "{expr}: {msg}");
+                continue;
+            }
+            let evaluated = evaluated.unwrap_or_else(|e| panic!("{expr}: BUILD eval: {e:#}"));
+            // Then parsed in each pool's default unit, as the engine does at
+            // link for a pool the config does not give another unit.
+            let got = Resources::from_config(&evaluated.targets[0].config)
+                .and_then(|r| r.parse(|p| Some(hcore::capacity::Unit::default_for(p))));
+            match (&want, got) {
+                // The parser's own error, which names the key it refused.
+                (Fails, Err(e)) => {
+                    let msg = format!("{e:#}");
+                    assert!(msg.contains("resources"), "{expr}: off-topic error {msg}");
+                }
+                (Fails | BridgeRefuses(_), Ok(r)) => panic!("{expr}: want an error, got {r:?}"),
+                (_, Err(e)) => panic!("{expr}: want {want:?}, got error {e:#}"),
+                (Empty, Ok(r)) => assert!(r.is_empty(), "{expr}: {r:?}"),
+                (Parses, Ok(_)) => {}
+                (Pool(p, n), Ok(r)) => {
+                    assert_eq!(r.declared(p), Some(*n), "{expr}: {r:?}")
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_starlark_file_pkg_relative_by_default() {
         // run_target_config runs in pkg "mypkg" — file("src/main.rs") should resolve
@@ -3682,6 +3887,55 @@ target(
             // it's a positive integer.
             Some(htvalue::Value::Int(i)) => assert!(*i >= 1, "num_cpu should be >= 1, got {i}"),
             other => panic!("expected num_cpu int, got {other:?}"),
+        }
+    }
+
+    /// D14: each value is the host read the engine's default capacity comes
+    /// from, and it lands in a target's `resources` as a declaration the SDK
+    /// helper accepts (memory over 2^31 included).
+    #[test]
+    fn core_resource_matches_the_engine_host_reads() {
+        let content = r#"
+cpu = heph.core.resource("cpu")
+memory = heph.core.resource("memory")
+target(name = "t", driver = "d", cpu = cpu, memory = memory, resources = {"cpu": cpu, "memory": memory})
+"#;
+        let config = run_target_config(content);
+        let cpus = hcore::sysres::host_cpus();
+        let memory = hcore::sysres::host_memory_bytes();
+        match config.get("cpu") {
+            Some(htvalue::Value::Float(f)) => assert_eq!(*f, cpus as f64),
+            other => panic!("cpu should be a float, got {other:?}"),
+        }
+        match config.get("memory") {
+            Some(htvalue::Value::Int(i)) => assert_eq!(u64::try_from(*i).ok(), Some(memory)),
+            Some(htvalue::Value::Float(f)) => assert_eq!(*f, memory as f64),
+            other => panic!("memory should be a number, got {other:?}"),
+        }
+        let declared = hplugin::driver::Resources::from_config(&config)
+            .and_then(|r| r.parse(|p| Some(hcore::capacity::Unit::default_for(p))))
+            .expect("valid resources");
+        assert_eq!(
+            declared.declared("cpu"),
+            Some(cpus as u64 * hplugin::driver::Resources::MICROS_PER_CPU)
+        );
+        assert_eq!(declared.declared("memory"), Some(memory));
+    }
+
+    /// A custom pool has no host value: the error names the name asked for
+    /// and the two that are valid, and a near-miss of a real one is refused
+    /// rather than matched.
+    #[test]
+    fn core_resource_unknown_name_names_the_valid_ones() {
+        for name in ["docker", "cpus", "CPU", ""] {
+            let err = run_target_config_err(&format!(
+                r#"target(name = "t", driver = "d", n = heph.core.resource("{name}"))"#
+            ));
+            assert!(err.contains(&format!("{name:?}")), "{name:?}: {err}");
+            assert!(
+                err.contains(r#""cpu""#) && err.contains(r#""memory""#),
+                "{name:?}: {err}"
+            );
         }
     }
 

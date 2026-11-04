@@ -1586,6 +1586,8 @@ struct RunStart {
     options: hplugin::driver::RunOptions,
     /// What the run's streams feed, for a run in the caller's terminal.
     channels: convert::RunChannels,
+    /// What the host reserved for the run; `None` from a host before 0.17.4.
+    allotment: Option<hplugin::driver::Allotment>,
 }
 
 impl RunStart {
@@ -1600,6 +1602,8 @@ impl RunStart {
         Ok(Self {
             options,
             channels,
+            allotment: convert::allotment_from_pb(req.allotment)
+                .context("decoding the run's allotment")?,
             shell: req.shell.unwrap_or(false),
             target: convert::target_def_from_pb(required_msg(
                 req.target,
@@ -1673,6 +1677,7 @@ async fn run_once(
     rr.credentials = start.credentials;
     rr.deferred = start.deferred;
     rr.options = start.options;
+    rr.allotment = start.allotment;
     let mrr = ManagedRunRequest {
         request: rr,
         sandbox_dir: start.sandbox_dir,

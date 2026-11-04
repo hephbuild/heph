@@ -126,6 +126,9 @@ struct OciLoadSpec {
     /// `tool = "docker"` rejects it: `docker load` has no instance selection.
     #[spec(ty = hcore::htvalue::signature::ParamType::String)]
     platform: Option<String>,
+    /// What the target reserves from the resource pools while it runs, e.g.
+    /// `{"cpu": 2}`. IO-bound: an undeclared `cpu` costs 0.1. Never hashed.
+    resources: hplugin::driver::Resources,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -424,6 +427,13 @@ impl ManagedDriver for Driver {
                     }],
                 }],
                 hash,
+                resources: spec
+                    .resources
+                    .advertise(
+                        hplugin::provider::PoolName::cpu(),
+                        hplugin::driver::Resources::IO_CPU,
+                    )
+                    .context("oci.load resources")?,
                 ..Default::default()
             },
         })

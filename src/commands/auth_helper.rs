@@ -138,7 +138,10 @@ fn material_for(inv: &Invocation) -> anyhow::Result<crate::engine::Material> {
 async fn refresh(
     pin: &crate::engine::credential::HelperPin,
 ) -> anyhow::Result<crate::engine::Material> {
-    let (engine, _shutdown) = crate::commands::bootstrap::new_engine()?;
+    // A helper runs before any command line is parsed (`main` dispatches it
+    // first), so it has no `-j`/`--resource` to give the engine, and runs no
+    // target, so a bad `HEPH_RESOURCE_<NAME>` is ignored rather than fatal.
+    let (engine, _shutdown) = crate::commands::bootstrap::new_helper_engine()?;
     let rs = engine.new_state();
     let addr = hmodel::htaddr::parse_addr(&pin.addr)?;
     engine

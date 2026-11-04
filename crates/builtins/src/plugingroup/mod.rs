@@ -72,6 +72,11 @@ struct GroupSpec {
     /// path; it cannot be combined with `strip_prefix`/`prefix`. A dict maps exact
     /// emitted paths to destinations.
     rename: Rename,
+    /// What the target reserves from the resource pools while it runs, e.g.
+    /// `{"cpu": 2}`. Defaults to 0 cpu: it reserves nothing. Never hashed. Only a group that
+    /// executes (a relocating one) reserves it: an aggregate group is spliced
+    /// into its consumers and never reaches admission.
+    resources: hplugin::driver::Resources,
 }
 
 impl GroupSpec {
@@ -222,6 +227,19 @@ impl hplugin::driver::Driver for Driver {
                 inputs,
                 outputs,
                 hash,
+                // Not in `hash` above: a declaration moves no key. Only a
+                // relocating group executes, so only it advertises a cost; an
+                // aggregate one keeps its (usually empty) declaration as is.
+                resources: if relocating {
+                    spec.resources
+                        .advertise(
+                            hplugin::provider::PoolName::cpu(),
+                            hplugin::driver::Resources::VIEW_CPU,
+                        )
+                        .context("group resources")?
+                } else {
+                    spec.resources
+                },
                 transparent: !relocating,
                 // `cache` stays at the default, off, in both modes, for different
                 // reasons: an aggregate group has nothing of its own to cache,
@@ -562,6 +580,33 @@ mod tests {
             def.hash, expected,
             "an aggregate group's def hash must not move when transforms exist"
         );
+    }
+
+    /// A relocating group that declares no `cpu` advertises 0 CPU (D3);
+    /// a declared `cpu` replaces it, and neither moves the def hash (U5). An
+    /// aggregate group never executes, so it advertises nothing.
+    #[tokio::test]
+    async fn resources_default_light_and_declared_unhashed() {
+        let prefix = ("prefix", Value::String("lib".into()));
+        let plain = parse_group(std::slice::from_ref(&prefix)).await;
+        assert_eq!(
+            plain.resources.declared("cpu"),
+            Some(hplugin::driver::Resources::VIEW_CPU)
+        );
+        assert!(
+            parse_group(&[]).await.resources.is_empty(),
+            "an aggregate group advertises nothing"
+        );
+        let declared = parse_group(&[
+            prefix,
+            (
+                "resources",
+                Value::Map([("cpu".to_string(), Value::Int(0))].into()),
+            ),
+        ])
+        .await;
+        assert_eq!(declared.resources.declared("cpu"), Some("0"));
+        assert_eq!(declared.hash, plain.hash);
     }
 
     /// A transform makes the group a real target: it can no longer be inlined,

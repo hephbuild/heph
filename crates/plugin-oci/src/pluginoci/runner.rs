@@ -68,6 +68,9 @@ pub(crate) struct TargetSpec {
     /// additional `-v` mounts, `--user`. The workspace and heph mounts are
     /// added automatically and must not be repeated here.
     pub run_args: Vec<String>,
+    /// What the target reserves from the resource pools while it runs, e.g.
+    /// `{"cpu": 2}`. Defaults to 1 cpu. Never hashed.
+    pub resources: hplugin::driver::Resources,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -201,6 +204,7 @@ impl ManagedDriver for Driver {
                 // machine's resolution key another's builds.
                 cache: CacheConfig::on(false),
                 hash,
+                resources: spec.resources,
                 ..Default::default()
             },
         })

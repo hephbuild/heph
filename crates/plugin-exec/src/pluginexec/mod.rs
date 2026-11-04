@@ -110,6 +110,9 @@ struct TargetDef {
     /// raw text, so a def with no reference hashes as it did when this was a
     /// `String` map.
     pub env: BTreeMap<String, hplugin::driver::Deferred<String>>,
+    /// Host snapshots only: a name the target (or a dependency's hashed
+    /// transitive `Pass`) passes, with the host value read at parse. A
+    /// dependency's hashed transitive literal goes to `env` instead.
     pub pass_env: BTreeMap<String, String>,
     pub runtime_pass_env: Vec<String>,
     pub runtime_env: HashMap<String, hplugin::driver::Deferred<String>>,
@@ -1705,6 +1708,9 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
                 entrypoint: engine_entrypoint,
                 pty: true,
                 hash,
+                // On the engine's def only, never on exec's `TargetDef`, so
+                // `Hash for TargetDef` cannot reach it (U5).
+                resources: spec.resources,
                 ..Default::default()
             },
         })
@@ -1725,6 +1731,9 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
             &mut xdef.dep_group_inputs,
             &mut xdef.runtime_dep_group_inputs,
         );
+        // The target's own `env` names, before any transitive literal joins
+        // `env`: those win over a dependency's, which only fill the rest.
+        let own_env: std::collections::HashSet<String> = xdef.env.keys().cloned().collect();
         for (name, env) in req.sandbox.env {
             match env.value {
                 // An entrypoint runs with the caller's whole environment as
@@ -1742,13 +1751,18 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
                 }
                 EnvValue::Literal(v) => {
                     // The host's walk covers the target's own config, not what a
-                    // dep hands down, so a reference here has no edge: it would
-                    // reach the process as text, or `resolve` would call it a heph
-                    // bug. Refuse it as the author's instead.
+                    // dep hands down, so no reference here has an edge or an
+                    // allotment check (`${resource:…}` included): it would reach
+                    // the process as text, or `resolve` would call it a heph bug.
+                    // Refuse it as the author's instead.
                     hplugin::htspec::reject_deferred_reference(&v)
                         .with_context(|| format!("transitive `env.{name}`"))?;
                     if env.hash {
-                        xdef.pass_env.insert(name, v);
+                        // A literal is the def's own content, so it joins `env`;
+                        // the target's own value for the name wins.
+                        if !own_env.contains(&name) {
+                            xdef.env.insert(name, hplugin::driver::Deferred::new(v));
+                        }
                     } else {
                         xdef.runtime_env
                             .insert(name, hplugin::driver::Deferred::new(v));
@@ -1852,7 +1866,7 @@ impl Driver {
         let resolved_run: Vec<String> = def
             .run
             .iter()
-            .map(|d| rreq.resolve(d).map(str::to_string))
+            .map(|d| rreq.resolve(d).map(std::borrow::Cow::into_owned))
             .collect::<anyhow::Result<_>>()?;
         // A run that accepts args gets them appended to the command; bash's
         // inline `-c` form needs a `$0` first so they land in `"$@"`. In
@@ -4207,6 +4221,52 @@ mod tests {
         Ok(())
     }
 
+    /// Run `def`'s command under `allotment`; its trimmed stdout.
+    async fn run_allotted(
+        def: TargetDef,
+        allotment: Option<hplugin::driver::Allotment>,
+    ) -> anyhow::Result<String> {
+        let driver = Driver::new_bash().with_host_path();
+        let target_def = EngineTargetDef {
+            raw_def: Arc::new(def),
+            cache: CacheConfig::on(true),
+            pty: true,
+            ..Default::default()
+        };
+        let mut stdout = Vec::new();
+        let request_id = "test".to_string();
+        let tmp = tempfile::tempdir()?;
+        let mut req = RunRequest::new(&request_id, &target_def, tmp.path());
+        req.stdout = Some(&mut stdout);
+        req.allotment = allotment;
+        driver
+            .run(make_req(req), &StdCancellationToken::new())
+            .await?;
+        Ok(String::from_utf8(stdout)?.trim().to_string())
+    }
+
+    /// An allotment of `cpu` CPUs, plus `memory` bytes when granted, as the
+    /// engine renders it.
+    fn allot(cpu: u32, memory_bytes: Option<u64>) -> Option<hplugin::driver::Allotment> {
+        let memory = memory_bytes.map(|m| ("memory".to_string(), m.to_string()));
+        Some(hplugin::driver::Allotment::new(
+            std::iter::once(("cpu".to_string(), cpu.to_string())).chain(memory),
+        ))
+    }
+
+    /// heph puts nothing of the allotment in a target's environment: a
+    /// target that wants it names `${resource:<pool>}`.
+    #[tokio::test]
+    async fn the_allotment_is_not_exported_to_the_env() -> anyhow::Result<()> {
+        let show = "echo \"${HEPH_CPUS-unset}|${HEPH_MEMORY_BYTES-unset}\"";
+        let def = TargetDef {
+            run: vec![D::new(show)],
+            ..Default::default()
+        };
+        assert_eq!(run_allotted(def, allot(3, Some(64))).await?, "unset|unset");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_parse_pass_env_resolves_value() -> anyhow::Result<()> {
         unsafe {
@@ -4621,6 +4681,66 @@ mod tests {
         Ok(())
     }
 
+    /// U5: a declared `resources` reaches the engine's def and moves neither
+    /// the parse nor the `apply_transitive` def hash of the golden config.
+    #[tokio::test]
+    async fn declared_resources_reach_the_def_and_not_the_hash() -> anyhow::Result<()> {
+        use hcore::htvalue::Value;
+        let ctoken = StdCancellationToken::new();
+        let driver = Driver::new_exec();
+        let parse = |config: HashMap<String, Value>| {
+            let driver = &driver;
+            let ctoken = &ctoken;
+            async move {
+                let parsed = driver
+                    .parse(
+                        hplugin::driver::ParseRequest {
+                            request_id: "res".to_string(),
+                            target_spec: Arc::new(hplugin::provider::TargetSpec {
+                                addr: parse_addr("//app:golden")?,
+                                driver: driver.name.clone(),
+                                config,
+                                ..Default::default()
+                            }),
+                        },
+                        ctoken,
+                    )
+                    .await?
+                    .target_def;
+                let applied = driver
+                    .apply_transitive(
+                        hplugin::driver::ApplyTransitiveRequest {
+                            request_id: "res".to_string(),
+                            target_def: parsed.clone(),
+                            sandbox: golden_transitive_sandbox(),
+                        },
+                        ctoken,
+                    )
+                    .await?
+                    .target_def;
+                anyhow::Ok((parsed, applied))
+            }
+        };
+        let (plain, plain_applied) = parse(golden_populated_config()).await?;
+        assert!(plain.resources.is_empty(), "undeclared: the engine default");
+        let mut config = golden_populated_config();
+        config.insert(
+            "resources".to_string(),
+            Value::Map(HashMap::from([
+                ("cpu".to_string(), Value::Float(1.5)),
+                ("memory".to_string(), Value::String("4G".to_string())),
+            ])),
+        );
+        let (declared, declared_applied) = parse(config).await?;
+        // As written: the engine parses them in the configured units at link.
+        assert_eq!(declared.resources.declared("cpu"), Some("1.5"));
+        assert_eq!(declared.resources.declared("memory"), Some("4G"));
+        assert_eq!(declared_applied.resources, declared.resources);
+        assert_eq!(declared.hash, plain.hash);
+        assert_eq!(declared_applied.hash, plain_applied.hash);
+        Ok(())
+    }
+
     const EXEC_DEF_GOLDEN_POPULATED: &str = r#"exec parse: 61dea7f3aa15aa34
   dep|sdk|0 //tools/go:sdk hashed=true runtime=true {}
   dep|srcs|0 //app:a hashed=true runtime=true {}
@@ -4631,7 +4751,7 @@ mod tests {
   tool||1 //tools:yq hashed=true runtime=true {"unpack_root": "tools"}
   tool|cc|0 //toolchain:gcc hashed=true runtime=true {"unpack_root": "tools"}
   runner //tools/devenv:runner hashed=true runtime=false {}
-exec apply_transitive: 26a90abee4625d43
+exec apply_transitive: 96d371e95980d767
   dep|sdk|0 //tools/go:sdk hashed=true runtime=true {}
   dep|srcs|0 //app:a hashed=true runtime=true {}
   dep|srcs|1 //app:b hashed=true runtime=true {}
@@ -4646,9 +4766,9 @@ exec apply_transitive: 26a90abee4625d43
   _transitive_x_0_dep_d1 //lib:rt_only hashed=false runtime=true {}
   _transitive_x_0_dep_d2 //lib:hash_only hashed=true runtime=false {}
 exec+coreutils parse: cfde72931f33cb07
-exec+coreutils apply_transitive: da2388103db4f305
+exec+coreutils apply_transitive: b3d46d6cf3e2cfbf
 bash parse: 61dea7f3aa15aa34
-bash apply_transitive: 26a90abee4625d43
+bash apply_transitive: 96d371e95980d767
 "#;
 
     /// `entrypoint = False` is no flag at all: the golden's exec and bash def
@@ -6239,13 +6359,13 @@ bash apply_transitive: 26a90abee4625d43
         );
 
         // With the toolbox off the transitive def hash is pinned to what it was
-        // before the toolbox's version reached this path (the digest is the one
-        // the unfixed code produced): a workspace that leaves the toolbox off
-        // keeps every key it has.
+        // before the toolbox's version reached this path: a workspace that
+        // leaves the toolbox off keeps every key it has. (It moved once, when a
+        // hashed transitive literal like `TR_VAR` moved from `pass_env` to `env`.)
         let off = parse_and_apply_transitive(&Driver::new_exec(), sandbox).await?;
         assert_eq!(
             String::from_utf8_lossy(&off.hash),
-            "8505d329f96f4aa6",
+            "29ceb3f7543c5520",
             "the toolbox-off transitive def hash must not move"
         );
         Ok(())
@@ -6256,29 +6376,78 @@ bash apply_transitive: 26a90abee4625d43
     /// reaching the process as text or failing at `resolve` as a heph bug.
     #[tokio::test]
     async fn a_reference_in_a_transitive_env_is_refused() -> anyhow::Result<()> {
-        for hash in [true, false] {
-            let mut sandbox = hplugin::driver::sandbox::Sandbox::default();
+        for reference in ["${read://infra:v}", "${src://infra:v}", "-j${resource:cpu}"] {
+            for hash in [true, false] {
+                let sandbox =
+                    tr_sandbox(&[("TR_VAR", EnvValue::Literal(reference.to_string()), hash)]);
+                let Err(err) = parse_and_apply_transitive(&Driver::new_exec(), sandbox).await
+                else {
+                    panic!("{reference} hash={hash}: a transitive reference must be refused");
+                };
+                let msg = format!("{err:#}");
+                assert!(
+                    msg.contains("transitive `env.TR_VAR`")
+                        && msg.contains("deferred value reference"),
+                    "{reference} hash={hash}: {msg}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// A hashed transitive literal is the def's content: it lands in `env`
+    /// (not `pass_env`, which holds host snapshots only), and the target's own
+    /// `env` value for the name wins. An unhashed one goes to `runtime_env`.
+    #[tokio::test]
+    async fn a_hashed_transitive_literal_lands_in_env_under_the_targets_own() -> anyhow::Result<()>
+    {
+        let mut xdef = TargetDef::default();
+        xdef.env.insert("OWN".to_string(), D::new("own"));
+        let def = EngineTargetDef {
+            raw_def: Arc::new(xdef),
+            ..Default::default()
+        };
+        let lit = |s: &str| EnvValue::Literal(s.to_string());
+        let out = Driver::new_exec()
+            .apply_transitive(
+                ApplyTransitiveRequest {
+                    request_id: "test".to_string(),
+                    target_def: def,
+                    sandbox: tr_sandbox(&[
+                        ("OWN", lit("dep"), true),
+                        ("DEP", lit("dep"), true),
+                        ("RT", lit("rt"), false),
+                    ]),
+                },
+                &StdCancellationToken::new(),
+            )
+            .await?
+            .target_def;
+        let mut xdef = out.def::<TargetDef>().clone();
+        assert!(xdef.pass_env.is_empty(), "{:?}", xdef.pass_env);
+        assert_eq!(xdef.env.get("OWN").map(D::raw), Some("own"));
+        assert_eq!(xdef.env.get("DEP").map(D::raw), Some("dep"));
+        assert!(!xdef.env.contains_key("RT"));
+        assert_eq!(xdef.runtime_env.get("RT").map(D::raw), Some("rt"));
+        xdef.run = vec![D::new("echo \"$OWN|$DEP|$RT\"")];
+        assert_eq!(run_allotted(xdef, allot(1, None)).await?, "own|dep|rt");
+        Ok(())
+    }
+
+    fn tr_sandbox(vars: &[(&str, EnvValue, bool)]) -> hplugin::driver::sandbox::Sandbox {
+        let mut sandbox = hplugin::driver::sandbox::Sandbox::default();
+        for (name, value, hash) in vars {
             sandbox.env.insert(
-                "TR_VAR".to_string(),
+                name.to_string(),
                 hplugin::driver::sandbox::Env {
-                    value: hplugin::driver::sandbox::EnvValue::Literal(
-                        "${read://infra:v}".to_string(),
-                    ),
-                    hash,
+                    value: value.clone(),
+                    hash: *hash,
                     append: false,
                     append_prefix: String::new(),
                 },
             );
-            let Err(err) = parse_and_apply_transitive(&Driver::new_exec(), sandbox).await else {
-                panic!("hash={hash}: a transitive reference must be refused");
-            };
-            let msg = format!("{err:#}");
-            assert!(
-                msg.contains("transitive `env.TR_VAR`") && msg.contains("deferred value reference"),
-                "hash={hash}: {msg}"
-            );
         }
-        Ok(())
+        sandbox
     }
 
     #[test]

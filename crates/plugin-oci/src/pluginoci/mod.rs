@@ -517,4 +517,82 @@ mod tests {
         );
         assert!(parse_docker_load_ref("nothing here").is_err());
     }
+
+    /// The IO-bound drivers (pull, push, load, layer, index, image) cost 0.1
+    /// cpu when the target declares none; a declared `cpu` replaces it, and
+    /// neither moves the def hash.
+    #[tokio::test]
+    async fn io_drivers_default_to_a_tenth_of_a_cpu_unhashed() {
+        use hcore::hasync::StdCancellationToken;
+        use hcore::htvalue::Value;
+        use hdriver_support::driver_managed::ManagedDriver;
+        use hplugin::driver::targetdef::TargetDef;
+        use hplugin::driver::{ParseRequest, Resources};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let s = |v: &str| Value::String(v.to_owned());
+        let list = |v: &[&str]| Value::List(v.iter().map(|x| s(x)).collect());
+        let pinned =
+            "alpine@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let cases: Vec<(&str, Vec<(&str, Value)>)> = vec![
+            ("oci.pull", vec![("ref", s(pinned))]),
+            (
+                "oci.push",
+                vec![("image", s(":img")), ("ref", s("reg.io/a:1"))],
+            ),
+            ("oci.load", vec![("image", s(":img")), ("tag", s("a:dev"))]),
+            (
+                "oci.layer",
+                vec![("srcs", list(&[":bin"])), ("prefix", s("/usr/bin"))],
+            ),
+            ("oci.index", vec![("images", list(&[":amd64"]))]),
+            (
+                "oci.image",
+                vec![("base", s(":base")), ("platforms", list(&["linux/amd64"]))],
+            ),
+        ];
+        for (driver, base) in cases {
+            let parse = |declared: Option<Value>| {
+                let mut config: HashMap<String, Value> = base
+                    .iter()
+                    .map(|(k, v)| ((*k).to_owned(), v.clone()))
+                    .collect();
+                if let Some(r) = declared {
+                    config.insert("resources".to_owned(), r);
+                }
+                let req = ParseRequest {
+                    request_id: "test".to_owned(),
+                    target_spec: Arc::new(hplugin::provider::TargetSpec {
+                        addr: hmodel::htaddr::parse_addr("//app:t").expect("addr"),
+                        driver: driver.to_owned(),
+                        config,
+                        ..Default::default()
+                    }),
+                };
+                async move {
+                    let ct = StdCancellationToken::new();
+                    let resp = match driver {
+                        "oci.pull" => pull::Driver::new().parse(req, &ct).await,
+                        "oci.push" => push::Driver::new().parse(req, &ct).await,
+                        "oci.load" => load::Driver::new().parse(req, &ct).await,
+                        "oci.layer" => layer::Driver::new().parse(req, &ct).await,
+                        "oci.index" => index::Driver::new().parse(req, &ct).await,
+                        _ => image::Driver::new().parse(req, &ct).await,
+                    };
+                    resp.unwrap_or_else(|e| panic!("{driver}: {e:#}"))
+                        .target_def
+                }
+            };
+            let plain: TargetDef = parse(None).await;
+            assert_eq!(
+                plain.resources.declared("cpu"),
+                Some(Resources::IO_CPU),
+                "{driver}"
+            );
+            let heavy = parse(Some(Value::Map([("cpu".to_owned(), Value::Int(2))].into()))).await;
+            assert_eq!(heavy.resources.declared("cpu"), Some("2"), "{driver}");
+            assert_eq!(heavy.hash, plain.hash, "{driver}: resources are unhashed");
+        }
+    }
 }

@@ -73,6 +73,9 @@ struct OciPushSpec {
     /// target that sets neither this nor `credentials` pushes anonymously.
     /// Not combinable with `credentials`.
     ambient_credentials: bool,
+    /// What the target reserves from the resource pools while it runs, e.g.
+    /// `{"cpu": 2}`. IO-bound: an undeclared `cpu` costs 0.1. Never hashed.
+    resources: hplugin::driver::Resources,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -276,6 +279,13 @@ impl ManagedDriver for Driver {
                 // An action with an external side effect: never cached (the
                 // default `CacheConfig::off()`), always runs.
                 hash,
+                resources: spec
+                    .resources
+                    .advertise(
+                        hplugin::provider::PoolName::cpu(),
+                        hplugin::driver::Resources::IO_CPU,
+                    )
+                    .context("oci.push resources")?,
                 ..Default::default()
             },
         })
@@ -302,7 +312,7 @@ impl ManagedDriver for Driver {
             .request
             .resolve(&def.dest)
             .context("resolve oci_push `ref`")?;
-        let dest = render_ref(def.dest.raw(), dest, || {
+        let dest = render_ref(def.dest.raw(), &dest, || {
             dep_input(&req, IMAGE_ORIGIN)?
                 .input
                 .artifact

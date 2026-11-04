@@ -28,7 +28,7 @@
 //!   reach it.
 //!
 //! The addr-only path never materializes its selection: the cache enumeration is
-//! streamed straight into a delete loop bounded by `max_workers`, so `all //...`
+//! streamed straight into a delete loop bounded by `fan_out`, so `all //...`
 //! over a cache of any size costs a fixed number of in-flight addrs rather than
 //! one `Addr` per match. The graph path cannot do the same, and the reason is a
 //! deadlock rather than a convenience — see [`Engine::resolve_selection`]. It
@@ -122,7 +122,7 @@ impl Engine {
     /// keeps that safe if a new matcher variant lands, since this code deletes.
     ///
     /// The addr-only path streams: the cache enumeration is fed straight into a
-    /// delete loop bounded by `max_workers`, so `all //...` costs a fixed number
+    /// delete loop bounded by `fan_out`, so `all //...` costs a fixed number
     /// of in-flight addrs whatever the cache's size. The graph path must finish
     /// resolving before it deletes — [`Engine::resolve_selection`] explains why
     /// that is forced — and so holds its matched addrs.
@@ -143,7 +143,7 @@ impl Engine {
     ) -> Result<CleanStats> {
         let mut run = CleanRun {
             set: JoinSet::new(),
-            limit: self.max_workers.max(1),
+            limit: self.fan_out.max(1),
             stats: CleanStats::default(),
         };
 
@@ -738,7 +738,7 @@ mod tests {
         assert!(!present(&engine, &drop, "h1"));
     }
 
-    /// An engine with `max_workers == 2` whose cache records, at each step of the
+    /// An engine with `fan_out == 2` whose cache records, at each step of the
     /// `list_targets` enumeration, how many clean tasks have started by then.
     ///
     /// A clean task announces itself by its `list_target_entries` call, which is
@@ -749,7 +749,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let _rt = crate::engine::test_rt_enter();
         let mut engine = Engine::new(Config {
-            // `max_workers` is `2 * parallelism`, so this pins the in-flight cap
+            // `fan_out` is `2 * parallelism`, so this pins the in-flight cap
             // at 2 and keeps the corpus the test needs small.
             parallelism: Some(1),
             ..Config::for_tests(dir.path())
@@ -782,7 +782,7 @@ mod tests {
     async fn the_cache_selection_is_never_materialized() {
         // The property, for the addr-only path — the one `all //...` takes, where
         // the selection is as large as the cache: it streams into a delete loop
-        // bounded by `max_workers` instead of building the matched set first.
+        // bounded by `fan_out` instead of building the matched set first.
         // (The graph path deliberately does not; see `resolve_selection`.)
         //
         // Observable because a bounded loop must *complete* work to free a slot
