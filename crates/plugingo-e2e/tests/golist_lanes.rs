@@ -1529,6 +1529,86 @@ async fn g13_a_checked_in_file_shadowing_a_generated_one_fails() -> anyhow::Resu
     Ok(())
 }
 
+/// G15: the generator stops writing one of its `.go` files: `_golist` re-runs
+/// and the file leaves `GoFiles`. Removal moves the key as addition does (G10).
+#[tokio::test]
+async fn g15_a_removed_generated_go_file_relists() -> anyhow::Result<()> {
+    require_go!();
+    let ws = make_workspace(gen_pkg(&[
+        ("gen.go", GEN_GO),
+        ("gen2.go", "package lib\n\nfunc H() {}\n"),
+    ])?)?;
+    let (pkg, _) = golist(&ws, "lib").await?;
+    assert_eq!(pkg.go_files, vec!["gen.go", "gen2.go", "lib.go"]);
+
+    regen(ws.dir.path(), &[("gen.go", GEN_GO)])?;
+    let ws = reopen(ws)?;
+    let (pkg, ev) = golist(&ws, "lib").await?;
+    ev.assert_executed("@heph/go/headers/lib", "headers", "gen2.go is gone");
+    ev.assert_executed("lib", "_golist", "the generator dropped a .go file");
+    assert_eq!(pkg.go_files, vec!["gen.go", "lib.go"]);
+    Ok(())
+}
+
+/// G16: a warm run over an unchanged tree executes nothing but the tree reads —
+/// the header target and `_golist` are both hits, as is everything around them.
+/// A header target
+/// that re-ran on every invocation would hold this red even with `_golist` a
+/// hit.
+#[tokio::test]
+async fn g16_a_warm_no_op_run_executes_nothing() -> anyhow::Result<()> {
+    require_go!();
+    let dir = gen_pkg(&[("gen.go", GEN_GO)])?;
+    write(
+        dir.path(),
+        "lib/lib_test.go",
+        "package lib\n\nimport \"testing\"\n\nfunc TestF(t *testing.T) { _ = F() }\n",
+    )?;
+    write(dir.path(), "lib/x.h", "// a header\n\nint x;\n")?;
+    let ws = make_workspace(dir)?;
+    let (_, ev) = run(&ws, "//lib:build_lib@v=host").await?;
+    ev.assert_executed("lib", "_golist", "first build");
+
+    let ws = reopen(ws)?;
+    let (_, ev) = run(&ws, "//lib:build_lib@v=host").await?;
+    ev.assert_hit("@heph/go/headers/lib", "headers", "nothing changed");
+    ev.assert_hit("lib", "_golist", "nothing changed");
+    // `//@heph/fs:*` are the reads of the tree itself, which every run makes
+    // to find out that nothing changed; everything else must be a hit.
+    let executed: Vec<String> = ev
+        .touched()
+        .into_iter()
+        .filter(|t| t.starts_with("exec") && !t.starts_with("exec //@heph/fs:"))
+        .collect();
+    assert!(executed.is_empty(), "a no-op run executed {executed:#?}");
+    Ok(())
+}
+
+/// G17: a generated `_test.go` file's body changes, its imports do not: the
+/// header target re-runs on the new bytes and `_golist` is a hit.
+#[tokio::test]
+async fn g17_a_generated_test_go_body_edit_keeps_golist() -> anyhow::Result<()> {
+    require_go!();
+    let test_go = "package lib\n\nimport \"testing\"\n\nfunc TestG(t *testing.T) { _ = G() }\n";
+    let ws = make_workspace(gen_pkg(&[("gen.go", GEN_GO), ("gen_test.go", test_go)])?)?;
+    let (pkg, _) = golist(&ws, "lib").await?;
+    assert_eq!(pkg.test_go_files, vec!["gen_test.go"]);
+
+    regen(
+        ws.dir.path(),
+        &[
+            ("gen.go", GEN_GO),
+            ("gen_test.go", &test_go.replace("_ = G()", "t.Log(G())")),
+        ],
+    )?;
+    let ws = reopen(ws)?;
+    let (_, ev) = golist(&ws, "lib").await?;
+    ev.assert_executed("lib", "gen", "the generator changed");
+    ev.assert_executed("@heph/go/headers/lib", "headers", "gen_test.go changed");
+    ev.assert_hit("lib", "_golist", "only a generated test body changed");
+    Ok(())
+}
+
 /// `go/build`'s view of every package directory of a tree: for each, the
 /// `ImportDir` result as JSON (with `-test` files and positions), and the bytes
 /// each `.go` file read, through a one-byte reader.
