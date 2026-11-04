@@ -93,23 +93,29 @@ fn decode_package_uncached(pkg: &PkgBuf, workspace_root: &Path) -> Option<GoPack
     // go.mod above the workspace when no in-workspace go.mod exists.
     //
     // That leniency must not reach another provider's virtual package
-    // (`@heph/bin`, …): it is a non-existent dir under the root go.mod too.
-    // No Go import path may contain `@` (`module.CheckImportPath`), so a
-    // package that does is never first-party Go.
-    if s.contains('@') {
-        return None;
-    }
+    // (`@heph/bin`, …): it is a non-existent dir under the root go.mod too, and
+    // existence cannot tell it from a not-yet-generated top-level `genpb/`. What
+    // does is that it can never be a Go import path, so the path below the
+    // module root must pass Go's import-path rules.
     let src_dir = workspace_root.join(s);
     if let Some((module_root, module_path)) = find_go_mod(&src_dir)
         && module_root.starts_with(workspace_root)
     {
         let rel = src_dir
             .strip_prefix(&module_root)
-            .expect("src_dir must be under module_root");
-        let import_path = if rel.as_os_str().is_empty() {
+            .expect("src_dir must be under module_root")
+            .to_str()?;
+        if !rel
+            .split('/')
+            .filter(|e| !e.is_empty())
+            .all(import_path_elem_ok)
+        {
+            return None;
+        }
+        let import_path = if rel.is_empty() {
             module_path.clone()
         } else {
-            format!("{}/{}", module_path, rel.to_string_lossy())
+            format!("{module_path}/{rel}")
         };
         return Some(GoPackageKind::FirstParty {
             module_root,
@@ -120,6 +126,19 @@ fn decode_package_uncached(pkg: &PkgBuf, workspace_root: &Path) -> Option<GoPack
     }
 
     None
+}
+
+/// One element of a Go import path, per `golang.org/x/mod/module`'s
+/// `checkElem` for import paths: ASCII letters, digits and `-._~+`, not all
+/// dots, and no trailing dot. Its Windows reserved-name rule (`con`, `nul`, …)
+/// is left out: Windows is not a supported platform.
+fn import_path_elem_ok(elem: &str) -> bool {
+    !elem.is_empty()
+        && elem
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'+'))
+        && !elem.bytes().all(|b| b == b'.')
+        && !elem.ends_with('.')
 }
 
 type GoModCache = Mutex<HashMap<PathBuf, Option<(PathBuf, String)>>>;
@@ -638,18 +657,46 @@ mod tests {
     }
 
     // Regression: another provider's virtual package (`@heph/bin`, hostbin's)
-    // is a non-existent dir under the root go.mod too, but no Go import path
-    // can contain `@`, so it is never first-party. Claiming it made the Go
+    // is a non-existent dir under the root go.mod too, but it is not a valid
+    // Go import path, so it is never first-party. Claiming it made the Go
     // provider list `//@heph/bin:build_lib`, which a `label(go-build)` query
-    // then matched and hostbin failed to run.
+    // then matched and hostbin failed to run. A non-existent package that *is*
+    // a valid import path (a not-yet-generated `genpb/`) still decodes.
     #[test]
-    fn test_decode_at_package_under_gomod_returns_none() {
+    fn test_decode_nonexistent_dir_under_gomod_needs_valid_import_path() {
         let ws = make_workspace_with_go_mod("example.com/myrepo");
-        for pkg in ["@heph/bin", "@other", "some/@virtual/pkg"] {
-            assert!(
-                decode_package(&PkgBuf::from(pkg), ws.path()).is_none(),
-                "{pkg} must not decode as a Go package"
+        let cases = [
+            ("@heph/bin", false),
+            ("@other", false),
+            ("some/@virtual/pkg", false),
+            ("has space/pkg", false),
+            ("café", false),
+            ("trailing./pkg", false),
+            ("a/.../b", false),
+            ("tab\tname", false),
+            ("genpb", true),
+            ("gen/deep", true),
+            ("a+b/c~d/e-f_g.h", true),
+            (".hidden/pkg", true),
+        ];
+        for (pkg, ok) in cases {
+            assert_eq!(
+                decode_package(&PkgBuf::from(pkg), ws.path()).is_some(),
+                ok,
+                "{pkg:?} decodes as first-party Go: expected {ok}"
             );
+        }
+    }
+
+    #[test]
+    fn test_import_path_elem_ok() {
+        for ok in ["a", "A9", "a.b", ".a", "a-b", "a_b", "a~b", "a+b", "v2"] {
+            assert!(import_path_elem_ok(ok), "{ok:?} must be accepted");
+        }
+        for bad in [
+            "", ".", "..", "...", "a.", "@a", "a@b", "a b", "é", "a:b", "a\\b",
+        ] {
+            assert!(!import_path_elem_ok(bad), "{bad:?} must be rejected");
         }
     }
 
