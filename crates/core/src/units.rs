@@ -2,6 +2,14 @@
 //! person: `heph tool gc`'s caps, a `scratch` declaration's `max_size`, and a
 //! config file. One definition, so `500MB` cannot come to mean two things
 //! depending on which surface it was typed into.
+//!
+//! Two parsers, one unit table: [`parse_size`] is a CLI and `scratch` cap and
+//! forgives whitespace (`" 8 MiB "`), which its callers' tests and users rely
+//! on; [`parse_memory_size`] is a reservation and refuses it, since `"4 G"` in a
+//! BUILD file is more often a typo than a meaning. Folding the lenient one into
+//! the strict one would change what `heph tool gc --max-size` accepts, so they
+//! stay apart; they must agree on every unit, which `memory_size_parse_table`
+//! checks against `parse_size`.
 
 use anyhow::Context as _;
 
@@ -181,6 +189,8 @@ mod tests {
                 *want,
                 "{s:?}"
             );
+            // The lenient parser agrees on every strict amount.
+            assert_eq!(parse_size(s).ok(), Some(*want), "parse_size {s:?}");
         }
         let err: &[&str] = &[
             "4 G",

@@ -3104,6 +3104,7 @@ target(
         #[derive(Debug, PartialEq)]
         enum Want {
             Fails,
+            BridgeRefuses(&'static str),
             Empty,
             Parses,
             Pool(&'static str, u64),
@@ -3141,8 +3142,14 @@ target(
             (r#"{"cpu": float("nan")}"#, Fails),
             (r#"{"cpu": float("inf")}"#, Fails),
             (r#"{"cpu": 1e30}"#, Fails),
-            (r#"{1: 4}"#, Fails),
-            (r#"{None: 1}"#, Fails),
+            (
+                r#"{1: 4}"#,
+                BridgeRefuses("config dict keys must be strings"),
+            ),
+            (
+                r#"{None: 1}"#,
+                BridgeRefuses("config dict keys must be strings"),
+            ),
             (r#"{"Memory": 1}"#, Fails),
             (r#"{"cpu ": 1}"#, Fails),
             (r#"{"": 1}"#, Fails),
@@ -3187,11 +3194,24 @@ target(
             )
             .unwrap();
             let provider = make_provider(&tmp_dir);
-            let got = run_pkg_blocking(&provider, "mypkg")
-                .and_then(|r| Resources::from_config(&r.targets[0].config));
+            let evaluated = run_pkg_blocking(&provider, "mypkg");
+            // The BUILD bridge refuses a few values before the parser sees
+            // them; the expected message is named, since an eval traceback
+            // quotes the source line and so always "mentions" `resources`.
+            if let BridgeRefuses(want) = want {
+                let msg = format!("{:#}", evaluated.expect_err("the bridge refuses it"));
+                assert!(msg.contains(want), "{expr}: {msg}");
+                continue;
+            }
+            let evaluated = evaluated.unwrap_or_else(|e| panic!("{expr}: BUILD eval: {e:#}"));
+            let got = Resources::from_config(&evaluated.targets[0].config);
             match (&want, got) {
-                (Fails, Err(_)) => {}
-                (Fails, Ok(r)) => panic!("{expr}: want an error, got {r:?}"),
+                // The parser's own error, which names the key it refused.
+                (Fails, Err(e)) => {
+                    let msg = format!("{e:#}");
+                    assert!(msg.contains("resources"), "{expr}: off-topic error {msg}");
+                }
+                (Fails | BridgeRefuses(_), Ok(r)) => panic!("{expr}: want an error, got {r:?}"),
                 (_, Err(e)) => panic!("{expr}: want {want:?}, got error {e:#}"),
                 (Empty, Ok(r)) => assert!(r.is_empty(), "{expr}: {r:?}"),
                 (Parses, Ok(_)) => {}
