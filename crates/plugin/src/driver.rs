@@ -1275,9 +1275,9 @@ impl Resources {
     /// What a target that declares no `cpu` reserves: one CPU.
     pub const DEFAULT_CPU_MICROS: u64 = Self::MICROS_PER_CPU;
     /// The `cpu` an `fs` or relocating `group` driver advertises for a target
-    /// that declares none: 0.0001 CPU, so they still queue through the `cpu`
-    /// pool in FIFO order but 10,000 of them fit in one CPU.
-    pub const VIEW_CPU: &'static str = "0.0001";
+    /// that declares none: 0, so it reserves nothing and is admitted at once,
+    /// never queueing behind a cpu request.
+    pub const VIEW_CPU: &'static str = "0";
     /// The `cpu` an IO-bound driver (`http`, OCI's pull, push, load, layer,
     /// index and image, `go.download`) advertises for a target that declares
     /// none: 0.1 CPU, so ten downloads share one CPU instead of each taking a
@@ -1725,9 +1725,9 @@ mod resources_tests {
         let r = Resources::default()
             .advertise(PoolName::cpu(), Resources::VIEW_CPU)
             .unwrap();
-        assert_eq!(r.declared("cpu"), Some("0.0001"));
+        assert_eq!(r.declared("cpu"), Some("0"));
         let d = r.parse(units).unwrap();
-        assert_eq!(d.amount("cpu"), 100);
+        assert_eq!(d.amount("cpu"), 0);
         assert_eq!(d.amount("memory"), 0);
         assert_eq!(
             Resources::default()

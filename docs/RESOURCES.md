@@ -79,7 +79,7 @@ refuses it at parse (an entrypoint reserves nothing, see
 |---|---|
 | any driver not below, including `exec`, `bash`, `docker_build`, the runners, and a def from a plugin built before resources existed | 1 (the engine's default) |
 | `http`; OCI `pull`, `push`, `load`, `layer`, `index`, `image`; `go.download` | 0.1, advertised by the driver: IO-bound, so ten downloads share one CPU |
-| `fs`, a *relocating* `group` | 0.0001, advertised by the driver: they still queue through the `cpu` pool in order, but 10,000 fit in one CPU |
+| `fs`, a *relocating* `group` | 0, advertised by the driver: they reserve nothing and are admitted at once (see zero-cost targets below) |
 | an aggregate `group` (no transform) | nothing, whatever it declares: it never executes |
 
 A driver whose targets cost other than one CPU **advertises** it: when the
@@ -90,13 +90,16 @@ in `heph inspect def` as the driver's declaration, crosses the plugin ABI in
 `TargetDef.resources` like any other entry, and, like every declaration, is
 never hashed. Undeclared `memory` and custom pools cost 0.
 
-**The light lane.** A request with no bounded need — 0 of every bounded pool
-(`cpu: 0` and nothing else, or `cpu: 0` plus amounts of unbounded pools only)
-— takes one slot of a separate `light` lane instead, whose capacity is
-`max(8 × cpu capacity in CPUs, 64)`. Its unbounded amounts are counted as held
-from the grant. It never waits behind `cpu` requests, and the number of
-concurrent executes stays bounded. `cpu: 0` with `memory: "8G"` still queues
-on memory.
+**Zero-cost targets are unbounded.** A request with no bounded need — 0 of
+every bounded pool (`cpu: 0` and nothing else, or `cpu: 0` plus amounts of
+unbounded pools only) — always fits, so it is granted **at once**: it never
+queues, never waits behind the FIFO's head, and nothing caps how many such
+targets run together. Their concurrency is limited only by the tokio runtime
+and the OS. That is deliberate, and it cuts both ways: an `fs` glob costs
+nothing to admit, but a process-spawning target declared `cpu: 0` launches as
+many processes as there are such targets ready. Its unbounded amounts are
+counted as held from the grant. `cpu: 0` with `memory: "8G"` still queues on
+memory.
 
 ## Configuring pools
 
@@ -256,6 +259,8 @@ reservation).
 - **Strict FIFO.** The head of the queue waits until every pool it needs fits
   at once, and nothing behind it is admitted while it waits. No starvation,
   deterministic, at the cost of idle capacity while a large request waits.
+  The one exception is a zero-cost request (nothing on a bounded pool), which
+  always fits and so is granted on arrival, past the queue.
 - **Atomic.** A grant covers every pool or none, so a target never holds its
   CPUs while it waits for memory.
 - **Clamped.** A request above a pool's capacity is reduced to the capacity:

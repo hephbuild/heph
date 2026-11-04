@@ -3328,7 +3328,7 @@ nested: { a: 1, b: [x, y] }
     fn an_advertised_cpu_crosses_as_a_declaration() {
         let mut td = full_target_def();
         for (text, micros) in [
-            (Resources::VIEW_CPU, 100),
+            (Resources::VIEW_CPU, 0),
             (Resources::IO_CPU, Resources::MICROS_PER_CPU / 10),
         ] {
             td.resources = Resources::default()

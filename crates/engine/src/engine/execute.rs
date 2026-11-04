@@ -429,8 +429,8 @@ impl Engine {
     }
 
     /// Reserve what `addr` declares (`resources`; an undeclared `cpu` is one
-    /// CPU, an all-zero request one light-lane slot) from the engine's pools,
-    /// parking in FIFO order until it fits. A pool whose capacity is 0 fails
+    /// CPU) from the engine's pools, parking in FIFO order until it fits; a
+    /// request needing nothing of a bounded pool is granted at once. A pool whose capacity is 0 fails
     /// the target here, before it runs, naming the override that would set it.
     ///
     /// The reservation is held until the run ends and returns itself on drop;
@@ -485,7 +485,6 @@ impl Engine {
         let reservation = granted.with_context(|| format!("admitting {addr}"))?;
         tracing::debug!(
             addr = %addr,
-            light = reservation.is_light(),
             granted = ?reservation.iter().collect::<Vec<_>>(),
             "admitted"
         );
@@ -608,7 +607,7 @@ fn admission_wait_start(
 }
 
 /// What a run is told of its reservation: `cpu` always, in whole CPUs
-/// (rounded up, at least 1, so a light-lane grant is told 1), and every other
+/// (rounded up, at least 1, so a zero-cost grant is told 1), and every other
 /// pool it was granted more than 0 of, each rendered by its pool's unit
 /// (`unit_of`, the engine's pools).
 pub(crate) fn allotment_of(
@@ -658,7 +657,7 @@ pub(crate) fn entrypoint_allotment(
 /// The `ExecuteStart` event: what the target declared (only its declared
 /// keys, in each pool's unit's base) and what it was granted, after
 /// clamping, and how long admission took. `reserved` always carries `cpu`, 0
-/// on a light-lane grant.
+/// on a zero-cost grant.
 pub(crate) fn execute_start(
     addr: String,
     driver: String,
@@ -762,10 +761,10 @@ mod tests {
         );
     }
 
-    /// A zero-cost target holds a light-lane slot: `reserved` still carries
-    /// `cpu` (0), and the run is told one CPU.
+    /// A zero-cost target reserves nothing: `reserved` still carries `cpu`
+    /// (0), and the run is told one CPU.
     #[test]
-    fn a_light_grant_reserves_zero_cpu_and_is_told_one() {
+    fn a_zero_cost_grant_reserves_zero_cpu_and_is_told_one() {
         let declared = req(&[("cpu", 0)]);
         let r = grant(&[("cpu", Limit::Bounded(4 * CPU))], &declared);
         let BuildEventKind::ExecuteStart { reserved, .. } =

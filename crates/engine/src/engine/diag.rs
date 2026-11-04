@@ -1075,73 +1075,62 @@ fn signed(n: i64) -> String {
 ///
 /// The text is a diagnostic, not an interface. Nothing should parse it — that is
 /// what the machine-readable surface is for.
-/// The admission pools' lines of the report: per lane, each pool's
-/// held/capacity and the queue length, then what the head waits for and for
-/// how long. A strict-FIFO head that does not fit idles everything behind it,
-/// so its unmet need is the line that explains a slow build.
+/// The admission pools' lines of the report: each pool's held/capacity and
+/// the queue length, then what the head waits for and for how long. A
+/// strict-FIFO head that does not fit idles everything behind it, so its
+/// unmet need is the line that explains a slow build.
 fn render_pools(p: &crate::engine::resource_pool::ResourceSnapshot, now: Instant) -> String {
     use hcore::events::display_amount;
     let mut out = String::new();
-    // The light lane's one pool is shown as `slots` under a `zero-cost` label:
-    // its internal name is `light`, which a user may also give a pool of their
-    // own, and the two must not read the same.
-    for (label, lane, light) in [("pools", &p.main, false), ("zero-cost", &p.light, true)] {
-        // The light lane is noise while nothing uses it.
-        if light && lane.queued == 0 && lane.pools.iter().all(|s| s.held == 0) {
-            continue;
-        }
-        fn shown(light: bool, name: &hplugin::provider::PoolName) -> &str {
-            if light { "slots" } else { name.as_str() }
-        }
-        let held: Vec<String> = lane
-            .pools
+    let lane = &p.main;
+    let held: Vec<String> = lane
+        .pools
+        .iter()
+        .map(|s| {
+            format!(
+                "{} {}/{}",
+                s.pool,
+                display_amount(s.unit, s.held),
+                s.capacity
+                    .bounded()
+                    .map_or_else(|| "unbounded".to_owned(), |c| display_amount(s.unit, c))
+            )
+        })
+        .collect();
+    out.push_str(&format!(
+        "  {:<12} {}; {} queued\n",
+        "pools",
+        held.join(", "),
+        lane.queued
+    ));
+    if let Some(head) = &lane.head {
+        let unmet: Vec<String> = head
+            .unmet
             .iter()
-            .map(|s| {
-                let pool = shown(light, &s.pool);
+            .map(|n| {
+                let unit = lane.pools.iter().find(|s| s.pool == n.pool).map_or_else(
+                    || hcore::capacity::Unit::default_for(n.pool.as_str()),
+                    |s| s.unit,
+                );
                 format!(
-                    "{pool} {}/{}",
-                    display_amount(s.unit, s.held),
-                    s.capacity
-                        .bounded()
-                        .map_or_else(|| "unbounded".to_owned(), |c| display_amount(s.unit, c))
+                    "{} {} ({} free)",
+                    n.pool,
+                    display_amount(unit, n.need),
+                    n.free
+                        .map_or_else(|| "unbounded".to_owned(), |f| display_amount(unit, f))
                 )
             })
             .collect();
+        let unmet = if unmet.is_empty() {
+            "nothing unmet".to_owned()
+        } else {
+            unmet.join(", ")
+        };
         out.push_str(&format!(
-            "  {label:<12} {}; {} queued\n",
-            held.join(", "),
-            lane.queued
+            "  {:<12} waits for {unmet} for {}\n",
+            "head",
+            secs(now.saturating_duration_since(head.since))
         ));
-        if let Some(head) = &lane.head {
-            let unmet: Vec<String> = head
-                .unmet
-                .iter()
-                .map(|n| {
-                    let pool = shown(light, &n.pool);
-                    let unit = lane
-                        .pools
-                        .iter()
-                        .find(|s| s.pool == n.pool)
-                        .map_or_else(|| hcore::capacity::Unit::default_for(pool), |s| s.unit);
-                    format!(
-                        "{pool} {} ({} free)",
-                        display_amount(unit, n.need),
-                        n.free
-                            .map_or_else(|| "unbounded".to_owned(), |f| display_amount(unit, f))
-                    )
-                })
-                .collect();
-            let unmet = if unmet.is_empty() {
-                "nothing unmet".to_owned()
-            } else {
-                unmet.join(", ")
-            };
-            out.push_str(&format!(
-                "  {:<12} waits for {unmet} for {}\n",
-                "head",
-                secs(now.saturating_duration_since(head.since))
-            ));
-        }
     }
     out
 }
@@ -1599,8 +1588,7 @@ mod tests {
     const T: Duration = Duration::from_secs(60);
 
     /// D8: the report prints each pool's held/capacity and the queue length,
-    /// then the head's unmet need and how long it has waited; an idle light
-    /// lane is left out.
+    /// then the head's unmet need and how long it has waited.
     #[test]
     fn report_lists_pools_and_the_head_wait() {
         use crate::engine::resource_pool::{
@@ -1638,16 +1626,6 @@ mod tests {
                     since,
                 }),
             },
-            light: LaneSnapshot {
-                pools: vec![PoolSnapshot {
-                    pool: name("light"),
-                    unit: Unit::Count,
-                    capacity: Limit::Bounded(64),
-                    held: 0,
-                }],
-                queued: 0,
-                head: None,
-            },
         };
         let text = render_pools(&snap, now);
         assert_eq!(
@@ -1656,16 +1634,8 @@ mod tests {
              head         waits for cpu 4 (2 free) for 41s\n",
         );
 
-        // A busy light lane beside a user pool that is also named `light`:
-        // the lane reads as `zero-cost`/`slots`, the user's pool as itself.
         // A custom pool reads in its own unit, the head's need included.
         let mut snap = snap;
-        snap.main.pools.push(PoolSnapshot {
-            pool: name("light"),
-            unit: Unit::Count,
-            capacity: Limit::Bounded(2),
-            held: 1,
-        });
         snap.main.pools.push(PoolSnapshot {
             pool: name("scratch_disk"),
             unit: Unit::Bytes,
@@ -1685,22 +1655,16 @@ mod tests {
                 free: Some(7 << 30),
             }];
         }
-        snap.light.pools[0].held = 64;
-        snap.light.queued = 3;
         let text = render_pools(&snap, now);
         assert!(
             text.contains(
-                "memory 2.0 GiB/16.0 GiB, light 1/2, scratch_disk 1.0 GiB/8.0 GiB, \
+                "memory 2.0 GiB/16.0 GiB, scratch_disk 1.0 GiB/8.0 GiB, \
                  tokens 5/unbounded; 7 queued"
             ),
             "{text}"
         );
         assert!(
             text.contains("waits for scratch_disk 8.0 GiB (7.0 GiB free)"),
-            "{text}"
-        );
-        assert!(
-            text.contains("  zero-cost    slots 64/64; 3 queued\n"),
             "{text}"
         );
     }

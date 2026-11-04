@@ -32,10 +32,12 @@
 //! `memory` when the host could not be read) always fits: what is granted from
 //! it is counted, never waited for.
 //!
-//! A request that reserves nothing anywhere (`cpu: 0`) takes 1 of the builtin
-//! **light** lane instead, a separate FIFO with capacity
-//! `max(8 × cpu capacity in CPUs, 64)`: the number of concurrent executes stays
-//! bounded, and a zero-cost target never waits behind a cpu request.
+//! A request that needs nothing of a bounded pool — 0 of every pool (`cpu: 0`
+//! and nothing else), or non-zero amounts of unbounded pools only — is granted
+//! at once and never queues: it always fits, so making it wait behind the head
+//! would only delay it. Nothing caps how many such grants are live; a
+//! zero-cost target is limited by the runtime and the OS alone. Its unbounded
+//! amounts are still counted as held, for the snapshot.
 //!
 //! # The grant and Drop contract
 //!
@@ -85,11 +87,6 @@ pub enum AcquireError {
     Closed,
 }
 
-/// The name of the light lane's one pool. A user may name a pool `light` too:
-/// the lane is a separate [`Lane`], so the two never share a grant, and the
-/// in-flight report shows this one as `zero-cost`/`slots`.
-const LIGHT: &str = "light";
-
 /// A pool's capacity in its unit's base (micro-CPUs, bytes, a count).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Limit {
@@ -116,32 +113,14 @@ impl Limit {
 #[derive(Debug)]
 pub struct ResourcePool {
     main: Arc<Lane>,
-    light: Arc<Lane>,
 }
 
 impl ResourcePool {
     /// A pool with these capacities (`cpu` in micro-CPUs, `memory` in bytes, a
-    /// custom pool a count). A pool given twice keeps the last capacity. The
-    /// light lane is sized from the `cpu` capacity (absent counts as 0,
-    /// unbounded as `u64::MAX`).
+    /// custom pool a count). A pool given twice keeps the last capacity.
     pub fn new(capacities: impl IntoIterator<Item = (PoolName, Limit)>) -> Arc<Self> {
-        let capacities: BTreeMap<PoolName, Limit> = capacities.into_iter().collect();
-        let cpu = capacities
-            .get(PoolName::CPU)
-            .map_or(0, |l| l.bounded().unwrap_or(u64::MAX));
-        let light_capacity = cpu
-            .div_ceil(Resources::MICROS_PER_CPU)
-            .saturating_mul(8)
-            .max(64);
-        // `light` is a well-formed pool name; the fallback only names the
-        // lane's one pool in a snapshot and never decides a grant.
-        let light_name = PoolName::try_from(LIGHT).unwrap_or_else(|_| PoolName::cpu());
         Arc::new(Self {
-            main: Lane::new(capacities, false),
-            light: Lane::new(
-                BTreeMap::from([(light_name, Limit::Bounded(light_capacity))]),
-                true,
-            ),
+            main: Lane::new(capacities.into_iter().collect()),
         })
     }
 
@@ -151,22 +130,12 @@ impl ResourcePool {
         self.main.capacity.get(idx).copied()
     }
 
-    /// Every named pool and its capacity, in name order (the light lane is not
-    /// a named pool).
+    /// Every named pool and its capacity, in name order.
     pub fn capacities(&self) -> impl Iterator<Item = (&PoolName, Limit)> {
         self.main
             .names
             .iter()
             .zip(self.main.capacity.iter().copied())
-    }
-
-    /// The light lane's capacity.
-    pub fn light_capacity(&self) -> u64 {
-        self.light
-            .capacity
-            .first()
-            .and_then(|l| l.bounded())
-            .unwrap_or(0)
     }
 
     /// What nobody holds in a named pool right now, `None` when it is not one
@@ -189,28 +158,22 @@ impl ResourcePool {
         let bounded = need
             .iter()
             .any(|&(idx, _)| matches!(self.main.capacity.get(idx), Some(Limit::Bounded(_))));
+        let need = need.into_boxed_slice();
         if bounded {
-            return Ok(self.main.enqueue(need.into_boxed_slice(), clamped));
+            return Ok(self.main.enqueue(need, clamped));
         }
-        // Nothing on a bounded pool: the light lane bounds how many run, and
-        // any unbounded amounts ride along, counted as held in the main lane
-        // from the grant (they always fit, so they never wait there).
-        let mut acquire = self.light.enqueue(Box::new([(0, 1)]), clamped);
-        if !need.is_empty() {
-            acquire.riding = Some(Riding {
-                lane: Arc::clone(&self.main),
-                granted: need.into_boxed_slice(),
-            });
-        }
-        Ok(acquire)
+        // Nothing on a bounded pool: it always fits, so it is granted now,
+        // past any queue, and nothing caps how many such grants are live.
+        Ok(Acquire {
+            state: AcquireState::Ready(Some(self.main.grant_now(need, clamped))),
+        })
     }
 
-    /// Per pool held/free/capacity, queue lengths, and what the head of each
-    /// lane is waiting for.
+    /// Per pool held/free/capacity, the queue length, and what the head is
+    /// waiting for.
     pub fn snapshot(&self) -> ResourceSnapshot {
         ResourceSnapshot {
             main: self.main.snapshot(),
-            light: self.light.snapshot(),
         }
     }
 
@@ -414,7 +377,6 @@ impl EnginePools {
     /// unit. `None` before the first admission has built the pool.
     pub fn snapshot(&self) -> Option<ResourceSnapshot> {
         let mut snap = self.built()?.snapshot();
-        // The light lane's pool is not a named pool: it keeps its default.
         for s in &mut snap.main.pools {
             if let Some(unit) = self.unit(s.pool.as_str()) {
                 s.unit = unit;
@@ -424,18 +386,14 @@ impl EnginePools {
     }
 }
 
-/// One FIFO over a fixed set of pools. The main lane holds every named pool;
-/// the light lane holds one.
+/// One FIFO over every named pool.
 #[derive(Debug)]
 struct Lane {
     /// Sorted, so a pool is found by binary search; indices are stable.
     names: Box<[PoolName]>,
     capacity: Box<[Limit]>,
-    /// Index of the `cpu` pool in `names`; `None` in the light lane, or if
-    /// the lane has no `cpu` pool.
+    /// Index of the `cpu` pool in `names`; `None` if there is none.
     cpu_idx: Option<usize>,
-    /// The light lane, whose grants reserve no named pool.
-    light: bool,
     state: Mutex<State>,
 }
 
@@ -459,15 +417,11 @@ struct Waiter {
 }
 
 impl Lane {
-    fn new(capacities: BTreeMap<PoolName, Limit>, light: bool) -> Arc<Self> {
+    fn new(capacities: BTreeMap<PoolName, Limit>) -> Arc<Self> {
         let (names, capacity): (Vec<PoolName>, Vec<Limit>) = capacities.into_iter().unzip();
-        let cpu_idx = if light {
-            None
-        } else {
-            names
-                .binary_search_by(|p| p.as_str().cmp(PoolName::CPU))
-                .ok()
-        };
+        let cpu_idx = names
+            .binary_search_by(|p| p.as_str().cmp(PoolName::CPU))
+            .ok();
         Arc::new(Self {
             state: Mutex::new(State {
                 held: vec![0; capacity.len()].into_boxed_slice(),
@@ -477,7 +431,6 @@ impl Lane {
             names: names.into_boxed_slice(),
             capacity: capacity.into_boxed_slice(),
             cpu_idx,
-            light,
         })
     }
 
@@ -507,6 +460,20 @@ impl Lane {
         Ok(())
     }
 
+    /// Grant `need` now, past the queue. Only for a need that always fits
+    /// (unbounded pools only, or nothing at all); an empty one takes no lock.
+    fn grant_now(self: &Arc<Self>, need: Box<[(usize, u64)]>, clamped: bool) -> Reservation {
+        if !need.is_empty() {
+            take(&mut self.state.lock().held, &need);
+        }
+        Reservation {
+            lane: Arc::clone(self),
+            granted: need,
+            clamped,
+            armed: true,
+        }
+    }
+
     fn enqueue(self: &Arc<Self>, need: Box<[(usize, u64)]>, clamped: bool) -> Acquire {
         let mut st = self.state.lock();
         if st.waiters.is_empty() && fits(&self.capacity, &st.held, &need) {
@@ -518,9 +485,7 @@ impl Lane {
                     granted: need,
                     clamped,
                     armed: true,
-                    riding: None,
                 })),
-                riding: None,
             };
         }
         let seq = st.next_seq;
@@ -548,7 +513,6 @@ impl Lane {
                 },
                 rx,
             },
-            riding: None,
         }
     }
 
@@ -567,7 +531,6 @@ impl Lane {
                 granted: waiter.need,
                 clamped: waiter.clamped,
                 armed: true,
-                riding: None,
             };
             if let Err(mut unobserved) = waiter.tx.send(reservation) {
                 unobserved.armed = false;
@@ -577,6 +540,10 @@ impl Lane {
     }
 
     fn release(self: &Arc<Self>, granted: &[(usize, u64)]) {
+        // An empty grant frees nothing, so it can admit nobody.
+        if granted.is_empty() {
+            return;
+        }
         let mut st = self.state.lock();
         give(&self.capacity, &mut st.held, granted);
         self.grant_chain(&mut st);
@@ -685,20 +652,6 @@ fn give(capacity: &[Limit], held: &mut [u64], granted: &[(usize, u64)]) {
     }
 }
 
-/// Unbounded main-lane amounts carried by a light-lane grant: counted as
-/// held in `lane` from the grant until the reservation drops.
-#[derive(Debug)]
-struct Riding {
-    lane: Arc<Lane>,
-    granted: Box<[(usize, u64)]>,
-}
-
-impl Riding {
-    fn take(&self) {
-        take(&mut self.lane.state.lock().held, &self.granted);
-    }
-}
-
 /// What a target holds while it runs; returns itself to the pool on drop.
 #[derive(Debug)]
 pub struct Reservation {
@@ -708,8 +661,6 @@ pub struct Reservation {
     /// False only for a grant handed back by a failed send, whose amounts the
     /// chain re-added itself.
     armed: bool,
-    /// On a light-lane grant, the unbounded named pools it also holds.
-    riding: Option<Riding>,
 }
 
 impl Reservation {
@@ -718,39 +669,23 @@ impl Reservation {
         self.clamped
     }
 
-    /// Whether this is a light-lane grant (the request reserved nothing).
-    pub fn is_light(&self) -> bool {
-        self.lane.light
-    }
-
-    /// The granted amount of a named pool; 0 for a pool not reserved (and, on
-    /// a light-lane grant, for every bounded pool).
+    /// The granted amount of a named pool; 0 for a pool not reserved.
     pub fn amount(&self, pool: &str) -> u64 {
         self.iter()
             .find_map(|(p, n)| (p.as_str() == pool).then_some(n))
             .unwrap_or(0)
     }
 
-    /// The granted amounts of named pools: on a light-lane grant, only the
-    /// unbounded ones riding along.
+    /// The granted non-zero amounts, by pool; empty for a zero-cost grant.
     pub fn iter(&self) -> impl Iterator<Item = (&PoolName, u64)> {
-        let (lane, granted): (&Lane, &[(usize, u64)]) = match (&self.riding, self.is_light()) {
-            (Some(r), _) => (&r.lane, &r.granted),
-            (None, true) => (&self.lane, &[]),
-            (None, false) => (&self.lane, &self.granted),
-        };
-        granted
+        self.granted
             .iter()
-            .filter_map(move |&(idx, n)| Some((lane.names.get(idx)?, n)))
+            .filter_map(|&(idx, n)| Some((self.lane.names.get(idx)?, n)))
     }
 }
 
 impl Drop for Reservation {
     fn drop(&mut self) {
-        if let Some(r) = self.riding.take() {
-            // Unbounded amounts: returning them can admit nobody.
-            give(&r.lane.capacity, &mut r.lane.state.lock().held, &r.granted);
-        }
         if self.armed {
             self.lane.release(&self.granted);
         }
@@ -762,8 +697,6 @@ impl Drop for Reservation {
 #[derive(Debug)]
 pub struct Acquire {
     state: AcquireState,
-    /// Unbounded amounts a light-lane request carries, taken at the grant.
-    riding: Option<Riding>,
 }
 
 #[derive(Debug)]
@@ -791,7 +724,7 @@ impl Future for Acquire {
     type Output = Result<Reservation, AcquireError>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let res = match &mut self.state {
+        Poll::Ready(match &mut self.state {
             AcquireState::Ready(r) => r.take().ok_or(AcquireError::Closed),
             AcquireState::Waiting { guard, rx } => match Pin::new(rx).poll(cx) {
                 Poll::Pending => return Poll::Pending,
@@ -805,16 +738,7 @@ impl Future for Acquire {
                     res.map_err(|_closed| AcquireError::Closed)
                 }
             },
-        };
-        // The riders are taken with the grant the caller observes, so a grant
-        // that is never observed never counts them.
-        Poll::Ready(res.map(|mut r| {
-            if let Some(riding) = self.riding.take() {
-                riding.take();
-                r.riding = Some(riding);
-            }
-            r
-        }))
+        })
     }
 }
 
@@ -859,8 +783,6 @@ pub struct PoolNeed {
 pub struct ResourceSnapshot {
     /// Every named pool, in name order.
     pub main: LaneSnapshot,
-    /// The light lane: one pool, `light`.
-    pub light: LaneSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -900,7 +822,6 @@ pub struct HeadSnapshot {
 mod tests {
     use super::*;
     use futures::FutureExt as _;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     const CPU: u64 = Resources::MICROS_PER_CPU;
@@ -1044,81 +965,44 @@ mod tests {
         assert_eq!(free(&p, "cpu"), CPU);
     }
 
-    /// The light lane is bounded at its capacity: `cap` grants are taken at
-    /// once, the next waits, and one release admits it.
+    /// An all-zero request is granted at once, past a full cpu pool and a cpu
+    /// waiter at the head, and reserves nothing; the waiter keeps its place.
     #[test]
-    fn the_light_lane_queues_past_its_capacity() {
-        let p = pool(&[("cpu", CPU)]);
-        let cap = p.light_capacity();
-        assert_eq!(cap, 64, "max(8 × 1, 64)");
-        let zero = req(&[("cpu", 0)]);
-        let mut held: Vec<_> = (0..cap).map(|_| now(&p, &zero)).collect();
-        assert!(held.iter().all(Reservation::is_light));
-        let mut next = queued(&p, &zero);
-        assert_eq!(p.snapshot().light.queued, 1);
-        drop(held.pop());
-        assert!(granted(&mut next).unwrap().is_light());
-        assert_eq!(free(&p, "cpu"), CPU, "the light lane never touches cpu");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn zero_cost_requests_use_the_light_pool_and_are_bounded() {
-        let p = pool(&[("cpu", CPU)]);
-        let cap = p.light_capacity();
-        assert_eq!(cap, 64, "max(8 × 1, 64)");
-        let in_flight = Arc::new(AtomicUsize::new(0));
-        let peak = Arc::new(AtomicUsize::new(0));
-        let mut tasks = tokio::task::JoinSet::new();
-        for _ in 0..10 * cap {
-            let (p, in_flight, peak) = (Arc::clone(&p), Arc::clone(&in_flight), Arc::clone(&peak));
-            tasks.spawn(async move {
-                let r = p.acquire(&req(&[("cpu", 0)])).unwrap().await.unwrap();
-                assert!(r.is_light());
-                assert_eq!(r.amount("cpu"), 0);
-                let n = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-                peak.fetch_max(n, Ordering::SeqCst);
-                // Hold the grant until the lane fills, so the bound is
-                // reached rather than merely not exceeded (bounded wait).
-                for _ in 0..1_000 {
-                    if peak.load(Ordering::SeqCst) >= usize::try_from(cap).unwrap() {
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                }
-                in_flight.fetch_sub(1, Ordering::SeqCst);
-                drop(r);
-            });
-        }
-        tokio::time::timeout(Duration::from_secs(30), async {
-            while let Some(r) = tasks.join_next().await {
-                r.unwrap();
-            }
-        })
-        .await
-        .expect("light waiters starved");
-        let peak = u64::try_from(peak.load(Ordering::SeqCst)).unwrap();
-        assert_eq!(peak, cap, "the lane filled exactly to its capacity");
-        assert_eq!(free(&p, "cpu"), CPU, "the light lane never touches cpu");
-        assert_eq!(p.snapshot().light.pools[0].free(), Some(cap));
-    }
-
-    #[test]
-    fn zero_cost_requests_never_wait_for_cpu() {
+    fn an_all_zero_request_is_granted_past_a_full_queue() {
         let p = pool(&[("cpu", CPU), ("memory", 8 * GIB)]);
         let held = now(&p, &req(&[]));
         let mut waiting_for_cpu = queued(&p, &req(&[]));
-        // The cpu lane is blocked at its head; a zero-cost request is not in it.
-        let light = now(&p, &req(&[("cpu", 0)]));
-        assert!(light.is_light());
+        for zero in [req(&[("cpu", 0)]), req(&[("cpu", 0), ("memory", 0)])] {
+            let r = now(&p, &zero);
+            assert_eq!(r.iter().count(), 0, "reserves nothing");
+            assert_eq!(p.snapshot().main.queued, 1, "never queued");
+            drop(r);
+            assert!(
+                (&mut waiting_for_cpu).now_or_never().is_none(),
+                "its release admits nobody"
+            );
+        }
         drop(held);
         drop(granted(&mut waiting_for_cpu).unwrap());
 
         // `cpu: 0` with memory is not zero-cost: it queues on memory.
         let mem = now(&p, &req(&[("cpu", 0), ("memory", 8 * GIB)]));
-        assert!(!mem.is_light());
         let mut more = queued(&p, &req(&[("cpu", 0), ("memory", 8 * GIB)]));
         drop(mem);
-        assert!(!granted(&mut more).unwrap().is_light());
+        assert_eq!(granted(&mut more).unwrap().amount("memory"), 8 * GIB);
+    }
+
+    /// Nothing caps zero-cost grants: far more than any cpu-derived bound
+    /// are live at once, none touching cpu.
+    #[test]
+    fn many_zero_cost_requests_are_all_granted_at_once() {
+        let p = pool(&[("cpu", CPU)]);
+        let zero = req(&[("cpu", 0)]);
+        let held: Vec<_> = (0..10_000).map(|_| now(&p, &zero)).collect();
+        assert_eq!(free(&p, "cpu"), CPU);
+        assert_eq!(p.snapshot().main.queued, 0);
+        drop(held);
+        assert_eq!(free(&p, "cpu"), CPU);
     }
 
     #[test]
@@ -1280,7 +1164,6 @@ mod tests {
     #[test]
     fn amounts_at_u64_max_do_not_wrap() {
         let p = pool(&[("cpu", u64::MAX), ("tokens", u64::MAX)]);
-        assert_eq!(p.light_capacity(), (u64::MAX / CPU + 1) * 8);
         let all = now(&p, &req(&[("cpu", u64::MAX), ("tokens", u64::MAX)]));
         assert!(!all.clamped());
         let mut one = queued(&p, &req(&[("tokens", 1)]));
@@ -1342,8 +1225,6 @@ mod tests {
         assert_eq!(info.since, h.since);
         assert_eq!(info.pools.len(), 2);
         assert_eq!(follower.wait_info().unwrap().ahead, 1);
-        assert_eq!(s.light.queued, 0);
-        assert_eq!(s.light.pools[0].pool, name("light"));
     }
 
     #[test]
@@ -1450,24 +1331,45 @@ mod tests {
     }
 
     /// D3: a def that says nothing reserves 1 cpu (exec, template), except
-    /// `fs` and `group`, which advertise 0.0001 CPU (100 micro-CPUs).
+    /// `fs` and `group`, which advertise cpu 0 and so reserve nothing.
     #[tokio::test]
     async fn a_def_without_resources_costs_one_cpu() {
         let p = pool(&[("cpu", 4 * CPU)]);
         for (driver, resources) in driver_defs(None).await {
             let want = match driver {
-                "fs" | "group" => 100,
+                "fs" | "group" => 0,
                 _ => CPU,
             };
             assert_eq!(resources.amount("cpu"), want, "{driver}");
             let r = now(&p, &resources);
-            assert!(!r.is_light(), "{driver}");
             assert_eq!(r.amount("cpu"), want, "{driver}");
+            if want == 0 {
+                assert_eq!(r.iter().count(), 0, "{driver}: reserves nothing");
+            }
         }
     }
 
+    /// An `fs` glob def is admitted at once while the cpu pool is saturated
+    /// and a `cpu: 1` waiter is at the head.
+    #[tokio::test]
+    async fn an_fs_def_is_granted_past_a_saturated_cpu_pool() {
+        let p = pool(&[("cpu", CPU)]);
+        let held = now(&p, &req(&[("cpu", CPU)]));
+        let mut head = queued(&p, &req(&[("cpu", CPU)]));
+        let fs = driver_defs(None)
+            .await
+            .into_iter()
+            .find_map(|(d, r)| (d == "fs").then_some(r))
+            .unwrap();
+        let r = now(&p, &fs);
+        assert_eq!(r.iter().count(), 0);
+        assert_eq!(p.snapshot().main.queued, 1, "the head still waits");
+        drop((r, held));
+        assert!(granted(&mut head).is_some());
+    }
+
     /// D3, D5: a declared `cpu` replaces every driver's default, and `cpu: 0`
-    /// takes the light lane, reserving nothing from `cpu`.
+    /// is granted at once, reserving nothing from `cpu`.
     #[tokio::test]
     async fn declared_resources_override_the_default() {
         use hcore::htvalue::Value;
@@ -1480,7 +1382,7 @@ mod tests {
         for (driver, resources) in driver_defs(cpu(Value::Int(0))).await {
             assert_eq!(resources.declared("cpu"), Some(0), "{driver}");
             let r = now(&p, &resources);
-            assert!(r.is_light(), "{driver}: cpu 0 is the light lane");
+            assert_eq!(r.iter().count(), 0, "{driver}: cpu 0 reserves nothing");
             assert_eq!(free(&p, "cpu"), 4 * CPU, "{driver}: holds no cpu");
         }
     }
@@ -1514,11 +1416,11 @@ mod tests {
     }
 
     /// A request that needs nothing of a bounded pool (`cpu: 0` beside an
-    /// unbounded pool only) takes the light lane, so its concurrency is
-    /// bounded, while its unbounded amounts are granted and counted as held
-    /// in their pool from the grant until the release.
+    /// unbounded pool only) is granted at once, past a cpu waiter at the
+    /// head, and its unbounded amounts are counted as held in their pool from
+    /// the grant until the release.
     #[test]
-    fn unbounded_only_requests_take_the_light_lane_and_keep_their_amounts() {
+    fn unbounded_only_requests_are_granted_at_once_and_keep_their_amounts() {
         let p = ResourcePool::new([
             (name("cpu"), Limit::Bounded(CPU)),
             (name("tokens"), Limit::Unbounded),
@@ -1531,23 +1433,25 @@ mod tests {
                 .find(|s| s.pool == name("tokens"))
                 .map(|s| s.held)
         };
+        let cpu = now(&p, &req(&[]));
+        let mut head = queued(&p, &req(&[]));
         let r = req(&[("cpu", 0), ("tokens", 5)]);
-        let cap = p.light_capacity();
-        let mut held: Vec<_> = (0..cap).map(|_| now(&p, &r)).collect();
-        assert!(held.iter().all(Reservation::is_light));
+        let held: Vec<_> = (0..100).map(|_| now(&p, &r)).collect();
         assert_eq!(held[0].amount("tokens"), 5);
         assert_eq!(held[0].amount("cpu"), 0);
-        assert_eq!(tokens_held(&p), Some(5 * cap));
-        let mut next = queued(&p, &r);
-        assert_eq!(p.snapshot().light.queued, 1, "bounded by the light lane");
-        assert_eq!(tokens_held(&p), Some(5 * cap), "a waiter holds nothing");
-        drop(held.pop());
-        let got = granted(&mut next).unwrap();
-        assert!(got.is_light());
-        assert_eq!(tokens_held(&p), Some(5 * cap));
-        drop((got, held));
+        assert_eq!(tokens_held(&p), Some(500));
+        assert_eq!(p.snapshot().main.queued, 1, "only the cpu waiter");
+        // An unobserved zero-cost grant returns its amounts too.
+        drop(p.acquire(&r).unwrap());
+        assert_eq!(tokens_held(&p), Some(500));
+        drop(held);
         assert_eq!(tokens_held(&p), Some(0));
-        assert_eq!(free(&p, "cpu"), CPU, "the light lane never touches cpu");
+        assert!(
+            (&mut head).now_or_never().is_none(),
+            "releasing unbounded amounts admits nobody"
+        );
+        drop(cpu);
+        assert!(granted(&mut head).is_some());
     }
 
     /// No value: a custom pool is unbounded, `cpu`/`memory` keep their

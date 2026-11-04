@@ -13,7 +13,7 @@
 //! `TempDir`. The test waits — with a deadline — until the pool snapshot shows
 //! one held and the other queued, checks the queued one has no `ExecuteStart`,
 //! opens the gate and asserts the two `ExecuteStart`/`ExecuteEnd` pairs never
-//! interleave in stream order. `two_light_targets_do_overlap` is the positive
+//! interleave in stream order. `two_small_targets_do_overlap` is the positive
 //! control: the same probe sees the overlap when the pool has room for both.
 
 use hcore::capacity::{Capacity, PoolSpec, Unit};
@@ -344,7 +344,7 @@ async fn empty_resources_count_as_cpu_one() -> anyhow::Result<()> {
 /// The positive control: the same probe at `cpu: 1` on a 4-cpu pool sees both
 /// running at once, so the probe can see an overlap.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn two_light_targets_do_overlap() -> anyhow::Result<()> {
+async fn two_small_targets_do_overlap() -> anyhow::Result<()> {
     let ws = tempfile::tempdir()?;
     let gates = tempfile::tempdir()?;
     let gate = gates.path().join("open");

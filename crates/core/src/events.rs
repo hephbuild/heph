@@ -58,8 +58,7 @@ pub fn display_amount(unit: Unit, amount: u64) -> String {
 }
 
 /// The unit of `pool` as a `RequestConfig`'s `units` names it; a pool it
-/// does not name (a host that predates `units`, or the light lane's `light`)
-/// has its default unit: a builtin's own, else `count`.
+/// does not name (a host that predates `units`) has its default unit: a builtin's own, else `count`.
 pub fn unit_of(units: &BTreeMap<String, String>, pool: &str) -> Unit {
     units
         .get(pool)
@@ -243,8 +242,8 @@ pub enum BuildEventKind {
         #[serde(default)]
         declared: Option<BTreeMap<String, u64>>,
         /// What the engine granted, after clamping to each pool's capacity.
-        /// Always carries `cpu` (0 for a zero-cost target, which holds a
-        /// light-lane slot instead). `None` from a host that predates
+        /// Always carries `cpu` (0 for a zero-cost target, which reserves
+        /// nothing and is admitted at once). `None` from a host that predates
         /// resources: such a target counts as one CPU.
         #[serde(default)]
         reserved: Option<BTreeMap<String, u64>>,
@@ -305,7 +304,7 @@ pub enum BuildEventKind {
     /// threshold.
     AdmissionWaitStart {
         addr: String,
-        /// The pool waited on (`cpu`, `memory`, a custom pool, or `light`).
+        /// The pool waited on (`cpu`, `memory`, or a custom pool).
         pool: String,
         /// What the target needs of `pool`, in the pool's unit.
         need: u64,

@@ -965,7 +965,7 @@ struct FsSpec {
     #[spec(ty = ParamType::String)]
     e: Option<String>,
     /// What the target reserves from the resource pools while it runs.
-    /// Defaults to 0.0001 cpu. Never hashed.
+    /// Defaults to 0 cpu: it reserves nothing. Never hashed.
     resources: hplugin::driver::Resources,
 }
 
@@ -1667,7 +1667,7 @@ mod tests {
         );
     }
 
-    /// An fs target that declares no `cpu` advertises 0.0001 CPU (D3); a
+    /// An fs target that declares no `cpu` advertises 0 CPU (D3); a
     /// declaration replaces that `cpu`, keeps its other pools, and moves no
     /// def hash (U5).
     #[tokio::test]
@@ -1687,13 +1687,13 @@ mod tests {
                 .target_def
         };
         let plain = parse(None).await;
-        assert_eq!(plain.resources.declared("cpu"), Some("0.0001"));
+        assert_eq!(plain.resources.declared("cpu"), Some("0"));
         assert_eq!(plain.resources.len(), 1);
         let gpu_only = parse(Some(Value::Map(
             [("gpu".to_string(), Value::Int(1))].into(),
         )))
         .await;
-        assert_eq!(gpu_only.resources.declared("cpu"), Some("0.0001"));
+        assert_eq!(gpu_only.resources.declared("cpu"), Some("0"));
         assert_eq!(gpu_only.resources.declared("gpu"), Some("1"));
         let heavy = parse(Some(Value::Map(
             [("cpu".to_string(), Value::Int(2))].into(),

@@ -73,7 +73,7 @@ struct GroupSpec {
     /// emitted paths to destinations.
     rename: Rename,
     /// What the target reserves from the resource pools while it runs, e.g.
-    /// `{"cpu": 2}`. Defaults to 0.0001 cpu. Never hashed. Only a group that
+    /// `{"cpu": 2}`. Defaults to 0 cpu: it reserves nothing. Never hashed. Only a group that
     /// executes (a relocating one) reserves it: an aggregate group is spliced
     /// into its consumers and never reaches admission.
     resources: hplugin::driver::Resources,
@@ -582,7 +582,7 @@ mod tests {
         );
     }
 
-    /// A relocating group that declares no `cpu` advertises 0.0001 CPU (D3);
+    /// A relocating group that declares no `cpu` advertises 0 CPU (D3);
     /// a declared `cpu` replaces it, and neither moves the def hash (U5). An
     /// aggregate group never executes, so it advertises nothing.
     #[tokio::test]
