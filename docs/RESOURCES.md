@@ -46,12 +46,18 @@ No spaces, signs, exponents or separators. The `cpu` pool's unit is `cpu`, the
 it (`count` unless it says otherwise). A target names at most 16 pools; pool
 names are `[a-z][a-z0-9_]{0,63}`.
 
-A pool that is not configured is an error when the def is linked, which
-`heph validate` reports too:
+A pool that is not configured is an error when the def is linked, so
+`heph validate` refuses it too; `--resource <name>=<n>` declares the pool for
+one run (see [Per-run overrides](#per-run-overrides)):
 
 ```
-//p:t declares resources.docker, but docker is not a pool: add resources: {docker: <n>} to .hephconfig (known: cpu, memory)
+//p:t declares resources.docker, but docker is not a pool: add resources: {docker: <n>} to .hephconfig, or --resource docker=<n> for one run (known: cpu, memory)
 ```
+
+When the amount is not a count, the entry to add names its unit:
+`resources = {"scratch": "64G"}` suggests `{scratch: {unit: bytes, value: <n>}}`,
+since a bare `<n>` would declare a count pool and then refuse `"64G"`. A name
+close to a known pool adds `(did you mean <pool>?)`.
 
 A wrong shape (not a dict, a non-string key, a list as an amount) fails the
 driver's `parse` with the target named; an amount its unit refuses fails at
@@ -77,14 +83,18 @@ refuses it at parse (an entrypoint reserves nothing, see
 | an aggregate `group` (no transform) | nothing, whatever it declares: it never executes |
 
 A declared `cpu` always wins. Undeclared `memory` and custom pools cost 0.
-The cdylib drivers (OCI, Go) send their lowered default across the plugin ABI
-as a declared `cpu`, so on the host their defs show it as a declaration.
+A lowered default is not a declaration: it stays off `resources`, so
+`heph inspect def` shows no `cpu` the target did not write, and the cdylib
+drivers (OCI, Go) carry theirs across the plugin ABI in its own field
+(`TargetDef.default_cpu`), which the host decodes back into the default.
 
-**The light lane.** A target that asks for 0 of everything (`cpu: 0` and
-nothing else) takes one slot of a separate `light` lane instead, whose
-capacity is `max(8 × cpu capacity in CPUs, 64)`. It never waits behind `cpu`
-requests, and the number of concurrent executes stays bounded. `cpu: 0` with
-`memory: "8G"` still queues on memory.
+**The light lane.** A request with no bounded need — 0 of every bounded pool
+(`cpu: 0` and nothing else, or `cpu: 0` plus amounts of unbounded pools only)
+— takes one slot of a separate `light` lane instead, whose capacity is
+`max(8 × cpu capacity in CPUs, 64)`. Its unbounded amounts are counted as held
+from the grant. It never waits behind `cpu` requests, and the number of
+concurrent executes stays bounded. `cpu: 0` with `memory: "8G"` still queues
+on memory.
 
 ## Configuring pools
 
@@ -103,6 +113,8 @@ resources:
 
 - **`{unit, value}`**: `unit` is `count`, `cpu` or `bytes`; `value` is an
   amount in it. A builtin's unit is fixed: `cpu: {unit: bytes}` is an error.
+  With no `unit` the pool's default unit applies, so a new pool written
+  `{value: 3}` is a count.
 - **Shorthand**: the amount alone, in the pool's default unit (`cpu` for
   `cpu`, `bytes` for `memory`, `count` for anything else).
 - **No value**: a custom pool is **unbounded**: every request is granted at
@@ -141,7 +153,8 @@ profile that tries is an error naming both.
 - `--resource <name>=<n>`, global and repeatable, once per pool.
 - `HEPH_RESOURCE_<NAME>=<n>` in heph's own environment (`<NAME>` is
   lowercased into the pool name). A malformed one is an error naming the
-  variable, never ignored.
+  variable; only the shell-completion and credential helpers, which run no
+  targets, ignore it with a warning.
 - `-j N` / `--jobs N` is `--resource cpu=N`: CPUs the run may reserve at once,
   **not** a target count. Giving both `-j` and `--resource cpu=` is an error.
 
@@ -197,9 +210,31 @@ reference text, so the mapping never moves a key.
   //p:t: `env.MEM` reads ${resource:memory}, but the target reserves no memory: add resources = {"memory": <amount>} to it
   ```
 
-- **Anything else passes through untouched**, like any `${…}` heph does not
-  own: `${resource:cpus}` (no such pool), `${resource:CPU}`, `${resource:-x}`,
-  bash's `${resource:offset}`.
+  A pool declared at 0 (`resources = {"gpu": 0}`) reserves none either, and
+  the message says so: `… reads ${resource:gpu}, but the target declares
+  gpu: 0, so it reserves none: declare an amount above 0`.
+- **A pool-shaped name that is no configured pool is a link error** too, with
+  a did-you-mean and the `--resource` route:
+
+  ```
+  //p:t: `env.X` reads ${resource:cpus}, but cpus is not a pool (did you mean cpu?): add resources: {cpus: <n>} to .hephconfig, or --resource cpus=<n> for one run (known: cpu, memory)
+  ```
+
+  Pool-shaped is the pool-name grammar, `[a-z][a-z0-9_]{0,63}`. The same two
+  checks hold a dependency's transitive `env` to the dependent's reservation,
+  over the merged sandbox env.
+- **Only text that is not pool-shaped passes through untouched**, like any
+  `${…}` heph does not own: `${resource:CPU}`, `${resource:-x}`,
+  `${resource:2}`. Bash's substring form with a lowercase variable
+  (`${resource:offset}`) is pool-shaped and so refused; write it
+  `${resource:$offset}` or `${resource: offset}`.
+
+From bash, put the allotment in a variable and read it:
+`env = {"N": "${resource:cpu}"}`, then `run = "make -j$N"`.
+
+**Rounding.** `cpu` renders in whole CPUs rounded up, so a `cpu: 0.5` target
+is told `1`. An author mapping it into `make -j` or a thread count gets one
+job per started CPU, not half of one; declare whole CPUs where that matters.
 
 **Entrypoints** (`heph run` of an entrypoint target) reserve nothing: they run
 in the caller's terminal, one at a time, and `${resource:cpu}` is the whole
@@ -298,6 +333,26 @@ depends on it is no more hermetic for holding the pool.
 **Nothing is enforced.** A reservation is a promise the target makes, not a
 limit heph applies: a `cpu: 1` target that spawns 32 threads gets 32 threads.
 
+## Measured
+
+The new `-j` default (cores, where it was `2 × cores` slots) was timed on a
+12-core macOS laptop under load 23–35, on the strollplanner-v2 `core` module,
+n=3 each:
+
+| Loop | `-j 100%` (default) | `-j 200%` (old concurrency) |
+|---|---|---|
+| inner loop (one package's tests), median | 0.91 s | 0.90 s |
+| cold build (817 targets) | 28.45 s | 26.68 s |
+
+The cold build is ≈6.6% slower at cores, but an earlier set of runs went the
+other way: read it as a weak signal of a few percent at most. A workspace that
+measures otherwise sets `-j 200%`.
+
+To repeat a cold build, clear heph's home. The read-only input stage under
+`.heph/stage/` (the Go SDK among it) is marked read-only like the Go
+module cache, so a plain `rm -rf` fails on it: clear it with `heph tool gc`,
+or `chmod -R u+w .heph/stage` first.
+
 ## Compatibility
 
 The repository keeps no release notes file; these are the notices for this
@@ -317,6 +372,11 @@ change (plugin ABI 0.17.3 → 0.17.4, patch, lane `^0.17.0`):
   declared amount as written (`"0.5"`, `"2G"`), which the host parses in the
   pool's unit at link; the allotment carries every granted pool (`cpu`
   always) rendered by its unit, which is what `${resource:<pool>}` becomes.
+  `TargetDef.default_cpu` (13, `string`, empty when absent) carries a
+  driver's lowered `cpu` default (`"0.1"`, `"0.00001"`) apart from
+  `resources`, so a cdylib def keeps the empty fast path and shows no
+  declaration it did not make; a declared `cpu` overrides it, and it is never
+  hashed.
 - **Source break for third-party SDK code.** `TargetDef` gains a field and is
   not `#[non_exhaustive]`, so a `TargetDef { … }` literal without
   `..Default::default()` stops compiling at rebuild. `RunRequest` is

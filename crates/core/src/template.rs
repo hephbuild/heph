@@ -85,11 +85,11 @@ pub const SRC_KIND: &str = "src";
 /// The one kind whose argument is not an address, so [`claims`] takes a
 /// `${resource:…}` only when the argument is a well-formed pool name
 /// ([`is_pool_name`](crate::capacity::is_pool_name)). Any other spelling —
-/// `${resource:-x}`, `${resource:CPU}`, bash's `${resource:offset}` substring
-/// form — is somebody else's text and passes through untouched, like every
-/// construct heph does not own. A claimed name that is no pool the engine knows
-/// is substituted with its own text (`${resource:nope}` stays as written).
-/// `${resources:…}` and a bare `${resource}` are likewise left alone.
+/// `${resource:-x}`, `${resource:CPU}`, `${resource:2}` — is somebody else's
+/// text and passes through untouched, like every construct heph does not own.
+/// A claimed name that is no pool the engine knows is refused when the def is
+/// linked (bash's `${resource:offset}` substring form is claimed, so it is
+/// refused too). `${resources:…}` and a bare `${resource}` are left alone.
 pub const RESOURCE_KIND: &str = "resource";
 
 /// Whether a `${kind:arg}` whose kind heph owns is *this* `${…}`.

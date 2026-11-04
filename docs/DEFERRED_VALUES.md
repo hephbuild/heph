@@ -146,13 +146,19 @@ a dependency handed down, which is the one place a reference may ride
 nothing of it to the environment. A target whose outputs then depend on the
 number is not reproducible, and saying so with `cache = False` is the author's.
 
-Only a configured pool is replaced. Any other `${resource:…}` —
-`${resource:cpus}` (no such pool), `${resource:CPU}`, `${resource:-x}`, bash's
-`${resource:offset}` — is left as written, like every construct heph does
-not own; so are `${resources:cpu}` and a bare `${resource}`. A reference to a configured pool the target does not reserve
-(`${resource:memory}` with no `memory` in its `resources`) is refused when the
-target is linked; a run told no allotment at all fails naming the target
-rather than substituting an empty string.
+heph claims a `${resource:<arg>}` whose argument is pool-shaped
+(`[a-z][a-z0-9_]{0,63}`), and refuses it when the target is linked unless it
+names a configured pool the target reserves: `${resource:cpus}` (no such pool)
+is an error with a did-you-mean and the `--resource cpus=<n>` route, and
+`${resource:memory}` with no `memory` in its `resources` (or with
+`memory: 0`) is an error naming the fix. A dependency's transitive `env` is
+held to the dependent's reservation by the same check. Only an argument that
+is not pool-shaped — `${resource:CPU}`, `${resource:-x}`, `${resource:2}` —
+is left as written, like every construct heph does not own; so are
+`${resources:cpu}` and a bare `${resource}`. Bash's `${resource:offset}` is
+pool-shaped and so refused; write `${resource: offset}`. A run told no
+allotment at all fails naming the target rather than substituting an empty
+string. See `docs/RESOURCES.md`.
 
 Either may name an output group — `${src://tools:cli\|bin}` — exactly as a dep
 does, which is how you narrow a producer that emits more than one file.

@@ -718,6 +718,34 @@ async fn unknown_pool_is_a_def_time_error() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// An amount that is not a count (`"64G"`) on an undeclared pool: the hint
+/// names the unit the new pool needs, since a bare `<n>` would declare a
+/// count and then refuse the same amount.
+#[tokio::test]
+async fn unknown_pool_hint_names_the_unit_of_the_amount() -> anyhow::Result<()> {
+    let ws = tempfile::tempdir()?;
+    write_build(
+        ws.path(),
+        "p",
+        r#"target(name = "t", driver = "bash", run = "echo t > $OUT", out = "t.txt", resources = {"scratch": "64G"})"#,
+    );
+    let engine = engine(ws.path(), BTreeMap::new())?;
+
+    let rs = engine.new_state();
+    let err = Arc::clone(&engine)
+        .get_def(rs, &parse_addr("//p:t")?)
+        .await
+        .err()
+        .expect("an unknown pool fails the def");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("declares resources.scratch") && msg.contains("{unit: bytes, value: <n>}"),
+        "{msg}"
+    );
+    assert!(msg.contains("--resource"), "{msg}");
+    Ok(())
+}
+
 /// The dep's error survives the memoizer and the consumer's wrapping: the
 /// message still names `//p:lib`, the pool and the key.
 #[tokio::test]
