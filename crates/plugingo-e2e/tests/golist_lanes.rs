@@ -1555,35 +1555,122 @@ fn g7_corpus() -> Vec<(&'static str, &'static str, String)> {
             "a.go",
             format!("// héllo\npackage p\n\nimport ü \"fmt\"\n\nvar _ = ü.Sprint\n{body}"),
         ),
+        (
+            "nul",
+            "a.go",
+            format!("package p\n\0import \"fmt\"\n{body}"),
+        ),
+        ("empty", "a.go", String::new()),
+        (
+            "no_imports",
+            "a.go",
+            format!("package p\n\nconst C = 1\n{body}"),
+        ),
+        (
+            "embed_grouped",
+            "a.go",
+            format!(
+                "package p\n\nimport (\n\t\"fmt\"\n\t_ \"embed\"\n)\n\nvar _ = fmt.Sprint\n\n//go:embed a.txt\nvar a string\n{body}"
+            ),
+        ),
+        (
+            "embed_aliased",
+            "a.go",
+            format!("package p\n\nimport em \"embed\"\n\n//go:embed a.txt\nvar a em.FS\n{body}"),
+        ),
+        (
+            "directives",
+            "a.go",
+            format!(
+                "//go:build linux || darwin\n//go:debug panicnil=1\n\n// Package p.\npackage p // import \"example.com/p\"\n\n//go:generate echo hi\nimport \"fmt\"\n\nvar _ = fmt.Sprint\n{body}"
+            ),
+        ),
+        (
+            "embed_indented_trailing",
+            "a.go",
+            format!(
+                "package p\n\nimport \"embed\"\n\n\t//go:embed a.txt\nvar a string\n\nvar b embed.FS //go:embed a.txt\n{body}"
+            ),
+        ),
     ]
 }
 
-/// G7: the `.go` view extractor holds to the real `go/build`: on every Go the
-/// suite pins, replacing a file's body with one that leaves the extract
-/// unchanged leaves `ImportDir`'s whole result (imports, positions, embeds,
-/// constraints, cgo directives, errors) identical — and without an embed
-/// import, `go/build` reads no further than the header.
+/// What go/build reads of `src` by the extractor's account, through a reader
+/// that hands it one byte at a time: the whole file for a `W` or `E` view, the
+/// header and the byte that ended it for an `H` one (none after a NUL, which
+/// is the last byte read) — and at least the three-byte BOM probe.
+fn go_view_read_len(src: &[u8]) -> anyhow::Result<usize> {
+    let v = plugingo::extract_go_view(src)?;
+    let read = match v.split_first() {
+        Some((b'H', header)) if header.len() < src.len() && header.last() != Some(&0) => {
+            header.len() + 1
+        }
+        Some((b'H', header)) => header.len(),
+        Some((b'W' | b'E', _)) => src.len(),
+        other => anyhow::bail!("unexpected view tag: {other:?}"),
+    };
+    Ok(read.max(src.len().min(3)))
+}
+
+/// Bytes appended past what go/build reads: a constraint that would exclude the
+/// file, a NUL that would fail it, a comment. None is part of any view.
+const HOSTILE_TAIL: &[u8] = b"\n//go:build linux && !linux\n\x00/* tail */\n";
+
+/// The header mutations of G7's reverse property, each a find/replace on the
+/// header region: wherever one changes `ImportDir`'s result, it must change the
+/// extract.
+const G7_HEADER_MUTATIONS: &[(&str, &str)] = &[
+    ("package p", "package q"),
+    ("\"fmt\"", "\"os\""),
+    ("a.txt", "b.txt"),
+    ("linux || darwin", "ignore"),
+    ("panicnil=1", "panicnil=0"),
+];
+
+/// G7: the `.go` view extractor holds to the real `go/build`, on every Go the
+/// suite pins:
+///
+/// - go/build reads exactly the bytes the extractor accounts for
+///   ([`go_view_read_len`]), file by file;
+/// - replacing everything past those bytes with [`HOSTILE_TAIL`] (appending it,
+///   for a file go/build reads whole) leaves the extract and `ImportDir`'s whole
+///   result (imports, positions, embeds, constraints, cgo directives, errors)
+///   identical;
+/// - the reverse: a header mutation ([`G7_HEADER_MUTATIONS`]) that changes
+///   `ImportDir`'s result changes the extract.
+///
+/// A `W` file (header syntax error) is read whole and keyed whole, so it has no
+/// tail to swap; it is in the corpus for the read count.
 #[tokio::test]
 async fn g7_the_go_view_extractor_matches_go_build() -> anyhow::Result<()> {
     require_go!();
     let corpus = g7_corpus();
     let tmp = tempfile::tempdir()?;
     let root = tmp.path().join("tree");
-    let mutated: Vec<String> = corpus
-        .iter()
-        .map(|(_, _, src)| {
-            src.replace("return 1", "return 2 + 2\n\t// more\n")
-                .replace("\nfunc F", "\nfunc G() {}\n\nfunc F")
-        })
-        .collect();
-    for ((dir, file, src), m) in corpus.iter().zip(&mutated) {
+    let put = |dir: &str, file: &str, bytes: &[u8]| -> anyhow::Result<()> {
+        std::fs::create_dir_all(root.join(dir))?;
+        std::fs::write(root.join(dir).join(file), bytes)?;
+        Ok(())
+    };
+    let mut mutated: Vec<Vec<u8>> = Vec::new();
+    let mut read_lens = BTreeMap::new();
+    for (dir, file, src) in &corpus {
+        let src = src.as_bytes();
+        let n = go_view_read_len(src)?;
+        let m = match plugingo::extract_go_view(src)?.first() {
+            Some(b'W') => src.to_vec(),
+            Some(b'E') => [src, HOSTILE_TAIL].concat(),
+            _ if n < src.len() => [src.get(..n).unwrap_or(src), HOSTILE_TAIL].concat(),
+            _ => src.to_vec(),
+        };
         assert_eq!(
-            plugingo::extract_go_view(src.as_bytes())?,
-            plugingo::extract_go_view(m.as_bytes())?,
-            "{dir}: the mutation must keep the extract"
+            plugingo::extract_go_view(src)?,
+            plugingo::extract_go_view(m.as_slice())?,
+            "{dir}: the hostile tail must keep the extract"
         );
-        write(&root, &format!("{dir}/{file}"), src)?;
-        write(&root, &format!("{dir}/a.txt"), "a")?;
+        mutated.push(m);
+        read_lens.insert(dir.to_string(), (*file, n));
+        put(dir, "a.txt", b"a")?;
     }
 
     for toolchain in go_toolchains() {
@@ -1617,39 +1704,66 @@ async fn g7_the_go_view_extractor_matches_go_build() -> anyhow::Result<()> {
                 .map(|(a, b, c)| (a.to_string(), (b.to_string(), c.to_string())))
                 .collect())
         };
-        for ((dir, file, src), _) in corpus.iter().zip(&mutated) {
-            write(&root, &format!("{dir}/{file}"), src)?;
+        for (dir, file, src) in &corpus {
+            put(dir, file, src.as_bytes())?;
         }
         let before = probe()?;
+        assert_eq!(before.len(), corpus.len(), "{tc:?}: every package probed");
+        for (dir, (_, reads)) in &before {
+            let (file, want) = read_lens[dir];
+            let n: usize = reads
+                .split(',')
+                .find_map(|kv| kv.strip_prefix(&format!("{file}=")))
+                .with_context(|| format!("{dir}: {file} was not opened"))?
+                .parse()?;
+            assert_eq!(
+                n, want,
+                "{tc:?} {dir}: go/build read {n} bytes, the extractor accounts for {want}"
+            );
+        }
+
         for ((dir, file, _), m) in corpus.iter().zip(&mutated) {
-            write(&root, &format!("{dir}/{file}"), m)?;
+            put(dir, file, m)?;
         }
         let after = probe()?;
-        assert_eq!(before.len(), corpus.len(), "{tc:?}: every package probed");
         for (dir, (view, _)) in &before {
             assert_eq!(
                 after.get(dir).map(|(v, _)| v),
                 Some(view),
-                "{tc:?} {dir}: go/build's view changed with only the body edited"
+                "{tc:?} {dir}: go/build's view changed with only the bytes past the extract"
             );
         }
-        // Without an embed import, go/build stops inside the first lines: it
-        // never reads the body.
-        for (dir, file, src) in &corpus {
-            if src.contains("\"embed\"") {
-                continue;
+
+        // The reverse property, one mutation per round.
+        let mut checked = 0;
+        for (from, to) in G7_HEADER_MUTATIONS {
+            let mut changed = Vec::new();
+            for (dir, file, src) in &corpus {
+                let m = src.replacen(from, to, 1);
+                put(dir, file, m.as_bytes())?;
+                if m != *src {
+                    changed.push((*dir, src.as_str(), m));
+                }
             }
-            let n: usize = before[*dir]
-                .1
-                .split(',')
-                .find_map(|kv| kv.strip_prefix(&format!("{file}=")))
-                .context("the file was read")?
-                .parse()?;
-            assert!(
-                n < src.len(),
-                "{tc:?} {dir}: go/build read {n} of {} bytes",
-                src.len()
-            );
+            let got = probe()?;
+            for (dir, src, m) in changed {
+                if got.get(dir).map(|(v, _)| v) == before.get(dir).map(|(v, _)| v) {
+                    continue;
+                }
+                checked += 1;
+                assert_ne!(
+                    plugingo::extract_go_view(src.as_bytes())?,
+                    plugingo::extract_go_view(m.as_bytes())?,
+                    "{tc:?} {dir}: `{from}` -> `{to}` changed go/build's view but not the extract"
+                );
+            }
+        }
+        assert!(
+            checked >= G7_HEADER_MUTATIONS.len(),
+            "{tc:?}: the reverse property checked only {checked} cases"
+        );
+        for (dir, file, src) in &corpus {
+            put(dir, file, src.as_bytes())?;
         }
     }
     Ok(())
