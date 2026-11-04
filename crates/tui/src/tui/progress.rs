@@ -428,8 +428,9 @@ fn art_lines(now_ms: u64, width: usize, rows: usize) -> Vec<Line<'static>> {
 /// Which body the TUI viewport is showing. The default view is the live
 /// slow-target / lock-wait breakdown; the list views each mirror one header
 /// counter — [`ViewMode::Done`] the completed count, [`ViewMode::Matched`] the
-/// matched total, [`ViewMode::Cached`] the cached count, [`ViewMode::Failed`]
-/// the failed count. `Tab` cycles through `[Default]` plus one entry per
+/// matched total, [`ViewMode::Cached`] the cached count, [`ViewMode::Waiting`]
+/// the admission-wait count, [`ViewMode::Failed`] the failed count. `Tab`
+/// cycles through `[Default]` plus one entry per
 /// tab-bound header segment the header model exposes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewMode {
@@ -444,6 +445,9 @@ pub enum ViewMode {
     Matched,
     /// The list of targets that hit cache. Mirrors the header's cached count.
     Cached,
+    /// The targets held at admission past the notice threshold, each as its
+    /// `⧗` row. They are shown here and nowhere else until the wait ends.
+    Waiting,
     /// The list of failed targets.
     Failed,
 }
@@ -870,6 +874,9 @@ pub struct Counts {
     pub total: Option<String>,
     /// Cache hits in scope, e.g. `"3 cached"`.
     pub cached: String,
+    /// Targets held at admission right now, e.g. `"2 waiting"`. Live-only: a
+    /// finished run has nothing waiting, so the final summary leaves it out.
+    pub waiting: String,
     /// Failures, e.g. `"0 failed"`.
     pub failed: String,
 }
@@ -1048,6 +1055,10 @@ impl BuildState {
                 ..
             } => {
                 self.retract_cache_hit(addr);
+                // A target that runs is no longer waiting. The engine sends
+                // `AdmissionWaitEnd` first; this keeps a lost End from leaving
+                // the row in the Waiting tab for the rest of the run.
+                self.admission_waits.remove(addr);
                 match hcore::events::clamp_text(declared.as_ref(), reserved.as_ref(), |p| {
                     self.unit_of(p)
                 }) {
@@ -1311,6 +1322,7 @@ impl BuildState {
             done,
             total,
             cached: format!("{} cached", self.cached_count(scope)),
+            waiting: format!("{} waiting", self.admission_waits.len()),
             failed: format!("{} failed", self.errored),
         }
     }
@@ -1535,9 +1547,14 @@ impl BuildState {
     /// Rows for targets whose admission has waited past the notice
     /// threshold: `⧗ //a:b waits for cpu 4 (2 free, 6 ahead, 41s)`. What was
     /// free and ahead is as of the notice. Sorted by addr so the order is
-    /// stable across frames.
-    pub fn admission_wait_lines(&self, now_ms: u64) -> Vec<Line<'static>> {
-        let mut waits: Vec<(&String, &AdmissionWait)> = self.admission_waits.iter().collect();
+    /// stable across frames. The body of the [`ViewMode::Waiting`] tab, thinned
+    /// by the `/` filter like the other list tabs.
+    pub fn admission_wait_lines(&self, now_ms: u64, filter: &str) -> Vec<Line<'static>> {
+        let mut waits: Vec<(&String, &AdmissionWait)> = self
+            .admission_waits
+            .iter()
+            .filter(|(addr, _)| addr_matches(addr, filter))
+            .collect();
         waits.sort_by(|a, b| a.0.cmp(b.0));
         waits
             .into_iter()
@@ -1629,10 +1646,10 @@ impl BuildState {
 
     /// The full body: wait notices first (they take priority), then every
     /// slow-target row. Uncollapsed — the caller windows it to the available rows.
+    /// Admission waits are not here: they live in the [`ViewMode::Waiting`] tab.
     pub fn body_lines(&self, now_ms: u64) -> Vec<Line<'static>> {
         let mut body = self.lock_wait_lines();
         body.extend(self.scratch_wait_lines(now_ms));
-        body.extend(self.admission_wait_lines(now_ms));
         body.extend(self.slow_rows(now_ms));
         body
     }
@@ -1828,6 +1845,7 @@ impl ProgressHeader for BuildHeader {
             done,
             total,
             cached,
+            waiting,
             failed,
         } = core.counts(scope);
         // The done segment `X / Y done` splits into two independent tabs: `X`
@@ -1848,6 +1866,8 @@ impl ProgressHeader for BuildHeader {
             HeaderItem::Split(done_parts),
             // The cached count is a tab into the cached-targets view.
             HeaderItem::tab(ViewMode::Cached, cached),
+            // The waiting count is a tab into the admission-wait view.
+            HeaderItem::tab(ViewMode::Waiting, waiting),
             // The failed count is a tab into the failed-targets view.
             HeaderItem::tab(ViewMode::Failed, failed),
         ];
@@ -2208,7 +2228,7 @@ impl TuiProgressView {
     }
 
     /// The rounded top border:
-    /// `╭─ 1m05s · D / N done · N cached · N failed · <workers> ──────╮`.
+    /// `╭─ 1m05s · D / N done · N cached · N waiting · N failed · <workers> ──╮`.
     /// The leading field is the elapsed-time clock. "done" shows matched progress
     /// `done / total` (total prefixed `~` while the matcher is still resolving),
     /// falling back to the executed count before any match streams. The "running"
@@ -2434,7 +2454,7 @@ impl TUIAppView for TuiProgressView {
     /// Layout (top to bottom), a rounded box sized to `height` rows (one third of
     /// the terminal, see [`rows_for_height`]), with a dim help row pinned beneath:
     /// ```text
-    /// ╭─ 1m05s · D / N done · N cached · N failed ──────────── <workers> ─╮
+    /// ╭─ 1m05s · D / N done · N cached · N waiting · N failed ── <workers> ─╮
     ///   <slow rows + lock waits, scrollable>
     /// ╰─── <label> ───────────────────────────────────────────────────────╯
     ///   ↑/↓ scroll
@@ -2465,6 +2485,8 @@ impl TUIAppView for TuiProgressView {
             ViewMode::Done => Body::Rows(self.state.done_rows(self.scope.get(), filter)),
             ViewMode::Matched => Body::Rows(self.state.matched_rows(filter)),
             ViewMode::Cached => Body::Rows(self.state.cached_rows(self.scope.get(), filter)),
+            // Bounded by what is queued right now, like the live body.
+            ViewMode::Waiting => Body::Lines(self.state.admission_wait_lines(now_ms, filter)),
             ViewMode::Failed => Body::Rows(self.state.failed_rows(filter)),
         };
         let total = body.len();
@@ -2501,6 +2523,13 @@ impl TUIAppView for TuiProgressView {
                 // Cached view with nothing cached: a dim placeholder.
                 ViewMode::Cached => lines.push(Line::from(Span::styled(
                     "  no cached targets",
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM),
+                ))),
+                // Waiting view with nothing held at admission: a dim placeholder.
+                ViewMode::Waiting => lines.push(Line::from(Span::styled(
+                    "  no waiting targets",
                     Style::default()
                         .fg(Color::DarkGray)
                         .add_modifier(Modifier::DIM),
@@ -3199,7 +3228,7 @@ mod tests {
                 ahead: 6,
             },
         ));
-        let text: String = s.admission_wait_lines(42_000)[0]
+        let text: String = s.admission_wait_lines(42_000, "")[0]
             .spans
             .iter()
             .map(|sp| sp.content.as_ref())
@@ -3211,7 +3240,99 @@ mod tests {
                 addr: "//a:b".into(),
             },
         ));
-        assert!(s.admission_wait_lines(43_000).is_empty());
+        assert!(s.admission_wait_lines(43_000, "").is_empty());
+    }
+
+    fn admission_wait_start(addr: &str) -> BuildEventKind {
+        BuildEventKind::AdmissionWaitStart {
+            addr: addr.into(),
+            pool: "cpu".into(),
+            need: 4 * CPU,
+            free: 2 * CPU,
+            ahead: 6,
+        }
+    }
+
+    /// The rendered frame as one string per line.
+    fn frame(v: &TuiProgressView, now_ms: u64) -> Vec<String> {
+        v.render("⠋", now_ms, 100, 10)
+            .iter()
+            .map(|l| format!("{l}"))
+            .collect()
+    }
+
+    #[test]
+    fn a_waiting_target_moves_to_the_waiting_tab_and_back() {
+        let mut v = TuiProgressView::new("L");
+        v.apply(&ev(1_000, admission_wait_start("//a:b")));
+
+        // The live body no longer carries the row…
+        assert_eq!(v.view.get(), ViewMode::Default);
+        let live = frame(&v, 42_000).join("\n");
+        assert!(!live.contains("//a:b"), "{live}");
+        assert!(live.contains("1 waiting"), "{live}");
+
+        // …the Waiting tab does, with pool, need, free, ahead and elapsed.
+        v.view.set(ViewMode::Waiting);
+        let waiting = frame(&v, 42_000);
+        assert!(
+            waiting
+                .iter()
+                .any(|l| l == "  ⧗ //a:b waits for cpu 4 (2 free, 6 ahead, 41s)"),
+            "{waiting:#?}"
+        );
+        // The `/` filter thins it like the other list tabs.
+        "zzz".clone_into(&mut v.search_query.borrow_mut());
+        let filtered = frame(&v, 42_000).join("\n");
+        assert!(filtered.contains("no targets match \"zzz\""), "{filtered}");
+        v.search_query.borrow_mut().clear();
+
+        // Granted: it leaves Waiting and shows where a running target shows.
+        v.apply(&ev(
+            43_000,
+            BuildEventKind::AdmissionWaitEnd {
+                addr: "//a:b".into(),
+            },
+        ));
+        v.apply(&ev(43_000, execute_start("//a:b")));
+        let waiting = frame(&v, 50_000).join("\n");
+        assert!(!waiting.contains("//a:b"), "{waiting}");
+        assert!(waiting.contains("no waiting targets"), "{waiting}");
+        assert!(waiting.contains("0 waiting"), "{waiting}");
+        v.view.set(ViewMode::Default);
+        let live = frame(&v, 50_000).join("\n");
+        assert!(live.contains("//a:b (▶ 7s)"), "{live}");
+    }
+
+    #[test]
+    fn execute_start_ends_an_admission_wait_without_its_end() {
+        let mut s = BuildState::new();
+        s.apply(&ev(1_000, admission_wait_start("//a:b")));
+        s.apply(&ev(1_000, admission_wait_start("//a:c")));
+        assert_eq!(s.counts(CountScope::Matched).waiting, "2 waiting");
+        s.apply(&ev(2_000, execute_start("//a:b")));
+        assert_eq!(s.counts(CountScope::Matched).waiting, "1 waiting");
+        let rows: Vec<String> = s
+            .admission_wait_lines(3_000, "")
+            .iter()
+            .map(|l| format!("{l}"))
+            .collect();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(rows[0].contains("//a:c"), "{rows:?}");
+    }
+
+    #[test]
+    fn the_waiting_tab_sits_left_of_failed() {
+        let v = TuiProgressView::new("L");
+        let modes = v.view_modes();
+        let at = |m: ViewMode| modes.iter().position(|&x| x == m).expect("mode present");
+        assert_eq!(at(ViewMode::Waiting) + 1, at(ViewMode::Failed), "{modes:?}");
+        assert_eq!(at(ViewMode::Cached) + 1, at(ViewMode::Waiting), "{modes:?}");
+        let header = format!("{}", v.header_line(0, 100));
+        assert!(
+            header.contains("0 cached · 0 waiting · 0 failed"),
+            "{header}"
+        );
     }
     fn execute_end(addr: &str) -> BuildEventKind {
         BuildEventKind::ExecuteEnd {
@@ -4306,11 +4427,12 @@ mod tests {
         assert_eq!(cached, "2 cached", "all cached");
     }
 
-    /// The three count fields as the split header renders them, in header order.
+    /// The three count fields as the split header renders them, in header order
+    /// (item 2, the live-only waiting count, is not in the summary).
     fn header_count_fields(s: &BuildState, scope: CountScope) -> (String, String, String) {
         let items = BuildHeader::new("L").header(s, scope);
         let text = |i: usize| header_text(&items[i..=i]);
-        (text(0), text(1), text(2))
+        (text(0), text(1), text(3))
     }
 
     /// Shorthand for a `(done, cached, failed)` golden.
@@ -4690,9 +4812,10 @@ mod tests {
     }
 
     #[test]
-    fn tab_cycles_default_done_matched_cached_failed_and_back() {
+    fn tab_cycles_default_done_matched_cached_waiting_failed_and_back() {
         let mut v = TuiProgressView::new("L");
         v.apply(&ev(0, execute_start("//slow:x")));
+        v.apply(&ev(0, admission_wait_start("//a:queued")));
         v.apply(&ev(1, matched(&["//a:ok", "//a:pending"], true)));
         v.apply(&ev(2, result_start("//a:ok")));
         v.apply(&ev(3, local_cache_hit("//a:ok")));
@@ -4730,6 +4853,13 @@ mod tests {
         let cached_body = body(&v);
         assert!(cached_body.contains("//a:ok"), "{cached_body}");
         assert!(!cached_body.contains("//a:pending"), "{cached_body}");
+
+        // Tab → waiting view: shows the target held at admission.
+        v.tab(true);
+        assert_eq!(v.view.get(), ViewMode::Waiting);
+        let waiting_body = body(&v);
+        assert!(waiting_body.contains("⧗ //a:queued"), "{waiting_body}");
+        assert!(!waiting_body.contains("//slow:x"), "{waiting_body}");
 
         // Tab → failed view: shows the failed target.
         v.tab(true);
@@ -4954,16 +5084,18 @@ mod tests {
     fn shift_tab_cycles_backwards() {
         let mut v = TuiProgressView::new("L");
         // A matched event gives the `X / Y done` denominator, so the Matched tab
-        // is present and all five modes exist.
+        // is present and all six modes exist.
         v.apply(&ev(0, matched(&["//a:ok"], true)));
         v.apply(&ev(1, result_start("//a:bad")));
         v.apply(&ev(2, result_end("//a:bad", Some("boom".into()))));
 
-        // Five modes (Default, Done, Matched, Cached, Failed): backward from
-        // Default wraps to the last (Failed), then steps back to Default.
+        // Six modes (Default, Done, Matched, Cached, Waiting, Failed): backward
+        // from Default wraps to the last (Failed), then steps back to Default.
         assert_eq!(v.view.get(), ViewMode::Default);
         v.tab(false);
         assert_eq!(v.view.get(), ViewMode::Failed);
+        v.tab(false);
+        assert_eq!(v.view.get(), ViewMode::Waiting);
         v.tab(false);
         assert_eq!(v.view.get(), ViewMode::Cached);
         v.tab(false);

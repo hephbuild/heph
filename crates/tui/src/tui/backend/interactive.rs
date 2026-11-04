@@ -1069,13 +1069,15 @@ mod tests {
 
         // Shrink the terminal, then re-anchor (the load-bearing call the fix runs
         // inside the EventStream-down window).
-        terminal.backend_mut().resize(40, 24);
+        // Narrower than 80, but wide enough for the idle header to fit: a
+        // header that overflows has no closing corner to look for.
+        terminal.backend_mut().resize(56, 24);
         reanchor_terminal(&mut terminal);
         draw_view(&mut terminal, &view);
 
         let buf = terminal.backend().buffer();
         // Buffers re-anchored to the new width, not stale 80.
-        assert_eq!(buf.area.width, 40, "viewport width should track resize");
+        assert_eq!(buf.area.width, 56, "viewport width should track resize");
 
         // The box reflowed to the new width: the rounded corners pin to the
         // last column of the header (top-right) and footer (bottom-right) rows.
