@@ -80,20 +80,17 @@ pub const READ_KIND: &str = "read";
 /// The sandbox path of a producer's artifact.
 pub const SRC_KIND: &str = "src";
 
-/// A share of the run's allotment: `${resource:cpu}`, `${resource:memory}`.
+/// A share of the run's allotment: `${resource:<pool>}`, any pool.
 ///
 /// The one kind whose argument is not an address, so [`claims`] takes a
-/// `${resource:…}` only when the argument is exactly one of [`RESOURCE_NAMES`].
-/// Any other `${resource:…}` — `${resource:cpus}`, `${resource:-x}`, bash's
-/// `${resource:offset}` substring form — is somebody else's text and passes
-/// through untouched, like every construct heph does not own (user decision).
+/// `${resource:…}` only when the argument is a well-formed pool name
+/// ([`is_pool_name`](crate::capacity::is_pool_name)). Any other spelling —
+/// `${resource:-x}`, `${resource:CPU}`, bash's `${resource:offset}` substring
+/// form — is somebody else's text and passes through untouched, like every
+/// construct heph does not own. A claimed name that is no pool the engine knows
+/// is substituted with its own text (`${resource:nope}` stays as written).
 /// `${resources:…}` and a bare `${resource}` are likewise left alone.
 pub const RESOURCE_KIND: &str = "resource";
-
-/// The names `${resource:…}` takes: whole CPUs of the run's allotment, and the
-/// bytes of memory it was granted. Custom pools are deliberately not exposed.
-/// Exact and case-sensitive.
-pub const RESOURCE_NAMES: &[&str] = &["cpu", "memory"];
 
 /// Whether a `${kind:arg}` whose kind heph owns is *this* `${…}`.
 ///
@@ -120,13 +117,13 @@ pub const RESOURCE_NAMES: &[&str] = &["cpu", "memory"];
 /// misclassification this module exists to prevent.
 ///
 /// [`RESOURCE_KIND`] is the exception: it names no target, so its discriminator
-/// is the exact name — one of [`RESOURCE_NAMES`] — and nothing else is claimed.
+/// is the pool-name syntax, and nothing else is claimed.
 pub fn claims(kind: Option<&str>, arg: &str, kinds: &[&str]) -> bool {
     let Some(k) = kind.filter(|k| kinds.contains(k)) else {
         return false;
     };
     if k == RESOURCE_KIND {
-        return RESOURCE_NAMES.contains(&arg);
+        return crate::capacity::is_pool_name(arg);
     }
     arg.starts_with("//")
 }
@@ -518,11 +515,15 @@ mod tests {
         assert_eq!(first("${resource:cpu}").as_deref(), Some("${resource:cpu}"));
         assert!(has_deferred_ref("${resource:memory}"));
         assert!(only_resource_refs("-j${resource:cpu}"));
-        // Not claimed — a typo, a bash form, another kind — and reproduced
-        // verbatim by `substitute`, even beside a claimed one.
+        // Any pool name is claimed, a custom one or one no engine knows.
+        assert!(has_deferred_ref("${resource:gpu}"));
+        assert!(has_deferred_ref("${resource:cpus}"));
+        // Not claimed — not a pool name, a bash form, another kind — and
+        // reproduced verbatim by `substitute`, even beside a claimed one.
         for other in [
-            "${resource:cpus}",
             "${resource:}",
+            "${resource:1gpu}",
+            "${resource:a-b}",
             "${resource:CPU}",
             "${resource:cpu:-1}",
             "${resource:-x}",
