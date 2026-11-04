@@ -914,6 +914,7 @@ mod tests {
                 cache: false,
                 declared: None,
                 reserved: None,
+                queued_ms: None,
             },
         ));
         t.apply(&ev(
@@ -1020,6 +1021,7 @@ mod tests {
                 cache: false,
                 declared: None,
                 reserved: None,
+                queued_ms: None,
             },
         ));
         assert_eq!(t.counters().cached(), 0, "hit retracted off its counter");
@@ -1052,6 +1054,7 @@ mod tests {
                 cache: false,
                 declared: None,
                 reserved: None,
+                queued_ms: None,
             },
         ));
         t.apply(&ev(
@@ -1127,6 +1130,7 @@ mod tests {
                     cache: false,
                     declared: None,
                     reserved: None,
+                    queued_ms: None,
                 },
             ));
         }

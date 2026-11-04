@@ -1873,6 +1873,7 @@ mod tests {
             cache: true,
             declared: None,
             reserved: None,
+            queued_ms: None,
         }));
         hook.on_event(&ev(BuildEventKind::ScratchLockWaitStart {
             addr: "//c:d".into(),

@@ -889,6 +889,7 @@ mod tests {
                     cache: false,
                     declared: None,
                     reserved: None,
+                    queued_ms: None,
                 },
             ));
         }
@@ -1087,6 +1088,7 @@ mod tests {
                 cache: false,
                 declared: None,
                 reserved: None,
+                queued_ms: None,
             },
         ));
         t.apply(&ev(
@@ -1307,6 +1309,7 @@ mod tests {
                     cache: false,
                     declared: None,
                     reserved: None,
+                    queued_ms: None,
                 },
             ));
         }

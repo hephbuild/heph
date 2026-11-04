@@ -64,6 +64,30 @@ pub fn display_amount(pool: &str, amount: u64) -> String {
     }
 }
 
+/// What an `ExecuteStart` was clamped by, as `cpu 16→4` (pools joined by
+/// `, `), or `None` when every declared pool was granted in full. Only the
+/// declared keys count: an undeclared pool was never asked for.
+pub fn clamp_text(
+    declared: Option<&BTreeMap<String, u64>>,
+    reserved: Option<&BTreeMap<String, u64>>,
+) -> Option<String> {
+    let (declared, reserved) = (declared?, reserved?);
+    let parts: Vec<String> = declared
+        .iter()
+        .filter_map(|(pool, &want)| {
+            let got = reserved.get(pool).copied().unwrap_or(0);
+            (got < want).then(|| {
+                format!(
+                    "{pool} {}→{}",
+                    display_amount(pool, want),
+                    display_amount(pool, got)
+                )
+            })
+        })
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
 /// The text of an admission-wait row, after its `⧗`:
 /// `//a:b waits for cpu 4 (2 free, 6 ahead, 41s)`. `waited` is the elapsed
 /// time as the renderer spells it.
@@ -208,6 +232,13 @@ pub enum BuildEventKind {
         /// resources: such a target counts as one CPU.
         #[serde(default)]
         reserved: Option<BTreeMap<String, u64>>,
+        /// How long the target waited for admission, in milliseconds — set
+        /// for every admitted run, so a wait under the `AdmissionWait*`
+        /// notice threshold is still answerable from the stream. `None`
+        /// from a host that predates it, and for a run that reserved nothing
+        /// (an entrypoint).
+        #[serde(default)]
+        queued_ms: Option<u64>,
     },
     ExecuteEnd {
         addr: String,
@@ -564,10 +595,14 @@ mod tests {
         let ev: BuildEvent = serde_json::from_str(old).expect("old frame must decode");
         match ev.kind {
             BuildEventKind::ExecuteStart {
-                declared, reserved, ..
+                declared,
+                reserved,
+                queued_ms,
+                ..
             } => {
                 assert_eq!(declared, None);
                 assert_eq!(reserved, None);
+                assert_eq!(queued_ms, None, "an old frame says nothing of a wait");
             }
             other => panic!("wrong variant: {other:?}"),
         }
@@ -580,13 +615,19 @@ mod tests {
                 cache: true,
                 declared: Some(BTreeMap::from([("cpu".into(), 16_000_000)])),
                 reserved: Some(BTreeMap::from([("cpu".into(), 4_000_000)])),
+                queued_ms: Some(1500),
             },
         };
         let back: BuildEvent =
             serde_json::from_str(&serde_json::to_string(&new).expect("encode")).expect("decode");
         match back.kind {
-            BuildEventKind::ExecuteStart { reserved, .. } => {
+            BuildEventKind::ExecuteStart {
+                reserved,
+                queued_ms,
+                ..
+            } => {
                 assert_eq!(reserved, Some(BTreeMap::from([("cpu".into(), 4_000_000)])));
+                assert_eq!(queued_ms, Some(1500));
             }
             other => panic!("wrong variant: {other:?}"),
         }

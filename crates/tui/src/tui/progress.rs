@@ -780,6 +780,10 @@ pub struct BuildState {
     /// Targets whose admission has waited past the notice threshold, by
     /// addr. Added on `AdmissionWaitStart`, removed on `AdmissionWaitEnd`.
     admission_waits: HashMap<String, AdmissionWait>,
+    /// Running targets granted less than they declared, by addr, as the
+    /// `cpu 16→4` their row shows. Set at `ExecuteStart`, cleared at
+    /// `ExecuteEnd`; a target that got what it asked for is not here.
+    clamped: HashMap<String, String>,
 }
 
 /// What a running target holds of the cpu and memory pools.
@@ -1026,8 +1030,21 @@ impl BuildState {
             // same addr as both cached and executed, which would let "executed + cached"
             // exceed the number of targets — and, on an offline run over a
             // remote-mirrored cache, report a full rebuild as "N cached".
-            BuildEventKind::ExecuteStart { addr, reserved, .. } => {
+            BuildEventKind::ExecuteStart {
+                addr,
+                declared,
+                reserved,
+                ..
+            } => {
                 self.retract_cache_hit(addr);
+                match hcore::events::clamp_text(declared.as_ref(), reserved.as_ref()) {
+                    Some(clamp) => {
+                        self.clamped.insert(addr.clone(), clamp);
+                    }
+                    None => {
+                        self.clamped.remove(addr);
+                    }
+                }
                 let held = Held::of(reserved.as_ref());
                 // A repeated Start replaces, rather than adds to, what the
                 // addr holds.
@@ -1048,6 +1065,7 @@ impl BuildState {
                 if let Some(held) = self.running_reserved.remove(addr) {
                     self.release(held);
                 }
+                self.clamped.remove(addr);
             }
             BuildEventKind::AdmissionWaitStart {
                 addr,
@@ -1551,7 +1569,8 @@ impl BuildState {
 
     /// The long-running ("slow") target rows, one per slow target and uncollapsed:
     /// `addr (icon Ns)…` — one `(icon Ns)` group per op the target passed through
-    /// or is in.
+    /// or is in — then `[cpu 16→4]` when the target was granted less than it
+    /// declared, so a clamp is visible without `-v`.
     fn slow_rows(&self, now_ms: u64) -> Vec<Line<'static>> {
         self.long_running(now_ms, LONG_RUNNING_THRESHOLD_MS)
             .into_iter()
@@ -1560,7 +1579,10 @@ impl BuildState {
                     .iter()
                     .map(|(op, ms)| format!(" ({} {}s)", op.icon(), ms / 1000))
                     .collect();
-                Line::from(format!("  {addr}{groups}"))
+                match self.clamped.get(&addr) {
+                    Some(clamp) => Line::from(format!("  {addr}{groups} [{clamp}]")),
+                    None => Line::from(format!("  {addr}{groups}")),
+                }
             })
             .collect()
     }
@@ -2651,10 +2673,13 @@ impl CIAppView for CiProgressView {
                 addr,
                 driver,
                 cache: true,
+                declared,
+                reserved,
                 ..
-            } => {
-                tracing::info!("running {addr} [{driver}]");
-            }
+            } => match hcore::events::clamp_text(declared.as_ref(), reserved.as_ref()) {
+                Some(clamp) => tracing::info!("running {addr} [{driver}] ({clamp})"),
+                None => tracing::info!("running {addr} [{driver}]"),
+            },
             BuildEventKind::AdmissionWaitStart { .. } | BuildEventKind::AdmissionWaitEnd { .. } => {
                 if let Some(line) = admission_ci_line(&self.core.state, ev) {
                     tracing::info!("{line}");
@@ -2871,6 +2896,7 @@ mod tests {
             cache: true,
             declared: None,
             reserved: None,
+            queued_ms: None,
         }
     }
 
@@ -2881,10 +2907,50 @@ mod tests {
             cache: true,
             declared: None,
             reserved: Some(reserved.iter().map(|&(p, n)| (p.into(), n)).collect()),
+            queued_ms: None,
         }
     }
 
     const CPU: u64 = hcore::capacity::MICROS_PER_CPU;
+
+    /// A target granted less than it declared shows `[cpu 16→4]` on its row
+    /// without `-v`; one granted in full shows nothing, and the note goes
+    /// with the run.
+    #[test]
+    fn a_clamped_target_row_shows_declared_to_reserved() {
+        let start = |addr: &str, declared: u64, reserved: u64| BuildEventKind::ExecuteStart {
+            addr: addr.into(),
+            driver: "exec".into(),
+            cache: true,
+            declared: Some([("cpu".into(), declared)].into()),
+            reserved: Some([("cpu".into(), reserved)].into()),
+            queued_ms: Some(0),
+        };
+        let mut s = BuildState::new();
+        s.apply(&ev(0, start("//p:big", 16 * CPU, 4 * CPU)));
+        s.apply(&ev(0, start("//p:fits", 2 * CPU, 2 * CPU)));
+        let rows: Vec<String> = s.slow_rows(9_000).iter().map(|l| format!("{l}")).collect();
+        let big = rows
+            .iter()
+            .find(|r| r.contains("//p:big"))
+            .expect("big row");
+        assert!(big.ends_with("[cpu 16→4]"), "{big}");
+        let fits = rows
+            .iter()
+            .find(|r| r.contains("//p:fits"))
+            .expect("fits row");
+        assert!(!fits.contains('→'), "{fits}");
+        s.apply(&ev(9_000, execute_end("//p:big")));
+        assert!(s.clamped.is_empty());
+        assert_eq!(
+            hcore::events::clamp_text(
+                Some(&[("cpu".into(), CPU / 2), ("memory".into(), 1 << 30)].into()),
+                Some(&[("cpu".into(), CPU / 4), ("memory".into(), 1 << 30)].into()),
+            )
+            .as_deref(),
+            Some("cpu 0.5→0.25")
+        );
+    }
 
     #[test]
     fn busy_cpu_tracks_start_and_end() {

@@ -127,7 +127,11 @@ impl Engine {
         // deps — prevents the classic diamond deadlock where mid-nodes hold
         // capacity while waiting for a leaf that also needs some.
         hcore::hmemoizer::set_phase("execute:semaphore_acquire");
+        let admit_started = std::time::Instant::now();
         let reservation = self.admit(&rs, addr, &def.target.resources).await?;
+        // On `ExecuteStart`, so a wait under the notice threshold (which
+        // announces nothing) is still answerable from the stream.
+        let queued_ms = u64::try_from(admit_started.elapsed().as_millis()).unwrap_or(u64::MAX);
         // Counted once the reservation is actually in hand.
         let _running = crate::engine::diag::RunningPermit::new();
         let allotment = allotment_of(&reservation, &def.target.resources);
@@ -151,6 +155,7 @@ impl Engine {
                 def.target.cache.enabled,
                 &def.target.resources,
                 &reservation,
+                queued_ms,
             ),
             move |error| crate::engine::event::BuildEventKind::ExecuteEnd {
                 addr: addr_str,
@@ -615,14 +620,15 @@ pub(crate) fn allotment_of(
 }
 
 /// The `ExecuteStart` event: what the target declared (only its declared
-/// keys) and what it was granted, after clamping. `reserved` always carries
-/// `cpu`, 0 on a light-lane grant.
+/// keys) and what it was granted, after clamping, and how long admission
+/// took. `reserved` always carries `cpu`, 0 on a light-lane grant.
 pub(crate) fn execute_start(
     addr: String,
     driver: String,
     cache: bool,
     declared: &hplugin::driver::Resources,
     reservation: &crate::engine::resource_pool::Reservation,
+    queued_ms: u64,
 ) -> crate::engine::event::BuildEventKind {
     use hplugin::provider::PoolName;
     let declared = declared
@@ -640,6 +646,7 @@ pub(crate) fn execute_start(
         cache,
         declared: Some(declared),
         reserved: Some(reserved),
+        queued_ms: Some(queued_ms),
     }
 }
 
@@ -690,13 +697,17 @@ mod tests {
     fn execute_start_reserved_is_the_granted_amount() {
         let declared = req(&[("cpu", 16 * CPU)]);
         let r = grant(&[("cpu", 4 * CPU), ("memory", 1 << 30)], &declared);
-        let ev = execute_start("//p:t".into(), "exec".into(), true, &declared, &r);
+        let ev = execute_start("//p:t".into(), "exec".into(), true, &declared, &r, 7);
         let BuildEventKind::ExecuteStart {
-            declared, reserved, ..
+            declared,
+            reserved,
+            queued_ms,
+            ..
         } = ev
         else {
             panic!("wrong variant: {ev:?}");
         };
+        assert_eq!(queued_ms, Some(7));
         assert_eq!(
             declared,
             Some(std::collections::BTreeMap::from([("cpu".into(), 16 * CPU)]))
@@ -714,7 +725,7 @@ mod tests {
         let declared = req(&[("cpu", 0)]);
         let r = grant(&[("cpu", 4 * CPU)], &declared);
         let BuildEventKind::ExecuteStart { reserved, .. } =
-            execute_start("//p:t".into(), "exec".into(), true, &declared, &r)
+            execute_start("//p:t".into(), "exec".into(), true, &declared, &r, 0)
         else {
             panic!("wrong variant");
         };
