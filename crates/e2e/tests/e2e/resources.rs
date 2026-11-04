@@ -633,7 +633,7 @@ async fn zero_capacity_pool_errors_at_admission_naming_the_override() -> anyhow:
         "//p:t acquires gpu, but pool gpu has capacity 0",
         "--resource gpu=<n>",
         "HEPH_RESOURCE_GPU=<n>",
-        "resources.gpu in .hephconfig",
+        "resources: {gpu: <n>} in .hephconfig",
     ] {
         assert!(err.contains(needle), "missing {needle:?} in {err}");
     }
@@ -1211,30 +1211,22 @@ target(name = "c", driver = "bash", run = "echo $MAKEFLAGS > $OUT", out = "c.txt
     Ok(())
 }
 
-/// A name that is not `cpu` or `memory` is refused when the def is built,
-/// naming the target, the field and the names that exist.
+/// A name that is not exactly `cpu` or `memory` is not heph's: the text
+/// reaches the target's environment untouched, like any other `${…}` heph
+/// does not own — beside a real reference too.
 #[tokio::test]
-async fn unknown_reference_is_a_parse_error() -> anyhow::Result<()> {
+async fn unknown_resource_reference_passes_through() -> anyhow::Result<()> {
     let ws = tempfile::tempdir()?;
     write_build(
         ws.path(),
         "p",
-        r#"target(name = "t", driver = "bash", run = "echo $X > $OUT", out = "t.txt", env = {"X": "${resource:nope}"})"#,
+        r#"target(name = "t", driver = "bash", run = 'echo "$X" > $OUT', out = "t.txt", env = {"X": "${resource:nope} ${resource:-x} ${resource:cpu}"}, resources = {"cpu": 2})"#,
     );
     let engine = engine(ws.path(), caps(&[("cpu", 4 * MICROS)]))?;
-    let err = Arc::clone(&engine)
-        .get_def(engine.new_state(), &parse_addr("//p:t")?)
-        .await
-        .err()
-        .expect("an unknown resource fails the def");
-    let msg = format!("{err:#}");
-    for want in [
-        "//p:t",
-        "`${resource:nope}` names no resource",
-        "`${resource:cpu}` or `${resource:memory}`",
-    ] {
-        assert!(msg.contains(want), "{want}: {msg}");
-    }
+    assert_eq!(
+        output(&engine, "//p:t").await?,
+        "${resource:nope} ${resource:-x} 2"
+    );
     Ok(())
 }
 

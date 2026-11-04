@@ -2231,7 +2231,6 @@ impl<'a, 'io> RunRequest<'a, 'io> {
             if hcore::template::only_resource_refs(d.raw()) {
                 let allotment = self.allotment.as_ref();
                 return hcore::template::substitute(d.raw(), &[RESOURCE_KIND], |r| {
-                    hcore::template::check_resource_name(r)?;
                     Allotment::reference(allotment, r.arg, &self.target.addr)
                 })
                 .map(std::borrow::Cow::Owned);

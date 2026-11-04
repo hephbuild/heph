@@ -238,6 +238,16 @@ fn walk(v: &Value, path: &str, pkg: &PkgBuf, out: &mut Vec<DeferredRef>) -> anyh
     Ok(())
 }
 
+/// Whether a `${resource:…}` may stand at config path `path`: one value of a
+/// top-level `env` or `runtime_env` map, the exec driver's fields that reach the
+/// process as environment and nothing else (D7). A transitive `env` never comes
+/// through this walk; `apply_transitive` takes it.
+fn resource_ref_allowed_at(path: &str) -> bool {
+    ["env.", "runtime_env."]
+        .iter()
+        .any(|p| path.strip_prefix(p).is_some_and(|name| !name.is_empty()))
+}
+
 /// The references in one string, or `None` when it holds none.
 fn parse_refs(s: &str, pkg: &PkgBuf, path: &str) -> anyhow::Result<Option<DeferredRef>> {
     if !hcore::template::has_ref(s) {
@@ -257,10 +267,23 @@ fn parse_refs(s: &str, pkg: &PkgBuf, path: &str) -> anyhow::Result<Option<Deferr
         }
         let kind = match r.kind {
             Some(SRC) => SRC,
-            // The run's allotment: no producer, so no edge. The name is checked
-            // here, at parse, so `${resource:cpus}` never reaches a run.
+            // The run's allotment: no producer, so no edge. Only an exact name is
+            // claimed, so `${resource:cpus}` never got here: it is text. Only
+            // an `env` / `runtime_env` value may carry one (D7): anywhere else
+            // the number could reach an output (a `template` var) and make
+            // its hashout per-machine.
             Some(RESOURCE) => {
-                hcore::template::check_resource_name(&r).with_context(|| format!("in `{path}`"))?;
+                if !resource_ref_allowed_at(path) {
+                    anyhow::bail!(
+                        "`{}` in `{path}`: a `${{resource:…}}` reference is only accepted in an \
+                         `env` or `runtime_env` value (or a transitive `env`), where it reaches \
+                         the process as an environment variable and never an output; in any \
+                         other field the allotment could change what the target produces. Read \
+                         `$HEPH_CPUS` / `$HEPH_MEMORY_BYTES` from the environment instead \
+                         (docs/RESOURCES.md)",
+                        r.raw
+                    );
+                }
                 names_resource = true;
                 continue;
             }
@@ -988,12 +1011,17 @@ mod tests {
         assert_eq!(paths, vec!["a", "m", "z"]);
     }
 
+    /// `{field: {"X": v}}` — one value of an env-shaped map.
+    fn env_cfg(field: &str, v: &str) -> HashMap<String, Value> {
+        cfg(&[(field, Value::Map(HashMap::from([("X".to_string(), s(v))])))])
+    }
+
     /// `${resource:…}` is collected (so the driver gate and the run see it) but
-    /// names no producer, so it adds no edge; a bad name is a parse error that
-    /// lists the good ones; a kind that is merely similar is left alone.
+    /// names no producer, so it adds no edge; a name that is not exactly one of
+    /// the two is somebody else's text, collected as nothing.
     #[test]
     fn a_resource_reference_is_collected_without_an_edge() {
-        let refs = collect(&cfg(&[("env", s("-j${resource:cpu}"))]), &pkg()).expect("collect");
+        let refs = collect(&env_cfg("env", "-j${resource:cpu}"), &pkg()).expect("collect");
         assert_eq!(refs.len(), 1);
         assert!(refs[0].producers.is_empty());
         assert!(inputs_for(&refs).is_empty(), "no producer, no edge");
@@ -1001,10 +1029,10 @@ mod tests {
 
         // Two in one value, and beside a `read`: one field, one edge.
         let refs = collect(
-            &cfg(&[(
-                "v",
-                s("${resource:cpu}/${resource:memory}@${read://infra:x}"),
-            )]),
+            &env_cfg(
+                "runtime_env",
+                "${resource:cpu}/${resource:memory}@${read://infra:x}",
+            ),
             &pkg(),
         )
         .expect("collect");
@@ -1012,33 +1040,82 @@ mod tests {
         assert_eq!(refs[0].producers.len(), 1);
         assert_eq!(inputs_for(&refs).len(), 1);
 
-        for bad in [
+        for other in [
             "${resource:cpus}",
             "${resource:}",
             "${resource:CPU}",
             "${resource:cpu:-1}",
+            "${resource:-x}",
             "${resource://cpu}",
             "${resource:nope}",
             "${resource:ćpu}",
+            "${resources:cpu}",
+            "${resource}",
+            "$${resource:cpu}",
         ] {
-            let err = collect(&cfg(&[("env", s(bad))]), &pkg()).expect_err(bad);
-            let msg = format!("{err:#}");
-            assert!(msg.contains("names no resource"), "{bad}: {msg}");
-            assert!(msg.contains("${resource:cpu}"), "{bad}: {msg}");
-            assert!(msg.contains("`env`"), "names the field: {msg}");
-        }
-        for other in ["${resources:cpu}", "${resource}", "$${resource:cpu}"] {
             assert!(
-                collect(&cfg(&[("env", s(other))]), &pkg())
-                    .expect("collect")
+                collect(&env_cfg("env", other), &pkg())
+                    .expect("passes through")
+                    .is_empty(),
+                "{other}"
+            );
+            // Nor is it refused outside env: it is not heph's.
+            assert!(
+                collect(&cfg(&[("vars", s(other))]), &pkg())
+                    .expect("passes through")
                     .is_empty(),
                 "{other}"
             );
         }
         // Unterminated and nested fail in the tokenizer, naming the field.
         for broken in ["-j${resource:cpu", "${X:-${resource:cpu}}"] {
-            let err = collect(&cfg(&[("env", s(broken))]), &pkg()).expect_err(broken);
-            assert!(format!("{err:#}").contains("`env`"), "{err:#}");
+            let err = collect(&env_cfg("env", broken), &pkg()).expect_err(broken);
+            assert!(format!("{err:#}").contains("`env.X`"), "{err:#}");
+        }
+    }
+
+    /// D7 scopes `${resource:…}` to the env maps: anywhere else (a `template`
+    /// var, an `oci` push `dest`, a credential presentation, a `run` line) the
+    /// number could land in an output and make its hashout per-machine.
+    #[test]
+    fn a_resource_reference_outside_env_is_refused() {
+        for (field, v) in [
+            (
+                "vars",
+                Value::Map(HashMap::from([("N".to_string(), s("${resource:cpu}"))])),
+            ),
+            ("dest", s("reg/x:${resource:memory}")),
+            ("run", Value::List(vec![s("make -j${resource:cpu}")])),
+            ("env", s("${resource:cpu}")),
+            (
+                "sources",
+                Value::List(vec![Value::Map(HashMap::from([(
+                    "present".to_string(),
+                    Value::Map(HashMap::from([(
+                        "env".to_string(),
+                        Value::Map(HashMap::from([("N".to_string(), s("${resource:cpu}"))])),
+                    )])),
+                )]))]),
+            ),
+        ] {
+            let err = collect(&cfg(&[(field, v)]), &pkg()).expect_err(field);
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("only accepted in an `env` or `runtime_env`"),
+                "{field}: {msg}"
+            );
+            assert!(msg.contains("$HEPH_CPUS"), "{field}: {msg}");
+        }
+        assert!(resource_ref_allowed_at("env.MAKEFLAGS"));
+        assert!(resource_ref_allowed_at("runtime_env.GOMAXPROCS"));
+        for refused in [
+            "env",
+            "env.",
+            "vars.env.X",
+            "environment.X",
+            "runtime_envs.X",
+        ] {
+            assert!(!resource_ref_allowed_at(refused), "{refused}");
         }
     }
 
@@ -1050,11 +1127,14 @@ mod tests {
             ..Default::default()
         };
         let refs = collect(
-            &cfg(&[
-                ("a", s("-j${resource:cpu} ${FOO:-d} $$")),
-                ("b", s("${read://infra:x}:${resource:cpu}")),
-                ("m", s("${resource:memory}")),
-            ]),
+            &cfg(&[(
+                "env",
+                Value::Map(HashMap::from([
+                    ("a".to_string(), s("-j${resource:cpu} ${FOO:-d} $$")),
+                    ("b".to_string(), s("${read://infra:x}:${resource:cpu}")),
+                    ("m".to_string(), s("${resource:memory}")),
+                ])),
+            )]),
             &pkg(),
         )
         .expect("collect");

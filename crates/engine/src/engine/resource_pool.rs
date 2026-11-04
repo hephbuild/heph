@@ -67,7 +67,7 @@ pub enum AcquireError {
     /// The request names a pool whose capacity is 0: it exists so a run can
     /// set it, and this run did not.
     #[error(
-        "acquires {pool}, but pool {pool} has capacity 0 and must be set: --resource {pool}=<n>, HEPH_RESOURCE_{env}=<n> or resources.{pool} in .hephconfig",
+        "acquires {pool}, but pool {pool} has capacity 0 and must be set: --resource {pool}=<n>, HEPH_RESOURCE_{env}=<n> or resources: {{{pool}: <n>}} in .hephconfig",
         env = pool.as_str().to_ascii_uppercase()
     )]
     ZeroCapacity { pool: PoolName },
@@ -1136,7 +1136,7 @@ mod tests {
             assert_eq!(
                 format!("//p:t {err}"),
                 "//p:t acquires gpu, but pool gpu has capacity 0 and must be set: \
-                 --resource gpu=<n>, HEPH_RESOURCE_GPU=<n> or resources.gpu in .hephconfig"
+                 --resource gpu=<n>, HEPH_RESOURCE_GPU=<n> or resources: {gpu: <n>} in .hephconfig"
             );
         }
         assert_eq!(p.snapshot().main.queued, 0, "refused before queueing");

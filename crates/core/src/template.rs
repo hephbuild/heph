@@ -82,36 +82,18 @@ pub const SRC_KIND: &str = "src";
 
 /// A share of the run's allotment: `${resource:cpu}`, `${resource:memory}`.
 ///
-/// The one kind whose argument is not an address, so [`claims`] takes every
-/// `${resource:…}` whatever follows the colon — including bash's
-/// `${resource:offset}` substring form, a cost accepted so that a typo such as
-/// `${resource:cpus}` is a parse error naming [`RESOURCE_NAMES`] rather than a
-/// literal that reaches the tool. `${resources:…}` and a bare `${resource}` are
-/// somebody else's and left alone.
+/// The one kind whose argument is not an address, so [`claims`] takes a
+/// `${resource:…}` only when the argument is exactly one of [`RESOURCE_NAMES`].
+/// Any other `${resource:…}` — `${resource:cpus}`, `${resource:-x}`, bash's
+/// `${resource:offset}` substring form — is somebody else's text and passes
+/// through untouched, like every construct heph does not own (user decision).
+/// `${resources:…}` and a bare `${resource}` are likewise left alone.
 pub const RESOURCE_KIND: &str = "resource";
 
 /// The names `${resource:…}` takes: whole CPUs of the run's allotment, and the
 /// bytes of memory it was granted. Custom pools are deliberately not exposed.
+/// Exact and case-sensitive.
 pub const RESOURCE_NAMES: &[&str] = &["cpu", "memory"];
-
-/// Refuse a `${resource:…}` whose name is not one of [`RESOURCE_NAMES`].
-///
-/// Exact and case-sensitive: `${resource:CPU}`, `${resource:}`,
-/// `${resource:cpu:-1}` and `${resource://cpu}` are all refused.
-pub fn check_resource_name(r: &Ref<'_>) -> anyhow::Result<()> {
-    if RESOURCE_NAMES.contains(&r.arg) {
-        return Ok(());
-    }
-    anyhow::bail!(
-        "`{}` names no resource: `${{resource:…}}` takes {} (custom pools are not exposed)",
-        r.raw,
-        RESOURCE_NAMES
-            .iter()
-            .map(|n| format!("`${{resource:{n}}}`"))
-            .collect::<Vec<_>>()
-            .join(" or ")
-    )
-}
 
 /// Whether a `${kind:arg}` whose kind heph owns is *this* `${…}`.
 ///
@@ -137,13 +119,16 @@ pub fn check_resource_name(r: &Ref<'_>) -> anyhow::Result<()> {
 /// that fills them in. Two answers to "is this heph's?" is the silent
 /// misclassification this module exists to prevent.
 ///
-/// [`RESOURCE_KIND`] is the exception: it names no target, so it is claimed
-/// whatever its argument, and the name is checked by [`check_resource_name`].
+/// [`RESOURCE_KIND`] is the exception: it names no target, so its discriminator
+/// is the exact name — one of [`RESOURCE_NAMES`] — and nothing else is claimed.
 pub fn claims(kind: Option<&str>, arg: &str, kinds: &[&str]) -> bool {
     let Some(k) = kind.filter(|k| kinds.contains(k)) else {
         return false;
     };
-    k == RESOURCE_KIND || arg.starts_with("//")
+    if k == RESOURCE_KIND {
+        return RESOURCE_NAMES.contains(&arg);
+    }
+    arg.starts_with("//")
 }
 
 /// The first `${kind:…}` in `s` whose kind is in `kinds`.
@@ -340,9 +325,11 @@ pub fn substitute(
     mut resolve: impl FnMut(&Ref<'_>) -> anyhow::Result<String>,
 ) -> anyhow::Result<String> {
     let pieces = parse(s)?;
+    // `claims`, not the kind alone: `${resource:cpus}` or `${read:-x}` beside a
+    // real reference is somebody else's text and is reproduced, not resolved.
     if !pieces
         .iter()
-        .any(|p| matches!(p, Piece::Ref(r) if r.kind.is_some_and(|k| want.contains(&k))))
+        .any(|p| matches!(p, Piece::Ref(r) if claims(r.kind, r.arg, want)))
     {
         return Ok(s.to_string());
     }
@@ -352,7 +339,7 @@ pub fn substitute(
             Piece::Text(t) => out.push_str(t),
             // Verbatim: not heph's escape here.
             Piece::Escape => out.push_str("$$"),
-            Piece::Ref(r) if r.kind.is_some_and(|k| want.contains(&k)) => {
+            Piece::Ref(r) if claims(r.kind, r.arg, want) => {
                 out.push_str(&resolve(r)?);
             }
             Piece::Ref(r) => out.push_str(r.raw),
@@ -522,47 +509,36 @@ mod tests {
         assert!(first_deferred_ref("sed 's/${/X/'").is_none());
     }
 
-    /// `${resource:…}` is claimed whatever its argument, so a typo reaches the
-    /// name check instead of the tool; anything that is not exactly that kind
-    /// stays somebody else's.
+    /// `${resource:…}` is claimed only for an exact name; every other spelling —
+    /// a typo, a bash form, another kind — is somebody else's text.
     #[test]
     fn resource_references_adversarial() {
         let first = |s: &str| first_deferred_ref(s).map(|r| r.raw.to_string());
-        let named = |s: &str| {
-            let r = first_deferred_ref(s).expect("claimed");
-            check_resource_name(&r).is_ok()
-        };
-        // Claimed, and a valid name.
-        assert!(named("${resource:cpu}"));
-        assert!(named("${resource:memory}"));
-        assert!(named("-j${resource:cpu}"));
-        // Claimed, and refused by name — each a typo or a bash form.
-        for bad in [
+        // Claimed: an exact name.
+        assert_eq!(first("${resource:cpu}").as_deref(), Some("${resource:cpu}"));
+        assert!(has_deferred_ref("${resource:memory}"));
+        assert!(only_resource_refs("-j${resource:cpu}"));
+        // Not claimed — a typo, a bash form, another kind — and reproduced
+        // verbatim by `substitute`, even beside a claimed one.
+        for other in [
             "${resource:cpus}",
             "${resource:}",
             "${resource:CPU}",
             "${resource:cpu:-1}",
+            "${resource:-x}",
             "${resource://cpu}",
             "${resource:cpü}",
             "${resource: cpu}",
-        ] {
-            assert!(has_deferred_ref(bad), "{bad} must be claimed");
-            assert!(!named(bad), "{bad} must be refused");
-            let r = first_deferred_ref(bad).expect("claimed");
-            let msg = format!("{:#}", check_resource_name(&r).unwrap_err());
-            assert!(
-                msg.contains("${resource:cpu}") && msg.contains("${resource:memory}"),
-                "{msg}"
-            );
-        }
-        // Not this kind: left alone.
-        for other in [
             "${resources:cpu}",
             "${resource}",
             "${Resource:cpu}",
             "$${resource:cpu}",
         ] {
             assert!(!has_deferred_ref(other), "{other}");
+            assert!(!only_resource_refs(other), "{other}");
+            let mixed = format!("{other} ${{resource:cpu}}");
+            let out = substitute(&mixed, &[RESOURCE_KIND], |_| Ok("3".to_string())).unwrap();
+            assert_eq!(out, format!("{other} 3"), "{mixed}");
         }
         // Two in one value, and mixed with `read`.
         let s = "${resource:cpu}/${resource:memory} ${read://a:b}";
