@@ -12,6 +12,11 @@ target(
 )
 ```
 
+**`-j N` now means CPUs, not targets.** `-j 8` lets the run reserve 8 CPUs at
+once: eight targets that declare nothing (each costs 1), or two that declare
+`cpu: 4`. The default is the core count, where it used to be `2 × cores`
+target slots — see [Compatibility](#compatibility).
+
 heph **tells**, it does not police. Nothing kills, throttles or pins a process
 that uses more than it reserved (no cgroups, `ulimit` or affinity), and no
 resource value reaches any hash.
@@ -25,6 +30,11 @@ A **pool** is a named capacity. Three kinds:
 | `cpu` | CPUs; held as micro-CPUs (10⁻⁶ CPU) | the engine's parallelism (the core count) |
 | `memory` | bytes | the memory this process may use: on Linux the cgroup limit when one is set (v2 `memory.max`, v1 `memory.limit_in_bytes`, capped at physical memory), else physical memory; on macOS physical memory |
 | a custom pool (`docker`, `gpu`, …) | a count | none: 0 until the config or a run gives it one |
+
+The `memory` default differs by platform on purpose: cgroup-aware on Linux,
+physical memory on macOS. A target that declares `memory` can therefore wait
+in a Linux CI container (limited to, say, 8G) where it ran at once on a 32G
+laptop; set `resources: {memory: …}` to make the two agree.
 
 Pool names are `[a-z][a-z0-9_]{0,63}`; a target names at most 16.
 
@@ -84,7 +94,7 @@ run that reaches a target needing it fails at admission, before the target
 runs:
 
 ```
-//p:t acquires gpu, but pool gpu has capacity 0 and must be set: --resource gpu=<n>, HEPH_RESOURCE_GPU=<n> or resources.gpu in .hephconfig
+//p:t acquires gpu, but pool gpu has capacity 0 and must be set: --resource gpu=<n>, HEPH_RESOURCE_GPU=<n> or resources: {gpu: <n>} in .hephconfig
 ```
 
 A pool that is not declared at all is an error when the def is linked, which
@@ -129,7 +139,11 @@ reservation).
 - **Clamped.** A request above a pool's capacity is reduced to the capacity:
   `cpu: 16` on 4 waits for an empty pool, runs alone and is told 4. The clamp
   is logged at `info` once per target per request and carried on the event
-  (`declared` vs `reserved`), not printed on every run.
+  (`declared` vs `reserved`); the TUI row and the CI `running` line show it
+  as `cpu 16→4`.
+
+`ExecuteStart.queued_ms` is how long each admitted run waited, so a short
+wait (under the notice threshold below) is still answerable from the stream.
 
 **Seeing it.** A wait that outlasts the notice threshold (5 s) is announced as
 `AdmissionWaitStart` / `AdmissionWaitEnd { addr, pool, need, free, ahead }`
@@ -165,9 +179,12 @@ They pass through an exec runner like the rest of the environment. Drivers that
 spawn nothing ignore the allotment.
 
 heph exports **only its own names**. Mapping them onto a tool is the author's,
-through a `${resource:cpu}` / `${resource:memory}` deferred value in a driver
-option, an `env`, `runtime_env` or transitive `env` value (see
-`docs/DEFERRED_VALUES.md`). It is substituted at run with the same text as
+through a `${resource:cpu}` / `${resource:memory}` deferred value in an `env`,
+`runtime_env` or transitive `env` value (see `docs/DEFERRED_VALUES.md`). Those
+are the only fields that take one: anywhere else (a `run` line, a `template`
+var, an `oci` push `dest`, a credential presentation) the number could reach
+an output and make its hashout per-machine, so heph refuses it when the def
+is built. It is substituted at run with the same text as
 `HEPH_CPUS` / `HEPH_MEMORY_BYTES`; a transitive value resolves with the
 *dependent's* allotment. The def hash covers the reference text, so the mapping
 never moves a key:
@@ -192,8 +209,10 @@ target(
 
 In a bash `run`, `$HEPH_CPUS` is ordinary shell expansion of the exported
 variable. `${resource:memory}` on a target that declared no memory is an
-error, not an empty string; `${resource:cpus}` and other names are parse
-errors (custom pools are not exposed).
+error, not an empty string. Only the two exact names are heph's:
+`${resource:cpus}`, `${resource:-x}` and any other `${resource:…}` pass
+through untouched, like any `${…}` heph does not own (custom pools are not
+exposed).
 
 **Go.** heph sets neither `GOMAXPROCS` nor `GOMEMLIMIT`, for any generated Go
 target or Go driver: a Go process sizes itself from the host as before, and
@@ -253,10 +272,29 @@ change (plugin ABI 0.17.3 → 0.17.4, patch, lane `^0.17.0`):
   cdylib driver that already reads a config key of that name keeps it, and the
   engine now also reads whatever it puts on `TargetDef.resources`. No builtin
   driver read the key before.
-- **Source break for third-party SDK code.** `TargetDef` and the run request
-  gain a field and are not `#[non_exhaustive]`, so struct literals without
-  `..Default::default()` stop compiling at rebuild. The wire is unchanged for
-  old plugins.
+- **`-j N` changed meaning.** It is CPUs the run may reserve at once, not a
+  count of targets, and the default went from `2 × cores` slots to `cores`
+  CPUs. A workspace whose targets declare nothing runs half as many at once
+  as before by default; `-j 200%` (or `resources: {cpu: 200%}`) restores
+  the old concurrency.
+- **Source break for third-party SDK code.** `TargetDef` gains a field and is
+  not `#[non_exhaustive]`, so a `TargetDef { … }` literal without
+  `..Default::default()` stops compiling at rebuild. `RunRequest` is
+  `#[non_exhaustive]` (built with `RunRequest::new`), so its new `allotment`
+  field breaks nothing; but `RunRequest::resolve` now returns
+  `Cow<'_, str>` instead of `&str`, so a caller that bound the result as
+  `&str` needs a `&*` or `.as_ref()`. The wire is unchanged for old plugins.
+- **`RequestConfig.max_workers`** is now the `cpu` capacity in CPUs, rounded
+  up — no longer the worker-slot count. A reader comparing it across versions
+  sees it halve by default, and differ under `-j 50%` or a fractional
+  capacity.
+- **Every `exec`/`bash` target now sees `HEPH_CPUS`** (`1` for a target that
+  declares nothing). Nothing reaches a key through it, but an output that
+  captures its own environment — a runner whose fingerprint hashes `env` —
+  changes once, so its consumers miss once on upgrade.
+- **Non-string dict keys in BUILD config are an error.** `env = {1: "x"}` or
+  any config dict with a non-string key used to drop the entry silently; it
+  now fails naming the key.
 - **Old plugin, new host.** A 0.17.3 cdylib sends no `resources` (its targets
   cost 1 CPU) and ignores the allotment (its tools are told nothing).
 - **New plugin, old host.** A 0.17.3 host ignores a new plugin's `resources`:
