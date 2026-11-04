@@ -598,8 +598,12 @@ pub fn detect_output_collisions(groups: &BTreeMap<PathBuf, Vec<RunInput>>) -> an
                         // is benign (last-writer-wins is safe when the bytes
                         // match). Allow it, keeping the first owner. Mirrors the
                         // `validate` codegen-overlap exemption. Any collision
-                        // involving a non-fs producer is still a hard error.
-                        if is_fs_source(existing) && is_fs_source(producer) {
+                        // involving a non-fs producer is still a hard error, and
+                        // so is one between two fs modes: a names-only glob
+                        // stages an empty placeholder, which must never land on
+                        // (or under) a content file's path. The rule is the fs
+                        // provider's own (`hmodel::htfs`).
+                        if hmodel::htfs::fs_overlap_is_benign(existing, producer) {
                             continue;
                         }
                         anyhow::bail!(
@@ -673,17 +677,6 @@ pub async fn detect_output_collisions_blocking(
         anyhow::Ok(groups)
     })
     .await
-}
-
-/// The fs provider's package. Its `file`/`glob` targets only expose existing
-/// workspace source (never materialize), so two of them claiming the same
-/// sandbox path provide identical bytes — a benign overlap. Kept as a literal to
-/// avoid a `driver-support` → `builtins` dependency (would cycle); mirrors
-/// `hbuiltins::pluginfs::is_fs_addr`.
-const FS_PROVIDER_PKG: &str = "@heph/fs";
-
-fn is_fs_source(addr: &Addr) -> bool {
-    addr.package.as_str() == FS_PROVIDER_PKG
 }
 
 // ---------------------------------------------------------------------
@@ -1103,6 +1096,49 @@ mod source_map_tests {
             ),
         ]);
         detect_output_collisions(&groups).expect("two fs deps overlapping must be allowed");
+    }
+
+    // The exemption holds within one fs mode only: a names-only glob stages an
+    // empty placeholder, so its overlap with a content glob or file would put a
+    // placeholder over the real bytes (or the reverse) by staging order. Two
+    // names globs both stage the placeholder, so they still agree.
+    #[test]
+    fn fs_names_vs_fs_content_collision_errors() {
+        for content_addr in [
+            "//@heph/fs:glob@p=mgmt/*",
+            "//@heph/fs:file@f=mgmt/embed.txt",
+        ] {
+            let groups = group(vec![
+                make_input(
+                    "dep|names|0",
+                    "//@heph/fs:glob@p=mgmt/*,m=names",
+                    &[("mgmt/embed.txt", "")],
+                ),
+                make_input("dep|content|0", content_addr, &[("mgmt/embed.txt", "x")]),
+            ]);
+            let err = detect_output_collisions(&groups)
+                .expect_err("a names placeholder over a content file must collide");
+            let msg = format!("{err:#}");
+            assert!(msg.contains("two different targets"), "{msg}");
+            assert!(
+                msg.contains("m=names") && msg.contains(content_addr),
+                "{msg}"
+            );
+        }
+
+        let groups = group(vec![
+            make_input(
+                "dep|names|0",
+                "//@heph/fs:glob@p=mgmt/*,m=names",
+                &[("mgmt/embed.txt", "")],
+            ),
+            make_input(
+                "dep|names|1",
+                "//@heph/fs:glob@p=mgmt/*.txt,m=names",
+                &[("mgmt/embed.txt", "")],
+            ),
+        ]);
+        detect_output_collisions(&groups).expect("two names globs overlapping must be allowed");
     }
 
     // The exemption is fs-only: an fs input colliding with a real (non-fs)

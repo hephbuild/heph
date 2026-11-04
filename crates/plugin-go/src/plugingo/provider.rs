@@ -8,6 +8,7 @@ use crate::plugingo::factors::{self, Factors, VariantRef, current_goarch, curren
 use crate::plugingo::gocache;
 use crate::plugingo::govet;
 use crate::plugingo::listed;
+use crate::plugingo::nongo_lanes;
 use crate::plugingo::pkg_analysis::{
     GoPackage, PackageAddrs, decode_go_package, decode_package_addrs, find_module_for_import,
     is_stdlib_import_path, parse_go_mod_module_path, parse_go_mod_requires, parse_go_sum_modules,
@@ -1730,23 +1731,85 @@ fn go_test_data_query_addr(pkg: &str) -> Addr {
     hplugin_query::pluginquery::query_addr(&expr, "", &["go"])
 }
 
-fn compute_pkg_src_addrs(pkg_str: &str, states: &[State]) -> anyhow::Result<Vec<String>> {
-    let non_go_glob = if pkg_str.is_empty() {
-        "**/*".to_string()
-    } else {
-        format!("{}/**/*", pkg_str)
+/// `_golist`'s non-Go inputs for `pkg_str` (the whole module for the root
+/// package), by lane — see [`nongo_lanes`] for why there are three:
+///
+/// - the names-only glob: every non-Go file but the header-read set, so editing
+///   an asset, a README or testdata re-lists nothing;
+/// - the header-read set (C/asm-family files in the package's own directory) as
+///   a content glob `go list` reads, staged unhashed, plus the provider-owned
+///   header target over that same glob, which is what the key hashes. Always
+///   added — deciding from disk whether the package has such files would be a
+///   spec-time read; with none, the header target's tar is empty;
+/// - the codegen lanes (`go_src` query, `go_codegen_deps`), staged unhashed with
+///   the source map; the header target takes the same addrs as hashed inputs
+///   and keys each generated `.go` file by its go/build view and every other
+///   generated file by its whole content (a generator has to run before its file
+///   names are known, so they cannot be split by glob).
+///
+/// All three exclude `.go` (their own lane) and the module files
+/// `go.mod`/`go.sum`, which the modfiles (`_go_mod`) lane delivers as `fs:file`
+/// deps — two targets writing the same sandbox file is an output collision.
+///
+/// A `vendored` module keeps today's single content lane, codegen included, all
+/// content-hashed: see [`nongo_lanes::vendored_module`].
+fn compute_pkg_src_addrs(
+    pkg_str: &str,
+    states: &[State],
+    vendored: bool,
+) -> anyhow::Result<target_golist::NonGoLanes> {
+    let gen_root = pick_codegen_root(states).map(|s| s.package.as_str());
+    let gen_deps = match pick_codegen_deps(states).and_then(|s| s.state.get("go_codegen_deps")) {
+        Some(v) => normalize_codegen_deps(
+            pkg_str,
+            &parse_strings(v).context("parsing go_codegen_deps from go provider_state")?,
+        )?,
+        None => Vec::new(),
     };
-    // Exclude `.go` (their own lane) and the module files `go.mod`/`go.sum`:
-    // the latter are delivered into `_golist` by the modfiles (`_go_mod`) lane
-    // as `fs:file` deps. Without excluding them here the non-go glob and the
-    // modfiles dep both produce `go.mod`/`go.sum` in the sandbox — two
-    // different targets writing the same file, which the sandbox runner now
-    // rejects as an output collision.
-    let non_go_glob_addr =
-        pluginfs::glob_addr(&non_go_glob, &["**/*.go", "**/go.mod", "**/go.sum"]);
-    let mut addrs = vec![non_go_glob_addr.format()];
+    let codegen = codegen_addrs(pkg_str, gen_root, &gen_deps);
+    let go_src = nongo_lanes::go_src_glob_addr(pkg_str).format();
+    Ok(if vendored {
+        target_golist::NonGoLanes::Vendored {
+            srcfiles: [go_src, nongo_lanes::content_glob_addr(pkg_str).format()]
+                .into_iter()
+                .chain(codegen)
+                .collect(),
+        }
+    } else {
+        target_golist::NonGoLanes::Split {
+            go_src,
+            codegen,
+            names: nongo_lanes::names_glob_addr(pkg_str).format(),
+            header_srcs: nongo_lanes::header_read_glob_addr(pkg_str).format(),
+            headers: nongo_lanes::headers_addr(pkg_str, gen_root, &gen_deps).format(),
+        }
+    })
+}
 
-    let codegen_root = pick_codegen_root(states);
+/// `go_codegen_deps` as absolute addrs, resolved against the consuming package
+/// `pkg_str` exactly as `_golist` parses its deps — so the header target, which
+/// lives in another package, names the same targets.
+fn normalize_codegen_deps(pkg_str: &str, deps: &[String]) -> anyhow::Result<Vec<String>> {
+    let pkg = PkgBuf::from(pkg_str);
+    deps.iter()
+        .map(|d| {
+            hplugin::driver::TargetAddr::parse(d, &pkg)
+                .map(|a| a.to_string())
+                .with_context(|| format!("parse go_codegen_deps entry {d}"))
+        })
+        .collect()
+}
+
+/// The codegen lanes of `pkg_str`: the `go_src` query over the codegen root's
+/// subtree (`gen_root`, the package of the closest `go_codegen_root` state) or
+/// the package's own, then the `go_codegen_deps` (already absolute). The **one**
+/// builder: `_golist` stages these and the header target hashes them, so both
+/// must name the same targets.
+pub(crate) fn codegen_addrs(
+    pkg_str: &str,
+    gen_root: Option<&str>,
+    gen_deps: &[String],
+) -> Vec<String> {
     // Scope: every package under the codegen root if one is declared, else the
     // target's own package *and everything under it*.
     //
@@ -1762,8 +1825,8 @@ fn compute_pkg_src_addrs(pkg_str: &str, states: &[State]) -> anyhow::Result<Vec<
     //
     // Widening the floor cannot pull in a foreign target: `tree_output(pkg)` still
     // requires the output to land in *this* package's tree.
-    let scope = match codegen_root {
-        Some(root) => pkg_prefix_pattern(root.package.as_str()),
+    let scope = match gen_root {
+        Some(root) => pkg_prefix_pattern(root),
         None => default_scope(pkg_str),
     };
     // Cheapest-first by resolution tier: `scope` resolves at the no-IO addr
@@ -1775,16 +1838,9 @@ fn compute_pkg_src_addrs(pkg_str: &str, states: &[State]) -> anyhow::Result<Vec<
     // building) the go provider's per-variant targets.
     let go_src_expr = format!("{scope} && label(go_src) && tree_output({pkg_str})");
     let go_src_query_addr = hplugin_query::pluginquery::query_addr(&go_src_expr, "", &["go"]);
-    addrs.push(go_src_query_addr.format());
-
-    if let Some(deps_state) = pick_codegen_deps(states)
-        && let Some(deps_val) = deps_state.state.get("go_codegen_deps")
-    {
-        let deps =
-            parse_strings(deps_val).context("parsing go_codegen_deps from go provider_state")?;
-        addrs.extend(deps);
-    }
-    Ok(addrs)
+    std::iter::once(go_src_query_addr.format())
+        .chain(gen_deps.iter().cloned())
+        .collect()
 }
 
 /// Pick the closest (deepest) ancestor state carrying `go_embed_deps`. Mirrors
@@ -1922,6 +1978,26 @@ impl ProviderInner {
             let sha256 = govet::expected_sha256(&self.sdk_checksums, tag, &goos, &goarch);
             let spec = govet::build_spec(addr.clone(), tag, &sha256);
             return Ok(GetResponse { target_spec: spec });
+        }
+
+        // The header target of a package's C/asm-family files:
+        // `//@heph/go/headers/<pkg>:headers`. Provider-owned (the buildfile
+        // provider never reads a BUILD file under `@heph/…` — its
+        // `is_reserved_package` — so none can stand in for `_golist`'s only
+        // hashed view of those files), variant-free, never listed, and derived
+        // from the addr alone — answering it reads nothing from disk. Its
+        // codegen inputs come from the consuming package's states, which this
+        // `get` cannot see (they are not ancestors of `@heph/…`), so `_golist`
+        // writes what it read of them into the addr's args.
+        if addr.name == nongo_lanes::HEADERS_NAME
+            && let Some(pkg) = nongo_lanes::pkg_from_headers_pkg(addr.package.as_str())
+        {
+            let (gen_root, gen_deps) =
+                nongo_lanes::headers_codegen_args(addr).map_err(GetError::Other)?;
+            let go_gen = codegen_addrs(pkg, gen_root.as_deref(), &gen_deps);
+            return Ok(GetResponse {
+                target_spec: nongo_lanes::headers_spec(addr.clone(), pkg, &go_gen),
+            });
         }
 
         // Standard library install: `@heph/go/std:install` builds all of std from
@@ -2942,26 +3018,26 @@ impl ProviderInner {
                     "_go_mod".to_string(),
                     Default::default(),
                 );
-                // Use a pluginfs glob directly instead of _go_src: _go_src spec
+                // The `.go` lane is a pluginfs glob, not _go_src: _go_src spec
                 // generation calls executor.result(_golist), which would deadlock.
+                // Staged unhashed beside the header target that hashes the
+                // files' go/build view — unless the module is vendored.
                 let pkg = addr.package.as_str();
-                let src_glob = if pkg.is_empty() {
-                    "*.go".to_string()
-                } else {
-                    format!("{}/*.go", pkg)
-                };
-                let go_src_glob_addr = pluginfs::glob_addr(&src_glob, &[]);
                 // Non-Go src tree + go_src codegen query + go_codegen_deps — needed
                 // so `go list` can resolve //go:embed patterns into EmbedFiles, and
                 // shared with the downstream `embed` target.
-                let extra_src_addrs = compute_pkg_src_addrs(pkg, states)?;
+                //
+                // Vendoring is checked on every `get`, at the module root, and
+                // never memoized: adding `vendor/` must take effect next run.
+                let vendored = nongo_lanes::vendored_module(module_root);
+                let non_go = compute_pkg_src_addrs(pkg, states, vendored)?;
                 // `-test` is only worth its cost where a test field can be read
                 // back. Codegen can produce a `_test.go` that isn't on disk when
                 // the spec is built, so any package with a codegen/extra source
                 // lane keeps the flag unconditionally — the on-disk scan is
                 // authoritative only for a package whose sources are all static.
                 let has_test_files =
-                    !extra_src_addrs.is_empty() || self.package_has_test_files_on_disk(pkg);
+                    non_go.has_extra_src_lane() || self.package_has_test_files_on_disk(pkg);
                 target_golist::build_spec_firstparty(
                     addr,
                     import_path,
@@ -2969,9 +3045,7 @@ impl ProviderInner {
                     &self.go_version,
                     &module_root_rel.to_string_lossy(),
                     &go_mod_addr,
-                    &go_src_glob_addr,
-                    None,
-                    &extra_src_addrs,
+                    &non_go,
                     has_test_files,
                 )?
             }
@@ -8261,20 +8335,21 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         assert!(res.is_ok(), "deeper test.skip=False must override");
     }
 
-    fn extract_srcfiles(resp: &GetResponse) -> Vec<String> {
+    /// The `_golist` spec's codegen lanes (its `gensrcs` dep group).
+    fn extract_codegen(resp: &GetResponse) -> Vec<String> {
         let deps = match resp.target_spec.config.get("deps").unwrap() {
             Value::Map(m) => m,
             _ => panic!("deps not a map"),
         };
-        match deps.get("srcfiles").unwrap() {
+        match deps.get(target_golist::GROUP_GEN_SRCS).unwrap() {
             Value::List(l) => l
                 .iter()
                 .map(|v| match v {
                     Value::String(s) => s.clone(),
-                    _ => panic!("srcfiles entry not a string"),
+                    _ => panic!("gensrcs entry not a string"),
                 })
                 .collect(),
-            _ => panic!("srcfiles not a list"),
+            _ => panic!("gensrcs not a list"),
         }
     }
 
@@ -8294,7 +8369,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             }),
         };
         let resp = p.get(req, &StdCancellationToken::new()).await.unwrap();
-        let srcfiles = extract_srcfiles(&resp);
+        let srcfiles = extract_codegen(&resp);
         let go_src_query = srcfiles
             .iter()
             .find(|s| s.contains("label(go_src)"))
@@ -8342,7 +8417,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             }),
         };
         let resp = p.get(req, &StdCancellationToken::new()).await.unwrap();
-        let srcfiles = extract_srcfiles(&resp);
+        let srcfiles = extract_codegen(&resp);
         let go_src_query = srcfiles
             .iter()
             .find(|s| s.contains("label(go_src)"))
@@ -8387,10 +8462,46 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     // and resolves each term at its cheapest tier — `scope` (addr, no IO) <
     // `label` (spec/`get_spec`) < `tree_output` (def/`get_def`). Freeze that
     // order in both source-set queries: `label` before `tree_output`.
+    /// A non-vendored package's lanes, as plain fields.
+    #[derive(Debug)]
+    struct SplitLanes {
+        go_src: String,
+        codegen: Vec<String>,
+        names: String,
+        header_srcs: String,
+        headers: String,
+    }
+
+    fn split_lanes(pkg: &str, states: &[State]) -> SplitLanes {
+        match compute_pkg_src_addrs(pkg, states, false).unwrap() {
+            target_golist::NonGoLanes::Split {
+                go_src,
+                codegen,
+                names,
+                header_srcs,
+                headers,
+            } => SplitLanes {
+                go_src,
+                codegen,
+                names,
+                header_srcs,
+                headers,
+            },
+            other => panic!("a non-vendored module splits its lanes: {other:?}"),
+        }
+    }
+
+    fn vendored_srcfiles(pkg: &str) -> Vec<String> {
+        match compute_pkg_src_addrs(pkg, &[], true).unwrap() {
+            target_golist::NonGoLanes::Vendored { srcfiles } => srcfiles,
+            other => panic!("a vendored module keeps one lane: {other:?}"),
+        }
+    }
+
     #[test]
     fn source_set_queries_order_label_before_tree_output() {
-        let go_src = compute_pkg_src_addrs("pkg", &[])
-            .unwrap()
+        let go_src = split_lanes("pkg", &[])
+            .codegen
             .into_iter()
             .find(|s| s.contains("label(go_src)"))
             .expect("go_src query present");
@@ -8428,7 +8539,17 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         // Decoupling guarantee: `_golist`'s source set pulls the `go_src` lane but
         // never `go_embed_src`, so an expensive asset build (frontend bundle) can
         // never block `go list` / query / metadata.
-        let addrs = compute_pkg_src_addrs("pkg", &[]).unwrap();
+        let lanes = split_lanes("pkg", &[]);
+        let addrs: Vec<&String> = lanes
+            .codegen
+            .iter()
+            .chain([
+                &lanes.go_src,
+                &lanes.names,
+                &lanes.header_srcs,
+                &lanes.headers,
+            ])
+            .collect();
         assert!(
             addrs.iter().any(|s| s.contains("label(go_src)")),
             "go_src lane must be present in golist srcfiles: {addrs:?}"
@@ -8449,8 +8570,9 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     fn label_queries_exclude_the_go_provider() {
         let exclude = format!("{}=go", hplugin_query::pluginquery::EXCLUDE_PROVIDER_ARG);
 
-        let src = compute_pkg_src_addrs("pkg", &[]).unwrap();
+        let src = split_lanes("pkg", &[]);
         let go_src = src
+            .codegen
             .iter()
             .find(|s| s.contains("label(go_src)"))
             .expect("go_src query present");
@@ -8482,19 +8604,173 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
     // an output collision, so the glob must exclude the module files.
     #[test]
     fn compute_pkg_src_addrs_glob_excludes_module_files() {
-        let addrs = compute_pkg_src_addrs("", &[]).unwrap();
-        let glob = addrs
+        let names = split_lanes("", &[]).names;
+        let vendored = vendored_srcfiles("");
+        let content = vendored
             .iter()
-            .find(|s| s.contains(":glob@"))
-            .expect("non-go glob present in golist srcfiles");
-        assert!(
-            glob.contains("**/go.mod"),
-            "glob must exclude go.mod: {glob}"
+            .find(|s| s.contains(":glob@") && **s != nongo_lanes::go_src_glob_addr("").format())
+            .expect("vendored module keeps the content glob in srcfiles");
+        for glob in [&names, content] {
+            assert!(
+                glob.contains("**/go.mod"),
+                "glob must exclude go.mod: {glob}"
+            );
+            assert!(
+                glob.contains("**/go.sum"),
+                "glob must exclude go.sum: {glob}"
+            );
+        }
+    }
+
+    /// T11: the D3 lanes, nested and root. The names lane is names-only, the
+    /// header-read lane and the header target are always present and share one
+    /// glob addr, and the codegen query stays content-hashed in `srcfiles`.
+    #[test]
+    fn compute_pkg_src_addrs_lanes() {
+        for pkg in ["pkg", ""] {
+            let lanes = split_lanes(pkg, &[]);
+            assert_eq!(lanes.names, nongo_lanes::names_glob_addr(pkg).format());
+            assert!(
+                lanes.names.contains("m=names"),
+                "names lane is names-only: {:?}",
+                lanes.names
+            );
+            assert_eq!(
+                lanes.header_srcs,
+                nongo_lanes::header_read_glob_addr(pkg).format()
+            );
+            assert_eq!(
+                lanes.headers,
+                nongo_lanes::headers_addr(pkg, None, &[]).format()
+            );
+            assert_eq!(lanes.go_src, nongo_lanes::go_src_glob_addr(pkg).format());
+            assert!(
+                lanes.codegen.iter().any(|s| s.contains("label(go_src)")),
+                "{lanes:?}"
+            );
+        }
+    }
+
+    /// T11, vendored (I8): exactly today's lanes — one content glob, no names
+    /// lane, no header target.
+    #[test]
+    fn compute_pkg_src_addrs_vendored_keeps_the_content_lane() {
+        let srcfiles = vendored_srcfiles("pkg");
+        assert_eq!(
+            srcfiles.first(),
+            Some(&nongo_lanes::go_src_glob_addr("pkg").format()),
+            "the .go glob, content-hashed"
         );
-        assert!(
-            glob.contains("**/go.sum"),
-            "glob must exclude go.sum: {glob}"
+        assert_eq!(
+            srcfiles.get(1).map(String::as_str),
+            Some(
+                pluginfs::glob_addr("pkg/**/*", &["**/*.go", "**/go.mod", "**/go.sum"])
+                    .format()
+                    .as_str()
+            ),
+            "today's addr, byte for byte"
         );
+    }
+
+    /// I8/B5: a module is vendored iff `vendor/modules.txt` is at its root, and
+    /// the check reads the disk every time.
+    #[test]
+    fn vendored_module_is_read_from_disk_each_time() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(!nongo_lanes::vendored_module(dir.path()));
+        std::fs::create_dir_all(dir.path().join("vendor")).expect("mkdir");
+        assert!(!nongo_lanes::vendored_module(dir.path()), "vendor/ alone");
+        std::fs::write(dir.path().join("vendor/modules.txt"), "").expect("write");
+        assert!(nongo_lanes::vendored_module(dir.path()));
+        std::fs::remove_file(dir.path().join("vendor/modules.txt")).expect("rm");
+        assert!(!nongo_lanes::vendored_module(dir.path()));
+    }
+
+    /// T11/T14: the provider answers the header target from the path alone, and
+    /// `_golist` takes it hashed but not staged, in a group with no source-map
+    /// annotation.
+    #[tokio::test]
+    async fn header_target_is_provider_owned_and_hash_only() {
+        let sandbox = tempfile::tempdir().expect("tempdir");
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
+        for pkg in ["pkg/sub", ""] {
+            let resp = provider_get(&p, nongo_lanes::headers_addr(pkg, None, &[]))
+                .await
+                .expect("header target resolves");
+            assert_eq!(resp.target_spec.driver, listed::DRIVER_HEADERS);
+            assert_eq!(
+                resp.target_spec.config.get("src"),
+                Some(&Value::String(
+                    nongo_lanes::header_read_glob_addr(pkg).format()
+                ))
+            );
+        }
+    }
+
+    /// A header addr whose args do not decode is an error from `get`, not a
+    /// header target answered with fewer inputs than `_golist` stages.
+    #[tokio::test]
+    async fn header_get_with_malformed_args_fails_loudly() {
+        let sandbox = tempfile::tempdir().expect("tempdir");
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
+        for (k, v) in [
+            (nongo_lanes::GEN_DEPS_ARG, "zz"),
+            (nongo_lanes::GEN_DEPS_ARG, "ff00"),
+            ("v", "host"),
+        ] {
+            let addr = Addr::new(
+                PkgBuf::from("@heph/go/headers/pkg"),
+                nongo_lanes::HEADERS_NAME.to_string(),
+                std::collections::BTreeMap::from([(k.to_string(), v.to_string())]),
+            );
+            let err = provider_get(&p, addr)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{k}={v} must fail"));
+            let GetError::Other(err) = err else {
+                panic!("{k}={v}: not an Other error: {err:?}");
+            };
+            let msg = format!("{err:#}");
+            assert!(msg.contains("the header target of //pkg"), "{k}={v}: {msg}");
+        }
+    }
+
+    /// The header target hashes exactly the codegen addrs `_golist` stages
+    /// unhashed: the codegen config `_golist` read from its states reaches the
+    /// header target through the addr, and the two lists agree.
+    #[tokio::test]
+    async fn header_target_hashes_the_codegen_golist_stages() {
+        let sandbox = tempfile::tempdir().expect("tempdir");
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
+        let state = State {
+            package: PkgBuf::from("app"),
+            provider: "go".to_string(),
+            state: HashMap::from([
+                ("go_codegen_root".to_string(), Value::Bool(true)),
+                (
+                    "go_codegen_deps".to_string(),
+                    Value::List(vec![Value::String(":gen".to_string())]),
+                ),
+            ]),
+        };
+        let lanes = split_lanes("app/sub", &[state]);
+        assert!(
+            lanes.codegen.iter().any(|s| s == "//app/sub:gen"),
+            "{lanes:?}"
+        );
+        let headers = hmodel::htaddr::parse_addr(&lanes.headers).unwrap();
+        let resp = provider_get(&p, headers).await.expect("resolves");
+        let go_gen: Vec<String> = match resp.target_spec.config.get("go_gen") {
+            Some(Value::List(l)) => l
+                .iter()
+                .map(|v| match v {
+                    Value::String(s) => s.clone(),
+                    _ => panic!("go_gen entry not a string"),
+                })
+                .collect(),
+            other => panic!("go_gen: {other:?}"),
+        };
+        assert_eq!(go_gen, lanes.codegen);
     }
 
     // Regression: a BUILD file declaring only `go_codegen_deps` (no
@@ -8529,7 +8805,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             }),
         };
         let resp = p.get(req, &StdCancellationToken::new()).await.unwrap();
-        let srcfiles = extract_srcfiles(&resp);
+        let srcfiles = extract_codegen(&resp);
         assert!(
             srcfiles.iter().any(|s| s == "//codegen:gen"),
             "go_codegen_deps must be appended even without go_codegen_root, got: {srcfiles:?}"

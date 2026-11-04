@@ -47,3 +47,6 @@ tempfile = "3"
 # `hplugin::config::Options` is a map of `serde_yaml::Value`, so building one to
 # exercise the provider's option parsing needs the same crate hconfig uses.
 serde_yaml = "0.9"
+# The fs driver's own glob engine: the lane-partition test compiles the
+# `_golist` lane patterns with it and checks every file lands in exactly one.
+wax = "0.7"

@@ -4,16 +4,19 @@ mod driver_compile;
 mod driver_download;
 mod driver_format;
 mod driver_golist;
+mod driver_headers;
 mod driver_lint;
 mod driver_testmain;
 mod embed;
 pub(crate) mod errors;
 mod factors;
 mod gen_testmain;
+mod go_view;
 pub mod gocache;
 mod govet;
 mod listed;
 mod module_fetch;
+mod nongo_lanes;
 mod pkg_analysis;
 mod provider;
 mod target_bin;
@@ -29,9 +32,25 @@ mod variant;
 pub use driver_compile::GoCompileDriver;
 pub use driver_download::GoDownloadDriver;
 pub use driver_format::{GoFormatCheckDriver, GoFormatDriver};
-pub use driver_golist::GoGolistDriver;
+// `GOLIST_JSON_FIELDS` is public for the plugingo-e2e differential that runs
+// `go list` exactly as `_golist` does.
+pub use driver_golist::{GOLIST_JSON_FIELDS, GoGolistDriver};
+// `extract_go_build_header` is public for the plugingo-e2e differential test,
+// which holds it to the real `go/build` on every supported Go.
+pub use driver_headers::{GoHeadersDriver, extract_go_build_header};
 pub use driver_lint::{GoLintDriver, GoLintFixDriver, GoLintGateDriver};
 pub use driver_testmain::GoTestmainDriver;
+// Public for the plugingo-e2e differential too, which holds it to `go/build`'s
+// `readGoInfo` on `.go` files.
+pub use go_view::extract_go_view;
+// The D4 rules, for the plugingo-e2e differentials (per-extension body
+// mutation, extractor vs `go/build`) to iterate over the same set.
+pub use nongo_lanes::{
+    GO_HEADER_READ_EXTS, GO_HEADER_RULES_VERIFIED_AGAINST, NonGoLane, classify_non_go,
+};
+// `_golist`'s `package.bin`, for the plugingo-e2e tests that assert what `go list`
+// reported (`EmbedFiles`, `SFiles`, the package error) after a workspace edit.
+pub use pkg_analysis::{GoPackage, decode_go_package};
 pub use provider::{Config, Provider};
 // `DEFAULT_GO_VERSION` / `HOST` / `checksum_key` are re-exported for the
 // `plugingo-e2e` harness: it must pin the same toolchain this provider does and

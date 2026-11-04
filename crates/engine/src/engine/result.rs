@@ -680,9 +680,13 @@ impl ResultArtifact {
     /// it on consume and fails if it diverges from the hash recorded at
     /// input-hashing time. See [`PassthroughContent`].
     ///
-    /// `is_passthrough` only ever flags a `Content::File` or a
-    /// `Content::View`; any other variant reaching here is a producer bug, so
-    /// it falls back to carrying the raw artifact rather than panicking.
+    /// `is_passthrough` flags a `Content::File`, a `Content::View` or a
+    /// `Content::Raw`. A `Raw` is carried as its own `OutputArtifact`: the
+    /// bytes are owned, so there is nothing to re-verify, and its hashout need
+    /// not be a function of them (a names-only glob entry's is path-only) — it
+    /// must never reach [`VerifyingReader`]. Any other variant reaching here is
+    /// a producer bug, so it too falls back to carrying the raw artifact rather
+    /// than panicking.
     fn passthrough(a: outputartifact::OutputArtifact) -> Self {
         let group = a.group.clone();
         let r#type = manifest_artifact_type(&a.r#type);
@@ -698,6 +702,7 @@ impl ResultArtifact {
             // so consumers get its header-only `entry_paths` and its
             // data-forwarding `walk` instead of the enum's generic fallbacks.
             outputartifact::Content::View(v) => v.view,
+            // `Raw` (owned bytes, unverified) and any unexpected variant.
             other => Arc::new(outputartifact::OutputArtifact {
                 content: other,
                 ..a
@@ -872,15 +877,25 @@ fn manifest_artifact_type(t: &outputartifact::Type) -> ManifestArtifactType {
 ///   duplicate every byte of the source for nothing; the source revision is
 ///   already cached, and the view is a few string operations to re-derive.
 ///
-/// Both borrow bytes they do not own, which is exactly why a *cacheable*
-/// revision is never a passthrough: it must own a durable copy, since the
-/// borrowed source may change or vanish across runs.
+/// * a `Content::Raw` — bytes the artifact already owns in memory (e.g. the
+///   empty placeholders of a names-only `@heph/fs:glob`). Packing them into the
+///   tmp store would buy nothing: the tmp store persists nothing across runs,
+///   the bytes are already in hand, and the pack is a tar job plus a store
+///   insert per artifact on every run, hits included. Carried as-is, it is
+///   never re-verified against its `hashout` (see [`ResultArtifact::passthrough`]),
+///   which is what a names entry needs: its hashout is a function of the path,
+///   not of the bytes.
+///
+/// The first two borrow bytes they do not own, which is exactly why a
+/// *cacheable* revision is never a passthrough: it must own a durable copy,
+/// since the borrowed source may change or vanish across runs. A cacheable
+/// `Raw` is packed too — the cache is what makes it outlive the run.
 fn is_passthrough(use_tmp_cache: bool, content: &outputartifact::Content) -> bool {
     use_tmp_cache
         && match content {
             outputartifact::Content::File(f) => f.passthrough,
-            outputartifact::Content::View(_) => true,
-            _ => false,
+            outputartifact::Content::View(_) | outputartifact::Content::Raw(_) => true,
+            outputartifact::Content::TarPath(_) | outputartifact::Content::CpioPath(_) => false,
         }
 }
 
@@ -3877,9 +3892,10 @@ impl Engine {
 
                     hcore::hmemoizer::set_phase("execute_cache:cache_locally");
 
-                    // Partition produced outputs. A zero-copy passthrough (an
-                    // uncached source file flagged by its producer — e.g.
-                    // `@heph/fs:file`) skips the local cache entirely and is
+                    // Partition produced outputs. A zero-copy passthrough (on
+                    // the uncached path: a source file flagged by its producer
+                    // — e.g. `@heph/fs:file` — a view, or owned raw bytes; see
+                    // `is_passthrough`) skips the local cache entirely and is
                     // carried as its raw `OutputArtifact`, so the cache-write
                     // hot path does no file read, tar, or copy. Everything else
                     // is packed/stored by `cache_locally`. Order is irrelevant —
@@ -4884,8 +4900,10 @@ mod tests {
     }
 
     /// Passthrough is gated two ways: only on the uncached (`tmp`) path, and only
-    /// for a producer-flagged `Content::File`. A cacheable revision, an unflagged
-    /// file, or any non-file content is never a passthrough — it must be packed.
+    /// for content that needs no cache copy there — a producer-flagged
+    /// `Content::File`, or owned `Content::Raw` bytes. A cacheable revision, an
+    /// unflagged file, or a tar on disk is never a passthrough — it must be
+    /// packed.
     #[test]
     fn is_passthrough_gates_on_tmp_and_producer_flag() {
         let flagged = file_output("/ws/go.mod", "go.mod", true, "h").content;
@@ -4902,7 +4920,50 @@ mod tests {
             !is_passthrough(true, &unflagged),
             "unflagged file must pack"
         );
-        assert!(!is_passthrough(true, &raw), "non-file must pack");
+        let tar = outputartifact::Content::TarPath(outputartifact::ContentPath {
+            path: "/sandbox/out.tar".to_string(),
+            owned: true,
+        });
+
+        assert!(is_passthrough(true, &raw), "tmp + owned raw bytes");
+        assert!(!is_passthrough(false, &raw), "cacheable raw must pack");
+        assert!(!is_passthrough(true, &tar), "a tar on disk must pack");
+    }
+
+    /// A `Raw` passthrough is carried as its own bytes and is never re-verified
+    /// against its hashout: a names-only glob entry's hashout is a function of
+    /// its path, so a verifying read would fail every consume.
+    #[test]
+    fn raw_passthrough_reads_its_bytes_without_verifying() {
+        let art = outputartifact::OutputArtifact {
+            group: "out".to_string(),
+            name: "a".to_string(),
+            r#type: outputartifact::Type::Output,
+            content: outputartifact::Content::Raw(outputartifact::ContentRaw {
+                data: Vec::new(),
+                path: "pkg/a.txt".to_string(),
+                x: false,
+            }),
+            hashout: "not-a-content-hash".to_string(),
+        };
+        let ra = ResultArtifact::passthrough(art);
+        assert_eq!(ra.content.hashout().expect("hashout"), "not-a-content-hash");
+        let entries: Vec<_> = ra
+            .content
+            .walk()
+            .expect("walk")
+            .collect::<anyhow::Result<Vec<_>>>()
+            .expect("walk entries");
+        assert_eq!(entries.len(), 1);
+        let entry = entries.into_iter().next().expect("one entry");
+        assert_eq!(entry.path, std::path::PathBuf::from("pkg/a.txt"));
+        let WalkEntryKind::File { mut data, size, .. } = entry.kind else {
+            panic!("a raw entry is a file");
+        };
+        assert_eq!(size, 0);
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut data, &mut buf).expect("read placeholder");
+        assert!(buf.is_empty());
     }
 
     /// A passthrough `ResultArtifact` is the raw `OutputArtifact` as `Content`: it

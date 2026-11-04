@@ -5,6 +5,66 @@ use hmodel::htaddr::Addr;
 use hplugin::provider::TargetSpec;
 use std::collections::HashMap;
 
+/// Dep group of the names-only lane: placeholders, hashed by path. Its own group
+/// so the driver knows content-blind files were staged (the D9 hint).
+pub const GROUP_NAMES: &str = "nongo_names";
+/// Dep group of the header-read files themselves: staged for `go list` to read,
+/// `hashed: false` — [`GROUP_HEADERS`] stands in for them in the key.
+pub const GROUP_HEADER_SRCS: &str = "headersrcs";
+/// Dep group of the header target: `hashed: true, runtime: false`, and no
+/// source-map annotation, so an embedded header-read file still routes to its
+/// own `fs:file` addr downstream.
+pub const GROUP_HEADERS: &str = "headers";
+/// Dep group of the package's own `.go` files when [`GROUP_HEADERS`] covers
+/// them: staged whole for `go list`, `hashed: false` — the header target hashes
+/// their go/build view instead. No source-map annotation: a `.go` file of the
+/// glob maps to its own `fs:file` addr either way.
+pub const GROUP_GO_SRCS: &str = "gosrcs";
+/// Dep group of the codegen lanes when [`GROUP_HEADERS`] covers them: staged for
+/// `go list`, `hashed: false` — the header target hashes the go/build view of
+/// each generated `.go` file and the whole content of every other generated
+/// file. **Keeps** the source-map annotation: it is how `_golist` maps a
+/// generated file back to the target that produced it.
+pub const GROUP_GEN_SRCS: &str = "gensrcs";
+
+/// `_golist`'s source inputs, by lane (see [`crate::plugingo::nongo_lanes`]).
+/// Built by the provider's `compute_pkg_src_addrs`: the shape is what makes an
+/// unhashed lane sound, so there is no way to stage one without the header
+/// target that keys it.
+#[derive(Debug)]
+pub enum NonGoLanes {
+    /// A vendored module: one content-hashed lane (`srcfiles`) — the `.go`
+    /// glob, the whole content glob and the codegen addrs.
+    Vendored { srcfiles: Vec<String> },
+    /// Every other module: each file staged once, keyed either by name or
+    /// through the header target.
+    Split {
+        /// The package's `.go` glob ([`GROUP_GO_SRCS`]), unhashed.
+        go_src: String,
+        /// The codegen lanes ([`GROUP_GEN_SRCS`]), unhashed.
+        codegen: Vec<String>,
+        /// The names-only glob ([`GROUP_NAMES`]).
+        names: String,
+        /// The header-read content glob ([`GROUP_HEADER_SRCS`]), unhashed.
+        header_srcs: String,
+        /// The header target that hashes all three unhashed lanes'
+        /// go/build views ([`GROUP_HEADERS`]).
+        headers: String,
+    },
+}
+
+impl NonGoLanes {
+    /// Whether a lane other than the package's own `.go` glob stages sources:
+    /// codegen can produce a `_test.go` that is not on disk when the spec is
+    /// built (a vendored module's lane always holds the codegen addrs it has).
+    pub fn has_extra_src_lane(&self) -> bool {
+        match self {
+            Self::Vendored { .. } => true,
+            Self::Split { codegen, .. } => !codegen.is_empty(),
+        }
+    }
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "all parameters are required, no natural grouping"
@@ -16,26 +76,37 @@ pub fn build_spec_firstparty(
     go_version: &str,
     go_module: &str,
     go_mod_addr: &Addr,
-    go_src_addr: &Addr,
-    go_src_query_addr: Option<&Addr>,
-    non_go_src_addrs: &[String],
+    non_go: &NonGoLanes,
     has_test_files: bool,
 ) -> anyhow::Result<TargetSpec> {
-    let mut srcfiles: Vec<String> = vec![go_src_addr.format()];
-    if let Some(q) = go_src_query_addr {
-        srcfiles.push(q.format());
+    let modfiles = [go_mod_addr.format()];
+    let mut groups: Vec<(&str, &[String])> = vec![("modfiles", &modfiles[..])];
+    match non_go {
+        NonGoLanes::Vendored { srcfiles } => groups.push(("srcfiles", srcfiles)),
+        NonGoLanes::Split {
+            go_src,
+            codegen,
+            names,
+            header_srcs,
+            headers,
+        } => {
+            groups.push(("srcfiles", &[]));
+            groups.push((GROUP_GO_SRCS, std::slice::from_ref(go_src)));
+            if !codegen.is_empty() {
+                groups.push((GROUP_GEN_SRCS, codegen));
+            }
+            groups.push((GROUP_NAMES, std::slice::from_ref(names)));
+            groups.push((GROUP_HEADER_SRCS, std::slice::from_ref(header_srcs)));
+            groups.push((GROUP_HEADERS, std::slice::from_ref(headers)));
+        }
     }
-    srcfiles.extend_from_slice(non_go_src_addrs);
     let mut spec = build_spec_inner(
         addr,
         import_path,
         factors,
         go_version,
         go_module,
-        &[
-            ("modfiles", &[go_mod_addr.format()][..]),
-            ("srcfiles", &srcfiles),
-        ],
+        &groups,
         // `-test` is what resolves TestEmbedFiles/XTestEmbedFiles and the test
         // import sets. A package with no `_test.go` on disk has none of those,
         // so the flag would only buy `go list` a second (test-variant) package
@@ -43,8 +114,9 @@ pub fn build_spec_firstparty(
         has_test_files,
     )?;
     // Only a first-party package has its `.go` sources staged into the sandbox
-    // (as `srcfiles` deps, codegen included). That is what lets the driver
-    // decide "this directory has no Go package" from the staged inputs alone.
+    // (the `gosrcs`/`gensrcs` groups, or a vendored module's `srcfiles`). That
+    // is what lets the driver decide "this directory has no Go package" from
+    // the staged inputs alone.
     spec.config
         .insert("firstparty".to_string(), Value::Bool(true));
     Ok(spec)
@@ -233,12 +305,18 @@ mod tests {
         Addr::new(PkgBuf::from(""), "_go_mod".to_string(), Default::default())
     }
 
-    fn go_src_addr() -> Addr {
-        Addr::new(
-            PkgBuf::from("mylib"),
-            "_go_src".to_string(),
-            Default::default(),
-        )
+    /// A vendored module's lanes: the `.go` glob content-hashed in `srcfiles`.
+    fn lanes() -> NonGoLanes {
+        NonGoLanes::Vendored {
+            srcfiles: vec![
+                Addr::new(
+                    PkgBuf::from("mylib"),
+                    "_go_src".to_string(),
+                    Default::default(),
+                )
+                .format(),
+            ],
+        }
     }
 
     /// The module has to reach the driver through the config: the driver sees
@@ -252,9 +330,7 @@ mod tests {
             V,
             "svc",
             &go_mod_addr(),
-            &go_src_addr(),
-            None,
-            &[],
+            &lanes(),
             false,
         )
         .expect("spec");
@@ -284,9 +360,7 @@ mod tests {
             V,
             "",
             &go_mod_addr(),
-            &go_src_addr(),
-            None,
-            &[],
+            &lanes(),
             true,
         )
         .unwrap();
@@ -302,9 +376,7 @@ mod tests {
             V,
             "",
             &go_mod_addr(),
-            &go_src_addr(),
-            None,
-            &[],
+            &lanes(),
             true,
         )
         .unwrap();
@@ -325,9 +397,7 @@ mod tests {
             V,
             "",
             &go_mod_addr(),
-            &go_src_addr(),
-            None,
-            &[],
+            &lanes(),
             true,
         )
         .unwrap();
@@ -349,9 +419,7 @@ mod tests {
             V,
             "",
             &go_mod_addr(),
-            &go_src_addr(),
-            None,
-            &[],
+            &lanes(),
             true,
         )
         .unwrap();
@@ -435,9 +503,7 @@ mod tests {
                 V,
                 "",
                 &go_mod_addr(),
-                &go_src_addr(),
-                None,
-                &[],
+                &lanes(),
                 has_tests,
             )
             .unwrap();
@@ -458,9 +524,7 @@ mod tests {
             V,
             "",
             &go_mod_addr(),
-            &go_src_addr(),
-            None,
-            &[],
+            &lanes(),
             true,
         )
         .unwrap();
@@ -484,9 +548,7 @@ mod tests {
             V,
             "",
             &go_mod_addr(),
-            &go_src_addr(),
-            None,
-            &[],
+            &lanes(),
             true,
         )
         .unwrap();
@@ -504,9 +566,7 @@ mod tests {
             V,
             "",
             &go_mod_addr(),
-            &go_src_addr(),
-            None,
-            &[],
+            &lanes(),
             true,
         )
         .unwrap();

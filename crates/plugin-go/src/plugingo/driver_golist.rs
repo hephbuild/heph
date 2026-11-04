@@ -26,7 +26,15 @@ use xxhash_rust::xxh3::Xxh3Default;
 /// rather than inlined so the shape stays in one place: the field set is part of
 /// what a shared `GOCACHE` entry is keyed by, so two call sites that drifted
 /// apart would quietly stop sharing cache entries.
-const GOLIST_JSON_FIELDS: &str = "-json=Dir,ImportPath,Name,GoFiles,SFiles,HFiles,TestGoFiles,XTestGoFiles,EmbedPatterns,EmbedFiles,TestEmbedPatterns,TestEmbedFiles,XTestEmbedPatterns,XTestEmbedFiles,Imports,TestImports,XTestImports,Standard,Module,Match,Incomplete,Error";
+///
+/// **Adding a field or a flag can break the `.go` trust rule.** `_golist` keys a
+/// first-party `.go` file on its go/build view only
+/// ([`crate::plugingo::go_view`]), on the rule that `go list` as invoked here
+/// reads nothing else of it. A field or flag that needs more of the file (a
+/// compile or cgo run such as `-export` or `-compiled`, or anything parsing past
+/// the imports) makes that an under-hash: re-check the rule in `go_view`'s docs
+/// first.
+pub const GOLIST_JSON_FIELDS: &str = "-json=Dir,ImportPath,Name,GoFiles,SFiles,HFiles,TestGoFiles,XTestGoFiles,EmbedPatterns,EmbedFiles,TestEmbedPatterns,TestEmbedFiles,XTestEmbedPatterns,XTestEmbedFiles,Imports,TestImports,XTestImports,Standard,Module,Match,Incomplete,Error";
 
 pub struct GoGolistDriver {
     /// Default exec runner for this driver's tool, from the plugin's `runner:`
@@ -145,6 +153,40 @@ struct GoGolistDef {
     /// see `plugingo::runner`: it reaches the cache key through the hashout of
     /// the input `parse` emits, exactly as a `hash_dep` does.
     runner: Option<TargetAddr>,
+    /// The names-only glob whose files were staged as empty placeholders, if
+    /// any — named in a failure (D9). Absent from `Hash`: it is one of
+    /// `dep_inputs`, which are hashed.
+    #[serde(default)]
+    content_blind: Option<String>,
+}
+
+/// A `go list` failure, with one more line when content-blind placeholders were
+/// staged: if `go list` ever needed the bytes of a non-Go file outside the
+/// header-read set, that is where it would fail, and the addr is what to report.
+///
+/// The line starts with `note: ` on a line of its own, so a script (or an
+/// agent) can find it without parsing the stderr above it.
+fn golist_failure(def: &GoGolistDef, stderr_tail: String) -> crate::plugingo::errors::GoListError {
+    let stderr_tail = match &def.content_blind {
+        Some(addr) => {
+            let pkg = if def.import_path.is_empty() {
+                "this package"
+            } else {
+                def.import_path.as_str()
+            };
+            format!(
+                "{stderr_tail}\nnote: heph staged the non-Go files of {pkg} outside the C/asm \
+                 header set as empty placeholders ({addr}), so go list saw their names but not \
+                 their bytes. If this failure is about one of them, it is a heph bug: report it \
+                 with this message. There is no option to stage them with content."
+            )
+        }
+        None => stderr_tail,
+    };
+    crate::plugingo::errors::GoListError {
+        import_path: def.import_path.clone(),
+        stderr_tail,
+    }
 }
 
 /// Bump to invalidate every cached `_golist` artifact whenever the driver's
@@ -311,7 +353,27 @@ impl ManagedDriver for GoGolistDriver {
             // std `src/`) per package. Source deps keep the source-map
             // annotation so golist can map codegen output back to its target.
             let is_sdk = group.as_str() == crate::plugingo::addr_util::GO_SDK_DEP_GROUP;
-            let annotations = if is_sdk {
+            // The header-read lanes (see `nongo_lanes`): the real files are
+            // staged for `go list` but stay out of the key, and the header target
+            // stands in for them in the key without being staged. Neither opts
+            // into the source map: an embedded header-read file must route to its
+            // own `fs:file` addr, never to the header extract.
+            // The package's `.go` files go the same way: staged whole, keyed
+            // through their go/build view in the header target.
+            // Generated files go that way too, but keep the source map: it is
+            // how a generated file routes to its producer downstream.
+            let (hashed, runtime) = match group.as_str() {
+                crate::plugingo::target_golist::GROUP_HEADER_SRCS
+                | crate::plugingo::target_golist::GROUP_GO_SRCS
+                | crate::plugingo::target_golist::GROUP_GEN_SRCS => (false, true),
+                crate::plugingo::target_golist::GROUP_HEADERS => (true, false),
+                _ => (true, true),
+            };
+            let source_mapped = group.as_str() == crate::plugingo::target_golist::GROUP_GEN_SRCS
+                || (hashed && runtime);
+            let annotations = if !source_mapped {
+                std::collections::BTreeMap::new()
+            } else if is_sdk {
                 std::collections::BTreeMap::from([(
                     hdriver_support::stage::READ_ONLY_ANNOTATION.to_string(),
                     "true".to_string(),
@@ -329,8 +391,8 @@ impl ManagedDriver for GoGolistDriver {
                     mode: InputMode::Standard,
                     origin_id: format!("dep|{group}|{i}"),
                     annotations: annotations.clone(),
-                    hashed: true,
-                    runtime: true,
+                    hashed,
+                    runtime,
                 });
             }
         }
@@ -374,7 +436,11 @@ impl ManagedDriver for GoGolistDriver {
             runtime: false,
         };
 
+        let content_blind = dep_strings
+            .get(crate::plugingo::target_golist::GROUP_NAMES)
+            .and_then(|v| v.first().cloned());
         let def = GoGolistDef {
+            content_blind,
             runner,
             import_path: spec.import_path,
             goos: spec.goos,
@@ -495,7 +561,8 @@ impl ManagedDriver for GoGolistDriver {
         // A first-party directory with no `.go` file staged into it cannot be a
         // Go package — a Go package needs at least one `.go` file, and every
         // source that could make it one (checked-in *and* codegen output, via
-        // the `srcfiles` deps) is already materialized here. So `go list` can
+        // the `gosrcs`/`gensrcs` deps, or a vendored module's `srcfiles`) is
+        // already materialized here. So `go list` can
         // only come back with the "no Go files" error the provider maps to
         // NotFound, and spawning it to learn that is pure cost.
         //
@@ -557,11 +624,7 @@ impl ManagedDriver for GoGolistDriver {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(crate::plugingo::errors::GoListError {
-                import_path: def.import_path.clone(),
-                stderr_tail: hplugin::error::last_n_lines(&stderr, 10),
-            }
-            .into());
+            return Err(golist_failure(def, hplugin::error::last_n_lines(&stderr, 10)).into());
         }
 
         // Parse once, normalize Dir on the struct, then serialize package.bin and
@@ -665,9 +728,9 @@ fn check_package_resolved(
                 && pkg.go_files.is_empty()
                 && !is_settled_package_error(&error.err) =>
         {
-            Err(crate::plugingo::errors::GoListError {
-                import_path: def.import_path.clone(),
-                stderr_tail: format!(
+            Err(golist_failure(
+                def,
+                format!(
                     "{}\n{}\ngo could not resolve this package. To reproduce, run `go list {}` \
                      in this module, in the same shell. A private module needs GOPRIVATE, `git` \
                      on PATH and working credentials: see docs/GO_MODULES.md.",
@@ -675,7 +738,7 @@ fn check_package_resolved(
                     hplugin::error::last_n_lines(&String::from_utf8_lossy(stderr), 10),
                     def.import_path
                 ),
-            })
+            ))
         }
         _ => Ok(()),
     }
@@ -684,7 +747,8 @@ fn check_package_resolved(
 /// Whether `dir` directly contains a file ending in `.go`.
 ///
 /// Non-recursive on purpose: a Go package is exactly one directory, and the
-/// `srcfiles` glob that stages sources is `<pkg>/*.go` for the same reason. A
+/// glob that stages its sources (`nongo_lanes::go_src_glob_addr`) is
+/// `<pkg>/*.go` for the same reason. A
 /// subdirectory's sources belong to a different package with its own `_golist`.
 /// `*_test.go` counts — a directory holding only tests is still a package.
 ///
@@ -1083,6 +1147,77 @@ mod tests {
         assert!(inputs.iter().any(|i| i.origin_id == "dep|srcfiles|0"));
     }
 
+    /// The non-Go lanes' flags, pinned: the header-read files are staged but
+    /// unhashed, the header target hashed but never staged, the names glob
+    /// hashed and staged. Neither header lane gets the source map (an embedded
+    /// header-read file must route to its own `fs:file` addr). And the names
+    /// glob's addr reaches the def, for the D9 hint.
+    #[tokio::test]
+    async fn test_parse_nongo_lane_flags_and_content_blind() {
+        use crate::plugingo::target_golist::{
+            GROUP_GEN_SRCS, GROUP_GO_SRCS, GROUP_HEADER_SRCS, GROUP_HEADERS, GROUP_NAMES,
+        };
+
+        let names = crate::plugingo::nongo_lanes::names_glob_addr("mylib").format();
+        let header_srcs = crate::plugingo::nongo_lanes::header_read_glob_addr("mylib").format();
+        let go_srcs = crate::plugingo::nongo_lanes::go_src_glob_addr("mylib").format();
+        let headers = crate::plugingo::nongo_lanes::headers_addr("mylib", None, &[]).format();
+        let ct = noop_ctoken();
+        let req = make_parse_request(
+            "mylib",
+            "example.com/mylib",
+            vec![
+                (GROUP_NAMES, vec![names.as_str()]),
+                (GROUP_HEADER_SRCS, vec![header_srcs.as_str()]),
+                (GROUP_GO_SRCS, vec![go_srcs.as_str()]),
+                (GROUP_GEN_SRCS, vec!["//mylib:gen"]),
+                (GROUP_HEADERS, vec![headers.as_str()]),
+                ("srcfiles", vec!["//mylib:_go_src"]),
+            ],
+        );
+        let resp = driver().parse(req, &ct).await.unwrap();
+        let flags = |group: &str| {
+            let input = resp
+                .target_def
+                .inputs
+                .iter()
+                .find(|i| i.origin_id == format!("dep|{group}|0"))
+                .unwrap_or_else(|| panic!("{group} input present"));
+            (input.hashed, input.runtime, input.annotations.clone())
+        };
+        let none = std::collections::BTreeMap::new();
+        assert_eq!(flags(GROUP_HEADER_SRCS), (false, true, none.clone()));
+        assert_eq!(
+            flags(GROUP_GO_SRCS),
+            (false, true, none.clone()),
+            "the package's .go files are staged unhashed, no source map"
+        );
+        assert_eq!(flags(GROUP_HEADERS), (true, false, none.clone()));
+        let source_map = std::collections::BTreeMap::from([(
+            hdriver_support::driver_managed::SOURCE_MAP_ANNOTATION.to_string(),
+            "true".to_string(),
+        )]);
+        assert_eq!(
+            flags(GROUP_GEN_SRCS),
+            (false, true, source_map),
+            "generated files are staged unhashed and keep the source map"
+        );
+        let (hashed, runtime, annotations) = flags(GROUP_NAMES);
+        assert!(hashed && runtime, "the names glob is hashed and staged");
+        assert!(
+            annotations.contains_key(hdriver_support::driver_managed::SOURCE_MAP_ANNOTATION),
+            "the names glob keeps the source map, like any source dep"
+        );
+        assert_eq!(
+            resp.target_def
+                .def::<GoGolistDef>()
+                .content_blind
+                .as_deref(),
+            Some(names.as_str()),
+            "the names glob's addr reaches the def"
+        );
+    }
+
     // Regression: dep groups came from a HashMap, so dep_inputs Vec order varied
     // across runs, making def.hash unstable and breaking the local cache for
     // go_golist targets. Order must now be sorted by group name.
@@ -1172,7 +1307,88 @@ mod tests {
             dep_inputs: vec![],
             thirdparty_download_addr: None,
             firstparty: true,
+            content_blind: None,
         }
+    }
+
+    /// T16 (D9): a failed listing with placeholders staged says so, naming the
+    /// names-only addr; one without placeholders carries no such line.
+    #[test]
+    fn a_failure_with_placeholders_staged_names_the_content_blind_addr() {
+        let mut def = def_with(false, vec![]);
+        let plain = golist_failure(&def, "boom".to_string());
+        assert!(!plain.to_string().contains("content-blind"), "{plain}");
+        def.content_blind = Some("//@heph/fs:glob@m=names,p=pkg/**/*".to_string());
+        let hinted = golist_failure(&def, "boom".to_string()).to_string();
+        assert!(hinted.contains("boom"), "{hinted}");
+        let last = hinted.lines().last().unwrap_or_default();
+        assert!(
+            last.starts_with("note: "),
+            "a stable prefix on its own line: {hinted}"
+        );
+        assert!(
+            last.contains("example.com/mylib"),
+            "names the package: {hinted}"
+        );
+        assert!(last.contains("empty placeholders"), "{hinted}");
+        assert!(last.contains("report it"), "says what to do: {hinted}");
+        assert!(
+            last.contains("//@heph/fs:glob@m=names,p=pkg/**/*"),
+            "{hinted}"
+        );
+    }
+
+    /// T18 (I2's trust): `go list` reads a header-read file no further than its
+    /// `readComments` prefix only because nothing on its command line asks for
+    /// more. Pin the whole argv: no `-compiled`, `-export`, `-deps`, `-find` or
+    /// cgo processing, and the field set unchanged. Adding such a flag means
+    /// moving the header-read files to a hashed lane first.
+    #[test]
+    fn golist_argv_reads_no_more_than_headers() {
+        let def = def_with(true, vec!["integration".to_string()]);
+        assert_eq!(
+            golist_args(&def),
+            [
+                "list",
+                GOLIST_JSON_FIELDS,
+                "-e",
+                "-test",
+                "-tags=integration",
+                "example.com/mylib"
+            ]
+        );
+        let plain = golist_args(&def_with(false, vec![]));
+        assert_eq!(
+            plain,
+            ["list", GOLIST_JSON_FIELDS, "-e", "example.com/mylib"]
+        );
+        for flag in ["-compiled", "-export", "-cgo", "-deps", "-find"] {
+            assert!(
+                !golist_args(&def).iter().any(|a| a.starts_with(flag)),
+                "{flag} must not reach go list"
+            );
+        }
+        assert!(
+            !GOLIST_JSON_FIELDS.contains("CompiledGoFiles"),
+            "a compiled-files field makes go list run cgo"
+        );
+    }
+
+    /// T18, env: `CGO_ENABLED` is pinned as before and a host `GOFLAGS` (which
+    /// could carry `-compiled`-like behaviour or `-mod=`) never reaches go list.
+    #[test]
+    fn golist_env_pins_cgo_and_strips_goflags() {
+        let env = golist_env(
+            &def_with(false, vec![]),
+            std::path::Path::new("/goroot"),
+            std::path::Path::new("/gocache"),
+            everything_set,
+        );
+        assert!(!env.contains_key("GOFLAGS"), "{env:?}");
+        assert_eq!(
+            env.get("CGO_ENABLED").map(String::as_str),
+            Some(crate::plugingo::factors::cgo_enabled_value("linux", false))
+        );
     }
 
     /// A host environment where every variable heph has ever passed through is
