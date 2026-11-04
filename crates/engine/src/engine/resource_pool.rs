@@ -218,30 +218,38 @@ impl ResourcePool {
     /// when it reserves nothing anywhere; and whether any amount was clamped.
     fn resolve(&self, request: &Demand) -> Result<(Vec<(usize, u64)>, bool), AcquireError> {
         let lane = &self.main;
-        let default_cpu = request
-            .declared(PoolName::CPU)
-            .is_none()
-            .then_some((&lane.cpu_name, Resources::DEFAULT_CPU_MICROS));
         let mut need = Vec::with_capacity(request.len().saturating_add(1));
         let mut clamped = false;
-        for (pool, amount) in request.iter().chain(default_cpu) {
-            let Some(idx) = lane.index(pool.as_str()) else {
-                return Err(AcquireError::UnknownPool { pool: pool.clone() });
-            };
-            let granted = match lane.capacity.get(idx).copied() {
-                Some(Limit::Unbounded) => amount,
-                Some(Limit::Bounded(0)) | None => {
-                    return Err(AcquireError::ZeroCapacity { pool: pool.clone() });
-                }
-                Some(Limit::Bounded(capacity)) => amount.min(capacity),
-            };
-            if amount == 0 {
-                continue;
-            }
-            clamped |= granted < amount;
-            need.push((idx, granted));
+        for (pool, amount) in request.iter() {
+            lane.grant(lane.index(pool.as_str()), amount, &mut need, &mut clamped)
+                .map_err(|e| e.naming(pool.clone()))?;
+        }
+        if request.declared(PoolName::CPU).is_none() {
+            lane.grant(
+                lane.cpu_idx,
+                Resources::DEFAULT_CPU_MICROS,
+                &mut need,
+                &mut clamped,
+            )
+            .map_err(|e| e.naming(PoolName::cpu()))?;
         }
         Ok((need, clamped))
+    }
+}
+
+/// Why a pool could not grant a request, before the pool's name is attached.
+#[derive(Debug, Clone, Copy)]
+enum GrantError {
+    Unknown,
+    ZeroCapacity,
+}
+
+impl GrantError {
+    fn naming(self, pool: PoolName) -> AcquireError {
+        match self {
+            Self::Unknown => AcquireError::UnknownPool { pool },
+            Self::ZeroCapacity => AcquireError::ZeroCapacity { pool },
+        }
     }
 }
 
@@ -423,7 +431,9 @@ struct Lane {
     /// Sorted, so a pool is found by binary search; indices are stable.
     names: Box<[PoolName]>,
     capacity: Box<[Limit]>,
-    cpu_name: PoolName,
+    /// Index of the `cpu` pool in `names`; `None` in the light lane, or if
+    /// the lane has no `cpu` pool.
+    cpu_idx: Option<usize>,
     /// The light lane, whose grants reserve no named pool.
     light: bool,
     state: Mutex<State>,
@@ -451,6 +461,13 @@ struct Waiter {
 impl Lane {
     fn new(capacities: BTreeMap<PoolName, Limit>, light: bool) -> Arc<Self> {
         let (names, capacity): (Vec<PoolName>, Vec<Limit>) = capacities.into_iter().unzip();
+        let cpu_idx = if light {
+            None
+        } else {
+            names
+                .binary_search_by(|p| p.as_str().cmp(PoolName::CPU))
+                .ok()
+        };
         Arc::new(Self {
             state: Mutex::new(State {
                 held: vec![0; capacity.len()].into_boxed_slice(),
@@ -459,13 +476,35 @@ impl Lane {
             }),
             names: names.into_boxed_slice(),
             capacity: capacity.into_boxed_slice(),
-            cpu_name: PoolName::cpu(),
+            cpu_idx,
             light,
         })
     }
 
     fn index(&self, pool: &str) -> Option<usize> {
         self.names.binary_search_by(|p| p.as_str().cmp(pool)).ok()
+    }
+
+    /// Adds `amount` of pool `idx` to `need`, clamped to a bounded capacity
+    /// (setting `clamped`); a zero amount is checked but adds nothing.
+    fn grant(
+        &self,
+        idx: Option<usize>,
+        amount: u64,
+        need: &mut Vec<(usize, u64)>,
+        clamped: &mut bool,
+    ) -> Result<(), GrantError> {
+        let idx = idx.ok_or(GrantError::Unknown)?;
+        let granted = match self.capacity.get(idx).copied() {
+            Some(Limit::Unbounded) => amount,
+            Some(Limit::Bounded(0)) | None => return Err(GrantError::ZeroCapacity),
+            Some(Limit::Bounded(capacity)) => amount.min(capacity),
+        };
+        if amount != 0 {
+            *clamped |= granted < amount;
+            need.push((idx, granted));
+        }
+        Ok(())
     }
 
     fn enqueue(self: &Arc<Self>, need: Box<[(usize, u64)]>, clamped: bool) -> Acquire {
