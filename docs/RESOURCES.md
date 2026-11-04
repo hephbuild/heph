@@ -77,16 +77,18 @@ refuses it at parse (an entrypoint reserves nothing, see
 
 | Driver | Undeclared `cpu` costs |
 |---|---|
-| any driver not below, including `exec`, `bash`, `docker_build`, the runners, and a def from a plugin built before resources existed | 1 |
-| `http`; OCI `pull`, `push`, `load`, `layer`, `index`, `image`; `go.download` | 0.1: IO-bound, so ten downloads share one CPU |
-| `fs`, a *relocating* `group` | 0.00001: they still queue through the `cpu` pool in order, but 100,000 fit in one CPU |
+| any driver not below, including `exec`, `bash`, `docker_build`, the runners, and a def from a plugin built before resources existed | 1 (the engine's default) |
+| `http`; OCI `pull`, `push`, `load`, `layer`, `index`, `image`; `go.download` | 0.1, advertised by the driver: IO-bound, so ten downloads share one CPU |
+| `fs`, a *relocating* `group` | 0.0001, advertised by the driver: they still queue through the `cpu` pool in order, but 10,000 fit in one CPU |
 | an aggregate `group` (no transform) | nothing, whatever it declares: it never executes |
 
-A declared `cpu` always wins. Undeclared `memory` and custom pools cost 0.
-A lowered default is not a declaration: it stays off `resources`, so
-`heph inspect def` shows no `cpu` the target did not write, and the cdylib
-drivers (OCI, Go) carry theirs across the plugin ABI in its own field
-(`TargetDef.default_cpu`), which the host decodes back into the default.
+A driver whose targets cost other than one CPU **advertises** it: when the
+target declares no `cpu`, the driver writes its own amount into the def's
+`resources` as an ordinary entry (`Resources::advertise`). A declared `cpu`
+always wins. There is no separate default field: the advertised `cpu` shows
+in `heph inspect def` as the driver's declaration, crosses the plugin ABI in
+`TargetDef.resources` like any other entry, and, like every declaration, is
+never hashed. Undeclared `memory` and custom pools cost 0.
 
 **The light lane.** A request with no bounded need — 0 of every bounded pool
 (`cpu: 0` and nothing else, or `cpu: 0` plus amounts of unbounded pools only)
@@ -372,11 +374,8 @@ change (plugin ABI 0.17.3 → 0.17.4, patch, lane `^0.17.0`):
   declared amount as written (`"0.5"`, `"2G"`), which the host parses in the
   pool's unit at link; the allotment carries every granted pool (`cpu`
   always) rendered by its unit, which is what `${resource:<pool>}` becomes.
-  `TargetDef.default_cpu` (13, `string`, empty when absent) carries a
-  driver's lowered `cpu` default (`"0.1"`, `"0.00001"`) apart from
-  `resources`, so a cdylib def keeps the empty fast path and shows no
-  declaration it did not make; a declared `cpu` overrides it, and it is never
-  hashed.
+  A cdylib driver's advertised cost (`cpu: "0.1"`) is an ordinary entry of
+  `TargetDef.resources`; there is no other resources field.
 - **Source break for third-party SDK code.** `TargetDef` gains a field and is
   not `#[non_exhaustive]`, so a `TargetDef { … }` literal without
   `..Default::default()` stops compiling at rebuild. `RunRequest` is

@@ -332,7 +332,11 @@ impl ManagedDriver for Driver {
                 hash,
                 resources: spec
                     .resources
-                    .with_default_cpu(hplugin::driver::Resources::IO_CPU_MICROS),
+                    .advertise(
+                        hplugin::provider::PoolName::cpu(),
+                        hplugin::driver::Resources::IO_CPU,
+                    )
+                    .context("oci.index resources")?,
                 ..Default::default()
             },
         })

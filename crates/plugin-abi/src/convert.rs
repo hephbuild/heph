@@ -1360,31 +1360,6 @@ fn resources_to_pb(r: &Resources) -> buffa::__private::HashMap<String, String> {
         .collect()
 }
 
-/// A driver-lowered `cpu` default ([`Resources::with_default_cpu`]) in the
-/// `cpu` unit's exact text, `None` when the engine's applies. Sent beside the
-/// declarations, never as one: a declared `cpu` would cost an IO driver's
-/// def the empty fast path and show in `inspect def` as written by nobody.
-fn default_cpu_to_pb(r: &Resources) -> Option<String> {
-    r.lowered_default_cpu()
-        .map(|n| hcore::capacity::Unit::Cpu.canonical(n))
-}
-
-/// The decoded declarations with the wire's lowered default, if any.
-fn resources_from_pb(
-    declared: buffa::__private::HashMap<String, String>,
-    default_cpu: Option<String>,
-) -> anyhow::Result<Resources> {
-    let r = Resources::try_from_pairs(declared).context("decoding TargetDef.resources")?;
-    Ok(match default_cpu {
-        None => r,
-        Some(text) => r.with_default_cpu(
-            hcore::capacity::Unit::Cpu
-                .parse(&text)
-                .context("decoding TargetDef.default_cpu")?,
-        ),
-    })
-}
-
 pub fn target_def_to_pb(td: &TargetDef) -> anyhow::Result<pb::TargetDef> {
     Ok(pb::TargetDef {
         addr: addr_to_pb(&td.addr).into(),
@@ -1399,7 +1374,6 @@ pub fn target_def_to_pb(td: &TargetDef) -> anyhow::Result<pb::TargetDef> {
         transparent: Some(td.transparent),
         entrypoint: td.entrypoint.as_ref().map(entrypoint_to_pb).into(),
         resources: resources_to_pb(&td.resources),
-        default_cpu: default_cpu_to_pb(&td.resources),
         ..Default::default()
     })
 }
@@ -1785,7 +1759,8 @@ pub fn target_def_from_pb(td: pb::TargetDef) -> anyhow::Result<TargetDef> {
                 .transpose()?,
             // Absent — what every plugin before 0.17.4 sends — is empty: the
             // def says nothing and reserves the defaults.
-            resources: resources_from_pb(td.resources, td.default_cpu)?,
+            resources: Resources::try_from_pairs(td.resources)
+                .context("decoding TargetDef.resources")?,
             // The engine parses `resources` into this when it links the def.
             demand: Default::default(),
             addr: addr.clone(),
@@ -3347,60 +3322,28 @@ nested: { a: 1, b: [x, y] }
         );
     }
 
-    /// A cdylib `fs`-like driver's lowered default is not lost at the seam,
-    /// and is not turned into a declaration: it rides `default_cpu`, so the
-    /// host's def keeps an empty `resources` (the fast path, and nothing
-    /// phantom in `inspect def`) and admits it at the same cost.
+    /// A cdylib driver's advertised cost is an ordinary `resources` entry, so
+    /// it crosses the seam as written and admits at the same cost on the host.
     #[test]
-    fn lowered_default_cpu_crosses_beside_the_declarations() {
+    fn an_advertised_cpu_crosses_as_a_declaration() {
         let mut td = full_target_def();
-        for micros in [Resources::VIEW_CPU_MICROS, Resources::IO_CPU_MICROS] {
-            td.resources = Resources::default().with_default_cpu(micros);
+        for (text, micros) in [
+            (Resources::VIEW_CPU, 100),
+            (Resources::IO_CPU, Resources::MICROS_PER_CPU / 10),
+        ] {
+            td.resources = Resources::default()
+                .advertise(hplugin::provider::PoolName::cpu(), text)
+                .expect("advertise");
             let wire = target_def_to_pb(&td).expect("encode");
-            assert!(wire.resources.is_empty(), "no declared cpu on the wire");
+            assert_eq!(wire.resources.get("cpu").map(String::as_str), Some(text));
             let back = target_def_from_pb(via_bytes(&wire)).expect("decode");
-            assert!(back.resources.is_empty(), "nothing declared");
-            assert_eq!(back.resources.lowered_default_cpu(), Some(micros));
+            assert_eq!(back.resources, td.resources);
+            let unit = |_: &str| Some(hcore::capacity::Unit::Cpu);
+            assert_eq!(
+                back.resources.parse(unit).expect("parse").amount("cpu"),
+                micros
+            );
         }
-        assert_eq!(
-            target_def_to_pb(&td)
-                .expect("encode")
-                .default_cpu
-                .as_deref(),
-            Some("0.1"),
-            "written exactly in the `cpu` unit"
-        );
-
-        // The default rides beside a declaration that leaves `cpu` out, and
-        // a declared `cpu` still wins at admission.
-        let mut declared = Resources::default();
-        declared
-            .insert(hplugin::provider::PoolName::cpu(), "3".to_owned())
-            .unwrap();
-        td.resources = declared.with_default_cpu(Resources::VIEW_CPU_MICROS);
-        let back =
-            target_def_from_pb(via_bytes(&target_def_to_pb(&td).expect("encode"))).expect("decode");
-        assert_eq!(back.resources.declared("cpu"), Some("3"));
-        let unit = |_: &str| Some(hcore::capacity::Unit::Cpu);
-        assert_eq!(
-            back.resources.parse(unit).expect("parse").amount("cpu"),
-            3 * Resources::MICROS_PER_CPU
-        );
-
-        // No lowered default, no field.
-        td.resources = Resources::default();
-        assert_eq!(target_def_to_pb(&td).expect("encode").default_cpu, None);
-
-        // A malformed default is refused, naming the field.
-        let mut wire = full_target_def_pb();
-        wire.default_cpu = Some("lots".to_owned());
-        let err = target_def_from_pb(via_bytes(&wire))
-            .err()
-            .expect("bad default is refused");
-        assert!(
-            format!("{err:#}").contains("TargetDef.default_cpu"),
-            "{err:#}"
-        );
     }
 
     #[test]
@@ -3409,7 +3352,6 @@ nested: { a: 1, b: [x, y] }
         assert!(wire.resources.is_empty(), "nothing declared, nothing sent");
         let back = target_def_from_pb(via_bytes(&wire)).expect("decode");
         assert!(back.resources.is_empty());
-        assert_eq!(back.resources.default_cpu(), Resources::DEFAULT_CPU_MICROS);
     }
 
     /// The bytes a 0.17.3 plugin sends for a minimal def (addr, raw_def, cache,
@@ -3429,7 +3371,6 @@ nested: { a: 1, b: [x, y] }
         assert_eq!(back.addr, addr("//p", "t"));
         assert_eq!(back.hash, vec![0xab, 0xcd]);
         assert!(back.resources.is_empty());
-        assert_eq!(back.resources.default_cpu(), Resources::DEFAULT_CPU_MICROS);
     }
 
     #[test]

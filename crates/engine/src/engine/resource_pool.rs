@@ -221,7 +221,7 @@ impl ResourcePool {
         let default_cpu = request
             .declared(PoolName::CPU)
             .is_none()
-            .then(|| (&lane.cpu_name, request.default_cpu()));
+            .then_some((&lane.cpu_name, Resources::DEFAULT_CPU_MICROS));
         let mut need = Vec::with_capacity(request.len().saturating_add(1));
         let mut clamped = false;
         for (pool, amount) in request.iter().chain(default_cpu) {
@@ -1363,7 +1363,7 @@ mod tests {
     }
 
     /// The resources on the def of a target of each driver the spec names
-    /// (`exec`, `template`, `fs`, `group`), parsed by the real in-tree drivers
+    /// (`exec`, `template`, `fs`, a relocating `group`), parsed by the real in-tree drivers
     /// with `resources` set to `declared`.
     async fn driver_defs(declared: Option<hcore::htvalue::Value>) -> Vec<(&'static str, Demand)> {
         use hcore::htvalue::Value;
@@ -1383,7 +1383,11 @@ mod tests {
             .await;
         let group = hbuiltins::plugingroup::Driver
             .parse(
-                parse_req("group", &[("deps", Value::List(vec![s(":a")]))], d),
+                parse_req(
+                    "group",
+                    &[("deps", Value::List(vec![s(":a")])), ("prefix", s("lib"))],
+                    d,
+                ),
                 &ct,
             )
             .await;
@@ -1407,13 +1411,13 @@ mod tests {
     }
 
     /// D3: a def that says nothing reserves 1 cpu (exec, template), except
-    /// `fs` and `group`, which lower their default to 10 micro-CPUs.
+    /// `fs` and `group`, which advertise 0.0001 CPU (100 micro-CPUs).
     #[tokio::test]
     async fn a_def_without_resources_costs_one_cpu() {
         let p = pool(&[("cpu", 4 * CPU)]);
         for (driver, resources) in driver_defs(None).await {
             let want = match driver {
-                "fs" | "group" => Resources::VIEW_CPU_MICROS,
+                "fs" | "group" => 100,
                 _ => CPU,
             };
             assert_eq!(resources.amount("cpu"), want, "{driver}");

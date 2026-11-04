@@ -586,11 +586,10 @@ mod tests {
             };
             let plain: TargetDef = parse(None).await;
             assert_eq!(
-                plain.resources.default_cpu(),
-                Resources::IO_CPU_MICROS,
+                plain.resources.declared("cpu"),
+                Some(Resources::IO_CPU),
                 "{driver}"
             );
-            assert!(plain.resources.is_empty(), "{driver}: no declaration");
             let heavy = parse(Some(Value::Map([("cpu".to_owned(), Value::Int(2))].into()))).await;
             assert_eq!(heavy.resources.declared("cpu"), Some("2"), "{driver}");
             assert_eq!(heavy.hash, plain.hash, "{driver}: resources are unhashed");

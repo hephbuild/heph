@@ -1249,19 +1249,14 @@ pub const REDACT_MIN_LEN: usize = 8;
 /// names the target.
 ///
 /// A driver builds it with [`from_config`](Self::from_config) in its `parse`
-/// and sets [`TargetDef::resources`](targetdef::TargetDef::resources). It is
-/// never hashed.
+/// and sets [`TargetDef::resources`](targetdef::TargetDef::resources). A
+/// driver whose targets cost something other than the engine's default
+/// advertises it as an ordinary entry ([`advertise`](Self::advertise)), which
+/// the target's own declaration of that pool overrides. It is never hashed.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Resources {
     declared: std::collections::BTreeMap<crate::provider::PoolName, String>,
-    /// What an undeclared `cpu` costs, when the driver lowered it
-    /// ([`with_default_cpu`](Self::with_default_cpu)); `None` is
-    /// [`DEFAULT_CPU_MICROS`](Self::DEFAULT_CPU_MICROS). Not a declaration:
-    /// not serialised, never hashed, and an `Option` so the most numerous defs
-    /// (`fs`, `group`) carry no map node for it.
-    #[serde(skip)]
-    default_cpu: Option<u64>,
 }
 
 /// `2^53`: an `f64` holds every integer up to here exactly, and none above it
@@ -1279,15 +1274,15 @@ impl Resources {
     pub const MICROS_PER_CPU: u64 = hcore::capacity::MICROS_PER_CPU;
     /// What a target that declares no `cpu` reserves: one CPU.
     pub const DEFAULT_CPU_MICROS: u64 = Self::MICROS_PER_CPU;
-    /// What an `fs` or `group` target reserves when it declares no `cpu`:
-    /// 0.00001 CPU, so they still queue through the `cpu` pool in FIFO order
-    /// but 100,000 of them fit in one CPU.
-    pub const VIEW_CPU_MICROS: u64 = 10;
-    /// What a target of an IO-bound driver (`http`, OCI's pull, push, load,
-    /// layer, index and image, `go.download`) reserves when it declares no
-    /// `cpu`: 0.1 CPU, so ten downloads share one CPU instead of each taking
-    /// a whole one while it waits on the network.
-    pub const IO_CPU_MICROS: u64 = Self::MICROS_PER_CPU / 10;
+    /// The `cpu` an `fs` or relocating `group` driver advertises for a target
+    /// that declares none: 0.0001 CPU, so they still queue through the `cpu`
+    /// pool in FIFO order but 10,000 of them fit in one CPU.
+    pub const VIEW_CPU: &'static str = "0.0001";
+    /// The `cpu` an IO-bound driver (`http`, OCI's pull, push, load, layer,
+    /// index and image, `go.download`) advertises for a target that declares
+    /// none: 0.1 CPU, so ten downloads share one CPU instead of each taking a
+    /// whole one while it waits on the network.
+    pub const IO_CPU: &'static str = "0.1";
 
     pub fn new() -> Self {
         Self::default()
@@ -1338,10 +1333,7 @@ impl Resources {
             let amount = amount_text(v).with_context(|| format!("in `resources.{pool}`"))?;
             out.insert(pool, amount);
         }
-        Ok(Self {
-            declared: out,
-            default_cpu: None,
-        })
+        Ok(Self { declared: out })
     }
 
     /// Build from wire pairs (`pb::TargetDef.resources`), checking every name
@@ -1357,9 +1349,9 @@ impl Resources {
     }
 
     /// Every declared amount parsed in its pool's unit, `unit_of` naming the
-    /// unit of each pool the engine has (`None`: not a pool, an error). The
-    /// lowered [`default_cpu`](Self::default_cpu) carries over. Errors name
-    /// the pool, not the target; the engine adds which target it was.
+    /// unit of each pool the engine has (`None`: not a pool, an error).
+    /// Errors name the pool, not the target; the engine adds which target it
+    /// was.
     pub fn parse(
         &self,
         unit_of: impl Fn(&str) -> Option<hcore::capacity::Unit>,
@@ -1373,10 +1365,7 @@ impl Resources {
                 .with_context(|| format!("`resources.{pool}` is in {unit}"))?;
             declared.insert(pool.clone(), amount);
         }
-        Ok(Demand {
-            declared,
-            default_cpu: self.default_cpu,
-        })
+        Ok(Demand { declared })
     }
 
     /// Declare `amount` (as written) of `pool`, replacing an earlier
@@ -1396,31 +1385,28 @@ impl Resources {
         Ok(self.declared.insert(pool, amount))
     }
 
-    /// `self`, with an undeclared `cpu` costing `micros` instead of
-    /// [`DEFAULT_CPU_MICROS`](Self::DEFAULT_CPU_MICROS). A declared `cpu`
-    /// still wins. Allocates nothing and declares nothing: `is_empty` and
-    /// `iter` are unchanged, and the def serialises as before.
+    /// `self`, with `amount` (as written) of `pool` when the target did not
+    /// declare `pool` itself: the driver advertising what its targets cost.
+    /// The target's own declaration wins. The entry is an ordinary one — it
+    /// crosses the plugin ABI, shows in `heph inspect def` and, like every
+    /// declaration, is never hashed. Fails when it would be the
+    /// [`MAX_POOLS`](Self::MAX_POOLS)+1th pool.
     ///
-    /// For a driver whose targets cost less than the engine's default (`fs`
-    /// and `group`, and the IO-bound drivers). Across the plugin ABI it rides
-    /// `TargetDef.default_cpu`, beside the declarations and never as one, so
-    /// a cdylib driver that sets it gets the same admission and an empty
-    /// `resources` on the host.
-    pub fn with_default_cpu(mut self, micros: u64) -> Self {
-        self.default_cpu = Some(micros);
-        self
-    }
-
-    /// What an undeclared `cpu` costs this target: the driver's
-    /// [`with_default_cpu`](Self::with_default_cpu), else
-    /// [`DEFAULT_CPU_MICROS`](Self::DEFAULT_CPU_MICROS).
-    pub fn default_cpu(&self) -> u64 {
-        self.default_cpu.unwrap_or(Self::DEFAULT_CPU_MICROS)
-    }
-
-    /// The driver-lowered default, `None` when the engine's applies.
-    pub fn lowered_default_cpu(&self) -> Option<u64> {
-        self.default_cpu
+    /// For a driver whose targets cost other than the engine's default `cpu`
+    /// of one CPU (`fs` and relocating `group` advertise
+    /// [`VIEW_CPU`](Self::VIEW_CPU), the IO-bound drivers
+    /// [`IO_CPU`](Self::IO_CPU)).
+    pub fn advertise(
+        mut self,
+        pool: crate::provider::PoolName,
+        amount: &str,
+    ) -> anyhow::Result<Self> {
+        if !self.declared.contains_key(&pool) {
+            let name = pool.to_string();
+            self.insert(pool, amount.to_owned())
+                .with_context(|| format!("advertising `resources.{name}`"))?;
+        }
+        Ok(self)
     }
 
     /// Whether nothing was declared (the target reserves the defaults).
@@ -1450,12 +1436,11 @@ impl Resources {
 /// [`TargetDef::demand`](targetdef::TargetDef::demand); what admission reads.
 ///
 /// Holds only the declared pools; [`amount`](Self::amount) applies the
-/// defaults (`cpu` one CPU or the driver's lowered default, every other pool
-/// nothing). Never hashed, never serialised, never crosses the plugin ABI.
+/// defaults (`cpu` one CPU, every other pool nothing). Never hashed, never
+/// serialised, never crosses the plugin ABI.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Demand {
     declared: std::collections::BTreeMap<crate::provider::PoolName, u64>,
-    default_cpu: Option<u64>,
 }
 
 impl Demand {
@@ -1476,18 +1461,6 @@ impl Demand {
         Ok(out)
     }
 
-    /// `self`, with an undeclared `cpu` costing `micros`
-    /// ([`Resources::with_default_cpu`]).
-    pub fn with_default_cpu(mut self, micros: u64) -> Self {
-        self.default_cpu = Some(micros);
-        self
-    }
-
-    /// What an undeclared `cpu` costs this target.
-    pub fn default_cpu(&self) -> u64 {
-        self.default_cpu.unwrap_or(Resources::DEFAULT_CPU_MICROS)
-    }
-
     /// Whether nothing was declared (the target reserves the defaults).
     pub fn is_empty(&self) -> bool {
         self.declared.is_empty()
@@ -1504,12 +1477,12 @@ impl Demand {
     }
 
     /// What the target reserves from `pool`: the declared amount, else the
-    /// default — [`default_cpu`](Self::default_cpu) for `cpu`, 0 for every
+    /// default — [`Resources::DEFAULT_CPU_MICROS`] for `cpu`, 0 for every
     /// other pool.
     pub fn amount(&self, pool: &str) -> u64 {
         match self.declared(pool) {
             Some(n) => n,
-            None if pool == crate::provider::PoolName::CPU => self.default_cpu(),
+            None if pool == crate::provider::PoolName::CPU => Resources::DEFAULT_CPU_MICROS,
             None => 0,
         }
     }
@@ -1649,6 +1622,7 @@ impl Allotment {
 #[cfg(test)]
 mod resources_tests {
     use super::*;
+    use crate::provider::PoolName;
 
     fn res(v: Value) -> anyhow::Result<Resources> {
         Resources::from_config(&HashMap::from([(Resources::CONFIG_KEY.to_string(), v)]))
@@ -1744,26 +1718,51 @@ mod resources_tests {
         assert!(!d.reserves("memory"));
     }
 
-    /// A lowered default changes what an undeclared `cpu` costs and nothing
-    /// else: still empty, still serialised as `{}`, and a declaration wins.
+    /// An advertised amount is an ordinary entry when the target declared
+    /// none of that pool, and the target's own declaration wins.
     #[test]
-    fn a_lowered_default_cpu_is_not_a_declaration() {
+    fn an_advertised_amount_yields_to_the_declaration() {
         let units = |p: &str| Some(hcore::capacity::Unit::default_for(p));
-        let r = Resources::default().with_default_cpu(Resources::VIEW_CPU_MICROS);
-        assert!(r.is_empty());
-        assert_eq!(r.declared("cpu"), None);
+        let r = Resources::default()
+            .advertise(PoolName::cpu(), Resources::VIEW_CPU)
+            .unwrap();
+        assert_eq!(r.declared("cpu"), Some("0.0001"));
         let d = r.parse(units).unwrap();
-        assert_eq!(d.amount("cpu"), Resources::VIEW_CPU_MICROS);
+        assert_eq!(d.amount("cpu"), 100);
         assert_eq!(d.amount("memory"), 0);
-        assert_eq!(serde_json::to_string(&r).unwrap(), "{}");
+        assert_eq!(
+            Resources::default()
+                .advertise(PoolName::cpu(), Resources::IO_CPU)
+                .unwrap()
+                .parse(units)
+                .unwrap()
+                .amount("cpu"),
+            Resources::MICROS_PER_CPU / 10
+        );
 
         let declared = res(Value::Map([("cpu".to_string(), Value::Int(2))].into()))
             .unwrap()
-            .with_default_cpu(Resources::VIEW_CPU_MICROS);
+            .advertise(PoolName::cpu(), Resources::VIEW_CPU)
+            .unwrap();
+        assert_eq!(declared.declared("cpu"), Some("2"));
         assert_eq!(
             declared.parse(units).unwrap().amount("cpu"),
             2 * Resources::MICROS_PER_CPU
         );
+    }
+
+    /// Advertising past the pool cap fails rather than produce a def the
+    /// host's wire decoder would refuse.
+    #[test]
+    fn advertising_past_the_cap_fails() {
+        let full = Resources::try_from_pairs(
+            (0..Resources::MAX_POOLS).map(|i| (format!("p{i}"), "1".to_owned())),
+        )
+        .unwrap();
+        let err = full
+            .advertise(PoolName::cpu(), Resources::VIEW_CPU)
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("resources.cpu"), "{err:#}");
     }
 
     #[test]

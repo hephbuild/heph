@@ -2519,13 +2519,9 @@ impl Engine {
         addr: &Addr,
         resources: &hplugin::driver::Resources,
     ) -> anyhow::Result<hplugin::driver::Demand> {
-        // Nearly every def declares nothing (an `fs`/`group` default is not a
-        // declaration); the warm path pays one branch and no allocation.
+        // A def that declares nothing pays one branch and no allocation.
         if resources.is_empty() {
-            return Ok(match resources.lowered_default_cpu() {
-                Some(micros) => hplugin::driver::Demand::default().with_default_cpu(micros),
-                None => hplugin::driver::Demand::default(),
-            });
+            return Ok(hplugin::driver::Demand::default());
         }
         if let Some((pool, amount)) = resources
             .iter()

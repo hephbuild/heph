@@ -458,7 +458,11 @@ impl ManagedDriver for GoDownloadDriver {
                 hash,
                 resources: spec
                     .resources
-                    .with_default_cpu(hplugin::driver::Resources::IO_CPU_MICROS),
+                    .advertise(
+                        hplugin::provider::PoolName::cpu(),
+                        hplugin::driver::Resources::IO_CPU,
+                    )
+                    .context("go.download resources")?,
                 ..Default::default()
             },
         })
@@ -696,7 +700,7 @@ mod tests {
         assert_ne!(base, other, "go_version is part of the key");
     }
 
-    /// A download waits on the network: an undeclared `cpu` costs 0.1, a
+    /// A download waits on the network: the driver advertises `cpu` 0.1, a
     /// declared one replaces it, and neither moves the def hash.
     #[tokio::test]
     async fn parse_defaults_resources_to_a_tenth_of_a_cpu_unhashed() {
@@ -704,10 +708,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            plain.resources.default_cpu(),
-            hplugin::driver::Resources::IO_CPU_MICROS
+            plain.resources.declared("cpu"),
+            Some(hplugin::driver::Resources::IO_CPU)
         );
-        assert!(plain.resources.is_empty(), "the default is no declaration");
         let mut declared = spec("gopkg.in/yaml.v2", "v2.4.0");
         declared.config.insert(
             "resources".to_string(),

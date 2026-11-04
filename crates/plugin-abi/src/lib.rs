@@ -35,10 +35,8 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// 0.17.4 (additive, a patch): target resources. `TargetDef.resources` (12,
 /// `map<string, string>`) — the pools a def reserves while it runs, each amount
 /// as the target wrote it (`"0.5"`, `"2G"`), which the host parses in the
-/// pool's unit at link; only declared pools present. `TargetDef.default_cpu`
-/// (13, `string`, explicit presence) — what an undeclared `cpu` costs when the driver
-/// lowered it, in the `cpu` unit's text; beside the declarations, never one,
-/// and absent means one cpu. `ManagedRunRequest.allotment` (15, `map<string, string>`) — every pool the
+/// pool's unit at link; only declared pools present, a driver's advertised
+/// cost among them. `ManagedRunRequest.allotment` (15, `map<string, string>`) — every pool the
 /// host granted the run (`cpu` always), each amount rendered by its pool's unit,
 /// which is what the driver substitutes for `${resource:<pool>}`; heph exports
 /// no environment for it. The skew, both ways: a 0.17.3 plugin sends no
