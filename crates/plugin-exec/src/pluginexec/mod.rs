@@ -110,14 +110,12 @@ struct TargetDef {
     /// raw text, so a def with no reference hashes as it did when this was a
     /// `String` map.
     pub env: BTreeMap<String, hplugin::driver::Deferred<String>>,
-    pub pass_env: BTreeMap<String, String>,
-    /// A dependency's hashed transitive `env` literal that carries a
-    /// `${resource:…}`: the `pass_env` layer at run (a plain literal goes to
-    /// `pass_env` itself), but deferred, because the number is the run's. A name
-    /// is in at most one of the two. Hashed as text, and only when non-empty, so
-    /// a def without one hashes as before the field existed.
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub transitive_env: BTreeMap<String, hplugin::driver::Deferred<String>>,
+    /// Host values snapshotted at parse, plus a dependency's hashed transitive
+    /// `env` literals. Deferred because such a literal may carry a
+    /// `${resource:…}`, whose number is the run's; a plain value is a `Deferred`
+    /// with no reference. `Deferred`'s `Hash` and serde form are its raw text, so
+    /// this hashes exactly as the `String` map it replaced.
+    pub pass_env: BTreeMap<String, hplugin::driver::Deferred<String>>,
     pub runtime_pass_env: Vec<String>,
     pub runtime_env: HashMap<String, hplugin::driver::Deferred<String>>,
     /// Exec runner for this target, already resolved (per-target field, then
@@ -152,10 +150,6 @@ impl Hash for TargetDef {
         self.support_files.hash(state);
         self.env.hash(state);
         self.pass_env.hash(state);
-        if !self.transitive_env.is_empty() {
-            "transitive_env".hash(state);
-            self.transitive_env.hash(state);
-        }
         // runtime_pass_env and runtime_env intentionally excluded
         // Only when set: a target without the flag hashes exactly as before
         // the flag existed. With it, `run` and `env` above plus these.
@@ -1566,14 +1560,21 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
         // `"*"` is a wildcard: pass through every host env var. Snapshotted at
         // parse time and hashed like any other pass_env (so the input hash
         // captures the whole environment — only use it on uncached targets).
-        let pass_env: BTreeMap<String, String> = if spec.pass_env.iter().any(|n| n == "*") {
-            std::env::vars().collect()
-        } else {
-            spec.pass_env
-                .into_iter()
-                .filter_map(|name| std::env::var(&name).ok().map(|val| (name, val)))
-                .collect()
-        };
+        let pass_env: BTreeMap<String, hplugin::driver::Deferred<String>> =
+            if spec.pass_env.iter().any(|n| n == "*") {
+                std::env::vars()
+                    .map(|(k, v)| (k, hplugin::driver::Deferred::new(v)))
+                    .collect()
+            } else {
+                spec.pass_env
+                    .into_iter()
+                    .filter_map(|name| {
+                        std::env::var(&name)
+                            .ok()
+                            .map(|val| (name, hplugin::driver::Deferred::new(val)))
+                    })
+                    .collect()
+            };
 
         // Built before the def hash — `outputs` and `support_files` are part of
         // the hashed def, so they have to exist by the time we hash it.
@@ -1662,7 +1663,6 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
             support_files: support_files.clone(),
             env: spec.env.into_iter().collect(),
             pass_env,
-            transitive_env: BTreeMap::new(),
             runtime_pass_env: spec.runtime_pass_env,
             runtime_env: spec.runtime_env,
             runner: runner.clone(),
@@ -1749,8 +1749,8 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
                 EnvValue::Pass => {
                     if env.hash {
                         if let Ok(value) = std::env::var(&name) {
-                            xdef.transitive_env.remove(&name);
-                            xdef.pass_env.insert(name, value);
+                            xdef.pass_env
+                                .insert(name, hplugin::driver::Deferred::new(value));
                         }
                     } else {
                         xdef.runtime_pass_env.push(name);
@@ -1758,16 +1758,14 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
                 }
                 // `${resource:…}` needs no edge, so it may ride a transitive
                 // value: kept as text (the def hash covers the reference, never
-                // the number) in a deferred map, and finished by `resolve` at run
-                // from the *dependent's* allotment. Hashed, it goes to
-                // `transitive_env`, which the run layers exactly where
-                // `pass_env` is — so a transitive literal has one precedence
+                // the number) and finished by `resolve` at run from the
+                // *dependent's* allotment. Hashed, it goes to `pass_env` like a
+                // plain literal — so a transitive literal has one precedence
                 // whether or not its value carries a reference.
                 EnvValue::Literal(v) if hcore::template::only_resource_refs(&v) => {
                     let d = hplugin::driver::Deferred::new(v);
                     if env.hash {
-                        xdef.pass_env.remove(&name);
-                        xdef.transitive_env.insert(name, d);
+                        xdef.pass_env.insert(name, d);
                     } else {
                         xdef.runtime_env.insert(name, d);
                     }
@@ -1780,8 +1778,8 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
                     hplugin::htspec::reject_deferred_reference(&v)
                         .with_context(|| format!("transitive `env.{name}`"))?;
                     if env.hash {
-                        xdef.transitive_env.remove(&name);
-                        xdef.pass_env.insert(name, v);
+                        xdef.pass_env
+                            .insert(name, hplugin::driver::Deferred::new(v));
                     } else {
                         xdef.runtime_env
                             .insert(name, hplugin::driver::Deferred::new(v));
@@ -2162,11 +2160,17 @@ impl Driver {
             None
         };
 
-        env.extend(def.pass_env.iter().map(|(k, v)| (k.clone(), v.clone())));
-        // The same layer as `pass_env`: a transitive literal's precedence does
-        // not depend on whether its value names a resource.
-        for (k, v) in &def.transitive_env {
-            env.insert(k.clone(), rreq.resolve(v)?.to_string());
+        // Only a value whose references are all `${resource:…}` is resolved: that
+        // is the one kind a transitive literal may carry (`apply_transitive`
+        // refuses the rest). Anything else — a host value snapshotted at parse
+        // included — reaches the process verbatim, as it always has.
+        for (k, v) in &def.pass_env {
+            let value = if hcore::template::only_resource_refs(v.raw()) {
+                rreq.resolve(v)?.into_owned()
+            } else {
+                v.raw().to_string()
+            };
+            env.insert(k.clone(), value);
         }
 
         // `"*"` passes through every host env var at run time (not hashed).
@@ -4152,7 +4156,7 @@ mod tests {
         let target_def = EngineTargetDef {
             raw_def: Arc::new(TargetDef {
                 run: vec![D::new(run_cmd.to_string())],
-                pass_env,
+                pass_env: pass_env.into_iter().map(|(k, v)| (k, D::new(v))).collect(),
                 runtime_pass_env,
                 runtime_env,
                 ..Default::default()
@@ -4356,8 +4360,8 @@ mod tests {
             .await?;
         let def = res.target_def.def::<TargetDef>();
         assert_eq!(
-            def.pass_env.get("heph_TEST_PARSE_PASS"),
-            Some(&"resolved_value".to_string())
+            def.pass_env.get("heph_TEST_PARSE_PASS").map(D::raw),
+            Some("resolved_value")
         );
         Ok(())
     }
@@ -5730,7 +5734,7 @@ bash apply_transitive: 26a90abee4625d43
                         runtime: true,
                     }],
                 )]),
-                pass_env: BTreeMap::from([("PATH".to_string(), existing_path.to_string())]),
+                pass_env: BTreeMap::from([("PATH".to_string(), D::new(existing_path))]),
                 ..Default::default()
             }),
             cache: CacheConfig::on(true),
@@ -6517,9 +6521,10 @@ bash apply_transitive: 26a90abee4625d43
                 "{value}"
             );
         }
-        // The later declaration of a name wins, across the two maps.
+        // The later declaration of a name wins, whether or not it names a
+        // resource.
         let mut xdef = TargetDef::default();
-        xdef.pass_env.insert("X".to_string(), "plain".to_string());
+        xdef.pass_env.insert("X".to_string(), D::new("plain"));
         let def = EngineTargetDef {
             raw_def: Arc::new(xdef),
             ..Default::default()
@@ -6540,8 +6545,7 @@ bash apply_transitive: 26a90abee4625d43
             .await?
             .target_def;
         let xdef = out.def::<TargetDef>();
-        assert!(!xdef.pass_env.contains_key("X"));
-        assert!(xdef.transitive_env.contains_key("X"));
+        assert_eq!(xdef.pass_env.get("X").map(D::raw), Some("${resource:cpu}"));
         Ok(())
     }
 
@@ -6728,7 +6732,7 @@ bash apply_transitive: 26a90abee4625d43
                         runtime: true,
                     }],
                 )]),
-                pass_env: BTreeMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]),
+                pass_env: BTreeMap::from([("PATH".to_string(), D::new("/usr/bin:/bin"))]),
                 ..Default::default()
             }),
             cache: CacheConfig::on(true),
