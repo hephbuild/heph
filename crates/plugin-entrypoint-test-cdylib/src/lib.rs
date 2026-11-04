@@ -4,7 +4,8 @@
 //! The second driver, `allot`, reports the run's allotment: its `parse` puts
 //! the target's `resources` on the def with the SDK helper, and its `run`
 //! writes what `RunRequest.allotment` carried into its one output,
-//! `allotment.txt` — `cpu=<n> memory=<bytes|none>`, or `told-nothing`. It is
+//! `allotment.txt` — every granted pool as `<pool>=<rendered amount>`, in
+//! name order and space-separated, or `told-nothing`. It is
 //! what lets `allotment_crosses_the_plugin_seam` see the field across a real
 //! `dlopen`, which a `convert.rs` round-trip cannot.
 //!
@@ -226,11 +227,11 @@ impl ManagedDriver for Allot {
         req: ManagedRunRequest<'a, 'io>,
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ManagedRunResponse> {
-        let seen = match req.request.allotment {
-            Some(a) => match a.memory_bytes {
-                Some(m) => format!("cpu={} memory={m}\n", a.cpu),
-                None => format!("cpu={} memory=none\n", a.cpu),
-            },
+        let seen = match &req.request.allotment {
+            Some(a) => {
+                let pools: Vec<String> = a.iter().map(|(p, n)| format!("{p}={n}")).collect();
+                format!("{}\n", pools.join(" "))
+            }
             None => "told-nothing\n".to_string(),
         };
         let out = req

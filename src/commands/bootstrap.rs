@@ -207,27 +207,13 @@ fn listed_facts_kill_switch(v: Option<&std::ffi::OsStr>) -> bool {
             .any(|off| s.eq_ignore_ascii_case(off)))
 }
 
-/// The command line's pool capacities (`-j`, `--resource`), set once by
-/// `main` after the parse, read by every [`new_engine`].
-///
-/// Process-global rather than an argument: `new_engine` has ~40 callers, most
-/// of which never see the global options, and every engine this process
-/// builds runs the one command the user typed — so they all get its flags,
-/// the way `diag::install` gives them all `--diag-backtrace`. Unset (tests,
-/// the completion engines) means "no flags".
-static RESOURCE_FLAGS: std::sync::OnceLock<super::global::ResourceSpecs> =
-    std::sync::OnceLock::new();
-
-/// Record the command line's pool capacities for every engine this process
-/// builds. Called once, from `main`; a second call keeps the first.
-pub fn set_resource_flags(flags: super::global::ResourceSpecs) {
-    // A second set would be a second command line, which a process never has.
-    if RESOURCE_FLAGS.set(flags).is_err() {
-        tracing::debug!("resource flags already set; keeping the first");
-    }
-}
-
-pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
+/// Build the engine for one command. `global` is the command line's global
+/// options; the engine reads its pool overrides (`-j`, `--resource`) from it.
+/// A caller with no command line (the shell-completion engine) passes
+/// `GlobalOptions::default()`.
+pub fn new_engine(
+    global: &super::GlobalOptions,
+) -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     let root = match engine::get_root() {
         Ok(r) => r,
         Err(inner) => anyhow::bail!("Error: {}", inner),
@@ -258,13 +244,12 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     // Pool capacities: flag over `HEPH_RESOURCE_<NAME>` over the config file;
     // the engine supplies the default for a pool none of them names. Read here,
     // like the kill switch above, so the engine never looks at the environment.
+    // Parsed against the config's units, which is why they wait until now.
     let env = super::global::env_resource_overrides(std::env::vars_os())
         .context("reading HEPH_RESOURCE_<NAME>")?;
-    super::global::layer_resources(
-        &mut config.resources,
-        env,
-        RESOURCE_FLAGS.get().unwrap_or(&Default::default()),
-    );
+    let flags = global.resource_overrides()?;
+    super::global::apply_resource_overrides(&mut config.resources, env, &flags)
+        .context("applying the run's resource overrides")?;
 
     // Captured before `config` is moved into the engine: the nix driver's state
     // dir hangs off `home_dir`, and telemetry reports the remote-cache backend

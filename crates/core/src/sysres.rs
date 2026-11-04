@@ -37,8 +37,9 @@ pub fn host_cpus() -> usize {
 /// capacity. Read once per process and cached.
 ///
 /// 0 only when neither a cgroup limit nor physical memory could be read, which
-/// the pool treats as "must be set" (an explicit capacity is then required for
-/// a target that declares memory) rather than inventing a number.
+/// the pool treats as **unbounded** (every memory request is granted at once)
+/// unless the run gives `memory` an explicit capacity — rather than inventing
+/// a number.
 pub fn host_memory_bytes() -> u64 {
     static CACHED: OnceLock<u64> = OnceLock::new();
     *CACHED.get_or_init(read_host_memory_bytes)

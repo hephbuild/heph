@@ -228,10 +228,10 @@ skipped in silence.
 ## History of breaks
 
 - **0.17.4** (additive patch) — target resources. `TargetDef.resources` (12,
-  `map<string, uint64>`): the pools a def reserves (`cpu` micro-CPUs, `memory`
-  bytes, custom pools a count; only declared pools present, empty means one cpu).
-  `ManagedRunRequest.allotment` (15, `Allotment { cpu, memory_bytes }`): what the
-  host reserved, told to the target as `HEPH_CPUS` / `HEPH_MEMORY_BYTES`; absent
+  `map<string, string>`): the pools a def reserves, each amount as written in
+  its pool's unit (only declared pools present, empty means one cpu).
+  `ManagedRunRequest.allotment` (15, `map<string, string>`): each pool the host
+  granted, rendered by its unit, which `${resource:<pool>}` substitutes; absent
   means "told nothing". A 0.17.3 plugin's defs reserve one cpu and it ignores the
   allotment; a 0.17.4 plugin on a 0.17.3 host loses its `resources` at decode and
   is told nothing. Neither field is hashed. `TargetDef` struct literals in SDK

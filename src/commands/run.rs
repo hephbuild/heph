@@ -977,7 +977,7 @@ async fn execute_async(args: RunArgs, sink: LogSink, global: GlobalOptions) -> a
     let base_pkg = get_cwp()?;
     refuse_misplaced_tool_args(&args, &base_pkg)?;
     let m = resolve_matcher(&args.expr, &args.arg1, &args.arg2, &base_pkg, false)?;
-    let (engine, shutdown) = bootstrap::new_engine()?;
+    let (engine, shutdown) = bootstrap::new_engine(&global)?;
     let raw = args.raw;
     let app = RunApp {
         args,

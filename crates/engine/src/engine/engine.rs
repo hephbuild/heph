@@ -649,15 +649,14 @@ impl Engine {
         self.pools.built().map(|p| p.snapshot())
     }
 
-    /// Every bounded named pool's capacity, in the pool's unit's base, as
-    /// `RequestConfig` announces it; an unbounded pool has no capacity to
-    /// announce and is left out. Builds the pool (and so reads the host's
-    /// memory) on the first call.
-    pub(crate) fn pool_capacities(&self) -> std::collections::BTreeMap<String, u64> {
+    /// Every named pool's capacity, in the pool's unit's base, as
+    /// `RequestConfig` announces it: `None` for an unbounded pool. Builds the
+    /// pool (and so reads the host's memory) on the first call.
+    pub(crate) fn pool_capacities(&self) -> std::collections::BTreeMap<String, Option<u64>> {
         self.pools
             .get()
             .capacities()
-            .filter_map(|(p, c)| Some((p.as_str().to_owned(), c.bounded()?)))
+            .map(|(p, c)| (p.as_str().to_owned(), c.bounded()))
             .collect()
     }
 

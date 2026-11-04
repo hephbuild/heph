@@ -3130,9 +3130,15 @@ target(
             (r#"{"cpu": 0.5}"#, Pool("cpu", 500_000)),
             (r#"{"cpu": 0.3}"#, Pool("cpu", 300_000)),
             (r#"{"cpu": 0.00001}"#, Pool("cpu", 10)),
-            (r#"{"cpu": 0.0000005}"#, Fails),
+            // Rounded half up to the micro-CPU; below half a step is refused.
+            (r#"{"cpu": 0.0000005}"#, Pool("cpu", 1)),
+            (r#"{"cpu": 0.0000004}"#, Fails),
             (r#"{"cpu": -0.5}"#, Fails),
-            (r#"{"cpu": "2"}"#, Fails),
+            // A string is the amount as written, in the pool's unit.
+            (r#"{"cpu": "2"}"#, Pool("cpu", 2 * M)),
+            (r#"{"cpu": "0.5"}"#, Pool("cpu", 500_000)),
+            (r#"{"cpu": "2G"}"#, Fails),
+            (r#"{"gpu": "1.5"}"#, Fails),
             (r#"{"cpu": True}"#, Fails),
             (r#"{"cpu": None}"#, Fails),
             (r#"{"cpu": {"n": 1}}"#, Fails),
@@ -3204,7 +3210,10 @@ target(
                 continue;
             }
             let evaluated = evaluated.unwrap_or_else(|e| panic!("{expr}: BUILD eval: {e:#}"));
-            let got = Resources::from_config(&evaluated.targets[0].config);
+            // Then parsed in each pool's default unit, as the engine does at
+            // link for a pool the config does not give another unit.
+            let got = Resources::from_config(&evaluated.targets[0].config)
+                .and_then(|r| r.parse(|p| Some(hcore::capacity::Unit::default_for(p))));
             match (&want, got) {
                 // The parser's own error, which names the key it refused.
                 (Fails, Err(e)) => {
@@ -3903,7 +3912,9 @@ target(name = "t", driver = "d", cpu = cpu, memory = memory, resources = {"cpu":
             Some(htvalue::Value::Float(f)) => assert_eq!(*f, memory as f64),
             other => panic!("memory should be a number, got {other:?}"),
         }
-        let declared = hplugin::driver::Resources::from_config(&config).expect("valid resources");
+        let declared = hplugin::driver::Resources::from_config(&config)
+            .and_then(|r| r.parse(|p| Some(hcore::capacity::Unit::default_for(p))))
+            .expect("valid resources");
         assert_eq!(
             declared.declared("cpu"),
             Some(cpus as u64 * hplugin::driver::Resources::MICROS_PER_CPU)

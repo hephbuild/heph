@@ -170,8 +170,8 @@ release-gated decision, not a routine one.
 A target declares `resources = {"cpu": 2, "memory": "4G", "docker": 1}`
 (default: 1 cpu); the engine admits executes in strict FIFO order so the sum
 of what runs fits each pool's capacity (`.hephconfig` `resources:`, `-j`,
-`--resource`, `HEPH_RESOURCE_<NAME>`), and tells the target what it got
-(`HEPH_CPUS`, `HEPH_MEMORY_BYTES`, `${resource:cpu}`).
+`--resource`, `HEPH_RESOURCE_<NAME>`). A target reads what it got only by
+naming it, `${resource:<pool>}`; heph exports nothing to its environment.
 
 Read `docs/RESOURCES.md` before touching it. The one thing to know going in:
 nothing about resources reaches any hash — the declaration is driver config

@@ -579,7 +579,7 @@ mod tests {
     async fn resources_default_light_and_declared_unhashed() {
         let plain = parse_group(&[]).await;
         assert_eq!(
-            plain.resources.amount("cpu"),
+            plain.resources.default_cpu(),
             hplugin::driver::Resources::VIEW_CPU_MICROS
         );
         assert!(plain.resources.is_empty(), "the default is no declaration");
@@ -588,7 +588,7 @@ mod tests {
             Value::Map([("cpu".to_string(), Value::Int(0))].into()),
         )])
         .await;
-        assert_eq!(declared.resources.declared("cpu"), Some(0));
+        assert_eq!(declared.resources.declared("cpu"), Some("0"));
         assert_eq!(declared.hash, plain.hash);
     }
 

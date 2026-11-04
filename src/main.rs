@@ -216,14 +216,12 @@ fn main() -> ExitCode {
     // engine resolves scratch caches at all.
     diag::install(cli.global.diag_backtrace);
 
-    // `-j` / `--resource`, for every engine the command builds. Checked here,
-    // before any work, so `-j 4 --resource cpu=8` fails like a bad flag.
-    match cli.global.resource_overrides() {
-        Ok(flags) => commands::bootstrap::set_resource_flags(flags),
-        Err(e) => {
-            error!(error = %format!("{e:#}"), "Invalid resource flags");
-            return ExitCode::FAILURE;
-        }
+    // `-j` / `--resource`: each engine the command builds reads them from
+    // `cli.global`. Checked here too, before any work, so `-j 4 --resource
+    // cpu=8` fails like a bad flag rather than after the config is loaded.
+    if let Err(e) = cli.global.resource_overrides() {
+        error!(error = %format!("{e:#}"), "Invalid resource flags");
+        return ExitCode::FAILURE;
     }
 
     // When `--pprof-cpu` is set, start the sampler + `SIGUSR2` dump watcher.

@@ -7801,8 +7801,6 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         require_go!();
         let sandbox = copy_fixture("with_test");
         let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
-        const MICROS: u64 = hplugin::driver::Resources::MICROS_PER_CPU;
-
         let root_only = vec![
             host_variant_state(),
             state_with_test_resources(
@@ -7821,8 +7819,8 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
                 .target_spec;
             assert_eq!(spec.driver, "exec", "{name}");
             let r = def_resources(spec).await;
-            assert_eq!(r.declared("cpu"), Some(4 * MICROS), "{name}");
-            assert_eq!(r.declared("memory"), Some(1 << 30), "{name}");
+            assert_eq!(r.declared("cpu"), Some("4"), "{name}");
+            assert_eq!(r.declared("memory"), Some("1G"), "{name}");
         }
         let build_test =
             provider_get_with_states(&p, make_addr("pkg", "build_test"), root_only.clone())
@@ -7847,8 +7845,8 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             .unwrap()
             .target_spec;
         let r = def_resources(spec).await;
-        assert_eq!(r.declared("cpu"), Some(4 * MICROS));
-        assert_eq!(r.declared("memory"), Some(2 << 30));
+        assert_eq!(r.declared("cpu"), Some("4"));
+        assert_eq!(r.declared("memory"), Some("2G"));
 
         let bad = vec![
             host_variant_state(),

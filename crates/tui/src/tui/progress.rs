@@ -953,7 +953,8 @@ impl BuildState {
                 ..
             } => {
                 self.max_workers = Some(*count);
-                self.memory_capacity = resources.get(hcore::capacity::MEMORY).copied();
+                // An unbounded memory pool has no capacity to show a share of.
+                self.memory_capacity = resources.get(hcore::capacity::MEMORY).copied().flatten();
             }
             BuildEventKind::Matched { addrs, complete } => {
                 self.matched_seen = true;
@@ -3014,7 +3015,11 @@ mod tests {
                 max_workers: 4,
                 fail_fast: false,
                 scratch_disabled: false,
-                resources: [("cpu".into(), 4 * CPU), ("memory".into(), 16 << 30)].into(),
+                resources: [
+                    ("cpu".into(), Some(4 * CPU)),
+                    ("memory".into(), Some(16 << 30)),
+                ]
+                .into(),
             },
         ));
         s.apply(&ev(0, execute_start("//a:x")));

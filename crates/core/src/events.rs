@@ -159,11 +159,14 @@ pub enum BuildEventKind {
         /// "scratch was off", which is both wrong and alarming.
         #[serde(default)]
         scratch_disabled: bool,
-        /// Every admission pool and its capacity, in the pool's unit (`cpu` in
-        /// micro-CPUs, `memory` in bytes, a custom pool a count). Empty from a
-        /// host that predates resources.
+        /// Every admission pool and its capacity, in the base of the pool's
+        /// unit (micro-CPUs for `cpu`, bytes, a count). `None` (`null` on the
+        /// wire) is an **unbounded** pool: a custom pool declared with no
+        /// value, or `memory` when the host's could not be read — every
+        /// request is granted at once. Empty from a host that predates
+        /// resources.
         #[serde(default)]
-        resources: BTreeMap<String, u64>,
+        resources: BTreeMap<String, Option<u64>>,
     },
     /// Incremental notice of matched top-level targets. `addrs` are newly
     /// matched addresses to add to the set; `complete` is false while the

@@ -134,7 +134,7 @@ there is nothing to remember there either.
 |---|---|---|---|
 | `${read://pkg:name}` | contents of the producer's single output, surrounding whitespace trimmed | `(hashed, not staged)` | no |
 | `${src://pkg:name}` | the sandbox path of the producer's single file | `(hashed, staged)` | **no** |
-| `${resource:cpu}`, `${resource:memory}` — exactly these two; only in an `env` / `runtime_env` value or a transitive `env` | this run's allotment: whole CPUs (`HEPH_CPUS`), bytes of memory (`HEPH_MEMORY_BYTES`) | none | **yes** — resolved with the dependent's allotment |
+| `${resource:<pool>}` — any configured pool; in any deferrable field or a transitive `env` | this run's allotment of the pool, rendered by its unit: `cpu` whole CPUs rounded up, `bytes` and `count` the integer | none | **yes** — resolved with the dependent's allotment |
 
 **`${resource:…}` names no target**, so it has no `//`, adds no edge and never
 reaches `hashin`: the def hash covers the reference text, and an artifact built
@@ -142,17 +142,18 @@ under `-j 8` serves a run under `-j 1`. It is substituted at run — by the host
 for a target's own `env` / `runtime_env` (in one pass with any `${read:}` or
 `${src:}` beside it), and by `RunRequest::resolve` for a transitive `env` value
 a dependency handed down, which is the one place a reference may ride
-`transitive`. In any other field — a `run` line, a `template` var, an `oci`
-push `dest`, a credential presentation — it is refused when the def is built:
-there the number could reach an output and make its hashout per-machine. Read
-`$HEPH_CPUS` from the environment instead.
+`transitive`. It is the only way a target learns its allotment: heph exports
+nothing of it to the environment. A target whose outputs then depend on the
+number is not reproducible, and saying so with `cache = False` is the author's.
 
-Only the exact names are claimed. Any other `${resource:…}` — `${resource:cpus}`,
-`${resource:CPU}`, `${resource:-x}`, bash's `${resource:offset}` — is not heph's
-and passes through untouched, like every construct heph does not own; so do
-`${resources:cpu}` and a bare `${resource}`. `${resource:memory}` on a target
-that declares no memory, and a run told no allotment at all, fail the run
-naming the target rather than substituting an empty string.
+Only configured pool names are claimed. Any other `${resource:…}` —
+`${resource:cpus}`, `${resource:CPU}`, `${resource:-x}`, bash's
+`${resource:offset}` — is not heph's and passes through untouched, like every
+construct heph does not own; so do `${resources:cpu}` and a bare
+`${resource}`. A reference to a configured pool the target does not reserve
+(`${resource:memory}` with no `memory` in its `resources`) is refused when the
+target is linked; a run told no allotment at all fails naming the target
+rather than substituting an empty string.
 
 Either may name an output group — `${src://tools:cli\|bin}` — exactly as a dep
 does, which is how you narrow a producer that emits more than one file.

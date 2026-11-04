@@ -1028,10 +1028,10 @@ fn a_plugin_from_another_abi_is_refused() {
 /// managed layer. `convert.rs`'s round-trip proves the encoding; only a real
 /// `dlopen` proves the host fills the field and the plugin's copy of the SDK
 /// reads it. The test cdylib's `allot` driver writes what it was told into its
-/// output (`cpu=<n> memory=<bytes|none>`, or `told-nothing`).
+/// output (each granted pool as `<pool>=<amount>`, or `told-nothing`).
 ///
 /// Two rows under `-j 2`: `cpu: 2` with `memory: "1G"` is told both; `cpu: 16`
-/// is clamped to the capacity and told 2, with no memory since it declared
+/// is clamped to the capacity and told 2, and no memory since it reserved
 /// none.
 #[test]
 fn allotment_crosses_the_plugin_seam() {
@@ -1057,7 +1057,7 @@ fn allotment_crosses_the_plugin_seam() {
 
     for (addr, want) in [
         ("//app:wide", "cpu=2 memory=1073741824"),
-        ("//app:clamped", "cpu=2 memory=none"),
+        ("//app:clamped", "cpu=2"),
     ] {
         let out = ws
             .run(&dist, &["-j", "2", "run", addr, "--cat-out"])

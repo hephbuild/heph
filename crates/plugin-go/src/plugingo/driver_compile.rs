@@ -1334,7 +1334,7 @@ mod driver_tests {
             Value::Map(HashMap::from([("cpu".to_string(), Value::Int(4))])),
         );
         let declared = parse_def(spec).await;
-        assert_eq!(declared.resources.declared("cpu"), Some(4_000_000));
+        assert_eq!(declared.resources.declared("cpu"), Some("4"));
         assert_eq!(declared.hash, plain.hash);
     }
 

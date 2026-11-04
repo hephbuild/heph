@@ -4269,69 +4269,55 @@ mod tests {
         Ok(String::from_utf8(stdout)?.trim().to_string())
     }
 
+    /// An allotment of `cpu` CPUs, plus `memory` bytes when granted, as the
+    /// engine renders it.
     fn allot(cpu: u32, memory_bytes: Option<u64>) -> Option<hplugin::driver::Allotment> {
-        Some(hplugin::driver::Allotment {
-            cpu: std::num::NonZeroU32::new(cpu)?,
-            memory_bytes,
-        })
+        let memory = memory_bytes.map(|m| ("memory".to_string(), m.to_string()));
+        Some(hplugin::driver::Allotment::new(
+            std::iter::once(("cpu".to_string(), cpu.to_string())).chain(memory),
+        ))
     }
 
-    /// A nested heph: the parent's `HEPH_CPUS` is in the host env, and a
-    /// wildcard passthrough (hashed or not) must not hand it to the child over
-    /// the child's own allotment.
+    /// heph puts nothing of the allotment in a target's environment: a
+    /// target that wants it names `${resource:<pool>}`.
     #[tokio::test]
-    async fn wildcard_pass_env_does_not_override_the_allotment() -> anyhow::Result<()> {
-        let _cpus = EnvGuard::set("HEPH_CPUS", "99");
-        let show = "echo cpus=$HEPH_CPUS";
-        let runtime = TargetDef {
+    async fn the_allotment_is_not_exported_to_the_env() -> anyhow::Result<()> {
+        let show = "echo \"${HEPH_CPUS-unset}|${HEPH_MEMORY_BYTES-unset}\"";
+        let def = TargetDef {
             run: vec![D::new(show)],
-            runtime_pass_env: vec!["*".to_string()],
             ..Default::default()
         };
-        assert_eq!(run_allotted(runtime, allot(2, None)).await?, "cpus=2");
-        // `pass_env = ["*"]` is resolved at parse into the hashed map.
-        let hashed = TargetDef {
-            run: vec![D::new(show)],
-            pass_env: std::env::vars().collect(),
-            ..Default::default()
-        };
-        assert_eq!(run_allotted(hashed, allot(2, None)).await?, "cpus=2");
+        assert_eq!(run_allotted(def, allot(3, Some(64))).await?, "unset|unset");
         Ok(())
     }
 
-    /// The order the env is layered in: allotment over passthroughs, the
-    /// target's own `env`/`runtime_env` over the allotment; memory only when
-    /// granted; no allotment, nothing set.
+    /// `${resource:<pool>}` in `env`/`runtime_env` is the granted amount as
+    /// rendered; a name the run was granted none of is left as written (the
+    /// engine refuses a known pool's at link, so that is only a non-pool).
     #[tokio::test]
-    async fn allotment_env_layering() -> anyhow::Result<()> {
-        let show = "echo \"${HEPH_CPUS-}|${HEPH_MEMORY_BYTES-unset}\"";
-        let def = |env: &[(&str, &str)], rt: &[(&str, &str)]| TargetDef {
+    async fn resource_refs_render_from_the_allotment() -> anyhow::Result<()> {
+        let show = "echo \"$N|$M|$G\"";
+        let def = TargetDef {
             run: vec![D::new(show)],
-            env: env
-                .iter()
-                .map(|(k, v)| (k.to_string(), D::new(*v)))
-                .collect(),
-            runtime_env: rt
-                .iter()
-                .map(|(k, v)| (k.to_string(), D::new(*v)))
-                .collect(),
+            runtime_env: [
+                ("N", "-j${resource:cpu}"),
+                ("M", "${resource:memory}"),
+                ("G", "${resource:gpu}"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), D::new(v)))
+            .collect(),
             ..Default::default()
         };
         assert_eq!(
-            run_allotted(def(&[], &[]), allot(3, Some(64))).await?,
-            "3|64"
+            run_allotted(def.clone(), allot(3, Some(64))).await?,
+            "-j3|64|${resource:gpu}"
         );
-        assert_eq!(
-            run_allotted(def(&[], &[]), allot(3, None)).await?,
-            "3|unset"
+        let with_gpu = hplugin::driver::Allotment::new(
+            [("cpu", "3"), ("memory", "64"), ("gpu", "2")]
+                .map(|(k, v)| (k.to_string(), v.to_string())),
         );
-        let user_wins = def(&[("HEPH_CPUS", "7")], &[("HEPH_MEMORY_BYTES", "8")]);
-        assert_eq!(run_allotted(user_wins, allot(3, Some(64))).await?, "7|8");
-        assert_eq!(
-            run_allotted(def(&[], &[]), None).await?,
-            "|unset",
-            "told nothing, nothing set"
-        );
+        assert_eq!(run_allotted(def, Some(with_gpu)).await?, "-j3|64|2");
         Ok(())
     }
 
@@ -4800,8 +4786,9 @@ mod tests {
             ])),
         );
         let (declared, declared_applied) = parse(config).await?;
-        assert_eq!(declared.resources.declared("cpu"), Some(1_500_000));
-        assert_eq!(declared.resources.declared("memory"), Some(4 << 30));
+        // As written: the engine parses them in the configured units at link.
+        assert_eq!(declared.resources.declared("cpu"), Some("1.5"));
+        assert_eq!(declared.resources.declared("memory"), Some("4G"));
         assert_eq!(declared_applied.resources, declared.resources);
         assert_eq!(declared.hash, plain.hash);
         assert_eq!(declared_applied.hash, plain_applied.hash);
@@ -6509,22 +6496,24 @@ bash apply_transitive: 26a90abee4625d43
 
     /// A hashed transitive literal has one precedence whether or not its value
     /// names a resource: the `pass_env` layer — over the target's own `env`,
-    /// under the allotment.
+    /// under its `runtime_env`.
     #[tokio::test]
     async fn a_transitive_literal_has_one_precedence_with_or_without_a_reference()
     -> anyhow::Result<()> {
         for (value, want) in [("plain", "plain"), ("-j${resource:cpu}", "-j2")] {
             let sandbox = tr_sandbox(&[
                 ("X", EnvValue::Literal(value.to_string()), true),
-                ("HEPH_CPUS", EnvValue::Literal(value.to_string()), true),
+                ("Y", EnvValue::Literal(value.to_string()), true),
             ]);
             let def = parse_and_apply_transitive(&Driver::new_exec(), sandbox).await?;
             let mut xdef = def.def::<TargetDef>().clone();
             xdef.env.insert("X".to_string(), D::new("own"));
-            xdef.run = vec![D::new("echo \"$X|$HEPH_CPUS\"")];
+            xdef.runtime_env
+                .insert("Y".to_string(), D::new("rt${resource:cpu}"));
+            xdef.run = vec![D::new("echo \"$X|$Y\"")];
             assert_eq!(
                 run_allotted(xdef, allot(2, None)).await?,
-                format!("{want}|2"),
+                format!("{want}|rt2"),
                 "{value}"
             );
         }
@@ -6553,61 +6542,6 @@ bash apply_transitive: 26a90abee4625d43
         let xdef = out.def::<TargetDef>();
         assert!(!xdef.pass_env.contains_key("X"));
         assert!(xdef.transitive_env.contains_key("X"));
-        Ok(())
-    }
-
-    /// Sets an env var for the guard's life and puts the old value back.
-    struct EnvGuard(&'static str, Option<String>);
-    impl EnvGuard {
-        fn set(name: &'static str, value: &str) -> Self {
-            let old = std::env::var(name).ok();
-            unsafe {
-                std::env::set_var(name, value);
-            }
-            Self(name, old)
-        }
-    }
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match &self.1 {
-                Some(v) => unsafe { std::env::set_var(self.0, v) },
-                None => unsafe { std::env::remove_var(self.0) },
-            }
-        }
-    }
-
-    /// A hashed passthrough never snapshots `HEPH_CPUS`/`HEPH_MEMORY_BYTES`:
-    /// the run overwrites them with its own allotment, so the key would cover
-    /// an inherited value (a nested heph's parent's) no process ever sees.
-    #[tokio::test]
-    async fn hashed_passthroughs_do_not_snapshot_the_allotment_names() -> anyhow::Result<()> {
-        let _cpus = EnvGuard::set("HEPH_CPUS", "99");
-        let _mem = EnvGuard::set("HEPH_MEMORY_BYTES", "123");
-        let names = |v: &[&str]| {
-            hcore::htvalue::Value::List(
-                v.iter()
-                    .map(|s| hcore::htvalue::Value::String(s.to_string()))
-                    .collect(),
-            )
-        };
-        for pass in [names(&["*"]), names(&["HEPH_CPUS", "HEPH_MEMORY_BYTES"])] {
-            let def = parse_with_driver(
-                &Driver::new_exec(),
-                HashMap::from([("pass_env".to_string(), pass)]),
-            )
-            .await?;
-            let xdef = def.def::<TargetDef>();
-            assert!(!xdef.pass_env.contains_key("HEPH_CPUS"));
-            assert!(!xdef.pass_env.contains_key("HEPH_MEMORY_BYTES"));
-        }
-        let sandbox = tr_sandbox(&[
-            ("HEPH_CPUS", EnvValue::Pass, true),
-            ("HEPH_MEMORY_BYTES", EnvValue::Pass, true),
-        ]);
-        let def = parse_and_apply_transitive(&Driver::new_exec(), sandbox).await?;
-        let xdef = def.def::<TargetDef>();
-        assert!(!xdef.pass_env.contains_key("HEPH_CPUS"));
-        assert!(!xdef.pass_env.contains_key("HEPH_MEMORY_BYTES"));
         Ok(())
     }
 

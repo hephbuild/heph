@@ -1678,7 +1678,7 @@ mod tests {
         };
         let plain = parse(None).await;
         assert_eq!(
-            plain.resources.amount("cpu"),
+            plain.resources.default_cpu(),
             hplugin::driver::Resources::VIEW_CPU_MICROS
         );
         assert!(plain.resources.is_empty(), "the default is no declaration");
@@ -1686,13 +1686,14 @@ mod tests {
             [("gpu".to_string(), Value::Int(1))].into(),
         )))
         .await;
-        assert_eq!(gpu_only.resources.amount("cpu"), 10);
-        assert_eq!(gpu_only.resources.declared("gpu"), Some(1));
+        assert_eq!(gpu_only.resources.default_cpu(), 10);
+        assert_eq!(gpu_only.resources.declared("cpu"), None);
+        assert_eq!(gpu_only.resources.declared("gpu"), Some("1"));
         let heavy = parse(Some(Value::Map(
             [("cpu".to_string(), Value::Int(2))].into(),
         )))
         .await;
-        assert_eq!(heavy.resources.declared("cpu"), Some(2_000_000));
+        assert_eq!(heavy.resources.declared("cpu"), Some("2"));
         assert_eq!(heavy.hash, plain.hash);
         assert_eq!(gpu_only.hash, plain.hash);
     }

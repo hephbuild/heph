@@ -961,13 +961,13 @@ impl RequestState {
     /// call from every top-level entry point (`result`, `result_addr`); only the
     /// first call emits, so dep recursion never re-announces.
     ///
-    /// `count` is the cpu capacity in CPUs; `resources` every pool's capacity,
-    /// called only by the announcing call.
+    /// `count` is the cpu capacity in CPUs; `resources` every pool's capacity
+    /// (`None`: unbounded), called only by the announcing call.
     pub fn announce_request_config(
         &self,
         count: usize,
         scratch_disabled: bool,
-        resources: impl FnOnce() -> std::collections::BTreeMap<String, u64>,
+        resources: impl FnOnce() -> std::collections::BTreeMap<String, Option<u64>>,
     ) {
         if !self
             .data

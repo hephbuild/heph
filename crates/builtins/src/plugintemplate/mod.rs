@@ -462,7 +462,7 @@ mod tests {
         )
         .await
         .expect("parse");
-        assert_eq!(declared.resources.declared("cpu"), Some(2_000_000));
+        assert_eq!(declared.resources.declared("cpu"), Some("2"));
         assert_eq!(declared.hash, plain.hash);
     }
 
