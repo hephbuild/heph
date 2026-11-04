@@ -2,9 +2,10 @@ use crate::plugingo::factors::VariantRef;
 use hcore::htvalue::Value;
 use hmodel::htaddr::Addr;
 use hmodel::htpkg::PkgBuf;
+use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 
 const STD_PREFIX: &str = "@heph/go/std/";
 const THIRD_PREFIX: &str = "@heph/go/thirdparty/";
@@ -32,100 +33,147 @@ pub enum GoPackageKind {
     },
 }
 
-type DecodeCache = Mutex<HashMap<(PkgBuf, PathBuf), Option<Arc<GoPackageKind>>>>;
-
-static DECODE_CACHE: OnceLock<DecodeCache> = OnceLock::new();
-
-fn decode_cache() -> &'static DecodeCache {
-    DECODE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+/// Maps heph packages to Go packages for one workspace, memoizing both the
+/// decode and the `go.mod` lookup it rests on. Owned by the provider, so the
+/// memo lives exactly as long as the provider that relies on it, and two
+/// providers (or two tests) never share one.
+///
+/// Both maps are pure functions of the workspace plus filesystem state that is
+/// stable for the duration of a build. They are race-tolerant: a concurrent
+/// miss computes the same value twice and the first insert wins.
+#[derive(Debug)]
+pub struct GoPkgResolver {
+    workspace_root: PathBuf,
+    decoded: Mutex<HashMap<PkgBuf, Option<Arc<GoPackageKind>>>>,
+    go_mods: Mutex<HashMap<PathBuf, Option<(PathBuf, String)>>>,
 }
 
-/// Decode a heph package address into its Go package kind.
-/// Returns None if the address doesn't correspond to a Go package.
-///
-/// Results are memoized in a process-wide cache keyed by `(pkg, workspace_root)`
-/// since the mapping is a pure function of those inputs plus filesystem state
-/// that is stable for the duration of a build.
-pub fn decode_package(pkg: &PkgBuf, workspace_root: &Path) -> Option<Arc<GoPackageKind>> {
-    let key = (pkg.clone(), workspace_root.to_path_buf());
-    {
-        let cache = decode_cache().lock().expect("decode_cache poisoned");
-        if let Some(cached) = cache.get(&key) {
+impl GoPkgResolver {
+    pub fn new(workspace_root: PathBuf) -> Self {
+        Self {
+            workspace_root,
+            decoded: Mutex::default(),
+            go_mods: Mutex::default(),
+        }
+    }
+
+    pub fn workspace_root(&self) -> &Path {
+        &self.workspace_root
+    }
+
+    /// Decode a heph package address into its Go package kind.
+    /// Returns None if the address doesn't correspond to a Go package.
+    pub fn decode(&self, pkg: &PkgBuf) -> Option<Arc<GoPackageKind>> {
+        if let Some(cached) = self.decoded.lock().get(pkg) {
             return cached.clone();
         }
+
+        let result = self.decode_uncached(pkg).map(Arc::new);
+
+        self.decoded
+            .lock()
+            .entry(pkg.clone())
+            .or_insert_with(|| result.clone())
+            .clone()
     }
 
-    let result = decode_package_uncached(pkg, workspace_root).map(Arc::new);
+    fn decode_uncached(&self, pkg: &PkgBuf) -> Option<GoPackageKind> {
+        let workspace_root = self.workspace_root.as_path();
+        let s = pkg.as_str();
 
-    let mut cache = decode_cache().lock().expect("decode_cache poisoned");
-    cache.entry(key).or_insert_with(|| result.clone());
-    result
-}
-
-fn decode_package_uncached(pkg: &PkgBuf, workspace_root: &Path) -> Option<GoPackageKind> {
-    let s = pkg.as_str();
-
-    if let Some(rest) = s.strip_prefix(STD_PREFIX) {
-        return Some(GoPackageKind::Stdlib {
-            import_path: rest.to_string(),
-        });
-    }
-
-    // Thirdparty — two formats:
-    // 1. "@heph/go/thirdparty/..."          → base_pkg = "" → module_root = workspace_root
-    // 2. "{base_pkg}/@heph/go/thirdparty/..." → module_root = workspace_root/base_pkg
-    if let Some(rest) = s.strip_prefix(THIRD_PREFIX) {
-        let module_root = workspace_root.to_path_buf();
-        return parse_thirdparty(rest, module_root);
-    }
-    if let Some((base_pkg, rest)) = s.split_once(THIRD_SEPARATOR) {
-        let module_root = workspace_root.join(base_pkg);
-        return parse_thirdparty(rest, module_root);
-    }
-
-    // First-party: any dir under a go.mod ancestor is a candidate, even if the
-    // dir doesn't exist on disk yet — generated subpackages (codegen output)
-    // are materialized inside the `_golist` sandbox by the codegen target wired
-    // via `go_codegen_deps`. `find_go_mod` walks parent paths via string ops,
-    // so it works on non-existent leaves as long as some ancestor has go.mod.
-    //
-    // Bound the result to `workspace_root` to avoid picking up an unrelated
-    // go.mod above the workspace when no in-workspace go.mod exists.
-    //
-    // That leniency must not reach another provider's virtual package
-    // (`@heph/bin`, …): it is a non-existent dir under the root go.mod too, and
-    // existence cannot tell it from a not-yet-generated top-level `genpb/`. What
-    // does is that it can never be a Go import path, so the path below the
-    // module root must pass Go's import-path rules.
-    let src_dir = workspace_root.join(s);
-    if let Some((module_root, module_path)) = find_go_mod(&src_dir)
-        && module_root.starts_with(workspace_root)
-    {
-        let rel = src_dir
-            .strip_prefix(&module_root)
-            .expect("src_dir must be under module_root")
-            .to_str()?;
-        if !rel
-            .split('/')
-            .filter(|e| !e.is_empty())
-            .all(import_path_elem_ok)
-        {
-            return None;
+        if let Some(rest) = s.strip_prefix(STD_PREFIX) {
+            return Some(GoPackageKind::Stdlib {
+                import_path: rest.to_string(),
+            });
         }
-        let import_path = if rel.is_empty() {
-            module_path.clone()
-        } else {
-            format!("{module_path}/{rel}")
-        };
-        return Some(GoPackageKind::FirstParty {
-            module_root,
-            module_path,
-            import_path,
-            src_dir,
-        });
+
+        // Thirdparty — two formats:
+        // 1. "@heph/go/thirdparty/..."          → base_pkg = "" → module_root = workspace_root
+        // 2. "{base_pkg}/@heph/go/thirdparty/..." → module_root = workspace_root/base_pkg
+        if let Some(rest) = s.strip_prefix(THIRD_PREFIX) {
+            let module_root = workspace_root.to_path_buf();
+            return parse_thirdparty(rest, module_root);
+        }
+        if let Some((base_pkg, rest)) = s.split_once(THIRD_SEPARATOR) {
+            let module_root = workspace_root.join(base_pkg);
+            return parse_thirdparty(rest, module_root);
+        }
+
+        // First-party: any dir under a go.mod ancestor is a candidate, even if the
+        // dir doesn't exist on disk yet — generated subpackages (codegen output)
+        // are materialized inside the `_golist` sandbox by the codegen target wired
+        // via `go_codegen_deps`. `find_go_mod` walks parent paths via string ops,
+        // so it works on non-existent leaves as long as some ancestor has go.mod.
+        //
+        // Bound the result to `workspace_root` to avoid picking up an unrelated
+        // go.mod above the workspace when no in-workspace go.mod exists.
+        //
+        // That leniency must not reach another provider's virtual package
+        // (`@heph/bin`, …): it is a non-existent dir under the root go.mod too, and
+        // existence cannot tell it from a not-yet-generated top-level `genpb/`. What
+        // does is that it can never be a Go import path, so the path below the
+        // module root must pass Go's import-path rules.
+        let src_dir = workspace_root.join(s);
+        if let Some((module_root, module_path)) = self.find_go_mod(&src_dir)
+            && module_root.starts_with(workspace_root)
+        {
+            let rel = src_dir
+                .strip_prefix(&module_root)
+                .expect("src_dir must be under module_root")
+                .to_str()?;
+            if !rel
+                .split('/')
+                .filter(|e| !e.is_empty())
+                .all(import_path_elem_ok)
+            {
+                return None;
+            }
+            let import_path = if rel.is_empty() {
+                module_path.clone()
+            } else {
+                format!("{module_path}/{rel}")
+            };
+            return Some(GoPackageKind::FirstParty {
+                module_root,
+                module_path,
+                import_path,
+                src_dir,
+            });
+        }
+
+        None
     }
 
-    None
+    /// Walk up from `start` looking for go.mod; return (module_root, module_path).
+    pub fn find_go_mod(&self, start: &Path) -> Option<(PathBuf, String)> {
+        if let Some(cached) = self.go_mods.lock().get(start) {
+            return cached.clone();
+        }
+
+        let mut visited: Vec<PathBuf> = Vec::new();
+        let mut current = start;
+        let result = 'walk: loop {
+            visited.push(current.to_path_buf());
+            let candidate = current.join("go.mod");
+            if candidate.exists()
+                && let Ok(content) = std::fs::read_to_string(&candidate)
+                && let Some(path) = parse_module_path(&content)
+            {
+                break 'walk Some((current.to_path_buf(), path));
+            }
+            match current.parent() {
+                Some(p) => current = p,
+                None => break 'walk None,
+            }
+        };
+
+        let mut cache = self.go_mods.lock();
+        for dir in visited {
+            cache.entry(dir).or_insert_with(|| result.clone());
+        }
+
+        result
+    }
 }
 
 /// One element of a Go import path, per `golang.org/x/mod/module`'s
@@ -139,48 +187,6 @@ fn import_path_elem_ok(elem: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'+'))
         && !elem.bytes().all(|b| b == b'.')
         && !elem.ends_with('.')
-}
-
-type GoModCache = Mutex<HashMap<PathBuf, Option<(PathBuf, String)>>>;
-
-static GO_MOD_CACHE: OnceLock<GoModCache> = OnceLock::new();
-
-fn go_mod_cache() -> &'static GoModCache {
-    GO_MOD_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Walk up from `start` looking for go.mod; return (module_root, module_path).
-pub fn find_go_mod(start: &Path) -> Option<(PathBuf, String)> {
-    {
-        let cache = go_mod_cache().lock().expect("go_mod_cache poisoned");
-        if let Some(cached) = cache.get(start) {
-            return cached.clone();
-        }
-    }
-
-    let mut visited: Vec<PathBuf> = Vec::new();
-    let mut current = start;
-    let result = 'walk: loop {
-        visited.push(current.to_path_buf());
-        let candidate = current.join("go.mod");
-        if candidate.exists()
-            && let Ok(content) = std::fs::read_to_string(&candidate)
-            && let Some(path) = parse_module_path(&content)
-        {
-            break 'walk Some((current.to_path_buf(), path));
-        }
-        match current.parent() {
-            Some(p) => current = p,
-            None => break 'walk None,
-        }
-    };
-
-    let mut cache = go_mod_cache().lock().expect("go_mod_cache poisoned");
-    for dir in visited {
-        cache.entry(dir).or_insert_with(|| result.clone());
-    }
-
-    result
 }
 
 fn parse_module_path(content: &str) -> Option<String> {
@@ -513,6 +519,15 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// A fresh resolver per call, so no test sees another's memo.
+    fn decode_package(pkg: &PkgBuf, workspace_root: &Path) -> Option<Arc<GoPackageKind>> {
+        GoPkgResolver::new(workspace_root.to_path_buf()).decode(pkg)
+    }
+
+    fn find_go_mod(start: &Path) -> Option<(PathBuf, String)> {
+        GoPkgResolver::new(PathBuf::new()).find_go_mod(start)
+    }
+
     fn make_workspace_with_go_mod(module_path: &str) -> TempDir {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -639,6 +654,29 @@ mod tests {
         let ws = tempfile::tempdir().unwrap();
         let pkg = PkgBuf::from("doesnotexist");
         assert!(decode_package(&pkg, ws.path()).is_none());
+    }
+
+    // The memo belongs to one resolver (one provider). A process-wide memo
+    // keyed on `(pkg, root)` answered a later provider for the same root with
+    // what an earlier one saw, here a "not Go" from before the go.mod existed.
+    #[test]
+    fn test_resolver_memo_is_not_shared() {
+        let ws = tempfile::tempdir().unwrap();
+        let pkg = PkgBuf::from("lib");
+        let first = GoPkgResolver::new(ws.path().to_path_buf());
+        assert!(first.decode(&pkg).is_none());
+
+        std::fs::write(ws.path().join("go.mod"), "module example.com/m\n").unwrap();
+        assert!(first.decode(&pkg).is_none(), "a resolver keeps its memo");
+
+        let second = GoPkgResolver::new(ws.path().to_path_buf());
+        assert!(
+            matches!(
+                second.decode(&pkg).as_deref(),
+                Some(GoPackageKind::FirstParty { import_path, .. }) if import_path == "example.com/m/lib"
+            ),
+            "a new resolver must not see another's memo"
+        );
     }
 
     // Regression: a non-existent dir UNDER a workspace go.mod must decode as
