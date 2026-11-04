@@ -6712,6 +6712,21 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         );
     }
 
+    /// Hostbin's `@heph/bin` sits under the root go.mod as a non-existent dir,
+    /// which first-party decoding accepts for codegen. The Go provider must
+    /// neither list nor resolve targets there: a listed `build_lib` matched
+    /// `label(go-build)` and hostbin then failed with "cannot find binary path".
+    #[tokio::test]
+    async fn test_other_providers_at_package_is_not_go() {
+        require_go!();
+        let sandbox = copy_fixture("simple_lib");
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
+        let names = provider_list(&p, "@heph/bin").await;
+        assert!(names.is_empty(), "@heph/bin must list nothing: {names:?}");
+        let result = provider_get(&p, make_addr("@heph/bin", "build_lib")).await;
+        assert!(matches!(result, Err(GetError::NotFound)));
+    }
+
     // ---- non-Go package ----
 
     #[tokio::test]

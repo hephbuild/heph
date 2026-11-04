@@ -91,6 +91,14 @@ fn decode_package_uncached(pkg: &PkgBuf, workspace_root: &Path) -> Option<GoPack
     //
     // Bound the result to `workspace_root` to avoid picking up an unrelated
     // go.mod above the workspace when no in-workspace go.mod exists.
+    //
+    // That leniency must not reach another provider's virtual package
+    // (`@heph/bin`, …): it is a non-existent dir under the root go.mod too.
+    // No Go import path may contain `@` (`module.CheckImportPath`), so a
+    // package that does is never first-party Go.
+    if s.contains('@') {
+        return None;
+    }
     let src_dir = workspace_root.join(s);
     if let Some((module_root, module_path)) = find_go_mod(&src_dir)
         && module_root.starts_with(workspace_root)
@@ -627,6 +635,22 @@ mod tests {
             &*kind,
             GoPackageKind::FirstParty { import_path, .. } if import_path == "example.com/myrepo/gen/deep"
         ));
+    }
+
+    // Regression: another provider's virtual package (`@heph/bin`, hostbin's)
+    // is a non-existent dir under the root go.mod too, but no Go import path
+    // can contain `@`, so it is never first-party. Claiming it made the Go
+    // provider list `//@heph/bin:build_lib`, which a `label(go-build)` query
+    // then matched and hostbin failed to run.
+    #[test]
+    fn test_decode_at_package_under_gomod_returns_none() {
+        let ws = make_workspace_with_go_mod("example.com/myrepo");
+        for pkg in ["@heph/bin", "@other", "some/@virtual/pkg"] {
+            assert!(
+                decode_package(&PkgBuf::from(pkg), ws.path()).is_none(),
+                "{pkg} must not decode as a Go package"
+            );
+        }
     }
 
     #[test]
