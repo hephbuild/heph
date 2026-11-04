@@ -1100,10 +1100,10 @@ fn render_pools(p: &crate::engine::resource_pool::ResourceSnapshot, now: Instant
                 let pool = shown(light, &s.pool);
                 format!(
                     "{pool} {}/{}",
-                    display_amount(pool, s.held),
+                    display_amount(s.unit, s.held),
                     s.capacity
                         .bounded()
-                        .map_or_else(|| "unbounded".to_owned(), |c| display_amount(pool, c))
+                        .map_or_else(|| "unbounded".to_owned(), |c| display_amount(s.unit, c))
                 )
             })
             .collect();
@@ -1118,11 +1118,16 @@ fn render_pools(p: &crate::engine::resource_pool::ResourceSnapshot, now: Instant
                 .iter()
                 .map(|n| {
                     let pool = shown(light, &n.pool);
+                    let unit = lane
+                        .pools
+                        .iter()
+                        .find(|s| s.pool == n.pool)
+                        .map_or_else(|| hcore::capacity::Unit::default_for(pool), |s| s.unit);
                     format!(
                         "{pool} {} ({} free)",
-                        display_amount(pool, n.need),
+                        display_amount(unit, n.need),
                         n.free
-                            .map_or_else(|| "unbounded".to_owned(), |f| display_amount(pool, f))
+                            .map_or_else(|| "unbounded".to_owned(), |f| display_amount(unit, f))
                     )
                 })
                 .collect();
@@ -1601,6 +1606,7 @@ mod tests {
         use crate::engine::resource_pool::{
             HeadSnapshot, LaneSnapshot, Limit, PoolNeed, PoolSnapshot, ResourceSnapshot,
         };
+        use hcore::capacity::Unit;
         use hplugin::provider::PoolName;
         let name = |s: &str| PoolName::try_from(s).expect("pool name");
         let cpu = 1_000_000;
@@ -1611,11 +1617,13 @@ mod tests {
                 pools: vec![
                     PoolSnapshot {
                         pool: name("cpu"),
+                        unit: Unit::Cpu,
                         capacity: Limit::Bounded(8 * cpu),
                         held: 6 * cpu,
                     },
                     PoolSnapshot {
                         pool: name("memory"),
+                        unit: Unit::Bytes,
                         capacity: Limit::Bounded(16 << 30),
                         held: 2 << 30,
                     },
@@ -1633,6 +1641,7 @@ mod tests {
             light: LaneSnapshot {
                 pools: vec![PoolSnapshot {
                     pool: name("light"),
+                    unit: Unit::Count,
                     capacity: Limit::Bounded(64),
                     held: 0,
                 }],
@@ -1649,22 +1658,45 @@ mod tests {
 
         // A busy light lane beside a user pool that is also named `light`:
         // the lane reads as `zero-cost`/`slots`, the user's pool as itself.
+        // A custom pool reads in its own unit, the head's need included.
         let mut snap = snap;
         snap.main.pools.push(PoolSnapshot {
             pool: name("light"),
+            unit: Unit::Count,
             capacity: Limit::Bounded(2),
             held: 1,
         });
         snap.main.pools.push(PoolSnapshot {
+            pool: name("scratch_disk"),
+            unit: Unit::Bytes,
+            capacity: Limit::Bounded(8 << 30),
+            held: 1 << 30,
+        });
+        snap.main.pools.push(PoolSnapshot {
             pool: name("tokens"),
+            unit: Unit::Count,
             capacity: Limit::Unbounded,
             held: 5,
         });
+        if let Some(head) = &mut snap.main.head {
+            head.unmet = vec![PoolNeed {
+                pool: name("scratch_disk"),
+                need: 8 << 30,
+                free: Some(7 << 30),
+            }];
+        }
         snap.light.pools[0].held = 64;
         snap.light.queued = 3;
         let text = render_pools(&snap, now);
         assert!(
-            text.contains("memory 2.0 GiB/16.0 GiB, light 1/2, tokens 5/unbounded; 7 queued"),
+            text.contains(
+                "memory 2.0 GiB/16.0 GiB, light 1/2, scratch_disk 1.0 GiB/8.0 GiB, \
+                 tokens 5/unbounded; 7 queued"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("waits for scratch_disk 8.0 GiB (7.0 GiB free)"),
             "{text}"
         );
         assert!(

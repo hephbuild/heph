@@ -365,6 +365,19 @@ impl EnginePools {
     pub fn built(&self) -> Option<&Arc<ResourcePool>> {
         self.pool.get()
     }
+
+    /// The built pool's snapshot, each named pool shown in its configured
+    /// unit. `None` before the first admission has built the pool.
+    pub fn snapshot(&self) -> Option<ResourceSnapshot> {
+        let mut snap = self.built()?.snapshot();
+        // The light lane's pool is not a named pool: it keeps its default.
+        for s in &mut snap.main.pools {
+            if let Some(unit) = self.unit(s.pool.as_str()) {
+                s.unit = unit;
+            }
+        }
+        Some(snap)
+    }
 }
 
 /// One FIFO over a fixed set of pools. The main lane holds every named pool;
@@ -516,6 +529,7 @@ impl Lane {
             .zip(self.capacity.iter().zip(st.held.iter()))
             .map(|(name, (&capacity, &held))| PoolSnapshot {
                 pool: name.clone(),
+                unit: Unit::default_for(name.as_str()),
                 capacity,
                 held,
             })
@@ -745,6 +759,11 @@ pub struct LaneSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolSnapshot {
     pub pool: PoolName,
+    /// How the pool's amounts are shown. The pool itself does not know its
+    /// unit: this is the name's default until
+    /// [`Engine::resource_snapshot`](crate::engine::Engine::resource_snapshot)
+    /// sets the configured one.
+    pub unit: Unit,
     pub capacity: Limit,
     pub held: u64,
 }
@@ -1180,11 +1199,13 @@ mod tests {
             [
                 PoolSnapshot {
                     pool: name("cpu"),
+                    unit: Unit::Cpu,
                     capacity: Limit::Bounded(4 * CPU),
                     held: 3 * CPU,
                 },
                 PoolSnapshot {
                     pool: name("memory"),
+                    unit: Unit::Bytes,
                     capacity: Limit::Bounded(8 * GIB),
                     held: GIB,
                 },

@@ -837,6 +837,7 @@ mod tests {
                 fail_fast: false,
                 scratch_disabled: false,
                 resources: Default::default(),
+                units: Default::default(),
             },
         ));
         t.apply(&ev(
@@ -1280,6 +1281,7 @@ mod tests {
                 fail_fast: true,
                 scratch_disabled: false,
                 resources: Default::default(),
+                units: Default::default(),
             },
         ));
         let md = render_live(&t, &ctx("heph run //...", 9_000), COMMENT_LIMIT);
@@ -1338,6 +1340,7 @@ mod tests {
                 fail_fast: false,
                 scratch_disabled: false,
                 resources: Default::default(),
+                units: Default::default(),
             },
         ));
         println!("\n===== LIVE, healthy =====\n");
@@ -1450,6 +1453,7 @@ mod tests {
                 fail_fast: false,
                 scratch_disabled: true,
                 resources: Default::default(),
+                units: Default::default(),
             },
         ));
         t.apply(&ev(

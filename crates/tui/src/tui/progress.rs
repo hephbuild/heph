@@ -7,12 +7,13 @@
 //! process split. Rendering callers pass their own `now_ms` wall clock.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 
 use crate::tui::app::{CIAppView, TUIAppView};
+use hcore::capacity::Unit;
 use hcore::events::{BuildEvent, BuildEventKind};
 
 /// Floor on the pinned viewport row count. The viewport targets one third of the
@@ -764,19 +765,17 @@ pub struct BuildState {
     /// blocked for three minutes between them is the whole reason the build was
     /// slow, and by the time anyone reads the summary every wait has ended.
     scratch_wait_totals: HashMap<String, (u64, u64)>,
-    /// The `memory` capacity announced by `RequestConfig`, for the `mem`
-    /// segment. `None` from a host that announces no pools.
-    memory_capacity: Option<u64>,
+    /// Every pool: its unit and capacity as `RequestConfig` announced them,
+    /// and what the running targets hold of it. `held` is the sum of
+    /// `running_reserved`, kept at Start/End so the header reads it without
+    /// walking the targets. A pool a target reserves that was never announced
+    /// (a host that announces no pools) is added with its default unit and no
+    /// capacity.
+    pools: BTreeMap<String, PoolView>,
     /// What each running target reserved, by addr, between its
     /// `ExecuteStart` and `ExecuteEnd`: the key that makes a repeated Start
     /// count once and an unpaired End subtract nothing.
-    running_reserved: HashMap<String, Held>,
-    /// The sum of `running_reserved`, kept at Start/End so the header reads
-    /// it without walking anything.
-    held: Held,
-    /// How many running targets reserved memory; the `mem` segment shows
-    /// only while one does.
-    memory_holders: usize,
+    running_reserved: HashMap<String, BTreeMap<String, u64>>,
     /// Targets whose admission has waited past the notice threshold, by
     /// addr. Added on `AdmissionWaitStart`, removed on `AdmissionWaitEnd`.
     admission_waits: HashMap<String, AdmissionWait>,
@@ -786,29 +785,35 @@ pub struct BuildState {
     clamped: HashMap<String, String>,
 }
 
-/// What a running target holds of the cpu and memory pools.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct Held {
-    /// Micro-CPUs.
-    cpu: u64,
-    /// Bytes.
-    memory: u64,
+/// One pool as the header shows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PoolView {
+    unit: Unit,
+    /// `None`: unbounded, or never announced.
+    capacity: Option<u64>,
+    /// What the running targets hold, in the unit's base.
+    held: u64,
 }
 
-impl Held {
-    /// From an `ExecuteStart`'s `reserved`; a frame without it (an older
-    /// host) counts as one CPU, which is what such a host reserved.
-    fn of(reserved: Option<&std::collections::BTreeMap<String, u64>>) -> Self {
-        match reserved {
-            None => Self {
-                cpu: hcore::capacity::MICROS_PER_CPU,
-                memory: 0,
-            },
-            Some(r) => Self {
-                cpu: r.get(hcore::capacity::CPU).copied().unwrap_or(0),
-                memory: r.get(hcore::capacity::MEMORY).copied().unwrap_or(0),
-            },
+impl PoolView {
+    fn of(pool: &str) -> Self {
+        Self {
+            unit: Unit::default_for(pool),
+            capacity: None,
+            held: 0,
         }
+    }
+}
+
+/// What an `ExecuteStart` reserved; a frame without `reserved` (an older
+/// host) counts as one CPU, which is what such a host reserved.
+fn reserved_of(reserved: Option<&BTreeMap<String, u64>>) -> BTreeMap<String, u64> {
+    match reserved {
+        None => BTreeMap::from([(
+            hcore::capacity::CPU.to_owned(),
+            hcore::capacity::MICROS_PER_CPU,
+        )]),
+        Some(r) => r.clone(),
     }
 }
 
@@ -950,11 +955,16 @@ impl BuildState {
             BuildEventKind::RequestConfig {
                 max_workers: count,
                 resources,
+                units,
                 ..
             } => {
                 self.max_workers = Some(*count);
-                // An unbounded memory pool has no capacity to show a share of.
-                self.memory_capacity = resources.get(hcore::capacity::MEMORY).copied().flatten();
+                for (pool, &capacity) in resources {
+                    let view = self.pool_mut(pool);
+                    view.unit = hcore::events::unit_of(units, pool);
+                    // An unbounded pool has no capacity to show a share of.
+                    view.capacity = capacity;
+                }
             }
             BuildEventKind::Matched { addrs, complete } => {
                 self.matched_seen = true;
@@ -1038,7 +1048,9 @@ impl BuildState {
                 ..
             } => {
                 self.retract_cache_hit(addr);
-                match hcore::events::clamp_text(declared.as_ref(), reserved.as_ref()) {
+                match hcore::events::clamp_text(declared.as_ref(), reserved.as_ref(), |p| {
+                    self.unit_of(p)
+                }) {
                     Some(clamp) => {
                         self.clamped.insert(addr.clone(), clamp);
                     }
@@ -1046,16 +1058,15 @@ impl BuildState {
                         self.clamped.remove(addr);
                     }
                 }
-                let held = Held::of(reserved.as_ref());
+                let held = reserved_of(reserved.as_ref());
+                for (pool, &amount) in &held {
+                    let view = self.pool_mut(pool);
+                    view.held = view.held.saturating_add(amount);
+                }
                 // A repeated Start replaces, rather than adds to, what the
                 // addr holds.
                 if let Some(prev) = self.running_reserved.insert(addr.clone(), held) {
-                    self.release(prev);
-                }
-                self.held.cpu = self.held.cpu.saturating_add(held.cpu);
-                self.held.memory = self.held.memory.saturating_add(held.memory);
-                if held.memory > 0 {
-                    self.memory_holders += 1;
+                    self.release(&prev);
                 }
             }
             BuildEventKind::ExecuteEnd { addr, error } => {
@@ -1064,7 +1075,7 @@ impl BuildState {
                 }
                 // An End with no Start releases nothing.
                 if let Some(held) = self.running_reserved.remove(addr) {
-                    self.release(held);
+                    self.release(&held);
                 }
                 self.clamped.remove(addr);
             }
@@ -1470,33 +1481,55 @@ impl BuildState {
 
     /// Take a finished target's reservation off the running sums. Saturating:
     /// a sum can never go below zero, whatever order the events came in.
-    fn release(&mut self, held: Held) {
-        self.held.cpu = self.held.cpu.saturating_sub(held.cpu);
-        self.held.memory = self.held.memory.saturating_sub(held.memory);
-        if held.memory > 0 {
-            self.memory_holders = self.memory_holders.saturating_sub(1);
+    fn release(&mut self, held: &BTreeMap<String, u64>) {
+        for (pool, &amount) in held {
+            if let Some(view) = self.pools.get_mut(pool) {
+                view.held = view.held.saturating_sub(amount);
+            }
         }
+    }
+
+    /// Pool `pool`'s entry, added with its default unit and no capacity when
+    /// it was never announced.
+    fn pool_mut(&mut self, pool: &str) -> &mut PoolView {
+        self.pools
+            .entry(pool.to_owned())
+            .or_insert_with(|| PoolView::of(pool))
+    }
+
+    /// Pool `pool`'s unit: as announced, else its default.
+    fn unit_of(&self, pool: &str) -> Unit {
+        self.pools
+            .get(pool)
+            .map_or_else(|| Unit::default_for(pool), |v| v.unit)
     }
 
     /// The cpu the running targets hold, in CPUs (rounded up). Kept at
     /// `ExecuteStart`/`ExecuteEnd`; reading it walks nothing.
     pub fn busy_cpus(&self) -> usize {
-        usize::try_from(self.held.cpu.div_ceil(hcore::capacity::MICROS_PER_CPU))
-            .unwrap_or(usize::MAX)
+        let held = self.pools.get(hcore::capacity::CPU).map_or(0, |v| v.held);
+        usize::try_from(held.div_ceil(hcore::capacity::MICROS_PER_CPU)).unwrap_or(usize::MAX)
     }
 
-    /// `mem <held>/<capacity>`, only while some running target reserved
-    /// memory and the capacity was announced.
-    pub fn memory_segment(&self) -> Option<String> {
-        if self.memory_holders == 0 {
-            return None;
-        }
-        let cap = self.memory_capacity?;
-        Some(format!(
-            "mem {}/{}",
-            hcore::units::human_bytes(self.held.memory),
-            hcore::units::human_bytes(cap)
-        ))
+    /// One `<pool> <held>/<capacity>` segment per pool other than `cpu`
+    /// (which the worker cells show) that a running target holds some of,
+    /// in name order and in the pool's unit: `memory 2.0 GiB/16.0 GiB`,
+    /// `gpu 1/2`. An unbounded pool has no capacity: `tokens 5`. Walks the
+    /// pools, never the targets.
+    pub fn pool_segments(&self) -> impl Iterator<Item = String> + '_ {
+        self.pools
+            .iter()
+            .filter(|(pool, v)| pool.as_str() != hcore::capacity::CPU && v.held > 0)
+            .map(|(pool, v)| {
+                let held = hcore::events::display_amount(v.unit, v.held);
+                match v.capacity {
+                    Some(cap) => format!(
+                        "{pool} {held}/{}",
+                        hcore::events::display_amount(v.unit, cap)
+                    ),
+                    None => format!("{pool} {held}"),
+                }
+            })
     }
 
     /// Rows for targets whose admission has waited past the notice
@@ -1514,7 +1547,13 @@ impl BuildState {
                     format!(
                         "  ⧗ {}",
                         hcore::events::admission_wait_text(
-                            addr, &w.pool, w.need, w.free, w.ahead, &waited
+                            addr,
+                            &w.pool,
+                            self.unit_of(&w.pool),
+                            w.need,
+                            w.free,
+                            w.ahead,
+                            &waited
                         )
                     ),
                     Style::default().fg(Color::Yellow),
@@ -1818,9 +1857,10 @@ impl ProgressHeader for BuildHeader {
         if !workers.is_empty() {
             items.push(HeaderItem::Text(workers));
         }
-        if let Some(mem) = core.memory_segment() {
-            items.push(HeaderItem::Text(vec![Span::raw(mem)]));
-        }
+        items.extend(
+            core.pool_segments()
+                .map(|seg| HeaderItem::Text(vec![Span::raw(seg)])),
+        );
         items
     }
 
@@ -2620,11 +2660,14 @@ fn admission_ci_line(state: &BuildState, ev: &BuildEvent) -> Option<String> {
             need,
             free,
             ahead,
-        } => Some(format!(
-            "⧗ {addr} waits for {pool} {} ({} free, {ahead} ahead)",
-            display_amount(pool, *need),
-            display_amount(pool, *free)
-        )),
+        } => {
+            let unit = state.unit_of(pool);
+            Some(format!(
+                "⧗ {addr} waits for {pool} {} ({} free, {ahead} ahead)",
+                display_amount(unit, *need),
+                display_amount(unit, *free)
+            ))
+        }
         BuildEventKind::AdmissionWaitEnd { addr } => state.admission_waits.get(addr).map(|w| {
             let waited = human_elapsed(ev.at_unix_ms.saturating_sub(w.since_ms));
             format!(
@@ -2677,7 +2720,9 @@ impl CIAppView for CiProgressView {
                 declared,
                 reserved,
                 ..
-            } => match hcore::events::clamp_text(declared.as_ref(), reserved.as_ref()) {
+            } => match hcore::events::clamp_text(declared.as_ref(), reserved.as_ref(), |p| {
+                self.core.state.unit_of(p)
+            }) {
                 Some(clamp) => tracing::info!("running {addr} [{driver}] ({clamp})"),
                 None => tracing::info!("running {addr} [{driver}]"),
             },
@@ -2947,9 +2992,42 @@ mod tests {
             hcore::events::clamp_text(
                 Some(&[("cpu".into(), CPU / 2), ("memory".into(), 1 << 30)].into()),
                 Some(&[("cpu".into(), CPU / 4), ("memory".into(), 1 << 30)].into()),
+                Unit::default_for,
             )
             .as_deref(),
             Some("cpu 0.5→0.25")
+        );
+    }
+
+    /// A clamp on a custom pool reads in the unit `RequestConfig` announced
+    /// for it, not as a bare count.
+    #[test]
+    fn a_clamp_on_a_custom_pool_reads_in_its_unit() {
+        let mut s = BuildState::new();
+        s.apply(&ev(
+            0,
+            BuildEventKind::RequestConfig {
+                max_workers: 4,
+                fail_fast: false,
+                scratch_disabled: false,
+                resources: [("scratch_disk".into(), Some(4 << 30))].into(),
+                units: [("scratch_disk".into(), "bytes".into())].into(),
+            },
+        ));
+        s.apply(&ev(
+            1,
+            BuildEventKind::ExecuteStart {
+                addr: "//p:big".into(),
+                driver: "exec".into(),
+                cache: true,
+                declared: Some([("scratch_disk".into(), 8 << 30)].into()),
+                reserved: Some([("cpu".into(), CPU), ("scratch_disk".into(), 4 << 30)].into()),
+                queued_ms: None,
+            },
+        ));
+        assert_eq!(
+            s.clamped.get("//p:big").map(String::as_str),
+            Some("scratch_disk 8.0 GiB→4.0 GiB")
         );
     }
 
@@ -3006,8 +3084,11 @@ mod tests {
         assert_eq!(s.busy_cpus(), 2);
     }
 
+    /// Every pool but `cpu` shows only while some running target holds it,
+    /// in its announced unit; an unbounded pool shows no capacity; a pool
+    /// that was never announced still shows what is held of it.
     #[test]
-    fn memory_segment_shows_only_while_memory_is_held() {
+    fn pool_segments_show_each_held_pool_in_its_unit() {
         let mut s = BuildState::new();
         s.apply(&ev(
             0,
@@ -3017,20 +3098,46 @@ mod tests {
                 scratch_disabled: false,
                 resources: [
                     ("cpu".into(), Some(4 * CPU)),
+                    ("gpu".into(), Some(2)),
                     ("memory".into(), Some(16 << 30)),
+                    ("tokens".into(), None),
+                ]
+                .into(),
+                units: [
+                    ("cpu".into(), "cpu".into()),
+                    ("gpu".into(), "count".into()),
+                    ("memory".into(), "bytes".into()),
+                    ("tokens".into(), "count".into()),
                 ]
                 .into(),
             },
         ));
+        let segments = |s: &BuildState| s.pool_segments().collect::<Vec<_>>();
         s.apply(&ev(0, execute_start("//a:x")));
-        assert_eq!(s.memory_segment(), None);
+        assert!(segments(&s).is_empty(), "cpu is the worker cells");
         s.apply(&ev(
             0,
             execute_start_reserving("//a:y", &[("cpu", CPU), ("memory", 2 << 30)]),
         ));
-        assert_eq!(s.memory_segment().as_deref(), Some("mem 2.0 GiB/16.0 GiB"));
+        assert_eq!(segments(&s), ["memory 2.0 GiB/16.0 GiB"]);
+        s.apply(&ev(
+            0,
+            execute_start_reserving("//a:z", &[("cpu", CPU), ("gpu", 1), ("tokens", 5)]),
+        ));
+        assert_eq!(
+            segments(&s),
+            ["gpu 1/2", "memory 2.0 GiB/16.0 GiB", "tokens 5"]
+        );
         s.apply(&ev(1, execute_end("//a:y")));
-        assert_eq!(s.memory_segment(), None);
+        assert_eq!(segments(&s), ["gpu 1/2", "tokens 5"]);
+        s.apply(&ev(
+            1,
+            execute_start_reserving("//a:w", &[("cpu", CPU), ("licenses", 3)]),
+        ));
+        assert_eq!(segments(&s), ["gpu 1/2", "licenses 3", "tokens 5"]);
+        s.apply(&ev(2, execute_end("//a:z")));
+        s.apply(&ev(2, execute_end("//a:w")));
+        assert!(segments(&s).is_empty(), "{:?}", segments(&s));
     }
 
     #[test]
@@ -3730,6 +3837,7 @@ mod tests {
             fail_fast: false,
             scratch_disabled: false,
             resources: Default::default(),
+            units: Default::default(),
         }
     }
 

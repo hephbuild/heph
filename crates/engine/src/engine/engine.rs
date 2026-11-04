@@ -646,18 +646,24 @@ impl Engine {
     /// The resource pool at this instant: per pool held/free/capacity and the
     /// queue. `None` before the first admission has built the pool.
     pub fn resource_snapshot(&self) -> Option<crate::engine::resource_pool::ResourceSnapshot> {
-        self.pools.built().map(|p| p.snapshot())
+        self.pools.snapshot()
     }
 
-    /// Every named pool's capacity, in the pool's unit's base, as
-    /// `RequestConfig` announces it: `None` for an unbounded pool. Builds the
-    /// pool (and so reads the host's memory) on the first call.
-    pub(crate) fn pool_capacities(&self) -> std::collections::BTreeMap<String, Option<u64>> {
-        self.pools
-            .get()
-            .capacities()
-            .map(|(p, c)| (p.as_str().to_owned(), c.bounded()))
-            .collect()
+    /// Every named pool's capacity, in the pool's unit's base, and its unit's
+    /// name, as `RequestConfig` announces them: `None` for an unbounded pool.
+    /// Builds the pool (and so reads the host's memory) on the first call.
+    pub(crate) fn pool_announcement(&self) -> crate::engine::request_state::PoolAnnouncement {
+        let mut ann = crate::engine::request_state::PoolAnnouncement::default();
+        for (p, c) in self.pools.get().capacities() {
+            let unit = self
+                .pools
+                .unit(p.as_str())
+                .unwrap_or_else(|| hcore::capacity::Unit::default_for(p.as_str()));
+            ann.capacities.insert(p.as_str().to_owned(), c.bounded());
+            ann.units
+                .insert(p.as_str().to_owned(), unit.name().to_owned());
+        }
+        ann
     }
 
     /// Lower the admission-wait notice threshold, so a test can see
@@ -810,7 +816,7 @@ impl Engine {
                 crate::engine::diag::global().register_worker_pool(max_workers, free.clone());
                 crate::engine::diag::global().register_pools({
                     let pools = Arc::clone(&pools);
-                    move || pools.built().map(|p| p.snapshot())
+                    move || pools.snapshot()
                 });
                 crate::engine::diag::global()
                     .limiter("workers")

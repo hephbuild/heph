@@ -23,6 +23,14 @@ type ArcErr = Arc<anyhow::Error>;
 type ExecuteCacheResult = Result<(Vec<ResultArtifact>, Vec<ArtifactMeta>), ArcErr>;
 type ProbeStatesResult = Result<Arc<Vec<State>>, ArcErr>;
 
+/// The pools a `RequestConfig` announces: each one's capacity (`None`:
+/// unbounded) and its unit's name, keyed by pool name.
+#[derive(Debug, Default)]
+pub struct PoolAnnouncement {
+    pub capacities: std::collections::BTreeMap<String, Option<u64>>,
+    pub units: std::collections::BTreeMap<String, String>,
+}
+
 /// Process-local memoizer key for an `Addr`.
 ///
 /// `Addr` is interned, so `Arc::ptr_eq` is already what `Addr::PartialEq`
@@ -961,24 +969,26 @@ impl RequestState {
     /// call from every top-level entry point (`result`, `result_addr`); only the
     /// first call emits, so dep recursion never re-announces.
     ///
-    /// `count` is the cpu capacity in CPUs; `resources` every pool's capacity
-    /// (`None`: unbounded), called only by the announcing call.
+    /// `count` is the cpu capacity in CPUs; `pools` every pool's capacity
+    /// (`None`: unbounded) and unit, called only by the announcing call.
     pub fn announce_request_config(
         &self,
         count: usize,
         scratch_disabled: bool,
-        resources: impl FnOnce() -> std::collections::BTreeMap<String, Option<u64>>,
+        pools: impl FnOnce() -> PoolAnnouncement,
     ) {
         if !self
             .data
             .workers_announced
             .swap(true, std::sync::atomic::Ordering::Relaxed)
         {
+            let pools = pools();
             self.emit(crate::engine::event::BuildEventKind::RequestConfig {
                 max_workers: count,
                 fail_fast: self.data.fail_fast,
                 scratch_disabled,
-                resources: resources(),
+                resources: pools.capacities,
+                units: pools.units,
             });
         }
     }

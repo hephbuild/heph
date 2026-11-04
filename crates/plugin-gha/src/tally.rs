@@ -155,6 +155,8 @@ pub(crate) struct RootFailure {
 pub(crate) struct AdmissionWait {
     pub addr: String,
     pub pool: String,
+    /// `pool`'s unit, as announced when the wait started.
+    pub unit: hcore::capacity::Unit,
     pub need: u64,
     pub free: u64,
     pub ahead: u64,
@@ -167,6 +169,7 @@ impl AdmissionWait {
         hcore::events::admission_wait_text(
             &self.addr,
             &self.pool,
+            self.unit,
             self.need,
             self.free,
             self.ahead,
@@ -254,6 +257,9 @@ pub(crate) struct Tally {
     misses_by_pkg: FxHashMap<Box<str>, usize>,
 
     max_workers: usize,
+    /// Each pool's unit name, from `RequestConfig`, so a wait row shows its
+    /// amounts the way the pool's are written.
+    pool_units: std::collections::BTreeMap<String, String>,
     /// Whether this invocation stops at the first failure. Reported by the
     /// engine, never inferred here — see `BuildEventKind::RequestConfig`.
     fail_fast: bool,
@@ -324,8 +330,10 @@ impl Tally {
                 scratch_disabled,
                 // Pool capacities; the report does not render them yet.
                 resources: _,
+                units,
             } => {
                 self.max_workers = *max_workers;
+                self.pool_units.clone_from(units);
                 self.fail_fast = *fail_fast;
                 self.scratch_disabled = *scratch_disabled;
             }
@@ -481,6 +489,7 @@ impl Tally {
                     AdmissionWait {
                         addr: addr.clone(),
                         pool: pool.clone(),
+                        unit: hcore::events::unit_of(&self.pool_units, pool),
                         need: *need,
                         free: *free,
                         ahead: *ahead,
@@ -1469,6 +1478,38 @@ mod tests {
         assert_eq!(waits.first().map(|w| w.addr.as_str()), Some("//a:c"));
     }
 
+    /// A wait on a custom pool reads in the unit `RequestConfig` announced
+    /// for it.
+    #[test]
+    fn an_admission_wait_on_a_custom_pool_reads_in_its_unit() {
+        let mut t = Tally::default();
+        t.apply(&ev(
+            0,
+            BuildEventKind::RequestConfig {
+                max_workers: 4,
+                fail_fast: false,
+                scratch_disabled: false,
+                resources: [("scratch_disk".into(), Some(8 << 30))].into(),
+                units: [("scratch_disk".into(), "bytes".into())].into(),
+            },
+        ));
+        t.apply(&ev(
+            1_000,
+            BuildEventKind::AdmissionWaitStart {
+                addr: "//a:b".into(),
+                pool: "scratch_disk".into(),
+                need: 4 << 30,
+                free: 1 << 30,
+                ahead: 0,
+            },
+        ));
+        let (waits, _) = t.admission_waits(5);
+        assert_eq!(
+            waits.iter().map(|w| w.text(2_000)).collect::<Vec<_>>(),
+            ["//a:b waits for scratch_disk 4.0 GiB (1.0 GiB free, 0 ahead, 1s)"]
+        );
+    }
+
     #[test]
     fn status_settles_when_the_stream_closes() {
         let mut t = Tally::default();
@@ -1586,6 +1627,7 @@ mod tests {
                 fail_fast: false,
                 scratch_disabled: false,
                 resources: Default::default(),
+                units: Default::default(),
             },
         ));
         t.apply(&ev(

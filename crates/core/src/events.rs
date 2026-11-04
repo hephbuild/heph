@@ -44,32 +44,37 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// An amount of a pool, as a person reads it: `cpu` in CPUs (`4`, `0.5`),
-/// `memory` in binary units (`2.0 GiB`), anything else a bare count. Shared
-/// by every renderer of the admission events.
-pub fn display_amount(pool: &str, amount: u64) -> String {
-    match pool {
-        crate::capacity::CPU => {
-            let per = crate::capacity::MICROS_PER_CPU;
-            let (whole, frac) = (amount / per, amount % per);
-            if frac == 0 {
-                whole.to_string()
-            } else {
-                let digits = format!("{frac:06}");
-                format!("{whole}.{}", digits.trim_end_matches('0'))
-            }
-        }
-        crate::capacity::MEMORY => crate::units::human_bytes(amount),
-        _ => amount.to_string(),
+use crate::capacity::Unit;
+
+/// An amount of a pool, as a person reads it, by the pool's unit: `cpu` in
+/// CPUs (`4`, `0.5`), `bytes` in binary units (`2.0 GiB`), `count` as the
+/// integer. Shared by every renderer of the admission events.
+pub fn display_amount(unit: Unit, amount: u64) -> String {
+    match unit {
+        Unit::Cpu => unit.canonical(amount),
+        Unit::Bytes => crate::units::human_bytes(amount),
+        Unit::Count => amount.to_string(),
     }
+}
+
+/// The unit of `pool` as a `RequestConfig`'s `units` names it; a pool it
+/// does not name (a host that predates `units`, or the light lane's `light`)
+/// has its default unit: a builtin's own, else `count`.
+pub fn unit_of(units: &BTreeMap<String, String>, pool: &str) -> Unit {
+    units
+        .get(pool)
+        .and_then(|u| Unit::from_name(u))
+        .unwrap_or_else(|| Unit::default_for(pool))
 }
 
 /// What an `ExecuteStart` was clamped by, as `cpu 16→4` (pools joined by
 /// `, `), or `None` when every declared pool was granted in full. Only the
-/// declared keys count: an undeclared pool was never asked for.
+/// declared keys count: an undeclared pool was never asked for. `unit`
+/// names each pool's unit.
 pub fn clamp_text(
     declared: Option<&BTreeMap<String, u64>>,
     reserved: Option<&BTreeMap<String, u64>>,
+    unit: impl Fn(&str) -> Unit,
 ) -> Option<String> {
     let (declared, reserved) = (declared?, reserved?);
     let parts: Vec<String> = declared
@@ -77,10 +82,11 @@ pub fn clamp_text(
         .filter_map(|(pool, &want)| {
             let got = reserved.get(pool).copied().unwrap_or(0);
             (got < want).then(|| {
+                let u = unit(pool);
                 format!(
                     "{pool} {}→{}",
-                    display_amount(pool, want),
-                    display_amount(pool, got)
+                    display_amount(u, want),
+                    display_amount(u, got)
                 )
             })
         })
@@ -90,10 +96,11 @@ pub fn clamp_text(
 
 /// The text of an admission-wait row, after its `⧗`:
 /// `//a:b waits for cpu 4 (2 free, 6 ahead, 41s)`. `waited` is the elapsed
-/// time as the renderer spells it.
+/// time as the renderer spells it; `unit` is `pool`'s.
 pub fn admission_wait_text(
     addr: &str,
     pool: &str,
+    unit: Unit,
     need: u64,
     free: u64,
     ahead: u64,
@@ -101,8 +108,8 @@ pub fn admission_wait_text(
 ) -> String {
     format!(
         "{addr} waits for {pool} {} ({} free, {ahead} ahead, {waited})",
-        display_amount(pool, need),
-        display_amount(pool, free)
+        display_amount(unit, need),
+        display_amount(unit, free)
     )
 }
 
@@ -167,6 +174,12 @@ pub enum BuildEventKind {
         /// resources.
         #[serde(default)]
         resources: BTreeMap<String, Option<u64>>,
+        /// Every pool in `resources` and its unit's name (`count`, `cpu`,
+        /// `bytes`), so a renderer shows an amount the way it was written.
+        /// Read through [`unit_of`]: a pool missing here (a host that
+        /// predates the field) has its default unit.
+        #[serde(default)]
+        units: BTreeMap<String, String>,
     },
     /// Incremental notice of matched top-level targets. `addrs` are newly
     /// matched addresses to add to the set; `complete` is false while the
@@ -638,11 +651,35 @@ mod tests {
 
     #[test]
     fn amounts_display_in_the_pools_unit() {
-        assert_eq!(display_amount("cpu", 4_000_000), "4");
-        assert_eq!(display_amount("cpu", 500_000), "0.5");
-        assert_eq!(display_amount("cpu", 10), "0.00001");
-        assert_eq!(display_amount("memory", 2 << 30), "2.0 GiB");
-        assert_eq!(display_amount("gpu", 2), "2");
+        assert_eq!(display_amount(Unit::Cpu, 4_000_000), "4");
+        assert_eq!(display_amount(Unit::Cpu, 500_000), "0.5");
+        assert_eq!(display_amount(Unit::Cpu, 10), "0.00001");
+        assert_eq!(display_amount(Unit::Bytes, 2 << 30), "2.0 GiB");
+        assert_eq!(display_amount(Unit::Count, 2), "2");
+    }
+
+    /// A pool's unit comes from `units`; a pool missing there has its
+    /// default, and an unknown unit name reads as the default too.
+    #[test]
+    fn unit_of_reads_the_announced_unit_else_the_default() {
+        let units = BTreeMap::from([
+            ("scratch_disk".to_owned(), "bytes".to_owned()),
+            ("odd".to_owned(), "furlongs".to_owned()),
+        ]);
+        assert_eq!(unit_of(&units, "scratch_disk"), Unit::Bytes);
+        assert_eq!(unit_of(&units, "memory"), Unit::Bytes);
+        assert_eq!(unit_of(&units, "cpu"), Unit::Cpu);
+        assert_eq!(unit_of(&units, "gpu"), Unit::Count);
+        assert_eq!(unit_of(&units, "odd"), Unit::Count);
+        assert_eq!(
+            clamp_text(
+                Some(&BTreeMap::from([("scratch_disk".into(), 8 << 30)])),
+                Some(&BTreeMap::from([("scratch_disk".into(), 4 << 30)])),
+                |p| unit_of(&units, p),
+            )
+            .as_deref(),
+            Some("scratch_disk 8.0 GiB→4.0 GiB")
+        );
     }
 
     /// The scratch spans decode with their detail fields absent — the shape an

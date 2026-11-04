@@ -1661,7 +1661,9 @@ impl Engine {
         // Announce worker capacity once per request. Covers the single-target
         // entry (`run` of one addr) that bypasses `Engine::result`; the once-guard
         // makes the dep recursion below a no-op.
-        rs.announce_request_config(self.max_workers, opts.no_scratch, || self.pool_capacities());
+        rs.announce_request_config(self.max_workers, opts.no_scratch, || {
+            self.pool_announcement()
+        });
 
         // Single-target entry (`run` of one addr, which bypasses `Engine::result`):
         // claim the matched stream and emit the set-of-one as already-complete
@@ -2014,7 +2016,9 @@ impl Engine {
 
         // Announce worker capacity up front so the client can paint a fixed
         // worker-slot indicator before any execute lands.
-        rs.announce_request_config(self.max_workers, opts.no_scratch, || self.pool_capacities());
+        rs.announce_request_config(self.max_workers, opts.no_scratch, || {
+            self.pool_announcement()
+        });
 
         let fail_fast = rs.fail_fast();
         let mut set: JoinSet<(Addr, anyhow::Result<Arc<EResult>>)> = JoinSet::new();
