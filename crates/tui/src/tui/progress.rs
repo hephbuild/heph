@@ -2675,40 +2675,6 @@ pub(crate) fn prepare_note(
     Some(Note { text, warn })
 }
 
-/// The CI log's lines for an admission wait, read against `state` *before*
-/// `ev` is folded into it. A log line cannot tick, so the wait is two lines:
-/// the notice, without an elapsed time (it would always read `0s`), and the
-/// end, with how long it waited past the notice, from the Start/End pair. An
-/// End with no Start says nothing.
-fn admission_ci_line(state: &BuildState, ev: &BuildEvent) -> Option<String> {
-    use hcore::events::display_amount;
-    match &ev.kind {
-        BuildEventKind::AdmissionWaitStart {
-            addr,
-            pool,
-            need,
-            free,
-            ahead,
-        } => {
-            let unit = state.unit_of(pool);
-            Some(format!(
-                "⧗ {addr} waits for {pool} {} ({} free, {ahead} ahead)",
-                display_amount(unit, *need),
-                display_amount(unit, *free)
-            ))
-        }
-        BuildEventKind::AdmissionWaitEnd { addr } => state.admission_waits.get(addr).map(|w| {
-            let waited = human_elapsed(ev.at_unix_ms.saturating_sub(w.since_ms));
-            format!(
-                "⧗ {addr} done waiting for {}, {} more",
-                w.pool,
-                waited.trim()
-            )
-        }),
-        _ => None,
-    }
-}
-
 /// The paved-road [`CIAppView`]: a one-line label header, a concise per-execute
 /// line, and a final one-line summary plus per-error lines — all through the
 /// log sink. Used by every command's `ci_view`.
@@ -2755,11 +2721,9 @@ impl CIAppView for CiProgressView {
                 Some(clamp) => tracing::info!("running {addr} [{driver}] ({clamp})"),
                 None => tracing::info!("running {addr} [{driver}]"),
             },
-            BuildEventKind::AdmissionWaitStart { .. } | BuildEventKind::AdmissionWaitEnd { .. } => {
-                if let Some(line) = admission_ci_line(&self.core.state, ev) {
-                    tracing::info!("{line}");
-                }
-            }
+            // Admission waits stay off the CI log: a line per wait is noise
+            // on a busy build, and the live views (the TUI's waiting tab, the
+            // GHA live report) show them as they happen.
             BuildEventKind::ResultLockWaitStart {
                 addr,
                 holder_pid,
@@ -4136,42 +4100,60 @@ mod tests {
         assert_eq!(v.core.state.errored, 1);
     }
 
-    /// The CI log's admission wait: the notice carries no elapsed time (it
-    /// used to print a constant `0s`), the end carries it from the pair.
+    /// What the CI view logs for `events`, captured from its `tracing` lines.
+    fn ci_view_log(events: &[BuildEvent]) -> String {
+        #[derive(Clone, Default)]
+        struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let sink = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || sink.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let mut v = CiProgressView::new("Running");
+            for e in events {
+                v.apply(e);
+            }
+        });
+        let bytes = buf.0.lock().expect("log buffer").clone();
+        String::from_utf8(bytes).expect("utf-8 log")
+    }
+
+    /// Admission waits stay off the CI log; the execute that follows still
+    /// logs, which also proves the capture sees the view's lines.
     #[test]
-    fn ci_view_admission_wait_lines_time_the_wait_from_its_pair() {
-        let mut v = CiProgressView::new("Running");
-        let start = ev(
-            1_000,
-            BuildEventKind::AdmissionWaitStart {
-                addr: "//a:b".into(),
-                pool: "cpu".into(),
-                need: 4_000_000,
-                free: 2_000_000,
-                ahead: 6,
-            },
-        );
-        assert_eq!(
-            admission_ci_line(&v.core.state, &start).as_deref(),
-            Some("⧗ //a:b waits for cpu 4 (2 free, 6 ahead)")
-        );
-        v.apply(&start);
-        let end = ev(
-            42_000,
-            BuildEventKind::AdmissionWaitEnd {
-                addr: "//a:b".into(),
-            },
-        );
-        assert_eq!(
-            admission_ci_line(&v.core.state, &end).as_deref(),
-            Some("⧗ //a:b done waiting for cpu, 41s more")
-        );
-        v.apply(&end);
-        assert_eq!(
-            admission_ci_line(&v.core.state, &end),
-            None,
-            "an End with no Start says nothing"
-        );
+    fn ci_view_logs_nothing_for_an_admission_wait() {
+        let log = ci_view_log(&[
+            ev(1_000, admission_wait_start("//a:b")),
+            ev(
+                42_000,
+                BuildEventKind::AdmissionWaitEnd {
+                    addr: "//a:b".into(),
+                },
+            ),
+        ]);
+        assert_eq!(log, "", "an admission wait logged: {log}");
+
+        let log = ci_view_log(&[
+            ev(1_000, admission_wait_start("//a:b")),
+            ev(2_000, execute_start("//a:b")),
+        ]);
+        assert!(!log.contains('⧗'), "{log}");
+        assert!(log.contains("running //a:b [exec]"), "{log}");
     }
 
     #[test]

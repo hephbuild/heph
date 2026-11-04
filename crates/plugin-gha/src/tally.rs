@@ -377,6 +377,10 @@ impl Tally {
             BuildEventKind::ExecuteStart { addr, driver, .. } => {
                 let at = ev.at_unix_ms;
                 self.ensure(addr, at);
+                // A target that executes is no longer waiting at admission. The
+                // engine sends `AdmissionWaitEnd` first; this keeps a lost End
+                // from leaving a stale `⧗` row in the live comment.
+                self.admission_waits.remove(addr.as_str());
                 let mut retract = None;
                 if let Some(rec) = self.live.get_mut(addr.as_str()) {
                     rec.phase = Some((Phase::Execute, at));

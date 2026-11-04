@@ -1244,6 +1244,42 @@ mod tests {
         assert!(!md.contains("waiting for resources"), "{md}");
     }
 
+    /// The live comment drops a wait once its target executes, even if the
+    /// `AdmissionWaitEnd` never arrived.
+    #[test]
+    fn admission_wait_leaves_the_live_comment_when_the_target_executes() {
+        let mut t = build(100, 0, 0);
+        t.apply(&ev(
+            559_000,
+            BuildEventKind::AdmissionWaitStart {
+                addr: "//a:b".into(),
+                pool: "cpu".into(),
+                need: 4_000_000,
+                free: 2_000_000,
+                ahead: 6,
+            },
+        ));
+        let md = render_live(&t, &ctx("heph run //...", 600_000), COMMENT_LIMIT);
+        assert!(
+            md.contains("- ⧗ //a:b waits for cpu 4 (2 free, 6 ahead, 41s)\n"),
+            "{md}"
+        );
+        t.apply(&ev(
+            600_000,
+            BuildEventKind::ExecuteStart {
+                addr: "//a:b".into(),
+                driver: "exec".into(),
+                cache: true,
+                declared: None,
+                reserved: None,
+                queued_ms: None,
+            },
+        ));
+        let md = render_live(&t, &ctx("heph run //...", 600_000), COMMENT_LIMIT);
+        assert!(!md.contains("waiting for resources"), "{md}");
+        assert!(!md.contains('⧗'), "{md}");
+    }
+
     #[test]
     fn clock_is_quantized_so_suppression_can_fire() {
         // An unquantized clock changes on every render, so every tick would PATCH
