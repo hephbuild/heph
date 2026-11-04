@@ -631,6 +631,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "core",
+ "enclose",
  "futures",
  "glob",
  "itertools 0.15.0",
