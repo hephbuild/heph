@@ -39,9 +39,9 @@ fn candidates(partial: &str) -> anyhow::Result<Vec<String>> {
     let base = get_cwp()?;
     bootstrap::block_on(async move {
         // `new_engine` spawns tokio tasks, so it must run inside the runtime.
-        // Completion runs before the command line is whole: no options.
-        let (engine, _shutdown) =
-            bootstrap::new_engine(&crate::commands::GlobalOptions::default())?;
+        // Completion runs before the command line is whole: no options, and
+        // a bad `HEPH_RESOURCE_<NAME>` must not break `<TAB>`.
+        let (engine, _shutdown) = bootstrap::new_helper_engine()?;
         addr_candidates(&engine, &base, partial).await
     })?
 }

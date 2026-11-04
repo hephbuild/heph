@@ -112,10 +112,17 @@ pub struct PoolDecl {
 }
 
 impl ResourcesConfig {
-    /// Refuse `other` changing the unit of a pool `self` declares.
+    /// Refuse `other` changing the unit of a pool `self` declares. A pool
+    /// `self` wrote without a unit has its default one (`slots: 2` is a
+    /// `count` pool), so a later `{unit: bytes}` changes it; a later value
+    /// without a unit keeps whatever `self` has.
     pub fn check_merge(&self, other: &Self) -> anyhow::Result<()> {
         for (name, decl) in &other.0 {
-            if let (Some(a), Some(b)) = (self.0.get(name).and_then(|d| d.unit), decl.unit)
+            let base = self.0.get(name).map(|d| {
+                d.unit
+                    .unwrap_or_else(|| hcore::capacity::Unit::default_for(name))
+            });
+            if let (Some(a), Some(b)) = (base, decl.unit)
                 && a != b
             {
                 anyhow::bail!(
@@ -1976,25 +1983,44 @@ plugins:
         assert_eq!(slots.capacity, Some(Amount(500_000)));
     }
 
-    /// A pool's unit is fixed by the first file that writes it.
+    /// A pool's unit is fixed by the first file that writes it, a default
+    /// unit included: `slots: 2` is a `count` pool, as if written.
     #[test]
     fn resources_unit_cannot_change_across_profiles() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path();
-        std::fs::write(
-            root.join(".hephconfig"),
-            "resources:\n  slots: {unit: cpu, value: 2}\n",
-        )
-        .expect("write base");
-        std::fs::write(
-            root.join("ci.hephconfig"),
-            "resources:\n  slots: {unit: count, value: 2}\n",
-        )
-        .expect("write ci");
-        let err = load_with_profiles(root, &["ci"]).expect_err("unit change");
-        let msg = format!("{err:#}");
-        assert!(msg.contains("resources.slots"), "{msg}");
-        assert!(msg.contains("cannot change"), "{msg}");
+        // (base, profile, refused)
+        let rows: &[(&str, &str, bool)] = &[
+            (
+                "slots: {unit: cpu, value: 2}",
+                "slots: {unit: count, value: 2}",
+                true,
+            ),
+            ("slots: 2", "slots: {unit: bytes}", true),
+            ("slots: {value: 2}", "slots: {unit: cpu, value: 1}", true),
+            ("memory: 8G", "memory: {unit: bytes, value: 4G}", false),
+            ("slots: 2", "slots: {unit: count, value: 3}", false),
+            ("slots: {unit: bytes, value: 2G}", "slots: 4G", false),
+        ];
+        for (base, profile, refused) in rows {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let root = dir.path();
+            std::fs::write(root.join(".hephconfig"), format!("resources:\n  {base}\n"))
+                .expect("write base");
+            std::fs::write(
+                root.join("ci.hephconfig"),
+                format!("resources:\n  {profile}\n"),
+            )
+            .expect("write ci");
+            let got = load_with_profiles(root, &["ci"]);
+            if *refused {
+                let msg = format!("{:#}", got.expect_err(profile));
+                assert!(msg.contains("cannot change"), "{base} + {profile}: {msg}");
+            } else {
+                let cfg = got.unwrap_or_else(|e| panic!("{base} + {profile}: {e:#}"));
+                cfg.resources
+                    .resolve()
+                    .unwrap_or_else(|e| panic!("{base} + {profile}: {e:#}"));
+            }
+        }
     }
 
     /// The config half of `percent_capacity_parse_table` (the CLI half is in

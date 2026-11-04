@@ -3140,6 +3140,52 @@ mod tests {
         assert!(segments(&s).is_empty(), "{:?}", segments(&s));
     }
 
+    /// The per-pool sum holds under what an event stream can do: two holders
+    /// of one non-cpu pool add up and release separately, a repeated Start
+    /// replaces what the addr held instead of adding to it, and an End with
+    /// no Start (or a second End) releases nothing.
+    #[test]
+    fn pool_sums_survive_shared_holders_repeats_and_unpaired_ends() {
+        let mut s = BuildState::new();
+        s.apply(&ev(
+            0,
+            BuildEventKind::RequestConfig {
+                max_workers: 4,
+                fail_fast: false,
+                scratch_disabled: false,
+                resources: [("cpu".into(), Some(4 * CPU)), ("gpu".into(), Some(4))].into(),
+                units: [("cpu".into(), "cpu".into()), ("gpu".into(), "count".into())].into(),
+            },
+        ));
+        let segments = |s: &BuildState| s.pool_segments().collect::<Vec<_>>();
+        let gpu = |n: u64| [("cpu", CPU), ("gpu", n)];
+
+        // Two holders of gpu.
+        s.apply(&ev(0, execute_start_reserving("//a:x", &gpu(1))));
+        s.apply(&ev(0, execute_start_reserving("//a:y", &gpu(2))));
+        assert_eq!(segments(&s), ["gpu 3/4"]);
+        assert_eq!(s.busy_cpus(), 2);
+
+        // A repeated Start for //a:x replaces its 1 with 1, not 2.
+        s.apply(&ev(1, execute_start_reserving("//a:x", &gpu(1))));
+        assert_eq!(segments(&s), ["gpu 3/4"], "a repeated Start replaces");
+        assert_eq!(s.busy_cpus(), 2);
+
+        // An End for an addr that never started releases nothing.
+        s.apply(&ev(1, execute_end("//a:never")));
+        assert_eq!(segments(&s), ["gpu 3/4"], "an unpaired End");
+
+        s.apply(&ev(2, execute_end("//a:y")));
+        assert_eq!(segments(&s), ["gpu 1/4"]);
+        // A second End for //a:y is unpaired too.
+        s.apply(&ev(2, execute_end("//a:y")));
+        assert_eq!(segments(&s), ["gpu 1/4"], "a second End");
+
+        s.apply(&ev(3, execute_end("//a:x")));
+        assert!(segments(&s).is_empty(), "{:?}", segments(&s));
+        assert_eq!(s.busy_cpus(), 0);
+    }
+
     #[test]
     fn admission_wait_row_names_the_pool_and_the_queue() {
         let mut s = BuildState::new();

@@ -2104,6 +2104,36 @@ pub(crate) mod tests {
         assert!(!root.join("g1/aaaa.lock").exists());
     }
 
+    /// A real staged entry is read-only (`0o555` dirs, no write bits), which
+    /// a plain `rm -rf` refuses; the sweep `heph tool gc` runs still removes it.
+    #[tokio::test]
+    async fn clear_stage_removes_a_read_only_entry() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let stage = tmp.path().join("stage");
+        let c = content("cafe", &[("d/e/f.txt", "x", false)]);
+        stage_and_link(
+            &c,
+            &stage,
+            "k",
+            &tmp.path().join("ws"),
+            None,
+            &[],
+            false,
+            &ct(),
+        )
+        .await
+        .expect("stage");
+        let entry = stage.join("k").join("cafe");
+        let mode = std::fs::metadata(entry.join("d/e"))
+            .expect("stat dir")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o222, 0, "the entry is read-only");
+        let (removed, _) = clear_stage(&stage);
+        assert_eq!(removed, 1);
+        assert!(!entry.exists());
+    }
+
     #[test]
     fn clear_stage_missing_root_is_noop() {
         let tmp = tempfile::tempdir().expect("tempdir");
