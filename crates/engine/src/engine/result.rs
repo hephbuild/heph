@@ -2527,13 +2527,24 @@ impl Engine {
                 None => hplugin::driver::Demand::default(),
             });
         }
-        if let Some((pool, _)) = resources
+        if let Some((pool, amount)) = resources
             .iter()
             .find(|(p, _)| !self.pools.is_pool(p.as_str()))
         {
+            // The entry to add, in the unit the amount is written in: a
+            // shorthand is a count, so `"8G"` needs `{unit: bytes, …}` spelled.
+            use hcore::capacity::Unit;
+            let declare = [Unit::Count, Unit::Bytes, Unit::Cpu]
+                .into_iter()
+                .find(|u| u.parse(amount).is_ok())
+                .filter(|u| *u != Unit::Count)
+                .map_or_else(
+                    || "<n>".to_string(),
+                    |u| format!("{{unit: {}, value: <n>}}", u.name()),
+                );
             anyhow::bail!(
-                "{addr} declares resources.{pool}, but {pool} is not a pool: add resources: {{{pool}: <n>}} to .hephconfig (known: {})",
-                self.pools.names().collect::<Vec<_>>().join(", ")
+                "{addr} declares resources.{pool}, but {}",
+                self.pools.unknown_hint(pool.as_str(), &declare)
             );
         }
         resources
@@ -2541,41 +2552,59 @@ impl Engine {
             .with_context(|| format!("{addr} declares resources"))
     }
 
-    /// Refuse a `${resource:<pool>}` in the target's config that names a pool
-    /// the engine has but the target does not reserve (`cpu` is always
-    /// reserved): there is no grant to substitute. A name that is no pool
-    /// passes, left as written at run. The run could not do better, and only
-    /// on a miss; here it fails on every path, a cache hit and `heph validate`
-    /// included. `refs` are the config's references
-    /// ([`deferred_refs`](Self::deferred_refs)), empty for almost every target.
-    pub(crate) fn validate_resource_refs(
+    /// Refuse a `${resource:<pool>}` that has no grant to substitute: one
+    /// whose name is pool-shaped (`[a-z][a-z0-9_]{0,63}`) but no configured
+    /// pool, with a "did you mean" hint, and one naming a pool the target does
+    /// not reserve (`cpu` is always reserved). A reference whose argument is
+    /// not pool-shaped (`${resource:CPU}`, bash's `${resource:-x}`) is not
+    /// heph's and passes untouched. The run could not do better, and only on
+    /// a miss; here it fails on every path, a cache hit and `heph validate`
+    /// included.
+    ///
+    /// `refs` are `(path, text)` pairs: the config's references
+    /// ([`deferred_refs`](Self::deferred_refs)) and the transitive env values
+    /// a dependency hands down, empty for almost every target.
+    pub(crate) fn validate_resource_refs<'a>(
         &self,
         addr: &Addr,
-        refs: &[crate::engine::deferred::DeferredRef],
+        refs: impl IntoIterator<Item = (&'a str, &'a str)>,
         demand: &hplugin::driver::Demand,
     ) -> anyhow::Result<()> {
-        for r in refs {
+        for (path, raw) in refs {
             // Already tokenized once by the collector; a parse failure here
-            // cannot happen, and would only skip the check.
-            let Ok(pieces) = hcore::template::parse(&r.raw) else {
+            // cannot happen for a config ref, and a transitive value that
+            // does not tokenize is no reference (`has_deferred_ref`).
+            let Ok(pieces) = hcore::template::parse(raw) else {
                 continue;
             };
-            let unreserved = pieces.iter().find_map(|p| match p {
-                hcore::template::Piece::Ref(t)
-                    if t.kind == Some(crate::engine::deferred::RESOURCE)
-                        && self.pools.is_pool(t.arg)
-                        && !demand.reserves(t.arg) =>
-                {
-                    Some(t.arg)
+            for p in &pieces {
+                let hcore::template::Piece::Ref(t) = p else {
+                    continue;
+                };
+                if !hcore::template::claims(t.kind, t.arg, &[crate::engine::deferred::RESOURCE]) {
+                    continue;
                 }
-                _ => None,
-            });
-            if let Some(pool) = unreserved {
-                anyhow::bail!(
-                    "{addr}: `{}` reads ${{resource:{pool}}}, but the target reserves no \
-                     {pool}: add resources = {{\"{pool}\": <amount>}} to it",
-                    r.path
-                );
+                let pool = t.arg;
+                if !self.pools.is_pool(pool) {
+                    anyhow::bail!(
+                        "{addr}: `{path}` reads ${{resource:{pool}}}, but {}",
+                        self.pools.unknown_hint(pool, "<n>")
+                    );
+                }
+                if !demand.reserves(pool) {
+                    let fix = if demand.declared(pool).is_some() {
+                        format!(
+                            "declares {pool}: 0, so it reserves none: declare an amount above 0"
+                        )
+                    } else {
+                        format!(
+                            "reserves no {pool}: add resources = {{\"{pool}\": <amount>}} to it"
+                        )
+                    };
+                    anyhow::bail!(
+                        "{addr}: `{path}` reads ${{resource:{pool}}}, but the target {fix}"
+                    );
+                }
             }
         }
         Ok(())
@@ -4499,8 +4528,12 @@ impl Engine {
         // cacheable target — and a transitive form that names a different one
         // is refused rather than believed.
         let parsed_entrypoint = def.entrypoint;
+        // `resources` likewise: what a target reserves is its config's, and a
+        // driver that rebuilds its def in `apply_transitive` (a cdylib across
+        // the ABI) must not drop the declaration or its lowered default.
         let mut def = match &all_transitive {
             Some(sb) if !sb.empty() => {
+                let parsed_resources = def.resources.clone();
                 let res = driver
                     .driver
                     .apply_transitive(
@@ -4524,6 +4557,7 @@ impl Engine {
                     ),
                     _ => transitive.entrypoint = parsed_entrypoint,
                 }
+                transitive.resources = parsed_resources;
                 transitive
             }
             _ => def,
@@ -4606,7 +4640,37 @@ impl Engine {
         // Same seam for `resources`: a pool the engine does not have fails at
         // definition time, on every path, and so in `heph validate`.
         def.demand = self.validate_resources(addr, &def.resources)?;
-        self.validate_resource_refs(addr, &deferred_refs, &def.demand)?;
+        self.validate_resource_refs(
+            addr,
+            deferred_refs
+                .iter()
+                .map(|r| (r.path.as_str(), r.raw.as_str())),
+            &def.demand,
+        )?;
+        // A dependency's transitive `env` is finished at run from *this*
+        // target's allotment, so it is held to this target's reservation too.
+        // The host's config walk never sees it; the merged sandbox does.
+        if let Some(sb) = &all_transitive {
+            let mut refs: Vec<(String, &str)> = sb
+                .env
+                .iter()
+                .filter_map(|(name, e)| match &e.value {
+                    hplugin::driver::sandbox::EnvValue::Literal(v)
+                        if hcore::template::has_deferred_ref(v) =>
+                    {
+                        Some((format!("transitive env.{name}"), v.as_str()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            // The env is a map: sort so the first refusal is deterministic.
+            refs.sort_unstable();
+            self.validate_resource_refs(
+                addr,
+                refs.iter().map(|(p, v)| (p.as_str(), *v)),
+                &def.demand,
+            )?;
+        }
 
         Ok(Arc::new(ExtendedTargetDef {
             target_def: Arc::new(def),

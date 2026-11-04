@@ -1898,6 +1898,7 @@ dependencies = [
  "smart-default",
  "sqlite",
  "stacker",
+ "strsim 0.11.1",
  "tar",
  "telemetry",
  "tempfile",

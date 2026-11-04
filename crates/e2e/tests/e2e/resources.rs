@@ -515,10 +515,26 @@ async fn custom_pool_allotment_renders() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The link error `get_def` of `addr` fails with, rendered as the CLI does.
+async fn link_error(engine: &Arc<Engine>, addr: &str) -> anyhow::Result<String> {
+    Arc::clone(engine)
+        .get_def(engine.new_state(), &parse_addr(addr)?)
+        .await
+        .err()
+        .map(|e| format!("{e:#}"))
+        .ok_or_else(|| anyhow::anyhow!("{addr}: must be refused at link"))
+}
+
+fn assert_has(err: &str, needles: &[&str]) {
+    for needle in needles {
+        assert!(err.contains(needle), "missing {needle:?} in {err}");
+    }
+}
+
 /// A `${resource:<pool>}` naming a pool the engine has but the target does
 /// not reserve is refused when the def is linked, naming the field and the
-/// fix; reserving it lets it through. A name that is no pool passes as
-/// written.
+/// fix; reserving it lets it through. Declaring 0 of it says so, rather than
+/// telling the author to add what they already wrote.
 #[tokio::test]
 async fn reference_to_an_unreserved_pool_is_refused_at_link() -> anyhow::Result<()> {
     let ws = tempfile::tempdir()?;
@@ -527,27 +543,65 @@ async fn reference_to_an_unreserved_pool_is_refused_at_link() -> anyhow::Result<
         "p",
         r#"
 target(name = "bad", driver = "bash", run = "echo $G > $OUT", out = "b.txt", env = {"G": "${resource:gpu}"})
+target(name = "zero", driver = "bash", run = "echo $G > $OUT", out = "z.txt", env = {"G": "${resource:gpu}"}, resources = {"gpu": 0})
 target(name = "ok", driver = "bash", run = "echo $G > $OUT", out = "o.txt", env = {"G": "${resource:gpu}"}, resources = {"gpu": 1})
-target(name = "other", driver = "bash", run = "echo \"$G\" > $OUT", out = "x.txt", env = {"G": "${resource:tpu}"})
 "#,
     );
     let engine = engine(ws.path(), caps(&[("cpu", MICROS), ("gpu", 1)]))?;
-    let err = Arc::clone(&engine)
-        .get_def(engine.new_state(), &parse_addr("//p:bad")?)
-        .await
-        .err()
-        .map(|e| format!("{e:#}"))
-        .unwrap_or_else(|| panic!("//p:bad: refused at link"));
-    for needle in [
-        "//p:bad",
-        "env.G",
-        "reserves no gpu",
-        r#"add resources = {"gpu": <amount>}"#,
-    ] {
-        assert!(err.contains(needle), "missing {needle:?} in {err}");
-    }
+    assert_has(
+        &link_error(&engine, "//p:bad").await?,
+        &[
+            "//p:bad",
+            "env.G",
+            "reserves no gpu",
+            r#"add resources = {"gpu": <amount>}"#,
+        ],
+    );
+    let zero = link_error(&engine, "//p:zero").await?;
+    assert_has(
+        &zero,
+        &["//p:zero", "declares gpu: 0", "declare an amount above 0"],
+    );
+    assert!(!zero.contains("add resources"), "{zero}");
     assert_eq!(output(&engine, "//p:ok").await?, "1");
-    assert_eq!(output(&engine, "//p:other").await?, "${resource:tpu}");
+    Ok(())
+}
+
+/// A pool-shaped name that is no configured pool is a link error with a
+/// "did you mean" when one is near, the two ways to declare it, and the
+/// known pools; a far name gets no guess.
+#[tokio::test]
+async fn reference_to_an_unconfigured_pool_is_refused_with_a_hint() -> anyhow::Result<()> {
+    let ws = tempfile::tempdir()?;
+    write_build(
+        ws.path(),
+        "p",
+        r#"
+target(name = "typo", driver = "bash", run = "echo $X > $OUT", out = "t.txt", env = {"X": "${resource:cpus}"})
+target(name = "gpus", driver = "bash", run = "echo ${resource:gpus} > $OUT", out = "g.txt", resources = {"gpu": 1})
+target(name = "far", driver = "bash", run = "echo $X > $OUT", out = "f.txt", env = {"X": "-j${resource:licence_server}"})
+"#,
+    );
+    let engine = engine(ws.path(), caps(&[("cpu", MICROS), ("gpu", 1)]))?;
+    assert_has(
+        &link_error(&engine, "//p:typo").await?,
+        &[
+            "//p:typo",
+            "env.X",
+            "${resource:cpus}",
+            "cpus is not a pool (did you mean cpu?)",
+            "add resources: {cpus: <n>} to .hephconfig",
+            "--resource cpus=<n>",
+            "(known: cpu, gpu, memory)",
+        ],
+    );
+    assert_has(
+        &link_error(&engine, "//p:gpus").await?,
+        &["//p:gpus", "run", "did you mean gpu?"],
+    );
+    let far = link_error(&engine, "//p:far").await?;
+    assert_has(&far, &["licence_server is not a pool:"]);
+    assert!(!far.contains("did you mean"), "{far}");
     Ok(())
 }
 
@@ -630,7 +684,7 @@ async fn first_then_second(
     Ok(execute_trace(&events))
 }
 
-const UNKNOWN_POOL: &str = "declares resources.docker, but docker is not a pool: add resources: {docker: <n>} to .hephconfig (known: cpu, memory)";
+const UNKNOWN_POOL: &str = "declares resources.docker, but docker is not a pool: add resources: {docker: <n>} to .hephconfig, or --resource docker=<n> for one run (known: cpu, memory)";
 
 #[tokio::test]
 async fn unknown_pool_is_a_def_time_error() -> anyhow::Result<()> {
@@ -895,7 +949,12 @@ target(name = "ok", driver = "bash", run = "echo $M > $OUT", out = "o.txt", env 
             .unwrap_or_else(|| panic!("{name}: refused at link"));
         let msg = format!("{err:#}");
         assert!(msg.contains(&format!("//p:{name}")), "{msg}");
-        assert!(msg.contains("reserves no memory"), "{msg}");
+        let why = if name == "zero" {
+            "declares memory: 0"
+        } else {
+            "reserves no memory"
+        };
+        assert!(msg.contains(why), "{msg}");
         assert!(msg.contains("env.M"), "{msg}");
     }
     assert_eq!(output(&engine, "//p:cpu_only").await?, "1");
@@ -959,7 +1018,7 @@ async fn validate_reports_an_unknown_pool() -> anyhow::Result<()> {
     let err = format!("{:#}", res.expect_err("validate reports it"));
     assert!(
         err.contains(
-            "//p:t declares resources.docker, but docker is not a pool: add resources: {docker: <n>} to .hephconfig (known: cpu, gpu, memory)"
+            "//p:t declares resources.docker, but docker is not a pool: add resources: {docker: <n>} to .hephconfig, or --resource docker=<n> for one run (known: cpu, gpu, memory)"
         ),
         "{err}"
     );
@@ -1282,22 +1341,188 @@ target(name = "c", driver = "bash", run = "echo $MAKEFLAGS > $OUT", out = "c.txt
     Ok(())
 }
 
-/// A name that is not exactly `cpu` or `memory` is not heph's: the text
-/// reaches the target's environment untouched, like any other `${…}` heph
-/// does not own — beside a real reference too.
+/// An argument that is not pool-shaped (`[a-z][a-z0-9_]{0,63}`) is not
+/// heph's: the text reaches the target's environment untouched, like any
+/// other `${…}` heph does not own — beside a real reference too.
 #[tokio::test]
-async fn unknown_resource_reference_passes_through() -> anyhow::Result<()> {
+async fn non_pool_shaped_resource_reference_passes_through() -> anyhow::Result<()> {
     let ws = tempfile::tempdir()?;
     write_build(
         ws.path(),
         "p",
-        r#"target(name = "t", driver = "bash", run = 'echo "$X" > $OUT', out = "t.txt", env = {"X": "${resource:nope} ${resource:-x} ${resource:cpu}"}, resources = {"cpu": 2})"#,
+        r#"target(name = "t", driver = "bash", run = 'echo "$X" > $OUT', out = "t.txt", env = {"X": "${resource:CPU} ${resource:-x} ${resource:1gpu} ${resource:cpu}"}, resources = {"cpu": 2})"#,
     );
     let engine = engine(ws.path(), caps(&[("cpu", 4 * MICROS)]))?;
     assert_eq!(
         output(&engine, "//p:t").await?,
-        "${resource:nope} ${resource:-x} 2"
+        "${resource:CPU} ${resource:-x} ${resource:1gpu} 2"
     );
+    Ok(())
+}
+
+/// A dependency's transitive `env` is finished from the *dependent's*
+/// allotment, so it is held to the dependent's reservation at link: a pool
+/// the dependent does not reserve, or one that is not configured, is the
+/// dependent's link error, never literal text at run.
+#[tokio::test]
+async fn transitive_env_reference_is_held_to_the_dependents_reservation() -> anyhow::Result<()> {
+    let ws = tempfile::tempdir()?;
+    write_build(
+        ws.path(),
+        "p",
+        r#"
+target(name = "tool", driver = "bash", run = "echo x > $OUT", out = "tool.txt",
+       transitive = {"env": {"G": "${resource:gpu}"}})
+target(name = "typo", driver = "bash", run = "echo x > $OUT", out = "typo.txt",
+       transitive = {"env": {"G": "${resource:gpus}"}})
+target(name = "bare", driver = "bash", run = "echo $G > $OUT", out = "b.txt", deps = ["//p:tool"])
+target(name = "held", driver = "bash", run = "echo $G > $OUT", out = "h.txt", deps = ["//p:tool"],
+       resources = {"gpu": 1})
+target(name = "typoed", driver = "bash", run = "echo $G > $OUT", out = "t.txt", deps = ["//p:typo"],
+       resources = {"gpu": 1})
+"#,
+    );
+    let engine = engine(ws.path(), caps(&[("cpu", 4 * MICROS), ("gpu", 2)]))?;
+    assert_has(
+        &link_error(&engine, "//p:bare").await?,
+        &["//p:bare", "transitive env.G", "reserves no gpu"],
+    );
+    assert_has(
+        &link_error(&engine, "//p:typoed").await?,
+        &[
+            "//p:typoed",
+            "transitive env.G",
+            "gpus is not a pool (did you mean gpu?)",
+        ],
+    );
+    assert_eq!(output(&engine, "//p:held").await?, "1");
+    Ok(())
+}
+
+/// Custom pools in other units: a `bytes` pool's amount is read as a size
+/// and rendered in bytes, a `cpu`-unit pool's fraction renders rounded up,
+/// and an amount its pool's unit refuses is a link error naming the target,
+/// the pool and the unit.
+#[tokio::test]
+async fn custom_pools_read_and_render_in_their_unit() -> anyhow::Result<()> {
+    let ws = tempfile::tempdir()?;
+    write_build(
+        ws.path(),
+        "p",
+        r#"
+target(name = "vram", driver = "bash", run = "echo $V > $OUT", out = "v.txt",
+       env = {"V": "${resource:vram}"}, resources = {"vram": "8G"})
+target(name = "slots", driver = "bash", run = "echo $S > $OUT", out = "s.txt",
+       env = {"S": "${resource:slots}"}, resources = {"slots": 0.5})
+target(name = "half_gpu", driver = "bash", run = "echo x > $OUT", out = "g.txt",
+       resources = {"gpu": 0.5})
+"#,
+    );
+    let mut pools = caps(&[("cpu", 4 * MICROS), ("gpu", 2)]);
+    for (name, unit, capacity) in [
+        ("vram", Unit::Bytes, 16u64 << 30),
+        ("slots", Unit::Cpu, 2 * MICROS),
+    ] {
+        pools.insert(
+            PoolName::try_from(name.to_string())?,
+            PoolSpec {
+                unit,
+                capacity: Some(Capacity::Amount(capacity)),
+            },
+        );
+    }
+    let engine = engine(ws.path(), pools)?;
+    assert_eq!(output(&engine, "//p:vram").await?, "8589934592");
+    assert_eq!(output(&engine, "//p:slots").await?, "1");
+    assert_has(
+        &link_error(&engine, "//p:half_gpu").await?,
+        &["//p:half_gpu", "resources.gpu", "count", "\"0.5\""],
+    );
+    Ok(())
+}
+
+/// What a target reserves is its parse's: a driver whose
+/// `apply_transitive` rebuilds the def without `resources` (as a cdylib
+/// across the ABI may) does not drop the declaration.
+#[tokio::test]
+async fn resources_survive_apply_transitive() -> anyhow::Result<()> {
+    struct DropsResources(pluginexec::Driver);
+    #[async_trait::async_trait]
+    impl heph::engine::driver_managed::ManagedDriver for DropsResources {
+        fn config(
+            &self,
+            _req: hplugin::driver::ConfigRequest,
+        ) -> anyhow::Result<hplugin::driver::ConfigResponse> {
+            Ok(hplugin::driver::ConfigResponse {
+                name: "drops".to_string(),
+            })
+        }
+        fn schema(&self) -> hplugin::driver::DriverSchema {
+            heph::engine::driver_managed::ManagedDriver::schema(&self.0)
+        }
+        async fn parse(
+            &self,
+            req: hplugin::driver::ParseRequest,
+            ctoken: &(dyn hcore::hasync::Cancellable + Send + Sync),
+        ) -> anyhow::Result<hplugin::driver::ParseResponse> {
+            heph::engine::driver_managed::ManagedDriver::parse(&self.0, req, ctoken).await
+        }
+        async fn apply_transitive(
+            &self,
+            req: hplugin::driver::ApplyTransitiveRequest,
+            ctoken: &(dyn hcore::hasync::Cancellable + Send + Sync),
+        ) -> anyhow::Result<hplugin::driver::ApplyTransitiveResponse> {
+            let mut res =
+                heph::engine::driver_managed::ManagedDriver::apply_transitive(&self.0, req, ctoken)
+                    .await?;
+            res.target_def.resources = Default::default();
+            Ok(res)
+        }
+        async fn run<'a, 'io>(
+            &self,
+            req: heph::engine::driver_managed::ManagedRunRequest<'a, 'io>,
+            ctoken: &(dyn hcore::hasync::Cancellable + Send + Sync),
+        ) -> anyhow::Result<heph::engine::driver_managed::ManagedRunResponse> {
+            heph::engine::driver_managed::ManagedDriver::run(&self.0, req, ctoken).await
+        }
+    }
+
+    let ws = tempfile::tempdir()?;
+    write_build(
+        ws.path(),
+        "p",
+        r#"
+target(name = "tool", driver = "drops", run = "echo x > $OUT", out = "tool.txt",
+       transitive = {"env": {"T": "t"}})
+target(name = "c", driver = "drops", run = "echo $G > $OUT", out = "c.txt", deps = ["//p:tool"],
+       env = {"G": "${resource:gpu}"}, resources = {"gpu": 2})
+"#,
+    );
+    let mut e = Engine::new(Config {
+        resources: caps(&[("cpu", 4 * MICROS), ("gpu", 2)]),
+        ..Config::for_tests(ws.path().to_path_buf())
+    })?;
+    let r = ws.path().to_path_buf();
+    e.register_provider(move |init| {
+        Box::new(pluginbuildfile::Provider::new(
+            r,
+            init.runtime.clone(),
+            Arc::clone(&init.functions),
+        ))
+    })?;
+    e.register_managed_driver(|_| {
+        Box::new(DropsResources(
+            pluginexec::Driver::new_bash().with_host_path(),
+        ))
+    })?;
+    let engine = Arc::new(e);
+    engine.install_exec_runner_host();
+    let def = Arc::clone(&engine)
+        .get_def(engine.new_state(), &parse_addr("//p:c")?)
+        .await?;
+    assert_eq!(def.target_def.resources.declared("gpu"), Some("2"));
+    assert_eq!(def.target_def.demand.declared("gpu"), Some(2));
+    assert_eq!(output(&engine, "//p:c").await?, "2");
     Ok(())
 }
 

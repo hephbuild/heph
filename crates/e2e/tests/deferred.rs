@@ -316,7 +316,8 @@ async fn a_reference_in_template_vars_renders_the_producers_bytes() -> anyhow::R
 
 /// `${resource:…}` is substituted in any deferrable field, a `template` var
 /// included: the rendered file holds the run's allotment (the default 1 cpu).
-/// An unknown name there is not heph's and renders as written.
+/// A name that is not pool-shaped there is not heph's and renders as
+/// written; a pool-shaped one that is no pool is refused, as in any field.
 #[tokio::test]
 async fn a_resource_reference_in_template_vars_renders() -> anyhow::Result<()> {
     let ws = Workspace::new();
@@ -327,6 +328,8 @@ async fn a_resource_reference_in_template_vars_renders() -> anyhow::Result<()> {
 target(name = "conf", driver = "template", src = file("conf.j2"), out = "conf",
        vars = {"jobs": "${resource:cpu}"})
 target(name = "other", driver = "template", src = file("conf.j2"), out = "other",
+       vars = {"jobs": "${resource:CPU}"})
+target(name = "typo", driver = "template", src = file("conf.j2"), out = "typo",
        vars = {"jobs": "${resource:cpus}"})
 "#,
     );
@@ -336,7 +339,20 @@ target(name = "other", driver = "template", src = file("conf.j2"), out = "other"
     );
     assert_eq!(
         common::artifact_string(&*ws.run("//app:other").await?),
-        "jobs: ${resource:cpus}\n"
+        "jobs: ${resource:CPU}\n"
+    );
+    let err = format!(
+        "{:#}",
+        ws.run("//app:typo")
+            .await
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("refused"))?
+    );
+    assert!(
+        err.contains(
+            "`vars.jobs` reads ${resource:cpus}, but cpus is not a pool (did you mean cpu?)"
+        ),
+        "{err}"
     );
     Ok(())
 }
