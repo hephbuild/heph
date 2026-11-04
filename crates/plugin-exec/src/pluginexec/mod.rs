@@ -111,6 +111,13 @@ struct TargetDef {
     /// `String` map.
     pub env: BTreeMap<String, hplugin::driver::Deferred<String>>,
     pub pass_env: BTreeMap<String, String>,
+    /// A dependency's hashed transitive `env` literal that carries a
+    /// `${resource:…}`: the `pass_env` layer at run (a plain literal goes to
+    /// `pass_env` itself), but deferred, because the number is the run's. A name
+    /// is in at most one of the two. Hashed as text, and only when non-empty, so
+    /// a def without one hashes as before the field existed.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub transitive_env: BTreeMap<String, hplugin::driver::Deferred<String>>,
     pub runtime_pass_env: Vec<String>,
     pub runtime_env: HashMap<String, hplugin::driver::Deferred<String>>,
     /// Exec runner for this target, already resolved (per-target field, then
@@ -145,6 +152,10 @@ impl Hash for TargetDef {
         self.support_files.hash(state);
         self.env.hash(state);
         self.pass_env.hash(state);
+        if !self.transitive_env.is_empty() {
+            "transitive_env".hash(state);
+            self.transitive_env.hash(state);
+        }
         // runtime_pass_env and runtime_env intentionally excluded
         // Only when set: a target without the flag hashes exactly as before
         // the flag existed. With it, `run` and `env` above plus these.
@@ -865,6 +876,13 @@ impl Driver {
     }
 }
 
+/// `HEPH_CPUS` / `HEPH_MEMORY_BYTES`: set at run from the run's allotment over
+/// any passthrough, so a hashed passthrough must not snapshot them.
+fn is_allotment_env(name: &str) -> bool {
+    name == hplugin::driver::Allotment::CPUS_ENV
+        || name == hplugin::driver::Allotment::MEMORY_BYTES_ENV
+}
+
 fn spec_path_to_target_path(
     raw: &str,
     pkg: &hmodel::htpkg::PkgBuf,
@@ -1555,11 +1573,17 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
         // `"*"` is a wildcard: pass through every host env var. Snapshotted at
         // parse time and hashed like any other pass_env (so the input hash
         // captures the whole environment — only use it on uncached targets).
+        // The allotment names are left out: the run overwrites them with this
+        // run's own allotment, so an inherited value (a nested heph's parent's)
+        // would be hashed and then never seen.
         let pass_env: BTreeMap<String, String> = if spec.pass_env.iter().any(|n| n == "*") {
-            std::env::vars().collect()
+            std::env::vars()
+                .filter(|(name, _)| !is_allotment_env(name))
+                .collect()
         } else {
             spec.pass_env
                 .into_iter()
+                .filter(|name| !is_allotment_env(name))
                 .filter_map(|name| std::env::var(&name).ok().map(|val| (name, val)))
                 .collect()
         };
@@ -1651,6 +1675,7 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
             support_files: support_files.clone(),
             env: spec.env.into_iter().collect(),
             pass_env,
+            transitive_env: BTreeMap::new(),
             runtime_pass_env: spec.runtime_pass_env,
             runtime_env: spec.runtime_env,
             runner: runner.clone(),
@@ -1736,7 +1761,12 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
                 EnvValue::Pass if is_entrypoint => {}
                 EnvValue::Pass => {
                     if env.hash {
-                        if let Ok(value) = std::env::var(&name) {
+                        // Not the allotment names: the run overwrites them, so
+                        // a snapshot would be hashed and never seen.
+                        if !is_allotment_env(&name)
+                            && let Ok(value) = std::env::var(&name)
+                        {
+                            xdef.transitive_env.remove(&name);
                             xdef.pass_env.insert(name, value);
                         }
                     } else {
@@ -1746,11 +1776,15 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
                 // `${resource:…}` needs no edge, so it may ride a transitive
                 // value: kept as text (the def hash covers the reference, never
                 // the number) in a deferred map, and finished by `resolve` at run
-                // from the *dependent's* allotment.
+                // from the *dependent's* allotment. Hashed, it goes to
+                // `transitive_env`, which the run layers exactly where
+                // `pass_env` is — so a transitive literal has one precedence
+                // whether or not its value carries a reference.
                 EnvValue::Literal(v) if hcore::template::only_resource_refs(&v) => {
                     let d = hplugin::driver::Deferred::new(v);
                     if env.hash {
-                        xdef.env.insert(name, d);
+                        xdef.pass_env.remove(&name);
+                        xdef.transitive_env.insert(name, d);
                     } else {
                         xdef.runtime_env.insert(name, d);
                     }
@@ -1763,6 +1797,7 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
                     hplugin::htspec::reject_deferred_reference(&v)
                         .with_context(|| format!("transitive `env.{name}`"))?;
                     if env.hash {
+                        xdef.transitive_env.remove(&name);
                         xdef.pass_env.insert(name, v);
                     } else {
                         xdef.runtime_env
@@ -2145,6 +2180,11 @@ impl Driver {
         };
 
         env.extend(def.pass_env.iter().map(|(k, v)| (k.clone(), v.clone())));
+        // The same layer as `pass_env`: a transitive literal's precedence does
+        // not depend on whether its value names a resource.
+        for (k, v) in &def.transitive_env {
+            env.insert(k.clone(), rreq.resolve(v)?.to_string());
+        }
 
         // `"*"` passes through every host env var at run time (not hashed).
         if def.runtime_pass_env.iter().any(|n| n == "*") {
@@ -2162,7 +2202,9 @@ impl Driver {
         // scratch dirs, never hashed (U5) — a target's outputs must not depend
         // on it. After the passthroughs, so a nested heph run under
         // `pass_env`/`runtime_pass_env = ["*"]` sees its own allotment rather
-        // than its parent's; but the target's own `env` and `runtime_env` win,
+        // than its parent's (and the hashed passthroughs never snapshot the two
+        // names at parse — `is_allotment_env` — so the key covers no value
+        // this overwrites); but the target's own `env` and `runtime_env` win,
         // as an author who sets the name means it. `env` was inserted above,
         // before the passthroughs, so it is skipped by name here rather than
         // moved, which would change what a passthrough overrides today.
@@ -4275,9 +4317,7 @@ mod tests {
     /// the child's own allotment.
     #[tokio::test]
     async fn wildcard_pass_env_does_not_override_the_allotment() -> anyhow::Result<()> {
-        unsafe {
-            std::env::set_var("HEPH_CPUS", "99");
-        }
+        let _cpus = EnvGuard::set("HEPH_CPUS", "99");
         let show = "echo cpus=$HEPH_CPUS";
         let runtime = TargetDef {
             run: vec![D::new(show)],
@@ -6461,6 +6501,149 @@ bash apply_transitive: 26a90abee4625d43
                 "hash={hash}: {msg}"
             );
         }
+        Ok(())
+    }
+
+    fn tr_sandbox(vars: &[(&str, EnvValue, bool)]) -> hplugin::driver::sandbox::Sandbox {
+        let mut sandbox = hplugin::driver::sandbox::Sandbox::default();
+        for (name, value, hash) in vars {
+            sandbox.env.insert(
+                name.to_string(),
+                hplugin::driver::sandbox::Env {
+                    value: value.clone(),
+                    hash: *hash,
+                    append: false,
+                    append_prefix: String::new(),
+                },
+            );
+        }
+        sandbox
+    }
+
+    /// A transitive literal follows the target's own `env`: an exact
+    /// `${resource:cpu}` is deferred, any other `${resource:…}` is somebody
+    /// else's text and is kept verbatim, hashed or not.
+    #[tokio::test]
+    async fn a_transitive_resource_reference_is_read_like_an_own_env_value() -> anyhow::Result<()> {
+        for hash in [true, false] {
+            let lit = |s: &str| EnvValue::Literal(s.to_string());
+            let sandbox = tr_sandbox(&[
+                ("REF", lit("-j${resource:cpu}"), hash),
+                ("TYPO", lit("${resource:cpus} ${resource:-x}"), hash),
+            ]);
+            let def = parse_and_apply_transitive(&Driver::new_exec(), sandbox).await?;
+            let mut xdef = def.def::<TargetDef>().clone();
+            xdef.run = vec![D::new("echo \"$REF|$TYPO\"")];
+            assert_eq!(
+                run_allotted(xdef, allot(3, None)).await?,
+                "-j3|${resource:cpus} ${resource:-x}",
+                "hash={hash}"
+            );
+        }
+        Ok(())
+    }
+
+    /// A hashed transitive literal has one precedence whether or not its value
+    /// names a resource: the `pass_env` layer — over the target's own `env`,
+    /// under the allotment.
+    #[tokio::test]
+    async fn a_transitive_literal_has_one_precedence_with_or_without_a_reference()
+    -> anyhow::Result<()> {
+        for (value, want) in [("plain", "plain"), ("-j${resource:cpu}", "-j2")] {
+            let sandbox = tr_sandbox(&[
+                ("X", EnvValue::Literal(value.to_string()), true),
+                ("HEPH_CPUS", EnvValue::Literal(value.to_string()), true),
+            ]);
+            let def = parse_and_apply_transitive(&Driver::new_exec(), sandbox).await?;
+            let mut xdef = def.def::<TargetDef>().clone();
+            xdef.env.insert("X".to_string(), D::new("own"));
+            xdef.run = vec![D::new("echo \"$X|$HEPH_CPUS\"")];
+            assert_eq!(
+                run_allotted(xdef, allot(2, None)).await?,
+                format!("{want}|2"),
+                "{value}"
+            );
+        }
+        // The later declaration of a name wins, across the two maps.
+        let mut xdef = TargetDef::default();
+        xdef.pass_env.insert("X".to_string(), "plain".to_string());
+        let def = EngineTargetDef {
+            raw_def: Arc::new(xdef),
+            ..Default::default()
+        };
+        let out = Driver::new_exec()
+            .apply_transitive(
+                ApplyTransitiveRequest {
+                    request_id: "test".to_string(),
+                    target_def: def,
+                    sandbox: tr_sandbox(&[(
+                        "X",
+                        EnvValue::Literal("${resource:cpu}".to_string()),
+                        true,
+                    )]),
+                },
+                &StdCancellationToken::new(),
+            )
+            .await?
+            .target_def;
+        let xdef = out.def::<TargetDef>();
+        assert!(!xdef.pass_env.contains_key("X"));
+        assert!(xdef.transitive_env.contains_key("X"));
+        Ok(())
+    }
+
+    /// Sets an env var for the guard's life and puts the old value back.
+    struct EnvGuard(&'static str, Option<String>);
+    impl EnvGuard {
+        fn set(name: &'static str, value: &str) -> Self {
+            let old = std::env::var(name).ok();
+            unsafe {
+                std::env::set_var(name, value);
+            }
+            Self(name, old)
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.1 {
+                Some(v) => unsafe { std::env::set_var(self.0, v) },
+                None => unsafe { std::env::remove_var(self.0) },
+            }
+        }
+    }
+
+    /// A hashed passthrough never snapshots `HEPH_CPUS`/`HEPH_MEMORY_BYTES`:
+    /// the run overwrites them with its own allotment, so the key would cover
+    /// an inherited value (a nested heph's parent's) no process ever sees.
+    #[tokio::test]
+    async fn hashed_passthroughs_do_not_snapshot_the_allotment_names() -> anyhow::Result<()> {
+        let _cpus = EnvGuard::set("HEPH_CPUS", "99");
+        let _mem = EnvGuard::set("HEPH_MEMORY_BYTES", "123");
+        let names = |v: &[&str]| {
+            hcore::htvalue::Value::List(
+                v.iter()
+                    .map(|s| hcore::htvalue::Value::String(s.to_string()))
+                    .collect(),
+            )
+        };
+        for pass in [names(&["*"]), names(&["HEPH_CPUS", "HEPH_MEMORY_BYTES"])] {
+            let def = parse_with_driver(
+                &Driver::new_exec(),
+                HashMap::from([("pass_env".to_string(), pass)]),
+            )
+            .await?;
+            let xdef = def.def::<TargetDef>();
+            assert!(!xdef.pass_env.contains_key("HEPH_CPUS"));
+            assert!(!xdef.pass_env.contains_key("HEPH_MEMORY_BYTES"));
+        }
+        let sandbox = tr_sandbox(&[
+            ("HEPH_CPUS", EnvValue::Pass, true),
+            ("HEPH_MEMORY_BYTES", EnvValue::Pass, true),
+        ]);
+        let def = parse_and_apply_transitive(&Driver::new_exec(), sandbox).await?;
+        let xdef = def.def::<TargetDef>();
+        assert!(!xdef.pass_env.contains_key("HEPH_CPUS"));
+        assert!(!xdef.pass_env.contains_key("HEPH_MEMORY_BYTES"));
         Ok(())
     }
 
