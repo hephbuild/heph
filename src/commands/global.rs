@@ -176,7 +176,7 @@ pub struct GlobalOptions {
     /// declares (one CPU unless it says otherwise), and targets wait until
     /// their reservation fits. The same as `--resource cpu=<N>`; giving both
     /// is an error. Default: the config's `resources.cpu`, else the
-    /// engine's parallelism.
+    /// engine's parallelism. The model is in `docs/RESOURCES.md`.
     #[arg(
         short = 'j',
         long = "jobs",
@@ -191,7 +191,7 @@ pub struct GlobalOptions {
     /// `cpu` and `memory` also take a percentage of their default
     /// (`memory=75%`). At least 1. Overrides `HEPH_RESOURCE_<NAME>`, which
     /// overrides `resources.<name>` in `.hephconfig`. A pool may be given
-    /// once per command line.
+    /// once per command line. See `docs/RESOURCES.md`.
     #[arg(
         long = "resource",
         value_name = "NAME=N",
