@@ -1352,19 +1352,25 @@ pub fn credential_mount_from_pb(
     })
 }
 
-/// The declared pools, plus a driver-lowered `cpu` default
-/// ([`Resources::with_default_cpu`]) as a declared `cpu`: the wire has no field
-/// for the default, and dropping it would admit the target at one CPU. A
-/// declaration already at [`Resources::MAX_POOLS`] has no room for it and
-/// keeps the engine's default, since the decoder refuses a 17th pool.
-fn resources_to_pb(r: &Resources) -> buffa::__private::HashMap<String, u64> {
+/// The declared pools as written, plus a driver-lowered `cpu` default
+/// ([`Resources::with_default_cpu`]) as a declared `cpu` in the `cpu` unit's
+/// exact text: the wire has no field for the default, and dropping it would
+/// admit the target at one CPU. A declaration already at
+/// [`Resources::MAX_POOLS`] has no room for it and keeps the engine's default,
+/// since the decoder refuses a 17th pool.
+fn resources_to_pb(r: &Resources) -> buffa::__private::HashMap<String, String> {
     let lowered = (r.declared(hplugin::provider::PoolName::CPU).is_none()
         && r.len() < Resources::MAX_POOLS)
         .then(|| r.lowered_default_cpu())
         .flatten()
-        .map(|n| (hplugin::provider::PoolName::CPU.to_owned(), n));
+        .map(|n| {
+            (
+                hplugin::provider::PoolName::CPU.to_owned(),
+                hcore::capacity::Unit::Cpu.canonical(n),
+            )
+        });
     r.iter()
-        .map(|(pool, n)| (pool.to_string(), n))
+        .map(|(pool, n)| (pool.to_string(), n.to_owned()))
         .chain(lowered)
         .collect()
 }
@@ -1387,26 +1393,31 @@ pub fn target_def_to_pb(td: &TargetDef) -> anyhow::Result<pb::TargetDef> {
     })
 }
 
-/// The wire form of a run's allotment (since 0.17.4).
-pub fn allotment_to_pb(a: &Allotment) -> pb::Allotment {
-    pb::Allotment {
-        cpu: Some(a.cpu.get()),
-        memory_bytes: a.memory_bytes,
-        ..Default::default()
-    }
+/// The wire form of a run's allotment (since 0.17.4): pool name to rendered
+/// amount.
+pub fn allotment_to_pb(a: &Allotment) -> buffa::__private::HashMap<String, String> {
+    a.iter()
+        .map(|(pool, amount)| (pool.to_owned(), amount.to_owned()))
+        .collect()
 }
 
-/// Absent — what every host before 0.17.4 sends — is "told nothing". A
-/// present message must carry a non-zero `cpu`: one that says nothing about
-/// cpu is a malformed sender, not a default.
-pub fn allotment_from_pb(a: Option<pb::Allotment>) -> anyhow::Result<Option<Allotment>> {
-    let Some(a) = a else { return Ok(None) };
-    let cpu = std::num::NonZeroU32::new(required(a.cpu, "Allotment.cpu")?)
-        .context("field Allotment.cpu is 0; an allotment is at least one CPU")?;
-    Ok(Some(Allotment {
-        cpu,
-        memory_bytes: a.memory_bytes,
-    }))
+/// Empty — what every host before 0.17.4 sends — is "told nothing". A
+/// non-empty map must name `cpu`, which every allotment carries, and only
+/// pool names: anything else is a malformed sender, not a default.
+pub fn allotment_from_pb(
+    a: buffa::__private::HashMap<String, String>,
+) -> anyhow::Result<Option<Allotment>> {
+    if a.is_empty() {
+        return Ok(None);
+    }
+    if !a.contains_key(hplugin::provider::PoolName::CPU) {
+        anyhow::bail!("field ManagedRunRequest.allotment has no `cpu`; every allotment names it");
+    }
+    for pool in a.keys() {
+        hplugin::provider::PoolName::try_from(pool.as_str())
+            .context("decoding ManagedRunRequest.allotment")?;
+    }
+    Ok(Some(Allotment::new(a)))
 }
 
 fn entrypoint_to_pb(e: &Entrypoint) -> pb::Entrypoint {
@@ -1765,6 +1776,8 @@ pub fn target_def_from_pb(td: pb::TargetDef) -> anyhow::Result<TargetDef> {
             // def says nothing and reserves the defaults.
             resources: Resources::try_from_pairs(td.resources)
                 .context("decoding TargetDef.resources")?,
+            // The engine parses `resources` into this when it links the def.
+            demand: Default::default(),
             addr: addr.clone(),
         })
     })();
@@ -3297,20 +3310,24 @@ nested: { a: 1, b: [x, y] }
     #[test]
     fn target_def_resources_round_trip() {
         let mut td = full_target_def();
-        for (pool, n) in [("cpu", 2_500_000), ("memory", 4 << 30), ("docker", 1)] {
+        for (pool, n) in [("cpu", "2.5"), ("memory", "4G"), ("docker", "1")] {
             td.resources
-                .insert(hplugin::provider::PoolName::try_from(pool).unwrap(), n)
+                .insert(
+                    hplugin::provider::PoolName::try_from(pool).unwrap(),
+                    n.to_owned(),
+                )
                 .unwrap();
         }
         let wire = target_def_to_pb(&td).expect("encode");
         assert_eq!(wire.resources.len(), 3);
         let back = target_def_from_pb(via_bytes(&wire)).expect("decode");
         assert_eq!(back.resources, td.resources);
-        assert_eq!(back.resources.amount("cpu"), 2_500_000);
+        assert_eq!(back.resources.declared("memory"), Some("4G"), "as written");
 
         // A pool name the parser would refuse is refused on the wire too.
         let mut wire = full_target_def_pb();
-        wire.resources.insert("Not A Pool".to_string(), 1);
+        wire.resources
+            .insert("Not A Pool".to_string(), "1".to_owned());
         let err = target_def_from_pb(via_bytes(&wire))
             .err()
             .expect("bad pool name is refused");
@@ -3329,20 +3346,24 @@ nested: { a: 1, b: [x, y] }
         assert!(td.resources.is_empty());
         let back =
             target_def_from_pb(via_bytes(&target_def_to_pb(&td).expect("encode"))).expect("decode");
+        // Written exactly in the `cpu` unit, so the host parses it back to
+        // the same micro-CPUs.
+        assert_eq!(back.resources.declared("cpu"), Some("0.00001"));
+        let unit = |_: &str| Some(hcore::capacity::Unit::Cpu);
         assert_eq!(
-            back.resources.declared("cpu"),
-            Some(Resources::VIEW_CPU_MICROS)
+            back.resources.parse(unit).expect("parse").amount("cpu"),
+            Resources::VIEW_CPU_MICROS
         );
 
         // A declared `cpu` wins over the default on the wire too.
         let mut declared = Resources::default();
         declared
-            .insert(hplugin::provider::PoolName::cpu(), 3)
+            .insert(hplugin::provider::PoolName::cpu(), "3".to_owned())
             .unwrap();
         td.resources = declared.with_default_cpu(Resources::VIEW_CPU_MICROS);
         let back =
             target_def_from_pb(via_bytes(&target_def_to_pb(&td).expect("encode"))).expect("decode");
-        assert_eq!(back.resources.declared("cpu"), Some(3));
+        assert_eq!(back.resources.declared("cpu"), Some("3"));
     }
 
     #[test]
@@ -3351,7 +3372,7 @@ nested: { a: 1, b: [x, y] }
         assert!(wire.resources.is_empty(), "nothing declared, nothing sent");
         let back = target_def_from_pb(via_bytes(&wire)).expect("decode");
         assert!(back.resources.is_empty());
-        assert_eq!(back.resources.amount("cpu"), Resources::DEFAULT_CPU_MICROS);
+        assert_eq!(back.resources.default_cpu(), Resources::DEFAULT_CPU_MICROS);
     }
 
     /// The bytes a 0.17.3 plugin sends for a minimal def (addr, raw_def, cache,
@@ -3371,35 +3392,39 @@ nested: { a: 1, b: [x, y] }
         assert_eq!(back.addr, addr("//p", "t"));
         assert_eq!(back.hash, vec![0xab, 0xcd]);
         assert!(back.resources.is_empty());
-        assert_eq!(back.resources.amount("cpu"), Resources::DEFAULT_CPU_MICROS);
+        assert_eq!(back.resources.default_cpu(), Resources::DEFAULT_CPU_MICROS);
     }
 
     #[test]
     fn managed_run_request_allotment_round_trip() {
+        let pairs = |p: &[(&str, &str)]| {
+            Allotment::new(p.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())))
+        };
         for a in [
-            Allotment::from_granted(3_000_000, None),
-            Allotment::from_granted(1, Some(4 << 30)),
+            pairs(&[("cpu", "3")]),
+            pairs(&[("cpu", "1"), ("memory", "4294967296"), ("gpu", "2")]),
         ] {
             let wire = pb::ManagedRunRequest {
-                allotment: Some(allotment_to_pb(&a)).into(),
+                allotment: allotment_to_pb(&a),
                 ..Default::default()
             };
             let back = via_bytes(&wire);
-            assert_eq!(
-                allotment_from_pb(back.allotment.into_option()).expect("decode"),
-                Some(a)
-            );
+            assert_eq!(allotment_from_pb(back.allotment).expect("decode"), Some(a));
         }
 
-        // A present allotment with no cpu, or cpu 0, is a malformed sender.
-        for cpu in [None, Some(0)] {
-            let wire = pb::Allotment {
-                cpu,
+        // A non-empty allotment with no cpu, or a key that is no pool name, is
+        // a malformed sender.
+        for bad in [
+            pairs(&[("gpu", "1")]),
+            pairs(&[("cpu", "1"), ("Not A Pool", "1")]),
+        ] {
+            let wire = pb::ManagedRunRequest {
+                allotment: allotment_to_pb(&bad),
                 ..Default::default()
             };
             assert!(
-                allotment_from_pb(Some(via_bytes(&wire))).is_err(),
-                "{cpu:?}"
+                allotment_from_pb(via_bytes(&wire).allotment).is_err(),
+                "{bad:?}"
             );
         }
     }
@@ -3407,11 +3432,8 @@ nested: { a: 1, b: [x, y] }
     #[test]
     fn absent_allotment_decodes_to_none() {
         let back = via_bytes(&pb::ManagedRunRequest::default());
-        assert!(back.allotment.is_unset());
-        assert_eq!(
-            allotment_from_pb(back.allotment.into_option()).expect("decode"),
-            None
-        );
+        assert!(back.allotment.is_empty());
+        assert_eq!(allotment_from_pb(back.allotment).expect("decode"), None);
     }
 
     /// buffa's default decode budget (32 MiB of elements, charged at their

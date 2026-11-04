@@ -2501,19 +2501,25 @@ impl Engine {
         }
     }
 
-    /// Refuse a def that reserves from a pool the engine does not have. Called
-    /// from `get_def_inner` beside [`validate_approval`](Self::validate_approval).
-    /// A pool at capacity 0 exists (a run sets it), so it passes here and fails
-    /// only at admission.
+    /// Parse the def's `resources` against the engine's pools into the
+    /// [`Demand`](hplugin::driver::Demand) admission reads: every declared pool
+    /// must be one the engine has, and each amount is parsed in its pool's
+    /// unit. Called from `get_def_inner` beside
+    /// [`validate_approval`](Self::validate_approval), so a bad declaration
+    /// fails at definition time, on every path. A pool at capacity 0 exists (a
+    /// run sets it), so it passes here and fails only at admission.
     pub(crate) fn validate_resources(
         &self,
         addr: &Addr,
         resources: &hplugin::driver::Resources,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<hplugin::driver::Demand> {
         // Nearly every def declares nothing (an `fs`/`group` default is not a
-        // declaration); the warm path pays one branch.
+        // declaration); the warm path pays one branch and no allocation.
         if resources.is_empty() {
-            return Ok(());
+            return Ok(match resources.lowered_default_cpu() {
+                Some(micros) => hplugin::driver::Demand::default().with_default_cpu(micros),
+                None => hplugin::driver::Demand::default(),
+            });
         }
         if let Some((pool, _)) = resources
             .iter()
@@ -2524,38 +2530,47 @@ impl Engine {
                 self.pools.names().collect::<Vec<_>>().join(", ")
             );
         }
-        Ok(())
+        resources
+            .parse(|pool| self.pools.unit(pool))
+            .with_context(|| format!("{addr} declares resources"))
     }
 
-    /// Refuse a `${resource:memory}` in the target's config when it declares
-    /// no memory above 0: there is no grant to substitute. The run would fail
-    /// the same way, but only on a miss; here it fails on every path, a cache
-    /// hit and `heph validate` included. `refs` are the config's references
+    /// Refuse a `${resource:<pool>}` in the target's config that names a pool
+    /// the engine has but the target does not reserve (`cpu` is always
+    /// reserved): there is no grant to substitute. A name that is no pool
+    /// passes, left as written at run. The run could not do better, and only
+    /// on a miss; here it fails on every path, a cache hit and `heph validate`
+    /// included. `refs` are the config's references
     /// ([`deferred_refs`](Self::deferred_refs)), empty for almost every target.
     pub(crate) fn validate_resource_refs(
+        &self,
         addr: &Addr,
         refs: &[crate::engine::deferred::DeferredRef],
-        resources: &hplugin::driver::Resources,
+        demand: &hplugin::driver::Demand,
     ) -> anyhow::Result<()> {
-        use hplugin::provider::PoolName;
-        if refs.is_empty() || resources.declared(PoolName::MEMORY).is_some_and(|m| m > 0) {
-            return Ok(());
-        }
-        let names_memory = |raw: &str| {
-            hcore::template::parse(raw).is_ok_and(|pieces| {
-                pieces.iter().any(|p| {
-                    matches!(p, hcore::template::Piece::Ref(r)
-                        if r.kind == Some(crate::engine::deferred::RESOURCE)
-                            && r.arg == PoolName::MEMORY)
-                })
-            })
-        };
-        if let Some(r) = refs.iter().find(|r| names_memory(&r.raw)) {
-            anyhow::bail!(
-                "{addr}: `{}` reads ${{resource:memory}}, but the target declares no memory: \
-                 add resources = {{\"memory\": \"<size>\"}} to it",
-                r.path
-            );
+        for r in refs {
+            // Already tokenized once by the collector; a parse failure here
+            // cannot happen, and would only skip the check.
+            let Ok(pieces) = hcore::template::parse(&r.raw) else {
+                continue;
+            };
+            let unreserved = pieces.iter().find_map(|p| match p {
+                hcore::template::Piece::Ref(t)
+                    if t.kind == Some(crate::engine::deferred::RESOURCE)
+                        && self.pools.is_pool(t.arg)
+                        && !demand.reserves(t.arg) =>
+                {
+                    Some(t.arg)
+                }
+                _ => None,
+            });
+            if let Some(pool) = unreserved {
+                anyhow::bail!(
+                    "{addr}: `{}` reads ${{resource:{pool}}}, but the target reserves no \
+                     {pool}: add resources = {{\"{pool}\": <amount>}} to it",
+                    r.path
+                );
+            }
         }
         Ok(())
     }
@@ -4584,8 +4599,8 @@ impl Engine {
             .with_context(|| "approval")?;
         // Same seam for `resources`: a pool the engine does not have fails at
         // definition time, on every path, and so in `heph validate`.
-        self.validate_resources(addr, &def.resources)?;
-        Self::validate_resource_refs(addr, &deferred_refs, &def.resources)?;
+        def.demand = self.validate_resources(addr, &def.resources)?;
+        self.validate_resource_refs(addr, &deferred_refs, &def.demand)?;
 
         Ok(Arc::new(ExtendedTargetDef {
             target_def: Arc::new(def),

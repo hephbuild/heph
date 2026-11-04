@@ -876,13 +876,6 @@ impl Driver {
     }
 }
 
-/// `HEPH_CPUS` / `HEPH_MEMORY_BYTES`: set at run from the run's allotment over
-/// any passthrough, so a hashed passthrough must not snapshot them.
-fn is_allotment_env(name: &str) -> bool {
-    name == hplugin::driver::Allotment::CPUS_ENV
-        || name == hplugin::driver::Allotment::MEMORY_BYTES_ENV
-}
-
 fn spec_path_to_target_path(
     raw: &str,
     pkg: &hmodel::htpkg::PkgBuf,
@@ -1573,17 +1566,11 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
         // `"*"` is a wildcard: pass through every host env var. Snapshotted at
         // parse time and hashed like any other pass_env (so the input hash
         // captures the whole environment — only use it on uncached targets).
-        // The allotment names are left out: the run overwrites them with this
-        // run's own allotment, so an inherited value (a nested heph's parent's)
-        // would be hashed and then never seen.
         let pass_env: BTreeMap<String, String> = if spec.pass_env.iter().any(|n| n == "*") {
-            std::env::vars()
-                .filter(|(name, _)| !is_allotment_env(name))
-                .collect()
+            std::env::vars().collect()
         } else {
             spec.pass_env
                 .into_iter()
-                .filter(|name| !is_allotment_env(name))
                 .filter_map(|name| std::env::var(&name).ok().map(|val| (name, val)))
                 .collect()
         };
@@ -1761,11 +1748,7 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
                 EnvValue::Pass if is_entrypoint => {}
                 EnvValue::Pass => {
                     if env.hash {
-                        // Not the allotment names: the run overwrites them, so
-                        // a snapshot would be hashed and never seen.
-                        if !is_allotment_env(&name)
-                            && let Ok(value) = std::env::var(&name)
-                        {
+                        if let Ok(value) = std::env::var(&name) {
                             xdef.transitive_env.remove(&name);
                             xdef.pass_env.insert(name, value);
                         }
@@ -2193,25 +2176,6 @@ impl Driver {
             for name in &def.runtime_pass_env {
                 if let Ok(value) = std::env::var(name) {
                     env.insert(name.clone(), value);
-                }
-            }
-        }
-
-        // The allotment (`HEPH_CPUS`, `HEPH_MEMORY_BYTES` when memory was
-        // declared): a host-provided runtime value like `WORKSPACE_ROOT` and the
-        // scratch dirs, never hashed (U5) — a target's outputs must not depend
-        // on it. After the passthroughs, so a nested heph run under
-        // `pass_env`/`runtime_pass_env = ["*"]` sees its own allotment rather
-        // than its parent's (and the hashed passthroughs never snapshot the two
-        // names at parse — `is_allotment_env` — so the key covers no value
-        // this overwrites); but the target's own `env` and `runtime_env` win,
-        // as an author who sets the name means it. `env` was inserted above,
-        // before the passthroughs, so it is skipped by name here rather than
-        // moved, which would change what a passthrough overrides today.
-        if let Some(a) = &rreq.allotment {
-            for (k, v) in a.env() {
-                if !def.env.contains_key(k) && !def.runtime_env.contains_key(k) {
-                    env.insert(k.to_string(), v);
                 }
             }
         }

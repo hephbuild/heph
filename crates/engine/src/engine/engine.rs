@@ -649,14 +649,15 @@ impl Engine {
         self.pools.built().map(|p| p.snapshot())
     }
 
-    /// Every named pool's capacity, in the pool's unit, as `RequestConfig`
-    /// announces it. Builds the pool (and so reads the host's memory) on the
-    /// first call.
+    /// Every bounded named pool's capacity, in the pool's unit's base, as
+    /// `RequestConfig` announces it; an unbounded pool has no capacity to
+    /// announce and is left out. Builds the pool (and so reads the host's
+    /// memory) on the first call.
     pub(crate) fn pool_capacities(&self) -> std::collections::BTreeMap<String, u64> {
         self.pools
             .get()
             .capacities()
-            .map(|(p, c)| (p.as_str().to_owned(), c))
+            .filter_map(|(p, c)| Some((p.as_str().to_owned(), c.bounded()?)))
             .collect()
     }
 
@@ -1444,7 +1445,9 @@ mod tests {
                 .pools
                 .get()
                 .capacity(hplugin::provider::PoolName::CPU),
-            Some(4 * hplugin::driver::Resources::MICROS_PER_CPU)
+            Some(crate::engine::resource_pool::Limit::Bounded(
+                4 * hplugin::driver::Resources::MICROS_PER_CPU
+            ))
         );
     }
 

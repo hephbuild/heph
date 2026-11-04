@@ -1101,7 +1101,9 @@ fn render_pools(p: &crate::engine::resource_pool::ResourceSnapshot, now: Instant
                 format!(
                     "{pool} {}/{}",
                     display_amount(pool, s.held),
-                    display_amount(pool, s.capacity)
+                    s.capacity
+                        .bounded()
+                        .map_or_else(|| "unbounded".to_owned(), |c| display_amount(pool, c))
                 )
             })
             .collect();
@@ -1119,7 +1121,8 @@ fn render_pools(p: &crate::engine::resource_pool::ResourceSnapshot, now: Instant
                     format!(
                         "{pool} {} ({} free)",
                         display_amount(pool, n.need),
-                        display_amount(pool, n.free)
+                        n.free
+                            .map_or_else(|| "unbounded".to_owned(), |f| display_amount(pool, f))
                     )
                 })
                 .collect();
@@ -1596,7 +1599,7 @@ mod tests {
     #[test]
     fn report_lists_pools_and_the_head_wait() {
         use crate::engine::resource_pool::{
-            HeadSnapshot, LaneSnapshot, PoolNeed, PoolSnapshot, ResourceSnapshot,
+            HeadSnapshot, LaneSnapshot, Limit, PoolNeed, PoolSnapshot, ResourceSnapshot,
         };
         use hplugin::provider::PoolName;
         let name = |s: &str| PoolName::try_from(s).expect("pool name");
@@ -1608,14 +1611,12 @@ mod tests {
                 pools: vec![
                     PoolSnapshot {
                         pool: name("cpu"),
-                        capacity: 8 * cpu,
-                        free: 2 * cpu,
+                        capacity: Limit::Bounded(8 * cpu),
                         held: 6 * cpu,
                     },
                     PoolSnapshot {
                         pool: name("memory"),
-                        capacity: 16 << 30,
-                        free: 14 << 30,
+                        capacity: Limit::Bounded(16 << 30),
                         held: 2 << 30,
                     },
                 ],
@@ -1624,7 +1625,7 @@ mod tests {
                     unmet: vec![PoolNeed {
                         pool: name("cpu"),
                         need: 4 * cpu,
-                        free: 2 * cpu,
+                        free: Some(2 * cpu),
                     }],
                     since,
                 }),
@@ -1632,8 +1633,7 @@ mod tests {
             light: LaneSnapshot {
                 pools: vec![PoolSnapshot {
                     pool: name("light"),
-                    capacity: 64,
-                    free: 64,
+                    capacity: Limit::Bounded(64),
                     held: 0,
                 }],
                 queued: 0,
@@ -1652,16 +1652,19 @@ mod tests {
         let mut snap = snap;
         snap.main.pools.push(PoolSnapshot {
             pool: name("light"),
-            capacity: 2,
-            free: 1,
+            capacity: Limit::Bounded(2),
             held: 1,
         });
+        snap.main.pools.push(PoolSnapshot {
+            pool: name("tokens"),
+            capacity: Limit::Unbounded,
+            held: 5,
+        });
         snap.light.pools[0].held = 64;
-        snap.light.pools[0].free = 0;
         snap.light.queued = 3;
         let text = render_pools(&snap, now);
         assert!(
-            text.contains("memory 2.0 GiB/16.0 GiB, light 1/2; 7 queued"),
+            text.contains("memory 2.0 GiB/16.0 GiB, light 1/2, tokens 5/unbounded; 7 queued"),
             "{text}"
         );
         assert!(

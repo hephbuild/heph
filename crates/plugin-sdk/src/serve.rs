@@ -1602,7 +1602,7 @@ impl RunStart {
         Ok(Self {
             options,
             channels,
-            allotment: convert::allotment_from_pb(req.allotment.into_option())
+            allotment: convert::allotment_from_pb(req.allotment)
                 .context("decoding the run's allotment")?,
             shell: req.shell.unwrap_or(false),
             target: convert::target_def_from_pb(required_msg(

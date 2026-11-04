@@ -27,7 +27,10 @@
 //! pool's capacity is clamped to the capacity (it then runs alone in that
 //! pool) and the grant says so ([`Reservation::clamped`]). A request naming a
 //! pool whose capacity is 0 is an error, never a wait: such a pool exists so
-//! a run can set it ([`AcquireError::ZeroCapacity`]).
+//! a run can set it ([`AcquireError::ZeroCapacity`]). A pool with no capacity
+//! at all ([`Limit::Unbounded`]: a custom pool declared without a value,
+//! `memory` when the host could not be read) always fits: what is granted from
+//! it is counted, never waited for.
 //!
 //! A request that reserves nothing anywhere (`cpu: 0`) takes 1 of the builtin
 //! **light** lane instead, a separate FIFO with capacity
@@ -49,7 +52,8 @@
 //!   queue is empty, or an arrival racing a release would overtake.
 //! - Removal from the queue is by key, not a scan.
 
-use hplugin::driver::Resources;
+use hcore::capacity::{PoolSpec, Unit};
+use hplugin::driver::{Demand, Resources};
 use hplugin::provider::PoolName;
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
@@ -86,6 +90,28 @@ pub enum AcquireError {
 /// in-flight report shows this one as `zero-cost`/`slots`.
 const LIGHT: &str = "light";
 
+/// A pool's capacity in its unit's base (micro-CPUs, bytes, a count).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Limit {
+    /// At most this much is held at once. `0`: the pool must be set per run,
+    /// and a request naming it is an error ([`AcquireError::ZeroCapacity`]).
+    Bounded(u64),
+    /// No capacity: every request fits at once and nothing is clamped. A
+    /// custom pool declared with no value, or `memory` when the host's could
+    /// not be read.
+    Unbounded,
+}
+
+impl Limit {
+    /// The capacity, `None` when unbounded.
+    pub fn bounded(self) -> Option<u64> {
+        match self {
+            Self::Bounded(n) => Some(n),
+            Self::Unbounded => None,
+        }
+    }
+}
+
 /// Admits targets against per-pool capacities. See the module docs.
 #[derive(Debug)]
 pub struct ResourcePool {
@@ -96,10 +122,13 @@ pub struct ResourcePool {
 impl ResourcePool {
     /// A pool with these capacities (`cpu` in micro-CPUs, `memory` in bytes, a
     /// custom pool a count). A pool given twice keeps the last capacity. The
-    /// light lane is sized from the `cpu` capacity (absent counts as 0).
-    pub fn new(capacities: impl IntoIterator<Item = (PoolName, u64)>) -> Arc<Self> {
-        let capacities: BTreeMap<PoolName, u64> = capacities.into_iter().collect();
-        let cpu = capacities.get(PoolName::CPU).copied().unwrap_or(0);
+    /// light lane is sized from the `cpu` capacity (absent counts as 0,
+    /// unbounded as `u64::MAX`).
+    pub fn new(capacities: impl IntoIterator<Item = (PoolName, Limit)>) -> Arc<Self> {
+        let capacities: BTreeMap<PoolName, Limit> = capacities.into_iter().collect();
+        let cpu = capacities
+            .get(PoolName::CPU)
+            .map_or(0, |l| l.bounded().unwrap_or(u64::MAX));
         let light_capacity = cpu
             .div_ceil(Resources::MICROS_PER_CPU)
             .saturating_mul(8)
@@ -109,19 +138,22 @@ impl ResourcePool {
         let light_name = PoolName::try_from(LIGHT).unwrap_or_else(|_| PoolName::cpu());
         Arc::new(Self {
             main: Lane::new(capacities, false),
-            light: Lane::new(BTreeMap::from([(light_name, light_capacity)]), true),
+            light: Lane::new(
+                BTreeMap::from([(light_name, Limit::Bounded(light_capacity))]),
+                true,
+            ),
         })
     }
 
     /// The capacity of a named pool, `None` when it is not one.
-    pub fn capacity(&self, pool: &str) -> Option<u64> {
+    pub fn capacity(&self, pool: &str) -> Option<Limit> {
         let idx = self.main.index(pool)?;
         self.main.capacity.get(idx).copied()
     }
 
     /// Every named pool and its capacity, in name order (the light lane is not
     /// a named pool).
-    pub fn capacities(&self) -> impl Iterator<Item = (&PoolName, u64)> {
+    pub fn capacities(&self) -> impl Iterator<Item = (&PoolName, Limit)> {
         self.main
             .names
             .iter()
@@ -130,22 +162,29 @@ impl ResourcePool {
 
     /// The light lane's capacity.
     pub fn light_capacity(&self) -> u64 {
-        self.light.capacity.first().copied().unwrap_or(0)
+        self.light
+            .capacity
+            .first()
+            .and_then(|l| l.bounded())
+            .unwrap_or(0)
     }
 
-    /// What nobody holds in a named pool right now, `None` when it is not one.
+    /// What nobody holds in a named pool right now, `None` when it is not one
+    /// or is unbounded.
     pub fn available(&self, pool: &str) -> Option<u64> {
         let idx = self.main.index(pool)?;
-        self.main.state.lock().free.get(idx).copied()
+        let cap = self.main.capacity.get(idx)?.bounded()?;
+        let held = self.main.state.lock().held.get(idx).copied()?;
+        Some(cap.saturating_sub(held))
     }
 
-    /// Ask for `request`'s amounts ([`Resources::amount`]: an undeclared `cpu`
+    /// Ask for `request`'s amounts ([`Demand::amount`]: an undeclared `cpu`
     /// is one CPU). Validates and clamps now, then either grants at once or
     /// queues; await the returned [`Acquire`] for the grant.
     ///
     /// Dropping the `Acquire` leaves the queue, or returns a grant it was
     /// sent but never observed.
-    pub fn acquire(self: &Arc<Self>, request: &Resources) -> Result<Acquire, AcquireError> {
+    pub fn acquire(self: &Arc<Self>, request: &Demand) -> Result<Acquire, AcquireError> {
         let (need, clamped) = self.resolve(request)?;
         let lane = if need.is_empty() {
             &self.light
@@ -167,7 +206,7 @@ impl ResourcePool {
 
     /// The request as `(pool index, granted amount)` in the main lane, empty
     /// when it reserves nothing anywhere; and whether any amount was clamped.
-    fn resolve(&self, request: &Resources) -> Result<(Vec<(usize, u64)>, bool), AcquireError> {
+    fn resolve(&self, request: &Demand) -> Result<(Vec<(usize, u64)>, bool), AcquireError> {
         let lane = &self.main;
         let default_cpu = request
             .declared(PoolName::CPU)
@@ -179,14 +218,16 @@ impl ResourcePool {
             let Some(idx) = lane.index(pool.as_str()) else {
                 return Err(AcquireError::UnknownPool { pool: pool.clone() });
             };
-            let capacity = lane.capacity.get(idx).copied().unwrap_or(0);
-            if capacity == 0 {
-                return Err(AcquireError::ZeroCapacity { pool: pool.clone() });
-            }
+            let granted = match lane.capacity.get(idx).copied() {
+                Some(Limit::Unbounded) => amount,
+                Some(Limit::Bounded(0)) | None => {
+                    return Err(AcquireError::ZeroCapacity { pool: pool.clone() });
+                }
+                Some(Limit::Bounded(capacity)) => amount.min(capacity),
+            };
             if amount == 0 {
                 continue;
             }
-            let granted = amount.min(capacity);
             clamped |= granted < amount;
             need.push((idx, granted));
         }
@@ -197,32 +238,54 @@ impl ResourcePool {
 /// Every pool's capacity, from what the config and the run wrote (`specs`)
 /// over the engine's defaults: `cpu` is `parallelism` CPUs, `memory` the
 /// host's ([`hcore::sysres::host_memory_bytes`], read through `host_memory`
-/// only when the memory capacity needs it), a custom pool only what was
-/// written. A percentage is of the default; a custom pool has none, which the
-/// parser already refused.
+/// only when the memory capacity needs it; 0 is "could not read"). A
+/// percentage is of the default; a custom pool has none, which the parser
+/// already refused.
+///
+/// A pool with no value is unbounded, except `cpu` (always the parallelism)
+/// and `memory` (the host's), which keep their default; a `memory` whose
+/// default is needed and could not be read is unbounded too.
 pub fn resolve_capacities(
-    specs: &BTreeMap<PoolName, hcore::capacity::Capacity>,
+    specs: &BTreeMap<PoolName, PoolSpec>,
     parallelism: usize,
     host_memory: impl FnOnce() -> u64,
-) -> Vec<(PoolName, u64)> {
+) -> Vec<(PoolName, Limit)> {
     let cpu_default = u64::try_from(parallelism)
         .unwrap_or(u64::MAX)
         .saturating_mul(Resources::MICROS_PER_CPU);
     let cpu = specs
         .get(PoolName::CPU)
-        .map_or(cpu_default, |c| c.resolve(PoolName::CPU, || cpu_default));
-    let memory = match specs.get(PoolName::MEMORY) {
-        Some(c) => c.resolve(PoolName::MEMORY, host_memory),
-        None => host_memory(),
+        .and_then(|s| s.capacity)
+        .map_or(cpu_default, |c| c.resolve(Unit::Cpu, || cpu_default));
+    let memory = match specs.get(PoolName::MEMORY).and_then(|s| s.capacity) {
+        Some(c @ hcore::capacity::Capacity::Amount(_)) => {
+            Limit::Bounded(c.resolve(Unit::Bytes, || 0))
+        }
+        Some(c) => match host_memory() {
+            0 => Limit::Unbounded,
+            host => Limit::Bounded(c.resolve(Unit::Bytes, || host)),
+        },
+        None => match host_memory() {
+            0 => Limit::Unbounded,
+            host => Limit::Bounded(host),
+        },
     };
     let custom = specs
         .iter()
         .filter(|(p, _)| p.as_str() != PoolName::CPU && p.as_str() != PoolName::MEMORY)
-        .map(|(p, c)| (p.clone(), c.resolve(p.as_str(), || 0)));
-    [(PoolName::cpu(), cpu), (PoolName::memory(), memory)]
-        .into_iter()
-        .chain(custom)
-        .collect()
+        .map(|(p, s)| {
+            let limit = s.capacity.map_or(Limit::Unbounded, |c| {
+                Limit::Bounded(c.resolve(s.unit, || 0))
+            });
+            (p.clone(), limit)
+        });
+    [
+        (PoolName::cpu(), Limit::Bounded(cpu)),
+        (PoolName::memory(), memory),
+    ]
+    .into_iter()
+    .chain(custom)
+    .collect()
 }
 
 /// The engine's [`ResourcePool`], built on first use.
@@ -234,17 +297,18 @@ pub fn resolve_capacities(
 /// itself on the first admission.
 #[derive(Debug)]
 pub struct EnginePools {
-    specs: BTreeMap<PoolName, hcore::capacity::Capacity>,
+    specs: BTreeMap<PoolName, PoolSpec>,
     parallelism: usize,
     cpu: u64,
     pool: std::sync::OnceLock<Arc<ResourcePool>>,
 }
 
 impl EnginePools {
-    pub fn new(specs: BTreeMap<PoolName, hcore::capacity::Capacity>, parallelism: usize) -> Self {
+    pub fn new(specs: BTreeMap<PoolName, PoolSpec>, parallelism: usize) -> Self {
         let cpu = resolve_capacities(&specs, parallelism, || 0)
             .into_iter()
             .find_map(|(p, c)| (p.as_str() == PoolName::CPU).then_some(c))
+            .and_then(Limit::bounded)
             .unwrap_or(0);
         Self {
             specs,
@@ -262,7 +326,16 @@ impl EnginePools {
     /// Whether `name` is a pool: `cpu`, `memory`, or one the config or the run
     /// named (even at capacity 0).
     pub fn is_pool(&self, name: &str) -> bool {
-        name == PoolName::CPU || name == PoolName::MEMORY || self.specs.contains_key(name)
+        self.unit(name).is_some()
+    }
+
+    /// The unit of pool `name` (a builtin's own, else what the config
+    /// declared), `None` when it is not a pool.
+    pub fn unit(&self, name: &str) -> Option<Unit> {
+        self.specs
+            .get(name)
+            .map(|s| s.unit)
+            .or_else(|| Unit::of_builtin(name))
     }
 
     /// Every pool name, in name order.
@@ -300,7 +373,7 @@ impl EnginePools {
 struct Lane {
     /// Sorted, so a pool is found by binary search; indices are stable.
     names: Box<[PoolName]>,
-    capacity: Box<[u64]>,
+    capacity: Box<[Limit]>,
     cpu_name: PoolName,
     /// The light lane, whose grants reserve no named pool.
     light: bool,
@@ -309,8 +382,9 @@ struct Lane {
 
 #[derive(Debug)]
 struct State {
-    /// Indexed like `Lane::names`.
-    free: Box<[u64]>,
+    /// What is granted and not yet released, indexed like `Lane::names`.
+    /// Counted for an unbounded pool too, which only the snapshot reads.
+    held: Box<[u64]>,
     /// The queue: arrival sequence → waiter. The first entry is the head;
     /// removal is by key.
     waiters: BTreeMap<u64, Waiter>,
@@ -326,11 +400,11 @@ struct Waiter {
 }
 
 impl Lane {
-    fn new(capacities: BTreeMap<PoolName, u64>, light: bool) -> Arc<Self> {
-        let (names, capacity): (Vec<PoolName>, Vec<u64>) = capacities.into_iter().unzip();
+    fn new(capacities: BTreeMap<PoolName, Limit>, light: bool) -> Arc<Self> {
+        let (names, capacity): (Vec<PoolName>, Vec<Limit>) = capacities.into_iter().unzip();
         Arc::new(Self {
             state: Mutex::new(State {
-                free: capacity.clone().into_boxed_slice(),
+                held: vec![0; capacity.len()].into_boxed_slice(),
                 waiters: BTreeMap::new(),
                 next_seq: 0,
             }),
@@ -347,8 +421,8 @@ impl Lane {
 
     fn enqueue(self: &Arc<Self>, need: Box<[(usize, u64)]>, clamped: bool) -> Acquire {
         let mut st = self.state.lock();
-        if st.waiters.is_empty() && fits(&st.free, &need) {
-            take(&mut st.free, &need);
+        if st.waiters.is_empty() && fits(&self.capacity, &st.held, &need) {
+            take(&mut st.held, &need);
             drop(st);
             return Acquire {
                 state: AcquireState::Ready(Some(Reservation {
@@ -392,11 +466,11 @@ impl Lane {
     /// here, so no armed `Reservation` is dropped under the lock.
     fn grant_chain(self: &Arc<Self>, st: &mut State) {
         while let Some(head) = st.waiters.first_entry() {
-            if !fits(&st.free, &head.get().need) {
+            if !fits(&self.capacity, &st.held, &head.get().need) {
                 break;
             }
             let waiter = head.remove();
-            take(&mut st.free, &waiter.need);
+            take(&mut st.held, &waiter.need);
             let reservation = Reservation {
                 lane: Arc::clone(self),
                 granted: waiter.need,
@@ -405,14 +479,14 @@ impl Lane {
             };
             if let Err(mut unobserved) = waiter.tx.send(reservation) {
                 unobserved.armed = false;
-                give(&mut st.free, &self.capacity, &unobserved.granted);
+                give(&mut st.held, &unobserved.granted);
             }
         }
     }
 
     fn release(self: &Arc<Self>, granted: &[(usize, u64)]) {
         let mut st = self.state.lock();
-        give(&mut st.free, &self.capacity, granted);
+        give(&mut st.held, granted);
         self.grant_chain(&mut st);
     }
 
@@ -429,7 +503,7 @@ impl Lane {
         let waiter = st.waiters.get(&seq)?;
         Some(WaitInfo {
             ahead: st.waiters.range(..seq).count(),
-            pools: self.needs(&st.free, &waiter.need, false),
+            pools: self.needs(&st.held, &waiter.need, false),
             since: waiter.since,
         })
     }
@@ -439,16 +513,15 @@ impl Lane {
         let pools = self
             .names
             .iter()
-            .zip(self.capacity.iter().zip(st.free.iter()))
-            .map(|(name, (&capacity, &free))| PoolSnapshot {
+            .zip(self.capacity.iter().zip(st.held.iter()))
+            .map(|(name, (&capacity, &held))| PoolSnapshot {
                 pool: name.clone(),
                 capacity,
-                free,
-                held: capacity.saturating_sub(free),
+                held,
             })
             .collect();
         let head = st.waiters.values().next().map(|w| HeadSnapshot {
-            unmet: self.needs(&st.free, &w.need, true),
+            unmet: self.needs(&st.held, &w.need, true),
             since: w.since,
         });
         LaneSnapshot {
@@ -458,13 +531,13 @@ impl Lane {
         }
     }
 
-    /// `need` as named amounts with each pool's free amount; only the pools it
-    /// does not fit in when `unmet_only`.
-    fn needs(&self, free: &[u64], need: &[(usize, u64)], unmet_only: bool) -> Vec<PoolNeed> {
+    /// `need` as named amounts with each pool's free amount (`None`:
+    /// unbounded); only the pools it does not fit in when `unmet_only`.
+    fn needs(&self, held: &[u64], need: &[(usize, u64)], unmet_only: bool) -> Vec<PoolNeed> {
         need.iter()
             .filter_map(|&(idx, amount)| {
-                let free = free.get(idx).copied().unwrap_or(0);
-                if unmet_only && amount <= free {
+                let free = free_of(self.capacity.get(idx).copied()?, held.get(idx).copied()?);
+                if unmet_only && free.is_none_or(|f| amount <= f) {
                     return None;
                 }
                 Some(PoolNeed {
@@ -477,35 +550,40 @@ impl Lane {
     }
 }
 
-fn fits(free: &[u64], need: &[(usize, u64)]) -> bool {
-    need.iter()
-        .all(|&(idx, n)| free.get(idx).is_some_and(|&f| n <= f))
+/// What a pool of capacity `limit` with `held` granted has free, `None` when
+/// it is unbounded.
+fn free_of(limit: Limit, held: u64) -> Option<u64> {
+    limit.bounded().map(|cap| cap.saturating_sub(held))
 }
 
-/// Subtract a need that [`fits`].
-fn take(free: &mut [u64], need: &[(usize, u64)]) {
+/// Whether `need` fits beside `held`: an unbounded pool always does.
+fn fits(capacity: &[Limit], held: &[u64], need: &[(usize, u64)]) -> bool {
+    need.iter()
+        .all(|&(idx, n)| match (capacity.get(idx), held.get(idx)) {
+            (Some(Limit::Unbounded), Some(_)) => true,
+            (Some(&Limit::Bounded(cap)), Some(&h)) => n <= cap.saturating_sub(h),
+            _ => false,
+        })
+}
+
+/// Count a need that [`fits`] as held. Saturates: an unbounded pool can be
+/// granted more than a `u64` in total, which only the snapshot reads.
+fn take(held: &mut [u64], need: &[(usize, u64)]) {
     for &(idx, n) in need {
-        if let Some(f) = free.get_mut(idx) {
-            *f = f.checked_sub(n).unwrap_or_else(|| {
-                tracing::error!(pool = idx, "resource pool took more than was free");
-                0
-            });
+        if let Some(h) = held.get_mut(idx) {
+            *h = h.saturating_add(n);
         }
     }
 }
 
-/// Return a grant, never past capacity.
-fn give(free: &mut [u64], capacity: &[u64], granted: &[(usize, u64)]) {
+/// Return a grant, never below nothing held.
+fn give(held: &mut [u64], granted: &[(usize, u64)]) {
     for &(idx, n) in granted {
-        let cap = capacity.get(idx).copied().unwrap_or(0);
-        if let Some(f) = free.get_mut(idx) {
-            *f = match f.checked_add(n) {
-                Some(v) if v <= cap => v,
-                _ => {
-                    tracing::error!(pool = idx, "resource pool released more than it granted");
-                    cap
-                }
-            };
+        if let Some(h) = held.get_mut(idx) {
+            *h = h.checked_sub(n).unwrap_or_else(|| {
+                tracing::error!(pool = idx, "resource pool released more than it granted");
+                0
+            });
         }
     }
 }
@@ -643,7 +721,8 @@ pub struct WaitInfo {
 pub struct PoolNeed {
     pub pool: PoolName,
     pub need: u64,
-    pub free: u64,
+    /// `None`: the pool is unbounded.
+    pub free: Option<u64>,
 }
 
 /// The pool at one instant, for the in-flight report and the TUI.
@@ -666,9 +745,15 @@ pub struct LaneSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolSnapshot {
     pub pool: PoolName,
-    pub capacity: u64,
-    pub free: u64,
+    pub capacity: Limit,
     pub held: u64,
+}
+
+impl PoolSnapshot {
+    /// What nobody holds, `None` when the pool is unbounded.
+    pub fn free(&self) -> Option<u64> {
+        free_of(self.capacity, self.held)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -692,15 +777,15 @@ mod tests {
     }
 
     fn pool(caps: &[(&str, u64)]) -> Arc<ResourcePool> {
-        ResourcePool::new(caps.iter().map(|&(n, c)| (name(n), c)))
+        ResourcePool::new(caps.iter().map(|&(n, c)| (name(n), Limit::Bounded(c))))
     }
 
-    fn req(pairs: &[(&str, u64)]) -> Resources {
-        Resources::try_from_pairs(pairs.iter().map(|&(n, a)| (n.to_string(), a))).unwrap()
+    fn req(pairs: &[(&str, u64)]) -> Demand {
+        Demand::try_from_pairs(pairs.iter().map(|&(n, a)| (n.to_string(), a))).unwrap()
     }
 
     /// Acquire and expect an immediate grant.
-    fn now(p: &Arc<ResourcePool>, r: &Resources) -> Reservation {
+    fn now(p: &Arc<ResourcePool>, r: &Demand) -> Reservation {
         p.acquire(r)
             .unwrap()
             .now_or_never()
@@ -709,7 +794,7 @@ mod tests {
     }
 
     /// Acquire and expect to queue.
-    fn queued(p: &Arc<ResourcePool>, r: &Resources) -> Acquire {
+    fn queued(p: &Arc<ResourcePool>, r: &Demand) -> Acquire {
         let mut a = p.acquire(r).unwrap();
         assert!((&mut a).now_or_never().is_none(), "must wait");
         a
@@ -880,7 +965,7 @@ mod tests {
         let peak = u64::try_from(peak.load(Ordering::SeqCst)).unwrap();
         assert_eq!(peak, cap, "the lane filled exactly to its capacity");
         assert_eq!(free(&p, "cpu"), CPU, "the light lane never touches cpu");
-        assert_eq!(p.snapshot().light.pools[0].free, cap);
+        assert_eq!(p.snapshot().light.pools[0].free(), Some(cap));
     }
 
     #[test]
@@ -973,7 +1058,7 @@ mod tests {
                     .process("//pkg:tgt".to_string(), move || async move {
                         mem_execute
                             .process("//pkg:tgt".to_string(), move || async move {
-                                let _r = p.acquire(&Resources::new()).unwrap().await.unwrap();
+                                let _r = p.acquire(&Demand::default()).unwrap().await.unwrap();
                                 futures::future::pending::<u32>().await
                             })
                             .await
@@ -1005,7 +1090,7 @@ mod tests {
 
         let live = tokio::time::timeout(
             Duration::from_secs(5),
-            p.acquire(&Resources::new()).unwrap(),
+            p.acquire(&Demand::default()).unwrap(),
         )
         .await
         .expect("a live caller must not be blocked by the abandoned chain")
@@ -1020,7 +1105,7 @@ mod tests {
         for _ in 0..32 {
             let p = Arc::clone(&p);
             tasks.spawn(async move {
-                let r = p.acquire(&Resources::new()).unwrap().await.unwrap();
+                let r = p.acquire(&Demand::default()).unwrap().await.unwrap();
                 tokio::task::yield_now().await;
                 drop(r);
             });
@@ -1095,14 +1180,12 @@ mod tests {
             [
                 PoolSnapshot {
                     pool: name("cpu"),
-                    capacity: 4 * CPU,
-                    free: CPU,
+                    capacity: Limit::Bounded(4 * CPU),
                     held: 3 * CPU,
                 },
                 PoolSnapshot {
                     pool: name("memory"),
-                    capacity: 8 * GIB,
-                    free: 7 * GIB,
+                    capacity: Limit::Bounded(8 * GIB),
                     held: GIB,
                 },
             ]
@@ -1114,7 +1197,7 @@ mod tests {
             [PoolNeed {
                 pool: name("cpu"),
                 need: 2 * CPU,
-                free: CPU,
+                free: Some(CPU),
             }],
             "only the pool it does not fit"
         );
@@ -1152,7 +1235,7 @@ mod tests {
         // A cpu capacity of 0 refuses even the default one-CPU request.
         let none = pool(&[("cpu", 0)]);
         assert_eq!(
-            none.acquire(&Resources::new()).unwrap_err(),
+            none.acquire(&Demand::default()).unwrap_err(),
             AcquireError::ZeroCapacity { pool: name("cpu") }
         );
     }
@@ -1185,9 +1268,7 @@ mod tests {
     /// The resources on the def of a target of each driver the spec names
     /// (`exec`, `template`, `fs`, `group`), parsed by the real in-tree drivers
     /// with `resources` set to `declared`.
-    async fn driver_defs(
-        declared: Option<hcore::htvalue::Value>,
-    ) -> Vec<(&'static str, Resources)> {
+    async fn driver_defs(declared: Option<hcore::htvalue::Value>) -> Vec<(&'static str, Demand)> {
         use hcore::htvalue::Value;
         use hdriver_support::driver_managed::ManagedDriver as _;
         use hplugin::driver::Driver as _;
@@ -1218,7 +1299,12 @@ mod tests {
         .into_iter()
         .map(|(name, res)| {
             let def = res.unwrap_or_else(|e| panic!("parse {name}: {e:#}"));
-            (name, def.target_def.resources)
+            let demand = def
+                .target_def
+                .resources
+                .parse(Unit::of_builtin)
+                .unwrap_or_else(|e| panic!("demand {name}: {e:#}"));
+            (name, demand)
         })
         .collect()
     }
@@ -1257,5 +1343,63 @@ mod tests {
             assert!(r.is_light(), "{driver}: cpu 0 is the light lane");
             assert_eq!(free(&p, "cpu"), 4 * CPU, "{driver}: holds no cpu");
         }
+    }
+
+    /// An unbounded pool admits every request at once, never clamps, and the
+    /// grant carries the declared amount; it is counted as held.
+    #[test]
+    fn an_unbounded_pool_admits_immediately_with_the_declared_amount() {
+        let p = ResourcePool::new([
+            (name("cpu"), Limit::Bounded(4 * CPU)),
+            (name("tokens"), Limit::Unbounded),
+        ]);
+        let big = req(&[("cpu", 0), ("tokens", u64::MAX)]);
+        let a = now(&p, &big);
+        let b = now(&p, &big);
+        assert!(!a.clamped() && !b.clamped());
+        assert_eq!(a.amount("tokens"), u64::MAX);
+        assert_eq!(p.available("tokens"), None, "no free amount to report");
+        let s = p.snapshot();
+        let tokens = s
+            .main
+            .pools
+            .iter()
+            .find(|s| s.pool == name("tokens"))
+            .unwrap();
+        assert_eq!(tokens.capacity, Limit::Unbounded);
+        assert_eq!(tokens.held, u64::MAX, "saturates rather than wrapping");
+        assert_eq!(tokens.free(), None);
+        drop((a, b));
+        assert_eq!(p.snapshot().main.queued, 0);
+    }
+
+    /// No value: a custom pool is unbounded, `cpu`/`memory` keep their
+    /// defaults, and a host memory that could not be read (0) is unbounded;
+    /// an explicit 0 stays a must-be-set pool.
+    #[test]
+    fn resolve_capacities_unbounded_and_zero() {
+        use hcore::capacity::Capacity;
+        let spec = |unit, capacity| PoolSpec { unit, capacity };
+        let specs = BTreeMap::from([
+            (name("cpu"), spec(Unit::Cpu, None)),
+            (name("memory"), spec(Unit::Bytes, None)),
+            (name("tokens"), spec(Unit::Count, None)),
+            (name("gpu"), spec(Unit::Count, Some(Capacity::Amount(0)))),
+        ]);
+        let got: BTreeMap<_, _> = resolve_capacities(&specs, 2, || 0).into_iter().collect();
+        assert_eq!(got[PoolName::CPU], Limit::Bounded(2 * CPU));
+        assert_eq!(got[PoolName::MEMORY], Limit::Unbounded, "host read failed");
+        assert_eq!(got["tokens"], Limit::Unbounded);
+        assert_eq!(got["gpu"], Limit::Bounded(0));
+        let got: BTreeMap<_, _> = resolve_capacities(&specs, 2, || GIB).into_iter().collect();
+        assert_eq!(got[PoolName::MEMORY], Limit::Bounded(GIB));
+
+        let p = ResourcePool::new(resolve_capacities(&specs, 2, || 0));
+        assert_eq!(
+            p.acquire(&req(&[("gpu", 1)])).unwrap_err(),
+            AcquireError::ZeroCapacity { pool: name("gpu") },
+            "value 0 still errors at admission"
+        );
+        assert!(!now(&p, &req(&[("memory", 64 * GIB)])).clamped());
     }
 }

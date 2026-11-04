@@ -428,8 +428,13 @@ impl Engine {
         }
 
         // An entrypoint reserves nothing (it runs in the caller's terminal, one
-        // at a time) and is told the whole cpu capacity.
-        let allotment = hplugin::driver::Allotment::from_granted(self.pools.cpu_capacity(), None);
+        // at a time) and is told the whole cpu capacity, plus what it declared
+        // of every other pool.
+        let allotment = crate::engine::execute::entrypoint_allotment(
+            self.pools.cpu_capacity(),
+            &target.demand,
+            |pool| self.pools.unit(pool),
+        );
         let deferred_refs = self.deferred_refs(&spec.spec, &spec.driver)?;
         let deferred = self
             .resolve_deferred(rs, &target, &deferred_refs, Some(&allotment))

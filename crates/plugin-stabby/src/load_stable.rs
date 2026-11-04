@@ -1074,7 +1074,7 @@ impl StableRemoteManagedDriver {
                 .allotment
                 .as_ref()
                 .map(convert::allotment_to_pb)
-                .into(),
+                .unwrap_or_default(),
             ..Default::default()
         };
         // `run` is bidi: the request stream carries the run request (RunInFrame),

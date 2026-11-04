@@ -33,16 +33,18 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// additive minors, and there was no version check to read them.
 ///
 /// 0.17.4 (additive, a patch): target resources. `TargetDef.resources` (12,
-/// `map<string, uint64>`) — the pools a def reserves while it runs (`cpu` in
-/// micro-CPUs, `memory` in bytes, a custom pool a count), only declared pools
-/// present; `ManagedRunRequest.allotment` (15, message `Allotment { cpu,
-/// memory_bytes }`) — what the host reserved, which the driver tells the target
-/// as `HEPH_CPUS` / `HEPH_MEMORY_BYTES`. The skew, both ways: a 0.17.3 plugin
-/// sends no `resources`, so its defs decode empty and reserve one cpu, and
-/// ignores `allotment`; a 0.17.4 plugin on a 0.17.3 host has its `resources`
-/// dropped at decode (every def costs one cpu there, a custom-pool exclusion is
-/// lost) and is sent no `allotment`, which means "told nothing" — it sets no
-/// allotment env. Neither is hashed. No plugin must be rebuilt; the SDK's Rust
+/// `map<string, string>`) — the pools a def reserves while it runs, each amount
+/// as the target wrote it (`"0.5"`, `"2G"`), which the host parses in the
+/// pool's unit at link; only declared pools present.
+/// `ManagedRunRequest.allotment` (15, `map<string, string>`) — every pool the
+/// host granted the run (`cpu` always), each amount rendered by its pool's unit,
+/// which is what the driver substitutes for `${resource:<pool>}`; heph exports
+/// no environment for it. The skew, both ways: a 0.17.3 plugin sends no
+/// `resources`, so its defs decode empty and reserve one cpu, and ignores
+/// `allotment`; a 0.17.4 plugin on a 0.17.3 host has its `resources` dropped
+/// at decode (every def costs one cpu there, a custom-pool exclusion is lost)
+/// and is sent an empty `allotment`, which means "told nothing" — a
+/// `${resource:}` reference then fails its run. Neither is hashed. No plugin must be rebuilt; the SDK's Rust
 /// source does change (`TargetDef` gains a field and is not `#[non_exhaustive]`,
 /// so a struct literal without `..Default::default()` stops compiling).
 ///

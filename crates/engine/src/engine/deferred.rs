@@ -238,16 +238,6 @@ fn walk(v: &Value, path: &str, pkg: &PkgBuf, out: &mut Vec<DeferredRef>) -> anyh
     Ok(())
 }
 
-/// Whether a `${resource:…}` may stand at config path `path`: one value of a
-/// top-level `env` or `runtime_env` map, the exec driver's fields that reach the
-/// process as environment and nothing else (D7). A transitive `env` never comes
-/// through this walk; `apply_transitive` takes it.
-fn resource_ref_allowed_at(path: &str) -> bool {
-    ["env.", "runtime_env."]
-        .iter()
-        .any(|p| path.strip_prefix(p).is_some_and(|name| !name.is_empty()))
-}
-
 /// The references in one string, or `None` when it holds none.
 fn parse_refs(s: &str, pkg: &PkgBuf, path: &str) -> anyhow::Result<Option<DeferredRef>> {
     if !hcore::template::has_ref(s) {
@@ -267,23 +257,12 @@ fn parse_refs(s: &str, pkg: &PkgBuf, path: &str) -> anyhow::Result<Option<Deferr
         }
         let kind = match r.kind {
             Some(SRC) => SRC,
-            // The run's allotment: no producer, so no edge. Only an exact name is
-            // claimed, so `${resource:cpus}` never got here: it is text. Only
-            // an `env` / `runtime_env` value may carry one (D7): anywhere else
-            // the number could reach an output (a `template` var) and make
-            // its hashout per-machine.
+            // The run's allotment: no producer, so no edge. Accepted in every
+            // deferrable field; whether it names a pool the target reserves is
+            // checked at link against the engine's pools
+            // (`validate_resource_refs`), and a name that is no pool is left
+            // as written at run.
             Some(RESOURCE) => {
-                if !resource_ref_allowed_at(path) {
-                    anyhow::bail!(
-                        "`{}` in `{path}`: a `${{resource:…}}` reference is only accepted in an \
-                         `env` or `runtime_env` value (or a transitive `env`), where it reaches \
-                         the process as an environment variable and never an output; in any \
-                         other field the allotment could change what the target produces. Read \
-                         `$HEPH_CPUS` / `$HEPH_MEMORY_BYTES` from the environment instead \
-                         (docs/RESOURCES.md)",
-                        r.raw
-                    );
-                }
                 names_resource = true;
                 continue;
             }
@@ -516,7 +495,7 @@ impl Engine {
             // contains `${` is never re-interpreted.
             let rendered = hcore::template::substitute(&r.raw, &[READ, RESOURCE], |t| {
                 if t.kind == Some(RESOURCE) {
-                    return hplugin::driver::Allotment::reference(allotment, t.arg, &def.addr)
+                    return hplugin::driver::Allotment::reference(allotment, t, &def.addr)
                         .with_context(|| format!("`{}` in `{}`", r.raw, r.path));
                 }
                 let addr = TargetAddr::parse(t.arg, &def.addr.package)?;
@@ -1016,9 +995,9 @@ mod tests {
         cfg(&[(field, Value::Map(HashMap::from([("X".to_string(), s(v))])))])
     }
 
-    /// `${resource:…}` is collected (so the driver gate and the run see it) but
-    /// names no producer, so it adds no edge; a name that is not exactly one of
-    /// the two is somebody else's text, collected as nothing.
+    /// `${resource:<pool name>}` is collected (so the link check and the run see
+    /// it) but names no producer, so it adds no edge; an argument that is not a
+    /// well-formed pool name is somebody else's text, collected as nothing.
     #[test]
     fn a_resource_reference_is_collected_without_an_edge() {
         let refs = collect(&env_cfg("env", "-j${resource:cpu}"), &pkg()).expect("collect");
@@ -1040,14 +1019,19 @@ mod tests {
         assert_eq!(refs[0].producers.len(), 1);
         assert_eq!(inputs_for(&refs).len(), 1);
 
+        // Any well-formed pool name is claimed, known to the engine or not:
+        // which ones are pools is the engine's, checked at link.
+        for claimed in ["${resource:cpus}", "${resource:nope}", "${resource:gpu}"] {
+            let refs = collect(&env_cfg("env", claimed), &pkg()).expect(claimed);
+            assert_eq!(refs.len(), 1, "{claimed}");
+            assert!(refs[0].producers.is_empty(), "{claimed}");
+        }
         for other in [
-            "${resource:cpus}",
             "${resource:}",
             "${resource:CPU}",
             "${resource:cpu:-1}",
             "${resource:-x}",
             "${resource://cpu}",
-            "${resource:nope}",
             "${resource:ćpu}",
             "${resources:cpu}",
             "${resource}",
@@ -1059,7 +1043,6 @@ mod tests {
                     .is_empty(),
                 "{other}"
             );
-            // Nor is it refused outside env: it is not heph's.
             assert!(
                 collect(&cfg(&[("vars", s(other))]), &pkg())
                     .expect("passes through")
@@ -1074,11 +1057,10 @@ mod tests {
         }
     }
 
-    /// D7 scopes `${resource:…}` to the env maps: anywhere else (a `template`
-    /// var, an `oci` push `dest`, a credential presentation, a `run` line) the
-    /// number could land in an output and make its hashout per-machine.
+    /// `${resource:…}` is accepted in every deferrable field, not only the env
+    /// maps: the engine gates nothing by field name.
     #[test]
-    fn a_resource_reference_outside_env_is_refused() {
+    fn a_resource_reference_is_collected_in_any_field() {
         for (field, v) in [
             (
                 "vars",
@@ -1098,24 +1080,9 @@ mod tests {
                 )]))]),
             ),
         ] {
-            let err = collect(&cfg(&[(field, v)]), &pkg()).expect_err(field);
-            let msg = format!("{err:#}");
-            assert!(
-                msg.contains("only accepted in an `env` or `runtime_env`"),
-                "{field}: {msg}"
-            );
-            assert!(msg.contains("$HEPH_CPUS"), "{field}: {msg}");
-        }
-        assert!(resource_ref_allowed_at("env.MAKEFLAGS"));
-        assert!(resource_ref_allowed_at("runtime_env.GOMAXPROCS"));
-        for refused in [
-            "env",
-            "env.",
-            "vars.env.X",
-            "environment.X",
-            "runtime_envs.X",
-        ] {
-            assert!(!resource_ref_allowed_at(refused), "{refused}");
+            let refs = collect(&cfg(&[(field, v)]), &pkg()).expect(field);
+            assert_eq!(refs.len(), 1, "{field}");
+            assert!(refs[0].producers.is_empty(), "{field}: no edge");
         }
     }
 
@@ -1139,7 +1106,10 @@ mod tests {
         )
         .expect("collect");
         let by_addr = BTreeMap::from([("//infra:x".to_string(), "${resource:cpu}".to_string())]);
-        let three = Allotment::from_granted(3_000_000, Some(4096));
+        let three = Allotment::new([
+            ("cpu".to_string(), "3".to_string()),
+            ("memory".to_string(), "4096".to_string()),
+        ]);
         let out = Engine::render_deferred(&def, &refs, &by_addr, Some(&three)).expect("render");
         let ready = |k: &str| match out.get(k) {
             Some(DeferredValue::Ready(v)) => v.clone(),
@@ -1153,13 +1123,13 @@ mod tests {
         );
         assert_eq!(ready("${resource:memory}"), "4096");
 
-        // Memory not declared: an error naming the target, never an empty value.
-        let no_mem = Allotment::from_granted(1, None);
-        let err = Engine::render_deferred(&def, &refs, &by_addr, Some(&no_mem))
-            .expect_err("undeclared memory");
-        let msg = format!("{err:#}");
-        assert!(msg.contains("//auth:t"), "{msg}");
-        assert!(msg.contains("declares no memory"), "{msg}");
+        // A pool the run was granted none of is left as written (the link
+        // check refuses it for a known pool before any run).
+        let no_mem = Allotment::new([("cpu".to_string(), "1".to_string())]);
+        let out = Engine::render_deferred(&def, &refs, &by_addr, Some(&no_mem)).expect("render");
+        assert!(
+            matches!(out.get("${resource:memory}"), Some(DeferredValue::Ready(v)) if v == "${resource:memory}")
+        );
 
         // No allotment at all: heph's bug, said so.
         let err = Engine::render_deferred(&def, &refs, &by_addr, None).expect_err("no allotment");

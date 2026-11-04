@@ -128,13 +128,13 @@ impl Engine {
         // capacity while waiting for a leaf that also needs some.
         hcore::hmemoizer::set_phase("execute:semaphore_acquire");
         let admit_started = std::time::Instant::now();
-        let reservation = self.admit(&rs, addr, &def.target.resources).await?;
+        let reservation = self.admit(&rs, addr, &def.target.demand).await?;
         // On `ExecuteStart`, so a wait under the notice threshold (which
         // announces nothing) is still answerable from the stream.
         let queued_ms = u64::try_from(admit_started.elapsed().as_millis()).unwrap_or(u64::MAX);
         // Counted once the reservation is actually in hand.
         let _running = crate::engine::diag::RunningPermit::new();
-        let allotment = allotment_of(&reservation, &def.target.resources);
+        let allotment = allotment_of(&reservation, |pool| self.pools.unit(pool));
         let deferred = Self::render_deferred(
             &def.target,
             &deferred_refs,
@@ -153,7 +153,7 @@ impl Engine {
                 addr_str.clone(),
                 driver.name.clone(),
                 def.target.cache.enabled,
-                &def.target.resources,
+                &def.target.demand,
                 &reservation,
                 queued_ms,
             ),
@@ -446,7 +446,7 @@ impl Engine {
         &self,
         rs: &Arc<RequestState>,
         addr: &Addr,
-        resources: &hplugin::driver::Resources,
+        resources: &hplugin::driver::Demand,
     ) -> anyhow::Result<crate::engine::resource_pool::Reservation> {
         let pool = self.pools.get();
         // Observed *before* the acquire, so the stamp times the wait rather than
@@ -590,43 +590,80 @@ fn admission_wait_start(
     addr: String,
     info: &crate::engine::resource_pool::WaitInfo,
 ) -> crate::engine::event::BuildEventKind {
+    // An unbounded pool (`free: None`) never holds a request back, so it is
+    // named only when every pool the request needs is unbounded.
     let pool = info
         .pools
         .iter()
-        .find(|p| p.need > p.free)
+        .find(|p| p.free.is_some_and(|f| p.need > f))
+        .or_else(|| info.pools.iter().find(|p| p.free.is_some()))
         .or_else(|| info.pools.first());
     crate::engine::event::BuildEventKind::AdmissionWaitStart {
         addr,
         pool: pool.map_or_else(String::new, |p| p.pool.as_str().to_owned()),
         need: pool.map_or(0, |p| p.need),
-        free: pool.map_or(0, |p| p.free),
+        free: pool.map_or(0, |p| p.free.unwrap_or(u64::MAX)),
         ahead: u64::try_from(info.ahead).unwrap_or(u64::MAX),
     }
 }
 
-/// What a run is told of its reservation: the granted cpu in whole CPUs
-/// (rounded up, at least 1, so a light-lane grant is told 1), and the granted
-/// memory only when the target declared some.
+/// What a run is told of its reservation: `cpu` always, in whole CPUs
+/// (rounded up, at least 1, so a light-lane grant is told 1), and every other
+/// pool it was granted more than 0 of, each rendered by its pool's unit
+/// (`unit_of`, the engine's pools).
 pub(crate) fn allotment_of(
     reservation: &crate::engine::resource_pool::Reservation,
-    declared: &hplugin::driver::Resources,
+    unit_of: impl Fn(&str) -> Option<hcore::capacity::Unit>,
 ) -> hplugin::driver::Allotment {
+    use hcore::capacity::Unit;
     use hplugin::provider::PoolName;
-    let memory = declared
-        .declared(PoolName::MEMORY)
-        .is_some_and(|m| m > 0)
-        .then(|| reservation.amount(PoolName::MEMORY));
-    hplugin::driver::Allotment::from_granted(reservation.amount(PoolName::CPU), memory)
+    let cpu = (
+        PoolName::CPU.to_owned(),
+        Unit::Cpu.render(reservation.amount(PoolName::CPU).max(1)),
+    );
+    let rest = reservation
+        .iter()
+        .filter(|(p, n)| p.as_str() != PoolName::CPU && *n > 0)
+        .map(|(p, n)| {
+            let unit = unit_of(p.as_str()).unwrap_or_else(|| Unit::default_for(p.as_str()));
+            (p.as_str().to_owned(), unit.render(n))
+        });
+    hplugin::driver::Allotment::new(std::iter::once(cpu).chain(rest))
+}
+
+/// What an entrypoint run is told, having reserved nothing: `cpu` is the
+/// whole `cpu_capacity` (in whole CPUs, at least 1), and every other pool its
+/// declared amount when above 0, rendered by the pool's unit.
+pub(crate) fn entrypoint_allotment(
+    cpu_capacity: u64,
+    demand: &hplugin::driver::Demand,
+    unit_of: impl Fn(&str) -> Option<hcore::capacity::Unit>,
+) -> hplugin::driver::Allotment {
+    use hcore::capacity::Unit;
+    use hplugin::provider::PoolName;
+    let cpu = (
+        PoolName::CPU.to_owned(),
+        Unit::Cpu.render(cpu_capacity.max(1)),
+    );
+    let rest = demand
+        .iter()
+        .filter(|(p, n)| p.as_str() != PoolName::CPU && *n > 0)
+        .map(|(p, n)| {
+            let unit = unit_of(p.as_str()).unwrap_or_else(|| Unit::default_for(p.as_str()));
+            (p.as_str().to_owned(), unit.render(n))
+        });
+    hplugin::driver::Allotment::new(std::iter::once(cpu).chain(rest))
 }
 
 /// The `ExecuteStart` event: what the target declared (only its declared
-/// keys) and what it was granted, after clamping, and how long admission
-/// took. `reserved` always carries `cpu`, 0 on a light-lane grant.
+/// keys, in each pool's unit's base) and what it was granted, after
+/// clamping, and how long admission took. `reserved` always carries `cpu`, 0
+/// on a light-lane grant.
 pub(crate) fn execute_start(
     addr: String,
     driver: String,
     cache: bool,
-    declared: &hplugin::driver::Resources,
+    declared: &hplugin::driver::Demand,
     reservation: &crate::engine::resource_pool::Reservation,
     queued_ms: u64,
 ) -> crate::engine::event::BuildEventKind {
@@ -667,19 +704,20 @@ where
 mod tests {
     use super::*;
     use crate::engine::event::BuildEventKind;
+    use crate::engine::resource_pool::Limit;
     use crate::engine::resource_pool::ResourcePool;
     use futures::FutureExt as _;
-    use hplugin::driver::Resources;
+    use hcore::capacity::Unit;
+    use hplugin::driver::{Demand, Resources};
     use hplugin::provider::PoolName;
 
     const CPU: u64 = Resources::MICROS_PER_CPU;
 
-    fn req(pairs: &[(&str, u64)]) -> Resources {
-        Resources::try_from_pairs(pairs.iter().map(|&(n, a)| (n.to_string(), a)))
-            .expect("resources")
+    fn req(pairs: &[(&str, u64)]) -> Demand {
+        Demand::try_from_pairs(pairs.iter().map(|&(n, a)| (n.to_string(), a))).expect("demand")
     }
 
-    fn grant(caps: &[(&str, u64)], r: &Resources) -> crate::engine::resource_pool::Reservation {
+    fn grant(caps: &[(&str, Limit)], r: &Demand) -> crate::engine::resource_pool::Reservation {
         ResourcePool::new(
             caps.iter()
                 .map(|&(n, c)| (PoolName::try_from(n).expect("pool"), c)),
@@ -696,7 +734,13 @@ mod tests {
     #[test]
     fn execute_start_reserved_is_the_granted_amount() {
         let declared = req(&[("cpu", 16 * CPU)]);
-        let r = grant(&[("cpu", 4 * CPU), ("memory", 1 << 30)], &declared);
+        let r = grant(
+            &[
+                ("cpu", Limit::Bounded(4 * CPU)),
+                ("memory", Limit::Bounded(1 << 30)),
+            ],
+            &declared,
+        );
         let ev = execute_start("//p:t".into(), "exec".into(), true, &declared, &r, 7);
         let BuildEventKind::ExecuteStart {
             declared,
@@ -723,7 +767,7 @@ mod tests {
     #[test]
     fn a_light_grant_reserves_zero_cpu_and_is_told_one() {
         let declared = req(&[("cpu", 0)]);
-        let r = grant(&[("cpu", 4 * CPU)], &declared);
+        let r = grant(&[("cpu", Limit::Bounded(4 * CPU))], &declared);
         let BuildEventKind::ExecuteStart { reserved, .. } =
             execute_start("//p:t".into(), "exec".into(), true, &declared, &r, 0)
         else {
@@ -733,21 +777,51 @@ mod tests {
             reserved,
             Some(std::collections::BTreeMap::from([("cpu".into(), 0)]))
         );
-        let a = allotment_of(&r, &declared);
-        assert_eq!((a.cpu.get(), a.memory_bytes), (1, None));
+        let a = allotment_of(&r, Unit::of_builtin);
+        assert_eq!(a.iter().collect::<Vec<_>>(), [("cpu", "1")]);
     }
 
-    /// The allotment rounds the granted cpu up to whole CPUs and carries the
-    /// granted memory only when memory was declared.
-    #[test]
-    fn allotment_is_the_grant_in_whole_cpus_and_declared_memory() {
-        let caps = [("cpu", 4 * CPU), ("memory", 4 << 30)];
-        let declared = req(&[("cpu", 2_500_000), ("memory", 8 << 30)]);
-        let a = allotment_of(&grant(&caps, &declared), &declared);
-        assert_eq!((a.cpu.get(), a.memory_bytes), (3, Some(4 << 30)));
+    fn units(pool: &str) -> Option<Unit> {
+        match pool {
+            "gpu" => Some(Unit::Count),
+            "scratch" => Some(Unit::Bytes),
+            p => Unit::of_builtin(p),
+        }
+    }
 
-        let undeclared = req(&[]);
-        let a = allotment_of(&grant(&caps, &undeclared), &undeclared);
-        assert_eq!((a.cpu.get(), a.memory_bytes), (1, None));
+    /// The allotment rounds the granted cpu up to whole CPUs and carries every
+    /// other pool granted more than 0, each rendered by its unit — custom pools
+    /// included.
+    #[test]
+    fn allotment_is_every_granted_pool_rendered_by_its_unit() {
+        let caps = [
+            ("cpu", Limit::Bounded(4 * CPU)),
+            ("gpu", Limit::Bounded(2)),
+            ("memory", Limit::Bounded(4 << 30)),
+            ("scratch", Limit::Unbounded),
+        ];
+        let declared = req(&[
+            ("cpu", 2_500_000),
+            ("gpu", 1),
+            ("memory", 8 << 30),
+            ("scratch", 3 << 40),
+        ]);
+        let a = allotment_of(&grant(&caps, &declared), units);
+        assert_eq!(
+            a.iter().collect::<Vec<_>>(),
+            [
+                ("cpu", "3"),
+                ("gpu", "1"),
+                ("memory", "4294967296"),
+                ("scratch", "3298534883328"),
+            ],
+            "memory clamped to 4 GiB; the unbounded pool carries what was declared"
+        );
+
+        // Nothing declared: cpu alone; a pool declared at 0 is not granted.
+        for undeclared in [req(&[]), req(&[("gpu", 0)])] {
+            let a = allotment_of(&grant(&caps, &undeclared), units);
+            assert_eq!(a.iter().collect::<Vec<_>>(), [("cpu", "1")]);
+        }
     }
 }
