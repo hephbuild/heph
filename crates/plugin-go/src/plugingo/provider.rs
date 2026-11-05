@@ -1,5 +1,5 @@
 use crate::plugingo::addr_util::{
-    GoPackageKind, decode_package, encode_firstparty, encode_stdlib, encode_thirdparty,
+    GoPackageKind, GoPkgResolver, encode_firstparty, encode_stdlib, encode_thirdparty,
     encode_thirdparty_download,
 };
 use crate::plugingo::cc_toolchain;
@@ -136,6 +136,10 @@ pub struct Provider {
 
 pub(crate) struct ProviderInner {
     workspace_root: PathBuf,
+    /// heph package → Go package decoding and `go.mod` lookups, memoized for
+    /// this provider's `workspace_root`. An `Arc` because the package walk
+    /// carries it into a blocking task.
+    pkgs: Arc<GoPkgResolver>,
     /// Go release the hermetic toolchain is pinned to (see [`Config::go_version`]).
     go_version: String,
     /// Expected SDK tarball checksums by [`toolchain::checksum_key`] (see
@@ -358,6 +362,7 @@ impl Provider {
     ) -> anyhow::Result<Self> {
         Ok(Self {
             inner: Arc::new(ProviderInner {
+                pkgs: Arc::new(GoPkgResolver::new(workspace_root.clone())),
                 workspace_root,
                 go_version: config.go_version,
                 sdk_checksums: config.sdk_checksums,
@@ -389,12 +394,13 @@ impl Provider {
 fn collect_go_packages(
     walker: &CachedWalker,
     dir: &Path,
-    workspace_root: &Path,
+    pkgs: &GoPkgResolver,
     under_gomod: bool,
     skip: &Ignore,
     result: &mut Vec<anyhow::Result<ListPackageResponse>>,
 ) {
-    let is_under = under_gomod || crate::plugingo::addr_util::find_go_mod(dir).is_some();
+    let workspace_root = pkgs.workspace_root();
+    let is_under = under_gomod || pkgs.find_go_mod(dir).is_some();
 
     if is_under {
         let rel = dir.strip_prefix(workspace_root).unwrap_or(dir);
@@ -456,7 +462,7 @@ fn collect_go_packages(
         if skip.prune_dir(&entry_path, rel) {
             continue;
         }
-        collect_go_packages(walker, &entry_path, workspace_root, is_under, skip, result);
+        collect_go_packages(walker, &entry_path, pkgs, is_under, skip, result);
     }
 }
 
@@ -845,7 +851,12 @@ impl PluginFn for GocacheAddrFn {
             // The workspace root from the call context, not the provider's: a
             // BUILD file is evaluated against the root that loaded it, and a
             // function's inputs are its arguments, `pkg` and `root` (I1).
-            module: module_of_pkg(&hmodel::htpkg::PkgBuf::from(ctx.pkg), ctx.root),
+            // A one-shot resolver for that root: one decode per call, and the
+            // provider's memo is keyed to the provider's root.
+            module: module_of_pkg(
+                &hmodel::htpkg::PkgBuf::from(ctx.pkg),
+                &GoPkgResolver::new(ctx.root.to_path_buf()),
+            ),
             go_version: gotool,
             goos,
             goarch,
@@ -919,7 +930,7 @@ impl ProviderInner {
                     >)
             };
 
-            let kind = match decode_package(&req.package, &self.workspace_root) {
+            let kind = match self.pkgs.decode(&req.package) {
                 Some(k) => k,
                 None => return empty(),
             };
@@ -973,9 +984,7 @@ impl ProviderInner {
                     .states_under(&hmodel::htpkg::PkgBuf::from(module_root.as_str()))
                     .await?
                     .into_iter()
-                    .filter(|s| {
-                        pkg_in_module(s.package.as_str(), &module_root, &self.workspace_root)
-                    })
+                    .filter(|s| pkg_in_module(s.package.as_str(), &module_root, &self.pkgs))
                     .collect();
                 variant::universe_variants(&module_states)?
             } else {
@@ -1152,9 +1161,9 @@ impl ProviderInner {
             // that cannot compile must fail here, not prune nothing.
             self.skip.ensure_compiled()?;
             let packages = hcore::blocking::run(
-                enclose!((self.workspace_root => workspace_root, self.skip => skip, self.walker => walker) move || {
+                enclose!((self.pkgs => pkgs, self.skip => skip, self.walker => walker) move || {
                     let mut packages = Vec::new();
-                    collect_go_packages(&walker, &search_dir, &workspace_root, false, &skip, &mut packages);
+                    collect_go_packages(&walker, &search_dir, &pkgs, false, &skip, &mut packages);
                     packages
                 }),
             )
@@ -1311,11 +1320,11 @@ fn module_root_rel(kind: &GoPackageKind, workspace_root: &Path) -> String {
 /// which land in the module-less cache rather than being attributed to whichever
 /// module asked first.
 ///
-/// `decode_package` is memoized, so this is a map lookup on the hot spec-
+/// `GoPkgResolver::decode` is memoized, so this is a map lookup on the hot spec-
 /// generation path rather than a `go.mod` walk per target.
-fn module_of_pkg(pkg: &hmodel::htpkg::PkgBuf, workspace_root: &Path) -> String {
-    decode_package(pkg, workspace_root)
-        .map(|k| module_root_rel(&k, workspace_root))
+fn module_of_pkg(pkg: &hmodel::htpkg::PkgBuf, pkgs: &GoPkgResolver) -> String {
+    pkgs.decode(pkg)
+        .map(|k| module_root_rel(&k, pkgs.workspace_root()))
         .unwrap_or_default()
 }
 
@@ -1323,9 +1332,9 @@ fn module_of_pkg(pkg: &hmodel::htpkg::PkgBuf, workspace_root: &Path) -> String {
 /// `target_module_root` (workspace-relative). The real nearest-`go.mod` check —
 /// used to bound `vp` honoring and library-variant enumeration to the target's
 /// own module, so a nested submodule's variants never leak across the boundary.
-fn pkg_in_module(pkg: &str, target_module_root: &str, workspace_root: &Path) -> bool {
-    match decode_package(&hmodel::htpkg::PkgBuf::from(pkg), workspace_root) {
-        Some(kind) => module_root_rel(&kind, workspace_root) == target_module_root,
+fn pkg_in_module(pkg: &str, target_module_root: &str, pkgs: &GoPkgResolver) -> bool {
+    match pkgs.decode(&hmodel::htpkg::PkgBuf::from(pkg)) {
+        Some(kind) => module_root_rel(&kind, pkgs.workspace_root()) == target_module_root,
         None => false,
     }
 }
@@ -1985,7 +1994,7 @@ impl ProviderInner {
             return Ok(GetResponse { target_spec: spec });
         }
 
-        let kind = match decode_package(&addr.package, &self.workspace_root) {
+        let kind = match self.pkgs.decode(&addr.package) {
             Some(k) => k,
             None => return Err(GetError::NotFound),
         };
@@ -2200,7 +2209,7 @@ impl ProviderInner {
             GoPackageKind::FirstParty { .. } => addr
                 .args
                 .get("vp")
-                .is_some_and(|vp| pkg_in_module(vp, &module_root, &self.workspace_root)),
+                .is_some_and(|vp| pkg_in_module(vp, &module_root, &self.pkgs)),
         };
         let (factors, vref) = variant::resolve(
             addr,
@@ -2331,7 +2340,7 @@ impl ProviderInner {
                         embed_golist,
                         &pkg_addrs.embed_files,
                         &self.go_version,
-                        &module_of_pkg(&addr.package, &self.workspace_root),
+                        &module_of_pkg(&addr.package, &self.pkgs),
                     ),
                     _ => {
                         // `go_embed_src` assets (kept out of `_golist`) are staged
@@ -2357,7 +2366,7 @@ impl ProviderInner {
                             &transitive.libs,
                             &pkg_addrs.go_files,
                             &self.go_version,
-                            &module_of_pkg(&addr.package, &self.workspace_root),
+                            &module_of_pkg(&addr.package, &self.pkgs),
                             embed_golist,
                             &pkg_addrs.embed_files,
                             &embed_src_addrs,
@@ -2395,12 +2404,12 @@ impl ProviderInner {
                     .iter()
                     .filter(|(_, dep)| {
                         is_firstparty_pkg(dep.package.as_str())
-                            && crate::plugingo::addr_util::find_go_mod(
-                                &self.workspace_root.join(dep.package.as_str()),
-                            )
-                            .is_some_and(|(dep_module_root, _)| {
-                                self.golangci_config_addr(&dep_module_root).is_some()
-                            })
+                            && self
+                                .pkgs
+                                .find_go_mod(&self.workspace_root.join(dep.package.as_str()))
+                                .is_some_and(|(dep_module_root, _)| {
+                                    self.golangci_config_addr(&dep_module_root).is_some()
+                                })
                     })
                     .map(|(ip, dep)| {
                         (
@@ -2580,7 +2589,7 @@ impl ProviderInner {
                     &test_embed_files,
                     &embed_src_addrs,
                     &self.go_version,
-                    &module_of_pkg(&addr.package, &self.workspace_root),
+                    &module_of_pkg(&addr.package, &self.pkgs),
                 );
                 Ok(GetResponse { target_spec: spec })
             }
@@ -2680,7 +2689,7 @@ impl ProviderInner {
                     &pkg_addrs.xtest_embed_files,
                     &embed_src_addrs,
                     &self.go_version,
-                    &module_of_pkg(&addr.package, &self.workspace_root),
+                    &module_of_pkg(&addr.package, &self.pkgs),
                 );
                 Ok(GetResponse { target_spec: spec })
             }
@@ -2715,7 +2724,7 @@ impl ProviderInner {
                     &testmain_src_addr,
                     &transitive.libs,
                     &self.go_version,
-                    &module_of_pkg(&addr.package, &self.workspace_root),
+                    &module_of_pkg(&addr.package, &self.pkgs),
                 );
                 Ok(GetResponse { target_spec: spec })
             }
@@ -2755,7 +2764,7 @@ impl ProviderInner {
                     &testmain_src_addr,
                     &transitive.libs,
                     &self.go_version,
-                    &module_of_pkg(&addr.package, &self.workspace_root),
+                    &module_of_pkg(&addr.package, &self.pkgs),
                 );
                 Ok(GetResponse { target_spec: spec })
             }
@@ -4148,7 +4157,6 @@ mod tests {
     }
 
     use super::*;
-    use crate::plugingo::addr_util::decode_package;
     use crate::plugingo::factors::Factors;
     use crate::plugingo::pkg_analysis::run_go_list;
     use anyhow::Context;
@@ -4500,7 +4508,8 @@ mod tests {
                         },
                         |(f, _)| f,
                     );
-                let kind = decode_package(&addr.package, &self.workspace_root)
+                let kind = GoPkgResolver::new(self.workspace_root.clone())
+                    .decode(&addr.package)
                     .ok_or_else(|| anyhow::anyhow!("unknown package: {}", addr.package))?;
 
                 let (import_path, run_dir) = match &*kind {
@@ -4837,7 +4846,8 @@ mod tests {
         let skip = Ignore::new(&[home.clone()], &["internal".to_string()]).unwrap();
         let walker = CachedWalker::disabled();
         let mut out = Vec::new();
-        collect_go_packages(&walker, root, root, false, &skip, &mut out);
+        let pkgs = GoPkgResolver::new(root.to_path_buf());
+        collect_go_packages(&walker, root, &pkgs, false, &skip, &mut out);
         let pkgs: Vec<String> = out
             .into_iter()
             .map(|r| r.unwrap().pkg.to_string())
@@ -4878,11 +4888,12 @@ mod tests {
             s
         };
 
+        let pkgs = GoPkgResolver::new(root.to_path_buf());
         let mut uncached = Vec::new();
         collect_go_packages(
             &CachedWalker::disabled(),
             root,
-            root,
+            &pkgs,
             false,
             &skip,
             &mut uncached,
@@ -4891,10 +4902,10 @@ mod tests {
         let dbdir = tempfile::tempdir().unwrap();
         let walker = CachedWalker::open(&dbdir.path().join("fswalk.db"));
         let mut cached = Vec::new();
-        collect_go_packages(&walker, root, root, false, &skip, &mut cached);
+        collect_go_packages(&walker, root, &pkgs, false, &skip, &mut cached);
         // Second walk: now served from the walker's cache; still identical.
         let mut cached2 = Vec::new();
-        collect_go_packages(&walker, root, root, false, &skip, &mut cached2);
+        collect_go_packages(&walker, root, &pkgs, false, &skip, &mut cached2);
 
         let expected = to_pkgs(uncached);
         assert!(expected.contains(&"a".to_string()));
@@ -6753,6 +6764,21 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             "_go_src must not appear in list output: {:?}",
             names
         );
+    }
+
+    /// Hostbin's `@heph/bin` sits under the root go.mod as a non-existent dir,
+    /// which first-party decoding accepts for codegen. The Go provider must
+    /// neither list nor resolve targets there: a listed `build_lib` matched
+    /// `label(go-build)` and hostbin then failed with "cannot find binary path".
+    #[tokio::test]
+    async fn test_other_providers_at_package_is_not_go() {
+        require_go!();
+        let sandbox = copy_fixture("simple_lib");
+        let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
+        let names = provider_list(&p, "@heph/bin").await;
+        assert!(names.is_empty(), "@heph/bin must list nothing: {names:?}");
+        let result = provider_get(&p, make_addr("@heph/bin", "build_lib")).await;
+        assert!(matches!(result, Err(GetError::NotFound)));
     }
 
     // ---- non-Go package ----
