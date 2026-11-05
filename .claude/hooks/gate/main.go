@@ -21,6 +21,8 @@
 // It also allows every command while telling the model, once per 100k step
 // above 300k, how large its context has grown (context.go): on 2026-10-04
 // two sessions made 209 calls above 300k, with the rule already in CLAUDE.md.
+// And once per threshold, when the volume drops under 30 GB and then 10 GB
+// free (disk.go): a full disk stalled five of six sessions in one week.
 //
 // The command is parsed with mvdan.cc/sh (shfmt's parser), so quoting,
 // heredocs, command substitution and `bash -c` are read the way the shell
@@ -40,6 +42,7 @@ package main
 import (
 	"encoding/json"
 	"os"
+	"strings"
 )
 
 type hookInput struct {
@@ -86,8 +89,17 @@ func main() {
 	// No permissionDecision below: the command still goes through the normal
 	// permission flow, exactly as the original would have.
 	out := map[string]any{}
+	var notices []string
 	if notice := contextNotice(in.TranscriptPath, in.SessionID, in.AgentID, os.TempDir()); notice != "" {
-		out["additionalContext"] = notice
+		notices = append(notices, notice)
+	}
+	if free, ok := freeBytes(in.Cwd); ok && in.SessionID != "" {
+		if notice := diskNotice(free, in.SessionID+"-"+in.AgentID, os.TempDir()); notice != "" {
+			notices = append(notices, notice)
+		}
+	}
+	if len(notices) > 0 {
+		out["additionalContext"] = strings.Join(notices, "\n\n")
 	}
 	if rewritten != "" {
 		in.ToolInput["command"] = rewritten
