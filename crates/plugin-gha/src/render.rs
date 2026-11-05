@@ -51,16 +51,6 @@ pub(crate) const LIVE_SECTION_BUDGET: usize = COMMENT_LIMIT / 4;
 /// the JSON document; the report is an index, not a transcript.
 const MAX_MSG_CHARS: usize = 200;
 
-/// The cache cell for a host older than `CacheOutcome` (see
-/// [`Counters::cache`]): it sent only tier events, which cannot be counted
-/// per target.
-pub(crate) const CACHE_UNAVAILABLE: &str =
-    "cache accounting unavailable: this heph predates per-target cache outcomes — upgrade heph";
-
-/// The live counts line's cached cell for the same host: names the cause,
-/// since a bare `n/a` reads like a broken report.
-const CACHED_UNAVAILABLE: &str = "cached n/a (heph too old)";
-
 /// `99.9%`, or `n/a` when there is no rate.
 ///
 /// Never `100.0%` while anything missed, nor `0.0%` while anything hit: 26,921
@@ -259,16 +249,11 @@ fn counts_line(t: &Tally, c: &Counters) -> String {
     } else {
         format!("~{}", fmt_count(total))
     };
-    // A host too old to send outcomes has no cached count; `0 cached` would
-    // read as a cold cache.
-    let cached = match c.cache {
-        Some(_) => format!("{} cached", fmt_count(c.cached())),
-        None => CACHED_UNAVAILABLE.to_string(),
-    };
     format!(
-        "**{} / {}** done · {cached} · {} executed · **{} failed**\n",
+        "**{} / {}** done · {} cached · {} executed · **{} failed**\n",
         fmt_count(done),
         total_str,
+        fmt_count(c.cached()),
         fmt_count(c.executed),
         fmt_count(c.roots_total),
     )
@@ -697,9 +682,8 @@ fn push_summary_table(b: &mut Budgeted, t: &Tally, c: &Counters) {
         fmt_count(done.saturating_sub(c.roots_total.min(done))),
         fmt_count(c.roots_total)
     ));
-    match (c.cache, c.hit_rate()) {
-        (None, _) => s.push_str(&format!("| cache | {CACHE_UNAVAILABLE} |\n")),
-        (Some(_), Some(_)) => {
+    match c.hit_rate() {
+        Some(_) => {
             // A rebuilt hit is a miss, but it points at cache health rather
             // than at changed inputs, so it is called out when there is one.
             let rebuilt = match c.rebuilt() {
@@ -713,7 +697,7 @@ fn push_summary_table(b: &mut Budgeted, t: &Tally, c: &Counters) {
             ));
         }
         // Never render "0%" for a cache that was never consulted.
-        (Some(_), None) => s.push_str("| cache | not consulted |\n"),
+        None => s.push_str("| cache | not consulted |\n"),
     }
     s.push_str(&format!(
         "| executed | {} targets |\n",
@@ -736,7 +720,7 @@ fn push_summary_table(b: &mut Budgeted, t: &Tally, c: &Counters) {
 /// events (`docs/GHA_REPORTING.md` §7.2); until then this says what *is* known
 /// and points at the command that answers the rest.
 fn push_zero_hit_diagnosis(b: &mut Budgeted, t: &Tally, c: &Counters) {
-    if c.cache.is_none() || c.cached() > 0 || c.misses() == 0 {
+    if c.cached() > 0 || c.misses() == 0 {
         return;
     }
     // Under `--no-scratch` a total miss is the *requested* outcome, not a
@@ -897,7 +881,6 @@ mod tests {
                 scratch_disabled: false,
                 resources: Default::default(),
                 units: Default::default(),
-                cache_outcomes: true,
             },
         ));
         t.apply(&ev(
@@ -1372,7 +1355,6 @@ mod tests {
                 scratch_disabled: false,
                 resources: Default::default(),
                 units: Default::default(),
-                cache_outcomes: true,
             },
         ));
         let md = render_live(&t, &ctx("heph run //...", 9_000), COMMENT_LIMIT);
@@ -1430,7 +1412,6 @@ mod tests {
                 scratch_disabled: false,
                 resources: Default::default(),
                 units: Default::default(),
-                cache_outcomes: true,
             },
         ));
         println!("\n===== LIVE, healthy =====\n");
@@ -1544,7 +1525,6 @@ mod tests {
                 scratch_disabled: true,
                 resources: Default::default(),
                 units: Default::default(),
-                cache_outcomes: true,
             },
         ));
         t.apply(&ev(0, outcome("//a:x", CacheOutcomeKind::Miss)));
@@ -1644,47 +1624,6 @@ mod tests {
         assert!(out.contains("1 hits (1 local, 0 remote)"), "{out}");
     }
 
-    /// A stream from a host older than `CacheOutcome`: its `RequestConfig`
-    /// carries no capability, and it sends tier events only.
-    fn old_host_tally() -> Tally {
-        let mut t = Tally::default();
-        t.apply(&ev(
-            0,
-            BuildEventKind::RequestConfig {
-                max_workers: 64,
-                fail_fast: false,
-                scratch_disabled: false,
-                resources: Default::default(),
-                units: Default::default(),
-                cache_outcomes: false,
-            },
-        ));
-        t.apply(&ev(
-            0,
-            BuildEventKind::Matched {
-                addrs: vec!["//a:x".into(), "//a:y".into()],
-                complete: true,
-            },
-        ));
-        t.apply(&ev(
-            1,
-            BuildEventKind::LocalCacheHit {
-                addr: "//a:x".into(),
-            },
-        ));
-        t
-    }
-
-    /// The live comment says why there is no cached count, from the first
-    /// tier event — not `0 cached`, which reads as a cold cache.
-    #[test]
-    fn old_host_live_counts_name_the_cause() {
-        let t = old_host_tally();
-        let md = render_live(&t, &ctx("Build", 5_000), COMMENT_LIMIT);
-        assert!(md.contains(CACHED_UNAVAILABLE), "{md}");
-        assert!(!md.contains("0 cached"), "{md}");
-    }
-
     /// 26,921 hits and 3 misses is not `100.0%`; one hit in 10,000 is not
     /// `0.0%`. Exact ends stay exact.
     #[test]
@@ -1742,29 +1681,5 @@ mod tests {
             md.contains(&format!("| cache | **{expected}** · 1 misses |")),
             "{md}"
         );
-    }
-
-    /// A host older than `CacheOutcome` sends tier events only: say so,
-    /// rather than render a tier-derived number or a 0% warning.
-    #[test]
-    fn old_host_renders_unavailable() {
-        let mut t = old_host_tally();
-        t.apply(&ev(
-            1,
-            BuildEventKind::LocalCacheMiss {
-                addr: "//a:y".into(),
-            },
-        ));
-        t.apply(&ev(
-            2,
-            BuildEventKind::RemoteCacheMiss {
-                addr: "//a:y".into(),
-            },
-        ));
-        t.set_closed();
-        let out = render_final(&t, &ctx("Build", 60_000), SUMMARY_BUDGET);
-        assert!(out.contains(CACHE_UNAVAILABLE), "{out}");
-        assert!(!out.contains("hit rate"), "{out}");
-        assert!(!out.contains("inspect hashin"), "{out}");
     }
 }

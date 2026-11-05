@@ -31,7 +31,7 @@ const ALLOWED: &[(&str, &str)] = &[
     ),
     (
         "crates/plugin-gha/src/tally.rs",
-        "tells an old host that consulted the cache from one that never did; never counts them",
+        "an explicit no-op match arm; never counts them",
     ),
     (
         "crates/tui/src/tui/progress.rs",

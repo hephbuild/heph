@@ -989,7 +989,6 @@ impl RequestState {
                 scratch_disabled,
                 resources: pools.capacities,
                 units: pools.units,
-                cache_outcomes: true,
             });
         }
     }

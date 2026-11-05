@@ -184,11 +184,8 @@ pub(crate) struct Counters {
     pub blocked: usize,
     /// Root failures seen, including those beyond `ROOTS_KEPT`.
     pub roots_total: usize,
-    /// Per-target cache accounting, or `None` when the host is older than
-    /// `CacheOutcome`: it sent tier events and no outcome. There is no
-    /// tier-derived fallback — that fold is the bug the outcome replaced, so
-    /// an old host's report says "unavailable" rather than a wrong number.
-    pub cache: Option<CacheCounts>,
+    /// Per-target cache counts, folded from `CacheOutcome` / `CacheHitRebuilt`.
+    pub cache: CacheCounts,
 }
 
 /// A count for display and JSON, from the fold's `u64`.
@@ -197,36 +194,33 @@ fn count(n: u64) -> usize {
 }
 
 impl Counters {
-    /// Targets served from cache. `0` when accounting is unavailable; a
-    /// surface that must not read that as "no hits" checks [`cache`]
-    /// (Self::cache).
+    /// Targets served from cache.
     pub(crate) fn cached(&self) -> usize {
-        self.cache.map_or(0, |c| count(c.hits()))
+        count(self.cache.hits())
     }
 
     pub(crate) fn local_hits(&self) -> usize {
-        self.cache.map_or(0, |c| count(c.local_hits()))
+        count(self.cache.local_hits())
     }
 
     pub(crate) fn remote_hits(&self) -> usize {
-        self.cache.map_or(0, |c| count(c.remote_hits()))
+        count(self.cache.remote_hits())
     }
 
     /// Targets that had to be built, rebuilt hits included.
     pub(crate) fn misses(&self) -> usize {
-        self.cache.map_or(0, |c| count(c.misses()))
+        count(self.cache.misses())
     }
 
     /// The part of [`misses`](Self::misses) announced as a hit and then rebuilt.
     pub(crate) fn rebuilt(&self) -> usize {
-        self.cache.map_or(0, |c| count(c.rebuilt()))
+        count(self.cache.rebuilt())
     }
 
     /// Hit rate over targets the cache was actually consulted for. `None` when it
-    /// was never consulted — rendering `0%` there would be a lie — or when
-    /// accounting is unavailable.
+    /// was never consulted — rendering `0%` there would be a lie.
     pub(crate) fn hit_rate(&self) -> Option<f64> {
-        self.cache.and_then(|c| c.hit_rate())
+        self.cache.hit_rate()
     }
 }
 
@@ -257,14 +251,6 @@ pub(crate) struct Tally {
     counters: Counters,
     /// Folded from `CacheOutcome` / `CacheHitRebuilt` only.
     cache: CacheCounts,
-    /// Whether the host said it emits `CacheOutcome`: a `RequestConfig` with
-    /// `cache_outcomes`, or an outcome itself. Never inferred from which events
-    /// have not arrived yet — a new host's first probe can error or be
-    /// cancelled before any outcome, and that is not an old host.
-    host_has_outcomes: bool,
-    /// Any tier event: the cache was consulted. With no outcome capability,
-    /// that is an old host whose per-target counts are unknowable.
-    saw_tier: bool,
 
     /// Roots in first-seen order — never re-sorted, so consecutive renders differ
     /// by appends only and an agent diffing two fetches sees "one new root"
@@ -353,9 +339,7 @@ impl Tally {
                 // Pool capacities; the report does not render them yet.
                 resources: _,
                 units,
-                cache_outcomes,
             } => {
-                self.host_has_outcomes |= *cache_outcomes;
                 self.max_workers = *max_workers;
                 self.pool_units.clone_from(units);
                 self.fail_fast = *fail_fast;
@@ -457,18 +441,13 @@ impl Tally {
             }
 
             // Tier events are per tier, not per target — a remote hit is a
-            // local miss first — so they count nothing. They only tell an old
-            // host that consulted the cache apart from a run that never did.
+            // local miss first — so they count nothing.
             BuildEventKind::LocalCacheHit { addr } | BuildEventKind::RemoteCacheHit { addr } => {
-                self.saw_tier = true;
                 self.ensure(addr, ev.at_unix_ms);
             }
-            BuildEventKind::RemoteCacheMiss { .. } | BuildEventKind::LocalCacheMiss { .. } => {
-                self.saw_tier = true;
-            }
+            BuildEventKind::RemoteCacheMiss { .. } | BuildEventKind::LocalCacheMiss { .. } => {}
 
             BuildEventKind::CacheOutcome { addr, outcome } => {
-                self.host_has_outcomes = true;
                 self.cache.apply(&ev.kind);
                 if *outcome == CacheOutcomeKind::Miss {
                     self.bump_pkg_miss(addr);
@@ -699,9 +678,8 @@ impl Tally {
     }
 
     pub(crate) fn counters(&self) -> Counters {
-        let old_host = !self.host_has_outcomes && self.saw_tier;
         Counters {
-            cache: (!old_host).then_some(self.cache),
+            cache: self.cache,
             ..self.counters
         }
     }
@@ -1096,7 +1074,7 @@ mod tests {
         }
         t.set_closed();
         let c = t.counters();
-        assert_eq!(c.cache, Some(fold));
+        assert_eq!(c.cache, fold);
         let (l, r, m, rb) = hcore::events::test_support::CACHE_STREAM_EXPECTED;
         let n = |x: u64| usize::try_from(x).expect("small");
         assert_eq!(
@@ -1138,67 +1116,6 @@ mod tests {
         let (rows, total) = t.misses_by_package(10);
         assert_eq!(rows, vec![("//cold".to_string(), 1)]);
         assert_eq!(total, 1);
-    }
-
-    /// A `RequestConfig` as the host announces it, with or without the
-    /// outcome capability.
-    fn request_config(cache_outcomes: bool) -> BuildEventKind {
-        BuildEventKind::RequestConfig {
-            max_workers: 4,
-            fail_fast: false,
-            scratch_disabled: false,
-            resources: Default::default(),
-            units: Default::default(),
-            cache_outcomes,
-        }
-    }
-
-    /// A host older than `CacheOutcome` sends tier events only. Its counts are
-    /// unknowable per target, so there are none — not a tier-derived guess —
-    /// and that is known from the first tier event, live or closed.
-    #[test]
-    fn old_host_cache_accounting_is_unavailable() {
-        let mut t = Tally::default();
-        t.apply(&ev(0, request_config(false)));
-        t.apply(&ev(
-            1,
-            BuildEventKind::LocalCacheMiss {
-                addr: "//a:x".into(),
-            },
-        ));
-        assert_eq!(t.counters().cache, None, "live, after one tier event");
-        t.apply(&ev(
-            2,
-            BuildEventKind::RemoteCacheHit {
-                addr: "//a:x".into(),
-            },
-        ));
-        t.set_closed();
-        assert_eq!(t.counters().cache, None, "closed, still no outcome");
-
-        // Never consulted: not "unavailable", just nothing.
-        let mut t = Tally::default();
-        t.apply(&ev(0, request_config(false)));
-        t.set_closed();
-        assert_eq!(t.counters().cache, Some(CacheCounts::default()));
-    }
-
-    /// A new host whose only probe settled no outcome — the remote read
-    /// errored or was cancelled — is not an old host: it announced the
-    /// capability, so the counts are what they are, not "unavailable".
-    #[test]
-    fn new_host_without_an_outcome_is_not_unavailable() {
-        let mut t = Tally::default();
-        t.apply(&ev(0, request_config(true)));
-        t.apply(&ev(
-            1,
-            BuildEventKind::LocalCacheMiss {
-                addr: "//a:x".into(),
-            },
-        ));
-        assert_eq!(t.counters().cache, Some(CacheCounts::default()), "live");
-        t.set_closed();
-        assert_eq!(t.counters().cache, Some(CacheCounts::default()), "closed");
     }
 
     #[test]
@@ -1574,7 +1491,6 @@ mod tests {
                 scratch_disabled: false,
                 resources: [("scratch_disk".into(), Some(8 << 30))].into(),
                 units: [("scratch_disk".into(), "bytes".into())].into(),
-                cache_outcomes: true,
             },
         ));
         t.apply(&ev(
@@ -1712,7 +1628,6 @@ mod tests {
                 scratch_disabled: false,
                 resources: Default::default(),
                 units: Default::default(),
-                cache_outcomes: true,
             },
         ));
         t.apply(&ev(

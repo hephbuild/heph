@@ -2995,7 +2995,6 @@ mod tests {
                 scratch_disabled: false,
                 resources: [("scratch_disk".into(), Some(4 << 30))].into(),
                 units: [("scratch_disk".into(), "bytes".into())].into(),
-                cache_outcomes: true,
             },
         ));
         s.apply(&ev(
@@ -3094,7 +3093,6 @@ mod tests {
                     ("tokens".into(), "count".into()),
                 ]
                 .into(),
-                cache_outcomes: true,
             },
         ));
         let segments = |s: &BuildState| s.pool_segments().collect::<Vec<_>>();
@@ -3140,7 +3138,6 @@ mod tests {
                 scratch_disabled: false,
                 resources: [("cpu".into(), Some(4 * CPU)), ("gpu".into(), Some(4))].into(),
                 units: [("cpu".into(), "cpu".into()), ("gpu".into(), "count".into())].into(),
-                cache_outcomes: true,
             },
         ));
         let segments = |s: &BuildState| s.pool_segments().collect::<Vec<_>>();
@@ -4016,7 +4013,6 @@ mod tests {
             scratch_disabled: false,
             resources: Default::default(),
             units: Default::default(),
-            cache_outcomes: true,
         }
     }
 

@@ -203,13 +203,6 @@ pub enum BuildEventKind {
         /// predates the field) has its default unit.
         #[serde(default)]
         units: BTreeMap<String, String>,
-        /// Whether this host emits [`CacheOutcome`](Self::CacheOutcome): `true`
-        /// from every host that does. A frame from an older host, which only
-        /// emits the tier events, decodes `false` — so a consumer can say
-        /// "cache accounting unavailable" from a signal rather than infer it
-        /// from which events have or have not arrived yet.
-        #[serde(default)]
-        cache_outcomes: bool,
     },
     /// Incremental notice of matched top-level targets. `addrs` are newly
     /// matched addresses to add to the set; `complete` is false while the
@@ -975,22 +968,6 @@ mod tests {
             } => {
                 assert_eq!(max_workers, 8);
                 assert!(resources.is_empty(), "{resources:?}");
-            }
-            other => panic!("wrong variant: {other:?}"),
-        }
-    }
-
-    /// `RequestConfig` from a host predating `CacheOutcome` says so: the
-    /// field is absent, and absent must read as "no per-target outcomes",
-    /// which is what lets a consumer report cache accounting as unavailable.
-    #[test]
-    fn an_old_request_config_has_no_cache_outcomes() {
-        let old = r#"{"at_unix_ms":1,"kind":{"type":"RequestConfig","max_workers":8,
-            "fail_fast":false,"scratch_disabled":false,"resources":{},"units":{}}}"#;
-        let ev: BuildEvent = serde_json::from_str(old).expect("old frame must decode");
-        match ev.kind {
-            BuildEventKind::RequestConfig { cache_outcomes, .. } => {
-                assert!(!cache_outcomes, "an old host emits no CacheOutcome");
             }
             other => panic!("wrong variant: {other:?}"),
         }

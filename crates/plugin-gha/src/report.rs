@@ -63,17 +63,6 @@ fn status_str(t: &Tally, c: &Counters) -> &'static str {
     }
 }
 
-/// `per_target`, or `unavailable` for a host too old to send `CacheOutcome`:
-/// the explicit marker beside the cache counts, so their `null` (or absent
-/// output key) means "unknown", never `0`.
-fn cache_accounting(c: &Counters) -> &'static str {
-    if c.cache.is_some() {
-        "per_target"
-    } else {
-        "unavailable"
-    }
-}
-
 /// The full document — unbounded, for `jsonPath`.
 ///
 /// `failures` and `slowest` are sorted deterministically so two runs diff
@@ -114,19 +103,16 @@ pub(crate) fn full_document(
             "done": done,
             "failed": c.roots_total,
             "blocked": c.blocked,
-            "cached": c.cache.map(|_| c.cached()),
+            "cached": c.cached(),
             "executed": c.executed,
         },
         // Per target (one count per cacheable addr): `misses` includes
-        // `rebuilt`. Every count is `null` when the host is too old to send
-        // `CacheOutcome` — see `Counters::cache` — and `accounting` says
-        // which, so a consumer never reads that `null` as `0`.
+        // `rebuilt`.
         "cache": {
-            "accounting": cache_accounting(c),
-            "local_hits": c.cache.map(|_| c.local_hits()),
-            "remote_hits": c.cache.map(|_| c.remote_hits()),
-            "misses": c.cache.map(|_| c.misses()),
-            "rebuilt": c.cache.map(|_| c.rebuilt()),
+            "local_hits": c.local_hits(),
+            "remote_hits": c.remote_hits(),
+            "misses": c.misses(),
+            "rebuilt": c.rebuilt(),
             "hit_rate": c.hit_rate(),
         },
         "failures": failures,
@@ -179,7 +165,7 @@ pub(crate) fn embedded_document(
                 "matched": matched,
                 "failed": c.roots_total,
                 "blocked": c.blocked,
-                "cached": c.cache.map(|_| c.cached()),
+                "cached": c.cached(),
                 "executed": c.executed,
             },
             "failures": addrs,
@@ -256,9 +242,6 @@ fn escape_annotation(s: &str) -> String {
 /// `key=value` lines for `$GITHUB_OUTPUT` — the GHA-native agent surface: free,
 /// no parsing, no rate limit, and readable by a downstream step as
 /// `${{ steps.build.outputs.heph_failed }}`.
-///
-/// `heph_cache_accounting` is always present; `heph_cached` and
-/// `heph_cache_hit_rate` can be absent.
 pub(crate) fn github_outputs(
     t: &Tally,
     c: &Counters,
@@ -270,15 +253,10 @@ pub(crate) fn github_outputs(
         format!("heph_failed={}", c.roots_total),
         format!("heph_blocked={}", c.blocked),
         format!("heph_executed={}", c.executed),
+        format!("heph_cached={}", c.cached()),
         format!("heph_elapsed_ms={elapsed_ms}"),
         format!("heph_elapsed={}", fmt_duration(elapsed_ms)),
-        format!("heph_cache_accounting={}", cache_accounting(c)),
     ];
-    // Absent, not `0`, when the host is too old to count per target;
-    // `heph_cache_accounting` says so explicitly.
-    if c.cache.is_some() {
-        out.push(format!("heph_cached={}", c.cached()));
-    }
     if let Some(rate) = c.hit_rate() {
         out.push(format!("heph_cache_hit_rate={rate:.4}"));
     }
@@ -481,10 +459,9 @@ mod tests {
         }
     }
 
-    /// `cache` keeps its keys, now per target, plus `rebuilt`; on a host too
-    /// old to send outcomes every count is `null`, never a tier-derived guess.
+    /// `cache` keeps its keys, now per target, plus `rebuilt`.
     #[test]
-    fn cache_block_is_per_target_and_null_on_an_old_host() {
+    fn cache_block_is_per_target() {
         use hcore::events::{CacheHitKind, CacheOutcomeKind};
         let mut t = failing(0, 0, 0);
         let o = |addr: &str, outcome| BuildEventKind::CacheOutcome {
@@ -513,42 +490,16 @@ mod tests {
         }
         let c = t.counters();
         let v = full_document(&t, &c, 1_000, "run //...", None);
-        assert_eq!(v["cache"]["accounting"], "per_target");
-        assert!(
-            github_outputs(&t, &c, 1_000, None)
-                .iter()
-                .any(|l| l == "heph_cache_accounting=per_target"),
-        );
         assert_eq!(v["cache"]["local_hits"], 0);
         assert_eq!(v["cache"]["remote_hits"], 1);
         assert_eq!(v["cache"]["misses"], 2, "inclusive of the rebuilt one");
         assert_eq!(v["cache"]["rebuilt"], 1);
         assert_eq!(v["cache"]["hit_rate"].as_f64(), Some(1.0 / 3.0));
         assert_eq!(v["targets"]["cached"], 1);
-
-        let mut t = failing(0, 0, 0);
-        t.apply(&BuildEvent {
-            at_unix_ms: 1,
-            kind: BuildEventKind::RemoteCacheHit {
-                addr: "//a:r".into(),
-            },
-        });
-        let c = t.counters();
-        let v = full_document(&t, &c, 1_000, "run //...", None);
-        for key in ["local_hits", "remote_hits", "misses", "rebuilt", "hit_rate"] {
-            assert!(v["cache"][key].is_null(), "{key}: {v}");
-        }
-        assert!(v["targets"]["cached"].is_null(), "{v}");
-        assert_eq!(v["cache"]["accounting"], "unavailable", "{v}");
-        let out = github_outputs(&t, &c, 1_000, None);
         assert!(
-            out.iter().any(|l| l == "heph_cache_accounting=unavailable"),
-            "{out:?}"
-        );
-        assert!(
-            !out.iter()
-                .any(|l| l.starts_with("heph_cached") || l.starts_with("heph_cache_hit_rate")),
-            "{out:?}"
+            github_outputs(&t, &c, 1_000, None)
+                .iter()
+                .any(|l| l == "heph_cached=1"),
         );
     }
 
