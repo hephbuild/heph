@@ -50,6 +50,15 @@ binary, the three plugin cdylibs, every proc-macro and every test harness.
 to explain a miss, `KACHE_PROGRESS=verbose` for per-crate stderr lines, and
 `kache doctor` when something looks wrong. `KACHE_DISABLED=1` bypasses it entirely.
 
+### Disk
+
+In the week to 2026-11-05, a full disk stalled five of the six go and bug-fix sessions. One sat blocked for four hours, and fix agents handed back half-done work. Each worktree's `target/` is 20–45 GB, and the kache store and `.heph/` sandboxes come on top. The gate hook says so once below 30 GB free and again below 10 GB.
+
+- `kache clean --orphans -y` (targets of deleted worktrees) is always safe.
+- `kache clean --stale 2d --dry-run` previews more.
+- Anything else is the user's to delete: another worktree, its `target/`, a running session's sandbox, the kache store.
+- A test failing with `No space left on device (os error 28)` is environmental. Say so, free space or ask, and rerun it. Don't debug it.
+
 ## Commands
 
 ```bash
@@ -235,8 +244,15 @@ cargo test -p e2e --test e2e clean::      # the e2e file covering the change (`<
 cargo test -p <crate> <test_name>         # one test while iterating
 ```
 
+**A bug report or a question is not a scope yet.** A pasted error with no ask, or a question like "what does that mean?", gets a diagnosis and a proposed fix first. The fix PR is just the fix. Anything the fix uncovers (a redesign, a second bug, a toolchain bump) is proposed as its own PR rather than grown into this one. In the week to 2026-11-05:
+- a one-line `awk` fix grew over ten hours into a new driver (#528);
+- a question about a vetx error became three stacked PRs and a Go bump (#530, #531, #534);
+- an error paste became a proto change that was redone twice (#533).
+
+A change to `proto/` or the plugin ABI goes through design whatever it started from.
+
 1. Make the change, with tests.
-2. Run `lint` and the tests of the touched and possibly-broken crates.
+2. Run `lint` and the tests of the touched and possibly-broken crates. `lint && git commit … && git push` in one command works: the gate checks that push when it runs.
 3. Commit, push, open the PR — if the change depends on an unmerged PR, stack it (see below). CI takes it from there.
 
 The same applies to subsequent pushes on an open PR: push the fix and let CI run the suite.
@@ -292,14 +308,16 @@ A change goes through three phases, and **each phase is its own session**:
 |---|---|---|
 | Design | the request | a published **spec** |
 | Implementation | `/goal implement <spec-url>` | an open PR whose spec tests pass |
-| Follow-up | `/goal get PR #<n> green and through review` | a merged PR |
+| Follow-up | `/goal PR #<n>: CI green on its HEAD, every finding fixed or answered` | a merged PR |
 
 The next session starts from the hand-off's link, never from the conversation that produced it. `/handoff` closes a phase: it brings the spec or the PR description up to date and prints the next session's prompt. If a session has to carry on past a phase boundary, `/compact` there instead of waiting for auto-compact.
 
 **The spec is the contract.** A plan that only describes the change leaves the implementation session to work the details out again, and gives the reviewer nothing to check the code against. The spec has these sections:
 
 - **Goal / Non-goals**: one paragraph each.
-- **Invariants and trust**: the rules the change rests on, stated as rules and **confirmed by the user** before any code. Cover every lifetime ("this lock is held for the request / for one use / until exit") and every new cross-component contract ("the provider reports X; who checks it: the engine at runtime, `heph validate`, or nobody?"). Give the alternatives and what each costs. On 2026-10-04, two PRs were half rebuilt because these were never asked. One built a per-revision lock rekey before hearing that locks must not outlive their use. In the other, the spec decided provider labels were "checked on every resolved spec", and the user reversed it after the PR was open: trust the provider and enforce with `heph validate`. A user's "lets do option 1" picks a mechanism. It does not confirm the invariant.
+- **Invariants and trust**: the rules the change rests on, stated as rules and **confirmed by the user** before any code. Cover every lifetime ("this lock is held for the request / for one use / until exit") and every new cross-component contract ("the provider reports X; who checks it: the engine at runtime, `heph validate`, or nobody?"). Give the alternatives and what each costs. On 2026-10-04, two PRs were half rebuilt because these were never asked. One built a per-revision lock rekey before hearing that locks must not outlive their use. In the other, the spec decided provider labels were "checked on every resolved spec", and the user reversed it after the PR was open: trust the provider and enforce with `heph validate`. A user's "lets do option 1" picks a mechanism. It does not confirm the invariant. Nor does "run the board", "go on", or an "ok" to a list of answers. Two kinds of decision need their own question:
+  - An exemption that narrows what the user asked for. One spec exempted `.go` files from a change whose whole point, for the user, was `.go` files, and the PR was reopened after CI was green (#537).
+  - What is core and what is sugar. #539 was rebuilt on generic pools after its code existed, because its cpu/memory-first model had been confirmed only by option picks.
 - **Decisions**: each settled decision with its reason. The implementation session does not reopen these.
 - **Tests**: each test that defines done, with its layer (unit, `crates/e2e` or `crates/bin-e2e`; see `.claude/testing.md`) and what it proves. Implementation is done when these pass and `lint` exits 0. A test that is dropped or changed is recorded in the PR description.
   - When the spec enumerates cases ("six failure points", "three commands"), Tests maps **each case to a named test** in a table. A case with no row is how a whole stage shipped untested and came back as a review BLOCKER.
@@ -320,6 +338,10 @@ The next session starts from the hand-off's link, never from the conversation th
 Brief a fresh agent with the diff range, the finding or the user's words, and the decisions that still hold. Don't do the work in a context that carries the whole history. On 2026-10-04 two sessions made 209 calls above 300k, and both of them were doing this kind of work. One delegated its last fix to a fresh agent and that worked, about 80 calls later than it should have. The gate hook says when context passes 300k.
 
 **An unrelated request is a new session.** Once the PR is pushed, a request that is not about it (another bug, a second small PR) starts a new session. Carried in the old one, it pays for the old one's history on every call.
+
+**The implementation session ends when the PR opens.** In the week to 2026-11-05, two implementation sessions went on to run their PR's review fixes, CI waits and follow-up requests (#539, #524). Together they took 57% of all input tokens, with 990 of their calls above 300k. One said "I'd recommend `/handoff`" at 412k and kept going for nine more hours. Run `/handoff` when the PR opens, and the follow-up session starts small.
+
+**A `/goal` condition names only what the model can check:** CI green on the PR's HEAD, the spec's tests passing, board verdicts recorded. "Through review" and "on real hardware" are the user's steps, so a goal that includes them is never met. In two sessions the Stop hook re-checked such a goal 7 and ~15 times, each time at ~600k context. When only the user's steps remain, say what they are once and end the turn.
 
 **Independent changes run in parallel.** One design session can produce several specs. Each gets its own implementation session in its own workspace or worktree, branched off `master`. Stack only when a change can't compile or be reviewed without the one below it (see "Stacked PRs"). Wall-clock time is then the slowest PR, not the sum of all of them.
 
@@ -343,6 +365,7 @@ Every turn re-sends the whole context, so a long session pays for its history on
   - Before you write a call site N times, ask whether it needs changing. Often the old signature can stay as a thin wrapper over a new `fn foo_with(.., X)`, and no caller changes. Follow it with `git diff --stat` and `git diff -U0` (so the user sees every change) and a `cargo clippy --keep-going` pass. Propagating one new argument through 48 test sites by hand took 47 Edits and 10.4M input tokens.
 - **Send long output to a file.** Redirect build and test output into the scratchpad and grep what you need from the file, instead of letting a whole run into context. Judge the run by its exit code, not by the grep: rustfmt prints `Diff in`, not `error`, and `| tail` hides the status.
 - **Don't poll.** CI: `/ci-triage` waits on the run and classifies each failure: a known flake (it reruns it), a failure inherited from a stacked base, or a real break. It reads the failed logs from a file, not into context. The primitive underneath is `gh run watch <run-id> --exit-status` with `run_in_background`. `gh pr checks` right after a push prints "no checks reported", which is not a pass. A local process: `run_in_background`, or Monitor with an until-loop.
+- **A PR body edit or a label restarts CI.** The workflow triggers on `edited` and `labeled` and cancels the PR's in-progress run (`.github/workflows/heph.yml` says why). Write the body at `gh pr create --body-file`, and change it together with a push, never while a run is in progress. Batch follow-up fixes into one push, too. In the week to 2026-11-05, 49 of 95 runs were cancelled before they finished, and #539 alone started 19. A green run takes a median 38 minutes.
 - **Artifacts: one publish per round of feedback.** Collect the changes, edit the local file with `Edit`, publish once. Don't read back the published page — the local file is the source.
 - **Claude Docs: one `batch` per round, and read narrowly.** Each `update` call takes 1–2 minutes, so one design session spent 17 of its 26 tool minutes on 36 of them. Group a round's edits into one `batch`. Load a `guide` topic once per session; `topic.index` plus `topic.editing` is 46k. Don't `read` a whole node, since one read returned 119k. Export the doc to the scratchpad and `rg` it, then read the section you need.
 - **The shell is zsh with GNU coreutils from nix**, not bash or BSD: `stat -c` (not `-f`), no `mapfile`, `sed -i` takes no suffix argument. A directory under `~/.claude/projects/` starts with `-`, so it needs `--` or `./` before it reaches `ls`/`du`/`find`.
@@ -376,6 +399,7 @@ Mechanical triggers — if the change touches it, consult. Not a judgment call.
 - Consults at the same stage run in parallel — one message, multiple agents.
 - **`/board design` and `/board review` run a consult.** The skill works out the triggered agents from the files touched, writes one brief, runs the consults in parallel, and records the verdicts in the spec's Board section.
 - **Brief the agent; don't send it to rediscover the change.** Give it the diff range or artifact link, the specific question, and the files that matter. An agent told only "review this" re-reads the codebase from scratch: one design session spent 124M tokens on 36 consults, nearly twice its own 67M. Consult the always-consult three plus only the agents whose trigger fired. For a follow-up round, continue the same agent with `SendMessage` rather than spawning a fresh one.
+- **Review runs before the PR opens.** #524's review board first ran with the PR already open and green, and only because the goal's Stop hook asked for it. Its two BLOCKERs then cost three fix rounds, each a full CI cycle.
 - A **BLOCKER** from `feature-quality`, `code-quality`, `hermeticity`, or `compatibility` is fixed, or explicitly overruled with a stated reason, before the commit.
 - **NOT HERMETIC** and **BREAKING** are never silently accepted — either fix, or record the decision in the commit body.
 - A **RETHINK** / **DON'T BUILD** from `product-vision` goes back to the user, not around them.
