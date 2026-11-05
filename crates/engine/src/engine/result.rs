@@ -3415,8 +3415,11 @@ impl Engine {
                         // the remote for the hit to stand — checked by presence, not by
                         // transfer (see `RemoteCacheSet::blobs_exist`).
                         let needed: Vec<String> = def.target.output_names();
-                        // A probe error returns here, before any outcome: the
-                        // resolution failed, so the target was never settled.
+                        // A backend read error is not an error here: the remote
+                        // set reports it as absence (breaker), so the target is a
+                        // plain `Miss`. Only a local error the probe propagates
+                        // (mirroring the manifest) returns here, before any
+                        // outcome: the resolution failed, nothing was settled.
                         crate::engine::event::emit_scope(
                             &rs,
                             crate::engine::event::BuildEventKind::RemoteCacheReadStart {
