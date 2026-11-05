@@ -28,7 +28,7 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
-use hcore::events::{BuildEvent, BuildEventKind, LogTailData};
+use hcore::events::{BuildEvent, BuildEventKind, CacheCounts, CacheOutcomeKind, LogTailData};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 /// How many completed targets to retain for the "slowest" table. The heap is
@@ -82,14 +82,6 @@ impl Phase {
     }
 }
 
-/// Which cache answered. Kept per in-flight target so a hit can be *un-counted*
-/// off the right counter when the target turns out to rebuild.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CacheHitKind {
-    Local,
-    Remote,
-}
-
 /// State for a target that is currently in flight. Dropped at `ResultEnd`.
 #[derive(Debug, Default)]
 struct TargetRec {
@@ -98,10 +90,7 @@ struct TargetRec {
     /// The active phase and when it began, or `None` between phases.
     phase: Option<(Phase, u64)>,
     driver: Option<Box<str>>,
-    /// The cache that answered, if any — retracted when the target executes.
-    cache: Option<CacheHitKind>,
-    /// Whether this target actually ran. A later cache hit must not count a
-    /// target that already executed.
+    /// Whether this target actually ran.
     executed: bool,
 }
 
@@ -191,30 +180,53 @@ pub(crate) struct LockWait {
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct Counters {
     pub executed: usize,
-    pub cached_local: usize,
-    pub cached_remote: usize,
-    pub miss_local: usize,
-    pub miss_remote: usize,
     /// Collateral failures across all roots, including those beyond `ROOTS_KEPT`.
     pub blocked: usize,
     /// Root failures seen, including those beyond `ROOTS_KEPT`.
     pub roots_total: usize,
+    /// Per-target cache accounting, or `None` when the host is older than
+    /// `CacheOutcome`: it sent tier events and no outcome. There is no
+    /// tier-derived fallback — that fold is the bug the outcome replaced, so
+    /// an old host's report says "unavailable" rather than a wrong number.
+    pub cache: Option<CacheCounts>,
+}
+
+/// A count for display and JSON, from the fold's `u64`.
+fn count(n: u64) -> usize {
+    usize::try_from(n).unwrap_or(usize::MAX)
 }
 
 impl Counters {
+    /// Targets served from cache. `0` when accounting is unavailable; a
+    /// surface that must not read that as "no hits" checks [`cache`]
+    /// (Self::cache).
     pub(crate) fn cached(&self) -> usize {
-        self.cached_local.saturating_add(self.cached_remote)
+        self.cache.map_or(0, |c| count(c.hits()))
     }
 
+    pub(crate) fn local_hits(&self) -> usize {
+        self.cache.map_or(0, |c| count(c.local_hits()))
+    }
+
+    pub(crate) fn remote_hits(&self) -> usize {
+        self.cache.map_or(0, |c| count(c.remote_hits()))
+    }
+
+    /// Targets that had to be built, rebuilt hits included.
     pub(crate) fn misses(&self) -> usize {
-        self.miss_local.saturating_add(self.miss_remote)
+        self.cache.map_or(0, |c| count(c.misses()))
+    }
+
+    /// The part of [`misses`](Self::misses) announced as a hit and then rebuilt.
+    pub(crate) fn rebuilt(&self) -> usize {
+        self.cache.map_or(0, |c| count(c.rebuilt()))
     }
 
     /// Hit rate over targets the cache was actually consulted for. `None` when it
-    /// was never consulted — rendering `0%` there would be a lie.
+    /// was never consulted — rendering `0%` there would be a lie — or when
+    /// accounting is unavailable.
     pub(crate) fn hit_rate(&self) -> Option<f64> {
-        let considered = self.cached().saturating_add(self.misses());
-        (considered > 0).then(|| self.cached() as f64 / considered as f64)
+        self.cache.and_then(|c| c.hit_rate())
     }
 }
 
@@ -243,6 +255,17 @@ pub(crate) struct Tally {
     background_ops: usize,
 
     counters: Counters,
+    /// Folded from `CacheOutcome` / `CacheHitRebuilt` only.
+    cache: CacheCounts,
+    /// Whether any `CacheOutcome` arrived: the host is new enough to send them.
+    saw_outcome: bool,
+    /// A tier event that the engine follows with the target's outcome at once
+    /// (a hit, or a remote miss). Seeing one with no outcome means an old host.
+    saw_settling_tier: bool,
+    /// A `LocalCacheMiss`: an old host on its own only once the stream has
+    /// closed, since a new host can spend a remote round trip between it and
+    /// the outcome — a live comment must not flash "unavailable" meanwhile.
+    saw_local_miss: bool,
 
     /// Roots in first-seen order — never re-sorted, so consecutive renders differ
     /// by appends only and an agent diffing two fetches sees "one new root"
@@ -381,30 +404,14 @@ impl Tally {
                 // engine sends `AdmissionWaitEnd` first; this keeps a lost End
                 // from leaving a stale `⧗` row in the live comment.
                 self.admission_waits.remove(addr.as_str());
-                let mut retract = None;
+                // A hit that rebuilds is taken back by its `CacheHitRebuilt`,
+                // which the engine emits before this; nothing to infer here.
                 if let Some(rec) = self.live.get_mut(addr.as_str()) {
                     rec.phase = Some((Phase::Execute, at));
                     rec.executed = true;
                     if rec.driver.is_none() {
                         rec.driver = Some(driver.as_str().into());
                     }
-                    // A target that executes is not a cached target, even when a
-                    // hit was announced first: the engine decides a hit from the
-                    // revision's manifest, and a manifest can outlive its blobs
-                    // (GC, a lifecycle rule, or blobs never pulled on a run that
-                    // is now offline), in which case it rebuilds. Retract the hit
-                    // off the counter it was put on, or "executed + cached" can
-                    // sum past the target count.
-                    retract = rec.cache.take();
-                }
-                match retract {
-                    Some(CacheHitKind::Local) => {
-                        self.counters.cached_local = self.counters.cached_local.saturating_sub(1);
-                    }
-                    Some(CacheHitKind::Remote) => {
-                        self.counters.cached_remote = self.counters.cached_remote.saturating_sub(1);
-                    }
-                    None => {}
                 }
             }
 
@@ -448,22 +455,27 @@ impl Tally {
                 self.clear_phase(addr);
             }
 
-            BuildEventKind::LocalCacheHit { addr } => {
-                self.hit(addr, ev.at_unix_ms, CacheHitKind::Local)
+            // Tier events are per tier, not per target — a remote hit is a
+            // local miss first — so they count nothing. They only tell an old
+            // host (no `CacheOutcome`) apart from a run that never consulted
+            // the cache.
+            BuildEventKind::LocalCacheHit { addr } | BuildEventKind::RemoteCacheHit { addr } => {
+                self.saw_settling_tier = true;
+                self.ensure(addr, ev.at_unix_ms);
             }
-            BuildEventKind::RemoteCacheHit { addr } => {
-                self.hit(addr, ev.at_unix_ms, CacheHitKind::Remote)
-            }
+            BuildEventKind::RemoteCacheMiss { .. } => self.saw_settling_tier = true,
+            BuildEventKind::LocalCacheMiss { .. } => self.saw_local_miss = true,
 
-            BuildEventKind::LocalCacheMiss { addr } => {
-                self.counters.miss_local = self.counters.miss_local.saturating_add(1);
-                self.bump_pkg_miss(addr);
+            BuildEventKind::CacheOutcome { addr, outcome } => {
+                self.saw_outcome = true;
+                self.cache.apply(&ev.kind);
+                if *outcome == CacheOutcomeKind::Miss {
+                    self.bump_pkg_miss(addr);
+                }
             }
-            BuildEventKind::RemoteCacheMiss { .. } => {
-                // Counted, but not rolled up by package: a remote miss almost
-                // always accompanies the local miss already counted above, and
-                // double-counting the package would overstate the rollup.
-                self.counters.miss_remote = self.counters.miss_remote.saturating_add(1);
+            BuildEventKind::CacheHitRebuilt { addr, .. } => {
+                self.cache.apply(&ev.kind);
+                self.bump_pkg_miss(addr);
             }
 
             BuildEventKind::ResultLockWaitStart {
@@ -571,27 +583,6 @@ impl Tally {
             && phase.is_background()
         {
             self.background_ops = self.background_ops.saturating_sub(1);
-        }
-    }
-
-    fn hit(&mut self, addr: &str, at: u64, kind: CacheHitKind) {
-        self.ensure(addr, at);
-        // A hit arriving *after* the target executed (possible: the result
-        // memoizer keys on `(addr, outputs, is_top)`, so a second variant can hit
-        // the local cache the first variant just populated) must not count the
-        // same addr as both executed and cached.
-        match self.live.get_mut(addr) {
-            Some(rec) if rec.executed || rec.cache.is_some() => return,
-            Some(rec) => rec.cache = Some(kind),
-            None => return,
-        }
-        match kind {
-            CacheHitKind::Local => {
-                self.counters.cached_local = self.counters.cached_local.saturating_add(1)
-            }
-            CacheHitKind::Remote => {
-                self.counters.cached_remote = self.counters.cached_remote.saturating_add(1)
-            }
         }
     }
 
@@ -703,7 +694,12 @@ impl Tally {
     }
 
     pub(crate) fn counters(&self) -> Counters {
-        self.counters
+        let old_host =
+            !self.saw_outcome && (self.saw_settling_tier || (self.closed && self.saw_local_miss));
+        Counters {
+            cache: (!old_host).then_some(self.cache),
+            ..self.counters
+        }
     }
 
     pub(crate) fn roots(&self) -> &[RootFailure] {
@@ -901,6 +897,22 @@ impl Tally {
 mod tests {
     use super::*;
 
+    use hcore::events::CacheHitKind;
+
+    fn outcome(addr: &str, outcome: CacheOutcomeKind) -> BuildEventKind {
+        BuildEventKind::CacheOutcome {
+            addr: addr.into(),
+            outcome,
+        }
+    }
+
+    fn rebuilt(addr: &str, was: CacheHitKind) -> BuildEventKind {
+        BuildEventKind::CacheHitRebuilt {
+            addr: addr.into(),
+            was,
+        }
+    }
+
     fn ev(at: u64, kind: BuildEventKind) -> BuildEvent {
         BuildEvent {
             at_unix_ms: at,
@@ -1019,25 +1031,29 @@ mod tests {
     fn cache_hit_is_retracted_when_the_target_rebuilds() {
         // A manifest can outlive its blobs, so an announced hit can still rebuild.
         let mut t = Tally::default();
-        t.apply(&ev(
-            1,
-            BuildEventKind::LocalCacheHit {
-                addr: "//a:x".into(),
-            },
-        ));
+        t.apply(&ev(1, outcome("//a:x", CacheOutcomeKind::LocalHit)));
         assert_eq!(t.counters().cached(), 1);
+        t.apply(&ev(2, rebuilt("//a:x", CacheHitKind::Local)));
         t.apply(&ev(
             2,
             BuildEventKind::ExecuteStart {
                 addr: "//a:x".into(),
                 driver: "exec".into(),
-                cache: false,
+                cache: true,
                 declared: None,
                 reserved: None,
                 queued_ms: None,
             },
         ));
-        assert_eq!(t.counters().cached(), 0, "hit retracted off its counter");
+        let c = t.counters();
+        assert_eq!(c.cached(), 0, "hit retracted off its counter");
+        assert_eq!((c.misses(), c.rebuilt()), (1, 1));
+        let (rows, _) = t.misses_by_package(10);
+        assert_eq!(
+            rows,
+            vec![("//a".to_string(), 1)],
+            "a rebuilt hit is a miss"
+        );
         t.apply(&ev(
             3,
             BuildEventKind::ExecuteEnd {
@@ -1055,57 +1071,112 @@ mod tests {
     }
 
     #[test]
-    fn cache_hit_after_execute_does_not_double_count() {
-        // The reverse order: a second memoizer variant hits the cache the first
-        // just populated.
+    fn local_and_remote_hits_are_counted_separately() {
         let mut t = Tally::default();
-        t.apply(&ev(
-            1,
-            BuildEventKind::ExecuteStart {
-                addr: "//a:x".into(),
-                driver: "exec".into(),
-                cache: false,
-                declared: None,
-                reserved: None,
-                queued_ms: None,
-            },
-        ));
-        t.apply(&ev(
-            2,
-            BuildEventKind::ExecuteEnd {
-                addr: "//a:x".into(),
-                error: None,
-            },
-        ));
-        t.apply(&ev(
-            3,
-            BuildEventKind::LocalCacheHit {
-                addr: "//a:x".into(),
-            },
-        ));
+        t.apply(&ev(1, outcome("//a:l", CacheOutcomeKind::LocalHit)));
+        t.apply(&ev(2, outcome("//a:r", CacheOutcomeKind::RemoteHit)));
         let c = t.counters();
-        assert_eq!(c.cached(), 0, "an executed target is not also cached");
-        assert_eq!(c.executed, 1);
+        assert_eq!((c.local_hits(), c.remote_hits()), (1, 1));
+        assert_eq!(c.cached(), 2);
+    }
+
+    /// The shared stream every consumer folds: same hits, misses and rate as
+    /// `CacheCounts` itself, the remote hit included.
+    #[test]
+    fn cache_counts_agree_across_consumers() {
+        let mut t = Tally::default();
+        let mut fold = CacheCounts::default();
+        for e in hcore::events::test_support::cache_stream() {
+            fold.apply(&e.kind);
+            t.apply(&e);
+        }
+        t.set_closed();
+        let c = t.counters();
+        assert_eq!(c.cache, Some(fold));
+        let (l, r, m, rb) = hcore::events::test_support::CACHE_STREAM_EXPECTED;
+        let n = |x: u64| usize::try_from(x).expect("small");
+        assert_eq!(
+            (c.local_hits(), c.remote_hits(), c.misses(), c.rebuilt()),
+            (n(l), n(r), n(m), n(rb))
+        );
+        assert_eq!(c.hit_rate(), fold.hit_rate());
+        // The package rollup counts the same misses: cold, solo and both
+        // rebuilds, and nothing for the remote hit's package `//q` beyond its
+        // one cold target.
+        let (rows, _) = t.misses_by_package(10);
+        let total: usize = rows.iter().map(|(_, n)| n).sum();
+        assert_eq!(total, c.misses());
     }
 
     #[test]
-    fn local_and_remote_hits_are_counted_separately() {
+    fn remote_hit_package_is_not_in_miss_rollup() {
+        let mut t = Tally::default();
+        for i in 0..3 {
+            let addr = format!("//remote:t{i}");
+            t.apply(&ev(
+                1,
+                BuildEventKind::LocalCacheMiss { addr: addr.clone() },
+            ));
+            t.apply(&ev(
+                2,
+                BuildEventKind::RemoteCacheHit { addr: addr.clone() },
+            ));
+            t.apply(&ev(2, outcome(&addr, CacheOutcomeKind::RemoteHit)));
+        }
+        t.apply(&ev(
+            3,
+            BuildEventKind::LocalCacheMiss {
+                addr: "//cold:x".into(),
+            },
+        ));
+        t.apply(&ev(3, outcome("//cold:x", CacheOutcomeKind::Miss)));
+        let (rows, total) = t.misses_by_package(10);
+        assert_eq!(rows, vec![("//cold".to_string(), 1)]);
+        assert_eq!(total, 1);
+    }
+
+    /// A host older than `CacheOutcome` sends tier events only. Its counts are
+    /// unknowable per target, so there are none — not a tier-derived guess.
+    #[test]
+    fn old_host_cache_accounting_is_unavailable() {
         let mut t = Tally::default();
         t.apply(&ev(
             1,
-            BuildEventKind::LocalCacheHit {
-                addr: "//a:l".into(),
+            BuildEventKind::LocalCacheMiss {
+                addr: "//a:x".into(),
             },
         ));
+        assert!(
+            t.counters().cache.is_some(),
+            "a lone local miss on a live stream may still get its outcome"
+        );
         t.apply(&ev(
             2,
             BuildEventKind::RemoteCacheHit {
-                addr: "//a:r".into(),
+                addr: "//a:x".into(),
             },
         ));
-        let c = t.counters();
-        assert_eq!((c.cached_local, c.cached_remote), (1, 1));
-        assert_eq!(c.cached(), 2);
+        assert_eq!(
+            t.counters().cache,
+            None,
+            "a settling tier event with no outcome"
+        );
+
+        // Cold and remote-less: only local misses, so it is known at close.
+        let mut t = Tally::default();
+        t.apply(&ev(
+            1,
+            BuildEventKind::LocalCacheMiss {
+                addr: "//a:x".into(),
+            },
+        ));
+        t.set_closed();
+        assert_eq!(t.counters().cache, None);
+
+        // Never consulted: not "unavailable", just nothing.
+        let mut t = Tally::default();
+        t.set_closed();
+        assert_eq!(t.counters().cache, Some(CacheCounts::default()));
     }
 
     #[test]
@@ -1373,17 +1444,13 @@ mod tests {
         for i in 0..30 {
             t.apply(&ev(
                 0,
-                BuildEventKind::LocalCacheMiss {
-                    addr: format!("//services/api:t{i}"),
-                },
+                outcome(&format!("//services/api:t{i}"), CacheOutcomeKind::Miss),
             ));
         }
         for i in 0..10 {
             t.apply(&ev(
                 0,
-                BuildEventKind::LocalCacheMiss {
-                    addr: format!("//web:t{i}"),
-                },
+                outcome(&format!("//web:t{i}"), CacheOutcomeKind::Miss),
             ));
         }
         let (rows, total_pkgs) = t.misses_by_package(10);
@@ -1401,18 +1468,8 @@ mod tests {
         let t = Tally::default();
         assert!(t.counters().hit_rate().is_none(), "0% would be a lie");
         let mut t = Tally::default();
-        t.apply(&ev(
-            0,
-            BuildEventKind::LocalCacheHit {
-                addr: "//a:x".into(),
-            },
-        ));
-        t.apply(&ev(
-            0,
-            BuildEventKind::LocalCacheMiss {
-                addr: "//a:y".into(),
-            },
-        ));
+        t.apply(&ev(0, outcome("//a:x", CacheOutcomeKind::LocalHit)));
+        t.apply(&ev(0, outcome("//a:y", CacheOutcomeKind::Miss)));
         assert_eq!(t.counters().hit_rate(), Some(0.5));
     }
 

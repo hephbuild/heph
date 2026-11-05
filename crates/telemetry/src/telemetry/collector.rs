@@ -16,7 +16,17 @@
 
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
-use hcore::events::BuildEventKind;
+use hcore::events::{BuildEventKind, CacheCounts};
+
+/// Apply one signed [`CacheDelta`](hcore::events::CacheDelta) field to a
+/// counter, saturating at 0 as [`CacheCounts::apply`] does.
+fn add_signed(counter: &AtomicU64, d: i64) {
+    if d != 0 {
+        counter.update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            v.saturating_add_signed(d)
+        });
+    }
+}
 
 /// Per-node counts of a parsed query `--expr` matcher tree. Filled by the
 /// command that actually parses the expression (so the real parser is the only
@@ -113,8 +123,18 @@ impl AtomicHistogram {
 pub struct TelemetryCollector {
     /// Targets that passed through `result_addr` — one per non-memoized resolve.
     targets: AtomicU64,
+    /// **Tier events, not targets** (deprecated for hit rates): a target that
+    /// misses locally and then hits a remote counts here as a local miss. Kept
+    /// under their old names so existing dashboards keep working; per-target
+    /// numbers are the `target_*` counters.
     local_cache_hits: AtomicU64,
     local_cache_misses: AtomicU64,
+    /// Per-target cache outcomes, folded through `CacheCounts::delta` so they
+    /// agree with the TUI and the GitHub Actions report. A rebuilt hit has
+    /// already been moved from its hit counter to `target_misses`.
+    target_local_hits: AtomicU64,
+    target_remote_hits: AtomicU64,
+    target_misses: AtomicU64,
     /// Total output artifacts across every resolved target (incl. those whose
     /// size is unknown).
     artifacts: AtomicU64,
@@ -128,15 +148,18 @@ pub struct TelemetryCollector {
     size_histogram: AtomicHistogram,
     /// Targets that actually executed (cache misses) this process.
     executes: AtomicU64,
-    /// Announced cache hits that then had to be rebuilt because the revision's
-    /// bytes could not be read — see [`record_cache_hit_rebuilt`](Self::record_cache_hit_rebuilt).
+    /// Targets whose hit outcome was taken back because the revision's bytes
+    /// could not be read (`CacheHitRebuilt`, once per addr per request). A
+    /// subset of `target_misses`.
     cache_hits_rebuilt: AtomicU64,
     /// Power-of-two histogram of per-target execute wall time (ms), for p99.
     execute_ms_histogram: AtomicHistogram,
     /// Total target count of a whole-graph (`//...`) query, when one ran. `0`
     /// means no whole-graph query was issued this process.
     graph_size: AtomicU64,
-    /// Remote (shared) cache outcomes, folded from the event stream.
+    /// Remote (shared) cache **tier events, not targets** (deprecated for hit
+    /// rates): `remote_cache_misses` follows a `local_cache_misses` for the
+    /// same target.
     remote_cache_hits: AtomicU64,
     remote_cache_misses: AtomicU64,
     /// Pushes to the remote cache (one per `RemoteCacheWriteStart`).
@@ -186,6 +209,9 @@ impl TelemetryCollector {
             targets: AtomicU64::new(0),
             local_cache_hits: AtomicU64::new(0),
             local_cache_misses: AtomicU64::new(0),
+            target_local_hits: AtomicU64::new(0),
+            target_remote_hits: AtomicU64::new(0),
+            target_misses: AtomicU64::new(0),
             artifacts: AtomicU64::new(0),
             sized_artifacts: AtomicU64::new(0),
             artifact_bytes: AtomicU64::new(0),
@@ -222,6 +248,13 @@ impl TelemetryCollector {
     /// the single point every progress event flows through, so the cache and
     /// target tallies stay in lockstep with what the renderer sees.
     pub fn observe_event(&self, kind: &BuildEventKind) {
+        if let Some(d) = CacheCounts::delta(kind) {
+            add_signed(&self.target_local_hits, d.local_hits);
+            add_signed(&self.target_remote_hits, d.remote_hits);
+            add_signed(&self.target_misses, d.misses);
+            add_signed(&self.cache_hits_rebuilt, d.rebuilt);
+            return;
+        }
         match kind {
             BuildEventKind::ResultStart { .. } => {
                 self.targets.fetch_add(1, Ordering::Relaxed);
@@ -272,20 +305,6 @@ impl TelemetryCollector {
     pub fn record_execute_ms(&self, ms: u64) {
         self.executes.fetch_add(1, Ordering::Relaxed);
         self.execute_ms_histogram.record(ms);
-    }
-
-    /// Record a cache hit that had to be rebuilt after all.
-    ///
-    /// A hit is decided from the revision's manifest, which can outlive its blobs
-    /// (a local GC, an object-store lifecycle rule, or blobs that were never
-    /// pulled on a run that is now offline), so `local_cache_hits` /
-    /// `remote_cache_hits` count *announced* hits and this counts the subset that
-    /// then executed. Reported rather than subtracted: how often a cache promises
-    /// bytes it cannot produce is the interesting number, and the collector holds
-    /// no per-addr state to subtract from — deliberately, so its memory never
-    /// grows with the build.
-    pub fn record_cache_hit_rebuilt(&self) {
-        self.cache_hits_rebuilt.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record the total target count of a whole-graph (`//...`) query. Keeps the
@@ -368,6 +387,9 @@ impl TelemetryCollector {
             targets: self.targets.load(Ordering::Relaxed),
             local_cache_hits: self.local_cache_hits.load(Ordering::Relaxed),
             local_cache_misses: self.local_cache_misses.load(Ordering::Relaxed),
+            target_local_hits: self.target_local_hits.load(Ordering::Relaxed),
+            target_remote_hits: self.target_remote_hits.load(Ordering::Relaxed),
+            target_misses: self.target_misses.load(Ordering::Relaxed),
             artifacts: self.artifacts.load(Ordering::Relaxed),
             artifact_bytes: self.artifact_bytes.load(Ordering::Relaxed),
             max_artifact_bytes: self.max_artifact_bytes.load(Ordering::Relaxed),
@@ -412,8 +434,13 @@ impl TelemetryCollector {
 #[derive(Debug, Clone, Copy)]
 pub struct TelemetrySnapshot {
     pub targets: u64,
+    /// Tier events, not targets — see the collector's field docs.
     pub local_cache_hits: u64,
     pub local_cache_misses: u64,
+    /// Per-target outcomes; see [`target_cache`](Self::target_cache).
+    pub target_local_hits: u64,
+    pub target_remote_hits: u64,
+    pub target_misses: u64,
     pub artifacts: u64,
     pub artifact_bytes: u64,
     pub max_artifact_bytes: u64,
@@ -425,12 +452,13 @@ pub struct TelemetrySnapshot {
     /// Targets that actually executed (cache misses); population behind the
     /// execute p99. `0` means `p99_execute_ms` is not meaningful.
     pub executes: u64,
-    /// Announced cache hits that then had to be rebuilt (the revision's bytes
-    /// were gone). A subset of `local_cache_hits + remote_cache_hits`.
+    /// Hit outcomes taken back and rebuilt (the revision's bytes were gone),
+    /// once per addr per request. A subset of `target_misses`.
     pub cache_hits_rebuilt: u64,
     /// Approximate 99th percentile per-target execute wall time (ms).
     pub p99_execute_ms: u64,
     pub graph_size: u64,
+    /// Tier events, not targets — see the collector's field docs.
     pub remote_cache_hits: u64,
     pub remote_cache_misses: u64,
     pub remote_cache_writes: u64,
@@ -448,9 +476,65 @@ pub struct TelemetrySnapshot {
     pub interactive: Option<bool>,
 }
 
+impl TelemetrySnapshot {
+    /// The per-target counters as the fold every other surface uses.
+    pub fn target_cache(&self) -> CacheCounts {
+        CacheCounts::from_parts(
+            self.target_local_hits,
+            self.target_remote_hits,
+            self.target_misses,
+            self.cache_hits_rebuilt,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The collector's atomics reach the same numbers as the shared fold, on
+    /// the shared stream — including the `LocalCacheMiss`-then-`RemoteCacheHit`
+    /// target the tier counters call a miss.
+    #[test]
+    fn cache_counts_agree_across_consumers() {
+        let c = TelemetryCollector::new();
+        let mut fold = CacheCounts::default();
+        for ev in hcore::events::test_support::cache_stream() {
+            c.observe_event(&ev.kind);
+            fold.apply(&ev.kind);
+        }
+        let got = c.snapshot().target_cache();
+        assert_eq!(got, fold);
+        assert_eq!(
+            (
+                got.local_hits(),
+                got.remote_hits(),
+                got.misses(),
+                got.rebuilt()
+            ),
+            hcore::events::test_support::CACHE_STREAM_EXPECTED
+        );
+        assert_eq!(got.hit_rate(), fold.hit_rate());
+        // The tier counters keep their old meaning: every tier event once.
+        let s = c.snapshot();
+        assert_eq!((s.local_cache_hits, s.local_cache_misses), (2, 4));
+        assert_eq!((s.remote_cache_hits, s.remote_cache_misses), (2, 1));
+    }
+
+    /// A rebuild whose hit the collector never saw cannot wrap the counter.
+    #[test]
+    fn target_counters_saturate() {
+        let c = TelemetryCollector::new();
+        c.observe_event(&BuildEventKind::CacheHitRebuilt {
+            addr: "//a:x".into(),
+            was: hcore::events::CacheHitKind::Remote,
+        });
+        let s = c.snapshot();
+        assert_eq!(
+            (s.target_remote_hits, s.target_misses, s.cache_hits_rebuilt),
+            (0, 1, 1)
+        );
+    }
 
     #[test]
     fn record_execute_ms_counts_and_p99() {

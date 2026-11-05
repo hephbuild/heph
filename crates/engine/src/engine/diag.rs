@@ -1024,6 +1024,8 @@ impl hplugin::hook::Hook for DiagHook {
             | BuildEventKind::LocalCacheMiss { .. }
             | BuildEventKind::RemoteCacheHit { .. }
             | BuildEventKind::RemoteCacheMiss { .. }
+            | BuildEventKind::CacheOutcome { .. }
+            | BuildEventKind::CacheHitRebuilt { .. }
             | BuildEventKind::Matched { .. } => s.touch(now),
             _ => {}
         }

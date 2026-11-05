@@ -1121,6 +1121,27 @@ pub(crate) struct LockedResolution {
     /// revision ("where can its bytes be fetched from"), never of what one caller
     /// asked for — see [`Engine::locate_remote_revision`].
     remote: RemoteCell,
+    /// Which tier this cell's `CacheOutcome` announced as a hit; `None` when it
+    /// executed (or never consulted the cache). Read by the rebuild branch of
+    /// [`execute_and_cache`] to say which hit it takes back.
+    hit: Option<hcore::events::CacheHitKind>,
+    /// Set by the first caller that rebuilds this hit, so `CacheHitRebuilt` is
+    /// emitted once per addr per request however many `(outputs, is_top)`
+    /// callers find the blobs gone. A swap, not a load-then-store: two callers
+    /// race here. `Relaxed` is enough — the flag orders nothing but itself.
+    rebuilt: std::sync::atomic::AtomicBool,
+}
+
+impl LockedResolution {
+    /// Take the hit back, once: the hit tier the first time a caller calls this
+    /// on a hit cell, `None` on every later call and on a cell that executed.
+    fn take_rebuilt(&self) -> Option<hcore::events::CacheHitKind> {
+        let was = self.hit?;
+        (!self
+            .rebuilt
+            .swap(true, std::sync::atomic::Ordering::Relaxed))
+        .then_some(was)
+    }
 }
 
 /// One revision's riding read, as the per-request memoizers keep it: **weakly**.
@@ -2790,12 +2811,16 @@ impl Engine {
                             hashin = opts.hashin.as_str(),
                             "cache entry confirmed but its artifacts are unavailable; rebuilding",
                         );
-                        // This addr was already announced as a cache hit. The
-                        // event-stream consumers (TUI, GHA summary) retract that
-                        // themselves when the `ExecuteStart` below lands, but the
-                        // telemetry collector keeps no per-addr state and cannot,
-                        // so tell it explicitly.
-                        htelemetry::telemetry::record_cache_hit_rebuilt();
+                        // This addr was already announced as a cache hit; take it
+                        // back, once per addr however many callers land here.
+                        // Every consumer (TUI, GHA, telemetry) moves one count
+                        // from `was` to misses.
+                        if let Some(was) = locked.take_rebuilt() {
+                            rs.emit(crate::engine::event::BuildEventKind::CacheHitRebuilt {
+                                addr: def.target.addr.format(),
+                                was,
+                            });
+                        }
                         let (cached, meta) = self
                             .clone()
                             .execute_and_cache_inner(rs.clone(), opts)
@@ -3203,6 +3228,8 @@ impl Engine {
                     executed: Some(executed),
                     manifest: None,
                     remote: known_remote(None),
+                    hit: None,
+                    rebuilt: Default::default(),
                 }),
                 handed,
             ));
@@ -3238,6 +3265,8 @@ impl Engine {
                     executed: None,
                     manifest: Some(manifest),
                     remote: RemoteCell::new(),
+                    hit: Some(hcore::events::CacheHitKind::Local),
+                    rebuilt: Default::default(),
                 }),
                 Some(read),
             ));
@@ -3322,6 +3351,8 @@ impl Engine {
                                 executed: None,
                                 manifest: Some(manifest),
                                 remote: RemoteCell::new(),
+                                hit: Some(hcore::events::CacheHitKind::Local),
+                                rebuilt: Default::default(),
                             }),
                             Some(read),
                         ));
@@ -3335,100 +3366,124 @@ impl Engine {
         // write lock excludes all others, so one re-check suffices. On the rare
         // race-win we share without executing; otherwise we execute + cache the
         // full set, which `build_eresult` filters per caller.
-        let (executed, manifest, remote) = match self.probe_cache_manifest(&rs, def, opts).await? {
-            // Same as branch A: where the blobs live stays unresolved until a
-            // caller needs them.
-            Some(manifest) => (None, Some(manifest), RemoteCell::new()),
-            None => {
-                // The settled local miss: both probes came back empty under the
-                // write lock, so this fires exactly once per cold target — the
-                // probe itself stays silent on a miss (see
-                // `probe_cache_manifest`). Uncacheable targets never reach this
-                // path (early return above), so the hit/miss stats cover only
-                // targets that could have hit.
-                rs.emit(crate::engine::event::BuildEventKind::LocalCacheMiss {
-                    addr: addr.format(),
-                });
-                // Local miss under the write lock: ask the remote caches whether
-                // this revision exists. Manifest only — no output blob is
-                // downloaded here, and none may be: a dependent that just needs
-                // this target's `hashout` must not pay for its outputs. The
-                // manifest is mirrored into the local cache (safe under the write
-                // lock, which excludes GC and other writers) and each caller pulls
-                // the groups it reads in `execute_and_cache`.
-                //
-                // Bracket the pull with one `RemoteCacheRead` span per target
-                // (only when a readable cache exists) so a slow download shows as
-                // a single `↓` op in the per-target timeline — never one per
-                // blob/cache.
-                // Honor the target's `remote_enabled`: drivers whose output
-                // embeds host-local paths (e.g. the nix driver bakes absolute
-                // `/nix/store/...` wrapper paths) set it false so a wrapper built
-                // on one machine is never pulled onto another that lacks that
-                // store path — which would `exec` a missing path (status 127).
-                let remote_attempted =
-                    def.target.cache.remote_enabled && self.remote_caches.has_readable();
-                let located = if remote_attempted {
+        let (executed, manifest, remote, hit) =
+            match self.probe_cache_manifest(&rs, def, opts).await? {
+                // Same as branch A: where the blobs live stays unresolved until a
+                // caller needs them.
+                Some(manifest) => (
+                    None,
+                    Some(manifest),
+                    RemoteCell::new(),
+                    Some(hcore::events::CacheHitKind::Local),
+                ),
+                None => {
+                    // The settled local miss: both probes came back empty under the
+                    // write lock, so this fires exactly once per cold target — the
+                    // probe itself stays silent on a miss (see
+                    // `probe_cache_manifest`). Uncacheable targets never reach this
+                    // path (early return above), so the hit/miss stats cover only
+                    // targets that could have hit. A hash-only request returned
+                    // before the write lock, so none of the events below is one.
+                    //
+                    // Formatted once for every event this branch emits.
                     let addr_s = addr.format();
-                    // Every blob a caller of this addr could read must still be on
-                    // the remote for the hit to stand — checked by presence, not by
-                    // transfer (see `RemoteCacheSet::blobs_exist`).
-                    let needed: Vec<String> = def.target.output_names();
-                    crate::engine::event::emit_scope(
-                        &rs,
-                        crate::engine::event::BuildEventKind::RemoteCacheReadStart {
-                            addr: addr_s.clone(),
-                        },
-                        move |error| crate::engine::event::BuildEventKind::RemoteCacheReadEnd {
-                            addr: addr_s,
-                            error: error.map(crate::engine::event::ErrorDetail::into_message),
-                        },
-                        self.probe_remote_revision(ctoken, addr, opts.hashin.as_str(), &needed),
-                    )
-                    .await?
-                } else {
-                    None
-                };
-                match located {
-                    Some((manifest, rev)) => {
-                        // A revision located on the remote is a cache hit —
-                        // "already built elsewhere", execution skipped. Emit it so
-                        // the cached count (TUI, GHA, telemetry) reflects remote
-                        // hits, not just local ones.
-                        rs.emit(crate::engine::event::BuildEventKind::RemoteCacheHit {
-                            addr: addr.format(),
-                        });
-                        // The one place the answer is already in hand: this cell
-                        // just located the revision, so the lazy cell starts
-                        // resolved and no caller re-fetches the manifest.
-                        (
-                            None,
-                            Some(Arc::new(manifest)),
-                            known_remote(Some(Arc::new(rev))),
+                    rs.emit(crate::engine::event::BuildEventKind::LocalCacheMiss {
+                        addr: addr_s.clone(),
+                    });
+                    // Local miss under the write lock: ask the remote caches whether
+                    // this revision exists. Manifest only — no output blob is
+                    // downloaded here, and none may be: a dependent that just needs
+                    // this target's `hashout` must not pay for its outputs. The
+                    // manifest is mirrored into the local cache (safe under the write
+                    // lock, which excludes GC and other writers) and each caller pulls
+                    // the groups it reads in `execute_and_cache`.
+                    //
+                    // Bracket the pull with one `RemoteCacheRead` span per target
+                    // (only when a readable cache exists) so a slow download shows as
+                    // a single `↓` op in the per-target timeline — never one per
+                    // blob/cache.
+                    // Honor the target's `remote_enabled`: drivers whose output
+                    // embeds host-local paths (e.g. the nix driver bakes absolute
+                    // `/nix/store/...` wrapper paths) set it false so a wrapper built
+                    // on one machine is never pulled onto another that lacks that
+                    // store path — which would `exec` a missing path (status 127).
+                    let remote_attempted =
+                        def.target.cache.remote_enabled && self.remote_caches.has_readable();
+                    let located = if remote_attempted {
+                        let span_addr = addr_s.clone();
+                        // Every blob a caller of this addr could read must still be on
+                        // the remote for the hit to stand — checked by presence, not by
+                        // transfer (see `RemoteCacheSet::blobs_exist`).
+                        let needed: Vec<String> = def.target.output_names();
+                        // A probe error returns here, before any outcome: the
+                        // resolution failed, so the target was never settled.
+                        crate::engine::event::emit_scope(
+                            &rs,
+                            crate::engine::event::BuildEventKind::RemoteCacheReadStart {
+                                addr: addr_s.clone(),
+                            },
+                            move |error| crate::engine::event::BuildEventKind::RemoteCacheReadEnd {
+                                addr: span_addr,
+                                error: error.map(crate::engine::event::ErrorDetail::into_message),
+                            },
+                            self.probe_remote_revision(ctoken, addr, opts.hashin.as_str(), &needed),
                         )
-                    }
-                    None => {
-                        // Only a real remote lookup that came back empty is a
-                        // remote miss; skip the event when no readable remote was
-                        // consulted at all.
-                        if remote_attempted {
-                            rs.emit(crate::engine::event::BuildEventKind::RemoteCacheMiss {
-                                addr: addr.format(),
+                        .await?
+                    } else {
+                        None
+                    };
+                    match located {
+                        Some((manifest, rev)) => {
+                            // A revision located on the remote is a cache hit —
+                            // "already built elsewhere", execution skipped. Emit it so
+                            // the cached count (TUI, GHA, telemetry) reflects remote
+                            // hits, not just local ones.
+                            rs.emit(crate::engine::event::BuildEventKind::RemoteCacheHit {
+                                addr: addr_s.clone(),
                             });
+                            rs.emit(crate::engine::event::BuildEventKind::CacheOutcome {
+                                addr: addr_s,
+                                outcome: hcore::events::CacheOutcomeKind::RemoteHit,
+                            });
+                            // The one place the answer is already in hand: this cell
+                            // just located the revision, so the lazy cell starts
+                            // resolved and no caller re-fetches the manifest.
+                            (
+                                None,
+                                Some(Arc::new(manifest)),
+                                known_remote(Some(Arc::new(rev))),
+                                Some(hcore::events::CacheHitKind::Remote),
+                            )
                         }
-                        let (cached, meta) = self
-                            .clone()
-                            .execute_and_cache_inner(rs.clone(), opts)
-                            .await?;
-                        (
-                            Some(Arc::new(ExecutedArtifacts { cached, meta })),
-                            None,
-                            known_remote(None),
-                        )
+                        None => {
+                            // Only a real remote lookup that came back empty is a
+                            // remote miss; skip the event when no readable remote was
+                            // consulted at all.
+                            if remote_attempted {
+                                rs.emit(crate::engine::event::BuildEventKind::RemoteCacheMiss {
+                                    addr: addr_s.clone(),
+                                });
+                            }
+                            // The target's outcome, remote or not, and before the
+                            // build: a build that then fails still had to build.
+                            rs.emit(crate::engine::event::BuildEventKind::CacheOutcome {
+                                addr: addr_s,
+                                outcome: hcore::events::CacheOutcomeKind::Miss,
+                            });
+                            let (cached, meta) = self
+                                .clone()
+                                .execute_and_cache_inner(rs.clone(), opts)
+                                .await?;
+                            (
+                                Some(Arc::new(ExecutedArtifacts { cached, meta })),
+                                None,
+                                known_remote(None),
+                                None,
+                            )
+                        }
                     }
                 }
-            }
-        };
+            };
 
         // A hit after all (the re-check, or the remote): the last failure is
         // stale. Under the write lock. An execute cleared it itself.
@@ -3460,6 +3515,8 @@ impl Engine {
                 executed,
                 manifest,
                 remote,
+                hit,
+                rebuilt: Default::default(),
             }),
             Some(read),
         ))
@@ -4347,7 +4404,8 @@ impl Engine {
     }
 
     /// Probe the **local** manifest for `(addr, hashin)` and decide whether it is
-    /// a usable hit, emitting `LocalCacheHit` on a hit. Returns the parsed
+    /// a usable hit, emitting `LocalCacheHit` and the target's `CacheOutcome`
+    /// on a hit. Returns the parsed
     /// manifest so the per-caller output read in
     /// [`execute_and_cache`](Self::execute_and_cache) reuses it instead of
     /// re-reading + re-deserializing it from the cache backend.
@@ -4408,8 +4466,17 @@ impl Engine {
             .await?
             .map(Arc::new);
         if hit.is_some() && !rs.hash_only() {
+            // Every `Some` returned here settles the cell as a local hit — the
+            // optimistic probe, the contended late hit and the write-lock
+            // re-check all return it straight away — so the target's outcome
+            // goes out with the tier event, once.
+            let addr_s = addr.format();
             rs.emit(crate::engine::event::BuildEventKind::LocalCacheHit {
-                addr: addr.format(),
+                addr: addr_s.clone(),
+            });
+            rs.emit(crate::engine::event::BuildEventKind::CacheOutcome {
+                addr: addr_s,
+                outcome: hcore::events::CacheOutcomeKind::LocalHit,
             });
         }
         Ok(hit)
@@ -13064,6 +13131,8 @@ mod tests {
             executed: None,
             manifest: None,
             remote: RemoteCell::new(),
+            hit: None,
+            rebuilt: Default::default(),
         };
         Arc::clone(&engine)
             .materialize_codegen_inner(engine.new_state(), &def, "hashin", &locked, cached, false)

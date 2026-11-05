@@ -6,6 +6,10 @@ edition = "2024"
 [lints]
 workspace = true
 
+[features]
+# `events::test_support`: the cache event stream every consumer's tests fold.
+test-support = []
+
 [dependencies]
 anyhow = "1.0.102"
 serde = { version = "1", features = ["derive"] }

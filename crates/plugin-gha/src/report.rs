@@ -103,13 +103,17 @@ pub(crate) fn full_document(
             "done": done,
             "failed": c.roots_total,
             "blocked": c.blocked,
-            "cached": c.cached(),
+            "cached": c.cache.map(|_| c.cached()),
             "executed": c.executed,
         },
+        // Per target (one count per cacheable addr): `misses` includes
+        // `rebuilt`. Every field is `null` when the host is too old to send
+        // `CacheOutcome` — see `Counters::cache`.
         "cache": {
-            "local_hits": c.cached_local,
-            "remote_hits": c.cached_remote,
-            "misses": c.misses(),
+            "local_hits": c.cache.map(|_| c.local_hits()),
+            "remote_hits": c.cache.map(|_| c.remote_hits()),
+            "misses": c.cache.map(|_| c.misses()),
+            "rebuilt": c.cache.map(|_| c.rebuilt()),
             "hit_rate": c.hit_rate(),
         },
         "failures": failures,
@@ -162,7 +166,7 @@ pub(crate) fn embedded_document(
                 "matched": matched,
                 "failed": c.roots_total,
                 "blocked": c.blocked,
-                "cached": c.cached(),
+                "cached": c.cache.map(|_| c.cached()),
                 "executed": c.executed,
             },
             "failures": addrs,
@@ -250,10 +254,13 @@ pub(crate) fn github_outputs(
         format!("heph_failed={}", c.roots_total),
         format!("heph_blocked={}", c.blocked),
         format!("heph_executed={}", c.executed),
-        format!("heph_cached={}", c.cached()),
         format!("heph_elapsed_ms={elapsed_ms}"),
         format!("heph_elapsed={}", fmt_duration(elapsed_ms)),
     ];
+    // Absent, not `0`, when the host is too old to count per target.
+    if c.cache.is_some() {
+        out.push(format!("heph_cached={}", c.cached()));
+    }
     if let Some(rate) = c.hit_rate() {
         out.push(format!("heph_cache_hit_rate={rate:.4}"));
     }
@@ -454,6 +461,66 @@ mod tests {
             assert_eq!(line.lines().count(), 1, "one line per key: {line}");
             assert!(line.contains('='), "key=value: {line}");
         }
+    }
+
+    /// `cache` keeps its keys, now per target, plus `rebuilt`; on a host too
+    /// old to send outcomes every count is `null`, never a tier-derived guess.
+    #[test]
+    fn cache_block_is_per_target_and_null_on_an_old_host() {
+        use hcore::events::{CacheHitKind, CacheOutcomeKind};
+        let mut t = failing(0, 0, 0);
+        let o = |addr: &str, outcome| BuildEventKind::CacheOutcome {
+            addr: addr.into(),
+            outcome,
+        };
+        t.apply(&BuildEvent {
+            at_unix_ms: 1,
+            kind: BuildEventKind::LocalCacheMiss {
+                addr: "//a:r".into(),
+            },
+        });
+        for kind in [
+            o("//a:r", CacheOutcomeKind::RemoteHit),
+            o("//a:l", CacheOutcomeKind::LocalHit),
+            o("//a:m", CacheOutcomeKind::Miss),
+            BuildEventKind::CacheHitRebuilt {
+                addr: "//a:l".into(),
+                was: CacheHitKind::Local,
+            },
+        ] {
+            t.apply(&BuildEvent {
+                at_unix_ms: 1,
+                kind,
+            });
+        }
+        let c = t.counters();
+        let v = full_document(&t, &c, 1_000, "run //...", None);
+        assert_eq!(v["cache"]["local_hits"], 0);
+        assert_eq!(v["cache"]["remote_hits"], 1);
+        assert_eq!(v["cache"]["misses"], 2, "inclusive of the rebuilt one");
+        assert_eq!(v["cache"]["rebuilt"], 1);
+        assert_eq!(v["cache"]["hit_rate"].as_f64(), Some(1.0 / 3.0));
+        assert_eq!(v["targets"]["cached"], 1);
+
+        let mut t = failing(0, 0, 0);
+        t.apply(&BuildEvent {
+            at_unix_ms: 1,
+            kind: BuildEventKind::RemoteCacheHit {
+                addr: "//a:r".into(),
+            },
+        });
+        let c = t.counters();
+        let v = full_document(&t, &c, 1_000, "run //...", None);
+        for key in ["local_hits", "remote_hits", "misses", "rebuilt", "hit_rate"] {
+            assert!(v["cache"][key].is_null(), "{key}: {v}");
+        }
+        assert!(v["targets"]["cached"].is_null(), "{v}");
+        let out = github_outputs(&t, &c, 1_000, None);
+        assert!(
+            !out.iter()
+                .any(|l| l.starts_with("heph_cached") || l.starts_with("heph_cache_hit_rate")),
+            "{out:?}"
+        );
     }
 
     #[test]

@@ -80,7 +80,11 @@ finished.
 
 - `MaxWorkers` — worker saturation, the "is it stuck vs busy" signal
 - `ResultLockWaitStart { holder_pid }` / `End` — the other half of that signal
-- `LocalCacheMiss`, `RemoteCacheMiss` — the entire denominator of the hit rate
+- `LocalCacheMiss`, `RemoteCacheMiss` — *tier* events, not target outcomes. They are **not** the
+  hit rate's denominator: a remote hit is a `LocalCacheMiss` first, and a full miss is one of each.
+  Adding them made a 99.99%-cached run report `50.0%`. The per-target outcome is its own event,
+  `CacheOutcome` (one per cacheable addr per request), with `CacheHitRebuilt` taking a hit back;
+  every count and rate in the report is folded from those two through `hcore::events::CacheCounts`.
 - `ResultStart` — per-target start time
 - `GcTargetSwept`
 
@@ -422,7 +426,7 @@ struct Tally {
     slowest: BoundedHeap<Completed, 20>,     // top-N by duration, ~6 KB constant
     roots: Vec<RootFailure>,                 // capped at 10 rendered, counted beyond
     by_package: FxHashMap<Box<str>, PkgTally>,
-    counters: Counters,                      // executed, cached_local, cached_remote, misses…
+    counters: Counters,                      // executed, blocked, roots; cache: Option<CacheCounts>
 }
 ```
 
@@ -443,7 +447,7 @@ only on miss. Otherwise a package `String` is allocated on every one of the ~160
 |---|---|---|
 | Total build time | cheap | fold `min`/`max` of `at_unix_ms`. Call it "build time" — the first event is not process start |
 | Driver mix | cheap | `ExecuteStart.driver`; ≤20 entries |
-| Hit rate, local vs remote | cheap | misses are free today (dropped); needs `CacheHitKind` to un-count on retraction |
+| Hit rate, local vs remote | cheap | four integers folded from `CacheOutcome` / `CacheHitRebuilt`; no per-addr state |
 | Lock waits, worker saturation | cheap | bounded by concurrency |
 | Package rollups | cheap | bounded by ~1–3k packages; obeys the key rule above |
 | Top-N slowest completed | cheap | bounded heap, ~6 KB |
@@ -727,7 +731,7 @@ line of a colon-joined chain serves it badly. Three surfaces, in priority order:
   "targets": { "matched": 20140, "done": 15923, "failed": 2, "blocked": 4117,
                "cached": 15802, "executed": 338 },
   "cache": {
-    "local_hits": 15650, "remote_hits": 152, "misses": 338, "hit_rate": 0.983,
+    "local_hits": 15650, "remote_hits": 152, "misses": 338, "rebuilt": 0, "hit_rate": 0.983,
     "miss_reasons": { "inputs_changed": 320, "no_entry": 18 },
     "remote": { "configured": true, "reachable": true, "endpoints": ["s3://ci-cache"],
                 "bytes_pulled": 1288490188 }
@@ -744,6 +748,15 @@ line of a colon-joined chain serves it badly. Three surfaces, in priority order:
 
 3. **`<!-- heph:json {...} -->`** in the comment body, for an agent that fetches the comment via the
    API and has no filesystem access. The marker machinery already exists.
+
+`cache` counts **targets**: one per cacheable addr per request, so `local_hits + remote_hits +
+misses` is the number of cacheable targets the run consulted the cache for. `misses` includes
+`rebuilt` (hits whose blobs were gone, so the target built after all), and `targets.cached` is
+`local_hits + remote_hits`. Before this, `misses` and `hit_rate` were folded from the tier events
+and counted a remote hit as a miss and a full miss twice; their meaning changed to the per-target
+one as a fix, within `heph.gha/1`. Against a `heph` too old to send `CacheOutcome`, every `cache`
+count, `targets.cached` and `heph_cached` are `null`/absent and the summary says
+`cache accounting unavailable (heph too old)`, rather than show a tier-derived number.
 
 Stability rules: **field names never change within a schema version**; `failures` and `slowest` are
 **deterministically sorted** (duration desc, then addr) so two runs diff cleanly; **collateral
