@@ -1121,6 +1121,30 @@ pub(crate) struct LockedResolution {
     /// revision ("where can its bytes be fetched from"), never of what one caller
     /// asked for — see [`Engine::locate_remote_revision`].
     remote: RemoteCell,
+    /// Which tier this cell's `CacheOutcome` **announced** as a hit: `Some`
+    /// only when that outcome was actually emitted. `None` when it executed,
+    /// never consulted the cache, or hit under a hash-only request (which
+    /// emits no outcome). Read by the rebuild branch of [`execute_and_cache`]
+    /// to say which hit it takes back, so a `CacheHitRebuilt` never takes back
+    /// a hit nobody announced.
+    hit: Option<hcore::events::CacheHitKind>,
+    /// Set by the first caller that rebuilds this hit, so `CacheHitRebuilt` is
+    /// emitted once per addr per request however many `(outputs, is_top)`
+    /// callers find the blobs gone. A swap, not a load-then-store: two callers
+    /// race here. `Relaxed` is enough — the flag orders nothing but itself.
+    rebuilt: std::sync::atomic::AtomicBool,
+}
+
+impl LockedResolution {
+    /// Take the hit back, once: the hit tier the first time a caller calls this
+    /// on a hit cell, `None` on every later call and on a cell that executed.
+    fn take_rebuilt(&self) -> Option<hcore::events::CacheHitKind> {
+        let was = self.hit?;
+        (!self
+            .rebuilt
+            .swap(true, std::sync::atomic::Ordering::Relaxed))
+        .then_some(was)
+    }
 }
 
 /// One revision's riding read, as the per-request memoizers keep it: **weakly**.
@@ -2790,12 +2814,16 @@ impl Engine {
                             hashin = opts.hashin.as_str(),
                             "cache entry confirmed but its artifacts are unavailable; rebuilding",
                         );
-                        // This addr was already announced as a cache hit. The
-                        // event-stream consumers (TUI, GHA summary) retract that
-                        // themselves when the `ExecuteStart` below lands, but the
-                        // telemetry collector keeps no per-addr state and cannot,
-                        // so tell it explicitly.
-                        htelemetry::telemetry::record_cache_hit_rebuilt();
+                        // This addr was already announced as a cache hit; take it
+                        // back, once per addr however many callers land here.
+                        // Every consumer (TUI, GHA, telemetry) moves one count
+                        // from `was` to misses.
+                        if let Some(was) = locked.take_rebuilt() {
+                            rs.emit(crate::engine::event::BuildEventKind::CacheHitRebuilt {
+                                addr: def.target.addr.format(),
+                                was,
+                            });
+                        }
                         let (cached, meta) = self
                             .clone()
                             .execute_and_cache_inner(rs.clone(), opts)
@@ -3203,6 +3231,8 @@ impl Engine {
                     executed: Some(executed),
                     manifest: None,
                     remote: known_remote(None),
+                    hit: None,
+                    rebuilt: Default::default(),
                 }),
                 handed,
             ));
@@ -3238,6 +3268,10 @@ impl Engine {
                     executed: None,
                     manifest: Some(manifest),
                     remote: RemoteCell::new(),
+                    // Announced only outside a hash-only request (see
+                    // `probe_cache_manifest`), so only then is it a hit to take back.
+                    hit: (!rs.hash_only()).then_some(hcore::events::CacheHitKind::Local),
+                    rebuilt: Default::default(),
                 }),
                 Some(read),
             ));
@@ -3322,6 +3356,9 @@ impl Engine {
                                 executed: None,
                                 manifest: Some(manifest),
                                 remote: RemoteCell::new(),
+                                hit: (!rs.hash_only())
+                                    .then_some(hcore::events::CacheHitKind::Local),
+                                rebuilt: Default::default(),
                             }),
                             Some(read),
                         ));
@@ -3335,100 +3372,127 @@ impl Engine {
         // write lock excludes all others, so one re-check suffices. On the rare
         // race-win we share without executing; otherwise we execute + cache the
         // full set, which `build_eresult` filters per caller.
-        let (executed, manifest, remote) = match self.probe_cache_manifest(&rs, def, opts).await? {
-            // Same as branch A: where the blobs live stays unresolved until a
-            // caller needs them.
-            Some(manifest) => (None, Some(manifest), RemoteCell::new()),
-            None => {
-                // The settled local miss: both probes came back empty under the
-                // write lock, so this fires exactly once per cold target — the
-                // probe itself stays silent on a miss (see
-                // `probe_cache_manifest`). Uncacheable targets never reach this
-                // path (early return above), so the hit/miss stats cover only
-                // targets that could have hit.
-                rs.emit(crate::engine::event::BuildEventKind::LocalCacheMiss {
-                    addr: addr.format(),
-                });
-                // Local miss under the write lock: ask the remote caches whether
-                // this revision exists. Manifest only — no output blob is
-                // downloaded here, and none may be: a dependent that just needs
-                // this target's `hashout` must not pay for its outputs. The
-                // manifest is mirrored into the local cache (safe under the write
-                // lock, which excludes GC and other writers) and each caller pulls
-                // the groups it reads in `execute_and_cache`.
-                //
-                // Bracket the pull with one `RemoteCacheRead` span per target
-                // (only when a readable cache exists) so a slow download shows as
-                // a single `↓` op in the per-target timeline — never one per
-                // blob/cache.
-                // Honor the target's `remote_enabled`: drivers whose output
-                // embeds host-local paths (e.g. the nix driver bakes absolute
-                // `/nix/store/...` wrapper paths) set it false so a wrapper built
-                // on one machine is never pulled onto another that lacks that
-                // store path — which would `exec` a missing path (status 127).
-                let remote_attempted =
-                    def.target.cache.remote_enabled && self.remote_caches.has_readable();
-                let located = if remote_attempted {
+        let (executed, manifest, remote, hit) =
+            match self.probe_cache_manifest(&rs, def, opts).await? {
+                // Same as branch A: where the blobs live stays unresolved until a
+                // caller needs them.
+                Some(manifest) => (
+                    None,
+                    Some(manifest),
+                    RemoteCell::new(),
+                    (!rs.hash_only()).then_some(hcore::events::CacheHitKind::Local),
+                ),
+                None => {
+                    // The settled local miss: both probes came back empty under the
+                    // write lock, so this fires exactly once per cold target — the
+                    // probe itself stays silent on a miss (see
+                    // `probe_cache_manifest`). Uncacheable targets never reach this
+                    // path (early return above), so the hit/miss stats cover only
+                    // targets that could have hit. A hash-only request returned
+                    // before the write lock, so none of the events below is one.
+                    //
+                    // Formatted once for every event this branch emits.
                     let addr_s = addr.format();
-                    // Every blob a caller of this addr could read must still be on
-                    // the remote for the hit to stand — checked by presence, not by
-                    // transfer (see `RemoteCacheSet::blobs_exist`).
-                    let needed: Vec<String> = def.target.output_names();
-                    crate::engine::event::emit_scope(
-                        &rs,
-                        crate::engine::event::BuildEventKind::RemoteCacheReadStart {
-                            addr: addr_s.clone(),
-                        },
-                        move |error| crate::engine::event::BuildEventKind::RemoteCacheReadEnd {
-                            addr: addr_s,
-                            error: error.map(crate::engine::event::ErrorDetail::into_message),
-                        },
-                        self.probe_remote_revision(ctoken, addr, opts.hashin.as_str(), &needed),
-                    )
-                    .await?
-                } else {
-                    None
-                };
-                match located {
-                    Some((manifest, rev)) => {
-                        // A revision located on the remote is a cache hit —
-                        // "already built elsewhere", execution skipped. Emit it so
-                        // the cached count (TUI, GHA, telemetry) reflects remote
-                        // hits, not just local ones.
-                        rs.emit(crate::engine::event::BuildEventKind::RemoteCacheHit {
-                            addr: addr.format(),
-                        });
-                        // The one place the answer is already in hand: this cell
-                        // just located the revision, so the lazy cell starts
-                        // resolved and no caller re-fetches the manifest.
-                        (
-                            None,
-                            Some(Arc::new(manifest)),
-                            known_remote(Some(Arc::new(rev))),
+                    rs.emit(crate::engine::event::BuildEventKind::LocalCacheMiss {
+                        addr: addr_s.clone(),
+                    });
+                    // Local miss under the write lock: ask the remote caches whether
+                    // this revision exists. Manifest only — no output blob is
+                    // downloaded here, and none may be: a dependent that just needs
+                    // this target's `hashout` must not pay for its outputs. The
+                    // manifest is mirrored into the local cache (safe under the write
+                    // lock, which excludes GC and other writers) and each caller pulls
+                    // the groups it reads in `execute_and_cache`.
+                    //
+                    // Bracket the pull with one `RemoteCacheRead` span per target
+                    // (only when a readable cache exists) so a slow download shows as
+                    // a single `↓` op in the per-target timeline — never one per
+                    // blob/cache.
+                    // Honor the target's `remote_enabled`: drivers whose output
+                    // embeds host-local paths (e.g. the nix driver bakes absolute
+                    // `/nix/store/...` wrapper paths) set it false so a wrapper built
+                    // on one machine is never pulled onto another that lacks that
+                    // store path — which would `exec` a missing path (status 127).
+                    let remote_attempted =
+                        def.target.cache.remote_enabled && self.remote_caches.has_readable();
+                    let located = if remote_attempted {
+                        let span_addr = addr_s.clone();
+                        // Every blob a caller of this addr could read must still be on
+                        // the remote for the hit to stand — checked by presence, not by
+                        // transfer (see `RemoteCacheSet::blobs_exist`).
+                        let needed: Vec<String> = def.target.output_names();
+                        // A backend read error is not an error here: the remote
+                        // set reports it as absence (breaker), so the target is a
+                        // plain `Miss`. Only a local error the probe propagates
+                        // (mirroring the manifest) returns here, before any
+                        // outcome: the resolution failed, nothing was settled.
+                        crate::engine::event::emit_scope(
+                            &rs,
+                            crate::engine::event::BuildEventKind::RemoteCacheReadStart {
+                                addr: addr_s.clone(),
+                            },
+                            move |error| crate::engine::event::BuildEventKind::RemoteCacheReadEnd {
+                                addr: span_addr,
+                                error: error.map(crate::engine::event::ErrorDetail::into_message),
+                            },
+                            self.probe_remote_revision(ctoken, addr, opts.hashin.as_str(), &needed),
                         )
-                    }
-                    None => {
-                        // Only a real remote lookup that came back empty is a
-                        // remote miss; skip the event when no readable remote was
-                        // consulted at all.
-                        if remote_attempted {
-                            rs.emit(crate::engine::event::BuildEventKind::RemoteCacheMiss {
-                                addr: addr.format(),
+                        .await?
+                    } else {
+                        None
+                    };
+                    match located {
+                        Some((manifest, rev)) => {
+                            // A revision located on the remote is a cache hit —
+                            // "already built elsewhere", execution skipped. Emit it so
+                            // the cached count (TUI, GHA, telemetry) reflects remote
+                            // hits, not just local ones.
+                            rs.emit(crate::engine::event::BuildEventKind::RemoteCacheHit {
+                                addr: addr_s.clone(),
                             });
+                            rs.emit(crate::engine::event::BuildEventKind::CacheOutcome {
+                                addr: addr_s,
+                                outcome: hcore::events::CacheOutcomeKind::RemoteHit,
+                            });
+                            // The one place the answer is already in hand: this cell
+                            // just located the revision, so the lazy cell starts
+                            // resolved and no caller re-fetches the manifest.
+                            (
+                                None,
+                                Some(Arc::new(manifest)),
+                                known_remote(Some(Arc::new(rev))),
+                                (!rs.hash_only()).then_some(hcore::events::CacheHitKind::Remote),
+                            )
                         }
-                        let (cached, meta) = self
-                            .clone()
-                            .execute_and_cache_inner(rs.clone(), opts)
-                            .await?;
-                        (
-                            Some(Arc::new(ExecutedArtifacts { cached, meta })),
-                            None,
-                            known_remote(None),
-                        )
+                        None => {
+                            // Only a real remote lookup that came back empty is a
+                            // remote miss; skip the event when no readable remote was
+                            // consulted at all.
+                            if remote_attempted {
+                                rs.emit(crate::engine::event::BuildEventKind::RemoteCacheMiss {
+                                    addr: addr_s.clone(),
+                                });
+                            }
+                            // The target's outcome, remote or not, and before the
+                            // build: a build that then fails still had to build.
+                            rs.emit(crate::engine::event::BuildEventKind::CacheOutcome {
+                                addr: addr_s,
+                                outcome: hcore::events::CacheOutcomeKind::Miss,
+                            });
+                            let (cached, meta) = self
+                                .clone()
+                                .execute_and_cache_inner(rs.clone(), opts)
+                                .await?;
+                            (
+                                Some(Arc::new(ExecutedArtifacts { cached, meta })),
+                                None,
+                                known_remote(None),
+                                None,
+                            )
+                        }
                     }
                 }
-            }
-        };
+            };
 
         // A hit after all (the re-check, or the remote): the last failure is
         // stale. Under the write lock. An execute cleared it itself.
@@ -3460,6 +3524,8 @@ impl Engine {
                 executed,
                 manifest,
                 remote,
+                hit,
+                rebuilt: Default::default(),
             }),
             Some(read),
         ))
@@ -4347,7 +4413,8 @@ impl Engine {
     }
 
     /// Probe the **local** manifest for `(addr, hashin)` and decide whether it is
-    /// a usable hit, emitting `LocalCacheHit` on a hit. Returns the parsed
+    /// a usable hit, emitting `LocalCacheHit` and the target's `CacheOutcome`
+    /// on a hit. Returns the parsed
     /// manifest so the per-caller output read in
     /// [`execute_and_cache`](Self::execute_and_cache) reuses it instead of
     /// re-reading + re-deserializing it from the cache backend.
@@ -4408,8 +4475,17 @@ impl Engine {
             .await?
             .map(Arc::new);
         if hit.is_some() && !rs.hash_only() {
+            // Every `Some` returned here settles the cell as a local hit — the
+            // optimistic probe, the contended late hit and the write-lock
+            // re-check all return it straight away — so the target's outcome
+            // goes out with the tier event, once.
+            let addr_s = addr.format();
             rs.emit(crate::engine::event::BuildEventKind::LocalCacheHit {
-                addr: addr.format(),
+                addr: addr_s.clone(),
+            });
+            rs.emit(crate::engine::event::BuildEventKind::CacheOutcome {
+                addr: addr_s,
+                outcome: hcore::events::CacheOutcomeKind::LocalHit,
             });
         }
         Ok(hit)
@@ -6652,6 +6728,43 @@ mod tests {
                 |e| matches!(&e.kind, BuildEventKind::ExecuteStart { addr, .. } if addr == "//pkg:t")
             ),
             "the target must be rebuilt when its advertised blobs cannot be served: {events:?}"
+        );
+        // The hit was announced once, and taken back once, before the rebuild ran:
+        // a consumer folding the stream moves the one remote hit to a miss.
+        assert_eq!(
+            count_kind(&events, |e| matches!(
+                e,
+                BuildEventKind::CacheOutcome { addr, outcome: hcore::events::CacheOutcomeKind::RemoteHit }
+                    if addr == "//pkg:t"
+            )),
+            1,
+            "expected exactly one RemoteHit outcome: {events:?}"
+        );
+        assert_eq!(
+            count_kind(&events, |e| matches!(
+                e,
+                BuildEventKind::CacheOutcome { .. }
+            )),
+            1,
+            "a rebuilt hit is still one outcome: {events:?}"
+        );
+        assert_eq!(
+            count_kind(&events, |e| matches!(
+                e,
+                BuildEventKind::CacheHitRebuilt { addr, was: hcore::events::CacheHitKind::Remote }
+                    if addr == "//pkg:t"
+            )),
+            1,
+            "expected exactly one CacheHitRebuilt{{was: Remote}}: {events:?}"
+        );
+        let pos = |pred: fn(&BuildEventKind) -> bool| events.iter().position(|e| pred(&e.kind));
+        let rebuilt = pos(|e| matches!(e, BuildEventKind::CacheHitRebuilt { .. }))
+            .expect("rebuilt event present");
+        let execute = pos(|e| matches!(e, BuildEventKind::ExecuteStart { .. }))
+            .expect("execute event present");
+        assert!(
+            rebuilt < execute,
+            "the hit must be taken back before the rebuild starts: {events:?}"
         );
         Ok(())
     }
@@ -9688,6 +9801,25 @@ mod tests {
             1,
             "the write lock must let exactly one request execute, got {events:?}"
         );
+
+        // contended_late_hit_counts_once: the per-target outcome follows the same
+        // rule — the winner's request reports one `Miss`, the loser's late re-probe
+        // one `LocalHit`, and neither request reports the target twice.
+        assert_eq!(
+            count_outcome(&events, "//pkg:a", hcore::events::CacheOutcomeKind::Miss),
+            1,
+            "expected exactly one Miss outcome across both requests, got {events:?}"
+        );
+        assert_eq!(
+            count_outcome(
+                &events,
+                "//pkg:a",
+                hcore::events::CacheOutcomeKind::LocalHit
+            ),
+            1,
+            "expected exactly one LocalHit outcome across both requests, got {events:?}"
+        );
+        assert_eq!(count_outcomes(&events), 2, "{events:?}");
         Ok(())
     }
 
@@ -9716,6 +9848,8 @@ mod tests {
                         | BuildEventKind::LocalCacheMiss { .. }
                         | BuildEventKind::RemoteCacheHit { .. }
                         | BuildEventKind::RemoteCacheMiss { .. }
+                        | BuildEventKind::CacheOutcome { .. }
+                        | BuildEventKind::CacheHitRebuilt { .. }
                 )),
                 "{pass}: uncacheable target must emit no cache events, got {events:?}"
             );
@@ -9763,10 +9897,378 @@ mod tests {
                     | BuildEventKind::LocalCacheMiss { .. }
                     | BuildEventKind::RemoteCacheHit { .. }
                     | BuildEventKind::RemoteCacheMiss { .. }
+                    | BuildEventKind::CacheOutcome { .. }
+                    | BuildEventKind::CacheHitRebuilt { .. }
             )),
             "a forced resolve must emit no cache events, got {forced_events:?}"
         );
         Ok(())
+    }
+
+    // ─── Per-target cache outcome (`CacheOutcome` / `CacheHitRebuilt`) ───────
+
+    /// Resolve `addr` with `outputs` and `opts` on a fresh event-collecting
+    /// request; the general form of [`resolve_collecting_events`].
+    async fn resolve_collecting_events_with(
+        engine: &Arc<Engine>,
+        addr: &Addr,
+        outputs: OutputMatcher,
+        opts: &ResultOptions,
+    ) -> (anyhow::Result<Arc<EResult>>, Vec<BuildEvent>) {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let rs = engine.new_state_with_events(true, Some(tx));
+        let res = engine
+            .clone()
+            .result_addr(rs.clone(), addr, outputs, opts)
+            .await;
+        drop(rs);
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        (res, events)
+    }
+
+    /// How many `CacheOutcome { outcome }` events name `addr`.
+    fn count_outcome(
+        events: &[BuildEvent],
+        addr: &str,
+        outcome: hcore::events::CacheOutcomeKind,
+    ) -> usize {
+        count_kind(
+            events,
+            |e| matches!(e, BuildEventKind::CacheOutcome { addr: a, outcome: o } if a == addr && *o == outcome),
+        )
+    }
+
+    fn count_outcomes(events: &[BuildEvent]) -> usize {
+        count_kind(events, |e| matches!(e, BuildEventKind::CacheOutcome { .. }))
+    }
+
+    fn count_rebuilt(events: &[BuildEvent], was: hcore::events::CacheHitKind) -> usize {
+        count_kind(
+            events,
+            |e| matches!(e, BuildEventKind::CacheHitRebuilt { was: w, .. } if *w == was),
+        )
+    }
+
+    /// Bash target with two output groups (`a`, `b`) and a slow, deterministic
+    /// build — so two callers asking for different groups of one addr overlap
+    /// in the rebuild, and the rebuild reproduces the recorded hashouts.
+    fn slow_two_group_target(addr: &str) -> pluginstatictarget::Target {
+        pluginstatictarget::Target {
+            addr: addr.to_string(),
+            driver: "bash".to_string(),
+            run: Some("sleep 0.3; echo a > $OUT_A; echo b > $OUT_B".to_string()),
+            out: HashMap::from([
+                ("a".to_string(), vec!["a.txt".to_string()]),
+                ("b".to_string(), vec!["b.txt".to_string()]),
+            ]),
+            ..Default::default()
+        }
+    }
+
+    /// Resolve `addr` twice concurrently in ONE request, once per output group,
+    /// and collect the request's events.
+    async fn resolve_both_groups_concurrently(
+        engine: &Arc<Engine>,
+        addr: &Addr,
+    ) -> Vec<BuildEvent> {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let rs = engine.new_state_with_events(true, Some(tx));
+        let spawn_group = |group: &str| {
+            let outputs = OutputMatcher::Exact(vec![group.to_string()]);
+            tokio::spawn(enclose!((engine, rs, addr) async move {
+                engine
+                    .result_addr(rs, &addr, outputs, &ResultOptions::default())
+                    .await
+            }))
+        };
+        let (t1, t2) = (spawn_group("a"), spawn_group("b"));
+        let (r1, r2) = tokio::time::timeout(Duration::from_secs(30), async {
+            (t1.await.expect("join a"), t2.await.expect("join b"))
+        })
+        .await
+        .expect("the two variants must not deadlock");
+        r1.expect("group a resolves (rebuilt)");
+        r2.expect("group b resolves (rebuilt)");
+        drop(rs);
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        events
+    }
+
+    /// A hit whose blobs prove unreadable is taken back once per addr per
+    /// request, however many output variants of it find the bytes gone — for
+    /// both hit tiers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn gone_blobs_rebuild_once() -> anyhow::Result<()> {
+        use hcore::events::{CacheHitKind, CacheOutcomeKind};
+        let addr = hmodel::htaddr::parse_addr("//pkg:t")?;
+        let targets = || vec![slow_two_group_target("//pkg:t")];
+
+        // ── was: Remote — the remote advertises blobs it cannot serve.
+        {
+            let remote = tempdir()?;
+            let remote_uri = format!("file://{}", remote.path().display());
+            let (seeder, _seeder_home) = engine_with_remote_bash(targets(), &remote_uri)?;
+            let seed_rs = seeder.new_state();
+            resolve(&seeder, &seed_rs, &addr, OutputMatcher::All).await?;
+            drain_bg(seed_rs).await;
+
+            let (engine, _home) = engine_with_remote_bash(targets(), &remote_uri)?;
+            let mut engine = engine;
+            let home = engine.home.to_path_buf();
+            Arc::get_mut(&mut engine)
+                .expect("engine must not be shared yet")
+                .remote_caches = crate::engine::RemoteCacheSet::with_backend(
+                Arc::new(EvictedBlobBackend {
+                    root: remote.path().to_path_buf(),
+                }),
+                home,
+            );
+
+            let events = resolve_both_groups_concurrently(&engine, &addr).await;
+            assert_eq!(
+                count_outcome(&events, "//pkg:t", CacheOutcomeKind::RemoteHit),
+                1,
+                "was Remote: one RemoteHit outcome: {events:?}"
+            );
+            assert_eq!(count_outcomes(&events), 1, "was Remote: {events:?}");
+            assert_eq!(
+                count_rebuilt(&events, CacheHitKind::Remote),
+                1,
+                "was Remote: exactly one CacheHitRebuilt across both variants: {events:?}"
+            );
+            assert_eq!(count_rebuilt(&events, CacheHitKind::Local), 0);
+        }
+
+        // ── was: Local — a locally-mirrored manifest whose blobs were never
+        // downloaded, and are then evicted from the remote too.
+        {
+            let remote = tempdir()?;
+            let remote_uri = format!("file://{}", remote.path().display());
+            let (seeder, _seeder_home) = engine_with_remote_bash(targets(), &remote_uri)?;
+            let seed_rs = seeder.new_state();
+            resolve(&seeder, &seed_rs, &addr, OutputMatcher::All).await?;
+            drain_bg(seed_rs).await;
+
+            let (engine, _home) = engine_with_remote_bash(targets(), &remote_uri)?;
+            // Hashout only: mirrors the manifest locally, pulls no blob.
+            let rs1 = engine.new_state();
+            let folded = resolve(&engine, &rs1, &addr, OutputMatcher::None).await?;
+            drain_bg(rs1).await;
+            drop(folded);
+
+            assert!(evict_remote_blobs(remote.path()) > 0);
+
+            let events = resolve_both_groups_concurrently(&engine, &addr).await;
+            assert_eq!(
+                count_outcome(&events, "//pkg:t", CacheOutcomeKind::LocalHit),
+                1,
+                "was Local: one LocalHit outcome: {events:?}"
+            );
+            assert_eq!(count_outcomes(&events), 1, "was Local: {events:?}");
+            assert_eq!(
+                count_rebuilt(&events, CacheHitKind::Local),
+                1,
+                "was Local: exactly one CacheHitRebuilt across both variants: {events:?}"
+            );
+            assert_eq!(count_rebuilt(&events, CacheHitKind::Remote), 0);
+        }
+        Ok(())
+    }
+
+    /// A target that opts out of the remote is still a cacheable target: it
+    /// misses once, and no remote lookup is reported for it.
+    #[tokio::test]
+    async fn remote_disabled_target_misses_once() -> anyhow::Result<()> {
+        let remote = tempdir()?;
+        let remote_uri = format!("file://{}", remote.path().display());
+        let (engine, _home) = engine_with_remote(vec![no_remote_target("//pkg:t")], &remote_uri)?;
+        let addr = hmodel::htaddr::parse_addr("//pkg:t")?;
+
+        let (res, events) = resolve_collecting_events(&engine, &addr).await;
+        res.expect("remote-disabled target resolves");
+        assert_eq!(
+            count_outcome(&events, "//pkg:t", hcore::events::CacheOutcomeKind::Miss),
+            1,
+            "{events:?}"
+        );
+        assert_eq!(count_outcomes(&events), 1, "{events:?}");
+        assert_eq!(
+            count_kind(&events, |e| matches!(
+                e,
+                BuildEventKind::RemoteCacheMiss { .. }
+            )),
+            0,
+            "the remote was never consulted: {events:?}"
+        );
+        Ok(())
+    }
+
+    /// The outcome is settled before the build: a build that then fails still
+    /// had to build, and counts as exactly one miss.
+    #[tokio::test]
+    async fn failed_build_is_one_miss() -> anyhow::Result<()> {
+        let (engine, _home) = engine_with_home(vec![static_target_run("//pkg:a", "false")])?;
+        let addr = hmodel::htaddr::parse_addr("//pkg:a")?;
+
+        let (res, events) = resolve_collecting_events(&engine, &addr).await;
+        assert!(res.is_err(), "run:false target must fail");
+        assert_eq!(
+            count_outcome(&events, "//pkg:a", hcore::events::CacheOutcomeKind::Miss),
+            1,
+            "{events:?}"
+        );
+        assert_eq!(count_outcomes(&events), 1, "{events:?}");
+        Ok(())
+    }
+
+    /// `--force` skips the cache, so a forced run of a warm, cacheable target
+    /// has no outcome — not a hit (it executed), not a miss (it never looked).
+    #[tokio::test]
+    async fn forced_run_emits_no_outcome() -> anyhow::Result<()> {
+        let (engine, _home) = engine_with_home(vec![static_target_run("//pkg:a", "true")])?;
+        let addr = hmodel::htaddr::parse_addr("//pkg:a")?;
+
+        let (warm, _) = resolve_collecting_events(&engine, &addr).await;
+        warm.expect("warming resolve");
+
+        let (res, events) = resolve_collecting_events_with(
+            &engine,
+            &addr,
+            OutputMatcher::All,
+            &ResultOptions {
+                force: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        res.expect("forced resolve");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(&e.kind, BuildEventKind::ExecuteStart { .. })),
+            "a forced run executes: {events:?}"
+        );
+        assert_eq!(count_outcomes(&events), 0, "{events:?}");
+        assert_eq!(
+            count_kind(&events, |e| matches!(
+                e,
+                BuildEventKind::CacheHitRebuilt { .. }
+            )),
+            0,
+            "{events:?}"
+        );
+        Ok(())
+    }
+
+    /// Remote store whose every read errors — a remote that is down.
+    struct ErroringRemoteBackend;
+
+    #[async_trait::async_trait]
+    impl crate::engine::remote_cache::RemoteCacheBackend for ErroringRemoteBackend {
+        async fn open_read(
+            &self,
+            key: &str,
+        ) -> anyhow::Result<Option<Pin<Box<dyn tokio::io::AsyncRead + Send>>>> {
+            anyhow::bail!("remote down: read {key}")
+        }
+        async fn open_write(
+            &self,
+            key: &str,
+        ) -> anyhow::Result<Pin<Box<dyn tokio::io::AsyncWrite + Send>>> {
+            anyhow::bail!("remote down: write {key}")
+        }
+        async fn exists(&self, key: &str) -> anyhow::Result<bool> {
+            anyhow::bail!("remote down: exists {key}")
+        }
+        async fn list_names(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+            anyhow::bail!("remote down: list {prefix}")
+        }
+    }
+
+    /// A remote whose manifest lookup errors does not fail the resolution:
+    /// `fetch_manifest` records the error against the cache's breaker and
+    /// answers "absent", so the target is an ordinary miss — one `Miss`
+    /// outcome, never a hit and never two outcomes.
+    #[tokio::test]
+    async fn remote_probe_error_is_one_miss() -> anyhow::Result<()> {
+        let remote = tempdir()?;
+        let remote_uri = format!("file://{}", remote.path().display());
+        let (engine, _home) =
+            engine_with_remote(vec![static_target_run("//pkg:a", "true")], &remote_uri)?;
+        let mut engine = engine;
+        let home = engine.home.to_path_buf();
+        Arc::get_mut(&mut engine)
+            .expect("engine must not be shared yet")
+            .remote_caches =
+            crate::engine::RemoteCacheSet::with_backend(Arc::new(ErroringRemoteBackend), home);
+        let addr = hmodel::htaddr::parse_addr("//pkg:a")?;
+
+        let (res, events) = resolve_collecting_events(&engine, &addr).await;
+        res.expect("a remote read error is absence, not a failure");
+        assert_eq!(
+            count_outcome(&events, "//pkg:a", hcore::events::CacheOutcomeKind::Miss),
+            1,
+            "{events:?}"
+        );
+        assert_eq!(count_outcomes(&events), 1, "{events:?}");
+        Ok(())
+    }
+
+    /// The outcome is per request: two sequential requests over a warm cache
+    /// each report their own hit.
+    #[tokio::test]
+    async fn two_requests_each_count() -> anyhow::Result<()> {
+        let (engine, _home) = engine_with_home(vec![static_target_run("//pkg:a", "true")])?;
+        let addr = hmodel::htaddr::parse_addr("//pkg:a")?;
+        let (warm, _) = resolve_collecting_events(&engine, &addr).await;
+        warm.expect("warming resolve");
+
+        for pass in ["first", "second"] {
+            let (res, events) = resolve_collecting_events(&engine, &addr).await;
+            res.unwrap_or_else(|e| panic!("{pass} warm resolve: {e:#}"));
+            assert_eq!(
+                count_outcome(
+                    &events,
+                    "//pkg:a",
+                    hcore::events::CacheOutcomeKind::LocalHit
+                ),
+                1,
+                "{pass}: {events:?}"
+            );
+            assert_eq!(count_outcomes(&events), 1, "{pass}: {events:?}");
+        }
+        Ok(())
+    }
+
+    /// The rebuild guard hands the hit tier back exactly once, and never on a
+    /// cell that did not hit.
+    #[test]
+    fn take_rebuilt_swaps_once() {
+        let cell = |hit| LockedResolution {
+            guard: None,
+            executed: None,
+            manifest: None,
+            remote: RemoteCell::new(),
+            hit,
+            rebuilt: Default::default(),
+        };
+        let local = cell(Some(hcore::events::CacheHitKind::Local));
+        assert_eq!(
+            local.take_rebuilt(),
+            Some(hcore::events::CacheHitKind::Local)
+        );
+        assert_eq!(local.take_rebuilt(), None);
+        assert_eq!(local.take_rebuilt(), None);
+
+        let executed = cell(None);
+        assert_eq!(executed.take_rebuilt(), None);
+        assert_eq!(executed.take_rebuilt(), None);
     }
 
     #[tokio::test]
@@ -10917,15 +11419,25 @@ mod tests {
     async fn hash_only_probes_do_not_report_cache_hits_to_hooks() -> anyhow::Result<()> {
         use crate::engine::hook::Hook;
 
+        /// Counts `LocalCacheHit` tier events and `CacheOutcome`s separately.
         #[derive(Default)]
-        struct HitCounter(std::sync::atomic::AtomicUsize);
+        struct HitCounter(
+            std::sync::atomic::AtomicUsize,
+            std::sync::atomic::AtomicUsize,
+        );
         impl Hook for HitCounter {
             fn name(&self) -> String {
                 "hit-counter".into()
             }
             fn on_event(&self, ev: &BuildEvent) {
-                if matches!(ev.kind, BuildEventKind::LocalCacheHit { .. }) {
-                    self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                match ev.kind {
+                    BuildEventKind::LocalCacheHit { .. } => {
+                        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    BuildEventKind::CacheOutcome { .. } => {
+                        self.1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    _ => {}
                 }
             }
             fn on_close(&self) {}
@@ -10951,6 +11463,21 @@ mod tests {
         engine.register_hook(Arc::clone(&counter) as Arc<dyn Hook>)?;
         let engine = Arc::new(engine);
         let addr = hmodel::htaddr::parse_addr("//pkg:top")?;
+        let outcomes = || counter.1.load(std::sync::atomic::Ordering::Relaxed);
+
+        // A hash-only probe on a cold engine: whatever it answers (it may well
+        // be "hash unknown"), it settles no target's cache outcome.
+        let _ = Arc::clone(&engine)
+            .meta(
+                engine.new_hash_only_state(addr.clone(), Default::default()),
+                &addr,
+            )
+            .await;
+        assert_eq!(
+            outcomes(),
+            0,
+            "a cold hash-only probe must not report a cache outcome"
+        );
 
         // Warm the cache; the cold run reports no hit.
         let rs = engine.new_state();
@@ -10966,6 +11493,7 @@ mod tests {
         drop(rs);
         let hits = || counter.0.load(std::sync::atomic::Ordering::Relaxed);
         assert_eq!(hits(), 0, "a cold resolve reports no cache hit");
+        assert_eq!(outcomes(), 2, "a cold resolve reports one miss per target");
 
         // Hash-only probes hit the cache — and stay silent about it.
         for _ in 0..3 {
@@ -10978,6 +11506,11 @@ mod tests {
                 .expect("cached target answerable without building");
         }
         assert_eq!(hits(), 0, "hash-only probes must not report cache hits");
+        assert_eq!(
+            outcomes(),
+            2,
+            "hash-only probes must not report cache outcomes"
+        );
 
         // A real warm resolve still does — one per cached target it resolves.
         let rs = engine.new_state();
@@ -10995,6 +11528,11 @@ mod tests {
             hits(),
             2,
             "a real warm resolve reports one hit per cached target (top + dep)"
+        );
+        assert_eq!(
+            outcomes(),
+            4,
+            "a real warm resolve reports one outcome per cached target (top + dep)"
         );
         Ok(())
     }
@@ -13064,6 +13602,8 @@ mod tests {
             executed: None,
             manifest: None,
             remote: RemoteCell::new(),
+            hit: None,
+            rebuilt: Default::default(),
         };
         Arc::clone(&engine)
             .materialize_codegen_inner(engine.new_state(), &def, "hashin", &locked, cached, false)

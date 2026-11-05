@@ -1119,6 +1119,13 @@ mod tests {
             },
         ));
         hook.on_event(&ev(
+            0,
+            BuildEventKind::CacheOutcome {
+                addr: "//a:x".into(),
+                outcome: hcore::events::CacheOutcomeKind::LocalHit,
+            },
+        ));
+        hook.on_event(&ev(
             5,
             BuildEventKind::ResultEnd {
                 addr: "//a:x".into(),

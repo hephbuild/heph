@@ -106,10 +106,13 @@ pub(crate) fn full_document(
             "cached": c.cached(),
             "executed": c.executed,
         },
+        // Per target (one count per cacheable addr): `misses` includes
+        // `rebuilt`.
         "cache": {
-            "local_hits": c.cached_local,
-            "remote_hits": c.cached_remote,
+            "local_hits": c.local_hits(),
+            "remote_hits": c.remote_hits(),
             "misses": c.misses(),
+            "rebuilt": c.rebuilt(),
             "hit_rate": c.hit_rate(),
         },
         "failures": failures,
@@ -454,6 +457,50 @@ mod tests {
             assert_eq!(line.lines().count(), 1, "one line per key: {line}");
             assert!(line.contains('='), "key=value: {line}");
         }
+    }
+
+    /// `cache` keeps its keys, now per target, plus `rebuilt`.
+    #[test]
+    fn cache_block_is_per_target() {
+        use hcore::events::{CacheHitKind, CacheOutcomeKind};
+        let mut t = failing(0, 0, 0);
+        let o = |addr: &str, outcome| BuildEventKind::CacheOutcome {
+            addr: addr.into(),
+            outcome,
+        };
+        t.apply(&BuildEvent {
+            at_unix_ms: 1,
+            kind: BuildEventKind::LocalCacheMiss {
+                addr: "//a:r".into(),
+            },
+        });
+        for kind in [
+            o("//a:r", CacheOutcomeKind::RemoteHit),
+            o("//a:l", CacheOutcomeKind::LocalHit),
+            o("//a:m", CacheOutcomeKind::Miss),
+            BuildEventKind::CacheHitRebuilt {
+                addr: "//a:l".into(),
+                was: CacheHitKind::Local,
+            },
+        ] {
+            t.apply(&BuildEvent {
+                at_unix_ms: 1,
+                kind,
+            });
+        }
+        let c = t.counters();
+        let v = full_document(&t, &c, 1_000, "run //...", None);
+        assert_eq!(v["cache"]["local_hits"], 0);
+        assert_eq!(v["cache"]["remote_hits"], 1);
+        assert_eq!(v["cache"]["misses"], 2, "inclusive of the rebuilt one");
+        assert_eq!(v["cache"]["rebuilt"], 1);
+        assert_eq!(v["cache"]["hit_rate"].as_f64(), Some(1.0 / 3.0));
+        assert_eq!(v["targets"]["cached"], 1);
+        assert!(
+            github_outputs(&t, &c, 1_000, None)
+                .iter()
+                .any(|l| l == "heph_cached=1"),
+        );
     }
 
     #[test]

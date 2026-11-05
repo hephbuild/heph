@@ -21,6 +21,7 @@
 //! a file under an aggregated directory is not declared by its `main.rs`.
 
 mod build_fmt_cli;
+mod cache_tier_gate;
 mod ci_gate;
 mod darwin_linker;
 mod execrunner_gate;

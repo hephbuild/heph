@@ -40,6 +40,30 @@
 //!   from `MaxWorkers` deliberately, pre-1.0, with that cost accepted.
 //!
 //! `scripts/abi-check.sh` watches this file and will flag changes for review.
+//!
+//! # Counting cache hits
+//!
+//! The four tier events — [`LocalCacheHit`](BuildEventKind::LocalCacheHit),
+//! [`LocalCacheMiss`](BuildEventKind::LocalCacheMiss),
+//! [`RemoteCacheHit`](BuildEventKind::RemoteCacheHit),
+//! [`RemoteCacheMiss`](BuildEventKind::RemoteCacheMiss) — say what each cache
+//! *tier* answered, and one target produces several of them: a remote hit is a
+//! `LocalCacheMiss` then a `RemoteCacheHit`, a full miss is a `LocalCacheMiss`
+//! then a `RemoteCacheMiss`. They are for timelines and tier statistics.
+//! **Never fold them into a hit count or a hit rate**: doing so counts every
+//! remote hit as a miss and every full miss twice.
+//!
+//! Per-target numbers come from [`CacheOutcome`](BuildEventKind::CacheOutcome)
+//! (at most one per cacheable addr per request; none when the resolution fails
+//! before it settles — cancellation, a lock or local mirror error) and
+//! [`CacheHitRebuilt`](BuildEventKind::CacheHitRebuilt) (a hit taken back), and
+//! nothing else. [`CacheCounts`] is that fold; every surface heph ships (the
+//! TUI, the GitHub Actions report, telemetry) uses it, and a hook should too.
+//! Local hits + remote hits + misses is the number of cacheable targets the
+//! request resolved.
+//!
+//! A hook sees every request on its engine, so a process that runs two
+//! requests sees an outcome for the same addr in each.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -259,11 +283,36 @@ pub enum BuildEventKind {
         addr: String,
         error: Option<String>,
     },
+    /// The local tier had the revision's manifest. A **tier event, not a target
+    /// outcome**: count targets with [`CacheOutcome`](Self::CacheOutcome).
     LocalCacheHit {
         addr: String,
     },
+    /// The local tier did not have the revision. A **tier event, not a target
+    /// outcome**: the target may still hit the remote tier right after, so a
+    /// hit rate folded from this counts every remote hit as a miss. Count
+    /// targets with [`CacheOutcome`](Self::CacheOutcome).
     LocalCacheMiss {
         addr: String,
+    },
+    /// The final cache outcome of one cacheable target: at most one per
+    /// cacheable addr per request, whatever output variants of it the request
+    /// resolved — none when the resolution fails before it settles
+    /// (cancellation, a lock or local mirror error). Not emitted
+    /// for a target that could not hit — caching off, `--force`,
+    /// `--no-scratch`, a shell — nor for the engine's hash-only nested
+    /// recomputes. See the module docs ("Counting cache hits").
+    CacheOutcome {
+        addr: String,
+        outcome: CacheOutcomeKind,
+    },
+    /// A target whose [`CacheOutcome`](Self::CacheOutcome) was a hit is being
+    /// rebuilt after all: the revision's manifest outlived its blobs. At most
+    /// once per addr per request, and only after a hit outcome. Move one count
+    /// from `was` to misses.
+    CacheHitRebuilt {
+        addr: String,
+        was: CacheHitKind,
     },
     /// Start of writing a target's artifacts to the local cache. Paired with
     /// `LocalCacheWriteEnd` via `emit_scope` (fires on completion, `?`, or
@@ -397,9 +446,15 @@ pub enum BuildEventKind {
         path_mismatch: bool,
         error: Option<String>,
     },
+    /// A remote tier had the revision. A **tier event, not a target outcome**:
+    /// count targets with [`CacheOutcome`](Self::CacheOutcome).
     RemoteCacheHit {
         addr: String,
     },
+    /// A remote tier was consulted and did not have the revision. A **tier
+    /// event, not a target outcome**: it follows a [`LocalCacheMiss`]
+    /// (Self::LocalCacheMiss) for the same target, so adding the two counts a
+    /// full miss twice. Count targets with [`CacheOutcome`](Self::CacheOutcome).
     RemoteCacheMiss {
         addr: String,
     },
@@ -502,6 +557,315 @@ pub struct LogTailData {
     /// 1-based line number of `text`'s first line within the full log, so a
     /// renderer can show true file positions rather than renumbering from 1.
     pub start_line: usize,
+}
+
+/// Which cache tier a hit came from.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheHitKind {
+    Local,
+    Remote,
+    /// A tier this build does not know, from a newer host. Ignored by
+    /// [`CacheCounts`]. Without it, one such value would fail the whole frame
+    /// and end a hook's stream (see the module docs).
+    #[serde(other)]
+    Unknown,
+}
+
+/// A cacheable target's final cache outcome — see
+/// [`BuildEventKind::CacheOutcome`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheOutcomeKind {
+    LocalHit,
+    RemoteHit,
+    Miss,
+    /// An outcome this build does not know, from a newer host. Ignored by
+    /// [`CacheCounts`].
+    #[serde(other)]
+    Unknown,
+}
+
+/// The change one event makes to [`CacheCounts`], so a consumer that keeps
+/// its counters elsewhere (telemetry's atomics) applies exactly the same
+/// mapping. Each field is `-1`, `0` or `1`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheDelta {
+    pub local_hits: i64,
+    pub remote_hits: i64,
+    pub misses: i64,
+    pub rebuilt: i64,
+}
+
+/// Per-target cache accounting, folded from
+/// [`CacheOutcome`](BuildEventKind::CacheOutcome) and
+/// [`CacheHitRebuilt`](BuildEventKind::CacheHitRebuilt) only. The tier events
+/// are ignored on purpose (module docs, "Counting cache hits").
+///
+/// Four integers and no per-addr state: the engine already guarantees one
+/// outcome per addr per request, so the fold needs no set to dedupe.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheCounts {
+    local_hits: u64,
+    remote_hits: u64,
+    misses: u64,
+    rebuilt: u64,
+}
+
+impl CacheCounts {
+    /// What `kind` changes, or `None` for an event that is not cache
+    /// accounting. A rebuilt hit moves one count from its tier to misses and
+    /// counts itself in `rebuilt`, which is a subset of misses.
+    pub fn delta(kind: &BuildEventKind) -> Option<CacheDelta> {
+        let d = match kind {
+            BuildEventKind::CacheOutcome { outcome, .. } => match outcome {
+                CacheOutcomeKind::LocalHit => CacheDelta {
+                    local_hits: 1,
+                    ..CacheDelta::default()
+                },
+                CacheOutcomeKind::RemoteHit => CacheDelta {
+                    remote_hits: 1,
+                    ..CacheDelta::default()
+                },
+                CacheOutcomeKind::Miss => CacheDelta {
+                    misses: 1,
+                    ..CacheDelta::default()
+                },
+                CacheOutcomeKind::Unknown => return None,
+            },
+            BuildEventKind::CacheHitRebuilt { was, .. } => {
+                let mut d = CacheDelta {
+                    misses: 1,
+                    rebuilt: 1,
+                    ..CacheDelta::default()
+                };
+                match was {
+                    CacheHitKind::Local => d.local_hits = -1,
+                    CacheHitKind::Remote => d.remote_hits = -1,
+                    CacheHitKind::Unknown => return None,
+                }
+                d
+            }
+            _ => return None,
+        };
+        Some(d)
+    }
+
+    /// Fold one event. Saturating, so a stream joined mid-way (a rebuild whose
+    /// hit was never seen) cannot underflow.
+    pub fn apply(&mut self, kind: &BuildEventKind) {
+        if let Some(d) = Self::delta(kind) {
+            self.local_hits = self.local_hits.saturating_add_signed(d.local_hits);
+            self.remote_hits = self.remote_hits.saturating_add_signed(d.remote_hits);
+            self.misses = self.misses.saturating_add_signed(d.misses);
+            self.rebuilt = self.rebuilt.saturating_add_signed(d.rebuilt);
+        }
+    }
+
+    /// Counts kept elsewhere, read back for display (telemetry's snapshot).
+    pub fn from_parts(local_hits: u64, remote_hits: u64, misses: u64, rebuilt: u64) -> Self {
+        Self {
+            local_hits,
+            remote_hits,
+            misses,
+            rebuilt,
+        }
+    }
+
+    pub fn local_hits(&self) -> u64 {
+        self.local_hits
+    }
+
+    pub fn remote_hits(&self) -> u64 {
+        self.remote_hits
+    }
+
+    pub fn hits(&self) -> u64 {
+        self.local_hits.saturating_add(self.remote_hits)
+    }
+
+    /// Targets that had to be built, rebuilt hits included.
+    pub fn misses(&self) -> u64 {
+        self.misses
+    }
+
+    /// The part of [`misses`](Self::misses) that was announced as a hit and
+    /// then rebuilt because its blobs were gone — cache health, not input
+    /// changes.
+    pub fn rebuilt(&self) -> u64 {
+        self.rebuilt
+    }
+
+    /// Cacheable targets the cache was consulted for.
+    pub fn consulted(&self) -> u64 {
+        self.hits().saturating_add(self.misses)
+    }
+
+    /// Hits over consulted targets, or `None` when nothing was consulted —
+    /// `0%` there would be a lie.
+    pub fn hit_rate(&self) -> Option<f64> {
+        let consulted = self.consulted();
+        (consulted > 0).then(|| self.hits() as f64 / consulted as f64)
+    }
+}
+
+/// Fixtures shared by every consumer's tests, so they are all checked against
+/// one event stream and one expected answer.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support {
+    use super::{BuildEvent, BuildEventKind, CacheHitKind, CacheOutcomeKind};
+
+    /// What [`cache_stream`] must fold to: `(local_hits, remote_hits, misses,
+    /// rebuilt)`. Seven cacheable targets: two local hits (one with a rebuild
+    /// of unknown `was`, which moves nothing), two remote hits (one of them
+    /// rebuilt), a rebuilt local hit, a full miss with a remote, and a miss
+    /// with no remote consulted.
+    pub const CACHE_STREAM_EXPECTED: (u64, u64, u64, u64) = (2, 1, 4, 2);
+
+    /// The events one request emits for the targets above, in the engine's
+    /// order: tier events, the outcome, `ExecuteStart` for whatever builds,
+    /// and an outcome kind from a newer host that must be ignored.
+    pub fn cache_stream() -> Vec<BuildEvent> {
+        fn ev(at_unix_ms: u64, kind: BuildEventKind) -> BuildEvent {
+            BuildEvent { at_unix_ms, kind }
+        }
+        let a = |s: &str| s.to_string();
+        let outcome = |addr: &str, outcome| BuildEventKind::CacheOutcome {
+            addr: addr.to_string(),
+            outcome,
+        };
+        let start = |addr: &str| BuildEventKind::ResultStart {
+            addr: addr.to_string(),
+        };
+        let exec = |addr: &str| BuildEventKind::ExecuteStart {
+            addr: addr.to_string(),
+            driver: "exec".to_string(),
+            cache: true,
+            declared: None,
+            reserved: None,
+            queued_ms: None,
+        };
+        let end = |addr: &str| BuildEventKind::ResultEnd {
+            addr: addr.to_string(),
+            error: None,
+            upstream_of: None,
+            exit_status: None,
+            log_tail: None,
+        };
+        vec![
+            // Local hit.
+            ev(1, start("//p:local")),
+            ev(
+                2,
+                BuildEventKind::LocalCacheHit {
+                    addr: a("//p:local"),
+                },
+            ),
+            ev(2, outcome("//p:local", CacheOutcomeKind::LocalHit)),
+            ev(3, end("//p:local")),
+            // Remote hit: a local tier miss first — the CI bug.
+            ev(4, start("//q:remote")),
+            ev(
+                5,
+                BuildEventKind::LocalCacheMiss {
+                    addr: a("//q:remote"),
+                },
+            ),
+            ev(
+                6,
+                BuildEventKind::RemoteCacheHit {
+                    addr: a("//q:remote"),
+                },
+            ),
+            ev(6, outcome("//q:remote", CacheOutcomeKind::RemoteHit)),
+            ev(7, end("//q:remote")),
+            // Full miss, remote consulted: two tier misses, one target.
+            ev(8, start("//q:cold")),
+            ev(
+                9,
+                BuildEventKind::LocalCacheMiss {
+                    addr: a("//q:cold"),
+                },
+            ),
+            ev(
+                10,
+                BuildEventKind::RemoteCacheMiss {
+                    addr: a("//q:cold"),
+                },
+            ),
+            ev(10, outcome("//q:cold", CacheOutcomeKind::Miss)),
+            ev(11, exec("//q:cold")),
+            ev(12, end("//q:cold")),
+            // Miss with no remote consulted.
+            ev(13, start("//r:solo")),
+            ev(
+                14,
+                BuildEventKind::LocalCacheMiss {
+                    addr: a("//r:solo"),
+                },
+            ),
+            ev(14, outcome("//r:solo", CacheOutcomeKind::Miss)),
+            ev(15, exec("//r:solo")),
+            ev(16, end("//r:solo")),
+            // Local hit whose blobs are gone: rebuilt.
+            ev(17, start("//r:gone")),
+            ev(
+                18,
+                BuildEventKind::LocalCacheHit {
+                    addr: a("//r:gone"),
+                },
+            ),
+            ev(18, outcome("//r:gone", CacheOutcomeKind::LocalHit)),
+            ev(
+                19,
+                BuildEventKind::CacheHitRebuilt {
+                    addr: a("//r:gone"),
+                    was: CacheHitKind::Local,
+                },
+            ),
+            ev(19, exec("//r:gone")),
+            ev(20, end("//r:gone")),
+            // Remote hit whose blobs are gone: rebuilt.
+            ev(21, start("//s:gone")),
+            ev(
+                22,
+                BuildEventKind::LocalCacheMiss {
+                    addr: a("//s:gone"),
+                },
+            ),
+            ev(
+                23,
+                BuildEventKind::RemoteCacheHit {
+                    addr: a("//s:gone"),
+                },
+            ),
+            ev(23, outcome("//s:gone", CacheOutcomeKind::RemoteHit)),
+            ev(
+                24,
+                BuildEventKind::CacheHitRebuilt {
+                    addr: a("//s:gone"),
+                    was: CacheHitKind::Remote,
+                },
+            ),
+            ev(24, exec("//s:gone")),
+            ev(25, end("//s:gone")),
+            // From a newer host: ignored by every fold.
+            ev(26, outcome("//s:future", CacheOutcomeKind::Unknown)),
+            // A local hit whose rebuild names a hit kind this build does not
+            // know: the rebuild moves nothing, so the hit stays a hit in every
+            // fold, the package rollup and the TUI's cached set alike.
+            ev(27, start("//t:odd")),
+            ev(28, outcome("//t:odd", CacheOutcomeKind::LocalHit)),
+            ev(
+                29,
+                BuildEventKind::CacheHitRebuilt {
+                    addr: a("//t:odd"),
+                    was: CacheHitKind::Unknown,
+                },
+            ),
+            ev(30, end("//t:odd")),
+        ]
+    }
 }
 
 pub type EventSender = tokio::sync::mpsc::UnboundedSender<BuildEvent>;
@@ -867,6 +1231,170 @@ mod tests {
         assert!(matches!(
             ev.kind,
             BuildEventKind::SelectionIncomplete { skipped: 0, ref groups } if groups.is_empty()
+        ));
+    }
+
+    fn fold(kinds: &[BuildEventKind]) -> CacheCounts {
+        let mut c = CacheCounts::default();
+        for k in kinds {
+            c.apply(k);
+        }
+        c
+    }
+
+    fn outcome(o: CacheOutcomeKind) -> BuildEventKind {
+        BuildEventKind::CacheOutcome {
+            addr: "//a:x".into(),
+            outcome: o,
+        }
+    }
+
+    fn rebuilt(was: CacheHitKind) -> BuildEventKind {
+        BuildEventKind::CacheHitRebuilt {
+            addr: "//a:x".into(),
+            was,
+        }
+    }
+
+    #[test]
+    fn cache_counts_fold_the_shared_stream() {
+        let kinds: Vec<_> = test_support::cache_stream()
+            .into_iter()
+            .map(|e| e.kind)
+            .collect();
+        let c = fold(&kinds);
+        assert_eq!(
+            (c.local_hits(), c.remote_hits(), c.misses(), c.rebuilt()),
+            test_support::CACHE_STREAM_EXPECTED
+        );
+        assert_eq!(c.consulted(), 7, "one count per cacheable target");
+    }
+
+    #[test]
+    fn cache_counts_ignore_tier_events() {
+        let c = fold(&[
+            BuildEventKind::LocalCacheMiss {
+                addr: "//a:x".into(),
+            },
+            BuildEventKind::RemoteCacheMiss {
+                addr: "//a:x".into(),
+            },
+            BuildEventKind::LocalCacheHit {
+                addr: "//a:y".into(),
+            },
+            BuildEventKind::RemoteCacheHit {
+                addr: "//a:z".into(),
+            },
+        ]);
+        assert_eq!(c, CacheCounts::default());
+        assert_eq!(c.hit_rate(), None, "nothing consulted is not 0%");
+    }
+
+    #[test]
+    fn cache_counts_rebuilt_moves_one_from_its_was_kind_to_misses() {
+        let c = fold(&[
+            outcome(CacheOutcomeKind::LocalHit),
+            outcome(CacheOutcomeKind::RemoteHit),
+            rebuilt(CacheHitKind::Remote),
+        ]);
+        assert_eq!(
+            (c.local_hits(), c.remote_hits(), c.misses(), c.rebuilt()),
+            (1, 0, 1, 1)
+        );
+        assert_eq!(c.hit_rate(), Some(0.5));
+
+        let c = fold(&[
+            outcome(CacheOutcomeKind::LocalHit),
+            rebuilt(CacheHitKind::Local),
+        ]);
+        assert_eq!(
+            (c.local_hits(), c.remote_hits(), c.misses(), c.rebuilt()),
+            (0, 0, 1, 1)
+        );
+        assert_eq!(c.hit_rate(), Some(0.0));
+    }
+
+    /// A stream joined after the hit was emitted cannot underflow.
+    #[test]
+    fn cache_counts_saturate() {
+        let c = fold(&[rebuilt(CacheHitKind::Local)]);
+        assert_eq!((c.local_hits(), c.misses(), c.rebuilt()), (0, 1, 1));
+    }
+
+    #[test]
+    fn cache_counts_ignore_unknown_kinds() {
+        let c = fold(&[
+            outcome(CacheOutcomeKind::Unknown),
+            rebuilt(CacheHitKind::Unknown),
+        ]);
+        assert_eq!(c, CacheCounts::default());
+    }
+
+    /// Both new variants round-trip, a consumer that predates them skips them
+    /// as `Unknown`, and an outcome value from a newer host decodes rather
+    /// than ending the stream.
+    #[test]
+    fn new_cache_events_decode_as_unknown_in_old_shape() {
+        for kind in [
+            outcome(CacheOutcomeKind::RemoteHit),
+            rebuilt(CacheHitKind::Local),
+        ] {
+            let ev = BuildEvent {
+                at_unix_ms: 3,
+                kind,
+            };
+            let json = serde_json::to_string(&ev).expect("encode");
+            let back: BuildEvent = serde_json::from_str(&json).expect("decode");
+            assert_eq!(
+                serde_json::to_string(&back).expect("re-encode"),
+                json,
+                "round trip is stable"
+            );
+
+            #[derive(Debug, Deserialize)]
+            #[serde(tag = "type")]
+            enum OlderKind {
+                #[expect(dead_code, reason = "only the variant tag is under test")]
+                LocalCacheMiss { addr: String },
+                #[serde(other)]
+                Unknown,
+            }
+            #[derive(Debug, Deserialize)]
+            struct OlderEvent {
+                kind: OlderKind,
+            }
+            let old: OlderEvent = serde_json::from_str(&json).expect("older consumer decodes");
+            assert!(matches!(old.kind, OlderKind::Unknown), "{old:?}");
+        }
+
+        let wire = r#"{"at_unix_ms":1,"kind":{"type":"CacheOutcome","addr":"//a:x","outcome":"remote_hit"}}"#;
+        let ev: BuildEvent = serde_json::from_str(wire).expect("decode");
+        assert!(matches!(
+            ev.kind,
+            BuildEventKind::CacheOutcome {
+                outcome: CacheOutcomeKind::RemoteHit,
+                ..
+            }
+        ));
+
+        let future = r#"{"at_unix_ms":1,"kind":{"type":"CacheOutcome","addr":"//a:x","outcome":"peer_hit"}}"#;
+        let ev: BuildEvent = serde_json::from_str(future).expect("an unknown outcome decodes");
+        assert!(matches!(
+            ev.kind,
+            BuildEventKind::CacheOutcome {
+                outcome: CacheOutcomeKind::Unknown,
+                ..
+            }
+        ));
+        let future =
+            r#"{"at_unix_ms":1,"kind":{"type":"CacheHitRebuilt","addr":"//a:x","was":"peer"}}"#;
+        let ev: BuildEvent = serde_json::from_str(future).expect("an unknown tier decodes");
+        assert!(matches!(
+            ev.kind,
+            BuildEventKind::CacheHitRebuilt {
+                was: CacheHitKind::Unknown,
+                ..
+            }
         ));
     }
 }

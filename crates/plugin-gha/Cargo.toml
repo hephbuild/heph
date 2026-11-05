@@ -25,3 +25,4 @@ rustc-hash = "2"
 [dev-dependencies]
 tempfile = "3"
 serde_yaml = "0.9"
+hcore = { package = "core", path = "../core", features = ["test-support"] }

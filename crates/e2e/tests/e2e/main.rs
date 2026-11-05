@@ -18,6 +18,7 @@
 mod common;
 
 mod cache_load;
+mod cache_outcome;
 mod clean;
 mod codegen_in_place;
 mod core_resource;

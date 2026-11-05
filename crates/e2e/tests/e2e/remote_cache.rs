@@ -12,76 +12,9 @@
 //! *different* output. An output that stays identical across runs therefore
 //! proves the result came from a cache, not a fresh execution.
 
-use heph::engine::{Config, Engine, HomeDir, OutputMatcher, RemoteCacheDef, ResultOptions};
-use heph::htaddr::parse_addr;
-use heph::{pluginbuildfile, pluginexec};
-use htestkit::artifact_string;
+use crate::common::{build_engine, build_engine_with_remote, run_drain};
+use heph::engine::HomeDir;
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
-
-/// Build a fresh engine rooted at `root`, wired to a single read+write remote
-/// cache at `remote_uri`. Each call gets its own empty in-memory cache tier.
-fn build_engine(root: &Path, remote_uri: &str) -> Arc<Engine> {
-    let mut e = Engine::new(Config {
-        remote_caches: vec![RemoteCacheDef {
-            name: "shared".to_string(),
-            uri: remote_uri.to_string(),
-            read: true,
-            write: true,
-            concurrency: 10,
-            endpoint: None,
-            region: None,
-        }],
-        ..Config::for_tests(root)
-    })
-    .expect("engine");
-    e.register_provider(|init| {
-        Box::new(pluginbuildfile::Provider::new(
-            init.root.to_path_buf(),
-            init.runtime.clone(),
-            std::sync::Arc::clone(&init.functions),
-        ))
-    })
-    .expect("register buildfile provider");
-    e.register_managed_driver(|_| Box::new(pluginexec::Driver::new_bash().with_host_path()))
-        .expect("register bash driver");
-    Arc::new(e)
-}
-
-/// Run a target and return its artifact string, after draining any background
-/// remote upload (mirrors the CLI/TUI, which blocks exit until `bg_pending`
-/// reaches zero). Without this the upload could still be in flight when the
-/// caller inspects the remote.
-async fn run_drain(engine: &Arc<Engine>, addr: &str) -> String {
-    let addr = parse_addr(addr).expect("parse addr");
-    let rs = engine.new_state();
-    let result = engine
-        .clone()
-        .result_addr(
-            rs.clone(),
-            &addr,
-            OutputMatcher::All,
-            &ResultOptions::default(),
-        )
-        .await
-        .expect("run target");
-
-    let bg = rs.bg_pending();
-    // Release the request before waiting on its counter. Some background work is
-    // only *submitted* when the request state drops (the post-write cache trim),
-    // and holds a slot until then — so a waiter that keeps `rs` alive waits on a
-    // counter that cannot reach zero. `heph run` unwinds in this order too: the
-    // drain loop runs after the app future, which owns the request, has returned.
-    drop(rs);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while bg.load(Ordering::Acquire) > 0 {
-        assert!(Instant::now() < deadline, "background upload never drained");
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    artifact_string(&result)
-}
 
 /// Count the objects (files) under a `file://` cache directory.
 fn remote_object_count(dir: &Path) -> usize {
@@ -262,20 +195,7 @@ async fn output_is_nondeterministic_without_cache() {
     .expect("write BUILD");
 
     // No `caches:` → no remote.
-    let build_plain = |root: &Path| -> Arc<Engine> {
-        let mut e = Engine::new(Config::for_tests(root)).expect("engine");
-        e.register_provider(|init| {
-            Box::new(pluginbuildfile::Provider::new(
-                init.root.to_path_buf(),
-                init.runtime.clone(),
-                std::sync::Arc::clone(&init.functions),
-            ))
-        })
-        .expect("provider");
-        e.register_managed_driver(|_| Box::new(pluginexec::Driver::new_bash().with_host_path()))
-            .expect("driver");
-        Arc::new(e)
-    };
+    let build_plain = |root: &Path| build_engine_with_remote(root, None);
 
     let e1 = build_plain(root.path());
     let first = run_drain(&e1, "//pkg:t").await;

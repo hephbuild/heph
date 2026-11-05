@@ -138,14 +138,6 @@ pub fn record_execute_ms(ms: u64) {
     COLLECTOR.record_execute_ms(ms);
 }
 
-/// Record a cache hit whose bytes turned out to be unreadable, so the target was
-/// rebuilt. Not derivable from the event stream: the collector holds no per-addr
-/// state, so it cannot tell that an `ExecuteStart` belongs to an addr it already
-/// counted as a hit.
-pub fn record_cache_hit_rebuilt() {
-    COLLECTOR.record_cache_hit_rebuilt();
-}
-
 /// Record the total target count of a whole-graph (`//...`) enumeration.
 pub fn record_graph_size(total: u64) {
     COLLECTOR.record_graph_size(total);
@@ -1297,12 +1289,22 @@ fn build_props(
     put("config_profile_count", profile_count.into());
     // Aggregate run counters.
     put("result_targets", stats.targets.into());
+    // Tier events, not targets — deprecated for hit rates: a target that misses
+    // locally and hits a remote is one local miss here. Kept under their names
+    // for existing dashboards; the `target_*` counters below are per target.
     put("local_cache_hits", stats.local_cache_hits.into());
     put("local_cache_misses", stats.local_cache_misses.into());
+    // Per-target outcomes, the same fold as the TUI and the GHA report:
+    // hits / (hits + misses) is the hit rate.
+    put("target_local_hits", stats.target_local_hits.into());
+    put("target_remote_hits", stats.target_remote_hits.into());
+    put("target_misses", stats.target_misses.into());
     put("executes", stats.executes.into());
-    // Announced hits that then had to be rebuilt — a cache promising bytes it
-    // could not produce. Only sent when it happened, so the common 0 costs
-    // nothing on the wire.
+    // Hit outcomes taken back and rebuilt — a cache promising bytes it could
+    // not produce. Once per addr per request, a subset of `target_misses`.
+    // That meaning is new (older binaries counted per rebuilding caller), so
+    // values are not comparable across that version boundary.
+    // Only sent when it happened, so the common 0 costs nothing on the wire.
     if stats.cache_hits_rebuilt > 0 {
         put("cache_hits_rebuilt", stats.cache_hits_rebuilt.into());
     }
@@ -1323,7 +1325,8 @@ fn build_props(
     if stats.graph_size > 0 {
         put("graph_size", stats.graph_size.into());
     }
-    // Remote (shared) cache outcomes this run.
+    // Remote (shared) cache tier events this run — not targets, deprecated for
+    // hit rates (a remote miss follows a local miss for the same target).
     put("remote_cache_hits", stats.remote_cache_hits.into());
     put("remote_cache_misses", stats.remote_cache_misses.into());
     put("remote_cache_writes", stats.remote_cache_writes.into());
@@ -1588,6 +1591,9 @@ mod tests {
             targets: 0,
             local_cache_hits: 0,
             local_cache_misses: 0,
+            target_local_hits: 0,
+            target_remote_hits: 0,
+            target_misses: 0,
             artifacts: 0,
             artifact_bytes: 0,
             max_artifact_bytes: 0,
@@ -1675,6 +1681,9 @@ mod tests {
             targets: 0,
             local_cache_hits: 0,
             local_cache_misses: 0,
+            target_local_hits: 9,
+            target_remote_hits: 10,
+            target_misses: 11,
             artifacts: 0,
             artifact_bytes: 0,
             max_artifact_bytes: 0,
@@ -1722,6 +1731,9 @@ mod tests {
         assert_eq!(n("query_expr_package_prefix"), Some(1));
         assert_eq!(n("query_expr_and"), Some(1));
         assert_eq!(n("query_expr_not"), Some(1));
+        assert_eq!(n("target_local_hits"), Some(9));
+        assert_eq!(n("target_remote_hits"), Some(10));
+        assert_eq!(n("target_misses"), Some(11));
         assert_eq!(n("remote_cache_hits"), Some(2));
         assert_eq!(n("remote_cache_misses"), Some(3));
         assert_eq!(n("remote_cache_writes"), Some(1));

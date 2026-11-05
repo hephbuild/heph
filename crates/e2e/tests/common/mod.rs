@@ -19,6 +19,111 @@ use std::sync::Arc;
 
 pub use htestkit::{artifact_bytes, artifact_paths, artifact_string, root};
 
+/// A fresh engine rooted at `root` — buildfile provider, bash driver — wired
+/// to a single read+write remote cache at `remote_uri`. Each call gets its own
+/// empty in-memory cache tier, so two calls over one root are two `heph`
+/// invocations sharing the on-disk cache.
+pub fn build_engine(root: &std::path::Path, remote_uri: &str) -> Arc<Engine> {
+    build_engine_with_remote(root, Some(remote_uri))
+}
+
+/// [`build_engine`] with the remote optional: `None` configures no remote.
+pub fn build_engine_with_remote(root: &std::path::Path, remote_uri: Option<&str>) -> Arc<Engine> {
+    let mut e = Engine::new(Config {
+        remote_caches: remote_uri
+            .map(|uri| heph::engine::RemoteCacheDef {
+                name: "shared".to_string(),
+                uri: uri.to_string(),
+                read: true,
+                write: true,
+                concurrency: 10,
+                endpoint: None,
+                region: None,
+            })
+            .into_iter()
+            .collect(),
+        ..Config::for_tests(root)
+    })
+    .expect("engine");
+    e.register_provider(|init| {
+        Box::new(pluginbuildfile::Provider::new(
+            init.root.to_path_buf(),
+            init.runtime.clone(),
+            std::sync::Arc::clone(&init.functions),
+        ))
+    })
+    .expect("register buildfile provider");
+    e.register_managed_driver(|_| Box::new(pluginexec::Driver::new_bash().with_host_path()))
+        .expect("register bash driver");
+    Arc::new(e)
+}
+
+/// Release `rs` and wait for its background work (remote uploads) to drain,
+/// as `heph run` does before exiting.
+///
+/// Takes the request by value and drops it before waiting: some background
+/// work is only *submitted* when the request state drops (the post-write cache
+/// trim) and holds a slot until then, so a waiter that keeps `rs` alive waits
+/// on a counter that cannot reach zero. `heph run` unwinds in this order too.
+pub async fn drain(rs: Arc<heph::engine::request_state::RequestState>) {
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+    let bg = rs.bg_pending();
+    drop(rs);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while bg.load(Ordering::Acquire) > 0 {
+        assert!(Instant::now() < deadline, "background upload never drained");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Run a target with all its outputs and return its artifact string, after
+/// draining any background remote upload. Without the drain the upload could
+/// still be in flight when the caller inspects the remote.
+pub async fn run_drain(engine: &Arc<Engine>, addr: &str) -> String {
+    let addr = heph::htaddr::parse_addr(addr).expect("parse addr");
+    let rs = engine.new_state();
+    let result = engine
+        .clone()
+        .result_addr(
+            rs.clone(),
+            &addr,
+            heph::engine::OutputMatcher::All,
+            &heph::engine::ResultOptions::default(),
+        )
+        .await
+        .expect("run target");
+    drain(rs).await;
+    artifact_string(&result)
+}
+
+/// `heph r <matcher>` on one event-collecting request: the batch result and
+/// every event the request emitted, after the background work drained.
+pub async fn run_drain_events(
+    engine: &Arc<Engine>,
+    m: &heph::htmatcher::Matcher,
+) -> (
+    anyhow::Result<heph::engine::BatchResult>,
+    Vec<heph::engine::event::BuildEvent>,
+) {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let rs = engine.new_state_with_events(false, Some(tx));
+    let res = Arc::clone(engine)
+        .result(
+            rs.clone(),
+            m,
+            heph::engine::OutputMatcher::All,
+            &heph::engine::ResultOptions::default(),
+        )
+        .await;
+    drain(rs).await;
+    let mut events = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        events.push(ev);
+    }
+    (res, events)
+}
+
 pub struct Workspace {
     inner: htestkit::Workspace,
     /// The configuration [`reopen`](Workspace::reopen) must reproduce. `None`

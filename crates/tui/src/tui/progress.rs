@@ -14,7 +14,7 @@ use ratatui::text::{Line, Span};
 
 use crate::tui::app::{CIAppView, TUIAppView};
 use hcore::capacity::Unit;
-use hcore::events::{BuildEvent, BuildEventKind};
+use hcore::events::{BuildEvent, BuildEventKind, CacheCounts, CacheOutcomeKind};
 
 /// Floor on the pinned viewport row count. The viewport targets one third of the
 /// terminal height (see [`rows_for_height`]) but never shrinks below this, which
@@ -660,15 +660,6 @@ fn event_op_boundary(kind: &BuildEventKind) -> Option<(&str, Op, Boundary)> {
     }
 }
 
-/// Which cache answered for an addr — kept so a hit can be taken back off the
-/// right counter when the target turns out to need building after all. See the
-/// `ExecuteStart` arm of [`BuildState::apply`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CacheHitKind {
-    Local,
-    Remote,
-}
-
 /// Folds the engine's build-progress event stream into renderable state.
 #[derive(Debug, Default)]
 pub struct BuildState {
@@ -726,22 +717,20 @@ pub struct BuildState {
     /// Targets whose driver actually ran to success (`ExecuteEnd` with no error).
     /// Distinct from `completed`, which includes cache hits that never executed.
     executed: usize,
-    local_hits: usize,
-    local_misses: usize,
-    remote_hits: usize,
-    remote_misses: usize,
-    /// Addrs that had a cache hit, and which kind. The header's "cached" count is
-    /// `matched ∩ cache_hit` so it tracks matched targets only, not the transitive
-    /// deps that also hit cache.
+    /// Per-target cache accounting, folded from `CacheOutcome` and
+    /// `CacheHitRebuilt` — the same fold the GHA report and telemetry use, so
+    /// the summary line agrees with them. The tier events are not counted.
+    cache: CacheCounts,
+    /// Addrs whose cache outcome was a hit that still stands. The header's
+    /// "cached" count is `matched ∩ cache_hit` so it tracks matched targets
+    /// only, not the transitive deps that also hit cache.
     ///
-    /// The kind is kept because a hit can be **retracted**: the engine decides a
-    /// hit from the revision's manifest, and a manifest can outlive its blobs (a
-    /// local GC, an object-store lifecycle rule, or simply a revision whose blobs
-    /// were never pulled on a run that is now offline). The engine then rebuilds
-    /// the target, which arrives here as an `ExecuteStart` for an addr already
-    /// counted as cached. Without the kind there is no way to know which counter
-    /// to take it back out of.
-    cache_hit: HashMap<String, CacheHitKind>,
+    /// A hit can be **retracted**: the engine decides a hit from the revision's
+    /// manifest, and a manifest can outlive its blobs (a local GC, an
+    /// object-store lifecycle rule, or simply a revision whose blobs were never
+    /// pulled on a run that is now offline). The engine then rebuilds the target
+    /// and says so with `CacheHitRebuilt`.
+    cache_hit: HashSet<String>,
     /// Worker capacity announced by the engine via `RequestConfig`. `None` until
     /// the event lands (no worker indicator rendered before then).
     max_workers: Option<usize>,
@@ -987,7 +976,7 @@ impl BuildState {
                         if self.finished.contains(addr) {
                             self.matched_finished += 1;
                         }
-                        if self.cache_hit.contains_key(addr) {
+                        if self.cache_hit.contains(addr) {
                             self.matched_cached += 1;
                         }
                     }
@@ -1038,23 +1027,13 @@ impl BuildState {
             }
             // The op timeline (folded above) tracks Execute's duration; here we
             // keep only the `executed` counter side effect on a successful end.
-            //
-            // A target that executes is not a cached target — even if it was
-            // announced as a hit first. The engine decides a hit from the
-            // revision's manifest, which can outlive its blobs, so the bytes may
-            // turn out to be unreadable (GC'd, expired on a shared cache, or
-            // simply never pulled and the remote is now unreachable) and the
-            // target is rebuilt. Retract the hit here rather than counting the
-            // same addr as both cached and executed, which would let "executed + cached"
-            // exceed the number of targets — and, on an offline run over a
-            // remote-mirrored cache, report a full rebuild as "N cached".
+            // A hit that rebuilds is retracted by its `CacheHitRebuilt`.
             BuildEventKind::ExecuteStart {
                 addr,
                 declared,
                 reserved,
                 ..
             } => {
-                self.retract_cache_hit(addr);
                 // A target that runs is no longer waiting. The engine sends
                 // `AdmissionWaitEnd` first; this keeps a lost End from leaving
                 // the row in the Waiting tab for the rest of the run.
@@ -1111,16 +1090,29 @@ impl BuildState {
             BuildEventKind::AdmissionWaitEnd { addr } => {
                 self.admission_waits.remove(addr);
             }
-            BuildEventKind::LocalCacheHit { addr } => {
-                self.local_hits += 1;
-                self.note_cache_hit(addr, CacheHitKind::Local);
+            // Tier events: per tier, not per target, so never a count here (a
+            // remote hit is a local miss first). See `hcore::events`.
+            BuildEventKind::LocalCacheHit { .. }
+            | BuildEventKind::LocalCacheMiss { .. }
+            | BuildEventKind::RemoteCacheHit { .. }
+            | BuildEventKind::RemoteCacheMiss { .. } => {}
+            BuildEventKind::CacheOutcome { addr, outcome } => {
+                self.cache.apply(&ev.kind);
+                if matches!(
+                    outcome,
+                    CacheOutcomeKind::LocalHit | CacheOutcomeKind::RemoteHit
+                ) {
+                    self.note_cache_hit(addr);
+                }
             }
-            BuildEventKind::LocalCacheMiss { .. } => self.local_misses += 1,
-            BuildEventKind::RemoteCacheHit { addr } => {
-                self.remote_hits += 1;
-                self.note_cache_hit(addr, CacheHitKind::Remote);
+            BuildEventKind::CacheHitRebuilt { addr, .. } => {
+                // A rebuild whose `was` this build does not know moves nothing
+                // in the fold, so it must not move the header's set either.
+                if CacheCounts::delta(&ev.kind).is_some() {
+                    self.cache.apply(&ev.kind);
+                    self.retract_cache_hit(addr);
+                }
             }
-            BuildEventKind::RemoteCacheMiss { .. } => self.remote_misses += 1,
             BuildEventKind::ResultLockWaitStart {
                 addr,
                 holder_pid,
@@ -1185,48 +1177,26 @@ impl BuildState {
         }
     }
 
-    /// Record a cache hit (local or remote). This is the cache edge of
+    /// Record a hit outcome (local or remote). This is the cache edge of
     /// `matched ∩ cache_hit`; the `Matched` arm of [`BuildState::apply`] covers
     /// the other one, so the count is right whichever event arrives first. A
     /// repeat hit on an addr already in the set does not re-count.
-    ///
-    /// `kind` is remembered so [`retract_cache_hit`](Self::retract_cache_hit) can
-    /// undo this exact bookkeeping if the hit turns out not to stand.
-    fn note_cache_hit(&mut self, addr: &str, kind: CacheHitKind) {
-        if self.cache_hit.insert(addr.to_string(), kind).is_none() && self.matched.contains(addr) {
+    fn note_cache_hit(&mut self, addr: &str) {
+        if self.cache_hit.insert(addr.to_string()) && self.matched.contains(addr) {
             self.matched_cached += 1;
         }
     }
 
-    /// Take a cache hit back off every counter [`note_cache_hit`](Self::note_cache_hit)
-    /// put it on, because the target is about to build after all.
+    /// Undo [`note_cache_hit`](Self::note_cache_hit) on a `CacheHitRebuilt`:
+    /// the target is about to build after all. The counts themselves moved in
+    /// [`CacheCounts`]; this is the header's set and its folded intersection.
     ///
-    /// The engine decides a hit from the revision's manifest, which can outlive
-    /// its blobs — a local GC, an expiry rule on a shared cache, or blobs that
-    /// were never pulled and a remote that is now unreachable. It announces the
-    /// hit, discovers the bytes are unreadable, and rebuilds. Dropping the addr
-    /// from `cache_hit` alone is not enough: `matched_cached` is folded, not
-    /// rescanned, so it has to be decremented in the same breath or the header
-    /// keeps reporting a target as cached while it builds.
-    ///
-    /// A no-op for an addr that never hit — the ordinary cache miss, which is
-    /// most `ExecuteStart`s.
+    /// Dropping the addr from `cache_hit` alone is not enough: `matched_cached`
+    /// is folded, not rescanned, so it has to be decremented in the same breath
+    /// or the header keeps reporting a target as cached while it builds.
     fn retract_cache_hit(&mut self, addr: &str) {
-        let Some(kind) = self.cache_hit.remove(addr) else {
-            return;
-        };
-        if self.matched.contains(addr) {
+        if self.cache_hit.remove(addr) && self.matched.contains(addr) {
             self.matched_cached = self.matched_cached.saturating_sub(1);
-        }
-        match kind {
-            CacheHitKind::Local => {
-                self.local_hits = self.local_hits.saturating_sub(1);
-                self.local_misses += 1;
-            }
-            CacheHitKind::Remote => {
-                self.remote_hits = self.remote_hits.saturating_sub(1);
-                self.remote_misses += 1;
-            }
         }
     }
 
@@ -1419,7 +1389,7 @@ impl BuildState {
         let mut rows = row_buffer(self.cache_hit.len(), filter);
         rows.extend(
             self.cache_hit
-                .keys()
+                .iter()
                 .filter(|a| match scope {
                     CountScope::All => true,
                     CountScope::Matched if self.matched_seen => self.matched.contains(*a),
@@ -1455,7 +1425,7 @@ impl BuildState {
                 );
                 self.matched_cached
             }
-            CountScope::Matched => self.local_hits + self.remote_hits,
+            CountScope::Matched => usize::try_from(self.cache.hits()).unwrap_or(usize::MAX),
         }
     }
 
@@ -1594,18 +1564,16 @@ impl BuildState {
             || self.completed > 0
             || self.errored > 0
             || !self.in_flight_results.is_empty()
-            || self.local_hits > 0
-            || self.local_misses > 0
-            || self.remote_hits > 0
-            || self.remote_misses > 0
+            || self.cache.consulted() > 0
     }
 
     /// One-line summary. Prefixed with matched progress once a `Matched` event
     /// has arrived: `matched D / N` (or `D / ~N` while the matcher is still
     /// streaming), then `done M, err K, running R, cache H hit / M miss`.
     pub fn summary(&self) -> String {
-        let hits = self.local_hits + self.remote_hits;
-        let misses = self.local_misses + self.remote_misses;
+        // Per target: a remote hit is a hit, a full miss one miss.
+        let hits = self.cache.hits();
+        let misses = self.cache.misses();
         let matched = match self.matched_progress() {
             // `~` marks a provisional total while the matcher is still streaming.
             Some((done, total, complete)) => {
@@ -3560,31 +3528,80 @@ mod tests {
     }
 
     #[test]
-    fn local_cache_hit_miss_counters() {
+    fn summary_counts_targets_not_tiers() {
         let mut s = BuildState::new();
+        // Nine remote hits, each a local tier miss first, and one full miss:
+        // eleven tier misses, one target miss.
+        for i in 0..9 {
+            let addr = format!("//r:t{i}");
+            s.apply(&ev(
+                1,
+                BuildEventKind::LocalCacheMiss { addr: addr.clone() },
+            ));
+            s.apply(&ev(
+                2,
+                BuildEventKind::RemoteCacheHit { addr: addr.clone() },
+            ));
+            s.apply(&ev(2, remote_cache_hit(&addr)));
+        }
         s.apply(&ev(
-            1,
-            BuildEventKind::LocalCacheHit {
-                addr: "//a:b".into(),
-            },
-        ));
-        s.apply(&ev(
-            2,
+            3,
             BuildEventKind::LocalCacheMiss {
                 addr: "//c:d".into(),
             },
         ));
         s.apply(&ev(
             3,
-            BuildEventKind::LocalCacheMiss {
-                addr: "//e:f".into(),
+            BuildEventKind::RemoteCacheMiss {
+                addr: "//c:d".into(),
             },
         ));
-        assert_eq!(s.local_hits, 1);
-        assert_eq!(s.local_misses, 2);
+        s.apply(&ev(
+            3,
+            BuildEventKind::CacheOutcome {
+                addr: "//c:d".into(),
+                outcome: CacheOutcomeKind::Miss,
+            },
+        ));
         let summary = s.summary();
-        assert!(summary.contains("1 hit"), "summary: {summary}");
-        assert!(summary.contains("2 miss"), "summary: {summary}");
+        assert!(
+            summary.ends_with("cache 9 hit / 1 miss"),
+            "summary: {summary}"
+        );
+    }
+
+    /// The summary line and the header's cached count, over the stream every
+    /// consumer is tested against.
+    #[test]
+    fn cache_counts_agree_across_consumers() {
+        let mut s = BuildState::new();
+        let mut fold = CacheCounts::default();
+        for e in hcore::events::test_support::cache_stream() {
+            fold.apply(&e.kind);
+            s.apply(&e);
+        }
+        assert_eq!(s.cache, fold);
+        let (l, r, m, _) = hcore::events::test_support::CACHE_STREAM_EXPECTED;
+        assert!(
+            s.summary()
+                .ends_with(&format!("cache {} hit / {m} miss", l + r)),
+            "{}",
+            s.summary()
+        );
+        assert_eq!(
+            s.cached_count(CountScope::All),
+            usize::try_from(l + r).expect("small"),
+            "the rebuilt hits are no longer listed as cached"
+        );
+    }
+
+    /// Before any `Matched` event the header falls back to the fold's hits,
+    /// and a remote hit is one of them.
+    #[test]
+    fn cached_count_falls_back_to_the_fold_before_matched() {
+        let mut s = BuildState::new();
+        s.apply(&ev(1, remote_cache_hit("//a:r")));
+        assert_eq!(s.cached_count(CountScope::Matched), 1);
     }
 
     /// A cache hit the engine later has to rebuild must stop counting as a hit.
@@ -3608,7 +3625,7 @@ mod tests {
         s.apply(&ev(3, remote_cache_hit("//a:remote")));
         s.apply(&ev(4, local_cache_hit("//a:stands")));
         s.apply(&ev(5, matched(&["//a:remote"], true)));
-        assert_eq!((s.local_hits, s.remote_hits), (2, 1));
+        assert_eq!(cache3(&s), (2, 1, 0));
         assert_eq!(
             s.cached_count(CountScope::Matched),
             3,
@@ -3616,20 +3633,23 @@ mod tests {
         );
 
         // Two of the three revisions turn out to be unreadable and get rebuilt.
+        use hcore::events::CacheHitKind;
+        s.apply(&ev(6, hit_rebuilt("//a:local", CacheHitKind::Local)));
         s.apply(&ev(6, execute_start("//a:local")));
+        s.apply(&ev(7, hit_rebuilt("//a:remote", CacheHitKind::Remote)));
         s.apply(&ev(7, execute_start("//a:remote")));
         s.apply(&ev(8, execute_end("//a:local")));
         s.apply(&ev(9, execute_end("//a:remote")));
 
         assert_eq!(
-            (s.local_hits, s.remote_hits),
-            (1, 0),
-            "a rebuilt target must be taken back off the cache counter it was put on"
+            cache3(&s),
+            (1, 0, 2),
+            "a rebuilt target is taken back off the tier it hit and counted as a miss"
         );
-        assert_eq!(
-            (s.local_misses, s.remote_misses),
-            (1, 1),
-            "and counted as the miss it turned out to be"
+        assert!(
+            s.summary().ends_with("cache 1 hit / 2 miss"),
+            "{}",
+            s.summary()
         );
         assert_eq!(s.executed, 2);
         // Through the header's own accessors, not the raw counters: these are the
@@ -3652,21 +3672,23 @@ mod tests {
             "the folded counter must still agree with the set it stands in for"
         );
         assert!(
-            !s.cache_hit.contains_key("//a:local") && s.cache_hit.contains_key("//a:stands"),
+            !s.cache_hit.contains("//a:local") && s.cache_hit.contains("//a:stands"),
             "only the rebuilt addrs are retracted: {:?}",
             s.cache_hit
         );
     }
 
-    /// A target that executes without ever being announced as a hit — the plain
-    /// miss — must not underflow the hit counters.
+    /// An execute is not cache accounting: a hit that stands stays a hit
+    /// however many `ExecuteStart`s land, and only `CacheHitRebuilt` takes it
+    /// back — the inference this replaced counted per caller.
     #[test]
-    fn executing_a_target_that_never_hit_leaves_the_counters_alone() {
+    fn executing_moves_no_cache_count() {
         let mut s = BuildState::new();
-        s.apply(&ev(1, execute_start("//a:fresh")));
-        s.apply(&ev(2, execute_end("//a:fresh")));
-        assert_eq!((s.local_hits, s.remote_hits), (0, 0));
-        assert_eq!((s.local_misses, s.remote_misses), (0, 0));
+        s.apply(&ev(1, local_cache_hit("//a:hit")));
+        s.apply(&ev(2, execute_start("//a:fresh")));
+        s.apply(&ev(3, execute_end("//a:fresh")));
+        s.apply(&ev(4, execute_start("//a:hit")));
+        assert_eq!(cache3(&s), (1, 0, 0));
         assert_eq!(s.executed, 1);
     }
 
@@ -4037,12 +4059,7 @@ mod tests {
         // One real build (execute end ok), one cache hit, one running, one failed.
         v.apply(&ev(0, execute_start("//a:built")));
         v.apply(&ev(1, execute_end("//a:built")));
-        v.apply(&ev(
-            2,
-            BuildEventKind::LocalCacheHit {
-                addr: "//a:cached".into(),
-            },
-        ));
+        v.apply(&ev(2, local_cache_hit("//a:cached")));
         v.apply(&ev(3, result_start("//a:running")));
         v.apply(&ev(4, result_start("//a:failed")));
         v.apply(&ev(5, result_end("//a:failed", Some("boom".into()))));
@@ -4329,12 +4346,36 @@ mod tests {
         assert!(s.summary().contains("matched 1 / 2"), "{}", s.summary());
     }
 
+    /// The target's local-hit outcome — what the header counts, not the tier
+    /// event.
     fn local_cache_hit(addr: &str) -> BuildEventKind {
-        BuildEventKind::LocalCacheHit { addr: addr.into() }
+        BuildEventKind::CacheOutcome {
+            addr: addr.into(),
+            outcome: CacheOutcomeKind::LocalHit,
+        }
     }
 
     fn remote_cache_hit(addr: &str) -> BuildEventKind {
-        BuildEventKind::RemoteCacheHit { addr: addr.into() }
+        BuildEventKind::CacheOutcome {
+            addr: addr.into(),
+            outcome: CacheOutcomeKind::RemoteHit,
+        }
+    }
+
+    fn hit_rebuilt(addr: &str, was: hcore::events::CacheHitKind) -> BuildEventKind {
+        BuildEventKind::CacheHitRebuilt {
+            addr: addr.into(),
+            was,
+        }
+    }
+
+    /// `(local_hits, remote_hits, misses)` as the summary reads them.
+    fn cache3(s: &BuildState) -> (u64, u64, u64) {
+        (
+            s.cache.local_hits(),
+            s.cache.remote_hits(),
+            s.cache.misses(),
+        )
     }
 
     /// The two matched intersections computed the slow way, straight off the
@@ -4344,7 +4385,7 @@ mod tests {
             s.matched.iter().filter(|a| s.finished.contains(*a)).count(),
             s.matched
                 .iter()
-                .filter(|a| s.cache_hit.contains_key(*a))
+                .filter(|a| s.cache_hit.contains(*a))
                 .count(),
         )
     }

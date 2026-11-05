@@ -51,6 +51,41 @@ pub(crate) const LIVE_SECTION_BUDGET: usize = COMMENT_LIMIT / 4;
 /// the JSON document; the report is an index, not a transcript.
 const MAX_MSG_CHARS: usize = 200;
 
+/// `99.9%`, or `n/a` when there is no rate.
+///
+/// Never `100.0%` while anything missed, nor `0.0%` while anything hit: 26,921
+/// hits and 3 misses round to `100.0%`, which reads as "nothing to look at"
+/// next to a misses count that says otherwise. Those clamp to `99.9%` / `0.1%`.
+fn fmt_rate(rate: Option<f64>) -> String {
+    rate.map_or_else(
+        || "n/a".to_string(),
+        |r| {
+            let pct = r * 100.0;
+            let shown = if r < 1.0 && pct > 99.9 {
+                99.9
+            } else if r > 0.0 && pct < 0.1 {
+                0.1
+            } else {
+                pct
+            };
+            format!("{shown:.1}%")
+        },
+    )
+}
+
+/// `N hits (L local, R remote) · X% hit rate` — the one spelling of the hit
+/// summary, shared by the all-cached line and the summary table's cache row
+/// so a single pattern reads both.
+fn fmt_hits(c: &Counters) -> String {
+    format!(
+        "{} hits ({} local, {} remote) · {} hit rate",
+        fmt_count(c.cached()),
+        fmt_count(c.local_hits()),
+        fmt_count(c.remote_hits()),
+        fmt_rate(c.hit_rate())
+    )
+}
+
 /// Longest addr rendered inline.
 const MAX_ADDR_CHARS: usize = 128;
 
@@ -612,12 +647,8 @@ pub(crate) fn render_final(t: &Tally, ctx: &RenderCtx<'_>, budget: usize) -> Str
             fmt_count(c.cached()),
             fmt_count(total)
         ));
-        b.push(&format!(
-            "{} cache hits ({} local, {} remote)\n",
-            fmt_count(c.cached()),
-            fmt_count(c.cached_local),
-            fmt_count(c.cached_remote)
-        ));
+        // The same text as the table row's start, so one parse reads both.
+        b.push(&format!("{}\n", fmt_hits(&c)));
         return b.finish();
     } else {
         b.push(&format!(
@@ -652,14 +683,19 @@ fn push_summary_table(b: &mut Budgeted, t: &Tally, c: &Counters) {
         fmt_count(c.roots_total)
     ));
     match c.hit_rate() {
-        Some(rate) => s.push_str(&format!(
-            "| cache | {} hits ({} local, {} remote) · **{:.1}% hit rate** · {} misses |\n",
-            fmt_count(c.cached()),
-            fmt_count(c.cached_local),
-            fmt_count(c.cached_remote),
-            rate * 100.0,
-            fmt_count(c.misses())
-        )),
+        Some(_) => {
+            // A rebuilt hit is a miss, but it points at cache health rather
+            // than at changed inputs, so it is called out when there is one.
+            let rebuilt = match c.rebuilt() {
+                0 => String::new(),
+                n => format!(", {} of them rebuilt after a hit", fmt_count(n)),
+            };
+            s.push_str(&format!(
+                "| cache | **{}** · {} misses{rebuilt} |\n",
+                fmt_hits(c),
+                fmt_count(c.misses())
+            ));
+        }
         // Never render "0%" for a cache that was never consulted.
         None => s.push_str("| cache | not consulted |\n"),
     }
@@ -808,7 +844,14 @@ fn push_miss_rollup(b: &mut Budgeted, t: &Tally, c: &Counters) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hcore::events::{BuildEvent, BuildEventKind};
+    use hcore::events::{BuildEvent, BuildEventKind, CacheCounts, CacheHitKind, CacheOutcomeKind};
+
+    fn outcome(addr: impl Into<String>, outcome: CacheOutcomeKind) -> BuildEventKind {
+        BuildEventKind::CacheOutcome {
+            addr: addr.into(),
+            outcome,
+        }
+    }
 
     fn ev(at: u64, kind: BuildEventKind) -> BuildEvent {
         BuildEvent {
@@ -1047,9 +1090,7 @@ mod tests {
         for i in 0..20_000 {
             t.apply(&ev(
                 1,
-                BuildEventKind::LocalCacheHit {
-                    addr: format!("//pkg:t{i}"),
-                },
+                outcome(format!("//pkg:t{i}"), CacheOutcomeKind::LocalHit),
             ));
             t.apply(&ev(
                 2,
@@ -1065,7 +1106,10 @@ mod tests {
         t.set_closed();
         let md = render_final(&t, &ctx("heph run //...", 41_000), SUMMARY_BUDGET);
         assert!(md.contains("nothing executed"), "{md}");
-        assert!(md.contains("20,000 cache hits"), "{md}");
+        assert!(
+            md.contains("20,000 hits (20,000 local, 0 remote) · 100.0% hit rate"),
+            "the all-cached line carries the rate too: {md}"
+        );
         assert!(md.len() < 300, "one line, not a wall: {} bytes", md.len());
     }
 
@@ -1092,12 +1136,7 @@ mod tests {
                 queued_ms: None,
             },
         ));
-        t.apply(&ev(
-            0,
-            BuildEventKind::LocalCacheMiss {
-                addr: "//a:slow".into(),
-            },
-        ));
+        t.apply(&ev(0, outcome("//a:slow", CacheOutcomeKind::Miss)));
         t.apply(&ev(
             252_000,
             BuildEventKind::ExecuteEnd {
@@ -1140,9 +1179,7 @@ mod tests {
         for i in 0..500 {
             t.apply(&ev(
                 0,
-                BuildEventKind::LocalCacheMiss {
-                    addr: format!("//pkg:t{i}"),
-                },
+                outcome(format!("//pkg:t{i}"), CacheOutcomeKind::Miss),
             ));
         }
         t.set_closed();
@@ -1354,9 +1391,7 @@ mod tests {
         for i in 0..8_412 {
             t.apply(&ev(
                 1,
-                BuildEventKind::LocalCacheHit {
-                    addr: format!("//pkg{}:t{i}", i % 50),
-                },
+                outcome(format!("//pkg{}:t{i}", i % 50), CacheOutcomeKind::LocalHit),
             ));
             t.apply(&ev(
                 2,
@@ -1492,12 +1527,7 @@ mod tests {
                 units: Default::default(),
             },
         ));
-        t.apply(&ev(
-            0,
-            BuildEventKind::LocalCacheMiss {
-                addr: "//a:x".into(),
-            },
-        ));
+        t.apply(&ev(0, outcome("//a:x", CacheOutcomeKind::Miss)));
 
         let out = render_final(&t, &ctx("Build", 60_000), 100_000);
         assert!(
@@ -1515,13 +1545,141 @@ mod tests {
     #[test]
     fn a_zero_hit_ordinary_run_still_warns() {
         let mut t = build(1, 0, 0);
-        t.apply(&ev(
-            0,
-            BuildEventKind::LocalCacheMiss {
-                addr: "//a:x".into(),
-            },
-        ));
+        t.apply(&ev(0, outcome("//a:x", CacheOutcomeKind::Miss)));
         let out = render_final(&t, &ctx("Build", 60_000), 100_000);
         assert!(out.contains("inspect hashin"), "{out}");
+    }
+
+    /// The CI run this fixed: 26,921 remote hits and 3 misses, each remote hit
+    /// a local tier miss first. It rendered `50.0% hit rate · 26,924 misses`.
+    #[test]
+    fn remote_hits_render_as_hits_not_misses() {
+        let mut t = build(26_924, 3, 0);
+        for i in 0..26_921 {
+            let addr = format!("//pkg{}:t{i}", i % 40);
+            t.apply(&ev(
+                1,
+                BuildEventKind::LocalCacheMiss { addr: addr.clone() },
+            ));
+            t.apply(&ev(
+                2,
+                BuildEventKind::RemoteCacheHit { addr: addr.clone() },
+            ));
+            t.apply(&ev(2, outcome(addr, CacheOutcomeKind::RemoteHit)));
+        }
+        for i in 0..3 {
+            let addr = format!("//cold:t{i}");
+            t.apply(&ev(
+                1,
+                BuildEventKind::LocalCacheMiss { addr: addr.clone() },
+            ));
+            t.apply(&ev(
+                2,
+                BuildEventKind::RemoteCacheMiss { addr: addr.clone() },
+            ));
+            t.apply(&ev(2, outcome(addr, CacheOutcomeKind::Miss)));
+        }
+        t.set_closed();
+        let out = render_final(&t, &ctx("Build", 60_000), SUMMARY_BUDGET);
+        assert!(
+            out.contains(
+                "| cache | **26,921 hits (0 local, 26,921 remote) · 99.9% hit rate** · 3 misses |"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("Cache misses by package (3 across 1 packages)"),
+            "only the cold package is a miss: {out}"
+        );
+    }
+
+    #[test]
+    fn rebuilt_misses_are_called_out() {
+        let mut t = build(4, 1, 0);
+        t.apply(&ev(0, outcome("//a:hit", CacheOutcomeKind::LocalHit)));
+        t.apply(&ev(0, outcome("//a:cold", CacheOutcomeKind::Miss)));
+        for (addr, was) in [
+            ("//a:l", CacheHitKind::Local),
+            ("//a:r", CacheHitKind::Remote),
+        ] {
+            let o = match was {
+                CacheHitKind::Remote => CacheOutcomeKind::RemoteHit,
+                _ => CacheOutcomeKind::LocalHit,
+            };
+            t.apply(&ev(0, outcome(addr, o)));
+            t.apply(&ev(
+                1,
+                BuildEventKind::CacheHitRebuilt {
+                    addr: addr.into(),
+                    was,
+                },
+            ));
+        }
+        t.set_closed();
+        let out = render_final(&t, &ctx("Build", 60_000), SUMMARY_BUDGET);
+        assert!(
+            out.contains("· 3 misses, 2 of them rebuilt after a hit |"),
+            "misses stay inclusive and the rebuilt part is named: {out}"
+        );
+        assert!(out.contains("1 hits (1 local, 0 remote)"), "{out}");
+    }
+
+    /// 26,921 hits and 3 misses is not `100.0%`; one hit in 10,000 is not
+    /// `0.0%`. Exact ends stay exact.
+    #[test]
+    fn rate_never_rounds_to_an_end_it_is_not() {
+        let rate = |hits: u64, misses: u64| {
+            fmt_rate(CacheCounts::from_parts(hits, 0, misses, 0).hit_rate())
+        };
+        assert_eq!(rate(26_921, 3), "99.9%");
+        assert_eq!(rate(1, 9_999), "0.1%");
+        assert_eq!(rate(5, 0), "100.0%");
+        assert_eq!(rate(0, 5), "0.0%");
+        assert_eq!(rate(1, 1), "50.0%");
+        assert_eq!(fmt_rate(None), "n/a");
+    }
+
+    /// The all-cached line and the table's cache row start with the same
+    /// text for the same counts, so one pattern reads either report.
+    #[test]
+    fn all_cached_line_and_table_row_share_the_hit_summary() {
+        let hits = |n: usize, misses: usize| {
+            let mut t = build(n + misses, 0, 0);
+            for i in 0..n {
+                let o = if i % 2 == 0 {
+                    CacheOutcomeKind::LocalHit
+                } else {
+                    CacheOutcomeKind::RemoteHit
+                };
+                t.apply(&ev(1, outcome(format!("//h:t{i}"), o)));
+            }
+            for i in 0..misses {
+                t.apply(&ev(1, outcome(format!("//m:t{i}"), CacheOutcomeKind::Miss)));
+                t.apply(&ev(
+                    2,
+                    BuildEventKind::ExecuteEnd {
+                        addr: format!("//m:t{i}"),
+                        error: None,
+                    },
+                ));
+            }
+            t.set_closed();
+            t
+        };
+        let all_cached = hits(4, 0);
+        let expected = fmt_hits(&all_cached.counters());
+        assert_eq!(expected, "4 hits (2 local, 2 remote) · 100.0% hit rate");
+        let md = render_final(&all_cached, &ctx("Build", 60_000), SUMMARY_BUDGET);
+        assert!(md.contains("nothing executed"), "{md}");
+        assert!(md.contains(&expected), "{md}");
+
+        let with_misses = hits(4, 1);
+        let expected = fmt_hits(&with_misses.counters());
+        assert_eq!(expected, "4 hits (2 local, 2 remote) · 80.0% hit rate");
+        let md = render_final(&with_misses, &ctx("Build", 60_000), SUMMARY_BUDGET);
+        assert!(
+            md.contains(&format!("| cache | **{expected}** · 1 misses |")),
+            "{md}"
+        );
     }
 }
