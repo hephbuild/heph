@@ -207,6 +207,84 @@ func TestStampLintRewritesOnlyLint(t *testing.T) {
 	}
 }
 
+// A command that lints or commits before it pushes can only be judged when the
+// push runs; the hook defers exactly those, and only pushes it can reach.
+func TestDecideDefersAPushTheCommandMayFix(t *testing.T) {
+	stale := gate{unlinted: func() string { return "stale" }}
+	const l, p = "LINT", "PUSHW"
+	for cmd, want := range map[string]string{
+		"lint && git push": "LINT && PUSHW git push",
+		"git commit -qm x && git push -u origin HEAD":                    "git commit -qm x && PUSHW git push -u origin HEAD",
+		"lint > l.log 2>&1 && git add -A && git commit -m x && git push": "LINT > l.log 2>&1 && git add -A && git commit -m x && PUSHW git push",
+		"git rebase origin/master && gh stack submit --auto":             "git rebase origin/master && PUSHW gh stack submit --auto",
+		"git commit -m x; timeout 60 git push":                           "git commit -m x; timeout 60 PUSHW git push",
+		"git commit -m x && HEPH_PUSH_UNLINTED=1 git push && git push":   "git commit -m x && HEPH_PUSH_UNLINTED=1 git push && PUSHW git push",
+	} {
+		reason, got := decide(cmd, stale, l, p)
+		if reason != "" || got != want {
+			t.Errorf("decide(%q) = (%q, %q), want deferred %q", cmd, reason, got, want)
+		}
+	}
+	for _, cmd := range []string{
+		// Nothing in the command can change the answer: refuse now.
+		"git push",
+		"git status && git push",
+		"git add -A && git push",
+		// Unreachable by the splice, so not deferrable.
+		"git commit -m x && bash -c 'git push'",
+		// Deferring the push does not lift another refusal.
+		"git commit -m x && git push && tst",
+	} {
+		if reason, got := decide(cmd, stale, l, p); reason == "" {
+			t.Errorf("decide(%q) allowed it as %q; want refused", cmd, got)
+		}
+	}
+	// Without the wrapper (gate dir unknown) nothing is deferred.
+	if reason, _ := decide("lint && git push", stale, "", ""); reason == "" {
+		t.Error("no wrapper: the push must stay refused")
+	}
+	// A linted tree is not rewritten for push at all.
+	linted := gate{unlinted: func() string { return "" }}
+	if reason, got := decide("git commit -m x && git push", linted, l, p); reason != "" || got != "" {
+		t.Errorf("linted tree: got (%q, %q), want the command unchanged", reason, got)
+	}
+}
+
+// The deferred check is the gate itself: a push of an unlinted HEAD must not
+// run, and one of the linted HEAD must run with its own exit code.
+func TestRunPushChecksTheStampWhenItRuns(t *testing.T) {
+	dir := t.TempDir()
+	g := func(args ...string) string {
+		t.Helper()
+		out, err := git(dir, nil, args...)
+		if err != nil {
+			t.Fatalf("git %v: %v", args, err)
+		}
+		return out
+	}
+	g("init", "-q")
+	g("-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", "a")
+	ran := filepath.Join(dir, "ran")
+	push := []string{"sh", "-c", "touch ran; exit 7"}
+
+	if code := runPush(dir, push); code != 1 {
+		t.Errorf("unlinted: exit %d, want 1", code)
+	}
+	if _, err := os.Stat(ran); err == nil {
+		t.Fatal("unlinted: the push ran")
+	}
+	stamp := filepath.Join(g("rev-parse", "--absolute-git-dir"), lintStampFile)
+	if err := os.WriteFile(stamp, []byte(g("rev-parse", "HEAD^{tree}")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if code := runPush(dir, push); code != 7 {
+		t.Errorf("linted: exit %d, want the push's 7", code)
+	}
+	if _, err := os.Stat(ran); err != nil {
+		t.Error("linted: the push did not run")
+	}
+}
+
 func TestShQuote(t *testing.T) {
 	const dir = "/it's a $dir"
 	out, err := exec.Command("sh", "-c", "printf %s "+shQuote(dir)).Output()

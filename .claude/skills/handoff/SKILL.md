@@ -76,9 +76,13 @@ next to the code. Memory is for the user's preferences.
 End with exactly one line the user can paste into a new session:
 
 ```
-/goal implement <spec-url> (spec text: <exported .md path>)
-/goal get PR #<n> green and through review
+/goal implement <spec-url> (spec text: <exported .md path>) — done when the PR is open, its spec tests pass, `lint` exits 0, and the review board's verdicts are recorded
+/goal PR #<n>: CI green on its HEAD, and every board and reviewer finding fixed or answered in the PR
 ```
+
+A goal names only states the model can check. "Through review" or "tested on real hardware" are
+the user's steps; a goal that includes them is never met, and its Stop hook re-checked one 15
+times over ~600k of context (2026-11-01).
 
 A spec with several PRs gets one line per PR, so each is built in its own context — stacked or
 not. Building every layer of a stack in one context is what grows it past 400k (CLAUDE.md, "One
