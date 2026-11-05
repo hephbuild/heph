@@ -1027,8 +1027,7 @@ impl BuildState {
             }
             // The op timeline (folded above) tracks Execute's duration; here we
             // keep only the `executed` counter side effect on a successful end.
-            // A hit that rebuilds is retracted by its `CacheHitRebuilt`, which
-            // the engine emits before this.
+            // A hit that rebuilds is retracted by its `CacheHitRebuilt`.
             BuildEventKind::ExecuteStart {
                 addr,
                 declared,
@@ -1107,8 +1106,12 @@ impl BuildState {
                 }
             }
             BuildEventKind::CacheHitRebuilt { addr, .. } => {
-                self.cache.apply(&ev.kind);
-                self.retract_cache_hit(addr);
+                // A rebuild whose `was` this build does not know moves nothing
+                // in the fold, so it must not move the header's set either.
+                if CacheCounts::delta(&ev.kind).is_some() {
+                    self.cache.apply(&ev.kind);
+                    self.retract_cache_hit(addr);
+                }
             }
             BuildEventKind::ResultLockWaitStart {
                 addr,
@@ -2992,6 +2995,7 @@ mod tests {
                 scratch_disabled: false,
                 resources: [("scratch_disk".into(), Some(4 << 30))].into(),
                 units: [("scratch_disk".into(), "bytes".into())].into(),
+                cache_outcomes: true,
             },
         ));
         s.apply(&ev(
@@ -3090,6 +3094,7 @@ mod tests {
                     ("tokens".into(), "count".into()),
                 ]
                 .into(),
+                cache_outcomes: true,
             },
         ));
         let segments = |s: &BuildState| s.pool_segments().collect::<Vec<_>>();
@@ -3135,6 +3140,7 @@ mod tests {
                 scratch_disabled: false,
                 resources: [("cpu".into(), Some(4 * CPU)), ("gpu".into(), Some(4))].into(),
                 units: [("cpu".into(), "cpu".into()), ("gpu".into(), "count".into())].into(),
+                cache_outcomes: true,
             },
         ));
         let segments = |s: &BuildState| s.pool_segments().collect::<Vec<_>>();
@@ -3592,6 +3598,15 @@ mod tests {
         );
     }
 
+    /// Before any `Matched` event the header falls back to the fold's hits,
+    /// and a remote hit is one of them.
+    #[test]
+    fn cached_count_falls_back_to_the_fold_before_matched() {
+        let mut s = BuildState::new();
+        s.apply(&ev(1, remote_cache_hit("//a:r")));
+        assert_eq!(s.cached_count(CountScope::Matched), 1);
+    }
+
     /// A cache hit the engine later has to rebuild must stop counting as a hit.
     ///
     /// The engine decides a hit from the revision's manifest, which can outlive
@@ -4001,6 +4016,7 @@ mod tests {
             scratch_disabled: false,
             resources: Default::default(),
             units: Default::default(),
+            cache_outcomes: true,
         }
     }
 

@@ -1121,9 +1121,12 @@ pub(crate) struct LockedResolution {
     /// revision ("where can its bytes be fetched from"), never of what one caller
     /// asked for — see [`Engine::locate_remote_revision`].
     remote: RemoteCell,
-    /// Which tier this cell's `CacheOutcome` announced as a hit; `None` when it
-    /// executed (or never consulted the cache). Read by the rebuild branch of
-    /// [`execute_and_cache`] to say which hit it takes back.
+    /// Which tier this cell's `CacheOutcome` **announced** as a hit: `Some`
+    /// only when that outcome was actually emitted. `None` when it executed,
+    /// never consulted the cache, or hit under a hash-only request (which
+    /// emits no outcome). Read by the rebuild branch of [`execute_and_cache`]
+    /// to say which hit it takes back, so a `CacheHitRebuilt` never takes back
+    /// a hit nobody announced.
     hit: Option<hcore::events::CacheHitKind>,
     /// Set by the first caller that rebuilds this hit, so `CacheHitRebuilt` is
     /// emitted once per addr per request however many `(outputs, is_top)`
@@ -3265,7 +3268,9 @@ impl Engine {
                     executed: None,
                     manifest: Some(manifest),
                     remote: RemoteCell::new(),
-                    hit: Some(hcore::events::CacheHitKind::Local),
+                    // Announced only outside a hash-only request (see
+                    // `probe_cache_manifest`), so only then is it a hit to take back.
+                    hit: (!rs.hash_only()).then_some(hcore::events::CacheHitKind::Local),
                     rebuilt: Default::default(),
                 }),
                 Some(read),
@@ -3351,7 +3356,8 @@ impl Engine {
                                 executed: None,
                                 manifest: Some(manifest),
                                 remote: RemoteCell::new(),
-                                hit: Some(hcore::events::CacheHitKind::Local),
+                                hit: (!rs.hash_only())
+                                    .then_some(hcore::events::CacheHitKind::Local),
                                 rebuilt: Default::default(),
                             }),
                             Some(read),
@@ -3374,7 +3380,7 @@ impl Engine {
                     None,
                     Some(manifest),
                     RemoteCell::new(),
-                    Some(hcore::events::CacheHitKind::Local),
+                    (!rs.hash_only()).then_some(hcore::events::CacheHitKind::Local),
                 ),
                 None => {
                     // The settled local miss: both probes came back empty under the
@@ -3455,7 +3461,7 @@ impl Engine {
                                 None,
                                 Some(Arc::new(manifest)),
                                 known_remote(Some(Arc::new(rev))),
-                                Some(hcore::events::CacheHitKind::Remote),
+                                (!rs.hash_only()).then_some(hcore::events::CacheHitKind::Remote),
                             )
                         }
                         None => {

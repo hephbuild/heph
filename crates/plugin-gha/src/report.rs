@@ -63,6 +63,17 @@ fn status_str(t: &Tally, c: &Counters) -> &'static str {
     }
 }
 
+/// `per_target`, or `unavailable` for a host too old to send `CacheOutcome`:
+/// the explicit marker beside the cache counts, so their `null` (or absent
+/// output key) means "unknown", never `0`.
+fn cache_accounting(c: &Counters) -> &'static str {
+    if c.cache.is_some() {
+        "per_target"
+    } else {
+        "unavailable"
+    }
+}
+
 /// The full document — unbounded, for `jsonPath`.
 ///
 /// `failures` and `slowest` are sorted deterministically so two runs diff
@@ -107,9 +118,11 @@ pub(crate) fn full_document(
             "executed": c.executed,
         },
         // Per target (one count per cacheable addr): `misses` includes
-        // `rebuilt`. Every field is `null` when the host is too old to send
-        // `CacheOutcome` — see `Counters::cache`.
+        // `rebuilt`. Every count is `null` when the host is too old to send
+        // `CacheOutcome` — see `Counters::cache` — and `accounting` says
+        // which, so a consumer never reads that `null` as `0`.
         "cache": {
+            "accounting": cache_accounting(c),
             "local_hits": c.cache.map(|_| c.local_hits()),
             "remote_hits": c.cache.map(|_| c.remote_hits()),
             "misses": c.cache.map(|_| c.misses()),
@@ -243,6 +256,9 @@ fn escape_annotation(s: &str) -> String {
 /// `key=value` lines for `$GITHUB_OUTPUT` — the GHA-native agent surface: free,
 /// no parsing, no rate limit, and readable by a downstream step as
 /// `${{ steps.build.outputs.heph_failed }}`.
+///
+/// `heph_cache_accounting` is always present; `heph_cached` and
+/// `heph_cache_hit_rate` can be absent.
 pub(crate) fn github_outputs(
     t: &Tally,
     c: &Counters,
@@ -256,8 +272,10 @@ pub(crate) fn github_outputs(
         format!("heph_executed={}", c.executed),
         format!("heph_elapsed_ms={elapsed_ms}"),
         format!("heph_elapsed={}", fmt_duration(elapsed_ms)),
+        format!("heph_cache_accounting={}", cache_accounting(c)),
     ];
-    // Absent, not `0`, when the host is too old to count per target.
+    // Absent, not `0`, when the host is too old to count per target;
+    // `heph_cache_accounting` says so explicitly.
     if c.cache.is_some() {
         out.push(format!("heph_cached={}", c.cached()));
     }
@@ -495,6 +513,12 @@ mod tests {
         }
         let c = t.counters();
         let v = full_document(&t, &c, 1_000, "run //...", None);
+        assert_eq!(v["cache"]["accounting"], "per_target");
+        assert!(
+            github_outputs(&t, &c, 1_000, None)
+                .iter()
+                .any(|l| l == "heph_cache_accounting=per_target"),
+        );
         assert_eq!(v["cache"]["local_hits"], 0);
         assert_eq!(v["cache"]["remote_hits"], 1);
         assert_eq!(v["cache"]["misses"], 2, "inclusive of the rebuilt one");
@@ -515,7 +539,12 @@ mod tests {
             assert!(v["cache"][key].is_null(), "{key}: {v}");
         }
         assert!(v["targets"]["cached"].is_null(), "{v}");
+        assert_eq!(v["cache"]["accounting"], "unavailable", "{v}");
         let out = github_outputs(&t, &c, 1_000, None);
+        assert!(
+            out.iter().any(|l| l == "heph_cache_accounting=unavailable"),
+            "{out:?}"
+        );
         assert!(
             !out.iter()
                 .any(|l| l.starts_with("heph_cached") || l.starts_with("heph_cache_hit_rate")),

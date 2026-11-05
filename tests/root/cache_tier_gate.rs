@@ -31,7 +31,7 @@ const ALLOWED: &[(&str, &str)] = &[
     ),
     (
         "crates/plugin-gha/src/tally.rs",
-        "detects a host too old to emit CacheOutcome; never counts them",
+        "tells an old host that consulted the cache from one that never did; never counts them",
     ),
     (
         "crates/tui/src/tui/progress.rs",
@@ -60,11 +60,34 @@ fn non_test(text: &str) -> &str {
     text
 }
 
+/// `line` up to the `//` that starts a line comment, if any. A `//` inside a
+/// string literal — an addr such as `"//a:x"` — starts nothing, so the code
+/// after it is still code. Escapes and the `'"'` char literal are honoured;
+/// that is all a line-oriented scan needs.
+fn strip_line_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut in_str = false;
+    let mut i = 0;
+    while let Some(&b) = bytes.get(i) {
+        match (in_str, b) {
+            (true, b'\\') => i += 1,
+            (_, b'"') => in_str = !in_str,
+            (false, b'\'') if bytes.get(i + 1..i + 3) == Some(b"\"'") => i += 2,
+            (false, b'/') if bytes.get(i + 1) == Some(&b'/') => {
+                return line.get(..i).unwrap_or(line);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    line
+}
+
 /// The 1-based line number of each code line in `code` naming a tier miss. A
 /// line that only mentions one in a comment is not a use.
 fn tier_mentions(code: &str) -> impl Iterator<Item = usize> + '_ {
     code.lines().enumerate().filter_map(|(n, line)| {
-        let code = line.split_once("//").map_or(line, |(code, _)| code);
+        let code = strip_line_comment(line);
         TIER_MISSES
             .iter()
             .any(|ev| code.contains(ev))
@@ -134,6 +157,18 @@ fn the_cache_tier_allowlist_is_minimal() {
              outside its tests — drop it from ALLOWED"
         );
     }
+}
+
+/// A `//` in a string is not a comment: an addr before the event name must
+/// not hide it. A real comment still does.
+#[test]
+fn tier_mentions_see_past_a_string_containing_slashes() {
+    let code = "let e = Ev { addr: \"//a:x\".into(), RemoteCacheMiss };\n\
+                // RemoteCacheMiss in a comment\n\
+                let x = 1; // LocalCacheMiss trailing\n\
+                let q = '\"'; RemoteCacheMiss\n\
+                let s = \"a \\\" // b\"; LocalCacheMiss\n";
+    assert_eq!(tier_mentions(code).collect::<Vec<_>>(), vec![1, 4, 5]);
 }
 
 #[test]

@@ -54,11 +54,46 @@ const MAX_MSG_CHARS: usize = 200;
 /// The cache cell for a host older than `CacheOutcome` (see
 /// [`Counters::cache`]): it sent only tier events, which cannot be counted
 /// per target.
-pub(crate) const CACHE_UNAVAILABLE: &str = "cache accounting unavailable (heph too old)";
+pub(crate) const CACHE_UNAVAILABLE: &str =
+    "cache accounting unavailable: this heph predates per-target cache outcomes — upgrade heph";
+
+/// The live counts line's cached cell for the same host: names the cause,
+/// since a bare `n/a` reads like a broken report.
+const CACHED_UNAVAILABLE: &str = "cached n/a (heph too old)";
 
 /// `99.9%`, or `n/a` when there is no rate.
+///
+/// Never `100.0%` while anything missed, nor `0.0%` while anything hit: 26,921
+/// hits and 3 misses round to `100.0%`, which reads as "nothing to look at"
+/// next to a misses count that says otherwise. Those clamp to `99.9%` / `0.1%`.
 fn fmt_rate(rate: Option<f64>) -> String {
-    rate.map_or_else(|| "n/a".to_string(), |r| format!("{:.1}%", r * 100.0))
+    rate.map_or_else(
+        || "n/a".to_string(),
+        |r| {
+            let pct = r * 100.0;
+            let shown = if r < 1.0 && pct > 99.9 {
+                99.9
+            } else if r > 0.0 && pct < 0.1 {
+                0.1
+            } else {
+                pct
+            };
+            format!("{shown:.1}%")
+        },
+    )
+}
+
+/// `N hits (L local, R remote) · X% hit rate` — the one spelling of the hit
+/// summary, shared by the all-cached line and the summary table's cache row
+/// so a single pattern reads both.
+fn fmt_hits(c: &Counters) -> String {
+    format!(
+        "{} hits ({} local, {} remote) · {} hit rate",
+        fmt_count(c.cached()),
+        fmt_count(c.local_hits()),
+        fmt_count(c.remote_hits()),
+        fmt_rate(c.hit_rate())
+    )
 }
 
 /// Longest addr rendered inline.
@@ -227,11 +262,11 @@ fn counts_line(t: &Tally, c: &Counters) -> String {
     // A host too old to send outcomes has no cached count; `0 cached` would
     // read as a cold cache.
     let cached = match c.cache {
-        Some(_) => fmt_count(c.cached()),
-        None => "n/a".to_string(),
+        Some(_) => format!("{} cached", fmt_count(c.cached())),
+        None => CACHED_UNAVAILABLE.to_string(),
     };
     format!(
-        "**{} / {}** done · {cached} cached · {} executed · **{} failed**\n",
+        "**{} / {}** done · {cached} · {} executed · **{} failed**\n",
         fmt_count(done),
         total_str,
         fmt_count(c.executed),
@@ -627,14 +662,8 @@ pub(crate) fn render_final(t: &Tally, ctx: &RenderCtx<'_>, budget: usize) -> Str
             fmt_count(c.cached()),
             fmt_count(total)
         ));
-        // The same shape as the table row's start, so one parse reads both.
-        b.push(&format!(
-            "{} cache hits ({} local, {} remote) · {} hit rate\n",
-            fmt_count(c.cached()),
-            fmt_count(c.local_hits()),
-            fmt_count(c.remote_hits()),
-            fmt_rate(c.hit_rate())
-        ));
+        // The same text as the table row's start, so one parse reads both.
+        b.push(&format!("{}\n", fmt_hits(&c)));
         return b.finish();
     } else {
         b.push(&format!(
@@ -670,19 +699,16 @@ fn push_summary_table(b: &mut Budgeted, t: &Tally, c: &Counters) {
     ));
     match (c.cache, c.hit_rate()) {
         (None, _) => s.push_str(&format!("| cache | {CACHE_UNAVAILABLE} |\n")),
-        (Some(_), Some(rate)) => {
+        (Some(_), Some(_)) => {
             // A rebuilt hit is a miss, but it points at cache health rather
             // than at changed inputs, so it is called out when there is one.
             let rebuilt = match c.rebuilt() {
                 0 => String::new(),
-                n => format!(" ({} rebuilt after hit)", fmt_count(n)),
+                n => format!(", {} of them rebuilt after a hit", fmt_count(n)),
             };
             s.push_str(&format!(
-                "| cache | {} hits ({} local, {} remote) · **{} hit rate** · {} misses{rebuilt} |\n",
-                fmt_count(c.cached()),
-                fmt_count(c.local_hits()),
-                fmt_count(c.remote_hits()),
-                fmt_rate(Some(rate)),
+                "| cache | **{}** · {} misses{rebuilt} |\n",
+                fmt_hits(c),
                 fmt_count(c.misses())
             ));
         }
@@ -834,7 +860,7 @@ fn push_miss_rollup(b: &mut Budgeted, t: &Tally, c: &Counters) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hcore::events::{BuildEvent, BuildEventKind, CacheHitKind, CacheOutcomeKind};
+    use hcore::events::{BuildEvent, BuildEventKind, CacheCounts, CacheHitKind, CacheOutcomeKind};
 
     fn outcome(addr: impl Into<String>, outcome: CacheOutcomeKind) -> BuildEventKind {
         BuildEventKind::CacheOutcome {
@@ -871,6 +897,7 @@ mod tests {
                 scratch_disabled: false,
                 resources: Default::default(),
                 units: Default::default(),
+                cache_outcomes: true,
             },
         ));
         t.apply(&ev(
@@ -1097,7 +1124,7 @@ mod tests {
         let md = render_final(&t, &ctx("heph run //...", 41_000), SUMMARY_BUDGET);
         assert!(md.contains("nothing executed"), "{md}");
         assert!(
-            md.contains("20,000 cache hits (20,000 local, 0 remote) · 100.0% hit rate"),
+            md.contains("20,000 hits (20,000 local, 0 remote) · 100.0% hit rate"),
             "the all-cached line carries the rate too: {md}"
         );
         assert!(md.len() < 300, "one line, not a wall: {} bytes", md.len());
@@ -1345,6 +1372,7 @@ mod tests {
                 scratch_disabled: false,
                 resources: Default::default(),
                 units: Default::default(),
+                cache_outcomes: true,
             },
         ));
         let md = render_live(&t, &ctx("heph run //...", 9_000), COMMENT_LIMIT);
@@ -1402,6 +1430,7 @@ mod tests {
                 scratch_disabled: false,
                 resources: Default::default(),
                 units: Default::default(),
+                cache_outcomes: true,
             },
         ));
         println!("\n===== LIVE, healthy =====\n");
@@ -1515,6 +1544,7 @@ mod tests {
                 scratch_disabled: true,
                 resources: Default::default(),
                 units: Default::default(),
+                cache_outcomes: true,
             },
         ));
         t.apply(&ev(0, outcome("//a:x", CacheOutcomeKind::Miss)));
@@ -1573,7 +1603,7 @@ mod tests {
         let out = render_final(&t, &ctx("Build", 60_000), SUMMARY_BUDGET);
         assert!(
             out.contains(
-                "| cache | 26,921 hits (0 local, 26,921 remote) · **100.0% hit rate** · 3 misses |"
+                "| cache | **26,921 hits (0 local, 26,921 remote) · 99.9% hit rate** · 3 misses |"
             ),
             "{out}"
         );
@@ -1608,23 +1638,117 @@ mod tests {
         t.set_closed();
         let out = render_final(&t, &ctx("Build", 60_000), SUMMARY_BUDGET);
         assert!(
-            out.contains("· 3 misses (2 rebuilt after hit) |"),
+            out.contains("· 3 misses, 2 of them rebuilt after a hit |"),
             "misses stay inclusive and the rebuilt part is named: {out}"
         );
         assert!(out.contains("1 hits (1 local, 0 remote)"), "{out}");
     }
 
-    /// A host older than `CacheOutcome` sends tier events only: say so,
-    /// rather than render a tier-derived number or a 0% warning.
-    #[test]
-    fn old_host_renders_unavailable() {
-        let mut t = build(2, 0, 0);
+    /// A stream from a host older than `CacheOutcome`: its `RequestConfig`
+    /// carries no capability, and it sends tier events only.
+    fn old_host_tally() -> Tally {
+        let mut t = Tally::default();
+        t.apply(&ev(
+            0,
+            BuildEventKind::RequestConfig {
+                max_workers: 64,
+                fail_fast: false,
+                scratch_disabled: false,
+                resources: Default::default(),
+                units: Default::default(),
+                cache_outcomes: false,
+            },
+        ));
+        t.apply(&ev(
+            0,
+            BuildEventKind::Matched {
+                addrs: vec!["//a:x".into(), "//a:y".into()],
+                complete: true,
+            },
+        ));
         t.apply(&ev(
             1,
             BuildEventKind::LocalCacheHit {
                 addr: "//a:x".into(),
             },
         ));
+        t
+    }
+
+    /// The live comment says why there is no cached count, from the first
+    /// tier event — not `0 cached`, which reads as a cold cache.
+    #[test]
+    fn old_host_live_counts_name_the_cause() {
+        let t = old_host_tally();
+        let md = render_live(&t, &ctx("Build", 5_000), COMMENT_LIMIT);
+        assert!(md.contains(CACHED_UNAVAILABLE), "{md}");
+        assert!(!md.contains("0 cached"), "{md}");
+    }
+
+    /// 26,921 hits and 3 misses is not `100.0%`; one hit in 10,000 is not
+    /// `0.0%`. Exact ends stay exact.
+    #[test]
+    fn rate_never_rounds_to_an_end_it_is_not() {
+        let rate = |hits: u64, misses: u64| {
+            fmt_rate(CacheCounts::from_parts(hits, 0, misses, 0).hit_rate())
+        };
+        assert_eq!(rate(26_921, 3), "99.9%");
+        assert_eq!(rate(1, 9_999), "0.1%");
+        assert_eq!(rate(5, 0), "100.0%");
+        assert_eq!(rate(0, 5), "0.0%");
+        assert_eq!(rate(1, 1), "50.0%");
+        assert_eq!(fmt_rate(None), "n/a");
+    }
+
+    /// The all-cached line and the table's cache row start with the same
+    /// text for the same counts, so one pattern reads either report.
+    #[test]
+    fn all_cached_line_and_table_row_share_the_hit_summary() {
+        let hits = |n: usize, misses: usize| {
+            let mut t = build(n + misses, 0, 0);
+            for i in 0..n {
+                let o = if i % 2 == 0 {
+                    CacheOutcomeKind::LocalHit
+                } else {
+                    CacheOutcomeKind::RemoteHit
+                };
+                t.apply(&ev(1, outcome(format!("//h:t{i}"), o)));
+            }
+            for i in 0..misses {
+                t.apply(&ev(1, outcome(format!("//m:t{i}"), CacheOutcomeKind::Miss)));
+                t.apply(&ev(
+                    2,
+                    BuildEventKind::ExecuteEnd {
+                        addr: format!("//m:t{i}"),
+                        error: None,
+                    },
+                ));
+            }
+            t.set_closed();
+            t
+        };
+        let all_cached = hits(4, 0);
+        let expected = fmt_hits(&all_cached.counters());
+        assert_eq!(expected, "4 hits (2 local, 2 remote) · 100.0% hit rate");
+        let md = render_final(&all_cached, &ctx("Build", 60_000), SUMMARY_BUDGET);
+        assert!(md.contains("nothing executed"), "{md}");
+        assert!(md.contains(&expected), "{md}");
+
+        let with_misses = hits(4, 1);
+        let expected = fmt_hits(&with_misses.counters());
+        assert_eq!(expected, "4 hits (2 local, 2 remote) · 80.0% hit rate");
+        let md = render_final(&with_misses, &ctx("Build", 60_000), SUMMARY_BUDGET);
+        assert!(
+            md.contains(&format!("| cache | **{expected}** · 1 misses |")),
+            "{md}"
+        );
+    }
+
+    /// A host older than `CacheOutcome` sends tier events only: say so,
+    /// rather than render a tier-derived number or a 0% warning.
+    #[test]
+    fn old_host_renders_unavailable() {
+        let mut t = old_host_tally();
         t.apply(&ev(
             1,
             BuildEventKind::LocalCacheMiss {

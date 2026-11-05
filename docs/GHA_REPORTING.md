@@ -246,7 +246,7 @@ Report the mode, don't set it.
 ```markdown
 ## ✅ heph run //... — 41s · 20,140/20,140 targets, nothing executed
 
-20,140 cache hits (19,988 local, 152 remote) · 1.2 GiB pulled
+20,140 hits (19,988 local, 152 remote) · 100.0% hit rate · 1.2 GiB pulled
 ```
 
 ### 5.2 Success, real work, 20k targets
@@ -257,7 +257,7 @@ Report the mode, don't set it.
 | | |
 | --- | --- |
 | targets | 20,140 matched · 20,140 ok · 0 failed |
-| cache | 19,802 hits (19,650 local, 152 remote) · **98.3% hit rate** · 338 misses |
+| cache | **19,802 hits (19,650 local, 152 remote) · 98.3% hit rate** · 338 misses |
 | executed | 338 targets · 3h11m of execute time over 64 workers |
 | remote cache | pulled 1.2 GiB (2m01s) · pushed 240 MiB (48s, 1,412 queued) |
 | drivers | exec 201 · go 128 · sh 9 |
@@ -718,7 +718,10 @@ line of a colon-joined chain serves it badly. Three surfaces, in priority order:
 
 1. **`GITHUB_OUTPUT`** — GHA-native, free, no parsing, no rate limit:
    `heph_status=failed`, `heph_failed=2`, `heph_blocked=4117`, `heph_elapsed_ms=468000`,
-   `heph_cache_hit_rate=0.983`, `heph_json_path=…`
+   `heph_cache_accounting=per_target`, `heph_cached=15802`, `heph_cache_hit_rate=0.983`,
+   `heph_json_path=…`. `heph_cache_accounting` (`per_target` or `unavailable`) is always present;
+   `heph_cached` and `heph_cache_hit_rate` can be absent — the hit rate when the cache was never
+   consulted, both when accounting is `unavailable` — and an absent key means "unknown", not `0`.
 2. **`jsonPath`** — a file the agent reads directly:
 
 ```json
@@ -731,6 +734,7 @@ line of a colon-joined chain serves it badly. Three surfaces, in priority order:
   "targets": { "matched": 20140, "done": 15923, "failed": 2, "blocked": 4117,
                "cached": 15802, "executed": 338 },
   "cache": {
+    "accounting": "per_target",
     "local_hits": 15650, "remote_hits": 152, "misses": 338, "rebuilt": 0, "hit_rate": 0.983,
     "miss_reasons": { "inputs_changed": 320, "no_entry": 18 },
     "remote": { "configured": true, "reachable": true, "endpoints": ["s3://ci-cache"],
@@ -754,9 +758,16 @@ misses` is the number of cacheable targets the run consulted the cache for. `mis
 `rebuilt` (hits whose blobs were gone, so the target built after all), and `targets.cached` is
 `local_hits + remote_hits`. Before this, `misses` and `hit_rate` were folded from the tier events
 and counted a remote hit as a miss and a full miss twice; their meaning changed to the per-target
-one as a fix, within `heph.gha/1`. Against a `heph` too old to send `CacheOutcome`, every `cache`
-count, `targets.cached` and `heph_cached` are `null`/absent and the summary says
-`cache accounting unavailable (heph too old)`, rather than show a tier-derived number.
+one as a fix, within `heph.gha/1`. A rebuilt hit renders as `3 misses, 2 of them rebuilt after a
+hit`. The rendered rate never rounds to an end it is not: `100.0%` only with no misses, `0.0%`
+only with no hits (26,921 hits and 3 misses read `99.9%`).
+
+`cache.accounting` says how to read the counts: `per_target`, or `unavailable` against a `heph`
+too old to send `CacheOutcome` (it announces the capability in `RequestConfig`). Under
+`unavailable` every `cache` count and `targets.cached` are `null` and `heph_cached` /
+`heph_cache_hit_rate` are absent — **`null` there means "unknown", not `0`** — and the summary
+says `cache accounting unavailable: this heph predates per-target cache outcomes — upgrade heph`
+(the live comment: `cached n/a (heph too old)`), rather than show a tier-derived number.
 
 Stability rules: **field names never change within a schema version**; `failures` and `slowest` are
 **deterministically sorted** (duration desc, then addr) so two runs diff cleanly; **collateral

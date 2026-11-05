@@ -1302,6 +1302,8 @@ fn build_props(
     put("executes", stats.executes.into());
     // Hit outcomes taken back and rebuilt — a cache promising bytes it could
     // not produce. Once per addr per request, a subset of `target_misses`.
+    // That meaning is new (older binaries counted per rebuilding caller), so
+    // values are not comparable across that version boundary.
     // Only sent when it happened, so the common 0 costs nothing on the wire.
     if stats.cache_hits_rebuilt > 0 {
         put("cache_hits_rebuilt", stats.cache_hits_rebuilt.into());

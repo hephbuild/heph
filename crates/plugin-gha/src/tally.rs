@@ -257,15 +257,14 @@ pub(crate) struct Tally {
     counters: Counters,
     /// Folded from `CacheOutcome` / `CacheHitRebuilt` only.
     cache: CacheCounts,
-    /// Whether any `CacheOutcome` arrived: the host is new enough to send them.
-    saw_outcome: bool,
-    /// A tier event that the engine follows with the target's outcome at once
-    /// (a hit, or a remote miss). Seeing one with no outcome means an old host.
-    saw_settling_tier: bool,
-    /// A `LocalCacheMiss`: an old host on its own only once the stream has
-    /// closed, since a new host can spend a remote round trip between it and
-    /// the outcome — a live comment must not flash "unavailable" meanwhile.
-    saw_local_miss: bool,
+    /// Whether the host said it emits `CacheOutcome`: a `RequestConfig` with
+    /// `cache_outcomes`, or an outcome itself. Never inferred from which events
+    /// have not arrived yet — a new host's first probe can error or be
+    /// cancelled before any outcome, and that is not an old host.
+    host_has_outcomes: bool,
+    /// Any tier event: the cache was consulted. With no outcome capability,
+    /// that is an old host whose per-target counts are unknowable.
+    saw_tier: bool,
 
     /// Roots in first-seen order — never re-sorted, so consecutive renders differ
     /// by appends only and an agent diffing two fetches sees "one new root"
@@ -354,7 +353,9 @@ impl Tally {
                 // Pool capacities; the report does not render them yet.
                 resources: _,
                 units,
+                cache_outcomes,
             } => {
+                self.host_has_outcomes |= *cache_outcomes;
                 self.max_workers = *max_workers;
                 self.pool_units.clone_from(units);
                 self.fail_fast = *fail_fast;
@@ -404,8 +405,8 @@ impl Tally {
                 // engine sends `AdmissionWaitEnd` first; this keeps a lost End
                 // from leaving a stale `⧗` row in the live comment.
                 self.admission_waits.remove(addr.as_str());
-                // A hit that rebuilds is taken back by its `CacheHitRebuilt`,
-                // which the engine emits before this; nothing to infer here.
+                // A hit that rebuilds is taken back by its `CacheHitRebuilt`;
+                // nothing to infer here.
                 if let Some(rec) = self.live.get_mut(addr.as_str()) {
                     rec.phase = Some((Phase::Execute, at));
                     rec.executed = true;
@@ -457,25 +458,29 @@ impl Tally {
 
             // Tier events are per tier, not per target — a remote hit is a
             // local miss first — so they count nothing. They only tell an old
-            // host (no `CacheOutcome`) apart from a run that never consulted
-            // the cache.
+            // host that consulted the cache apart from a run that never did.
             BuildEventKind::LocalCacheHit { addr } | BuildEventKind::RemoteCacheHit { addr } => {
-                self.saw_settling_tier = true;
+                self.saw_tier = true;
                 self.ensure(addr, ev.at_unix_ms);
             }
-            BuildEventKind::RemoteCacheMiss { .. } => self.saw_settling_tier = true,
-            BuildEventKind::LocalCacheMiss { .. } => self.saw_local_miss = true,
+            BuildEventKind::RemoteCacheMiss { .. } | BuildEventKind::LocalCacheMiss { .. } => {
+                self.saw_tier = true;
+            }
 
             BuildEventKind::CacheOutcome { addr, outcome } => {
-                self.saw_outcome = true;
+                self.host_has_outcomes = true;
                 self.cache.apply(&ev.kind);
                 if *outcome == CacheOutcomeKind::Miss {
                     self.bump_pkg_miss(addr);
                 }
             }
             BuildEventKind::CacheHitRebuilt { addr, .. } => {
-                self.cache.apply(&ev.kind);
-                self.bump_pkg_miss(addr);
+                // Only a rebuild the fold counts moves the rollup: one whose
+                // `was` this build does not know moves nothing in either.
+                if CacheCounts::delta(&ev.kind).is_some() {
+                    self.cache.apply(&ev.kind);
+                    self.bump_pkg_miss(addr);
+                }
             }
 
             BuildEventKind::ResultLockWaitStart {
@@ -694,8 +699,7 @@ impl Tally {
     }
 
     pub(crate) fn counters(&self) -> Counters {
-        let old_host =
-            !self.saw_outcome && (self.saw_settling_tier || (self.closed && self.saw_local_miss));
+        let old_host = !self.host_has_outcomes && self.saw_tier;
         Counters {
             cache: (!old_host).then_some(self.cache),
             ..self.counters
@@ -1101,8 +1105,9 @@ mod tests {
         );
         assert_eq!(c.hit_rate(), fold.hit_rate());
         // The package rollup counts the same misses: cold, solo and both
-        // rebuilds, and nothing for the remote hit's package `//q` beyond its
-        // one cold target.
+        // rebuilds, nothing for the remote hit's package `//q` beyond its
+        // one cold target, and nothing for `//t:odd`, whose rebuild names a
+        // hit kind this build does not know.
         let (rows, _) = t.misses_by_package(10);
         let total: usize = rows.iter().map(|(_, n)| n).sum();
         assert_eq!(total, c.misses());
@@ -1135,48 +1140,65 @@ mod tests {
         assert_eq!(total, 1);
     }
 
+    /// A `RequestConfig` as the host announces it, with or without the
+    /// outcome capability.
+    fn request_config(cache_outcomes: bool) -> BuildEventKind {
+        BuildEventKind::RequestConfig {
+            max_workers: 4,
+            fail_fast: false,
+            scratch_disabled: false,
+            resources: Default::default(),
+            units: Default::default(),
+            cache_outcomes,
+        }
+    }
+
     /// A host older than `CacheOutcome` sends tier events only. Its counts are
-    /// unknowable per target, so there are none — not a tier-derived guess.
+    /// unknowable per target, so there are none — not a tier-derived guess —
+    /// and that is known from the first tier event, live or closed.
     #[test]
     fn old_host_cache_accounting_is_unavailable() {
         let mut t = Tally::default();
+        t.apply(&ev(0, request_config(false)));
         t.apply(&ev(
             1,
             BuildEventKind::LocalCacheMiss {
                 addr: "//a:x".into(),
             },
         ));
-        assert!(
-            t.counters().cache.is_some(),
-            "a lone local miss on a live stream may still get its outcome"
-        );
+        assert_eq!(t.counters().cache, None, "live, after one tier event");
         t.apply(&ev(
             2,
             BuildEventKind::RemoteCacheHit {
                 addr: "//a:x".into(),
             },
         ));
-        assert_eq!(
-            t.counters().cache,
-            None,
-            "a settling tier event with no outcome"
-        );
+        t.set_closed();
+        assert_eq!(t.counters().cache, None, "closed, still no outcome");
 
-        // Cold and remote-less: only local misses, so it is known at close.
+        // Never consulted: not "unavailable", just nothing.
         let mut t = Tally::default();
+        t.apply(&ev(0, request_config(false)));
+        t.set_closed();
+        assert_eq!(t.counters().cache, Some(CacheCounts::default()));
+    }
+
+    /// A new host whose only probe settled no outcome — the remote read
+    /// errored or was cancelled — is not an old host: it announced the
+    /// capability, so the counts are what they are, not "unavailable".
+    #[test]
+    fn new_host_without_an_outcome_is_not_unavailable() {
+        let mut t = Tally::default();
+        t.apply(&ev(0, request_config(true)));
         t.apply(&ev(
             1,
             BuildEventKind::LocalCacheMiss {
                 addr: "//a:x".into(),
             },
         ));
+        assert_eq!(t.counters().cache, Some(CacheCounts::default()), "live");
         t.set_closed();
-        assert_eq!(t.counters().cache, None);
-
-        // Never consulted: not "unavailable", just nothing.
-        let mut t = Tally::default();
-        t.set_closed();
-        assert_eq!(t.counters().cache, Some(CacheCounts::default()));
+        assert_eq!(t.counters().cache, Some(CacheCounts::default()), "closed");
     }
 
     #[test]
@@ -1552,6 +1574,7 @@ mod tests {
                 scratch_disabled: false,
                 resources: [("scratch_disk".into(), Some(8 << 30))].into(),
                 units: [("scratch_disk".into(), "bytes".into())].into(),
+                cache_outcomes: true,
             },
         ));
         t.apply(&ev(
@@ -1689,6 +1712,7 @@ mod tests {
                 scratch_disabled: false,
                 resources: Default::default(),
                 units: Default::default(),
+                cache_outcomes: true,
             },
         ));
         t.apply(&ev(

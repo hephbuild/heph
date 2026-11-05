@@ -54,7 +54,8 @@
 //! remote hit as a miss and every full miss twice.
 //!
 //! Per-target numbers come from [`CacheOutcome`](BuildEventKind::CacheOutcome)
-//! (one per cacheable addr per request) and
+//! (at most one per cacheable addr per request; none when the resolution fails
+//! before it settles — cancellation, a lock or local mirror error) and
 //! [`CacheHitRebuilt`](BuildEventKind::CacheHitRebuilt) (a hit taken back), and
 //! nothing else. [`CacheCounts`] is that fold; every surface heph ships (the
 //! TUI, the GitHub Actions report, telemetry) uses it, and a hook should too.
@@ -202,6 +203,13 @@ pub enum BuildEventKind {
         /// predates the field) has its default unit.
         #[serde(default)]
         units: BTreeMap<String, String>,
+        /// Whether this host emits [`CacheOutcome`](Self::CacheOutcome): `true`
+        /// from every host that does. A frame from an older host, which only
+        /// emits the tier events, decodes `false` — so a consumer can say
+        /// "cache accounting unavailable" from a signal rather than infer it
+        /// from which events have or have not arrived yet.
+        #[serde(default)]
+        cache_outcomes: bool,
     },
     /// Incremental notice of matched top-level targets. `addrs` are newly
     /// matched addresses to add to the set; `complete` is false while the
@@ -294,8 +302,10 @@ pub enum BuildEventKind {
     LocalCacheMiss {
         addr: String,
     },
-    /// The final cache outcome of one cacheable target: exactly one per addr per
-    /// request, whatever output variants of it the request resolved. Not emitted
+    /// The final cache outcome of one cacheable target: at most one per
+    /// cacheable addr per request, whatever output variants of it the request
+    /// resolved — none when the resolution fails before it settles
+    /// (cancellation, a lock or local mirror error). Not emitted
     /// for a target that could not hit — caching off, `--force`,
     /// `--no-scratch`, a shell — nor for the engine's hash-only nested
     /// recomputes. See the module docs ("Counting cache hits").
@@ -713,10 +723,11 @@ pub mod test_support {
     use super::{BuildEvent, BuildEventKind, CacheHitKind, CacheOutcomeKind};
 
     /// What [`cache_stream`] must fold to: `(local_hits, remote_hits, misses,
-    /// rebuilt)`. Six cacheable targets: one local hit, two remote hits (one
-    /// of them rebuilt), and three misses — a full miss with a remote, a miss
-    /// with no remote consulted, and a rebuilt local hit.
-    pub const CACHE_STREAM_EXPECTED: (u64, u64, u64, u64) = (1, 1, 4, 2);
+    /// rebuilt)`. Seven cacheable targets: two local hits (one with a rebuild
+    /// of unknown `was`, which moves nothing), two remote hits (one of them
+    /// rebuilt), a rebuilt local hit, a full miss with a remote, and a miss
+    /// with no remote consulted.
+    pub const CACHE_STREAM_EXPECTED: (u64, u64, u64, u64) = (2, 1, 4, 2);
 
     /// The events one request emits for the targets above, in the engine's
     /// order: tier events, the outcome, `ExecuteStart` for whatever builds,
@@ -847,6 +858,19 @@ pub mod test_support {
             ev(25, end("//s:gone")),
             // From a newer host: ignored by every fold.
             ev(26, outcome("//s:future", CacheOutcomeKind::Unknown)),
+            // A local hit whose rebuild names a hit kind this build does not
+            // know: the rebuild moves nothing, so the hit stays a hit in every
+            // fold, the package rollup and the TUI's cached set alike.
+            ev(27, start("//t:odd")),
+            ev(28, outcome("//t:odd", CacheOutcomeKind::LocalHit)),
+            ev(
+                29,
+                BuildEventKind::CacheHitRebuilt {
+                    addr: a("//t:odd"),
+                    was: CacheHitKind::Unknown,
+                },
+            ),
+            ev(30, end("//t:odd")),
         ]
     }
 }
@@ -951,6 +975,22 @@ mod tests {
             } => {
                 assert_eq!(max_workers, 8);
                 assert!(resources.is_empty(), "{resources:?}");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// `RequestConfig` from a host predating `CacheOutcome` says so: the
+    /// field is absent, and absent must read as "no per-target outcomes",
+    /// which is what lets a consumer report cache accounting as unavailable.
+    #[test]
+    fn an_old_request_config_has_no_cache_outcomes() {
+        let old = r#"{"at_unix_ms":1,"kind":{"type":"RequestConfig","max_workers":8,
+            "fail_fast":false,"scratch_disabled":false,"resources":{},"units":{}}}"#;
+        let ev: BuildEvent = serde_json::from_str(old).expect("old frame must decode");
+        match ev.kind {
+            BuildEventKind::RequestConfig { cache_outcomes, .. } => {
+                assert!(!cache_outcomes, "an old host emits no CacheOutcome");
             }
             other => panic!("wrong variant: {other:?}"),
         }
@@ -1250,7 +1290,7 @@ mod tests {
             (c.local_hits(), c.remote_hits(), c.misses(), c.rebuilt()),
             test_support::CACHE_STREAM_EXPECTED
         );
-        assert_eq!(c.consulted(), 6, "one count per cacheable target");
+        assert_eq!(c.consulted(), 7, "one count per cacheable target");
     }
 
     #[test]

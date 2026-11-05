@@ -150,7 +150,9 @@ pub struct TelemetryCollector {
     executes: AtomicU64,
     /// Targets whose hit outcome was taken back because the revision's bytes
     /// could not be read (`CacheHitRebuilt`, once per addr per request). A
-    /// subset of `target_misses`.
+    /// subset of `target_misses`. Its meaning changed to once per addr per
+    /// request (older binaries counted per rebuilding caller), so values are
+    /// not comparable with theirs.
     cache_hits_rebuilt: AtomicU64,
     /// Power-of-two histogram of per-target execute wall time (ms), for p99.
     execute_ms_histogram: AtomicHistogram,
@@ -453,7 +455,8 @@ pub struct TelemetrySnapshot {
     /// execute p99. `0` means `p99_execute_ms` is not meaningful.
     pub executes: u64,
     /// Hit outcomes taken back and rebuilt (the revision's bytes were gone),
-    /// once per addr per request. A subset of `target_misses`.
+    /// once per addr per request. A subset of `target_misses`. Not comparable
+    /// with older binaries', which counted it per rebuilding caller.
     pub cache_hits_rebuilt: u64,
     /// Approximate 99th percentile per-target execute wall time (ms).
     pub p99_execute_ms: u64,
