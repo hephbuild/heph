@@ -10,7 +10,9 @@
 //   - git push / gh stack submit of a tree `lint` has not passed on: a red
 //     Lint job is a whole CI round-trip to learn what `lint` says locally.
 //     HEPH_PUSH_UNLINTED=1 is the opt-out. See lintstamp.go for how a
-//     passing `lint` is recorded.
+//     passing `lint` is recorded. A command that also lints or moves HEAD
+//     (`lint && git commit … && git push`) has its push checked when the push
+//     runs instead of refused up front (push.go).
 //   - sed -i, perl -i, a python read-replace-write: the prose rule "use Edit"
 //     was broken 390 times in one session, and line-number `sed -i` chains
 //     edited the wrong lines in another. HEPH_SCRIPTED_EDIT=1 is the opt-in
@@ -30,8 +32,9 @@
 // parser rejects (zsh-only syntax) — is allowed: a gate that misfires on a
 // legitimate command costs more than one that occasionally lets a suite run.
 //
-// `gate lint <dir> [args...]` is the other mode: the wrapper a rewritten
-// `lint` runs through (runLint).
+// `gate lint <dir> [args...]` and `gate push <dir> <cmd...>` are the other
+// modes: the wrappers a rewritten `lint` and a deferred push run through
+// (runLint, runPush).
 package main
 
 import (
@@ -51,6 +54,9 @@ func main() {
 	if len(os.Args) > 2 && os.Args[1] == "lint" {
 		os.Exit(runLint(os.Args[2], os.Args[3:]))
 	}
+	if len(os.Args) > 3 && os.Args[1] == "push" {
+		os.Exit(runPush(os.Args[2], os.Args[3:]))
+	}
 
 	var in hookInput
 	if err := json.NewDecoder(os.Stdin).Decode(&in); err != nil {
@@ -59,10 +65,17 @@ func main() {
 	command, _ := in.ToolInput["command"].(string)
 	background, _ := in.ToolInput["run_in_background"].(bool)
 
-	if reason := check(command, gate{
+	// `go run -C` put this process in the gate's own directory. Without it
+	// nothing is rewritten: no lint is stamped and no push is deferred.
+	var lintW, pushW string
+	if gateDir, err := os.Getwd(); err == nil {
+		lintW, pushW = lintWrapper(gateDir), pushWrapper(gateDir)
+	}
+	reason, rewritten := decide(command, gate{
 		background: background,
 		unlinted:   func() string { return lintStamp(in.Cwd) },
-	}); reason != "" {
+	}, lintW, pushW)
+	if reason != "" {
 		respond(map[string]any{
 			"permissionDecision":       "deny",
 			"permissionDecisionReason": reason,
@@ -76,12 +89,9 @@ func main() {
 	if notice := contextNotice(in.TranscriptPath, in.SessionID, in.AgentID, os.TempDir()); notice != "" {
 		out["additionalContext"] = notice
 	}
-	// `go run -C` put this process in the gate's own directory.
-	if gateDir, err := os.Getwd(); err == nil {
-		if rewritten := stampLint(command, lintWrapper(gateDir)); rewritten != "" {
-			in.ToolInput["command"] = rewritten
-			out["updatedInput"] = in.ToolInput
-		}
+	if rewritten != "" {
+		in.ToolInput["command"] = rewritten
+		out["updatedInput"] = in.ToolInput
 	}
 	if len(out) > 0 {
 		respond(out)
