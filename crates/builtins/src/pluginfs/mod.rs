@@ -595,7 +595,10 @@ fn normalize_path(path: &str) -> anyhow::Result<String> {
 }
 
 struct CompiledGlob {
-    glob: Arc<wax::Glob<'static>>,
+    /// The whole normalized pattern. Read only for the one match the split
+    /// below cannot answer on its own — see [`pattern_matches`].
+    pattern: String,
+    glob: GlobMatcher,
     not: Arc<wax::Any<'static>>,
     /// Literal directory prefix of the pattern, used as the walk root.
     prefix: String,
@@ -603,12 +606,37 @@ struct CompiledGlob {
     skip: Arc<Ignore>,
 }
 
-/// Process-global cache of compiled globs keyed by pattern string.
+/// How a [`CompiledGlob`] decides a match; see [`pattern_matches`].
+enum GlobMatcher {
+    /// A fully-literal pattern: matches exactly its prefix path.
+    Literal,
+    /// The pattern past its literal prefix ([`pattern_remainder`]), matched
+    /// against the path past that prefix. The common case, and the one the
+    /// [`glob_cache`] is for.
+    Remainder(Arc<wax::Glob<'static>>),
+    /// The whole pattern, matched against the whole root-relative path. Taken
+    /// when the remainder does not parse on its own — wax rejects a few
+    /// token sequences in leading position only (`pkg/(?i)**` parses,
+    /// `(?i)**` does not) — so such a pattern matches exactly as it did
+    /// before the split.
+    Whole(Arc<wax::Glob<'static>>),
+}
+
+/// Process-global cache of compiled globs, keyed by the pattern past its
+/// literal prefix ([`pattern_remainder`]).
 ///
-/// Identical patterns (`**/*.go`, etc.) repeat across hundreds of packages in
-/// the go-test pipeline; each `wax::Glob::new` builds a regex NFA. Patterns are
-/// already normalized before reaching here, so the key set is small and stable.
-/// Read-mostly: the lock is contended only on first sight of each pattern.
+/// Each `wax::Glob::new` builds a regex NFA. Keyed by the whole pattern the
+/// cache was only useful for a pattern that repeats verbatim; it missed once per
+/// Go package, because the go provider roots its source glob at the package
+/// (`<pkg>/**/*`, `compute_pkg_src_addrs`) and so every package spelled a
+/// different pattern. The literal prefix carries nothing a regex is needed for
+/// — it is the walk root, and a path either lies under it or not — so stripping
+/// it before compiling leaves a handful of distinct remainders (`**/*`,
+/// `**/*.go`, …) per workspace, compiled once each. The remainder is matched
+/// against the path with the prefix removed, which is also a shorter regex over
+/// a shorter input per entry. Patterns are already normalized before reaching
+/// here. Read-mostly: the lock is contended only on first sight of each
+/// remainder.
 fn glob_cache() -> &'static RwLock<FxHashMap<String, Arc<wax::Glob<'static>>>> {
     static CACHE: OnceLock<RwLock<FxHashMap<String, Arc<wax::Glob<'static>>>>> = OnceLock::new();
     CACHE.get_or_init(|| RwLock::new(FxHashMap::default()))
@@ -625,6 +653,50 @@ fn cached_glob(pattern: &str) -> Result<Arc<wax::Glob<'static>>, wax::BuildError
         .entry(pattern.to_owned())
         .or_insert_with(|| glob.clone());
     Ok(glob)
+}
+
+/// The part of `pattern` after its [`literal_prefix`] `prefix`, without the
+/// separating `/`: `mgmt/protos/x/**/*` → `**/*`, `**/*.rs` → `**/*.rs`, and
+/// the empty string for a fully-literal pattern.
+///
+/// `prefix` must be `literal_prefix(pattern)`: a run of whole components, so
+/// the cut lands on a `/` or at an end and never splits a component.
+fn pattern_remainder<'p>(pattern: &'p str, prefix: &str) -> &'p str {
+    pattern
+        .get(prefix.len()..)
+        .unwrap_or_default()
+        .trim_start_matches('/')
+}
+
+/// Whether the root-relative path `rel` matches `compiled`'s pattern: it lies
+/// under the literal prefix, and the compiled remainder matches what follows.
+///
+/// Equivalent to matching the whole pattern against `rel` — the literal prefix
+/// matches exactly itself, component by component, and wax's own
+/// `Glob::partition` splits a glob the same way — but lets one compiled
+/// remainder serve every pattern that differs only in its prefix. The
+/// `test_pattern_matches_agrees_with_whole_pattern` table holds it to that.
+fn pattern_matches(compiled: &CompiledGlob, rel: &std::path::Path) -> bool {
+    use wax::Program as _;
+
+    // `strip_prefix` is component-wise, so a near-miss prefix (`pkg` against
+    // `pkgx/f`) is a miss, and an empty prefix strips nothing.
+    let Ok(tail) = rel.strip_prefix(&compiled.prefix) else {
+        return false;
+    };
+    match &compiled.glob {
+        GlobMatcher::Literal => tail.as_os_str().is_empty(),
+        GlobMatcher::Whole(glob) => glob.is_match(rel),
+        GlobMatcher::Remainder(glob) if tail.as_os_str().is_empty() => {
+            // `rel` *is* the prefix: the walk root names a file and the pattern
+            // continues below it (`go.mod/**`). Whether that matches is wax's
+            // call on the whole pattern — `pkg/**` matches `pkg`, `pkg/*` does
+            // not — and the remainder alone answers differently (`*` matches an
+            // empty path). Rare enough to compile the whole pattern for.
+            cached_glob(&compiled.pattern).is_ok_and(|glob| glob.is_match(rel))
+        }
+        GlobMatcher::Remainder(glob) => glob.is_match(tail),
+    }
 }
 
 /// Per-request cache of compiled exclude `Any` unions.
@@ -717,7 +789,20 @@ fn compile_glob(
     pattern: &str,
     exclude: &[String],
 ) -> anyhow::Result<CompiledGlob> {
-    let glob = cached_glob(pattern).with_context(|| format!("invalid glob pattern '{pattern}'"))?;
+    let prefix = literal_prefix(pattern);
+    // Only the part past the literal prefix needs a regex; see `glob_cache`.
+    let glob = match pattern_remainder(pattern, prefix) {
+        "" => GlobMatcher::Literal,
+        remainder => match cached_glob(remainder) {
+            Ok(glob) => GlobMatcher::Remainder(glob),
+            // Not a verdict on the pattern: the whole decides, and its error
+            // is the one the user sees.
+            Err(_) => GlobMatcher::Whole(
+                cached_glob(pattern)
+                    .with_context(|| format!("invalid glob pattern '{pattern}'"))?,
+            ),
+        },
+    };
 
     // Compiles the engine's ignore set on first use. Every fs walk (the driver's
     // and `heph.fs.glob`'s) gets its `CompiledGlob` here, so a set that does not
@@ -734,9 +819,10 @@ fn compile_glob(
     };
 
     Ok(CompiledGlob {
+        pattern: pattern.to_owned(),
         glob,
         not,
-        prefix: literal_prefix(pattern).to_owned(),
+        prefix: prefix.to_owned(),
         skip: skip.clone(),
     })
 }
@@ -843,8 +929,9 @@ fn emit_glob_file(
     let Ok(rel) = abs.strip_prefix(root) else {
         return Ok(());
     };
-    // Include on a pattern match, drop on an exclude match.
-    if !compiled.glob.is_match(rel) || compiled.not.is_match(rel) {
+    // Include on a pattern match, drop on an exclude match. Excludes are
+    // root-relative patterns (`vendor/**`), so they see the whole `rel`.
+    if !pattern_matches(compiled, rel) || compiled.not.is_match(rel) {
         return Ok(());
     }
     // Skip net-new codegen outputs stamped back into the tree — sourcing them
@@ -2851,6 +2938,139 @@ mod tests {
     }
 
     #[test]
+    fn test_compile_glob_shares_one_remainder_across_prefixes() {
+        // The go provider roots one glob per package (`<pkg>/**/*`). Every
+        // package must reuse the one compiled `**/*`, not build its own.
+        let skip = Arc::new(Ignore::default());
+        let a = compile_glob(&skip, "t", "go/svc/alpha/**/*", &[]).unwrap();
+        let b = compile_glob(&skip, "t", "go/svc/beta/deeper/**/*", &[]).unwrap();
+        let c = compile_glob(&skip, "t", "**/*", &[]).unwrap();
+        assert_eq!(a.prefix, "go/svc/alpha");
+        assert_eq!(b.prefix, "go/svc/beta/deeper");
+        assert_eq!(c.prefix, "");
+        let remainder = |c: &CompiledGlob| match &c.glob {
+            GlobMatcher::Remainder(g) => Arc::clone(g),
+            _ => panic!("{}: expected a compiled remainder", c.pattern),
+        };
+        let (a, b, c) = (remainder(&a), remainder(&b), remainder(&c));
+        assert!(
+            Arc::ptr_eq(&a, &b) && Arc::ptr_eq(&b, &c),
+            "patterns differing only in their literal prefix must share one compiled remainder"
+        );
+
+        // A fully-literal pattern has no remainder and compiles nothing.
+        let lit = compile_glob(&skip, "t", "go/svc/alpha/go.mod", &[]).unwrap();
+        assert!(matches!(lit.glob, GlobMatcher::Literal));
+        assert_eq!(lit.prefix, "go/svc/alpha/go.mod");
+
+        // A remainder wax rejects in leading position falls back to the whole
+        // pattern; the pattern itself is still accepted.
+        let whole = compile_glob(&skip, "t", "pkg/(?i)**", &[]).unwrap();
+        assert!(matches!(whole.glob, GlobMatcher::Whole(_)));
+        assert_eq!(whole.prefix, "pkg");
+
+        // A pattern that is invalid as a whole reports the whole pattern.
+        let err = compile_glob(&skip, "t", "pkg/**/**", &[])
+            .err()
+            .expect("`pkg/**/**` is rejected by wax");
+        assert!(
+            format!("{err:#}").contains("invalid glob pattern 'pkg/**/**'"),
+            "{err:#}"
+        );
+    }
+
+    /// The one match the prefix split cannot decide alone: the walk root is a
+    /// file and the pattern continues below it. wax's answer for the whole
+    /// pattern is what counts — `go.mod/**` matches the file, `go.mod/*` does
+    /// not — not the remainder's answer for an empty path.
+    #[test]
+    fn test_walk_glob_file_at_literal_prefix_matches_as_whole_pattern() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("go.mod"), b"module x").unwrap();
+        let skip = Arc::new(Ignore::new(&[], &[]).unwrap());
+        let walker = CachedWalker::disabled();
+
+        let tree = compile_glob(&skip, "t", "go.mod/**", &[]).unwrap();
+        let arts = walk_glob(&walker, root, &tree).unwrap();
+        assert_eq!(
+            arts.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+            ["go.mod"]
+        );
+
+        let star = compile_glob(&skip, "t", "go.mod/*", &[]).unwrap();
+        assert!(walk_glob(&walker, root, &star).unwrap().is_empty());
+    }
+
+    /// `pattern_matches` must answer exactly what wax answers for the whole
+    /// pattern: the prefix split is an optimization, not a semantics change.
+    #[test]
+    fn test_pattern_matches_agrees_with_whole_pattern() {
+        use wax::Program as _;
+
+        let skip = Arc::new(Ignore::default());
+        // (pattern, path): prefixes of every depth, `**` matching zero
+        // components, near-miss prefixes, the directory the prefix itself
+        // names, fully-literal patterns, brace/`?`/class/escape/flag
+        // metacharacters at the cut, `.` in the prefix (a literal, not regex
+        // any-char), non-ASCII.
+        let cases: &[(&str, &str)] = &[
+            ("pkg/**/*", "pkg/a.txt"),
+            ("pkg/**/*", "pkg/a/b/c.txt"),
+            ("pkg/**/*", "pkgx/a.txt"),
+            ("pkg/**/*", "other/pkg/a.txt"),
+            ("pkg/**/*", "pkg"),
+            ("pkg/**", "pkg/a/b.txt"),
+            ("pkg/**", "pkg"),
+            ("pkg/*", "pkg"),
+            ("pkg/*", "pkg/a"),
+            ("pkg/sub/*.go", "pkg/sub/a.go"),
+            ("pkg/sub/*.go", "pkg/sub/deep/a.go"),
+            ("pkg/sub/*.go", "pkg/a.go"),
+            ("**/*.rs", "a.rs"),
+            ("**/*.rs", "x/y/a.rs"),
+            ("**/*.rs", "a.go"),
+            ("*.rs", "a.rs"),
+            ("*.rs", "x/a.rs"),
+            ("dir/ogen.{yml,yaml}", "dir/ogen.yaml"),
+            ("dir/ogen.{yml,yaml}", "dir/ogen.json"),
+            ("a/b?c/d", "a/bxc/d"),
+            ("a/b?c/d", "a/bc/d"),
+            ("a/[bc]/d", "a/b/d"),
+            ("a/[bc]/d", "a/x/d"),
+            ("mgmt/protos/x/go.mod", "mgmt/protos/x/go.mod"),
+            ("mgmt/protos/x/go.mod", "mgmt/protos/x/go.mod2"),
+            ("mgmt/protos/x/go.mod", "mgmt/protos/x"),
+            ("lit/dir", "lit/dir/file"),
+            ("p.q/**/*.txt", "p.q/a.txt"),
+            ("p.q/**/*.txt", "pXq/a.txt"),
+            ("café/**/*", "café/é.txt"),
+            ("café/**/*", "cafe/é.txt"),
+            ("a\\*b/*.txt", "a*b/c.txt"),
+            ("a\\*b/*.txt", "axb/c.txt"),
+            ("pkg/(?i)*.go", "pkg/A.GO"),
+            ("pkg/(?i)*.go", "pkg/a.go"),
+            ("pkg/(?i)*.go", "PKG/a.go"),
+            // Remainders wax rejects in leading position: the whole decides.
+            ("pkg/(?i)**", "pkg"),
+            ("pkg/(?i)**", "pkg/A/b"),
+            ("pkg/(?i)**/*.go", "pkg/x/A.GO"),
+            ("pkg/(?i)**/*.go", "pkg/x/a.rs"),
+        ];
+        for (pattern, path) in cases {
+            let whole = wax::Glob::new(pattern).unwrap();
+            let compiled = compile_glob(&skip, "t", pattern, &[]).unwrap();
+            let path = std::path::Path::new(path);
+            assert_eq!(
+                pattern_matches(&compiled, path),
+                whole.is_match(path),
+                "pattern {pattern:?} against {}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
     fn test_compile_glob_no_exclude_reuses_builtin() {
         let skip = Arc::new(Ignore::default());
         let compiled = compile_glob(&skip, "req-test", "**/*.rs", &[]).unwrap();
@@ -3025,6 +3245,25 @@ mod tests {
         assert_eq!(literal_prefix("**/*.rs"), "");
         assert_eq!(literal_prefix("dir/ogen.{yml,yaml}"), "dir");
         assert_eq!(literal_prefix("a/b?c/d"), "a");
+    }
+
+    #[test]
+    fn test_pattern_remainder() {
+        for (pattern, remainder) in [
+            ("mgmt/protos/x/**/*", "**/*"),
+            ("**/*.rs", "**/*.rs"),
+            ("*.rs", "*.rs"),
+            // Fully literal: nothing left to compile.
+            ("mgmt/protos/x/go.mod", ""),
+            ("dir/ogen.{yml,yaml}", "ogen.{yml,yaml}"),
+            ("a/b?c/d", "b?c/d"),
+        ] {
+            assert_eq!(
+                pattern_remainder(pattern, literal_prefix(pattern)),
+                remainder,
+                "{pattern}"
+            );
+        }
     }
 
     #[tokio::test]
