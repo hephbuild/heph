@@ -679,9 +679,7 @@ fn pattern_remainder<'p>(pattern: &'p str, prefix: &str) -> &'p str {
 fn pattern_matches(compiled: &CompiledGlob, rel: &std::path::Path) -> bool {
     use wax::Program as _;
 
-    // `strip_prefix` is component-wise, so a near-miss prefix (`pkg` against
-    // `pkgx/f`) is a miss, and an empty prefix strips nothing.
-    let Ok(tail) = rel.strip_prefix(&compiled.prefix) else {
+    let Some(tail) = strip_literal_prefix(rel, &compiled.prefix) else {
         return false;
     };
     match &compiled.glob {
@@ -697,6 +695,30 @@ fn pattern_matches(compiled: &CompiledGlob, rel: &std::path::Path) -> bool {
         }
         GlobMatcher::Remainder(glob) => glob.is_match(tail),
     }
+}
+
+/// `rel` past the literal `prefix`, or `None` when `rel` does not lie under it.
+///
+/// Byte-wise, with the boundary checked by hand, so a near-miss (`pkg` against
+/// `pkgx/f`) is a miss and an empty prefix strips nothing. Not
+/// `Path::strip_prefix`: that parses components on both sides, which costs more
+/// per walked entry than the regex match it guards (measured 2x the whole
+/// match). Byte-wise is exact here because both sides are already clean — `rel`
+/// is a walk path relative to the root, and `prefix` is whole components of a
+/// normalized pattern, with no `.`, empty or trailing components.
+fn strip_literal_prefix<'r>(rel: &'r std::path::Path, prefix: &str) -> Option<&'r std::path::Path> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    if prefix.is_empty() {
+        return Some(rel);
+    }
+    let rest = rel.as_os_str().as_bytes().strip_prefix(prefix.as_bytes())?;
+    let tail = match rest {
+        [] => rest,
+        [b'/', tail @ ..] => tail,
+        _ => return None,
+    };
+    Some(std::path::Path::new(std::ffi::OsStr::from_bytes(tail)))
 }
 
 /// Per-request cache of compiled exclude `Any` unions.
@@ -3245,6 +3267,28 @@ mod tests {
         assert_eq!(literal_prefix("**/*.rs"), "");
         assert_eq!(literal_prefix("dir/ogen.{yml,yaml}"), "dir");
         assert_eq!(literal_prefix("a/b?c/d"), "a");
+    }
+
+    #[test]
+    fn test_strip_literal_prefix() {
+        use std::path::Path;
+        for (rel, prefix, tail) in [
+            ("pkg/a/b.go", "pkg", Some("a/b.go")),
+            ("pkg", "pkg", Some("")),
+            ("pkgx/f", "pkg", None),
+            ("pk", "pkg", None),
+            ("other/pkg/f", "pkg", None),
+            ("a/b/c", "a/b", Some("c")),
+            ("a/bc", "a/b", None),
+            ("x/y", "", Some("x/y")),
+            ("café/é", "café", Some("é")),
+        ] {
+            assert_eq!(
+                strip_literal_prefix(Path::new(rel), prefix),
+                tail.map(Path::new),
+                "{rel:?} past {prefix:?}"
+            );
+        }
     }
 
     #[test]
