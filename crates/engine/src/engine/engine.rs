@@ -206,11 +206,11 @@ pub struct Engine {
     /// [`hold_local_cache_writes`](Self::hold_local_cache_writes).
     #[cfg(any(test, feature = "test-support"))]
     sqlite_writer_gate: Arc<crate::engine::local_cache_sqlite::WriterGate>,
-    /// Test-only: runs once an in_place write-back has landed on the tree and
-    /// before the fixpoint recompute re-reads it, for
-    /// [`set_in_place_written_hook`](Self::set_in_place_written_hook).
+    /// Test-only: runs after every non-frozen codegen write-back, before the
+    /// fixpoint recompute re-reads the tree, for
+    /// [`set_codegen_written_hook`](Self::set_codegen_written_hook).
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) in_place_written_hook: Option<InPlaceWrittenHook>,
+    pub(crate) codegen_written_hook: Option<CodegenWrittenHook>,
     /// Shared cross-run filesystem-walk cache (separate `fswalk.db`), handed to
     /// tree-walking plugins via [`PluginInit`].
     pub(crate) walker: Arc<hwalk::CachedWalker>,
@@ -462,9 +462,9 @@ impl Drop for Engine {
     }
 }
 
-/// Test-only: the hook [`Engine::set_in_place_written_hook`] installs.
+/// Test-only: the hook [`Engine::set_codegen_written_hook`] installs.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) type InPlaceWrittenHook = Arc<dyn Fn(&hmodel::htaddr::Addr) + Send + Sync>;
+pub(crate) type CodegenWrittenHook = Box<dyn Fn(&hmodel::htaddr::Addr) + Send + Sync>;
 
 /// Test-only: holds this engine's durable cache writes in its write-behind
 /// queue until dropped. See [`Engine::hold_local_cache_writes`].
@@ -499,16 +499,18 @@ impl Engine {
         LocalCacheWriteHold(Arc::clone(&self.sqlite_writer_gate))
     }
 
-    /// Run `hook` after each in_place write-back has landed on the tree and
-    /// before the fixpoint recompute re-reads it: the window in which an edit
-    /// reaches the recomputed key but not the revision stored under it. Exists
-    /// so a test can put an edit there deterministically instead of racing the
-    /// write-back. Runs on the resolving task, so it must not block.
-    pub fn set_in_place_written_hook(
+    /// Run `hook` after every non-frozen codegen write-back — `copy` and
+    /// `in_place` alike, on an executed run or a cache hit, and including one
+    /// that found the tree already matching and wrote nothing — before the
+    /// fixpoint recompute (if any) re-reads the tree: the window in which an
+    /// edit reaches the recomputed key but not the revision stored under it.
+    /// Exists so a test can put an edit there deterministically instead of
+    /// racing the write-back. Runs on the resolving task, so it must not block.
+    pub fn set_codegen_written_hook(
         &mut self,
         hook: impl Fn(&hmodel::htaddr::Addr) + Send + Sync + 'static,
     ) {
-        self.in_place_written_hook = Some(Arc::new(hook));
+        self.codegen_written_hook = Some(Box::new(hook));
     }
 }
 
@@ -814,7 +816,7 @@ impl Engine {
             #[cfg(any(test, feature = "test-support"))]
             sqlite_writer_gate,
             #[cfg(any(test, feature = "test-support"))]
-            in_place_written_hook: None,
+            codegen_written_hook: None,
             walker,
             providers: vec![],
             providers_by_name: HashMap::new(),

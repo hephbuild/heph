@@ -937,6 +937,77 @@ fn in_place_fs_addrs(
     out
 }
 
+/// The root-relative paths a codegen write-back moved, each mapped to the
+/// content hashout ([`hwalk::content_hashout`]) of what it wrote there, or
+/// `None` for a recreated symlink. See [`Engine::materialize_codegen_tree`].
+type WrittenPaths = rustc_hash::FxHashMap<std::path::PathBuf, Option<String>>;
+
+/// An `@heph/fs` input's per-path hashouts in the form a dependent's `hashin`
+/// folds them (see `Engine::input_hashout`): sorted, comma-joined.
+fn joined_sorted_hashouts(entries: &rustc_hash::FxHashMap<std::path::PathBuf, String>) -> String {
+    let mut hashouts: Vec<&str> = entries.values().map(String::as_str).collect();
+    hashouts.sort_unstable();
+    hashouts.join(",")
+}
+
+/// Why [`Engine::fixpoint_describes_this_run`] refused to file a recomputed
+/// fixpoint key: what differed, in which input, at which path.
+#[derive(Debug)]
+struct FixpointRefusal {
+    kind: FixpointRefusalKind,
+    /// The input that differed; `None` for a whole-target reason.
+    input: Option<Addr>,
+    /// The file that differed, for an `@heph/fs` input.
+    path: Option<std::path::PathBuf>,
+}
+
+#[derive(Debug)]
+enum FixpointRefusalKind {
+    /// The target's def (or driver) hashed differently on the recompute.
+    DefChanged,
+    /// The recompute expanded a different set of hashed inputs.
+    InputSetChanged,
+    /// A non-fs input's hashout, or an unwritten file's bytes, changed.
+    Changed,
+    /// A file the run read is gone.
+    Removed,
+    /// A file the run did not read appeared, and the write-back did not create it.
+    Appeared,
+    /// A written file no longer holds the bytes the write-back put there.
+    WrittenButDiverged,
+    /// The write-back recreated a symlink, whose target bytes it cannot vouch for.
+    WrittenSymlink,
+    /// An `@heph/fs` input's per-path files do not add up to the hashout its
+    /// dependent's `hashin` folds, so comparing them would prove nothing.
+    EntriesInconsistent,
+}
+
+impl FixpointRefusal {
+    fn target(kind: FixpointRefusalKind) -> Self {
+        Self {
+            kind,
+            input: None,
+            path: None,
+        }
+    }
+
+    fn input(kind: FixpointRefusalKind, input: &Addr) -> Self {
+        Self {
+            kind,
+            input: Some(input.clone()),
+            path: None,
+        }
+    }
+
+    fn file(kind: FixpointRefusalKind, input: &Addr, path: &std::path::Path) -> Self {
+        Self {
+            kind,
+            input: Some(input.clone()),
+            path: Some(path.to_path_buf()),
+        }
+    }
+}
+
 /// Build an [`EResult`] from produced artifacts, filtering by output group and
 /// type. The artifacts are **unguarded**: this is the memoized form, and
 /// [`guard_eresult`] attaches the read lock per caller (see [`GuardSlot`]).
@@ -3658,9 +3729,9 @@ impl Engine {
 
         // Test-only seam: an edit landing here reaches the fixpoint recompute
         // below but not the revision it would file. See
-        // `Engine::set_in_place_written_hook`.
+        // `Engine::set_codegen_written_hook`.
         #[cfg(any(test, feature = "test-support"))]
-        if !frozen && let Some(hook) = &self.in_place_written_hook {
+        if !frozen && let Some(hook) = &self.codegen_written_hook {
             hook(&def.target.addr);
         }
 
@@ -3751,18 +3822,25 @@ impl Engine {
         cached: &[ResultArtifact],
         root: &std::path::Path,
         frozen: bool,
-    ) -> anyhow::Result<rustc_hash::FxHashSet<std::path::PathBuf>> {
+    ) -> anyhow::Result<WrittenPaths> {
         use crate::engine::driver::targetdef::path::CodegenMode;
 
-        // The root-relative paths this call actually moved. Content writes,
-        // exec-bit reconciles and symlink recreates all count; the codegen xattr
-        // does not (it is metadata, outside the `@heph/fs` content+exec-bit
-        // hash). Empty therefore means the tree still hashes exactly as it did
-        // before this call — which is what lets the caller skip the fixpoint
-        // recompute — and the fixpoint check uses the set itself: these are the
-        // only paths whose bytes may differ between what the run read and what
-        // the recompute reads.
-        let mut written = rustc_hash::FxHashSet::default();
+        // The root-relative paths this call actually moved, each with the
+        // content hashout (`hwalk::content_hashout`) it now holds. Content
+        // writes, exec-bit reconciles and symlink recreates all count; the
+        // codegen xattr does not (it is metadata, outside the `@heph/fs`
+        // content+exec-bit hash). Empty therefore means the tree still hashes
+        // exactly as it did before this call — which is what lets the caller
+        // skip the fixpoint recompute — and the fixpoint check uses the map
+        // itself: these are the only paths whose bytes may differ between what
+        // the run read and what the recompute reads, and only to these hashes.
+        //
+        // The hash is computed from the bytes in memory, never re-read from
+        // disk: a re-read could see an edit that landed after the write, which
+        // is exactly what the check must catch. A recreated symlink maps to
+        // `None` — the fs walker follows links, and the write-back does not
+        // know the bytes behind one — so a written symlink refuses the fixpoint.
+        let mut written = WrittenPaths::default();
         let mut frozen_diff = String::new();
 
         // Map each codegen output group to its declared mode (first non-None
@@ -3888,9 +3966,9 @@ impl Engine {
                     .walk()
                     .with_context(|| format!("walk codegen output for write-back: {group}"))?;
                 for entry in walker {
-                    let entry = entry
+                    let WalkEntry { path, kind } = entry
                         .with_context(|| format!("read codegen entry for write-back: {group}"))?;
-                    let dest = root.join(&entry.path);
+                    let dest = root.join(&path);
                     // An `in_place` target must not write back into a tree file
                     // that another `codegen = "copy"` target owns (stamped with
                     // the codegen xattr) — doing so would clobber the copy
@@ -3901,11 +3979,15 @@ impl Engine {
                     {
                         continue;
                     }
-                    match entry.kind {
+                    match kind {
                         WalkEntryKind::File { mut data, x, .. } => {
                             let mut new_bytes = Vec::new();
                             std::io::Read::read_to_end(&mut data, &mut new_bytes)
-                                .with_context(|| format!("read generated file {:?}", entry.path))?;
+                                .with_context(|| format!("read generated file {:?}", path))?;
+                            // Whether this entry moved the tree: its bytes, its
+                            // exec bit, or both. Recorded once, below, with the
+                            // hash of the final (bytes, `x`).
+                            let mut moved = false;
                             let unchanged =
                                 matches!(std::fs::read(&dest), Ok(old) if old == new_bytes);
                             if !unchanged {
@@ -3916,7 +3998,7 @@ impl Engine {
                                 }
                                 std::fs::write(&dest, &new_bytes)
                                     .with_context(|| format!("write codegen file {:?}", dest))?;
-                                written.insert(entry.path.clone());
+                                moved = true;
                             }
                             // The exec bit is part of the `@heph/fs` (content,
                             // exec-bit) input hash, so reconcile it to the
@@ -3941,7 +4023,7 @@ impl Engine {
                                         .with_context(
                                             || format!("reconcile exec bit on {:?}", dest),
                                         )?;
-                                        written.insert(entry.path.clone());
+                                        moved = true;
                                     }
                                 }
                             }
@@ -3952,6 +4034,14 @@ impl Engine {
                             // fs hash.)
                             if matches!(mode, CodegenMode::Copy) {
                                 stamp_codegen_xattr(&dest, &stamp)?;
+                            }
+                            // The artifact's `x` is what the tree should now
+                            // carry. Had the reconcile above been skipped (its
+                            // metadata read failed), the tree's bit may differ,
+                            // the hashes then disagree, and the fixpoint check
+                            // refuses — the safe outcome.
+                            if moved {
+                                written.insert(path, Some(hwalk::content_hashout(&new_bytes, x)));
                             }
                         }
                         WalkEntryKind::Symlink { target } => {
@@ -3981,7 +4071,9 @@ impl Engine {
                                     std::os::unix::fs::symlink(&target, &dest).with_context(
                                         || format!("symlink {:?} -> {:?}", dest, target),
                                     )?;
-                                    written.insert(entry.path.clone());
+                                    // The bytes behind the link are unknown
+                                    // here; `None` refuses the fixpoint.
+                                    written.insert(path, None);
                                 }
                                 // Stamp Copy symlink outputs too, so a later fs
                                 // glob excludes them like regular Copy files.
@@ -4362,8 +4454,13 @@ impl Engine {
             .await?;
         let mut entries = rustc_hash::FxHashMap::default();
         for artifact in &res.artifacts {
-            let hashout = artifact.hashout()?;
-            for path in artifact.entry_paths()? {
+            let hashout = artifact
+                .hashout()
+                .with_context(|| format!("hashing a file of {addr}"))?;
+            for path in artifact
+                .entry_paths()
+                .with_context(|| format!("listing the files of {addr}"))?
+            {
                 entries.insert(path, hashout.clone());
             }
         }
@@ -4371,78 +4468,140 @@ impl Engine {
     }
 
     /// Whether the tree the fixpoint recompute (`fresh`) read is the tree this
-    /// run (`rs`) read, plus exactly the paths the write-back wrote — so that
-    /// the key recomputed from it describes the revision this run produced.
+    /// run (`rs`) read, plus exactly what the write-back wrote — so that the key
+    /// recomputed from it describes the revision this run produced. `Ok(None)`
+    /// when it is; otherwise the first difference found.
     ///
-    /// Everything `hashin` folds is compared. The def must hash the same on
-    /// both. A non-fs input (a dependency) must hash the same on both. An
-    /// `@heph/fs` input is compared path by path: every path the run read must
-    /// still be there; a path's bytes may differ only if this write-back wrote
-    /// it; a path the run did not read may appear only if this write-back
-    /// created it. Anything else is an edit that reached the recomputed key but
-    /// not the revision.
+    /// `hashin` folds the driver, the def hash and the hashout of every hashed
+    /// input the request expanded; each is compared. The def must hash the same
+    /// on both requests, and both must have expanded the same hashed inputs. A
+    /// non-fs input (a dependency) must hash the same on both. An `@heph/fs`
+    /// input is compared path by path, and only once its per-path files are
+    /// shown, on each request, to be exactly the hashout that request's
+    /// `hashin` folded: an unwritten path must keep its bytes; a written path
+    /// must hold exactly the bytes the write-back put there (a written symlink
+    /// refuses, its target's bytes being unknown); a path the run did not read
+    /// may appear only if the write-back created it, with those bytes; no path
+    /// the run read may be gone. Anything else is an edit that reached the
+    /// recomputed key but not the revision.
     ///
     /// Cheap where it matters: the run's side is memoized on `rs`, the fresh
-    /// side's non-fs inputs on `fresh` by the `meta` recompute that preceded
-    /// this, and an fs input's files are a per-request glob walk the recompute
-    /// already paid for. Only reached when the write-back moved the tree.
+    /// side's expansion and input hashouts on `fresh` by the `meta` recompute
+    /// that preceded this, and an fs input's files are a per-request glob walk
+    /// the recompute already paid for. Only reached when the write-back moved
+    /// the tree.
     async fn fixpoint_describes_this_run(
         self: Arc<Self>,
         rs: &Arc<RequestState>,
         fresh: &Arc<RequestState>,
         addr: &Addr,
-        written: &rustc_hash::FxHashSet<std::path::PathBuf>,
-    ) -> anyhow::Result<bool> {
-        let ran = Arc::clone(&self).get_def_no_track(rs.clone(), addr).await?;
+        written: &WrittenPaths,
+    ) -> anyhow::Result<Option<FixpointRefusal>> {
+        use FixpointRefusalKind as K;
+
+        let ran = Arc::clone(&self)
+            .get_def_no_track(rs.clone(), addr)
+            .await
+            .with_context(|| format!("reading the def {addr} ran with"))?;
         let recomputed = Arc::clone(&self)
             .get_def_no_track(fresh.clone(), addr)
-            .await?;
+            .await
+            .with_context(|| format!("re-reading the def of {addr} for its fixpoint"))?;
         if ran.driver != recomputed.driver || ran.target_def.hash != recomputed.target_def.hash {
-            return Ok(false);
+            return Ok(Some(FixpointRefusal::target(K::DefChanged)));
         }
 
-        // Memoized on this request — the run already expanded these.
+        // Both memoized: the run expanded `rs`'s, the `meta` recompute `fresh`'s.
         let inputs = Arc::clone(&self)
             .expanded_inputs_for(rs.clone(), addr)
-            .await?;
+            .await
+            .with_context(|| format!("listing the inputs {addr} ran with"))?;
+        let fresh_inputs = Arc::clone(&self)
+            .expanded_inputs_for(fresh.clone(), addr)
+            .await
+            .with_context(|| format!("re-listing the inputs of {addr} for its fixpoint"))?;
+        // `hashin` folds the hashed inputs of the request it ran on, so the
+        // recompute must have expanded the same ones — as a multiset, since a
+        // duplicated input folds its hashout twice.
+        let hashed_addrs = |inputs: &[Input]| {
+            let mut addrs: Vec<String> = inputs
+                .iter()
+                .filter(|i| i.hashed)
+                .map(|i| i.r#ref.r#ref.format())
+                .collect();
+            addrs.sort_unstable();
+            addrs
+        };
+        if hashed_addrs(&inputs[..]) != hashed_addrs(&fresh_inputs[..]) {
+            return Ok(Some(FixpointRefusal::target(K::InputSetChanged)));
+        }
+
         for input in inputs.iter().filter(|i| i.hashed) {
             let input_addr = &input.r#ref.r#ref;
+            let before_hashout = Arc::clone(&self)
+                .input_hashout(rs.clone(), input_addr)
+                .await
+                .with_context(|| format!("reading the hash {input_addr} had when {addr} ran"))?;
+            let after_hashout = Arc::clone(&self)
+                .input_hashout(fresh.clone(), input_addr)
+                .await
+                .with_context(|| {
+                    format!("re-reading the hash of {input_addr} for the fixpoint of {addr}")
+                })?;
             if !hbuiltins::pluginfs::is_fs_addr(input_addr) {
-                let before = Arc::clone(&self)
-                    .input_hashout(rs.clone(), input_addr)
-                    .await?;
-                let after = Arc::clone(&self)
-                    .input_hashout(fresh.clone(), input_addr)
-                    .await?;
-                if before != after {
-                    return Ok(false);
+                if before_hashout != after_hashout {
+                    return Ok(Some(FixpointRefusal::input(K::Changed, input_addr)));
                 }
                 continue;
             }
             let before = Arc::clone(&self)
                 .fs_input_entries(rs.clone(), input_addr)
-                .await?;
+                .await
+                .with_context(|| format!("reading the files {input_addr} had when {addr} ran"))?;
             let after = Arc::clone(&self)
                 .fs_input_entries(fresh.clone(), input_addr)
-                .await?;
-            // Every path the run read is still there, with the same bytes unless
-            // this write-back wrote it.
-            for (path, hashout) in &before {
-                match after.get(path) {
-                    Some(h) if h == hashout || written.contains(path) => {}
-                    _ => return Ok(false),
+                .await
+                .with_context(|| {
+                    format!("re-reading the files of {input_addr} for the fixpoint of {addr}")
+                })?;
+            // The per-path maps stand for the hashouts the two keys folded only
+            // if they add up to them: a second read of the input (this one asks
+            // for its artifacts, `meta` did not) that saw another tree, two
+            // artifacts at one path, or one artifact spanning several would
+            // otherwise compare something other than what was hashed.
+            if joined_sorted_hashouts(&before) != before_hashout
+                || joined_sorted_hashouts(&after) != after_hashout
+            {
+                return Ok(Some(FixpointRefusal::input(
+                    K::EntriesInconsistent,
+                    input_addr,
+                )));
+            }
+            // Every path the recompute found holds what the run read, or what
+            // the write-back wrote there.
+            for (path, hashout) in &after {
+                let refusal = match written.get(path) {
+                    Some(None) => Some(K::WrittenSymlink),
+                    Some(Some(content)) => {
+                        let expected = path.to_str().map(|p| hwalk::fs_entry_hashout(p, content));
+                        (expected.as_ref() != Some(hashout)).then_some(K::WrittenButDiverged)
+                    }
+                    None => match before.get(path) {
+                        Some(h) if h == hashout => None,
+                        Some(_) => Some(K::Changed),
+                        None => Some(K::Appeared),
+                    },
+                };
+                if let Some(kind) = refusal {
+                    return Ok(Some(FixpointRefusal::file(kind, input_addr, path)));
                 }
             }
-            // Every path the recompute found is one the run read or one this
-            // write-back created.
-            if after
-                .keys()
-                .any(|path| !before.contains_key(path) && !written.contains(path))
-            {
-                return Ok(false);
+            // And every path the run read is still there.
+            if let Some(path) = before.keys().find(|p| !after.contains_key(*p)) {
+                return Ok(Some(FixpointRefusal::file(K::Removed, input_addr, path)));
             }
         }
-        Ok(true)
+        Ok(None)
     }
 
     /// Register the just-executed in_place target's cache entry under the key a
@@ -4466,14 +4625,15 @@ impl Engine {
     ///
     /// The recomputed key is stored only when it describes the revision filed
     /// under it: the fresh request must have read exactly the tree this run read,
-    /// with only the bytes of `written` (the paths the write-back moved)
-    /// differing. See [`Self::fixpoint_describes_this_run`].
+    /// except that each path in `written` (the paths the write-back moved) holds
+    /// exactly what the write-back put there. See
+    /// [`Self::fixpoint_describes_this_run`].
     async fn maybe_store_fixpoint(
         self: Arc<Self>,
         rs: &Arc<RequestState>,
         def: &LinkedTargetDef,
         hashin: &str,
-        written: &rustc_hash::FxHashSet<std::path::PathBuf>,
+        written: &WrittenPaths,
     ) -> anyhow::Result<()> {
         use crate::engine::driver::targetdef::path::CodegenMode;
 
@@ -4533,11 +4693,14 @@ impl Engine {
             .fixpoint_describes_this_run(rs, &fresh, &addr, written)
             .await
         {
-            Ok(true) => {}
-            Ok(false) => {
+            Ok(None) => {}
+            Ok(Some(refusal)) => {
                 tracing::debug!(
                     %addr,
-                    "fixpoint: an input moved between the run and the recompute; not stored"
+                    reason = ?refusal.kind,
+                    input = refusal.input.as_ref().map(tracing::field::display),
+                    path = refusal.path.as_deref().map(|p| tracing::field::display(p.display())),
+                    "fixpoint: the recomputed tree is not the run's tree plus its write-back; not stored"
                 );
                 return Ok(());
             }
@@ -11978,6 +12141,17 @@ mod tests {
             mode & 0o111 != 0,
             "write-back must apply the exec bit even when content is unchanged (mode {mode:o})",
         );
+
+        // An exec-bit-only write is a written path like any other: the hash
+        // the fixpoint check expects for it folds the new bit, so the fixpoint
+        // is stored and the next run is a hit.
+        let (second, ev2) = resolve_collecting_events(&engine, &addr).await;
+        second?;
+        assert_eq!(
+            executions(&ev2, "//pkg:mkexec"),
+            0,
+            "an exec-bit-only write-back must keep the fixpoint: {ev2:?}"
+        );
         Ok(())
     }
 
@@ -12060,15 +12234,24 @@ mod tests {
         printf '%s\\n' \"$(tr a-z A-Z < \"$f\")\" > \"$f.tmp\" && mv \"$f.tmp\" \"$f\"; \
         done";
 
-    /// A hook for [`Engine::set_in_place_written_hook`] that runs `edit` on the
+    /// A hook for [`Engine::set_codegen_written_hook`] that runs `edit` on the
     /// first write-back only: the next run's write-back (a cache hit still
     /// reconciles the tree) must not re-apply the edit under test.
     fn once_after_write_back(
         edit: impl Fn() + Send + Sync + 'static,
     ) -> impl Fn(&Addr) + Send + Sync + 'static {
-        let fired = std::sync::atomic::AtomicBool::new(false);
+        on_nth_write_back(1, edit)
+    }
+
+    /// A hook that runs `edit` on the `n`th write-back (1-based) and on no
+    /// other: for an edit that must land in a later run's window.
+    fn on_nth_write_back(
+        n: usize,
+        edit: impl Fn() + Send + Sync + 'static,
+    ) -> impl Fn(&Addr) + Send + Sync + 'static {
+        let fired = std::sync::atomic::AtomicUsize::new(0);
         move |_| {
-            if !fired.swap(true, Ordering::SeqCst) {
+            if fired.fetch_add(1, Ordering::SeqCst) + 1 == n {
                 edit();
             }
         }
@@ -12091,7 +12274,7 @@ mod tests {
             )],
             |engine, root| {
                 let new = root.join("pkg/new.txt");
-                engine.set_in_place_written_hook(once_after_write_back(move || {
+                engine.set_codegen_written_hook(once_after_write_back(move || {
                     std::fs::write(&new, b"hello").expect("write new.txt");
                 }));
             },
@@ -12142,7 +12325,7 @@ mod tests {
             )],
             |engine, root| {
                 let b = root.join("pkg/b.txt");
-                engine.set_in_place_written_hook(once_after_write_back(move || {
+                engine.set_codegen_written_hook(once_after_write_back(move || {
                     std::fs::write(&b, b"changed").expect("edit b.txt");
                 }));
             },
@@ -12209,6 +12392,273 @@ mod tests {
             0,
             "a file the write-back created must not cost the fixpoint: {ev2:?}"
         );
+        Ok(())
+    }
+
+    /// A path the write-back wrote is excused from the before/after comparison
+    /// only for the bytes the write-back put there. Edited after the write
+    /// (`HELLO\n` → `edited`) and before the recompute, its new bytes reach the
+    /// recomputed key while the revision holds `HELLO\n`. Stored, the next run
+    /// would hit it and its write-back would revert the edit. So no fixpoint is
+    /// stored: the next run executes, and formats the edit.
+    #[tokio::test]
+    async fn no_fixpoint_when_a_written_file_is_edited_before_the_recompute() -> anyhow::Result<()>
+    {
+        let (engine, root) = engine_with_home_fs_with(
+            vec![codegen_run_target(
+                "//pkg:fmt",
+                "in_place",
+                &["*.txt"],
+                UPPERCASE_TXT,
+            )],
+            |engine, root| {
+                let a = root.join("pkg/a.txt");
+                engine.set_codegen_written_hook(once_after_write_back(move || {
+                    std::fs::write(&a, b"edited").expect("edit a.txt");
+                }));
+            },
+        )?;
+        let pkg_dir = root.path().join("pkg");
+        std::fs::create_dir_all(&pkg_dir)?;
+        std::fs::write(pkg_dir.join("a.txt"), b"hello")?;
+
+        let addr = hmodel::htaddr::parse_addr("//pkg:fmt")?;
+        let (first, ev1) = resolve_collecting_events(&engine, &addr).await;
+        first?;
+        assert_eq!(executions(&ev1, "//pkg:fmt"), 1, "{ev1:?}");
+        assert_eq!(
+            std::fs::read(pkg_dir.join("a.txt"))?,
+            b"edited",
+            "the edit landed after the write-back"
+        );
+
+        let (second, ev2) = resolve_collecting_events(&engine, &addr).await;
+        second?;
+        assert_eq!(
+            executions(&ev2, "//pkg:fmt"),
+            1,
+            "run 2 hit a fixpoint keyed over an edit to a written file: {ev2:?}"
+        );
+        assert_eq!(
+            std::fs::read(pkg_dir.join("a.txt"))?,
+            b"EDITED\n",
+            "the edit must be formatted, not reverted to the revision's bytes"
+        );
+        Ok(())
+    }
+
+    /// [`no_fixpoint_when_a_written_file_is_edited_before_the_recompute`] for a
+    /// file the write-back created rather than rewrote: being new to the tree
+    /// excuses its appearance, not whatever bytes it holds by the recompute.
+    #[tokio::test]
+    async fn no_fixpoint_when_a_created_file_is_edited_before_the_recompute() -> anyhow::Result<()>
+    {
+        let (engine, root) = engine_with_home_fs_with(
+            vec![codegen_run_target(
+                "//pkg:fmt",
+                "in_place",
+                &["*.txt"],
+                &format!("{UPPERCASE_TXT} && printf 'GEN\\n' > gen.txt"),
+            )],
+            |engine, root| {
+                let generated = root.join("pkg/gen.txt");
+                engine.set_codegen_written_hook(once_after_write_back(move || {
+                    std::fs::write(&generated, b"other").expect("edit gen.txt");
+                }));
+            },
+        )?;
+        let pkg_dir = root.path().join("pkg");
+        std::fs::create_dir_all(&pkg_dir)?;
+        std::fs::write(pkg_dir.join("a.txt"), b"hello")?;
+
+        let addr = hmodel::htaddr::parse_addr("//pkg:fmt")?;
+        let (first, ev1) = resolve_collecting_events(&engine, &addr).await;
+        first?;
+        assert_eq!(executions(&ev1, "//pkg:fmt"), 1, "{ev1:?}");
+        assert_eq!(std::fs::read(pkg_dir.join("gen.txt"))?, b"other");
+
+        let (second, ev2) = resolve_collecting_events(&engine, &addr).await;
+        second?;
+        assert_eq!(
+            executions(&ev2, "//pkg:fmt"),
+            1,
+            "run 2 hit a fixpoint keyed over an edit to a created file: {ev2:?}"
+        );
+        assert_eq!(std::fs::read(pkg_dir.join("gen.txt"))?, b"GEN\n");
+        Ok(())
+    }
+
+    /// An input file the run read and the write-back left alone is removed
+    /// before the recompute. The recomputed key covers a tree without it; the
+    /// revision holds it. Stored, the next run would hit and its write-back
+    /// would bring the removed file back. So no fixpoint is stored.
+    #[tokio::test]
+    async fn no_fixpoint_when_an_input_is_removed_before_the_recompute() -> anyhow::Result<()> {
+        let (engine, root) = engine_with_home_fs_with(
+            vec![codegen_run_target(
+                "//pkg:fmt",
+                "in_place",
+                &["*.txt"],
+                UPPERCASE_TXT,
+            )],
+            |engine, root| {
+                let b = root.join("pkg/b.txt");
+                engine.set_codegen_written_hook(once_after_write_back(move || {
+                    std::fs::remove_file(&b).expect("remove b.txt");
+                }));
+            },
+        )?;
+        let pkg_dir = root.path().join("pkg");
+        std::fs::create_dir_all(&pkg_dir)?;
+        std::fs::write(pkg_dir.join("a.txt"), b"hello")?;
+        std::fs::write(pkg_dir.join("b.txt"), b"WORLD\n")?;
+
+        let addr = hmodel::htaddr::parse_addr("//pkg:fmt")?;
+        let (first, ev1) = resolve_collecting_events(&engine, &addr).await;
+        first?;
+        assert_eq!(executions(&ev1, "//pkg:fmt"), 1, "{ev1:?}");
+        assert!(!pkg_dir.join("b.txt").exists(), "the removal landed");
+
+        let (second, ev2) = resolve_collecting_events(&engine, &addr).await;
+        second?;
+        assert_eq!(
+            executions(&ev2, "//pkg:fmt"),
+            1,
+            "run 2 hit a fixpoint keyed over a tree without b.txt: {ev2:?}"
+        );
+        assert!(
+            !pkg_dir.join("b.txt").exists(),
+            "the removed file must stay removed, not be restored from the revision"
+        );
+        Ok(())
+    }
+
+    /// The `@heph/fs:file` form of the fixpoint: literal output paths become
+    /// one `file()` input each instead of a glob, and the written path is
+    /// still recognised — the next run is a hit.
+    #[tokio::test]
+    async fn fixpoint_hit_over_file_inputs() -> anyhow::Result<()> {
+        let (engine, root) = engine_with_home_fs(vec![codegen_run_target(
+            "//pkg:fmt",
+            "in_place",
+            &["a.txt", "b.txt"],
+            UPPERCASE_TXT,
+        )])?;
+        let pkg_dir = root.path().join("pkg");
+        std::fs::create_dir_all(&pkg_dir)?;
+        std::fs::write(pkg_dir.join("a.txt"), b"hello")?;
+        std::fs::write(pkg_dir.join("b.txt"), b"WORLD\n")?;
+
+        let addr = hmodel::htaddr::parse_addr("//pkg:fmt")?;
+        let (first, ev1) = resolve_collecting_events(&engine, &addr).await;
+        first?;
+        assert_eq!(executions(&ev1, "//pkg:fmt"), 1, "{ev1:?}");
+        assert_eq!(std::fs::read(pkg_dir.join("a.txt"))?, b"HELLO\n");
+
+        let (second, ev2) = resolve_collecting_events(&engine, &addr).await;
+        second?;
+        assert_eq!(
+            executions(&ev2, "//pkg:fmt"),
+            0,
+            "the fixpoint over file() inputs must be stored: {ev2:?}"
+        );
+        Ok(())
+    }
+
+    /// [`no_fixpoint_when_an_unwritten_input_changes_before_the_recompute`]
+    /// over `file()` inputs: the already-formatted `b.txt` is edited in the
+    /// window, so no fixpoint is stored and the next run formats the edit.
+    #[tokio::test]
+    async fn no_fixpoint_when_an_unwritten_file_input_changes_before_the_recompute()
+    -> anyhow::Result<()> {
+        let (engine, root) = engine_with_home_fs_with(
+            vec![codegen_run_target(
+                "//pkg:fmt",
+                "in_place",
+                &["a.txt", "b.txt"],
+                UPPERCASE_TXT,
+            )],
+            |engine, root| {
+                let b = root.join("pkg/b.txt");
+                engine.set_codegen_written_hook(once_after_write_back(move || {
+                    std::fs::write(&b, b"changed").expect("edit b.txt");
+                }));
+            },
+        )?;
+        let pkg_dir = root.path().join("pkg");
+        std::fs::create_dir_all(&pkg_dir)?;
+        std::fs::write(pkg_dir.join("a.txt"), b"hello")?;
+        std::fs::write(pkg_dir.join("b.txt"), b"WORLD\n")?;
+
+        let addr = hmodel::htaddr::parse_addr("//pkg:fmt")?;
+        let (first, ev1) = resolve_collecting_events(&engine, &addr).await;
+        first?;
+        assert_eq!(executions(&ev1, "//pkg:fmt"), 1, "{ev1:?}");
+        assert_eq!(std::fs::read(pkg_dir.join("b.txt"))?, b"changed");
+
+        let (second, ev2) = resolve_collecting_events(&engine, &addr).await;
+        second?;
+        assert_eq!(
+            executions(&ev2, "//pkg:fmt"),
+            1,
+            "run 2 hit a fixpoint keyed over an edit run 1 never saw: {ev2:?}"
+        );
+        assert_eq!(std::fs::read(pkg_dir.join("b.txt"))?, b"CHANGED\n");
+        Ok(())
+    }
+
+    /// The write-back on a cache hit stores a fixpoint too, and is held to the
+    /// same check. Run 1 formats `a.txt` and stores its fixpoint; `a.txt` is
+    /// put back, so run 2 hits the primary key and writes `HELLO\n` back; an
+    /// edit to the unwritten `b.txt` lands in that second write-back's window.
+    /// Run 3 must execute rather than hit a key covering the edit.
+    #[tokio::test]
+    async fn no_fixpoint_from_a_cache_hit_write_back_when_an_input_changes() -> anyhow::Result<()> {
+        let (engine, root) = engine_with_home_fs_with(
+            vec![codegen_run_target(
+                "//pkg:fmt",
+                "in_place",
+                &["*.txt"],
+                UPPERCASE_TXT,
+            )],
+            |engine, root| {
+                let b = root.join("pkg/b.txt");
+                engine.set_codegen_written_hook(on_nth_write_back(2, move || {
+                    std::fs::write(&b, b"changed").expect("edit b.txt");
+                }));
+            },
+        )?;
+        let pkg_dir = root.path().join("pkg");
+        std::fs::create_dir_all(&pkg_dir)?;
+        std::fs::write(pkg_dir.join("a.txt"), b"hello")?;
+        std::fs::write(pkg_dir.join("b.txt"), b"WORLD\n")?;
+
+        let addr = hmodel::htaddr::parse_addr("//pkg:fmt")?;
+        let (first, ev1) = resolve_collecting_events(&engine, &addr).await;
+        first?;
+        assert_eq!(executions(&ev1, "//pkg:fmt"), 1, "{ev1:?}");
+        assert_eq!(std::fs::read(pkg_dir.join("a.txt"))?, b"HELLO\n");
+
+        // Back to the tree run 1 read: the primary key.
+        std::fs::write(pkg_dir.join("a.txt"), b"hello")?;
+        let (second, ev2) = resolve_collecting_events(&engine, &addr).await;
+        second?;
+        assert_eq!(
+            executions(&ev2, "//pkg:fmt"),
+            0,
+            "run 2 must hit the primary key and write back from the cache: {ev2:?}"
+        );
+        assert_eq!(std::fs::read(pkg_dir.join("a.txt"))?, b"HELLO\n");
+        assert_eq!(std::fs::read(pkg_dir.join("b.txt"))?, b"changed");
+
+        let (third, ev3) = resolve_collecting_events(&engine, &addr).await;
+        third?;
+        assert_eq!(
+            executions(&ev3, "//pkg:fmt"),
+            1,
+            "run 3 hit a fixpoint the cache-hit write-back keyed over an edit: {ev3:?}"
+        );
+        assert_eq!(std::fs::read(pkg_dir.join("b.txt"))?, b"CHANGED\n");
         Ok(())
     }
 
