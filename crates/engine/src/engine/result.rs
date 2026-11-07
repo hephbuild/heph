@@ -12141,16 +12141,52 @@ mod tests {
             mode & 0o111 != 0,
             "write-back must apply the exec bit even when content is unchanged (mode {mode:o})",
         );
+        Ok(())
+    }
 
-        // An exec-bit-only write is a written path like any other: the hash
-        // the fixpoint check expects for it folds the new bit, so the fixpoint
-        // is stored and the next run is a hit.
+    /// The hash the fixpoint check expects for a written path folds the exec
+    /// bit the write-back set, not only the bytes: a transform that rewrites a
+    /// script and marks it executable keeps its fixpoint.
+    ///
+    /// The content changes too, and with it the size, on purpose: `@heph/fs`
+    /// revalidates a file by `(size, mtime)`, so a chmod-only write would be
+    /// re-read from the walker's cache with the old bit, the recompute would
+    /// land on the primary key, and the check under test would never run.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fixpoint_folds_the_exec_bit_the_write_back_set() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let (engine, root) = engine_with_home_fs(vec![codegen_run_target(
+            "//pkg:mkexec",
+            "in_place",
+            &["*.sh"],
+            "printf 'echo hello\\n' > run.sh && chmod +x run.sh",
+        )])?;
+        let pkg_dir = root.path().join("pkg");
+        std::fs::create_dir_all(&pkg_dir)?;
+        let script = pkg_dir.join("run.sh");
+        std::fs::write(&script, b"echo hi\n")?;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644))?;
+
+        let addr = hmodel::htaddr::parse_addr("//pkg:mkexec")?;
+        let (first, ev1) = resolve_collecting_events(&engine, &addr).await;
+        first?;
+        assert_eq!(executions(&ev1, "//pkg:mkexec"), 1, "{ev1:?}");
+        assert_eq!(std::fs::read(&script)?, b"echo hello\n");
+        let mode = std::fs::metadata(&script)?.permissions().mode();
+        assert!(
+            mode & 0o111 != 0,
+            "write-back must set the exec bit (mode {mode:o})"
+        );
+
+        // The tree no longer hashes to the primary key, so only a stored
+        // fixpoint can make this run a hit.
         let (second, ev2) = resolve_collecting_events(&engine, &addr).await;
         second?;
         assert_eq!(
             executions(&ev2, "//pkg:mkexec"),
             0,
-            "an exec-bit-only write-back must keep the fixpoint: {ev2:?}"
+            "a write-back that set the exec bit must keep the fixpoint: {ev2:?}"
         );
         Ok(())
     }
