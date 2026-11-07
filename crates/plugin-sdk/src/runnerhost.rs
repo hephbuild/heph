@@ -62,6 +62,7 @@ impl RunnerHost for HostForwarder {
         request_id: &str,
         addr: &Addr,
         rewrite: SpecRewrite,
+        tty: bool,
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<PrepareOutcome> {
         // Cancellation is not forwarded: dropping this future is what the host
@@ -71,6 +72,7 @@ impl RunnerHost for HostForwarder {
             request_id: request_id.to_string(),
             addr: addr.format(),
             rewrite,
+            tty,
         };
         let reply = self.host.prepare(SVec::from(req.encode().as_slice())).await;
         match PrepareReply::decode(&reply)? {
@@ -155,6 +157,7 @@ async fn run_guest_prepare(
         fingerprint: &req.fingerprint,
         config: &config,
         ctoken: &ctoken,
+        tty: req.tty,
     };
     runner.prepare(&ctx, req.rewrite).await
 }

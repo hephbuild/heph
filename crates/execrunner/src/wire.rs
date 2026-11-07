@@ -33,6 +33,8 @@ pub struct PrepareRequest {
     /// The runner target's address, formatted (`//pkg:name`).
     pub addr: String,
     pub rewrite: SpecRewrite,
+    /// The target runs on a terminal — `registry::RunnerCtx::tty`.
+    pub tty: bool,
 }
 
 /// The reply. An error crosses as a message rather than a type: the plugin
@@ -66,6 +68,8 @@ pub struct RunnerRequest {
     /// owns its own config shape, exactly as it would in-process.
     pub config_json: String,
     pub rewrite: SpecRewrite,
+    /// The target runs on a terminal — `registry::RunnerCtx::tty`.
+    pub tty: bool,
 }
 
 /// The reply. `supplies_environment` is not here: it is a separate sync ABI
@@ -84,6 +88,7 @@ impl RunnerRequest {
         put(&mut out, self.fingerprint.as_bytes());
         put(&mut out, self.config_json.as_bytes());
         put_rewrite(&mut out, &self.rewrite);
+        out.push(u8::from(self.tty));
         out
     }
 
@@ -94,6 +99,7 @@ impl RunnerRequest {
             fingerprint: r.string()?,
             config_json: r.string()?,
             rewrite: read_rewrite(&mut r)?,
+            tty: r.bool()?,
         })
     }
 }
@@ -239,6 +245,7 @@ impl PrepareRequest {
         put(&mut out, self.request_id.as_bytes());
         put(&mut out, self.addr.as_bytes());
         put_rewrite(&mut out, &self.rewrite);
+        out.push(u8::from(self.tty));
         out
     }
 
@@ -248,6 +255,7 @@ impl PrepareRequest {
             request_id: r.string()?,
             addr: r.string()?,
             rewrite: read_rewrite(&mut r)?,
+            tty: r.bool()?,
         })
     }
 }
@@ -315,8 +323,39 @@ mod tests {
             request_id: "req-1".to_string(),
             addr: "//tools/devenv:runner".to_string(),
             rewrite: rewrite(),
+            tty: false,
         };
         assert_eq!(PrepareRequest::decode(&req.encode()).expect("decode"), req);
+    }
+
+    /// The terminal flag crosses in both directions, set and clear — a runner
+    /// on the far side decides `docker exec -t` on it, so a frame that lost it
+    /// would quietly give a `--shell` no terminal.
+    #[test]
+    fn the_terminal_flag_crosses_both_seams() {
+        for tty in [true, false] {
+            let req = PrepareRequest {
+                request_id: "req-1".to_string(),
+                addr: "//svc:runner".to_string(),
+                rewrite: rewrite(),
+                tty,
+            };
+            assert_eq!(
+                PrepareRequest::decode(&req.encode()).expect("decode").tty,
+                tty
+            );
+            let req = RunnerRequest {
+                addr: "//svc:runner".to_string(),
+                fingerprint: "oci:sha256:abc".to_string(),
+                config_json: "{}".to_string(),
+                rewrite: rewrite(),
+                tty,
+            };
+            assert_eq!(
+                RunnerRequest::decode(&req.encode()).expect("decode").tty,
+                tty
+            );
+        }
     }
 
     /// The reason the payload is bytes and not strings. A program name, an
@@ -334,6 +373,7 @@ mod tests {
                 env: vec![(OsString::from("K"), bad.clone())],
                 cwd: PathBuf::from("/"),
             },
+            tty: false,
         };
         let back = PrepareRequest::decode(&req.encode()).expect("decode");
         assert_eq!(back.rewrite.args[0], bad);
@@ -354,6 +394,7 @@ mod tests {
                 env: vec![(OsString::from("K"), OsString::new())],
                 cwd: PathBuf::new(),
             },
+            tty: false,
         };
         assert_eq!(PrepareRequest::decode(&req.encode()).expect("decode"), req);
     }
@@ -376,6 +417,7 @@ mod tests {
             fingerprint: "oci:sha256:abc".to_string(),
             config_json: r#"{"image":"x@sha256:abc"}"#.to_string(),
             rewrite: rewrite(),
+            tty: true,
         };
         assert_eq!(RunnerRequest::decode(&req.encode()).expect("decode"), req);
     }
@@ -396,6 +438,7 @@ mod tests {
             request_id: "req".to_string(),
             addr: "//a:b".to_string(),
             rewrite: rewrite(),
+            tty: false,
         };
         let full = req.encode();
         for cut in [0, 1, 4, full.len() / 2, full.len() - 1] {

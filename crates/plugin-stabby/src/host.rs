@@ -523,7 +523,7 @@ async fn run_prepare(bytes: Vec<u8>) -> anyhow::Result<hexecrunner::PrepareOutco
     let addr = hmodel::htaddr::parse_addr(&req.addr)
         .map_err(|e| anyhow::anyhow!("exec-runner seam: bad runner address {:?}: {e}", req.addr))?;
     let ctoken = hcore::hasync::StdCancellationToken::new();
-    hexecrunner::prepare_for_plugin(&req.request_id, &addr, req.rewrite, &ctoken).await
+    hexecrunner::prepare_for_plugin(&req.request_id, &addr, req.rewrite, req.tty, &ctoken).await
 }
 
 /// Wraps the per-request engine executor; handed to the plugin as a [`DynExecutor`].

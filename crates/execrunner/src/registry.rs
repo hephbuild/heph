@@ -34,6 +34,17 @@ pub struct RunnerCtx<'a> {
     pub config: &'a serde_json::Value,
     /// Cancellation for anything slow (an agent runner starting a session).
     pub ctoken: &'a (dyn Cancellable + Send + Sync),
+    /// The target's stdin, stdout and stderr are one terminal it may treat as
+    /// its own: a `--shell`, an entrypoint on the PTY heph owns, or a `--raw`
+    /// entrypoint whose inherited stdin, stdout and stderr are all terminals.
+    /// One redirected stream makes it false.
+    ///
+    /// Read-only. The terminal is the caller's contract with the process it
+    /// spawns (`setsid`/`ctty`, see `SpecRewrite`), not the runner's to change
+    /// — but a runner that moves the target behind another transport has to
+    /// hand a terminal through itself (`docker exec -t`), or the tool on the
+    /// far side sees a pipe and no resize ever reaches it.
+    pub tty: bool,
 }
 
 /// A named way of running a process somewhere other than plainly here.
@@ -155,6 +166,7 @@ impl RunnerRegistry {
         addr: &str,
         cfg: &RunnerConfig,
         rewrite: SpecRewrite,
+        tty: bool,
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<crate::PrepareOutcome> {
         self.validate(addr, cfg)?;
@@ -166,6 +178,7 @@ impl RunnerRegistry {
             fingerprint: &cfg.fingerprint,
             config: &cfg.config,
             ctoken,
+            tty,
         };
         Ok(crate::PrepareOutcome {
             rewrite: runner.prepare(&ctx, rewrite).await?,
@@ -322,7 +335,7 @@ mod tests {
     async fn run(c: &RunnerConfig, r: SpecRewrite) -> anyhow::Result<SpecRewrite> {
         let reg = RunnerRegistry::with_builtins();
         let ctoken = StdCancellationToken::new();
-        reg.prepare("//x:r", c, r, &ctoken)
+        reg.prepare("//x:r", c, r, false, &ctoken)
             .await
             .map(|outcome| outcome.rewrite)
     }

@@ -114,7 +114,7 @@ fn plugin_abi_version(lib: &libloading::Library) -> Option<String> {
 }
 
 /// The plugin ABI versions this host loads: `^MIN_PLUGIN_ABI`. Pre-1.0 that is
-/// one minor's lane (`^0.18.0` = `>=0.18.0, <0.19.0`): a patch is additive, so
+/// one minor's lane (`^0.19.0` = `>=0.19.0, <0.20.0`): a patch is additive, so
 /// a plugin a few patches newer or older than the host loads; a minor is a
 /// break, which raises `MIN_PLUGIN_ABI` to the new `x.y.0`.
 pub fn accepted_plugin_abi() -> anyhow::Result<semver::VersionReq> {

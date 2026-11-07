@@ -209,7 +209,14 @@ pub async fn spawn_foreground(
         setsid: false,
         ctty: false,
     };
-    crate::prepare(runner, &mut spec, path, ctoken).await?;
+    // On a slave the three fds are the PTY. Inherited, they are heph's own, and
+    // a terminal only when all three are one. Each matters to a runner that
+    // allocates one (`docker exec -it`): a non-tty stdin fails the run ("the
+    // input device is not a TTY"), a redirected stdout would get a tty's `\r\n`
+    // instead of the bytes, and a redirected stderr would be merged into the
+    // terminal's output, since a tty has only one.
+    let tty = cmd.slave.is_some() || stdio_is_a_terminal();
+    crate::prepare(runner, &mut spec, path, tty, ctoken).await?;
     // The last point a cancel can still mean "the tool never ran": the runner's
     // prepare can take a while, and nothing after this awaits.
     if ctoken.is_cancelled() {
@@ -222,6 +229,15 @@ pub async fn spawn_foreground(
     let slave = cmd.slave.take();
     let child = spawn_inherited(&spec.program, &spec.args, &spec.env, &spec.cwd, &cmd, slave);
     Ok((child, spawned_as))
+}
+
+/// Whether this process's own stdin, stdout and stderr are all terminals: what
+/// an inherited spawn hands the target.
+fn stdio_is_a_terminal() -> bool {
+    use std::io::IsTerminal as _;
+    std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
+        && std::io::stderr().is_terminal()
 }
 
 fn spawn_inherited(
