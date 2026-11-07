@@ -9,8 +9,8 @@
 //!
 //! These drive the real `Engine` and driver through the wrapper `run.rs` hands
 //! them, with files where the real one has fds 1 and 2. What the wrapper does on
-//! a real terminal, and that `--raw` gives an action no stdin, needs a process:
-//! `crates/bin-e2e`.
+//! a real terminal, and that a build target's action gets no stdin in any mode but
+//! `--shell`, needs a process: `crates/bin-e2e`.
 
 mod common;
 

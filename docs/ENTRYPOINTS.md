@@ -197,8 +197,14 @@ With no TUI, an `approval`-gated target in the closure is refused unless you pas
 `--auto-approve`. `run` has no `--json`.
 
 On a build target, `--raw` only changes the display: the action's output is
-printed plainly, redacted as in `log.txt`, the action reads no stdin, and capture,
-runners and the cache are unchanged. A cache hit prints nothing.
+printed plainly, redacted as in `log.txt`, and capture, runners and the cache are
+unchanged. A cache hit prints nothing.
+
+A build target's action reads no stdin, with or without `--raw`: it gets
+`/dev/null`, whether `heph run` was given a pipe, a file or your terminal. What
+the action would read is no part of its cache key, so two runs fed different
+bytes would share one artifact, and the second would get the first's. Only
+`--shell` hands a build target the keyboard.
 
 ## Exit status
 

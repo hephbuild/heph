@@ -104,7 +104,9 @@ pub struct RunArgs {
     /// bash config, so your aliases and prompt setup are absent.
     ///
     /// The session is neither logged nor redacted, so `env` in it shows any
-    /// credentials the target declares.
+    /// credentials the target declares. It is also the only way a build target
+    /// gets stdin: a plain build's action reads /dev/null, since what it would
+    /// read is no part of its cache key.
     #[arg(long = "shell", num_args = 0..=1, require_equals = true, default_missing_value = "", value_name = "TARGET",)]
     pub shell: Option<String>,
     /// Print output artifacts to stdout
@@ -134,9 +136,10 @@ pub struct RunArgs {
     /// on heph's PTY, with no byte passing through heph. That is what gives it
     /// real Ctrl-Z and exact terminal behaviour, at the cost of two signal limits:
     /// see docs/ENTRYPOINTS.md. On a build target it changes only the display:
-    /// the action's output is printed plainly, redacted as in `log.txt`, the
-    /// action reads no stdin, and capture, runners and the cache are unchanged,
-    /// so a cache hit prints nothing. Refused with `--shell`.
+    /// the action's output is printed plainly, redacted as in `log.txt`, and
+    /// capture, runners and the cache are unchanged, so a cache hit prints
+    /// nothing. A build target's action reads no stdin with or without this
+    /// flag; only `--shell` gets the keyboard. Refused with `--shell`.
     #[arg(long = "raw")]
     pub raw: bool,
     /// Arguments for an entrypoint (`entrypoint = True`) that declares `args = True`,
@@ -713,8 +716,6 @@ impl App for RunApp {
             Some(Arc::new(move |inner| {
                 let pauser = pauser.clone();
                 Box::pin(async move {
-                    use std::io::IsTerminal as _;
-
                     let _guard = pauser.pause_for(pause_for).await;
                     // A `--shell` target parks a person at a prompt: nothing
                     // opens, closes or moves bytes for as long as they think,
@@ -735,15 +736,16 @@ impl App for RunApp {
                     // also works on macOS PTY-slave fds where mio's AsyncFd
                     // rejects the registration with EINVAL.
                     //
-                    // A plain build gets stdin only from a terminal. Stdin is no
-                    // input of the cache key, so a pipe or a file reaching the
-                    // action would put its bytes in the artifact the next run,
-                    // with other bytes, gets from the cache. Typed keystrokes
-                    // stay as they are: that hole is reserved for the user.
-                    let mut stdin = (pause_for == tui::PauseFor::Input
-                        || io::stdin().is_terminal())
-                    .then(tui::tty::TtyReader::from_stdin)
-                    .and_then(Result::ok);
+                    // Only a `--shell` gets stdin; a plain build's action reads
+                    // /dev/null, as it does under `--raw`. Stdin is no input of
+                    // the cache key, so bytes reaching the action — piped, from
+                    // a file, or typed at the terminal — would end up in the
+                    // artifact the next run, with other bytes, gets from the
+                    // cache. An action that prompts during a plain build loses
+                    // its keyboard, and such an action was never hermetic.
+                    let mut stdin = (pause_for == tui::PauseFor::Input)
+                        .then(tui::tty::TtyReader::from_stdin)
+                        .and_then(Result::ok);
                     let mut stdout = tokio::io::stdout();
                     let mut stderr = tokio::io::stderr();
                     // A `--shell`'s PTY is the driver's, so the size travels to it.
