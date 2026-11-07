@@ -790,6 +790,12 @@ impl Content for PassthroughContent {
     fn hashout(&self) -> anyhow::Result<String> {
         Ok(self.expected.clone())
     }
+
+    fn entry_paths(&self) -> anyhow::Result<Vec<std::path::PathBuf>> {
+        // One file, at `out_path`: no need to open the source, as the
+        // `walk`-based default would.
+        Ok(vec![std::path::PathBuf::from(&self.out_path)])
+    }
 }
 
 /// A `Read` adapter that hashes the bytes it passes through and, at EOF, verifies
@@ -3645,10 +3651,18 @@ impl Engine {
         }
 
         let (target, root) = (Arc::clone(&def.target), self.cfg.root.clone());
-        let wrote = hcore::blocking::run(move || {
+        let written = hcore::blocking::run(move || {
             Self::materialize_codegen_tree(&target, &cached, &root, frozen)
         })
         .await?;
+
+        // Test-only seam: an edit landing here reaches the fixpoint recompute
+        // below but not the revision it would file. See
+        // `Engine::set_in_place_written_hook`.
+        #[cfg(any(test, feature = "test-support"))]
+        if !frozen && let Some(hook) = &self.in_place_written_hook {
+            hook(&def.target.addr);
+        }
 
         // Fixpoint registration: idempotent, and a no-op unless this is an in_place
         // target whose tree just moved — when the write-back moved nothing, the
@@ -3656,8 +3670,9 @@ impl Engine {
         // fixpoint would recompute that same key and early-return. Skipping it
         // there saves a full input re-hash on the steady-state path (an
         // already-formatted tree), which is the common case.
-        if !frozen && can_cache && wrote {
-            self.maybe_store_fixpoint(&rs, def, hashin).await?;
+        if !frozen && can_cache && !written.is_empty() {
+            self.maybe_store_fixpoint(&rs, def, hashin, &written)
+                .await?;
         }
         Ok(())
     }
@@ -3736,15 +3751,18 @@ impl Engine {
         cached: &[ResultArtifact],
         root: &std::path::Path,
         frozen: bool,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<rustc_hash::FxHashSet<std::path::PathBuf>> {
         use crate::engine::driver::targetdef::path::CodegenMode;
 
-        // Whether anything about the tree actually moved. Content writes, exec-bit
-        // reconciles and symlink recreates all count; the codegen xattr does not
-        // (it is metadata, outside the `@heph/fs` content+exec-bit hash). `false`
-        // therefore means the tree still hashes exactly as it did before this
-        // call — which is what lets the caller skip the fixpoint recompute.
-        let mut wrote = false;
+        // The root-relative paths this call actually moved. Content writes,
+        // exec-bit reconciles and symlink recreates all count; the codegen xattr
+        // does not (it is metadata, outside the `@heph/fs` content+exec-bit
+        // hash). Empty therefore means the tree still hashes exactly as it did
+        // before this call — which is what lets the caller skip the fixpoint
+        // recompute — and the fixpoint check uses the set itself: these are the
+        // only paths whose bytes may differ between what the run read and what
+        // the recompute reads.
+        let mut written = rustc_hash::FxHashSet::default();
         let mut frozen_diff = String::new();
 
         // Map each codegen output group to its declared mode (first non-None
@@ -3898,7 +3916,7 @@ impl Engine {
                                 }
                                 std::fs::write(&dest, &new_bytes)
                                     .with_context(|| format!("write codegen file {:?}", dest))?;
-                                wrote = true;
+                                written.insert(entry.path.clone());
                             }
                             // The exec bit is part of the `@heph/fs` (content,
                             // exec-bit) input hash, so reconcile it to the
@@ -3923,7 +3941,7 @@ impl Engine {
                                         .with_context(
                                             || format!("reconcile exec bit on {:?}", dest),
                                         )?;
-                                        wrote = true;
+                                        written.insert(entry.path.clone());
                                     }
                                 }
                             }
@@ -3963,7 +3981,7 @@ impl Engine {
                                     std::os::unix::fs::symlink(&target, &dest).with_context(
                                         || format!("symlink {:?} -> {:?}", dest, target),
                                     )?;
-                                    wrote = true;
+                                    written.insert(entry.path.clone());
                                 }
                                 // Stamp Copy symlink outputs too, so a later fs
                                 // glob excludes them like regular Copy files.
@@ -3984,7 +4002,7 @@ impl Engine {
             }));
         }
 
-        Ok(wrote)
+        Ok(written)
     }
 
     // Memoized by addr:hashin — at most one execute+cache cycle runs per target per request,
@@ -4272,11 +4290,11 @@ impl Engine {
         let fresh = self.new_hash_only_state(addr.clone(), rs.listed_facts_trust());
         for input_addr in watched {
             let before = Arc::clone(&self)
-                .fs_input_hashout(rs.clone(), &input_addr)
+                .input_hashout(rs.clone(), &input_addr)
                 .await
                 .with_context(|| format!("reading the hash {input_addr} had when {addr} ran"))?;
             let after = Arc::clone(&self)
-                .fs_input_hashout(fresh.clone(), &input_addr)
+                .input_hashout(fresh.clone(), &input_addr)
                 .await
                 // Sealed for the same reason the whole-`hashin` recompute was:
                 // the chain may carry request-property markers that
@@ -4305,12 +4323,13 @@ impl Engine {
         Ok(())
     }
 
-    /// The combined hashout of an `@heph/fs` input, as this request sees it.
+    /// The combined hashout of an input, as this request sees it — what it
+    /// contributes to a dependent's `hashin`.
     ///
-    /// Sorted and joined rather than compared as a set: a file addr yields one
-    /// artifact and a glob addr yields one per matched file, and for a glob the
-    /// *set* of files is as much a change as any file's bytes.
-    async fn fs_input_hashout(
+    /// Sorted and joined rather than compared as a set: an `@heph/fs` file addr
+    /// yields one artifact and a glob addr yields one per matched file, and for
+    /// a glob the *set* of files is as much a change as any file's bytes.
+    async fn input_hashout(
         self: Arc<Self>,
         rs: Arc<RequestState>,
         addr: &Addr,
@@ -4325,6 +4344,105 @@ impl Engine {
             .collect();
         hashouts.sort_unstable();
         Ok(hashouts.join(","))
+    }
+
+    /// The files of an `@heph/fs` input as this request sees them: each one's
+    /// root-relative path and the hashout bound to it.
+    ///
+    /// Keyed by path, unlike [`Self::input_hashout`]: a hashout is bound to its
+    /// path (`hwalk::fs_entry_hashout`), so hashouts alone cannot tell a file
+    /// whose bytes moved from a file that was replaced by another.
+    async fn fs_input_entries(
+        self: Arc<Self>,
+        rs: Arc<RequestState>,
+        addr: &Addr,
+    ) -> anyhow::Result<rustc_hash::FxHashMap<std::path::PathBuf, String>> {
+        let res = self
+            .result_addr(rs, addr, OutputMatcher::All, &ResultOptions::default())
+            .await?;
+        let mut entries = rustc_hash::FxHashMap::default();
+        for artifact in &res.artifacts {
+            let hashout = artifact.hashout()?;
+            for path in artifact.entry_paths()? {
+                entries.insert(path, hashout.clone());
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Whether the tree the fixpoint recompute (`fresh`) read is the tree this
+    /// run (`rs`) read, plus exactly the paths the write-back wrote — so that
+    /// the key recomputed from it describes the revision this run produced.
+    ///
+    /// Everything `hashin` folds is compared. The def must hash the same on
+    /// both. A non-fs input (a dependency) must hash the same on both. An
+    /// `@heph/fs` input is compared path by path: every path the run read must
+    /// still be there; a path's bytes may differ only if this write-back wrote
+    /// it; a path the run did not read may appear only if this write-back
+    /// created it. Anything else is an edit that reached the recomputed key but
+    /// not the revision.
+    ///
+    /// Cheap where it matters: the run's side is memoized on `rs`, the fresh
+    /// side's non-fs inputs on `fresh` by the `meta` recompute that preceded
+    /// this, and an fs input's files are a per-request glob walk the recompute
+    /// already paid for. Only reached when the write-back moved the tree.
+    async fn fixpoint_describes_this_run(
+        self: Arc<Self>,
+        rs: &Arc<RequestState>,
+        fresh: &Arc<RequestState>,
+        addr: &Addr,
+        written: &rustc_hash::FxHashSet<std::path::PathBuf>,
+    ) -> anyhow::Result<bool> {
+        let ran = Arc::clone(&self).get_def_no_track(rs.clone(), addr).await?;
+        let recomputed = Arc::clone(&self)
+            .get_def_no_track(fresh.clone(), addr)
+            .await?;
+        if ran.driver != recomputed.driver || ran.target_def.hash != recomputed.target_def.hash {
+            return Ok(false);
+        }
+
+        // Memoized on this request — the run already expanded these.
+        let inputs = Arc::clone(&self)
+            .expanded_inputs_for(rs.clone(), addr)
+            .await?;
+        for input in inputs.iter().filter(|i| i.hashed) {
+            let input_addr = &input.r#ref.r#ref;
+            if !hbuiltins::pluginfs::is_fs_addr(input_addr) {
+                let before = Arc::clone(&self)
+                    .input_hashout(rs.clone(), input_addr)
+                    .await?;
+                let after = Arc::clone(&self)
+                    .input_hashout(fresh.clone(), input_addr)
+                    .await?;
+                if before != after {
+                    return Ok(false);
+                }
+                continue;
+            }
+            let before = Arc::clone(&self)
+                .fs_input_entries(rs.clone(), input_addr)
+                .await?;
+            let after = Arc::clone(&self)
+                .fs_input_entries(fresh.clone(), input_addr)
+                .await?;
+            // Every path the run read is still there, with the same bytes unless
+            // this write-back wrote it.
+            for (path, hashout) in &before {
+                match after.get(path) {
+                    Some(h) if h == hashout || written.contains(path) => {}
+                    _ => return Ok(false),
+                }
+            }
+            // Every path the recompute found is one the run read or one this
+            // write-back created.
+            if after
+                .keys()
+                .any(|path| !before.contains_key(path) && !written.contains(path))
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Register the just-executed in_place target's cache entry under the key a
@@ -4345,11 +4463,17 @@ impl Engine {
     /// identical), re-reading the post-write-back tree reproduces the same key,
     /// so the hit is stable across repeated runs. Best-effort: any failure leaves
     /// the primary entry intact and the next run simply re-executes.
+    ///
+    /// The recomputed key is stored only when it describes the revision filed
+    /// under it: the fresh request must have read exactly the tree this run read,
+    /// with only the bytes of `written` (the paths the write-back moved)
+    /// differing. See [`Self::fixpoint_describes_this_run`].
     async fn maybe_store_fixpoint(
         self: Arc<Self>,
         rs: &Arc<RequestState>,
         def: &LinkedTargetDef,
         hashin: &str,
+        written: &rustc_hash::FxHashSet<std::path::PathBuf>,
     ) -> anyhow::Result<()> {
         use crate::engine::driver::targetdef::path::CodegenMode;
 
@@ -4375,7 +4499,7 @@ impl Engine {
         // Fresh request → fs inputs re-stat the post-write-back tree, yielding the
         // exact hashin the NEXT run will compute.
         let fresh = self.new_hash_only_state(addr.clone(), rs.listed_facts_trust());
-        let fixpoint = match Arc::clone(&self).meta(fresh, &addr).await {
+        let fixpoint = match Arc::clone(&self).meta(fresh.clone(), &addr).await {
             Ok(m) => m.hashin,
             Err(e) => {
                 // Optimization only: the primary entry is already cached.
@@ -4393,6 +4517,34 @@ impl Engine {
         if fixpoint == hashin {
             // Tree already at the fixpoint (idempotent run changed nothing).
             return Ok(());
+        }
+        // The recomputed key describes the tree the fresh request read. The
+        // revision about to be filed under it was produced from the tree *this
+        // run* read, plus what the write-back wrote — and nothing above makes
+        // those the same tree. An edit landing between the write-back guard and
+        // the recompute (a new file under an input glob, a changed byte in a file
+        // the write-back left alone) is folded into the key while the revision
+        // never processed it. Every later run would then hit a key that maps to
+        // an output it does not describe, and the write-back on that hit would
+        // put the revision's copy of the edited file back over the edit. So the
+        // key is stored only when the fresh tree is this run's tree plus the
+        // written paths, and nothing else (#544).
+        match Arc::clone(&self)
+            .fixpoint_describes_this_run(rs, &fresh, &addr, written)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::debug!(
+                    %addr,
+                    "fixpoint: an input moved between the run and the recompute; not stored"
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::debug!(error = %format!("{e:#}"), %addr, "fixpoint: input comparison failed");
+                return Ok(());
+            }
         }
         // Blob copy is synchronous IO — run it off the async poll like every
         // other cache write (see `cache_artifact_locally`).
@@ -9606,6 +9758,14 @@ mod tests {
         events.iter().filter(|e| pred(&e.kind)).count()
     }
 
+    /// How many times `addr` started executing in `events`.
+    fn executions(events: &[BuildEvent], addr: &str) -> usize {
+        count_kind(
+            events,
+            |e| matches!(e, BuildEventKind::ExecuteStart { addr: a, .. } if a == addr),
+        )
+    }
+
     /// Resolve `addr` with a fresh event-collecting `RequestState`, then drop the
     /// state (closing the sender) and drain every emitted event.
     async fn resolve_collecting_events(
@@ -11266,6 +11426,16 @@ mod tests {
     fn engine_with_home_fs(
         targets: Vec<pluginstatictarget::Target>,
     ) -> anyhow::Result<(Arc<Engine>, tempfile::TempDir)> {
+        engine_with_home_fs_with(targets, |_, _| {})
+    }
+
+    /// [`engine_with_home_fs`], with `configure` run over the engine and the
+    /// workspace root before the engine is shared — for a test-only hook that
+    /// needs `&mut Engine`.
+    fn engine_with_home_fs_with(
+        targets: Vec<pluginstatictarget::Target>,
+        configure: impl FnOnce(&mut Engine, &std::path::Path),
+    ) -> anyhow::Result<(Arc<Engine>, tempfile::TempDir)> {
         let root = tempdir()?;
         let mut engine = Engine::new(Config {
             parallelism: None,
@@ -11280,6 +11450,7 @@ mod tests {
         })?;
         let provider = pluginstatictarget::Provider::new(targets)?;
         engine.register_provider(move |_| Box::new(provider))?;
+        configure(&mut engine, root.path());
         Ok((Arc::new(engine), root))
     }
 
@@ -11880,6 +12051,164 @@ mod tests {
         );
         // The tree is unchanged by the no-op second run.
         assert_eq!(std::fs::read(pkg_dir.join("in.txt"))?, b"HELLO\n");
+        Ok(())
+    }
+
+    /// The transform of [`fixpoint_hit`] over every `*.txt` in the package:
+    /// uppercase, exactly one trailing newline, idempotent.
+    const UPPERCASE_TXT: &str = "for f in *.txt; do \
+        printf '%s\\n' \"$(tr a-z A-Z < \"$f\")\" > \"$f.tmp\" && mv \"$f.tmp\" \"$f\"; \
+        done";
+
+    /// A hook for [`Engine::set_in_place_written_hook`] that runs `edit` on the
+    /// first write-back only: the next run's write-back (a cache hit still
+    /// reconciles the tree) must not re-apply the edit under test.
+    fn once_after_write_back(
+        edit: impl Fn() + Send + Sync + 'static,
+    ) -> impl Fn(&Addr) + Send + Sync + 'static {
+        let fired = std::sync::atomic::AtomicBool::new(false);
+        move |_| {
+            if !fired.swap(true, Ordering::SeqCst) {
+                edit();
+            }
+        }
+    }
+
+    /// A file that appears under an in_place target's input glob after the
+    /// write-back guard ran and before the fixpoint recompute re-read the tree
+    /// is folded into the recomputed key, although the revision stored under
+    /// that key never processed it. Stored, every later run would hit it and
+    /// never format the new file (#544). So no fixpoint is stored: the next run
+    /// executes, and formats it.
+    #[tokio::test]
+    async fn no_fixpoint_when_an_input_appears_before_the_recompute() -> anyhow::Result<()> {
+        let (engine, root) = engine_with_home_fs_with(
+            vec![codegen_run_target(
+                "//pkg:fmt",
+                "in_place",
+                &["*.txt"],
+                UPPERCASE_TXT,
+            )],
+            |engine, root| {
+                let new = root.join("pkg/new.txt");
+                engine.set_in_place_written_hook(once_after_write_back(move || {
+                    std::fs::write(&new, b"hello").expect("write new.txt");
+                }));
+            },
+        )?;
+        let pkg_dir = root.path().join("pkg");
+        std::fs::create_dir_all(&pkg_dir)?;
+        std::fs::write(pkg_dir.join("a.txt"), b"hello")?;
+
+        let addr = hmodel::htaddr::parse_addr("//pkg:fmt")?;
+        let (first, ev1) = resolve_collecting_events(&engine, &addr).await;
+        first?;
+        assert_eq!(executions(&ev1, "//pkg:fmt"), 1, "{ev1:?}");
+        assert_eq!(std::fs::read(pkg_dir.join("a.txt"))?, b"HELLO\n");
+        assert_eq!(
+            std::fs::read(pkg_dir.join("new.txt"))?,
+            b"hello",
+            "new.txt landed after the write-back, unformatted"
+        );
+
+        // The tree now hashes to the key run 1 recomputed. Only a stored
+        // fixpoint could make this run a hit.
+        let (second, ev2) = resolve_collecting_events(&engine, &addr).await;
+        second?;
+        assert_eq!(
+            executions(&ev2, "//pkg:fmt"),
+            1,
+            "run 2 hit a fixpoint keyed over a file run 1 never processed: {ev2:?}"
+        );
+        assert_eq!(std::fs::read(pkg_dir.join("new.txt"))?, b"HELLO\n");
+        Ok(())
+    }
+
+    /// Same window, different edit: a file the write-back left alone (already
+    /// formatted, so its bytes were not rewritten) is edited. The recomputed key
+    /// covers the edit; the revision under it holds the pre-edit bytes. Stored,
+    /// the next run would hit it and its write-back would put those bytes back
+    /// over the edit. So no fixpoint is stored: the next run executes, and
+    /// formats the edit instead of reverting it.
+    #[tokio::test]
+    async fn no_fixpoint_when_an_unwritten_input_changes_before_the_recompute() -> anyhow::Result<()>
+    {
+        let (engine, root) = engine_with_home_fs_with(
+            vec![codegen_run_target(
+                "//pkg:fmt",
+                "in_place",
+                &["*.txt"],
+                UPPERCASE_TXT,
+            )],
+            |engine, root| {
+                let b = root.join("pkg/b.txt");
+                engine.set_in_place_written_hook(once_after_write_back(move || {
+                    std::fs::write(&b, b"changed").expect("edit b.txt");
+                }));
+            },
+        )?;
+        let pkg_dir = root.path().join("pkg");
+        std::fs::create_dir_all(&pkg_dir)?;
+        std::fs::write(pkg_dir.join("a.txt"), b"hello")?;
+        // Already at the fixpoint: the write-back finds identical bytes and
+        // leaves it alone.
+        std::fs::write(pkg_dir.join("b.txt"), b"WORLD\n")?;
+
+        let addr = hmodel::htaddr::parse_addr("//pkg:fmt")?;
+        let (first, ev1) = resolve_collecting_events(&engine, &addr).await;
+        first?;
+        assert_eq!(executions(&ev1, "//pkg:fmt"), 1, "{ev1:?}");
+        assert_eq!(std::fs::read(pkg_dir.join("a.txt"))?, b"HELLO\n");
+        assert_eq!(
+            std::fs::read(pkg_dir.join("b.txt"))?,
+            b"changed",
+            "the edit landed after the write-back"
+        );
+
+        let (second, ev2) = resolve_collecting_events(&engine, &addr).await;
+        second?;
+        assert_eq!(
+            executions(&ev2, "//pkg:fmt"),
+            1,
+            "run 2 hit a fixpoint keyed over an edit run 1 never saw: {ev2:?}"
+        );
+        assert_eq!(
+            std::fs::read(pkg_dir.join("b.txt"))?,
+            b"CHANGED\n",
+            "the edit must be formatted, not reverted to the revision's bytes"
+        );
+        Ok(())
+    }
+
+    /// The converse: a file the write-back *created* is not an edit from
+    /// outside. The revision holds it, so the recomputed key describes the
+    /// revision and the fixpoint is stored — the next run is a hit.
+    #[tokio::test]
+    async fn fixpoint_covers_a_file_the_write_back_created() -> anyhow::Result<()> {
+        let (engine, root) = engine_with_home_fs(vec![codegen_run_target(
+            "//pkg:fmt",
+            "in_place",
+            &["*.txt"],
+            &format!("{UPPERCASE_TXT} && printf 'GEN\\n' > gen.txt"),
+        )])?;
+        let pkg_dir = root.path().join("pkg");
+        std::fs::create_dir_all(&pkg_dir)?;
+        std::fs::write(pkg_dir.join("a.txt"), b"hello")?;
+
+        let addr = hmodel::htaddr::parse_addr("//pkg:fmt")?;
+        let (first, ev1) = resolve_collecting_events(&engine, &addr).await;
+        first?;
+        assert_eq!(executions(&ev1, "//pkg:fmt"), 1, "{ev1:?}");
+        assert_eq!(std::fs::read(pkg_dir.join("a.txt"))?, b"HELLO\n");
+        assert_eq!(std::fs::read(pkg_dir.join("gen.txt"))?, b"GEN\n");
+
+        let (second, ev2) = resolve_collecting_events(&engine, &addr).await;
+        second?;
+        assert_eq!(
+            executions(&ev2, "//pkg:fmt"),
+            0,
+            "a file the write-back created must not cost the fixpoint: {ev2:?}"
+        );
         Ok(())
     }
 
@@ -13737,13 +14066,6 @@ mod tests {
                 events.push(ev);
             }
             (res, events)
-        }
-
-        fn executions(events: &[BuildEvent], addr: &str) -> usize {
-            count_kind(
-                events,
-                |e| matches!(e, BuildEventKind::ExecuteStart { addr: a, .. } if a == addr),
-            )
         }
 
         fn forced() -> ResultOptions {
