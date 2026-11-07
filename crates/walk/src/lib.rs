@@ -291,6 +291,14 @@ fn check_pattern<'t, P: wax::Pattern<'t>>(pattern: P) -> Result<(), wax::BuildEr
     pattern.try_into().map(drop).map_err(Into::into)
 }
 
+/// Whether wax accepts `pattern` as a glob, without compiling it: the same
+/// answer as `wax::Glob::new(pattern).is_ok()` short of the regex size limit,
+/// at a fraction of the cost. For a caller that validates one pattern but
+/// compiles a different string, such as a part of it.
+pub fn check_glob(pattern: &str) -> Result<(), wax::BuildError> {
+    check_pattern(pattern)
+}
+
 /// Compiles glob patterns into one `wax::Any`. An empty set yields an `Any` that
 /// matches nothing.
 fn compile_any<'a>(patterns: impl Iterator<Item = &'a str>) -> anyhow::Result<Arc<Any<'static>>> {

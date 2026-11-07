@@ -92,3 +92,41 @@ async fn swapping_two_globbed_files_contents_reruns_the_consumer() -> anyhow::Re
     );
     Ok(())
 }
+
+/// The go provider's source glob, through the real engine: rooted at the
+/// package (`<pkg>/**/*`) with its `.go`/module-file excludes. The fs driver
+/// compiles only the part past the literal prefix and matches it against the
+/// path with the prefix stripped, so this pins that the split is invisible: a
+/// near-miss sibling (`pkgx`), a same-named directory deeper in the tree
+/// (`other/pkg`) and excluded files stay out, and nested files stay in.
+#[tokio::test]
+async fn package_rooted_glob_sources_exactly_its_own_tree() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_file("pkg/a.txt", "a");
+    ws.write_file("pkg/sub/deep/b.txt", "b");
+    ws.write_file("pkg/inner/e.txt", "e");
+    ws.write_file("pkg/x.go", "package x");
+    ws.write_file("pkg/go.mod", "module x");
+    ws.write_file("pkgx/c.txt", "c");
+    ws.write_file("other/pkg/d.txt", "d");
+    ws.write_build_file(
+        "pkg",
+        r#"
+target(
+    name = "t",
+    driver = "bash",
+    deps = {"src": [glob("**/*", exclude = ["**/*.go", "**/go.mod", "**/go.sum", "BUILD"])]},
+    out = "out.txt",
+    run = 'for f in $SRC_SRC; do echo "${f##*/pkg/}"; done | sort > $OUT',
+)
+"#,
+    );
+
+    let res = ws.run("//pkg:t").await?;
+    assert_eq!(
+        common::artifact_string(&res),
+        "a.txt\ninner/e.txt\nsub/deep/b.txt\n",
+        "a package-rooted glob must source exactly its own tree, minus its excludes"
+    );
+    Ok(())
+}
