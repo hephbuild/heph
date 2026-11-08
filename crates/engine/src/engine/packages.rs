@@ -184,6 +184,8 @@ impl Engine {
             let key = format!("{}:{}", provider.name, prefix);
 
             async move {
+                // A package walk can reach the codegen index: open it first.
+                self.open_codegen_index(rs).await?;
                 rs.data
                     .mem_packages
                     .once(

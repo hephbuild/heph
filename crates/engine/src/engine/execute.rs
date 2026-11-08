@@ -42,6 +42,8 @@ impl Engine {
             .get(&spec.driver)
             .ok_or_else(|| anyhow::anyhow!("driver not found: {}", spec.driver))
             .cloned()?;
+        // A target run can reach the codegen index (the fs driver's lookups).
+        self.open_codegen_index(&rs).await?;
         // The backstop for a direct `result_addr` on an entrypoint: it runs
         // only through `Engine::invoke`, never in a sandbox (D30, I8).
         if def.target.entrypoint.is_some() {

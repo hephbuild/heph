@@ -44,6 +44,14 @@ pub struct PluginInit {
     pub skip_globs: Vec<String>,
     /// Shared cross-run filesystem-walk cache for tree-walking plugins.
     pub walker: Arc<hwalk::CachedWalker>,
+    /// This checkout's codegen file index, the engine's one strong `Arc`.
+    /// Built before any plugin (nothing opened, no disk access); the engine
+    /// opens its db, if one exists, in the opening step at the start of the
+    /// first request that can reach a reader, before any BUILD evaluation or
+    /// target run, so a lookup finds it open. A lookup that somehow ran first
+    /// would open it itself (`CodegenIndex::snapshot` opens a db that
+    /// appeared), so the order is a cost, never a correctness, matter.
+    pub codegen_index: Arc<hwalk::codegen_index::CodegenIndex>,
     /// The engine's runtime — what an in-process plugin's memoizers spawn
     /// their computations on. Handed to the plugin, never discovered by it
     /// (a cdylib plugin uses its own runtime instead; this field serves the
@@ -214,6 +222,12 @@ pub struct Engine {
     /// Shared cross-run filesystem-walk cache (separate `fswalk.db`), handed to
     /// tree-walking plugins via [`PluginInit`].
     pub(crate) walker: Arc<hwalk::CachedWalker>,
+    /// This checkout's codegen file index (see [`PluginInit::codegen_index`]).
+    pub(crate) codegen_index: Arc<hwalk::codegen_index::CodegenIndex>,
+    /// Set once the opening step has run: [`Engine::open_codegen_index`].
+    pub(crate) codegen_index_opened: tokio::sync::OnceCell<()>,
+    /// The codegen index's target, section and import locks.
+    pub(crate) codegen_locks: crate::engine::codegen_lock::CodegenLocks,
 
     pub(crate) providers: Vec<Arc<Provider>>,
     pub providers_by_name: HashMap<String, Arc<Provider>>,
@@ -784,6 +798,15 @@ impl Engine {
         let walker = Arc::new(hwalk::CachedWalker::open(
             &home.join("cache").join("fswalk.db"),
         ));
+        // Nothing is opened here: the first request's opening step opens the
+        // db if it exists (`open_codegen_index`); nothing ever creates it but
+        // the first commit that needs one.
+        let codegen_index = Arc::new(hwalk::codegen_index::CodegenIndex::unopened(
+            &cfg.root,
+            &home,
+            Arc::new(hwalk::codegen_index::RealFs::new(Arc::clone(&walker))),
+        ));
+        let codegen_locks = crate::engine::codegen_lock::CodegenLocks::new(cfg.lock_backend, &home);
 
         // D12: the cpu capacity comes from the same `parallelism` as everything
         // else here; memory is read on the first admission (`EnginePools`).
@@ -818,6 +841,9 @@ impl Engine {
             #[cfg(any(test, feature = "test-support"))]
             codegen_written_hook: None,
             walker,
+            codegen_index,
+            codegen_index_opened: tokio::sync::OnceCell::new(),
+            codegen_locks,
             providers: vec![],
             providers_by_name: HashMap::new(),
             drivers: vec![],
@@ -1024,9 +1050,43 @@ impl Engine {
             skip_dirs: self.skip_dirs(),
             skip_globs: self.skip_globs(),
             walker: self.walker.clone(),
+            codegen_index: Arc::clone(&self.codegen_index),
             runtime: self.runtime.clone(),
             functions: Arc::clone(&self.function_slot),
         }
+    }
+
+    /// This checkout's codegen file index.
+    pub fn codegen_index(&self) -> &Arc<hwalk::codegen_index::CodegenIndex> {
+        &self.codegen_index
+    }
+
+    /// The opening step of the codegen index: once per engine, at the start
+    /// of the first request that can reach a reader (a provider call that may
+    /// evaluate BUILD files, a target run, a write-back). Opens this
+    /// checkout's db if it exists, on the blocking pool, under `rs`'s cancel
+    /// token; never creates, imports or walks. A newer, corrupt or unreadable
+    /// db fails the request, naming the file. A cancelled or failed step
+    /// leaves the cell unset, so the next request tries again. After the
+    /// first success this is one atomic load.
+    pub(crate) async fn open_codegen_index(&self, rs: &RequestState) -> anyhow::Result<()> {
+        if self.codegen_index_opened.initialized() {
+            return Ok(());
+        }
+        self.codegen_index_opened
+            .get_or_try_init(|| async {
+                let index = Arc::clone(&self.codegen_index);
+                let open = hcore::blocking::run(move || index.open_existing());
+                tokio::select! {
+                    biased;
+                    () = hcore::hasync::Cancellable::cancelled(rs.ctoken()) => {
+                        Err(anyhow::Error::new(hplugin::error::CancelledError))
+                    }
+                    r = open => r.map(drop).context("opening the codegen index"),
+                }
+            })
+            .await
+            .map(drop)
     }
 
     /// The targets' last-failure slots under `<home>/failures/`.

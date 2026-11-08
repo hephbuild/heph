@@ -155,18 +155,38 @@ impl CodegenIndex {
         fs: Arc<dyn IndexFs>,
         opts: IndexOptions,
     ) -> Result<Self> {
-        let db_path = db_path(root, home);
-        let store = OnceLock::new();
-        if exists(&db_path)? {
-            drop(store.set(Store::open(&db_path, &opts.store)?));
+        let index = Self::unopened_with(root, home, fs, opts);
+        if exists(&index.db_path)? {
+            drop(
+                index
+                    .store
+                    .set(Store::open(&index.db_path, &index.opts.store)?),
+            );
         }
-        Ok(Self {
+        Ok(index)
+    }
+
+    /// This checkout's index with nothing opened: no disk access at all. The
+    /// engine builds it at construction, so plugins get the `Arc` through
+    /// `PluginInit`, and opens the db with [`Self::open_existing`] in the
+    /// first request's opening step, before any reader runs.
+    pub fn unopened(root: &Path, home: &Path, fs: Arc<dyn IndexFs>) -> Self {
+        Self::unopened_with(root, home, fs, IndexOptions::default())
+    }
+
+    pub fn unopened_with(
+        root: &Path,
+        home: &Path,
+        fs: Arc<dyn IndexFs>,
+        opts: IndexOptions,
+    ) -> Self {
+        Self {
             root: root.to_path_buf(),
             gitignore: root.join(".gitignore"),
-            db_path,
+            db_path: db_path(root, home),
             env: Arc::new(LookupEnv::new(root.to_path_buf(), fs)),
             opts,
-            store,
+            store: OnceLock::new(),
             state: RwLock::new(State::default()),
             flight: Mutex::new(()),
             section: Mutex::new(SectionCache {
@@ -180,7 +200,14 @@ impl CodegenIndex {
             hook: Mutex::new(None),
             #[cfg(test)]
             fault: Mutex::new(None),
-        })
+        }
+    }
+
+    /// Open this checkout's db if it exists (and is not open yet): one stat
+    /// when there is none. Never creates, imports or walks. `true` when a db
+    /// is open afterwards.
+    pub fn open_existing(&self) -> Result<bool> {
+        Ok(self.store_or_late_open()?.is_some())
     }
 
     pub fn root(&self) -> &Path {

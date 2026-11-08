@@ -28,6 +28,7 @@ pub mod approval;
 pub mod diag;
 pub mod execrunner_host;
 pub use approval::{ApprovalHandler, ApprovalNotice, ApprovalRequest};
+pub mod codegen_lock;
 pub mod credential;
 pub mod credential_store;
 mod cwd;
