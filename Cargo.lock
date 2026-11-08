@@ -8575,6 +8575,7 @@ dependencies = [
  "unicode-case-mapping",
  "unicode-normalization",
  "wax",
+ "xattr",
  "xxhash-rust",
 ]
 

@@ -271,7 +271,7 @@ pub struct PendingSettled {
 /// The current bytes at `abs` hashed the way the row records them, fresh and
 /// uncached: a file's content hash, a symlink's target. `None` when nothing
 /// of the row's kind is there.
-fn fresh_row_hash(
+pub(super) fn fresh_row_hash(
     fs: &dyn IndexFs,
     abs: &Path,
     kind: RowKind,
@@ -287,7 +287,7 @@ fn fresh_row_hash(
     })
 }
 
-fn record_of(hash: String, st: &FileStat, written_at_ns: i64) -> Record {
+pub(super) fn record_of(hash: String, st: &FileStat, written_at_ns: i64) -> Record {
     Record {
         hash,
         size: st.size,
@@ -314,17 +314,17 @@ pub const CLOCK_PROBE: &str = ".clock";
 /// probe cannot be compared with its clock and gets the wall clock minus
 /// [`RECORD_RACY_SLACK_NS`] instead, which keeps it racy: always hashed. A
 /// settle that records nothing never writes the probe.
-struct FsClock<'a> {
+pub(super) struct FsClock<'a> {
     index: &'a CodegenIndex,
     probe: Option<FileStat>,
 }
 
 impl<'a> FsClock<'a> {
-    fn new(index: &'a CodegenIndex) -> Self {
+    pub(super) fn new(index: &'a CodegenIndex) -> Self {
         Self { index, probe: None }
     }
 
-    fn written_at(&mut self, st: &FileStat) -> Result<i64> {
+    pub(super) fn written_at(&mut self, st: &FileStat) -> Result<i64> {
         let probe = match self.probe {
             Some(p) => p,
             None => {
@@ -357,7 +357,7 @@ impl CodegenIndex {
             .with_context(|| format!("reading the clock probe {}", probe.display()))
     }
 
-    fn require_store(&self) -> Result<&Store> {
+    pub(super) fn require_store(&self) -> Result<&Store> {
         self.open_store()?.with_context(|| {
             format!(
                 "no codegen index at {}: a write-back's caller creates it \

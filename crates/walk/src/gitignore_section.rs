@@ -12,7 +12,7 @@ use hmodel::htaddr::{Addr, parse_addr};
 /// are owned by heph and rewritten on every run; everything outside is
 /// preserved verbatim.
 pub const BEGIN_MARKER: &str =
-    "# BEGIN heph-generated (managed by `heph tool gen-gitignore` — do not edit)";
+    "# BEGIN heph-generated (managed by `heph tool codegen gitignore` — do not edit)";
 pub const END_MARKER: &str = "# END heph-generated";
 
 /// Stable prefix of [`BEGIN_MARKER`]. Detection matches on this rather than the
@@ -97,6 +97,10 @@ pub struct ParsedSection {
     pub present: bool,
     /// The section's lines, in file order (BEGIN line excluded).
     pub lines: Vec<SectionLine>,
+    /// The section is present and its BEGIN line is not today's
+    /// [`BEGIN_MARKER`] text (an older heph's, found by
+    /// [`BEGIN_MARKER_PREFIX`]): stale until `codegen gitignore` rewrites it.
+    pub old_marker: bool,
     /// What the parse noticed and recovered from: a malformed section (read as
     /// none), a second BEGIN, a non-UTF-8 line (skipped). The caller decides
     /// how to surface them.
@@ -172,6 +176,9 @@ pub fn parse_section_bytes(existing: &[u8]) -> ParsedSection {
         }
         if line.starts_with(BEGIN_MARKER_PREFIX) {
             begins += 1;
+            if begins == 1 {
+                out.old_marker = line != BEGIN_MARKER;
+            }
             if begins == 2 {
                 out.warnings.push(format!(
                     ".gitignore line {line_no}: a second BEGIN marker inside the managed section; \
@@ -317,5 +324,18 @@ mod tests {
         let p = parse_section_bytes(text.as_bytes());
         let foreign: Vec<bool> = p.lines.iter().map(SectionLine::is_foreign).collect();
         assert_eq!(foreign, vec![true, true, true, false]);
+    }
+
+    #[test]
+    fn an_older_begin_text_is_found_and_flagged_old() {
+        let old = "# BEGIN heph-generated (managed by `heph tool gen-gitignore` — do not edit)";
+        let p = parse_section_bytes(format!("{old}\n# //p:gen\n/p/a\n{END_MARKER}\n").as_bytes());
+        assert!(p.present);
+        assert!(p.old_marker);
+        assert_eq!(patterns(&p), vec!["/p/a"]);
+
+        let p = parse_section_bytes(format!("{BEGIN_MARKER}\r\n/p/a\r\n{END_MARKER}\r\n").as_bytes());
+        assert!(p.present);
+        assert!(!p.old_marker, "CRLF is trimmed before the comparison");
     }
 }

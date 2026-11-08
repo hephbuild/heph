@@ -696,7 +696,14 @@ fn apply_migrations(conn: &Connection, from: i64, steps: &[&str]) -> Result<()> 
 /// onto `db_path`, fsync the directory. No reader ever sees a partial db, and
 /// nothing replaces `<home>/codegen/` itself, so another checkout's db in a
 /// shared home is untouched.
-pub fn create(db_path: &Path, _import: &ImportLockGuard) -> Result<bool> {
+pub fn create(db_path: &Path, import: &ImportLockGuard) -> Result<bool> {
+    create_with_rows(db_path, import, &[])
+}
+
+/// [`create`], with `rows` committed into the temp db before the rename (the
+/// import's first db): a reader sees the db with all of them or no db.
+/// `false`, with nothing written, when the db already exists.
+pub fn create_with_rows(db_path: &Path, _import: &ImportLockGuard, rows: &[Row]) -> Result<bool> {
     let dir = db_path
         .parent()
         .with_context(|| format!("the codegen index {} has no directory", db_path.display()))?;
@@ -707,7 +714,7 @@ pub fn create(db_path: &Path, _import: &ImportLockGuard) -> Result<bool> {
         return Ok(false);
     }
     let tmp = dir.join(tmp_name());
-    let built = build_fresh(&tmp).and_then(|()| {
+    let built = build_fresh(&tmp, rows).and_then(|()| {
         std::fs::File::open(&tmp)
             .and_then(|f| f.sync_all())
             .with_context(|| format!("syncing {}", tmp.display()))?;
@@ -739,12 +746,35 @@ fn tmp_name() -> String {
     format!("{TMP_PREFIX}{}-{nanos:x}-{seq}.db", std::process::id())
 }
 
-fn build_fresh(tmp: &Path) -> Result<()> {
-    let conn = Connection::open(tmp)
+fn build_fresh(tmp: &Path, rows: &[Row]) -> Result<()> {
+    let mut conn = Connection::open(tmp)
         .with_context(|| format!("creating the codegen index {}", tmp.display()))?;
     set_wal(&conn, tmp)?;
     apply_migrations(&conn, 0, MIGRATIONS)
         .with_context(|| format!("initialising the codegen index {}", tmp.display()))?;
+    if !rows.is_empty() {
+        let tx = conn
+            .transaction()
+            .with_context(|| format!("starting the first write to {}", tmp.display()))?;
+        let generation = tx
+            .query_row(
+                "UPDATE meta SET generation = generation + 1 WHERE id = 0 RETURNING generation",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .with_context(|| format!("bumping the generation of {}", tmp.display()))?;
+        let mut txn = WriteTxn {
+            tx,
+            generation: from_sql_u64(generation),
+            tombstones: Vec::new(),
+        };
+        for row in rows {
+            txn.put(row)?;
+        }
+        txn.tx
+            .commit()
+            .with_context(|| format!("committing the first write to {}", tmp.display()))?;
+    }
     conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
         .with_context(|| format!("checkpointing the codegen index {}", tmp.display()))?;
     // The last connection's close checkpoints again and deletes `-wal` and

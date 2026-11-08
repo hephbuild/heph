@@ -24,6 +24,8 @@
 //! - [`write`]: a `copy` write-back's protocol around the engine's
 //!   byte-mover: step 1 without a lock, steps 2 and 4 under the target's
 //!   codegen lock, and a command's settling of pending rows.
+//! - [`import`]: `heph tool codegen import`'s scan of the older heph's xattrs,
+//!   and its create-or-merge into the db.
 //!
 //! Locking: walk does not depend on `hlock` (it pulls in `plugin` and
 //! `core`). The engine takes the flocks at [`CodegenLockPaths`] with `hlock`'s
@@ -33,6 +35,7 @@
 
 pub mod fold;
 pub mod fs;
+pub mod import;
 mod index;
 pub mod lookup;
 pub mod paths;

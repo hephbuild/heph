@@ -166,6 +166,11 @@ impl Section {
         self.parsed.present
     }
 
+    /// The section's BEGIN line is an older heph's text.
+    pub fn old_marker(&self) -> bool {
+        self.parsed.old_marker
+    }
+
     pub fn lines(&self) -> &[SectionLine] {
         &self.parsed.lines
     }
