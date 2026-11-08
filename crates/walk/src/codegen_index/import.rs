@@ -292,6 +292,13 @@ fn verifies(row: &Row, s: &Stamped) -> bool {
     row.kind == s.kind && row.record.as_ref().is_some_and(|r| r.hash == s.hash)
 }
 
+/// Whether another target owns `row` and still claims its file: a `written`
+/// row (or a pending one, refused separately) that only its owner's lock
+/// may change.
+fn claimed_by_other(row: &Row, addr: &str) -> bool {
+    row.addr != addr && row.state == RowState::Written
+}
+
 impl CodegenIndex {
     /// With no db: build every scanned row into a temp db and rename it onto
     /// this checkout's db file, under the import lock. `None` when a db
@@ -337,6 +344,13 @@ impl CodegenIndex {
     /// target's lock: one transaction, committed only when something changes.
     /// A pending row is never touched; a row that verifies only gains
     /// `seen_in_section` (ORed, E10).
+    ///
+    /// Only the stamped addr's lock is held, so a row another target owns
+    /// and still claims (`written`, or pending) is left alone and counted
+    /// unchanged: its owner's write-back may be between steps 2 and 4, and
+    /// an xattr an older heph left is weaker evidence than its record. A
+    /// row another target merely remembers (`imported`, `dropped`) is
+    /// taken over: the stamp on the file is the newer word.
     pub fn import_merge(&self, guard: &TargetLockGuard, files: &[Stamped]) -> Result<ImportCounts> {
         let store = self.require_store()?;
         let addr = guard.addr();
@@ -344,7 +358,9 @@ impl CodegenIndex {
         let mut changes: Vec<(&Stamped, Option<Row>)> = Vec::new();
         for s in files {
             match store.row(&s.path)? {
-                Some(r) if r.pending_hash.is_some() => counts.unchanged += 1,
+                Some(r) if r.pending_hash.is_some() || claimed_by_other(&r, addr) => {
+                    counts.unchanged += 1;
+                }
                 Some(r) if verifies(&r, s) => {
                     counts.unchanged += 1;
                     if s.seen_in_section && !r.seen_in_section {
@@ -371,7 +387,7 @@ impl CodegenIndex {
                 // moved the row since the check above.
                 let current = txn.row(&s.path)?;
                 match current {
-                    Some(r) if r.pending_hash.is_some() => {}
+                    Some(r) if r.pending_hash.is_some() || claimed_by_other(&r, addr) => {}
                     Some(mut r) if verifies(&r, s) => {
                         if s.seen_in_section && !r.seen_in_section {
                             r.seen_in_section = true;
@@ -633,6 +649,46 @@ mod tests {
             }
         );
         assert_eq!(w.generation(), g, "a second run commits nothing");
+    }
+
+    /// The merge holds only the stamped addr's lock: another target's
+    /// `written` row is its owner's, whatever the stale xattr says, while a
+    /// row it only remembers (`imported`, `dropped`) is taken over.
+    #[test]
+    fn import_merge_never_replaces_another_targets_written_row() {
+        let w = ws();
+        w.section(&["/p"]);
+        for p in ["p/w.go", "p/i.go", "p/d.go"] {
+            w.write(p, b"x");
+        }
+        let written = w.recorded("p/w.go", "//p:other");
+        let mut imported = w.recorded("p/i.go", "//p:other");
+        imported.state = RowState::Imported;
+        let mut dropped = w.recorded("p/d.go", "//p:other");
+        dropped.state = RowState::Dropped;
+        w.put(&[written.clone(), imported, dropped]);
+        let x = FakeXattr::default();
+        for p in ["p/w.go", "p/i.go", "p/d.go"] {
+            // Bytes no row verifies: the merge would record each one anew.
+            w.write(p, b"stamped");
+            x.stamp(w.abs(p), b"//p:gen");
+        }
+        let c = import(&w, &x);
+        assert_eq!(
+            c,
+            ImportCounts {
+                recorded: 2,
+                unchanged: 1
+            }
+        );
+        let w_row = w.db_row("p/w.go").unwrap();
+        assert_eq!(w_row.addr, "//p:other");
+        assert_eq!(w_row.state, RowState::Written);
+        assert_eq!(w_row.seen_in_section, written.seen_in_section, "not touched");
+        for p in ["p/i.go", "p/d.go"] {
+            let r = w.db_row(p).unwrap();
+            assert_eq!((r.addr.as_str(), r.state), ("//p:gen", RowState::Imported), "{p}");
+        }
     }
 
     #[test]
