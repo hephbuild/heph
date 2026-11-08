@@ -318,30 +318,56 @@ pub enum FileMode {
     CopyOutput,
 }
 
+/// What the fs target over a path does with it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum FileSource {
+    /// Reads the file.
+    Read,
+    /// Zero artifacts. `warning` is the unrecorded-line warning, set the
+    /// first time in a run: the caller logs it ([`FileWarning::log`]) from
+    /// its own task, not from the blocking job this runs on, so it carries
+    /// the run's span and subscriber.
+    Excluded { warning: Option<FileWarning> },
+}
+
+/// The warning for an fs `file` input of an unrecorded section match (E14).
+#[derive(Debug, PartialEq, Eq)]
+pub struct FileWarning {
+    path: String,
+    line_no: usize,
+    message: String,
+}
+
+impl FileWarning {
+    pub fn log(&self) {
+        tracing::warn!(path = self.path, line = self.line_no, "{}", self.message);
+    }
+}
+
 /// Whether the fs target over `path` (root-relative, normalised) reads it.
-/// `Ok(false)` is zero artifacts; an error is a [`CodegenFileError`].
+/// An error is a [`CodegenFileError`].
 pub fn file_is_source(
     cg: &FsCodegen,
     root: &Path,
     path: &str,
     mode: FileMode,
     request_id: Option<&str>,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<FileSource> {
     let Some(index) = cg.index.as_deref() else {
-        return Ok(true);
+        return Ok(FileSource::Read);
     };
     let Some(rel) = normalize_rel(root, Path::new(path)) else {
-        return Ok(true);
+        return Ok(FileSource::Read);
     };
     let snap = index.snapshot().context_codegen()?;
     let st = snap
         .status(&rel, &LookupMeta::point(false))
         .with_context_path(path)?;
     if !st.kind.is_excluded() {
-        return Ok(true);
+        return Ok(FileSource::Read);
     }
     if mode == FileMode::CopyOutput {
-        return Ok(false);
+        return Ok(FileSource::Excluded { warning: None });
     }
     if let Some(row) = st.row {
         return Err(CodegenFileError {
@@ -360,20 +386,19 @@ pub fn file_is_source(
     let ex = Excluded::new(path, &st);
     report(cg, request_id, std::slice::from_ref(&ex));
     let line = st.line().and_then(|i| snap.section().line(i));
-    if let Some(line) = line.filter(|l| !l.is_foreign())
-        && let Some(addr) = &line.entry.addr
-        && cg
-            .report
-            .first_in_run(request_id, &format!("unrecorded\0{path}"))
-    {
-        tracing::warn!(
-            path,
-            line = line.line_no,
-            "{}",
-            unrecorded_message(path, line.line_no, &line.entry.pattern, &addr.format())
-        );
-    }
-    Ok(false)
+    let warning = line
+        .filter(|l| !l.is_foreign())
+        .and_then(|line| line.entry.addr.as_ref().map(|addr| (line, addr)))
+        .filter(|_| {
+            cg.report
+                .first_in_run(request_id, &format!("unrecorded\0{path}"))
+        })
+        .map(|(line, addr)| FileWarning {
+            path: path.to_owned(),
+            line_no: line.line_no,
+            message: unrecorded_message(path, line.line_no, &line.entry.pattern, &addr.format()),
+        });
+    Ok(FileSource::Excluded { warning })
 }
 
 /// Report what a read excluded: one `CodegenExcluded` per path per run, the

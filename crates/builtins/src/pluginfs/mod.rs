@@ -1179,17 +1179,19 @@ fn file_artifacts(
     path: &str,
     codegen: (&FsCodegen, codegen::FileMode),
     request_id: &str,
-) -> anyhow::Result<Vec<OutputArtifact>> {
+) -> anyhow::Result<(Vec<OutputArtifact>, Option<codegen::FileWarning>)> {
     let abs = root.join(path);
 
     // A path resolving into a `.heph*` dir (engine-internal artifact)
     // resolves to nothing.
     if resolves_into_heph_dir(&abs) {
-        return Ok(vec![]);
+        return Ok((vec![], None));
     }
     let (cg, mode) = codegen;
-    if !codegen::file_is_source(cg, root, path, mode, Some(request_id))? {
-        return Ok(vec![]);
+    if let codegen::FileSource::Excluded { warning } =
+        codegen::file_is_source(cg, root, path, mode, Some(request_id))?
+    {
+        return Ok((vec![], warning));
     }
 
     // Content hash + exec bit via the shared walker (cross-run cached).
@@ -1213,7 +1215,7 @@ fn file_artifacts(
     // `glob()` that matched it (see `hwalk::fs_entry_hashout`).
     let hashout = hwalk::fs_entry_hashout(path, &fh.hashout);
 
-    Ok(vec![OutputArtifact {
+    let artifact = OutputArtifact {
         group: "".to_string(),
         name,
         r#type: Type::Output,
@@ -1226,7 +1228,8 @@ fn file_artifacts(
             passthrough: true,
         }),
         hashout,
-    }])
+    };
+    Ok((vec![artifact], None))
 }
 
 pub struct Driver {
@@ -1441,12 +1444,15 @@ impl hplugin::driver::Driver for Driver {
                     codegen::FileMode::Strict
                 };
                 let request_id = req.request_id.clone();
-                let artifacts = hcore::blocking::run(
+                let (artifacts, warning) = hcore::blocking::run(
                     enclose::enclose!((self.walker => walker, self.codegen => cg) move || {
                         file_artifacts(&walker, &root, &path, (&cg, mode), &request_id)
                     }),
                 )
                 .await?;
+                if let Some(warning) = warning {
+                    warning.log();
+                }
 
                 Ok(RunResponse {
                     artifacts,
