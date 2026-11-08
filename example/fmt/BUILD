@@ -30,8 +30,9 @@ target(
 )
 
 # Copy codegen — emits a NEW, generated file into the source tree. Unlike
-# `in_place`, this file is NOT a tracked source: `codegen = "copy"` stamps it so
-# globs exclude it, and `heph tool gen-gitignore` adds it to the root .gitignore.
+# `in_place`, this file is NOT a tracked source: `codegen = "copy"` records it in
+# heph's codegen index, `heph tool codegen gitignore` adds it to the root
+# .gitignore, and globs exclude it (see docs/CODEGEN.md).
 # Consumers depend on the target (`//fmt:generated`), never on the raw file.
 target(
     name = "generated",
