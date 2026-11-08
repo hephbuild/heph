@@ -37,7 +37,7 @@ use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 // ---------------------------------------------------------------------------
 // Fixture
@@ -427,6 +427,44 @@ impl XattrProbe for CountingProbe {
     fn get(&self, path: &Path) -> std::io::Result<Option<Vec<u8>>> {
         self.0.fetch_add(1, Ordering::SeqCst);
         RealXattr.get(path)
+    }
+}
+
+/// A probe whose first read blocks until an async task on the test's runtime
+/// answers it, then reports `stamped` as stamped with `addr` (and nothing
+/// else). Run on that runtime's only async worker, the read would block the
+/// task that answers it: it gives up after [`HANDSHAKE_TIMEOUT`] and fails.
+struct HandshakeProbe {
+    entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    proceed: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    /// Root-relative.
+    stamped: &'static str,
+    addr: &'static str,
+}
+
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+impl XattrProbe for HandshakeProbe {
+    fn get(&self, path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+        fn poisoned<T>(_: T) -> std::io::Error {
+            std::io::Error::other("probe lock poisoned")
+        }
+        let entered = self.entered.lock().map_err(poisoned)?.take();
+        if let Some(entered) = entered {
+            // The receiver is the async task; a send to it never blocks.
+            if entered.send(()).is_err() {
+                return Err(std::io::Error::other("the answering task is gone"));
+            }
+            let proceed = self.proceed.lock().map_err(poisoned)?;
+            proceed.recv_timeout(HANDSHAKE_TIMEOUT).map_err(|e| {
+                std::io::Error::other(format!(
+                    "no async task ran while the xattr walk blocked ({e}): the walk is on the async worker"
+                ))
+            })?;
+        }
+        Ok(path
+            .ends_with(self.stamped)
+            .then(|| self.addr.as_bytes().to_vec()))
     }
 }
 
@@ -1437,50 +1475,38 @@ async fn write_back_and_import_create_db_once() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The walk runs on the blocking pool (spec: How the import runs): on a
-/// current-thread runtime, a heartbeat keeps ticking while the import hashes
-/// a large stamped file. Were the walk on the one async worker, the heartbeat
-/// would stall for the whole walk.
+/// The walk runs on the blocking pool (spec: How the import runs), shown
+/// without timing: on a current-thread runtime, the walk's first xattr read
+/// blocks until an async task spawned on that runtime answers it. On the
+/// blocking pool, the one async worker runs that task and the import
+/// completes; on the async worker, nothing could run it, the read gives up
+/// after [`HANDSHAKE_TIMEOUT`] and the import fails. Needs no xattr support:
+/// the probe stands in for the filesystem.
 #[tokio::test(flavor = "current_thread")]
 async fn codegen_import_runs_on_blocking_pool() -> anyhow::Result<()> {
     let ws = Workspace::new();
-    require_xattrs!(ws);
-    // A sparse 1 GiB file: free to create, and its hash takes a while.
-    let big = abs(&ws, "p/big.bin");
-    std::fs::create_dir_all(big.parent().context("parent")?)?;
-    std::fs::File::create(&big)?.set_len(1 << 30)?;
-    stamp(&ws, "p/big.bin", b"//p:big")?;
+    ws.write_file("p/a.txt", "aaa");
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (proceed_tx, proceed_rx) = std::sync::mpsc::channel();
+    let probe = HandshakeProbe {
+        entered: std::sync::Mutex::new(Some(entered_tx)),
+        proceed: std::sync::Mutex::new(proceed_rx),
+        stamped: "p/a.txt",
+        addr: "//p:a",
+    };
+    let engine = engine_with_probe(ws.dir.path(), Arc::new(probe))?;
 
-    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let heartbeat = tokio::spawn({
-        let done = Arc::clone(&done);
-        async move {
-            let mut max_gap = Duration::ZERO;
-            let mut last = Instant::now();
-            while !done.load(std::sync::atomic::Ordering::Acquire) {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-                let now = Instant::now();
-                max_gap = max_gap.max(now - last);
-                last = now;
-            }
-            max_gap
-        }
-    });
-    let started = Instant::now();
-    let report = import(&ws.engine).await?;
-    let took = started.elapsed();
-    done.store(true, std::sync::atomic::Ordering::Release);
-    let max_gap = heartbeat.await?;
+    // Answers the probe only once it is blocked waiting: a send before the
+    // walk would let a walk on the async worker through.
+    let answer =
+        tokio::spawn(async move { entered_rx.await.is_ok() && proceed_tx.send(()).is_ok() });
+    let report = tokio::time::timeout(HANDSHAKE_TIMEOUT * 4, import(&engine))
+        .await
+        .context("the import never finished")??;
+    assert!(answer.await?, "the walk never read an xattr");
 
     assert_eq!(report.recorded, 1, "{report:?}");
-    assert!(
-        took >= Duration::from_millis(100),
-        "the premise: the walk takes a while ({took:?})"
-    );
-    assert!(
-        max_gap * 3 < took,
-        "the async worker stalled for {max_gap:?} of a {took:?} import"
-    );
+    assert_eq!(row(&engine, "p/a.txt")?.map(|r| r.addr), Some("//p:a".into()));
     Ok(())
 }
 
