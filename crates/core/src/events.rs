@@ -498,6 +498,33 @@ pub enum BuildEventKind {
         #[serde(default)]
         bytes_removed: u64,
     },
+    /// A path the codegen index excluded from a lookup (an fs `file` target,
+    /// a glob) and that the user may have expected to see: `status` is the
+    /// index's verdict (`generated`, `modified`), `reason` why (`recorded`,
+    /// `pending`, `section`, `edited`, …), `addr` the target its row names,
+    /// if any. An older consumer reads it as [`BuildEventKind::Unknown`].
+    CodegenExcluded {
+        path: String,
+        status: String,
+        #[serde(default)]
+        reason: Option<String>,
+        #[serde(default)]
+        addr: Option<String>,
+    },
+    /// A file `addr` wrote has been edited since: excluded, and overwritten
+    /// by the next build of `addr`. Emitted once per path per run.
+    CodegenModified {
+        path: String,
+        addr: String,
+    },
+    /// `heph tool codegen import` recorded `files` stamped files and skipped
+    /// `skipped` whose stamp it could not read.
+    CodegenImported {
+        #[serde(default)]
+        files: usize,
+        #[serde(default)]
+        skipped: usize,
+    },
     /// An event kind this build of the consumer does not know.
     ///
     /// **Load-bearing for cross-version safety, not a placeholder.** Events ride

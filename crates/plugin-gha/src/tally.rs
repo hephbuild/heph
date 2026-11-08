@@ -523,6 +523,12 @@ impl Tally {
             // job summary does not render it yet.
             BuildEventKind::SelectionIncomplete { .. } => {}
 
+            // Codegen index diagnostics reach the user as log lines; the job
+            // summary does not tally them.
+            BuildEventKind::CodegenExcluded { .. }
+            | BuildEventKind::CodegenModified { .. }
+            | BuildEventKind::CodegenImported { .. } => {}
+
             // An event kind from a host newer than this plugin. Skipping it keeps
             // the rest of the stream flowing; the alternative is a decode failure,
             // which the SDK treats as end-of-stream and would silently truncate
