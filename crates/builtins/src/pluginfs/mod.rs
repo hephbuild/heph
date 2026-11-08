@@ -2284,6 +2284,102 @@ mod tests {
         assert_eq!(excluded, vec!["sub/b.rs"]);
     }
 
+    /// End of walk (codegen index spec, Snapshot): another writer commits a
+    /// pending row for `b.rs` while the glob walks. The walk classified `b.rs`
+    /// from its snapshot, taken before that commit, so it kept it as `Source`;
+    /// the end-of-walk recheck must move it to excluded.
+    ///
+    /// The commit is injected from the index's `lstat` of the recorded `a.rs`,
+    /// which only the walk's own lookup of `a.rs` makes: after the snapshot,
+    /// before the recheck, whichever of `a.rs`/`b.rs` the walk meets first.
+    #[test]
+    fn glob_reclassifies_when_generation_moves_mid_walk() {
+        use hwalk::codegen_index::{
+            FileStat, IndexFs, RealFs, Row, RowKind, StatusKind, StatusReason, Store, StoreOptions,
+            db_path,
+        };
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct CommitOnLstat {
+            inner: RealFs,
+            db: std::path::PathBuf,
+            armed: AtomicBool,
+            fired: AtomicBool,
+        }
+        impl IndexFs for CommitOnLstat {
+            fn lstat(&self, path: &std::path::Path) -> std::io::Result<FileStat> {
+                if self.armed.load(Ordering::SeqCst)
+                    && path.ends_with("a.rs")
+                    && !self.fired.swap(true, Ordering::SeqCst)
+                {
+                    // Another process's commit: its own store handle, not
+                    // published to this process's index.
+                    let store = Store::open(&self.db, &StoreOptions::default())
+                        .map_err(std::io::Error::other)?;
+                    let mut row = Row::new("b.rs", "//gen:other", RowKind::File);
+                    row.pending_hash = Some("in-flight".into());
+                    store
+                        .write(|t| t.put(&row))
+                        .map_err(std::io::Error::other)?;
+                }
+                self.inner.lstat(path)
+            }
+            fn read_link(&self, path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+                self.inner.read_link(path)
+            }
+            fn content_hash(&self, path: &std::path::Path) -> anyhow::Result<String> {
+                self.inner.content_hash(path)
+            }
+            fn fresh_hash(&self, path: &std::path::Path, x: bool) -> anyhow::Result<String> {
+                self.inner.fresh_hash(path, x)
+            }
+            fn unlink(&self, path: &std::path::Path) -> std::io::Result<()> {
+                self.inner.unlink(path)
+            }
+        }
+
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        for name in ["a.rs", "b.rs", "c.rs"] {
+            fs::write(root.join(name), name.as_bytes()).unwrap();
+        }
+        let walker = Arc::new(CachedWalker::disabled());
+        let cfs = Arc::new(CommitOnLstat {
+            inner: RealFs::new(Arc::clone(&walker)),
+            db: db_path(root, &root.join(".heph")),
+            armed: AtomicBool::new(false),
+            fired: AtomicBool::new(false),
+        });
+        let index = index_recording_over(root, "a.rs", "//gen:it", cfs.clone());
+        let cg = FsCodegen::new(index, Arc::new(NoReport));
+        let skip = Arc::new(Ignore::new(&[], &[]).unwrap());
+        let compiled = compile_glob(&skip, "t", "*.rs", &[]).unwrap();
+
+        cfs.armed.store(true, Ordering::SeqCst);
+        let (arts, mut excluded) = walk_glob(&walker, root, &compiled, &cg).unwrap();
+        assert!(
+            cfs.fired.load(Ordering::SeqCst),
+            "the walk's lookup of a.rs must have committed b.rs's row"
+        );
+
+        let names: Vec<_> = arts.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["c.rs"], "b.rs went pending mid-walk");
+        excluded.sort_by(|a, b| a.path.cmp(&b.path));
+        assert_eq!(
+            excluded.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(),
+            vec!["a.rs", "b.rs"]
+        );
+        let b = &excluded[1];
+        assert_eq!(
+            (b.kind, b.reason, b.addr.as_deref()),
+            (
+                StatusKind::Generated,
+                Some(StatusReason::Pending),
+                Some("//gen:other")
+            )
+        );
+    }
+
     /// The walk carries "resolves into a `.heph*` dir" down from each directory
     /// rather than re-deriving it per entry, so a symlink pointing into the cache
     /// must still be caught: it is the one entry kind the carried answer cannot
@@ -3639,13 +3735,20 @@ mod tests {
     /// `rel`, already on disk, is recorded as written by `addr` — through the
     /// write protocol, as the engine's `copy` write-back records it.
     fn index_recording(root: &std::path::Path, rel: &str, addr: &str) -> Arc<CodegenIndex> {
-        use hwalk::codegen_index::{
-            ImportLockGuard, Landing, LandingContent, RealFs, TargetLockGuard,
-        };
         let walker = Arc::new(CachedWalker::disabled());
-        let index = Arc::new(
-            CodegenIndex::open(root, &root.join(".heph"), Arc::new(RealFs::new(walker))).unwrap(),
-        );
+        let fs = Arc::new(hwalk::codegen_index::RealFs::new(walker));
+        index_recording_over(root, rel, addr, fs)
+    }
+
+    /// [`index_recording`] over the given filesystem.
+    fn index_recording_over(
+        root: &std::path::Path,
+        rel: &str,
+        addr: &str,
+        fs: Arc<dyn hwalk::codegen_index::IndexFs>,
+    ) -> Arc<CodegenIndex> {
+        use hwalk::codegen_index::{ImportLockGuard, Landing, LandingContent, TargetLockGuard};
+        let index = Arc::new(CodegenIndex::open(root, &root.join(".heph"), fs).unwrap());
         index
             .create_db(&ImportLockGuard::new(Box::new(())))
             .unwrap();
