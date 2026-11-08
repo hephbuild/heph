@@ -448,5 +448,7 @@ is unsupported.
   still set, so a rollback keeps excluding generated files; after one, rerun
   `heph tool codegen import`.
 - **v1.1.0** removes the xattr, `heph tool codegen import` and its hint, and
-  raises the plugin ABI (`ABI_SEMVER` and `MIN_PLUGIN_ABI`) to 0.19.0: every
-  cdylib plugin built before it must be rebuilt.
+  raises the plugin ABI (`ABI_SEMVER` and `MIN_PLUGIN_ABI`) to the next minor
+  above the ABI this release ships (0.20.0 at the time of writing), so every
+  cdylib plugin built before it, this release's included, is refused and must
+  be rebuilt.
