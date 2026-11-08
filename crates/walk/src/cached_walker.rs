@@ -176,7 +176,7 @@ pub fn file_hashout(path: &Path, x: bool) -> Result<String> {
     let file = std::fs::File::open(path)
         .with_context(|| format!("open file for hashing '{}'", path.display()))?;
     let mut reader = std::io::BufReader::new(file);
-    let mut h = Xxh3::new();
+    let mut h = ContentHasher::new();
     // Stream in chunks so large inputs never load wholesale into memory.
     let mut buf = [0u8; 64 * 1024];
     loop {
@@ -190,23 +190,37 @@ pub fn file_hashout(path: &Path, x: bool) -> Result<String> {
             h.update(chunk);
         }
     }
-    Ok(finish_content_hashout(h, x))
+    Ok(h.finish(x))
 }
 
 /// [`file_hashout`] of a file holding `bytes`, computed from memory: for a
-/// caller that has just written those bytes and must know what the file
-/// hashes to without re-reading it (a read could see a later edit instead).
-pub fn content_hashout(bytes: &[u8], x: bool) -> String {
-    let mut h = Xxh3::new();
+/// caller that has just written those bytes, or is about to, and must know
+/// what the file hashes to without re-reading it (a read could see a later
+/// edit instead). The codegen index records it as the bytes about to land.
+pub fn bytes_hashout(bytes: &[u8], x: bool) -> String {
+    let mut h = ContentHasher::new();
     h.update(bytes);
-    finish_content_hashout(h, x)
+    h.finish(x)
 }
 
-/// The one finalization [`file_hashout`] and [`content_hashout`] share, so the
-/// two cannot drift: the exec marker folded in after the content.
-fn finish_content_hashout(mut h: Xxh3, x: bool) -> String {
-    h.update(&[x as u8]);
-    format!("{:x}", h.digest())
+/// The one content hash [`file_hashout`], [`bytes_hashout`] and
+/// [`CachedWalker::file_hash`] share, so they cannot drift: the content
+/// streamed in, then the exec marker folded in after it.
+struct ContentHasher(Xxh3);
+
+impl ContentHasher {
+    fn new() -> Self {
+        Self(Xxh3::new())
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
+
+    fn finish(mut self, x: bool) -> String {
+        self.0.update(&[x as u8]);
+        format!("{:x}", self.0.digest())
+    }
 }
 
 #[cfg(unix)]
@@ -973,11 +987,11 @@ mod tests {
             .unwrap()
     }
 
-    /// `content_hashout` over bytes in memory is `file_hashout` over a file
+    /// `bytes_hashout` over bytes in memory is `file_hashout` over a file
     /// holding them, for either exec bit — including a body past one read
     /// chunk, and an empty one.
     #[test]
-    fn content_hashout_matches_file_hashout() {
+    fn bytes_hashout_matches_file_hashout() {
         let tmp = tempdir().unwrap();
         let big: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
         for (i, bytes) in [&b""[..], b"hello\n", &big].into_iter().enumerate() {
@@ -985,13 +999,13 @@ mod tests {
             std::fs::write(&f, bytes).unwrap();
             for x in [false, true] {
                 assert_eq!(
-                    content_hashout(bytes, x),
+                    bytes_hashout(bytes, x),
                     file_hashout(&f, x).unwrap(),
                     "body {i}, x={x}"
                 );
             }
         }
-        assert_ne!(content_hashout(b"a", false), content_hashout(b"a", true));
+        assert_ne!(bytes_hashout(b"a", false), bytes_hashout(b"a", true));
     }
 
     /// Opening a walker opens no database, and a walker that never walked

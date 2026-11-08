@@ -17,65 +17,15 @@ use crate::engine::discovery::Discovery;
 use crate::engine::driver::targetdef::path::{CodegenMode, Content};
 use crate::engine::query::skip_unresolvable;
 use crate::engine::request_state::RequestState;
-use hmodel::htaddr::{Addr, parse_addr};
+use hmodel::htaddr::Addr;
 use hmodel::htmatcher::{MatchResult, Matcher};
 
-/// Markers delimiting the heph-managed region. Lines between them (inclusive)
-/// are owned by heph and rewritten on every run; everything outside is
-/// preserved verbatim.
-pub const BEGIN_MARKER: &str =
-    "# BEGIN heph-generated (managed by `heph tool gen-gitignore` — do not edit)";
-pub const END_MARKER: &str = "# END heph-generated";
-
-/// Stable prefix of [`BEGIN_MARKER`]. Detection matches on this rather than the
-/// full marker so that changing the parenthetical (e.g. the command name) never
-/// orphans an already-committed section — the old block is still found and
-/// rewritten with the current [`BEGIN_MARKER`] text.
-pub const BEGIN_MARKER_PREFIX: &str = "# BEGIN heph-generated";
-
-/// Prefix marking an attribution comment line: `# //pkg:target`, rendered on its
-/// own line *above* the pattern it annotates.
-///
-/// git only treats a `#` as a comment when it is the **first** character of the
-/// line — a trailing `pattern # //pkg:target` is not a comment, it is the literal
-/// pattern `pattern # //pkg:target` (space and hash included), which matches a
-/// file of that exact name rather than `pattern`. So attribution must live on a
-/// preceding full-line comment; it round-trips through [`parse_section`].
-const COMMENT_PREFIX: &str = "# ";
-
-/// One managed `.gitignore` line: a root-anchored pattern plus the target that
-/// emits it. The target is rendered as a `# //pkg:target` comment on the line
-/// *above* the pattern so a scoped rebuild can tell which lines it owns without
-/// re-scanning the graph.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GitignoreEntry {
-    pub pattern: String,
-    /// The target whose `codegen = copy` output produces `pattern`. `None` only
-    /// for lines parsed from an existing section that lack the comment (legacy
-    /// or hand-edited) — kept verbatim so a scoped rebuild never drops them.
-    pub addr: Option<Addr>,
-}
-
-impl GitignoreEntry {
-    /// Render as gitignore text: a `# //pkg:target` attribution comment line
-    /// followed by the pattern line, or just the bare pattern when the emitting
-    /// target is unknown.
-    fn to_line(&self) -> String {
-        match &self.addr {
-            Some(addr) => format!("{COMMENT_PREFIX}{}\n{}", addr.format(), self.pattern),
-            None => self.pattern.clone(),
-        }
-    }
-
-    /// Sort key: by pattern first, then by emitting target so lines are
-    /// deterministic and dedupe-comparable.
-    fn sort_key(&self) -> (&str, String) {
-        (
-            self.pattern.as_str(),
-            self.addr.as_ref().map(Addr::format).unwrap_or_default(),
-        )
-    }
-}
+// The markers, the entry type and the one section parser live in `hwalk`, where
+// the codegen index reads the same section; re-exported so engine callers keep
+// their paths.
+pub use hwalk::gitignore_section::{
+    BEGIN_MARKER, BEGIN_MARKER_PREFIX, END_MARKER, GitignoreEntry, parse_section,
+};
 
 /// Sort, then drop exact `(pattern, addr)` duplicates so the rendered section is
 /// deterministic. Two *different* targets emitting the same path stay as two
@@ -146,72 +96,6 @@ impl Engine {
         let entries: Vec<GitignoreEntry> = per_target.into_iter().flatten().collect();
         Ok(normalize(entries))
     }
-}
-
-/// Extract the entries currently inside the heph-managed marker section of
-/// `existing`. Returns an empty vec when no section is present.
-///
-/// The section is a sequence of pattern lines, each optionally preceded by a
-/// `# //pkg:target` attribution comment on its own line. Walking is stateful: a
-/// parseable attribution comment is held and attached to the next pattern line;
-/// any other line (a bare pattern, or a comment that is not a valid target addr)
-/// is preserved verbatim as an un-attributed entry. Marker and blank lines are
-/// skipped.
-#[expect(
-    clippy::string_slice,
-    reason = "slice indices come from `find` on ASCII markers — always char-aligned"
-)]
-pub fn parse_section(existing: &str) -> Vec<GitignoreEntry> {
-    let (Some(start), Some(end)) = (
-        existing.find(BEGIN_MARKER_PREFIX),
-        existing.find(END_MARKER),
-    ) else {
-        return Vec::new();
-    };
-    if end < start {
-        return Vec::new();
-    }
-
-    let mut entries = Vec::new();
-    let mut pending: Option<Addr> = None;
-    for line in existing[start..end]
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with(BEGIN_MARKER_PREFIX))
-    {
-        if let Some(rest) = line.strip_prefix('#') {
-            // A `#` line is an attribution comment if the remainder parses as a
-            // target addr; flush any dangling pending comment as a bare line
-            // first so nothing is silently dropped, then hold this one.
-            if let Ok(addr) = parse_addr(rest.trim()) {
-                if let Some(prev) = pending.take() {
-                    entries.push(GitignoreEntry {
-                        pattern: format!("{COMMENT_PREFIX}{}", prev.format()),
-                        addr: None,
-                    });
-                }
-                pending = Some(addr);
-            } else {
-                entries.push(GitignoreEntry {
-                    pattern: line.to_string(),
-                    addr: None,
-                });
-            }
-            continue;
-        }
-        entries.push(GitignoreEntry {
-            pattern: line.to_string(),
-            addr: pending.take(),
-        });
-    }
-    // A trailing attribution comment with no following pattern is preserved.
-    if let Some(prev) = pending {
-        entries.push(GitignoreEntry {
-            pattern: format!("{COMMENT_PREFIX}{}", prev.format()),
-            addr: None,
-        });
-    }
-    entries
 }
 
 /// Merge a scoped rebuild into the existing section. Existing entries whose
@@ -308,6 +192,7 @@ pub fn render(existing: &str, entries: &[GitignoreEntry]) -> String {
 mod tests {
     use super::*;
     use crate::engine::Config;
+    use hmodel::htaddr::parse_addr;
     use hmodel::htpkg::PkgBuf;
 
     /// Bare entry (no emitting target) — renders as just the pattern.

@@ -20,6 +20,10 @@ parking_lot = "0.12"
 rustc-hash = "2"
 xxhash-rust = { version = "0.8.15", features = ["xxh3", "std"] }
 tracing = "0.1"
+hmodel = { package = "model", path = "../model" }
+ignore = "0.4"
+unicode-normalization = "0.1.26"
+unicode-case-mapping = "1"
 
 [dev-dependencies]
 tempfile = "3"

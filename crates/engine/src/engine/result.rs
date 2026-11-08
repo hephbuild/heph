@@ -938,7 +938,7 @@ fn in_place_fs_addrs(
 }
 
 /// The root-relative paths a codegen write-back moved, each mapped to the
-/// content hashout ([`hwalk::content_hashout`]) of what it wrote there, or
+/// content hashout ([`hwalk::bytes_hashout`]) of what it wrote there, or
 /// `None` for a recreated symlink. See [`Engine::materialize_codegen_tree`].
 type WrittenPaths = rustc_hash::FxHashMap<std::path::PathBuf, Option<String>>;
 
@@ -3826,7 +3826,7 @@ impl Engine {
         use crate::engine::driver::targetdef::path::CodegenMode;
 
         // The root-relative paths this call actually moved, each with the
-        // content hashout (`hwalk::content_hashout`) it now holds. Content
+        // content hashout (`hwalk::bytes_hashout`) it now holds. Content
         // writes, exec-bit reconciles and symlink recreates all count; the
         // codegen xattr does not (it is metadata, outside the `@heph/fs`
         // content+exec-bit hash). Empty therefore means the tree still hashes
@@ -4041,7 +4041,7 @@ impl Engine {
                             // the hashes then disagree, and the fixpoint check
                             // refuses — the safe outcome.
                             if moved {
-                                written.insert(path, Some(hwalk::content_hashout(&new_bytes, x)));
+                                written.insert(path, Some(hwalk::bytes_hashout(&new_bytes, x)));
                             }
                         }
                         WalkEntryKind::Symlink { target } => {
