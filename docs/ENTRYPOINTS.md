@@ -188,6 +188,8 @@ and the job keeps running with its writes to the PTY failing with EIO.
 heph run //web:dev --raw -- --port 4000
 ```
 
+The tool inherits heph's fds 0, 1 and 2, so `--raw` is transparent: it reads
+your stdin, whether a terminal, a pipe or a file, and heph reads none of it.
 stdout carries only the tool's bytes, stderr only failures, and no TUI starts.
 The exit status is the one below. An agent's stdio is usually not a terminal, so
 it would inherit without the flag too; `--raw` also drops the progress, and holds
@@ -196,9 +198,14 @@ on a terminal as well.
 With no TUI, an `approval`-gated target in the closure is refused unless you pass
 `--auto-approve`. `run` has no `--json`.
 
-On a build target, `--raw` only changes the display: the action's output is
-printed plainly, redacted as in `log.txt`, and capture, runners and the cache are
-unchanged. A cache hit prints nothing.
+### `heph run` of a build target
+
+This is about a target without `entrypoint = True`. heph builds it, and an
+entrypoint's stdin rules above do not apply.
+
+`--raw` only changes the display: the action's output is printed plainly,
+redacted as in `log.txt`, and capture, runners and the cache are unchanged. A
+cache hit prints nothing.
 
 A build target's action reads no stdin, with or without `--raw`: it gets
 `/dev/null`, whether `heph run` was given a pipe, a file or your terminal. What
