@@ -5,15 +5,17 @@
 //! - **Warm build**: rebuilding every `copy` target after a full build commits
 //!   nothing (the index db's `generation` does not move) and takes no codegen
 //!   lock (no file appears under `<home>/lock/codegen`).
-//! - **Snapshot publish**: a write-back copies the overlay only, never the
-//!   base. A write-back publishes twice (pending, then settled), and each
-//!   publish clones the overlay as it stands, so over a loaded base two
-//!   write-backs of kA and kB rows clone exactly 3 kA + kB entries. The spec's
-//!   "one target's rows per write-back" holds for the first write-back only:
-//!   the overlay accumulates until it folds at `FOLD_THRESHOLD`.
-//! - **`status` on a miss**: a microbench with 0, 100 and 5,000 section lines,
-//!   interleaved; the median at 5,000 lines must be within 1.5 x the 0-line
-//!   median.
+//! - **Snapshot publish**: a publish copies its own rows, never the base and
+//!   never the rest of the overlay (it is a persistent map). A write-back
+//!   publishes twice (pending, then settled), so over a loaded base a
+//!   write-back of k rows copies exactly 2k entries, whatever the overlay
+//!   already holds: checked for two write-backs in a row, each on its own,
+//!   with no fold and no reload.
+//! - **`status` on a miss**: a microbench with 1, 100 and 5,000 section lines,
+//!   interleaved; the median at 5,000 lines must be within 1.5 x the 1-line
+//!   median. The floor is 1 line, not 0: with no section a miss takes an
+//!   early exit (~100 ns against ~1.5 µs with any line, debug build), so a
+//!   0-line floor measures that exit, not how the section test scales.
 //!
 //! Their timed counterparts (glob, warm build, import) are Tier B scenarios
 //! in `dist.rs`, compared against N-1 by `compare`.
@@ -32,9 +34,10 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-/// Section sizes the `status` microbench measures.
-pub const STATUS_LINES: [usize; 3] = [0, 100, 5_000];
-/// The bar: the 5,000-line median over the 0-line median.
+/// Section sizes the `status` microbench measures. The smallest is 1, not 0:
+/// an empty section skips the section test entirely (see the module docs).
+pub const STATUS_LINES: [usize; 3] = [1, 100, 5_000];
+/// The bar: the 5,000-line median over the 1-line median.
 pub const STATUS_MAX_RATIO: f64 = 1.5;
 
 /// One line of the report: what was checked, what was seen, and whether it
@@ -151,20 +154,26 @@ fn package_of(addr: &str) -> Result<&str> {
         .with_context(|| format!("not a //pkg:name addr: {addr}"))
 }
 
+/// The outputs of the codegen target in `pkg`, per the manifest.
+fn rows_of(manifest: &CorpusManifest, pkg: &str) -> Result<u64> {
+    let n = manifest
+        .codegen_outputs
+        .iter()
+        .filter(|p| p.strip_prefix(pkg).is_some_and(|r| r.starts_with('/')))
+        .count();
+    u64::try_from(n).context("row count")
+}
+
 /// Over a base holding every row, write back target A then target B (both
-/// retagged so each must commit): the publishes clone A's rows and nothing
-/// else.
+/// retagged so each must commit): each write-back's two publishes copy its
+/// own rows and nothing else. B's publishes land on an overlay that already
+/// holds A's rows, so a copy of the overlay would show there.
 async fn publish(corpus: &Path, manifest: &CorpusManifest) -> Result<Check> {
     let (a, b) = match manifest.codegen_addrs.as_slice() {
         [a, b, ..] => (a.as_str(), b.as_str()),
         _ => bail!("need two codegen targets"),
     };
     let (pkg_a, pkg_b) = (package_of(a)?, package_of(b)?);
-    let rows_a = manifest
-        .codegen_outputs
-        .iter()
-        .filter(|p| p.strip_prefix(pkg_a).is_some_and(|r| r.starts_with('/')))
-        .count();
 
     let orig_a = bench_corpus::retag_codegen(corpus, pkg_a, "republished ")?;
     let orig_b = match bench_corpus::retag_codegen(corpus, pkg_b, "republished ") {
@@ -177,36 +186,31 @@ async fn publish(corpus: &Path, manifest: &CorpusManifest) -> Result<Check> {
     let measured = publish_two(corpus, a, b).await;
     restore(corpus, pkg_a, &orig_a)?;
     restore(corpus, pkg_b, &orig_b)?;
-    let (stats_before, stats) = measured?;
+    let [before, after_a, after_b] = measured?;
 
-    let rows_b = manifest
-        .codegen_outputs
-        .iter()
-        .filter(|p| p.strip_prefix(pkg_b).is_some_and(|r| r.starts_with('/')))
-        .count();
+    let (rows_a, rows_b) = (rows_of(manifest, pkg_a)?, rows_of(manifest, pkg_b)?);
     // A write-back publishes twice (rows marked pending, then settled), each
-    // cloning the overlay as it stands: A 0 then kA, B kA then kA + kB.
-    let expected = u64::try_from(3 * rows_a + rows_b).context("row count")?;
-    let cloned = stats.cloned_overlay_entries - stats_before.cloned_overlay_entries;
+    // copying exactly that write-back's rows.
+    let cloned_a = after_a.cloned_overlay_entries - before.cloned_overlay_entries;
+    let cloned_b = after_b.cloned_overlay_entries - after_a.cloned_overlay_entries;
+    let folds = after_b.folds - before.folds;
+    let reloads = after_b.reloads - before.reloads;
     Ok(Check {
         name: "snapshot-publish",
         detail: format!(
-            "two write-backs ({rows_a} and {rows_b} rows) over a {}-row base cloned {cloned} overlay entries, {} fold(s) (bar: exactly {expected}, the overlay at each of the 4 publishes, never the base)",
-            stats.rows_loaded,
-            stats.folds - stats_before.folds,
+            "over a {}-row base, write-back A ({rows_a} rows) copied {cloned_a} entries and B ({rows_b} rows, over A's overlay) {cloned_b}; {folds} fold(s), {reloads} reload(s) (bar: exactly 2 x each write-back's rows, no fold, no reload)",
+            before.rows_loaded,
         ),
-        ok: cloned == expected && stats.folds == stats_before.folds,
+        ok: cloned_a == 2 * rows_a && cloned_b == 2 * rows_b && folds == 0 && reloads == 0,
     })
 }
 
+/// The index stats before the first write-back, after A's and after B's.
 async fn publish_two(
     corpus: &Path,
     a: &str,
     b: &str,
-) -> Result<(
-    heph::htwalk::codegen_index::IndexStats,
-    heph::htwalk::codegen_index::IndexStats,
-)> {
+) -> Result<[heph::htwalk::codegen_index::IndexStats; 3]> {
     let e = inprocess::build_engine(corpus)?;
     let rs = e.new_state();
     e.open_codegen_index(&rs).await?;
@@ -217,10 +221,11 @@ async fn publish_two(
     build(&e, &Matcher::Addr(parse_addr(a)?))
         .await
         .with_context(|| format!("write back {a}"))?;
+    let after_a = e.codegen_index().stats();
     build(&e, &Matcher::Addr(parse_addr(b)?))
         .await
         .with_context(|| format!("write back {b}"))?;
-    Ok((before, e.codegen_index().stats()))
+    Ok([before, after_a, e.codegen_index().stats()])
 }
 
 fn restore(corpus: &Path, pkg: &str, src: &str) -> Result<()> {
@@ -254,7 +259,7 @@ fn median(v: &mut [f64]) -> f64 {
 }
 
 /// `Snapshot::status` of paths no row records and no section line matches
-/// (a walk's common case), over a section of 0, 100 and 5,000 lines. No db,
+/// (a walk's common case), over a section of 1, 100 and 5,000 lines. No db,
 /// so no fold map: the miss is the row probe plus the section test, and the
 /// bar is on how the section test scales.
 async fn status_miss(iters: usize, rounds: usize) -> Result<Check> {
@@ -300,12 +305,12 @@ async fn status_miss(iters: usize, rounds: usize) -> Result<Check> {
         }
     }
     let medians: Vec<f64> = per_ns.iter_mut().map(|v| median(v)).collect();
-    let (zero, top) = match medians.as_slice() {
-        [zero, .., top] => (*zero, *top),
+    let (floor, top) = match medians.as_slice() {
+        [floor, .., top] => (*floor, *top),
         _ => bail!("no samples"),
     };
-    let ratio = if zero > 0.0 {
-        top / zero
+    let ratio = if floor > 0.0 {
+        top / floor
     } else {
         f64::INFINITY
     };
@@ -315,7 +320,7 @@ async fn status_miss(iters: usize, rounds: usize) -> Result<Check> {
         .map(|(lines, ns)| format!("{lines} lines {ns:.1}"))
         .collect();
     let detail = format!(
-        "median ns per miss: {}; 5000/0 = {ratio:.2}x (bar: <= {STATUS_MAX_RATIO}x; {rounds} interleaved rounds of {iters})",
+        "median ns per miss: {}; 5000/1 = {ratio:.2}x (bar: <= {STATUS_MAX_RATIO}x; {rounds} interleaved rounds of {iters})",
         per_size.join(", ")
     );
     Ok(Check {

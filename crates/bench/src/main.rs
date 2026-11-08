@@ -38,8 +38,8 @@ enum Cmd {
     Compare(CompareArgs),
     /// The codegen index's exact bars on a codegen corpus, on this build's
     /// own engine (no baseline): a warm build commits nothing and takes no
-    /// lock, a write-back clones only the overlay, and `status` on a miss
-    /// scales with the section. Exits non-zero when one fails.
+    /// lock, a publish copies only its own rows, and `status` on a miss
+    /// stays flat as the section grows. Exits non-zero when one fails.
     CheckCodegen(CheckCodegenArgs),
 }
 
