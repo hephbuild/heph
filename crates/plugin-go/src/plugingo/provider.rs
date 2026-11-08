@@ -3333,28 +3333,20 @@ impl ProviderInner {
             return Ok(None);
         };
 
-        let go_files = self.package_go_files_on_disk(addr.package.as_str())?;
-        if go_files.is_empty() {
+        // The sources themselves are read through an fs glob target (see
+        // `driver_format::format_sources_addr`), so which files are sources is
+        // the fs driver's answer, generated files excluded. This only decides
+        // whether there is a target at all, and deliberately excludes nothing: a
+        // package of only generated `.go` files gets a `format` that stages
+        // nothing and writes nothing.
+        if !self.package_has_go_files_on_disk(addr.package.as_str())? {
             return Ok(None);
         }
-        let src_addrs: Vec<String> = go_files
-            .iter()
-            .map(|f| {
-                let rel = if addr.package.as_str().is_empty() {
-                    f.clone()
-                } else {
-                    format!("{}/{}", addr.package.as_str(), f)
-                };
-                pluginfs::file_addr(&rel).format()
-            })
-            .collect();
 
         let govet_addr = self.govet_tool_addr()?;
         let params = crate::plugingo::driver_format::FormatParams {
             addr: addr.clone(),
             govet_addr: &govet_addr,
-            src_addrs: &src_addrs,
-            go_files: &go_files,
             config_addr: Some(&config_addr),
         };
         let target_spec = if addr.name == "format" {
@@ -3365,15 +3357,6 @@ impl ProviderInner {
         Ok(Some(GetResponse { target_spec }))
     }
 
-    /// Every `.go` file directly in `pkg`'s directory, sorted, as basenames.
-    ///
-    /// Build constraints are deliberately not applied — see [`Self::get_format`].
-    /// Codegen-stamped files are skipped: they are owned by their generator (an
-    /// `fs:file` over one resolves to nothing anyway), and declaring one as a
-    /// `codegen = in_place` output of `format` would collide with the generator's
-    /// own output. Files reached through a `.heph*` cache dir are skipped for the
-    /// same reason they are in the fs provider — they are engine artifacts, not
-    /// source.
     /// Whether the package directory holds any `_test.go` file, read through the
     /// shared walk cache so an unchanged tree costs no `readdir`. Drives the
     /// `-test` decision for a first-party `_golist` (see
@@ -3398,7 +3381,13 @@ impl ProviderInner {
         }
     }
 
-    fn package_go_files_on_disk(&self, pkg: &str) -> anyhow::Result<Vec<String>> {
+    /// Whether `pkg`'s directory directly holds any `.go` file — the existence
+    /// test behind "no Go files, no `format` target".
+    ///
+    /// Build constraints are deliberately not applied — see [`Self::get_format`].
+    /// Nothing is excluded either, generated files included: which files are
+    /// sources is the fs glob's answer when the target runs, not this one's.
+    fn package_has_go_files_on_disk(&self, pkg: &str) -> anyhow::Result<bool> {
         let dir = if pkg.is_empty() {
             self.workspace_root.clone()
         } else {
@@ -3406,31 +3395,20 @@ impl ProviderInner {
         };
         let entries = match std::fs::read_dir(&dir) {
             Ok(e) => e,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(e) => return Err(anyhow::Error::new(e).context(format!("read go pkg dir {dir:?}"))),
         };
-        let mut files: Vec<String> = Vec::new();
         for entry in entries {
             let entry = entry.with_context(|| format!("read go pkg dir entry in {dir:?}"))?;
-            let path = entry.path();
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            if !name.ends_with(".go") {
-                continue;
+            let is_go = entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.ends_with(".go"));
+            if is_go && entry.path().is_file() {
+                return Ok(true);
             }
-            if !path.is_file() {
-                continue;
-            }
-            if pluginfs::has_codegen_xattr(&path) || pluginfs::resolves_into_heph_dir(&path) {
-                continue;
-            }
-            files.push(name.to_string());
         }
-        // `read_dir` order is filesystem-defined; sort so the spec (and therefore
-        // the target's input hash) is reproducible.
-        files.sort();
-        Ok(files)
+        Ok(false)
     }
 
     /// Spec for the user-facing `lint-check` (gate) and `lint` (fixer) targets:

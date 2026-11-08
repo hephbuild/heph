@@ -43,6 +43,35 @@ const GOVET_TOOL_GROUP: &str = "govet_tool";
 /// in a way the tool's own input hash does not already capture.
 const GO_FORMAT_FORMAT_VERSION: u32 = 1;
 
+/// The output group the fix driver declares its rewritten sources under.
+const SRC_OUTPUT_GROUP: &str = "src";
+
+/// The glob naming a package's `.go` sources: every `.go` file directly in
+/// `pkg`'s directory. One function builds both the `""` dep group's fs glob
+/// ([`format_sources_addr`]) and the fix driver's `in_place` output, so the
+/// engine's in-place guard pairs the input with the output by addr.
+///
+/// `pkg` is a literal path, so its glob metacharacters are escaped with wax's
+/// own [`wax::escape`] — the fs walker compiles this pattern with the same wax.
+/// `wax::escape` leaves `\` alone (to wax it is the escape character, not a
+/// metacharacter), so a `\` in `pkg` is escaped first; otherwise it would escape
+/// whatever follows it instead of matching itself.
+pub fn format_sources_pattern(pkg: &str) -> String {
+    if pkg.is_empty() {
+        return "*.go".to_string();
+    }
+    let backslashes = pkg.replace('\\', "\\\\");
+    format!("{}/*.go", wax::escape(&backslashes))
+}
+
+/// The `@heph/fs` glob target staging a package's `.go` sources. Going through
+/// the fs driver, rather than listing the directory in the provider, gives
+/// `format` the fs driver's answer about generated files: a `codegen = "copy"`
+/// output written back into the package is not a source and is not staged.
+pub fn format_sources_addr(pkg: &str) -> Addr {
+    hbuiltins::pluginfs::glob_addr(&format_sources_pattern(pkg), &[])
+}
+
 /// Locate the single staged `heph-govet` binary and the optional config path.
 fn govet_bin_and_config(
     req: &ManagedRunRequest<'_, '_>,
@@ -120,12 +149,9 @@ async fn govet_failed(
 #[derive(Spec)]
 struct GoFormatSpec {
     /// Dependencies, grouped by name → target addresses. The default (`""`) group
-    /// is the package `.go` sources; `govet_tool` the binary; `config` the
-    /// optional `.golangci.yml`.
+    /// is the package `.go` sources (one fs glob, see [`format_sources_addr`]);
+    /// `govet_tool` the binary; `config` the optional `.golangci.yml`.
     deps: HashMap<String, Vec<String>>,
-    /// Declared outputs (fix driver only): the `.go` files, written back in
-    /// place. Absent for the check driver.
-    out: HashMap<String, Vec<String>>,
     /// Exec runner this tool runs under: a target address producing a
     /// `runner.json`, so the tool runs inside a described environment (a devenv
     /// shell, a container) instead of on the bare host. Absent, or the literal
@@ -256,28 +282,18 @@ impl ManagedDriver for GoFormatDriver {
         )?;
         inputs.extend(runner_input);
 
-        let outputs: Vec<Output> = spec
-            .out
-            .iter()
-            .map(|(group, paths)| Output {
-                group: group.clone(),
-                paths: paths
-                    .iter()
-                    .map(|p| {
-                        let full_path = if pkg_str.is_empty() {
-                            p.clone()
-                        } else {
-                            format!("{pkg_str}/{p}")
-                        };
-                        TPath {
-                            content: Content::FilePath(full_path),
-                            codegen_tree: CodegenMode::InPlace,
-                            collect: true,
-                        }
-                    })
-                    .collect(),
-            })
-            .collect();
+        // The rewritten sources, written back in place: the same glob the `""`
+        // group stages, so the output covers exactly what was staged (generated
+        // files are never staged, so never collected or written back) and the
+        // engine's in-place guard pairs it with that input by addr.
+        let outputs = vec![Output {
+            group: SRC_OUTPUT_GROUP.to_string(),
+            paths: vec![TPath {
+                content: Content::Glob(format_sources_pattern(pkg_str)),
+                codegen_tree: CodegenMode::InPlace,
+                collect: true,
+            }],
+        }];
 
         let hash = {
             let mut h = DebugHasher::new(Xxh3Default::new(), || {
@@ -502,10 +518,6 @@ pub struct FormatParams<'a> {
     pub addr: Addr,
     /// `build` addr of the `heph-govet` binary (host factors).
     pub govet_addr: &'a Addr,
-    /// Source file target addresses (the `""` dep group).
-    pub src_addrs: &'a [String],
-    /// Source basenames (declared `in_place` outputs; fix target only).
-    pub go_files: &'a [String],
     /// `.golangci.yml` addr → `config` dep group. `None` → gofmt default.
     pub config_addr: Option<&'a Addr>,
 }
@@ -515,7 +527,7 @@ fn base_deps(p: &FormatParams) -> BTreeMap<String, Value> {
     let mut deps: BTreeMap<String, Value> = BTreeMap::new();
     deps.insert(
         String::new(),
-        Value::List(p.src_addrs.iter().cloned().map(Value::String).collect()),
+        str_one(&format_sources_addr(p.addr.package.as_str())),
     );
     deps.insert(GOVET_TOOL_GROUP.to_string(), str_one(p.govet_addr));
     if let Some(cfg) = p.config_addr {
@@ -529,13 +541,6 @@ pub fn build_format_spec(p: FormatParams) -> TargetSpec {
     let deps = base_deps(&p);
     let mut config: HashMap<String, Value> = HashMap::new();
     config.insert("deps".to_string(), Value::Map(deps.into_iter().collect()));
-    config.insert(
-        "out".to_string(),
-        Value::Map(HashMap::from([(
-            "src".to_string(),
-            Value::List(p.go_files.iter().cloned().map(Value::String).collect()),
-        )])),
-    );
     TargetSpec {
         addr: p.addr,
         driver: listed::DRIVER_FORMAT.to_string(),
@@ -587,8 +592,6 @@ mod tests {
         FormatParams {
             addr: addr("format"),
             govet_addr: g,
-            src_addrs: &[],
-            go_files: &[],
             config_addr: cfg,
         }
     }
@@ -666,6 +669,138 @@ mod tests {
         assert!(!input.runtime, "must not reach the sandbox");
     }
 
+    async fn parse_fix(spec: TargetSpec) -> TargetDef {
+        let ct = hcore::hasync::StdCancellationToken::new();
+        GoFormatDriver::new()
+            .parse(
+                ParseRequest {
+                    request_id: "t".to_string(),
+                    target_spec: std::sync::Arc::new(spec),
+                },
+                &ct,
+            )
+            .await
+            .expect("parse")
+            .target_def
+    }
+
+    /// The def hash is part of every `format` / `format-check` cache key, and
+    /// moving it invalidates every one of them. Reading sources through an fs
+    /// glob (instead of one `file` per source) and declaring a `Glob` output
+    /// (instead of one `FilePath` per source) must leave it where it was, so a
+    /// package whose source set is unchanged keeps hitting its old entry. The
+    /// literals are the hashes from before that change.
+    #[tokio::test]
+    async fn def_hash_did_not_move_with_the_glob_sources() {
+        let fix = parse_fix(build_format_spec(params(&govet(), None))).await;
+        assert_eq!(String::from_utf8_lossy(&fix.hash), "d1dd927ed529f768");
+
+        let ct = hcore::hasync::StdCancellationToken::new();
+        let check = GoFormatCheckDriver::new()
+            .parse(
+                ParseRequest {
+                    request_id: "t".to_string(),
+                    target_spec: std::sync::Arc::new(build_format_check_spec(params(
+                        &govet(),
+                        None,
+                    ))),
+                },
+                &ct,
+            )
+            .await
+            .expect("parse")
+            .target_def;
+        assert_eq!(String::from_utf8_lossy(&check.hash), "8cd045b8efcef9bd");
+    }
+
+    /// The fix driver's one `in_place` output is the very glob its `""` group
+    /// stages — what lets the engine's in-place guard and fixpoint check pair
+    /// the input with the output.
+    #[tokio::test]
+    async fn fix_output_is_the_staged_glob() {
+        let spec = build_format_spec(params(&govet(), None));
+        let def = parse_fix(spec).await;
+
+        let [output] = def.outputs.as_slice() else {
+            panic!("expected one output, got {:?}", def.outputs.len());
+        };
+        let [path] = output.paths.as_slice() else {
+            panic!("expected one output path, got {}", output.paths.len());
+        };
+        assert!(
+            matches!(&path.content, Content::Glob(p) if p == "mylib/*.go"),
+            "{:?}",
+            path.content
+        );
+        assert_eq!(path.codegen_tree, CodegenMode::InPlace);
+
+        let sources: Vec<String> = def
+            .inputs
+            .iter()
+            .filter(|i| i.origin_id.starts_with("dep||"))
+            .map(|i| i.r#ref.r#ref.format())
+            .collect();
+        assert_eq!(sources, vec![format_sources_addr("mylib").format()]);
+    }
+
+    /// Adversarial packages: every wax metacharacter (`? * $ : < > ( ) [ ] { } ,`)
+    /// and `\`, which `wax::escape` leaves alone, must match itself, and only
+    /// the trailing `*.go` may stay a wildcard.
+    #[test]
+    fn format_sources_pattern_escapes_the_package() {
+        assert_eq!(format_sources_pattern(""), "*.go");
+        assert_eq!(format_sources_pattern("a/b"), "a/b/*.go");
+        assert_eq!(
+            format_sources_pattern("we[i]rd/{x}<y>"),
+            r"we\[i\]rd/\{x\}\<y\>/*.go"
+        );
+        assert_eq!(format_sources_pattern(r"back\slash"), r"back\\slash/*.go");
+        assert_eq!(
+            format_sources_pattern("a?b*c$d:e(f),g"),
+            r"a\?b\*c\$d\:e\(f\)\,g/*.go"
+        );
+
+        // The escaped pattern is a valid wax glob that matches the literal
+        // package's sources and nothing that only its unescaped form would.
+        for pkg in ["we[i]rd/{x}<y>", "a?b*c$d:e(f),g", "plain"] {
+            let pattern = format_sources_pattern(pkg);
+            let glob = wax::Glob::new(&pattern)
+                .unwrap_or_else(|e| panic!("{pattern:?} must compile: {e}"));
+            use wax::Program as _;
+            assert!(
+                glob.is_match(format!("{pkg}/a.go").as_str()),
+                "{pattern:?} must match {pkg}/a.go"
+            );
+            assert!(
+                !glob.is_match(format!("{pkg}/sub/a.go").as_str()),
+                "{pattern:?} must not reach a subpackage"
+            );
+            assert!(
+                !glob.is_match(format!("{pkg}/a.txt").as_str()),
+                "{pattern:?} must match only .go files"
+            );
+        }
+        let pattern = format_sources_pattern("we[i]rd");
+        let glob = wax::Glob::new(&pattern).expect("compile");
+        use wax::Program as _;
+        assert!(
+            !glob.is_match("wei/a.go"),
+            "`[i]` must be a literal, not a character class"
+        );
+
+        // Known gap: wax 0.7 has no spelling for a literal `\` — its literal
+        // parser accepts `\` only before a metacharacter, and its character
+        // classes exclude `\` too — so a package path holding one cannot be
+        // globbed, and its `format` target fails at the fs glob's parse. Go
+        // itself refuses `\` in an import path. Pinned so a wax that learns to
+        // spell it turns this red and the gap gets closed.
+        let pattern = format_sources_pattern(r"back\slash");
+        assert!(
+            wax::Glob::new(&pattern).is_err(),
+            "wax now compiles {pattern:?}: a `\\` package can be globbed, close the gap"
+        );
+    }
+
     fn dep_groups(s: &TargetSpec) -> Vec<String> {
         match s.config.get("deps").unwrap() {
             Value::Map(m) => m.keys().cloned().collect(),
@@ -693,17 +828,11 @@ mod tests {
     #[test]
     fn fix_driver_name_and_outputs() {
         let g = govet();
-        let s = build_format_spec(FormatParams {
-            go_files: &["a.go".to_string()],
-            src_addrs: &["//mylib:a.go".to_string()],
-            ..params(&g, None)
-        });
+        let s = build_format_spec(params(&g, None));
         assert_eq!(s.driver, "go.format");
-        // Declares src outputs (parse marks them in_place).
-        match s.config.get("out").unwrap() {
-            Value::Map(m) => assert!(m.iter().any(|(k, _)| k == "src")),
-            _ => panic!("out not a map"),
-        }
+        // The outputs are the driver's, derived from the package at parse
+        // (see `fix_output_is_the_staged_glob`), not a list the spec carries.
+        assert!(!s.config.contains_key("out"));
         assert!(dep_groups(&s).contains(&"govet_tool".to_string()));
     }
 

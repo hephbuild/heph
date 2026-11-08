@@ -27,6 +27,9 @@ enclose = "1"
 parking_lot = "0.12"
 borsh = { version = "1.6.1", features = ["derive"] }
 glob = "0.3"
+# `wax::escape` for the `format` sources glob: the fs walker compiles that
+# pattern with this same wax, so its escaping is the authority.
+wax = "0.7"
 xxhash-rust = { version = "0.8.15", features = ["xxh3", "std"] }
 tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "io-util", "process", "macros", "sync", "fs"] }
 # Hermetic Go toolchain provisioning: download (hfetch), checksum (sha2),

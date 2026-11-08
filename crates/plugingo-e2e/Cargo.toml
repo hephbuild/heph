@@ -17,7 +17,7 @@ htestkit = { package = "testkit", path = "../testkit" }
 hcore = { package = "core", path = "../core" }
 hmodel = { package = "model", path = "../model" }
 hplugin = { package = "plugin", path = "../plugin" }
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync"] }
 anyhow = "1"
 tempfile = "3"
 futures = "0.3"
