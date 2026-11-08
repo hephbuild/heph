@@ -503,9 +503,11 @@ async fn glob_after_write_back_in_same_process_excludes_without_section() -> any
     Ok(())
 }
 
-/// BUILD `file()` builds the addr only: evaluation succeeds with an index
-/// every lookup of which fails, and the def hash is the same with and without
-/// rows.
+/// BUILD `file()` builds the addr only: the def hash is the same with and
+/// without rows, and evaluation succeeds with an index every lookup of which
+/// fails. The failing index is a root `.gitignore` that is a directory: every
+/// snapshot reads that file before it answers anything, so every lookup (the
+/// fs `file` and glob targets', shown failing here) errors.
 #[tokio::test]
 async fn file_builtin_never_reads_the_index() -> anyhow::Result<()> {
     let ws = Workspace::new();
@@ -533,6 +535,10 @@ async fn file_builtin_never_reads_the_index() -> anyhow::Result<()> {
     std::fs::create_dir(ws.dir.path().join(".gitignore"))?;
     let broken = ws.reopen()?;
     let lookup = fs_file(&broken, "p/gen.txt").await;
+    assert!(
+        format!("{:#}", lookup.expect_err("the index is unreadable")).contains("codegen index"),
+    );
+    let lookup = glob(&broken, "p/*.txt").await;
     assert!(
         format!("{:#}", lookup.expect_err("the index is unreadable")).contains("codegen index"),
     );
