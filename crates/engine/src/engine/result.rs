@@ -4075,6 +4075,11 @@ impl Engine {
         }))
         .await?;
         let (written, report, outside_section, no_section_hint) = outcome;
+        // Recording the flag twice is harmless; printing it twice is not.
+        let no_section_hint = no_section_hint
+            && !self
+                .codegen_no_section_hint_printed
+                .swap(true, std::sync::atomic::Ordering::Relaxed);
 
         for path in &report.overwritten_edits {
             let path = String::from_utf8_lossy(path);

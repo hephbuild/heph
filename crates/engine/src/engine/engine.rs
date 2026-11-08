@@ -228,6 +228,10 @@ pub struct Engine {
     pub(crate) codegen_index_opened: tokio::sync::OnceCell<()>,
     /// The codegen index's target, section and import locks.
     pub(crate) codegen_locks: crate::engine::codegen_lock::CodegenLocks,
+    /// The no-section write-back hint was printed by this engine. `meta`
+    /// records it for later runs, but two write-backs of one run can both
+    /// read it unset before either commits; this prints it once.
+    pub(crate) codegen_no_section_hint_printed: std::sync::atomic::AtomicBool,
 
     pub(crate) providers: Vec<Arc<Provider>>,
     pub providers_by_name: HashMap<String, Arc<Provider>>,
@@ -844,6 +848,7 @@ impl Engine {
             codegen_index,
             codegen_index_opened: tokio::sync::OnceCell::new(),
             codegen_locks,
+            codegen_no_section_hint_printed: std::sync::atomic::AtomicBool::new(false),
             providers: vec![],
             providers_by_name: HashMap::new(),
             drivers: vec![],
