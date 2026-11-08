@@ -516,6 +516,14 @@ impl CodegenIndex {
     }
 }
 
+/// Whether the db's row at `row.path` is still the one step 2 read: the
+/// same owner and the same pending mark.
+fn still_ours(store: &Store, row: &Row) -> Result<bool> {
+    Ok(store
+        .row(&row.path)?
+        .is_some_and(|now| now.addr == row.addr && now.pending_hash == row.pending_hash))
+}
+
 enum LeftoverFate {
     /// Unlinked (or already gone): delete the row by `(path, addr)`.
     Delete,
@@ -666,9 +674,18 @@ impl WriteBack {
             // J5: only a `written` row's file, only on a fresh hash equal to
             // its record (a pending mark the file proves is settled into the
             // record first, under this lock), only inside a current output.
+            //
+            // The row was read at step 2 under this target's lock only: with
+            // overlapping outputs another target may have taken the path
+            // since (marked it pending, maybe for these very bytes, so its
+            // mover skips the write). Re-read it right before the unlink and
+            // keep the file unless the row is still this target's, with the
+            // pending mark step 2 saw. The settle transaction below re-checks
+            // the addr again before it changes the row.
             if row.state == RowState::Written
                 && (is_record || is_pending)
                 && inside_current_copy_output(&row.path)
+                && still_ours(index.require_store()?, row)?
             {
                 fs.unlink(&abs)
                     .with_context(|| format!("deleting {}", abs.display()))?;
@@ -958,6 +975,31 @@ mod tests {
         w.fs.fake(&w.abs("gen/A.go"), Fake::Stat(landed));
         let r = wb.settle(&inside).unwrap();
         (w, r)
+    }
+
+    /// Overlapping outputs: after A read its leftover `gen/o` at step 2
+    /// (under A's lock only), B took the path and marked it pending for the
+    /// same bytes, so B's mover will skip the write. A's unlink would leave
+    /// B to settle a file that is gone.
+    #[test]
+    fn leftover_taken_by_another_target_since_step_2_is_not_unlinked() {
+        let w = ws();
+        run(&w, ADDR, &[("gen/a", b"a1"), ("gen/o", b"o1")]).unwrap();
+        let wb = w
+            .index
+            .begin_write_back(guard(ADDR), plan(&w, ADDR, &[("gen/a", b"a1")]).unwrap())
+            .unwrap();
+        let mut theirs = w.db_row("gen/o").unwrap();
+        theirs.addr = "//p:other".into();
+        theirs.pending_hash = Some(hash(b"o1"));
+        w.put(&[theirs.clone()]);
+        let r = wb.settle(&inside).unwrap();
+        assert!(r.deleted.is_empty(), "unlinked another target's file");
+        assert_eq!(w.read("gen/o").as_deref(), Some(&b"o1"[..]));
+        let row = w.db_row("gen/o").unwrap();
+        assert_eq!(row.addr, "//p:other");
+        assert_eq!(row.pending_hash, theirs.pending_hash);
+        assert_eq!(row.state, RowState::Written);
     }
 
     #[test]
