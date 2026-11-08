@@ -191,6 +191,12 @@ impl Scenario {
         }
     }
 
+    /// Whether a candidate rep times index lookups, and so must start from a
+    /// populated index ([`check_populated_index`]).
+    pub fn times_index_lookups(self) -> bool {
+        matches!(self, Scenario::CodegenGlobCold | Scenario::CodegenGlobWarm)
+    }
+
     fn is_codegen(self) -> bool {
         match self {
             Scenario::Cold | Scenario::FullHit | Scenario::Incremental => false,
@@ -345,7 +351,7 @@ pub const PROBE_FREE_GLOB: &str = "codegen-glob-cold-probe-free";
 pub fn measure_probe_free_glob(dist_dir: &Path, corpus: &Path) -> Result<f64> {
     // Same config and same cold start as `codegen-glob-cold`'s reps.
     let dist = Dist::locate(dist_dir)?;
-    write_codegen_config(corpus)?;
+    write_dist_codegen_config(&dist, corpus)?;
     let home = cache_dir(corpus)?;
     remove_prefixed(&home.join("cache"), "fswalk.db")?;
     let inert = InertIndex::hide(corpus, &home)?;
@@ -433,14 +439,82 @@ fn strip_section(text: &str) -> String {
     out
 }
 
+/// The codegen config with the default home (`.heph`): `check-codegen`'s,
+/// which runs one engine and has no second binary to keep apart from.
 pub(crate) fn write_codegen_config(corpus: &Path) -> Result<()> {
     std::fs::write(corpus.join(".hephconfig"), CODEGEN_CONFIG).context("write .hephconfig")
+}
+
+/// The heph home a codegen scenario gives `dist`'s binary: one per binary,
+/// so the baseline's prepare (which wipes its home) cannot delete the
+/// candidate's `<home>/codegen` db. In one shared home it did: the warmup
+/// prepares the candidate, then the baseline, and N-1 predates the index,
+/// so every candidate glob rep ran against the section with no rows. The
+/// name is under `.heph*`, which every tree walk prunes, both binaries'
+/// included.
+fn codegen_home(dist: &Dist) -> String {
+    use sha2::{Digest as _, Sha256};
+    use std::os::unix::ffi::OsStrExt as _;
+    let digest = Sha256::digest(dist.root.as_os_str().as_bytes());
+    let id: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
+    format!(".heph-bench-{id}")
+}
+
+/// The codegen config for `dist`'s binary, with its own home
+/// ([`codegen_home`]). Written before each of its prepares and reps, so
+/// `cache_dir` resolves the home of the binary about to run.
+fn write_dist_codegen_config(dist: &Dist, corpus: &Path) -> Result<()> {
+    let config = format!("{CODEGEN_CONFIG}homeDir: {}\n", codegen_home(dist));
+    std::fs::write(corpus.join(".hephconfig"), config).context("write .hephconfig")
+}
+
+/// Fail unless `dist`'s codegen index db exists and holds a settled row
+/// (recorded, not pending) for every corpus output: the state every
+/// candidate `codegen-glob-cold`/`-warm` rep must time its lookups against.
+/// Run before each such rep, outside the timed region; a probe-free rep
+/// that failed to put the db back fails the next one here.
+pub fn check_populated_index(
+    dist_dir: &Path,
+    corpus: &Path,
+    manifest: &CorpusManifest,
+) -> Result<()> {
+    let dist = Dist::locate(dist_dir)?;
+    write_dist_codegen_config(&dist, corpus)?;
+    let home = cache_dir(corpus)?;
+    check_index_rows(corpus, &home, manifest.codegen_outputs.len())
+}
+
+fn check_index_rows(corpus: &Path, home: &Path, expected: usize) -> Result<()> {
+    use heph::htwalk::codegen_index::{Store, StoreOptions, db_path};
+    let db = db_path(corpus, home);
+    if !db.is_file() {
+        bail!(
+            "no codegen index db at {}: the rep would time lookups against an empty index",
+            db.display()
+        );
+    }
+    let (_, rows) = Store::open(&db, &StoreOptions::default())
+        .and_then(|store| store.load_all())
+        .with_context(|| format!("read the codegen index {}", db.display()))?;
+    let settled = rows
+        .iter()
+        .filter(|r| r.record.is_some() && r.pending_hash.is_none())
+        .count();
+    if rows.len() != expected || settled != expected {
+        bail!(
+            "codegen index {} has {} rows ({settled} settled), the corpus has {expected} \
+             outputs: the rep would not time lookups against a populated index",
+            db.display(),
+            rows.len(),
+        );
+    }
+    Ok(())
 }
 
 /// Codegen scenarios' prepare: a wiped home and one full build of every
 /// `copy` target, which writes the files back and records (N-1: stamps) them.
 fn prepare_codegen(dist: &Dist, corpus: &Path) -> Result<()> {
-    write_codegen_config(corpus)?;
+    write_dist_codegen_config(dist, corpus)?;
     let manifest = bench_corpus::load_manifest(corpus).context("load corpus manifest")?;
     if manifest.codegen_addrs.is_empty() {
         bail!("corpus has no copy targets (generate with --codegen-files > 0)");
@@ -459,7 +533,7 @@ fn measure_codegen(
     if manifest.codegen_addrs.is_empty() {
         bail!("corpus has no copy targets (generate with --codegen-files > 0)");
     }
-    write_codegen_config(corpus)?;
+    write_dist_codegen_config(dist, corpus)?;
     match scenario {
         Scenario::CodegenGlobCold => {
             remove_prefixed(&cache_dir(corpus)?.join("cache"), "fswalk.db")?;
@@ -564,6 +638,79 @@ mod tests {
 
         assert_eq!(read(&codegen.join("db")), "rows");
         assert_eq!(read(&ignore), gitignore);
+    }
+
+    /// Two binaries get two homes, each pruned from every walk by its
+    /// `.heph` prefix, and the written config resolves `cache_dir` to the
+    /// home of the binary it was written for: a baseline prepare's wipe
+    /// cannot reach the candidate's db.
+    #[test]
+    fn each_binary_gets_its_own_home() {
+        use super::{Dist, codegen_home, write_dist_codegen_config};
+        let corpus = tempfile::tempdir().expect("tempdir");
+        let candidate = Dist {
+            root: "/dists/candidate".into(),
+        };
+        let baseline = Dist {
+            root: "/dists/baseline".into(),
+        };
+        assert_ne!(codegen_home(&candidate), codegen_home(&baseline));
+        for dist in [&candidate, &baseline] {
+            let name = codegen_home(dist);
+            assert!(name.starts_with(".heph"), "{name} is not pruned");
+            write_dist_codegen_config(dist, corpus.path()).expect("config");
+            let home = crate::inprocess::cache_dir(corpus.path()).expect("home");
+            assert_eq!(&*home, corpus.path().join(&name));
+        }
+    }
+
+    /// The check passes only on a db holding a settled row per output: no
+    /// db, too few rows, and a row still pending each fail it.
+    #[test]
+    fn index_check_wants_a_settled_row_per_output() {
+        use super::check_index_rows;
+        use heph::htwalk::codegen_index::{
+            ImportLockGuard, Record, Row, RowKind, db_path, store::create_with_rows,
+        };
+        let row = |path: &str, settled: bool| {
+            let mut row = Row::new(path.as_bytes(), "//p:gen", RowKind::File);
+            if settled {
+                row.record = Some(Record {
+                    hash: "h".into(),
+                    size: 1,
+                    mtime_ns: 1,
+                    ino: 1,
+                    dev: 1,
+                    mode: 0o100644,
+                    written_at_ns: 2,
+                });
+            } else {
+                row.pending_hash = Some("h".into());
+            }
+            row
+        };
+        let corpus = tempfile::tempdir().expect("tempdir");
+        let home = corpus.path().join(".heph-bench-x");
+        let err = check_index_rows(corpus.path(), &home, 2).expect_err("no db");
+        assert!(
+            format!("{err:#}").contains("no codegen index db"),
+            "{err:#}"
+        );
+
+        let db = db_path(corpus.path(), &home);
+        let rows = [row("p/a.txt", true), row("p/b.txt", false)];
+        create_with_rows(&db, &ImportLockGuard::new(Box::new(())), &rows).expect("create");
+        let err = check_index_rows(corpus.path(), &home, 2).expect_err("one row pending");
+        assert!(format!("{err:#}").contains("2 rows (1 settled)"), "{err:#}");
+        let err = check_index_rows(corpus.path(), &home, 3).expect_err("a row short");
+        assert!(format!("{err:#}").contains("3 outputs"), "{err:#}");
+
+        let settled = tempfile::tempdir().expect("tempdir");
+        let home = settled.path().join(".heph-bench-x");
+        let db = db_path(settled.path(), &home);
+        let rows = [row("p/a.txt", true), row("p/b.txt", true)];
+        create_with_rows(&db, &ImportLockGuard::new(Box::new(())), &rows).expect("create");
+        check_index_rows(settled.path(), &home, 2).expect("populated");
     }
 
     #[test]

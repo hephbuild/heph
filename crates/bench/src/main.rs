@@ -480,6 +480,10 @@ fn run_dist_both(args: RunDistArgs) -> Result<()> {
     let mut probe_free_ms = Vec::with_capacity(args.reps);
     for i in 0..args.reps {
         let seed = i as u64;
+        if args.scenario.times_index_lookups() {
+            dist::check_populated_index(&args.candidate_dist, &corpus, &manifest)
+                .context("the candidate's codegen index before its rep")?;
+        }
         candidate_ms.push(
             dist::measure_once(
                 &args.candidate_dist,
