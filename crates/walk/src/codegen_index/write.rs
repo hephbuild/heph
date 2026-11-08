@@ -519,6 +519,10 @@ impl CodegenIndex {
 enum LeftoverFate {
     /// Unlinked (or already gone): delete the row by `(path, addr)`.
     Delete,
+    /// The file is one of this write-back's landings under another name
+    /// (another casing on a case-folding filesystem): delete the row, never
+    /// the file, which the landing's row now records.
+    SameFileAsLanding,
     /// Keep the file; the row becomes `dropped`, its pending mark settled
     /// when the file proves it (`Some(record)`: the pending bytes landed;
     /// `clear`: the recorded bytes are there).
@@ -613,6 +617,33 @@ impl WriteBack {
             recorded.push((e, record_of(l.hash().into_owned(), &st, written_at), link));
         }
 
+        // Every landing's `(dev, ino)`, for the leftovers to be told apart
+        // from them. On APFS a dir output that produced `gen/A.go` and now
+        // produces `gen/a.go` writes into `A.go` (or skips equal bytes), so
+        // the leftover row `gen/A.go` names the file just recorded as
+        // `gen/a.go`: unlinking it on its matching hash would delete the
+        // only copy, and dropping it would leave a row at the on-disk name.
+        // The landing's row keeps the declared name, as on Linux; a lookup
+        // of the on-disk casing finds it by fold key and inode (Decision 13),
+        // so both hosts answer `Generated` for both names.
+        let landed: FxHashSet<(u64, u64)> = if self.leftovers.is_empty() {
+            FxHashSet::default()
+        } else {
+            let mut set: FxHashSet<(u64, u64)> =
+                recorded.iter().map(|(_, r, _)| (r.dev, r.ino)).collect();
+            for e in self
+                .entries
+                .iter()
+                .filter(|e| e.sel.action != EntryAction::Write)
+            {
+                let abs = root.join(rel_path(&e.landing.path));
+                if let Some(st) = lstat_opt(fs, &abs)? {
+                    set.insert((st.dev, st.ino));
+                }
+            }
+            set
+        };
+
         let mut fates: Vec<(&Row, LeftoverFate)> = Vec::with_capacity(self.leftovers.len());
         for row in &self.leftovers {
             let abs = root.join(rel_path(&row.path));
@@ -621,6 +652,13 @@ impl WriteBack {
                 fates.push((row, LeftoverFate::Delete));
                 continue;
             };
+            if landed.contains(&(st.dev, st.ino)) {
+                // Never unlinked, never dropped. A hard link a user made
+                // between a leftover and a landing lands here too: its file
+                // is kept, which is the safe direction of J5.
+                fates.push((row, LeftoverFate::SameFileAsLanding));
+                continue;
+            }
             let fresh = fresh_row_hash(fs, &abs, row.kind, Some(&st))?;
             let hash = fresh.as_ref().map(|(h, _)| h.as_str());
             let is_pending = hash.is_some() && hash == row.pending_hash.as_deref();
@@ -692,6 +730,9 @@ impl WriteBack {
                     LeftoverFate::Delete => {
                         txn.delete(&left.path, addr)?;
                         report.deleted.push(left.path.clone());
+                    }
+                    LeftoverFate::SameFileAsLanding => {
+                        txn.delete(&left.path, addr)?;
                     }
                     LeftoverFate::Drop {
                         record,
@@ -894,6 +935,65 @@ mod tests {
         let r = run(&w, ADDR, REV2).unwrap();
         assert_eq!(r.dropped, vec![b"old/x".to_vec()]);
         assert!(w.read("old/x").is_some());
+    }
+
+    /// A dir output produced `gen/A.go` and now produces `gen/a.go`. On a
+    /// case-folding filesystem the two names are one file, so the leftover
+    /// row `gen/A.go` is the landing under its old name. Staged on every host
+    /// by giving `gen/A.go` the landing's stat.
+    fn casing_rename(bytes: &[u8]) -> (Ws, SettleReport) {
+        let w = ws();
+        w.section(&["/gen"]);
+        run(&w, ADDR, &[("gen/A.go", b"x")]).unwrap();
+        let rev: Rev<'_> = &[("gen/a.go", bytes)];
+        let wb = w
+            .index
+            .begin_write_back(guard(ADDR), plan(&w, ADDR, rev).unwrap())
+            .unwrap();
+        write_bytes(&w, &wb, rev);
+        // On a case-sensitive host `gen/A.go` is a second file: give it the
+        // landing's bytes too, so a lookup hashing it reads what APFS would.
+        w.write("gen/A.go", bytes);
+        let landed = crate::codegen_index::fs::lstat(&w.abs("gen/a.go")).unwrap();
+        w.fs.fake(&w.abs("gen/A.go"), Fake::Stat(landed));
+        let r = wb.settle(&inside).unwrap();
+        (w, r)
+    }
+
+    #[test]
+    fn leftover_that_is_a_landing_under_another_casing_keeps_the_file() {
+        for bytes in [&b"x"[..], b"y"] {
+            let (w, r) = casing_rename(bytes);
+            let what = String::from_utf8_lossy(bytes);
+            assert!(r.deleted.is_empty(), "{what}: unlinked the landing");
+            assert!(r.dropped.is_empty(), "{what}: dropped the landing");
+            assert!(w.db_row("gen/A.go").is_none(), "{what}: old row kept");
+            assert_eq!(rows(&w, ADDR), [("gen/a.go".into(), RowState::Written)]);
+            assert_eq!(w.read("gen/a.go").as_deref(), Some(bytes), "{what}");
+            // Both names read as the landing, as on Linux: the row keeps the
+            // declared name, and the on-disk one is a fold hit by inode.
+            for p in ["gen/a.go", "gen/A.go"] {
+                assert_eq!(status(&w, p).0, StatusKind::Generated, "{what}: {p}");
+            }
+            assert!(plan(&w, ADDR, &[("gen/a.go", bytes)]).is_none(), "{what}");
+        }
+    }
+
+    /// The same on the real filesystem; asserts only where it folds case.
+    #[test]
+    fn casing_rename_on_the_real_fs() {
+        let w = ws();
+        run(&w, ADDR, &[("gen/A.go", b"x")]).unwrap();
+        if !w.abs("gen/a.go").exists() {
+            return; // case-sensitive: two files, covered by the test above
+        }
+        let r = run(&w, ADDR, &[("gen/a.go", b"x")]).unwrap();
+        assert!(r.deleted.is_empty(), "unlinked the only file");
+        assert_eq!(w.read("gen/a.go").as_deref(), Some(&b"x"[..]));
+        assert_eq!(rows(&w, ADDR), [("gen/a.go".into(), RowState::Written)]);
+        for p in ["gen/a.go", "gen/A.go"] {
+            assert_eq!(status(&w, p).0, StatusKind::Generated, "{p}");
+        }
     }
 
     #[test]
