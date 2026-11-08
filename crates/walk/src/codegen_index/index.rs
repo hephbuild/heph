@@ -54,7 +54,8 @@ pub struct IndexStats {
     pub rows_loaded: u64,
     /// Opens of a db that appeared after the index was opened.
     pub late_opens: u64,
-    /// Overlay entries copied by publishes.
+    /// Overlay entries copied by publishes: each publish's own rows and
+    /// tombstones, never the rest of the overlay (it is persistent).
     pub cloned_overlay_entries: u64,
     /// Overlay folds into a new base.
     pub folds: u64,
@@ -272,7 +273,8 @@ impl CodegenIndex {
     }
 
     /// Publish a commit this process made, after it committed, so this process
-    /// sees its own write without a reload. Copies only the overlay. Runs on
+    /// sees its own write without a reload. Copies only the commit's own
+    /// entries, into a persistent overlay; never the base. Runs on
     /// the writer's blocking job: past the fold threshold it folds the
     /// overlay there, inside the single-flight, never on a reader's path.
     pub fn publish(&self, generation: u64, rows: &[Row], tombstones: &[Vec<u8>]) {
@@ -677,12 +679,60 @@ mod tests {
         commit(&y, &many.iter().map(String::as_str).collect::<Vec<_>>());
         x.snapshot().unwrap();
         commit_publish(&x, &["a"]);
-        commit_publish(&x, &["b"]);
-        commit_publish(&x, &["c"]);
-        // 0, then 1, then 2 overlay entries copied: never the 100-row base.
-        assert_eq!(x.stats().cloned_overlay_entries, 3);
-        assert_eq!(x.snapshot().unwrap().rows().count(), 103);
+        commit_publish(&x, &["b", "c"]);
+        commit_publish(&x, &["d"]);
+        // Each publish copies its own entries: never the 100-row base, and
+        // never the overlay the earlier publishes built.
+        assert_eq!(x.stats().cloned_overlay_entries, 4);
+        assert_eq!(x.snapshot().unwrap().rows().count(), 104);
         assert_eq!(x.stats().reloads, 1);
+    }
+
+    /// Decision 22's bench bar at the product threshold: a run of
+    /// write-backs, one of them thousands of outputs wide, copies exactly
+    /// each publish's rows (not the overlay, which grows to the fold), and
+    /// the overlay folds once, when it passes the threshold.
+    #[test]
+    fn publish_cost_is_its_own_rows_at_the_default_threshold() {
+        let w = ws();
+        let (x, _y) = pair(&w, IndexOptions::default());
+        x.snapshot().unwrap();
+        let reloads = x.stats().reloads;
+        let publish = |target: usize, n: usize| -> usize {
+            let paths: Vec<String> = (0..n).map(|i| format!("t{target}/{i}.go")).collect();
+            let before = x.stats().cloned_overlay_entries;
+            commit_publish(&x, &paths.iter().map(String::as_str).collect::<Vec<_>>());
+            assert_eq!(
+                x.stats().cloned_overlay_entries - before,
+                n as u64,
+                "publish of target {target}: its {n} rows, nothing else"
+            );
+            n
+        };
+        // One write-back of several thousand outputs, under the threshold.
+        let mut published = publish(0, 3000);
+        assert_eq!(x.stats().folds, 0);
+        // Many small ones, until the overlay passes the threshold.
+        let mut target = 1;
+        while published <= FOLD_THRESHOLD {
+            assert_eq!(x.stats().folds, 0, "no fold at {published} rows");
+            published += publish(target, 37);
+            target += 1;
+        }
+        assert_eq!(x.stats().folds, 1, "the fold fired at {published} rows");
+        assert_eq!(
+            x.state.read().overlay_len(),
+            0,
+            "the fold took the whole overlay"
+        );
+        // Past the fold, a publish still costs its own rows.
+        for _ in 0..10 {
+            published += publish(target, 37);
+            target += 1;
+        }
+        assert_eq!(x.stats().folds, 1);
+        assert_eq!(x.snapshot().unwrap().rows().count(), published);
+        assert_eq!(x.stats().reloads, reloads, "publishes never reload");
     }
 
     #[test]

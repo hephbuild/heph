@@ -11,8 +11,9 @@
 //! held only to clone or swap; the rules for changing it live here, so they
 //! can be tested without a db:
 //!
-//! - **publish** copies only the overlay, takes the next sequence, and
-//!   advances `loaded_through` contiguously;
+//! - **publish** writes its own entries into a persistent copy of the
+//!   overlay (never a deep clone, never the base), takes the next sequence,
+//!   and advances `loaded_through` contiguously;
 //! - **reload install** replaces the base, keeps every overlay entry whose
 //!   `gen` is above the reload's generation, then advances contiguously;
 //! - **fold install** replaces the base with base + the overlay as copied at
@@ -114,17 +115,38 @@ struct OverlayEntry {
     seq: u64,
 }
 
+/// A persistent hash map: a clone is two pointer copies, an insert into a
+/// clone path-copies the trie nodes on the way to its key and shares the rest.
+type PMap<K, V> = rpds::HashTrieMapSync<K, V, rustc_hash::FxBuildHasher>;
+
 /// The rows this process published since its base.
-#[derive(Debug, Default, Clone)]
+///
+/// Both maps are persistent, so a publish costs the entries it writes and
+/// never the overlay it extends: a snapshot reading the previous overlay
+/// keeps its own root, and the new one shares every untouched node with it.
+/// A `FxHashMap` here was deep-cloned on every publish, which made a run of
+/// write-backs quadratic until the fold.
+#[derive(Default, Clone)]
 pub struct Overlay {
-    entries: FxHashMap<Vec<u8>, OverlayEntry>,
-    /// `fold → [path]` of the overlay's rows; stale like [`Base::fold`].
-    fold: FxHashMap<u64, Vec<Vec<u8>>>,
+    entries: PMap<Vec<u8>, OverlayEntry>,
+    /// `fold → [path]` of the overlay's rows; stale like [`Base::fold`]. A
+    /// bucket is the paths sharing one fold key, so copying it to push one is
+    /// a copy of a path or two, not of the overlay.
+    fold: PMap<u64, Vec<Vec<u8>>>,
+}
+
+// By hand: `FxBuildHasher` has no `Debug`.
+impl std::fmt::Debug for Overlay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map()
+            .entries(self.entries.iter().map(|(p, e)| (String::from_utf8_lossy(p), e)))
+            .finish()
+    }
 }
 
 impl Overlay {
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.entries.size()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -132,21 +154,18 @@ impl Overlay {
     }
 
     /// Add one change, unless the overlay already holds a later `gen` for
-    /// the path (publishes can arrive out of `gen` order).
-    fn put(&mut self, path: &[u8], row: Option<&Row>, generation: u64, seq: u64) {
-        if self
-            .entries
-            .get(path)
-            .is_some_and(|e| e.generation > generation)
-        {
-            return;
+    /// the path (publishes can arrive out of `gen` order). Whether it did.
+    fn put(&mut self, path: &[u8], row: Option<&Row>, generation: u64, seq: u64) -> bool {
+        let old = self.entries.get(path);
+        if old.is_some_and(|e| e.generation > generation) {
+            return false;
         }
         if let Some(row) = row
-            && !self.entries.contains_key(path)
+            && old.is_none()
         {
-            self.fold.entry(row.fold).or_default().push(path.to_vec());
+            self.index_fold(row.fold, path);
         }
-        self.entries.insert(
+        self.entries.insert_mut(
             path.to_vec(),
             OverlayEntry {
                 row: row.cloned(),
@@ -154,6 +173,13 @@ impl Overlay {
                 seq,
             },
         );
+        true
+    }
+
+    fn index_fold(&mut self, fold: u64, path: &[u8]) {
+        let mut paths = self.fold.get(&fold).cloned().unwrap_or_default();
+        paths.push(path.to_vec());
+        self.fold.insert_mut(fold, paths);
     }
 
     /// The entries `keep` selects, with their fold index.
@@ -161,9 +187,9 @@ impl Overlay {
         let mut out = Self::default();
         for (path, e) in self.entries.iter().filter(|(_, e)| keep(e)) {
             if let Some(row) = &e.row {
-                out.fold.entry(row.fold).or_default().push(path.clone());
+                out.index_fold(row.fold, path);
             }
-            out.entries.insert(path.clone(), e.clone());
+            out.entries.insert_mut(path.clone(), e.clone());
         }
         out
     }
@@ -193,27 +219,30 @@ impl State {
         self.published_above.retain(|g| *g > lt);
     }
 
-    /// Publish one commit's rows and deletions. Copies only the overlay, never
-    /// the base; returns how many entries it copied.
+    /// Publish one commit's rows and deletions. Copies only the entries it
+    /// writes, never the rest of the overlay nor the base (the overlay's
+    /// maps share every other node with the one snapshots still hold);
+    /// returns how many entries it wrote.
     pub fn publish(&mut self, generation: u64, rows: &[Row], tombstones: &[Vec<u8>]) -> usize {
         let mut overlay = Overlay::clone(&self.overlay);
-        let cloned = overlay.len();
+        let mut written = 0;
         let seq = self.next_seq;
         self.next_seq += 1;
+        let upserted: FxHashSet<&[u8]> = rows.iter().map(|r| r.path.as_slice()).collect();
         for path in tombstones {
-            if !rows.iter().any(|r| &r.path == path) {
-                overlay.put(path, None, generation, seq);
+            if !upserted.contains(path.as_slice()) {
+                written += usize::from(overlay.put(path, None, generation, seq));
             }
         }
         for row in rows {
-            overlay.put(&row.path, Some(row), generation, seq);
+            written += usize::from(overlay.put(&row.path, Some(row), generation, seq));
         }
         self.overlay = Arc::new(overlay);
         if generation > self.loaded_through {
             self.published_above.insert(generation);
         }
         self.advance();
-        cloned
+        written
     }
 
     /// Install a reload's base: keep every overlay entry above its generation

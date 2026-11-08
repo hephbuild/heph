@@ -27,6 +27,9 @@ unicode-case-mapping = "1"
 # The upgrade's import reads the older heph's provenance stamps. Removed in
 # v1.1.0 with the import itself.
 xattr = "1"
+# The codegen index's overlay: a persistent hash map, so a publish path-copies
+# the entries it writes instead of cloning the whole overlay (Decision 22).
+rpds = "1"
 
 [dev-dependencies]
 tempfile = "3"
