@@ -126,7 +126,7 @@ run heph tool codegen keep p/foo.pb.go.
 ```
 
 The next write-back overwrites it and says so ("overwrote hand edits to
-p/foo.pb.go").
+p/foo.pb.go; the previous content is gone").
 
 ## What each reader does
 

@@ -1138,7 +1138,8 @@ fn write_back_hints(addr: &str, outside_section: usize, no_section_hint: bool) -
         let verb = if outside_section == 1 { "is" } else { "are" };
         out.push(format!(
             "{outside_section} {files} written by {addr} {verb} not in the heph section of \
-             .gitignore; until heph tool codegen gitignore runs, only this machine excludes them."
+             .gitignore; until heph tool codegen gitignore runs, other checkouts and CI will \
+             treat them as source."
         ));
     }
     if no_section_hint {
@@ -4134,7 +4135,11 @@ impl Engine {
 
         for path in &report.overwritten_edits {
             let path = String::from_utf8_lossy(path);
-            tracing::warn!(addr = %addr, path = %path, "overwrote hand edits to {path}");
+            tracing::warn!(
+                addr = %addr,
+                path = %path,
+                "overwrote hand edits to {path}; the previous content is gone"
+            );
         }
         for path in &report.deleted {
             tracing::debug!(addr = %addr, path = %String::from_utf8_lossy(path), "deleted a codegen output the target no longer produces");
@@ -5784,6 +5789,26 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tempfile::tempdir;
+
+    #[test]
+    fn write_back_hints_say_what_other_checkouts_see() {
+        assert_eq!(
+            write_back_hints("//p:gen", 2, false),
+            [
+                "2 files written by //p:gen are not in the heph section of .gitignore; until \
+              heph tool codegen gitignore runs, other checkouts and CI will treat them as \
+              source."
+            ]
+        );
+        let both = write_back_hints("//p:gen", 1, true);
+        assert_eq!(both.len(), 2, "{both:?}");
+        assert!(
+            both.first()
+                .is_some_and(|m| m.starts_with("1 file written by //p:gen is not")),
+            "{both:?}"
+        );
+        assert!(write_back_hints("//p:gen", 0, false).is_empty());
+    }
 
     fn file_output(
         source_path: &str,
