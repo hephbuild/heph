@@ -270,7 +270,13 @@ pub fn verdicts(
             let Some(b) = baseline.scenarios.iter().find(|b| b.scenario == base_name) else {
                 continue;
             };
-            out.push(decide_bar(&c.scenario, &b.wall_ms, &c.wall_ms, bar, noise_k));
+            out.push(decide_bar(
+                &c.scenario,
+                &b.wall_ms,
+                &c.wall_ms,
+                bar,
+                noise_k,
+            ));
         }
     }
     out
@@ -482,7 +488,8 @@ mod tests {
             ]
         );
 
-        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/perfbench-thresholds.json");
+        let repo =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/perfbench-thresholds.json");
         let repo = load_thresholds(Some(&repo)).expect("the repo's thresholds file parses");
         for (scenario, t) in &repo {
             for bar in t.bars() {
@@ -546,7 +553,10 @@ mod tests {
     fn a_reported_bar_is_a_row_but_never_a_regression() {
         let baseline = results(&[
             ("codegen-glob-cold", &[100.0, 100.0, 100.0, 100.0, 100.0]),
-            ("codegen-glob-cold-probe-free", &[90.0, 90.0, 90.0, 90.0, 90.0]),
+            (
+                "codegen-glob-cold-probe-free",
+                &[90.0, 90.0, 90.0, 90.0, 90.0],
+            ),
         ]);
         let candidate = results(&[("codegen-glob-cold", &[140.0, 140.0, 140.0, 140.0, 140.0])]);
         let thresholds = HashMap::from([(
@@ -568,7 +578,10 @@ mod tests {
         let [gating, reported] = out.as_slice() else {
             panic!("two rows: {out:?}")
         };
-        assert!(gating.regression, "+55% over the probe-free baseline: {gating:?}");
+        assert!(
+            gating.regression,
+            "+55% over the probe-free baseline: {gating:?}"
+        );
         assert!(reported.over_bar && !reported.regression, "{reported:?}");
         let md = render_markdown(&out);
         assert_eq!(md.matches("REGRESSION").count(), 1, "{md}");

@@ -1506,7 +1506,10 @@ async fn codegen_import_runs_on_blocking_pool() -> anyhow::Result<()> {
     assert!(answer.await?, "the walk never read an xattr");
 
     assert_eq!(report.recorded, 1, "{report:?}");
-    assert_eq!(row(&engine, "p/a.txt")?.map(|r| r.addr), Some("//p:a".into()));
+    assert_eq!(
+        row(&engine, "p/a.txt")?.map(|r| r.addr),
+        Some("//p:a".into())
+    );
     Ok(())
 }
 
