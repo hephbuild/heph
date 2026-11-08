@@ -54,6 +54,10 @@ struct GenerateArgs {
     go_packages: usize,
     #[arg(long, default_value_t = 4)]
     go_max_depth: usize,
+    /// Codegen mode: this many `copy` output files spread over `--packages`,
+    /// plus a root `.gitignore` managed section. 0 = off.
+    #[arg(long, default_value_t = 0)]
+    codegen_files: usize,
     #[arg(long)]
     out: PathBuf,
 }
@@ -220,6 +224,7 @@ fn run_corpus(args: GenerateArgs) -> Result<()> {
         fan_out: args.fan_out,
         go_packages: args.go_packages,
         go_max_depth: args.go_max_depth,
+        codegen_files: args.codegen_files,
         ..Default::default()
     };
     let manifest = bench_corpus::generate(&params, &args.out).context("generate corpus")?;

@@ -67,6 +67,16 @@ pub struct CorpusParams {
     /// containing its `go.mod`). Defaults to the copy in this workspace via
     /// [`default_gorepogen_dir`].
     pub gorepogen_dir: PathBuf,
+    /// Codegen mode: the number of `codegen = "copy"` output files, spread
+    /// as evenly as possible over the `packages` BUILD packages (one `codegen`
+    /// target per package that gets any), with one managed-section line per
+    /// output in the root `.gitignore`. 0 (the default) = off: no copy
+    /// targets and no `.gitignore`, so the default corpus is unchanged. The
+    /// codegen-index bench shape is `packages = 1000, codegen_files = 5000`.
+    ///
+    /// Only the BUILD files and the section are written; the generated files
+    /// themselves appear when the copy targets are built.
+    pub codegen_files: usize,
 }
 
 impl Default for CorpusParams {
@@ -80,6 +90,7 @@ impl Default for CorpusParams {
             go_packages: 0,
             go_max_depth: 4,
             gorepogen_dir: default_gorepogen_dir(),
+            codegen_files: 0,
         }
     }
 }
@@ -116,6 +127,84 @@ pub struct CorpusManifest {
     /// The BUILD package directories that hold bash targets — the mutation
     /// unit for [`incrementalize`].
     pub bash_packages: Vec<String>,
+    /// Addrs of the codegen mode's `copy` targets, one per package that got
+    /// outputs (empty when [`CorpusParams::codegen_files`] is 0).
+    #[serde(default)]
+    pub codegen_addrs: Vec<String>,
+    /// Root-relative paths of every `copy` output, sorted the way the managed
+    /// section sorts its patterns.
+    #[serde(default)]
+    pub codegen_outputs: Vec<String>,
+}
+
+/// The managed section's BEGIN line, as `heph tool codegen gitignore` renders
+/// it (`BEGIN_MARKER` in `crates/engine/src/engine/gitignore.rs`). Copied rather
+/// than imported, because this crate links no engine. heph finds a section by
+/// its `# BEGIN heph-generated` prefix alone, so text drift here only makes
+/// `codegen gitignore --check` call the corpus stale; it never hides the section.
+pub const CODEGEN_BEGIN_MARKER: &str =
+    "# BEGIN heph-generated (managed by `heph tool codegen gitignore` — do not edit)";
+/// The managed section's END line.
+pub const CODEGEN_END_MARKER: &str = "# END heph-generated";
+
+/// Name of the one `copy` target codegen mode declares in each package.
+const CODEGEN_TARGET: &str = "codegen";
+
+/// Append codegen mode's `copy` targets to `pkg_src` and return their addrs
+/// and output paths (sorted by section pattern). Package `p` gets
+/// `files / packages` outputs, plus one more for the first `files % packages`
+/// packages, named `gen<k>.txt`.
+fn add_codegen_targets(files: usize, pkg_src: &mut [String]) -> Result<(Vec<String>, Vec<String>)> {
+    let packages = pkg_src.len();
+    let mut addrs = Vec::new();
+    let mut outputs = Vec::with_capacity(files);
+    if files == 0 || packages == 0 {
+        return Ok((addrs, outputs));
+    }
+    let (per, extra) = (files / packages, files % packages);
+    for (pkg, src) in pkg_src.iter_mut().enumerate() {
+        let n = per + usize::from(pkg < extra);
+        if n == 0 {
+            continue;
+        }
+        let names: Vec<String> = (0..n).map(|k| format!("gen{k}.txt")).collect();
+        let out_list = names
+            .iter()
+            .map(|f| format!("\"{f}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        // Distinct content per file, so no two outputs share a hash.
+        let run = names
+            .iter()
+            .map(|f| format!("echo pkg{pkg}/{f} > {f}"))
+            .collect::<Vec<_>>()
+            .join(" && ");
+        write!(
+            src,
+            "target(\n    name = \"{CODEGEN_TARGET}\",\n    driver = \"bash\",\n    codegen = \"copy\",\n    run = \"{run}\",\n    out = [{out_list}],\n)\n\n"
+        )
+        .context("format codegen target")?;
+        addrs.push(format!("//pkg{pkg}:{CODEGEN_TARGET}"));
+        outputs.extend(names.iter().map(|f| format!("pkg{pkg}/{f}")));
+    }
+    // The engine sorts section entries by pattern (`/` + path); a shared
+    // leading `/` leaves the order of the paths themselves unchanged.
+    outputs.sort();
+    Ok((addrs, outputs))
+}
+
+/// The root `.gitignore` codegen mode writes: only the managed section, one
+/// `# //pkg:target` attribution line above each root-anchored pattern, in the
+/// shape `heph tool codegen gitignore` renders.
+fn codegen_gitignore(outputs: &[String]) -> Result<String> {
+    let mut s = String::with_capacity(outputs.len() * 48 + 128);
+    writeln!(s, "{CODEGEN_BEGIN_MARKER}").context("format section")?;
+    for path in outputs {
+        let pkg = path.split_once('/').map_or("", |(pkg, _)| pkg);
+        writeln!(s, "# //{pkg}:{CODEGEN_TARGET}\n/{path}").context("format section line")?;
+    }
+    writeln!(s, "{CODEGEN_END_MARKER}").context("format section")?;
+    Ok(s)
 }
 
 struct Layered {
@@ -221,6 +310,8 @@ pub fn generate(params: &CorpusParams, root: &Path) -> Result<CorpusManifest> {
         writeln!(src, "    out = \"t{i}.out\",\n)\n").context("format out")?;
     }
 
+    let (codegen_addrs, codegen_outputs) = add_codegen_targets(params.codegen_files, &mut pkg_src)?;
+
     for (pkg, src) in pkg_src.iter().enumerate() {
         if src.is_empty() {
             continue;
@@ -230,7 +321,18 @@ pub fn generate(params: &CorpusParams, root: &Path) -> Result<CorpusManifest> {
             .with_context(|| format!("create {}", pkg_dir.display()))?;
         std::fs::write(pkg_dir.join("BUILD"), src)
             .with_context(|| format!("write {}/BUILD", pkg_dir.display()))?;
-        bash_packages.push(format!("pkg{pkg}"));
+        // pkg = i % packages, so exactly the first `target_count` packages
+        // hold bash targets; a package holding only a codegen target is not
+        // one of them.
+        if pkg < params.target_count {
+            bash_packages.push(format!("pkg{pkg}"));
+        }
+    }
+
+    if !codegen_outputs.is_empty() {
+        let path = root.join(".gitignore");
+        std::fs::write(&path, codegen_gitignore(&codegen_outputs)?)
+            .with_context(|| format!("write {}", path.display()))?;
     }
 
     let go_package_count = if params.go_packages > 0 {
@@ -246,6 +348,8 @@ pub fn generate(params: &CorpusParams, root: &Path) -> Result<CorpusManifest> {
         go_package_count,
         go_prefix: "go".to_string(),
         bash_packages,
+        codegen_addrs,
+        codegen_outputs,
     };
     save_manifest(&manifest, root)?;
     Ok(manifest)
@@ -556,6 +660,117 @@ mod tests {
     // output needs network (or a warm module cache) for its k8s.io/etc
     // third-party imports. Not run by `tst`; run manually with `--ignored`
     // when touching the go-subtree path.
+    /// Codegen mode at the bench shape: 5,000 outputs over 1,000 packages, a
+    /// `copy` target per package, and a section that is exactly one
+    /// attribution line plus one pattern per output, sorted, between the
+    /// markers, each pattern naming an output its package's BUILD declares.
+    #[test]
+    fn codegen_mode_writes_one_section_line_per_copy_output() {
+        let params = CorpusParams {
+            seed: 1,
+            target_count: 4000,
+            packages: 1000,
+            layers: 10,
+            fan_out: 3,
+            // Not a multiple of `packages`, so the uneven split is covered.
+            codegen_files: 5003,
+            ..Default::default()
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest = generate(&params, dir.path()).expect("generate");
+
+        assert_eq!(manifest.codegen_addrs.len(), 1000);
+        assert_eq!(manifest.codegen_outputs.len(), 5003);
+        assert_eq!(manifest.bash_packages.len(), 1000);
+
+        let section = std::fs::read_to_string(dir.path().join(".gitignore")).expect("read");
+        let lines: Vec<&str> = section.lines().collect();
+        assert_eq!(lines.first(), Some(&CODEGEN_BEGIN_MARKER));
+        assert_eq!(lines.last(), Some(&CODEGEN_END_MARKER));
+        let body = lines.get(1..lines.len() - 1).expect("markers present");
+        assert_eq!(
+            body.len(),
+            2 * 5003,
+            "one attribution + one pattern per output"
+        );
+
+        let mut patterns = Vec::new();
+        let (pairs, rest) = body.as_chunks::<2>();
+        assert!(rest.is_empty(), "odd section body");
+        for [attr, pattern] in pairs {
+            let path = pattern.strip_prefix('/').expect("root-anchored pattern");
+            let (pkg, file) = path.split_once('/').expect("pkg/file");
+            assert_eq!(*attr, format!("# //{pkg}:codegen"));
+            let build = std::fs::read_to_string(dir.path().join(pkg).join("BUILD")).expect("BUILD");
+            assert!(build.contains(r#"codegen = "copy""#), "{pkg}");
+            assert!(
+                build.contains(&format!("\"{file}\"")),
+                "{pkg} declares {file}"
+            );
+            patterns.push(*pattern);
+        }
+        let mut sorted = patterns.clone();
+        sorted.sort_unstable();
+        assert_eq!(patterns, sorted, "section is sorted by pattern");
+        let expected: Vec<String> = manifest
+            .codegen_outputs
+            .iter()
+            .map(|p| format!("/{p}"))
+            .collect();
+        assert_eq!(patterns, expected);
+        // 5003 = 5 * 1000 + 3: the first three packages get the extra one.
+        assert!(
+            manifest
+                .codegen_outputs
+                .contains(&"pkg2/gen5.txt".to_string())
+        );
+        assert!(
+            !manifest
+                .codegen_outputs
+                .contains(&"pkg3/gen5.txt".to_string())
+        );
+    }
+
+    /// Off by default: no `.gitignore`, no copy target, and the BUILD files
+    /// are the ones the corpus has always produced.
+    #[test]
+    fn codegen_mode_is_off_by_default() {
+        let params = CorpusParams {
+            seed: 9,
+            target_count: 40,
+            packages: 8,
+            ..Default::default()
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest = generate(&params, dir.path()).expect("generate");
+        assert!(manifest.codegen_addrs.is_empty());
+        assert!(manifest.codegen_outputs.is_empty());
+        assert!(!dir.path().join(".gitignore").exists());
+        for pkg in &manifest.bash_packages {
+            let build = std::fs::read_to_string(dir.path().join(pkg).join("BUILD")).expect("BUILD");
+            assert!(!build.contains("codegen"), "{pkg}");
+        }
+    }
+
+    /// More packages than bash targets: a package holding only a codegen
+    /// target is written but is not a bash package, so `incrementalize`
+    /// never picks it.
+    #[test]
+    fn codegen_only_packages_are_not_bash_packages() {
+        let params = CorpusParams {
+            target_count: 3,
+            packages: 5,
+            layers: 1,
+            codegen_files: 5,
+            ..Default::default()
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest = generate(&params, dir.path()).expect("generate");
+        assert_eq!(manifest.bash_packages, ["pkg0", "pkg1", "pkg2"]);
+        assert_eq!(manifest.codegen_addrs.len(), 5);
+        assert!(dir.path().join("pkg4/BUILD").is_file());
+    }
+
     #[test]
     #[ignore = "needs network for `go mod tidy` on gorepogen's third-party imports"]
     fn go_tree_produces_requested_package_count() {
