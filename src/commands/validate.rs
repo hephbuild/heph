@@ -236,12 +236,7 @@ pub async fn codegen_findings(
         let entries = Arc::clone(engine)
             .codegen_copy_gitignore_patterns(rs.clone(), &Matcher::TreeOutputTo(PkgBuf::from("")))
             .await?;
-        let path = root.join(".gitignore");
-        let existing = match std::fs::read_to_string(&path) {
-            Ok(s) => s,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
-        };
+        let existing = crate::commands::tool::codegen::read_gitignore(root)?;
         Ok(stale_messages(
             &gitignore::diff_section(&existing, &entries).reasons,
         ))

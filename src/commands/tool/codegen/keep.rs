@@ -286,7 +286,7 @@ async fn drop_covering_lines(
     blocking(move || {
         let _held = guard;
         let existing = read_gitignore(&root)?;
-        let parsed = hwalk::gitignore_section::parse_section_bytes(existing.as_bytes());
+        let parsed = hwalk::gitignore_section::parse_section_bytes(&existing);
         let keep_key: BTreeSet<(String, String)> = fresh
             .iter()
             .map(|e| {
@@ -302,9 +302,7 @@ async fn drop_covering_lines(
                 remaining.push(line.entry);
                 continue;
             }
-            let one = Section::compile(
-                gitignore::render("", std::slice::from_ref(&line.entry)).as_bytes(),
-            );
+            let one = Section::compile(&gitignore::render(b"", std::slice::from_ref(&line.entry)));
             if paths
                 .iter()
                 .any(|path| one.match_point(path, false).is_territory())

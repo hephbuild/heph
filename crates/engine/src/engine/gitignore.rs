@@ -212,7 +212,7 @@ pub struct SectionDiff {
     /// Empty when the section is current; sorted otherwise.
     pub reasons: Vec<StaleReason>,
     /// The whole `.gitignore` after the rewrite.
-    pub rendered: String,
+    pub rendered: Vec<u8>,
 }
 
 impl SectionDiff {
@@ -226,9 +226,9 @@ impl SectionDiff {
 /// render. Stale is exactly "[`render`] changes the file"; the reasons say
 /// why: an older marker, a malformed section, and otherwise (or as well)
 /// lines that differ.
-pub fn diff_section(existing: &str, entries: &[GitignoreEntry]) -> SectionDiff {
+pub fn diff_section(existing: &[u8], entries: &[GitignoreEntry]) -> SectionDiff {
     let rendered = render(existing, entries);
-    let parsed = hwalk::gitignore_section::parse_section_bytes(existing.as_bytes());
+    let parsed = hwalk::gitignore_section::parse_section_bytes(existing);
     let mut old: Vec<GitignoreEntry> = parsed.lines.iter().map(|l| l.entry.clone()).collect();
     old.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
     let new = normalize(entries.to_vec());
@@ -239,7 +239,8 @@ pub fn diff_section(existing: &str, entries: &[GitignoreEntry]) -> SectionDiff {
         if parsed.old_marker {
             reasons.push(StaleReason::OldMarker);
         }
-        let markers = existing.contains(BEGIN_MARKER_PREFIX) || existing.contains(END_MARKER);
+        let markers = find_bytes(existing, BEGIN_MARKER_PREFIX).is_some()
+            || find_bytes(existing, END_MARKER).is_some();
         if !parsed.present && markers {
             reasons.push(StaleReason::Malformed);
         }
@@ -333,12 +334,14 @@ pub fn newly_seen<'r>(
 /// resolve `matches_addr` without a def. The whole-workspace path must *not* go
 /// through here — it replaces the section wholesale instead.
 pub fn merge_section(
-    existing: &str,
+    existing: &[u8],
     fresh: Vec<GitignoreEntry>,
     matcher: &Matcher,
 ) -> Vec<GitignoreEntry> {
-    let mut merged: Vec<GitignoreEntry> = parse_section(existing)
+    let mut merged: Vec<GitignoreEntry> = hwalk::gitignore_section::parse_section_bytes(existing)
+        .lines
         .into_iter()
+        .map(|l| l.entry)
         .filter(|e| match &e.addr {
             Some(addr) => matcher.matches_addr(addr) != MatchResult::MatchYes,
             None => true,
@@ -369,14 +372,17 @@ pub(crate) fn content_to_pattern(content: &Content) -> String {
     }
 }
 
+/// The first offset of `needle` in `hay`.
+fn find_bytes(hay: &[u8], needle: &str) -> Option<usize> {
+    hay.windows(needle.len())
+        .position(|w| w == needle.as_bytes())
+}
+
 /// Render the new `.gitignore` content: replace the heph-managed marker section
 /// in `existing` with `entries`, or append a fresh section if no markers are
-/// present. Content outside the markers is preserved verbatim. Idempotent.
-#[expect(
-    clippy::string_slice,
-    reason = "slice indices come from `find` on ASCII markers — always char-aligned"
-)]
-pub fn render(existing: &str, entries: &[GitignoreEntry]) -> String {
+/// present. Content outside the markers is preserved verbatim, byte for byte:
+/// `.gitignore` need not be UTF-8. Idempotent.
+pub fn render(existing: &[u8], entries: &[GitignoreEntry]) -> Vec<u8> {
     let mut section = String::new();
     section.push_str(BEGIN_MARKER);
     section.push('\n');
@@ -385,30 +391,31 @@ pub fn render(existing: &str, entries: &[GitignoreEntry]) -> String {
         section.push('\n');
     }
     section.push_str(END_MARKER);
+    let section = section.as_bytes();
 
     match (
-        existing.find(BEGIN_MARKER_PREFIX),
-        existing.find(END_MARKER),
+        find_bytes(existing, BEGIN_MARKER_PREFIX),
+        find_bytes(existing, END_MARKER),
     ) {
         (Some(start), Some(end_marker_pos)) if end_marker_pos >= start => {
             let end = end_marker_pos + END_MARKER.len();
-            let mut result = String::with_capacity(existing.len() + section.len());
-            result.push_str(&existing[..start]);
-            result.push_str(&section);
-            result.push_str(&existing[end..]);
+            let mut result = Vec::with_capacity(existing.len() + section.len());
+            result.extend_from_slice(existing.get(..start).unwrap_or_default());
+            result.extend_from_slice(section);
+            result.extend_from_slice(existing.get(end..).unwrap_or_default());
             result
         }
         _ => {
-            let mut result = String::with_capacity(existing.len() + section.len() + 2);
-            result.push_str(existing);
-            if !existing.is_empty() && !existing.ends_with('\n') {
-                result.push('\n');
+            let mut result = Vec::with_capacity(existing.len() + section.len() + 2);
+            result.extend_from_slice(existing);
+            if !existing.is_empty() && !existing.ends_with(b"\n") {
+                result.push(b'\n');
             }
             if !existing.is_empty() {
-                result.push('\n');
+                result.push(b'\n');
             }
-            result.push_str(&section);
-            result.push('\n');
+            result.extend_from_slice(section);
+            result.push(b'\n');
             result
         }
     }
@@ -420,6 +427,43 @@ mod tests {
     use crate::engine::Config;
     use hmodel::htaddr::parse_addr;
     use hmodel::htpkg::PkgBuf;
+
+    // Text versions of the byte functions, so the tests below read as the
+    // `.gitignore` they describe. Non-UTF-8 input has its own test.
+
+    fn render(existing: &str, entries: &[GitignoreEntry]) -> String {
+        String::from_utf8(super::render(existing.as_bytes(), entries)).expect("rendered UTF-8")
+    }
+
+    fn diff_section(existing: &str, entries: &[GitignoreEntry]) -> SectionDiff {
+        super::diff_section(existing.as_bytes(), entries)
+    }
+
+    fn merge_section(
+        existing: &str,
+        fresh: Vec<GitignoreEntry>,
+        matcher: &Matcher,
+    ) -> Vec<GitignoreEntry> {
+        super::merge_section(existing.as_bytes(), fresh, matcher)
+    }
+
+    #[test]
+    fn non_utf8_bytes_outside_the_section_are_kept_verbatim() {
+        let mut existing = b"caf\xe9\n\n".to_vec();
+        existing.extend(super::render(b"", &[bare("/a")]));
+        existing.extend_from_slice(b"tail \xff\n");
+        let out = super::render(&existing, &[bare("/b")]);
+        assert!(out.starts_with(b"caf\xe9\n\n# BEGIN"), "{out:?}");
+        assert!(
+            out.ends_with(b"/b\n# END heph-generated\ntail \xff\n"),
+            "{out:?}"
+        );
+
+        let d = super::diff_section(&existing, &[bare("/b")]);
+        assert_eq!((d.added, d.removed), (vec![bare("/b")], vec![bare("/a")]));
+        assert_eq!(d.rendered, out);
+        assert!(!super::diff_section(&out, &[bare("/b")]).is_stale());
+    }
 
     /// Bare entry (no emitting target) — renders as just the pattern.
     fn bare(pattern: &str) -> GitignoreEntry {
@@ -654,7 +698,7 @@ mod tests {
         assert_eq!(d.reasons, vec![StaleReason::Lines]);
         assert_eq!(d.added, vec![attributed("/c/new.go", "//c:gen")]);
         assert_eq!(d.removed, vec![attributed("/b/old.go", "//b:gone")]);
-        assert_eq!(d.rendered, render(&existing, &entries));
+        assert_eq!(d.rendered, render(&existing, &entries).into_bytes());
     }
 
     #[test]

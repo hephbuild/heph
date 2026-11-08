@@ -1007,6 +1007,25 @@ async fn why_json_shape() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A non-UTF-8 line outside the section fails no command: `gitignore`
+/// rewrites the section and keeps those bytes verbatim, `--check` and
+/// `status` then read it as current.
+#[tokio::test]
+async fn non_utf8_gitignore_line_outside_the_section_is_kept() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file("p", &copy_target("gen", "gen.txt", "v1"));
+    run_on(&ws.engine, "//p:gen").await?;
+    let path = ws.dir.path().join(".gitignore");
+    std::fs::write(&path, b"caf\xe9\n")?;
+    let report = gitignore(&ws.engine).await?;
+    assert_eq!(report.exit_code(), 0, "{:?}", report.text());
+    let bytes = std::fs::read(&path)?;
+    assert!(bytes.starts_with(b"caf\xe9\n"), "{bytes:?}");
+    assert!(!gitignore_check(&ws.engine).await?.stale);
+    assert!(status(&ws.engine).await?.items.is_empty());
+    Ok(())
+}
+
 /// Path arguments: cwd-relative, root-relative, absolute and `..` all name
 /// the same file; outside the root is refused; a missing path is unknown.
 #[tokio::test]

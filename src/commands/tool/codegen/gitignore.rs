@@ -202,8 +202,8 @@ pub async fn gitignore(
     let (released, newly_seen) = blocking({
         let rendered = diff.rendered.clone();
         move || {
-            let old = Section::compile(existing.as_bytes());
-            let new = Section::compile(rendered.as_bytes());
+            let old = Section::compile(&existing);
+            let new = Section::compile(&rendered);
             let snap = index.snapshot()?;
             let mut released = Vec::new();
             for row in gitignore::released_rows(snap.rows(), &old, &new) {
@@ -244,7 +244,7 @@ pub async fn gitignore(
         })
         .collect();
     lines.sort_by(|a, b| (&a.pattern, &a.addr, a.added).cmp(&(&b.pattern, &b.addr, b.added)));
-    let entries = hwalk::gitignore_section::parse_section_bytes(diff.rendered.as_bytes())
+    let entries = hwalk::gitignore_section::parse_section_bytes(&diff.rendered)
         .lines
         .len();
     Ok(GitignoreReport {

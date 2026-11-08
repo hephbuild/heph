@@ -326,14 +326,16 @@ async fn blocking<T: Send + 'static>(
     hcore::blocking::run(f).await
 }
 
-/// Read the root `.gitignore`; a missing file is empty.
-fn read_gitignore(root: &std::path::Path) -> anyhow::Result<String> {
+/// Read the root `.gitignore` as bytes, as the index's reader does (a
+/// non-UTF-8 line is skipped with a warning, not an error); a missing file is
+/// empty.
+pub(crate) fn read_gitignore(root: &std::path::Path) -> anyhow::Result<Vec<u8>> {
     use anyhow::Context as _;
 
     let path = root.join(".gitignore");
-    match std::fs::read_to_string(&path) {
+    match std::fs::read(&path) {
         Ok(s) => Ok(s),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
     }
 }
