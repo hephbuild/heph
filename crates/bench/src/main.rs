@@ -170,6 +170,13 @@ struct RunDistArgs {
     /// from another scenario's baseline (`against` in the thresholds file).
     #[arg(long, conflicts_with_all = ["baseline_dist", "out_baseline"])]
     candidate_only: bool,
+    /// `codegen-glob-cold` only: also time the candidate's cold glob with the
+    /// index inert (no db, no managed `.gitignore` section) right after each
+    /// of its normal reps, and write those reps here as the scenario
+    /// `codegen-glob-cold-probe-free`: the probe-free baseline the cold
+    /// glob's bar is against (`against` in the thresholds file).
+    #[arg(long)]
+    out_probe_free: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -461,8 +468,16 @@ fn run_dist_both(args: RunDistArgs) -> Result<()> {
         }
     }
 
+    if args.out_probe_free.is_some() && !matches!(args.scenario, dist::Scenario::CodegenGlobCold) {
+        anyhow::bail!(
+            "--out-probe-free is the baseline of codegen-glob-cold; not of {}",
+            args.scenario.name()
+        );
+    }
+
     let mut candidate_ms = Vec::with_capacity(args.reps);
     let mut baseline_ms = Vec::with_capacity(args.reps);
+    let mut probe_free_ms = Vec::with_capacity(args.reps);
     for i in 0..args.reps {
         let seed = i as u64;
         candidate_ms.push(
@@ -475,6 +490,12 @@ fn run_dist_both(args: RunDistArgs) -> Result<()> {
             )
             .context("measure candidate")?,
         );
+        if args.out_probe_free.is_some() {
+            probe_free_ms.push(
+                dist::measure_probe_free_glob(&args.candidate_dist, &corpus)
+                    .context("measure the candidate with the index inert")?,
+            );
+        }
         if let Some((dist_dir, _)) = baseline {
             baseline_ms.push(
                 dist::measure_once(dist_dir, &corpus, &manifest, args.scenario, seed)
@@ -491,6 +512,9 @@ fn run_dist_both(args: RunDistArgs) -> Result<()> {
     )?;
     if let Some((_, out)) = baseline {
         write_results(out, "dist", args.scenario.name(), baseline_ms)?;
+    }
+    if let Some(out) = &args.out_probe_free {
+        write_results(out, "dist", dist::PROBE_FREE_GLOB, probe_free_ms)?;
     }
     Ok(())
 }

@@ -117,6 +117,9 @@ jobs:
       # narrows the noise floor itself. Bumped for now — a real number should
       # come from watching `noise_band_pct` in actual runs, not a guess.
       PERFBENCH_REPS: "7"
+      # The codegen bars are on the median of at least 5 interleaved runs
+      # (spec, Bench), whatever PERFBENCH_REPS is tuned to.
+      PERFBENCH_CODEGEN_REPS: "7"
     strategy:
       fail-fast: false
       matrix:
@@ -319,22 +322,34 @@ jobs:
           done
 
       # The codegen index's timed scenarios, Tier B on the codegen corpus.
-      # `codegen-import` has no N-1 counterpart (the command is new), so it
-      # runs on the candidate alone and "Compare and report" holds it against
-      # the baseline's `codegen-glob-cold` (`against` in the thresholds file).
+      # Each bar is on the median of PERFBENCH_CODEGEN_REPS interleaved runs
+      # (spec: "the median of 5"; `stat` in the thresholds file).
+      # `codegen-glob-cold` also times the candidate with the index inert
+      # (no db, no managed `.gitignore` section) after each of its reps:
+      # that is the probe-free baseline its gating bar is against, written
+      # as `baseline_dist_codegen-glob-cold-probe-free.json`; the row against
+      # N-1 is reported, not gating. `codegen-import` has no N-1 counterpart
+      # (the command is new), so it runs on the candidate alone and "Compare
+      # and report" holds it against the baseline's `codegen-glob-cold`
+      # (`against` in the thresholds file).
       - name: Time codegen (dist) scenarios
         if: steps.baseline_fetch.outputs.ok == 'true'
         continue-on-error: true
         run: |
-          for scenario in codegen-glob-cold codegen-glob-warm codegen-warm-build; do
+          ./candidate-dist/heph-bench run dist \
+            --candidate-dist candidate-dist --baseline-dist baseline-dist \
+            --corpus bench-corpus-codegen --scenario codegen-glob-cold --warmup 1 --reps "$PERFBENCH_CODEGEN_REPS" \
+            --out-candidate candidate_dist_codegen-glob-cold.json --out-baseline baseline_dist_codegen-glob-cold.json \
+            --out-probe-free baseline_dist_codegen-glob-cold-probe-free.json
+          for scenario in codegen-glob-warm codegen-warm-build; do
             ./candidate-dist/heph-bench run dist \
               --candidate-dist candidate-dist --baseline-dist baseline-dist \
-              --corpus bench-corpus-codegen --scenario "$scenario" --warmup 1 --reps "$PERFBENCH_REPS" \
+              --corpus bench-corpus-codegen --scenario "$scenario" --warmup 1 --reps "$PERFBENCH_CODEGEN_REPS" \
               --out-candidate "candidate_dist_${scenario}.json" --out-baseline "baseline_dist_${scenario}.json"
           done
           ./candidate-dist/heph-bench run dist \
             --candidate-dist candidate-dist --candidate-only \
-            --corpus bench-corpus-codegen --scenario codegen-import --warmup 1 --reps "$PERFBENCH_REPS" \
+            --corpus bench-corpus-codegen --scenario codegen-import --warmup 1 --reps "$PERFBENCH_CODEGEN_REPS" \
             --out-candidate candidate_dist_codegen-import.json
 
       # Every scenario/tier combination is always attempted and reported —
@@ -388,6 +403,11 @@ jobs:
                     cand_files+=("$c")
                   fi
                 done
+                # Baseline-only: the cold glob's probe-free baseline, which
+                # `codegen-glob-cold`'s gating bar names with `against`.
+                if [ -f "baseline_${tier}_codegen-glob-cold-probe-free.json" ]; then
+                  base_files+=("baseline_${tier}_codegen-glob-cold-probe-free.json")
+                fi
                 if [ ${#base_files[@]} -eq 0 ]; then
                   echo "_no results (run step failed — see logs)_"
                   continue
