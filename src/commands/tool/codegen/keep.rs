@@ -220,6 +220,16 @@ impl Declared {
     }
 }
 
+/// An output group as a message names it: the unnamed group of `out = "x"`
+/// is the target's default output, not an empty name.
+fn output_name(group: &str) -> String {
+    if group.is_empty() {
+        "its default output".to_string()
+    } else {
+        format!("output `{group}`")
+    }
+}
+
 fn result(path: &str, result: PathResultKind, reason: Option<String>) -> PathResult {
     PathResult {
         path: path.to_string(),
@@ -375,7 +385,8 @@ pub async fn keep(
                         &shown,
                         PathResultKind::Refused,
                         Some(format!(
-                            "{addr} declares it as a copy output (output `{output}` in {build}); remove the output first"
+                            "{addr} declares it as a copy output ({} in {build}); remove the output first",
+                            output_name(output)
                         )),
                     ));
                     continue;
@@ -495,7 +506,8 @@ pub async fn discard(
                                 &shown,
                                 PathResultKind::Refused,
                                 Some(format!(
-                                    "{addr} still declares it (output `{output}`); rebuild {addr} instead"
+                                    "{addr} still declares it ({}); rebuild {addr} instead",
+                                    output_name(output)
                                 )),
                             ));
                         } else if let Some(row) = snap.row(&rel) {
