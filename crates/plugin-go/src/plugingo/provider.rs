@@ -5494,41 +5494,112 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         }
     }
 
-    // Formatting targets resolve through the go provider: `format` is the check
-    // gate (no outputs), `format` rewrites sources in place (declares them).
+    /// The `""` (sources) dep group of a resolved format spec, as addr strings.
+    fn format_source_deps(spec: &hplugin::provider::TargetSpec) -> Vec<String> {
+        let deps = match spec.config.get("deps").expect("deps") {
+            Value::Map(m) => m,
+            other => panic!("deps not a map: {other:?}"),
+        };
+        match deps.iter().find(|(k, _)| k.is_empty()).map(|(_, v)| v) {
+            Some(Value::List(l)) => l
+                .iter()
+                .map(|v| match v {
+                    Value::String(s) => s.clone(),
+                    other => panic!("source dep not a string: {other:?}"),
+                })
+                .collect(),
+            other => panic!("default source group missing: {other:?}"),
+        }
+    }
+
+    /// A resolved format spec through its driver's own `parse`: the fixer for
+    /// `go.format`, the check gate otherwise.
+    async fn parse_format_spec(
+        spec: hplugin::provider::TargetSpec,
+    ) -> hplugin::driver::targetdef::TargetDef {
+        use crate::plugingo::driver_format::{GoFormatCheckDriver, GoFormatDriver};
+        use hdriver_support::driver_managed::ManagedDriver as _;
+        use hplugin::driver::ParseRequest;
+        let is_fix = spec.driver == "go.format";
+        let req = ParseRequest {
+            request_id: "test".to_string(),
+            target_spec: Arc::new(spec),
+        };
+        let ct = StdCancellationToken::new();
+        let resp = if is_fix {
+            GoFormatDriver::new().parse(req, &ct).await
+        } else {
+            GoFormatCheckDriver::new().parse(req, &ct).await
+        };
+        resp.expect("format spec parses").target_def
+    }
+
+    /// The fixer's outputs as `(group, glob pattern, codegen mode)`.
+    fn format_outputs(
+        def: &hplugin::driver::targetdef::TargetDef,
+    ) -> Vec<(
+        String,
+        String,
+        hplugin::driver::targetdef::path::CodegenMode,
+    )> {
+        use hplugin::driver::targetdef::path::Content;
+        def.outputs
+            .iter()
+            .flat_map(|o| {
+                o.paths.iter().map(|p| match &p.content {
+                    Content::Glob(g) => (o.group.clone(), g.clone(), p.codegen_tree.clone()),
+                    other => panic!("format output is not a glob: {other:?}"),
+                })
+            })
+            .collect()
+    }
+
+    // Formatting targets resolve through the go provider: `format-check` is the
+    // check gate (no outputs), `format` rewrites sources in place: its one
+    // `in_place` output is the very glob its `""` group stages.
     #[tokio::test]
     async fn test_format_targets_resolve() {
+        use crate::plugingo::driver_format::{format_sources_addr, format_sources_pattern};
         require_go!();
         let sandbox = copy_fixture("with_dep");
         enable_golangci(sandbox.path());
         let p = provider_with_govet(sandbox.path().to_path_buf(), GOVET_SOURCE_ADDR);
+        let sources = vec![format_sources_addr("cmd").format()];
 
         let check = provider_get(&p, make_bare_addr("cmd", "format-check"))
             .await
             .unwrap();
         assert_eq!(check.target_spec.driver, "go.format_check");
+        assert_eq!(format_source_deps(&check.target_spec), sources);
+        let check_def = parse_format_spec(check.target_spec).await;
         assert!(
-            !check.target_spec.config.contains_key("out"),
-            "check gate declares no outputs"
+            check_def.outputs.is_empty(),
+            "check gate declares no outputs: {:?}",
+            format_outputs(&check_def)
         );
 
         let fix = provider_get(&p, make_bare_addr("cmd", "format"))
             .await
             .unwrap();
         assert_eq!(fix.target_spec.driver, "go.format");
-        // Stages the heph-govet tool + the package's own sources.
+        // Stages the heph-govet tool + the package's sources, as one fs glob.
         let deps = match fix.target_spec.config.get("deps").unwrap() {
             Value::Map(m) => m,
             _ => panic!("deps not a map"),
         };
         assert!(deps.iter().any(|(k, _)| k == "govet_tool"), "tool staged");
-        match deps.iter().find(|(k, _)| k.is_empty()).map(|(_, v)| v) {
-            Some(Value::List(l)) => assert!(!l.is_empty(), "sources staged"),
-            _ => panic!("default source group missing"),
-        }
-        assert!(
-            fix.target_spec.config.contains_key("out"),
-            "fix declares in_place outputs"
+        assert_eq!(format_source_deps(&fix.target_spec), sources);
+
+        // The output is derived at parse, not carried in the spec.
+        let fix_def = parse_format_spec(fix.target_spec).await;
+        assert_eq!(
+            format_outputs(&fix_def),
+            vec![(
+                "src".to_string(),
+                format_sources_pattern("cmd"),
+                hplugin::driver::targetdef::path::CodegenMode::InPlace,
+            )],
+            "fix declares one in_place glob output, the pattern of its source glob"
         );
     }
 
@@ -5557,23 +5628,32 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let fix = provider_get(&p, make_bare_addr("cmd", "format"))
             .await
             .unwrap();
-        let out = match fix.target_spec.config.get("out").expect("out") {
-            Value::Map(m) => match m.iter().find(|(k, _)| *k == "src").map(|(_, v)| v) {
-                Some(Value::List(l)) => l
-                    .iter()
-                    .map(|v| match v {
-                        Value::String(s) => s.clone(),
-                        other => panic!("out entry not a string: {other:?}"),
-                    })
-                    .collect::<Vec<_>>(),
-                other => panic!("src group missing: {other:?}"),
-            },
-            other => panic!("out not a map: {other:?}"),
-        };
+        // The sources are one fs glob over the package directory — no
+        // `go list`, so no build constraint and no test-file filter between
+        // the directory and what is staged.
+        let pattern = crate::plugingo::driver_format::format_sources_pattern("cmd");
+        assert_eq!(
+            format_source_deps(&fix.target_spec),
+            vec![pluginfs::glob_addr(&pattern, &[]).format()]
+        );
+        // What is staged is written back: the in_place output is that pattern.
+        let def = parse_format_spec(fix.target_spec).await;
+        let outputs: Vec<String> = format_outputs(&def)
+            .into_iter()
+            .map(|(_, glob, _)| glob)
+            .collect();
+        assert_eq!(outputs, vec![pattern.clone()]);
+
+        // And the pattern covers both files `go list` would have dropped.
+        use wax::Program as _;
+        let glob =
+            wax::Glob::new(&pattern).unwrap_or_else(|e| panic!("{pattern:?} must compile: {e}"));
         for expected in ["only_windows.go", "main_test.go", "main.go"] {
+            assert!(pkg_dir.join(expected).is_file(), "fixture lost {expected}");
+            let rel = format!("cmd/{expected}");
             assert!(
-                out.iter().any(|f| f == expected),
-                "{expected} must be formatted: {out:?}"
+                glob.is_match(rel.as_str()),
+                "{expected} must be formatted: {pattern:?} misses {rel}"
             );
         }
     }
