@@ -39,6 +39,10 @@ pub struct Base {
     fold: FxHashMap<u64, Vec<Vec<u8>>>,
     /// `addr → [path]`, with the same staleness as `fold`.
     by_addr: FxHashMap<String, Vec<Vec<u8>>>,
+    /// Paths a fold deleted since the reload, with the deleting `gen`: a
+    /// late publish below it must not bring the row back (see
+    /// [`State::publish`]). Disjoint from `rows`; a reload starts it empty.
+    tombs: FxHashMap<Vec<u8>, u64>,
     /// The generation the rows were loaded at.
     generation: u64,
 }
@@ -69,31 +73,41 @@ impl Base {
             .push(row.path.clone());
     }
 
+    /// The `gen` an overlay entry at `path` must reach to win: the base row's,
+    /// or a folded deletion's.
+    fn floor(&self, path: &[u8]) -> Option<u64> {
+        match self.rows.get(path) {
+            Some(r) => Some(r.generation),
+            None => self.tombs.get(path).copied(),
+        }
+    }
+
     /// This base with `overlay` applied, entry by entry under the merge rule.
     fn folded(&self, overlay: &Overlay) -> Self {
         let mut base = self.clone();
         for (path, e) in &overlay.entries {
-            let wins = base
-                .rows
-                .get(path)
-                .is_none_or(|b| e.generation >= b.generation);
+            let wins = base.floor(path).is_none_or(|g| e.generation >= g);
             if !wins {
                 continue;
             }
             let old = base.rows.remove(path);
-            if let Some(row) = &e.row {
-                // Index a path only where it is not listed already.
-                if old.is_none() {
-                    base.fold.entry(row.fold).or_default().push(path.clone());
-                }
-                if old.as_ref().is_none_or(|o| o.addr != row.addr) {
-                    base.by_addr
-                        .entry(row.addr.clone())
-                        .or_default()
-                        .push(path.clone());
-                }
-                base.rows.insert(path.clone(), row.clone());
+            let Some(row) = &e.row else {
+                base.tombs.insert(path.clone(), e.generation);
+                continue;
+            };
+            // Index a path only where it is not listed already (a folded
+            // deletion leaves its path listed under its fold key).
+            let tomb = base.tombs.remove(path.as_slice());
+            if old.is_none() && tomb.is_none() {
+                base.fold.entry(row.fold).or_default().push(path.clone());
             }
+            if old.as_ref().is_none_or(|o| o.addr != row.addr) {
+                base.by_addr
+                    .entry(row.addr.clone())
+                    .or_default()
+                    .push(path.clone());
+            }
+            base.rows.insert(path.clone(), row.clone());
         }
         base
     }
@@ -223,7 +237,29 @@ impl State {
     /// writes, never the rest of the overlay nor the base (the overlay's
     /// maps share every other node with the one snapshots still hold);
     /// returns how many entries it wrote.
+    ///
+    /// **Why a deletion's `gen` can be dropped.** A fold applies a tombstone
+    /// by removing the base row, and a reload never sees the row at all; the
+    /// overlay entry that carried the deletion's `gen` is gone either way. A
+    /// publish that lands later with a lower `gen` for the same path would
+    /// then find nothing to lose to and bring the row back. What keeps that
+    /// from happening:
+    ///
+    /// - every delete names its addr (`DELETE … WHERE path AND addr`) and is
+    ///   committed and published under that addr's codegen lock, so no
+    ///   publish of *that* addr's rows can still be in flight behind it;
+    /// - another addr's row at the path can be: B commits `p` at `g`, A
+    ///   takes `p` over at `g' > g` and deletes it at `G`, and B publishes
+    ///   `g` only now. For that, a fold keeps each deletion as a `gen` in
+    ///   [`Base`]'s tombs, which a lower overlay `gen` loses to;
+    /// - and a publish at or below the base's reload generation is skipped
+    ///   here: the rows were read at that generation, so they already hold
+    ///   that commit or something newer (a deletion included).
     pub fn publish(&mut self, generation: u64, rows: &[Row], tombstones: &[Vec<u8>]) -> usize {
+        if generation <= self.base.generation {
+            // Already in the base; `loaded_through` is at or above it.
+            return 0;
+        }
         let mut overlay = Overlay::clone(&self.overlay);
         let mut written = 0;
         let seq = self.next_seq;
@@ -337,12 +373,12 @@ impl Snapshot {
     }
 
     /// The row at `path`: the higher `gen` of base and overlay, the overlay
-    /// winning a tie; a winning tombstone is no row.
+    /// winning a tie; a winning tombstone is no row, and neither is an
+    /// overlay row below a folded deletion.
     pub fn row(&self, path: &[u8]) -> Option<&Row> {
-        let b = self.base.rows.get(path);
         match self.overlay.entries.get(path) {
-            Some(o) if b.is_none_or(|b| o.generation >= b.generation) => o.row.as_ref(),
-            _ => b,
+            Some(o) if self.base.floor(path).is_none_or(|g| o.generation >= g) => o.row.as_ref(),
+            _ => self.base.rows.get(path),
         }
     }
 
@@ -413,12 +449,7 @@ impl Snapshot {
             .overlay
             .entries
             .iter()
-            .filter(|(p, o)| {
-                self.base
-                    .rows
-                    .get(*p)
-                    .is_none_or(|b| o.generation >= b.generation)
-            })
+            .filter(|(p, o)| self.base.floor(p).is_none_or(|g| o.generation >= g))
             .filter_map(|(_, o)| o.row.as_ref());
         base.chain(overlay)
     }
@@ -480,15 +511,29 @@ mod tests {
         ));
         // A stale publish (gen 4 < base's 5) does not hide the base row.
         st.publish(4, &[row("a", "//x:old", 4)], &[]);
-        st.publish(5, &[row("b", "//x:b", 5)], &[]);
-        st.publish(6, &[], &[b"c".to_vec()]);
+        st.publish(6, &[row("b", "//x:b", 6)], &[]);
+        st.publish(7, &[], &[b"c".to_vec()]);
         let s = snap(&st);
         assert_eq!(s.row(b"a").unwrap().addr, "//x:a");
-        assert_eq!(s.row(b"b").unwrap().addr, "//x:b", "tie: overlay wins");
+        assert_eq!(s.row(b"b").unwrap().addr, "//x:b");
         assert!(s.row(b"c").is_none(), "tombstone");
         assert_eq!(paths(s.rows_for_addr("//x:a")), ["a"]);
         assert_eq!(paths(s.rows().collect()), ["a", "b"]);
-        assert_eq!(s.loaded_through(), 6);
+        assert_eq!(s.loaded_through(), 7);
+    }
+
+    #[test]
+    fn merged_lookup_overlay_wins_a_tie_with_a_folded_row() {
+        let mut st = State::default();
+        st.install_reload(Base::from_rows(0, vec![]));
+        st.publish(1, &[row("a", "//x:a", 1)], &[]);
+        let (b, o, s) = st.fold_copy();
+        let folded = State::build_fold(&b, &o);
+        // Republished at the same gen after the copy (not a real sequence,
+        // the merge rule's tie-break).
+        st.publish(1, &[row("a", "//x:b", 1)], &[]);
+        st.install_fold(folded, s);
+        assert_eq!(snap(&st).row(b"a").unwrap().addr, "//x:b");
     }
 
     #[test]
@@ -523,6 +568,46 @@ mod tests {
         let sn = snap(&st);
         assert_eq!(paths(sn.rows().collect()), ["a", "b"]);
         assert_eq!(sn.loaded_through(), 2);
+    }
+
+    /// B commits `p` at 1 and is slow to publish; A takes `p` over at 2 and
+    /// deletes it at 3 (both under A's lock, both published); the overlay
+    /// folds. B's publish of 1 then lands: the row stays deleted.
+    #[test]
+    fn late_publish_below_a_folded_tombstone_stays_deleted() {
+        let mut st = State::default();
+        st.install_reload(Base::from_rows(0, vec![]));
+        st.publish(2, &[row("p", "//x:a", 2)], &[]);
+        st.publish(3, &[], &[b"p".to_vec()]);
+        let (b, o, s) = st.fold_copy();
+        let folded = State::build_fold(&b, &o);
+        st.install_fold(folded, s);
+        st.publish(1, &[row("p", "//x:b", 1)], &[]);
+        assert!(snap(&st).row(b"p").is_none(), "B's stale row came back");
+        assert!(snap(&st).rows().next().is_none());
+        assert!(snap(&st).rows_for_addr("//x:b").is_empty());
+        // A later commit at the path is a row again, through a fold too.
+        st.publish(4, &[row("p", "//x:c", 4)], &[]);
+        assert_eq!(snap(&st).row(b"p").unwrap().addr, "//x:c");
+        let (b, o, s) = st.fold_copy();
+        let folded = State::build_fold(&b, &o);
+        st.install_fold(folded, s);
+        assert_eq!(snap(&st).row(b"p").unwrap().addr, "//x:c");
+        assert_eq!(st.loaded_through(), 4);
+    }
+
+    /// The same, across a reload: the db read at 3 has no `p`, and B's
+    /// publish of 1 is older than everything the base reflects.
+    #[test]
+    fn late_publish_at_or_below_the_reload_is_already_in_the_base() {
+        let mut st = State::default();
+        st.install_reload(Base::from_rows(3, vec![row("q", "//x:a", 3)]));
+        st.publish(1, &[row("p", "//x:b", 1)], &[]);
+        st.publish(2, &[], &[b"q".to_vec()]);
+        let s = snap(&st);
+        assert!(s.row(b"p").is_none(), "B's stale row came back");
+        assert_eq!(s.row(b"q").unwrap().addr, "//x:a");
+        assert_eq!(st.overlay_len(), 0);
     }
 
     #[test]
