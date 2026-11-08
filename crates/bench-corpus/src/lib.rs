@@ -97,6 +97,9 @@ pub fn default_gorepogen_dir() -> PathBuf {
 /// recover it with [`load_manifest`].
 pub const MANIFEST_FILE: &str = ".bench-manifest.json";
 
+/// The workspace config file [`generate`] writes at the corpus root.
+pub const CONFIG_FILE: &str = ".hephconfig";
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CorpusManifest {
     /// Addrs of every generated bash target, in generation order.
@@ -220,6 +223,14 @@ pub fn generate(params: &CorpusParams, root: &Path) -> Result<CorpusManifest> {
         // `heph r build //...` run against the generated corpus).
         writeln!(src, "    out = \"t{i}.out\",\n)\n").context("format out")?;
     }
+
+    // The corpus is a workspace, so it carries the root marker every config
+    // load requires — Tier A reads it before Tier B has written its own. An
+    // empty file is the default config. Without it every Tier A rep failed
+    // ("reading config file …/.hephconfig"), and the Perf job still went green.
+    std::fs::create_dir_all(root).with_context(|| format!("create {}", root.display()))?;
+    let config = root.join(CONFIG_FILE);
+    std::fs::write(&config, "").with_context(|| format!("write {}", config.display()))?;
 
     for (pkg, src) in pkg_src.iter().enumerate() {
         if src.is_empty() {
