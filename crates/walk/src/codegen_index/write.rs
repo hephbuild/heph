@@ -15,7 +15,8 @@
 //! 3. The engine writes [`WriteBack::writes`].
 //! 4. [`WriteBack::settle`]: all file IO first (lstat what was written; fresh
 //!    hash, then unlink, each leftover heph wrote that a current `copy`
-//!    output still covers), then one transaction that only writes rows.
+//!    output still covers; rewrite the `.clock` probe whose mtime is the
+//!    records' `written_at`), then one transaction that only writes rows.
 //!    Dropping the [`WriteBack`] releases the lock; dropping it before
 //!    `settle` is a crash, which the next write-back (or a command's
 //!    [`CodegenIndex::settle_pending`]) settles.
@@ -23,7 +24,7 @@
 use super::TargetLockGuard;
 use super::fs::{FileStat, IndexFs, StatKind, lstat_opt};
 use super::index::CodegenIndex;
-use super::lookup::{read_link_opt, verify};
+use super::lookup::{RECORD_RACY_SLACK_NS, read_link_opt, verify};
 use super::paths::rel_path;
 use super::section::Section;
 use super::snapshot::Snapshot;
@@ -304,7 +305,58 @@ fn now_ns() -> i64 {
         .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
 }
 
+/// The probe file whose mtime is a settle's `written_at`, in the codegen dir.
+pub const CLOCK_PROBE: &str = ".clock";
+
+/// `written_at` for the records one settle makes, on the filesystem's clock
+/// (git's racy-clean rule): the mtime of `<home>/codegen/.clock`, rewritten
+/// once, lazily, after the bytes landed. A record on another device than the
+/// probe cannot be compared with its clock and gets the wall clock minus
+/// [`RECORD_RACY_SLACK_NS`] instead, which keeps it racy: always hashed. A
+/// settle that records nothing never writes the probe.
+struct FsClock<'a> {
+    index: &'a CodegenIndex,
+    probe: Option<FileStat>,
+}
+
+impl<'a> FsClock<'a> {
+    fn new(index: &'a CodegenIndex) -> Self {
+        Self { index, probe: None }
+    }
+
+    fn written_at(&mut self, st: &FileStat) -> Result<i64> {
+        let probe = match self.probe {
+            Some(p) => p,
+            None => {
+                let p = self.index.probe_fs_clock()?;
+                self.probe = Some(p);
+                p
+            }
+        };
+        Ok(if probe.dev == st.dev {
+            probe.mtime_ns
+        } else {
+            now_ns().saturating_sub(RECORD_RACY_SLACK_NS)
+        })
+    }
+}
+
 impl CodegenIndex {
+    /// Truncate and write `<codegen dir>/.clock`, then lstat it: its mtime is
+    /// "now" on the filesystem's clock.
+    fn probe_fs_clock(&self) -> Result<FileStat> {
+        let dir = self
+            .db_path()
+            .parent()
+            .context("the codegen db path has no parent directory")?;
+        let probe = dir.join(CLOCK_PROBE);
+        std::fs::write(&probe, now_ns().to_le_bytes())
+            .with_context(|| format!("writing the clock probe {}", probe.display()))?;
+        self.fs()
+            .lstat(&probe)
+            .with_context(|| format!("reading the clock probe {}", probe.display()))
+    }
+
     fn require_store(&self) -> Result<&Store> {
         self.open_store()?.with_context(|| {
             format!(
@@ -410,6 +462,7 @@ impl CodegenIndex {
             return Ok(Vec::new());
         };
         let fs = self.fs().as_ref();
+        let mut clock = FsClock::new(self);
         let mut out = Vec::new();
         let mut changes = Vec::new();
         for row in store.rows_for_addr(guard.addr())? {
@@ -431,7 +484,8 @@ impl CodegenIndex {
                 outcome,
             });
             if let (PendingOutcome::Recorded, Some(st), Some((h, link))) = (outcome, st, fresh) {
-                changes.push((row.path, Some((record_of(h, &st, now_ns()), link))));
+                let written_at = clock.written_at(&st)?;
+                changes.push((row.path, Some((record_of(h, &st, written_at), link))));
             } else if outcome == PendingOutcome::Cleared {
                 changes.push((row.path, None));
             }
@@ -513,7 +567,7 @@ impl WriteBack {
         let index = &self.index;
         let fs = index.fs().as_ref();
         let root = index.root();
-        let written_at = now_ns();
+        let mut clock = FsClock::new(index);
         let mut report = SettleReport::default();
 
         // File IO first, outside any transaction (Decision 19).
@@ -555,6 +609,7 @@ impl WriteBack {
             if e.sel.edited {
                 report.overwritten_edits.push(l.path.clone());
             }
+            let written_at = clock.written_at(&st)?;
             recorded.push((e, record_of(l.hash().into_owned(), &st, written_at), link));
         }
 
@@ -583,7 +638,9 @@ impl WriteBack {
                 continue;
             }
             let record = match fresh {
-                Some((h, link)) if is_pending => Some((record_of(h, &st, written_at), link)),
+                Some((h, link)) if is_pending => {
+                    Some((record_of(h, &st, clock.written_at(&st)?), link))
+                }
                 _ => None,
             };
             fates.push((
@@ -673,7 +730,7 @@ impl WriteBack {
 mod tests {
     use super::*;
     use crate::codegen_index::lookup::{LookupMeta, StatusKind, StatusReason};
-    use crate::codegen_index::testfs::{Fake, Ws, guard, hash, ws, ws_no_db};
+    use crate::codegen_index::testfs::{Fake, TestFs, Ws, file_stat, guard, hash, ws, ws_no_db};
 
     const ADDR: &str = "//p:gen";
 
@@ -943,6 +1000,67 @@ mod tests {
         let r = run(&w, ADDR, REV2).unwrap();
         assert_eq!(r.overwritten_edits, vec![b"gen/a".to_vec()]);
         assert_eq!(w.read("gen/a").as_deref(), Some(&b"a2"[..]));
+    }
+
+    /// A write-back of `gen/a` whose written file and clock probe lstat as
+    /// injected, then the file's bytes changed behind that same stat: what a
+    /// lookup makes of it, and how many content hashes it took.
+    fn clock_case(file: FileStat, probe: FileStat) -> ((StatusKind, Option<StatusReason>), u64) {
+        let w = ws();
+        let rev: Rev<'_> = &[("gen/a", b"a1")];
+        w.section(&["/gen"]);
+        let wb = w
+            .index
+            .begin_write_back(guard(ADDR), plan(&w, ADDR, rev).unwrap())
+            .unwrap();
+        write_bytes(&w, &wb, rev);
+        w.fs.fake(&w.abs("gen/a"), Fake::Stat(file));
+        let probe_path = w.index.db_path().parent().unwrap().join(CLOCK_PROBE);
+        w.fs.fake(&probe_path, Fake::Stat(probe));
+        wb.settle(&inside).unwrap();
+        assert!(probe_path.exists(), "settle writes the clock probe");
+        let rec = w.db_row("gen/a").unwrap().record.unwrap();
+        assert_eq!(rec.mtime_ns, file.mtime_ns);
+        w.write("gen/a", b"zz");
+        let before = TestFs::count(&w.fs.content_hashes);
+        let got = status(&w, "gen/a");
+        (got, TestFs::count(&w.fs.content_hashes) - before)
+    }
+
+    #[test]
+    fn record_from_an_earlier_fs_tick_is_stat_trusted() {
+        // The file's mtime is strictly older than the probe's: git's rule
+        // trusts the stat, so the changed bytes behind it go unhashed.
+        let (got, hashed) = clock_case(
+            file_stat(2, 1_000_000_000, 7, 1),
+            file_stat(8, 2_000_000_000, 9, 1),
+        );
+        assert_eq!(got, (StatusKind::Generated, Some(StatusReason::Recorded)));
+        assert_eq!(hashed, 0);
+    }
+
+    #[test]
+    fn record_from_the_probes_fs_tick_is_hashed() {
+        // Same tick as the probe: racy, so the lookup hashes and sees the edit.
+        let (got, hashed) = clock_case(
+            file_stat(2, 1_000_000_000, 7, 1),
+            file_stat(8, 1_000_000_000, 9, 1),
+        );
+        assert_eq!(got, (StatusKind::Modified, Some(StatusReason::Edited)));
+        assert_eq!(hashed, 1);
+    }
+
+    #[test]
+    fn record_on_another_device_than_the_probe_is_hashed() {
+        // The probe's clock says nothing about another device: `written_at`
+        // falls back behind the wall clock, so a file written now stays racy.
+        let now = now_ns();
+        let (got, hashed) = clock_case(
+            file_stat(2, now, 7, 1),
+            file_stat(8, now.saturating_add(5_000_000_000), 9, 2),
+        );
+        assert_eq!(got, (StatusKind::Modified, Some(StatusReason::Edited)));
+        assert_eq!(hashed, 1);
     }
 
     #[test]

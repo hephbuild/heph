@@ -27,11 +27,17 @@ use anyhow::{Context as _, Result};
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::Path;
 
-/// The racy window of a record, in ns: a row whose recorded mtime is within
-/// this of (or after) its `written_at` is checked by hash, never by stat.
-/// Git's rule is "not strictly older"; the slack covers filesystems whose
-/// mtime is coarser than the clock, as [`SECTION_RACY_SLACK`] does for the
-/// section.
+/// How far before the wall clock a record's `written_at` is put when the
+/// filesystem's own clock cannot be read for it (the file sits on another
+/// device than the `<home>/codegen/.clock` probe): far enough back that the
+/// record stays racy, so it is always checked by hash.
+///
+/// A record's racy rule is git's, on the filesystem's clock: `written_at` is
+/// the mtime of the probe settle writes after the bytes land, and a record
+/// whose mtime is not strictly older than it (`mtime_ns >= written_at_ns`)
+/// is checked by hash, never by stat. A file written in the same mtime tick
+/// as the probe therefore stays hashed; one written in an earlier tick is
+/// trusted by stat.
 pub const RECORD_RACY_SLACK_NS: i64 = SECTION_RACY_SLACK.as_nanos() as i64;
 
 /// What a path is.
@@ -253,7 +259,7 @@ fn same_at_recorded(fs: &dyn IndexFs, root: &Path, row: &Row, walked: &FileStat)
 /// Whether the stat alone proves `rec`: every compared field equal, and the
 /// record outside its racy window.
 pub(crate) fn stat_trusted(rec: &Record, st: &FileStat) -> bool {
-    let racy = rec.mtime_ns.saturating_add(RECORD_RACY_SLACK_NS) >= rec.written_at_ns;
+    let racy = rec.mtime_ns >= rec.written_at_ns;
     !racy
         && st.size == rec.size
         && st.mtime_ns == rec.mtime_ns
