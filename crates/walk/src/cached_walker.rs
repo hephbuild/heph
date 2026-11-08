@@ -190,8 +190,23 @@ pub fn file_hashout(path: &Path, x: bool) -> Result<String> {
             h.update(chunk);
         }
     }
+    Ok(finish_content_hashout(h, x))
+}
+
+/// [`file_hashout`] of a file holding `bytes`, computed from memory: for a
+/// caller that has just written those bytes and must know what the file
+/// hashes to without re-reading it (a read could see a later edit instead).
+pub fn content_hashout(bytes: &[u8], x: bool) -> String {
+    let mut h = Xxh3::new();
+    h.update(bytes);
+    finish_content_hashout(h, x)
+}
+
+/// The one finalization [`file_hashout`] and [`content_hashout`] share, so the
+/// two cannot drift: the exec marker folded in after the content.
+fn finish_content_hashout(mut h: Xxh3, x: bool) -> String {
     h.update(&[x as u8]);
-    Ok(format!("{:x}", h.digest()))
+    format!("{:x}", h.digest())
 }
 
 #[cfg(unix)]
@@ -956,6 +971,27 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap()
+    }
+
+    /// `content_hashout` over bytes in memory is `file_hashout` over a file
+    /// holding them, for either exec bit — including a body past one read
+    /// chunk, and an empty one.
+    #[test]
+    fn content_hashout_matches_file_hashout() {
+        let tmp = tempdir().unwrap();
+        let big: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        for (i, bytes) in [&b""[..], b"hello\n", &big].into_iter().enumerate() {
+            let f = tmp.path().join(format!("f{i}"));
+            std::fs::write(&f, bytes).unwrap();
+            for x in [false, true] {
+                assert_eq!(
+                    content_hashout(bytes, x),
+                    file_hashout(&f, x).unwrap(),
+                    "body {i}, x={x}"
+                );
+            }
+        }
+        assert_ne!(content_hashout(b"a", false), content_hashout(b"a", true));
     }
 
     /// Opening a walker opens no database, and a walker that never walked
