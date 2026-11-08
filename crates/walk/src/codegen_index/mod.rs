@@ -12,6 +12,13 @@
 //! - [`paths`]: normalised root-relative paths, this checkout's db file, and
 //!   the `<home>/lock/codegen/` lock files.
 //! - [`fs`]: the filesystem calls the index makes, injectable for tests.
+//! - [`store`]: the sqlite db (schema, migrations, creation under the import
+//!   lock, and the write transaction that bumps `generation`).
+//! - [`snapshot`]: the immutable base + generation-tagged overlay a reader
+//!   holds, and the publish / reload / fold rules over it.
+//! - [`CodegenIndex`]: one checkout's index: the store if its db exists, the
+//!   snapshot state behind a swap-only lock, the reload single-flight, and
+//!   the compiled section keyed by the root `.gitignore`.
 //!
 //! Locking: walk does not depend on `hlock` (it pulls in `plugin` and
 //! `core`). The engine takes the flocks at [`CodegenLockPaths`] with `hlock`'s
@@ -21,13 +28,19 @@
 
 pub mod fold;
 pub mod fs;
+mod index;
 pub mod paths;
 pub mod section;
+pub mod snapshot;
+pub mod store;
 
 pub use fold::fold_hash;
 pub use fs::{FileStat, IndexFs, RealFs, StatKind};
+pub use index::{CodegenIndex, FOLD_THRESHOLD, IndexOptions, IndexStats, SECTION_RACY_SLACK};
 pub use paths::{CodegenLockPaths, codegen_dir, db_path, normalize_rel, rel_path};
 pub use section::{Section, SectionMatch, SectionProbe};
+pub use snapshot::Snapshot;
+pub use store::{Committed, Record, Row, RowKind, RowState, Store, StoreOptions, WriteTxn};
 
 use std::any::Any;
 
