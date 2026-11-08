@@ -27,14 +27,18 @@ async fn test_codegen_gen_target_produces_go_file() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The strict Go fallback (codegen index spec, Decision 26): a generated `.go`
-/// file the Go provider does not know a generator for — here `//:gen` without
-/// the `go_src` label, so no source map names it — reaches the compile through
-/// `pkg_analysis`'s plain `file` addr fallback. Reading a generated path
-/// through an fs `file` input fails loudly, naming the generator, instead of
-/// silently compiling without it.
+/// The strict Go fallback (codegen index spec, Decision 26): a Go package that
+/// names a generated `.go` file *directly* — here through `go_codegen_deps`
+/// naming the fs `file` addr of `gen.go`, rather than `//:gen` — fails loudly,
+/// naming the generator, instead of silently compiling without it.
+///
+/// Every non-SDK `_golist` dep is source-mapped, so `pkg_analysis`'s plain
+/// `file_addr` fallback (`:157`) is never reached by a file the sandbox holds;
+/// the only way a generated file reaches a compile as a `file` addr is the
+/// `:147` pass-through of a source map entry that already is one, and that
+/// same `file` addr is a `_golist` dep. The strict read therefore fails at
+/// `_golist`, one step before the compile, with the same error.
 #[tokio::test]
-#[ignore = "scenario does not reach the fallback: _golist's *.go glob excludes the recorded gen.go, so go list never lists it and the compile fails with `undefined: GeneratedVar` (U3c)"]
 async fn go_pkg_analysis_fallback_on_generated_file_fails_loudly() -> anyhow::Result<()> {
     require_go!();
     let dir = fixture("codegen")?;
@@ -42,6 +46,11 @@ async fn go_pkg_analysis_fallback_on_generated_file_fails_loudly() -> anyhow::Re
     ws.write_build_file(
         "",
         r#"
+provider_state(
+    provider = "go",
+    go_codegen_deps = ["//@heph/fs:file@f=gen.go"],
+)
+
 target(
     name = "gen",
     driver = "bash",
