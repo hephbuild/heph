@@ -352,10 +352,13 @@ do and changes nothing.
 or unknown:
 
 ```
-{"schema": 1, "results": [{"path", "result", "reason"}, ...]}
+{"schema": 1, "results": [{"path", "result", "reason"}, ...],
+ "lines": [{"op": "remove", "pattern", "addr"}, ...], "released": ["p/other.pb.go", ...]}
 ```
 
 `result` is one of `kept`, `discarded`, `would_discard`, `refused`, `unknown`.
+`lines` are the section lines dropped, `released` the other recorded files
+they covered.
 
 ### `heph tool codegen why <path>...`
 
@@ -363,8 +366,23 @@ Explains any path, sources included: its status and reason, the row (target,
 output, state, when it was written, pending or not), how the bytes were
 verified (stat, hash, or another casing by inode), and the section line that
 matched with its line number and whether heph wrote it, or "no section line
-matches". `--json` adds `status`, `reason`, `row` (with `written_at`) and
-`section_line` to each result. Exits 1 when a path is unknown.
+matches". Exits 1 when a path is unknown.
+
+```
+{"schema": 1, "hint": "...",
+ "results": [{"path", "result", "reason", "status", "status_reason",
+              "row": {"path", "addr", "output", "state", "written_at", "pending", "verified"},
+              "section_line": {"line", "pattern", "heph_wrote", "negated"}}, ...]}
+```
+
+`result` is `explained`, `unknown` or `refused` (outside the workspace).
+`status` is `generated`, `modified`, `released` or `source`; `status_reason`
+is `recorded`, `pending`, `unrecorded` or `edited`, or null. `row.state` is
+`written`, `imported` or `dropped`; `row.verified` is `stat`, `hash`,
+`pending`, `missing` or `another_casing`. `row` and `section_line` are null
+when there is none; `section_line.negated` is true for a `!` line that
+re-includes the path. `hint` (also on `status`) is present only when the
+index is empty but section lines match files on disk.
 
 ### `heph tool codegen import`
 
@@ -393,7 +411,14 @@ gitignore (and --check for the up-to-date test)". With `--json`:
 
 Every `--json` output is `{"schema": 1, ...}` with sorted arrays and a `kind`
 or `result` enum. A new field is additive; a renamed or removed field bumps
-`schema`.
+`schema`. Consumers must ignore fields they do not know, and treat a `kind`,
+`result`, `reason`, `status`, `status_reason` or `state` value they do not
+know as opaque: a new value is additive too.
+
+A failure (exit 2) prints `{"schema": 1, "error": "<message>"}` on stdout and
+the message on stderr. A usage error is clap's, before any command runs: it
+prints nothing on stdout. The removed `gen-gitignore` prints its own document
+(above).
 
 ## Upgrading from the xattr
 
@@ -425,6 +450,11 @@ is unsupported.
   the old text as stale (`old_marker`): run `heph tool codegen gitignore` once
   and commit. A previous version running `gen-gitignore` writes the old text
   back.
+- **`validate`'s stale-section message changed** to "… is out of date; run
+  heph tool codegen gitignore", and `validate` now also fails on a section
+  with the old marker text (`old_marker`) or a malformed one (`malformed`: a
+  BEGIN or END marker without its pair, or out of order). Anything matching
+  the old text must match the new.
 - **After upgrading, run `heph tool codegen import` once in each checkout.**
   It records the files the previous version stamped with the xattr. Until it
   runs, such a file is excluded only where a section line covers it.

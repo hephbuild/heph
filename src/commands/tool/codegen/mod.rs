@@ -282,7 +282,7 @@ where
     Fut: Future<Output = anyhow::Result<R>> + Send + 'static,
 {
     let global = global.clone();
-    bootstrap::block_on(async move {
+    let res = bootstrap::block_on(async move {
         let (engine, shutdown) = bootstrap::new_engine(&global)?;
         let app = CodegenApp {
             engine,
@@ -293,7 +293,30 @@ where
         };
         let interactive = tui::should_use_tui(global.no_tui) && !json;
         tui::run_app(app, sink, interactive, shutdown).await
-    })?
+    })
+    .and_then(|r| r);
+    // The app has ended (and `--json` never takes the TUI), so stdout is
+    // ours. The error is still rendered on stderr by `main`.
+    if json && let Some(doc) = json_error(&res) {
+        println!("{doc}");
+    }
+    res
+}
+
+/// The `--json` document for a run that failed (exit 2): `{"schema": 1,
+/// "error": "<message>"}`, so a consumer of stdout never reads an empty
+/// document. `None` for success and for findings (exit 1), which printed
+/// their report, and for an exit that already printed its own document.
+fn json_error(res: &anyhow::Result<()>) -> Option<serde_json::Value> {
+    let err = res.as_ref().err()?;
+    let message = match err.downcast_ref::<CodegenExit>() {
+        Some(exit) => match &exit.error {
+            Some(e) if exit.code >= 2 => format!("{e:#}"),
+            _ => return None,
+        },
+        None => format!("{err:#}"),
+    };
+    Some(serde_json::json!({ "schema": JSON_SCHEMA, "error": message }))
 }
 
 /// Run a blocking job on the blocking pool.
@@ -366,6 +389,34 @@ mod tests {
         assert_eq!(c.code, 2);
         assert!(format!("{e}").contains("boom"));
         assert!(wrap_exit(Ok(())).is_ok());
+    }
+
+    #[test]
+    fn json_error_only_for_a_failure() {
+        let failed: anyhow::Result<()> =
+            Err(anyhow::anyhow!("opening the index").context("codegen status"));
+        assert_eq!(
+            json_error(&failed),
+            Some(serde_json::json!({
+                "schema": 1,
+                "error": "codegen status: opening the index",
+            }))
+        );
+        let wrapped: anyhow::Result<()> = Err(CodegenExit::failed(anyhow::anyhow!("boom")).into());
+        assert_eq!(
+            json_error(&wrapped),
+            Some(serde_json::json!({ "schema": 1, "error": "boom" }))
+        );
+        // Findings printed their report; an exit with no error its own
+        // document.
+        assert_eq!(json_error(&Err(CodegenExit::findings().into())), None);
+        let silent: anyhow::Result<()> = Err(CodegenExit {
+            code: 2,
+            error: None,
+        }
+        .into());
+        assert_eq!(json_error(&silent), None);
+        assert_eq!(json_error(&Ok(())), None);
     }
 
     #[test]
