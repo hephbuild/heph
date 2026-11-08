@@ -293,15 +293,20 @@ impl Engine {
         res.map(|(artifacts, teardown, guards)| (artifacts, teardown, guards, execute_guard))
     }
 
-    /// Where a run in `sandbox_dir` can have written its log: the directory
-    /// itself and, when FUSE is mounted, the mount-side and backing-side
-    /// directories the bridge redirects it to.
     /// The fs driver refuses a generated path naming the row's generator, but
     /// it cannot read defs, so it cannot tell a generator that still exists
     /// from one that was removed (Decision 18). On this failure path only, the
     /// row's addr is resolved once: when it is not found, the error is rebuilt
     /// to name `codegen keep` / `discard` instead of "depend on". Any other
     /// error, or a lookup that fails otherwise, is returned unchanged.
+    ///
+    /// The lookup is a *tracked* edge from this fs target to the generator.
+    /// A provider whose `get` of the generator builds this fs target (the go
+    /// provider's `_golist` shape) closes a cycle the request's dep graph
+    /// reports, instead of waiting on the in-flight spec or execute it is
+    /// itself part of; the cycle is "any other error", so the original
+    /// wording stands. fs targets reserve nothing, so the lookup holds no
+    /// capacity another target could be waiting for.
     async fn reword_removed_generator(
         self: Arc<Self>,
         rs: &Arc<RequestState>,
@@ -317,7 +322,7 @@ impl Engine {
         let Ok(generator) = hmodel::htaddr::parse_addr(&cg.addr) else {
             return err;
         };
-        match self.get_spec_no_track(Arc::clone(rs), &generator).await {
+        match self.get_spec(Arc::clone(rs), &generator).await {
             Err(e)
                 if hcore::hmemoizer::downcast_chain_ref::<
                     crate::engine::error::TargetNotFoundError,
@@ -334,6 +339,9 @@ impl Engine {
         }
     }
 
+    /// Where a run in `sandbox_dir` can have written its log: the directory
+    /// itself and, when FUSE is mounted, the mount-side and backing-side
+    /// directories the bridge redirects it to.
     fn sandbox_roots(&self, sandbox_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
         let mut roots = vec![sandbox_dir.to_path_buf()];
         if self.fuse.mount.is_some()
