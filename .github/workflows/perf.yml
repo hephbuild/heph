@@ -72,7 +72,10 @@ jobs:
   perfbench:
     name: Perf ${{ matrix.os }}/${{ matrix.arch }}
     runs-on: ${{ matrix.runs-on }}
-    timeout-minutes: 20
+    # Measured with both tiers working (#551): Tier A 7.5–10 min, Tier B ~10 min
+    # on linux/arm64 and over 11 on darwin/arm64 (dist `cold` alone is ~38 s
+    # per rep, 16 reps). 20 only ever fit while Tier A was failing in seconds.
+    timeout-minutes: 45
     # Own group per leg (matrix.os/arch), separate from the top-level `ci-*`
     # group in `heph.yml`: this job's cost (real runners, real corpus, real
     # timing) is high enough to warrant its own policy rather than inheriting
