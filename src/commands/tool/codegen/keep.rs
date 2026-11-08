@@ -13,7 +13,7 @@ use serde_json::json;
 use super::status::{AddrState, resolve_addrs};
 use super::{
     JSON_SCHEMA, Report, ResolvedPath, blocking, display, read_gitignore, resolve_path, root_hint,
-    run_cli, with_hint,
+    run_cli, with_hint, write_gitignore,
 };
 use crate::commands::GlobalOptions;
 use crate::engine::gitignore::{self, CopyTargets, GitignoreEntry};
@@ -316,9 +316,7 @@ async fn drop_covering_lines(
             return Ok((Vec::new(), Vec::new()));
         }
         if !dry_run {
-            let path = root.join(".gitignore");
-            std::fs::write(&path, gitignore::render(&existing, &remaining))
-                .with_context(|| format!("writing {}", path.display()))?;
+            write_gitignore(&root, &gitignore::render(&existing, &remaining))?;
         }
         let snap = index.snapshot()?;
         let named: BTreeSet<&[u8]> = paths.iter().map(Vec::as_slice).collect();

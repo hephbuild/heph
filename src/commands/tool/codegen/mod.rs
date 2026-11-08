@@ -340,6 +340,46 @@ pub(crate) fn read_gitignore(root: &std::path::Path) -> anyhow::Result<Vec<u8>> 
     }
 }
 
+/// Replace `<root>/.gitignore` with `content`, atomically.
+///
+/// `std::fs::write` truncates and then fills, so a concurrent `heph.fs.glob`
+/// reading the section in between saw an empty file, and a crash in between
+/// left the committed file truncated. This writes a sibling temp file and
+/// renames it over the old one: a reader sees the old bytes or the new ones.
+/// The file keeps its permissions, and a symlinked `.gitignore` keeps its
+/// link: the rename replaces the file it points to.
+pub(crate) fn write_gitignore(root: &std::path::Path, content: &[u8]) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    use std::io::Write as _;
+
+    let link = root.join(".gitignore");
+    let path = match std::fs::canonicalize(&link) {
+        Ok(p) => p,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => link,
+        Err(e) => return Err(e).with_context(|| format!("resolving {}", link.display())),
+    };
+    let dir = path.parent().unwrap_or(root);
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".gitignore.")
+        .suffix(".heph-tmp")
+        .tempfile_in(dir)
+        .with_context(|| format!("creating a temp file next to {}", path.display()))?;
+    match std::fs::metadata(&path) {
+        Ok(meta) => tmp
+            .as_file()
+            .set_permissions(meta.permissions())
+            .with_context(|| format!("copying the permissions of {}", path.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+    tmp.write_all(content)
+        .and_then(|()| tmp.as_file().sync_all())
+        .with_context(|| format!("writing a temp file for {}", path.display()))?;
+    tmp.persist(&path)
+        .with_context(|| format!("replacing {}", path.display()))?;
+    Ok(())
+}
+
 /// The empty-index hint (spec: Upgrade, Discovery), from a count the caller
 /// already has.
 pub fn import_hint(matching_files: usize) -> String {
@@ -380,6 +420,74 @@ fn display(rel: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reader racing the rewrite sees the old bytes or the new ones, never
+    /// the empty or half-written file `std::fs::write` exposed between its
+    /// truncate and its write.
+    #[test]
+    fn write_gitignore_never_exposes_a_partial_file() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().to_path_buf();
+        let a = "# heph\n".repeat(20_000).into_bytes();
+        let b = "/gen/\n".repeat(30_000).into_bytes();
+        write_gitignore(&root, &a)?;
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = std::thread::spawn({
+            let (root, stop, a, b) = (root.clone(), Arc::clone(&stop), a.clone(), b.clone());
+            move || -> usize {
+                let mut reads = 0;
+                while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                    let got = read_gitignore(&root).expect("read");
+                    assert!(got == a || got == b, "a reader saw {} bytes", got.len());
+                    reads += 1;
+                }
+                reads
+            }
+        });
+        for i in 0..200 {
+            write_gitignore(&root, if i % 2 == 0 { &b } else { &a })?;
+        }
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        let reads = reader
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        assert!(reads > 0);
+
+        let left: Vec<_> = std::fs::read_dir(&root)?
+            .map(|e| e.map(|e| e.file_name()))
+            .collect::<Result<_, _>>()?;
+        assert_eq!(
+            left,
+            [std::ffi::OsString::from(".gitignore")],
+            "temp files left"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn write_gitignore_keeps_permissions_and_a_symlink() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        std::fs::write(root.join("real"), "old\n")?;
+        std::fs::set_permissions(root.join("real"), std::fs::Permissions::from_mode(0o640))?;
+        std::os::unix::fs::symlink("real", root.join(".gitignore"))?;
+
+        write_gitignore(root, b"new\n")?;
+
+        assert!(std::fs::symlink_metadata(root.join(".gitignore"))?.is_symlink());
+        assert_eq!(std::fs::read(root.join("real"))?, b"new\n");
+        let mode = std::fs::metadata(root.join("real"))?.permissions().mode();
+        assert_eq!(mode & 0o777, 0o640);
+
+        // No `.gitignore` yet: created, as `std::fs::write` did.
+        let fresh = tempfile::tempdir()?;
+        write_gitignore(fresh.path(), b"x\n")?;
+        assert_eq!(read_gitignore(fresh.path())?, b"x\n");
+        Ok(())
+    }
 
     #[test]
     fn wrap_exit_keeps_a_codegen_exit_and_wraps_anything_else_as_two() {

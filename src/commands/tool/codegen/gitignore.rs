@@ -4,10 +4,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::Context as _;
 use serde_json::json;
 
-use super::{JSON_SCHEMA, Report, blocking, display, read_gitignore, run_cli};
+use super::{JSON_SCHEMA, Report, blocking, display, read_gitignore, run_cli, write_gitignore};
 use crate::commands::GlobalOptions;
 use crate::engine::gitignore::{self, GitignoreEntry, StaleReason};
 use crate::engine::request_state::RequestState;
@@ -179,8 +178,7 @@ pub async fn gitignore(
     let path = root.join(".gitignore");
     let section_lock = engine.codegen_locks().section(rs.ctoken()).await?;
     let (existing, diff) = blocking({
-        let (root, path, matcher, check) =
-            (root.clone(), path.clone(), opts.matcher.clone(), opts.check);
+        let (root, matcher, check) = (root.clone(), opts.matcher.clone(), opts.check);
         move || {
             let _held = section_lock;
             let existing = read_gitignore(&root)?;
@@ -190,8 +188,7 @@ pub async fn gitignore(
             };
             let diff = gitignore::diff_section(&existing, &entries);
             if !check && diff.is_stale() {
-                std::fs::write(&path, &diff.rendered)
-                    .with_context(|| format!("writing {}", path.display()))?;
+                write_gitignore(&root, &diff.rendered)?;
             }
             Ok((existing, diff))
         }
