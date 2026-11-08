@@ -209,6 +209,11 @@ x=$(cat)
 echo "saw=[$x]"
 echo "saw=[$x]" > $OUT
 """)
+target(name = "typed_action", driver = "bash", out = "seen.txt", run = """
+echo "typed-action-""ready" >&2
+x=$(cat)
+echo "saw=[$x]" > $OUT
+""")
 "#;
 
 /// A credential read from `HEPH_E2E_SECRET`, presented as `$TOKEN`.
@@ -1529,15 +1534,14 @@ fn raw_build_target_gets_no_stdin() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// What the cache holds for `//app:stdin_action`, asked with nothing on stdin.
-fn cached_stdin_action(dist: &Dist, ws: &Workspace) -> anyhow::Result<String> {
+/// What the cache holds for `//app:<target>`, a `cat`-reading action, asked with
+/// nothing on stdin.
+fn cached_stdin_action(dist: &Dist, ws: &Workspace, target: &str) -> anyhow::Result<String> {
     use std::process::Stdio;
 
+    let addr = format!("//app:{target}");
     let child = ws
-        .cmd(
-            dist,
-            &["--no-tui", "run", "//app:stdin_action", "--cat-out"],
-        )
+        .cmd(dist, &["--no-tui", "run", &addr, "--cat-out"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1550,9 +1554,8 @@ fn cached_stdin_action(dist: &Dist, ws: &Workspace) -> anyhow::Result<String> {
 /// A plain build under the TUI, so stderr is a terminal and the run is not
 /// `--raw`, with fd 0 piped or a file. Stdin is no input of the cache key, so an
 /// action must not see it: the run that came second would get the first one's
-/// artifact. Only a terminal's keystrokes still reach a build, a hole reserved
-/// for the person typing them. Each value gets its own workspace, as a second run
-/// over the first one's cache would never start the action.
+/// artifact. Each value gets its own workspace, as a second run over the first
+/// one's cache would never start the action.
 #[test]
 fn piped_stdin_does_not_reach_a_cached_build() -> anyhow::Result<()> {
     let dist = Dist::locate();
@@ -1563,7 +1566,7 @@ fn piped_stdin_does_not_reach_a_cached_build() -> anyhow::Result<()> {
         let (pty, status) = run_held(&dist, &ws, &command, &[], |_| {});
         assert_eq!(status, 0, "{}", pty.seen());
         assert_eq!(
-            cached_stdin_action(&dist, &ws)?,
+            cached_stdin_action(&dist, &ws, "stdin_action")?,
             "saw=[]\n",
             "piped {piped}"
         );
@@ -1579,6 +1582,42 @@ fn piped_stdin_does_not_reach_a_cached_build() -> anyhow::Result<()> {
     );
     let (pty, status) = run_held(&dist, &ws, &command, &[], |_| {});
     assert_eq!(status, 0, "{}", pty.seen());
-    assert_eq!(cached_stdin_action(&dist, &ws)?, "saw=[]\n", "from a file");
+    assert_eq!(
+        cached_stdin_action(&dist, &ws, "stdin_action")?,
+        "saw=[]\n",
+        "from a file"
+    );
+    Ok(())
+}
+
+/// A plain build with fd 0 the terminal itself, under the TUI and not `--raw`.
+/// What a person types is no input of the cache key either, so the action must
+/// not see it: a `K` typed into this run would be what every later run gets from
+/// the cache. The action reads `/dev/null` instead; only `--shell` gets the
+/// keyboard. The keystrokes go in once the action is at its `cat`, so a wrapper
+/// that still relayed the terminal would hand them straight to it.
+#[test]
+fn typed_stdin_does_not_reach_a_cached_build() -> anyhow::Result<()> {
+    let dist = Dist::locate();
+    let ws = workspace()?;
+    let (pty, status) = run_held(
+        &dist,
+        &ws,
+        r#""$HEPH" run //app:typed_action"#,
+        &[],
+        |pty| {
+            pty.wait_for("typed-action-ready", DEADLINE);
+            // A line, then Ctrl-D: the paused TUI leaves the terminal cooked, so
+            // a relayed `cat` would read `K` and end at the EOF.
+            pty.send(b"K\n\x04");
+        },
+    );
+    assert_eq!(status, 0, "{}", pty.seen());
+    assert_eq!(
+        cached_stdin_action(&dist, &ws, "typed_action")?,
+        "saw=[]\n",
+        "typed into a plain build\n{}",
+        pty.seen()
+    );
     Ok(())
 }
