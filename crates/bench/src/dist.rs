@@ -13,6 +13,7 @@
 //! `measure_once` still split the same way as `inprocess`'s for a uniform
 //! orchestrator shape, not because a compatibility seam requires it here.
 
+use crate::inprocess::{cache_dir, wipe_cache};
 use anyhow::{Context, Result, bail};
 use bench_corpus::CorpusManifest;
 use clap::ValueEnum;
@@ -198,24 +199,6 @@ impl Scenario {
             | Scenario::CodegenImport => true,
         }
     }
-}
-
-/// The corpus's heph home, resolved from its config the way the binary does.
-fn cache_dir(corpus: &Path) -> Result<heph::engine::HomeDir> {
-    use heph::engine::ConfigYamlExt as _;
-    Ok(heph::engine::config_yaml::load_from_root(corpus)
-        .context("load corpus config")?
-        .resolve(corpus)
-        .context("resolve corpus config")?
-        .home_dir)
-}
-
-fn wipe_cache(corpus: &Path) -> Result<()> {
-    let dir = cache_dir(corpus)?;
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir).with_context(|| format!("remove {}", dir.display()))?;
-    }
-    Ok(())
 }
 
 /// The label carried by the go plugin's compile targets (`build_lib`,
@@ -481,7 +464,7 @@ mod tests {
 
         let mut e = Engine::new(Config::new(
             dir.path().to_path_buf(),
-            super::cache_dir(dir.path()).expect("home dir"),
+            crate::inprocess::cache_dir(dir.path()).expect("home dir"),
         ))
         .expect("engine");
         heph::commands::bootstrap::register_builtin_factories(&mut e, dir.path())

@@ -17,6 +17,8 @@ bench-corpus = { path = "../bench-corpus" }
 # not-a-real-process linkage `crates/e2e` uses. Tier B (`run dist`) never
 # calls into this: it only spawns the prebuilt binary located on disk.
 heph = { path = "../.." }
+# `fsutil::remove_dir_all`: wiping a corpus home that holds read-only dirs.
+hcore = { package = "core", path = "../core" }
 htestkit = { package = "testkit", path = "../testkit" }
 anyhow = "1"
 clap = { version = "4.6.1", features = ["derive"] }
