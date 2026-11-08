@@ -138,17 +138,22 @@ pub struct CorpusManifest {
 }
 
 /// The managed section's BEGIN line, as `heph tool codegen gitignore` renders
-/// it (`BEGIN_MARKER` in `crates/engine/src/engine/gitignore.rs`). Copied rather
-/// than imported, because this crate links no engine. heph finds a section by
-/// its `# BEGIN heph-generated` prefix alone, so text drift here only makes
+/// it (`BEGIN_MARKER` in `crates/walk/src/gitignore_section.rs`). Copied rather
+/// than imported, because this crate links no heph crate; `crates/bench`, which
+/// links both, asserts the two are equal. heph finds a section by its
+/// `# BEGIN heph-generated` prefix alone, so text drift here only makes
 /// `codegen gitignore --check` call the corpus stale; it never hides the section.
 pub const CODEGEN_BEGIN_MARKER: &str =
     "# BEGIN heph-generated (managed by `heph tool codegen gitignore` — do not edit)";
-/// The managed section's END line.
+/// The managed section's END line (`END_MARKER` beside `BEGIN_MARKER`).
 pub const CODEGEN_END_MARKER: &str = "# END heph-generated";
 
 /// Name of the one `copy` target codegen mode declares in each package.
 const CODEGEN_TARGET: &str = "codegen";
+
+/// The label every codegen-mode `copy` target carries, so one selection
+/// (`heph r codegen //...`) builds all of them and none of the bash targets.
+pub const CODEGEN_LABEL: &str = "codegen";
 
 /// Append codegen mode's `copy` targets to `pkg_src` and return their addrs
 /// and output paths (sorted by section pattern). Package `p` gets
@@ -181,7 +186,7 @@ fn add_codegen_targets(files: usize, pkg_src: &mut [String]) -> Result<(Vec<Stri
             .join(" && ");
         write!(
             src,
-            "target(\n    name = \"{CODEGEN_TARGET}\",\n    driver = \"bash\",\n    codegen = \"copy\",\n    run = \"{run}\",\n    out = [{out_list}],\n)\n\n"
+            "target(\n    name = \"{CODEGEN_TARGET}\",\n    driver = \"bash\",\n    codegen = \"copy\",\n    labels = [\"{CODEGEN_LABEL}\"],\n    run = \"{run}\",\n    out = [{out_list}],\n)\n\n"
         )
         .context("format codegen target")?;
         addrs.push(format!("//pkg{pkg}:{CODEGEN_TARGET}"));
@@ -205,6 +210,21 @@ fn codegen_gitignore(outputs: &[String]) -> Result<String> {
     }
     writeln!(s, "{CODEGEN_END_MARKER}").context("format section")?;
     Ok(s)
+}
+
+/// Change the content of every output of `pkg`'s codegen target (prefix each
+/// echoed line with `tag`), so its next build writes back every row it owns.
+/// Returns the BUILD file's previous source for the caller to restore.
+pub fn retag_codegen(root: &Path, pkg: &str, tag: &str) -> Result<String> {
+    let path = root.join(pkg).join("BUILD");
+    let src = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let from = format!("echo {pkg}/");
+    if !src.contains(&from) {
+        anyhow::bail!("{} declares no codegen target", path.display());
+    }
+    let retagged = src.replace(&from, &format!("echo {tag}{pkg}/"));
+    std::fs::write(&path, retagged).with_context(|| format!("write {}", path.display()))?;
+    Ok(src)
 }
 
 struct Layered {
@@ -703,6 +723,7 @@ mod tests {
             assert_eq!(*attr, format!("# //{pkg}:codegen"));
             let build = std::fs::read_to_string(dir.path().join(pkg).join("BUILD")).expect("BUILD");
             assert!(build.contains(r#"codegen = "copy""#), "{pkg}");
+            assert!(build.contains(r#"labels = ["codegen"]"#), "{pkg}");
             assert!(
                 build.contains(&format!("\"{file}\"")),
                 "{pkg} declares {file}"
@@ -769,6 +790,32 @@ mod tests {
         assert_eq!(manifest.bash_packages, ["pkg0", "pkg1", "pkg2"]);
         assert_eq!(manifest.codegen_addrs.len(), 5);
         assert!(dir.path().join("pkg4/BUILD").is_file());
+    }
+
+    /// The retag changes only the codegen target's echoed content (every
+    /// output of it), never a bash target, and hands back the source it
+    /// replaced; a package with no codegen target is an error, not a no-op.
+    #[test]
+    fn retag_codegen_rewrites_only_the_copy_outputs() {
+        // pkg0 and pkg1 get one output each; pkg2 holds only a bash target.
+        let params = CorpusParams {
+            target_count: 3,
+            packages: 3,
+            layers: 1,
+            codegen_files: 2,
+            ..Default::default()
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        generate(&params, dir.path()).expect("generate");
+        let before = std::fs::read_to_string(dir.path().join("pkg1/BUILD")).expect("read");
+
+        let original = retag_codegen(dir.path(), "pkg1", "x-").expect("retag");
+        assert_eq!(original, before);
+        let after = std::fs::read_to_string(dir.path().join("pkg1/BUILD")).expect("read");
+        assert_eq!(after.matches("echo x-pkg1/").count(), 1, "{after}");
+        assert!(after.contains("echo 1 > $OUT"), "bash target untouched");
+
+        retag_codegen(dir.path(), "pkg2", "x-").expect_err("pkg2 has no codegen target");
     }
 
     #[test]

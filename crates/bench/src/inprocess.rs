@@ -47,7 +47,7 @@ impl Scenario {
     }
 }
 
-fn build_engine(root: &Path) -> Result<Arc<Engine>> {
+pub(crate) fn build_engine(root: &Path) -> Result<Arc<Engine>> {
     let mut e = Engine::new(Config::new(root.to_path_buf(), cache_dir(root)?))
         .context("construct engine")?;
     e.register_provider(|init| {
@@ -84,7 +84,7 @@ async fn resolve_all(root: &Path) -> Result<()> {
 }
 
 /// The corpus's heph home, resolved from its config the way the binary does.
-fn cache_dir(corpus: &Path) -> Result<HomeDir> {
+pub(crate) fn cache_dir(corpus: &Path) -> Result<HomeDir> {
     Ok(heph::engine::config_yaml::load_from_root(corpus)
         .context("load corpus config")?
         .resolve(corpus)
@@ -92,7 +92,7 @@ fn cache_dir(corpus: &Path) -> Result<HomeDir> {
         .home_dir)
 }
 
-fn wipe_cache(corpus: &Path) -> Result<()> {
+pub(crate) fn wipe_cache(corpus: &Path) -> Result<()> {
     let dir = cache_dir(corpus)?;
     if dir.exists() {
         std::fs::remove_dir_all(&dir).with_context(|| format!("remove {}", dir.display()))?;

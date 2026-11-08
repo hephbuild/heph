@@ -134,11 +134,46 @@ fn go_config_yaml(manifest_path: &Path) -> String {
     )
 }
 
+/// The `.hephconfig` the codegen scenarios run under: the builtins the
+/// corpus's bash and `copy` targets need, and no plugin cdylib, so either
+/// side runs it whatever plugins its dist ships.
+const CODEGEN_CONFIG: &str = "plugins:\n  \
+     - builtin: buildfile\n    options:\n      patterns:\n        - BUILD\n  \
+     - builtin: exec\n  \
+     - builtin: bash\n";
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum Scenario {
     Cold,
     FullHit,
     Incremental,
+    /// Codegen corpus (`--codegen-files`): the root `glob("**")`
+    /// (`//@heph/fs:glob@p=**`) with the walk cache (`fswalk.db`) removed
+    /// before each rep. `prepare` has built every `copy` target, so the
+    /// generated files are on disk and recorded (N-1: stamped).
+    ///
+    /// Bar (spec): cold <= 1.25 x the probe-free baseline re-measured on the
+    /// codegen corpus. The harness's baseline is N-1 as released: while N-1
+    /// still has the xattr probe, the bar is against N-1 *with* it, a looser
+    /// bar than the spec's, since no "N-1 with the probe stubbed" build
+    /// exists to fetch. Once N-1 carries the index, it is the probe-free
+    /// baseline.
+    CodegenGlobCold,
+    /// As `codegen-glob-cold`, keeping the walk cache across reps.
+    CodegenGlobWarm,
+    /// Codegen corpus: rebuild every `copy` target after `prepare`'s full
+    /// build (all cache hits; each write-back finds nothing to do). Bar: <=
+    /// 1.02 x N-1's warm build plus N-1's own spread. Its exact bars (0
+    /// commits, 0 lock files) are `check-codegen`'s, on the candidate alone.
+    CodegenWarmBuild,
+    /// Codegen corpus: `heph tool codegen import` with the index db removed
+    /// before each rep (the files keep the xattr every write-back stamps).
+    /// Candidate only (`run dist --candidate-only`): N-1 has no import. Bar:
+    /// <= 1.1 x N-1's `codegen-glob-cold`, i.e. its glob with the probe,
+    /// through `compare`'s `against`. That baseline only has the probe while
+    /// N-1 predates the index; against a later N-1 this compares the import
+    /// with a probe-free glob, which the spec does not ask for.
+    CodegenImport,
 }
 
 impl Scenario {
@@ -147,6 +182,20 @@ impl Scenario {
             Scenario::Cold => "cold",
             Scenario::FullHit => "full-hit",
             Scenario::Incremental => "incremental",
+            Scenario::CodegenGlobCold => "codegen-glob-cold",
+            Scenario::CodegenGlobWarm => "codegen-glob-warm",
+            Scenario::CodegenWarmBuild => "codegen-warm-build",
+            Scenario::CodegenImport => "codegen-import",
+        }
+    }
+
+    fn is_codegen(self) -> bool {
+        match self {
+            Scenario::Cold | Scenario::FullHit | Scenario::Incremental => false,
+            Scenario::CodegenGlobCold
+            | Scenario::CodegenGlobWarm
+            | Scenario::CodegenWarmBuild
+            | Scenario::CodegenImport => true,
         }
     }
 }
@@ -178,16 +227,25 @@ const GO_BUILD_LABEL: &str = "go-build";
 /// Number of targets `heph` reported matching, parsed from its `matched N
 /// targets` line. `None` if no such line was emitted.
 fn matched_targets(stderr: &str) -> Option<u64> {
-    let rest = stderr.rsplit_once("matched ")?.1;
+    count_after(stderr, "matched ")
+}
+
+/// The number right after the last `word` in `output`.
+fn count_after(output: &str, word: &str) -> Option<u64> {
+    let rest = output.rsplit_once(word)?.1;
     let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
     digits.parse().ok()
 }
 
-fn build_go_tree(dist: &Dist, corpus: &Path) -> Result<f64> {
+/// Run `heph <args>` in `corpus` with a throwaway `HOME`: the elapsed
+/// milliseconds and the combined stdout + stderr. A non-zero exit is an error
+/// carrying that output.
+fn run_heph(dist: &Dist, corpus: &Path, args: &[&str]) -> Result<(f64, String)> {
     let home = tempfile::tempdir().context("create HOME tempdir")?;
+    let what = args.join(" ");
     let start = Instant::now();
     let out = Command::new(dist.heph())
-        .args(["r", GO_BUILD_LABEL, "//go/..."])
+        .args(args)
         .current_dir(corpus)
         .env("HOME", home.path())
         .env("HEPH_CWD", corpus)
@@ -195,16 +253,21 @@ fn build_go_tree(dist: &Dist, corpus: &Path) -> Result<f64> {
         .env("HEPH_DISABLE_TELEMETRY", "1")
         .stdin(Stdio::null())
         .output()
-        .context("spawn heph r go-build //go/...")?;
-    let stderr =
+        .with_context(|| format!("spawn heph {what}"))?;
+    let ms = start.elapsed().as_secs_f64() * 1000.0;
+    let output =
         String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
     if !out.status.success() {
         bail!(
-            "heph r {GO_BUILD_LABEL} //go/... failed: status {}\n--- output ---\n{}",
+            "heph {what} failed: status {}\n--- output ---\n{output}",
             out.status,
-            stderr,
         );
     }
+    Ok((ms, output))
+}
+
+fn build_go_tree(dist: &Dist, corpus: &Path) -> Result<f64> {
+    let (ms, stderr) = run_heph(dist, corpus, &["r", GO_BUILD_LABEL, "//go/..."])?;
     // A selection that matches nothing still exits 0, so without this a broken
     // corpus or a renamed label reads as a passing — and very fast — benchmark.
     // That is not hypothetical: this scenario spent its whole life matching zero
@@ -218,7 +281,113 @@ fn build_go_tree(dist: &Dist, corpus: &Path) -> Result<f64> {
         ),
         Some(_) => {}
     }
-    Ok(start.elapsed().as_secs_f64() * 1000.0)
+    Ok(ms)
+}
+
+/// The root glob every codegen glob scenario resolves.
+const ROOT_GLOB: &str = "//@heph/fs:glob@p=**";
+
+/// Build every `copy` target of the codegen corpus (by its label), checking
+/// the selection matched exactly the manifest's count.
+fn build_codegen(dist: &Dist, corpus: &Path, expected: usize) -> Result<f64> {
+    let (ms, output) = run_heph(dist, corpus, &["r", bench_corpus::CODEGEN_LABEL, "//..."])?;
+    let matched = matched_targets(&output);
+    if matched != u64::try_from(expected).ok() {
+        bail!(
+            "heph r {} //... matched {matched:?} targets, the corpus declares {expected} — \
+             this would time something other than the copy targets\n--- output ---\n{output}",
+            bench_corpus::CODEGEN_LABEL,
+        );
+    }
+    Ok(ms)
+}
+
+fn glob_root(dist: &Dist, corpus: &Path) -> Result<f64> {
+    let (ms, output) = run_heph(dist, corpus, &["r", ROOT_GLOB])?;
+    if matched_targets(&output) != Some(1) {
+        bail!("heph r {ROOT_GLOB} did not match the glob target\n--- output ---\n{output}");
+    }
+    Ok(ms)
+}
+
+/// Remove every file `prefix` names in `dir` (`fswalk.db`, its `-wal`,
+/// `-shm` and lock siblings). A missing `dir` is nothing to remove.
+fn remove_prefixed(dir: &Path, prefix: &str) -> Result<()> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("list {}", dir.display())),
+    };
+    for entry in entries {
+        let entry = entry.with_context(|| format!("list {}", dir.display()))?;
+        if entry.file_name().to_string_lossy().starts_with(prefix) {
+            std::fs::remove_file(entry.path())
+                .with_context(|| format!("remove {}", entry.path().display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// `heph tool codegen import` into a removed index; the count it recorded
+/// must be every corpus output, or the rep timed a scan that found nothing
+/// (a filesystem without xattrs, or a prepare that never built).
+fn import_codegen(dist: &Dist, corpus: &Path, expected: usize) -> Result<f64> {
+    let home = cache_dir(corpus)?;
+    let codegen = heph::htwalk::codegen_index::codegen_dir(&home);
+    if codegen.exists() {
+        std::fs::remove_dir_all(&codegen)
+            .with_context(|| format!("remove {}", codegen.display()))?;
+    }
+    let (ms, output) = run_heph(dist, corpus, &["tool", "codegen", "import"])?;
+    let recorded = count_after(&output, "recorded ");
+    if recorded != u64::try_from(expected).ok() {
+        bail!(
+            "heph tool codegen import recorded {recorded:?} files, the corpus has {expected} \
+             stamped outputs\n--- output ---\n{output}"
+        );
+    }
+    Ok(ms)
+}
+
+pub(crate) fn write_codegen_config(corpus: &Path) -> Result<()> {
+    std::fs::write(corpus.join(".hephconfig"), CODEGEN_CONFIG).context("write .hephconfig")
+}
+
+/// Codegen scenarios' prepare: a wiped home and one full build of every
+/// `copy` target, which writes the files back and records (N-1: stamps) them.
+fn prepare_codegen(dist: &Dist, corpus: &Path) -> Result<()> {
+    write_codegen_config(corpus)?;
+    let manifest = bench_corpus::load_manifest(corpus).context("load corpus manifest")?;
+    if manifest.codegen_addrs.is_empty() {
+        bail!("corpus has no copy targets (generate with --codegen-files > 0)");
+    }
+    wipe_cache(corpus)?;
+    build_codegen(dist, corpus, manifest.codegen_addrs.len())?;
+    Ok(())
+}
+
+fn measure_codegen(
+    dist: &Dist,
+    corpus: &Path,
+    manifest: &CorpusManifest,
+    scenario: Scenario,
+) -> Result<f64> {
+    if manifest.codegen_addrs.is_empty() {
+        bail!("corpus has no copy targets (generate with --codegen-files > 0)");
+    }
+    write_codegen_config(corpus)?;
+    match scenario {
+        Scenario::CodegenGlobCold => {
+            remove_prefixed(&cache_dir(corpus)?.join("cache"), "fswalk.db")?;
+            glob_root(dist, corpus)
+        }
+        Scenario::CodegenGlobWarm => glob_root(dist, corpus),
+        Scenario::CodegenWarmBuild => build_codegen(dist, corpus, manifest.codegen_addrs.len()),
+        Scenario::CodegenImport => import_codegen(dist, corpus, manifest.codegen_outputs.len()),
+        Scenario::Cold | Scenario::FullHit | Scenario::Incremental => {
+            bail!("{} is not a codegen scenario", scenario.name())
+        }
+    }
 }
 
 /// `corpus` must already be absolute (canonicalize before calling — see
@@ -226,13 +395,12 @@ fn build_go_tree(dist: &Dist, corpus: &Path) -> Result<f64> {
 /// runs with `current_dir(corpus)`).
 pub fn prepare(dist_dir: &Path, corpus: &Path, scenario: Scenario) -> Result<()> {
     let dist = Dist::locate(dist_dir)?;
-    write_go_config(corpus, &dist)?;
-    match scenario {
-        Scenario::Cold | Scenario::FullHit | Scenario::Incremental => {
-            wipe_cache(corpus)?;
-            build_go_tree(&dist, corpus)?;
-        }
+    if scenario.is_codegen() {
+        return prepare_codegen(&dist, corpus);
     }
+    write_go_config(corpus, &dist)?;
+    wipe_cache(corpus)?;
+    build_go_tree(&dist, corpus)?;
     Ok(())
 }
 
@@ -247,6 +415,9 @@ pub fn measure_once(
     scenario: Scenario,
     mutate_seed: u64,
 ) -> Result<f64> {
+    if scenario.is_codegen() {
+        return measure_codegen(&Dist::locate(dist_dir)?, corpus, manifest, scenario);
+    }
     if manifest.go_package_count == 0 {
         bail!(
             "corpus has no go/ subtree (generate with --go-packages > 0) — nothing for Tier B to build"

@@ -1,3 +1,4 @@
+mod codegen;
 mod compare;
 mod dist;
 mod inprocess;
@@ -35,6 +36,11 @@ enum Cmd {
     MeasureInprocess(MeasureInprocessArgs),
     /// Decide regression between two `run` result files.
     Compare(CompareArgs),
+    /// The codegen index's exact bars on a codegen corpus, on this build's
+    /// own engine (no baseline): a warm build commits nothing and takes no
+    /// lock, a write-back clones only the overlay, and `status` on a miss
+    /// scales with the section. Exits non-zero when one fails.
+    CheckCodegen(CheckCodegenArgs),
 }
 
 #[derive(Args)]
@@ -145,8 +151,8 @@ struct RunDistArgs {
     /// (same layout `crates/bin-e2e`'s `Dist` expects). Never rebuilt here.
     #[arg(long)]
     candidate_dist: PathBuf,
-    #[arg(long)]
-    baseline_dist: PathBuf,
+    #[arg(long, required_unless_present = "candidate_only")]
+    baseline_dist: Option<PathBuf>,
     #[arg(long)]
     corpus: PathBuf,
     #[arg(long, value_enum)]
@@ -157,8 +163,27 @@ struct RunDistArgs {
     reps: usize,
     #[arg(long)]
     out_candidate: PathBuf,
+    #[arg(long, required_unless_present = "candidate_only")]
+    out_baseline: Option<PathBuf>,
+    /// Time the candidate alone: for a scenario the baseline cannot run
+    /// (`codegen-import`, which N-1 may predate), whose bar `compare` takes
+    /// from another scenario's baseline (`against` in the thresholds file).
+    #[arg(long, conflicts_with_all = ["baseline_dist", "out_baseline"])]
+    candidate_only: bool,
+}
+
+#[derive(Args)]
+struct CheckCodegenArgs {
+    /// A codegen corpus (`corpus --codegen-files N`, N >= 2 packages' worth).
+    /// Its heph home is wiped; every BUILD file edited is restored.
     #[arg(long)]
-    out_baseline: PathBuf,
+    corpus: PathBuf,
+    /// `status` calls per microbench sample.
+    #[arg(long, default_value_t = 200_000)]
+    status_iters: usize,
+    /// Interleaved microbench rounds; the bar is on the medians.
+    #[arg(long, default_value_t = 5)]
+    status_rounds: usize,
 }
 
 #[derive(Args)]
@@ -211,7 +236,34 @@ fn main() -> Result<()> {
             rt.block_on(run_measure_inprocess(args))
         }
         Cmd::Compare(args) => run_compare(args),
+        Cmd::CheckCodegen(args) => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("build tokio runtime")?;
+            rt.block_on(run_check_codegen(args))
+        }
     }
+}
+
+async fn run_check_codegen(args: CheckCodegenArgs) -> Result<()> {
+    let corpus = args
+        .corpus
+        .canonicalize()
+        .with_context(|| format!("canonicalize {}", args.corpus.display()))?;
+    let manifest = bench_corpus::load_manifest(&corpus)
+        .context("load corpus manifest (run `corpus --codegen-files N` first)")?;
+    let checks = codegen::check(&corpus, &manifest, args.status_iters, args.status_rounds).await?;
+    let mut failed = 0;
+    for c in &checks {
+        let verdict = if c.ok { "ok" } else { "FAIL" };
+        println!("{verdict} {}: {}", c.name, c.detail);
+        failed += usize::from(!c.ok);
+    }
+    if failed > 0 {
+        anyhow::bail!("{failed} codegen check(s) failed — see above");
+    }
+    Ok(())
 }
 
 fn run_corpus(args: GenerateArgs) -> Result<()> {
@@ -397,9 +449,16 @@ fn run_dist_both(args: RunDistArgs) -> Result<()> {
     let manifest = bench_corpus::load_manifest(&corpus)
         .context("load corpus manifest (run `corpus` first)")?;
 
+    // `None` under `--candidate-only` (clap makes both present otherwise).
+    let baseline = args
+        .baseline_dist
+        .as_deref()
+        .zip(args.out_baseline.as_deref());
     for _ in 0..args.warmup {
         dist::prepare(&args.candidate_dist, &corpus, args.scenario).context("prepare candidate")?;
-        dist::prepare(&args.baseline_dist, &corpus, args.scenario).context("prepare baseline")?;
+        if let Some((dist_dir, _)) = baseline {
+            dist::prepare(dist_dir, &corpus, args.scenario).context("prepare baseline")?;
+        }
     }
 
     let mut candidate_ms = Vec::with_capacity(args.reps);
@@ -416,10 +475,12 @@ fn run_dist_both(args: RunDistArgs) -> Result<()> {
             )
             .context("measure candidate")?,
         );
-        baseline_ms.push(
-            dist::measure_once(&args.baseline_dist, &corpus, &manifest, args.scenario, seed)
-                .context("measure baseline")?,
-        );
+        if let Some((dist_dir, _)) = baseline {
+            baseline_ms.push(
+                dist::measure_once(dist_dir, &corpus, &manifest, args.scenario, seed)
+                    .context("measure baseline")?,
+            );
+        }
     }
 
     write_results(
@@ -428,12 +489,9 @@ fn run_dist_both(args: RunDistArgs) -> Result<()> {
         args.scenario.name(),
         candidate_ms,
     )?;
-    write_results(
-        &args.out_baseline,
-        "dist",
-        args.scenario.name(),
-        baseline_ms,
-    )?;
+    if let Some((_, out)) = baseline {
+        write_results(out, "dist", args.scenario.name(), baseline_ms)?;
+    }
     Ok(())
 }
 
