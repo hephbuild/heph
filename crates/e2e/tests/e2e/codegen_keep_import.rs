@@ -165,7 +165,11 @@ async fn gitignore(engine: &Arc<Engine>) -> anyhow::Result<()> {
 
 async fn status_report(engine: &Arc<Engine>) -> anyhow::Result<status::StatusReport> {
     let rs = engine.new_state();
-    let res = status::status(engine, &rs, status::Options::default()).await;
+    let opts = status::Options {
+        hint: true,
+        ..status::Options::default()
+    };
+    let res = status::status(engine, &rs, opts).await;
     common::drain(rs).await;
     res
 }

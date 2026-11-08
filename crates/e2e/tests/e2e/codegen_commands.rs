@@ -130,6 +130,7 @@ async fn status(engine: &Arc<Engine>) -> anyhow::Result<StatusReport> {
         st::Options {
             check: false,
             settle: true,
+            hint: true,
         },
     )
     .await
@@ -659,6 +660,7 @@ async fn status_check_result_kinds() -> anyhow::Result<()> {
     let check = st::Options {
         check: true,
         settle: true,
+        hint: true,
     };
 
     let clean = status_with(&ws.engine, check).await?;
@@ -1113,6 +1115,33 @@ async fn validate_warns_local_findings() -> anyhow::Result<()> {
         "{w:?}"
     );
     assert!(!w.iter().any(|l| l.contains("section_stale")), "{w:?}");
+    Ok(())
+}
+
+/// Lifecycle row 22: on a fresh checkout (no index, a section whose line
+/// matches a file) `codegen status` walks the tree for the `codegen import`
+/// hint; `validate`'s listing does not, so CI walks nothing.
+#[tokio::test]
+async fn validate_skips_the_import_hint_walk() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    write_section(&ws, &["/p/a.txt"]);
+    ws.write_file("p/a.txt", "aaa");
+
+    let cli = status(&ws.engine).await?;
+    assert!(cli.hint.is_some(), "the CLI computes the hint: {cli:?}");
+
+    let listed = status_with(&ws.engine, st::Options::VALIDATE).await?;
+    assert_eq!(listed.hint, None, "{listed:?}");
+
+    let findings = validate(&ws.engine).await;
+    assert!(
+        !findings
+            .warnings
+            .iter()
+            .any(|w| w.contains("codegen import")),
+        "{:?}",
+        findings.warnings
+    );
     Ok(())
 }
 

@@ -248,10 +248,7 @@ pub async fn codegen_findings(
     }
     .await;
     // Serial with the check above, for the reason `run` gives.
-    let opts = codegen_status::Options {
-        check: false,
-        settle: false,
-    };
+    let opts = codegen_status::Options::VALIDATE;
     let warnings = match codegen_status::status(engine, rs, opts).await {
         Ok(report) => local_findings_warnings(&report),
         Err(e) => vec![format!(

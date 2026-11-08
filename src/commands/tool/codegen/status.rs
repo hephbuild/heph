@@ -33,6 +33,20 @@ pub struct Options {
     /// Settle pending rows from a fresh hash, each target under its lock.
     /// `validate` reads without settling.
     pub settle: bool,
+    /// Compute the `codegen import` hint: on an empty index, a walk of the
+    /// tree counting the files the section matches. `validate` leaves it
+    /// off, so a fresh checkout walks nothing (Lifecycle row 22).
+    pub hint: bool,
+}
+
+impl Options {
+    /// What `validate` lists its codegen findings with: no settling, no
+    /// hint walk.
+    pub const VALIDATE: Self = Self {
+        check: false,
+        settle: false,
+        hint: false,
+    };
 }
 
 /// What a listed item needs.
@@ -407,7 +421,11 @@ pub async fn status(
         ka.cmp(&kb)
     });
 
-    let hint = empty_index_hint(engine).await?;
+    let hint = if opts.hint {
+        empty_index_hint(engine).await?
+    } else {
+        None
+    };
     Ok(StatusReport {
         check: opts.check,
         items,
@@ -419,6 +437,7 @@ pub fn execute(args: &Args, sink: LogSink, global: &GlobalOptions) -> anyhow::Re
     let opts = Options {
         check: args.check,
         settle: true,
+        hint: true,
     };
     run_cli(
         "Codegen status",
