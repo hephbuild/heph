@@ -226,6 +226,9 @@ pub struct Engine {
     pub(crate) codegen_index: Arc<hwalk::codegen_index::CodegenIndex>,
     /// Set once the opening step has run: [`Engine::open_codegen_index`].
     pub(crate) codegen_index_opened: tokio::sync::OnceCell<()>,
+    /// The one way this engine's commands read the provenance xattr an older
+    /// heph stamped: [`Engine::xattr_probe`].
+    pub(crate) xattr_probe: Arc<dyn hwalk::codegen_index::import::XattrProbe>,
     /// The codegen index's target, section and import locks.
     pub(crate) codegen_locks: crate::engine::codegen_lock::CodegenLocks,
     /// The no-section write-back hint was printed by this engine. `meta`
@@ -537,6 +540,12 @@ impl Engine {
         hook: impl Fn(&hmodel::htaddr::Addr) + Send + Sync + 'static,
     ) {
         self.codegen_written_hook = Some(Box::new(hook));
+    }
+
+    /// Replace the probe [`xattr_probe`](Self::xattr_probe) hands out, so a
+    /// test can count the xattr reads a command makes, or block one.
+    pub fn set_xattr_probe(&mut self, probe: Arc<dyn hwalk::codegen_index::import::XattrProbe>) {
+        self.xattr_probe = probe;
     }
 }
 
@@ -855,6 +864,7 @@ impl Engine {
             walker,
             codegen_index,
             codegen_index_opened: tokio::sync::OnceCell::new(),
+            xattr_probe: Arc::new(hwalk::codegen_index::import::RealXattr),
             codegen_locks,
             codegen_no_section_hint_printed: std::sync::atomic::AtomicBool::new(false),
             providers: vec![],
@@ -1089,6 +1099,16 @@ impl Engine {
     /// This checkout's codegen file index.
     pub fn codegen_index(&self) -> &Arc<hwalk::codegen_index::CodegenIndex> {
         &self.codegen_index
+    }
+
+    /// The provenance-xattr probe every command of this engine reads an older
+    /// heph's stamp through (`codegen import`'s walk). [`RealXattr`] unless a
+    /// test replaced it (`set_xattr_probe`), so a test can count the probes
+    /// a command makes, the `status` / `why` hint's included (spec: Upgrade).
+    ///
+    /// [`RealXattr`]: hwalk::codegen_index::import::RealXattr
+    pub fn xattr_probe(&self) -> &Arc<dyn hwalk::codegen_index::import::XattrProbe> {
+        &self.xattr_probe
     }
 
     /// The codegen index's cross-process locks (J9): a command takes them

@@ -13,7 +13,7 @@ use crate::engine::Engine;
 use crate::engine::event::BuildEventKind;
 use crate::engine::request_state::RequestState;
 use crate::tui::LogSink;
-use hwalk::codegen_index::import::{ImportCounts, RealXattr, scan};
+use hwalk::codegen_index::import::{ImportCounts, scan};
 
 #[derive(clap::Args, Clone, Debug, Default)]
 pub struct Args {
@@ -82,6 +82,7 @@ pub async fn import(engine: &Arc<Engine>, rs: &Arc<RequestState>) -> anyhow::Res
 
     let index = Arc::clone(engine.codegen_index());
     let (dirs, globs) = (engine.skip_dirs(), engine.skip_globs());
+    let probe = Arc::clone(engine.xattr_probe());
     let (guard, found, created) = blocking({
         let index = Arc::clone(&index);
         move || {
@@ -91,7 +92,7 @@ pub async fn import(engine: &Arc<Engine>, rs: &Arc<RequestState>) -> anyhow::Res
                 index.root(),
                 &ignore,
                 index.fs().as_ref(),
-                &RealXattr,
+                probe.as_ref(),
                 snap.section(),
             )?;
             let created = index.import_create(&guard, &found)?;

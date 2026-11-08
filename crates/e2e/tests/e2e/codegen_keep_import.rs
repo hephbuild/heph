@@ -29,13 +29,14 @@ use heph::commands::tool::codegen::{Report as _, gitignore as gitignore_cmd, sta
 use heph::engine::event::{BuildEvent, BuildEventKind};
 use heph::engine::{Config, Engine, HomeDir, OutputMatcher, ResultOptions};
 use heph::htaddr::parse_addr;
-use heph::htwalk::codegen_index::import::CODEGEN_XATTR;
+use heph::htwalk::codegen_index::import::{CODEGEN_XATTR, RealXattr, XattrProbe};
 use heph::htwalk::codegen_index::{Row, RowState, StatusKind, StatusReason, Store, StoreOptions};
 use heph::htwalk::gitignore_section::{BEGIN_MARKER, END_MARKER};
 use heph::{pluginbuildfile, pluginexec};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
@@ -386,7 +387,19 @@ async fn capture_warnings<F: std::future::Future>(fut: F) -> (F::Output, String)
 /// An engine over `root` whose home is `home` (absolute, possibly shared by
 /// several checkouts): buildfile provider, bash driver.
 fn engine_with_home(root: &Path, home: &Path) -> anyhow::Result<Arc<Engine>> {
-    let home = HomeDir::resolve(root, Some(home))?;
+    Ok(Arc::new(unshared_engine(root, Some(home))?))
+}
+
+/// An engine over `root` (default home) whose xattr reads all go through
+/// `probe`: the next invocation, with the probe a test stands in.
+fn engine_with_probe(root: &Path, probe: Arc<dyn XattrProbe>) -> anyhow::Result<Arc<Engine>> {
+    let mut e = unshared_engine(root, None)?;
+    e.set_xattr_probe(probe);
+    Ok(Arc::new(e))
+}
+
+fn unshared_engine(root: &Path, home: Option<&Path>) -> anyhow::Result<Engine> {
+    let home = HomeDir::resolve(root, home)?;
     let mut e = Engine::new(Config::new(root.to_path_buf(), home))?;
     let provider_root = root.to_path_buf();
     e.register_provider(move |init| {
@@ -397,7 +410,24 @@ fn engine_with_home(root: &Path, home: &Path) -> anyhow::Result<Arc<Engine>> {
         ))
     })?;
     e.register_managed_driver(|_| Box::new(pluginexec::Driver::new_bash().with_host_path()))?;
-    Ok(Arc::new(e))
+    Ok(e)
+}
+
+/// The real probe, counting every read made through it.
+#[derive(Debug, Default)]
+struct CountingProbe(AtomicUsize);
+
+impl CountingProbe {
+    fn count(&self) -> usize {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+impl XattrProbe for CountingProbe {
+    fn get(&self, path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        RealXattr.get(path)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1204,8 +1234,10 @@ async fn why_hints_import_on_matched_path_with_empty_index() -> anyhow::Result<(
 
 /// The hint counts section matches, never stamps: the files it counts are the
 /// ones a line covers, stamped or not, and the stamped files outside every
-/// line are neither counted nor recorded. Its walk takes no `XattrProbe` at
-/// all, so the injected-probe form of this test has nothing to inject into.
+/// line are neither counted nor recorded. And it reads no xattr: the engine's
+/// probe ([`Engine::xattr_probe`], the one every command reads a stamp
+/// through) counts 0 reads across `status` and `why` with the hint printed,
+/// while `import` on the same engine, the control, reads through it.
 #[tokio::test]
 async fn import_hint_probes_no_xattr() -> anyhow::Result<()> {
     let ws = Workspace::new();
@@ -1214,16 +1246,28 @@ async fn import_hint_probes_no_xattr() -> anyhow::Result<()> {
     stamped_file(&ws, "p/b.txt", "bbb", "//p:b")?;
     stamped_file(&ws, "q/c.txt", "ccc", "//q:c")?;
     write_section(&ws, &["/p/a.txt"]);
+    let probe = Arc::new(CountingProbe::default());
+    let engine = engine_with_probe(ws.dir.path(), Arc::clone(&probe) as Arc<dyn XattrProbe>)?;
 
-    let hint = status_report(&ws.engine).await?.hint.context("the hint")?;
+    let hint = status_report(&engine).await?.hint.context("the hint")?;
     assert!(hint.contains("1 file matches"), "{hint}");
-    let hint = why_report(&ws.engine, &["p/a.txt", "p/b.txt"])
+    let hint = why_report(&engine, &["p/a.txt", "p/b.txt"])
         .await?
         .hint
         .context("the why hint")?;
     assert!(hint.contains("1 file matches"), "{hint}");
-    assert!(store(&ws.engine)?.is_none(), "nothing was recorded");
-    assert_eq!(status_of(&ws.engine, "p/b.txt")?.0, StatusKind::Source);
+    assert_eq!(probe.count(), 0, "status and why probed an xattr");
+    assert!(store(&engine)?.is_none(), "nothing was recorded");
+    assert_eq!(status_of(&engine, "p/b.txt")?.0, StatusKind::Source);
+
+    // The control: the import reads every file's xattr through the same probe.
+    let report = import(&engine).await?;
+    assert_eq!(report.recorded, 2, "{report:?}");
+    assert!(
+        probe.count() >= 3,
+        "the import read each file's xattr through the engine's probe: {}",
+        probe.count()
+    );
     Ok(())
 }
 
