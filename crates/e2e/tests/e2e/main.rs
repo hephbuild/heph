@@ -21,6 +21,7 @@ mod cache_load;
 mod cache_outcome;
 mod clean;
 mod codegen_in_place;
+mod codegen_index_read;
 mod codegen_index_write;
 mod core_resource;
 mod deps;

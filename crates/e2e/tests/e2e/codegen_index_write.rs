@@ -37,7 +37,7 @@ use std::time::Duration;
 // ---------------------------------------------------------------------------
 
 /// A `copy` target `name` writing `body` to `out` in its package.
-fn copy_target(name: &str, out: &str, body: &str) -> String {
+pub(crate) fn copy_target(name: &str, out: &str, body: &str) -> String {
     format!(
         r#"
 target(
@@ -67,7 +67,11 @@ target(
 
 /// Run `addr` on `engine` (all outputs), surfacing the root cause the way
 /// `heph run` renders it.
-async fn run_with(engine: &Arc<Engine>, addr: &str, opts: &ResultOptions) -> anyhow::Result<()> {
+pub(crate) async fn run_with(
+    engine: &Arc<Engine>,
+    addr: &str,
+    opts: &ResultOptions,
+) -> anyhow::Result<()> {
     let parsed = parse_addr(addr)?;
     let rs = engine.new_state();
     let res = Arc::clone(engine)
@@ -92,7 +96,7 @@ async fn run_with(engine: &Arc<Engine>, addr: &str, opts: &ResultOptions) -> any
     }
 }
 
-async fn run_on(engine: &Arc<Engine>, addr: &str) -> anyhow::Result<()> {
+pub(crate) async fn run_on(engine: &Arc<Engine>, addr: &str) -> anyhow::Result<()> {
     run_with(engine, addr, &ResultOptions::default()).await
 }
 
@@ -114,7 +118,7 @@ fn db_file(engine: &Engine) -> PathBuf {
 
 /// The db as another process sees it: opened fresh, so nothing an engine
 /// caches stands in for what was committed. `None` while there is no db.
-fn store(engine: &Engine) -> anyhow::Result<Option<Store>> {
+pub(crate) fn store(engine: &Engine) -> anyhow::Result<Option<Store>> {
     let path = db_file(engine);
     if !path.exists() {
         return Ok(None);
@@ -129,19 +133,22 @@ fn generation(engine: &Engine) -> anyhow::Result<u64> {
     })
 }
 
-fn row(engine: &Engine, rel: &str) -> anyhow::Result<Option<Row>> {
+pub(crate) fn row(engine: &Engine, rel: &str) -> anyhow::Result<Option<Row>> {
     Ok(match store(engine)? {
         Some(s) => s.row(rel.as_bytes())?,
         None => None,
     })
 }
 
-fn must_row(engine: &Engine, rel: &str) -> anyhow::Result<Row> {
+pub(crate) fn must_row(engine: &Engine, rel: &str) -> anyhow::Result<Row> {
     row(engine, rel)?.with_context(|| format!("no index row for {rel}"))
 }
 
 /// What a fresh snapshot says `rel` is.
-fn status(engine: &Engine, rel: &str) -> anyhow::Result<(StatusKind, Option<StatusReason>)> {
+pub(crate) fn status(
+    engine: &Engine,
+    rel: &str,
+) -> anyhow::Result<(StatusKind, Option<StatusReason>)> {
     let index: &CodegenIndex = engine.codegen_index();
     index.open_existing()?;
     let snap = index.snapshot()?;
@@ -166,12 +173,12 @@ fn assert_recorded(row: &Row, addr: &str, bytes: &str) {
     );
 }
 
-fn read(ws: &Workspace, rel: &str) -> Option<String> {
+pub(crate) fn read(ws: &Workspace, rel: &str) -> Option<String> {
     std::fs::read_to_string(ws.dir.path().join(rel)).ok()
 }
 
 /// A root `.gitignore` whose managed section holds `lines`.
-fn write_section(ws: &Workspace, lines: &[&str]) {
+pub(crate) fn write_section(ws: &Workspace, lines: &[&str]) {
     let mut text = format!("{BEGIN_MARKER}\n");
     for l in lines {
         text.push_str(l);
@@ -231,7 +238,15 @@ impl Captured {
 /// returned buffer. The callers run on a current-thread runtime, so every
 /// engine task — where the write-back's messages are logged — is polled on
 /// this thread.
-async fn capture_warnings<F: std::future::Future>(fut: F) -> (F::Output, String) {
+pub(crate) async fn capture_warnings<F: std::future::Future>(fut: F) -> (F::Output, String) {
+    capture_logs(tracing_subscriber::filter::LevelFilter::WARN, fut).await
+}
+
+/// [`capture_warnings`] at `level`.
+pub(crate) async fn capture_logs<F: std::future::Future>(
+    level: tracing_subscriber::filter::LevelFilter,
+    fut: F,
+) -> (F::Output, String) {
     use tracing_subscriber::util::SubscriberInitExt as _;
     let log = Captured::default();
     let writer = log.clone();
@@ -241,7 +256,7 @@ async fn capture_warnings<F: std::future::Future>(fut: F) -> (F::Output, String)
         let _guard = tracing_subscriber::fmt()
             .with_writer(move || writer.clone())
             .with_ansi(false)
-            .with_max_level(tracing_subscriber::filter::LevelFilter::WARN)
+            .with_max_level(level)
             .set_default();
         fut.await
     };
