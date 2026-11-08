@@ -844,6 +844,10 @@ async fn write_back_still_sets_xattr() -> anyhow::Result<()> {
     let probe = ws.dir.path().join("xattr-probe");
     std::fs::write(&probe, "")?;
     if let Err(e) = xattr::set(&probe, "user.heph.probe", b"1") {
+        assert!(
+            !common::xattrs_required(),
+            "no xattr support here ({e}), and CI or HEPH_REQUIRE_XATTRS requires it"
+        );
         eprintln!("skipping write_back_still_sets_xattr: no xattr support here ({e})");
         return Ok(());
     }

@@ -10,7 +10,7 @@
 //! invocation: it re-reads the BUILD files, so a target removed from one is
 //! gone for it. Stamping a file with `user.heph.codegen` stands in for what an
 //! older heph wrote; a test that needs it skips, saying so, on a filesystem
-//! without xattrs.
+//! without xattrs, and fails instead in CI or with `HEPH_REQUIRE_XATTRS` set.
 #![expect(
     clippy::panic_in_result_fn,
     reason = "restriction/style lints scoped to production code; tests are exempt"
@@ -264,11 +264,18 @@ fn section_has(ws: &Workspace, pattern: &str) -> bool {
     gitignore_text(ws).lines().any(|l| l.trim() == pattern)
 }
 
-/// Whether `dir`'s filesystem stores user xattrs.
+/// Whether `dir`'s filesystem stores user xattrs. Where they are required
+/// ([`common::xattrs_required`]) a filesystem without them fails the test.
 fn xattrs_supported(dir: &Path) -> bool {
     let probe = dir.join(".xattr-probe");
     let ok = std::fs::write(&probe, b"").is_ok() && xattr::set(&probe, CODEGEN_XATTR, b"x").is_ok();
-    std::fs::remove_file(&probe).is_ok() && ok
+    let ok = std::fs::remove_file(&probe).is_ok() && ok;
+    assert!(
+        ok || !common::xattrs_required(),
+        "{} stores no user xattrs, and CI or HEPH_REQUIRE_XATTRS requires them",
+        dir.display()
+    );
+    ok
 }
 
 /// Skip the test, saying so, where the workspace's filesystem has no xattrs.
