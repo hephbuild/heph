@@ -24,6 +24,7 @@ mod codegen_commands;
 mod codegen_in_place;
 mod codegen_index_read;
 mod codegen_index_write;
+mod codegen_keep_import;
 mod core_resource;
 mod deps;
 mod devenv_runner;
