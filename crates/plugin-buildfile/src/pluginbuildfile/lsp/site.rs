@@ -1610,8 +1610,13 @@ mod cost {
         ]
     }
 
-    /// The slowest resolution over a few runs, the cursor at the end (the
+    /// The fastest resolution over a few runs, the cursor at the end (the
     /// resolver walks every token before it).
+    ///
+    /// The fastest, not the slowest: a regression slows every run, while a
+    /// preempted thread on a loaded CI runner slows only some. Taking the
+    /// slowest made the bound a measure of the runner — a 6ms resolution
+    /// read as 95ms on `Test darwin/arm64`.
     fn time_resolve(text: &str) -> (Duration, Resolution) {
         let tokens = lex(text);
         let doc = Doc {
@@ -1620,15 +1625,15 @@ mod cost {
             overlay: None,
             ast: AstState::Current,
         };
-        let mut worst = Duration::ZERO;
+        let mut best = Duration::MAX;
         let mut last = None;
-        for _ in 0..3 {
+        for _ in 0..5 {
             let started = Instant::now();
             let r = resolve(&doc, text.len());
-            worst = worst.max(started.elapsed());
+            best = best.min(started.elapsed());
             last = Some(r);
         }
-        (worst, last.unwrap())
+        (best, last.unwrap())
     }
 
     /// A regression trips, noise does not: the bound is an order of magnitude
