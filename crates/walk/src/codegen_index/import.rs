@@ -151,7 +151,11 @@ pub fn scan(
         };
         let mut names = Vec::new();
         for entry in entries {
-            names.push(entry.with_context(|| format!("listing {}", dir.display()))?.path());
+            names.push(
+                entry
+                    .with_context(|| format!("listing {}", dir.display()))?
+                    .path(),
+            );
         }
         names.sort();
         for abs in names {
@@ -186,8 +190,9 @@ pub fn scan(
                 }
                 Err(e) if super::fs::is_absent(&e) => continue,
                 Err(e) => {
-                    return Err(e)
-                        .with_context(|| format!("reading the codegen xattr of {}", abs.display()));
+                    return Err(e).with_context(|| {
+                        format!("reading the codegen xattr of {}", abs.display())
+                    });
                 }
             };
             let rel = rel.as_os_str().as_encoded_bytes().to_vec();
@@ -214,6 +219,62 @@ pub fn scan(
     }
     out.skipped.sort();
     Ok(out)
+}
+
+/// How many files and symlinks under `root` a line of `section` covers,
+/// skipping what `ignore` prunes. Probes no xattr. Only the `codegen status` /
+/// `why` hint asks, and only when the index has no rows and the section has
+/// lines, so a workspace past the upgrade never walks for it.
+pub fn count_section_matches(
+    root: &Path,
+    ignore: &Ignore,
+    fs: &dyn IndexFs,
+    section: &Section,
+) -> Result<usize> {
+    if !section.lines().iter().any(|l| !l.is_comment()) {
+        return Ok(0);
+    }
+    ignore.ensure_compiled()?;
+    let mut n = 0;
+    let mut stack = vec![(root.to_path_buf(), false)];
+    while let Some((dir, territory)) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) if dir != root && super::fs::is_absent(&e) => continue,
+            Err(e) => return Err(e).with_context(|| format!("listing {}", dir.display())),
+        };
+        for entry in entries {
+            let abs = entry
+                .with_context(|| format!("listing {}", dir.display()))?
+                .path();
+            let Ok(rel) = abs.strip_prefix(root) else {
+                continue;
+            };
+            let Some(st) = lstat_opt(fs, &abs)? else {
+                continue;
+            };
+            let rel_bytes = rel.as_os_str().as_encoded_bytes();
+            match st.kind {
+                StatKind::Dir => {
+                    if !ignore.prune_dir(&abs, rel) {
+                        let t = section.dir_is_territory(rel_bytes, territory);
+                        stack.push((abs, t));
+                    }
+                }
+                StatKind::File | StatKind::Symlink => {
+                    if !ignore.exclude_file(rel)
+                        && section
+                            .match_walk(rel_bytes, false, territory)
+                            .is_territory()
+                    {
+                        n += 1;
+                    }
+                }
+                StatKind::Other => {}
+            }
+        }
+    }
+    Ok(n)
 }
 
 /// The `imported` row for `s`, owned by `addr`.
@@ -247,9 +308,8 @@ impl CodegenIndex {
             .db_path()
             .parent()
             .context("the codegen db path has no parent directory")?;
-        std::fs::create_dir_all(dir).with_context(|| {
-            format!("creating the codegen index directory {}", dir.display())
-        })?;
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("creating the codegen index directory {}", dir.display()))?;
         let mut clock = FsClock::new(self);
         let mut rows = Vec::with_capacity(scan.files());
         for (addr, files) in &scan.by_addr {
@@ -435,7 +495,13 @@ mod tests {
         assert!(w.snap().rows_for_addr("//q:gen").is_empty());
 
         let c = import(&w, &x);
-        assert_eq!(c, ImportCounts { recorded: 1, unchanged: 1 });
+        assert_eq!(
+            c,
+            ImportCounts {
+                recorded: 1,
+                unchanged: 1
+            }
+        );
         assert_eq!(w.snap().rows_for_addr("//q:gen").len(), 1);
     }
 
@@ -476,9 +542,9 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert!(
-            !names
-                .iter()
-                .any(|n| n.as_encoded_bytes().starts_with(store::TMP_PREFIX.as_bytes())),
+            !names.iter().any(|n| n
+                .as_encoded_bytes()
+                .starts_with(store::TMP_PREFIX.as_bytes())),
             "{names:?}"
         );
     }
@@ -504,7 +570,9 @@ mod tests {
         let snap = w.snap();
         assert_eq!(snap.rows().count(), 1);
         // A line still covers the skipped files: unrecorded, excluded.
-        let st = snap.status(b"p/junk.go", &super::super::LookupMeta::point(false)).unwrap();
+        let st = snap
+            .status(b"p/junk.go", &super::super::LookupMeta::point(false))
+            .unwrap();
         assert_eq!(st.kind, super::super::StatusKind::Generated);
         assert_eq!(st.reason, Some(super::super::StatusReason::Unrecorded));
     }
@@ -521,7 +589,11 @@ mod tests {
         let s = run_scan(&w, &x).unwrap();
         assert!(!s.supported);
         assert_eq!(s.files(), 0);
-        assert_eq!(x.probes.load(Ordering::Relaxed), 1, "stops at the first ENOTSUP");
+        assert_eq!(
+            x.probes.load(Ordering::Relaxed),
+            1,
+            "stops at the first ENOTSUP"
+        );
     }
 
     #[test]
@@ -537,7 +609,13 @@ mod tests {
         x.stamp(w.abs("p/a.go"), b"//p:gen");
         x.stamp(w.abs("p/b.go"), b"//p:gen");
         let c = import(&w, &x);
-        assert_eq!(c, ImportCounts { recorded: 1, unchanged: 1 });
+        assert_eq!(
+            c,
+            ImportCounts {
+                recorded: 1,
+                unchanged: 1
+            }
+        );
         let b = w.db_row("p/b.go").unwrap();
         assert_eq!(b.pending_hash.as_deref(), Some("h"));
         let a = w.db_row("p/a.go").unwrap();
@@ -547,7 +625,13 @@ mod tests {
 
         let g = w.generation();
         let c = import(&w, &x);
-        assert_eq!(c, ImportCounts { recorded: 0, unchanged: 2 });
+        assert_eq!(
+            c,
+            ImportCounts {
+                recorded: 0,
+                unchanged: 2
+            }
+        );
         assert_eq!(w.generation(), g, "a second run commits nothing");
     }
 
@@ -564,7 +648,12 @@ mod tests {
         let ig = Ignore::new(&[], &["vendor/**".to_string()]).unwrap();
         let snap = w.index.snapshot().unwrap();
         let s = scan(&w.root, &ig, w.fs.as_ref(), &x, snap.section()).unwrap();
-        let paths: Vec<_> = s.by_addr.values().flatten().map(|s| s.path.clone()).collect();
+        let paths: Vec<_> = s
+            .by_addr
+            .values()
+            .flatten()
+            .map(|s| s.path.clone())
+            .collect();
         assert_eq!(paths, vec![b"p/a.go".to_vec()]);
     }
 }

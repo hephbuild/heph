@@ -43,7 +43,11 @@ impl CodegenIndex {
     /// Set `seen_in_section` on the target's rows at `paths`, which the
     /// section just written covers. Only ever set (J1). Returns how many
     /// rows changed.
-    pub fn mark_seen_in_section(&self, guard: &TargetLockGuard, paths: &[Vec<u8>]) -> Result<usize> {
+    pub fn mark_seen_in_section(
+        &self,
+        guard: &TargetLockGuard,
+        paths: &[Vec<u8>],
+    ) -> Result<usize> {
         let Some(store) = self.open_store()? else {
             return Ok(0);
         };

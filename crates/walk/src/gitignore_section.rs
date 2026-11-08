@@ -334,7 +334,8 @@ mod tests {
         assert!(p.old_marker);
         assert_eq!(patterns(&p), vec!["/p/a"]);
 
-        let p = parse_section_bytes(format!("{BEGIN_MARKER}\r\n/p/a\r\n{END_MARKER}\r\n").as_bytes());
+        let p =
+            parse_section_bytes(format!("{BEGIN_MARKER}\r\n/p/a\r\n{END_MARKER}\r\n").as_bytes());
         assert!(p.present);
         assert!(!p.old_marker, "CRLF is trimmed before the comparison");
     }

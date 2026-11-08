@@ -16,11 +16,11 @@ use crate::engine::Engine;
 use crate::engine::discovery::Discovery;
 use crate::engine::driver::targetdef::TargetDef;
 use crate::engine::driver::targetdef::path::{CodegenMode, Content};
-use hwalk::codegen_index::{Row, Section};
 use crate::engine::query::skip_unresolvable;
 use crate::engine::request_state::RequestState;
 use hmodel::htaddr::Addr;
 use hmodel::htmatcher::{MatchResult, Matcher};
+use hwalk::codegen_index::{Row, Section};
 
 // The markers, the entry type and the one section parser live in `hwalk`, where
 // the codegen index reads the same section; re-exported so engine callers keep
@@ -140,7 +140,11 @@ impl std::fmt::Debug for CopyTargets {
         f.debug_struct("CopyTargets")
             .field(
                 "targets",
-                &self.targets.iter().map(|(a, _)| a.format()).collect::<Vec<_>>(),
+                &self
+                    .targets
+                    .iter()
+                    .map(|(a, _)| a.format())
+                    .collect::<Vec<_>>(),
             )
             .field("failed", &self.failed)
             .finish()
@@ -703,8 +707,11 @@ mod tests {
     #[test]
     fn released_rows_are_the_covered_rows_the_new_section_drops() {
         let old = Section::compile(
-            section_of(&[attributed("/a/x.go", "//a:gen"), attributed("/b", "//b:gen")])
-                .as_bytes(),
+            section_of(&[
+                attributed("/a/x.go", "//a:gen"),
+                attributed("/b", "//b:gen"),
+            ])
+            .as_bytes(),
         );
         let new = Section::compile(section_of(&[attributed("/b", "//b:gen")]).as_bytes());
         let mut pending = row("a/y.go", "//a:gen");

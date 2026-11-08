@@ -2,10 +2,10 @@ mod build_fmt;
 mod build_lsp;
 mod cache;
 mod clean;
+pub mod codegen;
 mod completions;
 mod coreutils;
 pub mod gc;
-mod gen_gitignore;
 mod plugins;
 mod resolve_plugins;
 mod scratch;
@@ -59,15 +59,18 @@ pub enum ToolCommands {
     ///
     /// `heph tool clean all //...` — clear the entire local cache
     Clean(clean::CleanArgs),
-    /// Manage the heph-generated section of the root .gitignore
+    /// Manage generated files and the heph section of the root .gitignore
     ///
-    /// Computes the ignore patterns for codegen-copy outputs and writes them
-    /// into a managed block in the workspace root .gitignore, leaving the rest
-    /// of the file untouched. Idempotent: a no-op when already up to date.
+    /// A `codegen = copy` target writes files into the source tree; heph
+    /// records which, so globs never read them as source. These subcommands
+    /// keep the managed `.gitignore` section in step with the targets, list
+    /// what needs a decision, and keep, discard or explain a generated file.
     ///
-    /// Example: `heph tool gen-gitignore`
-    #[command(name = "gen-gitignore")]
-    GenGitignore(gen_gitignore::Args),
+    /// Example: `heph tool codegen status`
+    Codegen(codegen::CodegenArgs),
+    /// Removed: use `heph tool codegen gitignore`.
+    #[command(name = "gen-gitignore", hide = true)]
+    GenGitignore(codegen::RemovedGenGitignoreArgs),
     /// Inspect and reclaim persistent scratch caches
     ///
     /// A scratch cache is a directory a target declares and carries between runs
@@ -157,7 +160,8 @@ impl ToolCommands {
         match self {
             ToolCommands::Gc(args) => gc::execute(args, sink, global),
             ToolCommands::Clean(args) => clean::execute(args, sink, global),
-            ToolCommands::GenGitignore(args) => gen_gitignore::execute(args, sink, global),
+            ToolCommands::Codegen(args) => args.execute(sink, global),
+            ToolCommands::GenGitignore(args) => codegen::removed_gen_gitignore(args),
             ToolCommands::Scratch(args) => args.execute(sink, global),
             ToolCommands::Cache(args) => args.execute(sink, global),
             ToolCommands::Coreutils(args) => args.execute(),
