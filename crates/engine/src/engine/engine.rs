@@ -1083,6 +1083,12 @@ impl Engine {
         &self.codegen_index
     }
 
+    /// The codegen index's cross-process locks (J9): a command takes them
+    /// after resolving every def it needs, one at a time.
+    pub fn codegen_locks(&self) -> &crate::engine::codegen_lock::CodegenLocks {
+        &self.codegen_locks
+    }
+
     /// The opening step of the codegen index: once per engine, at the start
     /// of the first request that can reach a reader (a provider call that may
     /// evaluate BUILD files, a target run, a write-back). Opens this
@@ -1091,7 +1097,7 @@ impl Engine {
     /// db fails the request, naming the file. A cancelled or failed step
     /// leaves the cell unset, so the next request tries again. After the
     /// first success this is one atomic load.
-    pub(crate) async fn open_codegen_index(&self, rs: &RequestState) -> anyhow::Result<()> {
+    pub async fn open_codegen_index(&self, rs: &RequestState) -> anyhow::Result<()> {
         if self.codegen_index_opened.initialized() {
             return Ok(());
         }

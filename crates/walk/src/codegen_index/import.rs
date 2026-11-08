@@ -51,6 +51,26 @@ impl XattrProbe for RealXattr {
     }
 }
 
+/// Remove [`CODEGEN_XATTR`] from `path` (never following a symlink), so a
+/// file `codegen keep` made source never comes back as generated after a lost
+/// db and an import, or under an older heph (Decision 24). Absent, an absent
+/// attribute, or a filesystem without xattrs: nothing to do.
+pub fn strip_xattr(path: &Path) -> Result<()> {
+    match xattr::get(path, CODEGEN_XATTR) {
+        Ok(Some(_)) => {}
+        Ok(None) => return Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::Unsupported || super::fs::is_absent(&e) => {
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("reading {CODEGEN_XATTR} of {}", path.display()));
+        }
+    }
+    xattr::remove(path, CODEGEN_XATTR)
+        .with_context(|| format!("removing {CODEGEN_XATTR} from {}", path.display()))
+}
+
 /// One stamped file, as the scan found it.
 #[derive(Debug, Clone)]
 pub struct Stamped {

@@ -2,10 +2,10 @@
 //!
 //! Codegen targets with `codegen = copy` write generated files into the source
 //! tree; those files must be gitignored. This module owns the *core* logic —
-//! enumerating the patterns and rendering the marked section — so it can be
-//! reused by the `tool gen-gitignore` command and by future validations (e.g. a
-//! CI check that the committed `.gitignore` is up to date). The command layer
-//! only handles file IO and progress reporting.
+//! enumerating the patterns, rendering the marked section, diffing it against
+//! the committed one and listing the recorded files a rewrite releases — so
+//! `heph tool codegen gitignore`, its `--check` and `heph validate` agree. The
+//! command layer only handles locks, file IO and reporting.
 
 use std::sync::Arc;
 
@@ -14,7 +14,9 @@ use futures::TryStreamExt;
 
 use crate::engine::Engine;
 use crate::engine::discovery::Discovery;
+use crate::engine::driver::targetdef::TargetDef;
 use crate::engine::driver::targetdef::path::{CodegenMode, Content};
+use hwalk::codegen_index::{Row, Section};
 use crate::engine::query::skip_unresolvable;
 use crate::engine::request_state::RequestState;
 use hmodel::htaddr::Addr;
@@ -50,15 +52,32 @@ impl Engine {
         rs: Arc<RequestState>,
         matcher: &Matcher,
     ) -> anyhow::Result<Vec<GitignoreEntry>> {
-        // Drain the addr stream first, then fan the def fetches out in parallel
-        // (each shares parse work through the per-request memoizer, like
-        // `codegen_copy_overlaps`). The sequential await-per-addr loop this
-        // replaced serialized every `get_def`.
+        // Always complete: the patterns are written to a file, and a short set
+        // would delete the entries of every target the walk skipped — and make
+        // `heph validate` report a correct file as out of date.
+        let targets = self
+            .codegen_copy_targets(rs, matcher, Discovery::Complete, false)
+            .await?;
+        Ok(targets.entries())
+    }
+
+    /// Resolve every target matching `matcher` that declares a `codegen =
+    /// copy` output. Drains the addr stream first, then fans the def fetches
+    /// out in parallel (each shares parse work through the per-request
+    /// memoizer, like `codegen_copy_overlaps`).
+    ///
+    /// `keep_going`: a def that fails to resolve is collected in
+    /// [`CopyTargets::failed`] instead of failing the call — what `codegen
+    /// status` needs to report a broken BUILD file without failing.
+    pub async fn codegen_copy_targets(
+        self: Arc<Self>,
+        rs: Arc<RequestState>,
+        matcher: &Matcher,
+        discovery: Discovery,
+        keep_going: bool,
+    ) -> anyhow::Result<CopyTargets> {
         let addrs: Vec<Addr> = {
-            // Always complete: the patterns are written to a file, and a short
-            // set would delete the entries of every target the walk skipped —
-            // and make `heph validate` report a correct file as out of date.
-            let stream = Arc::clone(&self).query(rs.clone(), matcher, Discovery::Complete);
+            let stream = Arc::clone(&self).query(rs.clone(), matcher, discovery);
             tokio::pin!(stream);
             let mut v = Vec::new();
             while let Some(addr) = stream.try_next().await? {
@@ -67,7 +86,7 @@ impl Engine {
             v
         };
 
-        let fail_fast = rs.fail_fast();
+        let fail_fast = rs.fail_fast() && !keep_going;
         let futs = addrs.iter().map(|addr| {
             enclose!((self => engine, rs, addr) async move {
                 // A listed candidate that doesn't resolve standalone (e.g. go's
@@ -75,12 +94,67 @@ impl Engine {
                 // in-context dep) emits no codegen-copy output. The helper rather
                 // than a `query_*` stream: the fan-out below reports *every*
                 // failure, and a stream stops at the first.
-                let Some(def) = skip_unresolvable(&addr, engine.get_def(rs, &addr).await)? else {
-                    return Ok(Vec::new());
+                let def = match skip_unresolvable(&addr, engine.get_def(rs, &addr).await) {
+                    Ok(Some(def)) => def,
+                    Ok(None) => return Ok(None),
+                    Err(e) if keep_going => return Ok(Some(Err((addr, e)))),
+                    Err(e) => return Err(e),
                 };
-                let entries: Vec<GitignoreEntry> = def
+                let has_copy = def
                     .target_def
                     .outputs
+                    .iter()
+                    .flat_map(|output| output.paths.iter())
+                    .any(|path| path.codegen_tree == CodegenMode::Copy);
+                Ok::<_, anyhow::Error>(
+                    has_copy.then(|| Ok((addr, Arc::clone(&def.target_def)))),
+                )
+            })
+        });
+        let per_target = crate::engine::fanout::join_all_failable(futs, fail_fast).await?;
+        let mut out = CopyTargets::default();
+        for r in per_target.into_iter().flatten() {
+            match r {
+                Ok(t) => out.targets.push(t),
+                Err(f) => out.failed.push(f),
+            }
+        }
+        out.targets.sort_by_cached_key(|(a, _)| a.format());
+        out.failed.sort_by_cached_key(|(a, _)| a.format());
+        Ok(out)
+    }
+}
+
+/// The targets declaring `codegen = copy` outputs, as
+/// [`Engine::codegen_copy_targets`] resolved them.
+#[derive(Default)]
+pub struct CopyTargets {
+    /// Sorted by addr.
+    pub targets: Vec<(Addr, Arc<TargetDef>)>,
+    /// Defs that failed to resolve (only with `keep_going`), sorted by addr.
+    pub failed: Vec<(Addr, anyhow::Error)>,
+}
+
+impl std::fmt::Debug for CopyTargets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CopyTargets")
+            .field(
+                "targets",
+                &self.targets.iter().map(|(a, _)| a.format()).collect::<Vec<_>>(),
+            )
+            .field("failed", &self.failed)
+            .finish()
+    }
+}
+
+impl CopyTargets {
+    /// The section lines these targets emit, sorted and deduplicated.
+    pub fn entries(&self) -> Vec<GitignoreEntry> {
+        let entries = self
+            .targets
+            .iter()
+            .flat_map(|(addr, def)| {
+                def.outputs
                     .iter()
                     .flat_map(|output| output.paths.iter())
                     .filter(|path| path.codegen_tree == CodegenMode::Copy)
@@ -88,14 +162,162 @@ impl Engine {
                         pattern: content_to_pattern(&path.content),
                         addr: Some(addr.clone()),
                     })
-                    .collect();
-                Ok::<Vec<GitignoreEntry>, anyhow::Error>(entries)
             })
-        });
-        let per_target = crate::engine::fanout::join_all_failable(futs, fail_fast).await?;
-        let entries: Vec<GitignoreEntry> = per_target.into_iter().flatten().collect();
-        Ok(normalize(entries))
+            .collect();
+        normalize(entries)
     }
+
+    /// The def of `addr` (formatted), when it declares a copy output.
+    pub fn get(&self, addr: &str) -> Option<&Arc<TargetDef>> {
+        self.targets
+            .binary_search_by(|(a, _)| a.format().as_str().cmp(addr))
+            .ok()
+            .and_then(|i| self.targets.get(i))
+            .map(|(_, d)| d)
+    }
+}
+
+/// Why a section is stale, as `--json` spells it (sorted by that spelling).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum StaleReason {
+    /// The lines differ from what the defs emit.
+    Lines,
+    /// Markers are present but do not delimit a section.
+    Malformed,
+    /// The BEGIN line is an older heph's text (Decision 21).
+    OldMarker,
+}
+
+impl StaleReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Lines => "lines",
+            Self::Malformed => "malformed",
+            Self::OldMarker => "old_marker",
+        }
+    }
+}
+
+/// What rewriting a section with a set of entries would change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SectionDiff {
+    /// Lines the rewrite adds, sorted.
+    pub added: Vec<GitignoreEntry>,
+    /// Lines the rewrite removes, sorted.
+    pub removed: Vec<GitignoreEntry>,
+    /// Empty when the section is current; sorted otherwise.
+    pub reasons: Vec<StaleReason>,
+    /// The whole `.gitignore` after the rewrite.
+    pub rendered: String,
+}
+
+impl SectionDiff {
+    /// The rewrite changes the file: `--check` and `validate` fail.
+    pub fn is_stale(&self) -> bool {
+        !self.reasons.is_empty()
+    }
+}
+
+/// Diff the `.gitignore` text `existing` against the section `entries` would
+/// render. Stale is exactly "[`render`] changes the file"; the reasons say
+/// why: an older marker, a malformed section, and otherwise (or as well)
+/// lines that differ.
+pub fn diff_section(existing: &str, entries: &[GitignoreEntry]) -> SectionDiff {
+    let rendered = render(existing, entries);
+    let parsed = hwalk::gitignore_section::parse_section_bytes(existing.as_bytes());
+    let mut old: Vec<GitignoreEntry> = parsed.lines.iter().map(|l| l.entry.clone()).collect();
+    old.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
+    let new = normalize(entries.to_vec());
+    let (added, removed) = sorted_difference(&new, &old);
+
+    let mut reasons = Vec::new();
+    if rendered != existing {
+        if parsed.old_marker {
+            reasons.push(StaleReason::OldMarker);
+        }
+        let markers = existing.contains(BEGIN_MARKER_PREFIX) || existing.contains(END_MARKER);
+        if !parsed.present && markers {
+            reasons.push(StaleReason::Malformed);
+        }
+        if !added.is_empty() || !removed.is_empty() || reasons.is_empty() {
+            reasons.push(StaleReason::Lines);
+        }
+        reasons.sort_by_key(|r| r.as_str());
+    }
+    SectionDiff {
+        added,
+        removed,
+        reasons,
+        rendered,
+    }
+}
+
+/// `(a − b, b − a)` of two sorted entry lists, as multisets.
+fn sorted_difference(
+    a: &[GitignoreEntry],
+    b: &[GitignoreEntry],
+) -> (Vec<GitignoreEntry>, Vec<GitignoreEntry>) {
+    use std::cmp::Ordering;
+
+    let (mut only_a, mut only_b) = (Vec::new(), Vec::new());
+    let (mut i, mut j) = (0, 0);
+    while let (Some(x), Some(y)) = (a.get(i), b.get(j)) {
+        match x.sort_key().cmp(&y.sort_key()) {
+            Ordering::Less => {
+                only_a.push(x.clone());
+                i += 1;
+            }
+            Ordering::Greater => {
+                only_b.push(y.clone());
+                j += 1;
+            }
+            Ordering::Equal => {
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    only_a.extend(a.iter().skip(i).cloned());
+    only_b.extend(b.iter().skip(j).cloned());
+    (only_a, only_b)
+}
+
+/// The rows a section rewrite releases: verified rows (not pending) the old
+/// section covered and the new one does not. The caller keeps those whose
+/// file is still there, and lists them.
+pub fn released_rows<'r>(
+    rows: impl IntoIterator<Item = &'r Row>,
+    old: &Section,
+    new: &Section,
+) -> Vec<&'r Row> {
+    let mut out: Vec<&Row> = rows
+        .into_iter()
+        .filter(|r| r.pending_hash.is_none())
+        .filter(|r| {
+            old.match_point(&r.path, false).is_territory()
+                && !new.match_point(&r.path, false).is_territory()
+        })
+        .collect();
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    out
+}
+
+/// The rows `section` covers whose `seen_in_section` is not yet set, by addr:
+/// what a section rewrite marks, each target's under its own lock.
+pub fn newly_seen<'r>(
+    rows: impl IntoIterator<Item = &'r Row>,
+    section: &Section,
+) -> std::collections::BTreeMap<String, Vec<Vec<u8>>> {
+    let mut out: std::collections::BTreeMap<String, Vec<Vec<u8>>> = Default::default();
+    for r in rows {
+        if !r.seen_in_section && section.match_point(&r.path, false).is_territory() {
+            out.entry(r.addr.clone()).or_default().push(r.path.clone());
+        }
+    }
+    for paths in out.values_mut() {
+        paths.sort();
+    }
+    out
 }
 
 /// Merge a scoped rebuild into the existing section. Existing entries whose
@@ -399,6 +621,125 @@ mod tests {
         assert_eq!(
             merged,
             vec![attributed("/foo/new.go", "//foo:gen"), bare("/legacy")]
+        );
+    }
+
+    fn section_of(entries: &[GitignoreEntry]) -> String {
+        render("", entries)
+    }
+
+    #[test]
+    fn diff_of_a_current_section_is_not_stale() {
+        let entries = [attributed("/a/gen.go", "//a:gen")];
+        let d = diff_section(&section_of(&entries), &entries);
+        assert!(!d.is_stale());
+        assert!(d.added.is_empty() && d.removed.is_empty());
+    }
+
+    #[test]
+    fn diff_lists_added_and_removed_lines_with_their_targets() {
+        let existing = section_of(&[
+            attributed("/a/gen.go", "//a:gen"),
+            attributed("/b/old.go", "//b:gone"),
+        ]);
+        let entries = [
+            attributed("/a/gen.go", "//a:gen"),
+            attributed("/c/new.go", "//c:gen"),
+        ];
+        let d = diff_section(&existing, &entries);
+        assert_eq!(d.reasons, vec![StaleReason::Lines]);
+        assert_eq!(d.added, vec![attributed("/c/new.go", "//c:gen")]);
+        assert_eq!(d.removed, vec![attributed("/b/old.go", "//b:gone")]);
+        assert_eq!(d.rendered, render(&existing, &entries));
+    }
+
+    #[test]
+    fn diff_of_an_old_marker_with_current_lines_says_only_old_marker() {
+        let entries = [attributed("/a/gen.go", "//a:gen")];
+        let existing = section_of(&entries).replace(
+            BEGIN_MARKER,
+            "# BEGIN heph-generated (managed by `heph tool gen-gitignore` — do not edit)",
+        );
+        let d = diff_section(&existing, &entries);
+        assert_eq!(d.reasons, vec![StaleReason::OldMarker]);
+        assert!(d.added.is_empty() && d.removed.is_empty());
+    }
+
+    #[test]
+    fn diff_of_an_old_marker_and_changed_lines_sorts_its_reasons() {
+        let existing = section_of(&[attributed("/a/gen.go", "//a:gen")])
+            .replace(BEGIN_MARKER, "# BEGIN heph-generated (old)");
+        let d = diff_section(&existing, &[]);
+        assert_eq!(d.reasons, vec![StaleReason::Lines, StaleReason::OldMarker]);
+        assert_eq!(d.removed, vec![attributed("/a/gen.go", "//a:gen")]);
+    }
+
+    #[test]
+    fn diff_of_markers_without_a_section_is_malformed() {
+        // END missing: the parser reads no section, and the rewrite appends one.
+        let existing = format!("{BEGIN_MARKER}\n/a\n");
+        let d = diff_section(&existing, &[]);
+        assert_eq!(d.reasons, vec![StaleReason::Malformed]);
+        assert!(d.added.is_empty() && d.removed.is_empty());
+
+        let existing = format!("{END_MARKER}\n{BEGIN_MARKER}\n");
+        let d = diff_section(&existing, &[attributed("/a", "//a:gen")]);
+        assert_eq!(d.reasons, vec![StaleReason::Lines, StaleReason::Malformed]);
+    }
+
+    #[test]
+    fn diff_counts_a_duplicate_line_once_per_copy() {
+        // Two targets emitting one path stay two lines; dropping one is a removal.
+        let existing = section_of(&[attributed("/x", "//a:gen"), attributed("/x", "//b:gen")]);
+        let d = diff_section(&existing, &[attributed("/x", "//a:gen")]);
+        assert_eq!(d.removed, vec![attributed("/x", "//b:gen")]);
+        assert!(d.added.is_empty());
+    }
+
+    fn row(path: &str, addr: &str) -> Row {
+        Row::new(path.as_bytes(), addr, hwalk::codegen_index::RowKind::File)
+    }
+
+    #[test]
+    fn released_rows_are_the_covered_rows_the_new_section_drops() {
+        let old = Section::compile(
+            section_of(&[attributed("/a/x.go", "//a:gen"), attributed("/b", "//b:gen")])
+                .as_bytes(),
+        );
+        let new = Section::compile(section_of(&[attributed("/b", "//b:gen")]).as_bytes());
+        let mut pending = row("a/y.go", "//a:gen");
+        pending.pending_hash = Some("h".into());
+        let rows = [
+            row("b/k.go", "//b:gen"),
+            row("a/x.go", "//a:gen"),
+            row("c/never.go", "//c:gen"),
+            pending,
+        ];
+        let released: Vec<&[u8]> = released_rows(&rows, &old, &new)
+            .into_iter()
+            .map(|r| r.path.as_slice())
+            .collect();
+        assert_eq!(released, vec![b"a/x.go".as_slice()]);
+    }
+
+    #[test]
+    fn newly_seen_groups_unmarked_covered_rows_by_target() {
+        let section = Section::compile(
+            section_of(&[attributed("/a", "//a:gen"), attributed("/b", "//b:gen")]).as_bytes(),
+        );
+        let mut seen = row("b/s.go", "//b:gen");
+        seen.seen_in_section = true;
+        let rows = [
+            row("a/2.go", "//a:gen"),
+            row("a/1.go", "//a:gen"),
+            seen,
+            row("c/out.go", "//c:gen"),
+        ];
+        let got = newly_seen(&rows, &section);
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            got.get("//a:gen"),
+            Some(&vec![b"a/1.go".to_vec(), b"a/2.go".to_vec()])
         );
     }
 

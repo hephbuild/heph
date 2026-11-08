@@ -171,4 +171,44 @@ mod tests {
             assert_eq!(again.addr(), "//p:gen");
         });
     }
+
+    /// `codegen import` waits on another process's import with no fixed
+    /// timeout, so the wait must end when the command is cancelled.
+    #[test]
+    fn import_wait_is_cancellable() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let home = tempfile::tempdir().unwrap();
+            let locks = std::sync::Arc::new(CodegenLocks::new(LockBackend::Fs, home.path()));
+            let other = CodegenLocks::new(LockBackend::Fs, home.path());
+            let never = StdCancellationToken::new();
+            let held = other.import(&never).await.unwrap();
+
+            let ct = StdCancellationToken::new();
+            let waiter = tokio::spawn({
+                let (locks, ct) = (std::sync::Arc::clone(&locks), ct.clone());
+                async move { locks.import(&ct).await.map(drop) }
+            });
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(!waiter.is_finished(), "the import lock is held elsewhere");
+
+            ct.cancel();
+            let res = tokio::time::timeout(Duration::from_secs(10), waiter)
+                .await
+                .expect("a cancelled import wait returns")
+                .unwrap();
+            assert!(res.is_err(), "a cancelled wait is an error");
+            drop(held);
+
+            tokio::time::timeout(Duration::from_secs(10), locks.import(&never))
+                .await
+                .expect("the released import lock is acquired")
+                .unwrap();
+        });
+    }
 }

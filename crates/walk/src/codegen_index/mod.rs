@@ -33,6 +33,7 @@
 //! [`TargetLockGuard`] / [`ImportLockGuard`]; an index call that needs a lock
 //! takes one of those, so the guard lives exactly as long as the job holding it.
 
+pub mod commands;
 pub mod fold;
 pub mod fs;
 pub mod import;

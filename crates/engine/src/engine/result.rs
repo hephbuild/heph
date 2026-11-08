@@ -1001,54 +1001,91 @@ fn codegen_landings(
 }
 
 /// A target's current `copy` outputs, as a matcher over root-relative paths:
-/// what settle asks before deleting a leftover heph wrote (J5).
-struct CopyOutputs {
-    files: rustc_hash::FxHashSet<Vec<u8>>,
-    dirs: Vec<Vec<u8>>,
-    globs: Vec<wax::Glob<'static>>,
+/// what settle asks before deleting a leftover heph wrote (J5), and what the
+/// codegen commands ask before keeping or discarding a path.
+#[derive(Debug)]
+pub struct CopyOutputs {
+    /// Output group names, indexed by the entries below.
+    groups: Vec<String>,
+    files: rustc_hash::FxHashMap<Vec<u8>, usize>,
+    dirs: Vec<(Vec<u8>, usize)>,
+    globs: Vec<(wax::Glob<'static>, usize)>,
 }
 
 impl CopyOutputs {
-    fn of(target: &crate::engine::driver::targetdef::TargetDef) -> anyhow::Result<Self> {
+    pub fn of(target: &crate::engine::driver::targetdef::TargetDef) -> anyhow::Result<Self> {
         use crate::engine::driver::targetdef::path::{CodegenMode, Content};
 
         let mut out = Self {
-            files: rustc_hash::FxHashSet::default(),
+            groups: Vec::new(),
+            files: rustc_hash::FxHashMap::default(),
             dirs: Vec::new(),
             globs: Vec::new(),
         };
-        for path in target
-            .outputs
-            .iter()
-            .flat_map(|o| o.paths.iter())
-            .filter(|p| matches!(p.codegen_tree, CodegenMode::Copy))
-        {
-            match &path.content {
-                Content::FilePath(p) => {
-                    out.files.insert(p.as_bytes().to_vec());
+        for output in &target.outputs {
+            let group = out.groups.len();
+            let mut any = false;
+            for path in output
+                .paths
+                .iter()
+                .filter(|p| matches!(p.codegen_tree, CodegenMode::Copy))
+            {
+                any = true;
+                match &path.content {
+                    Content::FilePath(p) => {
+                        out.files.entry(p.as_bytes().to_vec()).or_insert(group);
+                    }
+                    Content::DirPath(p) => {
+                        let mut d = p.trim_end_matches('/').as_bytes().to_vec();
+                        d.push(b'/');
+                        out.dirs.push((d, group));
+                    }
+                    Content::Glob(p) => out.globs.push((
+                        wax::Glob::new(p)
+                            .map(wax::Glob::into_owned)
+                            .with_context(|| format!("compile copy output glob {p}"))?,
+                        group,
+                    )),
                 }
-                Content::DirPath(p) => {
-                    let mut d = p.trim_end_matches('/').as_bytes().to_vec();
-                    d.push(b'/');
-                    out.dirs.push(d);
-                }
-                Content::Glob(p) => out.globs.push(
-                    wax::Glob::new(p)
-                        .map(wax::Glob::into_owned)
-                        .with_context(|| format!("compile copy output glob {p}"))?,
-                ),
+            }
+            if any {
+                out.groups.push(output.group.clone());
             }
         }
         Ok(out)
     }
 
-    fn contains(&self, rel: &[u8]) -> bool {
+    /// Whether the target declares any `copy` output at all.
+    pub fn is_empty(&self) -> bool {
+        self.groups.is_empty()
+    }
+
+    /// The output group whose `copy` paths cover `rel`, if any.
+    pub fn output_of(&self, rel: &[u8]) -> Option<&str> {
         use wax::Program as _;
 
-        self.files.contains(rel)
-            || self.dirs.iter().any(|d| rel.starts_with(d))
-            || (!self.globs.is_empty()
-                && std::str::from_utf8(rel).is_ok_and(|s| self.globs.iter().any(|g| g.is_match(s))))
+        let group = self
+            .files
+            .get(rel)
+            .copied()
+            .or_else(|| {
+                self.dirs
+                    .iter()
+                    .find(|(d, _)| rel.starts_with(d))
+                    .map(|(_, g)| *g)
+            })
+            .or_else(|| {
+                let s = std::str::from_utf8(rel).ok()?;
+                self.globs
+                    .iter()
+                    .find(|(g, _)| g.is_match(s))
+                    .map(|(_, g)| *g)
+            })?;
+        self.groups.get(group).map(String::as_str)
+    }
+
+    pub fn contains(&self, rel: &[u8]) -> bool {
+        self.output_of(rel).is_some()
     }
 }
 

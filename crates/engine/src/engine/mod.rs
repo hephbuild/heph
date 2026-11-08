@@ -73,6 +73,7 @@ mod revdeps;
 pub mod spec;
 pub use result::ArtifactMeta;
 pub use result::BatchResult;
+pub use result::CopyOutputs;
 pub use result::EResult;
 pub use result::OutputMatcher;
 pub use result::ResultOptions;
