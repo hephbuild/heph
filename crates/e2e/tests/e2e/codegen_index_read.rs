@@ -614,6 +614,86 @@ async fn glob_exclusion_count_names_reasons() -> anyhow::Result<()> {
     Ok(())
 }
 
+const EXCLUDED_NOTE: &str = "1 generated file was excluded from globs (1 recorded); heph tool codegen why <path> explains one";
+
+/// The lines of `log` carrying the end-of-request exclusion note.
+fn notes(log: &str) -> Vec<&str> {
+    log.lines()
+        .filter(|l| l.contains("excluded from globs"))
+        .collect()
+}
+
+/// Without `-v` a request that globbed past a generated file says so once,
+/// at `info`, when it ends: two globs over the same file are one count, a
+/// request that excluded nothing says nothing, and the per-path line stays at
+/// `debug`.
+#[tokio::test(flavor = "current_thread")]
+async fn glob_exclusions_logged_once_at_info_when_request_ends() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_file("p/a.txt", "a");
+    generated(&ws).await?;
+    let (res, log) = capture_logs(LevelFilter::INFO, async {
+        let rs = ws.engine.new_state();
+        for pattern in ["p/*.txt", "p/g*.txt"] {
+            Arc::clone(&ws.engine)
+                .result_addr(
+                    Arc::clone(&rs),
+                    &glob_addr(pattern, &[]),
+                    OutputMatcher::All,
+                    &ResultOptions::default(),
+                )
+                .await?;
+        }
+        common::drain(rs).await;
+        // Excludes nothing: no line of its own.
+        glob(&ws.engine, "p/a*.txt").await
+    })
+    .await;
+    assert_eq!(names(&res?), ["a.txt"]);
+    let notes = notes(&log);
+    assert_eq!(notes.len(), 1, "one note for the request: {log}");
+    let line = notes.first().copied().unwrap_or_default();
+    assert!(
+        line.contains("INFO") && line.contains(EXCLUDED_NOTE),
+        "{line}"
+    );
+    assert!(
+        !log.contains("codegen: excluded"),
+        "per-path detail is debug: {log}"
+    );
+    Ok(())
+}
+
+/// A BUILD evaluation's `heph.fs.glob` runs with no request; the request
+/// that ends after it logs its exclusions.
+#[tokio::test(flavor = "current_thread")]
+async fn eval_glob_exclusions_logged_by_the_next_request_to_end() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_file("p/a.txt", "a");
+    ws.write_build_file(
+        "p",
+        &format!(
+            "{}\ntarget(name = \"t\", driver = \"bash\", run = \"true\", srcs = heph.fs.glob(\"*.txt\"))\n",
+            copy_target("gen", "gen.txt", "v1")
+        ),
+    );
+    run_on(&ws.engine, "//p:gen").await?;
+    let e2 = ws.reopen()?;
+    let (res, log) = capture_logs(LevelFilter::INFO, async {
+        let rs = e2.new_state();
+        let res = Arc::clone(&e2)
+            .get_spec(Arc::clone(&rs), &parse_addr("//p:t")?)
+            .await;
+        common::drain(rs).await;
+        res
+    })
+    .await;
+    res?;
+    assert_eq!(notes(&log).len(), 1, "{log}");
+    assert!(log.contains(EXCLUDED_NOTE), "{log}");
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Lifecycle rows
 // ---------------------------------------------------------------------------

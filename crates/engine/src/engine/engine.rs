@@ -254,6 +254,11 @@ pub struct Engine {
     /// remote upload holding a child state — lives on to the exit-time drain.
     /// Removed when the data drops.
     pub(crate) request_ctokens: Mutex<HashMap<String, hcore::hasync::StdCancellationToken>>,
+    /// Paths a read with no request excluded (a BUILD evaluation's
+    /// `heph.fs.glob`), counted until the next request to end logs them with
+    /// its own. Shared with the fs plugin's codegen reporter.
+    pub(crate) codegen_unscoped_excluded:
+        Arc<parking_lot::Mutex<hbuiltins::pluginfs::ExclusionTally>>,
     /// Every exec runner this host knows, by name: `local`, `wrap`, `session`.
     ///
     /// Builtins only. A plugin that wants agent mode does not implement a
@@ -859,6 +864,7 @@ impl Engine {
             hooks: vec![],
             requests: Arc::new(Mutex::new(HashMap::new())),
             request_ctokens: Mutex::new(HashMap::new()),
+            codegen_unscoped_excluded: Arc::default(),
             exec_runners: Arc::new({
                 let mut registry = hexecrunner::registry::RunnerRegistry::with_builtins();
                 registry
@@ -936,9 +942,11 @@ impl Engine {
         //
         // Both read generated files through the engine's codegen index and
         // report what it excluded to the request that read them.
-        let codegen_report: Arc<dyn hbuiltins::pluginfs::CodegenReport> = Arc::new(
-            crate::engine::request_state::EngineCodegenReport::new(Arc::clone(&engine.requests)),
-        );
+        let codegen_report: Arc<dyn hbuiltins::pluginfs::CodegenReport> =
+            Arc::new(crate::engine::request_state::EngineCodegenReport::new(
+                Arc::clone(&engine.requests),
+                Arc::clone(&engine.codegen_unscoped_excluded),
+            ));
         engine.register_plugin("fs", |init| {
             let ignore = Arc::new(hwalk::Ignore::new(&init.skip_dirs, &init.skip_globs)?);
             let codegen = hbuiltins::pluginfs::FsCodegen::new(

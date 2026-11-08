@@ -133,9 +133,12 @@ p/foo.pb.go").
 ### Globs
 
 The fs `glob()` target and the BUILD-time `heph.fs.glob()` skip `Generated`
-and `Modified` files. The glob's exclusion count names the reasons ("excluded
-12 generated files (9 recorded, 2 unrecorded, 1 edited)"); `-v` and `--json`
-list each path. Reading the index needs no target definition, no engine call
+and `Modified` files. A run that excluded any prints one line when it ends,
+by default: "12 generated files were excluded from globs (9 recorded, 2
+unrecorded, 1 edited); heph tool codegen why <path> explains one". Each path is
+counted once per run, however many globs skipped it. `-v` and `--json` list
+each path, and `-v` adds each glob's own count ("excluded 3 generated files
+(…)"). Reading the index needs no target definition, no engine call
 and no write, so it is safe inside a BUILD evaluation.
 
 ### fs `file` targets

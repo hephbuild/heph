@@ -27,6 +27,17 @@ pub trait CodegenReport: Send + Sync {
     /// Whether `key` is reported for the first time in this run: true once
     /// per key per request (per engine with no request).
     fn first_in_run(&self, request_id: Option<&str>, key: &str) -> bool;
+    /// A path excluded for `reason`, reported for the first time in this
+    /// run, with its `CodegenExcluded` event. The engine also counts it into
+    /// the request's end-of-run line ([`ExclusionTally::note`]).
+    fn excluded(
+        &self,
+        request_id: Option<&str>,
+        _reason: Option<StatusReason>,
+        kind: BuildEventKind,
+    ) {
+        self.emit(request_id, kind);
+    }
 }
 
 /// Reports nothing and dedupes nothing: a driver built without an engine.
@@ -116,29 +127,89 @@ impl Excluded {
     }
 }
 
+/// The reasons a count is split by, in the order it names them.
+const TALLY_REASONS: [StatusReason; 4] = [
+    StatusReason::Recorded,
+    StatusReason::Pending,
+    StatusReason::Unrecorded,
+    StatusReason::Edited,
+];
+
+/// How many paths reads excluded, by reason: what a glob logs and what a
+/// request sums into the one line it prints when it ends.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ExclusionTally {
+    /// One slot per [`TALLY_REASONS`] entry, then one for no reason.
+    counts: [usize; 5],
+}
+
+impl ExclusionTally {
+    pub fn add(&mut self, reason: Option<StatusReason>) {
+        let slot = reason
+            .and_then(|r| TALLY_REASONS.iter().position(|&t| t == r))
+            .unwrap_or(TALLY_REASONS.len());
+        if let Some(c) = self.counts.get_mut(slot) {
+            *c += 1;
+        }
+    }
+
+    pub fn merge(&mut self, other: Self) {
+        for (c, o) in self.counts.iter_mut().zip(other.counts) {
+            *c += o;
+        }
+    }
+
+    pub fn total(&self) -> usize {
+        self.counts.iter().sum()
+    }
+
+    /// " (9 recorded, 2 unrecorded, 1 edited)", zero counts left out; empty
+    /// when no count has a reason.
+    fn breakdown(&self) -> String {
+        let parts: Vec<String> = TALLY_REASONS
+            .iter()
+            .zip(self.counts)
+            .filter(|(_, n)| *n > 0)
+            .map(|(r, n)| format!("{n} {}", reason_str(*r)))
+            .collect();
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", parts.join(", "))
+        }
+    }
+
+    /// The line a request logs when it ends, or `None` when nothing was
+    /// excluded: "12 generated files were excluded from globs (9 recorded,
+    /// 2 unrecorded, 1 edited); heph tool codegen why <path> explains one".
+    pub fn note(&self) -> Option<String> {
+        let n = self.total();
+        if n == 0 {
+            return None;
+        }
+        let (noun, verb) = if n == 1 {
+            ("file", "was")
+        } else {
+            ("files", "were")
+        };
+        Some(format!(
+            "{n} generated {noun} {verb} excluded from globs{}; \
+             heph tool codegen why <path> explains one",
+            self.breakdown()
+        ))
+    }
+}
+
 /// "excluded 12 generated files (9 recorded, 2 unrecorded, 1 edited)": the
 /// count a glob reports, split by reason, zero counts left out.
 pub fn exclusion_summary(excluded: &[Excluded]) -> String {
-    let count = |want: StatusReason| excluded.iter().filter(|e| e.reason == Some(want)).count();
-    let parts: Vec<String> = [
-        StatusReason::Recorded,
-        StatusReason::Pending,
-        StatusReason::Unrecorded,
-        StatusReason::Edited,
-    ]
-    .into_iter()
-    .filter_map(|r| {
-        let n = count(r);
-        (n > 0).then(|| format!("{n} {}", reason_str(r)))
-    })
-    .collect();
-    let n = excluded.len();
-    let noun = if n == 1 { "file" } else { "files" };
-    if parts.is_empty() {
-        format!("excluded {n} generated {noun}")
-    } else {
-        format!("excluded {n} generated {noun} ({})", parts.join(", "))
+    let mut tally = ExclusionTally::default();
+    for e in excluded {
+        tally.add(e.reason);
     }
+    let n = tally.total();
+    let noun = if n == 1 { "file" } else { "files" };
+    format!("excluded {n} generated {noun}{}", tally.breakdown())
 }
 
 /// The warning for a recorded file whose bytes were edited since heph wrote
@@ -401,8 +472,9 @@ pub fn file_is_source(
     Ok(FileSource::Excluded { warning })
 }
 
-/// Report what a read excluded: one `CodegenExcluded` per path per run, the
-/// `Modified` warning once per path per run, and the read's count at debug.
+/// Report what a read excluded: one `CodegenExcluded` per path per run (the
+/// path at debug; the request's count is logged once, when it ends), and the
+/// `Modified` warning once per path per run.
 pub fn report(cg: &FsCodegen, request_id: Option<&str>, excluded: &[Excluded]) {
     if excluded.is_empty() {
         return;
@@ -437,8 +509,9 @@ pub fn report(cg: &FsCodegen, request_id: Option<&str>, excluded: &[Excluded]) {
                 addr = ex.addr.as_deref(),
                 "codegen: excluded"
             );
-            cg.report.emit(
+            cg.report.excluded(
                 request_id,
+                ex.reason,
                 BuildEventKind::CodegenExcluded {
                     path: path.to_owned(),
                     status: status.to_owned(),
@@ -498,6 +571,32 @@ mod tests {
         assert_eq!(
             exclusion_summary(&[ex(StatusReason::Pending)]),
             "excluded 1 generated file (1 pending)"
+        );
+    }
+
+    #[test]
+    fn note_is_none_for_nothing_and_sums_merged_tallies() {
+        let mut t = ExclusionTally::default();
+        assert_eq!(t.note(), None);
+        t.add(Some(StatusReason::Recorded));
+        assert_eq!(
+            t.note().as_deref(),
+            Some(
+                "1 generated file was excluded from globs (1 recorded); \
+                 heph tool codegen why <path> explains one"
+            )
+        );
+        let mut other = ExclusionTally::default();
+        other.add(Some(StatusReason::Edited));
+        other.add(None);
+        t.merge(other);
+        assert_eq!(t.total(), 3);
+        assert_eq!(
+            t.note().as_deref(),
+            Some(
+                "3 generated files were excluded from globs (1 recorded, 1 edited); \
+                 heph tool codegen why <path> explains one"
+            )
         );
     }
 
