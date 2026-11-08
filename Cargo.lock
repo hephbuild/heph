@@ -1780,6 +1780,7 @@ dependencies = [
  "testkit",
  "tokio",
  "tracing-subscriber",
+ "xattr",
 ]
 
 [[package]]

@@ -38,6 +38,8 @@ futures = "0.3"
 tracing-subscriber = "0.3"
 anyhow = "1"
 tempfile = "3"
+# `codegen_index_write::write_back_still_sets_xattr` reads the stamp back.
+xattr = "1"
 libc = "0.2"
 tar = "0.4"
 serde_json = "1"
