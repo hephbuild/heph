@@ -501,7 +501,11 @@ async fn byte_move_failure(
     assert!(msg.contains(out), "the error names the path: {msg}");
 
     let r = must_row(&ws.engine, &rel)?;
-    assert_eq!(r.pending_hash, Some(hashout("v1")), "step 2 committed: {r:?}");
+    assert_eq!(
+        r.pending_hash,
+        Some(hashout("v1")),
+        "step 2 committed: {r:?}"
+    );
     assert!(r.record.is_none(), "nothing was recorded: {r:?}");
     let (kind, reason) = status(&ws.engine, &rel)?;
     assert_eq!(reason, Some(StatusReason::Pending));

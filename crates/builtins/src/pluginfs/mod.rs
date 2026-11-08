@@ -1404,6 +1404,10 @@ impl hplugin::driver::Driver for Driver {
                         hplugin::driver::Resources::VIEW_CPU,
                     )
                     .context("fs resources")?,
+                // `cache` stays off: the result depends on the local codegen
+                // index, so a cached strict-`file` error would be served after
+                // the index changed. A future cross-run memo must key on the
+                // index generation.
                 ..Default::default()
             },
         })

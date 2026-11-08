@@ -1451,6 +1451,12 @@ mod tests {
             }
         }
         if std::fs::OpenOptions::new().write(true).open(&db).is_ok() {
+            // Root ignores the mode bits. CI's runners are not root, so a skip
+            // there means the test stopped testing anything: fail instead.
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "permissions are not enforced for this user, and CI requires this test to run"
+            );
             eprintln!("skipping: permissions are not enforced for this user");
             return;
         }

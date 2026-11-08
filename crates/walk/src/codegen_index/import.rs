@@ -684,10 +684,17 @@ mod tests {
         let w_row = w.db_row("p/w.go").unwrap();
         assert_eq!(w_row.addr, "//p:other");
         assert_eq!(w_row.state, RowState::Written);
-        assert_eq!(w_row.seen_in_section, written.seen_in_section, "not touched");
+        assert_eq!(
+            w_row.seen_in_section, written.seen_in_section,
+            "not touched"
+        );
         for p in ["p/i.go", "p/d.go"] {
             let r = w.db_row(p).unwrap();
-            assert_eq!((r.addr.as_str(), r.state), ("//p:gen", RowState::Imported), "{p}");
+            assert_eq!(
+                (r.addr.as_str(), r.state),
+                ("//p:gen", RowState::Imported),
+                "{p}"
+            );
         }
     }
 

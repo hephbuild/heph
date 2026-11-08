@@ -144,8 +144,10 @@ and no write, so it is safe inside a BUILD evaluation.
 ### fs `file` targets
 
 The Starlark `file("p/foo.pb.go")` builtin checks nothing: it only builds the
-address of the fs `file` target, so evaluating a BUILD file and every def hash
-are independent of the local index. The fs `file` target checks when it runs:
+address of the fs `file` target, so a `file()` call, and the def hash of a
+target that names one, are independent of the local index. (`heph.fs.glob` is
+not: it reads the index while the BUILD file evaluates, see Globs and Cache
+keys.) The fs `file` target checks when it runs:
 
 - **A recorded or pending generated path, or an edited one, fails:**
 
@@ -185,6 +187,17 @@ that built the generator fails where a fresh CI checkout passes. Within one
 request that builds both, an fs target that runs before the generator's
 write-back finds no row and one that runs after it fails; the next run fails
 either way. Depending on the generator is correct everywhere.
+
+### Cache keys
+
+`heph.fs.glob` reads this checkout's codegen index and the root `.gitignore`
+section, so what it returns, and every def hash built from it, can differ
+between two checkouts of one commit. The index never reaches a cache key
+directly, only through which paths a glob returns. For one commit with the same
+files on disk, cache keys agree across machines when `heph tool codegen status
+--check` passes on both and no git-tracked file sits under a section line or a
+`copy` output. Outside that, a key can differ across machines, which costs a
+cache miss, never a wrong hit.
 
 ### `copy_output`: a target reading its own outputs
 
@@ -473,7 +486,7 @@ is unsupported.
   `format` target that runs (the glob syntax cannot express a literal `\`; Go
   refuses `\` in import paths).
 - **`introspect:outputs` over a `copy` target's outputs** now expands to the
-  `copy_output` fs target: consumers of it miss the cache once.
+  `copy_output` fs target.
 - **Rollback and mixed versions are unsupported.** Until v1.1.0 the xattr is
   still set, so a rollback keeps excluding generated files; after one, rerun
   `heph tool codegen import`.

@@ -153,7 +153,11 @@ pub struct Overlay {
 impl std::fmt::Debug for Overlay {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_map()
-            .entries(self.entries.iter().map(|(p, e)| (String::from_utf8_lossy(p), e)))
+            .entries(
+                self.entries
+                    .iter()
+                    .map(|(p, e)| (String::from_utf8_lossy(p), e)),
+            )
             .finish()
     }
 }
