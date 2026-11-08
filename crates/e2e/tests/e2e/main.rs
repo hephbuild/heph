@@ -31,6 +31,7 @@ mod execrunner;
 mod failure_slot;
 mod force;
 mod fs_glob;
+mod go_format_glob;
 mod group;
 mod group_relocate;
 mod home_dir;
