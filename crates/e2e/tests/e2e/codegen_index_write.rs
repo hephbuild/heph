@@ -477,6 +477,81 @@ async fn warm_rerun_with_pending_row_settles_it() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Step 3 fails for real when the tree cannot take the bytes: `break_tree`
+/// puts something in the way of `p/<out>`, `fix_tree` removes it. The
+/// failure reaches the caller, the target's codegen lock is released (the
+/// next run takes it and fails the same way, rather than hanging), the
+/// row step 2 marked pending keeps the path excluded, and the first run
+/// after the tree is fixed writes and settles it.
+async fn byte_move_failure(
+    out: &str,
+    break_tree: impl Fn(&Path),
+    fix_tree: impl Fn(&Path),
+) -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    let rel = format!("p/{out}");
+    ws.write_build_file("p", &copy_target("gen", out, "v1"));
+    let pkg = ws.dir.path().join("p");
+    break_tree(&pkg);
+
+    let err = run_on(&ws.engine, "//p:gen")
+        .await
+        .expect_err("the byte move cannot succeed");
+    let msg = format!("{err:#}");
+    assert!(msg.contains(out), "the error names the path: {msg}");
+
+    let r = must_row(&ws.engine, &rel)?;
+    assert_eq!(r.pending_hash, Some(hashout("v1")), "step 2 committed: {r:?}");
+    assert!(r.record.is_none(), "nothing was recorded: {r:?}");
+    let (kind, reason) = status(&ws.engine, &rel)?;
+    assert_eq!(reason, Some(StatusReason::Pending));
+    assert!(kind.is_excluded(), "a pending path stays out of readers");
+
+    // The lock went with the failed job: a second run takes it.
+    let again = tokio::time::timeout(Duration::from_secs(60), run_on(&ws.engine, "//p:gen"))
+        .await
+        .context("the second run waited on the failed run's codegen lock")?;
+    assert!(again.is_err(), "the tree is still broken");
+    let e2 = ws.reopen()?;
+    let again = tokio::time::timeout(Duration::from_secs(60), run_on(&e2, "//p:gen"))
+        .await
+        .context("a new engine waited on the failed run's codegen lock")?;
+    assert!(again.is_err(), "the tree is still broken");
+
+    fix_tree(&pkg);
+    let e3 = ws.reopen()?;
+    run_on(&e3, "//p:gen").await?;
+    assert_recorded(&must_row(&e3, &rel)?, "//p:gen", "v1");
+    assert_eq!(read(&ws, &rel).as_deref(), Some("v1"));
+    assert_eq!(
+        status(&e3, &rel)?,
+        (StatusKind::Generated, Some(StatusReason::Recorded))
+    );
+    Ok(())
+}
+
+/// The destination is a directory: the write itself fails.
+#[tokio::test]
+async fn byte_move_failure_destination_is_a_directory() -> anyhow::Result<()> {
+    byte_move_failure(
+        "gen.txt",
+        |pkg| std::fs::create_dir_all(pkg.join("gen.txt/inner")).unwrap(),
+        |pkg| std::fs::remove_dir_all(pkg.join("gen.txt")).unwrap(),
+    )
+    .await
+}
+
+/// A parent of the destination is a file: creating the parent fails.
+#[tokio::test]
+async fn byte_move_failure_parent_is_a_file() -> anyhow::Result<()> {
+    byte_move_failure(
+        "sub/gen.txt",
+        |pkg| std::fs::write(pkg.join("sub"), "a file").unwrap(),
+        |pkg| std::fs::remove_file(pkg.join("sub")).unwrap(),
+    )
+    .await
+}
+
 // ---------------------------------------------------------------------------
 // Row 4: a glob output that produces fewer files
 // ---------------------------------------------------------------------------
