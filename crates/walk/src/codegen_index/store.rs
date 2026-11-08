@@ -545,9 +545,10 @@ impl WriteTxn<'_> {
         .with_context(|| format!("reading {addr}'s rows"))
     }
 
-    /// The row at `path`, whoever owns it, as this transaction sees it: a
-    /// writer ORs its `seen_in_section` into what it puts, since commands set
-    /// the flag without the target's lock.
+    /// The row at `path`, whoever owns it, as this transaction sees it. A
+    /// writer holds only its own target's lock, so it rebuilds what it puts
+    /// from this read (another target may have taken the path since its
+    /// unlocked read) and ORs its `seen_in_section` into the flag found here.
     pub fn row(&self, path: &[u8]) -> Result<Option<Row>> {
         query_row_at(&self.tx, path)
             .with_context(|| format!("reading the row of {}", String::from_utf8_lossy(path)))
