@@ -52,9 +52,23 @@ impl CodegenIndex {
             return Ok(0);
         };
         let addr = guard.addr();
+        // Read first: a call that changes nothing commits nothing, so the
+        // generation (and every process's snapshot) stays put.
+        let mut todo = Vec::new();
+        for path in paths {
+            if store
+                .row(path)?
+                .is_some_and(|r| r.addr == addr && !r.seen_in_section)
+            {
+                todo.push(path);
+            }
+        }
+        if todo.is_empty() {
+            return Ok(0);
+        }
         let committed = store.write(|txn| {
             let mut n = 0;
-            for path in paths {
+            for path in todo {
                 let Some(mut row) = txn.row(path)?.filter(|r| r.addr == addr) else {
                     continue;
                 };
@@ -78,9 +92,19 @@ impl CodegenIndex {
             return Ok(Vec::new());
         };
         let addr = guard.addr();
+        // Read first, as `mark_seen_in_section` does: no row, no commit.
+        let mut todo = Vec::new();
+        for path in paths {
+            if store.row(path)?.is_some_and(|r| r.addr == addr) {
+                todo.push(path);
+            }
+        }
+        if todo.is_empty() {
+            return Ok(Vec::new());
+        }
         let committed = store.write(|txn| {
             let mut dropped = Vec::new();
-            for path in paths {
+            for path in todo {
                 if txn.delete(path, addr)? {
                     dropped.push(path.clone());
                 }
@@ -197,5 +221,68 @@ impl CodegenIndex {
         })?;
         self.publish_committed(&committed);
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::codegen_index::store::{Row, RowKind};
+    use crate::codegen_index::testfs::{guard, ws};
+
+    const ADDR: &str = "//p:gen";
+
+    fn row(path: &str, addr: &str, seen: bool) -> Row {
+        let mut r = Row::new(path.as_bytes().to_vec(), addr, RowKind::File);
+        r.seen_in_section = seen;
+        r
+    }
+
+    #[test]
+    fn mark_seen_in_section_that_changes_nothing_commits_nothing() {
+        let w = ws();
+        w.put(&[
+            row("gen/a.go", ADDR, true),
+            row("gen/b.go", "//p:other", false),
+        ]);
+        let g = w.generation();
+        let paths = [
+            b"gen/a.go".to_vec(),
+            b"gen/b.go".to_vec(),
+            b"gen/none".to_vec(),
+        ];
+        let n = w.index.mark_seen_in_section(&guard(ADDR), &paths).unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(w.generation(), g, "a no-op moved the generation");
+        assert!(!w.db_row("gen/b.go").unwrap().seen_in_section);
+        // One that changes something commits once.
+        w.put(&[row("gen/c.go", ADDR, false)]);
+        let g = w.generation();
+        let n = w
+            .index
+            .mark_seen_in_section(&guard(ADDR), &[b"gen/c.go".to_vec()])
+            .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(w.generation(), g + 1);
+        assert!(w.db_row("gen/c.go").unwrap().seen_in_section);
+    }
+
+    #[test]
+    fn forget_that_changes_nothing_commits_nothing() {
+        let w = ws();
+        w.put(&[row("gen/b.go", "//p:other", false)]);
+        let g = w.generation();
+        let paths = [b"gen/b.go".to_vec(), b"gen/none".to_vec()];
+        assert!(w.index.forget(&guard(ADDR), &paths).unwrap().is_empty());
+        assert_eq!(w.generation(), g, "a no-op moved the generation");
+        assert!(w.db_row("gen/b.go").is_some(), "another target's row");
+        w.put(&[row("gen/a.go", ADDR, false)]);
+        let g = w.generation();
+        let dropped = w
+            .index
+            .forget(&guard(ADDR), &[b"gen/a.go".to_vec()])
+            .unwrap();
+        assert_eq!(dropped, [b"gen/a.go".to_vec()]);
+        assert_eq!(w.generation(), g + 1);
+        assert!(w.db_row("gen/a.go").is_none());
     }
 }
