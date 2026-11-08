@@ -42,6 +42,8 @@ pub mod lookup;
 pub mod paths;
 pub mod section;
 pub mod snapshot;
+#[cfg(test)]
+mod startup_instrument;
 pub mod store;
 #[cfg(test)]
 mod testfs;
