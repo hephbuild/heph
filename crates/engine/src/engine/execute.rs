@@ -246,6 +246,7 @@ impl Engine {
                         let err = if hplugin::error::is_cancelled(&err) {
                             err
                         } else {
+                            let err = Arc::clone(&self).reword_removed_generator(&rs, err).await;
                             let slot = self
                                 .failure_slots
                                 .fill(crate::engine::failure_slot::Fill {
@@ -295,6 +296,44 @@ impl Engine {
     /// Where a run in `sandbox_dir` can have written its log: the directory
     /// itself and, when FUSE is mounted, the mount-side and backing-side
     /// directories the bridge redirects it to.
+    /// The fs driver refuses a generated path naming the row's generator, but
+    /// it cannot read defs, so it cannot tell a generator that still exists
+    /// from one that was removed (Decision 18). On this failure path only, the
+    /// row's addr is resolved once: when it is not found, the error is rebuilt
+    /// to name `codegen keep` / `discard` instead of "depend on". Any other
+    /// error, or a lookup that fails otherwise, is returned unchanged.
+    async fn reword_removed_generator(
+        self: Arc<Self>,
+        rs: &Arc<RequestState>,
+        err: anyhow::Error,
+    ) -> anyhow::Error {
+        use hbuiltins::pluginfs::{CodegenFileError, CodegenFileErrorKind};
+        let Some(cg) = hcore::hmemoizer::downcast_chain_ref::<CodegenFileError>(&err) else {
+            return err;
+        };
+        if cg.kind != CodegenFileErrorKind::Generated {
+            return err;
+        }
+        let Ok(generator) = hmodel::htaddr::parse_addr(&cg.addr) else {
+            return err;
+        };
+        match self.get_spec_no_track(Arc::clone(rs), &generator).await {
+            Err(e)
+                if hcore::hmemoizer::downcast_chain_ref::<
+                    crate::engine::error::TargetNotFoundError,
+                >(&e)
+                .is_some() =>
+            {
+                anyhow::Error::new(CodegenFileError {
+                    kind: CodegenFileErrorKind::TargetRemoved,
+                    ..cg.clone()
+                })
+                .context("run")
+            }
+            Ok(_) | Err(_) => err,
+        }
+    }
+
     fn sandbox_roots(&self, sandbox_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
         let mut roots = vec![sandbox_dir.to_path_buf()];
         if self.fuse.mount.is_some()

@@ -16,7 +16,7 @@ use hplugin::function::{FunctionRegistry, FunctionSlot, PluginFnDef};
 use hsandboxfuse as sandboxfuse;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex};
 use tracing::{error, warn};
 
 /// Context the engine injects when constructing any plugin (provider, driver, or
@@ -243,7 +243,10 @@ pub struct Engine {
     /// only observed. Usually empty (a cheap no-op on the emit hot path).
     pub(crate) hooks: Vec<Arc<dyn SDKHook>>,
 
-    pub requests: Mutex<HashMap<String, Weak<RequestState>>>,
+    /// Live root requests by id. Shared (`Arc`) with the fs plugin's codegen
+    /// reporter, which routes an event to its request without holding the
+    /// engine (see `EngineCodegenReport`).
+    pub requests: crate::engine::request_state::RequestRegistry,
     /// Every live request's cancellation token, by request id, for
     /// [`cancel_all_requests`](Engine::cancel_all_requests). Not read through
     /// `requests`: that holds the *root* `RequestState`, which the command
@@ -854,7 +857,7 @@ impl Engine {
             drivers: vec![],
             drivers_by_name: HashMap::new(),
             hooks: vec![],
-            requests: Mutex::new(HashMap::new()),
+            requests: Arc::new(Mutex::new(HashMap::new())),
             request_ctokens: Mutex::new(HashMap::new()),
             exec_runners: Arc::new({
                 let mut registry = hexecrunner::registry::RunnerRegistry::with_builtins();
@@ -930,15 +933,29 @@ impl Engine {
         // One `Ignore`, shared: the driver and the functions were each handed a
         // separately built copy of the same set. Its matchers compile on first
         // use, so a run that never walks through `fs` never compiles them.
+        //
+        // Both read generated files through the engine's codegen index and
+        // report what it excluded to the request that read them.
+        let codegen_report: Arc<dyn hbuiltins::pluginfs::CodegenReport> = Arc::new(
+            crate::engine::request_state::EngineCodegenReport::new(Arc::clone(&engine.requests)),
+        );
         engine.register_plugin("fs", |init| {
             let ignore = Arc::new(hwalk::Ignore::new(&init.skip_dirs, &init.skip_globs)?);
+            let codegen = hbuiltins::pluginfs::FsCodegen::new(
+                Arc::clone(&init.codegen_index),
+                codegen_report,
+            );
             Ok(PluginParts::default()
                 .with_provider(Box::new(hbuiltins::pluginfs::Provider))
-                .with_driver(Box::new(hbuiltins::pluginfs::Driver::new(
-                    Arc::clone(&ignore),
-                    init.walker.clone(),
+                .with_functions(hbuiltins::pluginfs::functions_with(
+                    &ignore,
+                    &init.walker,
+                    &codegen,
+                ))
+                .with_driver(Box::new(
+                    hbuiltins::pluginfs::Driver::new(Arc::clone(&ignore), init.walker.clone())
+                        .with_codegen(codegen),
                 )))
-                .with_functions(hbuiltins::pluginfs::functions(&ignore, &init.walker)))
         })?;
 
         Ok(engine)

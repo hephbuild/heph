@@ -34,7 +34,7 @@ async fn test_codegen_gen_target_produces_go_file() -> anyhow::Result<()> {
 /// through an fs `file` input fails loudly, naming the generator, instead of
 /// silently compiling without it.
 #[tokio::test]
-#[ignore = "needs the codegen index fs file check (U3)"]
+#[ignore = "scenario does not reach the fallback: _golist's *.go glob excludes the recorded gen.go, so go list never lists it and the compile fails with `undefined: GeneratedVar` (U3c)"]
 async fn go_pkg_analysis_fallback_on_generated_file_fails_loudly() -> anyhow::Result<()> {
     require_go!();
     let dir = fixture("codegen")?;

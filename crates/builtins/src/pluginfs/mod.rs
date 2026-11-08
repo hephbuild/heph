@@ -3712,7 +3712,11 @@ mod tests {
         let arts = run_fs(&driver, "glob", config, tmp.path()).await.unwrap();
 
         let names: Vec<_> = arts.iter().map(|a| a.name.as_str()).collect();
-        assert_eq!(names, vec!["plain.rs"], "the recorded file must be excluded");
+        assert_eq!(
+            names,
+            vec!["plain.rs"],
+            "the recorded file must be excluded"
+        );
         let events = recorder.events.lock();
         assert_eq!(events.len(), 1, "{events:?}");
         assert!(
@@ -3780,7 +3784,10 @@ mod tests {
         let arts = run_fs(&driver, "copy_output", f_config("generated.rs"), tmp.path())
             .await
             .unwrap();
-        assert!(arts.is_empty(), "copy_output of a recorded path yields nothing");
+        assert!(
+            arts.is_empty(),
+            "copy_output of a recorded path yields nothing"
+        );
         assert!(recorder.events.lock().is_empty(), "copy_output is silent");
 
         let arts = run_fs(&driver, "copy_output", f_config("plain.rs"), tmp.path())

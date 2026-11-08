@@ -254,10 +254,7 @@ impl<'a> GlobLookup<'a> {
             Some(p) => LookupMeta::walk(false, p),
             None => LookupMeta::point(false),
         };
-        let st = self
-            .snap
-            .status(&nrel, &meta)
-            .with_context_path(rel)?;
+        let st = self.snap.status(&nrel, &meta).with_context_path(rel)?;
         Ok(st.kind.is_excluded().then(|| Excluded::new(rel, &st)))
     }
 
@@ -408,7 +405,13 @@ pub fn report(cg: &FsCodegen, request_id: Option<&str>, excluded: &[Excluded]) {
         {
             let status = status_str(ex.kind);
             let reason = ex.reason.map(reason_str);
-            tracing::debug!(path, status, reason, addr = ex.addr.as_deref(), "codegen: excluded");
+            tracing::debug!(
+                path,
+                status,
+                reason,
+                addr = ex.addr.as_deref(),
+                "codegen: excluded"
+            );
             cg.report.emit(
                 request_id,
                 BuildEventKind::CodegenExcluded {

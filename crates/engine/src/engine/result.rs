@@ -1114,34 +1114,48 @@ fn write_back_hints(addr: &str, outside_section: usize, no_section_hint: bool) -
     out
 }
 
-/// The `@heph/fs` addrs covering every `codegen = in_place` output path.
+/// What every `codegen = in_place` output path reads as, keyed on
+/// `(kind, path)` ([`hbuiltins::pluginfs::FsPathKey`]).
 ///
-/// Uses the same path→addr mapping as [`crate::engine::expand`]'s synthesized fs
-/// inputs, so a declared in_place output and the input that reads it resolve to
-/// the same addr — which is what lets
-/// [`Engine::check_in_place_inputs_unchanged`] match one against the other.
-/// Verified on a real target: an output `FilePath("go/large/alpha/alpha.go")`
-/// and the input `//@heph/fs:file@f=go/large/alpha/alpha.go` are the same addr.
-fn in_place_fs_addrs(
+/// Built by the one helper [`crate::engine::expand`]'s synthesized fs inputs
+/// use ([`hbuiltins::pluginfs::output_fs_addr`]), and keyed on what the addr
+/// reads rather than the addr itself: strict `file` and lenient `copy_output`
+/// over one path are one key, so a strict/lenient mismatch between an output
+/// and the input that reads it can never silently skip the guard (E15).
+fn in_place_fs_keys(
     outputs: &[crate::engine::driver::targetdef::Output],
-) -> rustc_hash::FxHashSet<Addr> {
-    use crate::engine::driver::targetdef::path::{CodegenMode, Content};
+) -> rustc_hash::FxHashSet<hbuiltins::pluginfs::FsPathKey> {
+    use crate::engine::driver::targetdef::path::CodegenMode;
 
-    let mut out = rustc_hash::FxHashSet::default();
-    for path in outputs
+    outputs
         .iter()
         .flat_map(|o| o.paths.iter())
         .filter(|p| matches!(p.codegen_tree, CodegenMode::InPlace))
-    {
-        out.insert(match &path.content {
-            Content::FilePath(p) => hbuiltins::pluginfs::file_addr(p),
-            Content::Glob(p) => hbuiltins::pluginfs::glob_addr(p, &[]),
-            Content::DirPath(p) => {
-                hbuiltins::pluginfs::glob_addr(&format!("{}/**/*", p.trim_end_matches('/')), &[])
-            }
-        });
+        .filter_map(|p| hbuiltins::pluginfs::fs_path_key(&hbuiltins::pluginfs::output_fs_addr(p)))
+        .collect()
+}
+
+/// The hashed inputs of a target that read one of its `in_place` outputs,
+/// paired on `(kind, path)` (see [`in_place_fs_keys`]), never on raw `Addr`
+/// equality. An in_place output the target never read is not something it
+/// transformed, so it is not watched.
+fn in_place_watched_inputs(
+    outputs: &[crate::engine::driver::targetdef::Output],
+    inputs: &[crate::engine::driver::targetdef::Input],
+) -> Vec<Addr> {
+    let guarded = in_place_fs_keys(outputs);
+    if guarded.is_empty() {
+        return Vec::new();
     }
-    out
+    inputs
+        .iter()
+        .filter(|i| {
+            i.hashed
+                && hbuiltins::pluginfs::fs_path_key(&i.r#ref.r#ref)
+                    .is_some_and(|k| guarded.contains(&k))
+        })
+        .map(|i| i.r#ref.r#ref.clone())
+        .collect()
 }
 
 /// The root-relative paths a codegen write-back moved, each mapped to the
@@ -4693,11 +4707,19 @@ impl Engine {
         rs: &Arc<RequestState>,
         def: &LinkedTargetDef,
     ) -> anyhow::Result<()> {
-        // The `@heph/fs` addrs covering the paths about to be overwritten. Same
-        // path→addr mapping `expand::synthesized_fs_inputs` uses, so a declared
-        // in_place output and the input that reads it land on the same addr.
-        let guarded = in_place_fs_addrs(&def.target.outputs);
-        if guarded.is_empty() {
+        // No in_place output: nothing is about to be overwritten.
+        if !def
+            .target
+            .outputs
+            .iter()
+            .flat_map(|o| o.paths.iter())
+            .any(|p| {
+                matches!(
+                    p.codegen_tree,
+                    crate::engine::driver::targetdef::path::CodegenMode::InPlace
+                )
+            })
+        {
             return Ok(());
         }
 
@@ -4713,11 +4735,7 @@ impl Engine {
         // An in_place output the target never read is not something it
         // transformed, so there is no stale-transform hazard to guard — writing
         // it is the declared behaviour.
-        let watched: Vec<Addr> = inputs
-            .iter()
-            .filter(|i| i.hashed && guarded.contains(&i.r#ref.r#ref))
-            .map(|i| i.r#ref.r#ref.clone())
-            .collect();
+        let watched = in_place_watched_inputs(&def.target.outputs, &inputs);
         if watched.is_empty() {
             return Ok(());
         }
@@ -13389,12 +13407,74 @@ mod tests {
         Ok(())
     }
 
-    /// End-to-end provenance: after a `copy` codegen target writes+stamps a
-    /// net-new file, a subsequent `@heph/fs` glob over the same tree EXCLUDES it
-    /// (so it is never double-sourced), while an unstamped in_place output stays
-    /// visible to a glob.
+    /// The in-place guard pairs an `in_place` output with the inputs that read
+    /// it on `(kind, path)`, never raw `Addr` equality (Decision 25): a strict
+    /// `file` and a lenient `copy_output` over the output's path both pair, so
+    /// a strict/lenient mismatch cannot silently skip the guard. An unhashed
+    /// input, another path, and a glob that is not the output's glob do not.
+    #[test]
+    fn in_place_pairing_by_kind_and_path() {
+        use crate::engine::driver::targetdef::path::{CodegenMode, Content, Path};
+        use crate::engine::driver::targetdef::{Input, InputMode, Output};
+        use hbuiltins::pluginfs::{copy_output_addr, file_addr, glob_addr};
+
+        let path = |content, codegen_tree| Path {
+            content,
+            codegen_tree,
+            collect: false,
+        };
+        let outputs = vec![Output {
+            group: "main".to_string(),
+            paths: vec![
+                path(Content::FilePath("pkg/a.go".into()), CodegenMode::InPlace),
+                path(Content::Glob("pkg/*.txt".into()), CodegenMode::InPlace),
+                // Not in_place: never guarded.
+                path(Content::FilePath("pkg/c.go".into()), CodegenMode::Copy),
+            ],
+        }];
+        let input = |addr: Addr, hashed| Input {
+            r#ref: crate::engine::driver::TargetAddr {
+                r#ref: addr,
+                output: None,
+                filters: vec![],
+            },
+            mode: InputMode::Standard,
+            origin_id: "o".to_string(),
+            annotations: BTreeMap::new(),
+            hashed,
+            runtime: true,
+        };
+        let inputs = vec![
+            input(file_addr("pkg/a.go"), true),
+            input(copy_output_addr("pkg/a.go"), true),
+            input(file_addr("pkg/a.go"), false),
+            input(file_addr("pkg/b.go"), true),
+            input(glob_addr("pkg/*.txt", &[]), true),
+            input(glob_addr("pkg/*.txt", &["pkg/x.txt"]), true),
+            input(copy_output_addr("pkg/c.go"), true),
+        ];
+
+        let watched: Vec<String> = in_place_watched_inputs(&outputs, &inputs)
+            .iter()
+            .map(Addr::format)
+            .collect();
+        assert_eq!(
+            watched,
+            vec![
+                file_addr("pkg/a.go").format(),
+                copy_output_addr("pkg/a.go").format(),
+                glob_addr("pkg/*.txt", &[]).format(),
+            ],
+        );
+    }
+
+    /// End-to-end provenance: after a `copy` codegen target writes a net-new
+    /// file, which its write-back records in the codegen index, a subsequent
+    /// `@heph/fs` glob over the same tree EXCLUDES it (so it is never
+    /// double-sourced), while an in_place output, never recorded, stays visible
+    /// to a glob.
     #[tokio::test]
-    async fn stamped_copy_output_excluded_from_later_glob() -> anyhow::Result<()> {
+    async fn recorded_copy_output_excluded_from_later_glob() -> anyhow::Result<()> {
         let (engine, root) = engine_with_home_fs(vec![
             codegen_run_target("//pkg:cp", "copy", &["*.gen"], "echo generated > out.gen"),
             codegen_run_target("//pkg:ip", "in_place", &["keep.txt"], "true"),
@@ -13403,12 +13483,7 @@ mod tests {
         std::fs::create_dir_all(&pkg_dir)?;
         std::fs::write(pkg_dir.join("keep.txt"), b"keep\n")?;
 
-        // Skip the exclusion assertions on a filesystem that can't persist xattrs.
-        let probe = root.path().join(".xattr_probe");
-        std::fs::write(&probe, b"x")?;
-        let xattr_supported = xattr::set(&probe, hbuiltins::pluginfs::CODEGEN_XATTR, b"v").is_ok();
-
-        // Materialize + stamp the copy output, and write back the in_place file.
+        // Materialize + record the copy output, and write back the in_place file.
         resolve_collecting_events(&engine, &hmodel::htaddr::parse_addr("//pkg:cp")?)
             .await
             .0
@@ -13418,25 +13493,32 @@ mod tests {
             .0
             .expect("in_place target resolves");
 
-        // A glob over the stamped copy output must yield nothing.
+        // A glob over the recorded copy output must yield nothing, and say so
+        // on the request's event stream.
         let gen_glob = hbuiltins::pluginfs::glob_addr("pkg/*.gen", &[]);
-        let (res, _) = resolve_collecting_events(&engine, &gen_glob).await;
+        let (res, events) = resolve_collecting_events(&engine, &gen_glob).await;
         let gen_res = res.expect("glob over generated files resolves");
-        // A glob over the unstamped in_place output must still see it.
+        // A glob over the in_place output must still see it.
         let keep_glob = hbuiltins::pluginfs::glob_addr("pkg/keep.txt", &[]);
         let (res, _) = resolve_collecting_events(&engine, &keep_glob).await;
         let keep_res = res.expect("glob over in_place output resolves");
 
-        if xattr_supported {
-            assert!(
-                gen_res.artifacts.is_empty(),
-                "stamped copy output must be excluded from a later glob, got {} artifacts",
-                gen_res.artifacts.len(),
-            );
-        }
+        assert!(
+            gen_res.artifacts.is_empty(),
+            "recorded copy output must be excluded from a later glob, got {} artifacts",
+            gen_res.artifacts.len(),
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                &e.kind,
+                BuildEventKind::CodegenExcluded { path, addr: Some(addr), .. }
+                    if path == "pkg/out.gen" && addr == "//pkg:cp"
+            )),
+            "the exclusion reaches the request as CodegenExcluded, got {events:?}"
+        );
         assert!(
             !keep_res.artifacts.is_empty(),
-            "unstamped in_place output must remain visible to a glob",
+            "in_place output must remain visible to a glob",
         );
         Ok(())
     }

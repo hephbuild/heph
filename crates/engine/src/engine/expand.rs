@@ -1,6 +1,5 @@
 use crate::engine::Engine;
 use crate::engine::driver::TargetAddr;
-use crate::engine::driver::targetdef::path::Content;
 use crate::engine::driver::targetdef::{Input, InputMode};
 use crate::engine::invoke::EntrypointAsInput;
 use crate::engine::request_state::{AddrKey, RequestState};
@@ -70,14 +69,10 @@ fn synthesized_fs_inputs(
     let mut out = Vec::new();
     for output in outputs {
         for path in &output.paths {
-            let fs_addr = match &path.content {
-                Content::FilePath(p) => hbuiltins::pluginfs::file_addr(p),
-                Content::Glob(p) => hbuiltins::pluginfs::glob_addr(p, &[]),
-                Content::DirPath(p) => hbuiltins::pluginfs::glob_addr(
-                    &format!("{}/**/*", p.trim_end_matches('/')),
-                    &[],
-                ),
-            };
+            // A `copy` target's own `FilePath` output reads through the
+            // lenient `copy_output` target: an excluded path (its previous
+            // output) is zero artifacts, never its bytes (Decision 25).
+            let fs_addr = hbuiltins::pluginfs::output_fs_addr(path);
             if seen.insert(fs_addr.clone()) {
                 out.push(introspect_input(fs_addr, template));
             }
@@ -600,6 +595,36 @@ mod tests {
             !oids[0].starts_with("introspect_outputs"),
             "origin_id must be inherited from the magic dep, not synthesized, got: {:?}",
             oids[0],
+        );
+        Ok(())
+    }
+
+    // A `copy` target's own FilePath output reads through the lenient
+    // `copy_output` fs target, never strict `file` (Decision 25, E15): its
+    // previous output is excluded, and must resolve to nothing, not fail. A
+    // glob output is the plain glob either way.
+    #[tokio::test]
+    async fn introspect_outputs_of_a_copy_target_use_copy_output() -> anyhow::Result<()> {
+        let mut spec = introspect_exec_spec(
+            "//pkg:gen",
+            &["*.go", "foo.txt"],
+            &["//@heph/introspect:outputs"],
+        );
+        spec.config
+            .insert("codegen".to_string(), Value::String("copy".to_string()));
+        let (engine, _root) = engine_with(vec![spec])?;
+
+        let rs = engine.new_state();
+        let addr = hmodel::htaddr::parse_addr("//pkg:gen")?;
+        let expanded = Arc::clone(&engine).expanded_inputs_for(rs, &addr).await?;
+        let addrs: Vec<String> = expanded.iter().map(|i| i.r#ref.r#ref.format()).collect();
+
+        assert_eq!(
+            addrs,
+            vec![
+                hbuiltins::pluginfs::glob_addr("pkg/*.go", &[]).format(),
+                hbuiltins::pluginfs::copy_output_addr("pkg/foo.txt").format(),
+            ],
         );
         Ok(())
     }
