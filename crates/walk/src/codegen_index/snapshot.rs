@@ -20,10 +20,12 @@
 //!   (sequence ≥ `S`), by sequence, not by `gen`, because publishes can
 //!   arrive out of `gen` order.
 
+use super::fs::IndexFs;
 use super::section::Section;
 use super::store::Row;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// The rows as of one reload (or a fold of one).
@@ -248,12 +250,13 @@ impl State {
         self.base = Arc::new(base);
     }
 
-    pub fn snapshot(&self, section: Arc<Section>) -> Snapshot {
+    pub fn snapshot(&self, section: Arc<Section>, env: Arc<LookupEnv>) -> Snapshot {
         Snapshot {
             base: Arc::clone(&self.base),
             overlay: Arc::clone(&self.overlay),
             loaded_through: self.loaded_through,
             section,
+            env,
         }
     }
 
@@ -274,9 +277,36 @@ pub struct Snapshot {
     overlay: Arc<Overlay>,
     loaded_through: u64,
     section: Arc<Section>,
+    env: Arc<LookupEnv>,
+}
+
+/// What a lookup needs besides the rows: the root its paths are relative to,
+/// and the filesystem it stats and hashes through. One per index.
+pub struct LookupEnv {
+    pub(crate) root: PathBuf,
+    pub(crate) fs: Arc<dyn IndexFs>,
+}
+
+impl LookupEnv {
+    pub fn new(root: PathBuf, fs: Arc<dyn IndexFs>) -> Self {
+        Self { root, fs }
+    }
+}
+
+impl std::fmt::Debug for LookupEnv {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LookupEnv")
+            .field("root", &self.root)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Snapshot {
+    /// The root and filesystem lookups go through.
+    pub(crate) fn env(&self) -> &LookupEnv {
+        &self.env
+    }
+
     /// The row at `path`: the higher `gen` of base and overlay, the overlay
     /// winning a tie; a winning tombstone is no row.
     pub fn row(&self, path: &[u8]) -> Option<&Row> {
@@ -392,7 +422,11 @@ mod tests {
     }
 
     fn snap(st: &State) -> Snapshot {
-        st.snapshot(Arc::new(Section::empty()))
+        let env = LookupEnv::new(
+            PathBuf::from("/nonexistent"),
+            Arc::new(crate::codegen_index::testfs::TestFs::default()),
+        );
+        st.snapshot(Arc::new(Section::empty()), Arc::new(env))
     }
 
     fn paths(rows: Vec<&Row>) -> Vec<String> {

@@ -19,6 +19,11 @@
 //! - [`CodegenIndex`]: one checkout's index: the store if its db exists, the
 //!   snapshot state behind a swap-only lock, the reload single-flight, and
 //!   the compiled section keyed by the root `.gitignore`.
+//! - [`lookup`]: `Snapshot::status`, what one path is (`Generated`,
+//!   `Released`, `Modified`, `Source`), read-only (J6).
+//! - [`write`]: a `copy` write-back's protocol around the engine's
+//!   byte-mover: step 1 without a lock, steps 2 and 4 under the target's
+//!   codegen lock, and a command's settling of pending rows.
 //!
 //! Locking: walk does not depend on `hlock` (it pulls in `plugin` and
 //! `core`). The engine takes the flocks at [`CodegenLockPaths`] with `hlock`'s
@@ -29,18 +34,27 @@
 pub mod fold;
 pub mod fs;
 mod index;
+pub mod lookup;
 pub mod paths;
 pub mod section;
 pub mod snapshot;
 pub mod store;
+#[cfg(test)]
+mod testfs;
+pub mod write;
 
 pub use fold::fold_hash;
 pub use fs::{FileStat, IndexFs, RealFs, StatKind};
 pub use index::{CodegenIndex, FOLD_THRESHOLD, IndexOptions, IndexStats, SECTION_RACY_SLACK};
+pub use lookup::{LookupMeta, Status, StatusKind, StatusReason};
 pub use paths::{CodegenLockPaths, codegen_dir, db_path, normalize_rel, rel_path};
 pub use section::{Section, SectionMatch, SectionProbe};
-pub use snapshot::Snapshot;
+pub use snapshot::{LookupEnv, Snapshot};
 pub use store::{Committed, Record, Row, RowKind, RowState, Store, StoreOptions, WriteTxn};
+pub use write::{
+    EntryAction, Landing, LandingContent, PendingOutcome, PendingSettled, Plan, SettleReport,
+    WriteBack,
+};
 
 use std::any::Any;
 

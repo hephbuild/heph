@@ -387,6 +387,35 @@ impl Store {
         })
     }
 
+    /// The row at `path`, whoever owns it, as committed now.
+    pub fn row(&self, path: &[u8]) -> Result<Option<Row>> {
+        let conn = self.conn()?;
+        query_row_at(&conn, path).with_context(|| {
+            format!(
+                "reading the row of {} in the codegen index {}",
+                String::from_utf8_lossy(path),
+                self.path.display()
+            )
+        })
+    }
+
+    /// `meta.no_section_hint_shown`: the "this workspace has no managed
+    /// section" hint has been shown once already.
+    pub fn no_section_hint_shown(&self) -> Result<bool> {
+        let conn = self.conn()?;
+        conn.query_row(
+            "SELECT no_section_hint_shown FROM meta WHERE id = 0",
+            [],
+            |r| r.get::<_, bool>(0),
+        )
+        .with_context(|| {
+            format!(
+                "reading the meta of the codegen index {}",
+                self.path.display()
+            )
+        })
+    }
+
     /// Run one write: `BEGIN IMMEDIATE`, bump the generation, `f`, read back
     /// the rows tagged with it, commit. The returned [`Committed`] is what the
     /// caller publishes to the in-process snapshot, after this returns.
@@ -515,6 +544,31 @@ impl WriteTxn<'_> {
         )
         .with_context(|| format!("reading {addr}'s rows"))
     }
+
+    /// The row at `path`, whoever owns it, as this transaction sees it: a
+    /// writer ORs its `seen_in_section` into what it puts, since commands set
+    /// the flag without the target's lock.
+    pub fn row(&self, path: &[u8]) -> Result<Option<Row>> {
+        query_row_at(&self.tx, path)
+            .with_context(|| format!("reading the row of {}", String::from_utf8_lossy(path)))
+    }
+
+    /// Set `meta.no_section_hint_shown`.
+    pub fn set_no_section_hint_shown(&mut self) -> Result<()> {
+        self.tx
+            .execute("UPDATE meta SET no_section_hint_shown = 1 WHERE id = 0", [])
+            .context("recording that the no-section hint was shown")?;
+        Ok(())
+    }
+}
+
+fn query_row_at(conn: &Connection, path: &[u8]) -> rusqlite::Result<Option<Row>> {
+    let mut rows = query_rows(
+        conn,
+        &format!("SELECT {COLS} FROM files WHERE path = ?1"),
+        [path],
+    )?;
+    Ok(rows.pop())
 }
 
 /// A committed write: its generation, the rows it left tagged with it, the

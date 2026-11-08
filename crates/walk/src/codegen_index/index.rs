@@ -6,7 +6,7 @@ use super::ImportLockGuard;
 use super::fs::{IndexFs, is_absent};
 use super::paths::db_path;
 use super::section::Section;
-use super::snapshot::{Base, Snapshot, State};
+use super::snapshot::{Base, LookupEnv, Snapshot, State};
 use super::store::{self, Row, Store, StoreOptions};
 use anyhow::{Context as _, Result};
 use parking_lot::{Mutex, RwLock};
@@ -113,7 +113,7 @@ pub struct CodegenIndex {
     root: PathBuf,
     db_path: PathBuf,
     gitignore: PathBuf,
-    fs: Arc<dyn IndexFs>,
+    env: Arc<LookupEnv>,
     opts: IndexOptions,
     store: OnceLock<Store>,
     /// Held only to clone or swap.
@@ -124,7 +124,12 @@ pub struct CodegenIndex {
     stats: Stats,
     #[cfg(test)]
     hook: Mutex<Option<Hook>>,
+    #[cfg(test)]
+    fault: Mutex<Option<FaultHook>>,
 }
+
+#[cfg(test)]
+type FaultHook = Arc<dyn Fn(super::write::Fault) -> Result<()> + Send + Sync>;
 
 impl std::fmt::Debug for CodegenIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -159,7 +164,7 @@ impl CodegenIndex {
             root: root.to_path_buf(),
             gitignore: root.join(".gitignore"),
             db_path,
-            fs,
+            env: Arc::new(LookupEnv::new(root.to_path_buf(), fs)),
             opts,
             store,
             state: RwLock::new(State::default()),
@@ -173,6 +178,8 @@ impl CodegenIndex {
             stats: Stats::default(),
             #[cfg(test)]
             hook: Mutex::new(None),
+            #[cfg(test)]
+            fault: Mutex::new(None),
         })
     }
 
@@ -186,7 +193,7 @@ impl CodegenIndex {
     }
 
     pub fn fs(&self) -> &Arc<dyn IndexFs> {
-        &self.fs
+        &self.env.fs
     }
 
     /// The open store, if the db has been opened.
@@ -221,7 +228,7 @@ impl CodegenIndex {
                 self.reload(store, generation)?;
             }
         }
-        Ok(self.state.read().snapshot(section))
+        Ok(self.state.read().snapshot(section, Arc::clone(&self.env)))
     }
 
     /// After a glob's walk: the rows committed above the snapshot's
@@ -279,6 +286,10 @@ impl CodegenIndex {
 
     /// The open store, opening a db that appeared since inside the
     /// single-flight, so concurrent callers open it once.
+    pub(super) fn open_store(&self) -> Result<Option<&Store>> {
+        self.store_or_late_open()
+    }
+
     fn store_or_late_open(&self) -> Result<Option<&Store>> {
         if let Some(s) = self.store.get() {
             return Ok(Some(s));
@@ -339,7 +350,7 @@ impl CodegenIndex {
     }
 
     /// The compiled section, recompiled when the root `.gitignore` changed.
-    fn section(&self) -> Result<Arc<Section>> {
+    pub(super) fn section(&self) -> Result<Arc<Section>> {
         let key = match std::fs::metadata(&self.gitignore) {
             Ok(m) => Some(SectionKey {
                 size: m.size(),
@@ -396,7 +407,9 @@ impl CodegenIndex {
     /// The current state as a snapshot, without the freshness check.
     #[cfg(test)]
     fn peek(&self) -> Snapshot {
-        self.state.read().snapshot(Arc::new(Section::empty()))
+        self.state
+            .read()
+            .snapshot(Arc::new(Section::empty()), Arc::clone(&self.env))
     }
 
     fn hook(&self, _point: HookPoint) {
@@ -407,6 +420,28 @@ impl CodegenIndex {
                 h(_point);
             }
         }
+    }
+
+    /// Inject a failure at a write-back's crash point (tests only).
+    #[cfg(test)]
+    pub(super) fn set_fault(
+        &self,
+        f: impl Fn(super::write::Fault) -> Result<()> + Send + Sync + 'static,
+    ) {
+        *self.fault.lock() = Some(Arc::new(f));
+    }
+
+    /// A write-back passing one of its crash points: an injected failure in
+    /// tests, nothing otherwise.
+    #[cfg(test)]
+    pub(super) fn fault(&self, point: super::write::Fault) -> Result<()> {
+        let f = self.fault.lock().clone();
+        f.map_or(Ok(()), |f| f(point))
+    }
+
+    #[cfg(not(test))]
+    pub(super) fn fault(&self, _point: super::write::Fault) -> Result<()> {
+        Ok(())
     }
 }
 
