@@ -36,7 +36,7 @@ pub const DRIVER_NAME: &str = "fs";
 /// back to the tree (value = the generator's addr), for an N-1 heph and
 /// `heph tool codegen import`. Set only: no reader here looks at it; the
 /// codegen index decides what is generated (see [`codegen`]).
-pub const CODEGEN_XATTR: &str = "user.heph.codegen";
+pub use hwalk::codegen_index::import::CODEGEN_XATTR;
 
 mod codegen;
 pub use codegen::{
