@@ -322,14 +322,11 @@ pub fn make_workspace_hermetic(dir: TempDir) -> anyhow::Result<Workspace> {
     make_workspace_ordered(dir, false, true, &[], HERMETIC_GO)
 }
 
-/// A published heph release whose `heph-govet_<goos>_<goarch>` assets the lint
-/// suite downloads (via the built-in `http_fetch` driver, as a real workspace
-/// does). Pinned rather than "latest" so the fetch is reproducible.
-///
-/// Only the download path is tested against it, on a package that reads no
-/// archive: this release is built with go1.26, whose `go/types` cannot read the
-/// export data of the shell's Go. Lint behavior is tested with the tree's
-/// heph-govet ([`make_workspace_tree_govet`]).
+/// A published heph release, the `govet` option of a workspace that never lints:
+/// a dev build has no release of its own to point the default at. Nothing in the
+/// suite downloads it, since every lint test uses the tree's heph-govet
+/// ([`make_workspace_tree_govet`]). This release is built with go1.26, whose
+/// `go/types` cannot read the export data of the shell's Go.
 pub const GOVET_RELEASE: &str = "v1.0.0-alpha-build.177.721+g21169b25";
 
 /// The `govet` provider option pointing at [`GOVET_RELEASE`]'s download target.
@@ -340,10 +337,9 @@ pub fn govet_addr() -> String {
 /// Which heph-govet a workspace lints with.
 #[derive(Debug, Clone, Copy)]
 enum Govet {
-    /// [`GOVET_RELEASE`], downloaded through `http_fetch`, as a real workspace does.
-    /// Only the download path itself is worth testing against it: it is frozen, so
-    /// the lint driver tested against it is not tested against the tool it ships
-    /// with.
+    /// [`GOVET_RELEASE`], downloaded through `http_fetch` if anything lints. For
+    /// workspaces that don't: it is frozen, so a lint driver tested against it is
+    /// not tested against the tool it ships with.
     Release,
     /// `tools/heph-govet` built from this tree (see [`tree_govet_bin`]).
     Tree,
