@@ -55,6 +55,16 @@ event_paths=(
   "crates/core/src/events.rs"
 )
 
+# The exec-runner frames (`PrepareRequest`, `RunnerRequest` and their replies)
+# cross the seam as hand-encoded bytes, not protobuf: fields are read in order
+# with no tag and no absent-field default, so there is no additive change here.
+# A field added, removed, retyped or reordered is a break on its own — one side
+# reads the other's frame short or long and either errors or silently drops the
+# field (0.19.0 was the latter: a runner that never saw `tty`).
+wire_paths=(
+  "crates/execrunner/src/wire.rs"
+)
+
 # Resolve the merge-base so we compare only what this branch introduced, not
 # unrelated commits that landed on the base since it forked.
 if ! base_sha=$(git merge-base "$base_ref" HEAD 2>/dev/null); then
@@ -139,6 +149,11 @@ fi
 # cover it.
 if grep -q "^${soft_glob}" <<<"$changed"; then
   echo "::warning::proto/plugin/v1 changed — additive: bump ABI_SEMVER patch; a break: bump the minor AND raise MIN_PLUGIN_ABI (crates/plugin-abi/src/lib.rs) to the new x.y.0 — stabby cannot see a wire-only break (see $doc)" >&2
+fi
+
+# Exec-runner frames: see the note by `wire_paths`.
+if matches "${wire_paths[@]}"; then
+  echo "::warning::${wire_paths[*]} changed — these frames are hand-encoded bytes with no absent-field default, so any field change is a break: bump ABI_SEMVER's minor AND raise MIN_PLUGIN_ABI (crates/plugin-abi/src/lib.rs) to the new x.y.0 (see $doc)" >&2
 fi
 
 # Event stream: see the note by `event_paths`.

@@ -203,11 +203,12 @@ impl RunnerHost for EngineRunnerHost {
         request_id: &str,
         addr: &Addr,
         rewrite: SpecRewrite,
+        tty: bool,
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<PrepareOutcome> {
         let cfg = self.resolve(request_id, addr).await?;
         self.registry
-            .prepare(&addr.format(), &cfg, rewrite, ctoken)
+            .prepare(&addr.format(), &cfg, rewrite, tty, ctoken)
             .await
     }
 }

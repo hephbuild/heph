@@ -12,7 +12,7 @@ in order:
    reads the same whatever layout either side has. The host reads it before
    calling anything else in the plugin and accepts exactly the versions
    matching the caret requirement `^MIN_PLUGIN_ABI` (`crates/plugin-abi/src/lib.rs`;
-   pre-1.0, `^0.18.0` = `>=0.18.0, <0.19.0`), compared as semver. A plugin
+   pre-1.0, `^0.19.0` = `>=0.19.0, <0.20.0`), compared as semver. A plugin
    without the symbol predates 0.17.0 and is refused the same way. A plugin
    from a **later minor** is unsupported and refused: the host cannot know
    what that break changed. A later *patch* loads.
@@ -227,6 +227,16 @@ skipped in silence.
 
 ## History of breaks
 
+- **0.19.0** (break) — the exec-runner seam says whether the target runs on a
+  terminal. `PrepareRequest` and `RunnerRequest` (`hexecrunner::wire`) end in
+  a `tty` byte, read into `RunnerCtx::tty`, so a runner that moves the target
+  behind another transport can hand a terminal through: the oci runner enters
+  a `--shell` with `docker exec -it`. The frames are hand-encoded bytes, not
+  prost, so there is no absent-field default. A 0.18 plugin's runner would
+  ignore this host's trailing byte and never see the flag (the terminal silently
+  missing, the bug this fixes), and a 0.18 plugin driver's frame is truncated
+  to this host. `MIN_PLUGIN_ABI` rises to 0.19.0: every plugin must be
+  rebuilt.
 - **0.18.0** (break) — a run's terminal failure is one `RunFailure` in
   `RunOutFrame`'s oneof (7): the message, the exit status and the failure's
   `artifacts` (4, `OutputArtifactRef`s — normally the run's `log.txt`). It

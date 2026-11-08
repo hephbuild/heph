@@ -184,6 +184,17 @@ impl ShellSession {
         Self::spawn_with(dist, cwd, args, home.path(), None)
     }
 
+    /// [`Self::spawn`] with extra variables set on heph's environment.
+    fn spawn_env(
+        dist: &Dist,
+        cwd: &std::path::Path,
+        args: &[&str],
+        env: &[(&str, &std::ffi::OsStr)],
+    ) -> Self {
+        let home = tempfile::tempdir().expect("home tempdir");
+        Self::spawn_inner(dist, cwd, args, home.path(), None, env)
+    }
+
     /// [`Self::spawn`] with the caller's `HOME` and `PROMPT_COMMAND` chosen,
     /// the latter removed when `None` so a test host's cannot leak in.
     fn spawn_with(
@@ -192,6 +203,17 @@ impl ShellSession {
         args: &[&str],
         home: &std::path::Path,
         prompt_command: Option<&str>,
+    ) -> Self {
+        Self::spawn_inner(dist, cwd, args, home, prompt_command, &[])
+    }
+
+    fn spawn_inner(
+        dist: &Dist,
+        cwd: &std::path::Path,
+        args: &[&str],
+        home: &std::path::Path,
+        prompt_command: Option<&str>,
+        env: &[(&str, &std::ffi::OsStr)],
     ) -> Self {
         const ROWS: u16 = 40;
         const COLS: u16 = 140;
@@ -220,6 +242,9 @@ impl ShellSession {
         cmd.env("HEPH_DISABLE_TELEMETRY", "1");
         cmd.env("RUST_BACKTRACE", "1");
         cmd.env("TERM", "xterm-256color");
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
 
         let child = pair.slave.spawn_command(cmd).expect("spawn under pty");
         drop(pair.slave);
@@ -1010,6 +1035,212 @@ fn build_target_shell_forwards_resize() {
 
     let mut session = ShellSession::spawn(&dist, ws.root(), &["run", "--shell", "//pkg:tool"]);
     tool_follows_the_terminal(&mut session, "none");
+}
+
+/// The image the oci `--shell` test runs in. Built here, not pulled: a real
+/// base (the tool is bash and needs `stty`) with the marker baked into the
+/// image's environment, which a `docker exec` inherits.
+const OCI_SHELL_IMAGE: &str = "heph-bin-e2e-oci-shell:latest";
+
+/// A daemon that answers, not merely a `docker` on PATH — the question
+/// `crates/e2e`'s oci tests ask before running.
+fn docker_ready() -> bool {
+    std::process::Command::new("docker")
+        .args(["version", "--format", "{{.Server.Version}}"])
+        .output()
+        .map(|o| o.status.success() && !o.stdout.trim_ascii().is_empty())
+        .unwrap_or(false)
+}
+
+/// Build [`OCI_SHELL_IMAGE`]. A failure is the build's stderr: once a daemon
+/// answers, a build that fails (a registry rate limit, a network blip) must
+/// fail the test rather than skip it, or the one test that runs this fix
+/// against real docker would read as a pass.
+fn build_oci_shell_image() -> Result<(), String> {
+    let dir = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
+    std::fs::write(
+        dir.path().join("Dockerfile"),
+        "FROM debian:stable-slim\nENV XR_MARK=container\n",
+    )
+    .map_err(|e| format!("write Dockerfile: {e}"))?;
+    let out = std::process::Command::new("docker")
+        .args(["build", "-t", OCI_SHELL_IMAGE, "."])
+        .current_dir(dir.path())
+        .output()
+        .map_err(|e| format!("run docker build: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).into_owned())
+    }
+}
+
+/// A workspace that loads the shipped oci cdylib, with `pkg/BUILD` holding an
+/// `oci.runner` for `image`, [`FOLLOWING_TOOL`] under it as `tool`, and `extra`.
+fn oci_workspace(dist: &Dist, image: &str, extra: &str) -> common::Workspace {
+    let dylib = dist.plugin("oci");
+    assert!(dylib.is_file(), "missing {}", dylib.display());
+    let ws = common::Workspace::new().expect("workspace");
+    let manifest = ws.root().join("heph-oci-plugin.json");
+    let sum = common::sha256_file(&dylib).expect("hash oci cdylib");
+    common::write_manifest(&manifest, "oci", &dylib, Some(&sum)).expect("write manifest");
+    ws.config(&format!(
+        "{}  - path: {}\n",
+        common::BASE_CONFIG,
+        manifest.display()
+    ))
+    .expect("write config");
+    ws.write(
+        "pkg/BUILD",
+        &format!(
+            r#"
+target(name = "runner", driver = "oci.runner", image = "{image}")
+target(name = "tool", runner = "//pkg:runner", {FOLLOWING_TOOL})
+{extra}
+"#
+        ),
+    )
+    .expect("write BUILD");
+    ws
+}
+
+/// Under the oci runner the tool runs inside a container, entered with
+/// `docker exec` — the one runner whose target never gets heph's PTY slave.
+/// It still has a terminal: typed input reaches it, and a live resize of
+/// heph's PTY reaches the tool's own (#526). `XR_MARK` comes from the image,
+/// so the marker proves the tool ran in the container. Needs the shipped oci
+/// cdylib and a docker daemon. With no daemon it skips, as `crates/e2e`'s oci
+/// tests do; [`oci_runner_shell_asks_docker_for_a_terminal`] covers the same
+/// path everywhere, against a fake `docker`.
+#[test]
+fn oci_runner_shell_follows_the_terminal() {
+    if !docker_ready() {
+        eprintln!("skipping: no docker daemon is answering on this host");
+        return;
+    }
+    let dist = Dist::locate();
+    if let Err(stderr) = build_oci_shell_image() {
+        panic!("a docker daemon answers, but the fixture image did not build:\n{stderr}");
+    }
+    let ws = oci_workspace(&dist, OCI_SHELL_IMAGE, "");
+
+    let mut session = ShellSession::spawn(&dist, ws.root(), &["run", "--shell", "//pkg:tool"]);
+    tool_follows_the_terminal(&mut session, "container");
+}
+
+/// A stand-in `docker` that answers what the oci driver and runner ask, logs
+/// every `exec` argv to `log`, and then runs the target **here** with the
+/// `-w`/`-e` it was given — so the tool lands on heph's PTY as it would with
+/// no runner. A digest is any `sha256:` id; the image's `PATH` is the host's
+/// `/usr/bin:/bin`, where `bash` and `stty` live on both Linux and macOS.
+fn fake_docker(dir: &std::path::Path, log: &std::path::Path) {
+    let script = format!(
+        r#"#!/bin/sh
+case "$1" in
+  image) echo sha256:{digest}; exit 0 ;;
+  run) echo fakecontainer; exit 0 ;;
+  inspect) echo PATH=/usr/bin:/bin; exit 0 ;;
+  rm) exit 0 ;;
+  exec) ;;
+  *) echo "fake docker: unexpected: $*" >&2; exit 1 ;;
+esac
+printf '%s\n' "$*" >> '{log}'
+shift
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -i|-t) shift ;;
+    -w) cd "$2" || exit 1; shift 2 ;;
+    -e) export "$2"; shift 2 ;;
+    *) break ;;
+  esac
+done
+shift
+export XR_MARK=fake-container
+exec "$@"
+"#,
+        digest = "0".repeat(64),
+        log = log.display(),
+    );
+    let path = dir.join("docker");
+    std::fs::write(&path, script).expect("write fake docker");
+    let mut perms = std::fs::metadata(&path)
+        .expect("stat fake docker")
+        .permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+    std::fs::set_permissions(&path, perms).expect("chmod fake docker");
+}
+
+/// Every `exec` the fake logged since the last call, which it then forgets.
+fn take_execs(log: &std::path::Path) -> Vec<String> {
+    let lines = std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    std::fs::write(log, "").expect("truncate the exec log");
+    lines
+}
+
+/// The whole chain from heph's PTY to the `docker exec` argv, through the
+/// shipped oci cdylib, with no daemon: a `--shell` asks docker for a terminal
+/// (`-i -t` ahead of everything else) and a captured run of the same runner
+/// does not. Runs on every platform, where the daemon-backed test above skips
+/// on a host with no daemon, so each hop that carries the flag — the driver's
+/// spawn, the runner seam, the plugin's `RunnerCtx` — is covered everywhere.
+#[test]
+fn oci_runner_shell_asks_docker_for_a_terminal() {
+    let dist = Dist::locate();
+    let fake = tempfile::tempdir().expect("fake docker dir");
+    let log = fake.path().join("execs.log");
+    fake_docker(fake.path(), &log);
+    let path = std::env::join_paths(std::iter::once(fake.path().to_path_buf()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .expect("join PATH");
+
+    let ws = oci_workspace(
+        &dist,
+        "fake:latest",
+        r#"target(name = "plain", runner = "//pkg:runner", driver = "bash", cache = False, run = "echo plain-ran")"#,
+    );
+
+    let mut session = ShellSession::spawn_env(
+        &dist,
+        ws.root(),
+        &["run", "--shell", "//pkg:tool"],
+        &[("PATH", path.as_os_str())],
+    );
+    tool_follows_the_terminal(&mut session, "fake-container");
+    let shell = take_execs(&log);
+    assert!(!shell.is_empty(), "the shell never entered the container");
+    for line in &shell {
+        assert!(
+            line.starts_with("exec -i -t "),
+            "a --shell must enter with a terminal, got `{line}`"
+        );
+    }
+
+    let out = ws
+        .cmd(&dist, &["run", "//pkg:plain"])
+        .env("PATH", &path)
+        .output()
+        .expect("run heph");
+    assert!(
+        out.status.success(),
+        "captured run failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let captured = take_execs(&log);
+    assert!(
+        !captured.is_empty(),
+        "the captured run never entered the container"
+    );
+    for line in &captured {
+        assert!(
+            line.starts_with("exec -w "),
+            "a captured run must enter without a terminal, got `{line}`"
+        );
+    }
 }
 
 /// [`SET_PROMPT`]'s contract, in both directions — the same two halves as

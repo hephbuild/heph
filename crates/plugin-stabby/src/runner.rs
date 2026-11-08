@@ -74,6 +74,7 @@ impl ExecRunner for PluginRunner {
             // what is inside it.
             config_json: ctx.config.to_string(),
             rewrite,
+            tty: ctx.tty,
         };
         let reply = self
             .runner

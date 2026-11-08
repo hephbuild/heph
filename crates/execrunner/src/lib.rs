@@ -248,6 +248,7 @@ pub trait RunnerHost: Send + Sync {
     fn alive(&self) -> bool;
 
     /// Rewrite `rewrite` for the runner at `addr`, within request `request_id`.
+    /// `tty` is [`registry::RunnerCtx::tty`]: the target runs on a terminal.
     ///
     /// May start a session (an agent runner holds a live environment), so it is
     /// async and may be slow on first use for a given runner.
@@ -256,6 +257,7 @@ pub trait RunnerHost: Send + Sync {
         request_id: &str,
         addr: &Addr,
         rewrite: SpecRewrite,
+        tty: bool,
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<PrepareOutcome>;
 }
@@ -341,6 +343,7 @@ pub async fn prepare_for_plugin(
     request_id: &str,
     addr: &Addr,
     rewrite: SpecRewrite,
+    tty: bool,
     ctoken: &(dyn Cancellable + Send + Sync),
 ) -> anyhow::Result<PrepareOutcome> {
     let host = host_for(request_id).ok_or_else(|| {
@@ -351,7 +354,7 @@ pub async fn prepare_for_plugin(
             request_id,
         )
     })?;
-    host.prepare(request_id, addr, rewrite, ctoken).await
+    host.prepare(request_id, addr, rewrite, tty, ctoken).await
 }
 
 /// Resolve the runner and rewrite the spec in place.
@@ -365,10 +368,15 @@ pub async fn prepare_for_plugin(
 /// outcome this system can produce. (`hproc`'s supervisor tracker degrades to a
 /// no-op when uninstalled; that is right for a best-effort reaper and wrong
 /// here.)
+///
+/// `tty` is whether the target's stdio is a terminal — [`registry::RunnerCtx::tty`].
+/// The caller says, because `spec` cannot: the foreground path spawns outside
+/// `proc_exec` and its `ctty` is a placeholder.
 async fn prepare(
     runner: RunnerRef<'_>,
     spec: &mut proc_exec::Spec,
     path: &PathPolicy,
+    tty: bool,
     ctoken: &(dyn Cancellable + Send + Sync),
 ) -> anyhow::Result<()> {
     let Some(addr) = runner.addr else {
@@ -426,7 +434,13 @@ async fn prepare(
     }
 
     let outcome = host
-        .prepare(runner.request_id, addr, SpecRewrite::split(spec), ctoken)
+        .prepare(
+            runner.request_id,
+            addr,
+            SpecRewrite::split(spec),
+            tty,
+            ctoken,
+        )
         .await?;
     let supplies_environment = outcome.supplies_environment;
     outcome.rewrite.apply(spec);
@@ -543,7 +557,8 @@ pub async fn output_with_path(
     ctoken: &(dyn Cancellable + Send + Sync),
 ) -> anyhow::Result<std::process::Output> {
     let named = runner.addr.map(Addr::format);
-    prepare(runner, &mut spec, path, ctoken).await?;
+    let tty = spec.ctty;
+    prepare(runner, &mut spec, path, tty, ctoken).await?;
     // Name what was *actually* executed when a runner changed it. Under a wrap
     // runner the program is the prefix head, not the caller's — so a bare
     // `No such file or directory` sends the reader looking for the wrong binary.
@@ -608,7 +623,10 @@ pub async fn spawn_io_with_path(
     path: &PathPolicy,
     ctoken: &(dyn Cancellable + Send + Sync),
 ) -> anyhow::Result<(std::io::Result<proc_exec::Handle>, SpawnedAs)> {
-    prepare(runner, &mut spec, path, ctoken).await?;
+    // `ctty` is set exactly when stdin is a PTY slave the target will own — a
+    // build target's `--shell`, on the driver's own PTY.
+    let tty = spec.ctty;
+    prepare(runner, &mut spec, path, tty, ctoken).await?;
     let spawned_as = SpawnedAs {
         program: spec.program.clone(),
         cwd: spec.cwd.clone(),
@@ -728,7 +746,7 @@ mod tests {
         spec.env.push((os("PATH"), os("/usr/local/bin:/usr/bin")));
         let ctoken = StdCancellationToken::new();
         let policy = policy(&["/sandbox/bin"], Some("/fallback"));
-        prepare(RunnerRef::local(), &mut spec, &policy, &ctoken)
+        prepare(RunnerRef::local(), &mut spec, &policy, false, &ctoken)
             .await
             .expect("local prepare");
         assert_eq!(
@@ -773,7 +791,7 @@ mod tests {
         spec.env.push((os("PATH"), os("/declared")));
         let ctoken = StdCancellationToken::new();
         let policy = policy_with_suffix(&["/sandbox/bin"], &["/heph/coreutils/bin"]);
-        prepare(RunnerRef::local(), &mut spec, &policy, &ctoken)
+        prepare(RunnerRef::local(), &mut spec, &policy, false, &ctoken)
             .await
             .expect("local prepare");
         assert_eq!(

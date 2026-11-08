@@ -19,14 +19,21 @@
 //!   per-exec by definition. The agent papered over this by being handed the
 //!   spec through a socket. Running `docker exec -w <cwd>` says it directly.
 //!
-//! # What it does not fix
+//! # Terminal
 //!
-//! Terminal fidelity. `docker exec` connects the target's stdio through the
-//! daemon rather than handing it heph's PTY slave, so `--shell` into a
-//! container gets docker's line discipline, not ours. That was true of the
-//! `session` form too — the agent could pass descriptors, but only to a process
-//! the *container's* `docker run` had already started, not to one the daemon
-//! attaches later. It stays a known gap in `docs/EXEC_RUNNERS.md`.
+//! `docker exec` connects the target's stdio through the daemon rather than
+//! handing it heph's PTY slave: the docker *client* is what owns the slave. So
+//! a target on a terminal (`RunnerCtx::tty`: a `--shell`, or an entrypoint run
+//! on the caller's terminal) enters with `-i -t`, and the tool gets a terminal
+//! the daemon allocates — typed input reaches it, and a resize reaches the
+//! client as `SIGWINCH` (it is in the terminal's foreground process group),
+//! which forwards the size to the container's tty. What stays
+//! docker's is the line discipline: that terminal is the container's, not
+//! heph's slave, so its termios are the daemon's defaults rather than the
+//! caller's that the driver copies onto its own PTY. The `session` form could
+//! not do better — the agent could pass descriptors, but only to a process the
+//! *container's* `docker run` had already started, not to one the daemon
+//! attaches later. `docs/EXEC_RUNNERS.md` records what remains.
 //!
 //! # Paths
 //!
@@ -225,8 +232,27 @@ impl OciRunner {
 /// Separate from [`OciRunner::prepare`] so the argv can be asserted without a
 /// daemon: everything above it needs a running container, and this is the part
 /// that decides what the target actually sees.
-fn exec_args(id: &str, image_path: Option<&OsStr>, rewrite: SpecRewrite) -> Vec<OsString> {
+fn exec_args(
+    id: &str,
+    image_path: Option<&OsStr>,
+    tty: bool,
+    rewrite: SpecRewrite,
+) -> Vec<OsString> {
     let mut args: Vec<OsString> = vec!["exec".into()];
+    if tty {
+        // The target would have owned heph's PTY slave; here the docker client
+        // owns it, and only the daemon can give the tool a terminal. `-t` has
+        // it allocate one, `-i` attaches stdin to it. A resize sends SIGWINCH
+        // to the terminal's foreground process group, which the client is in
+        // (it leads the group on heph's PTY, and shares heph's on an inherited
+        // terminal), and it forwards the new size to the container's tty: that
+        // is how the tool inside follows a live resize.
+        // A captured run gets neither — a tool that sees a terminal changes its
+        // output (colour, progress bars, `\r\n`), and nothing is there to read
+        // it.
+        args.push("-i".into());
+        args.push("-t".into());
+    }
     args.push("-w".into());
     args.push(rewrite.cwd.into_os_string());
     for (k, v) in &rewrite.env {
@@ -333,7 +359,13 @@ impl ExecRunner for OciRunner {
         // `docker exec` rather than a fresh `docker run`: the cwd and the
         // environment are per-exec, and a container that is already up costs
         // nothing to enter.
-        let args = exec_args(&id, image_path.as_deref(), rewrite);
+        let args = exec_args(&id, image_path.as_deref(), ctx.tty, rewrite);
+        tracing::debug!(
+            runner = ctx.addr,
+            container = %id,
+            tty = ctx.tty,
+            "entering the container with `docker exec`"
+        );
 
         Ok(SpecRewrite {
             program: resolve_docker(&cfg.docker)?,
@@ -380,6 +412,7 @@ mod tests {
         let args = exec_args(
             "deadbeef",
             Some(OsStr::new("/usr/bin:/bin")),
+            false,
             SpecRewrite {
                 program: PathBuf::from("bash"),
                 args: vec![OsString::from("-c"), OsString::from("make")],
@@ -399,6 +432,47 @@ mod tests {
         // target's own command.
         let id_at = args.iter().position(|a| a == "deadbeef").expect("id");
         assert_eq!(args[id_at + 1], OsString::from("bash"));
+    }
+
+    fn shell_rewrite() -> SpecRewrite {
+        SpecRewrite {
+            program: PathBuf::from("bash"),
+            // The tool's own `-i`: it must stay the tool's, after the id.
+            args: vec![OsString::from("-i")],
+            env: vec![],
+            cwd: PathBuf::from("/ws/pkg"),
+        }
+    }
+
+    /// The docker flags, i.e. everything before the container id.
+    fn docker_flags(args: &[OsString]) -> &[OsString] {
+        let id_at = args.iter().position(|a| a == "deadbeef").expect("id");
+        &args[..id_at]
+    }
+
+    /// A `--shell` has the tool own a terminal, and the docker client owns
+    /// heph's PTY slave, so the terminal comes from the daemon: `-t` allocates
+    /// one and `-i` attaches stdin to it, both as docker flags ahead of the
+    /// container id, with the tool's own argv untouched behind it.
+    #[test]
+    fn a_shell_enters_the_container_with_a_terminal() {
+        let args = exec_args("deadbeef", None, true, shell_rewrite());
+        let flags = docker_flags(&args);
+        assert!(flags.contains(&OsString::from("-t")), "no -t in {args:?}");
+        assert!(flags.contains(&OsString::from("-i")), "no -i in {args:?}");
+        let id_at = flags.len();
+        assert_eq!(args[id_at + 1], OsString::from("bash"));
+        assert_eq!(args[id_at + 2], OsString::from("-i"));
+    }
+
+    /// A captured run gets no terminal: a tool that sees one changes its output
+    /// (colour, progress bars, `\r\n`) and nothing is there to read it.
+    #[test]
+    fn a_captured_run_enters_without_a_terminal() {
+        let args = exec_args("deadbeef", None, false, shell_rewrite());
+        let flags = docker_flags(&args);
+        assert!(!flags.contains(&OsString::from("-t")), "-t in {args:?}");
+        assert!(!flags.contains(&OsString::from("-i")), "-i in {args:?}");
     }
 
     /// `-e PATH` replaces the image's, so the image's own directories have to be

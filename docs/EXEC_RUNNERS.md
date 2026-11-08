@@ -353,6 +353,14 @@ nothing of heph needs to exist inside the image. The `session` form ran
 `heph __runner-agent` in the container, so heph's binary had to be mounted in
 and runnable there — which on a macOS host it is not.
 
+A `--shell` enters with `docker exec -it`: the tool gets a terminal the daemon
+allocates, typed input reaches it, Ctrl-C reaches it as a byte on that
+terminal, and a resize of heph's PTY is forwarded to it by the docker client.
+`heph run --raw` of an entrypoint gets the same only when its stdin, stdout and
+stderr are all terminals. If any of them is redirected, the tool gets plain
+pipes and no stdin, as from `docker exec` without `-it`. A captured run enters
+with neither flag, so a tool that changes its output on a terminal sees none.
+
 The workspace root and heph's home are bind-mounted **at the same paths**
 inside. This is correctness, not preference: every absolute path the driver
 computed is a host path, and a remapped mount would leave targets resolving
@@ -514,9 +522,14 @@ environment that applies everywhere else here.
 
 - **FUSE.** Runners are untested under `fuse.enabled`; bind-mounting a FUSE
   mount into a container, in particular, is not something to assume works.
-- **`docker exec` tty fidelity.** A container allocates its own tty rather than
-  receiving heph's PTY slave, so line discipline and winsize propagation are
-  docker's, not ours.
+- **`docker exec` line discipline.** Under `--shell`, and a `--raw` run on a
+  terminal, the oci runner enters with `docker exec -it`, so the tool has a
+  terminal and a live resize of heph's PTY reaches it: the docker client owns
+  the slave, takes the `SIGWINCH`, and forwards the size to the container's
+  tty. But that terminal is one the daemon allocated, not heph's slave, so its
+  line discipline is docker's default rather than the caller's termios the
+  driver copies onto its own PTY: `stty -a` inside the container shows
+  docker's settings, not your terminal's.
 - **Client startup cost.** Agent mode costs one `execve` of the heph binary per
   target (measured at ~3 ms on darwin/arm64, warm and uncontended). For a
   `go list`-heavy build that is worth measuring before turning it on; the

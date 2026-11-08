@@ -447,6 +447,7 @@ fn a_session_whose_launch_dies_fails_fast() {
             fingerprint: "fp",
             config: &config,
             ctoken: &ctoken,
+            tty: false,
         };
         let runner = reg.get("session").expect("session runner").clone();
         runner

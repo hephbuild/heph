@@ -789,6 +789,7 @@ mod host_go_tests {
             _request_id: &str,
             _addr: &Addr,
             mut rewrite: SpecRewrite,
+            _tty: bool,
             _ctoken: &(dyn Cancellable + Send + Sync),
         ) -> anyhow::Result<PrepareOutcome> {
             assert_eq!(
