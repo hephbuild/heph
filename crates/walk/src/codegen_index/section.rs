@@ -17,10 +17,19 @@
 //!
 //! Paths are normalised root-relative bytes ([`super::normalize_rel`]); one
 //! outside the root never reaches the matcher.
+//!
+//! A line that is a root-anchored path with no glob syntax (`/p/gen/a.go`,
+//! the only shape heph writes) skips `ignore`: it goes into a map keyed by the
+//! path it matches. Building a `Gitignore` costs ~1µs a line, which a process
+//! paid in full on its first lookup, for a section of one line per generated
+//! file. Git lets the last matching line decide, so a lookup takes whichever
+//! of the map's line and the matcher's line comes later in the section; a `!`
+//! line, which always goes to the matcher, still overrides a literal above it.
 
 use crate::gitignore_section::{ParsedSection, SectionLine, parse_section_bytes};
 use ignore::Match;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use rustc_hash::FxHashMap;
 use std::borrow::Cow;
 use std::path::PathBuf;
 
@@ -30,7 +39,50 @@ use super::paths::rel_path;
 #[derive(Debug)]
 pub struct Section {
     parsed: ParsedSection,
+    /// Every line `literal` does not hold.
     matcher: Gitignore,
+    /// The literal lines, by the path they match.
+    literal: FxHashMap<Box<[u8]>, LiteralLines>,
+}
+
+/// The last literal line matching a path as any entry (`/x`), and the last
+/// matching it only as a directory (`/x/`).
+#[derive(Debug, Default, Clone, Copy)]
+struct LiteralLines {
+    any: Option<usize>,
+    dir: Option<usize>,
+}
+
+impl LiteralLines {
+    fn get(self, is_dir: bool) -> Option<usize> {
+        if is_dir {
+            self.any.max(self.dir)
+        } else {
+            self.any
+        }
+    }
+}
+
+/// The path a line matches and whether only as a directory, when it means
+/// exactly that path to git: `/` then plain components, an optional trailing
+/// `/`, and none of glob syntax, an escape, whitespace or a control byte
+/// (whose trimming rules stay `ignore`'s). Anything else is `None`.
+fn literal_path(pattern: &str) -> Option<(&str, bool)> {
+    let rest = pattern.strip_prefix('/')?;
+    let (path, dir_only) = match rest.strip_suffix('/') {
+        Some(p) => (p, true),
+        None => (rest, false),
+    };
+    let plain = !path.is_empty()
+        && !path.starts_with('/')
+        && !path.ends_with('/')
+        && !path.contains("//")
+        && !path.bytes().any(|b| {
+            matches!(b, b'*' | b'?' | b'[' | b']' | b'\\' | b'{' | b'}')
+                || b.is_ascii_whitespace()
+                || b.is_ascii_control()
+        });
+    plain.then_some((path, dir_only))
 }
 
 /// Which section line decided a path, and how.
@@ -120,6 +172,11 @@ impl Section {
     /// Parse and compile a whole `.gitignore`. Parse warnings are logged once,
     /// here; a line `ignore` cannot compile is skipped with a warning.
     pub fn compile(gitignore: &[u8]) -> Self {
+        Self::compile_with(gitignore, true)
+    }
+
+    /// [`Self::compile`], with the literal map off to compare against.
+    fn compile_with(gitignore: &[u8], literal_map: bool) -> Self {
         let parsed = parse_section_bytes(gitignore);
         for w in &parsed.warnings {
             tracing::warn!("{w}");
@@ -130,8 +187,15 @@ impl Section {
         if let Err(e) = b.case_insensitive(false) {
             tracing::warn!(error = %e, "setting the managed section matcher case-sensitive");
         }
+        let mut literal: FxHashMap<Box<[u8]>, LiteralLines> = FxHashMap::default();
         for (i, line) in parsed.lines.iter().enumerate() {
             if line.is_comment() {
+                continue;
+            }
+            if literal_map && let Some((path, dir_only)) = literal_path(&line.entry.pattern) {
+                let e = literal.entry(path.as_bytes().into()).or_default();
+                // Lines come in order: a later duplicate replaces the earlier.
+                *if dir_only { &mut e.dir } else { &mut e.any } = Some(i);
                 continue;
             }
             // The index is carried as the glob's `from`, the only per-glob
@@ -150,7 +214,11 @@ impl Section {
             tracing::warn!(error = %e, "compiling the managed .gitignore section; read as empty");
             Gitignore::empty()
         });
-        Self { parsed, matcher }
+        Self {
+            parsed,
+            matcher,
+            literal,
+        }
     }
 
     /// A section with no lines (no `.gitignore`, or no markers in it).
@@ -158,7 +226,13 @@ impl Section {
         Self {
             parsed: ParsedSection::default(),
             matcher: Gitignore::empty(),
+            literal: FxHashMap::default(),
         }
+    }
+
+    /// No line can match anything.
+    fn matches_nothing(&self) -> bool {
+        self.matcher.is_empty() && self.literal.is_empty()
     }
 
     /// The workspace has a (well-formed) section.
@@ -198,10 +272,20 @@ impl Section {
 
     /// Test one entry alone, ignoring its ancestors.
     fn match_one(&self, rel: &[u8], is_dir: bool) -> SectionMatch {
-        if self.matcher.is_empty() || rel.is_empty() || rel.first() == Some(&b'/') {
+        if self.matches_nothing() || rel.is_empty() || rel.first() == Some(&b'/') {
             return SectionMatch::None;
         }
-        Self::to_match(self.matcher.matched(rel_path(rel), is_dir))
+        let literal = self.literal.get(rel).and_then(|l| l.get(is_dir));
+        let globbed = if self.matcher.is_empty() {
+            SectionMatch::None
+        } else {
+            Self::to_match(self.matcher.matched(rel_path(rel), is_dir))
+        };
+        // The later line decides, as in git.
+        match literal {
+            Some(i) if globbed.line().is_none_or(|g| i > g) => SectionMatch::Territory(i),
+            _ => globbed,
+        }
     }
 
     /// Test a walk entry: territory if its parent is, else the entry alone.
@@ -226,7 +310,7 @@ impl Section {
     /// territory (git does not descend into an excluded directory), then the
     /// path itself.
     pub fn match_point(&self, rel: &[u8], is_dir: bool) -> SectionMatch {
-        if self.matcher.is_empty() || rel.is_empty() || rel.first() == Some(&b'/') {
+        if self.matches_nothing() || rel.is_empty() || rel.first() == Some(&b'/') {
             return SectionMatch::None;
         }
         for (i, &c) in rel.iter().enumerate() {
@@ -401,6 +485,122 @@ mod tests {
             }
             let walk = s.match_walk(file.as_bytes(), false, terr).is_territory();
             assert_eq!(walk, territory(&s, file, false), "{file}");
+        }
+    }
+
+    fn text(lines: &[&str]) -> String {
+        let mut text = format!("{BEGIN_MARKER}\n");
+        for l in lines {
+            text.push_str(l);
+            text.push('\n');
+        }
+        text.push_str(END_MARKER);
+        text.push('\n');
+        text
+    }
+
+    #[test]
+    fn literal_path_takes_only_plain_anchored_paths() {
+        assert_eq!(literal_path("/p/a.go"), Some(("p/a.go", false)));
+        assert_eq!(literal_path("/p/gen/"), Some(("p/gen", true)));
+        assert_eq!(literal_path("/p/é.go"), Some(("p/é.go", false)));
+        for not in [
+            "p/a.go",
+            "*.go",
+            "/p/*.go",
+            "/p/a?.go",
+            "/p/a[12].go",
+            "/p/{a,b}.go",
+            "/p/\\#a",
+            "!/p/a.go",
+            "/",
+            "//",
+            "/p//a",
+            "/p/a.go ",
+            "/p/a b",
+            "/p/a\t",
+            "/p/\u{1}",
+            "/p/gen//",
+            "/**",
+            "/p/**/a",
+        ] {
+            assert_eq!(literal_path(not), None, "{not:?}");
+        }
+    }
+
+    /// The literal map answers every lookup exactly as `ignore` alone does,
+    /// over lines that mix it with globs, negations, duplicates and near-miss
+    /// names, for files and directories, walk and point lookups.
+    #[test]
+    fn literal_map_agrees_with_ignore_alone() {
+        let lines = [
+            "# //p:gen",
+            "/p/a.go",
+            "/p/ab.go",
+            "/p/gen/",
+            "/q/*.go",
+            "!q/keep.go",
+            "/q/keep.go",
+            "!/p/ab.go",
+            "/r/x",
+            "/r/x/",
+            "/r/x",
+            "*.pb.go",
+            "/s/é.go",
+            "/s/a b.go",
+            "/t/{a,b}",
+            "!/t/{a,b}",
+            "/t/{a,b}",
+            "/u/d/",
+            "!u/d/",
+            "/Gen",
+        ];
+        let fast = Section::compile_with(text(&lines).as_bytes(), true);
+        let slow = Section::compile_with(text(&lines).as_bytes(), false);
+        assert!(!fast.literal.is_empty() && slow.literal.is_empty());
+        let paths = [
+            "p/a.go",
+            "p/a.gox",
+            "p/a.g",
+            "p/ab.go",
+            "P/a.go",
+            "p",
+            "p/gen",
+            "p/gen/x.go",
+            "p/genx",
+            "q/a.go",
+            "q/keep.go",
+            "q/sub/a.go",
+            "r/x",
+            "r/x/y",
+            "r/xy",
+            "z/c.pb.go",
+            "s/é.go",
+            "s/e\u{301}.go",
+            "s/a b.go",
+            "t/{a,b}",
+            "t/a",
+            "u/d",
+            "u/d/f",
+            "Gen",
+            "gen",
+            "Gen/x",
+            "a/p/a.go",
+        ];
+        for p in paths {
+            for is_dir in [false, true] {
+                let b = p.as_bytes();
+                assert_eq!(
+                    fast.match_point(b, is_dir),
+                    slow.match_point(b, is_dir),
+                    "point {p} dir={is_dir}"
+                );
+                assert_eq!(
+                    fast.match_one(b, is_dir),
+                    slow.match_one(b, is_dir),
+                    "one {p} dir={is_dir}"
+                );
+            }
         }
     }
 
