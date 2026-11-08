@@ -12,7 +12,8 @@ use serde_json::json;
 
 use super::status::{AddrState, resolve_addrs};
 use super::{
-    JSON_SCHEMA, Report, ResolvedPath, blocking, display, read_gitignore, resolve_path, run_cli,
+    JSON_SCHEMA, Report, ResolvedPath, blocking, display, read_gitignore, resolve_path, root_hint,
+    run_cli, with_hint,
 };
 use crate::commands::GlobalOptions;
 use crate::engine::gitignore::{self, CopyTargets, GitignoreEntry};
@@ -230,6 +231,9 @@ fn output_name(group: &str) -> String {
     }
 }
 
+/// The `reason` of an `unknown` result.
+const NOT_GENERATED: &str = "not generated: no row records it and no section line covers it";
+
 fn result(path: &str, result: PathResultKind, reason: Option<String>) -> PathResult {
     PathResult {
         path: path.to_string(),
@@ -238,18 +242,19 @@ fn result(path: &str, result: PathResultKind, reason: Option<String>) -> PathRes
     }
 }
 
-/// Resolve the named paths; the ones outside the workspace are refused.
+/// Resolve the named paths, each with its [`root_hint`] for an `unknown`
+/// result; the ones outside the workspace are refused.
 fn resolve_named(
     root: &Path,
     cwd: &Path,
     args: &[String],
     results: &mut Vec<PathResult>,
-) -> Vec<Vec<u8>> {
-    let mut inside = BTreeSet::new();
+) -> Vec<(Vec<u8>, Option<String>)> {
+    let mut inside = BTreeMap::new();
     for a in args {
         match resolve_path(root, cwd, a) {
             ResolvedPath::Inside(rel) => {
-                inside.insert(rel);
+                inside.entry(rel).or_insert_with(|| root_hint(root, cwd, a));
             }
             ResolvedPath::Outside => results.push(result(
                 a,
@@ -378,7 +383,7 @@ pub async fn keep(
             let mut by_addr: BTreeMap<String, Vec<Vec<u8>>> = BTreeMap::new();
             let mut unrecorded = Vec::new();
             let mut decided = Vec::new();
-            for rel in named {
+            for (rel, hint) in named {
                 let shown = display(&rel);
                 if let Some((addr, output, build)) = declared.declaring(&rel) {
                     decided.push(result(
@@ -399,7 +404,7 @@ pub async fn keep(
                     decided.push(result(
                         &shown,
                         PathResultKind::Unknown,
-                        Some("not generated: no row records it and no section line covers it".into()),
+                        Some(with_hint(NOT_GENERATED, hint.as_deref())),
                     ));
                 }
             }
@@ -499,7 +504,7 @@ pub async fn discard(
             let mut decided = Vec::new();
             match named {
                 Some(named) => {
-                    for rel in named {
+                    for (rel, hint) in named {
                         let shown = display(&rel);
                         if let Some((addr, output, _)) = declared.declaring(&rel) {
                             decided.push(result(
@@ -522,7 +527,7 @@ pub async fn discard(
                             decided.push(result(
                                 &shown,
                                 PathResultKind::Unknown,
-                                Some("not generated: no row records it and no section line covers it".into()),
+                                Some(with_hint(NOT_GENERATED, hint.as_deref())),
                             ));
                         }
                     }
@@ -533,8 +538,8 @@ pub async fn discard(
                             continue;
                         }
                         let abs = root.join(hwalk::codegen_index::paths::rel_path(&row.path));
-                        let gone =
-                            hwalk::codegen_index::fs::lstat_opt(index.fs().as_ref(), &abs)?.is_none();
+                        let gone = hwalk::codegen_index::fs::lstat_opt(index.fs().as_ref(), &abs)?
+                            .is_none();
                         let live_declared = declared.declaring(&row.path).is_some();
                         let no_longer = row.state == RowState::Dropped
                             || match states.get(&row.addr) {
@@ -542,9 +547,7 @@ pub async fn discard(
                                 Some(AddrState::Missing) => true,
                                 Some(AddrState::Unresolved { .. }) | None => false,
                             }
-                            || snap
-                                .status(&row.path, &LookupMeta::point(false))?
-                                .kind
+                            || snap.status(&row.path, &LookupMeta::point(false))?.kind
                                 == StatusKind::Released;
                         if gone || (no_longer && !live_declared) {
                             by_addr

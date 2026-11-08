@@ -272,7 +272,9 @@ discard it").
 
 Every command lives under `heph tool codegen` and takes `--json`. Path
 arguments may be relative to the current directory, relative to the
-workspace root, or absolute; a path outside the workspace is refused.
+workspace root (`//p/foo.go`), or absolute; a path outside the workspace is
+refused. A bare `p/foo.go` typed in a subdirectory that names nothing there,
+while `//p/foo.go` exists, is `unknown` with "did you mean //p/foo.go?".
 
 **Exit codes** (these commands differ from the rest of heph, where every error
 exits 1, so that `--check` can tell findings from failures):

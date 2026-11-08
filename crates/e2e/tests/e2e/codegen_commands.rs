@@ -1052,7 +1052,21 @@ async fn command_path_argument_forms() -> anyhow::Result<()> {
     let missing = why_in(&ws.engine, &cwd, &["missing.txt"]).await?;
     assert_eq!(missing.items[0].path, "p/missing.txt");
     assert_eq!(missing.items[0].result, PathResultKind::Unknown);
+    assert_eq!(
+        missing.items[0].reason.as_deref(),
+        Some("no such file, no row and no section line")
+    );
     assert_eq!(missing.exit_code(), 1);
+
+    // A root-relative spelling typed in a subdirectory names nothing there;
+    // the root's path is suggested.
+    let typo = why_in(&ws.engine, &cwd, &["p/gen.txt"]).await?;
+    assert_eq!(typo.items[0].path, "p/p/gen.txt");
+    assert_eq!(typo.items[0].result, PathResultKind::Unknown);
+    assert_eq!(
+        typo.items[0].reason.as_deref(),
+        Some("no such file, no row and no section line; did you mean //p/gen.txt?")
+    );
     Ok(())
 }
 

@@ -9,7 +9,8 @@ use serde_json::json;
 
 use super::keep::PathResultKind;
 use super::{
-    JSON_SCHEMA, Report, ResolvedPath, blocking, display, empty_index_hint, resolve_path, run_cli,
+    JSON_SCHEMA, Report, ResolvedPath, blocking, display, empty_index_hint, resolve_path,
+    root_hint, run_cli, with_hint,
 };
 use crate::commands::GlobalOptions;
 use crate::engine::Engine;
@@ -302,7 +303,10 @@ pub async fn why(
             };
             let unknown = st.is_none() && row.is_none() && section_line.is_none();
             let reason = if unknown {
-                Some("no such file, no row and no section line".to_string())
+                Some(with_hint(
+                    "no such file, no row and no section line",
+                    root_hint(&root, &cwd, &arg).as_deref(),
+                ))
             } else {
                 match (status.kind, row.as_ref()) {
                     (StatusKind::Modified, Some(r)) => Some(format!(

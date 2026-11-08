@@ -30,7 +30,7 @@ use crate::engine::Engine;
 use crate::engine::request_state::RequestState;
 use crate::tui::{self, App, AppContext, BufferedStdout, LogSink};
 
-pub use paths::{ResolvedPath, resolve_path};
+pub use paths::{ResolvedPath, resolve_path, root_hint, with_hint};
 
 /// The `--help` epilogue every codegen subcommand carries.
 pub const EXIT_CODES_HELP: &str = "Exit codes:\n  0  OK\n  1  findings (--check), or a refused or unknown path\n  2  error; a usage error (an unknown flag, a missing argument) also exits 2";

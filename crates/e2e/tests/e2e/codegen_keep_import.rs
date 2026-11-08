@@ -542,6 +542,30 @@ async fn keep_partial_refusal_exits_1() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// From a subdirectory, a root-relative spelling without `//` names nothing
+/// there: `unknown`, suggesting the root's path, and nothing is kept.
+#[tokio::test]
+async fn keep_from_subdirectory_suggests_the_root_path() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    let engine = released_pair(&ws).await?;
+    let cwd = engine.root().join("p");
+    let rs = engine.new_state();
+    let res = keep_cmd::keep(&engine, &rs, &strings(&["p/a.txt"]), &cwd).await;
+    common::drain(rs).await;
+    let report = res?;
+    let r = result_for(&report, "p/p/a.txt");
+    assert_eq!(r.result, PathResultKind::Unknown, "{report:?}");
+    assert_eq!(
+        r.reason.as_deref(),
+        Some(
+            "not generated: no row records it and no section line covers it; \
+             did you mean //p/a.txt?"
+        )
+    );
+    assert!(row(&engine, "p/a.txt")?.is_some(), "nothing was kept");
+    Ok(())
+}
+
 /// A file no row records but a section line covers (an older heph's, before
 /// the import) is accepted; only its covering line is dropped.
 #[tokio::test]
