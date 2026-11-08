@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -8,8 +8,11 @@ use futures::TryStreamExt;
 
 use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
+use crate::commands::tool::codegen::gitignore::stale_messages;
+use crate::commands::tool::codegen::status::{self as codegen_status, ItemKind, StatusReport};
 use crate::engine::error::MultiError;
 use crate::engine::query::skip_unresolvable;
+use crate::engine::request_state::RequestState;
 use crate::engine::{Discovery, Engine, Gaps, get_cwp, get_root, gitignore};
 use crate::htaddr::Addr;
 use crate::htmatcher::Matcher;
@@ -144,27 +147,16 @@ impl App for ValidateApp {
                 .codegen_copy_overlaps(rs.clone(), &overlap_matcher, discovery.clone())
                 .await;
 
-            // 3. Verify `.gitignore` is up to date (whole-workspace runs only).
-            let gitignore_res: anyhow::Result<bool> = async {
-                if scoped {
-                    return Ok(false);
-                }
-                let entries = Arc::clone(&engine)
-                    .codegen_copy_gitignore_patterns(
-                        rs.clone(),
-                        &Matcher::TreeOutputTo(PkgBuf::from("")),
-                    )
-                    .await?;
-                let path = root.join(".gitignore");
-                let existing = match std::fs::read_to_string(&path) {
-                    Ok(s) => s,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-                    Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
-                };
-                let want = gitignore::render(&existing, &entries);
-                Ok(want != existing) // true = stale
-            }
-            .await;
+            // 3. The codegen checks (whole-workspace runs only).
+            let codegen = if scoped {
+                CodegenFindings::default()
+            } else {
+                codegen_findings(&engine, &rs, &root).await
+            };
+            let CodegenFindings {
+                failures: gitignore_res,
+                warnings: local_warnings,
+            } = codegen;
 
             // 4. Every provider lists exactly the facts its targets resolve to,
             //    and lists only what it resolves. The walks trust a listed No
@@ -188,13 +180,9 @@ impl App for ValidateApp {
                     })
                     .collect::<Vec<String>>()
             });
-            let gitignore_res = gitignore_res.map(|stale| {
-                if stale {
-                    vec!["`.gitignore` is out of date — run `heph tool gen-gitignore`".to_string()]
-                } else {
-                    Vec::new()
-                }
-            });
+            for w in &local_warnings {
+                out.println(w);
+            }
 
             finish(vec![
                 link_res.map(|()| Vec::new()),
@@ -214,6 +202,90 @@ impl App for ValidateApp {
 
         crate::commands::errors::finalize!(ctx, rs, res, gaps = &gaps)
     }
+}
+
+/// What `validate`'s codegen checks found.
+#[derive(Debug)]
+pub struct CodegenFindings {
+    /// What fails validation: one message per stale-section reason (a line
+    /// no target emits, a missing one, the old marker, a malformed section).
+    pub failures: anyhow::Result<Vec<String>>,
+    /// Findings local to this checkout, printed as warnings.
+    pub warnings: Vec<String>,
+}
+
+impl Default for CodegenFindings {
+    fn default() -> Self {
+        Self {
+            failures: Ok(Vec::new()),
+            warnings: Vec::new(),
+        }
+    }
+}
+
+/// `validate`'s codegen checks. Only a stale section fails: it is what the
+/// commit decides, and a line whose target is missing is stale because no def
+/// emits it. Everything else `codegen status` lists is local to this checkout
+/// and only warned about; `validate` reads and settles nothing.
+pub async fn codegen_findings(
+    engine: &Arc<Engine>,
+    rs: &Arc<RequestState>,
+    root: &Path,
+) -> CodegenFindings {
+    let failures: anyhow::Result<Vec<String>> = async {
+        let entries = Arc::clone(engine)
+            .codegen_copy_gitignore_patterns(rs.clone(), &Matcher::TreeOutputTo(PkgBuf::from("")))
+            .await?;
+        let path = root.join(".gitignore");
+        let existing = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        Ok(stale_messages(
+            &gitignore::diff_section(&existing, &entries).reasons,
+        ))
+    }
+    .await;
+    // Serial with the check above, for the reason `run` gives.
+    let opts = codegen_status::Options {
+        check: false,
+        settle: false,
+    };
+    let warnings = match codegen_status::status(engine, rs, opts).await {
+        Ok(report) => local_findings_warnings(&report),
+        Err(e) => vec![format!(
+            "warning: could not list codegen findings: {e:#}; run heph tool codegen status"
+        )],
+    };
+    CodegenFindings { failures, warnings }
+}
+
+/// The warnings `validate` prints for findings local to this checkout: every
+/// item `codegen status` lists except a stale section, which fails instead.
+/// One line per item, then one pointing at `heph tool codegen status`.
+fn local_findings_warnings(report: &StatusReport) -> Vec<String> {
+    let mut out: Vec<String> = report
+        .items
+        .iter()
+        .filter(|i| i.kind != ItemKind::SectionStale)
+        .map(|i| {
+            let head = i.path.as_deref().or(i.package.as_deref()).unwrap_or("");
+            format!(
+                "warning: codegen: {head}: {} ({})",
+                i.detail,
+                i.kind.as_str()
+            )
+        })
+        .collect();
+    if !out.is_empty() {
+        out.push(format!(
+            "warning: {} generated file finding{} local to this checkout; run heph tool codegen status",
+            out.len(),
+            if out.len() == 1 { "" } else { "s" }
+        ));
+    }
+    out
 }
 
 /// Fold the outcome of every validate check into a single result. Each check
@@ -268,8 +340,10 @@ async fn execute_async(
 
 #[cfg(test)]
 mod tests {
-    use super::finish;
+    use super::{ItemKind, StatusReport, finish, local_findings_warnings, stale_messages};
+    use crate::commands::tool::codegen::status::StatusItem;
     use crate::engine::error::MultiError;
+    use crate::engine::gitignore::StaleReason;
 
     #[test]
     fn all_checks_ok_is_ok() {
@@ -283,7 +357,7 @@ mod tests {
         let err = finish(vec![
             Err(anyhow::anyhow!("link broke for //pkg:a")),
             Ok(vec!["codegen overlap on `gen.rs`".to_string()]),
-            Ok(vec![".gitignore is out of date".to_string()]),
+            Ok(stale_messages(&[StaleReason::Lines])),
         ])
         .unwrap_err();
         let rendered = format!("{err:#}");
@@ -296,9 +370,50 @@ mod tests {
             "got: {rendered}"
         );
         assert!(
-            rendered.contains(".gitignore is out of date"),
+            rendered.contains("is out of date; run heph tool codegen gitignore"),
             "got: {rendered}"
         );
+        assert!(!rendered.contains("gen-gitignore"), "got: {rendered}");
+    }
+
+    fn item(kind: ItemKind, path: &str) -> StatusItem {
+        StatusItem {
+            kind,
+            path: Some(path.to_string()),
+            addr: Some("//p:gen".to_string()),
+            output: None,
+            fix: "heph tool codegen gitignore".to_string(),
+            detail: format!("detail of {path}"),
+            package: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn local_findings_skip_the_stale_section_and_point_at_status() {
+        let report = StatusReport {
+            check: false,
+            items: vec![
+                item(ItemKind::SectionStale, ".gitignore"),
+                item(ItemKind::NoLongerGenerated, "p/a.go"),
+                item(ItemKind::ForeignLine, "/q/b.go"),
+            ],
+            hint: None,
+        };
+        let w = local_findings_warnings(&report);
+        assert_eq!(w.len(), 3, "two items and the pointer: {w:?}");
+        assert!(w[0].contains("p/a.go") && w[0].contains("no_longer_generated"));
+        assert!(w[1].contains("/q/b.go") && w[1].contains("foreign_line"));
+        assert!(w[2].contains("2 generated file findings"), "{w:?}");
+        assert!(w[2].ends_with("run heph tool codegen status"), "{w:?}");
+        assert!(w.iter().all(|l| l.starts_with("warning: ")));
+        assert!(!w.iter().any(|l| l.contains(".gitignore")), "{w:?}");
+
+        let clean = StatusReport {
+            items: vec![item(ItemKind::SectionStale, ".gitignore")],
+            ..StatusReport::default()
+        };
+        assert!(local_findings_warnings(&clean).is_empty());
     }
 
     #[test]
