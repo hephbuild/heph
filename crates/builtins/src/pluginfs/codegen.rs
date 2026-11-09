@@ -309,16 +309,18 @@ impl<'a> GlobLookup<'a> {
                 .is_some_and(|rel| self.snap.section().dir_is_territory(&rel, false))
     }
 
-    /// The exclusion of file `abs` (root-relative `rel`), walked under a
+    /// The exclusion of the file at root-relative `rel`, walked under a
     /// directory whose territory is `parent_territory` (`None`: a lone path,
     /// tested as a point lookup). `None` when the glob keeps it.
+    ///
+    /// Takes the caller's root-relative path rather than the absolute one: a
+    /// second component-wise `strip_prefix` per file was ~5% of a glob walk.
     pub fn exclusion(
         &self,
-        abs: &Path,
         rel: &str,
         parent_territory: Option<bool>,
     ) -> anyhow::Result<Option<Excluded>> {
-        let Some(nrel) = normalize_rel(self.root, abs) else {
+        let Some(nrel) = normalize_rel(self.root, Path::new(rel)) else {
             return Ok(None);
         };
         let meta = match parent_territory {

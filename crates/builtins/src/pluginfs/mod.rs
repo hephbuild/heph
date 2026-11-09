@@ -1091,7 +1091,7 @@ fn emit_glob_file(
     // A generated file is sourced from its generator only: reading it here
     // would double-source the generated content.
     if let Some((lookup, parent_territory)) = codegen
-        && let Some(ex) = lookup.exclusion(abs, rel_str, parent_territory)?
+        && let Some(ex) = lookup.exclusion(rel_str, parent_territory)?
     {
         excluded.push(ex);
         return Ok(());
