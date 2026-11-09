@@ -27,7 +27,7 @@ use super::store::Row;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// The rows as of one reload (or a fold of one).
 #[derive(Debug, Default, Clone)]
@@ -37,8 +37,10 @@ pub struct Base {
     /// tombstone without pruning it): readers resolve each path through
     /// [`Snapshot::row`].
     fold: FxHashMap<u64, Vec<Vec<u8>>>,
-    /// `addr → [path]`, with the same staleness as `fold`.
-    by_addr: FxHashMap<String, Vec<Vec<u8>>>,
+    /// `addr → [path]` of `rows`, built on the first call that asks: only
+    /// the commands (`keep`, `discard`, `why`) do, never a glob, which paid
+    /// for it on every reload. A fold starts it empty again.
+    by_addr: OnceLock<FxHashMap<String, Vec<Vec<u8>>>>,
     /// Paths a fold deleted since the reload, with the deleting `gen`: a
     /// late publish below it must not bring the row back (see
     /// [`State::publish`]). Disjoint from `rows`; a reload starts it empty.
@@ -67,10 +69,16 @@ impl Base {
             .entry(row.fold)
             .or_default()
             .push(row.path.clone());
-        self.by_addr
-            .entry(row.addr.clone())
-            .or_default()
-            .push(row.path.clone());
+    }
+
+    fn by_addr(&self) -> &FxHashMap<String, Vec<Vec<u8>>> {
+        self.by_addr.get_or_init(|| {
+            let mut m: FxHashMap<String, Vec<Vec<u8>>> = FxHashMap::default();
+            for (path, row) in &self.rows {
+                m.entry(row.addr.clone()).or_default().push(path.clone());
+            }
+            m
+        })
     }
 
     /// The `gen` an overlay entry at `path` must reach to win: the base row's,
@@ -101,14 +109,9 @@ impl Base {
             if old.is_none() && tomb.is_none() {
                 base.fold.entry(row.fold).or_default().push(path.clone());
             }
-            if old.as_ref().is_none_or(|o| o.addr != row.addr) {
-                base.by_addr
-                    .entry(row.addr.clone())
-                    .or_default()
-                    .push(path.clone());
-            }
             base.rows.insert(path.clone(), row.clone());
         }
+        base.by_addr = OnceLock::new();
         base
     }
 
@@ -414,7 +417,7 @@ impl Snapshot {
             .map(|(p, _)| p);
         let paths = self
             .base
-            .by_addr
+            .by_addr()
             .get(addr)
             .into_iter()
             .flatten()
@@ -572,6 +575,29 @@ mod tests {
         let sn = snap(&st);
         assert_eq!(paths(sn.rows().collect()), ["a", "b"]);
         assert_eq!(sn.loaded_through(), 2);
+    }
+
+    /// The by-target map is built on first use; a fold that moves a path to
+    /// another target, after a lookup filled the map, is seen by the next.
+    #[test]
+    fn rows_for_addr_after_a_fold_sees_the_folded_rows() {
+        let mut st = State::default();
+        st.install_reload(Base::from_rows(
+            1,
+            vec![row("p", "//x:a", 1), row("q", "//x:a", 1)],
+        ));
+        assert_eq!(paths(snap(&st).rows_for_addr("//x:a")), ["p", "q"]);
+        st.publish(
+            2,
+            &[row("p", "//x:b", 2), row("r", "//x:b", 2)],
+            &[b"q".to_vec()],
+        );
+        let (b, o, s) = st.fold_copy();
+        let folded = State::build_fold(&b, &o);
+        st.install_fold(folded, s);
+        assert!(snap(&st).overlay.is_empty(), "the fold took the overlay");
+        assert!(snap(&st).rows_for_addr("//x:a").is_empty());
+        assert_eq!(paths(snap(&st).rows_for_addr("//x:b")), ["p", "r"]);
     }
 
     /// B commits `p` at 1 and is slow to publish; A takes `p` over at 2 and
