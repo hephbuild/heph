@@ -118,9 +118,13 @@ fn startup_instrument() {
         let snap = idx.snapshot().unwrap();
         let d_snap = t.elapsed();
         let t = Instant::now();
+        // As a glob looks them up: exclusion only, no lstat under a line.
         for r in &rels {
             let st = snap
-                .status(r.as_bytes(), &LookupMeta::walk(false, false))
+                .status(
+                    r.as_bytes(),
+                    &LookupMeta::walk(false, false).exclusion_only(),
+                )
                 .unwrap();
             assert!(st.kind.is_excluded());
         }

@@ -1172,9 +1172,7 @@ impl BuildState {
             // its own "incomplete selection" block.
             BuildEventKind::SelectionIncomplete { .. } => {}
             // Codegen index diagnostics are log lines, not build counters.
-            BuildEventKind::CodegenExcluded { .. }
-            | BuildEventKind::CodegenModified { .. }
-            | BuildEventKind::CodegenImported { .. } => {}
+            BuildEventKind::CodegenExcluded { .. } | BuildEventKind::CodegenImported { .. } => {}
             // An event kind newer than this build knows about. Skipped rather
             // than fatal — see `BuildEventKind::Unknown`.
             BuildEventKind::Unknown => {}

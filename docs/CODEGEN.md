@@ -103,7 +103,7 @@ Every reader asks the index for a file's status:
 | `Generated` | `recorded` | a row matches the bytes on disk, and a section line covers the path, or none ever did, or the workspace has no section | excluded |
 | `Generated` | `pending` | a row is pending, whatever the bytes | excluded |
 | `Generated` | `unrecorded` | no row, but a section line covers the path (fresh index, lost home, a file the import missed) | excluded |
-| `Modified` | `edited` | a row exists, a section line covers the path, and the bytes differ | excluded, with a warning |
+| `Modified` | `edited` | a row exists, a section line covers the path, and the bytes differ | excluded |
 | `Released` | — | a row matches, a section line covered the path once, and none covers it now | source |
 | `Source` | — | anything else | source |
 
@@ -117,16 +117,16 @@ git's racy-clean rule) and by content hash when the stat moved. On a
 case-insensitive filesystem another casing of a recorded path counts as the
 same file only when both names lead to the same inode.
 
-An edited generated file stays excluded, and heph warns once per run:
+An edited generated file stays excluded. The next write-back overwrites it and
+says so ("overwrote hand edits to p/foo.pb.go; the previous content is gone");
+`codegen status` and `codegen why` list it as `Modified` before then.
 
-```
-p/foo.pb.go was written by //p:gen and has been edited since; the next build of
-//p:gen overwrites it. To keep your version, remove that output from //p:gen and
-run heph tool codegen keep p/foo.pb.go.
-```
-
-The next write-back overwrites it and says so ("overwrote hand edits to
-p/foo.pb.go; the previous content is gone").
+A glob does not verify the bytes where that cannot change its answer: a row
+under a line is excluded whether or not it was edited, and a released row is
+kept either way. So a glob counts an edited file as `recorded`, and costs no
+`lstat` per generated file. Only a recorded path that no line covers and the
+section never listed (a workspace without a section) is verified, because there
+the bytes decide between `Generated` and `Source`.
 
 ## What each reader does
 
@@ -134,8 +134,8 @@ p/foo.pb.go; the previous content is gone").
 
 The fs `glob()` target and the BUILD-time `heph.fs.glob()` skip `Generated`
 and `Modified` files. A run that excluded any prints one line when it ends,
-by default: "12 generated files were excluded from globs (9 recorded, 2
-unrecorded, 1 edited); heph tool codegen why <path> explains one". Each path is
+by default: "12 generated files were excluded from globs (10 recorded, 2
+unrecorded); heph tool codegen why <path> explains one". Each path is
 counted once per run, however many globs skipped it. `-v` and `--json` list
 each path, and `-v` adds each glob's own count ("excluded 3 generated files
 (…)"). Reading the index needs no target definition, no engine call
@@ -246,7 +246,7 @@ nothing.
 | target renamed, same path | the next write-back takes the rows | rewritten | excluded | `codegen gitignore` |
 | `copy` → `in_place` | the in-place write-back refuses the path | kept | excluded | `codegen keep`, then build |
 | a BUILD file breaks | untouched | kept | excluded | fix it; `status` reports the package `unresolved` |
-| you edit a generated file | bytes differ | edited | `Modified`: excluded, warned | nothing, or remove the output and `keep` |
+| you edit a generated file | bytes differ | edited | `Modified`: excluded | nothing, or remove the output and `keep` |
 | you delete a generated file | dangling row | gone | — | nothing |
 | branch switch where the path is tracked source | row kept, no section line | git's file | `Source` | nothing |
 | `git clean -fdX` | dangling rows | gone | — | nothing |

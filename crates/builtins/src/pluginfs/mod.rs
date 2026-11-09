@@ -41,7 +41,7 @@ pub use hwalk::codegen_index::import::CODEGEN_XATTR;
 mod codegen;
 pub use codegen::{
     CodegenFileError, CodegenFileErrorKind, CodegenReport, ExclusionTally, FsCodegen, NoReport,
-    exclusion_summary, modified_message, reason_str, status_str, unrecorded_message,
+    exclusion_summary, reason_str, status_str, unrecorded_message,
 };
 
 /// wax's escape, for a caller building an fs glob pattern from a literal path.

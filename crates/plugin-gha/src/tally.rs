@@ -525,9 +525,7 @@ impl Tally {
 
             // Codegen index diagnostics reach the user as log lines; the job
             // summary does not tally them.
-            BuildEventKind::CodegenExcluded { .. }
-            | BuildEventKind::CodegenModified { .. }
-            | BuildEventKind::CodegenImported { .. } => {}
+            BuildEventKind::CodegenExcluded { .. } | BuildEventKind::CodegenImported { .. } => {}
 
             // An event kind from a host newer than this plugin. Skipping it keeps
             // the rest of the stream flowing; the alternative is a decode failure,

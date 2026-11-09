@@ -452,16 +452,10 @@ async fn introspect_outputs_over_copy_output_is_zero_artifacts_without_error_or_
     run_on(&ws.engine, "//p:gen").await?;
     // Edited, under a line: `Modified`, which `file` would refuse and warn on.
     ws.write_file("p/gen.txt", "hand edit");
-    let ((res, events), log) =
+    let ((res, _), log) =
         capture_warnings(resolve(&ws.engine, &copy_output_addr("p/gen.txt"))).await;
     assert_eq!(res?, Vec::<String>::new());
     assert!(log.is_empty(), "no warning: {log}");
-    assert!(
-        !events
-            .iter()
-            .any(|e| matches!(e, BuildEventKind::CodegenModified { .. })),
-        "{events:?}"
-    );
     Ok(())
 }
 
@@ -614,7 +608,9 @@ async fn glob_exclusion_count_names_reasons() -> anyhow::Result<()> {
     let (res, log) = capture_logs(LevelFilter::DEBUG, glob(&ws.engine, "p/*.txt")).await;
     assert_eq!(names(&res?), ["a.txt"]);
     assert!(
-        log.contains("excluded 3 generated files (1 recorded, 1 unrecorded, 1 edited)"),
+        // A glob does not verify a row under a line: the edited one counts
+        // as recorded.
+        log.contains("excluded 3 generated files (2 recorded, 1 unrecorded)"),
         "{log}"
     );
     Ok(())
@@ -704,10 +700,11 @@ async fn eval_glob_exclusions_logged_by_the_next_request_to_end() -> anyhow::Res
 // Lifecycle rows
 // ---------------------------------------------------------------------------
 
-/// Row 12: an edited generated file is excluded, warned, and reported as a
-/// typed event.
+/// Row 12: a glob excludes an edited generated file without verifying it,
+/// so without a warning and as `recorded`; a point lookup (`why`, `status`)
+/// still tells it is `Modified`.
 #[tokio::test(flavor = "current_thread")]
-async fn edited_generated_file_warned_and_excluded() -> anyhow::Result<()> {
+async fn edited_generated_file_excluded_by_glob_unverified() -> anyhow::Result<()> {
     let ws = Workspace::new();
     write_section(&ws, &["# //p:gen", "/p/gen.txt"]);
     generated(&ws).await?;
@@ -715,59 +712,18 @@ async fn edited_generated_file_warned_and_excluded() -> anyhow::Result<()> {
     let ((res, events), log) =
         capture_warnings(resolve(&ws.engine, &glob_addr("p/*.txt", &[]))).await;
     assert_eq!(res?, Vec::<String>::new());
-    assert!(
-        log.contains("p/gen.txt was written by //p:gen and has been edited since"),
-        "{log}"
-    );
+    assert!(log.is_empty(), "no warning: {log}");
     assert!(
         events.iter().any(|e| matches!(
             e,
-            BuildEventKind::CodegenModified { path, addr } if path == "p/gen.txt" && addr == "//p:gen"
+            BuildEventKind::CodegenExcluded { path, status, reason, .. }
+                if path == "p/gen.txt" && status == "generated" && reason.as_deref() == Some("recorded")
         )),
         "{events:?}"
     );
-    Ok(())
-}
-
-/// Row 12: two globs in one run warn once; the next run warns again.
-#[tokio::test(flavor = "current_thread")]
-async fn modified_warning_deduped_per_run() -> anyhow::Result<()> {
-    let ws = Workspace::new();
-    write_section(&ws, &["# //p:gen", "/p/gen.txt"]);
-    ws.write_build_file(
-        "p",
-        &format!(
-            "{}{}",
-            copy_target("gen", "gen.txt", "v1"),
-            r#"
-target(name = "g1", driver = "bash", deps = glob("*.txt"), run = "true")
-target(name = "g2", driver = "bash", deps = glob("gen.*"), run = "true")
-"#
-        ),
-    );
-    run_on(&ws.engine, "//p:gen").await?;
-    ws.write_file("p/gen.txt", "hand edit");
-    let needle = "has been edited since";
-    let run_both = |engine: Arc<Engine>| async move {
-        let (res, _) = common::run_drain_events(
-            &engine,
-            &heph::htmatcher::Matcher::Or(vec![
-                heph::htmatcher::Matcher::Addr(parse_addr("//p:g1")?),
-                heph::htmatcher::Matcher::Addr(parse_addr("//p:g2")?),
-            ]),
-        )
-        .await;
-        res.map(drop)
-    };
-    let (res, log) = capture_warnings(run_both(ws.reopen()?)).await;
-    res?;
-    assert_eq!(log.matches(needle).count(), 1, "{log}");
-    let (res, log) = capture_warnings(run_both(ws.reopen()?)).await;
-    res?;
     assert_eq!(
-        log.matches(needle).count(),
-        1,
-        "the next run warns again: {log}"
+        status(&ws.engine, "p/gen.txt")?,
+        (StatusKind::Modified, Some(StatusReason::Edited))
     );
     Ok(())
 }

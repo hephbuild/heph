@@ -511,12 +511,6 @@ pub enum BuildEventKind {
         #[serde(default)]
         addr: Option<String>,
     },
-    /// A file `addr` wrote has been edited since: excluded, and overwritten
-    /// by the next build of `addr`. Emitted once per path per run.
-    CodegenModified {
-        path: String,
-        addr: String,
-    },
     /// `heph tool codegen import` recorded `files` stamped files and skipped
     /// `skipped` whose stamp it could not read.
     CodegenImported {

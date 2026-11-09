@@ -111,6 +111,13 @@ pub struct LookupMeta {
     pub probe: SectionProbe,
     /// The path's `lstat`, when the caller has one (spares the lookup's).
     pub stat: Option<FileStat>,
+    /// Whether the caller needs only exclusion, as a glob does
+    /// ([`Self::exclusion_only`]): a row whose line or `seen_in_section`
+    /// settles that is not verified, so its edits go unseen. An excluded
+    /// answer is then `Generated` (`recorded`) where a verifying lookup may
+    /// say `Modified` (`edited`), and a kept one `Released` where it may say
+    /// `Source`.
+    pub exclusion_only: bool,
 }
 
 impl LookupMeta {
@@ -120,6 +127,7 @@ impl LookupMeta {
             is_dir,
             probe: SectionProbe::Point,
             stat: None,
+            exclusion_only: false,
         }
     }
 
@@ -129,11 +137,19 @@ impl LookupMeta {
             is_dir,
             probe: SectionProbe::Walk { parent_territory },
             stat: None,
+            exclusion_only: false,
         }
     }
 
     pub fn with_stat(mut self, stat: FileStat) -> Self {
         self.stat = Some(stat);
+        self
+    }
+
+    /// Answer exclusion only, skipping the lstat where the row's line or
+    /// `seen_in_section` settles it (see the field).
+    pub fn exclusion_only(mut self) -> Self {
+        self.exclusion_only = true;
         self
     }
 }
@@ -177,18 +193,28 @@ impl Snapshot {
                 matched,
             });
         }
-        let stat = match walked {
-            Some(s) => Some(s),
-            None => lstat_opt(env.fs.as_ref(), &abs)?,
-        };
         let status = |kind, reason| Status {
             kind,
             reason: Some(reason),
             row: Some(row),
             matched,
         };
+        let released = !territory && self.section().is_present() && row.seen_in_section;
+        if meta.exclusion_only && (territory || released) {
+            // Under a line the row is excluded verified or edited; released,
+            // it is kept either way. Only the reason needs the lstat.
+            return Ok(if territory {
+                status(StatusKind::Generated, StatusReason::Recorded)
+            } else {
+                status(StatusKind::Released, StatusReason::Recorded)
+            });
+        }
+        let stat = match walked {
+            Some(s) => Some(s),
+            None => lstat_opt(env.fs.as_ref(), &abs)?,
+        };
         Ok(if verify(env.fs.as_ref(), row, stat.as_ref(), &abs)? {
-            if !territory && self.section().is_present() && row.seen_in_section {
+            if released {
                 status(StatusKind::Released, StatusReason::Recorded)
             } else {
                 status(StatusKind::Generated, StatusReason::Recorded)
@@ -472,6 +498,74 @@ mod tests {
         assert_eq!(at(b"a.go"), Some(b"a.go".to_vec()));
         fake(&w, b"a.GO", 2);
         assert_eq!(at(b"a.GO"), Some(b"a.go".to_vec()));
+    }
+
+    /// A glob's lookup skips the lstat where a line or `seen_in_section`
+    /// settles exclusion, and its answer keeps or drops what a verifying
+    /// lookup would; a recorded row neither settles is still verified.
+    #[test]
+    fn exclusion_only_lstats_only_where_the_bytes_decide() {
+        let w = ws();
+        for rel in ["gen/a.go", "rel/b.go", "out/c.go", "out/d.go"] {
+            w.write(rel, b"old");
+        }
+        let mut released = w.recorded("rel/b.go", ADDR);
+        released.seen_in_section = true;
+        let rows = [
+            w.recorded("gen/a.go", ADDR),
+            released,
+            w.recorded("out/c.go", ADDR),
+            w.recorded("out/d.go", ADDR),
+        ];
+        w.put(&rows);
+        w.section(&["/gen/a.go"]);
+        for rel in ["gen/a.go", "rel/b.go", "out/d.go"] {
+            w.write(rel, b"edited bytes");
+        }
+        let glob = |rel: &str| {
+            let s = w.snap();
+            let st = s
+                .status(
+                    rel.as_bytes(),
+                    &LookupMeta::walk(false, false).exclusion_only(),
+                )
+                .unwrap();
+            (st.kind, st.reason)
+        };
+        let cases = [
+            // (path, glob's answer, glob's lstats, a verifying lookup's kind)
+            (
+                "gen/a.go",
+                (StatusKind::Generated, Some(StatusReason::Recorded)),
+                0,
+                StatusKind::Modified,
+            ),
+            (
+                "rel/b.go",
+                (StatusKind::Released, Some(StatusReason::Recorded)),
+                0,
+                StatusKind::Source,
+            ),
+            (
+                "out/c.go",
+                (StatusKind::Generated, Some(StatusReason::Recorded)),
+                1,
+                StatusKind::Generated,
+            ),
+            (
+                "out/d.go",
+                (StatusKind::Source, None),
+                1,
+                StatusKind::Source,
+            ),
+        ];
+        for (rel, want, lstats, verified) in cases {
+            let before = TestFs::count(&w.fs.lstats);
+            assert_eq!(glob(rel), want, "{rel}");
+            assert_eq!(TestFs::count(&w.fs.lstats) - before, lstats, "{rel}");
+            assert_eq!(kind(&w, rel), verified, "{rel}");
+            assert_eq!(want.0.is_excluded(), verified.is_excluded(), "{rel}");
+        }
     }
 
     #[test]
