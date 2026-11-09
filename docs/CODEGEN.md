@@ -133,12 +133,10 @@ the bytes decide between `Generated` and `Source`.
 ### Globs
 
 The fs `glob()` target and the BUILD-time `heph.fs.glob()` skip `Generated`
-and `Modified` files. A run that excluded any prints one line when it ends,
-by default: "12 generated files were excluded from globs (10 recorded, 2
-unrecorded); heph tool codegen why <path> explains one". Each path is
-counted once per run, however many globs skipped it. `-v` and `--json` list
-each path, and `-v` adds each glob's own count ("excluded 3 generated files
-(…)"). Reading the index needs no target definition, no engine call
+and `Modified` files, silently by default. `-v` and `--json` list each
+path, once per run however many globs skipped it, and `-v` adds each glob's
+own count ("excluded 3 generated files (…)"); `heph tool codegen why <path>`
+explains one. Reading the index needs no target definition, no engine call
 and no write, so it is safe inside a BUILD evaluation.
 
 A glob reads only the rows under its pattern's literal directory (`p/*.go`

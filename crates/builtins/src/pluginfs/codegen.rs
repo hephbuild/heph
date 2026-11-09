@@ -28,17 +28,6 @@ pub trait CodegenReport: Send + Sync {
     /// Whether `key` is reported for the first time in this run: true once
     /// per key per request (per engine with no request).
     fn first_in_run(&self, request_id: Option<&str>, key: &str) -> bool;
-    /// A path excluded for `reason`, reported for the first time in this
-    /// run, with its `CodegenExcluded` event. The engine also counts it into
-    /// the request's end-of-run line ([`ExclusionTally::note`]).
-    fn excluded(
-        &self,
-        request_id: Option<&str>,
-        _reason: Option<StatusReason>,
-        kind: BuildEventKind,
-    ) {
-        self.emit(request_id, kind);
-    }
 }
 
 /// Reports nothing and dedupes nothing: a driver built without an engine.
@@ -136,10 +125,9 @@ const TALLY_REASONS: [StatusReason; 4] = [
     StatusReason::Edited,
 ];
 
-/// How many paths reads excluded, by reason: what a glob logs and what a
-/// request sums into the one line it prints when it ends.
+/// How many paths a glob excluded, by reason: what it logs at `-v`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct ExclusionTally {
+struct ExclusionTally {
     /// One slot per [`TALLY_REASONS`] entry, then one for no reason.
     counts: [usize; 5],
 }
@@ -151,12 +139,6 @@ impl ExclusionTally {
             .unwrap_or(TALLY_REASONS.len());
         if let Some(c) = self.counts.get_mut(slot) {
             *c += 1;
-        }
-    }
-
-    pub fn merge(&mut self, other: Self) {
-        for (c, o) in self.counts.iter_mut().zip(other.counts) {
-            *c += o;
         }
     }
 
@@ -178,26 +160,6 @@ impl ExclusionTally {
         } else {
             format!(" ({})", parts.join(", "))
         }
-    }
-
-    /// The line a request logs when it ends, or `None` when nothing was
-    /// excluded: "12 generated files were excluded from globs (9 recorded,
-    /// 2 unrecorded, 1 edited); heph tool codegen why <path> explains one".
-    pub fn note(&self) -> Option<String> {
-        let n = self.total();
-        if n == 0 {
-            return None;
-        }
-        let (noun, verb) = if n == 1 {
-            ("file", "was")
-        } else {
-            ("files", "were")
-        };
-        Some(format!(
-            "{n} generated {noun} {verb} excluded from globs{}; \
-             heph tool codegen why <path> explains one",
-            self.breakdown()
-        ))
     }
 }
 
@@ -492,7 +454,7 @@ pub fn file_is_source(
 }
 
 /// Report what a read excluded: one `CodegenExcluded` per path per run (the
-/// path at debug; the request's count is logged once, when it ends).
+/// path at debug).
 pub fn report(cg: &FsCodegen, request_id: Option<&str>, excluded: &[Excluded]) {
     for ex in excluded {
         let path = ex.path.as_str();
@@ -509,9 +471,8 @@ pub fn report(cg: &FsCodegen, request_id: Option<&str>, excluded: &[Excluded]) {
                 addr = ex.addr.as_deref(),
                 "codegen: excluded"
             );
-            cg.report.excluded(
+            cg.report.emit(
                 request_id,
-                ex.reason,
                 BuildEventKind::CodegenExcluded {
                     path: path.to_owned(),
                     status: status.to_owned(),
@@ -571,32 +532,6 @@ mod tests {
         assert_eq!(
             exclusion_summary(&[ex(StatusReason::Pending)]),
             "excluded 1 generated file (1 pending)"
-        );
-    }
-
-    #[test]
-    fn note_is_none_for_nothing_and_sums_merged_tallies() {
-        let mut t = ExclusionTally::default();
-        assert_eq!(t.note(), None);
-        t.add(Some(StatusReason::Recorded));
-        assert_eq!(
-            t.note().as_deref(),
-            Some(
-                "1 generated file was excluded from globs (1 recorded); \
-                 heph tool codegen why <path> explains one"
-            )
-        );
-        let mut other = ExclusionTally::default();
-        other.add(Some(StatusReason::Edited));
-        other.add(None);
-        t.merge(other);
-        assert_eq!(t.total(), 3);
-        assert_eq!(
-            t.note().as_deref(),
-            Some(
-                "3 generated files were excluded from globs (1 recorded, 1 edited); \
-                 heph tool codegen why <path> explains one"
-            )
         );
     }
 

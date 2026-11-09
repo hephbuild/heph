@@ -373,11 +373,6 @@ pub struct RequestStateData {
     ///
     /// [`CodegenReport::first_in_run`]: hbuiltins::pluginfs::CodegenReport::first_in_run
     pub(crate) codegen_reported: Mutex<FxHashSet<String>>,
-    /// The paths this request's globs excluded, by reason, each counted once
-    /// (it is counted where its `CodegenExcluded` event fires). Logged as one
-    /// `info` line when the data drops, so an exclusion is visible without
-    /// `-v`; the per-path detail stays at `debug`.
-    pub(crate) codegen_excluded: Mutex<hbuiltins::pluginfs::ExclusionTally>,
     /// Guards the one-shot `RequestConfig` announcement so it fires once per request
     /// regardless of which entry point (`result` / `result_addr`) is hit first.
     pub workers_announced: std::sync::atomic::AtomicBool,
@@ -1175,7 +1170,6 @@ impl Drop for RequestStateData {
         for hook in &self.hooks {
             hook.on_close();
         }
-        let mut excluded = *self.codegen_excluded.lock();
         if let Some(engine) = self.engine.upgrade() {
             if let Ok(mut requests) = engine.requests.lock() {
                 requests.remove(&self.request_id);
@@ -1183,16 +1177,6 @@ impl Drop for RequestStateData {
             if let Ok(mut tokens) = engine.request_ctokens.lock() {
                 tokens.remove(&self.request_id);
             }
-            // A BUILD evaluation's `heph.fs.glob` has no request to count
-            // into: the first request to end after it takes its exclusions.
-            excluded.merge(std::mem::take(
-                &mut *engine.codegen_unscoped_excluded.lock(),
-            ));
-        }
-        // Through `tracing`, so the TUI, which owns the terminal until the
-        // run's drain loops finish (after this drop), renders it.
-        if let Some(note) = excluded.note() {
-            tracing::info!(excluded = excluded.total(), "{note}");
         }
     }
 }
@@ -1213,20 +1197,13 @@ pub(crate) struct EngineCodegenReport {
     requests: RequestRegistry,
     /// Keys reported with no live request, for the engine's lifetime.
     unscoped: Mutex<FxHashSet<String>>,
-    /// Exclusions with no live request, until a request ends and logs them
-    /// ([`Engine::codegen_unscoped_excluded`]).
-    unscoped_excluded: Arc<Mutex<hbuiltins::pluginfs::ExclusionTally>>,
 }
 
 impl EngineCodegenReport {
-    pub(crate) fn new(
-        requests: RequestRegistry,
-        unscoped_excluded: Arc<Mutex<hbuiltins::pluginfs::ExclusionTally>>,
-    ) -> Self {
+    pub(crate) fn new(requests: RequestRegistry) -> Self {
         Self {
             requests,
             unscoped: Mutex::new(FxHashSet::default()),
-            unscoped_excluded,
         }
     }
 
@@ -1241,21 +1218,6 @@ impl hbuiltins::pluginfs::CodegenReport for EngineCodegenReport {
     fn emit(&self, request_id: Option<&str>, kind: crate::engine::event::BuildEventKind) {
         if let Some(rs) = self.request(request_id) {
             rs.emit(kind);
-        }
-    }
-
-    fn excluded(
-        &self,
-        request_id: Option<&str>,
-        reason: Option<hwalk::codegen_index::StatusReason>,
-        kind: crate::engine::event::BuildEventKind,
-    ) {
-        match self.request(request_id) {
-            Some(rs) => {
-                rs.data.codegen_excluded.lock().add(reason);
-                rs.emit(kind);
-            }
-            None => self.unscoped_excluded.lock().add(reason),
         }
     }
 
@@ -1435,7 +1397,6 @@ impl Engine {
             hooks: self.hooks(),
             frozen: std::sync::atomic::AtomicBool::new(false),
             codegen_reported: Mutex::new(FxHashSet::default()),
-            codegen_excluded: Mutex::new(hbuiltins::pluginfs::ExclusionTally::default()),
             workers_announced: std::sync::atomic::AtomicBool::new(false),
             matched_announced: std::sync::atomic::AtomicBool::new(false),
             bg_pending: Arc::clone(&bg_pending),
