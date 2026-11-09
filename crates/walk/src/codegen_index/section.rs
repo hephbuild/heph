@@ -1,6 +1,11 @@
 //! The managed section compiled into a matcher: which paths are generated
 //! territory (J1).
 //!
+//! Territory is a path a section line covers, as git would read the line: it
+//! is where generated files are expected, not proof that the file on disk is
+//! one heph wrote (the index decides that). See the vocabulary in
+//! [`super`].
+//!
 //! Lines get git's meaning, case-sensitive on every target: they compile into
 //! the `ignore` crate's `Gitignore` with `case_insensitive(false)`. Two places
 //! where `ignore` and git differ are bridged here:

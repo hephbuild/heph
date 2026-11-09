@@ -230,8 +230,10 @@ impl std::fmt::Display for CodegenFileError {
 
 impl std::error::Error for CodegenFileError {}
 
-/// One glob walk's view of the index: one snapshot, territory carried down
-/// the walk the way `dir_in_heph` is.
+/// One glob walk's view of the index: one snapshot (of the walk's directory
+/// only, a region), territory carried down the walk the way `dir_in_heph` is.
+/// Territory is a path a managed `.gitignore` line covers; see the vocabulary
+/// in [`hwalk::codegen_index`].
 pub struct GlobLookup<'a> {
     index: &'a CodegenIndex,
     snap: Snapshot,

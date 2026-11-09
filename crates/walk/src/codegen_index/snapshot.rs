@@ -1,4 +1,6 @@
 //! The in-process view of the index (spec: Mechanism, Snapshot; Decision 22).
+//! Base, overlay, publish, reload, fold and region are defined in the
+//! vocabulary in [`super`].
 //!
 //! A [`Snapshot`] is two `Arc`s, an immutable [`Base`] (the rows as of one
 //! reload, with a fold multimap and an addr map) and a small [`Overlay`] of

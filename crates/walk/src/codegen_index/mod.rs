@@ -4,6 +4,57 @@
 //! The split: **the managed `.gitignore` section says which paths are
 //! generated territory; the index says which bytes heph wrote there.**
 //!
+//! # Vocabulary
+//!
+//! The section (committed, the same for everyone on a commit):
+//!
+//! - **Section**: the block of the root `.gitignore` between heph's BEGIN and
+//!   END markers, one **line** per `copy` output with the target that declares
+//!   it in a comment above. [`section`] compiles it into a matcher.
+//! - **Territory**: a path some section line covers, under git's rules: it
+//!   matches a line, or sits under a directory that does, and no later `!`
+//!   line re-includes it. Territory is where generated files are *expected*.
+//!   It says nothing about whether the file on disk is the one heph wrote.
+//!   Only the index can say that. A walk carries territory down: an entry
+//!   under a territory directory is territory without a match call
+//!   ([`SectionMatch::Inherited`]).
+//! - **Foreign line**: a section line heph did not write. It still makes
+//!   territory; `codegen status` lists it.
+//!
+//! The index (per checkout, never committed):
+//!
+//! - **Row**: one recorded file: path, the target that wrote it (`addr`), its
+//!   content hash, a stat, and a [`RowState`]: `written`, `imported`,
+//!   `dropped` (the target no longer produces it), or pending (a write-back
+//!   is in flight or crashed).
+//! - **Status**: what a reader makes of one path from its row, the file on
+//!   disk and its territory ([`lookup`]): `Generated` and `Modified` are
+//!   excluded from globs and `file` targets, while `Released` and `Source`
+//!   are read as source.
+//! - **Generation**: a counter in the db that every write transaction bumps.
+//!   A reader that loaded "through generation `G`" has every commit up to `G`,
+//!   so it can tell a commit of its own from a **foreign commit** (another
+//!   process's), which forces a reload.
+//!
+//! The in-process view ([`snapshot`]):
+//!
+//! - **Snapshot**: what a reader holds for one glob or one lookup. It is
+//!   immutable, so a concurrent publish never changes its answers.
+//! - **Base**: the rows as of the last **reload** (a full read of the db).
+//! - **Overlay**: rows this process **published** (wrote) since the base, each
+//!   tagged with its generation, deletions as tombstones. A lookup takes
+//!   whichever of base and overlay has the higher generation.
+//! - **Fold** (of the overlay): once the overlay passes [`FOLD_THRESHOLD`]
+//!   rows, it merges into a new base. Not to be confused with the **fold
+//!   key** ([`fold`]): the case-folded, normalised form of a path that finds
+//!   other casings of it on a case-insensitive filesystem.
+//! - **Region**: one directory's rows, loaded on their own. A glob over `p/`
+//!   needs only `p/`'s rows, so it reads those ([`CodegenIndex::snapshot_under`])
+//!   instead of the whole index. A region is a [`snapshot::Base`] of that
+//!   directory alone. After `MAX_REGIONS` (16) of them in one generation,
+//!   the next load reads the whole index: a run globbing that many packages
+//!   probably globs most of them.
+//!
 //! This module is engine-independent. What is here so far:
 //!
 //! - [`section`]: the managed section compiled into a git-semantics matcher,
