@@ -9,21 +9,18 @@ use std::sync::Arc;
 use crossterm::style::Stylize;
 
 use crate::engine::error::{CancelledError, FrozenCheckError, TargetFailure};
-use crate::hmemoizer::downcast_chain_ref;
+use crate::hmemoizer::{chain_frames, downcast_chain_ref};
 use crate::tui::color::stderr_color_enabled as color_enabled;
 
 /// Render the cause chain of an `anyhow::Error`, dropping the leading frames that
 /// merely restate the target address (engine boundaries like `execute //addr`,
 /// already shown in the title) and joining the rest the way anyhow's `{:#}`
 /// would. If every frame mentions the addr (e.g. a bare `target not found`), the
-/// whole chain is kept. A frame that renders empty (a failure's artifacts riding
-/// the chain) is no cause and is skipped.
+/// whole chain is kept. Frames are [`chain_frames`]: an empty one (a failure's
+/// artifacts riding the chain) is skipped, and one that repeats its source's
+/// text is cut back to its own part.
 fn cause_chain(source: &anyhow::Error, addr: &str) -> String {
-    let frames: Vec<String> = source
-        .chain()
-        .map(|c| c.to_string())
-        .filter(|f| !f.is_empty())
-        .collect();
+    let frames = chain_frames(source);
     let start = frames.iter().position(|f| !f.contains(addr)).unwrap_or(0);
     frames.get(start..).unwrap_or(&[]).join(": ")
 }
@@ -754,11 +751,7 @@ fn render_anyhow_to_string(e: &anyhow::Error, color: bool) -> Option<String> {
         render_diff_box(&mut out, &fc.diff, color);
         return Some(out);
     }
-    let frames: Vec<String> = e
-        .chain()
-        .map(|c| c.to_string())
-        .filter(|f| !f.is_empty())
-        .collect();
+    let frames = chain_frames(e);
     let top = frames.first()?;
     let mut out = format!("× {top}\n");
     let rest = frames.get(1..).unwrap_or(&[]);
@@ -788,6 +781,42 @@ mod tests {
         assert!(is_cancelled(&cancelled));
         let other = anyhow::anyhow!("boom").context("running //pkg:a");
         assert!(!is_cancelled(&other));
+    }
+
+    /// An error that writes its source into its own text, as object_store's do.
+    #[derive(Debug)]
+    struct Embeds(&'static str, anyhow::Error);
+
+    impl std::fmt::Display for Embeds {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}: {}", self.0, self.1)
+        }
+    }
+
+    impl std::error::Error for Embeds {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(self.1.as_ref())
+        }
+    }
+
+    /// The CLI's own renderers write a cause its wrapper already repeats once,
+    /// as `chain_message` does.
+    #[test]
+    fn a_cause_its_wrapper_repeats_is_rendered_once() {
+        let embedded = || Embeds("Generic GCS error", anyhow::anyhow!("token refused"));
+        let e = anyhow::Error::new(embedded()).context("open remote object k");
+        let out = render_anyhow_to_string(&e, false).expect("rendered");
+        assert_eq!(
+            out,
+            "× open remote object k\n╰─▶ Generic GCS error: token refused\n"
+        );
+
+        let a = crate::htaddr::parse_addr("//p:a").unwrap();
+        let e = anyhow::Error::new(embedded()).context("execute //p:a");
+        assert_eq!(
+            cause_chain(&e, &a.format()),
+            "Generic GCS error: token refused"
+        );
     }
 
     #[test]
