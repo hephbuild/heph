@@ -217,11 +217,35 @@ impl Overlay {
 }
 
 /// The current pair and its generation accounting.
+///
+/// **Directories loaded on their own** (`regions`). A glob reads one
+/// directory's rows ([`super::store::Store::load_under`]) instead of the
+/// whole index. Each region is a [`Base`] of those rows at the generation
+/// `R` it was read at, and a snapshot of it pairs it with the shared
+/// overlay, whose entries at or below `R` it ignores: the region was read at
+/// `R`, so it holds those commits or something newer. Sound because:
+///
+/// - a region is installed only when no foreign commit lies between `R` and
+///   `loaded_through` (above `R`, only this process's publishes, all in the
+///   overlay, since the loader holds the single-flight a fold needs); one
+///   read above `loaded_through` instead resets the state as a reload does
+///   ([`Self::install_region`]);
+/// - a reload or a fold drops every region: a reload keeps only the overlay
+///   above its own generation, a fold drops what it folded into the base.
+///
+/// With no full reload since, `base` holds only what was published (and
+/// folded) since, and `full` is false.
 #[derive(Debug, Default)]
 pub struct State {
     pub(super) base: Arc<Base>,
     pub(super) overlay: Arc<Overlay>,
-    /// Every committed row with `gen` at or below this is in base + overlay.
+    /// Whether `base` holds every row: the last reset was a full reload.
+    full: bool,
+    /// The directories loaded on their own since the last reset, by their
+    /// root-relative path as asked.
+    regions: FxHashMap<Vec<u8>, Arc<Base>>,
+    /// Every committed row with `gen` at or below this is in base + overlay
+    /// (with `full`; else in each region + overlay, for its directory).
     pub(super) loaded_through: u64,
     /// Generations this process published above `loaded_through`.
     published_above: BTreeSet<u64>,
@@ -291,13 +315,71 @@ impl State {
     /// Install a reload's base: keep every overlay entry above its generation
     /// (a publish that landed during the reload), then advance.
     pub fn install_reload(&mut self, base: Base) {
+        self.reset(base);
+        self.full = true;
+    }
+
+    /// The base becomes `base`, read at its generation `r`: the overlay
+    /// keeps what was published above `r`, every region goes.
+    fn reset(&mut self, base: Base) {
         let r = base.generation;
         self.overlay = Arc::new(self.overlay.retain(|e| e.generation > r));
         self.base = Arc::new(base);
+        self.regions.clear();
         // Above `r`, only this process's own publishes can have moved it, and
         // those are all in the overlay just kept.
         self.loaded_through = self.loaded_through.max(r);
         self.advance();
+    }
+
+    /// Install directory `dir`'s rows, read in one transaction at
+    /// `region.generation`. The caller holds the single-flight, so no fold
+    /// or reload ran since it last saw `loaded_through`.
+    ///
+    /// Read above `loaded_through`, the region holds a commit this process
+    /// did not publish (or one it has not published yet): everything else
+    /// loaded is stale, so the state resets to an empty base at that
+    /// generation, which only this process's publishes fill from here.
+    /// Read at or below it, every generation between is a publish of this
+    /// process, in the overlay.
+    pub fn install_region(&mut self, dir: Vec<u8>, region: Base) {
+        let r = region.generation;
+        if r > self.loaded_through {
+            self.reset(Base {
+                generation: r,
+                ..Base::default()
+            });
+            self.full = false;
+        }
+        self.regions.insert(dir, Arc::new(region));
+    }
+
+    /// Whether a snapshot of `dir` needs no load: the base is full, or `dir`
+    /// is at or under a loaded region.
+    pub fn covers(&self, dir: &[u8]) -> bool {
+        self.full || self.region_of(dir).is_some()
+    }
+
+    /// The region `dir` is at or under: `dir`'s, or its nearest loaded
+    /// ancestor's. A region holds every row whose fold is under its own
+    /// (both folds of [`super::fold::fold_bytes`]), and an ancestor's folds
+    /// are prefixes of `dir`'s, so it holds all `dir`'s.
+    fn region_of(&self, dir: &[u8]) -> Option<&Arc<Base>> {
+        let mut d = dir;
+        loop {
+            if let Some(r) = self.regions.get(d) {
+                return Some(r);
+            }
+            d = d.get(..d.iter().rposition(|&b| b == b'/')?)?;
+        }
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.full
+    }
+
+    pub fn region_count(&self) -> usize {
+        self.regions.len()
     }
 
     /// What a fold builds from: the pair and the sequence it was copied at.
@@ -320,13 +402,43 @@ impl State {
     pub fn install_fold(&mut self, base: Base, s: u64) {
         self.overlay = Arc::new(self.overlay.retain(|e| e.seq >= s));
         self.base = Arc::new(base);
+        // A region read below a folded entry no longer finds it in the
+        // overlay.
+        self.regions.clear();
     }
 
+    /// The snapshot of the base: every row when [`Self::is_full`].
     pub fn snapshot(&self, section: Arc<Section>, env: Arc<LookupEnv>) -> Snapshot {
+        self.snapshot_of(Arc::clone(&self.base), None, section, env)
+    }
+
+    /// The snapshot that answers for paths at or under `dir`, `None` when
+    /// nothing loaded covers it.
+    pub fn snapshot_under(
+        &self,
+        dir: &[u8],
+        section: Arc<Section>,
+        env: Arc<LookupEnv>,
+    ) -> Option<Snapshot> {
+        if self.full {
+            return Some(self.snapshot(section, env));
+        }
+        let region = Arc::clone(self.region_of(dir)?);
+        Some(self.snapshot_of(region, Some(dir.into()), section, env))
+    }
+
+    fn snapshot_of(
+        &self,
+        base: Arc<Base>,
+        scope: Option<Arc<[u8]>>,
+        section: Arc<Section>,
+        env: Arc<LookupEnv>,
+    ) -> Snapshot {
         Snapshot {
-            base: Arc::clone(&self.base),
+            base,
             overlay: Arc::clone(&self.overlay),
             loaded_through: self.loaded_through,
+            scope,
             section,
             env,
         }
@@ -345,9 +457,12 @@ impl State {
 /// reads (J10). Holds `Arc`s, never a lock.
 #[derive(Debug, Clone)]
 pub struct Snapshot {
+    /// The full base, or a region's ([`State`]).
     base: Arc<Base>,
     overlay: Arc<Overlay>,
     loaded_through: u64,
+    /// The directory a region snapshot answers for; `None`: every path.
+    scope: Option<Arc<[u8]>>,
     section: Arc<Section>,
     env: Arc<LookupEnv>,
 }
@@ -383,10 +498,49 @@ impl Snapshot {
     /// winning a tie; a winning tombstone is no row, and neither is an
     /// overlay row below a folded deletion.
     pub fn row(&self, path: &[u8]) -> Option<&Row> {
+        self.debug_assert_in_scope(path);
         match self.overlay.entries.get(path) {
-            Some(o) if self.base.floor(path).is_none_or(|g| o.generation >= g) => o.row.as_ref(),
+            Some(o)
+                if self.applies(o) && self.base.floor(path).is_none_or(|g| o.generation >= g) =>
+            {
+                o.row.as_ref()
+            }
             _ => self.base.rows.get(path),
         }
+    }
+
+    /// Whether an overlay entry is newer than what the base was read at. A
+    /// full base's overlay holds nothing else (a reload keeps only what is
+    /// above it, a publish at or below it is skipped); a region, read later
+    /// than the overlay's oldest entries, already holds those.
+    fn applies(&self, o: &OverlayEntry) -> bool {
+        o.generation > self.base.generation
+    }
+
+    /// A region snapshot holds only its directory's rows: asking it about
+    /// another path would answer `Source` for a generated file.
+    fn debug_assert_in_scope(&self, path: &[u8]) {
+        if cfg!(debug_assertions)
+            && let Some(dir) = &self.scope
+        {
+            use super::fold::{ascii_fold, fold_bytes};
+            let under = |d: Vec<u8>, p: Vec<u8>| {
+                p.strip_prefix(d.as_slice())
+                    .is_some_and(|rest| rest.is_empty() || rest.first() == Some(&b'/'))
+            };
+            assert!(
+                under(fold_bytes(dir), fold_bytes(path))
+                    || under(ascii_fold(dir), fold_bytes(path)),
+                "{} looked up in a snapshot of {} only",
+                String::from_utf8_lossy(path),
+                String::from_utf8_lossy(dir),
+            );
+        }
+    }
+
+    /// Whether this snapshot answers for every path, not one directory's.
+    pub fn is_whole(&self) -> bool {
+        self.scope.is_none()
     }
 
     /// Whether any row has a fold key at all: a fold probe is skipped when not.
@@ -407,8 +561,9 @@ impl Snapshot {
         self.resolve(paths, |r| r.fold == fold)
     }
 
-    /// One target's rows.
+    /// One target's rows. A whole snapshot only.
     pub fn rows_for_addr(&self, addr: &str) -> Vec<&Row> {
+        debug_assert!(self.is_whole(), "rows_for_addr on a directory's snapshot");
         let overlay = self
             .overlay
             .entries
@@ -439,8 +594,9 @@ impl Snapshot {
             .collect()
     }
 
-    /// Every row, merged.
+    /// Every row, merged. A whole snapshot only.
     pub fn rows(&self) -> impl Iterator<Item = &Row> {
+        debug_assert!(self.is_whole(), "rows on a directory's snapshot");
         let base = self
             .base
             .rows
@@ -449,14 +605,16 @@ impl Snapshot {
                 self.overlay
                     .entries
                     .get(*p)
-                    .is_none_or(|o| o.generation < b.generation)
+                    .is_none_or(|o| !self.applies(o) || o.generation < b.generation)
             })
             .map(|(_, b)| b);
         let overlay = self
             .overlay
             .entries
             .iter()
-            .filter(|(p, o)| self.base.floor(p).is_none_or(|g| o.generation >= g))
+            .filter(|(p, o)| {
+                self.applies(o) && self.base.floor(p).is_none_or(|g| o.generation >= g)
+            })
             .filter_map(|(_, o)| o.row.as_ref());
         base.chain(overlay)
     }

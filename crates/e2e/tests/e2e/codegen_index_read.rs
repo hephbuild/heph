@@ -576,6 +576,25 @@ async fn eval_glob_reads_index_without_engine_call() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A glob under one package loads that package's rows from the index, not
+/// the whole index; a root glob loads everything.
+#[tokio::test(flavor = "current_thread")]
+async fn glob_loads_only_its_directory() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    write_section(&ws, &["# //p:gen", "/p/gen.txt", "# //q:gen", "/q/gen.txt"]);
+    for pkg in ["p", "q"] {
+        ws.write_build_file(pkg, &copy_target("gen", "gen.txt", "v1"));
+        run_on(&ws.engine, &format!("//{pkg}:gen")).await?;
+    }
+    let engine = ws.reopen()?;
+    assert!(glob(&engine, "p/*.txt").await?.is_empty());
+    let st = engine.codegen_index().stats();
+    assert_eq!((st.region_loads, st.reloads, st.rows_loaded), (1, 0, 1));
+    assert!(glob(&engine, "**/gen.txt").await?.is_empty());
+    assert_eq!(engine.codegen_index().stats().reloads, 1);
+    Ok(())
+}
+
 /// The glob's count names its reasons.
 #[tokio::test(flavor = "current_thread")]
 async fn glob_exclusion_count_names_reasons() -> anyhow::Result<()> {

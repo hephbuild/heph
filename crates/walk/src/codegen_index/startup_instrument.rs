@@ -94,6 +94,7 @@ fn startup_instrument() {
         mut gen_lookups,
         mut src_lookups,
     ) = (vec![], vec![], vec![], vec![], vec![], vec![], vec![]);
+    let mut under = vec![];
     for rep in 0..=REPS {
         // Phases in isolation, each on a fresh open.
         let t = Instant::now();
@@ -110,6 +111,13 @@ fn startup_instrument() {
         let t = Instant::now();
         idx.section().unwrap();
         let d_section = t.elapsed();
+        drop(idx);
+
+        // One package's first snapshot, as a glob under it takes.
+        let idx = CodegenIndex::open(&root, &home, fs.clone()).unwrap();
+        let t = Instant::now();
+        drop(idx.snapshot_under(b"pkg7").unwrap());
+        under.push(t.elapsed());
         drop(idx);
 
         // The whole first snapshot of a fresh process, then its lookups.
@@ -180,6 +188,7 @@ fn startup_instrument() {
     println!("  Base::from_rows      {:?}", median(base));
     println!("  section compile      {:?}", median(section));
     println!("  first snapshot()     {:?}", median(first_snap));
+    println!("  first snapshot_under(one package) {:?}", median(under));
     println!("  {FILES} gen lookups    {:?}", median(gen_lookups));
     println!("  {FILES} src lookups    {:?}", median(src_lookups));
 }

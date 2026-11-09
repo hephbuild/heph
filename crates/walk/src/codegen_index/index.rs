@@ -19,6 +19,12 @@ use std::time::Duration;
 /// Overlay rows past which a publish folds the overlay into a new base.
 pub const FOLD_THRESHOLD: usize = 4096;
 
+/// Directories loaded on their own in one generation past which the next
+/// one loads the whole index instead ([`CodegenIndex::snapshot_under`]): a
+/// run that globs this many packages likely globs many more, and one full
+/// scan costs about as much as a handful of directory reads.
+pub const MAX_REGIONS: usize = 16;
+
 /// The slack of the section's racy rule. Git re-reads an index entry whose
 /// mtime is not strictly older than the index; here the compiled section is
 /// re-read while the `.gitignore`'s mtime is within this of (or after) the
@@ -50,7 +56,9 @@ impl Default for IndexOptions {
 pub struct IndexStats {
     /// Full row loads (reloads).
     pub reloads: u64,
-    /// Rows those loads read.
+    /// One directory's row loads ([`CodegenIndex::snapshot_under`]).
+    pub region_loads: u64,
+    /// Rows those loads (both kinds) read.
     pub rows_loaded: u64,
     /// Opens of a db that appeared after the index was opened.
     pub late_opens: u64,
@@ -66,6 +74,7 @@ pub struct IndexStats {
 #[derive(Debug, Default)]
 struct Stats {
     reloads: AtomicU64,
+    region_loads: AtomicU64,
     rows_loaded: AtomicU64,
     late_opens: AtomicU64,
     cloned_overlay_entries: AtomicU64,
@@ -84,6 +93,9 @@ enum HookPoint {
     Open,
     /// Inside the single-flight, after a reload read the rows, before install.
     ReloadRead,
+    /// Inside the single-flight, after a directory's rows were read, before
+    /// install.
+    RegionRead,
     /// Inside the single-flight, after a fold copied the pair, before install.
     FoldCopied,
 }
@@ -234,6 +246,7 @@ impl CodegenIndex {
         let get = |c: &AtomicU64| c.load(Ordering::Relaxed);
         IndexStats {
             reloads: get(&s.reloads),
+            region_loads: get(&s.region_loads),
             rows_loaded: get(&s.rows_loaded),
             late_opens: get(&s.late_opens),
             cloned_overlay_entries: get(&s.cloned_overlay_entries),
@@ -252,11 +265,56 @@ impl CodegenIndex {
         let section = self.section()?;
         if let Some(store) = self.store_or_late_open()? {
             let generation = store.generation()?;
-            if generation > self.state.read().loaded_through() {
+            let st = self.state.read();
+            let current = st.is_full() && generation <= st.loaded_through();
+            drop(st);
+            if !current {
                 self.reload(store, generation)?;
             }
         }
         Ok(self.state.read().snapshot(section, Arc::clone(&self.env)))
+    }
+
+    /// [`Self::snapshot`] for a reader that asks only about paths at or under
+    /// the root-relative, normalised directory `dir` (a glob's walk root, a
+    /// `file()` path's parent; empty is the whole tree). When nothing loaded
+    /// covers `dir`, it loads that directory's rows alone
+    /// ([`Store::load_under`]), so a process that reads a few packages never
+    /// reads the whole index. After [`MAX_REGIONS`] directories in one
+    /// generation it loads everything instead.
+    ///
+    /// The snapshot is wrong about any other path: its row is not loaded. A
+    /// debug build asserts on such a lookup.
+    pub fn snapshot_under(&self, dir: &[u8]) -> Result<Snapshot> {
+        if dir.is_empty() {
+            return self.snapshot();
+        }
+        let section = self.section()?;
+        let env = || Arc::clone(&self.env);
+        let Some(store) = self.store_or_late_open()? else {
+            return Ok(self.state.read().snapshot(section, env()));
+        };
+        let generation = store.generation()?;
+        {
+            let st = self.state.read();
+            if generation <= st.loaded_through()
+                && let Some(s) = st.snapshot_under(dir, Arc::clone(&section), env())
+            {
+                return Ok(s);
+            }
+        }
+        self.load_region(store, dir, generation)?;
+        let st = self.state.read();
+        Ok(match st.snapshot_under(dir, Arc::clone(&section), env()) {
+            Some(s) => s,
+            // A fold between the install and this read dropped the region:
+            // the base alone is right only when it is full.
+            None if st.is_full() => st.snapshot(section, env()),
+            None => {
+                drop(st);
+                return self.snapshot_under(dir);
+            }
+        })
     }
 
     /// After a glob's walk: the rows committed above the snapshot's
@@ -340,9 +398,42 @@ impl CodegenIndex {
     /// shares it when that one loaded through what this caller saw.
     fn reload(&self, store: &Store, seen: u64) -> Result<()> {
         let _flight = self.flight.lock();
-        if self.state.read().loaded_through() >= seen {
+        let st = self.state.read();
+        if st.is_full() && st.loaded_through() >= seen {
             return Ok(());
         }
+        drop(st);
+        self.reload_in_flight(store)
+    }
+
+    /// Load and install directory `dir`'s rows, single-flight like a reload;
+    /// a caller that waited shares a load that covers `dir` at what it saw.
+    fn load_region(&self, store: &Store, dir: &[u8], seen: u64) -> Result<()> {
+        let _flight = self.flight.lock();
+        let st = self.state.read();
+        let current = st.loaded_through() >= seen;
+        if current && st.covers(dir) {
+            return Ok(());
+        }
+        let crowded = current && st.region_count() >= MAX_REGIONS;
+        drop(st);
+        if crowded {
+            return self.reload_in_flight(store);
+        }
+        let (generation, rows) = store.load_under(dir)?;
+        bump(&self.stats.region_loads, 1);
+        bump(
+            &self.stats.rows_loaded,
+            u64::try_from(rows.len()).unwrap_or(u64::MAX),
+        );
+        self.hook(HookPoint::RegionRead);
+        let region = Base::from_rows(generation, rows);
+        self.state.write().install_region(dir.to_vec(), region);
+        Ok(())
+    }
+
+    /// The full reload; the caller holds the single-flight.
+    fn reload_in_flight(&self, store: &Store) -> Result<()> {
         let (generation, rows) = store.load_all()?;
         bump(&self.stats.reloads, 1);
         bump(
@@ -595,6 +686,134 @@ mod tests {
         assert!(x.end_of_walk(&s).unwrap().is_empty());
         assert!(!x.db_path().exists());
         assert!(!w.home.exists(), "nothing under the home either");
+    }
+
+    /// A directory's snapshot loads that directory alone, serves every
+    /// directory under it without another load, and a whole snapshot after
+    /// it loads everything.
+    #[test]
+    fn snapshot_under_loads_only_its_dir() {
+        let w = ws();
+        let (x, y) = pair(&w, IndexOptions::default());
+        commit(&y, &["p/a.go", "p/sub/c.go", "q/b.go", "pp/d.go"]);
+        let s = x.snapshot_under(b"p").unwrap();
+        assert!(has(&s, "p/a.go") && has(&s, "p/sub/c.go"));
+        let st = x.stats();
+        assert_eq!((st.region_loads, st.reloads, st.rows_loaded), (1, 0, 2));
+        assert!(has(&x.snapshot_under(b"p/sub").unwrap(), "p/sub/c.go"));
+        assert_eq!(x.stats().region_loads, 1, "under a loaded dir: no load");
+        assert!(has(&x.snapshot_under(b"q").unwrap(), "q/b.go"));
+        assert_eq!(x.stats().region_loads, 2);
+        let all = x.snapshot().unwrap();
+        assert_eq!(all.rows().count(), 4);
+        assert_eq!(x.stats().reloads, 1, "a whole snapshot loads everything");
+        assert!(has(&x.snapshot_under(b"pp").unwrap(), "pp/d.go"));
+        assert_eq!(x.stats().region_loads, 2, "the full base covers every dir");
+    }
+
+    /// A directory's snapshot sees this process's publishes without a load;
+    /// a foreign commit reloads the directory and drops the other loaded
+    /// ones, and a publish below a region's read stays out.
+    #[test]
+    fn snapshot_under_tracks_publishes_and_foreign_commits() {
+        let w = ws();
+        let (x, y) = pair(&w, IndexOptions::default());
+        commit(&y, &["p/a.go", "q/b.go"]);
+        x.snapshot_under(b"p").unwrap();
+        x.snapshot_under(b"q").unwrap();
+        commit_publish(&x, &["p/own.go"]);
+        assert!(has(&x.snapshot_under(b"p").unwrap(), "p/own.go"));
+        assert_eq!(x.stats().region_loads, 2, "own publish: no load");
+
+        // Committed by x but not yet published, then a foreign delete.
+        let late = commit(&x, &["p/late.go"]);
+        y.store()
+            .unwrap()
+            .write(|t| {
+                t.delete(b"p/a.go", "//p:gen")?;
+                t.delete(b"q/b.go", "//p:gen").map(drop)
+            })
+            .unwrap();
+        let s = x.snapshot_under(b"p").unwrap();
+        assert_eq!(x.stats().region_loads, 3, "a foreign commit reloads");
+        assert!(!has(&s, "p/a.go") && has(&s, "p/own.go") && has(&s, "p/late.go"));
+        x.publish_committed(&late);
+        assert!(has(&x.snapshot_under(b"p").unwrap(), "p/late.go"));
+        assert!(
+            !has(&x.snapshot_under(b"q").unwrap(), "q/b.go"),
+            "q, loaded before the foreign commit, is loaded again"
+        );
+        assert_eq!(x.stats().region_loads, 4);
+        assert_eq!(x.stats().reloads, 0);
+    }
+
+    /// A fold takes entries out of the overlay: a directory loaded before it
+    /// would no longer see them, so it is loaded again.
+    #[test]
+    fn a_fold_drops_loaded_dirs() {
+        let w = ws();
+        let (x, _) = pair(
+            &w,
+            IndexOptions {
+                fold_threshold: 2,
+                ..IndexOptions::default()
+            },
+        );
+        x.snapshot_under(b"p").unwrap();
+        for p in ["p/a.go", "p/b.go", "p/c.go"] {
+            commit_publish(&x, &[p]);
+        }
+        assert_eq!(x.stats().folds, 1);
+        let s = x.snapshot_under(b"p").unwrap();
+        assert!(["p/a.go", "p/b.go", "p/c.go"].iter().all(|p| has(&s, p)));
+        assert_eq!(x.stats().region_loads, 2);
+    }
+
+    #[test]
+    fn many_dirs_fall_back_to_a_full_load() {
+        let w = ws();
+        let (x, y) = pair(&w, IndexOptions::default());
+        let dirs: Vec<String> = (0..=MAX_REGIONS).map(|i| format!("d{i}")).collect();
+        let paths: Vec<String> = dirs.iter().map(|d| format!("{d}/a.go")).collect();
+        commit(&y, &paths.iter().map(String::as_str).collect::<Vec<_>>());
+        for d in &dirs {
+            let s = x.snapshot_under(d.as_bytes()).unwrap();
+            assert!(has(&s, &format!("{d}/a.go")));
+        }
+        let st = x.stats();
+        assert_eq!((st.region_loads, st.reloads), (MAX_REGIONS as u64, 1));
+    }
+
+    #[test]
+    fn region_load_is_single_flight() {
+        let w = ws();
+        let (x, y) = pair(&w, IndexOptions::default());
+        commit(&y, &["p/a.go"]);
+        x.set_hook(|p| {
+            if p == HookPoint::RegionRead {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+        let barrier = Barrier::new(8);
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    barrier.wait();
+                    assert!(has(&x.snapshot_under(b"p").unwrap(), "p/a.go"));
+                });
+            }
+        });
+        assert_eq!(x.stats().region_loads, 1, "{:?}", x.stats());
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "q/b.go looked up in a snapshot of p only")]
+    fn a_dir_snapshot_refuses_a_path_outside_it() {
+        let w = ws();
+        let (x, y) = pair(&w, IndexOptions::default());
+        commit(&y, &["p/a.go", "q/b.go"]);
+        x.snapshot_under(b"p").unwrap().row(b"q/b.go");
     }
 
     #[test]

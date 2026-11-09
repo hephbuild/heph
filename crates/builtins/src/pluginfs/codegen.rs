@@ -8,6 +8,7 @@
 //! row names still exist — is answered by the engine, on the error path only
 //! (see [`CodegenFileError`]).
 
+use std::borrow::Cow;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -273,16 +274,33 @@ pub struct GlobLookup<'a> {
     index: &'a CodegenIndex,
     snap: Snapshot,
     root: &'a Path,
+    /// The root-relative directory the walk stays under: all the snapshot
+    /// loads (`CodegenIndex::snapshot_under`).
+    scope: Vec<u8>,
 }
 
 impl<'a> GlobLookup<'a> {
-    /// The snapshot this glob reads, or `None` with no index.
-    pub fn open(cg: &'a FsCodegen, root: &'a Path) -> anyhow::Result<Option<Self>> {
+    /// The snapshot of `walk_root` (the pattern's literal prefix, under
+    /// `root`) this glob reads, or `None` with no index.
+    pub fn open(
+        cg: &'a FsCodegen,
+        root: &'a Path,
+        walk_root: &Path,
+    ) -> anyhow::Result<Option<Self>> {
         let Some(index) = cg.index.as_deref() else {
             return Ok(None);
         };
-        let snap = index.snapshot().context_codegen()?;
-        Ok(Some(Self { index, snap, root }))
+        // Outside the root nothing is looked up; the whole index is right.
+        let scope = normalize_rel(root, walk_root)
+            .map(Cow::into_owned)
+            .unwrap_or_default();
+        let snap = index.snapshot_under(&scope).context_codegen()?;
+        Ok(Some(Self {
+            index,
+            snap,
+            root,
+            scope,
+        }))
     }
 
     /// Whether the walk's starting directory is territory: a point match,
@@ -347,7 +365,7 @@ impl<'a> GlobLookup<'a> {
         if !artifacts.iter().any(named) {
             return Ok(());
         }
-        let fresh = self.index.snapshot().context_codegen()?;
+        let fresh = self.index.snapshot_under(&self.scope).context_codegen()?;
         let mut err = None;
         artifacts.retain(|a| {
             if err.is_some() || !named(a) {
@@ -425,7 +443,13 @@ pub fn file_is_source(
     let Some(rel) = normalize_rel(root, Path::new(path)) else {
         return Ok(FileSource::Read);
     };
-    let snap = index.snapshot().context_codegen()?;
+    // Only the file's directory is loaded.
+    let dir = rel
+        .iter()
+        .rposition(|&b| b == b'/')
+        .and_then(|i| rel.get(..i))
+        .unwrap_or_default();
+    let snap = index.snapshot_under(dir).context_codegen()?;
     let st = snap
         .status(&rel, &LookupMeta::point(false))
         .with_context_path(path)?;

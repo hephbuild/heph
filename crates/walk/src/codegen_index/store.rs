@@ -15,7 +15,7 @@
 //! rows it has.
 
 use super::ImportLockGuard;
-use super::fold::fold_hash;
+use super::fold::{ascii_fold, fold_bytes, fold_hash};
 use crate::migrate_lock::{MIGRATE_LOCK_TIMEOUT, lock_migration};
 use anyhow::{Context as _, Result, bail};
 use r2d2_sqlite::SqliteConnectionManager;
@@ -27,13 +27,21 @@ use std::time::Duration;
 
 /// The schema version this binary writes, in `PRAGMA user_version`: the
 /// number of [`MIGRATIONS`] applied.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
+
+/// One schema step: DDL, or a Rust function for what SQL cannot compute.
+#[derive(Clone, Copy)]
+enum Step {
+    Sql(&'static str),
+    Rust(fn(&Transaction<'_>) -> rusqlite::Result<()>),
+}
 
 /// The schema, one additive step per version. Step `i` takes a db from
 /// version `i` to `i + 1`; a db at version `v` runs steps `v..`.
-const MIGRATIONS: &[&str] = &[
+const MIGRATIONS: &[Step] = &[
     // 1: the files table and the single meta row.
-    "CREATE TABLE files (
+    Step::Sql(
+        "CREATE TABLE files (
          path            BLOB PRIMARY KEY NOT NULL,
          fold            INTEGER NOT NULL,
          addr            TEXT NOT NULL,
@@ -61,7 +69,26 @@ const MIGRATIONS: &[&str] = &[
          no_section_hint_shown INTEGER NOT NULL DEFAULT 0
      );
      INSERT INTO meta (id, generation) VALUES (0, 0);",
+    ),
+    // 2: each path's folded form, indexed, so a snapshot can load one
+    // directory with every other casing of it (`load_under`).
+    Step::Rust(add_folded),
 ];
+
+/// Migration 2: add `files.folded`, fill it for the rows already there, and
+/// index it.
+fn add_folded(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+    tx.execute_batch("ALTER TABLE files ADD COLUMN folded BLOB NOT NULL DEFAULT x'';")?;
+    let paths = tx
+        .prepare("SELECT path FROM files")?
+        .query_map([], |r| r.get::<_, Vec<u8>>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut set = tx.prepare("UPDATE files SET folded = ?2 WHERE path = ?1")?;
+    for path in paths {
+        set.execute(params![path, fold_bytes(&path)])?;
+    }
+    tx.execute_batch("CREATE INDEX files_folded ON files (folded);")
+}
 
 /// How long a statement waits on another connection's lock before the store
 /// gives up with an error naming the file.
@@ -265,6 +292,15 @@ fn row_from_sql(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
     })
 }
 
+/// [`Store::load_under`]'s query: a directory and its subtree, under each of
+/// two folds of its name.
+fn load_under_sql() -> String {
+    format!(
+        "SELECT {COLS} FROM files WHERE folded = ?1 OR (folded >= ?2 AND folded < ?3) \
+         OR folded = ?4 OR (folded >= ?5 AND folded < ?6)"
+    )
+}
+
 fn query_rows(
     conn: &Connection,
     sql: &str,
@@ -352,6 +388,44 @@ impl Store {
             Ok((generation, rows))
         };
         load().with_context(|| format!("loading the codegen index {}", self.path.display()))
+    }
+
+    /// The generation and every row at or under directory `dir`
+    /// (root-relative, non-empty) in any casing or normalisation, read in one
+    /// read transaction like [`Self::load_all`]: every row whose folded path
+    /// is `dir`'s, or under it, through the `files(folded)` index. A path
+    /// that is not UTF-8 folds by ASCII lowercase, so `dir`'s ASCII fold is
+    /// asked as well (see [`fold_bytes`]). May return a row outside `dir`
+    /// that folds into it, never miss one inside.
+    pub fn load_under(&self, dir: &[u8]) -> Result<(u64, Vec<Row>)> {
+        let conn = self.conn()?;
+        let (folded, ascii) = (fold_bytes(dir), ascii_fold(dir));
+        let range = |d: &[u8]| {
+            let lo = [d, b"/"].concat();
+            // `0` follows `/`: every byte string starting `d/` sorts below `d0`.
+            let hi = [d, b"0"].concat();
+            (d.to_vec(), lo, hi)
+        };
+        let load = || -> rusqlite::Result<(u64, Vec<Row>)> {
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Deferred)?;
+            let generation = read_generation(&tx)?;
+            let (a, a_lo, a_hi) = range(&folded);
+            let (b, b_lo, b_hi) = range(&ascii);
+            let rows = query_rows(
+                &tx,
+                &load_under_sql(),
+                params![a, a_lo, a_hi, b, b_lo, b_hi],
+            )?;
+            tx.commit()?;
+            Ok((generation, rows))
+        };
+        load().with_context(|| {
+            format!(
+                "loading {} from the codegen index {}",
+                String::from_utf8_lossy(dir),
+                self.path.display()
+            )
+        })
     }
 
     /// The rows committed above generation `gen`, through the `files(gen)`
@@ -493,8 +567,8 @@ impl WriteTxn<'_> {
         let record = row.record.as_ref();
         self.tx
             .prepare_cached(&format!(
-                "INSERT OR REPLACE INTO files ({COLS}) VALUES \
-                 (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"
+                "INSERT OR REPLACE INTO files ({COLS}, folded) VALUES \
+                 (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)"
             ))?
             .execute(params![
                 row.path,
@@ -514,6 +588,7 @@ impl WriteTxn<'_> {
                 row.seen_in_section,
                 record.map(|r| r.written_at_ns),
                 to_sql_u64(self.generation),
+                fold_bytes(&row.path),
             ])
             .with_context(|| format!("recording {}", String::from_utf8_lossy(&row.path)))?;
         Ok(())
@@ -673,13 +748,16 @@ fn set_wal(conn: &Connection, path: &Path) -> Result<()> {
 
 /// Apply `steps[from..]` and stamp the version, in one `BEGIN IMMEDIATE`:
 /// a failing step leaves the db exactly as it was.
-fn apply_migrations(conn: &Connection, from: i64, steps: &[&str]) -> Result<()> {
+fn apply_migrations(conn: &Connection, from: i64, steps: &[Step]) -> Result<()> {
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
         .context("starting the migration")?;
     let first = usize::try_from(from).context("negative schema version")?;
     for (i, step) in steps.iter().enumerate().skip(first) {
-        tx.execute_batch(step)
-            .with_context(|| format!("applying schema step {}", i + 1))?;
+        match step {
+            Step::Sql(sql) => tx.execute_batch(sql),
+            Step::Rust(f) => f(&tx),
+        }
+        .with_context(|| format!("applying schema step {}", i + 1))?;
     }
     let to = i64::try_from(steps.len()).context("schema version overflow")?;
     tx.execute_batch(&format!("PRAGMA user_version = {to};"))
@@ -889,6 +967,110 @@ mod tests {
         assert_eq!(store.load_all().unwrap(), (3, vec![]));
     }
 
+    fn paths(rows: &[Row]) -> Vec<String> {
+        let mut v: Vec<String> = rows
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.path).into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// `load_under` takes the directory, everything under it in any casing
+    /// or normalisation, and nothing beside it: not a sibling sharing its
+    /// name as a prefix (`gen0`, `genx`, `ge`).
+    #[test]
+    fn load_under_takes_the_dir_in_every_casing_and_nothing_beside_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&fresh(dir.path()), &StoreOptions::default()).unwrap();
+        let all: &[&[u8]] = &[
+            b"gen",
+            b"gen/a.go",
+            b"gen/sub/b.go",
+            b"Gen/C.go",
+            b"GEN/sub/D.go",
+            b"gen0/x.go",
+            b"gen.go",
+            b"genx/y.go",
+            b"ge/z.go",
+            b"other/gen/w.go",
+            "caf\u{e9}/n.go".as_bytes(),
+            "cafe\u{301}/d.go".as_bytes(),
+            "CAF\u{c9}/u.go".as_bytes(),
+            b"cafe/plain.go",
+            // Not UTF-8: folded by ASCII lowercase to `caf\xc3\x89/…`, which
+            // only the ASCII fold of `CAFÉ` reaches (its full fold is `café`).
+            b"CAF\xc3\x89/\xff.go",
+        ];
+        store
+            .write(|w| {
+                for p in all {
+                    w.put(&Row::new(p.to_vec(), "//p:gen", RowKind::File))?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let (generation, rows) = store.load_under(b"gen").unwrap();
+        assert_eq!(generation, 1);
+        assert_eq!(
+            paths(&rows),
+            [
+                "GEN/sub/D.go",
+                "Gen/C.go",
+                "gen",
+                "gen/a.go",
+                "gen/sub/b.go"
+            ]
+        );
+        let (_, rows) = store.load_under("CAF\u{c9}".as_bytes()).unwrap();
+        assert_eq!(
+            paths(&rows),
+            [
+                "CAF\u{c9}/u.go",
+                "CAF\u{c9}/\u{fffd}.go",
+                "cafe\u{301}/d.go",
+                "caf\u{e9}/n.go",
+            ]
+        );
+        let (_, rows) = store.load_under(b"nowhere").unwrap();
+        assert!(rows.is_empty());
+        // Through the index, never a scan of every row.
+        let conn = store.conn().unwrap();
+        let plan: Vec<String> = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", load_under_sql()))
+            .unwrap()
+            .query_map(params![b"a", b"b", b"c", b"d", b"e", b"f"], |r| r.get(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            plan.iter().all(|p| !p.starts_with("SCAN files")),
+            "{plan:?}"
+        );
+        assert!(plan.iter().any(|p| p.contains("files_folded")), "{plan:?}");
+    }
+
+    /// Migration 2 fills `folded` for the rows a version-1 db already holds,
+    /// so `load_under` finds them.
+    #[test]
+    fn migration_2_folds_existing_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.db");
+        let c = Connection::open(&db).unwrap();
+        set_wal(&c, &db).unwrap();
+        apply_migrations(&c, 0, &MIGRATIONS[..1]).unwrap();
+        c.execute(
+            "INSERT INTO files (path, fold, addr, kind, state, gen) \
+             VALUES (?1, ?2, '//p:gen', 'file', 'written', 1)",
+            params![b"Gen/a.go".to_vec(), to_sql_u64(fold_hash(b"Gen/a.go"))],
+        )
+        .unwrap();
+        drop(c);
+        let store = Store::open(&db, &StoreOptions::default()).unwrap();
+        assert_eq!(paths(&store.load_under(b"gen").unwrap().1), ["Gen/a.go"]);
+        assert!(schema(&db).iter().any(|(n, _)| n == "files_folded"));
+    }
+
     #[test]
     fn a_failed_write_commits_nothing() {
         let dir = tempfile::tempdir().unwrap();
@@ -937,22 +1119,26 @@ mod tests {
     fn newer_schema_refused_without_ddl() {
         let dir = tempfile::tempdir().unwrap();
         let db = fresh(dir.path());
+        let newer = SCHEMA_VERSION + 1;
         Connection::open(&db)
             .unwrap()
-            .execute_batch("PRAGMA user_version = 2;")
+            .execute_batch(&format!("PRAGMA user_version = {newer};"))
             .unwrap();
         let before = schema(&db);
         let err = Store::open(&db, &StoreOptions::default()).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains(&db.display().to_string()), "{msg}");
-        assert!(msg.contains("version 2"), "{msg}");
-        assert!(msg.contains("the 1 this heph knows"), "{msg}");
+        assert!(msg.contains(&format!("version {newer}")), "{msg}");
+        assert!(
+            msg.contains(&format!("the {SCHEMA_VERSION} this heph knows")),
+            "{msg}"
+        );
         assert_eq!(schema(&db), before, "no DDL");
         let c = Connection::open(&db).unwrap();
         let v: i64 = c
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 2);
+        assert_eq!(v, newer);
         assert_eq!(read_generation(&c).unwrap(), 0, "no write");
         assert!(
             !crate::migrate_lock::migrate_lock_path(&db).exists(),
@@ -978,7 +1164,12 @@ mod tests {
 
         // A step that fails rolls back every earlier one and the version.
         let c = Connection::open(&db).unwrap();
-        let err = apply_migrations(&c, 0, &[MIGRATIONS[0], "CREATE TABLE files (x);"]).unwrap_err();
+        let err = apply_migrations(
+            &c,
+            0,
+            &[MIGRATIONS[0], Step::Sql("CREATE TABLE files (x);")],
+        )
+        .unwrap_err();
         assert!(format!("{err:#}").contains("schema step 2"), "{err:#}");
         assert!(schema(&db).is_empty(), "step 1 rolled back");
         let v: i64 = c

@@ -968,7 +968,7 @@ fn walk_glob(
         root.join(&compiled.prefix)
     };
 
-    let lookup = codegen::GlobLookup::open(codegen, root)?;
+    let lookup = codegen::GlobLookup::open(codegen, root, &walk_root)?;
     let lookup = lookup.as_ref();
     let mut excluded = vec![];
     let mut artifacts = vec![];

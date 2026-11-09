@@ -141,6 +141,13 @@ each path, and `-v` adds each glob's own count ("excluded 3 generated files
 (…)"). Reading the index needs no target definition, no engine call
 and no write, so it is safe inside a BUILD evaluation.
 
+A glob reads only the rows under its pattern's literal directory (`p/*.go`
+reads `p/`, in every casing), and an fs `file` target only its file's
+directory, so a run that reads a few packages never loads the whole index.
+A root glob, a write-back, a `heph tool codegen` command, or a run that has
+read 16 directories since the index last changed loads every row once
+instead.
+
 ### fs `file` targets
 
 The Starlark `file("p/foo.pb.go")` builtin checks nothing: it only builds the
