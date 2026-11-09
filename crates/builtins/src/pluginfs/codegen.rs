@@ -1,6 +1,6 @@
-//! The fs plugin's reads of the codegen index: which files a glob, a `file`
-//! target or a `copy_output` target leaves out because heph generated them,
-//! and how that reaches the user.
+//! The fs plugin's reads of the codegen index: which files a glob or a `file`
+//! target leaves out because heph generated them, and how that reaches the
+//! user.
 //!
 //! Every reader takes one [`Snapshot`] (J10) and asks it per path; nothing
 //! here writes the index, waits on it or reads a def (J6). The fs driver
@@ -355,15 +355,6 @@ impl<'a> GlobLookup<'a> {
     }
 }
 
-/// What an fs `file` or `copy_output` target does with its one path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FileMode {
-    /// `file`: a generated path is an error, an unrecorded match warns.
-    Strict,
-    /// `copy_output`: an excluded path is zero artifacts, silently.
-    CopyOutput,
-}
-
 /// What the fs target over a path does with it.
 #[derive(Debug, PartialEq, Eq)]
 pub enum FileSource {
@@ -396,7 +387,6 @@ pub fn file_is_source(
     cg: &FsCodegen,
     root: &Path,
     path: &str,
-    mode: FileMode,
     request_id: Option<&str>,
 ) -> anyhow::Result<FileSource> {
     let Some(index) = cg.index.as_deref() else {
@@ -417,9 +407,6 @@ pub fn file_is_source(
         .with_context_path(path)?;
     if !st.kind.is_excluded() {
         return Ok(FileSource::Read);
-    }
-    if mode == FileMode::CopyOutput {
-        return Ok(FileSource::Excluded { warning: None });
     }
     if let Some(row) = st.row {
         return Err(CodegenFileError {

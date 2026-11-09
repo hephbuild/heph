@@ -204,14 +204,12 @@ files on disk, cache keys agree across machines when `heph tool codegen status
 `copy` output. Outside that, a key can differ across machines, which costs a
 cache miss, never a wrong hit.
 
-### `copy_output`: a target reading its own outputs
+### `introspect:outputs` lists no `copy` outputs
 
-`//@heph/introspect:outputs` over a `copy` target's own outputs expands to
-`//@heph/fs:copy_output@f=<path>` rather than `file`. `copy_output` means: an
-excluded path is zero artifacts, with no error and no warning, and never its
-bytes, so a target never hashes its own previous output. Any other path is the
-file, as with `file`. Only the engine emits it; everything else (user BUILD
-files, `in_place` outputs, the Go fallback below) uses the strict `file`.
+`//@heph/introspect:outputs` expands to an fs input per declared output path,
+except `copy` paths: those are generated, not source, so a target never reads
+or hashes its own previous output. A `copy` target listing it gets nothing
+from its `copy` outputs, whether or not a file sits at the path.
 
 ### In-place targets
 
@@ -490,8 +488,8 @@ is unsupported.
 - **A Go package whose directory path contains `\`** can no longer get a
   `format` target that runs (the glob syntax cannot express a literal `\`; Go
   refuses `\` in import paths).
-- **`introspect:outputs` over a `copy` target's outputs** now expands to the
-  `copy_output` fs target.
+- **`introspect:outputs` no longer lists `copy` outputs**: a target that read
+  a file at its own `copy` output path no longer sees it.
 - **Rollback and mixed versions are unsupported.** Until v1.1.0 the xattr is
   still set, so a rollback keeps excluding generated files; after one, rerun
   `heph tool codegen import`.

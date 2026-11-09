@@ -24,7 +24,7 @@ use heph::engine::fault_provider::{FaultProvider, Faults};
 use heph::engine::{Config, Engine, OutputMatcher, ResultOptions};
 use heph::htaddr::{Addr, parse_addr};
 use heph::htwalk::codegen_index::{Row, RowState, StatusKind, StatusReason};
-use heph::pluginfs::{copy_output_addr, file_addr, glob_addr};
+use heph::pluginfs::{file_addr, glob_addr};
 use heph::{pluginbuildfile, pluginexec};
 use std::path::Path;
 use std::sync::Arc;
@@ -407,8 +407,9 @@ target(
     Ok(())
 }
 
-/// A `copy` target that reads its own outputs: an excluded previous output is
-/// zero artifacts, so the sandbox never sees the bytes it wrote last time.
+/// A `copy` target listing `introspect:outputs`: its outputs are generated,
+/// not source, so the sandbox never sees the file at the output path, before
+/// the first run or after.
 const SELF_READ: &str = r#"
 target(
     name = "gen",
@@ -421,15 +422,15 @@ target(
 "#;
 
 #[tokio::test]
-async fn copy_output_never_sources_excluded_bytes() -> anyhow::Result<()> {
+async fn introspect_outputs_never_sources_copy_outputs() -> anyhow::Result<()> {
     let ws = Workspace::new();
     ws.write_file("p/gen.txt", "old");
     ws.write_build_file("p", &SELF_READ.replace("{tag}", "v1"));
     run_on(&ws.engine, "//p:gen").await?;
     assert_eq!(
         read(&ws, "p/gen.txt").as_deref(),
-        Some("v1 saw old"),
-        "an unrecorded file is source"
+        Some("v1 saw none"),
+        "a file at a copy output path is not an input"
     );
     ws.write_build_file("p", &SELF_READ.replace("{tag}", "v2"));
     let e2 = ws.reopen()?;
@@ -437,47 +438,22 @@ async fn copy_output_never_sources_excluded_bytes() -> anyhow::Result<()> {
     assert_eq!(
         read(&ws, "p/gen.txt").as_deref(),
         Some("v2 saw none"),
-        "the recorded previous output is absent from the inputs"
+        "the recorded previous output is not an input, and no error"
     );
     Ok(())
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn introspect_outputs_over_copy_output_is_zero_artifacts_without_error_or_warning()
--> anyhow::Result<()> {
-    let ws = Workspace::new();
-    write_section(&ws, &["# //p:gen", "/p/gen.txt"]);
-    ws.write_file("p/gen.txt", "old");
-    ws.write_build_file("p", &SELF_READ.replace("{tag}", "v1"));
-    run_on(&ws.engine, "//p:gen").await?;
-    // Edited, under a line: `Modified`, which `file` would refuse and warn on.
-    ws.write_file("p/gen.txt", "hand edit");
-    let ((res, _), log) =
-        capture_warnings(resolve(&ws.engine, &copy_output_addr("p/gen.txt"))).await;
-    assert_eq!(res?, Vec::<String>::new());
-    assert!(log.is_empty(), "no warning: {log}");
-    Ok(())
-}
-
-/// `copy_output` has its own def-hash tag; `file`'s key is the one it had
-/// before the codegen index (pinned at 5375abba).
+/// `file`'s key is the one it had before the codegen index (pinned at
+/// 5375abba).
 #[tokio::test]
-async fn copy_output_leaves_strict_file_keys_unchanged() -> anyhow::Result<()> {
+async fn file_def_hash_unchanged_by_the_index() -> anyhow::Result<()> {
     let ws = Workspace::new();
     ws.write_file("p/a.txt", "a");
-    let def_hash = |addr: Addr| {
-        let engine = Arc::clone(&ws.engine);
-        async move {
-            let def = Arc::clone(&engine)
-                .get_def(engine.new_state(), &addr)
-                .await?;
-            anyhow::Ok(String::from_utf8(def.target_def.hash.clone())?)
-        }
-    };
-    let file = def_hash(file_addr("p/a.txt")).await?;
-    let lenient = def_hash(copy_output_addr("p/a.txt")).await?;
-    assert_eq!(file, FILE_DEF_HASH_AT_5375ABBA, "the strict file key moved");
-    assert_ne!(file, lenient);
+    let def = Arc::clone(&ws.engine)
+        .get_def(ws.engine.new_state(), &file_addr("p/a.txt"))
+        .await?;
+    let file = String::from_utf8(def.target_def.hash.clone())?;
+    assert_eq!(file, FILE_DEF_HASH_AT_5375ABBA, "the file key moved");
     Ok(())
 }
 

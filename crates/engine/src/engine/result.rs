@@ -1152,46 +1152,37 @@ fn write_back_hints(addr: &str, outside_section: usize, no_section_hint: bool) -
     out
 }
 
-/// What every `codegen = in_place` output path reads as, keyed on
-/// `(kind, path)` ([`hbuiltins::pluginfs::FsPathKey`]).
-///
-/// Built by the one helper [`crate::engine::expand`]'s synthesized fs inputs
-/// use ([`hbuiltins::pluginfs::output_fs_addr`]), and keyed on what the addr
-/// reads rather than the addr itself: strict `file` and lenient `copy_output`
-/// over one path are one key, so a strict/lenient mismatch between an output
-/// and the input that reads it can never silently skip the guard (E15).
-fn in_place_fs_keys(
+/// The `@heph/fs` addrs covering every `codegen = in_place` output path. Same
+/// path→addr mapping `expand::synthesized_fs_inputs` uses
+/// ([`hbuiltins::pluginfs::output_fs_addr`]), so a declared in_place output and
+/// the input that reads it land on the same addr.
+fn in_place_fs_addrs(
     outputs: &[crate::engine::driver::targetdef::Output],
-) -> rustc_hash::FxHashSet<hbuiltins::pluginfs::FsPathKey> {
+) -> rustc_hash::FxHashSet<Addr> {
     use crate::engine::driver::targetdef::path::CodegenMode;
 
     outputs
         .iter()
         .flat_map(|o| o.paths.iter())
         .filter(|p| matches!(p.codegen_tree, CodegenMode::InPlace))
-        .filter_map(|p| hbuiltins::pluginfs::fs_path_key(&hbuiltins::pluginfs::output_fs_addr(p)))
+        .map(|p| hbuiltins::pluginfs::output_fs_addr(&p.content))
         .collect()
 }
 
-/// The hashed inputs of a target that read one of its `in_place` outputs,
-/// paired on `(kind, path)` (see [`in_place_fs_keys`]), never on raw `Addr`
-/// equality. An in_place output the target never read is not something it
-/// transformed, so it is not watched.
+/// The hashed inputs of a target that read one of its `in_place` outputs (see
+/// [`in_place_fs_addrs`]). An in_place output the target never read is not
+/// something it transformed, so it is not watched.
 fn in_place_watched_inputs(
     outputs: &[crate::engine::driver::targetdef::Output],
     inputs: &[crate::engine::driver::targetdef::Input],
 ) -> Vec<Addr> {
-    let guarded = in_place_fs_keys(outputs);
+    let guarded = in_place_fs_addrs(outputs);
     if guarded.is_empty() {
         return Vec::new();
     }
     inputs
         .iter()
-        .filter(|i| {
-            i.hashed
-                && hbuiltins::pluginfs::fs_path_key(&i.r#ref.r#ref)
-                    .is_some_and(|k| guarded.contains(&k))
-        })
+        .filter(|i| i.hashed && guarded.contains(&i.r#ref.r#ref))
         .map(|i| i.r#ref.r#ref.clone())
         .collect()
 }
@@ -13469,16 +13460,14 @@ mod tests {
         Ok(())
     }
 
-    /// The in-place guard pairs an `in_place` output with the inputs that read
-    /// it on `(kind, path)`, never raw `Addr` equality (Decision 25): a strict
-    /// `file` and a lenient `copy_output` over the output's path both pair, so
-    /// a strict/lenient mismatch cannot silently skip the guard. An unhashed
-    /// input, another path, and a glob that is not the output's glob do not.
+    /// The in-place guard watches the hashed inputs that read an `in_place`
+    /// output's own addr. An unhashed input, another path, a glob that is not
+    /// the output's glob, and a `copy` output do not pair.
     #[test]
-    fn in_place_pairing_by_kind_and_path() {
+    fn in_place_pairing_by_addr() {
         use crate::engine::driver::targetdef::path::{CodegenMode, Content, Path};
         use crate::engine::driver::targetdef::{Input, InputMode, Output};
-        use hbuiltins::pluginfs::{copy_output_addr, file_addr, glob_addr};
+        use hbuiltins::pluginfs::{file_addr, glob_addr};
 
         let path = |content, codegen_tree| Path {
             content,
@@ -13508,12 +13497,11 @@ mod tests {
         };
         let inputs = vec![
             input(file_addr("pkg/a.go"), true),
-            input(copy_output_addr("pkg/a.go"), true),
             input(file_addr("pkg/a.go"), false),
             input(file_addr("pkg/b.go"), true),
             input(glob_addr("pkg/*.txt", &[]), true),
             input(glob_addr("pkg/*.txt", &["pkg/x.txt"]), true),
-            input(copy_output_addr("pkg/c.go"), true),
+            input(file_addr("pkg/c.go"), true),
         ];
 
         let watched: Vec<String> = in_place_watched_inputs(&outputs, &inputs)
@@ -13524,7 +13512,6 @@ mod tests {
             watched,
             vec![
                 file_addr("pkg/a.go").format(),
-                copy_output_addr("pkg/a.go").format(),
                 glob_addr("pkg/*.txt", &[]).format(),
             ],
         );

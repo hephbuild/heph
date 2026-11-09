@@ -124,72 +124,21 @@ pub fn glob_addr(pattern: &str, exclude: &[&str]) -> Addr {
     Addr::new(PkgBuf::from(PKG), "glob".to_string(), args)
 }
 
-/// The `Addr` of the lenient single-file fs target over a `copy` target's own
-/// output, `//@heph/fs:copy_output@f=<path>` (Decision 25): an excluded path
-/// is zero artifacts, with no error and no warning; any other path is the
-/// file, as with [`file_addr`]. Only the engine's `introspect:outputs`
-/// expansion emits it (through [`output_fs_addr`]).
-pub fn copy_output_addr(path: &str) -> Addr {
-    Addr::new(
-        PkgBuf::from(PKG),
-        COPY_OUTPUT.to_string(),
-        BTreeMap::from([("f".to_string(), path.to_string())]),
-    )
-}
-
-const COPY_OUTPUT: &str = "copy_output";
-
-/// The fs addr reading an output path: [`copy_output_addr`] for a `copy`
-/// target's `FilePath`, strict [`file_addr`] for any other file (an
-/// `in_place` output included), a glob for a glob or a directory. The one
-/// mapping both `introspect:outputs` and the in-place guard use.
-pub fn output_fs_addr(path: &Path) -> Addr {
-    match &path.content {
-        PathContent::FilePath(p) if matches!(path.codegen_tree, CodegenMode::Copy) => {
-            copy_output_addr(p)
-        }
+/// The fs addr reading an output path: [`file_addr`] for a file, a glob for a
+/// glob or a directory. The one mapping both `introspect:outputs` and the
+/// in-place guard use, so an `in_place` output and the input that reads it
+/// land on the same addr.
+pub fn output_fs_addr(content: &PathContent) -> Addr {
+    match content {
         PathContent::FilePath(p) => file_addr(p),
         PathContent::Glob(p) => glob_addr(p, &[]),
         PathContent::DirPath(p) => glob_addr(&format!("{}/**/*", p.trim_end_matches('/')), &[]),
     }
 }
 
-/// What an fs addr reads, independent of how strictly: `file` and
-/// `copy_output` over one path are one [`FsPathKey::File`]. Pairing on this,
-/// never on raw `Addr` equality, keeps a strict/lenient mismatch from
-/// silently skipping a guard.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum FsPathKey {
-    File(String),
-    Glob {
-        pattern: String,
-        exclude: Option<String>,
-    },
-}
-
-/// The [`FsPathKey`] of an fs addr; `None` for any other addr.
-pub fn fs_path_key(addr: &Addr) -> Option<FsPathKey> {
-    if !is_fs_addr(addr) {
-        return None;
-    }
-    match addr.name.as_str() {
-        "file" | COPY_OUTPUT => addr.args.get("f").cloned().map(FsPathKey::File),
-        "glob" => addr.args.get("p").map(|p| FsPathKey::Glob {
-            pattern: p.clone(),
-            exclude: addr.args.get("e").cloned(),
-        }),
-        _ => None,
-    }
-}
-
 /// Returns `true` if `addr` refers to a single-file fs target.
 pub fn is_file_addr(addr: &Addr) -> bool {
     addr.package.as_str() == PKG && addr.name == "file"
-}
-
-/// Returns `true` if `addr` is the lenient [`copy_output_addr`] target.
-pub fn is_copy_output_addr(addr: &Addr) -> bool {
-    addr.package.as_str() == PKG && addr.name == COPY_OUTPUT
 }
 
 /// Returns `true` if `addr` refers to a glob fs target.
@@ -261,7 +210,7 @@ impl EProvider for Provider {
             }
 
             match req.addr.name.as_str() {
-                "file" | "glob" | COPY_OUTPUT => {}
+                "file" | "glob" => {}
                 _ => return Err(GetError::NotFound),
             }
 
@@ -878,8 +827,6 @@ fn cached_exclude_any(
 enum FsDef {
     File {
         path: String,
-        /// The lenient `copy_output` target rather than strict `file`.
-        copy_output: bool,
     },
     Glob {
         pattern: String,
@@ -1166,18 +1113,18 @@ fn memoize_glob_walk(
         .clone()
 }
 
-/// The single artifact of the fs `file` / `copy_output` target over `path`
-/// under `root`, or none for a path into a `.heph*` dir. Synchronous: one
-/// codegen index lookup, a stat and, on a walker miss, a full read and hash.
+/// The single artifact of the fs `file` target over `path` under `root`, or
+/// none for a path into a `.heph*` dir. Synchronous: one codegen index
+/// lookup, a stat and, on a walker miss, a full read and hash.
 ///
-/// A generated path is never re-read as raw source: `file` fails for one heph
+/// A generated path is never re-read as raw source: it fails for one heph
 /// recorded ([`CodegenFileError`]) and yields nothing for an unrecorded
-/// section match, with a warning; `copy_output` yields nothing, silently.
+/// section match, with a warning.
 fn file_artifacts(
     walker: &CachedWalker,
     root: &std::path::Path,
     path: &str,
-    codegen: (&FsCodegen, codegen::FileMode),
+    cg: &FsCodegen,
     request_id: &str,
 ) -> anyhow::Result<(Vec<OutputArtifact>, Option<codegen::FileWarning>)> {
     let abs = root.join(path);
@@ -1187,9 +1134,8 @@ fn file_artifacts(
     if resolves_into_heph_dir(&abs) {
         return Ok((vec![], None));
     }
-    let (cg, mode) = codegen;
     if let codegen::FileSource::Excluded { warning } =
-        codegen::file_is_source(cg, root, path, mode, Some(request_id))?
+        codegen::file_is_source(cg, root, path, Some(request_id))?
     {
         return Ok((vec![], warning));
     }
@@ -1326,24 +1272,14 @@ impl hplugin::driver::Driver for Driver {
             exclude_raw.split(',').map(str::to_owned).collect()
         };
 
-        // `copy_output` is `file` that never fails on a generated path; its own
-        // tag keeps every strict `file` key unchanged (Decision 25).
-        let copy_output = req.target_spec.addr.name == COPY_OUTPUT;
         let (def, outputs, hash) = match (file_path, glob_pattern) {
             (Some(path), _) => {
                 let mut h = Xxh3::new();
-                h.update(if copy_output {
-                    b"fs_copy_output".as_slice()
-                } else {
-                    b"fs_file".as_slice()
-                });
+                h.update(b"fs_file");
                 h.update(path.as_bytes());
                 let hash = format!("{:x}", h.digest()).into_bytes();
 
-                let def = FsDef::File {
-                    path: path.clone(),
-                    copy_output,
-                };
+                let def = FsDef::File { path: path.clone() };
                 let outputs = vec![Output {
                     group: "".to_string(),
                     paths: vec![Path {
@@ -1440,17 +1376,12 @@ impl hplugin::driver::Driver for Driver {
         // `hcore::blocking` job, so nothing here nests.
         let root = root.to_path_buf();
         match def {
-            FsDef::File { path, copy_output } => {
+            FsDef::File { path } => {
                 let path = path.clone();
-                let mode = if *copy_output {
-                    codegen::FileMode::CopyOutput
-                } else {
-                    codegen::FileMode::Strict
-                };
                 let request_id = req.request_id.clone();
                 let (artifacts, warning) = hcore::blocking::run(
                     enclose::enclose!((self.walker => walker, self.codegen => cg) move || {
-                        file_artifacts(&walker, &root, &path, (&cg, mode), &request_id)
+                        file_artifacts(&walker, &root, &path, &cg, &request_id)
                     }),
                 )
                 .await?;
@@ -2047,7 +1978,7 @@ mod tests {
         let def = res.target_def.def::<FsDef>();
         assert!(matches!(
             def,
-            FsDef::File { path, copy_output: false } if path == "src/main.rs"
+            FsDef::File { path } if path == "src/main.rs"
         ));
         assert!(!res.target_def.cache.enabled);
         assert!(!res.target_def.cache.remote_enabled);
@@ -3878,36 +3809,6 @@ mod tests {
             format!("{err:#}").contains("depend on //pkg:gen"),
             "{err:#}"
         );
-    }
-
-    /// The engine's `copy_output` over the same path is zero artifacts, with
-    /// no error; over a path the index does not exclude, it is the file.
-    #[tokio::test]
-    async fn test_driver_run_copy_output_of_recorded_codegen_yields_nothing() {
-        let tmp = tempdir().unwrap();
-        fs::write(tmp.path().join("generated.rs"), b"generated").unwrap();
-        fs::write(tmp.path().join("plain.rs"), b"plain").unwrap();
-        let index = index_recording(tmp.path(), "generated.rs", "//pkg:gen");
-        let recorder = Arc::new(Recorder::default());
-        let driver = Driver::default().with_codegen(FsCodegen::new(
-            index,
-            Arc::clone(&recorder) as Arc<dyn CodegenReport>,
-        ));
-
-        let arts = run_fs(&driver, "copy_output", f_config("generated.rs"), tmp.path())
-            .await
-            .unwrap();
-        assert!(
-            arts.is_empty(),
-            "copy_output of a recorded path yields nothing"
-        );
-        assert!(recorder.events.lock().is_empty(), "copy_output is silent");
-
-        let arts = run_fs(&driver, "copy_output", f_config("plain.rs"), tmp.path())
-            .await
-            .unwrap();
-        assert_eq!(arts.len(), 1);
-        assert_eq!(arts[0].name, "plain.rs");
     }
 
     #[tokio::test]

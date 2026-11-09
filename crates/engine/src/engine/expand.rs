@@ -49,7 +49,9 @@ fn introspect_input(fs_addr: Addr, template: &Input) -> Input {
 }
 
 /// Expands the `//@heph/introspect:outputs` magic input into one `@heph/fs`
-/// input per declared output path of `outputs`.
+/// input per declared output path of `outputs`, `codegen = "copy"` paths
+/// excepted: those are generated, not source, so a target never reads (or
+/// hashes) its own previous output.
 ///
 /// Output path strings are already root-relative: the exec driver prepends the
 /// owning package to each declared `out` entry (`spec_path_to_target_path`), so
@@ -67,12 +69,14 @@ fn synthesized_fs_inputs(
 ) -> Vec<Input> {
     let mut seen = FxHashSet::default();
     let mut out = Vec::new();
+    use crate::engine::driver::targetdef::path::CodegenMode;
+
     for output in outputs {
         for path in &output.paths {
-            // A `copy` target's own `FilePath` output reads through the
-            // lenient `copy_output` target: an excluded path (its previous
-            // output) is zero artifacts, never its bytes (Decision 25).
-            let fs_addr = hbuiltins::pluginfs::output_fs_addr(path);
+            if matches!(path.codegen_tree, CodegenMode::Copy) {
+                continue;
+            }
+            let fs_addr = hbuiltins::pluginfs::output_fs_addr(&path.content);
             if seen.insert(fs_addr.clone()) {
                 out.push(introspect_input(fs_addr, template));
             }
@@ -599,12 +603,10 @@ mod tests {
         Ok(())
     }
 
-    // A `copy` target's own FilePath output reads through the lenient
-    // `copy_output` fs target, never strict `file` (Decision 25, E15): its
-    // previous output is excluded, and must resolve to nothing, not fail. A
-    // glob output is the plain glob either way.
+    // A `copy` target's outputs are generated, not source: `introspect:outputs`
+    // lists none of them, file or glob.
     #[tokio::test]
-    async fn introspect_outputs_of_a_copy_target_use_copy_output() -> anyhow::Result<()> {
+    async fn introspect_outputs_skips_copy_outputs() -> anyhow::Result<()> {
         let mut spec = introspect_exec_spec(
             "//pkg:gen",
             &["*.go", "foo.txt"],
@@ -619,13 +621,7 @@ mod tests {
         let expanded = Arc::clone(&engine).expanded_inputs_for(rs, &addr).await?;
         let addrs: Vec<String> = expanded.iter().map(|i| i.r#ref.r#ref.format()).collect();
 
-        assert_eq!(
-            addrs,
-            vec![
-                hbuiltins::pluginfs::glob_addr("pkg/*.go", &[]).format(),
-                hbuiltins::pluginfs::copy_output_addr("pkg/foo.txt").format(),
-            ],
-        );
+        assert_eq!(addrs, Vec::<String>::new());
         Ok(())
     }
 }
