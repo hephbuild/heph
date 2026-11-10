@@ -5,6 +5,7 @@
     reason = "restriction/style lints scoped to production code; tests are exempt"
 )]
 
+use crate::codegen_index_write::{copy_target, must_row, run_on, status};
 use crate::common;
 
 use common::Workspace;
@@ -14,6 +15,7 @@ use heph::engine::{
     Engine, HomeDir, InteractiveInner, InteractiveWrapper, OutputMatcher, ResultOptions,
 };
 use heph::htaddr::parse_addr;
+use heph::htwalk::codegen_index::{RowState, StatusKind};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -398,6 +400,89 @@ async fn write_back_on_failure_respects_moved_source_guard() -> anyhow::Result<(
         failed.of(ADDR).fixes,
         Some(FailureFixes::NotWritten(FixesNotWritten::MovedSource))
     );
+    Ok(())
+}
+
+/// The write-back on failure reads the codegen index as a passing one does:
+/// a path another target recorded as its `copy` output is left to its owner
+/// (the file and its row untouched), while the target's source is fixed. An
+/// `in_place` file is a source, so the fixed one is read as source after the
+/// failure exactly as after a pass.
+#[tokio::test]
+async fn write_back_on_failure_leaves_another_targets_recorded_path() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "p",
+        &format!(
+            "{}{}",
+            copy_target("gen", "gen.txt", "generated"),
+            r#"
+target(
+    name = "fmt",
+    driver = "bash",
+    out = ["gen.txt", "src.txt"],
+    codegen = "in_place",
+    run = "printf FORMATTED > gen.txt; printf FORMATTED > src.txt; exit 1",
+)
+"#
+        ),
+    );
+    ws.write_file("p/src.txt", "unformatted");
+    run_on(&ws.engine, "//p:gen").await?;
+
+    let failed = resolve_failing(&ws.engine, "//p:fmt", &ResultOptions::default()).await?;
+    assert_eq!(read(&ws, "p/src.txt"), "FORMATTED", "{}", failed.error);
+    assert_eq!(
+        read(&ws, "p/gen.txt"),
+        "generated",
+        "another target's recorded file is its owner's, on failure too"
+    );
+    assert_eq!(
+        failed.of("//p:fmt").fixes,
+        written(
+            &["p/src.txt"],
+            Some(slot_dir(&ws.engine, "//p:fmt").join("fixes.txt"))
+        )
+    );
+    let row = must_row(&ws.engine, "p/gen.txt")?;
+    assert_eq!(row.addr, "//p:gen", "{row:?}");
+    assert_eq!(row.state, RowState::Written, "{row:?}");
+    assert_eq!(status(&ws.engine, "p/gen.txt")?.0, StatusKind::Generated);
+    assert_eq!(status(&ws.engine, "p/src.txt")?.0, StatusKind::Source);
+    Ok(())
+}
+
+/// A target switched from `copy` to `in_place` refuses, on failure as on a
+/// pass, to rewrite a path recorded as its own `copy` output: the file is
+/// untouched and the refusal, naming `codegen keep`, joins the tool's error.
+#[tokio::test]
+async fn write_back_on_failure_refuses_own_recorded_path() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file("p", &copy_target("t", "src.txt", "generated"));
+    run_on(&ws.engine, "//p:t").await?;
+
+    ws.write_build_file(
+        "p",
+        r#"
+target(
+    name = "t",
+    driver = "bash",
+    out = "src.txt",
+    codegen = "in_place",
+    run = "printf FORMATTED > $OUT; exit 1",
+)
+"#,
+    );
+    let e2 = ws.reopen()?;
+    let failed = resolve_failing(&e2, "//p:t", &ResultOptions::default()).await?;
+    assert_eq!(read(&ws, "p/src.txt"), "generated");
+    assert!(
+        failed.error.contains("codegen keep") && failed.error.contains("p/src.txt"),
+        "the refusal names the path and the way out: {}",
+        failed.error
+    );
+    assert_eq!(failed.of("//p:t").fixes, None);
+    assert_eq!(must_row(&e2, "p/src.txt")?.addr, "//p:t");
     Ok(())
 }
 
