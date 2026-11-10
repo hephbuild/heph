@@ -505,12 +505,20 @@ pub const WRITE_BACK_TAR_PREFIX: &str = "writeback-";
 /// run never wrote is skipped, so a fixer that died before one file keeps
 /// every other fix. A path that exists with the wrong kind is still an error.
 /// A group none of whose paths exist packs nothing.
+///
+/// A file `excluded` matches (the target's `failure_out`) is never packed: a
+/// diagnostic is kept in the failure slot, and must not land in the tree as
+/// an input other targets key on. `stop` is polled per file, as
+/// [`collect_outputs`] polls it.
 pub(crate) fn collect_write_back_inner(
     target_outputs: &[hplugin::driver::targetdef::Output],
+    excluded: &crate::failure_out::FailureOutMatch,
     hashin: &str,
     ws_dir: &Path,
     sandbox_dir: &Path,
+    stop: &dyn Fn() -> bool,
 ) -> anyhow::Result<Vec<outputartifact::OutputArtifact>> {
+    let skip = |rel: &Path| excluded.matches(rel);
     let prefixed = format!("{WRITE_BACK_TAR_PREFIX}{hashin}");
     let mut artifacts = Vec::new();
     for output in target_outputs {
@@ -534,18 +542,21 @@ pub(crate) fn collect_write_back_inner(
                     }
                 }
             }
-            add_path_to_tar(
+            add_path_to_tar_except(
                 tar.get_or_insert_with(hartifactcontent::tar::TarPacker::new),
                 ws_dir,
+                None,
                 path,
                 &output.group,
-                &|| false,
+                stop,
+                &skip,
             )?;
         }
         let Some(tar) = tar else {
             continue;
         };
-        let (tarpath, hashout) = pack_to_artifact_tar(sandbox_dir, &prefixed, &output.group, tar, &|| false)?;
+        let (tarpath, hashout) =
+            pack_to_artifact_tar(sandbox_dir, &prefixed, &output.group, tar, stop)?;
         artifacts.push(outputartifact::OutputArtifact {
             group: output.group.clone(),
             name: format!("{}.tar", output.group),
@@ -882,11 +893,28 @@ fn add_path_to_tar(
     group_for_err: &str,
     stop: &dyn Fn() -> bool,
 ) -> anyhow::Result<()> {
+    add_path_to_tar_except(tar, ws_dir, stage_dir, path, group_for_err, stop, &|_| false)
+}
+
+/// [`add_path_to_tar`], leaving out every file whose workspace-relative path
+/// `skip` reads true for.
+fn add_path_to_tar_except(
+    tar: &mut hartifactcontent::tar::TarPacker,
+    ws_dir: &Path,
+    stage_dir: Option<&Path>,
+    path: &path::Path,
+    group_for_err: &str,
+    stop: &dyn Fn() -> bool,
+    skip: &dyn Fn(&Path) -> bool,
+) -> anyhow::Result<()> {
     if stop() {
         return Err(crate::stop::cancelled());
     }
     match &path.content {
         Content::FilePath(fp) => {
+            if skip(Path::new(fp)) {
+                return Ok(());
+            }
             // Not read through a linked ancestor (hephbuild/heph#563), as a
             // glob would not be; see `output_glob`.
             crate::output_glob::check_declared_path(ws_dir, fp, stage_dir)
@@ -943,15 +971,14 @@ fn add_path_to_tar(
                 })?;
                 let ft = entry.file_type();
                 if ft.is_file() || ft.is_symlink() {
+                    let rel = entry.path().strip_prefix(ws_dir).with_context(|| {
+                        format!("strip ws prefix from {:?} (ws={:?})", entry.path(), ws_dir)
+                    })?;
+                    if skip(rel) {
+                        continue;
+                    }
+                    let rel = rel.to_string_lossy().into_owned();
                     let source = entry.path().to_string_lossy().into_owned();
-                    let rel = entry
-                        .path()
-                        .strip_prefix(ws_dir)
-                        .with_context(|| {
-                            format!("strip ws prefix from {:?} (ws={:?})", entry.path(), ws_dir)
-                        })?
-                        .to_string_lossy()
-                        .into_owned();
                     tar.create_file(source, rel);
                 }
             }
@@ -974,17 +1001,17 @@ fn add_path_to_tar(
                 })?;
                 let ft = md.file_type();
                 if ft.is_file() || ft.is_symlink() {
+                    let rel = matched.strip_prefix(ws_dir).with_context(|| {
+                        format!(
+                            "strip ws prefix from glob match {:?} (ws={:?})",
+                            matched, ws_dir
+                        )
+                    })?;
+                    if skip(rel) {
+                        continue;
+                    }
+                    let rel = rel.to_string_lossy().into_owned();
                     let source = matched.to_string_lossy().into_owned();
-                    let rel = matched
-                        .strip_prefix(ws_dir)
-                        .with_context(|| {
-                            format!(
-                                "strip ws prefix from glob match {:?} (ws={:?})",
-                                matched, ws_dir
-                            )
-                        })?
-                        .to_string_lossy()
-                        .into_owned();
                     tar.create_file(source, rel);
                 }
             }

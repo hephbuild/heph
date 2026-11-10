@@ -33,6 +33,8 @@ impl ManagedDriverFuse {
         ctoken: &(dyn Cancellable + Send + Sync),
         shell: bool,
     ) -> anyhow::Result<RunResponse> {
+        // First: the engine's `timeout` clock covers staging too.
+        let clock = hdriver_support::failure_out::RunClock::start(req.target);
         // Redirect sandbox_dir from `<home>/sandbox/...` to
         // `<fuse_lower>/...` so all writes go through the FUSE mount.
         let plain_sandbox_dir = req.sandbox_dir.clone();
@@ -184,6 +186,7 @@ impl ManagedDriverFuse {
                     &target.failure_outputs,
                     shell,
                     ctoken,
+                    clock.timed_out(ctoken),
                     &ws_dir,
                     &plain_sandbox_dir,
                     &[],
@@ -448,6 +451,7 @@ mod tests {
             _: &(dyn Cancellable + Send + Sync),
         ) -> anyhow::Result<hdriver_support::driver_managed::ManagedRunResponse> {
             fs::write(req.sandbox_pkg_dir.join("report.txt"), "report")?;
+            fs::write(req.sandbox_pkg_dir.join("fix.txt"), "fix")?;
             Err(anyhow::Error::new(hplugin::error::ProcessFailed::new(
                 "exit status: 1",
                 Some(hplugin::error::Exit::Code(1)),
@@ -489,6 +493,18 @@ mod tests {
                     "app/report.txt".to_string(),
                 )],
             }],
+            outputs: vec![hplugin::driver::targetdef::Output {
+                group: String::new(),
+                paths: vec![hplugin::driver::targetdef::path::Path {
+                    content: hplugin::driver::targetdef::path::Content::FilePath(
+                        "app/fix.txt".to_string(),
+                    ),
+                    codegen_tree: hplugin::driver::targetdef::path::CodegenMode::InPlace {
+                        write_on_failure: true,
+                    },
+                    collect: true,
+                }],
+            }],
             ..Default::default()
         };
         let id = "t".to_string();
@@ -503,6 +519,25 @@ mod tests {
             Some(staged.clone())
         );
         assert_eq!(fs::read_to_string(staged.join("app/report.txt"))?, "report");
+        // The `in_place` fixes are packed under the plain sandbox dir too, as
+        // a `writeback-` tar that outlives the slot.
+        let write_back = hplugin::error::failure_write_back(&err).expect("fixes collected");
+        let [art] = write_back.0.as_slice() else {
+            anyhow::bail!("one write-back tar: {:?}", write_back);
+        };
+        let hplugin::driver::outputartifact::Content::TarPath(tar) = &art.content else {
+            anyhow::bail!("a tar: {:?}", write_back);
+        };
+        let tar = PathBuf::from(&tar.path);
+        assert!(tar.starts_with(&plain), "{}", tar.display());
+        assert!(
+            tar.file_name().and_then(|n| n.to_str()).is_some_and(
+                |n| n.starts_with(hdriver_support::driver_managed::WRITE_BACK_TAR_PREFIX)
+            ),
+            "{}",
+            tar.display()
+        );
+        assert!(tar.is_file(), "{}", tar.display());
         assert!(
             dir.path()
                 .join("lower/app/__target_t/ws/app/report.txt")

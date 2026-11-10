@@ -45,6 +45,8 @@ impl ManagedDriverOs {
         ctoken: &(dyn Cancellable + Send + Sync),
         shell: bool,
     ) -> anyhow::Result<RunResponse> {
+        // First: the engine's `timeout` clock covers staging too.
+        let clock = crate::failure_out::RunClock::start(req.target);
         let sandbox_dir = req.sandbox_dir.clone();
         let cleanup_dir = sandbox_dir.clone();
         let mut sandbox_cleanup: Option<hplugin::driver::SandboxCleanupJob> =
@@ -181,6 +183,7 @@ impl ManagedDriverOs {
                     &target.failure_outputs,
                     shell,
                     ctoken,
+                    clock.timed_out(ctoken),
                     &ws_dir,
                     &sandbox_dir,
                     self.stage_dir.as_slice(),
@@ -313,6 +316,89 @@ mod tests {
         }
     }
 
+    /// A token that reads cancelled once `0` exists: a cancellation that
+    /// lands while the run is running, after it wrote that file.
+    struct CancelledOnceExists(std::path::PathBuf);
+
+    impl Cancellable for CancelledOnceExists {
+        fn is_cancelled(&self) -> bool {
+            self.0.exists()
+        }
+        fn cancelled(
+            &self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            Box::pin(async move {
+                while !self.0.exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+        }
+        fn clone_arc(&self) -> Arc<dyn Cancellable + Send + Sync> {
+            Arc::new(Self(self.0.clone()))
+        }
+    }
+
+    /// A run cancelled by its own `timeout` keeps its `failure_out` with no
+    /// process exit behind it, and writes nothing back; one cancelled short
+    /// of its limit keeps nothing.
+    #[tokio::test]
+    async fn timeout_keeps_failure_out_and_writes_nothing_back() -> anyhow::Result<()> {
+        use hplugin::driver::targetdef::path::{CodegenMode, Content, Path as DefPath};
+        let tmp = tempfile::tempdir()?;
+        let stage = tmp.path().join("stage");
+        let id = "t".to_string();
+        let cancelled: fn() -> anyhow::Error = || anyhow::anyhow!("cancelled");
+        let run = |name: &'static str, timeout: std::time::Duration| {
+            let sandbox = tmp.path().join(name);
+            let os = os_failing(Some(cancelled), &stage);
+            let id = &id;
+            async move {
+                let mut target = keeps_report();
+                target.timeout = Some(hplugin::driver::Timeout::new(timeout)?);
+                target.outputs = vec![hplugin::driver::targetdef::Output {
+                    group: String::new(),
+                    paths: vec![DefPath {
+                        content: Content::FilePath("app/report.txt".to_string()),
+                        codegen_tree: CodegenMode::InPlace {
+                            write_on_failure: true,
+                        },
+                        collect: true,
+                    }],
+                }];
+                let ct = CancelledOnceExists(sandbox.join("ws/app/report.txt"));
+                let req = RunRequest::new(id, &target, sandbox.clone());
+                let Err(err) = os.run_inner(req, &ct, false).await else {
+                    anyhow::bail!("{name}: the run must fail");
+                };
+                anyhow::Ok((err, sandbox))
+            }
+        };
+
+        // At its limit (well within the slack): a timeout.
+        let (err, sandbox) = run("timed-out", std::time::Duration::from_millis(1)).await?;
+        let staged = sandbox.join(crate::failure_out::FAILURE_OUT_STAGING);
+        assert_eq!(
+            hplugin::error::failure_out_dir(&err).map(std::path::PathBuf::from),
+            Some(staged.clone())
+        );
+        assert_eq!(fs::read_to_string(staged.join("app/report.txt"))?, "report");
+        assert!(
+            hplugin::error::failure_write_back(&err).is_none(),
+            "a timeout writes nothing back"
+        );
+
+        // An hour short of its limit: the request's cancellation.
+        let (err, sandbox) = run("cancelled", std::time::Duration::from_secs(3600)).await?;
+        assert_eq!(hplugin::error::failure_out_dir(&err), None);
+        assert!(
+            !sandbox
+                .join(crate::failure_out::FAILURE_OUT_STAGING)
+                .exists()
+        );
+        assert!(hplugin::error::failure_write_back(&err).is_none());
+        Ok(())
+    }
+
     /// A def in `//app` that keeps `app/report.txt` on failure.
     fn keeps_report() -> TargetDef {
         TargetDef {
@@ -350,12 +436,15 @@ mod tests {
             let target = &target;
             let id = &id;
             async move {
-                let ct = StdCancellationToken::new();
-                if cancel {
-                    ct.cancel();
-                }
+                // Cancelled once the run has written its report: staging
+                // stops on a token cancelled up front, before the run.
+                let ct: Arc<dyn Cancellable + Send + Sync> = if cancel {
+                    Arc::new(CancelledOnceExists(sandbox.join("ws/app/report.txt")))
+                } else {
+                    Arc::new(StdCancellationToken::new())
+                };
                 let req = RunRequest::new(id, target, sandbox.clone());
-                let err = match os.run_inner(req, &ct, shell).await {
+                let err = match os.run_inner(req, &*ct, shell).await {
                     Ok(_) => anyhow::bail!("{name}: the run must fail"),
                     Err(e) => e,
                 };

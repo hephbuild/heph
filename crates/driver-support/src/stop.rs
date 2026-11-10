@@ -55,11 +55,38 @@ where
     if ctoken.is_cancelled() {
         return Err(cancelled());
     }
-    let token = ctoken.clone_arc();
+    run_with(Some(ctoken.clone_arc()), f).await
+}
+
+/// [`run_blocking`] for a job that must outlive its run's cancellation: its
+/// `stop` reads true only once this future is dropped.
+///
+/// For the work a run does *because* it was cancelled at its `timeout`
+/// (keeping its `failure_out`): the token is already cancelled, and the engine
+/// waits out its grace for exactly this. Dropped — the grace ran out, or the
+/// request went away — the job stops between units as any other does.
+pub async fn run_blocking_until_dropped<R, F>(f: F) -> anyhow::Result<R>
+where
+    R: Send + 'static,
+    F: FnOnce(&(dyn Fn() -> bool + Sync)) -> anyhow::Result<R> + Send + 'static,
+{
+    run_with(None, f).await
+}
+
+async fn run_with<R, F>(
+    token: Option<Arc<dyn Cancellable + Send + Sync>>,
+    f: F,
+) -> anyhow::Result<R>
+where
+    R: Send + 'static,
+    F: FnOnce(&(dyn Fn() -> bool + Sync)) -> anyhow::Result<R> + Send + 'static,
+{
     let abandoned = Arc::new(AtomicBool::new(false));
     let _abandon = AbandonOnDrop(Arc::clone(&abandoned));
     hcore::blocking::run(move || {
-        let stop = || abandoned.load(Ordering::Acquire) || token.is_cancelled();
+        let stop = || {
+            abandoned.load(Ordering::Acquire) || token.as_ref().is_some_and(|t| t.is_cancelled())
+        };
         f(&stop).map_err(|e| {
             if stop() && !hplugin::error::is_cancelled(&e) {
                 e.context(CancelledError)
@@ -124,5 +151,43 @@ mod tests {
         .expect_err("cancelled");
         assert!(hplugin::error::is_cancelled(&err), "{err:#}");
         assert!(format!("{err:#}").contains("unpack stopped"), "{err:#}");
+    }
+
+    /// A job that outlives cancellation ignores the token, and stops once its
+    /// caller is dropped.
+    #[tokio::test]
+    async fn until_dropped_ignores_the_token_and_stops_on_drop() {
+        let ct = StdCancellationToken::new();
+        ct.cancel();
+        let v = run_blocking_until_dropped(|stop| {
+            assert!(!stop(), "a cancelled token does not stop it");
+            Ok(7)
+        })
+        .await
+        .expect("runs");
+        assert_eq!(v, 7);
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (saw_tx, saw_rx) = std::sync::mpsc::channel();
+        let fut = run_blocking_until_dropped(move |stop| -> anyhow::Result<()> {
+            started_tx.send(()).expect("send");
+            while !stop() {
+                std::thread::yield_now();
+            }
+            saw_tx.send(()).expect("send");
+            Err(cancelled())
+        });
+        let handle = tokio::spawn(fut);
+        tokio::task::spawn_blocking(move || started_rx.recv().expect("started"))
+            .await
+            .expect("join");
+        handle.abort();
+        tokio::task::spawn_blocking(move || {
+            saw_rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the dropped job saw its stop")
+        })
+        .await
+        .expect("join");
     }
 }
