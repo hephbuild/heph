@@ -693,6 +693,12 @@ mod tests {
                 assert!(msg.contains(why), "{raw:?}: {msg}");
                 assert!(msg.contains("failure_out"), "names the field: {msg}");
                 assert!(msg.contains(&format!("{raw:?}")), "names the path: {msg}");
+                if *why == "package root" {
+                    assert!(
+                        msg.contains("\"test-results/\""),
+                        "says what to write: {msg}"
+                    );
+                }
             }
         }
         // A group is named in the error.
