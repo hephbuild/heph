@@ -13,6 +13,10 @@
 //! manifest: a slot holds a log, an `out/`, or both. A failed move of `out/`
 //! keeps the log slot and records why ([`FailureSlot::out_error`]).
 //!
+//! When a failed `in_place` run's fixes were written back over the tree, the
+//! slot also holds `fixes.txt` ([`FIXES`]): every path written, one per line,
+//! workspace-relative. Another additive sibling under the same manifest.
+//!
 //! **Diagnostics only.** Nothing that hashes, selects content or stages into a
 //! sandbox ever reads a slot, and a slot is never a cache entry: it is not in the
 //! local cache, never uploaded, never part of any key. A slot that changes or
@@ -57,6 +61,9 @@ const MANIFEST: &str = "manifest.json";
 pub const LOG: &str = "log.txt";
 /// The kept `failure_out` matches, inside a slot, by workspace-relative path.
 pub const OUT: &str = "out";
+/// Every path a failed `in_place` run wrote back over the tree, one per line,
+/// workspace-relative (D21): the full list past the failure box's truncation.
+pub const FIXES: &str = "fixes.txt";
 const MANIFEST_VERSION: u32 = 1;
 /// Bytes of the readable part of a key.
 const READABLE_MAX: usize = 48;
@@ -133,6 +140,9 @@ pub struct FailureSlot {
     /// Why the run's `failure_out` matches were not kept, when keeping them
     /// failed: the target's error carries it as one context line.
     pub out_error: Option<String>,
+    /// What the run's `in_place` write-back on failure did, with the slot's
+    /// `fixes.txt` filled in when it was kept.
+    pub fixes: Option<hplugin::error::FailureFixes>,
 }
 
 impl fmt::Display for FailureSlot {
@@ -162,6 +172,9 @@ pub(crate) struct Fill<'a> {
     /// The target's outputs are credential material: the log's tail stays in
     /// memory and the slot gets `out/` only.
     pub material: bool,
+    /// What the run's `in_place` write-back on failure did. Written paths
+    /// become the slot's `fixes.txt`.
+    pub fixes: Option<hplugin::error::FailureFixes>,
 }
 
 /// The slots of one home, as one engine sees them.
@@ -265,8 +278,16 @@ impl FailureSlots {
     async fn fill_with(&self, fill: Fill<'_>, ops: SlotIo) -> FailureSlot {
         let source = select_log(fill.addr, fill.err);
         let out = hplugin::error::failure_out_dir(fill.err).map(PathBuf::from);
-        if source.is_none() && out.is_none() {
-            return FailureSlot::default();
+        let mut fixes = fill.fixes;
+        let written: Vec<String> = match &fixes {
+            Some(hplugin::error::FailureFixes::Written { paths, .. }) => paths.clone(),
+            _ => Vec::new(),
+        };
+        if source.is_none() && out.is_none() && written.is_empty() {
+            return FailureSlot {
+                fixes,
+                ..FailureSlot::default()
+            };
         }
         let key = addr_key(fill.addr);
         let manifest = SlotManifest {
@@ -305,7 +326,7 @@ impl FailureSlots {
                 Some(s) if material => (None, tail_of(&s)),
                 s => (s, None),
             };
-            if slot_log.is_none() && out.is_none() {
+            if slot_log.is_none() && out.is_none() && written.is_empty() {
                 return Filled {
                     log: memory,
                     ..Filled::default()
@@ -317,6 +338,7 @@ impl FailureSlots {
                 &manifest,
                 slot_log.as_ref(),
                 out.as_deref(),
+                &written,
                 ops,
             ) {
                 Ok(built) => {
@@ -331,6 +353,7 @@ impl FailureSlots {
                             .or(memory),
                         out: built.out,
                         out_error: built.out_error.map(|e| format!("{e:#}")),
+                        fixes: built.fixes,
                     }
                 }
                 Err(e) => {
@@ -355,10 +378,16 @@ impl FailureSlots {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .insert(key);
         }
+        if let (Some(hplugin::error::FailureFixes::Written { list, .. }), Some(path)) =
+            (fixes.as_mut(), filled.fixes)
+        {
+            *list = Some(path);
+        }
         FailureSlot {
             log: filled.log,
             out: filled.out,
             out_error: filled.out_error,
+            fixes,
         }
     }
 }
@@ -371,6 +400,8 @@ struct Filled {
     log: Option<FailureLog>,
     out: Option<PathBuf>,
     out_error: Option<String>,
+    /// The slot's `fixes.txt`, when one was written.
+    fixes: Option<PathBuf>,
 }
 
 /// The file operations a fill performs, injectable for tests.
@@ -539,6 +570,8 @@ struct Built {
     /// Why the staged directory was not moved in, when the slot was kept
     /// without it.
     out_error: Option<anyhow::Error>,
+    /// The slot's `fixes.txt`, when there were fixes to list.
+    fixes: Option<PathBuf>,
 }
 
 /// Build the slot `key` under `root` from `log` and the staged `failure_out`
@@ -555,6 +588,7 @@ fn fill_slot(
     manifest: &SlotManifest,
     log: Option<&LogSource>,
     out: Option<&Path>,
+    fixes: &[String],
     ops: SlotIo,
 ) -> anyhow::Result<Built> {
     use anyhow::Context as _;
@@ -599,6 +633,13 @@ fn fill_slot(
         }
         None => (false, None),
     };
+    let wrote_fixes = !fixes.is_empty();
+    if wrote_fixes {
+        let path = temp.path().join(FIXES);
+        let mut list = fixes.join("\n");
+        list.push('\n');
+        std::fs::write(&path, list).with_context(|| format!("writing {}", path.display()))?;
+    }
     // Last: a slot is complete exactly when its manifest exists.
     let json = serde_json::to_vec(manifest).context("encoding the failure manifest")?;
     let manifest_path = temp.path().join(MANIFEST);
@@ -624,6 +665,7 @@ fn fill_slot(
         log: log.map(|file| (dest.join(LOG), file)),
         out: moved.then(|| dest.join(OUT)),
         out_error,
+        fixes: wrote_fixes.then(|| dest.join(FIXES)),
     })
 }
 
@@ -685,13 +727,14 @@ pub fn read_manifest(dir: &Path, addr: &Addr) -> Option<SlotManifest> {
 
 /// The manifest of the slot at `dir`, if it is complete and of a version this
 /// heph reads, whichever address it names. What `heph tool gc` reads a slot
-/// it found by listing with. A complete slot holds a `log.txt`, an `out/`, or
-/// both.
+/// it found by listing with. A complete slot holds a `log.txt`, an `out/`, a
+/// `fixes.txt`, or any of them together.
 pub(crate) fn read_any_manifest(dir: &Path) -> Option<SlotManifest> {
     let bytes = std::fs::read(dir.join(MANIFEST)).ok()?;
     let m: SlotManifest = serde_json::from_slice(&bytes).ok()?;
-    (m.version == MANIFEST_VERSION && (dir.join(LOG).is_file() || dir.join(OUT).is_dir()))
-        .then_some(m)
+    (m.version == MANIFEST_VERSION
+        && (dir.join(LOG).is_file() || dir.join(OUT).is_dir() || dir.join(FIXES).is_file()))
+    .then_some(m)
 }
 
 /// Write a complete slot for `addr` under `root` by hand, as a fill would
@@ -885,6 +928,7 @@ mod tests {
             &manifest_for(&a),
             Some(&LogSource::Bytes(b"old\n".to_vec())),
             None,
+            &[],
             SlotIo::REAL,
         )
         .expect("first fill");
@@ -896,6 +940,7 @@ mod tests {
             &manifest_for(&a),
             Some(&LogSource::File(src)),
             None,
+            &[],
             SlotIo {
                 copy: |from, to| {
                     // Half a copy, then the disk fills.
@@ -929,6 +974,7 @@ mod tests {
             &manifest_for(&a),
             Some(&LogSource::File(src.clone())),
             None,
+            &[],
             SlotIo::REAL,
         )
         .expect("fill")
@@ -967,6 +1013,7 @@ mod tests {
                 err: &err,
                 lines: 10,
                 material: false,
+                fixes: None,
             })
             .await;
         slot.log.map(|l| l.tail().expect("tail").text)
@@ -1045,6 +1092,7 @@ mod tests {
                 err: &err,
                 lines: 10,
                 material: true,
+                fixes: None,
             })
             .await;
         let log = slot.log.expect("a tail");
@@ -1073,6 +1121,7 @@ mod tests {
                 err: &err,
                 lines: 10,
                 material: false,
+                fixes: None,
             })
             .await;
         let log = slot.log.clone().expect("the tail, in memory");
@@ -1116,10 +1165,69 @@ mod tests {
                     err,
                     lines: 10,
                     material,
+                    fixes: None,
                 },
                 ops,
             )
             .await
+    }
+
+    /// D21: the paths a failed `in_place` run wrote back land in `fixes.txt`,
+    /// one per line, and a slot holding only that list is still a slot. A
+    /// reason with no paths writes no file and fills no slot.
+    #[tokio::test]
+    async fn fills_fixes_txt() {
+        use hplugin::error::{FailureFixes, FixesNotWritten};
+        let home = tempfile::tempdir().expect("home");
+        let slots = FailureSlots::new(home.path());
+        let a = addr("//p:a");
+        let err = anyhow::anyhow!("boom");
+        let paths = vec!["p/a.go".to_owned(), "p/sub/b.go".to_owned()];
+        let slot = slots
+            .fill(Fill {
+                addr: &a,
+                hashin: "h",
+                roots: vec![],
+                err: &err,
+                lines: 10,
+                material: false,
+                fixes: Some(FailureFixes::Written {
+                    paths: paths.clone(),
+                    list: None,
+                }),
+            })
+            .await;
+        let dir = slots.slot_dir(&a);
+        assert_eq!(
+            slot.fixes,
+            Some(FailureFixes::Written {
+                paths,
+                list: Some(dir.join(FIXES)),
+            })
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join(FIXES)).expect("fixes.txt"),
+            "p/a.go\np/sub/b.go\n"
+        );
+        assert_eq!(slots.read(&a).map(|m| m.addr), Some(a.format()));
+
+        let b = addr("//p:b");
+        let slot = slots
+            .fill(Fill {
+                addr: &b,
+                hashin: "h",
+                roots: vec![],
+                err: &err,
+                lines: 10,
+                material: false,
+                fixes: Some(FailureFixes::NotWritten(FixesNotWritten::Frozen)),
+            })
+            .await;
+        assert_eq!(
+            slot.fixes,
+            Some(FailureFixes::NotWritten(FixesNotWritten::Frozen))
+        );
+        assert!(!slots.slot_dir(&b).exists());
     }
 
     /// D10: a slot with an `out/` and no log is a slot; I3: `clear` takes

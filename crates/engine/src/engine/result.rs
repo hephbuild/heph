@@ -674,6 +674,18 @@ impl ResultArtifact {
         }
     }
 
+    /// Wrap an artifact straight out of a run, never cached: the tars a
+    /// failed `in_place` run's write-back carries
+    /// ([`hplugin::error::FailureWriteBack`]), read over the tree while the
+    /// failed sandbox still holds them.
+    fn from_run(a: outputartifact::OutputArtifact) -> Self {
+        Self {
+            group: a.group.clone(),
+            r#type: manifest_artifact_type(&a.r#type),
+            content: Arc::new(a),
+        }
+    }
+
     /// Wrap a zero-copy passthrough output that skipped the local cache. The
     /// content reads the durable source file directly (no tar, no cache blob),
     /// and — because the file was never snapshotted into the cache — re-hashes
@@ -1191,6 +1203,17 @@ fn in_place_watched_inputs(
 /// content hashout ([`hwalk::bytes_hashout`]) of what it wrote there, or
 /// `None` for a recreated symlink. See [`Engine::materialize_codegen_tree`].
 type WrittenPaths = rustc_hash::FxHashMap<std::path::PathBuf, Option<String>>;
+
+/// What [`Engine::materialize_codegen_on_failure`] did.
+#[derive(Debug, Default)]
+pub(crate) struct WriteBackOnFailure {
+    /// For the failure box: the paths written, or why none were. `None` when
+    /// the target has no write-back on failure, or there was nothing to do.
+    pub fixes: Option<hplugin::error::FailureFixes>,
+    /// One line to join to the tool's error: the moved-source guard's refusal
+    /// (I5), or why the write failed (I7).
+    pub error: Option<String>,
+}
 
 /// An `@heph/fs` input's per-path hashouts in the form a dependent's `hashin`
 /// folds them (see `Engine::input_hashout`): sorted, comma-joined.
@@ -1918,12 +1941,15 @@ fn classify_failure(
     };
     let log_tail = log.as_ref().and_then(|l| l.tail().ok());
     let outputs = failure_slot_out(&e);
+    let fixes = downcast_chain_ref::<crate::engine::failure_slot::FailureSlot>(&e)
+        .and_then(|s| s.fixes.clone());
     rs.record_failure(
         addr.clone(),
         Arc::new(
             TargetFailure::new(addr.clone(), log_tail, e)
                 .with_log(log)
-                .with_outputs(outputs),
+                .with_outputs(outputs)
+                .with_fixes(fixes),
         ),
     );
     UpstreamFailed { root: addr.clone() }.into()
@@ -4073,21 +4099,7 @@ impl Engine {
             if !has_in_place {
                 return Ok(WrittenPaths::default());
             }
-            let none = rustc_hash::FxHashSet::default();
-            return hcore::blocking::run(move || {
-                let snap = index.snapshot()?;
-                Self::materialize_codegen_tree(
-                    &target,
-                    &cached,
-                    &root,
-                    &CodegenWrite {
-                        frozen: false,
-                        copy_writes: Some(&none),
-                        snapshot: Some(&snap),
-                    },
-                )
-            })
-            .await;
+            return self.write_in_place_only(target, cached).await;
         };
 
         if index.store().is_none() {
@@ -4161,6 +4173,207 @@ impl Engine {
             tracing::warn!(addr = %addr, files = outside_section, "{msg}");
         }
         Ok(written)
+    }
+
+    /// The byte mover for a write-back that records nothing in the codegen
+    /// index: every `copy` entry is left alone, and the `in_place` guard
+    /// ([`in_place_skips`]) reads a fresh snapshot, so a path another target
+    /// recorded is left to its owner and one recorded for this target is
+    /// refused. `in_place` files are sources, not generated files, so the
+    /// index has nothing to record for them (docs/CODEGEN.md). Shared by a
+    /// passing write-back with no `copy` entry to write and by the write-back
+    /// of a failed run, so the two cannot drift.
+    async fn write_in_place_only(
+        &self,
+        target: Arc<crate::engine::driver::targetdef::TargetDef>,
+        cached: Arc<Vec<ResultArtifact>>,
+    ) -> anyhow::Result<WrittenPaths> {
+        let root = self.cfg.root.clone();
+        let index = Arc::clone(&self.codegen_index);
+        hcore::blocking::run(move || {
+            let none = rustc_hash::FxHashSet::default();
+            let snap = index.snapshot()?;
+            Self::materialize_codegen_tree(
+                &target,
+                &cached,
+                &root,
+                &CodegenWrite {
+                    frozen: false,
+                    copy_writes: Some(&none),
+                    snapshot: Some(&snap),
+                },
+            )
+        })
+        .await
+    }
+
+    /// Write a failed `in_place` run's fixes back over the tree (D12, D15,
+    /// D16), from the [`FailureWriteBack`] the managed layer attached to `err`.
+    /// The target still fails (D3): this only decides what reaches the tree,
+    /// and reports it for the failure box.
+    ///
+    /// The engine's half of the D16 predicate, re-checked here because the
+    /// managed layer cannot see `--frozen` and is not to be trusted with the
+    /// tree: a target with a `write_on_failure` path, a process exit behind
+    /// `err`, not `--shell`, not hash-only, not cancelled. Then:
+    /// `--frozen`, a signal, or an exit code of 128 and above write nothing
+    /// and say why; an exit code from 1 to 127 writes.
+    ///
+    /// Entered through the **same** `mem_codegen_tree` cell as a passing
+    /// write-back, so one addr is written once per request whichever frame
+    /// gets there first — the "unavailable, rebuild" branch of
+    /// `execute_and_cache` included: when a passing frame already wrote, this
+    /// writes nothing and reports nothing. Inside, the same moved-source guard
+    /// ([`Self::check_in_place_inputs_unchanged`]) runs first; then
+    /// [`Self::materialize_codegen_tree`] over the run's tars. No cache write
+    /// and no fixpoint: a failed run recorded no revision (E1).
+    ///
+    /// Called from `execute`'s failure arm, after the sandbox was left for
+    /// diagnostics (which keeps the directory, so the tars are still there)
+    /// and before the slot is filled, which lists what was written in
+    /// `fixes.txt`.
+    ///
+    /// Never fails: a guard refusal is [`FixesNotWritten::MovedSource`] plus
+    /// the guard's message in [`WriteBackOnFailure::error`], which the caller
+    /// joins to the tool's error (I5); a write error is a `warn!` and the same
+    /// error line (I7).
+    ///
+    /// [`FailureWriteBack`]: hplugin::error::FailureWriteBack
+    /// [`FixesNotWritten::MovedSource`]: hplugin::error::FixesNotWritten::MovedSource
+    pub(crate) async fn materialize_codegen_on_failure(
+        self: &Arc<Self>,
+        rs: &Arc<RequestState>,
+        def: &LinkedTargetDef,
+        shell: bool,
+        err: &anyhow::Error,
+    ) -> WriteBackOnFailure {
+        use hplugin::error::{FailureFixes, FixesNotWritten};
+
+        if shell
+            || rs.hash_only()
+            || rs.ctoken().is_cancelled()
+            || hplugin::error::is_cancelled(err)
+            || !hdriver_support::failure_out::target_writes_back_on_failure(&def.target)
+        {
+            return WriteBackOnFailure::default();
+        }
+        let Some(exit) = hplugin::error::process_exit(err).filter(|e| e.is_failure_status()) else {
+            return WriteBackOnFailure::default();
+        };
+        let not_written = |why| WriteBackOnFailure {
+            fixes: Some(FailureFixes::NotWritten(why)),
+            error: None,
+        };
+        if rs.frozen() {
+            return not_written(FixesNotWritten::Frozen);
+        }
+        match exit {
+            hplugin::error::Exit::Signal(sig) => return not_written(FixesNotWritten::Signal(sig)),
+            hplugin::error::Exit::Code(code)
+                if !hdriver_support::failure_out::write_back_exit(exit) =>
+            {
+                return not_written(FixesNotWritten::HighExit(code));
+            }
+            hplugin::error::Exit::Code(_) => {}
+        }
+        // Nothing collected (every declared path missing, or a driver that
+        // keeps no fixes): nothing to write, nothing to report.
+        let Some(write_back) = hplugin::error::failure_write_back(err) else {
+            return WriteBackOnFailure::default();
+        };
+        let cached: Vec<ResultArtifact> = write_back
+            .0
+            .iter()
+            .cloned()
+            .map(ResultArtifact::from_run)
+            .collect();
+
+        /// What the single flight did, when this frame's closure is the one
+        /// that ran.
+        enum Ran {
+            Written(WrittenPaths),
+            Refused(anyhow::Error),
+            Failed(anyhow::Error),
+        }
+        let ran: Arc<std::sync::Mutex<Option<Ran>>> = Arc::default();
+        let engine = Arc::clone(self);
+        let def_owned = def.clone();
+        let entered = rs
+            .data
+            .mem_codegen_tree
+            .once(
+                AddrKey(def.target.addr.clone()),
+                enclose!((rs, ran) move || async move {
+                    let outcome = match Arc::clone(&engine)
+                        .check_in_place_inputs_unchanged(&rs, &def_owned)
+                        .await
+                    {
+                        Err(e) => Ran::Refused(e),
+                        Ok(()) => {
+                            let written = match engine.open_codegen_index(&rs).await {
+                                Ok(()) => {
+                                    engine
+                                        .write_in_place_only(
+                                            Arc::clone(&def_owned.target),
+                                            Arc::new(cached),
+                                        )
+                                        .await
+                                }
+                                Err(e) => Err(e),
+                            };
+                            match written {
+                                Ok(written) => Ran::Written(written),
+                                Err(e) => Ran::Failed(e),
+                            }
+                        }
+                    };
+                    *ran.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(outcome);
+                    // Never an error in the cell: what a failed run's
+                    // write-back hit is reported on its own failure, not
+                    // replayed to a later frame of the same addr.
+                    Ok(())
+                }),
+            )
+            .await;
+        if let Err(e) = entered {
+            let e = unwrap_arc_err(e);
+            tracing::warn!(addr = %def.target.addr, error = %format!("{e:#}"), "in_place write-back on failure");
+            return WriteBackOnFailure {
+                fixes: None,
+                error: Some(format!("in_place fixes not written: {e:#}")),
+            };
+        }
+        let ran = ran
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        match ran {
+            // A passing frame of this addr already wrote the tree this request.
+            None => WriteBackOnFailure::default(),
+            Some(Ran::Written(written)) => {
+                let mut paths: Vec<String> = written
+                    .into_keys()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect();
+                paths.sort_unstable();
+                WriteBackOnFailure {
+                    fixes: Some(FailureFixes::Written { paths, list: None }),
+                    error: None,
+                }
+            }
+            Some(Ran::Refused(e)) => WriteBackOnFailure {
+                fixes: Some(FailureFixes::NotWritten(FixesNotWritten::MovedSource)),
+                error: Some(format!("{e:#}")),
+            },
+            Some(Ran::Failed(e)) => {
+                tracing::warn!(addr = %def.target.addr, error = %format!("{e:#}"), "in_place write-back on failure");
+                WriteBackOnFailure {
+                    fixes: None,
+                    error: Some(format!("in_place fixes not written: {e:#}")),
+                }
+            }
+        }
     }
 
     /// Read `outputs` of an already-resolved revision out of the cache, pulling
@@ -5046,6 +5259,14 @@ impl Engine {
     /// except that each path in `written` (the paths the write-back moved) holds
     /// exactly what the write-back put there. See
     /// [`Self::fixpoint_describes_this_run`].
+    ///
+    /// **An `in_place` transform must be idempotent** (D23): the entry filed
+    /// here claims that running the target over its own output reproduces that
+    /// output. A non-idempotent tool is served a wrong hit, and, with codegen
+    /// off the def hash (D13), so is the same target switched to `copy` or no
+    /// codegen (E4). A failed run never reaches here: its write-back
+    /// ([`Self::materialize_codegen_on_failure`]) files no revision and
+    /// registers no fixpoint.
     async fn maybe_store_fixpoint(
         self: Arc<Self>,
         rs: &Arc<RequestState>,
@@ -10132,6 +10353,7 @@ mod tests {
                 err: &e,
                 lines: rs.log_tail_lines(),
                 material: false,
+                fixes: None,
             })
             .await;
         e.context(slot)

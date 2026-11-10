@@ -282,6 +282,14 @@ impl Engine {
                         let err = if cancelled {
                             err
                         } else {
+                            // An `in_place` run's fixes go over the tree
+                            // first, while the left sandbox still holds their
+                            // tars (leaving it keeps the directory; only a
+                            // later run's `remove_stale` reclaims it), so the
+                            // slot can list what was written (D21).
+                            let write_back = self
+                                .materialize_codegen_on_failure(&rs, def, shell, &err)
+                                .await;
                             let err = Arc::clone(&self).reword_removed_generator(&rs, err).await;
                             let slot = self
                                 .failure_slots
@@ -292,13 +300,20 @@ impl Engine {
                                     err: &err,
                                     lines: rs.log_tail_lines(),
                                     material: outputs_are_material,
+                                    fixes: write_back.fixes,
                                 })
                                 .await;
                             let out_error = slot.out_error.clone();
                             let err = err.context(slot);
                             // I7: the keep failed, the failure did not.
-                            match out_error {
+                            let err = match out_error {
                                 Some(e) => err.context(format!("failure_out not kept: {e}")),
+                                None => err,
+                            };
+                            // I5: a refused write-back is reported beside the
+                            // tool's own error, never in its place.
+                            match write_back.error {
+                                Some(e) => err.context(e),
                                 None => err,
                             }
                         };

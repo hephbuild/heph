@@ -583,7 +583,42 @@ pub struct TargetFailure {
     /// The `out/` directory of the target's failure slot, when the failed run
     /// kept `failure_out` matches there: what the box prints as `outputs:`.
     pub outputs: Option<std::path::PathBuf>,
+    /// What the `in_place` write-back on failure did, for a target with a
+    /// `write_on_failure` output that failed with a process exit: the fixes
+    /// it wrote, or why it wrote none. `None` for every other failure.
+    pub fixes: Option<FailureFixes>,
     pub source: std::sync::Arc<anyhow::Error>,
+}
+
+/// What a failed `in_place` run's write-back did to the tree (D20, D21).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FailureFixes {
+    /// The fixes written back over the tree while the target still failed.
+    Written {
+        /// Every path written, workspace-relative, sorted. Empty when the
+        /// run's fixes matched the tree already.
+        paths: Vec<String>,
+        /// The slot's `fixes.txt` listing `paths`, one per line, when it was
+        /// kept: the full list, past the box's truncation.
+        list: Option<std::path::PathBuf>,
+    },
+    /// Nothing was written, and why.
+    NotWritten(FixesNotWritten),
+}
+
+/// Why a failed `in_place` run wrote nothing back (D20).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FixesNotWritten {
+    /// The run was killed by a signal: a fixer cut off mid-write.
+    Signal(i32),
+    /// The run exited 128 or above, a shell's report of a killed child
+    /// (137 for an OOM kill, 143 for a timeout).
+    HighExit(i32),
+    /// An `in_place` source moved while the run read it, or could not be
+    /// confirmed unchanged (I5): writing would discard the newer bytes.
+    MovedSource,
+    /// `--frozen`: the run verifies the tree, it never writes it.
+    Frozen,
 }
 
 impl TargetFailure {
@@ -593,8 +628,15 @@ impl TargetFailure {
             log_tail,
             log: None,
             outputs: None,
+            fixes: None,
             source: std::sync::Arc::new(source),
         }
+    }
+
+    /// The same failure with what its `in_place` write-back did.
+    pub fn with_fixes(mut self, fixes: Option<FailureFixes>) -> Self {
+        self.fixes = fixes;
+        self
     }
 
     /// The same failure with the log its tail came from.
