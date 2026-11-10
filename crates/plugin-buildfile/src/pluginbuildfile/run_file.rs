@@ -327,7 +327,9 @@ pub(crate) fn build_globals(registry: &FunctionRegistry) -> Globals {
 pub(crate) fn param_type_to_ty(t: &ParamType) -> starlark::typing::Ty {
     use starlark::typing::Ty;
     match t {
-        ParamType::String => Ty::string(),
+        // Starlark types have no string literals; the set is checked by
+        // `FnSignature::validate_args` at the call.
+        ParamType::String | ParamType::Enum(_) => Ty::string(),
         ParamType::Bool => Ty::bool(),
         // htvalue distinguishes Int/Uint but Starlark has a single int type.
         ParamType::Int | ParamType::Uint => Ty::int(),

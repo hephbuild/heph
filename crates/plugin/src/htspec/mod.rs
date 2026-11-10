@@ -801,9 +801,25 @@ mod tests {
         assert!(format!("{err:#}").contains("expected one of"), "{err:#}");
     }
 
+    /// The schema is exactly the spellings the parser accepts: renamed, never
+    /// a skipped variant. Every literal it lists must parse, and a skipped
+    /// variant's snake_case name is neither listed nor parsed.
     #[test]
-    fn enum_param_type_is_string() {
-        assert_eq!(Codegen::spec_param_type(), ParamType::String);
+    fn enum_param_type_lists_exactly_the_accepted_spellings() {
+        let ty = Codegen::spec_param_type();
+        assert_eq!(
+            ty,
+            ParamType::Enum(vec![
+                "copy".to_string(),
+                "in_place".to_string(),
+                "in-place-v2".to_string(),
+            ])
+        );
+        for l in ty.literals() {
+            Codegen::from_spec_value(&Value::String(l.to_string()))
+                .unwrap_or_else(|e| panic!("schema lists {l:?}, parser refuses it: {e:#}"));
+        }
+        assert!(!ty.matches(&Value::String("none".to_string())));
     }
 
     // --- SpecStruct ---

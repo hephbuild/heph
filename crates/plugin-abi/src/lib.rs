@@ -32,6 +32,11 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// the new `x.y.0`. The 0.14.0 and 0.15.0 entries below predate it — they were
 /// additive minors, and there was no version check to read them.
 ///
+/// 0.19.2 (additive, a patch): `ParamType.literals` (6) — a string scalar
+/// narrowed to a closed set of literals (`ParamType::Enum`). A 0.19.1 peer
+/// skips it and reads a plain string; literals on any other kind fail the
+/// decode. No plugin must be rebuilt.
+///
 /// 0.19.1 (additive, a patch): target timeouts. `TargetDef.timeout_ms` (13,
 /// `uint64`) — how long the run may take; the host enforces it around the
 /// driver's `run` (cancel, a grace period, then abandon). Absent is no limit; a
@@ -277,7 +282,7 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// 0.3.0: `PluginComponents` gained a `hooks` field (a layout change to the
 /// create-entry struct) for the Hook plugin kind — a hard break, so every plugin
 /// must be rebuilt against this ABI.
-pub const ABI_SEMVER: &str = "0.19.1";
+pub const ABI_SEMVER: &str = "0.19.2";
 
 /// The start of the ABI lane this host loads: a plugin is accepted iff its
 /// version matches the caret requirement `^MIN_PLUGIN_ABI` — pre-1.0, one
@@ -294,7 +299,7 @@ pub const MIN_PLUGIN_ABI: &str = "0.19.0";
 
 /// [`ABI_SEMVER`], NUL-terminated: what a plugin's `heph_plugin_abi_semver`
 /// entry returns a pointer to. Bumped with it; a test holds the two equal.
-pub const ABI_SEMVER_C: &std::ffi::CStr = c"0.19.1";
+pub const ABI_SEMVER_C: &std::ffi::CStr = c"0.19.2";
 
 /// The first plugin ABI that reads `ManagedRunRequest.cancel_key`. The host
 /// sends a key, and cancels a run by it, only to a plugin at this version or

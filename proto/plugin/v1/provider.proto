@@ -142,6 +142,11 @@ message ParamType {
     Union union = 4;
     Struct struct = 5;  // named heterogeneous fields
   }
+  // With `scalar = SCALAR_STRING`: the closed set of strings accepted
+  // (`ParamType::Enum`); empty is any string. Outside the oneof so a peer that
+  // predates it (ABI < 0.19.2) skips the field and reads a plain string —
+  // looser, never wrong. Non-empty with any other kind is a decode error.
+  repeated string literals = 6;
 }
 
 // ---- Schemas (provider state + driver config) ----

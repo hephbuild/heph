@@ -32,6 +32,10 @@ pub enum ParamType {
     /// field names, each with its own type. All fields are optional: a value
     /// matches if every present key names a known field of matching type.
     Struct(Vec<StructField>),
+    /// A string drawn from a closed set of literals, e.g. exec's `workdir`
+    /// (`"caller" | "tree_root" | …`). Rendered as the quoted literals joined
+    /// by ` | `; matches only a string equal to one of them.
+    Enum(Vec<String>),
 }
 
 /// One named field of a [`ParamType::Struct`].
@@ -94,6 +98,31 @@ impl ParamType {
                     .join(", ");
                 format!("struct({rendered})")
             }
+            ParamType::Enum(literals) => literals
+                .iter()
+                .map(|l| format!("{l:?}"))
+                .collect::<Vec<_>>()
+                .join(" | "),
+        }
+    }
+
+    /// The string literals this type accepts as a value, through unions: the
+    /// members of every [`ParamType::Enum`] reachable without entering a
+    /// container. Empty when the type is not (or does not include) an enum —
+    /// a list or map of enums offers nothing for the value itself.
+    pub fn literals(&self) -> Vec<&str> {
+        match self {
+            ParamType::Enum(literals) => literals.iter().map(String::as_str).collect(),
+            ParamType::Union(types) => {
+                let mut out: Vec<&str> = Vec::new();
+                for l in types.iter().flat_map(ParamType::literals) {
+                    if !out.contains(&l) {
+                        out.push(l);
+                    }
+                }
+                out
+            }
+            _ => Vec::new(),
         }
     }
 
@@ -105,6 +134,7 @@ impl ParamType {
         }
         match (self, v) {
             (ParamType::String, Value::String(_)) => true,
+            (ParamType::Enum(literals), Value::String(s)) => literals.iter().any(|l| l == s),
             (ParamType::Bool, Value::Bool(_)) => true,
             (ParamType::Int, Value::Int(_)) => true,
             (ParamType::Uint, Value::Uint(_)) => true,
@@ -136,6 +166,23 @@ fn value_kind(v: &Value) -> &'static str {
         Value::Null() => "null",
         Value::Map(_) => "map",
         Value::List(_) => "list",
+    }
+}
+
+fn got(ty: &ParamType, v: &Value) -> String {
+    ty.describe_mismatch(v)
+}
+
+impl ParamType {
+    /// The "got …" half of a mismatch of `v` against this type: the value's
+    /// kind, or — for a string offered where literals are accepted — the
+    /// string itself, since "expected \"a\" | \"b\", got string" names no
+    /// mistake.
+    pub fn describe_mismatch(&self, v: &Value) -> String {
+        match v {
+            Value::String(s) if !self.literals().is_empty() => format!("{s:?}"),
+            _ => value_kind(v).to_string(),
+        }
     }
 }
 
@@ -236,7 +283,7 @@ impl FnSignature {
                             "{fn_display}: positional argument `{}` expected {}, got {}",
                             param.name,
                             param.ty.render(),
-                            value_kind(&v)
+                            got(&param.ty, &v)
                         );
                     }
                     out_positional.push(v);
@@ -260,7 +307,7 @@ impl FnSignature {
                         "{fn_display}: variadic argument `{}` expected {}, got {}",
                         var.name,
                         var.ty.render(),
-                        value_kind(&v)
+                        got(&var.ty, &v)
                     );
                 }
                 out_positional.push(v);
@@ -276,7 +323,7 @@ impl FnSignature {
                             "{fn_display}: argument `{}` expected {}, got {}",
                             param.name,
                             param.ty.render(),
-                            value_kind(&v)
+                            got(&param.ty, &v)
                         );
                     }
                     out_named.insert(param.name.to_string(), v);
@@ -305,7 +352,7 @@ impl FnSignature {
             anyhow::bail!(
                 "{fn_display}: return value expected {}, got {}",
                 self.returns.render(),
-                value_kind(v)
+                got(&self.returns, v)
             );
         }
         Ok(())
@@ -335,6 +382,52 @@ mod tests {
             Value::Bool(true)
         )]))));
         assert!(!ty.matches(&Value::Int(3)));
+    }
+
+    #[test]
+    fn enum_renders_quoted_and_matches_only_its_literals() {
+        let ty = ParamType::Enum(vec!["caller".to_string(), "tree_root".to_string()]);
+        assert_eq!(ty.render(), r#""caller" | "tree_root""#);
+        assert!(ty.matches(&Value::String("tree_root".to_string())));
+        // The near miss, a prefix, and the empty string are all refused.
+        for bad in ["root", "tree_roo", "tree_root_", "", "Caller"] {
+            assert!(!ty.matches(&Value::String(bad.to_string())), "{bad}");
+        }
+        assert!(!ty.matches(&Value::Bool(true)));
+
+        // In a union the literals and the other members both render and match.
+        let u = ParamType::union(vec![ParamType::Bool, ty.clone()]);
+        assert_eq!(u.render(), r#"bool | "caller" | "tree_root""#);
+        assert!(u.matches(&Value::Bool(false)));
+        assert!(u.matches(&Value::String("caller".to_string())));
+        assert_eq!(u.literals(), ["caller", "tree_root"]);
+        // A list of enums offers nothing for the value itself.
+        assert!(ParamType::list(ty).literals().is_empty());
+        assert!(ParamType::String.literals().is_empty());
+    }
+
+    #[test]
+    fn a_wrong_literal_names_the_string_it_got() {
+        let sig = FnSignature {
+            positional: vec![],
+            named: vec![Param::required(
+                "mode",
+                ParamType::Enum(vec!["a".to_string(), "b".to_string()]),
+            )],
+            variadic: None,
+            returns: ParamType::Null,
+        };
+        let err = sig
+            .validate_args(
+                "f",
+                vec![],
+                HashMap::from([("mode".to_string(), Value::String("c".to_string()))]),
+            )
+            .unwrap_err();
+        assert_eq!(
+            format!("{err:#}"),
+            r#"f: argument `mode` expected "a" | "b", got "c""#
+        );
     }
 
     #[test]

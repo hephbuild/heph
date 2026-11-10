@@ -227,6 +227,12 @@ skipped in silence.
 
 ## History of breaks
 
+- **0.19.2** (additive patch) — `ParamType.literals` (6, `repeated string`):
+  a string scalar narrowed to a closed set (`ParamType::Enum`), so a cdylib
+  driver's `workdir`-style field reaches the LSP as `"a" | "b"` rather than
+  `string`. A 0.19.1 host skips the field and reads a plain string: looser
+  completion and diagnostics, never a failed schema. A 0.19.1 plugin sends none.
+  Literals on any other kind are a decode error. No plugin must be rebuilt.
 - **0.19.1** (additive patch) — target timeouts. `TargetDef.timeout_ms` (13,
   `uint64`): how long the run may take, which the host enforces around the
   driver's `run`. Absent is no limit; a present 0 is refused at decode. Never

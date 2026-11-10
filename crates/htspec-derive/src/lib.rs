@@ -10,7 +10,9 @@
 //!   `map[<union of field types>]`.
 //! * `#[derive(SpecEnum)]` — on a unit-variant enum, generates a
 //!   [`FromSpecValue`] that parses a string into a variant (variant name lowered
-//!   to `snake_case` by default). `spec_param_type` is `string`.
+//!   to `snake_case` by default). `spec_param_type` is the enum of the
+//!   accepted spellings (`"a" | "b"`), so the LSP offers and checks exactly
+//!   what the parser accepts.
 //! * `#[derive(SpecUnion)]` — on a newtype-variant enum, a union: parsing tries
 //!   each variant's inner type in declared order; schema renders `a | b | c`.
 //!
@@ -485,7 +487,9 @@ fn expand_spec_enum(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream>
             }
 
             fn spec_param_type() -> crate::htvalue::signature::ParamType {
-                crate::htvalue::signature::ParamType::String
+                crate::htvalue::signature::ParamType::Enum(::std::vec![
+                    #(::std::string::String::from(#valid_names)),*
+                ])
             }
         }
     })
