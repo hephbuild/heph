@@ -1,4 +1,4 @@
-# In-place codegen (`codegen = "in_place"`)
+# In-place codegen (`codegen = "in_place"`, `"in_place_on_success"`)
 
 A formatter that rewrites its **own, committed** source files — and a contrasting
 `codegen = "copy"` target that emits a **generated, gitignored** file.
@@ -52,6 +52,26 @@ $ heph run //fmt:fmt --frozen          # dirty tree → fails
   │ +HELLO WORLD
   ╰────
 ```
+
+### When the formatter fails
+
+A run that exits with a code from 1 to 127 still writes back the files it
+fixed, and the target still fails. A fixer like `eslint --fix` with unfixable
+errors left keeps the fixes it could make. The failure box names them:
+
+```
+  fixes written, target still failed (re-run to verify; codegen = "in_place_on_success" opts out):
+    fmt/greeting.txt
+  restore with: git checkout -- fmt/greeting.txt
+```
+
+Nothing is written after a signal, an exit code of 128 or above, under
+`--frozen`, or in a `--shell`. `codegen = "in_place_on_success"` writes nothing
+back on any failure, which was `in_place`'s behaviour before.
+
+Either way, the transform must be **idempotent**: running it over its own
+output must change nothing. The fixed-point cache hit above depends on it. See
+[`docs/FAILURE_OUTPUTS.md`](../../docs/FAILURE_OUTPUTS.md).
 
 ## Copy (generated): `//fmt:generated`
 

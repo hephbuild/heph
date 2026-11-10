@@ -217,6 +217,18 @@ Read `docs/TEMPLATE.md` before touching it. The one thing to know going in:
 `vars` is hashed from a `BTreeMap` because it arrives as a `HashMap`, and
 hashing it in iteration order would move the def hash on every run.
 
+### Failure outputs
+
+A failed target's slot (`<home>/failures/<addr-key>/`) holds its `log.txt`, its
+`failure_out` matches under `out/`, and `fixes.txt` when an `in_place` run wrote
+fixes back while failing. `heph inspect failure <addr>` prints where they are.
+
+Read `docs/FAILURE_OUTPUTS.md` before touching any of it. The one thing to know
+going in: **nothing about failure outputs reaches a hash** — not `failure_out`,
+not the codegen mode, not the bytes a failure keeps — and `in_place` now writes
+back after an exit code from 1 to 127, so an `in_place` transform must be
+idempotent.
+
 ### The BUILD-file LSP
 
 `heph tool build-lsp` (`crates/plugin-buildfile/src/pluginbuildfile/lsp`) owns its

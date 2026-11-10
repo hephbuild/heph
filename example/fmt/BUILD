@@ -11,10 +11,18 @@
 # surfaced to the run script through `$SRC_<GROUP>` / `$LIST_SRC_<GROUP>`.
 #
 # Because the transform is idempotent, re-running over the already-formatted tree
-# is a no-op CACHE HIT (fixed-point caching) — no re-execution. And:
+# is a no-op CACHE HIT (fixed-point caching) — no re-execution. Idempotence is
+# the contract: `in_place` must change nothing when run over its own output. And:
 #
 #   heph run //fmt:fmt            # format the .txt files in place
 #   heph run //fmt:fmt --frozen   # CI check: fail (with a diff) if not formatted
+#
+# A run that exits 1–127 still writes back the files it fixed, and the target
+# still fails (a fixer like `eslint --fix` keeps the fixes it could make). The
+# failure box lists them with a `git checkout` restore hint.
+# `codegen = "in_place_on_success"` opts out: a failed run writes nothing back.
+# Use it for a tool that can leave a partial file behind when it fails. See
+# docs/FAILURE_OUTPUTS.md.
 #
 target(
     name = "fmt",
