@@ -42,6 +42,8 @@ impl Engine {
             .get(&spec.driver)
             .ok_or_else(|| anyhow::anyhow!("driver not found: {}", spec.driver))
             .cloned()?;
+        // A target run can reach the codegen index (the fs driver's lookups).
+        self.open_codegen_index(&rs).await?;
         // The backstop for a direct `result_addr` on an entrypoint: it runs
         // only through `Engine::invoke`, never in a sandbox (D30, I8).
         if def.target.entrypoint.is_some() {
@@ -252,6 +254,7 @@ impl Engine {
                         let err = if cancelled {
                             err
                         } else {
+                            let err = Arc::clone(&self).reword_removed_generator(&rs, err).await;
                             let slot = self
                                 .failure_slots
                                 .fill(crate::engine::failure_slot::Fill {
@@ -296,6 +299,52 @@ impl Engine {
         .await;
         htelemetry::telemetry::record_execute_ms(exec_started.elapsed().as_millis() as u64);
         res.map(|(artifacts, teardown, guards)| (artifacts, teardown, guards, execute_guard))
+    }
+
+    /// The fs driver refuses a generated path naming the row's generator, but
+    /// it cannot read defs, so it cannot tell a generator that still exists
+    /// from one that was removed (Decision 18). On this failure path only, the
+    /// row's addr is resolved once: when it is not found, the error is rebuilt
+    /// to name `codegen keep` / `discard` instead of "depend on". Any other
+    /// error, or a lookup that fails otherwise, is returned unchanged.
+    ///
+    /// The lookup is a *tracked* edge from this fs target to the generator.
+    /// A provider whose `get` of the generator builds this fs target (the go
+    /// provider's `_golist` shape) closes a cycle the request's dep graph
+    /// reports, instead of waiting on the in-flight spec or execute it is
+    /// itself part of; the cycle is "any other error", so the original
+    /// wording stands. fs targets reserve nothing, so the lookup holds no
+    /// capacity another target could be waiting for.
+    async fn reword_removed_generator(
+        self: Arc<Self>,
+        rs: &Arc<RequestState>,
+        err: anyhow::Error,
+    ) -> anyhow::Error {
+        use hbuiltins::pluginfs::{CodegenFileError, CodegenFileErrorKind};
+        let Some(cg) = hcore::hmemoizer::downcast_chain_ref::<CodegenFileError>(&err) else {
+            return err;
+        };
+        if cg.kind != CodegenFileErrorKind::Generated {
+            return err;
+        }
+        let Ok(generator) = hmodel::htaddr::parse_addr(&cg.addr) else {
+            return err;
+        };
+        match self.get_spec(Arc::clone(rs), &generator).await {
+            Err(e)
+                if hcore::hmemoizer::downcast_chain_ref::<
+                    crate::engine::error::TargetNotFoundError,
+                >(&e)
+                .is_some() =>
+            {
+                anyhow::Error::new(CodegenFileError {
+                    kind: CodegenFileErrorKind::TargetRemoved,
+                    ..cg.clone()
+                })
+                .context("run")
+            }
+            Ok(_) | Err(_) => err,
+        }
     }
 
     /// Where a run in `sandbox_dir` can have written its log: the directory

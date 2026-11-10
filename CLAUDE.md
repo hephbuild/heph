@@ -181,6 +181,18 @@ kept off every def hash, the allotment is runtime-only — so **a target's
 outputs must not depend on its allotment**, and a driver that folds its raw
 config map into its def hash breaks that silently.
 
+### Codegen index
+
+A `codegen = "copy"` write-back records each file it wrote in
+`<home>/codegen/index.db`; globs and fs `file` targets read that index plus the
+root `.gitignore`'s managed section (`heph tool codegen gitignore`) to keep
+generated files out of their inputs.
+
+Read `docs/CODEGEN.md` before touching it. The one thing to know going in:
+unlike `cache/`, losing the index **changes answers**, not just time, so no
+clean, gc or prune may touch it, and a lookup only ever reads it — no engine
+call, no def, no write — because it runs inside BUILD evaluation.
+
 ### Target timeouts
 
 `timeout = "10m"` on an `exec`/`bash` target bounds its run. The driver only

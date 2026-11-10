@@ -1,6 +1,5 @@
 use crate::engine::Engine;
 use crate::engine::driver::TargetAddr;
-use crate::engine::driver::targetdef::path::Content;
 use crate::engine::driver::targetdef::{Input, InputMode};
 use crate::engine::invoke::EntrypointAsInput;
 use crate::engine::request_state::{AddrKey, RequestState};
@@ -50,7 +49,9 @@ fn introspect_input(fs_addr: Addr, template: &Input) -> Input {
 }
 
 /// Expands the `//@heph/introspect:outputs` magic input into one `@heph/fs`
-/// input per declared output path of `outputs`.
+/// input per declared output path of `outputs`, `codegen = "copy"` paths
+/// excepted: those are generated, not source, so a target never reads (or
+/// hashes) its own previous output.
 ///
 /// Output path strings are already root-relative: the exec driver prepends the
 /// owning package to each declared `out` entry (`spec_path_to_target_path`), so
@@ -68,16 +69,14 @@ fn synthesized_fs_inputs(
 ) -> Vec<Input> {
     let mut seen = FxHashSet::default();
     let mut out = Vec::new();
+    use crate::engine::driver::targetdef::path::CodegenMode;
+
     for output in outputs {
         for path in &output.paths {
-            let fs_addr = match &path.content {
-                Content::FilePath(p) => hbuiltins::pluginfs::file_addr(p),
-                Content::Glob(p) => hbuiltins::pluginfs::glob_addr(p, &[]),
-                Content::DirPath(p) => hbuiltins::pluginfs::glob_addr(
-                    &format!("{}/**/*", p.trim_end_matches('/')),
-                    &[],
-                ),
-            };
+            if matches!(path.codegen_tree, CodegenMode::Copy) {
+                continue;
+            }
+            let fs_addr = hbuiltins::pluginfs::output_fs_addr(&path.content);
             if seen.insert(fs_addr.clone()) {
                 out.push(introspect_input(fs_addr, template));
             }
@@ -601,6 +600,28 @@ mod tests {
             "origin_id must be inherited from the magic dep, not synthesized, got: {:?}",
             oids[0],
         );
+        Ok(())
+    }
+
+    // A `copy` target's outputs are generated, not source: `introspect:outputs`
+    // lists none of them, file or glob.
+    #[tokio::test]
+    async fn introspect_outputs_skips_copy_outputs() -> anyhow::Result<()> {
+        let mut spec = introspect_exec_spec(
+            "//pkg:gen",
+            &["*.go", "foo.txt"],
+            &["//@heph/introspect:outputs"],
+        );
+        spec.config
+            .insert("codegen".to_string(), Value::String("copy".to_string()));
+        let (engine, _root) = engine_with(vec![spec])?;
+
+        let rs = engine.new_state();
+        let addr = hmodel::htaddr::parse_addr("//pkg:gen")?;
+        let expanded = Arc::clone(&engine).expanded_inputs_for(rs, &addr).await?;
+        let addrs: Vec<String> = expanded.iter().map(|i| i.r#ref.r#ref.format()).collect();
+
+        assert_eq!(addrs, Vec::<String>::new());
         Ok(())
     }
 }

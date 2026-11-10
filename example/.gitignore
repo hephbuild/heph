@@ -2,6 +2,7 @@
 profile.json.gz
 profile.json.syms.json
 
-# BEGIN heph-generated (managed by `heph tool gen-gitignore` — do not edit)
+# BEGIN heph-generated (managed by `heph tool codegen gitignore` — do not edit)
+# //fmt:generated
 /fmt/generated.txt
 # END heph-generated

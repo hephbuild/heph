@@ -58,6 +58,14 @@ pub fn build_engine_with_remote(root: &std::path::Path, remote_uri: Option<&str>
     Arc::new(e)
 }
 
+/// Whether a test that needs user xattrs must fail, not skip, on a
+/// filesystem without them: in CI (`CI` set, as GitHub Actions does), or
+/// with `HEPH_REQUIRE_XATTRS` set. Every CI runner's temp directory stores
+/// them, so a skip there would hide a test that never ran.
+pub fn xattrs_required() -> bool {
+    std::env::var_os("CI").is_some() || std::env::var_os("HEPH_REQUIRE_XATTRS").is_some()
+}
+
 /// Release `rs` and wait for its background work (remote uploads) to drain,
 /// as `heph run` does before exiting.
 ///

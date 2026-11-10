@@ -32,20 +32,20 @@ use xxhash_rust::xxh3::Xxh3;
 const PKG: &str = "@heph/fs";
 pub const DRIVER_NAME: &str = "fs";
 
-/// Extended-attribute name stamped on net-new codegen files written back to the
-/// tree (value = the generator's addr). Raw source reads must skip these so a
-/// generated file is never double-sourced.
-pub const CODEGEN_XATTR: &str = "user.heph.codegen";
+/// Extended-attribute name the engine stamps on net-new codegen files written
+/// back to the tree (value = the generator's addr), for an N-1 heph and
+/// `heph tool codegen import`. Set only: no reader here looks at it; the
+/// codegen index decides what is generated (see [`codegen`]).
+pub use hwalk::codegen_index::import::CODEGEN_XATTR;
 
-/// True if the file at `path` carries the codegen provenance xattr — i.e. it is
-/// a tree file owned by a `codegen = "copy"` target. `in_place` outputs are never
-/// stamped, so any stamped file belongs to some *other* codegen target.
-///
-/// A filesystem that does not support xattrs (or any IO error) is treated as
-/// "not stamped" so globbing/file reads never break on such trees.
-pub fn has_codegen_xattr(path: &std::path::Path) -> bool {
-    matches!(xattr::get(path, CODEGEN_XATTR), Ok(Some(_)))
-}
+mod codegen;
+pub use codegen::{
+    CodegenFileError, CodegenFileErrorKind, CodegenReport, FsCodegen, NoReport, exclusion_summary,
+    reason_str, status_str, unrecorded_message,
+};
+
+/// wax's escape, for a caller building an fs glob pattern from a literal path.
+pub use wax::escape;
 
 use hwalk::HEPH_DIR_PREFIX;
 
@@ -122,6 +122,18 @@ pub fn glob_addr(pattern: &str, exclude: &[&str]) -> Addr {
         args.insert("e".to_string(), exclude.join(","));
     }
     Addr::new(PkgBuf::from(PKG), "glob".to_string(), args)
+}
+
+/// The fs addr reading an output path: [`file_addr`] for a file, a glob for a
+/// glob or a directory. The one mapping both `introspect:outputs` and the
+/// in-place guard use, so an `in_place` output and the input that reads it
+/// land on the same addr.
+pub fn output_fs_addr(content: &PathContent) -> Addr {
+    match content {
+        PathContent::FilePath(p) => file_addr(p),
+        PathContent::Glob(p) => glob_addr(p, &[]),
+        PathContent::DirPath(p) => glob_addr(&format!("{}/**/*", p.trim_end_matches('/')), &[]),
+    }
 }
 
 /// Returns `true` if `addr` refers to a single-file fs target.
@@ -236,8 +248,19 @@ impl EProvider for Provider {
 ///
 /// `glob` and `parent` read the tree under the root (the documented
 /// tree-reading exemption of `PluginFn`'s purity contract); the rest are pure
-/// string handling.
+/// string handling. Without a codegen index, `glob` excludes nothing as
+/// generated; see [`functions_with`].
 pub fn functions(skip: &Arc<Ignore>, walker: &Arc<CachedWalker>) -> Vec<PluginFnDef> {
+    functions_with(skip, walker, &FsCodegen::default())
+}
+
+/// [`functions`] whose `glob` reads the codegen index through `codegen`: the
+/// same snapshot lookup as the fs driver's glob, with no engine call (J6).
+pub fn functions_with(
+    skip: &Arc<Ignore>,
+    walker: &Arc<CachedWalker>,
+    codegen: &FsCodegen,
+) -> Vec<PluginFnDef> {
     {
         // A single required string positional, returning a string.
         let one_path = || FnSignature {
@@ -262,6 +285,7 @@ pub fn functions(skip: &Arc<Ignore>, walker: &Arc<CachedWalker>) -> Vec<PluginFn
                 func: Arc::new(GlobFn {
                     skip: Arc::clone(skip),
                     walker: Arc::clone(walker),
+                    codegen: codegen.clone(),
                 }),
             },
             PluginFnDef {
@@ -328,6 +352,7 @@ pub fn functions(skip: &Arc<Ignore>, walker: &Arc<CachedWalker>) -> Vec<PluginFn
 struct GlobFn {
     skip: Arc<Ignore>,
     walker: Arc<CachedWalker>,
+    codegen: FsCodegen,
 }
 
 #[async_trait]
@@ -342,7 +367,11 @@ impl PluginFn for GlobFn {
         // No user excludes, so `request_id` is irrelevant (the built-in exclude
         // path is taken). Reuses the driver's compiled glob + walk verbatim.
         let compiled = compile_glob(&self.skip, "heph.fs.glob", &resolved, &[])?;
-        let artifacts = walk_glob(&self.walker, ctx.root, &compiled)?;
+        // The same snapshot read as the driver's glob: no engine call, no
+        // evaluation, no second pass. No request: events have nowhere to go,
+        // warnings dedupe per engine.
+        let (artifacts, excluded) = walk_glob(&self.walker, ctx.root, &compiled, &self.codegen)?;
+        codegen::report(&self.codegen, None, &excluded);
 
         let pkg_prefix = (!ctx.pkg.is_empty()).then(|| std::path::Path::new(ctx.pkg));
 
@@ -864,21 +893,31 @@ fn compile_glob(
 ///
 /// Recursion runs through the shared [`CachedWalker`]: every `readdir` and every
 /// file content hash is served from the cross-run fswalk cache when the tree is
-/// unchanged. Filtering (glob match, excludes, skip-dir pruning, codegen xattr)
-/// is applied here — the walker itself is consumer-agnostic. Starts at the
-/// pattern's literal prefix so a rooted pattern (`a/b/**/*`) scans only
+/// unchanged. Filtering (glob match, excludes, skip-dir pruning, generated
+/// files) is applied here — the walker itself is consumer-agnostic. Starts at
+/// the pattern's literal prefix so a rooted pattern (`a/b/**/*`) scans only
 /// `<root>/a/b`, not the whole tree.
+///
+/// Generated files: one codegen index snapshot per walk, asked per matched
+/// file, with the section's territory carried down the walk like
+/// `dir_in_heph`; `Generated` and `Modified` are left out and returned beside
+/// the artifacts for the caller to report. After the walk, a commit since the
+/// snapshot is rechecked against the kept paths.
 fn walk_glob(
     walker: &CachedWalker,
     root: &std::path::Path,
     compiled: &CompiledGlob,
-) -> anyhow::Result<Vec<OutputArtifact>> {
+    codegen: &FsCodegen,
+) -> anyhow::Result<(Vec<OutputArtifact>, Vec<codegen::Excluded>)> {
     let walk_root = if compiled.prefix.is_empty() {
         root.to_path_buf()
     } else {
         root.join(&compiled.prefix)
     };
 
+    let lookup = codegen::GlobLookup::open(codegen, root, &walk_root)?;
+    let lookup = lookup.as_ref();
+    let mut excluded = vec![];
     let mut artifacts = vec![];
     // The literal prefix can name a file directly (a fully-literal pattern), in
     // which case the walk root is that single file, not a directory to descend.
@@ -896,8 +935,11 @@ fn walk_glob(
             // Its components are therefore the parent's plus `name`, which is
             // exactly what the two operands below test.
             let root_in_heph = resolves_into_heph_dir(&walk_root);
-            let mut stack = vec![(walk_root, root_in_heph)];
-            while let Some((dir, dir_in_heph)) = stack.pop() {
+            // Section territory is carried the same way: a directory a line
+            // covers makes every entry under it territory without a match.
+            let root_territory = lookup.is_some_and(|l| l.start_territory(&walk_root));
+            let mut stack = vec![(walk_root, root_in_heph, root_territory)];
+            while let Some((dir, dir_in_heph, dir_territory)) = stack.pop() {
                 let listing = walker.read_dir(&dir)?;
                 for entry in &listing.entries {
                     let abs = dir.join(&entry.name);
@@ -908,7 +950,9 @@ fn walk_glob(
                         // parent was.
                         let rel = abs.strip_prefix(root).unwrap_or(&abs);
                         if !compiled.skip.prune_dir(&abs, rel) {
-                            stack.push((abs, dir_in_heph));
+                            let territory =
+                                lookup.is_some_and(|l| l.dir_territory(&abs, dir_territory));
+                            stack.push((abs, dir_in_heph, territory));
                         }
                     } else if matches!(
                         entry.kind,
@@ -923,7 +967,9 @@ fn walk_glob(
                             &abs,
                             entry.kind == hwalk::EntryKind::Symlink,
                             dir_in_heph,
+                            lookup.map(|l| (l, Some(dir_territory))),
                             &mut artifacts,
+                            &mut excluded,
                         )?;
                     }
                 }
@@ -938,16 +984,27 @@ fn walk_glob(
             &walk_root,
             true,
             false,
+            lookup.map(|l| (l, None)),
             &mut artifacts,
+            &mut excluded,
         )?,
         Err(_) => {} // missing walk root ⇒ empty match
     }
 
-    Ok(artifacts)
+    if let Some(l) = lookup {
+        l.recheck(&mut artifacts, &mut excluded)?;
+    }
+    Ok((artifacts, excluded))
 }
 
-/// If `abs` matches the glob (and isn't excluded or a codegen output), hash it
-/// via the walker and push its artifact onto `out`.
+/// If `abs` matches the glob (and isn't excluded, generated or engine
+/// internal), hash it via the walker and push its artifact onto `out`; a
+/// generated file goes onto `excluded` instead. `codegen` is the walk's index
+/// lookup and the territory of `abs`'s directory (`None`: a lone path).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one walk step's state, threaded from the loop above"
+)]
 fn emit_glob_file(
     walker: &CachedWalker,
     root: &std::path::Path,
@@ -955,7 +1012,9 @@ fn emit_glob_file(
     abs: &std::path::Path,
     is_symlink: bool,
     parent_in_heph: bool,
+    codegen: Option<(&codegen::GlobLookup<'_>, Option<bool>)>,
     out: &mut Vec<OutputArtifact>,
+    excluded: &mut Vec<codegen::Excluded>,
 ) -> anyhow::Result<()> {
     use wax::Program as _;
 
@@ -967,17 +1026,23 @@ fn emit_glob_file(
     if !pattern_matches(compiled, rel)? || compiled.not.is_match(rel) {
         return Ok(());
     }
-    // Skip net-new codegen outputs stamped back into the tree — sourcing them
-    // here would double-source the generated content. Same for paths resolving
-    // into a `.heph*` dir: they are engine-internal artifacts, not raw source.
+    // Paths resolving into a `.heph*` dir are engine-internal artifacts, not
+    // raw source.
     let name = abs.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-    if has_codegen_xattr(abs) || entry_resolves_into_heph_dir(abs, name, is_symlink, parent_in_heph)
-    {
+    if entry_resolves_into_heph_dir(abs, name, is_symlink, parent_in_heph) {
         return Ok(());
     }
     let Some(rel_str) = rel.to_str() else {
         anyhow::bail!("glob entry path is not valid UTF-8: {}", rel.display());
     };
+    // A generated file is sourced from its generator only: reading it here
+    // would double-source the generated content.
+    if let Some((lookup, parent_territory)) = codegen
+        && let Some(ex) = lookup.exclusion(rel_str, parent_territory)?
+    {
+        excluded.push(ex);
+        return Ok(());
+    }
     // Hash via the walker (follows symlinks). A symlink-to-dir or a
     // dangling/vanished link errors here → skip.
     let fh = match walker.file_hash(abs) {
@@ -1048,23 +1113,31 @@ fn memoize_glob_walk(
         .clone()
 }
 
-/// The single artifact of `file(path)` under `root`, or none for a codegen
-/// output or a path into a `.heph*` dir. Synchronous: a stat and, on a walker
-/// miss, a full read and hash.
+/// The single artifact of the fs `file` target over `path` under `root`, or
+/// none for a path into a `.heph*` dir. Synchronous: one codegen index
+/// lookup, a stat and, on a walker miss, a full read and hash.
+///
+/// A generated path is never re-read as raw source: it fails for one heph
+/// recorded ([`CodegenFileError`]) and yields nothing for an unrecorded
+/// section match, with a warning.
 fn file_artifacts(
     walker: &CachedWalker,
     root: &std::path::Path,
     path: &str,
-) -> anyhow::Result<Vec<OutputArtifact>> {
+    cg: &FsCodegen,
+    request_id: &str,
+) -> anyhow::Result<(Vec<OutputArtifact>, Option<codegen::FileWarning>)> {
     let abs = root.join(path);
 
-    // A file() over a net-new codegen output (stamped back into the
-    // tree) resolves to nothing — the generated content must only be
-    // sourced from its generator, never re-read as raw source. A path
-    // resolving into a `.heph*` dir (engine-internal artifact) is
-    // skipped the same way.
-    if has_codegen_xattr(&abs) || resolves_into_heph_dir(&abs) {
-        return Ok(vec![]);
+    // A path resolving into a `.heph*` dir (engine-internal artifact)
+    // resolves to nothing.
+    if resolves_into_heph_dir(&abs) {
+        return Ok((vec![], None));
+    }
+    if let codegen::FileSource::Excluded { warning } =
+        codegen::file_is_source(cg, root, path, Some(request_id))?
+    {
+        return Ok((vec![], warning));
     }
 
     // Content hash + exec bit via the shared walker (cross-run cached).
@@ -1088,7 +1161,7 @@ fn file_artifacts(
     // `glob()` that matched it (see `hwalk::fs_entry_hashout`).
     let hashout = hwalk::fs_entry_hashout(path, &fh.hashout);
 
-    Ok(vec![OutputArtifact {
+    let artifact = OutputArtifact {
         group: "".to_string(),
         name,
         r#type: Type::Output,
@@ -1101,7 +1174,8 @@ fn file_artifacts(
             passthrough: true,
         }),
         hashout,
-    }])
+    };
+    Ok((vec![artifact], None))
 }
 
 pub struct Driver {
@@ -1109,6 +1183,9 @@ pub struct Driver {
     skip: Arc<Ignore>,
     /// Shared cross-run filesystem-walk cache (readdir + file hashes).
     walker: Arc<CachedWalker>,
+    /// The codegen index the globs and file targets read, and where they
+    /// report what it excluded.
+    codegen: FsCodegen,
 }
 
 impl Default for Driver {
@@ -1116,13 +1193,25 @@ impl Default for Driver {
         Self {
             skip: Arc::default(),
             walker: Arc::new(CachedWalker::disabled()),
+            codegen: FsCodegen::default(),
         }
     }
 }
 
 impl Driver {
     pub fn new(skip: Arc<Ignore>, walker: Arc<CachedWalker>) -> Self {
-        Self { skip, walker }
+        Self {
+            skip,
+            walker,
+            codegen: FsCodegen::default(),
+        }
+    }
+
+    /// Read generated files through `codegen` (without it, nothing is).
+    #[must_use]
+    pub fn with_codegen(mut self, codegen: FsCodegen) -> Self {
+        self.codegen = codegen;
+        self
     }
 }
 
@@ -1251,6 +1340,10 @@ impl hplugin::driver::Driver for Driver {
                         hplugin::driver::Resources::VIEW_CPU,
                     )
                     .context("fs resources")?,
+                // `cache` stays off: the result depends on the local codegen
+                // index, so a cached strict-`file` error would be served after
+                // the index changed. A future cross-run memo must key on the
+                // index generation.
                 ..Default::default()
             },
         })
@@ -1285,11 +1378,16 @@ impl hplugin::driver::Driver for Driver {
         match def {
             FsDef::File { path } => {
                 let path = path.clone();
-                let artifacts =
-                    hcore::blocking::run(enclose::enclose!((self.walker => walker) move || {
-                        file_artifacts(&walker, &root, &path)
-                    }))
-                    .await?;
+                let request_id = req.request_id.clone();
+                let (artifacts, warning) = hcore::blocking::run(
+                    enclose::enclose!((self.walker => walker, self.codegen => cg) move || {
+                        file_artifacts(&walker, &root, &path, &cg, &request_id)
+                    }),
+                )
+                .await?;
+                if let Some(warning) = warning {
+                    warning.log();
+                }
 
                 Ok(RunResponse {
                     artifacts,
@@ -1309,12 +1407,20 @@ impl hplugin::driver::Driver for Driver {
                 let artifacts = match memoized_glob_walk(req.request_id, &key) {
                     Some(artifacts) => artifacts,
                     None => {
-                        let walked = hcore::blocking::run(
-                            enclose::enclose!((self.walker => walker, compiled) move || {
-                                walk_glob(&walker, &root, &compiled)
+                        let (walked, excluded) = hcore::blocking::run(
+                            enclose::enclose!((self.walker => walker, compiled, self.codegen => cg) move || {
+                                walk_glob(&walker, &root, &compiled, &cg)
                             }),
                         )
                         .await?;
+                        codegen::report(&self.codegen, Some(req.request_id), &excluded);
+                        if !excluded.is_empty() {
+                            tracing::debug!(
+                                pattern = %pattern,
+                                "{}",
+                                exclusion_summary(&excluded)
+                            );
+                        }
                         memoize_glob_walk(req.request_id, key, walked)
                     }
                 };
@@ -1345,6 +1451,7 @@ mod tests {
     use hmodel::htaddr::parse_addr;
     use hplugin::driver::{Driver as EDriver, RunRequest};
     use hplugin::provider::Provider as EProvider;
+    use hwalk::codegen_index::CodegenIndex;
     use hwalk::file_hashout;
     use std::fs;
     use tempfile::tempdir;
@@ -1402,6 +1509,7 @@ mod tests {
             GlobFn {
                 skip,
                 walker: Arc::new(CachedWalker::disabled()),
+                codegen: FsCodegen::default(),
             }
             .call(&ctx, args),
         )
@@ -1785,7 +1893,14 @@ mod tests {
             named: Default::default(),
         };
         let walker = Arc::new(CachedWalker::disabled());
-        let Err(err) = GlobFn { skip, walker }.call(&ctx, args).await else {
+        let Err(err) = GlobFn {
+            skip,
+            walker,
+            codegen: FsCodegen::default(),
+        }
+        .call(&ctx, args)
+        .await
+        else {
             panic!("heph.fs.glob: expected the glob to fail")
         };
         assert!(format!("{err:#}").contains("regex size limit"), "{err:#}");
@@ -1861,7 +1976,10 @@ mod tests {
             .await
             .unwrap();
         let def = res.target_def.def::<FsDef>();
-        assert!(matches!(def, FsDef::File { path } if path == "src/main.rs"));
+        assert!(matches!(
+            def,
+            FsDef::File { path } if path == "src/main.rs"
+        ));
         assert!(!res.target_def.cache.enabled);
         assert!(!res.target_def.cache.remote_enabled);
     }
@@ -2068,7 +2186,7 @@ mod tests {
     }
 
     /// `walk_glob` matches the right files (recursively), hashes them, and skips a
-    /// codegen-stamped file. Cross-run cache mechanics are tested in
+    /// file the codegen index recorded. Cross-run cache mechanics are tested in
     /// `htwalk::cached_walker`.
     #[test]
     fn test_walk_glob_matches_and_skips_codegen() {
@@ -2083,18 +2201,118 @@ mod tests {
         let compiled = compile_glob(&skip, "t", "**/*.rs", &[]).unwrap();
         let walker = CachedWalker::disabled();
 
-        let arts = walk_glob(&walker, root, &compiled).unwrap();
+        let (arts, excluded) = walk_glob(&walker, root, &compiled, &FsCodegen::default()).unwrap();
         let mut names: Vec<_> = arts.iter().map(|a| a.name.clone()).collect();
         names.sort();
         assert_eq!(names, vec!["a.rs".to_string(), "sub_b.rs".to_string()]);
         assert!(arts.iter().all(|a| !a.hashout.is_empty()));
+        assert!(excluded.is_empty());
 
-        // A codegen-stamped file drops out of a re-walk.
-        #[cfg(unix)]
-        if xattr::set(root.join("a.rs"), CODEGEN_XATTR, b"//gen:it").is_ok() {
-            let arts = walk_glob(&walker, root, &compiled).unwrap();
-            assert_eq!(arts.len(), 1, "codegen-stamped a.rs is excluded");
+        // A file the index recorded drops out of a re-walk, and is returned
+        // beside the artifacts for the caller to report.
+        let index = index_recording(root, "sub/b.rs", "//gen:it");
+        let cg = FsCodegen::new(index, Arc::new(NoReport));
+        let (arts, excluded) = walk_glob(&walker, root, &compiled, &cg).unwrap();
+        let names: Vec<_> = arts.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["a.rs"], "recorded sub/b.rs is excluded");
+        let excluded: Vec<_> = excluded.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(excluded, vec!["sub/b.rs"]);
+    }
+
+    /// End of walk (codegen index spec, Snapshot): another writer commits a
+    /// pending row for `b.rs` while the glob walks. The walk classified `b.rs`
+    /// from its snapshot, taken before that commit, so it kept it as `Source`;
+    /// the end-of-walk recheck must move it to excluded.
+    ///
+    /// The commit is injected from the index's `lstat` of the recorded `a.rs`,
+    /// which only the walk's own lookup of `a.rs` makes: after the snapshot,
+    /// before the recheck, whichever of `a.rs`/`b.rs` the walk meets first.
+    #[test]
+    fn glob_reclassifies_when_generation_moves_mid_walk() {
+        use hwalk::codegen_index::{
+            FileStat, IndexFs, RealFs, Row, RowKind, StatusKind, StatusReason, Store, StoreOptions,
+            db_path,
+        };
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct CommitOnLstat {
+            inner: RealFs,
+            db: std::path::PathBuf,
+            armed: AtomicBool,
+            fired: AtomicBool,
         }
+        impl IndexFs for CommitOnLstat {
+            fn lstat(&self, path: &std::path::Path) -> std::io::Result<FileStat> {
+                if self.armed.load(Ordering::SeqCst)
+                    && path.ends_with("a.rs")
+                    && !self.fired.swap(true, Ordering::SeqCst)
+                {
+                    // Another process's commit: its own store handle, not
+                    // published to this process's index.
+                    let store = Store::open(&self.db, &StoreOptions::default())
+                        .map_err(std::io::Error::other)?;
+                    let mut row = Row::new("b.rs", "//gen:other", RowKind::File);
+                    row.pending_hash = Some("in-flight".into());
+                    store
+                        .write(|t| t.put(&row))
+                        .map_err(std::io::Error::other)?;
+                }
+                self.inner.lstat(path)
+            }
+            fn read_link(&self, path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+                self.inner.read_link(path)
+            }
+            fn content_hash(&self, path: &std::path::Path) -> anyhow::Result<String> {
+                self.inner.content_hash(path)
+            }
+            fn fresh_hash(&self, path: &std::path::Path, x: bool) -> anyhow::Result<String> {
+                self.inner.fresh_hash(path, x)
+            }
+            fn unlink(&self, path: &std::path::Path) -> std::io::Result<()> {
+                self.inner.unlink(path)
+            }
+        }
+
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        for name in ["a.rs", "b.rs", "c.rs"] {
+            fs::write(root.join(name), name.as_bytes()).unwrap();
+        }
+        let walker = Arc::new(CachedWalker::disabled());
+        let cfs = Arc::new(CommitOnLstat {
+            inner: RealFs::new(Arc::clone(&walker)),
+            db: db_path(root, &root.join(".heph")),
+            armed: AtomicBool::new(false),
+            fired: AtomicBool::new(false),
+        });
+        let index = index_recording_over(root, "a.rs", "//gen:it", cfs.clone());
+        let cg = FsCodegen::new(index, Arc::new(NoReport));
+        let skip = Arc::new(Ignore::new(&[], &[]).unwrap());
+        let compiled = compile_glob(&skip, "t", "*.rs", &[]).unwrap();
+
+        cfs.armed.store(true, Ordering::SeqCst);
+        let (arts, mut excluded) = walk_glob(&walker, root, &compiled, &cg).unwrap();
+        assert!(
+            cfs.fired.load(Ordering::SeqCst),
+            "the walk's lookup of a.rs must have committed b.rs's row"
+        );
+
+        let names: Vec<_> = arts.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["c.rs"], "b.rs went pending mid-walk");
+        excluded.sort_by(|a, b| a.path.cmp(&b.path));
+        assert_eq!(
+            excluded.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(),
+            vec!["a.rs", "b.rs"]
+        );
+        let b = &excluded[1];
+        assert_eq!(
+            (b.kind, b.reason, b.addr.as_deref()),
+            (
+                StatusKind::Generated,
+                Some(StatusReason::Pending),
+                Some("//gen:other")
+            )
+        );
     }
 
     /// The walk carries "resolves into a `.heph*` dir" down from each directory
@@ -2127,7 +2345,7 @@ mod tests {
         let compiled = compile_glob(&skip, "t", "**/*.rs", &[]).unwrap();
         let walker = CachedWalker::disabled();
 
-        let arts = walk_glob(&walker, root, &compiled).unwrap();
+        let (arts, _) = walk_glob(&walker, root, &compiled, &FsCodegen::default()).unwrap();
         let mut names: Vec<_> = arts.iter().map(|a| a.name.clone()).collect();
         names.sort();
         assert_eq!(
@@ -2154,7 +2372,7 @@ mod tests {
         let compiled = compile_glob(&skip, "t", "**/*.rs", &[]).unwrap();
         let walker = CachedWalker::disabled();
 
-        let arts = walk_glob(&walker, root, &compiled).unwrap();
+        let (arts, _) = walk_glob(&walker, root, &compiled, &FsCodegen::default()).unwrap();
         let names: Vec<_> = arts.iter().map(|a| a.name.clone()).collect();
         assert_eq!(
             names,
@@ -2186,11 +2404,17 @@ mod tests {
 
         let skip = Arc::new(Ignore::new(&[], &[]).unwrap());
         let compiled = compile_glob(&skip, "t", "**/*.rs", &[]).unwrap();
-        let res = walk_glob(&CachedWalker::disabled(), root, &compiled);
+        let res = walk_glob(
+            &CachedWalker::disabled(),
+            root,
+            &compiled,
+            &FsCodegen::default(),
+        );
         fs::set_permissions(&heph, fs::Permissions::from_mode(0o755)).unwrap();
 
         let names: Vec<_> = res
             .expect("the walk must not list the .heph* dir")
+            .0
             .iter()
             .map(|a| a.name.clone())
             .collect();
@@ -2346,8 +2570,9 @@ mod tests {
         let compiled = compile_glob(&skip, "t", "pkg/*.go", &[]).unwrap();
         let walker = CachedWalker::disabled();
         let walk = || -> Vec<(String, String)> {
-            let mut v: Vec<_> = walk_glob(&walker, root, &compiled)
+            let mut v: Vec<_> = walk_glob(&walker, root, &compiled, &FsCodegen::default())
                 .unwrap()
+                .0
                 .into_iter()
                 .map(|a| (a.name, a.hashout))
                 .collect();
@@ -3025,14 +3250,15 @@ mod tests {
         let walker = CachedWalker::disabled();
 
         let tree = compile_glob(&skip, "t", "go.mod/**", &[]).unwrap();
-        let arts = walk_glob(&walker, root, &tree).unwrap();
+        let none = FsCodegen::default();
+        let (arts, _) = walk_glob(&walker, root, &tree, &none).unwrap();
         assert_eq!(
             arts.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
             ["go.mod"]
         );
 
         let star = compile_glob(&skip, "t", "go.mod/*", &[]).unwrap();
-        assert!(walk_glob(&walker, root, &star).unwrap().is_empty());
+        assert!(walk_glob(&walker, root, &star, &none).unwrap().0.is_empty());
     }
 
     /// `pattern_matches` must answer exactly what wax answers for the whole
@@ -3420,87 +3646,168 @@ mod tests {
         assert_eq!(result.target_spec.driver, DRIVER_NAME);
     }
 
-    // ─── Codegen-xattr exclusion ───────────────────────────────────────────
+    // ─── Codegen-index exclusion ───────────────────────────────────────────
 
-    /// Stamps the codegen xattr on `path` and returns whether the platform/FS
-    /// actually persisted it. Tests skip their assertions when this is `false`
-    /// so a tmpfs without xattr support can't make them flake.
-    fn stamp_codegen(path: &std::path::Path) -> bool {
-        if xattr::set(path, CODEGEN_XATTR, b"//pkg:gen").is_err() {
-            return false;
-        }
-        has_codegen_xattr(path)
+    /// What a [`CodegenReport`] was told, as `(request id, event)` pairs.
+    #[derive(Default)]
+    struct Recorder {
+        events: parking_lot::Mutex<Vec<(Option<String>, hcore::events::BuildEventKind)>>,
     }
 
-    #[tokio::test]
-    async fn test_driver_run_glob_excludes_stamped_codegen() {
-        let driver = Driver::default();
-        let tmp = tempdir().unwrap();
-        let plain = tmp.path().join("plain.rs");
-        let generated = tmp.path().join("generated.rs");
-        fs::write(&plain, b"plain").unwrap();
-        fs::write(&generated, b"generated").unwrap();
-
-        if !stamp_codegen(&generated) {
-            // Filesystem here doesn't support the codegen xattr; the exclusion
-            // can't be exercised, so don't assert anything misleading.
-            return;
+    impl CodegenReport for Recorder {
+        fn emit(&self, request_id: Option<&str>, kind: hcore::events::BuildEventKind) {
+            self.events
+                .lock()
+                .push((request_id.map(str::to_owned), kind));
         }
+
+        fn first_in_run(&self, _request_id: Option<&str>, _key: &str) -> bool {
+            true
+        }
+    }
+
+    /// A real codegen index over `root` (its db under `root/.heph`) in which
+    /// `rel`, already on disk, is recorded as written by `addr` — through the
+    /// write protocol, as the engine's `copy` write-back records it.
+    fn index_recording(root: &std::path::Path, rel: &str, addr: &str) -> Arc<CodegenIndex> {
+        let walker = Arc::new(CachedWalker::disabled());
+        let fs = Arc::new(hwalk::codegen_index::RealFs::new(walker));
+        index_recording_over(root, rel, addr, fs)
+    }
+
+    /// [`index_recording`] over the given filesystem.
+    fn index_recording_over(
+        root: &std::path::Path,
+        rel: &str,
+        addr: &str,
+        fs: Arc<dyn hwalk::codegen_index::IndexFs>,
+    ) -> Arc<CodegenIndex> {
+        use hwalk::codegen_index::{ImportLockGuard, Landing, LandingContent, TargetLockGuard};
+        let index = Arc::new(CodegenIndex::open(root, &root.join(".heph"), fs).unwrap());
+        index
+            .create_db(&ImportLockGuard::new(Box::new(())))
+            .unwrap();
+        let bytes = fs::read(root.join(rel)).unwrap();
+        let landing = Landing {
+            path: rel.as_bytes().to_vec(),
+            output: "out".into(),
+            content: LandingContent::File {
+                hash: hwalk::bytes_hashout(&bytes, false),
+                x: false,
+            },
+        };
+        let plan = index
+            .snapshot()
+            .unwrap()
+            .needs_write_back(addr, &[landing])
+            .unwrap()
+            .expect("an unrecorded path needs a write-back");
+        let wb = index
+            .begin_write_back(TargetLockGuard::new(addr, Box::new(())), plan)
+            .unwrap();
+        // Step 3 (the bytes) already happened: they are on disk.
+        wb.settle(&|_| true).unwrap();
+        index
+    }
+
+    /// Parse and run the fs target `//@heph/fs:<name>` with `config` over `root`.
+    async fn run_fs(
+        driver: &Driver,
+        name: &str,
+        config: std::collections::HashMap<String, Value>,
+        root: &std::path::Path,
+    ) -> anyhow::Result<Vec<OutputArtifact>> {
+        let mut parse_req = make_parse_req(config);
+        let mut spec = (*parse_req.target_spec).clone();
+        spec.addr = parse_addr(&format!("//{PKG}:{name}")).unwrap();
+        parse_req.target_spec = Arc::new(spec);
+        let parse_res = driver.parse(parse_req, &ctoken()).await.unwrap();
+        let request_id = "test".to_string();
+        let hashin = String::new();
+        let req = make_run_req(
+            &parse_res.target_def,
+            &request_id,
+            root.to_path_buf(),
+            &hashin,
+        );
+        Ok(driver.run(req, &ctoken()).await?.artifacts)
+    }
+
+    fn f_config(path: &str) -> std::collections::HashMap<String, Value> {
+        std::collections::HashMap::from([("f".to_string(), Value::String(path.to_string()))])
+    }
+
+    /// A glob leaves out a path the index recorded, and reports it to the
+    /// request that ran the glob as a typed `CodegenExcluded` event.
+    #[tokio::test]
+    async fn test_driver_run_glob_excludes_recorded_codegen() {
+        let tmp = tempdir().unwrap();
+        fs::write(tmp.path().join("plain.rs"), b"plain").unwrap();
+        fs::write(tmp.path().join("generated.rs"), b"generated").unwrap();
+        let index = index_recording(tmp.path(), "generated.rs", "//pkg:gen");
+        let recorder = Arc::new(Recorder::default());
+        let driver = Driver::default().with_codegen(FsCodegen::new(
+            index,
+            Arc::clone(&recorder) as Arc<dyn CodegenReport>,
+        ));
 
         let config =
             std::collections::HashMap::from([("p".to_string(), Value::String("*.rs".to_string()))]);
-        let parse_res = driver
-            .parse(make_parse_req(config), &ctoken())
-            .await
-            .unwrap();
+        let arts = run_fs(&driver, "glob", config, tmp.path()).await.unwrap();
 
-        let request_id = "test".to_string();
-        let hashin = String::new();
-        let req = make_run_req(
-            &parse_res.target_def,
-            &request_id,
-            tmp.path().to_path_buf(),
-            &hashin,
+        let names: Vec<_> = arts.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["plain.rs"],
+            "the recorded file must be excluded"
         );
-        let res = driver.run(req, &ctoken()).await.unwrap();
-
-        let names: Vec<_> = res.artifacts.iter().map(|a| a.name.as_str()).collect();
-        assert_eq!(names, vec!["plain.rs"], "stamped file must be excluded");
+        let events = recorder.events.lock();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(
+            matches!(
+                &events[0],
+                (Some(rid), hcore::events::BuildEventKind::CodegenExcluded {
+                    path,
+                    status,
+                    reason: Some(reason),
+                    addr: Some(addr),
+                }) if rid == "test"
+                    && path == "generated.rs"
+                    && status == "generated"
+                    && reason == "recorded"
+                    && addr == "//pkg:gen"
+            ),
+            "{events:?}"
+        );
     }
 
+    /// Strict `file` over a recorded path fails, naming the generator; the
+    /// engine reads the typed error to reword it for a removed target.
     #[tokio::test]
-    async fn test_driver_run_file_stamped_codegen_yields_nothing() {
-        let driver = Driver::default();
+    async fn test_driver_run_file_of_recorded_codegen_fails() {
         let tmp = tempdir().unwrap();
-        let generated = tmp.path().join("generated.rs");
-        fs::write(&generated, b"generated").unwrap();
+        fs::write(tmp.path().join("generated.rs"), b"generated").unwrap();
+        let index = index_recording(tmp.path(), "generated.rs", "//pkg:gen");
+        let driver = Driver::default().with_codegen(FsCodegen::new(index, Arc::new(NoReport)));
 
-        if !stamp_codegen(&generated) {
-            return;
-        }
-
-        let config = std::collections::HashMap::from([(
-            "f".to_string(),
-            Value::String("generated.rs".to_string()),
-        )]);
-        let parse_res = driver
-            .parse(make_parse_req(config), &ctoken())
-            .await
-            .unwrap();
-
-        let request_id = "test".to_string();
-        let hashin = String::new();
-        let req = make_run_req(
-            &parse_res.target_def,
-            &request_id,
-            tmp.path().to_path_buf(),
-            &hashin,
+        let Err(err) = run_fs(&driver, "file", f_config("generated.rs"), tmp.path()).await else {
+            panic!("file() over a recorded generated path must fail");
+        };
+        let cg = err
+            .chain()
+            .find_map(|e| e.downcast_ref::<CodegenFileError>())
+            .unwrap_or_else(|| panic!("not a CodegenFileError: {err:#}"));
+        assert_eq!(
+            *cg,
+            CodegenFileError {
+                path: "generated.rs".to_string(),
+                addr: "//pkg:gen".to_string(),
+                kind: CodegenFileErrorKind::Generated,
+            }
         );
-        let res = driver.run(req, &ctoken()).await.unwrap();
-
         assert!(
-            res.artifacts.is_empty(),
-            "file() over a stamped codegen file must yield no artifacts"
+            format!("{err:#}").contains("depend on //pkg:gen"),
+            "{err:#}"
         );
     }
 

@@ -257,6 +257,19 @@ fn main() -> ExitCode {
         // heph's own failure after the target resolved to an entrypoint (or
         // a Ctrl-C before its tool started): its box, and 125 (or 130), so it
         // is never read as the tool's status (R4).
+        // `heph tool codegen`: 1 for findings, 2 for a failure (Decision 20).
+        Err(e)
+            if e.downcast_ref::<commands::tool::codegen::CodegenExit>()
+                .is_some() =>
+        {
+            let exit = e.downcast_ref::<commands::tool::codegen::CodegenExit>();
+            if let Some(err) = exit.and_then(|x| x.error.as_ref())
+                && !heph::commands::errors::render_anyhow(err)
+            {
+                error!(error = %format!("{err:#}"), "Failed");
+            }
+            ExitCode::from(exit.map_or(2, |x| x.code))
+        }
         Err(e) if e.downcast_ref::<commands::run::InvokeFailed>().is_some() => {
             let failed = e.downcast_ref::<commands::run::InvokeFailed>();
             if let Some(f) = failed

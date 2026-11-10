@@ -39,7 +39,9 @@ use std::sync::{Arc, OnceLock, Weak};
 ///   `-j` or `--resource`);
 /// - for a function documented as tree-reading (`heph.fs.glob`,
 ///   `heph.fs.parent`), the workspace tree under `root` as the plugin's walker
-///   sees it.
+///   sees it. The glob also reads this checkout's codegen index and the root
+///   `.gitignore` section, so its value can differ between two checkouts of
+///   one commit (`docs/CODEGEN.md`, Cache keys).
 ///
 /// It must not read the environment, the cwd, `$HOME`, the clock, the network,
 /// or any path outside `root`. Its outputs never contain an absolute path:

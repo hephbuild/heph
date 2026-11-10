@@ -47,7 +47,7 @@ impl Scenario {
     }
 }
 
-fn build_engine(root: &Path) -> Result<Arc<Engine>> {
+pub(crate) fn build_engine(root: &Path) -> Result<Arc<Engine>> {
     let mut e = Engine::new(Config::new(root.to_path_buf(), cache_dir(root)?))
         .context("construct engine")?;
     e.register_provider(|init| {

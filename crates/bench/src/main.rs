@@ -1,3 +1,4 @@
+mod codegen;
 mod compare;
 mod dist;
 mod inprocess;
@@ -35,6 +36,11 @@ enum Cmd {
     MeasureInprocess(MeasureInprocessArgs),
     /// Decide regression between two `run` result files.
     Compare(CompareArgs),
+    /// The codegen index's exact bars on a codegen corpus, on this build's
+    /// own engine (no baseline): a warm build commits nothing and takes no
+    /// lock, a publish copies only its own rows, and `status` on a miss
+    /// stays flat as the section grows. Exits non-zero when one fails.
+    CheckCodegen(CheckCodegenArgs),
 }
 
 #[derive(Args)]
@@ -54,6 +60,10 @@ struct GenerateArgs {
     go_packages: usize,
     #[arg(long, default_value_t = 4)]
     go_max_depth: usize,
+    /// Codegen mode: this many `copy` output files spread over `--packages`,
+    /// plus a root `.gitignore` managed section. 0 = off.
+    #[arg(long, default_value_t = 0)]
+    codegen_files: usize,
     #[arg(long)]
     out: PathBuf,
 }
@@ -141,8 +151,8 @@ struct RunDistArgs {
     /// (same layout `crates/bin-e2e`'s `Dist` expects). Never rebuilt here.
     #[arg(long)]
     candidate_dist: PathBuf,
-    #[arg(long)]
-    baseline_dist: PathBuf,
+    #[arg(long, required_unless_present = "candidate_only")]
+    baseline_dist: Option<PathBuf>,
     #[arg(long)]
     corpus: PathBuf,
     #[arg(long, value_enum)]
@@ -153,8 +163,34 @@ struct RunDistArgs {
     reps: usize,
     #[arg(long)]
     out_candidate: PathBuf,
+    #[arg(long, required_unless_present = "candidate_only")]
+    out_baseline: Option<PathBuf>,
+    /// Time the candidate alone: for a scenario the baseline cannot run
+    /// (`codegen-import`, which N-1 may predate), whose bar `compare` takes
+    /// from another scenario's baseline (`against` in the thresholds file).
+    #[arg(long, conflicts_with_all = ["baseline_dist", "out_baseline"])]
+    candidate_only: bool,
+    /// `codegen-glob-cold` only: also time the candidate's cold glob with the
+    /// index inert (no db, no managed `.gitignore` section) right after each
+    /// of its normal reps, and write those reps here as the scenario
+    /// `codegen-glob-cold-probe-free`: the probe-free baseline the cold
+    /// glob's bar is against (`against` in the thresholds file).
     #[arg(long)]
-    out_baseline: PathBuf,
+    out_probe_free: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct CheckCodegenArgs {
+    /// A codegen corpus (`corpus --codegen-files N`, N >= 2 packages' worth).
+    /// Its heph home is wiped; every BUILD file edited is restored.
+    #[arg(long)]
+    corpus: PathBuf,
+    /// `status` calls per microbench sample.
+    #[arg(long, default_value_t = 200_000)]
+    status_iters: usize,
+    /// Interleaved microbench rounds; the bar is on the medians.
+    #[arg(long, default_value_t = 5)]
+    status_rounds: usize,
 }
 
 #[derive(Args)]
@@ -207,7 +243,34 @@ fn main() -> Result<()> {
             rt.block_on(run_measure_inprocess(args))
         }
         Cmd::Compare(args) => run_compare(args),
+        Cmd::CheckCodegen(args) => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("build tokio runtime")?;
+            rt.block_on(run_check_codegen(args))
+        }
     }
+}
+
+async fn run_check_codegen(args: CheckCodegenArgs) -> Result<()> {
+    let corpus = args
+        .corpus
+        .canonicalize()
+        .with_context(|| format!("canonicalize {}", args.corpus.display()))?;
+    let manifest = bench_corpus::load_manifest(&corpus)
+        .context("load corpus manifest (run `corpus --codegen-files N` first)")?;
+    let checks = codegen::check(&corpus, &manifest, args.status_iters, args.status_rounds).await?;
+    let mut failed = 0;
+    for c in &checks {
+        let verdict = if c.ok { "ok" } else { "FAIL" };
+        println!("{verdict} {}: {}", c.name, c.detail);
+        failed += usize::from(!c.ok);
+    }
+    if failed > 0 {
+        anyhow::bail!("{failed} codegen check(s) failed — see above");
+    }
+    Ok(())
 }
 
 fn run_corpus(args: GenerateArgs) -> Result<()> {
@@ -220,6 +283,7 @@ fn run_corpus(args: GenerateArgs) -> Result<()> {
         fan_out: args.fan_out,
         go_packages: args.go_packages,
         go_max_depth: args.go_max_depth,
+        codegen_files: args.codegen_files,
         ..Default::default()
     };
     let manifest = bench_corpus::generate(&params, &args.out).context("generate corpus")?;
@@ -392,15 +456,34 @@ fn run_dist_both(args: RunDistArgs) -> Result<()> {
     let manifest = bench_corpus::load_manifest(&corpus)
         .context("load corpus manifest (run `corpus` first)")?;
 
+    // `None` under `--candidate-only` (clap makes both present otherwise).
+    let baseline = args
+        .baseline_dist
+        .as_deref()
+        .zip(args.out_baseline.as_deref());
     for _ in 0..args.warmup {
         dist::prepare(&args.candidate_dist, &corpus, args.scenario).context("prepare candidate")?;
-        dist::prepare(&args.baseline_dist, &corpus, args.scenario).context("prepare baseline")?;
+        if let Some((dist_dir, _)) = baseline {
+            dist::prepare(dist_dir, &corpus, args.scenario).context("prepare baseline")?;
+        }
+    }
+
+    if args.out_probe_free.is_some() && !matches!(args.scenario, dist::Scenario::CodegenGlobCold) {
+        anyhow::bail!(
+            "--out-probe-free is the baseline of codegen-glob-cold; not of {}",
+            args.scenario.name()
+        );
     }
 
     let mut candidate_ms = Vec::with_capacity(args.reps);
     let mut baseline_ms = Vec::with_capacity(args.reps);
+    let mut probe_free_ms = Vec::with_capacity(args.reps);
     for i in 0..args.reps {
         let seed = i as u64;
+        if args.scenario.times_index_lookups() {
+            dist::check_populated_index(&args.candidate_dist, &corpus, &manifest)
+                .context("the candidate's codegen index before its rep")?;
+        }
         candidate_ms.push(
             dist::measure_once(
                 &args.candidate_dist,
@@ -411,10 +494,18 @@ fn run_dist_both(args: RunDistArgs) -> Result<()> {
             )
             .context("measure candidate")?,
         );
-        baseline_ms.push(
-            dist::measure_once(&args.baseline_dist, &corpus, &manifest, args.scenario, seed)
-                .context("measure baseline")?,
-        );
+        if args.out_probe_free.is_some() {
+            probe_free_ms.push(
+                dist::measure_probe_free_glob(&args.candidate_dist, &corpus)
+                    .context("measure the candidate with the index inert")?,
+            );
+        }
+        if let Some((dist_dir, _)) = baseline {
+            baseline_ms.push(
+                dist::measure_once(dist_dir, &corpus, &manifest, args.scenario, seed)
+                    .context("measure baseline")?,
+            );
+        }
     }
 
     write_results(
@@ -423,12 +514,12 @@ fn run_dist_both(args: RunDistArgs) -> Result<()> {
         args.scenario.name(),
         candidate_ms,
     )?;
-    write_results(
-        &args.out_baseline,
-        "dist",
-        args.scenario.name(),
-        baseline_ms,
-    )?;
+    if let Some((_, out)) = baseline {
+        write_results(out, "dist", args.scenario.name(), baseline_ms)?;
+    }
+    if let Some(out) = &args.out_probe_free {
+        write_results(out, "dist", dist::PROBE_FREE_GLOB, probe_free_ms)?;
+    }
     Ok(())
 }
 

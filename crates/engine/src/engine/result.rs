@@ -907,38 +907,288 @@ fn codegen_groups(def: &LinkedTargetDef) -> Vec<String> {
         .collect()
 }
 
-/// The `@heph/fs` addrs covering every `codegen = in_place` output path.
-///
-/// Uses the same path→addr mapping as [`crate::engine::expand`]'s synthesized fs
-/// inputs, so a declared in_place output and the input that reads it resolve to
-/// the same addr — which is what lets
-/// [`Engine::check_in_place_inputs_unchanged`] match one against the other.
-/// Verified on a real target: an output `FilePath("go/large/alpha/alpha.go")`
-/// and the input `//@heph/fs:file@f=go/large/alpha/alpha.go` are the same addr.
-fn in_place_fs_addrs(
-    outputs: &[crate::engine::driver::targetdef::Output],
-) -> rustc_hash::FxHashSet<Addr> {
-    use crate::engine::driver::targetdef::path::{CodegenMode, Content};
+/// Whether a target declares `copy` and `in_place` codegen outputs.
+fn codegen_modes(target: &crate::engine::driver::targetdef::TargetDef) -> (bool, bool) {
+    use crate::engine::driver::targetdef::path::CodegenMode;
 
-    let mut out = rustc_hash::FxHashSet::default();
-    for path in outputs
-        .iter()
-        .flat_map(|o| o.paths.iter())
-        .filter(|p| matches!(p.codegen_tree, CodegenMode::InPlace))
-    {
-        out.insert(match &path.content {
-            Content::FilePath(p) => hbuiltins::pluginfs::file_addr(p),
-            Content::Glob(p) => hbuiltins::pluginfs::glob_addr(p, &[]),
-            Content::DirPath(p) => {
-                hbuiltins::pluginfs::glob_addr(&format!("{}/**/*", p.trim_end_matches('/')), &[])
+    let modes = || target.outputs.iter().flat_map(|o| o.paths.iter());
+    (
+        modes().any(|p| matches!(p.codegen_tree, CodegenMode::Copy)),
+        modes().any(|p| matches!(p.codegen_tree, CodegenMode::InPlace)),
+    )
+}
+
+/// Each codegen output group's declared mode (first non-`None` path wins).
+fn codegen_group_modes(
+    target: &crate::engine::driver::targetdef::TargetDef,
+) -> rustc_hash::FxHashMap<&str, &crate::engine::driver::targetdef::path::CodegenMode> {
+    use crate::engine::driver::targetdef::path::CodegenMode;
+
+    let mut group_mode = rustc_hash::FxHashMap::default();
+    for output in &target.outputs {
+        if let Some(mode) = output
+            .paths
+            .iter()
+            .map(|p| &p.codegen_tree)
+            .find(|m| !matches!(m, CodegenMode::None))
+        {
+            group_mode.entry(output.group.as_str()).or_insert(mode);
+        }
+    }
+    group_mode
+}
+
+/// A codegen entry's path as the index keys it: root-relative, normalised.
+fn codegen_rel(root: &std::path::Path, path: &std::path::Path) -> anyhow::Result<Vec<u8>> {
+    hwalk::codegen_index::normalize_rel(root, path)
+        .map(std::borrow::Cow::into_owned)
+        .with_context(|| format!("codegen output {} is outside the workspace", path.display()))
+}
+
+/// Write protocol step 1's input: what every `copy` entry of `cached` puts
+/// in the tree, hashed from the bytes about to land, unchanged entries
+/// included.
+fn codegen_landings(
+    target: &crate::engine::driver::targetdef::TargetDef,
+    cached: &[ResultArtifact],
+    root: &std::path::Path,
+) -> anyhow::Result<Vec<hwalk::codegen_index::Landing>> {
+    use crate::engine::driver::targetdef::path::CodegenMode;
+    use hwalk::codegen_index::{Landing, LandingContent};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let group_mode = codegen_group_modes(target);
+    let mut out = Vec::new();
+    for artifact in cached {
+        if artifact.r#type != ManifestArtifactType::Output
+            || !matches!(
+                group_mode.get(artifact.group.as_str()),
+                Some(CodegenMode::Copy)
+            )
+        {
+            continue;
+        }
+        let group = artifact.group.as_str();
+        let walker = artifact
+            .content
+            .walk()
+            .with_context(|| format!("walk codegen output for the index: {group}"))?;
+        for entry in walker {
+            let WalkEntry { path, kind } =
+                entry.with_context(|| format!("read codegen entry for the index: {group}"))?;
+            let content = match kind {
+                WalkEntryKind::File { mut data, x, .. } => {
+                    let mut bytes = Vec::new();
+                    std::io::Read::read_to_end(&mut data, &mut bytes)
+                        .with_context(|| format!("read generated file {path:?}"))?;
+                    LandingContent::File {
+                        hash: hwalk::bytes_hashout(&bytes, x),
+                        x,
+                    }
+                }
+                WalkEntryKind::Symlink { target } => LandingContent::Symlink {
+                    target: target.as_os_str().as_bytes().to_vec(),
+                },
+            };
+            out.push(Landing {
+                path: codegen_rel(root, &path)?,
+                output: group.to_string(),
+                content,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// A target's current `copy` outputs, as a matcher over root-relative paths:
+/// what settle asks before deleting a leftover heph wrote (J5), and what the
+/// codegen commands ask before keeping or discarding a path.
+#[derive(Debug)]
+pub struct CopyOutputs {
+    /// Output group names, indexed by the entries below.
+    groups: Vec<String>,
+    files: rustc_hash::FxHashMap<Vec<u8>, usize>,
+    dirs: Vec<(Vec<u8>, usize)>,
+    globs: Vec<(wax::Glob<'static>, usize)>,
+}
+
+impl CopyOutputs {
+    pub fn of(target: &crate::engine::driver::targetdef::TargetDef) -> anyhow::Result<Self> {
+        use crate::engine::driver::targetdef::path::{CodegenMode, Content};
+
+        let mut out = Self {
+            groups: Vec::new(),
+            files: rustc_hash::FxHashMap::default(),
+            dirs: Vec::new(),
+            globs: Vec::new(),
+        };
+        for output in &target.outputs {
+            let group = out.groups.len();
+            let mut any = false;
+            for path in output
+                .paths
+                .iter()
+                .filter(|p| matches!(p.codegen_tree, CodegenMode::Copy))
+            {
+                any = true;
+                match &path.content {
+                    Content::FilePath(p) => {
+                        out.files.entry(p.as_bytes().to_vec()).or_insert(group);
+                    }
+                    Content::DirPath(p) => {
+                        let mut d = p.trim_end_matches('/').as_bytes().to_vec();
+                        d.push(b'/');
+                        out.dirs.push((d, group));
+                    }
+                    Content::Glob(p) => out.globs.push((
+                        wax::Glob::new(p)
+                            .map(wax::Glob::into_owned)
+                            .with_context(|| format!("compile copy output glob {p}"))?,
+                        group,
+                    )),
+                }
             }
-        });
+            if any {
+                out.groups.push(output.group.clone());
+            }
+        }
+        Ok(out)
+    }
+
+    /// Whether the target declares any `copy` output at all.
+    pub fn is_empty(&self) -> bool {
+        self.groups.is_empty()
+    }
+
+    /// The output group whose `copy` paths cover `rel`, if any.
+    pub fn output_of(&self, rel: &[u8]) -> Option<&str> {
+        use wax::Program as _;
+
+        let group = self
+            .files
+            .get(rel)
+            .copied()
+            .or_else(|| {
+                self.dirs
+                    .iter()
+                    .find(|(d, _)| rel.starts_with(d))
+                    .map(|(_, g)| *g)
+            })
+            .or_else(|| {
+                let s = std::str::from_utf8(rel).ok()?;
+                self.globs
+                    .iter()
+                    .find(|(g, _)| g.is_match(s))
+                    .map(|(_, g)| *g)
+            })?;
+        self.groups.get(group).map(String::as_str)
+    }
+
+    pub fn contains(&self, rel: &[u8]) -> bool {
+        self.output_of(rel).is_some()
+    }
+}
+
+/// What one pass of [`Engine::materialize_codegen_tree`] may do.
+struct CodegenWrite<'a> {
+    /// Diff against the tree instead of writing.
+    frozen: bool,
+    /// The `copy` entries to write (root-relative), as the write protocol
+    /// selected them; `None` for every entry (the frozen check compares all).
+    copy_writes: Option<&'a rustc_hash::FxHashSet<Vec<u8>>>,
+    /// What the `in_place` guard reads. `None` only for a target with no
+    /// `in_place` group.
+    snapshot: Option<&'a hwalk::codegen_index::Snapshot>,
+}
+
+/// The in-place guard (spec: Readers): an `in_place` target leaves a path
+/// the codegen index records as another target's (`Generated` or
+/// `Modified`) to its owner, and refuses one recorded for itself — a
+/// `copy` output it now claims to rewrite in place. `true`: skip the path.
+fn in_place_skips(
+    snap: Option<&hwalk::codegen_index::Snapshot>,
+    addr: &str,
+    rel: &[u8],
+) -> anyhow::Result<bool> {
+    let Some(snap) = snap else { return Ok(false) };
+    let st = snap.status(rel, &hwalk::codegen_index::LookupMeta::point(false))?;
+    let Some(row) = st.row.filter(|_| st.kind.is_excluded()) else {
+        return Ok(false);
+    };
+    if row.addr != addr {
+        return Ok(true);
+    }
+    let path = String::from_utf8_lossy(rel);
+    anyhow::bail!(
+        "{path} is recorded as a `copy` output of {addr}, which now rewrites it in place; \
+         run heph tool codegen keep {path} to make it a source file first"
+    )
+}
+
+/// The write-back hints (spec: Write-back hints): written paths no section
+/// line covers, and the one-time hint for a workspace with no section.
+fn write_back_hints(addr: &str, outside_section: usize, no_section_hint: bool) -> Vec<String> {
+    let mut out = Vec::new();
+    if outside_section > 0 {
+        let files = if outside_section == 1 {
+            "file"
+        } else {
+            "files"
+        };
+        let verb = if outside_section == 1 { "is" } else { "are" };
+        out.push(format!(
+            "{outside_section} {files} written by {addr} {verb} not in the heph section of \
+             .gitignore; until heph tool codegen gitignore runs, other checkouts and CI will \
+             treat them as source."
+        ));
+    }
+    if no_section_hint {
+        out.push(
+            "this workspace's .gitignore has no heph section: run heph tool codegen gitignore \
+             so every checkout excludes the files codegen targets write"
+                .to_string(),
+        );
     }
     out
 }
 
+/// The `@heph/fs` addrs covering every `codegen = in_place` output path. Same
+/// path→addr mapping `expand::synthesized_fs_inputs` uses
+/// ([`hbuiltins::pluginfs::output_fs_addr`]), so a declared in_place output and
+/// the input that reads it land on the same addr.
+fn in_place_fs_addrs(
+    outputs: &[crate::engine::driver::targetdef::Output],
+) -> rustc_hash::FxHashSet<Addr> {
+    use crate::engine::driver::targetdef::path::CodegenMode;
+
+    outputs
+        .iter()
+        .flat_map(|o| o.paths.iter())
+        .filter(|p| matches!(p.codegen_tree, CodegenMode::InPlace))
+        .map(|p| hbuiltins::pluginfs::output_fs_addr(&p.content))
+        .collect()
+}
+
+/// The hashed inputs of a target that read one of its `in_place` outputs (see
+/// [`in_place_fs_addrs`]). An in_place output the target never read is not
+/// something it transformed, so it is not watched.
+fn in_place_watched_inputs(
+    outputs: &[crate::engine::driver::targetdef::Output],
+    inputs: &[crate::engine::driver::targetdef::Input],
+) -> Vec<Addr> {
+    let guarded = in_place_fs_addrs(outputs);
+    if guarded.is_empty() {
+        return Vec::new();
+    }
+    inputs
+        .iter()
+        .filter(|i| i.hashed && guarded.contains(&i.r#ref.r#ref))
+        .map(|i| i.r#ref.r#ref.clone())
+        .collect()
+}
+
 /// The root-relative paths a codegen write-back moved, each mapped to the
-/// content hashout ([`hwalk::content_hashout`]) of what it wrote there, or
+/// content hashout ([`hwalk::bytes_hashout`]) of what it wrote there, or
 /// `None` for a recreated symlink. See [`Engine::materialize_codegen_tree`].
 type WrittenPaths = rustc_hash::FxHashMap<std::path::PathBuf, Option<String>>;
 
@@ -1061,20 +1311,15 @@ fn guard_eresult(eresult: &EResult, read: &Arc<ResultReadGuard>) -> EResult {
     }
 }
 
-/// Stamp the codegen-provenance xattr on a written-back `copy` output. This is
-/// REQUIRED, not best-effort: the stamp is what makes a later `glob()`/`file()`
-/// exclude the generated file, so a workspace whose filesystem cannot store
-/// extended attributes (some tmpfs/NFS/FAT) must FAIL loudly rather than silently
-/// emit an unstamped output that would then be double-sourced. (`in_place` outputs
-/// are never stamped, so they remain usable on any filesystem.)
+/// Stamp the codegen-provenance xattr on a written-back `copy` output. Set
+/// only, never read by the engine (the codegen index decides exclusion); kept
+/// until v1.1.0 so a rollback still sees its stamps, and best effort: a
+/// filesystem without extended attributes loses nothing the index needs.
 fn stamp_codegen_xattr(path: &std::path::Path, value: &str) -> anyhow::Result<()> {
-    xattr::set(path, hbuiltins::pluginfs::CODEGEN_XATTR, value.as_bytes()).with_context(|| {
-        format!(
-            "stamp codegen xattr on {:?}: `codegen = \"copy\"` requires a filesystem with \
-             extended-attribute support",
-            path
-        )
-    })
+    if let Err(e) = xattr::set(path, hbuiltins::pluginfs::CODEGEN_XATTR, value.as_bytes()) {
+        tracing::debug!(path = %path.display(), error = %e, "codegen xattr not set");
+    }
+    Ok(())
 }
 
 pub type InteractiveInner = Box<
@@ -3727,11 +3972,29 @@ impl Engine {
                 .await?;
         }
 
-        let (target, root) = (Arc::clone(&def.target), self.cfg.root.clone());
-        let written = hcore::blocking::run(move || {
-            Self::materialize_codegen_tree(&target, &cached, &root, frozen)
-        })
-        .await?;
+        self.open_codegen_index(&rs).await?;
+        let written = if frozen {
+            let (target, root) = (Arc::clone(&def.target), self.cfg.root.clone());
+            let index = Arc::clone(&self.codegen_index);
+            hcore::blocking::run(move || {
+                // The frozen check writes and records nothing and takes no
+                // lock; its snapshot only steers the `in_place` guard.
+                let snap = index.snapshot()?;
+                Self::materialize_codegen_tree(
+                    &target,
+                    &cached,
+                    &root,
+                    &CodegenWrite {
+                        frozen: true,
+                        copy_writes: None,
+                        snapshot: Some(&snap),
+                    },
+                )
+            })
+            .await?
+        } else {
+            self.codegen_write_back(&rs, def, cached).await?
+        };
 
         // Test-only seam: an edit landing here reaches the fixpoint recompute
         // below but not the revision it would file. See
@@ -3752,6 +4015,139 @@ impl Engine {
                 .await?;
         }
         Ok(())
+    }
+
+    /// A non-frozen write-back, under the codegen index's write protocol
+    /// (spec: Write protocol; J2, J5, J9).
+    ///
+    /// 1. One blocking job, no lock: the [`Landing`](hwalk::codegen_index::Landing)
+    ///    of every `copy` entry (unchanged ones included) against a snapshot.
+    ///    Nothing to do — a warm run — returns here: no lock, no commit, no
+    ///    file. A target with `in_place` groups still runs the byte mover for
+    ///    them, its `copy` entries untouched.
+    /// 2. With no db yet, the import lock (async, cancellable) and
+    ///    `create_db` under it, released before the target lock.
+    /// 3. The target's codegen lock (async, cancellable: no blocking permit
+    ///    held while waiting); its guard moves into a second blocking job that
+    ///    marks the rows pending, moves only the selected bytes, and settles.
+    ///    A failed settle fails the write-back.
+    async fn codegen_write_back(
+        self: &Arc<Self>,
+        rs: &Arc<RequestState>,
+        def: &LinkedTargetDef,
+        cached: Vec<ResultArtifact>,
+    ) -> anyhow::Result<WrittenPaths> {
+        let target = Arc::clone(&def.target);
+        let (has_copy, has_in_place) = codegen_modes(&target);
+        let root = self.cfg.root.clone();
+        let index = Arc::clone(&self.codegen_index);
+        let addr = target.addr.format();
+        let cached = Arc::new(cached);
+
+        // Step 1: compare, no lock.
+        let plan = if has_copy {
+            hcore::blocking::run(enclose!((target, cached, root, index, addr) move || {
+                let landings = codegen_landings(&target, &cached, &root)?;
+                index.snapshot()?.needs_write_back(&addr, &landings)
+            }))
+            .await
+            .with_context(|| format!("comparing {addr}'s codegen outputs with the index"))?
+        } else {
+            None
+        };
+
+        let Some(plan) = plan else {
+            if !has_in_place {
+                return Ok(WrittenPaths::default());
+            }
+            let none = rustc_hash::FxHashSet::default();
+            return hcore::blocking::run(move || {
+                let snap = index.snapshot()?;
+                Self::materialize_codegen_tree(
+                    &target,
+                    &cached,
+                    &root,
+                    &CodegenWrite {
+                        frozen: false,
+                        copy_writes: Some(&none),
+                        snapshot: Some(&snap),
+                    },
+                )
+            })
+            .await;
+        };
+
+        if index.store().is_none() {
+            let import = self.codegen_locks.import(rs.ctoken()).await?;
+            let idx = Arc::clone(&index);
+            // The guard moves into the job and is released when it ends,
+            // before the target lock is taken (J9).
+            hcore::blocking::run(move || idx.create_db(&import).map(drop))
+                .await
+                .context("creating the codegen index")?;
+        }
+        let guard = self.codegen_locks.target(&addr, rs.ctoken()).await?;
+
+        let outcome = hcore::blocking::run(enclose!((addr) move || -> anyhow::Result<_> {
+            let mut wb = index.begin_write_back(guard, plan)?;
+            let snap = index.snapshot()?;
+            let section = snap.section();
+            let writes: rustc_hash::FxHashSet<Vec<u8>> =
+                wb.writes().map(|l| l.path.clone()).collect();
+            let outside_section = if section.is_present() {
+                wb.writes()
+                    .filter(|l| !section.match_point(&l.path, false).is_territory())
+                    .count()
+            } else {
+                0
+            };
+            let no_section_hint =
+                !writes.is_empty() && !section.is_present() && !index.no_section_hint_shown()?;
+            if no_section_hint {
+                wb.mark_no_section_hint_shown();
+            }
+            let written = Self::materialize_codegen_tree(
+                &target,
+                &cached,
+                &root,
+                &CodegenWrite {
+                    frozen: false,
+                    copy_writes: Some(&writes),
+                    snapshot: Some(&snap),
+                },
+            )?;
+            let outputs = CopyOutputs::of(&target)?;
+            let report = wb
+                .settle(&|p| outputs.contains(p))
+                .with_context(|| format!("recording {addr}'s codegen write-back"))?;
+            Ok((written, report, outside_section, no_section_hint))
+        }))
+        .await?;
+        let (written, report, outside_section, no_section_hint) = outcome;
+        // Recording the flag twice is harmless; printing it twice is not.
+        let no_section_hint = no_section_hint
+            && !self
+                .codegen_no_section_hint_printed
+                .swap(true, std::sync::atomic::Ordering::Relaxed);
+
+        for path in &report.overwritten_edits {
+            let path = String::from_utf8_lossy(path);
+            tracing::warn!(
+                addr = %addr,
+                path = %path,
+                "overwrote hand edits to {path}; the previous content is gone"
+            );
+        }
+        for path in &report.deleted {
+            tracing::debug!(addr = %addr, path = %String::from_utf8_lossy(path), "deleted a codegen output the target no longer produces");
+        }
+        for path in &report.dropped {
+            tracing::debug!(addr = %addr, path = %String::from_utf8_lossy(path), "kept a codegen file the target no longer produces");
+        }
+        for msg in write_back_hints(&addr, outside_section, no_section_hint) {
+            tracing::warn!(addr = %addr, files = outside_section, "{msg}");
+        }
+        Ok(written)
     }
 
     /// Read `outputs` of an already-resolved revision out of the cache, pulling
@@ -3827,12 +4223,14 @@ impl Engine {
         target: &crate::engine::driver::targetdef::TargetDef,
         cached: &[ResultArtifact],
         root: &std::path::Path,
-        frozen: bool,
+        w: &CodegenWrite<'_>,
     ) -> anyhow::Result<WrittenPaths> {
         use crate::engine::driver::targetdef::path::CodegenMode;
+        let frozen = w.frozen;
+        let addr = target.addr.format();
 
         // The root-relative paths this call actually moved, each with the
-        // content hashout (`hwalk::content_hashout`) it now holds. Content
+        // content hashout (`hwalk::bytes_hashout`) it now holds. Content
         // writes, exec-bit reconciles and symlink recreates all count; the
         // codegen xattr does not (it is metadata, outside the `@heph/fs`
         // content+exec-bit hash). Empty therefore means the tree still hashes
@@ -3854,18 +4252,7 @@ impl Engine {
         // several `out` entries sharing a group), so the loop below is driven off
         // the cached artifacts and looks the mode up per artifact — covering every
         // artifact, and exactly once.
-        let mut group_mode: std::collections::HashMap<&str, &CodegenMode> =
-            std::collections::HashMap::new();
-        for output in &target.outputs {
-            if let Some(mode) = output
-                .paths
-                .iter()
-                .map(|p| &p.codegen_tree)
-                .find(|m| !matches!(m, CodegenMode::None))
-            {
-                group_mode.entry(output.group.as_str()).or_insert(mode);
-            }
-        }
+        let group_mode = codegen_group_modes(target);
 
         for artifact in cached {
             if artifact.r#type != ManifestArtifactType::Output {
@@ -3900,7 +4287,7 @@ impl Engine {
                     // divergence there is not drift this target would reconcile —
                     // don't flag it in the frozen check.
                     if matches!(mode, CodegenMode::InPlace)
-                        && hbuiltins::pluginfs::has_codegen_xattr(&tree_path)
+                        && in_place_skips(w.snapshot, &addr, &codegen_rel(root, &entry.path)?)?
                     {
                         continue;
                     }
@@ -3980,8 +4367,16 @@ impl Engine {
                     // the codegen xattr) — doing so would clobber the copy
                     // target's output and leave the provenance pointing at the
                     // wrong producer. Leave such files to their owner.
+                    let rel = codegen_rel(root, &path)?;
                     if matches!(mode, CodegenMode::InPlace)
-                        && hbuiltins::pluginfs::has_codegen_xattr(&dest)
+                        && in_place_skips(w.snapshot, &addr, &rel)?
+                    {
+                        continue;
+                    }
+                    // A `copy` entry is written only when the write protocol
+                    // selected it (step 2); the rest are already recorded.
+                    if matches!(mode, CodegenMode::Copy)
+                        && w.copy_writes.is_some_and(|s| !s.contains(&rel))
                     {
                         continue;
                     }
@@ -4047,7 +4442,7 @@ impl Engine {
                             // the hashes then disagree, and the fixpoint check
                             // refuses — the safe outcome.
                             if moved {
-                                written.insert(path, Some(hwalk::content_hashout(&new_bytes, x)));
+                                written.insert(path, Some(hwalk::bytes_hashout(&new_bytes, x)));
                             }
                         }
                         WalkEntryKind::Symlink { target } => {
@@ -4351,11 +4746,19 @@ impl Engine {
         rs: &Arc<RequestState>,
         def: &LinkedTargetDef,
     ) -> anyhow::Result<()> {
-        // The `@heph/fs` addrs covering the paths about to be overwritten. Same
-        // path→addr mapping `expand::synthesized_fs_inputs` uses, so a declared
-        // in_place output and the input that reads it land on the same addr.
-        let guarded = in_place_fs_addrs(&def.target.outputs);
-        if guarded.is_empty() {
+        // No in_place output: nothing is about to be overwritten.
+        if !def
+            .target
+            .outputs
+            .iter()
+            .flat_map(|o| o.paths.iter())
+            .any(|p| {
+                matches!(
+                    p.codegen_tree,
+                    crate::engine::driver::targetdef::path::CodegenMode::InPlace
+                )
+            })
+        {
             return Ok(());
         }
 
@@ -4371,11 +4774,7 @@ impl Engine {
         // An in_place output the target never read is not something it
         // transformed, so there is no stale-transform hazard to guard — writing
         // it is the declared behaviour.
-        let watched: Vec<Addr> = inputs
-            .iter()
-            .filter(|i| i.hashed && guarded.contains(&i.r#ref.r#ref))
-            .map(|i| i.r#ref.r#ref.clone())
-            .collect();
+        let watched = in_place_watched_inputs(&def.target.outputs, &inputs);
         if watched.is_empty() {
             return Ok(());
         }
@@ -5236,8 +5635,10 @@ impl Engine {
     ) -> anyhow::Result<Arc<Vec<State>>> {
         // Single chokepoint for every provider-dispatch path (get/probe/list all
         // route through here), so the function registry is sealed before any
-        // BUILD eval reads it.
+        // BUILD eval reads it — and so the codegen index is open before any
+        // BUILD eval looks it up.
         self.seal_functions();
+        self.open_codegen_index(rs).await?;
         rs.data
             .mem_probe
             .once(
@@ -5389,6 +5790,26 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tempfile::tempdir;
+
+    #[test]
+    fn write_back_hints_say_what_other_checkouts_see() {
+        assert_eq!(
+            write_back_hints("//p:gen", 2, false),
+            [
+                "2 files written by //p:gen are not in the heph section of .gitignore; until \
+              heph tool codegen gitignore runs, other checkouts and CI will treat them as \
+              source."
+            ]
+        );
+        let both = write_back_hints("//p:gen", 1, true);
+        assert_eq!(both.len(), 2, "{both:?}");
+        assert!(
+            both.first()
+                .is_some_and(|m| m.starts_with("1 file written by //p:gen is not")),
+            "{both:?}"
+        );
+        assert!(write_back_hints("//p:gen", 0, false).is_empty());
+    }
 
     fn file_output(
         source_path: &str,
@@ -13049,12 +13470,70 @@ mod tests {
         Ok(())
     }
 
-    /// End-to-end provenance: after a `copy` codegen target writes+stamps a
-    /// net-new file, a subsequent `@heph/fs` glob over the same tree EXCLUDES it
-    /// (so it is never double-sourced), while an unstamped in_place output stays
-    /// visible to a glob.
+    /// The in-place guard watches the hashed inputs that read an `in_place`
+    /// output's own addr. An unhashed input, another path, a glob that is not
+    /// the output's glob, and a `copy` output do not pair.
+    #[test]
+    fn in_place_pairing_by_addr() {
+        use crate::engine::driver::targetdef::path::{CodegenMode, Content, Path};
+        use crate::engine::driver::targetdef::{Input, InputMode, Output};
+        use hbuiltins::pluginfs::{file_addr, glob_addr};
+
+        let path = |content, codegen_tree| Path {
+            content,
+            codegen_tree,
+            collect: false,
+        };
+        let outputs = vec![Output {
+            group: "main".to_string(),
+            paths: vec![
+                path(Content::FilePath("pkg/a.go".into()), CodegenMode::InPlace),
+                path(Content::Glob("pkg/*.txt".into()), CodegenMode::InPlace),
+                // Not in_place: never guarded.
+                path(Content::FilePath("pkg/c.go".into()), CodegenMode::Copy),
+            ],
+        }];
+        let input = |addr: Addr, hashed| Input {
+            r#ref: crate::engine::driver::TargetAddr {
+                r#ref: addr,
+                output: None,
+                filters: vec![],
+            },
+            mode: InputMode::Standard,
+            origin_id: "o".to_string(),
+            annotations: BTreeMap::new(),
+            hashed,
+            runtime: true,
+        };
+        let inputs = vec![
+            input(file_addr("pkg/a.go"), true),
+            input(file_addr("pkg/a.go"), false),
+            input(file_addr("pkg/b.go"), true),
+            input(glob_addr("pkg/*.txt", &[]), true),
+            input(glob_addr("pkg/*.txt", &["pkg/x.txt"]), true),
+            input(file_addr("pkg/c.go"), true),
+        ];
+
+        let watched: Vec<String> = in_place_watched_inputs(&outputs, &inputs)
+            .iter()
+            .map(Addr::format)
+            .collect();
+        assert_eq!(
+            watched,
+            vec![
+                file_addr("pkg/a.go").format(),
+                glob_addr("pkg/*.txt", &[]).format(),
+            ],
+        );
+    }
+
+    /// End-to-end provenance: after a `copy` codegen target writes a net-new
+    /// file, which its write-back records in the codegen index, a subsequent
+    /// `@heph/fs` glob over the same tree EXCLUDES it (so it is never
+    /// double-sourced), while an in_place output, never recorded, stays visible
+    /// to a glob.
     #[tokio::test]
-    async fn stamped_copy_output_excluded_from_later_glob() -> anyhow::Result<()> {
+    async fn recorded_copy_output_excluded_from_later_glob() -> anyhow::Result<()> {
         let (engine, root) = engine_with_home_fs(vec![
             codegen_run_target("//pkg:cp", "copy", &["*.gen"], "echo generated > out.gen"),
             codegen_run_target("//pkg:ip", "in_place", &["keep.txt"], "true"),
@@ -13063,12 +13542,7 @@ mod tests {
         std::fs::create_dir_all(&pkg_dir)?;
         std::fs::write(pkg_dir.join("keep.txt"), b"keep\n")?;
 
-        // Skip the exclusion assertions on a filesystem that can't persist xattrs.
-        let probe = root.path().join(".xattr_probe");
-        std::fs::write(&probe, b"x")?;
-        let xattr_supported = xattr::set(&probe, hbuiltins::pluginfs::CODEGEN_XATTR, b"v").is_ok();
-
-        // Materialize + stamp the copy output, and write back the in_place file.
+        // Materialize + record the copy output, and write back the in_place file.
         resolve_collecting_events(&engine, &hmodel::htaddr::parse_addr("//pkg:cp")?)
             .await
             .0
@@ -13078,25 +13552,32 @@ mod tests {
             .0
             .expect("in_place target resolves");
 
-        // A glob over the stamped copy output must yield nothing.
+        // A glob over the recorded copy output must yield nothing, and say so
+        // on the request's event stream.
         let gen_glob = hbuiltins::pluginfs::glob_addr("pkg/*.gen", &[]);
-        let (res, _) = resolve_collecting_events(&engine, &gen_glob).await;
+        let (res, events) = resolve_collecting_events(&engine, &gen_glob).await;
         let gen_res = res.expect("glob over generated files resolves");
-        // A glob over the unstamped in_place output must still see it.
+        // A glob over the in_place output must still see it.
         let keep_glob = hbuiltins::pluginfs::glob_addr("pkg/keep.txt", &[]);
         let (res, _) = resolve_collecting_events(&engine, &keep_glob).await;
         let keep_res = res.expect("glob over in_place output resolves");
 
-        if xattr_supported {
-            assert!(
-                gen_res.artifacts.is_empty(),
-                "stamped copy output must be excluded from a later glob, got {} artifacts",
-                gen_res.artifacts.len(),
-            );
-        }
+        assert!(
+            gen_res.artifacts.is_empty(),
+            "recorded copy output must be excluded from a later glob, got {} artifacts",
+            gen_res.artifacts.len(),
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                &e.kind,
+                BuildEventKind::CodegenExcluded { path, addr: Some(addr), .. }
+                    if path == "pkg/out.gen" && addr == "//pkg:cp"
+            )),
+            "the exclusion reaches the request as CodegenExcluded, got {events:?}"
+        );
         assert!(
             !keep_res.artifacts.is_empty(),
-            "unstamped in_place output must remain visible to a glob",
+            "in_place output must remain visible to a glob",
         );
         Ok(())
     }

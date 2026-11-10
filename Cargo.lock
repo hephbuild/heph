@@ -192,6 +192,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "archery"
+version = "1.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33ca55ee147b1926dbea904f50fe4902494e97bc742205abbbf10c709e43815f"
+dependencies = [
+ "triomphe",
+]
+
+[[package]]
 name = "argmax"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1781,6 +1790,7 @@ dependencies = [
  "testkit",
  "tokio",
  "tracing-subscriber",
+ "xattr",
 ]
 
 [[package]]
@@ -3351,6 +3361,22 @@ checksum = "cb68373c0d6620ef8105e855e7745e18b0d00d3bdb07fb532e434244cdb9a714"
 dependencies = [
  "icu_normalizer",
  "icu_properties",
+]
+
+[[package]]
+name = "ignore"
+version = "0.4.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "484be5657551d7868d67587df967fb4fcbe9d266a761cc855aaa148fda0b3cc7"
+dependencies = [
+ "crossbeam-deque",
+ "globset",
+ "log",
+ "memchr",
+ "regex-automata",
+ "same-file",
+ "walkdir",
+ "winapi-util",
 ]
 
 [[package]]
@@ -5162,6 +5188,7 @@ dependencies = [
  "tokio",
  "tracing",
  "walk",
+ "wax",
  "xxhash-rust",
 ]
 
@@ -6033,6 +6060,16 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "rpds"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e025feb26210bc196b908e72deb063b1b4000754304341cbc168a1e72c857ebc"
+dependencies = [
+ "archery",
+ "smallvec",
 ]
 
 [[package]]
@@ -7688,6 +7725,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "357cc3acc6a036009fd6c973ed009037c732d60d0b4f6c673e9041497482a28f"
 
 [[package]]
+name = "unicode-case-mapping"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e9026503b74f3207a4c04e6bf4ea735daa8edf6c0bbfa044cae597bb947a9db"
+
+[[package]]
 name = "unicode-ident"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8539,15 +8582,21 @@ dependencies = [
  "borsh",
  "config",
  "glob",
+ "ignore",
+ "model",
  "parking_lot",
  "r2d2",
  "r2d2_sqlite",
+ "rpds",
  "rusqlite",
  "rustc-hash",
  "sqlite",
  "tempfile",
  "tracing",
+ "unicode-case-mapping",
+ "unicode-normalization",
  "wax",
+ "xattr",
  "xxhash-rust",
 ]
 

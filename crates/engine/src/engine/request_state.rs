@@ -366,6 +366,13 @@ pub struct RequestStateData {
     /// built for. Stamped by that frame (the top-level one) before it resolves any
     /// dependency, so every frame beneath it reads the run's real mode.
     pub(crate) frozen: std::sync::atomic::AtomicBool,
+    /// Keys the fs plugin's codegen reports have already fired for in this
+    /// run ([`CodegenReport::first_in_run`]): a `Modified` warning, an
+    /// unrecorded-match warning and a `CodegenExcluded` event each fire once
+    /// per path per request.
+    ///
+    /// [`CodegenReport::first_in_run`]: hbuiltins::pluginfs::CodegenReport::first_in_run
+    pub(crate) codegen_reported: Mutex<FxHashSet<String>>,
     /// Guards the one-shot `RequestConfig` announcement so it fires once per request
     /// regardless of which entry point (`result` / `result_addr`) is hit first.
     pub workers_announced: std::sync::atomic::AtomicBool,
@@ -1174,6 +1181,58 @@ impl Drop for RequestStateData {
     }
 }
 
+/// The engine's live root requests, by id ([`Engine::requests`]).
+pub type RequestRegistry =
+    Arc<std::sync::Mutex<std::collections::HashMap<String, Weak<RequestState>>>>;
+
+/// Where the fs plugin's codegen reads report (see
+/// [`hbuiltins::pluginfs::CodegenReport`]): an event goes on the stream of the
+/// request whose id it names, and a key fires once per request. A read with no
+/// request (a BUILD evaluation's `heph.fs.glob`), or one whose request is gone,
+/// emits nothing and dedupes engine-wide.
+///
+/// Holds the request registry, not the engine: the fs driver that holds this
+/// is owned by the engine, so a strong engine reference would be a cycle.
+pub(crate) struct EngineCodegenReport {
+    requests: RequestRegistry,
+    /// Keys reported with no live request, for the engine's lifetime.
+    unscoped: Mutex<FxHashSet<String>>,
+}
+
+impl EngineCodegenReport {
+    pub(crate) fn new(requests: RequestRegistry) -> Self {
+        Self {
+            requests,
+            unscoped: Mutex::new(FxHashSet::default()),
+        }
+    }
+
+    fn request(&self, request_id: Option<&str>) -> Option<Arc<RequestState>> {
+        let id = request_id?;
+        let requests = self.requests.lock().ok()?;
+        requests.get(id).and_then(Weak::upgrade)
+    }
+}
+
+impl hbuiltins::pluginfs::CodegenReport for EngineCodegenReport {
+    fn emit(&self, request_id: Option<&str>, kind: crate::engine::event::BuildEventKind) {
+        if let Some(rs) = self.request(request_id) {
+            rs.emit(kind);
+        }
+    }
+
+    fn first_in_run(&self, request_id: Option<&str>, key: &str) -> bool {
+        let first = |set: &Mutex<FxHashSet<String>>| {
+            let mut set = set.lock();
+            !set.contains(key) && set.insert(key.to_owned())
+        };
+        match self.request(request_id) {
+            Some(rs) => first(&rs.data.codegen_reported),
+            None => first(&self.unscoped),
+        }
+    }
+}
+
 /// How a request built by `Engine::new_state_inner` behaves beyond its
 /// front-end options.
 #[derive(Debug, Clone, Copy)]
@@ -1337,6 +1396,7 @@ impl Engine {
             events,
             hooks: self.hooks(),
             frozen: std::sync::atomic::AtomicBool::new(false),
+            codegen_reported: Mutex::new(FxHashSet::default()),
             workers_announced: std::sync::atomic::AtomicBool::new(false),
             matched_announced: std::sync::atomic::AtomicBool::new(false),
             bg_pending: Arc::clone(&bg_pending),

@@ -32,9 +32,11 @@ use std::sync::Arc;
 use wax::{Any, Glob, Program as _};
 
 pub mod cached_walker;
+pub mod codegen_index;
+pub mod gitignore_section;
 pub mod migrate_lock;
 pub use cached_walker::{
-    CachedWalker, DirEntry, DirListing, EntryKind, FileHash, content_hashout, file_hashout,
+    CachedWalker, DirEntry, DirListing, EntryKind, FileHash, bytes_hashout, file_hashout,
     fs_entry_hashout,
 };
 

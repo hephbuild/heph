@@ -28,7 +28,7 @@ mod variant;
 
 pub use driver_compile::GoCompileDriver;
 pub use driver_download::GoDownloadDriver;
-pub use driver_format::{GoFormatCheckDriver, GoFormatDriver};
+pub use driver_format::{GoFormatCheckDriver, GoFormatDriver, format_sources_pattern};
 pub use driver_golist::GoGolistDriver;
 pub use driver_lint::{GoLintDriver, GoLintFixDriver, GoLintGateDriver};
 pub use driver_testmain::GoTestmainDriver;

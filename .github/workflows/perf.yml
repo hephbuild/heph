@@ -117,6 +117,9 @@ jobs:
       # narrows the noise floor itself. Bumped for now — a real number should
       # come from watching `noise_band_pct` in actual runs, not a guess.
       PERFBENCH_REPS: "7"
+      # The codegen bars are on the median of at least 5 interleaved runs
+      # (spec, Bench), whatever PERFBENCH_REPS is tuned to.
+      PERFBENCH_CODEGEN_REPS: "7"
     strategy:
       fail-fast: false
       matrix:
@@ -269,6 +272,20 @@ jobs:
             --go-packages "$PERFBENCH_GO_PACKAGES" \
             --out bench-corpus
 
+      # The codegen scenarios' own corpus: 1,000 packages, 5,000 files that
+      # `copy` targets write back into the tree, under a managed `.gitignore`
+      # section. Separate from `bench-corpus` so the existing scenarios'
+      # numbers stay comparable with earlier runs.
+      - name: Generate codegen corpus
+        run: |
+          ./candidate-dist/heph-bench corpus \
+            --seed 1 \
+            --targets "$PERFBENCH_TARGETS" --packages 1000 \
+            --layers "$PERFBENCH_LAYERS" --fan-out "$PERFBENCH_FAN_OUT" \
+            --go-packages "$PERFBENCH_GO_PACKAGES" \
+            --codegen-files 5000 \
+            --out bench-corpus-codegen
+
       # `heph-bench run inprocess`/`run dist` are themselves the orchestrator
       # now — one call per scenario measures BOTH candidate and baseline,
       # interleaved rep-by-rep internally (see RunInprocessArgs'/RunDistArgs'
@@ -303,6 +320,37 @@ jobs:
               --corpus bench-corpus --scenario "$scenario" --warmup 1 --reps "$PERFBENCH_REPS" \
               --out-candidate "candidate_dist_${scenario}.json" --out-baseline "baseline_dist_${scenario}.json"
           done
+
+      # The codegen index's timed scenarios, Tier B on the codegen corpus.
+      # Each bar is on the median of PERFBENCH_CODEGEN_REPS interleaved runs
+      # (spec: "the median of 5"; `stat` in the thresholds file).
+      # `codegen-glob-cold` also times the candidate with the index inert
+      # (no db, no managed `.gitignore` section) after each of its reps:
+      # that is the probe-free baseline its gating bar is against, written
+      # as `baseline_dist_codegen-glob-cold-probe-free.json`; the row against
+      # N-1 is reported, not gating. `codegen-import` has no N-1 counterpart
+      # (the command is new), so it runs on the candidate alone and "Compare
+      # and report" holds it against the baseline's `codegen-glob-cold`
+      # (`against` in the thresholds file).
+      - name: Time codegen (dist) scenarios
+        if: steps.baseline_fetch.outputs.ok == 'true'
+        continue-on-error: true
+        run: |
+          ./candidate-dist/heph-bench run dist \
+            --candidate-dist candidate-dist --baseline-dist baseline-dist \
+            --corpus bench-corpus-codegen --scenario codegen-glob-cold --warmup 1 --reps "$PERFBENCH_CODEGEN_REPS" \
+            --out-candidate candidate_dist_codegen-glob-cold.json --out-baseline baseline_dist_codegen-glob-cold.json \
+            --out-probe-free baseline_dist_codegen-glob-cold-probe-free.json
+          for scenario in codegen-glob-warm codegen-warm-build; do
+            ./candidate-dist/heph-bench run dist \
+              --candidate-dist candidate-dist --baseline-dist baseline-dist \
+              --corpus bench-corpus-codegen --scenario "$scenario" --warmup 1 --reps "$PERFBENCH_CODEGEN_REPS" \
+              --out-candidate "candidate_dist_${scenario}.json" --out-baseline "baseline_dist_${scenario}.json"
+          done
+          ./candidate-dist/heph-bench run dist \
+            --candidate-dist candidate-dist --candidate-only \
+            --corpus bench-corpus-codegen --scenario codegen-import --warmup 1 --reps "$PERFBENCH_CODEGEN_REPS" \
+            --out-candidate candidate_dist_codegen-import.json
 
       # Every scenario/tier combination is always attempted and reported —
       # `--allow-regression` keeps an individual `compare` call from ever
@@ -342,14 +390,24 @@ jobs:
                 fi
                 base_files=()
                 cand_files=()
-                for scenario in cold full-hit incremental; do
+                for scenario in cold full-hit incremental \
+                    codegen-glob-cold codegen-glob-warm codegen-warm-build codegen-import; do
                   b="baseline_${tier}_${scenario}.json"
                   c="candidate_${tier}_${scenario}.json"
                   if [ -f "$b" ] && [ -f "$c" ]; then
                     base_files+=("$b")
                     cand_files+=("$c")
+                  elif [ -f "$c" ] && [ "$scenario" = "codegen-import" ]; then
+                    # Candidate-only: compared against another scenario's
+                    # baseline (`against` in the thresholds file).
+                    cand_files+=("$c")
                   fi
                 done
+                # Baseline-only: the cold glob's probe-free baseline, which
+                # `codegen-glob-cold`'s gating bar names with `against`.
+                if [ -f "baseline_${tier}_codegen-glob-cold-probe-free.json" ]; then
+                  base_files+=("baseline_${tier}_codegen-glob-cold-probe-free.json")
+                fi
                 if [ ${#base_files[@]} -eq 0 ]; then
                   echo "_no results (run step failed — see logs)_"
                   continue
@@ -388,7 +446,17 @@ jobs:
             exit 1
           fi
 
-      # `always()`: the step above now genuinely exits non-zero on a real
+      # The codegen index's exact bars, on the candidate's own engine: a warm
+      # build commits nothing and takes no lock, a publish copies only its
+      # own rows, `status` on a miss stays flat as the section grows. No
+      # baseline and no noise, so no `continue-on-error`: a failure here is a
+      # broken invariant, not a slow runner. `!cancelled()` so it runs (and
+      # can fail the job) whatever the comparison above decided.
+      - name: Check codegen bars
+        if: ${{ !cancelled() }}
+        run: ./candidate-dist/heph-bench check-codegen --corpus bench-corpus-codegen
+
+      # `always()`: "Compare and report" now genuinely exits non-zero on a real
       # regression, and the numbers are worth having in PostHog regardless of
       # whether this run passed or failed the gate. `event_type` (pull_request
       # vs push) rides along as a property rather than gating which runs get

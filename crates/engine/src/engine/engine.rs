@@ -16,7 +16,7 @@ use hplugin::function::{FunctionRegistry, FunctionSlot, PluginFnDef};
 use hsandboxfuse as sandboxfuse;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex};
 use tracing::{error, warn};
 
 /// Context the engine injects when constructing any plugin (provider, driver, or
@@ -44,6 +44,14 @@ pub struct PluginInit {
     pub skip_globs: Vec<String>,
     /// Shared cross-run filesystem-walk cache for tree-walking plugins.
     pub walker: Arc<hwalk::CachedWalker>,
+    /// This checkout's codegen file index, the engine's one strong `Arc`.
+    /// Built before any plugin (nothing opened, no disk access); the engine
+    /// opens its db, if one exists, in the opening step at the start of the
+    /// first request that can reach a reader, before any BUILD evaluation or
+    /// target run, so a lookup finds it open. A lookup that somehow ran first
+    /// would open it itself (`CodegenIndex::snapshot` opens a db that
+    /// appeared), so the order is a cost, never a correctness, matter.
+    pub codegen_index: Arc<hwalk::codegen_index::CodegenIndex>,
     /// The engine's runtime — what an in-process plugin's memoizers spawn
     /// their computations on. Handed to the plugin, never discovered by it
     /// (a cdylib plugin uses its own runtime instead; this field serves the
@@ -214,6 +222,19 @@ pub struct Engine {
     /// Shared cross-run filesystem-walk cache (separate `fswalk.db`), handed to
     /// tree-walking plugins via [`PluginInit`].
     pub(crate) walker: Arc<hwalk::CachedWalker>,
+    /// This checkout's codegen file index (see [`PluginInit::codegen_index`]).
+    pub(crate) codegen_index: Arc<hwalk::codegen_index::CodegenIndex>,
+    /// Set once the opening step has run: [`Engine::open_codegen_index`].
+    pub(crate) codegen_index_opened: tokio::sync::OnceCell<()>,
+    /// The one way this engine's commands read the provenance xattr an older
+    /// heph stamped: [`Engine::xattr_probe`].
+    pub(crate) xattr_probe: Arc<dyn hwalk::codegen_index::import::XattrProbe>,
+    /// The codegen index's target, section and import locks.
+    pub(crate) codegen_locks: crate::engine::codegen_lock::CodegenLocks,
+    /// The no-section write-back hint was printed by this engine. `meta`
+    /// records it for later runs, but two write-backs of one run can both
+    /// read it unset before either commits; this prints it once.
+    pub(crate) codegen_no_section_hint_printed: std::sync::atomic::AtomicBool,
 
     pub(crate) providers: Vec<Arc<Provider>>,
     pub providers_by_name: HashMap<String, Arc<Provider>>,
@@ -225,7 +246,10 @@ pub struct Engine {
     /// only observed. Usually empty (a cheap no-op on the emit hot path).
     pub(crate) hooks: Vec<Arc<dyn SDKHook>>,
 
-    pub requests: Mutex<HashMap<String, Weak<RequestState>>>,
+    /// Live root requests by id. Shared (`Arc`) with the fs plugin's codegen
+    /// reporter, which routes an event to its request without holding the
+    /// engine (see `EngineCodegenReport`).
+    pub requests: crate::engine::request_state::RequestRegistry,
     /// Every live request's cancellation token, by request id, for
     /// [`cancel_all_requests`](Engine::cancel_all_requests). Not read through
     /// `requests`: that holds the *root* `RequestState`, which the command
@@ -517,6 +541,12 @@ impl Engine {
     ) {
         self.codegen_written_hook = Some(Box::new(hook));
     }
+
+    /// Replace the probe [`xattr_probe`](Self::xattr_probe) hands out, so a
+    /// test can count the xattr reads a command makes, or block one.
+    pub fn set_xattr_probe(&mut self, probe: Arc<dyn hwalk::codegen_index::import::XattrProbe>) {
+        self.xattr_probe = probe;
+    }
 }
 
 impl Drop for EngineFuse {
@@ -796,6 +826,15 @@ impl Engine {
         let walker = Arc::new(hwalk::CachedWalker::open(
             &home.join("cache").join("fswalk.db"),
         ));
+        // Nothing is opened here: the first request's opening step opens the
+        // db if it exists (`open_codegen_index`); nothing ever creates it but
+        // the first commit that needs one.
+        let codegen_index = Arc::new(hwalk::codegen_index::CodegenIndex::unopened(
+            &cfg.root,
+            &home,
+            Arc::new(hwalk::codegen_index::RealFs::new(Arc::clone(&walker))),
+        ));
+        let codegen_locks = crate::engine::codegen_lock::CodegenLocks::new(cfg.lock_backend, &home);
 
         // D12: the cpu capacity comes from the same `parallelism` as everything
         // else here; memory is read on the first admission (`EnginePools`).
@@ -830,12 +869,17 @@ impl Engine {
             #[cfg(any(test, feature = "test-support"))]
             codegen_written_hook: None,
             walker,
+            codegen_index,
+            codegen_index_opened: tokio::sync::OnceCell::new(),
+            xattr_probe: Arc::new(hwalk::codegen_index::import::RealXattr),
+            codegen_locks,
+            codegen_no_section_hint_printed: std::sync::atomic::AtomicBool::new(false),
             providers: vec![],
             providers_by_name: HashMap::new(),
             drivers: vec![],
             drivers_by_name: HashMap::new(),
             hooks: vec![],
-            requests: Mutex::new(HashMap::new()),
+            requests: Arc::new(Mutex::new(HashMap::new())),
             request_ctokens: Mutex::new(HashMap::new()),
             exec_runners: Arc::new({
                 let mut registry = hexecrunner::registry::RunnerRegistry::with_builtins();
@@ -912,15 +956,29 @@ impl Engine {
         // One `Ignore`, shared: the driver and the functions were each handed a
         // separately built copy of the same set. Its matchers compile on first
         // use, so a run that never walks through `fs` never compiles them.
+        //
+        // Both read generated files through the engine's codegen index and
+        // report what it excluded to the request that read them.
+        let codegen_report: Arc<dyn hbuiltins::pluginfs::CodegenReport> = Arc::new(
+            crate::engine::request_state::EngineCodegenReport::new(Arc::clone(&engine.requests)),
+        );
         engine.register_plugin("fs", |init| {
             let ignore = Arc::new(hwalk::Ignore::new(&init.skip_dirs, &init.skip_globs)?);
+            let codegen = hbuiltins::pluginfs::FsCodegen::new(
+                Arc::clone(&init.codegen_index),
+                codegen_report,
+            );
             Ok(PluginParts::default()
                 .with_provider(Box::new(hbuiltins::pluginfs::Provider))
-                .with_driver(Box::new(hbuiltins::pluginfs::Driver::new(
-                    Arc::clone(&ignore),
-                    init.walker.clone(),
+                .with_functions(hbuiltins::pluginfs::functions_with(
+                    &ignore,
+                    &init.walker,
+                    &codegen,
+                ))
+                .with_driver(Box::new(
+                    hbuiltins::pluginfs::Driver::new(Arc::clone(&ignore), init.walker.clone())
+                        .with_codegen(codegen),
                 )))
-                .with_functions(hbuiltins::pluginfs::functions(&ignore, &init.walker)))
         })?;
 
         Ok(engine)
@@ -1037,9 +1095,59 @@ impl Engine {
             skip_dirs: self.skip_dirs(),
             skip_globs: self.skip_globs(),
             walker: self.walker.clone(),
+            codegen_index: Arc::clone(&self.codegen_index),
             runtime: self.runtime.clone(),
             functions: Arc::clone(&self.function_slot),
         }
+    }
+
+    /// This checkout's codegen file index.
+    pub fn codegen_index(&self) -> &Arc<hwalk::codegen_index::CodegenIndex> {
+        &self.codegen_index
+    }
+
+    /// The provenance-xattr probe every command of this engine reads an older
+    /// heph's stamp through (`codegen import`'s walk). [`RealXattr`] unless a
+    /// test replaced it (`set_xattr_probe`), so a test can count the probes
+    /// a command makes, the `status` / `why` hint's included (spec: Upgrade).
+    ///
+    /// [`RealXattr`]: hwalk::codegen_index::import::RealXattr
+    pub fn xattr_probe(&self) -> &Arc<dyn hwalk::codegen_index::import::XattrProbe> {
+        &self.xattr_probe
+    }
+
+    /// The codegen index's cross-process locks (J9): a command takes them
+    /// after resolving every def it needs, one at a time.
+    pub fn codegen_locks(&self) -> &crate::engine::codegen_lock::CodegenLocks {
+        &self.codegen_locks
+    }
+
+    /// The opening step of the codegen index: once per engine, at the start
+    /// of the first request that can reach a reader (a provider call that may
+    /// evaluate BUILD files, a target run, a write-back). Opens this
+    /// checkout's db if it exists, on the blocking pool, under `rs`'s cancel
+    /// token; never creates, imports or walks. A newer, corrupt or unreadable
+    /// db fails the request, naming the file. A cancelled or failed step
+    /// leaves the cell unset, so the next request tries again. After the
+    /// first success this is one atomic load.
+    pub async fn open_codegen_index(&self, rs: &RequestState) -> anyhow::Result<()> {
+        if self.codegen_index_opened.initialized() {
+            return Ok(());
+        }
+        self.codegen_index_opened
+            .get_or_try_init(|| async {
+                let index = Arc::clone(&self.codegen_index);
+                let open = hcore::blocking::run(move || index.open_existing());
+                tokio::select! {
+                    biased;
+                    () = hcore::hasync::Cancellable::cancelled(rs.ctoken()) => {
+                        Err(anyhow::Error::new(hplugin::error::CancelledError))
+                    }
+                    r = open => r.map(drop).context("opening the codegen index"),
+                }
+            })
+            .await
+            .map(drop)
     }
 
     /// The targets' last-failure slots under `<home>/failures/`.
