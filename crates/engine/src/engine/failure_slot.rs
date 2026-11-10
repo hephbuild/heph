@@ -680,7 +680,7 @@ fn move_dir(from: &Path, to: &Path, ops: SlotIo) -> anyhow::Result<()> {
     match (ops.rename)(from, to) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::CrossesDevices => {
-            copy_tree(from, to, ops.copy)
+            hcore::fsutil::copy_tree(from, to, ops.copy)
                 .with_context(|| format!("copying {} to {}", from.display(), to.display()))?;
             if let Err(e) = std::fs::remove_dir_all(from) {
                 tracing::debug!(dir = %from.display(), error = %e, "removing the copied failure_out staging dir");
@@ -689,37 +689,6 @@ fn move_dir(from: &Path, to: &Path, ops: SlotIo) -> anyhow::Result<()> {
         }
         Err(e) => Err(e).with_context(|| format!("moving {} to {}", from.display(), to.display())),
     }
-}
-
-/// Copy the tree at `from` to `to`, which must not exist. A symlink is
-/// copied as a symlink, never followed; anything that is not a file, a
-/// directory or a symlink is skipped.
-fn copy_tree(
-    from: &Path,
-    to: &Path,
-    copy: fn(&Path, &Path) -> io::Result<()>,
-) -> anyhow::Result<()> {
-    use anyhow::Context as _;
-    std::fs::create_dir(to).with_context(|| format!("creating {}", to.display()))?;
-    for entry in std::fs::read_dir(from).with_context(|| format!("listing {}", from.display()))? {
-        let entry = entry.with_context(|| format!("listing {}", from.display()))?;
-        let (src, dst) = (entry.path(), to.join(entry.file_name()));
-        let ft = entry
-            .file_type()
-            .with_context(|| format!("reading the type of {}", src.display()))?;
-        if ft.is_dir() {
-            copy_tree(&src, &dst, copy)?;
-        } else if ft.is_symlink() {
-            let target = std::fs::read_link(&src)
-                .with_context(|| format!("reading the link {}", src.display()))?;
-            std::os::unix::fs::symlink(&target, &dst)
-                .with_context(|| format!("linking {}", dst.display()))?;
-        } else if ft.is_file() {
-            copy(&src, &dst)
-                .with_context(|| format!("copying {} to {}", src.display(), dst.display()))?;
-        }
-    }
-    Ok(())
 }
 
 /// The manifest of the slot at `dir`, if it is complete, of a version this

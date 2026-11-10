@@ -363,7 +363,7 @@ async fn resolve_scope_dir(
                 // warm one.
                 Err(err) => {
                     tracing::debug!(
-                        %addr, slot, error = %err,
+                        %addr, slot, error = %format!("{err:#}"),
                         "could not seed scratch from fallback scope; starting cold",
                     );
                     let dead = own.clone();
@@ -375,29 +375,16 @@ async fn resolve_scope_dir(
     Ok((own, Prepared::Cold))
 }
 
-/// Recursively copy `src` to `dst`, following no symlinks out of the tree.
+/// Recursively copy `src` to `dst`, following no symlinks out of the tree
+/// ([`hcore::fsutil::copy_tree`]).
 ///
-/// Deliberately plain: a reflink would make this near-free on APFS/btrfs and is
-/// the obvious next step, but it is a per-platform optimization and this has to
-/// be correct on every filesystem first. Symlinks are recreated as symlinks
-/// rather than followed, so a slot that has acquired a link to somewhere else
-/// does not silently duplicate that somewhere else into the new scope.
-fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let (from, to) = (entry.path(), dst.join(entry.file_name()));
-        let ft = entry.file_type()?;
-        if ft.is_dir() {
-            copy_tree(&from, &to)?;
-        } else if ft.is_symlink() {
-            let target = std::fs::read_link(&from)?;
-            std::os::unix::fs::symlink(target, &to)?;
-        } else {
-            std::fs::copy(&from, &to)?;
-        }
-    }
-    Ok(())
+/// Deliberately plain: it has to be correct on every filesystem first.
+/// Symlinks are recreated as symlinks rather than followed, so a slot that has
+/// acquired a link to somewhere else does not silently duplicate that
+/// somewhere else into the new scope; a fifo or socket left in a slot is
+/// skipped.
+fn copy_tree(src: &Path, dst: &Path) -> anyhow::Result<()> {
+    hcore::fsutil::copy_tree(src, dst, |from, to| std::fs::copy(from, to).map(drop))
 }
 
 /// True when this input is a scratch reference rather than an ordinary dep.
