@@ -205,6 +205,17 @@ message ManagedRunRequest {
   // nothing", what every older host sends; a run that then resolves a
   // `${resource:}` reference fails.
   map<string, string> allotment = 15;
+  // This one call's cancellation key (since 0.19.1). `request_id` names the
+  // whole engine request, which every target of it shares; this names the run
+  // alone, so cancelling one run (its `timeout`) stops that run and no other.
+  // When present the plugin registers the run's token under it, before the
+  // `run` dispatch returns, and the host cancels the run by it
+  // (`StableCancel::cancel(cancel_key)`), never by `request_id`. It always
+  // starts with `plugin_abi::CANCEL_KEY_PREFIX`, so a plugin tells a cancel for
+  // a call that already ended from a request cancel, and drops it. Absent —
+  // what every older host sends — the run is cancelled by `request_id`, as
+  // before. Sent only to a plugin at 0.19.1 or later.
+  string cancel_key = 16;
 }
 
 // Mirrors driver::RunOptions. Every field is absent unless set, and absence is

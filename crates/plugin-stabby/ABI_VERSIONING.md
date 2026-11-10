@@ -229,11 +229,25 @@ skipped in silence.
 
 - **0.19.1** (additive patch) — target timeouts. `TargetDef.timeout_ms` (13,
   `uint64`): how long the run may take, which the host enforces around the
-  driver's `run`. Absent is no limit; a present 0 is refused at decode. A 0.19.0
-  plugin's defs have no limit (its drivers refuse a `timeout` attribute as an
-  unknown key, so nothing is lost silently); a 0.19.1 plugin on a 0.19.0 host
-  has its `timeout_ms` dropped at decode and its targets run unbounded. Never
-  hashed. `TargetDef` struct literals in SDK code need the new field (a source
+  driver's `run`. Absent is no limit; a present 0 is refused at decode. Never
+  hashed. A timeout cancels one run, but a cancel across the seam named the
+  whole request (`StableCancel::cancel(request_id)`, shared by every target of
+  the request: it tripped every in-flight call of that driver and parked the id
+  for the next one), so `ManagedRunRequest.cancel_key` (16, `string`) gives each
+  run call a key of its own. The host mints it (unique in the process, starting
+  with `plugin_abi::CANCEL_KEY_PREFIX`) and cancels the run by it alone; the SDK
+  registers the run's token under it before the `run` dispatch returns, so a
+  cancel is never early and a key is never parked — one naming no run in flight
+  is for a run that ended, and is dropped. A request cancel still reaches every
+  run: each run's token is cancelled with its request. `request_id` is still
+  sent and still keys the runner callback. The skew, both ways: a 0.19.0 plugin
+  is sent no key (the host reads its reported version) and is cancelled by
+  `request_id` as before; it cannot declare a timeout (its `TargetDef` has no
+  such field), so its runs are cancelled only with their request, where the
+  request-wide cancel is right. A 0.19.1 plugin on a 0.19.0 host gets no key and
+  falls back to `request_id`, and its `timeout_ms` is dropped at decode, so its
+  targets run unbounded: accepted, by decision — no host capability bit refuses
+  it. `TargetDef` struct literals in SDK code need the new field (a source
   break, not a wire break). `MIN_PLUGIN_ABI` stays 0.19.0.
 - **0.19.0** (break) — the exec-runner seam says whether the target runs on a
   terminal. `PrepareRequest` and `RunnerRequest` (`hexecrunner::wire`) end in

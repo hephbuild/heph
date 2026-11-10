@@ -35,10 +35,24 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// 0.19.1 (additive, a patch): target timeouts. `TargetDef.timeout_ms` (13,
 /// `uint64`) — how long the run may take; the host enforces it around the
 /// driver's `run` (cancel, a grace period, then abandon). Absent is no limit; a
-/// present 0 is refused. The skew, both ways: a 0.19.0 plugin sends none, and its
-/// drivers refuse a `timeout` attribute as an unknown key, so nothing is dropped
-/// silently on that side; a 0.19.1 plugin on a 0.19.0 host has its timeout
-/// dropped at decode and runs unbounded. Never hashed. No plugin must be rebuilt.
+/// present 0 is refused. Never hashed.
+///
+/// A timeout cancels one run, but a cancel across the seam named the whole
+/// request (`StableCancel::cancel(request_id)`, which every target of the
+/// request shares), so it also gets `ManagedRunRequest.cancel_key` (16,
+/// `string`): one key per run call, minted by the host and starting with
+/// [`CANCEL_KEY_PREFIX`]. The plugin registers the run's token under it before
+/// its `run` dispatch returns; the host cancels a run by its key alone, so a
+/// timeout stops that run and no sibling. A request cancel still reaches every
+/// run, since each run's own token is cancelled with the request.
+///
+/// The skew, both ways: a 0.19.0 plugin is sent no key and its runs are
+/// cancelled by `request_id` as before; it cannot declare a timeout (its
+/// `TargetDef` has no such field), so its runs are cancelled only with their
+/// request, and the request-wide cancel is right. A 0.19.1 plugin on a 0.19.0
+/// host gets no key and falls back to `request_id`, and its `timeout_ms` is
+/// dropped at decode, so its targets run unbounded: accepted, by decision —
+/// there is no host capability to refuse it on. No plugin must be rebuilt.
 ///
 /// 0.19.0 (a break): the exec-runner seam says whether the target runs on a
 /// terminal. `PrepareRequest` and `RunnerRequest` (`hexecrunner::wire`) end in
@@ -281,6 +295,18 @@ pub const MIN_PLUGIN_ABI: &str = "0.19.0";
 /// [`ABI_SEMVER`], NUL-terminated: what a plugin's `heph_plugin_abi_semver`
 /// entry returns a pointer to. Bumped with it; a test holds the two equal.
 pub const ABI_SEMVER_C: &std::ffi::CStr = c"0.19.1";
+
+/// The first plugin ABI that reads `ManagedRunRequest.cancel_key`. The host
+/// sends a key, and cancels a run by it, only to a plugin at this version or
+/// later; an older one is cancelled by `request_id`.
+pub const CANCEL_KEY_SINCE: &str = "0.19.1";
+
+/// The prefix of every `ManagedRunRequest.cancel_key`. A plugin sees cancels
+/// for request ids and for run keys through the one `cancel` entry; one with
+/// this prefix that names no run in flight is for a run that already ended,
+/// and is dropped rather than parked as a request cancel for a later call.
+/// Engine request ids (`req-{n}`) never start with it.
+pub const CANCEL_KEY_PREFIX: &str = "heph-run-cancel:";
 
 /// Decode a wire message from a trusted peer.
 ///

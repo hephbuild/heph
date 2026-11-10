@@ -57,12 +57,22 @@ removing it never rebuilds anything.
 
 ## Which drivers accept it
 
-`exec` and `bash`. Every other driver refuses `timeout` as an unknown attribute
-at parse, so a declaration is never silently ignored. A driver adds it by
-carrying a `timeout: Option<hplugin::driver::Timeout>` field on its spec and
-moving it onto `TargetDef.timeout`; it must not fold it into its own def or
-hash.
+`exec` and `bash`. Every other in-tree driver refuses `timeout` as an unknown
+attribute at parse, so a declaration is never silently ignored. A driver adds
+it by carrying a `timeout: Option<hplugin::driver::Timeout>` field on its spec
+and moving it onto `TargetDef.timeout`; it must not fold it into its own def or
+hash. A cdylib driver can do the same: its timeout is enforced exactly like an
+in-process driver's.
 
 A cdylib driver's timeout crosses the plugin ABI as `TargetDef.timeout_ms`
-(since ABI 0.19.1). A 0.19.0 plugin sends none; a 0.19.1 plugin on a 0.19.0
-host has it dropped at decode and runs unbounded.
+(since ABI 0.19.1). Cancelling a timed-out run stops that run alone: each run
+call carries its own `ManagedRunRequest.cancel_key`, and the host cancels it by
+that key, not by the request id every target of the request shares (which would
+also stop every sibling run of the same driver). A cancelled request still
+stops every run.
+
+Skew, both ways. A 0.19.0 plugin cannot declare a timeout (its `TargetDef` has
+none), so its runs are cancelled only with their request; the host cancels
+them by request id, as before. A 0.19.1 plugin on a 0.19.0 host has its
+timeout dropped at decode and its targets run unbounded: an accepted outcome,
+by decision, not refused.

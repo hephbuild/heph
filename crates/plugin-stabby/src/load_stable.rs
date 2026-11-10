@@ -322,7 +322,8 @@ pub fn load(
     // from another ABI is refused here, once, rather than failing each call
     // with whatever the skew happens to break (a wire-only break passes
     // stabby's structural check below).
-    check_plugin_abi(path, plugin_abi_version(&lib).as_deref())?;
+    let reported_abi = plugin_abi_version(&lib);
+    check_plugin_abi(path, reported_abi.as_deref())?;
 
     // Scope the symbol borrow so the library can be leaked after the call.
     let comps: PluginComponents = {
@@ -403,8 +404,11 @@ pub fn load(
         .transpose()
         .with_context(|| format!("loading plugin {name:?}"))?;
 
-    let host_drivers =
-        decode_drivers(drivers).with_context(|| format!("loading plugin {name:?}"))?;
+    let host_drivers = decode_drivers(drivers)
+        .with_context(|| format!("loading plugin {name:?}"))?
+        .into_iter()
+        .map(|(local, d)| (local, d.with_plugin_abi(reported_abi.as_deref())))
+        .collect();
 
     let mut host_hooks = Vec::new();
     for nh in hooks {
@@ -630,10 +634,11 @@ fn provider_cancel(inner: &Arc<DynProvider>, request_id: &str) -> impl FnOnce() 
     move || inner.cancel(id.into())
 }
 
-/// The cancel signal for a driver call.
-fn driver_cancel(inner: &Arc<DynManagedDriver>, request_id: &str) -> impl FnOnce() + Send {
+/// The cancel signal for a driver call: its `request_id`, or a run's own
+/// `cancel_key`.
+fn driver_cancel(inner: &Arc<DynManagedDriver>, id: &str) -> impl FnOnce() + Send {
     let inner = Arc::clone(inner);
-    let id = request_id.to_string();
+    let id = id.to_string();
     move || inner.cancel(id.into())
 }
 
@@ -879,6 +884,11 @@ pub struct StableRemoteManagedDriver {
     /// Decoded once, at load: `schema` has no error channel, and the plugin's
     /// answer never changes.
     schema: Arc<DriverSchema>,
+    /// The plugin reads `ManagedRunRequest.cancel_key` (ABI 0.19.1 and later):
+    /// each run gets a key of its own and is cancelled by it alone. Otherwise a
+    /// run is cancelled by its `request_id`, which trips every call of this
+    /// driver in flight under the request.
+    cancel_keys: bool,
 }
 
 impl StableRemoteManagedDriver {
@@ -886,6 +896,9 @@ impl StableRemoteManagedDriver {
     /// decode fails here — at load, naming the driver — rather than reading as
     /// the empty schema on every call, which would flag each of the driver's
     /// keys as unknown.
+    ///
+    /// The driver is taken to be at this host's ABI; [`with_plugin_abi`]
+    /// (Self::with_plugin_abi) says otherwise.
     pub fn new(inner: DynManagedDriver, name: impl Into<String>) -> anyhow::Result<Self> {
         use anyhow::Context as _;
         let name = name.into();
@@ -895,8 +908,45 @@ impl StableRemoteManagedDriver {
             inner: Arc::new(inner),
             name,
             schema: Arc::new(schema),
+            cancel_keys: true,
         })
     }
+
+    /// The ABI version the plugin reported at load (`None`: it reported none).
+    /// Decides how a run is cancelled across the seam: by its own
+    /// `cancel_key` from [`plugin_abi::CANCEL_KEY_SINCE`] on, by `request_id`
+    /// before it.
+    #[must_use]
+    pub fn with_plugin_abi(mut self, reported: Option<&str>) -> Self {
+        self.cancel_keys = reported.is_some_and(reads_cancel_key);
+        self
+    }
+}
+
+/// Whether a plugin reporting ABI `reported` reads `ManagedRunRequest.cancel_key`.
+/// A version that does not parse is taken not to.
+fn reads_cancel_key(reported: &str) -> bool {
+    match (
+        semver::Version::parse(reported),
+        semver::Version::parse(plugin_abi::CANCEL_KEY_SINCE),
+    ) {
+        (Ok(plugin), Ok(since)) => plugin >= since,
+        _ => false,
+    }
+}
+
+/// A fresh `ManagedRunRequest.cancel_key`: unique in this process, so across
+/// every engine and plugin in it, and never reused, so a cancel that arrives
+/// after its run ended can name nothing else.
+fn mint_cancel_key() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // Only uniqueness is needed; no other memory is published through it.
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "{}{}",
+        plugin_abi::CANCEL_KEY_PREFIX,
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 /// A provider's `StateSchema` meta answer. Empty bytes are "no schema"; any
@@ -1021,6 +1071,9 @@ impl StableRemoteManagedDriver {
         ct: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ManagedRunResponse> {
         let request_id = req.request.request_id.clone();
+        // This run's own cancel key, for a plugin that reads one. `request_id`
+        // still rides the request: the runner callback keys on it.
+        let cancel_key = self.cancel_keys.then(mint_cancel_key);
         let deferred = convert::deferred_to_pb(&req.request.deferred)?;
         // N9 is enforced here, at the seam: options for a def that declared no
         // entrypoint are refused rather than sent (the engine is the sender and
@@ -1075,6 +1128,7 @@ impl StableRemoteManagedDriver {
                 .as_ref()
                 .map(convert::allotment_to_pb)
                 .unwrap_or_default(),
+            cancel_key: cancel_key.clone(),
             ..Default::default()
         };
         // `run` is bidi: the request stream carries the run request (RunInFrame),
@@ -1194,7 +1248,13 @@ impl StableRemoteManagedDriver {
         let result = {
             let background = futures::future::join(pump, relay);
             futures::pin_mut!(background);
-            let run = await_with_cancel(ct, driver_cancel(&self.inner, &request_id), rx);
+            // By the run's own key when it has one: `ct` is this run's token
+            // (a timed run's own, a request cancel forwarded into it), so its
+            // firing names this run, not every run of the request. The plugin
+            // registered the key before `invoke_bidi` above resolved, and this
+            // is the first point a cancel can be sent, so it is never early.
+            let cancel_by = cancel_key.as_deref().unwrap_or(&request_id);
+            let run = await_with_cancel(ct, driver_cancel(&self.inner, cancel_by), rx);
             futures::pin_mut!(run);
             // `pump` and `relay` never complete; the run's terminal result ends
             // the select, which drops `relay` and with it `in_tx`, ending the
@@ -1493,6 +1553,33 @@ mod tests {
         assert!(refusal(Some("0.9.0")).contains("(plugin 0.9.0; host "));
         let pre = format!("{}-rc.1", plugin_abi::MIN_PLUGIN_ABI);
         assert!(refusal(Some(&pre)).contains(&format!("(plugin {pre}; host ")));
+    }
+
+    /// A run is sent its own cancel key, and cancelled by it, only from 0.19.1
+    /// on; an older plugin, or one whose version does not parse, is cancelled
+    /// by request id. Compared as semver ("0.19.10" is later than "0.19.1").
+    #[test]
+    fn only_a_plugin_from_0_19_1_reads_cancel_keys() {
+        for (v, reads) in [
+            ("0.19.0", false),
+            ("0.19.1-rc.1", false),
+            ("0.19.1", true),
+            ("0.19.10", true),
+            (plugin_abi::ABI_SEMVER, true),
+            ("not a version", false),
+        ] {
+            assert_eq!(reads_cancel_key(v), reads, "{v}");
+        }
+    }
+
+    /// Keys are unique and carry the prefix a plugin tells them apart by.
+    #[test]
+    fn minted_cancel_keys_are_unique_and_prefixed() {
+        let (a, b) = (mint_cancel_key(), mint_cancel_key());
+        assert_ne!(a, b);
+        for k in [a, b] {
+            assert!(k.starts_with(plugin_abi::CANCEL_KEY_PREFIX), "{k}");
+        }
     }
 
     /// A schema is decoded once, at load, and one that does not decode fails
