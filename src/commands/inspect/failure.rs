@@ -87,18 +87,26 @@ async fn execute_async(args: Args, _sink: LogSink, global: GlobalOptions) -> any
     let addr = htaddr::parse_addr_with_base(args.addr.as_ref(), &base)
         .with_context(|| format!("parse {}", args.addr))?;
     let (engine, _shutdown) = bootstrap::new_engine(&global)?;
-    let Some(view) = failure_view(engine.failure_slots(), &addr)? else {
-        anyhow::bail!("no recorded failure for {}", addr.format());
-    };
-    if args.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&view).context("serialize failure")?
-        );
-    } else {
-        print!("{}", render_text(&view));
-    }
+    let view = failure_view(engine.failure_slots(), &addr)?;
+    print!("{}", render(&addr, view.as_ref(), args.json)?);
     Ok(())
+}
+
+/// What the command prints on stdout for `view`, or the error it exits 1
+/// with. With no recorded failure, text mode is an error (`no recorded
+/// failure for <addr>` on stderr, exit 1), while `--json` prints `null` and
+/// succeeds: a script tells "no failure" from "the command broke" by the exit
+/// code alone.
+fn render(addr: &Addr, view: Option<&FailureView>, json: bool) -> anyhow::Result<String> {
+    if json {
+        let mut out = serde_json::to_string_pretty(&view).context("serialize failure")?;
+        out.push('\n');
+        return Ok(out);
+    }
+    match view {
+        Some(view) => Ok(render_text(view)),
+        None => anyhow::bail!("no recorded failure for {}", addr.format()),
+    }
 }
 
 #[cfg(test)]
@@ -143,6 +151,53 @@ mod tests {
         let other = htaddr::parse_addr("//web:other").expect("addr");
         assert_eq!(failure_view(&slots, &other).expect("read"), None);
         assert!(!slots.slot_dir(&other).exists());
+    }
+
+    /// No recorded failure: text mode is an error naming the target (exit 1),
+    /// `--json` is `null` on stdout and a success.
+    #[test]
+    fn no_recorded_failure_text_errors_json_is_null() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: Args,
+        }
+
+        let home = tempfile::tempdir().expect("tempdir");
+        let slots = FailureSlots::new(home.path());
+        for (argv, want) in [
+            (&["failure", "//web:lint"][..], None),
+            (&["failure", "//web:lint", "--json"][..], Some("null\n")),
+        ] {
+            let args = Cli::try_parse_from(argv).expect("parse").args;
+            let addr = htaddr::parse_addr(&args.addr).expect("addr");
+            let view = failure_view(&slots, &addr).expect("read");
+            assert_eq!(view, None, "{argv:?}");
+            let got = render(&addr, view.as_ref(), args.json);
+            match want {
+                Some(want) => assert_eq!(got.expect("json succeeds"), want, "{argv:?}"),
+                None => assert_eq!(
+                    got.expect_err("text mode exits 1").to_string(),
+                    "no recorded failure for //web:lint"
+                ),
+            }
+        }
+    }
+
+    /// A recorded failure renders through the same step in both modes.
+    #[test]
+    fn render_prints_the_view() {
+        let addr = htaddr::parse_addr("//web:lint").expect("addr");
+        let (_home, slots) = slot(&addr, true);
+        let view = failure_view(&slots, &addr).expect("read").expect("a slot");
+        assert_eq!(
+            render(&addr, Some(&view), false).expect("text"),
+            render_text(&view)
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&render(&addr, Some(&view), true).expect("json")).expect("parse");
+        assert_eq!(json, serde_json::to_value(&view).expect("serialize"));
     }
 
     #[test]

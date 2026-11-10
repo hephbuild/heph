@@ -154,11 +154,17 @@ pub enum InspectCommands {
     /// `out` (its `failure_out` matches, laid out as in the workspace) and
     /// `fixes` (every file an `in_place` write-back changed). Nothing is
     /// built: this reads what the last failure recorded, and a pass or cache
-    /// hit since has cleared it. With no recorded failure it exits 1.
+    /// hit since has cleared it.
     ///
     /// --json prints `{addr, slot, hashin, failed_at, log, out, fixes}`, the
     /// paths absolute and an absent part `null`, so a CI step or an agent can
-    /// find a failed run's traces without knowing the slot's key.
+    /// find a failed run's traces without knowing the slot's key. `hashin`
+    /// (the failed run's input hash) and `failed_at` (milliseconds since the
+    /// Unix epoch) are in the JSON only.
+    ///
+    /// With no recorded failure, the text form prints `no recorded failure
+    /// for <addr>` on stderr and exits 1; --json prints `null` and exits 0,
+    /// so a script tells "no failure" from "the command broke".
     ///
     /// Examples:
     ///
