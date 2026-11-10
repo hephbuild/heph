@@ -1,6 +1,7 @@
 mod def;
 mod deps;
 mod deps_explorer;
+pub mod failure;
 mod functions;
 mod hashin;
 mod hashout;
@@ -146,6 +147,25 @@ pub enum InspectCommands {
     ///
     /// `heph inspect path //cmd/server:bin //lib:core --no-transitive`
     Path(path::Args),
+    /// Print where a target's last failure was kept (log, failure_out, fixes)
+    ///
+    /// Reads the target's failure slot and prints its directory, then the
+    /// path of each part the failed run left: `log` (the full process log),
+    /// `out` (its `failure_out` matches, laid out as in the workspace) and
+    /// `fixes` (every file an `in_place` write-back changed). Nothing is
+    /// built: this reads what the last failure recorded, and a pass or cache
+    /// hit since has cleared it. With no recorded failure it exits 1.
+    ///
+    /// --json prints `{addr, slot, hashin, failed_at, log, out, fixes}`, the
+    /// paths absolute and an absent part `null`, so a CI step or an agent can
+    /// find a failed run's traces without knowing the slot's key.
+    ///
+    /// Examples:
+    ///
+    /// `heph inspect failure //web:e2e`
+    ///
+    /// `heph inspect failure //web:e2e --json`
+    Failure(failure::Args),
     /// Show the `provider_state(...)` declared across the package tree
     ///
     /// A `provider_state(provider="X", …)` call in a BUILD file configures
@@ -203,6 +223,7 @@ impl InspectCommands {
             InspectCommands::Deps(args) => deps::execute(args, sink, global),
             InspectCommands::Revdeps(args) => revdeps::execute(args, sink, global),
             InspectCommands::Path(args) => path::execute(args, sink, global),
+            InspectCommands::Failure(args) => failure::execute(args, sink, global),
             InspectCommands::States(args) => states::execute(args, sink, global),
             InspectCommands::Functions(args) => functions::execute(args, sink, global),
         }

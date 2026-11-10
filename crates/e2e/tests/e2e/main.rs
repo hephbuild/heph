@@ -41,6 +41,7 @@ mod group;
 mod group_relocate;
 mod home_dir;
 mod http_fetch;
+mod inspect_failure;
 mod label_select;
 mod listed_facts;
 mod oci;
