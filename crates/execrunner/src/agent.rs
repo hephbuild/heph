@@ -834,8 +834,16 @@ async fn run_one(conn: &mut UnixStream, fds: [OwnedFd; 3]) -> anyhow::Result<Exe
     //
     // **EOF is the client being gone**, guaranteed by the kernel even when the
     // client is `SIGKILL`ed, and it is this agent's job to escalate from there.
+    //
+    // A relayed signal is a cancel too, and is remembered as one: whatever it
+    // leaves of the target's group once the target exits is killed, as
+    // `proc_exec` does for a cancelled local target. The cost is at a
+    // `--shell` prompt: a background job that ignores SIGINT dies when the
+    // shell is Ctrl+C'd out.
+    let relayed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let eof = tokio::task::spawn_blocking({
         let peer = conn.try_clone().ok();
+        let relayed = Arc::clone(&relayed);
         move || {
             let Some(mut peer) = peer else {
                 return;
@@ -847,8 +855,12 @@ async fn run_one(conn: &mut UnixStream, fds: [OwnedFd; 3]) -> anyhow::Result<Exe
                     Ok(0) | Err(_) => return,
                     // `killpg`, not `kill`: the target is a process-group
                     // leader, and a shell's own children are what a Ctrl+C is
-                    // usually aimed at.
-                    Ok(_) => killpg(pgid, i32::from(byte[0])),
+                    // usually aimed at. Recorded before it is sent, so a
+                    // target the signal ends is never seen exiting without it.
+                    Ok(_) => {
+                        relayed.store(true, std::sync::atomic::Ordering::Release);
+                        killpg(pgid, i32::from(byte[0]));
+                    }
                 }
             }
         }
@@ -860,6 +872,13 @@ async fn run_one(conn: &mut UnixStream, fds: [OwnedFd; 3]) -> anyhow::Result<Exe
     let mut waiter = waiter;
     tokio::select! {
         status = &mut waiter => {
+            // The target is reaped, which is what makes its id safe to signal
+            // (see `hproc::process_supervisor::kill_group`): kill what a
+            // relayed signal left of its group — a descendant that ignored the
+            // SIGINT, as a shell's `&` job does.
+            if relayed.load(std::sync::atomic::Ordering::Acquire) {
+                killpg(pgid, libc::SIGKILL);
+            }
             match status {
                 Ok(Ok(st)) => Ok(outcome_of(st)),
                 Ok(Err(e)) => Ok(ExecOutcome::Failed(format!("wait for target: {e}"))),
@@ -867,20 +886,26 @@ async fn run_one(conn: &mut UnixStream, fds: [OwnedFd; 3]) -> anyhow::Result<Exe
             }
         }
         _ = eof => {
-            // Mirror `proc_exec`'s own escalation so a cancelled agent target
-            // dies the way a cancelled local one does.
+            // `proc_exec`'s own cancel, so a cancelled agent target dies the
+            // way a cancelled local one does: SIGINT the group, SIGKILL it if
+            // the target outlives the grace, and once the target is reaped
+            // SIGKILL what is left of the group either way.
             killpg(pgid, libc::SIGINT);
-            match tokio::time::timeout(proc_exec::CANCEL_GRACE, &mut waiter).await {
-                Ok(Ok(Ok(st))) => Ok(outcome_of(st)),
-                _ => {
+            let status = match tokio::time::timeout(proc_exec::CANCEL_GRACE, &mut waiter).await {
+                Ok(status) => status,
+                Err(_elapsed) => {
                     killpg(pgid, libc::SIGKILL);
                     // Reap it before answering. heph queues the sandbox for
                     // removal as soon as the client is reaped, so replying
                     // while the target is still alive leaves a process writing
                     // into a directory the cleaner is deleting.
-                    _ = waiter.await;
-                    Ok(ExecOutcome::Signaled(libc::SIGKILL))
+                    waiter.await
                 }
+            };
+            killpg(pgid, libc::SIGKILL);
+            match status {
+                Ok(Ok(st)) => Ok(outcome_of(st)),
+                _ => Ok(ExecOutcome::Signaled(libc::SIGKILL)),
             }
         }
     }

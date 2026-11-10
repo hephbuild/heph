@@ -334,6 +334,94 @@ fn a_target_dies_when_its_client_disconnects() {
     );
 }
 
+/// A target that starts a `&` job, which a non-interactive `sh` starts with
+/// SIGINT ignored. The job writes its own pid only once it runs with the
+/// signal already ignored, and holds none of the target's output, so neither
+/// the SIGINT nor a closing pipe can end it: only a SIGKILL to the group.
+fn target_with_a_sigint_ignoring_grandchild(dir: &Path) -> (ExecRequest, PathBuf, PathBuf) {
+    let pidfile = dir.join("pid");
+    let gpidfile = dir.join("gpid");
+    let req = sh(&format!(
+        "/bin/sh -c 'echo $$ > {gpid}; exec sleep 300' >/dev/null 2>&1 </dev/null & \
+         echo $$ > {pid}; wait",
+        gpid = gpidfile.display(),
+        pid = pidfile.display(),
+    ));
+    (req, pidfile, gpidfile)
+}
+
+/// A relayed Ctrl+C ends the target, and with it everything left in the
+/// target's group — as it does for a target heph runs itself. The grandchild
+/// ignores the SIGINT, so only the agent's SIGKILL to the group once the
+/// target is reaped can end it.
+#[test]
+fn a_relayed_signal_kills_what_is_left_of_the_targets_group() {
+    let agent = Agent::start();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (req, pidfile, gpidfile) = target_with_a_sigint_ignoring_grandchild(dir.path());
+    let out = capture();
+
+    let devnull = std::fs::File::open("/dev/null").expect("/dev/null");
+    let mut conn = start_via_agent(
+        &agent.socket,
+        &req,
+        [devnull.as_fd(), out.as_fd(), out.as_fd()],
+    )
+    .expect("handshake");
+    wait_for_pid(&pidfile).expect("the target should have started");
+    let gpid = wait_for_pid(&gpidfile).expect("the grandchild should have started");
+
+    use std::io::Write as _;
+    conn.write_all(&[libc::SIGINT as u8])
+        .expect("forward SIGINT");
+    // How the shell reports dying of it (an exit code or the signal) is the
+    // shell's business; only what it leaves behind is the agent's.
+    let outcome = await_reply(conn);
+    assert_ne!(
+        outcome,
+        ExecOutcome::Exited(0),
+        "the target must have been interrupted"
+    );
+
+    assert!(
+        wait_until_dead(gpid, Duration::from_secs(10)),
+        "the grandchild (pid {gpid}) outlived its interrupted target"
+    );
+}
+
+/// The client going away ends the target and everything left in its group,
+/// even when the target itself dies of the SIGINT within the grace and so is
+/// never SIGKILLed.
+#[test]
+fn a_disconnect_kills_what_is_left_of_the_targets_group() {
+    let agent = Agent::start();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (req, pidfile, gpidfile) = target_with_a_sigint_ignoring_grandchild(dir.path());
+    let out = capture();
+
+    let (pid, gpid) = {
+        let devnull = std::fs::File::open("/dev/null").expect("/dev/null");
+        let _conn = start_via_agent(
+            &agent.socket,
+            &req,
+            [devnull.as_fd(), out.as_fd(), out.as_fd()],
+        )
+        .expect("handshake");
+        let pid = wait_for_pid(&pidfile).expect("the target should have started");
+        let gpid = wait_for_pid(&gpidfile).expect("the grandchild should have started");
+        (pid, gpid)
+    };
+
+    assert!(
+        wait_until_dead(pid, Duration::from_secs(30)),
+        "the target (pid {pid}) survived its client disconnecting"
+    );
+    assert!(
+        wait_until_dead(gpid, Duration::from_secs(10)),
+        "the grandchild (pid {gpid}) outlived its cancelled target"
+    );
+}
+
 /// Two targets in flight at once must each get their own descriptors. If the
 /// agent let one request's stdio leak into the next fork, heph's reader would
 /// never see EOF on the first — the stray-descendant hang `setsid` exists to
@@ -396,6 +484,26 @@ fn wait_until_gone(pid: i32, within: Duration) -> bool {
     while Instant::now() < deadline {
         // SAFETY: signal 0 only probes for the process's existence.
         if unsafe { libc::kill(pid, 0) } != 0 {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+/// Whether `pid` is gone or a zombie, polled to a deadline. A killed orphan
+/// is reaped by whichever ancestor adopted it, which this process does not
+/// control; a zombie is as dead as it gets.
+fn wait_until_dead(pid: i32, within: Duration) -> bool {
+    let deadline = Instant::now() + within;
+    while Instant::now() < deadline {
+        // SAFETY: signal 0 only probes for the process's existence.
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return true;
+        }
+        if std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .is_ok_and(|s| s.rsplit_once(") ").is_some_and(|(_, r)| r.starts_with('Z')))
+        {
             return true;
         }
         std::thread::sleep(Duration::from_millis(50));
