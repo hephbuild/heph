@@ -245,8 +245,12 @@ impl Engine {
                     Ok(res) => res,
                     Err(err) => {
                         // The run is over: its capacity goes back before
-                        // anything is kept (D17), so a slow keep of a large
-                        // `failure_out` holds no pool.
+                        // the engine keeps anything (D17). The managed layer
+                        // already copied `failure_out` into its staging dir
+                        // inside the run, under the reservation; what is left
+                        // — the write-back and moving the staged dir into the
+                        // slot, a rename unless it crosses filesystems — holds
+                        // no pool.
                         drop(reservation.take());
                         // The sandbox is kept for diagnostics: nothing may be
                         // queued against it. The tree survives until this
