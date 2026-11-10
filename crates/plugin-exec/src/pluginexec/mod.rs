@@ -915,15 +915,8 @@ fn spec_path_to_target_path(
 ) -> anyhow::Result<Path> {
     let path = hmodel::htpkg::join_rel_checked(pkg.as_str(), raw)
         .with_context(|| format!("resolving output path {raw:?} in package {pkg}"))?;
-    let content = if ["*", "?", "["].iter().any(|&p| path.contains(p)) {
-        Content::Glob(path)
-    } else if path.ends_with('/') {
-        Content::DirPath(path)
-    } else {
-        Content::FilePath(path)
-    };
     Ok(Path {
-        content,
+        content: spec::path_content(path),
         codegen_tree: codegen.clone(),
         collect: true,
     })
@@ -1628,6 +1621,10 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
             .map(|p| spec_path_to_target_path(p, &pkg, &CodegenMode::None))
             .collect::<anyhow::Result<Vec<_>>>()?;
 
+        // Never on exec's own def: it reaches no hash, no env, argv or LIST
+        // file, and no sandbox mkdir (D19). Only the engine's def carries it.
+        let failure_outputs = spec::failure_outputs(&spec.failure_out, pkg.as_str())?;
+
         // Per-target field wins, then the driver's workspace-wide default.
         // `"local"` is the explicit opt-out — the one value that is not an
         // address, so a per-package override of a workspace default can be
@@ -1743,6 +1740,7 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
                     .chain(credential_inputs)
                     .collect(),
                 outputs,
+                failure_outputs,
                 support_files,
                 cache,
                 entrypoint: engine_entrypoint,
@@ -5469,7 +5467,7 @@ bash apply_transitive: 96d371e95980d767
             parse_with(config).await
         };
         let plain = parse_mode(None).await?;
-        for mode in ["copy", "in_place"] {
+        for mode in ["copy", "in_place", "in_place_on_success"] {
             let def = parse_mode(Some(mode)).await?;
             assert_eq!(
                 def.hash, plain.hash,
@@ -5482,6 +5480,150 @@ bash apply_transitive: 96d371e95980d767
                     .all(|p| p.codegen_tree != CodegenMode::None),
                 "codegen = {mode:?}: the def keeps the real mode"
             );
+        }
+        Ok(())
+    }
+
+    /// I1: `failure_out` reaches no def hash — not parse's, not
+    /// `apply_transitive`'s — whatever its shape, and never becomes an output;
+    /// it reaches only the engine's `failure_outputs`.
+    #[tokio::test]
+    async fn failure_out_is_off_the_def_hash() -> anyhow::Result<()> {
+        use hcore::htvalue::Value;
+        let ctoken = StdCancellationToken::new();
+        let s = |v: &str| Value::String(v.to_string());
+        for driver in [Driver::new_exec(), Driver::new_bash()] {
+            let parse = |config: HashMap<String, Value>| {
+                let driver = &driver;
+                let ctoken = &ctoken;
+                async move {
+                    let parsed = driver
+                        .parse(
+                            hplugin::driver::ParseRequest {
+                                request_id: "fo".to_string(),
+                                target_spec: Arc::new(hplugin::provider::TargetSpec {
+                                    addr: parse_addr("//app:golden")?,
+                                    driver: driver.name.clone(),
+                                    config,
+                                    ..Default::default()
+                                }),
+                            },
+                            ctoken,
+                        )
+                        .await?
+                        .target_def;
+                    let applied = driver
+                        .apply_transitive(
+                            hplugin::driver::ApplyTransitiveRequest {
+                                request_id: "fo".to_string(),
+                                target_def: parsed.clone(),
+                                sandbox: golden_transitive_sandbox(),
+                            },
+                            ctoken,
+                        )
+                        .await?
+                        .target_def;
+                    anyhow::Ok((parsed, applied))
+                }
+            };
+            let (plain, plain_applied) = parse(golden_populated_config()).await?;
+            assert!(plain.failure_outputs.is_empty());
+            for value in [
+                s("test-results/"),
+                Value::List(vec![s("junit.xml"), s("**/*.png")]),
+                Value::Map(HashMap::from([(
+                    "report".to_string(),
+                    Value::List(vec![s("playwright-report/")]),
+                )])),
+            ] {
+                let mut config = golden_populated_config();
+                config.insert("failure_out".to_string(), value.clone());
+                let (declared, declared_applied) = parse(config).await?;
+                assert!(!declared.failure_outputs.is_empty(), "{value:?}");
+                assert_eq!(
+                    declared_applied.failure_outputs.len(),
+                    declared.failure_outputs.len(),
+                    "apply_transitive keeps them"
+                );
+                assert_eq!(declared.hash, plain.hash, "{value:?} moved the parse hash");
+                assert_eq!(
+                    declared_applied.hash, plain_applied.hash,
+                    "{value:?} moved the apply_transitive hash"
+                );
+                let paths = |td: &hplugin::driver::targetdef::TargetDef| {
+                    td.outputs
+                        .iter()
+                        .map(|o| (o.group.clone(), o.paths.len()))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(paths(&declared), paths(&plain), "never an output");
+                assert_eq!(declared.support_files.len(), plain.support_files.len());
+                assert_eq!(
+                    serde_json::to_string(declared.def::<TargetDef>())?,
+                    serde_json::to_string(plain.def::<TargetDef>())?,
+                    "exec's own def is untouched"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// D19: `failure_out` is no run surface. With and without it, the child
+    /// sees the same argv and environment, and the sandbox holds the same
+    /// pre-created directories — even when a `failure_out` path names a
+    /// directory, as an `out` path would have had created.
+    #[tokio::test]
+    async fn failure_out_reaches_no_env_or_mkdir() -> anyhow::Result<()> {
+        use hcore::htvalue::Value;
+        let driver = Driver::new_bash().with_host_path();
+        let ctoken = StdCancellationToken::new();
+        let s = |v: &str| Value::String(v.to_string());
+        // argv, the environment, then every directory in the sandbox, each
+        // sorted; volatile shell variables dropped.
+        let script = "printf 'argv:%s\\n' \"$0\" \"$@\"; \
+                      env | grep -v -E '^(_|SHLVL|PWD|OLDPWD)=' | sort; \
+                      echo dirs:; find \"$WORKSPACE_ROOT\" -type d | sort";
+        let tmp = tempfile::tempdir()?;
+        let mut seen = Vec::new();
+        for failure_out in [
+            None,
+            Some(s("reports/")),
+            Some(Value::Map(HashMap::from([(
+                "trace".to_string(),
+                Value::List(vec![s("traces/deep/"), s("shot.png"), s("**/*.webm")]),
+            )]))),
+        ] {
+            let mut config = HashMap::from([
+                ("run".to_string(), s(script)),
+                ("out".to_string(), s("bin/x")),
+            ]);
+            if let Some(v) = failure_out.clone() {
+                config.insert("failure_out".to_string(), v);
+            }
+            let def = parse_with_driver_at(&driver, parse_addr("//app:t")?, config).await?;
+            assert_eq!(def.failure_outputs.is_empty(), failure_out.is_none());
+            // The same sandbox path every time, so paths in the env compare.
+            let sandbox = tmp.path().join("sandbox");
+            if sandbox.exists() {
+                std::fs::remove_dir_all(&sandbox)?;
+            }
+            std::fs::create_dir_all(&sandbox)?;
+            let mut stdout = Vec::new();
+            let request_id = "fo".to_string();
+            let mut req = RunRequest::new(&request_id, &def, &sandbox);
+            req.stdout = Some(&mut stdout);
+            driver.run(make_req(req), &ctoken).await?;
+            seen.push((failure_out, String::from_utf8(stdout)?));
+        }
+        let (_, plain) = &seen[0];
+        assert!(plain.contains("argv:"), "{plain}");
+        assert!(plain.contains("dirs:"), "{plain}");
+        assert!(
+            plain.lines().any(|l| l.ends_with("/app/bin")),
+            "the `out` dir is pre-created, so the listing is real: {plain}"
+        );
+        for (failure_out, out) in &seen[1..] {
+            assert_eq!(out, plain, "failure_out = {failure_out:?} reached the run");
         }
         Ok(())
     }

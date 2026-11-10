@@ -1,6 +1,8 @@
-use hplugin::driver::targetdef::path::CodegenMode;
+use anyhow::Context;
+use hplugin::driver::targetdef::FailureOutput;
+use hplugin::driver::targetdef::path::{CodegenMode, Content};
 use hplugin::htspec::{Spec, SpecEnum, TargetSpecCache};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// The `codegen` attribute as written: absent/null is `None`, which is never a
 /// string. Converted into the def's [`CodegenMode`] by [`Codegen::mode`].
@@ -11,6 +13,7 @@ pub(crate) enum Codegen {
     None,
     Copy,
     InPlace,
+    InPlaceOnSuccess,
 }
 
 impl Codegen {
@@ -20,6 +23,9 @@ impl Codegen {
             Codegen::Copy => CodegenMode::Copy,
             Codegen::InPlace => CodegenMode::InPlace {
                 write_on_failure: true,
+            },
+            Codegen::InPlaceOnSuccess => CodegenMode::InPlace {
+                write_on_failure: false,
             },
         }
     }
@@ -88,8 +94,34 @@ pub(crate) struct TargetSpec {
     pub outputs: HashMap<String, Vec<String>>,
     /// Extra files materialized into the sandbox but not hashed as deps.
     pub support_files: Vec<String>,
-    /// Codegen mode: `copy` or `in_place`. Omit for a normal (non-codegen) target.
+    /// What happens to the source tree after a run. Omit for a normal
+    /// (non-codegen) target.
+    ///
+    /// - `copy`: a passing run's outputs are copied into the tree.
+    /// - `in_place`: the outputs are written over the sources they were made
+    ///   from. A run that exits non-zero (with an exit code from 1 to 127)
+    ///   writes back the outputs it produced too, and the target still fails:
+    ///   a fixer like `eslint --fix` keeps the fixes it could make. Nothing is
+    ///   written after a signal, an exit code of 128 or above, under
+    ///   `--frozen` or in a `--shell`.
+    /// - `in_place_on_success`: as `in_place`, but a failed run writes
+    ///   nothing back.
+    ///
+    /// An `in_place` transform must be **idempotent**: running it over its own
+    /// output must change nothing. The mode is not part of the cache key, so a
+    /// result filed after a write-back is served to the rewritten tree.
     pub codegen: Codegen,
+    /// What a failed run leaves behind for whoever fixes it, such as test
+    /// reports, traces or screenshots. Same shape as `out`: a path, a list, or
+    /// a dict of group → list. Paths are relative to the package and may be
+    /// globs; `..`, absolute paths and the package root itself are refused.
+    ///
+    /// Collected only when the run exits non-zero, into the target's failure
+    /// slot (`<home>/failures/<addr-key>/out/<workspace-relative path>`). A
+    /// path that matches nothing is skipped. Never an output, never an input,
+    /// never cached, and not part of the cache key: a passing run collects
+    /// nothing. Refused on an entrypoint.
+    pub failure_out: HashMap<String, Vec<String>>,
     /// Caching: bool toggles local+remote, or a dict `{enabled, remote, history}`.
     pub cache: TargetSpecCache,
     /// Environment variables set for the command.
@@ -122,7 +154,7 @@ pub(crate) struct TargetSpec {
     /// for a build, in a sandbox of the invocation's own removed when it
     /// exits, and `$SRC_<group>`, `$TOOL_<group>` and `$WORKSPACE_ROOT` name
     /// paths inside it (`$HEPH_ROOT` is the real workspace root). What only a
-    /// build uses is refused: `out`, `cache`, `codegen`, `support_files`, the
+    /// build uses is refused: `out`, `failure_out`, `cache`, `codegen`, `support_files`, the
     /// `*_env` fields, `runner`, and `scratch` outside `workdir = "sandbox"`. An `exec`
     /// argv cannot name `$SRC_<group>` (there is no shell): use
     /// `${src://pkg:name}`, or `driver = "bash"`.
@@ -149,6 +181,81 @@ pub(crate) struct TargetSpec {
     /// engine, never hashed, never shown to the run: changing it does not
     /// rebuild. Not applied to `--shell`.
     pub timeout: Option<hplugin::driver::Timeout>,
+}
+
+/// `failure_out` resolved against the target's package, one entry per group in
+/// group order, each path workspace-relative.
+///
+/// Bound for the engine's def only: never exec's own def, its hash, its
+/// outputs, env, argv or sandbox (D19).
+pub(crate) fn failure_outputs(
+    failure_out: &HashMap<String, Vec<String>>,
+    pkg: &str,
+) -> anyhow::Result<Vec<FailureOutput>> {
+    let groups: BTreeMap<&String, &Vec<String>> = failure_out.iter().collect();
+    groups
+        .into_iter()
+        .map(|(group, paths)| {
+            let paths = paths
+                .iter()
+                .map(|raw| {
+                    failure_out_path(raw, pkg).with_context(|| {
+                        if group.is_empty() {
+                            format!("`failure_out` path {raw:?}")
+                        } else {
+                            format!("`failure_out` group {group:?}, path {raw:?}")
+                        }
+                    })
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            Ok(FailureOutput {
+                group: group.clone(),
+                paths,
+            })
+        })
+        .collect()
+}
+
+/// One `failure_out` path, checked and made workspace-relative.
+///
+/// Checked on the path as written, before the join: `join_rel_checked` would
+/// accept `/etc/x` as `<pkg>/etc/x` and `../sibling` as a path in the parent
+/// package. The package root (`.`, or a pattern of nothing but `*`/`**`) is
+/// refused too: it would sweep up the whole sandbox package dir.
+fn failure_out_path(raw: &str, pkg: &str) -> anyhow::Result<Content> {
+    if raw.starts_with('/') {
+        anyhow::bail!(
+            "an absolute path is not allowed: failure outputs are collected from the sandbox, \
+             relative to the package"
+        );
+    }
+    let segments: Vec<&str> = raw
+        .split('/')
+        .filter(|s| !s.is_empty() && *s != ".")
+        .collect();
+    if segments.contains(&"..") {
+        anyhow::bail!("`..` is not allowed: a failure output must be inside the package");
+    }
+    if segments.iter().all(|s| matches!(*s, "*" | "**")) {
+        anyhow::bail!(
+            "the package root is not allowed: name the files or directories to keep, \
+             e.g. \"test-results/\""
+        );
+    }
+    let path = hmodel::htpkg::join_rel_checked(pkg, raw)?;
+    Ok(path_content(path))
+}
+
+/// A workspace-relative path as the def's [`Content`]: a glob if it has a
+/// pattern character, a directory if it ends in `/`, a file otherwise.
+pub(crate) fn path_content(path: String) -> Content {
+    if ["*", "?", "["].iter().any(|&p| path.contains(p)) {
+        Content::Glob(path)
+    } else if path.ends_with('/') {
+        Content::DirPath(path)
+    } else {
+        Content::FilePath(path)
+    }
 }
 
 #[cfg(test)]
@@ -179,6 +286,7 @@ mod tests {
             "cache",
             "support_files",
             "codegen",
+            "failure_out",
             "deps",
             "hash_deps",
             "runtime_deps",
@@ -213,6 +321,9 @@ mod tests {
             by_name["env"].ty,
             ParamType::union(vec![ParamType::String, ParamType::map(ParamType::String)])
         );
+        // Same shape as `out`: a path, a list, or a group → list dict.
+        assert_eq!(by_name["failure_out"].ty, by_name["out"].ty);
+        assert!(!by_name["failure_out"].doc.is_empty());
         assert!(!by_name["run"].doc.is_empty());
     }
 
@@ -457,6 +568,149 @@ mod tests {
     fn test_codegen_copy_parsed() {
         let spec = make_spec([("codegen", Value::String("copy".to_string()))]).unwrap();
         assert_eq!(spec.codegen.mode(), CodegenMode::Copy);
+    }
+
+    #[test]
+    fn codegen_in_place_on_success_parsed() {
+        let spec =
+            make_spec([("codegen", Value::String("in_place_on_success".to_string()))]).unwrap();
+        assert_eq!(spec.codegen, Codegen::InPlaceOnSuccess);
+        assert_eq!(
+            spec.codegen.mode(),
+            CodegenMode::InPlace {
+                write_on_failure: false
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_codegen_lists_values() {
+        let err = match make_spec([("codegen", Value::String("in-place".to_string()))]) {
+            Ok(_) => panic!("expected error"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        // Every value, and only those: `None` is the absent attribute, never a
+        // string to write.
+        assert!(
+            msg.contains("expected one of [copy, in_place, in_place_on_success]"),
+            "{msg}"
+        );
+        assert!(msg.contains("codegen"), "names the field: {msg}");
+        assert!(
+            msg.contains("\"in-place\""),
+            "names what was written: {msg}"
+        );
+    }
+
+    fn failure_out_of(value: Value, pkg: &str) -> anyhow::Result<Vec<FailureOutput>> {
+        let spec = make_spec([("failure_out", value)])?;
+        failure_outputs(&spec.failure_out, pkg)
+    }
+
+    fn shape(fo: &[FailureOutput]) -> Vec<(String, Vec<String>)> {
+        fo.iter()
+            .map(|o| {
+                (
+                    o.group.clone(),
+                    o.paths.iter().map(|p| p.to_string()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// The shape of `out`: a bare path and a list land in the unnamed group,
+    /// a dict keeps its groups (sorted); paths become workspace-relative and
+    /// keep their kind.
+    #[test]
+    fn failure_out_shapes() {
+        let s = |v: &str| Value::String(v.to_string());
+        assert_eq!(
+            shape(&failure_out_of(s("junit.xml"), "app").unwrap()),
+            [(String::new(), vec!["FilePath(app/junit.xml)".to_string()])]
+        );
+        assert_eq!(
+            shape(
+                &failure_out_of(
+                    Value::List(vec![s("test-results/"), s("**/*.png"), s("./a/b.txt")]),
+                    "app/web",
+                )
+                .unwrap()
+            ),
+            [(
+                String::new(),
+                vec![
+                    "DirPath(app/web/test-results/)".to_string(),
+                    "Glob(app/web/**/*.png)".to_string(),
+                    "FilePath(app/web/a/b.txt)".to_string(),
+                ]
+            )]
+        );
+        let dict = Value::Map(HashMap::from([
+            ("report".to_string(), s("playwright-report/")),
+            ("junit".to_string(), Value::List(vec![s("junit.xml")])),
+        ]));
+        assert_eq!(
+            shape(&failure_out_of(dict, "").unwrap()),
+            [
+                ("junit".to_string(), vec!["FilePath(junit.xml)".to_string()]),
+                (
+                    "report".to_string(),
+                    vec!["DirPath(playwright-report/)".to_string()]
+                ),
+            ]
+        );
+        assert!(failure_outputs(&HashMap::new(), "app").unwrap().is_empty());
+    }
+
+    /// D4: a failure output stays inside the package, and is never the
+    /// package itself. Checked on the path as written: `join_rel_checked`
+    /// alone would turn `/etc/x` into `app/etc/x` and accept `../x` as a file
+    /// of the parent package.
+    #[test]
+    fn failure_out_refuses_escaping_and_root_paths() {
+        let cases: &[(&str, &str)] = &[
+            ("../x", "`..`"),
+            ("a/../../x", "`..`"),
+            ("a/../b", "`..`"),
+            ("..", "`..`"),
+            ("/etc/passwd", "absolute"),
+            ("/", "absolute"),
+            ("//x", "absolute"),
+            (".", "package root"),
+            ("./", "package root"),
+            ("", "package root"),
+            ("*", "package root"),
+            ("**", "package root"),
+            ("./**/*", "package root"),
+        ];
+        for (raw, why) in cases {
+            for pkg in ["", "app"] {
+                let err = failure_out_of(Value::String(raw.to_string()), pkg)
+                    .err()
+                    .unwrap_or_else(|| panic!("{raw:?} in {pkg:?} must be refused"));
+                let msg = format!("{err:#}");
+                assert!(msg.contains(why), "{raw:?}: {msg}");
+                assert!(msg.contains("failure_out"), "names the field: {msg}");
+                assert!(msg.contains(&format!("{raw:?}")), "names the path: {msg}");
+            }
+        }
+        // A group is named in the error.
+        let err = failure_out_of(
+            Value::Map(HashMap::from([(
+                "report".to_string(),
+                Value::String("../x".to_string()),
+            )])),
+            "app",
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("\"report\""), "{err:#}");
+
+        // Near misses stay accepted: a dotted name, a pattern under a dir.
+        for ok in ["..foo", "a..b/c", ".hidden/", "out/*", "a/**"] {
+            failure_out_of(Value::String(ok.to_string()), "app")
+                .unwrap_or_else(|e| panic!("{ok:?} must be accepted: {e:#}"));
+        }
     }
 
     #[test]
