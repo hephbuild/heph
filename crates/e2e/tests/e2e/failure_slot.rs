@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Resolve `addr` on `engine` and return the failures it recorded.
-async fn failures(
+pub(crate) async fn failures(
     engine: &Arc<Engine>,
     addr: &str,
     opts: &ResultOptions,
@@ -37,19 +37,19 @@ fn slot_log(engine: &Engine, addr: &str) -> Option<String> {
     std::fs::read_to_string(slots.slot_dir(&addr).join("log.txt")).ok()
 }
 
-fn slot_exists(engine: &Engine, addr: &str) -> bool {
+pub(crate) fn slot_exists(engine: &Engine, addr: &str) -> bool {
     engine
         .failure_slots()
         .slot_dir(&parse_addr(addr).expect("addr"))
         .exists()
 }
 
-fn render(f: &[Arc<TargetFailure>]) -> String {
+pub(crate) fn render(f: &[Arc<TargetFailure>]) -> String {
     heph::commands::errors::render_failures_to_string(f, false)
 }
 
 /// Every file under `dir` whose bytes contain `needle`.
-fn files_containing(dir: &Path, needle: &str) -> Vec<PathBuf> {
+pub(crate) fn files_containing(dir: &Path, needle: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
         return out;
@@ -363,6 +363,64 @@ async fn concurrent_failures_same_target_slot_never_mixed() -> anyhow::Result<()
     let log = slot_log(&ws.engine, "//p:t").expect("a complete slot");
     assert_eq!(log.lines().count(), 200);
     assert!(homogeneous(&log), "the slot mixes two runs");
+    Ok(())
+}
+
+/// Many callers of one failing target on one request, directly and through
+/// groups, on a multi-threaded runtime: the target runs once and its slot is
+/// filled once, and every caller's failure names the same complete slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn single_fill_under_concurrent_callers() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    let ctl = tempfile::tempdir()?;
+    let c = ctl.path().display();
+    ws.write_build_file(
+        "p",
+        &format!(
+            r#"
+target(name = "t", driver = "bash", cache = False, failure_out = "report.txt",
+       run = "printf x >> {c}/runs; printf run-$$ > report.txt; echo run-$$; exit 1")
+target(name = "g1", driver = "group", deps = [":t"])
+target(name = "g2", driver = "group", deps = [":t", ":g1"])
+"#
+        ),
+    );
+    let rs = ws.engine.new_state();
+    let opts = ResultOptions::default();
+    let mut callers = tokio::task::JoinSet::new();
+    for name in ["t", "g1", "t", "g2", "t", "g1", "g2", "t"] {
+        let (engine, rs, opts) = (ws.engine.clone(), rs.clone(), opts.clone());
+        let addr = parse_addr(&format!("//p:{name}"))?;
+        callers.spawn(async move {
+            engine
+                .result_addr(rs, &addr, OutputMatcher::All, &opts)
+                .await
+                .map(|_| ())
+        });
+    }
+    while let Some(res) = callers.join_next().await {
+        assert!(res?.is_err(), "every caller sees the failure");
+    }
+    assert_eq!(std::fs::read_to_string(ctl.path().join("runs"))?, "x");
+    assert_eq!(ws.engine.failure_slots().fills(), 1);
+
+    let addr = parse_addr("//p:t")?;
+    let slots = ws.engine.failure_slots();
+    assert!(slots.read(&addr).is_some(), "a complete slot");
+    let out = slots.slot_dir(&addr).join(heph::engine::failure_slot::OUT);
+    let log = slot_log(&ws.engine, "//p:t").expect("the log");
+    let report = std::fs::read_to_string(out.join("p/report.txt"))?;
+    assert_eq!(format!("{report}\n"), log, "the log and out/ are one run's");
+    let names: Vec<String> = std::fs::read_dir(slots.root())?
+        .map(|e| e.map(|e| e.file_name().to_string_lossy().into_owned()))
+        .collect::<Result<_, _>>()?;
+    assert_eq!(names.len(), 1, "one slot, no temporaries: {names:?}");
+    let failures = rs.take_failures();
+    let mine: Vec<_> = failures.iter().filter(|f| f.addr == addr).collect();
+    assert!(!mine.is_empty());
+    for f in mine {
+        assert_eq!(f.outputs.as_deref(), Some(out.as_path()));
+    }
     Ok(())
 }
 
