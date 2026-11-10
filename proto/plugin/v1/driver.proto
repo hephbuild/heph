@@ -346,6 +346,11 @@ message RunFailure {
   // a plugin shares the host's process. The host drops one it cannot decode
   // and keeps the message and exit.
   repeated OutputArtifactRef artifacts = 4;
+  // The fixes a failed in_place run left behind, for the host to write back
+  // over the tree while the target still fails (since 0.20.0). Never the
+  // diagnostics in `artifacts`, and never cached. Decoded leniently like
+  // `artifacts`.
+  repeated OutputArtifactRef write_back = 5;
 }
 
 message RunOutFrame {

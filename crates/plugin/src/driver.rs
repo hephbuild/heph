@@ -646,6 +646,19 @@ pub mod targetdef {
         pub raw_def: Arc<dyn RawDef>,
         pub inputs: Vec<Input>,
         pub outputs: Vec<Output>,
+        /// What a run that fails with a process exit leaves behind for its
+        /// diagnosis (exec's `failure_out`), workspace-relative.
+        ///
+        /// **Never part of a def hash, never an output, never an input**: a
+        /// passing run collects nothing from it, and what a failure keeps goes
+        /// to the failure slot, never into a cache entry. A driver keeps it off
+        /// its own def (and its def hash) and never merges it into
+        /// [`outputs`](Self::outputs). Crosses the plugin ABI as
+        /// `pb::TargetDef.failure_outputs` (since 0.20.0); a def from an older
+        /// plugin decodes empty. Skipped when empty, so `inspect def --json`
+        /// of every other target is unchanged.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        pub failure_outputs: Vec<FailureOutput>,
         pub support_files: Vec<path::Path>,
         pub cache: CacheConfig,
         /// `Some` when the target is an entrypoint (`entrypoint = True` on
@@ -720,6 +733,7 @@ pub mod targetdef {
                 raw_def: Arc::new(()),
                 inputs: Vec::new(),
                 outputs: Vec::new(),
+                failure_outputs: Vec::new(),
                 support_files: Vec::new(),
                 cache: CacheConfig::off(),
                 entrypoint: None,
@@ -889,6 +903,18 @@ pub mod targetdef {
         pub paths: Vec<path::Path>,
     }
 
+    /// A group of paths a failed run leaves behind for the human fixing it
+    /// (exec's `failure_out`), copied into the target's failure slot.
+    ///
+    /// Plain [`path::Content`], not [`path::Path`]: `collect` and the codegen
+    /// mode mean nothing for a file that is never an output. The group only
+    /// labels the failure box's line; the slot layout is workspace-relative.
+    #[derive(Clone, Debug, Serialize)]
+    pub struct FailureOutput {
+        pub group: String,
+        pub paths: Vec<path::Content>,
+    }
+
     pub mod path {
         use serde::Serialize;
         use std::fmt::Display;
@@ -917,21 +943,40 @@ pub mod targetdef {
             }
         }
 
-        /// Codegen mode parsed from the BUILD-file `codegen` attribute. A bare
-        /// string (`copy` / `in_place`) or absent/null → `None`. `#[derive(SpecEnum)]`
-        /// supplies the [`FromSpecValue`] impl (string → variant); `None` is
-        /// `#[spec(skip)]` so it is only the absent/null default, never a string.
-        ///
-        /// [`FromSpecValue`]: crate::htspec::FromSpecValue
-        #[derive(
-            Clone, Debug, Default, Hash, PartialEq, Eq, Serialize, crate::htspec::SpecEnum,
-        )]
+        /// What happens to the tree after a run: an output path's codegen mode.
+        /// A driver sets it from its own config (exec's `codegen` attribute).
+        #[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
         pub enum CodegenMode {
+            /// A plain output: nothing reaches the tree.
             #[default]
-            #[spec(skip)]
             None,
+            /// Copied into the tree, beside the sources.
             Copy,
-            InPlace,
+            /// Written back over the tracked files it was produced from.
+            ///
+            /// `write_on_failure`: also write back what a run that exited with
+            /// a code from 1 to 127 left behind, while the target still fails.
+            /// exec's `in_place` sets it; `in_place_on_success` does not.
+            InPlace { write_on_failure: bool },
+        }
+
+        /// Spelled as the unit variants it had before `InPlace` carried a
+        /// field, so `inspect def --json` keeps saying `"InPlace"` for exec's
+        /// `in_place`; `in_place_on_success` is `"InPlaceOnSuccess"`.
+        impl Serialize for CodegenMode {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                let (index, name) = match self {
+                    CodegenMode::None => (0, "None"),
+                    CodegenMode::Copy => (1, "Copy"),
+                    CodegenMode::InPlace {
+                        write_on_failure: true,
+                    } => (2, "InPlace"),
+                    CodegenMode::InPlace {
+                        write_on_failure: false,
+                    } => (3, "InPlaceOnSuccess"),
+                };
+                s.serialize_unit_variant("CodegenMode", index, name)
+            }
         }
     }
 }

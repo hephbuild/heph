@@ -5650,7 +5650,9 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             vec![(
                 "src".to_string(),
                 format_sources_pattern("cmd"),
-                hplugin::driver::targetdef::path::CodegenMode::InPlace,
+                hplugin::driver::targetdef::path::CodegenMode::InPlace {
+                    write_on_failure: true,
+                },
             )],
             "fix declares one in_place glob output, the pattern of its source glob"
         );

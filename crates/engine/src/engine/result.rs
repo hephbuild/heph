@@ -914,7 +914,7 @@ fn codegen_modes(target: &crate::engine::driver::targetdef::TargetDef) -> (bool,
     let modes = || target.outputs.iter().flat_map(|o| o.paths.iter());
     (
         modes().any(|p| matches!(p.codegen_tree, CodegenMode::Copy)),
-        modes().any(|p| matches!(p.codegen_tree, CodegenMode::InPlace)),
+        modes().any(|p| matches!(p.codegen_tree, CodegenMode::InPlace { .. })),
     )
 }
 
@@ -1164,7 +1164,7 @@ fn in_place_fs_addrs(
     outputs
         .iter()
         .flat_map(|o| o.paths.iter())
-        .filter(|p| matches!(p.codegen_tree, CodegenMode::InPlace))
+        .filter(|p| matches!(p.codegen_tree, CodegenMode::InPlace { .. }))
         .map(|p| hbuiltins::pluginfs::output_fs_addr(&p.content))
         .collect()
 }
@@ -4286,7 +4286,7 @@ impl Engine {
                     // target never touches a copy-owned tree file, so a
                     // divergence there is not drift this target would reconcile —
                     // don't flag it in the frozen check.
-                    if matches!(mode, CodegenMode::InPlace)
+                    if matches!(mode, CodegenMode::InPlace { .. })
                         && in_place_skips(w.snapshot, &addr, &codegen_rel(root, &entry.path)?)?
                     {
                         continue;
@@ -4368,7 +4368,7 @@ impl Engine {
                     // target's output and leave the provenance pointing at the
                     // wrong producer. Leave such files to their owner.
                     let rel = codegen_rel(root, &path)?;
-                    if matches!(mode, CodegenMode::InPlace)
+                    if matches!(mode, CodegenMode::InPlace { .. })
                         && in_place_skips(w.snapshot, &addr, &rel)?
                     {
                         continue;
@@ -4755,7 +4755,7 @@ impl Engine {
             .any(|p| {
                 matches!(
                     p.codegen_tree,
-                    crate::engine::driver::targetdef::path::CodegenMode::InPlace
+                    crate::engine::driver::targetdef::path::CodegenMode::InPlace { .. }
                 )
             })
         {
@@ -5054,7 +5054,7 @@ impl Engine {
         let is_in_place = def.target.outputs.iter().any(|o| {
             o.paths
                 .iter()
-                .any(|p| matches!(p.codegen_tree, CodegenMode::InPlace))
+                .any(|p| matches!(p.codegen_tree, CodegenMode::InPlace { .. }))
         });
         if !is_in_place {
             return Ok(());
@@ -5379,7 +5379,7 @@ impl Engine {
                 o.paths.iter().any(|p| {
                     matches!(
                         p.codegen_tree,
-                        crate::engine::driver::targetdef::path::CodegenMode::InPlace
+                        crate::engine::driver::targetdef::path::CodegenMode::InPlace { .. }
                     )
                 })
             })
@@ -13487,8 +13487,18 @@ mod tests {
         let outputs = vec![Output {
             group: "main".to_string(),
             paths: vec![
-                path(Content::FilePath("pkg/a.go".into()), CodegenMode::InPlace),
-                path(Content::Glob("pkg/*.txt".into()), CodegenMode::InPlace),
+                path(
+                    Content::FilePath("pkg/a.go".into()),
+                    CodegenMode::InPlace {
+                        write_on_failure: true,
+                    },
+                ),
+                path(
+                    Content::Glob("pkg/*.txt".into()),
+                    CodegenMode::InPlace {
+                        write_on_failure: true,
+                    },
+                ),
                 // Not in_place: never guarded.
                 path(Content::FilePath("pkg/c.go".into()), CodegenMode::Copy),
             ],

@@ -1616,7 +1616,7 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
                 Ok((
                     k.clone(),
                     v.iter()
-                        .map(|p| spec_path_to_target_path(p, &pkg, &spec.codegen))
+                        .map(|p| spec_path_to_target_path(p, &pkg, &spec.codegen.mode()))
                         .collect::<anyhow::Result<Vec<_>>>()?,
                 ))
             })

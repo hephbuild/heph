@@ -1,6 +1,29 @@
 use hplugin::driver::targetdef::path::CodegenMode;
-use hplugin::htspec::{Spec, TargetSpecCache};
+use hplugin::htspec::{Spec, SpecEnum, TargetSpecCache};
 use std::collections::HashMap;
+
+/// The `codegen` attribute as written: absent/null is `None`, which is never a
+/// string. Converted into the def's [`CodegenMode`] by [`Codegen::mode`].
+#[derive(SpecEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Codegen {
+    #[default]
+    #[spec(skip)]
+    None,
+    Copy,
+    InPlace,
+}
+
+impl Codegen {
+    pub(crate) fn mode(self) -> CodegenMode {
+        match self {
+            Codegen::None => CodegenMode::None,
+            Codegen::Copy => CodegenMode::Copy,
+            Codegen::InPlace => CodegenMode::InPlace {
+                write_on_failure: true,
+            },
+        }
+    }
+}
 
 /// Exec-driver target config. `#[derive(Spec)]` generates `TargetSpec::from`
 /// (parser) and `TargetSpec::schema` (LSP schema) from these fields, so the two
@@ -66,7 +89,7 @@ pub(crate) struct TargetSpec {
     /// Extra files materialized into the sandbox but not hashed as deps.
     pub support_files: Vec<String>,
     /// Codegen mode: `copy` or `in_place`. Omit for a normal (non-codegen) target.
-    pub codegen: CodegenMode,
+    pub codegen: Codegen,
     /// Caching: bool toggles local+remote, or a dict `{enabled, remote, history}`.
     pub cache: TargetSpecCache,
     /// Environment variables set for the command.
@@ -421,13 +444,19 @@ mod tests {
     #[test]
     fn test_codegen_in_place_parsed() {
         let spec = make_spec([("codegen", Value::String("in_place".to_string()))]).unwrap();
-        assert_eq!(spec.codegen, CodegenMode::InPlace);
+        assert_eq!(spec.codegen, Codegen::InPlace);
+        assert_eq!(
+            spec.codegen.mode(),
+            CodegenMode::InPlace {
+                write_on_failure: true
+            }
+        );
     }
 
     #[test]
     fn test_codegen_copy_parsed() {
         let spec = make_spec([("codegen", Value::String("copy".to_string()))]).unwrap();
-        assert_eq!(spec.codegen, CodegenMode::Copy);
+        assert_eq!(spec.codegen.mode(), CodegenMode::Copy);
     }
 
     #[test]
@@ -447,6 +476,6 @@ mod tests {
     #[test]
     fn test_codegen_default_none() {
         let spec = make_spec([]).unwrap();
-        assert_eq!(spec.codegen, CodegenMode::None);
+        assert_eq!(spec.codegen.mode(), CodegenMode::None);
     }
 }

@@ -1097,7 +1097,7 @@ pub fn listed_facts_from_pb(
 // ---- TargetDef and its parts (driver path) ----
 
 use hplugin::driver::targetdef::path::{CodegenMode, Content as PathContent, Path};
-use hplugin::driver::targetdef::{CacheConfig, Input, InputMode, Output, TargetDef};
+use hplugin::driver::targetdef::{CacheConfig, FailureOutput, Input, InputMode, Output, TargetDef};
 
 fn input_mode_to_pb(m: &InputMode) -> pb::InputMode {
     match m {
@@ -1149,18 +1149,72 @@ fn codegen_to_pb(c: &CodegenMode) -> pb::CodegenMode {
     match c {
         CodegenMode::None => pb::CodegenMode::None,
         CodegenMode::Copy => pb::CodegenMode::Copy,
-        CodegenMode::InPlace => pb::CodegenMode::InPlace,
+        CodegenMode::InPlace {
+            write_on_failure: true,
+        } => pb::CodegenMode::InPlace,
+        CodegenMode::InPlace {
+            write_on_failure: false,
+        } => pb::CodegenMode::InPlaceOnSuccess,
     }
 }
 
+/// A value this build does not know stays a decode error (`required_enum`):
+/// read as any known mode, a future one could become a tree write nobody
+/// asked for.
 fn codegen_from_pb(c: Option<EnumValue<pb::CodegenMode>>) -> anyhow::Result<CodegenMode> {
     Ok(match required_enum(c, "Path.codegen_tree")? {
         pb::CodegenMode::None => CodegenMode::None,
         pb::CodegenMode::Copy => CodegenMode::Copy,
-        pb::CodegenMode::InPlace => CodegenMode::InPlace,
+        pb::CodegenMode::InPlace => CodegenMode::InPlace {
+            write_on_failure: true,
+        },
+        pb::CodegenMode::InPlaceOnSuccess => CodegenMode::InPlace {
+            write_on_failure: false,
+        },
         pb::CodegenMode::Unspecified => {
             bail!("field Path.codegen_tree is CODEGEN_MODE_UNSPECIFIED")
         }
+    })
+}
+
+fn path_content_to_pb(c: &PathContent) -> pb::path_content::Content {
+    match c {
+        PathContent::FilePath(s) => pb::path_content::Content::FilePath(s.clone()),
+        PathContent::DirPath(s) => pb::path_content::Content::DirPath(s.clone()),
+        PathContent::Glob(s) => pb::path_content::Content::Glob(s.clone()),
+    }
+}
+
+fn failure_output_to_pb(o: &FailureOutput) -> pb::FailureOutput {
+    pb::FailureOutput {
+        group: Some(o.group.clone()),
+        paths: o
+            .paths
+            .iter()
+            .map(|c| pb::PathContent {
+                content: Some(path_content_to_pb(c)),
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    }
+}
+
+/// Each path's `content` is required, as `Path.content` is.
+fn failure_output_from_pb(o: pb::FailureOutput) -> anyhow::Result<FailureOutput> {
+    Ok(FailureOutput {
+        group: o.group.unwrap_or_default(),
+        paths: o
+            .paths
+            .into_iter()
+            .map(|p| {
+                Ok(match required(p.content, "FailureOutput.paths.content")? {
+                    pb::path_content::Content::FilePath(s) => PathContent::FilePath(s),
+                    pb::path_content::Content::DirPath(s) => PathContent::DirPath(s),
+                    pb::path_content::Content::Glob(s) => PathContent::Glob(s),
+                })
+            })
+            .collect::<anyhow::Result<_>>()?,
     })
 }
 
@@ -1371,6 +1425,11 @@ pub fn target_def_to_pb(td: &TargetDef) -> anyhow::Result<pb::TargetDef> {
         raw_def: raw_def_to_blob(&td.raw_def)?.into(),
         inputs: td.inputs.iter().map(input_to_pb).collect(),
         outputs: td.outputs.iter().map(output_to_pb).collect(),
+        failure_outputs: td
+            .failure_outputs
+            .iter()
+            .map(failure_output_to_pb)
+            .collect(),
         support_files: td.support_files.iter().map(path_to_pb).collect(),
         cache: cache_config_to_pb(&td.cache).into(),
         pty: Some(td.pty),
@@ -1735,7 +1794,8 @@ pub fn exit_from_pb(
 
 /// A run's failure as the wire carries it: `message` (the plugin's whole
 /// rendered chain), plus the process exit and the
-/// [`FailureArtifacts`](hplugin::error::FailureArtifacts) riding `err`. Any
+/// [`FailureArtifacts`](hplugin::error::FailureArtifacts) and
+/// [`FailureWriteBack`](hplugin::error::FailureWriteBack) riding `err`. Any
 /// error may carry artifacts, with or without an exit. One that cannot cross
 /// (a host-only view) is left out: the message still says what failed.
 pub fn run_failure_to_pb(err: &anyhow::Error, message: String) -> pb::RunFailure {
@@ -1747,42 +1807,33 @@ pub fn run_failure_to_pb(err: &anyhow::Error, message: String) -> pb::RunFailure
         failure.exit = exit_to_pb(exit).into();
     }
     if let Some(fa) = hplugin::error::failure_artifacts(err) {
-        failure.artifacts = fa
-            .0
-            .iter()
-            .filter_map(|a| match output_artifact_to_pb(a) {
-                Ok(pb) => Some(pb),
-                Err(e) => {
-                    tracing::debug!(artifact = %a.name, error = %format!("{e:#}"), "failure artifact cannot cross the plugin ABI; dropped");
-                    None
-                }
-            })
-            .collect();
+        failure.artifacts = failure_artifacts_to_pb(&fa.0);
+    }
+    if let Some(wb) = hplugin::error::failure_write_back(err) {
+        failure.write_back = failure_artifacts_to_pb(&wb.0);
     }
     failure
 }
 
-/// The host's error for a `RunFailure`: a
-/// [`RemoteProcessFailed`](hplugin::error::RemoteProcessFailed) when it carries
-/// an exit, a plain message otherwise, with its artifacts rebuilt as the same
-/// [`FailureArtifacts`](hplugin::error::FailureArtifacts) context.
-///
-/// Lenient on the artifacts, as nowhere else on the wire: this is the failure
-/// path, and an artifact that does not decode must not cost the message that
-/// says what failed. It is dropped with a `debug!`; message and exit are kept.
-pub fn run_failure_from_pb(failure: pb::RunFailure) -> anyhow::Error {
-    let pb::RunFailure {
-        message,
-        exit,
-        artifacts,
-        ..
-    } = failure;
-    let message = message.unwrap_or_default();
-    let err = match exit_from_pb(exit) {
-        Some(exit) => anyhow::Error::new(hplugin::error::RemoteProcessFailed::new(message, exit)),
-        None => anyhow::Error::msg(message),
-    };
-    let artifacts = artifacts
+/// Each of `artifacts` that can cross; one that cannot is dropped with a
+/// `debug!`.
+fn failure_artifacts_to_pb(artifacts: &[OutputArtifact]) -> Vec<pb::OutputArtifactRef> {
+    artifacts
+        .iter()
+        .filter_map(|a| match output_artifact_to_pb(a) {
+            Ok(pb) => Some(pb),
+            Err(e) => {
+                tracing::debug!(artifact = %a.name, error = %format!("{e:#}"), "failure artifact cannot cross the plugin ABI; dropped");
+                None
+            }
+        })
+        .collect()
+}
+
+/// Each of `artifacts` that decodes; one that does not is dropped with a
+/// `debug!`.
+fn failure_artifacts_from_pb(artifacts: Vec<pb::OutputArtifactRef>) -> Vec<OutputArtifact> {
+    artifacts
         .into_iter()
         .filter_map(|a| match output_artifact_from_pb(a) {
             Ok(a) => Some(a),
@@ -1791,8 +1842,35 @@ pub fn run_failure_from_pb(failure: pb::RunFailure) -> anyhow::Error {
                 None
             }
         })
-        .collect();
-    hplugin::error::with_failure_artifacts(err, artifacts)
+        .collect()
+}
+
+/// The host's error for a `RunFailure`: a
+/// [`RemoteProcessFailed`](hplugin::error::RemoteProcessFailed) when it carries
+/// an exit, a plain message otherwise, with its artifacts rebuilt as the same
+/// [`FailureArtifacts`](hplugin::error::FailureArtifacts) context and its
+/// `write_back` as the same
+/// [`FailureWriteBack`](hplugin::error::FailureWriteBack) one.
+///
+/// Lenient on both artifact lists, as nowhere else on the wire: this is the failure
+/// path, and an artifact that does not decode must not cost the message that
+/// says what failed. It is dropped with a `debug!`; message and exit are kept.
+pub fn run_failure_from_pb(failure: pb::RunFailure) -> anyhow::Error {
+    let pb::RunFailure {
+        message,
+        exit,
+        artifacts,
+        write_back,
+        ..
+    } = failure;
+    let message = message.unwrap_or_default();
+    let err = match exit_from_pb(exit) {
+        Some(exit) => anyhow::Error::new(hplugin::error::RemoteProcessFailed::new(message, exit)),
+        None => anyhow::Error::msg(message),
+    };
+    let err = hplugin::error::with_failure_artifacts(err, failure_artifacts_from_pb(artifacts));
+    // Absent — what every plugin before 0.20.0 sends — is no write-back.
+    hplugin::error::with_failure_write_back(err, failure_artifacts_from_pb(write_back))
 }
 
 /// `addr`, `raw_def`, `cache` and `hash` are required; `pty` and `transparent`
@@ -1812,6 +1890,12 @@ pub fn target_def_from_pb(td: pb::TargetDef) -> anyhow::Result<TargetDef> {
                 .outputs
                 .into_iter()
                 .map(output_from_pb)
+                .collect::<anyhow::Result<_>>()?,
+            // Absent — what every plugin before 0.20.0 sends — is none.
+            failure_outputs: td
+                .failure_outputs
+                .into_iter()
+                .map(failure_output_from_pb)
                 .collect::<anyhow::Result<_>>()?,
             support_files: paths_from_pb(td.support_files)?,
             cache: cache_config_from_pb(required_msg(td.cache, "TargetDef.cache")?)?,
@@ -3342,9 +3426,31 @@ nested: { a: 1, b: [x, y] }
                         ),
                         path(
                             PathContent::Glob("*.go".to_string()),
-                            CodegenMode::InPlace,
+                            CodegenMode::InPlace {
+                                write_on_failure: true,
+                            },
                             false,
                         ),
+                        path(
+                            PathContent::Glob("*.ts".to_string()),
+                            CodegenMode::InPlace {
+                                write_on_failure: false,
+                            },
+                            true,
+                        ),
+                    ],
+                },
+            ],
+            failure_outputs: vec![
+                FailureOutput {
+                    group: String::new(),
+                    paths: vec![PathContent::FilePath("p/junit.xml".to_string())],
+                },
+                FailureOutput {
+                    group: "report".to_string(),
+                    paths: vec![
+                        PathContent::DirPath("p/test-results/".to_string()),
+                        PathContent::Glob("p/**/*.png".to_string()),
                     ],
                 },
             ],
@@ -3429,6 +3535,170 @@ nested: { a: 1, b: [x, y] }
         );
         assert_eq!(back.hash, vec![0xde, 0xad, 0, 1]);
         assert!(!back.inputs[1].hashed && !back.inputs[2].runtime);
+    }
+
+    /// D7: `failure_outputs` (field 13) crosses both ways, every path kind and
+    /// a named group; a def from a plugin that predates it decodes empty.
+    #[test]
+    fn targetdef_failure_outputs_roundtrip() {
+        let td = full_target_def();
+        let wire = target_def_to_pb(&td).expect("encode");
+        assert_eq!(wire.failure_outputs.len(), 2);
+        let back = target_def_from_pb(via_bytes(&wire)).expect("decode");
+        let shape = |fo: &[FailureOutput]| -> Vec<(String, Vec<String>)> {
+            fo.iter()
+                .map(|o| {
+                    (
+                        o.group.clone(),
+                        o.paths.iter().map(|p| p.to_string()).collect(),
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(shape(&back.failure_outputs), shape(&td.failure_outputs));
+        assert_eq!(
+            shape(&back.failure_outputs),
+            [
+                (String::new(), vec!["FilePath(p/junit.xml)".to_string()]),
+                (
+                    "report".to_string(),
+                    vec![
+                        "DirPath(p/test-results/)".to_string(),
+                        "Glob(p/**/*.png)".to_string(),
+                    ]
+                ),
+            ]
+        );
+        // Never folded into the outputs.
+        assert_eq!(back.outputs.len(), td.outputs.len());
+
+        // An older plugin sends no field 13: none, not an error.
+        let mut old = full_target_def_pb();
+        old.failure_outputs.clear();
+        let back = target_def_from_pb(via_bytes(&old)).expect("decode");
+        assert!(back.failure_outputs.is_empty());
+
+        // A path with no content is malformed, as an output's is.
+        let mut wire = full_target_def_pb();
+        wire.failure_outputs[0].paths[0].content = None;
+        let err = target_def_from_pb(via_bytes(&wire))
+            .err()
+            .expect("a path with no content is refused");
+        assert!(
+            format!("{err:#}").contains("FailureOutput.paths.content"),
+            "{err:#}"
+        );
+    }
+
+    /// D7, D14: `InPlace` crosses with its flag intact (`IN_PLACE` with it,
+    /// `IN_PLACE_ON_SUCCESS` without), and a mode this build does not know is
+    /// a decode error, never read as a tree write.
+    #[test]
+    fn codegen_in_place_on_success_roundtrip() {
+        for mode in [
+            CodegenMode::None,
+            CodegenMode::Copy,
+            CodegenMode::InPlace {
+                write_on_failure: true,
+            },
+            CodegenMode::InPlace {
+                write_on_failure: false,
+            },
+        ] {
+            let p = path(
+                PathContent::FilePath("a.ts".to_string()),
+                mode.clone(),
+                true,
+            );
+            let back = path_from_pb(via_bytes(&path_to_pb(&p))).expect("decode");
+            assert_eq!(back.codegen_tree, mode);
+        }
+        assert_eq!(
+            codegen_to_pb(&CodegenMode::InPlace {
+                write_on_failure: false
+            }),
+            pb::CodegenMode::InPlaceOnSuccess
+        );
+        assert_eq!(
+            pb::CodegenMode::InPlaceOnSuccess as i32,
+            4,
+            "appended, never renumbered"
+        );
+
+        let mut wire = full_target_def_pb();
+        wire.outputs[0].paths[0].codegen_tree = Some(buffa::EnumValue::Unknown(5));
+        let err = target_def_from_pb(via_bytes(&wire))
+            .err()
+            .expect("an unknown codegen mode is refused");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("Path.codegen_tree"), "{msg}");
+        assert!(msg.contains("value 5"), "{msg}");
+    }
+
+    /// D6: a failure's write-back (`RunFailure.write_back`) crosses both ways
+    /// as its own context, beside the diagnostics and never inside them; an
+    /// undecodable one is dropped like a bad diagnostic, and an older plugin's
+    /// failure carries none.
+    #[test]
+    fn run_failure_write_back_roundtrip() {
+        let file = |name: &str| OutputArtifact {
+            group: "fmt".to_string(),
+            name: name.to_string(),
+            r#type: OaType::Output,
+            content: OaContent::File(ContentFile {
+                source_path: format!("/sandbox/{name}"),
+                out_path: name.to_string(),
+                x: false,
+                passthrough: false,
+            }),
+            hashout: String::new(),
+        };
+        let log = OutputArtifact {
+            group: String::new(),
+            name: "log.txt".to_string(),
+            r#type: OaType::Log,
+            ..file("log.txt")
+        };
+        let err = anyhow::Error::new(hplugin::error::ProcessFailed::new(
+            "exit status: 1",
+            Some(Exit::Code(1)),
+        ));
+        let err = hplugin::error::with_failure_artifacts(err, vec![log]);
+        let err = hplugin::error::with_failure_write_back(err, vec![file("a.go"), file("b.go")]);
+
+        let mut wire = run_failure_to_pb(&err, hcore::hmemoizer::chain_message(&err));
+        assert_eq!(wire.artifacts.len(), 1);
+        assert_eq!(wire.write_back.len(), 2);
+        // One a newer or broken peer may send: dropped, the rest kept.
+        wire.write_back.insert(0, pb::OutputArtifactRef::default());
+
+        let back = run_failure_from_pb(via_bytes(&wire));
+        assert_eq!(
+            hcore::hmemoizer::chain_message(&back),
+            "process exited with status: exit status: 1"
+        );
+        assert_eq!(hplugin::error::process_exit(&back), Some(Exit::Code(1)));
+        let names = |a: &[OutputArtifact]| -> Vec<(String, String)> {
+            a.iter()
+                .map(|a| (a.group.clone(), a.name.clone()))
+                .collect()
+        };
+        let wb = hplugin::error::failure_write_back(&back).expect("write-back crosses");
+        assert_eq!(
+            names(&wb.0),
+            [
+                ("fmt".to_string(), "a.go".to_string()),
+                ("fmt".to_string(), "b.go".to_string())
+            ]
+        );
+        let fa = hplugin::error::failure_artifacts(&back).expect("diagnostics cross");
+        assert_eq!(names(&fa.0), [(String::new(), "log.txt".to_string())]);
+
+        // An older plugin's failure: no `write_back`, so no context.
+        wire.write_back.clear();
+        let back = run_failure_from_pb(via_bytes(&wire));
+        assert!(hplugin::error::failure_write_back(&back).is_none());
+        assert!(hplugin::error::failure_log(&back).is_some());
     }
 
     #[test]

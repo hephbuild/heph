@@ -295,7 +295,9 @@ impl ManagedDriver for GoFormatDriver {
             group: SRC_OUTPUT_GROUP.to_string(),
             paths: vec![TPath {
                 content: Content::Glob(format_sources_pattern(pkg_str)),
-                codegen_tree: CodegenMode::InPlace,
+                codegen_tree: CodegenMode::InPlace {
+                    write_on_failure: true,
+                },
                 collect: true,
             }],
         }];
@@ -733,7 +735,12 @@ mod tests {
             "{:?}",
             path.content
         );
-        assert_eq!(path.codegen_tree, CodegenMode::InPlace);
+        assert_eq!(
+            path.codegen_tree,
+            CodegenMode::InPlace {
+                write_on_failure: true
+            }
+        );
 
         let sources: Vec<String> = def
             .inputs
