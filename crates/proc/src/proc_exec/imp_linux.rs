@@ -129,6 +129,9 @@ impl StdinPump {
 /// docs for the mechanism.
 pub struct Handle {
     pid: i32,
+    /// Spawned with `setsid`, so `pid` is also the id of a group that holds
+    /// only the child's own descendants — the one a cancel kills.
+    own_group: bool,
     child: Child,
     stdin: Option<StdinPump>,
     stdout: Option<ChunkReader>,
@@ -191,6 +194,13 @@ impl Handle {
                         process_supervisor::kill_child(self.pid);
                         drop(self.child.wait().await);
                     }
+                }
+                // The child is gone, but a descendant that ignored the SIGINT
+                // (a shell's `&` job starts with it ignored) is not: kill
+                // what is left of the group. Right after the reap, which is
+                // what makes the id safe to signal (see `kill_group`).
+                if self.own_group {
+                    process_supervisor::kill_group(self.pid);
                 }
                 Err(io::Error::other("cancelled"))
             }
@@ -257,6 +267,7 @@ pub(super) fn spawn(spec: Spec) -> io::Result<Handle> {
 
     Ok(Handle {
         pid,
+        own_group: setsid,
         child,
         stdin: stdin_pump,
         stdout: stdout_reader,

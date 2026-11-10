@@ -363,6 +363,13 @@ pub trait RemoteCacheBackend: Send + Sync {
     /// per target. Object keys mirror the target address (see
     /// [`RemoteCacheSet::key`]), so a revision is exactly one key prefix.
     async fn list_names(&self, prefix: &str) -> anyhow::Result<Vec<String>>;
+    /// The command that renews this backend's credential (`az login`), shown
+    /// when it is refused. Only for a credential with a known way to renew it
+    /// — a CLI login — and `None` otherwise: a remedy that is a guess sends the
+    /// user the wrong way.
+    fn auth_remedy(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// One cache entry from `caches:` — name plus URI, permissions, and request cap.
@@ -508,6 +515,111 @@ impl std::error::Error for AuthError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&*self.0)
     }
+}
+
+/// The one-line warning for an auth failure that disables cache `cache`: what
+/// failed and why, as briefly as the error allows; what that costs; and the
+/// backend's [`auth_remedy`] when it has one, last, so the command copies
+/// cleanly.
+///
+/// The full cause chain is logged separately at debug. A refusal's reason is
+/// the response body the server sent — a token endpoint's multi-line JSON, an
+/// S3 or Azure XML document — which otherwise dominates the warning; when the
+/// warning shows less than the whole chain it says how to see the rest.
+///
+/// [`auth_remedy`]: RemoteCacheBackend::auth_remedy
+pub(crate) fn auth_warning(cache: &str, e: &anyhow::Error, remedy: Option<&str>) -> String {
+    let (reason, condensed) = match refusal_reason(e) {
+        Some(reason) => (reason, true),
+        None => one_line(&hcore::hmemoizer::chain_message(e)),
+    };
+    let mut msg = format!(
+        "remote cache {cache:?}: authentication failed ({reason}); \
+         builds continue without it for the rest of this run"
+    );
+    if condensed {
+        msg.push_str(" (HEPH_LOG=debug shows the full error)");
+    }
+    msg.push('.');
+    if let Some(remedy) = remedy {
+        msg.push_str(" To sign in again, run `");
+        msg.push_str(remedy);
+        msg.push('`');
+    }
+    msg
+}
+
+/// Longest error text a warning carries, in chars. A response body the
+/// reason parser does not recognize (a proxy's HTML page) can be kilobytes.
+const WARNING_DETAIL_MAX_CHARS: usize = 300;
+
+/// `text` on one line, cut to [`WARNING_DETAIL_MAX_CHARS`] with a trailing `…`;
+/// and whether anything was cut.
+fn one_line(text: &str) -> (String, bool) {
+    let mut out = String::with_capacity(text.len().min(WARNING_DETAIL_MAX_CHARS * 4));
+    let mut chars = 0;
+    for word in text.split_whitespace() {
+        let sep = (!out.is_empty()).then_some(' ');
+        for c in sep.into_iter().chain(word.chars()) {
+            if chars >= WARNING_DETAIL_MAX_CHARS {
+                out.push('…');
+                return (out, true);
+            }
+            out.push(c);
+            chars += 1;
+        }
+    }
+    (out, false)
+}
+
+/// The server's own words for a refusal, read from the response body at the
+/// tail of the innermost link (object_store reports a refused request as
+/// `…400 Bad Request: <body>`), in the shapes the supported stores answer with:
+///
+/// - an OAuth 2.0 token endpoint (Google, Entra ID; RFC 6749 §5.2):
+///   `{"error": "invalid_grant", "error_description": "…"}`;
+/// - a Google API: `{"error": {"code": 403, "message": "…"}}`;
+/// - S3 and Azure Blob: `<Error><Code>…</Code><Message>…</Message></Error>`.
+///
+/// `None` for anything else, and the caller falls back to the cause chain.
+fn refusal_reason(e: &anyhow::Error) -> Option<String> {
+    let last = e.chain().last()?.to_string();
+    let reason = json_reason(&last).or_else(|| xml_reason(&last))?;
+    // Collapse the body's line breaks and indentation: the warning is one line.
+    Some(one_line(&reason).0)
+}
+
+fn json_reason(text: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum ErrorField {
+        OAuth(String),
+        Api { message: String },
+    }
+    #[derive(serde::Deserialize)]
+    struct Body {
+        error: ErrorField,
+        error_description: Option<String>,
+    }
+    let body: Body = serde_json::from_str(text.get(text.find('{')?..)?).ok()?;
+    Some(match (body.error, body.error_description) {
+        (ErrorField::OAuth(code), Some(d)) if !d.trim().is_empty() => format!("{code}: {d}"),
+        (ErrorField::OAuth(code), _) => code,
+        (ErrorField::Api { message }, _) => message,
+    })
+}
+
+fn xml_reason(text: &str) -> Option<String> {
+    let element = |name: &str| {
+        let (_, rest) = text.split_once(&format!("<{name}>"))?;
+        let (value, _) = rest.split_once(&format!("</{name}>"))?;
+        Some(value.trim()).filter(|v| !v.is_empty())
+    };
+    let code = element("Code")?;
+    Some(match element("Message") {
+        Some(message) => format!("{code}: {message}"),
+        None => code.to_owned(),
+    })
 }
 
 /// Whether `e` is an [`AuthError`]-class failure anywhere in its chain.
@@ -663,22 +775,44 @@ impl ConfiguredCache {
             // too and stay quiet.
             self.health.warned.store(true, Ordering::Relaxed);
             if !self.health.auth_failed.swap(true, Ordering::Relaxed) {
+                // `auth_warning` stays one tested string; the fields carry
+                // what a log filter needs.
                 warn!(
                     cache = %self.def.name,
                     op,
-                    "remote cache authentication failed, disabling it for the rest of this run: {e:#}",
+                    "{}",
+                    auth_warning(&self.def.name, e, self.backend.auth_remedy()),
+                );
+                debug!(
+                    cache = %self.def.name,
+                    op,
+                    error = %hcore::hmemoizer::chain_message(e),
+                    "remote cache authentication failure",
                 );
             }
             return;
         }
         if !self.health.warned.swap(true, Ordering::Relaxed) {
-            // `{e:#}` is anyhow's alternate Display: the cause chain on one line,
-            // no backtrace. (`{e:?}` would dump the full `Caused by:` ladder plus
-            // a process backtrace — useless noise for the user.)
+            // `chain_message` is the cause chain with each cause once, no
+            // backtrace (`{e:?}` would dump the full `Caused by:` ladder plus a
+            // process backtrace); `one_line` keeps a response body it carries
+            // from taking over the warning. The whole chain goes to debug.
+            let (detail, cut) = one_line(&hcore::hmemoizer::chain_message(e));
+            let more = if cut {
+                " (HEPH_LOG=debug shows the full error)"
+            } else {
+                ""
+            };
             warn!(
                 cache = %self.def.name,
                 op,
-                "remote cache unavailable, skipping it for {op}: {e:#}. Further errors for this cache are suppressed.",
+                "remote cache unavailable, skipping it for {op}: {detail}{more}. Further errors for this cache are suppressed.",
+            );
+            debug!(
+                cache = %self.def.name,
+                op,
+                error = %hcore::hmemoizer::chain_message(e),
+                "remote cache unavailable",
             );
         }
         let n = self
@@ -2549,6 +2683,120 @@ mod tests {
         assert!(cache.broken(), "an auth failure has no cooldown");
         cache.note_ok();
         assert!(cache.broken(), "a later success must not re-arm the cache");
+    }
+
+    /// The server's reason, read from each response shape the stores refuse
+    /// with, and the inputs that must fall back to the cause chain instead.
+    #[test]
+    fn refusal_reason_reads_each_stores_response() {
+        let reason = |innermost: &str| {
+            refusal_reason(&anyhow::anyhow!(innermost.to_owned()).context("open remote object k"))
+        };
+        let ok = |innermost: &str, want: &str| {
+            assert_eq!(reason(innermost).as_deref(), Some(want), "{innermost:?}");
+        };
+        // OAuth 2.0 token endpoints: Google, Entra ID. Pretty-printed bodies
+        // collapse to one line.
+        ok(
+            "400 Bad Request: {\n  \"error\": \"invalid_grant\",\n  \
+             \"error_description\": \"reauth related error (invalid_rapt)\"\n}",
+            "invalid_grant: reauth related error (invalid_rapt)",
+        );
+        ok("401: {\"error\": \"invalid_client\"}", "invalid_client");
+        ok(
+            "401: {\"error\": \"invalid_client\", \"error_description\": \"  \"}",
+            "invalid_client",
+        );
+        ok(
+            "400: {\"error\":\"invalid_client\",\"error_description\":\"AADSTS7000215: \
+             Invalid client secret.\\r\\nTrace ID: 1\"}",
+            "invalid_client: AADSTS7000215: Invalid client secret. Trace ID: 1",
+        );
+        // A Google API (GCS's own 401/403).
+        ok(
+            "403 Forbidden: {\"error\": {\"code\": 403, \"message\": \"a@b.c does not have \
+             storage.objects.get access\", \"errors\": []}}",
+            "a@b.c does not have storage.objects.get access",
+        );
+        // S3, Azure Blob.
+        ok(
+            "400: <?xml version=\"1.0\"?><Error><Code>ExpiredToken</Code>\
+             <Message>The provided token has expired.</Message></Error>",
+            "ExpiredToken: The provided token has expired.",
+        );
+        ok(
+            "403: <Error><Code>AccessDenied</Code></Error>",
+            "AccessDenied",
+        );
+        ok(
+            "403: <Error><Code>AuthenticationFailed</Code><Message>Server failed\n\
+             to authenticate the request.\nRequestId:é1</Message></Error>",
+            "AuthenticationFailed: Server failed to authenticate the request. RequestId:é1",
+        );
+
+        // Not a response the stores send: the caller writes the chain instead.
+        for innermost in [
+            "",
+            "401 Unauthorized",
+            "{}",
+            "{\"error\": 3}",
+            "{\"message\": \"no error field\"}",
+            "{\"error\": \"x\"} trailing",
+            "{not json",
+            "<Code></Code>",
+            "<Code>unterminated",
+            "<Message>only</Message>",
+        ] {
+            assert_eq!(reason(innermost), None, "{innermost:?}");
+        }
+    }
+
+    /// The warning without a reason in the body: the cause chain, once, and the
+    /// backend's remedy when it has one.
+    #[test]
+    fn auth_warning_falls_back_to_the_chain() {
+        let e = anyhow::Error::new(AuthError("token file unreadable".into()))
+            .context("open remote object k");
+        assert_eq!(
+            auth_warning("main", &e, None),
+            "remote cache \"main\": authentication failed (open remote object k: \
+             authentication failed: token file unreadable); builds continue without it \
+             for the rest of this run.",
+        );
+        assert_eq!(
+            auth_warning("main", &e, Some("az login")),
+            "remote cache \"main\": authentication failed (open remote object k: \
+             authentication failed: token file unreadable); builds continue without it \
+             for the rest of this run. To sign in again, run `az login`",
+        );
+
+        // A body nothing recognizes (a proxy's HTML page) is one line, capped,
+        // and says where the rest is.
+        let page = format!("<html>\n<body>{}</body>\n</html>", "denied ".repeat(100));
+        let e = anyhow::Error::new(AuthError(page.into())).context("open remote object k");
+        let msg = auth_warning("main", &e, None);
+        assert!(!msg.contains('\n'), "{msg}");
+        assert!(msg.contains("…); builds continue"), "{msg}");
+        assert!(
+            msg.contains("(HEPH_LOG=debug shows the full error)"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn one_line_collapses_and_caps_on_a_char_boundary() {
+        assert_eq!(one_line("a\n  b\tc "), ("a b c".to_owned(), false));
+        assert_eq!(one_line(""), (String::new(), false));
+        let at_cap = "é".repeat(WARNING_DETAIL_MAX_CHARS);
+        assert_eq!(one_line(&at_cap), (at_cap.clone(), false));
+        let (cut, was_cut) = one_line(&format!("{at_cap}é"));
+        assert!(was_cut);
+        assert_eq!(cut, format!("{at_cap}…"));
+        // The cap reached exactly at a word's end still cuts what follows.
+        assert_eq!(
+            one_line(&format!("{at_cap} x")),
+            (format!("{at_cap}…"), true)
+        );
     }
 
     /// Every shape an auth failure reaches the breaker in, and the near

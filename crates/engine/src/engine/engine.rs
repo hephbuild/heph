@@ -291,6 +291,11 @@ pub struct Engine {
     /// (`AdmissionWaitStart`): the result-lock notice threshold, settable in
     /// tests only ([`Engine::set_admission_notice`]).
     pub(crate) admission_notice: std::time::Duration,
+    /// How long a run past its `timeout` has to stop after it is cancelled
+    /// before the engine abandons it
+    /// ([`run_timeout::GRACE`](crate::engine::run_timeout::GRACE)), settable
+    /// in tests only ([`Engine::set_timeout_grace`]).
+    pub(crate) timeout_grace: std::time::Duration,
 
     /// YAML-selected builtins, by plugin name; consumed when applied.
     pub(crate) plugin_factories: HashMap<String, PluginFactory>,
@@ -730,6 +735,13 @@ impl Engine {
         self.admission_notice = after;
     }
 
+    /// Shorten the grace a timed-out run gets to stop, so a test of a driver
+    /// that ignores cancellation does not wait the production grace.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_timeout_grace(&mut self, grace: std::time::Duration) {
+        self.timeout_grace = grace;
+    }
+
     pub fn new(cfg: Config) -> anyhow::Result<Engine> {
         let home = cfg.home_dir.clone();
         ensure_home(&home)?;
@@ -899,6 +911,7 @@ impl Engine {
             max_workers,
             fan_out,
             admission_notice: crate::engine::result::RESULT_LOCK_NOTICE,
+            timeout_grace: crate::engine::run_timeout::GRACE,
             plugin_factories: HashMap::new(),
             plugins: HashMap::new(),
             fuse,

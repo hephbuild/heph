@@ -144,6 +144,24 @@ impl FromSpecValue for crate::driver::Resources {
     }
 }
 
+/// The shared `timeout` attribute, parsed by the one SDK parser
+/// ([`Timeout::from_value`](crate::driver::Timeout::from_value)). A driver
+/// config carries it as a `timeout: Option<Timeout>` field and moves it onto
+/// [`TargetDef::timeout`](crate::driver::targetdef::TargetDef::timeout); the
+/// engine enforces it, and it must never reach a def hash.
+impl FromSpecValue for crate::driver::Timeout {
+    fn from_spec_value(v: &Value) -> anyhow::Result<Self> {
+        if let Value::String(s) = v {
+            reject_deferred_reference(s)?;
+        }
+        Self::from_value(v)
+    }
+
+    fn spec_param_type() -> ParamType {
+        ParamType::union(vec![ParamType::String, ParamType::Int])
+    }
+}
+
 /// Any decodable type becomes optional for free: absent or null is `None`.
 ///
 /// Blanket rather than one impl per `Option<T>`, so a nested config struct can

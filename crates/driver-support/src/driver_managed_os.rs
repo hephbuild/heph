@@ -68,7 +68,7 @@ impl ManagedDriverOs {
         // last-write-wins. Off the worker: the check enumerates every input's
         // entry paths, which for a cache-backed input is a header scan over a
         // sqlite blob and can park on that key's queued write.
-        let groups = detect_output_collisions_blocking(groups)
+        let groups = detect_output_collisions_blocking(groups, ctoken)
             .await
             .with_context(|| format!("output-collision check for {}", req.target.addr.format()))?;
 
@@ -112,12 +112,14 @@ impl ManagedDriverOs {
                     }
                     _ => {
                         // Writes the input's entire tree to disk — off the
-                        // worker, see `unpack_blocking`.
+                        // worker, and stopped by the run's cancellation, see
+                        // `unpack_blocking`.
                         unpack_blocking(
                             Arc::clone(&input.artifact.content),
                             unpack_root.clone(),
                             list_path.clone(),
                             input.filters.clone(),
+                            ctoken,
                         )
                         .await
                         .with_context(|| {
@@ -142,7 +144,7 @@ impl ManagedDriverOs {
         fs::create_dir_all(&sandbox_pkg_dir)
             .with_context(|| format!("create pkg dir: {:?}", sandbox_pkg_dir))?;
 
-        let inputs = write_source_map_blocking(inputs, &ws_dir, &sandbox_pkg_dir).await?;
+        let inputs = write_source_map_blocking(inputs, &ws_dir, &sandbox_pkg_dir, ctoken).await?;
 
         let target = req.target;
         let hashin = req.hashin;
@@ -176,7 +178,7 @@ impl ManagedDriverOs {
         }
 
         res.artifacts
-            .extend(collect_outputs(target, hashin, &ws_dir, &sandbox_dir).await?);
+            .extend(collect_outputs(target, hashin, &ws_dir, &sandbox_dir, ctoken).await?);
 
         Ok(RunResponse {
             artifacts: res.artifacts,

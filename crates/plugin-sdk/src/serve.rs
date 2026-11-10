@@ -377,13 +377,51 @@ pub fn named_managed_driver<D: ManagedDriver + 'static>(
 /// whole request subtree shares it — so multiple calls can be in flight under
 /// one id concurrently. Each keeps its own token in the `Vec`; `cancel` trips
 /// them all (a request cancel means the whole subtree stops).
+///
+/// A run from a host at 0.19.1 or later is keyed by its own `cancel_key`
+/// instead (in `calls`, through [`enter_call`](Self::enter_call)), so the host
+/// can cancel that one run — its `timeout` — without stopping its siblings. It
+/// is not registered under its request id: the host cancels it by its key when
+/// the request is cancelled too, since the run's token is cancelled with the
+/// request. A key is never parked (see [`cancel`](Self::cancel)).
 #[derive(Default)]
 struct CancelRegistry {
     inflight: Mutex<HashMap<String, Vec<StdCancellationToken>>>,
     precancelled: Mutex<HashSet<String>>,
+    /// Runs in flight by their cancel key. One token per key: a key names one
+    /// call, and a second call under the same key is refused.
+    calls: Mutex<HashMap<String, StdCancellationToken>>,
 }
 
 impl CancelRegistry {
+    /// Register a run under its own cancel key, and return a guard that
+    /// deregisters it on drop. Called before the run's dispatch returns to the
+    /// host, which sends a cancel for the key only after that, so no cancel for
+    /// it can arrive first. A key already in flight is refused: the host mints
+    /// each key once, and two calls sharing one would cancel each other.
+    fn enter_call(self: &Arc<Self>, key: &str) -> Result<CancelGuard> {
+        let token = StdCancellationToken::new();
+        match self
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(key.to_string())
+        {
+            std::collections::hash_map::Entry::Occupied(_) => {
+                anyhow::bail!("run: cancel key {key:?} is already in flight")
+            }
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(token.clone());
+            }
+        }
+        Ok(CancelGuard {
+            reg: Arc::clone(self),
+            id: key.to_string(),
+            token,
+            call: true,
+        })
+    }
+
     /// Register a fresh token for `id` and return a guard that deregisters on drop.
     /// An empty id (no cancellation wired for this call) is a no-op passthrough.
     ///
@@ -417,6 +455,7 @@ impl CancelRegistry {
             reg: Arc::clone(self),
             id: id.to_string(),
             token,
+            call: false,
         }
     }
 
@@ -424,8 +463,19 @@ impl CancelRegistry {
     /// id not consumed here is consumed (and applied) by the next `enter` under
     /// the same id — ids name an engine request, and a cancelled request stays
     /// cancelled, so applying it to that later call is correct.
+    ///
+    /// A run's cancel key ([`plugin_abi::CANCEL_KEY_PREFIX`]) trips that run
+    /// alone, and is never parked: its run registered it before the host could
+    /// send this, so a key not in flight names a run that already ended, and
+    /// parking it would only leak it.
     fn cancel(&self, id: &str) {
         if id.is_empty() {
+            return;
+        }
+        if id.starts_with(plugin_abi::CANCEL_KEY_PREFIX) {
+            if let Some(t) = self.calls.lock().unwrap_or_else(|e| e.into_inner()).get(id) {
+                t.cancel();
+            }
             return;
         }
         self.precancelled
@@ -447,6 +497,8 @@ struct CancelGuard {
     reg: Arc<CancelRegistry>,
     id: String,
     token: StdCancellationToken,
+    /// `id` is a run's cancel key (in `calls`), not a request id.
+    call: bool,
 }
 
 impl CancelGuard {
@@ -457,6 +509,16 @@ impl CancelGuard {
 
 impl Drop for CancelGuard {
     fn drop(&mut self) {
+        if self.call {
+            // The key is this guard's alone (`enter_call` refuses a second), so
+            // nothing else can be under it; nothing was parked for it either.
+            self.reg
+                .calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&self.id);
+            return;
+        }
         if !self.id.is_empty() {
             {
                 let mut map = self.reg.inflight.lock().unwrap_or_else(|e| e.into_inner());
@@ -1343,17 +1405,42 @@ fn run_error_stream(msg: String) -> DynItemStream {
     make_item_stream(Box::new(std::iter::once(run_out_err(msg).encode_to_vec())))
 }
 
-/// Pull the first request-stream item: the run request (`RunInFrame{start}`),
-/// with its `request_id` — required, since it is what a cancel names.
-fn pull_run_start(req: &DynItemStream) -> Result<(String, pb::ManagedRunRequest)> {
+/// The run request a run's start frame carries, with what names it.
+#[derive(Debug)]
+struct RunStartFrame {
+    /// Required: the runner callback keys on it, and a host before 0.19.1
+    /// cancels the run by it.
+    request_id: String,
+    /// The run's own cancel key (since 0.19.1); `None` from an older host.
+    cancel_key: Option<String>,
+    start: pb::ManagedRunRequest,
+}
+
+/// Pull the first request-stream item: the run request (`RunInFrame{start}`).
+/// A `cancel_key` without [`plugin_abi::CANCEL_KEY_PREFIX`] is refused: a
+/// cancel for it after the run ended would read as a request cancel.
+fn pull_run_start(req: &DynItemStream) -> Result<RunStartFrame> {
     let bytes = req.next();
     if bytes.is_empty() {
         anyhow::bail!("run: missing start frame");
     }
     match decode_req::<pb::RunInFrame>(&bytes[..], "the run start frame")?.msg {
         Some(pb::run_in_frame::Msg::Start(mut s)) => {
-            let id = required(s.request_id.take(), "ManagedRunRequest.request_id")?;
-            Ok((id, *s))
+            let request_id = required(s.request_id.take(), "ManagedRunRequest.request_id")?;
+            let cancel_key = s.cancel_key.take();
+            if let Some(key) = &cancel_key {
+                anyhow::ensure!(
+                    key.len() > plugin_abi::CANCEL_KEY_PREFIX.len()
+                        && key.starts_with(plugin_abi::CANCEL_KEY_PREFIX),
+                    "run: ManagedRunRequest.cancel_key {key:?} does not start with {:?}",
+                    plugin_abi::CANCEL_KEY_PREFIX
+                );
+            }
+            Ok(RunStartFrame {
+                request_id,
+                cancel_key,
+                start: *s,
+            })
         }
         // Named, not Debug-printed: a stdin chunk is the target's input bytes,
         // which have no place in an error message.
@@ -1379,13 +1466,28 @@ async fn run_bidi(
     req: DynItemStream,
     cancels: Arc<CancelRegistry>,
 ) -> DynItemStream {
-    let (request_id, start) = match pull_run_start(&req) {
+    let RunStartFrame {
+        request_id,
+        cancel_key,
+        start,
+    } = match pull_run_start(&req) {
         Ok(s) => s,
         Err(e) => return run_error_stream(err_message(&e)),
     };
     let mut start = match RunStart::from_pb(start) {
         Ok(s) => s,
         Err(e) => return run_error_stream(err_message(&e)),
+    };
+    // A run with its own cancel key registers it HERE, before this dispatch
+    // returns, not in the spawned body: the host sends a cancel for the key only
+    // once `invoke_bidi` has resolved, so the key is always in flight by then
+    // and the cancel is never early (nor parked, which a key must not be). A run
+    // from a host before 0.19.1 has no key and registers its request id in the
+    // body, where a cancel racing the spawn is parked as for every other call.
+    let call_guard = match cancel_key.as_deref().map(|k| cancels.enter_call(k)) {
+        None => None,
+        Some(Ok(g)) => Some(g),
+        Some(Err(e)) => return run_error_stream(err_message(&e)),
     };
     // A run in the caller's terminal keeps reading the request stream for the
     // signals the host relays. Only that run: a captured one has nothing more to
@@ -1401,7 +1503,7 @@ async fn run_bidi(
     // caller's memoizer frame chain for cycle detection.
     let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
     hcore::hmemoizer::spawn_on_with_cycle_ctx(cdylib_runtime().handle(), async move {
-        let guard = cancels.enter(&request_id);
+        let guard = call_guard.unwrap_or_else(|| cancels.enter(&request_id));
         // The tool's stops ride the response stream too, on a run with a PTY.
         // A task of its own: `run_once` holds the run's whole lifetime.
         let stop_forward = stops.map(|mut stops| {
@@ -3868,6 +3970,362 @@ mod tests {
                 .is_empty(),
             "the guard's token (and the emptied entry) must be gone"
         );
+    }
+
+    // ---- Per-run cancel keys (0.19.1): a run keyed by its own cancel key is
+    // cancelled alone, never through its request id, and a key is never
+    // parked. ----
+
+    fn cancel_key(n: u32) -> String {
+        format!("{}{n}", plugin_abi::CANCEL_KEY_PREFIX)
+    }
+
+    // B2: cancelling one run's key trips that run alone — not a sibling run of
+    // the same request, not another call (a parse) under its request id. With
+    // a request-id-only registry, cancelling one run tripped all three.
+    #[test]
+    fn registry_a_cancel_key_trips_its_own_run_only() {
+        let reg = Arc::new(CancelRegistry::default());
+        let a = reg.enter_call(&cancel_key(1)).expect("enter a");
+        let b = reg.enter_call(&cancel_key(2)).expect("enter b");
+        let parse = reg.enter("req-1");
+        reg.cancel(&cancel_key(1));
+        assert!(a.token().is_cancelled(), "the keyed run must trip");
+        assert!(!b.token().is_cancelled(), "its sibling run must not");
+        assert!(
+            !parse.token().is_cancelled(),
+            "a call under the request id must not"
+        );
+        assert!(
+            reg.precancelled
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty(),
+            "a key cancel parks nothing"
+        );
+    }
+
+    // A request cancel by id does not reach a keyed run: the host cancels a
+    // keyed run by its key, the run's token being cancelled with the request.
+    // A parked request id therefore cannot poison a later keyed run either.
+    #[test]
+    fn registry_a_request_id_cancel_leaves_keyed_runs_alone() {
+        let reg = Arc::new(CancelRegistry::default());
+        reg.cancel("req-1");
+        let run = reg.enter_call(&cancel_key(1)).expect("enter");
+        reg.cancel("req-1");
+        assert!(!run.token().is_cancelled());
+    }
+
+    // A cancel for a key that is not in flight names a run that already ended
+    // (the run registers before the host can send one). It is dropped: nothing
+    // is parked, so nothing leaks and no later call starts cancelled.
+    #[test]
+    fn registry_a_late_key_cancel_leaves_no_state_behind() {
+        let reg = Arc::new(CancelRegistry::default());
+        let run = reg.enter_call(&cancel_key(1)).expect("enter");
+        drop(run);
+        reg.cancel(&cancel_key(1));
+        reg.cancel(&cancel_key(2));
+        assert!(
+            reg.precancelled
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+        );
+        assert!(
+            reg.calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+        );
+        let next = reg.enter_call(&cancel_key(2)).expect("enter");
+        assert!(!next.token().is_cancelled(), "a stale key poisons nothing");
+    }
+
+    // Two calls sharing a key would cancel each other; the second is refused.
+    #[test]
+    fn registry_refuses_a_key_already_in_flight() {
+        let reg = Arc::new(CancelRegistry::default());
+        let _first = reg.enter_call(&cancel_key(1)).expect("enter");
+        let Err(err) = reg.enter_call(&cancel_key(1)) else {
+            panic!("a duplicate key must be refused");
+        };
+        assert!(format!("{err:#}").contains("already in flight"), "{err:#}");
+    }
+
+    // The key crosses in the run's start frame; absent (a host before 0.19.1)
+    // reads as none, and one without the reserved prefix is refused — a late
+    // cancel for it would read as a request cancel and be parked.
+    #[test]
+    fn the_cancel_key_crosses_in_the_start_frame() {
+        let pull = |key: Option<String>| {
+            let mut req = wire_run(wire_target());
+            req.cancel_key = key;
+            let frame = start_frame(req);
+            pull_run_start(&make_item_stream(Box::new(std::iter::once(frame))))
+        };
+        let got = pull(Some(cancel_key(7))).expect("keyed");
+        assert_eq!(got.request_id, "r");
+        assert_eq!(got.cancel_key, Some(cancel_key(7)));
+        assert_eq!(got.start.cancel_key, None, "taken out of the request");
+
+        let got = pull(None).expect("unkeyed");
+        assert_eq!(got.cancel_key, None);
+
+        for bad in ["req-1", "", plugin_abi::CANCEL_KEY_PREFIX] {
+            let err = pull(Some(bad.into())).expect_err(bad);
+            assert!(
+                format!("{err:#}").contains("cancel_key"),
+                "{bad:?}: {err:#}"
+            );
+        }
+    }
+
+    /// A cdylib driver whose run `a` ends only when cancelled, and run `b`
+    /// when cancelled (an error) or released (a success), whichever its token
+    /// says first. Each run reports its `hashin` on `entered` once inside.
+    struct WaitDriver {
+        release_b: Arc<tokio::sync::Notify>,
+        entered: tokio::sync::mpsc::UnboundedSender<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl ManagedDriver for WaitDriver {
+        fn config(
+            &self,
+            _req: hplugin::driver::ConfigRequest,
+        ) -> Result<hplugin::driver::ConfigResponse> {
+            Ok(hplugin::driver::ConfigResponse {
+                name: "waitdrv".into(),
+            })
+        }
+        fn schema(&self) -> hplugin::driver::DriverSchema {
+            hplugin::driver::DriverSchema::default()
+        }
+        async fn parse(
+            &self,
+            _req: hplugin::driver::ParseRequest,
+            _ct: &(dyn Cancellable + Send + Sync),
+        ) -> Result<hplugin::driver::ParseResponse> {
+            anyhow::bail!("unused")
+        }
+        async fn apply_transitive(
+            &self,
+            _req: hplugin::driver::ApplyTransitiveRequest,
+            _ct: &(dyn Cancellable + Send + Sync),
+        ) -> Result<hplugin::driver::ApplyTransitiveResponse> {
+            anyhow::bail!("unused")
+        }
+        async fn run<'a, 'io>(
+            &self,
+            req: hdriver_support::driver_managed::ManagedRunRequest<'a, 'io>,
+            ct: &(dyn Cancellable + Send + Sync),
+        ) -> Result<hdriver_support::driver_managed::ManagedRunResponse> {
+            let which = req.request.hashin.to_string();
+            drop(self.entered.send(which.clone()));
+            if which == "b" {
+                tokio::select! {
+                    biased;
+                    () = ct.cancelled() => {}
+                    () = self.release_b.notified() => {
+                        return Ok(hdriver_support::driver_managed::ManagedRunResponse {
+                            artifacts: vec![],
+                        });
+                    }
+                }
+            } else {
+                ct.cancelled().await;
+            }
+            anyhow::bail!("run {which} cancelled")
+        }
+    }
+
+    type WaitHarness = (
+        hplugin_stabby::load_stable::StableRemoteManagedDriver,
+        Arc<tokio::sync::Notify>,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+    );
+
+    /// The host proxy over [`WaitDriver`] through the real stable seam, for a
+    /// plugin reporting ABI `plugin_abi`.
+    fn wait_harness(plugin_abi: &str) -> WaitHarness {
+        let release_b = Arc::new(tokio::sync::Notify::new());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let dynd = make_dyn_managed_driver(Arc::new(WaitDriver {
+            release_b: Arc::clone(&release_b),
+            entered: tx,
+        }) as Arc<dyn ManagedDriver>);
+        let host = hplugin_stabby::load_stable::StableRemoteManagedDriver::new(dynd, "waitdrv")
+            .expect("load")
+            .with_plugin_abi(Some(plugin_abi));
+        (host, release_b, rx)
+    }
+
+    /// A run of `target` under request `id`, told apart in the driver by
+    /// `which` (its hashin).
+    fn wait_run<'a>(
+        id: &'a String,
+        target: &'a hplugin::driver::targetdef::TargetDef,
+        which: &'a str,
+    ) -> hdriver_support::driver_managed::ManagedRunRequest<'a, 'a> {
+        let mut rr = RunRequest::new(id, target, "/sb");
+        rr.hashin = which;
+        hdriver_support::driver_managed::ManagedRunRequest {
+            request: rr,
+            sandbox_dir: "/sb".into(),
+            sandbox_ws_dir: "/sb/ws".into(),
+            sandbox_pkg_dir: "/sb/ws/p".into(),
+            inputs: vec![],
+        }
+    }
+
+    fn host_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("rt")
+    }
+
+    /// B2 through the seam: two runs of one cdylib driver under ONE request id,
+    /// each with its own token (a timed run's). Cancelling the first's token
+    /// stops it and leaves the second running, which then finishes uncancelled.
+    /// Before 0.19.1 the cancel crossed as `cancel(request_id)` and stopped
+    /// both (see the 0.19.0 test below).
+    #[test]
+    fn cancelling_one_run_leaves_its_sibling_running() {
+        let (host, release_b, mut entered) = wait_harness(plugin_abi::ABI_SEMVER);
+        let target = convert::target_def_from_pb(wire_target()).expect("def");
+        let id = "req-1".to_string();
+        let (ct_a, ct_b) = (StdCancellationToken::new(), StdCancellationToken::new());
+        host_runtime().block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                let fa = host.run(wait_run(&id, &target, "a"), &ct_a);
+                let fb = host.run(wait_run(&id, &target, "b"), &ct_b);
+                tokio::pin!(fa, fb);
+                let both_in = async {
+                    entered.recv().await;
+                    entered.recv().await;
+                };
+                tokio::select! {
+                    () = both_in => {}
+                    r = &mut fa => panic!("a ended before any cancel: ok={}", r.is_ok()),
+                    r = &mut fb => panic!("b ended before any cancel: ok={}", r.is_ok()),
+                }
+                ct_a.cancel();
+                let ra = tokio::select! {
+                    r = &mut fa => r,
+                    r = &mut fb => panic!("b ended on a's cancel: ok={}", r.is_ok()),
+                };
+                let err = ra.err().expect("a is cancelled");
+                assert!(format!("{err:#}").contains("run a cancelled"), "{err:#}");
+                // `b`'s token was not tripped: released, its biased select
+                // still finds it uncancelled and returns success.
+                release_b.notify_one();
+                if let Err(e) = fb.await {
+                    panic!("b must run to completion uncancelled: {e:#}");
+                }
+            })
+            .await
+            .expect("runs ended in time");
+        });
+    }
+
+    /// A request cancel still reaches every run: an untimed run is handed the
+    /// request's token itself (a timed one has it forwarded into its own), so
+    /// each run's cancel fires and each is cancelled by its own key.
+    #[test]
+    fn a_request_cancel_reaches_every_run() {
+        let (host, _release_b, mut entered) = wait_harness(plugin_abi::ABI_SEMVER);
+        let target = convert::target_def_from_pb(wire_target()).expect("def");
+        let id = "req-1".to_string();
+        let request = StdCancellationToken::new();
+        host_runtime().block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                let fa = host.run(wait_run(&id, &target, "a"), &request);
+                let fb = host.run(wait_run(&id, &target, "b"), &request);
+                let cancel = async {
+                    entered.recv().await;
+                    entered.recv().await;
+                    request.cancel();
+                };
+                let (ra, rb, ()) = tokio::join!(fa, fb, cancel);
+                for (which, r) in [("a", ra), ("b", rb)] {
+                    let err = r.err().unwrap_or_else(|| panic!("{which} is cancelled"));
+                    assert!(
+                        format!("{err:#}").contains(&format!("run {which} cancelled")),
+                        "{err:#}"
+                    );
+                }
+            })
+            .await
+            .expect("runs ended in time");
+        });
+    }
+
+    /// A cancel racing the run's entry is not lost: the token is cancelled
+    /// before the run starts, or from another thread while it is starting.
+    /// The key is registered before the dispatch returns, and the host sends
+    /// its cancel only after, so whichever side wins, the run stops.
+    #[test]
+    fn a_cancel_racing_the_runs_entry_is_not_lost() {
+        let (host, _release_b, _entered) = wait_harness(plugin_abi::ABI_SEMVER);
+        let target = convert::target_def_from_pb(wire_target()).expect("def");
+        let id = "req-1".to_string();
+        let rt = host_runtime();
+        for i in 0..50 {
+            let ct = StdCancellationToken::new();
+            let canceller = (i > 0).then(|| {
+                let ct = ct.clone();
+                std::thread::spawn(move || ct.cancel())
+            });
+            if canceller.is_none() {
+                ct.cancel();
+            }
+            let r = rt.block_on(async {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    host.run(wait_run(&id, &target, "a"), &ct),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("cancel lost on iteration {i}"))
+            });
+            assert!(r.is_err(), "iteration {i}: the run is cancelled");
+            if let Some(t) = canceller {
+                t.join().expect("canceller");
+            }
+        }
+    }
+
+    /// The skew with a 0.19.0 plugin: the host sends it no key (it would not
+    /// read one) and cancels a run by its request id, as before 0.19.1 — so
+    /// one run's cancel stops its sibling too. Such a plugin cannot declare a
+    /// timeout, so its runs are cancelled only with their request, where that
+    /// is right.
+    #[test]
+    fn a_0_19_0_plugin_is_cancelled_by_request_id() {
+        let (host, _release_b, mut entered) = wait_harness("0.19.0");
+        let target = convert::target_def_from_pb(wire_target()).expect("def");
+        let id = "req-1".to_string();
+        let (ct_a, ct_b) = (StdCancellationToken::new(), StdCancellationToken::new());
+        host_runtime().block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                let fa = host.run(wait_run(&id, &target, "a"), &ct_a);
+                let fb = host.run(wait_run(&id, &target, "b"), &ct_b);
+                let cancel = async {
+                    entered.recv().await;
+                    entered.recv().await;
+                    ct_a.cancel();
+                };
+                let (ra, rb, ()) = tokio::join!(fa, fb, cancel);
+                assert!(ra.is_err(), "a is cancelled");
+                let err = rb.err().expect("b is cancelled with it, by request id");
+                assert!(format!("{err:#}").contains("run b cancelled"), "{err:#}");
+            })
+            .await
+            .expect("runs ended in time");
+        });
     }
 
     /// Base provider for the seam tests below: every method is a benign stub;

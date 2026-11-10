@@ -1,4 +1,4 @@
-use crate::hartifactcontent::{Content, WalkEntryKind};
+use crate::hartifactcontent::{Content, StopRead, WalkEntryKind};
 use anyhow::Context;
 use std::fs;
 use std::fs::OpenOptions;
@@ -42,6 +42,26 @@ pub fn unpack(
     list_dst: Option<&Path>,
     should_unpack: Option<&dyn Fn(&Path) -> bool>,
 ) -> anyhow::Result<()> {
+    unpack_with_stop(content, dst, list_dst, should_unpack, &|| false)
+}
+
+/// [`unpack`], stopping with an error as soon as `stop` reads true.
+///
+/// `stop` is polled before each entry and on every chunk of an entry's copy
+/// (see [`StopRead`]), so a cancelled unpack writes at most the remainder of
+/// one chunk after it is asked to stop. The entry being copied is left
+/// partial; the caller owns the tree and decides what that means.
+///
+/// This exists because an unpack runs as a blocking job that outlives its
+/// caller's future when that future is dropped: without a stop it keeps
+/// writing into a sandbox the next run of the same target may already own.
+pub fn unpack_with_stop(
+    content: &dyn Content,
+    dst: &Path,
+    list_dst: Option<&Path>,
+    should_unpack: Option<&dyn Fn(&Path) -> bool>,
+    stop: &dyn Fn() -> bool,
+) -> anyhow::Result<()> {
     let mut list_dst_f = match list_dst {
         Some(p) => Some(io::BufWriter::new(
             OpenOptions::new()
@@ -65,6 +85,13 @@ pub fn unpack(
     {
         let mut entry =
             entry.with_context(|| format!("read entry while unpacking into {:?}", dst))?;
+        if stop() {
+            anyhow::bail!(
+                "unpack into {:?} stopped before {:?}: the job was cancelled",
+                dst,
+                entry.path
+            );
+        }
         if let Some(pred) = should_unpack
             && !pred(&entry.path)
         {
@@ -154,7 +181,8 @@ pub fn unpack(
                     )
                 })?;
                 let mut dest_file = io::BufWriter::with_capacity(65536, f);
-                io::copy(data, &mut dest_file)
+                let mut data = StopRead { inner: data, stop };
+                io::copy(&mut data, &mut dest_file)
                     .with_context(|| format!("copy entry data into {:?}", dest))?;
                 #[cfg(unix)]
                 if *x {
@@ -311,6 +339,112 @@ mod tests {
         let err = unpack(&content, out.path(), None, None).expect_err("expected error");
         let msg = format!("{err:#}");
         assert!(msg.contains("divergent target"), "unexpected: {msg}");
+    }
+
+    /// `n` one-byte files `f0..f{n-1}`, each yielding `data(i)` as its bytes;
+    /// walking entry `trip_at` sets `trip`.
+    struct Synth<D: Fn(usize) -> Box<dyn Read> + Send + Sync> {
+        n: usize,
+        trip_at: usize,
+        trip: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        data: D,
+    }
+
+    impl<D: Fn(usize) -> Box<dyn Read> + Send + Sync> Content for Synth<D> {
+        fn reader(&self) -> anyhow::Result<Box<dyn Read>> {
+            anyhow::bail!("walk only")
+        }
+        fn walk(&self) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<WalkEntry>> + '_>> {
+            Ok(Box::new((0..self.n).map(move |i| {
+                if i == self.trip_at {
+                    self.trip.store(true, std::sync::atomic::Ordering::Release);
+                }
+                Ok(WalkEntry {
+                    path: PathBuf::from(format!("f{i}")),
+                    kind: WalkEntryKind::File {
+                        data: (self.data)(i),
+                        x: false,
+                        size: 1,
+                    },
+                })
+            })))
+        }
+        fn hashout(&self) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    /// A stop that reads true from entry `k` on writes exactly the entries
+    /// before it, and errors.
+    #[test]
+    fn unpack_stops_between_entries() {
+        let trip = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let content = Synth {
+            n: 50,
+            trip_at: 10,
+            trip: std::sync::Arc::clone(&trip),
+            data: |_| Box::new(Cursor::new(b"x".to_vec())),
+        };
+        let out = tempfile::tempdir().expect("out tempdir");
+        let stop = || trip.load(std::sync::atomic::Ordering::Acquire);
+
+        let err = unpack_with_stop(&content, out.path(), None, None, &stop)
+            .expect_err("a stopped unpack fails");
+        assert!(format!("{err:#}").contains("cancelled"), "{err:#}");
+        let written = std::fs::read_dir(out.path()).expect("read out").count();
+        assert_eq!(written, 10, "only the entries before the stop are written");
+        assert!(!out.path().join("f10").exists(), "nothing from the stop on");
+    }
+
+    /// One long entry stops within a chunk of the stop, not at its end: the
+    /// copy polls it per read.
+    #[test]
+    fn unpack_stops_inside_a_long_entry() {
+        const TOTAL: u64 = 64 << 20;
+        const TRIP_AFTER: u64 = 1 << 20;
+        /// Yields `TOTAL` bytes and sets `trip` once `TRIP_AFTER` have gone.
+        struct Tripwire {
+            sent: u64,
+            trip: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl Read for Tripwire {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let left = usize::try_from(TOTAL - self.sent).unwrap_or(usize::MAX);
+                let n = left.min(buf.len());
+                buf.iter_mut().take(n).for_each(|b| *b = 7);
+                self.sent += n as u64;
+                if self.sent >= TRIP_AFTER {
+                    self.trip.store(true, std::sync::atomic::Ordering::Release);
+                }
+                Ok(n)
+            }
+        }
+
+        let trip = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let t = std::sync::Arc::clone(&trip);
+        let content = Synth {
+            n: 1,
+            trip_at: usize::MAX,
+            trip: std::sync::Arc::clone(&trip),
+            data: move |_| {
+                Box::new(Tripwire {
+                    sent: 0,
+                    trip: std::sync::Arc::clone(&t),
+                })
+            },
+        };
+        let out = tempfile::tempdir().expect("out tempdir");
+        let stop = || trip.load(std::sync::atomic::Ordering::Acquire);
+
+        unpack_with_stop(&content, out.path(), None, None, &stop)
+            .expect_err("a stopped unpack fails");
+        let len = std::fs::metadata(out.path().join("f0"))
+            .expect("the partial entry")
+            .len();
+        assert!(
+            len < 2 * TRIP_AFTER,
+            "stopped within a chunk of the trip, not at the end: wrote {len} of {TOTAL}"
+        );
     }
 
     #[test]

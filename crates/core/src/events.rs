@@ -255,6 +255,11 @@ pub enum BuildEventKind {
         /// failing result, so a green build pays nothing for it.
         #[serde(default)]
         log_tail: Option<LogTailData>,
+        /// Set when the target failed because its run outlasted its `timeout`,
+        /// so a consumer can tell a timeout from any other failure without
+        /// reading `error`. `None` from a host that predates timeouts.
+        #[serde(default)]
+        timed_out: Option<TimedOutData>,
     },
     ExecuteStart {
         addr: String,
@@ -580,6 +585,17 @@ pub struct LogTailData {
     pub start_line: usize,
 }
 
+/// A run stopped at its target's `timeout`, carried on `ResultEnd`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TimedOutData {
+    /// The target's `timeout`, in milliseconds.
+    pub timeout_ms: u64,
+    /// The run did not stop within the grace after it was cancelled, and heph
+    /// stopped waiting for it: its process may still be running.
+    #[serde(default)]
+    pub abandoned: bool,
+}
+
 /// Which cache tier a hit came from.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -772,6 +788,7 @@ pub mod test_support {
             upstream_of: None,
             exit_status: None,
             log_tail: None,
+            timed_out: None,
         };
         vec![
             // Local hit.
@@ -922,12 +939,14 @@ mod tests {
                 upstream_of,
                 exit_status,
                 log_tail,
+                timed_out,
             } => {
                 assert_eq!(addr, "//a:x");
                 assert_eq!(error.as_deref(), Some("boom"));
                 assert_eq!(upstream_of, None);
                 assert_eq!(exit_status, None);
                 assert_eq!(log_tail, None);
+                assert_eq!(timed_out, None);
             }
             other => panic!("wrong variant: {other:?}"),
         }
@@ -1176,6 +1195,10 @@ mod tests {
                     text: "FAIL".into(),
                     start_line: 88,
                 }),
+                timed_out: Some(TimedOutData {
+                    timeout_ms: 600_000,
+                    abandoned: true,
+                }),
             },
         };
         let json = serde_json::to_string(&ev).expect("encode");
@@ -1185,11 +1208,19 @@ mod tests {
                 upstream_of,
                 exit_status,
                 log_tail,
+                timed_out,
                 ..
             } => {
                 assert_eq!(upstream_of.as_deref(), Some("//base:proto"));
                 assert_eq!(exit_status.as_deref(), Some("exit status: 1"));
                 assert_eq!(log_tail.map(|l| l.start_line), Some(88));
+                assert_eq!(
+                    timed_out,
+                    Some(TimedOutData {
+                        timeout_ms: 600_000,
+                        abandoned: true
+                    })
+                );
             }
             other => panic!("wrong variant: {other:?}"),
         }

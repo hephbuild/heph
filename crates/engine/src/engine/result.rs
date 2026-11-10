@@ -2713,19 +2713,25 @@ impl Engine {
             },
             // The one scope that carries structured detail: `ResultEnd` is where
             // a consumer learns a target's outcome, so it is where `upstream_of`
-            // (root vs collateral), the exit status and the log tail belong.
-            move |error| {
-                let (error, upstream_of, exit_status, log_tail) = match error {
-                    Some(d) => (Some(d.message), d.upstream_of, d.exit_status, d.log_tail),
-                    None => (None, None, None, None),
-                };
-                crate::engine::event::BuildEventKind::ResultEnd {
+            // (root vs collateral), the exit status, the log tail and a timeout
+            // belong.
+            move |error| match error {
+                Some(d) => crate::engine::event::BuildEventKind::ResultEnd {
                     addr: addr_str,
-                    error,
-                    upstream_of,
-                    exit_status,
-                    log_tail,
-                }
+                    error: Some(d.message),
+                    upstream_of: d.upstream_of,
+                    exit_status: d.exit_status,
+                    log_tail: d.log_tail,
+                    timed_out: d.timed_out,
+                },
+                None => crate::engine::event::BuildEventKind::ResultEnd {
+                    addr: addr_str,
+                    error: None,
+                    upstream_of: None,
+                    exit_status: None,
+                    log_tail: None,
+                    timed_out: None,
+                },
             },
             async {
                 // Use _no_track: result_addr set parent=addr before entering the memoizer,
@@ -5324,10 +5330,13 @@ impl Engine {
         let parsed_entrypoint = def.entrypoint;
         // `resources` likewise: what a target reserves is its config's, and a
         // driver that rebuilds its def in `apply_transitive` (a cdylib across
-        // the ABI) must not drop the declaration or its lowered default.
+        // the ABI) must not drop the declaration or its lowered default. And
+        // `timeout`: a driver that does not echo it back must not lift the
+        // limit, nor one that rewrites it move it.
         let mut def = match &all_transitive {
             Some(sb) if !sb.empty() => {
                 let parsed_resources = def.resources.clone();
+                let parsed_timeout = def.timeout;
                 let res = driver
                     .driver
                     .apply_transitive(
@@ -5352,6 +5361,7 @@ impl Engine {
                     _ => transitive.entrypoint = parsed_entrypoint,
                 }
                 transitive.resources = parsed_resources;
+                transitive.timeout = parsed_timeout;
                 transitive
             }
             _ => def,

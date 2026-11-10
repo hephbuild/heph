@@ -422,6 +422,9 @@ impl StdinPump {
 /// flaky, it is wrong.
 pub struct Handle {
     pid: i32,
+    /// Spawned with `setsid`, so `pid` is also the id of a group that holds
+    /// only the child's own descendants — the one a cancel kills.
+    own_group: bool,
     child: Option<Child>,
     stdin: Option<StdinPump>,
     output: Option<OutputReader>,
@@ -542,9 +545,18 @@ impl Handle {
             }
         };
         self.reaped = true;
+        let cancelled = cancel.is_cancelled();
+        // The child is gone, but a descendant that ignored the SIGINT (a
+        // shell's `&` job starts with it ignored) is not: kill what is left
+        // of the group. Before the drain, which would otherwise wait on any
+        // pipe that descendant holds; and within a poll of the watcher's reap,
+        // which is what makes the id safe to signal (see `kill_group`).
+        if cancelled && self.own_group {
+            process_supervisor::kill_group(self.pid);
+        }
         let drains = std::mem::take(&mut self.drains);
         drain_with_deadline(self.pid, drains, &self.abandoned).await;
-        if cancel.is_cancelled() {
+        if cancelled {
             return Err(io::Error::other("cancelled"));
         }
         Ok(status)
@@ -657,6 +669,7 @@ fn spawn_with(spec: Spec, capacity: DrainCapacity) -> io::Result<Handle> {
 
     Ok(Handle {
         pid,
+        own_group: setsid,
         child: Some(child),
         stdin: stdin_pump,
         output,

@@ -294,6 +294,7 @@ mod tests {
             t.apply(&ev(
                 1_000,
                 BuildEventKind::ResultEnd {
+                    timed_out: None,
                     addr: format!("//very/long/package/path/number{i}:some-broken-target"),
                     error: Some(msg.clone()),
                     upstream_of: None,
@@ -309,6 +310,7 @@ mod tests {
             t.apply(&ev(
                 2_000,
                 BuildEventKind::ResultEnd {
+                    timed_out: None,
                     addr: format!("//svc:t{i}"),
                     error: Some("dependency failed".into()),
                     upstream_of: Some("//very/long/package/path/number0:some-broken-target".into()),
@@ -413,6 +415,7 @@ mod tests {
         t.apply(&ev(
             0,
             BuildEventKind::ResultEnd {
+                timed_out: None,
                 addr: "//a:x".into(),
                 error: Some("boom".into()),
                 upstream_of: None,

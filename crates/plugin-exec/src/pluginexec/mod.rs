@@ -1711,6 +1711,8 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
                 // On the engine's def only, never on exec's `TargetDef`, so
                 // `Hash for TargetDef` cannot reach it (U5).
                 resources: spec.resources,
+                // Same: the engine enforces it, and no hash sees it.
+                timeout: spec.timeout,
                 ..Default::default()
             },
         })
@@ -2749,8 +2751,24 @@ impl Driver {
         // Cancellation takes precedence over whatever the wait task returned
         // (`wait_or_cancel` surfaces an io error on cancel) so we preserve the
         // `Err("cancelled")` contract callers and tests rely on.
+        //
+        // The log rides on it: a run cancelled at its `timeout` is a failure
+        // to the engine, whose failure box shows what it printed. A real
+        // cancellation skips the failure slot, so it costs nothing there. Best
+        // effort — a log path that cannot be described does not replace the
+        // cancellation.
         if ctoken.is_cancelled() {
-            anyhow::bail!("cancelled");
+            let log = if writes_log {
+                log_response(&output_log_path)
+                    .map(|r| r.artifacts)
+                    .unwrap_or_default()
+            } else {
+                vec![]
+            };
+            return Err(hplugin::error::with_failure_artifacts(
+                anyhow::anyhow!("cancelled"),
+                log,
+            ));
         }
         let status = wait_res
             .context("wait task panicked")?
@@ -3567,7 +3585,7 @@ mod tests {
         let res = run_fut.await;
         assert!(res.is_err());
         let err = res.err().unwrap();
-        assert_eq!(err.to_string(), "cancelled");
+        assert_eq!(hcore::hmemoizer::chain_message(&err), "cancelled");
 
         Ok(())
     }
@@ -3608,7 +3626,13 @@ mod tests {
 
         let res = run_fut.await;
         let err = res.err().expect("cancelled run must error");
-        assert_eq!(err.to_string(), "cancelled");
+        // The log rides as an outer, empty-`Display` frame; the message is
+        // the cause's.
+        assert_eq!(hcore::hmemoizer::chain_message(&err), "cancelled");
+        assert!(
+            hplugin::error::failure_log(&err).is_some(),
+            "a cancelled captured run carries its log, for a timeout's failure box"
+        );
 
         Ok(())
     }

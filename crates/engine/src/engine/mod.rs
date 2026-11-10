@@ -90,6 +90,7 @@ mod execute;
 pub mod failure_gc;
 pub mod failure_slot;
 pub mod invoke;
+pub mod run_timeout;
 pub use invoke::{InvokeOutcome, InvokeRequest};
 pub(crate) mod invoke_sandbox;
 mod managed_register;

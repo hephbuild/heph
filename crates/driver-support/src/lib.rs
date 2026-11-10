@@ -10,3 +10,4 @@ pub mod driver_managed;
 pub mod driver_managed_os;
 pub mod scratch;
 pub mod stage;
+pub mod stop;

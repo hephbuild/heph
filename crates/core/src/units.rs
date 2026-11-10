@@ -271,13 +271,46 @@ pub fn parse_duration(s: &str) -> anyhow::Result<std::time::Duration> {
     Ok(std::time::Duration::from_secs(total))
 }
 
-/// Format a duration the way a person reads an elapsed time or an age: the
-/// coarsest two units, truncated, never rounded — `0s`, `59s`, `1m05s`,
-/// `1h05m`, `2d03h`.
+/// Format a duration exactly, for a value someone *declared* (a timeout, a
+/// ttl) rather than one that elapsed: every non-zero unit, unpadded —
+/// `0s`, `90s` → `1m30s`, `10m`, `1h5s`, `1d2h3m4s`.
+///
+/// A whole number of seconds parses back with [`parse_duration`] to the same
+/// value. A sub-second remainder is kept as `ms` (`1s500ms`, `500ms`), which
+/// [`parse_duration`] does not read: only a value that came from somewhere
+/// finer than the BUILD-file grammar has one.
+///
+/// For an elapsed time shown to a person, where precision is noise, use
+/// [`human_duration`].
+pub fn format_duration(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    let mut out = String::new();
+    for (n, unit) in [
+        (secs / 86_400, "d"),
+        (secs % 86_400 / 3_600, "h"),
+        (secs % 3_600 / 60, "m"),
+        (secs % 60, "s"),
+        (u64::from(d.subsec_millis()), "ms"),
+    ] {
+        if n != 0 {
+            out += &n.to_string();
+            out += unit;
+        }
+    }
+    if out.is_empty() {
+        out.push_str("0s");
+    }
+    out
+}
+
+/// Format a duration the way a person reads an elapsed time or an age, padded
+/// for a column (the TUI, the job summary): the coarsest two units, truncated,
+/// never rounded — `0s`, `59s`, `1m05s`, `1h05m`, `2d03h`.
 ///
 /// Sub-second precision is dropped: this is for "how long ago / how long
 /// until", where `12.4s` is noise. The output parses back with
-/// [`parse_duration`] (to the precision shown).
+/// [`parse_duration`] (to the precision shown). Not for a declared value,
+/// which must read back exactly: that is [`format_duration`].
 pub fn human_duration(d: std::time::Duration) -> String {
     let secs = d.as_secs();
     if secs < 60 {
@@ -293,8 +326,43 @@ pub fn human_duration(d: std::time::Duration) -> String {
 
 #[cfg(test)]
 mod duration_tests {
-    use super::{human_duration, parse_duration};
+    use super::{format_duration, human_duration, parse_duration};
     use std::time::Duration;
+
+    #[test]
+    fn format_duration_is_exact_and_unpadded() {
+        let f = |s: u64| format_duration(Duration::from_secs(s));
+        assert_eq!(f(0), "0s");
+        assert_eq!(f(59), "59s");
+        assert_eq!(f(60), "1m");
+        assert_eq!(f(90), "1m30s");
+        assert_eq!(f(600), "10m");
+        assert_eq!(
+            f(3_605),
+            "1h5s",
+            "no unit is dropped, unlike human_duration"
+        );
+        assert_eq!(f(5_400), "1h30m");
+        assert_eq!(f(86_400 + 2 * 3_600 + 3 * 60 + 4), "1d2h3m4s");
+        assert_eq!(format_duration(Duration::from_millis(1_500)), "1s500ms");
+        assert_eq!(format_duration(Duration::from_millis(500)), "500ms");
+        assert_eq!(
+            format_duration(Duration::from_secs(u64::MAX)),
+            "213503982334601d7h15s"
+        );
+    }
+
+    #[test]
+    fn format_duration_parses_back_exactly() {
+        for s in [1, 59, 61, 3_599, 3_605, 86_399, 86_401, 7 * 86_400 + 1] {
+            let d = Duration::from_secs(s);
+            assert_eq!(
+                parse_duration(&format_duration(d)).expect("parse"),
+                d,
+                "{s}"
+            );
+        }
+    }
 
     #[test]
     fn human_duration_shows_the_two_coarsest_units_at_each_boundary() {
