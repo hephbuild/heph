@@ -49,6 +49,7 @@
 use anyhow::Context as _;
 use async_trait::async_trait;
 use hcore::hasync::Cancellable;
+use hcore::htvalue::signature::ParamType;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
 use hexecrunner::RunnerRef;
 use hplugin::driver::targetdef::path::{CodegenMode, Content, Path as OutPath};
@@ -167,6 +168,7 @@ fn normalize_value(value: &str) -> String {
 pub(crate) struct TargetSpec {
     /// `wrap` (default) captures the environment and runs targets locally in it.
     /// `session` holds one `devenv shell` open and runs targets inside it.
+    #[spec(ty = Mode::param_type())]
     pub mode: String,
     /// Directory containing `devenv.nix`, relative to this package. Defaults to
     /// the package directory.
@@ -207,16 +209,40 @@ pub enum Mode {
 }
 
 impl Mode {
+    /// Every mode; [`parse`](Self::parse) matches against their
+    /// [`as_str`](Self::as_str) spellings.
+    const ALL: [Self; 2] = [Self::Wrap, Self::Session];
+
     fn parse(raw: &str) -> anyhow::Result<Self> {
-        match raw {
-            "" | "wrap" => Ok(Self::Wrap),
-            "session" => Ok(Self::Session),
-            other => anyhow::bail!(
-                "devenv_runner: unknown mode {other:?}; expected \"wrap\" (capture the \
-                 environment, run targets locally in it) or \"session\" (hold one `devenv shell` \
-                 open and run targets inside it)"
-            ),
+        // `""` is an absent `mode` (the field is a plain `String`), so the default.
+        if raw.is_empty() {
+            return Ok(Self::Wrap);
         }
+        Self::ALL
+            .into_iter()
+            .find(|m| m.as_str() == raw)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "devenv_runner: unknown mode {raw:?}; expected \"wrap\" (capture the \
+                     environment, run targets locally in it) or \"session\" (hold one `devenv \
+                     shell` open and run targets inside it)"
+                )
+            })
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Wrap => "wrap",
+            Self::Session => "session",
+        }
+    }
+
+    /// The schema type of `mode`: what [`parse`](Self::parse) takes — every
+    /// mode, and the `""` an absent key reads as.
+    fn param_type() -> ParamType {
+        let mut literals: Vec<String> = Self::ALL.iter().map(|m| m.as_str().to_string()).collect();
+        literals.push(String::new());
+        ParamType::Enum(literals)
     }
 }
 
@@ -602,6 +628,25 @@ mod tests {
         assert_eq!(Mode::parse("").expect("default"), Mode::Wrap);
         assert_eq!(Mode::parse("wrap").expect("wrap"), Mode::Wrap);
         assert_eq!(Mode::parse("session").expect("session"), Mode::Session);
+    }
+
+    /// The schema lists exactly what `Mode::parse` takes — `""` included, since
+    /// the parser takes it — so the LSP never flags a valid mode.
+    #[test]
+    fn mode_schema_is_the_enum_parse_takes() {
+        let schema = TargetSpec::schema();
+        let ty = &schema
+            .fields
+            .iter()
+            .find(|f| f.name == "mode")
+            .expect("mode field")
+            .ty;
+        assert_eq!(ty.literals(), vec!["wrap", "session", ""]);
+        for l in ty.literals() {
+            Mode::parse(l).unwrap_or_else(|e| panic!("schema lists {l:?}: {e:#}"));
+        }
+        assert!(!ty.matches(&hcore::htvalue::Value::String("agent".to_string())));
+        Mode::parse("agent").expect_err("near-miss refused");
     }
 
     fn def(mode: Mode) -> DevenvDef {

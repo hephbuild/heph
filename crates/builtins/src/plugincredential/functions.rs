@@ -30,19 +30,48 @@ use async_trait::async_trait;
 use hcore::htvalue::Value;
 use hcore::htvalue::signature::{FnSignature, Param, ParamType};
 use hplugin::function::{FnArgs, FnCallContext, FnOutcome, PluginFn, PluginFnDef};
+use hplugin::htspec::FromSpecValue;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+use super::present::Dialect;
+use super::source::{INLINE_KINDS, OIDC_PROVIDERS};
 
 // ---------------------------------------------------------------------------
 // Signature helpers
 // ---------------------------------------------------------------------------
 
+/// One string or a list of them — what the parser's `Vec<String>` decoding
+/// accepts, so the two cannot disagree.
 pub(crate) fn strs() -> ParamType {
-    ParamType::union(vec![ParamType::String, ParamType::list(ParamType::String)])
+    <Vec<String> as FromSpecValue>::spec_param_type()
 }
 
 fn str_map() -> ParamType {
     ParamType::map(ParamType::String)
+}
+
+/// `oidc`'s `provider`: one of [`OIDC_PROVIDERS`], the list the parser checks.
+fn oidc_provider_ty() -> ParamType {
+    ParamType::Enum(OIDC_PROVIDERS.iter().map(|p| p.to_string()).collect())
+}
+
+/// `present.helper`: a dialect name, or the dict whose keys [`Helper`]'s
+/// derive owns — the two shapes `parse_helper` dispatches on.
+///
+/// [`Helper`]: super::present::Helper
+pub(crate) fn helper_ty() -> ParamType {
+    let dialect = <Dialect as FromSpecValue>::spec_param_type();
+    ParamType::union(vec![
+        dialect.clone(),
+        ParamType::strukt(vec![
+            ("dialect", dialect),
+            ("registries", strs()),
+            ("hosts", strs()),
+            ("audience", ParamType::String),
+            ("impersonate", ParamType::String),
+        ]),
+    ])
 }
 
 /// The shape a presentation preset returns.
@@ -55,19 +84,7 @@ pub(crate) fn presentation_ty() -> ParamType {
     ParamType::strukt(vec![
         ("env", str_map()),
         ("files", str_map()),
-        (
-            "helper",
-            ParamType::union(vec![
-                ParamType::String,
-                ParamType::strukt(vec![
-                    ("dialect", ParamType::String),
-                    ("registries", ParamType::list(ParamType::String)),
-                    ("hosts", ParamType::list(ParamType::String)),
-                    ("audience", ParamType::String),
-                    ("impersonate", ParamType::String),
-                ]),
-            ]),
-        ),
+        ("helper", helper_ty()),
     ])
 }
 
@@ -75,20 +92,25 @@ pub(crate) fn presentation_ty() -> ParamType {
 /// kind's fields, which is what the driver's own schema says too.
 pub(crate) fn source_ty() -> ParamType {
     ParamType::strukt(vec![
-        ("kind", ParamType::String),
+        (
+            "kind",
+            ParamType::Enum(INLINE_KINDS.iter().map(|k| k.to_string()).collect()),
+        ),
         ("when", ParamType::String),
         ("credentials", strs()),
         ("present", presentation_ty()),
         ("hint", ParamType::String),
-        ("names", ParamType::list(ParamType::String)),
+        ("names", strs()),
         ("path", ParamType::String),
-        ("run", ParamType::list(ParamType::String)),
+        ("run", strs()),
         ("fields", str_map()),
         ("expires", ParamType::String),
-        ("login", ParamType::list(ParamType::list(ParamType::String))),
+        // One argv, or a list of argvs each of which may be a bare string —
+        // `parse_login`'s two shapes.
+        ("login", ParamType::list(strs())),
         ("runner", ParamType::String),
         ("paths", str_map()),
-        ("provider", ParamType::String),
+        ("provider", oidc_provider_ty()),
         ("audience", ParamType::String),
     ])
 }
@@ -366,9 +388,14 @@ pub fn definitions() -> Vec<PluginFnDef> {
         ),
         source_def(
             "oidc",
+            // `""` is listed because the body takes it for the default — the
+            // schema says what the call accepts, not only what is documented.
             vec![Param::optional(
                 "provider",
-                ParamType::String,
+                ParamType::union(vec![
+                    oidc_provider_ty(),
+                    ParamType::Enum(vec![String::new()]),
+                ]),
                 s("github_actions"),
             )],
             vec![Param::optional(
@@ -689,7 +716,7 @@ mod tests {
     /// stands for.
     #[test]
     fn every_source_preset_parses_as_a_source() {
-        let cases: Vec<Case> = vec![
+        let mut cases: Vec<Case> = vec![
             (
                 "env",
                 vec![list(&["GITHUB_TOKEN"])],
@@ -747,10 +774,124 @@ mod tests {
                 vec![("audience", s("sts.amazonaws.com"))],
             ),
         ];
+        cases.push((
+            "exec",
+            vec![s("gh-token")],
+            vec![("login", list(&["gh", "auth", "login"]))],
+        ));
         for (name, positional, named) in cases {
             let v = call(name, positional, &named).unwrap_or_else(|e| panic!("{name}: {e:#}"));
             SourceDecl::parse(&v).unwrap_or_else(|e| panic!("{name} does not parse: {e:#}"));
+            // The return value is checked against `source_ty` at the call, so
+            // a dict the parser takes must match it too.
+            assert!(
+                source_ty().matches(&v),
+                "{name} returns {v:?}, outside its declared type {}",
+                source_ty().render()
+            );
         }
+    }
+
+    fn field_ty(ty: &ParamType, name: &str) -> ParamType {
+        let ParamType::Struct(fields) = ty else {
+            panic!("not a struct: {}", ty.render());
+        };
+        fields
+            .iter()
+            .find(|f| f.name == name)
+            .unwrap_or_else(|| panic!("no field {name}"))
+            .ty
+            .clone()
+    }
+
+    fn enum_of(literals: &[&str]) -> ParamType {
+        ParamType::Enum(literals.iter().map(|l| l.to_string()).collect())
+    }
+
+    /// The closed sets are typed as such, from the lists the parsers check, so
+    /// the LSP flags a typo and never a value the parser takes.
+    #[test]
+    fn closed_string_sets_are_enums_of_what_the_parsers_accept() {
+        let dialects = enum_of(&["aws", "gcp", "docker", "git", "kubernetes"]);
+        let source = source_ty();
+        assert_eq!(
+            field_ty(&source, "kind"),
+            enum_of(&["env", "file", "exec", "passthrough", "oidc"])
+        );
+        assert_eq!(
+            field_ty(&source, "provider"),
+            enum_of(&["github_actions", "generic"])
+        );
+        let helper = field_ty(&presentation_ty(), "helper");
+        let ParamType::Union(members) = &helper else {
+            panic!("helper is a dialect or a dict: {}", helper.render());
+        };
+        assert_eq!(members[0], dialects);
+        assert_eq!(field_ty(&members[1], "dialect"), dialects);
+
+        let defs = definitions();
+        let oidc = defs.iter().find(|d| d.name == "oidc").expect("oidc");
+        let provider = &oidc.signature.positional[0].ty;
+        for ok in ["github_actions", "generic", ""] {
+            assert!(provider.matches(&s(ok)), "{ok:?} is accepted by the call");
+            call("oidc", vec![s(ok)], &[]).unwrap_or_else(|e| panic!("{ok:?}: {e:#}"));
+        }
+        assert!(!provider.matches(&s("github")));
+    }
+
+    /// Hand-written source dicts in each shape the parser takes match the
+    /// schema the `sources` field and the LSP use.
+    #[test]
+    fn source_shapes_the_parser_accepts_match_the_schema() {
+        let m = |pairs: Vec<(&str, Value)>| {
+            Value::Map(pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
+        };
+        let cases = vec![
+            m(vec![("kind", s("env")), ("names", s("TOKEN"))]),
+            m(vec![("kind", s("exec")), ("run", s("gh-token"))]),
+            m(vec![
+                ("kind", s("exec")),
+                ("run", list(&["gh", "auth", "token"])),
+                ("login", Value::List(vec![s("gh-login"), list(&["a", "b"])])),
+            ]),
+            m(vec![
+                ("kind", s("oidc")),
+                ("provider", s("generic")),
+                (
+                    "present",
+                    m(vec![(
+                        "helper",
+                        m(vec![("dialect", s("docker")), ("registries", s("ghcr.io"))]),
+                    )]),
+                ),
+            ]),
+            m(vec![
+                ("kind", s("env")),
+                ("names", s("T")),
+                ("present", m(vec![("helper", s("aws"))])),
+            ]),
+        ];
+        for v in cases {
+            SourceDecl::parse(&v).unwrap_or_else(|e| panic!("{v:?} does not parse: {e:#}"));
+            assert!(
+                source_ty().matches(&v),
+                "{v:?} parses but the schema refuses it"
+            );
+        }
+        // And the other direction, for the enums: a near-miss is refused by both.
+        let typo = m(vec![("kind", s("execs")), ("run", s("x"))]);
+        SourceDecl::parse(&typo).expect_err("unknown kind");
+        assert!(!source_ty().matches(&typo));
+    }
+
+    /// `Presentation`'s own schema says what `parse_helper` takes, string form
+    /// included — the same type the presets' return value is checked against.
+    #[test]
+    fn presentation_helper_field_schema_includes_the_dialect_name_form() {
+        let schema = Presentation::spec_param_type();
+        let rendered = schema.render();
+        assert!(rendered.contains("\"kubernetes\""), "{rendered}");
+        assert!(rendered.contains("registries"), "{rendered}");
     }
 
     #[test]
@@ -783,6 +924,10 @@ mod tests {
         for (name, positional, named) in cases {
             let v = call(name, positional, &named).unwrap_or_else(|e| panic!("{name}: {e:#}"));
             Presentation::parse(&v).unwrap_or_else(|e| panic!("{name} does not parse: {e:#}"));
+            assert!(
+                presentation_ty().matches(&v),
+                "{name} returns {v:?}, outside its declared type"
+            );
         }
     }
 

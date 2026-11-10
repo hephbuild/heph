@@ -137,7 +137,7 @@ struct OciImageSpec {
     /// Ports the image declares (`EXPOSE`), e.g. `["8080/tcp"]`.
     exposed_ports: Vec<String>,
     /// Archive format: `oci` (default) or `docker`.
-    #[spec(ty = hcore::htvalue::signature::ParamType::String)]
+    #[spec(ty = ImageFormat::any_param_type())]
     format: Option<String>,
     /// Write an OCI **layout directory** instead of a single archive file. This
     /// is the shape another image's `base`, and buildx's `oci-layout://` build
@@ -830,6 +830,23 @@ mod tests {
         let mut h = Xxh3Default::new();
         d.hash(&mut h);
         h.finish()
+    }
+
+    /// `format`'s schema is the enum of what `ImageFormat::parse` reads.
+    #[test]
+    fn format_schema_is_the_enum_parse_reads() {
+        let schema = OciImageSpec::schema();
+        let ty = &schema
+            .fields
+            .iter()
+            .find(|f| f.name == "format")
+            .expect("format field")
+            .ty;
+        assert_eq!(ty.literals(), vec!["oci", "docker"]);
+        for l in ty.literals() {
+            ImageFormat::parse(l).unwrap_or_else(|e| panic!("{l:?}: {e:#}"));
+        }
+        assert!(!ty.matches(&hcore::htvalue::Value::String("tar".to_string())));
     }
 
     /// `hashin` folds a sorted, unlabeled multiset of dep hashouts: no address,

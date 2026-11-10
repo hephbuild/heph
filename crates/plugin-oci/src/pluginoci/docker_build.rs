@@ -281,7 +281,7 @@ struct DockerBuildSpec {
     /// pulled for. Hashed inputs, like `context`.
     bases: HashMap<String, Vec<String>>,
     /// Archive format: `oci` (default) or `docker`.
-    #[spec(ty = hcore::htvalue::signature::ParamType::String)]
+    #[spec(ty = ImageFormat::any_param_type())]
     format: Option<String>,
     /// `--build-arg` values passed to the build. Hashed (they change the image).
     /// A key may not contain `=` — docker would re-split it and silently take a
@@ -1801,6 +1801,24 @@ exit 0
         );
         let err = ImageFormat::parse("tar").expect_err("unknown format");
         assert!(format!("{err:#}").contains("oci"), "got: {err:#}");
+    }
+
+    /// `format`'s schema is the enum of what `ImageFormat::parse` reads, so the
+    /// LSP flags `"tar"` and never `"docker"`.
+    #[test]
+    fn format_schema_is_the_enum_parse_reads() {
+        let schema = DockerBuildSpec::schema();
+        let ty = &schema
+            .fields
+            .iter()
+            .find(|f| f.name == "format")
+            .expect("format field")
+            .ty;
+        assert_eq!(ty.literals(), vec!["oci", "docker"]);
+        for l in ty.literals() {
+            ImageFormat::parse(l).unwrap_or_else(|e| panic!("{l:?}: {e:#}"));
+        }
+        assert!(!ty.matches(&Value::String("tar".to_string())));
     }
 
     #[test]

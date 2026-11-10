@@ -123,7 +123,8 @@ struct OciLoadSpec {
     /// GOOS/GOARCH — `darwin` on macOS, which no Linux manifest list matches, so
     /// the load would fail outright there.
     ///
-    /// `tool = "docker"` rejects it: `docker load` has no instance selection.
+    /// An archive holding a single image loads that image whichever `os/arch`
+    /// `platform` names; the choice only applies when there is more than one.
     #[spec(ty = hcore::htvalue::signature::ParamType::String)]
     platform: Option<String>,
     /// What the target reserves from the resource pools while it runs, e.g.

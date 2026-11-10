@@ -55,12 +55,31 @@ impl ImageFormat {
         }
     }
 
+    /// Every format; [`parse`](Self::parse) matches against their
+    /// [`output_type`](Self::output_type) spellings.
+    const ALL: [Self; 2] = [ImageFormat::Oci, ImageFormat::Docker];
+
     pub(crate) fn parse(s: &str) -> anyhow::Result<Self> {
-        match s {
-            "oci" => Ok(ImageFormat::Oci),
-            "docker" => Ok(ImageFormat::Docker),
-            other => anyhow::bail!("`format` must be \"oci\" or \"docker\", got {other:?}"),
-        }
+        Self::ALL
+            .into_iter()
+            .find(|f| f.output_type() == s)
+            .ok_or_else(|| anyhow::anyhow!("`format` must be \"oci\" or \"docker\", got {s:?}"))
+    }
+
+    /// The schema type of a `format` field accepting `formats`, spelled as
+    /// [`parse`](Self::parse) reads them.
+    pub(crate) fn param_type(formats: &[Self]) -> hcore::htvalue::signature::ParamType {
+        hcore::htvalue::signature::ParamType::Enum(
+            formats
+                .iter()
+                .map(|f| f.output_type().to_string())
+                .collect(),
+        )
+    }
+
+    /// The schema type of a `format` field that takes every format.
+    pub(crate) fn any_param_type() -> hcore::htvalue::signature::ParamType {
+        Self::param_type(&Self::ALL)
     }
 }
 /// Parse the image ref/id `docker load` printed to stdout, e.g.

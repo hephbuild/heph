@@ -51,16 +51,26 @@ pub enum Access {
 }
 
 impl Access {
+    /// Every mode. [`parse`](Self::parse) matches against these spellings and
+    /// [`param_type`](Self::param_type) lists them, so the two agree.
+    const ALL: [Self; 2] = [Self::Exclusive, Self::Shared];
+
     fn parse(s: &str) -> anyhow::Result<Self> {
-        match s {
-            "exclusive" => Ok(Self::Exclusive),
-            "shared" => Ok(Self::Shared),
-            other => anyhow::bail!(
-                "unknown scratch `access` {other:?} — expected \"exclusive\" (one consumer at a \
-                 time) or \"shared\" (concurrent; only for a cache that is safe under concurrent \
-                 access by construction)"
-            ),
-        }
+        Self::ALL
+            .into_iter()
+            .find(|a| a.as_str() == s)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unknown scratch `access` {s:?} — expected \"exclusive\" (one consumer at a \
+                     time) or \"shared\" (concurrent; only for a cache that is safe under \
+                     concurrent access by construction)"
+                )
+            })
+    }
+
+    /// The schema type of `access`: the spellings [`parse`](Self::parse) takes.
+    fn param_type() -> ParamType {
+        ParamType::Enum(Self::ALL.map(|a| a.as_str().to_string()).to_vec())
     }
 
     pub fn as_str(self) -> &'static str {
@@ -96,7 +106,7 @@ struct ScratchSpec {
     env: Option<String>,
     /// `"exclusive"` (default) — one consumer at a time. `"shared"` — concurrent,
     /// for a cache that is safe under concurrent access by construction.
-    #[spec(ty = ParamType::String)]
+    #[spec(ty = Access::param_type())]
     access: Option<String>,
     /// Everything the contents depend on, beyond the declaring address —
     /// **the whole of it**. Two declarations sharing an addr share a directory
@@ -435,6 +445,28 @@ mod tests {
     fn access_parses_its_words() {
         let d = parse(&[("path", s("c")), ("access", s("shared"))], "n").expect("parse");
         assert_eq!(d.access, Access::Shared);
+    }
+
+    /// The schema lists exactly what the parser takes, so the LSP flags a typo
+    /// and never a valid mode.
+    #[test]
+    fn access_schema_is_the_enum_of_parsed_words() {
+        let schema = ScratchSpec::schema();
+        let ty = &schema
+            .fields
+            .iter()
+            .find(|f| f.name == "access")
+            .expect("access field")
+            .ty;
+        assert_eq!(
+            *ty,
+            ParamType::Enum(vec!["exclusive".to_string(), "shared".to_string()])
+        );
+        for l in ty.literals() {
+            parse(&[("path", s("c")), ("access", s(l))], "n")
+                .unwrap_or_else(|e| panic!("schema lists {l:?}, parser refuses it: {e:#}"));
+        }
+        assert!(!ty.matches(&s("concurrent")));
     }
 
     /// `version` is the *whole* of a slot's identity beyond its addr, so the

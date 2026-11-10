@@ -27,12 +27,19 @@ impl BuildMode {
     /// Accepted spellings, for schema docs and "allowed: [...]" errors.
     pub const NAMES: &'static [&'static str] = &["exe", "pie"];
 
+    /// Every mode; [`parse`](Self::parse) matches against their
+    /// [`as_str`](Self::as_str) spellings.
+    const ALL: [Self; 2] = [Self::Exe, Self::Pie];
+
     pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "exe" => Some(Self::Exe),
-            "pie" => Some(Self::Pie),
-            _ => None,
-        }
+        Self::ALL.into_iter().find(|m| m.as_str() == s)
+    }
+
+    /// The schema type of a variant's `buildmode`: exactly [`Self::NAMES`].
+    pub fn param_type() -> hcore::htvalue::signature::ParamType {
+        hcore::htvalue::signature::ParamType::Enum(
+            Self::NAMES.iter().map(|n| n.to_string()).collect(),
+        )
     }
 
     /// The `-buildmode=` value handed to `go tool link`.
@@ -412,7 +419,17 @@ mod tests {
             let mode = BuildMode::parse(name).unwrap_or_else(|| panic!("`{name}` must parse"));
             assert_eq!(mode.as_str(), *name);
         }
+        // And the other direction: no mode parses that `NAMES` leaves out.
+        assert_eq!(
+            BuildMode::ALL.map(BuildMode::as_str).as_slice(),
+            BuildMode::NAMES
+        );
         assert!(BuildMode::parse("c-archive").is_none());
+        assert!(BuildMode::parse("").is_none());
+        assert_eq!(
+            BuildMode::param_type(),
+            hcore::htvalue::signature::ParamType::Enum(vec!["exe".into(), "pie".into()])
+        );
     }
 
     #[test]

@@ -956,6 +956,32 @@ fn capture_provenance(eval: &Evaluator) -> Vec<ProvenanceFrame> {
 /// it is driver config (a driver whose schema derives from `Spec` lists it),
 /// not a field of `target()`, so it is not listed here, where it would also be
 /// offered on the drivers that refuse it.
+/// `string | list[string]`: what `parse_strings` takes.
+fn strs() -> ParamType {
+    ParamType::union(vec![ParamType::String, ParamType::list(ParamType::String)])
+}
+
+/// The `transitive` value, key for key what [`sandbox_from`] accepts:
+/// `deps`/`tools` through `parse_map_string_strings` (a bare address, a list, or
+/// a `{group: addr | [addr]}` map), `env` through `parse_map_string_string`, and
+/// the two pass-through lists through `parse_strings`. Any other key is refused.
+fn transitive_ty() -> ParamType {
+    let groups = || {
+        ParamType::union(vec![
+            ParamType::String,
+            ParamType::list(ParamType::String),
+            ParamType::map(strs()),
+        ])
+    };
+    ParamType::strukt(vec![
+        ("deps", groups()),
+        ("tools", groups()),
+        ("env", ParamType::map(ParamType::String)),
+        ("pass_env", strs()),
+        ("runtime_pass_env", strs()),
+    ])
+}
+
 pub(crate) fn target_base_fields() -> Vec<hplugin::driver::DriverField> {
     use hplugin::driver::DriverField;
     let f = |name: &str, ty: ParamType, doc: &str, required: bool| DriverField {
@@ -980,21 +1006,17 @@ pub(crate) fn target_base_fields() -> Vec<hplugin::driver::DriverField> {
         ),
         f(
             "transitive",
-            ParamType::map(ParamType::union(vec![
-                ParamType::list(ParamType::String),
-                ParamType::map(ParamType::list(ParamType::String)),
-            ])),
-            "Sandbox applied transitively: `deps`, `tools`, `env`, `pass_env`, `runtime_pass_env`, `runtime_env`.",
+            transitive_ty(),
+            "Sandbox applied transitively: `deps` and `tools` (an address, a list of them, or a \
+             `{group: [addr, …]}` map), `env` (map[string]), and `pass_env`/`runtime_pass_env` \
+             (a variable name or a list of them).",
             false,
         ),
         f(
             "approval",
             ParamType::union(vec![
                 ParamType::Bool,
-                ParamType::map(ParamType::union(vec![
-                    ParamType::Bool,
-                    ParamType::list(ParamType::String),
-                ])),
+                ParamType::strukt(vec![("required", ParamType::Bool), ("notice", strs())]),
             ]),
             "Require explicit approval before executing: `True`, or `{required, notice}` where `notice` lists input groups shown to the user.",
             false,
@@ -4990,5 +5012,74 @@ target(name = "hand", driver = "exec", transitive = {"deps": {"g": [":sib", "//o
             Some(htvalue::Value::String(s)) => assert_eq!(s, "a/b/c"),
             other => panic!("expected joined path, got {other:?}"),
         }
+    }
+
+    fn base_field_ty(name: &str) -> ParamType {
+        target_base_fields()
+            .into_iter()
+            .find(|f| f.name == name)
+            .unwrap_or_else(|| panic!("no base field {name}"))
+            .ty
+    }
+
+    /// `transitive`'s schema is what `sandbox_from` takes, shape for shape: the
+    /// LSP must not flag a valid sandbox, and must flag the key it refuses.
+    #[test]
+    fn transitive_schema_matches_what_sandbox_from_accepts() {
+        use htvalue::Value;
+        let s = |v: &str| Value::String(v.to_string());
+        let l = |vs: &[&str]| Value::List(vs.iter().map(|v| s(v)).collect());
+        let m = |pairs: Vec<(&str, Value)>| {
+            Value::Map(pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
+        };
+        let ty = base_field_ty("transitive");
+        let pkg = PkgBuf::from("p");
+        let accepted = [
+            m(vec![("deps", s("//a:b"))]),
+            m(vec![("deps", l(&["//a:b", "//a:c"]))]),
+            m(vec![(
+                "tools",
+                m(vec![("go", s("//t:go")), ("cc", l(&["//t:cc"]))]),
+            )]),
+            m(vec![("env", m(vec![("K", s("v"))]))]),
+            m(vec![
+                ("pass_env", s("HOME")),
+                ("runtime_pass_env", l(&["TERM"])),
+            ]),
+        ];
+        for v in accepted {
+            sandbox_from(v.clone(), &pkg).unwrap_or_else(|e| panic!("{v:?}: {e:#}"));
+            assert!(
+                ty.matches(&v),
+                "{v:?} parses but {} refuses it",
+                ty.render()
+            );
+        }
+        let refused = m(vec![("runtime_env", m(vec![("K", s("v"))]))]);
+        sandbox_from(refused.clone(), &pkg).expect_err("runtime_env is not a transitive key");
+        assert!(!ty.matches(&refused));
+        let doc = target_base_fields()
+            .into_iter()
+            .find(|f| f.name == "transitive")
+            .expect("transitive")
+            .doc;
+        assert!(!doc.contains("runtime_env"), "{doc}");
+    }
+
+    /// `approval`'s schema takes the bare-string `notice` `approval_from` does.
+    #[test]
+    fn approval_schema_matches_what_approval_from_accepts() {
+        use htvalue::Value;
+        let ty = base_field_ty("approval");
+        let v = Value::Map(HashMap::from([
+            ("required".to_string(), Value::Bool(true)),
+            ("notice".to_string(), Value::String("srcs".to_string())),
+        ]));
+        approval_from(v.clone()).expect("bare-string notice parses");
+        assert!(ty.matches(&v), "{}", ty.render());
+        assert!(ty.matches(&Value::Bool(true)));
+        let typo = Value::Map(HashMap::from([("requred".to_string(), Value::Bool(true))]));
+        approval_from(typo.clone()).expect_err("unknown key");
+        assert!(!ty.matches(&typo));
     }
 }

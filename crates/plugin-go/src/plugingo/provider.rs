@@ -614,14 +614,18 @@ impl Provider {
             doc: doc.to_string(),
             required: false,
         };
+        // Every list-valued key below is read with `parse_strings`, which takes a
+        // bare string as a one-element list.
+        let strs = || ParamType::union(vec![ParamType::String, ParamType::list(ParamType::String)]);
         let variant_struct = ParamType::strukt(vec![
             ("goos", ParamType::String),
             ("goarch", ParamType::String),
-            ("tags", ParamType::list(ParamType::String)),
-            ("goexperiment", ParamType::list(ParamType::String)),
-            ("gcflags", ParamType::list(ParamType::String)),
-            ("ldflags", ParamType::list(ParamType::String)),
-            ("buildmode", ParamType::String),
+            ("tags", strs()),
+            ("goexperiment", strs()),
+            ("gcflags", strs()),
+            ("ldflags", strs()),
+            ("buildmode", factors::BuildMode::param_type()),
+            ("inherit", ParamType::String),
         ]);
         Some(StateSchema {
             fields: vec![
@@ -630,10 +634,14 @@ impl Provider {
                     ParamType::map(variant_struct),
                     "Named Go build variants for this package (and its descendants, via \
                      closest-ancestor lookup). Maps a variant name to a static factor set: \
-                     `goos`/`goarch` (required), plus optional `tags` (build tags), \
+                     `goos`/`goarch` (required, unless inherited), plus optional `tags` \
+                     (build tags), \
                      `goexperiment` (GOEXPERIMENT), `gcflags` (extra `go tool compile` flags), \
                      `ldflags` (extra `go tool link` flags) and `buildmode` \
-                     (`exe`, the default, or `pie`). `exe` matches plain `go build`: on \
+                     (`exe`, the default, or `pie`). `inherit = \"OTHER\"` starts from \
+                     another variant in the same `variants` map and overrides the fields \
+                     given here (a list field replaces the inherited one, it does not \
+                     append); cycles are an error. `exe` matches plain `go build`: on \
                      Linux it links a static binary with no interpreter, so it runs in a \
                      `FROM scratch` image; `pie` produces a position-independent executable, \
                      which on Linux always needs `/lib/ld-linux-<arch>.so.1` present. On \
@@ -651,9 +659,18 @@ impl Provider {
                 ),
                 field(
                     "go_codegen_deps",
-                    ParamType::list(ParamType::String),
+                    strs(),
                     "Extra dependencies (target addresses) injected into generated Go targets. \
                      Always applies to descendants, independent of `recursive`.",
+                ),
+                field(
+                    "go_embed_deps",
+                    strs(),
+                    "Extra embed-only sources (target addresses) for `//go:embed`: staged \
+                     for the compile but kept out of `_golist`, like targets labelled \
+                     `go_embed_src`, for ones that don't carry the label. The closest \
+                     declaring ancestor wins. Always applies to descendants, independent \
+                     of `recursive`.",
                 ),
                 field(
                     "test",
@@ -661,10 +678,10 @@ impl Provider {
                         ParamType::Bool,
                         ParamType::strukt(vec![
                             ("env", ParamType::map(ParamType::String)),
-                            ("pass_env", ParamType::list(ParamType::String)),
+                            ("pass_env", strs()),
                             ("runtime_env", ParamType::map(ParamType::String)),
-                            ("runtime_pass_env", ParamType::list(ParamType::String)),
-                            ("pre_run", ParamType::list(ParamType::String)),
+                            ("runtime_pass_env", strs()),
+                            ("pre_run", strs()),
                             ("runner", ParamType::String),
                             (
                                 "resources",
@@ -682,8 +699,8 @@ impl Provider {
                      targets — and their `test_race`/`xtest_race` counterparts, which \
                      are the same targets built with the race detector — \
                      `env`/`runtime_env` (map[string]) and \
-                     `pass_env`/`runtime_pass_env` (list[string]) set env, and \
-                     `pre_run` (list[string]) runs shell lines before the test binary \
+                     `pass_env`/`runtime_pass_env` (string | list[string]) set env, and \
+                     `pre_run` (string | list[string]) runs shell lines before the test binary \
                      (switching the target to the bash driver), and `runner` (string) \
                      names an exec-runner target so the tests run inside a described \
                      environment — a devenv shell or a container — instead of on the \
@@ -713,7 +730,7 @@ impl Provider {
                 field(
                     "link",
                     ParamType::strukt(vec![
-                        ("flags", ParamType::list(ParamType::String)),
+                        ("flags", strs()),
                         ("deps", link_deps_param_type()),
                         ("runtime_deps", link_deps_param_type()),
                     ]),
@@ -8775,5 +8792,86 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             srcfiles.iter().any(|s| s == "//codegen:gen"),
             "go_codegen_deps must be appended even without go_codegen_root, got: {srcfiles:?}"
         );
+    }
+
+    /// The state schema the LSP checks against takes every shape the state
+    /// parsers do: an `inherit`-only variant with no `goos`/`goarch`, a bare
+    /// string for a `parse_strings` list, and exactly the buildmodes
+    /// `BuildMode::parse` knows.
+    #[test]
+    fn state_schema_accepts_what_the_state_parsers_accept() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let p = Provider::new(tmp.path().to_path_buf(), test_runtime()).expect("provider");
+        let schema = p.go_state_schema().expect("schema");
+        let ty = |name: &str| {
+            schema
+                .fields
+                .iter()
+                .find(|f| f.name == name)
+                .unwrap_or_else(|| panic!("no state field {name}"))
+                .ty
+                .clone()
+        };
+        let s = |v: &str| Value::String(v.to_string());
+        let m = |pairs: Vec<(&str, Value)>| {
+            Value::Map(pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
+        };
+
+        let variants = m(vec![
+            (
+                "base",
+                m(vec![
+                    ("goos", s("linux")),
+                    ("goarch", s("amd64")),
+                    ("buildmode", s("pie")),
+                ]),
+            ),
+            (
+                "child",
+                m(vec![("inherit", s("base")), ("tags", s("netgo"))]),
+            ),
+        ]);
+        // The provider resolves it, so the schema must not flag it.
+        let state = State {
+            package: PkgBuf::from(""),
+            provider: "go".to_string(),
+            state: HashMap::from([("variants".to_string(), variants.clone())]),
+        };
+        variant::build_universe(&[state]).expect("inherit-only variant resolves");
+        assert!(
+            ty("variants").matches(&variants),
+            "{}",
+            ty("variants").render()
+        );
+
+        let ParamType::Map(variant_struct) = ty("variants") else {
+            panic!("variants is a map");
+        };
+        let ParamType::Struct(fields) = *variant_struct else {
+            panic!("a variant is a struct");
+        };
+        let buildmode = &fields
+            .iter()
+            .find(|f| f.name == "buildmode")
+            .expect("buildmode")
+            .ty;
+        assert_eq!(buildmode.literals(), factors::BuildMode::NAMES.to_vec());
+        assert!(!buildmode.matches(&s("c-archive")));
+
+        let test = m(vec![
+            ("pre_run", s("echo hi")),
+            ("pass_env", s("HOME")),
+            ("runtime_pass_env", s("TERM")),
+        ]);
+        let state = State {
+            package: PkgBuf::from("p"),
+            provider: "go".to_string(),
+            state: HashMap::from([("test".to_string(), test.clone())]),
+        };
+        let env = pick_test_env(&[state], "p").expect("bare strings parse");
+        assert_eq!(env.pre_run, vec!["echo hi".to_string()]);
+        assert!(ty("test").matches(&test), "{}", ty("test").render());
+        assert!(ty("link").matches(&m(vec![("flags", s("-s"))])));
+        assert!(ty("go_embed_deps").matches(&s("//assets:bundle")));
     }
 }

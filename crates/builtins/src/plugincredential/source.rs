@@ -136,6 +136,15 @@ pub enum SourceKind {
     Target { addr: String },
 }
 
+/// The `kind` spellings an inline source accepts — the arms of
+/// [`SourceDecl::parse_inline`]'s match, listed for the schema. A test holds the
+/// two together.
+pub(crate) const INLINE_KINDS: &[&str] = &["env", "file", "exec", "passthrough", "oidc"];
+
+/// The `provider` spellings an `oidc` source accepts; the parser checks against
+/// this list.
+pub(crate) const OIDC_PROVIDERS: &[&str] = &["github_actions", "generic"];
+
 impl SourceKind {
     pub fn kind_name(&self) -> &'static str {
         match self {
@@ -406,7 +415,7 @@ impl SourceDecl {
                     .map(|v| string(v, "provider"))
                     .transpose()?
                     .unwrap_or_else(|| "github_actions".to_string());
-                if provider != "github_actions" && provider != "generic" {
+                if !OIDC_PROVIDERS.contains(&provider.as_str()) {
                     anyhow::bail!(
                         "unknown oidc `provider` {provider:?} — heph knows `github_actions` and \
                          `generic` (a token named by variable or file)"
@@ -610,6 +619,42 @@ mod tests {
             ("runner", s("${read://infra:runner}")),
         ]))
         .expect_err("a runner's fingerprint moves every consumer's key, so it is never deferred");
+    }
+
+    /// `INLINE_KINDS` is the schema's list; the parser's match is separate. Every
+    /// listed kind must reach its own arm (failing, if at all, on a missing
+    /// field), and a near-miss must not.
+    #[test]
+    fn every_listed_inline_kind_is_one_the_parser_knows() {
+        let unknown = "unknown credential source kind";
+        for kind in INLINE_KINDS {
+            if let Err(err) = SourceDecl::parse(&map(&[("kind", s(kind))])) {
+                assert!(
+                    !format!("{err:#}").contains(unknown),
+                    "schema lists {kind:?}, parser refuses it: {err:#}"
+                );
+            }
+        }
+        for near_miss in ["Env", "envs", "target", ""] {
+            let err = SourceDecl::parse(&map(&[("kind", s(near_miss))]))
+                .expect_err("a near-miss kind must fail");
+            assert!(
+                format!("{err:#}").contains(unknown),
+                "{near_miss:?}: {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_listed_oidc_provider_parses_and_a_near_miss_does_not() {
+        for p in OIDC_PROVIDERS {
+            SourceDecl::parse(&map(&[("kind", s("oidc")), ("provider", s(p))]))
+                .unwrap_or_else(|e| panic!("schema lists {p:?}, parser refuses it: {e:#}"));
+        }
+        for near_miss in ["github", "GitHub_Actions", ""] {
+            SourceDecl::parse(&map(&[("kind", s("oidc")), ("provider", s(near_miss))]))
+                .expect_err("a near-miss provider must fail");
+        }
     }
 
     #[test]

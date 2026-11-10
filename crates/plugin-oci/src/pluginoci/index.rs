@@ -89,10 +89,10 @@ struct OciIndexSpec {
     /// order they happen to be written in.
     #[spec(required)]
     images: Vec<String>,
-    /// Archive format: `oci` (default). `docker` is rejected — a docker-format
-    /// archive holds a single image, which is the one thing this rule does not
-    /// produce.
-    #[spec(ty = hcore::htvalue::signature::ParamType::String)]
+    /// Archive format: `oci`, the default and the only one an index takes — a
+    /// docker-format archive holds a single image, which is the one thing this
+    /// rule does not produce.
+    #[spec(ty = ImageFormat::param_type(&[ImageFormat::Oci]))]
     format: Option<String>,
     /// Write an OCI **layout directory** instead of a single archive file. This
     /// is the shape `docker_build`'s `bases` and buildx's `oci-layout://` build
@@ -575,6 +575,30 @@ mod tests {
         .err()
         .expect("docker format must fail");
         assert!(format!("{err:#}").contains("single image"), "got: {err:#}");
+    }
+
+    /// `parse` refuses `docker` for an index, so the schema offers only `oci`:
+    /// the LSP flags `"docker"` where it is written, as the parse would.
+    #[tokio::test]
+    async fn format_schema_is_oci_only() {
+        let schema = OciIndexSpec::schema();
+        let ty = &schema
+            .fields
+            .iter()
+            .find(|f| f.name == "format")
+            .expect("format field")
+            .ty;
+        assert_eq!(ty.literals(), vec!["oci"]);
+        assert!(!ty.matches(&Value::String("docker".to_string())));
+        parse_at(
+            "//app:img",
+            cfg(&[
+                ("images", images(&[":amd64"])),
+                ("format", Value::String("oci".to_string())),
+            ]),
+        )
+        .await
+        .expect("the listed format parses");
     }
 
     #[tokio::test]
