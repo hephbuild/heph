@@ -210,7 +210,8 @@ message ManagedRunRequest {
   // alone, so cancelling one run (its `timeout`) stops that run and no other.
   // When present the plugin registers the run's token under it, before the
   // `run` dispatch returns, and the host cancels the run by it
-  // (`StableCancel::cancel(cancel_key)`), never by `request_id`. It always
+  // (`StableCancel::cancel(cancel_key)`, or `cancel_timed_out(cancel_key)`
+  // when its `timeout` stopped it, since 0.20.0), never by `request_id`. It always
   // starts with `plugin_abi::CANCEL_KEY_PREFIX`, so a plugin tells a cancel for
   // a call that already ended from a request cancel, and drops it. Absent —
   // what every older host sends — the run is cancelled by `request_id`, as

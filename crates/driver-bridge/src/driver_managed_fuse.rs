@@ -33,8 +33,6 @@ impl ManagedDriverFuse {
         ctoken: &(dyn Cancellable + Send + Sync),
         shell: bool,
     ) -> anyhow::Result<RunResponse> {
-        // First: the engine's `timeout` clock covers staging too.
-        let clock = hdriver_support::failure_out::RunClock::start(req.target);
         // Redirect sandbox_dir from `<home>/sandbox/...` to
         // `<fuse_lower>/...` so all writes go through the FUSE mount.
         let plain_sandbox_dir = req.sandbox_dir.clone();
@@ -186,7 +184,6 @@ impl ManagedDriverFuse {
                     &target.failure_outputs,
                     shell,
                     ctoken,
-                    clock.timed_out(ctoken),
                     &ws_dir,
                     &plain_sandbox_dir,
                     &[],

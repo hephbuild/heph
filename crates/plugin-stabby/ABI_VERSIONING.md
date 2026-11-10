@@ -244,6 +244,16 @@ skipped in silence.
   and `CodegenMode` no longer derives `SpecEnum`, so a plugin that matched
   `InPlace` or parsed the mode through `SpecEnum` must change its code, not
   just rebuild.
+
+  A timed-out run says so across the seam. `StableCancel` gains
+  `cancel_timed_out(cancel_key)`, appended after `cancel`: the host sends it
+  instead of `cancel` for a run its `timeout` stopped, and the plugin cancels
+  that run's token as timed out, so the driver's `Cancellable::timed_out` reads
+  what the host's token does (a request cancel stays `cancel`). An id that is
+  not a cancel key is a plain cancel. This is a vtable change, which the
+  0.21.0 rebuild already covers; no wire message changes. `Cancellable` gains
+  the required `timed_out()` method, a Rust source break for a plugin that
+  implements `Cancellable` itself.
 - **0.20.0** (break) — `ParamType.literal` (6, `string`), a member of the
   `kind` oneof: exactly one string (`ParamType::Literal`). A closed set is a
   `union` of literals, so a cdylib driver's `workdir`-style field reaches the

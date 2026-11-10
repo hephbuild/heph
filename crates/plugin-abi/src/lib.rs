@@ -47,6 +47,15 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// `SpecEnum`, so a plugin that matched `InPlace` or parsed the mode with
 /// `SpecEnum` must change its code, not just rebuild.
 ///
+/// Also in 0.21.0, a timed-out run says so across the seam:
+/// `StableCancel::cancel_timed_out(cancel_key)`, appended after `cancel`, is
+/// what the host sends instead of `cancel` for a run its `timeout` stopped,
+/// and the plugin cancels that run's token as timed out
+/// (`Cancellable::timed_out`). An id that is not a cancel key is a plain
+/// cancel. A vtable change the 0.21.0 rebuild covers; no message changes.
+/// `Cancellable` gains the required `timed_out()`, a source break for a
+/// plugin that implements it.
+///
 /// 0.20.0 (a break): `ParamType.literal` (6, `string`, in the `kind` oneof) —
 /// exactly one string (`ParamType::Literal`); a closed set, e.g. a `workdir`
 /// or `format` field, is a `union` of them, so a cdylib's schema reaches the

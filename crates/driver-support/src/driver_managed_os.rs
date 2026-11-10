@@ -45,8 +45,6 @@ impl ManagedDriverOs {
         ctoken: &(dyn Cancellable + Send + Sync),
         shell: bool,
     ) -> anyhow::Result<RunResponse> {
-        // First: the engine's `timeout` clock covers staging too.
-        let clock = crate::failure_out::RunClock::start(req.target);
         let sandbox_dir = req.sandbox_dir.clone();
         let cleanup_dir = sandbox_dir.clone();
         let mut sandbox_cleanup: Option<hplugin::driver::SandboxCleanupJob> =
@@ -183,7 +181,6 @@ impl ManagedDriverOs {
                     &target.failure_outputs,
                     shell,
                     ctoken,
-                    clock.timed_out(ctoken),
                     &ws_dir,
                     &sandbox_dir,
                     self.stage_dir.as_slice(),
@@ -317,12 +314,16 @@ mod tests {
     }
 
     /// A token that reads cancelled once `0` exists: a cancellation that
-    /// lands while the run is running, after it wrote that file.
-    struct CancelledOnceExists(std::path::PathBuf);
+    /// lands while the run is running, after it wrote that file. `.1` is its
+    /// reason: the run's `timeout`, or (false) its request's cancellation.
+    struct CancelledOnceExists(std::path::PathBuf, bool);
 
     impl Cancellable for CancelledOnceExists {
         fn is_cancelled(&self) -> bool {
             self.0.exists()
+        }
+        fn timed_out(&self) -> bool {
+            self.1 && self.is_cancelled()
         }
         fn cancelled(
             &self,
@@ -334,13 +335,13 @@ mod tests {
             })
         }
         fn clone_arc(&self) -> Arc<dyn Cancellable + Send + Sync> {
-            Arc::new(Self(self.0.clone()))
+            Arc::new(Self(self.0.clone(), self.1))
         }
     }
 
-    /// A run cancelled by its own `timeout` keeps its `failure_out` with no
-    /// process exit behind it, and writes nothing back; one cancelled short
-    /// of its limit keeps nothing.
+    /// A run cancelled by its own `timeout` (its token says so) keeps its
+    /// `failure_out` with no process exit behind it, and writes nothing back;
+    /// one cancelled by its request keeps nothing.
     #[tokio::test]
     async fn timeout_keeps_failure_out_and_writes_nothing_back() -> anyhow::Result<()> {
         use hplugin::driver::targetdef::path::{CodegenMode, Content, Path as DefPath};
@@ -348,13 +349,15 @@ mod tests {
         let stage = tmp.path().join("stage");
         let id = "t".to_string();
         let cancelled: fn() -> anyhow::Error = || anyhow::anyhow!("cancelled");
-        let run = |name: &'static str, timeout: std::time::Duration| {
+        let run = |name: &'static str, timed_out: bool| {
             let sandbox = tmp.path().join(name);
             let os = os_failing(Some(cancelled), &stage);
             let id = &id;
             async move {
                 let mut target = keeps_report();
-                target.timeout = Some(hplugin::driver::Timeout::new(timeout)?);
+                target.timeout = Some(hplugin::driver::Timeout::new(
+                    std::time::Duration::from_secs(3600),
+                )?);
                 target.outputs = vec![hplugin::driver::targetdef::Output {
                     group: String::new(),
                     paths: vec![DefPath {
@@ -365,7 +368,7 @@ mod tests {
                         collect: true,
                     }],
                 }];
-                let ct = CancelledOnceExists(sandbox.join("ws/app/report.txt"));
+                let ct = CancelledOnceExists(sandbox.join("ws/app/report.txt"), timed_out);
                 let req = RunRequest::new(id, &target, sandbox.clone());
                 let Err(err) = os.run_inner(req, &ct, false).await else {
                     anyhow::bail!("{name}: the run must fail");
@@ -374,8 +377,8 @@ mod tests {
             }
         };
 
-        // At its limit (well within the slack): a timeout.
-        let (err, sandbox) = run("timed-out", std::time::Duration::from_millis(1)).await?;
+        // Cancelled as timed out, however far from its limit the clock says.
+        let (err, sandbox) = run("timed-out", true).await?;
         let staged = sandbox.join(crate::failure_out::FAILURE_OUT_STAGING);
         assert_eq!(
             hplugin::error::failure_out_dir(&err).map(std::path::PathBuf::from),
@@ -387,8 +390,8 @@ mod tests {
             "a timeout writes nothing back"
         );
 
-        // An hour short of its limit: the request's cancellation.
-        let (err, sandbox) = run("cancelled", std::time::Duration::from_secs(3600)).await?;
+        // The same run cancelled by its request.
+        let (err, sandbox) = run("cancelled", false).await?;
         assert_eq!(hplugin::error::failure_out_dir(&err), None);
         assert!(
             !sandbox
@@ -439,7 +442,10 @@ mod tests {
                 // Cancelled once the run has written its report: staging
                 // stops on a token cancelled up front, before the run.
                 let ct: Arc<dyn Cancellable + Send + Sync> = if cancel {
-                    Arc::new(CancelledOnceExists(sandbox.join("ws/app/report.txt")))
+                    Arc::new(CancelledOnceExists(
+                        sandbox.join("ws/app/report.txt"),
+                        false,
+                    ))
                 } else {
                     Arc::new(StdCancellationToken::new())
                 };

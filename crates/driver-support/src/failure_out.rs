@@ -9,7 +9,7 @@
 //! target's failure slot as `out/`.
 //!
 //! - **Only after a process exit** ([`kept_failure_exit`]) **or the run's own
-//!   `timeout`** ([`RunClock::timed_out`]): never on a request's cancellation,
+//!   `timeout`** ([`Cancellable::timed_out`]): never on a request's cancellation,
 //!   never under `--shell`, never for a failure no process exit is behind
 //!   (sandbox prep, credentials, a runner).
 //! - **Never in the write-back.** A path a `failure_out` entry matches is
@@ -46,7 +46,6 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
-use std::time::{Duration, Instant};
 
 /// The directory, directly under the run's sandbox, a failed run's
 /// `failure_out` matches are copied into. Outside `ws/`, so the run can never
@@ -61,68 +60,16 @@ const GLOB_OPTS: glob::MatchOptions = glob::MatchOptions {
     require_literal_leading_dot: false,
 };
 
-/// How far short of its `timeout` a cancelled run may be and still count as
-/// timed out ([`RunClock::timed_out`]).
-///
-/// The engine starts the clock just before it first polls the driver's `run`
-/// (and, for a cdylib, before the request crosses the ABI), the managed layer
-/// just after: a timed-out run reads a little under its limit here. The slack
-/// covers that. Its cost is the other direction: a request cancelled within
-/// it of the limit is read as a timeout, and pays for one `failure_out` copy
-/// the engine then discards, since it keeps nothing for a cancellation.
-pub const TIMEOUT_SLACK: Duration = Duration::from_secs(1);
-
-/// When a managed run started, and the `timeout` the engine holds it to: what
-/// tells the run's own timeout from a request's cancellation, which reach the
-/// run as the same cancelled token.
-///
-/// The engine enforces a timeout by cancelling the run's token, the very
-/// token a request's cancellation is forwarded into, and neither the token
-/// nor the ABI says which it was. The managed layer has the def's `timeout`
-/// and a clock, which is enough: once the token is cancelled, a run at its
-/// limit (less [`TIMEOUT_SLACK`]) timed out, and one short of it was
-/// cancelled.
-#[derive(Debug, Clone, Copy)]
-pub struct RunClock {
-    started: Instant,
-    timeout: Option<Duration>,
-}
-
-impl RunClock {
-    /// Start the clock for a run of `target`: first thing in the managed
-    /// layer's `run`, since the engine's clock covers staging too.
-    pub fn start(target: &TargetDef) -> Self {
-        Self {
-            started: Instant::now(),
-            timeout: target.timeout.map(hplugin::driver::Timeout::duration),
-        }
-    }
-
-    /// Whether the run was stopped by its own `timeout`: its token is
-    /// cancelled, and it has run for its limit, less [`TIMEOUT_SLACK`].
-    pub fn timed_out(&self, ctoken: &(dyn Cancellable + Send + Sync)) -> bool {
-        self.timed_out_at(ctoken, self.started.elapsed())
-    }
-
-    fn timed_out_at(&self, ctoken: &(dyn Cancellable + Send + Sync), elapsed: Duration) -> bool {
-        ctoken.is_cancelled()
-            && self
-                .timeout
-                .is_some_and(|t| elapsed.saturating_add(TIMEOUT_SLACK) >= t)
-    }
-}
-
 /// Whether a failed run keeps its `failure_out`: [`kept_failure_exit`], or a
-/// run stopped by its own `timeout` (`timed_out`, [`RunClock::timed_out`]),
-/// which the engine reports as a failure and whose process was killed like a
-/// signalled one. Never under `--shell`.
+/// run stopped by its own `timeout` ([`Cancellable::timed_out`]: the engine
+/// cancelled its token as timed out), which the engine reports as a failure
+/// and whose process was killed like a signalled one. Never under `--shell`.
 pub fn keeps_failure_out(
     err: &anyhow::Error,
     shell: bool,
     ctoken: &(dyn Cancellable + Send + Sync),
-    timed_out: bool,
 ) -> bool {
-    !shell && (timed_out || kept_failure_exit(err, shell, ctoken).is_some())
+    !shell && (ctoken.timed_out() || kept_failure_exit(err, shell, ctoken).is_some())
 }
 
 /// Whether every component of `p` is a plain name: no root, no `..`, no `.`.
@@ -314,25 +261,21 @@ pub async fn keep_failure_write_back(
 /// failed — never another error in its place.
 ///
 /// The copy stops when the request is cancelled, or this future dropped. A
-/// `timed_out` run's token is already cancelled, so its copy stops only on
-/// the drop: the engine waits out its grace for it.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each is one fact about the failed run the two managed layers hold apart"
-)]
+/// timed-out run's token is already cancelled, so its copy stops only on the
+/// drop: the engine waits out its grace for it.
 pub async fn keep_failure_outputs(
     err: anyhow::Error,
     outputs: &[FailureOutput],
     shell: bool,
     ctoken: &(dyn Cancellable + Send + Sync),
-    timed_out: bool,
     ws_dir: &Path,
     staging_parent: &Path,
     follow_roots: &[PathBuf],
 ) -> anyhow::Error {
-    if outputs.is_empty() || !keeps_failure_out(&err, shell, ctoken, timed_out) {
+    if outputs.is_empty() || !keeps_failure_out(&err, shell, ctoken) {
         return err;
     }
+    let timed_out = ctoken.timed_out();
     let outputs = outputs.to_vec();
     let staging = staging_parent.join(FAILURE_OUT_STAGING);
     let mut roots = Vec::with_capacity(follow_roots.len() + 1);
@@ -1221,61 +1164,75 @@ mod tests {
         assert!(!gone.exists(), "the removed sandbox was created again");
     }
 
-    /// A timeout keeps `failure_out` whatever the error; a request's
-    /// cancellation, `--shell`, and no process exit keep nothing.
+    /// A token cancelled as timed out keeps `failure_out` whatever the error;
+    /// a request's cancellation, `--shell`, and no process exit keep nothing.
     #[test]
     fn keeps_failure_out_predicate() {
         let live = hcore::hasync::StdCancellationToken::new();
         let cancelled = hcore::hasync::StdCancellationToken::new();
         cancelled.cancel();
+        let timed_out = hcore::hasync::StdCancellationToken::new();
+        timed_out.cancel_timed_out();
         let bare = || anyhow::anyhow!("cancelled");
-        assert!(keeps_failure_out(&bare(), false, &cancelled, true));
-        assert!(!keeps_failure_out(&bare(), true, &cancelled, true));
-        assert!(!keeps_failure_out(&bare(), false, &cancelled, false));
-        assert!(!keeps_failure_out(&bare(), false, &live, false));
+        assert!(keeps_failure_out(&bare(), false, &timed_out));
+        assert!(!keeps_failure_out(&bare(), true, &timed_out));
+        assert!(!keeps_failure_out(&bare(), false, &cancelled));
+        assert!(!keeps_failure_out(&bare(), false, &live));
         assert!(keeps_failure_out(
             &process_failed(Exit::Signal(9)),
             false,
-            &live,
-            false
+            &live
         ));
         assert!(!keeps_failure_out(
             &process_failed(Exit::Code(1)),
             false,
-            &cancelled,
-            false
+            &cancelled
         ));
     }
 
-    /// Timed out: cancelled, with a timeout, at its limit less the slack.
-    #[test]
-    fn run_clock_tells_a_timeout_from_a_cancellation() {
-        let live = hcore::hasync::StdCancellationToken::new();
+    /// The whole keep, on the token's reason alone: a run cancelled as timed
+    /// out has its matches copied and attached, though its copy outlives the
+    /// cancelled token; one cancelled by its request keeps nothing, with the
+    /// same error and the same files.
+    #[tokio::test]
+    async fn a_timed_out_token_keeps_failure_out_and_a_cancelled_one_does_not() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ws = tmp.path().join("ws");
+        write(&ws.join("app/junit.xml"), "j");
+        let outputs = out(vec![Content::FilePath("app/junit.xml".into())]);
+        let keep = |sandbox: &'static str, token: hcore::hasync::StdCancellationToken| {
+            let (ws, outputs) = (ws.clone(), outputs.clone());
+            let sandbox = tmp.path().join(sandbox);
+            async move {
+                fs::create_dir_all(&sandbox).expect("sandbox");
+                let err = keep_failure_outputs(
+                    anyhow::Error::new(hplugin::error::CancelledError),
+                    &outputs,
+                    false,
+                    &token,
+                    &ws,
+                    &sandbox,
+                    &[],
+                )
+                .await;
+                (err, sandbox.join(FAILURE_OUT_STAGING))
+            }
+        };
+
+        let timed_out = hcore::hasync::StdCancellationToken::new();
+        timed_out.cancel_timed_out();
+        let (err, staging) = keep("timed-out", timed_out).await;
+        let kept = hplugin::error::failure_artifacts(&err).expect("kept on a timeout");
+        assert_eq!(kept.0.len(), 1, "{err:#}");
+        assert_eq!(
+            fs::read_to_string(staging.join("app/junit.xml")).expect("copied"),
+            "j"
+        );
+
         let cancelled = hcore::hasync::StdCancellationToken::new();
         cancelled.cancel();
-        let clock = |secs: Option<u64>| RunClock {
-            started: Instant::now(),
-            timeout: secs.map(Duration::from_secs),
-        };
-        let s = Duration::from_secs;
-        assert!(clock(Some(10)).timed_out_at(&cancelled, s(10)));
-        assert!(clock(Some(10)).timed_out_at(&cancelled, s(10).saturating_sub(TIMEOUT_SLACK)));
-        assert!(clock(Some(10)).timed_out_at(&cancelled, s(30)));
-        assert!(
-            !clock(Some(10)).timed_out_at(&cancelled, s(2)),
-            "a cancellation well before the limit"
-        );
-        assert!(
-            !clock(Some(10)).timed_out_at(&live, s(30)),
-            "not cancelled at all"
-        );
-        assert!(
-            !clock(None).timed_out_at(&cancelled, s(3600)),
-            "no timeout to reach"
-        );
-        let mut td = TargetDef::default();
-        assert!(RunClock::start(&td).timeout.is_none());
-        td.timeout = Some(hplugin::driver::Timeout::new(s(90)).expect("timeout"));
-        assert_eq!(RunClock::start(&td).timeout, Some(s(90)));
+        let (err, staging) = keep("cancelled", cancelled).await;
+        assert!(hplugin::error::failure_artifacts(&err).is_none(), "{err:#}");
+        assert!(!staging.exists(), "nothing copied for a request cancel");
     }
 }

@@ -634,12 +634,33 @@ fn provider_cancel(inner: &Arc<DynProvider>, request_id: &str) -> impl FnOnce() 
     move || inner.cancel(id.into())
 }
 
-/// The cancel signal for a driver call: its `request_id`, or a run's own
-/// `cancel_key`.
+/// The cancel signal for a driver call other than a run (`parse`,
+/// `apply_transitive`): its `request_id`. A run's is [`run_cancel`].
 fn driver_cancel(inner: &Arc<DynManagedDriver>, id: &str) -> impl FnOnce() + Send {
     let inner = Arc::clone(inner);
     let id = id.to_string();
     move || inner.cancel(id.into())
+}
+
+/// The cancel signal for a run: by its own `cancel_key` when it has one, and
+/// then saying why. Called once `ct` has fired, so `ct`'s reason is settled: a
+/// run the engine stopped at its `timeout` is cancelled as timed out
+/// (`cancel_timed_out`), so the plugin's token reads what `ct` does. A run
+/// with no key (a plugin before 0.19.1) is cancelled by `request_id`.
+fn run_cancel<'a>(
+    inner: &Arc<DynManagedDriver>,
+    ct: &'a (dyn Cancellable + Send + Sync),
+    cancel_key: Option<&str>,
+    request_id: &str,
+) -> impl FnOnce() + Send + 'a {
+    let inner = Arc::clone(inner);
+    let key = cancel_key.map(str::to_string);
+    let request_id = request_id.to_string();
+    move || match key {
+        Some(key) if ct.timed_out() => inner.cancel_timed_out(key.into()),
+        Some(key) => inner.cancel(key.into()),
+        None => inner.cancel(request_id.into()),
+    }
 }
 
 /// Host handle to a loaded plugin's provider. `Clone` (cheap — shares the loaded
@@ -1253,8 +1274,11 @@ impl StableRemoteManagedDriver {
             // firing names this run, not every run of the request. The plugin
             // registered the key before `invoke_bidi` above resolved, and this
             // is the first point a cancel can be sent, so it is never early.
-            let cancel_by = cancel_key.as_deref().unwrap_or(&request_id);
-            let run = await_with_cancel(ct, driver_cancel(&self.inner, cancel_by), rx);
+            let run = await_with_cancel(
+                ct,
+                run_cancel(&self.inner, ct, cancel_key.as_deref(), &request_id),
+                rx,
+            );
             futures::pin_mut!(run);
             // `pump` and `relay` never complete; the run's terminal result ends
             // the select, which drops `relay` and with it `in_tx`, ending the
