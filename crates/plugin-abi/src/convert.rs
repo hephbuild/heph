@@ -3537,7 +3537,7 @@ nested: { a: 1, b: [x, y] }
         assert!(!back.inputs[1].hashed && !back.inputs[2].runtime);
     }
 
-    /// D7: `failure_outputs` (field 13) crosses both ways, every path kind and
+    /// D7: `failure_outputs` (field 14) crosses both ways, every path kind and
     /// a named group; a def from a plugin that predates it decodes empty.
     #[test]
     fn targetdef_failure_outputs_roundtrip() {
@@ -3572,7 +3572,7 @@ nested: { a: 1, b: [x, y] }
         // Never folded into the outputs.
         assert_eq!(back.outputs.len(), td.outputs.len());
 
-        // An older plugin sends no field 13: none, not an error.
+        // An older plugin sends no field 14: none, not an error.
         let mut old = full_target_def_pb();
         old.failure_outputs.clear();
         let back = target_def_from_pb(via_bytes(&old)).expect("decode");
@@ -3699,6 +3699,74 @@ nested: { a: 1, b: [x, y] }
         let back = run_failure_from_pb(via_bytes(&wire));
         assert!(hplugin::error::failure_write_back(&back).is_none());
         assert!(hplugin::error::failure_log(&back).is_some());
+    }
+
+    /// `b` with every top-level field numbered in `drop` removed, the rest
+    /// byte for byte: what a peer on a schema without those fields sends.
+    fn without_fields(b: &[u8], drop: &[u32]) -> Vec<u8> {
+        let mut fields =
+            buffa::UnknownFields::decode_from_slice(b).expect("well-formed wire bytes");
+        fields.retain(|f| !drop.contains(&f.number));
+        let mut out = Vec::new();
+        fields.write_to(&mut out);
+        out
+    }
+
+    /// D7, D6: bytes from a 0.19 peer — a `TargetDef` without field 14 and a
+    /// `RunFailure` without field 5, every other field as sent — decode to no
+    /// failure outputs and no write-back, and lose nothing else.
+    #[test]
+    fn old_wire_bytes_decode_without_failure_outputs_or_write_back() {
+        let new = full_target_def_pb().encode_to_vec();
+        assert!(
+            field_numbers(&new).contains(&14),
+            "the fixture sends field 14"
+        );
+        let old = without_fields(&new, &[14]);
+        assert!(!field_numbers(&old).contains(&14));
+        assert!(field_numbers(&old).contains(&5), "outputs are still sent");
+        let back = target_def_from_pb(crate::decode(&old).expect("bytes")).expect("decode");
+        assert!(back.failure_outputs.is_empty());
+        let mut expected = full_target_def_pb();
+        expected.failure_outputs.clear();
+        assert_eq!(
+            target_def_to_pb(&back).expect("re-encode"),
+            expected,
+            "every other field survives"
+        );
+
+        let file = |name: &str, r#type: OaType| OutputArtifact {
+            group: String::new(),
+            name: name.to_string(),
+            r#type,
+            content: OaContent::File(ContentFile {
+                source_path: format!("/sandbox/{name}"),
+                out_path: name.to_string(),
+                x: false,
+                passthrough: false,
+            }),
+            hashout: String::new(),
+        };
+        let err = anyhow::Error::new(hplugin::error::ProcessFailed::new(
+            "exit status: 1",
+            Some(Exit::Code(1)),
+        ));
+        let err = hplugin::error::with_failure_artifacts(err, vec![file("log.txt", OaType::Log)]);
+        let err = hplugin::error::with_failure_write_back(err, vec![file("a.go", OaType::Output)]);
+        let new = run_failure_to_pb(&err, hcore::hmemoizer::chain_message(&err)).encode_to_vec();
+        assert!(
+            field_numbers(&new).contains(&5),
+            "the fixture sends field 5"
+        );
+        let old = without_fields(&new, &[5]);
+        assert!(!field_numbers(&old).contains(&5));
+        let back = run_failure_from_pb(crate::decode(&old).expect("bytes"));
+        assert!(hplugin::error::failure_write_back(&back).is_none());
+        assert!(
+            hplugin::error::failure_log(&back).is_some(),
+            "the log survives"
+        );
+        assert_eq!(hplugin::error::process_exit(&back), Some(Exit::Code(1)));
     }
 
     #[test]
