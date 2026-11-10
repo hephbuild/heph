@@ -1711,6 +1711,8 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
                 // On the engine's def only, never on exec's `TargetDef`, so
                 // `Hash for TargetDef` cannot reach it (U5).
                 resources: spec.resources,
+                // Same: the engine enforces it, and no hash sees it.
+                timeout: spec.timeout,
                 ..Default::default()
             },
         })

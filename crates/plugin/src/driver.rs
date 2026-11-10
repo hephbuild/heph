@@ -693,6 +693,20 @@ pub mod targetdef {
         /// never crosses the plugin ABI.
         #[serde(skip)]
         pub demand: super::Demand,
+        /// How long the run may take, from the moment the driver's `run` is
+        /// called. `None` is no limit.
+        ///
+        /// Set by the driver's `parse` from the `timeout` config key (a
+        /// `timeout: Option<Timeout>` field on its spec); **enforced by the
+        /// engine**, never by the driver: past it the engine cancels the run's
+        /// token, waits a grace period, then abandons the run and fails the
+        /// target. **Never part of a def hash**: a limit does not change what a
+        /// run that finishes within it produces. Crosses the plugin ABI as
+        /// `pb::TargetDef.timeout_ms` (since 0.19.1); a def from an older
+        /// plugin decodes to `None`. Skipped when `None`, so `inspect def
+        /// --json` of every other target is unchanged.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub timeout: Option<super::Timeout>,
     }
 
     /// For tests and struct-update syntax (`..Default::default()`); `raw_def` is
@@ -713,6 +727,7 @@ pub mod targetdef {
                 transparent: false,
                 resources: super::Resources::default(),
                 demand: super::Demand::default(),
+                timeout: None,
             }
         }
     }
@@ -1239,6 +1254,98 @@ pub struct CredentialMount {
 /// than left for someone to discover in a log.
 pub const REDACT_MIN_LEN: usize = 8;
 
+/// How long a target's run may take: the `timeout` attribute, e.g.
+/// `timeout = "10m"`, `"1h30m"`, or `90` (a bare number is seconds, the same
+/// grammar as every other duration heph reads, [`hcore::units::parse_duration`]).
+///
+/// A driver carries it as a `timeout: Option<Timeout>` field on its spec and
+/// moves it onto [`TargetDef::timeout`](targetdef::TargetDef::timeout); the
+/// **engine** enforces it, so a driver does nothing else with it. It is never
+/// hashed.
+///
+/// Always above zero and at most `u64::MAX` milliseconds, so it crosses the
+/// plugin ABI (`TargetDef.timeout_ms`) losslessly. "No limit" is `None`, never
+/// a zero timeout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Timeout(std::time::Duration);
+
+impl Timeout {
+    /// The `target()` config key a declaration rides on.
+    pub const CONFIG_KEY: &'static str = "timeout";
+
+    /// A timeout of `d`; refuses zero and anything over `u64::MAX`
+    /// milliseconds.
+    pub fn new(d: std::time::Duration) -> anyhow::Result<Self> {
+        if d.is_zero() {
+            anyhow::bail!(
+                "`timeout` must be above zero; leave it out for no limit, or write e.g. \"10m\""
+            );
+        }
+        u64::try_from(d.as_millis())
+            .map_err(|_overflow| anyhow::anyhow!("`timeout` {d:?} is too long"))?;
+        Ok(Self(d))
+    }
+
+    /// From the wire's `timeout_ms`.
+    pub fn from_millis(ms: u64) -> anyhow::Result<Self> {
+        Self::new(std::time::Duration::from_millis(ms))
+    }
+
+    /// For the wire's `timeout_ms`; lossless by construction.
+    pub fn as_millis(self) -> u64 {
+        u64::try_from(self.0.as_millis()).unwrap_or(u64::MAX)
+    }
+
+    pub fn duration(self) -> std::time::Duration {
+        self.0
+    }
+
+    /// Read a `timeout` value: a whole number of seconds above zero, or a
+    /// duration string (`"30s"`, `"10m"`, `"1h30m"`).
+    pub fn from_value(v: &Value) -> anyhow::Result<Self> {
+        let d = match v {
+            Value::String(s) => {
+                hcore::units::parse_duration(s).with_context(|| format!("`timeout` {s:?}"))?
+            }
+            Value::Int(n) => {
+                std::time::Duration::from_secs(u64::try_from(*n).map_err(|_negative| {
+                    anyhow::anyhow!("`timeout` must be above zero, got {n}")
+                })?)
+            }
+            Value::Uint(n) => std::time::Duration::from_secs(*n),
+            other => anyhow::bail!(
+                "`timeout` must be a duration such as \"10m\" or a number of seconds, got {other:?}"
+            ),
+        };
+        Self::new(d)
+    }
+}
+
+/// Exact, and readable back by [`hcore::units::parse_duration`] when it is a
+/// whole number of seconds: `"90s"`, `"10m"`, `"2h"`; `"1500ms"` otherwise
+/// (only a plugin's wire value can be finer than a second).
+impl Display for Timeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0.subsec_nanos() != 0 {
+            return write!(f, "{}ms", self.0.as_millis());
+        }
+        let s = self.0.as_secs();
+        if s.is_multiple_of(3600) {
+            write!(f, "{}h", s / 3600)
+        } else if s.is_multiple_of(60) {
+            write!(f, "{}m", s / 60)
+        } else {
+            write!(f, "{s}s")
+        }
+    }
+}
+
+impl Serialize for Timeout {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
 /// What a target declares it reserves from the engine's resource pools, **as
 /// written**: each declared pool's amount as text (`"0.5"`, `"2G"`, `"1"`).
 ///
@@ -1615,6 +1722,88 @@ impl Allotment {
             );
         };
         Ok(a.get(r.arg).unwrap_or(r.raw).to_owned())
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn parse(v: Value) -> anyhow::Result<Timeout> {
+        <Timeout as crate::htspec::FromSpecValue>::from_spec_value(&v)
+    }
+
+    #[test]
+    fn accepted_spellings() {
+        for (v, secs) in [
+            (Value::String("90s".into()), 90),
+            (Value::String("10m".into()), 600),
+            (Value::String("1h30m".into()), 5400),
+            (Value::Int(45), 45),
+            (Value::Uint(7), 7),
+        ] {
+            let t = parse(v.clone()).unwrap_or_else(|e| panic!("{v:?}: {e:#}"));
+            assert_eq!(t.duration(), Duration::from_secs(secs), "{v:?}");
+        }
+    }
+
+    /// Each refusal names `timeout`, so the driver's "in target //p:t" context
+    /// is enough to find it.
+    #[test]
+    fn refused_spellings() {
+        for v in [
+            Value::String("0s".into()),
+            Value::Int(0),
+            Value::Int(-5),
+            Value::String(String::new()),
+            Value::String("10 minutes please".into()),
+            Value::String("1.5h".into()),
+            Value::String("${read://p:t}".into()),
+            Value::Float(1.5),
+            Value::Bool(true),
+            Value::List(vec![]),
+        ] {
+            let err = parse(v.clone())
+                .err()
+                .unwrap_or_else(|| panic!("{v:?} accepted"));
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("timeout") || msg.contains("deferred"),
+                "{v:?}: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn displays_exactly_and_parses_back() {
+        for (secs, text) in [
+            (90, "90s"),
+            (600, "10m"),
+            (5400, "90m"),
+            (7200, "2h"),
+            (61, "61s"),
+        ] {
+            let t = Timeout::new(Duration::from_secs(secs)).expect("timeout");
+            assert_eq!(t.to_string(), text);
+            assert_eq!(
+                hcore::units::parse_duration(text).expect("parse"),
+                t.duration()
+            );
+        }
+        let t = Timeout::from_millis(1500).expect("timeout");
+        assert_eq!(t.to_string(), "1500ms");
+        assert_eq!(t.as_millis(), 1500);
+    }
+
+    #[test]
+    fn wire_bounds() {
+        assert!(Timeout::from_millis(0).is_err());
+        assert_eq!(
+            Timeout::from_millis(u64::MAX).expect("max").as_millis(),
+            u64::MAX
+        );
+        assert!(Timeout::new(Duration::MAX).is_err(), "over u64::MAX ms");
     }
 }
 

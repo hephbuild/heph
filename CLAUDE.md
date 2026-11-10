@@ -181,6 +181,18 @@ kept off every def hash, the allotment is runtime-only — so **a target's
 outputs must not depend on its allotment**, and a driver that folds its raw
 config map into its def hash breaks that silently.
 
+### Target timeouts
+
+`timeout = "10m"` on an `exec`/`bash` target bounds its run. The driver only
+moves it onto `TargetDef.timeout`; the **engine** enforces it around
+`Driver::run` (`crates/engine/src/engine/run_timeout.rs`): cancel the run's own
+token, wait a 10s grace, then abandon the run and fail the target.
+
+Read `docs/TIMEOUTS.md` before touching it. The one thing to know going in: a
+timed-out run must stay a *failure*, never a cancellation (`is_cancelled` false,
+log kept, nothing cached), and like `resources` the timeout must never reach a
+hash.
+
 ### The `template` driver
 
 `template(name, src, out, vars)` renders a declared template with declared

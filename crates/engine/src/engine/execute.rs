@@ -400,10 +400,24 @@ impl Engine {
                     if !driver.managed {
                         req.options.fire_handover().context("handing over the terminal")?;
                     }
-                    let res = if shell {
-                        driver.driver.run_shell(req, rs.ctoken()).await
-                    } else {
-                        driver.driver.run(req, rs.ctoken()).await
+                    // A `--shell` is a person at a prompt: never timed. A
+                    // run without a timeout gets the request's token as is.
+                    let res = match target.timeout {
+                        _ if shell => driver.driver.run_shell(req, rs.ctoken()).await,
+                        None => driver.driver.run(req, rs.ctoken()).await,
+                        Some(timeout) => {
+                            let run_token = hcore::hasync::StdCancellationToken::new();
+                            let run = driver.driver.run(req, &run_token);
+                            crate::engine::run_timeout::enforce(
+                                run,
+                                &run_token,
+                                rs.ctoken(),
+                                &target.addr,
+                                timeout,
+                                engine.timeout_grace,
+                            )
+                            .await
+                        }
                     };
                     drop(tx.send(res));
                     Ok(())

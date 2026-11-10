@@ -116,6 +116,11 @@ message TargetDef {
   // sends it here like any declaration; empty and absent are the same and
   // mean "the def says nothing" (one cpu). Never hashed.
   map<string, string> resources = 12;
+  // How long the run may take, in milliseconds (since 0.19.1). The host
+  // enforces it around the driver's `run`: past it, the run is cancelled and,
+  // after a grace period, abandoned. Absent is no limit — what every older
+  // plugin sends. A present value is never 0. Never hashed.
+  uint64 timeout_ms = 13;
 }
 
 // Where an entrypoint runs. Mirrors driver::targetdef::Workdir.

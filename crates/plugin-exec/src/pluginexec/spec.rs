@@ -117,6 +117,12 @@ pub(crate) struct TargetSpec {
     /// `{"cpu": 2, "memory": "4G"}`. Defaults to 1 cpu. Never hashed: moved
     /// onto the engine's def, never into exec's own. Refused on an entrypoint.
     pub resources: hplugin::driver::Resources,
+    /// How long the run may take, e.g. `"10m"`, `"1h30m"`, or a number of
+    /// seconds. Past it heph cancels the run (the process group is killed),
+    /// and the target fails as timed out; nothing is cached. Enforced by the
+    /// engine, never hashed: changing it does not rebuild. Not applied to
+    /// `--shell`.
+    pub timeout: Option<hplugin::driver::Timeout>,
 }
 
 #[cfg(test)]

@@ -227,6 +227,14 @@ skipped in silence.
 
 ## History of breaks
 
+- **0.19.1** (additive patch) — target timeouts. `TargetDef.timeout_ms` (13,
+  `uint64`): how long the run may take, which the host enforces around the
+  driver's `run`. Absent is no limit; a present 0 is refused at decode. A 0.19.0
+  plugin's defs have no limit (its drivers refuse a `timeout` attribute as an
+  unknown key, so nothing is lost silently); a 0.19.1 plugin on a 0.19.0 host
+  has its `timeout_ms` dropped at decode and its targets run unbounded. Never
+  hashed. `TargetDef` struct literals in SDK code need the new field (a source
+  break, not a wire break). `MIN_PLUGIN_ABI` stays 0.19.0.
 - **0.19.0** (break) — the exec-runner seam says whether the target runs on a
   terminal. `PrepareRequest` and `RunnerRequest` (`hexecrunner::wire`) end in
   a `tty` byte, read into `RunnerCtx::tty`, so a runner that moves the target

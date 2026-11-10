@@ -31,7 +31,7 @@ use hplugin::driver::sandbox::{Dep, Env, EnvValue, Mode, Sandbox, Tool};
 use hplugin::driver::targetdef::{Entrypoint, RawDef, RawDefBytes, Workdir};
 use hplugin::driver::{
     Allotment, ContinueSender, Disposition, Foreground, PtyStdio, Resources, RunOptions, RunStdio,
-    Signal, SignalSender, StopReceiver,
+    Signal, SignalSender, StopReceiver, Timeout,
 };
 use hplugin::error::Exit;
 use hplugin::function::{DeclaredState, DeclaredTarget, FnArgs, FnOutcome};
@@ -1374,6 +1374,7 @@ pub fn target_def_to_pb(td: &TargetDef) -> anyhow::Result<pb::TargetDef> {
         transparent: Some(td.transparent),
         entrypoint: td.entrypoint.as_ref().map(entrypoint_to_pb).into(),
         resources: resources_to_pb(&td.resources),
+        timeout_ms: td.timeout.map(Timeout::as_millis),
         ..Default::default()
     })
 }
@@ -1825,6 +1826,13 @@ pub fn target_def_from_pb(td: pb::TargetDef) -> anyhow::Result<TargetDef> {
                 .context("decoding TargetDef.resources")?,
             // The engine parses `resources` into this when it links the def.
             demand: Default::default(),
+            // Absent — what every plugin before 0.19.1 sends — is no limit; a
+            // present 0 is refused rather than read as one.
+            timeout: td
+                .timeout_ms
+                .map(Timeout::from_millis)
+                .transpose()
+                .context("decoding TargetDef.timeout_ms")?,
             addr: addr.clone(),
         })
     })();
@@ -3448,6 +3456,33 @@ nested: { a: 1, b: [x, y] }
                 micros
             );
         }
+    }
+
+    #[test]
+    fn target_def_timeout_round_trip() {
+        let mut td = full_target_def();
+        td.timeout = Some(Timeout::new(std::time::Duration::from_secs(90)).unwrap());
+        let wire = target_def_to_pb(&td).expect("encode");
+        assert_eq!(wire.timeout_ms, Some(90_000));
+        let back = target_def_from_pb(via_bytes(&wire)).expect("decode");
+        assert_eq!(back.timeout, td.timeout);
+
+        // Absent — every plugin before 0.19.1 — is no limit.
+        let wire = full_target_def_pb();
+        assert_eq!(wire.timeout_ms, None, "nothing declared, nothing sent");
+        let back = target_def_from_pb(via_bytes(&wire)).expect("decode");
+        assert_eq!(back.timeout, None);
+
+        // A present 0 is not "no limit", and not an instant kill either.
+        let mut wire = full_target_def_pb();
+        wire.timeout_ms = Some(0);
+        let err = target_def_from_pb(via_bytes(&wire))
+            .err()
+            .expect("a zero timeout is refused");
+        assert!(
+            format!("{err:#}").contains("TargetDef.timeout_ms"),
+            "{err:#}"
+        );
     }
 
     #[test]
