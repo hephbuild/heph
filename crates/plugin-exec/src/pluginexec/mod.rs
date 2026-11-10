@@ -144,7 +144,7 @@ impl Hash for TargetDef {
         // runtime_dep_group_inputs intentionally excluded — runtime_deps
         // (and runtime-only transitives) must not affect the cache key.
         self.tool_group_inputs.hash(state);
-        outputs_sans_codegen(&self.outputs).hash(state);
+        hash_outputs_sans_codegen(&self.outputs, state);
         self.support_files.hash(state);
         self.env.hash(state);
         self.pass_env.hash(state);
@@ -170,19 +170,32 @@ impl Hash for TargetDef {
 /// `in_place` transform must be idempotent (the `codegen` field's contract).
 ///
 /// The def itself keeps the real mode; `Path`'s derived `Hash` is untouched.
-/// Same container type and key, so a def with no codegen hashes byte-identically
-/// to hashing `outputs` directly (pinned by `exec_def_hash_golden_populated`).
-fn outputs_sans_codegen(
+///
+/// Streamed, with no intermediate collection: this runs on every exec/bash def
+/// hash, warm runs included. It feeds the hasher exactly the sequence std's
+/// `Hash for BTreeMap<String, Vec<Path>>` does: the map's length, then per
+/// entry (in key order, which `outputs` already iterates in) the key as a
+/// `str`, the Vec's length, and each path. std writes both lengths through
+/// `Hasher::write_length_prefix`, whose default — the only one a stable
+/// `Hasher` can have — is `write_usize`. So a def with no codegen hashes
+/// byte-identically to hashing `outputs` directly (pinned by
+/// `exec_def_hash_golden_populated`).
+fn hash_outputs_sans_codegen<H: std::hash::Hasher>(
     outputs: &BTreeMap<String, Vec<Path>>,
-) -> BTreeMap<&str, Vec<PathSansCodegen<'_>>> {
-    outputs
-        .iter()
-        .map(|(group, paths)| (group.as_str(), paths.iter().map(PathSansCodegen).collect()))
-        .collect()
+    state: &mut H,
+) {
+    state.write_usize(outputs.len());
+    for (group, paths) in outputs {
+        group.as_str().hash(state);
+        state.write_usize(paths.len());
+        for path in paths {
+            PathSansCodegen(path).hash(state);
+        }
+    }
 }
 
 /// A [`Path`] hashed field for field as its derived `Hash`, with
-/// `codegen_tree` read as [`CodegenMode::None`]. See [`outputs_sans_codegen`].
+/// `codegen_tree` read as [`CodegenMode::None`]. See [`hash_outputs_sans_codegen`].
 struct PathSansCodegen<'a>(&'a Path);
 
 impl Hash for PathSansCodegen<'_> {
@@ -5482,6 +5495,39 @@ bash apply_transitive: 96d371e95980d767
             );
         }
         Ok(())
+    }
+
+    /// The streamed outputs hash feeds the hasher what std's `Hash` for the
+    /// `BTreeMap<String, Vec<Path>>` does, for any shape with no codegen: empty
+    /// map, empty group, several groups and paths.
+    #[test]
+    fn streamed_outputs_hash_matches_the_map_hash() {
+        let path = |content: Content| Path {
+            content,
+            codegen_tree: CodegenMode::None,
+            collect: true,
+        };
+        let shapes: [BTreeMap<String, Vec<Path>>; 3] = [
+            BTreeMap::new(),
+            BTreeMap::from([(String::new(), vec![])]),
+            BTreeMap::from([
+                (
+                    String::new(),
+                    vec![
+                        path(Content::FilePath("a.txt".into())),
+                        path(Content::DirPath("d".into())),
+                    ],
+                ),
+                ("gen".into(), vec![path(Content::Glob("**/*.go".into()))]),
+            ]),
+        ];
+        for outputs in shapes {
+            let mut want = Xxh3Default::new();
+            outputs.hash(&mut want);
+            let mut got = Xxh3Default::new();
+            hash_outputs_sans_codegen(&outputs, &mut got);
+            assert_eq!(got.finish(), want.finish(), "{outputs:?}");
+        }
     }
 
     /// I1: `failure_out` reaches no def hash — not parse's, not
