@@ -462,6 +462,14 @@ fn expand_spec_enum(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream>
         valid_names.push(key);
     }
 
+    // An empty set would schema as `ParamType::Enum([])`, which crosses the
+    // plugin ABI as "any string" — the opposite of "nothing parses".
+    if valid_names.is_empty() {
+        return Err(syn::Error::new_spanned(
+            name,
+            "`SpecEnum` needs at least one variant that is not `#[spec(skip)]`",
+        ));
+    }
     let valid = valid_names.join(", ");
     let null_arm = if has_default {
         quote! {

@@ -660,6 +660,11 @@ fn sorted_groups(m: &HashMap<String, Vec<String>>) -> Vec<(&String, &Vec<String>
     groups
 }
 
+/// The keys [`sandbox_from`] accepts. Anything else is refused before any is
+/// parsed, so the parser cannot take a key this list (and so [`transitive_ty`],
+/// which a test holds to it) does not name.
+const SANDBOX_KEYS: &[&str] = &["deps", "env", "tools", "pass_env", "runtime_pass_env"];
+
 /// Parse a BUILD-file `sandbox`/`transitive` value (Starlark → `htvalue`) into a
 /// [`Sandbox`]. Free function rather than an inherent `impl` because `Sandbox`
 /// now lives in the `heph-plugin` contract crate (orphan rule).
@@ -673,6 +678,15 @@ fn sandbox_from(m: htvalue::Value, pkg: &PkgBuf) -> anyhow::Result<Sandbox> {
     };
 
     let mut m: HashMap<&str, &htvalue::Value> = m.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    let mut unknown_keys: Vec<&str> = m
+        .keys()
+        .copied()
+        .filter(|k| !SANDBOX_KEYS.contains(k))
+        .collect();
+    if !unknown_keys.is_empty() {
+        unknown_keys.sort_unstable();
+        anyhow::bail!("unknown entries found: {:?}", unknown_keys)
+    }
 
     let mut sandbox = Sandbox::default();
 
@@ -753,8 +767,9 @@ fn sandbox_from(m: htvalue::Value, pkg: &PkgBuf) -> anyhow::Result<Sandbox> {
     }
 
     if !m.is_empty() {
-        let unknown_keys: Vec<&str> = m.into_keys().collect();
-        anyhow::bail!("unknown entries found: {:?}", unknown_keys)
+        // A key in `SANDBOX_KEYS` that no branch above consumed.
+        let unhandled: Vec<&str> = m.into_keys().collect();
+        anyhow::bail!("listed sandbox entries not handled: {:?}", unhandled)
     }
 
     Ok(sandbox)
@@ -949,16 +964,10 @@ fn capture_provenance(eval: &Evaluator) -> Vec<ProvenanceFrame> {
         .collect()
 }
 
-/// The driver-independent keyword arguments the `target()` builtin always
-/// accepts, for BUILD-file LSP completion. Kept next to the `target()` builtin
-/// (below) so the two don't drift. Driver-specific config args come from the
-/// driver's own schema and are merged in by the LSP — `resources` among them:
-/// it is driver config (a driver whose schema derives from `Spec` lists it),
-/// not a field of `target()`, so it is not listed here, where it would also be
-/// offered on the drivers that refuse it.
-/// `string | list[string]`: what `parse_strings` takes.
+/// `string | list[string]`: what `parse_strings` takes, which is what the
+/// spec decoding of a `Vec<String>` takes.
 fn strs() -> ParamType {
-    ParamType::union(vec![ParamType::String, ParamType::list(ParamType::String)])
+    <Vec<String> as hplugin::htspec::FromSpecValue>::spec_param_type()
 }
 
 /// The `transitive` value, key for key what [`sandbox_from`] accepts:
@@ -966,13 +975,7 @@ fn strs() -> ParamType {
 /// a `{group: addr | [addr]}` map), `env` through `parse_map_string_string`, and
 /// the two pass-through lists through `parse_strings`. Any other key is refused.
 fn transitive_ty() -> ParamType {
-    let groups = || {
-        ParamType::union(vec![
-            ParamType::String,
-            ParamType::list(ParamType::String),
-            ParamType::map(strs()),
-        ])
-    };
+    let groups = || hplugin::htspec::flatten_union(vec![strs(), ParamType::map(strs())]);
     ParamType::strukt(vec![
         ("deps", groups()),
         ("tools", groups()),
@@ -982,6 +985,13 @@ fn transitive_ty() -> ParamType {
     ])
 }
 
+/// The driver-independent keyword arguments the `target()` builtin always
+/// accepts, for BUILD-file LSP completion. Kept next to the `target()` builtin
+/// (below) so the two don't drift. Driver-specific config args come from the
+/// driver's own schema and are merged in by the LSP — `resources` among them:
+/// it is driver config (a driver whose schema derives from `Spec` lists it),
+/// not a field of `target()`, so it is not listed here, where it would also be
+/// offered on the drivers that refuse it.
 pub(crate) fn target_base_fields() -> Vec<hplugin::driver::DriverField> {
     use hplugin::driver::DriverField;
     let f = |name: &str, ty: ParamType, doc: &str, required: bool| DriverField {
@@ -2789,6 +2799,45 @@ target(
             chain.contains("undefined_symbol"),
             "eval error must name the offending symbol: {chain}"
         );
+    }
+
+    /// `transitive_ty` lists exactly `SANDBOX_KEYS`, and every listed key reaches
+    /// a parser branch: a map holding all of them, each with a value its schema
+    /// type takes, parses. A near-miss key is refused.
+    #[test]
+    fn transitive_schema_lists_exactly_the_keys_sandbox_from_accepts() {
+        let ParamType::Struct(fields) = transitive_ty() else {
+            panic!("transitive is a struct");
+        };
+        let mut schema: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+        schema.sort_unstable();
+        let mut keys = SANDBOX_KEYS.to_vec();
+        keys.sort_unstable();
+        assert_eq!(schema, keys);
+
+        let address = htvalue::Value::String("//p:x".to_string());
+        let env = htvalue::Value::Map(HashMap::from([(
+            "A".to_string(),
+            htvalue::Value::String("x".to_string()),
+        )]));
+        let all: HashMap<String, htvalue::Value> = fields
+            .iter()
+            .map(|f| {
+                let v = if f.ty.matches(&address) {
+                    address.clone()
+                } else {
+                    env.clone()
+                };
+                assert!(f.ty.matches(&v), "{}: no sample value", f.name);
+                (f.name.clone(), v)
+            })
+            .collect();
+        let pkg = PkgBuf::from("p");
+        sandbox_from(htvalue::Value::Map(all), &pkg).expect("every listed key parses");
+
+        let near_miss = htvalue::Value::Map(HashMap::from([("dep".to_string(), address)]));
+        let err = sandbox_from(near_miss, &pkg).expect_err("an unlisted key");
+        assert!(format!("{err:#}").contains("unknown entries"), "{err:#}");
     }
 
     #[test]

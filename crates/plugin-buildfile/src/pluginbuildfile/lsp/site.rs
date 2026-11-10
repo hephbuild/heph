@@ -927,15 +927,12 @@ pub(crate) fn resolve(doc: &Doc<'_>, o: usize) -> Resolution {
         },
         Err(reason) => return Resolution::none(reason),
     };
-    // Shadowing, decided here for every feature.
+    // Shadowing, decided here for every feature. Every site inside a
+    // `target(` / `provider_state(` call is shadowed with its callee, so the
+    // list is `Site::call`'s, not a second copy that a new kind can miss.
     let callee = match &resolution.site {
-        Site::Callee { call }
-        | Site::DriverValue { call, .. }
-        | Site::ProviderValue { call, .. }
-        | Site::TargetKey { call, .. }
-        | Site::StateKey { call, .. } => Some(call.callee.name()),
         Site::PluginNamespace { .. } | Site::PluginMember { .. } => Some("heph"),
-        _ => None,
+        site => site.call().map(|call| call.callee.name()),
     };
     let ast_degraded = match doc.ast {
         AstState::Current => None,
@@ -1455,15 +1452,22 @@ mod tests {
     #[test]
     fn site_target_rebound_by_def_and_by_assignment() {
         // The overlay carries the names; either binding disables the schema.
+        // Every site inside the call is shadowed, a field value included.
         for src in ["def target(**kw):\n    pass\n", "target = None\n"] {
-            let r = with_overlay(&format!("{src}target(dri│)\n"), &["target"]);
-            assert_eq!(kind(&r), "none");
-            assert_eq!(
-                r.reason,
-                Some(Reason::CalleeRebound {
-                    name: "target".to_string()
-                })
-            );
+            for call in [
+                "target(dri│)\n",
+                "target(name = \"x\", workdir = \"tr│\")\n",
+            ] {
+                let r = with_overlay(&format!("{src}{call}"), &["target"]);
+                assert_eq!(kind(&r), "none", "{call}");
+                assert_eq!(
+                    r.reason,
+                    Some(Reason::CalleeRebound {
+                        name: "target".to_string()
+                    }),
+                    "{call}"
+                );
+            }
         }
     }
 

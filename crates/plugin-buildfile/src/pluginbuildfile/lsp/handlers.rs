@@ -81,13 +81,18 @@ pub(crate) enum Merge {
     PassThrough,
     /// heph's items ranked first, the stock ones after them ([`prepend`]).
     Prepend,
+    /// Decided by the field's type ([`field_value`]): heph's items when it
+    /// has literals matching the prefix, which replace the stock ones;
+    /// otherwise the stock answer, untouched. Never both.
+    ByField,
 }
 
 /// The stock column of the site table.
 pub(crate) fn merge_for(site: &Site) -> Merge {
     match site {
         Site::None | Site::Callee { .. } => Merge::PassThrough,
-        Site::ArgKey { .. } | Site::FieldValue { .. } => Merge::Prepend,
+        Site::ArgKey { .. } => Merge::Prepend,
+        Site::FieldValue { .. } => Merge::ByField,
         _ => Merge::Replace,
     }
 }
@@ -182,7 +187,8 @@ fn item_kind(site: &Site) -> CompletionItemKind {
 /// The heph completion items for a site, conventions applied.
 pub(crate) fn items(site: &Site, ctx: &Ctx<'_>) -> Vec<CompletionItem> {
     let (candidates, edit, value): (Vec<Candidate>, Bytes<usize>, Option<&Str>) = match site {
-        // A prepend site: its items come from `prepend`, with the stock ones.
+        // Not a replace site: its items come from `prepend` / `field_value`,
+        // which also see the stock ones.
         Site::None | Site::Callee { .. } | Site::FieldValue { .. } => return Vec::new(),
         Site::TargetKey { call, edit, .. } => (target_keys(call, ctx), edit.clone(), None),
         Site::StateKey { call, edit, .. } => (state_keys(call, ctx), edit.clone(), None),
@@ -261,9 +267,6 @@ pub(crate) fn prepend(
     ctx: &Ctx<'_>,
     stock: Vec<CompletionItem>,
 ) -> Vec<CompletionItem> {
-    if let Site::FieldValue { call, key, value } = site {
-        return field_value_items(site, call, key, value, ctx, stock);
-    }
     let Site::ArgKey { call, edit, .. } = site else {
         return stock;
     };
@@ -289,14 +292,20 @@ pub(crate) fn prepend(
 /// `FieldValue` site): the literals its type accepts, replacing the stock
 /// items, which offer nothing inside a string. A field with no literals, or
 /// none matching the prefix, passes the stock answer through untouched.
-fn field_value_items(
+///
+/// A literal that cannot be inserted verbatim between quotes (one holding a
+/// quote, a backslash or a control character) is not offered, and neither is
+/// the empty one (`""`, which a parser may accept as "unset"): it would show
+/// as a blank item.
+pub(crate) fn field_value(
     site: &Site,
-    call: &Call,
-    key: &str,
-    value: &Str,
     ctx: &Ctx<'_>,
     stock: Vec<CompletionItem>,
 ) -> Vec<CompletionItem> {
+    let Site::FieldValue { call, key, value } = site else {
+        return stock;
+    };
+    let key = key.as_str();
     let field = match call.callee {
         Builtin::ProviderState => ctx
             .provider(call)
@@ -319,6 +328,12 @@ fn field_value_items(
     let candidates = ty
         .literals()
         .into_iter()
+        .filter(|l| {
+            !l.is_empty()
+                && !l
+                    .chars()
+                    .any(|c| matches!(c, '"' | '\'' | '\\') || c.is_control())
+        })
         .map(|l| Candidate {
             label: l.to_string(),
             detail: Some(format!("{key}: {rendered}")),
@@ -1318,7 +1333,32 @@ mod tests {
 
     #[test]
     fn every_site_has_a_merge_policy() {
+        let merge = |fixture: &str| {
+            let o = fixture.find('│').expect("cursor marker");
+            let text = fixture.replacen('│', "", 1);
+            let tokens = lex::lex(&text);
+            let doc = super::super::site::Doc {
+                text: &text,
+                tokens: &tokens,
+                overlay: None,
+                ast: super::super::site::AstState::Current,
+            };
+            let resolution = super::super::site::resolve(&doc, o);
+            (resolution.site.kind(), merge_for(&resolution.site))
+        };
         assert_eq!(merge_for(&Site::None), Merge::PassThrough);
+        assert_eq!(
+            merge("target(name = \"x\", driver = \"exec\", workdir = \"tr│\")\n"),
+            ("field_value", Merge::ByField)
+        );
+        assert_eq!(
+            merge("def f(alpha):\n    pass\n\nf(al│)\n"),
+            ("arg_key", Merge::Prepend)
+        );
+        assert_eq!(
+            merge("target(name = \"x\", driver = \"ex│\")\n"),
+            ("driver_value", Merge::Replace)
+        );
     }
 
     fn binding(src: &str, name: &str) -> Option<(String, String)> {

@@ -74,10 +74,13 @@ covers keyword names, driver and provider names, plugin namespaces and members,
 addresses, and load paths and symbols. The stock answer **passes through**
 only where heph cannot know: free expressions, locals, other value positions.
 
-`field_value` is decided by the field's type rather than the site: an enum
-field's literals **replace** the stock items (which offer nothing inside a
-string), and a field with no literal matching the prefix passes the stock
-answer through. Only a string is a `field_value`: before one, `workdir = │`
+`field_value` merges **by field**: the field's type decides, not the site. An
+enum field's literals matching the prefix **replace** the stock items (which
+offer nothing inside a string); a field with no such literal passes the stock
+answer through. It is one or the other, never both. A literal that cannot sit
+verbatim between quotes (a quote, a backslash, a control character) is not
+offered, and neither is `""` (a parser may accept it as "unset"), which would
+show as a blank item. Only a string is a `field_value`: before one, `workdir = │`
 is where a variable or an expression may start, and an unclosed `target(`
 above would make that position depend on the text after the cursor.
 

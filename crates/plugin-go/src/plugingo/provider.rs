@@ -614,24 +614,11 @@ impl Provider {
             doc: doc.to_string(),
             required: false,
         };
-        // Every list-valued key below is read with `parse_strings`, which takes a
-        // bare string as a one-element list.
-        let strs = || ParamType::union(vec![ParamType::String, ParamType::list(ParamType::String)]);
-        let variant_struct = ParamType::strukt(vec![
-            ("goos", ParamType::String),
-            ("goarch", ParamType::String),
-            ("tags", strs()),
-            ("goexperiment", strs()),
-            ("gcflags", strs()),
-            ("ldflags", strs()),
-            ("buildmode", factors::BuildMode::param_type()),
-            ("inherit", ParamType::String),
-        ]);
         Some(StateSchema {
             fields: vec![
                 field(
                     "variants",
-                    ParamType::map(variant_struct),
+                    ParamType::map(variant_ty()),
                     "Named Go build variants for this package (and its descendants, via \
                      closest-ancestor lookup). Maps a variant name to a static factor set: \
                      `goos`/`goarch` (required, unless inherited), plus optional `tags` \
@@ -674,25 +661,7 @@ impl Provider {
                 ),
                 field(
                     "test",
-                    ParamType::union(vec![
-                        ParamType::Bool,
-                        ParamType::strukt(vec![
-                            ("env", ParamType::map(ParamType::String)),
-                            ("pass_env", strs()),
-                            ("runtime_env", ParamType::map(ParamType::String)),
-                            ("runtime_pass_env", strs()),
-                            ("pre_run", strs()),
-                            ("runner", ParamType::String),
-                            (
-                                "resources",
-                                ParamType::map(ParamType::union(vec![
-                                    ParamType::Int,
-                                    ParamType::Float,
-                                    ParamType::String,
-                                ])),
-                            ),
-                        ]),
-                    ]),
+                    ParamType::union(vec![ParamType::Bool, test_state_ty()]),
                     "Test settings for this package. `test = False` skips its tests, \
                      `test = True` (or unset) runs them. \
                      The struct form configures the generated `test`/`xtest` run \
@@ -729,11 +698,7 @@ impl Provider {
                 ),
                 field(
                     "link",
-                    ParamType::strukt(vec![
-                        ("flags", strs()),
-                        ("deps", link_deps_param_type()),
-                        ("runtime_deps", link_deps_param_type()),
-                    ]),
+                    link_state_ty(),
                     "Link settings for a `main` package's `build` (binary) target. \
                      `flags` are passed verbatim to `go tool link`; `deps` are target \
                      addresses staged into the link sandbox (hashed inputs) that the \
@@ -1670,11 +1635,57 @@ const LINK_STATE_KEYS: &[&str] = &["flags", "deps", "runtime_deps"];
 /// `{group: addr | [addr, …]}` map naming dep groups. Mirrors the exec plugin's
 /// `deps` union so BUILD authors get the same shape everywhere.
 fn link_deps_param_type() -> ParamType {
-    let str_or_list = ParamType::union(vec![ParamType::String, ParamType::list(ParamType::String)]);
-    ParamType::union(vec![
-        ParamType::String,
-        ParamType::list(ParamType::String),
-        ParamType::map(str_or_list),
+    hplugin::htspec::flatten_union(vec![strs(), ParamType::map(strs())])
+}
+
+/// `string | list[string]`: what `parse_strings` takes (a bare string is a
+/// one-element list), which is what the spec decoding of a `Vec<String>` takes.
+fn strs() -> ParamType {
+    <Vec<String> as hplugin::htspec::FromSpecValue>::spec_param_type()
+}
+
+/// One entry of `variants`: the keys [`variant::VARIANT_KEYS`] lists, which a
+/// test holds to this.
+fn variant_ty() -> ParamType {
+    ParamType::strukt(vec![
+        ("goos", ParamType::String),
+        ("goarch", ParamType::String),
+        ("tags", strs()),
+        ("goexperiment", strs()),
+        ("gcflags", strs()),
+        ("ldflags", strs()),
+        ("buildmode", factors::BuildMode::param_type()),
+        ("inherit", ParamType::String),
+    ])
+}
+
+/// The struct form of `test`: the keys [`TEST_STATE_KEYS`] lists, which a test
+/// holds to this.
+fn test_state_ty() -> ParamType {
+    ParamType::strukt(vec![
+        ("env", ParamType::map(ParamType::String)),
+        ("pass_env", strs()),
+        ("runtime_env", ParamType::map(ParamType::String)),
+        ("runtime_pass_env", strs()),
+        ("pre_run", strs()),
+        ("runner", ParamType::String),
+        (
+            "resources",
+            ParamType::map(ParamType::union(vec![
+                ParamType::Int,
+                ParamType::Float,
+                ParamType::String,
+            ])),
+        ),
+    ])
+}
+
+/// `link`: the keys [`LINK_STATE_KEYS`] lists, which a test holds to this.
+fn link_state_ty() -> ParamType {
+    ParamType::strukt(vec![
+        ("flags", strs()),
+        ("deps", link_deps_param_type()),
+        ("runtime_deps", link_deps_param_type()),
     ])
 }
 
@@ -4194,6 +4205,31 @@ mod tests {
             pkg: "",
             root: std::path::Path::new("/"),
         }
+    }
+
+    /// The field names of a schema struct, sorted.
+    fn struct_keys(ty: &ParamType) -> Vec<String> {
+        let ParamType::Struct(fields) = ty else {
+            panic!("not a struct: {}", ty.render());
+        };
+        let mut keys: Vec<String> = fields.iter().map(|f| f.name.clone()).collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    fn sorted(keys: &[&str]) -> Vec<String> {
+        let mut keys: Vec<String> = keys.iter().map(|k| k.to_string()).collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    /// Each provider-state struct the LSP sees lists exactly the keys its
+    /// parser accepts (the lists the parsers check unknown keys against).
+    #[test]
+    fn state_schema_structs_list_exactly_the_keys_the_parsers_accept() {
+        assert_eq!(struct_keys(&variant_ty()), sorted(variant::VARIANT_KEYS));
+        assert_eq!(struct_keys(&test_state_ty()), sorted(TEST_STATE_KEYS));
+        assert_eq!(struct_keys(&link_state_ty()), sorted(LINK_STATE_KEYS));
     }
 
     /// A workspace with a nested module: `svc/go.mod` alongside the root one.

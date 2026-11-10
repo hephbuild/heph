@@ -384,6 +384,17 @@ mod tests {
                             doc: String::new(),
                             required: false,
                         },
+                        // An enum nested in a dict of structs, like go's
+                        // `variants`.
+                        DriverField {
+                            name: "variants".to_string(),
+                            ty: ParamType::map(ParamType::strukt(vec![(
+                                "buildmode",
+                                ParamType::Enum(vec!["exe".to_string(), "pie".to_string()]),
+                            )])),
+                            doc: String::new(),
+                            required: false,
+                        },
                     ],
                 }),
                 // A required field that collides with a base `target` field
@@ -504,6 +515,22 @@ mod tests {
                 .iter()
                 .any(|m| m.contains(r#"expects "caller" | "tree_root", got int"#))
         );
+    }
+
+    /// An enum inside a dict of structs is checked too, and the message names
+    /// the path to the bad literal.
+    #[test]
+    fn an_enum_nested_in_a_dict_of_structs_is_flagged() {
+        let src = |v: &str| {
+            format!("target(name = \"t\", driver = \"exec\", cmd = \"c\", variants = {v})\n")
+        };
+        let msgs = messages(&src(r#"{"v": {"buildmode": "bogus"}}"#));
+        assert!(
+            msgs.iter().any(|m| m.starts_with("`variants` expects")
+                && m.ends_with(r#"got map (`v.buildmode`: "bogus")"#)),
+            "{msgs:?}"
+        );
+        assert!(messages(&src(r#"{"v": {"buildmode": "pie"}}"#)).is_empty());
     }
 
     #[test]

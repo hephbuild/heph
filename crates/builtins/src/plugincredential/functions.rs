@@ -35,7 +35,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::present::Dialect;
-use super::source::{INLINE_KINDS, OIDC_PROVIDERS};
+use super::source::{InlineKind, OIDC_PROVIDERS};
 
 // ---------------------------------------------------------------------------
 // Signature helpers
@@ -94,7 +94,12 @@ pub(crate) fn source_ty() -> ParamType {
     ParamType::strukt(vec![
         (
             "kind",
-            ParamType::Enum(INLINE_KINDS.iter().map(|k| k.to_string()).collect()),
+            ParamType::Enum(
+                InlineKind::ALL
+                    .iter()
+                    .map(|k| k.name().to_string())
+                    .collect(),
+            ),
         ),
         ("when", ParamType::String),
         ("credentials", strs()),
@@ -113,6 +118,14 @@ pub(crate) fn source_ty() -> ParamType {
         ("provider", oidc_provider_ty()),
         ("audience", ParamType::String),
     ])
+}
+
+/// One entry of a credential's `sources`: a target address, or an inline
+/// source — the two shapes [`SourceDecl::parse`] dispatches on.
+///
+/// [`SourceDecl::parse`]: super::source::SourceDecl::parse
+pub(crate) fn source_entry_ty() -> ParamType {
+    ParamType::union(vec![ParamType::String, source_ty()])
 }
 
 /// The four fields every source constructor accepts, appended to its own named
@@ -716,7 +729,7 @@ mod tests {
     /// stands for.
     #[test]
     fn every_source_preset_parses_as_a_source() {
-        let mut cases: Vec<Case> = vec![
+        let cases: Vec<Case> = vec![
             (
                 "env",
                 vec![list(&["GITHUB_TOKEN"])],
@@ -773,12 +786,12 @@ mod tests {
                 vec![s("github_actions")],
                 vec![("audience", s("sts.amazonaws.com"))],
             ),
+            (
+                "exec",
+                vec![s("gh-token")],
+                vec![("login", list(&["gh", "auth", "login"]))],
+            ),
         ];
-        cases.push((
-            "exec",
-            vec![s("gh-token")],
-            vec![("login", list(&["gh", "auth", "login"]))],
-        ));
         for (name, positional, named) in cases {
             let v = call(name, positional, &named).unwrap_or_else(|e| panic!("{name}: {e:#}"));
             SourceDecl::parse(&v).unwrap_or_else(|e| panic!("{name} does not parse: {e:#}"));
@@ -870,18 +883,21 @@ mod tests {
                 ("names", s("T")),
                 ("present", m(vec![("helper", s("aws"))])),
             ]),
+            // A bare target address: the producer form.
+            s("//auth:vault"),
         ];
+        let entry = source_entry_ty();
         for v in cases {
             SourceDecl::parse(&v).unwrap_or_else(|e| panic!("{v:?} does not parse: {e:#}"));
-            assert!(
-                source_ty().matches(&v),
-                "{v:?} parses but the schema refuses it"
-            );
+            assert!(entry.matches(&v), "{v:?} parses but the schema refuses it");
         }
         // And the other direction, for the enums: a near-miss is refused by both.
         let typo = m(vec![("kind", s("execs")), ("run", s("x"))]);
         SourceDecl::parse(&typo).expect_err("unknown kind");
-        assert!(!source_ty().matches(&typo));
+        assert!(!entry.matches(&typo));
+        // Neither shape: refused by both.
+        SourceDecl::parse(&Value::Int(1)).expect_err("an int is no source");
+        assert!(!entry.matches(&Value::Int(1)));
     }
 
     /// `Presentation`'s own schema says what `parse_helper` takes, string form
@@ -892,6 +908,30 @@ mod tests {
         let rendered = schema.render();
         assert!(rendered.contains("\"kubernetes\""), "{rendered}");
         assert!(rendered.contains("registries"), "{rendered}");
+    }
+
+    /// `helper_ty`'s dict form lists exactly `Helper`'s fields (the keys its
+    /// derive parses, read off its serialized form), so neither can gain a key
+    /// the other lacks.
+    #[test]
+    fn helper_ty_dict_lists_exactly_helpers_fields() {
+        use crate::plugincredential::present::Helper;
+        let ParamType::Union(members) = helper_ty() else {
+            panic!("helper is a dialect or a dict");
+        };
+        let ParamType::Struct(fields) = &members[1] else {
+            panic!("the dict form is a struct");
+        };
+        let mut schema: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+        schema.sort_unstable();
+        let serde_json::Value::Object(helper) =
+            serde_json::to_value(Helper::default()).expect("serialize Helper")
+        else {
+            panic!("Helper serializes to an object");
+        };
+        let mut parsed: Vec<&str> = helper.keys().map(String::as_str).collect();
+        parsed.sort_unstable();
+        assert_eq!(schema, parsed);
     }
 
     #[test]

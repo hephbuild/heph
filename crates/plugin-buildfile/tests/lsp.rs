@@ -180,12 +180,30 @@ impl LspEngine for FakeEngine {
     }
     fn provider_state_schema(&self, name: &str) -> Option<StateSchema> {
         (name == "go").then(|| StateSchema {
-            fields: vec![StateField {
-                name: "go_codegen_root".to_string(),
-                ty: ParamType::Bool,
-                doc: "Mark this package as a Go codegen root.".to_string(),
-                required: false,
-            }],
+            fields: vec![
+                StateField {
+                    name: "go_codegen_root".to_string(),
+                    ty: ParamType::Bool,
+                    doc: "Mark this package as a Go codegen root.".to_string(),
+                    required: false,
+                },
+                // A `bool | enum` union whose literals include ones that
+                // cannot be offered: the empty string, and two that cannot
+                // sit verbatim between quotes.
+                StateField {
+                    name: "buildmode".to_string(),
+                    ty: ParamType::union(vec![
+                        ParamType::Bool,
+                        ParamType::Enum(
+                            ["", "default", "pie", "say\"hi", "tab\tbed"]
+                                .map(String::from)
+                                .to_vec(),
+                        ),
+                    ]),
+                    doc: "How the package is built.".to_string(),
+                    required: false,
+                },
+            ],
         })
     }
     fn provider_options(&self, _name: &str) -> hplugin::config::Options {
@@ -1080,7 +1098,10 @@ fn completion_in_provider_state_offers_provider_then_schema() {
     assert_eq!(labels(&lsp.completion(&doc)), vec!["provider"]);
 
     let doc = lsp.open("chosen/BUILD", "provider_state(provider = \"go\", │)\n");
-    assert_eq!(labels(&lsp.completion(&doc)), vec!["go_codegen_root"]);
+    assert_eq!(
+        labels(&lsp.completion(&doc)),
+        vec!["buildmode", "go_codegen_root"]
+    );
 }
 
 #[test]
@@ -2243,6 +2264,68 @@ fn a_field_value_without_literals_passes_the_stock_answer_through() {
         "target(name = \"x\", driver = \"exec\", deps = \"//li│\")\n",
     );
     assert_eq!(kind(&lsp.explain(&doc)), "address");
+}
+
+/// A `provider_state(` field's string completes from the provider's schema,
+/// through a `bool | enum` union, never offering a literal that cannot be
+/// typed between quotes (`""`, one holding a quote or a control character).
+/// An unknown provider passes the stock answer through.
+#[test]
+fn completion_in_a_provider_state_enum_field_offers_its_literals() {
+    let mut lsp = Lsp::start();
+    let pre = "provider_state(provider = \"go\", buildmode = ";
+    let doc = lsp.open("BUILD", &format!("{pre}\"│\")\n"));
+    assert_eq!(kind(&lsp.explain(&doc)), "field_value");
+    assert_eq!(labels(&lsp.completion(&doc)), ["default", "pie"]);
+
+    let doc = lsp.open("p/BUILD", &format!("{pre}\"p│\")\n"));
+    let result = lsp.completion(&doc);
+    assert_eq!(labels(&result), ["pie"]);
+    assert_eq!(
+        apply(&doc.text, &item(&result, "pie")),
+        format!("{pre}\"pie\")\n")
+    );
+    // Only unofferable literals start with `s` / `t`: stock.
+    for (i, prefix) in ["s", "t"].iter().enumerate() {
+        let doc = lsp.open(&format!("s{i}/BUILD"), &format!("{pre}\"{prefix}│\")\n"));
+        assert!(heph_items(&lsp.completion(&doc)).is_empty(), "{prefix}");
+    }
+
+    let doc = lsp.open(
+        "u/BUILD",
+        "provider_state(provider = \"nope\", buildmode = \"p│\")\n",
+    );
+    assert_eq!(kind(&lsp.explain(&doc)), "field_value");
+    assert!(heph_items(&lsp.completion(&doc)).is_empty());
+}
+
+/// Corner rows of a field's string: non-ASCII or an escape before the cursor
+/// (no panic, nothing offered, since no literal starts with that text), and a
+/// cursor in the middle of a closed literal (the edit replaces the whole
+/// content).
+#[test]
+fn completion_in_a_field_value_corner_cases() {
+    let mut lsp = Lsp::start();
+    let pre = "target(name = \"x\", driver = \"exec\", workdir = ";
+    for (i, value) in ["\"é│\")", "\"tree\\x5f│\")"].iter().enumerate() {
+        let doc = lsp.open(&format!("c{i}/BUILD"), &format!("{pre}{value}\n"));
+        let result = lsp.completion(&doc);
+        assert!(result.is_array(), "{value}: {result}");
+        assert!(heph_items(&result).is_empty(), "{value}: {result}");
+    }
+
+    let doc = lsp.open("m/BUILD", &format!("{pre}\"tree_│root\")\n"));
+    assert_eq!(kind(&lsp.explain(&doc)), "field_value");
+    let result = lsp.completion(&doc);
+    assert_eq!(labels(&result), ["tree_package", "tree_root"]);
+    assert_eq!(
+        apply(&doc.text, &item(&result, "tree_root")),
+        format!("{pre}\"tree_root\")\n")
+    );
+    assert_eq!(
+        apply(&doc.text, &item(&result, "tree_package")),
+        format!("{pre}\"tree_package\")\n")
+    );
 }
 
 #[test]

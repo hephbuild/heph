@@ -146,6 +146,9 @@ message ParamType {
   // (`ParamType::Enum`); empty is any string. Outside the oneof so a peer that
   // predates it (ABI < 0.19.2) skips the field and reads a plain string —
   // looser, never wrong. Non-empty with any other kind is a decode error.
+  // Changing field 6's meaning (e.g. literals on another kind) is a minor ABI
+  // bump with `MIN_PLUGIN_ABI` raised, not a patch: an older peer would read
+  // the new meaning as the old one.
   repeated string literals = 6;
 }
 
