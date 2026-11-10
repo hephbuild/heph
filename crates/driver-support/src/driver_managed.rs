@@ -492,6 +492,73 @@ fn collect_outputs_inner(
     Ok(artifacts)
 }
 
+/// The name prefix of a write-back tar (`writeback-<hashin>-<group>.tar`).
+/// An `out` tar's name starts with its hex `hashin`, so the two namespaces
+/// never meet, whatever the groups are called.
+pub const WRITE_BACK_TAR_PREFIX: &str = "writeback-";
+
+/// Pack the `in_place` paths a failed run writes back (D16, D18): every
+/// collected path whose mode is `InPlace { write_on_failure: true }`, one tar
+/// per group, named under [`WRITE_BACK_TAR_PREFIX`].
+///
+/// **Lenient**, unlike [`collect_outputs`]: a declared file or directory the
+/// run never wrote is skipped, so a fixer that died before one file keeps
+/// every other fix. A path that exists with the wrong kind is still an error.
+/// A group none of whose paths exist packs nothing.
+pub(crate) fn collect_write_back_inner(
+    target_outputs: &[hplugin::driver::targetdef::Output],
+    hashin: &str,
+    ws_dir: &Path,
+    sandbox_dir: &Path,
+) -> anyhow::Result<Vec<outputartifact::OutputArtifact>> {
+    let prefixed = format!("{WRITE_BACK_TAR_PREFIX}{hashin}");
+    let mut artifacts = Vec::new();
+    for output in target_outputs {
+        let mut tar: Option<hartifactcontent::tar::TarPacker> = None;
+        for path in output
+            .paths
+            .iter()
+            .filter(|p| p.collect && crate::failure_out::writes_back_on_failure(&p.codegen_tree))
+        {
+            if let Content::FilePath(p) | Content::DirPath(p) = &path.content {
+                match fs::symlink_metadata(ws_dir.join(p)) {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                        tracing::debug!(path = %p, group = %output.group, "in_place output missing after a failed run; skipped");
+                        continue;
+                    }
+                    Err(e) => {
+                        return Err(e).with_context(|| {
+                            format!("lstat in_place output {p:?} (group={})", output.group)
+                        });
+                    }
+                }
+            }
+            add_path_to_tar(
+                tar.get_or_insert_with(hartifactcontent::tar::TarPacker::new),
+                ws_dir,
+                path,
+                &output.group,
+                &|| false,
+            )?;
+        }
+        let Some(tar) = tar else {
+            continue;
+        };
+        let (tarpath, hashout) = pack_to_artifact_tar(sandbox_dir, &prefixed, &output.group, tar, &|| false)?;
+        artifacts.push(outputartifact::OutputArtifact {
+            group: output.group.clone(),
+            name: format!("{}.tar", output.group),
+            r#type: outputartifact::Type::Output,
+            // Borrowed: a write-back is read over the tree, never moved into
+            // the cache.
+            content: TarPath(ContentPath::borrowed(tarpath)),
+            hashout,
+        });
+    }
+    Ok(artifacts)
+}
+
 /// Input annotation key opting a dep into source_map.json generation.
 /// Absent (the default) means the input is excluded — source_map.json is
 /// only emitted for targets whose inputs explicitly request it (e.g. the

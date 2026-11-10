@@ -166,6 +166,16 @@ impl ManagedDriverOs {
             // Here, while the sandbox is live and before the stage holds drop:
             // a staged input the target listed is still linked.
             Err(err) => {
+                let err = crate::failure_out::keep_failure_write_back(
+                    err,
+                    target,
+                    hashin,
+                    shell,
+                    ctoken,
+                    &ws_dir,
+                    &sandbox_dir,
+                )
+                .await;
                 return Err(crate::failure_out::keep_failure_outputs(
                     err,
                     &target.failure_outputs,

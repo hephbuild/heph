@@ -169,6 +169,16 @@ impl ManagedDriverFuse {
             // that outlives the slot, for the engine to rename into the
             // failure slot.
             Err(err) => {
+                let err = hdriver_support::failure_out::keep_failure_write_back(
+                    err,
+                    target,
+                    hashin,
+                    shell,
+                    ctoken,
+                    &ws_dir,
+                    &plain_sandbox_dir,
+                )
+                .await;
                 return Err(hdriver_support::failure_out::keep_failure_outputs(
                     err,
                     &target.failure_outputs,

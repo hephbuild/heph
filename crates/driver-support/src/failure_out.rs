@@ -27,8 +27,8 @@
 
 use anyhow::Context as _;
 use hcore::hasync::Cancellable;
-use hplugin::driver::targetdef::FailureOutput;
-use hplugin::driver::targetdef::path::Content;
+use hplugin::driver::targetdef::path::{CodegenMode, Content};
+use hplugin::driver::targetdef::{FailureOutput, TargetDef};
 use hplugin::error::Exit;
 use std::collections::BTreeSet;
 use std::fs;
@@ -60,6 +60,86 @@ pub fn kept_failure_exit(
         return None;
     }
     hplugin::error::process_exit(err).filter(|e| e.is_failure_status())
+}
+
+/// Whether a path in `mode` is written back over the tree after a failed run:
+/// `InPlace { write_on_failure: true }` (exec's `in_place`, `go_format`).
+pub fn writes_back_on_failure(mode: &CodegenMode) -> bool {
+    matches!(
+        mode,
+        CodegenMode::InPlace {
+            write_on_failure: true
+        }
+    )
+}
+
+/// Whether `target` has any path [`writes_back_on_failure`].
+pub fn target_writes_back_on_failure(target: &TargetDef) -> bool {
+    target
+        .outputs
+        .iter()
+        .flat_map(|o| o.paths.iter())
+        .any(|p| writes_back_on_failure(&p.codegen_tree))
+}
+
+/// D8: the exits a write-back on failure follows — a code from 1 to 127.
+/// A signal, or a code of 128 and above (bash's report of a killed child: 137
+/// for an OOM kill, 143 for a timeout), may have cut a fixer off mid-write.
+pub fn write_back_exit(exit: Exit) -> bool {
+    matches!(exit, Exit::Code(1..=127))
+}
+
+/// The managed layer's half of the D16 write-back predicate:
+/// [`kept_failure_exit`] narrowed to [`write_back_exit`].
+///
+/// `--frozen` is not a property of the run request, so the managed layer
+/// cannot see it, nor a hash-only request (which never runs a driver at all):
+/// the engine re-checks the whole predicate before writing anything.
+pub fn write_back_on_failure_exit(
+    err: &anyhow::Error,
+    shell: bool,
+    ctoken: &(dyn Cancellable + Send + Sync),
+) -> Option<Exit> {
+    kept_failure_exit(err, shell, ctoken).filter(|e| write_back_exit(*e))
+}
+
+/// Collect the fixes a failed `in_place` run left behind and attach them to
+/// `err` as a [`FailureWriteBack`](hplugin::error::FailureWriteBack), for the
+/// engine to write over the tree.
+///
+/// Only when [`write_back_on_failure_exit`] holds and the target has a
+/// [`writes_back_on_failure`] path; a target without one pays nothing. The
+/// tars are packed under `tar_parent` (a directory that outlives the run's
+/// slot guards), leniently (D18). Never another error in `err`'s place: a
+/// collect error is a `warn!` and one context line (I7).
+pub async fn keep_failure_write_back(
+    err: anyhow::Error,
+    target: &TargetDef,
+    hashin: &str,
+    shell: bool,
+    ctoken: &(dyn Cancellable + Send + Sync),
+    ws_dir: &Path,
+    tar_parent: &Path,
+) -> anyhow::Error {
+    if !target_writes_back_on_failure(target)
+        || write_back_on_failure_exit(&err, shell, ctoken).is_none()
+    {
+        return err;
+    }
+    let outputs = target.outputs.clone();
+    let hashin = hashin.to_owned();
+    let (ws_dir, tar_parent) = (ws_dir.to_path_buf(), tar_parent.to_path_buf());
+    let collected = hcore::blocking::run(move || {
+        crate::driver_managed::collect_write_back_inner(&outputs, &hashin, &ws_dir, &tar_parent)
+    })
+    .await;
+    match collected {
+        Ok(artifacts) => hplugin::error::with_failure_write_back(err, artifacts),
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "collecting in_place fixes of a failed run");
+            err.context(format!("in_place fixes not written: {e:#}"))
+        }
+    }
 }
 
 /// Keep `outputs`' matches for a failed run: copy them out of `ws_dir` into
@@ -454,6 +534,176 @@ mod tests {
                 "{gone} must not be copied"
             );
         }
+    }
+
+    fn process_failed(exit: Exit) -> anyhow::Error {
+        anyhow::Error::new(hplugin::error::ProcessFailed::new(
+            format!("{exit:?}"),
+            Some(exit),
+        ))
+    }
+
+    /// D16 and D8: only a clean exit code from 1 to 127, never under
+    /// `--shell`, never cancelled, never without a process exit.
+    #[test]
+    fn write_back_predicate() {
+        let live = hcore::hasync::StdCancellationToken::new();
+        let cancelled = hcore::hasync::StdCancellationToken::new();
+        cancelled.cancel();
+        let cases: [(&str, anyhow::Error, bool, bool, bool); 9] = [
+            ("exit 1", process_failed(Exit::Code(1)), false, false, true),
+            (
+                "exit 127",
+                process_failed(Exit::Code(127)),
+                false,
+                false,
+                true,
+            ),
+            (
+                "exit 128",
+                process_failed(Exit::Code(128)),
+                false,
+                false,
+                false,
+            ),
+            (
+                "exit 137",
+                process_failed(Exit::Code(137)),
+                false,
+                false,
+                false,
+            ),
+            (
+                "SIGKILL",
+                process_failed(Exit::Signal(9)),
+                false,
+                false,
+                false,
+            ),
+            ("exit 0", process_failed(Exit::Code(0)), false, false, false),
+            (
+                "shell exit 1",
+                process_failed(Exit::Code(1)),
+                true,
+                false,
+                false,
+            ),
+            (
+                "cancelled exit 1",
+                process_failed(Exit::Code(1)),
+                false,
+                true,
+                false,
+            ),
+            (
+                "no process exit",
+                anyhow::anyhow!("sandbox prep"),
+                false,
+                false,
+                false,
+            ),
+        ];
+        for (name, err, shell, cancel, want) in cases {
+            let ct: &(dyn Cancellable + Send + Sync) = if cancel { &cancelled } else { &live };
+            assert_eq!(
+                write_back_on_failure_exit(&err, shell, ct).is_some(),
+                want,
+                "{name}"
+            );
+        }
+        assert!(writes_back_on_failure(&CodegenMode::InPlace {
+            write_on_failure: true
+        }));
+        for mode in [
+            CodegenMode::None,
+            CodegenMode::Copy,
+            CodegenMode::InPlace {
+                write_on_failure: false,
+            },
+        ] {
+            assert!(!writes_back_on_failure(&mode), "{mode:?}");
+        }
+    }
+
+    fn in_place(
+        group: &str,
+        paths: Vec<(Content, CodegenMode)>,
+    ) -> hplugin::driver::targetdef::Output {
+        hplugin::driver::targetdef::Output {
+            group: group.to_owned(),
+            paths: paths
+                .into_iter()
+                .map(
+                    |(content, codegen_tree)| hplugin::driver::targetdef::path::Path {
+                        content,
+                        codegen_tree,
+                        collect: true,
+                    },
+                )
+                .collect(),
+        }
+    }
+
+    const WRITE: CodegenMode = CodegenMode::InPlace {
+        write_on_failure: true,
+    };
+
+    /// D18: a declared path the failed run never wrote is skipped, and the
+    /// rest of the group is still packed; only `write_on_failure` paths are
+    /// packed, under the `writeback-` namespace; a group with nothing present
+    /// packs no tar.
+    #[test]
+    fn write_back_collection_is_lenient() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ws = tmp.path().join("ws");
+        write(&ws.join("app/a.go"), "a");
+        write(&ws.join("app/gen/x.go"), "x");
+        write(&ws.join("app/on_success.go"), "s");
+        let sandbox = tmp.path().join("sandbox");
+        let outputs = vec![
+            in_place(
+                "",
+                vec![
+                    (Content::FilePath("app/a.go".into()), WRITE),
+                    (Content::FilePath("app/missing.go".into()), WRITE),
+                    (Content::DirPath("app/gen".into()), WRITE),
+                    (Content::DirPath("app/nodir".into()), WRITE),
+                    (Content::Glob("app/none/*.go".into()), WRITE),
+                    (
+                        Content::FilePath("app/on_success.go".into()),
+                        CodegenMode::InPlace {
+                            write_on_failure: false,
+                        },
+                    ),
+                ],
+            ),
+            in_place(
+                "gone",
+                vec![(Content::FilePath("app/gone.go".into()), WRITE)],
+            ),
+        ];
+        let arts = crate::driver_managed::collect_write_back_inner(&outputs, "abc", &ws, &sandbox)
+            .expect("collect");
+        assert_eq!(arts.len(), 1, "the all-missing group packs nothing");
+        let art = &arts[0];
+        let hplugin::driver::outputartifact::Content::TarPath(tar) = &art.content else {
+            panic!("a tar");
+        };
+        assert!(
+            Path::new(&tar.path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(crate::driver_managed::WRITE_BACK_TAR_PREFIX)),
+            "{}",
+            tar.path
+        );
+        let mut names: Vec<String> = hcore::hartifactcontent::Content::entry_paths(art)
+            .expect("entries")
+            .into_iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["app/a.go", "app/gen/x.go"]);
     }
 
     /// A follow root lets a link into the shared stage be copied — as bytes in
