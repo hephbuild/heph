@@ -1404,4 +1404,81 @@ mod tests {
         );
         assert!(!staging.exists(), "the staging copy is freed");
     }
+
+    /// The `.tmp-` directories under the slots root.
+    fn temp_dirs(root: &Path) -> Vec<String> {
+        std::fs::read_dir(root)
+            .expect("ls")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(TEMP_PREFIX))
+            .collect()
+    }
+
+    /// D17: a fill dropped mid-way — the request cancelled while the blocking
+    /// job moves `out/` into the slot — leaves no `.tmp-` directory behind.
+    /// The job is detached, not killed: it runs to the end on its own and
+    /// renames the slot into place.
+    #[tokio::test]
+    async fn cancel_mid_fill_leaves_no_tmp_dir() {
+        use std::sync::{Condvar, Mutex, PoisonError};
+        // `SlotIo` holds plain fns, so the gate is a static; only this test
+        // uses it.
+        static ENTERED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+        static RELEASE: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
+        let gated = SlotIo {
+            rename: |from, to| {
+                ENTERED.notify_one();
+                let (lock, cvar) = &RELEASE;
+                let mut released = lock.lock().unwrap_or_else(PoisonError::into_inner);
+                while !*released {
+                    released = cvar
+                        .wait(released)
+                        .unwrap_or_else(PoisonError::into_inner);
+                }
+                drop(released);
+                std::fs::rename(from, to)
+            },
+            ..SlotIo::REAL
+        };
+        let home = tempfile::tempdir().expect("home");
+        let sandbox = tempfile::tempdir().expect("sandbox");
+        let slots = FailureSlots::new(home.path());
+        let a = addr("//p:a");
+        let staging = stage(sandbox.path());
+        let err = with_failure_artifacts(
+            anyhow::anyhow!("boom"),
+            vec![out_artifact(&staging), raw_log(b"why\n")],
+        );
+        tokio::select! {
+            _ = fill_ops(&slots, &a, sandbox.path(), &err, false, gated) => {
+                panic!("the fill finished past a closed gate");
+            }
+            () = ENTERED.notified() => {}
+        }
+        // The fill's future is gone; its job is parked in `out/`'s move.
+        assert_eq!(
+            temp_dirs(slots.root()).len(),
+            1,
+            "the job is mid-fill, its temporary in place"
+        );
+
+        {
+            let (lock, cvar) = &RELEASE;
+            *lock.lock().unwrap_or_else(PoisonError::into_inner) = true;
+            cvar.notify_all();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while slots.read(&a).is_none() || !temp_dirs(slots.root()).is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the detached fill never finished: {:?}",
+                temp_dirs(slots.root())
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let dir = slots.slot_dir(&a);
+        assert!(dir.join("out/pkg/report/index.html").is_file());
+        assert_eq!(std::fs::read(dir.join(LOG)).expect("log"), b"why\n");
+        assert!(temp_dirs(slots.root()).is_empty(), "no `.tmp-` left behind");
+    }
 }
