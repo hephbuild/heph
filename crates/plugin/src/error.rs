@@ -496,6 +496,49 @@ pub fn failure_log(err: &anyhow::Error) -> Option<&OutputArtifact> {
         .find(|a| a.r#type == ArtifactType::Log)
 }
 
+/// The name of the [`FailureArtifacts`] entry that carries a failed run's
+/// `failure_out` matches: a directory, already copied out of the tree the run
+/// wrote, laid out by workspace-relative path.
+pub const FAILURE_OUT_NAME: &str = "failure_out";
+
+/// The [`FailureArtifacts`] entry for the staged `failure_out` directory at
+/// `dir`: an `Output` artifact named [`FAILURE_OUT_NAME`] whose `File` content
+/// is the directory. No new artifact type and no new wire kind — an
+/// `OutputArtifact` of any type already crosses the plugin ABI on a
+/// `RunFailure`, and only [`failure_out_dir`] reads it back. `None` when the
+/// path is not UTF-8, which an artifact cannot name.
+pub fn failure_out_artifact(dir: &std::path::Path) -> Option<OutputArtifact> {
+    Some(OutputArtifact {
+        group: String::new(),
+        name: FAILURE_OUT_NAME.to_string(),
+        r#type: ArtifactType::Output,
+        content: OaContent::File(ContentFile {
+            source_path: dir.to_str()?.to_string(),
+            out_path: FAILURE_OUT_NAME.to_string(),
+            x: false,
+            // A copy in the sandbox, never a workspace file.
+            passthrough: false,
+        }),
+        hashout: String::new(),
+    })
+}
+
+/// The staged `failure_out` directory the failure carries, if any (see
+/// [`failure_out_artifact`]).
+pub fn failure_out_dir(err: &anyhow::Error) -> Option<&str> {
+    failure_artifacts(err)?
+        .0
+        .iter()
+        .find_map(|a| match &a.content {
+            OaContent::File(f)
+                if a.r#type == ArtifactType::Output && a.name == FAILURE_OUT_NAME =>
+            {
+                Some(f.source_path.as_str())
+            }
+            _ => None,
+        })
+}
+
 impl fmt::Display for RemoteProcessFailed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.message)
@@ -537,6 +580,9 @@ pub struct TargetFailure {
     /// failure slot (open, with its path for the box's `full log:` footer), or
     /// the tail in memory when no copy is kept.
     pub log: Option<FailureLog>,
+    /// The `out/` directory of the target's failure slot, when the failed run
+    /// kept `failure_out` matches there: what the box prints as `outputs:`.
+    pub outputs: Option<std::path::PathBuf>,
     pub source: std::sync::Arc<anyhow::Error>,
 }
 
@@ -546,6 +592,7 @@ impl TargetFailure {
             addr,
             log_tail,
             log: None,
+            outputs: None,
             source: std::sync::Arc::new(source),
         }
     }
@@ -553,6 +600,12 @@ impl TargetFailure {
     /// The same failure with the log its tail came from.
     pub fn with_log(mut self, log: Option<FailureLog>) -> Self {
         self.log = log;
+        self
+    }
+
+    /// The same failure with the slot's `out/` directory, when one was kept.
+    pub fn with_outputs(mut self, outputs: Option<std::path::PathBuf>) -> Self {
+        self.outputs = outputs;
         self
     }
 }

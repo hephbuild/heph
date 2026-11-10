@@ -149,7 +149,7 @@ impl ManagedDriverOs {
         let target = req.target;
         let hashin = req.hashin;
 
-        let mut res = invoke_inner(
+        let invoked = invoke_inner(
             &**self.driver,
             req,
             ctoken,
@@ -160,7 +160,24 @@ impl ManagedDriverOs {
             inputs,
             &self.shell_fallback,
         )
-        .await?;
+        .await;
+        let mut res = match invoked {
+            Ok(res) => res,
+            // Here, while the sandbox is live and before the stage holds drop:
+            // a staged input the target listed is still linked.
+            Err(err) => {
+                return Err(crate::failure_out::keep_failure_outputs(
+                    err,
+                    &target.failure_outputs,
+                    shell,
+                    ctoken,
+                    &ws_dir,
+                    &sandbox_dir,
+                    self.stage_dir.as_slice(),
+                )
+                .await);
+            }
+        };
 
         // The stage holds ride out with the response: the engine drops them
         // with the rest of the run's guards, after it has read the sandbox.
@@ -214,8 +231,9 @@ mod tests {
         ParseRequest, ParseResponse,
     };
 
-    /// A driver whose run succeeds or fails, and does nothing else.
-    struct Outcome(bool);
+    /// A driver whose run writes `report.txt` into its package dir, then
+    /// succeeds (`None`) or fails with the error the function makes.
+    struct Outcome(Option<fn() -> anyhow::Error>);
 
     #[async_trait]
     impl ManagedDriver for Outcome {
@@ -245,24 +263,132 @@ mod tests {
         }
         async fn run<'a, 'io>(
             &self,
-            _: ManagedRunRequest<'a, 'io>,
+            req: ManagedRunRequest<'a, 'io>,
             _: &(dyn Cancellable + Send + Sync),
         ) -> anyhow::Result<ManagedRunResponse> {
-            anyhow::ensure!(self.0, "the run failed");
-            Ok(ManagedRunResponse { artifacts: vec![] })
+            fs::write(req.sandbox_pkg_dir.join("report.txt"), "report")?;
+            match self.0 {
+                Some(fail) => Err(fail()),
+                None => Ok(ManagedRunResponse { artifacts: vec![] }),
+            }
+        }
+        fn supports_shell(&self) -> bool {
+            true
+        }
+        async fn run_shell<'a, 'io>(
+            &self,
+            req: ManagedRunRequest<'a, 'io>,
+            ct: &(dyn Cancellable + Send + Sync),
+        ) -> anyhow::Result<ManagedRunResponse> {
+            self.run(req, ct).await
         }
     }
 
     fn os(ok: bool, stage: &std::path::Path) -> ManagedDriverOs {
+        os_failing(
+            (!ok).then_some((|| anyhow::anyhow!("the run failed")) as fn() -> anyhow::Error),
+            stage,
+        )
+    }
+
+    fn os_failing(fail: Option<fn() -> anyhow::Error>, stage: &std::path::Path) -> ManagedDriverOs {
         let fallback = Arc::new(ShellFallback {
-            driver: Arc::new(Outcome(true)),
+            driver: Arc::new(Outcome(None)),
             spec_template: Arc::new(hplugin::provider::TargetSpec::default()),
         });
         ManagedDriverOs {
-            driver: Arc::new(Box::new(Outcome(ok))),
+            driver: Arc::new(Box::new(Outcome(fail))),
             shell_fallback: fallback,
             stage_dir: Some(stage.to_path_buf()),
         }
+    }
+
+    /// A def in `//app` that keeps `app/report.txt` on failure.
+    fn keeps_report() -> TargetDef {
+        TargetDef {
+            addr: hmodel::htaddr::parse_addr("//app:t").expect("addr"),
+            failure_outputs: vec![hplugin::driver::targetdef::FailureOutput {
+                group: String::new(),
+                paths: vec![hplugin::driver::targetdef::path::Content::FilePath(
+                    "app/report.txt".to_string(),
+                )],
+            }],
+            ..TargetDef::default()
+        }
+    }
+
+    /// A failure no process exit is behind — a driver's or heph's own, before
+    /// or around the run — keeps nothing, and neither does a cancelled run or a
+    /// `--shell`; a process exit keeps the report, as a copy under the
+    /// sandbox's staging dir (Surface table, I8).
+    #[tokio::test]
+    async fn failure_without_exit_collects_nothing() -> anyhow::Result<()> {
+        use hplugin::error::{Exit, ProcessFailed};
+        let tmp = tempfile::tempdir()?;
+        let stage = tmp.path().join("stage");
+        let target = keeps_report();
+        let id = "t".to_string();
+        let exit1: fn() -> anyhow::Error =
+            || anyhow::Error::new(ProcessFailed::new("exit status: 1", Some(Exit::Code(1))));
+        let no_exit: fn() -> anyhow::Error = || anyhow::anyhow!("credential source failed");
+        let unknown_exit: fn() -> anyhow::Error =
+            || anyhow::Error::new(ProcessFailed::new("exit status: ?", None));
+
+        let run = |name: &'static str, fail: fn() -> anyhow::Error, cancel: bool, shell: bool| {
+            let sandbox = tmp.path().join(name);
+            let os = os_failing(Some(fail), &stage);
+            let target = &target;
+            let id = &id;
+            async move {
+                let ct = StdCancellationToken::new();
+                if cancel {
+                    ct.cancel();
+                }
+                let req = RunRequest::new(id, target, sandbox.clone());
+                let err = match os.run_inner(req, &ct, shell).await {
+                    Ok(_) => anyhow::bail!("{name}: the run must fail"),
+                    Err(e) => e,
+                };
+                anyhow::Ok((err, sandbox))
+            }
+        };
+
+        for (name, fail, cancel, shell) in [
+            ("no-exit", no_exit, false, false),
+            ("unknown-exit", unknown_exit, false, false),
+            ("cancelled", exit1, true, false),
+            ("shell", exit1, false, true),
+        ] {
+            let (err, sandbox) = run(name, fail, cancel, shell).await?;
+            assert_eq!(hplugin::error::failure_out_dir(&err), None, "{name}");
+            assert!(
+                !sandbox
+                    .join(crate::failure_out::FAILURE_OUT_STAGING)
+                    .exists(),
+                "{name}: nothing staged"
+            );
+            assert!(
+                sandbox.join("ws/app/report.txt").exists(),
+                "{name}: the run did write it"
+            );
+        }
+
+        let (err, sandbox) = run("exit-1", exit1, false, false).await?;
+        let staged = sandbox.join(crate::failure_out::FAILURE_OUT_STAGING);
+        assert_eq!(
+            hplugin::error::failure_out_dir(&err).map(std::path::PathBuf::from),
+            Some(staged.clone())
+        );
+        assert_eq!(
+            std::fs::read_to_string(staged.join("app/report.txt"))?,
+            "report"
+        );
+        assert_eq!(
+            hplugin::error::process_exit(&err),
+            Some(Exit::Code(1)),
+            "the target's own error is still there"
+        );
+        Ok(())
     }
 
     fn read_only_input() -> RunInput {
