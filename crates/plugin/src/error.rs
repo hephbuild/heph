@@ -614,8 +614,9 @@ pub enum FixesNotWritten {
     /// The run exited 128 or above, a shell's report of a killed child
     /// (137 for an OOM kill, 143 for a timeout).
     HighExit(i32),
-    /// An `in_place` source moved while the run read it, or could not be
-    /// confirmed unchanged (I5): writing would discard the newer bytes.
+    /// An `in_place` source moved while the run read it (I5): writing would
+    /// discard the newer bytes. A guard that could not run at all is not
+    /// this; it is reported as a failed write on the error instead.
     MovedSource,
     /// `--frozen`: the run verifies the tree, it never writes it.
     Frozen,
