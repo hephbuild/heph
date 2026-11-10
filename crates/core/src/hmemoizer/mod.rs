@@ -424,27 +424,68 @@ impl fmt::Display for SharedAnyhow {
 }
 
 /// Write `e`'s cause chain as anyhow's alternate `{:#}` does — each frame's
-/// `Display`, joined with `": "` — but skipping a frame that renders empty.
+/// `Display`, joined with `": "` — but writing each cause's text once.
 ///
-/// A frame with an empty `Display` is data riding the chain (a context carrying
-/// a failure's artifacts), not a cause; `{:#}` would render it as a stray `: :`.
+/// - A frame with an empty `Display` is data riding the chain (a context
+///   carrying a failure's artifacts), not a cause; `{:#}` would render it as a
+///   stray `: :`.
+/// - A frame whose `Display` already ends with its source's (most of
+///   object_store's errors: `"Error performing token request: {source}"`) is
+///   cut back to its own part, so a cause four layers down is not printed four
+///   times. See [`chain_frames`].
 pub fn write_chain(f: &mut dyn fmt::Write, e: &anyhow::Error) -> fmt::Result {
-    use fmt::Write as _;
-    let mut first = true;
-    let mut frame = String::new();
-    for cause in e.chain() {
-        frame.clear();
-        write!(frame, "{cause}")?;
-        if frame.is_empty() {
-            continue;
-        }
-        if !first {
+    for (i, frame) in chain_frames(e).iter().enumerate() {
+        if i > 0 {
             f.write_str(": ")?;
         }
-        first = false;
-        f.write_str(&frame)?;
+        f.write_str(frame)?;
     }
     Ok(())
+}
+
+/// `e`'s cause chain as [`write_chain`] writes it, one entry per cause: empty
+/// frames dropped, and each frame cut back to its own part when it ends with
+/// its source's text. The cut is taken only at a `": "` or `" - "` separator,
+/// so a frame that merely ends in the same letters (`non-ASCII` over `ASCII`)
+/// keeps its text. For a renderer that filters causes before joining them.
+pub fn chain_frames(e: &anyhow::Error) -> Vec<String> {
+    let frames: Vec<String> = e
+        .chain()
+        .map(|c| c.to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    frames
+        .iter()
+        .enumerate()
+        .filter_map(|(i, frame)| {
+            let own = match frames.get(i + 1) {
+                Some(next) => own_part(frame, next),
+                None => frame,
+            };
+            (!own.is_empty()).then(|| own.to_owned())
+        })
+        .collect()
+}
+
+/// `frame` without a trailing copy of its source's text `next`, and without the
+/// separator before that copy. `frame` itself when it does not end that way.
+fn own_part<'a>(frame: &'a str, next: &str) -> &'a str {
+    let Some(head) = frame.strip_suffix(next) else {
+        return frame;
+    };
+    if head.trim_end().is_empty() {
+        return "";
+    }
+    // The separator is followed by whitespace in every embedding error seen
+    // (`"{own}: {source}"`, object_store's `"{own} - {source}"`); without it,
+    // `-`/`:` is more likely part of a word or a number.
+    if !head.ends_with(char::is_whitespace) {
+        return frame;
+    }
+    match head.trim_end().strip_suffix([':', '-']) {
+        Some(own) => own.trim_end(),
+        None => frame,
+    }
 }
 
 /// [`write_chain`] into a `String`.
@@ -2378,6 +2419,80 @@ mod tests {
     }
 
     impl std::error::Error for Marker {}
+
+    /// An error that writes its source into its own `Display`, as most of
+    /// object_store's do, joined by `sep`.
+    #[derive(Debug)]
+    struct Embeds {
+        own: &'static str,
+        sep: &'static str,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    }
+
+    impl std::fmt::Display for Embeds {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}{}{}", self.own, self.sep, self.source)
+        }
+    }
+
+    impl std::error::Error for Embeds {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&*self.source)
+        }
+    }
+
+    fn embeds(
+        own: &'static str,
+        sep: &'static str,
+        source: impl Into<Box<dyn std::error::Error + Send + Sync>>,
+    ) -> Embeds {
+        Embeds {
+            own,
+            sep,
+            source: source.into(),
+        }
+    }
+
+    /// The remote cache's expired-gcloud-login warning printed the token
+    /// endpoint's response three times: each object_store layer writes its
+    /// source into its own text, and the chain then writes the source again.
+    #[test]
+    fn chain_message_writes_an_embedded_source_once() {
+        let body = "Server returned non-2xx status code: 400 Bad Request: {\n  \"error\": \"invalid_grant\"\n}";
+        let retry = embeds("Error performing POST https://t in 105ms", " - ", body);
+        let token = embeds("Error performing token request", ": ", retry);
+        let e = anyhow::Error::new(token).context("open remote object k");
+        assert_eq!(
+            chain_message(&e),
+            format!(
+                "open remote object k: Error performing token request: \
+                 Error performing POST https://t in 105ms: {body}"
+            ),
+        );
+
+        // A frame identical to its source adds nothing and is dropped.
+        let e = anyhow::Error::new(embeds("", "", "boom")).context("ctx");
+        assert_eq!(chain_message(&e), "ctx: boom");
+    }
+
+    /// Near misses: a frame that ends with its source's text but not after a
+    /// separator, or that names it mid-sentence, keeps all of its text.
+    #[test]
+    fn chain_message_keeps_a_frame_that_only_resembles_its_source() {
+        let e = anyhow::Error::new(embeds("fo", "", "o"));
+        assert_eq!(chain_message(&e), "foo: o");
+        let e = anyhow::Error::new(embeds("non", "-", "ASCII"));
+        assert_eq!(chain_message(&e), "non-ASCII: ASCII");
+        let e = anyhow::Error::new(embeds("127.0.0.1", ":", "8080"));
+        assert_eq!(chain_message(&e), "127.0.0.1:8080: 8080");
+        let e = anyhow::Error::new(embeds("read config", " (", "missing)"));
+        assert_eq!(chain_message(&e), "read config (missing): missing)");
+        let e = anyhow::anyhow!("not found").context("lookup: not found here");
+        assert_eq!(chain_message(&e), "lookup: not found here: not found");
+        // Multi-byte text around the cut.
+        let e = anyhow::Error::new(embeds("échec —", " : ", "ünïcode"));
+        assert_eq!(chain_message(&e), "échec —: ünïcode");
+    }
 
     #[test]
     fn unwrap_arc_err_preserves_type_when_unique() {

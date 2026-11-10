@@ -411,6 +411,8 @@ impl StoreOptions<'_> {
 pub struct ObjStoreBackend {
     store: Arc<dyn ObjectStore>,
     prefix: ObjPath,
+    /// See [`RemoteCacheBackend::auth_remedy`].
+    remedy: Option<&'static str>,
 }
 
 impl ObjStoreBackend {
@@ -445,7 +447,10 @@ impl ObjStoreBackend {
         env: impl IntoIterator<Item = (String, String)>,
     ) -> anyhow::Result<Self> {
         let url = Url::parse(uri).with_context(|| format!("parse remote cache uri {uri}"))?;
-        let (store, prefix): (Box<dyn ObjectStore>, ObjPath) = if url.scheme() == "gs" {
+        // `remedy`: how the user renews the credential the store resolves, when
+        // that is a CLI login; see [`RemoteCacheBackend::auth_remedy`].
+        type Built = (Box<dyn ObjectStore>, ObjPath, Option<&'static str>);
+        let (store, prefix, remedy): Built = if url.scheme() == "gs" {
             opts_override.reject_non_s3(uri)?;
             let genv =
                 SchemeEnv::split::<GoogleConfigKey>(&opts_override.prefixes(GCS_ENV_PREFIX), env)?;
@@ -476,6 +481,18 @@ impl ObjStoreBackend {
                 .with_url(uri)
                 .with_retry(retry_config())
                 .with_http_connector(NegotiatingConnector);
+            // Read off the assembled builder, so it follows the credential
+            // object_store will actually use. An external_account credential
+            // is not a gcloud login.
+            // With `CLOUDSDK_CONFIG` set, gcloud logs in to a file object_store
+            // never reads.
+            let gcloud_writes_default = std::env::var_os("CLOUDSDK_CONFIG").is_none();
+            let remedy = match external {
+                None if gcloud_writes_default => {
+                    gcloud_adc_path().and_then(|gcloud| gcloud_login_remedy(&builder, &gcloud))
+                }
+                _ => None,
+            };
             if let Some(source) = external {
                 // object_store can't decode an external_account credential.
                 // Inject a `google-cloud-auth`-backed bearer provider so the
@@ -501,7 +518,7 @@ impl ObjStoreBackend {
             // slash, percent-decoded).
             let prefix = ObjPath::from_url_path(url.path())
                 .with_context(|| format!("parse object prefix from {uri}"))?;
-            (Box::new(store), prefix)
+            (Box::new(store), prefix, remedy)
         } else {
             // s3/azure/http: dedicated per-scheme builders so each carries
             // `retry_config()` directly, the same policy GCS gets above.
@@ -526,7 +543,7 @@ impl ObjStoreBackend {
             // ambient environment outright ([`SchemeEnv`]). The list also
             // carries a lifted-but-finite request timeout; see
             // [`SchemeEnv::opts`] for why it sits where it does.
-            let store: Box<dyn ObjectStore> = match scheme {
+            let (store, remedy): (Box<dyn ObjectStore>, _) = match scheme {
                 ObjectStoreScheme::AmazonS3 => {
                     let opts = SchemeEnv::split::<AmazonS3ConfigKey>(
                         &opts_override.prefixes(S3_ENV_PREFIX),
@@ -555,12 +572,13 @@ impl ObjStoreBackend {
                         .clone()
                         .build()
                         .with_context(|| format!("build S3 store for {uri}"))?;
-                    Box::new(
-                        builder
-                            .with_credentials(auth_classifying(resolved.credentials()))
-                            .build()
-                            .with_context(|| format!("build S3 store for {uri}"))?,
-                    )
+                    // No remedy: object_store reads S3 credentials from the
+                    // environment only, and no login command refreshes that.
+                    let store = builder
+                        .with_credentials(auth_classifying(resolved.credentials()))
+                        .build()
+                        .with_context(|| format!("build S3 store for {uri}"))?;
+                    (Box::new(store), None)
                 }
                 ObjectStoreScheme::MicrosoftAzure => {
                     opts_override.reject_non_s3(uri)?;
@@ -571,17 +589,17 @@ impl ObjStoreBackend {
                     .opts(url.scheme());
                     let builder = build_with_opts!(MicrosoftAzureBuilder, uri, opts)
                         .with_retry(retry_config());
+                    let remedy = azure_cli_login_remedy(&builder);
                     // Built twice, as for GCS: see [`AuthClassifying`].
                     let resolved = builder
                         .clone()
                         .build()
                         .with_context(|| format!("build Azure store for {uri}"))?;
-                    Box::new(
-                        builder
-                            .with_credentials(auth_classifying(resolved.credentials()))
-                            .build()
-                            .with_context(|| format!("build Azure store for {uri}"))?,
-                    )
+                    let store = builder
+                        .with_credentials(auth_classifying(resolved.credentials()))
+                        .build()
+                        .with_context(|| format!("build Azure store for {uri}"))?;
+                    (Box::new(store), remedy)
                 }
                 ObjectStoreScheme::Http => {
                     opts_override.reject_non_s3(uri)?;
@@ -591,26 +609,29 @@ impl ObjStoreBackend {
                     )?
                     .opts(url.scheme());
                     let base = &url[..url::Position::BeforePath];
-                    Box::new(
-                        build_with_opts!(HttpBuilder, base, opts)
-                            .with_retry(retry_config())
-                            .build()
-                            .with_context(|| format!("build HTTP store for {uri}"))?,
-                    )
+                    let store = build_with_opts!(HttpBuilder, base, opts)
+                        .with_retry(retry_config())
+                        .build()
+                        .with_context(|| format!("build HTTP store for {uri}"))?;
+                    (Box::new(store), None)
                 }
                 // `file`/`memory`: no network client, no retry semantics — and
                 // no credentials, so no `HEPH_*` namespace to carve out either.
                 _ => {
                     opts_override.reject_non_s3(uri)?;
-                    parse_url_opts(&url, env)
-                        .with_context(|| format!("open remote cache store for {uri}"))?
-                        .0
+                    let (store, _) = parse_url_opts(&url, env)
+                        .with_context(|| format!("open remote cache store for {uri}"))?;
+                    (store, None)
                 }
             };
-            (store, path)
+            (store, path, remedy)
         };
         let store: Arc<dyn ObjectStore> = Arc::new(LimitStore::new(store, max_concurrency));
-        Ok(Self { store, prefix })
+        Ok(Self {
+            store,
+            prefix,
+            remedy,
+        })
     }
 
     /// Join a logical cache key under the configured prefix. `Path::from`
@@ -715,6 +736,10 @@ fn stream_read_err(path: &ObjPath, e: object_store::Error) -> std::io::Error {
 
 #[async_trait]
 impl RemoteCacheBackend for ObjStoreBackend {
+    fn auth_remedy(&self) -> Option<&str> {
+        self.remedy
+    }
+
     async fn open_read(&self, key: &str) -> anyhow::Result<Option<Pin<Box<dyn AsyncRead + Send>>>> {
         let path = self.object_path(key);
         match self.store.get(&path).await {
@@ -1038,9 +1063,86 @@ fn adc_credential_path() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("GOOGLE_APPLICATION_CREDENTIALS") {
         return Some(PathBuf::from(p));
     }
-    let home = std::env::var_os("HOME")?;
-    let path = Path::new(&home).join(".config/gcloud/application_default_credentials.json");
+    let path = gcloud_adc_path()?;
     path.exists().then_some(path)
+}
+
+/// Where `gcloud auth application-default login` writes its credential.
+fn gcloud_adc_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(Path::new(&home).join(".config/gcloud/application_default_credentials.json"))
+}
+
+/// The command that renews the credential `builder` resolves, when that is a
+/// user login gcloud wrote to `gcloud_adc`: `gcloud auth application-default
+/// login`. Google refuses that login's refresh token once it expires or needs
+/// re-authentication (`invalid_grant`), and logging in again rewrites the file.
+///
+/// Mirrors object_store 0.14's `GoogleCloudStorageBuilder::build`: a service
+/// account (path or key) is taken before any ADC file, and the ADC file is
+/// `ApplicationCredentials` or else the gcloud path. Any other credential —
+/// a service account, a user login kept elsewhere, an unsigned store — gets no
+/// remedy, since that command does not renew it. The caller does not ask when
+/// gcloud writes elsewhere (`CLOUDSDK_CONFIG`).
+fn gcloud_login_remedy(
+    builder: &GoogleCloudStorageBuilder,
+    gcloud_adc: &Path,
+) -> Option<&'static str> {
+    let get = |key| builder.get_config_value(&key);
+    if get(GoogleConfigKey::ServiceAccount).is_some()
+        || get(GoogleConfigKey::ServiceAccountKey).is_some()
+        || config_on(get(GoogleConfigKey::SkipSignature))
+    {
+        return None;
+    }
+    let adc = get(GoogleConfigKey::ApplicationCredentials)
+        .map_or_else(|| gcloud_adc.to_owned(), PathBuf::from);
+    (adc == gcloud_adc && read_adc_type(&adc).as_deref() == Some("authorized_user"))
+        .then_some("gcloud auth application-default login")
+}
+
+/// The command that renews the credential `builder` resolves, when that is the
+/// Azure CLI's login (`az account get-access-token`): `az login`.
+///
+/// Mirrors object_store 0.14's `MicrosoftAzureBuilder::build`: the emulator
+/// and an unsigned store use no login; an explicit `CredentialType` decides
+/// outright; under `auto` (`resolve_credential_auto`) the CLI is the last
+/// configured choice, after any key, token, SAS or service principal — each
+/// taken when merely present, even empty, as object_store does.
+fn azure_cli_login_remedy(builder: &MicrosoftAzureBuilder) -> Option<&'static str> {
+    let get = |key| builder.get_config_value(&key);
+    if config_on(get(AzureConfigKey::UseEmulator)) || config_on(get(AzureConfigKey::SkipSignature))
+    {
+        return None;
+    }
+    let cli = match get(AzureConfigKey::CredentialType).as_deref() {
+        None | Some("auto") => {
+            config_on(get(AzureConfigKey::UseAzureCli))
+                && ![
+                    AzureConfigKey::FabricSessionToken,
+                    AzureConfigKey::Token,
+                    AzureConfigKey::AccessKey,
+                    AzureConfigKey::ClientId,
+                    AzureConfigKey::SasKey,
+                ]
+                .into_iter()
+                .any(|key| get(key).is_some())
+        }
+        Some(kind) => kind == "azure_cli",
+    };
+    cli.then_some("az login")
+}
+
+/// Whether a boolean option held as written reads as true. A flag set from the
+/// environment keeps its spelling; these are the ones object_store's own
+/// parser (`config.rs`) accepts as true.
+fn config_on(value: Option<String>) -> bool {
+    value.is_some_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes" | "y"
+        )
+    })
 }
 
 /// Read the `type` field of an ADC JSON file. Returns `None` if the file is
@@ -1068,6 +1170,7 @@ fn ensure_rustls_provider_installed() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn put(backend: &ObjStoreBackend, key: &str, data: &[u8]) {
@@ -1209,6 +1312,7 @@ mod tests {
                 peak: Arc::clone(&peak),
             }),
             prefix: ObjPath::from("repo"),
+            remedy: None,
         };
 
         // Several parts' worth: `BufWriter`'s default part size is 10 MiB, and
@@ -1259,12 +1363,23 @@ mod tests {
     /// An HTTP server on loopback that answers every request with `status` and
     /// `body`, standing in for S3. Returns its base URL.
     async fn canned_http_server(status: &'static str, body: &'static str) -> String {
+        counting_http_server(status, body).await.0
+    }
+
+    /// [`canned_http_server`], plus how many requests it has answered.
+    async fn counting_http_server(
+        status: &'static str,
+        body: &'static str,
+    ) -> (String, Arc<AtomicUsize>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
         let addr = listener.local_addr().expect("local addr");
+        let served = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&served);
         tokio::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
+                let counter = Arc::clone(&counter);
                 tokio::spawn(async move {
                     // Read up to the end of the request head; no request here
                     // carries a body.
@@ -1276,6 +1391,7 @@ mod tests {
                             Ok(n) => head.extend_from_slice(buf.get(..n).unwrap_or_default()),
                         }
                     }
+                    counter.fetch_add(1, Ordering::Relaxed);
                     let resp = format!(
                         "HTTP/1.1 {status}\r\ncontent-type: application/xml\r\n\
                          content-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -1285,7 +1401,34 @@ mod tests {
                 });
             }
         });
-        format!("http://{addr}")
+        (format!("http://{addr}"), served)
+    }
+
+    /// An Azure Blob backend pointed at `endpoint` with a static account key,
+    /// allowed `max_retries` — as `from_uri` builds it, with the retry budget
+    /// left open so a test can see whether it is spent.
+    fn azure_backend(endpoint: &str, max_retries: usize) -> ObjStoreBackend {
+        let builder = MicrosoftAzureBuilder::new()
+            .with_account("account")
+            .with_container_name("container")
+            .with_access_key("a2V5")
+            .with_endpoint(endpoint.to_owned())
+            .with_allow_http(true)
+            .with_retry(RetryConfig {
+                max_retries,
+                ..Default::default()
+            });
+        let resolved = builder.clone().build().expect("build Azure store");
+        ObjStoreBackend {
+            store: Arc::new(
+                builder
+                    .with_credentials(auth_classifying(resolved.credentials()))
+                    .build()
+                    .expect("build Azure store"),
+            ),
+            prefix: ObjPath::from("repo"),
+            remedy: None,
+        }
     }
 
     /// An S3 backend pointed at `endpoint` with static credentials, behind
@@ -1293,6 +1436,15 @@ mod tests {
     fn s3_backend(
         endpoint: &str,
         creds: Option<Arc<dyn CredentialProvider<Credential = object_store::aws::AwsCredential>>>,
+    ) -> ObjStoreBackend {
+        s3_backend_retrying(endpoint, creds, 0)
+    }
+
+    /// [`s3_backend`], allowed `max_retries`.
+    fn s3_backend_retrying(
+        endpoint: &str,
+        creds: Option<Arc<dyn CredentialProvider<Credential = object_store::aws::AwsCredential>>>,
+        max_retries: usize,
     ) -> ObjStoreBackend {
         let mut builder = AmazonS3Builder::new()
             .with_bucket_name("bucket")
@@ -1302,7 +1454,7 @@ mod tests {
             .with_access_key_id("AKID")
             .with_secret_access_key("secret")
             .with_retry(RetryConfig {
-                max_retries: 0,
+                max_retries,
                 ..Default::default()
             });
         if let Some(creds) = creds {
@@ -1311,6 +1463,7 @@ mod tests {
         ObjStoreBackend {
             store: Arc::new(builder.build().expect("build S3 store")),
             prefix: ObjPath::from("repo"),
+            remedy: None,
         }
     }
 
@@ -1421,6 +1574,7 @@ mod tests {
         ObjStoreBackend {
             store: Arc::new(store),
             prefix: ObjPath::from("repo"),
+            remedy: None,
         }
     }
 
@@ -1457,6 +1611,285 @@ mod tests {
             crate::engine::remote_cache::is_auth_failure(&e),
             "list: {e:#}"
         );
+    }
+
+    /// The warning for an expired gcloud login is one line: the token
+    /// endpoint's own reason, not its multi-line JSON response, and the command
+    /// that renews the login — not the cause chain with that response in it
+    /// three times.
+    #[tokio::test]
+    async fn a_refused_gcloud_login_warns_with_its_reason_and_remedy() {
+        let backend = gcs_backend_failing_with(|| {
+            gcs_error(
+                anyhow::anyhow!(
+                    "Server returned non-2xx status code: 400 Bad Request: {{\n  \
+                     \"error\": \"invalid_grant\",\n  \
+                     \"error_description\": \"reauth related error (invalid_rapt)\",\n  \
+                     \"error_uri\": \"https://support.google.com/a/answer/9368756\",\n  \
+                     \"error_subtype\": \"invalid_rapt\"\n}}"
+                )
+                .context("Error performing POST https://accounts.google.com/o/oauth2/token")
+                .context("Error performing token request"),
+            )
+        });
+        let e = backend
+            .open_read("k")
+            .await
+            .err()
+            .expect("credential fails");
+        assert_eq!(
+            crate::engine::remote_cache::auth_warning("main", &e, Some(GCLOUD_LOGIN)),
+            "remote cache \"main\": authentication failed (invalid_grant: reauth related \
+             error (invalid_rapt)); builds continue without it for the rest of this run \
+             (HEPH_LOG=debug shows the full error). To sign in again, run \
+             `gcloud auth application-default login`",
+        );
+
+        // A refusal with no response body and no known remedy still says why.
+        let backend =
+            gcs_backend_failing_with(|| gcs_error(anyhow::anyhow!("401 Unauthorized: bad key")));
+        let e = backend.exists("k").await.expect_err("credential fails");
+        let msg = crate::engine::remote_cache::auth_warning("main", &e, backend.auth_remedy());
+        assert!(msg.contains("401 Unauthorized: bad key);"), "{msg}");
+        assert!(!msg.contains("sign in"), "{msg}");
+    }
+
+    /// S3 and Azure refuse with an XML document; the warning carries its code
+    /// and message, whether the refusal is a 400 (an expired S3 session token)
+    /// or a typed 401/403.
+    #[tokio::test]
+    async fn s3_and_azure_refusals_warn_with_the_servers_reason() {
+        let warn = |e: &anyhow::Error| crate::engine::remote_cache::auth_warning("c", e, None);
+        let reason = "authentication failed (ExpiredToken: The provided token has expired.);";
+
+        let endpoint = canned_http_server("400 Bad Request", s3_error_body!("ExpiredToken")).await;
+        let e = s3_backend(&endpoint, None)
+            .open_read("k")
+            .await
+            .err()
+            .expect("400");
+        assert!(warn(&e).contains(reason), "{}", warn(&e));
+
+        let endpoint = canned_http_server("403 Forbidden", s3_error_body!("ExpiredToken")).await;
+        let e = s3_backend(&endpoint, None)
+            .open_read("k")
+            .await
+            .err()
+            .expect("403");
+        assert!(warn(&e).contains(reason), "{}", warn(&e));
+
+        let endpoint = canned_http_server("403 Forbidden", AZURE_AUTH_FAILED).await;
+        let e = azure_backend(&endpoint, 0)
+            .open_read("k")
+            .await
+            .err()
+            .expect("403");
+        assert!(crate::engine::remote_cache::is_auth_failure(&e), "{e:#}");
+        assert!(
+            warn(&e).contains(
+                "authentication failed (AuthenticationFailed: Server failed to \
+                 authenticate the request.);"
+            ),
+            "{}",
+            warn(&e)
+        );
+    }
+
+    /// A real object_store refusal whose body nothing parses: its text appears
+    /// once in the rendered chain — object_store's error embeds its source,
+    /// which `{:#}` printed again — and the warning keeps it on one line.
+    #[tokio::test]
+    async fn an_unparsed_refusal_body_is_rendered_once_on_one_line() {
+        let endpoint = canned_http_server("403 Forbidden", "denied\nby policy").await;
+        let e = s3_backend(&endpoint, None)
+            .open_read("k")
+            .await
+            .err()
+            .expect("403");
+        assert!(
+            format!("{e:#}").matches("by policy").count() > 1,
+            "the chain no longer repeats the body, so this no longer tests the dedup: {e:#}"
+        );
+        let chain = hcore::hmemoizer::chain_message(&e);
+        assert_eq!(chain.matches("by policy").count(), 1, "{chain}");
+        let msg = crate::engine::remote_cache::auth_warning("c", &e, None);
+        assert!(!msg.contains('\n'), "{msg}");
+        assert_eq!(msg.matches("by policy").count(), 1, "{msg}");
+    }
+
+    /// Azure's refusal of a request it could not authenticate.
+    const AZURE_AUTH_FAILED: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?><Error>\
+        <Code>AuthenticationFailed</Code>\
+        <Message>Server failed to authenticate the request.</Message></Error>";
+
+    /// A refused credential is asked once, on every store: retrying cannot
+    /// change the answer. The retry budget is left open (3) so a retry would
+    /// show, and a 503 proves the server counts the retries it is sent.
+    #[tokio::test]
+    async fn an_auth_refusal_is_sent_once_on_every_store() {
+        for (status, body) in [
+            ("400 Bad Request", s3_error_body!("ExpiredToken")),
+            ("401 Unauthorized", s3_error_body!("InvalidToken")),
+            ("403 Forbidden", s3_error_body!("InvalidAccessKeyId")),
+        ] {
+            let (endpoint, served) = counting_http_server(status, body).await;
+            let e = s3_backend_retrying(&endpoint, None, 3)
+                .open_read("k")
+                .await
+                .err()
+                .expect("refused");
+            assert!(
+                crate::engine::remote_cache::is_auth_failure(&e),
+                "S3 {status}: {e:#}"
+            );
+            assert_eq!(served.load(Ordering::Relaxed), 1, "S3 {status} retried");
+        }
+        for status in ["401 Unauthorized", "403 Forbidden"] {
+            let (endpoint, served) = counting_http_server(status, AZURE_AUTH_FAILED).await;
+            let e = azure_backend(&endpoint, 3)
+                .open_read("k")
+                .await
+                .err()
+                .expect("refused");
+            assert!(
+                crate::engine::remote_cache::is_auth_failure(&e),
+                "Azure {status}: {e:#}"
+            );
+            assert_eq!(served.load(Ordering::Relaxed), 1, "Azure {status} retried");
+        }
+
+        let (endpoint, served) = counting_http_server("503 Service Unavailable", "").await;
+        let _unavailable = s3_backend_retrying(&endpoint, None, 3).open_read("k").await;
+        assert_eq!(served.load(Ordering::Relaxed), 4, "a 503 is retried");
+    }
+
+    const GCLOUD_LOGIN: &str = "gcloud auth application-default login";
+
+    /// Only a user login at gcloud's own path, used because nothing object_store
+    /// prefers is configured, is renewed by logging in again.
+    #[test]
+    fn gcloud_login_remedy_needs_the_gcloud_login_to_be_the_credential() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let gcloud = dir.path().join("application_default_credentials.json");
+        std::fs::write(&gcloud, r#"{"type": "authorized_user"}"#).expect("write");
+        let base = || GoogleCloudStorageBuilder::new().with_bucket_name("b");
+        let at = |path: &Path| {
+            base().with_config(
+                GoogleConfigKey::ApplicationCredentials,
+                path.to_string_lossy(),
+            )
+        };
+        // The default location, found or named.
+        assert_eq!(gcloud_login_remedy(&base(), &gcloud), Some(GCLOUD_LOGIN));
+        assert_eq!(
+            gcloud_login_remedy(&at(&gcloud), &gcloud),
+            Some(GCLOUD_LOGIN)
+        );
+        // The same login copied elsewhere: gcloud would renew a different file.
+        let elsewhere = write_adc(dir.path(), r#"{"type": "authorized_user"}"#);
+        assert_eq!(gcloud_login_remedy(&at(&elsewhere), &gcloud), None);
+        // A service account is taken before the ADC file; an unsigned store
+        // uses no credential.
+        for (key, value) in [
+            (GoogleConfigKey::ServiceAccount, "/k/sa.json"),
+            (GoogleConfigKey::ServiceAccountKey, "{}"),
+            (GoogleConfigKey::SkipSignature, "true"),
+        ] {
+            assert_eq!(
+                gcloud_login_remedy(&base().with_config(key, value), &gcloud),
+                None,
+                "{key:?}"
+            );
+        }
+        // Not a user login.
+        for body in [
+            r#"{"type": "service_account"}"#,
+            r#"{"type": "external_account"}"#,
+            "not json",
+        ] {
+            std::fs::write(&gcloud, body).expect("write");
+            assert_eq!(gcloud_login_remedy(&base(), &gcloud), None, "{body}");
+        }
+        std::fs::remove_file(&gcloud).expect("remove");
+        assert_eq!(gcloud_login_remedy(&base(), &gcloud), None, "missing");
+    }
+
+    /// `az login` renews only the Azure CLI's credential, which object_store
+    /// uses when told to, or when asked to and nothing it prefers is configured.
+    #[test]
+    fn azure_cli_login_remedy_needs_the_cli_to_be_the_credential() {
+        let base = || MicrosoftAzureBuilder::new().with_account("a");
+        let cli = || base().with_config(AzureConfigKey::UseAzureCli, "yes");
+        assert_eq!(azure_cli_login_remedy(&cli()), Some("az login"));
+        assert_eq!(azure_cli_login_remedy(&base()), None, "managed identity");
+        let typed = |kind| base().with_config(AzureConfigKey::CredentialType, kind);
+        assert_eq!(
+            azure_cli_login_remedy(&typed("azure_cli")),
+            Some("az login")
+        );
+        assert_eq!(
+            azure_cli_login_remedy(&typed("auto").with_config(AzureConfigKey::UseAzureCli, "1")),
+            Some("az login")
+        );
+        assert_eq!(
+            azure_cli_login_remedy(
+                &typed("managed_identity").with_config(AzureConfigKey::UseAzureCli, "true")
+            ),
+            None,
+            "an explicit credential type wins over the CLI flag"
+        );
+        for (key, value) in [
+            (AzureConfigKey::AccessKey, "a2V5"),
+            // Present but empty is still taken, as object_store does.
+            (AzureConfigKey::AccessKey, ""),
+            (AzureConfigKey::Token, "bearer"),
+            (AzureConfigKey::ClientId, "id"),
+            (AzureConfigKey::SasKey, "sv=1"),
+            (AzureConfigKey::FabricSessionToken, "t"),
+            (AzureConfigKey::UseEmulator, "true"),
+            (AzureConfigKey::SkipSignature, "1"),
+        ] {
+            assert_eq!(
+                azure_cli_login_remedy(&cli().with_config(key, value)),
+                None,
+                "{key:?}={value:?} is taken before the CLI"
+            );
+        }
+    }
+
+    /// The remedy reaches the backend `from_uri` builds, from the environment
+    /// it is given.
+    #[test]
+    fn from_uri_carries_the_azure_cli_remedy() {
+        let env = |extra: &[(&str, &str)]| {
+            [("AZURE_STORAGE_ACCOUNT_NAME", "a")]
+                .iter()
+                .chain(extra)
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect::<Vec<_>>()
+        };
+        let build = |extra: &[(&str, &str)]| {
+            ObjStoreBackend::from_uri_with_env(
+                "az://c/repo",
+                4,
+                &StoreOptions::default(),
+                env(extra),
+            )
+            .expect("build Azure backend")
+        };
+        assert_eq!(
+            build(&[("AZURE_USE_AZURE_CLI", "true")]).auth_remedy(),
+            Some("az login")
+        );
+        assert_eq!(build(&[]).auth_remedy(), None);
+        let s3 = ObjStoreBackend::from_uri_with_env(
+            "s3://b/repo",
+            4,
+            &StoreOptions::default(),
+            env(&[("AWS_REGION", "us-east-1")]),
+        )
+        .expect("build S3 backend");
+        assert_eq!(s3.auth_remedy(), None);
     }
 
     /// A token endpoint that could not be reached is an outage, not a refusal:
