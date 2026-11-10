@@ -144,6 +144,16 @@ impl LspEngine for FakeEngine {
                         "Environment variables.",
                         false,
                     ),
+                    field(
+                        "workdir",
+                        ParamType::Enum(vec![
+                            "caller".to_string(),
+                            "tree_root".to_string(),
+                            "tree_package".to_string(),
+                        ]),
+                        "Where the program runs.",
+                        false,
+                    ),
                 ],
             }),
             "go_binary" => Some(DriverSchema {
@@ -861,7 +871,7 @@ fn completion_in_target_call_offers_only_missing_keys() {
     let result = lsp.completion(&doc);
     assert_eq!(
         labels(&result),
-        vec!["approval", "cmd", "env", "labels", "transitive"],
+        vec!["approval", "cmd", "env", "labels", "transitive", "workdir"],
         "only the missing heph keys"
     );
 
@@ -1052,7 +1062,7 @@ fn completion_in_target_call_is_unaffected_by_loaded_functions() {
     let result = lsp.completion(&doc);
     assert_eq!(
         labels(&result),
-        vec!["approval", "cmd", "env", "labels", "transitive"],
+        vec!["approval", "cmd", "env", "labels", "transitive", "workdir"],
         "only the missing heph keys"
     );
     assert_eq!(kind(&lsp.explain(&doc)), "target_key");
@@ -1306,6 +1316,7 @@ fn matrix(site: &str, feature: Feature) {
         "callee" => "tar│get(name = \"x\", driver = \"exec\")\n",
         "driver_value" => "target(name = \"x\", driver = \"ex│ec\")\n",
         "provider_value" => "provider_state(provider = \"g│o\")\n",
+        "field_value" => "target(name = \"x\", driver = \"exec\", workdir = \"tree_p│\")\n",
         "target_key" => "target(name = \"x\", driver = \"exec\", c│md = \"true\")\n",
         "state_key" => "provider_state(provider = \"go\", go_codegen_r│oot = True)\n",
         "plugin_namespace" => "x = heph.f│s\n",
@@ -1345,6 +1356,7 @@ fn matrix(site: &str, feature: Feature) {
                 }
                 "driver_value" => &["exec"],
                 "provider_value" => &["go"],
+                "field_value" => &["tree_package"],
                 "target_key" => &["cmd"],
                 "state_key" => &["go_codegen_root"],
                 "plugin_namespace" => &["fs"],
@@ -1367,6 +1379,12 @@ fn matrix(site: &str, feature: Feature) {
                 "plugin_member" => Some("Join two path segments."),
                 // Stock passes through; it has nothing on a keyword name.
                 "arg_key" => None,
+                "field_value" => {
+                    // Stock, as for `none`: the evaluation's targets, and no
+                    // heph schema doc for the field.
+                    assert!(!hover_text(&hover).contains("Where the program"), "{hover}");
+                    return;
+                }
                 "plugin_namespace" | "address" | "load_path" | "load_symbol" => None,
                 "none" => {
                     // Stock: an undocumented assignment has no hover, and no
@@ -1418,6 +1436,18 @@ fn matrix_driver_value_hover() {
 #[test]
 fn matrix_driver_value_definition() {
     matrix("driver_value", Feature::Definition);
+}
+#[test]
+fn matrix_field_value_items() {
+    matrix("field_value", Feature::Items);
+}
+#[test]
+fn matrix_field_value_hover() {
+    matrix("field_value", Feature::Hover);
+}
+#[test]
+fn matrix_field_value_definition() {
+    matrix("field_value", Feature::Definition);
 }
 #[test]
 fn matrix_provider_value_items() {
@@ -2137,6 +2167,82 @@ fn broken_plugin_namespace_with_broken_tail() {
     let mut lsp = Lsp::start();
     let doc = lsp.open("BUILD", "x = heph.│\ny = (\n");
     assert_eq!(labels(&lsp.completion(&doc)), vec!["core", "fs"]);
+}
+
+/// An enum field's value completes to its literals, quoted the way a driver
+/// name is, in every quote state.
+#[test]
+fn completion_in_an_enum_field_value_offers_its_literals() {
+    let mut lsp = Lsp::start();
+    let pre = "target(name = \"x\", driver = \"exec\", workdir = ";
+    for (i, (value, after)) in [
+        ("\"│\")", "\"tree_root\")"),
+        ("\"tree_r│\")", "\"tree_root\")"),
+        ("'tr│')", "'tree_root')"),
+        ("\"tr│)", "\"tree_root\")"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let fixture = format!("{pre}{value}\n");
+        let doc = lsp.open(&format!("e{i}/BUILD"), &fixture);
+        assert_eq!(kind(&lsp.explain(&doc)), "field_value", "{fixture:?}");
+        let result = lsp.completion(&doc);
+        assert!(has(&result, "tree_root"), "{fixture:?}: {result}");
+        assert_eq!(
+            apply(&doc.text, &item(&result, "tree_root")),
+            format!("{pre}{after}\n"),
+            "{fixture:?}"
+        );
+    }
+
+    // Every literal, and nothing else, in the empty string.
+    let doc = lsp.open("s/BUILD", &format!("{pre}\"│\")\n"));
+    assert_eq!(
+        labels(&lsp.completion(&doc)),
+        ["caller", "tree_package", "tree_root"]
+    );
+}
+
+/// Where heph has no literal to offer, a field's string answers as `none`
+/// did: a non-enum field, an unknown driver, a prefix no literal starts with.
+/// Before a string the position is not a site at all (a variable may stand
+/// there), a value inside a nested bracket is not the field's, and an address
+/// keeps its own site.
+#[test]
+fn a_field_value_without_literals_passes_the_stock_answer_through() {
+    let mut lsp = Lsp::start();
+    for (i, fixture) in [
+        "target(name = \"x\", driver = \"exec\", cmd = \"tr│\")\n",
+        "target(name = \"x\", driver = \"nope\", workdir = \"tr│\")\n",
+        "target(name = \"x\", driver = \"exec\", workdir = \"root│\")\n",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let doc = lsp.open(&format!("p{i}/BUILD"), fixture);
+        assert_eq!(kind(&lsp.explain(&doc)), "field_value", "{fixture:?}");
+        let result = lsp.completion(&doc);
+        assert!(heph_items(&result).is_empty(), "{fixture:?}: {result}");
+    }
+    let doc = lsp.open(
+        "i/BUILD",
+        "MY_WD = 1\ntarget(name = \"x\", driver = \"exec\", workdir = MY_│)\n",
+    );
+    assert_eq!(kind(&lsp.explain(&doc)), "none");
+    assert!(has(&lsp.completion(&doc), "MY_WD"));
+    // Nested in a list: not the field's value.
+    let doc = lsp.open(
+        "n/BUILD",
+        "target(name = \"x\", driver = \"exec\", workdir = [\"tr│\"])\n",
+    );
+    assert_ne!(kind(&lsp.explain(&doc)), "field_value");
+    // An address-shaped string stays an address.
+    let doc = lsp.open(
+        "a/BUILD",
+        "target(name = \"x\", driver = \"exec\", deps = \"//li│\")\n",
+    );
+    assert_eq!(kind(&lsp.explain(&doc)), "address");
 }
 
 #[test]

@@ -654,9 +654,11 @@ impl Server<'_> {
             Merge::Prepend => {
                 let stock = self.stock_completion(params, &located);
                 // Parameters need no registry: they come from the document,
-                // the loaded files and the builtins' docs.
-                let empty = Registry::default();
-                self.with_ctx(&located.key, &empty, |ctx| {
+                // the loaded files and the builtins' docs. A field's literals
+                // do; until it lands the site resolves to `none` (see
+                // `locate`), so an empty one is only ever seen by `arg_key`.
+                let registry = self.registry().unwrap_or_default();
+                self.with_ctx(&located.key, &registry, |ctx| {
                     handlers::prepend(&located.resolution.site, ctx, stock)
                 })
                 .unwrap_or_default()
@@ -715,7 +717,9 @@ impl Server<'_> {
         let registry = self.registry().unwrap_or_default();
         let reg = &*registry;
         let hover = match site {
-            Site::None | Site::ArgKey { .. } => self.stock_hover(params, &located, reg),
+            Site::None | Site::ArgKey { .. } | Site::FieldValue { .. } => {
+                self.stock_hover(params, &located, reg)
+            }
             _ => self
                 .with_ctx(&located.key, reg, |ctx| {
                     let mut hover = handlers::hover(site, ctx)?;

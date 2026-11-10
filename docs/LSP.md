@@ -52,6 +52,7 @@ start; until that snapshot lands, heph answers with the stock results and
 | `callee` | `target` / `provider_state` identifier before its `(` | stock passes through | the builtin's signature, narrowed to the selected driver / provider | — |
 | `driver_value` | `driver =` inside `target(`, with a closed string, an unterminated one, or no string yet | driver names | the driver's fields | — |
 | `provider_value` | `provider =` inside `provider_state(` | provider names | the provider's state fields | — |
+| `field_value` | a string value of any other keyword directly inside `target(` / `provider_state(` (`workdir = "tr│"`), unless address-shaped | the field's literals, when its type is an enum (`"caller" \| "tree_root" \| …`); otherwise stock | stock | stock |
 | `target_key` | a keyword-name position inside `target(` | base fields + the selected driver's, minus keys present | the field's type and doc | — |
 | `state_key` | a keyword-name position inside `provider_state(` | `provider` + the selected provider's schema, minus keys present | the field's type and doc | — |
 | `arg_key` | a keyword-name position inside a call to any other plain-named function (`my_rule(`, `glob(`; not `x.f(`, not a `def`'s parameters) | the callee's unwritten parameters, each inserting `name = `, ranked first; then stock (see below) | stock | stock |
@@ -72,6 +73,13 @@ Wherever heph controls or knows the answer for sure, heph is authoritative and
 covers keyword names, driver and provider names, plugin namespaces and members,
 addresses, and load paths and symbols. The stock answer **passes through**
 only where heph cannot know: free expressions, locals, other value positions.
+
+`field_value` is decided by the field's type rather than the site: an enum
+field's literals **replace** the stock items (which offer nothing inside a
+string), and a field with no literal matching the prefix passes the stock
+answer through. Only a string is a `field_value`: before one, `workdir = │`
+is where a variable or an expression may start, and an unclosed `target(`
+above would make that position depend on the text after the cursor.
 
 One site **prepends**: `arg_key`. A keyword-name position is also where a
 positional argument starts, so the stock items (locals, globals) stay, after

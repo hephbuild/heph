@@ -254,6 +254,15 @@ pub(crate) enum Site {
         call: Call,
         value: Str,
     },
+    /// The string value of any other keyword directly inside `target(` /
+    /// `provider_state(`: `workdir = "tr│"`. Whether heph has anything to
+    /// offer depends on the field's type (its literals), which only the
+    /// handlers know; everywhere else it answers as `None` does.
+    FieldValue {
+        call: Call,
+        key: String,
+        value: Str,
+    },
     /// A keyword-name position inside `target(`.
     TargetKey {
         call: Call,
@@ -306,6 +315,7 @@ impl Site {
             Site::Callee { .. } => "callee",
             Site::DriverValue { .. } => "driver_value",
             Site::ProviderValue { .. } => "provider_value",
+            Site::FieldValue { .. } => "field_value",
             Site::TargetKey { .. } => "target_key",
             Site::StateKey { .. } => "state_key",
             Site::ArgKey { .. } => "arg_key",
@@ -322,6 +332,7 @@ impl Site {
             Site::Callee { call }
             | Site::DriverValue { call, .. }
             | Site::ProviderValue { call, .. }
+            | Site::FieldValue { call, .. }
             | Site::TargetKey { call, .. }
             | Site::StateKey { call, .. } => Some(call),
             _ => None,
@@ -329,10 +340,11 @@ impl Site {
     }
 
     /// The keyword argument the cursor sits in the value of.
-    pub(crate) fn keyword(&self) -> Option<&'static str> {
+    pub(crate) fn keyword(&self) -> Option<&str> {
         match self {
             Site::DriverValue { .. } => Some("driver"),
             Site::ProviderValue { .. } => Some("provider"),
+            Site::FieldValue { key, .. } => Some(key),
             _ => None,
         }
     }
@@ -343,6 +355,7 @@ impl Site {
             Site::None | Site::Callee { .. } => None,
             Site::DriverValue { value, .. }
             | Site::ProviderValue { value, .. }
+            | Site::FieldValue { value, .. }
             | Site::Address { value }
             | Site::LoadPath { value }
             | Site::LoadSymbol { value, .. } => Some(&value.prefix),
@@ -366,6 +379,7 @@ impl Site {
         match self {
             Site::DriverValue { value, .. }
             | Site::ProviderValue { value, .. }
+            | Site::FieldValue { value, .. }
             | Site::Address { value }
             | Site::LoadPath { value }
             | Site::LoadSymbol { value, .. } => Some(value),
@@ -1054,6 +1068,9 @@ fn classify(doc: &Doc<'_>, o: usize) -> Result<Site, Reason> {
                 (Builtin::ProviderState, Some("provider")) => {
                     Ok(Site::ProviderValue { call, value })
                 }
+                // Another field's value is a site only once it is a string
+                // (`string_site`): before one, the position is where a
+                // variable or an expression starts, which the stock answers.
                 _ => Err(Reason::NotASite),
             }
         }
@@ -1176,6 +1193,18 @@ fn string_site(
                 let value = doc.str_at(i, o, is_name_byte)?;
                 return Some(Site::ProviderValue { call, value });
             }
+            // Any other keyword's string value, unless it is an address
+            // (`deps = "//x"`), which keeps its own site below.
+            (Builtin::Target | Builtin::ProviderState, Some(key))
+                if direct && !is_address_shaped(&doc.str_at(i, o, is_address_byte)?) =>
+            {
+                let value = doc.str_at(i, o, is_name_byte)?;
+                return Some(Site::FieldValue {
+                    key: key.to_string(),
+                    call,
+                    value,
+                });
+            }
             (Builtin::Load, _) => {
                 let value = doc.str_at(i, o, is_address_byte)?;
                 if prev == Some(open_idx) {
@@ -1193,8 +1222,12 @@ fn string_site(
         }
     }
     let value = doc.str_at(i, o, is_address_byte)?;
-    (value.prefix.starts_with("//") || value.prefix.starts_with(':'))
-        .then_some(Site::Address { value })
+    is_address_shaped(&value).then_some(Site::Address { value })
+}
+
+/// Whether a string's text before the cursor starts an address.
+fn is_address_shaped(value: &Str) -> bool {
+    value.prefix.starts_with("//") || value.prefix.starts_with(':')
 }
 
 /// The selected driver (`target`) or provider (`provider_state`) of the call
@@ -1325,7 +1358,10 @@ mod tests {
     #[test]
     fn site_comment_or_non_address_string() {
         assert_eq!(kind(&at("target(name = \"x\") # dri│\n")), "none");
-        assert_eq!(kind(&at("target(name = \"hel│lo\")\n")), "none");
+        // A field's string value is a site; the handlers decide whether heph
+        // has anything there (only an enum field's literals).
+        assert_eq!(kind(&at("target(name = \"hel│lo\")\n")), "field_value");
+        assert_eq!(kind(&at("other(name = \"hel│lo\")\n")), "none");
         assert_eq!(at("x = \"plain│\"\n").reason, Some(Reason::NotASite));
     }
 
