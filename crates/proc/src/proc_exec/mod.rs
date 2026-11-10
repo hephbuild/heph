@@ -726,4 +726,59 @@ mod tests {
             "cancelled output took {elapsed:?}, budget {budget:?}",
         );
     }
+
+    /// A cancel kills the child's whole group, including a descendant the
+    /// SIGINT cannot reach. `sh` starts a `&` job with SIGINT ignored, so the
+    /// shell dies of the SIGINT while the `sleep` lives on, holding none of
+    /// the pipes the drain could escalate on. Only the SIGKILL to the group
+    /// once the shell has exited ends it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancel_kills_a_descendant_that_ignores_sigint() {
+        let sleep = sleep_tool!();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("pid");
+        let script = format!(
+            "{} {STRAY_LIFETIME_SECS} >/dev/null 2>&1 & echo $! > '{}'; wait",
+            sleep.display(),
+            pid_file.display(),
+        );
+        let handle = spawn(sh_spec(Session::Own, &script)).expect("spawn");
+        let cancel = std::sync::Arc::new(StdCancellationToken::new());
+        let wait = handle.spawn_wait(std::sync::Arc::clone(&cancel) as _);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let pid: libc::pid_t = loop {
+            if let Some(pid) = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+            {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "the script never wrote its pid");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        cancel.cancel();
+        let res = wait.await.expect("wait task");
+        assert!(res.is_err(), "a cancelled wait must not return Ok");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            // SAFETY: signal 0 only checks that the pid exists; nothing is sent.
+            let rc = unsafe { libc::kill(pid, 0) };
+            if rc != 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                break;
+            }
+            // Killed but not yet reaped by whichever ancestor adopted it.
+            if std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .is_ok_and(|s| s.rsplit_once(") ").is_some_and(|(_, r)| r.starts_with('Z')))
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the descendant {pid} outlived the cancelled run"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
 }

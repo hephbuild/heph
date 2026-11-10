@@ -2916,6 +2916,7 @@ mod tests {
             upstream_of: None,
             exit_status: None,
             log_tail: None,
+            timed_out: None,
         }
     }
     fn execute_start(addr: &str) -> BuildEventKind {

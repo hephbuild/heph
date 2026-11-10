@@ -2268,3 +2268,120 @@ async fn pty_fallback_warns_when_plugin_offers_none() -> anyhow::Result<()> {
     assert_eq!(*offered.lock().expect("offered"), [true], "the host's exec");
     Ok(())
 }
+
+/// An entrypoint is held to its `timeout` like a build: the tool is stopped,
+/// the invocation fails as timed out (a heph-side failure, which the CLI exits
+/// 125 on), and its sandbox is removed as on any other end. `exec`, because on
+/// the caller's terminal the tool shares heph's process group and only the
+/// direct child is killed: a forked `sleep` would outlive the test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn entrypoint_past_its_timeout_fails_as_timed_out() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "app",
+        r#"target(name = "slow", driver = "bash", entrypoint = True, run = "exec sleep 30", timeout = 1)"#,
+    );
+    let out = ws.dir.path().join("out.txt");
+    let started = std::time::Instant::now();
+    let err = failed(invoke(&ws.engine, request("//app:slow", ws.dir.path(), &[], &out)?).await);
+    assert!(
+        format!("{err:#}").contains("//app:slow timed out after 1s"),
+        "{err:#}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(9),
+        "stopped at the timeout: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        invoke_sandboxes(&ws.engine, "app", "slow"),
+        Vec::<PathBuf>::new()
+    );
+    Ok(())
+}
+
+/// `--shell` is never timed: a session on a target with `timeout = 1` that
+/// outlasts it ends as the person ended it. The session is driven on a PTY the
+/// test owns, as the CLI's handover hands one over: it types a command that
+/// takes longer than the timeout, then `exit 0`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shell_is_not_held_to_the_timeout() -> anyhow::Result<()> {
+    use std::io::{Read as _, Write as _};
+    use std::os::fd::{FromRawFd as _, OwnedFd};
+
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "app",
+        r#"target(name = "sh", driver = "bash", entrypoint = True, run = "true", timeout = 1)"#,
+    );
+
+    let (mut master, slave) = {
+        let (mut m, mut s) = (-1, -1);
+        // SAFETY: openpty writes two fds we take ownership of just below.
+        let rc = unsafe {
+            libc::openpty(
+                &mut m,
+                &mut s,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        anyhow::ensure!(rc == 0, "openpty: {}", std::io::Error::last_os_error());
+        // SAFETY: openpty handed us ownership of the master fd.
+        let master = unsafe { OwnedFd::from_raw_fd(m) };
+        // SAFETY: and of the slave fd.
+        let slave = unsafe { OwnedFd::from_raw_fd(s) };
+        (std::fs::File::from(master), slave)
+    };
+    // The person at the prompt: drain the session's output (or it blocks on a
+    // full PTY) and, at the first prompt, type the command. Detached: it ends
+    // when the session's last slave fd closes.
+    let mut typist = master.try_clone()?;
+    std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 4096];
+        let mut typed = false;
+        while let Ok(n @ 1..) = master.read(&mut buf) {
+            seen.extend_from_slice(buf.get(..n).unwrap_or_default());
+            if !typed && seen.ends_with(b"$ ") {
+                typed = true;
+                if typist.write_all(b"sleep 3; exit 0\n").is_err() {
+                    return;
+                }
+            }
+        }
+    });
+
+    let (stops, _stopped) = hplugin::driver::stop_channel();
+    let (_resume, continues) = hplugin::driver::continue_channel();
+    let handover = hplugin::driver::Handover::deciding(move |_offered| {
+        Ok(Some(hplugin::driver::PtyHandover {
+            slave,
+            stops,
+            continues,
+        }))
+    });
+    let out = ws.dir.path().join("out.txt");
+    let started = std::time::Instant::now();
+    let exit = exited(
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            invoke(
+                &ws.engine,
+                request("//app:sh", ws.dir.path(), &[], &out)?
+                    .with_shell(true)
+                    .with_handover(handover),
+            ),
+        )
+        .await
+        .context("the session never ended")?,
+    );
+    assert_eq!(exit, Exit::Code(0));
+    assert!(
+        started.elapsed() >= Duration::from_secs(3),
+        "the session outlasted the timeout: {:?}",
+        started.elapsed()
+    );
+    Ok(())
+}

@@ -2945,6 +2945,7 @@ mod tests {
             upstream_of: None,
             exit_status: None,
             log_tail: None,
+            timed_out: None,
         }));
         assert_eq!(s.open_count(Op::Result), 0);
         assert_eq!((s.done(), s.failed()), (1, 1));

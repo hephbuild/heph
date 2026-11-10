@@ -1,4 +1,4 @@
-use crate::hartifactcontent::{WalkEntry, WalkEntryKind};
+use crate::hartifactcontent::{StopRead, WalkEntry, WalkEntryKind};
 use anyhow::Context;
 use std::fs::File;
 use std::io::{self, Cursor, Read, Write};
@@ -172,9 +172,21 @@ impl TarPacker {
     }
 
     pub fn pack<W: Write>(self, to: W) -> anyhow::Result<()> {
+        self.pack_with_stop(to, &|| false)
+    }
+
+    /// [`pack`](Self::pack), stopping with an error as soon as `stop` reads
+    /// true: polled before each entry and on every chunk of an entry's bytes
+    /// (see [`StopRead`]), so a cancelled pack reads and writes at most the
+    /// rest of one chunk after it is asked to stop. What was written to `to`
+    /// by then is a truncated archive; the caller must not publish it.
+    pub fn pack_with_stop<W: Write>(self, to: W, stop: &dyn Fn() -> bool) -> anyhow::Result<()> {
         let mut builder = tar::Builder::new(to);
 
         for entry in self.entries {
+            if stop() {
+                anyhow::bail!("tar pack stopped: the job was cancelled");
+            }
             match entry {
                 PackEntry::File { source, at } => {
                     let symlink_meta = std::fs::symlink_metadata(&source)
@@ -207,7 +219,11 @@ impl TarPacker {
                         header.set_size(meta.len());
                         header.set_mode(if x { 0o755 } else { 0o644 });
                         header.set_cksum();
-                        builder.append_data(&mut header, &at, &mut src)?;
+                        let src = StopRead {
+                            inner: &mut src,
+                            stop,
+                        };
+                        builder.append_data(&mut header, &at, src)?;
                     }
                 }
                 PackEntry::Raw { data, at, x } => {
@@ -221,9 +237,16 @@ impl TarPacker {
                     let src = File::open(&path).with_context(|| format!("open: {}", path))?;
                     let mut archive = tar::Archive::new(src);
                     for entry in archive.entries()? {
+                        if stop() {
+                            anyhow::bail!("tar pack stopped in {path}: the job was cancelled");
+                        }
                         let mut entry = entry?;
                         let header = entry.header().clone();
-                        builder.append(&header, &mut entry as &mut dyn io::Read)?;
+                        let entry = StopRead {
+                            inner: &mut entry as &mut dyn io::Read,
+                            stop,
+                        };
+                        builder.append(&header, entry)?;
                     }
                 }
             }
@@ -343,6 +366,92 @@ mod tests {
         assert!(
             format!("{err}").contains("absolute symlink not allowed"),
             "unexpected: {err}"
+        );
+    }
+
+    /// Counts what reaches it and trips `stop` once `trip_after` bytes have.
+    struct TripWriter {
+        written: u64,
+        trip_after: u64,
+        trip: Arc<AtomicBool>,
+    }
+
+    impl Write for TripWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.written += buf.len() as u64;
+            if self.written >= self.trip_after {
+                self.trip.store(true, Ordering::Release);
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A pack stopped while copying one large file stops within a chunk,
+    /// rather than reading the rest of the file.
+    #[test]
+    fn pack_stops_inside_a_large_file() {
+        const SIZE: u64 = 32 << 20;
+        const TRIP_AFTER: u64 = 1 << 20;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let big = dir.path().join("big.bin");
+        File::create(&big)
+            .and_then(|f| f.set_len(SIZE))
+            .expect("sparse file");
+
+        let mut packer = TarPacker::new();
+        packer.create_file(big.to_str().expect("utf-8 path"), "big.bin");
+        let trip = Arc::new(AtomicBool::new(false));
+        let mut w = TripWriter {
+            written: 0,
+            trip_after: TRIP_AFTER,
+            trip: Arc::clone(&trip),
+        };
+        let stop = || trip.load(Ordering::Acquire);
+
+        packer
+            .pack_with_stop(&mut w, &stop)
+            .expect_err("a stopped pack fails");
+        assert!(
+            w.written < 2 * TRIP_AFTER,
+            "stopped within a chunk of the trip: wrote {} of {SIZE}",
+            w.written
+        );
+    }
+
+    /// A pack stopped after one entry adds no further entry.
+    #[test]
+    fn pack_stops_between_entries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut packer = TarPacker::new();
+        for i in 0..20 {
+            let p = dir.path().join(format!("f{i}"));
+            std::fs::write(&p, b"x").expect("write");
+            packer.create_file(p.to_str().expect("utf-8 path"), format!("f{i}"));
+        }
+        // One small entry is a 512-byte header plus one 512-byte data block.
+        let trip = Arc::new(AtomicBool::new(false));
+        let mut w = TripWriter {
+            written: 0,
+            trip_after: 1024,
+            trip: Arc::clone(&trip),
+        };
+        let stop = || trip.load(Ordering::Acquire);
+
+        let err = packer
+            .pack_with_stop(&mut w, &stop)
+            .expect_err("a stopped pack fails");
+        assert!(format!("{err:#}").contains("cancelled"), "{err:#}");
+        // The trip lands on an entry boundary or one entry short of it,
+        // depending on how the tar builder splits its writes; either way at
+        // most one more entry follows it, not the other eighteen.
+        assert!(
+            w.written <= 2 * 1024,
+            "at most one entry past the stop: wrote {} of {}",
+            w.written,
+            21 * 1024
         );
     }
 

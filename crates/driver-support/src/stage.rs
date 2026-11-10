@@ -132,6 +132,7 @@ async fn stage_and_link_with_hook(
             link_root.to_path_buf(),
             list.map(|l| l.path().to_path_buf()),
             filters.to_vec(),
+            ctoken,
         )
         .await
         .with_context(|| format!("unshared unpack into {:?} (no content hash)", link_root))?;
@@ -240,16 +241,22 @@ async fn ensure_materialized(
         // `.ready` is written inside too: it is the witness that the entry is
         // complete, and publishing it from a future that may never be polled
         // again would leave a materialized entry nobody can use.
+        //
+        // A cancelled or dropped consumer stops the unpack early (see
+        // `crate::stop`) rather than finishing it for nobody: it then errors
+        // before `.ready`, still under the lock, and the next consumer clears
+        // the partial entry under the same lock and starts over — the path a
+        // crashed materialization already takes.
         let (content, entry_owned, ready_owned) =
             (Arc::clone(content), entry.clone(), ready.clone());
-        hcore::blocking::run(move || {
+        crate::stop::run_blocking(ctoken, move |stop| {
             let _guard = guard;
             // Re-check under the lock: another writer may have finished while we
             // waited. The `.ready` marker is the witness, written last.
             if ready_owned.exists() {
                 return Ok(());
             }
-            materialize(content.as_ref(), &entry_owned)
+            materialize(content.as_ref(), &entry_owned, stop)
                 .with_context(|| format!("materialize stage entry {:?}", entry_owned))?;
             std::fs::write(&ready_owned, b"")
                 .with_context(|| format!("write stage ready marker {:?}", ready_owned))
@@ -655,7 +662,7 @@ fn link_symlinked(
 ///
 /// Synchronous and byte-moving: reached from [`stage_and_link`] only through
 /// `hcore::blocking::run`.
-fn materialize(content: &dyn Content, entry: &Path) -> anyhow::Result<()> {
+fn materialize(content: &dyn Content, entry: &Path, stop: &dyn Fn() -> bool) -> anyhow::Result<()> {
     match hcore::fsutil::remove_dir_all(entry) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -664,7 +671,7 @@ fn materialize(content: &dyn Content, entry: &Path) -> anyhow::Result<()> {
         }
     }
     std::fs::create_dir_all(entry).with_context(|| format!("create stage entry {:?}", entry))?;
-    unpack::unpack(content, entry, None, None)
+    unpack::unpack_with_stop(content, entry, None, None, stop)
         .with_context(|| format!("unpack into stage entry {:?}", entry))?;
     // Publish read-only (Go-module-cache style) so no consumer can corrupt the
     // shared copy. `make_readonly_tree` lives next to its inverse

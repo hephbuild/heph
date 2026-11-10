@@ -896,6 +896,7 @@ mod tests {
             t.apply(&ev(
                 1_000,
                 BuildEventKind::ResultEnd {
+                    timed_out: None,
                     addr: format!("//root{i}:broken"),
                     error: Some("target failed".into()),
                     upstream_of: None,
@@ -908,6 +909,7 @@ mod tests {
             t.apply(&ev(
                 2_000,
                 BuildEventKind::ResultEnd {
+                    timed_out: None,
                     addr: format!("//services/api:t{i}"),
                     error: Some("dependency failed".into()),
                     upstream_of: Some("//root0:broken".into()),
@@ -1003,6 +1005,7 @@ mod tests {
             t.apply(&ev(
                 1_000,
                 BuildEventKind::ResultEnd {
+                    timed_out: None,
                     addr: format!("//pkg{i}:broken"),
                     error: Some(format!("execute failed: {huge}")),
                     upstream_of: None,
@@ -1035,6 +1038,7 @@ mod tests {
         t.apply(&ev(
             1_000,
             BuildEventKind::ResultEnd {
+                timed_out: None,
                 addr: "//a:x".into(),
                 // `format!("{e:#}")` puts the whole chain on ONE line, so a line
                 // cap alone would not bound this.
@@ -1055,6 +1059,7 @@ mod tests {
         t.apply(&ev(
             1_000,
             BuildEventKind::ResultEnd {
+                timed_out: None,
                 addr: format!("//パッケージ:{}", "名前".repeat(200)),
                 error: Some("エラー".repeat(500)),
                 upstream_of: None,
@@ -1095,6 +1100,7 @@ mod tests {
             t.apply(&ev(
                 2,
                 BuildEventKind::ResultEnd {
+                    timed_out: None,
                     addr: format!("//pkg:t{i}"),
                     error: None,
                     upstream_of: None,
@@ -1147,6 +1153,7 @@ mod tests {
         t.apply(&ev(
             252_000,
             BuildEventKind::ResultEnd {
+                timed_out: None,
                 addr: "//a:slow".into(),
                 error: None,
                 upstream_of: None,
@@ -1204,6 +1211,7 @@ mod tests {
         t.apply(&ev(
             5,
             BuildEventKind::ResultEnd {
+                timed_out: None,
                 addr: "//a:x".into(),
                 error: None,
                 upstream_of: None,
@@ -1396,6 +1404,7 @@ mod tests {
             t.apply(&ev(
                 2,
                 BuildEventKind::ResultEnd {
+                    timed_out: None,
                     addr: format!("//pkg{}:t{i}", i % 50),
                     error: None,
                     upstream_of: None,

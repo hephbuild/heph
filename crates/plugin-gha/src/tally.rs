@@ -369,6 +369,9 @@ impl Tally {
                 upstream_of,
                 exit_status,
                 log_tail,
+                // The message already says it timed out; the report has no
+                // separate place for it.
+                timed_out: _,
             } => {
                 self.finish(
                     addr,
@@ -934,6 +937,7 @@ mod tests {
         t.apply(&ev(
             end,
             BuildEventKind::ResultEnd {
+                timed_out: None,
                 addr: addr.into(),
                 error: None,
                 upstream_of: None,
@@ -951,6 +955,7 @@ mod tests {
         t.apply(&ev(
             10,
             BuildEventKind::ResultEnd {
+                timed_out: None,
                 addr: "//base:proto".into(),
                 error: Some("execute //base:proto: process exited with status 1".into()),
                 upstream_of: None,
@@ -962,6 +967,7 @@ mod tests {
             t.apply(&ev(
                 20,
                 BuildEventKind::ResultEnd {
+                    timed_out: None,
                     addr: format!("//services/api:t{i}"),
                     error: Some("dependency failed".into()),
                     upstream_of: Some("//base:proto".into()),
@@ -995,6 +1001,7 @@ mod tests {
             t.apply(&ev(
                 5,
                 BuildEventKind::ResultEnd {
+                    timed_out: None,
                     addr: "//a:x".into(),
                     error: Some("boom".into()),
                     upstream_of: None,
@@ -1531,6 +1538,7 @@ mod tests {
         t.apply(&ev(
             5,
             BuildEventKind::ResultEnd {
+                timed_out: None,
                 addr: "//a:x".into(),
                 error: Some("boom".into()),
                 upstream_of: None,
@@ -1548,6 +1556,7 @@ mod tests {
             t.apply(&ev(
                 0,
                 BuildEventKind::ResultEnd {
+                    timed_out: None,
                     addr: format!("//a:t{i}"),
                     error: Some("boom".into()),
                     upstream_of: None,
@@ -1569,6 +1578,7 @@ mod tests {
             t.apply(&ev(
                 0,
                 BuildEventKind::ResultEnd {
+                    timed_out: None,
                     addr: addr.into(),
                     error: Some("boom".into()),
                     upstream_of: None,
@@ -1589,6 +1599,7 @@ mod tests {
         t.apply(&ev(
             10,
             BuildEventKind::ResultEnd {
+                timed_out: None,
                 addr: "//services/api:test".into(),
                 error: Some("target failed: //services/api:test".into()),
                 upstream_of: None,
@@ -1633,6 +1644,7 @@ mod tests {
         t.apply(&ev(
             5_000,
             BuildEventKind::ResultEnd {
+                timed_out: None,
                 addr: "//a:x".into(),
                 error: None,
                 upstream_of: None,

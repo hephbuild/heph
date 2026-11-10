@@ -13,6 +13,27 @@ pub use view::{
 use std::io;
 use std::path::PathBuf;
 
+/// A reader that fails once `stop` reads true, so a long copy of a single
+/// entry ([`unpack::unpack_with_stop`], [`tar::TarPacker::pack_with_stop`])
+/// stops within one chunk instead of running to the end of the entry.
+///
+/// `stop` is polled on every `read` call, i.e. once per buffer-sized chunk:
+/// for a cancellation token that is an atomic load per chunk, and nothing is
+/// allocated unless it fires.
+pub(crate) struct StopRead<'a, R: ?Sized> {
+    pub(crate) inner: &'a mut R,
+    pub(crate) stop: &'a dyn Fn() -> bool,
+}
+
+impl<R: io::Read + ?Sized> io::Read for StopRead<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if (self.stop)() {
+            return Err(io::Error::other("stopped mid-entry: the job was cancelled"));
+        }
+        self.inner.read(buf)
+    }
+}
+
 pub struct WalkEntry {
     pub path: PathBuf,
     pub kind: WalkEntryKind,

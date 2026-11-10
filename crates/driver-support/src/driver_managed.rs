@@ -13,7 +13,6 @@ use hplugin::driver::{
 };
 use hplugin::provider::TargetSpec;
 use std::collections::{BTreeMap, HashMap};
-use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -406,18 +405,30 @@ fn staged_path(inputs: &[ManagedRunInput], origin_id: &str, arg: &str) -> anyhow
 ///
 /// The clones are of the output *declarations* (a handful of small structs), not
 /// of anything they name, and they buy the `'static` the pool needs.
+///
+/// Stops early, with a cancellation error, once `ctoken` is cancelled or this
+/// future is dropped (see [`crate::stop`]): between output paths, between the
+/// entries of a walked directory, and per chunk while packing.
 pub async fn collect_outputs(
     target: &hplugin::driver::targetdef::TargetDef,
     hashin: &str,
     ws_dir: &Path,
     sandbox_dir: &Path,
+    ctoken: &(dyn Cancellable + Send + Sync),
 ) -> anyhow::Result<Vec<outputartifact::OutputArtifact>> {
     let outputs = target.outputs.clone();
     let support_files = target.support_files.clone();
     let hashin = hashin.to_string();
     let (ws_dir, sandbox_dir) = (ws_dir.to_path_buf(), sandbox_dir.to_path_buf());
-    hcore::blocking::run(move || {
-        collect_outputs_inner(&outputs, &support_files, &hashin, &ws_dir, &sandbox_dir)
+    crate::stop::run_blocking(ctoken, move |stop| {
+        collect_outputs_inner(
+            &outputs,
+            &support_files,
+            &hashin,
+            &ws_dir,
+            &sandbox_dir,
+            stop,
+        )
     })
     .await
 }
@@ -430,6 +441,7 @@ fn collect_outputs_inner(
     hashin: &str,
     ws_dir: &Path,
     sandbox_dir: &Path,
+    stop: &dyn Fn() -> bool,
 ) -> anyhow::Result<Vec<outputartifact::OutputArtifact>> {
     let mut artifacts = Vec::new();
     for output in target_outputs {
@@ -441,9 +453,9 @@ fn collect_outputs_inner(
             if !path.collect {
                 continue;
             }
-            add_path_to_tar(&mut tar, ws_dir, path, &output.group)?;
+            add_path_to_tar(&mut tar, ws_dir, path, &output.group, stop)?;
         }
-        let tarpath = pack_to_artifact_tar(sandbox_dir, hashin, &output.group, tar)?;
+        let tarpath = pack_to_artifact_tar(sandbox_dir, hashin, &output.group, tar, stop)?;
         artifacts.push(outputartifact::OutputArtifact {
             group: output.group.clone(),
             name: format!("{}.tar", output.group),
@@ -457,9 +469,9 @@ fn collect_outputs_inner(
     if !support_files.is_empty() {
         let mut tar = hartifactcontent::tar::TarPacker::new();
         for path in support_files {
-            add_path_to_tar(&mut tar, ws_dir, path, "support")?;
+            add_path_to_tar(&mut tar, ws_dir, path, "support", stop)?;
         }
-        let (tarpath, hashout) = pack_to_artifact_tar(sandbox_dir, hashin, "support", tar)?;
+        let (tarpath, hashout) = pack_to_artifact_tar(sandbox_dir, hashin, "support", tar, stop)?;
         artifacts.push(outputartifact::OutputArtifact {
             group: String::new(),
             name: "support.tar".to_string(),
@@ -539,14 +551,19 @@ pub(crate) fn build_source_map(
 /// Cheap when nothing opts in — but an input that does costs an `entry_paths()`
 /// per artifact, which for tar-backed cache content is a header scan over a
 /// sqlite blob. That is real I/O and it does not belong on a tokio worker.
+///
+/// A job stopped by `ctoken` or by this future being dropped (see
+/// [`crate::stop`]) writes no file: it would land in a sandbox the next run of
+/// the target may already own.
 pub async fn write_source_map_blocking(
     inputs: Vec<ManagedRunInput>,
     ws_dir: &Path,
     sandbox_pkg_dir: &Path,
+    ctoken: &(dyn Cancellable + Send + Sync),
 ) -> anyhow::Result<Vec<ManagedRunInput>> {
     let (ws_dir, sandbox_pkg_dir) = (ws_dir.to_path_buf(), sandbox_pkg_dir.to_path_buf());
-    hcore::blocking::run(move || {
-        write_source_map(&inputs, &ws_dir, &sandbox_pkg_dir)?;
+    crate::stop::run_blocking(ctoken, move |stop| {
+        write_source_map(&inputs, &ws_dir, &sandbox_pkg_dir, stop)?;
         anyhow::Ok(inputs)
     })
     .await
@@ -556,10 +573,14 @@ pub fn write_source_map(
     inputs: &[ManagedRunInput],
     ws_dir: &Path,
     sandbox_pkg_dir: &Path,
+    stop: &dyn Fn() -> bool,
 ) -> anyhow::Result<()> {
     let source_map = build_source_map(inputs, ws_dir)?;
     if source_map.is_empty() {
         return Ok(());
+    }
+    if stop() {
+        return Err(crate::stop::cancelled());
     }
     let source_map_json =
         serde_json::to_string(&source_map).with_context(|| "serialize source_map")?;
@@ -610,10 +631,22 @@ pub fn list_path_for(input: &RunInput, list_dir: &Path) -> Option<PathBuf> {
 /// Synchronous and I/O-bound: call it from
 /// [`detect_output_collisions_blocking`] rather than directly from an `async fn`.
 pub fn detect_output_collisions(groups: &BTreeMap<PathBuf, Vec<RunInput>>) -> anyhow::Result<()> {
+    detect_output_collisions_with_stop(groups, &|| false)
+}
+
+/// [`detect_output_collisions`], returning a cancellation error before the
+/// next input's enumeration once `stop` reads true.
+pub fn detect_output_collisions_with_stop(
+    groups: &BTreeMap<PathBuf, Vec<RunInput>>,
+    stop: &dyn Fn() -> bool,
+) -> anyhow::Result<()> {
     // Absolute sandbox path -> the target that claimed it.
     let mut owners: HashMap<PathBuf, Addr> = HashMap::new();
     for (unpack_root, inputs) in groups {
         for input in inputs {
+            if stop() {
+                return Err(crate::stop::cancelled());
+            }
             let producer = &input.source_addr;
             let paths = input.artifact.content.entry_paths().with_context(|| {
                 format!(
@@ -676,13 +709,19 @@ pub fn detect_output_collisions(groups: &BTreeMap<PathBuf, Vec<RunInput>>) -> an
 /// list. Shared by both sandbox runners and by [`crate::stage`] so the discipline
 /// has one definition — and one test — rather than three copies, only some of
 /// which run on a host with a FUSE mount.
+///
+/// Stops with a cancellation error, between entries or mid-copy within one
+/// chunk, once `ctoken` is cancelled or this future is dropped (see
+/// [`crate::stop`]). Without that, a dropped run's unpack kept writing its
+/// inputs into the per-addr sandbox the next run of the target reuses.
 pub async fn unpack_blocking(
     content: Arc<dyn hartifactcontent::Content>,
     dst: PathBuf,
     list_path: Option<PathBuf>,
     filters: Vec<String>,
+    ctoken: &(dyn Cancellable + Send + Sync),
 ) -> anyhow::Result<()> {
-    hcore::blocking::run(move || {
+    crate::stop::run_blocking(ctoken, move |stop| {
         let compiled = hartifactcontent::PathFilter::new(&filters);
         let pred = |rel: &Path| compiled.matches(rel);
         let predicate: Option<&dyn Fn(&Path) -> bool> = if compiled.is_empty() {
@@ -690,7 +729,13 @@ pub async fn unpack_blocking(
         } else {
             Some(&pred)
         };
-        hartifactcontent::unpack::unpack(content.as_ref(), &dst, list_path.as_deref(), predicate)
+        hartifactcontent::unpack::unpack_with_stop(
+            content.as_ref(),
+            &dst,
+            list_path.as_deref(),
+            predicate,
+            stop,
+        )
     })
     .await
 }
@@ -705,11 +750,14 @@ pub async fn unpack_blocking(
 /// Inline in an `async fn` that is exactly the runtime-worker stall
 /// `hcore::blocking` exists to remove; inside a blocking job the park is the
 /// backend's documented contract.
+///
+/// Stops between inputs once `ctoken` is cancelled or this future is dropped.
 pub async fn detect_output_collisions_blocking(
     groups: BTreeMap<PathBuf, Vec<RunInput>>,
+    ctoken: &(dyn Cancellable + Send + Sync),
 ) -> anyhow::Result<BTreeMap<PathBuf, Vec<RunInput>>> {
-    hcore::blocking::run(move || {
-        detect_output_collisions(&groups)?;
+    crate::stop::run_blocking(ctoken, move |stop| {
+        detect_output_collisions_with_stop(&groups, stop)?;
         anyhow::Ok(groups)
     })
     .await
@@ -755,7 +803,11 @@ fn add_path_to_tar(
     ws_dir: &Path,
     path: &path::Path,
     group_for_err: &str,
+    stop: &dyn Fn() -> bool,
 ) -> anyhow::Result<()> {
+    if stop() {
+        return Err(crate::stop::cancelled());
+    }
     match &path.content {
         Content::FilePath(fp) => {
             let source = ws_dir.join(fp);
@@ -800,6 +852,9 @@ fn add_path_to_tar(
             // buffers each directory's entries, so this reuses that buffer
             // instead of collecting the whole tree to sort it.
             for entry in walkdir::WalkDir::new(&dir_full).sort_by_file_name() {
+                if stop() {
+                    return Err(crate::stop::cancelled());
+                }
                 let entry = entry.with_context(|| {
                     format!("walk output dir {:?} (group={})", dir_full, group_for_err)
                 })?;
@@ -823,6 +878,9 @@ fn add_path_to_tar(
             for matched in glob::glob(&full_pattern)
                 .with_context(|| format!("compile output glob {full_pattern:?}"))?
             {
+                if stop() {
+                    return Err(crate::stop::cancelled());
+                }
                 let matched =
                     matched.with_context(|| format!("glob entry from {full_pattern:?}"))?;
                 let md = fs::symlink_metadata(&matched).with_context(|| {
@@ -849,30 +907,53 @@ fn add_path_to_tar(
     Ok(())
 }
 
+/// Pack `tar` into a new file under `<sandbox>/heph-collect-artifacts/` and
+/// return its path and hashout.
+///
+/// The file is **created fresh, under a name no other run can hold**
+/// (`<hashin>-<group>-<random>.tar`, `O_EXCL`), and kept only once the pack
+/// completes; a failed or stopped pack deletes it. The sandbox path is per
+/// addr, so with a fixed name (it used to be `<hashin>-<group>.tar`, opened
+/// with a truncating create) a dropped run's straggling pack could truncate
+/// and rewrite the very file a later run of the same target had just packed
+/// and hashed — and that later run would cache bytes that are not its
+/// recorded hashout. A unique name makes that impossible whatever the
+/// straggler does, rather than only unlikely once it observes its stop.
 fn pack_to_artifact_tar(
     sandbox_dir: &Path,
     hashin: &str,
     name_suffix: &str,
     tar: hartifactcontent::tar::TarPacker,
+    stop: &dyn Fn() -> bool,
 ) -> anyhow::Result<(String, String)> {
     let artifacts_dir = sandbox_dir.join("heph-collect-artifacts");
     fs::create_dir_all(&artifacts_dir)
         .with_context(|| format!("create artifacts dir {:?}", artifacts_dir))?;
-    let tarpath = artifacts_dir
-        .join(format!("{}-{}.tar", hashin, name_suffix))
-        .to_string_lossy()
-        .into_owned();
-    let tarf = File::create(Path::new(&tarpath))
-        .with_context(|| format!("create output tar {tarpath:?}"))?;
+    let prefix = format!("{hashin}-{name_suffix}-");
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(&prefix).suffix(".tar");
+    // The mode `File::create` used (0o666 less the umask), not tempfile's
+    // owner-only default: the engine adopts this file as the cache blob by
+    // rename, mode and all.
+    #[cfg(unix)]
+    builder.permissions(<fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o666));
+    let tmp = builder
+        .tempfile_in(&artifacts_dir)
+        .with_context(|| format!("create output tar in {artifacts_dir:?}"))?;
 
     let mut hw = HashingWriter {
-        inner: tarf,
+        inner: tmp.as_file(),
         hasher: Xxh3::new(),
     };
 
-    tar.pack(&mut hw).with_context(|| "pack")?;
+    tar.pack_with_stop(&mut hw, stop)
+        .with_context(|| format!("pack output tar {:?}", tmp.path()))?;
+    let hashout = format!("{:x}", hw.hasher.digest());
 
-    Ok((tarpath, format!("{:x}", hw.hasher.digest())))
+    let (_file, tarpath) = tmp
+        .keep()
+        .with_context(|| format!("keep output tar in {artifacts_dir:?}"))?;
+    Ok((tarpath.to_string_lossy().into_owned(), hashout))
 }
 
 #[cfg(test)]
@@ -937,6 +1018,7 @@ mod source_map_tests {
     use super::*;
     use hcore::hartifactcontent::tar::{TarPacker, TarWalker};
     use hcore::hartifactcontent::{Content, WalkEntry};
+    use hcore::hasync::StdCancellationToken;
     use hmodel::htaddr::parse_addr;
     use hplugin::driver::inputartifact::{InputArtifact, Type};
     use std::io::{Cursor, Read};
@@ -1091,7 +1173,7 @@ mod source_map_tests {
         fs::create_dir_all(dir.path().join("out")).expect("mkdir");
         let p = out_path(path::Content::FilePath("out".to_string()));
         let mut tar = TarPacker::new();
-        let err = add_path_to_tar(&mut tar, dir.path(), &p, "bin").unwrap_err();
+        let err = add_path_to_tar(&mut tar, dir.path(), &p, "bin", &|| false).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("is a directory"), "got: {msg}");
         assert!(
@@ -1108,7 +1190,7 @@ mod source_map_tests {
         fs::write(dir.path().join("out"), b"x").expect("write");
         let p = out_path(path::Content::DirPath("out".to_string()));
         let mut tar = TarPacker::new();
-        let err = add_path_to_tar(&mut tar, dir.path(), &p, "data").unwrap_err();
+        let err = add_path_to_tar(&mut tar, dir.path(), &p, "data", &|| false).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("is a file"), "got: {msg}");
         assert!(
@@ -1137,7 +1219,7 @@ mod source_map_tests {
 
         let p = out_path(path::Content::DirPath("out".to_string()));
         let mut tar = TarPacker::new();
-        add_path_to_tar(&mut tar, dir.path(), &p, "data").expect("add dir output");
+        add_path_to_tar(&mut tar, dir.path(), &p, "data", &|| false).expect("add dir output");
         let mut buf = Vec::new();
         tar.pack(&mut buf).expect("pack");
 
@@ -1359,7 +1441,8 @@ mod source_map_tests {
         input.input.artifact.content = content;
         input.unpack_root = ws_dir.clone();
 
-        let inputs = write_source_map_blocking(vec![input], &ws_dir, &pkg_dir)
+        let ct = StdCancellationToken::new();
+        let inputs = write_source_map_blocking(vec![input], &ws_dir, &pkg_dir, &ct)
             .await
             .expect("write source map");
 
@@ -1384,7 +1467,8 @@ mod source_map_tests {
         let mut input = make_input("dep|a|0", "//pkg:_a", &[("pkg/x.txt", "1")]);
         input.input.artifact.content = content;
 
-        let groups = detect_output_collisions_blocking(group(vec![input]))
+        let ct = StdCancellationToken::new();
+        let groups = detect_output_collisions_blocking(group(vec![input]), &ct)
             .await
             .expect("no collision");
 
@@ -1405,9 +1489,15 @@ mod source_map_tests {
         fs::create_dir_all(&dst).expect("mkdir");
         let (content, thread) = recording_content(&[("pkg/x.txt", "hello")]);
 
-        unpack_blocking(content, dst.clone(), None, Vec::new())
-            .await
-            .expect("unpack");
+        unpack_blocking(
+            content,
+            dst.clone(),
+            None,
+            Vec::new(),
+            &StdCancellationToken::new(),
+        )
+        .await
+        .expect("unpack");
 
         assert_eq!(
             fs::read_to_string(dst.join("pkg/x.txt")).expect("unpacked file"),
@@ -1415,5 +1505,284 @@ mod source_map_tests {
             "the tree must still be materialized"
         );
         assert_ran_on_blocking_pool(&thread, "unpacking an input");
+    }
+}
+
+/// A managed run's staging and collection stop when the run is cancelled or
+/// dropped (see [`crate::stop`]): a job that ran on would keep writing into the
+/// per-addr sandbox the next run of the target reuses.
+#[cfg(test)]
+mod cancel_tests {
+    use super::*;
+    use hcore::hartifactcontent::{Content as HContent, WalkEntry, WalkEntryKind};
+    use hcore::hasync::StdCancellationToken;
+    use hplugin::driver::targetdef::{Output, TargetDef};
+    use std::io::{Cursor, Read};
+
+    /// `n` one-byte files `f0..`, calling `on_entry(i)` as entry `i` is walked.
+    struct Entries {
+        n: usize,
+        on_entry: Box<dyn Fn(usize) + Send + Sync>,
+    }
+
+    impl HContent for Entries {
+        fn reader(&self) -> anyhow::Result<Box<dyn Read>> {
+            anyhow::bail!("walk only")
+        }
+        fn walk(&self) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<WalkEntry>> + '_>> {
+            Ok(Box::new((0..self.n).map(move |i| {
+                (self.on_entry)(i);
+                Ok(WalkEntry {
+                    path: PathBuf::from(format!("f{i}")),
+                    kind: WalkEntryKind::File {
+                        data: Box::new(Cursor::new(b"x".to_vec())),
+                        x: false,
+                        size: 1,
+                    },
+                })
+            })))
+        }
+        fn hashout(&self) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    fn files_in(dir: &Path) -> usize {
+        fs::read_dir(dir).map_or(0, Iterator::count)
+    }
+
+    /// The run's token cancelled mid-unpack: the unpack returns a
+    /// cancellation, and writes nothing past the entry it was cancelled at.
+    #[tokio::test]
+    async fn a_cancelled_unpack_stops_with_a_cancellation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ct = StdCancellationToken::new();
+        let at = ct.clone();
+        let content: Arc<dyn HContent> = Arc::new(Entries {
+            n: 200,
+            on_entry: Box::new(move |i| {
+                if i == 10 {
+                    at.cancel();
+                }
+            }),
+        });
+
+        let err = unpack_blocking(content, dir.path().to_path_buf(), None, Vec::new(), &ct)
+            .await
+            .expect_err("a cancelled unpack fails");
+
+        assert!(hplugin::error::is_cancelled(&err), "{err:#}");
+        assert_eq!(files_in(dir.path()), 10, "nothing from the cancel on");
+    }
+
+    /// The same unpack, uncancelled, writes every entry.
+    #[tokio::test]
+    async fn an_uncancelled_unpack_writes_everything() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let content: Arc<dyn HContent> = Arc::new(Entries {
+            n: 200,
+            on_entry: Box::new(|_| {}),
+        });
+        let ct = StdCancellationToken::new();
+        unpack_blocking(content, dir.path().to_path_buf(), None, Vec::new(), &ct)
+            .await
+            .expect("unpack");
+        assert_eq!(files_in(dir.path()), 200);
+    }
+
+    /// Sends once when dropped.
+    struct Done(std::sync::mpsc::Sender<()>);
+
+    impl Drop for Done {
+        fn drop(&mut self) {
+            // The receiver may be gone if the test already failed; nothing
+            // is left to tell then.
+            if self.0.send(()).is_err() {}
+        }
+    }
+
+    /// `inner`, plus a [`Done`] that fires when the job drops the content.
+    struct Witness {
+        inner: Entries,
+        _done: Done,
+    }
+
+    impl HContent for Witness {
+        fn reader(&self) -> anyhow::Result<Box<dyn Read>> {
+            self.inner.reader()
+        }
+        fn walk(&self) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<WalkEntry>> + '_>> {
+            self.inner.walk()
+        }
+        fn hashout(&self) -> anyhow::Result<String> {
+            self.inner.hashout()
+        }
+    }
+
+    /// The caller's future dropped mid-unpack — the engine abandoning a run
+    /// that outlived its grace, `--fail-fast`, Ctrl-C — with the token never
+    /// cancelled: the detached job stops at its next entry instead of writing
+    /// on into a sandbox the next run may own.
+    ///
+    /// Deterministic: the walk parks at entry 10 until the test has dropped
+    /// the future, and the content reports when the job has let go of it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_abandoned_unpack_stops_writing() {
+        use std::sync::Barrier;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let reached = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let (r, l) = (Arc::clone(&reached), Arc::clone(&release));
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let content: Arc<dyn HContent> = Arc::new(Witness {
+            inner: Entries {
+                n: 200,
+                on_entry: Box::new(move |i| {
+                    if i == 10 {
+                        r.wait();
+                        l.wait();
+                    }
+                }),
+            },
+            _done: Done(done_tx),
+        });
+
+        let dst = dir.path().to_path_buf();
+        let task = tokio::spawn(async move {
+            let ct = StdCancellationToken::new();
+            unpack_blocking(content, dst, None, Vec::new(), &ct).await
+        });
+        tokio::task::spawn_blocking(move || reached.wait())
+            .await
+            .expect("the walk reaches entry 10");
+        task.abort();
+        let join = task.await;
+        assert!(
+            join.as_ref()
+                .is_err_and(tokio::task::JoinError::is_cancelled),
+            "the caller's future is dropped"
+        );
+        tokio::task::spawn_blocking(move || {
+            release.wait();
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .expect("the detached job finishes");
+        })
+        .await
+        .expect("join");
+
+        assert_eq!(files_in(dir.path()), 10, "the abandoned job wrote no more");
+    }
+
+    /// A sandbox with `ws/out/<name>` files, and a target collecting `out`.
+    fn sandbox_with_outputs(files: &[(&str, &[u8])]) -> (tempfile::TempDir, TargetDef) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("ws/out");
+        fs::create_dir_all(&out).expect("mkdir");
+        for (name, body) in files {
+            fs::write(out.join(name), body).expect("write");
+        }
+        let target = TargetDef {
+            outputs: vec![Output {
+                group: "bin".to_string(),
+                paths: vec![path::Path {
+                    content: Content::DirPath("out".to_string()),
+                    codegen_tree: path::CodegenMode::None,
+                    collect: true,
+                }],
+            }],
+            ..TargetDef::default()
+        };
+        (dir, target)
+    }
+
+    fn artifacts_dir(sandbox: &Path) -> PathBuf {
+        sandbox.join("heph-collect-artifacts")
+    }
+
+    /// Collection for a run already cancelled packs nothing.
+    #[tokio::test]
+    async fn a_cancelled_collect_packs_nothing() {
+        let (dir, target) = sandbox_with_outputs(&[("a", b"a")]);
+        let ct = StdCancellationToken::new();
+        ct.cancel();
+        let err = collect_outputs(&target, "h", &dir.path().join("ws"), dir.path(), &ct)
+            .await
+            .err()
+            .expect("cancelled");
+        assert!(hplugin::error::is_cancelled(&err), "{err:#}");
+        assert_eq!(files_in(&artifacts_dir(dir.path())), 0, "no tar");
+    }
+
+    /// Stopped part-way through packing a large output, collection fails and
+    /// leaves no tar behind: a partial tar is never kept, so it can never be
+    /// mistaken for an output.
+    #[test]
+    fn a_collect_stopped_mid_pack_leaves_no_tar() {
+        const SIZE: u64 = 32 << 20;
+        let (dir, target) = sandbox_with_outputs(&[]);
+        fs::File::create(dir.path().join("ws/out/big"))
+            .and_then(|f| f.set_len(SIZE))
+            .expect("sparse output");
+        let arts = artifacts_dir(dir.path());
+        // Stops once the tar being written passes 1 MiB: the observable,
+        // deterministic middle of the pack.
+        let stop = || {
+            fs::read_dir(&arts).is_ok_and(|rd| {
+                rd.flatten()
+                    .any(|e| e.metadata().is_ok_and(|m| m.len() >= 1 << 20))
+            })
+        };
+
+        let stopped = collect_outputs_inner(
+            &target.outputs,
+            &[],
+            "h",
+            &dir.path().join("ws"),
+            dir.path(),
+            &stop,
+        );
+        assert!(stopped.is_err(), "a stopped collect fails");
+        assert_eq!(files_in(&arts), 0, "the partial tar is removed");
+    }
+
+    /// Each collection packs into a file of its own. The sandbox path is per
+    /// addr, so with one fixed name per hashin a dropped run's straggling pack
+    /// could truncate the tar a later run of the same target recorded.
+    #[tokio::test]
+    async fn collected_tars_never_share_a_path() {
+        let (dir, target) = sandbox_with_outputs(&[("a", b"first")]);
+        let ws = dir.path().join("ws");
+        let ct = StdCancellationToken::new();
+
+        let first = collect_outputs(&target, "h", &ws, dir.path(), &ct)
+            .await
+            .expect("collect");
+        fs::write(ws.join("out/a"), b"second, longer").expect("rewrite");
+        let second = collect_outputs(&target, "h", &ws, dir.path(), &ct)
+            .await
+            .expect("collect");
+
+        let mut paths = Vec::new();
+        for a in first.iter().chain(&second) {
+            let TarPath(p) = &a.content else {
+                panic!("collected outputs are tar paths")
+            };
+            let p = PathBuf::from(&p.path);
+            let name = p.file_name().and_then(|n| n.to_str()).expect("name");
+            assert!(
+                name.starts_with("h-bin-") && name.ends_with(".tar"),
+                "{name}"
+            );
+            let bytes = fs::read(&p).expect("the tar is kept");
+            assert_eq!(
+                format!("{:x}", xxhash_rust::xxh3::xxh3_64(&bytes)),
+                a.hashout,
+                "each tar holds exactly the bytes its hashout names"
+            );
+            paths.push(p);
+        }
+        assert_eq!(paths.len(), 2, "one tar per collection");
+        assert_ne!(paths[0], paths[1], "two runs never pack into the same file");
     }
 }
