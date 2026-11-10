@@ -190,8 +190,10 @@ token, wait a 10s grace, then abandon the run and fail the target.
 
 Read `docs/TIMEOUTS.md` before touching it. The one thing to know going in: a
 timed-out run must stay a *failure*, never a cancellation (`is_cancelled` false,
-log kept, nothing cached), and like `resources` the timeout must never reach a
-hash.
+log kept, nothing cached; `ResultEnd.timed_out` is the typed signal), and like
+`resources` the timeout must never reach a hash, nor the run (argv, env,
+files). For `exec`/`bash` the clock includes staging inputs and collecting
+outputs, which stop within one chunk of a cancel.
 
 ### The `template` driver
 

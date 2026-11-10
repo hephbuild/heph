@@ -38,27 +38,51 @@ by ignoring it:
 
 A timeout is a **failure**, not a cancellation: the failure box shows the log
 tail, the sandbox is kept for diagnostics, `--fail-fast` reacts to it, and
-nothing is cached, so the next build runs the target again.
+nothing is cached, so the next build runs the target again. (A cancellation
+gets no failure slot: when the request was cancelled, by `--fail-fast` or
+Ctrl-C, a run's error is treated as that cancellation unless it is a timeout,
+so a real failure racing the cancel is not slotted either.)
+
+A machine tells a timeout from any other failure by the `ResultEnd` event's
+`timed_out` field (`{timeout_ms, abandoned}`), not by reading `error`. It is
+unset for every other outcome, and from a host that predates timeouts.
+
+A cache hit shows nothing: nothing ran. The timeout is per target only; there
+is no workspace-wide default yet.
 
 ## What the clock covers
 
-Only the driver's `run`: not the wait for admission (`resources`), not building
-dependencies, not preparing the sandbox. A target queued behind others does not
-burn its timeout while it waits.
+The driver's `run`: not the wait for admission (`resources`), not building
+dependencies. A target queued behind others does not burn its timeout while it
+waits.
+
+For `exec`/`bash` (managed drivers), `run` includes staging the inputs into the
+sandbox and collecting the outputs, so those count. Heph's own staging and
+collection stop within one chunk once the run is cancelled, so they never use
+up the grace; only the driver's process can. Leftover jobs of an abandoned run
+stop as soon as it is dropped, and each output tar is written under a name
+unique to its run, so a leftover job cannot overwrite a later run's artifact.
 
 `--shell` is never timed: it is a person at a prompt. An entrypoint
-(`heph run //x`) is held to its `timeout` like a build.
+(`heph run //x`) is held to its `timeout` like a build, and a timed-out
+entrypoint exits 125. On the caller's terminal (inherited stdio, not a PTY)
+the tool shares heph's process group, so only its direct child is killed: a
+process it forked can outlive it.
 
 ## Never hashed
 
 A limit does not change what a run that finishes within it produces, so the
 timeout reaches no def hash, input hash or cache key: changing it, adding it or
-removing it never rebuilds anything.
+removing it never rebuilds anything. That holds only while the run cannot see
+its limit: a driver must not expose the timeout to the run (argv, env, a
+file), or the run's outputs can depend on a value no hash covers.
 
 ## Which drivers accept it
 
 `exec` and `bash`. Every other in-tree driver refuses `timeout` as an unknown
-attribute at parse, so a declaration is never silently ignored. A driver adds
+attribute at parse, so a declaration is never silently ignored; that holds for
+drivers whose spec is built on the `Spec` derive, which refuses unknown keys. A
+driver adds
 it by carrying a `timeout: Option<hplugin::driver::Timeout>` field on its spec
 and moving it onto `TargetDef.timeout`; it must not fold it into its own def or
 hash. A cdylib driver can do the same: its timeout is enforced exactly like an

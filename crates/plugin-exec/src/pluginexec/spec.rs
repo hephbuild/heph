@@ -118,10 +118,12 @@ pub(crate) struct TargetSpec {
     /// onto the engine's def, never into exec's own. Refused on an entrypoint.
     pub resources: hplugin::driver::Resources,
     /// How long the run may take, e.g. `"10m"`, `"1h30m"`, or a number of
-    /// seconds. Past it heph cancels the run (the process group is killed),
+    /// seconds. The clock covers staging inputs, the process and collecting
+    /// outputs. Past it heph cancels the run (the process group is killed;
+    /// for an entrypoint on the caller's terminal, only its direct child),
     /// and the target fails as timed out; nothing is cached. Enforced by the
-    /// engine, never hashed: changing it does not rebuild. Not applied to
-    /// `--shell`.
+    /// engine, never hashed, never shown to the run: changing it does not
+    /// rebuild. Not applied to `--shell`.
     pub timeout: Option<hplugin::driver::Timeout>,
 }
 
