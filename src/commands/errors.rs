@@ -8,7 +8,9 @@ use std::sync::Arc;
 
 use crossterm::style::Stylize;
 
-use crate::engine::error::{CancelledError, FrozenCheckError, TargetFailure};
+use crate::engine::error::{
+    CancelledError, FailureFixes, FixesNotWritten, FrozenCheckError, TargetFailure,
+};
 use crate::hmemoizer::{chain_frames, downcast_chain_ref};
 use crate::tui::color::stderr_color_enabled as color_enabled;
 
@@ -151,7 +153,82 @@ fn render_target_failure(f: &TargetFailure, color: bool) -> String {
     if let Some(path) = f.log.as_ref().and_then(|l| l.path()) {
         out.push_str(&format!("  full log: {}\n", path.display()));
     }
+    if let Some(outputs) = &f.outputs {
+        out.push_str(&format!("  outputs: {}\n", outputs.display()));
+    }
+    if let Some(fixes) = &f.fixes {
+        render_fixes(&mut out, fixes);
+    }
     out
+}
+
+/// How many written-back paths the box names before it points at `fixes.txt`.
+const FIXES_SHOWN: usize = 10;
+
+/// The box's account of a failed `in_place` run's write-back (D20): the files
+/// it changed and how to undo that, or why it changed nothing. A write-back
+/// that matched the tree already says nothing.
+fn render_fixes(out: &mut String, fixes: &FailureFixes) {
+    match fixes {
+        FailureFixes::Written { paths, .. } if paths.is_empty() => {}
+        FailureFixes::Written { paths, list } => {
+            out.push_str(
+                "  fixes written, target still failed (re-run to verify; \
+                 codegen = \"in_place_on_success\" opts out):\n",
+            );
+            for p in paths.iter().take(FIXES_SHOWN) {
+                out.push_str(&format!("    {p}\n"));
+            }
+            let more = paths.len().saturating_sub(FIXES_SHOWN);
+            match list {
+                Some(list) if more > 0 => {
+                    out.push_str(&format!(
+                        "    +{more} more (full list: {})\n",
+                        list.display()
+                    ));
+                    // The list is one path per line, which is what git's
+                    // `--pathspec-from-file` reads: no xargs word splitting.
+                    out.push_str(&format!(
+                        "  restore with: git checkout --pathspec-from-file={}\n",
+                        shell_quote(&list.to_string_lossy())
+                    ));
+                }
+                _ => {
+                    if more > 0 {
+                        out.push_str(&format!("    +{more} more\n"));
+                    }
+                    // With no list to point at, the hint names every path:
+                    // a truncated restore would silently leave files behind.
+                    let quoted: Vec<_> = paths.iter().map(|p| shell_quote(p)).collect();
+                    out.push_str(&format!(
+                        "  restore with: git checkout -- {}\n",
+                        quoted.join(" ")
+                    ));
+                }
+            }
+        }
+        FailureFixes::NotWritten(reason) => {
+            let reason = match reason {
+                FixesNotWritten::Signal(sig) => format!("killed by signal {sig}"),
+                FixesNotWritten::HighExit(code) => {
+                    format!("exit {code} (128+, treated as a signal)")
+                }
+                FixesNotWritten::MovedSource => {
+                    "an in_place source changed while the target ran".to_string()
+                }
+                FixesNotWritten::Frozen => {
+                    "--frozen checks the tree, it never writes it".to_string()
+                }
+            };
+            out.push_str(&format!("  fixes not written: {reason}\n"));
+        }
+    }
+}
+
+/// `s` as one shell word, so a restore hint pastes as-is. A path that cannot
+/// be quoted (a NUL byte) is printed raw: it could not be passed to git either.
+fn shell_quote(s: &str) -> std::borrow::Cow<'_, str> {
+    shlex::try_quote(s).unwrap_or(std::borrow::Cow::Borrowed(s))
 }
 
 /// Render each recorded target failure, separated by a blank line. Pure, so the
@@ -1366,6 +1443,108 @@ mod tests {
     ╰────
 ";
         assert_eq!(rendered, expected);
+    }
+
+    #[test]
+    fn renders_failure_outputs_and_fixes() {
+        let addr = || crate::htaddr::parse_addr("//web:lint").unwrap();
+        let slot = std::path::Path::new("/ws/.heph/failures/abc");
+
+        // Few fixes: every path, and a restore hint naming each one.
+        let f = TargetFailure::new(addr(), None, anyhow::anyhow!("boom"))
+            .with_outputs(Some(slot.join("out")))
+            .with_fixes(Some(FailureFixes::Written {
+                paths: vec!["web/a.ts".into(), "web/my file.ts".into()],
+                list: Some(slot.join("fixes.txt")),
+            }));
+        let expected = "\
+× target failed: //web:lint
+╰─▶ boom
+  outputs: /ws/.heph/failures/abc/out
+  fixes written, target still failed (re-run to verify; codegen = \"in_place_on_success\" opts out):
+    web/a.ts
+    web/my file.ts
+  restore with: git checkout -- web/a.ts 'web/my file.ts'
+";
+        assert_eq!(render_target_failure(&f, false), expected);
+
+        // Twelve fixes: ten named, the rest counted, and the restore reads the
+        // full list rather than the ten the box shows.
+        let paths: Vec<String> = (0..12).map(|i| format!("web/f{i:02}.ts")).collect();
+        let f = TargetFailure::new(addr(), None, anyhow::anyhow!("boom")).with_fixes(Some(
+            FailureFixes::Written {
+                paths: paths.clone(),
+                list: Some(slot.join("fixes.txt")),
+            },
+        ));
+        let rendered = render_target_failure(&f, false);
+        let mut expected = String::from(
+            "× target failed: //web:lint\n╰─▶ boom\n  fixes written, target still failed \
+             (re-run to verify; codegen = \"in_place_on_success\" opts out):\n",
+        );
+        for p in &paths[..10] {
+            expected.push_str(&format!("    {p}\n"));
+        }
+        expected.push_str(
+            "    +2 more (full list: /ws/.heph/failures/abc/fixes.txt)\n  restore with: git \
+             checkout --pathspec-from-file=/ws/.heph/failures/abc/fixes.txt\n",
+        );
+        assert_eq!(rendered, expected);
+        assert!(!rendered.contains("outputs:"), "{rendered}");
+
+        // Twelve fixes and no list kept: the hint still names all twelve.
+        let f = TargetFailure::new(addr(), None, anyhow::anyhow!("boom")).with_fixes(Some(
+            FailureFixes::Written {
+                paths: paths.clone(),
+                list: None,
+            },
+        ));
+        let rendered = render_target_failure(&f, false);
+        assert!(rendered.contains("    +2 more\n"), "{rendered}");
+        assert!(
+            rendered.ends_with(&format!(
+                "  restore with: git checkout -- {}\n",
+                paths.join(" ")
+            )),
+            "{rendered}"
+        );
+
+        // A write-back that matched the tree already says nothing.
+        let f = TargetFailure::new(addr(), None, anyhow::anyhow!("boom")).with_fixes(Some(
+            FailureFixes::Written {
+                paths: vec![],
+                list: None,
+            },
+        ));
+        assert_eq!(
+            render_target_failure(&f, false),
+            "× target failed: //web:lint\n╰─▶ boom\n"
+        );
+
+        for (reason, line) in [
+            (FixesNotWritten::Signal(9), "killed by signal 9"),
+            (
+                FixesNotWritten::HighExit(137),
+                "exit 137 (128+, treated as a signal)",
+            ),
+            (
+                FixesNotWritten::MovedSource,
+                "an in_place source changed while the target ran",
+            ),
+            (
+                FixesNotWritten::Frozen,
+                "--frozen checks the tree, it never writes it",
+            ),
+        ] {
+            let f = TargetFailure::new(addr(), None, anyhow::anyhow!("boom"))
+                .with_fixes(Some(FailureFixes::NotWritten(reason)));
+            let rendered = render_target_failure(&f, false);
+            assert!(
+                rendered.ends_with(&format!("  fixes not written: {line}\n")),
+                "{reason:?}: {rendered}"
+            );
+            assert!(!rendered.contains("restore with"), "{rendered}");
+        }
     }
 
     #[test]
