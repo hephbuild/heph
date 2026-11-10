@@ -263,6 +263,39 @@ fn no_tui_flag_wins_over_an_attached_terminal() {
     );
 }
 
+/// With stdout piped into a reader, the interactive renderer must stay off even
+/// though stderr is a terminal. The reader prints to that same terminal while
+/// the TUI holds it raw, so `heph q //p | grep x` printed its matches as a
+/// staircase with the TUI's redraws interleaved into them. The matches must
+/// still come through, and stderr falls back to the line backend.
+#[test]
+fn stdout_into_a_pipe_keeps_the_tui_off() {
+    let dist = Dist::locate();
+    let ws = common::Workspace::new().expect("workspace");
+    ws.write("pkg/BUILD", BUILD).expect("write BUILD");
+
+    let session = run_in_pty_piped(&dist, ws.root(), &["q", "all", "//pkg"]);
+
+    assert!(session.status_success, "{}", session.report());
+    assert!(
+        !contains(&session.raw, DSR_CURSOR),
+        "a piped stdout still built the inline viewport\n{}",
+        session.report()
+    );
+    assert!(
+        !contains(&session.raw, CURSOR_HIDE),
+        "a piped stdout still took the cursor\n{}",
+        session.report()
+    );
+    // Cooked mode: the reader's newlines come back as CRLF, so each address
+    // starts its own line rather than where the last one ended.
+    assert!(
+        contains(&session.raw, b"//pkg:ok\r\n") && contains(&session.raw, b"//pkg:slow\r\n"),
+        "the matches did not reach the terminal as whole lines\n{}",
+        session.report()
+    );
+}
+
 /// The named target announces itself, then sleeps far longer than the test can
 /// wait — so "the run ended" can only mean the Ctrl-C ended it. `cache = False`
 /// keeps a second run from short-circuiting to a cache hit.
@@ -386,6 +419,36 @@ fn run_in_pty_typing(
     interact: Option<Interact>,
     deadline: Duration,
 ) -> Session {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let mut cmd = CommandBuilder::new(dist.heph());
+    for arg in args {
+        cmd.arg(arg);
+    }
+    drive_pty(cmd, cwd, home.path(), interact, deadline)
+}
+
+/// `heph <args> | cat`, run in a pty: heph's stderr is the terminal and its
+/// stdout a pipe into a reader that prints to that same terminal — the shape of
+/// `heph q //p | grep x`.
+fn run_in_pty_piped(dist: &Dist, cwd: &std::path::Path, args: &[&str]) -> Session {
+    let home = tempfile::tempdir().expect("home tempdir");
+    let mut cmd = CommandBuilder::new("sh");
+    cmd.arg("-c");
+    cmd.arg("\"$0\" \"$@\" | cat");
+    cmd.arg(dist.heph());
+    for arg in args {
+        cmd.arg(arg);
+    }
+    drive_pty(cmd, cwd, home.path(), None, DEADLINE)
+}
+
+fn drive_pty(
+    mut cmd: CommandBuilder,
+    cwd: &std::path::Path,
+    home: &std::path::Path,
+    interact: Option<Interact>,
+    deadline: Duration,
+) -> Session {
     const ROWS: u16 = 40;
     const COLS: u16 = 140;
 
@@ -398,13 +461,8 @@ fn run_in_pty_typing(
         })
         .expect("open pty");
 
-    let home = tempfile::tempdir().expect("home tempdir");
-    let mut cmd = CommandBuilder::new(dist.heph());
-    for arg in args {
-        cmd.arg(arg);
-    }
     cmd.cwd(cwd);
-    cmd.env("HOME", home.path());
+    cmd.env("HOME", home);
     cmd.env("HEPH_CWD", cwd);
     cmd.env("HEPH_NO_SELF_UPDATE", "1");
     cmd.env("HEPH_DISABLE_TELEMETRY", "1");

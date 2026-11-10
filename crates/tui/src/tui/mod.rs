@@ -29,10 +29,29 @@ pub fn should_use_tui(force_off: bool) -> bool {
     let foreground = unsafe { libc::tcgetpgrp(libc::STDERR_FILENO) };
     // SAFETY: no preconditions.
     let own = unsafe { libc::getpgrp() };
-    let interactive = tui_allowed(force_off, io::stderr().is_terminal(), foreground, own);
+    let interactive = tui_allowed(
+        force_off,
+        io::stderr().is_terminal(),
+        stdout_is_pipe(),
+        foreground,
+        own,
+    );
     // Record the decision here, at the one place that makes it.
     htelemetry::telemetry::record_interactive(interactive);
     interactive
+}
+
+/// Whether fd 1 feeds another process: a pipe (`| grep`, `>(…)`) or a socket.
+/// A failing `fstat` (fd 1 closed) is not a reader.
+fn stdout_is_pipe() -> bool {
+    let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `fstat` only writes into `st`, which is read only on success.
+    if unsafe { libc::fstat(libc::STDOUT_FILENO, st.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    // SAFETY: `fstat` returned 0, so it initialised `st`.
+    let kind = unsafe { st.assume_init() }.st_mode & libc::S_IFMT;
+    kind == libc::S_IFIFO || kind == libc::S_IFSOCK
 }
 
 /// The decision behind [`should_use_tui`]. `foreground` is `tcgetpgrp(2)`, and
@@ -43,13 +62,21 @@ pub fn should_use_tui(force_off: bool) -> bool {
 /// what disqualifies, because the TUI would go raw and stop on the terminal
 /// before the run ever got to hand it over. A failing `tcgetpgrp` (a terminal
 /// that is not this session's) says nothing about being in the background.
+///
+/// Stdout into a pipe disqualifies too. The reader (`heph q //p | grep x`)
+/// usually prints to the same terminal the TUI draws on, and nothing tells heph
+/// when it does: its lines land in the middle of the inline viewport while the
+/// terminal is raw, so newlines lose their carriage return and stair-step, and
+/// the TUI's redraws are interleaved into the output. Stdout into a file keeps
+/// the TUI, since nothing else writes to the terminal then.
 fn tui_allowed(
     force_off: bool,
     stderr_is_terminal: bool,
+    stdout_is_pipe: bool,
     foreground: libc::pid_t,
     own: libc::pid_t,
 ) -> bool {
-    !force_off && stderr_is_terminal && (foreground < 0 || foreground == own)
+    !force_off && stderr_is_terminal && !stdout_is_pipe && (foreground < 0 || foreground == own)
 }
 
 pub async fn run_app<A: App + 'static>(
@@ -84,19 +111,42 @@ mod tests {
     fn should_use_tui_foreground_table() {
         const OWN: libc::pid_t = 100;
         const OTHER: libc::pid_t = 200;
-        // (case, force_off, stderr is a terminal, tcgetpgrp(2), expected)
+        // (case, force_off, stderr is a terminal, stdout is a pipe, tcgetpgrp(2), expected)
         let cases = [
-            ("foreground", false, true, OWN, true),
-            ("backgrounded job", false, true, OTHER, false),
-            ("not this session's terminal", false, true, -1, true),
-            ("stderr redirected", false, false, -1, false),
-            ("stderr redirected, stale group", false, false, OTHER, false),
-            ("forced off", true, true, OWN, false),
-            ("forced off in the background", true, true, OTHER, false),
+            ("foreground", false, true, false, OWN, true),
+            ("backgrounded job", false, true, false, OTHER, false),
+            ("not this session's terminal", false, true, false, -1, true),
+            ("stderr redirected", false, false, false, -1, false),
+            (
+                "stderr redirected, stale group",
+                false,
+                false,
+                false,
+                OTHER,
+                false,
+            ),
+            ("forced off", true, true, false, OWN, false),
+            (
+                "forced off in the background",
+                true,
+                true,
+                false,
+                OTHER,
+                false,
+            ),
+            ("stdout piped to a reader", false, true, true, OWN, false),
+            (
+                "stdout piped, stderr redirected",
+                false,
+                false,
+                true,
+                OWN,
+                false,
+            ),
         ];
-        for (case, force_off, terminal, foreground, expected) in cases {
+        for (case, force_off, terminal, piped, foreground, expected) in cases {
             assert_eq!(
-                tui_allowed(force_off, terminal, foreground, OWN),
+                tui_allowed(force_off, terminal, piped, foreground, OWN),
                 expected,
                 "{case}"
             );
