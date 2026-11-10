@@ -144,7 +144,7 @@ impl Hash for TargetDef {
         // runtime_dep_group_inputs intentionally excluded — runtime_deps
         // (and runtime-only transitives) must not affect the cache key.
         self.tool_group_inputs.hash(state);
-        self.outputs.hash(state);
+        outputs_sans_codegen(&self.outputs).hash(state);
         self.support_files.hash(state);
         self.env.hash(state);
         self.pass_env.hash(state);
@@ -155,6 +155,46 @@ impl Hash for TargetDef {
             "entrypoint".hash(state);
             mode.hash(state);
         }
+    }
+}
+
+/// `outputs` as the def hash sees them: every path's `codegen_tree` read as
+/// [`CodegenMode::None`].
+///
+/// No codegen mode reaches the def hash. The mode decides what happens to the
+/// tree after a run — copied back, written over the sources, or neither — and
+/// never what the run produces, so hashing it only cache-missed a target whose
+/// outputs did not change. `materialize_codegen_tree` takes the mode from the
+/// current def, not from the cache entry, so an entry filed under one mode is
+/// written back under the mode the def has now. That is sound because an
+/// `in_place` transform must be idempotent (the `codegen` field's contract).
+///
+/// The def itself keeps the real mode; `Path`'s derived `Hash` is untouched.
+/// Same container type and key, so a def with no codegen hashes byte-identically
+/// to hashing `outputs` directly (pinned by `exec_def_hash_golden_populated`).
+fn outputs_sans_codegen(
+    outputs: &BTreeMap<String, Vec<Path>>,
+) -> BTreeMap<&str, Vec<PathSansCodegen<'_>>> {
+    outputs
+        .iter()
+        .map(|(group, paths)| (group.as_str(), paths.iter().map(PathSansCodegen).collect()))
+        .collect()
+}
+
+/// A [`Path`] hashed field for field as its derived `Hash`, with
+/// `codegen_tree` read as [`CodegenMode::None`]. See [`outputs_sans_codegen`].
+struct PathSansCodegen<'a>(&'a Path);
+
+impl Hash for PathSansCodegen<'_> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let Path {
+            content,
+            codegen_tree: _,
+            collect,
+        } = self.0;
+        content.hash(state);
+        CodegenMode::None.hash(state);
+        collect.hash(state);
     }
 }
 
@@ -5412,28 +5452,37 @@ bash apply_transitive: 96d371e95980d767
         Ok(())
     }
 
+    /// D13: no codegen mode reaches the def hash. The mode decides what happens
+    /// to the tree after a run, never what the run produces, so every mode —
+    /// and none — hashes like a plain target with the same `out`. The def still
+    /// carries the mode it was given.
     #[tokio::test]
-    async fn test_parse_codegen_change_def_hash() -> anyhow::Result<()> {
-        // `codegen` is baked into every output path's `codegen_tree`, and it
-        // decides whether the outputs land back in the tree. Changing it is a
-        // semantic change to the target.
-        let copy = parse_with(HashMap::from([
-            ("out".to_string(), out_value(&[("", &["a.txt"])])),
-            (
-                "codegen".to_string(),
-                hcore::htvalue::Value::String("copy".to_string()),
-            ),
-        ]))
-        .await?;
-        let in_place = parse_with(HashMap::from([
-            ("out".to_string(), out_value(&[("", &["a.txt"])])),
-            (
-                "codegen".to_string(),
-                hcore::htvalue::Value::String("in_place".to_string()),
-            ),
-        ]))
-        .await?;
-        assert_ne!(copy.hash, in_place.hash);
+    async fn codegen_is_off_the_def_hash() -> anyhow::Result<()> {
+        let parse_mode = |mode: Option<&'static str>| async move {
+            let mut config = HashMap::from([("out".to_string(), out_value(&[("", &["a.txt"])]))]);
+            if let Some(mode) = mode {
+                config.insert(
+                    "codegen".to_string(),
+                    hcore::htvalue::Value::String(mode.to_string()),
+                );
+            }
+            parse_with(config).await
+        };
+        let plain = parse_mode(None).await?;
+        for mode in ["copy", "in_place"] {
+            let def = parse_mode(Some(mode)).await?;
+            assert_eq!(
+                def.hash, plain.hash,
+                "codegen = {mode:?} moved the def hash"
+            );
+            assert!(
+                def.outputs
+                    .iter()
+                    .flat_map(|o| &o.paths)
+                    .all(|p| p.codegen_tree != CodegenMode::None),
+                "codegen = {mode:?}: the def keeps the real mode"
+            );
+        }
         Ok(())
     }
 
