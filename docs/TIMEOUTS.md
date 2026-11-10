@@ -29,11 +29,11 @@ by ignoring it:
 3. Either way the target fails:
 
    ```
-   //p:integration timed out after 10m00s (its `timeout`)
+   //p:integration timed out after 10m (its `timeout`)
    ```
 
-   (durations in heph's one format, as in the TUI; `inspect def --json` shows
-   the exact value as `timeout_ms`)
+   (the limit exactly as declared, `hcore::units::format_duration`; `inspect
+   def --json` shows it as `timeout_ms`)
 
    with `; the run did not stop within 10s of being cancelled and was
    abandoned, so its process may still be running` appended when step 2 ran

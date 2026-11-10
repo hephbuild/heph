@@ -1323,12 +1323,12 @@ impl Timeout {
     }
 }
 
-/// heph's one duration format ([`hcore::units::human_duration`]): `90s` reads
-/// `1m30s`, `10m` reads `10m00s`, as in the TUI. For people; it keeps the two
-/// coarsest units, so it is not exact past an hour — [`Serialize`] is.
+/// Exact, as declared ([`hcore::units::format_duration`]): `10m`, `1m30s`,
+/// `1h5s`. A declared limit must read back as written, which the TUI's padded,
+/// two-unit format does not do past an hour.
 impl Display for Timeout {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&hcore::units::human_duration(self.duration()))
+        f.write_str(&hcore::units::format_duration(self.duration()))
     }
 }
 
@@ -1774,17 +1774,15 @@ mod timeout_tests {
     }
 
     #[test]
-    /// Displayed in heph's one duration format; serialized exactly, since
-    /// that format keeps only the two coarsest units.
-    fn displays_like_the_tui_and_serializes_exactly() {
-        for (secs, text) in [
-            (90, "1m30s"),
-            (600, "10m00s"),
-            (5400, "1h30m"),
-            (3605, "1h00m"),
-        ] {
+    /// Displayed and serialized exactly, and the text reads back as declared.
+    fn displays_and_serializes_exactly() {
+        for (secs, text) in [(90, "1m30s"), (600, "10m"), (5400, "1h30m"), (3605, "1h5s")] {
             let t = Timeout::new(Duration::from_secs(secs)).expect("timeout");
             assert_eq!(t.to_string(), text);
+            assert_eq!(
+                hcore::units::parse_duration(text).expect("parse"),
+                t.duration()
+            );
             assert_eq!(
                 serde_json::to_value(t).expect("serialize"),
                 serde_json::json!(secs * 1000),

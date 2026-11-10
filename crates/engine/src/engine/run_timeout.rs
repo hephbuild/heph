@@ -79,7 +79,7 @@ impl fmt::Display for TimedOutError {
                 f,
                 "; the run did not stop within {} of being cancelled and was abandoned, so its \
                  process may still be running",
-                hcore::units::human_duration(grace)
+                hcore::units::format_duration(grace)
             )?;
         }
         Ok(())
@@ -385,7 +385,7 @@ mod tests {
         assert_eq!(te.abandoned_after, Some(Duration::from_secs(10)));
         assert_eq!(
             format!("{err}"),
-            "//p:t timed out after 1m00s (its `timeout`); the run did not stop within 10s of being \
+            "//p:t timed out after 1m (its `timeout`); the run did not stop within 10s of being \
              cancelled and was abandoned, so its process may still be running"
         );
     }
