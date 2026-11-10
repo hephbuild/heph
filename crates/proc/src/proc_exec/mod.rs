@@ -737,47 +737,97 @@ mod tests {
         let sleep = sleep_tool!();
         let dir = tempfile::tempdir().expect("tempdir");
         let pid_file = dir.path().join("pid");
-        let script = format!(
-            "{} {STRAY_LIFETIME_SECS} >/dev/null 2>&1 & echo $! > '{}'; wait",
-            sleep.display(),
-            pid_file.display(),
-        );
+        let script = format!("{} wait", sigint_ignoring_job(&sleep, &pid_file));
         let handle = spawn(sh_spec(Session::Own, &script)).expect("spawn");
         let cancel = std::sync::Arc::new(StdCancellationToken::new());
         let wait = handle.spawn_wait(std::sync::Arc::clone(&cancel) as _);
 
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let pid: libc::pid_t = loop {
-            if let Some(pid) = std::fs::read_to_string(&pid_file)
-                .ok()
-                .and_then(|s| s.trim().parse().ok())
-            {
-                break pid;
-            }
-            assert!(Instant::now() < deadline, "the script never wrote its pid");
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        };
+        let pid = read_pid(&pid_file).await;
         cancel.cancel();
         let res = wait.await.expect("wait task");
         assert!(res.is_err(), "a cancelled wait must not return Ok");
+        assert_dies(pid, "the descendant outlived the cancelled run").await;
+    }
 
+    /// Dropping a wait mid-cancel — the child still alive, its grace running —
+    /// kills the child's whole group, not just the child. The child ignores
+    /// the SIGINT (so the wait is still in its grace when dropped), and so
+    /// does its `&` job.
+    ///
+    /// Current-thread on purpose: on macOS a multi-thread wait parks in
+    /// `block_in_place` until the child exits, so it cannot be dropped
+    /// mid-cancel at all; the current-thread wait polls and can.
+    #[tokio::test]
+    async fn dropping_a_cancelled_wait_kills_the_childs_group() {
+        let sleep = sleep_tool!();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("pid");
+        let script = format!(
+            "trap '' INT; {} wait",
+            sigint_ignoring_job(&sleep, &pid_file)
+        );
+        let handle = spawn(sh_spec(Session::Own, &script)).expect("spawn");
+        let child = handle.pid();
+        let pid = read_pid(&pid_file).await;
+
+        let cancel = StdCancellationToken::new();
+        cancel.cancel();
+        // Well inside the grace, so the child is still unreaped when the wait
+        // (and the `Handle` it owns) is dropped.
+        let res =
+            tokio::time::timeout(Duration::from_millis(300), handle.wait_or_cancel(&cancel)).await;
+        assert!(
+            res.is_err(),
+            "the child ignores SIGINT, so the wait must still be in its grace"
+        );
+
+        assert_dies(child, "the child outlived its dropped handle").await;
+        assert_dies(pid, "the descendant outlived its dropped handle").await;
+    }
+
+    /// A `&` job that writes its own pid to `pid_file` once it runs — by then
+    /// with SIGINT ignored, as `sh` starts every `&` job, so a cancel cannot
+    /// race the pid write and kill it with the SIGINT. Its output goes
+    /// nowhere, so no pipe escalation can reach it either. Ends in the `&`, so
+    /// the caller appends the next command without a `;`.
+    fn sigint_ignoring_job(sleep: &std::path::Path, pid_file: &std::path::Path) -> String {
+        format!(
+            "/bin/sh -c 'echo $$ > \"{}\"; exec {} {STRAY_LIFETIME_SECS}' >/dev/null 2>&1 </dev/null &",
+            pid_file.display(),
+            sleep.display(),
+        )
+    }
+
+    async fn read_pid(pid_file: &std::path::Path) -> libc::pid_t {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(pid) = std::fs::read_to_string(pid_file)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+            {
+                return pid;
+            }
+            assert!(Instant::now() < deadline, "the script never wrote its pid");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Wait for `pid` to be gone, or a zombie: a killed orphan is reaped by
+    /// whichever ancestor adopted it, which the test does not control.
+    async fn assert_dies(pid: libc::pid_t, what: &str) {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             // SAFETY: signal 0 only checks that the pid exists; nothing is sent.
             let rc = unsafe { libc::kill(pid, 0) };
             if rc != 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-                break;
+                return;
             }
-            // Killed but not yet reaped by whichever ancestor adopted it.
             if std::fs::read_to_string(format!("/proc/{pid}/stat"))
                 .is_ok_and(|s| s.rsplit_once(") ").is_some_and(|(_, r)| r.starts_with('Z')))
             {
-                break;
+                return;
             }
-            assert!(
-                Instant::now() < deadline,
-                "the descendant {pid} outlived the cancelled run"
-            );
+            assert!(Instant::now() < deadline, "{what} (pid {pid})");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }

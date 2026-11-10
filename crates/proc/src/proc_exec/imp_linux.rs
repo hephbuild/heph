@@ -174,7 +174,18 @@ impl Handle {
         cancel: &(dyn Cancellable + Send + Sync),
     ) -> io::Result<ExitStatus> {
         tokio::select! {
-            res = self.child.wait() => res,
+            res = self.child.wait() => {
+                let status = res?;
+                // The select is unbiased, so the child's exit can win against
+                // a cancel that had already fired. A cancel is a cancel
+                // whenever it lands before the reap — as on macOS, which only
+                // looks at the token once the child is reaped.
+                if cancel.is_cancelled() {
+                    self.kill_what_is_left();
+                    return Err(io::Error::other("cancelled"));
+                }
+                Ok(status)
+            }
             _ = cancel.cancelled() => {
                 // Graceful: SIGINT the child (and its pgid) first, then give
                 // it a grace window to exit before escalating to SIGKILL.
@@ -195,15 +206,32 @@ impl Handle {
                         drop(self.child.wait().await);
                     }
                 }
-                // The child is gone, but a descendant that ignored the SIGINT
-                // (a shell's `&` job starts with it ignored) is not: kill
-                // what is left of the group. Right after the reap, which is
-                // what makes the id safe to signal (see `kill_group`).
-                if self.own_group {
-                    process_supervisor::kill_group(self.pid);
-                }
+                self.kill_what_is_left();
                 Err(io::Error::other("cancelled"))
             }
+        }
+    }
+
+    /// The cancelled child is gone, but a descendant that ignored the SIGINT
+    /// (a shell's `&` job starts with it ignored) is not: kill what is left
+    /// of the group. Only right after the reap, which is what makes the id
+    /// safe to signal (see `kill_group`).
+    fn kill_what_is_left(&self) {
+        if self.own_group {
+            process_supervisor::kill_group(self.pid);
+        }
+    }
+}
+
+impl Drop for Handle {
+    fn drop(&mut self) {
+        // `id()` is `None` once the child has been reaped. Until then the pid
+        // (and a group it leads) is still held, so it names nobody else.
+        // Dropped mid-wait — a cancel whose grace is still running, say — the
+        // child dies here, and so does its group, as on macOS. `kill_on_drop`
+        // alone would reach only the child, leaving every descendant behind.
+        if self.child.id().is_some() {
+            process_supervisor::kill_unreaped(self.pid, self.own_group);
         }
     }
 }

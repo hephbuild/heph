@@ -410,11 +410,35 @@ pub fn kill_child(pid: i32) {
 ///     handed out. The callers signal right after the reap (Linux) or within
 ///     a poll of hearing of it (macOS's watcher reaps): milliseconds, against
 ///     the tens of thousands of forks a wrap would take.
-pub fn kill_group(pgid: i32) {
+///
+/// A `pgid` of 0 or 1 is refused: `killpg(0)` is the caller's own group, and
+/// 1 is init's. Neither can be a group a spawned child leads.
+pub(crate) fn kill_group(pgid: i32) {
+    if pgid <= 1 {
+        return;
+    }
     // SAFETY: killpg on a group a child we spawned leads; see above for why
     // the id cannot name a stranger's group.
     unsafe {
         libc::killpg(pgid, libc::SIGKILL);
+    }
+}
+
+/// `SIGKILL` a child that has not been reaped — what a `Handle` dropped
+/// before its wait finished does, on both backends. An unreaped pid is still
+/// held, so neither it nor a group it leads can name anyone else.
+///
+/// The group too only for a child spawned into its own (`own_group`, i.e.
+/// with `setsid`): that group holds only the child's descendants. A child
+/// sharing heph's group gets the pid alone.
+pub(crate) fn kill_unreaped(pid: i32, own_group: bool) {
+    if own_group {
+        kill_child(pid);
+    } else {
+        // SAFETY: kill on a pid we spawned and have not reaped.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
     }
 }
 
