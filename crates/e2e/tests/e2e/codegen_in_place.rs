@@ -519,6 +519,13 @@ target(
         if !f.ends_with("manifest-v1.borsh") {
             let blob = remote.path().join(f);
             std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o000))?;
+            // Root reads a mode-000 file anyway: the remote would serve the
+            // hit, nothing would be rebuilt, and the test would prove nothing.
+            assert!(
+                std::fs::File::open(&blob).is_err(),
+                "{} is still readable at mode 000: running as root?",
+                blob.display()
+            );
             unreadable += 1;
         }
     }
@@ -704,9 +711,10 @@ target(
     Ok(())
 }
 
-/// A `failure_out` path inside an `in_place` output directory: the report is
-/// kept in the slot, the fixes are written over the tree, and the slot holds
-/// none of the fixes.
+/// A `failure_out` path inside an `in_place` output directory (I1): the report
+/// is kept in the slot and left out of the write-back, the fixes beside it in
+/// the same directory are written over the tree, and the slot holds none of
+/// the fixes.
 #[tokio::test]
 async fn failure_out_inside_in_place_output() -> anyhow::Result<()> {
     let ws = Workspace::new();
@@ -738,9 +746,62 @@ target(
         std::fs::read_to_string(out.join("fix/gen/report.log"))?,
         "report-marker\n"
     );
-    // Not asserted: `gen/report.log` is also under the declared `in_place`
-    // directory, so today it is written over the tree as a fix too, exactly
-    // as a pass would write it. Whether a `failure_out` match should be
-    // carved out of an `in_place` directory's write-back is a spec question.
+    assert!(
+        !ws.dir.path().join("fix/gen/report.log").exists(),
+        "a failure_out match is never written back over the tree"
+    );
+    assert_eq!(
+        failed.of(ADDR).fixes,
+        written(
+            &["fix/gen/a.txt"],
+            Some(slot_dir(&ws.engine, ADDR).join("fixes.txt"))
+        ),
+        "the report is not listed as a fix"
+    );
+    Ok(())
+}
+
+/// A run stopped by its own `timeout` was killed mid-write like a signalled
+/// one: the fix it already made never reaches the tree, and the failure does
+/// not report one written.
+#[tokio::test]
+async fn timeout_writes_nothing_back() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "fix",
+        r#"
+target(
+    name = "upper",
+    driver = "bash",
+    deps = [file("src.txt")],
+    out = "src.txt",
+    codegen = "in_place",
+    timeout = 1,
+    run = "up=$(tr a-z A-Z < src.txt); printf '%s' \"$up\" > $OUT; sleep 60",
+)
+"#,
+    );
+    ws.write_file("fix/src.txt", "hello");
+
+    let failed = resolve_failing(&ws.engine, ADDR, &ResultOptions::default()).await?;
+    assert!(
+        failed.error.contains("timed out after 1s"),
+        "{}",
+        failed.error
+    );
+    assert!(
+        !files_containing(&ws.engine.home.join("sandbox"), "HELLO").is_empty(),
+        "the run did make its fix in the sandbox before the timeout"
+    );
+    assert_eq!(read(&ws, "fix/src.txt"), "hello", "{}", failed.error);
+    let fixes = &failed.of(ADDR).fixes;
+    assert!(
+        !matches!(fixes, Some(FailureFixes::Written { .. })),
+        "{fixes:?}"
+    );
+    assert!(
+        !slot_dir(&ws.engine, ADDR).join("fixes.txt").exists(),
+        "no fixes.txt for a run that wrote nothing"
+    );
     Ok(())
 }

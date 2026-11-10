@@ -1,6 +1,7 @@
 //! `failure_out`: what a failed run leaves behind, kept in its failure slot as
 //! `out/<workspace-relative path>`. Collected only on a process exit (a code
-//! from 1 to 255 or a signal), never on success or cancellation; copied, never
+//! from 1 to 255 or a signal) or the run's own `timeout`, never on success or
+//! cancellation; copied, never
 //! linked; following no link out of the sandbox. Every test has its own
 //! `TempDir` home.
 
@@ -224,6 +225,25 @@ async fn collected_on_exit_137() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A run stopped by its own `timeout` is a failure, not a cancellation: what
+/// it wrote before the limit is kept.
+#[tokio::test]
+async fn collected_on_timeout() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "p",
+        r#"target(name = "t", driver = "bash", failure_out = "report.txt", timeout = 1,
+       run = "printf timeout-report > report.txt; sleep 60")"#,
+    );
+    let f = failures(&ws.engine, "//p:t", &ResultOptions::default()).await?;
+    assert!(render(&f).contains("timed out after 1s"), "{}", render(&f));
+    assert_eq!(
+        read(out_dir(&ws.engine, "//p:t").join("p/report.txt")),
+        "timeout-report"
+    );
+    Ok(())
+}
+
 /// Fail-fast cancels a running sibling: its process is killed, and that is a
 /// cancellation, not a failure, so it keeps nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -262,9 +282,14 @@ target(name = "grp", driver = "group", deps = [":slow", ":fast"])
     // A sibling process that outlived its cancellation would now exit 1 on its
     // own; without the release it would hold the runtime's shutdown open.
     std::fs::write(ctl.path().join("release"), "")?;
-    // The cancelled sibling's execute unwinds after the request returned; give
-    // a late (wrong) fill the time to land before looking.
-    tokio::time::sleep(Duration::from_millis(1000)).await;
+    // The cancelled sibling's execute may unwind after the request returned.
+    // A fill happens under its execute lock, so once that lock is free again
+    // any late (wrong) fill has landed.
+    let slow = parse_addr("//p:slow")?;
+    eventually(30, "the cancelled sibling's execute never let go", || {
+        matches!(ws.engine.result_lock().try_lock_execute(&slow), Ok(Some(_)))
+    })
+    .await;
     if ctl.path().join("outlived").exists() {
         eprintln!("nothing_on_cancel: the cancelled sibling's process outlived its cancellation");
     }
@@ -284,11 +309,12 @@ target(name = "grp", driver = "group", deps = [":slow", ":fast"])
 /// finishes even when its caller is gone, so no `.tmp-` slot is ever left
 /// behind, whichever of them the drop lands in.
 ///
-/// Deterministic in its assertion, not in where the drop lands: thousands of
-/// matches make the managed layer's collect long enough that the drop, made
-/// as soon as the staging directory appears, lands inside it; the engine's
-/// fill (a few renames) is hit only if it happens to be running when the
-/// staging directory is first seen.
+/// A "no hang, nothing half-made" test, deterministic in its assertion, not in
+/// where the drop lands: thousands of matches make the managed layer's collect
+/// long enough that the drop, made as soon as the staging directory appears,
+/// usually lands inside it, but a run that finished first is accepted too. The
+/// engine's fill window (a few renames) is pinned down by an engine unit test,
+/// not here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancel_mid_collect_leaves_no_tmp_dir() -> anyhow::Result<()> {
     let ws = Workspace::new();
@@ -322,11 +348,18 @@ async fn cancel_mid_collect_leaves_no_tmp_dir() -> anyhow::Result<()> {
         }
     });
     let deadline = Instant::now() + Duration::from_secs(120);
-    while !staging.exists() && !has_tmp(&root) && !task.is_finished() {
+    // Whether the collect (or the fill after it) was seen running, rather
+    // than the run finishing before the poll caught it.
+    let seen_collect = loop {
+        if staging.exists() || has_tmp(&root) {
+            break true;
+        }
+        if task.is_finished() {
+            break false;
+        }
         assert!(Instant::now() < deadline, "the collect never started");
         tokio::time::sleep(Duration::from_millis(1)).await;
-    }
-    let landed_mid_collect = !task.is_finished();
+    };
     rs.ctoken().cancel();
     task.abort();
     // Aborted, or finished on its own: either way it is over.
@@ -334,19 +367,26 @@ async fn cancel_mid_collect_leaves_no_tmp_dir() -> anyhow::Result<()> {
     common::drain(rs).await;
 
     eventually(30, "a .tmp- slot outlived its fill", || !has_tmp(&root)).await;
+    let slots = slot_root_names(&ws.engine);
+    // A run that finished before the poll saw its collect was a plain failure,
+    // never cancelled: it must have filled its slot. Without this, a run that
+    // never reached the collect at all (a broken BUILD, a wrong staging path)
+    // would leave nothing and pass the loop below on no slot.
+    assert!(
+        seen_collect || !slots.is_empty(),
+        "the run finished without the collect ever being seen, and kept no slot"
+    );
     // Whatever slot there is, is a complete one.
-    for name in slot_root_names(&ws.engine) {
+    for name in slots {
         assert!(!name.starts_with(".tmp-"), "{name}");
-        let slots = ws.engine.failure_slots();
         assert!(
-            slots.read(&parse_addr("//p:t")?).is_some(),
+            ws.engine
+                .failure_slots()
+                .read(&parse_addr("//p:t")?)
+                .is_some(),
             "a slot without its manifest: {name}"
         );
     }
-    assert!(
-        landed_mid_collect,
-        "the run finished before the collect was seen: the drop landed nowhere"
-    );
     Ok(())
 }
 
@@ -484,27 +524,44 @@ async fn directory_is_copied_whole() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Names with spaces, non-ASCII and (where the filesystem takes it, which
-/// APFS does not) non-UTF-8 bytes, and a deep path: the slot's tree is the
-/// run's tree, byte for byte.
+/// Names with spaces, non-ASCII and non-UTF-8 bytes, and a deep path: the
+/// slot's tree is the run's tree, byte for byte. Linux filesystems take the
+/// non-UTF-8 name; APFS refuses it (`EILSEQ`), which the run records in
+/// `nonutf8-refused`, outside `failure_out`.
 #[tokio::test]
 async fn odd_names() -> anyhow::Result<()> {
     let ws = Workspace::new();
     ws.write_build_file(
         "p",
         r#"target(name = "t", driver = "bash", failure_out = ["odd"],
-       run = "mkdir -p 'odd/with space/a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p'; printf s > 'odd/with space/file name.txt'; printf d > 'odd/with space/a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/deep.txt'; printf u > 'odd/ünïcödé ✓.txt'; printf t > 'odd/tab\there'; printf n > $'odd/bad\\xffname' 2>/dev/null || true; exit 1")"#,
+       run = "mkdir -p 'odd/with space/a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p'; printf s > 'odd/with space/file name.txt'; printf d > 'odd/with space/a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/deep.txt'; printf u > 'odd/ünïcödé ✓.txt'; printf t > 'odd/tab\there'; printf n > $'odd/bad\\xffname' 2>/dev/null || printf '' > nonutf8-refused; exit 1")"#,
     );
     failures(&ws.engine, "//p:t", &ResultOptions::default()).await?;
-    let ran = tree(&sandbox_ws(&ws.engine, "p", "t").join("p/odd"));
+    let pkg = sandbox_ws(&ws.engine, "p", "t").join("p");
+    let ran = tree(&pkg.join("odd"));
     assert!(ran.len() >= 21, "the run wrote its tree: {:?}", names(&ran));
     assert!(ran.contains_key("ünïcödé ✓.txt".as_bytes()));
     let kept = tree(&out_dir(&ws.engine, "//p:t").join("p/odd"));
     assert_eq!(kept, ran, "kept byte-exact");
-    if ran.keys().any(|k| std::str::from_utf8(k).is_err()) {
-        eprintln!("odd_names: a non-UTF-8 name was exercised");
+
+    let non_utf8: &[u8] = b"bad\xffname";
+    let refused = pkg.join("nonutf8-refused").exists();
+    if cfg!(target_os = "linux") {
+        assert!(!refused, "the filesystem refused a non-UTF-8 name");
+        assert_eq!(
+            ran.get(non_utf8),
+            Some(&Entry::File(b"n".to_vec())),
+            "the run wrote the non-UTF-8 name: {:?}",
+            names(&ran)
+        );
+        assert_eq!(kept.get(non_utf8), ran.get(non_utf8), "and it was kept");
     } else {
-        eprintln!("odd_names: this filesystem refused the non-UTF-8 name");
+        assert!(refused, "APFS took a non-UTF-8 name: {:?}", names(&ran));
+        assert!(
+            ran.keys().all(|k| std::str::from_utf8(k).is_ok()),
+            "{:?}",
+            names(&ran)
+        );
     }
     Ok(())
 }
