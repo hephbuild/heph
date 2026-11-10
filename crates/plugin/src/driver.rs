@@ -703,9 +703,10 @@ pub mod targetdef {
         /// target. **Never part of a def hash**: a limit does not change what a
         /// run that finishes within it produces. Crosses the plugin ABI as
         /// `pb::TargetDef.timeout_ms` (since 0.19.1); a def from an older
-        /// plugin decodes to `None`. Skipped when `None`, so `inspect def
-        /// --json` of every other target is unchanged.
-        #[serde(skip_serializing_if = "Option::is_none")]
+        /// plugin decodes to `None`. Serialized as `timeout_ms`, exact, like
+        /// the wire; skipped when `None`, so `inspect def --json` of every
+        /// other target is unchanged.
+        #[serde(rename = "timeout_ms", skip_serializing_if = "Option::is_none")]
         pub timeout: Option<super::Timeout>,
     }
 
@@ -1322,29 +1323,19 @@ impl Timeout {
     }
 }
 
-/// Exact, and readable back by [`hcore::units::parse_duration`] when it is a
-/// whole number of seconds: `"90s"`, `"10m"`, `"2h"`; `"1500ms"` otherwise
-/// (only a plugin's wire value can be finer than a second).
+/// heph's one duration format ([`hcore::units::human_duration`]): `90s` reads
+/// `1m30s`, `10m` reads `10m00s`, as in the TUI. For people; it keeps the two
+/// coarsest units, so it is not exact past an hour — [`Serialize`] is.
 impl Display for Timeout {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let ms = self.0.get();
-        if !ms.is_multiple_of(1000) {
-            return write!(f, "{ms}ms");
-        }
-        let s = ms / 1000;
-        if s.is_multiple_of(3600) {
-            write!(f, "{}h", s / 3600)
-        } else if s.is_multiple_of(60) {
-            write!(f, "{}m", s / 60)
-        } else {
-            write!(f, "{s}s")
-        }
+        f.write_str(&hcore::units::human_duration(self.duration()))
     }
 }
 
+/// Whole milliseconds, exact (the field is named `timeout_ms`).
 impl Serialize for Timeout {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.collect_str(self)
+        serializer.serialize_u64(self.as_millis())
     }
 }
 
@@ -1783,23 +1774,24 @@ mod timeout_tests {
     }
 
     #[test]
-    fn displays_exactly_and_parses_back() {
+    /// Displayed in heph's one duration format; serialized exactly, since
+    /// that format keeps only the two coarsest units.
+    fn displays_like_the_tui_and_serializes_exactly() {
         for (secs, text) in [
-            (90, "90s"),
-            (600, "10m"),
-            (5400, "90m"),
-            (7200, "2h"),
-            (61, "61s"),
+            (90, "1m30s"),
+            (600, "10m00s"),
+            (5400, "1h30m"),
+            (3605, "1h00m"),
         ] {
             let t = Timeout::new(Duration::from_secs(secs)).expect("timeout");
             assert_eq!(t.to_string(), text);
             assert_eq!(
-                hcore::units::parse_duration(text).expect("parse"),
-                t.duration()
+                serde_json::to_value(t).expect("serialize"),
+                serde_json::json!(secs * 1000),
+                "{text} is exact in JSON"
             );
         }
         let t = Timeout::from_millis(1500).expect("timeout");
-        assert_eq!(t.to_string(), "1500ms");
         assert_eq!(t.as_millis(), 1500);
     }
 
