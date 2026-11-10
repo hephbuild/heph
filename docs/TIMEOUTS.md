@@ -25,8 +25,12 @@ by ignoring it:
 1. At the timeout the engine cancels the run's own cancellation token. The
    driver's cancellation path runs: `exec`/`bash` send `SIGINT` to the run's
    process group, then `SIGKILL` to the group once the command has exited, or
-   after a 2s grace if it has not. A process the command started is killed
-   too, even one that ignores `SIGINT` (as a shell's `&` job does).
+   after a 2s grace if it has not. Anything still in the command's process
+   group is killed too, even a process that ignores `SIGINT` (as a shell's `&`
+   job does). A process that left the group escapes it: a tool that calls
+   `setsid` or daemonizes, or a job started under `set -m`. The same holds
+   for a target under a session runner (`docs/EXEC_RUNNERS.md`): its agent
+   kills what is left of the target's group once the target exits.
 2. The run has a grace period (10s) to return. If it does not, the engine stops
    waiting and drops it.
 3. Either way the target fails:

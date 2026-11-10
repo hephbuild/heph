@@ -224,23 +224,30 @@ fn join_finished(drains: Vec<DrainHandle>) {
 /// Happy path: every drain returns within `DRAIN_JOIN_BUDGET`. Bug-B
 /// path: an orphaned descendant (reparented to pid 1 because the
 /// immediate child double-forked) is still holding the pipe write end.
-/// We escalate with `process_supervisor::kill_child(pid)` — `killpg` on
-/// the pgid reaps the whole tree if `setsid: true` was used at spawn.
-/// If even that fails (fd dup'd into a process outside our pgid), we
-/// log and detach the still-running threads rather than parking the
-/// runtime forever.
+/// For a child spawned with `setsid` (`own_group`) we escalate with
+/// `process_supervisor::kill_group(pid)` — `killpg` on the group, which
+/// holds the whole tree; never the pid itself, which the watcher has
+/// already reaped. A child in heph's own group has no group of its own to
+/// kill, so nothing is sent. If that fails or was not possible (fd dup'd
+/// into a process outside the group), we log and detach the still-running
+/// threads rather than parking the runtime forever.
 ///
 /// **The bounded streaming drain adds a third state**, and conflating it with
 /// the second would be a bug in both directions. A thread parked in a full
 /// `send` is not waiting on the child at all — it is waiting on our own
-/// consumer, which no signal can hurry. Escalating would fire `killpg`+`kill`
+/// consumer, which no signal can hurry. Escalating would fire `killpg`
 /// at a pid the watcher has already reaped (macOS recycles pids, and heph
 /// spawns thousands per build), and abandoning would tell the reader to stop
 /// while chunks are still queued for it. So the escalation and the abandon
 /// both key off [`DrainHandle::waiting_on_pipe`] only; a consumer-blocked
 /// drain is simply left to finish, which it always does — its `send` fails
 /// the moment the reader is dropped.
-async fn drain_with_deadline(pid: i32, drains: Vec<DrainHandle>, abandoned: &AtomicBool) {
+async fn drain_with_deadline(
+    pid: i32,
+    own_group: bool,
+    drains: Vec<DrainHandle>,
+    abandoned: &AtomicBool,
+) {
     if drains.is_empty() {
         return;
     }
@@ -252,9 +259,12 @@ async fn drain_with_deadline(pid: i32, drains: Vec<DrainHandle>, abandoned: &Ato
     if drains.iter().any(DrainHandle::waiting_on_pipe) {
         tracing::warn!(
             pid,
+            own_group,
             "proc_exec: drain threads still reading after child exit; killpg on pgid"
         );
-        process_supervisor::kill_child(pid);
+        if own_group {
+            process_supervisor::kill_group(pid);
+        }
 
         if poll_drains(&drains, DRAIN_JOIN_BUDGET).await {
             join_finished(drains);
@@ -555,7 +565,7 @@ impl Handle {
             process_supervisor::kill_group(self.pid);
         }
         let drains = std::mem::take(&mut self.drains);
-        drain_with_deadline(self.pid, drains, &self.abandoned).await;
+        drain_with_deadline(self.pid, self.own_group, drains, &self.abandoned).await;
         if cancelled {
             return Err(io::Error::other("cancelled"));
         }
@@ -573,8 +583,9 @@ impl Drop for Handle {
         // handler (or the 1s WNOHANG backstop) will call `waitpid` and reap
         // the zombie. We do NOT block on the exit_rx here — that would risk a
         // deadlock on a runtime worker — but dropping it is safe because the
-        // watcher reaps before it tries to send on the sender.
-        process_supervisor::kill_child(self.pid);
+        // watcher reaps before it tries to send on the sender. Linux's Drop
+        // does the same.
+        process_supervisor::kill_unreaped(self.pid, self.own_group);
         // Nothing will run `drain_with_deadline` for this child now, so a
         // surviving descendant holding a pipe would leave an `OutputReader`
         // parked with no termination condition. Release it.
