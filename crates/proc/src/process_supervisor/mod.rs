@@ -392,6 +392,32 @@ pub fn kill_child(pid: i32) {
     signal_child(pid, libc::SIGKILL);
 }
 
+/// `SIGKILL` the process group `pgid` leads, and nothing else. The cancel
+/// path's last step: what is left of a cancelled child's group once the child
+/// itself has exited — a descendant that ignored the `SIGINT`.
+///
+/// Unlike [`kill_child`] it never signals the pid itself, so it is meant for
+/// a child that has already been reaped. Two cases for that `pgid`:
+///   - **A member is alive.** The group id stays allocated while any member
+///     lives — neither Linux nor macOS hands out a pid that is still in use
+///     as a process-group id — so the signal reaches exactly the leftovers of
+///     the child's group.
+///   - **The group is empty.** Then `pgid` is a free pid. `killpg` gets
+///     `ESRCH`, ignored, unless that pid was reallocated *and* its new owner
+///     leads a group in the moment since the reap. Both kernels allocate pids
+///     cyclically (Linux `idr_alloc_cyclic` to `pid_max`, macOS `nextpid` to
+///     99999), so a freed pid comes back only after every other one has been
+///     handed out. The callers signal right after the reap (Linux) or within
+///     a poll of hearing of it (macOS's watcher reaps): milliseconds, against
+///     the tens of thousands of forks a wrap would take.
+pub fn kill_group(pgid: i32) {
+    // SAFETY: killpg on a group a child we spawned leads; see above for why
+    // the id cannot name a stranger's group.
+    unsafe {
+        libc::killpg(pgid, libc::SIGKILL);
+    }
+}
+
 /// Politely ask a child (and its process group) to stop with `SIGINT` —
 /// the same signal a terminal Ctrl-C delivers. Used by the cancellation
 /// path so well-behaved children can clean up before we escalate to

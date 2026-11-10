@@ -210,8 +210,27 @@ async fn build_raw(
 
 /// The process the timeout kills is the run's whole process group, not just
 /// the shell: a backgrounded grandchild the shell is waiting on is gone too.
+///
+/// A non-interactive shell starts a `&` job with SIGINT ignored, so the
+/// group's SIGINT never reaches this `sleep`; only the SIGKILL to the group
+/// once the shell has exited does.
 #[tokio::test]
 async fn a_timeout_kills_the_runs_grandchildren() -> anyhow::Result<()> {
+    assert_timeout_kills_grandchild("sleep 300").await
+}
+
+/// The same, for a grandchild that holds none of the run's output pipes. One
+/// that does is also killed by the post-exit drain's escalation on macOS,
+/// which is how the test above passed there while the group was never killed
+/// on Linux; this one passes only if the cancel path itself kills the group.
+#[tokio::test]
+async fn a_timeout_kills_a_grandchild_detached_from_the_runs_output() -> anyhow::Result<()> {
+    assert_timeout_kills_grandchild("sleep 300 >/dev/null 2>&1").await
+}
+
+/// Run `<grandchild> & echo $! > pid; wait` under a 1s timeout, then wait for
+/// the backgrounded grandchild to be gone.
+async fn assert_timeout_kills_grandchild(grandchild: &str) -> anyhow::Result<()> {
     let ws = tempfile::tempdir()?;
     let marks = tempfile::tempdir()?;
     let pid_file = marks.path().join("pid");
@@ -222,7 +241,7 @@ async fn a_timeout_kills_the_runs_grandchildren() -> anyhow::Result<()> {
 target(
     name = "bg",
     driver = "bash",
-    run = "sleep 300 & echo $! > '{pid}'; wait",
+    run = "{grandchild} & echo $! > '{pid}'; wait",
     out = "out.txt",
     timeout = 1,
 )
@@ -239,19 +258,37 @@ target(
 
     let pid: libc::pid_t = std::fs::read_to_string(&pid_file)?.trim().parse()?;
     let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        // SAFETY: signal 0 only checks that the pid exists; nothing is sent.
-        let rc = unsafe { libc::kill(pid, 0) };
-        if rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-            break;
-        }
+    while !process_gone(pid) {
         assert!(
             Instant::now() < deadline,
-            "the grandchild {pid} outlived its timed-out run"
+            "the grandchild {pid} outlived its timed-out run (state {:?})",
+            process_state(pid),
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     Ok(())
+}
+
+/// Whether `pid` no longer runs: reaped, or a zombie. A killed orphan is
+/// reparented to whichever ancestor reaps orphans, and until that one gets to
+/// it `kill(pid, 0)` still succeeds; the zombie runs nothing, so it counts.
+fn process_gone(pid: libc::pid_t) -> bool {
+    // SAFETY: signal 0 only checks that the pid exists; nothing is sent.
+    let rc = unsafe { libc::kill(pid, 0) };
+    if rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+        return true;
+    }
+    process_state(pid) == Some('Z')
+}
+
+/// The state letter `ps` shows for `pid` (`S`, `R`, `Z`, …), or `None` once
+/// it is gone or `ps` cannot say.
+fn process_state(pid: libc::pid_t) -> Option<char> {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout).trim().chars().next()
 }
 
 /// The last-failure slot (`<home>/failures/<addr-key>/log.txt`), when complete.

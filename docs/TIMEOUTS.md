@@ -23,7 +23,10 @@ the declaration onto the def (`TargetDef.timeout`). So a driver cannot opt out
 by ignoring it:
 
 1. At the timeout the engine cancels the run's own cancellation token. The
-   driver's cancellation path runs: `exec`/`bash` kill the process group.
+   driver's cancellation path runs: `exec`/`bash` send `SIGINT` to the run's
+   process group, then `SIGKILL` to the group once the command has exited, or
+   after a 2s grace if it has not. A process the command started is killed
+   too, even one that ignores `SIGINT` (as a shell's `&` job does).
 2. The run has a grace period (10s) to return. If it does not, the engine stops
    waiting and drops it.
 3. Either way the target fails:
