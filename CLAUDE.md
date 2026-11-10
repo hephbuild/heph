@@ -221,7 +221,9 @@ hashing it in iteration order would move the def hash on every run.
 
 A failed target's slot (`<home>/failures/<addr-key>/`) holds its `log.txt`, its
 `failure_out` matches under `out/`, and `fixes.txt` when an `in_place` run wrote
-fixes back while failing. `heph inspect failure <addr>` prints where they are.
+fixes back while failing. `heph inspect failure <addr>` prints where they are;
+after a failed `heph run`, an agent calls `heph inspect failure --json <addr>`
+(`null` when nothing is recorded).
 
 Read `docs/FAILURE_OUTPUTS.md` before touching any of it. The one thing to know
 going in: **nothing about failure outputs reaches a hash** — not `failure_out`,

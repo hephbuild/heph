@@ -41,7 +41,11 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// `in_place` run's fixes beside, never inside, its `artifacts`; both decode
 /// empty when absent. An unknown codegen value stays a decode error. A 0.20
 /// plugin's `IN_PLACE` never asked for a write-back on failure, so
-/// `MIN_PLUGIN_ABI` rises to 0.21.0 and every plugin must be rebuilt.
+/// `MIN_PLUGIN_ABI` rises to 0.21.0 and every plugin must be rebuilt. It is a
+/// Rust source break too: `CodegenMode::InPlace` became the struct variant
+/// `InPlace { write_on_failure }` and `CodegenMode` no longer derives
+/// `SpecEnum`, so a plugin that matched `InPlace` or parsed the mode with
+/// `SpecEnum` must change its code, not just rebuild.
 ///
 /// 0.20.0 (a break): `ParamType.literal` (6, `string`, in the `kind` oneof) —
 /// exactly one string (`ParamType::Literal`); a closed set, e.g. a `workdir`

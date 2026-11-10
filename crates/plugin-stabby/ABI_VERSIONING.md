@@ -239,7 +239,11 @@ skipped in silence.
   new fields decode empty when absent, and an unknown codegen value stays a
   decode error, never read as a tree write. A 0.20 plugin's `IN_PLACE` never
   asked for a write-back on failure, so `MIN_PLUGIN_ABI` rises to 0.21.0:
-  every plugin must be rebuilt.
+  every plugin must be rebuilt. It is a Rust source break as well:
+  `CodegenMode::InPlace` became the struct variant `InPlace { write_on_failure }`
+  and `CodegenMode` no longer derives `SpecEnum`, so a plugin that matched
+  `InPlace` or parsed the mode through `SpecEnum` must change its code, not
+  just rebuild.
 - **0.20.0** (break) — `ParamType.literal` (6, `string`), a member of the
   `kind` oneof: exactly one string (`ParamType::Literal`). A closed set is a
   `union` of literals, so a cdylib driver's `workdir`-style field reaches the
