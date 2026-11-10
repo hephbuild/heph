@@ -385,6 +385,18 @@ target(name = "t", driver = "auth.credential", sources = ["//auth:fetch"],
     );
     let f = failures(&ws.engine, "//app:a", &ResultOptions::default()).await?;
     assert!(!slot_exists(&ws.engine, "//auth:fetch"));
+    // The failed producer's sandbox is torn down, not kept for diagnostics:
+    // a material target's tree must not outlive its failure.
+    let sandbox = ws.engine.home.join("sandbox/auth/__target_fetch");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while sandbox.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the failed material sandbox was never removed: {}",
+            sandbox.display()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
     assert!(
         !ws.engine.failure_slots().root().exists()
             || std::fs::read_dir(ws.engine.failure_slots().root())?

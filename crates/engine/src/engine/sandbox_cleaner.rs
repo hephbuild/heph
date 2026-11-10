@@ -286,7 +286,10 @@ pub mod generation {
 ///   [`generation::remove_stale`] reclaims it, exactly as it always has. This
 ///   is retention by design, not a leak: at most one tree per failed addr,
 ///   the same bound as before teardown ownership existed.
-/// * `Drop` without either — **cancellation or abandonment only** (the future
+/// * [`reclaim`](Self::reclaim) — **a material target failed**: its sandbox
+///   holds presented credentials, so once the failure slot has read what it
+///   keeps, the generation-checked reclaim is enqueued at once.
+/// * `Drop` without any of these — **cancellation or abandonment only** (the future
 ///   was dropped or unwound without resolving): a generation-checked
 ///   [`generation::remove_stale`] reclaim is enqueued. If a successor already
 ///   reclaimed the path it declines; otherwise it removes this run's
@@ -380,13 +383,21 @@ impl SandboxTeardown {
         self.armed = false;
         self.job = None;
     }
-}
 
-impl Drop for SandboxTeardown {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
+    /// The target failed, and its sandbox must not outlive the failure (its
+    /// outputs are credential material): enqueue the generation-checked
+    /// [`generation::remove_stale`] reclaim now. Call once nothing reads the
+    /// sandbox any more — after the failure slot's fill. Not
+    /// [`complete`](Self::complete): a failed run hands over no bridge job,
+    /// so `complete` would enqueue nothing and leave the presented
+    /// credentials on disk.
+    pub fn reclaim(mut self) {
+        self.armed = false;
+        self.job = None;
+        self.enqueue_reclaim();
+    }
+
+    fn enqueue_reclaim(&self) {
         let (dir, generation) = (self.dir.clone(), self.generation);
         let label = format!("reclaim {}", dir.display());
         enqueue(
@@ -395,6 +406,14 @@ impl Drop for SandboxTeardown {
             Box::new(move || generation::remove_stale(&dir, generation)),
             Arc::clone(&self.pending),
         );
+    }
+}
+
+impl Drop for SandboxTeardown {
+    fn drop(&mut self) {
+        if self.armed {
+            self.enqueue_reclaim();
+        }
     }
 }
 
@@ -585,6 +604,23 @@ mod tests {
                 wait_for(&ran, Duration::from_secs(5)),
                 "job did not run on {lane:?}"
             );
+        }
+    }
+
+    /// A failed material target's sandbox is removed: no bridge job was ever
+    /// handed over, and `reclaim` needs none.
+    #[test]
+    fn reclaim_removes_a_failed_material_sandbox() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sandbox = dir.path().join("__target_fetch");
+        std::fs::create_dir_all(sandbox.join("ws")).expect("mkdir");
+        std::fs::write(sandbox.join("ws/cred.json"), b"secret").expect("write");
+        let generation = generation::claim(&sandbox);
+        SandboxTeardown::arm(sandbox.clone(), generation, counter()).reclaim();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while sandbox.exists() {
+            assert!(Instant::now() < deadline, "the sandbox was not reclaimed");
+            std::thread::sleep(Duration::from_millis(2));
         }
     }
 

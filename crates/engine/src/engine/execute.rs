@@ -201,7 +201,9 @@ impl Engine {
                 // `leave_for_diagnostics` in the match below (the failure
                 // renderer reads the log tail lazily from the sandbox, so a
                 // failed target's tree must survive until its next run — its
-                // documented pre-teardown behaviour); and a bare drop —
+                // documented pre-teardown behaviour), or, for credential
+                // material, as `reclaim` once the failure slot is filled; and
+                // a bare drop —
                 // cancellation or an unwind, and only those — queues a
                 // generation-checked reclaim of the directory. Without that
                 // last leg, mass fail-fast leaves one abandoned sandbox tree
@@ -300,8 +302,11 @@ impl Engine {
                                 None => err,
                             }
                         };
+                        // Not `complete`: a failed run handed over no bridge
+                        // job, so it would enqueue nothing and leave the
+                        // presented credentials on disk.
                         if let Some(teardown) = material_teardown {
-                            teardown.complete(addr.format());
+                            teardown.reclaim();
                         }
                         return Err(err);
                     }
