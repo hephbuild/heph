@@ -580,7 +580,7 @@ struct Built {
 ///
 /// `out` is renamed in as `out/`, or copied when it is on another filesystem.
 /// A failure there drops `out/` and keeps the rest of the slot, unless there
-/// is no log to keep. Anything else that fails before the rename leaves the
+/// is neither a log nor a fixes list to keep. Anything else that fails before the rename leaves the
 /// old slot as it was and the temporary directory removed.
 fn fill_slot(
     root: &Path,
@@ -617,8 +617,11 @@ fn fill_slot(
             let to = temp.path().join(OUT);
             match move_dir(from, &to, ops) {
                 Ok(()) => (true, None),
-                Err(e) if log.is_some() => {
-                    // Half a copy is not an `out/`: the log slot is kept alone.
+                Err(e) if log.is_some() || !fixes.is_empty() => {
+                    // Half a copy is not an `out/`: the slot is kept without
+                    // it, for its log or its `fixes.txt` (a material target
+                    // has no log on disk, and its fixes are still worth a
+                    // list).
                     match std::fs::remove_dir_all(&to) {
                         Err(e) if e.kind() != io::ErrorKind::NotFound => {
                             return Err(e)
@@ -1369,6 +1372,70 @@ mod tests {
                 .collect();
             assert_eq!(names, [addr_key(&a)], "{name}: no temporary left behind");
         }
+    }
+
+    /// A run with no log on disk — a material target — and fixes written
+    /// keeps its `fixes.txt` when moving `out/` fails: the slot is kept
+    /// without `out/`, not dropped.
+    #[tokio::test]
+    async fn failed_output_move_keeps_a_no_log_slots_fixes() {
+        use hplugin::error::FailureFixes;
+        let home = tempfile::tempdir().expect("home");
+        let sandbox = tempfile::tempdir().expect("sandbox");
+        let slots = FailureSlots::new(home.path());
+        let a = addr("//auth:fetch");
+        let staging = stage(sandbox.path());
+        let log = sandbox.path().join("log.txt");
+        std::fs::write(&log, "secret-ish\n").expect("log");
+        let err = with_failure_artifacts(
+            anyhow::anyhow!("boom"),
+            vec![
+                out_artifact(&staging),
+                log_file_artifact(&log).expect("artifact"),
+            ],
+        );
+        let paths = vec!["auth/a.go".to_owned()];
+        let slot = slots
+            .fill_with(
+                Fill {
+                    addr: &a,
+                    hashin: "h",
+                    roots: vec![sandbox.path().to_path_buf()],
+                    err: &err,
+                    lines: 10,
+                    material: true,
+                    fixes: Some(FailureFixes::Written {
+                        paths: paths.clone(),
+                        list: None,
+                    }),
+                },
+                SlotIo {
+                    rename: |_, _| Err(io::Error::other("EIO")),
+                    ..SlotIo::REAL
+                },
+            )
+            .await;
+        let dir = slots.slot_dir(&a);
+        assert!(slot.out.is_none());
+        assert!(slot.out_error.is_some());
+        assert!(
+            slot.log.expect("a tail").path().is_none(),
+            "material: in memory"
+        );
+        assert_eq!(
+            slot.fixes,
+            Some(FailureFixes::Written {
+                paths,
+                list: Some(dir.join(FIXES)),
+            })
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join(FIXES)).expect("fixes.txt"),
+            "auth/a.go\n"
+        );
+        assert!(!dir.join(OUT).exists(), "no partial out/");
+        assert!(!dir.join(LOG).exists(), "a material log never reaches disk");
+        assert_eq!(slots.read(&a).map(|m| m.addr), Some(a.format()));
     }
 
     /// Across filesystems the staged dir is copied, symlinks as symlinks, and
