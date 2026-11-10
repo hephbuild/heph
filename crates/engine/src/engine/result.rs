@@ -4292,9 +4292,12 @@ impl Engine {
     /// gets there first — the "unavailable, rebuild" branch of
     /// `execute_and_cache` included: when a passing frame already wrote, this
     /// writes nothing and reports nothing. Inside, the same moved-source guard
-    /// ([`Self::check_in_place_inputs_unchanged`]) runs first; then
-    /// [`Self::materialize_codegen_tree`] over the run's tars. No cache write
-    /// and no fixpoint: a failed run recorded no revision (E1).
+    /// ([`Self::check_in_place_inputs_unchanged`]) runs first; then the same
+    /// byte mover as a passing `in_place` write-back
+    /// ([`Self::write_in_place_only`]) over the run's tars, whose guard reads
+    /// the codegen index. No cache write, no fixpoint and no index record: a
+    /// failed run recorded no revision (E1), and an `in_place` file is a
+    /// source, which the index never records.
     ///
     /// Called from `execute`'s failure arm, after the sandbox was left for
     /// diagnostics (which keeps the directory, so the tars are still there)
