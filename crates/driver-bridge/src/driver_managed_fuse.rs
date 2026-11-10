@@ -6,6 +6,7 @@ use hdriver_support::driver_managed::{
     detect_output_collisions_blocking, invoke_inner, list_path_for, resolve_unpack_root,
     unpack_blocking, write_source_map_blocking,
 };
+use hdriver_support::stop;
 use hplugin::driver::{RunInput, RunRequest, RunResponse, SandboxGuard};
 use hsandboxfuse as sandboxfuse;
 use std::collections::BTreeMap;
@@ -71,7 +72,7 @@ impl ManagedDriverFuse {
         // shadow by registration order. Off the worker: the check enumerates
         // every input's entry paths, which for a cache-backed input is a header
         // scan over a sqlite blob and can park on that key's queued write.
-        let groups = detect_output_collisions_blocking(groups)
+        let groups = detect_output_collisions_blocking(groups, ctoken)
             .await
             .with_context(|| format!("output-collision check for {}", req.target.addr.format()))?;
 
@@ -87,6 +88,7 @@ impl ManagedDriverFuse {
                 unpack_root.clone(),
                 list_dir.clone(),
                 group,
+                ctoken,
             )
             .await?;
             match slot {
@@ -107,13 +109,15 @@ impl ManagedDriverFuse {
                     // into the FUSE upper layer just like OS mode.
                     for input in group {
                         let list_path = list_path_for(&input, &list_dir);
-                        // Off the worker, through the same shared helper the OS
+                        // Off the worker and stopped by the run's
+                        // cancellation, through the same shared helper the OS
                         // runner uses — see `unpack_blocking`.
                         unpack_blocking(
                             Arc::clone(&input.artifact.content),
                             unpack_root.clone(),
                             list_path.clone(),
                             input.filters.clone(),
+                            ctoken,
                         )
                         .await
                         .with_context(|| {
@@ -141,7 +145,7 @@ impl ManagedDriverFuse {
         // Off the worker, as the OS runner already does it: an input that opts in
         // costs an `entry_paths()` per artifact, a header scan over a sqlite blob
         // that can park on that key's queued write.
-        let inputs = write_source_map_blocking(inputs, &ws_dir, &sandbox_pkg_dir).await?;
+        let inputs = write_source_map_blocking(inputs, &ws_dir, &sandbox_pkg_dir, ctoken).await?;
 
         let target = req.target;
         let hashin = req.hashin;
@@ -178,7 +182,7 @@ impl ManagedDriverFuse {
         }
 
         res.artifacts
-            .extend(collect_outputs(target, hashin, &ws_dir, &sandbox_dir).await?);
+            .extend(collect_outputs(target, hashin, &ws_dir, &sandbox_dir, ctoken).await?);
 
         Ok(RunResponse {
             artifacts: res.artifacts,
@@ -216,6 +220,7 @@ async fn try_register_slot_blocking(
     unpack_root: PathBuf,
     list_dir: PathBuf,
     group: Vec<RunInput>,
+    ctoken: &(dyn Cancellable + Send + Sync),
 ) -> anyhow::Result<(Option<sandboxfuse::SlotGuard>, Vec<RunInput>)> {
     let prefix = unpack_root
         .strip_prefix(&fuse_lower)
@@ -228,8 +233,8 @@ async fn try_register_slot_blocking(
         })?
         .to_path_buf();
 
-    let (built, group) = hcore::blocking::run(move || {
-        let built = build_slot_layers(&unpack_root, &list_dir, &group)?;
+    let (built, group) = stop::run_blocking(ctoken, move |stop| {
+        let built = build_slot_layers(&unpack_root, &list_dir, &group, stop)?;
         anyhow::Ok((built, group))
     })
     .await?;
@@ -251,17 +256,22 @@ async fn try_register_slot_blocking(
 /// to unpack-into-upper for that group.
 ///
 /// Synchronous and I/O-bound: reached from `run_inner` only through
-/// [`try_register_slot_blocking`].
+/// [`try_register_slot_blocking`]. Writes nothing; `stop` is polled before
+/// each input's index build so a cancelled run is not held up by the rest.
 fn build_slot_layers(
     unpack_root: &Path,
     list_dir: &Path,
     group: &[RunInput],
+    stop: &(dyn Fn() -> bool + Sync),
 ) -> anyhow::Result<Option<SlotLayers>> {
     use rayon::prelude::*;
     type Built = (Arc<sandboxfuse::Layer>, Option<(PathBuf, Vec<PathBuf>)>);
     let results: Vec<anyhow::Result<Option<Built>>> = group
         .par_iter()
         .map(|input| -> anyhow::Result<Option<Built>> {
+            if stop() {
+                return Err(stop::cancelled());
+            }
             let Some(seekable) = input.artifact.content.seekable_reader().with_context(|| {
                 format!(
                     "open seekable reader for input origin_id={} source_addr={}",
@@ -411,10 +421,17 @@ mod tests {
         };
 
         let fs_handle = Arc::new(sandboxfuse::LayeredFs::new_empty(dir.path().join("upper")));
-        let (slot, group) =
-            try_register_slot_blocking(fs_handle, fuse_lower, unpack_root, list_dir, vec![input])
-                .await
-                .expect("register slot");
+        let ct = hcore::hasync::StdCancellationToken::new();
+        let (slot, group) = try_register_slot_blocking(
+            fs_handle,
+            fuse_lower,
+            unpack_root,
+            list_dir,
+            vec![input],
+            &ct,
+        )
+        .await
+        .expect("register slot");
 
         assert!(slot.is_some(), "a seekable input must register a slot");
         assert_eq!(group.len(), 1, "the group must come back to the caller");
