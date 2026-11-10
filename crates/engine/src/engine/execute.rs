@@ -154,16 +154,20 @@ impl Engine {
         // Telemetry: per-target execute wall time. This path runs only on a real
         // execution (cache misses), so it captures exactly the executed targets.
         let exec_started = std::time::Instant::now();
+        let start = execute_start(
+            addr_str.clone(),
+            driver.name.clone(),
+            def.target.cache.enabled,
+            &def.target.demand,
+            &reservation,
+            queued_ms,
+        );
+        // Held until the run ends; a failed run hands it back before keeping
+        // what it failed with (D17).
+        let mut reservation = Some(reservation);
         let res = crate::engine::event::emit_scope(
             &rs,
-            execute_start(
-                addr_str.clone(),
-                driver.name.clone(),
-                def.target.cache.enabled,
-                &def.target.demand,
-                &reservation,
-                queued_ms,
-            ),
+            start,
             move |error| crate::engine::event::BuildEventKind::ExecuteEnd {
                 addr: addr_str,
                 error: error.map(crate::engine::event::ErrorDetail::into_message),
@@ -238,10 +242,32 @@ impl Engine {
                 let res = match run {
                     Ok(res) => res,
                     Err(err) => {
-                        // The target failed. Keep its log in the failure slot
-                        // (or, for material, its tail in memory) before anything
-                        // is done to the sandbox it lives in. Here, under the
-                        // execute lock, once per run — not per caller.
+                        // The run is over: its capacity goes back before
+                        // anything is kept (D17), so a slow keep of a large
+                        // `failure_out` holds no pool.
+                        drop(reservation.take());
+                        // The sandbox is kept for diagnostics: nothing may be
+                        // queued against it. The tree survives until this
+                        // target's next run, whose `remove_stale` reclaims it.
+                        // Resolved before the fill is awaited (D17): a
+                        // cancellation during the fill must not drop the
+                        // teardown and queue a reclaim under the blocking job
+                        // still moving the staged outputs out of it.
+                        //
+                        // Unless the outputs are material, in which case the
+                        // diagnostic is not worth the secret it would leave on
+                        // disk: torn down once the fill has read it.
+                        let material_teardown = if outputs_are_material {
+                            Some(sandbox_teardown)
+                        } else {
+                            sandbox_teardown.leave_for_diagnostics();
+                            None
+                        };
+                        // The target failed. Keep its log and its `failure_out`
+                        // in the failure slot (for material, the log's tail in
+                        // memory and `out/` only) before anything is done to
+                        // the sandbox they live in. Here, under the execute
+                        // lock, once per run — not per caller.
                         // A cancelled run did not fail: nothing to keep. A
                         // driver may report a cancellation as an error of its
                         // own (exec's bare "cancelled", log attached so that a
@@ -266,19 +292,16 @@ impl Engine {
                                     material: outputs_are_material,
                                 })
                                 .await;
-                            err.context(slot)
+                            let out_error = slot.out_error.clone();
+                            let err = err.context(slot);
+                            // I7: the keep failed, the failure did not.
+                            match out_error {
+                                Some(e) => err.context(format!("failure_out not kept: {e}")),
+                                None => err,
+                            }
                         };
-                        // The sandbox is kept for diagnostics: nothing may be
-                        // queued against it. The tree survives until this
-                        // target's next run, whose `remove_stale` reclaims it.
-                        //
-                        // Unless the outputs are material, in which case the
-                        // diagnostic is not worth the secret it would leave on
-                        // disk.
-                        if outputs_are_material {
-                            sandbox_teardown.complete(addr.format());
-                        } else {
-                            sandbox_teardown.leave_for_diagnostics();
+                        if let Some(teardown) = material_teardown {
+                            teardown.complete(addr.format());
                         }
                         return Err(err);
                     }
