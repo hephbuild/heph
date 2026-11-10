@@ -1917,9 +1917,14 @@ fn classify_failure(
         failure_slot_log(&e)
     };
     let log_tail = log.as_ref().and_then(|l| l.tail().ok());
+    let outputs = failure_slot_out(&e);
     rs.record_failure(
         addr.clone(),
-        Arc::new(TargetFailure::new(addr.clone(), log_tail, e).with_log(log)),
+        Arc::new(
+            TargetFailure::new(addr.clone(), log_tail, e)
+                .with_log(log)
+                .with_outputs(outputs),
+        ),
     );
     UpstreamFailed { root: addr.clone() }.into()
 }
@@ -1932,6 +1937,14 @@ fn classify_failure(
 fn failure_slot_log(e: &anyhow::Error) -> Option<hplugin::error::FailureLog> {
     downcast_chain_ref::<crate::engine::failure_slot::FailureSlot>(e)?
         .log
+        .clone()
+}
+
+/// The `out/` of the failure slot `execute` filled for this failure, when the
+/// run's `failure_out` matches were kept there.
+fn failure_slot_out(e: &anyhow::Error) -> Option<std::path::PathBuf> {
+    downcast_chain_ref::<crate::engine::failure_slot::FailureSlot>(e)?
+        .out
         .clone()
 }
 
@@ -10163,6 +10176,37 @@ mod tests {
         let _ = classify_failure(&rs, &addr, false, process_failed_with_log(&log_path));
         let recorded = rs.get_failure(&addr).expect("recorded");
         assert!(recorded.log_tail.is_none() && recorded.log.is_none());
+        Ok(())
+    }
+
+    /// The recorded failure's `outputs` is the slot's `out/` when the run's
+    /// `failure_out` was kept, and absent with no slot on the chain.
+    #[tokio::test]
+    async fn classify_reads_failure_slot_out() -> anyhow::Result<()> {
+        let engine = engine_with(vec![static_target("//pkg:a", &[], &[])])?;
+        let rs = engine.new_state();
+        let addr = hmodel::htaddr::parse_addr("//pkg:a")?;
+        let sandbox = tempfile::tempdir().expect("tempdir");
+        let staging = sandbox.path().join(".heph-failure-out");
+        std::fs::create_dir_all(staging.join("pkg/report"))?;
+        std::fs::write(staging.join("pkg/report/index.html"), "<html>")?;
+        let failed = || {
+            hplugin::error::with_failure_artifacts(
+                anyhow::anyhow!("exit 1"),
+                vec![hplugin::error::failure_out_artifact(&staging).expect("utf-8")],
+            )
+        };
+
+        let e = slotted(&engine, &rs, &addr, sandbox.path(), failed()).await;
+        let _ = classify_failure(&rs, &addr, false, e);
+        let recorded = rs.get_failure(&addr).expect("recorded");
+        let out = recorded.outputs.clone().expect("outputs");
+        assert_eq!(out, engine.failure_slots.slot_dir(&addr).join("out"));
+        assert!(out.join("pkg/report/index.html").is_file());
+
+        let rs = engine.new_state();
+        let _ = classify_failure(&rs, &addr, false, failed());
+        assert!(rs.get_failure(&addr).expect("recorded").outputs.is_none());
         Ok(())
     }
 
