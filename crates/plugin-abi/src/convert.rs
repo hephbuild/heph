@@ -1200,7 +1200,10 @@ fn failure_output_to_pb(o: &FailureOutput) -> pb::FailureOutput {
     }
 }
 
-/// Each path's `content` is required, as `Path.content` is.
+/// Each path's `content` is required, as `Path.content` is, and must be
+/// workspace-relative: every component a plain name. An absolute path, a `..`
+/// or a `.` is never a valid `failure_out` path, and could reach out of the
+/// staging directory the managed layer copies into.
 fn failure_output_from_pb(o: pb::FailureOutput) -> anyhow::Result<FailureOutput> {
     Ok(FailureOutput {
         group: o.group.unwrap_or_default(),
@@ -1208,11 +1211,22 @@ fn failure_output_from_pb(o: pb::FailureOutput) -> anyhow::Result<FailureOutput>
             .paths
             .into_iter()
             .map(|p| {
-                Ok(match required(p.content, "FailureOutput.paths.content")? {
+                let content = match required(p.content, "FailureOutput.paths.content")? {
                     pb::path_content::Content::FilePath(s) => PathContent::FilePath(s),
                     pb::path_content::Content::DirPath(s) => PathContent::DirPath(s),
                     pb::path_content::Content::Glob(s) => PathContent::Glob(s),
-                })
+                };
+                let raw = match &content {
+                    PathContent::FilePath(s) | PathContent::DirPath(s) | PathContent::Glob(s) => s,
+                };
+                anyhow::ensure!(
+                    std::path::Path::new(raw)
+                        .components()
+                        .all(|c| matches!(c, std::path::Component::Normal(_))),
+                    "FailureOutput.paths: {raw:?} is not workspace-relative \
+                     (an absolute path, `..` or `.`)"
+                );
+                Ok(content)
             })
             .collect::<anyhow::Result<_>>()?,
     })
@@ -3588,6 +3602,26 @@ nested: { a: 1, b: [x, y] }
             format!("{err:#}").contains("FailureOutput.paths.content"),
             "{err:#}"
         );
+
+        // A path that is not workspace-relative is refused at decode.
+        for bad in [
+            pb::path_content::Content::FilePath("/etc/passwd".to_string()),
+            pb::path_content::Content::FilePath("../sibling/x".to_string()),
+            pb::path_content::Content::DirPath("p/../../out/".to_string()),
+            pb::path_content::Content::FilePath("./p/x".to_string()),
+            pb::path_content::Content::Glob("/abs/**/*.png".to_string()),
+            pb::path_content::Content::Glob("../*.log".to_string()),
+        ] {
+            let mut wire = full_target_def_pb();
+            wire.failure_outputs[0].paths[0].content = Some(bad.clone());
+            let err = target_def_from_pb(via_bytes(&wire))
+                .err()
+                .unwrap_or_else(|| panic!("{bad:?} must be refused"));
+            assert!(
+                format!("{err:#}").contains("not workspace-relative"),
+                "{bad:?}: {err:#}"
+            );
+        }
     }
 
     /// D7, D14: `InPlace` crosses with its flag intact (`IN_PLACE` with it,
