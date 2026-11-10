@@ -1261,43 +1261,44 @@ pub const REDACT_MIN_LEN: usize = 8;
 /// A driver carries it as a `timeout: Option<Timeout>` field on its spec and
 /// moves it onto [`TargetDef::timeout`](targetdef::TargetDef::timeout); the
 /// **engine** enforces it, so a driver does nothing else with it. It is never
-/// hashed.
+/// hashed, and has no `Hash` impl, so nothing can start hashing it by
+/// accident.
 ///
-/// Always above zero and at most `u64::MAX` milliseconds, so it crosses the
-/// plugin ABI (`TargetDef.timeout_ms`) losslessly. "No limit" is `None`, never
-/// a zero timeout.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Timeout(std::time::Duration);
+/// Stored as a non-zero whole number of milliseconds, which is exactly what
+/// crosses the plugin ABI (`TargetDef.timeout_ms`): zero and a sub-millisecond
+/// remainder are unrepresentable rather than checked for. "No limit" is
+/// `None`, never a zero timeout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Timeout(std::num::NonZeroU64);
 
 impl Timeout {
-    /// The `target()` config key a declaration rides on.
-    pub const CONFIG_KEY: &'static str = "timeout";
-
-    /// A timeout of `d`; refuses zero and anything over `u64::MAX`
-    /// milliseconds.
+    /// A timeout of `d`; refuses zero, a sub-millisecond remainder, and
+    /// anything over `u64::MAX` milliseconds.
     pub fn new(d: std::time::Duration) -> anyhow::Result<Self> {
-        if d.is_zero() {
-            anyhow::bail!(
-                "`timeout` must be above zero; leave it out for no limit, or write e.g. \"10m\""
-            );
+        if !d.subsec_nanos().is_multiple_of(1_000_000) {
+            anyhow::bail!("`timeout` {d:?} is not a whole number of milliseconds");
         }
-        u64::try_from(d.as_millis())
+        let ms = u64::try_from(d.as_millis())
             .map_err(|_overflow| anyhow::anyhow!("`timeout` {d:?} is too long"))?;
-        Ok(Self(d))
+        Self::from_millis(ms)
     }
 
-    /// From the wire's `timeout_ms`.
+    /// From the wire's `timeout_ms`; refuses zero.
     pub fn from_millis(ms: u64) -> anyhow::Result<Self> {
-        Self::new(std::time::Duration::from_millis(ms))
+        std::num::NonZeroU64::new(ms).map(Self).ok_or_else(|| {
+            anyhow::anyhow!(
+                "`timeout` must be above zero; leave it out for no limit, or write e.g. \"10m\""
+            )
+        })
     }
 
-    /// For the wire's `timeout_ms`; lossless by construction.
+    /// For the wire's `timeout_ms`: exactly what is stored.
     pub fn as_millis(self) -> u64 {
-        u64::try_from(self.0.as_millis()).unwrap_or(u64::MAX)
+        self.0.get()
     }
 
     pub fn duration(self) -> std::time::Duration {
-        self.0
+        std::time::Duration::from_millis(self.0.get())
     }
 
     /// Read a `timeout` value: a whole number of seconds above zero, or a
@@ -1326,10 +1327,11 @@ impl Timeout {
 /// (only a plugin's wire value can be finer than a second).
 impl Display for Timeout {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.0.subsec_nanos() != 0 {
-            return write!(f, "{}ms", self.0.as_millis());
+        let ms = self.0.get();
+        if !ms.is_multiple_of(1000) {
+            return write!(f, "{ms}ms");
         }
-        let s = self.0.as_secs();
+        let s = ms / 1000;
         if s.is_multiple_of(3600) {
             write!(f, "{}h", s / 3600)
         } else if s.is_multiple_of(60) {
@@ -1759,6 +1761,11 @@ mod timeout_tests {
             Value::String(String::new()),
             Value::String("10 minutes please".into()),
             Value::String("1.5h".into()),
+            // Parses to `u64::MAX` seconds: over `u64::MAX` milliseconds.
+            Value::String("9999999999999999999h".into()),
+            // Does not fit a `u64` at all.
+            Value::String("99999999999999999999h".into()),
+            Value::Uint(u64::MAX),
             Value::String("${read://p:t}".into()),
             Value::Float(1.5),
             Value::Bool(true),
@@ -1804,6 +1811,17 @@ mod timeout_tests {
             u64::MAX
         );
         assert!(Timeout::new(Duration::MAX).is_err(), "over u64::MAX ms");
+        // What is stored is what crosses the wire: no sub-millisecond part to
+        // lose on the way.
+        assert!(Timeout::new(Duration::from_micros(1500)).is_err());
+        assert!(Timeout::new(Duration::from_nanos(1)).is_err());
+        assert!(Timeout::new(Duration::ZERO).is_err());
+        assert_eq!(
+            Timeout::new(Duration::from_millis(2500))
+                .expect("whole ms")
+                .as_millis(),
+            2500
+        );
     }
 }
 

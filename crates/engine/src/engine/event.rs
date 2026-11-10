@@ -39,6 +39,10 @@ pub struct ErrorDetail {
     /// The subprocess's exit status as the OS reported it.
     pub exit_status: Option<String>,
     pub log_tail: Option<hcore::events::LogTailData>,
+    /// The run outlasted the target's `timeout` (a
+    /// [`TimedOutError`](crate::engine::run_timeout::TimedOutError) on the
+    /// chain).
+    pub timed_out: Option<hcore::events::TimedOutData>,
 }
 
 impl ErrorDetail {
@@ -75,6 +79,14 @@ impl ErrorDetail {
                     start_line: tail.start_line,
                 });
             }
+        }
+        // Through the memoizer's shared wrappers too: a recorded failure
+        // reaches `ResultEnd` behind `TargetFailure`'s source.
+        if let Some(t) = crate::engine::run_timeout::timed_out(e) {
+            d.timed_out = Some(hcore::events::TimedOutData {
+                timeout_ms: t.timeout.as_millis(),
+                abandoned: t.abandoned_after.is_some(),
+            });
         }
         d
     }

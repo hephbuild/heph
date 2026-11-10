@@ -32,8 +32,9 @@ by ignoring it:
    //p:integration timed out after 10m (its `timeout`)
    ```
 
-   with `; its driver did not stop within 10s of being cancelled, and was
-   abandoned` appended when step 2 ran out.
+   with `; the run did not stop within 10s of being cancelled and was
+   abandoned, so its process may still be running` appended when step 2 ran
+   out.
 
 A timeout is a **failure**, not a cancellation: the failure box shows the log
 tail, the sandbox is kept for diagnostics, `--fail-fast` reacts to it, and

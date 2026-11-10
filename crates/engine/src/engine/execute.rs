@@ -240,8 +240,16 @@ impl Engine {
                         // (or, for material, its tail in memory) before anything
                         // is done to the sandbox it lives in. Here, under the
                         // execute lock, once per run — not per caller.
-                        // A cancelled run did not fail: nothing to keep.
-                        let err = if hplugin::error::is_cancelled(&err) {
+                        // A cancelled run did not fail: nothing to keep. A
+                        // driver may report a cancellation as an error of its
+                        // own (exec's bare "cancelled", log attached so that a
+                        // timeout keeps it), so the request's token decides —
+                        // except for a timeout, which is a failure even when
+                        // the request was cancelled during its grace.
+                        let cancelled = hplugin::error::is_cancelled(&err)
+                            || (rs.ctoken().is_cancelled()
+                                && !crate::engine::run_timeout::is_timed_out(&err));
+                        let err = if cancelled {
                             err
                         } else {
                             let slot = self

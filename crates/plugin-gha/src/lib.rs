@@ -1128,6 +1128,7 @@ mod tests {
         hook.on_event(&ev(
             5,
             BuildEventKind::ResultEnd {
+                timed_out: None,
                 addr: "//a:x".into(),
                 error: None,
                 upstream_of: None,
@@ -1258,6 +1259,7 @@ mod tests {
         hook.on_event(&ev(
             1_000,
             BuildEventKind::ResultEnd {
+                timed_out: None,
                 addr: "//a:x".into(),
                 error: Some("target failed".into()),
                 upstream_of: None,
@@ -1306,6 +1308,7 @@ mod tests {
         hook.on_event(&ev(
             10,
             BuildEventKind::ResultEnd {
+                timed_out: None,
                 addr: "//base:proto".into(),
                 error: Some("boom".into()),
                 upstream_of: None,
@@ -1317,6 +1320,7 @@ mod tests {
             hook.on_event(&ev(
                 20,
                 BuildEventKind::ResultEnd {
+                    timed_out: None,
                     addr: format!("//svc:t{i}"),
                     error: Some("dependency failed".into()),
                     upstream_of: Some("//base:proto".into()),
