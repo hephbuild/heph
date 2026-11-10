@@ -1467,9 +1467,7 @@ mod tests {
                 let (lock, cvar) = &RELEASE;
                 let mut released = lock.lock().unwrap_or_else(PoisonError::into_inner);
                 while !*released {
-                    released = cvar
-                        .wait(released)
-                        .unwrap_or_else(PoisonError::into_inner);
+                    released = cvar.wait(released).unwrap_or_else(PoisonError::into_inner);
                 }
                 drop(released);
                 std::fs::rename(from, to)

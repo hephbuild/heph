@@ -176,8 +176,8 @@ pub fn copy_tree(
         if ft.is_dir() {
             copy_tree(&src, &dst, copy)?;
         } else if ft.is_symlink() {
-            let target =
-                fs::read_link(&src).with_context(|| format!("reading the link {}", src.display()))?;
+            let target = fs::read_link(&src)
+                .with_context(|| format!("reading the link {}", src.display()))?;
             std::os::unix::fs::symlink(&target, &dst)
                 .with_context(|| format!("linking {}", dst.display()))?;
         } else if ft.is_file() {
