@@ -319,9 +319,10 @@ impl Engine {
                         };
                         // Not `complete`: a failed run handed over no bridge
                         // job, so it would enqueue nothing and leave the
-                        // presented credentials on disk.
+                        // presented credentials on disk — in the FUSE upper
+                        // side, under FUSE, which goes too.
                         if let Some(teardown) = material_teardown {
-                            teardown.reclaim();
+                            teardown.reclaim(self.fuse_upper(&sandbox_dir));
                         }
                         return Err(err);
                     }
@@ -395,13 +396,26 @@ impl Engine {
     /// directories the bridge redirects it to.
     fn sandbox_roots(&self, sandbox_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
         let mut roots = vec![sandbox_dir.to_path_buf()];
-        if self.fuse.mount.is_some()
-            && let Ok(rel) = sandbox_dir.strip_prefix(self.home.join("sandbox"))
-        {
+        if let Some(rel) = self.fuse_rel(sandbox_dir) {
             roots.push(self.fuse.lower.join(rel));
             roots.push(self.fuse.upper.join(rel));
         }
         roots
+    }
+
+    /// The backing-side directory a run in `sandbox_dir` wrote to, when FUSE
+    /// is mounted: what the FUSE bridge's cleanup job removes after a passing
+    /// run.
+    fn fuse_upper(&self, sandbox_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+        self.fuse_rel(sandbox_dir)
+            .map(|rel| self.fuse.upper.join(rel))
+    }
+
+    /// `sandbox_dir` relative to the plain sandbox root, when FUSE is mounted
+    /// and the bridge redirects the run.
+    fn fuse_rel<'a>(&self, sandbox_dir: &'a std::path::Path) -> Option<&'a std::path::Path> {
+        self.fuse.mount.as_ref()?;
+        sandbox_dir.strip_prefix(self.home.join("sandbox")).ok()
     }
 
     /// The one sandbox block every run goes through, a build's

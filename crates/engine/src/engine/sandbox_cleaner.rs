@@ -288,7 +288,8 @@ pub mod generation {
 ///   the same bound as before teardown ownership existed.
 /// * [`reclaim`](Self::reclaim) — **a material target failed**: its sandbox
 ///   holds presented credentials, so once the failure slot has read what it
-///   keeps, the generation-checked reclaim is enqueued at once.
+///   keeps, the generation-checked reclaim is enqueued at once — of the
+///   FUSE upper-side directory too, when the run wrote there.
 /// * `Drop` without any of these — **cancellation or abandonment only** (the future
 ///   was dropped or unwound without resolving): a generation-checked
 ///   [`generation::remove_stale`] reclaim is enqueued. If a successor already
@@ -391,10 +392,37 @@ impl SandboxTeardown {
     /// [`complete`](Self::complete): a failed run hands over no bridge job,
     /// so `complete` would enqueue nothing and leave the presented
     /// credentials on disk.
-    pub fn reclaim(mut self) {
+    ///
+    /// `fuse_upper` is the sandbox's FUSE upper-side directory when the run
+    /// went through the mount: its writes, presented credentials included,
+    /// live there and not in `dir`. It is removed directly, bypassing the
+    /// mount, as the FUSE bridge's own cleanup job does for a passing run,
+    /// and under the same generation check as `dir`: a successor of this addr
+    /// reuses the same upper path.
+    pub fn reclaim(mut self, fuse_upper: Option<PathBuf>) {
         self.armed = false;
         self.job = None;
-        self.enqueue_reclaim();
+        let Some(upper) = fuse_upper else {
+            self.enqueue_reclaim();
+            return;
+        };
+        let dir = self.dir.clone();
+        let remove = |p: &std::path::Path| match remove_dir_all(p) {
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            other => other,
+        };
+        let job: SandboxCleanupJob = Box::new(move || {
+            // Both are attempted; the first error is the job's.
+            let upper = remove(&upper);
+            let plain = remove(&dir);
+            upper.and(plain)
+        });
+        enqueue(
+            Lane::Reclaim,
+            format!("reclaim {}", self.dir.display()),
+            generation::guarded(self.dir.clone(), self.generation, job),
+            Arc::clone(&self.pending),
+        );
     }
 
     fn enqueue_reclaim(&self) {
@@ -616,12 +644,51 @@ mod tests {
         std::fs::create_dir_all(sandbox.join("ws")).expect("mkdir");
         std::fs::write(sandbox.join("ws/cred.json"), b"secret").expect("write");
         let generation = generation::claim(&sandbox);
-        SandboxTeardown::arm(sandbox.clone(), generation, counter()).reclaim();
+        SandboxTeardown::arm(sandbox.clone(), generation, counter()).reclaim(None);
         let deadline = Instant::now() + Duration::from_secs(5);
         while sandbox.exists() {
             assert!(Instant::now() < deadline, "the sandbox was not reclaimed");
             std::thread::sleep(Duration::from_millis(2));
         }
+    }
+
+    /// Under FUSE a failed material run's writes — the presented credential
+    /// among them — sit in the upper-side directory, not the plain sandbox:
+    /// `reclaim` removes both. The plain dir need not exist (the FUSE bridge
+    /// redirects the run away from it).
+    #[test]
+    fn reclaim_removes_a_failed_material_sandboxs_fuse_upper() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sandbox = dir.path().join("sandbox/__target_fetch");
+        let upper = dir.path().join("sandboxfuse1/upper/__target_fetch");
+        std::fs::create_dir_all(sandbox.join("ws")).expect("mkdir");
+        std::fs::create_dir_all(upper.join("ws")).expect("mkdir upper");
+        std::fs::write(upper.join("ws/cred.json"), b"secret").expect("write");
+        let pending = counter();
+        let generation = generation::claim(&sandbox);
+        SandboxTeardown::arm(sandbox.clone(), generation, Arc::clone(&pending))
+            .reclaim(Some(upper.clone()));
+        wait_drained(&pending, Duration::from_secs(5));
+        assert!(!upper.exists(), "the upper side holds the credential");
+        assert!(!sandbox.exists());
+
+        // Without a plain dir at all, the upper side still goes.
+        std::fs::create_dir_all(upper.join("ws")).expect("mkdir upper");
+        let generation = generation::claim(&sandbox);
+        SandboxTeardown::arm(sandbox.clone(), generation, Arc::clone(&pending))
+            .reclaim(Some(upper.clone()));
+        wait_drained(&pending, Duration::from_secs(5));
+        assert!(!upper.exists());
+
+        // A successor's claim makes the reclaim decline: the upper path is
+        // the successor's now.
+        std::fs::create_dir_all(upper.join("ws")).expect("mkdir upper");
+        let stale = generation::claim(&sandbox);
+        let _successor = generation::claim(&sandbox);
+        SandboxTeardown::arm(sandbox.clone(), stale, Arc::clone(&pending))
+            .reclaim(Some(upper.clone()));
+        wait_drained(&pending, Duration::from_secs(5));
+        assert!(upper.exists(), "a superseded reclaim declines");
     }
 
     #[test]
