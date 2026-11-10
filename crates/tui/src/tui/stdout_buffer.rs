@@ -13,9 +13,11 @@ const DEFAULT_INTERVAL: Duration = Duration::from_millis(100);
 ///
 /// The TUI renders to stderr. When stdout is the *same* tty, a raw stdout write
 /// would interleave with spinner redraws, so we pause the TUI around each flush.
-/// When stdout is redirected (a pipe/file), there is nothing to interleave with —
+/// When stdout is redirected to a file, there is nothing to interleave with —
 /// pausing would only churn the TUI (each resume re-anchors the inline viewport,
-/// scrolling blank lines onto stderr), so we write directly without pausing.
+/// scrolling blank lines onto stderr), so we write directly without pausing. A
+/// pipe never gets here with the TUI up: its reader may print to the TUI's
+/// terminal at any time, so `should_use_tui` refuses the TUI for it.
 pub struct BufferedStdout {
     buf: Arc<Mutex<Vec<u8>>>,
     task: Option<JoinHandle<()>>,
