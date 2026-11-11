@@ -281,8 +281,7 @@ struct DockerBuildSpec {
     /// pulled for. Hashed inputs, like `context`.
     bases: HashMap<String, Vec<String>>,
     /// Archive format: `oci` (default) or `docker`.
-    #[spec(ty = ImageFormat::any_param_type())]
-    format: Option<String>,
+    format: ImageFormat,
     /// `--build-arg` values passed to the build. Hashed (they change the image).
     /// A key may not contain `=` — docker would re-split it and silently take a
     /// different name/value pair than the one written here.
@@ -807,7 +806,7 @@ impl ManagedDriver for Driver {
         let pkg = addr.package.clone();
         let pkg_str = addr.package.as_str();
 
-        let format = ImageFormat::parse(spec.format.as_deref().unwrap_or("oci"))?;
+        let format = spec.format;
 
         let dockerfile_spec = spec.dockerfile.unwrap_or_else(|| "Dockerfile".to_string());
         let dockerfile_ref = if is_addr(&dockerfile_spec) {
@@ -1790,35 +1789,6 @@ exit 0
             .err()
             .expect("parse must fail");
         format!("{err:#}")
-    }
-
-    #[test]
-    fn format_parse_rejects_unknown() {
-        assert_eq!(ImageFormat::parse("oci").expect("oci"), ImageFormat::Oci);
-        assert_eq!(
-            ImageFormat::parse("docker").expect("docker"),
-            ImageFormat::Docker
-        );
-        let err = ImageFormat::parse("tar").expect_err("unknown format");
-        assert!(format!("{err:#}").contains("oci"), "got: {err:#}");
-    }
-
-    /// `format`'s schema is the enum of what `ImageFormat::parse` reads, so the
-    /// LSP flags `"tar"` and never `"docker"`.
-    #[test]
-    fn format_schema_is_the_enum_parse_reads() {
-        let schema = DockerBuildSpec::schema();
-        let ty = &schema
-            .fields
-            .iter()
-            .find(|f| f.name == "format")
-            .expect("format field")
-            .ty;
-        assert_eq!(ty.literals(), vec!["oci", "docker"]);
-        for l in ty.literals() {
-            ImageFormat::parse(l).unwrap_or_else(|e| panic!("{l:?}: {e:#}"));
-        }
-        assert!(!ty.matches(&Value::String("tar".to_string())));
     }
 
     #[test]

@@ -58,7 +58,7 @@ use hplugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
     ParseResponse, TargetAddr,
 };
-use hplugin::htspec::Spec;
+use hplugin::htspec::{FromSpecValue, Spec};
 use hproc::proc_exec;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -168,8 +168,7 @@ fn normalize_value(value: &str) -> String {
 pub(crate) struct TargetSpec {
     /// `wrap` (default) captures the environment and runs targets locally in it.
     /// `session` holds one `devenv shell` open and runs targets inside it.
-    #[spec(ty = Mode::param_type())]
-    pub mode: String,
+    pub mode: Mode,
     /// Directory containing `devenv.nix`, relative to this package. Defaults to
     /// the package directory.
     pub root: String,
@@ -202,10 +201,26 @@ pub struct DevenvDef {
     pub pass_env: BTreeMap<String, String>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub enum Mode {
+    /// The default, for an absent `mode` and for `""`.
+    #[default]
     Wrap,
     Session,
+}
+
+/// Decoded by hand rather than `#[derive(SpecEnum)]`: `""` is accepted as the
+/// default, and an unknown mode is told what each one does. The schema comes
+/// from the same table as the parse.
+impl FromSpecValue for Mode {
+    fn from_spec_value(v: &hcore::htvalue::Value) -> anyhow::Result<Self> {
+        Self::parse(&String::from_spec_value(v)?)
+    }
+
+    /// What [`Mode::parse`] takes: every mode, and `""`.
+    fn spec_param_type() -> ParamType {
+        ParamType::one_of(Self::ALL.iter().map(|m| m.as_str()).chain([""]))
+    }
 }
 
 impl Mode {
@@ -214,7 +229,7 @@ impl Mode {
     const ALL: [Self; 2] = [Self::Wrap, Self::Session];
 
     fn parse(raw: &str) -> anyhow::Result<Self> {
-        // `""` is an absent `mode` (the field is a plain `String`), so the default.
+        // `""` is the default, as an absent `mode` is.
         if raw.is_empty() {
             return Ok(Self::Wrap);
         }
@@ -235,12 +250,6 @@ impl Mode {
             Self::Wrap => "wrap",
             Self::Session => "session",
         }
-    }
-
-    /// The schema type of `mode`: what [`parse`](Self::parse) takes — every
-    /// mode, and the `""` an absent key reads as.
-    fn param_type() -> ParamType {
-        ParamType::one_of(Self::ALL.iter().map(|m| m.as_str()).chain([""]))
     }
 }
 
@@ -294,7 +303,7 @@ impl ManagedDriver for Driver {
     ) -> anyhow::Result<ParseResponse> {
         let spec = TargetSpec::from(&req.target_spec.config)?;
         let pkg = req.target_spec.addr.package.clone();
-        let mode = Mode::parse(&spec.mode)?;
+        let mode = spec.mode;
         check_root(&spec.root)?;
 
         let names: Vec<String> = if spec.pass_env.is_empty() {
@@ -629,9 +638,12 @@ mod tests {
     }
 
     /// The schema lists exactly what `Mode::parse` takes — `""` included, since
-    /// the parser takes it — so the LSP never flags a valid mode.
+    /// the parser takes it — so the LSP never flags a valid mode; an absent
+    /// `mode` is the default.
     #[test]
-    fn mode_schema_is_the_enum_parse_takes() {
+    fn mode_schema_is_the_literals_parse_takes() {
+        let absent = TargetSpec::from(&Default::default()).expect("absent mode");
+        assert_eq!(absent.mode, Mode::Wrap);
         let schema = TargetSpec::schema();
         let ty = &schema
             .fields

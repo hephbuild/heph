@@ -137,8 +137,7 @@ struct OciImageSpec {
     /// Ports the image declares (`EXPOSE`), e.g. `["8080/tcp"]`.
     exposed_ports: Vec<String>,
     /// Archive format: `oci` (default) or `docker`.
-    #[spec(ty = ImageFormat::any_param_type())]
-    format: Option<String>,
+    format: ImageFormat,
     /// Write an OCI **layout directory** instead of a single archive file. This
     /// is the shape another image's `base`, and buildx's `oci-layout://` build
     /// context, consume.
@@ -497,10 +496,7 @@ impl ManagedDriver for Driver {
              Add at least one `oci.layer` target."
         );
 
-        let format = spec
-            .format
-            .as_deref()
-            .map_or(Ok(ImageFormat::Oci), ImageFormat::parse)?;
+        let format = spec.format;
         anyhow::ensure!(
             !(matches!(format, ImageFormat::Docker) && platforms.len() > 1),
             "`format = \"docker\"` holds a single image, but `platforms` lists {}. A daemon tag \
@@ -832,21 +828,28 @@ mod tests {
         h.finish()
     }
 
-    /// `format`'s schema is the enum of what `ImageFormat::parse` reads.
+    /// `format` decodes straight to an [`ImageFormat`]: absent or `None` is
+    /// `oci`, and an unknown spelling is refused naming the field and the
+    /// choices.
     #[test]
-    fn format_schema_is_the_enum_parse_reads() {
-        let schema = OciImageSpec::schema();
-        let ty = &schema
-            .fields
-            .iter()
-            .find(|f| f.name == "format")
-            .expect("format field")
-            .ty;
-        assert_eq!(ty.literals(), vec!["oci", "docker"]);
-        for l in ty.literals() {
-            ImageFormat::parse(l).unwrap_or_else(|e| panic!("{l:?}: {e:#}"));
-        }
-        assert!(!ty.matches(&hcore::htvalue::Value::String("tar".to_string())));
+    fn format_decodes_to_the_image_format() {
+        use hcore::htvalue::Value;
+        let parse = |v: Option<Value>| {
+            let config: HashMap<String, Value> =
+                v.map(|v| ("format".to_string(), v)).into_iter().collect();
+            OciImageSpec::from(&config).map(|s| s.format)
+        };
+        assert_eq!(parse(None).expect("absent"), ImageFormat::Oci);
+        assert_eq!(parse(Some(Value::Null())).expect("None"), ImageFormat::Oci);
+        assert_eq!(
+            parse(Some(Value::String("docker".to_string()))).expect("docker"),
+            ImageFormat::Docker
+        );
+        let err = parse(Some(Value::String("tar".to_string()))).expect_err("tar");
+        assert_eq!(
+            format!("{err:#}"),
+            r#"parse `format`: invalid: expected one of [oci, docker], got: "tar""#
+        );
     }
 
     /// `hashin` folds a sorted, unlabeled multiset of dep hashouts: no address,

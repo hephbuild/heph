@@ -92,8 +92,12 @@ struct OciIndexSpec {
     /// Archive format: `oci`, the default and the only one an index takes — a
     /// docker-format archive holds a single image, which is the one thing this
     /// rule does not produce.
-    #[spec(ty = ImageFormat::param_type(&[ImageFormat::Oci]))]
-    format: Option<String>,
+    ///
+    /// Decoded as any [`ImageFormat`], so `"docker"` reaches `parse` and is
+    /// refused there with the reason and the way out; the schema narrows to
+    /// `"oci"` so the LSP flags it before that.
+    #[spec(ty = hcore::htvalue::signature::ParamType::literal("oci"))]
+    format: ImageFormat,
     /// Write an OCI **layout directory** instead of a single archive file. This
     /// is the shape `docker_build`'s `bases` and buildx's `oci-layout://` build
     /// context consume.
@@ -231,10 +235,7 @@ impl ManagedDriver for Driver {
             !spec.images.is_empty(),
             "`images` is empty; an oci_index groups per-platform images and needs at least one"
         );
-        let format = spec
-            .format
-            .as_deref()
-            .map_or(Ok(ImageFormat::Oci), ImageFormat::parse)?;
+        let format = spec.format;
         anyhow::ensure!(
             !matches!(format, ImageFormat::Docker),
             "`format = \"docker\"` holds a single image, which is the one thing an oci_index does \

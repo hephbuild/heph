@@ -1,3 +1,4 @@
+use hplugin::htspec::FromSpecValue;
 use std::collections::BTreeMap;
 
 /// Link buildmode — the `go build -buildmode=` equivalent, narrowed to the two
@@ -23,6 +24,31 @@ pub enum BuildMode {
     Pie,
 }
 
+/// A `go_compile` spec's `buildmode`: a [`BuildMode::NAMES`] spelling, or `""`
+/// for the default `exe` (what a string-typed producer writes for "absent").
+/// An unknown spelling is a hard error rather than a silent fallback — it
+/// would change the linkage of the produced binary.
+impl FromSpecValue for BuildMode {
+    fn from_spec_value(v: &hcore::htvalue::Value) -> anyhow::Result<Self> {
+        let s = String::from_spec_value(v)?;
+        if s.is_empty() {
+            return Ok(Self::default());
+        }
+        Self::parse(&s).ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown `buildmode` `{s}` (allowed: {})",
+                Self::NAMES.join(", ")
+            )
+        })
+    }
+
+    /// What [`from_spec_value`](Self::from_spec_value) takes: the names, and
+    /// `""`.
+    fn spec_param_type() -> hcore::htvalue::signature::ParamType {
+        hcore::htvalue::signature::ParamType::one_of(Self::NAMES.iter().copied().chain([""]))
+    }
+}
+
 impl BuildMode {
     /// Accepted spellings, for schema docs and "allowed: [...]" errors.
     pub const NAMES: &'static [&'static str] = &["exe", "pie"];
@@ -35,7 +61,9 @@ impl BuildMode {
         Self::ALL.into_iter().find(|m| m.as_str() == s)
     }
 
-    /// The schema type of a variant's `buildmode`: exactly [`Self::NAMES`].
+    /// The schema type of a variant's `buildmode`: exactly [`Self::NAMES`],
+    /// which is what the variant parser takes (it refuses `""`, unlike a
+    /// `go_compile` spec's [`FromSpecValue`] decode).
     pub fn param_type() -> hcore::htvalue::signature::ParamType {
         hcore::htvalue::signature::ParamType::one_of(Self::NAMES.iter().copied())
     }

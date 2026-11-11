@@ -26,7 +26,8 @@ use hplugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
     ParseResponse, RunRequest, RunResponse, targetdef::TargetDef,
 };
-use hplugin::htspec::Spec;
+use hcore::htvalue::Value;
+use hplugin::htspec::{FromSpecValue, Spec};
 use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3;
 
@@ -50,9 +51,23 @@ pub enum Access {
     Shared,
 }
 
+/// Decoded by hand rather than `#[derive(SpecEnum)]`, whose generic "expected
+/// one of" would drop what each mode means; the schema still comes from the
+/// same table as the parse.
+impl FromSpecValue for Access {
+    fn from_spec_value(v: &Value) -> anyhow::Result<Self> {
+        Self::parse(&String::from_spec_value(v)?)
+    }
+
+    /// The spellings [`Access::parse`] accepts.
+    fn spec_param_type() -> ParamType {
+        ParamType::one_of(Self::ALL.map(Self::as_str))
+    }
+}
+
 impl Access {
     /// Every mode. [`parse`](Self::parse) matches against these spellings and
-    /// [`param_type`](Self::param_type) lists them, so the two agree.
+    /// the schema lists them, so the two agree.
     const ALL: [Self; 2] = [Self::Exclusive, Self::Shared];
 
     fn parse(s: &str) -> anyhow::Result<Self> {
@@ -66,11 +81,6 @@ impl Access {
                      concurrent access by construction)"
                 )
             })
-    }
-
-    /// The schema type of `access`: the spellings [`parse`](Self::parse) takes.
-    fn param_type() -> ParamType {
-        ParamType::one_of(Self::ALL.map(Self::as_str))
     }
 
     pub fn as_str(self) -> &'static str {
@@ -106,8 +116,7 @@ struct ScratchSpec {
     env: Option<String>,
     /// `"exclusive"` (default) — one consumer at a time. `"shared"` — concurrent,
     /// for a cache that is safe under concurrent access by construction.
-    #[spec(ty = Access::param_type())]
-    access: Option<String>,
+    access: Option<Access>,
     /// Everything the contents depend on, beyond the declaring address —
     /// **the whole of it**. Two declarations sharing an addr share a directory
     /// if and only if they agree here.
@@ -237,12 +246,7 @@ impl ScratchDef {
         if !spec.path.is_empty() {
             validate_path(&spec.path)?;
         }
-        let access = spec
-            .access
-            .as_deref()
-            .map(Access::parse)
-            .transpose()?
-            .unwrap_or(Access::Exclusive);
+        let access = spec.access.unwrap_or(Access::Exclusive);
         let env = match spec.env {
             Some(e) if e.trim().is_empty() => {
                 anyhow::bail!("scratch `env` must not be empty — omit it to get `SCRATCH_<NAME>`")
@@ -448,9 +452,9 @@ mod tests {
     }
 
     /// The schema lists exactly what the parser takes, so the LSP flags a typo
-    /// and never a valid mode.
+    /// and never a valid mode; `None` is the default.
     #[test]
-    fn access_schema_is_the_enum_of_parsed_words() {
+    fn access_schema_is_the_literals_of_parsed_words() {
         let schema = ScratchSpec::schema();
         let ty = &schema
             .fields
@@ -460,8 +464,13 @@ mod tests {
             .ty;
         assert_eq!(
             *ty,
-            ParamType::one_of(["exclusive", "shared"])
+            ParamType::union(vec![
+                ParamType::one_of(["exclusive", "shared"]),
+                ParamType::Null
+            ])
         );
+        let d = parse(&[("path", s("c")), ("access", Value::Null())], "n").expect("None");
+        assert_eq!(d.access, Access::Exclusive);
         for l in ty.literals() {
             parse(&[("path", s("c")), ("access", s(l))], "n")
                 .unwrap_or_else(|e| panic!("schema lists {l:?}, parser refuses it: {e:#}"));
