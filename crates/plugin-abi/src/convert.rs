@@ -2294,8 +2294,8 @@ mod tests {
             ParamType::map(ParamType::strukt(vec![("buildmode", set)])),
         ] {
             let wire = param_type_to_pb(&ty).encode_to_vec();
-            let back = param_type_from_pb(crate::decode(&wire).expect("wire decode"))
-                .expect("decode");
+            let back =
+                param_type_from_pb(crate::decode(&wire).expect("wire decode")).expect("decode");
             assert_eq!(back, ty, "{}", ty.render());
         }
         assert_eq!(
