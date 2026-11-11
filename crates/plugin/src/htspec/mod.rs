@@ -49,34 +49,6 @@ pub trait FromSpecValue: Sized {
     fn spec_param_type() -> ParamType;
 }
 
-/// Build a union [`ParamType`] from member types, flattening nested unions and
-/// dropping duplicates so `a | (a | b)` renders as `a | b`. A single member is
-/// returned bare (no wrapping `Union`).
-pub fn flatten_union(members: Vec<ParamType>) -> ParamType {
-    let mut flat: Vec<ParamType> = Vec::new();
-    for m in members {
-        match m {
-            ParamType::Union(inner) => {
-                for t in inner {
-                    if !flat.contains(&t) {
-                        flat.push(t);
-                    }
-                }
-            }
-            other => {
-                if !flat.contains(&other) {
-                    flat.push(other);
-                }
-            }
-        }
-    }
-    if flat.len() == 1 {
-        flat.pop().expect("len checked")
-    } else {
-        ParamType::Union(flat)
-    }
-}
-
 /// Reject a value that carries a deferred reference in a field that cannot take
 /// one.
 ///
@@ -809,10 +781,10 @@ mod tests {
         let ty = Codegen::spec_param_type();
         assert_eq!(
             ty,
-            ParamType::Enum(vec![
-                "copy".to_string(),
-                "in_place".to_string(),
-                "in-place-v2".to_string(),
+            ParamType::Union(vec![
+                ParamType::literal("copy"),
+                ParamType::literal("in_place"),
+                ParamType::literal("in-place-v2"),
             ])
         );
         for l in ty.literals() {

@@ -199,16 +199,9 @@ use hcore::htvalue::signature::{FnSignature, Param, ParamType, StructField};
 pub fn param_type_to_pb(t: &ParamType) -> pb::ParamType {
     use pb::param_type::{Kind, Scalar, Struct, Union, r#struct};
     let scalar = |s: Scalar| Kind::Scalar(EnumValue::from(s));
-    let mut literals = Vec::new();
     let kind = match t {
         ParamType::String => scalar(Scalar::String),
-        // An enum travels as a string scalar plus its literals, so a peer that
-        // predates `literals` reads a plain string rather than failing the
-        // decode.
-        ParamType::Enum(l) => {
-            literals.clone_from(l);
-            scalar(Scalar::String)
-        }
+        ParamType::Literal(l) => Kind::Literal(l.clone()),
         ParamType::Bool => scalar(Scalar::Bool),
         ParamType::Int => scalar(Scalar::Int),
         ParamType::Uint => scalar(Scalar::Uint),
@@ -234,7 +227,6 @@ pub fn param_type_to_pb(t: &ParamType) -> pb::ParamType {
     };
     pb::ParamType {
         kind: Some(kind),
-        literals,
         ..Default::default()
     }
 }
@@ -245,17 +237,8 @@ pub fn param_type_to_pb(t: &ParamType) -> pb::ParamType {
 pub fn param_type_from_pb(t: pb::ParamType) -> anyhow::Result<ParamType> {
     use pb::param_type::{Kind, Scalar};
     let kind = required(t.kind, "ParamType.kind")?;
-    if !t.literals.is_empty() {
-        // Literals narrow a string; on any other kind they mean nothing this
-        // host could check against, so the type is refused, not guessed.
-        return match kind {
-            Kind::Scalar(s) if known_enum(s, "ParamType.scalar")? == Scalar::String => {
-                Ok(ParamType::Enum(t.literals))
-            }
-            _ => bail!("field ParamType.literals is set on a non-string kind"),
-        };
-    }
     Ok(match kind {
+        Kind::Literal(l) => ParamType::Literal(l),
         Kind::Scalar(s) => match known_enum(s, "ParamType.scalar")? {
             Scalar::String => ParamType::String,
             Scalar::Bool => ParamType::Bool,
@@ -267,7 +250,8 @@ pub fn param_type_from_pb(t: pb::ParamType) -> anyhow::Result<ParamType> {
         },
         Kind::List(inner) => ParamType::list(param_type_from_pb(*inner)?),
         Kind::Map(value) => ParamType::map(param_type_from_pb(*value)?),
-        Kind::Union(u) => ParamType::union(
+        // As sent: the union is the sender's, not re-normalized here.
+        Kind::Union(u) => ParamType::Union(
             u.types
                 .into_iter()
                 .map(param_type_from_pb)
@@ -2297,33 +2281,27 @@ mod tests {
         );
     }
 
+    /// Literals cross the seam as oneof members, through unions and
+    /// containers, the empty string included: a present `literal = ""` is a
+    /// literal, not a missing kind.
     #[test]
-    fn param_type_enum_roundtrips_and_reads_as_a_string_to_an_older_peer() {
-        let lits = ParamType::Enum(vec!["caller".to_string(), "tree_root".to_string()]);
-        let ty = ParamType::union(vec![ParamType::Bool, ParamType::list(lits.clone())]);
-        assert_eq!(
-            param_type_from_pb(param_type_to_pb(&ty)).expect("decode"),
-            ty
-        );
-
-        // A peer from before `literals` (6) skips the field and reads only
-        // `kind`, which is exactly a plain string's: looser, never a failure.
-        let enum_pb = param_type_to_pb(&lits);
-        assert_eq!(enum_pb.kind, param_type_to_pb(&ParamType::String).kind);
-        let mut old_view = enum_pb.clone();
-        old_view.literals.clear();
-        assert_eq!(
-            param_type_from_pb(old_view).expect("decode"),
-            ParamType::String
-        );
-
-        // Literals on anything but a string scalar are refused, not dropped.
-        for ty in [ParamType::Bool, ParamType::list(ParamType::String)] {
-            let mut bad = param_type_to_pb(&ty);
-            bad.literals = vec!["x".to_string()];
-            let err = param_type_from_pb(bad).expect_err("literals on a non-string");
-            assert!(format!("{err:#}").contains("ParamType.literals"), "{err:#}");
+    fn param_type_literals_roundtrip_including_the_empty_string() {
+        let set = ParamType::one_of(["caller", "tree_root", ""]);
+        for ty in [
+            set.clone(),
+            ParamType::literal(""),
+            ParamType::union(vec![ParamType::Bool, ParamType::list(set.clone())]),
+            ParamType::map(ParamType::strukt(vec![("buildmode", set)])),
+        ] {
+            let wire = param_type_to_pb(&ty).encode_to_vec();
+            let back = param_type_from_pb(crate::decode(&wire).expect("wire decode"))
+                .expect("decode");
+            assert_eq!(back, ty, "{}", ty.render());
         }
+        assert_eq!(
+            param_type_to_pb(&ParamType::literal("")).kind,
+            Some(pb::param_type::Kind::Literal(String::new()))
+        );
     }
 
     #[test]

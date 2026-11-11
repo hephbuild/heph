@@ -106,7 +106,7 @@ impl EmbedVariant {
 fn compile_buildmode_ty() -> hcore::htvalue::signature::ParamType {
     hcore::htvalue::signature::ParamType::union(vec![
         BuildMode::param_type(),
-        hcore::htvalue::signature::ParamType::Enum(vec![String::new()]),
+        hcore::htvalue::signature::ParamType::literal(""),
     ])
 }
 

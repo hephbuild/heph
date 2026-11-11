@@ -65,7 +65,7 @@ impl FromSpecValue for Dialect {
 
     /// The spellings [`Dialect::parse`] accepts, from the same table.
     fn spec_param_type() -> ParamType {
-        ParamType::Enum(Self::ALL.iter().map(|d| d.as_str().to_string()).collect())
+        ParamType::one_of(Self::ALL.map(Self::as_str))
     }
 }
 
@@ -399,11 +399,7 @@ mod tests {
         let ty = Dialect::spec_param_type();
         assert_eq!(
             ty,
-            ParamType::Enum(
-                ["aws", "gcp", "docker", "git", "kubernetes"]
-                    .map(String::from)
-                    .to_vec()
-            )
+            ParamType::one_of(["aws", "gcp", "docker", "git", "kubernetes"])
         );
         for l in ty.literals() {
             let d = Dialect::from_spec_value(&s(l)).expect("listed dialect parses");

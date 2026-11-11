@@ -32,14 +32,11 @@ pub enum ParamType {
     /// field names, each with its own type. All fields are optional: a value
     /// matches if every present key names a known field of matching type.
     Struct(Vec<StructField>),
-    /// A string drawn from a closed set of literals, e.g. exec's `workdir`
-    /// (`"caller" | "tree_root" | …`). Rendered as the quoted literals joined
-    /// by ` | `; matches only a string equal to one of them.
-    ///
-    /// The set is non-empty: an empty one crosses the plugin ABI as no
-    /// literals at all, which reads back as any string. `#[derive(SpecEnum)]`
-    /// refuses to compile an enum with no parseable variant for that reason.
-    Enum(Vec<String>),
+    /// Exactly this string. Rendered quoted (`"caller"`); matches only a string
+    /// equal to it. A closed set, e.g. exec's `workdir`, is a
+    /// [`ParamType::Union`] of literals ([`ParamType::one_of`]), rendered
+    /// `"caller" | "tree_root" | …`.
+    Literal(String),
 }
 
 /// One named field of a [`ParamType::Struct`].
@@ -60,9 +57,42 @@ impl ParamType {
         ParamType::Map(Box::new(value))
     }
 
-    /// Convenience: a union accepting any of `types`.
+    /// Convenience: a union accepting any of `types`. A member that is itself
+    /// a union is spliced in and a repeated member dropped, so
+    /// `null | ("a" | "b")` is the flat `null | "a" | "b"` and `a | (a | b)` is
+    /// `a | b` (a mismatch message then sees every container member at one
+    /// level); a single member is returned bare.
     pub fn union(types: Vec<ParamType>) -> ParamType {
-        ParamType::Union(types)
+        let mut flat: Vec<ParamType> = Vec::with_capacity(types.len());
+        let mut add = |t: ParamType| {
+            if !flat.contains(&t) {
+                flat.push(t);
+            }
+        };
+        for t in types {
+            match t {
+                ParamType::Union(inner) => inner.into_iter().for_each(&mut add),
+                t => add(t),
+            }
+        }
+        if flat.len() == 1
+            && let Some(only) = flat.pop()
+        {
+            return only;
+        }
+        ParamType::Union(flat)
+    }
+
+    /// Convenience: exactly the string `s`.
+    pub fn literal(s: impl Into<String>) -> ParamType {
+        ParamType::Literal(s.into())
+    }
+
+    /// Convenience: a closed set of strings — the union of a
+    /// [`ParamType::Literal`] per member, or the one literal when there is
+    /// only one.
+    pub fn one_of<S: Into<String>>(literals: impl IntoIterator<Item = S>) -> ParamType {
+        ParamType::union(literals.into_iter().map(ParamType::literal).collect())
     }
 
     /// Convenience: a struct with the given `(name, type)` fields.
@@ -102,21 +132,17 @@ impl ParamType {
                     .join(", ");
                 format!("struct({rendered})")
             }
-            ParamType::Enum(literals) => literals
-                .iter()
-                .map(|l| format!("{l:?}"))
-                .collect::<Vec<_>>()
-                .join(" | "),
+            ParamType::Literal(l) => format!("{l:?}"),
         }
     }
 
-    /// The string literals this type accepts as a value, through unions: the
-    /// members of every [`ParamType::Enum`] reachable without entering a
-    /// container. Empty when the type is not (or does not include) an enum —
-    /// a list or map of enums offers nothing for the value itself.
+    /// The string literals this type accepts as a value, through unions: every
+    /// [`ParamType::Literal`] reachable without entering a container, once
+    /// each, in order. Empty when the type is not (or does not include) a
+    /// literal — a list or map of literals offers nothing for the value itself.
     pub fn literals(&self) -> Vec<&str> {
         match self {
-            ParamType::Enum(literals) => literals.iter().map(String::as_str).collect(),
+            ParamType::Literal(l) => vec![l.as_str()],
             ParamType::Union(types) => {
                 let mut out: Vec<&str> = Vec::new();
                 for l in types.iter().flat_map(ParamType::literals) {
@@ -138,7 +164,7 @@ impl ParamType {
         }
         match (self, v) {
             (ParamType::String, Value::String(_)) => true,
-            (ParamType::Enum(literals), Value::String(s)) => literals.iter().any(|l| l == s),
+            (ParamType::Literal(l), Value::String(s)) => l == s,
             (ParamType::Bool, Value::Bool(_)) => true,
             (ParamType::Int, Value::Int(_)) => true,
             (ParamType::Uint, Value::Uint(_)) => true,
@@ -483,8 +509,8 @@ mod tests {
     }
 
     #[test]
-    fn enum_renders_quoted_and_matches_only_its_literals() {
-        let ty = ParamType::Enum(vec!["caller".to_string(), "tree_root".to_string()]);
+    fn a_union_of_literals_renders_quoted_and_matches_only_its_literals() {
+        let ty = ParamType::one_of(["caller", "tree_root"]);
         assert_eq!(ty.render(), r#""caller" | "tree_root""#);
         assert!(ty.matches(&Value::String("tree_root".to_string())));
         // The near miss, a prefix, and the empty string are all refused.
@@ -493,25 +519,46 @@ mod tests {
         }
         assert!(!ty.matches(&Value::Bool(true)));
 
-        // In a union the literals and the other members both render and match.
+        // Nested in another union, the literals splice in flat: they and the
+        // other members both render and match.
         let u = ParamType::union(vec![ParamType::Bool, ty.clone()]);
+        assert_eq!(
+            u,
+            ParamType::Union(vec![
+                ParamType::Bool,
+                ParamType::literal("caller"),
+                ParamType::literal("tree_root"),
+            ])
+        );
         assert_eq!(u.render(), r#"bool | "caller" | "tree_root""#);
         assert!(u.matches(&Value::Bool(false)));
         assert!(u.matches(&Value::String("caller".to_string())));
         assert_eq!(u.literals(), ["caller", "tree_root"]);
-        // A list of enums offers nothing for the value itself.
+        // A list of literals offers nothing for the value itself.
         assert!(ParamType::list(ty).literals().is_empty());
         assert!(ParamType::String.literals().is_empty());
+    }
+
+    /// A set of one is just its literal, and the empty string is a literal
+    /// like any other.
+    #[test]
+    fn a_single_literal_is_not_wrapped_in_a_union() {
+        assert_eq!(ParamType::one_of(["only"]), ParamType::literal("only"));
+        let ty = ParamType::literal("");
+        assert_eq!(ty.render(), r#""""#);
+        assert!(ty.matches(&Value::String(String::new())));
+        assert!(!ty.matches(&Value::String(" ".to_string())));
+        assert_eq!(ty.literals(), [""]);
+        // A literal repeated across members is offered once.
+        let dup = ParamType::Union(vec![ParamType::literal("a"), ParamType::one_of(["a", "b"])]);
+        assert_eq!(dup.literals(), ["a", "b"]);
     }
 
     #[test]
     fn a_wrong_literal_names_the_string_it_got() {
         let sig = FnSignature {
             positional: vec![],
-            named: vec![Param::required(
-                "mode",
-                ParamType::Enum(vec!["a".to_string(), "b".to_string()]),
-            )],
+            named: vec![Param::required("mode", ParamType::one_of(["a", "b"]))],
             variadic: None,
             returns: ParamType::Null,
         };
@@ -545,7 +592,7 @@ mod tests {
     /// union, a struct, a map and a list, in sorted key order.
     #[test]
     fn a_container_mismatch_names_the_offending_path_and_value() {
-        let dialect = ParamType::Enum(vec!["aws".to_string(), "docker".to_string()]);
+        let dialect = ParamType::one_of(["aws", "docker"]);
         let present = ParamType::strukt(vec![
             ("env", ParamType::map(ParamType::String)),
             (
@@ -558,7 +605,7 @@ mod tests {
         ]);
         let v = map(&[("helper", s("k8s"))]);
         assert_eq!(present.describe_mismatch(&v), r#"map (`helper`: "k8s")"#);
-        // Into the union's struct member, then its enum field.
+        // Into the union's struct member, then its literal field.
         let v = map(&[("helper", map(&[("dialect", s("gcp"))]))]);
         assert_eq!(
             present.describe_mismatch(&v),
@@ -591,7 +638,7 @@ mod tests {
     /// A quoted user string is cut at 64 characters, by character, not byte.
     #[test]
     fn a_quoted_mismatch_is_capped() {
-        let ty = ParamType::Enum(vec!["a".to_string()]);
+        let ty = ParamType::literal("a");
         let exact = "é".repeat(64);
         assert_eq!(ty.describe_mismatch(&s(&exact)), format!("{exact:?}"));
         let long = "é".repeat(65);

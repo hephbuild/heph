@@ -1635,7 +1635,7 @@ const LINK_STATE_KEYS: &[&str] = &["flags", "deps", "runtime_deps"];
 /// `{group: addr | [addr, …]}` map naming dep groups. Mirrors the exec plugin's
 /// `deps` union so BUILD authors get the same shape everywhere.
 fn link_deps_param_type() -> ParamType {
-    hplugin::htspec::flatten_union(vec![strs(), ParamType::map(strs())])
+    ParamType::union(vec![strs(), ParamType::map(strs())])
 }
 
 /// `string | list[string]`: what `parse_strings` takes (a bare string is a

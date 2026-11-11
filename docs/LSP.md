@@ -52,7 +52,7 @@ start; until that snapshot lands, heph answers with the stock results and
 | `callee` | `target` / `provider_state` identifier before its `(` | stock passes through | the builtin's signature, narrowed to the selected driver / provider | — |
 | `driver_value` | `driver =` inside `target(`, with a closed string, an unterminated one, or no string yet | driver names | the driver's fields | — |
 | `provider_value` | `provider =` inside `provider_state(` | provider names | the provider's state fields | — |
-| `field_value` | a string value of any other keyword directly inside `target(` / `provider_state(` (`workdir = "tr│"`), unless address-shaped | the field's literals, when its type is an enum (`"caller" \| "tree_root" \| …`); otherwise stock | stock | stock |
+| `field_value` | a string value of any other keyword directly inside `target(` / `provider_state(` (`workdir = "tr│"`), unless address-shaped | the field's string literals, when its type has any (`"caller" \| "tree_root" \| …`); otherwise stock | stock | stock |
 | `target_key` | a keyword-name position inside `target(` | base fields + the selected driver's, minus keys present | the field's type and doc | — |
 | `state_key` | a keyword-name position inside `provider_state(` | `provider` + the selected provider's schema, minus keys present | the field's type and doc | — |
 | `arg_key` | a keyword-name position inside a call to any other plain-named function (`my_rule(`, `glob(`; not `x.f(`, not a `def`'s parameters) | the callee's unwritten parameters, each inserting `name = `, ranked first; then stock (see below) | stock | stock |
@@ -74,8 +74,8 @@ covers keyword names, driver and provider names, plugin namespaces and members,
 addresses, and load paths and symbols. The stock answer **passes through**
 only where heph cannot know: free expressions, locals, other value positions.
 
-`field_value` merges **by field**: the field's type decides, not the site. An
-enum field's literals matching the prefix **replace** the stock items (which
+`field_value` merges **by field**: the field's type decides, not the site. The
+field's string literals (`ParamType::Literal`, alone or in a union) matching the prefix **replace** the stock items (which
 offer nothing inside a string); a field with no such literal passes the stock
 answer through. It is one or the other, never both. A literal that cannot sit
 verbatim between quotes (a quote, a backslash, a control character) is not

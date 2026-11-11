@@ -10,7 +10,7 @@
 //! site prepends instead: the keyword names of a call to a loaded, local or
 //! global function whose parameters heph can read come first, the stock items
 //! (values a positional argument could take) after them. A field's string
-//! value is decided by the field's type: an enum's literals replace the stock
+//! value is decided by the field's type: its string literals replace the stock
 //! items, anything else passes them through. Every
 //! heph completion item carries a text edit over the site's token, a
 //! `filterText` matching what the editor compares against, one kind per site

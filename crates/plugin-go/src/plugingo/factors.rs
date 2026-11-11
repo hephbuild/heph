@@ -37,9 +37,7 @@ impl BuildMode {
 
     /// The schema type of a variant's `buildmode`: exactly [`Self::NAMES`].
     pub fn param_type() -> hcore::htvalue::signature::ParamType {
-        hcore::htvalue::signature::ParamType::Enum(
-            Self::NAMES.iter().map(|n| n.to_string()).collect(),
-        )
+        hcore::htvalue::signature::ParamType::one_of(Self::NAMES.iter().copied())
     }
 
     /// The `-buildmode=` value handed to `go tool link`.
@@ -428,7 +426,7 @@ mod tests {
         assert!(BuildMode::parse("").is_none());
         assert_eq!(
             BuildMode::param_type(),
-            hcore::htvalue::signature::ParamType::Enum(vec!["exe".into(), "pie".into()])
+            hcore::htvalue::signature::ParamType::one_of(["exe", "pie"])
         );
     }
 

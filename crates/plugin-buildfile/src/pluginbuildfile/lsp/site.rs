@@ -1356,7 +1356,7 @@ mod tests {
     fn site_comment_or_non_address_string() {
         assert_eq!(kind(&at("target(name = \"x\") # dri│\n")), "none");
         // A field's string value is a site; the handlers decide whether heph
-        // has anything there (only an enum field's literals).
+        // has anything there (only a field's string literals).
         assert_eq!(kind(&at("target(name = \"hel│lo\")\n")), "field_value");
         assert_eq!(kind(&at("other(name = \"hel│lo\")\n")), "none");
         assert_eq!(at("x = \"plain│\"\n").reason, Some(Reason::NotASite));

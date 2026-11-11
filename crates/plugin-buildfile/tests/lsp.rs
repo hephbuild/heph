@@ -146,11 +146,7 @@ impl LspEngine for FakeEngine {
                     ),
                     field(
                         "workdir",
-                        ParamType::Enum(vec![
-                            "caller".to_string(),
-                            "tree_root".to_string(),
-                            "tree_package".to_string(),
-                        ]),
+                        ParamType::one_of(["caller", "tree_root", "tree_package"]),
                         "Where the program runs.",
                         false,
                     ),
@@ -187,18 +183,14 @@ impl LspEngine for FakeEngine {
                     doc: "Mark this package as a Go codegen root.".to_string(),
                     required: false,
                 },
-                // A `bool | enum` union whose literals include ones that
+                // A `bool | "…" | …` union whose literals include ones that
                 // cannot be offered: the empty string, and two that cannot
                 // sit verbatim between quotes.
                 StateField {
                     name: "buildmode".to_string(),
                     ty: ParamType::union(vec![
                         ParamType::Bool,
-                        ParamType::Enum(
-                            ["", "default", "pie", "say\"hi", "tab\tbed"]
-                                .map(String::from)
-                                .to_vec(),
-                        ),
+                        ParamType::one_of(["", "default", "pie", "say\"hi", "tab\tbed"]),
                     ]),
                     doc: "How the package is built.".to_string(),
                     required: false,
@@ -2190,10 +2182,10 @@ fn broken_plugin_namespace_with_broken_tail() {
     assert_eq!(labels(&lsp.completion(&doc)), vec!["core", "fs"]);
 }
 
-/// An enum field's value completes to its literals, quoted the way a driver
+/// A field of literals completes its value to them, quoted the way a driver
 /// name is, in every quote state.
 #[test]
-fn completion_in_an_enum_field_value_offers_its_literals() {
+fn completion_in_a_literal_field_value_offers_its_literals() {
     let mut lsp = Lsp::start();
     let pre = "target(name = \"x\", driver = \"exec\", workdir = ";
     for (i, (value, after)) in [
@@ -2226,7 +2218,7 @@ fn completion_in_an_enum_field_value_offers_its_literals() {
 }
 
 /// Where heph has no literal to offer, a field's string answers as `none`
-/// did: a non-enum field, an unknown driver, a prefix no literal starts with.
+/// did: a field with no literals, an unknown driver, a prefix no literal starts with.
 /// Before a string the position is not a site at all (a variable may stand
 /// there), a value inside a nested bracket is not the field's, and an address
 /// keeps its own site.
@@ -2267,11 +2259,11 @@ fn a_field_value_without_literals_passes_the_stock_answer_through() {
 }
 
 /// A `provider_state(` field's string completes from the provider's schema,
-/// through a `bool | enum` union, never offering a literal that cannot be
+/// through a `bool | "…" | …` union, never offering a literal that cannot be
 /// typed between quotes (`""`, one holding a quote or a control character).
 /// An unknown provider passes the stock answer through.
 #[test]
-fn completion_in_a_provider_state_enum_field_offers_its_literals() {
+fn completion_in_a_provider_state_literal_field_offers_its_literals() {
     let mut lsp = Lsp::start();
     let pre = "provider_state(provider = \"go\", buildmode = ";
     let doc = lsp.open("BUILD", &format!("{pre}\"│\")\n"));

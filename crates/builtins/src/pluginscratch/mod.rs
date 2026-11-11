@@ -70,7 +70,7 @@ impl Access {
 
     /// The schema type of `access`: the spellings [`parse`](Self::parse) takes.
     fn param_type() -> ParamType {
-        ParamType::Enum(Self::ALL.map(|a| a.as_str().to_string()).to_vec())
+        ParamType::one_of(Self::ALL.map(Self::as_str))
     }
 
     pub fn as_str(self) -> &'static str {
@@ -460,7 +460,7 @@ mod tests {
             .ty;
         assert_eq!(
             *ty,
-            ParamType::Enum(vec!["exclusive".to_string(), "shared".to_string()])
+            ParamType::one_of(["exclusive", "shared"])
         );
         for l in ty.literals() {
             parse(&[("path", s("c")), ("access", s(l))], "n")

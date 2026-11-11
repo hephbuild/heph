@@ -53,7 +53,7 @@ fn str_map() -> ParamType {
 
 /// `oidc`'s `provider`: one of [`OIDC_PROVIDERS`], the list the parser checks.
 fn oidc_provider_ty() -> ParamType {
-    ParamType::Enum(OIDC_PROVIDERS.iter().map(|p| p.to_string()).collect())
+    ParamType::one_of(OIDC_PROVIDERS.iter().copied())
 }
 
 /// `present.helper`: a dialect name, or the dict whose keys [`Helper`]'s
@@ -94,12 +94,7 @@ pub(crate) fn source_ty() -> ParamType {
     ParamType::strukt(vec![
         (
             "kind",
-            ParamType::Enum(
-                InlineKind::ALL
-                    .iter()
-                    .map(|k| k.name().to_string())
-                    .collect(),
-            ),
+            ParamType::one_of(InlineKind::ALL.iter().map(|k| k.name())),
         ),
         ("when", ParamType::String),
         ("credentials", strs()),
@@ -405,10 +400,7 @@ pub fn definitions() -> Vec<PluginFnDef> {
             // schema says what the call accepts, not only what is documented.
             vec![Param::optional(
                 "provider",
-                ParamType::union(vec![
-                    oidc_provider_ty(),
-                    ParamType::Enum(vec![String::new()]),
-                ]),
+                ParamType::union(vec![oidc_provider_ty(), ParamType::literal("")]),
                 s("github_actions"),
             )],
             vec![Param::optional(
@@ -817,30 +809,30 @@ mod tests {
             .clone()
     }
 
-    fn enum_of(literals: &[&str]) -> ParamType {
-        ParamType::Enum(literals.iter().map(|l| l.to_string()).collect())
-    }
-
     /// The closed sets are typed as such, from the lists the parsers check, so
     /// the LSP flags a typo and never a value the parser takes.
     #[test]
-    fn closed_string_sets_are_enums_of_what_the_parsers_accept() {
-        let dialects = enum_of(&["aws", "gcp", "docker", "git", "kubernetes"]);
+    fn closed_string_sets_are_the_literals_the_parsers_accept() {
+        let dialect_names = ["aws", "gcp", "docker", "git", "kubernetes"];
+        let dialects = ParamType::one_of(dialect_names);
         let source = source_ty();
         assert_eq!(
             field_ty(&source, "kind"),
-            enum_of(&["env", "file", "exec", "passthrough", "oidc"])
+            ParamType::one_of(["env", "file", "exec", "passthrough", "oidc"])
         );
         assert_eq!(
             field_ty(&source, "provider"),
-            enum_of(&["github_actions", "generic"])
+            ParamType::one_of(["github_actions", "generic"])
         );
+        // A dialect name or the dict: the names splice into the union flat,
+        // the dict is its last member.
         let helper = field_ty(&presentation_ty(), "helper");
+        assert_eq!(helper.literals(), dialect_names);
         let ParamType::Union(members) = &helper else {
             panic!("helper is a dialect or a dict: {}", helper.render());
         };
-        assert_eq!(members[0], dialects);
-        assert_eq!(field_ty(&members[1], "dialect"), dialects);
+        let dict = members.last().expect("helper has members");
+        assert_eq!(field_ty(dict, "dialect"), dialects);
 
         let defs = definitions();
         let oidc = defs.iter().find(|d| d.name == "oidc").expect("oidc");
@@ -919,7 +911,8 @@ mod tests {
         let ParamType::Union(members) = helper_ty() else {
             panic!("helper is a dialect or a dict");
         };
-        let ParamType::Struct(fields) = &members[1] else {
+        // The dialect names splice in flat; the dict form is the last member.
+        let Some(ParamType::Struct(fields)) = members.last() else {
             panic!("the dict form is a struct");
         };
         let mut schema: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();

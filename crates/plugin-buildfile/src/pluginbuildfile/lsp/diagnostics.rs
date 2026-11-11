@@ -257,7 +257,7 @@ fn check_call(
 /// statically-evaluable literal (a variable, call, concatenation, f-string, …).
 /// Numeric values are placeholders — only the *kind* matters for type-checking,
 /// except a leading minus, which is tracked so a uint field rejects it. A
-/// string keeps its text, which an enum field is checked against.
+/// string keeps its text, which a field of literals is checked against.
 /// Mirrors `run_file::starlark_to_rust` so the kinds line up with what the engine
 /// would produce at eval time.
 fn literal_value(expr: &AstExpr) -> Option<Value> {
@@ -377,20 +377,17 @@ mod tests {
                         },
                         DriverField {
                             name: "workdir".to_string(),
-                            ty: ParamType::Enum(vec![
-                                "caller".to_string(),
-                                "tree_root".to_string(),
-                            ]),
+                            ty: ParamType::one_of(["caller", "tree_root"]),
                             doc: String::new(),
                             required: false,
                         },
-                        // An enum nested in a dict of structs, like go's
+                        // A closed set nested in a dict of structs, like go's
                         // `variants`.
                         DriverField {
                             name: "variants".to_string(),
                             ty: ParamType::map(ParamType::strukt(vec![(
                                 "buildmode",
-                                ParamType::Enum(vec!["exe".to_string(), "pie".to_string()]),
+                                ParamType::one_of(["exe", "pie"]),
                             )])),
                             doc: String::new(),
                             required: false,
@@ -498,7 +495,7 @@ mod tests {
     }
 
     #[test]
-    fn a_string_outside_an_enum_is_flagged_by_its_value() {
+    fn a_string_outside_a_closed_set_is_flagged_by_its_value() {
         let src = |v: &str| {
             format!("target(name = \"t\", driver = \"exec\", cmd = \"c\", workdir = {v})\n")
         };
@@ -517,10 +514,10 @@ mod tests {
         );
     }
 
-    /// An enum inside a dict of structs is checked too, and the message names
-    /// the path to the bad literal.
+    /// A closed set inside a dict of structs is checked too, and the message
+    /// names the path to the bad literal.
     #[test]
-    fn an_enum_nested_in_a_dict_of_structs_is_flagged() {
+    fn a_closed_set_nested_in_a_dict_of_structs_is_flagged() {
         let src = |v: &str| {
             format!("target(name = \"t\", driver = \"exec\", cmd = \"c\", variants = {v})\n")
         };

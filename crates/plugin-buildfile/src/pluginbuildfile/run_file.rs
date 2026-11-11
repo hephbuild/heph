@@ -329,7 +329,7 @@ pub(crate) fn param_type_to_ty(t: &ParamType) -> starlark::typing::Ty {
     match t {
         // Starlark types have no string literals; the set is checked by
         // `FnSignature::validate_args` at the call.
-        ParamType::String | ParamType::Enum(_) => Ty::string(),
+        ParamType::String | ParamType::Literal(_) => Ty::string(),
         ParamType::Bool => Ty::bool(),
         // htvalue distinguishes Int/Uint but Starlark has a single int type.
         ParamType::Int | ParamType::Uint => Ty::int(),
@@ -975,7 +975,7 @@ fn strs() -> ParamType {
 /// a `{group: addr | [addr]}` map), `env` through `parse_map_string_string`, and
 /// the two pass-through lists through `parse_strings`. Any other key is refused.
 fn transitive_ty() -> ParamType {
-    let groups = || hplugin::htspec::flatten_union(vec![strs(), ParamType::map(strs())]);
+    let groups = || ParamType::union(vec![strs(), ParamType::map(strs())]);
     ParamType::strukt(vec![
         ("deps", groups()),
         ("tools", groups()),

@@ -69,12 +69,7 @@ impl ImageFormat {
     /// The schema type of a `format` field accepting `formats`, spelled as
     /// [`parse`](Self::parse) reads them.
     pub(crate) fn param_type(formats: &[Self]) -> hcore::htvalue::signature::ParamType {
-        hcore::htvalue::signature::ParamType::Enum(
-            formats
-                .iter()
-                .map(|f| f.output_type().to_string())
-                .collect(),
-        )
+        hcore::htvalue::signature::ParamType::one_of(formats.iter().map(|f| f.output_type()))
     }
 
     /// The schema type of a `format` field that takes every format.

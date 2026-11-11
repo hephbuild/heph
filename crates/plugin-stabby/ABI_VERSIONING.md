@@ -12,7 +12,7 @@ in order:
    reads the same whatever layout either side has. The host reads it before
    calling anything else in the plugin and accepts exactly the versions
    matching the caret requirement `^MIN_PLUGIN_ABI` (`crates/plugin-abi/src/lib.rs`;
-   pre-1.0, `^0.19.0` = `>=0.19.0, <0.20.0`), compared as semver. A plugin
+   pre-1.0, `^0.20.0` = `>=0.20.0, <0.21.0`), compared as semver. A plugin
    without the symbol predates 0.17.0 and is refused the same way. A plugin
    from a **later minor** is unsupported and refused: the host cannot know
    what that break changed. A later *patch* loads.
@@ -227,12 +227,17 @@ skipped in silence.
 
 ## History of breaks
 
-- **0.19.2** (additive patch) — `ParamType.literals` (6, `repeated string`):
-  a string scalar narrowed to a closed set (`ParamType::Enum`), so a cdylib
-  driver's `workdir`-style field reaches the LSP as `"a" | "b"` rather than
-  `string`. A 0.19.1 host skips the field and reads a plain string: looser
-  completion and diagnostics, never a failed schema. A 0.19.1 plugin sends none.
-  Literals on any other kind are a decode error. No plugin must be rebuilt.
+- **0.20.0** (break) — `ParamType.literal` (6, `string`), a member of the
+  `kind` oneof: exactly one string (`ParamType::Literal`). A closed set is a
+  `union` of literals, so a cdylib driver's `workdir`-style field reaches the
+  LSP as `"a" | "b"` rather than `string`; a oneof member has presence, so
+  `literal = ""` is a literal, not a missing kind. Types travel plugin → host
+  only (driver and provider-state schemas, function signatures). An old plugin
+  never sends a literal, but a 0.19 host would see a new plugin's literal as
+  no `kind` at all and refuse the schema (`missing field ParamType.kind`), so
+  the change is not additive: a patch would let a 0.19 host load the plugin
+  and fail it per schema. `MIN_PLUGIN_ABI` rises to 0.20.0: every plugin must
+  be rebuilt.
 - **0.19.1** (additive patch) — target timeouts. `TargetDef.timeout_ms` (13,
   `uint64`): how long the run may take, which the host enforces around the
   driver's `run`. Absent is no limit; a present 0 is refused at decode. Never

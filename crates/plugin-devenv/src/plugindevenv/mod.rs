@@ -240,9 +240,7 @@ impl Mode {
     /// The schema type of `mode`: what [`parse`](Self::parse) takes — every
     /// mode, and the `""` an absent key reads as.
     fn param_type() -> ParamType {
-        let mut literals: Vec<String> = Self::ALL.iter().map(|m| m.as_str().to_string()).collect();
-        literals.push(String::new());
-        ParamType::Enum(literals)
+        ParamType::one_of(Self::ALL.iter().map(|m| m.as_str()).chain([""]))
     }
 }
 
