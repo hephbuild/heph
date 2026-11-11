@@ -39,7 +39,7 @@ use std::collections::BTreeMap;
 const GO_PROVIDER: &str = "go";
 
 /// Keys accepted inside a single variant definition struct.
-const VARIANT_KEYS: &[&str] = &[
+pub(crate) const VARIANT_KEYS: &[&str] = &[
     "goos",
     "goarch",
     "tags",

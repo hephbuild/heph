@@ -35,11 +35,24 @@ pub mod push;
 pub mod registry;
 pub mod runner;
 
-/// Archive format an image is built/consumed as.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// Archive format an image is built/consumed as: a `format` field's type, so
+/// its schema (`"oci" | "docker"`) and its parse are one table.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    crate::htspec::SpecEnum,
+)]
 pub(crate) enum ImageFormat {
     /// OCI image layout archive (`--output type=oci`). Portable, standard;
-    /// pushed and pulled daemonlessly over the registry protocol.
+    /// pushed and pulled daemonlessly over the registry protocol. The default:
+    /// an absent or `None` `format` is this.
+    #[default]
     Oci,
     /// Docker-format image archive (`--output type=docker`). Loadable straight
     /// into a docker daemon with `docker load`.
@@ -52,14 +65,6 @@ impl ImageFormat {
         match self {
             ImageFormat::Oci => "oci",
             ImageFormat::Docker => "docker",
-        }
-    }
-
-    pub(crate) fn parse(s: &str) -> anyhow::Result<Self> {
-        match s {
-            "oci" => Ok(ImageFormat::Oci),
-            "docker" => Ok(ImageFormat::Docker),
-            other => anyhow::bail!("`format` must be \"oci\" or \"docker\", got {other:?}"),
         }
     }
 }
@@ -500,6 +505,22 @@ pub(crate) mod testfake {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `format` is written as the BuildKit `--output type=` it selects: the
+    /// schema lists exactly those spellings, and each decodes to its format.
+    #[test]
+    fn image_format_is_spelled_as_its_output_type() {
+        use crate::htspec::FromSpecValue;
+        let all = [ImageFormat::Oci, ImageFormat::Docker];
+        assert_eq!(
+            ImageFormat::spec_param_type().literals(),
+            all.map(ImageFormat::output_type)
+        );
+        for f in all {
+            let v = hcore::htvalue::Value::String(f.output_type().to_string());
+            assert_eq!(ImageFormat::from_spec_value(&v).expect("decodes"), f);
+        }
+    }
 
     #[test]
     fn docker_load_ref_prefers_the_last_loaded_line() {

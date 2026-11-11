@@ -136,6 +136,48 @@ pub enum SourceKind {
     Target { addr: String },
 }
 
+/// The `kind` of an inline source. [`SourceDecl::parse_inline`] matches on this,
+/// exhaustively, and a spelling becomes one only through [`InlineKind::ALL`] —
+/// the list the schema renders — so the parser cannot accept a kind the schema
+/// does not list, nor the schema list one without a parser arm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InlineKind {
+    Env,
+    File,
+    Exec,
+    Passthrough,
+    Oidc,
+}
+
+impl InlineKind {
+    /// Every kind, in the order the schema lists them.
+    pub(crate) const ALL: [InlineKind; 5] = [
+        InlineKind::Env,
+        InlineKind::File,
+        InlineKind::Exec,
+        InlineKind::Passthrough,
+        InlineKind::Oidc,
+    ];
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            InlineKind::Env => "env",
+            InlineKind::File => "file",
+            InlineKind::Exec => "exec",
+            InlineKind::Passthrough => "passthrough",
+            InlineKind::Oidc => "oidc",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|k| k.name() == s)
+    }
+}
+
+/// The `provider` spellings an `oidc` source accepts; the parser checks against
+/// this list.
+pub(crate) const OIDC_PROVIDERS: &[&str] = &["github_actions", "generic"];
+
 impl SourceKind {
     pub fn kind_name(&self) -> &'static str {
         match self {
@@ -290,8 +332,16 @@ impl SourceDecl {
             .transpose()?
             .unwrap_or_default();
 
-        let kind = match kind_name.as_str() {
-            "env" => {
+        let Some(inline_kind) = InlineKind::parse(&kind_name) else {
+            anyhow::bail!(
+                "unknown credential source kind {kind_name:?} — core knows env, file, exec, \
+                 passthrough and oidc, and nothing else. There is deliberately no per-product \
+                 source: a secret manager is `exec` with a field map, or a target when its tool \
+                 lives in an environment"
+            );
+        };
+        let kind = match inline_kind {
+            InlineKind::Env => {
                 let names = strings(
                     m.get("names").ok_or_else(|| {
                         anyhow::anyhow!("an `env` credential source needs `names`")
@@ -308,7 +358,7 @@ impl SourceDecl {
                 )?;
                 SourceKind::Env { names }
             }
-            "file" => {
+            InlineKind::File => {
                 let path = string(
                     m.get("path").ok_or_else(|| {
                         anyhow::anyhow!("a `file` credential source needs a `path`")
@@ -335,7 +385,7 @@ impl SourceDecl {
                     expires,
                 }
             }
-            "exec" => {
+            InlineKind::Exec => {
                 let run = strings(
                     m.get("run").ok_or_else(|| {
                         anyhow::anyhow!("an `exec` credential source needs `run`")
@@ -373,7 +423,7 @@ impl SourceDecl {
                     runner: runner.filter(|r| r != "local"),
                 }
             }
-            "passthrough" => {
+            InlineKind::Passthrough => {
                 let paths = m
                     .get("paths")
                     .map(|v| str_map(v, "paths"))
@@ -400,13 +450,13 @@ impl SourceDecl {
                 )?;
                 SourceKind::Passthrough { paths, login }
             }
-            "oidc" => {
+            InlineKind::Oidc => {
                 let provider = m
                     .get("provider")
                     .map(|v| string(v, "provider"))
                     .transpose()?
                     .unwrap_or_else(|| "github_actions".to_string());
-                if provider != "github_actions" && provider != "generic" {
+                if !OIDC_PROVIDERS.contains(&provider.as_str()) {
                     anyhow::bail!(
                         "unknown oidc `provider` {provider:?} — heph knows `github_actions` and \
                          `generic` (a token named by variable or file)"
@@ -432,12 +482,6 @@ impl SourceDecl {
                 )?;
                 SourceKind::Oidc { provider, audience }
             }
-            other => anyhow::bail!(
-                "unknown credential source kind {other:?} — core knows env, file, exec, \
-                 passthrough and oidc, and nothing else. There is deliberately no per-product \
-                 source: a secret manager is `exec` with a field map, or a target when its tool \
-                 lives in an environment"
-            ),
         };
 
         Ok(Self {
@@ -610,6 +654,42 @@ mod tests {
             ("runner", s("${read://infra:runner}")),
         ]))
         .expect_err("a runner's fingerprint moves every consumer's key, so it is never deferred");
+    }
+
+    /// `InlineKind::ALL` is the schema's list and the only way into the parser's
+    /// match. Every listed kind must reach its own arm (failing, if at all, on a
+    /// missing field), and a near-miss must not.
+    #[test]
+    fn every_listed_inline_kind_is_one_the_parser_knows() {
+        let unknown = "unknown credential source kind";
+        for kind in InlineKind::ALL.map(InlineKind::name) {
+            if let Err(err) = SourceDecl::parse(&map(&[("kind", s(kind))])) {
+                assert!(
+                    !format!("{err:#}").contains(unknown),
+                    "schema lists {kind:?}, parser refuses it: {err:#}"
+                );
+            }
+        }
+        for near_miss in ["Env", "envs", "target", ""] {
+            let err = SourceDecl::parse(&map(&[("kind", s(near_miss))]))
+                .expect_err("a near-miss kind must fail");
+            assert!(
+                format!("{err:#}").contains(unknown),
+                "{near_miss:?}: {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_listed_oidc_provider_parses_and_a_near_miss_does_not() {
+        for p in OIDC_PROVIDERS {
+            SourceDecl::parse(&map(&[("kind", s("oidc")), ("provider", s(p))]))
+                .unwrap_or_else(|e| panic!("schema lists {p:?}, parser refuses it: {e:#}"));
+        }
+        for near_miss in ["github", "GitHub_Actions", ""] {
+            SourceDecl::parse(&map(&[("kind", s("oidc")), ("provider", s(near_miss))]))
+                .expect_err("a near-miss provider must fail");
+        }
     }
 
     #[test]

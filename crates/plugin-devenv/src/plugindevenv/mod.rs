@@ -49,6 +49,7 @@
 use anyhow::Context as _;
 use async_trait::async_trait;
 use hcore::hasync::Cancellable;
+use hcore::htvalue::signature::ParamType;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
 use hexecrunner::RunnerRef;
 use hplugin::driver::targetdef::path::{CodegenMode, Content, Path as OutPath};
@@ -57,7 +58,7 @@ use hplugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
     ParseResponse, TargetAddr,
 };
-use hplugin::htspec::Spec;
+use hplugin::htspec::{FromSpecValue, Spec};
 use hproc::proc_exec;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -167,7 +168,7 @@ fn normalize_value(value: &str) -> String {
 pub(crate) struct TargetSpec {
     /// `wrap` (default) captures the environment and runs targets locally in it.
     /// `session` holds one `devenv shell` open and runs targets inside it.
-    pub mode: String,
+    pub mode: Mode,
     /// Directory containing `devenv.nix`, relative to this package. Defaults to
     /// the package directory.
     pub root: String,
@@ -200,22 +201,54 @@ pub struct DevenvDef {
     pub pass_env: BTreeMap<String, String>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub enum Mode {
+    /// The default, for an absent `mode` and for `""`.
+    #[default]
     Wrap,
     Session,
 }
 
+/// Decoded by hand rather than `#[derive(SpecEnum)]`: `""` is accepted as the
+/// default, and an unknown mode is told what each one does. The schema comes
+/// from the same table as the parse.
+impl FromSpecValue for Mode {
+    fn from_spec_value(v: &hcore::htvalue::Value) -> anyhow::Result<Self> {
+        Self::parse(&String::from_spec_value(v)?)
+    }
+
+    /// What [`Mode::parse`] takes: every mode, and `""`.
+    fn spec_param_type() -> ParamType {
+        ParamType::one_of(Self::ALL.iter().map(|m| m.as_str()).chain([""]))
+    }
+}
+
 impl Mode {
+    /// Every mode; [`parse`](Self::parse) matches against their
+    /// [`as_str`](Self::as_str) spellings.
+    const ALL: [Self; 2] = [Self::Wrap, Self::Session];
+
     fn parse(raw: &str) -> anyhow::Result<Self> {
-        match raw {
-            "" | "wrap" => Ok(Self::Wrap),
-            "session" => Ok(Self::Session),
-            other => anyhow::bail!(
-                "devenv_runner: unknown mode {other:?}; expected \"wrap\" (capture the \
-                 environment, run targets locally in it) or \"session\" (hold one `devenv shell` \
-                 open and run targets inside it)"
-            ),
+        // `""` is the default, as an absent `mode` is.
+        if raw.is_empty() {
+            return Ok(Self::Wrap);
+        }
+        Self::ALL
+            .into_iter()
+            .find(|m| m.as_str() == raw)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "devenv_runner: unknown mode {raw:?}; expected \"wrap\" (capture the \
+                     environment, run targets locally in it) or \"session\" (hold one `devenv \
+                     shell` open and run targets inside it)"
+                )
+            })
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Wrap => "wrap",
+            Self::Session => "session",
         }
     }
 }
@@ -270,7 +303,7 @@ impl ManagedDriver for Driver {
     ) -> anyhow::Result<ParseResponse> {
         let spec = TargetSpec::from(&req.target_spec.config)?;
         let pkg = req.target_spec.addr.package.clone();
-        let mode = Mode::parse(&spec.mode)?;
+        let mode = spec.mode;
         check_root(&spec.root)?;
 
         let names: Vec<String> = if spec.pass_env.is_empty() {
@@ -602,6 +635,28 @@ mod tests {
         assert_eq!(Mode::parse("").expect("default"), Mode::Wrap);
         assert_eq!(Mode::parse("wrap").expect("wrap"), Mode::Wrap);
         assert_eq!(Mode::parse("session").expect("session"), Mode::Session);
+    }
+
+    /// The schema lists exactly what `Mode::parse` takes — `""` included, since
+    /// the parser takes it — so the LSP never flags a valid mode; an absent
+    /// `mode` is the default.
+    #[test]
+    fn mode_schema_is_the_literals_parse_takes() {
+        let absent = TargetSpec::from(&Default::default()).expect("absent mode");
+        assert_eq!(absent.mode, Mode::Wrap);
+        let schema = TargetSpec::schema();
+        let ty = &schema
+            .fields
+            .iter()
+            .find(|f| f.name == "mode")
+            .expect("mode field")
+            .ty;
+        assert_eq!(ty.literals(), vec!["wrap", "session", ""]);
+        for l in ty.literals() {
+            Mode::parse(l).unwrap_or_else(|e| panic!("schema lists {l:?}: {e:#}"));
+        }
+        assert!(!ty.matches(&hcore::htvalue::Value::String("agent".to_string())));
+        Mode::parse("agent").expect_err("near-miss refused");
     }
 
     fn def(mode: Mode) -> DevenvDef {

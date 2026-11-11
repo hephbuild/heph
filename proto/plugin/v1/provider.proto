@@ -141,6 +141,12 @@ message ParamType {
     ParamType map = 3;  // string-keyed map value type
     Union union = 4;
     Struct struct = 5;  // named heterogeneous fields
+    // Exactly this string (`ParamType::Literal`). A closed set is a `union`
+    // of literals. A oneof member has presence, so `literal = ""` (the empty
+    // string, e.g. go's `buildmode` "absent") is distinct from no kind at all.
+    // Since ABI 0.20.0: a peer that predates it sees no `kind` and fails the
+    // decode, which is why it was a minor bump.
+    string literal = 6;
   }
 }
 

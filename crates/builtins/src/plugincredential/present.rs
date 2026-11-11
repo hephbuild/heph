@@ -63,25 +63,36 @@ impl FromSpecValue for Dialect {
         Self::parse(&String::from_spec_value(v)?)
     }
 
+    /// The spellings [`Dialect::parse`] accepts, from the same table.
     fn spec_param_type() -> ParamType {
-        ParamType::String
+        ParamType::one_of(Self::ALL.map(Self::as_str))
     }
 }
 
 impl Dialect {
+    /// Every dialect. [`parse`](Self::parse) matches a string against these
+    /// [`as_str`](Self::as_str) spellings and the schema lists them, so the
+    /// accepted set and the documented one are the same list.
+    pub const ALL: [Self; 5] = [
+        Self::Aws,
+        Self::Gcp,
+        Self::Docker,
+        Self::Git,
+        Self::Kubernetes,
+    ];
+
     pub fn parse(s: &str) -> anyhow::Result<Self> {
-        Ok(match s {
-            "aws" => Self::Aws,
-            "gcp" => Self::Gcp,
-            "docker" => Self::Docker,
-            "git" => Self::Git,
-            "kubernetes" => Self::Kubernetes,
-            other => anyhow::bail!(
-                "unknown credential helper dialect {other:?} — expected one of aws, gcp, docker, \
-                 git, kubernetes. A helper is a protocol heph speaks on a tool's behalf; for a \
-                 tool that speaks none, use `env` or `files`"
-            ),
-        })
+        Self::ALL
+            .into_iter()
+            .find(|d| d.as_str() == s)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unknown credential helper dialect {s:?} — expected one of {}. A helper is a \
+                     protocol heph speaks on a tool's behalf; for a tool that speaks none, use \
+                     `env` or `files`",
+                    Self::ALL.map(Self::as_str).join(", ")
+                )
+            })
     }
 
     pub fn as_str(self) -> &'static str {
@@ -112,7 +123,8 @@ impl Dialect {
 /// everything on this side of the line.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Default, SpecStruct)]
 pub struct Helper {
-    /// Which callback protocol heph speaks.
+    /// Which callback protocol heph speaks: `aws`, `gcp`, `docker`, `git` or
+    /// `kubernetes`.
     pub dialect: Option<Dialect>,
     /// Docker: registries this credential authenticates. Empty is an error —
     /// a credHelpers map with no entries authenticates nothing.
@@ -147,7 +159,7 @@ pub struct Presentation {
     /// run end whatever the outcome. Reachable as `${file:<name>}`.
     pub files: BTreeMap<String, Deferred<String>>,
     /// A callback protocol. The only presentation that survives expiry.
-    #[spec(parse = parse_helper)]
+    #[spec(parse = parse_helper, ty = super::functions::helper_ty())]
     pub helper: Option<Helper>,
 }
 
@@ -378,6 +390,25 @@ mod tests {
 
     fn s(v: &str) -> Value {
         Value::String(v.to_string())
+    }
+
+    /// The schema is the parser's table: every listed dialect decodes to
+    /// itself, and a near-miss is refused by both.
+    #[test]
+    fn dialect_schema_is_exactly_the_parsed_spellings() {
+        let ty = Dialect::spec_param_type();
+        assert_eq!(
+            ty,
+            ParamType::one_of(["aws", "gcp", "docker", "git", "kubernetes"])
+        );
+        for l in ty.literals() {
+            let d = Dialect::from_spec_value(&s(l)).expect("listed dialect parses");
+            assert_eq!(d.as_str(), l);
+        }
+        for near_miss in ["k8s", "Docker", ""] {
+            assert!(!ty.matches(&s(near_miss)));
+            Dialect::parse(near_miss).expect_err("near-miss refused");
+        }
     }
 
     #[test]

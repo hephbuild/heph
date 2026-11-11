@@ -120,7 +120,7 @@ struct CredentialSpec {
     /// `heph.auth.*` constructor. The first *applicable* source is the source:
     /// an acquire failure is terminal, not a fallthrough, so a misconfigured
     /// role in CI cannot silently fall back to an ambient identity.
-    #[spec(required, parse = parse_sources, ty = ParamType::list(functions::source_ty()))]
+    #[spec(required, parse = parse_sources, ty = ParamType::list(functions::source_entry_ty()))]
     sources: Vec<SourceDecl>,
     /// How the material reaches a consumer: `env` (name → template), `files`
     /// (name → content template, written 0600 and deleted at run end) and/or

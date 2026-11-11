@@ -30,19 +30,48 @@ use async_trait::async_trait;
 use hcore::htvalue::Value;
 use hcore::htvalue::signature::{FnSignature, Param, ParamType};
 use hplugin::function::{FnArgs, FnCallContext, FnOutcome, PluginFn, PluginFnDef};
+use hplugin::htspec::FromSpecValue;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+use super::present::Dialect;
+use super::source::{InlineKind, OIDC_PROVIDERS};
 
 // ---------------------------------------------------------------------------
 // Signature helpers
 // ---------------------------------------------------------------------------
 
+/// One string or a list of them — what the parser's `Vec<String>` decoding
+/// accepts, so the two cannot disagree.
 pub(crate) fn strs() -> ParamType {
-    ParamType::union(vec![ParamType::String, ParamType::list(ParamType::String)])
+    <Vec<String> as FromSpecValue>::spec_param_type()
 }
 
 fn str_map() -> ParamType {
     ParamType::map(ParamType::String)
+}
+
+/// `oidc`'s `provider`: one of [`OIDC_PROVIDERS`], the list the parser checks.
+fn oidc_provider_ty() -> ParamType {
+    ParamType::one_of(OIDC_PROVIDERS.iter().copied())
+}
+
+/// `present.helper`: a dialect name, or the dict whose keys [`Helper`]'s
+/// derive owns — the two shapes `parse_helper` dispatches on.
+///
+/// [`Helper`]: super::present::Helper
+pub(crate) fn helper_ty() -> ParamType {
+    let dialect = <Dialect as FromSpecValue>::spec_param_type();
+    ParamType::union(vec![
+        dialect.clone(),
+        ParamType::strukt(vec![
+            ("dialect", dialect),
+            ("registries", strs()),
+            ("hosts", strs()),
+            ("audience", ParamType::String),
+            ("impersonate", ParamType::String),
+        ]),
+    ])
 }
 
 /// The shape a presentation preset returns.
@@ -55,19 +84,7 @@ pub(crate) fn presentation_ty() -> ParamType {
     ParamType::strukt(vec![
         ("env", str_map()),
         ("files", str_map()),
-        (
-            "helper",
-            ParamType::union(vec![
-                ParamType::String,
-                ParamType::strukt(vec![
-                    ("dialect", ParamType::String),
-                    ("registries", ParamType::list(ParamType::String)),
-                    ("hosts", ParamType::list(ParamType::String)),
-                    ("audience", ParamType::String),
-                    ("impersonate", ParamType::String),
-                ]),
-            ]),
-        ),
+        ("helper", helper_ty()),
     ])
 }
 
@@ -75,22 +92,35 @@ pub(crate) fn presentation_ty() -> ParamType {
 /// kind's fields, which is what the driver's own schema says too.
 pub(crate) fn source_ty() -> ParamType {
     ParamType::strukt(vec![
-        ("kind", ParamType::String),
+        (
+            "kind",
+            ParamType::one_of(InlineKind::ALL.iter().map(|k| k.name())),
+        ),
         ("when", ParamType::String),
         ("credentials", strs()),
         ("present", presentation_ty()),
         ("hint", ParamType::String),
-        ("names", ParamType::list(ParamType::String)),
+        ("names", strs()),
         ("path", ParamType::String),
-        ("run", ParamType::list(ParamType::String)),
+        ("run", strs()),
         ("fields", str_map()),
         ("expires", ParamType::String),
-        ("login", ParamType::list(ParamType::list(ParamType::String))),
+        // One argv, or a list of argvs each of which may be a bare string —
+        // `parse_login`'s two shapes.
+        ("login", ParamType::list(strs())),
         ("runner", ParamType::String),
         ("paths", str_map()),
-        ("provider", ParamType::String),
+        ("provider", oidc_provider_ty()),
         ("audience", ParamType::String),
     ])
+}
+
+/// One entry of a credential's `sources`: a target address, or an inline
+/// source — the two shapes [`SourceDecl::parse`] dispatches on.
+///
+/// [`SourceDecl::parse`]: super::source::SourceDecl::parse
+pub(crate) fn source_entry_ty() -> ParamType {
+    ParamType::union(vec![ParamType::String, source_ty()])
 }
 
 /// The four fields every source constructor accepts, appended to its own named
@@ -366,9 +396,11 @@ pub fn definitions() -> Vec<PluginFnDef> {
         ),
         source_def(
             "oidc",
+            // `""` is listed because the body takes it for the default — the
+            // schema says what the call accepts, not only what is documented.
             vec![Param::optional(
                 "provider",
-                ParamType::String,
+                ParamType::union(vec![oidc_provider_ty(), ParamType::literal("")]),
                 s("github_actions"),
             )],
             vec![Param::optional(
@@ -746,11 +778,153 @@ mod tests {
                 vec![s("github_actions")],
                 vec![("audience", s("sts.amazonaws.com"))],
             ),
+            (
+                "exec",
+                vec![s("gh-token")],
+                vec![("login", list(&["gh", "auth", "login"]))],
+            ),
         ];
         for (name, positional, named) in cases {
             let v = call(name, positional, &named).unwrap_or_else(|e| panic!("{name}: {e:#}"));
             SourceDecl::parse(&v).unwrap_or_else(|e| panic!("{name} does not parse: {e:#}"));
+            // The return value is checked against `source_ty` at the call, so
+            // a dict the parser takes must match it too.
+            assert!(
+                source_ty().matches(&v),
+                "{name} returns {v:?}, outside its declared type {}",
+                source_ty().render()
+            );
         }
+    }
+
+    fn field_ty(ty: &ParamType, name: &str) -> ParamType {
+        let ParamType::Struct(fields) = ty else {
+            panic!("not a struct: {}", ty.render());
+        };
+        fields
+            .iter()
+            .find(|f| f.name == name)
+            .unwrap_or_else(|| panic!("no field {name}"))
+            .ty
+            .clone()
+    }
+
+    /// The closed sets are typed as such, from the lists the parsers check, so
+    /// the LSP flags a typo and never a value the parser takes.
+    #[test]
+    fn closed_string_sets_are_the_literals_the_parsers_accept() {
+        let dialect_names = ["aws", "gcp", "docker", "git", "kubernetes"];
+        let dialects = ParamType::one_of(dialect_names);
+        let source = source_ty();
+        assert_eq!(
+            field_ty(&source, "kind"),
+            ParamType::one_of(["env", "file", "exec", "passthrough", "oidc"])
+        );
+        assert_eq!(
+            field_ty(&source, "provider"),
+            ParamType::one_of(["github_actions", "generic"])
+        );
+        // A dialect name or the dict: the names splice into the union flat,
+        // the dict is its last member.
+        let helper = field_ty(&presentation_ty(), "helper");
+        assert_eq!(helper.literals(), dialect_names);
+        let ParamType::Union(members) = &helper else {
+            panic!("helper is a dialect or a dict: {}", helper.render());
+        };
+        let dict = members.last().expect("helper has members");
+        assert_eq!(field_ty(dict, "dialect"), dialects);
+
+        let defs = definitions();
+        let oidc = defs.iter().find(|d| d.name == "oidc").expect("oidc");
+        let provider = &oidc.signature.positional[0].ty;
+        for ok in ["github_actions", "generic", ""] {
+            assert!(provider.matches(&s(ok)), "{ok:?} is accepted by the call");
+            call("oidc", vec![s(ok)], &[]).unwrap_or_else(|e| panic!("{ok:?}: {e:#}"));
+        }
+        assert!(!provider.matches(&s("github")));
+    }
+
+    /// Hand-written source dicts in each shape the parser takes match the
+    /// schema the `sources` field and the LSP use.
+    #[test]
+    fn source_shapes_the_parser_accepts_match_the_schema() {
+        let m = |pairs: Vec<(&str, Value)>| {
+            Value::Map(pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
+        };
+        let cases = vec![
+            m(vec![("kind", s("env")), ("names", s("TOKEN"))]),
+            m(vec![("kind", s("exec")), ("run", s("gh-token"))]),
+            m(vec![
+                ("kind", s("exec")),
+                ("run", list(&["gh", "auth", "token"])),
+                ("login", Value::List(vec![s("gh-login"), list(&["a", "b"])])),
+            ]),
+            m(vec![
+                ("kind", s("oidc")),
+                ("provider", s("generic")),
+                (
+                    "present",
+                    m(vec![(
+                        "helper",
+                        m(vec![("dialect", s("docker")), ("registries", s("ghcr.io"))]),
+                    )]),
+                ),
+            ]),
+            m(vec![
+                ("kind", s("env")),
+                ("names", s("T")),
+                ("present", m(vec![("helper", s("aws"))])),
+            ]),
+            // A bare target address: the producer form.
+            s("//auth:vault"),
+        ];
+        let entry = source_entry_ty();
+        for v in cases {
+            SourceDecl::parse(&v).unwrap_or_else(|e| panic!("{v:?} does not parse: {e:#}"));
+            assert!(entry.matches(&v), "{v:?} parses but the schema refuses it");
+        }
+        // And the other direction, for the enums: a near-miss is refused by both.
+        let typo = m(vec![("kind", s("execs")), ("run", s("x"))]);
+        SourceDecl::parse(&typo).expect_err("unknown kind");
+        assert!(!entry.matches(&typo));
+        // Neither shape: refused by both.
+        SourceDecl::parse(&Value::Int(1)).expect_err("an int is no source");
+        assert!(!entry.matches(&Value::Int(1)));
+    }
+
+    /// `Presentation`'s own schema says what `parse_helper` takes, string form
+    /// included — the same type the presets' return value is checked against.
+    #[test]
+    fn presentation_helper_field_schema_includes_the_dialect_name_form() {
+        let schema = Presentation::spec_param_type();
+        let rendered = schema.render();
+        assert!(rendered.contains("\"kubernetes\""), "{rendered}");
+        assert!(rendered.contains("registries"), "{rendered}");
+    }
+
+    /// `helper_ty`'s dict form lists exactly `Helper`'s fields (the keys its
+    /// derive parses, read off its serialized form), so neither can gain a key
+    /// the other lacks.
+    #[test]
+    fn helper_ty_dict_lists_exactly_helpers_fields() {
+        use crate::plugincredential::present::Helper;
+        let ParamType::Union(members) = helper_ty() else {
+            panic!("helper is a dialect or a dict");
+        };
+        // The dialect names splice in flat; the dict form is the last member.
+        let Some(ParamType::Struct(fields)) = members.last() else {
+            panic!("the dict form is a struct");
+        };
+        let mut schema: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+        schema.sort_unstable();
+        let serde_json::Value::Object(helper) =
+            serde_json::to_value(Helper::default()).expect("serialize Helper")
+        else {
+            panic!("Helper serializes to an object");
+        };
+        let mut parsed: Vec<&str> = helper.keys().map(String::as_str).collect();
+        parsed.sort_unstable();
+        assert_eq!(schema, parsed);
     }
 
     #[test]
@@ -783,6 +957,10 @@ mod tests {
         for (name, positional, named) in cases {
             let v = call(name, positional, &named).unwrap_or_else(|e| panic!("{name}: {e:#}"));
             Presentation::parse(&v).unwrap_or_else(|e| panic!("{name} does not parse: {e:#}"));
+            assert!(
+                presentation_ty().matches(&v),
+                "{name} returns {v:?}, outside its declared type"
+            );
         }
     }
 

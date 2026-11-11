@@ -134,7 +134,7 @@ struct GoCompileSpec {
     /// Variant buildmode (`exe`/`pie`); empty → `exe`. Decides whether the
     /// compile/asm steps get `-shared`, which must agree with the link's
     /// `-buildmode=` (see `BuildMode::needs_shared`).
-    buildmode: String,
+    buildmode: BuildMode,
     /// Race-detector build: pass `-race` to `go tool compile`, instrumenting every
     /// memory access in this package. Whole-program — every archive in the link
     /// must agree — so it rides the address and keys this archive's cache.
@@ -324,20 +324,9 @@ impl ManagedDriver for GoCompileDriver {
             .first()
             .and_then(|s| EmbedVariant::parse(s));
 
-        // Absent (or empty) means the default `exe`; an unrecognized spelling is
-        // a hard error rather than a silent fallback — it would change the
-        // linkage of the produced binary.
-        let buildmode = if spec.buildmode.is_empty() {
-            BuildMode::default()
-        } else {
-            BuildMode::parse(&spec.buildmode).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "unknown `buildmode` `{}` (allowed: {})",
-                    spec.buildmode,
-                    BuildMode::NAMES.join(", ")
-                )
-            })?
-        };
+        // Absent (or empty) is the default `exe`; an unknown spelling already
+        // failed the decode.
+        let buildmode = spec.buildmode;
 
         let (runner, runner_input) = super::runner::parse_runner_with_default(
             &spec.runner,
@@ -1311,6 +1300,29 @@ mod driver_tests {
         let declared = parse_def(spec).await;
         assert_eq!(declared.resources.declared("cpu"), Some("4"));
         assert_eq!(declared.hash, plain.hash);
+    }
+
+    // The schema lists exactly what `parse` takes: each mode, and `""` for
+    // "absent". Every listed literal must parse.
+    #[tokio::test]
+    async fn buildmode_schema_lists_exactly_what_parse_takes() {
+        use hcore::htvalue::signature::ParamType;
+        let schema = GoCompileSpec::schema();
+        let ty = &schema
+            .fields
+            .iter()
+            .find(|f| f.name == "buildmode")
+            .expect("buildmode field")
+            .ty;
+        assert_eq!(ty.literals(), vec!["exe", "pie", ""]);
+        assert!(!ty.matches(&Value::String("c-archive".to_string())));
+        assert!(matches!(ty, ParamType::Union(_)));
+        for l in ty.literals() {
+            let mut spec = spec_with_buildmode(BuildMode::Exe);
+            spec.config
+                .insert("buildmode".to_string(), Value::String(l.to_string()));
+            parse_def(spec).await;
+        }
     }
 
     // An unparseable buildmode must fail the parse rather than quietly linking a

@@ -10,7 +10,9 @@
 //!   `map[<union of field types>]`.
 //! * `#[derive(SpecEnum)]` — on a unit-variant enum, generates a
 //!   [`FromSpecValue`] that parses a string into a variant (variant name lowered
-//!   to `snake_case` by default). `spec_param_type` is `string`.
+//!   to `snake_case` by default). `spec_param_type` is the union of the
+//!   accepted spellings as literals (`"a" | "b"`), so the LSP offers and checks exactly
+//!   what the parser accepts.
 //! * `#[derive(SpecUnion)]` — on a newtype-variant enum, a union: parsing tries
 //!   each variant's inner type in declared order; schema renders `a | b | c`.
 //!
@@ -403,7 +405,7 @@ fn expand_spec_struct(input: DeriveInput) -> syn::Result<proc_macro2::TokenStrea
 
             fn spec_param_type() -> crate::htvalue::signature::ParamType {
                 crate::htvalue::signature::ParamType::map(
-                    crate::htspec::flatten_union(::std::vec![ #(#param_tys),* ])
+                    crate::htvalue::signature::ParamType::union(::std::vec![ #(#param_tys),* ])
                 )
             }
         }
@@ -460,6 +462,14 @@ fn expand_spec_enum(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream>
         valid_names.push(key);
     }
 
+    // An empty set would schema as an empty union, a field no value can
+    // satisfy: a type that only says the enum is broken.
+    if valid_names.is_empty() {
+        return Err(syn::Error::new_spanned(
+            name,
+            "`SpecEnum` needs at least one variant that is not `#[spec(skip)]`",
+        ));
+    }
     let valid = valid_names.join(", ");
     let null_arm = if has_default {
         quote! {
@@ -485,7 +495,9 @@ fn expand_spec_enum(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream>
             }
 
             fn spec_param_type() -> crate::htvalue::signature::ParamType {
-                crate::htvalue::signature::ParamType::String
+                crate::htvalue::signature::ParamType::one_of([
+                    #(#valid_names),*
+                ])
             }
         }
     })
@@ -556,7 +568,7 @@ fn expand_spec_union(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream
             }
 
             fn spec_param_type() -> crate::htvalue::signature::ParamType {
-                crate::htspec::flatten_union(::std::vec![ #(#member_tys),* ])
+                crate::htvalue::signature::ParamType::union(::std::vec![ #(#member_tys),* ])
             }
         }
     })

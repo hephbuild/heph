@@ -49,34 +49,6 @@ pub trait FromSpecValue: Sized {
     fn spec_param_type() -> ParamType;
 }
 
-/// Build a union [`ParamType`] from member types, flattening nested unions and
-/// dropping duplicates so `a | (a | b)` renders as `a | b`. A single member is
-/// returned bare (no wrapping `Union`).
-pub fn flatten_union(members: Vec<ParamType>) -> ParamType {
-    let mut flat: Vec<ParamType> = Vec::new();
-    for m in members {
-        match m {
-            ParamType::Union(inner) => {
-                for t in inner {
-                    if !flat.contains(&t) {
-                        flat.push(t);
-                    }
-                }
-            }
-            other => {
-                if !flat.contains(&other) {
-                    flat.push(other);
-                }
-            }
-        }
-    }
-    if flat.len() == 1 {
-        flat.pop().expect("len checked")
-    } else {
-        ParamType::Union(flat)
-    }
-}
-
 /// Reject a value that carries a deferred reference in a field that cannot take
 /// one.
 ///
@@ -801,9 +773,25 @@ mod tests {
         assert!(format!("{err:#}").contains("expected one of"), "{err:#}");
     }
 
+    /// The schema is exactly the spellings the parser accepts: renamed, never
+    /// a skipped variant. Every literal it lists must parse, and a skipped
+    /// variant's snake_case name is neither listed nor parsed.
     #[test]
-    fn enum_param_type_is_string() {
-        assert_eq!(Codegen::spec_param_type(), ParamType::String);
+    fn enum_param_type_lists_exactly_the_accepted_spellings() {
+        let ty = Codegen::spec_param_type();
+        assert_eq!(
+            ty,
+            ParamType::Union(vec![
+                ParamType::literal("copy"),
+                ParamType::literal("in_place"),
+                ParamType::literal("in-place-v2"),
+            ])
+        );
+        for l in ty.literals() {
+            Codegen::from_spec_value(&Value::String(l.to_string()))
+                .unwrap_or_else(|e| panic!("schema lists {l:?}, parser refuses it: {e:#}"));
+        }
+        assert!(!ty.matches(&Value::String("none".to_string())));
     }
 
     // --- SpecStruct ---

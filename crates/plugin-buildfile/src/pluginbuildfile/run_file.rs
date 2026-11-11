@@ -327,7 +327,9 @@ pub(crate) fn build_globals(registry: &FunctionRegistry) -> Globals {
 pub(crate) fn param_type_to_ty(t: &ParamType) -> starlark::typing::Ty {
     use starlark::typing::Ty;
     match t {
-        ParamType::String => Ty::string(),
+        // Starlark types have no string literals; the set is checked by
+        // `FnSignature::validate_args` at the call.
+        ParamType::String | ParamType::Literal(_) => Ty::string(),
         ParamType::Bool => Ty::bool(),
         // htvalue distinguishes Int/Uint but Starlark has a single int type.
         ParamType::Int | ParamType::Uint => Ty::int(),
@@ -658,6 +660,11 @@ fn sorted_groups(m: &HashMap<String, Vec<String>>) -> Vec<(&String, &Vec<String>
     groups
 }
 
+/// The keys [`sandbox_from`] accepts. Anything else is refused before any is
+/// parsed, so the parser cannot take a key this list (and so [`transitive_ty`],
+/// which a test holds to it) does not name.
+const SANDBOX_KEYS: &[&str] = &["deps", "env", "tools", "pass_env", "runtime_pass_env"];
+
 /// Parse a BUILD-file `sandbox`/`transitive` value (Starlark → `htvalue`) into a
 /// [`Sandbox`]. Free function rather than an inherent `impl` because `Sandbox`
 /// now lives in the `heph-plugin` contract crate (orphan rule).
@@ -671,6 +678,15 @@ fn sandbox_from(m: htvalue::Value, pkg: &PkgBuf) -> anyhow::Result<Sandbox> {
     };
 
     let mut m: HashMap<&str, &htvalue::Value> = m.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    let mut unknown_keys: Vec<&str> = m
+        .keys()
+        .copied()
+        .filter(|k| !SANDBOX_KEYS.contains(k))
+        .collect();
+    if !unknown_keys.is_empty() {
+        unknown_keys.sort_unstable();
+        anyhow::bail!("unknown entries found: {:?}", unknown_keys)
+    }
 
     let mut sandbox = Sandbox::default();
 
@@ -751,8 +767,9 @@ fn sandbox_from(m: htvalue::Value, pkg: &PkgBuf) -> anyhow::Result<Sandbox> {
     }
 
     if !m.is_empty() {
-        let unknown_keys: Vec<&str> = m.into_keys().collect();
-        anyhow::bail!("unknown entries found: {:?}", unknown_keys)
+        // A key in `SANDBOX_KEYS` that no branch above consumed.
+        let unhandled: Vec<&str> = m.into_keys().collect();
+        anyhow::bail!("listed sandbox entries not handled: {:?}", unhandled)
     }
 
     Ok(sandbox)
@@ -947,6 +964,27 @@ fn capture_provenance(eval: &Evaluator) -> Vec<ProvenanceFrame> {
         .collect()
 }
 
+/// `string | list[string]`: what `parse_strings` takes, which is what the
+/// spec decoding of a `Vec<String>` takes.
+fn strs() -> ParamType {
+    <Vec<String> as hplugin::htspec::FromSpecValue>::spec_param_type()
+}
+
+/// The `transitive` value, key for key what [`sandbox_from`] accepts:
+/// `deps`/`tools` through `parse_map_string_strings` (a bare address, a list, or
+/// a `{group: addr | [addr]}` map), `env` through `parse_map_string_string`, and
+/// the two pass-through lists through `parse_strings`. Any other key is refused.
+fn transitive_ty() -> ParamType {
+    let groups = || ParamType::union(vec![strs(), ParamType::map(strs())]);
+    ParamType::strukt(vec![
+        ("deps", groups()),
+        ("tools", groups()),
+        ("env", ParamType::map(ParamType::String)),
+        ("pass_env", strs()),
+        ("runtime_pass_env", strs()),
+    ])
+}
+
 /// The driver-independent keyword arguments the `target()` builtin always
 /// accepts, for BUILD-file LSP completion. Kept next to the `target()` builtin
 /// (below) so the two don't drift. Driver-specific config args come from the
@@ -978,21 +1016,17 @@ pub(crate) fn target_base_fields() -> Vec<hplugin::driver::DriverField> {
         ),
         f(
             "transitive",
-            ParamType::map(ParamType::union(vec![
-                ParamType::list(ParamType::String),
-                ParamType::map(ParamType::list(ParamType::String)),
-            ])),
-            "Sandbox applied transitively: `deps`, `tools`, `env`, `pass_env`, `runtime_pass_env`, `runtime_env`.",
+            transitive_ty(),
+            "Sandbox applied transitively: `deps` and `tools` (an address, a list of them, or a \
+             `{group: [addr, …]}` map), `env` (map[string]), and `pass_env`/`runtime_pass_env` \
+             (a variable name or a list of them).",
             false,
         ),
         f(
             "approval",
             ParamType::union(vec![
                 ParamType::Bool,
-                ParamType::map(ParamType::union(vec![
-                    ParamType::Bool,
-                    ParamType::list(ParamType::String),
-                ])),
+                ParamType::strukt(vec![("required", ParamType::Bool), ("notice", strs())]),
             ]),
             "Require explicit approval before executing: `True`, or `{required, notice}` where `notice` lists input groups shown to the user.",
             false,
@@ -2765,6 +2799,45 @@ target(
             chain.contains("undefined_symbol"),
             "eval error must name the offending symbol: {chain}"
         );
+    }
+
+    /// `transitive_ty` lists exactly `SANDBOX_KEYS`, and every listed key reaches
+    /// a parser branch: a map holding all of them, each with a value its schema
+    /// type takes, parses. A near-miss key is refused.
+    #[test]
+    fn transitive_schema_lists_exactly_the_keys_sandbox_from_accepts() {
+        let ParamType::Struct(fields) = transitive_ty() else {
+            panic!("transitive is a struct");
+        };
+        let mut schema: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+        schema.sort_unstable();
+        let mut keys = SANDBOX_KEYS.to_vec();
+        keys.sort_unstable();
+        assert_eq!(schema, keys);
+
+        let address = htvalue::Value::String("//p:x".to_string());
+        let env = htvalue::Value::Map(HashMap::from([(
+            "A".to_string(),
+            htvalue::Value::String("x".to_string()),
+        )]));
+        let all: HashMap<String, htvalue::Value> = fields
+            .iter()
+            .map(|f| {
+                let v = if f.ty.matches(&address) {
+                    address.clone()
+                } else {
+                    env.clone()
+                };
+                assert!(f.ty.matches(&v), "{}: no sample value", f.name);
+                (f.name.clone(), v)
+            })
+            .collect();
+        let pkg = PkgBuf::from("p");
+        sandbox_from(htvalue::Value::Map(all), &pkg).expect("every listed key parses");
+
+        let near_miss = htvalue::Value::Map(HashMap::from([("dep".to_string(), address)]));
+        let err = sandbox_from(near_miss, &pkg).expect_err("an unlisted key");
+        assert!(format!("{err:#}").contains("unknown entries"), "{err:#}");
     }
 
     #[test]
@@ -4988,5 +5061,74 @@ target(name = "hand", driver = "exec", transitive = {"deps": {"g": [":sib", "//o
             Some(htvalue::Value::String(s)) => assert_eq!(s, "a/b/c"),
             other => panic!("expected joined path, got {other:?}"),
         }
+    }
+
+    fn base_field_ty(name: &str) -> ParamType {
+        target_base_fields()
+            .into_iter()
+            .find(|f| f.name == name)
+            .unwrap_or_else(|| panic!("no base field {name}"))
+            .ty
+    }
+
+    /// `transitive`'s schema is what `sandbox_from` takes, shape for shape: the
+    /// LSP must not flag a valid sandbox, and must flag the key it refuses.
+    #[test]
+    fn transitive_schema_matches_what_sandbox_from_accepts() {
+        use htvalue::Value;
+        let s = |v: &str| Value::String(v.to_string());
+        let l = |vs: &[&str]| Value::List(vs.iter().map(|v| s(v)).collect());
+        let m = |pairs: Vec<(&str, Value)>| {
+            Value::Map(pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
+        };
+        let ty = base_field_ty("transitive");
+        let pkg = PkgBuf::from("p");
+        let accepted = [
+            m(vec![("deps", s("//a:b"))]),
+            m(vec![("deps", l(&["//a:b", "//a:c"]))]),
+            m(vec![(
+                "tools",
+                m(vec![("go", s("//t:go")), ("cc", l(&["//t:cc"]))]),
+            )]),
+            m(vec![("env", m(vec![("K", s("v"))]))]),
+            m(vec![
+                ("pass_env", s("HOME")),
+                ("runtime_pass_env", l(&["TERM"])),
+            ]),
+        ];
+        for v in accepted {
+            sandbox_from(v.clone(), &pkg).unwrap_or_else(|e| panic!("{v:?}: {e:#}"));
+            assert!(
+                ty.matches(&v),
+                "{v:?} parses but {} refuses it",
+                ty.render()
+            );
+        }
+        let refused = m(vec![("runtime_env", m(vec![("K", s("v"))]))]);
+        sandbox_from(refused.clone(), &pkg).expect_err("runtime_env is not a transitive key");
+        assert!(!ty.matches(&refused));
+        let doc = target_base_fields()
+            .into_iter()
+            .find(|f| f.name == "transitive")
+            .expect("transitive")
+            .doc;
+        assert!(!doc.contains("runtime_env"), "{doc}");
+    }
+
+    /// `approval`'s schema takes the bare-string `notice` `approval_from` does.
+    #[test]
+    fn approval_schema_matches_what_approval_from_accepts() {
+        use htvalue::Value;
+        let ty = base_field_ty("approval");
+        let v = Value::Map(HashMap::from([
+            ("required".to_string(), Value::Bool(true)),
+            ("notice".to_string(), Value::String("srcs".to_string())),
+        ]));
+        approval_from(v.clone()).expect("bare-string notice parses");
+        assert!(ty.matches(&v), "{}", ty.render());
+        assert!(ty.matches(&Value::Bool(true)));
+        let typo = Value::Map(HashMap::from([("requred".to_string(), Value::Bool(true))]));
+        approval_from(typo.clone()).expect_err("unknown key");
+        assert!(!ty.matches(&typo));
     }
 }

@@ -89,11 +89,15 @@ struct OciIndexSpec {
     /// order they happen to be written in.
     #[spec(required)]
     images: Vec<String>,
-    /// Archive format: `oci` (default). `docker` is rejected — a docker-format
-    /// archive holds a single image, which is the one thing this rule does not
-    /// produce.
-    #[spec(ty = hcore::htvalue::signature::ParamType::String)]
-    format: Option<String>,
+    /// Archive format: `oci`, the default and the only one an index takes — a
+    /// docker-format archive holds a single image, which is the one thing this
+    /// rule does not produce.
+    ///
+    /// Decoded as any [`ImageFormat`], so `"docker"` reaches `parse` and is
+    /// refused there with the reason and the way out; the schema narrows to
+    /// `"oci"` so the LSP flags it before that.
+    #[spec(ty = hcore::htvalue::signature::ParamType::literal("oci"))]
+    format: ImageFormat,
     /// Write an OCI **layout directory** instead of a single archive file. This
     /// is the shape `docker_build`'s `bases` and buildx's `oci-layout://` build
     /// context consume.
@@ -231,10 +235,7 @@ impl ManagedDriver for Driver {
             !spec.images.is_empty(),
             "`images` is empty; an oci_index groups per-platform images and needs at least one"
         );
-        let format = spec
-            .format
-            .as_deref()
-            .map_or(Ok(ImageFormat::Oci), ImageFormat::parse)?;
+        let format = spec.format;
         anyhow::ensure!(
             !matches!(format, ImageFormat::Docker),
             "`format = \"docker\"` holds a single image, which is the one thing an oci_index does \
@@ -575,6 +576,30 @@ mod tests {
         .err()
         .expect("docker format must fail");
         assert!(format!("{err:#}").contains("single image"), "got: {err:#}");
+    }
+
+    /// `parse` refuses `docker` for an index, so the schema offers only `oci`:
+    /// the LSP flags `"docker"` where it is written, as the parse would.
+    #[tokio::test]
+    async fn format_schema_is_oci_only() {
+        let schema = OciIndexSpec::schema();
+        let ty = &schema
+            .fields
+            .iter()
+            .find(|f| f.name == "format")
+            .expect("format field")
+            .ty;
+        assert_eq!(ty.literals(), vec!["oci"]);
+        assert!(!ty.matches(&Value::String("docker".to_string())));
+        parse_at(
+            "//app:img",
+            cfg(&[
+                ("images", images(&[":amd64"])),
+                ("format", Value::String("oci".to_string())),
+            ]),
+        )
+        .await
+        .expect("the listed format parses");
     }
 
     #[tokio::test]

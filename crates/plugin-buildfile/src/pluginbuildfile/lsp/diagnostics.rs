@@ -202,7 +202,11 @@ fn check_call(
                             out.push(diag(
                                 ast,
                                 value.span,
-                                format!("`{key}` expects {}, got {}", ty.render(), value_kind(&v)),
+                                format!(
+                                    "`{key}` expects {}, got {}",
+                                    ty.render(),
+                                    ty.describe_mismatch(&v)
+                                ),
                             ));
                         }
                     }
@@ -252,12 +256,13 @@ fn check_call(
 /// The [`Value`] of a literal expression, or `None` when the expression isn't a
 /// statically-evaluable literal (a variable, call, concatenation, f-string, …).
 /// Numeric values are placeholders — only the *kind* matters for type-checking,
-/// except a leading minus, which is tracked so a uint field rejects it.
+/// except a leading minus, which is tracked so a uint field rejects it. A
+/// string keeps its text, which a field of literals is checked against.
 /// Mirrors `run_file::starlark_to_rust` so the kinds line up with what the engine
 /// would produce at eval time.
 fn literal_value(expr: &AstExpr) -> Option<Value> {
     match &expr.node {
-        Expr::Literal(AstLiteral::String(_)) => Some(Value::String(String::new())),
+        Expr::Literal(AstLiteral::String(s)) => Some(Value::String(s.node.clone())),
         Expr::Literal(AstLiteral::Int(_)) => Some(Value::Int(0)),
         Expr::Literal(AstLiteral::Float(_)) => Some(Value::Float(0.0)),
         // A negated literal: a non-negative int/float becomes negative.
@@ -319,20 +324,6 @@ fn value_matches(ty: &ParamType, v: &Value) -> bool {
     }
 }
 
-/// The value-kind name of `v`, for the "got …" half of a type-mismatch message.
-fn value_kind(v: &Value) -> &'static str {
-    match v {
-        Value::String(_) => "string",
-        Value::Bool(_) => "bool",
-        Value::Int(_) => "int",
-        Value::Uint(_) => "uint",
-        Value::Float(_) => "float",
-        Value::Null() => "null",
-        Value::Map(_) => "map",
-        Value::List(_) => "list",
-    }
-}
-
 /// An error diagnostic over `span` with heph as the source (so the editor groups
 /// it apart from the stock Starlark diagnostics).
 fn diag(ast: &AstModule, span: Span, message: String) -> Diagnostic {
@@ -381,6 +372,23 @@ mod tests {
                         DriverField {
                             name: "verbose".to_string(),
                             ty: ParamType::Bool,
+                            doc: String::new(),
+                            required: false,
+                        },
+                        DriverField {
+                            name: "workdir".to_string(),
+                            ty: ParamType::one_of(["caller", "tree_root"]),
+                            doc: String::new(),
+                            required: false,
+                        },
+                        // A closed set nested in a dict of structs, like go's
+                        // `variants`.
+                        DriverField {
+                            name: "variants".to_string(),
+                            ty: ParamType::map(ParamType::strukt(vec![(
+                                "buildmode",
+                                ParamType::one_of(["exe", "pie"]),
+                            )])),
                             doc: String::new(),
                             required: false,
                         },
@@ -484,6 +492,42 @@ mod tests {
                 .any(|m| m.contains("`cmd` expects string, got int")),
             "expected type mismatch on cmd, got {msgs:?}"
         );
+    }
+
+    #[test]
+    fn a_string_outside_a_closed_set_is_flagged_by_its_value() {
+        let src = |v: &str| {
+            format!("target(name = \"t\", driver = \"exec\", cmd = \"c\", workdir = {v})\n")
+        };
+        let msgs = messages(&src("\"root\""));
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains(r#"`workdir` expects "caller" | "tree_root", got "root""#)),
+            "{msgs:?}"
+        );
+        // An accepted literal is clean; a non-string still names its kind.
+        assert!(messages(&src("\"tree_root\"")).is_empty());
+        assert!(
+            messages(&src("1"))
+                .iter()
+                .any(|m| m.contains(r#"expects "caller" | "tree_root", got int"#))
+        );
+    }
+
+    /// A closed set inside a dict of structs is checked too, and the message
+    /// names the path to the bad literal.
+    #[test]
+    fn a_closed_set_nested_in_a_dict_of_structs_is_flagged() {
+        let src = |v: &str| {
+            format!("target(name = \"t\", driver = \"exec\", cmd = \"c\", variants = {v})\n")
+        };
+        let msgs = messages(&src(r#"{"v": {"buildmode": "bogus"}}"#));
+        assert!(
+            msgs.iter().any(|m| m.starts_with("`variants` expects")
+                && m.ends_with(r#"got map (`v.buildmode`: "bogus")"#)),
+            "{msgs:?}"
+        );
+        assert!(messages(&src(r#"{"v": {"buildmode": "pie"}}"#)).is_empty());
     }
 
     #[test]

@@ -9,7 +9,9 @@
 //! passes through only where heph cannot know (free expressions, locals). One
 //! site prepends instead: the keyword names of a call to a loaded, local or
 //! global function whose parameters heph can read come first, the stock items
-//! (values a positional argument could take) after them. Every
+//! (values a positional argument could take) after them. A field's string
+//! value is decided by the field's type: its string literals replace the stock
+//! items, anything else passes them through. Every
 //! heph completion item carries a text edit over the site's token, a
 //! `filterText` matching what the editor compares against, one kind per site
 //! kind, Markdown documentation and a `sortText` of `0_<name>`; heph filters by
@@ -79,6 +81,10 @@ pub(crate) enum Merge {
     PassThrough,
     /// heph's items ranked first, the stock ones after them ([`prepend`]).
     Prepend,
+    /// Decided by the field's type ([`field_value`]): heph's items when it
+    /// has literals matching the prefix, which replace the stock ones;
+    /// otherwise the stock answer, untouched. Never both.
+    ByField,
 }
 
 /// The stock column of the site table.
@@ -86,6 +92,7 @@ pub(crate) fn merge_for(site: &Site) -> Merge {
     match site {
         Site::None | Site::Callee { .. } => Merge::PassThrough,
         Site::ArgKey { .. } => Merge::Prepend,
+        Site::FieldValue { .. } => Merge::ByField,
         _ => Merge::Replace,
     }
 }
@@ -166,7 +173,9 @@ fn item_kind(site: &Site) -> CompletionItemKind {
         Site::TargetKey { .. } | Site::StateKey { .. } | Site::ArgKey { .. } => {
             CompletionItemKind::FIELD
         }
-        Site::DriverValue { .. } | Site::ProviderValue { .. } => CompletionItemKind::ENUM_MEMBER,
+        Site::DriverValue { .. } | Site::ProviderValue { .. } | Site::FieldValue { .. } => {
+            CompletionItemKind::ENUM_MEMBER
+        }
         Site::PluginNamespace { .. } => CompletionItemKind::MODULE,
         Site::PluginMember { .. } | Site::LoadSymbol { .. } => CompletionItemKind::FUNCTION,
         Site::Address { .. } => CompletionItemKind::REFERENCE,
@@ -178,7 +187,9 @@ fn item_kind(site: &Site) -> CompletionItemKind {
 /// The heph completion items for a site, conventions applied.
 pub(crate) fn items(site: &Site, ctx: &Ctx<'_>) -> Vec<CompletionItem> {
     let (candidates, edit, value): (Vec<Candidate>, Bytes<usize>, Option<&Str>) = match site {
-        Site::None | Site::Callee { .. } => return Vec::new(),
+        // Not a replace site: its items come from `prepend` / `field_value`,
+        // which also see the stock ones.
+        Site::None | Site::Callee { .. } | Site::FieldValue { .. } => return Vec::new(),
         Site::TargetKey { call, edit, .. } => (target_keys(call, ctx), edit.clone(), None),
         Site::StateKey { call, edit, .. } => (state_keys(call, ctx), edit.clone(), None),
         Site::ArgKey { call, edit, .. } => (
@@ -277,6 +288,63 @@ pub(crate) fn prepend(
     out
 }
 
+/// The value completion of a `target(` / `provider_state(` field's string (a
+/// `FieldValue` site): the literals its type accepts, replacing the stock
+/// items, which offer nothing inside a string. A field with no literals, or
+/// none matching the prefix, passes the stock answer through untouched.
+///
+/// A literal that cannot be inserted verbatim between quotes (one holding a
+/// quote, a backslash or a control character) is not offered, and neither is
+/// the empty one (`""`, which a parser may accept as "unset"): it would show
+/// as a blank item.
+pub(crate) fn field_value(
+    site: &Site,
+    ctx: &Ctx<'_>,
+    stock: Vec<CompletionItem>,
+) -> Vec<CompletionItem> {
+    let Site::FieldValue { call, key, value } = site else {
+        return stock;
+    };
+    let key = key.as_str();
+    let field = match call.callee {
+        Builtin::ProviderState => ctx
+            .provider(call)
+            .and_then(|(_, s)| s.fields.iter().find(|f| f.name == key))
+            .map(|f| (f.ty.clone(), f.doc.clone())),
+        _ => target_base_fields()
+            .into_iter()
+            .find(|f| f.name == key)
+            .map(|f| (f.ty, f.doc))
+            .or_else(|| {
+                let (_, schema) = ctx.driver(call)?;
+                let f = schema.fields.iter().find(|f| f.name == key)?;
+                Some((f.ty.clone(), f.doc.clone()))
+            }),
+    };
+    let Some((ty, doc)) = field else {
+        return stock;
+    };
+    let rendered = ty.render();
+    let candidates = ty
+        .literals()
+        .into_iter()
+        .filter(|l| {
+            !l.is_empty()
+                && !l
+                    .chars()
+                    .any(|c| matches!(c, '"' | '\'' | '\\') || c.is_control())
+        })
+        .map(|l| Candidate {
+            label: l.to_string(),
+            detail: Some(format!("{key}: {rendered}")),
+            doc: field_doc(key, &rendered, &doc, false),
+            insert: l.to_string(),
+        })
+        .collect();
+    let out = render(site, candidates, value.edit.clone(), Some(value), ctx);
+    if out.is_empty() { stock } else { out }
+}
+
 /// `candidates` as completion items under the conventions: prefix-filtered,
 /// deduped by label, sorted, each with its text edit over `edit`.
 fn render(
@@ -336,6 +404,7 @@ fn needs_quotes(site: &Site) -> bool {
         site,
         Site::DriverValue { .. }
             | Site::ProviderValue { .. }
+            | Site::FieldValue { .. }
             | Site::Address { .. }
             | Site::LoadPath { .. }
             | Site::LoadSymbol { .. }
@@ -832,7 +901,10 @@ fn hover_markdown(value: String, range: Option<Range>) -> Hover {
 pub(crate) fn hover(site: &Site, ctx: &Ctx<'_>) -> Option<Hover> {
     let (md, range) = match site {
         Site::None | Site::PluginNamespace { .. } | Site::Address { .. } => return None,
-        Site::LoadPath { .. } | Site::LoadSymbol { .. } | Site::ArgKey { .. } => return None,
+        Site::LoadPath { .. }
+        | Site::LoadSymbol { .. }
+        | Site::ArgKey { .. }
+        | Site::FieldValue { .. } => return None,
         Site::Callee { call } => {
             let md = match call.callee {
                 Builtin::ProviderState => {
@@ -1004,7 +1076,7 @@ fn link(origin: Range, path: &Path, line: u32) -> Option<LocationLink> {
 /// `Some(empty)` is heph saying there is nothing to jump to.
 pub(crate) fn definition(site: &Site, ctx: &Ctx<'_>) -> Option<Vec<LocationLink>> {
     match site {
-        Site::None | Site::ArgKey { .. } => None,
+        Site::None | Site::ArgKey { .. } | Site::FieldValue { .. } => None,
         Site::Address { value } => Some(address_definition(value, ctx).into_iter().collect()),
         Site::LoadPath { value } => {
             let origin = ctx.range(&value.token);
@@ -1261,7 +1333,32 @@ mod tests {
 
     #[test]
     fn every_site_has_a_merge_policy() {
+        let merge = |fixture: &str| {
+            let o = fixture.find('│').expect("cursor marker");
+            let text = fixture.replacen('│', "", 1);
+            let tokens = lex::lex(&text);
+            let doc = super::super::site::Doc {
+                text: &text,
+                tokens: &tokens,
+                overlay: None,
+                ast: super::super::site::AstState::Current,
+            };
+            let resolution = super::super::site::resolve(&doc, o);
+            (resolution.site.kind(), merge_for(&resolution.site))
+        };
         assert_eq!(merge_for(&Site::None), Merge::PassThrough);
+        assert_eq!(
+            merge("target(name = \"x\", driver = \"exec\", workdir = \"tr│\")\n"),
+            ("field_value", Merge::ByField)
+        );
+        assert_eq!(
+            merge("def f(alpha):\n    pass\n\nf(al│)\n"),
+            ("arg_key", Merge::Prepend)
+        );
+        assert_eq!(
+            merge("target(name = \"x\", driver = \"ex│\")\n"),
+            ("driver_value", Merge::Replace)
+        );
     }
 
     fn binding(src: &str, name: &str) -> Option<(String, String)> {

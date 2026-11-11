@@ -108,10 +108,11 @@ pub(crate) struct TargetSpec {
     /// (`heph run //x -- a b`) to the command (`"$@"` for `bash`). Without it,
     /// trailing arguments are refused before anything builds.
     pub args: bool,
-    /// With `entrypoint = True`: where the program runs, `"caller"` (the
-    /// caller's cwd, the default), `"root"` (the workspace root) or
-    /// `"sandbox"` (the invocation's own sandbox package dir, as a build runs;
-    /// nothing written there survives the run).
+    /// With `entrypoint = True`: where the program runs. `"caller"` (the
+    /// caller's cwd, the default), `"tree_root"` (the workspace root, in the
+    /// real tree), `"tree_package"` (the target's package dir, in the real
+    /// tree), or `"sandbox"` (the invocation's own sandbox package dir, as a
+    /// build runs; nothing written there survives the run).
     pub workdir: super::entrypoint_mode::Workdir,
     /// What the target reserves from the resource pools while it runs, e.g.
     /// `{"cpu": 2, "memory": "4G"}`. Defaults to 1 cpu. Never hashed: moved

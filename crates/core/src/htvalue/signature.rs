@@ -32,6 +32,11 @@ pub enum ParamType {
     /// field names, each with its own type. All fields are optional: a value
     /// matches if every present key names a known field of matching type.
     Struct(Vec<StructField>),
+    /// Exactly this string. Rendered quoted (`"caller"`); matches only a string
+    /// equal to it. A closed set, e.g. exec's `workdir`, is a
+    /// [`ParamType::Union`] of literals ([`ParamType::one_of`]), rendered
+    /// `"caller" | "tree_root" | …`.
+    Literal(String),
 }
 
 /// One named field of a [`ParamType::Struct`].
@@ -52,9 +57,42 @@ impl ParamType {
         ParamType::Map(Box::new(value))
     }
 
-    /// Convenience: a union accepting any of `types`.
+    /// Convenience: a union accepting any of `types`. A member that is itself
+    /// a union is spliced in and a repeated member dropped, so
+    /// `null | ("a" | "b")` is the flat `null | "a" | "b"` and `a | (a | b)` is
+    /// `a | b` (a mismatch message then sees every container member at one
+    /// level); a single member is returned bare.
     pub fn union(types: Vec<ParamType>) -> ParamType {
-        ParamType::Union(types)
+        let mut flat: Vec<ParamType> = Vec::with_capacity(types.len());
+        let mut add = |t: ParamType| {
+            if !flat.contains(&t) {
+                flat.push(t);
+            }
+        };
+        for t in types {
+            match t {
+                ParamType::Union(inner) => inner.into_iter().for_each(&mut add),
+                t => add(t),
+            }
+        }
+        if flat.len() == 1
+            && let Some(only) = flat.pop()
+        {
+            return only;
+        }
+        ParamType::Union(flat)
+    }
+
+    /// Convenience: exactly the string `s`.
+    pub fn literal(s: impl Into<String>) -> ParamType {
+        ParamType::Literal(s.into())
+    }
+
+    /// Convenience: a closed set of strings — the union of a
+    /// [`ParamType::Literal`] per member, or the one literal when there is
+    /// only one.
+    pub fn one_of<S: Into<String>>(literals: impl IntoIterator<Item = S>) -> ParamType {
+        ParamType::union(literals.into_iter().map(ParamType::literal).collect())
     }
 
     /// Convenience: a struct with the given `(name, type)` fields.
@@ -94,6 +132,27 @@ impl ParamType {
                     .join(", ");
                 format!("struct({rendered})")
             }
+            ParamType::Literal(l) => format!("{l:?}"),
+        }
+    }
+
+    /// The string literals this type accepts as a value, through unions: every
+    /// [`ParamType::Literal`] reachable without entering a container, once
+    /// each, in order. Empty when the type is not (or does not include) a
+    /// literal — a list or map of literals offers nothing for the value itself.
+    pub fn literals(&self) -> Vec<&str> {
+        match self {
+            ParamType::Literal(l) => vec![l.as_str()],
+            ParamType::Union(types) => {
+                let mut out: Vec<&str> = Vec::new();
+                for l in types.iter().flat_map(ParamType::literals) {
+                    if !out.contains(&l) {
+                        out.push(l);
+                    }
+                }
+                out
+            }
+            _ => Vec::new(),
         }
     }
 
@@ -105,6 +164,7 @@ impl ParamType {
         }
         match (self, v) {
             (ParamType::String, Value::String(_)) => true,
+            (ParamType::Literal(l), Value::String(s)) => l == s,
             (ParamType::Bool, Value::Bool(_)) => true,
             (ParamType::Int, Value::Int(_)) => true,
             (ParamType::Uint, Value::Uint(_)) => true,
@@ -123,6 +183,86 @@ impl ParamType {
             _ => false,
         }
     }
+
+    /// The "got …" half of a mismatch of `v` against this type.
+    ///
+    /// A scalar is named by its kind — or, for a string offered where literals
+    /// are accepted, by the string itself, since "expected \"a\" | \"b\", got
+    /// string" names no mistake. A list or map also names the first entry that
+    /// does not match and what it holds, `map (`helper`: "k8s")`, so a typo
+    /// deep in a dict is found without reading the whole type. Quoted strings
+    /// are cut at 64 characters.
+    pub fn describe_mismatch(&self, v: &Value) -> String {
+        match v {
+            Value::Map(_) | Value::List(_) => match self.first_mismatch(v) {
+                Some((path, what)) => format!("{} (`{path}`: {what})", value_kind(v)),
+                None => value_kind(v).to_string(),
+            },
+            _ => self.describe_leaf(v),
+        }
+    }
+
+    /// A scalar mismatch: the string itself where literals are accepted,
+    /// otherwise the value's kind.
+    fn describe_leaf(&self, v: &Value) -> String {
+        match v {
+            Value::String(s) if !self.literals().is_empty() => format!("{:?}", capped(s)),
+            _ => value_kind(v).to_string(),
+        }
+    }
+
+    /// The path to the first entry of container `v` that does not match, and
+    /// what is there. `None` when the container's own shape is the mismatch,
+    /// or a union has more than one member of that shape (descending into the
+    /// wrong one would name the wrong entry). Map keys are visited in sorted
+    /// order, so the answer does not depend on hash order.
+    fn first_mismatch(&self, v: &Value) -> Option<(String, String)> {
+        let ty = match self {
+            ParamType::Union(types) => {
+                let mut fits = types.iter().filter(|t| t.holds_shape_of(v));
+                let only = fits.next()?;
+                if fits.next().is_some() {
+                    return None;
+                }
+                only
+            }
+            ty => ty,
+        };
+        let step = |seg: String, ty: &ParamType, e: &Value| match ty.first_mismatch(e) {
+            Some((rest, what)) => (join_path(seg, &rest), what),
+            None => (seg, ty.describe_leaf(e)),
+        };
+        match (ty, v) {
+            (ParamType::List(inner), Value::List(items)) => items
+                .iter()
+                .enumerate()
+                .find(|(_, e)| !inner.matches(e))
+                .map(|(i, e)| step(format!("[{i}]"), inner, e)),
+            (ParamType::Map(inner), Value::Map(m)) => sorted(m)
+                .into_iter()
+                .find(|(_, e)| !inner.matches(e))
+                .map(|(k, e)| step(capped(k).into_owned(), inner, e)),
+            (ParamType::Struct(fields), Value::Map(m)) => {
+                sorted(m).into_iter().find_map(|(k, e)| {
+                    match fields.iter().find(|f| &f.name == k) {
+                        None => Some((capped(k).into_owned(), "unknown field".to_string())),
+                        Some(f) if !f.ty.matches(e) => Some(step(capped(k).into_owned(), &f.ty, e)),
+                        Some(_) => None,
+                    }
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether `v` has the container shape this (non-union) type describes.
+    fn holds_shape_of(&self, v: &Value) -> bool {
+        matches!(
+            (self, v),
+            (ParamType::List(_), Value::List(_))
+                | (ParamType::Map(_) | ParamType::Struct(_), Value::Map(_))
+        )
+    }
 }
 
 /// The value-kind name of `v`, for error messages.
@@ -136,6 +276,37 @@ fn value_kind(v: &Value) -> &'static str {
         Value::Null() => "null",
         Value::Map(_) => "map",
         Value::List(_) => "list",
+    }
+}
+
+/// The longest user string a mismatch message quotes, in characters.
+const QUOTE_CAP: usize = 64;
+
+/// `s`, cut to [`QUOTE_CAP`] characters with a trailing `…` when longer.
+fn capped(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.chars().nth(QUOTE_CAP).is_some() {
+        let mut out: String = s.chars().take(QUOTE_CAP).collect();
+        out.push('…');
+        out.into()
+    } else {
+        s.into()
+    }
+}
+
+/// `m`'s entries in key order, so a message does not depend on hash order.
+fn sorted(m: &HashMap<String, Value>) -> Vec<(&String, &Value)> {
+    let mut entries: Vec<(&String, &Value)> = m.iter().collect();
+    entries.sort_unstable_by_key(|(k, _)| *k);
+    entries
+}
+
+/// `inner` appended to the path `outer`: `a` + `b` is `a.b`, `a` + `[0]` is
+/// `a[0]`.
+fn join_path(outer: String, inner: &str) -> String {
+    if inner.starts_with('[') {
+        outer + inner
+    } else {
+        format!("{outer}.{inner}")
     }
 }
 
@@ -236,7 +407,7 @@ impl FnSignature {
                             "{fn_display}: positional argument `{}` expected {}, got {}",
                             param.name,
                             param.ty.render(),
-                            value_kind(&v)
+                            param.ty.describe_mismatch(&v)
                         );
                     }
                     out_positional.push(v);
@@ -260,7 +431,7 @@ impl FnSignature {
                         "{fn_display}: variadic argument `{}` expected {}, got {}",
                         var.name,
                         var.ty.render(),
-                        value_kind(&v)
+                        var.ty.describe_mismatch(&v)
                     );
                 }
                 out_positional.push(v);
@@ -276,7 +447,7 @@ impl FnSignature {
                             "{fn_display}: argument `{}` expected {}, got {}",
                             param.name,
                             param.ty.render(),
-                            value_kind(&v)
+                            param.ty.describe_mismatch(&v)
                         );
                     }
                     out_named.insert(param.name.to_string(), v);
@@ -305,7 +476,7 @@ impl FnSignature {
             anyhow::bail!(
                 "{fn_display}: return value expected {}, got {}",
                 self.returns.render(),
-                value_kind(v)
+                self.returns.describe_mismatch(v)
             );
         }
         Ok(())
@@ -335,6 +506,150 @@ mod tests {
             Value::Bool(true)
         )]))));
         assert!(!ty.matches(&Value::Int(3)));
+    }
+
+    #[test]
+    fn a_union_of_literals_renders_quoted_and_matches_only_its_literals() {
+        let ty = ParamType::one_of(["caller", "tree_root"]);
+        assert_eq!(ty.render(), r#""caller" | "tree_root""#);
+        assert!(ty.matches(&Value::String("tree_root".to_string())));
+        // The near miss, a prefix, and the empty string are all refused.
+        for bad in ["root", "tree_roo", "tree_root_", "", "Caller"] {
+            assert!(!ty.matches(&Value::String(bad.to_string())), "{bad}");
+        }
+        assert!(!ty.matches(&Value::Bool(true)));
+
+        // Nested in another union, the literals splice in flat: they and the
+        // other members both render and match.
+        let u = ParamType::union(vec![ParamType::Bool, ty.clone()]);
+        assert_eq!(
+            u,
+            ParamType::Union(vec![
+                ParamType::Bool,
+                ParamType::literal("caller"),
+                ParamType::literal("tree_root"),
+            ])
+        );
+        assert_eq!(u.render(), r#"bool | "caller" | "tree_root""#);
+        assert!(u.matches(&Value::Bool(false)));
+        assert!(u.matches(&Value::String("caller".to_string())));
+        assert_eq!(u.literals(), ["caller", "tree_root"]);
+        // A list of literals offers nothing for the value itself.
+        assert!(ParamType::list(ty).literals().is_empty());
+        assert!(ParamType::String.literals().is_empty());
+    }
+
+    /// A set of one is just its literal, and the empty string is a literal
+    /// like any other.
+    #[test]
+    fn a_single_literal_is_not_wrapped_in_a_union() {
+        assert_eq!(ParamType::one_of(["only"]), ParamType::literal("only"));
+        let ty = ParamType::literal("");
+        assert_eq!(ty.render(), r#""""#);
+        assert!(ty.matches(&Value::String(String::new())));
+        assert!(!ty.matches(&Value::String(" ".to_string())));
+        assert_eq!(ty.literals(), [""]);
+        // A literal repeated across members is offered once.
+        let dup = ParamType::Union(vec![ParamType::literal("a"), ParamType::one_of(["a", "b"])]);
+        assert_eq!(dup.literals(), ["a", "b"]);
+    }
+
+    #[test]
+    fn a_wrong_literal_names_the_string_it_got() {
+        let sig = FnSignature {
+            positional: vec![],
+            named: vec![Param::required("mode", ParamType::one_of(["a", "b"]))],
+            variadic: None,
+            returns: ParamType::Null,
+        };
+        let err = sig
+            .validate_args(
+                "f",
+                vec![],
+                HashMap::from([("mode".to_string(), Value::String("c".to_string()))]),
+            )
+            .unwrap_err();
+        assert_eq!(
+            format!("{err:#}"),
+            r#"f: argument `mode` expected "a" | "b", got "c""#
+        );
+    }
+
+    fn s(v: &str) -> Value {
+        Value::String(v.to_string())
+    }
+
+    fn map(pairs: &[(&str, Value)]) -> Value {
+        Value::Map(
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect(),
+        )
+    }
+
+    /// A container names the first entry that does not match, through a
+    /// union, a struct, a map and a list, in sorted key order.
+    #[test]
+    fn a_container_mismatch_names_the_offending_path_and_value() {
+        let dialect = ParamType::one_of(["aws", "docker"]);
+        let present = ParamType::strukt(vec![
+            ("env", ParamType::map(ParamType::String)),
+            (
+                "helper",
+                ParamType::union(vec![
+                    dialect.clone(),
+                    ParamType::strukt(vec![("dialect", dialect)]),
+                ]),
+            ),
+        ]);
+        let v = map(&[("helper", s("k8s"))]);
+        assert_eq!(present.describe_mismatch(&v), r#"map (`helper`: "k8s")"#);
+        // Into the union's struct member, then its literal field.
+        let v = map(&[("helper", map(&[("dialect", s("gcp"))]))]);
+        assert_eq!(
+            present.describe_mismatch(&v),
+            r#"map (`helper.dialect`: "gcp")"#
+        );
+        // An unknown key, and the first offender in sorted order.
+        let v = map(&[("zzz", s("x")), ("env", map(&[("B", Value::Int(1))]))]);
+        assert_eq!(present.describe_mismatch(&v), "map (`env.B`: int)");
+        let v = map(&[("bogus", s("x"))]);
+        assert_eq!(
+            present.describe_mismatch(&v),
+            "map (`bogus`: unknown field)"
+        );
+        // A list index, and a map of lists.
+        let ty = ParamType::map(ParamType::list(ParamType::String));
+        let v = map(&[("a", Value::List(vec![s("ok"), Value::Bool(true)]))]);
+        assert_eq!(ty.describe_mismatch(&v), "map (`a[1]`: bool)");
+        // The container's own shape is the mismatch: just its kind.
+        assert_eq!(ParamType::String.describe_mismatch(&map(&[])), "map");
+        // Two union members of the container's shape: no guess.
+        let ambiguous = ParamType::union(vec![
+            ParamType::map(ParamType::Bool),
+            ParamType::map(ParamType::Int),
+        ]);
+        assert_eq!(ambiguous.describe_mismatch(&map(&[("a", s("x"))])), "map");
+        // Scalars keep their kind.
+        assert_eq!(ParamType::String.describe_mismatch(&Value::Int(1)), "int");
+    }
+
+    /// A quoted user string is cut at 64 characters, by character, not byte.
+    #[test]
+    fn a_quoted_mismatch_is_capped() {
+        let ty = ParamType::literal("a");
+        let exact = "é".repeat(64);
+        assert_eq!(ty.describe_mismatch(&s(&exact)), format!("{exact:?}"));
+        let long = "é".repeat(65);
+        assert_eq!(ty.describe_mismatch(&s(&long)), format!("\"{exact}…\""));
+        // A key on the path is capped too.
+        let key = "k".repeat(70);
+        let v = map(&[(key.as_str(), s("x"))]);
+        assert_eq!(
+            ParamType::map(ty).describe_mismatch(&v),
+            format!("map (`{}…`: \"x\")", "k".repeat(64))
+        );
     }
 
     #[test]

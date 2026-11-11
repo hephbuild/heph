@@ -201,6 +201,7 @@ pub fn param_type_to_pb(t: &ParamType) -> pb::ParamType {
     let scalar = |s: Scalar| Kind::Scalar(EnumValue::from(s));
     let kind = match t {
         ParamType::String => scalar(Scalar::String),
+        ParamType::Literal(l) => Kind::Literal(l.clone()),
         ParamType::Bool => scalar(Scalar::Bool),
         ParamType::Int => scalar(Scalar::Int),
         ParamType::Uint => scalar(Scalar::Uint),
@@ -235,7 +236,9 @@ pub fn param_type_to_pb(t: &ParamType) -> pb::ParamType {
 /// plugin never declared.
 pub fn param_type_from_pb(t: pb::ParamType) -> anyhow::Result<ParamType> {
     use pb::param_type::{Kind, Scalar};
-    Ok(match required(t.kind, "ParamType.kind")? {
+    let kind = required(t.kind, "ParamType.kind")?;
+    Ok(match kind {
+        Kind::Literal(l) => ParamType::Literal(l),
         Kind::Scalar(s) => match known_enum(s, "ParamType.scalar")? {
             Scalar::String => ParamType::String,
             Scalar::Bool => ParamType::Bool,
@@ -247,7 +250,8 @@ pub fn param_type_from_pb(t: pb::ParamType) -> anyhow::Result<ParamType> {
         },
         Kind::List(inner) => ParamType::list(param_type_from_pb(*inner)?),
         Kind::Map(value) => ParamType::map(param_type_from_pb(*value)?),
-        Kind::Union(u) => ParamType::union(
+        // As sent: the union is the sender's, not re-normalized here.
+        Kind::Union(u) => ParamType::Union(
             u.types
                 .into_iter()
                 .map(param_type_from_pb)
@@ -2274,6 +2278,29 @@ mod tests {
         assert_eq!(
             param_type_from_pb(param_type_to_pb(&ty)).expect("decode"),
             ty
+        );
+    }
+
+    /// Literals cross the seam as oneof members, through unions and
+    /// containers, the empty string included: a present `literal = ""` is a
+    /// literal, not a missing kind.
+    #[test]
+    fn param_type_literals_roundtrip_including_the_empty_string() {
+        let set = ParamType::one_of(["caller", "tree_root", ""]);
+        for ty in [
+            set.clone(),
+            ParamType::literal(""),
+            ParamType::union(vec![ParamType::Bool, ParamType::list(set.clone())]),
+            ParamType::map(ParamType::strukt(vec![("buildmode", set)])),
+        ] {
+            let wire = param_type_to_pb(&ty).encode_to_vec();
+            let back =
+                param_type_from_pb(crate::decode(&wire).expect("wire decode")).expect("decode");
+            assert_eq!(back, ty, "{}", ty.render());
+        }
+        assert_eq!(
+            param_type_to_pb(&ParamType::literal("")).kind,
+            Some(pb::param_type::Kind::Literal(String::new()))
         );
     }
 
