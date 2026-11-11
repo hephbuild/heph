@@ -654,7 +654,7 @@ pub mod targetdef {
         /// to the failure slot, never into a cache entry. A driver keeps it off
         /// its own def (and its def hash) and never merges it into
         /// [`outputs`](Self::outputs). Crosses the plugin ABI as
-        /// `pb::TargetDef.failure_outputs` (since 0.20.0); a def from an older
+        /// `pb::TargetDef.failure_outputs` (since 0.21.0); a def from an older
         /// plugin decodes empty. Skipped when empty, so `inspect def --json`
         /// of every other target is unchanged.
         #[serde(skip_serializing_if = "Vec::is_empty")]

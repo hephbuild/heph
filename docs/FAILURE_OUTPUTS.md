@@ -276,8 +276,8 @@ This changes what existing targets do.
   gets a new def hash once and runs again on the first build after upgrading.
   plugin-go's def hashes do not move, `go_format` and the lint-fix driver
   included. Nothing else moves.
-- **Every plugin cdylib must be rebuilt.** The plugin ABI is now 0.20.0, and
-  the host refuses a plugin built against 0.19. See
+- **Every plugin cdylib must be rebuilt.** The plugin ABI is now 0.21.0, and
+  the host refuses a plugin built against 0.20. See
   `crates/plugin-stabby/ABI_VERSIONING.md`.
 - **An older heph removes a newer slot.** A heph from before this change reads
   a slot with `out/` or `fixes.txt` but no `log.txt` as litter and deletes it.

@@ -108,7 +108,7 @@ stops every run.
 The run's token says why it was cancelled. The engine cancels a timed-out
 run's token as timed out (`Cancellable::timed_out`), and the host sends a
 cdylib's run `StableCancel::cancel_timed_out(cancel_key)` rather than
-`cancel` (ABI 0.20.0), so the plugin's token reads the same. That is how the
+`cancel` (ABI 0.21.0), so the plugin's token reads the same. That is how the
 managed layer keeps a timed-out run's `failure_out` and nothing of a
 cancelled one's.
 

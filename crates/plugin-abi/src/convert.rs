@@ -1883,7 +1883,7 @@ pub fn run_failure_from_pb(failure: pb::RunFailure) -> anyhow::Error {
         None => anyhow::Error::msg(message),
     };
     let err = hplugin::error::with_failure_artifacts(err, failure_artifacts_from_pb(artifacts));
-    // Absent — what every plugin before 0.20.0 sends — is no write-back.
+    // Absent — what every plugin before 0.21.0 sends — is no write-back.
     hplugin::error::with_failure_write_back(err, failure_artifacts_from_pb(write_back))
 }
 
@@ -1905,7 +1905,7 @@ pub fn target_def_from_pb(td: pb::TargetDef) -> anyhow::Result<TargetDef> {
                 .into_iter()
                 .map(output_from_pb)
                 .collect::<anyhow::Result<_>>()?,
-            // Absent — what every plugin before 0.20.0 sends — is none.
+            // Absent — what every plugin before 0.21.0 sends — is none.
             failure_outputs: td
                 .failure_outputs
                 .into_iter()
@@ -3746,7 +3746,7 @@ nested: { a: 1, b: [x, y] }
         out
     }
 
-    /// D7, D6: bytes from a 0.19 peer — a `TargetDef` without field 14 and a
+    /// D7, D6: bytes from a 0.20 peer — a `TargetDef` without field 14 and a
     /// `RunFailure` without field 5, every other field as sent — decode to no
     /// failure outputs and no write-back, and lose nothing else.
     #[test]

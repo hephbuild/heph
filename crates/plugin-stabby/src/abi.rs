@@ -318,7 +318,7 @@ pub trait StableHook {
 /// subprocess (`run`) stops, exactly as for an in-process target. `request_id` is
 /// the id carried in each request message; it must be unique per in-flight call.
 ///
-/// `cancel_timed_out(cancel_key)` (ABI 0.20.0) is the same cancel for a run
+/// `cancel_timed_out(cancel_key)` (ABI 0.21.0) is the same cancel for a run
 /// the host stopped because it outlasted its `timeout`: the plugin cancels
 /// that run's token as timed out, so the driver's
 /// `Cancellable::timed_out` reads what the host's did. Only by a run's
