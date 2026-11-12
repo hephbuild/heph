@@ -1247,8 +1247,8 @@ mod tests {
         let sandbox = tempfile::tempdir().expect("sandbox");
         let slots = FailureSlots::new(home.path());
         let a = addr("//p:a");
-        let staging = stage(sandbox.path());
-        let err = with_failure_artifacts(anyhow::anyhow!("boom"), vec![out_artifact(&staging)]);
+        let staged_tar = stage(sandbox.path());
+        let err = with_failure_artifacts(anyhow::anyhow!("boom"), vec![out_artifact(&staged_tar)]);
         let slot = fill_ops(&slots, &a, sandbox.path(), &err, false, SlotIo::REAL).await;
         assert!(slot.log.is_none());
         assert!(slot.out_error.is_none(), "{:?}", slot.out_error);
@@ -1259,7 +1259,7 @@ mod tests {
             b"zip"
         );
         assert!(!dir.join(LOG).exists());
-        assert!(!staging.exists(), "the owned tar is freed once unpacked");
+        assert!(!staged_tar.exists(), "the owned tar is freed once unpacked");
         assert_eq!(slots.read(&a).map(|m| m.addr), Some(a.format()));
         slots.clear(&a).await;
         assert!(!dir.exists(), "cleared with its out/");
@@ -1268,11 +1268,11 @@ mod tests {
         let m = addr("//auth:fetch");
         let log = sandbox.path().join("log.txt");
         std::fs::write(&log, "secret-ish\n").expect("log");
-        let staging = stage(sandbox.path());
+        let staged_tar = stage(sandbox.path());
         let err = with_failure_artifacts(
             anyhow::anyhow!("boom"),
             vec![
-                out_artifact(&staging),
+                out_artifact(&staged_tar),
                 log_file_artifact(&log).expect("artifact"),
             ],
         );
@@ -1288,7 +1288,7 @@ mod tests {
     /// The tar is read only when it is a regular file inside the sandbox:
     /// anything else is left where it is, and no slot is made.
     #[tokio::test]
-    async fn refuses_a_staging_dir_outside_the_sandbox() {
+    async fn refuses_a_tar_outside_the_sandbox() {
         let home = tempfile::tempdir().expect("home");
         let sandbox = tempfile::tempdir().expect("sandbox");
         let outside = tempfile::tempdir().expect("outside");
@@ -1331,10 +1331,10 @@ mod tests {
             let sandbox = tempfile::tempdir().expect("sandbox");
             let slots = FailureSlots::new(home.path());
             let a = addr("//p:a");
-            let staging = stage(sandbox.path());
+            let staged_tar = stage(sandbox.path());
             let err = with_failure_artifacts(
                 anyhow::anyhow!("the target's own error"),
-                vec![out_artifact(&staging), raw_log(b"why\n")],
+                vec![out_artifact(&staged_tar), raw_log(b"why\n")],
             );
             let slot = fill_ops(&slots, &a, sandbox.path(), &err, false, ops).await;
             assert!(slot.out.is_none(), "{name}");
@@ -1344,7 +1344,7 @@ mod tests {
             assert_eq!(log.tail().expect("tail").text, "why", "{name}");
             let dir = slots.slot_dir(&a);
             assert!(!dir.join(OUT).exists(), "{name}: no partial out/");
-            assert!(!staging.exists(), "{name}: the owned tar is freed");
+            assert!(!staged_tar.exists(), "{name}: the owned tar is freed");
             assert!(slots.read(&a).is_some(), "{name}");
             let e = err.context(slot);
             assert_eq!(
@@ -1355,10 +1355,10 @@ mod tests {
 
             // Nothing but `out/` to keep: no slot, and still the error.
             let b = addr("//p:b");
-            let staging = stage(sandbox.path());
+            let staged_tar = stage(sandbox.path());
             let err = with_failure_artifacts(
                 anyhow::anyhow!("the target's own error"),
-                vec![out_artifact(&staging)],
+                vec![out_artifact(&staged_tar)],
             );
             let slot = fill_ops(&slots, &b, sandbox.path(), &err, false, ops).await;
             assert!(slot.out.is_none() && slot.log.is_none(), "{name}");
@@ -1373,22 +1373,22 @@ mod tests {
     }
 
     /// A run with no log on disk — a material target — and fixes written
-    /// keeps its `fixes.txt` when moving `out/` fails: the slot is kept
+    /// keeps its `fixes.txt` when unpacking `out/` fails: the slot is kept
     /// without `out/`, not dropped.
     #[tokio::test]
-    async fn failed_output_move_keeps_a_no_log_slots_fixes() {
+    async fn failed_unpack_keeps_a_no_log_slots_fixes() {
         use hplugin::error::FailureFixes;
         let home = tempfile::tempdir().expect("home");
         let sandbox = tempfile::tempdir().expect("sandbox");
         let slots = FailureSlots::new(home.path());
         let a = addr("//auth:fetch");
-        let staging = stage(sandbox.path());
+        let staged_tar = stage(sandbox.path());
         let log = sandbox.path().join("log.txt");
         std::fs::write(&log, "secret-ish\n").expect("log");
         let err = with_failure_artifacts(
             anyhow::anyhow!("boom"),
             vec![
-                out_artifact(&staging),
+                out_artifact(&staged_tar),
                 log_file_artifact(&log).expect("artifact"),
             ],
         );
@@ -1446,10 +1446,10 @@ mod tests {
         let a = addr("//p:a");
         let link = links.path().join("latest.html");
         std::os::unix::fs::symlink("index.html", &link).expect("symlink");
-        let staging = stage_with(sandbox.path(), |tar| {
+        let staged_tar = stage_with(sandbox.path(), |tar| {
             tar.create_file(link.to_str().expect("utf-8"), "pkg/report/latest.html");
         });
-        let err = with_failure_artifacts(anyhow::anyhow!("boom"), vec![out_artifact(&staging)]);
+        let err = with_failure_artifacts(anyhow::anyhow!("boom"), vec![out_artifact(&staged_tar)]);
         let slot = fill_ops(&slots, &a, sandbox.path(), &err, false, SlotIo::REAL).await;
         let out = slot.out.expect("unpacked");
         assert!(slot.out_error.is_none(), "{:?}", slot.out_error);
@@ -1465,10 +1465,10 @@ mod tests {
             std::fs::symlink_metadata(out.join("pkg/report/latest.html")).is_err(),
             "a link member is never unpacked"
         );
-        assert!(!staging.exists(), "the owned tar is freed");
+        assert!(!staged_tar.exists(), "the owned tar is freed");
 
-        let staging = stage(sandbox.path());
-        let mut borrowed = out_artifact(&staging);
+        let staged_tar = stage(sandbox.path());
+        let mut borrowed = out_artifact(&staged_tar);
         if let Content::TarPath(t) = &mut borrowed.content {
             t.owned = false;
         }
@@ -1476,7 +1476,7 @@ mod tests {
         let slot = fill_ops(&slots, &a, sandbox.path(), &err, false, SlotIo::REAL).await;
         assert!(slot.out.is_some());
         assert!(
-            staging.is_file(),
+            staged_tar.is_file(),
             "a borrowed tar is the driver's to remove"
         );
     }
@@ -1615,10 +1615,10 @@ mod tests {
         let sandbox = tempfile::tempdir().expect("sandbox");
         let slots = FailureSlots::new(home.path());
         let a = addr("//p:a");
-        let staging = stage(sandbox.path());
+        let staged_tar = stage(sandbox.path());
         let err = with_failure_artifacts(
             anyhow::anyhow!("boom"),
-            vec![out_artifact(&staging), raw_log(b"why\n")],
+            vec![out_artifact(&staged_tar), raw_log(b"why\n")],
         );
         tokio::select! {
             _ = fill_ops(&slots, &a, sandbox.path(), &err, false, gated) => {

@@ -401,6 +401,20 @@ pub(crate) fn tar_files(a: &OutputArtifact) -> std::collections::BTreeMap<String
         .collect()
 }
 
+/// The `failure_out` tars packed under `sandbox`, sorted.
+#[cfg(test)]
+pub(crate) fn packed(sandbox: &Path) -> Vec<String> {
+    let dir = sandbox.join(crate::driver_managed::COLLECT_ARTIFACTS_DIR);
+    let mut v: Vec<String> = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(FAILURE_OUT_TAR_PREFIX))
+        .collect();
+    v.sort();
+    v
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -437,19 +451,6 @@ mod tests {
             &|| false,
         )
         .expect("collect")
-    }
-
-    /// The `failure_out` tars packed under `sandbox`.
-    fn packed(sandbox: &Path) -> Vec<String> {
-        let dir = sandbox.join(crate::driver_managed::COLLECT_ARTIFACTS_DIR);
-        let mut v: Vec<String> = fs::read_dir(dir)
-            .into_iter()
-            .flatten()
-            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
-            .filter(|n| n.starts_with(FAILURE_OUT_TAR_PREFIX))
-            .collect();
-        v.sort();
-        v
     }
 
     /// Files and directories land at their workspace-relative path; a glob
@@ -501,7 +502,7 @@ mod tests {
 
     /// Nothing matched: no artifact, and no tar packed.
     #[test]
-    fn nothing_matched_leaves_no_staging() {
+    fn nothing_matched_packs_no_tar() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let ws = tmp.path().join("ws");
         fs::create_dir_all(&ws).expect("mkdir");

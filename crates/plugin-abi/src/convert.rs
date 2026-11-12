@@ -1203,7 +1203,7 @@ fn failure_output_to_pb(o: &FailureOutput) -> pb::FailureOutput {
 /// Each path's `content` is required, as `Path.content` is, and must be
 /// workspace-relative: every component a plain name. An absolute path, a `..`
 /// or a `.` is never a valid `failure_out` path, and could reach out of the
-/// staging directory the managed layer copies into.
+/// sandbox's workspace the managed layer collects it from.
 fn failure_output_from_pb(o: pb::FailureOutput) -> anyhow::Result<FailureOutput> {
     Ok(FailureOutput {
         group: o.group.unwrap_or_default(),

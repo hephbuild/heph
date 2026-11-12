@@ -508,7 +508,11 @@ pub const COLLECT_ARTIFACTS_DIR: &str = "heph-collect-artifacts";
 /// **Lenient**, unlike [`collect_outputs`]: a declared file or directory the
 /// run never wrote is skipped, so a fixer that died before one file keeps
 /// every other fix. A path that exists with the wrong kind is still an error.
-/// A group none of whose paths exist packs nothing.
+///
+/// A group that adds no file — none of its paths exist, or every file is
+/// `excluded` — packs no tar and returns no artifact for it. Nothing is
+/// written under the sandbox for that group, so [`pack_to_artifact_tar`]'s
+/// guard against a removed sandbox (its `create_dir`) never runs for it.
 ///
 /// A file `excluded` matches (the target's `failure_out`) is never packed: a
 /// diagnostic is kept in the failure slot, and must not land in the tree as

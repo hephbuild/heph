@@ -1076,11 +1076,12 @@ pub mod outputartifact {
     #[derive(Clone, Debug)]
     pub struct ContentPath {
         pub path: String,
-        /// True when `path` is a temp file the driver produced *for* the local
-        /// cache and will never read again — a sandbox-collected output tar. The
+        /// True when `path` is a temp file the driver produced for the engine
+        /// and will never read again. For a sandbox-collected output tar, the
         /// cache write may then hand the file over whole (a rename, no bytes
         /// copied) instead of streaming it, and `path` is gone once the write
-        /// returns.
+        /// returns. For a `failure_out` tar, the engine frees it once it is
+        /// unpacked into the failure slot.
         ///
         /// Leave false for anything the producer still owns: the engine copies
         /// out of it and the file is untouched. Like

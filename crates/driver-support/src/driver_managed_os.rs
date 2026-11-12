@@ -395,22 +395,9 @@ mod tests {
         // The same run cancelled by its request.
         let (err, sandbox) = run("cancelled", false).await?;
         assert!(hplugin::error::failure_out_tar(&err).is_none());
-        assert!(!has_failure_out_tar(&sandbox));
+        assert!(crate::failure_out::packed(&sandbox).is_empty());
         assert!(hplugin::error::failure_write_back(&err).is_none());
         Ok(())
-    }
-
-    /// Whether a `failure_out` tar was packed under `sandbox`.
-    fn has_failure_out_tar(sandbox: &std::path::Path) -> bool {
-        fs::read_dir(sandbox.join(crate::driver_managed::COLLECT_ARTIFACTS_DIR))
-            .into_iter()
-            .flatten()
-            .flatten()
-            .any(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .starts_with(crate::failure_out::FAILURE_OUT_TAR_PREFIX)
-            })
     }
 
     /// A def in `//app` that keeps `app/report.txt` on failure.
@@ -477,7 +464,10 @@ mod tests {
         ] {
             let (err, sandbox) = run(name, fail, cancel, shell).await?;
             assert!(hplugin::error::failure_out_tar(&err).is_none(), "{name}");
-            assert!(!has_failure_out_tar(&sandbox), "{name}: nothing packed");
+            assert!(
+                crate::failure_out::packed(&sandbox).is_empty(),
+                "{name}: nothing packed"
+            );
             assert!(
                 sandbox.join("ws/app/report.txt").exists(),
                 "{name}: the run did write it"

@@ -39,7 +39,6 @@ fn sandbox_ws(engine: &Engine, pkg: &str, name: &str) -> PathBuf {
         .join("ws")
 }
 
-/// The names directly under `failures/`, slots and temporaries alike.
 /// Whether a `failure_out` tar (`heph-collect-artifacts/failureout-*`) is
 /// under the run's sandbox.
 fn packs_failure_out(sandbox: &Path) -> bool {
@@ -50,6 +49,7 @@ fn packs_failure_out(sandbox: &Path) -> bool {
     })
 }
 
+/// The names directly under `failures/`, slots and temporaries alike.
 fn slot_root_names(engine: &Engine) -> Vec<String> {
     let root = engine.failure_slots().root();
     if !root.exists() {

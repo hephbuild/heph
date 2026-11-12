@@ -246,11 +246,10 @@ impl Engine {
                     Err(err) => {
                         // The run is over: its capacity goes back before
                         // the engine keeps anything (D17). The managed layer
-                        // already copied `failure_out` into its staging dir
-                        // inside the run, under the reservation; what is left
-                        // — the write-back and moving the staged dir into the
-                        // slot, a rename unless it crosses filesystems — holds
-                        // no pool.
+                        // already packed `failure_out` into a tar in the
+                        // sandbox inside the run, under the reservation; what
+                        // is left — the write-back and unpacking that tar into
+                        // the slot — holds no pool.
                         drop(reservation.take());
                         // The sandbox is kept for diagnostics: nothing may be
                         // queued against it. The tree survives until this
@@ -258,7 +257,7 @@ impl Engine {
                         // Resolved before the fill is awaited (D17): a
                         // cancellation during the fill must not drop the
                         // teardown and queue a reclaim under the blocking job
-                        // still moving the staged outputs out of it.
+                        // still unpacking the `failure_out` tar out of it.
                         //
                         // Unless the outputs are material, in which case the
                         // diagnostic is not worth the secret it would leave on

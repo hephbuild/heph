@@ -83,11 +83,18 @@ the paths in the BUILD file; the slot does not split by group.
 - **A path that matches nothing is skipped**, not an error. Playwright writes
   `test-results/` only for some failures.
 - **Symlinks do not leave the sandbox.** A symlink pointing outside the sandbox
-  is not followed, as for the log.
+  is not followed, as for the log. One inside it is kept as the file it points
+  to, or as the whole directory when the link is the declared path or a glob
+  match itself.
+- **Globs are bounded.** A `failure_out` glob walks from its literal prefix,
+  never through a linked directory, and only as deep as the pattern can match:
+  `*.txt` reads the package directory, not every input staged below it. This is
+  the `failure_out` walk only; `out` globs are collected as they always were.
 - **Packed, then unpacked: never linked.** The matches are packed into a tar in
-  the sandbox (`heph-collect-artifacts/failureout-*.tar`) by the same walker
-  and packer as outputs, and the engine unpacks it into the slot and deletes
-  it. Every file in the slot is a new inode, never a hardlink or a move, so
+  the sandbox (`heph-collect-artifacts/failureout-*.tar`) by the same packer
+  as outputs, and the engine unpacks it into the slot and deletes it. Only
+  file members are unpacked, never a link, and only at a plain relative path.
+  Every file in the slot is a new inode, never a hardlink or a move, so
   editing a file in the slot cannot change an input staged for another run.
   A tar holds files: an empty directory is not kept, and neither is a file
   whose name is not UTF-8.
