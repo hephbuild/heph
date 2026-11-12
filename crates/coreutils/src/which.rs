@@ -1,25 +1,30 @@
 //! `which` — where a command on `PATH` comes from.
 //!
-//! Not part of coreutils, so uutils has no applet for it. GNU `which` and BSD
-//! `which` agree on the useful core (`-a`, `-s`, exit 1 when anything is
-//! missing), and that core is what ships. Resolution is the `which` crate's,
-//! against the `PATH` this process was given, so inside a target it answers
-//! for the target's `PATH` — builtins included — not the host's.
+//! Not part of coreutils, so uutils has no applet for it. This follows BSD
+//! `which`, the one macOS ships: `-a`, `-s`, options only before the first
+//! name, a name containing `/` checked as given and printed verbatim, and exit
+//! 1 for anything short of every name found (usage errors included).
+//!
+//! Lookup on `PATH` is the `which` crate's, against the `PATH` this process
+//! was given, so inside a target it answers for the target's `PATH` —
+//! builtins included — not the host's. One departure from BSD comes with it:
+//! a match through a *relative* `PATH` entry is printed absolute.
 
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 
 const OK: i32 = 0;
-const NOT_FOUND: i32 = 1;
-const USAGE: i32 = 2;
+const FAILED: i32 = 1;
 
 const HELP: &str = "usage: which [-as] program ...\n\
      \n\
      Prints the path each program resolves to on PATH.\n\
      -a  print every match, not just the first\n\
      -s  print nothing; only set the exit status\n\
-     Exits 1 if any program is not found.";
+     Exits 1 unless every program is found.";
 
 pub(crate) fn main(argv: Vec<OsString>) -> i32 {
     let cwd = std::env::current_dir().unwrap_or_default();
@@ -39,20 +44,17 @@ fn run(
 ) -> i32 {
     let mut all = false;
     let mut silent = false;
-    let mut names = Vec::new();
-    let mut flags_done = false;
-    for arg in argv.iter().skip(1) {
-        let bytes = arg.as_encoded_bytes();
-        let flags = match bytes.strip_prefix(b"-") {
-            Some(rest) if !flags_done && !rest.is_empty() => rest,
-            _ => {
-                names.push(arg);
-                continue;
-            }
+    let mut args = argv.iter().skip(1).peekable();
+    // Options end at the first name or at `--`, as in grep: `which tool -s`
+    // looks up a program called `-s`.
+    while let Some(&arg) = args.peek() {
+        let bytes = arg.as_bytes();
+        let Some(flags) = bytes.strip_prefix(b"-").filter(|f| !f.is_empty()) else {
+            break;
         };
+        args.next();
         if bytes == b"--" {
-            flags_done = true;
-            continue;
+            break;
         }
         if bytes == b"--help" {
             drop(writeln!(out, "{HELP}"));
@@ -65,50 +67,82 @@ fn run(
                 _ => {
                     drop(writeln!(
                         err,
-                        "which: unknown option -{}\n{HELP}",
-                        char::from(flag)
+                        "which: unknown option {}\n{HELP}",
+                        arg.to_string_lossy()
                     ));
-                    return USAGE;
+                    return FAILED;
                 }
             }
         }
     }
+    let names: Vec<&OsString> = args.collect();
     if names.is_empty() {
         drop(writeln!(err, "{HELP}"));
-        return USAGE;
+        return FAILED;
     }
 
     let mut code = OK;
     for name in names {
-        let mut found = false;
-        // An empty name is "not found" rather than whatever the finder makes
-        // of it; GNU and BSD both say so.
-        if !name.is_empty()
-            && let Ok(hits) = which::which_in_all(name, path, cwd)
-        {
-            for hit in hits {
-                found = true;
-                if !silent {
-                    drop(out.write_all(hit.as_os_str().as_encoded_bytes()));
-                    drop(out.write_all(b"\n"));
-                }
-                if !all {
-                    break;
-                }
+        let found = if name.as_bytes().contains(&b'/') {
+            // A path, not a name to search for: checked where it points and
+            // printed as given, so `which ./tool` says `./tool`.
+            let hit = is_executable_file(&cwd.join(name));
+            if hit && !silent {
+                print(out, name);
             }
-        }
+            hit
+        } else {
+            lookup(name, path, cwd, all, silent, out)
+        };
         if !found {
-            code = NOT_FOUND;
+            code = FAILED;
         }
     }
     drop(out.flush());
     code
 }
 
+/// Search `path` for `name`, printing the first match or, under `all`, each.
+fn lookup(
+    name: &OsStr,
+    path: Option<&OsStr>,
+    cwd: &Path,
+    all: bool,
+    silent: bool,
+    out: &mut impl Write,
+) -> bool {
+    // An empty name is "not found" rather than whatever the finder makes of it.
+    if name.is_empty() {
+        return false;
+    }
+    let Ok(hits) = which::which_in_all(name, path, cwd) else {
+        return false;
+    };
+    let mut found = false;
+    for hit in hits {
+        found = true;
+        if !silent {
+            print(out, hit.as_os_str());
+        }
+        if !all {
+            break;
+        }
+    }
+    found
+}
+
+fn is_executable_file(p: &Path) -> bool {
+    std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+fn print(out: &mut impl Write, p: &OsStr) {
+    drop(out.write_all(p.as_bytes()));
+    drop(out.write_all(b"\n"));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt as _;
     use std::path::PathBuf;
 
     fn exe(dir: &Path, name: &str) -> PathBuf {
@@ -184,11 +218,37 @@ mod tests {
     }
 
     #[test]
-    fn usage_errors_exit_2() {
+    fn usage_errors_exit_1_as_bsd_does() {
         let t = tempfile::tempdir().expect("tempdir");
         let path = path_of(&[t.path()]);
-        assert_eq!(which(&[], &path, t.path()).0, 2);
-        assert_eq!(which(&["-x", "tool"], &path, t.path()).0, 2);
+        assert_eq!(which(&[], &path, t.path()).0, 1);
+        assert_eq!(which(&["-x", "tool"], &path, t.path()).0, 1);
+        assert_eq!(which(&["--all", "tool"], &path, t.path()).0, 1);
+    }
+
+    #[test]
+    fn options_end_at_the_first_name() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let dir = t.path().join("bin");
+        let tool = exe(&dir, "tool");
+        // `-s` after a name is a program to look up, not "be silent".
+        let (code, out) = which(&["tool", "-s"], &path_of(&[&dir]), t.path());
+        assert_eq!(code, 1);
+        assert_eq!(out, format!("{}\n", tool.display()));
+    }
+
+    #[test]
+    fn a_name_with_a_slash_is_checked_and_printed_as_given() {
+        let t = tempfile::tempdir().expect("tempdir");
+        exe(&t.path().join("rel"), "tool");
+        std::fs::write(t.path().join("rel/data"), "x").expect("write");
+        let empty = path_of(&[&t.path().join("nowhere")]);
+        assert_eq!(
+            which(&["./rel/tool", "rel/tool"], &empty, t.path()),
+            (0, "./rel/tool\nrel/tool\n".to_string())
+        );
+        assert_eq!(which(&["rel/data"], &empty, t.path()), (1, String::new()));
+        assert_eq!(which(&["rel"], &empty, t.path()), (1, String::new()));
     }
 
     #[test]

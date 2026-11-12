@@ -87,7 +87,6 @@ applets! {
     "cp" => uu!(uu_cp),
     "cut" => uu!(uu_cut),
     "date" => uu!(uu_date),
-    "dd" => uu!(uu_dd),
     "dirname" => uu!(uu_dirname),
     "du" => uu!(uu_du),
     "echo" => uu!(uu_echo),
@@ -123,7 +122,6 @@ applets! {
     "sha512sum" => uu!(uu_sha512sum),
     "sleep" => uu!(uu_sleep),
     "sort" => uu!(uu_sort),
-    "split" => uu!(uu_split),
     "stat" => uu!(uu_stat),
     "tail" => uu!(uu_tail),
     "tar" => crate::archive::tar,
@@ -427,19 +425,29 @@ mod tests {
         }
     }
 
-    // --- golden cases: filesystem effects + exit code ---
-
     #[test]
-    fn dd_copies_the_requested_blocks() {
-        // `if=`/`of=` are not whole operands, so the `@` rewrite cannot reach
-        // them; run from inside the tree with relative paths instead.
-        golden_cwd(
-            |d| write(d, "src", "abcdef"),
-            &["dd", "if=src", "of=out", "bs=2", "count=2", "status=none"],
-            0,
-            &["out (4 bytes)", "src (6 bytes)"],
+    fn the_version_pins_the_applet_set() {
+        // COREUTILS_VERSION is in every exec target's def hash *and* names the
+        // shim directory. An applet added or removed without a bump keeps the
+        // old keys — one key for two toolboxes — and a binary self-updated in
+        // place reuses the old shim dir, missing the new link. When this fails,
+        // bump COREUTILS_VERSION in the same change and update both lines.
+        let names: Vec<&str> = APPLETS.iter().map(|a| a.name).collect();
+        assert_eq!(
+            (COREUTILS_VERSION, names.join(",")),
+            (
+                7,
+                "b2sum,base64,basename,cat,chmod,cksum,comm,cp,cut,date,dirname,du,echo,env,\
+                 false,find,grep,groups,gunzip,gzip,head,id,install,ln,ls,md5sum,mkdir,mktemp,\
+                 mv,nproc,od,printenv,printf,pwd,readlink,realpath,rm,rmdir,sed,seq,sha1sum,\
+                 sha256sum,sha512sum,sleep,sort,stat,tail,tar,tee,test,timeout,tmpl,touch,tr,\
+                 true,truncate,uniq,unlink,wc,which,whoami,xargs,yes,zstd"
+                    .to_string()
+            )
         );
     }
+
+    // --- golden cases: filesystem effects + exit code ---
 
     #[test]
     fn truncate_grows_and_shrinks() {
@@ -454,25 +462,6 @@ mod tests {
             &["truncate", "-s", "1K", "@new"],
             0,
             &["new (1024 bytes)"],
-        );
-    }
-
-    #[test]
-    fn split_chunks_by_bytes() {
-        golden(
-            |d| {
-                write(d, "src", "abcde");
-                std::fs::create_dir(d.join("out")).unwrap();
-            },
-            &["split", "-b", "2", "@src", "@out/x"],
-            0,
-            &[
-                "out/",
-                "out/xaa (2 bytes)",
-                "out/xab (2 bytes)",
-                "out/xac (1 bytes)",
-                "src (5 bytes)",
-            ],
         );
     }
 

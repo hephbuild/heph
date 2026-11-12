@@ -154,7 +154,7 @@ in one direction and a permanent full-miss in the other.
 
 ### Builtin coreutils
 
-heph ships 66 POSIX utilities inside the binary (`crates/coreutils`) and can put
+heph ships 64 POSIX utilities inside the binary (`crates/coreutils`) and can put
 them on every target's `PATH`, so `cp`/`install`/`sha256sum` behave the same on
 Linux and macOS. On by default; `coreutils: false` on the `exec`/`bash` driver
 opts out. The host's directories are **not** on a target's `PATH` — it sees its
