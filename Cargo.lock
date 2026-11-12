@@ -118,6 +118,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ansi-width"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "90759a65f5178dbbd1b0eecc97b187996401bced0eb4a943d9ac6d7a6304d111"
+dependencies = [
+ "unicode-width 0.2.2",
+]
+
+[[package]]
 name = "anstream"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1099,27 +1108,36 @@ dependencies = [
  "tar",
  "tempfile",
  "template",
+ "uu_b2sum",
  "uu_base64",
  "uu_basename",
  "uu_cat",
  "uu_chmod",
+ "uu_cksum",
  "uu_comm",
  "uu_cp",
  "uu_cut",
  "uu_date",
  "uu_dirname",
+ "uu_du",
  "uu_echo",
  "uu_env",
  "uu_false",
+ "uu_groups",
  "uu_head",
+ "uu_id",
  "uu_install",
  "uu_ln",
+ "uu_ls",
  "uu_md5sum",
  "uu_mkdir",
  "uu_mktemp",
  "uu_mv",
  "uu_nproc",
+ "uu_od",
+ "uu_printenv",
  "uu_printf",
+ "uu_pwd",
  "uu_readlink",
  "uu_realpath",
  "uu_rm",
@@ -1133,14 +1151,20 @@ dependencies = [
  "uu_stat",
  "uu_tail",
  "uu_tee",
+ "uu_test",
  "uu_timeout",
  "uu_touch",
  "uu_tr",
  "uu_true",
+ "uu_truncate",
  "uu_uniq",
+ "uu_unlink",
  "uu_wc",
+ "uu_whoami",
+ "uu_yes",
  "uucore 0.12.0",
  "walkdir",
+ "which",
  "xxhash-rust",
  "zstd",
 ]
@@ -2662,6 +2686,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "half"
+version = "2.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ea2d84b969582b4b1864a92dc5d27cd2b77b622a8d79306834f1be5ba20d84b"
+dependencies = [
+ "cfg-if",
+ "crunchy",
+ "zerocopy",
+]
+
+[[package]]
 name = "hash32"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2857,6 +2892,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cc627f471c528ff0c4a49e1d5e60450c8f6461dd6d10ba9dcd3a61d3dff7728d"
 dependencies = [
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "hostname"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "617aaa3557aef3810a6369d0a99fac8a080891b68bd9f9812a1eeda0c0730cbd"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "windows-link",
 ]
 
 [[package]]
@@ -3927,6 +3973,16 @@ name = "lru-slab"
 version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
+
+[[package]]
+name = "lscolors"
+version = "0.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d60e266dfb1426eb2d24792602e041131fdc0236bb7007abc0e589acafd60929"
+dependencies = [
+ "aho-corasick",
+ "nu-ansi-term",
+]
 
 [[package]]
 name = "lsp-server"
@@ -7829,6 +7885,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
+name = "uu_b2sum"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4aa4061f010d64b18f046f6aba14cac3d2dfe4a824816e5d1d30d554c7001c6e"
+dependencies = [
+ "clap",
+ "fluent",
+ "uu_checksum_common",
+ "uucore 0.12.0",
+]
+
+[[package]]
 name = "uu_base32"
 version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7898,6 +7966,18 @@ dependencies = [
  "clap",
  "fluent",
  "thiserror 2.0.21",
+ "uucore 0.12.0",
+]
+
+[[package]]
+name = "uu_cksum"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3db6b4b87b7d6c92add8ba1a4cfae7355734bc9afbf74d6904e1bc6b05ffcef5"
+dependencies = [
+ "clap",
+ "fluent",
+ "uu_checksum_common",
  "uucore 0.12.0",
 ]
 
@@ -7977,6 +8057,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "uu_du"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ae0fca6efbb42021688f47ce7c1ef88059452c6b73b744c0a99304a38973363"
+dependencies = [
+ "clap",
+ "fluent",
+ "glob",
+ "rustc-hash",
+ "thiserror 2.0.21",
+ "uucore 0.12.0",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "uu_echo"
 version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8013,6 +8108,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "uu_groups"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09304bb2bebc49744b43367fbc7e0e8a729a4a7736dbc03f160729fa00d84015"
+dependencies = [
+ "clap",
+ "fluent",
+ "thiserror 2.0.21",
+ "uucore 0.12.0",
+]
+
+[[package]]
 name = "uu_head"
 version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8022,6 +8129,18 @@ dependencies = [
  "fluent",
  "memchr",
  "thiserror 2.0.21",
+ "uucore 0.12.0",
+]
+
+[[package]]
+name = "uu_id"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6cd6bfb5a25b2457d05659c1dabd06d6e1abe886ddca68122095bdc42a6d7ac7"
+dependencies = [
+ "clap",
+ "fluent",
+ "rustix",
  "uucore 0.12.0",
 ]
 
@@ -8049,6 +8168,25 @@ dependencies = [
  "rustix",
  "thiserror 2.0.21",
  "uucore 0.12.0",
+]
+
+[[package]]
+name = "uu_ls"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd8f956231b30edd22f1c0ef803d6928da0d7cb5f07add01a4d15e5b2d4a2540"
+dependencies = [
+ "ansi-width",
+ "clap",
+ "fluent",
+ "glob",
+ "hostname",
+ "lscolors",
+ "rustc-hash",
+ "terminal_size",
+ "thiserror 2.0.21",
+ "uucore 0.12.0",
+ "uutils_term_grid",
 ]
 
 [[package]]
@@ -8121,10 +8259,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "uu_od"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f163305dfac8638f14e110666bd632f12e99c637382bbcbeeee63c771476c79e"
+dependencies = [
+ "clap",
+ "fluent",
+ "half",
+ "libc",
+ "rustix",
+ "uucore 0.12.0",
+]
+
+[[package]]
+name = "uu_printenv"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ff7f1090fe0d0ac3e8b7a79cd48830f2f93577329d2ee739d84bb0d893889ccc"
+dependencies = [
+ "clap",
+ "fluent",
+ "uucore 0.12.0",
+]
+
+[[package]]
 name = "uu_printf"
 version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ad2cacf36fe7936f5bda5a4c259f6961e3e5f77cf04db26e1922ea7dffad195"
+dependencies = [
+ "clap",
+ "fluent",
+ "uucore 0.12.0",
+]
+
+[[package]]
+name = "uu_pwd"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "905aa087f76dcfbd22cf9549f56d2713be97f80d68a7638334c8afc91ae528f9"
 dependencies = [
  "clap",
  "fluent",
@@ -8306,6 +8480,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "uu_test"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9007d3a30901a0dba2e28c017aba9edb2aa26c919946ae84c770446067e98304"
+dependencies = [
+ "clap",
+ "fluent",
+ "libc",
+ "rustix",
+ "thiserror 2.0.21",
+ "uucore 0.12.0",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "uu_timeout"
 version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8361,10 +8550,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "uu_truncate"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1991acfea078be5657c18bab731d77d083bb7facf5157c2567e53f2a6d0b9727"
+dependencies = [
+ "clap",
+ "fluent",
+ "uucore 0.12.0",
+]
+
+[[package]]
 name = "uu_uniq"
 version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "53c59563ff6419f674e2cd5b50cef9f3a0f0e73a06291dd635c006fc253ad268"
+dependencies = [
+ "clap",
+ "fluent",
+ "uucore 0.12.0",
+]
+
+[[package]]
+name = "uu_unlink"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3e3ca22bbb2d23bdd136ec8a6260c12c2550f9ae44c679323bee246bf460494b"
 dependencies = [
  "clap",
  "fluent",
@@ -8384,6 +8595,32 @@ dependencies = [
  "rustix",
  "thiserror 2.0.21",
  "unicode-width 0.2.2",
+ "uucore 0.12.0",
+]
+
+[[package]]
+name = "uu_whoami"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c1267f81972136719195877c21cefd2fb1bc821c8fb692d16f8b0ce4b717108c"
+dependencies = [
+ "clap",
+ "fluent",
+ "rustix",
+ "uucore 0.12.0",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "uu_yes"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7a00721c606207353591d7d5a4fe6c89d94073decccd061392f3f0dea1c37af4"
+dependencies = [
+ "clap",
+ "fluent",
+ "itertools 0.15.0",
+ "rustix",
  "uucore 0.12.0",
 ]
 
@@ -8499,6 +8736,15 @@ dependencies = [
  "rand 0.10.3",
  "serde_core",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "uutils_term_grid"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e70bdc0434ef5f30856fbe0908a7d96568f8b212a28c20b16d44851f753e465f"
+dependencies = [
+ "ansi-width",
 ]
 
 [[package]]

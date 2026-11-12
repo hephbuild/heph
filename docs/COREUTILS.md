@@ -1,6 +1,6 @@
 # Builtin coreutils
 
-heph ships 49 POSIX utilities inside its own binary and can put them on every
+heph ships 64 POSIX utilities inside its own binary and can put them on every
 target's `PATH`, so a recipe that runs `cp`, `install` or `sha256sum` behaves
 identically on Linux and macOS.
 
@@ -190,28 +190,73 @@ exists to prevent.
 
 ## The applets
 
-Forty MIT-licensed [uutils/coreutils] crates, tested upstream against the GNU
-test suite; `find` and `xargs` from [uutils/findutils]; and a `grep` built on
-ripgrep's search engine. Adding one is a line in the `applets!` table in
-`crates/coreutils/src/lib.rs` plus its crate in `Cargo.toml` — and a
-`COREUTILS_VERSION` bump.
+Fifty-four MIT-licensed [uutils/coreutils] crates, tested upstream against the
+GNU test suite; `find` and `xargs` from [uutils/findutils]; a `grep` built on
+ripgrep's search engine; and a `which` over the `which` crate. Adding one is a
+line in the `applets!` table in `crates/coreutils/src/lib.rs` plus its crate in
+`Cargo.toml` — and a `COREUTILS_VERSION` bump, which
+`the_version_pins_the_applet_set` fails without.
 
-The selection rule: **a utility ships only if its behaviour or flags actually
-differ between GNU and BSD userland, or it is missing on one of them — and it
-shows up in build recipes.** Uniform ones are included only where they are
-nearly free and their absence would push a pipeline back onto the host `PATH`
-halfway through.
+The selection rule has two halves:
+
+* **Divergences.** A utility whose behaviour or flags differ between GNU and
+  BSD userland, or that is missing on one of them, and that shows up in build
+  recipes (`install`, `sed`, `sort`, `tar`, …).
+* **Basics.** A utility so basic that its absence makes the sandbox unusable
+  to run a recipe in or to poke around from `--shell`: `ls`, `pwd`, `test`,
+  `which`, `printenv`, `du`, `od`, `truncate`, `cksum`, `b2sum`, `yes`,
+  `unlink`, and `id`/`whoami`/`groups`. The host's directories are not on a
+  target's `PATH`, so without these a recipe — or an engineer inspecting one —
+  cannot even list what it was given.
+
+Some of these report facts about the machine, not the build: `id`/`whoami`/
+`groups` (who is running it), `du` and `ls -l` (allocation, owner, mtime),
+`pwd` (the sandbox path) and `which` (the per-install shim path). The *value*
+is the host's; the *format* is GNU's on both OSes — `du` counts 1K blocks on
+macOS too, where the system `du` counts 512-byte ones. They ship because they
+are basic, and none of them reaches a fact a target could not already read
+(`$UID`, `stat -c %U`, `$PWD`, `command -v`).
+
+What they change is how quietly a mistake goes through. A value from these
+that reaches a target's **output** is outside its cache key: `docker build
+--build-arg UID=$(id -u)` built on a macOS laptop (uid 501) is served to a Linux
+machine (uid 1000) under the same key. When the value belongs in the output,
+pass it in through the target's `env` or `pass_env` — hashed, unlike the
+`runtime_*` variants — so it is part of the key, or mark the target
+`cache = False`. Runtime-only uses are fine as they are —
+`docker run --user "$(id -u):$(id -g)"` leaves nothing in an artifact. (Under
+an `oci` runner heph's applets are not on `PATH` at all; see `EXEC_RUNNERS.md`.)
 
 Not shipped, deliberately: `awk`/`perl`/`python` (implementing a language is a
 project, not an applet), `curl`/`wget` (the `http_fetch` driver already covers
-fetching, hermetically and cacheably), `git`, `uname` (normalising `arm64` vs
-`aarch64` would change recipes that already switch on it), `du`/`df` (they
-answer questions about the machine, not the build), and anything interactive.
+fetching, hermetically and cacheably), `git`, `uname`/`arch` (`-m` is `arm64`
+on macOS and `aarch64` on Linux, and normalising it would change recipes that
+already switch on it), `hostname`, `df`, `dd` (its `iflag`/`oflag` values
+`direct`, `dsync`, `sync`, `nocache`, `noatime` and `nofollow` are Linux-only
+upstream, and `SIGUSR1` prints progress on Linux but kills it on macOS),
+`split` (`--filter` runs the host's `/bin/sh`, the dependency this toolbox
+exists to remove), `[` (uucore takes the utility's name from the real
+`argv[0]`, so `heph __coreutils [` would not require the closing `]`; the
+shell's builtin `[` covers recipes), and anything interactive.
 
-The applet set is complete. `diff`/`cmp`
-are not planned: the `diffutils` crate exposes its algorithms but keeps its CLI
-in a private `main`, so wiring it up would mean reimplementing its argument
-parsing for the lowest-value pair in the set.
+`diff`/`cmp` are not planned: the `diffutils` crate exposes its algorithms but
+keeps its CLI in a private `main`, so wiring it up would mean reimplementing its
+argument parsing for the lowest-value pair in the set.
+
+### `which`
+
+Resolves against the `PATH` it was given — inside a target, the target's
+`PATH`, builtins included — so it answers "which program on this target's
+`PATH`", not "what is on this machine". Shell builtins shadow `PATH`: in a
+bash target, `which printf` names heph's shim while bash runs its own builtin,
+from the host's shell. `type -a printf` is the answer to "what will this
+recipe run".
+
+It follows BSD `which`, the one macOS ships: `-a` for every match, `-s` for
+status only, options only before the first name, a name containing `/` checked
+as given and printed verbatim, and exit 1 unless every name is found (usage
+errors included). One departure: a match through a *relative* `PATH` entry is
+printed absolute.
 
 ### `tmpl`
 
