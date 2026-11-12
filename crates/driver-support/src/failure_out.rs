@@ -41,7 +41,7 @@
 //! - **Never hides the failure.** A collect error is a `warn!` and a context
 //!   line on the target's own error.
 
-use crate::driver_managed::{GLOB_OPTS, Reading, Walk, add_content, pack_to_artifact_tar};
+use crate::driver_managed::{GLOB_OPTS, Reading, add_content, pack_to_artifact_tar};
 use hcore::hartifactcontent::tar::TarPacker;
 use hcore::hasync::Cancellable;
 use hplugin::driver::outputartifact::OutputArtifact;
@@ -346,11 +346,7 @@ pub fn collect_failure_outputs(
         .iter()
         .filter_map(|r| fs::canonicalize(r).ok())
         .collect();
-    let walk = Walk {
-        missing_ok: true,
-        skip: &|_: &Path| false,
-        reading: Reading::Diagnostics { roots: &roots },
-    };
+    let reading = Reading::Diagnostics { roots: &roots };
     let mut members: BTreeSet<String> = BTreeSet::new();
     let mut tar = TarPacker::new();
     for content in outputs
@@ -368,7 +364,7 @@ pub fn collect_failure_outputs(
             content,
             "",
             stop,
-            &walk,
+            reading,
         )?;
     }
     if members.is_empty() {
@@ -565,11 +561,6 @@ mod tests {
     /// per entry it reads, and a matched file polls it no more.
     fn glob_walked(ws: &Path, pattern: &str) -> (Vec<String>, usize) {
         let roots = [fs::canonicalize(ws).expect("canonical ws")];
-        let walk = Walk {
-            missing_ok: true,
-            skip: &|_: &Path| false,
-            reading: Reading::Diagnostics { roots: &roots },
-        };
         let polls = std::cell::Cell::new(0_usize);
         let mut members = Vec::new();
         add_content(
@@ -581,7 +572,7 @@ mod tests {
                 polls.set(polls.get() + 1);
                 false
             },
-            &walk,
+            Reading::Diagnostics { roots: &roots },
         )
         .expect("walk");
         (members, polls.get() - 1)

@@ -522,10 +522,10 @@ pub(crate) fn collect_write_back_inner(
     sandbox_dir: &Path,
     stop: &dyn Fn() -> bool,
 ) -> anyhow::Result<Vec<outputartifact::OutputArtifact>> {
-    let walk = Walk {
+    let reading = Reading::Build {
         missing_ok: true,
         skip: &|rel: &Path| excluded.matches(rel),
-        reading: Reading::Build { stage_dir: None },
+        stage_dir: None,
     };
     let prefixed = format!("{WRITE_BACK_TAR_PREFIX}{hashin}");
     let mut artifacts = Vec::new();
@@ -545,7 +545,7 @@ pub(crate) fn collect_write_back_inner(
                 &path.content,
                 &output.group,
                 stop,
-                &walk,
+                reading,
             )?;
         }
         let Some(tar) = tar else {
@@ -881,34 +881,31 @@ impl<W: Write> Write for HashingWriter<W> {
     }
 }
 
-/// How [`add_content`] reads the tree it walks.
-#[derive(Clone, Copy)]
-pub(crate) struct Walk<'a> {
-    /// A declared file or directory that does not exist adds nothing, rather
-    /// than failing the collection: a failed run may never have written it.
-    /// A path that exists with the wrong kind is still an error under
-    /// [`Reading::Build`].
-    pub missing_ok: bool,
-    /// Leave out every file whose workspace-relative path this reads true for.
-    pub skip: &'a dyn Fn(&Path) -> bool,
-    pub reading: Reading<'a>,
-}
-
-/// What a walk collects for.
+/// What [`add_content`] collects for, and so how it reads the tree it walks.
 #[derive(Clone, Copy)]
 pub(crate) enum Reading<'a> {
     /// What a build consumes (outputs, the `in_place` write-back): a declared
     /// path must have its declared kind, a symlink is packed as the link, and
     /// anything that cannot be read fails the collection.
-    ///
-    /// `stage_dir` is heph's shared stage when the sandbox links read-only
-    /// inputs into it (the OS sandbox, see [`crate::stage`]): globs and
-    /// declared paths follow those links, and no other directory link (see
-    /// [`crate::output_glob`]). `None` where inputs are real directories.
-    Build { stage_dir: Option<&'a Path> },
-    /// What a human reads after a failure (`failure_out`): it never fails
-    /// the collection over one entry, and never packs anything from outside
-    /// `roots` (canonical: the sandbox's workspace and the shared stage).
+    Build {
+        /// A declared file or directory that does not exist adds nothing,
+        /// rather than failing the collection: a failed run may never have
+        /// written it. A path that exists with the wrong kind is still an
+        /// error.
+        missing_ok: bool,
+        /// Leave out every file whose workspace-relative path this reads
+        /// true for.
+        skip: &'a dyn Fn(&Path) -> bool,
+        /// Heph's shared stage when the sandbox links read-only inputs into
+        /// it (the OS sandbox, see [`crate::stage`]): globs and declared
+        /// paths follow those links, and no other directory link (see
+        /// [`crate::output_glob`]). `None` where inputs are real directories.
+        stage_dir: Option<&'a Path>,
+    },
+    /// What a human reads after a failure (`failure_out`): it never packs
+    /// anything from outside `roots` (canonical: the sandbox's workspace and
+    /// the shared stage), and a declared path that does not exist adds
+    /// nothing.
     ///
     /// - A declared path, or a glob match, is taken as whatever it is: a
     ///   file, or a directory packed whole.
@@ -916,9 +913,14 @@ pub(crate) enum Reading<'a> {
     ///   a file always, a directory only when it is the declared path or a
     ///   glob match. A dangling one, a loop, or one leaving `roots` is
     ///   dropped. A walk never descends a linked directory, so none can loop.
+    /// - A glob walks from its literal prefix, never through a linked
+    ///   directory, and only as deep as its pattern can match.
     /// - A file that cannot be opened is skipped with a `warn!`, an entry the
     ///   walk cannot read with a `debug!`, and so is a name that is not UTF-8,
     ///   which a tar member cannot carry.
+    /// - An lstat that fails other than with `NotFound` (on a declared path,
+    ///   a glob match or an entry under one) still fails the collection, and
+    ///   so does a stat of what a link inside `roots` resolves to.
     Diagnostics { roots: &'a [PathBuf] },
 }
 
@@ -926,13 +928,15 @@ fn nothing_skipped(_: &Path) -> bool {
     false
 }
 
-impl Walk<'_> {
+impl<'a> Reading<'a> {
     /// A passing run's outputs: strict, and every link kept as a link.
-    pub(crate) const OUTPUT: Walk<'static> = Walk {
-        missing_ok: false,
-        skip: &nothing_skipped,
-        reading: Reading::Build { stage_dir: None },
-    };
+    pub(crate) const fn output(stage_dir: Option<&'a Path>) -> Self {
+        Reading::Build {
+            missing_ok: false,
+            skip: &nothing_skipped,
+            stage_dir,
+        }
+    }
 }
 
 fn check_stop(stop: &dyn Fn() -> bool) -> anyhow::Result<()> {
@@ -956,14 +960,11 @@ fn add_path_to_tar(
         &path.content,
         group_for_err,
         stop,
-        &Walk {
-            reading: Reading::Build { stage_dir },
-            ..Walk::OUTPUT
-        },
+        Reading::output(stage_dir),
     )
 }
 
-/// Hand `add` every file `content` names under `ws_dir`, read as `walk`
+/// Hand `add` every file `content` names under `ws_dir`, read as `reading`
 /// says: its source path, and its member name (workspace-relative).
 ///
 /// The one walker behind every collected group — outputs, the write-back on
@@ -975,10 +976,10 @@ pub(crate) fn add_content(
     content: &Content,
     group_for_err: &str,
     stop: &dyn Fn() -> bool,
-    walk: &Walk<'_>,
+    reading: Reading<'_>,
 ) -> anyhow::Result<()> {
     check_stop(stop)?;
-    match (content, walk.reading) {
+    match (content, reading) {
         (Content::FilePath(p) | Content::DirPath(p), Reading::Diagnostics { roots }) => {
             let rel = Path::new(p.trim_end_matches('/'));
             if rel.as_os_str().is_empty() {
@@ -990,10 +991,17 @@ pub(crate) fn add_content(
                 tracing::debug!(path = %rel.display(), "failure_out path is not under the sandbox; skipped");
                 return Ok(());
             }
-            add_diagnostic(add, &src, rel, true, stop, walk, roots)
+            add_diagnostic(add, &src, rel, true, stop, roots)
         }
-        (Content::FilePath(fp), Reading::Build { stage_dir }) => {
-            if (walk.skip)(Path::new(fp)) {
+        (
+            Content::FilePath(fp),
+            Reading::Build {
+                missing_ok,
+                skip,
+                stage_dir,
+            },
+        ) => {
+            if skip(Path::new(fp)) {
                 return Ok(());
             }
             // Not read through a linked ancestor (hephbuild/heph#563), as a
@@ -1005,7 +1013,7 @@ pub(crate) fn add_content(
             // check a path that materialized as a directory is registered blindly
             // and only fails deep in `tar.pack` with a cryptic `Is a directory`
             // (EISDIR). lstat here so the consumer gets a path-and-group message.
-            let Some(md) = lstat_declared(&source, walk.missing_ok).with_context(|| {
+            let Some(md) = lstat_declared(&source, missing_ok).with_context(|| {
                 format!("lstat declared file output {fp:?} (group={group_for_err})")
             })?
             else {
@@ -1021,14 +1029,21 @@ pub(crate) fn add_content(
             add(source.to_string_lossy().into_owned(), fp.clone());
             Ok(())
         }
-        (Content::DirPath(dir), Reading::Build { stage_dir }) => {
+        (
+            Content::DirPath(dir),
+            Reading::Build {
+                missing_ok,
+                skip,
+                stage_dir,
+            },
+        ) => {
             crate::output_glob::check_declared_path(ws_dir, dir, stage_dir)
                 .with_context(|| format!("group={group_for_err}"))?;
             let dir_full = ws_dir.join(dir);
             // Symmetric to the FilePath guard: a directory output declared on a
             // path that materialized as a file would otherwise be single-walked
             // and packed silently. lstat so the consumer gets a clear message.
-            let Some(md) = lstat_declared(&dir_full, walk.missing_ok).with_context(|| {
+            let Some(md) = lstat_declared(&dir_full, missing_ok).with_context(|| {
                 format!("lstat declared directory output {dir:?} (group={group_for_err})")
             })?
             else {
@@ -1040,17 +1055,14 @@ pub(crate) fn add_content(
                 "declared directory output {dir:?} (group={group_for_err}) is a file, \
                  not a directory; declare it as a file or glob output instead"
             );
-            add_dir(
-                add,
-                ws_dir,
-                &dir_full,
-                Path::new(dir),
-                group_for_err,
-                stop,
-                walk,
-            )
+            add_build_dir(add, ws_dir, &dir_full, group_for_err, stop, skip)
         }
-        (Content::Glob(pattern), Reading::Build { stage_dir }) => {
+        (
+            Content::Glob(pattern),
+            Reading::Build {
+                skip, stage_dir, ..
+            },
+        ) => {
             // Not `glob::glob`: it follows directory symlinks (hephbuild/heph#563).
             // `OutputGlob` is the same walk, refusing a link it would descend.
             for matched in crate::output_glob::OutputGlob::new(ws_dir, pattern, stage_dir)
@@ -1072,7 +1084,7 @@ pub(crate) fn add_content(
                             matched, ws_dir
                         )
                     })?;
-                    if (walk.skip)(rel) {
+                    if skip(rel) {
                         continue;
                     }
                     let rel = rel.to_string_lossy().into_owned();
@@ -1083,11 +1095,8 @@ pub(crate) fn add_content(
             Ok(())
         }
         (Content::Glob(pattern), Reading::Diagnostics { roots }) => {
-            glob_walk(ws_dir, pattern, stop, walk, |entry, rel| {
-                if (walk.skip)(rel) {
-                    return Ok(GlobStep::Next);
-                }
-                add_diagnostic(add, entry.path(), rel, true, stop, walk, roots)?;
+            glob_walk(ws_dir, pattern, stop, roots, |entry, rel| {
+                add_diagnostic(add, entry.path(), rel, true, stop, roots)?;
                 // A matched directory was packed whole.
                 Ok(if entry.file_type().is_dir() {
                     GlobStep::SkipDir
@@ -1109,17 +1118,9 @@ fn lstat_declared(path: &Path, missing_ok: bool) -> io::Result<Option<fs::Metada
     }
 }
 
-/// Hand `add` every file under the directory `dir_full`, whose
-/// workspace-relative path is `rel`.
-fn add_dir(
-    add: &mut dyn FnMut(String, String),
-    ws_dir: &Path,
-    dir_full: &Path,
-    rel: &Path,
-    group_for_err: &str,
-    stop: &dyn Fn() -> bool,
-    walk: &Walk<'_>,
-) -> anyhow::Result<()> {
+/// Every entry under `dir`, `dir` itself first, never following a link but
+/// `dir`'s own, each directory's entries in name order.
+fn sorted_walk(dir: &Path) -> walkdir::IntoIter {
     // `sort_by_file_name`, not the bare walk: `read_dir` returns entries
     // in whatever order the filesystem keeps them (hash order on ext4,
     // insertion order on APFS, something else again on tmpfs), and that
@@ -1134,48 +1135,68 @@ fn add_dir(
     // instead of collecting the whole tree to sort it.
     //
     // Never following a link (walkdir's default) but the root's.
-    for entry in walkdir::WalkDir::new(dir_full).sort_by_file_name() {
+    walkdir::WalkDir::new(dir).sort_by_file_name().into_iter()
+}
+
+/// [`Reading::Build`]: hand `add` every file and link under the declared
+/// directory `dir_full`, as its workspace-relative path, but those `skip`
+/// reads true for. An entry the walk cannot read fails the collection.
+fn add_build_dir(
+    add: &mut dyn FnMut(String, String),
+    ws_dir: &Path,
+    dir_full: &Path,
+    group_for_err: &str,
+    stop: &dyn Fn() -> bool,
+    skip: &dyn Fn(&Path) -> bool,
+) -> anyhow::Result<()> {
+    for entry in sorted_walk(dir_full) {
         check_stop(stop)?;
-        let entry = match (entry, walk.reading) {
-            (Ok(e), _) => e,
-            (Err(e), Reading::Diagnostics { .. }) => {
+        let entry = entry
+            .with_context(|| format!("walk output dir {:?} (group={})", dir_full, group_for_err))?;
+        let ft = entry.file_type();
+        if !(ft.is_file() || ft.is_symlink()) {
+            continue;
+        }
+        let member = entry.path().strip_prefix(ws_dir).with_context(|| {
+            format!("strip ws prefix from {:?} (ws={:?})", entry.path(), ws_dir)
+        })?;
+        if skip(member) {
+            continue;
+        }
+        let member = member.to_string_lossy().into_owned();
+        add(entry.path().to_string_lossy().into_owned(), member);
+    }
+    Ok(())
+}
+
+/// [`Reading::Diagnostics`]: hand `add` every file under the directory
+/// `dir_full`, as `rel` joined with its path below `dir_full` — under the
+/// declared path, never under where a linked directory resolves to. An entry
+/// the walk cannot read is skipped.
+fn add_diagnostic_dir(
+    add: &mut dyn FnMut(String, String),
+    dir_full: &Path,
+    rel: &Path,
+    stop: &dyn Fn() -> bool,
+    roots: &[PathBuf],
+) -> anyhow::Result<()> {
+    for entry in sorted_walk(dir_full) {
+        check_stop(stop)?;
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
                 tracing::debug!(error = %e, "walking a failure_out directory; entry skipped");
                 continue;
-            }
-            (Err(e), Reading::Build { .. }) => {
-                return Err(e).with_context(|| {
-                    format!("walk output dir {:?} (group={})", dir_full, group_for_err)
-                });
             }
         };
         let ft = entry.file_type();
         if !(ft.is_file() || ft.is_symlink()) {
             continue;
         }
-        match walk.reading {
-            Reading::Build { .. } => {
-                let member = entry.path().strip_prefix(ws_dir).with_context(|| {
-                    format!("strip ws prefix from {:?} (ws={:?})", entry.path(), ws_dir)
-                })?;
-                if (walk.skip)(member) {
-                    continue;
-                }
-                let member = member.to_string_lossy().into_owned();
-                add(entry.path().to_string_lossy().into_owned(), member);
-            }
-            // Under the declared path, never under where a linked directory
-            // resolves to.
-            Reading::Diagnostics { roots } => {
-                let Ok(sub) = entry.path().strip_prefix(dir_full) else {
-                    continue;
-                };
-                let member = rel.join(sub);
-                if (walk.skip)(&member) {
-                    continue;
-                }
-                add_diagnostic(add, entry.path(), &member, false, stop, walk, roots)?;
-            }
-        }
+        let Ok(sub) = entry.path().strip_prefix(dir_full) else {
+            continue;
+        };
+        add_diagnostic(add, entry.path(), &rel.join(sub), false, stop, roots)?;
     }
     Ok(())
 }
@@ -1191,14 +1212,11 @@ fn add_diagnostic(
     rel: &Path,
     top: bool,
     stop: &dyn Fn() -> bool,
-    walk: &Walk<'_>,
     roots: &[PathBuf],
 ) -> anyhow::Result<()> {
     let md = match fs::symlink_metadata(src) {
         Ok(md) => md,
-        Err(e) if e.kind() == io::ErrorKind::NotFound && (walk.missing_ok || !top) => {
-            return Ok(());
-        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e).with_context(|| format!("lstat {}", src.display())),
     };
     let ft = md.file_type();
@@ -1218,7 +1236,7 @@ fn add_diagnostic(
         return if md.is_file() {
             add_readable(add, &real, rel)
         } else if md.is_dir() && top {
-            add_dir(add, &real, &real, rel, "", stop, walk)
+            add_diagnostic_dir(add, &real, rel, stop, roots)
         } else {
             Ok(())
         };
@@ -1226,7 +1244,7 @@ fn add_diagnostic(
     if ft.is_file() {
         add_readable(add, src, rel)
     } else if ft.is_dir() && top {
-        add_dir(add, src, src, rel, "", stop, walk)
+        add_diagnostic_dir(add, src, rel, stop, roots)
     } else {
         Ok(())
     }
@@ -1284,7 +1302,7 @@ fn glob_walk(
     ws_dir: &Path,
     pattern: &str,
     stop: &dyn Fn() -> bool,
-    walk: &Walk<'_>,
+    roots: &[PathBuf],
     mut visit: impl FnMut(&walkdir::DirEntry, &Path) -> anyhow::Result<GlobStep>,
 ) -> anyhow::Result<()> {
     let compiled = glob::Pattern::new(pattern).context("compiling the pattern")?;
@@ -1300,11 +1318,7 @@ fn glob_walk(
         .collect::<Result<_, _>>()
         .context("compiling the pattern's components")?;
     let base = ws_dir.join(&prefix);
-    let resolves = match walk.reading {
-        Reading::Build { .. } => fs::metadata(&base).is_ok(),
-        Reading::Diagnostics { roots } => inside(&base, roots),
-    };
-    if !resolves {
+    if !inside(&base, roots) {
         return Ok(());
     }
     let mut walker = walkdir::WalkDir::new(&base)
@@ -1316,14 +1330,11 @@ fn glob_walk(
     let mut entries = walker.into_iter();
     while let Some(entry) = entries.next() {
         check_stop(stop)?;
-        let entry = match (entry, walk.reading) {
-            (Ok(e), _) => e,
-            (Err(e), Reading::Diagnostics { .. }) => {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
                 tracing::debug!(error = %e, "walking for a failure_out glob; entry skipped");
                 continue;
-            }
-            (Err(e), Reading::Build { .. }) => {
-                return Err(e).with_context(|| format!("walking {base:?} for a glob"));
             }
         };
         let Ok(rel) = entry.path().strip_prefix(ws_dir) else {
