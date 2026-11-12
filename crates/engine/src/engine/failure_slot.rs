@@ -10,7 +10,9 @@
 //! a tar in the sandbox, [`hplugin::error::failure_out_tar`]), the tar is
 //! **unpacked** into the slot as `out/`, laid out by workspace-relative path,
 //! and removed when the driver handed it over (`owned`). Only a regular file
-//! inside the sandbox is read or removed. `out/` is an additive sibling of
+//! inside the sandbox is read or removed. Only file members are unpacked,
+//! never a link, and only at a plain relative path, so nothing lands outside
+//! `out/`. `out/` is an additive sibling of
 //! `log.txt` under the same version-1 manifest: a slot holds a log, an `out/`,
 //! or both. A failed unpack of `out/` keeps the log slot and records why
 //! ([`FailureSlot::out_error`]).
@@ -427,12 +429,13 @@ impl SlotIo {
         unpack: |tar, to| {
             use anyhow::Context as _;
             std::fs::create_dir(to).with_context(|| format!("creating {}", to.display()))?;
-            // A member is a workspace-relative path; anything else could
-            // land outside `out/`.
-            hcore::hartifactcontent::unpack::unpack(
+            // A member is a workspace-relative path, and a file: anything
+            // else could land outside `out/` (`../x`, or a link `l -> ..`
+            // followed by `l/x`). The managed layer packs a link as what it
+            // resolves to, so a link member was never its.
+            hcore::hartifactcontent::unpack::unpack_files_only(
                 tar,
                 to,
-                None,
                 Some(&|p: &Path| hdriver_support::failure_out::is_plain_relative(p)),
             )
         },
@@ -1432,8 +1435,8 @@ mod tests {
         assert_eq!(slots.read(&a).map(|m| m.addr), Some(a.format()));
     }
 
-    /// The tar is unpacked, symlinks as symlinks, and the owned tar is freed;
-    /// a borrowed one is left alone.
+    /// The tar's files are unpacked, a link member is not, and the owned tar
+    /// is freed; a borrowed one is left alone.
     #[tokio::test]
     async fn failure_out_unpacks_and_frees_the_owned_tar() {
         let home = tempfile::tempdir().expect("home");
@@ -1458,9 +1461,9 @@ mod tests {
             std::fs::read(out.join("pkg/report/data/trace.zip")).expect("trace"),
             b"zip"
         );
-        assert_eq!(
-            std::fs::read_link(out.join("pkg/report/latest.html")).expect("still a link"),
-            Path::new("index.html")
+        assert!(
+            std::fs::symlink_metadata(out.join("pkg/report/latest.html")).is_err(),
+            "a link member is never unpacked"
         );
         assert!(!staging.exists(), "the owned tar is freed");
 
@@ -1476,6 +1479,103 @@ mod tests {
             staging.is_file(),
             "a borrowed tar is the driver's to remove"
         );
+    }
+
+    /// A raw tar header for `name`, written byte for byte: the `tar` crate's
+    /// builder refuses a `..` component, which is what this test feeds.
+    fn raw_header(name: &str, kind: tar::EntryType, size: u64, link: &str) -> tar::Header {
+        let mut h = tar::Header::new_gnu();
+        let gnu = h.as_gnu_mut().expect("gnu header");
+        for (slot, b) in gnu.name.iter_mut().zip(name.bytes()) {
+            *slot = b;
+        }
+        for (slot, b) in gnu.linkname.iter_mut().zip(link.bytes()) {
+            *slot = b;
+        }
+        h.set_entry_type(kind);
+        h.set_size(size);
+        h.set_mode(0o644);
+        h.set_cksum();
+        h
+    }
+
+    /// Every path under `dir`, links not followed, relative to `dir`, with
+    /// whether it is a link.
+    fn tree(dir: &Path) -> Vec<(PathBuf, bool)> {
+        let mut found = Vec::new();
+        let mut todo = vec![dir.to_path_buf()];
+        while let Some(d) = todo.pop() {
+            for e in std::fs::read_dir(&d).expect("ls") {
+                let p = e.expect("entry").path();
+                let ft = std::fs::symlink_metadata(&p).expect("lstat").file_type();
+                if ft.is_dir() {
+                    todo.push(p.clone());
+                }
+                let rel = p.strip_prefix(dir).expect("under dir").to_path_buf();
+                found.push((rel, ft.is_symlink()));
+            }
+        }
+        found.sort();
+        found
+    }
+
+    /// A `failure_out` tar the managed layer never packs — a `../` member, a
+    /// link to `../../..` and a file written through that link — unpacked
+    /// through the real fill: nothing lands outside `out/`, and no link is
+    /// created.
+    #[tokio::test]
+    async fn failure_out_never_writes_outside_out() {
+        let root = tempfile::tempdir().expect("root");
+        let home = root.path().join("home");
+        let sandbox = root.path().join("sandbox");
+        std::fs::create_dir_all(&sandbox).expect("sandbox");
+        let slots = FailureSlots::new(&home);
+        let a = addr("//p:a");
+        let tar_path = stage_with(&sandbox, |_| {});
+        let mut b = tar::Builder::new(std::fs::File::create(&tar_path).expect("tar"));
+        for (name, kind, data, link) in [
+            ("ok.txt", tar::EntryType::Regular, &b"ok"[..], ""),
+            (
+                "../escape.txt",
+                tar::EntryType::Regular,
+                &b"escaped"[..],
+                "",
+            ),
+            ("l", tar::EntryType::Symlink, &b""[..], "../../.."),
+            ("l/x.txt", tar::EntryType::Regular, &b"through"[..], ""),
+        ] {
+            let h = raw_header(name, kind, data.len() as u64, link);
+            b.append(&h, data).expect("append");
+        }
+        b.finish().expect("finish");
+        drop(b);
+
+        let err = with_failure_artifacts(anyhow::anyhow!("boom"), vec![out_artifact(&tar_path)]);
+        let slot = fill_ops(&slots, &a, &sandbox, &err, false, SlotIo::REAL).await;
+        let out = slot.out.expect("unpacked");
+        assert!(slot.out_error.is_none(), "{:?}", slot.out_error);
+        assert_eq!(
+            tree(&out),
+            [
+                (PathBuf::from("l"), false),
+                (PathBuf::from("l/x.txt"), false),
+                (PathBuf::from("ok.txt"), false),
+            ],
+            "the files, `l` a plain directory, nothing else"
+        );
+        let out_rel = out.strip_prefix(root.path()).expect("out under root");
+        let strays: Vec<_> = tree(root.path())
+            .into_iter()
+            .filter(|(p, link)| {
+                *link
+                    || (!p.starts_with(out_rel)
+                        && matches!(
+                            p.file_name().and_then(|n| n.to_str()),
+                            Some("escape.txt" | "x.txt")
+                        ))
+            })
+            .collect();
+        assert!(strays.is_empty(), "written outside out/: {strays:?}");
     }
 
     /// The `.tmp-` directories under the slots root.
