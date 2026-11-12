@@ -20,6 +20,7 @@ mod find;
 mod grep;
 mod sed;
 mod tmpl;
+mod which;
 
 use anyhow::Context as _;
 use std::ffi::OsString;
@@ -36,11 +37,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 ///
 /// Bump it on any observable behaviour change — an applet added or removed, an
 /// upstream upgrade that changes output, a fix to one of the hand-written parts.
-pub const COREUTILS_VERSION: u32 = 6;
+pub const COREUTILS_VERSION: u32 = 7;
 
 /// Where the applets come from, for `heph tool coreutils list`.
 pub const UPSTREAM: &str =
-    "uutils/coreutils 0.12, uutils/findutils 0.10, ripgrep's grep-* crates, tar/flate2/zstd";
+    "uutils/coreutils 0.12, uutils/findutils 0.10, ripgrep's grep-* crates, tar/flate2/zstd, which";
 
 /// One utility, and the entry point that runs it.
 #[derive(Debug)]
@@ -76,31 +77,41 @@ macro_rules! uu {
 }
 
 applets! {
+    "b2sum" => uu!(uu_b2sum),
     "base64" => uu!(uu_base64),
     "basename" => uu!(uu_basename),
     "cat" => uu!(uu_cat),
     "chmod" => uu!(uu_chmod),
+    "cksum" => uu!(uu_cksum),
     "comm" => uu!(uu_comm),
     "cp" => uu!(uu_cp),
     "cut" => uu!(uu_cut),
     "date" => uu!(uu_date),
+    "dd" => uu!(uu_dd),
     "dirname" => uu!(uu_dirname),
+    "du" => uu!(uu_du),
     "echo" => uu!(uu_echo),
     "env" => uu!(uu_env),
     "false" => uu!(uu_false),
     "find" => crate::find::find,
     "grep" => crate::grep::main,
+    "groups" => uu!(uu_groups),
     "gunzip" => crate::archive::gunzip,
     "gzip" => crate::archive::gzip,
     "head" => uu!(uu_head),
+    "id" => uu!(uu_id),
     "install" => uu!(uu_install),
     "ln" => uu!(uu_ln),
+    "ls" => uu!(uu_ls),
     "md5sum" => uu!(uu_md5sum),
     "mkdir" => uu!(uu_mkdir),
     "mktemp" => uu!(uu_mktemp),
     "mv" => uu!(uu_mv),
     "nproc" => uu!(uu_nproc),
+    "od" => uu!(uu_od),
+    "printenv" => uu!(uu_printenv),
     "printf" => uu!(uu_printf),
+    "pwd" => uu!(uu_pwd),
     "readlink" => uu!(uu_readlink),
     "realpath" => uu!(uu_realpath),
     "rm" => uu!(uu_rm),
@@ -112,18 +123,25 @@ applets! {
     "sha512sum" => uu!(uu_sha512sum),
     "sleep" => uu!(uu_sleep),
     "sort" => uu!(uu_sort),
+    "split" => uu!(uu_split),
     "stat" => uu!(uu_stat),
     "tail" => uu!(uu_tail),
     "tar" => crate::archive::tar,
     "tee" => uu!(uu_tee),
+    "test" => uu!(uu_test),
     "timeout" => uu!(uu_timeout),
     "tmpl" => crate::tmpl::main,
     "touch" => uu!(uu_touch),
     "tr" => uu!(uu_tr),
     "true" => uu!(uu_true),
+    "truncate" => uu!(uu_truncate),
     "uniq" => uu!(uu_uniq),
+    "unlink" => uu!(uu_unlink),
     "wc" => uu!(uu_wc),
+    "which" => crate::which::main,
+    "whoami" => uu!(uu_whoami),
     "xargs" => crate::find::xargs,
+    "yes" => uu!(uu_yes),
     "zstd" => crate::archive::zstd,
 }
 
@@ -399,7 +417,77 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_shell_basics_ship() {
+        // Uniform across hosts, so not a divergence — but the host's
+        // directories are not on a target's PATH, and a `--shell` into a
+        // sandbox without these cannot even look at what it was given.
+        for name in ["ls", "pwd", "test", "which", "printenv", "du", "id"] {
+            assert!(is_applet(name), "{name} must ship");
+        }
+    }
+
     // --- golden cases: filesystem effects + exit code ---
+
+    #[test]
+    fn dd_copies_the_requested_blocks() {
+        // `if=`/`of=` are not whole operands, so the `@` rewrite cannot reach
+        // them; run from inside the tree with relative paths instead.
+        golden_cwd(
+            |d| write(d, "src", "abcdef"),
+            &["dd", "if=src", "of=out", "bs=2", "count=2", "status=none"],
+            0,
+            &["out (4 bytes)", "src (6 bytes)"],
+        );
+    }
+
+    #[test]
+    fn truncate_grows_and_shrinks() {
+        golden(
+            |d| write(d, "f", "abcdef"),
+            &["truncate", "-s", "2", "@f"],
+            0,
+            &["f (2 bytes)"],
+        );
+        golden(
+            |_| {},
+            &["truncate", "-s", "1K", "@new"],
+            0,
+            &["new (1024 bytes)"],
+        );
+    }
+
+    #[test]
+    fn split_chunks_by_bytes() {
+        golden(
+            |d| {
+                write(d, "src", "abcde");
+                std::fs::create_dir(d.join("out")).unwrap();
+            },
+            &["split", "-b", "2", "@src", "@out/x"],
+            0,
+            &[
+                "out/",
+                "out/xaa (2 bytes)",
+                "out/xab (2 bytes)",
+                "out/xac (1 bytes)",
+                "src (5 bytes)",
+            ],
+        );
+    }
+
+    #[test]
+    fn unlink_removes_one_file() {
+        golden(
+            |d| {
+                write(d, "gone", "x");
+                write(d, "kept", "y");
+            },
+            &["unlink", "@gone"],
+            0,
+            &["kept (1 bytes)"],
+        );
+    }
 
     #[test]
     fn install_d_makes_the_parent_dirs() {
