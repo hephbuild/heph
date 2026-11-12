@@ -1275,6 +1275,11 @@ enum GlobStep {
 /// than through `glob::glob`, which follows a linked directory on `**`: a link
 /// to `/` would walk the host, and a link to an ancestor would recurse until
 /// the path is too long. A name that is not UTF-8 never matches.
+///
+/// The walk reads only the depth the pattern names: with no `**` after the
+/// prefix it stops at as many levels as the pattern has components, and it
+/// never descends a directory no match can be under (see [`may_hold_match`]).
+/// `*.txt` reads the top directory, not every staged input below it.
 fn glob_walk(
     ws_dir: &Path,
     pattern: &str,
@@ -1283,10 +1288,17 @@ fn glob_walk(
     mut visit: impl FnMut(&walkdir::DirEntry, &Path) -> anyhow::Result<GlobStep>,
 ) -> anyhow::Result<()> {
     let compiled = glob::Pattern::new(pattern).context("compiling the pattern")?;
-    let prefix: PathBuf = pattern
-        .split('/')
-        .take_while(|c| !c.contains(['*', '?', '[']))
-        .collect();
+    let mut components = pattern.split('/').peekable();
+    let mut prefix = PathBuf::new();
+    while let Some(c) = components.next_if(|c| !c.contains(['*', '?', '['])) {
+        prefix.push(c);
+    }
+    // One single-component pattern per component after the prefix; `None`
+    // for `**`, which the glob crate only accepts as a whole component.
+    let rest: Vec<Option<glob::Pattern>> = components
+        .map(|c| (c != "**").then(|| glob::Pattern::new(c)).transpose())
+        .collect::<Result<_, _>>()
+        .context("compiling the pattern's components")?;
     let base = ws_dir.join(&prefix);
     let resolves = match walk.reading {
         Reading::Build { .. } => fs::metadata(&base).is_ok(),
@@ -1295,10 +1307,13 @@ fn glob_walk(
     if !resolves {
         return Ok(());
     }
-    let mut entries = walkdir::WalkDir::new(&base)
+    let mut walker = walkdir::WalkDir::new(&base)
         .min_depth(1)
-        .sort_by_file_name()
-        .into_iter();
+        .sort_by_file_name();
+    if rest.iter().all(Option::is_some) {
+        walker = walker.max_depth(rest.len());
+    }
+    let mut entries = walker.into_iter();
     while let Some(entry) = entries.next() {
         check_stop(stop)?;
         let entry = match (entry, walk.reading) {
@@ -1318,6 +1333,15 @@ fn glob_walk(
             .to_str()
             .is_some_and(|r| compiled.matches_with(r, GLOB_OPTS))
         {
+            // `skip_current_dir` after a file would skip its siblings.
+            if entry.file_type().is_dir()
+                && !entry
+                    .path()
+                    .strip_prefix(&base)
+                    .is_ok_and(|below| may_hold_match(&rest, below))
+            {
+                entries.skip_current_dir();
+            }
             continue;
         }
         if let GlobStep::SkipDir = visit(&entry, rel)? {
@@ -1325,6 +1349,30 @@ fn glob_walk(
         }
     }
     Ok(())
+}
+
+/// Whether a directory at `below` (relative to the pattern's literal prefix)
+/// can hold a match of `rest`, the pattern's components after that prefix:
+/// each of its components matches its own component of the pattern up to a
+/// `**`, which matches whatever follows, and the pattern goes deeper than it.
+fn may_hold_match(rest: &[Option<glob::Pattern>], below: &Path) -> bool {
+    let mut rest = rest.iter();
+    for component in below.components() {
+        match rest.next() {
+            None => return false,
+            Some(None) => return true,
+            Some(Some(p)) => {
+                if !component
+                    .as_os_str()
+                    .to_str()
+                    .is_some_and(|c| p.matches_with(c, GLOB_OPTS))
+                {
+                    return false;
+                }
+            }
+        }
+    }
+    rest.next().is_some()
 }
 
 /// Pack `tar` into a new file under `<sandbox>/heph-collect-artifacts/` and

@@ -560,6 +560,68 @@ mod tests {
         );
     }
 
+    /// The members a `failure_out` glob packs under `ws`, and how many
+    /// entries its walk read: the walk polls `stop` once on entry and once
+    /// per entry it reads, and a matched file polls it no more.
+    fn glob_walked(ws: &Path, pattern: &str) -> (Vec<String>, usize) {
+        let roots = [fs::canonicalize(ws).expect("canonical ws")];
+        let walk = Walk {
+            missing_ok: true,
+            skip: &|_: &Path| false,
+            reading: Reading::Diagnostics { roots: &roots },
+        };
+        let polls = std::cell::Cell::new(0_usize);
+        let mut members = Vec::new();
+        add_content(
+            &mut |_, member| members.push(member),
+            ws,
+            &Content::Glob(pattern.into()),
+            "",
+            &|| {
+                polls.set(polls.get() + 1);
+                false
+            },
+            &walk,
+        )
+        .expect("walk");
+        (members, polls.get() - 1)
+    }
+
+    /// A glob with no `**` reads only as deep as it has components: `*.txt`
+    /// never opens a nested directory, `a/*/x.txt` never goes below `a/*/*`.
+    #[test]
+    fn glob_walk_reads_only_the_depth_it_names() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ws = tmp.path().join("ws");
+        write(&ws.join("top.txt"), "t");
+        write(&ws.join("deep/1/2/3/4/5/x.txt"), "d");
+        let (members, read) = glob_walked(&ws, "*.txt");
+        assert_eq!(members, ["top.txt"]);
+        assert_eq!(read, 2, "`deep` and `top.txt`, nothing below `deep`");
+
+        write(&ws.join("a/b/x.txt"), "x");
+        write(&ws.join("a/b/c/d/x.txt"), "deeper");
+        let (members, read) = glob_walked(&ws, "a/*/x.txt");
+        assert_eq!(members, ["a/b/x.txt"]);
+        assert_eq!(
+            read, 3,
+            "`a/b`, `a/b/c` and `a/b/x.txt`; `a/b/c` is not opened"
+        );
+    }
+
+    /// Under `**` the walk still never descends a directory whose path
+    /// cannot lead to a match.
+    #[test]
+    fn glob_walk_prunes_what_cannot_match() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ws = tmp.path().join("ws");
+        write(&ws.join("a/b1/z/x.txt"), "x");
+        write(&ws.join("a/c/1/2/3/x.txt"), "pruned");
+        let (members, read) = glob_walked(&ws, "a/b*/**/x.txt");
+        assert_eq!(members, ["a/b1/z/x.txt"]);
+        assert_eq!(read, 4, "`a/b1`, `a/b1/z`, its `x.txt`, and `a/c` unopened");
+    }
+
     fn process_failed(exit: Exit) -> anyhow::Error {
         anyhow::Error::new(hplugin::error::ProcessFailed::new(
             format!("{exit:?}"),
