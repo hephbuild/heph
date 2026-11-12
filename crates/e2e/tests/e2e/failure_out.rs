@@ -67,7 +67,7 @@ fn slot_root_names(engine: &Engine) -> Vec<String> {
 }
 
 /// One entry of a [`tree`].
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Entry {
     Dir,
     File(Vec<u8>),
@@ -533,9 +533,11 @@ async fn directory_is_copied_whole() -> anyhow::Result<()> {
 }
 
 /// Names with spaces, non-ASCII and non-UTF-8 bytes, and a deep path: the
-/// slot's tree is the run's tree, byte for byte. Linux filesystems take the
-/// non-UTF-8 name; APFS refuses it (`EILSEQ`), which the run records in
-/// `nonutf8-refused`, outside `failure_out`.
+/// slot's tree is the run's tree, byte for byte, but for a non-UTF-8 name,
+/// which a tar member cannot carry and is skipped (as an `out` path would be
+/// mangled). Linux filesystems take the non-UTF-8 name; APFS refuses it
+/// (`EILSEQ`), which the run records in `nonutf8-refused`, outside
+/// `failure_out`.
 #[tokio::test]
 async fn odd_names() -> anyhow::Result<()> {
     let ws = Workspace::new();
@@ -550,9 +552,11 @@ async fn odd_names() -> anyhow::Result<()> {
     assert!(ran.len() >= 21, "the run wrote its tree: {:?}", names(&ran));
     assert!(ran.contains_key("ünïcödé ✓.txt".as_bytes()));
     let kept = tree(&out_dir(&ws.engine, "//p:t").join("p/odd"));
-    assert_eq!(kept, ran, "kept byte-exact");
-
     let non_utf8: &[u8] = b"bad\xffname";
+    let mut want = ran.clone();
+    want.remove(non_utf8);
+    assert_eq!(kept, want, "kept byte-exact, but for the non-UTF-8 name");
+
     let refused = pkg.join("nonutf8-refused").exists();
     if cfg!(target_os = "linux") {
         assert!(!refused, "the filesystem refused a non-UTF-8 name");
@@ -562,7 +566,7 @@ async fn odd_names() -> anyhow::Result<()> {
             "the run wrote the non-UTF-8 name: {:?}",
             names(&ran)
         );
-        assert_eq!(kept.get(non_utf8), ran.get(non_utf8), "and it was kept");
+        assert_eq!(kept.get(non_utf8), None, "and it was skipped");
     } else {
         assert!(refused, "APFS took a non-UTF-8 name: {:?}", names(&ran));
         assert!(
