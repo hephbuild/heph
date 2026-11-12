@@ -584,6 +584,9 @@ pub struct TargetFailure {
 pub enum FailureFixes {
     /// The fixes written back over the tree while the target still failed.
     Written {
+        /// The workspace root the fixes were written under: what `paths` are
+        /// relative to, and where the box's restore hint runs git.
+        root: std::path::PathBuf,
         /// Every path written, workspace-relative, sorted. Empty when the
         /// run's fixes matched the tree already.
         paths: Vec<String>,

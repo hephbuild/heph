@@ -225,8 +225,10 @@ fn walk(dir: &Path) -> Vec<String> {
     out
 }
 
-fn written(paths: &[&str], list: Option<PathBuf>) -> Option<FailureFixes> {
+/// The fixes an engine at `root` reports: written under that root.
+fn written(root: &Path, paths: &[&str], list: Option<PathBuf>) -> Option<FailureFixes> {
     Some(FailureFixes::Written {
+        root: root.to_path_buf(),
         paths: paths.iter().map(|p| (*p).to_string()).collect(),
         list,
     })
@@ -250,7 +252,11 @@ async fn writes_fixes_on_failure_and_fails() -> anyhow::Result<()> {
     let slot = slot_dir(&ws.engine, ADDR);
     assert_eq!(
         failed.of(ADDR).fixes,
-        written(&["fix/src.txt"], Some(slot.join("fixes.txt"))),
+        written(
+            ws.engine.root(),
+            &["fix/src.txt"],
+            Some(slot.join("fixes.txt"))
+        ),
         "{}",
         failed.error
     );
@@ -268,7 +274,11 @@ async fn writes_fixes_on_failure_and_fails() -> anyhow::Result<()> {
     let again = resolve_failing(&ws.engine, ADDR, &ResultOptions::default()).await?;
     assert_eq!(
         again.of(ADDR).fixes,
-        written(&["fix/src.txt"], Some(slot.join("fixes.txt"))),
+        written(
+            ws.engine.root(),
+            &["fix/src.txt"],
+            Some(slot.join("fixes.txt"))
+        ),
         "re-executed, not served from a cache entry: {}",
         again.error
     );
@@ -307,6 +317,7 @@ target(
     assert_eq!(
         failed.of(ADDR).fixes,
         written(
+            ws.engine.root(),
             &["fix/a.txt"],
             Some(slot_dir(&ws.engine, ADDR).join("fixes.txt"))
         )
@@ -440,6 +451,7 @@ target(
     assert_eq!(
         failed.of("//p:fmt").fixes,
         written(
+            ws.engine.root(),
             &["p/src.txt"],
             Some(slot_dir(&ws.engine, "//p:fmt").join("fixes.txt"))
         )
@@ -662,6 +674,7 @@ target(
     assert_eq!(
         failed.of(ADDR).fixes,
         written(
+            engine.root(),
             &["fix/src.txt"],
             Some(slot_dir(&engine, ADDR).join("fixes.txt"))
         )
@@ -731,7 +744,7 @@ target(
     let list = slot_dir(&ws.engine, ADDR).join("fixes.txt");
     assert_eq!(
         failed.of(ADDR).fixes,
-        written(&want, Some(list.clone())),
+        written(ws.engine.root(), &want, Some(list.clone())),
         "{}",
         failed.error
     );
@@ -789,6 +802,7 @@ target(
     assert_eq!(
         f.fixes,
         written(
+            ws.engine.root(),
             &["fix/src.txt"],
             Some(slot_dir(&ws.engine, ADDR).join("fixes.txt"))
         )
@@ -838,6 +852,7 @@ target(
     assert_eq!(
         failed.of(ADDR).fixes,
         written(
+            ws.engine.root(),
             &["fix/gen/a.txt"],
             Some(slot_dir(&ws.engine, ADDR).join("fixes.txt"))
         ),

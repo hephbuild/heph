@@ -1185,6 +1185,7 @@ mod tests {
         let a = addr("//p:a");
         let err = anyhow::anyhow!("boom");
         let paths = vec!["p/a.go".to_owned(), "p/sub/b.go".to_owned()];
+        let root = std::path::PathBuf::from("/ws");
         let slot = slots
             .fill(Fill {
                 addr: &a,
@@ -1194,6 +1195,7 @@ mod tests {
                 lines: 10,
                 material: false,
                 fixes: Some(FailureFixes::Written {
+                    root: root.clone(),
                     paths: paths.clone(),
                     list: None,
                 }),
@@ -1203,6 +1205,7 @@ mod tests {
         assert_eq!(
             slot.fixes,
             Some(FailureFixes::Written {
+                root,
                 paths,
                 list: Some(dir.join(FIXES)),
             })
@@ -1397,6 +1400,7 @@ mod tests {
                     lines: 10,
                     material: true,
                     fixes: Some(FailureFixes::Written {
+                        root: sandbox.path().to_path_buf(),
                         paths: paths.clone(),
                         list: None,
                     }),
@@ -1414,6 +1418,7 @@ mod tests {
         assert_eq!(
             slot.fixes,
             Some(FailureFixes::Written {
+                root: sandbox.path().to_path_buf(),
                 paths,
                 list: Some(dir.join(FIXES)),
             })

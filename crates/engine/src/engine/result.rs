@@ -1252,7 +1252,8 @@ impl FailureWriteBackRan {
         }
     }
 
-    fn report(&self, addr: &Addr) -> WriteBackOnFailure {
+    /// `root` is the workspace root the fixes were written under.
+    fn report(&self, addr: &Addr, root: &std::path::Path) -> WriteBackOnFailure {
         use hplugin::error::{FailureFixes, FixesNotWritten};
         match self {
             Self::Written(written) => {
@@ -1262,7 +1263,11 @@ impl FailureWriteBackRan {
                     .collect();
                 paths.sort_unstable();
                 WriteBackOnFailure {
-                    fixes: Some(FailureFixes::Written { paths, list: None }),
+                    fixes: Some(FailureFixes::Written {
+                        root: root.to_path_buf(),
+                        paths,
+                        list: None,
+                    }),
                     error: None,
                 }
             }
@@ -4414,7 +4419,7 @@ impl Engine {
         match ran.get() {
             // A passing frame of this addr already wrote the tree this request.
             None => WriteBackOnFailure::default(),
-            Some(ran) => ran.report(&def.target.addr),
+            Some(ran) => ran.report(&def.target.addr, self.root()),
         }
     }
 
@@ -15324,7 +15329,7 @@ mod tests {
             anyhow::Error::new(MovedSourceError("it changed while it ran".to_string()))
                 .context("guarding"),
         )
-        .report(&def.target.addr);
+        .report(&def.target.addr, root.path());
         assert_eq!(
             moved.fixes,
             Some(hplugin::error::FailureFixes::NotWritten(

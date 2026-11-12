@@ -14,18 +14,6 @@ use crate::engine::error::{
 use crate::hmemoizer::{chain_frames, downcast_chain_ref};
 use crate::tui::color::stderr_color_enabled as color_enabled;
 
-/// The workspace root of this process's command, for the restore hint: the
-/// written-back paths are workspace-relative, and the hint must work from any
-/// cwd. Process-global like `diag`'s dump dir, set once by the engine
-/// bootstrap; no test sets it.
-static WORKSPACE_ROOT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
-
-/// Record the workspace root the restore hint runs git in. Called once the
-/// root is known; a later call is ignored.
-pub fn set_workspace_root(root: &std::path::Path) {
-    drop(WORKSPACE_ROOT.set(root.to_path_buf()));
-}
-
 /// Render the cause chain of an `anyhow::Error`, dropping the leading frames that
 /// merely restate the target address (engine boundaries like `execute //addr`,
 /// already shown in the title) and joining the rest the way anyhow's `{:#}`
@@ -125,15 +113,6 @@ fn render_diff_box(out: &mut String, diff: &str, color: bool) {
 /// Render a single target failure to a string. The `×` and `╰─▶` markers are red
 /// when `color`.
 fn render_target_failure(f: &TargetFailure, color: bool) -> String {
-    render_target_failure_in(f, color, WORKSPACE_ROOT.get().map(|p| p.as_path()))
-}
-
-/// [`render_target_failure`] with the workspace root the restore hint names.
-fn render_target_failure_in(
-    f: &TargetFailure,
-    color: bool,
-    root: Option<&std::path::Path>,
-) -> String {
     let cross = if color {
         format!("{}", "×".red())
     } else {
@@ -178,7 +157,7 @@ fn render_target_failure_in(
         out.push_str(&format!("  outputs: {}\n", outputs.display()));
     }
     if let Some(fixes) = &f.fixes {
-        render_fixes(&mut out, fixes, root);
+        render_fixes(&mut out, fixes);
     }
     out
 }
@@ -190,24 +169,22 @@ const FIXES_SHOWN: usize = 10;
 /// it changed and how to undo that, or why it changed nothing. A write-back
 /// that matched the tree already says nothing.
 ///
-/// The restore hint runs git in `root` (`-C`), since the paths are
-/// workspace-relative and the user's cwd may be anywhere, and with
+/// The restore hint runs git in the root the fixes were written under (`-C`),
+/// since the paths are workspace-relative and the user's cwd may be anywhere,
+/// and with
 /// `--literal-pathspecs`, since git reads a pathspec as a glob: `web/[id].ts`
 /// would also revert `web/i.ts`. It restores the index version, so it says
 /// that uncommitted edits to those files go with it.
-fn render_fixes(out: &mut String, fixes: &FailureFixes, root: Option<&std::path::Path>) {
-    let git = match root {
-        Some(root) => format!(
-            "git -C {} --literal-pathspecs checkout",
-            shell_quote(&root.to_string_lossy())
-        ),
-        None => "git --literal-pathspecs checkout".to_string(),
-    };
+fn render_fixes(out: &mut String, fixes: &FailureFixes) {
     const RESTORE: &str =
         "  restore with (takes the index version; uncommitted edits to these files are lost):\n";
     match fixes {
         FailureFixes::Written { paths, .. } if paths.is_empty() => {}
-        FailureFixes::Written { paths, list } => {
+        FailureFixes::Written { root, paths, list } => {
+            let git = format!(
+                "git -C {} --literal-pathspecs checkout",
+                shell_quote(&root.to_string_lossy())
+            );
             out.push_str(
                 "  fixes written, target still failed (re-run to verify; \
                  codegen = \"in_place_on_success\" opts out):\n",
@@ -1485,7 +1462,7 @@ mod tests {
         let addr = || crate::htaddr::parse_addr("//web:lint").unwrap();
         let slot = std::path::Path::new("/ws/.heph/failures/abc");
 
-        let root = Some(std::path::Path::new("/my ws"));
+        let root = || std::path::PathBuf::from("/my ws");
 
         // Few fixes: every path, and a restore hint naming each one. It runs
         // git in the (quoted) workspace root, since the paths are
@@ -1494,6 +1471,7 @@ mod tests {
         let f = TargetFailure::new(addr(), None, anyhow::anyhow!("boom"))
             .with_outputs(Some(slot.join("out")))
             .with_fixes(Some(FailureFixes::Written {
+                root: root(),
                 paths: vec!["web/[id].ts".into(), "web/my file.ts".into()],
                 list: Some(slot.join("fixes.txt")),
             }));
@@ -1507,18 +1485,19 @@ mod tests {
   restore with (takes the index version; uncommitted edits to these files are lost):
     git -C '/my ws' --literal-pathspecs checkout -- 'web/[id].ts' 'web/my file.ts'
 ";
-        assert_eq!(render_target_failure_in(&f, false, root), expected);
+        assert_eq!(render_target_failure(&f, false), expected);
 
         // Twelve fixes: ten named, the rest counted, and the restore reads the
         // full list rather than the ten the box shows.
         let paths: Vec<String> = (0..12).map(|i| format!("web/f{i:02}.ts")).collect();
         let f = TargetFailure::new(addr(), None, anyhow::anyhow!("boom")).with_fixes(Some(
             FailureFixes::Written {
+                root: root(),
                 paths: paths.clone(),
                 list: Some(slot.join("fixes.txt")),
             },
         ));
-        let rendered = render_target_failure_in(&f, false, root);
+        let rendered = render_target_failure(&f, false);
         let mut expected = String::from(
             "× target failed: //web:lint\n╰─▶ boom\n  fixes written, target still failed \
              (re-run to verify; codegen = \"in_place_on_success\" opts out):\n",
@@ -1534,19 +1513,19 @@ mod tests {
         assert_eq!(rendered, expected);
         assert!(!rendered.contains("outputs:"), "{rendered}");
 
-        // Twelve fixes and no list kept: the hint still names all twelve. With
-        // no root recorded, git runs in the cwd, still reading paths literally.
+        // Twelve fixes and no list kept: the hint still names all twelve.
         let f = TargetFailure::new(addr(), None, anyhow::anyhow!("boom")).with_fixes(Some(
             FailureFixes::Written {
+                root: root(),
                 paths: paths.clone(),
                 list: None,
             },
         ));
-        let rendered = render_target_failure_in(&f, false, None);
+        let rendered = render_target_failure(&f, false);
         assert!(rendered.contains("    +2 more\n"), "{rendered}");
         assert!(
             rendered.ends_with(&format!(
-                "    git --literal-pathspecs checkout -- {}\n",
+                "    git -C '/my ws' --literal-pathspecs checkout -- {}\n",
                 paths.join(" ")
             )),
             "{rendered}"
@@ -1555,6 +1534,7 @@ mod tests {
         // A write-back that matched the tree already says nothing.
         let f = TargetFailure::new(addr(), None, anyhow::anyhow!("boom")).with_fixes(Some(
             FailureFixes::Written {
+                root: root(),
                 paths: vec![],
                 list: None,
             },
