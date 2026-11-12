@@ -10452,14 +10452,18 @@ mod tests {
         let rs = engine.new_state();
         let addr = hmodel::htaddr::parse_addr("//pkg:a")?;
         let sandbox = tempfile::tempdir().expect("tempdir");
-        let staging = sandbox.path().join(".heph-failure-out");
-        std::fs::create_dir_all(staging.join("pkg/report"))?;
-        std::fs::write(staging.join("pkg/report/index.html"), "<html>")?;
+        let tar_path = sandbox.path().join("failureout.tar");
+        let mut tar = hcore::hartifactcontent::tar::TarPacker::new();
+        tar.create_raw(b"<html>".to_vec(), "pkg/report/index.html", false);
+        tar.pack(std::fs::File::create(&tar_path)?)?;
+        let tar_path = tar_path.to_str().expect("utf-8").to_owned();
         let failed = || {
-            hplugin::error::with_failure_artifacts(
-                anyhow::anyhow!("exit 1"),
-                vec![hplugin::error::failure_out_artifact(&staging).expect("utf-8")],
-            )
+            let mut kept = hplugin::error::failure_out_artifact(tar_path.clone(), String::new());
+            // Read twice below: the driver keeps it.
+            if let hplugin::driver::outputartifact::Content::TarPath(t) = &mut kept.content {
+                t.owned = false;
+            }
+            hplugin::error::with_failure_artifacts(anyhow::anyhow!("exit 1"), vec![kept])
         };
 
         let e = slotted(&engine, &rs, &addr, sandbox.path(), failed()).await;

@@ -1,5 +1,6 @@
 use crate::driver::outputartifact::{
-    Content as OaContent, ContentFile, ContentRaw, OutputArtifact, Type as ArtifactType,
+    Content as OaContent, ContentFile, ContentPath, ContentRaw, OutputArtifact,
+    Type as ArtifactType,
 };
 use hmodel::htaddr::Addr;
 use std::fmt;
@@ -497,46 +498,34 @@ pub fn failure_log(err: &anyhow::Error) -> Option<&OutputArtifact> {
 }
 
 /// The name of the [`FailureArtifacts`] entry that carries a failed run's
-/// `failure_out` matches: a directory, already copied out of the tree the run
-/// wrote, laid out by workspace-relative path.
+/// `failure_out` matches: a tar packed in the sandbox, its members
+/// workspace-relative paths.
 pub const FAILURE_OUT_NAME: &str = "failure_out";
 
-/// The [`FailureArtifacts`] entry for the staged `failure_out` directory at
-/// `dir`: an `Output` artifact named [`FAILURE_OUT_NAME`] whose `File` content
-/// is the directory. No new artifact type and no new wire kind — an
-/// `OutputArtifact` of any type already crosses the plugin ABI on a
-/// `RunFailure`, and only [`failure_out_dir`] reads it back. `None` when the
-/// path is not UTF-8, which an artifact cannot name.
-pub fn failure_out_artifact(dir: &std::path::Path) -> Option<OutputArtifact> {
-    Some(OutputArtifact {
+/// The [`FailureArtifacts`] entry for the `failure_out` tar at `tar_path`:
+/// an `Output` artifact named [`FAILURE_OUT_NAME`] whose content is the tar,
+/// owned (the engine unpacks it into the failure slot and removes it). No new
+/// artifact type and no new wire kind — an `OutputArtifact` with `TarPath`
+/// content already crosses the plugin ABI on a `RunFailure`, and only
+/// [`failure_out_tar`] reads it back.
+pub fn failure_out_artifact(tar_path: String, hashout: String) -> OutputArtifact {
+    OutputArtifact {
         group: String::new(),
         name: FAILURE_OUT_NAME.to_string(),
         r#type: ArtifactType::Output,
-        content: OaContent::File(ContentFile {
-            source_path: dir.to_str()?.to_string(),
-            out_path: FAILURE_OUT_NAME.to_string(),
-            x: false,
-            // A copy in the sandbox, never a workspace file.
-            passthrough: false,
-        }),
-        hashout: String::new(),
-    })
+        content: OaContent::TarPath(ContentPath::owned(tar_path)),
+        hashout,
+    }
 }
 
-/// The staged `failure_out` directory the failure carries, if any (see
+/// The `failure_out` tar the failure carries, if any (see
 /// [`failure_out_artifact`]).
-pub fn failure_out_dir(err: &anyhow::Error) -> Option<&str> {
-    failure_artifacts(err)?
-        .0
-        .iter()
-        .find_map(|a| match &a.content {
-            OaContent::File(f)
-                if a.r#type == ArtifactType::Output && a.name == FAILURE_OUT_NAME =>
-            {
-                Some(f.source_path.as_str())
-            }
-            _ => None,
-        })
+pub fn failure_out_tar(err: &anyhow::Error) -> Option<&OutputArtifact> {
+    failure_artifacts(err)?.0.iter().find(|a| {
+        a.r#type == ArtifactType::Output
+            && a.name == FAILURE_OUT_NAME
+            && matches!(a.content, OaContent::TarPath(_))
+    })
 }
 
 impl fmt::Display for RemoteProcessFailed {

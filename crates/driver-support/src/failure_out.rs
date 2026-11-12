@@ -1,12 +1,18 @@
 //! `failure_out`: what a failed run leaves behind for the human fixing it.
 //!
-//! When a managed run fails with a process exit, the managed layer copies each
-//! of the target's [`FailureOutput`] matches out of the sandbox's workspace into
-//! `<sandbox>/.heph-failure-out/<workspace-relative path>`, while the sandbox
-//! (and a FUSE slot) is still live, and attaches that directory to the error as
-//! a [`FailureArtifacts`](hplugin::error::FailureArtifacts) entry
-//! ([`hplugin::error::failure_out_artifact`]). The engine renames it into the
+//! When a managed run fails with a process exit, the managed layer packs each
+//! of the target's [`FailureOutput`] matches, while the sandbox (and a FUSE
+//! slot) is still live, into one tar under
+//! `<sandbox>/heph-collect-artifacts/` (named under
+//! [`FAILURE_OUT_TAR_PREFIX`]), its members workspace-relative paths, and
+//! attaches it to the error as a
+//! [`FailureArtifacts`](hplugin::error::FailureArtifacts) entry
+//! ([`hplugin::error::failure_out_artifact`]). The engine unpacks it into the
 //! target's failure slot as `out/`.
+//!
+//! The walk and the pack are the ones outputs use
+//! ([`add_content`](crate::driver_managed::add_content) under
+//! `Reading::Diagnostics`, and the shared tar packer).
 //!
 //! - **Only after a process exit** ([`kept_failure_exit`]) **or the run's own
 //!   `timeout`** ([`Cancellable::timed_out`]): never on a request's cancellation,
@@ -18,47 +24,38 @@
 //! - **Inside the workspace.** A path with anything but plain components
 //!   (absolute, `..`, `.`) is skipped with a `warn!`; exec never produces one,
 //!   and the ABI refuses one at decode.
-//! - **Stoppable, and never recreating the sandbox.** The copy polls a stop
-//!   between files, and creates the staging directory with `create_dir`: a
-//!   job left running after its run was dropped stops, or fails on the
-//!   removed sandbox, rather than writing into it again.
-//! - **Copied** with `std::fs::copy`, which reflinks where the filesystem can.
-//!   Never a hardlink and never a rename of the original: a hardlink would
-//!   share an inode with a staged input, and an edit in the slot would change
-//!   that input under the same key.
+//! - **Stoppable, and never recreating the sandbox.** The walk and the pack
+//!   poll a stop, and the tar's directory is created with `create_dir`: a job
+//!   left running after its run was dropped stops, or fails on the removed
+//!   sandbox, rather than writing into it again.
+//! - **Packed, never linked.** A tar member is bytes; the slot's file is a new
+//!   inode, so an edit in the slot can never change a staged input.
 //! - **Lenient.** A path that matches nothing is skipped, and so is a file
-//!   that cannot be read. A symlink is followed
-//!   only when it resolves inside the sandbox's workspace or the shared stage
-//!   (a staged read-only input is a link into it); a dangling one, a loop, or
-//!   one leaving both is skipped. Inside a copied directory, a link to a
-//!   directory is never followed, so no walk can loop.
-//! - **Byte-exact names.** Paths are joined as `OsStr`s; a glob cannot match a
-//!   name that is not UTF-8, but a directory copied whole keeps every name.
+//!   that cannot be read. A symlink is kept as its content only when it
+//!   resolves inside the sandbox's workspace or the shared stage (a staged
+//!   read-only input is a link into it); a dangling one, a loop, or one leaving
+//!   both is skipped. Inside a packed directory, a link to a directory is never
+//!   followed, so no walk can loop.
+//! - **UTF-8 names.** A tar member names a UTF-8 path; a file whose name is not
+//!   UTF-8 is skipped.
 //! - **Never hides the failure.** A collect error is a `warn!` and a context
 //!   line on the target's own error.
 
-use anyhow::Context as _;
+use crate::driver_managed::{GLOB_OPTS, Reading, Walk, add_content, pack_to_artifact_tar};
+use hcore::hartifactcontent::tar::TarPacker;
 use hcore::hasync::Cancellable;
+use hplugin::driver::outputartifact::OutputArtifact;
 use hplugin::driver::targetdef::path::{CodegenMode, Content};
 use hplugin::driver::targetdef::{FailureOutput, TargetDef};
 use hplugin::error::Exit;
 use std::collections::BTreeSet;
 use std::fs;
-use std::io;
 use std::path::{Component, Path, PathBuf};
 
-/// The directory, directly under the run's sandbox, a failed run's
-/// `failure_out` matches are copied into. Outside `ws/`, so the run can never
-/// have written it, and nothing the run wrote is mistaken for it.
-pub const FAILURE_OUT_STAGING: &str = ".heph-failure-out";
-
-/// How the `failure_out` globs match: `*` stays within one component, and a
-/// leading dot is matched like any other character.
-const GLOB_OPTS: glob::MatchOptions = glob::MatchOptions {
-    case_sensitive: true,
-    require_literal_separator: true,
-    require_literal_leading_dot: false,
-};
+/// The name prefix of a `failure_out` tar (`failureout-<hashin>-out-….tar`)
+/// under the sandbox's `heph-collect-artifacts/`. An `out` tar's name starts
+/// with its hex `hashin`, and a write-back's with `writeback-`, so none meet.
+pub const FAILURE_OUT_TAR_PREFIX: &str = "failureout-";
 
 /// Whether a failed run keeps its `failure_out`: [`kept_failure_exit`], or a
 /// run stopped by its own `timeout` ([`Cancellable::timed_out`]: the engine
@@ -74,7 +71,7 @@ pub fn keeps_failure_out(
 
 /// Whether every component of `p` is a plain name: no root, no `..`, no `.`.
 /// A `failure_out` path is workspace-relative; anything else could reach out
-/// of the staging directory, or copy a file onto itself.
+/// of the sandbox, or out of the failure slot it is unpacked into.
 pub fn is_plain_relative(p: &Path) -> bool {
     p.components().all(|c| matches!(c, Component::Normal(_)))
 }
@@ -251,25 +248,30 @@ pub async fn keep_failure_write_back(
     }
 }
 
-/// Keep `outputs`' matches for a failed run: copy them out of `ws_dir` into
-/// `<staging_parent>/.heph-failure-out` and attach that directory to `err`.
+/// Keep `outputs`' matches for a failed run: pack them out of `ws_dir` into a
+/// tar under `<sandbox_dir>/heph-collect-artifacts/` and attach it to `err`.
 ///
 /// `follow_roots` are the directories, besides `ws_dir`, a symlink may resolve
 /// into and still be followed (the shared stage). Returns `err` unchanged when
 /// the run keeps nothing ([`keeps_failure_out`]), nothing matched, or the
-/// copy was stopped; with a `warn!` and one context line when collecting
+/// pack was stopped; with a `warn!` and one context line when collecting
 /// failed — never another error in its place.
 ///
-/// The copy stops when the request is cancelled, or this future dropped. A
-/// timed-out run's token is already cancelled, so its copy stops only on the
+/// The pack stops when the request is cancelled, or this future dropped. A
+/// timed-out run's token is already cancelled, so its pack stops only on the
 /// drop: the engine waits out its grace for it.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the managed layer's run state, passed through as its sibling keep_failure_write_back takes it"
+)]
 pub async fn keep_failure_outputs(
     err: anyhow::Error,
     outputs: &[FailureOutput],
+    hashin: &str,
     shell: bool,
     ctoken: &(dyn Cancellable + Send + Sync),
     ws_dir: &Path,
-    staging_parent: &Path,
+    sandbox_dir: &Path,
     follow_roots: &[PathBuf],
 ) -> anyhow::Error {
     if outputs.is_empty() || !keeps_failure_out(&err, shell, ctoken) {
@@ -277,34 +279,27 @@ pub async fn keep_failure_outputs(
     }
     let timed_out = ctoken.timed_out();
     let outputs = outputs.to_vec();
-    let staging = staging_parent.join(FAILURE_OUT_STAGING);
+    let hashin = hashin.to_owned();
     let mut roots = Vec::with_capacity(follow_roots.len() + 1);
     roots.push(ws_dir.to_path_buf());
     roots.extend_from_slice(follow_roots);
-    let ws_dir = ws_dir.to_path_buf();
+    let (ws_dir, sandbox_dir) = (ws_dir.to_path_buf(), sandbox_dir.to_path_buf());
     // Off the worker: a Playwright report is thousands of files.
-    let job_staging = staging.clone();
     let job = move |stop: &(dyn Fn() -> bool + Sync)| {
-        collect_failure_outputs(&outputs, &ws_dir, &job_staging, &roots, stop)
+        collect_failure_outputs(&outputs, &ws_dir, &sandbox_dir, &hashin, &roots, stop)
     };
-    let copied = if timed_out {
+    let collected = if timed_out {
         crate::stop::run_blocking_until_dropped(job).await
     } else {
         crate::stop::run_blocking(ctoken, job).await
     };
-    match copied {
-        Ok(0) => err,
+    match collected {
+        Ok(None) => err,
+        Ok(Some(a)) => hplugin::error::with_failure_artifacts(err, vec![a]),
         Err(e) if hplugin::error::is_cancelled(&e) => {
-            tracing::debug!(error = %format!("{e:#}"), "keeping failure_out: copy stopped");
+            tracing::debug!(error = %format!("{e:#}"), "keeping failure_out: pack stopped");
             err
         }
-        Ok(_) => match hplugin::error::failure_out_artifact(&staging) {
-            Some(a) => hplugin::error::with_failure_artifacts(err, vec![a]),
-            None => {
-                tracing::warn!(dir = %staging.display(), "failure_out staging dir is not UTF-8; not kept");
-                err.context("failure_out not kept: its staging directory is not UTF-8")
-            }
-        },
         Err(e) => {
             tracing::warn!(error = %format!("{e:#}"), "keeping failure_out");
             err.context(format!("failure_out not kept: {e:#}"))
@@ -326,292 +321,94 @@ fn plain_content(content: &Content) -> Option<&Content> {
     }
 }
 
-/// Copy every match of `outputs` under `ws_dir` into `staging`, at its
-/// workspace-relative path. Returns how many files were copied; with none,
-/// `staging` is left absent.
+/// Pack every match of `outputs` under `ws_dir` into one tar under
+/// `<sandbox_dir>/heph-collect-artifacts/`, each at its workspace-relative
+/// path, and return it as the [`hplugin::error::failure_out_artifact`]. With
+/// nothing matched, `None` and no tar.
 ///
-/// `stop` is polled before each file; once it reads true the copy returns
-/// [`crate::stop::cancelled`]. `staging` is created with `create_dir` and
-/// every directory under it one level at a time, so a parent that is gone (a
-/// sandbox removed under a job its run abandoned) fails the copy instead of
-/// being created again.
+/// `roots` (the workspace and the shared stage) are what a symlink may resolve
+/// inside and still be kept. A member two entries name (a file inside a
+/// declared directory and also matched by a glob) is packed once.
+///
+/// `stop` is polled before each file and while packing; once it reads true
+/// the collect returns [`crate::stop::cancelled`]. The tar's directory is
+/// created with `create_dir`, so a sandbox removed under a job its run
+/// abandoned fails the collect instead of being created again.
 pub fn collect_failure_outputs(
     outputs: &[FailureOutput],
     ws_dir: &Path,
-    staging: &Path,
+    sandbox_dir: &Path,
+    hashin: &str,
     roots: &[PathBuf],
     stop: &dyn Fn() -> bool,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<Option<OutputArtifact>> {
     let roots: Vec<PathBuf> = roots
         .iter()
         .filter_map(|r| fs::canonicalize(r).ok())
         .collect();
-    let mut matched: BTreeSet<PathBuf> = BTreeSet::new();
-    for output in outputs {
-        for content in output.paths.iter().filter_map(plain_content) {
-            match content {
-                Content::FilePath(p) | Content::DirPath(p) => {
-                    let rel = PathBuf::from(p.trim_end_matches('/'));
-                    if !rel.as_os_str().is_empty() {
-                        matched.insert(rel);
-                    }
-                }
-                Content::Glob(pattern) => glob_matches(ws_dir, pattern, &roots, &mut matched)
-                    .with_context(|| format!("matching failure_out glob {pattern:?}"))?,
-            }
-        }
-    }
-
-    let mut copier = Copier {
-        staging,
-        roots: &roots,
-        stop,
-        staging_made: false,
+    let walk = Walk {
+        missing_ok: true,
+        skip: &|_: &Path| false,
+        reading: Reading::Diagnostics { roots: &roots },
     };
-    let mut copied = 0;
-    // Sorted component-wise, a directory's descendants follow it directly:
-    // once it is copied whole, they are skipped.
-    let mut last_dir: Option<&Path> = None;
-    for rel in &matched {
-        if last_dir.is_some_and(|d| rel.starts_with(d)) {
-            continue;
-        }
-        let src = ws_dir.join(rel);
-        // A link in a parent would carry the lstat below out of the sandbox.
-        if !src.parent().is_some_and(|p| inside(p, &roots)) {
-            tracing::debug!(path = %rel.display(), "failure_out path is not under the sandbox; skipped");
-            continue;
-        }
-        let n = copier
-            .entry(&src, rel, true)
-            .with_context(|| format!("copying failure_out {}", rel.display()))?;
-        if n.dir {
-            last_dir = Some(rel);
-        }
-        copied += n.files;
-    }
-    // Only a staging dir this job saw or made, and only while its run still
-    // owns the sandbox.
-    if copied == 0 && copier.staging_made && !stop() {
-        match fs::remove_dir_all(staging) {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => {
-                tracing::debug!(dir = %staging.display(), error = %e, "removing an empty failure_out staging dir");
-            }
-            _ => {}
-        }
-    }
-    Ok(copied)
-}
-
-/// Whether `path`, every link resolved, is inside one of `roots` (already
-/// canonical). A path that does not resolve is not.
-fn inside(path: &Path, roots: &[PathBuf]) -> bool {
-    fs::canonicalize(path).is_ok_and(|real| roots.iter().any(|r| real.starts_with(r)))
-}
-
-/// Add every workspace-relative path under `ws_dir` that `pattern` matches.
-///
-/// Walks from the pattern's literal prefix without following links, rather
-/// than through `glob::glob`, which follows a linked directory on `**`: a link
-/// to `/` would walk the host, and a link to an ancestor would recurse until
-/// the path is too long. A matched directory is not descended into: it is
-/// copied whole.
-fn glob_matches(
-    ws_dir: &Path,
-    pattern: &str,
-    roots: &[PathBuf],
-    matched: &mut BTreeSet<PathBuf>,
-) -> anyhow::Result<()> {
-    let compiled = glob::Pattern::new(pattern).context("compiling the pattern")?;
-    let prefix: PathBuf = pattern
-        .split('/')
-        .take_while(|c| !c.contains(['*', '?', '[']))
-        .collect();
-    let base = ws_dir.join(&prefix);
-    if !inside(&base, roots) {
-        return Ok(());
-    }
-    let mut walk = walkdir::WalkDir::new(&base)
-        .follow_links(false)
-        .min_depth(1)
-        .into_iter();
-    while let Some(entry) = walk.next() {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::debug!(error = %e, "walking for a failure_out glob; entry skipped");
-                continue;
-            }
-        };
-        let Ok(rel) = entry.path().strip_prefix(ws_dir) else {
-            continue;
-        };
-        let Some(rel_str) = rel.to_str() else {
-            continue;
-        };
-        if !compiled.matches_with(rel_str, GLOB_OPTS) {
-            continue;
-        }
-        if entry.file_type().is_dir() {
-            walk.skip_current_dir();
-        }
-        matched.insert(rel.to_path_buf());
-    }
-    Ok(())
-}
-
-/// What one [`Copier::entry`] copied.
-#[derive(Debug, Default, Clone, Copy)]
-struct Copied {
-    files: usize,
-    /// A directory was copied whole.
-    dir: bool,
-}
-
-/// Copies matches into the staging directory at their workspace-relative
-/// paths, creating it and every directory under it one `create_dir` at a
-/// time: never anything above it, so a removed sandbox is not created again.
-struct Copier<'a> {
-    staging: &'a Path,
-    /// Canonical; what a followed link must resolve inside.
-    roots: &'a [PathBuf],
-    stop: &'a dyn Fn() -> bool,
-    /// The staging directory exists: made here, or already there.
-    staging_made: bool,
-}
-
-/// `create_dir`, a directory already there being fine.
-fn create_dir_once(dir: &Path) -> anyhow::Result<()> {
-    match fs::create_dir(dir) {
-        Err(e) if e.kind() != io::ErrorKind::AlreadyExists => {
-            Err(e).with_context(|| format!("creating {}", dir.display()))
-        }
-        _ => Ok(()),
-    }
-}
-
-impl Copier<'_> {
-    fn check_stop(&self) -> anyhow::Result<()> {
-        if (self.stop)() {
-            return Err(crate::stop::cancelled());
-        }
-        Ok(())
-    }
-
-    /// Create `rel` under the staging directory, and every directory between.
-    fn mkdir(&mut self, rel: &Path) -> anyhow::Result<()> {
-        if !self.staging_made {
-            create_dir_once(self.staging)?;
-            self.staging_made = true;
-        }
-        let mut at = self.staging.to_path_buf();
-        for c in rel.components() {
-            at.push(c);
-            create_dir_once(&at)?;
-        }
-        Ok(())
-    }
-
-    /// Copy `src` to `rel`: a file, or a directory whole. A missing `src`
-    /// copies nothing. A symlink is copied as what it resolves to when that is
-    /// inside the roots: a file always, a directory only when `top` (the
-    /// declared path itself, never a link met inside a walk). Anything else — a
-    /// socket, a fifo, a dangling link, a loop — is skipped. `top` also means
-    /// `rel`'s parents may not exist yet.
-    fn entry(&mut self, src: &Path, rel: &Path, top: bool) -> anyhow::Result<Copied> {
-        let md = match fs::symlink_metadata(src) {
-            Ok(md) => md,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Copied::default()),
-            Err(e) => return Err(e).with_context(|| format!("lstat {}", src.display())),
-        };
-        let ft = md.file_type();
-        if ft.is_symlink() {
-            let real = match fs::canonicalize(src) {
-                Ok(real) if self.roots.iter().any(|r| real.starts_with(r)) => real,
-                Ok(real) => {
-                    tracing::debug!(path = %src.display(), real = %real.display(), "failure_out link leaves the sandbox; not followed");
-                    return Ok(Copied::default());
+    let mut members: BTreeSet<String> = BTreeSet::new();
+    let mut tar = TarPacker::new();
+    for content in outputs
+        .iter()
+        .flat_map(|o| o.paths.iter())
+        .filter_map(plain_content)
+    {
+        add_content(
+            &mut |source, member| {
+                if members.insert(member.clone()) {
+                    tar.create_file(source, member);
                 }
-                Err(e) => {
-                    tracing::debug!(path = %src.display(), error = %e, "failure_out link does not resolve; skipped");
-                    return Ok(Copied::default());
-                }
-            };
-            let md = fs::metadata(&real).with_context(|| format!("stat {}", real.display()))?;
-            return if md.is_file() {
-                self.file(&real, rel, top)
-            } else if md.is_dir() && top {
-                self.dir(&real, rel)
-            } else {
-                Ok(Copied::default())
-            };
-        }
-        if ft.is_file() {
-            self.file(src, rel, top)
-        } else if ft.is_dir() {
-            self.dir(src, rel)
-        } else {
-            Ok(Copied::default())
-        }
+            },
+            ws_dir,
+            content,
+            "",
+            stop,
+            &walk,
+        )?;
     }
+    if members.is_empty() {
+        return Ok(None);
+    }
+    let (tar_path, hashout) = pack_to_artifact_tar(
+        sandbox_dir,
+        &format!("{FAILURE_OUT_TAR_PREFIX}{hashin}"),
+        "out",
+        tar,
+        stop,
+    )?;
+    Ok(Some(hplugin::error::failure_out_artifact(
+        tar_path, hashout,
+    )))
+}
 
-    /// Copy the file `src` to `rel`. One that cannot be read is skipped with a
-    /// `warn!`: the rest of the diagnostics are still kept.
-    fn file(&mut self, src: &Path, rel: &Path, top: bool) -> anyhow::Result<Copied> {
-        self.check_stop()?;
-        if top && let Some(parent) = rel.parent() {
-            self.mkdir(parent)?;
-        }
-        let dst = self.staging.join(rel);
-        // Reflinks where it can (`clonefile` on APFS, `copy_file_range` on
-        // btrfs and XFS); a new inode either way.
-        match fs::copy(src, &dst) {
-            Ok(_) => Ok(Copied {
-                files: 1,
-                dir: false,
-            }),
-            Err(e) if fs::File::open(src).is_err() => {
-                tracing::warn!(path = %rel.display(), error = %e, "failure_out file cannot be read; skipped");
-                Ok(Copied::default())
-            }
-            Err(e) => {
-                Err(e).with_context(|| format!("copying {} to {}", src.display(), dst.display()))
-            }
-        }
-    }
-
-    /// Copy the directory `src` to `rel`, whole.
-    fn dir(&mut self, src: &Path, rel: &Path) -> anyhow::Result<Copied> {
-        self.mkdir(rel)?;
-        let mut files = 0;
-        for entry in walkdir::WalkDir::new(src).follow_links(false).min_depth(1) {
-            self.check_stop()?;
-            let entry = match entry {
-                Ok(e) => e,
-                Err(e) => {
-                    tracing::debug!(error = %e, "walking a failure_out directory; entry skipped");
-                    continue;
-                }
+/// Every file member of a `failure_out` tar, and its contents.
+#[cfg(test)]
+pub(crate) fn tar_files(a: &OutputArtifact) -> std::collections::BTreeMap<String, String> {
+    use hcore::hartifactcontent::{Content as _, WalkEntryKind};
+    use std::io::Read as _;
+    a.walk()
+        .expect("walk")
+        .map(|e| {
+            let e = e.expect("entry");
+            let WalkEntryKind::File { mut data, .. } = e.kind else {
+                panic!("{} is not a file", e.path.display());
             };
-            let Ok(sub) = entry.path().strip_prefix(src) else {
-                continue;
-            };
-            let to = rel.join(sub);
-            if entry.file_type().is_dir() {
-                // Walked parent first: one level, its parent already made.
-                create_dir_once(&self.staging.join(&to))?;
-            } else {
-                files += self.entry(entry.path(), &to, false)?.files;
-            }
-        }
-        Ok(Copied { files, dir: true })
-    }
+            let mut s = String::new();
+            data.read_to_string(&mut s).expect("read");
+            (e.path.to_string_lossy().into_owned(), s)
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::{MetadataExt as _, symlink};
+    use std::os::unix::fs::symlink;
 
     fn out(paths: Vec<Content>) -> Vec<FailureOutput> {
         vec![FailureOutput {
@@ -625,8 +422,42 @@ mod tests {
         fs::write(p, s).expect("write");
     }
 
+    /// A new sandbox dir under `tmp`, as the run's would be.
+    fn sandbox(tmp: &Path, name: &str) -> PathBuf {
+        let s = tmp.join(name);
+        fs::create_dir_all(&s).expect("sandbox");
+        s
+    }
+
+    /// [`collect_failure_outputs`] with the sandbox's own workspace as the only
+    /// root, never stopped.
+    fn collect(outputs: &[FailureOutput], ws: &Path, sandbox: &Path) -> Option<OutputArtifact> {
+        collect_failure_outputs(
+            outputs,
+            ws,
+            sandbox,
+            "abc",
+            std::slice::from_ref(&ws.to_path_buf()),
+            &|| false,
+        )
+        .expect("collect")
+    }
+
+    /// The `failure_out` tars packed under `sandbox`.
+    fn packed(sandbox: &Path) -> Vec<String> {
+        let dir = sandbox.join(crate::driver_managed::COLLECT_ARTIFACTS_DIR);
+        let mut v: Vec<String> = fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(FAILURE_OUT_TAR_PREFIX))
+            .collect();
+        v.sort();
+        v
+    }
+
     /// Files and directories land at their workspace-relative path; a glob
-    /// matches across directories; a matched directory's files are copied once.
+    /// matches across directories; a file two entries match is packed once.
     #[test]
     fn copies_files_dirs_and_globs() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -636,59 +467,59 @@ mod tests {
         write(&ws.join("app/shots/x.png"), "x");
         write(&ws.join("app/shots/deep/y.png"), "y");
         write(&ws.join("app/shots/deep/z.txt"), "z");
-        let staging = tmp.path().join("stage");
-        let n = collect_failure_outputs(
+        let sandbox = sandbox(tmp.path(), "sandbox");
+        let art = collect(
             &out(vec![
                 Content::FilePath("app/junit.xml".into()),
                 Content::DirPath("app/test-results/".into()),
                 Content::Glob("app/**/*.png".into()),
+                Content::FilePath("app/shots/x.png".into()),
                 Content::FilePath("app/missing.txt".into()),
             ]),
             &ws,
-            &staging,
-            std::slice::from_ref(&ws),
-            &|| false,
+            &sandbox,
         )
-        .expect("collect");
-        assert_eq!(n, 4);
-        for (p, s) in [
+        .expect("kept");
+        let files = tar_files(&art);
+        let want: Vec<(&str, &str)> = vec![
             ("app/junit.xml", "j"),
-            ("app/test-results/a/b/trace.zip", "t"),
-            ("app/shots/x.png", "x"),
             ("app/shots/deep/y.png", "y"),
-        ] {
-            assert_eq!(fs::read_to_string(staging.join(p)).expect(p), s);
-        }
-        assert!(!staging.join("app/shots/deep/z.txt").exists());
-        assert_ne!(
-            fs::metadata(ws.join("app/junit.xml")).expect("src").ino(),
-            fs::metadata(staging.join("app/junit.xml"))
-                .expect("dst")
-                .ino(),
-            "a copy, never a link"
-        );
+            ("app/shots/x.png", "x"),
+            ("app/test-results/a/b/trace.zip", "t"),
+        ];
+        let got: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        assert_eq!(got, want);
+        let names = hcore::hartifactcontent::Content::entry_paths(&art).expect("entries");
+        assert_eq!(names.len(), want.len(), "each member once: {names:?}");
+        assert_eq!(art.name, hplugin::error::FAILURE_OUT_NAME);
+        assert!(!art.hashout.is_empty());
+        let hplugin::driver::outputartifact::Content::TarPath(tar) = &art.content else {
+            panic!("a tar");
+        };
+        assert!(tar.owned, "the engine frees it once unpacked");
+        assert_eq!(packed(&sandbox).len(), 1);
     }
 
-    /// Nothing matched: nothing copied, and no staging directory is left.
+    /// Nothing matched: no artifact, and no tar packed.
     #[test]
     fn nothing_matched_leaves_no_staging() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let ws = tmp.path().join("ws");
         fs::create_dir_all(&ws).expect("mkdir");
-        let staging = tmp.path().join("stage");
-        let n = collect_failure_outputs(
+        let sandbox = sandbox(tmp.path(), "sandbox");
+        let art = collect(
             &out(vec![
                 Content::DirPath("app/test-results".into()),
                 Content::Glob("app/**/*.png".into()),
             ]),
             &ws,
-            &staging,
-            std::slice::from_ref(&ws),
-            &|| false,
-        )
-        .expect("collect");
-        assert_eq!(n, 0);
-        assert!(!staging.exists());
+            &sandbox,
+        );
+        assert!(art.is_none());
+        assert!(packed(&sandbox).is_empty());
     }
 
     /// A link out of the sandbox, a dangling one, a loop and a link to an
@@ -707,8 +538,8 @@ mod tests {
         symlink(ws.join("app"), ws.join("app/r/ancestor")).expect("link");
         symlink(ws.join("app/r/real.txt"), ws.join("app/r/inside")).expect("link");
         symlink(&outside, ws.join("app/escape")).expect("link");
-        let staging = tmp.path().join("stage");
-        let n = collect_failure_outputs(
+        let sandbox = sandbox(tmp.path(), "sandbox");
+        let art = collect(
             &out(vec![
                 Content::DirPath("app/r".into()),
                 Content::Glob("app/**/*.txt".into()),
@@ -716,29 +547,17 @@ mod tests {
                 Content::DirPath("app/escape".into()),
             ]),
             &ws,
-            &staging,
-            std::slice::from_ref(&ws),
-            &|| false,
+            &sandbox,
         )
-        .expect("collect");
-        assert_eq!(n, 2, "real.txt, and the link to it as a file");
+        .expect("kept");
         assert_eq!(
-            fs::read_to_string(staging.join("app/r/inside")).expect("inside"),
-            "real"
+            tar_files(&art).into_iter().collect::<Vec<_>>(),
+            [
+                ("app/r/inside".to_owned(), "real".to_owned()),
+                ("app/r/real.txt".to_owned(), "real".to_owned()),
+            ],
+            "real.txt, and the link to it as a file; nothing else"
         );
-        for gone in [
-            "app/r/out-file",
-            "app/r/out-dir",
-            "app/r/dangling",
-            "app/r/loop",
-            "app/r/ancestor",
-            "app/escape",
-        ] {
-            assert!(
-                fs::symlink_metadata(staging.join(gone)).is_err(),
-                "{gone} must not be copied"
-            );
-        }
     }
 
     fn process_failed(exit: Exit) -> anyhow::Error {
@@ -864,7 +683,7 @@ mod tests {
         write(&ws.join("app/a.go"), "a");
         write(&ws.join("app/gen/x.go"), "x");
         write(&ws.join("app/on_success.go"), "s");
-        let sandbox = tmp.path().join("sandbox");
+        let sandbox = sandbox(tmp.path(), "sandbox");
         let outputs = vec![
             in_place(
                 "",
@@ -918,8 +737,8 @@ mod tests {
         assert_eq!(names, ["app/a.go", "app/gen/x.go"]);
     }
 
-    /// A follow root lets a link into the shared stage be copied — as bytes in
-    /// a new inode, not as the link.
+    /// A follow root lets a link into the shared stage be kept — as a file
+    /// member holding its bytes, not as the link; without the root it is not.
     #[test]
     fn link_into_a_follow_root_is_copied() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -928,22 +747,24 @@ mod tests {
         write(&stage.join("e/gen.txt"), "staged");
         fs::create_dir_all(ws.join("app")).expect("mkdir");
         symlink(stage.join("e/gen.txt"), ws.join("app/gen.txt")).expect("link");
-        let staging = tmp.path().join("stage");
-        let n = collect_failure_outputs(
-            &out(vec![Content::FilePath("app/gen.txt".into())]),
+        let sandbox = sandbox(tmp.path(), "sandbox");
+        let outputs = out(vec![Content::FilePath("app/gen.txt".into())]);
+        let art = collect_failure_outputs(
+            &outputs,
             &ws,
-            &staging,
+            &sandbox,
+            "abc",
             &[ws.clone(), stage.clone()],
             &|| false,
         )
-        .expect("collect");
-        assert_eq!(n, 1);
-        let kept = staging.join("app/gen.txt");
-        assert!(!fs::symlink_metadata(&kept).expect("kept").is_symlink());
-        assert_ne!(
-            fs::metadata(&kept).expect("kept").ino(),
-            fs::metadata(stage.join("e/gen.txt")).expect("staged").ino()
+        .expect("collect")
+        .expect("kept");
+        assert_eq!(
+            tar_files(&art).get("app/gen.txt").map(String::as_str),
+            Some("staged"),
+            "a file member (tar_files panics on a link)"
         );
+        assert!(collect(&outputs, &ws, &sandbox).is_none(), "no follow root");
     }
 
     /// I1: a `failure_out` path inside an `in_place` directory, or matched by
@@ -959,7 +780,7 @@ mod tests {
         write(&ws.join("app/gen/shots/s.png"), "s");
         write(&ws.join("app/gen/shots/deep/t.png"), "t");
         write(&ws.join("app/report.log"), "top");
-        let sandbox = tmp.path().join("sandbox");
+        let sandbox = sandbox(tmp.path(), "sandbox");
         let outputs = vec![in_place(
             "",
             vec![
@@ -1043,8 +864,8 @@ mod tests {
     }
 
     /// An absolute path, a `..`, a leading `.`, and a glob through either are
-    /// skipped; nothing lands outside the staging directory, nor is a file
-    /// copied onto itself.
+    /// skipped; nothing outside the workspace is packed, and no member names
+    /// anything but a plain relative path.
     #[test]
     fn non_plain_paths_are_skipped() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1052,9 +873,9 @@ mod tests {
         write(&ws.join("app/ok.txt"), "ok");
         write(&ws.join("app/self.txt"), "self-bytes");
         write(&tmp.path().join("outside.txt"), "outside");
-        let staging = tmp.path().join("stage");
+        let sandbox = sandbox(tmp.path(), "sandbox");
         let abs = ws.join("app/self.txt");
-        let n = collect_failure_outputs(
+        let art = collect(
             &out(vec![
                 Content::FilePath(abs.to_str().expect("utf-8").to_owned()),
                 Content::FilePath("../outside.txt".into()),
@@ -1065,36 +886,18 @@ mod tests {
                 Content::FilePath("app/ok.txt".into()),
             ]),
             &ws,
-            &staging,
-            std::slice::from_ref(&ws),
-            &|| false,
+            &sandbox,
         )
-        .expect("collect");
-        assert_eq!(n, 1);
-        assert_eq!(read_tree(&staging), ["app", "app/ok.txt"]);
+        .expect("kept");
+        assert_eq!(
+            tar_files(&art).into_keys().collect::<Vec<_>>(),
+            ["app/ok.txt"]
+        );
         assert_eq!(fs::read_to_string(&abs).expect("self"), "self-bytes");
         assert!(is_plain_relative(Path::new("a/b/**/*.x")));
         for bad in ["/a", "../a", "a/../b", "./a", ""] {
             assert_eq!(is_plain_relative(Path::new(bad)), bad.is_empty(), "{bad}");
         }
-    }
-
-    /// Every path under `dir`, relative, sorted.
-    fn read_tree(dir: &Path) -> Vec<String> {
-        let mut v: Vec<String> = walkdir::WalkDir::new(dir)
-            .min_depth(1)
-            .into_iter()
-            .map(|e| {
-                e.expect("entry")
-                    .path()
-                    .strip_prefix(dir)
-                    .expect("under")
-                    .to_string_lossy()
-                    .into_owned()
-            })
-            .collect();
-        v.sort();
-        v
     }
 
     /// A file that cannot be read is skipped; every other match is kept.
@@ -1114,52 +917,47 @@ mod tests {
             eprintln!("unreadable_file_is_skipped: running as root, mode 000 is readable; skipped");
             return;
         }
-        let staging = tmp.path().join("stage");
-        let n = collect_failure_outputs(
+        let sandbox = sandbox(tmp.path(), "sandbox");
+        let art = collect(
             &out(vec![
                 Content::DirPath("app/r".into()),
                 Content::FilePath("app/top-locked.txt".into()),
                 Content::FilePath("app/z.txt".into()),
             ]),
             &ws,
-            &staging,
-            std::slice::from_ref(&ws),
-            &|| false,
+            &sandbox,
         )
-        .expect("one unreadable file does not fail the copy");
-        assert_eq!(n, 2);
+        .expect("one unreadable file does not fail the collect");
         assert_eq!(
-            fs::read_to_string(staging.join("app/r/a.txt")).expect("a"),
-            "a"
+            tar_files(&art).into_iter().collect::<Vec<_>>(),
+            [
+                ("app/r/a.txt".to_owned(), "a".to_owned()),
+                ("app/z.txt".to_owned(), "z".to_owned()),
+            ]
         );
-        assert_eq!(
-            fs::read_to_string(staging.join("app/z.txt")).expect("z"),
-            "z"
-        );
-        assert!(!staging.join("app/r/locked.txt").exists());
-        assert!(!staging.join("app/top-locked.txt").exists());
     }
 
-    /// A stopped copy writes nothing and reads as a cancellation; a copy whose
-    /// staging parent is gone fails rather than creating it again.
+    /// A stopped collect packs nothing and reads as a cancellation; a collect
+    /// whose sandbox is gone fails rather than creating it again.
     #[test]
     fn stopped_or_orphaned_copy_writes_nothing() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let ws = tmp.path().join("ws");
         write(&ws.join("app/a/b.txt"), "b");
         let outputs = out(vec![Content::DirPath("app/a".into())]);
-        let staging = tmp.path().join("stage");
-        let err =
-            collect_failure_outputs(&outputs, &ws, &staging, std::slice::from_ref(&ws), &|| true)
-                .expect_err("stopped");
+        let live = sandbox(tmp.path(), "sandbox");
+        let roots = std::slice::from_ref(&ws);
+        let Err(err) = collect_failure_outputs(&outputs, &ws, &live, "abc", roots, &|| true) else {
+            panic!("stopped");
+        };
         assert!(hplugin::error::is_cancelled(&err), "{err:#}");
-        assert!(!staging.join("app/a/b.txt").exists());
+        assert!(packed(&live).is_empty());
 
         let gone = tmp.path().join("removed-sandbox");
-        let orphan = gone.join(FAILURE_OUT_STAGING);
-        let err =
-            collect_failure_outputs(&outputs, &ws, &orphan, std::slice::from_ref(&ws), &|| false)
-                .expect_err("the sandbox is gone");
+        let Err(err) = collect_failure_outputs(&outputs, &ws, &gone, "abc", roots, &|| false)
+        else {
+            panic!("the sandbox is gone");
+        };
         assert!(!hplugin::error::is_cancelled(&err), "{err:#}");
         assert!(!gone.exists(), "the removed sandbox was created again");
     }
@@ -1191,7 +989,7 @@ mod tests {
     }
 
     /// The whole keep, on the token's reason alone: a run cancelled as timed
-    /// out has its matches copied and attached, though its copy outlives the
+    /// out has its matches packed and attached, though its pack outlives the
     /// cancelled token; one cancelled by its request keeps nothing, with the
     /// same error and the same files.
     #[tokio::test]
@@ -1208,6 +1006,7 @@ mod tests {
                 let err = keep_failure_outputs(
                     anyhow::Error::new(hplugin::error::CancelledError),
                     &outputs,
+                    "abc",
                     false,
                     &token,
                     &ws,
@@ -1215,24 +1014,28 @@ mod tests {
                     &[],
                 )
                 .await;
-                (err, sandbox.join(FAILURE_OUT_STAGING))
+                (err, sandbox)
             }
         };
 
         let timed_out = hcore::hasync::StdCancellationToken::new();
         timed_out.cancel_timed_out();
-        let (err, staging) = keep("timed-out", timed_out).await;
+        let (err, _) = keep("timed-out", timed_out).await;
         let kept = hplugin::error::failure_artifacts(&err).expect("kept on a timeout");
         assert_eq!(kept.0.len(), 1, "{err:#}");
+        let tar = hplugin::error::failure_out_tar(&err).expect("the failure_out tar");
         assert_eq!(
-            fs::read_to_string(staging.join("app/junit.xml")).expect("copied"),
-            "j"
+            tar_files(tar).get("app/junit.xml").map(String::as_str),
+            Some("j")
         );
 
         let cancelled = hcore::hasync::StdCancellationToken::new();
         cancelled.cancel();
-        let (err, staging) = keep("cancelled", cancelled).await;
+        let (err, sandbox) = keep("cancelled", cancelled).await;
         assert!(hplugin::error::failure_artifacts(&err).is_none(), "{err:#}");
-        assert!(!staging.exists(), "nothing copied for a request cancel");
+        assert!(
+            packed(&sandbox).is_empty(),
+            "nothing packed for a request cancel"
+        );
     }
 }

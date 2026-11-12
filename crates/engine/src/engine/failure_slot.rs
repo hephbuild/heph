@@ -6,12 +6,14 @@
 //! **last** naming the address, the revision and when it failed. The failure box
 //! renders the tail from the copy and points at it (`full log: <path>`).
 //!
-//! When the run kept `failure_out` matches (the managed layer staged them in
-//! the sandbox, [`hplugin::error::failure_out_dir`]), the staging directory is
-//! **renamed** into the slot as `out/`, laid out by workspace-relative path.
-//! `out/` is an additive sibling of `log.txt` under the same version-1
-//! manifest: a slot holds a log, an `out/`, or both. A failed move of `out/`
-//! keeps the log slot and records why ([`FailureSlot::out_error`]).
+//! When the run kept `failure_out` matches (the managed layer packed them into
+//! a tar in the sandbox, [`hplugin::error::failure_out_tar`]), the tar is
+//! **unpacked** into the slot as `out/`, laid out by workspace-relative path,
+//! and removed when the driver handed it over (`owned`). Only a regular file
+//! inside the sandbox is read or removed. `out/` is an additive sibling of
+//! `log.txt` under the same version-1 manifest: a slot holds a log, an `out/`,
+//! or both. A failed unpack of `out/` keeps the log slot and records why
+//! ([`FailureSlot::out_error`]).
 //!
 //! When a failed `in_place` run's fixes were written back over the tree, the
 //! slot also holds `fixes.txt` ([`FIXES`]): every path written, one per line,
@@ -277,7 +279,7 @@ impl FailureSlots {
     /// [`fill`](Self::fill), with the file operations injected.
     async fn fill_with(&self, fill: Fill<'_>, ops: SlotIo) -> FailureSlot {
         let source = select_log(fill.addr, fill.err);
-        let out = hplugin::error::failure_out_dir(fill.err).map(PathBuf::from);
+        let out = hplugin::error::failure_out_tar(fill.err).cloned();
         let mut fixes = fill.fixes;
         let written: Vec<String> = match &fixes {
             Some(hplugin::error::FailureFixes::Written { paths, .. }) => paths.clone(),
@@ -313,7 +315,7 @@ impl FailureSlots {
                 },
                 bytes => Some(bytes),
             });
-            let out = out.and_then(|dir| staged_out_dir(&addr, &dir, &roots));
+            let out = out.and_then(|tar| staged_out_tar(&addr, tar, &roots));
             let tail_of = |source: &LogSource| match memory_tail(source, lines) {
                 Ok(t) => Some(FailureLog::in_memory(t)),
                 Err(e) => {
@@ -332,15 +334,21 @@ impl FailureSlots {
                     ..Filled::default()
                 };
             }
-            match fill_slot(
+            let built = fill_slot(
                 &root,
                 &key,
                 &manifest,
                 slot_log.as_ref(),
-                out.as_deref(),
+                out.as_ref(),
                 &written,
                 ops,
-            ) {
+            );
+            // The tar was packed for this fill alone: freed once read, whatever
+            // became of the slot.
+            if let Some(tar) = &out {
+                free_owned_tar(&addr, tar);
+            }
+            match built {
                 Ok(built) => {
                     if let Some(e) = &built.out_error {
                         tracing::warn!(addr = %addr, error = %format!("{e:#}"), "keeping failure_out");
@@ -409,49 +417,65 @@ struct Filled {
 struct SlotIo {
     /// Copy one file: `std::fs::copy`, which reflinks where it can.
     copy: fn(&Path, &Path) -> io::Result<()>,
-    /// Rename a directory: `std::fs::rename`.
-    rename: fn(&Path, &Path) -> io::Result<()>,
+    /// Unpack the `failure_out` tar into the new directory `to`.
+    unpack: fn(&OutputArtifact, &Path) -> anyhow::Result<()>,
 }
 
 impl SlotIo {
     const REAL: Self = Self {
         copy: |from, to| std::fs::copy(from, to).map(drop),
-        rename: |from, to| std::fs::rename(from, to),
+        unpack: |tar, to| {
+            use anyhow::Context as _;
+            std::fs::create_dir(to).with_context(|| format!("creating {}", to.display()))?;
+            // A member is a workspace-relative path; anything else could
+            // land outside `out/`.
+            hcore::hartifactcontent::unpack::unpack(
+                tar,
+                to,
+                None,
+                Some(&|p: &Path| hdriver_support::failure_out::is_plain_relative(p)),
+            )
+        },
     };
 }
 
-/// The staged `failure_out` directory at `dir`, resolved, if it is a real
-/// directory strictly inside one of `roots`. Anything else is refused with a
-/// warning: the staging directory is the managed layer's, inside the sandbox,
-/// and a rename of anything else would move a tree heph does not own.
-fn staged_out_dir(addr: &Addr, dir: &Path, roots: &[PathBuf]) -> Option<PathBuf> {
-    let refuse = |why: &str| {
-        tracing::warn!(addr = %addr, dir = %dir.display(), why, "failure_out not kept");
-        None
+/// The `failure_out` tar `tar` names, read from its resolved path, if that is
+/// a regular file inside one of `roots`. Anything else is refused with a
+/// warning: the tar is the managed layer's, packed in the sandbox, and heph
+/// neither reads nor removes a file it does not own.
+fn staged_out_tar(
+    addr: &Addr,
+    mut tar: OutputArtifact,
+    roots: &[PathBuf],
+) -> Option<OutputArtifact> {
+    let Content::TarPath(content) = &mut tar.content else {
+        return None;
     };
-    match std::fs::symlink_metadata(dir) {
-        Ok(m) if m.is_dir() => {}
-        Ok(_) => return refuse("the staging path is not a directory"),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            return refuse("the staging directory is gone");
-        }
-        Err(e) => return refuse(&e.to_string()),
-    }
-    let real = match std::fs::canonicalize(dir) {
-        Ok(p) => p,
-        Err(e) => return refuse(&e.to_string()),
+    let why = match resolve_in_roots(Path::new(&content.path), roots) {
+        Ok(Some(real)) => match real.into_os_string().into_string() {
+            Ok(real) => {
+                content.path = real;
+                return Some(tar);
+            }
+            Err(_) => "the tar's resolved path is not UTF-8".to_owned(),
+        },
+        Ok(None) => "the tar is gone, not a regular file, or outside the sandbox".to_owned(),
+        Err(e) => e.to_string(),
     };
-    let roots: Vec<PathBuf> = roots
-        .iter()
-        .filter_map(|r| std::fs::canonicalize(r).ok())
-        .collect();
-    if roots.contains(&real) {
-        return refuse("the staging directory is a sandbox root");
+    tracing::warn!(addr = %addr, tar = %content.path, why, "failure_out not kept");
+    None
+}
+
+/// Remove the `failure_out` tar once the fill has read it, when the driver
+/// handed it over (`owned`); one it keeps is left alone.
+fn free_owned_tar(addr: &Addr, tar: &OutputArtifact) {
+    if let Content::TarPath(t) = &tar.content
+        && t.owned
+        && let Err(e) = std::fs::remove_file(&t.path)
+        && e.kind() != io::ErrorKind::NotFound
+    {
+        tracing::debug!(addr = %addr, tar = %t.path, error = %e, "removing the failure_out tar");
     }
-    if !roots.iter().any(|r| real.starts_with(r)) {
-        return refuse("the staging directory is outside the sandbox");
-    }
-    Some(real)
 }
 
 /// The `Log` artifact to keep, if the failure carries one this module can
@@ -463,7 +487,7 @@ fn select_log(addr: &Addr, err: &anyhow::Error) -> Option<LogSource> {
     let mut chosen: Option<&OutputArtifact> = None;
     for a in &artifacts.0 {
         if a.r#type == ArtifactType::Output && a.name == hplugin::error::FAILURE_OUT_NAME {
-            // The staged `failure_out` directory: `fill` keeps it as `out/`.
+            // The `failure_out` tar: `fill` unpacks it as `out/`.
         } else if a.r#type != ArtifactType::Log {
             tracing::debug!(addr = %addr, r#type = ?a.r#type, name = %a.name, "ignoring a failure artifact that is not a log");
         } else if chosen.is_some() {
@@ -488,7 +512,7 @@ fn resolve_in_roots(path: &Path, roots: &[PathBuf]) -> io::Result<Option<PathBuf
     let real = match std::fs::canonicalize(path) {
         Ok(p) => p,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            tracing::debug!(path = %path.display(), "the failure log is gone");
+            tracing::debug!(path = %path.display(), "the failure file is gone");
             return Ok(None);
         }
         Err(e) => return Err(e),
@@ -499,7 +523,7 @@ fn resolve_in_roots(path: &Path, roots: &[PathBuf]) -> io::Result<Option<PathBuf
             .unwrap_or(false)
     });
     if !inside {
-        tracing::debug!(path = %path.display(), real = %real.display(), "the failure log is outside the sandbox; not read");
+        tracing::debug!(path = %path.display(), real = %real.display(), "the failure file is outside the sandbox; not read");
         return Ok(None);
     }
     if !std::fs::metadata(&real)?.is_file() {
@@ -565,29 +589,29 @@ struct Built {
     /// the rename, so it is this fill's copy whatever replaces the slot
     /// afterwards.
     log: Option<(PathBuf, std::fs::File)>,
-    /// The slot's `out/`, when the staged directory was moved in.
+    /// The slot's `out/`, when the `failure_out` tar was unpacked in.
     out: Option<PathBuf>,
-    /// Why the staged directory was not moved in, when the slot was kept
+    /// Why the `failure_out` tar was not unpacked in, when the slot was kept
     /// without it.
     out_error: Option<anyhow::Error>,
     /// The slot's `fixes.txt`, when there were fixes to list.
     fixes: Option<PathBuf>,
 }
 
-/// Build the slot `key` under `root` from `log` and the staged `failure_out`
-/// directory `out`, and rename it into place, replacing any slot already
-/// there.
+/// Build the slot `key` under `root` from `log` and the `failure_out` tar
+/// `out`, and rename it into place, replacing any slot already there.
 ///
-/// `out` is renamed in as `out/`, or copied when it is on another filesystem.
-/// A failure there drops `out/` and keeps the rest of the slot, unless there
-/// is neither a log nor a fixes list to keep. Anything else that fails before the rename leaves the
-/// old slot as it was and the temporary directory removed.
+/// `out` is unpacked in as `out/`: every file a new inode, whatever
+/// filesystem the sandbox is on. A failure there drops `out/` and keeps the
+/// rest of the slot, unless there is neither a log nor a fixes list to keep.
+/// Anything else that fails before the rename leaves the old slot as it was
+/// and the temporary directory removed.
 fn fill_slot(
     root: &Path,
     key: &str,
     manifest: &SlotManifest,
     log: Option<&LogSource>,
-    out: Option<&Path>,
+    out: Option<&OutputArtifact>,
     fixes: &[String],
     ops: SlotIo,
 ) -> anyhow::Result<Built> {
@@ -613,12 +637,14 @@ fn fill_slot(
         None => None,
     };
     let (moved, out_error) = match out {
-        Some(from) => {
+        Some(tar) => {
             let to = temp.path().join(OUT);
-            match move_dir(from, &to, ops) {
+            match (ops.unpack)(tar, &to)
+                .with_context(|| format!("unpacking failure_out into {}", to.display()))
+            {
                 Ok(()) => (true, None),
                 Err(e) if log.is_some() || !fixes.is_empty() => {
-                    // Half a copy is not an `out/`: the slot is kept without
+                    // Half an unpack is not an `out/`: the slot is kept without
                     // it, for its log or its `fixes.txt` (a material target
                     // has no log on disk, and its fixes are still worth a
                     // list).
@@ -670,25 +696,6 @@ fn fill_slot(
         out_error,
         fixes: wrote_fixes.then(|| dest.join(FIXES)),
     })
-}
-
-/// Move the directory `from` to `to`: a rename, or a recursive copy when the
-/// two are on different filesystems. The staged directory is heph's own copy,
-/// never the run's tree, so it is removed after a copy.
-fn move_dir(from: &Path, to: &Path, ops: SlotIo) -> anyhow::Result<()> {
-    use anyhow::Context as _;
-    match (ops.rename)(from, to) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::CrossesDevices => {
-            hcore::fsutil::copy_tree(from, to, ops.copy)
-                .with_context(|| format!("copying {} to {}", from.display(), to.display()))?;
-            if let Err(e) = std::fs::remove_dir_all(from) {
-                tracing::debug!(dir = %from.display(), error = %e, "removing the copied failure_out staging dir");
-            }
-            Ok(())
-        }
-        Err(e) => Err(e).with_context(|| format!("moving {} to {}", from.display(), to.display())),
-    }
 }
 
 /// The manifest of the slot at `dir`, if it is complete, of a version this
@@ -1106,19 +1113,42 @@ mod tests {
         );
     }
 
-    /// A sandbox with a staged `failure_out` dir holding `pkg/report/index.html`
-    /// and `pkg/report/data/trace.zip`; returns the staging dir.
+    /// A sandbox with a packed `failure_out` tar holding
+    /// `pkg/report/index.html` and `pkg/report/data/trace.zip`, where the
+    /// managed layer packs it; returns the tar.
     fn stage(sandbox: &Path) -> PathBuf {
-        let staging = sandbox.join(".heph-failure-out");
-        std::fs::create_dir_all(staging.join("pkg/report/data")).expect("mkdir");
-        std::fs::write(staging.join("pkg/report/index.html"), "<html>").expect("index");
-        std::fs::write(staging.join("pkg/report/data/trace.zip"), "zip").expect("trace");
-        staging
+        stage_with(sandbox, |_| {})
     }
 
-    fn out_artifact(dir: &Path) -> OutputArtifact {
-        hplugin::error::failure_out_artifact(dir).expect("utf-8")
+    /// [`stage`], with more members added by `more`.
+    fn stage_with(
+        sandbox: &Path,
+        more: impl FnOnce(&mut hcore::hartifactcontent::tar::TarPacker),
+    ) -> PathBuf {
+        let dir = sandbox.join(hdriver_support::driver_managed::COLLECT_ARTIFACTS_DIR);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let tar_path = dir.join(format!(
+            "{}h-out.tar",
+            hdriver_support::failure_out::FAILURE_OUT_TAR_PREFIX
+        ));
+        let mut tar = hcore::hartifactcontent::tar::TarPacker::new();
+        tar.create_raw(b"<html>".to_vec(), "pkg/report/index.html", false);
+        tar.create_raw(b"zip".to_vec(), "pkg/report/data/trace.zip", false);
+        more(&mut tar);
+        tar.pack(std::fs::File::create(&tar_path).expect("tar"))
+            .expect("pack");
+        tar_path
     }
+
+    fn out_artifact(tar: &Path) -> OutputArtifact {
+        hplugin::error::failure_out_artifact(tar.to_str().expect("utf-8").to_owned(), String::new())
+    }
+
+    /// Unpack ops that fail before writing anything.
+    const FAIL_UP_FRONT: SlotIo = SlotIo {
+        unpack: |_, _| Err(anyhow::anyhow!("EIO")),
+        ..SlotIo::REAL
+    };
 
     async fn fill_ops(
         slots: &FailureSlots,
@@ -1223,7 +1253,7 @@ mod tests {
             b"zip"
         );
         assert!(!dir.join(LOG).exists());
-        assert!(!staging.exists(), "renamed, not copied");
+        assert!(!staging.exists(), "the owned tar is freed once unpacked");
         assert_eq!(slots.read(&a).map(|m| m.addr), Some(a.format()));
         slots.clear(&a).await;
         assert!(!dir.exists(), "cleared with its out/");
@@ -1249,8 +1279,8 @@ mod tests {
         assert!(!dir.join(LOG).exists(), "a material log never reaches disk");
     }
 
-    /// The staging dir is renamed only when it lies strictly inside the
-    /// sandbox: anything else is left where it is and no slot is made.
+    /// The tar is read only when it is a regular file inside the sandbox:
+    /// anything else is left where it is, and no slot is made.
     #[tokio::test]
     async fn refuses_a_staging_dir_outside_the_sandbox() {
         let home = tempfile::tempdir().expect("home");
@@ -1272,33 +1302,25 @@ mod tests {
             assert!(slot.out.is_none() && slot.log.is_none(), "{name}");
             assert_eq!(slots.read(&a), None, "{name}");
         }
-        assert!(
-            elsewhere.join("pkg/report/index.html").is_file(),
-            "untouched"
-        );
+        assert!(elsewhere.is_file(), "a refused tar is never removed");
         assert!(sandbox.path().is_dir());
     }
 
-    /// I7: a failed move of `out/` — or no slot at all — never hides the
-    /// target's error, and the log slot is kept where it can be.
+    /// I7: a failed unpack of `out/` — or no slot at all — never hides the
+    /// target's error, and the log slot is kept where it can be. The owned
+    /// tar is freed either way.
     #[tokio::test]
     async fn failed_output_copy_keeps_the_failure() {
-        let fail_rename = SlotIo {
-            rename: |_, _| Err(io::Error::other("EIO")),
+        // The unpack dies half way, `out/` partly written.
+        let fail_half_way = SlotIo {
+            unpack: |tar, to| {
+                (SlotIo::REAL.unpack)(tar, to)?;
+                assert!(to.join("pkg/report/index.html").is_file());
+                Err(anyhow::anyhow!("ENOSPC"))
+            },
             ..SlotIo::REAL
         };
-        // Across filesystems, and the copy dies half way.
-        let fail_copy = SlotIo {
-            rename: |_, _| Err(io::ErrorKind::CrossesDevices.into()),
-            copy: |from, to| {
-                if from.ends_with("trace.zip") {
-                    Err(io::Error::other("ENOSPC"))
-                } else {
-                    std::fs::copy(from, to).map(drop)
-                }
-            },
-        };
-        for (name, ops) in [("rename", fail_rename), ("copy", fail_copy)] {
+        for (name, ops) in [("up front", FAIL_UP_FRONT), ("half way", fail_half_way)] {
             let home = tempfile::tempdir().expect("home");
             let sandbox = tempfile::tempdir().expect("sandbox");
             let slots = FailureSlots::new(home.path());
@@ -1316,6 +1338,7 @@ mod tests {
             assert_eq!(log.tail().expect("tail").text, "why", "{name}");
             let dir = slots.slot_dir(&a);
             assert!(!dir.join(OUT).exists(), "{name}: no partial out/");
+            assert!(!staging.exists(), "{name}: the owned tar is freed");
             assert!(slots.read(&a).is_some(), "{name}");
             let e = err.context(slot);
             assert_eq!(
@@ -1378,10 +1401,7 @@ mod tests {
                         list: None,
                     }),
                 },
-                SlotIo {
-                    rename: |_, _| Err(io::Error::other("EIO")),
-                    ..SlotIo::REAL
-                },
+                FAIL_UP_FRONT,
             )
             .await;
         let dir = slots.slot_dir(&a);
@@ -1407,25 +1427,24 @@ mod tests {
         assert_eq!(slots.read(&a).map(|m| m.addr), Some(a.format()));
     }
 
-    /// Across filesystems the staged dir is copied, symlinks as symlinks, and
-    /// the staging copy is removed.
+    /// The tar is unpacked, symlinks as symlinks, and the owned tar is freed;
+    /// a borrowed one is left alone.
     #[tokio::test]
-    async fn failure_out_copies_across_filesystems() {
+    async fn failure_out_unpacks_and_frees_the_owned_tar() {
         let home = tempfile::tempdir().expect("home");
         let sandbox = tempfile::tempdir().expect("sandbox");
+        let links = tempfile::tempdir().expect("links");
         let slots = FailureSlots::new(home.path());
         let a = addr("//p:a");
-        let staging = stage(sandbox.path());
-        std::os::unix::fs::symlink("index.html", staging.join("pkg/report/latest.html"))
-            .expect("symlink");
+        let link = links.path().join("latest.html");
+        std::os::unix::fs::symlink("index.html", &link).expect("symlink");
+        let staging = stage_with(sandbox.path(), |tar| {
+            tar.create_file(link.to_str().expect("utf-8"), "pkg/report/latest.html");
+        });
         let err = with_failure_artifacts(anyhow::anyhow!("boom"), vec![out_artifact(&staging)]);
-        let ops = SlotIo {
-            rename: |_, _| Err(io::ErrorKind::CrossesDevices.into()),
-            ..SlotIo::REAL
-        };
-        let slot = fill_ops(&slots, &a, sandbox.path(), &err, false, ops).await;
-        let out = slot.out.expect("copied");
-        assert!(slot.out_error.is_none());
+        let slot = fill_ops(&slots, &a, sandbox.path(), &err, false, SlotIo::REAL).await;
+        let out = slot.out.expect("unpacked");
+        assert!(slot.out_error.is_none(), "{:?}", slot.out_error);
         assert_eq!(
             std::fs::read(out.join("pkg/report/index.html")).expect("index"),
             b"<html>"
@@ -1438,7 +1457,20 @@ mod tests {
             std::fs::read_link(out.join("pkg/report/latest.html")).expect("still a link"),
             Path::new("index.html")
         );
-        assert!(!staging.exists(), "the staging copy is freed");
+        assert!(!staging.exists(), "the owned tar is freed");
+
+        let staging = stage(sandbox.path());
+        let mut borrowed = out_artifact(&staging);
+        if let Content::TarPath(t) = &mut borrowed.content {
+            t.owned = false;
+        }
+        let err = with_failure_artifacts(anyhow::anyhow!("boom"), vec![borrowed]);
+        let slot = fill_ops(&slots, &a, sandbox.path(), &err, false, SlotIo::REAL).await;
+        assert!(slot.out.is_some());
+        assert!(
+            staging.is_file(),
+            "a borrowed tar is the driver's to remove"
+        );
     }
 
     /// The `.tmp-` directories under the slots root.
@@ -1451,7 +1483,7 @@ mod tests {
     }
 
     /// D17: a fill dropped mid-way — the request cancelled while the blocking
-    /// job moves `out/` into the slot — leaves no `.tmp-` directory behind.
+    /// job unpacks `out/` into the slot — leaves no `.tmp-` directory behind.
     /// The job is detached, not killed: it runs to the end on its own and
     /// renames the slot into place.
     #[tokio::test]
@@ -1462,7 +1494,7 @@ mod tests {
         static ENTERED: tokio::sync::Notify = tokio::sync::Notify::const_new();
         static RELEASE: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
         let gated = SlotIo {
-            rename: |from, to| {
+            unpack: |tar, to| {
                 ENTERED.notify_one();
                 let (lock, cvar) = &RELEASE;
                 let mut released = lock.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1470,7 +1502,7 @@ mod tests {
                     released = cvar.wait(released).unwrap_or_else(PoisonError::into_inner);
                 }
                 drop(released);
-                std::fs::rename(from, to)
+                (SlotIo::REAL.unpack)(tar, to)
             },
             ..SlotIo::REAL
         };
@@ -1489,7 +1521,7 @@ mod tests {
             }
             () = ENTERED.notified() => {}
         }
-        // The fill's future is gone; its job is parked in `out/`'s move.
+        // The fill's future is gone; its job is parked in `out/`'s unpack.
         assert_eq!(
             temp_dirs(slots.root()).len(),
             1,

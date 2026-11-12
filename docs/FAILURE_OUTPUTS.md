@@ -84,9 +84,13 @@ the paths in the BUILD file; the slot does not split by group.
   `test-results/` only for some failures.
 - **Symlinks do not leave the sandbox.** A symlink pointing outside the sandbox
   is not followed, as for the log.
-- **Copied, never linked.** Files are copied with `std::fs::copy`, which uses a
-  reflink on APFS and btrfs. They are never hardlinked or moved, so editing a
-  file in the slot cannot change an input staged for another run.
+- **Packed, then unpacked: never linked.** The matches are packed into a tar in
+  the sandbox (`heph-collect-artifacts/failureout-*.tar`) by the same walker
+  and packer as outputs, and the engine unpacks it into the slot and deletes
+  it. Every file in the slot is a new inode, never a hardlink or a move, so
+  editing a file in the slot cannot change an input staged for another run.
+  A tar holds files: an empty directory is not kept, and neither is a file
+  whose name is not UTF-8.
 - **Refused paths.** These are refused when the BUILD file is parsed, and the
   error names the path:
   - a path with a `..` segment;

@@ -165,10 +165,16 @@ impl ManagedDriverFuse {
         let mut res = match invoked {
             Ok(res) => res,
             // Read through the mount while the slot guards still hold the
-            // inputs; staged under the *plain* sandbox dir, a real directory
-            // that outlives the slot, for the engine to rename into the
+            // inputs; packed under the *plain* sandbox dir, a real directory
+            // that outlives the slot, for the engine to unpack into the
             // failure slot.
             Err(err) => {
+                // A FUSE run writes nothing under the plain dir, so it may not
+                // exist yet; the packs create only their own directory under
+                // it (never a removed sandbox), so it is made here, by the run
+                // itself, never by a job that could outlive it. A failure here
+                // surfaces as the pack's own error, with its path.
+                drop(fs::create_dir_all(&plain_sandbox_dir));
                 let err = hdriver_support::failure_out::keep_failure_write_back(
                     err,
                     target,
@@ -182,6 +188,7 @@ impl ManagedDriverFuse {
                 return Err(hdriver_support::failure_out::keep_failure_outputs(
                     err,
                     &target.failure_outputs,
+                    hashin,
                     shell,
                     ctoken,
                     &ws_dir,
@@ -510,12 +517,26 @@ mod tests {
         let Err(err) = fuse.run_inner(req, &ct, false).await else {
             anyhow::bail!("the run must fail");
         };
-        let staged = plain.join(hdriver_support::failure_out::FAILURE_OUT_STAGING);
-        assert_eq!(
-            hplugin::error::failure_out_dir(&err).map(PathBuf::from),
-            Some(staged.clone())
+        let kept = hplugin::error::failure_out_tar(&err)
+            .ok_or_else(|| anyhow::anyhow!("failure_out not kept: {err:#}"))?;
+        let hplugin::driver::outputartifact::Content::TarPath(kept_tar) = &kept.content else {
+            anyhow::bail!("failure_out is a tar");
+        };
+        assert!(
+            PathBuf::from(&kept_tar.path).starts_with(&plain),
+            "packed under the plain sandbox dir: {}",
+            kept_tar.path
         );
-        assert_eq!(fs::read_to_string(staged.join("app/report.txt"))?, "report");
+        let mut report = String::new();
+        for entry in hcore::hartifactcontent::Content::walk(kept)? {
+            let entry = entry?;
+            if entry.path == std::path::Path::new("app/report.txt")
+                && let hcore::hartifactcontent::WalkEntryKind::File { mut data, .. } = entry.kind
+            {
+                std::io::Read::read_to_string(&mut data, &mut report)?;
+            }
+        }
+        assert_eq!(report, "report");
         // The `in_place` fixes are packed under the plain sandbox dir too, as
         // a `writeback-` tar that outlives the slot.
         let write_back = hplugin::error::failure_write_back(&err).expect("fixes collected");

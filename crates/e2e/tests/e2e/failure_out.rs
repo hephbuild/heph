@@ -40,6 +40,16 @@ fn sandbox_ws(engine: &Engine, pkg: &str, name: &str) -> PathBuf {
 }
 
 /// The names directly under `failures/`, slots and temporaries alike.
+/// Whether a `failure_out` tar (`heph-collect-artifacts/failureout-*`) is
+/// under the run's sandbox.
+fn packs_failure_out(sandbox: &Path) -> bool {
+    std::fs::read_dir(sandbox.join("heph-collect-artifacts")).is_ok_and(|entries| {
+        entries
+            .flatten()
+            .any(|e| e.file_name().as_bytes().starts_with(b"failureout-"))
+    })
+}
+
 fn slot_root_names(engine: &Engine) -> Vec<String> {
     let root = engine.failure_slots().root();
     if !root.exists() {
@@ -176,12 +186,8 @@ async fn nothing_on_success() -> anyhow::Result<()> {
     assert!(!slot_exists(&ws.engine, "//p:t"));
     assert!(slot_root_names(&ws.engine).is_empty());
     assert!(
-        !sandbox_ws(&ws.engine, "p", "t")
-            .parent()
-            .expect("sandbox")
-            .join(".heph-failure-out")
-            .exists(),
-        "a pass stages nothing"
+        !packs_failure_out(sandbox_ws(&ws.engine, "p", "t").parent().expect("sandbox")),
+        "a pass packs nothing"
     );
     // Nowhere in the home but the run's own sandbox holds the bytes.
     let sandboxes = ws.engine.home.join("sandbox");
@@ -311,7 +317,7 @@ target(name = "grp", driver = "group", deps = [":slow", ":fast"])
 ///
 /// A "no hang, nothing half-made" test, deterministic in its assertion, not in
 /// where the drop lands: thousands of matches make the managed layer's collect
-/// long enough that the drop, made as soon as the staging directory appears,
+/// long enough that the drop, made as soon as the `failure_out` tar appears,
 /// usually lands inside it, but a run that finished first is accepted too. The
 /// engine's fill window (a few renames) is pinned down by an engine unit test,
 /// not here.
@@ -323,10 +329,10 @@ async fn cancel_mid_collect_leaves_no_tmp_dir() -> anyhow::Result<()> {
         r#"target(name = "t", driver = "bash", cache = False, failure_out = "r",
        run = "mkdir -p r; for i in $(seq 1 4000); do printf x > r/$i.txt; done; exit 1")"#,
     );
-    let staging = sandbox_ws(&ws.engine, "p", "t")
+    let sandbox = sandbox_ws(&ws.engine, "p", "t")
         .parent()
         .expect("sandbox")
-        .join(".heph-failure-out");
+        .to_path_buf();
     let root = ws.engine.failure_slots().root().to_path_buf();
     let has_tmp = |root: &Path| {
         std::fs::read_dir(root).is_ok_and(|entries| {
@@ -351,7 +357,7 @@ async fn cancel_mid_collect_leaves_no_tmp_dir() -> anyhow::Result<()> {
     // Whether the collect (or the fill after it) was seen running, rather
     // than the run finishing before the poll caught it.
     let seen_collect = loop {
-        if staging.exists() || has_tmp(&root) {
+        if packs_failure_out(&sandbox) || has_tmp(&root) {
             break true;
         }
         if task.is_finished() {
@@ -508,12 +514,14 @@ async fn directory_is_copied_whole() -> anyhow::Result<()> {
     failures(&ws.engine, "//p:t", &ResultOptions::default()).await?;
     let out = out_dir(&ws.engine, "//p:t");
     let sandbox = sandbox_ws(&ws.engine, "p", "t");
-    let ran = tree(&sandbox.join("p/test-results"));
+    let mut ran = tree(&sandbox.join("p/test-results"));
     assert_eq!(ran.len(), 7, "the run's tree: {:?}", names(&ran));
+    // A tar holds files: a directory with no file under it is not kept.
+    assert!(ran.remove(b"empty".as_slice()).is_some());
     assert_eq!(
         tree(&out.join("p/test-results")),
         ran,
-        "the directory, subdirectories and all, empty ones included"
+        "the directory, subdirectories and all, but the empty one"
     );
     let logs = tree(&out.join("p/tree"));
     assert_eq!(

@@ -179,6 +179,7 @@ impl ManagedDriverOs {
                 return Err(crate::failure_out::keep_failure_outputs(
                     err,
                     &target.failure_outputs,
+                    hashin,
                     shell,
                     ctoken,
                     &ws_dir,
@@ -378,13 +379,14 @@ mod tests {
         };
 
         // Cancelled as timed out, however far from its limit the clock says.
-        let (err, sandbox) = run("timed-out", true).await?;
-        let staged = sandbox.join(crate::failure_out::FAILURE_OUT_STAGING);
+        let (err, _sandbox) = run("timed-out", true).await?;
+        let kept = hplugin::error::failure_out_tar(&err).expect("kept on a timeout");
         assert_eq!(
-            hplugin::error::failure_out_dir(&err).map(std::path::PathBuf::from),
-            Some(staged.clone())
+            crate::failure_out::tar_files(kept)
+                .get("app/report.txt")
+                .map(String::as_str),
+            Some("report")
         );
-        assert_eq!(fs::read_to_string(staged.join("app/report.txt"))?, "report");
         assert!(
             hplugin::error::failure_write_back(&err).is_none(),
             "a timeout writes nothing back"
@@ -392,14 +394,23 @@ mod tests {
 
         // The same run cancelled by its request.
         let (err, sandbox) = run("cancelled", false).await?;
-        assert_eq!(hplugin::error::failure_out_dir(&err), None);
-        assert!(
-            !sandbox
-                .join(crate::failure_out::FAILURE_OUT_STAGING)
-                .exists()
-        );
+        assert!(hplugin::error::failure_out_tar(&err).is_none());
+        assert!(!has_failure_out_tar(&sandbox));
         assert!(hplugin::error::failure_write_back(&err).is_none());
         Ok(())
+    }
+
+    /// Whether a `failure_out` tar was packed under `sandbox`.
+    fn has_failure_out_tar(sandbox: &std::path::Path) -> bool {
+        fs::read_dir(sandbox.join(crate::driver_managed::COLLECT_ARTIFACTS_DIR))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(crate::failure_out::FAILURE_OUT_TAR_PREFIX)
+            })
     }
 
     /// A def in `//app` that keeps `app/report.txt` on failure.
@@ -418,8 +429,8 @@ mod tests {
 
     /// A failure no process exit is behind — a driver's or heph's own, before
     /// or around the run — keeps nothing, and neither does a cancelled run or a
-    /// `--shell`; a process exit keeps the report, as a copy under the
-    /// sandbox's staging dir (Surface table, I8).
+    /// `--shell`; a process exit keeps the report, packed into a tar under
+    /// the sandbox (Surface table, I8).
     #[tokio::test]
     async fn failure_without_exit_collects_nothing() -> anyhow::Result<()> {
         use hplugin::error::{Exit, ProcessFailed};
@@ -465,28 +476,21 @@ mod tests {
             ("shell", exit1, false, true),
         ] {
             let (err, sandbox) = run(name, fail, cancel, shell).await?;
-            assert_eq!(hplugin::error::failure_out_dir(&err), None, "{name}");
-            assert!(
-                !sandbox
-                    .join(crate::failure_out::FAILURE_OUT_STAGING)
-                    .exists(),
-                "{name}: nothing staged"
-            );
+            assert!(hplugin::error::failure_out_tar(&err).is_none(), "{name}");
+            assert!(!has_failure_out_tar(&sandbox), "{name}: nothing packed");
             assert!(
                 sandbox.join("ws/app/report.txt").exists(),
                 "{name}: the run did write it"
             );
         }
 
-        let (err, sandbox) = run("exit-1", exit1, false, false).await?;
-        let staged = sandbox.join(crate::failure_out::FAILURE_OUT_STAGING);
+        let (err, _sandbox) = run("exit-1", exit1, false, false).await?;
+        let kept = hplugin::error::failure_out_tar(&err).expect("kept on an exit");
         assert_eq!(
-            hplugin::error::failure_out_dir(&err).map(std::path::PathBuf::from),
-            Some(staged.clone())
-        );
-        assert_eq!(
-            std::fs::read_to_string(staged.join("app/report.txt"))?,
-            "report"
+            crate::failure_out::tar_files(kept)
+                .get("app/report.txt")
+                .map(String::as_str),
+            Some("report")
         );
         assert_eq!(
             hplugin::error::process_exit(&err),
