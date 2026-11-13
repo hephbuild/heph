@@ -243,7 +243,7 @@ nothing.
 | `copy` target first built | recorded | written | excluded | run `codegen gitignore` (the write-back warns until you do) |
 | rebuilt, same bytes | no write | untouched | excluded | nothing |
 | output added | new rows | written | excluded | `codegen gitignore` |
-| a glob output produces fewer files | the file heph wrote is deleted (its hash still matches) | deleted | gone | nothing |
+| a glob or dir output produces fewer files | the file heph wrote is deleted (its hash still matches) | deleted, and the directories that left empty | gone | nothing |
 | output removed or renamed, target rebuilt | old rows `dropped` | kept | excluded | `codegen status`, then keep or discard |
 | output or target removed, not rebuilt | unchanged | kept | excluded | the same; `validate` fails on the stale section |
 | target renamed, same path | the next write-back takes the rows | rewritten | excluded | `codegen gitignore` |
@@ -262,6 +262,15 @@ fresh uncached hash equal to the record, and either a write-back of the same
 target whose current outputs still cover the path, or `codegen discard`. It
 never deletes an `imported` row's file on its record (only `discard --force`
 does).
+
+A write-back that deletes files also removes the directories those deletions
+left empty, as `rsync --delete` would: a package dropped from a
+`node_modules/` output goes whole. Only a directory strictly below the
+output's root is removed (a dir output's directory, a glob's literal prefix:
+`p/gen` for `p/gen/**/*.txt`), so the root itself stays, even empty. A
+directory holding anything else (a file heph never wrote, a kept leftover)
+stays, and so does every directory above it. A directory nothing was deleted
+from, such as a tool's empty cache, is never touched.
 
 ### "This file should now be checked in"
 

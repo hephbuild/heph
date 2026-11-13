@@ -1008,8 +1008,12 @@ pub struct CopyOutputs {
     /// Output group names, indexed by the entries below.
     groups: Vec<String>,
     files: rustc_hash::FxHashMap<Vec<u8>, usize>,
+    /// Each dir output's directory, with a trailing `/`.
     dirs: Vec<(Vec<u8>, usize)>,
     globs: Vec<(wax::Glob<'static>, usize)>,
+    /// Each glob's literal prefix (`p/gen` for `p/gen/**/*.txt`), with a
+    /// trailing `/` unless it is empty.
+    glob_roots: Vec<Vec<u8>>,
 }
 
 impl CopyOutputs {
@@ -1021,6 +1025,7 @@ impl CopyOutputs {
             files: rustc_hash::FxHashMap::default(),
             dirs: Vec::new(),
             globs: Vec::new(),
+            glob_roots: Vec::new(),
         };
         for output in &target.outputs {
             let group = out.groups.len();
@@ -1040,12 +1045,18 @@ impl CopyOutputs {
                         d.push(b'/');
                         out.dirs.push((d, group));
                     }
-                    Content::Glob(p) => out.globs.push((
-                        wax::Glob::new(p)
+                    Content::Glob(p) => {
+                        let glob = wax::Glob::new(p)
                             .map(wax::Glob::into_owned)
-                            .with_context(|| format!("compile copy output glob {p}"))?,
-                        group,
-                    )),
+                            .with_context(|| format!("compile copy output glob {p}"))?;
+                        let (prefix, _) = glob.clone().partition();
+                        let mut root = prefix.into_os_string().into_encoded_bytes();
+                        if !root.is_empty() {
+                            root.push(b'/');
+                        }
+                        out.glob_roots.push(root);
+                        out.globs.push((glob, group));
+                    }
                 }
             }
             if any {
@@ -1087,6 +1098,16 @@ impl CopyOutputs {
     pub fn contains(&self, rel: &[u8]) -> bool {
         self.output_of(rel).is_some()
     }
+
+    /// Whether the root-relative directory `dir` lies strictly below the
+    /// root of a `copy` output: a dir output's directory, or a glob's literal
+    /// prefix. The write-back may remove such a directory once deleting
+    /// leftovers emptied it; a root itself, and a file output's directory,
+    /// are never below one.
+    pub fn below_root(&self, dir: &[u8]) -> bool {
+        self.dirs.iter().any(|(d, _)| dir.starts_with(d))
+            || self.glob_roots.iter().any(|r| dir.starts_with(r))
+    }
 }
 
 /// What one pass of [`Engine::materialize_codegen_tree`] may do.
@@ -1099,6 +1120,32 @@ struct CodegenWrite<'a> {
     /// What the `in_place` guard reads. `None` only for a target with no
     /// `in_place` group.
     snapshot: Option<&'a hwalk::codegen_index::Snapshot>,
+}
+
+/// Runs `create`, which makes the entry at `dest`, after creating `dest`'s
+/// parent directory. A write-back removes the directories its deletions left
+/// empty, and with overlapping `copy` outputs another target's write-back can
+/// remove this parent between the two steps: `create` then finds no
+/// directory, so the parent is created again and `create` retried once.
+fn create_in_dir(
+    dest: &std::path::Path,
+    mut create: impl FnMut() -> std::io::Result<()>,
+) -> anyhow::Result<()> {
+    let mkdir = || -> anyhow::Result<()> {
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create parent dir for {dest:?}"))?;
+        }
+        Ok(())
+    };
+    mkdir()?;
+    match create() {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            mkdir()?;
+            Ok(create()?)
+        }
+        r => Ok(r?),
+    }
 }
 
 /// The in-place guard (spec: Readers): an `in_place` target leaves a path
@@ -4118,7 +4165,7 @@ impl Engine {
             )?;
             let outputs = CopyOutputs::of(&target)?;
             let report = wb
-                .settle(&|p| outputs.contains(p))
+                .settle_with(&|p| outputs.contains(p), &|d| outputs.below_root(d))
                 .with_context(|| format!("recording {addr}'s codegen write-back"))?;
             Ok((written, report, outside_section, no_section_hint))
         }))
@@ -4143,6 +4190,9 @@ impl Engine {
         }
         for path in &report.dropped {
             tracing::debug!(addr = %addr, path = %String::from_utf8_lossy(path), "kept a codegen file the target no longer produces");
+        }
+        for dir in &report.removed_dirs {
+            tracing::debug!(addr = %addr, dir = %String::from_utf8_lossy(dir), "removed a directory the deleted codegen outputs left empty");
         }
         for msg in write_back_hints(&addr, outside_section, no_section_hint) {
             tracing::warn!(addr = %addr, files = outside_section, "{msg}");
@@ -4392,12 +4442,7 @@ impl Engine {
                             let unchanged =
                                 matches!(std::fs::read(&dest), Ok(old) if old == new_bytes);
                             if !unchanged {
-                                if let Some(parent) = dest.parent() {
-                                    std::fs::create_dir_all(parent).with_context(|| {
-                                        format!("create parent dir for {:?}", dest)
-                                    })?;
-                                }
-                                std::fs::write(&dest, &new_bytes)
+                                create_in_dir(&dest, || std::fs::write(&dest, &new_bytes))
                                     .with_context(|| format!("write codegen file {:?}", dest))?;
                                 moved = true;
                             }
@@ -4455,23 +4500,17 @@ impl Engine {
                                     Err(_) => true,
                                 };
                                 if recreate {
-                                    if let Some(parent) = dest.parent() {
-                                        std::fs::create_dir_all(parent).with_context(|| {
-                                            format!("create parent dir for {:?}", dest)
-                                        })?;
-                                    }
-                                    match std::fs::remove_file(&dest) {
-                                        Ok(()) => {}
-                                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                                        Err(e) => {
-                                            return Err(e).with_context(|| {
-                                                format!("remove {:?} before symlink", dest)
-                                            });
+                                    create_in_dir(&dest, || {
+                                        match std::fs::remove_file(&dest) {
+                                            Ok(()) => {}
+                                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                                            Err(e) => return Err(e),
                                         }
-                                    }
-                                    std::os::unix::fs::symlink(&target, &dest).with_context(
-                                        || format!("symlink {:?} -> {:?}", dest, target),
-                                    )?;
+                                        std::os::unix::fs::symlink(&target, &dest)
+                                    })
+                                    .with_context(|| {
+                                        format!("symlink {:?} -> {:?}", dest, target)
+                                    })?;
                                     // The bytes behind the link are unknown
                                     // here; `None` refuses the fixpoint.
                                     written.insert(path, None);
@@ -5776,6 +5815,41 @@ fn rewrite_query_inputs(
 mod tests {
     use super::*;
     use crate::engine::Config;
+
+    /// The parent vanishing between its creation and the write (another
+    /// write-back removing it as emptied) costs one retry, not the build.
+    #[test]
+    fn create_in_dir_recreates_a_parent_removed_before_the_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("nm/pkg/index.js");
+        let mut raced = false;
+        create_in_dir(&dest, || {
+            if !raced {
+                raced = true;
+                std::fs::remove_dir(dest.parent().expect("parent"))?;
+            }
+            std::fs::write(&dest, "x")
+        })
+        .expect("retried");
+        assert_eq!(std::fs::read_to_string(&dest).expect("written"), "x");
+    }
+
+    /// A second miss is an error, not a loop.
+    #[test]
+    fn create_in_dir_fails_when_the_parent_is_removed_twice() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("nm/pkg/index.js");
+        let err = create_in_dir(&dest, || {
+            std::fs::remove_dir(dest.parent().expect("parent"))?;
+            std::fs::write(&dest, "x")
+        })
+        .expect_err("gives up");
+        assert!(
+            err.downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+            "{err:#}"
+        );
+    }
     use crate::engine::provider::{
         ConfigRequest, ConfigResponse, ListPackageResponse, ListPackagesRequest, ListResponse,
         ProbeRequest, ProbeResponse,

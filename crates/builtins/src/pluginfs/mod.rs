@@ -2271,6 +2271,9 @@ mod tests {
             fn unlink(&self, path: &std::path::Path) -> std::io::Result<()> {
                 self.inner.unlink(path)
             }
+            fn rmdir(&self, path: &std::path::Path) -> std::io::Result<()> {
+                self.inner.rmdir(path)
+            }
         }
 
         let tmp = tempdir().unwrap();

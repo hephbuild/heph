@@ -15,7 +15,8 @@
 //! 3. The engine writes [`WriteBack::writes`].
 //! 4. [`WriteBack::settle`]: all file IO first (lstat what was written; fresh
 //!    hash, then unlink, each leftover heph wrote that a current `copy`
-//!    output still covers; rewrite the `.clock` probe whose mtime is the
+//!    output still covers, then `rmdir` the directories that left empty
+//!    below the output's root; rewrite the `.clock` probe whose mtime is the
 //!    records' `written_at`), then one transaction that only writes rows.
 //!    Dropping the [`WriteBack`] releases the lock; dropping it before
 //!    `settle` is a crash, which the next write-back (or a command's
@@ -173,6 +174,75 @@ fn is_leftover(row: &Row, produced: &FxHashSet<&[u8]>) -> bool {
     row.state != RowState::Dropped && !produced.contains(row.path.as_slice())
 }
 
+/// The parent of a root-relative path, `None` at the root.
+fn parent_dir(path: &[u8]) -> Option<&[u8]> {
+    let i = path.iter().rposition(|&b| b == b'/')?;
+    path.get(..i)
+}
+
+/// Removes, deepest first, each directory between a deleted leftover and the
+/// root of its output that the deletions left empty. `rmdir(2)` refuses a
+/// non-empty directory, so one still holding anything (a file heph never
+/// wrote, a kept leftover, a tool's cache) stays, and with it every
+/// directory above. A directory nothing was deleted from is never a
+/// candidate, empty or not. Best effort: a failed `rmdir` keeps the
+/// directory and never fails the write-back.
+///
+/// `deleted` includes leftovers found already gone, so a crash between the
+/// unlinks and the commit (which leaves their rows dangling) still has its
+/// directories removed by the next write-back.
+fn remove_emptied_dirs<'a>(
+    fs: &dyn IndexFs,
+    root: &Path,
+    deleted: impl Iterator<Item = &'a [u8]>,
+    below_copy_output_root: &dyn Fn(&[u8]) -> bool,
+) -> Vec<Vec<u8>> {
+    let mut candidates: FxHashSet<&[u8]> = FxHashSet::default();
+    for path in deleted {
+        let mut dir = path;
+        // Being below a root is inherited by subdirectories, so the first
+        // ancestor outside every root, or one already seen, ends the walk.
+        while let Some(parent) = parent_dir(dir) {
+            dir = parent;
+            if !below_copy_output_root(dir) || !candidates.insert(dir) {
+                break;
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    // A child is longer than its parent: longest first is deepest first.
+    let mut candidates: Vec<&[u8]> = candidates.into_iter().collect();
+    candidates.sort_unstable_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+
+    let mut kept: FxHashSet<&[u8]> = FxHashSet::default();
+    let mut removed = Vec::new();
+    for dir in candidates {
+        if !kept.contains(dir) {
+            let abs = root.join(rel_path(dir));
+            match fs.rmdir(&abs) {
+                Ok(()) => {
+                    removed.push(dir.to_vec());
+                    continue;
+                }
+                // Already gone: its parent may be empty now too.
+                Err(e) if super::fs::is_absent(&e) => continue,
+                Err(e) => {
+                    if e.kind() != std::io::ErrorKind::DirectoryNotEmpty {
+                        tracing::debug!(dir = %abs.display(), error = %e, "kept a directory a codegen write-back emptied");
+                    }
+                }
+            }
+        }
+        // A directory kept is a non-empty parent: no `rmdir` for it.
+        if let Some(parent) = parent_dir(dir) {
+            kept.insert(parent);
+        }
+    }
+    removed
+}
+
 impl Snapshot {
     /// Write protocol step 1, no lock: `None` when the write-back has nothing
     /// to do, so the caller takes no lock and commits nothing.
@@ -248,6 +318,8 @@ pub struct SettleReport {
     pub deleted: Vec<Vec<u8>>,
     /// Leftovers whose rows are now `dropped`, files kept.
     pub dropped: Vec<Vec<u8>>,
+    /// Directories the deletions left empty, removed, deepest first.
+    pub removed_dirs: Vec<Vec<u8>>,
 }
 
 /// How a command's settling of one pending row ended.
@@ -576,6 +648,20 @@ impl WriteBack {
         self,
         inside_current_copy_output: &dyn Fn(&[u8]) -> bool,
     ) -> Result<SettleReport> {
+        self.settle_with(inside_current_copy_output, &|_| false)
+    }
+
+    /// [`settle`](Self::settle), then remove the directories the deleted
+    /// leftovers left empty, as `rsync --delete` would. Only a directory
+    /// `below_copy_output_root` holds is a candidate: one strictly below the
+    /// root of a current `copy` output (a dir output's directory, a glob's
+    /// literal prefix), so an output's own directory and everything above it
+    /// stay, even empty.
+    pub fn settle_with(
+        self,
+        inside_current_copy_output: &dyn Fn(&[u8]) -> bool,
+        below_copy_output_root: &dyn Fn(&[u8]) -> bool,
+    ) -> Result<SettleReport> {
         let index = &self.index;
         let fs = index.fs().as_ref();
         let root = index.root();
@@ -706,6 +792,15 @@ impl WriteBack {
                 },
             ));
         }
+        report.removed_dirs = remove_emptied_dirs(
+            fs,
+            root,
+            fates
+                .iter()
+                .filter(|(_, f)| matches!(f, LeftoverFate::Delete))
+                .map(|(row, _)| row.path.as_slice()),
+            below_copy_output_root,
+        );
         index.fault(Fault::AfterUnlink)?;
 
         let flags: Vec<&[u8]> = self
@@ -1467,5 +1562,87 @@ mod tests {
         };
         let err = format!("{err:#}");
         assert!(err.contains(&name), "names the file: {err}");
+    }
+
+    /// `remove_emptied_dirs` over a temp tree holding `dirs` (and `files`),
+    /// after deleting `deleted`, with every directory below `root_of` (a
+    /// `/`-terminated prefix) a candidate.
+    fn prune(
+        dirs: &[&str],
+        files: &[&str],
+        deleted: &[&str],
+        root_of: &str,
+    ) -> (tempfile::TempDir, Vec<String>) {
+        let dir = tempfile::tempdir().unwrap();
+        for d in dirs {
+            std::fs::create_dir_all(dir.path().join(d)).unwrap();
+        }
+        for f in files {
+            std::fs::write(dir.path().join(f), "x").unwrap();
+        }
+        let fs = TestFs::default();
+        let removed = remove_emptied_dirs(
+            &fs,
+            dir.path(),
+            deleted.iter().map(|p| p.as_bytes()),
+            &|d: &[u8]| d.starts_with(root_of.as_bytes()),
+        );
+        let removed = removed
+            .into_iter()
+            .map(|d| String::from_utf8(d).unwrap())
+            .collect();
+        (dir, removed)
+    }
+
+    /// Siblings emptied by the same write-back take their common parent with
+    /// them, whatever order the leftovers came in.
+    #[test]
+    fn emptied_siblings_remove_their_parent() {
+        let (dir, removed) = prune(
+            &["nm/a/b", "nm/a/c", "nm/keep"],
+            &["nm/keep/f"],
+            &["nm/a/b/x", "nm/a/c/y", "nm/a/b/z"],
+            "nm/",
+        );
+        assert_eq!(removed, ["nm/a/b", "nm/a/c", "nm/a"]);
+        assert!(dir.path().join("nm/keep/f").exists());
+        assert!(dir.path().join("nm").is_dir(), "the root stays");
+    }
+
+    /// A directory still holding a file stays, and so does every directory
+    /// above it.
+    #[test]
+    fn non_empty_dir_stops_the_walk() {
+        let (dir, removed) = prune(&["nm/a/b/c"], &["nm/a/f"], &["nm/a/b/c/x"], "nm/");
+        assert_eq!(removed, ["nm/a/b/c", "nm/a/b"]);
+        assert!(dir.path().join("nm/a/f").exists());
+    }
+
+    /// The root check is on whole components: `nm/` is no root of `nmx`.
+    #[test]
+    fn near_miss_root_is_not_a_root() {
+        let (dir, removed) = prune(&["nmx/a"], &[], &["nmx/a/x"], "nm/");
+        assert!(removed.is_empty(), "{removed:?}");
+        assert!(dir.path().join("nmx/a").is_dir());
+    }
+
+    /// A leftover at the workspace root has no directory to remove, and an
+    /// already-gone directory does not stop its parent from going.
+    #[test]
+    fn root_level_and_already_gone() {
+        let (_dir, removed) = prune(&[], &[], &["x"], "");
+        assert!(removed.is_empty());
+
+        let (dir, removed) = prune(&["nm/a"], &[], &["nm/a/gone/x"], "nm/");
+        assert_eq!(removed, ["nm/a"]);
+        assert!(!dir.path().join("nm/a").exists());
+    }
+
+    /// A directory nothing was deleted from is never touched, empty or not.
+    #[test]
+    fn untouched_empty_dir_stays() {
+        let (dir, removed) = prune(&["nm/a", "nm/.vite/deps"], &[], &["nm/a/x"], "nm/");
+        assert_eq!(removed, ["nm/a"]);
+        assert!(dir.path().join("nm/.vite/deps").is_dir());
     }
 }
