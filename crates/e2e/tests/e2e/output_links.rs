@@ -9,7 +9,8 @@
 //! Two rules (hephbuild/heph#563):
 //! - an output glob never descends a symlinked directory; a target whose glob
 //!   would fails, rather than packing what is behind the link (the host, an
-//!   ancestor, a directory outside the output);
+//!   ancestor, a directory outside the output), except heph's own links into
+//!   its stage, which the OS sandbox puts where FUSE has a real directory;
 //! - a symlink packed into an artifact must be relative and resolve to a file or
 //!   directory inside that same artifact.
 
@@ -232,6 +233,34 @@ async fn a_declared_directory_under_a_linked_directory_fails() -> anyhow::Result
     assert!(
         msg.contains("heph does not follow") && msg.contains("app/out/vendor"),
         "must name the linked ancestor: {msg}"
+    );
+    Ok(())
+}
+
+/// In the OS sandbox a read-only dep is staged once and linked in: a
+/// directory with two files becomes one absolute link into heph's stage. That
+/// link is heph's, not the target's, so an output glob over it walks it as
+/// the directory it is under FUSE and packs the dep's files.
+#[tokio::test]
+async fn an_output_glob_descends_a_staged_read_only_dep() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "app",
+        r#"
+target(name = "d", driver = "bash", out = "in/*.txt",
+       run = "mkdir -p in && echo a > in/a.txt && echo b > in/b.txt")
+target(name = "c", driver = "bash", deps = {"r": ":d"}, read_only_deps = ["r"],
+       out = "**/*.txt",
+       run = "test -L in && echo c > c.txt")
+"#,
+    );
+    let result = ws.run("//app:c").await?;
+    let mut got = members(&result);
+    got.sort();
+    assert_eq!(
+        got,
+        ["app/c.txt", "app/in/a.txt", "app/in/b.txt"],
+        "the staged dep's files are packed through heph's link"
     );
     Ok(())
 }

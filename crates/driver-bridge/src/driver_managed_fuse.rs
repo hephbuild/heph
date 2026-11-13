@@ -182,7 +182,8 @@ impl ManagedDriverFuse {
         }
 
         res.artifacts
-            .extend(collect_outputs(target, hashin, &ws_dir, &sandbox_dir, ctoken).await?);
+            // FUSE shows inputs as real directories: no stage links to follow.
+            .extend(collect_outputs(target, hashin, &ws_dir, &sandbox_dir, None, ctoken).await?);
 
         Ok(RunResponse {
             artifacts: res.artifacts,

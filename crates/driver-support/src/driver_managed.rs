@@ -409,17 +409,24 @@ fn staged_path(inputs: &[ManagedRunInput], origin_id: &str, arg: &str) -> anyhow
 /// Stops early, with a cancellation error, once `ctoken` is cancelled or this
 /// future is dropped (see [`crate::stop`]): between output paths, between the
 /// entries of a walked directory, and per chunk while packing.
+///
+/// `stage_dir` is heph's shared stage when the sandbox links read-only inputs
+/// into it (the OS sandbox, see [`crate::stage`]): output globs and declared
+/// paths follow those links, and no other directory link (see
+/// [`crate::output_glob`]). `None` where inputs are real directories (FUSE).
 pub async fn collect_outputs(
     target: &hplugin::driver::targetdef::TargetDef,
     hashin: &str,
     ws_dir: &Path,
     sandbox_dir: &Path,
+    stage_dir: Option<&Path>,
     ctoken: &(dyn Cancellable + Send + Sync),
 ) -> anyhow::Result<Vec<outputartifact::OutputArtifact>> {
     let outputs = target.outputs.clone();
     let support_files = target.support_files.clone();
     let hashin = hashin.to_string();
     let (ws_dir, sandbox_dir) = (ws_dir.to_path_buf(), sandbox_dir.to_path_buf());
+    let stage_dir = stage_dir.map(Path::to_path_buf);
     crate::stop::run_blocking(ctoken, move |stop| {
         collect_outputs_inner(
             &outputs,
@@ -427,6 +434,7 @@ pub async fn collect_outputs(
             &hashin,
             &ws_dir,
             &sandbox_dir,
+            stage_dir.as_deref(),
             stop,
         )
     })
@@ -441,6 +449,7 @@ fn collect_outputs_inner(
     hashin: &str,
     ws_dir: &Path,
     sandbox_dir: &Path,
+    stage_dir: Option<&Path>,
     stop: &dyn Fn() -> bool,
 ) -> anyhow::Result<Vec<outputartifact::OutputArtifact>> {
     let mut artifacts = Vec::new();
@@ -453,7 +462,7 @@ fn collect_outputs_inner(
             if !path.collect {
                 continue;
             }
-            add_path_to_tar(&mut tar, ws_dir, None, path, &output.group, stop)?;
+            add_path_to_tar(&mut tar, ws_dir, stage_dir, path, &output.group, stop)?;
         }
         let tarpath = pack_to_artifact_tar(sandbox_dir, hashin, &output.group, tar, stop)?;
         artifacts.push(outputartifact::OutputArtifact {
@@ -469,7 +478,7 @@ fn collect_outputs_inner(
     if !support_files.is_empty() {
         let mut tar = hartifactcontent::tar::TarPacker::new();
         for path in support_files {
-            add_path_to_tar(&mut tar, ws_dir, None, path, "support", stop)?;
+            add_path_to_tar(&mut tar, ws_dir, stage_dir, path, "support", stop)?;
         }
         let (tarpath, hashout) = pack_to_artifact_tar(sandbox_dir, hashin, "support", tar, stop)?;
         artifacts.push(outputartifact::OutputArtifact {
@@ -1716,7 +1725,7 @@ mod cancel_tests {
         let (dir, target) = sandbox_with_outputs(&[("a", b"a")]);
         let ct = StdCancellationToken::new();
         ct.cancel();
-        let err = collect_outputs(&target, "h", &dir.path().join("ws"), dir.path(), &ct)
+        let err = collect_outputs(&target, "h", &dir.path().join("ws"), dir.path(), None, &ct)
             .await
             .err()
             .expect("cancelled");
@@ -1750,6 +1759,7 @@ mod cancel_tests {
             "h",
             &dir.path().join("ws"),
             dir.path(),
+            None,
             &stop,
         );
         assert!(stopped.is_err(), "a stopped collect fails");
@@ -1765,11 +1775,11 @@ mod cancel_tests {
         let ws = dir.path().join("ws");
         let ct = StdCancellationToken::new();
 
-        let first = collect_outputs(&target, "h", &ws, dir.path(), &ct)
+        let first = collect_outputs(&target, "h", &ws, dir.path(), None, &ct)
             .await
             .expect("collect");
         fs::write(ws.join("out/a"), b"second, longer").expect("rewrite");
-        let second = collect_outputs(&target, "h", &ws, dir.path(), &ct)
+        let second = collect_outputs(&target, "h", &ws, dir.path(), None, &ct)
             .await
             .expect("collect");
 
