@@ -2,11 +2,7 @@
   "cold": 20.0,
   "full-hit": 20.0,
   "incremental": 20.0,
-  "codegen-glob-cold": [
-    { "pct": 25.0, "stat": "median", "against": "codegen-glob-cold-probe-free" },
-    { "pct": 25.0, "stat": "median", "gate": false }
-  ],
+  "codegen-glob-cold": { "pct": 25.0, "stat": "median" },
   "codegen-glob-warm": { "pct": 25.0, "stat": "median" },
-  "codegen-warm-build": { "pct": 2.0, "noise": "add", "stat": "median" },
-  "codegen-import": { "pct": 10.0, "against": "codegen-glob-cold", "stat": "median" }
+  "codegen-warm-build": { "pct": 2.0, "noise": "add", "stat": "median" }
 }

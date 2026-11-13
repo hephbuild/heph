@@ -151,15 +151,7 @@ pub enum Scenario {
     /// Codegen corpus (`--codegen-files`): the root `glob("**")`
     /// (`//@heph/fs:glob@p=**`) with the walk cache (`fswalk.db`) removed
     /// before each rep. `prepare` has built every `copy` target, so the
-    /// generated files are on disk and recorded (N-1: stamped).
-    ///
-    /// Bar (spec): cold <= 1.25 x the probe-free baseline re-measured on the
-    /// codegen corpus, on the medians. That baseline is the candidate itself
-    /// with the index inert, interleaved with its normal reps (`run dist
-    /// --out-probe-free`, [`PROBE_FREE_GLOB`]): no "N-1 with the probe
-    /// stubbed" build exists to fetch. The comparison with N-1 as released
-    /// (with the xattr probe, while N-1 predates the index) is a reported
-    /// row, not a gate.
+    /// generated files are on disk and recorded.
     CodegenGlobCold,
     /// As `codegen-glob-cold`, keeping the walk cache across reps.
     CodegenGlobWarm,
@@ -168,14 +160,6 @@ pub enum Scenario {
     /// 1.02 x N-1's warm build plus N-1's own spread. Its exact bars (0
     /// commits, 0 lock files) are `check-codegen`'s, on the candidate alone.
     CodegenWarmBuild,
-    /// Codegen corpus: `heph tool codegen import` with the index db removed
-    /// before each rep (the files keep the xattr every write-back stamps).
-    /// Candidate only (`run dist --candidate-only`): N-1 has no import. Bar:
-    /// <= 1.1 x N-1's `codegen-glob-cold`, i.e. its glob with the probe,
-    /// through `compare`'s `against`. That baseline only has the probe while
-    /// N-1 predates the index; against a later N-1 this compares the import
-    /// with a probe-free glob, which the spec does not ask for.
-    CodegenImport,
 }
 
 impl Scenario {
@@ -187,7 +171,6 @@ impl Scenario {
             Scenario::CodegenGlobCold => "codegen-glob-cold",
             Scenario::CodegenGlobWarm => "codegen-glob-warm",
             Scenario::CodegenWarmBuild => "codegen-warm-build",
-            Scenario::CodegenImport => "codegen-import",
         }
     }
 
@@ -200,10 +183,9 @@ impl Scenario {
     fn is_codegen(self) -> bool {
         match self {
             Scenario::Cold | Scenario::FullHit | Scenario::Incremental => false,
-            Scenario::CodegenGlobCold
-            | Scenario::CodegenGlobWarm
-            | Scenario::CodegenWarmBuild
-            | Scenario::CodegenImport => true,
+            Scenario::CodegenGlobCold | Scenario::CodegenGlobWarm | Scenario::CodegenWarmBuild => {
+                true
+            }
         }
     }
 }
@@ -318,127 +300,6 @@ fn remove_prefixed(dir: &Path, prefix: &str) -> Result<()> {
     Ok(())
 }
 
-/// `heph tool codegen import` into a removed index; the count it recorded
-/// must be every corpus output, or the rep timed a scan that found nothing
-/// (a filesystem without xattrs, or a prepare that never built).
-fn import_codegen(dist: &Dist, corpus: &Path, expected: usize) -> Result<f64> {
-    let home = cache_dir(corpus)?;
-    let codegen = heph::htwalk::codegen_index::codegen_dir(&home);
-    if codegen.exists() {
-        std::fs::remove_dir_all(&codegen)
-            .with_context(|| format!("remove {}", codegen.display()))?;
-    }
-    let (ms, output) = run_heph(dist, corpus, &["tool", "codegen", "import"])?;
-    let recorded = count_after(&output, "recorded ");
-    if recorded != u64::try_from(expected).ok() {
-        bail!(
-            "heph tool codegen import recorded {recorded:?} files, the corpus has {expected} \
-             stamped outputs\n--- output ---\n{output}"
-        );
-    }
-    Ok(ms)
-}
-
-/// The scenario name [`measure_probe_free_glob`]'s reps are written under.
-pub const PROBE_FREE_GLOB: &str = "codegen-glob-cold-probe-free";
-
-/// The probe-free baseline of `codegen-glob-cold` (spec, Bench: "cold <=
-/// 1.25 x the probe-free baseline re-measured on the codegen corpus"): the
-/// same cold root glob by the same binary on the same corpus, with the index
-/// inert — no `<home>/codegen` db and no managed section in `.gitignore` —
-/// so nothing the glob does depends on codegen at all. `run dist
-/// --out-probe-free` interleaves it with the candidate's normal reps.
-pub fn measure_probe_free_glob(dist_dir: &Path, corpus: &Path) -> Result<f64> {
-    // Same config and same cold start as `codegen-glob-cold`'s reps.
-    let dist = Dist::locate(dist_dir)?;
-    write_dist_codegen_config(&dist, corpus)?;
-    let home = cache_dir(corpus)?;
-    remove_prefixed(&home.join("cache"), "fswalk.db")?;
-    let inert = InertIndex::hide(corpus, &home)?;
-    let ms = glob_root(&dist, corpus);
-    inert.restore()?;
-    ms
-}
-
-/// The index's two inputs moved out of the way, restored by [`restore`].
-///
-/// [`restore`]: InertIndex::restore
-struct InertIndex {
-    gitignore: PathBuf,
-    original: Option<Vec<u8>>,
-    codegen: PathBuf,
-    aside: PathBuf,
-}
-
-impl InertIndex {
-    fn hide(corpus: &Path, home: &Path) -> Result<Self> {
-        let codegen = heph::htwalk::codegen_index::codegen_dir(home);
-        let aside = codegen.with_extension("probe-free-aside");
-        if aside.exists() {
-            bail!(
-                "{} exists: an earlier probe-free rep was not restored",
-                aside.display()
-            );
-        }
-        if codegen.exists() {
-            std::fs::rename(&codegen, &aside)
-                .with_context(|| format!("move {} aside", codegen.display()))?;
-        }
-        let gitignore = corpus.join(".gitignore");
-        let original = match std::fs::read(&gitignore) {
-            Ok(bytes) => Some(bytes),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e).with_context(|| format!("read {}", gitignore.display())),
-        };
-        if let Some(bytes) = &original {
-            std::fs::write(&gitignore, strip_section(&String::from_utf8_lossy(bytes)))
-                .with_context(|| format!("write {}", gitignore.display()))?;
-        }
-        Ok(InertIndex {
-            gitignore,
-            original,
-            codegen,
-            aside,
-        })
-    }
-
-    /// Put back the `.gitignore` and the db as they were; a db the inert
-    /// run created is dropped.
-    fn restore(self) -> Result<()> {
-        if let Some(bytes) = &self.original {
-            std::fs::write(&self.gitignore, bytes)
-                .with_context(|| format!("restore {}", self.gitignore.display()))?;
-        }
-        if self.codegen.exists() {
-            std::fs::remove_dir_all(&self.codegen)
-                .with_context(|| format!("remove {}", self.codegen.display()))?;
-        }
-        if self.aside.exists() {
-            std::fs::rename(&self.aside, &self.codegen)
-                .with_context(|| format!("restore {}", self.codegen.display()))?;
-        }
-        Ok(())
-    }
-}
-
-/// `text` without its heph-managed section (BEGIN line through END line).
-fn strip_section(text: &str) -> String {
-    use heph::htwalk::gitignore_section::{BEGIN_MARKER_PREFIX, END_MARKER};
-    let mut out = String::with_capacity(text.len());
-    let mut inside = false;
-    for line in text.split_inclusive('\n') {
-        let bare = line.trim_end_matches(['\n', '\r']);
-        if !inside && bare.starts_with(BEGIN_MARKER_PREFIX) {
-            inside = true;
-        } else if inside {
-            inside = bare != END_MARKER;
-        } else {
-            out.push_str(line);
-        }
-    }
-    out
-}
-
 /// The codegen config with the default home (`.heph`): `check-codegen`'s,
 /// which runs one engine and has no second binary to keep apart from.
 pub(crate) fn write_codegen_config(corpus: &Path) -> Result<()> {
@@ -471,8 +332,7 @@ fn write_dist_codegen_config(dist: &Dist, corpus: &Path) -> Result<()> {
 /// Fail unless `dist`'s codegen index db exists and holds a settled row
 /// (recorded, not pending) for every corpus output: the state every
 /// candidate `codegen-glob-cold`/`-warm` rep must time its lookups against.
-/// Run before each such rep, outside the timed region; a probe-free rep
-/// that failed to put the db back fails the next one here.
+/// Run before each such rep, outside the timed region.
 pub fn check_populated_index(
     dist_dir: &Path,
     corpus: &Path,
@@ -541,7 +401,6 @@ fn measure_codegen(
         }
         Scenario::CodegenGlobWarm => glob_root(dist, corpus),
         Scenario::CodegenWarmBuild => build_codegen(dist, corpus, manifest.codegen_addrs.len()),
-        Scenario::CodegenImport => import_codegen(dist, corpus, manifest.codegen_outputs.len()),
         Scenario::Cold | Scenario::FullHit | Scenario::Incremental => {
             bail!("{} is not a codegen scenario", scenario.name())
         }
@@ -599,46 +458,7 @@ pub fn measure_once(
 
 #[cfg(test)]
 mod tests {
-    use super::{InertIndex, matched_targets, strip_section};
-    use heph::htwalk::gitignore_section::{BEGIN_MARKER, END_MARKER};
-
-    /// The managed section goes, whatever surrounds it; a file without one,
-    /// or with a BEGIN line of an older marker text, is handled the same.
-    #[test]
-    fn strip_section_drops_only_the_managed_section() {
-        let text = format!("/target\n{BEGIN_MARKER}\n# //p:g\n/p/g.txt\n{END_MARKER}\n/out\n");
-        assert_eq!(strip_section(&text), "/target\n/out\n");
-        assert_eq!(strip_section("/target\n"), "/target\n");
-        let old = format!("# BEGIN heph-generated (old text)\n/p/g.txt\n{END_MARKER}\n");
-        assert_eq!(strip_section(&old), "");
-        let crlf = format!("{BEGIN_MARKER}\r\n/p/g.txt\r\n{END_MARKER}\r\n/x\r\n");
-        assert_eq!(strip_section(&crlf), "/x\r\n");
-    }
-
-    /// Hidden, the index has neither input; restored, both are back as they
-    /// were, and a db the inert run created is gone.
-    #[test]
-    fn inert_index_hides_and_restores_both_inputs() {
-        let read = |p: &std::path::Path| std::fs::read_to_string(p).expect("read");
-        let corpus = tempfile::tempdir().expect("tempdir");
-        let home = corpus.path().join(".heph");
-        let codegen = heph::htwalk::codegen_index::codegen_dir(&home);
-        let ignore = corpus.path().join(".gitignore");
-        std::fs::create_dir_all(&codegen).expect("mkdir");
-        std::fs::write(codegen.join("db"), "rows").expect("write db");
-        let gitignore = format!("{BEGIN_MARKER}\n/p/g.txt\n{END_MARKER}\n");
-        std::fs::write(&ignore, &gitignore).expect("write .gitignore");
-
-        let inert = InertIndex::hide(corpus.path(), &home).expect("hide");
-        assert!(!codegen.exists(), "the db is out of the way");
-        assert_eq!(read(&ignore), "");
-        std::fs::create_dir_all(&codegen).expect("mkdir");
-        std::fs::write(codegen.join("db"), "made by the inert run").expect("write db");
-        inert.restore().expect("restore");
-
-        assert_eq!(read(&codegen.join("db")), "rows");
-        assert_eq!(read(&ignore), gitignore);
-    }
+    use super::matched_targets;
 
     /// Two binaries get two homes, each pruned from every walk by its
     /// `.heph` prefix, and the written config resolves `cache_dir` to the

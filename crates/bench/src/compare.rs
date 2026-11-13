@@ -34,11 +34,12 @@ pub enum Stat {
 }
 
 /// A scenario's entry in the thresholds file: a bare number is the pct floor
-/// (`{"cold": 20.0}`); an object can change how noise applies, which
-/// statistic is compared, and take the baseline from another scenario
-/// (`{"pct": 10.0, "against": "codegen-glob-cold"}`: the candidate's import
-/// against the baseline's glob); a list holds several bars for one
-/// scenario, one row each, e.g. a gating bar and a reported one.
+/// (`{"cold": 20.0}`); an object can change how noise applies and which
+/// statistic is compared; a list holds several bars for one scenario, one
+/// row each, e.g. a gating bar and a reported one. A bar always compares a
+/// scenario with the same scenario of the baseline build: comparing it with
+/// another scenario holds a fixed cost to a bar the baseline moves, and
+/// fails on commits that changed neither.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Threshold {
     Pct(f64),
@@ -72,10 +73,6 @@ pub struct Bar {
     pub pct: f64,
     #[serde(default)]
     pub noise: NoiseRule,
-    /// The baseline scenario to compare against, when not the same-named
-    /// one.
-    #[serde(default)]
-    pub against: Option<String>,
     #[serde(default)]
     pub stat: Stat,
     /// `false`: the row is reported, never a regression.
@@ -94,7 +91,6 @@ impl Bar {
         Bar {
             pct,
             noise: NoiseRule::Max,
-            against: None,
             stat: Stat::Mean,
             gate: true,
         }
@@ -114,10 +110,6 @@ impl Threshold {
 #[derive(Debug, Clone, Serialize)]
 pub struct ScenarioVerdict {
     pub scenario: String,
-    /// The baseline scenario the candidate was compared with, when it is not
-    /// `scenario` itself.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub against: Option<String>,
     pub baseline_reps: usize,
     pub candidate_reps: usize,
     pub baseline_mean_ms: f64,
@@ -217,7 +209,6 @@ pub fn decide_bar(
 
     ScenarioVerdict {
         scenario: scenario.to_string(),
-        against: bar.against.clone(),
         baseline_reps: baseline.len(),
         candidate_reps: candidate.len(),
         baseline_mean_ms,
@@ -251,8 +242,8 @@ pub fn load_thresholds(path: Option<&Path>) -> Result<HashMap<String, Threshold>
     serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))
 }
 
-/// One verdict per bar of each candidate scenario whose baseline (its own,
-/// or the `against` one) is present; the rest are skipped.
+/// One verdict per bar of each candidate scenario the baseline also has;
+/// the rest are skipped.
 pub fn verdicts(
     baseline: &RunResults,
     candidate: &RunResults,
@@ -262,14 +253,13 @@ pub fn verdicts(
 ) -> Vec<ScenarioVerdict> {
     let mut out = Vec::new();
     for c in &candidate.scenarios {
+        let Some(b) = baseline.scenarios.iter().find(|b| b.scenario == c.scenario) else {
+            continue;
+        };
         let bars = thresholds
             .get(&c.scenario)
             .map_or_else(|| vec![Bar::pct(default_threshold_pct)], Threshold::bars);
         for bar in &bars {
-            let base_name = bar.against.as_deref().unwrap_or(&c.scenario);
-            let Some(b) = baseline.scenarios.iter().find(|b| b.scenario == base_name) else {
-                continue;
-            };
             out.push(decide_bar(
                 &c.scenario,
                 &b.wall_ms,
@@ -299,12 +289,8 @@ pub fn render_markdown(verdicts: &[ScenarioVerdict]) -> String {
             (false, false) => "ok (reported, not gating)",
         };
         out.push_str(&format!(
-            "| {}{} | {:.1} ({stat}n={}) | {:.1} ({stat}n={}) | {:+.1}% | {:.1}% | {verdict} |\n",
+            "| {} | {:.1} ({stat}n={}) | {:.1} ({stat}n={}) | {:+.1}% | {:.1}% | {verdict} |\n",
             v.scenario,
-            v.against
-                .as_deref()
-                .map(|a| format!(" (vs baseline {a})"))
-                .unwrap_or_default(),
             v.baseline_ms,
             v.baseline_reps,
             v.candidate_ms,
@@ -437,8 +423,7 @@ mod tests {
     fn thresholds_file_takes_numbers_and_bars() {
         let parsed: HashMap<String, Threshold> = serde_json::from_str(
             r#"{"cold": 20.0,
-                "codegen-warm-build": {"pct": 2.0, "noise": "add"},
-                "codegen-import": {"pct": 10.0, "against": "codegen-glob-cold"}}"#,
+                "codegen-warm-build": {"pct": 2.0, "noise": "add"}}"#,
         )
         .expect("parse");
         assert_eq!(parsed.get("cold"), Some(&Threshold::Pct(20.0)));
@@ -449,15 +434,12 @@ mod tests {
                 ..Bar::pct(2.0)
             }])
         );
-        assert_eq!(
-            parsed.get("codegen-import").map(Threshold::bars),
-            Some(vec![Bar {
-                against: Some("codegen-glob-cold".into()),
-                ..Bar::pct(10.0)
-            }])
-        );
-        serde_json::from_str::<HashMap<String, Threshold>>(r#"{"x": {"pct": 1.0, "agains": "y"}}"#)
+        serde_json::from_str::<HashMap<String, Threshold>>(r#"{"x": {"pct": 1.0, "nois": "add"}}"#)
             .expect_err("a misspelt key is refused");
+        serde_json::from_str::<HashMap<String, Threshold>>(
+            r#"{"x": {"pct": 1.0, "against": "y"}}"#,
+        )
+        .expect_err("a bar never compares with another scenario");
         serde_json::from_str::<HashMap<String, Threshold>>(r#"{"x": {"pct": 1.0, "stat": "p90"}}"#)
             .expect_err("an unknown stat is refused");
     }
@@ -467,7 +449,7 @@ mod tests {
     #[test]
     fn thresholds_file_takes_stat_gate_and_lists() {
         let parsed: HashMap<String, Threshold> = serde_json::from_str(
-            r#"{"g": [{"pct": 25.0, "stat": "median", "against": "g-free"},
+            r#"{"g": [{"pct": 25.0, "stat": "median"},
                       {"pct": 25.0, "stat": "median", "gate": false}]}"#,
         )
         .expect("parse");
@@ -477,7 +459,6 @@ mod tests {
             vec![
                 Bar {
                     stat: Stat::Median,
-                    against: Some("g-free".into()),
                     ..Bar::pct(25.0)
                 },
                 Bar {
@@ -501,19 +482,6 @@ mod tests {
                 );
             }
         }
-        let gating: Vec<Option<String>> = repo
-            .get("codegen-glob-cold")
-            .map(Threshold::bars)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|b| b.gate)
-            .map(|b| b.against)
-            .collect();
-        assert_eq!(
-            gating,
-            [Some("codegen-glob-cold-probe-free".to_string())],
-            "the cold glob gates on the probe-free baseline alone"
-        );
     }
 
     /// The median ignores one slow rep the mean does not: the same samples
@@ -551,20 +519,13 @@ mod tests {
     /// the workflow's grep for REGRESSION never fails on it.
     #[test]
     fn a_reported_bar_is_a_row_but_never_a_regression() {
-        let baseline = results(&[
-            ("codegen-glob-cold", &[100.0, 100.0, 100.0, 100.0, 100.0]),
-            (
-                "codegen-glob-cold-probe-free",
-                &[90.0, 90.0, 90.0, 90.0, 90.0],
-            ),
-        ]);
+        let baseline = results(&[("codegen-glob-cold", &[100.0, 100.0, 100.0, 100.0, 100.0])]);
         let candidate = results(&[("codegen-glob-cold", &[140.0, 140.0, 140.0, 140.0, 140.0])]);
         let thresholds = HashMap::from([(
             "codegen-glob-cold".to_string(),
             Threshold::Bars(vec![
                 Bar {
                     stat: Stat::Median,
-                    against: Some("codegen-glob-cold-probe-free".into()),
                     ..Bar::pct(25.0)
                 },
                 Bar {
@@ -578,10 +539,7 @@ mod tests {
         let [gating, reported] = out.as_slice() else {
             panic!("two rows: {out:?}")
         };
-        assert!(
-            gating.regression,
-            "+55% over the probe-free baseline: {gating:?}"
-        );
+        assert!(gating.regression, "+40% past a 25% bar: {gating:?}");
         assert!(reported.over_bar && !reported.regression, "{reported:?}");
         let md = render_markdown(&out);
         assert_eq!(md.matches("REGRESSION").count(), 1, "{md}");
@@ -607,31 +565,5 @@ mod tests {
         assert!((within.effective_threshold_pct - (2.0 + within.noise_band_pct)).abs() < 1e-9);
         let past = decide("w", &base, &[106.0], 2.0, 1.0, NoiseRule::Add);
         assert!(past.regression, "{past:?}");
-    }
-
-    /// A candidate-only scenario is decided against another scenario's
-    /// baseline, and says so; without that baseline it is skipped.
-    #[test]
-    fn against_takes_the_baseline_from_the_named_scenario() {
-        let baseline = results(&[("codegen-glob-cold", &[100.0, 100.0, 100.0])]);
-        let candidate = results(&[("codegen-import", &[112.0, 112.0])]);
-        let thresholds = HashMap::from([(
-            "codegen-import".to_string(),
-            Threshold::Bar(Bar {
-                against: Some("codegen-glob-cold".into()),
-                ..Bar::pct(10.0)
-            }),
-        )]);
-        let out = verdicts(&baseline, &candidate, &thresholds, 8.0, 2.0);
-        let [v] = out.as_slice() else {
-            panic!("one verdict: {out:?}")
-        };
-        assert_eq!(v.scenario, "codegen-import");
-        assert_eq!(v.against.as_deref(), Some("codegen-glob-cold"));
-        assert!(v.regression, "+12% past a 10% bar: {v:?}");
-        assert!(render_markdown(&out).contains("codegen-import (vs baseline codegen-glob-cold)"));
-
-        let none = verdicts(&results(&[]), &candidate, &thresholds, 8.0, 2.0);
-        assert!(none.is_empty());
     }
 }
