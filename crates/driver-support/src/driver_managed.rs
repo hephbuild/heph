@@ -677,15 +677,19 @@ pub fn write_source_map(
     Ok(())
 }
 
+/// Where `input` materializes: `<sandbox>/exec_<root>` when it carries an
+/// `unpack_root` annotation, else the sandbox workspace dir.
+///
+/// A support input carries its dep's annotations, so it lands in the same tree
+/// as that dep's outputs. A tool's `sdk/bin/x` and its support `sdk/lib/` then
+/// keep the relative layout they had in the producer's sandbox, which is what
+/// a launcher that finds its files from its own path relies on.
 pub fn resolve_unpack_root(input: &RunInput, sandbox_dir: &Path, ws_dir: &Path) -> PathBuf {
-    match input.artifact.r#type {
-        inputartifact::Type::Support => ws_dir.to_path_buf(),
-        inputartifact::Type::Dep => input
-            .annotations
-            .get("unpack_root")
-            .map(|root| sandbox_dir.join(format!("exec_{root}")))
-            .unwrap_or_else(|| ws_dir.to_path_buf()),
-    }
+    input
+        .annotations
+        .get("unpack_root")
+        .map(|root| sandbox_dir.join(format!("exec_{root}")))
+        .unwrap_or_else(|| ws_dir.to_path_buf())
 }
 
 pub fn list_path_for(input: &RunInput, list_dir: &Path) -> Option<PathBuf> {

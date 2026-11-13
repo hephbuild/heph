@@ -108,3 +108,46 @@ target(
     assert!(content.contains("bbb"), "missing 'bbb', got: {content:?}");
     Ok(())
 }
+
+/// A tool that finds its own files relative to where it lives: `sdk/bin/hello`
+/// reads `sdk/lib/data.txt` through `readlink -f "$0"`, the shape of an SDK
+/// launcher. Its support files must land in the same tree as its outputs
+/// (`exec_tools/`), so the layout between the two matches the producer's own
+/// sandbox.
+const SDK_TOOL_BUILD: &str = r#"
+target(
+    name = "tool",
+    driver = "bash",
+    run = [
+        "mkdir -p sdk/bin sdk/lib",
+        "echo hello > sdk/lib/data.txt",
+        "printf '#!/bin/sh\\ncat \"$(dirname \"$(readlink -f \"$0\")\")/../lib/data.txt\"\\n' > sdk/bin/hello",
+        "chmod +x sdk/bin/hello",
+    ],
+    out = {"hello": "sdk/bin/hello"},
+    support_files = ["sdk/"],
+)
+"#;
+
+#[tokio::test]
+async fn tool_support_files_are_staged_next_to_the_tool() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file("sdktool", SDK_TOOL_BUILD);
+    ws.write_build_file(
+        "sdkuse",
+        r#"
+target(
+    name = "consumer",
+    driver = "bash",
+    tools = ["//sdktool:tool"],
+    run = "hello > $OUT",
+    out = "out.txt",
+)
+"#,
+    );
+
+    let result = ws.run("//sdkuse:consumer").await?;
+    let content = common::artifact_string(&result);
+    assert_eq!(content.trim(), "hello", "got: {content:?}");
+    Ok(())
+}
