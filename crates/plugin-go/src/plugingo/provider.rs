@@ -1812,7 +1812,7 @@ fn compute_pkg_src_addrs(pkg_str: &str, states: &[State]) -> anyhow::Result<Vec<
     let non_go_glob = if pkg_str.is_empty() {
         "**/*".to_string()
     } else {
-        format!("{}/**/*", pkg_str)
+        format!("{}/**/*", pluginfs::escape_fs_literal(pkg_str))
     };
     // Exclude `.go` (their own lane) and the module files `go.mod`/`go.sum`:
     // the latter are delivered into `_golist` by the modfiles (`_go_mod`) lane
@@ -1926,7 +1926,7 @@ fn pkg_static_embed_glob_addr(pkg_str: &str) -> String {
     let glob = if pkg_str.is_empty() {
         "**/*".to_string()
     } else {
-        format!("{pkg_str}/**/*")
+        format!("{}/**/*", pluginfs::escape_fs_literal(pkg_str))
     };
     pluginfs::glob_addr(&glob, &["**/*.go"]).format()
 }
@@ -3028,7 +3028,7 @@ impl ProviderInner {
                 let src_glob = if pkg.is_empty() {
                     "*.go".to_string()
                 } else {
-                    format!("{}/*.go", pkg)
+                    format!("{}/*.go", pluginfs::escape_fs_literal(pkg))
                 };
                 let go_src_glob_addr = pluginfs::glob_addr(&src_glob, &[]);
                 // Non-Go src tree + go_src codegen query + go_codegen_deps — needed

@@ -921,15 +921,17 @@ impl Driver {
     }
 }
 
+/// One declared `out` entry as a workspace-root-relative output path; see
+/// [`spec::path_content`] for how it is classified and joined.
 fn spec_path_to_target_path(
     raw: &str,
     pkg: &hmodel::htpkg::PkgBuf,
     codegen: &CodegenMode,
 ) -> anyhow::Result<Path> {
-    let path = hmodel::htpkg::join_rel_checked(pkg.as_str(), raw)
+    let content = spec::path_content(raw, pkg.as_str())
         .with_context(|| format!("resolving output path {raw:?} in package {pkg}"))?;
     Ok(Path {
-        content: spec::path_content(path),
+        content,
         codegen_tree: codegen.clone(),
         collect: true,
     })
@@ -3250,6 +3252,55 @@ mod tests {
             err.to_string().contains("resolving output path"),
             "got {err}"
         );
+    }
+
+    /// A package whose path holds `[ ] * ?` (Next.js `app/[slug]`): the kind
+    /// is the user's `out`, and only the user's part of a glob is pattern
+    /// text — the package is escaped in front of it.
+    #[test]
+    fn spec_path_to_target_path_escapes_a_metachar_package() {
+        use hmodel::htpkg::PkgBuf;
+
+        let content = |out: &str, pkg: &str| {
+            spec_path_to_target_path(out, &PkgBuf::from(pkg), &CodegenMode::None)
+                .unwrap()
+                .content
+        };
+        let assert_file = |c: Content, want: &str| {
+            assert!(matches!(&c, Content::FilePath(p) if p == want), "got {c}");
+        };
+        let assert_dir = |c: Content, want: &str| {
+            assert!(matches!(&c, Content::DirPath(p) if p == want), "got {c}");
+        };
+        let assert_glob = |c: Content, want: &str| {
+            assert!(matches!(&c, Content::Glob(p) if p == want), "got {c}");
+        };
+
+        // A plain file and a dir stay literal paths, unescaped.
+        assert_file(content("a.txt", "app/[slug]"), "app/[slug]/a.txt");
+        assert_dir(content("gen/", "app/[slug]"), "app/[slug]/gen/");
+        assert_file(content("a.txt", "x/*/y?"), "x/*/y?/a.txt");
+
+        // A glob gets the package escaped and the user's pattern verbatim.
+        assert_glob(content("*.txt", "app/[slug]"), "app/[[]slug[]]/*.txt");
+        assert_glob(content("gen/**/*.go", "x/*/y?"), "x/[*]/y[?]/gen/**/*.go");
+        assert_glob(content("[ab].txt", "a]b"), "a[]]b/[ab].txt");
+        // `..` pops the escaped component whole.
+        assert_glob(content("../*.txt", "app/[slug]"), "app/*.txt");
+
+        // The escaped pattern matches the literal package's files and no
+        // sibling its unescaped form would have read as a class.
+        let pattern = glob::Pattern::new("app/[[]slug[]]/*.txt").unwrap();
+        assert!(pattern.matches("app/[slug]/a.txt"));
+        assert!(!pattern.matches("app/s/a.txt"));
+
+        // An ordinary package's patterns are byte-identical to what they
+        // were, so its def hashes do not move.
+        assert_glob(
+            content("gen/**/*.go", "a/b-c/d_e.f"),
+            "a/b-c/d_e.f/gen/**/*.go",
+        );
+        assert_glob(content("*", ""), "*");
     }
 
     fn make_req<'a, 'io>(request: RunRequest<'a, 'io>) -> ManagedRunRequest<'a, 'io> {

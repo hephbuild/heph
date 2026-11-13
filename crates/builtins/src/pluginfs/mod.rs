@@ -115,7 +115,10 @@ pub fn file_addr(path: &str) -> Addr {
 }
 
 /// Returns the `Addr` for a glob fs target.
-/// `exclude` is a list of glob patterns to skip; pass `&[]` for none.
+/// `exclude` is a list of glob patterns to skip; pass `&[]` for none. They are
+/// joined with `,` into one arg and split back by [`split_excludes`], which
+/// keeps an escaped `\,` (a package `a,b`, [`escape_fs_literal`]) inside its
+/// pattern.
 pub fn glob_addr(pattern: &str, exclude: &[&str]) -> Addr {
     let mut args = BTreeMap::from([("p".to_string(), pattern.to_string())]);
     if !exclude.is_empty() {
@@ -124,16 +127,181 @@ pub fn glob_addr(pattern: &str, exclude: &[&str]) -> Addr {
     Addr::new(PkgBuf::from(PKG), "glob".to_string(), args)
 }
 
+/// The exclude patterns of a glob addr's `e` arg ([`glob_addr`]): split on
+/// each `,` that is not escaped, i.e. preceded by an even run of `\` (`\\,`
+/// is an escaped `\`, then a separator). An empty arg is no excludes.
+fn split_excludes(raw: &str) -> Vec<String> {
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut backslashes = 0usize;
+    for (i, b) in raw.bytes().enumerate() {
+        match b {
+            b'\\' => backslashes += 1,
+            b',' if backslashes.is_multiple_of(2) => {
+                out.push(raw.get(start..i).unwrap_or_default().to_owned());
+                start = i + 1;
+                backslashes = 0;
+            }
+            _ => backslashes = 0,
+        }
+    }
+    out.push(raw.get(start..).unwrap_or_default().to_owned());
+    out
+}
+
 /// The fs addr reading an output path: [`file_addr`] for a file, a glob for a
 /// glob or a directory. The one mapping both `introspect:outputs` and the
 /// in-place guard use, so an `in_place` output and the input that reads it
 /// land on the same addr.
-pub fn output_fs_addr(content: &PathContent) -> Addr {
-    match content {
+///
+/// An fs glob is a `wax` pattern while an output glob is the `glob` crate's
+/// (see `PathContent`), so a glob is translated ([`fs_pattern_of_output_glob`])
+/// and a directory escaped ([`escape_fs_literal`]): handed over verbatim, the
+/// package `app/[slug]` reads as a class to one and is a compile error to the
+/// other. A path in neither dialect's metacharacters comes through unchanged.
+///
+/// Fails on an output glob with no fs glob spelling
+/// ([`fs_pattern_of_output_glob`]); the collector rejects or misreads the
+/// same pattern, so there is no addr that would read what it collects.
+pub fn output_fs_addr(content: &PathContent) -> anyhow::Result<Addr> {
+    Ok(match content {
         PathContent::FilePath(p) => file_addr(p),
-        PathContent::Glob(p) => glob_addr(p, &[]),
-        PathContent::DirPath(p) => glob_addr(&format!("{}/**/*", p.trim_end_matches('/')), &[]),
+        PathContent::Glob(p) => glob_addr(&fs_pattern_of_output_glob(p)?, &[]),
+        PathContent::DirPath(p) => glob_addr(
+            &format!("{}/**/*", escape_fs_literal(p.trim_end_matches('/'))),
+            &[],
+        ),
+    })
+}
+
+/// Whether `c` needs a `\` to match itself in a `wax` pattern: wax's own
+/// metacharacters, and `\`, its escape character, which `wax::escape` leaves
+/// alone (so a `\` would escape whatever follows it instead).
+fn is_fs_meta(c: char) -> bool {
+    c == '\\' || wax::is_meta_character(c)
+}
+
+/// `literal` as fs glob pattern text (`wax`) matching exactly itself: the
+/// form a package directory takes in front of a pattern. A path with none of
+/// `? * $ : < > ( ) [ ] { } , \` comes back unchanged.
+pub fn escape_fs_literal(literal: &str) -> String {
+    let mut out = String::with_capacity(literal.len());
+    for c in literal.chars() {
+        if is_fs_meta(c) {
+            out.push('\\');
+        }
+        out.push(c);
     }
+    out
+}
+
+/// An output glob (the `glob` crate's dialect) as the fs glob (`wax`)
+/// matching the same paths.
+///
+/// Wildcards, `/` and classes carry over; a literal that is a wax
+/// metacharacter is escaped, and a one-character class of `[ ] * ?` — how
+/// [`hplugin::driver::targetdef::path::escape_glob_literal`] spells those —
+/// becomes the backslash form, so the translation of an escaped literal is
+/// exactly [`escape_fs_literal`] of it.
+///
+/// Fails rather than pass a pattern through untranslated, since a pattern
+/// valid in both dialects can mean different things in each: an unclosed
+/// class, which the collector rejects, and a `\` in a class, which wax cannot
+/// spell (`glob` reads `[a\]b]` as `[a\]` then `b]`; wax as one class of `a ]
+/// b`).
+///
+/// What translation cannot remove, because the collector is not a pure
+/// `glob::Pattern` match, so the fs glob still differs from what was
+/// collected:
+/// - **A trailing `**`** (`gen/**`): the collector packs nothing for it (a
+///   `**` that ends the pattern selects directories, and only files are
+///   packed), while wax selects every file below `gen`.
+/// - **Case.** On a case-insensitive filesystem (APFS by default) the
+///   collector resolves a literal component through the filesystem, so
+///   `Gen/*.txt` collects from `gen/`; the fs walk compares bytes, and does
+///   not.
+pub fn fs_pattern_of_output_glob(glob: &str) -> anyhow::Result<String> {
+    translate_output_glob(glob)
+        .with_context(|| format!("output glob {glob:?} has no fs glob (wax) spelling"))
+}
+
+fn translate_output_glob(glob: &str) -> anyhow::Result<String> {
+    use hplugin::driver::targetdef::path::glob_literal_escape_at;
+
+    let mut out = String::with_capacity(glob.len());
+    let mut rest = glob;
+    while let Some(c) = rest.chars().next() {
+        if let Some(m) = glob_literal_escape_at(rest) {
+            out.push('\\');
+            out.push(m);
+            rest = rest.get(3..).unwrap_or_default();
+            continue;
+        }
+        let mut next = rest.get(c.len_utf8()..).unwrap_or_default();
+        match c {
+            '*' | '?' | '/' => out.push(c),
+            '[' => {
+                // The class bounds as the `glob` crate finds them: a `]` right
+                // after `[` or `[!` is a member, not the end.
+                let (negated, body) = match next.strip_prefix('!') {
+                    Some(body) => (true, body),
+                    None => (false, next),
+                };
+                let first_len = body.chars().next().map_or(0, char::len_utf8);
+                let end = body
+                    .get(first_len..)
+                    .and_then(|after| after.find(']'))
+                    .filter(|_| first_len > 0)
+                    .map(|j| first_len + j)
+                    .context("unclosed character class")?;
+                let members: Vec<char> = body.get(..end).unwrap_or_default().chars().collect();
+                out.push('[');
+                if negated {
+                    out.push('!');
+                }
+                let mut k = 0;
+                while let Some(&a) = members.get(k) {
+                    // `glob`'s range rule: `x-y` wherever three are left.
+                    if members.get(k + 1) == Some(&'-')
+                        && let Some(&b) = members.get(k + 2)
+                    {
+                        push_class_char(&mut out, a)?;
+                        out.push('-');
+                        push_class_char(&mut out, b)?;
+                        k += 3;
+                    } else {
+                        push_class_char(&mut out, a)?;
+                        k += 1;
+                    }
+                }
+                out.push(']');
+                next = body.get(end + 1..).unwrap_or_default();
+            }
+            c => {
+                if is_fs_meta(c) {
+                    out.push('\\');
+                }
+                out.push(c);
+            }
+        }
+        rest = next;
+    }
+    Ok(out)
+}
+
+/// One class member in wax's spelling. Fails on `\`, which a wax class
+/// cannot hold.
+fn push_class_char(out: &mut String, c: char) -> anyhow::Result<()> {
+    match c {
+        '\\' => anyhow::bail!("a `\\` in a character class"),
+        '[' | ']' | '-' => out.push('\\'),
+        _ => {}
+    }
+    out.push(c);
+    Ok(())
 }
 
 /// Returns `true` if `addr` refers to a single-file fs target.
@@ -361,7 +529,9 @@ impl PluginFn for GlobFn {
         // Arg shape is enforced by the declared signature before we get here.
         let pattern = str_arg("heph.fs.glob", &args)?;
 
-        let resolved = hmodel::htpkg::join_rel_checked(ctx.pkg, pattern)
+        // Only `pattern` is pattern text: the package is escaped, or
+        // `app/[slug]` reads as a class and the call finds nothing.
+        let resolved = hmodel::htpkg::join_rel_checked(&escape_fs_literal(ctx.pkg), pattern)
             .context("heph.fs.glob: normalizing pattern")?;
 
         // No user excludes, so `request_id` is irrelevant (the built-in exclude
@@ -571,22 +741,41 @@ fn compile_any(patterns: &[String]) -> anyhow::Result<Arc<wax::Any<'static>>> {
 }
 
 /// Returns the leading literal path prefix of `pattern` — the run of complete
-/// components that contain no glob metacharacters.
+/// components that contain no unescaped glob metacharacters — **unescaped**,
+/// with its length in `pattern`'s bytes.
 ///
 /// Used as the walk root so a pattern like `mgmt/protos/x/**/*` scans only
 /// `<root>/mgmt/protos/x` instead of the whole workspace. A fully-literal
 /// pattern returns itself, letting `walkdir` visit just that one path.
 ///
+/// A `\x` escape is the literal `x`: it is how a package directory is spelled
+/// in front of a pattern ([`escape_fs_literal`]), so `app/\(marketing\)/about/*.ts`
+/// walks from `app/(marketing)/about`, not from `app`. The prefix comes back
+/// as the path it names (borrowed when it holds no escape), since the walk
+/// joins it onto the root and [`strip_literal_prefix`] compares it to entry
+/// paths byte for byte.
+///
 /// `pattern` must already be normalized (no empty, `.`, or `..` components).
-fn literal_prefix(pattern: &str) -> &str {
-    // wax glob metacharacters (plus `\` escape and `,` which is only meaningful
-    // inside `{…}` but signals a non-literal component).
-    const META: &[char] = &['*', '?', '[', ']', '{', '}', '<', '>', '\\', ','];
+fn literal_prefix(pattern: &str) -> (std::borrow::Cow<'_, str>, usize) {
+    // wax glob metacharacters (plus `,` which is only meaningful inside `{…}`
+    // but signals a non-literal component). `\` is wax's escape, read below.
+    const META: &[char] = &['*', '?', '[', ']', '{', '}', '<', '>', ','];
     let mut end = 0usize;
     let mut pos = 0usize;
-    for comp in pattern.split('/') {
-        if comp.contains(META) {
-            break;
+    let mut escaped = false;
+    'components: for comp in pattern.split('/') {
+        let mut chars = comp.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                // `split` took the `/`s, so a `\` ending a component escapes
+                // nothing it can read as literal: stop there.
+                '\\' => match chars.next() {
+                    Some(_) => escaped = true,
+                    None => break 'components,
+                },
+                c if META.contains(&c) => break 'components,
+                _ => {}
+            }
         }
         pos += comp.len();
         end = pos; // include this component in the prefix
@@ -594,7 +783,19 @@ fn literal_prefix(pattern: &str) -> &str {
     }
     // `end` always lands on a `/` separator (ASCII) or 0/len, so it is a valid
     // char boundary; `get` keeps that guarantee explicit and panic-free.
-    pattern.get(..end).unwrap_or(pattern)
+    let raw = pattern.get(..end).unwrap_or(pattern);
+    if !escaped {
+        return (std::borrow::Cow::Borrowed(raw), end);
+    }
+    let mut unescaped = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        unescaped.push(match c {
+            '\\' => chars.next().unwrap_or(c),
+            c => c,
+        });
+    }
+    (std::borrow::Cow::Owned(unescaped), end)
 }
 
 /// Collapses `.`, empty, and `..` components in a forward-slash path.
@@ -630,8 +831,8 @@ struct CompiledGlob {
     glob: GlobMatcher,
     not: Arc<wax::Any<'static>>,
     /// Literal directory prefix of the pattern, used as the walk root. Whole
-    /// components; a trailing `/` only on a fully-literal pattern (from
-    /// `heph.fs.glob("sub/")`).
+    /// components, unescaped (the path itself, not pattern text); a trailing
+    /// `/` only on a fully-literal pattern (from `heph.fs.glob("sub/")`).
     prefix: String,
     /// Engine-provided dirs/globs to prune during the walk.
     skip: Arc<Ignore>,
@@ -681,14 +882,15 @@ fn cached_glob(pattern: &str) -> Result<Arc<wax::Glob<'static>>, wax::BuildError
         .clone())
 }
 
-/// `pattern` split at its [`literal_prefix`]: the prefix, and the rest without
-/// the separating `/`. `mgmt/protos/x/**/*` → (`mgmt/protos/x`, `**/*`),
-/// `**/*.rs` → (``, `**/*.rs`), and a fully-literal pattern → (itself, ``).
-fn split_literal_prefix(pattern: &str) -> (&str, &str) {
-    let prefix = literal_prefix(pattern);
+/// `pattern` split at its [`literal_prefix`]: the prefix (unescaped), and the
+/// rest without the separating `/`. `mgmt/protos/x/**/*` → (`mgmt/protos/x`,
+/// `**/*`), `**/*.rs` → (``, `**/*.rs`), `app/\[slug\]/*.ts` → (`app/[slug]`,
+/// `*.ts`), and a fully-literal pattern → (itself, ``).
+fn split_literal_prefix(pattern: &str) -> (std::borrow::Cow<'_, str>, &str) {
+    let (prefix, end) = literal_prefix(pattern);
     // The prefix is a run of whole components, so the cut lands on a `/` or at
     // an end and never splits a component.
-    let rest = pattern.get(prefix.len()..).unwrap_or_default();
+    let rest = pattern.get(end..).unwrap_or_default();
     (prefix, rest.strip_prefix('/').unwrap_or(rest))
 }
 
@@ -735,7 +937,9 @@ fn pattern_matches(compiled: &CompiledGlob, rel: &std::path::Path) -> anyhow::Re
 /// per walked entry than the regex match it guards (measured 2x the whole
 /// match). Byte-wise is exact here because `rel` is the walk root (`prefix`
 /// itself) followed by directory entry names, and wax matches the same raw
-/// bytes. A prefix with a trailing `/` (`heph.fs.glob("sub/")`) is always a
+/// bytes. `prefix` is the unescaped path ([`literal_prefix`]), so it compares
+/// to entry paths as they are on disk: `app/[slug]`, never `app/\[slug\]`.
+/// A prefix with a trailing `/` (`heph.fs.glob("sub/")`) is always a
 /// fully-literal pattern, so the walk only asks about `rel == prefix`.
 fn strip_literal_prefix<'r>(rel: &'r std::path::Path, prefix: &str) -> Option<&'r std::path::Path> {
     use std::os::unix::ffi::OsStrExt as _;
@@ -884,7 +1088,7 @@ fn compile_glob(
         pattern: pattern.to_owned(),
         glob,
         not,
-        prefix: prefix.to_owned(),
+        prefix: prefix.into_owned(),
         skip: skip.clone(),
     })
 }
@@ -1266,11 +1470,7 @@ impl hplugin::driver::Driver for Driver {
         let exclude_raw = spec.e.unwrap_or_default();
 
         // "e" arg is comma-separated glob patterns.
-        let exclude: Vec<String> = if exclude_raw.is_empty() {
-            vec![]
-        } else {
-            exclude_raw.split(',').map(str::to_owned).collect()
-        };
+        let exclude = split_excludes(&exclude_raw);
 
         let (def, outputs, hash) = match (file_path, glob_pattern) {
             (Some(path), _) => {
@@ -2847,6 +3047,111 @@ mod tests {
         assert_eq!(parsed.args.get("f"), addr.args.get("f"));
     }
 
+    /// An output glob (the `glob` crate's dialect) and the fs glob
+    /// `output_fs_addr` reads it through (wax's) match the same paths, for an
+    /// escaped package and for each place the dialects part.
+    #[test]
+    fn output_glob_translates_to_the_same_fs_glob() {
+        use hplugin::driver::targetdef::path::escape_glob_literal;
+        use wax::Program as _;
+
+        let cases: &[(&str, &str, &[&str], &[&str])] = &[
+            // (output glob, its fs glob, matched, not matched)
+            ("pkg/*.go", "pkg/*.go", &["pkg/a.go"], &["pkg/a/b.go"]),
+            (
+                "app/[[]slug[]]/*.txt",
+                r"app/\[slug\]/*.txt",
+                &["app/[slug]/a.txt"],
+                &["app/s/a.txt"],
+            ),
+            ("a/[*][?]/x", r"a/\*\?/x", &["a/*?/x"], &["a/bc/x"]),
+            // Literals that are wax syntax and nothing to `glob`.
+            (
+                "app/(group)/*.ts",
+                r"app/\(group\)/*.ts",
+                &["app/(group)/a.ts"],
+                &[],
+            ),
+            (
+                "a/{x,y}$:<>",
+                r"a/\{x\,y\}\$\:\<\>",
+                &["a/{x,y}$:<>"],
+                &["a/x"],
+            ),
+            ("a]b/*", r"a\]b/*", &["a]b/c"], &[]),
+            // Classes and ranges carry over; a `-` at an edge is a member.
+            ("[a-c]x[!0-9]", "[a-c]x[!0-9]", &["bxz"], &["dxz", "bx5"]),
+            ("[ab-]", r"[ab\-]", &["-"], &["c"]),
+            ("[]a]", r"[\]a]", &["]", "a"], &["b"]),
+            ("**/*.go", "**/*.go", &["a/b/c.go", "c.go"], &["c.rs"]),
+            // Multi-byte members and literals.
+            ("é/[üa]x", "é/[üa]x", &["é/üx", "é/ax"], &["é/bx"]),
+            ("[!]]x", r"[!\]]x", &["ax"], &["]x"]),
+        ];
+        for &(output, fs, yes, no) in cases {
+            assert_eq!(
+                fs_pattern_of_output_glob(output).unwrap(),
+                fs,
+                "translating {output}"
+            );
+            let g = glob::Pattern::new(output).unwrap();
+            let w = wax::Glob::new(fs).unwrap();
+            let opts = glob::MatchOptions {
+                require_literal_separator: true,
+                ..glob::MatchOptions::new()
+            };
+            for p in yes {
+                assert!(g.matches_with(p, opts), "{output} must match {p}");
+                assert!(w.is_match(*p), "{fs} must match {p}");
+            }
+            for p in no {
+                assert!(!g.matches_with(p, opts), "{output} must not match {p}");
+                assert!(!w.is_match(*p), "{fs} must not match {p}");
+            }
+        }
+
+        // The translation of an escaped literal is the fs escape of it, so a
+        // driver can spell one package both ways and land on one addr.
+        for pkg in [
+            "app/[slug]",
+            "a?b*c$d:e(f),g",
+            r"back\slash",
+            "plain/pkg",
+            "",
+        ] {
+            assert_eq!(
+                fs_pattern_of_output_glob(&escape_glob_literal(pkg)).unwrap(),
+                escape_fs_literal(pkg),
+                "{pkg}"
+            );
+        }
+
+        // No fs spelling: an unclosed class, and a `\` in a class, which the
+        // two dialects would read differently (`glob`: `[a\]` then `b]`; wax:
+        // one class `a ] b`). Each fails rather than pass through.
+        for pattern in ["a/[bc", "a/[", "a/[!", "a/[]", r"[a\]", r"[a\]b]", r"[\-z]"] {
+            let err = fs_pattern_of_output_glob(pattern)
+                .expect_err(&format!("{pattern} has no fs spelling"));
+            assert!(
+                format!("{err:#}").contains("no fs glob (wax) spelling"),
+                "{pattern}: {err:#}"
+            );
+            output_fs_addr(&PathContent::Glob(pattern.into())).unwrap_err();
+        }
+    }
+
+    /// A directory output's fs glob has the directory escaped.
+    #[test]
+    fn output_fs_addr_escapes_a_dir() {
+        let addr = output_fs_addr(&PathContent::DirPath("app/[slug]/gen/".into())).unwrap();
+        assert_eq!(
+            addr.args.get("p").map(String::as_str),
+            Some(r"app/\[slug\]/gen/**/*")
+        );
+        let addr = output_fs_addr(&PathContent::DirPath("pkg/gen/".into())).unwrap();
+        assert_eq!(addr.args.get("p").map(String::as_str), Some("pkg/gen/**/*"));
+    }
+
     #[test]
     fn test_glob_addr_no_excludes() {
         let addr = glob_addr("src/**/*.rs", &[]);
@@ -3310,6 +3615,18 @@ mod tests {
             ("café/**/*", "cafe/é.txt"),
             ("a\\*b/*.txt", "a*b/c.txt"),
             ("a\\*b/*.txt", "axb/c.txt"),
+            // An escaped package directory is part of the (unescaped) prefix.
+            (r"app/\[slug\]/*.txt", "app/[slug]/a.txt"),
+            (r"app/\[slug\]/*.txt", "app/s/a.txt"),
+            (r"app/\[slug\]/a.txt", "app/[slug]/a.txt"),
+            (r"app/\[slug\]/a.txt", "app/s/a.txt"),
+            (
+                r"app/\(marketing\)/about/*.ts",
+                "app/(marketing)/about/p.ts",
+            ),
+            (r"app/\(marketing\)/about/*.ts", "app/marketing/about/p.ts"),
+            (r"a\,b/*.ts", "a,b/x.ts"),
+            (r"a\,b/*.ts", "a/x.ts"),
             ("pkg/(?i)*.go", "pkg/A.GO"),
             ("pkg/(?i)*.go", "pkg/a.go"),
             ("pkg/(?i)*.go", "PKG/a.go"),
@@ -3497,16 +3814,44 @@ mod tests {
 
     #[test]
     fn test_literal_prefix() {
-        assert_eq!(literal_prefix("mgmt/protos/x/**/*"), "mgmt/protos/x");
+        use std::borrow::Cow;
+
+        let prefix = |p| literal_prefix(p).0;
+        assert_eq!(prefix("mgmt/protos/x/**/*"), "mgmt/protos/x");
         // Fully-literal pattern returns itself (walk visits just that path).
-        assert_eq!(
-            literal_prefix("mgmt/protos/x/go.mod"),
-            "mgmt/protos/x/go.mod"
-        );
-        assert_eq!(literal_prefix("*.rs"), "");
-        assert_eq!(literal_prefix("**/*.rs"), "");
-        assert_eq!(literal_prefix("dir/ogen.{yml,yaml}"), "dir");
-        assert_eq!(literal_prefix("a/b?c/d"), "a");
+        assert_eq!(prefix("mgmt/protos/x/go.mod"), "mgmt/protos/x/go.mod");
+        assert_eq!(prefix("*.rs"), "");
+        assert_eq!(prefix("**/*.rs"), "");
+        assert_eq!(prefix("dir/ogen.{yml,yaml}"), "dir");
+        assert_eq!(prefix("a/b?c/d"), "a");
+        assert!(matches!(literal_prefix("pkg/sub/*"), (Cow::Borrowed(_), 7)));
+    }
+
+    /// An escaped package directory is literal and comes back unescaped: the
+    /// walk starts at the package itself, not at its parent.
+    #[test]
+    fn test_literal_prefix_reads_escapes() {
+        for (pattern, prefix, end) in [
+            (r"app/\(marketing\)/about/*.ts", "app/(marketing)/about", 23),
+            (r"app/\[slug\]/*.txt", "app/[slug]", 12),
+            (r"app/\[slug\]/a.txt", "app/[slug]/a.txt", 18),
+            (r"a\,b/*.ts", "a,b", 4),
+            (r"back\\slash/x/**", r"back\slash/x", 13),
+            (r"a\]b/x", "a]b/x", 6),
+            // An escape in a component that is not all literal stops there.
+            (r"app/\[x\]*/a", "app", 3),
+            // A `\` ending the pattern escapes nothing.
+            ("app/x\\", "app", 3),
+        ] {
+            let (got, got_end) = literal_prefix(pattern);
+            assert_eq!((got.as_ref(), got_end), (prefix, end), "{pattern}");
+        }
+
+        // The walk root of a glob in such a package is the package dir.
+        let skip = Arc::new(Ignore::default());
+        let compiled = compile_glob(&skip, "t", r"app/\(marketing\)/about/*.ts", &[]).unwrap();
+        assert_eq!(compiled.prefix, "app/(marketing)/about");
+        assert!(matches!(compiled.glob, GlobMatcher::Remainder(_)));
     }
 
     #[test]
@@ -3546,13 +3891,35 @@ mod tests {
             ("a/b?c/d", "a", "b?c/d"),
             // Only the one separating `/` is cut.
             ("pkg/sub/", "pkg/sub/", ""),
+            // The prefix is unescaped; the remainder is pattern text as is.
+            (r"app/\[slug\]/\[x\]*.ts", "app/[slug]", r"\[x\]*.ts"),
         ] {
-            assert_eq!(
-                split_literal_prefix(pattern),
-                (prefix, remainder),
-                "{pattern}"
-            );
+            let (got, rest) = split_literal_prefix(pattern);
+            assert_eq!((got.as_ref(), rest), (prefix, remainder), "{pattern}");
         }
+    }
+
+    /// The `e` arg splits on a `,` preceded by an even run of `\` only, so a
+    /// package `a,b` (escaped `a\,b`) stays one exclude.
+    #[test]
+    fn test_split_excludes() {
+        for (raw, want) in [
+            ("", &[][..]),
+            ("x", &["x"][..]),
+            ("x,y", &["x", "y"]),
+            (r"a\,b/x.ts", &[r"a\,b/x.ts"]),
+            (r"a\,b/x.ts,a\,b/y.ts", &[r"a\,b/x.ts", r"a\,b/y.ts"]),
+            // An escaped `\` then a separator.
+            (r"a\\,b", &[r"a\\", "b"]),
+            (r"a\\\,b", &[r"a\\\,b"]),
+            (",", &["", ""]),
+        ] {
+            assert_eq!(split_excludes(raw), want, "{raw}");
+        }
+        // Round trip through the addr.
+        let addr = glob_addr(r"a\,b/*.ts", &[r"a\,b/x.ts", "**/y"]);
+        let e = addr.args.get("e").map(String::as_str).unwrap_or_default();
+        assert_eq!(split_excludes(e), [r"a\,b/x.ts", "**/y"]);
     }
 
     /// `compile_glob` accepts exactly the patterns wax accepts. The prefix cut

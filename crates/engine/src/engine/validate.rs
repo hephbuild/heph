@@ -20,7 +20,7 @@ use futures::TryStreamExt;
 
 use crate::engine::Engine;
 use crate::engine::discovery::Discovery;
-use crate::engine::driver::targetdef::path::CodegenMode;
+use crate::engine::driver::targetdef::path::{CodegenMode, Content};
 use crate::engine::gitignore::content_to_pattern;
 use crate::engine::query::skip_unresolvable;
 use crate::engine::request_state::RequestState;
@@ -32,8 +32,22 @@ use hmodel::htmatcher::Matcher;
 /// target that emits it.
 #[derive(Debug, Clone)]
 pub struct CodegenOutput {
+    /// The comparison key: the output as a `.gitignore` line
+    /// ([`content_to_pattern`]), so a literal `[` reads `[[]`.
     pub path: String,
+    /// The output as the target declared it, root-anchored, for messages:
+    /// `/app/[slug]/gen.txt`, not the key's `/app/[[]slug[]]/gen.txt`.
+    pub shown: String,
     pub addr: Addr,
+}
+
+/// `content` as [`CodegenOutput::shown`] spells it: its own path or pattern,
+/// with one leading `/` and no trailing one.
+fn shown_path(content: &Content) -> String {
+    let p = match content {
+        Content::FilePath(p) | Content::DirPath(p) | Content::Glob(p) => p,
+    };
+    format!("/{}", p.trim_start_matches('/').trim_end_matches('/'))
 }
 
 /// A single collision between two `codegen = copy` outputs from *different*
@@ -97,15 +111,15 @@ impl Engine {
                 let Some(def) = skip_unresolvable(&addr, engine.get_def(rs, &addr).await)? else {
                     return Ok((addr, Vec::new()));
                 };
-                let paths: Vec<String> = def
+                let paths: Vec<(String, String)> = def
                     .target_def
                     .outputs
                     .iter()
                     .flat_map(|output| output.paths.iter())
                     .filter(|p| p.codegen_tree == CodegenMode::Copy)
-                    .map(|p| content_to_pattern(&p.content))
+                    .map(|p| (content_to_pattern(&p.content), shown_path(&p.content)))
                     .collect();
-                Ok::<(Addr, Vec<String>), anyhow::Error>((addr, paths))
+                Ok::<(Addr, Vec<(String, String)>), anyhow::Error>((addr, paths))
             })
         });
         let per_target = crate::engine::fanout::join_all_failable(futs, fail_fast).await?;
@@ -120,8 +134,9 @@ impl Engine {
         let mut outs: Vec<CodegenOutput> = per_target
             .into_iter()
             .flat_map(|(addr, paths)| {
-                paths.into_iter().map(move |path| CodegenOutput {
+                paths.into_iter().map(move |(path, shown)| CodegenOutput {
                     path,
+                    shown,
                     addr: addr.clone(),
                 })
             })
@@ -234,6 +249,28 @@ mod tests {
         assert!(
             has_pair(&overlaps, "/a/gen.go", "//a:t1", "/a/gen.go", "//a:t2"),
             "{overlaps:?}"
+        );
+        Ok(())
+    }
+
+    /// In a package like `app/[slug]` the overlap is found on the escaped key,
+    /// and reported with the path as declared.
+    #[tokio::test]
+    async fn overlap_in_a_metachar_package_shows_the_declared_path() -> anyhow::Result<()> {
+        let (engine, _root) = engine_with(vec![
+            codegen_target("//app/[slug]:t1", &["gen.txt"], "copy"),
+            codegen_target("//app/[slug]:t2", &["gen.txt"], "copy"),
+        ])?;
+        let overlaps = Arc::clone(&engine)
+            .codegen_copy_overlaps(engine.new_state(), &all(), Discovery::Complete)
+            .await?;
+
+        assert_eq!(overlaps.len(), 1, "one collision: {overlaps:?}");
+        let o = overlaps.first().expect("one overlap");
+        assert_eq!(o.a.path, "/app/[[]slug[]]/gen.txt");
+        assert_eq!(
+            (o.a.shown.as_str(), o.b.shown.as_str()),
+            ("/app/[slug]/gen.txt", "/app/[slug]/gen.txt")
         );
         Ok(())
     }

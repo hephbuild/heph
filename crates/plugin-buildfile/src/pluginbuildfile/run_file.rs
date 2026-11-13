@@ -928,6 +928,25 @@ fn starlark_to_rust(v: &Value) -> anyhow::Result<htvalue::Value> {
 /// prefix is empty but the path is still normalized. Errors when a `..` segment
 /// would escape the workspace root.
 fn resolve_fs_path(eval: &Evaluator, path: &str, abs: bool) -> anyhow::Result<String> {
+    resolve_fs_path_with(eval, path, abs, |pkg| std::borrow::Cow::Borrowed(pkg))
+}
+
+/// [`resolve_fs_path`] for a glob `pattern`: only the user's part is pattern
+/// text, so the package goes in through [`hbuiltins::pluginfs::escape_fs_literal`].
+/// Unescaped, `glob("*.ts")` in package `app/[slug]` read `[slug]` as a
+/// character class and staged nothing. An ordinary package escapes to itself.
+fn resolve_fs_glob(eval: &Evaluator, pattern: &str, abs: bool) -> anyhow::Result<String> {
+    resolve_fs_path_with(eval, pattern, abs, |pkg| {
+        std::borrow::Cow::Owned(hbuiltins::pluginfs::escape_fs_literal(pkg))
+    })
+}
+
+fn resolve_fs_path_with(
+    eval: &Evaluator,
+    path: &str,
+    abs: bool,
+    pkg_prefix: impl for<'p> Fn(&'p str) -> std::borrow::Cow<'p, str>,
+) -> anyhow::Result<String> {
     if abs {
         return Ok(path.to_string());
     }
@@ -936,7 +955,9 @@ fn resolve_fs_path(eval: &Evaluator, path: &str, abs: bool) -> anyhow::Result<St
         .expect("evaluator extra must be set")
         .downcast_ref::<Extra>()
         .expect("evaluator extra must be of type Extra");
-    hmodel::htpkg::join_rel_checked(extra.pkg, path)
+    // `..` pops whole components and escaping never adds a `/`, so an escaped
+    // package joins exactly as the literal one would.
+    hmodel::htpkg::join_rel_checked(&pkg_prefix(extra.pkg), path)
         .with_context(|| format!("resolving fs path {path:?} in package {}", extra.pkg))
 }
 
@@ -1160,7 +1181,7 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
         exclude: Option<Value<'v>>,
         #[starlark(require = named, default = false)] abs: bool,
     ) -> starlark::Result<String> {
-        let resolved = resolve_fs_path(eval, pattern, abs)?;
+        let resolved = resolve_fs_glob(eval, pattern, abs)?;
         let excludes: Vec<String> = match exclude {
             Some(v) => {
                 if let Some(s) = v.unpack_str() {
@@ -1175,7 +1196,7 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
         };
         let excludes = excludes
             .iter()
-            .map(|e| resolve_fs_path(eval, e, abs))
+            .map(|e| resolve_fs_glob(eval, e, abs))
             .collect::<anyhow::Result<Vec<String>>>()?;
         let excludes_ref: Vec<&str> = excludes.iter().map(String::as_str).collect();
         Ok(hbuiltins::pluginfs::glob_addr(&resolved, &excludes_ref).format())

@@ -39,10 +39,11 @@
 //!   from it; a cold build of the same target fails.
 //! - **A sandbox path holding `[`, `]`, `*` or `?`** (a checkout or heph
 //!   home under such a directory) is taken literally. Before, an output glob
-//!   there silently matched nothing (see "The root"). The package, though, is
-//!   part of the pattern, not of the root: the exec driver turns `out =
-//!   "*.txt"` in package `app/[slug]` into the glob `app/[slug]/*.txt`, which
-//!   still reads `[slug]` as a character class.
+//!   there silently matched nothing (see "The root"). The package is part of
+//!   the pattern, not of the root, and its driver escapes it: the exec
+//!   driver turns `out = "*.txt"` in package `app/[slug]` into the glob
+//!   `app/[[]slug[]]/*.txt` (`escape_glob_literal`), so only the user's
+//!   `*.txt` is pattern text.
 //!
 //! # What is refused
 //!

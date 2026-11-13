@@ -58,31 +58,41 @@ fn introspect_input(fs_addr: Addr, template: &Input) -> Input {
 /// a `//pkg:gen` target declaring `out=["*.go"]` stores `Glob("pkg/*.go")`. The
 /// `@heph/fs` driver resolves a glob/file addr's `p`/`f` arg relative to the
 /// same workspace root (`walk_glob` joins the pattern's literal prefix onto
-/// `root`), so feeding the path verbatim into `glob_addr`/`file_addr` makes the
-/// synthesized input read exactly the files the output declares.
+/// `root`). An output glob is in the collector's dialect and an fs glob in
+/// wax's, so the path goes through `output_fs_addr`, which translates a glob
+/// and escapes a directory: the synthesized input then reads the files the
+/// output declares, in a package like `app/[slug]` too.
 ///
 /// Ordering is deterministic (outputs then their paths, in declaration order);
-/// the same fs addr is never emitted twice within one expansion.
+/// the same fs addr is never emitted twice within one expansion. Fails on an
+/// output glob with no fs glob spelling.
 fn synthesized_fs_inputs(
     outputs: &[crate::engine::driver::targetdef::Output],
     template: &Input,
-) -> Vec<Input> {
+) -> anyhow::Result<Vec<Input>> {
+    use crate::engine::driver::targetdef::path::CodegenMode;
+    use anyhow::Context as _;
+
     let mut seen = FxHashSet::default();
     let mut out = Vec::new();
-    use crate::engine::driver::targetdef::path::CodegenMode;
-
     for output in outputs {
         for path in &output.paths {
             if matches!(path.codegen_tree, CodegenMode::Copy) {
                 continue;
             }
-            let fs_addr = hbuiltins::pluginfs::output_fs_addr(&path.content);
+            let fs_addr =
+                hbuiltins::pluginfs::output_fs_addr(&path.content).with_context(|| {
+                    format!(
+                        "expanding //@heph/introspect:outputs: reading output {} as an fs input",
+                        path.content
+                    )
+                })?;
             if seen.insert(fs_addr.clone()) {
                 out.push(introspect_input(fs_addr, template));
             }
         }
     }
-    out
+    Ok(out)
 }
 
 /// Returns `def.inputs` with every `//@heph/introspect:outputs` magic input
@@ -92,24 +102,27 @@ fn synthesized_fs_inputs(
 /// Allocate-on-write: if no magic input is present the original `inputs` Vec is
 /// cloned only once (the common case still pays a clone because the caller needs
 /// an owned `Vec` for `expand_inputs`).
-pub(crate) fn expand_introspect_inputs(def: &mut crate::engine::driver::targetdef::TargetDef) {
+pub(crate) fn expand_introspect_inputs(
+    def: &mut crate::engine::driver::targetdef::TargetDef,
+) -> anyhow::Result<()> {
     if !def
         .inputs
         .iter()
         .any(|i| is_introspect_outputs(&i.r#ref.r#ref))
     {
-        return;
+        return Ok(());
     }
 
     let mut rebuilt = Vec::with_capacity(def.inputs.len());
     for input in &def.inputs {
         if is_introspect_outputs(&input.r#ref.r#ref) {
-            rebuilt.extend(synthesized_fs_inputs(&def.outputs, input));
+            rebuilt.extend(synthesized_fs_inputs(&def.outputs, input)?);
         } else {
             rebuilt.push(input.clone());
         }
     }
     def.inputs = rebuilt;
+    Ok(())
 }
 
 /// Routing context inherited from a parent transparent-group input. Carries

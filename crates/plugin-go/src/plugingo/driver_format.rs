@@ -46,22 +46,33 @@ const GO_FORMAT_FORMAT_VERSION: u32 = 1;
 /// The output group the fix driver declares its rewritten sources under.
 const SRC_OUTPUT_GROUP: &str = "src";
 
-/// The glob naming a package's `.go` sources: every `.go` file directly in
-/// `pkg`'s directory. One function builds both the `""` dep group's fs glob
-/// ([`format_sources_addr`]) and the fix driver's `in_place` output, so the
-/// engine's in-place guard pairs the input with the output by addr.
+/// The fs glob naming a package's `.go` sources: every `.go` file directly in
+/// `pkg`'s directory, for the `""` dep group ([`format_sources_addr`]).
 ///
-/// `pkg` is a literal path, so its glob metacharacters are escaped with wax's
-/// own [`wax::escape`] — the fs walker compiles this pattern with the same wax.
-/// `wax::escape` leaves `\` alone (to wax it is the escape character, not a
-/// metacharacter), so a `\` in `pkg` is escaped first; otherwise it would escape
-/// whatever follows it instead of matching itself.
+/// `pkg` is a literal path, so its glob metacharacters are escaped for wax,
+/// which the fs walker compiles this pattern with
+/// ([`hbuiltins::pluginfs::escape_fs_literal`], which also escapes `\`).
 pub fn format_sources_pattern(pkg: &str) -> String {
     if pkg.is_empty() {
         return "*.go".to_string();
     }
-    let backslashes = pkg.replace('\\', "\\\\");
-    format!("{}/*.go", wax::escape(&backslashes))
+    format!("{}/*.go", hbuiltins::pluginfs::escape_fs_literal(pkg))
+}
+
+/// The fix driver's `in_place` output: the same files as
+/// [`format_sources_pattern`], spelled in the output-glob dialect the
+/// collector compiles (`escape_glob_literal`). The engine maps it back to an
+/// fs glob with `pluginfs::output_fs_addr`, which lands on
+/// [`format_sources_addr`] exactly — that is how the in-place guard pairs the
+/// output with the input it read.
+fn format_output_pattern(pkg: &str) -> String {
+    if pkg.is_empty() {
+        return "*.go".to_string();
+    }
+    format!(
+        "{}/*.go",
+        hplugin::driver::targetdef::path::escape_glob_literal(pkg)
+    )
 }
 
 /// The `@heph/fs` glob target staging a package's `.go` sources. Going through
@@ -294,7 +305,7 @@ impl ManagedDriver for GoFormatDriver {
         let outputs = vec![Output {
             group: SRC_OUTPUT_GROUP.to_string(),
             paths: vec![TPath {
-                content: Content::Glob(format_sources_pattern(pkg_str)),
+                content: Content::Glob(format_output_pattern(pkg_str)),
                 codegen_tree: CodegenMode::InPlace {
                     write_on_failure: true,
                 },
@@ -807,6 +818,29 @@ mod tests {
             wax::Glob::new(&pattern).is_err(),
             "wax now compiles {pattern:?}: a `\\` package can be globbed, close the gap"
         );
+    }
+
+    /// The fix output is the collector's glob for the package's sources, and
+    /// maps back to exactly the fs glob the `""` group stages, so the in-place
+    /// guard pairs them — for a package with metacharacters too, where the two
+    /// dialects spell it differently.
+    #[test]
+    fn format_output_pairs_with_the_sources_glob() {
+        for pkg in ["", "mylib", "app/[slug]", "a?b*c$d:e(f),g"] {
+            let output = format_output_pattern(pkg);
+            assert_eq!(
+                hbuiltins::pluginfs::output_fs_addr(&Content::Glob(output.clone()))
+                    .expect("translatable"),
+                format_sources_addr(pkg),
+                "{pkg}"
+            );
+            if pkg.is_empty() {
+                continue;
+            }
+            let glob = glob::Pattern::new(&output).expect("compile");
+            assert!(glob.matches(&format!("{pkg}/a.go")), "{output} must match");
+        }
+        assert_eq!(format_output_pattern("mylib"), "mylib/*.go");
     }
 
     fn dep_groups(s: &TargetSpec) -> Vec<String> {
