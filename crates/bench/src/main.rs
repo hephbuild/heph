@@ -151,8 +151,8 @@ struct RunDistArgs {
     /// (same layout `crates/bin-e2e`'s `Dist` expects). Never rebuilt here.
     #[arg(long)]
     candidate_dist: PathBuf,
-    #[arg(long, required_unless_present = "candidate_only")]
-    baseline_dist: Option<PathBuf>,
+    #[arg(long)]
+    baseline_dist: PathBuf,
     #[arg(long)]
     corpus: PathBuf,
     #[arg(long, value_enum)]
@@ -163,20 +163,8 @@ struct RunDistArgs {
     reps: usize,
     #[arg(long)]
     out_candidate: PathBuf,
-    #[arg(long, required_unless_present = "candidate_only")]
-    out_baseline: Option<PathBuf>,
-    /// Time the candidate alone: for a scenario the baseline cannot run
-    /// (`codegen-import`, which N-1 may predate), whose bar `compare` takes
-    /// from another scenario's baseline (`against` in the thresholds file).
-    #[arg(long, conflicts_with_all = ["baseline_dist", "out_baseline"])]
-    candidate_only: bool,
-    /// `codegen-glob-cold` only: also time the candidate's cold glob with the
-    /// index inert (no db, no managed `.gitignore` section) right after each
-    /// of its normal reps, and write those reps here as the scenario
-    /// `codegen-glob-cold-probe-free`: the probe-free baseline the cold
-    /// glob's bar is against (`against` in the thresholds file).
     #[arg(long)]
-    out_probe_free: Option<PathBuf>,
+    out_baseline: PathBuf,
 }
 
 #[derive(Args)]
@@ -456,28 +444,13 @@ fn run_dist_both(args: RunDistArgs) -> Result<()> {
     let manifest = bench_corpus::load_manifest(&corpus)
         .context("load corpus manifest (run `corpus` first)")?;
 
-    // `None` under `--candidate-only` (clap makes both present otherwise).
-    let baseline = args
-        .baseline_dist
-        .as_deref()
-        .zip(args.out_baseline.as_deref());
     for _ in 0..args.warmup {
         dist::prepare(&args.candidate_dist, &corpus, args.scenario).context("prepare candidate")?;
-        if let Some((dist_dir, _)) = baseline {
-            dist::prepare(dist_dir, &corpus, args.scenario).context("prepare baseline")?;
-        }
-    }
-
-    if args.out_probe_free.is_some() && !matches!(args.scenario, dist::Scenario::CodegenGlobCold) {
-        anyhow::bail!(
-            "--out-probe-free is the baseline of codegen-glob-cold; not of {}",
-            args.scenario.name()
-        );
+        dist::prepare(&args.baseline_dist, &corpus, args.scenario).context("prepare baseline")?;
     }
 
     let mut candidate_ms = Vec::with_capacity(args.reps);
     let mut baseline_ms = Vec::with_capacity(args.reps);
-    let mut probe_free_ms = Vec::with_capacity(args.reps);
     for i in 0..args.reps {
         let seed = i as u64;
         if args.scenario.times_index_lookups() {
@@ -494,18 +467,10 @@ fn run_dist_both(args: RunDistArgs) -> Result<()> {
             )
             .context("measure candidate")?,
         );
-        if args.out_probe_free.is_some() {
-            probe_free_ms.push(
-                dist::measure_probe_free_glob(&args.candidate_dist, &corpus)
-                    .context("measure the candidate with the index inert")?,
-            );
-        }
-        if let Some((dist_dir, _)) = baseline {
-            baseline_ms.push(
-                dist::measure_once(dist_dir, &corpus, &manifest, args.scenario, seed)
-                    .context("measure baseline")?,
-            );
-        }
+        baseline_ms.push(
+            dist::measure_once(&args.baseline_dist, &corpus, &manifest, args.scenario, seed)
+                .context("measure baseline")?,
+        );
     }
 
     write_results(
@@ -514,12 +479,12 @@ fn run_dist_both(args: RunDistArgs) -> Result<()> {
         args.scenario.name(),
         candidate_ms,
     )?;
-    if let Some((_, out)) = baseline {
-        write_results(out, "dist", args.scenario.name(), baseline_ms)?;
-    }
-    if let Some(out) = &args.out_probe_free {
-        write_results(out, "dist", dist::PROBE_FREE_GLOB, probe_free_ms)?;
-    }
+    write_results(
+        &args.out_baseline,
+        "dist",
+        args.scenario.name(),
+        baseline_ms,
+    )?;
     Ok(())
 }
 

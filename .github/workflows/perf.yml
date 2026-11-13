@@ -323,34 +323,20 @@ jobs:
 
       # The codegen index's timed scenarios, Tier B on the codegen corpus.
       # Each bar is on the median of PERFBENCH_CODEGEN_REPS interleaved runs
-      # (spec: "the median of 5"; `stat` in the thresholds file).
-      # `codegen-glob-cold` also times the candidate with the index inert
-      # (no db, no managed `.gitignore` section) after each of its reps:
-      # that is the probe-free baseline its gating bar is against, written
-      # as `baseline_dist_codegen-glob-cold-probe-free.json`; the row against
-      # N-1 is reported, not gating. `codegen-import` has no N-1 counterpart
-      # (the command is new), so it runs on the candidate alone and "Compare
-      # and report" holds it against the baseline's `codegen-glob-cold`
-      # (`against` in the thresholds file).
+      # (spec: "the median of 5"; `stat` in the thresholds file). Every bar
+      # compares a scenario with the same scenario of N-1: a bar against
+      # another scenario holds a fixed cost to a bar the baseline moves, and
+      # filed issues on commits that changed neither (#559–#570).
       - name: Time codegen (dist) scenarios
         if: steps.baseline_fetch.outputs.ok == 'true'
         continue-on-error: true
         run: |
-          ./candidate-dist/heph-bench run dist \
-            --candidate-dist candidate-dist --baseline-dist baseline-dist \
-            --corpus bench-corpus-codegen --scenario codegen-glob-cold --warmup 1 --reps "$PERFBENCH_CODEGEN_REPS" \
-            --out-candidate candidate_dist_codegen-glob-cold.json --out-baseline baseline_dist_codegen-glob-cold.json \
-            --out-probe-free baseline_dist_codegen-glob-cold-probe-free.json
-          for scenario in codegen-glob-warm codegen-warm-build; do
+          for scenario in codegen-glob-cold codegen-glob-warm codegen-warm-build; do
             ./candidate-dist/heph-bench run dist \
               --candidate-dist candidate-dist --baseline-dist baseline-dist \
               --corpus bench-corpus-codegen --scenario "$scenario" --warmup 1 --reps "$PERFBENCH_CODEGEN_REPS" \
               --out-candidate "candidate_dist_${scenario}.json" --out-baseline "baseline_dist_${scenario}.json"
           done
-          ./candidate-dist/heph-bench run dist \
-            --candidate-dist candidate-dist --candidate-only \
-            --corpus bench-corpus-codegen --scenario codegen-import --warmup 1 --reps "$PERFBENCH_CODEGEN_REPS" \
-            --out-candidate candidate_dist_codegen-import.json
 
       # Every scenario/tier combination is always attempted and reported —
       # `--allow-regression` keeps an individual `compare` call from ever
@@ -391,23 +377,14 @@ jobs:
                 base_files=()
                 cand_files=()
                 for scenario in cold full-hit incremental \
-                    codegen-glob-cold codegen-glob-warm codegen-warm-build codegen-import; do
+                    codegen-glob-cold codegen-glob-warm codegen-warm-build; do
                   b="baseline_${tier}_${scenario}.json"
                   c="candidate_${tier}_${scenario}.json"
                   if [ -f "$b" ] && [ -f "$c" ]; then
                     base_files+=("$b")
                     cand_files+=("$c")
-                  elif [ -f "$c" ] && [ "$scenario" = "codegen-import" ]; then
-                    # Candidate-only: compared against another scenario's
-                    # baseline (`against` in the thresholds file).
-                    cand_files+=("$c")
                   fi
                 done
-                # Baseline-only: the cold glob's probe-free baseline, which
-                # `codegen-glob-cold`'s gating bar names with `against`.
-                if [ -f "baseline_${tier}_codegen-glob-cold-probe-free.json" ]; then
-                  base_files+=("baseline_${tier}_codegen-glob-cold-probe-free.json")
-                fi
                 if [ ${#base_files[@]} -eq 0 ]; then
                   echo "_no results (run step failed — see logs)_"
                   continue
@@ -508,29 +485,63 @@ jobs:
       # already happened — a red check on the commit is easy to miss, so a
       # regression instead becomes a durable, visible artifact. `always()`
       # because the step above now genuinely exits non-zero on a real
-      # regression (outputs set before `exit 1` are still recorded); a dedup
-      # check against open issues keeps a re-run (or retry) from spamming.
+      # regression (outputs set before `exit 1` are still recorded).
+      #
+      # Deduplicated on the regressed ROWS (`<tier>/<scenario>`), not on the
+      # platform or the commit: one regression shows up on every platform
+      # leg, and a row stuck over its bar shows up on every later commit —
+      # keyed on platform and SHA, that filed five issues for one row
+      # (#559–#570). Each issue carries its rows in a hidden marker; a run
+      # whose rows overlap an open issue's comments there instead, and a
+      # re-run of a leg that already reported (its own run marker) does
+      # nothing. Two legs finishing within seconds of each other can still
+      # both file; closing one as a duplicate is the remedy.
       - name: File regression issue
         if: always() && steps.compare.outputs.regressed == 'true' && github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          LEG: ${{ matrix.os }}/${{ matrix.arch }}
         run: |
-          TITLE="Perf regression: ${{ matrix.os }}/${{ matrix.arch }} at ${{ github.sha }}"
-          existing=$(gh issue list --repo "${{ github.repository }}" --state open \
-            --search "\"$TITLE\" in:title" --json number --jq '.[0].number // empty')
+          rows=$(for f in verdicts/*.json; do
+            [ -f "$f" ] || continue
+            jq -r --arg tier "$(basename "$f" .json)" \
+              '.[] | select(.regression) | "\($tier)/\(.scenario)"' "$f"
+          done | sort -u | paste -sd ' ' -)
+          if [ -z "$rows" ]; then
+            echo "the report says REGRESSION but no verdict file has a regressed row" >&2
+            exit 1
+          fi
+          RUN_MARKER="<!-- perf-run: $LEG ${{ github.sha }} -->"
+          existing=$(gh issue list --repo "$REPO" --state open --label perf-regression \
+            --limit 100 --json number,body \
+            | jq -r --arg rows "$rows" '
+                ($rows | split(" ")) as $mine
+                | [ .[]
+                    | . as $i
+                    | [ $i.body | capture("<!-- perf-rows: (?<r>[^>]*) -->") | .r | split(" ")[] ] as $theirs
+                    | select(any($mine[]; . as $m | any($theirs[]; . == $m)))
+                    | $i.number ]
+                | min // empty')
+          LINKS=$(printf 'Job summary: %s/%s/actions/runs/%s\nCommit: %s/%s/commit/%s\n' \
+            "${{ github.server_url }}" "$REPO" "${{ github.run_id }}" \
+            "${{ github.server_url }}" "$REPO" "${{ github.sha }}")
+          REPORT=$(printf '%s\n\nRegressed: `%s` on **%s** at `%s`, vs the previous commit `%s`:\n\n%s\n%s' \
+            "$RUN_MARKER" "$rows" "$LEG" "${{ github.sha }}" "${{ steps.base.outputs.sha }}" \
+            "$(cat perf-report.md)" "$LINKS")
           if [ -n "$existing" ]; then
-            echo "issue #$existing already covers this — not filing a duplicate"
+            if gh issue view "$existing" --repo "$REPO" --json body,comments \
+                --jq '[.body, .comments[].body] | join("\n")' | grep -qF -- "$RUN_MARKER"; then
+              echo "issue #$existing already has this leg's report — not repeating it"
+              exit 0
+            fi
+            echo "issue #$existing already tracks a row of [$rows] — commenting there"
+            gh issue comment "$existing" --repo "$REPO" --body "$REPORT"
             exit 0
           fi
-          gh label create perf-regression --repo "${{ github.repository }}" \
+          gh label create perf-regression --repo "$REPO" \
             --color d73a4a --description "Automated performance regression report" --force
-          LINKS=$(printf 'Job summary: %s/%s/actions/runs/%s\nCommit: %s/%s/commit/%s\n' \
-            "${{ github.server_url }}" "${{ github.repository }}" "${{ github.run_id }}" \
-            "${{ github.server_url }}" "${{ github.repository }}" "${{ github.sha }}")
-          BODY=$(printf 'Perf regression on `master` for **%s/%s**, vs the previous commit `%s`:\n\n%s\n%s' \
-            "${{ matrix.os }}" "${{ matrix.arch }}" "${{ steps.base.outputs.sha }}" \
-            "$(cat perf-report.md)" "$LINKS")
-          gh issue create --repo "${{ github.repository }}" \
-            --title "$TITLE" \
+          gh issue create --repo "$REPO" \
+            --title "Perf regression: $rows" \
             --label perf-regression \
-            --body "$BODY"
+            --body "$(printf '<!-- perf-rows: %s -->\n%s' "$rows" "$REPORT")"
