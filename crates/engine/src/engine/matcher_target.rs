@@ -7,9 +7,11 @@
 //! dependency on the driver/target-def types.
 
 use crate::engine::driver::targetdef::TargetDef;
+use crate::engine::driver::targetdef::path::{glob_literal_escape_at, unescape_glob_literal};
 use crate::engine::provider::TargetSpec;
 use hmodel::htmatcher::{MatchResult, Matcher};
 use hmodel::htpkg::PkgBuf;
+use std::borrow::Cow;
 
 /// Normalise a relative filesystem path to a package path. Mirrors
 /// `tref.ToPackage` — strips leading `./`, treats `.` as the empty package.
@@ -31,29 +33,42 @@ fn parent_dir(p: &str) -> &str {
     p.rsplit_once('/').map(|(parent, _)| parent).unwrap_or("")
 }
 
-/// Split a glob pattern into `(base, pattern)` where `base` is the longest
-/// `/`-bounded prefix containing no glob metacharacters. Mirrors
-/// `hfs.GlobSplit` for the cases relevant to the matcher. `/` and the glob
-/// metas (`*`, `?`, `[`, `{`) are all ASCII, so `seg_start` and `base_end`
-/// always land on a UTF-8 char boundary.
-#[expect(
-    clippy::string_slice,
-    reason = "indices come from ASCII matches only — always char-aligned"
-)]
-fn glob_split(g: &str) -> (&str, &str) {
+/// Split a `Content::Glob` pattern into `(base, pattern)`: `base` is the
+/// longest run of leading `/`-bounded components that match only themselves,
+/// **unescaped**, and `pattern` the rest from the first component holding a
+/// wildcard or a real class.
+///
+/// A one-character class of a metacharacter (`[[]`, `[]]`, `[*]`, `[?]`) is
+/// a literal: it is how an output in package `app/[slug]` spells its
+/// directory (`escape_glob_literal`), and reading it as a pattern would make
+/// the base `app` and the output look like it lands in every package under
+/// `app`. The base borrows from `g` unless it holds such an escape.
+pub(crate) fn glob_split(g: &str) -> (Cow<'_, str>, &str) {
+    // `/`, `[`, `*` and `?` are ASCII, so every index tested or cut at below
+    // is a char boundary.
     let bytes = g.as_bytes();
     let mut seg_start = 0;
-    for (i, &c) in bytes.iter().enumerate() {
-        if c == b'/' {
-            seg_start = i + 1;
-            continue;
+    let mut i = 0;
+    while let Some(&c) = bytes.get(i) {
+        match c {
+            b'/' => seg_start = i + 1,
+            b'[' if g.get(i..).and_then(glob_literal_escape_at).is_some() => {
+                // Every escape is three bytes: `[`, the character, `]`.
+                i += 3;
+                continue;
+            }
+            b'*' | b'?' | b'[' => {
+                let base = g.get(..seg_start.saturating_sub(1)).unwrap_or_default();
+                return (
+                    unescape_glob_literal(base),
+                    g.get(seg_start..).unwrap_or_default(),
+                );
+            }
+            _ => {}
         }
-        if matches!(c, b'*' | b'?' | b'[' | b'{') {
-            let base_end = seg_start.saturating_sub(1);
-            return (&g[..base_end], &g[seg_start..]);
-        }
+        i += 1;
     }
-    (g, "")
+    (unescape_glob_literal(g), "")
 }
 
 /// Resolve a matcher against a parsed target definition, and the spec it was
@@ -113,7 +128,7 @@ pub fn match_target(m: &Matcher, spec: &TargetSpec, def: &TargetDef) -> MatchRes
                         Content::DirPath(p) => (path_to_pkg(p), true),
                         Content::Glob(g) => {
                             let (base, _) = glob_split(g);
-                            (path_to_pkg(base), true)
+                            (path_to_pkg(&base), true)
                         }
                     };
                     let out_pkg = PkgBuf::from(out_pkg);
@@ -255,11 +270,48 @@ mod tests {
 
     #[test]
     fn glob_split_separates_base_and_pattern() {
-        assert_eq!(glob_split("cmd/gen/*.go"), ("cmd/gen", "*.go"));
-        assert_eq!(glob_split("cmd/**/*"), ("cmd", "**/*"));
-        assert_eq!(glob_split("*"), ("", "*"));
-        assert_eq!(glob_split("foo/bar"), ("foo/bar", ""));
-        assert_eq!(glob_split("foo/[abc]/bar"), ("foo", "[abc]/bar"));
+        let split = |g| {
+            let (base, pattern) = glob_split(g);
+            (base.into_owned(), pattern.to_string())
+        };
+        assert!(matches!(
+            glob_split("cmd/[ab]/*.go"),
+            (Cow::Borrowed("cmd"), _)
+        ));
+        assert!(matches!(
+            glob_split("cmd/gen"),
+            (Cow::Borrowed("cmd/gen"), "")
+        ));
+        let want = |b: &str, p: &str| (b.to_string(), p.to_string());
+        assert_eq!(split("cmd/gen/*.go"), want("cmd/gen", "*.go"));
+        assert_eq!(split("cmd/**/*"), want("cmd", "**/*"));
+        assert_eq!(split("*"), want("", "*"));
+        assert_eq!(split("foo/bar"), want("foo/bar", ""));
+        assert_eq!(split("foo/[abc]/bar"), want("foo", "[abc]/bar"));
+        // An escaped metacharacter is literal, and the base comes back
+        // unescaped: the package `app/[slug]`, not `app`.
+        assert_eq!(split("app/[[]slug[]]/*.go"), want("app/[slug]", "*.go"));
+        assert_eq!(split("a/[*][?]/b"), want("a/*?/b", ""));
+        // Near misses stay patterns: a two-char class, an unclosed one.
+        assert_eq!(split("a/[[x]/b"), want("a", "[[x]/b"));
+        assert_eq!(split("a/[*"), want("a", "[*"));
+        // `{` is a literal in the `glob` dialect.
+        assert_eq!(split("a/{x,y}/*.go"), want("a/{x,y}", "*.go"));
+    }
+
+    /// An output glob in package `app/[slug]` (its directory escaped) is in
+    /// that package.
+    #[test]
+    fn tree_output_to_reads_an_escaped_package() {
+        let d = def_with_paths(
+            "app/[slug]",
+            "t",
+            vec![p_glob("app/[[]slug[]]/*.txt", true)],
+        );
+        assert_eq!(
+            match_target(&Matcher::TreeOutputTo(PkgBuf::from("app/[slug]")), &d),
+            MatchResult::MatchYes
+        );
     }
 
     #[test]

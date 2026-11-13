@@ -5045,6 +5045,7 @@ dependencies = [
  "core",
  "erased-serde 0.4.10",
  "futures",
+ "glob",
  "htspec-derive",
  "itertools 0.15.0",
  "model",

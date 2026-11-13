@@ -1022,11 +1022,23 @@ pub struct CopyOutputs {
     files: rustc_hash::FxHashMap<Vec<u8>, usize>,
     /// Each dir output's directory, with a trailing `/`.
     dirs: Vec<(Vec<u8>, usize)>,
-    globs: Vec<(wax::Glob<'static>, usize)>,
-    /// Each glob's literal prefix (`p/gen` for `p/gen/**/*.txt`), with a
-    /// trailing `/` unless it is empty.
+    /// Compiled in the `glob` crate's dialect, the one the output collector
+    /// expanded them in, so a path is an output here exactly when it was
+    /// collected — a package like `app/[slug]` arrives escaped (`[[]slug[]]`),
+    /// which is not even valid `wax`.
+    globs: Vec<(glob::Pattern, usize)>,
+    /// Each glob's literal prefix, unescaped (`app/[slug]/gen` for
+    /// `app/[[]slug[]]/gen/**/*.txt`), with a trailing `/` unless it is empty.
     glob_roots: Vec<Vec<u8>>,
 }
+
+/// How the output collector's `glob::glob` walk matches: one component at a
+/// time, so `*` and `?` never cross a `/`; dotfiles are not special.
+const COPY_GLOB_MATCH: glob::MatchOptions = glob::MatchOptions {
+    case_sensitive: true,
+    require_literal_separator: true,
+    require_literal_leading_dot: false,
+};
 
 impl CopyOutputs {
     pub fn of(target: &crate::engine::driver::targetdef::TargetDef) -> anyhow::Result<Self> {
@@ -1058,11 +1070,12 @@ impl CopyOutputs {
                         out.dirs.push((d, group));
                     }
                     Content::Glob(p) => {
-                        let glob = wax::Glob::new(p)
-                            .map(wax::Glob::into_owned)
+                        let glob = glob::Pattern::new(p)
                             .with_context(|| format!("compile copy output glob {p}"))?;
-                        let (prefix, _) = glob.clone().partition();
-                        let mut root = prefix.into_os_string().into_encoded_bytes();
+                        // The literal prefix, unescaped: the directory the
+                        // root-relative paths `below_root` gets spell it in.
+                        let (prefix, _) = crate::engine::matcher_target::glob_split(p);
+                        let mut root = prefix.into_owned().into_bytes();
                         if !root.is_empty() {
                             root.push(b'/');
                         }
@@ -1085,8 +1098,6 @@ impl CopyOutputs {
 
     /// The output group whose `copy` paths cover `rel`, if any.
     pub fn output_of(&self, rel: &[u8]) -> Option<&str> {
-        use wax::Program as _;
-
         let group = self
             .files
             .get(rel)
@@ -1101,7 +1112,7 @@ impl CopyOutputs {
                 let s = std::str::from_utf8(rel).ok()?;
                 self.globs
                     .iter()
-                    .find(|(g, _)| g.is_match(s))
+                    .find(|(g, _)| g.matches_with(s, COPY_GLOB_MATCH))
                     .map(|(_, g)| *g)
             })?;
         self.groups.get(group).map(String::as_str)
@@ -1214,17 +1225,21 @@ fn write_back_hints(addr: &str, outside_section: usize, no_section_hint: bool) -
 /// The `@heph/fs` addrs covering every `codegen = in_place` output path. Same
 /// path→addr mapping `expand::synthesized_fs_inputs` uses
 /// ([`hbuiltins::pluginfs::output_fs_addr`]), so a declared in_place output and
-/// the input that reads it land on the same addr.
+/// the input that reads it land on the same addr. Fails on an output glob with
+/// no fs glob spelling.
 fn in_place_fs_addrs(
     outputs: &[crate::engine::driver::targetdef::Output],
-) -> rustc_hash::FxHashSet<Addr> {
+) -> anyhow::Result<rustc_hash::FxHashSet<Addr>> {
     use crate::engine::driver::targetdef::path::CodegenMode;
 
     outputs
         .iter()
         .flat_map(|o| o.paths.iter())
         .filter(|p| matches!(p.codegen_tree, CodegenMode::InPlace { .. }))
-        .map(|p| hbuiltins::pluginfs::output_fs_addr(&p.content))
+        .map(|p| {
+            hbuiltins::pluginfs::output_fs_addr(&p.content)
+                .with_context(|| format!("reading in_place output {} as an fs input", p.content))
+        })
         .collect()
 }
 
@@ -1234,16 +1249,16 @@ fn in_place_fs_addrs(
 fn in_place_watched_inputs(
     outputs: &[crate::engine::driver::targetdef::Output],
     inputs: &[crate::engine::driver::targetdef::Input],
-) -> Vec<Addr> {
-    let guarded = in_place_fs_addrs(outputs);
+) -> anyhow::Result<Vec<Addr>> {
+    let guarded = in_place_fs_addrs(outputs)?;
     if guarded.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    inputs
+    Ok(inputs
         .iter()
         .filter(|i| i.hashed && guarded.contains(&i.r#ref.r#ref))
         .map(|i| i.r#ref.r#ref.clone())
-        .collect()
+        .collect())
 }
 
 /// The root-relative paths a codegen write-back moved, each mapped to the
@@ -5086,7 +5101,8 @@ impl Engine {
         // An in_place output the target never read is not something it
         // transformed, so there is no stale-transform hazard to guard — writing
         // it is the declared behaviour.
-        let watched = in_place_watched_inputs(&def.target.outputs, &inputs);
+        let watched = in_place_watched_inputs(&def.target.outputs, &inputs)
+            .with_context(|| format!("{addr}: guarding its in-place write-back"))?;
         if watched.is_empty() {
             return Ok(());
         }
@@ -5615,7 +5631,8 @@ impl Engine {
         // collection below and every downstream consumer — hashing and
         // execution alike — see the synthesized fs inputs and never the magic
         // addr, which no provider serves.
-        crate::engine::expand::expand_introspect_inputs(&mut def);
+        crate::engine::expand::expand_introspect_inputs(&mut def)
+            .with_context(|| format!("{addr}: expanding its introspect:outputs input"))?;
 
         // Deferred values: every `${read://…}` in the target's *config*, at any
         // nesting depth, becomes a `hashed: true, runtime: false` input appended
@@ -13917,6 +13934,7 @@ mod tests {
         ];
 
         let watched: Vec<String> = in_place_watched_inputs(&outputs, &inputs)
+            .expect("every output has an fs spelling")
             .iter()
             .map(Addr::format)
             .collect();
@@ -13927,6 +13945,116 @@ mod tests {
                 glob_addr("pkg/*.txt", &[]).format(),
             ],
         );
+    }
+
+    /// An in_place glob output in package `app/[slug]` (escaped, in the
+    /// output dialect) pairs with the fs glob that reads that package: the
+    /// two dialects spell the package differently, and the guard compares
+    /// addrs.
+    #[test]
+    fn in_place_pairing_in_a_metachar_package() {
+        use crate::engine::driver::targetdef::path::{CodegenMode, Content, Path};
+        use crate::engine::driver::targetdef::{Input, InputMode, Output};
+        use hbuiltins::pluginfs::glob_addr;
+
+        let outputs = vec![Output {
+            group: "main".to_string(),
+            paths: vec![Path {
+                content: Content::Glob("app/[[]slug[]]/*.txt".into()),
+                codegen_tree: CodegenMode::InPlace {
+                    write_on_failure: true,
+                },
+                collect: true,
+            }],
+        }];
+        let read = glob_addr(r"app/\[slug\]/*.txt", &[]);
+        let inputs = vec![Input {
+            r#ref: crate::engine::driver::TargetAddr {
+                r#ref: read.clone(),
+                output: None,
+                filters: vec![],
+            },
+            mode: InputMode::Standard,
+            origin_id: "o".to_string(),
+            annotations: BTreeMap::new(),
+            hashed: true,
+            runtime: true,
+        }];
+        assert_eq!(
+            in_place_watched_inputs(&outputs, &inputs).expect("translatable"),
+            vec![read]
+        );
+
+        // An output glob with no fs glob spelling fails the guard rather than
+        // watch an addr that reads something else.
+        let untranslatable = vec![Output {
+            group: "main".to_string(),
+            paths: vec![Path {
+                content: Content::Glob(r"app/[a\]b]/*.txt".into()),
+                codegen_tree: CodegenMode::InPlace {
+                    write_on_failure: true,
+                },
+                collect: true,
+            }],
+        }];
+        let err = in_place_watched_inputs(&untranslatable, &inputs)
+            .expect_err("a `\\` in a class has no wax spelling");
+        assert!(
+            format!("{err:#}").contains("no fs glob (wax) spelling"),
+            "{err:#}"
+        );
+    }
+
+    /// `CopyOutputs` matches a glob in the collector's dialect: an escaped
+    /// package is literal, and `*` stays inside one component.
+    #[test]
+    fn copy_outputs_match_a_metachar_package_glob() -> anyhow::Result<()> {
+        use crate::engine::driver::targetdef::Output;
+        use crate::engine::driver::targetdef::path::{CodegenMode, Content, Path};
+
+        let def = TargetDef {
+            outputs: vec![Output {
+                group: "gen".to_string(),
+                paths: vec![Path {
+                    content: Content::Glob("app/[[]slug[]]/*.gen.txt".into()),
+                    codegen_tree: CodegenMode::Copy,
+                    collect: true,
+                }],
+            }],
+            ..Default::default()
+        };
+        let outs = CopyOutputs::of(&def)?;
+        assert_eq!(outs.output_of(b"app/[slug]/page.gen.txt"), Some("gen"));
+        assert_eq!(outs.output_of(b"app/s/page.gen.txt"), None);
+        assert_eq!(outs.output_of(b"app/[slug]/sub/page.gen.txt"), None);
+        Ok(())
+    }
+
+    /// A glob's root is its literal prefix *unescaped*: the write-back may
+    /// remove a directory emptied below `app/[slug]/gen`, never the package
+    /// directory itself nor anything outside it.
+    #[test]
+    fn copy_outputs_below_root_of_a_metachar_package_glob() -> anyhow::Result<()> {
+        use crate::engine::driver::targetdef::Output;
+        use crate::engine::driver::targetdef::path::{CodegenMode, Content, Path};
+
+        let def = TargetDef {
+            outputs: vec![Output {
+                group: "gen".to_string(),
+                paths: vec![Path {
+                    content: Content::Glob("app/[[]slug[]]/gen/**/*.txt".into()),
+                    codegen_tree: CodegenMode::Copy,
+                    collect: true,
+                }],
+            }],
+            ..Default::default()
+        };
+        let outs = CopyOutputs::of(&def)?;
+        assert!(outs.below_root(b"app/[slug]/gen/sub/"));
+        assert!(!outs.below_root(b"app/[slug]/gen"));
+        assert!(!outs.below_root(b"app/[slug]/"));
+        assert!(!outs.below_root(b"app/s/gen/sub/"));
+        Ok(())
     }
 
     /// End-to-end provenance: after a `copy` codegen target writes a net-new

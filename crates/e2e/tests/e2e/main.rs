@@ -36,6 +36,7 @@ mod failure_out;
 mod failure_slot;
 mod force;
 mod fs_glob;
+mod glob_metachar_package;
 mod go_format_glob;
 mod group;
 mod group_relocate;

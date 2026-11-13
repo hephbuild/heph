@@ -172,9 +172,9 @@ impl App for ValidateApp {
                     .map(|o| {
                         format!(
                             "codegen=copy outputs overlap: `{}` ({}) and `{}` ({})",
-                            o.a.path,
+                            o.a.shown,
                             o.a.addr.format(),
-                            o.b.path,
+                            o.b.shown,
                             o.b.addr.format()
                         )
                     })

@@ -89,11 +89,37 @@ fn split_filters(rest: &str) -> Vec<String> {
     out
 }
 
+/// The byte offset of the `[` that opens `v`'s trailing filter list, if it
+/// has one.
+///
+/// A filter list follows the target name, and an address always names its
+/// target after a `:` (`//pkg:name`, `:name`, `./pkg:name`), so a `[` before
+/// the first `:` is part of the package (`//app/[slug]:page`) and never
+/// opens one. Nor does a `[` escaped with `\`, which is how an fs glob's addr
+/// carries a literal bracket (`//@heph/fs:glob@p=app/\[slug\]/*.txt`).
+///
+/// Every string that had a filter list before still has the same one: only
+/// a `[` the old rule would have refused as unclosed, or split out of an
+/// escaped glob, reads differently.
+fn filter_list_start(v: &str) -> Option<usize> {
+    let name_start = v.find(':')?;
+    let bracket = v.rfind('[')?;
+    if bracket < name_start {
+        return None;
+    }
+    #[expect(
+        clippy::string_slice,
+        reason = "bracket is the byte offset of an ASCII '[', always a char boundary"
+    )]
+    let escaped = v[..bracket].ends_with('\\');
+    (!escaped).then_some(bracket)
+}
+
 impl TargetAddr {
     pub fn parse(v: &str, base: &PkgBuf) -> anyhow::Result<Self> {
         // Strip optional trailing [filter1,filter2] suffix.
         // bracket is a byte offset from rfind; '[' is ASCII so split_at is always on a char boundary.
-        let (v, filters) = if let Some(bracket) = v.rfind('[') {
+        let (v, filters) = if let Some(bracket) = filter_list_start(v) {
             let (addr_part, bracket_part) = v.split_at(bracket);
             let rest = bracket_part
                 .strip_prefix('[')
@@ -140,6 +166,33 @@ mod tests {
         assert_eq!(t.r#ref.name, "baz");
         assert!(t.output.is_none());
         assert!(t.filters.is_empty());
+    }
+
+    /// A `[` in the package, or an escaped one, never opens a filter list; a
+    /// `[` after the name still does.
+    #[test]
+    fn parse_brackets_outside_the_filter_list() {
+        let t = TargetAddr::parse("//app/[slug]:page", &base()).unwrap();
+        assert_eq!(t.r#ref.package.as_str(), "app/[slug]");
+        assert_eq!(t.r#ref.name, "page");
+        assert!(t.filters.is_empty());
+
+        let t = TargetAddr::parse("//app/[slug]:page[*.txt,b]", &base()).unwrap();
+        assert_eq!(t.r#ref.package.as_str(), "app/[slug]");
+        assert_eq!(t.filters, vec!["*.txt".to_string(), "b".to_string()]);
+
+        let t = TargetAddr::parse("//app/[slug]:page|out[x]", &base()).unwrap();
+        assert_eq!(t.output.as_deref(), Some("out"));
+        assert_eq!(t.filters, vec!["x".to_string()]);
+
+        let t = TargetAddr::parse(r"//@heph/fs:glob@p=app/\[slug\]/*.txt", &base()).unwrap();
+        assert!(t.filters.is_empty(), "{:?}", t.filters);
+
+        let t = TargetAddr::parse(r"//@heph/fs:glob@p=app/\[slug\]", &base()).unwrap();
+        assert!(t.filters.is_empty(), "{:?}", t.filters);
+
+        let err = TargetAddr::parse("//a:b[x", &base()).unwrap_err();
+        assert!(format!("{err:#}").contains("unclosed '['"), "{err:#}");
     }
 
     #[test]
@@ -926,11 +979,75 @@ pub mod targetdef {
             pub collect: bool,
         }
 
+        /// A declared output path, workspace-root-relative.
+        ///
+        /// `Glob` is pattern text in the dialect of the `glob` crate, which
+        /// the output collector compiles: `?`, `*`, `**` as a whole
+        /// component, `[...]` / `[!...]`, and no backslash escape. Any
+        /// literal part of it — the package directory above all — goes in
+        /// through [`escape_glob_literal`], or a package like `app/[slug]`
+        /// reads as a character class and the pattern matches nothing.
+        ///
+        /// That dialect binds the globs the collector expands (`collect:
+        /// true`) and every consumer of them. Two drivers declare
+        /// `collect: false` globs in another dialect, describing rather than
+        /// collecting: the fs driver's glob output is its `wax` pattern
+        /// (`pluginfs`), and a relocating group's outputs are its `include`
+        /// patterns (`plugingroup`). The only reader of those is query
+        /// selection (`matcher_target::glob_split`, which takes the leading
+        /// literal components as the output's package); nothing collects,
+        /// matches or ignores by them.
         #[derive(Clone, Debug, Hash, Serialize)]
         pub enum Content {
             FilePath(String),
             DirPath(String),
             Glob(String),
+        }
+
+        /// `literal` as `Content::Glob` pattern text matching exactly itself:
+        /// each of `? * [ ]` becomes a one-character class (`[[]`). A path
+        /// with none of them comes back unchanged. [`glob_literal_escape_at`]
+        /// reads one back.
+        pub fn escape_glob_literal(literal: &str) -> String {
+            glob::Pattern::escape(literal)
+        }
+
+        /// The character an [`escape_glob_literal`] class at the start of
+        /// `pattern` stands for: `[[]`, `[]]`, `[*]` or `[?]`, each three
+        /// bytes long. `None` for anything else, a real class included —
+        /// `[[x]` and `[!]]` are patterns, not escapes.
+        pub fn glob_literal_escape_at(pattern: &str) -> Option<char> {
+            match pattern.as_bytes() {
+                [b'[', m @ (b'[' | b']' | b'*' | b'?'), b']', ..] => Some(char::from(*m)),
+                _ => None,
+            }
+        }
+
+        /// `pattern` with every [`escape_glob_literal`] class replaced by the
+        /// character it stands for; everything else, a real class included,
+        /// is left as it is. Borrows when there is nothing to replace. The
+        /// inverse of `escape_glob_literal` on text that is all literal.
+        pub fn unescape_glob_literal(pattern: &str) -> std::borrow::Cow<'_, str> {
+            if !pattern
+                .match_indices('[')
+                .any(|(i, _)| pattern.get(i..).and_then(glob_literal_escape_at).is_some())
+            {
+                return std::borrow::Cow::Borrowed(pattern);
+            }
+            let mut out = String::with_capacity(pattern.len());
+            let mut rest = pattern;
+            while let Some(at) = rest.find('[') {
+                let (literal, from) = rest.split_at(at);
+                out.push_str(literal);
+                let (c, len) = match glob_literal_escape_at(from) {
+                    Some(m) => (m, 3),
+                    None => ('[', 1),
+                };
+                out.push(c);
+                rest = from.get(len..).unwrap_or_default();
+            }
+            out.push_str(rest);
+            std::borrow::Cow::Owned(out)
         }
 
         impl Display for Content {
@@ -1858,6 +1975,49 @@ mod timeout_tests {
                 .as_millis(),
             2500
         );
+    }
+}
+
+#[cfg(test)]
+mod glob_literal_tests {
+    use super::targetdef::path::{
+        escape_glob_literal, glob_literal_escape_at, unescape_glob_literal,
+    };
+    use std::borrow::Cow;
+
+    /// Unescaping inverts escaping for every literal, and leaves a real
+    /// class and the near misses of an escape alone.
+    #[test]
+    fn unescape_inverts_escape() {
+        for literal in [
+            "",
+            "plain/pkg",
+            "app/[slug]",
+            "a]b",
+            "a[b",
+            "x/*/y?",
+            "é[ü]",
+        ] {
+            assert_eq!(
+                unescape_glob_literal(&escape_glob_literal(literal)),
+                literal
+            );
+        }
+        assert!(matches!(
+            unescape_glob_literal("plain/[ab]/*"),
+            Cow::Borrowed(_)
+        ));
+        for (pattern, want) in [
+            ("a/[[]x[]]/[ab]", "a/[x]/[ab]"),
+            ("[[x]", "[[x]"),
+            ("[!]]", "[!]]"),
+            ("[*", "[*"),
+            ("[", "["),
+        ] {
+            assert_eq!(unescape_glob_literal(pattern), want, "{pattern}");
+        }
+        assert_eq!(glob_literal_escape_at("[?]rest"), Some('?'));
+        assert_eq!(glob_literal_escape_at("[a]"), None);
     }
 }
 

@@ -242,20 +242,35 @@ fn failure_out_path(raw: &str, pkg: &str) -> anyhow::Result<Content> {
              e.g. \"test-results/\""
         );
     }
-    let path = hmodel::htpkg::join_rel_checked(pkg, raw)?;
-    Ok(path_content(path))
+    path_content(raw, pkg)
 }
 
-/// A workspace-relative path as the def's [`Content`]: a glob if it has a
-/// pattern character, a directory if it ends in `/`, a file otherwise.
-pub(crate) fn path_content(path: String) -> Content {
-    if ["*", "?", "["].iter().any(|&p| path.contains(p)) {
-        Content::Glob(path)
-    } else if path.ends_with('/') {
+/// `raw`, a path declared in package `pkg`, as the def's workspace-relative
+/// [`Content`]: a glob if `raw` has a pattern character, a directory if it
+/// ends in `/`, a file otherwise.
+///
+/// Only `raw` is the user's pattern text: the kind is decided on `raw` alone,
+/// and a glob gets the package directory escaped in front of it
+/// (`escape_glob_literal`). Classifying the joined path instead made a
+/// package such as `app/[slug]` turn every path into a glob whose `[slug]` is
+/// a character class, which matched nothing. A package with no `? * [ ]`
+/// escapes to itself, so its patterns — and def hashes — are what they
+/// always were.
+pub(crate) fn path_content(raw: &str, pkg: &str) -> anyhow::Result<Content> {
+    if raw.contains(['*', '?', '[']) {
+        // `..` pops whole components and escaping never adds a `/`, so the
+        // escaped package joins exactly as the literal one would.
+        let escaped = hplugin::driver::targetdef::path::escape_glob_literal(pkg);
+        return Ok(Content::Glob(hmodel::htpkg::join_rel_checked(
+            &escaped, raw,
+        )?));
+    }
+    let path = hmodel::htpkg::join_rel_checked(pkg, raw)?;
+    Ok(if path.ends_with('/') {
         Content::DirPath(path)
     } else {
         Content::FilePath(path)
-    }
+    })
 }
 
 #[cfg(test)]
@@ -661,6 +676,31 @@ mod tests {
             ]
         );
         assert!(failure_outputs(&HashMap::new(), "app").unwrap().is_empty());
+    }
+
+    /// In a package like `app/[slug]` the kind is decided on the path as
+    /// written: a plain file stays a file, and a glob escapes the package so
+    /// `[slug]` is not read as a character class.
+    #[test]
+    fn failure_out_in_a_metachar_package() {
+        let s = |v: &str| Value::String(v.to_string());
+        assert_eq!(
+            shape(
+                &failure_out_of(
+                    Value::List(vec![s("junit.xml"), s("out/"), s("*.png")]),
+                    "app/[slug]",
+                )
+                .unwrap()
+            ),
+            [(
+                String::new(),
+                vec![
+                    "FilePath(app/[slug]/junit.xml)".to_string(),
+                    "DirPath(app/[slug]/out/)".to_string(),
+                    "Glob(app/[[]slug[]]/*.png)".to_string(),
+                ]
+            )]
+        );
     }
 
     /// D4: a failure output stays inside the package, and is never the

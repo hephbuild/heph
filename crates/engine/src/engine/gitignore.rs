@@ -361,15 +361,56 @@ pub fn merge_section(
 /// treats as a file, not a directory — so `/gen/` would fail to ignore it and the
 /// link would show up untracked. `/gen` matches both spellings.
 ///
+/// A file or directory path is a literal, and `.gitignore` lines are patterns
+/// ([`escape_gitignore_literal`]): unescaped, the output `app/[slug]/gen.ts`
+/// became a line matching `app/s/gen.ts` and not itself. A glob output keeps
+/// its `glob`-dialect classes and wildcards, which mean the same to git, and
+/// gets only git's own escapes ([`anchored_gitignore_line`]).
+///
 /// Reused by `validate` as the canonical, normalized output-path key for
 /// detecting overlapping `codegen = copy` outputs across targets; its overlap
-/// tests trim trailing slashes anyway, so they are unaffected.
+/// tests trim trailing slashes anyway, so they are unaffected, and a literal
+/// spelled the same way in all three kinds keeps a file and a glob in one
+/// package comparable.
 pub(crate) fn content_to_pattern(content: &Content) -> String {
     match content {
-        Content::FilePath(p) => format!("/{}", p.trim_start_matches('/')),
-        Content::DirPath(p) => format!("/{}", p.trim_start_matches('/').trim_end_matches('/')),
-        Content::Glob(g) => format!("/{}", g.trim_start_matches('/')),
+        Content::FilePath(p) => escape_gitignore_literal(p.trim_start_matches('/')),
+        Content::DirPath(p) => {
+            escape_gitignore_literal(p.trim_start_matches('/').trim_end_matches('/'))
+        }
+        Content::Glob(g) => anchored_gitignore_line(g.trim_start_matches('/')),
     }
+}
+
+/// The literal path `path` as a root-anchored `.gitignore` line matching
+/// exactly itself: its `? * [ ]` as one-character classes, the form a glob
+/// output already spells its package directory in (`escape_glob_literal`),
+/// which git's wildmatch and the `ignore` crate both read as the character
+/// itself; then git's own escapes ([`anchored_gitignore_line`]).
+fn escape_gitignore_literal(path: &str) -> String {
+    use crate::engine::driver::targetdef::path::escape_glob_literal;
+    anchored_gitignore_line(&escape_glob_literal(path))
+}
+
+/// `glob_text` (pattern text in the `glob` dialect, which has no escape
+/// character) as a root-anchored `.gitignore` line: `/` in front, each `\`
+/// doubled, since to git it escapes the next character, and a trailing space
+/// written `\ `, since git strips an unescaped one. A path with neither comes
+/// out as `/` plus itself.
+fn anchored_gitignore_line(glob_text: &str) -> String {
+    let mut out = String::with_capacity(glob_text.len() + 2);
+    out.push('/');
+    for c in glob_text.chars() {
+        if c == '\\' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    if out.ends_with(' ') {
+        out.pop();
+        out.push_str("\\ ");
+    }
+    out
 }
 
 /// The first offset of `needle` in `hay`.
@@ -497,6 +538,115 @@ mod tests {
             content_to_pattern(&Content::Glob("foo/gen/**/*.go".into())),
             "/foo/gen/**/*.go"
         );
+    }
+
+    /// The lines for outputs in package `app/[slug]` ignore exactly those
+    /// outputs — under git itself, and under the `ignore`-crate matcher the
+    /// codegen index compiles the section into — and not a path the
+    /// unescaped `[slug]` class would have matched.
+    #[test]
+    fn content_to_pattern_escapes_a_metachar_package() -> anyhow::Result<()> {
+        let lines = [
+            content_to_pattern(&Content::FilePath("app/[slug]/gen.txt".into())),
+            content_to_pattern(&Content::DirPath("app/[slug]/out/".into())),
+            // What the exec driver declares for `out = "*.gen.ts"`.
+            content_to_pattern(&Content::Glob("app/[[]slug[]]/*.gen.ts".into())),
+            content_to_pattern(&Content::FilePath("q/a?b*c/x".into())),
+            // `\` is git's escape character, and the `glob` dialect has none:
+            // a literal one is doubled in every kind.
+            content_to_pattern(&Content::FilePath(r"back\slash/gen.txt".into())),
+            content_to_pattern(&Content::DirPath(r"back\slash/out/".into())),
+            content_to_pattern(&Content::Glob(r"back\slash/*.gen.ts".into())),
+            // git strips an unescaped trailing space.
+            content_to_pattern(&Content::FilePath("sp/trail ".into())),
+        ];
+        assert_eq!(
+            lines,
+            [
+                "/app/[[]slug[]]/gen.txt",
+                "/app/[[]slug[]]/out",
+                "/app/[[]slug[]]/*.gen.ts",
+                "/q/a[?]b[*]c/x",
+                r"/back\\slash/gen.txt",
+                r"/back\\slash/out",
+                r"/back\\slash/*.gen.ts",
+                r"/sp/trail\ ",
+            ]
+        );
+
+        let ignored = [
+            "app/[slug]/gen.txt",
+            "app/[slug]/out/x.txt",
+            "app/[slug]/page.gen.ts",
+            "q/a?b*c/x",
+            r"back\slash/gen.txt",
+            r"back\slash/out/x.txt",
+            r"back\slash/page.gen.ts",
+            "sp/trail ",
+        ];
+        let not_ignored = [
+            "app/s/gen.txt",
+            "app/s/out/x.txt",
+            "app/s/page.gen.ts",
+            "app/[slug]/page.ts",
+            "q/aXbYYc/x",
+            "backslash/gen.txt",
+            "backslash/out/x.txt",
+            "backslash/page.gen.ts",
+            r"back\slash/page.ts",
+            "sp/trail",
+        ];
+
+        // git's own reading.
+        let repo = tempfile::tempdir()?;
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(args)
+                .output()
+        };
+        let init = git(&["init", "-q"])?;
+        assert!(init.status.success(), "git init: {init:?}");
+        std::fs::write(repo.path().join(".gitignore"), lines.join("\n") + "\n")?;
+        for p in ignored.iter().chain(&not_ignored) {
+            let path = repo.path().join(p);
+            std::fs::create_dir_all(path.parent().expect("has a parent"))?;
+            std::fs::write(&path, "x")?;
+        }
+        for p in ignored {
+            let out = git(&["check-ignore", "-q", "--no-index", p])?;
+            assert_eq!(out.status.code(), Some(0), "git must ignore {p}: {out:?}");
+        }
+        for p in not_ignored {
+            let out = git(&["check-ignore", "-q", "--no-index", p])?;
+            assert_eq!(
+                out.status.code(),
+                Some(1),
+                "git must not ignore {p}: {out:?}"
+            );
+        }
+
+        // The codegen index's reading of the same lines. Not the trailing
+        // space: `parse_section_bytes` trims every line, so `\ ` loses its
+        // space there (it read the unescaped line as `sp/trail` before, too).
+        let entries: Vec<GitignoreEntry> = lines.iter().map(|l| bare(l)).collect();
+        let section = Section::compile(&super::render(b"", &entries));
+        let ignored = ignored.iter().filter(|p| !p.starts_with("sp/"));
+        let not_ignored = not_ignored.iter().filter(|p| !p.starts_with("sp/"));
+        for p in ignored {
+            assert!(
+                section.match_point(p.as_bytes(), false).is_territory(),
+                "the section must cover {p}"
+            );
+        }
+        for p in not_ignored {
+            assert!(
+                !section.match_point(p.as_bytes(), false).is_territory(),
+                "the section must not cover {p}"
+            );
+        }
+        Ok(())
     }
 
     #[test]

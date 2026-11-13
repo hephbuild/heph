@@ -440,8 +440,12 @@ impl ManagedDriver for GoDownloadDriver {
             format!("{:x}", h.finish()).into_bytes()
         };
 
-        let glob = hmodel::htpkg::join_rel_checked(pkg.as_str(), "**/*")
-            .context("resolve go.download output glob")?;
+        // The package is a literal directory in front of the pattern.
+        let glob = hmodel::htpkg::join_rel_checked(
+            &hplugin::driver::targetdef::path::escape_glob_literal(pkg.as_str()),
+            "**/*",
+        )
+        .context("resolve go.download output glob")?;
 
         Ok(ParseResponse {
             target_def: TargetDef {
