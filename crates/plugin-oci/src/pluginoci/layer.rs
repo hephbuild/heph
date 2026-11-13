@@ -403,12 +403,15 @@ impl ManagedDriver for Driver {
 
         let mut entries: Vec<Entry> = Vec::new();
         let mut stripped_none: Vec<String> = Vec::new();
-        for input in &req.inputs {
-            if !input.input.origin_id.starts_with("srcs|") {
+        // Per origin, not per input: a `glob()` dep reaches here as one input
+        // per matched file, and each origin's list already names all of them.
+        // `parse` gave the i-th `srcs` entry origin `src_origin(i)`.
+        for origin in (0..def.srcs.len()).map(src_origin) {
+            let Some(src) = req.inputs.iter().find(|m| m.input.origin_id == origin) else {
                 continue;
-            }
-            let from = input.input.source_addr.to_string();
-            for path in dep_files(&req, &input.input.origin_id)? {
+            };
+            let from = src.input.source_addr.to_string();
+            for path in dep_files(&req, &origin)? {
                 let ws_rel = path.strip_prefix(&req.sandbox_ws_dir).unwrap_or(&path);
                 match dest_path(ws_rel, def.strip.as_deref(), &def.prefix)? {
                     Some(dest) => {
