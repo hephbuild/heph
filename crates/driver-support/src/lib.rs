@@ -8,6 +8,7 @@
 pub mod credential;
 pub mod driver_managed;
 pub mod driver_managed_os;
+mod output_glob;
 pub mod scratch;
 pub mod stage;
 pub mod stop;

@@ -1475,23 +1475,24 @@ async fn an_unreachable_remote_degrades_to_a_cold_build() -> anyhow::Result<()> 
 /// What a broad glob beside a mounted scratch actually does.
 ///
 /// It used to be rejected at *parse* time, on the reasoning that the glob would
-/// sweep the cache into the artifact. That reasoning was wrong: collection uses
-/// `symlink_metadata` and takes `is_file() || is_symlink()`, and `walkdir` does
-/// not follow symlinks — so a glob reaching a mount collects the *symlink*, never
-/// what is behind it. The parse-time guard was also redundant, because the packer
-/// already refuses an absolute symlink, and says so precisely.
+/// sweep the cache into the artifact. A parse-time guard is not needed: the mount
+/// is a symlink to a directory, and output globs never descend one
+/// (hephbuild/heph#563) — the walk refuses it, naming the mount, before reading
+/// anything behind it. (Were it only matched, the packer would refuse it too: it
+/// is absolute, and points outside the artifact.)
 ///
-/// So this is the behaviour today: the build runs, and packing fails naming the
-/// mount. **Still not right** — heph created that symlink, the author did not, so
-/// collection ought to skip it rather than hand the author an error about it.
-/// Fixing that means threading the mount paths into `collect_outputs`; until
-/// then this test pins what actually happens rather than what should.
+/// So this is the behaviour today: the build runs, and output collection fails
+/// naming the mount. **Still not right** — heph created that symlink, the author
+/// did not, so collection ought to skip it rather than hand the author an error
+/// about it. Fixing that means threading the mount paths into
+/// `collect_outputs`; until then this test pins what actually happens rather
+/// than what should.
 ///
 /// The overlap that is genuinely invalid is a mount landing on a materialized
 /// input — that destroys a real file, and is covered by
 /// `a_scratch_cannot_mount_over_a_materialized_input`.
 #[tokio::test]
-async fn a_broad_glob_beside_a_mount_fails_in_the_packer_not_the_parser() -> anyhow::Result<()> {
+async fn a_broad_glob_beside_a_mount_fails_at_collection_not_the_parser() -> anyhow::Result<()> {
     let ws = Workspace::new();
     ws.write_build_file(
         "build",
@@ -1505,12 +1506,12 @@ async fn a_broad_glob_beside_a_mount_fails_in_the_packer_not_the_parser() -> any
 
     let err = expect_err(
         ws.run("//app:a").await,
-        "packing must refuse the mount symlink",
+        "collection must refuse the mount symlink",
     );
     let msg = format!("{err:#}");
     assert!(
-        msg.contains("absolute symlink not allowed"),
-        "the packer's own check is what rejects it now: {msg}"
+        msg.contains("heph does not follow"),
+        "the output glob refuses to descend the mount: {msg}"
     );
     // And it names the mount, which is the part a person needs.
     assert!(msg.contains(".cache/x"), "must name the mount: {msg}");

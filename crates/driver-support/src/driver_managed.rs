@@ -409,17 +409,24 @@ fn staged_path(inputs: &[ManagedRunInput], origin_id: &str, arg: &str) -> anyhow
 /// Stops early, with a cancellation error, once `ctoken` is cancelled or this
 /// future is dropped (see [`crate::stop`]): between output paths, between the
 /// entries of a walked directory, and per chunk while packing.
+///
+/// `stage_dir` is heph's shared stage when the sandbox links read-only inputs
+/// into it (the OS sandbox, see [`crate::stage`]): output globs and declared
+/// paths follow those links, and no other directory link (see
+/// [`crate::output_glob`]). `None` where inputs are real directories (FUSE).
 pub async fn collect_outputs(
     target: &hplugin::driver::targetdef::TargetDef,
     hashin: &str,
     ws_dir: &Path,
     sandbox_dir: &Path,
+    stage_dir: Option<&Path>,
     ctoken: &(dyn Cancellable + Send + Sync),
 ) -> anyhow::Result<Vec<outputartifact::OutputArtifact>> {
     let outputs = target.outputs.clone();
     let support_files = target.support_files.clone();
     let hashin = hashin.to_string();
     let (ws_dir, sandbox_dir) = (ws_dir.to_path_buf(), sandbox_dir.to_path_buf());
+    let stage_dir = stage_dir.map(Path::to_path_buf);
     crate::stop::run_blocking(ctoken, move |stop| {
         collect_outputs_inner(
             &outputs,
@@ -427,6 +434,7 @@ pub async fn collect_outputs(
             &hashin,
             &ws_dir,
             &sandbox_dir,
+            stage_dir.as_deref(),
             stop,
         )
     })
@@ -441,6 +449,7 @@ fn collect_outputs_inner(
     hashin: &str,
     ws_dir: &Path,
     sandbox_dir: &Path,
+    stage_dir: Option<&Path>,
     stop: &dyn Fn() -> bool,
 ) -> anyhow::Result<Vec<outputartifact::OutputArtifact>> {
     let mut artifacts = Vec::new();
@@ -453,7 +462,7 @@ fn collect_outputs_inner(
             if !path.collect {
                 continue;
             }
-            add_path_to_tar(&mut tar, ws_dir, path, &output.group, stop)?;
+            add_path_to_tar(&mut tar, ws_dir, stage_dir, path, &output.group, stop)?;
         }
         let tarpath = pack_to_artifact_tar(sandbox_dir, hashin, &output.group, tar, stop)?;
         artifacts.push(outputartifact::OutputArtifact {
@@ -469,7 +478,7 @@ fn collect_outputs_inner(
     if !support_files.is_empty() {
         let mut tar = hartifactcontent::tar::TarPacker::new();
         for path in support_files {
-            add_path_to_tar(&mut tar, ws_dir, path, "support", stop)?;
+            add_path_to_tar(&mut tar, ws_dir, stage_dir, path, "support", stop)?;
         }
         let (tarpath, hashout) = pack_to_artifact_tar(sandbox_dir, hashin, "support", tar, stop)?;
         artifacts.push(outputartifact::OutputArtifact {
@@ -801,6 +810,7 @@ impl<W: Write> Write for HashingWriter<W> {
 fn add_path_to_tar(
     tar: &mut hartifactcontent::tar::TarPacker,
     ws_dir: &Path,
+    stage_dir: Option<&Path>,
     path: &path::Path,
     group_for_err: &str,
     stop: &dyn Fn() -> bool,
@@ -810,6 +820,10 @@ fn add_path_to_tar(
     }
     match &path.content {
         Content::FilePath(fp) => {
+            // Not read through a linked ancestor (hephbuild/heph#563), as a
+            // glob would not be; see `output_glob`.
+            crate::output_glob::check_declared_path(ws_dir, fp, stage_dir)
+                .with_context(|| format!("group={group_for_err}"))?;
             let source = ws_dir.join(fp);
             // A single-file output must resolve to a file/symlink. Without this
             // check a path that materialized as a directory is registered blindly
@@ -827,6 +841,8 @@ fn add_path_to_tar(
             tar.create_file(source.to_string_lossy().into_owned(), fp.clone());
         }
         Content::DirPath(dir) => {
+            crate::output_glob::check_declared_path(ws_dir, dir, stage_dir)
+                .with_context(|| format!("group={group_for_err}"))?;
             let dir_full = ws_dir.join(dir);
             // Symmetric to the FilePath guard: a directory output declared on a
             // path that materialized as a file would otherwise be single-walked
@@ -874,15 +890,18 @@ fn add_path_to_tar(
             }
         }
         Content::Glob(pattern) => {
-            let full_pattern = ws_dir.join(pattern).to_string_lossy().into_owned();
-            for matched in glob::glob(&full_pattern)
-                .with_context(|| format!("compile output glob {full_pattern:?}"))?
+            // Not `glob::glob`: it follows directory symlinks (hephbuild/heph#563).
+            // `OutputGlob` is the same walk, refusing a link it would descend.
+            for matched in crate::output_glob::OutputGlob::new(ws_dir, pattern, stage_dir)
+                .with_context(|| {
+                    format!("compile output glob {pattern:?} (group={group_for_err})")
+                })?
             {
                 if stop() {
                     return Err(crate::stop::cancelled());
                 }
-                let matched =
-                    matched.with_context(|| format!("glob entry from {full_pattern:?}"))?;
+                let matched = matched
+                    .with_context(|| format!("output glob {pattern:?} (group={group_for_err})"))?;
                 let md = fs::symlink_metadata(&matched).with_context(|| {
                     format!("lstat glob match {:?} (group={})", matched, group_for_err)
                 })?;
@@ -1173,7 +1192,7 @@ mod source_map_tests {
         fs::create_dir_all(dir.path().join("out")).expect("mkdir");
         let p = out_path(path::Content::FilePath("out".to_string()));
         let mut tar = TarPacker::new();
-        let err = add_path_to_tar(&mut tar, dir.path(), &p, "bin", &|| false).unwrap_err();
+        let err = add_path_to_tar(&mut tar, dir.path(), None, &p, "bin", &|| false).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("is a directory"), "got: {msg}");
         assert!(
@@ -1190,7 +1209,7 @@ mod source_map_tests {
         fs::write(dir.path().join("out"), b"x").expect("write");
         let p = out_path(path::Content::DirPath("out".to_string()));
         let mut tar = TarPacker::new();
-        let err = add_path_to_tar(&mut tar, dir.path(), &p, "data", &|| false).unwrap_err();
+        let err = add_path_to_tar(&mut tar, dir.path(), None, &p, "data", &|| false).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("is a file"), "got: {msg}");
         assert!(
@@ -1219,7 +1238,7 @@ mod source_map_tests {
 
         let p = out_path(path::Content::DirPath("out".to_string()));
         let mut tar = TarPacker::new();
-        add_path_to_tar(&mut tar, dir.path(), &p, "data", &|| false).expect("add dir output");
+        add_path_to_tar(&mut tar, dir.path(), None, &p, "data", &|| false).expect("add dir output");
         let mut buf = Vec::new();
         tar.pack(&mut buf).expect("pack");
 
@@ -1706,7 +1725,7 @@ mod cancel_tests {
         let (dir, target) = sandbox_with_outputs(&[("a", b"a")]);
         let ct = StdCancellationToken::new();
         ct.cancel();
-        let err = collect_outputs(&target, "h", &dir.path().join("ws"), dir.path(), &ct)
+        let err = collect_outputs(&target, "h", &dir.path().join("ws"), dir.path(), None, &ct)
             .await
             .err()
             .expect("cancelled");
@@ -1740,6 +1759,7 @@ mod cancel_tests {
             "h",
             &dir.path().join("ws"),
             dir.path(),
+            None,
             &stop,
         );
         assert!(stopped.is_err(), "a stopped collect fails");
@@ -1755,11 +1775,11 @@ mod cancel_tests {
         let ws = dir.path().join("ws");
         let ct = StdCancellationToken::new();
 
-        let first = collect_outputs(&target, "h", &ws, dir.path(), &ct)
+        let first = collect_outputs(&target, "h", &ws, dir.path(), None, &ct)
             .await
             .expect("collect");
         fs::write(ws.join("out/a"), b"second, longer").expect("rewrite");
-        let second = collect_outputs(&target, "h", &ws, dir.path(), &ct)
+        let second = collect_outputs(&target, "h", &ws, dir.path(), None, &ct)
             .await
             .expect("collect");
 

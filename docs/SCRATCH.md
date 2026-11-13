@@ -160,13 +160,17 @@ created after every input is materialized and before the driver runs. It
 hard-errors if anything already exists at that path: a mount landing on a
 materialized input would destroy a real file.
 
-A broad output glob beside a mount does **not** collect the cache. Collection
-uses `symlink_metadata` and takes `is_file() || is_symlink()`, and `walkdir` does
-not follow symlinks, so a glob reaching a mount captures the symlink and never
-what is behind it. The artifact packer then refuses it, an absolute symlink being
-unpackable. That is a rough edge rather than a hazard: heph created the symlink,
-so collection ought to skip its own mounts instead of handing the author an error
-about one.
+A broad output glob beside a mount does **not** collect the cache. An output
+glob never descends a symlinked directory: one that would (`**/*` beside the
+mount) fails the target before reading anything behind it, with `output would
+descend the symlink <mount> -> <slot>, which is an absolute path; heph does not
+follow it`. A directory output (`walkdir`, which does not follow symlinks) or a
+glob that only *matches* the mount captures the symlink itself, and the
+artifact packer refuses it with `absolute symlink not allowed: <mount> ->
+<slot> is an absolute path`: a symlink in an artifact must be relative and
+point inside the artifact. That is a rough edge rather than a hazard: heph
+created the symlink, so collection ought to skip its own mounts instead of
+handing the author an error about one.
 
 ## Concurrency
 

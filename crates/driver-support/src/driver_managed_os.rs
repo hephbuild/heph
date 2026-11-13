@@ -177,8 +177,17 @@ impl ManagedDriverOs {
             });
         }
 
-        res.artifacts
-            .extend(collect_outputs(target, hashin, &ws_dir, &sandbox_dir, ctoken).await?);
+        res.artifacts.extend(
+            collect_outputs(
+                target,
+                hashin,
+                &ws_dir,
+                &sandbox_dir,
+                self.stage_dir.as_deref(),
+                ctoken,
+            )
+            .await?,
+        );
 
         Ok(RunResponse {
             artifacts: res.artifacts,
