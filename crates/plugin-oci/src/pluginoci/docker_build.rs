@@ -103,8 +103,7 @@ use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3Default;
 
 use super::{
-    ImageFormat, basename, dep_files, dep_origins, dep_single_file, is_addr, normalize_platform,
-    ws_path,
+    ImageFormat, basename, dep_files, dep_single_file, is_addr, normalize_platform, ws_path,
 };
 
 /// The user-facing output streams a driver relays its tool's output to.
@@ -417,6 +416,11 @@ fn platform_ctx_origin(platform: &str, group: &str, i: usize) -> String {
     )
 }
 
+/// Origin id for the i-th dep of `context` group `group`.
+fn context_origin(group: &str, i: usize) -> String {
+    format!("context|{group}|{i}")
+}
+
 /// Stage each per-platform dep into the build context under its own platform
 /// prefix, by hard link.
 ///
@@ -430,16 +434,12 @@ fn link_platform_contexts(
     def: &DockerBuildDef,
     context_dir: &Path,
 ) -> anyhow::Result<()> {
-    for (platform, group, _) in &def.platform_contexts {
+    for (platform, group, addrs) in &def.platform_contexts {
         let seg = platform_segment(platform);
         let root = req.sandbox_dir.join(format!("exec_{seg}_{group}"));
         let dest_root = context_dir.join(PLATFORM_CTX_PREFIX).join(platform);
-        let prefix = format!("context_by_platform|{seg}|{group}|");
-        for origin in dep_origins(req) {
-            if !origin.starts_with(&prefix) {
-                continue;
-            }
-            for path in dep_files(req, origin)? {
+        for i in 0..addrs.len() {
+            for path in dep_files(req, &platform_ctx_origin(platform, group, i))? {
                 let rel = path.strip_prefix(&root).unwrap_or(&path);
                 let dest = dest_root.join(rel);
                 if let Some(parent) = dest.parent() {
@@ -993,7 +993,7 @@ impl ManagedDriver for Driver {
                 inputs.push(Input {
                     r#ref,
                     mode: InputMode::Standard,
-                    origin_id: format!("context|{group}|{i}"),
+                    origin_id: context_origin(group, i),
                     annotations: BTreeMap::new(),
                     hashed: true,
                     runtime: true,
@@ -1164,7 +1164,7 @@ impl ManagedDriver for Driver {
             .context("staging per-platform context deps")?;
 
         let named_contexts = resolve_named_contexts(&req, &def)?;
-        let src_args = resolve_src_args(&req, &context_dir)?;
+        let src_args = resolve_src_args(&req, &def, &context_dir)?;
         let argv = build_argv(
             &self.docker_bin,
             &def,
@@ -1580,6 +1580,7 @@ fn missing_tool_error(e: std::io::Error, bin: &str, what: &str) -> anyhow::Error
 /// and what `exec`'s `SRC_*` env vars already do.
 fn resolve_src_args(
     req: &ManagedRunRequest<'_, '_>,
+    def: &DockerBuildDef,
     context_dir: &Path,
 ) -> anyhow::Result<BTreeMap<String, String>> {
     let mut by_group: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -1589,42 +1590,33 @@ fn resolve_src_args(
     // same paths everywhere — one target built two ways, the usual case — so
     // disagreement is an error rather than a silently platform-dependent arg.
     let mut by_platform_group: BTreeMap<String, BTreeMap<String, Vec<String>>> = BTreeMap::new();
-    for origin in dep_origins(req) {
-        if let Some(rest) = origin.strip_prefix("context_by_platform|") {
-            // `context_by_platform|<platform>|<group>|<index>`; the platform
-            // itself contains `/` but never `|`.
-            let mut parts = rest.splitn(2, '|');
-            let (Some(platform), Some(tail)) = (parts.next(), parts.next()) else {
-                continue;
-            };
-            let Some((group, _)) = tail.rsplit_once('|') else {
-                continue;
-            };
-            let root = req.sandbox_dir.join(format!("exec_{platform}_{group}"));
-            for path in dep_files(req, origin)? {
+    // The origins are enumerated from the def, which records every group and
+    // its deps, rather than decoded back out of the origin ids.
+    for (platform, group, addrs) in &def.platform_contexts {
+        let root = req
+            .sandbox_dir
+            .join(format!("exec_{}_{group}", platform_segment(platform)));
+        for i in 0..addrs.len() {
+            for path in dep_files(req, &platform_ctx_origin(platform, group, i))? {
                 let rel = path.strip_prefix(&root).unwrap_or(&path);
                 by_platform_group
-                    .entry(group.to_string())
+                    .entry(group.clone())
                     .or_default()
-                    .entry(platform.to_string())
+                    .entry(platform.clone())
                     .or_default()
                     .push(rel.to_string_lossy().into_owned());
             }
-            continue;
         }
-        let Some(rest) = origin.strip_prefix("context|") else {
-            continue;
-        };
-        // origin_id is `context|<group>|<index>`; the group may itself be empty.
-        let Some((group, _)) = rest.rsplit_once('|') else {
-            continue;
-        };
-        for path in dep_files(req, origin)? {
-            let rel = path.strip_prefix(context_dir).unwrap_or(&path);
-            by_group
-                .entry(group.to_string())
-                .or_default()
-                .push(rel.to_string_lossy().into_owned());
+    }
+    for (group, addrs) in &def.context {
+        for i in 0..addrs.len() {
+            for path in dep_files(req, &context_origin(group, i))? {
+                let rel = path.strip_prefix(context_dir).unwrap_or(&path);
+                by_group
+                    .entry(group.clone())
+                    .or_default()
+                    .push(rel.to_string_lossy().into_owned());
+            }
         }
     }
     let mut args: BTreeMap<String, String> = by_group

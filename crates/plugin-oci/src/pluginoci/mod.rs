@@ -231,6 +231,12 @@ pub(crate) fn split_platform(platform: &str) -> anyhow::Result<(&str, &str)> {
 }
 /// All paths a Dep input materialized into the sandbox, read from its `.list`
 /// file (one absolute path per line — see `driver_managed.rs::list_path_for`).
+///
+/// The list covers the whole origin. A dep that produces several artifacts (a
+/// `glob()` or a `group`, one per file) reaches the driver as several inputs
+/// sharing that origin, so call this once per origin the driver declared in
+/// `parse`, never once per input: per input, every file comes back once per
+/// artifact.
 fn dep_files(req: &ManagedRunRequest<'_, '_>, origin_id: &str) -> anyhow::Result<Vec<PathBuf>> {
     let Some(m) = req.inputs.iter().find(|m| {
         m.input.origin_id == origin_id
@@ -249,27 +255,6 @@ fn dep_files(req: &ManagedRunRequest<'_, '_>, origin_id: &str) -> anyhow::Result
         .filter(|l| !l.is_empty())
         .map(PathBuf::from)
         .collect())
-}
-
-/// Each Dep input's `origin_id`, once, in input order.
-///
-/// A dep that produces several artifacts (a `group` produces one per file)
-/// reaches the driver as several inputs sharing one origin, while its `.list`
-/// file, the one [`dep_files`] reads, covers the whole origin. So a loop that
-/// calls `dep_files` per *input* sees every file once per artifact. Loop over
-/// this instead.
-fn dep_origins<'r>(req: &'r ManagedRunRequest<'_, '_>) -> impl Iterator<Item = &'r str> {
-    let mut seen = std::collections::HashSet::new();
-    req.inputs
-        .iter()
-        .filter(|m| {
-            matches!(
-                m.input.artifact.r#type,
-                hplugin::driver::inputartifact::Type::Dep
-            )
-        })
-        .map(|m| m.input.origin_id.as_str())
-        .filter(move |o| seen.insert(*o))
 }
 
 /// Absolute path of the OCI layout a dep materialized — a layout *directory*,
