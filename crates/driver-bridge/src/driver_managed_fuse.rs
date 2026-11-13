@@ -183,6 +183,8 @@ impl ManagedDriverFuse {
                     ctoken,
                     &ws_dir,
                     &plain_sandbox_dir,
+                    // FUSE shows inputs as real directories: no stage links.
+                    None,
                 )
                 .await;
                 return Err(hdriver_support::failure_out::keep_failure_outputs(

@@ -524,12 +524,13 @@ pub(crate) fn collect_write_back_inner(
     hashin: &str,
     ws_dir: &Path,
     sandbox_dir: &Path,
+    stage_dir: Option<&Path>,
     stop: &dyn Fn() -> bool,
 ) -> anyhow::Result<Vec<outputartifact::OutputArtifact>> {
     let reading = Reading::Build {
         missing_ok: true,
         skip: &|rel: &Path| excluded.matches(rel),
-        stage_dir: None,
+        stage_dir,
     };
     let prefixed = format!("{WRITE_BACK_TAR_PREFIX}{hashin}");
     let mut artifacts = Vec::new();

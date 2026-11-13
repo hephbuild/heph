@@ -89,7 +89,9 @@ the paths in the BUILD file; the slot does not split by group.
 - **Globs are bounded.** A `failure_out` glob walks from its literal prefix,
   never through a linked directory, and only as deep as the pattern can match:
   `*.txt` reads the package directory, not every input staged below it. This is
-  the `failure_out` walk only; `out` globs are collected as they always were.
+  the `failure_out` walk only. The `in_place` fixes written back on failure are
+  walked as a passing run's outputs are, by the output glob that refuses a
+  linked directory outside the stage (#566).
 - **Packed, then unpacked: never linked.** The matches are packed into a tar in
   the sandbox (`heph-collect-artifacts/failureout-*.tar`) by the same packer
   as outputs, and the engine unpacks it into the slot and deletes it. Only

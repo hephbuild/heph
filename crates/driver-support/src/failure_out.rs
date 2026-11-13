@@ -206,6 +206,13 @@ pub fn write_back_on_failure_exit(
 ///
 /// Never on a timeout: its token is cancelled, which
 /// [`write_back_on_failure_exit`] refuses, so the pack stops with the run.
+///
+/// `stage_dir` is read as [`crate::driver_managed::collect_outputs`] reads
+/// it: the fixes are walked as a passing run's outputs would be.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the managed layer's run state, passed through as collect_outputs takes it"
+)]
 pub async fn keep_failure_write_back(
     err: anyhow::Error,
     target: &TargetDef,
@@ -214,6 +221,7 @@ pub async fn keep_failure_write_back(
     ctoken: &(dyn Cancellable + Send + Sync),
     ws_dir: &Path,
     tar_parent: &Path,
+    stage_dir: Option<&Path>,
 ) -> anyhow::Error {
     if !target_writes_back_on_failure(target)
         || write_back_on_failure_exit(&err, shell, ctoken).is_none()
@@ -224,6 +232,7 @@ pub async fn keep_failure_write_back(
     let excluded = FailureOutMatch::new(&target.failure_outputs);
     let hashin = hashin.to_owned();
     let (ws_dir, tar_parent) = (ws_dir.to_path_buf(), tar_parent.to_path_buf());
+    let stage_dir = stage_dir.map(Path::to_path_buf);
     let collected = crate::stop::run_blocking(ctoken, move |stop| {
         crate::driver_managed::collect_write_back_inner(
             &outputs,
@@ -231,6 +240,7 @@ pub async fn keep_failure_write_back(
             &hashin,
             &ws_dir,
             &tar_parent,
+            stage_dir.as_deref(),
             stop,
         )
     })
@@ -766,6 +776,7 @@ mod tests {
             "abc",
             &ws,
             &sandbox,
+            None,
             &|| false,
         )
         .expect("collect");
@@ -855,6 +866,7 @@ mod tests {
             "abc",
             &ws,
             &sandbox,
+            None,
             &|| false,
         )
         .expect("collect");
@@ -883,6 +895,7 @@ mod tests {
             "abc",
             &ws,
             &tmp.path().join("sandbox"),
+            None,
             &|| true,
         ) else {
             panic!("a stopped write-back packs nothing");

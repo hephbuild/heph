@@ -174,6 +174,7 @@ impl ManagedDriverOs {
                     ctoken,
                     &ws_dir,
                     &sandbox_dir,
+                    self.stage_dir.as_deref(),
                 )
                 .await;
                 return Err(crate::failure_out::keep_failure_outputs(
