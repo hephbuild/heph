@@ -208,8 +208,11 @@ Rules:
    counter attributed to its root, and a per-package tally under that root.
 2. **Roots render in first-seen order, never re-sorted**, so consecutive PATCH bodies differ by
    appends only and an agent diffing two fetches sees "one new root", not a reshuffle.
-3. **Log tail: 5 lines, first root only**, ~1 KiB cap. Mid-build the reader is answering "is this
-   mine?" — one error answers that, ten don't.
+3. **Log tail on every listed root**: the lines `--log-lines` retained, 2 KiB cap each. The first
+   root's is open; the rest sit in a collapsed `<details>`, so the comment still reads on a phone
+   and a reviewer can start diagnosing any failure without opening the job log. A tail that does
+   not fit the section budget is dropped; its root stays listed. The fence is longer than any
+   backtick run in the log, so a target's output cannot close it and render as markdown.
 4. Roots are themselves capped (10) with `…and N more root failures`.
 
 Without rule 1, this same moment renders 4,117 rows of `dependency failed` and the actual proto
