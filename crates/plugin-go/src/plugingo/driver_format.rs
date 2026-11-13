@@ -33,7 +33,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3Default;
 
-use crate::plugingo::driver_lint::staged_paths_in_group;
+use crate::plugingo::deps::{DepGroups, dep_origin};
 use crate::plugingo::listed;
 
 /// Dep group carrying the `heph-govet` binary (shared with lint; staged read-only).
@@ -75,13 +75,15 @@ pub fn format_sources_addr(pkg: &str) -> Addr {
 /// Locate the single staged `heph-govet` binary and the optional config path.
 fn govet_bin_and_config(
     req: &ManagedRunRequest<'_, '_>,
+    deps: &DepGroups,
 ) -> anyhow::Result<(String, HashMap<String, String>)> {
-    let bin = staged_paths_in_group(req, GOVET_TOOL_GROUP)
+    let bin = deps
+        .staged_paths(req, GOVET_TOOL_GROUP)?
         .into_iter()
         .next()
         .ok_or_else(|| anyhow::anyhow!("format: heph-govet tool not staged"))?;
     let mut env: HashMap<String, String> = HashMap::new();
-    if let Some(cfg) = staged_paths_in_group(req, "config").into_iter().next() {
+    if let Some(cfg) = deps.staged_paths(req, "config")?.into_iter().next() {
         env.insert("HEPH_GOVET_GOLANGCI_CONFIG".to_string(), cfg);
     }
     Ok((bin, env))
@@ -170,6 +172,9 @@ struct GoFormatDef {
     /// `plugingo::runner`: it reaches the cache key through the hashout of the
     /// input `parse` emits, exactly as a `hash_dep` does.
     runner: Option<hplugin::driver::TargetAddr>,
+    /// Deliberately absent from `Hash`: see [`DepGroups`].
+    #[serde(default)]
+    deps: DepGroups,
 }
 
 impl Hash for GoFormatDef {
@@ -211,7 +216,7 @@ fn parse_inputs(spec: &GoFormatSpec, pkg: &hmodel::htpkg::PkgBuf) -> anyhow::Res
                 r#ref: TargetAddr::parse(addr_str, pkg)
                     .with_context(|| format!("parse dep addr {addr_str}"))?,
                 mode: InputMode::Standard,
-                origin_id: format!("dep|{group}|{i}"),
+                origin_id: dep_origin(group, i),
                 annotations: annotations.clone(),
                 hashed: true,
                 runtime: true,
@@ -295,15 +300,16 @@ impl ManagedDriver for GoFormatDriver {
             }],
         }];
 
+        let def = GoFormatDef {
+            check: false,
+            runner,
+            deps: DepGroups::of(&spec.deps),
+        };
         let hash = {
             let mut h = DebugHasher::new(Xxh3Default::new(), || {
                 format!("go_format_{}", req.target_spec.addr.format())
             });
-            GoFormatDef {
-                check: false,
-                runner: None,
-            }
-            .hash(&mut h);
+            def.hash(&mut h);
             format!("{:x}", h.finish()).into_bytes()
         };
 
@@ -311,10 +317,7 @@ impl ManagedDriver for GoFormatDriver {
             target_def: TargetDef {
                 addr: req.target_spec.addr.clone(),
                 labels: req.target_spec.labels.clone(),
-                raw_def: Arc::new(GoFormatDef {
-                    check: false,
-                    runner: runner.clone(),
-                }),
+                raw_def: Arc::new(def),
                 inputs,
                 outputs,
                 cache: CacheConfig::on(true),
@@ -343,8 +346,8 @@ impl ManagedDriver for GoFormatDriver {
         let pkg_dir = &req.sandbox_pkg_dir;
         let def = req.request.target.def_de::<GoFormatDef>();
         let runner = super::runner::runner_ref(req.request.request_id, def.runner.as_ref());
-        let (bin, env) = govet_bin_and_config(&req)?;
-        let files = staged_paths_in_group(&req, "");
+        let (bin, env) = govet_bin_and_config(&req, &def.deps)?;
+        let files = def.deps.staged_paths(&req, "")?;
         if files.is_empty() {
             return Ok(ManagedRunResponse { artifacts: vec![] });
         }
@@ -419,15 +422,16 @@ impl ManagedDriver for GoFormatCheckDriver {
         )?;
         inputs.extend(runner_input);
 
+        let def = GoFormatDef {
+            check: true,
+            runner,
+            deps: DepGroups::of(&spec.deps),
+        };
         let hash = {
             let mut h = DebugHasher::new(Xxh3Default::new(), || {
                 format!("go_format_check_{}", req.target_spec.addr.format())
             });
-            GoFormatDef {
-                check: true,
-                runner: None,
-            }
-            .hash(&mut h);
+            def.hash(&mut h);
             format!("{:x}", h.finish()).into_bytes()
         };
 
@@ -435,10 +439,7 @@ impl ManagedDriver for GoFormatCheckDriver {
             target_def: TargetDef {
                 addr: req.target_spec.addr.clone(),
                 labels: req.target_spec.labels.clone(),
-                raw_def: Arc::new(GoFormatDef {
-                    check: true,
-                    runner: runner.clone(),
-                }),
+                raw_def: Arc::new(def),
                 inputs,
                 cache: CacheConfig::on(true),
                 hash,
@@ -466,8 +467,8 @@ impl ManagedDriver for GoFormatCheckDriver {
         let pkg_dir = &req.sandbox_pkg_dir;
         let def = req.request.target.def_de::<GoFormatDef>();
         let runner = super::runner::runner_ref(req.request.request_id, def.runner.as_ref());
-        let (bin, env) = govet_bin_and_config(&req)?;
-        let files = staged_paths_in_group(&req, "");
+        let (bin, env) = govet_bin_and_config(&req, &def.deps)?;
+        let files = def.deps.staged_paths(&req, "")?;
         if files.is_empty() {
             return Ok(ManagedRunResponse { artifacts: vec![] });
         }

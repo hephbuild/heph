@@ -330,7 +330,7 @@ impl ManagedDriver for GoGolistDriver {
                     r#ref: TargetAddr::parse(addr_str, &pkg)
                         .with_context(|| format!("parse dep addr {addr_str}"))?,
                     mode: InputMode::Standard,
-                    origin_id: format!("dep|{group}|{i}"),
+                    origin_id: crate::plugingo::deps::dep_origin(group, i),
                     annotations: annotations.clone(),
                     hashed: true,
                     runtime: true,
