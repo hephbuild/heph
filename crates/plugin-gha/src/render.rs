@@ -94,9 +94,12 @@ const MAX_ADDR_CHARS: usize = 128;
 const LIVE_RUNNING_ROWS: usize = 6;
 const LIVE_LOCK_ROWS: usize = 3;
 const LIVE_ROOT_ROWS: usize = 5;
-/// Log-tail lines shown live, for the first root only.
-const LIVE_LOG_LINES: usize = 5;
-const LIVE_LOG_BYTES: usize = 1024;
+/// Log-tail bytes shown live, per listed root. No line cap: the engine already
+/// applied `--log-lines`, and a second, smaller cap here is what left the comment
+/// showing five lines that rarely reached the error. Five roots at this cap use
+/// 10 KiB of the 16 KiB [`LIVE_SECTION_BUDGET`]; a root whose tail does not fit
+/// is still listed, without it.
+const LIVE_LOG_BYTES: usize = 2 * 1024;
 
 /// Final view: table sizes.
 const FINAL_SLOWEST_ROWS: usize = 20;
@@ -373,29 +376,38 @@ fn push_live_failures(b: &mut Budgeted, t: &Tally, c: &Counters) {
             .duration_ms
             .map(|d| format!(", after {}", fmt_duration(d)))
             .unwrap_or_default();
-        let mut section = format!(
+        let head = format!(
             "### `{}` — failed{}\n\n{}\n",
             addr_cell(&r.addr),
             dur,
             one_line(&r.message, MAX_MSG_CHARS)
         );
-        // Only the first root gets a log tail live: mid-build the reader is
-        // answering "is this mine?", and one error answers that where ten don't.
-        if i == 0
-            && let Some(tail) = r.log_tail.as_ref().and_then(live_log_tail)
-        {
-            section.push_str(&format!("\n```\n{tail}\n```\n"));
+        let mut tail_md = String::new();
+        // Every listed root carries its log tail: the message is an index, the
+        // log is what lets a reader start diagnosing from the PR. The first is
+        // open; the rest are collapsed so the comment still reads on a phone.
+        if let Some(tail) = r.log_tail.as_ref().and_then(live_log_tail) {
+            let block = code_block(&tail);
+            if i == 0 {
+                tail_md = format!("\n{block}");
+            } else {
+                tail_md = format!("\n<details><summary>Log</summary>\n\n{block}\n</details>\n");
+            }
         }
-        section.push_str(&format!("\nReproduce: `heph run {}`\n", addr_cell(&r.addr)));
+        let mut rest = format!("\nReproduce: `heph run {}`\n", addr_cell(&r.addr));
         if r.blocked > 0 {
-            section.push_str(&format!(
+            rest.push_str(&format!(
                 "**{} targets blocked** — {}\n",
                 fmt_count(r.blocked),
                 pkg_rollup(r, 3)
             ));
         }
-        section.push('\n');
-        if !b.push(&section) {
+        rest.push('\n');
+        // A root whose tail does not fit is still listed, without the tail: the
+        // failure itself matters more than its log.
+        if !b.push(&format!("{head}{tail_md}{rest}"))
+            && (tail_md.is_empty() || !b.push(&format!("{head}{rest}")))
+        {
             break;
         }
     }
@@ -407,37 +419,46 @@ fn push_live_failures(b: &mut Budgeted, t: &Tally, c: &Counters) {
     }
 }
 
-/// The last few lines of a failing target's log, bounded for the live view.
+/// A failing target's retained log tail, bounded for the live comment.
 ///
-/// Mid-build the reader is answering "is this mine?", which one error answers
-/// and ten don't — so this is deliberately shorter than the final view's tail,
-/// and only the first root gets one. The byte cap matters independently of the
-/// line cap: a single line of a minified bundle or a base64 blob can be
-/// megabytes on its own.
+/// Shorter than the final view's tail because up to [`LIVE_ROOT_ROWS`] of them
+/// share one comment section with every other heph step in the job. Bounded in
+/// bytes only, like [`final_log_tail`]: the engine already applied `--log-lines`.
 fn live_log_tail(tail: &hcore::events::LogTailData) -> Option<String> {
-    bounded_tail(&tail.text, LIVE_LOG_LINES, LIVE_LOG_BYTES)
+    bounded_tail(&tail.text, LIVE_LOG_BYTES)
+}
+
+/// `text` in a fenced code block that `text` cannot close.
+///
+/// The tail is whatever the target printed, and it lands in a public PR comment.
+/// With a fixed ```` ``` ```` fence, a log line of three backticks ends the block
+/// and the rest renders as markdown: headings, links, `@` mentions. A fence one
+/// backtick longer than the longest run in `text` cannot be closed from inside
+/// (CommonMark: a closing fence is at least as long as the opening one).
+fn code_block(text: &str) -> String {
+    let longest = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat(longest.saturating_add(1).max(3));
+    format!("{fence}\n{text}\n{fence}\n")
 }
 
 /// The full retained tail for the final report, bounded in bytes only — the
 /// engine already applied the user's `--log-lines`, so a line cap here would
 /// silently override their choice.
 fn final_log_tail(tail: &hcore::events::LogTailData) -> Option<String> {
-    bounded_tail(&tail.text, usize::MAX, FINAL_LOG_BYTES)
+    bounded_tail(&tail.text, FINAL_LOG_BYTES)
 }
 
-/// The last `max_lines` lines of `text`, in order, stopping before `max_bytes`.
+/// The last whole lines of `text`, in order, stopping before `max_bytes`.
 ///
-/// Both caps are load-bearing. A line cap alone does not bound the output: one
-/// line of a minified bundle, a base64 blob, or a stack trace with a huge inline
-/// value can be megabytes by itself. A byte cap alone would cut mid-line.
-fn bounded_tail(text: &str, max_lines: usize, max_bytes: usize) -> Option<String> {
-    let lines: Vec<&str> = text.lines().collect();
-    let start = lines.len().saturating_sub(max_lines);
+/// The byte cap is load-bearing: the engine caps the tail in lines, and one line
+/// of a minified bundle, a base64 blob, or a stack trace with a huge inline value
+/// can be megabytes by itself. Whole lines only, so nothing is cut mid-line.
+fn bounded_tail(text: &str, max_bytes: usize) -> Option<String> {
     let mut kept: Vec<&str> = Vec::new();
     let mut bytes = 0usize;
     // Walk backwards so the *end* of the log survives — that is where the error
     // is — then restore order.
-    for line in lines.get(start..).unwrap_or(&[]).iter().rev() {
+    for line in text.lines().rev() {
         let cost = line.len().saturating_add(1);
         if bytes.saturating_add(cost) > max_bytes {
             break;
@@ -764,7 +785,8 @@ fn push_final_failures(b: &mut Budgeted, t: &Tally, c: &Counters) {
         // an index, this is what actually says what went wrong. Bounded in bytes:
         // one line of a minified bundle can be megabytes on its own.
         if let Some(tail) = r.log_tail.as_ref().and_then(final_log_tail) {
-            s.push_str(&format!("```\n{tail}\n```\n\n"));
+            s.push_str(&code_block(&tail));
+            s.push('\n');
         }
         s.push_str(&format!("Reproduce: `heph run {}`\n", addr_cell(&r.addr)));
         if r.blocked > 0 {
@@ -1372,6 +1394,122 @@ mod tests {
         let plain = build(20_000, 1, 0);
         let md = render_live(&plain, &ctx("heph run //...", 9_000), COMMENT_LIMIT);
         assert!(!md.contains("Stopped at the first failure"), "{md}");
+    }
+
+    /// A tally with `n` root failures, root `i` carrying `tail(i)` as its log.
+    fn roots_with_tails(n: usize, tail: impl Fn(usize) -> String) -> Tally {
+        let mut t = build(100, 0, 0);
+        for i in 0..n {
+            t.apply(&ev(
+                1_000,
+                BuildEventKind::ResultEnd {
+                    timed_out: None,
+                    addr: format!("//root{i}:broken"),
+                    error: Some("target failed".into()),
+                    upstream_of: None,
+                    exit_status: Some("exit status: 1".into()),
+                    log_tail: Some(hcore::events::LogTailData {
+                        text: tail(i),
+                        start_line: 1,
+                    }),
+                },
+            ));
+        }
+        t
+    }
+
+    #[test]
+    fn live_comment_shows_every_listed_roots_log() {
+        // The comment is where a reviewer starts diagnosing. Before, only the
+        // first root carried a tail, and only its last five lines: the second
+        // root's error was a click into the job log away.
+        let t = roots_with_tails(3, |i| {
+            (0..10)
+                .map(|l| format!("root{i} line{l}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        });
+        let md = render_live(&t, &ctx("heph run //...", 9_000), LIVE_SECTION_BUDGET);
+        for i in 0..3 {
+            // All ten retained lines: `--log-lines` already chose how many.
+            assert!(md.contains(&format!("root{i} line0")), "root{i} head: {md}");
+            assert!(md.contains(&format!("root{i} line9")), "root{i} end: {md}");
+        }
+        // The first is open; the others collapse, so the comment reads on a phone.
+        let first = md.find("root0 line0").expect("first tail");
+        assert!(
+            !md.get(..first).unwrap_or_default().contains("<details>"),
+            "first root's log is open: {md}"
+        );
+        assert_eq!(
+            md.matches("<details><summary>Log</summary>").count(),
+            2,
+            "later roots' logs are collapsed: {md}"
+        );
+    }
+
+    #[test]
+    fn a_log_cannot_close_its_code_block() {
+        // The tail is whatever the target printed, rendered into a public PR
+        // comment. A line of backticks must not end the block and turn the rest
+        // of the log into markdown.
+        let hostile = "ok\n```\n# not a heading @someone\n````\nend".to_string();
+        let t = roots_with_tails(1, |_| hostile.clone());
+        for md in [
+            render_live(&t, &ctx("heph run //...", 9_000), LIVE_SECTION_BUDGET),
+            render_final(&t, &ctx("heph run //...", 9_000), SUMMARY_BUDGET),
+        ] {
+            let at = md.find(&hostile).expect("tail rendered verbatim");
+            let open = md
+                .get(..at)
+                .unwrap_or_default()
+                .lines()
+                .last()
+                .unwrap_or_default();
+            assert_eq!(open, "`````", "fence longer than any run in the log: {md}");
+            let after = md
+                .get(at.saturating_add(hostile.len())..)
+                .unwrap_or_default();
+            assert!(
+                after.starts_with("\n`````\n"),
+                "closed by the same fence: {md}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_root_whose_log_does_not_fit_is_still_listed() {
+        // Five roots at the live byte cap fill most of a section; under a tight
+        // budget the logs give way, never the failures themselves.
+        let t = roots_with_tails(5, |i| {
+            (0..400)
+                .map(|l| format!("root{i} {l:>40}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        });
+        let budget = 6 * 1024;
+        let md = render_live(&t, &ctx("heph run //...", 9_000), budget);
+        assert!(md.len() <= budget, "budget held: {}", md.len());
+        for i in 0..5 {
+            assert!(
+                md.contains(&format!("`//root{i}:broken`")),
+                "root{i} listed: {md}"
+            );
+        }
+        assert!(md.contains("root0 "), "the first root's log fits: {md}");
+    }
+
+    #[test]
+    fn the_closed_comment_keeps_the_logs() {
+        // The comment is re-rendered once more when the build ends; that last
+        // body is the one people read, and it must still carry the logs.
+        let mut t = roots_with_tails(2, |i| format!("error in root{i}"));
+        t.set_closed();
+        let md = render_live(&t, &ctx("heph run //...", 9_000), LIVE_SECTION_BUDGET);
+        assert!(
+            md.contains("error in root0") && md.contains("error in root1"),
+            "{md}"
+        );
     }
 
     /// Prints the rendered views for eyeballing against the mockups in
