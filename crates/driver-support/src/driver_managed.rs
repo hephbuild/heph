@@ -453,7 +453,7 @@ fn collect_outputs_inner(
             if !path.collect {
                 continue;
             }
-            add_path_to_tar(&mut tar, ws_dir, path, &output.group, stop)?;
+            add_path_to_tar(&mut tar, ws_dir, None, path, &output.group, stop)?;
         }
         let tarpath = pack_to_artifact_tar(sandbox_dir, hashin, &output.group, tar, stop)?;
         artifacts.push(outputartifact::OutputArtifact {
@@ -469,7 +469,7 @@ fn collect_outputs_inner(
     if !support_files.is_empty() {
         let mut tar = hartifactcontent::tar::TarPacker::new();
         for path in support_files {
-            add_path_to_tar(&mut tar, ws_dir, path, "support", stop)?;
+            add_path_to_tar(&mut tar, ws_dir, None, path, "support", stop)?;
         }
         let (tarpath, hashout) = pack_to_artifact_tar(sandbox_dir, hashin, "support", tar, stop)?;
         artifacts.push(outputartifact::OutputArtifact {
@@ -801,6 +801,7 @@ impl<W: Write> Write for HashingWriter<W> {
 fn add_path_to_tar(
     tar: &mut hartifactcontent::tar::TarPacker,
     ws_dir: &Path,
+    stage_dir: Option<&Path>,
     path: &path::Path,
     group_for_err: &str,
     stop: &dyn Fn() -> bool,
@@ -810,6 +811,10 @@ fn add_path_to_tar(
     }
     match &path.content {
         Content::FilePath(fp) => {
+            // Not read through a linked ancestor (hephbuild/heph#563), as a
+            // glob would not be; see `output_glob`.
+            crate::output_glob::check_declared_path(ws_dir, fp, stage_dir)
+                .with_context(|| format!("group={group_for_err}"))?;
             let source = ws_dir.join(fp);
             // A single-file output must resolve to a file/symlink. Without this
             // check a path that materialized as a directory is registered blindly
@@ -827,6 +832,8 @@ fn add_path_to_tar(
             tar.create_file(source.to_string_lossy().into_owned(), fp.clone());
         }
         Content::DirPath(dir) => {
+            crate::output_glob::check_declared_path(ws_dir, dir, stage_dir)
+                .with_context(|| format!("group={group_for_err}"))?;
             let dir_full = ws_dir.join(dir);
             // Symmetric to the FilePath guard: a directory output declared on a
             // path that materialized as a file would otherwise be single-walked
@@ -874,15 +881,18 @@ fn add_path_to_tar(
             }
         }
         Content::Glob(pattern) => {
-            let full_pattern = ws_dir.join(pattern).to_string_lossy().into_owned();
-            for matched in glob::glob(&full_pattern)
-                .with_context(|| format!("compile output glob {full_pattern:?}"))?
+            // Not `glob::glob`: it follows directory symlinks (hephbuild/heph#563).
+            // `OutputGlob` is the same walk, refusing a link it would descend.
+            for matched in crate::output_glob::OutputGlob::new(ws_dir, pattern, stage_dir)
+                .with_context(|| {
+                    format!("compile output glob {pattern:?} (group={group_for_err})")
+                })?
             {
                 if stop() {
                     return Err(crate::stop::cancelled());
                 }
-                let matched =
-                    matched.with_context(|| format!("glob entry from {full_pattern:?}"))?;
+                let matched = matched
+                    .with_context(|| format!("output glob {pattern:?} (group={group_for_err})"))?;
                 let md = fs::symlink_metadata(&matched).with_context(|| {
                     format!("lstat glob match {:?} (group={})", matched, group_for_err)
                 })?;
@@ -1173,7 +1183,7 @@ mod source_map_tests {
         fs::create_dir_all(dir.path().join("out")).expect("mkdir");
         let p = out_path(path::Content::FilePath("out".to_string()));
         let mut tar = TarPacker::new();
-        let err = add_path_to_tar(&mut tar, dir.path(), &p, "bin", &|| false).unwrap_err();
+        let err = add_path_to_tar(&mut tar, dir.path(), None, &p, "bin", &|| false).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("is a directory"), "got: {msg}");
         assert!(
@@ -1190,7 +1200,7 @@ mod source_map_tests {
         fs::write(dir.path().join("out"), b"x").expect("write");
         let p = out_path(path::Content::DirPath("out".to_string()));
         let mut tar = TarPacker::new();
-        let err = add_path_to_tar(&mut tar, dir.path(), &p, "data", &|| false).unwrap_err();
+        let err = add_path_to_tar(&mut tar, dir.path(), None, &p, "data", &|| false).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("is a file"), "got: {msg}");
         assert!(
@@ -1219,7 +1229,7 @@ mod source_map_tests {
 
         let p = out_path(path::Content::DirPath("out".to_string()));
         let mut tar = TarPacker::new();
-        add_path_to_tar(&mut tar, dir.path(), &p, "data", &|| false).expect("add dir output");
+        add_path_to_tar(&mut tar, dir.path(), None, &p, "data", &|| false).expect("add dir output");
         let mut buf = Vec::new();
         tar.pack(&mut buf).expect("pack");
 
