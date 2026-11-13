@@ -1122,6 +1122,72 @@ struct CodegenWrite<'a> {
     snapshot: Option<&'a hwalk::codegen_index::Snapshot>,
 }
 
+/// Runs `create`, which makes the entry at `dest`, after creating `dest`'s
+/// parent directory. A write-back removes the directories its deletions left
+/// empty, and with overlapping `copy` outputs another target's write-back can
+/// remove this parent between the two steps: `create` then finds no
+/// directory, so the parent is created again and `create` retried once.
+fn create_in_dir(
+    dest: &std::path::Path,
+    mut create: impl FnMut() -> std::io::Result<()>,
+) -> anyhow::Result<()> {
+    let mkdir = || -> anyhow::Result<()> {
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create parent dir for {dest:?}"))?;
+        }
+        Ok(())
+    };
+    mkdir()?;
+    match create() {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            mkdir()?;
+            Ok(create()?)
+        }
+        r => Ok(r?),
+    }
+}
+
+#[cfg(test)]
+mod create_in_dir_tests {
+    use super::create_in_dir;
+
+    /// The parent vanishing between its creation and the write (another
+    /// write-back removing it as emptied) costs one retry, not the build.
+    #[test]
+    fn parent_removed_before_the_write_is_recreated() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("nm/pkg/index.js");
+        let mut raced = false;
+        create_in_dir(&dest, || {
+            if !raced {
+                raced = true;
+                std::fs::remove_dir(dest.parent().expect("parent"))?;
+            }
+            std::fs::write(&dest, "x")
+        })
+        .expect("retried");
+        assert_eq!(std::fs::read_to_string(&dest).expect("written"), "x");
+    }
+
+    /// A second miss is an error, not a loop.
+    #[test]
+    fn parent_removed_twice_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("nm/pkg/index.js");
+        let err = create_in_dir(&dest, || {
+            std::fs::remove_dir(dest.parent().expect("parent"))?;
+            std::fs::write(&dest, "x")
+        })
+        .expect_err("gives up");
+        assert!(
+            err.downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+            "{err:#}"
+        );
+    }
+}
+
 /// The in-place guard (spec: Readers): an `in_place` target leaves a path
 /// the codegen index records as another target's (`Generated` or
 /// `Modified`) to its owner, and refuses one recorded for itself — a
@@ -4165,6 +4231,9 @@ impl Engine {
         for path in &report.dropped {
             tracing::debug!(addr = %addr, path = %String::from_utf8_lossy(path), "kept a codegen file the target no longer produces");
         }
+        for dir in &report.removed_dirs {
+            tracing::debug!(addr = %addr, dir = %String::from_utf8_lossy(dir), "removed a directory the deleted codegen outputs left empty");
+        }
         for msg in write_back_hints(&addr, outside_section, no_section_hint) {
             tracing::warn!(addr = %addr, files = outside_section, "{msg}");
         }
@@ -4231,9 +4300,6 @@ impl Engine {
     /// This walks every generated file, reads its bytes out of the cache, reads the
     /// tree file back and (when frozen) diffs the two — the heaviest synchronous
     /// read on the result path, and one that parks on any queued sqlite write to
-        for dir in &report.removed_dirs {
-            tracing::debug!(addr = %addr, dir = %String::from_utf8_lossy(dir), "removed a directory the deleted codegen outputs left empty");
-        }
     /// the artifact it is walking. It does not belong on a runtime worker, so it is
     /// synchronous and called only through `hcore::blocking::run`.
     ///
@@ -4416,12 +4482,7 @@ impl Engine {
                             let unchanged =
                                 matches!(std::fs::read(&dest), Ok(old) if old == new_bytes);
                             if !unchanged {
-                                if let Some(parent) = dest.parent() {
-                                    std::fs::create_dir_all(parent).with_context(|| {
-                                        format!("create parent dir for {:?}", dest)
-                                    })?;
-                                }
-                                std::fs::write(&dest, &new_bytes)
+                                create_in_dir(&dest, || std::fs::write(&dest, &new_bytes))
                                     .with_context(|| format!("write codegen file {:?}", dest))?;
                                 moved = true;
                             }
@@ -4479,23 +4540,17 @@ impl Engine {
                                     Err(_) => true,
                                 };
                                 if recreate {
-                                    if let Some(parent) = dest.parent() {
-                                        std::fs::create_dir_all(parent).with_context(|| {
-                                            format!("create parent dir for {:?}", dest)
-                                        })?;
-                                    }
-                                    match std::fs::remove_file(&dest) {
-                                        Ok(()) => {}
-                                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                                        Err(e) => {
-                                            return Err(e).with_context(|| {
-                                                format!("remove {:?} before symlink", dest)
-                                            });
+                                    create_in_dir(&dest, || {
+                                        match std::fs::remove_file(&dest) {
+                                            Ok(()) => {}
+                                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                                            Err(e) => return Err(e),
                                         }
-                                    }
-                                    std::os::unix::fs::symlink(&target, &dest).with_context(
-                                        || format!("symlink {:?} -> {:?}", dest, target),
-                                    )?;
+                                        std::os::unix::fs::symlink(&target, &dest)
+                                    })
+                                    .with_context(|| {
+                                        format!("symlink {:?} -> {:?}", dest, target)
+                                    })?;
                                     // The bytes behind the link are unknown
                                     // here; `None` refuses the fixpoint.
                                     written.insert(path, None);
