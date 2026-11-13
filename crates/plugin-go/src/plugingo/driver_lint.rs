@@ -1135,7 +1135,9 @@ impl ManagedDriver for GoLintFixDriver {
                         };
                         TPath {
                             content: Content::FilePath(full_path),
-                            codegen_tree: CodegenMode::InPlace,
+                            codegen_tree: CodegenMode::InPlace {
+                                write_on_failure: true,
+                            },
                             collect: true,
                         }
                     })
@@ -2288,7 +2290,12 @@ mod tests {
             .flat_map(|o| &o.paths)
             .next()
             .expect("one output path");
-        assert_eq!(path.codegen_tree, CodegenMode::InPlace);
+        assert_eq!(
+            path.codegen_tree,
+            CodegenMode::InPlace {
+                write_on_failure: true
+            }
+        );
         assert!(path.collect);
         match &path.content {
             Content::FilePath(p) => assert_eq!(p, "mylib/a.go", "output is pkg-relative"),

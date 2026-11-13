@@ -4,7 +4,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::task::{Context, Poll, Waker};
 
 /// A manual, std-only implementation of a cancellation signal.
@@ -19,8 +19,19 @@ pub struct StdCancellationToken {
     inner: Arc<SharedState>,
 }
 
+/// [`SharedState::state`]: not cancelled.
+const LIVE: u8 = 0;
+/// [`SharedState::state`]: cancelled ([`StdCancellationToken::cancel`]).
+const CANCELLED: u8 = 1;
+/// [`SharedState::state`]: cancelled because its run timed out
+/// ([`StdCancellationToken::cancel_timed_out`]).
+const TIMED_OUT: u8 = 2;
+
 struct SharedState {
-    cancelled: AtomicBool,
+    /// [`LIVE`], [`CANCELLED`] or [`TIMED_OUT`]. One atomic, so the reason is
+    /// published with the cancel itself: whoever sees the token cancelled sees
+    /// why. It leaves [`LIVE`] once, so the first cancel's reason sticks.
+    state: AtomicU8,
     // One waker per outstanding `Cancelled` future, keyed by a unique id so
     // concurrent waiters don't clobber each other. A single `Option<Waker>`
     // slot would only ever wake the last registered waiter — the bug this
@@ -39,7 +50,7 @@ impl StdCancellationToken {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(SharedState {
-                cancelled: AtomicBool::new(false),
+                state: AtomicU8::new(LIVE),
                 wakers: Mutex::new(HashMap::new()),
                 next_id: AtomicU64::new(0),
             }),
@@ -47,11 +58,26 @@ impl StdCancellationToken {
     }
 
     pub fn cancel(&self) {
-        // Set the flag BEFORE taking the waker lock. `Cancelled::poll`
-        // re-checks the flag while holding the same lock, so any waiter that
-        // registers concurrently with `cancel` either sees the flag (→ Ready)
-        // or is already in the map and gets woken below. No lost wakeups.
-        self.inner.cancelled.store(true, Ordering::SeqCst);
+        self.cancel_with(CANCELLED);
+    }
+
+    /// Cancel because the run this token was handed to outlasted its
+    /// `timeout`: [`timed_out`](Cancellable::timed_out) then reads `true`,
+    /// unless the token was already cancelled.
+    pub fn cancel_timed_out(&self) {
+        self.cancel_with(TIMED_OUT);
+    }
+
+    fn cancel_with(&self, reason: u8) {
+        // Set the state BEFORE taking the waker lock. `Cancelled::poll`
+        // re-checks it while holding the same lock, so any waiter that
+        // registers concurrently with `cancel` either sees it (→ Ready) or is
+        // already in the map and gets woken below. No lost wakeups. Only from
+        // LIVE: an earlier cancel's reason stands.
+        let _already =
+            self.inner
+                .state
+                .compare_exchange(LIVE, reason, Ordering::SeqCst, Ordering::SeqCst);
 
         // Wake every outstanding waiter. The mutex is never poisoned: the only
         // critical sections move `Waker`s around, no panics possible.
@@ -67,7 +93,11 @@ impl StdCancellationToken {
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.inner.cancelled.load(Ordering::SeqCst)
+        self.inner.state.load(Ordering::SeqCst) != LIVE
+    }
+
+    pub fn timed_out(&self) -> bool {
+        self.inner.state.load(Ordering::SeqCst) == TIMED_OUT
     }
 
     /// Token identity: `true` iff `other` is a clone of `self` (they share the
@@ -92,7 +122,7 @@ impl Future for Cancelled {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        if this.state.cancelled.load(Ordering::SeqCst) {
+        if this.state.state.load(Ordering::SeqCst) != LIVE {
             return Poll::Ready(());
         }
 
@@ -105,7 +135,7 @@ impl Future for Cancelled {
         // Re-check under the lock: if `cancel` ran after our load above, it has
         // already set the flag (it stores before locking), so we observe it
         // here and avoid registering a waker that would never be drained.
-        if this.state.cancelled.load(Ordering::SeqCst) {
+        if this.state.state.load(Ordering::SeqCst) != LIVE {
             return Poll::Ready(());
         }
         let id = *this
@@ -130,6 +160,10 @@ impl Drop for Cancelled {
 impl Cancellable for StdCancellationToken {
     fn is_cancelled(&self) -> bool {
         self.is_cancelled()
+    }
+
+    fn timed_out(&self) -> bool {
+        self.timed_out()
     }
 
     fn cancelled(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
@@ -187,6 +221,27 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), token.cancelled())
             .await
             .expect("already-cancelled token must resolve immediately");
+    }
+
+    /// The first cancel's reason sticks, on every clone; a timed-out token is
+    /// cancelled, wakes its waiters, and stays timed out when cancelled again.
+    #[tokio::test]
+    async fn the_first_cancel_decides_whether_it_timed_out() {
+        let timed = StdCancellationToken::new();
+        let waiter = timed.clone();
+        assert!(!timed.timed_out());
+        timed.cancel_timed_out();
+        tokio::time::timeout(Duration::from_secs(1), Cancellable::cancelled(&waiter))
+            .await
+            .expect("a timed-out token wakes its waiters");
+        timed.cancel();
+        assert!(waiter.is_cancelled() && waiter.timed_out());
+        assert!(Cancellable::timed_out(&*timed.clone_arc()));
+
+        let plain = StdCancellationToken::new();
+        plain.cancel();
+        plain.cancel_timed_out();
+        assert!(plain.is_cancelled() && !plain.timed_out());
     }
 
     #[test]

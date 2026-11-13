@@ -1,5 +1,6 @@
 use crate::driver::outputartifact::{
-    Content as OaContent, ContentFile, ContentRaw, OutputArtifact, Type as ArtifactType,
+    Content as OaContent, ContentFile, ContentPath, ContentRaw, OutputArtifact,
+    Type as ArtifactType,
 };
 use hmodel::htaddr::Addr;
 use std::fmt;
@@ -408,21 +409,26 @@ pub fn with_failure_artifacts(err: anyhow::Error, artifacts: Vec<OutputArtifact>
     if artifacts.is_empty() {
         return err;
     }
-    let mut merged = artifacts;
-    if let Some(prev) = failure_artifacts(&err) {
-        let kept: Vec<OutputArtifact> = prev
-            .0
-            .iter()
-            .filter(|p| {
-                !merged
-                    .iter()
-                    .any(|m| m.group == p.group && m.name == p.name)
-            })
-            .cloned()
-            .collect();
-        merged.extend(kept);
-    }
+    let merged = merge_artifacts(artifacts, failure_artifacts(&err).map(|p| p.0.as_slice()));
     err.context(FailureArtifacts(merged))
+}
+
+/// `new`, then each of `prev` whose path (`group` and `name`) no artifact in
+/// `new` names: the outermost attachment is authoritative.
+fn merge_artifacts(
+    mut new: Vec<OutputArtifact>,
+    prev: Option<&[OutputArtifact]>,
+) -> Vec<OutputArtifact> {
+    let Some(prev) = prev else {
+        return new;
+    };
+    let kept: Vec<OutputArtifact> = prev
+        .iter()
+        .filter(|p| !new.iter().any(|m| m.group == p.group && m.name == p.name))
+        .cloned()
+        .collect();
+    new.extend(kept);
+    new
 }
 
 /// The outermost [`FailureArtifacts`] on `err`'s chain, through memoizer
@@ -431,12 +437,95 @@ pub fn failure_artifacts(err: &anyhow::Error) -> Option<&FailureArtifacts> {
     hcore::hmemoizer::downcast_chain_ref::<FailureArtifacts>(err)
 }
 
+/// The fixes a failed `in_place` run left behind, for the engine to write back
+/// over the tree while the target still fails — riding the error as a context
+/// beside, never inside, [`FailureArtifacts`].
+///
+/// Its own context rather than another artifact type, so nothing can mistake
+/// a fix for the diagnostics, and neither can reach a cache manifest: what a
+/// failed run produced is never cached. Data, not a cause: its `Display` is
+/// empty, like [`FailureArtifacts`]'s. Attach it with
+/// [`with_failure_write_back`] and read it with [`failure_write_back`].
+pub struct FailureWriteBack(pub Vec<OutputArtifact>);
+
+impl fmt::Debug for FailureWriteBack {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list()
+            .entries(
+                self.0
+                    .iter()
+                    .map(|a| (a.group.as_str(), a.name.as_str(), &a.r#type)),
+            )
+            .finish()
+    }
+}
+
+impl fmt::Display for FailureWriteBack {
+    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Ok(())
+    }
+}
+
+impl std::error::Error for FailureWriteBack {}
+
+/// Attach `artifacts` to `err` as a [`FailureWriteBack`] context, merged with
+/// the ones already on the chain exactly as [`with_failure_artifacts`] merges:
+/// a new artifact replaces one with the same `group` and `name`, the rest are
+/// kept after the new ones. Nothing to attach adds no frame.
+pub fn with_failure_write_back(
+    err: anyhow::Error,
+    artifacts: Vec<OutputArtifact>,
+) -> anyhow::Error {
+    if artifacts.is_empty() {
+        return err;
+    }
+    let merged = merge_artifacts(artifacts, failure_write_back(&err).map(|p| p.0.as_slice()));
+    err.context(FailureWriteBack(merged))
+}
+
+/// The outermost [`FailureWriteBack`] on `err`'s chain, through memoizer
+/// wrappers too — which, by [`with_failure_write_back`]'s merge, holds them all.
+pub fn failure_write_back(err: &anyhow::Error) -> Option<&FailureWriteBack> {
+    hcore::hmemoizer::downcast_chain_ref::<FailureWriteBack>(err)
+}
+
 /// The failure's `Log` artifact, if it carries one.
 pub fn failure_log(err: &anyhow::Error) -> Option<&OutputArtifact> {
     failure_artifacts(err)?
         .0
         .iter()
         .find(|a| a.r#type == ArtifactType::Log)
+}
+
+/// The name of the [`FailureArtifacts`] entry that carries a failed run's
+/// `failure_out` matches: a tar packed in the sandbox, its members
+/// workspace-relative paths.
+pub const FAILURE_OUT_NAME: &str = "failure_out";
+
+/// The [`FailureArtifacts`] entry for the `failure_out` tar at `tar_path`:
+/// an `Output` artifact named [`FAILURE_OUT_NAME`] whose content is the tar,
+/// owned (the engine unpacks it into the failure slot and removes it). No new
+/// artifact type and no new wire kind — an `OutputArtifact` with `TarPath`
+/// content already crosses the plugin ABI on a `RunFailure`, and only
+/// [`failure_out_tar`] reads it back.
+pub fn failure_out_artifact(tar_path: String, hashout: String) -> OutputArtifact {
+    OutputArtifact {
+        group: String::new(),
+        name: FAILURE_OUT_NAME.to_string(),
+        r#type: ArtifactType::Output,
+        content: OaContent::TarPath(ContentPath::owned(tar_path)),
+        hashout,
+    }
+}
+
+/// The `failure_out` tar the failure carries, if any (see
+/// [`failure_out_artifact`]).
+pub fn failure_out_tar(err: &anyhow::Error) -> Option<&OutputArtifact> {
+    failure_artifacts(err)?.0.iter().find(|a| {
+        a.r#type == ArtifactType::Output
+            && a.name == FAILURE_OUT_NAME
+            && matches!(a.content, OaContent::TarPath(_))
+    })
 }
 
 impl fmt::Display for RemoteProcessFailed {
@@ -480,7 +569,49 @@ pub struct TargetFailure {
     /// failure slot (open, with its path for the box's `full log:` footer), or
     /// the tail in memory when no copy is kept.
     pub log: Option<FailureLog>,
+    /// The `out/` directory of the target's failure slot, when the failed run
+    /// kept `failure_out` matches there: what the box prints as `outputs:`.
+    pub outputs: Option<std::path::PathBuf>,
+    /// What the `in_place` write-back on failure did, for a target with a
+    /// `write_on_failure` output that failed with a process exit: the fixes
+    /// it wrote, or why it wrote none. `None` for every other failure.
+    pub fixes: Option<FailureFixes>,
     pub source: std::sync::Arc<anyhow::Error>,
+}
+
+/// What a failed `in_place` run's write-back did to the tree (D20, D21).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FailureFixes {
+    /// The fixes written back over the tree while the target still failed.
+    Written {
+        /// The workspace root the fixes were written under: what `paths` are
+        /// relative to, and where the box's restore hint runs git.
+        root: std::path::PathBuf,
+        /// Every path written, workspace-relative, sorted. Empty when the
+        /// run's fixes matched the tree already.
+        paths: Vec<String>,
+        /// The slot's `fixes.txt` listing `paths`, one per line, when it was
+        /// kept: the full list, past the box's truncation.
+        list: Option<std::path::PathBuf>,
+    },
+    /// Nothing was written, and why.
+    NotWritten(FixesNotWritten),
+}
+
+/// Why a failed `in_place` run wrote nothing back (D20).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FixesNotWritten {
+    /// The run was killed by a signal: a fixer cut off mid-write.
+    Signal(i32),
+    /// The run exited 128 or above, a shell's report of a killed child
+    /// (137 for an OOM kill, 143 for a timeout).
+    HighExit(i32),
+    /// An `in_place` source moved while the run read it (I5): writing would
+    /// discard the newer bytes. A guard that could not run at all is not
+    /// this; it is reported as a failed write on the error instead.
+    MovedSource,
+    /// `--frozen`: the run verifies the tree, it never writes it.
+    Frozen,
 }
 
 impl TargetFailure {
@@ -489,13 +620,27 @@ impl TargetFailure {
             addr,
             log_tail,
             log: None,
+            outputs: None,
+            fixes: None,
             source: std::sync::Arc::new(source),
         }
+    }
+
+    /// The same failure with what its `in_place` write-back did.
+    pub fn with_fixes(mut self, fixes: Option<FailureFixes>) -> Self {
+        self.fixes = fixes;
+        self
     }
 
     /// The same failure with the log its tail came from.
     pub fn with_log(mut self, log: Option<FailureLog>) -> Self {
         self.log = log;
+        self
+    }
+
+    /// The same failure with the slot's `out/` directory, when one was kept.
+    pub fn with_outputs(mut self, outputs: Option<std::path::PathBuf>) -> Self {
+        self.outputs = outputs;
         self
     }
 }
@@ -887,6 +1032,52 @@ mod tests {
         // Nothing to attach adds no frame.
         let untouched = with_failure_artifacts(anyhow::anyhow!("plain"), vec![]);
         assert!(failure_artifacts(&untouched).is_none());
+    }
+
+    /// D6: a `FailureWriteBack` frame renders as nothing, like
+    /// `FailureArtifacts`; it is found through contexts and a memoizer wrapper,
+    /// merges like `FailureArtifacts`, and never reaches `failure_artifacts` or
+    /// `failure_log` — a fix is not a diagnostic, and the log stays the log.
+    #[test]
+    fn failure_write_back_is_its_own_silent_context() {
+        let failed = with_failure_artifacts(
+            anyhow::Error::new(ProcessFailed::new("exit status: 1", Some(Exit::Code(1)))),
+            vec![raw("log.txt", "the log")],
+        );
+        let inner = with_failure_write_back(failed, vec![raw("a.go", "inner"), raw("b.go", "b")])
+            .context("go fmt failed");
+        let outer = with_failure_write_back(inner, vec![raw("a.go", "outer")]).context("run");
+        let want = "run: go fmt failed: process exited with status: exit status: 1";
+        assert_eq!(hcore::hmemoizer::chain_message(&outer), want);
+
+        let arc = std::sync::Arc::new(outer);
+        let shared =
+            hcore::hmemoizer::unwrap_arc_err(std::sync::Arc::clone(&arc)).context("execute //p:t");
+        assert_eq!(
+            hcore::hmemoizer::chain_message(&shared),
+            format!("execute //p:t: {want}")
+        );
+
+        let wb = failure_write_back(&shared).expect("found");
+        let names: Vec<&str> = wb.0.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["a.go", "b.go"]);
+        assert_eq!(data(&wb.0[0]), b"outer");
+
+        // The diagnostics are untouched by the write-back beside them.
+        let fa = failure_artifacts(&shared).expect("diagnostics");
+        let names: Vec<&str> = fa.0.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["log.txt"]);
+        assert_eq!(data(failure_log(&shared).expect("log")), b"the log");
+
+        // A write-back alone is no log, even an artifact typed `Log` (all of
+        // `raw`'s are): the context, not the type, tells them apart. Nothing
+        // to attach adds no frame.
+        let only_fixes = with_failure_write_back(anyhow::anyhow!("boom"), vec![raw("a.go", "x")]);
+        assert_eq!(hcore::hmemoizer::chain_message(&only_fixes), "boom");
+        assert!(failure_log(&only_fixes).is_none());
+        assert!(failure_artifacts(&only_fixes).is_none());
+        let untouched = with_failure_write_back(anyhow::anyhow!("plain"), vec![]);
+        assert!(failure_write_back(&untouched).is_none());
     }
 
     /// E5: the status is data next to an unchanged message.

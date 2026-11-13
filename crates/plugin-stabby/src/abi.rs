@@ -317,9 +317,16 @@ pub trait StableHook {
 /// cancellation token it handed the provider/driver — so a long `get` or a running
 /// subprocess (`run`) stops, exactly as for an in-process target. `request_id` is
 /// the id carried in each request message; it must be unique per in-flight call.
+///
+/// `cancel_timed_out(cancel_key)` (ABI 0.21.0) is the same cancel for a run
+/// the host stopped because it outlasted its `timeout`: the plugin cancels
+/// that run's token as timed out, so the driver's
+/// `Cancellable::timed_out` reads what the host's did. Only by a run's
+/// `ManagedRunRequest.cancel_key`; anything else is a plain `cancel`.
 #[stabby::stabby]
 pub trait StableCancel {
     extern "C" fn cancel(&self, request_id: SString);
+    extern "C" fn cancel_timed_out(&self, cancel_key: SString);
 }
 
 /// Owned ABI-stable handles to a loaded plugin's components. Each composes

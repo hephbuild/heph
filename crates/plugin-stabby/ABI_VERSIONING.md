@@ -12,7 +12,7 @@ in order:
    reads the same whatever layout either side has. The host reads it before
    calling anything else in the plugin and accepts exactly the versions
    matching the caret requirement `^MIN_PLUGIN_ABI` (`crates/plugin-abi/src/lib.rs`;
-   pre-1.0, `^0.20.0` = `>=0.20.0, <0.21.0`), compared as semver. A plugin
+   pre-1.0, `^0.21.0` = `>=0.21.0, <0.22.0`), compared as semver. A plugin
    without the symbol predates 0.17.0 and is refused the same way. A plugin
    from a **later minor** is unsupported and refused: the host cannot know
    what that break changed. A later *patch* loads.
@@ -227,6 +227,33 @@ skipped in silence.
 
 ## History of breaks
 
+- **0.21.0** (break) — outputs from failed targets. `CODEGEN_MODE_IN_PLACE`
+  (3) changes meaning: it now also asks the host to write back what a run that
+  exited with a code from 1 to 127 left behind (`InPlace { write_on_failure:
+  true }`), and the appended `CODEGEN_MODE_IN_PLACE_ON_SUCCESS` (4) is what 3
+  meant before. `TargetDef.failure_outputs` (14, `FailureOutput`s of
+  `PathContent`) declares what a failed run keeps for its diagnosis, never an
+  output and never hashed. `RunFailure.write_back` (5, `OutputArtifactRef`s)
+  carries a failed `in_place` run's fixes as the host's `FailureWriteBack`
+  context, beside and never inside its `artifacts`, decoded as leniently. Both
+  new fields decode empty when absent, and an unknown codegen value stays a
+  decode error, never read as a tree write. A 0.20 plugin's `IN_PLACE` never
+  asked for a write-back on failure, so `MIN_PLUGIN_ABI` rises to 0.21.0:
+  every plugin must be rebuilt. It is a Rust source break as well:
+  `CodegenMode::InPlace` became the struct variant `InPlace { write_on_failure }`
+  and `CodegenMode` no longer derives `SpecEnum`, so a plugin that matched
+  `InPlace` or parsed the mode through `SpecEnum` must change its code, not
+  just rebuild.
+
+  A timed-out run says so across the seam. `StableCancel` gains
+  `cancel_timed_out(cancel_key)`, appended after `cancel`: the host sends it
+  instead of `cancel` for a run its `timeout` stopped, and the plugin cancels
+  that run's token as timed out, so the driver's `Cancellable::timed_out` reads
+  what the host's token does (a request cancel stays `cancel`). An id that is
+  not a cancel key is a plain cancel. This is a vtable change, which the
+  0.21.0 rebuild already covers; no wire message changes. `Cancellable` gains
+  the required `timed_out()` method, a Rust source break for a plugin that
+  implements `Cancellable` itself.
 - **0.20.0** (break) — `ParamType.literal` (6, `string`), a member of the
   `kind` oneof: exactly one string (`ParamType::Literal`). A closed set is a
   `union` of literals, so a cdylib driver's `workdir`-style field reaches the

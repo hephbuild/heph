@@ -150,7 +150,7 @@ impl ManagedDriverFuse {
         let target = req.target;
         let hashin = req.hashin;
 
-        let mut res = invoke_inner(
+        let invoked = invoke_inner(
             &**self.driver,
             req,
             ctoken,
@@ -161,7 +161,45 @@ impl ManagedDriverFuse {
             inputs,
             &self.shell_fallback,
         )
-        .await?;
+        .await;
+        let mut res = match invoked {
+            Ok(res) => res,
+            // Read through the mount while the slot guards still hold the
+            // inputs; packed under the *plain* sandbox dir, a real directory
+            // that outlives the slot, for the engine to unpack into the
+            // failure slot.
+            Err(err) => {
+                // A FUSE run writes nothing under the plain dir, so it may not
+                // exist yet; the packs create only their own directory under
+                // it (never a removed sandbox), so it is made here, by the run
+                // itself, never by a job that could outlive it. A failure here
+                // surfaces as the pack's own error, with its path.
+                drop(fs::create_dir_all(&plain_sandbox_dir));
+                let err = hdriver_support::failure_out::keep_failure_write_back(
+                    err,
+                    target,
+                    hashin,
+                    shell,
+                    ctoken,
+                    &ws_dir,
+                    &plain_sandbox_dir,
+                    // FUSE shows inputs as real directories: no stage links.
+                    None,
+                )
+                .await;
+                return Err(hdriver_support::failure_out::keep_failure_outputs(
+                    err,
+                    &target.failure_outputs,
+                    hashin,
+                    shell,
+                    ctoken,
+                    &ws_dir,
+                    &plain_sandbox_dir,
+                    &[],
+                )
+                .await);
+            }
+        };
 
         // Type-erase the slot guards into the contract's opaque `SandboxGuard`
         // so `hplugin` need not depend on `sandboxfuse`; the engine only holds
@@ -379,6 +417,154 @@ mod tests {
             drop(slot);
             Ok(Some(Box::new(std::io::Cursor::new(self.bytes.clone()))))
         }
+    }
+
+    /// Writes `report.txt` into its package dir and exits 1.
+    struct FailsWithReport;
+
+    #[async_trait::async_trait]
+    impl hdriver_support::driver_managed::ManagedDriver for FailsWithReport {
+        fn config(
+            &self,
+            _: hplugin::driver::ConfigRequest,
+        ) -> anyhow::Result<hplugin::driver::ConfigResponse> {
+            Ok(hplugin::driver::ConfigResponse {
+                name: "fails".to_string(),
+            })
+        }
+        fn schema(&self) -> hplugin::driver::DriverSchema {
+            hplugin::driver::DriverSchema::default()
+        }
+        async fn parse(
+            &self,
+            _: hplugin::driver::ParseRequest,
+            _: &(dyn Cancellable + Send + Sync),
+        ) -> anyhow::Result<hplugin::driver::ParseResponse> {
+            anyhow::bail!("not parsed in this test")
+        }
+        async fn apply_transitive(
+            &self,
+            req: hplugin::driver::ApplyTransitiveRequest,
+            _: &(dyn Cancellable + Send + Sync),
+        ) -> anyhow::Result<hplugin::driver::ApplyTransitiveResponse> {
+            Ok(hplugin::driver::ApplyTransitiveResponse {
+                target_def: req.target_def,
+            })
+        }
+        async fn run<'a, 'io>(
+            &self,
+            req: hdriver_support::driver_managed::ManagedRunRequest<'a, 'io>,
+            _: &(dyn Cancellable + Send + Sync),
+        ) -> anyhow::Result<hdriver_support::driver_managed::ManagedRunResponse> {
+            fs::write(req.sandbox_pkg_dir.join("report.txt"), "report")?;
+            fs::write(req.sandbox_pkg_dir.join("fix.txt"), "fix")?;
+            Err(anyhow::Error::new(hplugin::error::ProcessFailed::new(
+                "exit status: 1",
+                Some(hplugin::error::Exit::Code(1)),
+            )))
+        }
+    }
+
+    /// The FUSE runner keeps `failure_out` on a process exit exactly as the OS
+    /// one does, read from the redirected workspace while the run's slot is
+    /// live, and staged under the **plain** sandbox dir — a real directory the
+    /// engine's sandbox roots name, which outlives the slot.
+    ///
+    /// Needs no FUSE mount: without one the redirected `lower` is a plain
+    /// directory, and this is the runner's own code path either way. No
+    /// `crates/e2e` test mounts FUSE, so this is that runner's coverage.
+    #[tokio::test]
+    async fn failure_out_is_staged_under_the_plain_sandbox() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let home = dir.path().join("home");
+        let plain = home.join("sandbox/app/__target_t");
+        let driver: Box<dyn hdriver_support::driver_managed::ManagedDriver> =
+            Box::new(FailsWithReport);
+        let fuse = ManagedDriverFuse {
+            driver: Arc::new(driver),
+            shell_fallback: Arc::new(ShellFallback {
+                driver: Arc::new(FailsWithReport),
+                spec_template: Arc::new(hplugin::provider::TargetSpec::default()),
+            }),
+            home: home.clone(),
+            fs: Arc::new(sandboxfuse::LayeredFs::new_empty(dir.path().join("upper"))),
+            fuse_lower: dir.path().join("lower"),
+            fuse_upper: dir.path().join("upper"),
+        };
+        let target = hplugin::driver::targetdef::TargetDef {
+            addr: hmodel::htaddr::parse_addr("//app:t")?,
+            failure_outputs: vec![hplugin::driver::targetdef::FailureOutput {
+                group: String::new(),
+                paths: vec![hplugin::driver::targetdef::path::Content::FilePath(
+                    "app/report.txt".to_string(),
+                )],
+            }],
+            outputs: vec![hplugin::driver::targetdef::Output {
+                group: String::new(),
+                paths: vec![hplugin::driver::targetdef::path::Path {
+                    content: hplugin::driver::targetdef::path::Content::FilePath(
+                        "app/fix.txt".to_string(),
+                    ),
+                    codegen_tree: hplugin::driver::targetdef::path::CodegenMode::InPlace {
+                        write_on_failure: true,
+                    },
+                    collect: true,
+                }],
+            }],
+            ..Default::default()
+        };
+        let id = "t".to_string();
+        let ct = hcore::hasync::StdCancellationToken::new();
+        let req = RunRequest::new(&id, &target, plain.clone());
+        let Err(err) = fuse.run_inner(req, &ct, false).await else {
+            anyhow::bail!("the run must fail");
+        };
+        let kept = hplugin::error::failure_out_tar(&err)
+            .ok_or_else(|| anyhow::anyhow!("failure_out not kept: {err:#}"))?;
+        let hplugin::driver::outputartifact::Content::TarPath(kept_tar) = &kept.content else {
+            anyhow::bail!("failure_out is a tar");
+        };
+        assert!(
+            PathBuf::from(&kept_tar.path).starts_with(&plain),
+            "packed under the plain sandbox dir: {}",
+            kept_tar.path
+        );
+        let mut report = String::new();
+        for entry in hcore::hartifactcontent::Content::walk(kept)? {
+            let entry = entry?;
+            if entry.path == std::path::Path::new("app/report.txt")
+                && let hcore::hartifactcontent::WalkEntryKind::File { mut data, .. } = entry.kind
+            {
+                std::io::Read::read_to_string(&mut data, &mut report)?;
+            }
+        }
+        assert_eq!(report, "report");
+        // The `in_place` fixes are packed under the plain sandbox dir too, as
+        // a `writeback-` tar that outlives the slot.
+        let write_back = hplugin::error::failure_write_back(&err).expect("fixes collected");
+        let [art] = write_back.0.as_slice() else {
+            anyhow::bail!("one write-back tar: {:?}", write_back);
+        };
+        let hplugin::driver::outputartifact::Content::TarPath(tar) = &art.content else {
+            anyhow::bail!("a tar: {:?}", write_back);
+        };
+        let tar = PathBuf::from(&tar.path);
+        assert!(tar.starts_with(&plain), "{}", tar.display());
+        assert!(
+            tar.file_name().and_then(|n| n.to_str()).is_some_and(
+                |n| n.starts_with(hdriver_support::driver_managed::WRITE_BACK_TAR_PREFIX)
+            ),
+            "{}",
+            tar.display()
+        );
+        assert!(tar.is_file(), "{}", tar.display());
+        assert!(
+            dir.path()
+                .join("lower/app/__target_t/ws/app/report.txt")
+                .exists(),
+            "the run wrote through the redirected sandbox"
+        );
+        Ok(())
     }
 
     /// Registering a FUSE slot must not run on a tokio worker.

@@ -62,6 +62,36 @@ pub fn unpack_with_stop(
     should_unpack: Option<&dyn Fn(&Path) -> bool>,
     stop: &dyn Fn() -> bool,
 ) -> anyhow::Result<()> {
+    unpack_inner(content, dst, list_dst, should_unpack, stop, Links::Create)
+}
+
+/// [`unpack`], writing only regular files: a symlink member is skipped with
+/// a `warn!`, never created. For a tree that must hold nothing but files,
+/// where a link member would let a later member (`l -> ..`, then `l/x`)
+/// write through it outside `dst`.
+pub fn unpack_files_only(
+    content: &dyn Content,
+    dst: &Path,
+    should_unpack: Option<&dyn Fn(&Path) -> bool>,
+) -> anyhow::Result<()> {
+    unpack_inner(content, dst, None, should_unpack, &|| false, Links::Skip)
+}
+
+/// What an unpack does with a symlink member.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Links {
+    Create,
+    Skip,
+}
+
+fn unpack_inner(
+    content: &dyn Content,
+    dst: &Path,
+    list_dst: Option<&Path>,
+    should_unpack: Option<&dyn Fn(&Path) -> bool>,
+    stop: &dyn Fn() -> bool,
+    links: Links,
+) -> anyhow::Result<()> {
     let mut list_dst_f = match list_dst {
         Some(p) => Some(io::BufWriter::new(
             OpenOptions::new()
@@ -95,6 +125,10 @@ pub fn unpack_with_stop(
         if let Some(pred) = should_unpack
             && !pred(&entry.path)
         {
+            continue;
+        }
+        if links == Links::Skip && matches!(entry.kind, WalkEntryKind::Symlink { .. }) {
+            tracing::warn!(path = %entry.path.display(), dst = %dst.display(), "symlink member not unpacked: only files are");
             continue;
         }
         let dest = dst.join(&entry.path);
@@ -278,6 +312,19 @@ mod tests {
         // Symlink resolves to file with the expected content.
         let resolved = std::fs::read(&link_path).unwrap();
         assert_eq!(resolved, b"hello");
+    }
+
+    /// `unpack_files_only` writes the files and skips the link member.
+    #[test]
+    fn unpack_files_only_skips_a_link() {
+        let content = TarBytes(pack_with_symlink(false));
+        let out = tempfile::tempdir().expect("out tempdir");
+        unpack_files_only(&content, out.path(), None).expect("unpack");
+        assert_eq!(
+            std::fs::read(out.path().join("target.txt")).unwrap(),
+            b"hello"
+        );
+        assert!(std::fs::symlink_metadata(out.path().join("link.txt")).is_err());
     }
 
     #[test]

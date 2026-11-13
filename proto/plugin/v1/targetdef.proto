@@ -60,11 +60,34 @@ message Input {
   bool runtime = 6;
 }
 
+// A value this build does not know is a decode error, never read as any of
+// these: mapping a future mode onto a tree write would poison the tree.
 enum CodegenMode {
   CODEGEN_MODE_UNSPECIFIED = 0;
   CODEGEN_MODE_NONE = 1;
   CODEGEN_MODE_COPY = 2;
+  // Written back over the tree after a pass, and (since 0.21.0) also after a
+  // run that exits with a code from 1 to 127: `InPlace { write_on_failure:
+  // true }`.
   CODEGEN_MODE_IN_PLACE = 3;
+  // Written back after a pass only — what IN_PLACE meant before 0.21.0
+  // (since 0.21.0): `InPlace { write_on_failure: false }`.
+  CODEGEN_MODE_IN_PLACE_ON_SUCCESS = 4;
+}
+
+// Mirrors driver::path::Content: one path, file, directory or glob.
+message PathContent {
+  oneof content {
+    string file_path = 1;
+    string dir_path = 2;
+    string glob = 3;
+  }
+}
+
+// Mirrors driver::targetdef::FailureOutput (since 0.21.0).
+message FailureOutput {
+  string group = 1;
+  repeated PathContent paths = 2;
 }
 
 // Mirrors driver::path::Path + path::Content. `content` and `codegen_tree`
@@ -121,6 +144,10 @@ message TargetDef {
   // after a grace period, abandoned. Absent is no limit — what every older
   // plugin sends. A present value is never 0. Never hashed.
   uint64 timeout_ms = 13;
+  // What a run that fails with a process exit leaves behind for its diagnosis
+  // (since 0.21.0). Absent — what every older plugin sends — is none. Never
+  // hashed, never an output.
+  repeated FailureOutput failure_outputs = 14;
 }
 
 // Where an entrypoint runs. Mirrors driver::targetdef::Workdir.

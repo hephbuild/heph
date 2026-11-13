@@ -8,8 +8,10 @@
 //! 1. The run gets a cancellation token of its own, which the request's token
 //!    is forwarded into. A run without a timeout is handed the request's token
 //!    directly and pays nothing.
-//! 2. When the timeout elapses, that token is cancelled: the driver's own
-//!    cancellation path runs (exec kills the process group).
+//! 2. When the timeout elapses, that token is cancelled, as timed out
+//!    ([`Cancellable::timed_out`](hcore::hasync::Cancellable::timed_out)):
+//!    the driver's own cancellation path runs (exec kills the process group),
+//!    and the managed layer tells the timeout from a request cancel by it.
 //! 3. The run then has [`GRACE`] to return. Whether it does or not, the
 //!    target fails with [`TimedOutError`]; a run still going after the grace
 //!    is dropped (abandoned) rather than waited on. Its process may still be
@@ -158,7 +160,10 @@ pub(crate) async fn enforce<T>(
         () = tokio::time::sleep(timeout.duration()) => {}
     }
 
-    run_token.cancel();
+    // Timed out, and the token says so: the managed layer keeps a timed-out
+    // run's `failure_out` and nothing of a cancelled one's, and a cdylib's
+    // token hears it across the seam (`StableCancel::cancel_timed_out`).
+    run_token.cancel_timed_out();
     let (abandoned_after, artifacts) = match tokio::time::timeout(grace, &mut run).await {
         // Even an `Ok` is a timeout: the run returned only because it was
         // stopped, and whatever it produced is not what a finished run would.
@@ -276,6 +281,7 @@ mod tests {
         .await
         .expect_err("times out");
         assert!(token.is_cancelled(), "the driver was told to stop");
+        assert!(token.timed_out(), "and told why: its timeout");
         assert!(!parent.is_cancelled(), "only this run, not the request");
         assert_eq!(started.elapsed(), Duration::from_secs(90), "no grace used");
         assert!(is_timed_out(&err), "{err:#}");
@@ -410,6 +416,7 @@ mod tests {
         .await
         .expect_err("cancelled");
         assert!(token.is_cancelled(), "forwarded to the run");
+        assert!(!token.timed_out(), "a request cancel is not a timeout");
         assert!(hplugin::error::is_cancelled(&err), "{err:#}");
         assert!(!is_timed_out(&err), "{err:#}");
     }

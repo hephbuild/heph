@@ -72,6 +72,11 @@ const REFUSED_FIELDS: &[(&str, &str)] = &[
         "an entrypoint has no outputs: it runs in your world, and nothing it writes is collected \
          or cached. Drop `out`; to produce files for other targets, make a separate build target",
     ),
+    (
+        "failure_out",
+        "an entrypoint keeps nothing from a failed run: it runs in your world, where whatever it \
+         wrote is already where it wrote it. Drop `failure_out`",
+    ),
     ("cache", "an entrypoint is never cached. Drop `cache`"),
     (
         "resources",
@@ -266,6 +271,10 @@ mod tests {
             (
                 vec![flag(), ("out", s("bin/x"))],
                 &["`out`", "no outputs", "Drop `out`"],
+            ),
+            (
+                vec![flag(), ("failure_out", s("test-results/"))],
+                &["`failure_out`", "keeps nothing", "Drop `failure_out`"],
             ),
             (
                 vec![flag(), ("cache", Value::Bool(true))],

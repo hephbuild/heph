@@ -32,6 +32,30 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// the new `x.y.0`. The 0.14.0 and 0.15.0 entries below predate it — they were
 /// additive minors, and there was no version check to read them.
 ///
+/// 0.21.0 (a break): outputs from failed targets. `CODEGEN_MODE_IN_PLACE` (3)
+/// changes meaning: it now also asks the host to write back what a run that
+/// exited with a code from 1 to 127 left behind (`InPlace { write_on_failure:
+/// true }`), and `CODEGEN_MODE_IN_PLACE_ON_SUCCESS` (4, appended) is what 3
+/// meant before. `TargetDef.failure_outputs` (14) declares what a failed run
+/// keeps for its diagnosis, and `RunFailure.write_back` (5) carries a failed
+/// `in_place` run's fixes beside, never inside, its `artifacts`; both decode
+/// empty when absent. An unknown codegen value stays a decode error. A 0.20
+/// plugin's `IN_PLACE` never asked for a write-back on failure, so
+/// `MIN_PLUGIN_ABI` rises to 0.21.0 and every plugin must be rebuilt. It is a
+/// Rust source break too: `CodegenMode::InPlace` became the struct variant
+/// `InPlace { write_on_failure }` and `CodegenMode` no longer derives
+/// `SpecEnum`, so a plugin that matched `InPlace` or parsed the mode with
+/// `SpecEnum` must change its code, not just rebuild.
+///
+/// Also in 0.21.0, a timed-out run says so across the seam:
+/// `StableCancel::cancel_timed_out(cancel_key)`, appended after `cancel`, is
+/// what the host sends instead of `cancel` for a run its `timeout` stopped,
+/// and the plugin cancels that run's token as timed out
+/// (`Cancellable::timed_out`). An id that is not a cancel key is a plain
+/// cancel. A vtable change the 0.21.0 rebuild covers; no message changes.
+/// `Cancellable` gains the required `timed_out()`, a source break for a
+/// plugin that implements it.
+///
 /// 0.20.0 (a break): `ParamType.literal` (6, `string`, in the `kind` oneof) —
 /// exactly one string (`ParamType::Literal`); a closed set, e.g. a `workdir`
 /// or `format` field, is a `union` of them, so a cdylib's schema reaches the
@@ -290,11 +314,11 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// 0.3.0: `PluginComponents` gained a `hooks` field (a layout change to the
 /// create-entry struct) for the Hook plugin kind — a hard break, so every plugin
 /// must be rebuilt against this ABI.
-pub const ABI_SEMVER: &str = "0.20.0";
+pub const ABI_SEMVER: &str = "0.21.0";
 
 /// The start of the ABI lane this host loads: a plugin is accepted iff its
 /// version matches the caret requirement `^MIN_PLUGIN_ABI` — pre-1.0, one
-/// minor (`^0.20.0` = `>=0.20.0, <0.21.0`). A patch is additive, so host and
+/// minor (`^0.21.0` = `>=0.21.0, <0.22.0`). A patch is additive, so host and
 /// plugin may differ in patch either way; a plugin from a later minor is a
 /// break the host cannot know and is refused.
 ///
@@ -303,11 +327,11 @@ pub const ABI_SEMVER: &str = "0.20.0";
 /// structural check passes it and nothing but this check refuses the old
 /// plugin. A test holds `ABI_SEMVER` inside `^MIN_PLUGIN_ABI`, so bumping one
 /// without the other fails.
-pub const MIN_PLUGIN_ABI: &str = "0.20.0";
+pub const MIN_PLUGIN_ABI: &str = "0.21.0";
 
 /// [`ABI_SEMVER`], NUL-terminated: what a plugin's `heph_plugin_abi_semver`
 /// entry returns a pointer to. Bumped with it; a test holds the two equal.
-pub const ABI_SEMVER_C: &std::ffi::CStr = c"0.20.0";
+pub const ABI_SEMVER_C: &std::ffi::CStr = c"0.21.0";
 
 /// The first plugin ABI that reads `ManagedRunRequest.cancel_key`. The host
 /// sends a key, and cancels a run by it, only to a plugin at this version or

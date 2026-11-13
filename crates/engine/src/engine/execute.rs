@@ -154,16 +154,20 @@ impl Engine {
         // Telemetry: per-target execute wall time. This path runs only on a real
         // execution (cache misses), so it captures exactly the executed targets.
         let exec_started = std::time::Instant::now();
+        let start = execute_start(
+            addr_str.clone(),
+            driver.name.clone(),
+            def.target.cache.enabled,
+            &def.target.demand,
+            &reservation,
+            queued_ms,
+        );
+        // Held until the run ends; a failed run hands it back before keeping
+        // what it failed with (D17).
+        let mut reservation = Some(reservation);
         let res = crate::engine::event::emit_scope(
             &rs,
-            execute_start(
-                addr_str.clone(),
-                driver.name.clone(),
-                def.target.cache.enabled,
-                &def.target.demand,
-                &reservation,
-                queued_ms,
-            ),
+            start,
             move |error| crate::engine::event::BuildEventKind::ExecuteEnd {
                 addr: addr_str,
                 error: error.map(crate::engine::event::ErrorDetail::into_message),
@@ -197,7 +201,9 @@ impl Engine {
                 // `leave_for_diagnostics` in the match below (the failure
                 // renderer reads the log tail lazily from the sandbox, so a
                 // failed target's tree must survive until its next run — its
-                // documented pre-teardown behaviour); and a bare drop —
+                // documented pre-teardown behaviour), or, for credential
+                // material, as `reclaim` once the failure slot is filled; and
+                // a bare drop —
                 // cancellation or an unwind, and only those — queues a
                 // generation-checked reclaim of the directory. Without that
                 // last leg, mass fail-fast leaves one abandoned sandbox tree
@@ -238,10 +244,35 @@ impl Engine {
                 let res = match run {
                     Ok(res) => res,
                     Err(err) => {
-                        // The target failed. Keep its log in the failure slot
-                        // (or, for material, its tail in memory) before anything
-                        // is done to the sandbox it lives in. Here, under the
-                        // execute lock, once per run — not per caller.
+                        // The run is over: its capacity goes back before
+                        // the engine keeps anything (D17). The managed layer
+                        // already packed `failure_out` into a tar in the
+                        // sandbox inside the run, under the reservation; what
+                        // is left — the write-back and unpacking that tar into
+                        // the slot — holds no pool.
+                        drop(reservation.take());
+                        // The sandbox is kept for diagnostics: nothing may be
+                        // queued against it. The tree survives until this
+                        // target's next run, whose `remove_stale` reclaims it.
+                        // Resolved before the fill is awaited (D17): a
+                        // cancellation during the fill must not drop the
+                        // teardown and queue a reclaim under the blocking job
+                        // still unpacking the `failure_out` tar out of it.
+                        //
+                        // Unless the outputs are material, in which case the
+                        // diagnostic is not worth the secret it would leave on
+                        // disk: torn down once the fill has read it.
+                        let material_teardown = if outputs_are_material {
+                            Some(sandbox_teardown)
+                        } else {
+                            sandbox_teardown.leave_for_diagnostics();
+                            None
+                        };
+                        // The target failed. Keep its log and its `failure_out`
+                        // in the failure slot (for material, the log's tail in
+                        // memory and `out/` only) before anything is done to
+                        // the sandbox they live in. Here, under the execute
+                        // lock, once per run — not per caller.
                         // A cancelled run did not fail: nothing to keep. A
                         // driver may report a cancellation as an error of its
                         // own (exec's bare "cancelled", log attached so that a
@@ -254,6 +285,14 @@ impl Engine {
                         let err = if cancelled {
                             err
                         } else {
+                            // An `in_place` run's fixes go over the tree
+                            // first, while the left sandbox still holds their
+                            // tars (leaving it keeps the directory; only a
+                            // later run's `remove_stale` reclaims it), so the
+                            // slot can list what was written (D21).
+                            let write_back = self
+                                .materialize_codegen_on_failure(&rs, def, shell, &err)
+                                .await;
                             let err = Arc::clone(&self).reword_removed_generator(&rs, err).await;
                             let slot = self
                                 .failure_slots
@@ -264,21 +303,29 @@ impl Engine {
                                     err: &err,
                                     lines: rs.log_tail_lines(),
                                     material: outputs_are_material,
+                                    fixes: write_back.fixes,
                                 })
                                 .await;
-                            err.context(slot)
+                            let out_error = slot.out_error.clone();
+                            let err = err.context(slot);
+                            // I7: the keep failed, the failure did not.
+                            let err = match out_error {
+                                Some(e) => err.context(format!("failure_out not kept: {e}")),
+                                None => err,
+                            };
+                            // I5: a refused write-back is reported beside the
+                            // tool's own error, never in its place.
+                            match write_back.error {
+                                Some(e) => err.context(e),
+                                None => err,
+                            }
                         };
-                        // The sandbox is kept for diagnostics: nothing may be
-                        // queued against it. The tree survives until this
-                        // target's next run, whose `remove_stale` reclaims it.
-                        //
-                        // Unless the outputs are material, in which case the
-                        // diagnostic is not worth the secret it would leave on
-                        // disk.
-                        if outputs_are_material {
-                            sandbox_teardown.complete(addr.format());
-                        } else {
-                            sandbox_teardown.leave_for_diagnostics();
+                        // Not `complete`: a failed run handed over no bridge
+                        // job, so it would enqueue nothing and leave the
+                        // presented credentials on disk — in the FUSE upper
+                        // side, under FUSE, which goes too.
+                        if let Some(teardown) = material_teardown {
+                            teardown.reclaim(self.fuse_upper(&sandbox_dir));
                         }
                         return Err(err);
                     }
@@ -352,13 +399,26 @@ impl Engine {
     /// directories the bridge redirects it to.
     fn sandbox_roots(&self, sandbox_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
         let mut roots = vec![sandbox_dir.to_path_buf()];
-        if self.fuse.mount.is_some()
-            && let Ok(rel) = sandbox_dir.strip_prefix(self.home.join("sandbox"))
-        {
+        if let Some(rel) = self.fuse_rel(sandbox_dir) {
             roots.push(self.fuse.lower.join(rel));
             roots.push(self.fuse.upper.join(rel));
         }
         roots
+    }
+
+    /// The backing-side directory a run in `sandbox_dir` wrote to, when FUSE
+    /// is mounted: what the FUSE bridge's cleanup job removes after a passing
+    /// run.
+    fn fuse_upper(&self, sandbox_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+        self.fuse_rel(sandbox_dir)
+            .map(|rel| self.fuse.upper.join(rel))
+    }
+
+    /// `sandbox_dir` relative to the plain sandbox root, when FUSE is mounted
+    /// and the bridge redirects the run.
+    fn fuse_rel<'a>(&self, sandbox_dir: &'a std::path::Path) -> Option<&'a std::path::Path> {
+        self.fuse.mount.as_ref()?;
+        sandbox_dir.strip_prefix(self.home.join("sandbox")).ok()
     }
 
     /// The one sandbox block every run goes through, a build's

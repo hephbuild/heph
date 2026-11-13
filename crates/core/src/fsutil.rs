@@ -153,6 +153,41 @@ pub fn make_readwrite_tree(dir: &Path) {
 #[cfg(not(unix))]
 pub fn make_readwrite_tree(_dir: &Path) {}
 
+/// Copy the tree at `from` to `to`, creating `to` and its parents, each file
+/// through `copy` (`|f, t| std::fs::copy(f, t).map(drop)` in production; a
+/// parameter so a caller can inject a failure). A symlink is recreated as a
+/// symlink, never followed, so a link out of the tree does not duplicate
+/// whatever it points at. Anything that is not a file, a directory or a
+/// symlink — a fifo, a socket, a device — is skipped: opening a fifo to copy
+/// it would block on a writer that never comes.
+#[cfg(unix)]
+pub fn copy_tree(
+    from: &Path,
+    to: &Path,
+    copy: fn(&Path, &Path) -> io::Result<()>,
+) -> anyhow::Result<()> {
+    fs::create_dir_all(to).with_context(|| format!("creating {}", to.display()))?;
+    for entry in fs::read_dir(from).with_context(|| format!("listing {}", from.display()))? {
+        let entry = entry.with_context(|| format!("listing {}", from.display()))?;
+        let (src, dst) = (entry.path(), to.join(entry.file_name()));
+        let ft = entry
+            .file_type()
+            .with_context(|| format!("reading the type of {}", src.display()))?;
+        if ft.is_dir() {
+            copy_tree(&src, &dst, copy)?;
+        } else if ft.is_symlink() {
+            let target = fs::read_link(&src)
+                .with_context(|| format!("reading the link {}", src.display()))?;
+            std::os::unix::fs::symlink(&target, &dst)
+                .with_context(|| format!("linking {}", dst.display()))?;
+        } else if ft.is_file() {
+            copy(&src, &dst)
+                .with_context(|| format!("copying {} to {}", src.display(), dst.display()))?;
+        }
+    }
+    Ok(())
+}
+
 /// Recursively strip write bits from every file and directory under `root`
 /// (dirs become `0o555`, files keep their mode minus `0o222`), publishing a
 /// read-only tree the way the Go module cache marks downloaded modules
@@ -208,6 +243,29 @@ mod tests {
     const STILL_BLOCKED: Duration = Duration::from_millis(200);
     /// Ceiling for the barrier to notice the fd is gone. Only a hang trips it.
     const RELEASE: Duration = Duration::from_secs(10);
+
+    /// Files are copied, symlinks recreated rather than followed, and a
+    /// socket — like a fifo, not something a copy can read — is skipped
+    /// instead of failing the copy.
+    #[test]
+    fn copy_tree_copies_files_keeps_links_and_skips_specials() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (src, dst) = (tmp.path().join("a"), tmp.path().join("x/b"));
+        fs::create_dir_all(src.join("d")).expect("mkdir");
+        fs::write(src.join("d/f"), b"x").expect("write");
+        std::os::unix::fs::symlink("/somewhere/else", src.join("link")).expect("symlink");
+        let _listener =
+            std::os::unix::net::UnixListener::bind(src.join("sock")).expect("bind a socket");
+
+        copy_tree(&src, &dst, |f, t| fs::copy(f, t).map(drop)).expect("copy");
+
+        assert_eq!(fs::read(dst.join("d/f")).expect("read"), b"x");
+        assert_eq!(
+            fs::read_link(dst.join("link")).expect("still a link"),
+            Path::new("/somewhere/else")
+        );
+        assert!(!dst.join("sock").exists(), "a socket is skipped");
+    }
 
     fn write_script(path: &Path) -> fs::File {
         let mut file = fs::File::create(path).expect("create");

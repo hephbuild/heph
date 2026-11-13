@@ -2388,4 +2388,217 @@ mod tests {
             "the capped-out path must never call the queue-waiting probe"
         );
     }
+
+    /// Fails while `fail` is set, carrying everything a failed run can: its
+    /// log and a diagnostic on `FailureArtifacts`, and a fix on
+    /// `FailureWriteBack`. The diagnostic and the fix are typed `Output`, in
+    /// the target's own output group under the name a pass uses — the
+    /// shape most likely to be mistaken for a run's outputs. Passes otherwise.
+    struct FailingDriver {
+        fail: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    fn sandbox_file(
+        group: &str,
+        name: &str,
+        r#type: outputartifact::Type,
+        path: &std::path::Path,
+    ) -> outputartifact::OutputArtifact {
+        outputartifact::OutputArtifact {
+            group: group.to_string(),
+            name: name.to_string(),
+            r#type,
+            content: outputartifact::Content::File(outputartifact::ContentFile {
+                source_path: path.to_string_lossy().into_owned(),
+                out_path: name.to_string(),
+                x: false,
+                passthrough: false,
+            }),
+            hashout: format!("hashout-{name}"),
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::engine::driver::Driver for FailingDriver {
+        fn config(
+            &self,
+            _r: crate::engine::driver::ConfigRequest,
+        ) -> anyhow::Result<crate::engine::driver::ConfigResponse> {
+            Ok(crate::engine::driver::ConfigResponse {
+                name: "failing".to_string(),
+            })
+        }
+        fn schema(&self) -> crate::engine::driver::DriverSchema {
+            crate::engine::driver::DriverSchema::default()
+        }
+        async fn parse(
+            &self,
+            r: crate::engine::driver::ParseRequest,
+            _c: &(dyn Cancellable + Send + Sync),
+        ) -> anyhow::Result<crate::engine::driver::ParseResponse> {
+            Ok(crate::engine::driver::ParseResponse {
+                target_def: TargetDef {
+                    addr: r.target_spec.addr.clone(),
+                    outputs: vec![crate::engine::driver::targetdef::Output {
+                        group: "main".to_string(),
+                        paths: vec![],
+                    }],
+                    cache: CacheConfig::on(false),
+                    hash: b"failing-def".to_vec(),
+                    ..Default::default()
+                },
+            })
+        }
+        async fn apply_transitive(
+            &self,
+            r: crate::engine::driver::ApplyTransitiveRequest,
+            _c: &(dyn Cancellable + Send + Sync),
+        ) -> anyhow::Result<crate::engine::driver::ApplyTransitiveResponse> {
+            Ok(crate::engine::driver::ApplyTransitiveResponse {
+                target_def: r.target_def,
+            })
+        }
+        async fn run<'a, 'io>(
+            &self,
+            r: crate::engine::driver::RunRequest<'a, 'io>,
+            _c: &(dyn Cancellable + Send + Sync),
+        ) -> anyhow::Result<crate::engine::driver::RunResponse> {
+            use outputartifact::Type;
+            std::fs::create_dir_all(&r.sandbox_dir)?;
+            let out = r.sandbox_dir.join("out.txt");
+            if !self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                std::fs::write(&out, b"pass")?;
+                return Ok(crate::engine::driver::RunResponse {
+                    artifacts: vec![sandbox_file("main", "out", Type::Output, &out)],
+                    sandbox_cleanup: None,
+                    sandbox_guards: vec![],
+                });
+            }
+            let log = r.sandbox_dir.join("log.txt");
+            std::fs::write(&log, b"boom\n")?;
+            let report = r.sandbox_dir.join("report.txt");
+            std::fs::write(&report, b"trace")?;
+            std::fs::write(&out, b"fixed")?;
+            let err = anyhow::Error::new(hplugin::error::ProcessFailed::new(
+                "exit status: 1",
+                Some(hplugin::error::Exit::Code(1)),
+            ));
+            let err = hplugin::error::with_failure_artifacts(
+                err,
+                vec![
+                    hplugin::error::log_file_artifact(&log).expect("utf-8 path"),
+                    sandbox_file("main", "report", Type::Output, &report),
+                ],
+            );
+            Err(hplugin::error::with_failure_write_back(
+                err,
+                vec![sandbox_file("main", "out", Type::Output, &out)],
+            ))
+        }
+        async fn run_shell<'a, 'io>(
+            &self,
+            _r: crate::engine::driver::RunRequest<'a, 'io>,
+            _c: &(dyn Cancellable + Send + Sync),
+        ) -> anyhow::Result<crate::engine::driver::RunResponse> {
+            anyhow::bail!("not used")
+        }
+    }
+
+    /// D6: what a failed run carries — diagnostics on `FailureArtifacts`, fixes
+    /// on `FailureWriteBack` — never lands in a cache manifest, nor as a blob.
+    ///
+    /// Drives the real path: `result_addr` → execute → the failure arm. The
+    /// key is the one the failure slot recorded, and the control is the same
+    /// target passing at that key, which does file a manifest, holding only
+    /// what the pass returned.
+    #[tokio::test]
+    async fn failure_artifacts_never_reach_a_manifest() -> anyhow::Result<()> {
+        use crate::engine::result::{OutputMatcher, ResultOptions};
+        let dir = tempfile::tempdir()?;
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut engine = Engine::new(Config {
+            parallelism: None,
+            ..Config::for_tests(dir.path())
+        })?;
+        engine.register_driver({
+            let fail = Arc::clone(&fail);
+            move |_| Box::new(FailingDriver { fail })
+        })?;
+        let provider = crate::engine::fault_provider::FaultProvider::new(
+            vec![hbuiltins::pluginstatictarget::Target {
+                addr: "//pkg:tgt".to_string(),
+                driver: "failing".to_string(),
+                ..Default::default()
+            }],
+            Default::default(),
+        )?;
+        engine.register_provider(move |_| Box::new(provider))?;
+        let engine = Arc::new(engine);
+        let addr = hmodel::htaddr::parse_addr("//pkg:tgt")?;
+
+        let err = match Arc::clone(&engine)
+            .result_addr(
+                engine.new_state(),
+                &addr,
+                OutputMatcher::All,
+                &ResultOptions::default(),
+            )
+            .await
+        {
+            Ok(_) => panic!("the run must fail"),
+            Err(e) => e,
+        };
+        assert!(format!("{err:#}").contains("exit status: 1"), "{err:#}");
+        let hashin = engine
+            .failure_slots()
+            .read(&addr)
+            .expect("the failure filled its slot")
+            .hashin;
+        assert!(
+            engine.read_manifest(&addr, &hashin)?.is_none(),
+            "a failed run filed a manifest"
+        );
+        for (name, r#type) in [
+            ("out", outputartifact::Type::Output),
+            ("report", outputartifact::Type::Output),
+            ("log.txt", outputartifact::Type::Log),
+        ] {
+            let entry = cache_entry_name(&sandbox_file(
+                "main",
+                name,
+                r#type,
+                std::path::Path::new("/x"),
+            ));
+            assert!(
+                !engine.local_cache.exists(&addr, &hashin, &entry)?,
+                "a failed run stored blob {entry}"
+            );
+        }
+
+        // Control: the same target passing files its manifest at that key, so
+        // the absence above was looked for in the right place.
+        fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        Arc::clone(&engine)
+            .result_addr(
+                engine.new_state(),
+                &addr,
+                OutputMatcher::All,
+                &ResultOptions::default(),
+            )
+            .await?;
+        let manifest = engine
+            .read_manifest(&addr, &hashin)?
+            .expect("a pass at the same key files a manifest");
+        let names: Vec<(&str, &str)> = manifest
+            .artifacts
+            .iter()
+            .map(|a| (a.group.as_str(), a.name.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            [("main", "out_out.tar")],
+            "only what the pass returned"
+        );
+        Ok(())
+    }
 }

@@ -149,7 +149,7 @@ impl ManagedDriverOs {
         let target = req.target;
         let hashin = req.hashin;
 
-        let mut res = invoke_inner(
+        let invoked = invoke_inner(
             &**self.driver,
             req,
             ctoken,
@@ -160,7 +160,36 @@ impl ManagedDriverOs {
             inputs,
             &self.shell_fallback,
         )
-        .await?;
+        .await;
+        let mut res = match invoked {
+            Ok(res) => res,
+            // Here, while the sandbox is live and before the stage holds drop:
+            // a staged input the target listed is still linked.
+            Err(err) => {
+                let err = crate::failure_out::keep_failure_write_back(
+                    err,
+                    target,
+                    hashin,
+                    shell,
+                    ctoken,
+                    &ws_dir,
+                    &sandbox_dir,
+                    self.stage_dir.as_deref(),
+                )
+                .await;
+                return Err(crate::failure_out::keep_failure_outputs(
+                    err,
+                    &target.failure_outputs,
+                    hashin,
+                    shell,
+                    ctoken,
+                    &ws_dir,
+                    &sandbox_dir,
+                    self.stage_dir.as_slice(),
+                )
+                .await);
+            }
+        };
 
         // The stage holds ride out with the response: the engine drops them
         // with the rest of the run's guards, after it has read the sandbox.
@@ -214,8 +243,9 @@ mod tests {
         ParseRequest, ParseResponse,
     };
 
-    /// A driver whose run succeeds or fails, and does nothing else.
-    struct Outcome(bool);
+    /// A driver whose run writes `report.txt` into its package dir, then
+    /// succeeds (`None`) or fails with the error the function makes.
+    struct Outcome(Option<fn() -> anyhow::Error>);
 
     #[async_trait]
     impl ManagedDriver for Outcome {
@@ -245,24 +275,220 @@ mod tests {
         }
         async fn run<'a, 'io>(
             &self,
-            _: ManagedRunRequest<'a, 'io>,
+            req: ManagedRunRequest<'a, 'io>,
             _: &(dyn Cancellable + Send + Sync),
         ) -> anyhow::Result<ManagedRunResponse> {
-            anyhow::ensure!(self.0, "the run failed");
-            Ok(ManagedRunResponse { artifacts: vec![] })
+            fs::write(req.sandbox_pkg_dir.join("report.txt"), "report")?;
+            match self.0 {
+                Some(fail) => Err(fail()),
+                None => Ok(ManagedRunResponse { artifacts: vec![] }),
+            }
+        }
+        fn supports_shell(&self) -> bool {
+            true
+        }
+        async fn run_shell<'a, 'io>(
+            &self,
+            req: ManagedRunRequest<'a, 'io>,
+            ct: &(dyn Cancellable + Send + Sync),
+        ) -> anyhow::Result<ManagedRunResponse> {
+            self.run(req, ct).await
         }
     }
 
     fn os(ok: bool, stage: &std::path::Path) -> ManagedDriverOs {
+        os_failing(
+            (!ok).then_some((|| anyhow::anyhow!("the run failed")) as fn() -> anyhow::Error),
+            stage,
+        )
+    }
+
+    fn os_failing(fail: Option<fn() -> anyhow::Error>, stage: &std::path::Path) -> ManagedDriverOs {
         let fallback = Arc::new(ShellFallback {
-            driver: Arc::new(Outcome(true)),
+            driver: Arc::new(Outcome(None)),
             spec_template: Arc::new(hplugin::provider::TargetSpec::default()),
         });
         ManagedDriverOs {
-            driver: Arc::new(Box::new(Outcome(ok))),
+            driver: Arc::new(Box::new(Outcome(fail))),
             shell_fallback: fallback,
             stage_dir: Some(stage.to_path_buf()),
         }
+    }
+
+    /// A token that reads cancelled once `0` exists: a cancellation that
+    /// lands while the run is running, after it wrote that file. `.1` is its
+    /// reason: the run's `timeout`, or (false) its request's cancellation.
+    struct CancelledOnceExists(std::path::PathBuf, bool);
+
+    impl Cancellable for CancelledOnceExists {
+        fn is_cancelled(&self) -> bool {
+            self.0.exists()
+        }
+        fn timed_out(&self) -> bool {
+            self.1 && self.is_cancelled()
+        }
+        fn cancelled(
+            &self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            Box::pin(async move {
+                while !self.0.exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+        }
+        fn clone_arc(&self) -> Arc<dyn Cancellable + Send + Sync> {
+            Arc::new(Self(self.0.clone(), self.1))
+        }
+    }
+
+    /// A run cancelled by its own `timeout` (its token says so) keeps its
+    /// `failure_out` with no process exit behind it, and writes nothing back;
+    /// one cancelled by its request keeps nothing.
+    #[tokio::test]
+    async fn timeout_keeps_failure_out_and_writes_nothing_back() -> anyhow::Result<()> {
+        use hplugin::driver::targetdef::path::{CodegenMode, Content, Path as DefPath};
+        let tmp = tempfile::tempdir()?;
+        let stage = tmp.path().join("stage");
+        let id = "t".to_string();
+        let cancelled: fn() -> anyhow::Error = || anyhow::anyhow!("cancelled");
+        let run = |name: &'static str, timed_out: bool| {
+            let sandbox = tmp.path().join(name);
+            let os = os_failing(Some(cancelled), &stage);
+            let id = &id;
+            async move {
+                let mut target = keeps_report();
+                target.timeout = Some(hplugin::driver::Timeout::new(
+                    std::time::Duration::from_secs(3600),
+                )?);
+                target.outputs = vec![hplugin::driver::targetdef::Output {
+                    group: String::new(),
+                    paths: vec![DefPath {
+                        content: Content::FilePath("app/report.txt".to_string()),
+                        codegen_tree: CodegenMode::InPlace {
+                            write_on_failure: true,
+                        },
+                        collect: true,
+                    }],
+                }];
+                let ct = CancelledOnceExists(sandbox.join("ws/app/report.txt"), timed_out);
+                let req = RunRequest::new(id, &target, sandbox.clone());
+                let Err(err) = os.run_inner(req, &ct, false).await else {
+                    anyhow::bail!("{name}: the run must fail");
+                };
+                anyhow::Ok((err, sandbox))
+            }
+        };
+
+        // Cancelled as timed out, however far from its limit the clock says.
+        let (err, _sandbox) = run("timed-out", true).await?;
+        let kept = hplugin::error::failure_out_tar(&err).expect("kept on a timeout");
+        assert_eq!(
+            crate::failure_out::tar_files(kept)
+                .get("app/report.txt")
+                .map(String::as_str),
+            Some("report")
+        );
+        assert!(
+            hplugin::error::failure_write_back(&err).is_none(),
+            "a timeout writes nothing back"
+        );
+
+        // The same run cancelled by its request.
+        let (err, sandbox) = run("cancelled", false).await?;
+        assert!(hplugin::error::failure_out_tar(&err).is_none());
+        assert!(crate::failure_out::packed(&sandbox).is_empty());
+        assert!(hplugin::error::failure_write_back(&err).is_none());
+        Ok(())
+    }
+
+    /// A def in `//app` that keeps `app/report.txt` on failure.
+    fn keeps_report() -> TargetDef {
+        TargetDef {
+            addr: hmodel::htaddr::parse_addr("//app:t").expect("addr"),
+            failure_outputs: vec![hplugin::driver::targetdef::FailureOutput {
+                group: String::new(),
+                paths: vec![hplugin::driver::targetdef::path::Content::FilePath(
+                    "app/report.txt".to_string(),
+                )],
+            }],
+            ..TargetDef::default()
+        }
+    }
+
+    /// A failure no process exit is behind — a driver's or heph's own, before
+    /// or around the run — keeps nothing, and neither does a cancelled run or a
+    /// `--shell`; a process exit keeps the report, packed into a tar under
+    /// the sandbox (Surface table, I8).
+    #[tokio::test]
+    async fn failure_without_exit_collects_nothing() -> anyhow::Result<()> {
+        use hplugin::error::{Exit, ProcessFailed};
+        let tmp = tempfile::tempdir()?;
+        let stage = tmp.path().join("stage");
+        let target = keeps_report();
+        let id = "t".to_string();
+        let exit1: fn() -> anyhow::Error =
+            || anyhow::Error::new(ProcessFailed::new("exit status: 1", Some(Exit::Code(1))));
+        let no_exit: fn() -> anyhow::Error = || anyhow::anyhow!("credential source failed");
+        let unknown_exit: fn() -> anyhow::Error =
+            || anyhow::Error::new(ProcessFailed::new("exit status: ?", None));
+
+        let run = |name: &'static str, fail: fn() -> anyhow::Error, cancel: bool, shell: bool| {
+            let sandbox = tmp.path().join(name);
+            let os = os_failing(Some(fail), &stage);
+            let target = &target;
+            let id = &id;
+            async move {
+                // Cancelled once the run has written its report: staging
+                // stops on a token cancelled up front, before the run.
+                let ct: Arc<dyn Cancellable + Send + Sync> = if cancel {
+                    Arc::new(CancelledOnceExists(
+                        sandbox.join("ws/app/report.txt"),
+                        false,
+                    ))
+                } else {
+                    Arc::new(StdCancellationToken::new())
+                };
+                let req = RunRequest::new(id, target, sandbox.clone());
+                let err = match os.run_inner(req, &*ct, shell).await {
+                    Ok(_) => anyhow::bail!("{name}: the run must fail"),
+                    Err(e) => e,
+                };
+                anyhow::Ok((err, sandbox))
+            }
+        };
+
+        for (name, fail, cancel, shell) in [
+            ("no-exit", no_exit, false, false),
+            ("unknown-exit", unknown_exit, false, false),
+            ("cancelled", exit1, true, false),
+            ("shell", exit1, false, true),
+        ] {
+            let (err, sandbox) = run(name, fail, cancel, shell).await?;
+            assert!(hplugin::error::failure_out_tar(&err).is_none(), "{name}");
+            assert!(
+                crate::failure_out::packed(&sandbox).is_empty(),
+                "{name}: nothing packed"
+            );
+            assert!(
+                sandbox.join("ws/app/report.txt").exists(),
+                "{name}: the run did write it"
+            );
+        }
+
+        let (err, _sandbox) = run("exit-1", exit1, false, false).await?;
+        let kept = hplugin::error::failure_out_tar(&err).expect("kept on an exit");
+        assert_eq!(
+            crate::failure_out::tar_files(kept)
+                .get("app/report.txt")
+                .map(String::as_str),
+            Some("report")
+        );
+        assert_eq!(
+            hplugin::error::process_exit(&err),
+            Some(Exit::Code(1)),
+            "the target's own error is still there"
+        );
+        Ok(())
     }
 
     fn read_only_input() -> RunInput {

@@ -105,6 +105,13 @@ that key, not by the request id every target of the request shares (which would
 also stop every sibling run of the same driver). A cancelled request still
 stops every run.
 
+The run's token says why it was cancelled. The engine cancels a timed-out
+run's token as timed out (`Cancellable::timed_out`), and the host sends a
+cdylib's run `StableCancel::cancel_timed_out(cancel_key)` rather than
+`cancel` (ABI 0.21.0), so the plugin's token reads the same. That is how the
+managed layer keeps a timed-out run's `failure_out` and nothing of a
+cancelled one's.
+
 Skew, both ways. A 0.19.0 plugin cannot declare a timeout (its `TargetDef` has
 none), so its runs are cancelled only with their request; the host cancels
 them by request id, as before. A 0.19.1 plugin on a 0.19.0 host has its

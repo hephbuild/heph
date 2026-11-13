@@ -490,6 +490,25 @@ impl CancelRegistry {
             }
         }
     }
+
+    /// [`cancel`](Self::cancel), for a run its host stopped at its `timeout`:
+    /// the run's token is cancelled as timed out
+    /// ([`Cancellable::timed_out`](hcore::hasync::Cancellable::timed_out)).
+    /// Only a run's own cancel key names one run; any other id is a plain
+    /// cancel, so the stop itself is never lost.
+    fn cancel_timed_out(&self, key: &str) {
+        if !key.starts_with(plugin_abi::CANCEL_KEY_PREFIX) {
+            return self.cancel(key);
+        }
+        if let Some(t) = self
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+        {
+            t.cancel_timed_out();
+        }
+    }
 }
 
 /// Holds a call's cancellation token registered; deregisters on drop.
@@ -564,6 +583,9 @@ pub struct StableProviderImpl {
 impl StableCancel for StableProviderImpl {
     extern "C" fn cancel(&self, request_id: stabby::string::String) {
         self.cancels.cancel(&request_id);
+    }
+    extern "C" fn cancel_timed_out(&self, cancel_key: stabby::string::String) {
+        self.cancels.cancel_timed_out(&cancel_key);
     }
 }
 
@@ -1134,6 +1156,9 @@ pub struct StableManagedDriverImpl {
 impl StableCancel for StableManagedDriverImpl {
     extern "C" fn cancel(&self, request_id: stabby::string::String) {
         self.cancels.cancel(&request_id);
+    }
+    extern "C" fn cancel_timed_out(&self, cancel_key: stabby::string::String) {
+        self.cancels.cancel_timed_out(&cancel_key);
     }
 }
 
@@ -4005,6 +4030,26 @@ mod tests {
         );
     }
 
+    // A timeout cancel trips its run as timed out, and that run alone; a plain
+    // key cancel is not a timeout; a timeout cancel by a request id (no host
+    // sends one) still stops the request, as a plain cancel.
+    #[test]
+    fn registry_a_timeout_cancel_says_so_on_its_own_run_only() {
+        let reg = Arc::new(CancelRegistry::default());
+        let timed = reg.enter_call(&cancel_key(1)).expect("enter timed");
+        let plain = reg.enter_call(&cancel_key(2)).expect("enter plain");
+        let sibling = reg.enter_call(&cancel_key(3)).expect("enter sibling");
+        reg.cancel_timed_out(&cancel_key(1));
+        reg.cancel(&cancel_key(2));
+        assert!(timed.token().is_cancelled() && timed.token().timed_out());
+        assert!(plain.token().is_cancelled() && !plain.token().timed_out());
+        assert!(!sibling.token().is_cancelled());
+
+        let parse = reg.enter("req-1");
+        reg.cancel_timed_out("req-1");
+        assert!(parse.token().is_cancelled() && !parse.token().timed_out());
+    }
+
     // A request cancel by id does not reach a keyed run: the host cancels a
     // keyed run by its key, the run's token being cancelled with the request.
     // A parked request id therefore cannot poison a later keyed run either.
@@ -4137,7 +4182,9 @@ mod tests {
             } else {
                 ct.cancelled().await;
             }
-            anyhow::bail!("run {which} cancelled")
+            // What the plugin's token says of why: the seam carries it.
+            let why = if ct.timed_out() { " (timed out)" } else { "" };
+            anyhow::bail!("run {which} cancelled{why}")
         }
     }
 
@@ -4232,6 +4279,42 @@ mod tests {
         });
     }
 
+    /// A run the host's token stopped as timed out reads timed out on the
+    /// plugin's side of the seam too (`StableCancel::cancel_timed_out`), and
+    /// its sibling, cancelled plainly a moment later, does not.
+    #[test]
+    fn a_timeout_crosses_the_seam_as_a_timeout() {
+        let (host, _release_b, mut entered) = wait_harness(plugin_abi::ABI_SEMVER);
+        let target = convert::target_def_from_pb(wire_target()).expect("def");
+        let id = "req-1".to_string();
+        let (ct_a, ct_b) = (StdCancellationToken::new(), StdCancellationToken::new());
+        host_runtime().block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                let fa = host.run(wait_run(&id, &target, "a"), &ct_a);
+                let fb = host.run(wait_run(&id, &target, "b"), &ct_b);
+                let cancel = async {
+                    entered.recv().await;
+                    entered.recv().await;
+                    ct_a.cancel_timed_out();
+                    ct_b.cancel();
+                };
+                let (ra, rb, ()) = tokio::join!(fa, fb, cancel);
+                let err = ra.err().expect("a is cancelled");
+                assert!(
+                    format!("{err:#}").contains("run a cancelled (timed out)"),
+                    "{err:#}"
+                );
+                let err = format!("{:#}", rb.err().expect("b is cancelled"));
+                assert!(
+                    err.contains("run b cancelled") && !err.contains("timed out"),
+                    "{err}"
+                );
+            })
+            .await
+            .expect("runs ended in time");
+        });
+    }
+
     /// A request cancel still reaches every run: an untimed run is handed the
     /// request's token itself (a timed one has it forwarded into its own), so
     /// each run's cancel fires and each is cancelled by its own key.
@@ -4253,9 +4336,11 @@ mod tests {
                 let (ra, rb, ()) = tokio::join!(fa, fb, cancel);
                 for (which, r) in [("a", ra), ("b", rb)] {
                     let err = r.err().unwrap_or_else(|| panic!("{which} is cancelled"));
+                    let err = format!("{err:#}");
                     assert!(
-                        format!("{err:#}").contains(&format!("run {which} cancelled")),
-                        "{err:#}"
+                        err.contains(&format!("run {which} cancelled"))
+                            && !err.contains("timed out"),
+                        "a request cancel is not a timeout: {err}"
                     );
                 }
             })
