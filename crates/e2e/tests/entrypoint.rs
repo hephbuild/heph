@@ -2385,3 +2385,42 @@ async fn shell_is_not_held_to_the_timeout() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// An entrypoint's tool finds its support files next to itself, as in a build
+/// (`tool_env::tool_support_files_are_staged_next_to_the_tool`): `hello`
+/// resolves its own path and reads `../lib/data.txt` from there.
+#[tokio::test]
+async fn entrypoint_tool_support_files_are_staged_next_to_the_tool() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "sdktool",
+        r#"
+target(
+    name = "tool",
+    driver = "bash",
+    run = [
+        "mkdir -p sdk/bin sdk/lib",
+        "echo hello > sdk/lib/data.txt",
+        "printf '#!/bin/sh\\ncat \"$(dirname \"$(readlink -f \"$0\")\")/../lib/data.txt\"\\n' > sdk/bin/hello",
+        "chmod +x sdk/bin/hello",
+    ],
+    out = {"hello": "sdk/bin/hello"},
+    support_files = ["sdk/"],
+)
+"#,
+    );
+    ws.write_build_file(
+        "app",
+        r#"
+target(name = "ep", driver = "bash", entrypoint = True, tools = ["//sdktool:tool"],
+       run = "exec > \"$HEPH_TEST_OUT\" 2>&1; hello")
+"#,
+    );
+    let out = ws.dir.path().join("out.txt");
+    let outcome = invoke(&ws.engine, request("//app:ep", ws.dir.path(), &[], &out)?).await;
+    let exit = exited(outcome);
+    let got = read(&out)?;
+    assert_eq!(exit, Exit::Code(0), "{got}");
+    assert_eq!(got.trim(), "hello", "{got}");
+    Ok(())
+}
