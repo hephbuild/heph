@@ -771,3 +771,52 @@ target(
     );
     Ok(())
 }
+
+/// A `glob()` dep produces one artifact per matched file. Every one of them
+/// must land in the layer at its own path, once — whether `srcs` is the bare
+/// glob or a list holding it.
+#[tokio::test]
+async fn test_a_glob_src_puts_each_file_at_its_own_path() -> anyhow::Result<()> {
+    for srcs in [r#"glob("*.js")"#, r#"[glob("*.js")]"#] {
+        let ws = workspace();
+        ws.write_file("app/a.js", "a");
+        ws.write_file("app/b.js", "bb");
+        ws.write_file("app/c.js", "ccc");
+        ws.write_file("app/skip.txt", "no");
+        ws.write_build_file(
+            "app",
+            &format!(
+                r#"
+target(
+    name = "layer",
+    driver = "oci.layer",
+    srcs = {srcs},
+    strip = "app",
+    prefix = "/transactions",
+)
+"#
+            ),
+        );
+        let r = ws.run("//app:layer").await?;
+        let bytes = htestkit::artifact_bytes(&r);
+        let mut ar = tar::Archive::new(std::io::Cursor::new(bytes));
+        let mut got = Vec::new();
+        for e in ar.entries()? {
+            let mut e = e?;
+            let path = e.path()?.to_string_lossy().into_owned();
+            let mut body = String::new();
+            std::io::Read::read_to_string(&mut e, &mut body)?;
+            got.push((path, body));
+        }
+        assert_eq!(
+            got,
+            vec![
+                ("transactions/a.js".to_string(), "a".to_string()),
+                ("transactions/b.js".to_string(), "bb".to_string()),
+                ("transactions/c.js".to_string(), "ccc".to_string()),
+            ],
+            "srcs = {srcs}"
+        );
+    }
+    Ok(())
+}

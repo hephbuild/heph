@@ -56,7 +56,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3Default;
 
-use super::{dep_files, ws_path};
+use super::{dep_files, dep_origins, ws_path};
 
 /// Origin id prefix of a `srcs` dep input. The index is in the id so a
 /// `HEPH_DEBUG_HASH` trace names the entry rather than "a src".
@@ -403,12 +403,16 @@ impl ManagedDriver for Driver {
 
         let mut entries: Vec<Entry> = Vec::new();
         let mut stripped_none: Vec<String> = Vec::new();
-        for input in &req.inputs {
-            if !input.input.origin_id.starts_with("srcs|") {
-                continue;
-            }
-            let from = input.input.source_addr.to_string();
-            for path in dep_files(&req, &input.input.origin_id)? {
+        // Per origin, not per input: a `glob()` dep reaches here as one input
+        // per matched file, and each origin's list already names all of them.
+        for origin in dep_origins(&req).filter(|o| o.starts_with("srcs|")) {
+            let from = req
+                .inputs
+                .iter()
+                .find(|m| m.input.origin_id == origin)
+                .map(|m| m.input.source_addr.to_string())
+                .unwrap_or_default();
+            for path in dep_files(&req, origin)? {
                 let ws_rel = path.strip_prefix(&req.sandbox_ws_dir).unwrap_or(&path);
                 match dest_path(ws_rel, def.strip.as_deref(), &def.prefix)? {
                     Some(dest) => {
