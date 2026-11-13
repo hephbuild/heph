@@ -567,7 +567,19 @@ async fn glob_gen_twice(
     between: impl FnOnce(&Workspace) -> anyhow::Result<()>,
     next: &str,
 ) -> anyhow::Result<Arc<Engine>> {
-    ws.write_build_file("p", GLOB_GEN);
+    gen_twice(ws, GLOB_GEN, words, between, next).await
+}
+
+/// Builds `build` (a `//p:gen` reading `p/n.txt`) with `words`, then again
+/// with `next` on a new engine.
+async fn gen_twice(
+    ws: &Workspace,
+    build: &str,
+    words: &str,
+    between: impl FnOnce(&Workspace) -> anyhow::Result<()>,
+    next: &str,
+) -> anyhow::Result<Arc<Engine>> {
+    ws.write_build_file("p", build);
     ws.write_file("p/n.txt", words);
     run_on(&ws.engine, "//p:gen").await?;
     between(ws)?;
@@ -685,6 +697,121 @@ async fn imported_leftover_is_dropped_not_deleted() -> anyhow::Result<()> {
 
     assert_eq!(read(&ws, "p/gen/b.txt").as_deref(), Some("file b"), "kept");
     assert_eq!(must_row(&e2, "p/gen/b.txt")?.state, RowState::Dropped);
+    Ok(())
+}
+
+/// A `copy` target shaped like a `node_modules` install: one package
+/// directory per word of `n.txt`, each with a nested file, under the
+/// directory output `node_modules/`.
+const DIR_GEN: &str = r#"
+target(
+    name = "gen",
+    driver = "bash",
+    deps = [file("n.txt")],
+    run = "mkdir -p node_modules; for w in $(cat n.txt); do mkdir -p node_modules/$w/lib; printf '{}' > node_modules/$w/package.json; printf 'm %s' \"$w\" > node_modules/$w/lib/index.js; done",
+    out = "node_modules/",
+    codegen = "copy",
+)
+"#;
+
+/// `GLOB_GEN` one directory deeper: `gen/<word>/x.txt` under `gen/**/*.txt`.
+const DEEP_GLOB_GEN: &str = r#"
+target(
+    name = "gen",
+    driver = "bash",
+    deps = [file("n.txt")],
+    run = "for w in $(cat n.txt); do mkdir -p gen/$w; printf 'file %s' \"$w\" > gen/$w/x.txt; done",
+    out = "gen/**/*.txt",
+    codegen = "copy",
+)
+"#;
+
+fn exists(ws: &Workspace, rel: &str) -> bool {
+    ws.dir.path().join(rel).symlink_metadata().is_ok()
+}
+
+/// A package dropped from the install goes whole: its files, then the
+/// directories their deletion emptied, as `rsync --delete` did. The
+/// packages still produced are untouched.
+#[tokio::test]
+async fn dropped_package_dir_is_removed() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    gen_twice(&ws, DIR_GEN, "a b", |_| Ok(()), "a").await?;
+
+    assert!(
+        !exists(&ws, "p/node_modules/b"),
+        "the emptied package dir goes"
+    );
+    assert_eq!(
+        read(&ws, "p/node_modules/a/lib/index.js").as_deref(),
+        Some("m a")
+    );
+    Ok(())
+}
+
+/// Only a directory the deletion emptied goes: one still holding a file heph
+/// never wrote stays (with it), and an empty directory nothing was deleted
+/// from (a tool's cache) is never touched.
+#[tokio::test]
+async fn emptied_dir_holding_a_foreign_file_is_kept() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    gen_twice(
+        &ws,
+        DIR_GEN,
+        "a b",
+        |ws| {
+            ws.write_file("p/node_modules/b/.marker", "mine");
+            std::fs::create_dir_all(ws.dir.path().join("p/node_modules/.vite/deps"))?;
+            Ok(())
+        },
+        "a",
+    )
+    .await?;
+
+    assert_eq!(
+        read(&ws, "p/node_modules/b/.marker").as_deref(),
+        Some("mine")
+    );
+    assert!(
+        !exists(&ws, "p/node_modules/b/lib"),
+        "its emptied subdir goes"
+    );
+    assert!(!exists(&ws, "p/node_modules/b/package.json"));
+    assert!(exists(&ws, "p/node_modules/.vite/deps"), "untouched");
+    Ok(())
+}
+
+/// The output's own directory is never removed, even when nothing is left
+/// in it.
+#[tokio::test]
+async fn emptied_output_root_is_kept() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    gen_twice(&ws, DIR_GEN, "a", |_| Ok(()), "").await?;
+
+    assert!(!exists(&ws, "p/node_modules/a"));
+    assert!(
+        ws.dir.path().join("p/node_modules").is_dir(),
+        "the output root stays"
+    );
+    Ok(())
+}
+
+/// A glob output prunes below its literal prefix (`p/gen`), never the
+/// prefix itself.
+#[tokio::test]
+async fn glob_output_prunes_below_its_prefix_only() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    gen_twice(&ws, DEEP_GLOB_GEN, "a b", |_| Ok(()), "a").await?;
+    assert!(
+        !exists(&ws, "p/gen/b"),
+        "the emptied dir below the prefix goes"
+    );
+    assert_eq!(read(&ws, "p/gen/a/x.txt").as_deref(), Some("file a"));
+
+    let ws = Workspace::new();
+    gen_twice(&ws, DEEP_GLOB_GEN, "a", |_| Ok(()), "").await?;
+    assert!(!exists(&ws, "p/gen/a"));
+    assert!(ws.dir.path().join("p/gen").is_dir(), "the prefix stays");
     Ok(())
 }
 

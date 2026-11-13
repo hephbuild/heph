@@ -55,6 +55,8 @@ pub trait IndexFs: Send + Sync {
     fn fresh_hash(&self, path: &Path, x: bool) -> Result<String>;
     /// `unlink(2)`.
     fn unlink(&self, path: &Path) -> io::Result<()>;
+    /// `rmdir(2)`: removes `path` only when it is an empty directory.
+    fn rmdir(&self, path: &Path) -> io::Result<()>;
 }
 
 /// The real filesystem, with lookups' hashes cached by the shared walker.
@@ -123,6 +125,10 @@ impl IndexFs for RealFs {
 
     fn unlink(&self, path: &Path) -> io::Result<()> {
         std::fs::remove_file(path)
+    }
+
+    fn rmdir(&self, path: &Path) -> io::Result<()> {
+        std::fs::remove_dir(path)
     }
 }
 

@@ -612,6 +612,9 @@ mod tests {
         fn unlink(&self, path: &Path) -> std::io::Result<()> {
             std::fs::remove_file(path)
         }
+        fn rmdir(&self, path: &Path) -> std::io::Result<()> {
+            std::fs::remove_dir(path)
+        }
     }
 
     struct Ws {

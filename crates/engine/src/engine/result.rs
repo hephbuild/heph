@@ -1008,8 +1008,12 @@ pub struct CopyOutputs {
     /// Output group names, indexed by the entries below.
     groups: Vec<String>,
     files: rustc_hash::FxHashMap<Vec<u8>, usize>,
+    /// Each dir output's directory, with a trailing `/`.
     dirs: Vec<(Vec<u8>, usize)>,
     globs: Vec<(wax::Glob<'static>, usize)>,
+    /// Each glob's literal prefix (`p/gen` for `p/gen/**/*.txt`), with a
+    /// trailing `/` unless it is empty.
+    glob_roots: Vec<Vec<u8>>,
 }
 
 impl CopyOutputs {
@@ -1021,6 +1025,7 @@ impl CopyOutputs {
             files: rustc_hash::FxHashMap::default(),
             dirs: Vec::new(),
             globs: Vec::new(),
+            glob_roots: Vec::new(),
         };
         for output in &target.outputs {
             let group = out.groups.len();
@@ -1040,12 +1045,18 @@ impl CopyOutputs {
                         d.push(b'/');
                         out.dirs.push((d, group));
                     }
-                    Content::Glob(p) => out.globs.push((
-                        wax::Glob::new(p)
+                    Content::Glob(p) => {
+                        let glob = wax::Glob::new(p)
                             .map(wax::Glob::into_owned)
-                            .with_context(|| format!("compile copy output glob {p}"))?,
-                        group,
-                    )),
+                            .with_context(|| format!("compile copy output glob {p}"))?;
+                        let (prefix, _) = glob.clone().partition();
+                        let mut root = prefix.into_os_string().into_encoded_bytes();
+                        if !root.is_empty() {
+                            root.push(b'/');
+                        }
+                        out.glob_roots.push(root);
+                        out.globs.push((glob, group));
+                    }
                 }
             }
             if any {
@@ -1086,6 +1097,16 @@ impl CopyOutputs {
 
     pub fn contains(&self, rel: &[u8]) -> bool {
         self.output_of(rel).is_some()
+    }
+
+    /// Whether the root-relative directory `dir` lies strictly below the
+    /// root of a `copy` output: a dir output's directory, or a glob's literal
+    /// prefix. The write-back may remove such a directory once deleting
+    /// leftovers emptied it; a root itself, and a file output's directory,
+    /// are never below one.
+    pub fn below_root(&self, dir: &[u8]) -> bool {
+        self.dirs.iter().any(|(d, _)| dir.starts_with(d))
+            || self.glob_roots.iter().any(|r| dir.starts_with(r))
     }
 }
 
@@ -4118,7 +4139,7 @@ impl Engine {
             )?;
             let outputs = CopyOutputs::of(&target)?;
             let report = wb
-                .settle(&|p| outputs.contains(p))
+                .settle_with(&|p| outputs.contains(p), &|d| outputs.below_root(d))
                 .with_context(|| format!("recording {addr}'s codegen write-back"))?;
             Ok((written, report, outside_section, no_section_hint))
         }))
@@ -4210,6 +4231,9 @@ impl Engine {
     /// This walks every generated file, reads its bytes out of the cache, reads the
     /// tree file back and (when frozen) diffs the two — the heaviest synchronous
     /// read on the result path, and one that parks on any queued sqlite write to
+        for dir in &report.removed_dirs {
+            tracing::debug!(addr = %addr, dir = %String::from_utf8_lossy(dir), "removed a directory the deleted codegen outputs left empty");
+        }
     /// the artifact it is walking. It does not belong on a runtime worker, so it is
     /// synchronous and called only through `hcore::blocking::run`.
     ///
