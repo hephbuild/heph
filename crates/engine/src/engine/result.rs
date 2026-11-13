@@ -1148,46 +1148,6 @@ fn create_in_dir(
     }
 }
 
-#[cfg(test)]
-mod create_in_dir_tests {
-    use super::create_in_dir;
-
-    /// The parent vanishing between its creation and the write (another
-    /// write-back removing it as emptied) costs one retry, not the build.
-    #[test]
-    fn parent_removed_before_the_write_is_recreated() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let dest = dir.path().join("nm/pkg/index.js");
-        let mut raced = false;
-        create_in_dir(&dest, || {
-            if !raced {
-                raced = true;
-                std::fs::remove_dir(dest.parent().expect("parent"))?;
-            }
-            std::fs::write(&dest, "x")
-        })
-        .expect("retried");
-        assert_eq!(std::fs::read_to_string(&dest).expect("written"), "x");
-    }
-
-    /// A second miss is an error, not a loop.
-    #[test]
-    fn parent_removed_twice_fails() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let dest = dir.path().join("nm/pkg/index.js");
-        let err = create_in_dir(&dest, || {
-            std::fs::remove_dir(dest.parent().expect("parent"))?;
-            std::fs::write(&dest, "x")
-        })
-        .expect_err("gives up");
-        assert!(
-            err.downcast_ref::<std::io::Error>()
-                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound),
-            "{err:#}"
-        );
-    }
-}
-
 /// The in-place guard (spec: Readers): an `in_place` target leaves a path
 /// the codegen index records as another target's (`Generated` or
 /// `Modified`) to its owner, and refuses one recorded for itself — a
@@ -5855,6 +5815,41 @@ fn rewrite_query_inputs(
 mod tests {
     use super::*;
     use crate::engine::Config;
+
+    /// The parent vanishing between its creation and the write (another
+    /// write-back removing it as emptied) costs one retry, not the build.
+    #[test]
+    fn create_in_dir_recreates_a_parent_removed_before_the_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("nm/pkg/index.js");
+        let mut raced = false;
+        create_in_dir(&dest, || {
+            if !raced {
+                raced = true;
+                std::fs::remove_dir(dest.parent().expect("parent"))?;
+            }
+            std::fs::write(&dest, "x")
+        })
+        .expect("retried");
+        assert_eq!(std::fs::read_to_string(&dest).expect("written"), "x");
+    }
+
+    /// A second miss is an error, not a loop.
+    #[test]
+    fn create_in_dir_fails_when_the_parent_is_removed_twice() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("nm/pkg/index.js");
+        let err = create_in_dir(&dest, || {
+            std::fs::remove_dir(dest.parent().expect("parent"))?;
+            std::fs::write(&dest, "x")
+        })
+        .expect_err("gives up");
+        assert!(
+            err.downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+            "{err:#}"
+        );
+    }
     use crate::engine::provider::{
         ConfigRequest, ConfigResponse, ListPackageResponse, ListPackagesRequest, ListResponse,
         ProbeRequest, ProbeResponse,
