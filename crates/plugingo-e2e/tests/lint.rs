@@ -143,6 +143,25 @@ async fn go_format_stages_sources_through_fs_glob() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The sources glob reaches the driver as one input per matched file, all sharing
+/// one origin whose list names every file. Reading that list once per *input*
+/// handed heph-govet each file once per `.go` file in the package, so with
+/// `lib.go` and `two.go` staged, `two.go` was reported twice. Read once per
+/// origin, it is reported once.
+#[tokio::test]
+async fn go_format_check_reports_each_unformatted_file_once() -> anyhow::Result<()> {
+    require_go!();
+    let ws = format_workspace()?;
+
+    let Err(err) = ws.run("//lib:format-check").await else {
+        panic!("format-check passed, but lib/two.go is not gofmt-clean");
+    };
+    let msg = format!("{err:#}");
+    assert!(msg.contains("1 file(s) need formatting"), "{msg}");
+    assert_eq!(msg.matches("two.go").count(), 1, "{msg}");
+    Ok(())
+}
+
 /// A `.go` file a `copy` generator wrote into the package is not a source: the
 /// fs glob does not stage it, so `format` neither collects nor rewrites it.
 #[tokio::test]

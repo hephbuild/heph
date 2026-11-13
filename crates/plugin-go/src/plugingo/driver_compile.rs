@@ -12,6 +12,7 @@
 //! `-shared`, `-symabis`, `-asmhdr`, `-embedcfg`) so archives stay
 //! byte-compatible.
 
+use crate::plugingo::deps::{DepGroups, dep_origin};
 use crate::plugingo::embed;
 use crate::plugingo::factors::BuildMode;
 use crate::plugingo::listed;
@@ -197,6 +198,9 @@ struct GoCompileDef {
     /// see `plugingo::runner`: it reaches the cache key through the hashout of
     /// the input `parse` emits, exactly as a `hash_dep` does.
     runner: Option<TargetAddr>,
+    /// Deliberately absent from `Hash`: see [`DepGroups`].
+    #[serde(default)]
+    deps: DepGroups,
 }
 
 /// Bump to invalidate every cached `go_compile` archive whenever the compile
@@ -300,7 +304,7 @@ impl ManagedDriver for GoCompileDriver {
                 BTreeMap::new()
             };
             for (i, addr_str) in addrs.iter().enumerate() {
-                let origin_id = format!("dep|{group}|{i}");
+                let origin_id = dep_origin(group, i);
                 if group == "golist" && golist_origin_id.is_none() {
                     golist_origin_id = Some(origin_id.clone());
                 }
@@ -357,6 +361,7 @@ impl ManagedDriver for GoCompileDriver {
                 None
             },
             embed_src_origin_ids,
+            deps: DepGroups::of(&spec.deps),
         };
 
         let outputs: Vec<Output> = spec
@@ -534,7 +539,7 @@ impl ManagedDriver for GoCompileDriver {
             for ip in &import_paths {
                 let group = crate::plugingo::addr_util::import_path_to_dep_group(ip);
                 let archive = self
-                    .single_staged_path(&req, &group)
+                    .single_staged_path(&req, &def.deps, &group)
                     .with_context(|| format!("locate staged archive for lib {ip}"))?;
                 importcfg.push_str(&format!("packagefile {ip}={archive}\n"));
             }
@@ -542,7 +547,7 @@ impl ManagedDriver for GoCompileDriver {
             std::fs::write(&importcfg_path, &importcfg).context("write importcfg")?;
 
             // 2. sources response file: every staged `.go` source in the default group.
-            let src_paths = self.group_staged_paths(&req, "");
+            let src_paths = def.deps.staged_paths(&req, "")?;
             let rsp_path = pkg_dir.join("gofiles.rsp");
             std::fs::write(&rsp_path, src_paths.join("\n"))
                 .context("write sources response file")?;
@@ -729,35 +734,14 @@ impl ManagedDriver for GoCompileDriver {
 }
 
 impl GoCompileDriver {
-    /// All staged file paths for the inputs in dep `group` (origin `dep|group|*`).
-    fn group_staged_paths(&self, req: &ManagedRunRequest<'_, '_>, group: &str) -> Vec<String> {
-        let prefix = format!("dep|{group}|");
-        let mut out: Vec<String> = Vec::new();
-        for m in &req.inputs {
-            if !m.input.origin_id.starts_with(&prefix) {
-                continue;
-            }
-            let Ok(list_path) = m.require_list_path() else {
-                continue;
-            };
-            if let Ok(f) = std::fs::File::open(list_path) {
-                for line in std::io::BufReader::new(f).lines().map_while(Result::ok) {
-                    if !line.is_empty() {
-                        out.push(line);
-                    }
-                }
-            }
-        }
-        out
-    }
-
     /// The single staged path for a one-output group (e.g. a lib archive).
     fn single_staged_path(
         &self,
         req: &ManagedRunRequest<'_, '_>,
+        deps: &DepGroups,
         group: &str,
     ) -> anyhow::Result<String> {
-        self.group_staged_paths(req, group)
+        deps.staged_paths(req, group)?
             .into_iter()
             .next()
             .ok_or_else(|| anyhow::anyhow!("no staged file for dep group {group}"))
@@ -1513,6 +1497,7 @@ mod driver_tests {
             embed_variant: None,
             golist_origin_id: None,
             embed_src_origin_ids: vec![],
+            deps: DepGroups::default(),
         }
     }
 
@@ -1536,6 +1521,7 @@ mod driver_tests {
             embed_variant: None,
             golist_origin_id: None,
             embed_src_origin_ids: vec![],
+            deps: DepGroups::default(),
         };
         let a = mk(&["net", "os", "errors", "io", "crypto/rand"]);
         let b = mk(&["crypto/rand", "io", "net", "errors", "os"]);

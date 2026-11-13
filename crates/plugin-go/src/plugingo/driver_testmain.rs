@@ -1,3 +1,4 @@
+use crate::plugingo::deps::dep_origin;
 use crate::plugingo::gen_testmain::{analyze_test_main, generate_testmain};
 use crate::plugingo::pkg_analysis::decode_go_package;
 use anyhow::Context;
@@ -104,7 +105,7 @@ impl ManagedDriver for GoTestmainDriver {
             anyhow::bail!("go_testmain: deps.golist must have at least one entry");
         }
 
-        let golist_origin_id = "dep|golist|0".to_string();
+        let golist_origin_id = dep_origin("golist", 0);
 
         let mut inputs: Vec<Input> = Vec::new();
         for (i, addr_str) in golist_addrs.iter().enumerate() {
@@ -112,7 +113,7 @@ impl ManagedDriver for GoTestmainDriver {
                 r#ref: TargetAddr::parse(addr_str, &pkg)
                     .with_context(|| format!("parse golist dep addr {addr_str}"))?,
                 mode: InputMode::Standard,
-                origin_id: format!("dep|golist|{i}"),
+                origin_id: dep_origin("golist", i),
                 annotations: std::collections::BTreeMap::new(),
                 hashed: true,
                 runtime: true,
@@ -129,7 +130,7 @@ impl ManagedDriver for GoTestmainDriver {
                         r#ref: TargetAddr::parse(addr_str, &pkg)
                             .with_context(|| format!("parse {group} src dep addr {addr_str}"))?,
                         mode: InputMode::Standard,
-                        origin_id: format!("dep|{group}|{i}"),
+                        origin_id: dep_origin(group, i),
                         annotations: std::collections::BTreeMap::new(),
                         hashed: true,
                         runtime: true,

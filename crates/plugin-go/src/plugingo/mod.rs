@@ -1,5 +1,6 @@
 mod addr_util;
 mod cc_toolchain;
+mod deps;
 mod driver_compile;
 mod driver_download;
 mod driver_format;

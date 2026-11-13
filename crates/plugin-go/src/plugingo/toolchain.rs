@@ -371,11 +371,16 @@ pub(crate) fn host_goroot(go_bin: &std::path::Path) -> anyhow::Result<std::path:
 /// staged into this sandbox via the `gosdk` dep. The dep's output is either a
 /// full GOROOT tree (we pick its `bin/go`) or a single `go` binary (a hostbin or
 /// nix wrapper); when both shapes appear, prefer a `.../bin/go`.
+///
+/// The group holds exactly the one dep [`go_sdk_dep`] declares, so its origin is
+/// the group's first.
+///
+/// [`go_sdk_dep`]: crate::plugingo::addr_util::go_sdk_dep
 pub(crate) fn resolve_target_go(inputs: &[ManagedRunInput]) -> anyhow::Result<std::path::PathBuf> {
-    let prefix = format!("dep|{}|", crate::plugingo::addr_util::GO_SDK_DEP_GROUP);
+    let origin = crate::plugingo::deps::dep_origin(crate::plugingo::addr_util::GO_SDK_DEP_GROUP, 0);
     let gosdk = inputs
         .iter()
-        .find(|m| m.input.origin_id.starts_with(&prefix))
+        .find(|m| m.input.origin_id == origin)
         .context("go toolchain: target `gosdk` dep not staged")?;
 
     // Only paths are needed to locate the `go` binary — `entry_paths` is

@@ -393,7 +393,7 @@ impl ManagedDriver for GoDownloadDriver {
                     r#ref: TargetAddr::parse(addr, &pkg)
                         .with_context(|| format!("parse dep addr {addr}"))?,
                     mode: InputMode::Standard,
-                    origin_id: format!("dep|{group}|{i}"),
+                    origin_id: crate::plugingo::deps::dep_origin(group, i),
                     annotations: annotations.clone(),
                     hashed: true,
                     runtime: true,
