@@ -1671,6 +1671,49 @@ mod tests {
         );
     }
 
+    /// The engine's `sandbox` pool reads like any other, from a live pool:
+    /// held/capacity with the queue, and a run waiting for cleanup is the
+    /// head waiting for `sandbox 1 (0 free)` while cpu is free.
+    #[test]
+    fn report_lists_the_sandbox_pool_and_a_run_waiting_on_it() {
+        use crate::engine::resource_pool::{ResourcePool, resolve_capacities};
+        use futures::FutureExt as _;
+        use hcore::capacity::{Capacity, PoolSpec, Unit};
+        use hplugin::provider::PoolName;
+        let specs = std::collections::BTreeMap::from([(
+            PoolName::sandbox(),
+            PoolSpec {
+                unit: Unit::Count,
+                capacity: Some(Capacity::Amount(1)),
+            },
+        )]);
+        let pool = ResourcePool::new(resolve_capacities(&specs, 2, || 0));
+        let slot = [(PoolName::sandbox(), 1)];
+        let mut held = pool
+            .acquire_with(&hplugin::driver::Demand::default(), &slot)
+            .expect("acquire")
+            .now_or_never()
+            .expect("granted at once")
+            .expect("granted");
+        // The run ended; its slot rides into the removal still owed.
+        let _pending_removal = held.split_off(PoolName::SANDBOX).expect("the slot");
+        drop(held);
+        let mut waiter = pool
+            .acquire_with(&hplugin::driver::Demand::default(), &slot)
+            .expect("acquire");
+        assert!(
+            (&mut waiter).now_or_never().is_none(),
+            "the only slot is out"
+        );
+
+        let text = render_pools(&pool.snapshot(), Instant::now());
+        assert!(
+            text.contains("cpu 0/2, memory 0 B/unbounded, sandbox 1/1; 1 queued"),
+            "{text}"
+        );
+        assert!(text.contains("waits for sandbox 1 (0 free)"), "{text}");
+    }
+
     /// A `--shell` target owning the terminal must not read as a stall.
     ///
     /// A person at a prompt opens no spans, closes none and moves no bytes —
