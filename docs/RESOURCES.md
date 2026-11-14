@@ -202,6 +202,11 @@ bounds the build sandboxes on disk, **running or awaiting removal**:
 - It is **always bounded**: there is no unbounded form, and `0` is refused on
   every surface (the config's "the caller sets it" included), as is a unit
   other than `count`. A pool of your own named `sandbox` must be renamed.
+- Admission is strict FIFO, so a managed run at the head of the queue that
+  waits for a `sandbox` slot holds back every run behind it, including one
+  that takes no slot (a `template` target) and would fit the free cpu. This
+  is deliberate: letting such runs pass would let a stream of them starve the
+  waiting run, the same reason no other pool's head is overtaken.
 
 A `cpu: 0` managed target needs a sandbox slot, so it is no longer zero-cost
 and queues like any other run. When removal falls behind, runs wait in

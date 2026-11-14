@@ -625,3 +625,62 @@ async fn a_run_cancelled_while_queued_on_the_sandbox_pool_is_a_cancellation() ->
     all_capacity_back(&engine).await;
     Ok(())
 }
+
+/// Strict FIFO, accepted on purpose (`docs/RESOURCES.md`): a managed run at
+/// the head of the queue waiting for a `sandbox` slot holds back every run
+/// behind it, even one that needs no slot and fits the free cpu. Here the
+/// template target `conf` (one cpu, of four free) waits behind `parked`
+/// until busy's removal gives the slot back. Pinned so that changing it is a
+/// decision rather than an accident.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_waiting_on_sandbox_holds_back_the_runs_behind_it() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("p"))?;
+    std::fs::write(root.join("p/conf.j2"), "name: {{ name }}\n")?;
+    write_build(
+        root,
+        "p",
+        &format!(
+            "{}{}{}",
+            target("busy", "echo busy > $OUT", None),
+            target("parked", "echo parked > $OUT", None),
+            r#"
+target(name = "conf", driver = "template", src = file("conf.j2"), out = "conf",
+       vars = {"name": "x"})
+"#,
+        ),
+    );
+    let (engine, gate) = gated_engine(root, 1)?;
+
+    let busy = exhaust_the_pool(&engine).await?;
+    let spawn_build = |addr: &str| {
+        let (engine, addrs) = (Arc::clone(&engine), vec![addr.to_owned()]);
+        tokio::spawn(async move { build(&engine, &addrs).await })
+    };
+    let parked = spawn_build("//p:parked");
+    snapshot_until(&engine, "parked at the head, waiting on sandbox", |s| {
+        s.main.queued == 1 && head_waits_on_sandbox(s)
+    })
+    .await;
+    let conf = spawn_build("//p:conf");
+    snapshot_until(&engine, "conf queued behind parked", |s| s.main.queued == 2).await;
+
+    let s = snapshot(&engine).expect("the pool is built");
+    assert_eq!(held(&s, PoolName::CPU), 0, "every cpu is free: {s:?}");
+    assert!(
+        head_waits_on_sandbox(&s),
+        "the head waits on sandbox: {s:?}"
+    );
+    assert!(
+        !conf.is_finished(),
+        "conf needs no slot and fits the free cpu, and still waits"
+    );
+
+    gate.open();
+    tokio::time::timeout(DEADLINE, parked).await???;
+    tokio::time::timeout(DEADLINE, conf).await???;
+    drain(busy).await;
+    all_capacity_back(&engine).await;
+    Ok(())
+}
