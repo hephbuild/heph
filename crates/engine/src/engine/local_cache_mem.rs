@@ -145,6 +145,16 @@ impl LocalCache for LocalCacheMem {
         self.inner.exists_committed(addr, hashin, name)
     }
 
+    /// Forwarded rather than defaulted: the default's `reader` would drain a
+    /// large blob into this tier only to measure it. A resident entry holds the
+    /// stored bytes verbatim, so its length answers without the inner backend.
+    fn stored_size(&self, addr: &Addr, hashin: &str, name: &str) -> Result<Option<u64>> {
+        if let Some(buf) = self.cache.peek(&Self::key(addr, hashin, name)) {
+            return Ok(Some(buf.len() as u64));
+        }
+        self.inner.stored_size(addr, hashin, name)
+    }
+
     fn delete(&self, addr: &Addr, hashin: &str, name: &str) -> Result<()> {
         let key = Self::key(addr, hashin, name);
         self.cache.remove(&key);

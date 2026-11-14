@@ -1949,6 +1949,7 @@ dependencies = [
  "which",
  "xattr",
  "xxhash-rust",
+ "zstd",
 ]
 
 [[package]]

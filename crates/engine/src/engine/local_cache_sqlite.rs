@@ -1062,6 +1062,27 @@ impl LocalCache for LocalCacheSQLite {
         Self::exists_committed(self, &Self::key(addr), hashin, name)
     }
 
+    /// One point lookup of `length(data)`, rather than the default's `reader`,
+    /// which spawns a copy of a large blob into a pipe only to drop it.
+    fn stored_size(&self, addr: &Addr, hashin: &str, name: &str) -> Result<Option<u64>> {
+        let addr_key = Self::key(addr);
+        self.pending.wait_if_pending(&addr_key, hashin, name);
+        let conn = self.read_conn()?;
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT length(data) FROM artifacts WHERE addr=?1 AND hashin=?2 AND name=?3",
+            )
+            .context("preparing stored size lookup")?;
+        match stmt.query_row(rusqlite::params![addr_key, hashin, name], |row| {
+            row.get::<_, i64>(0)
+        }) {
+            Ok(len) => Ok(Some(u64::try_from(len).unwrap_or(0))),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e)
+                .with_context(|| format!("looking up the stored size of {name} in sqlite cache")),
+        }
+    }
+
     fn list_targets(&self) -> Result<TargetStream> {
         // Stream distinct addrs over a bounded channel: the producer holds one
         // pooled connection and a `SELECT DISTINCT addr` cursor on a dedicated

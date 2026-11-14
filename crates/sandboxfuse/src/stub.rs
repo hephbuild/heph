@@ -18,6 +18,11 @@ impl Layer {
     pub fn new(index: TarIndex, open: LayerOpener) -> Self {
         Self { index, open }
     }
+
+    /// No-op: nothing is served without FUSE.
+    pub fn with_read_chunk(self, _chunk: usize) -> Self {
+        self
+    }
 }
 
 pub struct LayeredFs {

@@ -22,6 +22,13 @@ mod support;
 
 pub use support::{FuseSupport, support_check};
 
+/// Read chunk for a layer whose source is a compressed cache blob: the
+/// blob's seekable zstd frame size, so a chunk decodes exactly one frame.
+pub const COMPRESSED_READ_CHUNK: usize = 1 << 20;
+
+#[cfg(all(unix, feature = "fuse-sandbox"))]
+mod chunk_cache;
+
 #[cfg(all(unix, feature = "fuse-sandbox"))]
 mod imp;
 

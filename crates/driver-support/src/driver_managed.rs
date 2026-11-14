@@ -713,7 +713,9 @@ pub fn list_path_for(input: &RunInput, list_dir: &Path) -> Option<PathBuf> {
 /// Path enumeration goes through [`Content::entry_paths`], which the tar-backed
 /// cache artifact implements as a header-only scan (seeking past file data), so
 /// the check stays cheap and does not read the input bytes the FUSE path is
-/// designed never to touch — the format detail stays behind the trait.
+/// designed never to touch — the format detail stays behind the trait. For a
+/// zstd-compressed blob the scan decodes the frames that hold tar headers and
+/// skips those holding only file data.
 ///
 /// Runs on the execution (cache-miss) path before any input is materialized, so
 /// a collision fails fast with both producers named rather than silently
@@ -836,7 +838,8 @@ pub async fn unpack_blocking(
 /// groups so the job can own them.
 ///
 /// The check is not the cheap map walk it looks like: `entry_paths()` on a
-/// cache-backed input is a header scan over a sqlite blob, and it goes through
+/// cache-backed input is a header scan over a sqlite blob (decoding the frames
+/// that hold headers, when the blob is compressed), and it goes through
 /// `LocalCacheSQLite::seekable_reader`, which parks the calling thread until any
 /// queued write to that key has been committed by the single writer thread.
 /// Inline in an `async fn` that is exactly the runtime-worker stall

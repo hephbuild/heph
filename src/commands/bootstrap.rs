@@ -20,7 +20,7 @@ use crate::{
 /// silently degrades to inline execution if saturated; the explicit `8 × N + 64`
 /// gives clear headroom without ever hitting the cliff.
 ///
-/// The heavy synchronous work — cache writes, gzip, starlark evaluation, the Go
+/// The heavy synchronous work — cache writes, zstd, starlark evaluation, the Go
 /// package walks — does *not* draw on this pool: it runs on `hcore::blocking`'s own
 /// dedicated threads, which is what keeps these `n` workers free to poll the
 /// reactor and the timer wheel.
