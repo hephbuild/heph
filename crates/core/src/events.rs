@@ -41,6 +41,22 @@
 //!
 //! `scripts/abi-check.sh` watches this file and will flag changes for review.
 //!
+//! # It is also an on-disk format
+//!
+//! Every heph process records its session to `~/.heph/sessions/<id>/events.ndjson`
+//! (`crates/tui/src/tui/session/`), and a viewer from a **different heph version**
+//! reads it back: `heph session show|attach` of a run started by an older or newer
+//! binary. Each line is a record envelope `{at_unix_ms, kind?, session?}` whose
+//! `kind` is a [`BuildEventKind`] encoded byte-for-byte as on the plugin wire, so
+//! the rules above bind the file exactly as they bind the seam. Session-only
+//! records (log lines, the final exit, truncation) live under the envelope's
+//! `session` key, never as `BuildEventKind` variants: they are not build events,
+//! and a plugin hook must never receive one.
+//!
+//! The session reader is the one consumer allowed — required — to skip a line it
+//! cannot decode and carry on, counting it; the stop-on-first-error rule above
+//! is the plugin SDK's and does not apply to a file a later heph appends to.
+//!
 //! # Counting cache hits
 //!
 //! The four tier events — [`LocalCacheHit`](BuildEventKind::LocalCacheHit),

@@ -586,6 +586,18 @@ impl Op {
         }
     }
 
+    /// The op's name in a [`crate::tui::session::SessionSnapshot`]. Part of the
+    /// snapshot's JSON: renaming one is a format change.
+    fn name(self) -> &'static str {
+        match self {
+            Op::RemoteCacheRead => "remote_cache_read",
+            Op::ScratchPrepare => "scratch_prepare",
+            Op::Execute => "execute",
+            Op::LocalCacheWrite => "local_cache_write",
+            Op::RemoteCacheWrite => "remote_cache_write",
+        }
+    }
+
     /// Pipeline ordinal for stable left-to-right ordering of the breakdown:
     /// remote download → scratch warm → execute → local-cache write → remote
     /// upload. This is the order the engine runs them in, so a row reads
@@ -737,10 +749,14 @@ pub struct BuildState {
     /// Server timestamp of the first event seen — the run's start anchor for the
     /// header's elapsed clock. `None` until any event lands.
     started_at_ms: Option<u64>,
+    /// Server timestamp of the latest event seen — how long the run has been
+    /// quiet, for a session viewer. `None` until any event lands.
+    last_event_ms: Option<u64>,
     /// Addrs blocked on the result lock past the notice threshold, mapped to
-    /// what is known of the holder. Added on `ResultLockWaitStart`, removed on
-    /// `ResultLockWaitEnd`, so it reflects only currently-blocked waits.
-    lock_waits: HashMap<String, LockHolder>,
+    /// what is known of the holder and when the wait was announced. Added on
+    /// `ResultLockWaitStart`, removed on `ResultLockWaitEnd`, so it reflects
+    /// only currently-blocked waits.
+    lock_waits: HashMap<String, (LockHolder, u64)>,
     /// Consumers blocked on a scratch slot, keyed by the *consumer* addr so a
     /// wait can be removed when its own `ScratchLockWaitEnd` lands.
     ///
@@ -897,6 +913,10 @@ impl BuildState {
             Some(t) => t.min(ev.at_unix_ms),
             None => ev.at_unix_ms,
         });
+        self.last_event_ms = Some(
+            self.last_event_ms
+                .map_or(ev.at_unix_ms, |t| t.max(ev.at_unix_ms)),
+        );
         // Generic op timeline: any event that is an op boundary folds here,
         // independent of the counter side effects handled in the match below.
         if let Some((addr, op, boundary)) = event_op_boundary(&ev.kind) {
@@ -1120,7 +1140,10 @@ impl BuildState {
             } => {
                 self.lock_waits.insert(
                     addr.clone(),
-                    LockHolder::of(*holder_pid, *in_use_by_readers),
+                    (
+                        LockHolder::of(*holder_pid, *in_use_by_readers),
+                        ev.at_unix_ms,
+                    ),
                 );
             }
             BuildEventKind::ResultLockWaitEnd { addr } => {
@@ -1700,11 +1723,11 @@ impl BuildState {
     /// Sorted by addr so the order is stable across frames. Empty when nothing
     /// is blocked.
     pub fn lock_wait_lines(&self) -> Vec<Line<'static>> {
-        let mut waits: Vec<(&String, &LockHolder)> = self.lock_waits.iter().collect();
+        let mut waits: Vec<(&String, &(LockHolder, u64))> = self.lock_waits.iter().collect();
         waits.sort_by(|a, b| a.0.cmp(b.0));
         waits
             .into_iter()
-            .map(|(addr, holder)| {
+            .map(|(addr, (holder, _))| {
                 let holder = match holder {
                     LockHolder::Pid(pid) => format!("locked by pid {pid}"),
                     LockHolder::Readers => "locked, in use".to_string(),
@@ -1716,6 +1739,90 @@ impl BuildState {
                 ))
             })
             .collect()
+    }
+
+    /// What this state says a session is doing, as `status.json` and `--json`
+    /// carry it. Full lists, each sorted so two folds of the same events
+    /// produce the same bytes. `end` and `truncated` are the recorder's to set.
+    ///
+    /// Walks the in-flight sets (open ops, waits) and the failure list, never
+    /// every target; called at most once a second by the recorder.
+    pub fn snapshot(&self) -> crate::tui::session::SessionSnapshot {
+        use crate::tui::session::format::{
+            AdmissionWaitEntry, LockWaitEntry, RunningTarget, SessionSnapshot, SnapshotCounts,
+        };
+        let count = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+        let mut running: Vec<RunningTarget> = self
+            .open_ops
+            .iter()
+            .filter_map(|addr| {
+                let (op, since) = self.ops.get(addr)?.active?;
+                Some(RunningTarget {
+                    addr: addr.clone(),
+                    op: op.name().to_owned(),
+                    since_unix_ms: since,
+                })
+            })
+            .collect();
+        running.sort_by(|a, b| {
+            a.since_unix_ms
+                .cmp(&b.since_unix_ms)
+                .then_with(|| a.addr.cmp(&b.addr))
+        });
+        let mut lock_waits: Vec<LockWaitEntry> = self
+            .lock_waits
+            .iter()
+            .map(|(addr, (holder, since))| LockWaitEntry {
+                addr: addr.clone(),
+                holder_pid: match holder {
+                    LockHolder::Pid(pid) => Some(*pid),
+                    LockHolder::Readers | LockHolder::Unknown => None,
+                },
+                in_use_by_readers: *holder == LockHolder::Readers,
+                since_unix_ms: *since,
+            })
+            .collect();
+        lock_waits.sort_by(|a, b| a.addr.cmp(&b.addr));
+        let mut admission_waits: Vec<AdmissionWaitEntry> = self
+            .admission_waits
+            .iter()
+            .map(|(addr, w)| AdmissionWaitEntry {
+                addr: addr.clone(),
+                pool: w.pool.clone(),
+                need: w.need,
+                free: w.free,
+                ahead: w.ahead,
+                since_unix_ms: w.since_ms,
+            })
+            .collect();
+        admission_waits.sort_by(|a, b| a.addr.cmp(&b.addr));
+        let mut waiting: Vec<String> = lock_waits
+            .iter()
+            .map(|w| w.addr.clone())
+            .chain(admission_waits.iter().map(|w| w.addr.clone()))
+            .collect();
+        waiting.sort();
+        waiting.dedup();
+        SessionSnapshot {
+            first_event_unix_ms: self.started_at_ms,
+            last_event_unix_ms: self.last_event_ms,
+            counts: SnapshotCounts {
+                matched: self.matched_seen.then(|| count(self.matched.len())),
+                matched_complete: self.matched_complete,
+                matched_done: count(self.matched_finished),
+                matched_cached: count(self.matched_cached),
+                finished: count(self.finished.len()),
+                in_flight: count(self.in_flight_results.len()),
+                executed: count(self.executed),
+                failed: count(self.errored),
+            },
+            running,
+            waiting,
+            failed: self.failed.iter().map(|(addr, _)| addr.clone()).collect(),
+            lock_waits,
+            admission_waits,
+            ..SessionSnapshot::default()
+        }
     }
 }
 
@@ -1789,6 +1896,11 @@ pub trait ProgressHeader: Send {
     /// on (the `a` toggle), so the printed summary matches the header the user
     /// was reading; state-private headers ignore it.
     fn last_render(&self, core: &BuildState, scope: CountScope) -> String;
+    /// Which header a session viewer should rebuild for this run. Defaults to
+    /// the build counts.
+    fn session_kind(&self) -> crate::tui::session::HeaderKind {
+        crate::tui::session::HeaderKind::Build
+    }
 }
 
 /// Build/query/inspect header: the elapsed-clock counts segment plus worker
@@ -1946,6 +2058,10 @@ impl ProgressHeader for GcHeader {
         self.label.clone()
     }
 
+    fn session_kind(&self) -> crate::tui::session::HeaderKind {
+        crate::tui::session::HeaderKind::Gc
+    }
+
     fn last_render(&self, _core: &BuildState, _scope: CountScope) -> String {
         if self.targets > 0 || self.failure_logs.is_some_and(|(n, _)| n > 0) {
             self.segment()
@@ -1992,6 +2108,10 @@ pub struct TuiProgressView {
     /// for commands without an approval gate. When a prompt is active it is
     /// rendered at the top of the live body and `y`/`n`/Enter resolve it.
     approval: Option<crate::tui::approval::ApprovalCenter>,
+    /// What `q` on the main view does while the run is still going. `None` for
+    /// a run of this process, where `q` does nothing (Ctrl-C cancels); a
+    /// session viewer detaches here ([`Self::with_quit`]).
+    on_quit: Option<Box<dyn Fn() + Send>>,
 }
 
 impl TuiProgressView {
@@ -2013,7 +2133,38 @@ impl TuiProgressView {
             search_active: Cell::new(false),
             search_query: RefCell::new(String::new()),
             approval: None,
+            on_quit: None,
         }
+    }
+
+    /// Call `f` when `q` is pressed on the main view while the run is still
+    /// going — how `heph session attach` detaches. Never a cancel: the view has
+    /// no way to reach the run it shows.
+    pub fn with_quit(mut self, f: impl Fn() + Send + 'static) -> Self {
+        self.on_quit = Some(Box::new(f));
+        self
+    }
+
+    /// The folded state, for a caller that renders more than the view does
+    /// (`heph session show`'s stuck-on block reads its snapshot).
+    pub fn state(&self) -> &BuildState {
+        &self.state
+    }
+
+    /// One frame as plain lines, for printing once (`heph session show`): the
+    /// header, the default body (lock waits, scratch waits, long-running
+    /// targets) and the admission waits the TUI keeps on its own tab. No bottom
+    /// border, no key help, no idle art; nothing windowed. `ratatui`'s `Line`
+    /// prints its text with `Display`, styles dropped.
+    ///
+    /// `now_ms` is the clock the elapsed time and wait ages are measured
+    /// against: the viewer's now for a live session, the `End` record's time
+    /// for an ended one.
+    pub fn snapshot_lines(&self, now_ms: u64, width: u16) -> Vec<Line<'static>> {
+        let mut lines = vec![self.header_line(now_ms, width)];
+        lines.extend(self.state.body_lines(now_ms));
+        lines.extend(self.state.admission_wait_lines(now_ms, ""));
+        lines
     }
 
     /// The final summary segment, scoped to whatever the `a` toggle was left on
@@ -2310,6 +2461,19 @@ impl TUIAppView for TuiProgressView {
     fn apply(&mut self, ev: &BuildEvent) {
         self.state.apply(ev);
         self.model.apply(ev);
+    }
+
+    fn session_header(&self) -> crate::tui::session::SessionHeader {
+        crate::tui::session::SessionHeader {
+            kind: self.model.session_kind(),
+            label: self.model.label(),
+        }
+    }
+
+    fn quit_while_running(&mut self) {
+        if let Some(f) = &self.on_quit {
+            f();
+        }
     }
 
     fn rows(&self, term_height: u16) -> u16 {
@@ -2691,6 +2855,13 @@ impl CiProgressView {
 }
 
 impl CIAppView for CiProgressView {
+    fn session_header(&self) -> crate::tui::session::SessionHeader {
+        crate::tui::session::SessionHeader {
+            kind: crate::tui::session::HeaderKind::Build,
+            label: self.core.label.clone(),
+        }
+    }
+
     fn begin(&self) {
         tracing::info!("{}", self.core.label);
     }
@@ -2800,6 +2971,13 @@ impl GcCiView {
 impl CIAppView for GcCiView {
     fn begin(&self) {
         tracing::info!("{}", self.header.label());
+    }
+
+    fn session_header(&self) -> crate::tui::session::SessionHeader {
+        crate::tui::session::SessionHeader {
+            kind: crate::tui::session::HeaderKind::Gc,
+            label: self.header.label(),
+        }
     }
 
     fn apply(&mut self, ev: &BuildEvent) {
@@ -4807,6 +4985,49 @@ mod tests {
         let text: String = help.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("scroll"), "{text}");
         assert_eq!(help.spans[0].style.fg, Some(Color::DarkGray));
+    }
+
+    /// A18: one frame as plain text — the header box line, then the lock wait
+    /// and the long-running target — with no bottom border, help row or idle
+    /// art, measured against the clock it is given.
+    #[test]
+    fn snapshot_lines_render_one_plain_frame() {
+        let mut v = TuiProgressView::new("L");
+        v.apply(&ev(0, matched(&["//a:slow", "//a:locked"], true)));
+        v.apply(&ev(0, result_start("//a:slow")));
+        v.apply(&ev(
+            0,
+            BuildEventKind::ResultLockWaitStart {
+                addr: "//a:locked".into(),
+                holder_pid: Some(4242),
+                in_use_by_readers: false,
+            },
+        ));
+        let text: Vec<String> = v
+            .snapshot_lines(65_000, 60)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let header = text.first().expect("header");
+        assert!(
+            header.starts_with("╭─ ") && header.contains("1m05s · 0 / 2 done"),
+            "{header}"
+        );
+        assert!(header.ends_with("─╮"), "{header}");
+        assert_eq!(header.chars().count(), 60, "{header}");
+        assert_eq!(
+            text.get(1).map(String::as_str),
+            Some("  🔒 //a:locked (locked by pid 4242)"),
+            "{text:?}"
+        );
+        assert!(
+            !text
+                .iter()
+                .any(|l| l.starts_with("╰") || l.contains("scroll")),
+            "no bottom border or help row: {text:?}"
+        );
+        // An empty view is just its header: nothing invented to fill rows.
+        assert_eq!(TuiProgressView::new("L").snapshot_lines(0, 60).len(), 1);
     }
 
     #[test]

@@ -236,6 +236,20 @@ fn main() -> ExitCode {
         None => None,
     };
 
+    // Where this process records its session (`heph session …`): read from the
+    // environment once, here, and handed to the TUI's slot — never by the
+    // engine. Outside every cache key, and the session's id and directory are
+    // never exported to the environment (a target's `pass_env` would see them).
+    heph::tui::session::process().configure(
+        heph::tui::session::SessionRoot::from_env(
+            std::env::var_os("HEPH_NO_SESSION").as_deref(),
+            std::env::var_os("HOME").as_deref(),
+        ),
+        std::env::args_os()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect(),
+    );
+
     let exec_result = cli.command.execute(sink, &cli.global);
     // An entrypoint's program ended without success: heph exits as it did.
     // Nothing to render — the program said what it had to say.
@@ -244,15 +258,15 @@ fn main() -> ExitCode {
         .err()
         .and_then(|e| e.downcast_ref::<commands::run::ToolExit>())
         .map(|t| t.0);
-    let result = match &exec_result {
-        Ok(_) => ExitCode::SUCCESS,
+    // A `u8` rather than an `ExitCode`, which cannot be read back: the session
+    // records the number.
+    let code: u8 = match &exec_result {
+        Ok(_) => 0,
         Err(_) if tool_exit.is_some() => match tool_exit {
             // A wait status carries 0–255, so the conversion never falls back.
-            Some(hcore::process::Exit::Code(code)) => {
-                ExitCode::from(u8::try_from(code).unwrap_or(1))
-            }
+            Some(hcore::process::Exit::Code(code)) => u8::try_from(code).unwrap_or(1),
             // Re-raised below, once everything else on the way out has run.
-            _ => ExitCode::FAILURE,
+            _ => 1,
         },
         // heph's own failure after the target resolved to an entrypoint (or
         // a Ctrl-C before its tool started): its box, and 125 (or 130), so it
@@ -268,7 +282,18 @@ fn main() -> ExitCode {
             {
                 error!(error = %format!("{err:#}"), "Failed");
             }
-            ExitCode::from(exit.map_or(2, |x| x.code))
+            exit.map_or(2, |x| x.code)
+        }
+        // `heph session`: 125 for its own failures, else the code `attach`
+        // mirrors from the session it followed.
+        Err(e) if commands::session::exit_code(e).is_some() => {
+            let exit = e.downcast_ref::<commands::session::SessionExit>();
+            if let Some(err) = exit.and_then(|x| x.error.as_ref())
+                && !heph::commands::errors::render_anyhow(err)
+            {
+                error!(error = %format!("{err:#}"), "Failed");
+            }
+            commands::session::exit_code(e).unwrap_or(commands::session::SessionExit::OWN_FAILURE)
         }
         Err(e) if e.downcast_ref::<commands::run::InvokeFailed>().is_some() => {
             let failed = e.downcast_ref::<commands::run::InvokeFailed>();
@@ -277,7 +302,7 @@ fn main() -> ExitCode {
             {
                 error!(error = %format!("{:#}", f.error), "Failed");
             }
-            ExitCode::from(failed.map_or(1, |f| f.code))
+            failed.map_or(1, |f| f.code)
         }
         Err(e) => {
             // Render a graphical diagnostic if the error chain carries one
@@ -287,9 +312,17 @@ fn main() -> ExitCode {
             if !heph::commands::errors::render_anyhow(e) {
                 error!(error = %format!("{:#}", e), "Failed");
             }
-            ExitCode::FAILURE
+            1
         }
     };
+    let result = ExitCode::from(code);
+    // `End` and the lock release, before anything slow on the way out
+    // (telemetry, the profiler). A tool killed by a signal has no exit code;
+    // the process re-raises it below.
+    heph::tui::session::process().finish(match tool_exit {
+        Some(hcore::process::Exit::Signal(_)) => None,
+        _ => Some(i32::from(code)),
+    });
 
     // Best-effort, opt-out usage telemetry: spool this invocation's event and,
     // when due, spawn the detached flusher (CI sends inline). Opted out, record

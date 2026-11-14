@@ -7,6 +7,7 @@ pub mod panic;
 pub mod paused;
 pub mod progress;
 pub mod pty_session;
+pub mod session;
 pub mod stderr_backend;
 pub mod stdout_buffer;
 pub mod tty;
@@ -85,6 +86,24 @@ pub async fn run_app<A: App + 'static>(
     interactive: bool,
     shutdown: hcore::shutdown::ShutdownTrigger,
 ) -> anyhow::Result<A::Output> {
+    run_app_in(session::process(), app, sink, interactive, shutdown).await
+}
+
+/// [`run_app`] against a given session slot, so a test records into its own
+/// rather than the process's.
+pub(crate) async fn run_app_in<A: App + 'static>(
+    slot: &session::SessionSlot,
+    app: A,
+    sink: LogSink,
+    interactive: bool,
+    shutdown: hcore::shutdown::ShutdownTrigger,
+) -> anyhow::Result<A::Output> {
+    // A viewer never records itself (A3). The slot opens the process's session
+    // on the first recording run, once the backend has built its view (the
+    // view names the header a viewer rebuilds).
+    let slot = app.records_session().then_some(slot);
+    // A panic that unwinds out of the run still writes `End { panicked }`.
+    let _panic_guard = slot.map(session::PanicGuard);
     // Establish a stable identity for the runtime's outer `block_on`
     // future so the memoizer's cross-task wait-for graph doesn't collide
     // unrelated callers on the sentinel id 0. No-op when the cycle
@@ -95,9 +114,9 @@ pub async fn run_app<A: App + 'static>(
     // the receiver for rendering. This auto-plumbs the bus into every command.
     hcore::hmemoizer::with_cycle_ctx(async move {
         if interactive {
-            backend::interactive::run(app, sink, shutdown).await
+            backend::interactive::run(app, sink, shutdown, slot).await
         } else {
-            backend::ci::run(app, sink, shutdown).await
+            backend::ci::run(app, sink, shutdown, slot).await
         }
     })
     .await

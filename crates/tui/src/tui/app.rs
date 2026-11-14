@@ -5,6 +5,7 @@ use ratatui::text::Line;
 use tokio::sync::{mpsc, oneshot};
 
 use super::log_sink::LogSink;
+use super::session::SessionHeader;
 use hcore::events::{BuildEvent, EventSender};
 use hcore::pending::PendingCounter;
 
@@ -235,6 +236,12 @@ pub trait TUIAppView: Send {
     /// by default for views without tabs.
     fn back_to_main(&mut self) {}
 
+    /// `q` on the main view while the run is still going. No-op by default: in
+    /// a run of this process `q` does nothing and Ctrl-C cancels. A session
+    /// viewer (`heph session attach`) detaches here, and the run it shows goes
+    /// on — a viewer never cancels anything.
+    fn quit_while_running(&mut self) {}
+
     /// Whether the view is currently capturing keystrokes into a search query
     /// (the `/` filter). While `true` the backend routes printable keys, Backspace,
     /// Enter and Esc to the search methods below instead of the normal shortcuts.
@@ -299,6 +306,13 @@ pub trait TUIAppView: Send {
     /// directly to the terminal (stderr) so it persists in scrollback. NOT
     /// routed through the log sink. No-op by default.
     fn last_render(&self) {}
+
+    /// How a session viewer should title this run: which header it rebuilds
+    /// and the label. Recorded once in the session's `meta.json`. Default: the
+    /// build header with no label.
+    fn session_header(&self) -> SessionHeader {
+        SessionHeader::default()
+    }
 }
 
 /// Aggregates the engine's build-event stream and renders progress in non-TUI
@@ -313,6 +327,11 @@ pub trait CIAppView: Send {
 
     /// Print the final summary once the event stream ends.
     fn finish(&self) {}
+
+    /// See [`TUIAppView::session_header`].
+    fn session_header(&self) -> SessionHeader {
+        SessionHeader::default()
+    }
 }
 
 #[async_trait]
@@ -334,4 +353,11 @@ pub trait App: Send {
 
     /// Run the business logic. May call `ctx.pause()` to suspend the TUI.
     async fn run(self, ctx: AppContext) -> anyhow::Result<Self::Output>;
+
+    /// Whether running this app records a session (`~/.heph/sessions/<id>/`).
+    /// True for every command; a session *viewer* says false, so watching a
+    /// session never creates another one.
+    fn records_session(&self) -> bool {
+        true
+    }
 }

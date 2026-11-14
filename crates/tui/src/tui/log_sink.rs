@@ -1,8 +1,11 @@
 use std::io::{self, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use tokio::sync::mpsc;
+use tracing::Level;
 use tracing_subscriber::fmt::MakeWriter;
+
+use crate::tui::session::SessionTap;
 
 enum Inner {
     Direct,
@@ -12,13 +15,40 @@ enum Inner {
 #[derive(Clone)]
 pub struct LogSink {
     inner: Arc<Mutex<Inner>>,
+    /// The session's log tap (design amendment A11). Outside `Inner` because
+    /// pausing and resuming the TUI replaces `Inner`, and a paused run must keep
+    /// recording. Set once, by the first `run_app` that opens a session.
+    tap: Arc<OnceLock<SessionTap>>,
 }
 
 impl LogSink {
     pub fn new_direct() -> Self {
         Self {
             inner: Arc::new(Mutex::new(Inner::Direct)),
+            tap: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// Tee every `info!`-and-above line written through this sink into the
+    /// session. A second call is ignored: a process has one session.
+    pub fn set_session_tap(&self, tap: SessionTap) {
+        drop(self.tap.set(tap));
+    }
+
+    /// Record a formatted log line of `level` in the session, if the line is
+    /// one the terminal shows (`info!` and above). Lossy UTF-8, verbatim
+    /// otherwise: a viewer escapes control bytes when it prints.
+    fn tee(&self, level: Option<Level>, buf: &[u8]) {
+        let (Some(level), Some(tap)) = (level, self.tap.get()) else {
+            return;
+        };
+        // Ordered by verbosity: ERROR < WARN < INFO < DEBUG < TRACE.
+        if level > Level::INFO || tap.is_stopped() {
+            return;
+        }
+        let text = String::from_utf8_lossy(buf);
+        let text = text.strip_suffix('\n').unwrap_or(&text);
+        tap.log(level.as_str(), text.to_owned());
     }
 
     /// Whether ANSI color should be emitted on this sink. The sink owns the
@@ -72,15 +102,20 @@ impl LogSink {
 
 pub struct LogSinkWriter {
     sink: LogSink,
+    /// The level of the event being written, when the formatter said
+    /// (`make_writer_for`). `None`: not a log event, never teed.
+    level: Option<Level>,
 }
 
 impl Write for LogSinkWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.sink.tee(self.level, buf);
         self.sink.write_bytes(buf)?;
         Ok(buf.len())
     }
 
     fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.sink.tee(self.level, buf);
         self.sink.write_bytes(buf)
     }
 
@@ -106,6 +141,14 @@ impl<'a> MakeWriter<'a> for MakeLogSink {
     fn make_writer(&'a self) -> Self::Writer {
         LogSinkWriter {
             sink: self.sink.clone(),
+            level: None,
+        }
+    }
+
+    fn make_writer_for(&'a self, meta: &tracing::Metadata<'_>) -> Self::Writer {
+        LogSinkWriter {
+            sink: self.sink.clone(),
+            level: Some(*meta.level()),
         }
     }
 }

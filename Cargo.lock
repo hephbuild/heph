@@ -7723,12 +7723,15 @@ dependencies = [
  "libc",
  "proc",
  "ratatui",
+ "serde",
+ "serde_json",
  "telemetry",
  "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
  "unicode-width 0.2.2",
+ "uuid",
 ]
 
 [[package]]

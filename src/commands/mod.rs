@@ -10,6 +10,7 @@ pub mod inspect;
 mod progress_app;
 pub mod query;
 pub mod run;
+pub mod session;
 pub mod tool;
 mod utils;
 pub mod validate;
@@ -104,6 +105,22 @@ pub enum Commands {
     ///
     /// `heph auth login` — run whichever sign-ins have gone stale
     Auth(auth::AuthArgs),
+    /// Watch the heph runs going on in other terminals
+    ///
+    /// Every heph run records what it is doing under `~/.heph/sessions`.
+    /// These commands list those sessions, print one, follow one live, and ask
+    /// one for its in-flight report. They only read: nothing here cancels,
+    /// signals or cleans up a session. Their own failures exit 125.
+    ///
+    /// Examples:
+    ///
+    /// `heph session list` — this workspace's sessions, live first
+    ///
+    /// `heph session show k7q2m` — what it is doing and what it is stuck on
+    ///
+    /// `heph session attach k7q2m` — follow it; `q` detaches
+    #[command(arg_required_else_help = true)]
+    Session(session::SessionArgs),
     /// Developer tools
     ///
     /// Maintenance and housekeeping subcommands that operate on the workspace
@@ -123,6 +140,7 @@ impl Commands {
             Commands::Validate(args) => validate::execute(args, sink, global),
             Commands::Version(args) => version::execute(args),
             Commands::Auth(args) => args.execute(sink, global),
+            Commands::Session(args) => args.execute(sink, global),
             Commands::Tool(args) => args.execute(sink, global),
             Commands::GenDocs(args) => gendocs::execute(args),
         }
