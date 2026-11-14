@@ -3711,3 +3711,6 @@ mod tests {
         assert_eq!(classes(&p), 0);
     }
 }
+
+#[cfg(test)]
+mod admission_replay;
