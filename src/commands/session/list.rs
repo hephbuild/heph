@@ -31,6 +31,7 @@ struct ListJson {
 #[derive(Debug, Serialize)]
 struct ListJsonEntry {
     id: String,
+    /// `null` only for a session in a newer directory format.
     owner_pid: Option<u32>,
     argv: Vec<String>,
     workspace_root: Option<String>,
@@ -40,11 +41,55 @@ struct ListJsonEntry {
     started_unix_ms: u64,
     last_event_unix_ms: Option<u64>,
     exit_code: Option<i32>,
+    /// Set when the session ended in a panic (its `exit_code` may still be 0).
+    panicked: bool,
+    /// The PROGRESS column's numbers; `null` before the session wrote its
+    /// first `status.json`.
+    progress: Option<Progress>,
+    /// The NOW column for a live session: the lock or pool it waits on, else
+    /// its oldest running target. `null` once it ended, or with nothing on.
+    now: Option<String>,
     blocked_on: Vec<BlockedOn>,
     /// Set only for a session in a newer directory format, which this heph
     /// does not read further.
     #[serde(skip_serializing_if = "Option::is_none")]
     format: Option<u32>,
+}
+
+/// How far a session got, as PROGRESS shows it.
+#[derive(Debug, Serialize)]
+struct Progress {
+    /// Matched targets that finished once `total` is known; before that,
+    /// every target that finished.
+    done: u64,
+    /// Matched targets so far; `null` before the matcher reported.
+    total: Option<u64>,
+    /// Whether `total` is final (the table marks a provisional one `~`).
+    total_complete: bool,
+    /// Targets with an operation open now.
+    running: u64,
+    failed: u64,
+}
+
+impl Progress {
+    fn of(s: &crate::tui::session::SessionSnapshot) -> Self {
+        let c = &s.counts;
+        Self {
+            done: if c.matched.is_some() {
+                c.matched_done
+            } else {
+                c.finished
+            },
+            total: c.matched,
+            total_complete: c.matched_complete,
+            running: s
+                .totals
+                .running
+                .total
+                .max(u64::try_from(s.running.len()).unwrap_or(u64::MAX)),
+            failed: c.failed,
+        }
+    }
 }
 
 pub(crate) async fn list(
@@ -85,10 +130,15 @@ fn write_json(
             let state = derive_state(e, opts.now_ms, opts.stall);
             let status = e.status.as_ref();
             let blocked_on = status.map(|s| blocked_on(s, e, every)).unwrap_or_default();
-            let exit_code = status
-                .and_then(|s| s.end.as_ref())
-                .and_then(|x| x.exit_code);
+            let end = status.and_then(|s| s.end.as_ref());
+            let exit_code = end.and_then(|x| x.exit_code);
             let last_event_unix_ms = status.and_then(|s| s.last_event_unix_ms);
+            let now = match state {
+                SessionState::Running | SessionState::Waiting | SessionState::Stalled => status
+                    .map(|s| now_cell(s, e, every, opts))
+                    .filter(|n| n != "-"),
+                _ => None,
+            };
             match &e.meta {
                 EntryMeta::Known(m) => ListJsonEntry {
                     id: e.id.encode(),
@@ -100,6 +150,9 @@ fn write_json(
                     started_unix_ms: m.started_unix_ms,
                     last_event_unix_ms,
                     exit_code,
+                    panicked: end.is_some_and(|x| x.panicked),
+                    progress: status.map(Progress::of),
+                    now,
                     blocked_on,
                     format: None,
                 },
@@ -113,6 +166,9 @@ fn write_json(
                     started_unix_ms: e.id.started_unix_ms(),
                     last_event_unix_ms: None,
                     exit_code: None,
+                    panicked: false,
+                    progress: None,
+                    now: None,
                     blocked_on: Vec::new(),
                     format: Some(*found),
                 },

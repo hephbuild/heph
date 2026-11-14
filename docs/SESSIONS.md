@@ -153,10 +153,26 @@ is a live session of unknown format.
 ### `--json` stability
 
 `list --json` is `{version, sessions: [{id, owner_pid, argv, workspace_root,
-cwd, state, started_unix_ms, last_event_unix_ms, exit_code, blocked_on}]}`,
-sorted by id, times in absolute unix ms; `blocked_on` entries are
-`{kind: "lock", addr, holder_pid, holder_session}` or `{kind: "admission",
-addr, pool}`.
+cwd, state, started_unix_ms, last_event_unix_ms, exit_code, panicked,
+progress, now, blocked_on, format}]}`, sorted by id, times in absolute unix
+ms:
+
+- `progress` is PROGRESS as numbers, `{done, total, total_complete, running,
+  failed}`: `total` is the matched targets (`null` before the matcher
+  reported, provisional until `total_complete`), and `done` counts matched
+  targets that finished once `total` is known, every finished target before.
+  `progress` is `null` before the session wrote its first `status.json`.
+- `now` is NOW for a live session (the lock or pool it waits on, else its
+  oldest running target); `null` once it ended.
+- `panicked` is true when the session ended in a panic, whatever its
+  `exit_code`.
+- `blocked_on` entries are `{kind: "lock", addr, holder_pid, holder_session}`
+  or `{kind: "admission", addr, pool}`. From `status.json`, so at most the
+  first 100 of each kind.
+- `format` appears only on the row of a session in a newer directory format,
+  which this heph reads no further: that row has `owner_pid: null`, empty
+  `argv`, `null` progress and `state: "unknown"`. `owner_pid` is never `null`
+  otherwise.
 
 `show --json` is the `SessionSnapshot` (every list in full, folded from the
 event log) plus `id`, `state`, `blocked_on` (the same entries as `list

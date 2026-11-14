@@ -498,9 +498,24 @@ async fn commands_run_against_any_source() {
     assert_eq!(a_json["started_unix_ms"], T0);
     assert_eq!(a_json["blocked_on"][0]["kind"], "lock");
     assert_eq!(a_json["blocked_on"][0]["holder_session"], holder.encode());
+    // The table's NOW and PROGRESS, as data.
+    assert_eq!(
+        a_json["now"],
+        format!("lock on //go:sdk held by {holder}"),
+        "{a_json}"
+    );
+    assert_eq!(a_json["progress"]["total"], serde_json::Value::Null);
+    assert_eq!(a_json["progress"]["running"], 0);
+    assert_eq!(a_json["panicked"], false);
+    assert!(a_json.get("format").is_none(), "only on too-new rows");
     let b_json = &json["sessions"][1];
     assert_eq!(b_json["exit_code"], 0);
     assert_eq!(b_json["state"], "ok");
+    assert_eq!(b_json["now"], serde_json::Value::Null, "it ended");
+    assert_eq!(
+        b_json["progress"],
+        serde_json::json!({"done": 1, "total": 1, "total_complete": true, "running": 0, "failed": 0})
+    );
 
     // show: header, folded body, the stuck-on chain, one next action.
     let out = run_show(&sources, &a.encode(), false)
@@ -1273,6 +1288,35 @@ async fn list_never_reads_events() {
 }
 
 #[tokio::test]
+async fn list_json_says_panicked() {
+    let id = SessionId::new(T0, 1);
+    let source = FakeSource {
+        sessions: vec![(
+            entry(
+                meta(id, 1, &["heph", "run"]),
+                false,
+                Some(SessionSnapshot {
+                    end: Some(SessionEnd {
+                        at_unix_ms: NOW,
+                        exit_code: Some(0),
+                        panicked: true,
+                    }),
+                    ..SessionSnapshot::default()
+                }),
+            ),
+            Vec::new(),
+        )],
+    };
+    let sources: [&dyn SessionSource; 1] = [&source];
+    let json: serde_json::Value =
+        serde_json::from_str(&run_list(&sources, Workspace::All, true).await).expect("json");
+    let s = &json["sessions"][0];
+    assert_eq!(s["panicked"], true, "{s}");
+    assert_eq!(s["exit_code"], 0);
+    assert_eq!(s["state"], "failed");
+}
+
+#[tokio::test]
 async fn list_shows_newer_format_placeholder() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path().join("sessions");
@@ -1302,6 +1346,10 @@ async fn list_shows_newer_format_placeholder() {
     assert_eq!(json["sessions"][0]["format"], 999);
     assert_eq!(json["sessions"][0]["state"], "unknown");
     assert_eq!(json["sessions"][0]["started_unix_ms"], T0);
+    // Nothing more is read of it: no pid, no progress.
+    assert_eq!(json["sessions"][0]["owner_pid"], serde_json::Value::Null);
+    assert_eq!(json["sessions"][0]["progress"], serde_json::Value::Null);
+    assert_eq!(json["sessions"][0]["panicked"], false);
 
     let err = run_show(&sources, &id.encode(), false)
         .await
