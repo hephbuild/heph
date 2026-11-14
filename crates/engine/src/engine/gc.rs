@@ -25,10 +25,13 @@
 //! the filesystem (see `cache_db_space`), converting a database created before
 //! incremental auto-vacuum with a full `VACUUM`. That conversion rewrites the
 //! whole file — minutes, on a large one — under its write lock and the schema
-//! migration lock. Another heph process's cache writes wait meanwhile, each
-//! batch retried for up to `local_cache_sqlite::WRITE_BUSY_RETRY_TOTAL` (see
-//! `commit_with_retry`); a process that exits first loses its pending writes,
-//! which become cache misses, never wrong hits. The temporary copy goes to
+//! migration lock. Another heph process's cache writes wait meanwhile, retried
+//! for up to `local_cache_sqlite::WRITE_BUSY_RETRY_TOTAL` in all (see
+//! `commit_with_retry`); a process that exits first, or outlasts that
+//! deadline, loses the writes still queued. Each is normally a miss, but can
+//! leave a mixed revision on a `--force` rebuild of a non-reproducible target
+//! (see `cache_db_space`, and the gap documented in
+//! `Engine::cache_locally`). The temporary copy goes to
 //! sqlite's temp directory (`SQLITE_TMPDIR`, `TMPDIR`, …), which on Linux may
 //! be a tmpfs, i.e. RAM; the conversion's free-space check covers it.
 

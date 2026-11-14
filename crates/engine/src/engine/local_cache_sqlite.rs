@@ -9,6 +9,7 @@ use hcore::hartifactcontent;
 use hmodel::htaddr::Addr;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{Connection, OpenFlags};
+use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::future::{Future, poll_fn};
 use std::io::{self, Seek};
@@ -18,7 +19,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Poll, Waker};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tempfile::SpooledTempFile;
 
 const SPOOL_MEM_THRESHOLD: usize = 1024 * 1024;
@@ -484,6 +485,8 @@ pub struct MaintenanceOverrides {
     /// Replaces [`WRITER_BUSY_TIMEOUT`] on the writer connection. Read when
     /// the writer is spawned, i.e. by the first write.
     pub busy_timeout: Option<Duration>,
+    /// Replaces [`WRITE_BUSY_RETRY_TOTAL`]. Read when the writer is spawned.
+    pub busy_retry_total: Option<Duration>,
 }
 
 /// The maintenance knobs in effect: the defaults, or a test's overrides.
@@ -493,6 +496,7 @@ struct Knobs {
     free_space: Option<u64>,
     migrate_lock_timeout: Duration,
     busy_timeout: Duration,
+    busy_retry_total: Duration,
 }
 
 impl LocalCacheSQLite {
@@ -507,6 +511,7 @@ impl LocalCacheSQLite {
             free_space: None,
             migrate_lock_timeout: hwalk::migrate_lock::MIGRATE_LOCK_TIMEOUT,
             busy_timeout: WRITER_BUSY_TIMEOUT,
+            busy_retry_total: WRITE_BUSY_RETRY_TOTAL,
         };
         #[cfg(any(test, feature = "test-support"))]
         let k = {
@@ -516,6 +521,7 @@ impl LocalCacheSQLite {
                 free_space: o.free_space,
                 migrate_lock_timeout: o.migrate_lock_timeout.unwrap_or(k.migrate_lock_timeout),
                 busy_timeout: o.busy_timeout.unwrap_or(k.busy_timeout),
+                busy_retry_total: o.busy_retry_total.unwrap_or(k.busy_retry_total),
             }
         };
         k
@@ -571,7 +577,8 @@ impl LocalCacheSQLite {
     /// another heph process using this home meanwhile waits — its schema check
     /// on the migration lock (up to `MIGRATE_LOCK_TIMEOUT`, only for a database
     /// it has to migrate), its cache writes on the write lock, which its writer
-    /// retries for up to [`WRITE_BUSY_RETRY_TOTAL`] before dropping one.
+    /// retries for up to [`WRITE_BUSY_RETRY_TOTAL`] in all before dropping the
+    /// batches still kept out.
     pub(crate) fn compact_for_gc(
         &self,
         keep_going: Box<dyn Fn() -> bool + Send>,
@@ -825,8 +832,10 @@ impl LocalCacheSQLite {
              PRAGMA journal_size_limit = {JOURNAL_SIZE_LIMIT_BYTES};"
         ))
         .context("configuring sqlite cache write connection")?;
-        conn.busy_timeout(self.knobs().busy_timeout)
+        let knobs = self.knobs();
+        conn.busy_timeout(knobs.busy_timeout)
             .context("setting the sqlite cache writer busy timeout")?;
+        let busy_retry_total = knobs.busy_retry_total;
 
         let (tx, rx) = mpsc::channel::<WriterCmd>();
         let pending = Arc::clone(&self.pending);
@@ -845,6 +854,8 @@ impl LocalCacheSQLite {
                         pending: &pending,
                         db_path: &db_path,
                         closing: &thread_closing,
+                        busy_retry_total,
+                        busy_since: Cell::new(None),
                         #[cfg(any(test, feature = "test-support"))]
                         gate: &gate,
                     },
@@ -1074,6 +1085,12 @@ struct WriterEnv<'a> {
     db_path: &'a std::path::Path,
     /// See [`Writer::closing`].
     closing: &'a AtomicBool,
+    /// [`WRITE_BUSY_RETRY_TOTAL`], or a test's override of it.
+    busy_retry_total: Duration,
+    /// When another process's lock first kept a batch out, since the last
+    /// commit: the start of the writer-wide busy deadline (see
+    /// [`commit_with_retry`]). `None` while batches commit.
+    busy_since: Cell<Option<Instant>>,
     #[cfg(any(test, feature = "test-support"))]
     gate: &'a WriterGate,
 }
@@ -1100,48 +1117,58 @@ fn writer_loop(conn: &mut Connection, env: &WriterEnv<'_>) {
     }
 }
 
-/// How long the writer keeps retrying a batch that another process's write
-/// lock keeps out (`SQLITE_BUSY`/`SQLITE_LOCKED` after the connection's busy
-/// timeout) before dropping it. Long enough to outlast another process's
-/// `heph tool gc` converting a large `cache.db`, whose `VACUUM` holds the
-/// write lock for the whole rewrite; bounded so a stuck holder cannot park the
-/// writer, and every reader of a queued key, forever.
+/// How long the writer keeps retrying while another process's write lock
+/// keeps its batches out (`SQLITE_BUSY` after the connection's busy timeout),
+/// counted from the first refusal since the last commit — across batches, not
+/// per batch. Long enough to outlast another process's `heph tool gc`
+/// converting a large `cache.db`, whose `VACUUM` holds the write lock for the
+/// whole rewrite; bounded so a stuck holder (a suspended gc, say) cannot park
+/// the writer, every reader of a queued key, and the owner's exit, forever.
 pub(crate) const WRITE_BUSY_RETRY_TOTAL: Duration = Duration::from_secs(5 * 60);
 /// The longest pause between two attempts of a kept-out batch.
 const WRITE_BUSY_BACKOFF_MAX: Duration = Duration::from_secs(2);
 
 /// Whether `e` is sqlite reporting another connection's lock.
+///
+/// `SQLITE_BUSY` only. Without shared-cache mode, which heph never enables,
+/// `SQLITE_LOCKED` is a conflict inside this one connection (a statement still
+/// reading a table being dropped, say): no other process releases it, so
+/// retrying it would only wait out the deadline.
 fn is_busy(e: &anyhow::Error) -> bool {
     e.chain()
         .filter_map(|c| c.downcast_ref::<rusqlite::Error>())
-        .any(|e| {
-            matches!(
-                e.sqlite_error_code(),
-                Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
-            )
-        })
+        .any(|e| e.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy))
 }
 
 /// [`process_batch`], retried while another process's write lock keeps it
-/// out, for up to [`WRITE_BUSY_RETRY_TOTAL`] or until the cache is `closing`
-/// (dropped: it must not hang its owner's exit). A failed attempt rolled back,
-/// so the next one starts from nothing; each attempt waits out the busy
-/// timeout itself, the pause between two only spaces them.
+/// out, until the cache is `closing` (dropped: it must not hang its owner's
+/// exit) or the lock has kept the writer out for [`WriterEnv::busy_retry_total`].
+///
+/// The deadline is the writer's, not the batch's: it starts at the first
+/// refusal since the last commit ([`WriterEnv::busy_since`]) and only a commit
+/// resets it. Once it has passed, each later batch gets a single attempt — one
+/// busy timeout — until one commits, so a lock that is never released costs
+/// the whole queue the deadline plus one busy timeout per batch, not the
+/// deadline per batch.
+///
+/// A failed attempt rolled back, so the next one starts from nothing; each
+/// attempt waits out the busy timeout itself, the pause between two only
+/// spaces them. A batch that is given up on is lost: normally a miss, but see
+/// the module docs of `cache_db_space` for when it is not.
 fn commit_with_retry(
     conn: &mut Connection,
     batch: &mut [WriterCmd],
-    closing: &AtomicBool,
+    env: &WriterEnv<'_>,
 ) -> Result<()> {
-    let started = std::time::Instant::now();
     let mut pause = Duration::from_millis(50);
     let mut attempts: u32 = 0;
     loop {
         let err = match process_batch(conn, batch) {
             Ok(()) => {
-                if attempts > 0 {
+                if let Some(since) = env.busy_since.take() {
                     tracing::info!(
                         attempts = attempts + 1,
-                        waited = ?started.elapsed(),
+                        kept_out = ?since.elapsed(),
                         "sqlite cache writer: batch committed after another process released the lock",
                     );
                 }
@@ -1150,17 +1177,25 @@ fn commit_with_retry(
             Err(e) => e,
         };
         attempts = attempts.saturating_add(1);
-        let waited = started.elapsed();
-        if !is_busy(&err) || waited >= WRITE_BUSY_RETRY_TOTAL || closing.load(Ordering::Acquire) {
-            return Err(err.context(format!("after {attempts} attempt(s) over {waited:?}")));
+        if !is_busy(&err) {
+            return Err(err.context(format!("after {attempts} attempt(s)")));
         }
-        if attempts == 1 {
+        let since = env.busy_since.get().unwrap_or_else(|| {
             tracing::warn!(
                 error = %format!("{err:#}"),
                 "sqlite cache writer: another process holds cache.db's write lock; retrying",
             );
+            let now = Instant::now();
+            env.busy_since.set(Some(now));
+            now
+        });
+        let kept_out = since.elapsed();
+        if kept_out >= env.busy_retry_total || env.closing.load(Ordering::Acquire) {
+            return Err(err.context(format!(
+                "after {attempts} attempt(s); the write lock has kept the writer out for {kept_out:?}"
+            )));
         }
-        std::thread::sleep(pause.min(WRITE_BUSY_RETRY_TOTAL.saturating_sub(waited)));
+        std::thread::sleep(pause.min(env.busy_retry_total.saturating_sub(kept_out)));
         pause = pause.saturating_mul(2).min(WRITE_BUSY_BACKOFF_MAX);
     }
 }
@@ -1177,7 +1212,7 @@ fn write_batch(
 
     // Its slots stay pending while it is retried: a reader of one of its keys
     // waits for the write rather than reading the key as absent.
-    if let Err(e) = commit_with_retry(conn, &mut batch, env.closing) {
+    if let Err(e) = commit_with_retry(conn, &mut batch, env) {
         tracing::error!(error = %format!("{e:#}"), "sqlite cache writer: batch failed");
     }
 
@@ -3770,6 +3805,82 @@ mod tests {
             .reader
             .read_to_end(&mut data)?;
         assert_eq!(data, b"queued behind the lock");
+        Ok(())
+    }
+
+    /// The busy deadline is the writer's, not each batch's: with the lock held
+    /// past it, `BATCHES` queued batches are all given up on in about the
+    /// deadline plus one busy timeout per later batch — not `BATCHES` times
+    /// the deadline, which an exit waiting on the queue would sit through. A
+    /// commit after the release resets it, so the next lock is retried for a
+    /// whole deadline again.
+    #[test]
+    fn the_busy_deadline_spans_batches_and_resets_on_commit() -> Result<()> {
+        const BATCHES: u32 = 4;
+        let dir = tempdir()?;
+        let path = dir.path().join("cache.db");
+        let cache = open(&path)?;
+        let busy = Duration::from_millis(50);
+        let total = Duration::from_millis(1000);
+        cache.set_maintenance_overrides(MaintenanceOverrides {
+            busy_timeout: Some(busy),
+            busy_retry_total: Some(total),
+            ..MaintenanceOverrides::default()
+        });
+        let addr = make_addr("pkg", "deadline");
+        put(&cache, &addr, "first", b"spawns the writer")?;
+        assert!(cache.exists(&addr, "h", "first")?);
+
+        let holder = Connection::open(&path)?;
+        holder.execute_batch("BEGIN IMMEDIATE;")?;
+        // Queued behind the closed gate, so they split into whole batches of
+        // `WRITE_BATCH_MAX` instead of trickling in one by one.
+        cache.gate.close();
+        let jobs = WRITE_BATCH_MAX * usize::try_from(BATCHES)?;
+        for i in 0..jobs {
+            put(&cache, &addr, &format!("held-{i}"), b"x")?;
+        }
+        let started = Instant::now();
+        cache.gate.open();
+        // Batches drain in order: the last key's slot is released with the
+        // last batch, and then the read finds nothing.
+        assert!(
+            cache
+                .reader(&addr, "h", &format!("held-{}", jobs - 1))
+                .is_err(),
+            "the lock was never released: every batch was given up on"
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= total,
+            "given up before the deadline: {elapsed:?}"
+        );
+        assert!(
+            elapsed < total * 2,
+            "{BATCHES} batches took {elapsed:?}: the deadline ({total:?}) restarted per batch"
+        );
+
+        holder.execute_batch("COMMIT;")?;
+        put(&cache, &addr, "after", b"commits once released")?;
+        assert!(
+            cache.exists(&addr, "h", "after")?,
+            "past the deadline, the first batch after the release commits on its one attempt"
+        );
+
+        // The commit reset the deadline: a new lock is retried again, well past
+        // the single busy timeout a still-expired deadline would allow.
+        holder.execute_batch("BEGIN IMMEDIATE;")?;
+        put(&cache, &addr, "again", b"retried, not dropped")?;
+        std::thread::sleep(busy * 6);
+        assert!(
+            cache
+                .pending
+                .pending(&LocalCacheSQLite::key(&addr), "h", "again")
+                .is_some(),
+            "still retried six busy timeouts in: the deadline was reset"
+        );
+        holder.execute_batch("COMMIT;")?;
+        assert!(cache.exists(&addr, "h", "again")?);
         Ok(())
     }
 
