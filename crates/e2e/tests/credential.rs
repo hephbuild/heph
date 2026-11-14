@@ -19,6 +19,7 @@
 
 mod common;
 
+use anyhow::Context as _;
 use common::Workspace;
 use std::sync::Arc;
 
@@ -1615,5 +1616,85 @@ target(name = "t", driver = "auth.credential",
         1,
         "a cache hit must not acquire, got {after_second:?}"
     );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// A producer runs nested inside its consumer's run
+// ---------------------------------------------------------------------------
+
+/// Bound on a run whose failure mode is a hang: a nested producer waiting on a
+/// pool its consumer holds parks forever, and that must fail the test rather
+/// than the CI job.
+const NESTED_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// A producer target behind a credential, and a sandboxed consumer of it.
+fn write_nested_producer(ws: &htestkit::Workspace) {
+    ws.write_build_file(
+        "auth",
+        r#"
+target(name = "fetch", driver = "bash", cache = False,
+       out = {"credential": "cred.json"},
+       run = ["printf '{\"token\":\"nested\",\"expires_in\":600}' > cred.json"])
+target(name = "t", driver = "auth.credential", sources = ["//auth:fetch"],
+       present = {"env": {"T": "${token}"}})
+"#,
+    );
+    ws.write_build_file(
+        "app",
+        r#"target(name = "a", driver = "bash", out = "o.txt", cache = False,
+       credentials = ["//auth:t"], run = ["printf '%s' \"$T\" > o.txt"])"#,
+    );
+}
+
+/// A credential producer runs without a sandbox permit: it runs inside its
+/// consumer's run, which already holds one. With a single permit, a producer
+/// that waited for its own would wait on its consumer forever.
+#[tokio::test]
+async fn a_credential_producer_runs_with_the_pool_exhausted() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().to_path_buf();
+    let mut engine = heph::engine::Engine::new(heph::engine::Config {
+        sandbox_permits: Some(1),
+        ..heph::engine::Config::for_tests(root.clone())
+    })?;
+    engine.register_provider(move |init| {
+        Box::new(heph::pluginbuildfile::Provider::new(
+            root,
+            init.runtime.clone(),
+            Arc::clone(&init.functions),
+        ))
+    })?;
+    engine.register_managed_driver(|_| {
+        Box::new(heph::pluginexec::Driver::new_bash().with_host_path())
+    })?;
+    let engine = Arc::new(engine);
+    engine.install_exec_runner_host();
+    let ws = htestkit::Workspace { dir, engine };
+    write_nested_producer(&ws);
+
+    let res = tokio::time::timeout(NESTED_DEADLINE, ws.run("//app:a"))
+        .await
+        .context("the consumer hung: its producer is waiting for the sandbox permit it holds")??;
+    assert_eq!(common::artifact_string(&res), "nested");
+    Ok(())
+}
+
+/// A target-sourced credential at `-j 1`: the consumer holds the only cpu
+/// while its producer runs inside its run.
+///
+/// Hangs today: the consumer's `execute` is admitted before `run` reaches
+/// `acquire_and_present`, and the producer's own `execute` then waits in
+/// `admit` for the cpu its consumer holds.
+#[tokio::test]
+#[ignore = "deadlock: consumer holds its cpu admission while a credential producer waits for admission at -j 1; tracked separately"]
+async fn a_target_sourced_credential_runs_at_j1() -> anyhow::Result<()> {
+    let ws = Workspace::with_parallelism(1);
+    write_nested_producer(&ws);
+
+    let res = tokio::time::timeout(NESTED_DEADLINE, ws.run("//app:a"))
+        .await
+        .context("the consumer hung: its producer is waiting for cpu admission")??;
+    assert_eq!(common::artifact_string(&res), "nested");
     Ok(())
 }
