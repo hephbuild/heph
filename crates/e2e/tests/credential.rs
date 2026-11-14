@@ -1649,16 +1649,24 @@ target(name = "t", driver = "auth.credential", sources = ["//auth:fetch"],
     );
 }
 
-/// A workspace whose engine has `permits` sandbox permits and 4 cpus, with
+/// A workspace whose engine has a `sandbox` pool of `slots` and 4 cpus, with
 /// the buildfile provider and the managed bash driver.
-fn permit_ws(permits: usize) -> anyhow::Result<htestkit::Workspace> {
+fn sandbox_pool_ws(slots: usize) -> anyhow::Result<htestkit::Workspace> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().to_path_buf();
-    let mut engine = heph::engine::Engine::new(heph::engine::Config {
-        sandbox_permits: Some(permits),
+    let mut cfg = heph::engine::Config {
         parallelism: Some(4),
         ..heph::engine::Config::for_tests(root.clone())
-    })?;
+    };
+    cfg.resources.insert(
+        hplugin::provider::PoolName::sandbox(),
+        hcore::capacity::PoolSpec::from_written(
+            hplugin::provider::PoolName::SANDBOX,
+            None,
+            Some(&slots.to_string()),
+        )?,
+    );
+    let mut engine = heph::engine::Engine::new(cfg)?;
     engine.register_provider(move |init| {
         Box::new(heph::pluginbuildfile::Provider::new(
             root,
@@ -1674,27 +1682,34 @@ fn permit_ws(permits: usize) -> anyhow::Result<htestkit::Workspace> {
     Ok(htestkit::Workspace { dir, engine })
 }
 
-/// The consumer acquires its credential before it takes a sandbox permit, so
-/// with a single permit the producer gets it, runs, and gives it back before
+/// How many runs are queued for admission (cpu or a `sandbox` slot) right
+/// now; 0 before the pool is built.
+fn queued(ws: &htestkit::Workspace) -> usize {
+    ws.engine.resource_snapshot().map_or(0, |s| s.main.queued)
+}
+
+/// The consumer acquires its credential before it takes a `sandbox` slot, so
+/// with a single slot the producer gets it, runs, and gives it back before
 /// the consumer asks for it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_credential_producer_runs_with_the_pool_exhausted() -> anyhow::Result<()> {
-    let ws = permit_ws(1)?;
+    let ws = sandbox_pool_ws(1)?;
     write_nested_producer(&ws);
 
     let res = tokio::time::timeout(NESTED_DEADLINE, ws.run("//app:a"))
         .await
-        .with_context(|| format!("the consumer hung: {:?}", ws.engine.sandbox_permit_gauge()))??;
+        .with_context(|| format!("the consumer hung: {:?}", ws.engine.resource_snapshot()))??;
     assert_eq!(common::artifact_string(&res), "nested");
     Ok(())
 }
 
-/// The producer's own uncached dep needs a permit too. Were the producer run
-/// inside its consumer's run, that dep would wait for the one permit the
-/// consumer holds, forever.
+/// The producer's own uncached dep needs a `sandbox` slot too. Were the
+/// producer run inside its consumer's run, that dep would wait for the one
+/// slot the consumer holds, forever.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_credential_producer_with_an_uncached_dep_runs_with_one_permit() -> anyhow::Result<()> {
-    let ws = permit_ws(1)?;
+async fn a_credential_producer_with_an_uncached_dep_runs_with_one_sandbox_slot()
+-> anyhow::Result<()> {
+    let ws = sandbox_pool_ws(1)?;
     ws.write_build_file(
         "auth",
         r#"
@@ -1714,23 +1729,23 @@ target(name = "t", driver = "auth.credential", sources = ["//auth:fetch"],
 
     let res = tokio::time::timeout(NESTED_DEADLINE, ws.run("//app:a"))
         .await
-        .with_context(|| format!("the consumer hung: {:?}", ws.engine.sandbox_permit_gauge()))??;
+        .with_context(|| format!("the consumer hung: {:?}", ws.engine.resource_snapshot()))??;
     assert_eq!(common::artifact_string(&res), "nested");
     Ok(())
 }
 
 /// A plain run of the producer beside a consumer of its credential, with one
-/// permit. The plain run holds the producer's build lock while it waits for
-/// the permit; a consumer acquiring its credential while holding that permit
-/// would wait for the producer's build lock, and neither would move.
+/// `sandbox` slot. The plain run holds the producer's build lock while it
+/// waits for the slot; a consumer acquiring its credential while holding that
+/// slot would wait for the producer's build lock, and neither would move.
 ///
 /// The interleaving is forced: the consumer's first credential is an `exec`
 /// source parked on a gate, the plain run starts while it is parked, and the
-/// gate opens only once the plain run is waiting for the permit (or done).
+/// gate opens only once the plain run is queued for admission (or done).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_plain_run_of_the_producer_beside_its_consumer_runs_with_one_permit() -> anyhow::Result<()>
-{
-    let ws = permit_ws(1)?;
+async fn a_plain_run_of_the_producer_beside_its_consumer_runs_with_one_sandbox_slot()
+-> anyhow::Result<()> {
+    let ws = sandbox_pool_ws(1)?;
     let gates = tempfile::tempdir()?;
     let parked = gates.path().join("parked");
     let gate = gates.path().join("open");
@@ -1775,7 +1790,7 @@ target(name = "g", driver = "auth.credential",
             let ws = Arc::clone(&ws);
             async move { ws.run("//auth:fetch").await }
         });
-        while !plain.is_finished() && ws.engine.sandbox_permit_gauge().waiting == 0 {
+        while !plain.is_finished() && queued(&ws) == 0 {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         std::fs::write(&gate, "")?;
@@ -1788,7 +1803,7 @@ target(name = "g", driver = "auth.credential",
         .with_context(|| {
             format!(
                 "the consumer and the plain run hung: {:?}",
-                ws.engine.sandbox_permit_gauge()
+                ws.engine.resource_snapshot()
             )
         })??;
     assert_eq!(common::artifact_string(&consumer), "gnested");

@@ -3,37 +3,47 @@
     reason = "restriction/style lints scoped to production code; tests are exempt"
 )]
 
-//! The sandbox permit end to end: a managed run takes a permit before its
-//! sandbox exists and gives it back only once the reclaim lane has removed the
-//! sandbox, so the sandboxes on disk — live plus pending removal — never
-//! outnumber the permits (`Config::sandbox_permits`).
+//! The `sandbox` resource pool end to end: a managed run is admitted with one
+//! `sandbox` slot alongside its cpu, and the slot comes back only once the
+//! reclaim lane has removed the sandbox, so the sandboxes on disk — live plus
+//! pending removal — never outnumber the pool's capacity (`--resource
+//! sandbox=N`, here `Config.resources`).
 //!
 //! A slow disk is stood in by `Engine::set_sandbox_removal_delay`, which makes
-//! every removal that releases a permit sleep first: removal falls behind
-//! creation, which is the condition the permit exists for.
+//! every removal that releases a slot sleep first: removal falls behind
+//! creation, which is the condition the pool's bound exists for.
 
+use hcore::capacity::PoolSpec;
 use heph::engine::request_state::RequestState;
-use heph::engine::{Config, Engine, OutputMatcher, ResultOptions};
+use heph::engine::resource_pool::{PoolSnapshot, ResourceSnapshot};
+use heph::engine::{Config, Engine, InvokeOutcome, InvokeRequest, OutputMatcher, ResultOptions};
 use heph::htaddr::parse_addr;
 use heph::htmatcher::Matcher;
 use heph::{pluginbuildfile, pluginexec};
+use hplugin::provider::PoolName;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-/// Bound on every build here: a leaked permit parks the next run forever, and
-/// a hang must fail the test rather than the CI job.
+/// Bound on every build here: a leaked slot parks the next run forever, and a
+/// hang must fail the test rather than the CI job.
 const DEADLINE: Duration = Duration::from_secs(120);
 
 /// An engine over `root` with the buildfile provider, the managed bash driver,
-/// `permits` sandbox permits and 4 cpus.
-fn engine(root: &Path, permits: usize) -> anyhow::Result<Arc<Engine>> {
-    let mut e = Engine::new(Config {
+/// the non-managed template driver, 4 cpus and a `sandbox` pool of `slots`;
+/// every removal that releases a slot first waits `removal_delay`.
+fn engine(root: &Path, slots: usize, removal_delay: Duration) -> anyhow::Result<Arc<Engine>> {
+    let mut cfg = Config {
         parallelism: Some(4),
-        sandbox_permits: Some(permits),
         ..Config::for_tests(root.to_path_buf())
-    })?;
+    };
+    cfg.resources.insert(
+        PoolName::sandbox(),
+        PoolSpec::from_written(PoolName::SANDBOX, None, Some(&slots.to_string()))?,
+    );
+    let mut e = Engine::new(cfg)?;
+    e.set_sandbox_removal_delay(removal_delay);
     let r = root.to_path_buf();
     e.register_provider(move |init| {
         Box::new(pluginbuildfile::Provider::new(
@@ -145,52 +155,90 @@ async fn drain(rs: Arc<RequestState>) {
     }
 }
 
-/// Wait until every permit is back, or fail naming what is still out.
-async fn all_permits_back(engine: &Engine) {
+/// The pool at this instant; `None` before the first admission built it.
+fn snapshot(engine: &Engine) -> Option<ResourceSnapshot> {
+    engine.resource_snapshot()
+}
+
+fn pool<'a>(snap: &'a ResourceSnapshot, name: &str) -> Option<&'a PoolSnapshot> {
+    snap.main.pools.iter().find(|p| p.pool.as_str() == name)
+}
+
+/// What `pool` holds in `snap`, 0 when it is absent.
+fn held(snap: &ResourceSnapshot, name: &str) -> u64 {
+    pool(snap, name).map_or(0, |p| p.held)
+}
+
+/// Whether the head of the queue waits on a `sandbox` slot.
+fn head_waits_on_sandbox(snap: &ResourceSnapshot) -> bool {
+    snap.main
+        .head
+        .as_ref()
+        .is_some_and(|h| h.unmet.iter().any(|n| n.pool.as_str() == PoolName::SANDBOX))
+}
+
+/// Wait until every cpu and sandbox slot is back and nothing is queued, or
+/// fail naming what is still out.
+async fn all_capacity_back(engine: &Engine) {
     let deadline = Instant::now() + DEADLINE;
     loop {
-        let g = engine.sandbox_permit_gauge();
-        if g.held == 0 && g.pending_removal == 0 && g.waiting == 0 {
+        let Some(s) = snapshot(engine) else {
+            // Never built: nothing was ever admitted, so nothing is out.
+            return;
+        };
+        if held(&s, PoolName::SANDBOX) == 0 && held(&s, PoolName::CPU) == 0 && s.main.queued == 0 {
             return;
         }
-        assert!(Instant::now() < deadline, "a permit leaked: {g:?}");
+        assert!(Instant::now() < deadline, "capacity leaked: {s:?}");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
-/// Wait until the gauge satisfies `cond`, or fail naming `what`.
-async fn gauge_until(
-    engine: &Engine,
-    what: &str,
-    cond: impl Fn(&heph::engine::sandbox_permits::SandboxPermitGauge) -> bool,
-) {
+/// Wait until the snapshot satisfies `cond`, or fail naming `what`.
+async fn snapshot_until(engine: &Engine, what: &str, cond: impl Fn(&ResourceSnapshot) -> bool) {
     let deadline = Instant::now() + DEADLINE;
     loop {
-        let g = engine.sandbox_permit_gauge();
-        if cond(&g) {
+        let s = snapshot(engine);
+        if s.as_ref().is_some_and(&cond) {
             return;
         }
-        assert!(Instant::now() < deadline, "never saw {what}: {g:?}");
+        assert!(Instant::now() < deadline, "never saw {what}: {s:?}");
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
 
-/// A slow disk for the tests that need a permit to stay pending removal while
+/// A slow disk for the tests that need a slot to stay pending removal while
 /// something else happens: long next to everything they do meanwhile.
 const SLOW_REMOVAL: Duration = Duration::from_secs(3);
 
-/// Build `//p:busy` in its own request and return once its sandbox is queued
-/// for removal: with one permit and [`SLOW_REMOVAL`], the pool is exhausted
-/// for the next few seconds. The request is returned so the caller drains it.
+/// Build `//p:busy` in its own request and return once its run has ended and
+/// its sandbox is queued for removal: no cpu held, the only `sandbox` slot
+/// held by the pending removal. With one slot and [`SLOW_REMOVAL`], the pool
+/// is exhausted for the next few seconds. The request is returned so the
+/// caller drains it.
 async fn exhaust_the_pool(engine: &Arc<Engine>) -> anyhow::Result<Arc<RequestState>> {
-    engine.set_sandbox_removal_delay(SLOW_REMOVAL);
     let rs = engine.new_state();
     build_in(engine, &rs, &["//p:busy".to_owned()]).await?;
-    gauge_until(engine, "busy's sandbox pending removal", |g| {
-        g.pending_removal == 1 && g.held == 1
+    snapshot_until(engine, "busy's sandbox pending removal", |s| {
+        held(s, PoolName::SANDBOX) == 1 && held(s, PoolName::CPU) == 0
     })
     .await;
     Ok(rs)
+}
+
+/// Assert busy's slot is still out (its removal still owed) and nothing else
+/// is held or queued.
+fn assert_only_busy_pending(engine: &Engine, what: &str) {
+    let s = snapshot(engine).expect("the pool is built");
+    assert_eq!(
+        (
+            held(&s, PoolName::SANDBOX),
+            held(&s, PoolName::CPU),
+            s.main.queued
+        ),
+        (1, 0, 0),
+        "{what}: only busy's removal is owed: {s:?}"
+    );
 }
 
 /// The sandbox directories under `pkg`'s sandbox root right now.
@@ -205,13 +253,13 @@ fn sandboxes(engine: &Engine, pkg: &str) -> usize {
 }
 
 /// The ceiling itself. Twenty independent targets at `-j 4` behind a reclaim
-/// lane slowed to 300ms a removal: without the permit, finished sandboxes pile
+/// lane slowed to 300ms a removal: without the pool, finished sandboxes pile
 /// up faster than they are removed (the disk-filling `validate`). With two
-/// permits, a watcher sampling the sandbox root every millisecond never sees
+/// slots, a watcher sampling the sandbox root every millisecond never sees
 /// more than two.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn sandboxes_on_disk_never_exceed_the_permit_count() -> anyhow::Result<()> {
-    const PERMITS: usize = 2;
+async fn sandboxes_on_disk_never_exceed_the_sandbox_pool() -> anyhow::Result<()> {
+    const SLOTS: usize = 2;
     let tmp = tempfile::tempdir()?;
     let root = tmp.path();
     let names: Vec<String> = (0..20).map(|i| format!("s{i}")).collect();
@@ -223,8 +271,7 @@ async fn sandboxes_on_disk_never_exceed_the_permit_count() -> anyhow::Result<()>
             .map(|n| target(n, &format!("echo {n} > $OUT"), None))
             .collect::<String>(),
     );
-    let engine = engine(root, PERMITS)?;
-    engine.set_sandbox_removal_delay(Duration::from_millis(300));
+    let engine = engine(root, SLOTS, Duration::from_millis(300))?;
 
     let stop = Arc::new(AtomicBool::new(false));
     let peak = Arc::new(AtomicUsize::new(0));
@@ -250,37 +297,36 @@ async fn sandboxes_on_disk_never_exceed_the_permit_count() -> anyhow::Result<()>
         "the watcher never saw a sandbox: the probe is blind"
     );
     assert!(
-        peak <= PERMITS,
-        "{peak} sandboxes on disk at once, with {PERMITS} permits"
+        peak <= SLOTS,
+        "{peak} sandboxes on disk at once, with a sandbox pool of {SLOTS}"
     );
     assert_eq!(sandboxes(&engine, "p"), 0, "every sandbox is removed");
-    all_permits_back(&engine).await;
+    all_capacity_back(&engine).await;
     Ok(())
 }
 
-/// One permit and a ten-deep chain: each target's permit is back (its sandbox
+/// One slot and a ten-deep chain: each target's slot is back (its sandbox
 /// removed) before the next can run, so the chain completes only if no step
 /// keeps one. A dep resolved while its dependant holds nothing is what makes
 /// this finish at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_full_permit_pool_drains() -> anyhow::Result<()> {
+async fn a_full_sandbox_pool_drains() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let root = tmp.path();
     write_build(root, "p", &chain(10, |i| format!("echo {i} > $OUT")));
-    let engine = engine(root, 1)?;
-    engine.set_sandbox_removal_delay(Duration::from_millis(20));
+    let engine = engine(root, 1, Duration::from_millis(20))?;
 
     build(&engine, &["//p:t9".to_owned()]).await?;
-    all_permits_back(&engine).await;
+    all_capacity_back(&engine).await;
     assert_eq!(sandboxes(&engine, "p"), 0);
     Ok(())
 }
 
 /// The failure leg: the fifth link fails. Its sandbox stays for the
-/// diagnostic, outside the bound, and its permit comes back at once: a target
-/// built afterwards with the single permit still runs.
+/// diagnostic, outside the bound, and its slot comes back at once: a target
+/// built afterwards with the single slot still runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_full_permit_pool_drains_after_a_failure() -> anyhow::Result<()> {
+async fn a_full_sandbox_pool_drains_after_a_failure() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let root = tmp.path();
     let mut build_file = chain(10, |i| {
@@ -292,26 +338,26 @@ async fn a_full_permit_pool_drains_after_a_failure() -> anyhow::Result<()> {
     });
     build_file.push_str(&target("after", "echo after > $OUT", None));
     write_build(root, "p", &build_file);
-    let engine = engine(root, 1)?;
+    let engine = engine(root, 1, Duration::ZERO)?;
 
     let err = build(&engine, &["//p:t9".to_owned()])
         .await
         .expect_err("t5 fails");
     assert!(format!("{err:#}").contains("//p:t5"), "{err:#}");
-    all_permits_back(&engine).await;
+    all_capacity_back(&engine).await;
     // The failed sandbox is kept, and only it.
     assert_eq!(sandboxes(&engine, "p"), 1);
 
     build(&engine, &["//p:after".to_owned()]).await?;
-    all_permits_back(&engine).await;
+    all_capacity_back(&engine).await;
     Ok(())
 }
 
 /// The cancellation leg: the request is cancelled while the fifth link runs
 /// (it waits on a gate nobody opens). The dropped teardown queues the reclaim
-/// with the permit in it, so it comes back, and a later build still runs.
+/// with the slot in it, so it comes back, and a later build still runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_full_permit_pool_drains_after_a_cancellation() -> anyhow::Result<()> {
+async fn a_full_sandbox_pool_drains_after_a_cancellation() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let root = tmp.path();
     let gates = tempfile::tempdir()?;
@@ -330,7 +376,7 @@ async fn a_full_permit_pool_drains_after_a_cancellation() -> anyhow::Result<()> 
     });
     build_file.push_str(&target("after", "echo after > $OUT", None));
     write_build(root, "p", &build_file);
-    let engine = engine(root, 1)?;
+    let engine = engine(root, 1, Duration::ZERO)?;
 
     let rs = engine.new_state();
     let task = tokio::spawn({
@@ -343,8 +389,9 @@ async fn a_full_permit_pool_drains_after_a_cancellation() -> anyhow::Result<()> 
         assert!(Instant::now() < deadline, "t5 never started");
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    // t5 holds the only permit while it runs.
-    assert_eq!(engine.sandbox_permit_gauge().held, 1);
+    // t5 holds the only slot while it runs.
+    let s = snapshot(&engine).expect("the pool is built");
+    assert_eq!(held(&s, PoolName::SANDBOX), 1, "{s:?}");
     rs.ctoken().cancel();
     let ended = tokio::time::timeout(DEADLINE, task)
         .await
@@ -354,19 +401,19 @@ async fn a_full_permit_pool_drains_after_a_cancellation() -> anyhow::Result<()> 
         "a cancelled build does not succeed"
     );
     drain(rs).await;
-    all_permits_back(&engine).await;
+    all_capacity_back(&engine).await;
 
     build(&engine, &["//p:after".to_owned()]).await?;
-    all_permits_back(&engine).await;
+    all_capacity_back(&engine).await;
     Ok(())
 }
 
-/// A cache hit creates no sandbox, so it takes no permit: with the only one
+/// A cache hit creates no sandbox, so it takes no slot: with the only one
 /// pending removal behind a slow disk, a target already in the cache still
 /// comes back at once. The target's run counts itself into a file outside
 /// the sandbox, so "it was a hit" is observed, not assumed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_cache_hit_takes_no_permit() -> anyhow::Result<()> {
+async fn a_cache_hit_takes_no_sandbox_slot() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let root = tmp.path();
     let runs = tmp.path().join("runs");
@@ -383,20 +430,19 @@ async fn a_cache_hit_takes_no_permit() -> anyhow::Result<()> {
             target("busy", "echo busy > $OUT", None),
         ),
     );
-    let engine = engine(root, 1)?;
+    let engine = engine(root, 1, SLOW_REMOVAL)?;
     build(&engine, &["//p:cached".to_owned()]).await?;
-    all_permits_back(&engine).await;
+    all_capacity_back(&engine).await;
 
     let busy = exhaust_the_pool(&engine).await?;
     let started = Instant::now();
     let rs = engine.new_state();
     build_in(&engine, &rs, &["//p:cached".to_owned()]).await?;
     let elapsed = started.elapsed();
-    let g = engine.sandbox_permit_gauge();
-    assert_eq!(g.pending_removal, 1, "busy's removal is still owed: {g:?}");
+    assert_only_busy_pending(&engine, "after the hit");
     assert!(
         elapsed < SLOW_REMOVAL,
-        "the hit waited {elapsed:?}, as long as the removal: {g:?}"
+        "the hit waited {elapsed:?}, as long as the removal"
     );
     assert_eq!(
         std::fs::read_to_string(&runs)?.lines().count(),
@@ -406,15 +452,15 @@ async fn a_cache_hit_takes_no_permit() -> anyhow::Result<()> {
 
     drain(rs).await;
     drain(busy).await;
-    all_permits_back(&engine).await;
+    all_capacity_back(&engine).await;
     Ok(())
 }
 
 /// A non-managed driver (`template`, rendered in-process) creates no
-/// sandbox, so it takes no permit either: its first run completes while the
-/// only permit is pending removal.
+/// sandbox, so it takes no slot either: its first run completes while the
+/// only slot is pending removal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_non_managed_driver_takes_no_permit() -> anyhow::Result<()> {
+async fn a_non_managed_driver_takes_no_sandbox_slot() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let root = tmp.path();
     std::fs::create_dir_all(root.join("p"))?;
@@ -431,31 +477,86 @@ target(name = "conf", driver = "template", src = file("conf.j2"), out = "conf",
 "#,
         ),
     );
-    let engine = engine(root, 1)?;
+    let engine = engine(root, 1, SLOW_REMOVAL)?;
 
     let busy = exhaust_the_pool(&engine).await?;
     let started = Instant::now();
     let rs = engine.new_state();
     build_in(&engine, &rs, &["//p:conf".to_owned()]).await?;
     let elapsed = started.elapsed();
-    let g = engine.sandbox_permit_gauge();
-    assert_eq!(g.pending_removal, 1, "busy's removal is still owed: {g:?}");
+    assert_only_busy_pending(&engine, "after the template");
     assert!(
         elapsed < SLOW_REMOVAL,
-        "the template waited {elapsed:?}, as long as the removal: {g:?}"
+        "the template waited {elapsed:?}, as long as the removal"
     );
 
     drain(rs).await;
     drain(busy).await;
-    all_permits_back(&engine).await;
+    all_capacity_back(&engine).await;
     Ok(())
 }
 
-/// Cancelled while parked for a permit: the run leaves the queue as a
-/// cancellation — never a failure — without ever taking a permit, and the
-/// pool is whole afterwards.
+/// An invocation (`heph run` of an entrypoint) runs in its own sandbox but
+/// takes no admission, so no slot: it completes while the only slot is still
+/// pending removal behind a slow disk.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_run_cancelled_while_waiting_for_a_permit_is_a_cancellation() -> anyhow::Result<()> {
+async fn an_invocation_takes_no_sandbox_slot() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let root = tmp.path();
+    let out = tmp.path().join("invoked");
+    write_build(
+        root,
+        "p",
+        &format!(
+            "{}{}",
+            target("busy", "echo busy > $OUT", None),
+            r#"
+target(name = "ep", driver = "bash", entrypoint = True,
+       run = "echo invoked > \"$HEPH_TEST_OUT\"")
+"#,
+        ),
+    );
+    let engine = engine(root, 1, SLOW_REMOVAL)?;
+
+    let busy = exhaust_the_pool(&engine).await?;
+    let started = Instant::now();
+    let req = InvokeRequest::new(
+        parse_addr("//p:ep")?,
+        root,
+        vec![
+            ("PATH".into(), "/usr/bin:/bin".into()),
+            ("HEPH_TEST_OUT".into(), out.as_os_str().to_owned()),
+        ],
+    );
+    let outcome = tokio::time::timeout(
+        DEADLINE,
+        Arc::clone(&engine).invoke(engine.new_state(), req),
+    )
+    .await
+    .map_err(|_elapsed| anyhow::anyhow!("the invocation hung"))??;
+    let elapsed = started.elapsed();
+    match outcome {
+        InvokeOutcome::Exited(exit) => assert_eq!(exit, hcore::process::Exit::Code(0)),
+        other => panic!("the invocation did not exit cleanly: {other:?}"),
+    }
+    assert_eq!(std::fs::read_to_string(&out)?, "invoked\n");
+    assert_only_busy_pending(&engine, "after the invocation");
+    assert!(
+        elapsed < SLOW_REMOVAL,
+        "the invocation waited {elapsed:?}, as long as the removal"
+    );
+
+    drain(busy).await;
+    all_capacity_back(&engine).await;
+    Ok(())
+}
+
+/// Cancelled while queued for a slot: the run leaves the queue as a
+/// cancellation — never a failure — without ever taking a slot, and the pool
+/// is whole afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_cancelled_while_queued_on_the_sandbox_pool_is_a_cancellation() -> anyhow::Result<()>
+{
     let tmp = tempfile::tempdir()?;
     let root = tmp.path();
     write_build(
@@ -467,7 +568,7 @@ async fn a_run_cancelled_while_waiting_for_a_permit_is_a_cancellation() -> anyho
             target("parked", "echo parked > $OUT", None),
         ),
     );
-    let engine = engine(root, 1)?;
+    let engine = engine(root, 1, SLOW_REMOVAL)?;
 
     let busy = exhaust_the_pool(&engine).await?;
     let rs = engine.new_state();
@@ -481,20 +582,24 @@ async fn a_run_cancelled_while_waiting_for_a_permit_is_a_cancellation() -> anyho
                 .map(|batch| batch.errors.len())
         }
     });
-    gauge_until(&engine, "the run parked for a permit", |g| g.waiting == 1).await;
+    snapshot_until(&engine, "the run queued on the sandbox pool", |s| {
+        s.main.queued == 1 && head_waits_on_sandbox(s)
+    })
+    .await;
+    let cancelled_at = Instant::now();
     rs.ctoken().cancel();
     let ended = tokio::time::timeout(DEADLINE, task)
         .await
         .map_err(|_elapsed| anyhow::anyhow!("a cancelled wait hung"))??;
+    let left_after = cancelled_at.elapsed();
 
-    // Back out of the queue, holding nothing: the only permit out is busy's,
-    // whose removal is still owed.
-    let g = engine.sandbox_permit_gauge();
-    assert_eq!(
-        (g.waiting, g.held, g.pending_removal),
-        (0, 1, 1),
-        "the cancelled run took no permit: {g:?}"
+    // Back out of the queue at once, holding nothing: the only slot out is
+    // busy's, whose removal is still owed.
+    assert!(
+        left_after < SLOW_REMOVAL,
+        "the cancelled run left the queue only after {left_after:?}, once busy's slot was back"
     );
+    assert_only_busy_pending(&engine, "after the cancelled wait");
     match ended {
         Err(e) => assert!(hplugin::error::is_cancelled(&e), "{e:#}"),
         Ok(errors) => assert!(errors > 0, "a cancelled run did not succeed"),
@@ -511,6 +616,6 @@ async fn a_run_cancelled_while_waiting_for_a_permit_is_a_cancellation() -> anyho
 
     drain(rs).await;
     drain(busy).await;
-    all_permits_back(&engine).await;
+    all_capacity_back(&engine).await;
     Ok(())
 }
