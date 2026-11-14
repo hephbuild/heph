@@ -685,6 +685,51 @@ target(name = "conf", driver = "template", src = file("conf.j2"), out = "conf",
     Ok(())
 }
 
+/// `sandbox: 0` in the config is "the run sets it", as for any pool: a
+/// managed run that reaches admission fails at once with the generic
+/// zero-capacity error rather than waiting for a slot that never comes, and
+/// a non-managed target, which takes no slot, still builds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_zero_sandbox_pool_fails_a_managed_run_at_once() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("p"))?;
+    std::fs::write(root.join("p/conf.j2"), "name: {{ name }}\n")?;
+    write_build(
+        root,
+        "p",
+        &format!(
+            "{}{}",
+            target("managed", "echo managed > $OUT", None),
+            r#"
+target(name = "conf", driver = "template", src = file("conf.j2"), out = "conf",
+       vars = {"name": "x"})
+"#,
+        ),
+    );
+    let engine = engine(root, 0, Duration::ZERO)?;
+
+    let started = Instant::now();
+    let err = build(&engine, &["//p:managed".to_owned()])
+        .await
+        .expect_err("a managed run with no sandbox capacity fails");
+    let err = format!("{err:#}");
+    assert!(
+        err.contains(
+            "//p:managed acquires sandbox, but pool sandbox has capacity 0 and must be set: \
+             --resource sandbox=<n>"
+        ),
+        "{err}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "failed at admission, not after a wait: {:?}",
+        started.elapsed()
+    );
+    build(&engine, &["//p:conf".to_owned()]).await?;
+    Ok(())
+}
+
 /// A run waiting on `sandbox` names its cause: the `AdmissionWaitStart` it
 /// emits carries `removals_pending`, here busy's removal held by the gate,
 /// and the count is back to 0 once that removal returns.

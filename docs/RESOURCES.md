@@ -127,8 +127,8 @@ resources:
 - **No value**: a custom pool is **unbounded**: every request is granted at
   once and nothing is clamped, but what is held is still counted and shown.
   `cpu`, `memory` and `sandbox` without a value keep their defaults.
-- **`0`** (any pool but `sandbox`, which refuses it): "this pool exists; the
-  caller sets its capacity per run". BUILD
+- **`0`** (any pool, `sandbox` included): "this pool exists; the caller sets
+  its capacity per run". BUILD
   files naming it validate on every machine, and a run that reaches a target
   needing it fails at admission, before the target runs:
 
@@ -145,8 +145,8 @@ difference between platforms is on purpose: a target that declares `memory`
 can wait in a Linux CI container limited to 8G where it ran at once on a 32G
 laptop. Set `resources: {memory: …}` to make the two agree.
 
-`sandbox` is 4 per CPU of the resolved `cpu` capacity (rounded up), so `-j 2`
-makes it 8.
+`sandbox` is 4 per CPU of the resolved `cpu` capacity (rounded up, and at
+least 1, so a `cpu: 0` still leaves one), so `-j 2` makes it 8.
 
 **Percentages** (`cpu: 50%`, `memory: 75%`, `sandbox: 200%`, and the same on
 the command line) are of the builtin's default and exist only for the
@@ -199,9 +199,12 @@ bounds the build sandboxes on disk, **running or awaiting removal**:
   `${resource:sandbox}` is refused when the def is linked. Size it with
   `--resource sandbox=<n>`, `HEPH_RESOURCE_SANDBOX=<n>` or
   `resources: {sandbox: <n>}`.
-- It is **always bounded**: there is no unbounded form, and `0` is refused on
-  every surface (the config's "the caller sets it" included), as is a unit
-  other than `count`. A pool of your own named `sandbox` must be renamed.
+- It is **always bounded**: there is no unbounded form, and a unit other
+  than `count` is refused. A pool of your own named `sandbox` must be
+  renamed. `0` follows the same rule as every pool's: `.hephconfig` may say
+  `sandbox: 0` ("the run sets it"), `--resource sandbox=0` and
+  `HEPH_RESOURCE_SANDBOX=0` are refused, and a managed run under a 0 pool
+  fails at admission, before it runs, naming how to set it.
 - Admission is strict FIFO, so a managed run at the head of the queue that
   waits for a `sandbox` slot holds back every run behind it, including one
   that takes no slot (a `template` target) and would fit the free cpu. This

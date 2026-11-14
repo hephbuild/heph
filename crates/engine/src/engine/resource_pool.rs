@@ -322,18 +322,20 @@ pub fn resolve_capacities(
         .get(PoolName::CPU)
         .and_then(|s| s.capacity)
         .map_or(cpu_default, |c| c.resolve(Unit::Cpu, || cpu_default));
+    // The default is never empty, even taken of a `cpu: 0`, and a
+    // percentage floors at 1 (`Capacity::resolve`). An explicit 0 stays 0,
+    // as for any pool: the run sets it, and admission refuses a managed run
+    // until it does.
     let sandbox_default = cpu
         .div_ceil(Resources::MICROS_PER_CPU)
-        .saturating_mul(SANDBOXES_PER_CPU);
+        .saturating_mul(SANDBOXES_PER_CPU)
+        .max(1);
     let sandbox = specs
         .get(PoolName::SANDBOX)
         .and_then(|s| s.capacity)
         .map_or(sandbox_default, |c| {
             c.resolve(Unit::Count, || sandbox_default)
-        })
-        // Never empty: the parser refuses 0, and this also covers a default
-        // taken of a `cpu: 0`.
-        .max(1);
+        });
     let memory = match specs.get(PoolName::MEMORY).and_then(|s| s.capacity) {
         Some(c @ hcore::capacity::Capacity::Amount(_)) => {
             Limit::Bounded(c.resolve(Unit::Bytes, || 0))
@@ -1697,22 +1699,32 @@ mod tests {
             Limit::Bounded(16),
             "200% of 4 x 2"
         );
-        // Always bounded and never empty: a percentage that floors to 0, a 0
-        // that slipped past the parser, and a default taken of `cpu: 0`.
+        // What the engine computes is never empty: a percentage that floors
+        // to 0, and a default taken of `cpu: 0`. What the user wrote is kept:
+        // an explicit 0 is "the run sets it", as for any pool.
         assert_eq!(
             sandbox_of(&sandbox(Capacity::Percent(10)), 1),
             Limit::Bounded(1),
             "10% of 4 x 1 floors to 0, raised to 1"
         );
         assert_eq!(
-            sandbox_of(&sandbox(Capacity::Amount(0)), 1),
-            Limit::Bounded(1),
-            "0 is never an empty sandbox pool"
-        );
-        assert_eq!(
             sandbox_of(&cpu(Capacity::Amount(0)), 1),
             Limit::Bounded(1),
             "a default of cpu: 0 is still one sandbox"
+        );
+        assert_eq!(
+            sandbox_of(&sandbox(Capacity::Amount(0)), 1),
+            Limit::Bounded(0),
+            "an explicit 0 stays 0"
+        );
+        let p = ResourcePool::new(resolve_capacities(&sandbox(Capacity::Amount(0)), 1, || 0));
+        assert_eq!(
+            p.acquire_with(&Default::default(), &[(name("sandbox"), 1)])
+                .unwrap_err(),
+            AcquireError::ZeroCapacity {
+                pool: name("sandbox")
+            },
+            "a managed run fails at admission, like any pool's 0"
         );
     }
 

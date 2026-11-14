@@ -244,7 +244,7 @@ pub struct GlobalOptions {
     /// a custom pool as its configured `unit` (a count unless it says
     /// otherwise); `cpu` and `memory` also take a percentage of their default
     /// (`memory=75%`). Above 0. `sandbox` is the engine's own pool: it bounds
-    /// sandboxes on disk (a count or a percentage of 4 per CPU, never 0).
+    /// sandboxes on disk (a count or a percentage of 4 per CPU).
     /// Overrides `HEPH_RESOURCE_<NAME>`, which
     /// overrides `resources.<name>` in `.hephconfig`. A pool may be given
     /// once per command line. See `docs/RESOURCES.md`.
@@ -433,18 +433,24 @@ mod tests {
         // A builtin's value is checked at parse, before any config is read.
         assert!(flags(&["-j", "abc"]).is_err());
         assert!(flags(&["--resource", "memory=lots"]).is_err());
-        // `sandbox` is the engine's own pool and always bounded: 0 is refused
-        // with what it bounds, on the flag and in the environment alike.
-        let err = flags(&["--resource", "sandbox=0"]).unwrap_err().to_string();
-        assert!(err.contains("sandboxes exist on disk"), "{err}");
-        let err = format!(
-            "{:#}",
-            env_over(Specs::new(), &[("HEPH_RESOURCE_SANDBOX", "0")]).unwrap_err()
-        );
-        assert!(
-            err.contains("HEPH_RESOURCE_SANDBOX") && err.contains("engine's own"),
-            "{err}"
-        );
+        // A run never sets a pool to 0, and `sandbox` is no exception: its 0
+        // is refused with the generic words, on the flag and in the
+        // environment alike (a builtin's at parse, a custom pool's once its
+        // unit is known).
+        let zero = "\"0\" is not a capacity for a run: it is above 0";
+        for pool in ["sandbox", "gpu"] {
+            let err = format!(
+                "{:#}",
+                overrides(&["--resource", &format!("{pool}=0")]).unwrap_err()
+            );
+            assert!(err.contains(zero), "{pool}: {err}");
+            let var = format!("HEPH_RESOURCE_{}", pool.to_uppercase());
+            let err = format!(
+                "{:#}",
+                env_over(Specs::new(), &[(var.as_str(), "0")]).unwrap_err()
+            );
+            assert!(err.contains(&var) && err.contains(zero), "{pool}: {err}");
+        }
         assert_eq!(
             overrides(&["--resource", "sandbox=10%"]).unwrap(),
             specs(&[("sandbox", Count, Some(Capacity::Percent(10)))])

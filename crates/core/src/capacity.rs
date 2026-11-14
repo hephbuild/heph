@@ -198,9 +198,6 @@ impl Capacity {
     ///   default (`cpu`, `memory`, `sandbox`). Over 100 is an overcommit by
     ///   choice.
     /// - anything else: an amount in `unit` ([`Unit::parse`]).
-    ///
-    /// `sandbox` refuses 0 whatever `zero` says: it is the engine's own pool
-    /// and has no "the run sets it" or unbounded form.
     pub fn parse(pool: &str, unit: Unit, s: &str, zero: Zero) -> anyhow::Result<Self> {
         if let Some(digits) = s.strip_suffix('%') {
             if Unit::of_builtin(pool).is_none() {
@@ -216,13 +213,6 @@ impl Capacity {
             return Ok(Self::Percent(pct));
         }
         let amount = unit.parse(s)?;
-        if amount == 0 && pool == SANDBOX {
-            anyhow::bail!(
-                "{s:?} would stop every sandboxed run: pool {SANDBOX} is the engine's own and \
-                 bounds how many build sandboxes exist on disk at once, so it is always bounded; \
-                 give it at least 1 (the default is 4 per CPU)"
-            );
-        }
         if amount == 0 && zero == Zero::Refused {
             anyhow::bail!("{s:?} is not a capacity for a run: it is above 0");
         }
@@ -468,37 +458,36 @@ mod tests {
         );
     }
 
-    /// `sandbox` is the engine's own pool and always bounded: 0 is refused on
-    /// every surface, the config's "the run sets it" included, and the error
-    /// says what the pool bounds.
+    /// `sandbox` follows the same 0 rule as every pool: the config may say
+    /// "the run sets it", a run (`Zero::Refused`) may not set 0, and the
+    /// refusal is the generic one, word for word.
     #[test]
-    fn sandbox_refuses_zero_everywhere() {
-        for zero in [Zero::Allowed, Zero::Refused] {
-            let err = Capacity::parse("sandbox", Unit::Count, "0", zero)
-                .unwrap_err()
-                .to_string();
-            assert!(
-                err.contains("engine's own") && err.contains("sandboxes exist on disk"),
-                "{err}"
-            );
-        }
-        assert_eq!(
-            Capacity::parse("sandbox", Unit::Count, "1", Zero::Refused).unwrap(),
-            Capacity::Amount(1)
-        );
-        assert_eq!(
-            Capacity::parse("sandbox", Unit::Count, "10%", Zero::Refused).unwrap(),
-            Capacity::Percent(10)
-        );
-        // Near-miss names are ordinary pools.
-        for pool in ["sandboxes", "sandbo", "my_sandbox"] {
+    fn sandbox_takes_zero_like_any_pool() {
+        for pool in ["sandbox", "gpu"] {
             assert_eq!(
                 Capacity::parse(pool, Unit::Count, "0", Zero::Allowed).unwrap(),
                 Capacity::Amount(0),
                 "{pool}"
             );
+            assert_eq!(
+                Capacity::parse(pool, Unit::Count, "0", Zero::Refused)
+                    .unwrap_err()
+                    .to_string(),
+                "\"0\" is not a capacity for a run: it is above 0",
+                "{pool}"
+            );
+            assert_eq!(
+                PoolSpec::from_written(pool, None, Some("0"))
+                    .unwrap()
+                    .capacity,
+                Some(Capacity::Amount(0)),
+                "{pool}"
+            );
         }
-        assert!(PoolSpec::from_written("sandbox", None, Some("0")).is_err());
+        assert_eq!(
+            Capacity::parse("sandbox", Unit::Count, "10%", Zero::Refused).unwrap(),
+            Capacity::Percent(10)
+        );
     }
 
     #[test]
