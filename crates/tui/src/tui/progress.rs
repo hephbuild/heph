@@ -786,6 +786,16 @@ struct PoolView {
     capacity: Option<u64>,
     /// What the running targets hold, in the unit's base.
     held: u64,
+    /// How many announced admission waits name this pool: the count of
+    /// `admission_waits` on it, kept at Start/End. It is how a pool no
+    /// running target reports holding shows at all: `sandbox`, whose slot is
+    /// the engine's and never in `reserved`.
+    waiting: u64,
+    /// The `removals_pending` of the latest `AdmissionWaitStart` on this
+    /// pool that carried one (`sandbox` only): finished runs whose sandbox
+    /// was not removed yet, the cause of a `sandbox` wait. Shown beside
+    /// `waiting` while that is above 0.
+    removals_pending: u64,
 }
 
 impl PoolView {
@@ -794,6 +804,8 @@ impl PoolView {
             unit: Unit::default_for(pool),
             capacity: None,
             held: 0,
+            waiting: 0,
+            removals_pending: 0,
         }
     }
 }
@@ -817,6 +829,7 @@ struct AdmissionWait {
     need: u64,
     free: u64,
     ahead: u64,
+    removals_pending: Option<u64>,
     since_ms: u64,
 }
 
@@ -1037,7 +1050,7 @@ impl BuildState {
                 // A target that runs is no longer waiting. The engine sends
                 // `AdmissionWaitEnd` first; this keeps a lost End from leaving
                 // the row in the Waiting tab for the rest of the run.
-                self.admission_waits.remove(addr);
+                self.end_admission_wait(addr);
                 match hcore::events::clamp_text(declared.as_ref(), reserved.as_ref(), |p| {
                     self.unit_of(p)
                 }) {
@@ -1075,7 +1088,15 @@ impl BuildState {
                 need,
                 free,
                 ahead,
+                removals_pending,
             } => {
+                // A repeated Start replaces the wait, so it counts once.
+                self.end_admission_wait(addr);
+                let view = self.pool_mut(pool);
+                view.waiting = view.waiting.saturating_add(1);
+                if let Some(n) = *removals_pending {
+                    view.removals_pending = n;
+                }
                 self.admission_waits.insert(
                     addr.clone(),
                     AdmissionWait {
@@ -1083,12 +1104,13 @@ impl BuildState {
                         need: *need,
                         free: *free,
                         ahead: *ahead,
+                        removals_pending: *removals_pending,
                         since_ms: ev.at_unix_ms,
                     },
                 );
             }
             BuildEventKind::AdmissionWaitEnd { addr } => {
-                self.admission_waits.remove(addr);
+                self.end_admission_wait(addr);
             }
             // Tier events: per tier, not per target, so never a count here (a
             // remote hit is a local miss first). See `hcore::events`.
@@ -1473,6 +1495,16 @@ impl BuildState {
         }
     }
 
+    /// Drop `addr`'s announced admission wait, if any, and its count on the
+    /// pool it named. Saturating, like [`release`](Self::release).
+    fn end_admission_wait(&mut self, addr: &str) {
+        if let Some(w) = self.admission_waits.remove(addr)
+            && let Some(view) = self.pools.get_mut(&w.pool)
+        {
+            view.waiting = view.waiting.saturating_sub(1);
+        }
+    }
+
     /// Pool `pool`'s entry, added with its default unit and no capacity when
     /// it was never announced.
     fn pool_mut(&mut self, pool: &str) -> &mut PoolView {
@@ -1498,20 +1530,36 @@ impl BuildState {
     /// One `<pool> <held>/<capacity>` segment per pool other than `cpu`
     /// (which the worker cells show) that a running target holds some of,
     /// in name order and in the pool's unit: `memory 2.0 GiB/16.0 GiB`,
-    /// `gpu 1/2`. An unbounded pool has no capacity: `tokens 5`. Walks the
-    /// pools, never the targets.
+    /// `gpu 1/2`. An unbounded pool has no capacity: `tokens 5`. A pool that
+    /// announced admission waits name adds how many: `gpu 2/2, 3 waiting`;
+    /// one no running target reports holding shows by its waits alone:
+    /// `sandbox: 3 waiting` (its slots are the engine's, in no `reserved`).
+    /// Walks the pools, never the targets.
     pub fn pool_segments(&self) -> impl Iterator<Item = String> + '_ {
         self.pools
             .iter()
-            .filter(|(pool, v)| pool.as_str() != hcore::capacity::CPU && v.held > 0)
+            .filter(|(pool, v)| {
+                pool.as_str() != hcore::capacity::CPU && (v.held > 0 || v.waiting > 0)
+            })
             .map(|(pool, v)| {
                 let held = hcore::events::display_amount(v.unit, v.held);
-                match v.capacity {
-                    Some(cap) => format!(
+                let base = match (v.held, v.capacity) {
+                    (0, _) => format!("{pool}:"),
+                    (_, Some(cap)) => format!(
                         "{pool} {held}/{}",
                         hcore::events::display_amount(v.unit, cap)
                     ),
-                    None => format!("{pool} {held}"),
+                    (_, None) => format!("{pool} {held}"),
+                };
+                let waiting = match v.waiting {
+                    0 => return base,
+                    n if v.held == 0 => format!("{base} {n} waiting"),
+                    n => format!("{base}, {n} waiting"),
+                };
+                match v.removals_pending {
+                    0 => waiting,
+                    1 => format!("{waiting} (1 removal pending)"),
+                    n => format!("{waiting} ({n} removals pending)"),
                 }
             })
     }
@@ -1542,6 +1590,7 @@ impl BuildState {
                             w.need,
                             w.free,
                             w.ahead,
+                            w.removals_pending,
                             &waited
                         )
                     ),
@@ -3172,6 +3221,107 @@ mod tests {
         assert_eq!(s.busy_cpus(), 0);
     }
 
+    /// The `sandbox` slot is in no `ExecuteStart.reserved`, so the pool shows
+    /// by its announced waits: `sandbox: N waiting` while runs wait for
+    /// cleanup, gone once they are admitted. A held pool adds its waits to
+    /// its usual segment. A repeated Start counts once, and an End or the
+    /// waiter's own `ExecuteStart` takes it off.
+    #[test]
+    fn pool_segments_show_runs_waiting_on_a_pool() {
+        let mut s = BuildState::new();
+        s.apply(&ev(
+            0,
+            BuildEventKind::RequestConfig {
+                max_workers: 4,
+                fail_fast: false,
+                scratch_disabled: false,
+                resources: [
+                    ("cpu".into(), Some(4 * CPU)),
+                    ("gpu".into(), Some(1)),
+                    ("sandbox".into(), Some(16)),
+                ]
+                .into(),
+                units: [
+                    ("cpu".into(), "cpu".into()),
+                    ("gpu".into(), "count".into()),
+                    ("sandbox".into(), "count".into()),
+                ]
+                .into(),
+            },
+        ));
+        let segments = |s: &BuildState| s.pool_segments().collect::<Vec<_>>();
+        let wait = |addr: &str, pool: &str| BuildEventKind::AdmissionWaitStart {
+            addr: addr.into(),
+            pool: pool.into(),
+            need: 1,
+            free: 0,
+            ahead: 0,
+            removals_pending: None,
+        };
+        let end = |addr: &str| BuildEventKind::AdmissionWaitEnd { addr: addr.into() };
+
+        s.apply(&ev(0, execute_start("//a:running")));
+        assert!(segments(&s).is_empty(), "a running slot is not shown");
+        s.apply(&ev(1, wait("//a:x", "sandbox")));
+        s.apply(&ev(1, wait("//a:y", "sandbox")));
+        assert_eq!(segments(&s), ["sandbox: 2 waiting"]);
+        s.apply(&ev(2, wait("//a:y", "sandbox")));
+        assert_eq!(segments(&s), ["sandbox: 2 waiting"], "a repeated Start");
+
+        s.apply(&ev(
+            2,
+            execute_start_reserving("//a:g", &[("cpu", CPU), ("gpu", 1)]),
+        ));
+        s.apply(&ev(2, wait("//a:z", "gpu")));
+        assert_eq!(segments(&s), ["gpu 1/1, 1 waiting", "sandbox: 2 waiting"]);
+
+        s.apply(&ev(3, end("//a:x")));
+        // A lost End: the waiter's ExecuteStart takes the wait off.
+        s.apply(&ev(3, execute_start("//a:y")));
+        s.apply(&ev(3, end("//a:never")));
+        assert_eq!(segments(&s), ["gpu 1/1, 1 waiting"]);
+        s.apply(&ev(4, end("//a:z")));
+        assert_eq!(segments(&s), ["gpu 1/1"]);
+    }
+
+    /// A `sandbox` wait names its cause in the header: how many finished
+    /// runs' sandboxes were still being removed, as of the latest notice.
+    #[test]
+    fn pool_segments_show_removals_pending_on_a_sandbox_wait() {
+        let mut s = BuildState::new();
+        let segments = |s: &BuildState| s.pool_segments().collect::<Vec<_>>();
+        let wait = |addr: &str, pending| BuildEventKind::AdmissionWaitStart {
+            addr: addr.into(),
+            pool: "sandbox".into(),
+            need: 1,
+            free: 0,
+            ahead: 0,
+            removals_pending: Some(pending),
+        };
+        s.apply(&ev(1, wait("//a:x", 0)));
+        assert_eq!(segments(&s), ["sandbox: 1 waiting"], "none pending");
+        s.apply(&ev(1, wait("//a:y", 1)));
+        assert_eq!(segments(&s), ["sandbox: 2 waiting (1 removal pending)"]);
+        s.apply(&ev(2, wait("//a:z", 3)));
+        assert_eq!(segments(&s), ["sandbox: 3 waiting (3 removals pending)"]);
+        let row: String = s.admission_wait_lines(2, "")[2]
+            .spans
+            .iter()
+            .map(|sp| sp.content.as_ref())
+            .collect();
+        assert!(
+            row.ends_with("— cleanup is behind: 3 removals pending"),
+            "{row}"
+        );
+        for addr in ["//a:x", "//a:y", "//a:z"] {
+            s.apply(&ev(
+                3,
+                BuildEventKind::AdmissionWaitEnd { addr: addr.into() },
+            ));
+        }
+        assert!(segments(&s).is_empty(), "{:?}", segments(&s));
+    }
+
     #[test]
     fn admission_wait_row_names_the_pool_and_the_queue() {
         let mut s = BuildState::new();
@@ -3183,6 +3333,7 @@ mod tests {
                 need: 4 * CPU,
                 free: 2 * CPU,
                 ahead: 6,
+                removals_pending: None,
             },
         ));
         let text: String = s.admission_wait_lines(42_000, "")[0]
@@ -3207,6 +3358,7 @@ mod tests {
             need: 4 * CPU,
             free: 2 * CPU,
             ahead: 6,
+            removals_pending: None,
         }
     }
 

@@ -119,7 +119,14 @@ pub fn clamp_text(
 
 /// The text of an admission-wait row, after its `⧗`:
 /// `//a:b waits for cpu 4 (2 free, 6 ahead, 41s)`. `waited` is the elapsed
-/// time as the renderer spells it; `unit` is `pool`'s.
+/// time as the renderer spells it; `unit` is `pool`'s. With removals pending
+/// (`removals_pending` above 0, only ever set on a `sandbox` wait), the cause
+/// is named: `… — cleanup is behind: 3 removals pending`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one per field of the row; a struct for them would be built at each call site only \
+              to be taken apart here"
+)]
 pub fn admission_wait_text(
     addr: &str,
     pool: &str,
@@ -127,13 +134,21 @@ pub fn admission_wait_text(
     need: u64,
     free: u64,
     ahead: u64,
+    removals_pending: Option<u64>,
     waited: &str,
 ) -> String {
-    format!(
+    let text = format!(
         "{addr} waits for {pool} {} ({} free, {ahead} ahead, {waited})",
         display_amount(unit, need),
         display_amount(unit, free)
-    )
+    );
+    match removals_pending {
+        Some(n @ 1..) => {
+            let noun = if n == 1 { "removal" } else { "removals" };
+            format!("{text} — cleanup is behind: {n} {noun} pending")
+        }
+        _ => text,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -366,6 +381,12 @@ pub enum BuildEventKind {
         free: u64,
         /// How many requests were queued ahead of it.
         ahead: u64,
+        /// Set only when `pool` is `sandbox`: how many finished runs' sandboxes
+        /// were still waiting to be removed (each holding its slot until then)
+        /// when the notice fired. Above 0, the wait is on cleanup, not on runs.
+        /// `None` from a host that predates it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        removals_pending: Option<u64>,
     },
     /// The admission wait ended (granted, or the wait was cancelled).
     AdmissionWaitEnd {
@@ -950,6 +971,43 @@ mod tests {
             }
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    /// The wait row names cleanup as the cause only when removals are
+    /// pending: not for a non-`sandbox` wait (`None`), nor for a `sandbox`
+    /// wait with none pending (`Some(0)`).
+    #[test]
+    fn admission_wait_text_names_pending_removals_only_when_there_are_some() {
+        let text =
+            |pending| admission_wait_text("//a:b", "sandbox", Unit::Count, 1, 0, 2, pending, "41s");
+        let plain = "//a:b waits for sandbox 1 (0 free, 2 ahead, 41s)";
+        assert_eq!(text(None), plain);
+        assert_eq!(text(Some(0)), plain);
+        assert_eq!(
+            text(Some(1)),
+            format!("{plain} — cleanup is behind: 1 removal pending")
+        );
+        assert_eq!(
+            text(Some(3)),
+            format!("{plain} — cleanup is behind: 3 removals pending")
+        );
+    }
+
+    /// `AdmissionWaitStart` from a host predating `removals_pending` decodes
+    /// as `None`, and a frame without it serializes without the key.
+    #[test]
+    fn an_old_admission_wait_has_no_removals_pending() {
+        let old = r#"{"at_unix_ms":1,"kind":{"type":"AdmissionWaitStart","addr":"//a:x",
+            "pool":"cpu","need":1,"free":0,"ahead":0}}"#;
+        let ev: BuildEvent = serde_json::from_str(old).expect("old frame must decode");
+        match &ev.kind {
+            BuildEventKind::AdmissionWaitStart {
+                removals_pending, ..
+            } => assert_eq!(*removals_pending, None),
+            other => panic!("wrong variant: {other:?}"),
+        }
+        let json = serde_json::to_string(&ev).expect("encode");
+        assert!(!json.contains("removals_pending"), "{json}");
     }
 
     /// `ResultLockWaitStart` from a host predating `in_use_by_readers` decodes,

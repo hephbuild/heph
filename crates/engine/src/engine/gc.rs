@@ -350,19 +350,20 @@ impl Engine {
     /// revision, and that is all the budget decision needs. Deliberately not
     /// `exists` here: `exists` parks the caller until the sqlite writer has
     /// drained *everything queued ahead of our entry* — at the end of a large
-    /// build, the whole remaining write backlog — and this runs on the single FIFO
-    /// cleaner thread that also owes every sandbox rmdir and gates process exit.
-    /// Paying that before knowing whether there is anything to delete would charge
+    /// build, the whole remaining write backlog — and this runs on the
+    /// bookkeeping lane's one FIFO thread, whose `bg_pending` gates process exit
+    /// and whose every later trim queues behind this one. Paying that before knowing whether there is anything to delete would charge
     /// every within-budget target for a decision it does not need. The wait stays
     /// where it has always been, inside the lock branch, where the enumeration
     /// that actually chooses what to delete has to be ordered against our write.
     ///
     /// Deliberately `try_lock_target` and not a blocking `lock_target`: the lock is a
     /// cross-process `flock`, so a blocking acquire can wait on another `heph`
-    /// arbitrarily long — on the single FIFO cleaner thread that also owes every
-    /// sandbox rmdir, on the path that gates exit, and with no runtime to await
-    /// the async `ResultLock::write` on anyway. A skip is recoverable; an
-    /// unbounded stall of all cleanup is not. [`Engine::run_trim_batch_with_delay`] hedges
+    /// arbitrarily long — on the bookkeeping lane's one FIFO thread (sandbox
+    /// removals have their own lane, `sandbox_cleaner::Lane::Reclaim`), on the
+    /// path that gates exit, and with no runtime to await the async
+    /// `ResultLock::write` on anyway. A skip is recoverable; an unbounded stall
+    /// of every trim queued behind it, and of exit, is not. [`Engine::run_trim_batch_with_delay`] hedges
     /// the skip instead, with one immediate re-probe and one delayed retry.
     pub(crate) fn try_trim_after_write(
         &self,

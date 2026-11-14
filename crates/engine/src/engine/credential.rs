@@ -83,6 +83,33 @@ pub struct ResolvedCredential {
     pub deferred: Vec<crate::engine::deferred::DeferredRef>,
 }
 
+/// A target's credentials with their material acquired and not yet presented:
+/// what [`Engine::acquire_credentials`] hands to
+/// [`Engine::present_credentials`] across the wait for the run's pools.
+///
+/// Held in memory only. The material is the same the process cache holds;
+/// nothing here writes it anywhere.
+pub(crate) struct HeldCredentials {
+    held: Vec<(ResolvedCredential, Acquired)>,
+}
+
+impl HeldCredentials {
+    /// The first credential whose material is no longer usable at `now` —
+    /// expired, or inside its skew margin — when any is. Material can lapse
+    /// while its consumer waits for its pools.
+    pub(crate) fn lapsed(&self, now: SystemTime) -> Option<&Addr> {
+        self.held
+            .iter()
+            .find(|(_, a)| !a.material.usable_at(now, a.acquired_at))
+            .map(|(rc, _)| &rc.addr)
+    }
+
+    /// Back to the resolved references, to acquire again.
+    pub(crate) fn into_resolved(self) -> Vec<ResolvedCredential> {
+        self.held.into_iter().map(|(rc, _)| rc).collect()
+    }
+}
+
 /// What led to a credential: the addresses already being acquired, and the
 /// resolution keys of the parents whose identity this one is derived under.
 ///
@@ -942,6 +969,11 @@ impl Engine {
     /// `cache = False` is required and enforced here rather than documented,
     /// because a cacheable producer would be pushed to the shared remote before
     /// anything here could intervene.
+    ///
+    /// The producer's run is an ordinary one as far as the pools go — its
+    /// deps, its admission for cpu and a `sandbox` slot — which is sound only
+    /// because nothing up the stack holds any of them: a consumer acquires
+    /// before its execute lock and admission (`Engine::acquire_credentials`).
     async fn material_from_producer(
         self: &Arc<Self>,
         rs: &Arc<RequestState>,
@@ -1180,29 +1212,64 @@ impl Engine {
         }
     }
 
-    /// Acquire and present every credential a target declared.
+    /// Acquire the material of every credential a target declared, without
+    /// presenting any of it.
     ///
-    /// Returns the mounts the driver applies, plus a teardown that deletes the
-    /// presented files. Runs strictly *downstream* of runner preparation, which is
-    /// the rule that keeps the devenv `wrap` runner's environment capture — a
-    /// cached, remotely-shippable `runner.json` — from ever seeing material.
-    pub(crate) async fn acquire_and_present(
+    /// Called before the target takes its execute lock or its admission (cpu
+    /// and a `sandbox` slot): acquiring can *build* — a producer source is an
+    /// `execute` of its own, with deps, the producer's build lock, and cpu
+    /// and a sandbox slot of its own — and a consumer holding any of those
+    /// while it waits on that build deadlocks once the pool is small enough
+    /// (`-j 1`, `--resource sandbox=1`) or a plain
+    /// run of the producer holds the producer's lock while it waits for the
+    /// pool. [`present_credentials`](Self::present_credentials) writes the
+    /// material into the sandbox once the run has its pools.
+    ///
+    /// Runs strictly *downstream* of runner preparation, which is the rule
+    /// that keeps the devenv `wrap` runner's environment capture — a cached,
+    /// remotely-shippable `runner.json` — from ever seeing material: the
+    /// runner is a dep, and deps have resolved before this is called.
+    pub(crate) async fn acquire_credentials(
         self: &Arc<Self>,
         rs: &Arc<RequestState>,
         consumer: &Addr,
-        sandbox_dir: &Path,
-        resolved: &[ResolvedCredential],
-    ) -> anyhow::Result<(Vec<CredentialMount>, CredentialTeardown)> {
-        if resolved.is_empty() {
-            return Ok((Vec::new(), CredentialTeardown::none()));
-        }
-        let root = credential_dir(sandbox_dir);
-        let mut mounts = Vec::with_capacity(resolved.len());
+        resolved: Vec<ResolvedCredential>,
+    ) -> anyhow::Result<HeldCredentials> {
+        let mut held = Vec::with_capacity(resolved.len());
         for rc in resolved {
             let acquired = self
                 .acquire_declared(rs, &rc.addr, &rc.def, &Chain::root())
                 .await
                 .with_context(|| format!("{consumer} needs credential {}", rc.addr))?;
+            held.push((rc, acquired));
+        }
+        Ok(HeldCredentials { held })
+    }
+
+    /// Present material [`acquire_credentials`](Self::acquire_credentials)
+    /// returned into `sandbox_dir`.
+    ///
+    /// Returns the mounts the driver applies, plus a teardown that deletes the
+    /// presented files. Acquires nothing: whatever builds happened before the
+    /// run took its pools.
+    pub(crate) async fn present_credentials(
+        self: &Arc<Self>,
+        rs: &Arc<RequestState>,
+        consumer: &Addr,
+        sandbox_dir: &Path,
+        credentials: &HeldCredentials,
+    ) -> anyhow::Result<(Vec<CredentialMount>, CredentialTeardown)> {
+        if credentials.held.is_empty() {
+            return Ok((Vec::new(), CredentialTeardown::none()));
+        }
+        let root = credential_dir(sandbox_dir);
+        // Armed before the first file is written: a presentation failing
+        // half-way (the second credential's template) returns by `?`, and the
+        // first credential's files must not outlive it in a sandbox kept for
+        // diagnostics.
+        let teardown = CredentialTeardown::at(root.clone());
+        let mut mounts = Vec::with_capacity(credentials.held.len());
+        for (rc, acquired) in &credentials.held {
             let source = rc.def.sources.get(acquired.source_index).ok_or_else(|| {
                 anyhow::anyhow!("credential {} chose a source that vanished", rc.addr)
             })?;
@@ -1216,11 +1283,11 @@ impl Engine {
                 .await
                 .with_context(|| format!("resolve deferred values for credential {}", rc.addr))?;
             let mount = self
-                .present_material(&rc.addr, present, &acquired, &dir, &values)
+                .present_material(&rc.addr, present, acquired, &dir, &values)
                 .with_context(|| format!("present credential {} to {consumer}", rc.addr))?;
             mounts.push(mount);
         }
-        Ok((mounts, CredentialTeardown::at(root)))
+        Ok((mounts, teardown))
     }
 
     /// Turn material plus a presentation into a mount, writing any files.

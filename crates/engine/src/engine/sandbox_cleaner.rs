@@ -51,12 +51,42 @@
 //! may move onto a tokio runtime — see the waker note above.
 //!
 //! Ordering: callers must invoke `enqueue` only *after* any read of the
-//! sandbox completes (per `project_sandbox_cleanup_ordering.md`). Within a
-//! lane, jobs run in FIFO order on that lane's one thread. There is no
-//! ordering guarantee *between* lanes — that is the point.
+//! sandbox completes (per `project_sandbox_cleanup_ordering.md`). The
+//! bookkeeping lane runs its jobs in FIFO order on its one thread. The reclaim
+//! lane drains one queue with up to four threads (`MAX_RECLAIM_WORKERS`), so
+//! its jobs run concurrently and in **no** order relative to each other —
+//! sandbox removals are ordered by [`generation`] claims, never by queue
+//! position, so nothing there relied on FIFO. There is no ordering guarantee
+//! *between* lanes either — that is the point.
+//!
+//! That argument covers the plain sandbox directory, which is all
+//! [`generation::remove_stale`] knows about. A FUSE run's upper side
+//! (`<fuse.upper>/<rel>`) is a separate tree, and a superseded, cancelled or
+//! failed run's upper dir is not removed by `remove_stale` — the successor's
+//! claim reclaims the plain dir only. (A failed credential-material run is the
+//! exception: [`SandboxTeardown::reclaim`] removes its upper dir explicitly.)
+//! That is a known gap, independent of queue order: running the reclaim lane
+//! FIFO would not close it. It is also outside the `sandbox` pool's bound
+//! below: such an upper dir outlives the slot its run released. Known gap; a
+//! follow-up is to be filed.
 //!
 //! Both lanes decrement the same per-request `bg_pending` counter, so the
 //! shutdown path that blocks on it drains both.
+//!
+//! ## The reclaim backlog is bounded
+//!
+//! The queue itself is unbounded, and posting never blocks — but what can be
+//! posted to the reclaim lane is: a managed driver's execute is admitted with
+//! one slot of the `sandbox` resource pool beside its cpu, before its sandbox
+//! exists (`resource_pool`'s module docs), and that slot, split off the grant,
+//! rides in the sandbox's [`SandboxTeardown`] into its removal job, released
+//! when the removal returns. Live sandboxes plus sandboxes queued or being
+//! removed number at most the pool's capacity (a credential producer takes a
+//! slot too: its consumer acquires credentials before its own admission, so
+//! no run waits for a slot while holding one). When removal falls behind, new
+//! runs wait in admission instead of the disk filling. Outside the bound:
+//! failed sandboxes kept for diagnostics (one per failed addr) and invocation
+//! sandboxes.
 use crossbeam_channel::{Sender, unbounded};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
@@ -95,7 +125,7 @@ pub use hcore::pending::PendingCounter;
 /// decrement when it completes.
 type Job = (String, SandboxCleanupJob, PendingCounter);
 
-/// Which worker thread a job runs on.
+/// Which queue — and so which worker threads — a job runs on.
 ///
 /// The two classes have very different cost profiles and one must never be able
 /// to queue behind the other; see the module docs for why. Every job picks its
@@ -147,7 +177,8 @@ pub enum Lane {
 /// flight), so it is safe to call inline on a tokio worker at queue time.
 /// Walks hold the `walk` mutex for their whole duration and take `generation`
 /// only for the staleness check; walk holders are dedicated OS threads (the
-/// blocking pool, the cleaner thread), never tokio workers. Lock order is
+/// blocking pool, the reclaim lane's workers), never tokio workers. Two reclaim
+/// workers holding jobs for one path simply take turns on its `walk` lock. Lock order is
 /// `walk` then `generation`, and nothing takes them in the other order.
 ///
 /// Executes for one addr are serialized (in-process and cross-process by the
@@ -305,12 +336,24 @@ pub mod generation {
 /// only guaranteed on the completion path, while the reclaim touches nothing
 /// but the logical directory — the same operation the next execute's
 /// `remove_stale` would perform, just sooner.
+///
+/// It also carries the run's `sandbox` pool slot, when it took one
+/// ([`with_sandbox_slot`](Self::with_sandbox_slot)): every path that queues a
+/// removal moves the slot into that job, released once the removal returns,
+/// and every path that queues none — `leave_for_diagnostics`, a `complete`
+/// with no bridge job — drops it at once.
 pub struct SandboxTeardown {
     dir: PathBuf,
     generation: u64,
     pending: PendingCounter,
     /// The bridge-owned cleanup closure, handed over once the run responded.
     job: Option<SandboxCleanupJob>,
+    /// This sandbox's slot in the engine's `sandbox` pool, split off the
+    /// run's admission grant.
+    slot: Option<crate::engine::resource_pool::Reservation>,
+    /// What each removal this teardown queues waits for first: a test stands
+    /// in a slow disk with it. Nothing outside tests.
+    hold: RemovalHold,
     armed: bool,
 }
 
@@ -325,7 +368,123 @@ impl std::fmt::Debug for SandboxTeardown {
             .field("generation", &self.generation)
             .field("armed", &self.armed)
             .field("job", &self.job.is_some())
+            .field("slot", &self.slot.is_some())
             .finish()
+    }
+}
+
+/// `job`, counted in [`ResourcePool::removals_pending`] from now and
+/// releasing `slot` (when there is one) once it has run — whether it
+/// removed, declined (a successor owns the path), failed or panicked — or
+/// when the job is dropped unrun (a closed lane). The release runs on the
+/// reclaim lane's OS thread; `Reservation`'s drop needs no runtime and wakes
+/// a queued tokio waiter (`resource_pool`'s module docs).
+///
+/// [`ResourcePool::removals_pending`]: crate::engine::resource_pool::ResourcePool::removals_pending
+fn releasing(
+    job: SandboxCleanupJob,
+    slot: Option<crate::engine::resource_pool::Reservation>,
+    hold: RemovalHold,
+) -> SandboxCleanupJob {
+    let Some(slot) = slot else {
+        return job;
+    };
+    // Counted as a pending removal from the moment it is queued, through the
+    // hold and the removal itself, until the slot is released.
+    let slot = slot.into_removal();
+    Box::new(move || {
+        // Dropped on every way out of this closure, an unwind included, and
+        // with the closure when it never runs.
+        let _slot = slot;
+        hold.wait();
+        job()
+    })
+}
+
+/// What a removal holding a `sandbox` slot waits for before it runs: a test
+/// stands in a slow disk with a fixed delay ([`Engine::set_sandbox_removal_delay`])
+/// or holds removals until it says so ([`RemovalGate`]). Empty, and a no-op,
+/// outside tests.
+///
+/// [`Engine::set_sandbox_removal_delay`]: crate::engine::Engine::set_sandbox_removal_delay
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RemovalHold {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) delay: std::time::Duration,
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) gate: Option<Arc<GateState>>,
+}
+
+impl RemovalHold {
+    /// Sleep the delay, then wait for the gate to be open. Runs on a reclaim
+    /// lane thread.
+    fn wait(&self) {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            if !self.delay.is_zero() {
+                thread::sleep(self.delay);
+            }
+            if let Some(gate) = &self.gate {
+                let mut open = gate.open.lock();
+                while !*open {
+                    gate.changed.wait(&mut open);
+                }
+            }
+        }
+    }
+}
+
+/// A [`RemovalGate`]'s shared state: whether it is open, and the condition
+/// the held removals wait on.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Default)]
+pub(crate) struct GateState {
+    open: parking_lot::Mutex<bool>,
+    changed: parking_lot::Condvar,
+}
+
+/// Holds every sandbox removal that releases a `sandbox` slot until the test
+/// opens it ([`Engine::set_sandbox_removal_gate`]), so a slot stays pending
+/// removal for exactly as long as the test needs rather than for a delay it
+/// hopes is long enough. Dropping the gate opens it, so a test that fails
+/// with it closed does not leave reclaim lane threads parked for good.
+///
+/// [`Engine::set_sandbox_removal_gate`]: crate::engine::Engine::set_sandbox_removal_gate
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug)]
+pub struct RemovalGate {
+    state: Arc<GateState>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl RemovalGate {
+    /// A gate that holds removals until [`open`](Self::open).
+    pub fn closed() -> Self {
+        Self {
+            state: Arc::default(),
+        }
+    }
+
+    /// Let every held and later removal run.
+    pub fn open(&self) {
+        *self.state.open.lock() = true;
+        self.state.changed.notify_all();
+    }
+
+    /// Hold every removal that has not passed the gate yet, again.
+    pub fn close(&self) {
+        *self.state.open.lock() = false;
+    }
+
+    pub(crate) fn state(&self) -> Arc<GateState> {
+        Arc::clone(&self.state)
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for RemovalGate {
+    fn drop(&mut self) {
+        self.open();
     }
 }
 
@@ -338,8 +497,28 @@ impl SandboxTeardown {
             generation,
             pending,
             job: None,
+            slot: None,
+            hold: RemovalHold::default(),
             armed: true,
         }
+    }
+
+    /// Hand this teardown the run's `sandbox` pool slot, released when the
+    /// sandbox's removal returns (or at once, when nothing will remove it).
+    pub fn with_sandbox_slot(
+        mut self,
+        slot: Option<crate::engine::resource_pool::Reservation>,
+    ) -> Self {
+        self.slot = slot;
+        self
+    }
+
+    /// Make each removal this teardown queues wait for `hold` first, so a
+    /// test can stand in a slow disk.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn with_removal_hold(mut self, hold: RemovalHold) -> Self {
+        self.hold = hold;
+        self
     }
 
     /// The claimed sandbox directory.
@@ -360,13 +539,21 @@ impl SandboxTeardown {
     /// The run completed (with a success or an error value): enqueue the
     /// bridge cleanup, generation-guarded. Call only after every reader of the
     /// sandbox is done — `cache_locally` reads from it.
+    ///
+    /// The sandbox slot rides in the job; with no job (a driver that hands
+    /// over no cleanup) nothing is queued and it is released here.
     pub fn complete(mut self, label: String) {
         self.armed = false;
+        let slot = self.slot.take();
         if let Some(job) = self.job.take() {
             enqueue(
                 Lane::Reclaim,
                 label,
-                generation::guarded(self.dir.clone(), self.generation, job),
+                releasing(
+                    generation::guarded(self.dir.clone(), self.generation, job),
+                    slot,
+                    std::mem::take(&mut self.hold),
+                ),
                 Arc::clone(&self.pending),
             );
         }
@@ -380,9 +567,15 @@ impl SandboxTeardown {
     /// `Drop`: a drop-time reclaim here made the diagnostic race its own
     /// cleanup, surfacing a failed target's exit status with its output
     /// already deleted.
+    ///
+    /// The sandbox slot is released here: a sandbox kept for diagnostics is
+    /// outside the `sandbox` pool's bound, which it cannot hold — nothing
+    /// removes it until the addr runs again. It is bounded on its own, at one
+    /// tree per failed addr.
     pub fn leave_for_diagnostics(mut self) {
         self.armed = false;
         self.job = None;
+        self.slot = None;
     }
 
     /// The target failed, and its sandbox must not outlive the failure (its
@@ -420,18 +613,26 @@ impl SandboxTeardown {
         enqueue(
             Lane::Reclaim,
             format!("reclaim {}", self.dir.display()),
-            generation::guarded(self.dir.clone(), self.generation, job),
+            releasing(
+                generation::guarded(self.dir.clone(), self.generation, job),
+                self.slot.take(),
+                std::mem::take(&mut self.hold),
+            ),
             Arc::clone(&self.pending),
         );
     }
 
-    fn enqueue_reclaim(&self) {
+    fn enqueue_reclaim(&mut self) {
         let (dir, generation) = (self.dir.clone(), self.generation);
         let label = format!("reclaim {}", dir.display());
         enqueue(
             Lane::Reclaim,
             label,
-            Box::new(move || generation::remove_stale(&dir, generation)),
+            releasing(
+                Box::new(move || generation::remove_stale(&dir, generation)),
+                self.slot.take(),
+                std::mem::take(&mut self.hold),
+            ),
             Arc::clone(&self.pending),
         );
     }
@@ -477,12 +678,57 @@ impl Lane {
     }
 }
 
-/// Spawn one lane's worker thread and return its queue.
+/// The most worker threads the reclaim lane runs.
+///
+/// A `remove_dir_all` is metadata-bound — one `unlink`/`rmdir` per inode — and
+/// a single thread issuing them leaves most of the filesystem's parallelism
+/// unused: a cold Go `validate` finishes thousands of sandboxes faster than one
+/// thread can remove them. The cap keeps a removal burst from competing with
+/// the build itself for the whole machine; it is a chosen bound, not a measured
+/// optimum.
+const MAX_RECLAIM_WORKERS: usize = 4;
+
+/// How many worker threads `lane` drains its queue with.
+///
+/// Reclaim: [`MAX_RECLAIM_WORKERS`], or fewer on a smaller machine. Bookkeeping
+/// stays at exactly one — its one job class is a sqlite trim that a second
+/// thread would only contend with, and nothing about it is latency-critical.
+fn lane_workers(lane: Lane) -> usize {
+    match lane {
+        Lane::Reclaim => thread::available_parallelism()
+            .map_or(1, std::num::NonZero::get)
+            .min(MAX_RECLAIM_WORKERS),
+        Lane::Bookkeeping => 1,
+    }
+}
+
+/// Spawn one lane's worker threads and return its queue.
+///
+/// Every worker drains the same queue (crossbeam's channel is multi-consumer),
+/// so with more than one worker jobs on the lane run concurrently and in no
+/// particular order. Nothing on the reclaim lane depends on its order: sandbox
+/// removals are ordered by [`generation`] claims, not by queue position, and
+/// an invocation sandbox's removal holds its `.owner` lock while it walks, which
+/// a concurrent sweep skips.
 fn spawn_lane(lane: Lane) -> io::Result<Sender<Job>> {
     let name = lane.thread_name();
     let (tx, rx) = unbounded::<Job>();
+    for _ in 0..lane_workers(lane) {
+        spawn_worker(lane, rx.clone())
+            // Name the lane in the error: `sender` resolves both lanes through
+            // one expression, so the panic location alone doesn't say which one
+            // failed.
+            .map_err(|e| io::Error::new(e.kind(), format!("spawn {name} thread: {e}")))?;
+    }
+    Ok(tx)
+}
+
+/// One worker of `lane`: runs every job it takes off `rx` until the queue
+/// closes, which it never does in practice (the sender is a process-lifetime
+/// static).
+fn spawn_worker(lane: Lane, rx: crossbeam_channel::Receiver<Job>) -> io::Result<()> {
     thread::Builder::new()
-        .name(name.into())
+        .name(lane.thread_name().into())
         .spawn(move || {
             for (label, job, pending) in rx.iter() {
                 // catch_unwind so a panicking job doesn't kill the
@@ -516,10 +762,7 @@ fn spawn_lane(lane: Lane) -> io::Result<Sender<Job>> {
                 }
             }
         })
-        // Name the lane in the error: `sender` resolves both lanes through one
-        // expression, so the panic location alone doesn't say which one failed.
-        .map_err(|e| io::Error::new(e.kind(), format!("spawn {name} thread: {e}")))?;
-    Ok(tx)
+        .map(drop)
 }
 
 fn sender(lane: Lane) -> &'static Sender<Job> {
@@ -1273,15 +1516,18 @@ mod tests {
     #[test]
     fn enqueue_survives_panicking_job() {
         // Same shape as the NotFound case: a panic shouldn't kill a lane's
-        // thread; subsequent jobs still run.
+        // thread; subsequent jobs still run. One panicker per worker, so a lane
+        // whose workers each died on theirs would run the follow-up on none.
         for lane in ALL_LANES {
             let pending = counter();
-            enqueue(
-                lane,
-                format!("enqueue_survives_panicking_job_panicker {lane:?}"),
-                Box::new(|| panic!("boom")),
-                Arc::clone(&pending),
-            );
+            for _ in 0..lane_workers(lane) {
+                enqueue(
+                    lane,
+                    format!("enqueue_survives_panicking_job_panicker {lane:?}"),
+                    Box::new(|| panic!("boom")),
+                    Arc::clone(&pending),
+                );
+            }
             let ran = Arc::new(AtomicBool::new(false));
             let ran_clone = Arc::clone(&ran);
             enqueue(
@@ -1304,5 +1550,382 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(2));
             }
         }
+    }
+
+    /// The reclaim lane drains with more than one thread: as many gated jobs as
+    /// it has workers are all *running* at once. On a single queue thread the
+    /// second never starts while the first is parked.
+    #[test]
+    fn the_reclaim_lane_runs_its_workers_concurrently() {
+        let _parked = park_lock();
+        let workers = lane_workers(Lane::Reclaim);
+        assert!(
+            (1..=MAX_RECLAIM_WORKERS).contains(&workers),
+            "{workers} reclaim workers"
+        );
+        let gate = Arc::new(AtomicBool::new(false));
+        let _release = OpenOnDrop(Arc::clone(&gate));
+        let pending = counter();
+        let started: Vec<_> = (0..workers)
+            .map(|i| {
+                let started = Arc::new(AtomicBool::new(false));
+                enqueue(
+                    Lane::Reclaim,
+                    format!("the_reclaim_lane_runs_its_workers_concurrently {i}"),
+                    gated_job(Arc::clone(&started), Arc::clone(&gate)),
+                    Arc::clone(&pending),
+                );
+                started
+            })
+            .collect();
+        for (i, started) in started.iter().enumerate() {
+            assert!(
+                wait_for(started, Duration::from_secs(30)),
+                "reclaim job {i} of {workers} never ran while the others were parked — the lane \
+                 is not draining with {workers} workers"
+            );
+        }
+        assert_eq!(pending.load(Ordering::Acquire), workers);
+        gate.store(true, Ordering::SeqCst);
+        wait_drained(&pending, Duration::from_secs(5));
+    }
+
+    /// `bg_pending` stays exact with several workers draining one queue: every
+    /// job — passing, failing, `NotFound`, panicking — is counted in exactly
+    /// once and out exactly once, whichever worker took it. Enqueued from
+    /// several threads at once so the increments race the decrements too.
+    #[test]
+    fn a_multi_worker_drain_keeps_bg_pending_exact() {
+        const PRODUCERS: usize = 4;
+        const PER_PRODUCER: usize = 64;
+        const TOTAL: usize = PRODUCERS * PER_PRODUCER;
+
+        let _parked = park_lock();
+        let pending = counter();
+        let gate = Arc::new(AtomicBool::new(false));
+        let _release = OpenOnDrop(Arc::clone(&gate));
+        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        std::thread::scope(|s| {
+            for p in 0..PRODUCERS {
+                let (pending, gate, ran) = (&pending, &gate, &ran);
+                s.spawn(move || {
+                    for i in 0..PER_PRODUCER {
+                        let (gate, ran) = (Arc::clone(gate), Arc::clone(ran));
+                        enqueue(
+                            Lane::Reclaim,
+                            format!("a_multi_worker_drain_keeps_bg_pending_exact {p}/{i}"),
+                            Box::new(move || {
+                                while !gate.load(Ordering::SeqCst) {
+                                    std::thread::sleep(Duration::from_millis(1));
+                                }
+                                ran.fetch_add(1, Ordering::SeqCst);
+                                match i % 4 {
+                                    0 => Ok(()),
+                                    1 => Err(io::Error::from(io::ErrorKind::NotFound)),
+                                    2 => Err(io::Error::other("expected test failure")),
+                                    _ => panic!("expected test panic"),
+                                }
+                            }),
+                            Arc::clone(pending),
+                        );
+                    }
+                });
+            }
+        });
+        // Every job is queued or parked on a worker: none has finished, so the
+        // count is exactly what was enqueued.
+        assert_eq!(pending.load(Ordering::Acquire), TOTAL);
+
+        gate.store(true, Ordering::SeqCst);
+        wait_drained(&pending, Duration::from_secs(30));
+        assert_eq!(ran.load(Ordering::SeqCst), TOTAL, "every job ran once");
+        // Exactly zero, not merely "not above zero": an extra decrement wraps
+        // the `usize` to a huge value and shutdown would wait forever.
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(pending.load(Ordering::Acquire), 0);
+    }
+
+    /// Every way a teardown resolves gives its `sandbox` slot back: after the
+    /// removal for the three that queue one (complete, material reclaim, a
+    /// drop), at once for the two that queue none (left for diagnostics, a
+    /// completion with no bridge job). A leg that kept it would shrink the pool
+    /// by one for the rest of the process.
+    #[test]
+    fn every_teardown_path_releases_its_sandbox_slot() {
+        use crate::engine::resource_pool::{Limit, ResourcePool};
+        use futures::FutureExt as _;
+        use hplugin::provider::PoolName;
+        const CPU: u64 = hplugin::driver::Resources::MICROS_PER_CPU;
+        let pool = ResourcePool::new([
+            (PoolName::cpu(), Limit::Bounded(4 * CPU)),
+            (PoolName::sandbox(), Limit::Bounded(1)),
+        ]);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pending = counter();
+
+        type Resolve = fn(SandboxTeardown, &std::path::Path);
+        let legs: [(&str, Resolve, bool); 5] = [
+            (
+                "complete",
+                |mut t, dir| {
+                    let dir = dir.to_path_buf();
+                    t.set_job(Some(Box::new(move || std::fs::remove_dir_all(&dir))));
+                    t.complete("complete".into());
+                },
+                true,
+            ),
+            ("complete, no job", |t, _| t.complete("none".into()), false),
+            ("reclaim", |t, _| t.reclaim(None), true),
+            ("drop", |t, _| drop(t), true),
+            (
+                "leave_for_diagnostics",
+                |t, _| t.leave_for_diagnostics(),
+                false,
+            ),
+        ];
+        for (i, (leg, resolve, removes)) in legs.into_iter().enumerate() {
+            let sandbox = tmp.path().join(format!("sandbox{i}"));
+            std::fs::create_dir_all(&sandbox).expect("mkdir");
+            // A pool of one: granted at once only if the previous leg gave
+            // its slot back.
+            let mut grant = pool
+                .acquire_with(&Default::default(), &[(PoolName::sandbox(), 1)])
+                .expect("acquire")
+                .now_or_never()
+                .unwrap_or_else(|| panic!("the leg before {leg} kept its slot"))
+                .expect("granted");
+            let slot = grant.split_off(PoolName::SANDBOX).expect("a sandbox slot");
+            // The run ends before its sandbox is removed: its cpu returns now.
+            drop(grant);
+            assert_eq!(pool.available(PoolName::CPU), Some(4 * CPU), "{leg}");
+            assert_eq!(pool.available(PoolName::SANDBOX), Some(0), "{leg}");
+            let claim = generation::claim(&sandbox);
+            let teardown = SandboxTeardown::arm(sandbox.clone(), claim, Arc::clone(&pending))
+                .with_sandbox_slot(Some(slot));
+            resolve(teardown, &sandbox);
+            wait_drained(&pending, Duration::from_secs(30));
+            assert_eq!(pool.available(PoolName::SANDBOX), Some(1), "{leg}");
+            assert_eq!(!sandbox.exists(), removes, "{leg}: removed?");
+        }
+    }
+
+    /// A removal job holds its slot while it runs and gives it back after,
+    /// on a panic, and when it is dropped unrun (a closed lane). A queued
+    /// waiter is woken by the release, from a thread with no runtime.
+    #[test]
+    fn a_reclaim_job_releases_its_slot_however_it_ends() {
+        use crate::engine::resource_pool::{Limit, Reservation, ResourcePool};
+        use futures::FutureExt as _;
+        use hplugin::provider::PoolName;
+        let pool = ResourcePool::new([
+            (PoolName::cpu(), Limit::Bounded(4_000_000)),
+            (PoolName::sandbox(), Limit::Bounded(1)),
+        ]);
+        let slot = |pool: &Arc<ResourcePool>| -> Reservation {
+            let mut grant = pool
+                .acquire_with(&Default::default(), &[(PoolName::sandbox(), 1)])
+                .expect("acquire")
+                .now_or_never()
+                .expect("granted at once")
+                .expect("granted");
+            grant.split_off(PoolName::SANDBOX).expect("slot")
+        };
+
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let job = releasing(
+            Box::new({
+                let pool = Arc::clone(&pool);
+                let seen = Arc::clone(&seen);
+                move || {
+                    *seen.lock().expect("lock") = pool.available(PoolName::SANDBOX);
+                    Ok(())
+                }
+            }),
+            Some(slot(&pool)),
+            RemovalHold::default(),
+        );
+        // A run queued behind the slot, parked in an executor on its own
+        // thread: only a wake from the job's release, on a third thread with
+        // no runtime, can finish it. `parked` is set at its first Pending.
+        let mut waiter = pool
+            .acquire_with(&Default::default(), &[(PoolName::sandbox(), 1)])
+            .expect("acquire");
+        let parked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let waiting = std::thread::spawn({
+            let parked = Arc::clone(&parked);
+            move || {
+                futures::executor::block_on(std::future::poll_fn(|cx| {
+                    let polled = waiter.poll_unpin(cx);
+                    if polled.is_pending() {
+                        parked.store(true, Ordering::Release);
+                    }
+                    polled
+                }))
+            }
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !parked.load(Ordering::Acquire) {
+            assert!(!waiting.is_finished(), "granted while the slot is held");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the waiter never parked"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!waiting.is_finished(), "the slot is held");
+        std::thread::spawn(job)
+            .join()
+            .expect("no panic")
+            .expect("job");
+        assert_eq!(*seen.lock().expect("lock"), Some(0), "held during removal");
+        while !waiting.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the release never woke the parked waiter"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let woken = waiting
+            .join()
+            .expect("no panic")
+            .expect("woken by the release");
+        drop(woken);
+
+        let panics = releasing(
+            Box::new(|| panic!("removal panicked")),
+            Some(slot(&pool)),
+            RemovalHold::default(),
+        );
+        assert!(catch_unwind(AssertUnwindSafe(panics)).is_err());
+        assert_eq!(pool.available(PoolName::SANDBOX), Some(1), "after a panic");
+
+        drop(releasing(
+            Box::new(|| Ok(())),
+            Some(slot(&pool)),
+            RemovalHold::default(),
+        ));
+        assert_eq!(pool.available(PoolName::SANDBOX), Some(1), "dropped unrun");
+    }
+
+    /// A closed [`RemovalGate`] holds a removal, and so its slot, until it is
+    /// opened, and dropping the gate opens it: a test that fails with the
+    /// gate closed does not park reclaim lane threads for good.
+    #[test]
+    fn a_removal_gate_holds_the_removal_and_its_slot_until_it_opens() {
+        use crate::engine::resource_pool::{Limit, ResourcePool};
+        use futures::FutureExt as _;
+        use hplugin::provider::PoolName;
+        let pool = ResourcePool::new([
+            (PoolName::cpu(), Limit::Bounded(4_000_000)),
+            (PoolName::sandbox(), Limit::Bounded(1)),
+        ]);
+        for by_drop in [false, true] {
+            // Opened and closed again first: a reopened gate holds anew.
+            let gate = RemovalGate::closed();
+            gate.open();
+            gate.close();
+            let mut grant = pool
+                .acquire_with(&Default::default(), &[(PoolName::sandbox(), 1)])
+                .expect("acquire")
+                .now_or_never()
+                .expect("granted at once")
+                .expect("granted");
+            let slot = grant.split_off(PoolName::SANDBOX).expect("slot");
+            let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let job = releasing(
+                Box::new({
+                    let ran = Arc::clone(&ran);
+                    move || {
+                        ran.store(true, Ordering::Release);
+                        Ok(())
+                    }
+                }),
+                Some(slot),
+                RemovalHold {
+                    gate: Some(gate.state()),
+                    ..RemovalHold::default()
+                },
+            );
+            let removing = std::thread::spawn(job);
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(!removing.is_finished(), "by_drop={by_drop}: held");
+            assert!(!ran.load(Ordering::Acquire), "by_drop={by_drop}: not run");
+            assert_eq!(pool.available(PoolName::SANDBOX), Some(0), "slot held");
+            if by_drop {
+                drop(gate);
+            } else {
+                gate.open();
+            }
+            removing.join().expect("no panic").expect("job");
+            assert!(ran.load(Ordering::Acquire), "by_drop={by_drop}: ran");
+            assert_eq!(pool.available(PoolName::SANDBOX), Some(1), "released");
+        }
+    }
+
+    /// A queued removal is counted as pending from the moment it is queued,
+    /// while the gate holds it and while it runs, and drops back to 0 once it
+    /// has returned — on a panic and when dropped unrun too.
+    #[test]
+    fn a_pending_removal_is_counted_until_it_returns() {
+        use crate::engine::resource_pool::{Limit, ResourcePool};
+        use futures::FutureExt as _;
+        use hplugin::provider::PoolName;
+        let pool = ResourcePool::new([
+            (PoolName::cpu(), Limit::Bounded(4_000_000)),
+            (PoolName::sandbox(), Limit::Bounded(2)),
+        ]);
+        let slot = || {
+            pool.acquire_with(&Default::default(), &[(PoolName::sandbox(), 1)])
+                .expect("acquire")
+                .now_or_never()
+                .expect("granted at once")
+                .expect("granted")
+                .split_off(PoolName::SANDBOX)
+                .expect("slot")
+        };
+        assert_eq!(pool.removals_pending(), 0);
+        let gate = RemovalGate::closed();
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let job = releasing(
+            Box::new({
+                let pool = Arc::clone(&pool);
+                let seen = Arc::clone(&seen);
+                move || {
+                    *seen.lock().expect("lock") = Some(pool.removals_pending());
+                    Ok(())
+                }
+            }),
+            Some(slot()),
+            RemovalHold {
+                gate: Some(gate.state()),
+                ..RemovalHold::default()
+            },
+        );
+        assert_eq!(pool.removals_pending(), 1, "queued");
+        assert_eq!(pool.snapshot().main.removals_pending, 1, "in the snapshot");
+        let removing = std::thread::spawn(job);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!removing.is_finished(), "held by the gate");
+        assert_eq!(pool.removals_pending(), 1, "held by the gate");
+        gate.open();
+        removing.join().expect("no panic").expect("job");
+        assert_eq!(*seen.lock().expect("lock"), Some(1), "while removing");
+        assert_eq!(pool.removals_pending(), 0, "after the removal");
+        assert_eq!(pool.available(PoolName::SANDBOX), Some(2), "released");
+
+        let panics = releasing(
+            Box::new(|| panic!("removal panicked")),
+            Some(slot()),
+            RemovalHold::default(),
+        );
+        assert_eq!(pool.removals_pending(), 1);
+        assert!(catch_unwind(AssertUnwindSafe(panics)).is_err());
+        assert_eq!(pool.removals_pending(), 0, "after a panic");
+
+        let unrun = releasing(Box::new(|| Ok(())), Some(slot()), RemovalHold::default());
+        assert_eq!(pool.removals_pending(), 1);
+        drop(unrun);
+        assert_eq!(pool.removals_pending(), 0, "dropped unrun");
     }
 }

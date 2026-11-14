@@ -149,6 +149,8 @@ pub(crate) struct AdmissionWait {
     pub need: u64,
     pub free: u64,
     pub ahead: u64,
+    /// On a `sandbox` wait: finished runs whose sandbox was not removed yet.
+    pub removals_pending: Option<u64>,
     pub since_ms: u64,
 }
 
@@ -162,6 +164,7 @@ impl AdmissionWait {
             self.need,
             self.free,
             self.ahead,
+            self.removals_pending,
             &hcore::units::human_duration(std::time::Duration::from_millis(
                 now_ms.saturating_sub(self.since_ms),
             )),
@@ -486,6 +489,7 @@ impl Tally {
                 need,
                 free,
                 ahead,
+                removals_pending,
             } => {
                 self.admission_waits.insert(
                     addr.as_str().into(),
@@ -496,6 +500,7 @@ impl Tally {
                         need: *need,
                         free: *free,
                         ahead: *ahead,
+                        removals_pending: *removals_pending,
                         since_ms: ev.at_unix_ms,
                     },
                 );
@@ -1455,6 +1460,7 @@ mod tests {
             need,
             free: 2_000_000,
             ahead: 6,
+            removals_pending: None,
         };
         t.apply(&ev(1_000, start("//a:b", 4_000_000)));
         t.apply(&ev(5_000, start("//a:c", 500_000)));
@@ -1512,6 +1518,7 @@ mod tests {
                 need: 4 << 30,
                 free: 1 << 30,
                 ahead: 0,
+                removals_pending: None,
             },
         ));
         let (waits, _) = t.admission_waits(5);

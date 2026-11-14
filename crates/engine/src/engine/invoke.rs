@@ -452,6 +452,14 @@ impl Engine {
             .resolve_credentials(rs, addr, &target.inputs)
             .await
             .with_context(|| format!("resolve credentials for {addr}"))?;
+        // Acquired before the sandbox exists, as a build's are; presented
+        // inside it by `run_in_sandbox`. An invocation takes no admission (no
+        // cpu, no `sandbox` slot), so there is no queue for the material to
+        // lapse in.
+        let credentials = self
+            .acquire_credentials(rs, addr, credentials)
+            .await
+            .with_context(|| format!("credentials for {addr}"))?;
 
         // The invocation's own sandbox, created exclusively; then any sibling a
         // crashed heph left, swept off the request's path.

@@ -973,6 +973,221 @@ mod tests {
         assert!(!input.runtime, "must not reach the sandbox");
     }
 
+    /// What a `_golist` sandbox costs on disk once the OS runner has
+    /// materialized it: the SDK is not in it, only a link to it.
+    ///
+    /// The real `go list` cannot run in a unit test (it needs the hermetic SDK,
+    /// a ~150 MB download), so the run itself is a stub. Everything up to it is
+    /// real: the `_golist` def comes from this driver's `parse` — so the `gosdk`
+    /// input carries exactly the annotations it ships with — and the sandbox is
+    /// built by the managed OS runner with a `<home>/stage` root, as the engine
+    /// builds it. The SDK is an SDK-shaped read-only artifact at the hermetic
+    /// toolchain's path.
+    #[cfg(unix)]
+    mod sdk_staging {
+        use super::*;
+        use hcore::hartifactcontent::tar::{TarPacker, TarWalker};
+        use hcore::hartifactcontent::{Content as ArtifactContent, WalkEntry};
+        use hdriver_support::driver_managed::ShellFallback;
+        use hdriver_support::driver_managed_os::ManagedDriverOs;
+        use hplugin::driver::inputartifact::{InputArtifact, Type};
+        use hplugin::driver::{
+            ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse,
+            ParseRequest, ParseResponse, RunInput, RunRequest,
+        };
+
+        /// Files in the fake SDK. A copy into the sandbox would cost at least
+        /// this many inodes; the bound below is far under it.
+        const SDK_FILES: usize = 600;
+        /// The most inodes a `_golist` sandbox may hold, SDK included: the
+        /// sandbox skeleton, the toolchain's path prefix and the one link.
+        const MAX_SANDBOX_INODES: usize = 32;
+
+        struct TarBytes {
+            bytes: Vec<u8>,
+            hash: String,
+        }
+
+        impl ArtifactContent for TarBytes {
+            fn reader(&self) -> anyhow::Result<Box<dyn std::io::Read>> {
+                Ok(Box::new(std::io::Cursor::new(self.bytes.clone())))
+            }
+            fn walk(
+                &self,
+            ) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<WalkEntry>> + '_>>
+            {
+                Ok(Box::new(TarWalker::new(std::io::Cursor::new(
+                    self.bytes.clone(),
+                ))?))
+            }
+            fn hashout(&self) -> anyhow::Result<String> {
+                Ok(self.hash.clone())
+            }
+        }
+
+        /// The hermetic SDK's shape: everything under
+        /// `<toolchain pkg>/go/`, with a `bin/go` and many small `src/` files.
+        fn fake_sdk(goroot: &str) -> Arc<dyn ArtifactContent> {
+            let mut packer = TarPacker::new();
+            packer.create_raw(b"#!/bin/sh\n".to_vec(), format!("{goroot}/bin/go"), true);
+            packer.create_raw(b"go1.0".to_vec(), format!("{goroot}/VERSION"), false);
+            for i in 0..SDK_FILES {
+                packer.create_raw(
+                    format!("package p{i}\n").into_bytes(),
+                    format!("{goroot}/src/p{}/f{i}.go", i % 40),
+                    false,
+                );
+            }
+            let mut bytes = Vec::new();
+            packer.pack(&mut bytes).expect("pack fake sdk");
+            Arc::new(TarBytes {
+                bytes,
+                hash: "fakesdk0".to_string(),
+            })
+        }
+
+        /// A `go list` stand-in: the run is not what is measured.
+        struct NoopRun;
+
+        #[async_trait]
+        impl ManagedDriver for NoopRun {
+            fn config(&self, _: ConfigRequest) -> anyhow::Result<ConfigResponse> {
+                Ok(ConfigResponse {
+                    name: "noop".to_string(),
+                })
+            }
+            fn schema(&self) -> hplugin::driver::DriverSchema {
+                hplugin::driver::DriverSchema::default()
+            }
+            async fn parse(
+                &self,
+                _: ParseRequest,
+                _: &(dyn Cancellable + Send + Sync),
+            ) -> anyhow::Result<ParseResponse> {
+                anyhow::bail!("not parsed in this test")
+            }
+            async fn apply_transitive(
+                &self,
+                req: ApplyTransitiveRequest,
+                _: &(dyn Cancellable + Send + Sync),
+            ) -> anyhow::Result<ApplyTransitiveResponse> {
+                Ok(ApplyTransitiveResponse {
+                    target_def: req.target_def,
+                })
+            }
+            async fn run<'a, 'io>(
+                &self,
+                _: ManagedRunRequest<'a, 'io>,
+                _: &(dyn Cancellable + Send + Sync),
+            ) -> anyhow::Result<ManagedRunResponse> {
+                Ok(ManagedRunResponse { artifacts: vec![] })
+            }
+        }
+
+        /// Every inode under `dir`, without following symlinks.
+        fn count_inodes(dir: &std::path::Path) -> usize {
+            let mut n = 0;
+            let mut stack = vec![dir.to_path_buf()];
+            while let Some(d) = stack.pop() {
+                for entry in std::fs::read_dir(&d).expect("read sandbox dir") {
+                    let entry = entry.expect("sandbox entry");
+                    n += 1;
+                    if entry.file_type().expect("file type").is_dir() {
+                        stack.push(entry.path());
+                    }
+                }
+            }
+            n
+        }
+
+        #[tokio::test]
+        async fn golist_sandbox_links_the_sdk() {
+            let ct = noop_ctoken();
+            let version = crate::plugingo::toolchain::DEFAULT_GO_VERSION;
+            let sdk_addr = crate::plugingo::toolchain::toolchain_addr(version);
+            let req = make_parse_request(
+                "mylib",
+                "example.com/mylib",
+                vec![("gosdk", vec![sdk_addr.format().as_str()])],
+            );
+            let mut def = driver().parse(req, &ct).await.expect("parse").target_def;
+            let sdk_input = def
+                .inputs
+                .iter()
+                .find(|i| i.origin_id == "dep|gosdk|0")
+                .expect("gosdk input")
+                .clone();
+            // `go list`'s outputs are the stub's to write, and it writes none.
+            def.outputs.clear();
+
+            let home = tempfile::tempdir().expect("home");
+            let stage = home.path().join("stage");
+            let sandbox = home.path().join("sandbox/mylib/__target__golist");
+            let goroot = crate::plugingo::toolchain::staged_goroot(version);
+            let os = ManagedDriverOs {
+                driver: Arc::new(Box::new(NoopRun)),
+                shell_fallback: Arc::new(ShellFallback {
+                    driver: Arc::new(NoopRun),
+                    spec_template: Arc::new(hplugin::provider::TargetSpec::default()),
+                }),
+                stage_dir: Some(stage.clone()),
+            };
+            let request_id = "test".to_string();
+            let mut run = RunRequest::new(&request_id, &def, sandbox.clone());
+            run.inputs = vec![RunInput {
+                artifact: InputArtifact {
+                    r#type: Type::Dep,
+                    origin_id: sdk_input.origin_id.clone(),
+                    content: fake_sdk(&goroot),
+                },
+                origin_id: sdk_input.origin_id.clone(),
+                source_addr: sdk_addr,
+                filters: vec![],
+                annotations: sdk_input.annotations.clone(),
+            }];
+            let res = os.run_inner(run, &ct, false).await.expect("run");
+
+            // The SDK's root is one symlink, and it points into the stage.
+            let linked = sandbox.join("ws").join(&goroot);
+            let md = std::fs::symlink_metadata(&linked).expect("lstat the sdk in the sandbox");
+            assert!(
+                md.file_type().is_symlink(),
+                "{} must be a symlink into the stage, not a copy",
+                linked.display()
+            );
+            let target = std::fs::read_link(&linked).expect("readlink");
+            assert!(
+                target.starts_with(&stage),
+                "the SDK link must point into {}, points at {}",
+                stage.display(),
+                target.display()
+            );
+            assert!(linked.join("bin/go").is_file(), "the SDK is reachable");
+
+            let inodes = count_inodes(&sandbox);
+            assert!(
+                inodes <= MAX_SANDBOX_INODES,
+                "a _golist sandbox holds {inodes} inodes (bound {MAX_SANDBOX_INODES}); the \
+                 {SDK_FILES}-file SDK was copied instead of linked"
+            );
+
+            // Tearing the sandbox down removes the link, never the shared SDK.
+            drop(res.sandbox_guards);
+            let cleanup = res
+                .sandbox_cleanup
+                .expect("the OS runner hands back a cleanup job");
+            cleanup().expect("remove the sandbox");
+            assert!(!sandbox.exists());
+            let staged_go = std::fs::read_dir(&stage)
+                .expect("read stage")
+                .filter_map(Result::ok)
+                .flat_map(|group| std::fs::read_dir(group.path()).into_iter().flatten())
+                .filter_map(Result::ok)
+                .any(|entry| entry.path().join(&goroot).join("bin/go").is_file());
+            assert!(staged_go, "the staged SDK survives the sandbox's removal");
+        }
+    }
+
     #[tokio::test]
     async fn test_driver_name_is_go_golist() {
         let resp = driver().config(ConfigRequest {}).unwrap();

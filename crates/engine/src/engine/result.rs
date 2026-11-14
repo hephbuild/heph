@@ -3046,6 +3046,19 @@ impl Engine {
         if resources.is_empty() {
             return Ok(hplugin::driver::Demand::default());
         }
+        if let Some((pool, _)) = resources
+            .iter()
+            .find(|(p, _)| crate::engine::resource_pool::is_engine_owned(p.as_str()))
+        {
+            // Only `sandbox` is engine-owned (`is_engine_owned`), so the
+            // remedy names it literally.
+            anyhow::bail!(
+                "{addr} declares resources.{pool}, but every managed run (exec, bash) takes one \
+                 sandbox slot on its own, held until its sandbox is removed. Remove {pool} from \
+                 the target's resources; to bound sandbox use, size the pool with \
+                 --resource sandbox=<n> or `resources: {{sandbox: <n>}}` in .hephconfig"
+            );
+        }
         if let Some((pool, amount)) = resources
             .iter()
             .find(|(p, _)| !self.pools.is_pool(p.as_str()))
@@ -3103,6 +3116,14 @@ impl Engine {
                     continue;
                 }
                 let pool = t.arg;
+                if crate::engine::resource_pool::is_engine_owned(pool) {
+                    anyhow::bail!(
+                        "{addr}: `{path}` reads ${{resource:{pool}}}, but a target cannot read \
+                         the {pool} pool: it is no part of a run's allotment. Remove \
+                         `${{resource:{pool}}}`; to bound sandbox use, size the pool with \
+                         --resource sandbox=<n>"
+                    );
+                }
                 if !self.pools.is_pool(pool) {
                     anyhow::bail!(
                         "{addr}: `{path}` reads ${{resource:{pool}}}, but {}",

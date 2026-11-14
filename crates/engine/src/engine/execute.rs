@@ -77,21 +77,6 @@ impl Engine {
             .await
             .with_context(|| format!("acquire scratch for {addr}"))?;
 
-        // Credentials, after scratch and after every dep has resolved.
-        //
-        // The ordering is load-bearing in two directions. **After the cache
-        // decision**, because a cache hit never reaches `execute` at all — which
-        // is what makes "zero cost on a hit" structural rather than aspirational:
-        // a fully cached build probes nothing, spawns nothing and prompts nobody.
-        // And **strictly downstream of runner preparation**, because the devenv
-        // `wrap` runner captures its entire resolved environment into a
-        // `runner.json` that is a cached, remotely-shippable artifact; a runner
-        // capture must never see material.
-        //
-        // Resolution (which declaration does this reference name, and is the set
-        // coherent?) already happened at `get_def`. What happens here is the part
-        // that costs something: walking the chain, acquiring, and writing the
-        // presented files into this run's sandbox.
         // Deferred option values. The producers are already built — they are
         // `hashed` inputs, so `hashin` waited on them — and what is left here is
         // reading their bytes. Inside `execute`, so a cache hit resolves nothing.
@@ -104,25 +89,22 @@ impl Engine {
             .await
             .with_context(|| format!("resolve deferred values for {addr}"))?;
 
-        hcore::hmemoizer::set_phase("execute:credential_acquire");
+        // Resolution (which declaration does each reference name, and is the
+        // set coherent?) already happened at `get_def`; this repeats it on the
+        // finalized def. Acquisition happens in `admit_with_credentials`.
         let resolved_credentials = self
             .resolve_credentials(&rs, addr, &def.target.inputs)
             .await
             .with_context(|| format!("resolve credentials for {addr}"))?;
 
-        // One run of this target at a time, in any process: its sandbox is per
-        // addr. After deps (holding it across a dep's build could deadlock with
-        // a forced rebuild of that dep), before the worker permit (a target
-        // parked here holds no worker). Returned to the caller, which holds it
-        // until the outputs are cached. See `ResultLock::lock_execute`.
-        hcore::hmemoizer::set_phase("execute:execute_lock");
-        let execute_guard = self
-            .acquire_with_notice(
-                &rs,
-                addr,
-                None,
-                self.result_lock().lock_execute(addr, rs.ctoken()),
-            )
+        let Admitted {
+            credentials,
+            execute_guard,
+            reservation,
+            sandbox_slot,
+            queued_ms,
+        } = self
+            .admit_with_credentials(&rs, addr, &driver, def, resolved_credentials)
             .await?;
 
         // This target resolves again: its last failure no longer describes it.
@@ -130,15 +112,6 @@ impl Engine {
         // this run fills a slot nothing clears behind it.
         self.failure_slots.clear(addr).await;
 
-        // Admission AFTER dep resolution so nothing is reserved while waiting for
-        // deps — prevents the classic diamond deadlock where mid-nodes hold
-        // capacity while waiting for a leaf that also needs some.
-        hcore::hmemoizer::set_phase("execute:semaphore_acquire");
-        let admit_started = std::time::Instant::now();
-        let reservation = self.admit(&rs, addr, &def.target.demand).await?;
-        // On `ExecuteStart`, so a wait under the notice threshold (which
-        // announces nothing) is still answerable from the stream.
-        let queued_ms = u64::try_from(admit_started.elapsed().as_millis()).unwrap_or(u64::MAX);
         // Counted once the reservation is actually in hand.
         let _running = crate::engine::diag::RunningPermit::new();
         let allotment = allotment_of(&reservation, |pool| self.pools.unit(pool));
@@ -209,10 +182,14 @@ impl Engine {
                 // last leg, mass fail-fast leaves one abandoned sandbox tree
                 // per *cancelled* execute and nothing ever collects them
                 // (`gc` has no sandbox sweep).
-                let mut sandbox_teardown = crate::engine::sandbox_cleaner::SandboxTeardown::arm(
+                // The run's `sandbox` slot rides in the teardown from here:
+                // released when the removal it queues returns, or at once by
+                // `leave_for_diagnostics`.
+                let mut sandbox_teardown = self.sandbox_teardown(
                     sandbox_dir.clone(),
                     sandbox_generation,
                     rs.bg_pending(),
+                    sandbox_slot,
                 );
 
                 // Everything fallible between the claim and the run response
@@ -230,7 +207,7 @@ impl Engine {
                             inputs: deps_result,
                             hashin: hashin.to_owned(),
                             scratch: scratch_mounts,
-                            credentials: resolved_credentials,
+                            credentials,
                             deferred,
                             wrapper: exec_wrapper,
                             shell,
@@ -475,9 +452,10 @@ impl Engine {
         // directory this run owns and its teardown deletes them whatever the
         // outcome — including a build's failure path, which deliberately keeps
         // the rest of the sandbox for diagnostics. The log tail is what makes
-        // that useful, not the token.
+        // that useful, not the token. Only presented: the material was
+        // acquired before the run took any pool (`acquire_credentials`).
         let (credential_mounts, _credential_teardown) = self
-            .acquire_and_present(rs, addr, &sandbox_dir, &credentials)
+            .present_credentials(rs, addr, &sandbox_dir, &credentials)
             .await
             .with_context(|| format!("credentials for {addr}"))?;
         let exec_wrapper: InteractiveWrapper = wrapper.unwrap_or_else(|| {
@@ -595,6 +573,141 @@ impl Engine {
         Ok(results.into_iter().flatten().collect())
     }
 
+    /// Everything a run takes before its sandbox exists, in the one order
+    /// that cannot deadlock: credential material, the execute lock, then
+    /// admission — whose request, for a managed driver, carries the run's
+    /// `sandbox` slot beside its cpu (see `resource_pool`'s module docs).
+    ///
+    /// **Material before both.** Acquiring can build — a producer source is
+    /// an `execute` of its own, needing its deps, the producer's gateway and
+    /// execute lock, and its own admission (cpu and a sandbox slot) — so a run
+    /// holding any of its own while it acquires can wait on itself:
+    ///
+    /// - the execute lock is a leaf (`ResultLock::lock_execute`): nothing is
+    ///   acquired under it, and a producer's gateway would be;
+    /// - the producer, or a dep of it, waits for the sandbox slot or the cpu
+    ///   its consumer holds — at once with `--resource sandbox=1`, or at
+    ///   `-j 1`;
+    /// - a plain run of the producer holds the producer's gateway while it
+    ///   waits for a slot the consumer holds, and the consumer waits for
+    ///   that gateway.
+    ///
+    /// Acquiring first, the consumer holds only what its caller does (its
+    /// result lock, its scratch slots), none of which a producer's build
+    /// takes.
+    ///
+    /// **One admission for cpu and sandbox**, atomic and FIFO: a run waiting
+    /// for cleanup holds no cpu, and a run waiting for cpu holds no slot for
+    /// a sandbox not yet made. Slots come back from the reclaim lane, which
+    /// waits on nothing, so the wait ends.
+    ///
+    /// **Material that lapsed while the run waited** (expired, or inside its
+    /// skew margin) is acquired again with everything handed back first:
+    /// re-acquiring while holding it is the deadlock above. Bounded —
+    /// material whose lifetime is shorter than the wait fails the run naming
+    /// the credential instead of looping.
+    async fn admit_with_credentials(
+        self: &Arc<Self>,
+        rs: &Arc<RequestState>,
+        addr: &Addr,
+        driver: &crate::engine::engine::Driver,
+        def: &LinkedTargetDef,
+        resolved: Vec<crate::engine::ResolvedCredential>,
+    ) -> anyhow::Result<Admitted> {
+        /// Acquisitions before a run whose material keeps lapsing fails.
+        const MAX_CREDENTIAL_ROUNDS: usize = 3;
+        let elapsed_ms = |since: std::time::Instant| {
+            u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)
+        };
+        let mut resolved = resolved;
+        let mut round = 0;
+        loop {
+            round += 1;
+            hcore::hmemoizer::set_phase("execute:credential_acquire");
+            let credentials = self
+                .acquire_credentials(rs, addr, resolved)
+                .await
+                .with_context(|| format!("credentials for {addr}"))?;
+
+            // One run of this target at a time, in any process: its sandbox
+            // is per addr. After deps and credentials (holding it across a
+            // build could deadlock with a forced rebuild of that build).
+            // Returned to the caller, which holds it until the outputs are
+            // cached. See `ResultLock::lock_execute`.
+            hcore::hmemoizer::set_phase("execute:execute_lock");
+            let execute_guard = self
+                .acquire_with_notice(
+                    rs,
+                    addr,
+                    None,
+                    self.result_lock().lock_execute(addr, rs.ctoken()),
+                )
+                .await?;
+
+            // Admission AFTER dep resolution so nothing is reserved while
+            // waiting for deps — prevents the classic diamond deadlock where
+            // mid-nodes hold capacity while waiting for a leaf that also needs
+            // some.
+            hcore::hmemoizer::set_phase("execute:semaphore_acquire");
+            let admit_started = std::time::Instant::now();
+            let mut reservation = self
+                .admit(rs, addr, &def.target.demand, driver.managed)
+                .await?;
+            // On `ExecuteStart`, so a wait under the notice threshold (which
+            // announces nothing) is still answerable from the stream.
+            let queued_ms = elapsed_ms(admit_started);
+            // The sandbox slot outlives the run: it rides in the sandbox's
+            // teardown into its removal. Split off before anything reads the
+            // grant, so it is never part of the allotment or `reserved`.
+            let sandbox_slot = reservation.split_off(hplugin::provider::PoolName::SANDBOX);
+
+            let Some(lapsed) = credentials.lapsed(std::time::SystemTime::now()) else {
+                return Ok(Admitted {
+                    credentials,
+                    execute_guard,
+                    reservation,
+                    sandbox_slot,
+                    queued_ms,
+                });
+            };
+            if round >= MAX_CREDENTIAL_ROUNDS {
+                anyhow::bail!(
+                    "credential {lapsed} expired while {addr} waited to start, {round} times in a \
+                     row: its material lives shorter than the wait for a sandbox and cpu. Give it \
+                     a longer lifetime (`ttl`, or what its source reports), or build fewer \
+                     targets at once"
+                );
+            }
+            tracing::debug!(
+                addr = %addr,
+                credential = %lapsed,
+                round,
+                "credential material lapsed while the run waited to start; acquiring it again"
+            );
+            drop(reservation);
+            drop(sandbox_slot);
+            drop(execute_guard);
+            resolved = credentials.into_resolved();
+        }
+    }
+
+    /// Own the teardown of the sandbox `dir` just claimed as `generation`,
+    /// carrying the run's `sandbox` pool slot into its removal.
+    fn sandbox_teardown(
+        &self,
+        dir: std::path::PathBuf,
+        generation: u64,
+        pending: crate::engine::sandbox_cleaner::PendingCounter,
+        slot: Option<crate::engine::resource_pool::Reservation>,
+    ) -> crate::engine::sandbox_cleaner::SandboxTeardown {
+        let teardown =
+            crate::engine::sandbox_cleaner::SandboxTeardown::arm(dir, generation, pending)
+                .with_sandbox_slot(slot);
+        #[cfg(any(test, feature = "test-support"))]
+        let teardown = teardown.with_removal_hold(self.sandbox_removal_hold.clone());
+        teardown
+    }
+
     /// Reserve what `addr` declares (`resources`; an undeclared `cpu` is one
     /// CPU) from the engine's pools, parking in FIFO order until it fits; a
     /// request needing nothing of a bounded pool is granted at once. A pool whose capacity is 0 fails
@@ -609,11 +722,16 @@ impl Engine {
     /// `AdmissionWaitEnd` on grant or cancellation, the way
     /// `acquire_with_notice` announces a lock wait. A grant within the
     /// threshold announces nothing.
+    ///
+    /// `managed`: the run makes a sandbox, so the request carries `sandbox:
+    /// 1` on top of what the target declares, granted atomically with it.
+    /// The caller splits it off the grant (`Reservation::split_off`).
     pub(crate) async fn admit(
         &self,
         rs: &Arc<RequestState>,
         addr: &Addr,
         resources: &hplugin::driver::Demand,
+        managed: bool,
     ) -> anyhow::Result<crate::engine::resource_pool::Reservation> {
         let pool = self.pools.get();
         // Observed *before* the acquire, so the stamp times the wait rather than
@@ -625,11 +743,20 @@ impl Engine {
             crate::engine::engine::cpu_free_cpus(&self.pools),
             d.now_ms(),
         );
+        let implicit: &[_] = if managed {
+            std::slice::from_ref(&*SANDBOX_IMPLICIT)
+        } else {
+            &[]
+        };
         let acquire = pool
-            .acquire(resources)
+            .acquire_with(resources, implicit)
             .map_err(|err| anyhow::anyhow!("{addr} {err}"))?;
         tokio::pin!(acquire);
-        let granted: anyhow::Result<_> =
+        // Raced against the request's cancellation: a `sandbox` slot comes
+        // back only once a removal finishes, which a cancellation does not
+        // hurry, so a cancelled run must not wait for one. Dropping the
+        // acquire leaves the queue.
+        let wait = async {
             match tokio::time::timeout(self.admission_notice, &mut acquire).await {
                 Ok(granted) => granted.map_err(Into::into),
                 Err(_elapsed) => match acquire.wait_info() {
@@ -639,7 +766,7 @@ impl Engine {
                         let addr_str = addr.format();
                         crate::engine::event::emit_scope(
                             rs,
-                            admission_wait_start(addr_str.clone(), &info),
+                            admission_wait_start(addr_str.clone(), &info, pool.removals_pending()),
                             move |_| crate::engine::event::BuildEventKind::AdmissionWaitEnd {
                                 addr: addr_str,
                             },
@@ -648,19 +775,34 @@ impl Engine {
                         .await
                     }
                 },
-            };
+            }
+        };
+        let granted: anyhow::Result<_> = {
+            use hcore::hasync::Cancellable as _;
+            tokio::select! {
+                biased;
+                () = rs.ctoken().cancelled() => {
+                    return Err(anyhow::Error::new(hplugin::error::CancelledError));
+                }
+                granted = wait => granted,
+            }
+        };
         let reservation = granted.with_context(|| format!("admitting {addr}"))?;
-        tracing::debug!(
-            addr = %addr,
-            granted = ?reservation.iter().collect::<Vec<_>>(),
-            "admitted"
-        );
+        // What the run is allotted: the `sandbox` slot the caller splits off
+        // is the engine's, never part of it, so the logs leave it out.
+        let allotment = || {
+            reservation
+                .iter()
+                .filter(|(p, _)| p.as_str() != hplugin::provider::PoolName::SANDBOX)
+                .collect::<Vec<_>>()
+        };
+        tracing::debug!(addr = %addr, granted = ?allotment(), "admitted");
         // Once per addr per request: `execute` is memoised per addr.
         if reservation.clamped() {
             tracing::info!(
                 addr = %addr,
                 declared = ?resources,
-                granted = ?reservation.iter().collect::<Vec<_>>(),
+                granted = ?allotment(),
                 "reservation clamped to the pool's capacity; the target runs alone in it"
             );
         }
@@ -732,6 +874,21 @@ impl<'l> SandboxLease<'l> {
     }
 }
 
+/// What [`Engine::admit_with_credentials`] took for one run, in the order it
+/// took them.
+struct Admitted {
+    credentials: crate::engine::credential::HeldCredentials,
+    execute_guard: crate::engine::result_lock::ExecuteGuard,
+    /// Everything granted but the sandbox slot: released when the run ends.
+    reservation: crate::engine::resource_pool::Reservation,
+    /// The run's `sandbox` slot, split off the grant: released once its
+    /// sandbox has been removed. `None` for a non-managed driver, which
+    /// makes no sandbox.
+    sandbox_slot: Option<crate::engine::resource_pool::Reservation>,
+    /// How long admission took, the wait for a sandbox slot included.
+    queued_ms: u64,
+}
+
 /// Everything [`Engine::run_in_sandbox`] needs besides the lease.
 pub(crate) struct SandboxRun {
     pub driver: Arc<crate::engine::engine::Driver>,
@@ -739,7 +896,8 @@ pub(crate) struct SandboxRun {
     pub inputs: Vec<RunInput>,
     pub hashin: String,
     pub scratch: Vec<crate::engine::driver::ScratchMount>,
-    pub credentials: Vec<crate::engine::ResolvedCredential>,
+    /// Acquired before the run took any pool; presented by `run_in_sandbox`.
+    pub credentials: crate::engine::credential::HeldCredentials,
     pub deferred: std::collections::BTreeMap<String, crate::engine::driver::DeferredValue>,
     pub wrapper: Option<InteractiveWrapper>,
     pub shell: bool,
@@ -749,12 +907,19 @@ pub(crate) struct SandboxRun {
     pub allotment: Option<hplugin::driver::Allotment>,
 }
 
+/// What a managed run is admitted with on top of what it declares: one
+/// `sandbox` slot. Built once, so admission allocates no pool name per run.
+static SANDBOX_IMPLICIT: std::sync::LazyLock<(hplugin::provider::PoolName, u64)> =
+    std::sync::LazyLock::new(|| (hplugin::provider::PoolName::sandbox(), 1));
+
 /// The `AdmissionWaitStart` event for a queued request: the first pool it does
 /// not fit in, or — fitting everywhere but queued behind others — the first it
-/// needs.
+/// needs. On a `sandbox` wait it carries `removals_pending`, the pool's count
+/// of finished runs whose sandbox has not been removed yet: the wait's cause.
 fn admission_wait_start(
     addr: String,
     info: &crate::engine::resource_pool::WaitInfo,
+    removals_pending: u64,
 ) -> crate::engine::event::BuildEventKind {
     // An unbounded pool (`free: None`) never holds a request back, so it is
     // named only when every pool the request needs is unbounded.
@@ -764,8 +929,12 @@ fn admission_wait_start(
         .find(|p| p.free.is_some_and(|f| p.need > f))
         .or_else(|| info.pools.iter().find(|p| p.free.is_some()))
         .or_else(|| info.pools.first());
+    let removals_pending = pool
+        .is_some_and(|p| p.pool.as_str() == hplugin::provider::PoolName::SANDBOX)
+        .then_some(removals_pending);
     crate::engine::event::BuildEventKind::AdmissionWaitStart {
         addr,
+        removals_pending,
         pool: pool.map_or_else(String::new, |p| p.pool.as_str().to_owned()),
         need: pool.map_or(0, |p| p.need),
         free: pool.map_or(0, |p| p.free.unwrap_or(u64::MAX)),
