@@ -88,6 +88,8 @@ struct Shared {
     stopped: AtomicBool,
     /// Messages sent and not yet received.
     pending: AtomicUsize,
+    /// The owner finished the session: every later send is dropped, silently.
+    finished: AtomicBool,
     /// The owner's `flock`, held until `End` is on disk. Here rather than on the
     /// thread so a recorder that stopped early still holds the session alive
     /// until the process finishes it.
@@ -129,7 +131,7 @@ pub struct SessionTap {
 
 impl SessionTap {
     fn send(&self, msg: Msg) {
-        if self.shared.is_stopped() {
+        if self.shared.is_stopped() || self.shared.finished.load(Ordering::Acquire) {
             return;
         }
         if self.shared.pending.fetch_add(1, Ordering::Relaxed) >= MAX_PENDING {
@@ -316,7 +318,6 @@ pub(crate) struct RecorderStart {
 #[derive(Debug)]
 pub struct Recorder {
     tap: SessionTap,
-    finished: AtomicBool,
 }
 
 impl Recorder {
@@ -327,6 +328,7 @@ impl Recorder {
         let shared = Arc::new(Shared {
             stopped: AtomicBool::new(false),
             pending: AtomicUsize::new(0),
+            finished: AtomicBool::new(false),
             lock: Mutex::new(Some(start.lock)),
         });
         // The thread logs through whatever subscriber the spawner had — the
@@ -370,7 +372,6 @@ impl Recorder {
             })?;
         Ok(Self {
             tap: SessionTap { tx, shared },
-            finished: AtomicBool::new(false),
         })
     }
 
@@ -386,12 +387,16 @@ impl Recorder {
     /// here with no `End` on disk — a viewer reads that as a lost session, which
     /// is the truth about its records.
     pub fn finish(&self, exit_code: Option<i32>, panicked: bool, timeout: Duration) {
-        if self.finished.swap(true, Ordering::AcqRel) {
+        let shared = &self.tap.shared;
+        // From here every tap drops its sends: nothing may follow `End`.
+        if shared.finished.swap(true, Ordering::AcqRel) {
             return;
         }
-        let shared = &self.tap.shared;
         if !shared.is_stopped() {
             let (ack, acked) = mpsc::sync_channel(1);
+            // Counted like every other message: the thread uncounts each one
+            // it receives, `End` included.
+            shared.pending.fetch_add(1, Ordering::Relaxed);
             let sent = self
                 .tap
                 .tx
@@ -402,6 +407,9 @@ impl Recorder {
                     ack,
                 })
                 .is_ok();
+            if !sent {
+                shared.pending.fetch_sub(1, Ordering::Relaxed);
+            }
             if sent {
                 match acked.recv_timeout(timeout) {
                     Ok(()) | Err(RecvTimeoutError::Disconnected) => {}

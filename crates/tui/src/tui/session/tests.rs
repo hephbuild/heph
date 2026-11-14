@@ -305,6 +305,35 @@ fn enospc_warns_once() {
     assert!(!lockfile::is_held(&dir.path().join(files::LOCK)).expect("probe"));
 }
 
+/// A send after `finish` (a log line on the way out: `--pprof-cpu`'s, the
+/// telemetry's) is dropped silently. `End` is counted like any other message,
+/// so the pending count cannot underflow into a false "fell behind" stop.
+#[test]
+fn send_after_finish_is_dropped_silently() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let captured = Captured::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(captured.clone())
+        .with_ansi(false)
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        let rec = recorder_with(dir.path(), Box::new(io::sink()), Faults::default());
+        let tap = rec.tap();
+        tap.log("INFO", "before".into());
+        rec.finish(Some(0), false, Duration::from_secs(5));
+        tap.log("INFO", "after".into());
+        for ev in events() {
+            tap.event(ev);
+        }
+        assert!(
+            !tap.is_stopped(),
+            "a send after finish stopped the recording"
+        );
+    });
+    let log = String::from_utf8(captured.0.lock().expect("lock").clone()).expect("utf8");
+    assert_eq!(log.matches("WARN").count(), 0, "{log}");
+}
+
 /// I1/A8: a write that never returns blocks neither the sender nor the
 /// finisher past its timeout.
 #[test]
