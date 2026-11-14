@@ -210,14 +210,15 @@ fn listed_facts_kill_switch(v: Option<&std::ffi::OsStr>) -> bool {
 
 /// Build the engine for one command. `global` is the command line's global
 /// options; the engine reads its pool overrides (`-j`, `--resource`) from it.
-/// The workspace it resolves is recorded in `session` (the command's sink's,
-/// when the command goes on to `run_app`), for the `meta.json` of the session
-/// that run opens. `None`: the command records no session.
+/// The workspace it resolves is recorded in `session`, the process's session
+/// threaded from `main`, for the `meta.json` of the session a later `run_app`
+/// opens. Only workspace fields are stored: a command that never reaches
+/// `run_app` opens no session.
 pub fn new_engine(
     global: &super::GlobalOptions,
-    session: Option<&SessionSlot>,
+    session: &SessionSlot,
 ) -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
-    new_engine_with(global, BadEnv::Refuse, session)
+    new_engine_with(global, BadEnv::Refuse, Some(session))
 }
 
 /// The engine for a caller with no command line of its own: shell

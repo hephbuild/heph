@@ -708,14 +708,17 @@ async fn attach_mirrors_the_session_exit() {
         ],
     };
     let sources: [&dyn SessionSource; 1] = [&source];
+    let slot = std::sync::Arc::new(crate::tui::session::SessionSlot::new());
     let run = |id: SessionId| {
         let sources = &sources;
+        let slot = &slot;
         async move {
             attach::attach(
                 sources,
                 opts(),
                 &id.encode(),
-                crate::tui::LogSink::new_direct(),
+                crate::tui::LogSink::new_direct_with(std::sync::Arc::clone(slot)),
+                slot,
                 true,
             )
             .await

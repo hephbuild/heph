@@ -3,6 +3,7 @@
 //! produces any more. Both drop the rows and the section lines a full
 //! `codegen gitignore` would drop for those paths (J8).
 
+use crate::tui::session::SessionSlot;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -606,13 +607,19 @@ fn cwd() -> anyhow::Result<PathBuf> {
     std::env::current_dir().context("reading the working directory")
 }
 
-pub fn execute_keep(args: &KeepArgs, sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
+pub fn execute_keep(
+    args: &KeepArgs,
+    sink: LogSink,
+    session: &Arc<SessionSlot>,
+    global: &GlobalOptions,
+) -> anyhow::Result<()> {
     let paths = args.paths.clone();
     let cwd = cwd()?;
     run_cli(
         "Keeping generated files",
         args.json,
         sink,
+        session,
         global,
         move |engine, rs| async move { keep(&engine, &rs, &paths, &cwd).await },
     )
@@ -621,6 +628,7 @@ pub fn execute_keep(args: &KeepArgs, sink: LogSink, global: &GlobalOptions) -> a
 pub fn execute_discard(
     args: &DiscardArgs,
     sink: LogSink,
+    session: &Arc<SessionSlot>,
     global: &GlobalOptions,
 ) -> anyhow::Result<()> {
     let opts = Options {
@@ -637,6 +645,7 @@ pub fn execute_discard(
         "Discarding generated files",
         args.json,
         sink,
+        session,
         global,
         move |engine, rs| async move { discard(&engine, &rs, &opts).await },
     )

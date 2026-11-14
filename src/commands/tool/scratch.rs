@@ -8,6 +8,7 @@
 //! keeps working when the targets that produced a slot have been deleted or
 //! renamed — the same property `heph tool clean` has for addr-only selections.
 
+use crate::tui::session::SessionSlot;
 use std::sync::Arc;
 
 use crate::commands::progress_app::{request_state, run_with_progress};
@@ -127,15 +128,20 @@ impl ScratchArgs {
     /// declarations, and a provider may run a target to answer that — so they
     /// run under the TUI like `run` does. The rest read the store, or the remote,
     /// and build nothing.
-    pub fn execute(&self, sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
+    pub fn execute(
+        &self,
+        sink: LogSink,
+        session: &Arc<SessionSlot>,
+        global: &GlobalOptions,
+    ) -> anyhow::Result<()> {
         match &self.command {
-            ScratchCommands::Ls => bootstrap::block_on(ls(global))?,
+            ScratchCommands::Ls => bootstrap::block_on(ls(session, global))?,
             ScratchCommands::Head { addr } => {
-                bootstrap::block_on(head(addr.clone(), sink, global.clone()))?
+                bootstrap::block_on(head(addr.clone(), sink, session, global.clone()))?
             }
-            ScratchCommands::Path { addr } => bootstrap::block_on(path(addr, global))?,
+            ScratchCommands::Path { addr } => bootstrap::block_on(path(addr, session, global))?,
             ScratchCommands::Rm { addr, all } => {
-                bootstrap::block_on(rm(addr.as_deref(), *all, global))?
+                bootstrap::block_on(rm(addr.as_deref(), *all, session, global))?
             }
             ScratchCommands::Push {
                 addr,
@@ -147,13 +153,14 @@ impl ScratchArgs {
                 *all,
                 *force,
                 producer.clone(),
+                session,
                 global,
             ))?,
             ScratchCommands::Pull { addr, all } => {
                 if *all == addr.is_some() {
                     anyhow::bail!("pass either an address or --all, not both or neither");
                 }
-                bootstrap::block_on(pull(addr.clone(), sink, global.clone()))?
+                bootstrap::block_on(pull(addr.clone(), sink, session, global.clone()))?
             }
         }
     }
@@ -196,8 +203,8 @@ fn describe(slot: &SlotEntry) -> (String, String) {
     }
 }
 
-async fn ls(global: &GlobalOptions) -> anyhow::Result<()> {
-    let (engine, _shutdown) = bootstrap::new_engine(global, None)?;
+async fn ls(session: &Arc<SessionSlot>, global: &GlobalOptions) -> anyhow::Result<()> {
+    let (engine, _shutdown) = bootstrap::new_engine(global, session)?;
     let mut slots = engine.scratch_slots()?;
     if slots.is_empty() {
         println!("No scratch caches in this workspace.");
@@ -275,12 +282,18 @@ fn local_trace(
     out
 }
 
-async fn head(addr: String, sink: LogSink, global: GlobalOptions) -> anyhow::Result<()> {
-    let (engine, shutdown) = bootstrap::new_engine(&global, Some(sink.session()))?;
+async fn head(
+    addr: String,
+    sink: LogSink,
+    session: &Arc<SessionSlot>,
+    global: GlobalOptions,
+) -> anyhow::Result<()> {
+    let (engine, shutdown) = bootstrap::new_engine(&global, session)?;
     let label = format!("Resolving scratch {addr}");
     run_with_progress(
         label,
         sink,
+        session,
         global.no_tui,
         shutdown,
         move |ctx| async move {
@@ -458,8 +471,12 @@ async fn head_trace(
     Ok(())
 }
 
-async fn path(addr: &str, global: &GlobalOptions) -> anyhow::Result<()> {
-    let (engine, _shutdown) = bootstrap::new_engine(global, None)?;
+async fn path(
+    addr: &str,
+    session: &Arc<SessionSlot>,
+    global: &GlobalOptions,
+) -> anyhow::Result<()> {
+    let (engine, _shutdown) = bootstrap::new_engine(global, session)?;
     let slots = engine.scratch_slots()?;
     let found = slots
         .iter()
@@ -478,11 +495,16 @@ async fn path(addr: &str, global: &GlobalOptions) -> anyhow::Result<()> {
     }
 }
 
-async fn rm(addr: Option<&str>, all: bool, global: &GlobalOptions) -> anyhow::Result<()> {
+async fn rm(
+    addr: Option<&str>,
+    all: bool,
+    session: &Arc<SessionSlot>,
+    global: &GlobalOptions,
+) -> anyhow::Result<()> {
     if all == addr.is_some() {
         anyhow::bail!("pass either an address or --all, not both or neither");
     }
-    let (engine, _shutdown) = bootstrap::new_engine(global, None)?;
+    let (engine, _shutdown) = bootstrap::new_engine(global, session)?;
     let (removed, freed) = engine.scratch_remove(addr)?;
     if removed == 0 {
         println!("Nothing to remove.");
@@ -524,9 +546,10 @@ async fn push(
     all: bool,
     force: bool,
     producer: String,
+    session: &Arc<SessionSlot>,
     global: &GlobalOptions,
 ) -> anyhow::Result<()> {
-    let (engine, _shutdown) = bootstrap::new_engine(global, None)?;
+    let (engine, _shutdown) = bootstrap::new_engine(global, session)?;
     let selected = select(engine.scratch_slots()?, addr, all)?;
     if selected.is_empty() {
         println!("Nothing to publish.");
@@ -614,8 +637,13 @@ async fn declared_scratches(
 }
 
 /// The caller has checked that exactly one of `addr` and `--all` was given.
-async fn pull(addr: Option<String>, sink: LogSink, global: GlobalOptions) -> anyhow::Result<()> {
-    let (engine, shutdown) = bootstrap::new_engine(&global, Some(sink.session()))?;
+async fn pull(
+    addr: Option<String>,
+    sink: LogSink,
+    session: &Arc<SessionSlot>,
+    global: GlobalOptions,
+) -> anyhow::Result<()> {
+    let (engine, shutdown) = bootstrap::new_engine(&global, session)?;
     let label = match &addr {
         Some(a) => format!("Fetching scratch {a}"),
         None => "Fetching scratch caches".to_string(),
@@ -623,6 +651,7 @@ async fn pull(addr: Option<String>, sink: LogSink, global: GlobalOptions) -> any
     run_with_progress(
         label,
         sink,
+        session,
         global.no_tui,
         shutdown,
         move |ctx| async move {
@@ -963,12 +992,15 @@ mod tests {
     async fn head_and_pull_keep_their_exits_under_the_progress_app() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
         let engine = one_scratch_engine(root.path())?;
+        let session = Arc::new(SessionSlot::new());
+        let sink = || LogSink::new_direct_with(Arc::clone(&session));
         let head = |addr: &'static str| {
             let engine = Arc::clone(&engine);
             let (shutdown, _rx) = hcore::shutdown::ShutdownTrigger::new();
             run_with_progress(
                 "t",
-                LogSink::new_direct(),
+                sink(),
+                &session,
                 true,
                 shutdown,
                 move |ctx| async move {
@@ -993,7 +1025,8 @@ mod tests {
             let (shutdown, _rx) = hcore::shutdown::ShutdownTrigger::new();
             run_with_progress(
                 "t",
-                LogSink::new_direct(),
+                sink(),
+                &session,
                 true,
                 shutdown,
                 move |ctx| async move {

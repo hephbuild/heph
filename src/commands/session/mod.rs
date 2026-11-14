@@ -21,8 +21,10 @@ mod show;
 #[cfg(test)]
 mod tests;
 
+use crate::tui::session::SessionSlot;
 use std::borrow::Cow;
 use std::io::Write;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -127,8 +129,13 @@ pub struct InflightArgs {
 }
 
 impl SessionArgs {
-    pub fn execute(&self, sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
-        wrap_exit(execute(&self.command, sink, global))
+    pub fn execute(
+        &self,
+        sink: LogSink,
+        session: &Arc<SessionSlot>,
+        global: &GlobalOptions,
+    ) -> anyhow::Result<()> {
+        wrap_exit(execute(&self.command, sink, session, global))
     }
 }
 
@@ -144,7 +151,12 @@ pub(crate) fn wrap_exit(res: anyhow::Result<()>) -> anyhow::Result<()> {
     })
 }
 
-fn execute(cmd: &SessionCommands, sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
+fn execute(
+    cmd: &SessionCommands,
+    sink: LogSink,
+    session: &Arc<SessionSlot>,
+    global: &GlobalOptions,
+) -> anyhow::Result<()> {
     // A viewer reads HOME and nothing else: `HEPH_NO_SESSION` turns recording
     // off, not looking.
     let root = hcore::userdir::heph_user_dir_from(std::env::var_os("HOME").as_deref())
@@ -182,7 +194,14 @@ fn execute(cmd: &SessionCommands, sink: LogSink, global: &GlobalOptions) -> anyh
         }
         SessionCommands::Attach(a) => {
             drop(stdout);
-            bootstrap::block_on(attach::attach(&sources, opts, &a.id, sink, global.no_tui))?
+            bootstrap::block_on(attach::attach(
+                &sources,
+                opts,
+                &a.id,
+                sink,
+                session,
+                global.no_tui,
+            ))?
         }
     }
 }

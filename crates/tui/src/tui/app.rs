@@ -83,6 +83,14 @@ impl AppContext {
         &self.sink
     }
 
+    /// The session the run records into: the slot handed to
+    /// [`run_app`](crate::tui::run_app) (the sink's, which `run_app` checks is
+    /// the same one). Where a command records what it prints outside the
+    /// event stream, like the failure report on the line backend.
+    pub fn session(&self) -> &super::session::SessionSlot {
+        self.sink.session()
+    }
+
     /// The build-event sender to plumb into the request state, e.g.
     /// `engine.new_state_full(fail_fast, ctx.event_sender(), ctx.bg_pending())`.
     pub fn event_sender(&self) -> Option<EventSender> {

@@ -18,7 +18,9 @@ pub mod version;
 
 pub use global::GlobalOptions;
 
+use crate::tui::session::SessionSlot;
 use clap::Subcommand;
+use std::sync::Arc;
 
 use crate::tui::LogSink;
 
@@ -132,16 +134,21 @@ pub enum Commands {
 }
 
 impl Commands {
-    pub fn execute(&self, sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
+    pub fn execute(
+        &self,
+        sink: LogSink,
+        session: &Arc<SessionSlot>,
+        global: &GlobalOptions,
+    ) -> anyhow::Result<()> {
         match self {
-            Commands::Run(args) => run::execute(args, sink, global),
-            Commands::Inspect(args) => args.execute(sink, global),
-            Commands::Query(args) => query::execute(args, sink, global),
-            Commands::Validate(args) => validate::execute(args, sink, global),
+            Commands::Run(args) => run::execute(args, sink, session, global),
+            Commands::Inspect(args) => args.execute(sink, session, global),
+            Commands::Query(args) => query::execute(args, sink, session, global),
+            Commands::Validate(args) => validate::execute(args, sink, session, global),
             Commands::Version(args) => version::execute(args),
-            Commands::Auth(args) => args.execute(sink, global),
-            Commands::Session(args) => args.execute(sink, global),
-            Commands::Tool(args) => args.execute(sink, global),
+            Commands::Auth(args) => args.execute(sink, session, global),
+            Commands::Session(args) => args.execute(sink, session, global),
+            Commands::Tool(args) => args.execute(sink, session, global),
             Commands::GenDocs(args) => gendocs::execute(args),
         }
     }

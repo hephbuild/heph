@@ -1522,7 +1522,7 @@ mod tests {
         use std::io::Write;
         use tracing_subscriber::fmt::MakeWriter;
 
-        let sink = LogSink::new_direct();
+        let sink = LogSink::new_direct_with(Default::default());
         let mut rx = sink.switch_to_buffered();
         let mut writer = MakeLogSink::new(sink.clone()).make_writer();
 

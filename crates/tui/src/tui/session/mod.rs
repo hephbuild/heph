@@ -12,9 +12,10 @@
 //!   wait, bad lines are skipped and counted).
 //! - [`cleanup`]: removing ended sessions, at session start only.
 //! - [`SessionSlot`]: the process's one session. `main` builds it and hands it
-//!   to whoever needs it — the [`LogSink`](crate::tui::LogSink) every command
-//!   and `run_app` already receive, the diag sweeper, the error renderer — and
-//!   finishes it with the exit code. `run_app` opens it lazily.
+//!   to whoever needs it — every command, which passes it to `new_engine` and
+//!   `run_app` as their own argument; the [`LogSink`](crate::tui::LogSink),
+//!   which only tees log lines into it; the diag sweeper; the error renderer —
+//!   and finishes it with the exit code. `run_app` opens it lazily.
 //!
 //! The types live here, in `tui`, rather than in `hcore`, because the snapshot
 //! is built from [`crate::tui::BuildState`] and every consumer (the root crate's

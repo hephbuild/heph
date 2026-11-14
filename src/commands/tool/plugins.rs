@@ -1,4 +1,6 @@
+use crate::tui::session::SessionSlot;
 use anyhow::Context;
+use std::sync::Arc;
 
 use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
@@ -12,12 +14,22 @@ pub struct Args {
     pub json: bool,
 }
 
-pub fn execute(args: &Args, sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
-    bootstrap::block_on(execute_async(args.clone(), sink, global.clone()))?
+pub fn execute(
+    args: &Args,
+    sink: LogSink,
+    session: &Arc<SessionSlot>,
+    global: &GlobalOptions,
+) -> anyhow::Result<()> {
+    bootstrap::block_on(execute_async(args.clone(), sink, session, global.clone()))?
 }
 
-async fn execute_async(args: Args, _sink: LogSink, global: GlobalOptions) -> anyhow::Result<()> {
-    let (engine, _shutdown) = bootstrap::new_engine(&global, None)?;
+async fn execute_async(
+    args: Args,
+    _sink: LogSink,
+    session: &Arc<SessionSlot>,
+    global: GlobalOptions,
+) -> anyhow::Result<()> {
+    let (engine, _shutdown) = bootstrap::new_engine(&global, session)?;
     let plugins = engine.plugins();
     if args.json {
         println!(

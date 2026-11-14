@@ -422,7 +422,7 @@ mod tests {
         let (shutdown, _shutdown_rx) = ShutdownTrigger::new();
         let observed = run(
             TestApp::new(view.clone(), Behavior::BlockUntilFolded),
-            LogSink::new_direct(),
+            LogSink::new_direct_with(Default::default()),
             shutdown,
             None,
         )
@@ -453,7 +453,7 @@ mod tests {
         let (shutdown, _shutdown_rx) = ShutdownTrigger::new();
         run(
             TestApp::new(view.clone(), Behavior::Emit(N)),
-            LogSink::new_direct(),
+            LogSink::new_direct_with(Default::default()),
             shutdown,
             None,
         )
@@ -479,7 +479,7 @@ mod tests {
         let (shutdown, _shutdown_rx) = ShutdownTrigger::new();
         let outcome = std::panic::AssertUnwindSafe(run(
             TestApp::new(RecordingView::default(), Behavior::Panic),
-            LogSink::new_direct(),
+            LogSink::new_direct_with(Default::default()),
             shutdown,
             None,
         ))
@@ -511,7 +511,7 @@ mod tests {
         let (shutdown, _shutdown_rx) = ShutdownTrigger::new();
         let err = run(
             TestApp::new(view.clone(), Behavior::EmitThenFail(3)),
-            LogSink::new_direct(),
+            LogSink::new_direct_with(Default::default()),
             shutdown,
             None,
         )
@@ -540,7 +540,7 @@ mod tests {
         let started = Instant::now();
         run(
             TestApp::new(RecordingView::default(), Behavior::LeavesBackgroundWork),
-            LogSink::new_direct(),
+            LogSink::new_direct_with(Default::default()),
             shutdown,
             None,
         )
@@ -566,7 +566,7 @@ mod tests {
         run(
             TestApp::new(RecordingView::default(), Behavior::Emit(2))
                 .with_probe(DropProbe(Arc::clone(&drops))),
-            LogSink::new_direct(),
+            LogSink::new_direct_with(Default::default()),
             shutdown,
             None,
         )

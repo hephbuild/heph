@@ -152,8 +152,9 @@ fn main() -> ExitCode {
     // look through argv: after `--`, `--raw` is the tool's.
     let soft_match = Cli::command().try_get_matches();
     // The process's session (`heph session …`): owned here and handed to what
-    // records into it — the sink (and through it every command and `run_app`),
-    // the diag sweeper, the error renderer — then finished below with the exit
+    // records into it — the sink (which tees log lines into it), the command
+    // (which hands it to `new_engine` and `run_app` as their own argument), the
+    // diag sweeper, the error renderer — then finished below with the exit
     // code. Configured once the command line is parsed.
     let session = Arc::new(SessionSlot::new());
     // `run --raw` is a tool's own invocation: its stderr carries the tool's
@@ -270,7 +271,7 @@ fn main() -> ExitCode {
     // none: `HEPH_NO_SESSION` turns recording off, not looking.
     session.configure_lookup(SessionRoot::for_reading(home.as_deref()));
 
-    let exec_result = cli.command.execute(sink, &cli.global);
+    let exec_result = cli.command.execute(sink, &session, &cli.global);
     // An entrypoint's program ended without success: heph exits as it did.
     // Nothing to render — the program said what it had to say.
     let tool_exit = exec_result

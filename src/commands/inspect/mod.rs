@@ -13,7 +13,9 @@ mod revdeps;
 mod spec;
 mod states;
 
+use crate::tui::session::SessionSlot;
 use clap::{Args, Subcommand};
+use std::sync::Arc;
 
 use crate::commands::GlobalOptions;
 use crate::tui::LogSink;
@@ -207,9 +209,14 @@ pub enum InspectCommands {
 }
 
 impl InspectArgs {
-    pub fn execute(&self, sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
+    pub fn execute(
+        &self,
+        sink: LogSink,
+        session: &Arc<SessionSlot>,
+        global: &GlobalOptions,
+    ) -> anyhow::Result<()> {
         if let Some(cmd) = &self.command {
-            return cmd.execute(sink, global);
+            return cmd.execute(sink, session, global);
         }
 
         Ok(())
@@ -217,21 +224,26 @@ impl InspectArgs {
 }
 
 impl InspectCommands {
-    pub fn execute(&self, sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
+    pub fn execute(
+        &self,
+        sink: LogSink,
+        session: &Arc<SessionSlot>,
+        global: &GlobalOptions,
+    ) -> anyhow::Result<()> {
         match self {
-            InspectCommands::Packages(args) => packages::execute(args, sink, global),
-            InspectCommands::Labels(args) => labels::execute(args, sink, global),
-            InspectCommands::Hashin(args) => hashin::execute(args, sink, global),
-            InspectCommands::Hashout(args) => hashout::execute(args, sink, global),
-            InspectCommands::Outputs(args) => outputs::execute(args, sink, global),
-            InspectCommands::Spec(args) => spec::execute(args, sink, global),
-            InspectCommands::Def(args) => def::execute(args, sink, global),
-            InspectCommands::Deps(args) => deps::execute(args, sink, global),
-            InspectCommands::Revdeps(args) => revdeps::execute(args, sink, global),
-            InspectCommands::Path(args) => path::execute(args, sink, global),
-            InspectCommands::Failure(args) => failure::execute(args, sink, global),
-            InspectCommands::States(args) => states::execute(args, sink, global),
-            InspectCommands::Functions(args) => functions::execute(args, sink, global),
+            InspectCommands::Packages(args) => packages::execute(args, sink, session, global),
+            InspectCommands::Labels(args) => labels::execute(args, sink, session, global),
+            InspectCommands::Hashin(args) => hashin::execute(args, sink, session, global),
+            InspectCommands::Hashout(args) => hashout::execute(args, sink, session, global),
+            InspectCommands::Outputs(args) => outputs::execute(args, sink, session, global),
+            InspectCommands::Spec(args) => spec::execute(args, sink, session, global),
+            InspectCommands::Def(args) => def::execute(args, sink, session, global),
+            InspectCommands::Deps(args) => deps::execute(args, sink, session, global),
+            InspectCommands::Revdeps(args) => revdeps::execute(args, sink, session, global),
+            InspectCommands::Path(args) => path::execute(args, sink, session, global),
+            InspectCommands::Failure(args) => failure::execute(args, sink, session, global),
+            InspectCommands::States(args) => states::execute(args, sink, session, global),
+            InspectCommands::Functions(args) => functions::execute(args, sink, session, global),
         }
     }
 }

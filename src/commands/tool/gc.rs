@@ -1,3 +1,4 @@
+use crate::tui::session::SessionSlot;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -107,12 +108,22 @@ impl App for GcApp {
     }
 }
 
-pub fn execute(args: &GcArgs, sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
-    bootstrap::block_on(execute_async(args.clone(), sink, global.clone()))?
+pub fn execute(
+    args: &GcArgs,
+    sink: LogSink,
+    session: &Arc<SessionSlot>,
+    global: &GlobalOptions,
+) -> anyhow::Result<()> {
+    bootstrap::block_on(execute_async(args.clone(), sink, session, global.clone()))?
 }
 
-async fn execute_async(_args: GcArgs, sink: LogSink, global: GlobalOptions) -> anyhow::Result<()> {
-    let (engine, shutdown) = bootstrap::new_engine(&global, Some(sink.session()))?;
+async fn execute_async(
+    _args: GcArgs,
+    sink: LogSink,
+    session: &Arc<SessionSlot>,
+    global: GlobalOptions,
+) -> anyhow::Result<()> {
+    let (engine, shutdown) = bootstrap::new_engine(&global, session)?;
     let app = GcApp {
         engine,
         fail_fast: global.fail_fast,
@@ -129,7 +140,7 @@ async fn execute_async(_args: GcArgs, sink: LogSink, global: GlobalOptions) -> a
         ),
     };
     let interactive = tui::should_use_tui(global.no_tui);
-    tui::run_app(app, sink, interactive, shutdown).await
+    tui::run_app(app, sink, session, interactive, shutdown).await
 }
 
 #[cfg(test)]

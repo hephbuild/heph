@@ -11,6 +11,7 @@
 //! must never land inside a live frame. Print it with [`tui::paused!`] once it is
 //! computed, or through a [`tui::BufferedStdout`] when it is incremental.
 
+use crate::tui::session::SessionSlot;
 use std::future::Future;
 use std::sync::Arc;
 
@@ -55,6 +56,7 @@ where
 pub(crate) async fn run_with_progress<F, Fut>(
     label: impl Into<String>,
     sink: LogSink,
+    session: &Arc<SessionSlot>,
     no_tui: bool,
     shutdown: hcore::shutdown::ShutdownTrigger,
     body: F,
@@ -67,7 +69,7 @@ where
         label: label.into(),
         body,
     };
-    tui::run_app(app, sink, tui::should_use_tui(no_tui), shutdown).await
+    tui::run_app(app, sink, session, tui::should_use_tui(no_tui), shutdown).await
 }
 
 /// A request whose build events reach `ctx`'s view, and whose sandbox cleanups
@@ -95,8 +97,10 @@ mod tests {
     /// must not be turned into one.
     #[tokio::test]
     async fn the_body_decides_the_exit() {
+        let session = Arc::new(SessionSlot::new());
+        let sink = || LogSink::new_direct_with(Arc::clone(&session));
         let (shutdown, _rx) = hcore::shutdown::ShutdownTrigger::new();
-        let err = run_with_progress("t", LogSink::new_direct(), true, shutdown, |_ctx| async {
+        let err = run_with_progress("t", sink(), &session, true, shutdown, |_ctx| async {
             anyhow::bail!("2 of 3 credentials are not available here")
         })
         .await
@@ -104,16 +108,10 @@ mod tests {
         assert!(err.to_string().contains("2 of 3"), "{err:#}");
 
         let (shutdown, _rx) = hcore::shutdown::ShutdownTrigger::new();
-        run_with_progress(
-            "t",
-            LogSink::new_direct(),
-            true,
-            shutdown,
-            |ctx| async move {
-                assert!(!ctx.interactive(), "no_tui means the line backend");
-                Ok(())
-            },
-        )
+        run_with_progress("t", sink(), &session, true, shutdown, |ctx| async move {
+            assert!(!ctx.interactive(), "no_tui means the line backend");
+            Ok(())
+        })
         .await
         .expect("a passing body passes");
     }

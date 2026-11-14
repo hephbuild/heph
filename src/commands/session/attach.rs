@@ -12,6 +12,7 @@
 //! once its TUI is torn down. `q` and Ctrl-C detach — they end this viewer,
 //! never the session — and the viewer records no session of its own.
 
+use crate::tui::session::SessionSlot;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
@@ -43,6 +44,7 @@ pub(crate) async fn attach(
     opts: ViewOpts,
     arg: &str,
     sink: LogSink,
+    session: &Arc<SessionSlot>,
     no_tui: bool,
 ) -> anyhow::Result<()> {
     let (i, entry) = resolve(sources, arg, opts).await?;
@@ -73,7 +75,14 @@ pub(crate) async fn attach(
         quit_tx,
         quit_rx,
     };
-    let outcome = tui::run_app(app, sink.clone(), tui::should_use_tui(no_tui), shutdown).await;
+    let outcome = tui::run_app(
+        app,
+        sink.clone(),
+        session,
+        tui::should_use_tui(no_tui),
+        shutdown,
+    )
+    .await;
     sigint_task.abort();
     // The run printed these below its final summary; the viewer's own summary
     // was printed at its teardown, so they land in the same place.

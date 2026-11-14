@@ -624,6 +624,7 @@ async fn run_in(slot: &Arc<SessionSlot>, records: bool) -> bool {
             ran: Arc::clone(&ran),
         },
         crate::tui::LogSink::new_direct_with(Arc::clone(slot)),
+        slot,
         false,
         shutdown,
     )

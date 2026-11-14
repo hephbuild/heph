@@ -14,9 +14,10 @@ enum Inner {
 
 /// Where the process's terminal output goes, and the session recording it.
 ///
-/// `main` builds one and hands it to the command, which hands it to
-/// [`run_app`](crate::tui::run_app): that is how the session reaches the run
-/// that opens it, and how every `info!` line reaches the session.
+/// `main` builds one and hands it to the command, beside the session itself.
+/// The sink keeps its own reference to the session only to tee every `info!`
+/// line into it; the session reaches [`run_app`](crate::tui::run_app) as its own
+/// argument, never through the sink.
 #[derive(Clone)]
 pub struct LogSink {
     inner: Arc<Mutex<Inner>>,
@@ -27,7 +28,8 @@ pub struct LogSink {
 }
 
 impl LogSink {
-    /// A sink recording into `session` once a run opens it.
+    /// A sink recording into `session` once a run opens it. The same slot is
+    /// what the caller hands [`run_app`](crate::tui::run_app).
     pub fn new_direct_with(session: Arc<SessionSlot>) -> Self {
         Self {
             inner: Arc::new(Mutex::new(Inner::Direct)),
@@ -35,14 +37,9 @@ impl LogSink {
         }
     }
 
-    /// A sink with a session slot of its own that nobody configured: nothing
-    /// is recorded (a test, an embedder).
-    pub fn new_direct() -> Self {
-        Self::new_direct_with(Arc::new(SessionSlot::new()))
-    }
-
-    /// The session this sink's output is recorded in.
-    pub fn session(&self) -> &Arc<SessionSlot> {
+    /// The session this sink tees into. Crate-private: a command gets the
+    /// session as its own argument.
+    pub(crate) fn session(&self) -> &Arc<SessionSlot> {
         &self.session
     }
 
@@ -165,7 +162,7 @@ mod tests {
 
     #[test]
     fn buffered_writer_pushes_bytes_through_channel() {
-        let sink = LogSink::new_direct();
+        let sink = LogSink::new_direct_with(Default::default());
         let mut rx = sink.switch_to_buffered();
 
         let make = MakeLogSink::new(sink.clone());
@@ -181,7 +178,7 @@ mod tests {
 
     #[test]
     fn direct_writer_bypasses_channel() {
-        let sink = LogSink::new_direct();
+        let sink = LogSink::new_direct_with(Default::default());
         let make = MakeLogSink::new(sink.clone());
         let mut w = make.make_writer();
         w.write_all(b"x").expect("write");

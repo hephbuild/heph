@@ -603,7 +603,7 @@ macro_rules! finalize {
                     $crate::commands::errors::FailedTargets::reported_to_stderr(
                         failures,
                         incomplete,
-                        $ctx.sink().session(),
+                        $ctx.session(),
                     )
                     .into_error(),
                 )
@@ -1027,12 +1027,13 @@ mod tests {
     }
 
     /// `finalize!` is duck-typed over the app context and the request state — it
-    /// only ever calls `interactive()`, `pause()` and `take_failures()` — so the
+    /// only ever calls `interactive()`, `session()`, `pause()` and
+    /// `take_failures()` — so the
     /// branch it takes can be driven without an engine or a terminal.
     struct FakeCtx {
         interactive: bool,
         pauses: std::cell::Cell<usize>,
-        sink: crate::tui::LogSink,
+        session: crate::tui::session::SessionSlot,
     }
 
     struct FakeGuard;
@@ -1042,14 +1043,14 @@ mod tests {
             Self {
                 interactive,
                 pauses: std::cell::Cell::new(0),
-                sink: crate::tui::LogSink::new_direct(),
+                session: crate::tui::session::SessionSlot::new(),
             }
         }
         fn interactive(&self) -> bool {
             self.interactive
         }
-        fn sink(&self) -> &crate::tui::LogSink {
-            &self.sink
+        fn session(&self) -> &crate::tui::session::SessionSlot {
+            &self.session
         }
         async fn pause(&self) -> FakeGuard {
             self.pauses.set(self.pauses.get() + 1);

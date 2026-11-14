@@ -80,19 +80,26 @@ fn tui_allowed(
     !force_off && stderr_is_terminal && !stdout_is_pipe && (foreground < 0 || foreground == own)
 }
 
-/// Run `app` on the TUI or the line backend, recording into `sink`'s session.
+/// Run `app` on the TUI or the line backend, recording into `session`.
+///
+/// `session` is the process's one session, threaded from `main` as its own
+/// argument. `sink` must be the sink built over the same slot (it tees log
+/// lines into it); a debug build checks that they are one slot.
 pub async fn run_app<A: App + 'static>(
     app: A,
     sink: LogSink,
+    session: &std::sync::Arc<session::SessionSlot>,
     interactive: bool,
     shutdown: hcore::shutdown::ShutdownTrigger,
 ) -> anyhow::Result<A::Output> {
-    // The backends take the sink by value; the slot it carries is shared.
-    let sink_slot = std::sync::Arc::clone(sink.session());
+    debug_assert!(
+        std::sync::Arc::ptr_eq(session, sink.session()),
+        "run_app's session and its sink's session must be the same slot"
+    );
     // A viewer never records itself (A3). The slot opens the process's session
     // on the first recording run, once the backend has built its view (the
     // view names the header a viewer rebuilds).
-    let slot = app.records_session().then_some(&*sink_slot);
+    let slot = app.records_session().then_some(&**session);
     // A panic that unwinds out of the run still writes `End { panicked }`.
     let _panic_guard = slot.map(session::PanicGuard);
     // Establish a stable identity for the runtime's outer `block_on`

@@ -1,3 +1,4 @@
+use crate::tui::session::SessionSlot;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -57,15 +58,25 @@ impl App for DepsApp {
     }
 }
 
-pub fn execute(args: &Args, sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
-    bootstrap::block_on(execute_async(args.clone(), sink, global.clone()))?
+pub fn execute(
+    args: &Args,
+    sink: LogSink,
+    session: &Arc<SessionSlot>,
+    global: &GlobalOptions,
+) -> anyhow::Result<()> {
+    bootstrap::block_on(execute_async(args.clone(), sink, session, global.clone()))?
 }
 
-async fn execute_async(args: Args, sink: LogSink, global: GlobalOptions) -> anyhow::Result<()> {
+async fn execute_async(
+    args: Args,
+    sink: LogSink,
+    session: &Arc<SessionSlot>,
+    global: GlobalOptions,
+) -> anyhow::Result<()> {
     let base = crate::engine::get_cwp()?;
     let addr = htaddr::parse_addr_with_base(args.addr.as_ref(), &base)
         .with_context(|| format!("parse {}", args.addr))?;
-    let (engine, shutdown) = bootstrap::new_engine(&global, Some(sink.session()))?;
+    let (engine, shutdown) = bootstrap::new_engine(&global, session)?;
     let interactive = tui::should_use_tui(global.no_tui);
 
     if args.interactive {
@@ -80,5 +91,5 @@ async fn execute_async(args: Args, sink: LogSink, global: GlobalOptions) -> anyh
         addr,
         fail_fast: global.fail_fast,
     };
-    tui::run_app(app, sink, interactive, shutdown).await
+    tui::run_app(app, sink, session, interactive, shutdown).await
 }

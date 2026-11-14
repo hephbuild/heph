@@ -20,6 +20,7 @@ use heph::commands::run::{RunArgs, execute, plain_output_wrapper};
 use heph::engine::{InteractiveInner, InteractiveWrapper, OutputMatcher, ResultOptions};
 use heph::htaddr::parse_addr;
 use heph::tui::LogSink;
+use heph::tui::session::SessionSlot;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt as _;
@@ -155,7 +156,9 @@ fn raw_refused_with_shell() {
         raw: true,
         args: Vec::new(),
     };
-    let err = execute(&args, LogSink::new_direct(), &GlobalOptions::default())
+    let session = Arc::new(SessionSlot::new());
+    let sink = LogSink::new_direct_with(Arc::clone(&session));
+    let err = execute(&args, sink, &session, &GlobalOptions::default())
         .expect_err("`--raw --shell` has no meaning");
     let msg = format!("{err:#}");
     assert!(

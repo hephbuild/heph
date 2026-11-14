@@ -11,7 +11,9 @@ mod resolve_plugins;
 mod scratch;
 mod telemetry;
 
+use crate::tui::session::SessionSlot;
 use clap::{Args, Subcommand};
+use std::sync::Arc;
 
 use crate::commands::GlobalOptions;
 use crate::tui::LogSink;
@@ -152,9 +154,14 @@ pub enum ToolCommands {
 }
 
 impl ToolArgs {
-    pub fn execute(&self, sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
+    pub fn execute(
+        &self,
+        sink: LogSink,
+        session: &Arc<SessionSlot>,
+        global: &GlobalOptions,
+    ) -> anyhow::Result<()> {
         if let Some(cmd) = &self.command {
-            return cmd.execute(sink, global);
+            return cmd.execute(sink, session, global);
         }
 
         Ok(())
@@ -162,20 +169,27 @@ impl ToolArgs {
 }
 
 impl ToolCommands {
-    pub fn execute(&self, sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
+    pub fn execute(
+        &self,
+        sink: LogSink,
+        session: &Arc<SessionSlot>,
+        global: &GlobalOptions,
+    ) -> anyhow::Result<()> {
         match self {
-            ToolCommands::Gc(args) => gc::execute(args, sink, global),
-            ToolCommands::Clean(args) => clean::execute(args, sink, global),
-            ToolCommands::Codegen(args) => args.execute(sink, global),
+            ToolCommands::Gc(args) => gc::execute(args, sink, session, global),
+            ToolCommands::Clean(args) => clean::execute(args, sink, session, global),
+            ToolCommands::Codegen(args) => args.execute(sink, session, global),
             ToolCommands::GenGitignore(args) => codegen::removed_gen_gitignore(args),
-            ToolCommands::Scratch(args) => args.execute(sink, global),
-            ToolCommands::Cache(args) => args.execute(sink, global),
+            ToolCommands::Scratch(args) => args.execute(sink, session, global),
+            ToolCommands::Cache(args) => args.execute(sink, session, global),
             ToolCommands::Coreutils(args) => args.execute(),
             ToolCommands::Completions(args) => completions::execute(args),
-            ToolCommands::BuildFmt(args) => build_fmt::execute(args, sink, global),
-            ToolCommands::BuildLsp(args) => build_lsp::execute(args, sink, global),
-            ToolCommands::ResolvePlugins(args) => resolve_plugins::execute(args, sink, global),
-            ToolCommands::Plugins(args) => plugins::execute(args, sink, global),
+            ToolCommands::BuildFmt(args) => build_fmt::execute(args, sink, session, global),
+            ToolCommands::BuildLsp(args) => build_lsp::execute(args, sink, session, global),
+            ToolCommands::ResolvePlugins(args) => {
+                resolve_plugins::execute(args, sink, session, global)
+            }
+            ToolCommands::Plugins(args) => plugins::execute(args, sink, session, global),
             ToolCommands::Telemetry(args) => args.execute(),
         }
     }

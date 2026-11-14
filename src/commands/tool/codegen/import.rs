@@ -2,6 +2,7 @@
 //! its `user.heph.codegen` xattr (spec: Upgrade from the xattr). The only way
 //! the import runs. Removed in v1.1.0.
 
+use crate::tui::session::SessionSlot;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -143,11 +144,17 @@ fn finish(
     })
 }
 
-pub fn execute(args: &Args, sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
+pub fn execute(
+    args: &Args,
+    sink: LogSink,
+    session: &Arc<SessionSlot>,
+    global: &GlobalOptions,
+) -> anyhow::Result<()> {
     run_cli(
         "Importing codegen xattrs",
         args.json,
         sink,
+        session,
         global,
         |engine, rs| async move { import(&engine, &rs).await },
     )

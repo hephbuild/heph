@@ -1,5 +1,7 @@
+use crate::tui::session::SessionSlot;
 use anyhow::Context;
 use clap::Args as ClapArgs;
+use std::sync::Arc;
 
 use crate::commands::{GlobalOptions, bootstrap};
 use crate::tui::LogSink;
@@ -22,7 +24,12 @@ pub struct Args {
     json: bool,
 }
 
-pub fn execute(args: &Args, _sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
+pub fn execute(
+    args: &Args,
+    _sink: LogSink,
+    session: &Arc<SessionSlot>,
+    global: &GlobalOptions,
+) -> anyhow::Result<()> {
     if let Some(target) = &args.explain {
         let out = crate::pluginbuildfile::lsp_explain(target, args.json)?;
         println!("{out}");
@@ -37,6 +44,6 @@ pub fn execute(args: &Args, _sink: LogSink, global: &GlobalOptions) -> anyhow::R
         .build()
         .context("building tokio runtime for build-lsp")?;
     let _guard = runtime.enter();
-    let (engine, _shutdown) = bootstrap::new_engine(global, None)?;
+    let (engine, _shutdown) = bootstrap::new_engine(global, session)?;
     crate::pluginbuildfile::serve_stdio(engine)
 }

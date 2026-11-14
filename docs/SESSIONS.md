@@ -165,11 +165,12 @@ error.
 
 The process's session is a `SessionSlot` that `main` owns: there is no
 process-wide instance. `main` configures it and hands it to whatever records
-into it — the `LogSink` (which every command threads into `run_app`, and
-which tees `info!` lines into the open session), `bootstrap::new_engine` (the
-workspace for `meta.json`), the diag sweeper, and the error renderer.
-`tui::run_app` opens it lazily from its sink's slot (a viewer's
-`App::records_session()` is false), and `main` finishes it with the exit code
+into it — every command, as its own argument beside the sink;
+`bootstrap::new_engine` (the workspace for `meta.json`); the `LogSink`, which
+keeps a reference only to tee `info!` lines into the open session; the diag
+sweeper; and the error renderer. `tui::run_app` takes the session as an
+explicit argument (a debug build asserts it is the sink's slot) and opens it
+lazily (a viewer's `App::records_session()` is false), and `main` finishes it with the exit code
 just before `std::process::exit`. Both
 backends consume a tapped receiver that moves each event to the recorder right
 after the view folds it, so what is recorded is what was shown, paused TUI

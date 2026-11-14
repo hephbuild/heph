@@ -1,3 +1,4 @@
+use crate::tui::session::SessionSlot;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -67,21 +68,31 @@ impl App for LabelsApp {
     }
 }
 
-pub fn execute(args: &Args, sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
-    bootstrap::block_on(execute_async(args.clone(), sink, global.clone()))?
+pub fn execute(
+    args: &Args,
+    sink: LogSink,
+    session: &Arc<SessionSlot>,
+    global: &GlobalOptions,
+) -> anyhow::Result<()> {
+    bootstrap::block_on(execute_async(args.clone(), sink, session, global.clone()))?
 }
 
-async fn execute_async(args: Args, sink: LogSink, global: GlobalOptions) -> anyhow::Result<()> {
+async fn execute_async(
+    args: Args,
+    sink: LogSink,
+    session: &Arc<SessionSlot>,
+    global: GlobalOptions,
+) -> anyhow::Result<()> {
     let matcher = match &args.matcher {
         Some(s) => htpkg::parse(s.as_str(), &crate::engine::get_cwp()?)?,
         None => Matcher::PackagePrefix(PkgBuf::from("")),
     };
-    let (engine, shutdown) = bootstrap::new_engine(&global, Some(sink.session()))?;
+    let (engine, shutdown) = bootstrap::new_engine(&global, session)?;
     let app = LabelsApp {
         engine,
         matcher,
         fail_fast: global.fail_fast,
     };
     let interactive = tui::should_use_tui(global.no_tui);
-    tui::run_app(app, sink, interactive, shutdown).await
+    tui::run_app(app, sink, session, interactive, shutdown).await
 }

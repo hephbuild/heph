@@ -1,6 +1,7 @@
 //! `heph tool codegen why <path>...`: why a path is, or is not, read as
 //! generated. Works on any path, `Source` included; reads only.
 
+use crate::tui::session::SessionSlot;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -345,13 +346,19 @@ pub async fn why(
     Ok(WhyReport { items, hint })
 }
 
-pub fn execute(args: &Args, sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
+pub fn execute(
+    args: &Args,
+    sink: LogSink,
+    session: &Arc<SessionSlot>,
+    global: &GlobalOptions,
+) -> anyhow::Result<()> {
     let paths = args.paths.clone();
     let cwd: PathBuf = std::env::current_dir().context("reading the working directory")?;
     run_cli(
         "Explaining",
         args.json,
         sink,
+        session,
         global,
         move |engine, rs| async move { why(&engine, &rs, &paths, &cwd).await },
     )
