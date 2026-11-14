@@ -1,6 +1,5 @@
 use crate::engine::cache_db_space::{
-    self, CompactReport, JOURNAL_SIZE_LIMIT_BYTES, MaintainKind, ReclaimPolicy,
-    WRITER_BUSY_TIMEOUT,
+    self, CompactReport, JOURNAL_SIZE_LIMIT_BYTES, MaintainKind, ReclaimPolicy, WRITER_BUSY_TIMEOUT,
 };
 use crate::engine::local_cache::{
     EntryWriter, Existence, LocalCache, NotFoundError, PendingWrite, SizedReader, TargetStream,
@@ -1152,8 +1151,7 @@ fn commit_with_retry(
         };
         attempts = attempts.saturating_add(1);
         let waited = started.elapsed();
-        if !is_busy(&err) || waited >= WRITE_BUSY_RETRY_TOTAL || closing.load(Ordering::Acquire)
-        {
+        if !is_busy(&err) || waited >= WRITE_BUSY_RETRY_TOTAL || closing.load(Ordering::Acquire) {
             return Err(err.context(format!("after {attempts} attempt(s) over {waited:?}")));
         }
         if attempts == 1 {
@@ -1308,64 +1306,39 @@ impl LocalCache for LocalCacheSQLite {
         self.pending.wait_if_pending(&addr_key, hashin, name);
 
         let conn = self.read_conn()?;
-
-        let mut stmt = conn
-            .prepare_cached(
-                "SELECT rowid, length(data) FROM artifacts WHERE addr=?1 AND hashin=?2 AND name=?3",
-            )
-            .context("preparing reader lookup")?;
-        let (row_id, blob_len): (i64, usize) =
-            match stmt.query_row(rusqlite::params![addr_key, hashin, name], |row| {
-                let row_id: i64 = row.get(0)?;
-                let blob_len: i64 = row.get(1)?;
-                Ok((row_id, usize::try_from(blob_len).unwrap_or(0)))
-            }) {
-                Err(rusqlite::Error::QueryReturnedNoRows) => {
-                    return Err(anyhow::anyhow!(NotFoundError));
-                }
-                Err(e) => {
-                    return Err(e).with_context(|| {
-                        format!("looking up {name} hashin={hashin} in sqlite cache")
-                    });
-                }
-                Ok(v) => v,
-            };
-
-        let size = blob_len as u64;
+        let mut blob = open_blob(&conn, &addr_key, hashin, name)?;
+        let blob_len = blob.len();
 
         if blob_len <= self.inline_threshold {
-            let mut blob = conn
-                .blob_open(rusqlite::MAIN_DB, "artifacts", "data", row_id, true)
-                .with_context(|| format!("opening blob for {name}"))?;
             let mut buf = Vec::with_capacity(blob_len);
             io::copy(&mut blob, &mut buf)
                 .with_context(|| format!("reading small blob for {name}"))?;
             let arc: Arc<[u8]> = Arc::from(buf);
             return Ok(SizedReader {
-                size,
+                size: blob_len as u64,
                 reader: Box::new(io::Cursor::new(arc.clone())),
                 bytes: Some(arc),
             });
         }
 
-        // Release the SELECT connection before acquiring semaphore + a fresh pipe connection.
-        drop(stmt);
+        // Release the lookup's connection before acquiring semaphore + a fresh
+        // pipe connection, which looks the key up again: a rowid is only good
+        // inside the snapshot it was read in (see `open_blob`), and the key may
+        // be gone by now — a miss, then.
+        drop(blob);
         drop(conn);
 
         // Semaphore acquired before pool to bound concurrent open pipes (= open FDs).
         let permit = self.pipe_sem.acquire();
-        let conn = self.read_conn()?;
+        let mut blob = OwnedBlob::new(self.read_conn()?, &addr_key, hashin, name)?;
+        let size = blob.len() as u64;
 
         let (pipe_reader, mut pipe_writer) =
             io::pipe().with_context(|| format!("creating pipe for sqlite blob read of {name}"))?;
 
-        // Move the pooled connection into the rayon pool; returns to pool on drop.
+        // Move the blob, and the pooled connection it owns, into the rayon pool;
+        // the connection returns to the pool on drop.
         rayon::spawn(move || {
-            let mut blob =
-                match conn.blob_open(rusqlite::MAIN_DB, "artifacts", "data", row_id, true) {
-                    Ok(b) => b,
-                    Err(_) => return,
-                };
             drop(io::copy(&mut blob, &mut pipe_writer));
         });
 
@@ -1502,26 +1475,76 @@ impl LocalCache for LocalCacheSQLite {
         let addr_key = Self::key(addr);
         self.pending.wait_if_pending(&addr_key, hashin, name);
 
-        let conn = self.read_conn()?;
+        Ok(Some(Box::new(OwnedBlob::new(
+            self.read_conn()?,
+            &addr_key,
+            hashin,
+            name,
+        )?)))
+    }
+}
 
-        let mut stmt = conn
-            .prepare_cached("SELECT rowid FROM artifacts WHERE addr=?1 AND hashin=?2 AND name=?3")
-            .context("preparing seekable_reader lookup")?;
-        let row_id: i64 =
-            match stmt.query_row(rusqlite::params![addr_key, hashin, name], |row| row.get(0)) {
-                Err(rusqlite::Error::QueryReturnedNoRows) => {
-                    return Err(anyhow::anyhow!(NotFoundError));
-                }
-                Err(e) => {
-                    return Err(e).with_context(|| {
-                        format!("looking up {name} hashin={hashin} for seekable read")
-                    });
-                }
-                Ok(v) => v,
-            };
-        drop(stmt);
+/// Look up a key's row and open its blob, both in one read snapshot.
+/// [`NotFoundError`] when the key has no row.
+///
+/// A rowid names a row only inside the snapshot it was read in. Opened by
+/// rowid in a later transaction, the blob could be another key's: another
+/// process deleting the row and inserting a different key that reuses the
+/// rowid, or a `VACUUM` renumbering the rows of a table with no `INTEGER
+/// PRIMARY KEY` (as `artifacts` has none), would serve that key's bytes as
+/// this one's — a wrong cache hit.
+///
+/// So the lookup's cursor is kept open, its statement unreset, until the blob
+/// is open. A connection's read transaction — and with it, in WAL mode, its
+/// snapshot — lasts while any of its statements is active, so the lookup and
+/// the open see one snapshot; once open, the blob is that active statement,
+/// and every read through it sees the same snapshot until it is dropped.
+/// `a_blob_opened_under_the_lookup_cursor_reads_the_lookups_snapshot` pins
+/// this down.
+fn open_blob<'c>(
+    conn: &'c Connection,
+    addr_key: &str,
+    hashin: &str,
+    name: &str,
+) -> Result<rusqlite::blob::Blob<'c>> {
+    let mut stmt = conn
+        .prepare_cached("SELECT rowid FROM artifacts WHERE addr=?1 AND hashin=?2 AND name=?3")
+        .context("preparing sqlite cache lookup")?;
+    let lookup_failed = || format!("looking up {name} hashin={hashin} in sqlite cache");
+    let mut rows = stmt
+        .query(rusqlite::params![addr_key, hashin, name])
+        .with_context(lookup_failed)?;
+    // Not stepped again: a step to the end of the result would end the
+    // statement, and the read transaction with it, before the blob opens.
+    let row_id: i64 = match rows.next().with_context(lookup_failed)? {
+        Some(row) => row.get(0).with_context(lookup_failed)?,
+        None => return Err(anyhow::anyhow!(NotFoundError)),
+    };
+    #[cfg(test)]
+    after_rowid_lookup(row_id);
+    let blob = conn
+        .blob_open(rusqlite::MAIN_DB, "artifacts", "data", row_id, true)
+        .with_context(|| format!("opening blob for {name} hashin={hashin}"))?;
+    // Only now: the open blob holds the read transaction from here on.
+    drop(rows);
+    Ok(blob)
+}
 
-        Ok(Some(Box::new(OwnedBlob::new(conn, row_id)?)))
+#[cfg(test)]
+type RowidHook = Box<dyn FnOnce(i64)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook, run on the reading thread between a read's rowid lookup and
+    /// its blob open, with the rowid. Taken by its first run.
+    static AFTER_ROWID_LOOKUP: std::cell::RefCell<Option<RowidHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn after_rowid_lookup(row_id: i64) {
+    if let Some(hook) = AFTER_ROWID_LOOKUP.with_borrow_mut(Option::take) {
+        hook(row_id);
     }
 }
 
@@ -1559,14 +1582,19 @@ struct OwnedBlob {
 unsafe impl Send for OwnedBlob {}
 
 impl OwnedBlob {
-    fn new(conn: r2d2::PooledConnection<SqliteConnectionManager>, row_id: i64) -> Result<Self> {
+    /// Open the key's blob on `conn` through [`open_blob`]: [`NotFoundError`]
+    /// when the key has no row.
+    fn new(
+        conn: r2d2::PooledConnection<SqliteConnectionManager>,
+        addr_key: &str,
+        hashin: &str,
+        name: &str,
+    ) -> Result<Self> {
         // Box BEFORE borrowing: the blob captures an address that must survive
         // this struct being moved out of `new`. See the type doc.
         let conn = Box::new(conn);
         let conn_ref: &Connection = &conn;
-        let blob = conn_ref
-            .blob_open(rusqlite::MAIN_DB, "artifacts", "data", row_id, true)
-            .context("opening seekable sqlite blob")?;
+        let blob = open_blob(conn_ref, addr_key, hashin, name)?;
         // SAFETY: `blob` borrows the `Connection` inside the heap allocation
         // `conn` owns, which this struct keeps alive and never moves (moving the
         // `Box` moves the pointer, not the pointee). Field order drops `blob`
@@ -1576,6 +1604,11 @@ impl OwnedBlob {
             blob: blob_static,
             _conn: conn,
         })
+    }
+
+    /// The blob's size, in the snapshot it was opened in.
+    fn len(&self) -> usize {
+        self.blob.len()
     }
 }
 
@@ -2958,6 +2991,178 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.is::<NotFoundError>(), "{err:#}");
+    }
+
+    /// Arm [`AFTER_ROWID_LOOKUP`] to do what another process's delete and a
+    /// later insert reusing the rowid would: replace the looked-up row with
+    /// `other`'s, at the same rowid.
+    fn reuse_the_rowid_after_lookup(path: &std::path::Path, other: &Addr, bytes: &[u8]) {
+        let path = path.to_path_buf();
+        let other = LocalCacheSQLite::key(other);
+        let bytes = bytes.to_vec();
+        AFTER_ROWID_LOOKUP.with_borrow_mut(|hook| {
+            *hook = Some(Box::new(move |row_id| {
+                let conn = Connection::open(&path).expect("open a second connection");
+                conn.busy_timeout(Duration::from_secs(10))
+                    .expect("busy timeout");
+                // `other` too, should an earlier swap have left it behind.
+                conn.execute(
+                    "DELETE FROM artifacts WHERE rowid = ?1 OR addr = ?2",
+                    rusqlite::params![row_id, other],
+                )
+                .expect("delete the looked-up row");
+                conn.execute(
+                    "INSERT INTO artifacts (rowid, addr, hashin, name, data)
+                     VALUES (?1, ?2, 'h', 'blob', ?3)",
+                    rusqlite::params![row_id, other, bytes],
+                )
+                .expect("insert another key at the same rowid");
+            }));
+        });
+    }
+
+    /// A read whose row is replaced between its rowid lookup and its blob
+    /// open — a delete, then an insert reusing the rowid — never serves the
+    /// replacement's bytes as its own key: it serves the key's bytes from the
+    /// lookup's snapshot, or misses. Serving the other key's bytes would be a
+    /// wrong cache hit. Covers the inline, pipe and seekable paths.
+    #[test]
+    fn a_rowid_reused_between_lookup_and_open_is_never_served_as_this_key() -> Result<()> {
+        let mut wrong = Vec::new();
+        let mut outcome = |read: Result<Vec<u8>>, mine: &[u8], theirs: &[u8], path: &str| match read
+        {
+            Ok(bytes) if bytes == theirs => wrong.push(format!("{path}: another key's bytes")),
+            Ok(bytes) if bytes != mine => wrong.push(format!("{path}: neither key's bytes")),
+            Ok(_) => {}
+            Err(e) if e.is::<NotFoundError>() => {}
+            Err(e) => wrong.push(format!("{path}: {e:#}")),
+        };
+
+        for (path_name, inline_threshold) in [("inline", 1024 * 1024), ("pipe", 0)] {
+            let dir = tempdir()?;
+            let path = dir.path().join("cache.db");
+            let cache = LocalCacheSQLite::with_pipe_limit(
+                path.clone(),
+                inline_threshold,
+                DEFAULT_MAX_CONCURRENT_PIPES,
+            )?;
+            let mine = make_addr("pkg", "mine");
+            let theirs = make_addr("pkg", "theirs");
+            let (my_bytes, their_bytes) = (vec![0xaa; 4096], vec![0xbb; 4096]);
+            queued_write(&cache, &mine, "blob", &my_bytes);
+            assert!(cache.exists(&mine, "h", "blob")?, "barrier");
+
+            reuse_the_rowid_after_lookup(&path, &theirs, &their_bytes);
+            let read = cache.reader(&mine, "h", "blob").and_then(|mut r| {
+                let mut bytes = Vec::new();
+                r.reader.read_to_end(&mut bytes)?;
+                Ok(bytes)
+            });
+            outcome(read, &my_bytes, &their_bytes, path_name);
+
+            // Seekable, against the same database, with `mine` back under a
+            // fresh rowid.
+            queued_write(&cache, &mine, "blob", &my_bytes);
+            assert!(cache.exists(&mine, "h", "blob")?, "barrier");
+            reuse_the_rowid_after_lookup(&path, &theirs, &their_bytes);
+            let read = cache.seekable_reader(&mine, "h", "blob").and_then(|r| {
+                let mut bytes = Vec::new();
+                r.expect("sqlite serves a seekable reader")
+                    .read_to_end(&mut bytes)?;
+                Ok(bytes)
+            });
+            outcome(read, &my_bytes, &their_bytes, "seekable");
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        Ok(())
+    }
+
+    /// What `open_blob` rests on: with the lookup's cursor open until the blob
+    /// opens, a row another connection replaces in between at the same rowid
+    /// is invisible to the blob *and* to every other statement on the
+    /// connection while the blob is open — one snapshot — and visible once the
+    /// blob is dropped.
+    #[test]
+    fn a_blob_opened_under_the_lookup_cursor_reads_the_lookups_snapshot() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("cache.db");
+        let cache = open(&path)?;
+        let (mine, theirs) = (make_addr("pkg", "mine"), make_addr("pkg", "theirs"));
+        put(&cache, &mine, "blob", b"my bytes")?;
+        assert!(cache.exists(&mine, "h", "blob")?, "barrier");
+        let count_theirs = |conn: &Connection| -> Result<i64> {
+            Ok(conn.query_row(
+                "SELECT count(*) FROM artifacts WHERE addr = ?1",
+                [LocalCacheSQLite::key(&theirs)],
+                |r| r.get(0),
+            )?)
+        };
+
+        let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        reuse_the_rowid_after_lookup(&path, &theirs, b"their bytes");
+        let mut blob = open_blob(&conn, &LocalCacheSQLite::key(&mine), "h", "blob")?;
+        assert_eq!(
+            count_theirs(&Connection::open(&path)?)?,
+            1,
+            "the swap committed"
+        );
+        assert_eq!(count_theirs(&conn)?, 0, "the blob's snapshot predates it");
+        let mut bytes = Vec::new();
+        blob.read_to_end(&mut bytes)?;
+        assert_eq!(bytes, b"my bytes");
+        drop(blob);
+        assert_eq!(count_theirs(&conn)?, 1, "the snapshot ends with the blob");
+        Ok(())
+    }
+
+    /// A `heph tool gc` conversion (a full `VACUUM` of a NONE database) of a
+    /// table with rowid gaps keeps every rowid naming the key it named.
+    #[test]
+    fn converting_a_none_database_keeps_every_rowid_to_key_mapping() -> Result<()> {
+        type Mapping = Vec<(i64, String, String, String)>;
+        fn mapping(path: &std::path::Path) -> Result<Mapping> {
+            let conn = Connection::open(path)?;
+            let mut stmt =
+                conn.prepare("SELECT rowid, addr, hashin, name FROM artifacts ORDER BY rowid")?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+                .collect::<rusqlite::Result<Mapping>>()?;
+            Ok(rows)
+        }
+
+        let dir = tempdir()?;
+        let path = dir.path().join("cache.db");
+        let addr = make_addr("pkg", "gaps");
+        none_db(&path, &addr)?;
+        {
+            let conn = Connection::open(&path)?;
+            for i in 0..30u8 {
+                conn.execute(
+                    "INSERT INTO artifacts (addr, hashin, name, data) VALUES (?1, 'h', ?2, ?3)",
+                    rusqlite::params![LocalCacheSQLite::key(&addr), format!("n{i}"), vec![i; 4096]],
+                )?;
+            }
+            conn.execute("DELETE FROM artifacts WHERE rowid % 3 = 0", [])?;
+        }
+        let before = mapping(&path)?;
+        assert!(
+            before.windows(2).any(|w| w[1].0 - w[0].0 > 1),
+            "the table has rowid gaps: {before:?}"
+        );
+
+        let cache = open(&path)?;
+        cache.set_maintenance_overrides(MaintenanceOverrides {
+            free_space: Some(u64::MAX),
+            ..MaintenanceOverrides::default()
+        });
+        let report = cache.compact_for_gc(Box::new(|| true))?;
+        assert!(
+            matches!(report.action, CompactAction::Converted { .. }),
+            "{report:?}"
+        );
+        assert_eq!(pragma::<i64>(&path, "auto_vacuum")?, 2, "INCREMENTAL");
+        assert_eq!(mapping(&path)?, before);
+        Ok(())
     }
 
     #[test]
