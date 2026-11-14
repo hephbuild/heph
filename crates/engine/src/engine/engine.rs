@@ -528,6 +528,21 @@ impl Engine {
         LocalCacheWriteHold(Arc::clone(&self.sqlite_writer_gate))
     }
 
+    /// Override `cache.db`'s maintenance knobs: the end-of-request reclaim
+    /// policy (interval, floor, cap, chunk size), so a test does not wait an
+    /// hour.
+    pub fn set_cache_db_maintenance(
+        &self,
+        overrides: crate::engine::local_cache_sqlite::MaintenanceOverrides,
+    ) {
+        self.sqlite_writes.set_maintenance_overrides(overrides);
+    }
+
+    /// Where this engine's `cache.db` is.
+    pub fn cache_db_path(&self) -> std::path::PathBuf {
+        self.home.join("cache").join("cache.db")
+    }
+
     /// Run `hook` after every non-frozen codegen write-back — `copy` and
     /// `in_place` alike, on an executed run or a cache hit, and including one
     /// that found the tree already matching and wrote nothing — before the

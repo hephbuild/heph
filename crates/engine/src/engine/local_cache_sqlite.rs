@@ -1,3 +1,6 @@
+use crate::engine::cache_db_space::{
+    self, CompactReport, JOURNAL_SIZE_LIMIT_BYTES, MaintainKind, ReclaimPolicy,
+};
 use crate::engine::local_cache::{
     EntryWriter, Existence, LocalCache, NotFoundError, PendingWrite, SizedReader, TargetStream,
 };
@@ -6,7 +9,7 @@ use hcore::hartifactcontent;
 use hmodel::htaddr::Addr;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{Connection, OpenFlags};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::{Future, poll_fn};
 use std::io::{self, Seek};
 use std::path::PathBuf;
@@ -347,9 +350,29 @@ struct DeleteJob {
     slot: Arc<PendingSlot>,
 }
 
+/// A maintenance pass (see [`cache_db_space`]) for the writer thread, which runs
+/// it on its connection — the one every cache write goes through — and sends the
+/// outcome back on `reply`.
+struct MaintainJob {
+    kind: MaintainKind,
+    /// Polled at every chunk boundary; false abandons the pass there.
+    keep_going: Box<dyn Fn() -> bool + Send>,
+    reply: mpsc::Sender<Result<CompactReport>>,
+    /// Test hook, run on the writer thread after each chunk with the chunk's
+    /// index, before the queued writes are drained.
+    #[cfg(test)]
+    on_chunk: Option<ChunkHook>,
+}
+
+#[cfg(test)]
+type ChunkHook = Box<dyn FnMut(usize, &Connection) + Send>;
+
 enum WriterCmd {
     Write(WriteJob),
     Delete(DeleteJob),
+    /// Never part of a write batch: [`collect_batch`] sets it aside, and the
+    /// writer runs it once the batch it interrupted has committed.
+    Maintain(MaintainJob),
 }
 
 /// Test-only brake on the writer thread, held closed while a test observes the
@@ -435,9 +458,72 @@ pub struct LocalCacheSQLite {
     inline_threshold: usize,
     #[cfg(any(test, feature = "test-support"))]
     gate: Arc<WriterGate>,
+    /// Test overrides of the maintenance knobs, so a test does not wait out
+    /// the reclaim interval. See [`Self::set_maintenance_overrides`].
+    #[cfg(any(test, feature = "test-support"))]
+    overrides: Mutex<MaintenanceOverrides>,
+}
+
+/// See [`LocalCacheSQLite::set_maintenance_overrides`].
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MaintenanceOverrides {
+    /// Replaces [`ReclaimPolicy::default`] for the end-of-request reclaim.
+    pub policy: Option<ReclaimPolicy>,
 }
 
 impl LocalCacheSQLite {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_maintenance_overrides(&self, o: MaintenanceOverrides) {
+        *self.overrides.lock().expect("overrides poisoned") = o;
+    }
+
+    fn maintenance_overrides(&self) -> ReclaimPolicy {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            let o = *self.overrides.lock().expect("overrides poisoned");
+            o.policy.unwrap_or_default()
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        {
+            ReclaimPolicy::default()
+        }
+    }
+
+    /// Hand `kind` to the writer thread and wait for its report. Parks the
+    /// calling thread: callers are the bookkeeping lane and a blocking task.
+    fn maintain(
+        &self,
+        kind: MaintainKind,
+        keep_going: Box<dyn Fn() -> bool + Send>,
+        #[cfg(test)] on_chunk: Option<ChunkHook>,
+    ) -> Result<CompactReport> {
+        let (reply, rx) = mpsc::channel();
+        self.writer_tx()?
+            .send(WriterCmd::Maintain(MaintainJob {
+                kind,
+                keep_going,
+                reply,
+                #[cfg(test)]
+                on_chunk,
+            }))
+            .map_err(|_closed| anyhow::anyhow!("sqlite cache writer thread is gone"))?;
+        rx.recv()
+            .context("sqlite cache writer thread exited during maintenance")?
+    }
+
+    /// The end-of-request reclaim, after the `cache.history` trim: vacuum an
+    /// `INCREMENTAL` database if [`ReclaimPolicy::due`], within its time
+    /// budget. See [`cache_db_space`].
+    pub(crate) fn reclaim_after_trim(&self) -> Result<CompactReport> {
+        self.maintain(
+            MaintainKind::AfterTrim(self.maintenance_overrides()),
+            Box::new(|| true),
+            #[cfg(test)]
+            None,
+        )
+    }
+
     /// Resolve once every write queued before the call has committed.
     ///
     /// For a caller about to leave the process without the teardown that
@@ -561,6 +647,8 @@ impl LocalCacheSQLite {
             inline_threshold,
             #[cfg(any(test, feature = "test-support"))]
             gate: Arc::new(WriterGate::default()),
+            #[cfg(any(test, feature = "test-support"))]
+            overrides: Mutex::new(MaintenanceOverrides::default()),
         })
     }
 
@@ -648,18 +736,23 @@ impl LocalCacheSQLite {
             .with_context(|| format!("opening sqlite cache at {:?}", self.db_path))?;
         // Per-connection settings only; the persistent ones (journal mode,
         // auto-vacuum, page size) are the schema's, applied by `migrate_schema`.
-        conn.execute_batch(
+        // `journal_size_limit` truncates the WAL back to that size whenever it
+        // is reset, so a large batch or a vacuum does not leave it at its
+        // high-water mark.
+        conn.execute_batch(&format!(
             "PRAGMA busy_timeout = 10000;
              PRAGMA synchronous = NORMAL;
              PRAGMA foreign_keys = ON;
              PRAGMA temp_store = MEMORY;
              PRAGMA cache_size = -64000;
-             PRAGMA mmap_size = 268435456;",
-        )
+             PRAGMA mmap_size = 268435456;
+             PRAGMA journal_size_limit = {JOURNAL_SIZE_LIMIT_BYTES};"
+        ))
         .context("configuring sqlite cache write connection")?;
 
         let (tx, rx) = mpsc::channel::<WriterCmd>();
         let pending = Arc::clone(&self.pending);
+        let db_path = self.db_path.clone();
         #[cfg(any(test, feature = "test-support"))]
         let gate = Arc::clone(&self.gate);
         let handle = std::thread::Builder::new()
@@ -669,6 +762,7 @@ impl LocalCacheSQLite {
                     &mut conn,
                     &rx,
                     &pending,
+                    &db_path,
                     #[cfg(any(test, feature = "test-support"))]
                     &gate,
                 )
@@ -763,21 +857,36 @@ fn migrate_schema(db_path: &std::path::Path) -> Result<()> {
         // Another process migrated while this one waited for the lock.
         return Ok(());
     }
-    // Outside the transaction: neither can change inside one. Both persist in
-    // the file, and the order is load-bearing: the page size only takes effect
-    // on a database whose header is not written yet, and switching to WAL
-    // writes it — WAL first left every database at the 4 KiB default, which is
-    // what every pre-versioning database has. On such a database (version 0,
-    // already WAL) the page size is a silent no-op, which is harmless: it is a
-    // per-file setting every sqlite reads.
+    // Outside the transaction: none can change inside one. All persist in the
+    // file, and the order is load-bearing: the page size and auto-vacuum only
+    // take effect on a database whose header is not written yet, and switching
+    // to WAL writes it — WAL first left every database at the 4 KiB default
+    // and auto-vacuum NONE, which is what every pre-versioning database has.
+    // On such a database (version 0, already WAL) the page size is a silent
+    // no-op, which is harmless: it is a per-file setting every sqlite reads.
     //
-    // No `auto_vacuum`: nothing ever runs `incremental_vacuum`, so INCREMENTAL
-    // would only add pointer-map pages, and no existing database has it — the
-    // old open-time batch set it after WAL too, where it never took effect.
-    conn.execute_batch(
+    // `auto_vacuum = INCREMENTAL` only on a database with no tables yet: there
+    // it is free, and it lets the end-of-request reclaim return free pages to
+    // the filesystem (`cache_db_space`). An existing NONE database stays NONE
+    // on open — switching it takes a full `VACUUM`, a rewrite of the whole file
+    // that no open may stall on; `heph tool gc` does it when the disk has room.
+    // The mode lives in the header, so an older heph opens either kind.
+    let fresh: bool = conn
+        .query_row("SELECT count(*) = 0 FROM sqlite_master", [], |row| {
+            row.get(0)
+        })
+        .context("reading sqlite cache schema")?;
+    //
+    // Page size first: `auto_vacuum` ahead of it fixed the page size at the
+    // 4 KiB default (pinned by `a_fresh_database_gets_its_persistent_pragmas`).
+    conn.execute_batch(if fresh {
         "PRAGMA page_size = 8192;
-         PRAGMA journal_mode = WAL;",
-    )
+         PRAGMA auto_vacuum = INCREMENTAL;
+         PRAGMA journal_mode = WAL;"
+    } else {
+        "PRAGMA page_size = 8192;
+         PRAGMA journal_mode = WAL;"
+    })
     .context("setting sqlite cache persistent pragmas")?;
     conn.execute_batch(&format!(
         "BEGIN IMMEDIATE;
@@ -829,13 +938,19 @@ impl Drop for DrainOnExit<'_> {
 fn write_bytes(cmd: &WriterCmd) -> i64 {
     match cmd {
         WriterCmd::Write(job) => job.size,
-        WriterCmd::Delete(_) => 0,
+        WriterCmd::Delete(_) | WriterCmd::Maintain(_) => 0,
     }
 }
 
 /// Take `first` plus whatever is already queued, up to [`WRITE_BATCH_MAX`] jobs
-/// or [`WRITE_BATCH_MAX_BYTES`] of blob data — whichever comes first.
-fn collect_batch(first: WriterCmd, rx: &mpsc::Receiver<WriterCmd>) -> Vec<WriterCmd> {
+/// or [`WRITE_BATCH_MAX_BYTES`] of blob data — whichever comes first. A
+/// maintenance job met on the way ends the batch and goes onto `maintenance`
+/// instead: it is not a write, and the writes queued after it wait for it.
+fn collect_batch(
+    first: WriterCmd,
+    rx: &mpsc::Receiver<WriterCmd>,
+    maintenance: &mut VecDeque<MaintainJob>,
+) -> Vec<WriterCmd> {
     let mut batch = Vec::with_capacity(WRITE_BATCH_MAX);
     let mut batch_bytes = write_bytes(&first);
     batch.push(first);
@@ -843,6 +958,10 @@ fn collect_batch(first: WriterCmd, rx: &mpsc::Receiver<WriterCmd>) -> Vec<Writer
     // over the cap goes alone rather than dragging a second one in with it.
     while batch.len() < WRITE_BATCH_MAX && batch_bytes < WRITE_BATCH_MAX_BYTES {
         match rx.try_recv() {
+            Ok(WriterCmd::Maintain(job)) => {
+                maintenance.push_back(job);
+                break;
+            }
             Ok(cmd) => {
                 batch_bytes = batch_bytes.saturating_add(write_bytes(&cmd));
                 batch.push(cmd);
@@ -857,34 +976,119 @@ fn writer_loop(
     conn: &mut Connection,
     rx: &mpsc::Receiver<WriterCmd>,
     pending: &PendingTracker,
+    db_path: &std::path::Path,
     #[cfg(any(test, feature = "test-support"))] gate: &WriterGate,
 ) {
     let _drain = DrainOnExit(pending);
+    let mut maintenance: VecDeque<MaintainJob> = VecDeque::new();
     loop {
-        let first = match rx.recv() {
-            Ok(cmd) => cmd,
-            Err(_) => return,
+        let first = match maintenance.pop_front() {
+            Some(job) => WriterCmd::Maintain(job),
+            None => match rx.recv() {
+                Ok(cmd) => cmd,
+                Err(_) => return,
+            },
         };
 
         #[cfg(any(test, feature = "test-support"))]
         gate.wait_while_closed();
 
-        let mut batch = collect_batch(first, rx);
-
-        if let Err(e) = process_batch(conn, &mut batch) {
-            tracing::error!(error = %format!("{e:#}"), "sqlite cache writer: batch failed");
-        }
-
-        // Whether the batch succeeded or not, the pending slots must be released so that
-        // readers don't hang. On failure the readers will simply observe NotFound from the
-        // DB, which is the correct behavior for a write that didn't land.
-        for cmd in &batch {
-            match cmd {
-                WriterCmd::Write(j) => pending.complete(&j.key, &j.slot),
-                WriterCmd::Delete(j) => pending.complete(&j.key, &j.slot),
-            }
+        match first {
+            WriterCmd::Maintain(job) => run_maintenance(
+                conn,
+                rx,
+                pending,
+                db_path,
+                &mut maintenance,
+                #[cfg(any(test, feature = "test-support"))]
+                gate,
+                job,
+            ),
+            cmd => write_batch(conn, rx, pending, &mut maintenance, cmd),
         }
     }
+}
+
+/// Commit `first` and the writes queued behind it as one batch.
+fn write_batch(
+    conn: &mut Connection,
+    rx: &mpsc::Receiver<WriterCmd>,
+    pending: &PendingTracker,
+    maintenance: &mut VecDeque<MaintainJob>,
+    first: WriterCmd,
+) {
+    let mut batch = collect_batch(first, rx, maintenance);
+
+    if let Err(e) = process_batch(conn, &mut batch) {
+        tracing::error!(error = %format!("{e:#}"), "sqlite cache writer: batch failed");
+    }
+
+    // Whether the batch succeeded or not, the pending slots must be released so that
+    // readers don't hang. On failure the readers will simply observe NotFound from the
+    // DB, which is the correct behavior for a write that didn't land.
+    for cmd in &batch {
+        match cmd {
+            WriterCmd::Write(j) => pending.complete(&j.key, &j.slot),
+            WriterCmd::Delete(j) => pending.complete(&j.key, &j.slot),
+            WriterCmd::Maintain(_) => {}
+        }
+    }
+}
+
+/// Run one maintenance pass, committing the writes queued meanwhile between
+/// its chunks, so a vacuum delays a cache write by at most one chunk. A failure
+/// is the requester's to report; it never touches the write path.
+fn run_maintenance(
+    conn: &mut Connection,
+    rx: &mpsc::Receiver<WriterCmd>,
+    pending: &PendingTracker,
+    db_path: &std::path::Path,
+    maintenance: &mut VecDeque<MaintainJob>,
+    #[cfg(any(test, feature = "test-support"))] gate: &WriterGate,
+    job: MaintainJob,
+) {
+    let MaintainJob {
+        kind,
+        keep_going,
+        reply,
+        #[cfg(test)]
+        mut on_chunk,
+    } = job;
+    #[cfg(test)]
+    let mut chunk = 0usize;
+    let mut between = |conn: &mut Connection| -> bool {
+        #[cfg(test)]
+        {
+            if let Some(hook) = on_chunk.as_mut() {
+                hook(chunk, conn);
+            }
+            chunk += 1;
+        }
+        // Commit what queued up during the chunk. A closed channel means the
+        // cache is being dropped: stop at this boundary.
+        loop {
+            match rx.try_recv() {
+                Ok(WriterCmd::Maintain(job)) => maintenance.push_back(job),
+                Ok(cmd) => {
+                    #[cfg(any(test, feature = "test-support"))]
+                    gate.wait_while_closed();
+                    write_batch(conn, rx, pending, maintenance, cmd);
+                }
+                Err(mpsc::TryRecvError::Empty) => return true,
+                Err(mpsc::TryRecvError::Disconnected) => return false,
+            }
+        }
+    };
+    let res = cache_db_space::run(conn, db_path, &kind, &*keep_going, &mut between);
+    if res.is_err() {
+        // Whatever failed may have left a transaction open; the next write
+        // batch must not start inside it.
+        if !conn.is_autocommit() {
+            drop(conn.execute_batch("ROLLBACK;"));
+        }
+    }
+    // The requester may have given up waiting; the report then has no reader.
+    drop(reply.send(res));
 }
 
 fn process_batch(conn: &mut Connection, batch: &mut [WriterCmd]) -> Result<()> {
@@ -932,6 +1136,8 @@ fn process_batch(conn: &mut Connection, batch: &mut [WriterCmd]) -> Result<()> {
                     )
                 })?;
             }
+            // `collect_batch` never puts one in a batch.
+            WriterCmd::Maintain(_) => {}
         }
     }
 
@@ -1468,7 +1674,11 @@ mod tests {
         assert!(!open(&path)?.exists(&make_addr("pkg", "t"), "h", "a")?);
         assert_eq!(pragma::<i64>(&path, "page_size")?, 8192);
         assert_eq!(pragma::<String>(&path, "journal_mode")?, "wal");
-        assert_eq!(pragma::<i64>(&path, "auto_vacuum")?, 0, "auto_vacuum NONE");
+        assert_eq!(
+            pragma::<i64>(&path, "auto_vacuum")?,
+            2,
+            "auto_vacuum INCREMENTAL"
+        );
         Ok(())
     }
 
@@ -1614,7 +1824,11 @@ mod tests {
         Connection::open(&path)?.execute_batch(PRE_VERSIONING_DDL)?;
         assert_eq!(user_version(&path)?, SCHEMA_VERSION);
         assert_eq!(pragma::<i64>(&path, "page_size")?, 8192);
-        assert_eq!(pragma::<i64>(&path, "auto_vacuum")?, 0);
+        assert_eq!(
+            pragma::<i64>(&path, "auto_vacuum")?,
+            2,
+            "the previous binary keeps a new database INCREMENTAL"
+        );
 
         let lock = hwalk::migrate_lock::migrate_lock_path(&path);
         std::fs::remove_file(&lock)?;
@@ -1660,7 +1874,7 @@ mod tests {
         }
 
         let first = rx.recv().expect("first");
-        let batch = collect_batch(first, &rx);
+        let batch = collect_batch(first, &rx, &mut VecDeque::new());
 
         assert!(
             batch.len() < JOBS,
@@ -1684,7 +1898,7 @@ mod tests {
         tx.send(write_cmd("small", 1)).expect("send");
 
         let first = rx.recv().expect("first");
-        let batch = collect_batch(first, &rx);
+        let batch = collect_batch(first, &rx, &mut VecDeque::new());
 
         assert_eq!(
             batch.len(),
@@ -1707,7 +1921,7 @@ mod tests {
         }
 
         let first = rx.recv().expect("first");
-        let batch = collect_batch(first, &rx);
+        let batch = collect_batch(first, &rx, &mut VecDeque::new());
 
         assert_eq!(
             batch.len(),
@@ -1975,6 +2189,7 @@ mod tests {
         let slot_of = |cmd: &WriterCmd| match cmd {
             WriterCmd::Write(j) => j.slot.clone(),
             WriterCmd::Delete(j) => j.slot.clone(),
+            WriterCmd::Maintain(_) => panic!("no maintenance was queued"),
         };
         assert!(
             Arc::ptr_eq(&slot_of(&queued[0]), &first) && Arc::ptr_eq(&slot_of(&queued[1]), &second),
@@ -2764,6 +2979,339 @@ mod tests {
             got, "good bytes",
             "an abandoned rewrite must not replace the committed entry"
         );
+        Ok(())
+    }
+
+    // --- cache.db space reclaim -------------------------------------------
+
+    use crate::engine::cache_db_space::{CompactAction, VacuumMode, sidecar_path};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    const KIB: u64 = 1024;
+    /// Blobs [`fill_and_free`] writes then deletes, and their size: 160 pages
+    /// of 8 KiB, i.e. 20 chunks of [`small_policy`]'s 64 KiB.
+    const BULK_BLOBS: usize = 40;
+    const BULK_BLOB_BYTES: usize = 32 * 1024;
+
+    /// A reclaim policy at test scale: a 64 KiB floor, a cap no test database
+    /// reaches (100 % of the file, at most 100 MiB), 64 KiB chunks, and a
+    /// budget no test runs out of.
+    fn small_policy() -> ReclaimPolicy {
+        ReclaimPolicy {
+            interval: Duration::from_secs(60 * 60),
+            min_free_bytes: 64 * KIB,
+            cap_bytes: 100 * 1024 * KIB,
+            cap_percent: 100,
+            chunk_bytes: 64 * KIB,
+            budget: Duration::from_secs(60),
+        }
+    }
+
+    fn open_with(path: &std::path::Path, policy: ReclaimPolicy) -> Result<LocalCacheSQLite> {
+        let cache = open(path)?;
+        cache.set_maintenance_overrides(MaintenanceOverrides {
+            policy: Some(policy),
+        });
+        Ok(cache)
+    }
+
+    /// Write [`BULK_BLOBS`] blobs and delete them, leaving their pages free;
+    /// checkpoint the lot into the main file, then commit one more small row
+    /// so the WAL is not empty. `keep` survives.
+    fn fill_and_free(cache: &LocalCacheSQLite, path: &std::path::Path) -> Result<Addr> {
+        let addr = make_addr("pkg", "reclaim");
+        put(cache, &addr, "keep", b"kept bytes")?;
+        let blob = vec![0x5a; BULK_BLOB_BYTES];
+        for i in 0..BULK_BLOBS {
+            put(cache, &addr, &format!("bulk{i}"), &blob)?;
+        }
+        for i in 0..BULK_BLOBS {
+            cache.delete(&addr, "h", &format!("bulk{i}"))?;
+        }
+        Connection::open(path)?.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+        put(cache, &addr, "late", b"after the checkpoint")?;
+        assert!(cache.exists(&addr, "h", "late")?, "barrier");
+        Ok(addr)
+    }
+
+    /// What a reclaim can change, read from outside the cache.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Snap {
+        file: u64,
+        wal: u64,
+        free_pages: i64,
+        sidecar: Option<String>,
+    }
+
+    fn snap(path: &std::path::Path) -> Result<Snap> {
+        let mut wal = path.as_os_str().to_owned();
+        wal.push("-wal");
+        Ok(Snap {
+            file: std::fs::metadata(path)?.len(),
+            wal: std::fs::metadata(&wal).map_or(0, |m| m.len()),
+            free_pages: pragma::<i64>(path, "freelist_count")?,
+            sidecar: std::fs::read_to_string(sidecar_path(path)).ok(),
+        })
+    }
+
+    fn unix_secs(t: SystemTime) -> u64 {
+        t.duration_since(UNIX_EPOCH)
+            .expect("after the epoch")
+            .as_secs()
+    }
+
+    fn write_sidecar(path: &std::path::Path, at: SystemTime) -> Result<()> {
+        std::fs::write(sidecar_path(path), format!("{}\n", unix_secs(at)))?;
+        Ok(())
+    }
+
+    /// The row `fill_and_free` keeps still reads back.
+    fn assert_kept(cache: &LocalCacheSQLite, addr: &Addr) -> Result<()> {
+        let mut data = Vec::new();
+        cache
+            .reader(addr, "h", "keep")?
+            .reader
+            .read_to_end(&mut data)?;
+        assert_eq!(data, b"kept bytes");
+        Ok(())
+    }
+
+    /// Run the end-of-request reclaim on a freshly filled database with the
+    /// sidecar set to `sidecar` (`None`: absent) and `policy`, and return the
+    /// state before, the state after, and what it reported.
+    fn reclaim_case(
+        policy: ReclaimPolicy,
+        sidecar: Option<SystemTime>,
+    ) -> Result<(Snap, Snap, CompactAction)> {
+        let dir = tempdir()?;
+        let path = dir.path().join("cache.db");
+        let cache = open_with(&path, policy)?;
+        let addr = fill_and_free(&cache, &path)?;
+        if let Some(at) = sidecar {
+            write_sidecar(&path, at)?;
+        }
+        let before = snap(&path)?;
+        assert!(
+            before.free_pages >= 100 && before.wal > 0,
+            "setup left free pages and a WAL: {before:?}"
+        );
+        let report = cache.reclaim_after_trim()?;
+        let after = snap(&path)?;
+        assert_kept(&cache, &addr)?;
+        Ok((before, after, report.action))
+    }
+
+    /// A reclaim that ran: the file shrank, no free page is left, the WAL is
+    /// truncated and the sidecar moved to now.
+    fn assert_vacuumed(before: &Snap, after: &Snap, action: &CompactAction) {
+        assert!(
+            after.file < before.file,
+            "file shrank: {before:?} → {after:?}"
+        );
+        assert!(
+            matches!(action, CompactAction::Vacuumed { complete: true, freed_bytes } if *freed_bytes > 0),
+            "{action:?}"
+        );
+        assert_eq!(after.free_pages, 0, "{before:?} → {after:?}");
+        assert_eq!(after.wal, 0, "WAL truncated: {before:?} → {after:?}");
+        let now = unix_secs(SystemTime::now());
+        let recorded: u64 = after
+            .sidecar
+            .as_deref()
+            .expect("sidecar written")
+            .trim()
+            .parse()
+            .expect("sidecar is unix seconds");
+        assert!(
+            after.sidecar != before.sidecar && now.abs_diff(recorded) <= 5,
+            "sidecar moved to now ({now}): {before:?} → {after:?}"
+        );
+    }
+
+    fn assert_untouched(before: &Snap, after: &Snap, action: &CompactAction) {
+        assert_eq!(*action, CompactAction::Unchanged);
+        assert_eq!(before, after, "a reclaim that is not due changes nothing");
+    }
+
+    const TEN_MIN: Duration = Duration::from_secs(10 * 60);
+    const TWO_HOURS: Duration = Duration::from_secs(2 * 60 * 60);
+
+    /// (1) The interval has not elapsed and free pages are under the cap.
+    #[test]
+    fn reclaim_waits_out_the_interval_below_the_cap() -> Result<()> {
+        let (before, after, action) =
+            reclaim_case(small_policy(), Some(SystemTime::now() - TEN_MIN))?;
+        assert_untouched(&before, &after, &action);
+        Ok(())
+    }
+
+    /// (2) The interval has elapsed and free pages are at the floor.
+    #[test]
+    fn reclaim_runs_once_the_interval_elapsed_above_the_floor() -> Result<()> {
+        let (before, after, action) =
+            reclaim_case(small_policy(), Some(SystemTime::now() - TWO_HOURS))?;
+        assert_vacuumed(&before, &after, &action);
+        Ok(())
+    }
+
+    /// (3) The interval has not elapsed, but free pages reached the cap.
+    #[test]
+    fn reclaim_runs_inside_the_interval_at_the_cap() -> Result<()> {
+        let policy = ReclaimPolicy {
+            cap_bytes: 256 * KIB,
+            ..small_policy()
+        };
+        let (before, after, action) = reclaim_case(policy, Some(SystemTime::now() - TEN_MIN))?;
+        assert_vacuumed(&before, &after, &action);
+        Ok(())
+    }
+
+    /// (4) No record of a last vacuum, or one in the future (the clock moved
+    /// back), counts as the interval elapsed.
+    #[test]
+    fn reclaim_runs_with_a_missing_or_future_sidecar() -> Result<()> {
+        let (before, after, action) = reclaim_case(small_policy(), None)?;
+        assert!(before.sidecar.is_none());
+        assert_vacuumed(&before, &after, &action);
+
+        let future = SystemTime::now() + Duration::from_secs(24 * 60 * 60);
+        let (before, after, action) = reclaim_case(small_policy(), Some(future))?;
+        assert_vacuumed(&before, &after, &action);
+        Ok(())
+    }
+
+    /// (5) The interval has elapsed but free pages are under the floor.
+    #[test]
+    fn reclaim_skips_free_pages_under_the_floor() -> Result<()> {
+        let policy = ReclaimPolicy {
+            min_free_bytes: 100 * 1024 * KIB,
+            ..small_policy()
+        };
+        let (before, after, action) = reclaim_case(policy, Some(SystemTime::now() - TWO_HOURS))?;
+        assert_untouched(&before, &after, &action);
+        Ok(())
+    }
+
+    /// A database from before `auto_vacuum = INCREMENTAL`, as every existing
+    /// one is: page size 8 KiB, WAL, the schema at version 1, mode NONE.
+    fn none_db(path: &std::path::Path, addr: &Addr) -> Result<()> {
+        let conn = Connection::open(path)?;
+        conn.execute_batch(
+            "PRAGMA page_size = 8192;
+             PRAGMA journal_mode = WAL;
+             CREATE TABLE artifacts (
+                 addr   TEXT NOT NULL,
+                 hashin TEXT NOT NULL,
+                 name   TEXT NOT NULL,
+                 data   BLOB NOT NULL,
+                 PRIMARY KEY (addr, hashin, name)
+             );
+             CREATE INDEX idx_artifacts_addr_hashin ON artifacts (addr, hashin);
+             PRAGMA user_version = 1;",
+        )?;
+        conn.execute(
+            "INSERT INTO artifacts (addr, hashin, name, data) VALUES (?1, 'h', 'keep', ?2)",
+            rusqlite::params![LocalCacheSQLite::key(addr), b"kept bytes".as_slice()],
+        )?;
+        Ok(())
+    }
+
+    /// The new binary leaves an existing NONE database NONE — converting it is
+    /// a full rewrite, `heph tool gc`'s to do — keeps its rows, writes to it,
+    /// and its end-of-request reclaim does nothing to it.
+    #[test]
+    fn an_existing_none_database_stays_none_and_keeps_its_rows() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("cache.db");
+        let addr = make_addr("pkg", "reclaim");
+        none_db(&path, &addr)?;
+        assert_eq!(pragma::<i64>(&path, "auto_vacuum")?, 0);
+
+        let cache = open_with(&path, small_policy())?;
+        assert_kept(&cache, &addr)?;
+        fill_and_free(&cache, &path)?;
+        assert_eq!(pragma::<i64>(&path, "auto_vacuum")?, 0, "still NONE");
+        assert_eq!(pragma::<i64>(&path, "page_size")?, 8192);
+
+        let before = snap(&path)?;
+        let report = cache.reclaim_after_trim()?;
+        assert_eq!(report.before.mode, VacuumMode::None);
+        assert_untouched(&before, &snap(&path)?, &report.action);
+        assert_kept(&cache, &addr)?;
+        Ok(())
+    }
+
+    /// A vacuum is chunked: a write queued while it runs commits at the next
+    /// chunk boundary, not after the last chunk.
+    #[test]
+    fn a_write_queued_during_a_vacuum_commits_between_chunks() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("cache.db");
+        let cache = open_with(&path, small_policy())?;
+        let addr = fill_and_free(&cache, &path)?;
+
+        // Per chunk: (index, rows named `mid` visible on the writer connection).
+        let seen: Arc<Mutex<Vec<(usize, i64)>>> = Arc::default();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let (queued_tx, queued_rx) = mpsc::channel::<()>();
+        let hook: ChunkHook = Box::new({
+            let seen = Arc::clone(&seen);
+            move |chunk, conn: &Connection| {
+                let n: i64 = conn
+                    .query_row(
+                        "SELECT count(*) FROM artifacts WHERE name = 'mid'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .expect("count mid");
+                seen.lock().expect("seen").push((chunk, n));
+                if chunk == 0 {
+                    go_tx.send(()).expect("signal the writer");
+                    queued_rx
+                        .recv_timeout(Duration::from_secs(30))
+                        .expect("the write was queued");
+                }
+            }
+        });
+
+        let report = std::thread::scope(|s| -> Result<CompactReport> {
+            let (cache, addr) = (&cache, &addr);
+            s.spawn(move || {
+                go_rx.recv().expect("go");
+                put(cache, addr, "mid", b"queued mid-vacuum").expect("queue mid");
+                queued_tx.send(()).expect("ack");
+            });
+            cache.maintain(
+                MaintainKind::AfterTrim(small_policy()),
+                Box::new(|| true),
+                Some(hook),
+            )
+        })?;
+
+        assert!(
+            matches!(
+                report.action,
+                CompactAction::Vacuumed { complete: true, .. }
+            ),
+            "{report:?}"
+        );
+        let seen = seen.lock().expect("seen").clone();
+        assert_eq!(
+            seen.first(),
+            Some(&(0, 0)),
+            "not committed before: {seen:?}"
+        );
+        assert_eq!(
+            seen.get(1),
+            Some(&(1, 1)),
+            "committed at the first boundary after it was queued: {seen:?}"
+        );
+        assert!(
+            seen.len() >= 4,
+            "the vacuum went on for more chunks after the write: {seen:?}"
+        );
+        assert!(cache.exists(&addr, "h", "mid")?);
+        assert_eq!(snap(&path)?.free_pages, 0);
         Ok(())
     }
 }

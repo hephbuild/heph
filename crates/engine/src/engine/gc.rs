@@ -22,6 +22,7 @@
 //! same manifest.
 
 use crate::engine::Engine;
+use crate::engine::cache_db_space::CompactAction;
 use crate::engine::error::TargetNotFoundError;
 use crate::engine::local_cache::{Existence, MANIFEST_V1};
 use crate::engine::request_state::RequestState;
@@ -668,6 +669,29 @@ impl Engine {
                 .await;
 
         Ok(stats)
+    }
+
+    /// The end-of-request reclaim, run by the deferred trim batch once it has
+    /// removed something: vacuum `cache.db` if it is `INCREMENTAL` and the
+    /// [`ReclaimPolicy`](crate::engine::ReclaimPolicy) says it is due. Never
+    /// fails the run; a failure is logged and the next request tries again.
+    pub(crate) fn reclaim_cache_db_after_trim(&self) {
+        match self.sqlite_writes.reclaim_after_trim() {
+            Ok(report) => {
+                if report.action != CompactAction::Unchanged {
+                    tracing::debug!(
+                        action = ?report.action,
+                        file_bytes = report.after.file_bytes,
+                        free_bytes = report.after.free_bytes,
+                        "cache.db reclaimed after the history trim",
+                    );
+                }
+            }
+            Err(e) => tracing::warn!(
+                error = %format!("{e:#}"),
+                "cache.db reclaim after the history trim failed; the next request retries",
+            ),
+        }
     }
 
     /// Phase 1: resolve every cached target's [`Decision`] under one shared,
