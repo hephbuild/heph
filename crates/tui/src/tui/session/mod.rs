@@ -281,9 +281,6 @@ impl SessionSlot {
     /// The front end's one call: where sessions go (from
     /// [`SessionRoot::from_env`]), and the command line to record.
     pub fn configure(&self, root: Result<Option<SessionRoot>, String>, argv: Vec<String>) {
-        let cwd = std::env::current_dir()
-            .ok()
-            .map(|p| p.to_string_lossy().into_owned());
         self.with(|s| {
             s.setup = match root {
                 Ok(Some(root)) => Setup::Root(root),
@@ -291,14 +288,15 @@ impl SessionSlot {
                 Err(why) => Setup::Unavailable(why),
             };
             s.argv = argv;
-            s.cwd = cwd;
         });
     }
 
     /// The workspace, once bootstrap has resolved it. Recorded in `meta.json`
-    /// of a session opened after this.
-    pub fn set_workspace(&self, root: &Path, home_dir: &Path) {
+    /// of a session opened after this. `cwd` is the directory heph works from
+    /// (`HEPH_CWD` when set), not the process's own cwd.
+    pub fn set_workspace(&self, cwd: &Path, root: &Path, home_dir: &Path) {
         self.with(|s| {
+            s.cwd = Some(cwd.to_string_lossy().into_owned());
             s.workspace_root = Some(root.to_string_lossy().into_owned());
             s.home_dir = Some(home_dir.to_string_lossy().into_owned());
         });

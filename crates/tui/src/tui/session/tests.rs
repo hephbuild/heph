@@ -498,9 +498,20 @@ async fn run_app_records_through_the_slot() {
         SessionRoot::from_env(None, Some(home.path().as_os_str())),
         vec!["heph".into()],
     );
+    // The cwd heph resolved (`HEPH_CWD`), not the process's own.
+    let ws = tempfile::tempdir().expect("tempdir");
+    let cwd = ws.path().join("sub");
+    slot.set_workspace(&cwd, ws.path(), &ws.path().join(".heph"));
     assert!(run_in(&slot, true).await);
     let dir = slot.dir().expect("a session opened");
     assert!(dir.starts_with(home.path().join(".heph").join(SESSIONS_DIR)));
+    let meta =
+        SessionMeta::decode(&std::fs::read(dir.join(files::META)).expect("meta")).expect("meta");
+    assert_eq!(meta.cwd.as_deref(), Some(&*cwd.to_string_lossy()));
+    assert_eq!(
+        meta.workspace_root.as_deref(),
+        Some(&*ws.path().to_string_lossy())
+    );
     slot.finish(Some(0));
     let (records, _) = read_records(&dir);
     assert_eq!(
