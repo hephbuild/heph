@@ -555,29 +555,15 @@ fn copy_up_layer_entry(
             let mut reader = (layer.open)()
                 .map_err(|e| std::io::Error::other(format!("open layer reader: {e}")))?;
             reader.seek(SeekFrom::Start(entry.data_offset))?;
-            let mut remaining = entry.size as usize;
             let mut out = fs::OpenOptions::new()
                 .write(true)
                 .create(true)
                 .truncate(true)
                 .mode(UPPER_FILE_MODE)
                 .open(dst)?;
-            let mut buf = vec![0u8; 64 * 1024];
-            while remaining > 0 {
-                let want = remaining.min(buf.len());
-                #[expect(clippy::indexing_slicing, reason = "want <= buf.len() by construction")]
-                let n = reader.read(&mut buf[..want])?;
-                if n == 0 {
-                    break;
-                }
-                #[expect(
-                    clippy::indexing_slicing,
-                    reason = "n <= buf.len() by Read::read contract"
-                )]
-                let chunk = &buf[..n];
-                std::io::Write::write_all(&mut out, chunk)?;
-                remaining = remaining.saturating_sub(n);
-            }
+            // `io::copy` keeps reading past short reads and retries
+            // `Interrupted`; `take` stops it at the entry's end.
+            std::io::copy(&mut reader.take(entry.size), &mut out)?;
             Ok(())
         }
         IndexEntryKind::Symlink(target) => std::os::unix::fs::symlink(target, dst),
@@ -760,25 +746,10 @@ impl LayeredFs {
                 layer,
                 data_offset,
                 want,
-            }) => {
-                let mut buf = vec![0u8; want];
-                match (layer.open)() {
-                    Ok(mut reader) => {
-                        if reader.seek(SeekFrom::Start(data_offset)).is_err() {
-                            Some(ReadHit::IsDir)
-                        } else {
-                            match reader.read(&mut buf) {
-                                Ok(n) => {
-                                    buf.truncate(n);
-                                    Some(ReadHit::Bytes(buf))
-                                }
-                                Err(_) => Some(ReadHit::IsDir),
-                            }
-                        }
-                    }
-                    Err(_) => Some(ReadHit::IsDir),
-                }
-            }
+            }) => match read_layer_range(&layer, data_offset, want) {
+                Ok(buf) => Some(ReadHit::Bytes(buf)),
+                Err(_) => Some(ReadHit::IsDir),
+            },
             None => None,
         };
         match outcome {
@@ -1231,10 +1202,26 @@ const ENOATTR: i32 = libc::ENOATTR;
 #[cfg(not(target_os = "macos"))]
 const ENOATTR: i32 = libc::ENODATA;
 
-fn read_upper(path: &Path, offset: u64, size: u32) -> std::io::Result<Vec<u8>> {
-    let mut f = fs::File::open(path)?;
-    f.seek(SeekFrom::Start(offset))?;
-    let mut buf = vec![0u8; size as usize];
+/// The `want` bytes of a layer's byte source at `data_offset`, fewer only at
+/// the end of the source.
+///
+/// A FUSE reply shorter than the request reads as end of file, so a single
+/// `read` is not enough: a reader may return short at any point (a seekable
+/// zstd decoder does at every frame boundary), and the rest of the file would
+/// come back as zeros.
+fn read_layer_range(layer: &Layer, data_offset: u64, want: usize) -> std::io::Result<Vec<u8>> {
+    let mut reader =
+        (layer.open)().map_err(|e| std::io::Error::other(format!("open layer reader: {e}")))?;
+    reader.seek(SeekFrom::Start(data_offset))?;
+    let mut buf = vec![0u8; want];
+    let n = read_full(&mut reader, &mut buf)?;
+    buf.truncate(n);
+    Ok(buf)
+}
+
+/// Fill `buf` from `reader`, stopping early only at end of input. Returns the
+/// bytes read; `Interrupted` is retried.
+fn read_full(reader: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
     let mut filled = 0usize;
     while filled < buf.len() {
         #[expect(
@@ -1242,11 +1229,21 @@ fn read_upper(path: &Path, offset: u64, size: u32) -> std::io::Result<Vec<u8>> {
             reason = "filled <= buf.len() loop invariant"
         )]
         let tail = &mut buf[filled..];
-        match f.read(tail)? {
-            0 => break,
-            n => filled += n,
+        match reader.read(tail) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
         }
     }
+    Ok(filled)
+}
+
+fn read_upper(path: &Path, offset: u64, size: u32) -> std::io::Result<Vec<u8>> {
+    let mut f = fs::File::open(path)?;
+    f.seek(SeekFrom::Start(offset))?;
+    let mut buf = vec![0u8; size as usize];
+    let filled = read_full(&mut f, &mut buf)?;
     buf.truncate(filled);
     Ok(buf)
 }
@@ -1574,6 +1571,55 @@ mod tests {
         std::sync::Arc::new(Layer::new(index, opener))
     }
 
+    /// A reader that returns at most `max` bytes per `read`, the way
+    /// `SeekableDecoder` stops at a frame boundary.
+    struct ShortReads<R> {
+        inner: R,
+        max: usize,
+    }
+
+    impl<R: Read> Read for ShortReads<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = buf.len().min(self.max);
+            self.inner.read(&mut buf[..n])
+        }
+    }
+
+    impl<R: Seek> Seek for ShortReads<R> {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    fn short_read_layer(bytes: Vec<u8>, max: usize) -> std::sync::Arc<Layer> {
+        let index = TarIndex::build(Cursor::new(bytes.clone())).expect("index");
+        let opener: LayerOpener = Box::new(move || {
+            Ok(Box::new(ShortReads {
+                inner: Cursor::new(bytes.clone()),
+                max,
+            }))
+        });
+        std::sync::Arc::new(Layer::new(index, opener))
+    }
+
+    /// Content no two offsets of which repeat within a short window, so a
+    /// misplaced or zero-filled byte shows.
+    fn patterned(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    #[test]
+    fn layer_read_fills_the_request_across_short_reads() {
+        let content = patterned(10_000);
+        let layer = short_read_layer(pack(&[("f.bin", &content)]), 1000);
+        let entry = layer.index.entries.get(Path::new("f.bin")).expect("entry");
+        // Spans several 1000-byte short reads, starting mid-chunk.
+        let (off, want) = (1500usize, 6000usize);
+        let got = read_layer_range(&layer, entry.data_offset + off as u64, want).expect("read");
+        assert_eq!(got.len(), want, "short read returned as EOF");
+        assert_eq!(got, content[off..off + want]);
+    }
+
     #[test]
     fn build_layer_dirs_materializes_implicit_parents() {
         let layer = layer_from_tar(pack(&[("a/b/c.txt", b"x"), ("a/d.txt", b"y")]));
@@ -1630,6 +1676,17 @@ mod tests {
         fs.copy_up(Path::new("dir/f.txt")).expect("copy_up");
         let bytes = std::fs::read(upper.path().join("dir/f.txt")).expect("read upper");
         assert_eq!(bytes, b"layered");
+    }
+
+    #[test]
+    fn copy_up_copies_whole_file_across_short_reads() {
+        let content = patterned(10_000);
+        let layer = short_read_layer(pack(&[("f.bin", &content)]), 1000);
+        let upper = tempfile::tempdir().expect("upper");
+        let fs = LayeredFs::new(vec![layer], upper.path().to_path_buf());
+        fs.copy_up(Path::new("f.bin")).expect("copy_up");
+        let bytes = std::fs::read(upper.path().join("f.bin")).expect("read upper");
+        assert_eq!(bytes, content);
     }
 
     /// Regression test for a lock-scope bug: `copy_up` used to run the
