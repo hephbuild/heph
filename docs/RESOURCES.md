@@ -209,10 +209,21 @@ bounds the build sandboxes on disk, **running or awaiting removal**:
   waiting run, the same reason no other pool's head is overtaken.
 
 A `cpu: 0` managed target needs a sandbox slot, so it is no longer zero-cost
-and queues like any other run. When removal falls behind, runs wait in
-admission for `sandbox` and it shows as any other pool wait does (`⧗ //a:b
-waits for sandbox 1 (0 free, …)`, the TUI header's `sandbox <held>/<capacity>`,
-the in-flight report).
+and queues like any other run.
+
+**If builds stall on `sandbox`, sandboxes are being removed slower than runs
+create them.** Every surface names the removals still owed, the cause of the
+wait (`AdmissionWaitStart.removals_pending`, set on a `sandbox` wait only):
+
+- the wait row: `⧗ //a:b waits for sandbox 1 (0 free, 2 ahead, 41s) —
+  cleanup is behind: 3 removals pending`;
+- the TUI header, once a wait passes the notice threshold:
+  `sandbox: 4 waiting (3 removals pending)`;
+- the in-flight report's `pools` line: `…, sandbox 8/8; 4 queued; 3 removals
+  pending`.
+
+Raise the pool only if the disk can hold that many more sandboxes: the bound
+is what keeps a backlog of removals from filling it.
 
 ## Reading the allotment
 
@@ -316,11 +327,15 @@ CPUs, `bytes` human-sized, `count` as an integer), from the `units` that
 
 - The TUI header shows `cpu` as worker cells and every other pool that
   something holds as `<pool> <held>/<capacity>` (an unbounded one as just
-  `<pool> <held>`, e.g. `tokens 5`).
+  `<pool> <held>`, e.g. `tokens 5`), and a pool with announced waits with
+  their count (`gpu 1/1, 2 waiting`). `sandbox`, whose slots no running
+  target reports holding, shows only its waits: `sandbox: 4 waiting (3
+  removals pending)`.
 - A clamped run's TUI row, CI `running` line and GitHub Actions report entry
   say so: `[cpu 16→4]`, `[scratch_disk 8.0 GiB→4.0 GiB]`.
 - A wait that outlasts the notice threshold (5 s) is announced as
   `AdmissionWaitStart` / `AdmissionWaitEnd { addr, pool, need, free, ahead }`
+  (plus `removals_pending` on a `sandbox` wait, [above](#the-sandbox-pool))
   and rendered as a row in the TUI and the GitHub Actions report:
 
   ```
@@ -331,7 +346,8 @@ CPUs, `bytes` human-sized, `count` as an integer), from the `units` that
   `queued_ms`, how long the run waited, so a wait under the threshold is
   still answerable from the event stream.
 - The in-flight report (SIGQUIT) prints each pool's held/capacity in its
-  unit, the queue length, and what the head waits for and for how long.
+  unit, the queue length, the sandbox removals still owed when there are
+  any, and what the head waits for and for how long.
 
 ## Sizing a declaration
 
@@ -445,3 +461,10 @@ change (plugin ABI 0.17.3 → 0.17.4, patch, lane `^0.17.0`):
   empty allotment, so a `${resource:…}` reference fails its run.
 - **`.hephconfig`.** `resources:` is refused loudly by an older heph
   (`ConfigYaml` denies unknown fields).
+- **`sandbox` is now the engine's pool.** A pool of your own named `sandbox`
+  must be renamed: a target may no longer declare or read it, and every
+  managed run takes one slot of it. A `cpu: 0` managed target, admitted at
+  once before, now queues for its slot.
+- **`AdmissionWaitStart.removals_pending`** is a new optional event field,
+  absent from an older host's frames and omitted when unset, so a consumer
+  built against an older `hcore` decodes the new frames unchanged.

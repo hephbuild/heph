@@ -766,7 +766,7 @@ impl Engine {
                         let addr_str = addr.format();
                         crate::engine::event::emit_scope(
                             rs,
-                            admission_wait_start(addr_str.clone(), &info),
+                            admission_wait_start(addr_str.clone(), &info, pool.removals_pending()),
                             move |_| crate::engine::event::BuildEventKind::AdmissionWaitEnd {
                                 addr: addr_str,
                             },
@@ -914,10 +914,12 @@ static SANDBOX_IMPLICIT: std::sync::LazyLock<(hplugin::provider::PoolName, u64)>
 
 /// The `AdmissionWaitStart` event for a queued request: the first pool it does
 /// not fit in, or — fitting everywhere but queued behind others — the first it
-/// needs.
+/// needs. On a `sandbox` wait it carries `removals_pending`, the pool's count
+/// of finished runs whose sandbox has not been removed yet: the wait's cause.
 fn admission_wait_start(
     addr: String,
     info: &crate::engine::resource_pool::WaitInfo,
+    removals_pending: u64,
 ) -> crate::engine::event::BuildEventKind {
     // An unbounded pool (`free: None`) never holds a request back, so it is
     // named only when every pool the request needs is unbounded.
@@ -927,8 +929,12 @@ fn admission_wait_start(
         .find(|p| p.free.is_some_and(|f| p.need > f))
         .or_else(|| info.pools.iter().find(|p| p.free.is_some()))
         .or_else(|| info.pools.first());
+    let removals_pending = pool
+        .is_some_and(|p| p.pool.as_str() == hplugin::provider::PoolName::SANDBOX)
+        .then_some(removals_pending);
     crate::engine::event::BuildEventKind::AdmissionWaitStart {
         addr,
+        removals_pending,
         pool: pool.map_or_else(String::new, |p| p.pool.as_str().to_owned()),
         need: pool.map_or(0, |p| p.need),
         free: pool.map_or(0, |p| p.free.unwrap_or(u64::MAX)),

@@ -89,6 +89,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Instant;
 use tokio::sync::oneshot;
@@ -215,6 +216,12 @@ impl ResourcePool {
         ResourceSnapshot {
             main: self.main.snapshot(),
         }
+    }
+
+    /// How many finished runs' sandbox removals have not returned yet
+    /// ([`Reservation::into_removal`]), each holding its `sandbox` slot.
+    pub fn removals_pending(&self) -> u64 {
+        self.main.removals.load(Ordering::Acquire)
     }
 
     /// The request plus `implicit` as `(pool index, granted amount)` in the
@@ -496,6 +503,9 @@ struct Lane {
     /// Index of the `cpu` pool in `names`; `None` if there is none.
     cpu_idx: Option<usize>,
     state: Mutex<State>,
+    /// Live [`PendingRemoval`]s: grants a finished run still holds until its
+    /// sandbox is removed. Diagnostic only; nothing is admitted by it.
+    removals: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -532,6 +542,7 @@ impl Lane {
             names: names.into_boxed_slice(),
             capacity: capacity.into_boxed_slice(),
             cpu_idx,
+            removals: AtomicU64::new(0),
         })
     }
 
@@ -689,6 +700,7 @@ impl Lane {
             pools,
             queued: st.waiters.len(),
             head,
+            removals_pending: self.removals.load(Ordering::Acquire),
         }
     }
 
@@ -805,6 +817,33 @@ impl Reservation {
             armed: self.armed,
         })
     }
+
+    /// Hold this grant for a sandbox removal: counted in
+    /// [`ResourcePool::removals_pending`] from now until the returned guard
+    /// drops, which uncounts it and then releases the grant, so a waiter the
+    /// release admits never sees its own wait's cause still counted.
+    pub fn into_removal(self) -> PendingRemoval {
+        self.lane.removals.fetch_add(1, Ordering::AcqRel);
+        PendingRemoval { reservation: self }
+    }
+}
+
+/// A [`Reservation`] held until a finished run's sandbox has been removed
+/// ([`Reservation::into_removal`]). Dropping it ends the removal's count and
+/// returns the grant.
+#[derive(Debug)]
+pub struct PendingRemoval {
+    reservation: Reservation,
+}
+
+impl Drop for PendingRemoval {
+    fn drop(&mut self) {
+        // Before the field drops, which is the release.
+        self.reservation
+            .lane
+            .removals
+            .fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl Drop for Reservation {
@@ -914,6 +953,9 @@ pub struct LaneSnapshot {
     pub queued: usize,
     /// What the head of the queue waits for: only the pools it does not fit.
     pub head: Option<HeadSnapshot>,
+    /// Finished runs whose sandbox removal has not returned yet, each still
+    /// holding its `sandbox` slot ([`Reservation::into_removal`]).
+    pub removals_pending: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

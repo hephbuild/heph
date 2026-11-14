@@ -684,3 +684,66 @@ target(name = "conf", driver = "template", src = file("conf.j2"), out = "conf",
     all_capacity_back(&engine).await;
     Ok(())
 }
+
+/// A run waiting on `sandbox` names its cause: the `AdmissionWaitStart` it
+/// emits carries `removals_pending`, here busy's removal held by the gate,
+/// and the count is back to 0 once that removal returns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sandbox_wait_reports_the_removals_pending() -> anyhow::Result<()> {
+    use heph::engine::event::{BuildEventKind, EventReceiver};
+    let tmp = tempfile::tempdir()?;
+    let root = tmp.path();
+    write_build(
+        root,
+        "p",
+        &format!(
+            "{}{}",
+            target("busy", "echo busy > $OUT", None),
+            target("parked", "echo parked > $OUT", None),
+        ),
+    );
+    let gate = RemovalGate::closed();
+    let engine = engine_with(root, 1, |e| {
+        e.set_sandbox_removal_gate(&gate);
+        e.set_admission_notice(Duration::from_millis(50));
+    })?;
+
+    let busy = exhaust_the_pool(&engine).await?;
+    let pending = |e: &Engine| snapshot(e).map(|s| s.main.removals_pending);
+    assert_eq!(pending(&engine), Some(1), "busy's removal is held");
+
+    let (tx, mut rx): (_, EventReceiver) = tokio::sync::mpsc::unbounded_channel();
+    let rs = engine.new_state_with_events(false, Some(tx));
+    let parked = tokio::spawn({
+        let (engine, rs) = (Arc::clone(&engine), Arc::clone(&rs));
+        async move { build_in(&engine, &rs, &["//p:parked".to_owned()]).await }
+    });
+    let start = loop {
+        let ev = tokio::time::timeout(DEADLINE, rx.recv())
+            .await
+            .map_err(|_elapsed| anyhow::anyhow!("no AdmissionWaitStart for parked"))?
+            .ok_or_else(|| anyhow::anyhow!("the event stream closed first"))?;
+        if let BuildEventKind::AdmissionWaitStart {
+            addr,
+            pool,
+            removals_pending,
+            ..
+        } = ev.kind
+        {
+            break (addr, pool, removals_pending);
+        }
+    };
+    assert_eq!(
+        start,
+        ("//p:parked".to_owned(), "sandbox".to_owned(), Some(1)),
+        "the wait names sandbox and the one removal owed"
+    );
+
+    gate.open();
+    tokio::time::timeout(DEADLINE, parked).await???;
+    drain(rs).await;
+    drain(busy).await;
+    all_capacity_back(&engine).await;
+    assert_eq!(pending(&engine), Some(0), "every removal returned");
+    Ok(())
+}

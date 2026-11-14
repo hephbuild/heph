@@ -373,11 +373,14 @@ impl std::fmt::Debug for SandboxTeardown {
     }
 }
 
-/// `job`, releasing `slot` (when there is one) once it has run — whether it
+/// `job`, counted in [`ResourcePool::removals_pending`] from now and
+/// releasing `slot` (when there is one) once it has run — whether it
 /// removed, declined (a successor owns the path), failed or panicked — or
 /// when the job is dropped unrun (a closed lane). The release runs on the
 /// reclaim lane's OS thread; `Reservation`'s drop needs no runtime and wakes
 /// a queued tokio waiter (`resource_pool`'s module docs).
+///
+/// [`ResourcePool::removals_pending`]: crate::engine::resource_pool::ResourcePool::removals_pending
 fn releasing(
     job: SandboxCleanupJob,
     slot: Option<crate::engine::resource_pool::Reservation>,
@@ -386,6 +389,9 @@ fn releasing(
     let Some(slot) = slot else {
         return job;
     };
+    // Counted as a pending removal from the moment it is queued, through the
+    // hold and the removal itself, until the slot is released.
+    let slot = slot.into_removal();
     Box::new(move || {
         // Dropped on every way out of this closure, an unwind included, and
         // with the closure when it never runs.
@@ -1855,5 +1861,71 @@ mod tests {
             assert!(ran.load(Ordering::Acquire), "by_drop={by_drop}: ran");
             assert_eq!(pool.available(PoolName::SANDBOX), Some(1), "released");
         }
+    }
+
+    /// A queued removal is counted as pending from the moment it is queued,
+    /// while the gate holds it and while it runs, and drops back to 0 once it
+    /// has returned — on a panic and when dropped unrun too.
+    #[test]
+    fn a_pending_removal_is_counted_until_it_returns() {
+        use crate::engine::resource_pool::{Limit, ResourcePool};
+        use futures::FutureExt as _;
+        use hplugin::provider::PoolName;
+        let pool = ResourcePool::new([
+            (PoolName::cpu(), Limit::Bounded(4_000_000)),
+            (PoolName::sandbox(), Limit::Bounded(2)),
+        ]);
+        let slot = || {
+            pool.acquire_with(&Default::default(), &[(PoolName::sandbox(), 1)])
+                .expect("acquire")
+                .now_or_never()
+                .expect("granted at once")
+                .expect("granted")
+                .split_off(PoolName::SANDBOX)
+                .expect("slot")
+        };
+        assert_eq!(pool.removals_pending(), 0);
+        let gate = RemovalGate::closed();
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let job = releasing(
+            Box::new({
+                let pool = Arc::clone(&pool);
+                let seen = Arc::clone(&seen);
+                move || {
+                    *seen.lock().expect("lock") = Some(pool.removals_pending());
+                    Ok(())
+                }
+            }),
+            Some(slot()),
+            RemovalHold {
+                gate: Some(gate.state()),
+                ..RemovalHold::default()
+            },
+        );
+        assert_eq!(pool.removals_pending(), 1, "queued");
+        assert_eq!(pool.snapshot().main.removals_pending, 1, "in the snapshot");
+        let removing = std::thread::spawn(job);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!removing.is_finished(), "held by the gate");
+        assert_eq!(pool.removals_pending(), 1, "held by the gate");
+        gate.open();
+        removing.join().expect("no panic").expect("job");
+        assert_eq!(*seen.lock().expect("lock"), Some(1), "while removing");
+        assert_eq!(pool.removals_pending(), 0, "after the removal");
+        assert_eq!(pool.available(PoolName::SANDBOX), Some(2), "released");
+
+        let panics = releasing(
+            Box::new(|| panic!("removal panicked")),
+            Some(slot()),
+            RemovalHold::default(),
+        );
+        assert_eq!(pool.removals_pending(), 1);
+        assert!(catch_unwind(AssertUnwindSafe(panics)).is_err());
+        assert_eq!(pool.removals_pending(), 0, "after a panic");
+
+        let unrun = releasing(Box::new(|| Ok(())), Some(slot()), RemovalHold::default());
+        assert_eq!(pool.removals_pending(), 1);
+        drop(unrun);
+        assert_eq!(pool.removals_pending(), 0, "dropped unrun");
     }
 }

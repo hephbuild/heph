@@ -626,8 +626,10 @@ target(name = "reads", driver = "bash", run = "echo $S > $OUT", out = "r.txt", e
         &declares,
         &[
             "//p:declares declares resources.sandbox",
-            "sandbox is the engine's",
+            "every managed run (exec, bash) takes one sandbox slot",
+            "Remove sandbox from the target's resources",
             "--resource sandbox=<n>",
+            "`resources: {sandbox: <n>}` in .hephconfig",
         ],
     );
     assert!(!declares.contains("is not a pool"), "{declares}");
@@ -637,8 +639,9 @@ target(name = "reads", driver = "bash", run = "echo $S > $OUT", out = "r.txt", e
         &[
             "//p:reads",
             "env.S",
-            "${resource:sandbox}",
-            "sandbox is the engine's",
+            "a target cannot read the sandbox pool",
+            "Remove `${resource:sandbox}`",
+            "--resource sandbox=<n>",
         ],
     );
     assert!(!reads.contains("is not a pool"), "{reads}");
@@ -1192,6 +1195,7 @@ fn admission_waits(events: &[BuildEvent]) -> (Vec<WaitStart>, Vec<String>) {
                 need,
                 free,
                 ahead,
+                ..
             } => starts.push((addr.clone(), pool.clone(), *need, *free, *ahead)),
             BuildEventKind::AdmissionWaitEnd { addr } => ends.push(addr.clone()),
             _ => {}

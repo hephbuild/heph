@@ -1099,8 +1099,15 @@ fn render_pools(p: &crate::engine::resource_pool::ResourceSnapshot, now: Instant
             )
         })
         .collect();
+    // A `sandbox` slot comes back only once its run's sandbox is removed, so
+    // removals still owed are why a run waits on `sandbox`.
+    let removals = match lane.removals_pending {
+        0 => String::new(),
+        1 => "; 1 removal pending".to_owned(),
+        n => format!("; {n} removals pending"),
+    };
     out.push_str(&format!(
-        "  {:<12} {}; {} queued\n",
+        "  {:<12} {}; {} queued{removals}\n",
         "pools",
         held.join(", "),
         lane.queued
@@ -1627,6 +1634,7 @@ mod tests {
                     }],
                     since,
                 }),
+                removals_pending: 0,
             },
         };
         let text = render_pools(&snap, now);
@@ -1672,8 +1680,9 @@ mod tests {
     }
 
     /// The engine's `sandbox` pool reads like any other, from a live pool:
-    /// held/capacity with the queue, and a run waiting for cleanup is the
-    /// head waiting for `sandbox 1 (0 free)` while cpu is free.
+    /// held/capacity with the queue and the removals still owed, and a run
+    /// waiting for cleanup is the head waiting for `sandbox 1 (0 free)` while
+    /// cpu is free.
     #[test]
     fn report_lists_the_sandbox_pool_and_a_run_waiting_on_it() {
         use crate::engine::resource_pool::{ResourcePool, resolve_capacities};
@@ -1696,7 +1705,10 @@ mod tests {
             .expect("granted at once")
             .expect("granted");
         // The run ended; its slot rides into the removal still owed.
-        let _pending_removal = held.split_off(PoolName::SANDBOX).expect("the slot");
+        let pending_removal = held
+            .split_off(PoolName::SANDBOX)
+            .expect("the slot")
+            .into_removal();
         drop(held);
         let mut waiter = pool
             .acquire_with(&hplugin::driver::Demand::default(), &slot)
@@ -1708,10 +1720,18 @@ mod tests {
 
         let text = render_pools(&pool.snapshot(), Instant::now());
         assert!(
-            text.contains("cpu 0/2, memory 0 B/unbounded, sandbox 1/1; 1 queued"),
+            text.contains(
+                "cpu 0/2, memory 0 B/unbounded, sandbox 1/1; 1 queued; 1 removal pending\n"
+            ),
             "{text}"
         );
         assert!(text.contains("waits for sandbox 1 (0 free)"), "{text}");
+
+        // The removal returned: the slot goes to the waiter, nothing pending.
+        drop(pending_removal);
+        let _admitted = waiter.now_or_never().expect("admitted").expect("granted");
+        let text = render_pools(&pool.snapshot(), Instant::now());
+        assert!(text.contains("sandbox 1/1; 0 queued\n"), "{text}");
     }
 
     /// A `--shell` target owning the terminal must not read as a stall.
