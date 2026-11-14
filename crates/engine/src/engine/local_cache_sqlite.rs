@@ -14,6 +14,7 @@ use std::collections::{HashMap, VecDeque};
 use std::future::{Future, poll_fn};
 use std::io::{self, Seek};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Poll, Waker};
@@ -433,6 +434,9 @@ const SCHEMA_VERSION: i64 = 1;
 struct Writer {
     tx: mpsc::Sender<WriterCmd>,
     handle: JoinHandle<()>,
+    /// Set when the cache is dropped: the writer stops retrying a batch
+    /// another process's lock keeps out (see [`commit_with_retry`]).
+    closing: Arc<AtomicBool>,
 }
 
 /// The local SQLite cache.
@@ -567,7 +571,8 @@ impl LocalCacheSQLite {
     /// included, which rewrites the file and holds its write lock throughout:
     /// another heph process using this home meanwhile waits — its schema check
     /// on the migration lock (up to `MIGRATE_LOCK_TIMEOUT`, only for a database
-    /// it has to migrate), its cache writes on the write lock.
+    /// it has to migrate), its cache writes on the write lock, which its writer
+    /// retries for up to [`WRITE_BUSY_RETRY_TOTAL`] before dropping one.
     pub(crate) fn compact_for_gc(
         &self,
         keep_going: Box<dyn Fn() -> bool + Send>,
@@ -827,6 +832,8 @@ impl LocalCacheSQLite {
         let (tx, rx) = mpsc::channel::<WriterCmd>();
         let pending = Arc::clone(&self.pending);
         let db_path = self.db_path.clone();
+        let closing = Arc::new(AtomicBool::new(false));
+        let thread_closing = Arc::clone(&closing);
         #[cfg(any(test, feature = "test-support"))]
         let gate = Arc::clone(&self.gate);
         let handle = std::thread::Builder::new()
@@ -834,15 +841,22 @@ impl LocalCacheSQLite {
             .spawn(move || {
                 writer_loop(
                     &mut conn,
-                    &rx,
-                    &pending,
-                    &db_path,
-                    #[cfg(any(test, feature = "test-support"))]
-                    &gate,
+                    &WriterEnv {
+                        rx: &rx,
+                        pending: &pending,
+                        db_path: &db_path,
+                        closing: &thread_closing,
+                        #[cfg(any(test, feature = "test-support"))]
+                        gate: &gate,
+                    },
                 )
             })
             .context("spawning sqlite writer thread")?;
-        Ok(Writer { tx, handle })
+        Ok(Writer {
+            tx,
+            handle,
+            closing,
+        })
     }
 
     fn key(addr: &Addr) -> String {
@@ -888,7 +902,15 @@ impl LocalCacheSQLite {
 impl Drop for LocalCacheSQLite {
     fn drop(&mut self) {
         // Nothing to do when nothing was ever written: no writer was spawned.
-        if let Some(Ok(Writer { tx, handle })) = self.writer.take() {
+        if let Some(Ok(Writer {
+            tx,
+            handle,
+            closing,
+        })) = self.writer.take()
+        {
+            // A batch kept out by another process's write lock gets one more
+            // attempt, not minutes of retries: the drop must not hang exit.
+            closing.store(true, Ordering::Release);
             // Close the channel so the writer thread observes a Disconnected,
             // finishes its queue and exits cleanly.
             drop(tx);
@@ -1046,54 +1068,118 @@ fn collect_batch(
     batch
 }
 
-fn writer_loop(
-    conn: &mut Connection,
-    rx: &mpsc::Receiver<WriterCmd>,
-    pending: &PendingTracker,
-    db_path: &std::path::Path,
-    #[cfg(any(test, feature = "test-support"))] gate: &WriterGate,
-) {
-    let _drain = DrainOnExit(pending);
+/// What the writer thread works with besides its connection.
+struct WriterEnv<'a> {
+    rx: &'a mpsc::Receiver<WriterCmd>,
+    pending: &'a PendingTracker,
+    db_path: &'a std::path::Path,
+    /// See [`Writer::closing`].
+    closing: &'a AtomicBool,
+    #[cfg(any(test, feature = "test-support"))]
+    gate: &'a WriterGate,
+}
+
+fn writer_loop(conn: &mut Connection, env: &WriterEnv<'_>) {
+    let _drain = DrainOnExit(env.pending);
     let mut maintenance: VecDeque<MaintainJob> = VecDeque::new();
     loop {
         let first = match maintenance.pop_front() {
             Some(job) => WriterCmd::Maintain(job),
-            None => match rx.recv() {
+            None => match env.rx.recv() {
                 Ok(cmd) => cmd,
                 Err(_) => return,
             },
         };
 
         #[cfg(any(test, feature = "test-support"))]
-        gate.wait_while_closed();
+        env.gate.wait_while_closed();
 
         match first {
-            WriterCmd::Maintain(job) => run_maintenance(
-                conn,
-                rx,
-                pending,
-                db_path,
-                &mut maintenance,
-                #[cfg(any(test, feature = "test-support"))]
-                gate,
-                job,
-            ),
-            cmd => write_batch(conn, rx, pending, &mut maintenance, cmd),
+            WriterCmd::Maintain(job) => run_maintenance(conn, env, &mut maintenance, job),
+            cmd => write_batch(conn, env, &mut maintenance, cmd),
         }
+    }
+}
+
+/// How long the writer keeps retrying a batch that another process's write
+/// lock keeps out (`SQLITE_BUSY`/`SQLITE_LOCKED` after the connection's busy
+/// timeout) before dropping it. Long enough to outlast another process's
+/// `heph tool gc` converting a large `cache.db`, whose `VACUUM` holds the
+/// write lock for the whole rewrite; bounded so a stuck holder cannot park the
+/// writer, and every reader of a queued key, forever.
+pub(crate) const WRITE_BUSY_RETRY_TOTAL: Duration = Duration::from_secs(5 * 60);
+/// The longest pause between two attempts of a kept-out batch.
+const WRITE_BUSY_BACKOFF_MAX: Duration = Duration::from_secs(2);
+
+/// Whether `e` is sqlite reporting another connection's lock.
+fn is_busy(e: &anyhow::Error) -> bool {
+    e.chain()
+        .filter_map(|c| c.downcast_ref::<rusqlite::Error>())
+        .any(|e| {
+            matches!(
+                e.sqlite_error_code(),
+                Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+            )
+        })
+}
+
+/// [`process_batch`], retried while another process's write lock keeps it
+/// out, for up to [`WRITE_BUSY_RETRY_TOTAL`] or until the cache is `closing`
+/// (dropped: it must not hang its owner's exit). A failed attempt rolled back,
+/// so the next one starts from nothing; each attempt waits out the busy
+/// timeout itself, the pause between two only spaces them.
+fn commit_with_retry(
+    conn: &mut Connection,
+    batch: &mut [WriterCmd],
+    closing: &AtomicBool,
+) -> Result<()> {
+    let started = std::time::Instant::now();
+    let mut pause = Duration::from_millis(50);
+    let mut attempts: u32 = 0;
+    loop {
+        let err = match process_batch(conn, batch) {
+            Ok(()) => {
+                if attempts > 0 {
+                    tracing::info!(
+                        attempts = attempts + 1,
+                        waited = ?started.elapsed(),
+                        "sqlite cache writer: batch committed after another process released the lock",
+                    );
+                }
+                return Ok(());
+            }
+            Err(e) => e,
+        };
+        attempts = attempts.saturating_add(1);
+        let waited = started.elapsed();
+        if !is_busy(&err) || waited >= WRITE_BUSY_RETRY_TOTAL || closing.load(Ordering::Acquire)
+        {
+            return Err(err.context(format!("after {attempts} attempt(s) over {waited:?}")));
+        }
+        if attempts == 1 {
+            tracing::warn!(
+                error = %format!("{err:#}"),
+                "sqlite cache writer: another process holds cache.db's write lock; retrying",
+            );
+        }
+        std::thread::sleep(pause.min(WRITE_BUSY_RETRY_TOTAL.saturating_sub(waited)));
+        pause = pause.saturating_mul(2).min(WRITE_BUSY_BACKOFF_MAX);
     }
 }
 
 /// Commit `first` and the writes queued behind it as one batch.
 fn write_batch(
     conn: &mut Connection,
-    rx: &mpsc::Receiver<WriterCmd>,
-    pending: &PendingTracker,
+    env: &WriterEnv<'_>,
     maintenance: &mut VecDeque<MaintainJob>,
     first: WriterCmd,
 ) {
-    let mut batch = collect_batch(first, rx, maintenance);
+    let pending = env.pending;
+    let mut batch = collect_batch(first, env.rx, maintenance);
 
-    if let Err(e) = process_batch(conn, &mut batch) {
+    // Its slots stay pending while it is retried: a reader of one of its keys
+    // waits for the write rather than reading the key as absent.
+    if let Err(e) = commit_with_retry(conn, &mut batch, env.closing) {
         tracing::error!(error = %format!("{e:#}"), "sqlite cache writer: batch failed");
     }
 
@@ -1114,11 +1200,8 @@ fn write_batch(
 /// is the requester's to report; it never touches the write path.
 fn run_maintenance(
     conn: &mut Connection,
-    rx: &mpsc::Receiver<WriterCmd>,
-    pending: &PendingTracker,
-    db_path: &std::path::Path,
+    env: &WriterEnv<'_>,
     maintenance: &mut VecDeque<MaintainJob>,
-    #[cfg(any(test, feature = "test-support"))] gate: &WriterGate,
     job: MaintainJob,
 ) {
     let MaintainJob {
@@ -1141,19 +1224,19 @@ fn run_maintenance(
         // Commit what queued up during the chunk. A closed channel means the
         // cache is being dropped: stop at this boundary.
         loop {
-            match rx.try_recv() {
+            match env.rx.try_recv() {
                 Ok(WriterCmd::Maintain(job)) => maintenance.push_back(job),
                 Ok(cmd) => {
                     #[cfg(any(test, feature = "test-support"))]
-                    gate.wait_while_closed();
-                    write_batch(conn, rx, pending, maintenance, cmd);
+                    env.gate.wait_while_closed();
+                    write_batch(conn, env, maintenance, cmd);
                 }
                 Err(mpsc::TryRecvError::Empty) => return true,
                 Err(mpsc::TryRecvError::Disconnected) => return false,
             }
         }
     };
-    let res = cache_db_space::run(conn, db_path, &kind, &*keep_going, &mut between);
+    let res = cache_db_space::run(conn, env.db_path, &kind, &*keep_going, &mut between);
     if res.is_err() {
         // Whatever failed may have left a transaction open; the next write
         // batch must not start inside it.
@@ -3441,6 +3524,47 @@ mod tests {
         );
         assert!(cache.exists(&addr, "h", "mid")?);
         assert_eq!(snap(&path)?.free_pages, 0);
+        Ok(())
+    }
+
+    /// A batch another connection's write lock keeps out past the busy
+    /// timeout — another process's gc converting the database, say — is
+    /// retried, not dropped: its slot stays pending meanwhile, and it commits
+    /// once the lock is released.
+    #[test]
+    fn a_batch_kept_out_past_the_busy_timeout_commits_after_release() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("cache.db");
+        let cache = open(&path)?;
+        let busy = Duration::from_millis(50);
+        cache.set_maintenance_overrides(MaintenanceOverrides {
+            busy_timeout: Some(busy),
+            ..MaintenanceOverrides::default()
+        });
+        let addr = make_addr("pkg", "busy");
+        put(&cache, &addr, "first", b"spawns the writer")?;
+        assert!(cache.exists(&addr, "h", "first")?);
+
+        let holder = Connection::open(&path)?;
+        holder.execute_batch("BEGIN IMMEDIATE;")?;
+        put(&cache, &addr, "held", b"queued behind the lock")?;
+        std::thread::sleep(busy * 10);
+        assert!(
+            cache
+                .pending
+                .pending(&LocalCacheSQLite::key(&addr), "h", "held")
+                .is_some(),
+            "still queued, not dropped, ten busy timeouts in"
+        );
+        holder.execute_batch("COMMIT;")?;
+
+        let mut data = Vec::new();
+        cache
+            .reader(&addr, "h", "held")
+            .context("committed once the lock was released")?
+            .reader
+            .read_to_end(&mut data)?;
+        assert_eq!(data, b"queued behind the lock");
         Ok(())
     }
 
