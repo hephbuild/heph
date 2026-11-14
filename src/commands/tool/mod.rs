@@ -32,6 +32,12 @@ pub enum ToolCommands {
     /// reachable from any current target, reclaiming disk space. Resolves every
     /// cached target's spec, so providers may run.
     ///
+    /// Last, it gives the cache database's free pages back to the filesystem.
+    /// The first run on a cache an older version created rewrites the whole
+    /// database once: minutes on a large one, during which other heph
+    /// processes' cache writes wait. It is skipped while the disk lacks room
+    /// for the copy it makes.
+    ///
     /// Example: `heph tool gc`
     Gc(gc::GcArgs),
     /// Remove the selected targets' entries from the local cache

@@ -11,10 +11,17 @@ use std::time::{Duration, Instant};
 
 /// How long a migrator waits for another process's migration before failing.
 ///
-/// Matches the stores' `busy_timeout`: a migration is a handful of statements,
-/// so a lock held for longer than the busy handler would wait is held by a
-/// process that is stuck (or stopped), not one that is about to finish — and an
+/// Matches the stores' `busy_timeout`. A schema migration is a handful of
+/// statements, so a migration holding the lock for longer than the busy
+/// handler would wait is stuck (or stopped), not about to finish — and an
 /// untimed `flock` would hang this process behind it with no diagnostic.
+///
+/// One holder is not brief: `heph tool gc` converting a `cache.db` to
+/// incremental auto-vacuum holds the lock for the whole `VACUUM`, minutes on a
+/// large file. A process that has to migrate that database meanwhile times out
+/// here and fails its cache open naming the lock file; one whose schema is
+/// already current never takes the lock, and only its writes wait, on
+/// sqlite's write lock.
 pub const MIGRATE_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The migration lock file of the database at `db_path`.

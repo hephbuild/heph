@@ -605,6 +605,13 @@ impl Drop for DeferredTrims {
                         "deferred cache-history trims failed; those targets keep their stale revisions",
                     );
                 }
+                // The trim freed pages inside cache.db; give them back to the
+                // filesystem when due. In this job, not a thread of its own, so
+                // the `bg_pending` slot covers it like the retries above; it is
+                // bounded by its time budget and never fails the run.
+                if report.removed > 0 {
+                    engine.reclaim_cache_db_after_trim();
+                }
                 Ok(())
             }),
             Arc::clone(&self.bg_pending),
