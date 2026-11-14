@@ -6,10 +6,10 @@
 //! typed into. Also the one check of a pool name's syntax
 //! (`hplugin::provider::PoolName` delegates here).
 //!
-//! Pools are generic: `cpu` and `memory` are pools like any other, except that
-//! they exist without being declared, have a fixed unit (`cpu` and `bytes`)
-//! and a host default (the parallelism, the host's memory) that a percentage
-//! is taken of.
+//! Pools are generic: `cpu`, `memory` and `sandbox` are pools like any other,
+//! except that they exist without being declared, have a fixed unit (`cpu`,
+//! `bytes`, `count`) and a default (the parallelism, the host's memory, four
+//! sandboxes per CPU) that a percentage is taken of.
 
 /// Micro-CPUs in one CPU: how the `cpu` unit stores an amount.
 pub const MICROS_PER_CPU: u64 = 1_000_000;
@@ -18,6 +18,10 @@ pub const MICROS_PER_CPU: u64 = 1_000_000;
 pub const CPU: &str = "cpu";
 /// The memory pool's name.
 pub const MEMORY: &str = "memory";
+/// The sandbox pool's name: build sandboxes on disk, live or awaiting
+/// removal. The engine's own: every managed run takes one, and no target
+/// declares or reads it.
+pub const SANDBOX: &str = "sandbox";
 
 /// The longest a pool name may be.
 pub const MAX_POOL_NAME_LEN: usize = 64;
@@ -63,12 +67,13 @@ impl Unit {
         Self::ALL.into_iter().find(|u| u.name() == s)
     }
 
-    /// The fixed unit of a builtin pool (`cpu`, `memory`), `None` for any
-    /// other name.
+    /// The fixed unit of a builtin pool (`cpu`, `memory`, `sandbox`), `None`
+    /// for any other name.
     pub fn of_builtin(pool: &str) -> Option<Self> {
         match pool {
             CPU => Some(Self::Cpu),
             MEMORY => Some(Self::Bytes),
+            SANDBOX => Some(Self::Count),
             _ => None,
         }
     }
@@ -173,8 +178,8 @@ pub enum Capacity {
     /// An amount in the pool's unit's base (a count, micro-CPUs, bytes). `0`
     /// means "the pool exists; the run sets its capacity" (config only).
     Amount(u64),
-    /// A percentage (> 0) of the engine's default capacity; `cpu` and
-    /// `memory` only, the pools that have one.
+    /// A percentage (> 0) of the engine's default capacity; `cpu`, `memory`
+    /// and `sandbox` only, the pools that have one.
     Percent(u64),
 }
 
@@ -189,8 +194,9 @@ pub enum Zero {
 impl Capacity {
     /// Parse `s` as the capacity of `pool`, whose unit is `unit`.
     ///
-    /// - `N%`: ASCII digits then one `%`, N ≥ 1, only for a pool with a host
-    ///   default (`cpu`, `memory`). Over 100 is an overcommit by choice.
+    /// - `N%`: ASCII digits then one `%`, N ≥ 1, only for a pool with a
+    ///   default (`cpu`, `memory`, `sandbox`). Over 100 is an overcommit by
+    ///   choice.
     /// - anything else: an amount in `unit` ([`Unit::parse`]).
     pub fn parse(pool: &str, unit: Unit, s: &str, zero: Zero) -> anyhow::Result<Self> {
         if let Some(digits) = s.strip_suffix('%') {

@@ -283,10 +283,10 @@ pub struct Engine {
     /// The `cpu` capacity, in CPUs (rounded up), announced to clients as the
     /// `RequestConfig` build event's `max_workers`.
     pub(crate) max_workers: usize,
-    /// Bounds the managed-driver sandboxes on disk, live or awaiting removal
-    /// (`Config::sandbox_permits`; see the module docs of
-    /// [`sandbox_permits`](crate::engine::sandbox_permits)).
-    pub(crate) sandbox_permits: crate::engine::sandbox_permits::SandboxPermits,
+    /// How long each sandbox removal holding a `sandbox` slot sleeps first
+    /// ([`set_sandbox_removal_delay`](Self::set_sandbox_removal_delay)).
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) sandbox_removal_delay: std::time::Duration,
     /// How wide the engine's own fan-outs run (top-level spawns, the gc and
     /// clean loops): `2 × parallelism`, independent of the `cpu` capacity, so
     /// `-j 1` does not serialise them.
@@ -746,17 +746,11 @@ impl Engine {
         self.timeout_grace = grace;
     }
 
-    /// Make each sandbox removal that releases one of this engine's sandbox
-    /// permits wait `delay` first, so a test can stand in a slow disk.
+    /// Make each removal of a build sandbox that holds a `sandbox` pool slot
+    /// wait `delay` first, so a test can stand in a slow disk.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn set_sandbox_removal_delay(&self, delay: std::time::Duration) {
-        self.sandbox_permits.set_removal_delay(delay);
-    }
-
-    /// The sandbox permit pool's state now.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn sandbox_permit_gauge(&self) -> crate::engine::sandbox_permits::SandboxPermitGauge {
-        self.sandbox_permits.gauge()
+    pub fn set_sandbox_removal_delay(&mut self, delay: std::time::Duration) {
+        self.sandbox_removal_delay = delay;
     }
 
     pub fn new(cfg: Config) -> anyhow::Result<Engine> {
@@ -866,17 +860,6 @@ impl Engine {
                 .div_ceil(hplugin::driver::Resources::MICROS_PER_CPU),
         )
         .unwrap_or(usize::MAX);
-        // 4 × the workers: room for every running sandbox and three
-        // generations of finished ones queued behind it on the reclaim lane
-        // before a new run waits for cleanup.
-        let sandbox_permits = crate::engine::sandbox_permits::SandboxPermits::new(
-            cfg.sandbox_permits
-                .unwrap_or_else(|| max_workers.saturating_mul(4)),
-        );
-        crate::engine::diag::global().register_sandbox_permits({
-            let permits = sandbox_permits.clone();
-            move || permits.gauge()
-        });
 
         // Fails loudly here rather than at first request: every request's
         // memoizers spawn on this handle, and an engine constructed off-runtime
@@ -937,7 +920,8 @@ impl Engine {
                 pools
             },
             max_workers,
-            sandbox_permits,
+            #[cfg(any(test, feature = "test-support"))]
+            sandbox_removal_delay: std::time::Duration::ZERO,
             fan_out,
             admission_notice: crate::engine::result::RESULT_LOCK_NOTICE,
             timeout_grace: crate::engine::run_timeout::GRACE,

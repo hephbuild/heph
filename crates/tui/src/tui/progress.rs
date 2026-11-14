@@ -2929,7 +2929,6 @@ mod tests {
             declared: None,
             reserved: None,
             queued_ms: None,
-            sandbox_wait_ms: None,
         }
     }
 
@@ -2941,7 +2940,6 @@ mod tests {
             declared: None,
             reserved: Some(reserved.iter().map(|&(p, n)| (p.into(), n)).collect()),
             queued_ms: None,
-            sandbox_wait_ms: None,
         }
     }
 
@@ -2959,7 +2957,6 @@ mod tests {
             declared: Some([("cpu".into(), declared)].into()),
             reserved: Some([("cpu".into(), reserved)].into()),
             queued_ms: Some(0),
-            sandbox_wait_ms: None,
         };
         let mut s = BuildState::new();
         s.apply(&ev(0, start("//p:big", 16 * CPU, 4 * CPU)));
@@ -3012,7 +3009,6 @@ mod tests {
                 declared: Some([("scratch_disk".into(), 8 << 30)].into()),
                 reserved: Some([("cpu".into(), CPU), ("scratch_disk".into(), 4 << 30)].into()),
                 queued_ms: None,
-                sandbox_wait_ms: None,
             },
         ));
         assert_eq!(

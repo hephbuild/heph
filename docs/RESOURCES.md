@@ -99,12 +99,14 @@ and the OS. That is deliberate, and it cuts both ways: an `fs` glob costs
 nothing to admit, but a process-spawning target declared `cpu: 0` launches as
 many processes as there are such targets ready. Its unbounded amounts are
 counted as held from the grant. `cpu: 0` with `memory: "8G"` still queues on
-memory.
+memory, and a `cpu: 0` target of a managed driver queues on the
+[`sandbox`](#the-sandbox-pool) slot every managed run takes.
 
 ## Configuring pools
 
-`cpu` and `memory` always exist. Any other pool is declared in `.hephconfig`,
-one entry per pool, either in full or as a shorthand:
+`cpu`, `memory` and [`sandbox`](#the-sandbox-pool) always exist. Any other pool
+is declared in `.hephconfig`, one entry per pool, either in full or as a
+shorthand:
 
 ```yaml
 resources:
@@ -121,10 +123,10 @@ resources:
   With no `unit` the pool's default unit applies, so a new pool written
   `{value: 3}` is a count.
 - **Shorthand**: the amount alone, in the pool's default unit (`cpu` for
-  `cpu`, `bytes` for `memory`, `count` for anything else).
+  `cpu`, `bytes` for `memory`, `count` for `sandbox` and anything else).
 - **No value**: a custom pool is **unbounded**: every request is granted at
   once and nothing is clamped, but what is held is still counted and shown.
-  `cpu` and `memory` without a value keep their defaults.
+  `cpu`, `memory` and `sandbox` without a value keep their defaults.
 - **`0`**: "this pool exists; the caller sets its capacity per run". BUILD
   files naming it validate on every machine, and a run that reaches a target
   needing it fails at admission, before the target runs:
@@ -142,9 +144,12 @@ difference between platforms is on purpose: a target that declares `memory`
 can wait in a Linux CI container limited to 8G where it ran at once on a 32G
 laptop. Set `resources: {memory: …}` to make the two agree.
 
-**Percentages** (`cpu: 50%`, `memory: 75%`, and the same on the command line)
-are of the builtin's default and exist only for `cpu` and `memory`: a custom
-pool has no default to take one of. cpu rounds to the nearest micro-CPU,
+`sandbox` is 4 per CPU of the resolved `cpu` capacity (rounded up), so `-j 2`
+makes it 8.
+
+**Percentages** (`cpu: 50%`, `memory: 75%`, `sandbox: 200%`, and the same on
+the command line) are of the builtin's default and exist only for the
+builtins: a custom pool has no default to take one of. cpu rounds to the nearest micro-CPU,
 memory floors to bytes, over 100% is an overcommit by choice, and `0%` is an
 error.
 
@@ -171,6 +176,34 @@ the default.
 `-j` sizes the `cpu` pool only. The engine's own fan-outs (cache pipes, gc and
 clean loops) keep following its parallelism, and `-j 1` serialises neither
 them nor `cpu: 0` targets.
+
+### The `sandbox` pool
+
+Admission bounds what *runs*. A finished run's sandbox is removed afterwards,
+fire-and-forget, so a build of many short targets (thousands of sandboxed
+`go list` runs in a cold Go `validate`) can finish sandboxes faster than the
+disk removes them, and that backlog once filled a disk. The `sandbox` pool
+bounds the build sandboxes on disk, **running or awaiting removal**:
+
+- Every run of a managed driver (one that runs in a build sandbox the engine
+  prepares, such as `exec` and `bash`) is admitted with `sandbox: 1` on top of
+  what it declares, in the same atomic, FIFO grant as its cpu.
+- Its cpu (and every other pool) returns when the run ends; its sandbox slot
+  only once the sandbox directory has been removed.
+- Cache hits, non-managed drivers (`fs`, `group`, `template`, …) and the
+  sandboxes of `heph run` invocations take none. A failed target's sandbox,
+  kept on disk for its diagnostic, gives its slot back at once: there is at
+  most one such tree per failed target, and that target's next run removes it.
+- It is the engine's own: a target that declares it in `resources` or reads
+  `${resource:sandbox}` is refused when the def is linked. Size it with
+  `--resource sandbox=<n>`, `HEPH_RESOURCE_SANDBOX=<n>` or
+  `resources: {sandbox: <n>}`.
+
+A `cpu: 0` managed target needs a sandbox slot, so it is no longer zero-cost
+and queues like any other run. When removal falls behind, runs wait in
+admission for `sandbox` and it shows as any other pool wait does (`⧗ //a:b
+waits for sandbox 1 (0 free, …)`, the TUI header's `sandbox <held>/<capacity>`,
+the in-flight report).
 
 ## Reading the allotment
 

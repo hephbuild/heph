@@ -3046,6 +3046,17 @@ impl Engine {
         if resources.is_empty() {
             return Ok(hplugin::driver::Demand::default());
         }
+        if let Some((pool, _)) = resources
+            .iter()
+            .find(|(p, _)| crate::engine::resource_pool::is_engine_owned(p.as_str()))
+        {
+            anyhow::bail!(
+                "{addr} declares resources.{pool}, but {pool} is the engine's: every sandboxed run \
+                 takes one {pool} on its own, held until its sandbox is removed. Size the pool \
+                 with --resource {pool}=<n> or resources: {{{pool}: <n>}} in .hephconfig, and \
+                 drop it from the target"
+            );
+        }
         if let Some((pool, amount)) = resources
             .iter()
             .find(|(p, _)| !self.pools.is_pool(p.as_str()))
@@ -3103,6 +3114,13 @@ impl Engine {
                     continue;
                 }
                 let pool = t.arg;
+                if crate::engine::resource_pool::is_engine_owned(pool) {
+                    anyhow::bail!(
+                        "{addr}: `{path}` reads ${{resource:{pool}}}, but {pool} is the engine's \
+                         and no part of a run's allotment: a run holds one {pool} until its \
+                         sandbox is removed, whatever it is told"
+                    );
+                }
                 if !self.pools.is_pool(pool) {
                     anyhow::bail!(
                         "{addr}: `{path}` reads ${{resource:{pool}}}, but {}",

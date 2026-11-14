@@ -53,6 +53,33 @@
 //! - The arrival fast path (grant without queueing) is taken only when the
 //!   queue is empty, or an arrival racing a release would overtake.
 //! - Removal from the queue is by key, not a scan.
+//! - A grant can be split ([`Reservation::split_off`]); each half returns its
+//!   own amounts when it drops. A release is synchronous (the mutex and a
+//!   `oneshot` send) and needs no runtime, so a half dropped on a plain OS
+//!   thread — the reclaim lane's — wakes a queued tokio waiter like any other
+//!   release.
+//!
+//! # The `sandbox` pool
+//!
+//! Admission bounds what *runs*; a finished run's sandbox is removed later,
+//! fire-and-forget, on the reclaim lane (`sandbox_cleaner`). A build of many
+//! short targets (thousands of sandboxed `go list` runs in a cold Go
+//! `validate`) finishes sandboxes faster than they are removed, and nothing
+//! bounded that backlog: it filled a disk. So the engine adds `sandbox: 1` to
+//! every managed-driver run's request ([`ResourcePool::acquire_with`]),
+//! admitted atomically with its cpu, and splits that part off the grant: the
+//! cpu returns when the run ends, the sandbox only once the reclaim lane has
+//! removed the directory. Live plus pending-removal sandboxes number at most
+//! the pool's capacity ([`SANDBOXES_PER_CPU`] per CPU by default).
+//!
+//! It is the engine's ([`is_engine_owned`]): no target declares it or reads it
+//! with `${resource:sandbox}`, and like every pool nothing about it reaches a
+//! hash, argv, env or file. A `cpu: 0` managed run needs something of a
+//! bounded pool now, so it queues like any other: that is the point (it is
+//! exactly the run that piled sandboxes up). Outside the bound: cache hits,
+//! non-managed drivers and invocation sandboxes take none, and a failed run's
+//! sandbox kept for its diagnostic gives its slot back at once (one tree per
+//! failed addr, removed by that addr's next run).
 
 use hcore::capacity::{PoolSpec, Unit};
 use hplugin::driver::{Demand, Resources};
@@ -154,7 +181,20 @@ impl ResourcePool {
     /// Dropping the `Acquire` leaves the queue, or returns a grant it was
     /// sent but never observed.
     pub fn acquire(self: &Arc<Self>, request: &Demand) -> Result<Acquire, AcquireError> {
-        let (need, clamped) = self.resolve(request)?;
+        self.acquire_with(request, &[])
+    }
+
+    /// [`acquire`](Self::acquire) with `implicit` amounts on top of
+    /// `request`'s, granted atomically with them: what the engine demands on
+    /// the run's behalf (`sandbox: 1` for a managed run), which the target
+    /// never declared. A pool in both is the target's declaration plus the
+    /// implicit amount.
+    pub fn acquire_with(
+        self: &Arc<Self>,
+        request: &Demand,
+        implicit: &[(PoolName, u64)],
+    ) -> Result<Acquire, AcquireError> {
+        let (need, clamped) = self.resolve(request, implicit)?;
         let bounded = need
             .iter()
             .any(|&(idx, _)| matches!(self.main.capacity.get(idx), Some(Limit::Bounded(_))));
@@ -177,13 +217,37 @@ impl ResourcePool {
         }
     }
 
-    /// The request as `(pool index, granted amount)` in the main lane, empty
-    /// when it reserves nothing anywhere; and whether any amount was clamped.
-    fn resolve(&self, request: &Demand) -> Result<(Vec<(usize, u64)>, bool), AcquireError> {
+    /// The request plus `implicit` as `(pool index, granted amount)` in the
+    /// main lane, empty when it reserves nothing anywhere; and whether any
+    /// amount was clamped.
+    fn resolve(
+        &self,
+        request: &Demand,
+        implicit: &[(PoolName, u64)],
+    ) -> Result<(Vec<(usize, u64)>, bool), AcquireError> {
         let lane = &self.main;
-        let mut need = Vec::with_capacity(request.len().saturating_add(1));
+        let mut need =
+            Vec::with_capacity(request.len().saturating_add(1).saturating_add(implicit.len()));
         let mut clamped = false;
+        // One entry per pool: `fits` checks each entry on its own, so a pool
+        // listed twice could be granted past its capacity.
+        let implicit_of = |pool: &str| {
+            implicit
+                .iter()
+                .filter(|(p, _)| p.as_str() == pool)
+                .fold(0u64, |acc, (_, n)| acc.saturating_add(*n))
+        };
         for (pool, amount) in request.iter() {
+            let amount = amount.saturating_add(implicit_of(pool.as_str()));
+            lane.grant(lane.index(pool.as_str()), amount, &mut need, &mut clamped)
+                .map_err(|e| e.naming(pool.clone()))?;
+        }
+        for (i, (pool, _)) in implicit.iter().enumerate() {
+            let first = implicit.iter().position(|(p, _)| p == pool) == Some(i);
+            if !first || request.declared(pool.as_str()).is_some() {
+                continue;
+            }
+            let amount = implicit_of(pool.as_str());
             lane.grant(lane.index(pool.as_str()), amount, &mut need, &mut clamped)
                 .map_err(|e| e.naming(pool.clone()))?;
         }
@@ -216,16 +280,22 @@ impl GrantError {
     }
 }
 
+/// The `sandbox` pool's default capacity per CPU of the `cpu` capacity: room
+/// for every running sandbox and three generations of finished ones queued
+/// behind them on the reclaim lane before a new run waits for cleanup.
+pub const SANDBOXES_PER_CPU: u64 = 4;
+
 /// Every pool's capacity, from what the config and the run wrote (`specs`)
 /// over the engine's defaults: `cpu` is `parallelism` CPUs, `memory` the
 /// host's ([`hcore::sysres::host_memory_bytes`], read through `host_memory`
-/// only when the memory capacity needs it; 0 is "could not read"). A
-/// percentage is of the default; a custom pool has none, which the parser
+/// only when the memory capacity needs it; 0 is "could not read"), `sandbox`
+/// [`SANDBOXES_PER_CPU`] per CPU of the resolved `cpu` capacity, rounded up.
+/// A percentage is of the default; a custom pool has none, which the parser
 /// already refused.
 ///
-/// A pool with no value is unbounded, except `cpu` (always the parallelism)
-/// and `memory` (the host's), which keep their default; a `memory` whose
-/// default is needed and could not be read is unbounded too.
+/// A pool with no value is unbounded, except `cpu` (always the parallelism),
+/// `memory` (the host's) and `sandbox`, which keep their default; a `memory`
+/// whose default is needed and could not be read is unbounded too.
 pub fn resolve_capacities(
     specs: &BTreeMap<PoolName, PoolSpec>,
     parallelism: usize,
@@ -238,6 +308,15 @@ pub fn resolve_capacities(
         .get(PoolName::CPU)
         .and_then(|s| s.capacity)
         .map_or(cpu_default, |c| c.resolve(Unit::Cpu, || cpu_default));
+    let sandbox_default = cpu
+        .div_ceil(Resources::MICROS_PER_CPU)
+        .saturating_mul(SANDBOXES_PER_CPU);
+    let sandbox = specs
+        .get(PoolName::SANDBOX)
+        .and_then(|s| s.capacity)
+        .map_or(sandbox_default, |c| {
+            c.resolve(Unit::Count, || sandbox_default)
+        });
     let memory = match specs.get(PoolName::MEMORY).and_then(|s| s.capacity) {
         Some(c @ hcore::capacity::Capacity::Amount(_)) => {
             Limit::Bounded(c.resolve(Unit::Bytes, || 0))
@@ -253,7 +332,7 @@ pub fn resolve_capacities(
     };
     let custom = specs
         .iter()
-        .filter(|(p, _)| p.as_str() != PoolName::CPU && p.as_str() != PoolName::MEMORY)
+        .filter(|(p, _)| Unit::of_builtin(p.as_str()).is_none())
         .map(|(p, s)| {
             let limit = s.capacity.map_or(Limit::Unbounded, |c| {
                 Limit::Bounded(c.resolve(s.unit, || 0))
@@ -263,10 +342,19 @@ pub fn resolve_capacities(
     [
         (PoolName::cpu(), Limit::Bounded(cpu)),
         (PoolName::memory(), memory),
+        (PoolName::sandbox(), Limit::Bounded(sandbox)),
     ]
     .into_iter()
     .chain(custom)
     .collect()
+}
+
+/// Whether `pool` is the engine's own: a pool the engine demands on a run's
+/// behalf, which no target may declare in `resources` nor read with
+/// `${resource:…}`. Only `sandbox`: every managed run takes one, released
+/// when its sandbox has been removed rather than when the run ends.
+pub fn is_engine_owned(pool: &str) -> bool {
+    pool == PoolName::SANDBOX
 }
 
 /// The engine's [`ResourcePool`], built on first use.
@@ -319,13 +407,16 @@ impl EnginePools {
             .or_else(|| Unit::of_builtin(name))
     }
 
-    /// Every pool name, in name order.
+    /// Every pool a target may name, in name order: every pool but
+    /// `sandbox`, which is the engine's (see [`is_engine_owned`]). These are
+    /// what the "did you mean" and "known:" hints offer.
     pub fn names(&self) -> impl Iterator<Item = &str> {
         let builtin = [PoolName::CPU, PoolName::MEMORY]
             .into_iter()
             .filter(|n| !self.specs.contains_key(*n));
         let mut all: Vec<&str> = builtin
             .chain(self.specs.keys().map(PoolName::as_str))
+            .filter(|n| !is_engine_owned(n))
             .collect();
         all.sort_unstable();
         all.into_iter()
@@ -681,6 +772,28 @@ impl Reservation {
         self.granted
             .iter()
             .filter_map(|&(idx, n)| Some((self.lane.names.get(idx)?, n)))
+    }
+
+    /// Move what this grant holds of `pool` into a reservation of its own,
+    /// returned to the pool when *it* drops; `None` (and `self` unchanged)
+    /// when nothing of `pool` was granted. The two halves are released
+    /// independently, each running the grant chain: the `sandbox` part of a
+    /// managed run outlives the run, until its sandbox has been removed.
+    ///
+    /// The split-off half is never `clamped`: whether the grant was clamped
+    /// stays a fact about the original request.
+    pub fn split_off(&mut self, pool: &str) -> Option<Reservation> {
+        let idx = self.lane.index(pool)?;
+        let pos = self.granted.iter().position(|&(i, _)| i == idx)?;
+        let mut rest = std::mem::take(&mut self.granted).into_vec();
+        let part = rest.remove(pos);
+        self.granted = rest.into_boxed_slice();
+        Some(Reservation {
+            lane: Arc::clone(&self.lane),
+            granted: Box::new([part]),
+            clamped: false,
+            armed: self.armed,
+        })
     }
 }
 

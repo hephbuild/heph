@@ -135,12 +135,6 @@ pub struct Config {
     /// parallelism, `memory` the host's); a custom pool with no value is
     /// unbounded; a percentage is of the default. Resolved in `Engine::new`.
     pub resources: BTreeMap<hplugin::provider::PoolName, hcore::capacity::PoolSpec>,
-    /// How many managed-driver sandboxes may exist at once, live or waiting for
-    /// removal ([`SandboxPermits`]). `None` is 4 × the engine's max workers.
-    /// An embedder's knob only: no flag, config key or env var sets it.
-    ///
-    /// [`SandboxPermits`]: crate::engine::sandbox_permits::SandboxPermits
-    pub sandbox_permits: Option<usize>,
 }
 
 /// Resolved scratch-lineage policy. The config's `${git:branch}` is already
@@ -193,7 +187,6 @@ impl Config {
             scratch: ScratchOptions::default(),
             listed_facts_trust: Default::default(),
             resources: BTreeMap::new(),
-            sandbox_permits: None,
         }
     }
 
@@ -336,8 +329,6 @@ impl ConfigYamlExt for ConfigYaml {
                     Ok((pool, spec))
                 })
                 .collect::<anyhow::Result<_>>()?,
-            // Not workspace policy: no config key sets it.
-            sandbox_permits: defaults.sandbox_permits,
         })
     }
 }

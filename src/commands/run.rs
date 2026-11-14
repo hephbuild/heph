@@ -1019,10 +1019,9 @@ async fn execute_async(args: RunArgs, sink: LogSink, global: GlobalOptions) -> a
                 // a hang that ends with the process being killed takes every
                 // byte of in-flight state with it unless it was already on disk.
                 // A failure here must not cost us the paragraph itself.
-                if let Err(e) = inflight.write(&hengine::engine::diag::InflightLog::render(
-                    snapshot,
-                    report.sandboxes,
-                )) {
+                if let Err(e) =
+                    inflight.write(&hengine::engine::diag::InflightLog::render(snapshot))
+                {
                     tracing::warn!(
                         path = %inflight.path().display(),
                         error = %e,

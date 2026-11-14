@@ -971,9 +971,9 @@ impl Engine {
     /// anything here could intervene.
     ///
     /// The producer's run is an ordinary one as far as the pools go — its
-    /// deps, a sandbox permit, its cpu — which is sound only because nothing
-    /// up the stack holds any of them: a consumer acquires before its execute
-    /// lock, permit and admission (`Engine::acquire_credentials`).
+    /// deps, its admission for cpu and a `sandbox` slot — which is sound only
+    /// because nothing up the stack holds any of them: a consumer acquires
+    /// before its execute lock and admission (`Engine::acquire_credentials`).
     async fn material_from_producer(
         self: &Arc<Self>,
         rs: &Arc<RequestState>,
@@ -1215,11 +1215,12 @@ impl Engine {
     /// Acquire the material of every credential a target declared, without
     /// presenting any of it.
     ///
-    /// Called before the target takes its execute lock, its sandbox permit or
-    /// its cpu: acquiring can *build* — a producer source is an `execute` of
-    /// its own, with deps, the producer's build lock, a permit and cpu of its
-    /// own — and a consumer holding any of those while it waits on that build
-    /// deadlocks once the pool is small enough (`-j 1`, one permit) or a plain
+    /// Called before the target takes its execute lock or its admission (cpu
+    /// and a `sandbox` slot): acquiring can *build* — a producer source is an
+    /// `execute` of its own, with deps, the producer's build lock, and cpu
+    /// and a sandbox slot of its own — and a consumer holding any of those
+    /// while it waits on that build deadlocks once the pool is small enough
+    /// (`-j 1`, `--resource sandbox=1`) or a plain
     /// run of the producer holds the producer's lock while it waits for the
     /// pool. [`present_credentials`](Self::present_credentials) writes the
     /// material into the sandbox once the run has its pools.

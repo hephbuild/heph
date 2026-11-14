@@ -74,16 +74,17 @@
 //! ## The reclaim backlog is bounded
 //!
 //! The queue itself is unbounded, and posting never blocks — but what can be
-//! posted to the reclaim lane is: a managed driver's execute takes a sandbox
-//! permit before its sandbox exists ([`crate::engine::sandbox_permits`]), and
-//! the permit rides in that sandbox's [`SandboxTeardown`] into its removal
-//! job, released when the removal returns. Live sandboxes plus sandboxes
-//! queued or being removed number at most the engine's permit count `S` (a
-//! credential producer takes one too: its consumer acquires credentials before
-//! its own permit, so no run waits for a permit while holding one). When
-//! removal falls behind, new
-//! runs wait instead of the disk filling. Outside the bound: failed sandboxes
-//! kept for diagnostics (one per failed addr) and invocation sandboxes.
+//! posted to the reclaim lane is: a managed driver's execute is admitted with
+//! one slot of the `sandbox` resource pool beside its cpu, before its sandbox
+//! exists (`resource_pool`'s module docs), and that slot, split off the grant,
+//! rides in the sandbox's [`SandboxTeardown`] into its removal job, released
+//! when the removal returns. Live sandboxes plus sandboxes queued or being
+//! removed number at most the pool's capacity (a credential producer takes a
+//! slot too: its consumer acquires credentials before its own admission, so
+//! no run waits for a slot while holding one). When removal falls behind, new
+//! runs wait in admission instead of the disk filling. Outside the bound:
+//! failed sandboxes kept for diagnostics (one per failed addr) and invocation
+//! sandboxes.
 use crossbeam_channel::{Sender, unbounded};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
@@ -334,20 +335,24 @@ pub mod generation {
 /// but the logical directory — the same operation the next execute's
 /// `remove_stale` would perform, just sooner.
 ///
-/// It also carries the run's sandbox permit, when it took one
-/// ([`with_permit`](Self::with_permit)): every path that queues a removal
-/// moves the permit into that job, released once the removal returns, and
-/// every path that queues none — `leave_for_diagnostics`, a `complete` with no
-/// bridge job — drops it at once.
+/// It also carries the run's `sandbox` pool slot, when it took one
+/// ([`with_sandbox_slot`](Self::with_sandbox_slot)): every path that queues a
+/// removal moves the slot into that job, released once the removal returns,
+/// and every path that queues none — `leave_for_diagnostics`, a `complete`
+/// with no bridge job — drops it at once.
 pub struct SandboxTeardown {
     dir: PathBuf,
     generation: u64,
     pending: PendingCounter,
     /// The bridge-owned cleanup closure, handed over once the run responded.
     job: Option<SandboxCleanupJob>,
-    /// This sandbox's place in the engine's
-    /// [`SandboxPermits`](crate::engine::sandbox_permits::SandboxPermits).
-    permit: Option<crate::engine::sandbox_permits::SandboxPermit>,
+    /// This sandbox's slot in the engine's `sandbox` pool, split off the
+    /// run's admission grant.
+    slot: Option<crate::engine::resource_pool::Reservation>,
+    /// How long each removal this teardown queues sleeps first: a test
+    /// stands in a slow disk with it.
+    #[cfg(any(test, feature = "test-support"))]
+    removal_delay: std::time::Duration,
     armed: bool,
 }
 
@@ -362,20 +367,33 @@ impl std::fmt::Debug for SandboxTeardown {
             .field("generation", &self.generation)
             .field("armed", &self.armed)
             .field("job", &self.job.is_some())
-            .field("permit", &self.permit.is_some())
+            .field("slot", &self.slot.is_some())
             .finish()
     }
 }
 
-/// `job`, releasing `permit` (when there is one) once it has run.
+/// `job`, releasing `slot` (when there is one) once it has run — whether it
+/// removed, declined (a successor owns the path), failed or panicked — or
+/// when the job is dropped unrun (a closed lane). The release runs on the
+/// reclaim lane's OS thread; `Reservation`'s drop needs no runtime and wakes
+/// a queued tokio waiter (`resource_pool`'s module docs).
 fn releasing(
     job: SandboxCleanupJob,
-    permit: Option<crate::engine::sandbox_permits::SandboxPermit>,
+    slot: Option<crate::engine::resource_pool::Reservation>,
+    delay: std::time::Duration,
 ) -> SandboxCleanupJob {
-    match permit {
-        Some(permit) => permit.release_after(job),
-        None => job,
-    }
+    let Some(slot) = slot else {
+        return job;
+    };
+    Box::new(move || {
+        // Dropped on every way out of this closure, an unwind included, and
+        // with the closure when it never runs.
+        let _slot = slot;
+        if !delay.is_zero() {
+            thread::sleep(delay);
+        }
+        job()
+    })
 }
 
 impl SandboxTeardown {
@@ -387,19 +405,41 @@ impl SandboxTeardown {
             generation,
             pending,
             job: None,
-            permit: None,
+            slot: None,
+            #[cfg(any(test, feature = "test-support"))]
+            removal_delay: std::time::Duration::ZERO,
             armed: true,
         }
     }
 
-    /// Hand this teardown the run's sandbox permit, released when the
+    /// Hand this teardown the run's `sandbox` pool slot, released when the
     /// sandbox's removal returns (or at once, when nothing will remove it).
-    pub fn with_permit(
+    pub fn with_sandbox_slot(
         mut self,
-        permit: Option<crate::engine::sandbox_permits::SandboxPermit>,
+        slot: Option<crate::engine::resource_pool::Reservation>,
     ) -> Self {
-        self.permit = permit;
+        self.slot = slot;
         self
+    }
+
+    /// Make each removal this teardown queues sleep `delay` first, so a test
+    /// can stand in a slow disk.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_removal_delay(mut self, delay: std::time::Duration) -> Self {
+        self.removal_delay = delay;
+        self
+    }
+
+    /// The test-only removal delay; zero outside tests.
+    fn removal_delay(&self) -> std::time::Duration {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            self.removal_delay
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        {
+            std::time::Duration::ZERO
+        }
     }
 
     /// The claimed sandbox directory.
@@ -421,18 +461,19 @@ impl SandboxTeardown {
     /// bridge cleanup, generation-guarded. Call only after every reader of the
     /// sandbox is done — `cache_locally` reads from it.
     ///
-    /// The permit rides in the job; with no job (a driver that hands over no
-    /// cleanup) nothing is queued and it is released here.
+    /// The sandbox slot rides in the job; with no job (a driver that hands
+    /// over no cleanup) nothing is queued and it is released here.
     pub fn complete(mut self, label: String) {
         self.armed = false;
-        let permit = self.permit.take();
+        let slot = self.slot.take();
         if let Some(job) = self.job.take() {
             enqueue(
                 Lane::Reclaim,
                 label,
                 releasing(
                     generation::guarded(self.dir.clone(), self.generation, job),
-                    permit,
+                    slot,
+                    self.removal_delay(),
                 ),
                 Arc::clone(&self.pending),
             );
@@ -448,13 +489,14 @@ impl SandboxTeardown {
     /// cleanup, surfacing a failed target's exit status with its output
     /// already deleted.
     ///
-    /// The permit is released here: a sandbox kept for diagnostics is outside
-    /// the permit bound, which it cannot hold — nothing removes it until the
-    /// addr runs again. It is bounded on its own, at one tree per failed addr.
+    /// The sandbox slot is released here: a sandbox kept for diagnostics is
+    /// outside the `sandbox` pool's bound, which it cannot hold — nothing
+    /// removes it until the addr runs again. It is bounded on its own, at one
+    /// tree per failed addr.
     pub fn leave_for_diagnostics(mut self) {
         self.armed = false;
         self.job = None;
-        self.permit = None;
+        self.slot = None;
     }
 
     /// The target failed, and its sandbox must not outlive the failure (its
@@ -494,7 +536,8 @@ impl SandboxTeardown {
             format!("reclaim {}", self.dir.display()),
             releasing(
                 generation::guarded(self.dir.clone(), self.generation, job),
-                self.permit.take(),
+                self.slot.take(),
+                self.removal_delay(),
             ),
             Arc::clone(&self.pending),
         );
@@ -508,7 +551,8 @@ impl SandboxTeardown {
             label,
             releasing(
                 Box::new(move || generation::remove_stale(&dir, generation)),
-                self.permit.take(),
+                self.slot.take(),
+                self.removal_delay(),
             ),
             Arc::clone(&self.pending),
         );
@@ -1523,20 +1567,21 @@ mod tests {
         assert_eq!(pending.load(Ordering::Acquire), 0);
     }
 
-    /// Every way a teardown resolves gives its sandbox permit back: after the
+    /// Every way a teardown resolves gives its `sandbox` slot back: after the
     /// removal for the three that queue one (complete, material reclaim, a
     /// drop), at once for the two that queue none (left for diagnostics, a
     /// completion with no bridge job). A leg that kept it would shrink the pool
     /// by one for the rest of the process.
     #[test]
-    fn every_teardown_path_releases_its_permit() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .expect("rt");
-        let pool = crate::engine::sandbox_permits::SandboxPermits::new(1);
-        let addr = hmodel::htaddr::parse_addr("//p:t").expect("addr");
-        let token = hcore::hasync::StdCancellationToken::new();
+    fn every_teardown_path_releases_its_sandbox_slot() {
+        use crate::engine::resource_pool::{Limit, ResourcePool};
+        use futures::FutureExt as _;
+        use hplugin::provider::PoolName;
+        const CPU: u64 = hplugin::driver::Resources::MICROS_PER_CPU;
+        let pool = ResourcePool::new([
+            (PoolName::cpu(), Limit::Bounded(4 * CPU)),
+            (PoolName::sandbox(), Limit::Bounded(1)),
+        ]);
         let tmp = tempfile::tempdir().expect("tempdir");
         let pending = counter();
 
@@ -1563,22 +1608,91 @@ mod tests {
         for (i, (leg, resolve, removes)) in legs.into_iter().enumerate() {
             let sandbox = tmp.path().join(format!("sandbox{i}"));
             std::fs::create_dir_all(&sandbox).expect("mkdir");
-            // A pool of one: this acquire only returns if the previous leg
-            // gave its permit back.
-            let permit = rt
-                .block_on(async {
-                    tokio::time::timeout(Duration::from_secs(30), pool.acquire(&addr, &token)).await
-                })
-                .unwrap_or_else(|_| panic!("the leg before {leg} kept its permit"))
-                .expect("acquire");
+            // A pool of one: granted at once only if the previous leg gave
+            // its slot back.
+            let mut grant = pool
+                .acquire_with(&Default::default(), &[(PoolName::sandbox(), 1)])
+                .expect("acquire")
+                .now_or_never()
+                .unwrap_or_else(|| panic!("the leg before {leg} kept its slot"))
+                .expect("granted");
+            let slot = grant.split_off(PoolName::SANDBOX).expect("a sandbox slot");
+            // The run ends before its sandbox is removed: its cpu returns now.
+            drop(grant);
+            assert_eq!(pool.available(PoolName::CPU), Some(4 * CPU), "{leg}");
+            assert_eq!(pool.available(PoolName::SANDBOX), Some(0), "{leg}");
             let claim = generation::claim(&sandbox);
             let teardown = SandboxTeardown::arm(sandbox.clone(), claim, Arc::clone(&pending))
-                .with_permit(Some(permit));
+                .with_sandbox_slot(Some(slot));
             resolve(teardown, &sandbox);
             wait_drained(&pending, Duration::from_secs(30));
-            let g = pool.gauge();
-            assert_eq!((g.held, g.pending_removal), (0, 0), "{leg}");
+            assert_eq!(pool.available(PoolName::SANDBOX), Some(1), "{leg}");
             assert_eq!(!sandbox.exists(), removes, "{leg}: removed?");
         }
+    }
+
+    /// A removal job holds its slot while it runs and gives it back after,
+    /// on a panic, and when it is dropped unrun (a closed lane). A queued
+    /// waiter is woken by the release, from a thread with no runtime.
+    #[test]
+    fn a_reclaim_job_releases_its_slot_however_it_ends() {
+        use crate::engine::resource_pool::{Limit, Reservation, ResourcePool};
+        use futures::FutureExt as _;
+        use hplugin::provider::PoolName;
+        let pool = ResourcePool::new([
+            (PoolName::cpu(), Limit::Bounded(4_000_000)),
+            (PoolName::sandbox(), Limit::Bounded(1)),
+        ]);
+        let slot = |pool: &Arc<ResourcePool>| -> Reservation {
+            let mut grant = pool
+                .acquire_with(&Default::default(), &[(PoolName::sandbox(), 1)])
+                .expect("acquire")
+                .now_or_never()
+                .expect("granted at once")
+                .expect("granted");
+            grant.split_off(PoolName::SANDBOX).expect("slot")
+        };
+
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let job = releasing(
+            Box::new({
+                let pool = Arc::clone(&pool);
+                let seen = Arc::clone(&seen);
+                move || {
+                    *seen.lock().expect("lock") = pool.available(PoolName::SANDBOX);
+                    Ok(())
+                }
+            }),
+            Some(slot(&pool)),
+            Duration::ZERO,
+        );
+        // A run queued behind the slot, woken by the job's release on
+        // another OS thread.
+        let mut waiter = pool
+            .acquire_with(&Default::default(), &[(PoolName::sandbox(), 1)])
+            .expect("acquire");
+        assert!((&mut waiter).now_or_never().is_none(), "the slot is held");
+        std::thread::spawn(job)
+            .join()
+            .expect("no panic")
+            .expect("job");
+        assert_eq!(*seen.lock().expect("lock"), Some(0), "held during removal");
+        let woken = futures::executor::block_on(waiter).expect("woken by the release");
+        drop(woken);
+
+        let panics = releasing(
+            Box::new(|| panic!("removal panicked")),
+            Some(slot(&pool)),
+            Duration::ZERO,
+        );
+        assert!(catch_unwind(AssertUnwindSafe(panics)).is_err());
+        assert_eq!(pool.available(PoolName::SANDBOX), Some(1), "after a panic");
+
+        drop(releasing(
+            Box::new(|| Ok(())),
+            Some(slot(&pool)),
+            Duration::ZERO,
+        ));
+        assert_eq!(pool.available(PoolName::SANDBOX), Some(1), "dropped unrun");
     }
 }

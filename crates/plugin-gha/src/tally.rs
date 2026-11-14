@@ -929,7 +929,6 @@ mod tests {
                 declared: None,
                 reserved: None,
                 queued_ms: None,
-                sandbox_wait_ms: None,
             },
         ));
         t.apply(&ev(
@@ -1037,7 +1036,6 @@ mod tests {
                 declared: None,
                 reserved: None,
                 queued_ms: None,
-                sandbox_wait_ms: None,
             },
         ));
         let c = t.counters();
@@ -1167,7 +1165,6 @@ mod tests {
                     declared: None,
                     reserved: None,
                     queued_ms: None,
-                    sandbox_wait_ms: None,
                 },
             ));
         }

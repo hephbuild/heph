@@ -100,9 +100,8 @@ impl Engine {
         let Admitted {
             credentials,
             execute_guard,
-            sandbox_permit,
             reservation,
-            sandbox_wait_ms,
+            sandbox_slot,
             queued_ms,
         } = self
             .admit_with_credentials(&rs, addr, &driver, def, resolved_credentials)
@@ -135,7 +134,6 @@ impl Engine {
             &def.target.demand,
             &reservation,
             queued_ms,
-            sandbox_wait_ms,
         );
         // Held until the run ends; a failed run hands it back before keeping
         // what it failed with (D17).
@@ -184,15 +182,15 @@ impl Engine {
                 // last leg, mass fail-fast leaves one abandoned sandbox tree
                 // per *cancelled* execute and nothing ever collects them
                 // (`gc` has no sandbox sweep).
-                // The permit rides in the teardown from here: released when
-                // the removal it queues returns, or at once by
+                // The run's `sandbox` slot rides in the teardown from here:
+                // released when the removal it queues returns, or at once by
                 // `leave_for_diagnostics`.
-                let mut sandbox_teardown = crate::engine::sandbox_cleaner::SandboxTeardown::arm(
+                let mut sandbox_teardown = self.sandbox_teardown(
                     sandbox_dir.clone(),
                     sandbox_generation,
                     rs.bg_pending(),
-                )
-                .with_permit(sandbox_permit);
+                    sandbox_slot,
+                );
 
                 // Everything fallible between the claim and the run response
                 // lives in the shared block, so an `Err` — a failing target
@@ -576,37 +574,36 @@ impl Engine {
     }
 
     /// Everything a run takes before its sandbox exists, in the one order
-    /// that cannot deadlock: credential material, the execute lock, a sandbox
-    /// permit (managed drivers only), then admission.
+    /// that cannot deadlock: credential material, the execute lock, then
+    /// admission — whose request, for a managed driver, carries the run's
+    /// `sandbox` slot beside its cpu (see `resource_pool`'s module docs).
     ///
-    /// **Material before all three.** Acquiring can build — a producer source
-    /// is an `execute` of its own, needing its deps, the producer's gateway
-    /// and execute lock, a sandbox permit and cpu — so a run holding any of
-    /// its own while it acquires can wait on itself:
+    /// **Material before both.** Acquiring can build — a producer source is
+    /// an `execute` of its own, needing its deps, the producer's gateway and
+    /// execute lock, and its own admission (cpu and a sandbox slot) — so a run
+    /// holding any of its own while it acquires can wait on itself:
     ///
     /// - the execute lock is a leaf (`ResultLock::lock_execute`): nothing is
     ///   acquired under it, and a producer's gateway would be;
-    /// - the producer, or a dep of it, waits for the permit or the cpu its
-    ///   consumer holds — at once with one permit, or at `-j 1`;
+    /// - the producer, or a dep of it, waits for the sandbox slot or the cpu
+    ///   its consumer holds — at once with `--resource sandbox=1`, or at
+    ///   `-j 1`;
     /// - a plain run of the producer holds the producer's gateway while it
-    ///   waits for a permit the consumer holds, and the consumer waits for
+    ///   waits for a slot the consumer holds, and the consumer waits for
     ///   that gateway.
     ///
     /// Acquiring first, the consumer holds only what its caller does (its
     /// result lock, its scratch slots), none of which a producer's build
     /// takes.
     ///
-    /// **The permit after the execute lock** (one run per addr owns its
-    /// sandbox path, and a target parked on the lock holds no permit) and
-    /// **before admission**, so a run parked on cleanup holds no cpu. Permits
-    /// come back from the reclaim lane, which waits on nothing, so the wait
-    /// ends; after admission, a run stuck behind cleanup would hold cpu it
-    /// cannot use, idling the machine on a slow disk. The cost of this order:
-    /// a run queued for admission holds a permit for a sandbox not yet made.
+    /// **One admission for cpu and sandbox**, atomic and FIFO: a run waiting
+    /// for cleanup holds no cpu, and a run waiting for cpu holds no slot for
+    /// a sandbox not yet made. Slots come back from the reclaim lane, which
+    /// waits on nothing, so the wait ends.
     ///
     /// **Material that lapsed while the run waited** (expired, or inside its
-    /// skew margin) is acquired again with all three handed back first:
-    /// re-acquiring while holding them is the deadlock above. Bounded —
+    /// skew margin) is acquired again with everything handed back first:
+    /// re-acquiring while holding it is the deadlock above. Bounded —
     /// material whose lifetime is shorter than the wait fails the run naming
     /// the credential instead of looping.
     async fn admit_with_credentials(
@@ -647,41 +644,29 @@ impl Engine {
                 )
                 .await?;
 
-            // A managed run's sandbox, live and then queued on the reclaim
-            // lane, holds a permit until its removal returns, so the
-            // sandboxes on disk number at most `S`. Failed sandboxes kept for
-            // diagnostics are outside the bound; see `sandbox_permits`.
-            hcore::hmemoizer::set_phase("execute:sandbox_permit");
-            let (sandbox_permit, sandbox_wait_ms) = if driver.managed {
-                let started = std::time::Instant::now();
-                let permit = self
-                    .sandbox_permits
-                    .acquire(addr, rs.ctoken())
-                    .await
-                    .with_context(|| format!("waiting for a sandbox for {addr}"))?;
-                (Some(permit), Some(elapsed_ms(started)))
-            } else {
-                (None, None)
-            };
-
             // Admission AFTER dep resolution so nothing is reserved while
             // waiting for deps — prevents the classic diamond deadlock where
             // mid-nodes hold capacity while waiting for a leaf that also needs
             // some.
             hcore::hmemoizer::set_phase("execute:semaphore_acquire");
             let admit_started = std::time::Instant::now();
-            let reservation = self.admit(rs, addr, &def.target.demand).await?;
+            let mut reservation = self
+                .admit(rs, addr, &def.target.demand, driver.managed)
+                .await?;
             // On `ExecuteStart`, so a wait under the notice threshold (which
             // announces nothing) is still answerable from the stream.
             let queued_ms = elapsed_ms(admit_started);
+            // The sandbox slot outlives the run: it rides in the sandbox's
+            // teardown into its removal. Split off before anything reads the
+            // grant, so it is never part of the allotment or `reserved`.
+            let sandbox_slot = reservation.split_off(hplugin::provider::PoolName::SANDBOX);
 
             let Some(lapsed) = credentials.lapsed(std::time::SystemTime::now()) else {
                 return Ok(Admitted {
                     credentials,
                     execute_guard,
-                    sandbox_permit,
                     reservation,
-                    sandbox_wait_ms,
+                    sandbox_slot,
                     queued_ms,
                 });
             };
@@ -700,10 +685,26 @@ impl Engine {
                 "credential material lapsed while the run waited to start; acquiring it again"
             );
             drop(reservation);
-            drop(sandbox_permit);
+            drop(sandbox_slot);
             drop(execute_guard);
             resolved = credentials.into_resolved();
         }
+    }
+
+    /// Own the teardown of the sandbox `dir` just claimed as `generation`,
+    /// carrying the run's `sandbox` pool slot into its removal.
+    fn sandbox_teardown(
+        &self,
+        dir: std::path::PathBuf,
+        generation: u64,
+        pending: crate::engine::sandbox_cleaner::PendingCounter,
+        slot: Option<crate::engine::resource_pool::Reservation>,
+    ) -> crate::engine::sandbox_cleaner::SandboxTeardown {
+        let teardown = crate::engine::sandbox_cleaner::SandboxTeardown::arm(dir, generation, pending)
+            .with_sandbox_slot(slot);
+        #[cfg(any(test, feature = "test-support"))]
+        let teardown = teardown.with_removal_delay(self.sandbox_removal_delay);
+        teardown
     }
 
     /// Reserve what `addr` declares (`resources`; an undeclared `cpu` is one
@@ -720,11 +721,16 @@ impl Engine {
     /// `AdmissionWaitEnd` on grant or cancellation, the way
     /// `acquire_with_notice` announces a lock wait. A grant within the
     /// threshold announces nothing.
+    ///
+    /// `managed`: the run makes a sandbox, so the request carries `sandbox:
+    /// 1` on top of what the target declares, granted atomically with it.
+    /// The caller splits it off the grant (`Reservation::split_off`).
     pub(crate) async fn admit(
         &self,
         rs: &Arc<RequestState>,
         addr: &Addr,
         resources: &hplugin::driver::Demand,
+        managed: bool,
     ) -> anyhow::Result<crate::engine::resource_pool::Reservation> {
         let pool = self.pools.get();
         // Observed *before* the acquire, so the stamp times the wait rather than
@@ -736,8 +742,9 @@ impl Engine {
             crate::engine::engine::cpu_free_cpus(&self.pools),
             d.now_ms(),
         );
+        let sandbox = managed.then(|| (hplugin::provider::PoolName::sandbox(), 1));
         let acquire = pool
-            .acquire(resources)
+            .acquire_with(resources, sandbox.as_slice())
             .map_err(|err| anyhow::anyhow!("{addr} {err}"))?;
         tokio::pin!(acquire);
         let granted: anyhow::Result<_> =
@@ -848,12 +855,13 @@ impl<'l> SandboxLease<'l> {
 struct Admitted {
     credentials: crate::engine::credential::HeldCredentials,
     execute_guard: crate::engine::result_lock::ExecuteGuard,
-    /// `None` for a non-managed driver, which makes no sandbox.
-    sandbox_permit: Option<crate::engine::sandbox_permits::SandboxPermit>,
+    /// Everything granted but the sandbox slot: released when the run ends.
     reservation: crate::engine::resource_pool::Reservation,
-    /// How long the permit took; `None` when none was taken.
-    sandbox_wait_ms: Option<u64>,
-    /// How long admission took.
+    /// The run's `sandbox` slot, split off the grant: released once its
+    /// sandbox has been removed. `None` for a non-managed driver, which
+    /// makes no sandbox.
+    sandbox_slot: Option<crate::engine::resource_pool::Reservation>,
+    /// How long admission took, the wait for a sandbox slot included.
     queued_ms: u64,
 }
 
@@ -949,9 +957,8 @@ pub(crate) fn entrypoint_allotment(
 
 /// The `ExecuteStart` event: what the target declared (only its declared
 /// keys, in each pool's unit's base) and what it was granted, after
-/// clamping, how long admission took, and how long the run waited for a
-/// sandbox (`None` for a run that takes no sandbox permit). `reserved` always
-/// carries `cpu`, 0 on a zero-cost grant.
+/// clamping, and how long admission took. `reserved` always carries `cpu`, 0
+/// on a zero-cost grant.
 pub(crate) fn execute_start(
     addr: String,
     driver: String,
@@ -959,7 +966,6 @@ pub(crate) fn execute_start(
     declared: &hplugin::driver::Demand,
     reservation: &crate::engine::resource_pool::Reservation,
     queued_ms: u64,
-    sandbox_wait_ms: Option<u64>,
 ) -> crate::engine::event::BuildEventKind {
     use hplugin::provider::PoolName;
     let declared = declared
@@ -978,7 +984,6 @@ pub(crate) fn execute_start(
         declared: Some(declared),
         reserved: Some(reserved),
         queued_ms: Some(queued_ms),
-        sandbox_wait_ms,
     }
 }
 
@@ -1036,27 +1041,17 @@ mod tests {
             ],
             &declared,
         );
-        let ev = execute_start(
-            "//p:t".into(),
-            "exec".into(),
-            true,
-            &declared,
-            &r,
-            7,
-            Some(3),
-        );
+        let ev = execute_start("//p:t".into(), "exec".into(), true, &declared, &r, 7);
         let BuildEventKind::ExecuteStart {
             declared,
             reserved,
             queued_ms,
-            sandbox_wait_ms,
             ..
         } = ev
         else {
             panic!("wrong variant: {ev:?}");
         };
         assert_eq!(queued_ms, Some(7));
-        assert_eq!(sandbox_wait_ms, Some(3));
         assert_eq!(
             declared,
             Some(std::collections::BTreeMap::from([("cpu".into(), 16 * CPU)]))
@@ -1074,7 +1069,7 @@ mod tests {
         let declared = req(&[("cpu", 0)]);
         let r = grant(&[("cpu", Limit::Bounded(4 * CPU))], &declared);
         let BuildEventKind::ExecuteStart { reserved, .. } =
-            execute_start("//p:t".into(), "exec".into(), true, &declared, &r, 0, None)
+            execute_start("//p:t".into(), "exec".into(), true, &declared, &r, 0)
         else {
             panic!("wrong variant");
         };
