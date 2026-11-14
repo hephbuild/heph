@@ -1,5 +1,5 @@
 use crate::engine::local_cache::{
-    EntryWriter, Existence, LocalCache, MANIFEST_V1, Manifest, NotFoundError, SizedReader,
+    EntryWriter, Existence, LocalCache, MANIFESTS, Manifest, NotFoundError, SizedReader,
     TargetStream,
 };
 use anyhow::{Context, Result};
@@ -303,7 +303,7 @@ impl LocalCache for LocalCacheFS {
 }
 
 /// Recursively walk `dir`; for each `__target_*` directory (one per target),
-/// read any one revision's `MANIFEST_V1` to recover the addr (`manifest.target`
+/// read any one revision's manifest to recover the addr (`manifest.target`
 /// is authoritative — the on-disk path hashes arg'd addrs irreversibly) and push
 /// it once. Does not descend into a target dir. Targets whose manifests are all
 /// missing/corrupt are skipped (best-effort; GC tolerates noise).
@@ -339,7 +339,7 @@ fn collect_targets(dir: &Path, out: &mut Vec<String>) -> Result<()> {
 }
 
 /// Read `manifest.target` from the first revision under a target dir that has a
-/// readable `MANIFEST_V1`. `None` if none do.
+/// readable manifest (any of `MANIFESTS`). `None` if none do.
 fn read_any_target_addr(target_dir: &Path) -> Result<Option<String>> {
     for entry in fs::read_dir(target_dir).with_context(|| format!("read {target_dir:?}"))? {
         let entry = entry.with_context(|| format!("read dir entry under {target_dir:?}"))?;
@@ -350,14 +350,16 @@ fn read_any_target_addr(target_dir: &Path) -> Result<Option<String>> {
         {
             continue;
         }
-        let manifest_path = entry.path().join(MANIFEST_V1);
-        let buf = match fs::read(&manifest_path) {
-            Ok(b) => b,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e).with_context(|| format!("read {manifest_path:?}")),
-        };
-        if let Ok(manifest) = borsh::from_slice::<Manifest>(&buf) {
-            return Ok(Some(manifest.target));
+        for name in MANIFESTS {
+            let manifest_path = entry.path().join(name);
+            let buf = match fs::read(&manifest_path) {
+                Ok(b) => b,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e).with_context(|| format!("read {manifest_path:?}")),
+            };
+            if let Ok(manifest) = borsh::from_slice::<Manifest>(&buf) {
+                return Ok(Some(manifest.target));
+            }
         }
     }
     Ok(None)
@@ -544,7 +546,8 @@ mod tests {
             "t".to_string(),
             Default::default(),
         );
-        for h in ["h1", "h2"] {
+        // One revision per manifest name: the addr is recovered from either.
+        for (h, manifest_name) in [("h1", MANIFESTS[0]), ("h2", MANIFESTS[1])] {
             let manifest = Manifest {
                 version: "1.0.0".to_string(),
                 target: addr.format(),
@@ -552,7 +555,7 @@ mod tests {
                 hashin: h.to_string(),
                 artifacts: vec![],
             };
-            let mut w = cache.writer(&addr, h, MANIFEST_V1)?;
+            let mut w = cache.writer(&addr, h, manifest_name)?;
             borsh::to_writer(&mut w, &manifest)?;
             w.commit()?;
         }

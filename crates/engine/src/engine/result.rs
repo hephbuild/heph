@@ -7761,7 +7761,7 @@ mod tests {
             &self,
             key: &str,
         ) -> anyhow::Result<Option<Pin<Box<dyn tokio::io::AsyncRead + Send>>>> {
-            if !key.ends_with(crate::engine::local_cache::MANIFEST_V1) {
+            if !key.ends_with(crate::engine::local_cache::MANIFEST_V2) {
                 // The blob is gone, even though `exists` still claims otherwise.
                 return Ok(None);
             }
@@ -7925,7 +7925,7 @@ mod tests {
             &self,
             key: &str,
         ) -> anyhow::Result<Option<Pin<Box<dyn tokio::io::AsyncRead + Send>>>> {
-            if key.ends_with(crate::engine::local_cache::MANIFEST_V1) {
+            if key.ends_with(crate::engine::local_cache::MANIFEST_V2) {
                 self.metadata.fetch_add(1, Ordering::SeqCst);
             } else {
                 self.blobs.fetch_add(1, Ordering::SeqCst);
@@ -8228,7 +8228,7 @@ mod tests {
             if path.is_dir() {
                 removed += evict_remote_blobs(&path);
             } else if path.file_name().and_then(|n| n.to_str())
-                != Some(crate::engine::local_cache::MANIFEST_V1)
+                != Some(crate::engine::local_cache::MANIFEST_V2)
             {
                 std::fs::remove_file(&path).expect("evict blob");
                 removed += 1;
@@ -8252,7 +8252,7 @@ mod tests {
                 continue;
             }
             if path.file_name().and_then(|n| n.to_str())
-                != Some(crate::engine::local_cache::MANIFEST_V1)
+                != Some(crate::engine::local_cache::MANIFEST_V2)
             {
                 continue;
             }
@@ -11659,6 +11659,9 @@ mod tests {
         /// it ran on. That name is the only direct evidence of which background
         /// lane the rmdir was routed to.
         cleanup_thread: Option<SArc<std::sync::OnceLock<String>>>,
+        /// When set, every output is this file as a borrowed `TarPath` instead
+        /// of a raw `hi` — the shape whose storage the content scan decides.
+        container: Option<SArc<std::path::PathBuf>>,
     }
 
     #[async_trait]
@@ -11716,11 +11719,18 @@ mod tests {
                         group: group.clone(),
                         name: name.clone(),
                         r#type: outputartifact::Type::Output,
-                        content: outputartifact::Content::Raw(outputartifact::ContentRaw {
-                            data: b"hi".to_vec(),
-                            path: name.clone(),
-                            x: false,
-                        }),
+                        content: match &self.container {
+                            Some(path) => outputartifact::Content::TarPath(
+                                outputartifact::ContentPath::borrowed(
+                                    path.to_string_lossy().into_owned(),
+                                ),
+                            ),
+                            None => outputartifact::Content::Raw(outputartifact::ContentRaw {
+                                data: b"hi".to_vec(),
+                                path: name.clone(),
+                                x: false,
+                            }),
+                        },
                         hashout: "feedface".to_string(),
                     })
                     .collect(),
@@ -11860,6 +11870,7 @@ mod tests {
                 exec_count,
                 outputs: SArc::new(outputs),
                 cleanup_thread,
+                container: None,
             })
         })?;
         let addr = Addr::new(
@@ -11876,14 +11887,36 @@ mod tests {
         Ok((Arc::new(engine), dir, addr))
     }
 
+    /// What the target of [`resolve_one_artifact_at_spill`] emits.
+    enum SpillOutput {
+        /// A container the content scan stores as is (a 2 MiB tar of gzip
+        /// payload): the only kind of blob a consumer can open as a file.
+        Verbatim,
+        /// The raw `hi`, which heph packs itself and always compresses.
+        Compressed,
+    }
+
     /// Resolve one cacheable target through the **real** production cache stack
     /// (`Mem(Spill(SQLite, FS))`, mem tier at its default) at the given spill
     /// threshold, and hand back its single result artifact. Held `TempDir` is
     /// returned because the cache lives under it.
+    ///
+    /// See [`SpillOutput`] for what the target emits.
     async fn resolve_one_artifact_at_spill(
         spill_threshold_bytes: u64,
+        output: SpillOutput,
     ) -> (Arc<dyn Content>, tempfile::TempDir) {
         let dir = tempdir().expect("tempdir");
+        let container = match output {
+            SpillOutput::Verbatim => {
+                let src = dir.path().join("container");
+                std::fs::create_dir_all(&src).expect("mkdir");
+                let (path, _) =
+                    crate::engine::cache_codec::tests::tar_of_one(&src, b"\x1f\x8b", 2 << 20);
+                Some(SArc::new(path))
+            }
+            SpillOutput::Compressed => None,
+        };
         let mut engine = Engine::new(Config {
             parallelism: None,
             spill_threshold_bytes,
@@ -11891,11 +11924,12 @@ mod tests {
         })
         .expect("engine");
         engine
-            .register_driver(|_| {
+            .register_driver(move |_| {
                 Box::new(BlockingDriver {
                     exec_count: SArc::new(AtomicUsize::new(0)),
                     outputs: SArc::new(vec![("main".to_string(), "out_main".to_string())]),
                     cleanup_thread: None,
+                    container: container.clone(),
                 })
             })
             .expect("driver");
@@ -11932,13 +11966,15 @@ mod tests {
     /// whole path off with nothing failing. The unit tests pin the tiers; this
     /// pins that they compose, which is the property that was actually broken.
     ///
-    /// The spill threshold is lowered to 64 bytes so the packed tar lands in the
-    /// FS blob store without the test writing megabytes. The mem tier is left at
+    /// The spill threshold is lowered to 64 bytes so the 2 MiB container lands
+    /// in the FS blob store (at the default 8 MiB it would stay in sqlite). The
+    /// mem tier is left at
     /// its default — it is what production runs, and it is the tier sitting on
-    /// top of the answer.
+    /// top of the answer. The container is one stored verbatim: a compressed
+    /// blob has no file of decoded bytes to hand out (see the test below).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_cached_artifact_exposes_its_blob_file_for_direct_open() {
-        let (artifact, _dir) = resolve_one_artifact_at_spill(64).await;
+        let (artifact, _dir) = resolve_one_artifact_at_spill(64, SpillOutput::Verbatim).await;
 
         let path = artifact
             .file_path()
@@ -11957,6 +11993,34 @@ mod tests {
         );
     }
 
+    /// The other half of the direct-open contract: a compressed blob reports
+    /// no file even when it is spilled to one, because that file holds zstd
+    /// bytes, not the artifact — a consumer that opened it would read garbage
+    /// as a tar. It must still stream the decoded artifact.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_compressed_cached_artifact_reports_no_file_and_streams_decoded() {
+        let (artifact, _dir) = resolve_one_artifact_at_spill(1, SpillOutput::Compressed).await;
+
+        assert!(
+            artifact.file_path().is_none(),
+            "a compressed blob's file is not the artifact"
+        );
+        assert!(
+            artifact.seekable_reader().expect("seekable").is_none(),
+            "nor can it be seeked as one"
+        );
+        let entries: Vec<_> = artifact
+            .walk()
+            .expect("walk")
+            .map(|e| e.expect("entry").path)
+            .collect();
+        assert_eq!(
+            entries,
+            [std::path::PathBuf::from("out_main")],
+            "the stream decodes to the packed tar"
+        );
+    }
+
     /// The property that makes handing out a bare `PathBuf` safe at all: an fd
     /// opened from it keeps serving the bytes it was opened on, even after the
     /// same cache key is rewritten underneath it.
@@ -11969,7 +12033,7 @@ mod tests {
     /// consumer that opened the file could observe a torn mix of two revisions.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_fd_opened_from_the_path_survives_the_blob_being_rewritten() {
-        let (artifact, _dir) = resolve_one_artifact_at_spill(64).await;
+        let (artifact, _dir) = resolve_one_artifact_at_spill(64, SpillOutput::Verbatim).await;
         let path = artifact.file_path().expect("spilled blob has a path");
 
         let mut fd = std::fs::File::open(&path).expect("open before the rewrite");
@@ -12006,9 +12070,12 @@ mod tests {
     /// this branch and never the one above.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_small_cached_artifact_reports_no_file_and_still_streams() {
-        let (artifact, _dir) =
-            resolve_one_artifact_at_spill(crate::engine::config::DEFAULT_SPILL_THRESHOLD_BYTES)
-                .await;
+        // Verbatim, so the only reason there is no file is the threshold.
+        let (artifact, _dir) = resolve_one_artifact_at_spill(
+            crate::engine::config::DEFAULT_SPILL_THRESHOLD_BYTES,
+            SpillOutput::Verbatim,
+        )
+        .await;
 
         assert!(
             artifact.file_path().is_none(),
@@ -12320,7 +12387,7 @@ mod tests {
         // presence-probe and the per-caller read each parsed the manifest (two
         // backend reads per hit); now the probe stashes the parsed manifest on
         // `LockedResolution` and the caller filters its outputs from it.
-        use crate::engine::local_cache::MANIFEST_V1;
+        use crate::engine::local_cache::is_manifest_name;
         use crate::engine::local_cache_test_double::ForwardingCache;
 
         let dir = tempdir().expect("tempdir");
@@ -12339,8 +12406,10 @@ mod tests {
         engine.local_cache =
             SArc::new(ForwardingCache::new(engine.local_cache.clone()).on_reader({
                 let manifest_reads = SArc::clone(&manifest_reads);
+                // Every manifest name, misses included: a hit on a v2 revision
+                // must not also probe for a v1 manifest.
                 move |_, _, name| {
-                    if name == MANIFEST_V1 {
+                    if is_manifest_name(name) {
                         manifest_reads.fetch_add(1, Ordering::SeqCst);
                     }
                 }
@@ -12353,6 +12422,7 @@ mod tests {
                         exec_count,
                         outputs: SArc::new(vec![("main".to_string(), "out".to_string())]),
                         cleanup_thread: None,
+                        container: None,
                     })
                 }
             ))

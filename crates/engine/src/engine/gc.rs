@@ -23,7 +23,7 @@
 
 use crate::engine::Engine;
 use crate::engine::error::TargetNotFoundError;
-use crate::engine::local_cache::{Existence, MANIFEST_V1};
+use crate::engine::local_cache::{Existence, MANIFEST_V2, MANIFESTS};
 use crate::engine::request_state::RequestState;
 use crate::engine::result_lock::TargetGuard;
 use anyhow::{Context, Result};
@@ -187,7 +187,9 @@ impl Engine {
     /// `write_revision`).
     pub(crate) fn gc_entry(&self, addr: &Addr, hashin: &str) -> Result<u64> {
         let mut bytes = 0u64;
-        if let Some(manifest) = self.read_manifest(addr, hashin)? {
+        // Both manifests, not just the one reads prefer: a revision written by
+        // an older heph and by this one has two, and each names its own blobs.
+        for (_, manifest) in Self::read_all_manifests(&self.local_cache, addr, hashin)? {
             for a in &manifest.artifacts {
                 // A manifest can name blobs that were never downloaded (a
                 // revision mirrored from a remote materializes lazily), so only
@@ -204,9 +206,11 @@ impl Engine {
                 }
             }
         }
-        self.local_cache
-            .delete(addr, hashin, MANIFEST_V1)
-            .with_context(|| format!("delete manifest for {addr} {hashin}"))?;
+        for name in MANIFESTS {
+            self.local_cache
+                .delete(addr, hashin, name)
+                .with_context(|| format!("delete {name} for {addr} {hashin}"))?;
+        }
         Ok(bytes)
     }
 
@@ -381,7 +385,7 @@ impl Engine {
         } else {
             match self
                 .local_cache
-                .existence(addr, written_hashin, MANIFEST_V1)
+                .existence(addr, written_hashin, MANIFEST_V2)
             {
                 // Queued or committed, the revision exists as far as a budget
                 // decision is concerned. `Queued` is dropped without awaiting: it
@@ -423,7 +427,7 @@ impl Engine {
                 // mem tier cannot answer from a stale resident entry. Each of those
                 // three is pinned by its own test; without them this is not a
                 // barrier at all, and the failure is silent.
-                if let Err(e) = self.local_cache.exists(addr, written_hashin, MANIFEST_V1) {
+                if let Err(e) = self.local_cache.exists(addr, written_hashin, MANIFEST_V2) {
                     tracing::debug!(error = %format!("{e:#}"), %addr, "post-write gc barrier");
                     return TrimOutcome::Failed;
                 }
@@ -923,9 +927,9 @@ mod tests {
     use crate::engine::Config;
     use crate::engine::cache_test_support::{addr, present, test_engine, wlock, write_revision};
     use crate::engine::local_cache::{
-        EntryWriter, Existence, LocalCache, MANIFEST_V1, Manifest, ManifestArtifact,
+        EntryWriter, Existence, LocalCache, MANIFEST_V1, MANIFEST_V2, Manifest, ManifestArtifact,
         ManifestArtifactContentType, ManifestArtifactEncoding, ManifestArtifactType, PendingWrite,
-        SizedReader, TargetStream,
+        SizedReader, TargetStream, is_manifest_name,
     };
     use crate::engine::local_cache_test_double::ForwardingCache;
     use hcore::hasync::StdCancellationToken;
@@ -1023,8 +1027,10 @@ mod tests {
         ) -> anyhow::Result<Box<dyn EntryWriter>> {
             self.inner.writer(addr, hashin, name)
         }
+        // The in-flight revision is one this version wrote, so its manifest —
+        // and the post-write barrier's key — is `MANIFEST_V2`.
         fn exists(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<bool> {
-            if name == MANIFEST_V1 {
+            if name == MANIFEST_V2 {
                 self.barrier_reads.fetch_add(1, Ordering::SeqCst);
                 // The wait: once this returns, the write has landed and every
                 // later enumeration sees it.
@@ -1035,7 +1041,7 @@ mod tests {
         fn existence(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<Existence> {
             // Reports the queue, never waits on it, and never clears it — the
             // whole point of `existence` is that it settles nothing.
-            if name == MANIFEST_V1 && self.is_queued(addr, hashin) {
+            if name == MANIFEST_V2 && self.is_queued(addr, hashin) {
                 return Ok(Existence::Queued(PendingWrite::new(std::future::ready(()))));
             }
             self.inner.existence(addr, hashin, name)
@@ -1048,7 +1054,7 @@ mod tests {
         /// and `existence`. Committed-only, so no `land` and no
         /// `barrier_reads`: this settles nothing and waits for nothing.
         fn exists_committed(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<bool> {
-            if name == MANIFEST_V1 && self.is_queued(addr, hashin) {
+            if name == MANIFEST_V2 && self.is_queued(addr, hashin) {
                 return Ok(false);
             }
             self.inner.exists_committed(addr, hashin, name)
@@ -1120,12 +1126,16 @@ mod tests {
         // reads (`reader` on the manifest key, one per revision). Everything
         // else is forwarded verbatim to the real backend, so the target under
         // test is a genuine sqlite cache rather than a stub.
+        //
+        // Reads count every manifest name, misses included: a probe of a v1
+        // manifest that is not there is still a round-trip. The barrier is on
+        // `MANIFEST_V2`, the name of the revision this version just wrote.
         engine.local_cache = Arc::new(
             ForwardingCache::new(Arc::clone(&engine.local_cache))
                 .on_reader({
                     let manifest_reads = Arc::clone(&manifest_reads);
                     move |_, _, name| {
-                        if name == MANIFEST_V1 {
+                        if is_manifest_name(name) {
                             manifest_reads.fetch_add(1, Ordering::SeqCst);
                         }
                     }
@@ -1133,7 +1143,7 @@ mod tests {
                 .on_exists({
                     let barrier_reads = Arc::clone(&barrier_reads);
                     move |_, _, name| {
-                        if name == MANIFEST_V1 {
+                        if name == MANIFEST_V2 {
                             barrier_reads.fetch_add(1, Ordering::SeqCst);
                         }
                     }
@@ -1351,9 +1361,10 @@ mod tests {
         );
         assert_eq!(
             manifest_reads.load(Ordering::SeqCst),
-            3,
-            "over budget: one recency read per revision, plus the artifact list \
-             of the one revision actually deleted"
+            4,
+            "over budget: one recency read per revision, plus the artifact lists \
+             of the one revision actually deleted (its v2 manifest, and the probe \
+             for a v1 one an older heph may have left beside it)"
         );
         assert!(!present(&engine, &a, "h1"), "stale revision trimmed");
     }

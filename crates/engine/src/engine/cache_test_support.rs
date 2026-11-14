@@ -7,8 +7,8 @@
 //! the two suites cannot drift into disagreeing about what a cache revision is.
 
 use crate::engine::local_cache::{
-    MANIFEST_V1, Manifest, ManifestArtifact, ManifestArtifactContentType, ManifestArtifactEncoding,
-    ManifestArtifactType,
+    MANIFEST_V2, MANIFEST_V2_VERSION, MANIFESTS, Manifest, ManifestArtifact,
+    ManifestArtifactContentType, ManifestArtifactEncoding, ManifestArtifactType,
 };
 use crate::engine::result_lock::TargetGuard;
 use crate::engine::{Config, Engine};
@@ -43,7 +43,9 @@ pub(crate) fn addr_in(pkg: &str, name: &str) -> Addr {
 }
 
 /// Write a cache revision with a controlled `created_at` and artifact set, so
-/// recency ordering is deterministic.
+/// recency ordering is deterministic. Written under [`MANIFEST_V2`], the name
+/// every revision this version writes has — and the one the post-write barrier
+/// waits on.
 pub(crate) fn write_revision(
     engine: &Engine,
     addr: &Addr,
@@ -60,7 +62,7 @@ pub(crate) fn write_revision(
         w.commit().expect("commit artifact");
     }
     let manifest = Manifest {
-        version: "1.0.0".to_string(),
+        version: MANIFEST_V2_VERSION.to_string(),
         target: addr.format(),
         created_at_nanos: created,
         hashin: hashin.to_string(),
@@ -79,7 +81,7 @@ pub(crate) fn write_revision(
     };
     let mut w = engine
         .local_cache
-        .writer(addr, hashin, MANIFEST_V1)
+        .writer(addr, hashin, MANIFEST_V2)
         .expect("manifest writer");
     borsh::to_writer(&mut w, &manifest).expect("write manifest");
     w.commit().expect("commit manifest");
@@ -87,17 +89,20 @@ pub(crate) fn write_revision(
     assert!(
         engine
             .local_cache
-            .exists(addr, hashin, MANIFEST_V1)
+            .exists(addr, hashin, MANIFEST_V2)
             .expect("exists")
     );
 }
 
-/// Whether the revision's manifest is still in the cache.
+/// Whether the revision still has a manifest, under either name: GC must
+/// delete both for a revision to count as gone.
 pub(crate) fn present(engine: &Engine, addr: &Addr, hashin: &str) -> bool {
-    engine
-        .local_cache
-        .exists(addr, hashin, MANIFEST_V1)
-        .expect("exists")
+    MANIFESTS.iter().any(|name| {
+        engine
+            .local_cache
+            .exists(addr, hashin, name)
+            .expect("exists")
+    })
 }
 
 /// Take `addr`'s target lock — as a build of it would — blocking until free.

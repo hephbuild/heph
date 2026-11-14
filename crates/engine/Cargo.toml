@@ -81,6 +81,9 @@ rustc-hash = "2"
 rustls = { version = "0.23", features = ["ring"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
+# Cache blobs at rest and on the remote (see `engine::cache_codec`). The same
+# major as `coreutils`' tar applets, so it adds no crate to the lockfile.
+zstd = "0.14"
 sha2 = "0.11"
 hex = "0.4"
 serde_yaml = "0.9"

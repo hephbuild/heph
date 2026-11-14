@@ -1,4 +1,5 @@
 use crate::engine::Engine;
+use crate::engine::cache_codec;
 use crate::engine::driver::outputartifact;
 use crate::engine::link::LinkedTargetDef;
 use crate::engine::result::ArtifactMeta;
@@ -308,7 +309,30 @@ pub struct NotFoundError;
 /// ([`probe_remote_revision`](Engine::probe_remote_revision)) starts with none of
 /// them, and materializes per caller. Read paths therefore check residency
 /// explicitly — see [`missing_local_blobs`](Engine::missing_local_blobs).
+///
+/// Every revision this version writes uses [`MANIFEST_V2`]. A v1 manifest was
+/// written by a heph that stores every blob raw; it is still read (so an
+/// upgrade keeps the local cache warm) and still collected by GC, but never
+/// written.
 pub(crate) const MANIFEST_V1: &str = "manifest-v1.borsh";
+
+/// Name of the manifest of a revision whose blobs may be encoded (see
+/// [`cache_codec`](crate::engine::cache_codec)). Each artifact's `encoding`
+/// says how its blob is stored. A heph that predates encoding never reads this
+/// name, which is what keeps it from reading zstd bytes as a tar.
+pub(crate) const MANIFEST_V2: &str = "manifest-v2.borsh";
+
+/// `Manifest::version` of a [`MANIFEST_V2`] manifest. Informational: the name,
+/// not this string, is what readers branch on.
+pub(crate) const MANIFEST_V2_VERSION: &str = "2.0.0";
+
+/// Every manifest name a revision can have, newest first: the read order.
+pub(crate) const MANIFESTS: [&str; 2] = [MANIFEST_V2, MANIFEST_V1];
+
+/// Whether `name` is a manifest rather than an artifact blob.
+pub(crate) fn is_manifest_name(name: &str) -> bool {
+    MANIFESTS.contains(&name)
+}
 
 #[derive(Clone)]
 pub struct CacheArtifact {
@@ -316,6 +340,10 @@ pub struct CacheArtifact {
     pub hashin: String,
     pub name: String,
     pub cache: Arc<dyn LocalCache>,
+    /// How the blob is stored. Reads decode it; an encoded blob has no
+    /// seekable reader and no file path, since neither would yield the
+    /// decoded bytes.
+    pub encoding: ManifestArtifactEncoding,
     pub content_type: hartifactcontent::Type,
     pub hashout: String,
     pub group: String,
@@ -327,10 +355,12 @@ pub struct CacheArtifact {
 
 impl hartifactcontent::Content for CacheArtifact {
     fn reader(&self) -> anyhow::Result<Box<dyn io::Read>> {
-        Ok(self
+        let stored = self
             .cache
             .reader(&self.addr, &self.hashin, &self.name)?
-            .reader)
+            .reader;
+        cache_codec::decode_reader(stored, &self.encoding)
+            .with_context(|| format!("decode cached artifact {} of {}", self.name, self.addr))
     }
 
     fn walk(
@@ -353,13 +383,15 @@ impl hartifactcontent::Content for CacheArtifact {
     fn entry_paths(&self) -> anyhow::Result<Vec<std::path::PathBuf>> {
         match &self.content_type {
             // Header-only: index the tar over the seekable reader (seeks past
-            // file data) instead of walking and reading every byte.
-            hartifactcontent::Type::Tar => {
-                let reader = self.seekable_reader()?.ok_or_else(|| {
-                    anyhow::anyhow!("tar cache artifact {} has no seekable reader", self.name)
-                })?;
-                Ok(hcore::hartifactcontent::tar_index::TarIndex::build(reader)?.entry_paths())
-            }
+            // file data) instead of walking and reading every byte. A
+            // compressed blob cannot seek, so it walks; decoding runs at about
+            // 1 GB/s, which is what the walk costs on top of the index.
+            hartifactcontent::Type::Tar => match self.seekable_reader()? {
+                Some(reader) => {
+                    Ok(hcore::hartifactcontent::tar_index::TarIndex::build(reader)?.entry_paths())
+                }
+                None => self.walk()?.map(|r| r.map(|e| e.path)).collect(),
+            },
             // No index for cpio yet — fall back to the walk-based default.
             hartifactcontent::Type::Cpio => self.walk()?.map(|r| r.map(|e| e.path)).collect(),
         }
@@ -368,6 +400,9 @@ impl hartifactcontent::Content for CacheArtifact {
     fn seekable_reader(
         &self,
     ) -> anyhow::Result<Option<Box<dyn hartifactcontent::ReadSeek + Send>>> {
+        if self.encoding != ManifestArtifactEncoding::None {
+            return Ok(None);
+        }
         self.cache
             .seekable_reader(&self.addr, &self.hashin, &self.name)
     }
@@ -377,6 +412,9 @@ impl hartifactcontent::Content for CacheArtifact {
     }
 
     fn file_path(&self) -> Option<std::path::PathBuf> {
+        if self.encoding != ManifestArtifactEncoding::None {
+            return None;
+        }
         self.cache.file_path(&self.addr, &self.hashin, &self.name)
     }
 }
@@ -483,37 +521,48 @@ fn cache_entry_name(artifact: &outputartifact::OutputArtifact) -> String {
 /// mem, or an FS store on the other side of an `EXDEV` — is copied into exactly
 /// as before. The size is read before either, so it is the file's own size on
 /// both paths.
+///
+/// Which of the two is decided by [`cache_codec::container_encoding`]: a
+/// container whose payload is already compressed is stored verbatim (and so
+/// can still be adopted); any other is compressed into the writer, which is a
+/// copy by construction. Returns the decoded size, the encoding, and the entry
+/// name the blob landed under.
 fn store_container(
     cache: &dyn LocalCache,
     addr: &Addr,
     hashin: &str,
-    name: &str,
+    base_name: &str,
     content: &outputartifact::ContentPath,
-    kind: &str,
-) -> anyhow::Result<u64> {
+    content_type: &ManifestArtifactContentType,
+) -> anyhow::Result<(u64, ManifestArtifactEncoding, String)> {
+    let kind = match content_type {
+        ManifestArtifactContentType::Tar => "tar",
+        ManifestArtifactContentType::Cpio => "cpio",
+    };
     let src = std::path::Path::new(&content.path);
     let size = std::fs::metadata(src)
         .with_context(|| format!("stat {kind} artifact {}", content.path))?
         .size();
+    let encoding = cache_codec::container_encoding(src, size, content_type);
+    let name = cache_codec::entry_name(base_name, &encoding);
 
-    if content.owned
+    if encoding == ManifestArtifactEncoding::None
+        && content.owned
         && cache
-            .adopt_file(addr, hashin, name, src)
+            .adopt_file(addr, hashin, &name, src)
             .with_context(|| format!("adopt {kind} artifact {} as {addr} {name}", content.path))?
     {
-        return Ok(size);
+        return Ok((size, encoding, name));
     }
 
     let mut f =
         File::open(src).with_context(|| format!("open {kind} artifact {}", content.path))?;
-    let mut w = cache
-        .writer(addr, hashin, name)
-        .with_context(|| format!("open cache writer for {addr} {name}"))?;
+    let mut w = cache_codec::open_writer(cache, addr, hashin, &name, &encoding)?;
     io::copy(&mut f, &mut w)
         .with_context(|| format!("copy {kind} artifact {} into {addr} {name}", content.path))?;
     w.commit()
         .with_context(|| format!("commit {kind} artifact {addr} {name}"))?;
-    Ok(size)
+    Ok((size, encoding, name))
 }
 
 impl Engine {
@@ -541,19 +590,28 @@ impl Engine {
         // reactor entirely.
         hcore::blocking::run(enclose!((cache => local_cache, addr, artifact) move || {
             let _slot = slot;
-            let open_writer =
-                |name: &str| -> anyhow::Result<Box<dyn EntryWriter>> {
-                    local_cache.writer(&addr, &hashin, name)
-                };
-            let name = cache_entry_name(&artifact);
+            let base_name = cache_entry_name(&artifact);
+            // What heph packs itself is always compressed: its size is unknown
+            // until packed, and a tar of small files is mostly padding.
+            // Containers decide per file in `store_container`.
+            let packed_name =
+                cache_codec::entry_name(&base_name, &ManifestArtifactEncoding::Zstd);
+            let open_writer = |name: &str| -> anyhow::Result<Box<dyn EntryWriter>> {
+                cache_codec::open_writer(
+                    &*local_cache,
+                    &addr,
+                    &hashin,
+                    name,
+                    &ManifestArtifactEncoding::Zstd,
+                )
+            };
+            let name = &packed_name;
 
-            let (size, content_type) = match &artifact.content {
+            // `size` is always the decoded size: the counter sits above the
+            // encoder.
+            let (size, content_type, encoding, name) = match &artifact.content {
                 outputartifact::Content::Raw(raw) => {
-                    let mut cw = CountingWriter::new(
-                        open_writer(&name).with_context(|| {
-                            format!("open cache writer for {addr} {name}")
-                        })?,
-                    );
+                    let mut cw = CountingWriter::new(open_writer(name)?);
                     let mut p = hartifactcontent::tar::TarPacker::new();
                     p.create_raw(raw.data.clone(), raw.path.clone(), raw.x);
                     p.pack(&mut cw)
@@ -562,14 +620,10 @@ impl Engine {
                     cw.into_inner().commit().with_context(|| {
                         format!("commit raw artifact {addr} {name}")
                     })?;
-                    (size, hartifactcontent::Type::Tar)
+                    (size, hartifactcontent::Type::Tar, ManifestArtifactEncoding::Zstd, packed_name.clone())
                 }
                 outputartifact::Content::File(file) => {
-                    let mut cw = CountingWriter::new(
-                        open_writer(&name).with_context(|| {
-                            format!("open cache writer for {addr} {name}")
-                        })?,
-                    );
+                    let mut cw = CountingWriter::new(open_writer(name)?);
                     let mut p = hartifactcontent::tar::TarPacker::new();
                     p.create_file(file.source_path.clone(), file.out_path.clone());
                     p.pack(&mut cw).with_context(|| {
@@ -582,7 +636,7 @@ impl Engine {
                     cw.into_inner().commit().with_context(|| {
                         format!("commit file artifact {addr} {name}")
                     })?;
-                    (size, hartifactcontent::Type::Tar)
+                    (size, hartifactcontent::Type::Tar, ManifestArtifactEncoding::Zstd, packed_name.clone())
                 }
                 // A view normally never arrives here: `is_passthrough` diverts it
                 // before the cache write, because its whole point is to own no
@@ -592,11 +646,7 @@ impl Engine {
                 // is free to change or be reclaimed underneath it. That costs a
                 // full copy, which is the cost of having asked to cache it.
                 outputartifact::Content::View(v) => {
-                    let mut cw = CountingWriter::new(
-                        open_writer(&name).with_context(|| {
-                            format!("open cache writer for {addr} {name}")
-                        })?,
-                    );
+                    let mut cw = CountingWriter::new(open_writer(name)?);
                     let mut r = hartifactcontent::Content::reader(v.view.as_ref())
                         .with_context(|| {
                             format!("open view artifact reader for {addr} {name}")
@@ -608,16 +658,30 @@ impl Engine {
                     cw.into_inner().commit().with_context(|| {
                         format!("commit view artifact {addr} {name}")
                     })?;
-                    (size, hartifactcontent::Type::Tar)
+                    (size, hartifactcontent::Type::Tar, ManifestArtifactEncoding::Zstd, packed_name.clone())
                 }
-                outputartifact::Content::TarPath(content) => (
-                    store_container(&*local_cache, &addr, &hashin, &name, content, "tar")?,
-                    hartifactcontent::Type::Tar,
-                ),
-                outputartifact::Content::CpioPath(content) => (
-                    store_container(&*local_cache, &addr, &hashin, &name, content, "cpio")?,
-                    hartifactcontent::Type::Cpio,
-                ),
+                outputartifact::Content::TarPath(content) => {
+                    let (size, encoding, name) = store_container(
+                        &*local_cache,
+                        &addr,
+                        &hashin,
+                        &base_name,
+                        content,
+                        &ManifestArtifactContentType::Tar,
+                    )?;
+                    (size, hartifactcontent::Type::Tar, encoding, name)
+                }
+                outputartifact::Content::CpioPath(content) => {
+                    let (size, encoding, name) = store_container(
+                        &*local_cache,
+                        &addr,
+                        &hashin,
+                        &base_name,
+                        content,
+                        &ManifestArtifactContentType::Cpio,
+                    )?;
+                    (size, hartifactcontent::Type::Cpio, encoding, name)
+                }
             };
 
             let artifact_type = match artifact.r#type {
@@ -632,6 +696,7 @@ impl Engine {
                     hashin: hashin.clone(),
                     name: name.clone(),
                     cache: local_cache.clone(),
+                    encoding: encoding.clone(),
                     hashout: artifact.hashout.clone(),
                     content_type,
                     group: artifact.group.clone(),
@@ -641,14 +706,14 @@ impl Engine {
                 ManifestArtifact {
                     hashout: artifact.hashout.clone(),
                     group: artifact.group.clone(),
-                    name: name.clone(),
+                    name,
                     size,
                     r#type: artifact_type,
                     content_type: match content_type {
                         hartifactcontent::Type::Tar => ManifestArtifactContentType::Tar,
                         hartifactcontent::Type::Cpio => ManifestArtifactContentType::Cpio,
                     },
-                    encoding: ManifestArtifactEncoding::None,
+                    encoding,
                 },
             ))
         }))
@@ -678,6 +743,18 @@ impl Engine {
                     anyhow::bail!(
                         "duplicate cache entry name `{name}` among the artifacts of {addr}: \
                          artifact names must be unique per (type, name) within a target"
+                    );
+                }
+            }
+            // A compressed blob's entry is `<name>.zst`, so `a` compressed and a
+            // raw `a.zst` would land on one key too. Which of them compresses is
+            // decided per write, so refuse the pair whatever the outcome.
+            for name in &seen {
+                let suffixed = format!("{name}{}", cache_codec::ZSTD_SUFFIX);
+                if seen.contains(&suffixed) {
+                    anyhow::bail!(
+                        "cache entry names `{name}` and `{suffixed}` among the artifacts of \
+                         {addr} would collide once `{name}` is compressed"
                     );
                 }
             }
@@ -736,7 +813,7 @@ impl Engine {
         let (res_artifacts, manifest_artifacts): (Vec<_>, Vec<_>) = written.into_iter().unzip();
 
         let manifest = Manifest {
-            version: "1.0.0".to_string(),
+            version: MANIFEST_V2_VERSION.to_string(),
             target: addr.format(),
             created_at_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(0),
             hashin: hashin.to_string(),
@@ -757,7 +834,7 @@ impl Engine {
         // pool's tar jobs would only delay the moment dependents can read this
         // result.
         let mut manifest_writer = cache
-            .writer(addr, &key, MANIFEST_V1)
+            .writer(addr, &key, MANIFEST_V2)
             .with_context(|| format!("open manifest writer for {addr}"))?;
         borsh::to_writer(&mut manifest_writer, &manifest)
             .with_context(|| format!("write manifest for {addr}"))?;
@@ -794,7 +871,7 @@ impl Engine {
         // shutdown of a cancelled build.
         if !tmp
             && !self
-                .exists_local(addr, &key, MANIFEST_V1)
+                .exists_local(addr, &key, MANIFEST_V2)
                 .await
                 .with_context(|| format!("waiting for the cache write of {addr} to commit"))?
         {
@@ -826,10 +903,44 @@ impl Engine {
         addr: &Addr,
         hashin: &str,
     ) -> anyhow::Result<Option<Manifest>> {
-        let sized = match cache.reader(addr, hashin, MANIFEST_V1) {
+        // Newest first: a revision both an older heph and this one wrote has
+        // both manifests, each naming its own blobs, and either is complete.
+        for name in MANIFESTS {
+            if let Some(m) = Self::read_named_manifest(cache, addr, hashin, name)? {
+                return Ok(Some(m));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Every manifest `(addr, hashin)` has, newest first. GC needs all of them:
+    /// each names blobs the others do not.
+    pub(crate) fn read_all_manifests(
+        cache: &Arc<dyn LocalCache>,
+        addr: &Addr,
+        hashin: &str,
+    ) -> anyhow::Result<Vec<(&'static str, Manifest)>> {
+        let mut out = Vec::new();
+        for name in MANIFESTS {
+            if let Some(m) = Self::read_named_manifest(cache, addr, hashin, name)? {
+                out.push((name, m));
+            }
+        }
+        Ok(out)
+    }
+
+    fn read_named_manifest(
+        cache: &Arc<dyn LocalCache>,
+        addr: &Addr,
+        hashin: &str,
+        name: &str,
+    ) -> anyhow::Result<Option<Manifest>> {
+        let sized = match cache.reader(addr, hashin, name) {
             Ok(s) => s,
             Err(e) if e.is::<NotFoundError>() => return Ok(None),
-            Err(e) => return Err(e).with_context(|| format!("read manifest for {addr} {hashin}")),
+            Err(e) => {
+                return Err(e).with_context(|| format!("read {name} for {addr} {hashin}"));
+            }
         };
         let mut buf = Vec::with_capacity(sized.size as usize);
         sized
@@ -914,7 +1025,7 @@ impl Engine {
         };
         let mut manifest_writer = self
             .local_cache
-            .writer(addr, dst_key, MANIFEST_V1)
+            .writer(addr, dst_key, MANIFEST_V2)
             .with_context(|| format!("open manifest writer for {addr} {dst_key}"))?;
         borsh::to_writer(&mut manifest_writer, &dup_manifest)
             .with_context(|| format!("write manifest for {addr} {dst_key}"))?;
@@ -1151,6 +1262,7 @@ impl Engine {
                 hashin: hashin.to_string(),
                 name: artifact.name.clone(),
                 cache: local_cache.clone(),
+                encoding: artifact.encoding.clone(),
                 content_type: match artifact.content_type {
                     ManifestArtifactContentType::Tar => hartifactcontent::Type::Tar,
                     ManifestArtifactContentType::Cpio => hartifactcontent::Type::Cpio,
@@ -1671,7 +1783,8 @@ mod tests {
             .expect("read manifest")
             .expect("manifest present");
         let names: Vec<_> = manifest.artifacts.iter().map(|a| a.name.as_str()).collect();
-        let expected: Vec<_> = (0..16).map(|i| format!("out_a{i:02}.tar")).collect();
+        // Raw artifacts are packed by heph and always compressed.
+        let expected: Vec<_> = (0..16).map(|i| format!("out_a{i:02}.tar.zst")).collect();
         assert_eq!(
             names,
             expected.iter().map(String::as_str).collect::<Vec<_>>()
@@ -1716,12 +1829,12 @@ mod tests {
         let events = log.events.lock().unwrap();
         let manifest_open = events
             .iter()
-            .position(|(name, ev)| name == MANIFEST_V1 && *ev == "open")
+            .position(|(name, ev)| name == MANIFEST_V2 && *ev == "open")
             .expect("manifest opened");
         let artifact_dones = events
             .iter()
             .enumerate()
-            .filter(|(_, (name, ev))| name != MANIFEST_V1 && *ev == "done")
+            .filter(|(_, (name, ev))| !is_manifest_name(name) && *ev == "done")
             .map(|(i, _)| i)
             .collect::<Vec<_>>();
         assert_eq!(artifact_dones.len(), 8, "events: {events:?}");
@@ -1852,7 +1965,7 @@ mod tests {
         assert!(
             engine
                 .local_cache
-                .exists_committed(&addr, "HASHIN_DURABLE", MANIFEST_V1)
+                .exists_committed(&addr, "HASHIN_DURABLE", MANIFEST_V2)
                 .expect("exists_committed"),
             "the manifest is committed by the time cache_locally returns",
         );
@@ -2034,21 +2147,34 @@ mod tests {
         }
     }
 
+    /// A container the content scan classifies as already compressed (a tar of
+    /// one gzip-magic member, over the scan's size gate), so it is stored
+    /// verbatim and is eligible for adoption. Written under `dir/<sub>/c.tar`.
+    fn precompressed_tar(dir: &std::path::Path, sub: &str) -> (std::path::PathBuf, Vec<u8>) {
+        let parent = dir.join(sub);
+        std::fs::create_dir_all(&parent).expect("mkdir");
+        let (path, _) =
+            crate::engine::cache_codec::tests::tar_of_one(&parent, b"\x1f\x8b", 2 * 1024 * 1024);
+        let bytes = std::fs::read(&path).expect("read tar");
+        (path, bytes)
+    }
+
     /// Collecting a target's outputs already wrote every byte once, into a tar
     /// whose only purpose is this write — so the cache takes the file instead of
     /// reading it back and writing a second, byte-identical copy. The revision
     /// must be indistinguishable from the copied one: same bytes, same recorded
     /// size, and no leftover in the sandbox for the teardown to sweep.
+    ///
+    /// Only a container stored verbatim can be adopted (a compressed one is a
+    /// copy through the encoder by construction), so the fixture is one the
+    /// scan classifies as already compressed.
     #[tokio::test]
     async fn an_owned_container_is_moved_into_the_cache() {
         let (engine, dir) = test_engine_spilling_at(64);
         let ctoken = StdCancellationToken::new();
         let addr = test_addr();
 
-        let src = dir.path().join("sandbox-collect").join("out.tar");
-        std::fs::create_dir_all(src.parent().expect("parent")).expect("mkdir");
-        let bytes = vec![7u8; 256];
-        std::fs::write(&src, &bytes).expect("write tar");
+        let (src, bytes) = precompressed_tar(dir.path(), "sandbox-collect");
 
         let arts = engine
             .cache_locally(
@@ -2083,20 +2209,74 @@ mod tests {
             .expect("read manifest")
             .expect("manifest committed");
         assert_eq!(manifest.artifacts[0].size, bytes.len() as u64);
+        assert_eq!(
+            manifest.artifacts[0].encoding,
+            ManifestArtifactEncoding::None
+        );
+        assert_eq!(
+            manifest.artifacts[0].name, "out_out.tar",
+            "no `.zst` suffix"
+        );
+    }
+
+    /// The other side of the scan: an owned container of ordinary content is
+    /// compressed — written through the encoder, so not adopted — and still
+    /// reads back as the original bytes, with the decoded size recorded.
+    #[tokio::test]
+    async fn an_owned_plain_container_is_compressed_not_adopted() {
+        let (engine, dir) = test_engine_spilling_at(64);
+        let ctoken = StdCancellationToken::new();
+        let addr = test_addr();
+
+        let src = dir.path().join("plain.tar");
+        let bytes = vec![7u8; 256 * 1024];
+        std::fs::write(&src, &bytes).expect("write tar");
+
+        let arts = engine
+            .cache_locally(
+                &ctoken,
+                &addr,
+                "HASHIN_PLAIN",
+                vec![tar_artifact("out.tar", &src, true)],
+                false,
+            )
+            .await
+            .expect("cache_locally");
+
+        assert_eq!(arts[0].encoding, ManifestArtifactEncoding::Zstd);
+        assert_eq!(arts[0].name, "out_out.tar.zst");
+        assert_eq!(arts[0].size, bytes.len() as u64, "the decoded size");
+        assert!(src.exists(), "a compressed container is copied, not moved");
+        let stored = engine
+            .local_cache
+            .reader(&addr, "HASHIN_PLAIN", &arts[0].name)
+            .expect("blob");
+        assert!(
+            stored.size < bytes.len() as u64 / 10,
+            "stored {} bytes of {}",
+            stored.size,
+            bytes.len()
+        );
+        assert_eq!(
+            drain_reader(hartifactcontent::Content::reader(&arts[0]).expect("reader")),
+            bytes,
+            "the artifact reads back decoded"
+        );
     }
 
     /// The move is gated on the producer handing the file over. A container it
     /// still owns — anything reaching the engine across the plugin ABI, where
     /// ownership does not travel — is copied and left exactly where it was.
+    ///
+    /// The fixture is stored verbatim, so ownership is the only thing standing
+    /// between it and an adopt.
     #[tokio::test]
     async fn a_borrowed_container_is_copied_and_left_alone() {
         let (engine, dir) = test_engine_spilling_at(64);
         let ctoken = StdCancellationToken::new();
         let addr = test_addr();
 
-        let src = dir.path().join("kept.tar");
-        let bytes = vec![5u8; 256];
-        std::fs::write(&src, &bytes).expect("write tar");
+        let (src, bytes) = precompressed_tar(dir.path(), "kept");
 
         let arts = engine
             .cache_locally(
@@ -2114,6 +2294,7 @@ mod tests {
             bytes,
             "a borrowed container must outlive the write untouched"
         );
+        assert_eq!(arts[0].encoding, ManifestArtifactEncoding::None);
         assert_eq!(
             drain_reader(
                 engine
@@ -2129,15 +2310,17 @@ mod tests {
     /// A container small enough to belong in sqlite is copied even when it is
     /// offered: the backend declines, and declining must cost a copy rather than
     /// the write. Same revision either way.
+    ///
+    /// "Small" is relative to the spill threshold, which is set above the
+    /// fixture: the fixture has to clear the scan's size gate to be stored
+    /// verbatim, which is the only way the adopt is offered at all.
     #[tokio::test]
     async fn an_owned_container_below_the_spill_threshold_still_lands() {
-        let (engine, dir) = test_engine_spilling_at(64 * 1024);
+        let (engine, dir) = test_engine_spilling_at(16 * 1024 * 1024);
         let ctoken = StdCancellationToken::new();
         let addr = test_addr();
 
-        let src = dir.path().join("small.tar");
-        let bytes = vec![3u8; 128];
-        std::fs::write(&src, &bytes).expect("write tar");
+        let (src, bytes) = precompressed_tar(dir.path(), "small");
 
         let arts = engine
             .cache_locally(
@@ -2151,6 +2334,14 @@ mod tests {
             .expect("cache_locally");
 
         assert_eq!(arts[0].size, bytes.len() as u64);
+        assert_eq!(arts[0].encoding, ManifestArtifactEncoding::None);
+        assert!(
+            engine
+                .local_cache
+                .file_path(&addr, "HASHIN_SMALL", &arts[0].name)
+                .is_none(),
+            "the blob stayed in the primary: the adopt was declined"
+        );
         assert_eq!(
             drain_reader(
                 engine
@@ -2563,16 +2754,23 @@ mod tests {
             ("report", outputartifact::Type::Output),
             ("log.txt", outputartifact::Type::Log),
         ] {
-            let entry = cache_entry_name(&sandbox_file(
+            let base = cache_entry_name(&sandbox_file(
                 "main",
                 name,
                 r#type,
                 std::path::Path::new("/x"),
             ));
-            assert!(
-                !engine.local_cache.exists(&addr, &hashin, &entry)?,
-                "a failed run stored blob {entry}"
-            );
+            // Under either name a blob could land under: raw, or compressed.
+            for encoding in [
+                ManifestArtifactEncoding::None,
+                ManifestArtifactEncoding::Zstd,
+            ] {
+                let entry = cache_codec::entry_name(&base, &encoding);
+                assert!(
+                    !engine.local_cache.exists(&addr, &hashin, &entry)?,
+                    "a failed run stored blob {entry}"
+                );
+            }
         }
 
         // Control: the same target passing files its manifest at that key, so
@@ -2596,7 +2794,7 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            [("main", "out_out.tar")],
+            [("main", "out_out.tar.zst")],
             "only what the pass returned"
         );
         Ok(())
