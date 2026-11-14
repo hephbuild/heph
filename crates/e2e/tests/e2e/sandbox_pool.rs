@@ -721,14 +721,18 @@ async fn a_run_cancelled_while_queued_on_the_sandbox_pool_is_a_cancellation() ->
     Ok(())
 }
 
-/// Strict FIFO, accepted on purpose (`docs/RESOURCES.md`): a managed run at
-/// the head of the queue waiting for a `sandbox` slot holds back every run
-/// behind it, even one that needs no slot and fits the free cpu. Here the
-/// template target `conf` (one cpu, of four free) waits behind `parked`
-/// until busy's removal gives the slot back. Pinned so that changing it is a
-/// decision rather than an accident.
+/// A managed run at the head of the queue waiting for a `sandbox` slot does
+/// not hold back a run behind it that fits what is free. Here the template
+/// target `conf` takes one cpu of the four free and, not being managed, no
+/// slot: it takes nothing `parked` is short of, so it is built to its end
+/// while `parked` still waits for busy's removal to give the slot back.
+///
+/// This is the opposite of what the test pinned under strict FIFO, where
+/// `conf` waited behind `parked` with every cpu idle. Admission now starts
+/// any waiter that fits, and holds one back only once the head has been
+/// overtaken as far as it may be on a pool that waiter takes from.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_run_waiting_on_sandbox_holds_back_the_runs_behind_it() -> anyhow::Result<()> {
+async fn a_cpu_only_run_passes_a_head_waiting_on_sandbox() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let root = tmp.path();
     std::fs::create_dir_all(root.join("p"))?;
@@ -749,32 +753,36 @@ target(name = "conf", driver = "template", src = file("conf.j2"), out = "conf",
     let (engine, gate) = gated_engine(root, 1)?;
 
     let busy = exhaust_the_pool(&engine).await?;
-    let spawn_build = |addr: &str| {
-        let (engine, addrs) = (Arc::clone(&engine), vec![addr.to_owned()]);
-        tokio::spawn(async move { build(&engine, &addrs).await })
-    };
-    let parked = spawn_build("//p:parked");
+    let parked = tokio::spawn({
+        let engine = Arc::clone(&engine);
+        async move { build(&engine, &["//p:parked".to_owned()]).await }
+    });
     snapshot_until(&engine, "parked at the head, waiting on sandbox", |s| {
         s.main.queued == 1 && head_waits_on_sandbox(s)
     })
     .await;
-    let conf = spawn_build("//p:conf");
-    snapshot_until(&engine, "conf queued behind parked", |s| s.main.queued == 2).await;
 
+    // Bounded well under `DEADLINE`: a `conf` held back waits for a gate
+    // that opens only after it, and that must fail here, not hang.
+    let conf = tokio::time::timeout(
+        Duration::from_secs(20),
+        build(&engine, &["//p:conf".to_owned()]),
+    )
+    .await;
     let s = snapshot(&engine).expect("the pool is built");
-    assert_eq!(held(&s, PoolName::CPU), 0, "every cpu is free: {s:?}");
-    assert!(
-        head_waits_on_sandbox(&s),
-        "the head waits on sandbox: {s:?}"
-    );
-    assert!(
-        !conf.is_finished(),
-        "conf needs no slot and fits the free cpu, and still waits"
-    );
+    let parked_still_waits = !parked.is_finished();
 
     gate.open();
     tokio::time::timeout(DEADLINE, parked).await???;
-    tokio::time::timeout(DEADLINE, conf).await???;
+    conf.map_err(|_elapsed| {
+        anyhow::anyhow!(
+            "conf needs no slot and fits the free cpu, and still waited behind the head: {s:?}"
+        )
+    })??;
+    assert!(
+        parked_still_waits && s.main.queued == 1 && head_waits_on_sandbox(&s),
+        "conf ended while parked was still the head, waiting on sandbox: {s:?}"
+    );
     drain(busy).await;
     all_capacity_back(&engine).await;
     Ok(())
