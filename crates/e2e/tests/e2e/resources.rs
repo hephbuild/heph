@@ -1356,7 +1356,7 @@ target(name = "b", driver = "bash", run = "echo b > $OUT", out = "b.txt", deps =
         let _guard = tracing_subscriber::fmt()
             .with_writer(move || writer.clone())
             .with_ansi(false)
-            .with_max_level(tracing_subscriber::filter::LevelFilter::INFO)
+            .with_max_level(tracing_subscriber::filter::LevelFilter::DEBUG)
             .set_default();
         build_events(&engine, &["//p:a", "//p:b"]).await.0
     };
@@ -1369,6 +1369,17 @@ target(name = "b", driver = "bash", run = "echo b > $OUT", out = "b.txt", deps =
     assert_eq!(clamps.len(), 1, "one clamp line: {text}");
     let line = clamps.first().copied().unwrap_or_default();
     assert!(line.contains("INFO") && line.contains("//p:big"), "{line}");
+    // The grant a log reports is the run's allotment: the `sandbox` slot
+    // every managed run also takes is the engine's, split off before the run.
+    let admitted: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("admitted") && l.contains("granted"))
+        .collect();
+    assert_eq!(admitted.len(), 3, "one admission per target: {text}");
+    for l in clamps.iter().chain(&admitted) {
+        assert!(l.contains("\"cpu\""), "{l}");
+        assert!(!l.contains("sandbox"), "the engine's slot is logged: {l}");
+    }
     Ok(())
 }
 

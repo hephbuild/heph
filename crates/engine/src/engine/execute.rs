@@ -743,9 +743,13 @@ impl Engine {
             crate::engine::engine::cpu_free_cpus(&self.pools),
             d.now_ms(),
         );
-        let sandbox = managed.then(|| (hplugin::provider::PoolName::sandbox(), 1));
+        let implicit: &[_] = if managed {
+            std::slice::from_ref(&*SANDBOX_IMPLICIT)
+        } else {
+            &[]
+        };
         let acquire = pool
-            .acquire_with(resources, sandbox.as_slice())
+            .acquire_with(resources, implicit)
             .map_err(|err| anyhow::anyhow!("{addr} {err}"))?;
         tokio::pin!(acquire);
         // Raced against the request's cancellation: a `sandbox` slot comes
@@ -784,17 +788,21 @@ impl Engine {
             }
         };
         let reservation = granted.with_context(|| format!("admitting {addr}"))?;
-        tracing::debug!(
-            addr = %addr,
-            granted = ?reservation.iter().collect::<Vec<_>>(),
-            "admitted"
-        );
+        // What the run is allotted: the `sandbox` slot the caller splits off
+        // is the engine's, never part of it, so the logs leave it out.
+        let allotment = || {
+            reservation
+                .iter()
+                .filter(|(p, _)| p.as_str() != hplugin::provider::PoolName::SANDBOX)
+                .collect::<Vec<_>>()
+        };
+        tracing::debug!(addr = %addr, granted = ?allotment(), "admitted");
         // Once per addr per request: `execute` is memoised per addr.
         if reservation.clamped() {
             tracing::info!(
                 addr = %addr,
                 declared = ?resources,
-                granted = ?reservation.iter().collect::<Vec<_>>(),
+                granted = ?allotment(),
                 "reservation clamped to the pool's capacity; the target runs alone in it"
             );
         }
@@ -898,6 +906,11 @@ pub(crate) struct SandboxRun {
     /// reservation, an invocation's full cpu capacity.
     pub allotment: Option<hplugin::driver::Allotment>,
 }
+
+/// What a managed run is admitted with on top of what it declares: one
+/// `sandbox` slot. Built once, so admission allocates no pool name per run.
+static SANDBOX_IMPLICIT: std::sync::LazyLock<(hplugin::provider::PoolName, u64)> =
+    std::sync::LazyLock::new(|| (hplugin::provider::PoolName::sandbox(), 1));
 
 /// The `AdmissionWaitStart` event for a queued request: the first pool it does
 /// not fit in, or — fitting everywhere but queued behind others — the first it
