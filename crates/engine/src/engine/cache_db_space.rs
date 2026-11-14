@@ -19,6 +19,17 @@
 //! - Every outcome is a [`CompactReport`] with the file's [`CacheDbSpace`]
 //!   before and after, which `heph tool gc` prints.
 //!
+//! A conversion rewrites the whole file — minutes, on a large one — holding
+//! its write lock and the schema migration lock throughout. Meanwhile another
+//! heph process's cache writes wait: its writer retries a batch the lock keeps
+//! out for up to `local_cache_sqlite::WRITE_BUSY_RETRY_TOTAL` (see
+//! `commit_with_retry`), and a process that exits before the lock is released
+//! loses its pending writes. Those become cache misses, never wrong hits. The
+//! conversion's temporary copy goes to sqlite's temp directory
+//! (`SQLITE_TMPDIR`, `TMPDIR`, then `/var/tmp`, `/usr/tmp`, `/tmp`), which on
+//! Linux may be a tmpfs, i.e. RAM; the free-space check counts that
+//! filesystem as well as the cache's.
+//!
 //! Nothing here reaches a hash or a cache key: it moves pages, never rows.
 
 use anyhow::{Context as _, Result};
@@ -551,8 +562,7 @@ impl ConvertPlacement {
         let cache_dev = std::fs::metadata(&cache_dir)
             .with_context(|| format!("stat {cache_dir:?}"))?
             .dev();
-        let temp = sqlite_temp_dir()
-            .and_then(|d| std::fs::metadata(&d).ok().map(|m| (d, m.dev())));
+        let temp = sqlite_temp_dir().and_then(|d| std::fs::metadata(&d).ok().map(|m| (d, m.dev())));
         Ok(Self {
             cache_dir,
             cache_dev,
@@ -777,7 +787,10 @@ mod tests {
         let report = run(&mut conn, &path, &gc_kind(), &|| true, &mut |_| true)?;
 
         assert!(
-            matches!(report.action, CompactAction::Vacuumed { complete: true, .. }),
+            matches!(
+                report.action,
+                CompactAction::Vacuumed { complete: true, .. }
+            ),
             "{report:?}"
         );
         assert_eq!(report.after.free_bytes, 0, "{report:?}");

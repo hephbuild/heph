@@ -20,6 +20,17 @@
 //! Revision recency comes from each group's `manifest-v1.borsh`
 //! (`created_at_nanos`); the full artifact name list to delete comes from the
 //! same manifest.
+//!
+//! After the sweep, [`Engine::gc_all`] gives `cache.db`'s free pages back to
+//! the filesystem (see `cache_db_space`), converting a database created before
+//! incremental auto-vacuum with a full `VACUUM`. That conversion rewrites the
+//! whole file — minutes, on a large one — under its write lock and the schema
+//! migration lock. Another heph process's cache writes wait meanwhile, each
+//! batch retried for up to `local_cache_sqlite::WRITE_BUSY_RETRY_TOTAL` (see
+//! `commit_with_retry`); a process that exits first loses its pending writes,
+//! which become cache misses, never wrong hits. The temporary copy goes to
+//! sqlite's temp directory (`SQLITE_TMPDIR`, `TMPDIR`, …), which on Linux may
+//! be a tmpfs, i.e. RAM; the conversion's free-space check covers it.
 
 use crate::engine::Engine;
 use crate::engine::cache_db_space::{CompactAction, CompactReport};
@@ -2443,10 +2454,20 @@ mod tests {
             .expect("a cancelled pass still reports");
 
         assert!(
-            matches!(report.action, CompactAction::Vacuumed { complete: false, .. }),
+            matches!(
+                report.action,
+                CompactAction::Vacuumed {
+                    complete: false,
+                    ..
+                }
+            ),
             "{report:?}"
         );
-        assert_eq!(db_pragma(&db, "freelist_count"), free_before, "no chunk ran");
+        assert_eq!(
+            db_pragma(&db, "freelist_count"),
+            free_before,
+            "no chunk ran"
+        );
         assert!(!sidecar.exists(), "an unfinished vacuum records nothing");
         let detail = event_detail(&report).expect("detail");
         assert!(detail.contains("stopped early"), "{detail}");
@@ -2456,7 +2477,10 @@ mod tests {
             .compact_for_gc(Box::new(|| true))
             .expect("the next pass");
         assert!(
-            matches!(report.action, CompactAction::Vacuumed { complete: true, .. }),
+            matches!(
+                report.action,
+                CompactAction::Vacuumed { complete: true, .. }
+            ),
             "{report:?}"
         );
         assert_eq!(db_pragma(&db, "freelist_count"), 0);
