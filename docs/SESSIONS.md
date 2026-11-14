@@ -48,6 +48,12 @@ crashed).
 once, by the front end, beside `HOME`; with no `HOME` or an unwritable
 `~/.heph` the run records nothing and says so once with a `warn!`.
 
+`heph run --raw` sets up no session at all: no directory, no recorder, no
+start line, and no warning, so its stderr carries only the tool's bytes and
+heph's failures. (`--raw` is also what lowers heph's log to `warn`; there is
+no separate quiet flag.) It still names another session in a lock-wait
+notice: that only reads.
+
 ## Layout
 
 `~/.heph/sessions/<id>/`, directory 0700, files 0600 (the per-user directory

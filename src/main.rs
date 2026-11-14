@@ -156,7 +156,12 @@ fn main() -> ExitCode {
     // the diag sweeper, the error renderer — then finished below with the exit
     // code. Configured once the command line is parsed.
     let session = Arc::new(SessionSlot::new());
-    let sink = log::init(raw_requested(&soft_match), Arc::clone(&session));
+    // `run --raw` is a tool's own invocation: its stderr carries the tool's
+    // bytes and heph's failures, nothing else. It sets up no session at all —
+    // no directory, no recorder, no start line, no "records no session"
+    // warning. The log's quiet filter is the same flag.
+    let raw = raw_requested(&soft_match);
+    let sink = log::init(raw, Arc::clone(&session));
     heph::tui::panic::install(sink.clone());
 
     // Self-upgrade BEFORE matching the command. A workspace can pin a newer heph
@@ -249,10 +254,14 @@ fn main() -> ExitCode {
     // environment (a target's `pass_env` would see them).
     let home = std::env::var_os("HOME");
     session.configure(
-        SessionRoot::from_env(
-            std::env::var_os("HEPH_NO_SESSION").as_deref(),
-            home.as_deref(),
-        ),
+        if raw {
+            Ok(None)
+        } else {
+            SessionRoot::from_env(
+                std::env::var_os("HEPH_NO_SESSION").as_deref(),
+                home.as_deref(),
+            )
+        },
         std::env::args_os()
             .map(|a| a.to_string_lossy().into_owned())
             .collect(),

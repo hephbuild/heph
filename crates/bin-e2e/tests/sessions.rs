@@ -220,3 +220,41 @@ fn no_session_env() {
     assert!(out.status.success(), "{}", describe(&out));
     assert!(last_end(&session_of(&ws, &out)).is_some());
 }
+
+/// `run --raw` sets up no session: no directory, and nothing on stderr — no
+/// start line, no "records no session" warning — beside the tool's bytes.
+#[test]
+fn raw_records_no_session() {
+    let dist = Dist::locate();
+    let ws = workspace();
+    ws.write(
+        "raw/BUILD",
+        r#"target(name = "tool", driver = "bash", entrypoint = True, run = "echo raw-tool-bytes")"#,
+    )
+    .expect("write BUILD");
+
+    let out = ws
+        .cmd(&dist, &["run", "//raw:tool", "--raw"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run");
+    assert!(out.status.success(), "{}", describe(&out));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "raw-tool-bytes\n",
+        "{}",
+        describe(&out)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "",
+        "{}",
+        describe(&out)
+    );
+    let sessions = sessions_dir(ws.home());
+    assert!(
+        std::fs::read_dir(&sessions).map_or(true, |mut d| d.next().is_none()),
+        "a session was recorded under {}",
+        sessions.display()
+    );
+}
