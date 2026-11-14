@@ -29,6 +29,7 @@ pub mod id;
 pub mod lockfile;
 pub mod reader;
 pub mod recorder;
+pub mod source;
 
 #[cfg(test)]
 mod tests;
@@ -47,6 +48,7 @@ pub use format::{
 pub use id::SessionId;
 pub use reader::RecordReader;
 pub use recorder::{Recorder, SessionTap, TappedReceiver};
+pub use source::{EntryMeta, FileSource, SessionEntry, SessionItem, SessionSource};
 
 use cleanup::Retention;
 use recorder::{Faults, RecorderStart};

@@ -251,6 +251,8 @@ pub async fn run<A: App + 'static>(
                         if view.is_on_main_view() {
                             if held {
                                 quit = true;
+                            } else if app_result.is_none() {
+                                view.quit_while_running();
                             }
                         } else {
                             view.back_to_main();
