@@ -861,7 +861,12 @@ impl Engine {
                 .filter(|(p, _)| p.as_str() != hplugin::provider::PoolName::SANDBOX)
                 .collect::<Vec<_>>()
         };
-        tracing::debug!(addr = %addr, granted = ?allotment(), "admitted");
+        tracing::debug!(
+            addr = %addr,
+            granted = ?allotment(),
+            how = admitted_kind(reservation.admitted()).as_str(),
+            "admitted"
+        );
         // Once per addr per request: `execute` is memoised per addr.
         if reservation.clamped() {
             tracing::info!(
@@ -981,6 +986,8 @@ static SANDBOX_IMPLICIT: std::sync::LazyLock<(hplugin::provider::PoolName, u64)>
 /// not fit in, or — fitting everywhere but queued behind others — the first it
 /// needs. On a `sandbox` wait it carries `removals_pending`, the pool's count
 /// of finished runs whose sandbox has not been removed yet: the wait's cause.
+/// A request that fits and is held back for the oldest waiter carries
+/// `yielding_to`, that waiter's need.
 fn admission_wait_start(
     addr: String,
     info: &crate::engine::resource_pool::WaitInfo,
@@ -1004,6 +1011,26 @@ fn admission_wait_start(
         need: pool.map_or(0, |p| p.need),
         free: pool.map_or(0, |p| p.free.unwrap_or(u64::MAX)),
         ahead: u64::try_from(info.ahead).unwrap_or(u64::MAX),
+        yielding_to: info
+            .yielding_to
+            .as_ref()
+            .map(|to| hcore::events::YieldingToData {
+                pool: to.pool.as_str().to_owned(),
+                need: to.need,
+            }),
+    }
+}
+
+/// How the pool admitted a run, as `ExecuteStart` and the logs spell it.
+fn admitted_kind(admitted: crate::engine::resource_pool::Admitted) -> hcore::events::AdmittedKind {
+    // Not imported as `Admitted`: that is this module's own admission bundle.
+    use crate::engine::resource_pool::Admitted as Pool;
+    use hcore::events::AdmittedKind as Kind;
+    match admitted {
+        Pool::Arrival => Kind::Arrival,
+        Pool::Head => Kind::Head,
+        Pool::Handoff => Kind::Handoff,
+        Pool::Pass => Kind::Pass,
     }
 }
 
@@ -1057,8 +1084,8 @@ pub(crate) fn entrypoint_allotment(
 
 /// The `ExecuteStart` event: what the target declared (only its declared
 /// keys, in each pool's unit's base) and what it was granted, after
-/// clamping, and how long admission took. `reserved` always carries `cpu`, 0
-/// on a zero-cost grant.
+/// clamping, how long admission took and how the grant came about.
+/// `reserved` always carries `cpu`, 0 on a zero-cost grant.
 pub(crate) fn execute_start(
     addr: String,
     driver: String,
@@ -1084,6 +1111,7 @@ pub(crate) fn execute_start(
         declared: Some(declared),
         reserved: Some(reserved),
         queued_ms: Some(queued_ms),
+        admitted: Some(admitted_kind(reservation.admitted())),
     }
 }
 
@@ -1104,10 +1132,12 @@ where
 mod tests {
     use super::*;
     use crate::engine::event::BuildEventKind;
+    use crate::engine::resource_pool::Admitted as PoolAdmitted;
     use crate::engine::resource_pool::Limit;
     use crate::engine::resource_pool::ResourcePool;
     use futures::FutureExt as _;
     use hcore::capacity::Unit;
+    use hcore::events::AdmittedKind;
     use hplugin::driver::{Demand, Resources};
     use hplugin::provider::PoolName;
 
@@ -1146,12 +1176,14 @@ mod tests {
             declared,
             reserved,
             queued_ms,
+            admitted,
             ..
         } = ev
         else {
             panic!("wrong variant: {ev:?}");
         };
         assert_eq!(queued_ms, Some(7));
+        assert_eq!(admitted, Some(AdmittedKind::Arrival), "nobody was waiting");
         assert_eq!(
             declared,
             Some(std::collections::BTreeMap::from([("cpu".into(), 16 * CPU)]))
@@ -1160,6 +1192,105 @@ mod tests {
             reserved,
             Some(std::collections::BTreeMap::from([("cpu".into(), 4 * CPU)]))
         );
+    }
+
+    /// `ExecuteStart.admitted` is what the pool says of that grant: a run
+    /// that queued and started as the oldest waiter says `head`, not the
+    /// `arrival` of the run it waited for.
+    #[test]
+    fn execute_start_says_how_the_run_was_admitted() {
+        let one = req(&[("cpu", CPU)]);
+        let pool = ResourcePool::new([(
+            PoolName::try_from("cpu").expect("pool"),
+            Limit::Bounded(CPU),
+        )]);
+        let admitted = |r: &crate::engine::resource_pool::Reservation| match execute_start(
+            "//p:t".into(),
+            "exec".into(),
+            true,
+            &one,
+            r,
+            0,
+        ) {
+            BuildEventKind::ExecuteStart { admitted, .. } => admitted,
+            other => panic!("wrong variant: {other:?}"),
+        };
+        let first = pool
+            .acquire(&one)
+            .expect("acquire")
+            .now_or_never()
+            .expect("granted at once")
+            .expect("granted");
+        assert_eq!(admitted(&first), Some(AdmittedKind::Arrival));
+
+        let mut waiter = pool.acquire(&one).expect("acquire");
+        assert!((&mut waiter).now_or_never().is_none(), "the pool is full");
+        drop(first);
+        let second = waiter
+            .now_or_never()
+            .expect("granted on the release")
+            .expect("granted");
+        assert_eq!(admitted(&second), Some(AdmittedKind::Head));
+
+        for (from, to) in [
+            (PoolAdmitted::Arrival, AdmittedKind::Arrival),
+            (PoolAdmitted::Head, AdmittedKind::Head),
+            (PoolAdmitted::Handoff, AdmittedKind::Handoff),
+            (PoolAdmitted::Pass, AdmittedKind::Pass),
+        ] {
+            assert_eq!(admitted_kind(from), to);
+        }
+    }
+
+    /// `AdmissionWaitStart` carries the pool's `yielding_to` — the oldest
+    /// waiter's pool and need, which need not be the pool the event names —
+    /// and nothing when the waiter is not held back for it.
+    #[test]
+    fn admission_wait_start_carries_what_the_waiter_yields_to() {
+        use crate::engine::resource_pool::{PoolNeed, WaitInfo, YieldingTo};
+        let name = |n: &str| PoolName::try_from(n).expect("pool");
+        let info = |yielding_to| WaitInfo {
+            ahead: 2,
+            pools: vec![PoolNeed {
+                pool: name("cpu"),
+                need: CPU,
+                free: Some(3 * CPU),
+            }],
+            since: std::time::Instant::now(),
+            yielding_to,
+        };
+        let held_back = info(Some(YieldingTo {
+            pool: name("memory"),
+            need: 8 << 30,
+        }));
+        let BuildEventKind::AdmissionWaitStart {
+            pool,
+            need,
+            free,
+            ahead,
+            removals_pending,
+            yielding_to,
+            ..
+        } = admission_wait_start("//p:t".into(), &held_back, 0)
+        else {
+            panic!("wrong variant");
+        };
+        assert_eq!((pool.as_str(), need, free, ahead), ("cpu", CPU, 3 * CPU, 2));
+        assert_eq!(removals_pending, None, "not a sandbox wait");
+        assert_eq!(
+            yielding_to,
+            Some(hcore::events::YieldingToData {
+                pool: "memory".into(),
+                need: 8 << 30,
+            })
+        );
+
+        let BuildEventKind::AdmissionWaitStart { yielding_to, .. } =
+            admission_wait_start("//p:t".into(), &info(None), 0)
+        else {
+            panic!("wrong variant");
+        };
+        assert_eq!(yielding_to, None);
     }
 
     /// A zero-cost target reserves nothing: `reserved` still carries `cpu`

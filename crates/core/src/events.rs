@@ -119,9 +119,13 @@ pub fn clamp_text(
 
 /// The text of an admission-wait row, after its `⧗`:
 /// `//a:b waits for cpu 4 (2 free, 6 ahead, 41s)`. `waited` is the elapsed
-/// time as the renderer spells it; `unit` is `pool`'s. With removals pending
-/// (`removals_pending` above 0, only ever set on a `sandbox` wait), the cause
-/// is named: `… — cleanup is behind: 3 removals pending`.
+/// time as the renderer spells it; `unit` is `pool`'s. A waiter that fits
+/// what is free and is held back for the oldest one (`yielding_to`, with the
+/// unit of *its* pool, which need not be `pool`) says so in place of the
+/// queue: `//a:b waits for cpu 1 (3 free, yielding to a cpu 8 run, 41s)`.
+/// With removals pending (`removals_pending` above 0, only ever set on a
+/// `sandbox` wait), the cause is named:
+/// `… — cleanup is behind: 3 removals pending`.
 #[expect(
     clippy::too_many_arguments,
     reason = "one per field of the row; a struct for them would be built at each call site only \
@@ -134,11 +138,20 @@ pub fn admission_wait_text(
     need: u64,
     free: u64,
     ahead: u64,
+    yielding_to: Option<(&YieldingToData, Unit)>,
     removals_pending: Option<u64>,
     waited: &str,
 ) -> String {
+    let queue = match yielding_to {
+        Some((to, to_unit)) => format!(
+            "yielding to a {} {} run",
+            to.pool,
+            display_amount(to_unit, to.need)
+        ),
+        None => format!("{ahead} ahead"),
+    };
     let text = format!(
-        "{addr} waits for {pool} {} ({} free, {ahead} ahead, {waited})",
+        "{addr} waits for {pool} {} ({} free, {queue}, {waited})",
         display_amount(unit, need),
         display_amount(unit, free)
     );
@@ -298,6 +311,13 @@ pub enum BuildEventKind {
         /// (an entrypoint).
         #[serde(default)]
         queued_ms: Option<u64>,
+        /// How the run was admitted: on arrival, as the oldest waiter, or
+        /// ahead of an older one. It answers "why did this start before
+        /// that". `None` from a host that predates it, and for a run that
+        /// reserved nothing (an entrypoint): absent never means `arrival`.
+        /// Treat [`AdmittedKind::Unknown`] like `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        admitted: Option<AdmittedKind>,
     },
     ExecuteEnd {
         addr: String,
@@ -387,6 +407,12 @@ pub enum BuildEventKind {
         /// `None` from a host that predates it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         removals_pending: Option<u64>,
+        /// Set when the target fits what is free and still waits: the oldest
+        /// waiter has been overtaken as far as it may be, and starting this
+        /// one would take what that one needs. `None` otherwise, and from a
+        /// host that predates it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        yielding_to: Option<YieldingToData>,
     },
     /// The admission wait ended (granted, or the wait was cancelled).
     AdmissionWaitEnd {
@@ -617,6 +643,52 @@ pub struct TimedOutData {
     pub abandoned: bool,
 }
 
+/// How a run was admitted, carried on [`BuildEventKind::ExecuteStart`].
+/// Diagnostic: it explains the order runs started in, and decides nothing.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum AdmittedKind {
+    /// On arrival, with nobody waiting (a zero-cost run always is).
+    Arrival,
+    /// As the oldest waiter.
+    Head,
+    /// Ahead of an older waiter, in the slot a run of its own shape just
+    /// released.
+    Handoff,
+    /// Ahead of an older waiter, in capacity that was free.
+    Pass,
+    /// A way this build does not know, from a newer host. A consumer treats
+    /// it like an absent `admitted`. Without it, one such value would fail
+    /// the whole frame and end a hook's stream (see the module docs).
+    #[serde(other)]
+    Unknown,
+}
+
+impl AdmittedKind {
+    /// The value as it is spelled on the wire.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Arrival => "arrival",
+            Self::Head => "head",
+            Self::Handoff => "handoff",
+            Self::Pass => "pass",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// What a waiter that fits is held back for, carried on
+/// [`BuildEventKind::AdmissionWaitStart`]: the oldest waiter's need of the
+/// first pool where both cannot fit.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct YieldingToData {
+    /// The pool the oldest waiter needs. Not always the pool the event
+    /// names as waited on.
+    pub pool: String,
+    /// What the oldest waiter needs of `pool`, in that pool's unit.
+    pub need: u64,
+}
+
 /// Which cache tier a hit came from.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -802,6 +874,7 @@ pub mod test_support {
             declared: None,
             reserved: None,
             queued_ms: None,
+            admitted: None,
         };
         let end = |addr: &str| BuildEventKind::ResultEnd {
             addr: addr.to_string(),
@@ -978,8 +1051,19 @@ mod tests {
     /// wait with none pending (`Some(0)`).
     #[test]
     fn admission_wait_text_names_pending_removals_only_when_there_are_some() {
-        let text =
-            |pending| admission_wait_text("//a:b", "sandbox", Unit::Count, 1, 0, 2, pending, "41s");
+        let text = |pending| {
+            admission_wait_text(
+                "//a:b",
+                "sandbox",
+                Unit::Count,
+                1,
+                0,
+                2,
+                None,
+                pending,
+                "41s",
+            )
+        };
         let plain = "//a:b waits for sandbox 1 (0 free, 2 ahead, 41s)";
         assert_eq!(text(None), plain);
         assert_eq!(text(Some(0)), plain);
@@ -1008,6 +1092,221 @@ mod tests {
         }
         let json = serde_json::to_string(&ev).expect("encode");
         assert!(!json.contains("removals_pending"), "{json}");
+    }
+
+    /// A waiter held back for the oldest one names it in place of the queue,
+    /// each amount in its own pool's unit; the cleanup cause still follows.
+    #[test]
+    fn the_wait_text_names_what_it_yields_to() {
+        let to = |pool: &str, need| YieldingToData {
+            pool: pool.into(),
+            need,
+        };
+        let cpu = 1_000_000;
+        assert_eq!(
+            admission_wait_text(
+                "//a:b",
+                "cpu",
+                Unit::Cpu,
+                4 * cpu,
+                2 * cpu,
+                6,
+                None,
+                None,
+                "41s"
+            ),
+            "//a:b waits for cpu 4 (2 free, 6 ahead, 41s)",
+            "unchanged without it"
+        );
+        assert_eq!(
+            admission_wait_text(
+                "//a:b",
+                "cpu",
+                Unit::Cpu,
+                cpu,
+                3 * cpu,
+                6,
+                Some((&to("cpu", 8 * cpu), Unit::Cpu)),
+                None,
+                "41s"
+            ),
+            "//a:b waits for cpu 1 (3 free, yielding to a cpu 8 run, 41s)"
+        );
+        // The pool yielded for is not the one the row waits on.
+        assert_eq!(
+            admission_wait_text(
+                "//a:b",
+                "cpu",
+                Unit::Cpu,
+                cpu,
+                3 * cpu,
+                0,
+                Some((&to("memory", 2 << 30), Unit::Bytes)),
+                None,
+                "41s"
+            ),
+            "//a:b waits for cpu 1 (3 free, yielding to a memory 2.0 GiB run, 41s)"
+        );
+        assert_eq!(
+            admission_wait_text(
+                "//a:b",
+                "sandbox",
+                Unit::Count,
+                1,
+                2,
+                1,
+                Some((&to("cpu", 8 * cpu), Unit::Cpu)),
+                Some(3),
+                "41s"
+            ),
+            "//a:b waits for sandbox 1 (2 free, yielding to a cpu 8 run, 41s) — cleanup is \
+             behind: 3 removals pending"
+        );
+    }
+
+    /// `ExecuteStart.admitted` and `AdmissionWaitStart.yielding_to` are
+    /// additive in both directions: a frame from a host that predates them
+    /// reads as absent, a value from a newer host reads as `unknown`, a
+    /// consumer that predates them still reads a frame that carries them,
+    /// and a frame without them is spelled as it was before.
+    #[test]
+    fn an_old_frame_without_the_new_fields_still_parses() {
+        let old_start = r#"{"at_unix_ms":1,"kind":{"type":"ExecuteStart","addr":"//a:x",
+            "driver":"exec","cache":true,"declared":{"cpu":1000000},
+            "reserved":{"cpu":1000000},"queued_ms":3}}"#;
+        let start: BuildEvent = serde_json::from_str(old_start).expect("old frame must decode");
+        match &start.kind {
+            BuildEventKind::ExecuteStart { admitted, .. } => {
+                assert_eq!(*admitted, None, "absent, never `arrival`");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+        let old_wait = r#"{"at_unix_ms":1,"kind":{"type":"AdmissionWaitStart","addr":"//a:x",
+            "pool":"cpu","need":1,"free":0,"ahead":0}}"#;
+        let wait: BuildEvent = serde_json::from_str(old_wait).expect("old frame must decode");
+        match &wait.kind {
+            BuildEventKind::AdmissionWaitStart { yielding_to, .. } => {
+                assert_eq!(*yielding_to, None);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+        // Absent stays absent on the wire.
+        for ev in [&start, &wait] {
+            let json = serde_json::to_string(ev).expect("encode");
+            assert!(
+                !json.contains("admitted") && !json.contains("yielding_to"),
+                "{json}"
+            );
+        }
+
+        // A way of being admitted this build does not know.
+        let future = r#"{"at_unix_ms":1,"kind":{"type":"ExecuteStart","addr":"//a:x",
+            "driver":"exec","cache":true,"admitted":"future"}}"#;
+        let ev: BuildEvent = serde_json::from_str(future).expect("unknown value must decode");
+        match ev.kind {
+            BuildEventKind::ExecuteStart { admitted, .. } => {
+                assert_eq!(admitted, Some(AdmittedKind::Unknown));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        // What a new host puts on the wire.
+        let new_start = serde_json::to_string(&BuildEvent {
+            at_unix_ms: 2,
+            kind: BuildEventKind::ExecuteStart {
+                addr: "//a:x".into(),
+                driver: "exec".into(),
+                cache: true,
+                declared: None,
+                reserved: None,
+                queued_ms: Some(3),
+                admitted: Some(AdmittedKind::Handoff),
+            },
+        })
+        .expect("encode");
+        assert!(new_start.contains(r#""admitted":"handoff""#), "{new_start}");
+        let new_wait = serde_json::to_string(&BuildEvent {
+            at_unix_ms: 2,
+            kind: BuildEventKind::AdmissionWaitStart {
+                addr: "//a:x".into(),
+                pool: "cpu".into(),
+                need: 1_000_000,
+                free: 3_000_000,
+                ahead: 2,
+                removals_pending: None,
+                yielding_to: Some(YieldingToData {
+                    pool: "cpu".into(),
+                    need: 8_000_000,
+                }),
+            },
+        })
+        .expect("encode");
+        assert!(
+            new_wait.contains(r#""yielding_to":{"pool":"cpu","need":8000000}"#),
+            "{new_wait}"
+        );
+        for kind in [
+            AdmittedKind::Arrival,
+            AdmittedKind::Head,
+            AdmittedKind::Handoff,
+            AdmittedKind::Pass,
+            AdmittedKind::Unknown,
+        ] {
+            assert_eq!(
+                serde_json::to_string(&kind).expect("encode"),
+                format!("\"{}\"", kind.as_str())
+            );
+        }
+
+        // An older consumer: these events as they were before the fields
+        // existed, with the same serde attributes as `BuildEventKind`.
+        #[derive(Debug, Deserialize)]
+        struct OldEvent {
+            kind: OldKind,
+        }
+        #[derive(Debug, Deserialize)]
+        #[serde(tag = "type")]
+        enum OldKind {
+            ExecuteStart {
+                addr: String,
+                #[serde(default)]
+                queued_ms: Option<u64>,
+            },
+            AdmissionWaitStart {
+                addr: String,
+                pool: String,
+                need: u64,
+                free: u64,
+                ahead: u64,
+                #[serde(default)]
+                removals_pending: Option<u64>,
+            },
+            #[serde(other)]
+            Unknown,
+        }
+        let old: OldEvent = serde_json::from_str(&new_start).expect("an old consumer must decode");
+        match old.kind {
+            OldKind::ExecuteStart { addr, queued_ms } => {
+                assert_eq!((addr.as_str(), queued_ms), ("//a:x", Some(3)));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+        let old: OldEvent = serde_json::from_str(&new_wait).expect("an old consumer must decode");
+        match old.kind {
+            OldKind::AdmissionWaitStart {
+                addr,
+                pool,
+                need,
+                free,
+                ahead,
+                removals_pending,
+            } => {
+                assert_eq!((addr.as_str(), pool.as_str()), ("//a:x", "cpu"));
+                assert_eq!((need, free, ahead), (1_000_000, 3_000_000, 2));
+                assert_eq!(removals_pending, None);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
     }
 
     /// `ResultLockWaitStart` from a host predating `in_use_by_readers` decodes,
@@ -1102,6 +1401,7 @@ mod tests {
                 declared: Some(BTreeMap::from([("cpu".into(), 16_000_000)])),
                 reserved: Some(BTreeMap::from([("cpu".into(), 4_000_000)])),
                 queued_ms: Some(1500),
+                admitted: None,
             },
         };
         let back: BuildEvent =

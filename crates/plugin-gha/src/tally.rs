@@ -151,6 +151,9 @@ pub(crate) struct AdmissionWait {
     pub ahead: u64,
     /// On a `sandbox` wait: finished runs whose sandbox was not removed yet.
     pub removals_pending: Option<u64>,
+    /// The oldest waiter's need this one is held back for, when it is, with
+    /// its pool's unit as announced when the wait started.
+    pub yielding_to: Option<(hcore::events::YieldingToData, hcore::capacity::Unit)>,
     pub since_ms: u64,
 }
 
@@ -164,6 +167,7 @@ impl AdmissionWait {
             self.need,
             self.free,
             self.ahead,
+            self.yielding_to.as_ref().map(|(to, unit)| (to, *unit)),
             self.removals_pending,
             &hcore::units::human_duration(std::time::Duration::from_millis(
                 now_ms.saturating_sub(self.since_ms),
@@ -490,6 +494,7 @@ impl Tally {
                 free,
                 ahead,
                 removals_pending,
+                yielding_to,
             } => {
                 self.admission_waits.insert(
                     addr.as_str().into(),
@@ -501,6 +506,10 @@ impl Tally {
                         free: *free,
                         ahead: *ahead,
                         removals_pending: *removals_pending,
+                        yielding_to: yielding_to.as_ref().map(|to| {
+                            let unit = hcore::events::unit_of(&self.pool_units, &to.pool);
+                            (to.clone(), unit)
+                        }),
                         since_ms: ev.at_unix_ms,
                     },
                 );
@@ -934,6 +943,7 @@ mod tests {
                 declared: None,
                 reserved: None,
                 queued_ms: None,
+                admitted: None,
             },
         ));
         t.apply(&ev(
@@ -1041,6 +1051,7 @@ mod tests {
                 declared: None,
                 reserved: None,
                 queued_ms: None,
+                admitted: None,
             },
         ));
         let c = t.counters();
@@ -1170,6 +1181,7 @@ mod tests {
                     declared: None,
                     reserved: None,
                     queued_ms: None,
+                    admitted: None,
                 },
             ));
         }
@@ -1461,6 +1473,7 @@ mod tests {
             free: 2_000_000,
             ahead: 6,
             removals_pending: None,
+            yielding_to: None,
         };
         t.apply(&ev(1_000, start("//a:b", 4_000_000)));
         t.apply(&ev(5_000, start("//a:c", 500_000)));
@@ -1519,12 +1532,50 @@ mod tests {
                 free: 1 << 30,
                 ahead: 0,
                 removals_pending: None,
+                yielding_to: None,
             },
         ));
         let (waits, _) = t.admission_waits(5);
         assert_eq!(
             waits.iter().map(|w| w.text(2_000)).collect::<Vec<_>>(),
             ["//a:b waits for scratch_disk 4.0 GiB (1.0 GiB free, 0 ahead, 1s)"]
+        );
+    }
+
+    /// A wait held back for the oldest waiter names that waiter's need, in
+    /// the unit announced for the pool it yields, not the pool it waits on.
+    #[test]
+    fn an_admission_wait_names_what_it_yields_to_in_that_pools_unit() {
+        let mut t = Tally::default();
+        t.apply(&ev(
+            0,
+            BuildEventKind::RequestConfig {
+                max_workers: 4,
+                fail_fast: false,
+                scratch_disabled: false,
+                resources: [("scratch_disk".into(), Some(8 << 30))].into(),
+                units: [("scratch_disk".into(), "bytes".into())].into(),
+            },
+        ));
+        t.apply(&ev(
+            1_000,
+            BuildEventKind::AdmissionWaitStart {
+                addr: "//a:b".into(),
+                pool: "cpu".into(),
+                need: 1_000_000,
+                free: 3_000_000,
+                ahead: 2,
+                removals_pending: None,
+                yielding_to: Some(hcore::events::YieldingToData {
+                    pool: "scratch_disk".into(),
+                    need: 4 << 30,
+                }),
+            },
+        ));
+        let (waits, _) = t.admission_waits(5);
+        assert_eq!(
+            waits.iter().map(|w| w.text(2_000)).collect::<Vec<_>>(),
+            ["//a:b waits for cpu 1 (3 free, yielding to a scratch_disk 4.0 GiB run, 1s)"]
         );
     }
 

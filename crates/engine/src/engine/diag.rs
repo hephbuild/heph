@@ -2009,6 +2009,7 @@ mod tests {
             declared: None,
             reserved: None,
             queued_ms: None,
+            admitted: None,
         }));
         hook.on_event(&ev(BuildEventKind::ScratchLockWaitStart {
             addr: "//c:d".into(),

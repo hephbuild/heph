@@ -958,6 +958,7 @@ mod tests {
                     declared: None,
                     reserved: None,
                     queued_ms: None,
+                    admitted: None,
                 },
             ));
         }
@@ -1162,6 +1163,7 @@ mod tests {
                 declared: None,
                 reserved: None,
                 queued_ms: None,
+                admitted: None,
             },
         ));
         t.apply(&ev(0, outcome("//a:slow", CacheOutcomeKind::Miss)));
@@ -1294,6 +1296,7 @@ mod tests {
                 free: 2_000_000,
                 ahead: 6,
                 removals_pending: None,
+                yielding_to: None,
             },
         ));
         let md = render_live(&t, &ctx("heph run //...", 600_000), COMMENT_LIMIT);
@@ -1326,6 +1329,7 @@ mod tests {
                 free: 2_000_000,
                 ahead: 6,
                 removals_pending: None,
+                yielding_to: None,
             },
         ));
         let md = render_live(&t, &ctx("heph run //...", 600_000), COMMENT_LIMIT);
@@ -1342,6 +1346,7 @@ mod tests {
                 declared: None,
                 reserved: None,
                 queued_ms: None,
+                admitted: None,
             },
         ));
         let md = render_live(&t, &ctx("heph run //...", 600_000), COMMENT_LIMIT);
@@ -1533,6 +1538,7 @@ mod tests {
                     declared: None,
                     reserved: None,
                     queued_ms: None,
+                    admitted: None,
                 },
             ));
         }

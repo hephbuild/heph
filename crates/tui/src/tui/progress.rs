@@ -830,6 +830,8 @@ struct AdmissionWait {
     free: u64,
     ahead: u64,
     removals_pending: Option<u64>,
+    /// The oldest waiter's need this one is held back for, when it is.
+    yielding_to: Option<hcore::events::YieldingToData>,
     since_ms: u64,
 }
 
@@ -1089,6 +1091,7 @@ impl BuildState {
                 free,
                 ahead,
                 removals_pending,
+                yielding_to,
             } => {
                 // A repeated Start replaces the wait, so it counts once.
                 self.end_admission_wait(addr);
@@ -1105,6 +1108,7 @@ impl BuildState {
                         free: *free,
                         ahead: *ahead,
                         removals_pending: *removals_pending,
+                        yielding_to: yielding_to.clone(),
                         since_ms: ev.at_unix_ms,
                     },
                 );
@@ -1590,6 +1594,9 @@ impl BuildState {
                             w.need,
                             w.free,
                             w.ahead,
+                            w.yielding_to
+                                .as_ref()
+                                .map(|to| (to, self.unit_of(&to.pool))),
                             w.removals_pending,
                             &waited
                         )
@@ -2978,6 +2985,7 @@ mod tests {
             declared: None,
             reserved: None,
             queued_ms: None,
+            admitted: None,
         }
     }
 
@@ -2989,6 +2997,7 @@ mod tests {
             declared: None,
             reserved: Some(reserved.iter().map(|&(p, n)| (p.into(), n)).collect()),
             queued_ms: None,
+            admitted: None,
         }
     }
 
@@ -3006,6 +3015,7 @@ mod tests {
             declared: Some([("cpu".into(), declared)].into()),
             reserved: Some([("cpu".into(), reserved)].into()),
             queued_ms: Some(0),
+            admitted: None,
         };
         let mut s = BuildState::new();
         s.apply(&ev(0, start("//p:big", 16 * CPU, 4 * CPU)));
@@ -3058,6 +3068,7 @@ mod tests {
                 declared: Some([("scratch_disk".into(), 8 << 30)].into()),
                 reserved: Some([("cpu".into(), CPU), ("scratch_disk".into(), 4 << 30)].into()),
                 queued_ms: None,
+                admitted: None,
             },
         ));
         assert_eq!(
@@ -3257,6 +3268,7 @@ mod tests {
             free: 0,
             ahead: 0,
             removals_pending: None,
+            yielding_to: None,
         };
         let end = |addr: &str| BuildEventKind::AdmissionWaitEnd { addr: addr.into() };
 
@@ -3297,6 +3309,7 @@ mod tests {
             free: 0,
             ahead: 0,
             removals_pending: Some(pending),
+            yielding_to: None,
         };
         s.apply(&ev(1, wait("//a:x", 0)));
         assert_eq!(segments(&s), ["sandbox: 1 waiting"], "none pending");
@@ -3334,6 +3347,7 @@ mod tests {
                 free: 2 * CPU,
                 ahead: 6,
                 removals_pending: None,
+                yielding_to: None,
             },
         ));
         let text: String = s.admission_wait_lines(42_000, "")[0]
@@ -3351,6 +3365,40 @@ mod tests {
         assert!(s.admission_wait_lines(43_000, "").is_empty());
     }
 
+    /// A waiter that fits and is held back for the oldest one says so in its
+    /// row, the amount in the unit of the pool it yields, which is not
+    /// always the pool it waits on.
+    #[test]
+    fn admission_wait_row_names_what_it_yields_to() {
+        let mut s = BuildState::new();
+        let wait = |addr: &str, pool: &str, need| BuildEventKind::AdmissionWaitStart {
+            addr: addr.into(),
+            pool: "cpu".into(),
+            need: CPU,
+            free: 3 * CPU,
+            ahead: 6,
+            removals_pending: None,
+            yielding_to: Some(hcore::events::YieldingToData {
+                pool: pool.into(),
+                need,
+            }),
+        };
+        s.apply(&ev(1_000, wait("//a:b", "cpu", 8 * CPU)));
+        s.apply(&ev(1_000, wait("//a:c", "memory", 2 << 30)));
+        let rows: Vec<String> = s
+            .admission_wait_lines(42_000, "")
+            .iter()
+            .map(|l| format!("{l}"))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                "  ⧗ //a:b waits for cpu 1 (3 free, yielding to a cpu 8 run, 41s)",
+                "  ⧗ //a:c waits for cpu 1 (3 free, yielding to a memory 2.0 GiB run, 41s)",
+            ]
+        );
+    }
+
     fn admission_wait_start(addr: &str) -> BuildEventKind {
         BuildEventKind::AdmissionWaitStart {
             addr: addr.into(),
@@ -3359,6 +3407,7 @@ mod tests {
             free: 2 * CPU,
             ahead: 6,
             removals_pending: None,
+            yielding_to: None,
         }
     }
 
