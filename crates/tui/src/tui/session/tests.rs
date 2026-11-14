@@ -766,6 +766,121 @@ async fn file_source_follows_until_end() {
     );
 }
 
+/// Read a follow stream up to its `CaughtUp`, counting the records before it.
+/// An `Ended` first fails the test: the cases below need the follower to be
+/// past its first read before the owner acts.
+async fn until_caught_up(
+    stream: &mut futures::stream::BoxStream<'static, anyhow::Result<SessionItem>>,
+) -> usize {
+    use futures::StreamExt as _;
+    let mut records = 0;
+    loop {
+        match stream.next().await.expect("item").expect("ok") {
+            SessionItem::Record(_) => records += 1,
+            SessionItem::CaughtUp { skipped } => {
+                assert_eq!(skipped, 0);
+                return records;
+            }
+            SessionItem::Ended { .. } => panic!("ended before catching up"),
+        }
+    }
+}
+
+/// `End` written while the follower is already polling the tail (not found
+/// in its first read): every record after `CaughtUp` arrives, then `Ended`
+/// with the exit code, not lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn follow_sees_an_end_written_mid_follow() {
+    use futures::StreamExt as _;
+    let root = tempfile::tempdir().expect("tempdir");
+    let session = Session::open(&SessionRoot::new(root.path()), start()).expect("open");
+    let tap = session.tap();
+    let mut evs = events().into_iter();
+    tap.event(evs.next().expect("one event"));
+    // Recorded before subscribing, so the first read finds it.
+    while read_records(session.dir()).0.is_empty() {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let source = FileSource::new(root.path());
+    let mut stream = source.subscribe(session.id()).await.expect("subscribe");
+    assert_eq!(until_caught_up(&mut stream).await, 1);
+
+    // The follower is in its tail loop now; the rest of the run happens.
+    let rest = evs.len();
+    for ev in evs {
+        tap.event(ev);
+    }
+    session.finish(Some(2), false);
+
+    let mut records = 0usize;
+    let ended = loop {
+        let item = tokio::time::timeout(Duration::from_secs(10), stream.next())
+            .await
+            .expect("the follower sees the end")
+            .expect("item")
+            .expect("ok");
+        match item {
+            SessionItem::Record(_) => records += 1,
+            SessionItem::CaughtUp { .. } => panic!("caught up twice"),
+            SessionItem::Ended { exit, lost } => break (exit, lost),
+        }
+    };
+    assert_eq!(ended, (Some(2), false));
+    assert_eq!(records, rest + 1, "the remaining events plus `End`");
+}
+
+/// The owner's lock freed without an `End` while the follower polls (a
+/// `SIGKILL`ed heph): the follower keeps waiting while the lock is held, and
+/// reads the release as lost, with no exit code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn follow_reads_a_lock_freed_without_end_as_lost() {
+    use futures::StreamExt as _;
+    // A real session gives a real `meta.json` and a first record; the owner
+    // below is hand-made so it can die without writing `End`.
+    let template = tempfile::tempdir().expect("tempdir");
+    let real = Session::open(&SessionRoot::new(template.path()), start()).expect("open");
+    real.tap().event(events().into_iter().next().expect("one event"));
+    real.finish(Some(0), false);
+    let events_file = std::fs::read_to_string(real.dir().join(files::EVENTS)).expect("events");
+    let first = events_file.lines().next().expect("a first record");
+
+    let root = tempfile::tempdir().expect("tempdir");
+    let dir = root.path().join(real.id().encode());
+    std::fs::create_dir(&dir).expect("mkdir");
+    std::fs::copy(real.dir().join(files::META), dir.join(files::META)).expect("meta");
+    std::fs::write(dir.join(files::EVENTS), format!("{first}\n")).expect("events");
+    let lock = lockfile::acquire_owner_lock(&dir.join(files::LOCK)).expect("lock");
+
+    let source = FileSource::new(root.path());
+    let mut stream = source.subscribe(real.id()).await.expect("subscribe");
+    assert_eq!(until_caught_up(&mut stream).await, 1);
+    // Held: several ticks pass with nothing to say.
+    assert!(
+        tokio::time::timeout(source::FOLLOW_TICK * 3, stream.next())
+            .await
+            .is_err(),
+        "a held lock is a live session"
+    );
+
+    drop(lock);
+    let item = tokio::time::timeout(Duration::from_secs(10), stream.next())
+        .await
+        .expect("the follower sees the release")
+        .expect("item")
+        .expect("ok");
+    assert!(
+        matches!(
+            item,
+            SessionItem::Ended {
+                exit: None,
+                lost: true
+            }
+        ),
+        "{item:?}"
+    );
+}
+
 /// A live session whose owner never said it answers in-flight requests (an
 /// older heph, no `inflight` capability) is refused by name, and the viewer
 /// writes no request file into it: nobody would ever answer one.
