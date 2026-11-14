@@ -937,11 +937,21 @@ impl Engine {
         addr: &Addr,
         hashin: &str,
     ) -> anyhow::Result<Option<Manifest>> {
+        Ok(Self::read_newest_manifest(cache, addr, hashin)?.map(|(_, m)| m))
+    }
+
+    /// [`read_manifest_from`](Self::read_manifest_from), plus the name of the
+    /// manifest it read, which says how the blobs it names are named.
+    fn read_newest_manifest(
+        cache: &Arc<dyn LocalCache>,
+        addr: &Addr,
+        hashin: &str,
+    ) -> anyhow::Result<Option<(&'static str, Manifest)>> {
         // Newest first: a revision both an older heph and this one wrote has
         // both manifests, each naming its own blobs, and either is complete.
         for name in MANIFESTS {
             if let Some(m) = Self::read_named_manifest(cache, addr, hashin, name)? {
-                return Ok(Some(m));
+                return Ok(Some((name, m)));
             }
         }
         Ok(None)
@@ -1000,26 +1010,47 @@ impl Engine {
         if src_key == dst_key {
             return Ok(false);
         }
-        let Some(manifest) = self.read_manifest(addr, src_key)? else {
+        let Some((manifest_name, manifest)) =
+            Self::read_newest_manifest(&self.local_cache, addr, src_key)?
+        else {
             return Ok(false);
         };
-        self.duplicate_cache_entry(addr, src_key, dst_key, &manifest)?;
+        self.duplicate_cache_entry(
+            addr,
+            src_key,
+            dst_key,
+            manifest_name == MANIFEST_V1,
+            &manifest,
+        )?;
         Ok(true)
     }
 
     /// Copy the blobs named in `manifest` from `src_key` to `dst_key`, then write
-    /// `manifest` (rewritten with `hashin = dst_key`) under `dst_key`. Blob bytes
-    /// are copied verbatim so the duplicate is identical to the primary; only the
-    /// manifest's `hashin` differs so a reader keyed by `dst_key` sees a
-    /// consistent revision.
+    /// `manifest` (rewritten with `hashin = dst_key`) under `dst_key` as a
+    /// [`MANIFEST_V2`]. Blob bytes are copied verbatim so the duplicate decodes
+    /// to the primary; only the manifest's `hashin` differs so a reader keyed by
+    /// `dst_key` sees a consistent revision.
+    ///
+    /// `from_v1`: `manifest` was read from a [`MANIFEST_V1`], whose blob names
+    /// are bare. A v2 manifest never names a bare blob (that name is an older
+    /// heph's), so each blob is copied to its v2
+    /// [`entry_name`](cache_codec::entry_name) for its encoding, and the
+    /// duplicate records that name.
     fn duplicate_cache_entry(
         &self,
         addr: &Addr,
         src_key: &str,
         dst_key: &str,
+        from_v1: bool,
         manifest: &Manifest,
     ) -> anyhow::Result<()> {
+        let mut dup_artifacts = Vec::with_capacity(manifest.artifacts.len());
         for artifact in &manifest.artifacts {
+            let dst_name = if from_v1 {
+                cache_codec::entry_name(&artifact.name, &artifact.encoding)
+            } else {
+                artifact.name.clone()
+            };
             let mut reader = self
                 .local_cache
                 .reader(addr, src_key, &artifact.name)
@@ -1029,16 +1060,17 @@ impl Engine {
                 .reader;
             let mut writer = self
                 .local_cache
-                .writer(addr, dst_key, &artifact.name)
-                .with_context(|| {
-                    format!("open dest blob {} for {addr} {dst_key}", artifact.name)
-                })?;
-            io::copy(&mut reader, &mut writer).with_context(|| {
-                format!("copy blob {} for {addr} into {dst_key}", artifact.name)
-            })?;
-            writer.commit().with_context(|| {
-                format!("commit blob {} for {addr} into {dst_key}", artifact.name)
-            })?;
+                .writer(addr, dst_key, &dst_name)
+                .with_context(|| format!("open dest blob {dst_name} for {addr} {dst_key}"))?;
+            io::copy(&mut reader, &mut writer)
+                .with_context(|| format!("copy blob {dst_name} for {addr} into {dst_key}"))?;
+            writer
+                .commit()
+                .with_context(|| format!("commit blob {dst_name} for {addr} into {dst_key}"))?;
+            dup_artifacts.push(ManifestArtifact {
+                name: dst_name,
+                ..artifact.clone()
+            });
         }
 
         // Stamp the duplicate with a freshly-sampled, strictly-newer timestamp.
@@ -1053,9 +1085,11 @@ impl Engine {
             .unwrap_or(0)
             .max(manifest.created_at_nanos.saturating_add(1));
         let dup_manifest = Manifest {
+            version: MANIFEST_V2_VERSION.to_string(),
+            target: manifest.target.clone(),
             hashin: dst_key.to_string(),
             created_at_nanos: dup_created,
-            ..manifest.clone()
+            artifacts: dup_artifacts,
         };
         let mut manifest_writer = self
             .local_cache
@@ -2549,6 +2583,187 @@ mod tests {
         );
         assert_eq!(primary_bytes, extra_bytes);
         assert!(!primary_bytes.is_empty());
+    }
+
+    /// Plant what an older heph wrote: a [`MANIFEST_V1`] (version "1.0.0")
+    /// naming one raw tar output `name` of group `out`, and its blob under that
+    /// bare name, written through the cache writer.
+    fn write_v1_revision(engine: &Engine, addr: &Addr, hashin: &str, name: &str, data: &[u8]) {
+        let mut w = cache_codec::open_writer(
+            &*engine.local_cache,
+            addr,
+            hashin,
+            name,
+            &ManifestArtifactEncoding::None,
+        )
+        .expect("blob writer");
+        io::Write::write_all(&mut w, data).expect("write blob");
+        w.commit().expect("commit blob");
+        let manifest = Manifest {
+            version: "1.0.0".to_string(),
+            target: addr.format(),
+            created_at_nanos: 100,
+            hashin: hashin.to_string(),
+            artifacts: vec![ManifestArtifact {
+                hashout: "ho-v1".to_string(),
+                group: "out".to_string(),
+                name: name.to_string(),
+                size: data.len() as u64,
+                r#type: ManifestArtifactType::Output,
+                content_type: ManifestArtifactContentType::Tar,
+                encoding: ManifestArtifactEncoding::None,
+            }],
+        };
+        let mut w = engine
+            .local_cache
+            .writer(addr, hashin, MANIFEST_V1)
+            .expect("manifest writer");
+        borsh::to_writer(&mut w, &manifest).expect("write manifest");
+        w.commit().expect("commit manifest");
+    }
+
+    fn v1_tar(dir: &std::path::Path) -> Vec<u8> {
+        let (path, _) = cache_codec::tests::tar_of_one(dir, b"v1 member", 4096);
+        std::fs::read(path).expect("read tar")
+    }
+
+    /// An upgrade keeps the local cache warm: a revision an older heph wrote
+    /// (v1 manifest, raw blob under its bare name) is served as is.
+    #[tokio::test]
+    async fn a_local_v1_revision_is_served() {
+        let (engine, dir) = test_engine();
+        let ctoken = StdCancellationToken::new();
+        let addr = test_addr();
+        let def = linked_def(&addr);
+        let tar = v1_tar(dir.path());
+        write_v1_revision(&engine, &addr, "V1HASH", "out_a.tar", &tar);
+
+        let (arts, meta) = engine
+            .artifacts_from_local_cache(&ctoken, &def, "V1HASH", vec!["out".to_string()])
+            .await
+            .expect("read v1 revision")
+            .expect("v1 revision is a hit");
+
+        assert_eq!(meta.len(), 1);
+        let [art] = arts.as_slice() else {
+            panic!("expected one artifact, got {}", arts.len());
+        };
+        assert_eq!(art.name, "out_a.tar");
+        assert_eq!(art.encoding, ManifestArtifactEncoding::None);
+        assert_eq!(
+            drain_reader(hartifactcontent::Content::reader(art).expect("reader")),
+            tar
+        );
+        let mut seekable = hartifactcontent::Content::seekable_reader(art)
+            .expect("seekable reader")
+            .expect("a raw v1 blob has a seekable reader");
+        let mut via_seek = Vec::new();
+        io::Read::read_to_end(&mut seekable, &mut via_seek).expect("read seekable");
+        assert_eq!(via_seek, tar);
+    }
+
+    /// Duplicating a v2 revision keeps each blob's encoding and name, and the
+    /// copy decodes to the original.
+    #[tokio::test]
+    async fn duplicating_a_v2_revision_keeps_its_encoding() {
+        let (engine, _dir) = test_engine();
+        let ctoken = StdCancellationToken::new();
+        let addr = test_addr();
+        let def = linked_def(&addr);
+        engine
+            .cache_locally(
+                &ctoken,
+                &addr,
+                "PRIMARYHASH",
+                vec![raw_artifact("a", b"compress me compress me compress me")],
+                false,
+            )
+            .await
+            .expect("cache_locally");
+        assert!(
+            engine
+                .duplicate_cache_revision(&addr, "PRIMARYHASH", "FIXPOINTKEY")
+                .expect("duplicate")
+        );
+
+        let src = engine
+            .read_manifest(&addr, "PRIMARYHASH")
+            .expect("read")
+            .expect("src");
+        let dup = Engine::read_all_manifests(&engine.local_cache, &addr, "FIXPOINTKEY")
+            .expect("read dup manifests");
+        let [(dup_name, dup)] = dup.as_slice() else {
+            panic!("expected exactly one manifest for the duplicate");
+        };
+        assert_eq!(*dup_name, MANIFEST_V2);
+        assert_eq!(dup.version, MANIFEST_V2_VERSION);
+        assert_eq!(dup.artifacts[0].name, src.artifacts[0].name);
+        assert_eq!(dup.artifacts[0].encoding, ManifestArtifactEncoding::Zstd);
+
+        let primary = decoded_output(&engine, &def, "PRIMARYHASH").await;
+        let copy = decoded_output(&engine, &def, "FIXPOINTKEY").await;
+        assert!(!primary.is_empty());
+        assert_eq!(copy, primary);
+    }
+
+    /// The decoded bytes of the one `out` artifact of `hashin`'s revision.
+    async fn decoded_output(engine: &Engine, def: &LinkedTargetDef, hashin: &str) -> Vec<u8> {
+        let (arts, _) = engine
+            .artifacts_from_local_cache(
+                &StdCancellationToken::new(),
+                def,
+                hashin,
+                vec!["out".to_string()],
+            )
+            .await
+            .expect("read")
+            .expect("present");
+        drain_reader(hartifactcontent::Content::reader(&arts[0]).expect("reader"))
+    }
+
+    /// Duplicating a v1 revision writes a v2 one: every blob is copied to its
+    /// suffixed v2 name, since a v2 manifest naming a bare blob would name an
+    /// older heph's key.
+    #[tokio::test]
+    async fn duplicating_a_v1_revision_writes_v2_names() {
+        let (engine, dir) = test_engine();
+        let ctoken = StdCancellationToken::new();
+        let addr = test_addr();
+        let def = linked_def(&addr);
+        let tar = v1_tar(dir.path());
+        write_v1_revision(&engine, &addr, "V1HASH", "out_a.tar", &tar);
+
+        assert!(
+            engine
+                .duplicate_cache_revision(&addr, "V1HASH", "FIXPOINTKEY")
+                .expect("duplicate")
+        );
+
+        let dup = Engine::read_all_manifests(&engine.local_cache, &addr, "FIXPOINTKEY")
+            .expect("read dup manifests");
+        let [(dup_name, dup)] = dup.as_slice() else {
+            panic!("expected exactly one manifest for the duplicate");
+        };
+        assert_eq!(*dup_name, MANIFEST_V2);
+        assert_eq!(dup.version, MANIFEST_V2_VERSION);
+        for a in &dup.artifacts {
+            assert!(
+                cache_codec::V2_SUFFIXES.iter().any(|s| a.name.ends_with(s)),
+                "a v2 manifest names only suffixed blobs: {}",
+                a.name
+            );
+        }
+
+        let (arts, _) = engine
+            .artifacts_from_local_cache(&ctoken, &def, "FIXPOINTKEY", vec!["out".to_string()])
+            .await
+            .expect("read duplicate")
+            .expect("duplicate present");
+        assert_eq!(arts[0].name, "out_a.tar.raw");
+        assert_eq!(
+            drain_reader(hartifactcontent::Content::reader(&arts[0]).expect("reader")),
+            tar
+        );
     }
 
     fn drain_reader(mut r: Box<dyn io::Read>) -> Vec<u8> {
