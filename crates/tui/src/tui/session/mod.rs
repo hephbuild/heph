@@ -448,11 +448,6 @@ impl SessionSlot {
         self.with(|s| s.session.as_ref().map(|x| x.dir().to_path_buf()))
     }
 
-    /// The open session's id, if any.
-    pub fn id(&self) -> Option<SessionId> {
-        self.with(|s| s.session.as_ref().map(|x| x.id()))
-    }
-
     /// The open session's tap, if any.
     fn tap(&self) -> Option<SessionTap> {
         self.with(|s| s.session.as_ref().map(|x| x.tap()))
