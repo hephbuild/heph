@@ -7,6 +7,13 @@ The code is `crates/engine/src/engine/cache_codec.rs`.
 
 - A revision is written under `manifest-v2.borsh`. Each artifact's `encoding`
   says how its blob is stored: `Zstd` (entry name `<name>.zst`) or `None`.
+- A `Zstd` blob is in the zstd seekable format (zstd's
+  `contrib/seekable_format`). The decoded bytes are cut into 1 MiB frames,
+  each compressed on its own with a checksum. A seek table in a skippable frame
+  at the end lists each frame's stored and decoded size. The blob is still one
+  valid zstd stream, so `zstd -d` and any streaming decoder read it whole.
+  Through the seek table, a read at any offset decodes only the frame holding
+  it.
 - Artifacts heph packs itself (raw, file, view) are always compressed. A
   container output (`TarPath`/`CpioPath`) is scanned when it is 1 MiB or more:
   a tar whose payload is already compressed (an OCI image of gzip layers) is
@@ -33,12 +40,36 @@ directory or a bucket.
 
 ## What a compressed blob gives up
 
-It has no O(1) pread and no plain file. Its `CacheArtifact` reports no seekable
-reader and no file path, and each consumer falls back:
+Its `CacheArtifact` still has a seekable reader, which decodes through the seek
+table. A FUSE slot serves the blob lazily. The tar index is built from the
+headers and decodes only the frames that hold one. A random read decodes up to
+one frame (1 MiB).
 
-- A FUSE slot with such an input runs on the OS unpack path.
-- A plugin streams the blob instead of opening the file.
-- The tar index is built by walking the decoded stream.
+Two things are lost:
+
+- There is no plain file. `file_path()` is `None`, so a plugin streams the
+  blob instead of opening the file.
+- The output cannot be adopted into the cache by rename. It is compressed on
+  the way in.
+
+A container whose payload is already compressed is stored verbatim and keeps
+both.
+
+## Frame size
+
+Frames are 1 MiB of decoded data. Each frame starts with an empty window, so
+smaller frames compress worse. A random read decodes a whole frame, so larger
+frames make it slower. At 1 MiB the blob is 0.5–1.1% larger than a single zstd
+frame of the same data:
+
+| sample | one frame | 1 MiB frames |
+|---|---|---|
+| Go `.a` archives, 116 MB | 4.58x | 4.56x |
+| Rust rlibs, 129 MB | 3.54x | 3.52x |
+| native binaries, 59 MB | 2.55x | 2.52x |
+| Go source, 21 MB | 3.27x | 3.25x |
+
+Both forms decode at about 1.5–1.7 GB/s in-process.
 
 ## Why zstd -1
 

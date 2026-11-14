@@ -11996,7 +11996,8 @@ mod tests {
     /// The other half of the direct-open contract: a compressed blob reports
     /// no file even when it is spilled to one, because that file holds zstd
     /// bytes, not the artifact — a consumer that opened it would read garbage
-    /// as a tar. It must still stream the decoded artifact.
+    /// as a tar. It must still stream the decoded artifact, and its seekable
+    /// reader serves the decoded tar too.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_compressed_cached_artifact_reports_no_file_and_streams_decoded() {
         let (artifact, _dir) = resolve_one_artifact_at_spill(1, SpillOutput::Compressed).await;
@@ -12004,10 +12005,6 @@ mod tests {
         assert!(
             artifact.file_path().is_none(),
             "a compressed blob's file is not the artifact"
-        );
-        assert!(
-            artifact.seekable_reader().expect("seekable").is_none(),
-            "nor can it be seeked as one"
         );
         let entries: Vec<_> = artifact
             .walk()
@@ -12019,6 +12016,13 @@ mod tests {
             [std::path::PathBuf::from("out_main")],
             "the stream decodes to the packed tar"
         );
+        let seekable = artifact
+            .seekable_reader()
+            .expect("seekable")
+            .expect("a compressed blob seeks through its seek table");
+        let index =
+            hcore::hartifactcontent::tar_index::TarIndex::build(seekable).expect("tar index");
+        assert_eq!(index.entry_paths(), entries, "the index sees the same tar");
     }
 
     /// The property that makes handing out a bare `PathBuf` safe at all: an fd

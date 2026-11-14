@@ -340,9 +340,9 @@ pub struct CacheArtifact {
     pub hashin: String,
     pub name: String,
     pub cache: Arc<dyn LocalCache>,
-    /// How the blob is stored. Reads decode it; an encoded blob has no
-    /// seekable reader and no file path, since neither would yield the
-    /// decoded bytes.
+    /// How the blob is stored. Reads decode it, the seekable reader through
+    /// the seek table of the zstd seekable format; an encoded blob has no file
+    /// path, since the file would not hold the decoded bytes.
     pub encoding: ManifestArtifactEncoding,
     pub content_type: hartifactcontent::Type,
     pub hashout: String,
@@ -383,9 +383,10 @@ impl hartifactcontent::Content for CacheArtifact {
     fn entry_paths(&self) -> anyhow::Result<Vec<std::path::PathBuf>> {
         match &self.content_type {
             // Header-only: index the tar over the seekable reader (seeks past
-            // file data) instead of walking and reading every byte. A
-            // compressed blob cannot seek, so it walks; decoding runs at about
-            // 1 GB/s, which is what the walk costs on top of the index.
+            // file data) instead of walking and reading every byte. For a
+            // compressed blob that decodes only the frames holding a header;
+            // a frame of nothing but file data is skipped. A backend with no
+            // seekable reader walks the whole stream.
             hartifactcontent::Type::Tar => match self.seekable_reader()? {
                 Some(reader) => {
                     Ok(hcore::hartifactcontent::tar_index::TarIndex::build(reader)?.entry_paths())
@@ -400,11 +401,18 @@ impl hartifactcontent::Content for CacheArtifact {
     fn seekable_reader(
         &self,
     ) -> anyhow::Result<Option<Box<dyn hartifactcontent::ReadSeek + Send>>> {
-        if self.encoding != ManifestArtifactEncoding::None {
+        let Some(stored) = self
+            .cache
+            .seekable_reader(&self.addr, &self.hashin, &self.name)?
+        else {
             return Ok(None);
-        }
-        self.cache
-            .seekable_reader(&self.addr, &self.hashin, &self.name)
+        };
+        cache_codec::decode_seekable(stored, &self.encoding).with_context(|| {
+            format!(
+                "open seekable decoder for cached artifact {} of {}",
+                self.name, self.addr
+            )
+        })
     }
 
     fn byte_size(&self) -> Option<u64> {

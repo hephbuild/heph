@@ -19,22 +19,31 @@
 //! binaries it compresses as well as gzip -6 (2.5–4.6x), about 3.5x faster than
 //! gzip -1, and decodes at about 1 GB/s. The numbers are in `docs/CACHE_COMPRESSION.md`.
 //!
-//! What a compressed blob gives up: it has no O(1) pread and no plain file on
-//! disk, so [`CacheArtifact`](crate::engine::local_cache::CacheArtifact)
-//! reports no seekable reader and no file path for it. Their consumers already
-//! fall back: a FUSE slot with such an input runs on the OS unpack path, a
-//! plugin streams instead of opening the file, and the tar index is built by
-//! walking. A container output that is already compressed (an OCI image of
-//! gzip layers) is stored verbatim instead, which keeps those paths and the
-//! zero-copy rename for exactly the artifacts that would gain nothing.
+//! The format is the zstd *seekable format* (zstd's
+//! `contrib/seekable_format`): the decoded bytes are cut into frames of
+//! [`SEEKABLE_FRAME_SIZE`], each compressed independently, followed by a seek
+//! table in a skippable frame that lists every frame's stored and decoded
+//! size. The whole blob is still one valid zstd stream, so a plain streaming
+//! decoder reads it front to back ([`decode_reader`]); the seek table lets
+//! [`SeekableDecoder`] serve a read at any decoded offset by decoding only the
+//! frame that holds it. That is what gives a compressed blob a seekable reader:
+//! a FUSE slot serves it lazily and the tar index is built from headers alone,
+//! skipping the frames that hold nothing but file data.
+//!
+//! What a compressed blob still gives up: it has no plain file on disk, so
+//! [`CacheArtifact`](crate::engine::local_cache::CacheArtifact) reports no file
+//! path for it and a plugin streams instead of opening the file, and it cannot
+//! be adopted into the cache by rename. A container output that is already
+//! compressed (an OCI image of gzip layers) is stored verbatim instead, which
+//! keeps those paths for exactly the artifacts that would gain nothing.
 
 use crate::engine::local_cache::{
     EntryWriter, LocalCache, ManifestArtifactContentType, ManifestArtifactEncoding,
 };
 use anyhow::Context;
-use hcore::hartifactcontent::sniff;
+use hcore::hartifactcontent::{ReadSeek, sniff};
 use hmodel::htaddr::Addr;
-use std::io;
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use tracing::debug;
 
@@ -42,6 +51,36 @@ use tracing::debug;
 /// that already matches gzip -6's ratio on build outputs; higher levels cost
 /// write CPU on every build for a few percent of disk.
 pub(crate) const ZSTD_LEVEL: i32 = 1;
+
+/// Decoded bytes per seekable frame.
+///
+/// The trade-off: each frame starts with an empty window, so smaller frames
+/// compress worse; and a read at a random offset decodes up to a whole frame,
+/// so larger frames make a FUSE read or a tar-header seek cost more. At 1 MiB
+/// the blob is 0.5–1.1% larger than one frame on Go archives, rlibs and native
+/// binaries, a random read decodes at most 1 MiB (well under a millisecond at
+/// the 1.5 GB/s it decodes), and the seek table costs 8 bytes per MiB. It is
+/// also the most a writer or a reader holds in memory per blob.
+pub(crate) const SEEKABLE_FRAME_SIZE: usize = 1 << 20;
+
+/// Magic of the skippable frame that carries the seek table.
+const SKIPPABLE_MAGIC: u32 = 0x184D_2A5E;
+/// Magic closing the seek table footer.
+const SEEKABLE_MAGIC: u32 = 0x8F92_EAB1;
+/// Skippable frame header: magic + frame size, both `u32` LE.
+const SKIPPABLE_HEADER_SIZE: usize = 8;
+/// Seek table footer: frame count `u32`, descriptor `u8`, magic `u32`.
+const FOOTER_SIZE: usize = 9;
+/// Descriptor bit: each entry carries a 4-byte decoded-data checksum.
+const DESCRIPTOR_CHECKSUM: u8 = 0x80;
+/// Descriptor bits the format reserves; a table with any set is refused.
+const DESCRIPTOR_RESERVED: u8 = 0x7C;
+/// A seek table entry that this writer emits: stored size, decoded size. The
+/// per-entry checksum is left out because every frame carries zstd's own.
+const ENTRY_SIZE: usize = 8;
+/// Largest decoded frame a reader accepts. heph writes [`SEEKABLE_FRAME_SIZE`];
+/// the cap only bounds what a corrupt table can make the reader allocate.
+const MAX_FRAME_DECODED: u64 = 64 << 20;
 
 /// Suffix of a zstd-compressed blob's entry name. Keeps compressed and raw
 /// blobs of one revision under distinct keys (see the module docs).
@@ -84,6 +123,11 @@ pub(crate) fn open_writer(
 }
 
 /// Wrap a stored-bytes reader so it yields decoded bytes.
+///
+/// A seekable blob is a plain zstd stream, so this streams it with the
+/// ordinary decoder. One check is added: a stream of several frames that is
+/// cut exactly between two frames decodes cleanly to short data, so the
+/// stored bytes must end with the seek table's magic.
 pub(crate) fn decode_reader(
     reader: Box<dyn io::Read>,
     encoding: &ManifestArtifactEncoding,
@@ -91,11 +135,25 @@ pub(crate) fn decode_reader(
     match encoding {
         ManifestArtifactEncoding::None => Ok(reader),
         ManifestArtifactEncoding::Zstd => Ok(Box::new(
-            zstd::stream::read::Decoder::new(reader).context("open zstd decoder")?,
+            zstd::stream::read::Decoder::new(SeekTableTail::new(reader))
+                .context("open zstd decoder")?,
         )),
         // Only ever written by the remote of an older heph, under a manifest
         // name this version does not read.
         ManifestArtifactEncoding::Gzip => anyhow::bail!("gzip cache blobs are not supported"),
+    }
+}
+
+/// Wrap a stored-bytes seekable reader so it yields decoded bytes with random
+/// access. `None` for an encoding that has no seekable decoder.
+pub(crate) fn decode_seekable(
+    reader: Box<dyn ReadSeek + Send>,
+    encoding: &ManifestArtifactEncoding,
+) -> anyhow::Result<Option<Box<dyn ReadSeek + Send>>> {
+    match encoding {
+        ManifestArtifactEncoding::None => Ok(Some(reader)),
+        ManifestArtifactEncoding::Zstd => Ok(Some(Box::new(SeekableDecoder::open(reader)?))),
+        ManifestArtifactEncoding::Gzip => Ok(None),
     }
 }
 
@@ -146,38 +204,365 @@ fn is_precompressed(path: &Path, size: u64) -> bool {
     }
 }
 
-/// An [`EntryWriter`] that zstd-compresses into another one. Commit finishes
-/// the frame, then commits the inner writer; dropping it uncommitted drops the
-/// inner writer uncommitted, which discards the entry.
+/// An [`EntryWriter`] that writes the zstd seekable format into another one:
+/// one frame per [`SEEKABLE_FRAME_SIZE`] decoded bytes, then the seek table.
+/// Commit writes the last frame and the table, then commits the inner writer;
+/// dropping it uncommitted drops the inner writer uncommitted, which discards
+/// the entry.
 struct ZstdEntryWriter {
-    enc: zstd::stream::write::Encoder<'static, Box<dyn EntryWriter>>,
+    inner: Box<dyn EntryWriter>,
+    cctx: zstd::bulk::Compressor<'static>,
+    /// Decoded bytes of the frame being filled, at most [`SEEKABLE_FRAME_SIZE`].
+    /// Grows with what is written, so a small blob costs a small buffer.
+    pending: Vec<u8>,
+    /// Scratch for one compressed frame.
+    frame: Vec<u8>,
+    /// `(stored, decoded)` size of every frame written so far.
+    table: Vec<(u32, u32)>,
 }
 
 impl ZstdEntryWriter {
     fn new(inner: Box<dyn EntryWriter>) -> anyhow::Result<Self> {
-        let mut enc =
-            zstd::stream::write::Encoder::new(inner, ZSTD_LEVEL).context("open zstd encoder")?;
+        let mut cctx = zstd::bulk::Compressor::new(ZSTD_LEVEL).context("open zstd compressor")?;
         // A cache serves the same bytes for weeks; a 4-byte checksum per frame
         // turns on-disk corruption into a read error instead of a bad tar.
-        enc.include_checksum(true)
+        cctx.set_parameter(zstd::stream::raw::CParameter::ChecksumFlag(true))
             .context("enable zstd frame checksum")?;
-        Ok(Self { enc })
+        Ok(Self {
+            inner,
+            cctx,
+            pending: Vec::new(),
+            frame: Vec::new(),
+            table: Vec::new(),
+        })
+    }
+
+    /// Compress `data` as one frame and write it to the inner writer.
+    fn write_frame(&mut self, data: &[u8]) -> io::Result<()> {
+        let decoded = u32::try_from(data.len()).map_err(io::Error::other)?;
+        self.frame.clear();
+        self.frame
+            .reserve(zstd::zstd_safe::compress_bound(data.len()));
+        let stored = self.cctx.compress_to_buffer(data, &mut self.frame)?;
+        let stored = u32::try_from(stored).map_err(io::Error::other)?;
+        self.inner.write_all(&self.frame)?;
+        self.table.push((stored, decoded));
+        Ok(())
+    }
+
+    /// Write the buffered bytes as a frame, keeping the buffer's allocation.
+    fn write_pending(&mut self) -> io::Result<()> {
+        let pending = std::mem::take(&mut self.pending);
+        let res = self.write_frame(&pending);
+        self.pending = pending;
+        self.pending.clear();
+        res
+    }
+
+    /// The seek table, as the skippable frame that ends the blob.
+    fn seek_table(&self) -> anyhow::Result<Vec<u8>> {
+        let frames = u32::try_from(self.table.len()).context("too many zstd frames")?;
+        let body = self.table.len() * ENTRY_SIZE + FOOTER_SIZE;
+        let mut out = Vec::with_capacity(SKIPPABLE_HEADER_SIZE + body);
+        out.extend_from_slice(&SKIPPABLE_MAGIC.to_le_bytes());
+        out.extend_from_slice(
+            &u32::try_from(body)
+                .context("zstd seek table too large")?
+                .to_le_bytes(),
+        );
+        for (stored, decoded) in &self.table {
+            out.extend_from_slice(&stored.to_le_bytes());
+            out.extend_from_slice(&decoded.to_le_bytes());
+        }
+        out.extend_from_slice(&frames.to_le_bytes());
+        out.push(0); // descriptor: no per-entry checksums
+        out.extend_from_slice(&SEEKABLE_MAGIC.to_le_bytes());
+        Ok(out)
     }
 }
 
 impl io::Write for ZstdEntryWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.enc.write(buf)
+        // A full frame is written before more is accepted, so a failed frame
+        // write never reports bytes it took as consumed.
+        if self.pending.len() == SEEKABLE_FRAME_SIZE {
+            self.write_pending()?;
+        }
+        if self.pending.is_empty() && buf.len() >= SEEKABLE_FRAME_SIZE {
+            // A whole frame straight from the caller's buffer, without a copy.
+            let (frame, _) = buf.split_at(SEEKABLE_FRAME_SIZE);
+            self.write_frame(frame)?;
+            return Ok(SEEKABLE_FRAME_SIZE);
+        }
+        let take = buf.len().min(SEEKABLE_FRAME_SIZE - self.pending.len());
+        let (taken, _) = buf.split_at(take);
+        self.pending.extend_from_slice(taken);
+        Ok(take)
     }
 
+    /// Flushes the inner writer only: ending a frame early would change the
+    /// blob's framing, and nothing reads an entry before it is committed.
     fn flush(&mut self) -> io::Result<()> {
-        self.enc.flush()
+        self.inner.flush()
     }
 }
 
 impl EntryWriter for ZstdEntryWriter {
-    fn commit(self: Box<Self>) -> anyhow::Result<()> {
-        self.enc.finish().context("finish zstd frame")?.commit()
+    fn commit(mut self: Box<Self>) -> anyhow::Result<()> {
+        if !self.pending.is_empty() {
+            self.write_pending().context("write last zstd frame")?;
+        }
+        let table = self.seek_table()?;
+        self.inner
+            .write_all(&table)
+            .context("write zstd seek table")?;
+        self.inner.commit()
+    }
+}
+
+/// Little-endian `u32` at `at` in `buf`.
+fn u32_at(buf: &[u8], at: usize) -> anyhow::Result<u32> {
+    let bytes = buf.get(at..at + 4).context("zstd seek table cut short")?;
+    Ok(u32::from_le_bytes(
+        bytes.try_into().context("zstd seek table field")?,
+    ))
+}
+
+/// Random access to the decoded bytes of a seekable-format blob.
+///
+/// Opening reads the seek table (one read at the end of the blob) and checks
+/// that its frames account for every stored byte, so a truncated or padded
+/// blob fails here rather than reading short. A read decodes the frame that
+/// holds the position and keeps it, so sequential reads and seeks within one
+/// frame decode it once.
+pub(crate) struct SeekableDecoder {
+    src: Box<dyn ReadSeek + Send>,
+    /// Frame `i` is `stored[i]..stored[i + 1]` of the blob and
+    /// `decoded[i]..decoded[i + 1]` of the decoded bytes. Both start at 0 and
+    /// hold one more element than there are frames.
+    stored: Vec<u64>,
+    decoded: Vec<u64>,
+    dctx: zstd::bulk::Decompressor<'static>,
+    /// The frame whose decoded bytes are in `frame`.
+    current: Option<usize>,
+    frame: Vec<u8>,
+    /// One frame's stored bytes.
+    scratch: Vec<u8>,
+    pos: u64,
+}
+
+impl SeekableDecoder {
+    pub(crate) fn open(mut src: Box<dyn ReadSeek + Send>) -> anyhow::Result<Self> {
+        let len = src.seek(SeekFrom::End(0)).context("size zstd blob")?;
+        anyhow::ensure!(
+            len >= (SKIPPABLE_HEADER_SIZE + FOOTER_SIZE) as u64,
+            "zstd blob of {len} bytes is too short to hold a seek table"
+        );
+        src.seek(SeekFrom::Start(len - FOOTER_SIZE as u64))
+            .context("seek to zstd seek table footer")?;
+        let mut footer = [0u8; FOOTER_SIZE];
+        src.read_exact(&mut footer)
+            .context("read zstd seek table footer")?;
+        let frames = u32_at(&footer, 0)?;
+        let descriptor = footer.get(4).copied().unwrap_or_default();
+        anyhow::ensure!(
+            u32_at(&footer, 5)? == SEEKABLE_MAGIC,
+            "zstd blob does not end with a seek table: truncated, or not in the seekable format"
+        );
+        anyhow::ensure!(
+            descriptor & DESCRIPTOR_RESERVED == 0,
+            "zstd seek table descriptor {descriptor:#x} sets reserved bits"
+        );
+        let entry: u64 = if descriptor & DESCRIPTOR_CHECKSUM != 0 {
+            ENTRY_SIZE as u64 + 4
+        } else {
+            ENTRY_SIZE as u64
+        };
+        let body = u64::from(frames) * entry + FOOTER_SIZE as u64;
+        let table_len = SKIPPABLE_HEADER_SIZE as u64 + body;
+        anyhow::ensure!(
+            table_len <= len,
+            "zstd seek table of {frames} frames is longer than the {len}-byte blob"
+        );
+        let table_start = len - table_len;
+        src.seek(SeekFrom::Start(table_start))
+            .context("seek to zstd seek table")?;
+        let mut table = vec![0u8; usize::try_from(table_len - FOOTER_SIZE as u64)?];
+        src.read_exact(&mut table).context("read zstd seek table")?;
+        anyhow::ensure!(
+            u32_at(&table, 0)? == SKIPPABLE_MAGIC && u64::from(u32_at(&table, 4)?) == body,
+            "zstd seek table has a malformed frame header"
+        );
+
+        let cap = usize::try_from(frames)? + 1;
+        let mut stored = Vec::with_capacity(cap);
+        let mut decoded = Vec::with_capacity(cap);
+        let (mut c_end, mut d_end) = (0u64, 0u64);
+        stored.push(c_end);
+        decoded.push(d_end);
+        let entry = usize::try_from(entry)?;
+        for i in 0..usize::try_from(frames)? {
+            let at = SKIPPABLE_HEADER_SIZE + i * entry;
+            let c = u64::from(u32_at(&table, at)?);
+            let d = u64::from(u32_at(&table, at + 4)?);
+            anyhow::ensure!(
+                d <= MAX_FRAME_DECODED,
+                "zstd frame {i} claims {d} decoded bytes"
+            );
+            c_end += c;
+            d_end += d;
+            stored.push(c_end);
+            decoded.push(d_end);
+        }
+        anyhow::ensure!(
+            c_end == table_start,
+            "zstd seek table frames cover {c_end} bytes, but {table_start} precede the table"
+        );
+        Ok(Self {
+            src,
+            stored,
+            decoded,
+            dctx: zstd::bulk::Decompressor::new().context("open zstd decompressor")?,
+            current: None,
+            frame: Vec::new(),
+            scratch: Vec::new(),
+            pos: 0,
+        })
+    }
+
+    fn decoded_len(&self) -> u64 {
+        self.decoded.last().copied().unwrap_or_default()
+    }
+
+    /// Decode frame `i` into `frame`, unless it is already there.
+    fn load(&mut self, i: usize) -> io::Result<()> {
+        if self.current == Some(i) {
+            return Ok(());
+        }
+        let bad = |msg: String| io::Error::new(io::ErrorKind::InvalidData, msg);
+        let (Some(&c0), Some(&c1), Some(&d0), Some(&d1)) = (
+            self.stored.get(i),
+            self.stored.get(i + 1),
+            self.decoded.get(i),
+            self.decoded.get(i + 1),
+        ) else {
+            return Err(bad(format!("zstd frame {i} is not in the seek table")));
+        };
+        self.current = None;
+        self.src.seek(SeekFrom::Start(c0))?;
+        self.scratch.clear();
+        let c_len = c1 - c0;
+        let read = (&mut self.src).take(c_len).read_to_end(&mut self.scratch)?;
+        if read as u64 != c_len {
+            return Err(bad(format!(
+                "zstd frame {i}: read {read} of its {c_len} stored bytes"
+            )));
+        }
+        let d_len = usize::try_from(d1 - d0).map_err(io::Error::other)?;
+        self.frame.clear();
+        self.frame.reserve(d_len);
+        let n = self
+            .dctx
+            .decompress_to_buffer(&self.scratch, &mut self.frame)
+            .map_err(|e| io::Error::new(e.kind(), format!("decode zstd frame {i}: {e}")))?;
+        if n != d_len {
+            return Err(bad(format!(
+                "zstd frame {i} decoded to {n} bytes, the seek table says {d_len}"
+            )));
+        }
+        self.current = Some(i);
+        Ok(())
+    }
+}
+
+impl Read for SeekableDecoder {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() || self.pos >= self.decoded_len() {
+            return Ok(0);
+        }
+        // The last frame starting at or before `pos`; `decoded[0]` is 0 and
+        // `pos` is under the end, so it exists and is not past the last one.
+        // Empty frames start where the next one does, so they are skipped.
+        let i = self
+            .decoded
+            .partition_point(|&start| start <= self.pos)
+            .saturating_sub(1);
+        self.load(i)?;
+        let start = self.decoded.get(i).copied().unwrap_or_default();
+        let off = usize::try_from(self.pos - start).map_err(io::Error::other)?;
+        let avail = self.frame.get(off..).unwrap_or_default();
+        let n = avail.len().min(buf.len());
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("zstd frame {i} holds no byte at offset {}", self.pos),
+            ));
+        }
+        let (dst, _) = buf.split_at_mut(n);
+        let (src, _) = avail.split_at(n);
+        dst.copy_from_slice(src);
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for SeekableDecoder {
+    /// Like a file: seeking past the end is allowed and reads nothing there;
+    /// seeking before the start is an error.
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let new = match pos {
+            SeekFrom::Start(n) => Some(n),
+            SeekFrom::End(d) => self.decoded_len().checked_add_signed(d),
+            SeekFrom::Current(d) => self.pos.checked_add_signed(d),
+        }
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid seek {pos:?} from {} in a zstd blob", self.pos),
+            )
+        })?;
+        self.pos = new;
+        Ok(new)
+    }
+}
+
+/// A stored-bytes reader that fails at the end of the stream unless the bytes
+/// it passed on ended with the seek table's magic. See [`decode_reader`].
+struct SeekTableTail<R> {
+    inner: R,
+    /// The last four bytes read, as a little-endian `u32`.
+    tail: u32,
+    seen: u64,
+}
+
+impl<R> SeekTableTail<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            tail: 0,
+            seen: 0,
+        }
+    }
+}
+
+impl<R: Read> Read for SeekTableTail<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n == 0 && !buf.is_empty() {
+            if self.seen < 4 || self.tail != SEEKABLE_MAGIC {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "zstd cache blob does not end with its seek table: it is truncated",
+                ));
+            }
+            return Ok(0);
+        }
+        let filled = buf.get(..n).unwrap_or_default();
+        for &b in filled.iter().skip(n.saturating_sub(4)) {
+            self.tail = (self.tail >> 8) | (u32::from(b) << 24);
+        }
+        self.seen += n as u64;
+        Ok(n)
     }
 }
 
@@ -226,14 +611,37 @@ pub(crate) mod tests {
         assert!(!cache.exists(&a, "h", "b.zst").expect("exists"));
     }
 
-    #[test]
-    fn corrupt_zstd_blob_is_a_read_error() {
+    const F: usize = SEEKABLE_FRAME_SIZE;
+
+    /// Deterministic bytes that compress somewhat (a quarter of each 16-byte
+    /// run is noise), so frames are neither trivial nor incompressible.
+    fn sample(len: usize, seed: u64) -> Vec<u8> {
+        let mut x = seed | 1;
+        (0..len)
+            .map(|i| {
+                if i % 16 < 4 {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    x as u8
+                } else {
+                    (i / 16) as u8
+                }
+            })
+            .collect()
+    }
+
+    /// The stored bytes of `data` written through the zstd writer.
+    fn encode(data: &[u8]) -> Vec<u8> {
         let dir = tempfile::tempdir().expect("tempdir");
         let cache = LocalCacheFS::new(dir.path().to_path_buf()).expect("cache");
         let a = addr();
         let mut w =
             open_writer(&cache, &a, "h", "b.zst", &ManifestArtifactEncoding::Zstd).expect("writer");
-        w.write_all(&[7u8; 4096]).expect("write");
+        // Uneven writes, so frames are cut from buffered and direct input alike.
+        for chunk in data.chunks(F / 3 + 7) {
+            w.write_all(chunk).expect("write");
+        }
         w.commit().expect("commit");
         let mut stored = Vec::new();
         cache
@@ -242,20 +650,249 @@ pub(crate) mod tests {
             .reader
             .read_to_end(&mut stored)
             .expect("read");
-        let last = stored.len() - 1;
-        stored[last] ^= 0xff; // flips a checksum byte
-        let mut w = cache.writer(&a, "h", "b.zst").expect("writer");
-        w.write_all(&stored).expect("write");
-        w.commit().expect("commit");
+        stored
+    }
 
+    fn seekable(stored: Vec<u8>) -> anyhow::Result<SeekableDecoder> {
+        SeekableDecoder::open(Box::new(io::Cursor::new(stored)))
+    }
+
+    fn stream(stored: Vec<u8>) -> io::Result<Vec<u8>> {
         let mut out = Vec::new();
-        let res = decode_reader(
-            cache.reader(&a, "h", "b.zst").expect("reader").reader,
+        decode_reader(
+            Box::new(io::Cursor::new(stored)),
             &ManifestArtifactEncoding::Zstd,
         )
         .expect("decoder")
-        .read_to_end(&mut out);
-        assert!(res.is_err(), "corruption decoded silently");
+        .read_to_end(&mut out)?;
+        Ok(out)
+    }
+
+    /// Frame count from the seek table footer.
+    fn frame_count(stored: &[u8]) -> u32 {
+        u32_at(stored, stored.len() - FOOTER_SIZE).expect("footer")
+    }
+
+    /// Every size around a frame boundary decodes back through the seekable
+    /// decoder, the streaming path, and zstd's own decoder (format validity:
+    /// the blob is a plain zstd stream), with one frame per started MiB.
+    #[test]
+    fn seekable_format_round_trips_at_frame_boundaries() {
+        for len in [0, 1, F - 1, F, F + 1, 3 * F + 12345] {
+            let data = sample(len, len as u64);
+            let stored = encode(&data);
+            assert_eq!(frame_count(&stored) as usize, len.div_ceil(F), "len {len}");
+
+            let mut plain = Vec::new();
+            zstd::stream::read::Decoder::new(stored.as_slice())
+                .expect("zstd decoder")
+                .read_to_end(&mut plain)
+                .expect("plain zstd decode");
+            assert!(plain == data, "plain zstd decode differs at len {len}");
+
+            assert!(
+                stream(stored.clone()).expect("stream") == data,
+                "stream differs at len {len}"
+            );
+
+            let mut out = Vec::new();
+            seekable(stored)
+                .expect("open")
+                .read_to_end(&mut out)
+                .expect("seekable read");
+            assert!(out == data, "seekable read differs at len {len}");
+        }
+    }
+
+    /// Seeks of every kind land on the right bytes, including across frame
+    /// boundaries and backwards into an already-decoded frame.
+    #[test]
+    fn seekable_decoder_reads_at_any_offset() {
+        let len = 3 * F + 12345;
+        let data = sample(len, 42);
+        let mut d = seekable(encode(&data)).expect("open");
+        let len64 = len as u64;
+
+        let check = |d: &mut SeekableDecoder, at: u64, n: usize| {
+            let mut buf = vec![0u8; n];
+            let mut got = 0;
+            while got < n {
+                let k = d.read(&mut buf[got..]).expect("read");
+                if k == 0 {
+                    break;
+                }
+                got += k;
+            }
+            let at = at as usize;
+            let want = &data[at.min(len)..(at + n).min(len)];
+            assert_eq!(got, want.len(), "length at {at}");
+            assert!(&buf[..got] == want, "bytes at {at}");
+        };
+
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut offsets: Vec<u64> = vec![0, F as u64 - 1, F as u64, F as u64 + 1, len64 - 1];
+        for _ in 0..64 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            offsets.push(x % len64);
+        }
+        for (k, &at) in offsets.iter().enumerate() {
+            let n = 1 + (k * 4099) % (F + 17);
+            assert_eq!(d.seek(SeekFrom::Start(at)).expect("seek"), at);
+            check(&mut d, at, n);
+        }
+
+        // Relative to the current position, backwards into a decoded frame.
+        d.seek(SeekFrom::Start(F as u64 + 100)).expect("seek");
+        check(&mut d, F as u64 + 100, 50);
+        let at = d.seek(SeekFrom::Current(-120)).expect("seek current");
+        assert_eq!(at, F as u64 + 30);
+        check(&mut d, at, 300);
+
+        // Relative to the end.
+        let at = d.seek(SeekFrom::End(-10)).expect("seek end");
+        assert_eq!(at, len64 - 10);
+        check(&mut d, at, 100);
+
+        // Past the end: allowed, and reads nothing.
+        assert_eq!(d.seek(SeekFrom::End(5)).expect("seek past end"), len64 + 5);
+        assert_eq!(d.read(&mut [0u8; 8]).expect("read past end"), 0);
+        // Before the start: an error.
+        assert!(d.seek(SeekFrom::Current(-(len as i64) - 100)).is_err());
+    }
+
+    /// A flipped byte in a frame's checksum fails both read paths.
+    #[test]
+    fn corrupt_zstd_frame_is_a_read_error() {
+        let data = sample(2 * F, 7);
+        let mut stored = encode(&data);
+        let first_frame =
+            u32_at(&stored, stored.len() - FOOTER_SIZE - 2 * ENTRY_SIZE).expect("entry") as usize;
+        stored[first_frame - 1] ^= 0xff; // last byte of frame 0: its checksum
+
+        assert!(stream(stored.clone()).is_err(), "stream decoded corruption");
+        let mut out = Vec::new();
+        let res = seekable(stored).expect("open").read_to_end(&mut out);
+        assert!(res.is_err(), "seekable decoded corruption");
+    }
+
+    /// A blob cut anywhere at its end is an error, never short data: inside
+    /// the seek table, exactly at the last frame's end (the table gone whole,
+    /// which a multi-frame stream would otherwise decode cleanly), and inside
+    /// a frame.
+    #[test]
+    fn truncated_zstd_blob_is_an_error() {
+        let data = sample(2 * F + 99, 11);
+        let stored = encode(&data);
+        let table = SKIPPABLE_HEADER_SIZE + 3 * ENTRY_SIZE + FOOTER_SIZE;
+        for cut in [1, 5, table, table + 1, table + 1000] {
+            let short = stored[..stored.len() - cut].to_vec();
+            assert!(seekable(short.clone()).is_err(), "seekable open, cut {cut}");
+            assert!(stream(short).is_err(), "stream, cut {cut}");
+        }
+    }
+
+    /// The case the seekable format exists for: a compressed artifact on the
+    /// sqlite + spill backend has a seekable reader, whether it stayed inline
+    /// or spilled to a file, and the header-only index agrees with the walk.
+    /// Each entry then reads back through a fresh reader at its data offset,
+    /// as a FUSE layer reads it.
+    #[test]
+    fn a_compressed_artifact_has_a_seekable_reader() {
+        use crate::engine::local_cache::CacheArtifact;
+        use crate::engine::local_cache_spill::LocalCacheSpill;
+        use crate::engine::local_cache_sqlite::{DEFAULT_MAX_CONCURRENT_PIPES, LocalCacheSQLite};
+        use hcore::hartifactcontent::Content;
+        use hcore::hartifactcontent::tar_index::TarIndex;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sqlite = Arc::new(
+            LocalCacheSQLite::with_pipe_limit(
+                dir.path().join("cache.db"),
+                16 * 1024,
+                DEFAULT_MAX_CONCURRENT_PIPES,
+            )
+            .expect("sqlite"),
+        );
+        let blobs = Arc::new(LocalCacheFS::new(dir.path().join("blobs")).expect("fs"));
+        let cache: Arc<dyn LocalCache> =
+            Arc::new(LocalCacheSpill::new(sqlite, Arc::clone(&blobs), 64 * 1024));
+        let a = addr();
+
+        // Members around and across frame boundaries.
+        let files: Vec<(String, Vec<u8>)> = [10, 3 * F + 5, 0, F / 2, 1, 2 * F + 7]
+            .iter()
+            .enumerate()
+            .map(|(i, &n)| (format!("d{}/f{i}.bin", i % 2), sample(n, i as u64 + 1)))
+            .collect();
+        let tar_of = |files: &[(String, Vec<u8>)]| {
+            let mut b = tar::Builder::new(Vec::new());
+            for (path, body) in files {
+                let mut h = tar::Header::new_gnu();
+                h.set_size(body.len() as u64);
+                h.set_mode(0o644);
+                h.set_cksum();
+                b.append_data(&mut h, path, body.as_slice())
+                    .expect("append");
+            }
+            b.into_inner().expect("tar")
+        };
+
+        for (name, files) in [("small.tar.zst", &files[..1]), ("big.tar.zst", &files[..])] {
+            let tar = tar_of(files);
+            let mut w = open_writer(
+                cache.as_ref(),
+                &a,
+                "h",
+                name,
+                &ManifestArtifactEncoding::Zstd,
+            )
+            .expect("writer");
+            w.write_all(&tar).expect("write");
+            w.commit().expect("commit");
+            let art = CacheArtifact {
+                addr: a.clone(),
+                hashin: "h".to_string(),
+                name: name.to_string(),
+                cache: Arc::clone(&cache),
+                encoding: ManifestArtifactEncoding::Zstd,
+                content_type: hcore::hartifactcontent::Type::Tar,
+                hashout: "ho".to_string(),
+                group: String::new(),
+                r#type: crate::engine::local_cache::ManifestArtifactType::Output,
+                size: tar.len() as u64,
+            };
+            let spilled = blobs.exists(&a, "h", name).expect("exists");
+            assert_eq!(spilled, name == "big.tar.zst", "{name} spill placement");
+            assert!(art.file_path().is_none(), "{name}: no plain file to offer");
+
+            let index = TarIndex::build(
+                art.seekable_reader()
+                    .expect("seekable")
+                    .expect("some reader"),
+            )
+            .expect("index");
+            // The index is path-ordered, the walk is archive-ordered.
+            let mut walked: Vec<_> = art
+                .walk()
+                .expect("walk")
+                .map(|e| e.expect("entry").path)
+                .collect();
+            walked.sort();
+            assert_eq!(art.entry_paths().expect("entry paths"), walked, "{name}");
+            assert_eq!(index.entry_paths(), walked, "{name}");
+
+            for (path, body) in files {
+                let entry = &index.entries[std::path::Path::new(path)];
+                let mut r = art.seekable_reader().expect("seekable").expect("reader");
+                r.seek(SeekFrom::Start(entry.data_offset)).expect("seek");
+                let mut got = vec![0u8; entry.size as usize];
+                r.read_exact(&mut got).expect("read member");
+                assert!(&got == body, "{name}: {path} bytes");
+            }
+        }
     }
 
     #[test]
