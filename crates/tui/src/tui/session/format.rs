@@ -269,9 +269,18 @@ pub struct ApprovalPromptNotice {
     pub path: String,
 }
 
+/// The most entries each list of a `status.json` snapshot keeps (U3, which
+/// reverses design amendment A17). `totals` carries each list's full length;
+/// a viewer that needs every entry folds `events.ndjson` instead.
+pub const STATUS_LIST_CAP: usize = 100;
+
 /// `status.json`, a viewer's `--json`, and later a daemon's reply: what the
-/// session is doing now. Full lists — a human renderer caps them, `--json` does
-/// not.
+/// session is doing now.
+///
+/// In `status.json` each list holds at most its first [`STATUS_LIST_CAP`]
+/// entries, so the file stays small whatever the build's size; `totals` says
+/// how long each list really is and whether it was cut. A fold of the event
+/// log (`show`, `attach`) has every entry, and says `truncated: false`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSnapshot {
     /// [`SNAPSHOT_VERSION`] of the heph that wrote it.
@@ -297,12 +306,66 @@ pub struct SessionSnapshot {
     pub lock_waits: Vec<LockWaitEntry>,
     #[serde(default)]
     pub admission_waits: Vec<AdmissionWaitEntry>,
+    /// Each list's full length, and whether the list above was cut to
+    /// [`STATUS_LIST_CAP`].
+    #[serde(default)]
+    pub totals: ListTotals,
     /// `events.ndjson` hit its cap; a fold of it is short of this snapshot.
     #[serde(default)]
     pub truncated: bool,
     /// Set once the process wrote its `End`.
     #[serde(default)]
     pub end: Option<SessionEnd>,
+}
+
+/// One list's full length, and whether the snapshot's copy was cut.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListTotal {
+    #[serde(default)]
+    pub total: u64,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+impl ListTotal {
+    /// The full length of a list of `len` entries, of which the snapshot keeps
+    /// at most `cap`.
+    pub fn of(len: usize, cap: usize) -> Self {
+        Self {
+            total: u64::try_from(len).unwrap_or(u64::MAX),
+            truncated: len > cap,
+        }
+    }
+}
+
+/// [`SessionSnapshot::totals`]: one [`ListTotal`] per list.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListTotals {
+    #[serde(default)]
+    pub running: ListTotal,
+    #[serde(default)]
+    pub waiting: ListTotal,
+    #[serde(default)]
+    pub failed: ListTotal,
+    #[serde(default)]
+    pub lock_waits: ListTotal,
+    #[serde(default)]
+    pub admission_waits: ListTotal,
+}
+
+impl ListTotals {
+    /// Whether any list was cut.
+    pub fn any_truncated(&self) -> bool {
+        [
+            self.running,
+            self.waiting,
+            self.failed,
+            self.lock_waits,
+            self.admission_waits,
+        ]
+        .iter()
+        .any(|t| t.truncated)
+    }
 }
 
 impl Default for SessionSnapshot {
@@ -317,6 +380,7 @@ impl Default for SessionSnapshot {
             failed: Vec::new(),
             lock_waits: Vec::new(),
             admission_waits: Vec::new(),
+            totals: ListTotals::default(),
             truncated: false,
             end: None,
         }
@@ -388,6 +452,11 @@ pub struct SnapshotCounts {
     pub executed: u64,
     #[serde(default)]
     pub failed: u64,
+    /// Running targets that are in no lock or admission wait. Counted over the
+    /// full lists, so a viewer can tell "every running target waits" from a
+    /// capped `status.json`, whose `running` and `waiting` may each be cut.
+    #[serde(default)]
+    pub running_unblocked: u64,
 }
 
 /// A target with an operation open.

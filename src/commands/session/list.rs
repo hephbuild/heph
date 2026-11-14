@@ -285,7 +285,7 @@ fn now_cell(
     every: &[&SessionEntry],
     opts: ViewOpts,
 ) -> String {
-    if s.running.iter().all(|r| s.waiting.contains(&r.addr))
+    if s.counts.running_unblocked == 0
         && let Some(w) = s.lock_waits.first()
     {
         let holder = match w.holder_pid {

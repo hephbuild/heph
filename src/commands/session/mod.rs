@@ -332,12 +332,7 @@ pub(crate) fn derive_state(entry: &SessionEntry, now_ms: u64, stall: Duration) -
     let Some(status) = status else {
         return SessionState::Running;
     };
-    if !status.waiting.is_empty()
-        && status
-            .running
-            .iter()
-            .all(|r| status.waiting.contains(&r.addr))
-    {
+    if all_waiting(status) {
         return SessionState::Waiting;
     }
     let last = status
@@ -350,6 +345,14 @@ pub(crate) fn derive_state(entry: &SessionEntry, now_ms: u64, stall: Duration) -
     } else {
         SessionState::Running
     }
+}
+
+/// Something waits, and every running target is among the waiters. From the
+/// counts, which cover the full lists, never from the lists themselves: in
+/// `status.json` `running` and `waiting` are each cut to their first entries.
+pub(crate) fn all_waiting(status: &crate::tui::session::SessionSnapshot) -> bool {
+    (!status.waiting.is_empty() || status.totals.waiting.total > 0)
+        && status.counts.running_unblocked == 0
 }
 
 /// Every session the sources know, merged: the first source to list an id

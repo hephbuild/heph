@@ -751,7 +751,8 @@ impl RecorderThread {
     }
 
     fn write_status(&mut self) -> io::Result<()> {
-        let mut snapshot: SessionSnapshot = self.state.snapshot();
+        let mut snapshot: SessionSnapshot =
+            self.state.snapshot_capped(super::format::STATUS_LIST_CAP);
         snapshot.truncated = self.truncated;
         snapshot.end = self.end.clone();
         write_atomically(&self.dir, files::STATUS, &snapshot)?;

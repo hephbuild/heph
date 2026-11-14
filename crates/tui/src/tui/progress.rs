@@ -1812,37 +1812,72 @@ impl BuildState {
             .collect()
     }
 
-    /// What this state says a session is doing, as `status.json` and `--json`
-    /// carry it. Full lists, each sorted so two folds of the same events
-    /// produce the same bytes. `end` and `truncated` are the recorder's to set.
+    /// What this state says a session is doing, as `show --json` carries it:
+    /// every list in full, each sorted so two folds of the same events produce
+    /// the same bytes. `end` and `truncated` are the caller's to set.
+    pub fn snapshot(&self) -> crate::tui::session::SessionSnapshot {
+        self.snapshot_capped(usize::MAX)
+    }
+
+    /// [`Self::snapshot`] with each list cut to its first `cap` entries, as
+    /// `status.json` carries it ([`crate::tui::session::STATUS_LIST_CAP`]);
+    /// `totals` and the counts are over the full lists.
     ///
     /// Walks the in-flight sets (open ops, waits) and the failure list, never
-    /// every target; called at most once a second by the recorder.
-    pub fn snapshot(&self) -> crate::tui::session::SessionSnapshot {
+    /// every target, and clones only the entries it keeps; called at most once
+    /// a second by the recorder, on its own thread.
+    pub fn snapshot_capped(&self, cap: usize) -> crate::tui::session::SessionSnapshot {
         use crate::tui::session::format::{
-            AdmissionWaitEntry, LockWaitEntry, RunningTarget, SessionSnapshot, SnapshotCounts,
+            AdmissionWaitEntry, ListTotal, ListTotals, LockWaitEntry, RunningTarget,
+            SessionSnapshot, SnapshotCounts,
         };
         let count = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
-        let mut running: Vec<RunningTarget> = self
+        let mut running: Vec<(&String, _, u64)> = self
             .open_ops
             .iter()
             .filter_map(|addr| {
                 let (op, since) = self.ops.get(addr)?.active?;
-                Some(RunningTarget {
-                    addr: addr.clone(),
-                    op: op.name().to_owned(),
-                    since_unix_ms: since,
-                })
+                Some((addr, op, since))
             })
             .collect();
-        running.sort_by(|a, b| {
-            a.since_unix_ms
-                .cmp(&b.since_unix_ms)
-                .then_with(|| a.addr.cmp(&b.addr))
-        });
-        let mut lock_waits: Vec<LockWaitEntry> = self
-            .lock_waits
+        running.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(b.0)));
+        let running_unblocked = running
             .iter()
+            .filter(|(addr, ..)| {
+                !self.lock_waits.contains_key(*addr) && !self.admission_waits.contains_key(*addr)
+            })
+            .count();
+        let mut lock_waits: Vec<(&String, &(LockHolder, u64))> = self.lock_waits.iter().collect();
+        lock_waits.sort_by(|a, b| a.0.cmp(b.0));
+        let mut admission_waits: Vec<(&String, &AdmissionWait)> =
+            self.admission_waits.iter().collect();
+        admission_waits.sort_by(|a, b| a.0.cmp(b.0));
+        let mut waiting: Vec<&String> = lock_waits
+            .iter()
+            .map(|(addr, _)| *addr)
+            .chain(admission_waits.iter().map(|(addr, _)| *addr))
+            .collect();
+        waiting.sort();
+        waiting.dedup();
+        let totals = ListTotals {
+            running: ListTotal::of(running.len(), cap),
+            waiting: ListTotal::of(waiting.len(), cap),
+            failed: ListTotal::of(self.failed.len(), cap),
+            lock_waits: ListTotal::of(lock_waits.len(), cap),
+            admission_waits: ListTotal::of(admission_waits.len(), cap),
+        };
+        let running: Vec<RunningTarget> = running
+            .into_iter()
+            .take(cap)
+            .map(|(addr, op, since)| RunningTarget {
+                addr: addr.clone(),
+                op: op.name().to_owned(),
+                since_unix_ms: since,
+            })
+            .collect();
+        let lock_waits: Vec<LockWaitEntry> = lock_waits
+            .into_iter()
+            .take(cap)
             .map(|(addr, (holder, since))| LockWaitEntry {
                 addr: addr.clone(),
                 holder_pid: match holder {
@@ -1853,10 +1888,9 @@ impl BuildState {
                 since_unix_ms: *since,
             })
             .collect();
-        lock_waits.sort_by(|a, b| a.addr.cmp(&b.addr));
-        let mut admission_waits: Vec<AdmissionWaitEntry> = self
-            .admission_waits
-            .iter()
+        let admission_waits: Vec<AdmissionWaitEntry> = admission_waits
+            .into_iter()
+            .take(cap)
             .map(|(addr, w)| AdmissionWaitEntry {
                 addr: addr.clone(),
                 pool: w.pool.clone(),
@@ -1866,14 +1900,7 @@ impl BuildState {
                 since_unix_ms: w.since_ms,
             })
             .collect();
-        admission_waits.sort_by(|a, b| a.addr.cmp(&b.addr));
-        let mut waiting: Vec<String> = lock_waits
-            .iter()
-            .map(|w| w.addr.clone())
-            .chain(admission_waits.iter().map(|w| w.addr.clone()))
-            .collect();
-        waiting.sort();
-        waiting.dedup();
+        let waiting: Vec<String> = waiting.into_iter().take(cap).cloned().collect();
         SessionSnapshot {
             first_event_unix_ms: self.started_at_ms,
             last_event_unix_ms: self.last_event_ms,
@@ -1886,12 +1913,19 @@ impl BuildState {
                 in_flight: count(self.in_flight_results.len()),
                 executed: count(self.executed),
                 failed: count(self.errored),
+                running_unblocked: count(running_unblocked),
             },
             running,
             waiting,
-            failed: self.failed.iter().map(|(addr, _)| addr.clone()).collect(),
+            failed: self
+                .failed
+                .iter()
+                .take(cap)
+                .map(|(addr, _)| addr.clone())
+                .collect(),
             lock_waits,
             admission_waits,
+            totals,
             ..SessionSnapshot::default()
         }
     }

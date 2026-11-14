@@ -72,9 +72,21 @@ workspace rooted at `$HOME`, whose home is `~/.heph`.
 | `meta.json` | once at start, temp + rename | `format`, id, `owner_pid`, start time, heph version, argv, cwd (`HEPH_CWD` when set), workspace root and home, label, interactive, `capabilities` |
 | `lock` | `flock` taken at start, held until exit | nothing: held means alive |
 | `events.ndjson` | appended, flushed every 250ms and at exit | one record per line |
-| `status.json` | temp + rename, at most once a second, only when changed | a `SessionSnapshot` |
+| `status.json` | temp + rename, at most once a second, only when changed | a `SessionSnapshot`, each list capped at its first 100 entries |
 | `inflight.request` | by a viewer, temp + rename | nothing; the owner consumes it |
 | `inflight.txt` | by the owner, temp + rename | the last in-flight report |
+
+`status.json` keeps at most the first 100 entries of each list (`running`,
+`waiting`, `failed`, `lock_waits`, `admission_waits`), plus
+`totals.<list> = {total, truncated}` with the full length. This reverses A17
+(user decision), the design amendment that kept full lists: a 50k-target
+build that fails wide would otherwise rewrite megabytes every second, and
+`list` reads it for every session. The counts (`counts`, including
+`running_unblocked`, which `waiting` is derived from) are over the full
+lists. `list` reads only `status.json` and stays cheap; `show` (text and
+`--json`) and `attach` fold `events.ndjson` and have every entry. Past the
+event log's 64 MiB cap a fold is short of the run, so `show --json` prints
+`status.json` instead, capped, and its `totals` say so.
 
 The id is 10 Crockford base32 characters: 42 bits of start time in ms, then 8
 random bits, so ids sort by start. Uniqueness comes from `create_dir` (not
@@ -126,6 +138,9 @@ incompatible change:
   needs newer heph") and exits 0. A viewer older than `meta.heph_version`
   warns that the session may be shown incomplete.
 - **`SessionSnapshot.version`** versions `status.json` and `show --json`.
+  The list cap and `totals` came without a bump: they are new fields, and a
+  reader that ignores them reads the lists it gets correctly, as the first
+  entries of each (no heph had shipped a snapshot without them).
 - **`events.ndjson`** only grows additively: new record kinds and fields,
   never a changed meaning.
 

@@ -18,7 +18,7 @@ use super::{
 };
 use crate::tui::session::{
     HeaderKind, SessionEntry, SessionItem, SessionMeta, SessionRecordKind, SessionSnapshot,
-    SessionSource, holder_session,
+    SessionSource, format::SessionEnd, holder_session,
 };
 use crate::tui::{self, TUIAppView as _};
 
@@ -46,8 +46,8 @@ struct Folded {
     view: tui::TuiProgressView,
     /// Records that carried a build event.
     events: u64,
-    /// The `End` record's time and exit code.
-    end: Option<(u64, Option<i32>)>,
+    /// The `End` record.
+    end: Option<SessionEnd>,
     /// The latest record's time.
     last_at: Option<u64>,
     skipped: u64,
@@ -80,8 +80,15 @@ async fn fold(
                     folded.events += 1;
                 }
                 match r.session {
-                    Some(SessionRecordKind::End { exit_code, .. }) => {
-                        folded.end = Some((r.at_unix_ms, exit_code));
+                    Some(SessionRecordKind::End {
+                        exit_code,
+                        panicked,
+                    }) => {
+                        folded.end = Some(SessionEnd {
+                            at_unix_ms: r.at_unix_ms,
+                            exit_code,
+                            panicked,
+                        });
                     }
                     Some(SessionRecordKind::Truncated) => folded.truncated = true,
                     _ => {}
@@ -120,26 +127,15 @@ pub(crate) async fn show(
         .context("the session's source went missing")?;
     let state = derive_state(&entry, opts.now_ms, opts.stall);
 
+    let folded = fold(source, &entry, meta).await?;
     if json {
-        // `status.json` is the snapshot; a session that has not written one yet
-        // is folded instead.
-        let folded_snapshot;
-        let snapshot = match &entry.status {
-            Some(s) => s,
-            None => {
-                let f = fold(source, &entry, meta).await?;
-                let mut s = f.view.state().snapshot();
-                s.truncated = f.truncated;
-                folded_snapshot = s;
-                &folded_snapshot
-            }
-        };
+        let snapshot = json_snapshot(&folded, entry.status.as_ref());
         serde_json::to_writer_pretty(
             &mut *out,
             &ShowJson {
                 id: entry.id.encode(),
                 state,
-                snapshot,
+                snapshot: &snapshot,
             },
         )
         .context("writing the session")?;
@@ -147,7 +143,6 @@ pub(crate) async fn show(
         return Ok(());
     }
 
-    let folded = fold(source, &entry, meta).await?;
     let mut text = String::new();
     header(&mut text, &entry, meta, opts.now_ms);
     if recorded_by_newer(&meta.heph_version, opts.version) {
@@ -172,8 +167,8 @@ pub(crate) async fn show(
     }
     // Drawn at the time of the `End` for an ended session, of the last record
     // for a lost one, of now for a live one.
-    let drawn_at = match (folded.end, state) {
-        (Some((at, _)), _) => at,
+    let drawn_at = match (&folded.end, state) {
+        (Some(end), _) => end.at_unix_ms,
         (None, SessionState::Lost) => folded.last_at.unwrap_or(opts.now_ms),
         _ => opts.now_ms,
     };
@@ -200,6 +195,24 @@ pub(crate) async fn show(
     out.write_all(text.as_bytes())
         .context("writing the session")?;
     Ok(())
+}
+
+/// The snapshot `show --json` prints: the fold of the event log, which has
+/// every list in full where `status.json` keeps only their first entries (U3).
+/// Past the event log's cap the fold is short of the run, so `status.json`,
+/// capped but current, is printed instead; its `totals` say what was cut.
+fn json_snapshot(folded: &Folded, status: Option<&SessionSnapshot>) -> SessionSnapshot {
+    if folded.truncated
+        && let Some(s) = status
+    {
+        return s.clone();
+    }
+    let mut s = folded.view.state().snapshot();
+    s.truncated = folded.truncated;
+    s.end = status
+        .and_then(|st| st.end.clone())
+        .or_else(|| folded.end.clone());
+    s
 }
 
 /// `heph run //go/... (session k7q2r8bn3f, pid 48377, pacu, /Users/…/pacu, started 41s ago, heph v0.48.1)`

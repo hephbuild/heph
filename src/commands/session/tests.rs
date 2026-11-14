@@ -208,9 +208,30 @@ fn state_is_derived() {
             live(fresh(SessionSnapshot {
                 running: vec![running("//a:b", NOW - 5_000), running("//a:d", NOW)],
                 waiting: vec!["//a:b".to_owned()],
+                counts: SnapshotCounts {
+                    running_unblocked: 1,
+                    ..SnapshotCounts::default()
+                },
                 ..SessionSnapshot::default()
             })),
             SessionState::Running,
+        ),
+        (
+            // `status.json` cut both lists; the counts cover them in full.
+            "capped lists, every running target waits",
+            live(fresh(SessionSnapshot {
+                running: vec![running("//z:z", NOW - 5_000)],
+                waiting: vec!["//a:a".to_owned()],
+                totals: crate::tui::session::format::ListTotals {
+                    waiting: crate::tui::session::format::ListTotal {
+                        total: 500,
+                        truncated: true,
+                    },
+                    ..Default::default()
+                },
+                ..SessionSnapshot::default()
+            })),
+            SessionState::Waiting,
         ),
         (
             "quiet past the stall threshold",
@@ -383,7 +404,25 @@ async fn commands_run_against_any_source() {
                         ..ended(Some(0), T0 + 6_000)
                     }),
                 ),
-                build_records("//x:y", T0 + 5_000, Some(0)),
+                {
+                    // `show --json` folds the log: the target finishes in it.
+                    let mut r = build_records("//x:y", T0 + 5_000, Some(0));
+                    r.insert(
+                        2,
+                        record(
+                            T0 + 5_500,
+                            BuildEventKind::ResultEnd {
+                                addr: "//x:y".into(),
+                                error: None,
+                                upstream_of: None,
+                                exit_status: None,
+                                log_tail: None,
+                                timed_out: None,
+                            },
+                        ),
+                    );
+                    r
+                },
             ),
             (
                 entry(
@@ -593,6 +632,99 @@ async fn empty_events_say_no_events_recorded() {
     let sources: [&dyn SessionSource; 1] = [&source];
     let out = run_show(&sources, &id.encode(), false).await.expect("show");
     assert!(out.contains("\nno events recorded\n"), "{out}");
+}
+
+/// U3: `status.json` keeps the first entries of each list, with the full count;
+/// `show` folds the event log and has them all.
+#[tokio::test]
+async fn status_lists_are_capped_and_show_has_them_all() {
+    const N: usize = 50_000;
+    let id = SessionId::new(T0, 1);
+    let m = meta(id, 1, &["heph", "run", "//..."]);
+    let mut records = Vec::with_capacity(3 * N);
+    for i in 0..N {
+        let addr = format!("//f:t{i:05}");
+        records.push(record(T0 + 1, BuildEventKind::ResultStart { addr: addr.clone() }));
+        records.push(record(
+            T0 + 2,
+            BuildEventKind::ResultEnd {
+                addr,
+                error: Some("boom".to_owned()),
+                upstream_of: None,
+                exit_status: None,
+                log_tail: None,
+                timed_out: None,
+            },
+        ));
+    }
+    for i in 0..N {
+        records.push(record(
+            T0 + 3,
+            BuildEventKind::AdmissionWaitStart {
+                addr: format!("//w:t{i:05}"),
+                pool: "cpu".to_owned(),
+                need: 1,
+                free: 0,
+                ahead: 0,
+                removals_pending: None,
+            },
+        ));
+    }
+    use crate::tui::TUIAppView as _;
+    // What the recorder writes: the same fold, capped.
+    let mut view = show::new_view(&m);
+    for r in &records {
+        if let Some(ev) = r.build_event() {
+            view.apply(&ev);
+        }
+    }
+    let status = view
+        .state()
+        .snapshot_capped(crate::tui::session::STATUS_LIST_CAP);
+    let bytes = serde_json::to_vec(&status).expect("encode");
+    assert!(
+        bytes.len() < 32 * 1024,
+        "status.json stays small: {} bytes",
+        bytes.len()
+    );
+    assert_eq!(status.waiting.len(), 100);
+    assert_eq!(status.failed.len(), 100);
+    assert_eq!(status.admission_waits.len(), 100);
+    assert_eq!(status.totals.waiting.total, N as u64);
+    assert!(status.totals.waiting.truncated);
+    assert_eq!(status.totals.failed.total, N as u64);
+    assert!(status.totals.failed.truncated);
+    assert_eq!(status.totals.admission_waits.total, N as u64);
+    assert!(!status.totals.lock_waits.truncated);
+    // The first entries: failure order, and sorted waits.
+    assert_eq!(status.failed[0], "//f:t00000");
+    assert_eq!(status.waiting[99], "//w:t00099");
+    // It reads back, the counts intact.
+    let decoded = SessionSnapshot::decode(&bytes).expect("decode");
+    assert_eq!(decoded.counts.failed, N as u64);
+
+    let source = FakeSource {
+        sessions: vec![(entry(m, true, Some(decoded)), records)],
+    };
+    let sources: [&dyn SessionSource; 1] = [&source];
+    // `list` reads only status.json, and still sees every waiter.
+    let listed: serde_json::Value =
+        serde_json::from_str(&run_list(&sources, Workspace::All, true).await).expect("json");
+    assert_eq!(listed["sessions"][0]["state"], "waiting");
+
+    let out = run_show(&sources, &id.encode(), false).await.expect("show");
+    assert!(out.contains(&format!("{N} failed")), "{out}");
+    assert!(
+        out.contains(&format!("… and {} more", N - 10)),
+        "every admission wait is counted:\n{out}"
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&run_show(&sources, &id.encode(), true).await.expect("json"))
+            .expect("json");
+    assert_eq!(json["waiting"].as_array().expect("waiting").len(), N);
+    assert_eq!(json["failed"].as_array().expect("failed").len(), N);
+    assert_eq!(json["totals"]["failed"]["total"], N);
+    assert_eq!(json["totals"]["failed"]["truncated"], false);
 }
 
 #[tokio::test]
