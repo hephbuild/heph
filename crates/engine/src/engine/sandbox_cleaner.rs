@@ -51,9 +51,13 @@
 //! may move onto a tokio runtime — see the waker note above.
 //!
 //! Ordering: callers must invoke `enqueue` only *after* any read of the
-//! sandbox completes (per `project_sandbox_cleanup_ordering.md`). Within a
-//! lane, jobs run in FIFO order on that lane's one thread. There is no
-//! ordering guarantee *between* lanes — that is the point.
+//! sandbox completes (per `project_sandbox_cleanup_ordering.md`). The
+//! bookkeeping lane runs its jobs in FIFO order on its one thread. The reclaim
+//! lane drains one queue with up to four threads (`MAX_RECLAIM_WORKERS`), so
+//! its jobs run concurrently and in **no** order relative to each other —
+//! sandbox removals are ordered by [`generation`] claims, never by queue
+//! position, so nothing there relied on FIFO. There is no ordering guarantee
+//! *between* lanes either — that is the point.
 //!
 //! Both lanes decrement the same per-request `bg_pending` counter, so the
 //! shutdown path that blocks on it drains both.
@@ -95,7 +99,7 @@ pub use hcore::pending::PendingCounter;
 /// decrement when it completes.
 type Job = (String, SandboxCleanupJob, PendingCounter);
 
-/// Which worker thread a job runs on.
+/// Which queue — and so which worker threads — a job runs on.
 ///
 /// The two classes have very different cost profiles and one must never be able
 /// to queue behind the other; see the module docs for why. Every job picks its
@@ -147,7 +151,8 @@ pub enum Lane {
 /// flight), so it is safe to call inline on a tokio worker at queue time.
 /// Walks hold the `walk` mutex for their whole duration and take `generation`
 /// only for the staleness check; walk holders are dedicated OS threads (the
-/// blocking pool, the cleaner thread), never tokio workers. Lock order is
+/// blocking pool, the reclaim lane's workers), never tokio workers. Two reclaim
+/// workers holding jobs for one path simply take turns on its `walk` lock. Lock order is
 /// `walk` then `generation`, and nothing takes them in the other order.
 ///
 /// Executes for one addr are serialized (in-process and cross-process by the
@@ -477,12 +482,57 @@ impl Lane {
     }
 }
 
-/// Spawn one lane's worker thread and return its queue.
+/// The most worker threads the reclaim lane runs.
+///
+/// A `remove_dir_all` is metadata-bound — one `unlink`/`rmdir` per inode — and
+/// a single thread issuing them leaves most of the filesystem's parallelism
+/// unused: a cold Go `validate` finishes thousands of sandboxes faster than one
+/// thread can remove them. The cap keeps a removal burst from competing with
+/// the build itself for the whole machine; it is a chosen bound, not a measured
+/// optimum.
+const MAX_RECLAIM_WORKERS: usize = 4;
+
+/// How many worker threads `lane` drains its queue with.
+///
+/// Reclaim: [`MAX_RECLAIM_WORKERS`], or fewer on a smaller machine. Bookkeeping
+/// stays at exactly one — its one job class is a sqlite trim that a second
+/// thread would only contend with, and nothing about it is latency-critical.
+fn lane_workers(lane: Lane) -> usize {
+    match lane {
+        Lane::Reclaim => thread::available_parallelism()
+            .map_or(1, std::num::NonZero::get)
+            .min(MAX_RECLAIM_WORKERS),
+        Lane::Bookkeeping => 1,
+    }
+}
+
+/// Spawn one lane's worker threads and return its queue.
+///
+/// Every worker drains the same queue (crossbeam's channel is multi-consumer),
+/// so with more than one worker jobs on the lane run concurrently and in no
+/// particular order. Nothing on the reclaim lane depends on its order: sandbox
+/// removals are ordered by [`generation`] claims, not by queue position, and
+/// an invocation sandbox's removal holds its `.owner` lock while it walks, which
+/// a concurrent sweep skips.
 fn spawn_lane(lane: Lane) -> io::Result<Sender<Job>> {
     let name = lane.thread_name();
     let (tx, rx) = unbounded::<Job>();
+    for _ in 0..lane_workers(lane) {
+        spawn_worker(lane, rx.clone())
+            // Name the lane in the error: `sender` resolves both lanes through
+            // one expression, so the panic location alone doesn't say which one
+            // failed.
+            .map_err(|e| io::Error::new(e.kind(), format!("spawn {name} thread: {e}")))?;
+    }
+    Ok(tx)
+}
+
+/// One worker of `lane`: runs every job it takes off `rx` until the queue
+/// closes, which it never does in practice (the sender is a process-lifetime
+/// static).
+fn spawn_worker(lane: Lane, rx: crossbeam_channel::Receiver<Job>) -> io::Result<()> {
     thread::Builder::new()
-        .name(name.into())
+        .name(lane.thread_name().into())
         .spawn(move || {
             for (label, job, pending) in rx.iter() {
                 // catch_unwind so a panicking job doesn't kill the
@@ -516,10 +566,7 @@ fn spawn_lane(lane: Lane) -> io::Result<Sender<Job>> {
                 }
             }
         })
-        // Name the lane in the error: `sender` resolves both lanes through one
-        // expression, so the panic location alone doesn't say which one failed.
-        .map_err(|e| io::Error::new(e.kind(), format!("spawn {name} thread: {e}")))?;
-    Ok(tx)
+        .map(drop)
 }
 
 fn sender(lane: Lane) -> &'static Sender<Job> {
@@ -1273,15 +1320,18 @@ mod tests {
     #[test]
     fn enqueue_survives_panicking_job() {
         // Same shape as the NotFound case: a panic shouldn't kill a lane's
-        // thread; subsequent jobs still run.
+        // thread; subsequent jobs still run. One panicker per worker, so a lane
+        // whose workers each died on theirs would run the follow-up on none.
         for lane in ALL_LANES {
             let pending = counter();
-            enqueue(
-                lane,
-                format!("enqueue_survives_panicking_job_panicker {lane:?}"),
-                Box::new(|| panic!("boom")),
-                Arc::clone(&pending),
-            );
+            for _ in 0..lane_workers(lane) {
+                enqueue(
+                    lane,
+                    format!("enqueue_survives_panicking_job_panicker {lane:?}"),
+                    Box::new(|| panic!("boom")),
+                    Arc::clone(&pending),
+                );
+            }
             let ran = Arc::new(AtomicBool::new(false));
             let ran_clone = Arc::clone(&ran);
             enqueue(
@@ -1304,5 +1354,99 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(2));
             }
         }
+    }
+
+    /// The reclaim lane drains with more than one thread: as many gated jobs as
+    /// it has workers are all *running* at once. On a single queue thread the
+    /// second never starts while the first is parked.
+    #[test]
+    fn the_reclaim_lane_runs_its_workers_concurrently() {
+        let _parked = park_lock();
+        let workers = lane_workers(Lane::Reclaim);
+        assert!(
+            (1..=MAX_RECLAIM_WORKERS).contains(&workers),
+            "{workers} reclaim workers"
+        );
+        let gate = Arc::new(AtomicBool::new(false));
+        let _release = OpenOnDrop(Arc::clone(&gate));
+        let pending = counter();
+        let started: Vec<_> = (0..workers)
+            .map(|i| {
+                let started = Arc::new(AtomicBool::new(false));
+                enqueue(
+                    Lane::Reclaim,
+                    format!("the_reclaim_lane_runs_its_workers_concurrently {i}"),
+                    gated_job(Arc::clone(&started), Arc::clone(&gate)),
+                    Arc::clone(&pending),
+                );
+                started
+            })
+            .collect();
+        for (i, started) in started.iter().enumerate() {
+            assert!(
+                wait_for(started, Duration::from_secs(30)),
+                "reclaim job {i} of {workers} never ran while the others were parked — the lane \
+                 is not draining with {workers} workers"
+            );
+        }
+        assert_eq!(pending.load(Ordering::Acquire), workers);
+        gate.store(true, Ordering::SeqCst);
+        wait_drained(&pending, Duration::from_secs(5));
+    }
+
+    /// `bg_pending` stays exact with several workers draining one queue: every
+    /// job — passing, failing, `NotFound`, panicking — is counted in exactly
+    /// once and out exactly once, whichever worker took it. Enqueued from
+    /// several threads at once so the increments race the decrements too.
+    #[test]
+    fn a_multi_worker_drain_keeps_bg_pending_exact() {
+        const PRODUCERS: usize = 4;
+        const PER_PRODUCER: usize = 64;
+        const TOTAL: usize = PRODUCERS * PER_PRODUCER;
+
+        let _parked = park_lock();
+        let pending = counter();
+        let gate = Arc::new(AtomicBool::new(false));
+        let _release = OpenOnDrop(Arc::clone(&gate));
+        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        std::thread::scope(|s| {
+            for p in 0..PRODUCERS {
+                let (pending, gate, ran) = (&pending, &gate, &ran);
+                s.spawn(move || {
+                    for i in 0..PER_PRODUCER {
+                        let (gate, ran) = (Arc::clone(gate), Arc::clone(ran));
+                        enqueue(
+                            Lane::Reclaim,
+                            format!("a_multi_worker_drain_keeps_bg_pending_exact {p}/{i}"),
+                            Box::new(move || {
+                                while !gate.load(Ordering::SeqCst) {
+                                    std::thread::sleep(Duration::from_millis(1));
+                                }
+                                ran.fetch_add(1, Ordering::SeqCst);
+                                match i % 4 {
+                                    0 => Ok(()),
+                                    1 => Err(io::Error::from(io::ErrorKind::NotFound)),
+                                    2 => Err(io::Error::other("expected test failure")),
+                                    _ => panic!("expected test panic"),
+                                }
+                            }),
+                            Arc::clone(pending),
+                        );
+                    }
+                });
+            }
+        });
+        // Every job is queued or parked on a worker: none has finished, so the
+        // count is exactly what was enqueued.
+        assert_eq!(pending.load(Ordering::Acquire), TOTAL);
+
+        gate.store(true, Ordering::SeqCst);
+        wait_drained(&pending, Duration::from_secs(30));
+        assert_eq!(ran.load(Ordering::SeqCst), TOTAL, "every job ran once");
+        // Exactly zero, not merely "not above zero": an extra decrement wraps
+        // the `usize` to a huge value and shutdown would wait forever.
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(pending.load(Ordering::Acquire), 0);
     }
 }
