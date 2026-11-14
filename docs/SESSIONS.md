@@ -62,6 +62,27 @@ heph's failures. (`--raw` is also what lowers heph's log to `warn`; there is
 no separate quiet flag.) It still names another session in a lock-wait
 notice: that only reads.
 
+### heph inside a target
+
+A target that runs heph (a test of a BUILD file, a tool wrapping `heph
+query`) starts a heph of its own, and that heph records a session like any
+other. Where it lands depends on what the target passes through:
+
+- With no `HOME` in the target's environment (the default: a target sees only
+  what it declares), the nested heph records nothing and says so once with a
+  `warn!`.
+- With `pass_env = ["HOME"]` (or `["*"]`, or `runtime_pass_env`), and in an
+  `entrypoint = True` target, which runs with the whole environment, the
+  nested heph writes to the real `~/.heph/sessions`, beside the outer run's.
+  `heph session list` shows it as one more session, and retention removes it
+  like any other.
+
+Either way the outer run is unaffected: nothing about its session reaches the
+target (I1), so the nested run is a separate session, never a child of the
+outer one. A target that runs heph should set `HEPH_NO_SESSION=1` in its
+`env`, or use `heph run --raw` when it only wants the tool's bytes, which
+records nothing and prints no start line.
+
 ## Layout
 
 `~/.heph/sessions/<id>/`, directory 0700, files 0600 (the per-user directory
@@ -216,7 +237,8 @@ keeps a reference only to tee `info!` lines into the open session; the diag
 sweeper; and the error renderer. `tui::run_app` takes the session as an
 explicit argument (a debug build asserts it is the sink's slot) and opens it
 lazily (a viewer's `App::records_session()` is false), and `main` finishes it with the exit code
-just before `std::process::exit`. Both
+just before it returns its `ExitCode`, ahead of anything slow on the way out
+(telemetry, the profiler). Both
 backends consume a tapped receiver that moves each event to the recorder right
 after the view folds it, so what is recorded is what was shown, paused TUI
 included. The recorder is its own OS thread behind an unbounded channel:
