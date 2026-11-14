@@ -172,7 +172,7 @@ pub(crate) async fn show(
     let mut stuck = String::new();
     let chain_root = if matches!(
         state,
-        SessionState::Running | SessionState::Waiting | SessionState::Stalled
+        SessionState::Running | SessionState::Waiting | SessionState::Quiet
     ) {
         stuck_on(&mut stuck, &entry, &snapshot, &every, opts.now_ms)
     } else {
@@ -203,6 +203,24 @@ pub(crate) async fn show(
         text.push_str(&format!(
             "recorded by a newer heph ({}), may be incomplete\n",
             escape(&meta.heph_version)
+        ));
+    }
+    if state == SessionState::Quiet {
+        let last = entry
+            .status
+            .as_ref()
+            .and_then(|s| s.last_event_unix_ms)
+            .unwrap_or(meta.started_unix_ms)
+            .max(meta.started_unix_ms);
+        let running = snapshot
+            .totals
+            .running
+            .total
+            .max(u64::try_from(snapshot.running.len()).unwrap_or(u64::MAX));
+        text.push_str(&format!(
+            "no events for {}; {running} target{} still running\n",
+            ago(opts.now_ms, last),
+            if running == 1 { "" } else { "s" }
         ));
     }
     if state == SessionState::Lost {
@@ -457,7 +475,7 @@ fn next_action(
                 "follow it until the wait ends",
             ),
         },
-        SessionState::Stalled => next(
+        SessionState::Quiet => next(
             NextKind::Inflight,
             format!("heph session inflight {id}"),
             "ask it what it is doing",

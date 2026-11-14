@@ -39,7 +39,7 @@ use crate::tui::session::{EntryMeta, FileSource, SessionEntry, SessionId, Sessio
 /// How long `heph session inflight` waits for the session to answer.
 const INFLIGHT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The quiet time after which a live session reads as `stalled` when
+/// The quiet time after which a live session reads as `quiet` when
 /// `--stall-notice` is off.
 const DEFAULT_STALL: Duration = Duration::from_secs(60);
 
@@ -256,7 +256,7 @@ pub fn exit_code(e: &anyhow::Error) -> Option<u8> {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ViewOpts {
     pub now_ms: u64,
-    /// Quiet for longer than this, a live session reads as `stalled`.
+    /// Quiet for longer than this, a live session reads as `quiet`.
     pub stall: Duration,
     /// This heph's version, against which a session's recorder is "newer".
     pub version: &'static str,
@@ -285,7 +285,11 @@ pub(crate) enum Workspace<'a> {
 pub enum SessionState {
     Running,
     Waiting,
-    Stalled,
+    /// No event for longer than the quiet threshold (`--stall-notice`, 60s
+    /// when it is off). Not a verdict: a long compile is quiet too. It moves
+    /// with the viewer's `--stall-notice`; `last_event_unix_ms` is the stable
+    /// signal.
+    Quiet,
     Ok,
     Failed,
     Lost,
@@ -298,7 +302,7 @@ impl SessionState {
         match self {
             Self::Running => "running",
             Self::Waiting => "waiting",
-            Self::Stalled => "stalled",
+            Self::Quiet => "quiet",
             Self::Ok => "ok",
             Self::Failed => "failed",
             Self::Lost => "lost",
@@ -312,7 +316,7 @@ impl SessionState {
 /// Ended: `ok` / `failed` from `status.json`'s `end`, `lost` without one,
 /// `unknown` when `status.json` is there but unreadable (newer). Live:
 /// `waiting` when something waits and every running target is among the
-/// waiters, else `stalled` when no event came for longer than `stall`, else
+/// waiters, else `quiet` when no event came for longer than `stall`, else
 /// `running`.
 pub(crate) fn derive_state(entry: &SessionEntry, now_ms: u64, stall: Duration) -> SessionState {
     let Some(meta) = entry.known_meta() else {
@@ -341,7 +345,7 @@ pub(crate) fn derive_state(entry: &SessionEntry, now_ms: u64, stall: Duration) -
         .max(meta.started_unix_ms);
     let stall_ms = u64::try_from(stall.as_millis()).unwrap_or(u64::MAX);
     if now_ms.saturating_sub(last) > stall_ms {
-        SessionState::Stalled
+        SessionState::Quiet
     } else {
         SessionState::Running
     }

@@ -45,8 +45,10 @@ reported as an error with that reason. An agent tells "the run failed" from
 "the wait failed" by that line, or by `heph session show <id> --json`.
 
 STATE is computed by the viewer, never stored: `running`; `waiting` (every
-open target is in a lock or admission wait); `stalled` (no event for longer
-than the stall notice, 60s when it is off); `ok` or `failed` once `End` is
+open target is in a lock or admission wait); `quiet` (no event for longer
+than the stall notice, 60s when it is off: not a verdict, a long compile is
+quiet too, and `show` says "no events for 1m05s; N targets still running");
+`ok` or `failed` once `End` is
 written; `lost` when the lock is free and there is no `End` (killed, or
 crashed).
 
@@ -188,7 +190,9 @@ same command alone, its reason on the line below.
 Field names are permanent once released: a field may be added, never renamed
 or removed without a version bump. `state` is computed by the viewer and may
 gain values; a consumer treats one it does not know as unknown, not as an
-error.
+error. `state` also depends on the viewer's `--stall-notice` (the `quiet`
+threshold), so two viewers can disagree on it; `last_event_unix_ms` is the
+stable signal for "has it gone silent".
 
 ## Invariants
 

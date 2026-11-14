@@ -134,7 +134,7 @@ fn write_json(
             let exit_code = end.and_then(|x| x.exit_code);
             let last_event_unix_ms = status.and_then(|s| s.last_event_unix_ms);
             let now = match state {
-                SessionState::Running | SessionState::Waiting | SessionState::Stalled => status
+                SessionState::Running | SessionState::Waiting | SessionState::Quiet => status
                     .map(|s| now_cell(s, e, every, opts))
                     .filter(|n| n != "-"),
                 _ => None,

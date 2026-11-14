@@ -240,7 +240,7 @@ fn state_is_derived() {
                 running: vec![running("//a:b", NOW - 90_000)],
                 ..SessionSnapshot::default()
             }),
-            SessionState::Stalled,
+            SessionState::Quiet,
         ),
         (
             "quiet, but not for long",
@@ -689,6 +689,14 @@ async fn next_is_structured_for_every_state() {
         let out = run_show(&sources, &id.encode(), false).await.expect("show");
         let want = format!("\nNext: {}\n  {reason}\n", command.unwrap_or("nothing"));
         assert!(out.ends_with(&want), "case {n}: {out}");
+        // Item 11: a quiet session says how long, and what is still open.
+        if kind == "inflight" {
+            assert_eq!(json["state"], "quiet");
+            assert!(
+                out.contains("\nno events for 1m01s; 0 targets still running\n"),
+                "{out}"
+            );
+        }
     }
 }
 
