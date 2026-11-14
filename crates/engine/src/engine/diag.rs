@@ -1113,14 +1113,17 @@ fn render_pools(p: &crate::engine::resource_pool::ResourceSnapshot, now: Instant
         lane.queued
     ));
     if let Some(head) = &lane.head {
+        let unit_of = |pool: &hplugin::provider::PoolName| {
+            lane.pools.iter().find(|s| &s.pool == pool).map_or_else(
+                || hcore::capacity::Unit::default_for(pool.as_str()),
+                |s| s.unit,
+            )
+        };
         let unmet: Vec<String> = head
             .unmet
             .iter()
             .map(|n| {
-                let unit = lane.pools.iter().find(|s| s.pool == n.pool).map_or_else(
-                    || hcore::capacity::Unit::default_for(n.pool.as_str()),
-                    |s| s.unit,
-                );
+                let unit = unit_of(&n.pool);
                 format!(
                     "{} {} ({} free)",
                     n.pool,
@@ -1135,8 +1138,31 @@ fn render_pools(p: &crate::engine::resource_pool::ResourceSnapshot, now: Instant
         } else {
             unmet.join(", ")
         };
+        // Runs that fit what was free started ahead of the head, up to a
+        // limit; at the limit nothing more takes what it needs, and its pools
+        // drain until it fits. Without this, idle capacity beside a waiting
+        // head reads as a stuck queue.
+        let overtaken: Vec<String> = head
+            .overtaken
+            .iter()
+            .filter(|o| o.by > 0)
+            .map(|o| {
+                let unit = unit_of(&o.pool);
+                format!(
+                    "{} of {} {}",
+                    display_amount(unit, o.by),
+                    display_amount(unit, o.limit),
+                    o.pool
+                )
+            })
+            .collect();
+        let overtaken = match (overtaken.is_empty(), head.draining()) {
+            (true, _) => String::new(),
+            (false, false) => format!("; overtaken by {}", overtaken.join(", ")),
+            (false, true) => format!("; overtaken by {}, draining", overtaken.join(", ")),
+        };
         out.push_str(&format!(
-            "  {:<12} waits for {unmet} for {}\n",
+            "  {:<12} waits for {unmet} for {}{overtaken}\n",
             "head",
             secs(now.saturating_duration_since(head.since))
         ));
@@ -1633,6 +1659,7 @@ mod tests {
                         free: Some(2 * cpu),
                     }],
                     since,
+                    overtaken: vec![],
                 }),
                 removals_pending: 0,
             },
@@ -1677,6 +1704,49 @@ mod tests {
             text.contains("waits for scratch_disk 8.0 GiB (7.0 GiB free)"),
             "{text}"
         );
+    }
+
+    /// The head's line says how far it has been overtaken, from a live pool:
+    /// nothing while no run passed it, the debt against its limit once one
+    /// did, and `draining` at the limit, when idle cpu beside a waiting head
+    /// is deliberate.
+    #[test]
+    fn the_in_flight_report_shows_overtaken_and_draining() {
+        use crate::engine::resource_pool::{Limit, ResourcePool};
+        use futures::FutureExt as _;
+        use hplugin::driver::{Demand, Resources};
+        use hplugin::provider::PoolName;
+        const CPU: u64 = Resources::MICROS_PER_CPU;
+        let pool = ResourcePool::new([(PoolName::cpu(), Limit::Bounded(8 * CPU))]);
+        let cpus = |n: u64| Demand::try_from_pairs([("cpu".to_owned(), n * CPU)]).expect("demand");
+        let acquire = |n: u64| pool.acquire(&cpus(n)).expect("acquire");
+        let head_line = || {
+            let text = render_pools(&pool.snapshot(), Instant::now());
+            text.lines().nth(1).unwrap_or_default().trim().to_owned()
+        };
+
+        let held = acquire(6).now_or_never().expect("fits").expect("granted");
+        // Needs 4 with 2 free: it waits, and limits at min(16 × 4, 4 × 8).
+        let _head = acquire(4);
+        assert_eq!(head_line(), "head         waits for cpu 4 (2 free) for 0s");
+
+        let mut passers = Vec::new();
+        passers.push(acquire(2).now_or_never().expect("passes").expect("granted"));
+        assert_eq!(
+            head_line(),
+            "head         waits for cpu 4 (0 free) for 0s; overtaken by 2 of 32 cpu"
+        );
+
+        // Each pass frees its 2 cpu for the next, until 32 cpu went by.
+        while pool.snapshot().main.head.is_some_and(|h| !h.draining()) {
+            passers.clear();
+            passers.push(acquire(2).now_or_never().expect("passes").expect("granted"));
+        }
+        assert_eq!(
+            head_line(),
+            "head         waits for cpu 4 (0 free) for 0s; overtaken by 32 of 32 cpu, draining"
+        );
+        drop((held, passers));
     }
 
     /// The engine's `sandbox` pool reads like any other, from a live pool:

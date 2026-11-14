@@ -87,7 +87,9 @@ use hcore::capacity::{PoolSpec, Unit};
 use hplugin::driver::{Demand, Resources};
 use hplugin::provider::PoolName;
 use parking_lot::Mutex;
-use std::collections::BTreeMap;
+use rustc_hash::FxHashMap;
+use std::collections::BTreeSet;
+use std::collections::btree_map::{self, BTreeMap};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -197,18 +199,16 @@ impl ResourcePool {
         request: &Demand,
         implicit: &[(PoolName, u64)],
     ) -> Result<Acquire, AcquireError> {
-        let (need, clamped) = self.resolve(request, implicit)?;
-        let bounded = need
-            .iter()
-            .any(|&(idx, _)| matches!(self.main.capacity.get(idx), Some(Limit::Bounded(_))));
-        let need = need.into_boxed_slice();
-        if bounded {
+        let (mut need, clamped) = self.resolve(request, implicit)?;
+        // One spelling per shape: `resolve` lists pools in declaration order.
+        need.sort_unstable_by_key(|&(idx, _)| idx);
+        if self.main.frees_bounded(&need) {
             return Ok(self.main.enqueue(need, clamped));
         }
         // Nothing on a bounded pool: it always fits, so it is granted now,
         // past any queue, and nothing caps how many such grants are live.
         Ok(Acquire {
-            state: AcquireState::Ready(Some(self.main.grant_now(need, clamped))),
+            state: AcquireState::Ready(Some(self.main.grant_now(need.into(), clamped))),
         })
     }
 
@@ -498,7 +498,40 @@ impl EnginePools {
     }
 }
 
-/// One FIFO over every named pool.
+/// A need: `(pool index, amount)`, one entry per pool, sorted by pool index.
+/// Amounts on unbounded pools are part of it: two runs that differ only there
+/// are told different amounts, so they are two shapes.
+type Shape = Arc<[(usize, u64)]>;
+
+/// A head is overtaken by this many times its own need of a pool before it is
+/// protected.
+const PATIENCE: u64 = 16;
+
+/// And never by more than this many times the pool's capacity, so a request
+/// for a whole pool waits about four pool-lengths, not sixteen.
+const PATIENCE_POOLS: u64 = 4;
+
+/// How many classes one event's walk tests at most. What it leaves untested,
+/// the following events test.
+const WALK_CAP: usize = 64;
+
+/// How a grant came about. Diagnostic: it answers "why did this start before
+/// that", and decides nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admitted {
+    /// On arrival, with nobody waiting (a zero-cost request always is).
+    Arrival,
+    /// As the oldest waiter.
+    Head,
+    /// Ahead of an older waiter, in the slot a run of its own shape just
+    /// released.
+    Handoff,
+    /// Ahead of an older waiter, in capacity that was free: on arrival or
+    /// from the queue.
+    Pass,
+}
+
+/// One queue over every named pool.
 #[derive(Debug)]
 struct Lane {
     /// Sorted, so a pool is found by binary search; indices are stable.
@@ -521,14 +554,205 @@ struct State {
     /// removal is by key.
     waiters: BTreeMap<u64, Waiter>,
     next_seq: u64,
+    /// Shape → the id of its class. Looked up, never iterated: a hash map's
+    /// order must not decide a grant.
+    shapes: FxHashMap<Shape, u64>,
+    /// The waiting classes by id, which is creation order. A class is here
+    /// exactly while it has a waiter.
+    classes: BTreeMap<u64, Class>,
+    next_class: u64,
+    head: Head,
+    /// The class id the next batch of the walk starts from.
+    cursor: u64,
+    untested: Untested,
+    /// The walk's batch, kept for its allocation.
+    batch: Vec<(u64, u64)>,
+    /// How many classes the walk has tested, over the lane's life.
+    #[cfg(test)]
+    visited: u64,
 }
 
 #[derive(Debug)]
 struct Waiter {
-    need: Box<[(usize, u64)]>,
+    class: u64,
     clamped: bool,
     since: Instant,
     tx: oneshot::Sender<Reservation>,
+}
+
+/// The waiters of one shape, in arrival order.
+#[derive(Debug)]
+struct Class {
+    need: Shape,
+    waiters: BTreeSet<u64>,
+}
+
+/// What the head has been overtaken by. It belongs to the waiter `seq`: any
+/// other head starts from nothing ([`State::sync_head`]).
+#[derive(Debug, Default)]
+struct Head {
+    seq: Option<u64>,
+    need: Option<Shape>,
+    /// Per entry of `need`: what was granted behind this head, on that pool,
+    /// without leaving its need there.
+    debt: Vec<u64>,
+}
+
+impl Head {
+    /// Whether its debt reached its limit on a pool it needs. From then on
+    /// nothing is granted that takes from what it needs.
+    fn protected(&self, capacity: &[Limit]) -> bool {
+        self.need.as_deref().is_some_and(|need| {
+            need.iter().zip(&self.debt).any(|(&(idx, n), &debt)| {
+                patience(capacity.get(idx).copied(), n).is_some_and(|limit| debt >= limit)
+            })
+        })
+    }
+
+    /// Count a grant of `grant` against the head: its amount on each pool
+    /// where it does not leave the head's need. `held` is before the grant.
+    fn charge(&mut self, capacity: &[Limit], held: &[u64], grant: &[(usize, u64)]) {
+        let Some(need) = self.need.as_deref() else {
+            return;
+        };
+        for (&(idx, n), debt) in need.iter().zip(&mut self.debt) {
+            let taken = amount_in(grant, idx);
+            if taken != 0 && !leaves(capacity, held, idx, taken, n) {
+                *debt = debt.saturating_add(taken);
+            }
+        }
+    }
+}
+
+/// What of the current pass over the waiting classes is still to test. A pass
+/// starts when something changed that could let a waiter fit, and covers
+/// every class once, [`WALK_CAP`] per event.
+#[derive(Debug, Clone, Copy)]
+enum Untested {
+    /// Nothing: no waiter can be granted until a release or a head change.
+    Nothing,
+    /// The class ids from the cursor up, then those below `stop`.
+    Wrap { stop: u64 },
+    /// The class ids from the cursor up to `stop`, exclusive.
+    Until { stop: u64 },
+}
+
+/// What came of offering a class's oldest waiter what is free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Offer {
+    Granted,
+    /// It does not fit, or it would take what a protected head needs, or the
+    /// class has no waiter left.
+    Refused,
+    /// Its receiver was dropped: it left the queue with nothing granted, and
+    /// the class's next waiter can be offered the same.
+    Gone,
+}
+
+impl State {
+    /// Point `head` at the oldest waiter. A waiter that was not the head the
+    /// last time this ran starts with no debt.
+    fn sync_head(&mut self) {
+        let first = self
+            .waiters
+            .first_key_value()
+            .map(|(&seq, w)| (seq, w.class));
+        let seq = first.map(|(seq, _)| seq);
+        if self.head.seq == seq {
+            return;
+        }
+        self.head.seq = seq;
+        self.head.need = first
+            .and_then(|(_, class)| self.classes.get(&class))
+            .map(|c| Arc::clone(&c.need));
+        let entries = self.head.need.as_deref().map_or(0, <[_]>::len);
+        self.head.debt.clear();
+        self.head.debt.resize(entries, 0);
+    }
+
+    /// The class of the oldest waiter.
+    fn head_class(&self) -> Option<u64> {
+        self.waiters.first_key_value().map(|(_, w)| w.class)
+    }
+
+    fn head_seq(&self) -> Option<u64> {
+        self.waiters.first_key_value().map(|(&seq, _)| seq)
+    }
+
+    /// Take a waiter out of the queue and of its class; its last waiter
+    /// takes the class with it.
+    fn remove(&mut self, seq: u64) -> Option<Waiter> {
+        let waiter = self.waiters.remove(&seq)?;
+        if let btree_map::Entry::Occupied(mut class) = self.classes.entry(waiter.class) {
+            class.get_mut().waiters.remove(&seq);
+            if class.get().waiters.is_empty() {
+                let class = class.remove();
+                self.shapes.remove(&class.need);
+            }
+        }
+        Some(waiter)
+    }
+
+    /// Queue a waiter of `class`, which exists.
+    fn push(&mut self, class: u64, clamped: bool) -> (u64, oneshot::Receiver<Reservation>) {
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        let (tx, rx) = oneshot::channel();
+        if let Some(c) = self.classes.get_mut(&class) {
+            c.waiters.insert(seq);
+        }
+        self.waiters.insert(
+            seq,
+            Waiter {
+                class,
+                clamped,
+                since: Instant::now(),
+                tx,
+            },
+        );
+        (seq, rx)
+    }
+
+    /// Move up to [`WALK_CAP`] untested classes into `batch`, as `(oldest
+    /// waiter, class id)`, in id order from the cursor. The head's class is
+    /// left out: its oldest waiter is the head, which the walk tests first.
+    fn next_batch(&mut self, head_class: u64) {
+        let (classes, batch) = (&self.classes, &mut self.batch);
+        batch.clear();
+        // The id of the first class left out once the batch is full.
+        let mut fill = |range: btree_map::Range<'_, u64, Class>| {
+            for (&id, class) in range {
+                if id == head_class {
+                    continue;
+                }
+                if batch.len() >= WALK_CAP {
+                    return Some(id);
+                }
+                if let Some(&oldest) = class.waiters.first() {
+                    batch.push((oldest, id));
+                }
+            }
+            None
+        };
+        let (cursor, untested) = match self.untested {
+            Untested::Nothing => return,
+            Untested::Wrap { stop } => match fill(classes.range(self.cursor..)) {
+                Some(next) => (next, Untested::Wrap { stop }),
+                None => match fill(classes.range(..stop)) {
+                    Some(next) => (next, Untested::Until { stop }),
+                    None => (stop, Untested::Nothing),
+                },
+            },
+            // `range` panics on a start past its end.
+            Untested::Until { stop } if self.cursor >= stop => (stop, Untested::Nothing),
+            Untested::Until { stop } => match fill(classes.range(self.cursor..stop)) {
+                Some(next) => (next, Untested::Until { stop }),
+                None => (stop, Untested::Nothing),
+            },
+        };
+        self.cursor = cursor;
+        self.untested = untested;
+    }
 }
 
 impl Lane {
@@ -542,6 +766,15 @@ impl Lane {
                 held: vec![0; capacity.len()].into_boxed_slice(),
                 waiters: BTreeMap::new(),
                 next_seq: 0,
+                shapes: FxHashMap::default(),
+                classes: BTreeMap::new(),
+                next_class: 0,
+                head: Head::default(),
+                cursor: 0,
+                untested: Untested::Nothing,
+                batch: Vec::new(),
+                #[cfg(test)]
+                visited: 0,
             }),
             names: names.into_boxed_slice(),
             capacity: capacity.into_boxed_slice(),
@@ -578,48 +811,87 @@ impl Lane {
 
     /// Grant `need` now, past the queue. Only for a need that always fits
     /// (unbounded pools only, or nothing at all); an empty one takes no lock.
-    fn grant_now(self: &Arc<Self>, need: Box<[(usize, u64)]>, clamped: bool) -> Reservation {
+    fn grant_now(self: &Arc<Self>, need: Shape, clamped: bool) -> Reservation {
         if !need.is_empty() {
             take(&mut self.state.lock().held, &need);
         }
         Reservation {
             lane: Arc::clone(self),
             granted: need,
+            origin: None,
             clamped,
+            admitted: Admitted::Arrival,
             armed: true,
         }
     }
 
-    fn enqueue(self: &Arc<Self>, need: Box<[(usize, u64)]>, clamped: bool) -> Acquire {
-        let mut st = self.state.lock();
-        if st.waiters.is_empty() && fits(&self.capacity, &st.held, &need) {
-            take(&mut st.held, &need);
-            drop(st);
-            return Acquire {
-                state: AcquireState::Ready(Some(Reservation {
-                    lane: Arc::clone(self),
-                    granted: need,
-                    clamped,
-                    armed: true,
-                })),
-            };
-        }
-        let seq = st.next_seq;
-        st.next_seq = st.next_seq.wrapping_add(1);
-        let (tx, rx) = oneshot::channel();
-        st.waiters.insert(
-            seq,
-            Waiter {
-                need,
-                clamped,
-                since: Instant::now(),
-                tx,
-            },
-        );
-        // An arrival is a mutation too. The head did not fit before it, so this
-        // grants nothing unless this waiter is the head — kept for the rule.
-        self.grant_chain(&mut st);
-        drop(st);
+    /// Whether `amounts` holds something of a bounded pool: the only thing a
+    /// request waits for, and the only thing whose release lets a waiter fit.
+    fn frees_bounded(&self, amounts: &[(usize, u64)]) -> bool {
+        amounts
+            .iter()
+            .any(|&(idx, _)| matches!(self.capacity.get(idx), Some(Limit::Bounded(_))))
+    }
+
+    /// An arrival. Behind a waiter of its own shape it queues, so one shape
+    /// starts in arrival order. Otherwise it is judged alone, as the walk
+    /// would judge it: granted when it fits and nobody waits, or when it fits
+    /// and either the head is not protected or the grant leaves the head's
+    /// need.
+    fn enqueue(self: &Arc<Self>, need: Vec<(usize, u64)>, clamped: bool) -> Acquire {
+        let mut guard = self.state.lock();
+        let st = &mut *guard;
+        // Older classes an unfinished pass has not reached go first.
+        self.pass(st);
+        let class = match st.shapes.get(need.as_slice()).copied() {
+            Some(class) => class,
+            None => {
+                let need: Shape = need.into();
+                st.sync_head();
+                let admitted = if !fits(&self.capacity, &st.held, &need) {
+                    None
+                } else if let Some(head) = st.head.need.as_deref() {
+                    let room = leaves_room(&self.capacity, &st.held, &need, head);
+                    if room {
+                        Some(Admitted::Pass)
+                    } else if st.head.protected(&self.capacity) {
+                        None
+                    } else {
+                        st.head.charge(&self.capacity, &st.held, &need);
+                        Some(Admitted::Pass)
+                    }
+                } else {
+                    Some(Admitted::Arrival)
+                };
+                if let Some(admitted) = admitted {
+                    take(&mut st.held, &need);
+                    drop(guard);
+                    return Acquire {
+                        state: AcquireState::Ready(Some(Reservation {
+                            lane: Arc::clone(self),
+                            granted: need,
+                            origin: None,
+                            clamped,
+                            admitted,
+                            armed: true,
+                        })),
+                    };
+                }
+                let class = st.next_class;
+                st.next_class = st.next_class.wrapping_add(1);
+                st.shapes.insert(Arc::clone(&need), class);
+                st.classes.insert(
+                    class,
+                    Class {
+                        need,
+                        waiters: BTreeSet::new(),
+                    },
+                );
+                class
+            }
+        };
+        let (seq, rx) = st.push(class, clamped);
+        drop(guard);
         Acquire {
             state: AcquireState::Waiting {
                 guard: WaitGuard {
@@ -632,59 +904,197 @@ impl Lane {
         }
     }
 
-    /// Grant from the head while the head fits. Runs under the lock; a send
-    /// that fails hands the grant back, disarmed, and its amounts are re-added
-    /// here, so no armed `Reservation` is dropped under the lock.
-    fn grant_chain(self: &Arc<Self>, st: &mut State) {
-        while let Some(head) = st.waiters.first_entry() {
-            if !fits(&self.capacity, &st.held, &head.get().need) {
-                break;
-            }
-            let waiter = head.remove();
-            take(&mut st.held, &waiter.need);
-            let reservation = Reservation {
-                lane: Arc::clone(self),
-                granted: waiter.need,
-                clamped: waiter.clamped,
-                armed: true,
+    /// Offer `class`'s oldest waiter what is free. The head is granted when
+    /// it fits. Any other waiter must also not take what a protected head
+    /// needs; a grant that does not leave an unprotected head's need is
+    /// charged to it.
+    ///
+    /// Runs under the lock. The grant is built here and counted as held only
+    /// once it is sent: a send that fails hands it back, which is disarmed,
+    /// so no armed `Reservation` is dropped under the lock and nothing is
+    /// charged for a waiter that was not there.
+    fn offer(self: &Arc<Self>, st: &mut State, class: u64, how: Admitted) -> Offer {
+        st.sync_head();
+        let (seq, need, room) = {
+            let Some(c) = st.classes.get(&class) else {
+                return Offer::Refused;
             };
-            if let Err(mut unobserved) = waiter.tx.send(reservation) {
-                unobserved.armed = false;
-                give(&self.capacity, &mut st.held, &unobserved.granted);
+            let Some(&seq) = c.waiters.first() else {
+                return Offer::Refused;
+            };
+            if !fits(&self.capacity, &st.held, &c.need) {
+                return Offer::Refused;
             }
+            let room = st.head.seq == Some(seq)
+                || st
+                    .head
+                    .need
+                    .as_deref()
+                    .is_none_or(|head| leaves_room(&self.capacity, &st.held, &c.need, head));
+            if !room && st.head.protected(&self.capacity) {
+                return Offer::Refused;
+            }
+            (seq, Arc::clone(&c.need), room)
+        };
+        let is_head = st.head.seq == Some(seq);
+        let Some(waiter) = st.remove(seq) else {
+            return Offer::Refused;
+        };
+        let reservation = Reservation {
+            lane: Arc::clone(self),
+            granted: Arc::clone(&need),
+            origin: None,
+            clamped: waiter.clamped,
+            admitted: if is_head { Admitted::Head } else { how },
+            armed: true,
+        };
+        if let Err(mut unobserved) = waiter.tx.send(reservation) {
+            unobserved.armed = false;
+            return Offer::Gone;
         }
+        if !room {
+            st.head.charge(&self.capacity, &st.held, &need);
+        }
+        take(&mut st.held, &need);
+        Offer::Granted
     }
 
-    fn release(self: &Arc<Self>, granted: &[(usize, u64)]) {
+    /// Steps 2 and 3 of the rule, after something changed that could let a
+    /// waiter fit: capacity came back, or the head left. Grants the head
+    /// while it fits, then starts a pass over the other classes.
+    fn walk(self: &Arc<Self>, st: &mut State) {
+        while let Some(class) = st.head_class() {
+            if self.offer(st, class, Admitted::Head) == Offer::Refused {
+                break;
+            }
+        }
+        st.untested = Untested::Wrap { stop: st.cursor };
+        self.pass(st);
+    }
+
+    /// One batch of the pass over the waiting classes, if one is unfinished:
+    /// each class's oldest waiter is offered what is free, the class with the
+    /// older waiter first. A class that is granted is offered again; a class
+    /// that is refused is done for this pass, because what is free only
+    /// shrinks during it.
+    fn pass(self: &Arc<Self>, st: &mut State) {
+        if matches!(st.untested, Untested::Nothing) {
+            return;
+        }
+        let Some(head_class) = st.head_class() else {
+            st.untested = Untested::Nothing;
+            return;
+        };
+        st.next_batch(head_class);
+        let mut batch = std::mem::take(&mut st.batch);
+        batch.sort_unstable();
+        for &(_, class) in &batch {
+            #[cfg(test)]
+            {
+                st.visited = st.visited.saturating_add(1);
+            }
+            while self.offer(st, class, Admitted::Pass) != Offer::Refused {}
+        }
+        st.batch = batch;
+    }
+
+    /// Return `granted`, part or all of a grant admitted as `shape`. The
+    /// oldest waiter of that shape is offered the slot first; unless it took
+    /// it and the head is who it was, the walk runs.
+    fn release(self: &Arc<Self>, granted: &[(usize, u64)], shape: &[(usize, u64)]) {
         // An empty grant frees nothing, so it can admit nobody.
         if granted.is_empty() {
             return;
         }
-        let mut st = self.state.lock();
+        let mut guard = self.state.lock();
+        let st = &mut *guard;
         give(&self.capacity, &mut st.held, granted);
-        self.grant_chain(&mut st);
+        if !self.frees_bounded(granted) {
+            // Nothing a waiter waits for came back.
+            self.pass(st);
+            return;
+        }
+        let head = st.head_seq();
+        let mut handed = false;
+        if let Some(class) = st.shapes.get(shape).copied() {
+            loop {
+                match self.offer(st, class, Admitted::Handoff) {
+                    Offer::Gone => {}
+                    Offer::Granted => {
+                        handed = true;
+                        break;
+                    }
+                    Offer::Refused => break,
+                }
+            }
+        }
+        if handed && st.head_seq() == head {
+            // The slot went to a run of the shape that released it, which
+            // takes at least what came back: nothing is freer than before
+            // the release, so nobody else can newly fit.
+            self.pass(st);
+        } else {
+            self.walk(st);
+        }
     }
 
-    /// Leave the queue (no-op once granted) and run the chain.
+    /// Leave the queue (no-op once granted). Only the head leaving can let
+    /// another waiter start: the next head has no debt, so it protects
+    /// nothing yet.
     fn cancel(self: &Arc<Self>, seq: u64) {
-        let mut st = self.state.lock();
-        if st.waiters.remove(&seq).is_some() {
-            self.grant_chain(&mut st);
+        let mut guard = self.state.lock();
+        let st = &mut *guard;
+        let was_head = st.head_seq() == Some(seq);
+        if st.remove(seq).is_none() {
+            return;
+        }
+        if was_head {
+            self.walk(st);
+        } else {
+            self.pass(st);
         }
     }
 
     fn wait_info(&self, seq: u64) -> Option<WaitInfo> {
-        let st = self.state.lock();
+        let mut guard = self.state.lock();
+        let st = &mut *guard;
+        st.sync_head();
         let waiter = st.waiters.get(&seq)?;
+        let need = &st.classes.get(&waiter.class)?.need;
+        // It fits and still waits: only a protected head holds it back.
+        let yielding_to = st
+            .head
+            .need
+            .as_deref()
+            .filter(|_| {
+                st.head.seq != Some(seq)
+                    && fits(&self.capacity, &st.held, need)
+                    && st.head.protected(&self.capacity)
+            })
+            .and_then(|head| {
+                need.iter().find_map(|&(idx, n)| {
+                    let wanted = amount_in(head, idx);
+                    if leaves(&self.capacity, &st.held, idx, n, wanted) {
+                        return None;
+                    }
+                    Some(YieldingTo {
+                        pool: self.names.get(idx)?.clone(),
+                        need: wanted,
+                    })
+                })
+            });
         Some(WaitInfo {
             ahead: st.waiters.range(..seq).count(),
-            pools: self.needs(&st.held, &waiter.need, false),
+            pools: self.needs(&st.held, need, false),
             since: waiter.since,
+            yielding_to,
         })
     }
 
     fn snapshot(&self) -> LaneSnapshot {
-        let st = self.state.lock();
+        let mut guard = self.state.lock();
+        let st = &mut *guard;
+        st.sync_head();
         let pools = self
             .names
             .iter()
@@ -696,10 +1106,26 @@ impl Lane {
                 held,
             })
             .collect();
-        let head = st.waiters.values().next().map(|w| HeadSnapshot {
-            unmet: self.needs(&st.held, &w.need, true),
-            since: w.since,
-        });
+        let head = st
+            .waiters
+            .values()
+            .next()
+            .zip(st.head.need.as_deref())
+            .map(|(w, need)| HeadSnapshot {
+                unmet: self.needs(&st.held, need, true),
+                since: w.since,
+                overtaken: need
+                    .iter()
+                    .zip(&st.head.debt)
+                    .filter_map(|(&(idx, n), &by)| {
+                        Some(Overtaken {
+                            pool: self.names.get(idx)?.clone(),
+                            by,
+                            limit: patience(self.capacity.get(idx).copied(), n)?,
+                        })
+                    })
+                    .collect(),
+            });
         LaneSnapshot {
             pools,
             queued: st.waiters.len(),
@@ -743,6 +1169,52 @@ fn fits(capacity: &[Limit], held: &[u64], need: &[(usize, u64)]) -> bool {
         })
 }
 
+/// What `shape` takes of pool `idx`; 0 when it does not name it.
+fn amount_in(shape: &[(usize, u64)], idx: usize) -> u64 {
+    shape
+        .iter()
+        .find_map(|&(i, n)| (i == idx).then_some(n))
+        .unwrap_or(0)
+}
+
+/// Whether granting `grant` of pool `idx`, which fits, leaves `head` of it
+/// free. An unbounded pool always does. Written as subtractions from what is
+/// free, like [`fits`], so no sum can overflow.
+fn leaves(capacity: &[Limit], held: &[u64], idx: usize, grant: u64, head: u64) -> bool {
+    match (capacity.get(idx), held.get(idx)) {
+        (Some(&Limit::Bounded(cap)), Some(&h)) => {
+            head <= cap.saturating_sub(h).saturating_sub(grant)
+        }
+        _ => true,
+    }
+}
+
+/// Whether a grant of `grant`, which fits, leaves room for the head: on every
+/// bounded pool the grant takes from, the head's whole need still fits beside
+/// it.
+fn leaves_room(
+    capacity: &[Limit],
+    held: &[u64],
+    grant: &[(usize, u64)],
+    head: &[(usize, u64)],
+) -> bool {
+    grant
+        .iter()
+        .all(|&(idx, n)| leaves(capacity, held, idx, n, amount_in(head, idx)))
+}
+
+/// By how much a head needing `need` of a pool is overtaken there before it
+/// is protected: [`PATIENCE`] times its need, at most [`PATIENCE_POOLS`]
+/// times the pool. `None` for an unbounded pool, where every grant leaves
+/// room.
+fn patience(limit: Option<Limit>, need: u64) -> Option<u64> {
+    let capacity = limit?.bounded()?;
+    Some(
+        need.saturating_mul(PATIENCE)
+            .min(capacity.saturating_mul(PATIENCE_POOLS)),
+    )
+}
+
 /// Count a need that [`fits`] as held. Saturates: an unbounded pool can be
 /// granted more than a `u64` in total, which only the snapshot reads.
 fn take(held: &mut [u64], need: &[(usize, u64)]) {
@@ -773,10 +1245,16 @@ fn give(capacity: &[Limit], held: &mut [u64], granted: &[(usize, u64)]) {
 #[derive(Debug)]
 pub struct Reservation {
     lane: Arc<Lane>,
-    granted: Box<[(usize, u64)]>,
+    /// Shared with the class it was granted from.
+    granted: Shape,
+    /// The shape this was admitted as, once `granted` is only a part of it
+    /// ([`split_off`](Self::split_off)). Each part, when it is released, is
+    /// offered to that shape's oldest waiter first.
+    origin: Option<Shape>,
     clamped: bool,
-    /// False only for a grant handed back by a failed send, whose amounts the
-    /// chain re-added itself.
+    admitted: Admitted,
+    /// False only for a grant handed back by a failed send, which was never
+    /// counted as held.
     armed: bool,
 }
 
@@ -784,6 +1262,11 @@ impl Reservation {
     /// Whether some amount was clamped to its pool's capacity.
     pub fn clamped(&self) -> bool {
         self.clamped
+    }
+
+    /// How this grant came about.
+    pub fn admitted(&self) -> Admitted {
+        self.admitted
     }
 
     /// The granted amount of a named pool; 0 for a pool not reserved.
@@ -810,14 +1293,20 @@ impl Reservation {
     /// stays a fact about the original request.
     pub fn split_off(&mut self, pool: &str) -> Option<Reservation> {
         let idx = self.lane.index(pool)?;
-        let pos = self.granted.iter().position(|&(i, _)| i == idx)?;
-        let mut rest = std::mem::take(&mut self.granted).into_vec();
-        let part = rest.remove(pos);
-        self.granted = rest.into_boxed_slice();
+        let part = self.granted.iter().copied().find(|&(i, _)| i == idx)?;
+        let origin = Arc::clone(self.origin.get_or_insert_with(|| Arc::clone(&self.granted)));
+        self.granted = self
+            .granted
+            .iter()
+            .copied()
+            .filter(|&(i, _)| i != idx)
+            .collect();
         Some(Reservation {
             lane: Arc::clone(&self.lane),
-            granted: Box::new([part]),
+            granted: Arc::from([part]),
+            origin: Some(origin),
             clamped: false,
+            admitted: self.admitted,
             armed: self.armed,
         })
     }
@@ -853,7 +1342,8 @@ impl Drop for PendingRemoval {
 impl Drop for Reservation {
     fn drop(&mut self) {
         if self.armed {
-            self.lane.release(&self.granted);
+            let shape = self.origin.as_deref().unwrap_or(&self.granted);
+            self.lane.release(&self.granted, shape);
         }
     }
 }
@@ -926,13 +1416,29 @@ impl Drop for WaitGuard {
     }
 }
 
-/// A queued request's position: how many wait ahead of it, and per pool what
-/// it needs against what is free.
+/// A queued request at one instant: how many were queued before it, and per
+/// pool what it needs against what is free.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WaitInfo {
+    /// How many waiters arrived before this one and still wait. A snapshot,
+    /// and not a promise that they start first: a waiter that fits what is
+    /// free can start ahead of an older one (see the module docs).
     pub ahead: usize,
     pub pools: Vec<PoolNeed>,
     pub since: Instant,
+    /// Set when this request fits what is free and still waits: the oldest
+    /// waiter has been overtaken as far as it may be, and this grant would
+    /// take what it needs.
+    pub yielding_to: Option<YieldingTo>,
+}
+
+/// What a waiter that fits is held back for: the oldest waiter's need of the
+/// first pool where both cannot fit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct YieldingTo {
+    pub pool: PoolName,
+    /// What the oldest waiter needs of `pool`.
+    pub need: u64,
 }
 
 /// One pool of a request: what it needs and what is free right now.
@@ -985,6 +1491,28 @@ impl PoolSnapshot {
 pub struct HeadSnapshot {
     pub unmet: Vec<PoolNeed>,
     pub since: Instant,
+    /// Per bounded pool the head needs: what has started ahead of it there,
+    /// against how much may.
+    pub overtaken: Vec<Overtaken>,
+}
+
+impl HeadSnapshot {
+    /// Whether the head has been overtaken as far as it may be: nothing more
+    /// is admitted that takes what it needs, so its pools drain until it
+    /// fits.
+    pub fn draining(&self) -> bool {
+        self.overtaken.iter().any(|o| o.by >= o.limit)
+    }
+}
+
+/// How far the oldest waiter has been overtaken on one pool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Overtaken {
+    pub pool: PoolName,
+    /// The amounts granted behind it that did not leave its need of `pool`.
+    pub by: u64,
+    /// Once `by` reaches this, it is overtaken no further.
+    pub limit: u64,
 }
 
 #[cfg(test)]
@@ -1032,19 +1560,122 @@ mod tests {
         p.available(pool).unwrap()
     }
 
+    fn cpus(n: u64) -> Demand {
+        req(&[("cpu", n * CPU)])
+    }
+
+    /// How many classes the walk has tested so far.
+    fn visited(p: &ResourcePool) -> u64 {
+        p.main.state.lock().visited
+    }
+
+    /// How many classes wait. Each is findable by its shape, and no other
+    /// shape is.
+    fn classes(p: &ResourcePool) -> usize {
+        let st = p.main.state.lock();
+        assert_eq!(st.classes.len(), st.shapes.len());
+        st.classes.len()
+    }
+
+    /// The head's debt and limit on `pool`.
+    fn overtaken(p: &ResourcePool, pool: &str) -> (u64, u64) {
+        let head = p.snapshot().main.head.expect("a head");
+        let o = head
+            .overtaken
+            .iter()
+            .find(|o| o.pool.as_str() == pool)
+            .expect("the head needs the pool");
+        (o.by, o.limit)
+    }
+
+    fn draining(p: &ResourcePool) -> bool {
+        p.snapshot().main.head.is_some_and(|h| h.draining())
+    }
+
+    /// Arrivals of `r` that start at once, each released before the next,
+    /// until one has to queue (and leaves).
+    fn passes(p: &Arc<ResourcePool>, r: &Demand) -> u64 {
+        let mut n = 0;
+        loop {
+            let mut a = p.acquire(r).unwrap();
+            match (&mut a).now_or_never() {
+                Some(g) => drop(g.unwrap()),
+                None => return n,
+            }
+            n += 1;
+            assert!(n < 100_000, "never refused");
+        }
+    }
+
+    /// Whether a full walk would grant nothing: no pass is unfinished, the
+    /// head does not fit, and every other class's oldest waiter either does
+    /// not fit or would take what a protected head needs.
+    fn settled(p: &ResourcePool) -> bool {
+        let lane = &p.main;
+        let mut guard = lane.state.lock();
+        let st = &mut *guard;
+        st.sync_head();
+        matches!(st.untested, Untested::Nothing)
+            && st.classes.values().all(|c| {
+                let Some(&oldest) = c.waiters.first() else {
+                    return false;
+                };
+                if !fits(&lane.capacity, &st.held, &c.need) {
+                    return true;
+                }
+                let Some(head) = st.head.need.as_deref() else {
+                    return false;
+                };
+                st.head.seq != Some(oldest)
+                    && !leaves_room(&lane.capacity, &st.held, &c.need, head)
+                    && st.head.protected(&lane.capacity)
+            })
+    }
+
+    /// A waiter whose receiver is gone and which never left the queue: what
+    /// a grant finds when it races the waiter's drop.
+    fn dead(a: Acquire) -> WaitGuard {
+        match a.state {
+            AcquireState::Waiting { guard, rx } => {
+                drop(rx);
+                guard
+            }
+            AcquireState::Ready(_) => panic!("must wait"),
+        }
+    }
+
+    /// splitmix64: a seeded sequence, the same on every run.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
     #[test]
     fn grants_in_arrival_order() {
         let p = pool(&[("cpu", 4 * CPU)]);
-        let held = now(&p, &req(&[("cpu", 3 * CPU)]));
-        let mut big = queued(&p, &req(&[("cpu", 2 * CPU)]));
-        // One CPU is free and this asks for one, but it arrived behind `big`.
+        let held = now(&p, &req(&[("cpu", 4 * CPU)]));
+        let mut big = queued(&p, &req(&[("cpu", 3 * CPU)]));
+        // Nothing is free, so neither fits: a follower that did would start.
         let mut small = queued(&p, &req(&[("cpu", CPU)]));
-        assert_eq!(free(&p, "cpu"), CPU, "a waiter holds nothing");
+        assert_eq!(free(&p, "cpu"), 0, "a waiter holds nothing");
 
         drop(held);
         let big = granted(&mut big).expect("the head first");
+        assert_eq!(big.admitted(), Admitted::Head);
         let small = granted(&mut small).expect("then its follower");
-        assert_eq!(free(&p, "cpu"), CPU);
+        assert_eq!(small.admitted(), Admitted::Head, "the oldest once big left");
+        assert_eq!(free(&p, "cpu"), 0);
         drop((big, small));
         assert_eq!(free(&p, "cpu"), 4 * CPU);
     }
@@ -1176,14 +1807,19 @@ mod tests {
 
     #[test]
     fn cancelling_the_head_admits_the_follower_without_a_release() {
-        let p = pool(&[("cpu", 2 * CPU)]);
-        let _held = now(&p, &req(&[]));
-        let head = queued(&p, &req(&[("cpu", 2 * CPU)]));
+        let p = pool(&[("cpu", 2 * CPU), ("docker", 1)]);
+        let _docker = now(&p, &req(&[("cpu", 0), ("docker", 1)]));
+        let passes = |n| (0..n).map(|_| drop(now(&p, &req(&[])))).count();
+        // Waits for `docker`, and is overtaken by cpu runs until its cpu
+        // debt reaches its limit: min(16 × 2, 4 × 2) cpu.
+        let head = queued(&p, &req(&[("cpu", 2 * CPU), ("docker", 1)]));
+        assert_eq!(passes(8), 8);
+        // Fits, but would take the cpu the head is now owed.
         let mut follower = queued(&p, &req(&[]));
         drop(head);
         assert!(
             granted(&mut follower).is_some(),
-            "the head's drop runs the chain"
+            "the head's drop runs the walk"
         );
     }
 
@@ -1348,6 +1984,30 @@ mod tests {
         let r = now(&small, &req(&[("cpu", u64::MAX)]));
         assert!(r.clamped());
         assert_eq!(r.amount("cpu"), 4 * CPU);
+
+        // The head's limit (16 times its need, 4 times the pool), its debt
+        // and the leaves-room test all saturate: a head needing the whole
+        // pool is overtaken twice by runs one short of it, then protected.
+        let p = pool(&[("cpu", u64::MAX)]);
+        let wide = req(&[("cpu", u64::MAX - 1)]);
+        let first = now(&p, &wide);
+        let mut head = queued(&p, &req(&[("cpu", u64::MAX)]));
+        let mut followers = [queued(&p, &wide), queued(&p, &wide), queued(&p, &wide)];
+        drop(first);
+        let [a, b, c] = &mut followers;
+        let a = granted(a).expect("handed off");
+        assert_eq!(overtaken(&p, "cpu"), (u64::MAX - 1, u64::MAX));
+        drop(a);
+        let b = granted(b).expect("handed off: the debt is one short");
+        assert_eq!(overtaken(&p, "cpu"), (u64::MAX, u64::MAX), "saturated");
+        assert!(draining(&p));
+        drop(b);
+        assert!(granted(c).is_none(), "the head is protected");
+        let head = granted(&mut head).expect("it fits once the pool is empty");
+        assert_eq!(head.admitted(), Admitted::Head);
+        drop(head);
+        drop(granted(c).expect("then the follower"));
+        assert_eq!(free(&p, "cpu"), u64::MAX);
     }
 
     #[test]
@@ -1359,7 +2019,8 @@ mod tests {
 
         let _held = now(&p, &req(&[("cpu", 3 * CPU), ("memory", GIB)]));
         let head = queued(&p, &req(&[("cpu", 2 * CPU), ("memory", GIB)]));
-        let follower = queued(&p, &req(&[]));
+        // Two cpu with one free: a follower that fit would not queue.
+        let follower = queued(&p, &req(&[("cpu", 2 * CPU)]));
         let s = p.snapshot();
         assert_eq!(
             s.main.pools,
@@ -1827,5 +2488,1163 @@ mod tests {
             (free(&p, "cpu"), free(&p, "gpu"), free(&p, "sandbox")),
             (4 * CPU, 4, 4)
         );
+    }
+
+    // ---- Step 3: a waiter that fits passes the head -----------------------
+
+    #[test]
+    fn a_run_needing_another_pool_passes_a_waiting_head() {
+        let p = pool(&[("cpu", 4 * CPU), ("docker", 1)]);
+        let cpu = now(&p, &cpus(4));
+        let _docker = now(&p, &req(&[("cpu", 0), ("docker", 1)]));
+        let mut head = queued(&p, &req(&[("cpu", CPU), ("docker", 1)]));
+        let mut waiter = queued(&p, &cpus(1));
+
+        drop(cpu);
+        assert!(granted(&mut head).is_none(), "docker is still held");
+        let run = granted(&mut waiter).expect("cpu is free and the head keeps its own");
+        assert_eq!(run.admitted(), Admitted::Pass);
+        assert_eq!(overtaken(&p, "cpu").0, 0, "it left the head's cpu");
+        assert!(settled(&p));
+    }
+
+    #[test]
+    fn a_run_that_fits_passes_an_unprotected_head() {
+        let p = pool(&[("cpu", 4 * CPU)]);
+        let _stays = now(&p, &cpus(1));
+        let leaves = now(&p, &cpus(3));
+        let mut head = queued(&p, &cpus(4));
+        let mut waiter = queued(&p, &cpus(1));
+
+        drop(leaves);
+        assert!(granted(&mut head).is_none(), "3 of the 4 it needs are free");
+        let run = granted(&mut waiter).expect("it fits the 3 free");
+        assert_eq!(run.admitted(), Admitted::Pass);
+        assert_eq!(overtaken(&p, "cpu"), (CPU, 16 * CPU), "min(16 × 4, 4 × 4)");
+        assert!(settled(&p));
+    }
+
+    #[test]
+    fn the_walk_serves_the_older_class_first() {
+        let p = pool(&[("cpu", 4 * CPU), ("tokens", 4)]);
+        let _stays = now(&p, &cpus(3));
+        // A shape nobody waits in, so its release is not handed off.
+        let leaves = now(&p, &req(&[("cpu", CPU), ("tokens", 2)]));
+        let _head = queued(&p, &cpus(4));
+        let plain = cpus(1);
+        let token = req(&[("cpu", CPU), ("tokens", 1)]);
+        // The `plain` class is created first, then loses its oldest waiter:
+        // by class id it comes first, by oldest waiter second.
+        let first = queued(&p, &plain);
+        let mut older = queued(&p, &token);
+        let mut younger = queued(&p, &plain);
+        drop(first);
+
+        drop(leaves);
+        let _run = granted(&mut older).expect("one cpu, to the older waiter");
+        assert!(granted(&mut younger).is_none());
+        assert!(settled(&p));
+    }
+
+    #[test]
+    fn a_granted_class_is_tried_again() {
+        let p = pool(&[("cpu", 8 * CPU)]);
+        let _stays = now(&p, &cpus(4));
+        let leaves = now(&p, &cpus(4));
+        let mut head = queued(&p, &cpus(8));
+        let mut waiters: Vec<Acquire> = (0..3).map(|_| queued(&p, &cpus(1))).collect();
+
+        drop(leaves);
+        assert!(granted(&mut head).is_none());
+        let runs: Vec<Reservation> = waiters.iter_mut().filter_map(granted).collect();
+        assert_eq!(runs.len(), 3, "one release admits the class three times");
+        assert_eq!(overtaken(&p, "cpu").0, 3 * CPU);
+        assert_eq!(free(&p, "cpu"), CPU);
+    }
+
+    // ---- Step 1: hand-off -------------------------------------------------
+
+    #[test]
+    fn a_release_goes_to_the_next_waiter_of_its_shape() {
+        let p = pool(&[("cpu", 8 * CPU)]);
+        let wide = now(&p, &cpus(8));
+        let mut narrow: Vec<Acquire> = (0..3).map(|_| queued(&p, &cpus(1))).collect();
+        let mut next_wide = queued(&p, &cpus(8));
+        let before = visited(&p);
+
+        drop(wide);
+        let run = granted(&mut next_wide).expect("the slot stays with its shape");
+        assert_eq!(run.admitted(), Admitted::Handoff);
+        assert!(
+            narrow.iter_mut().all(|w| granted(w).is_none()),
+            "the older narrow runs wait for the next drain"
+        );
+        assert_eq!(overtaken(&p, "cpu"), (8 * CPU, 16 * CPU));
+        assert_eq!(visited(&p), before, "a hand-off walks nothing");
+        assert!(settled(&p));
+    }
+
+    #[test]
+    fn a_hand_off_to_the_head_changes_the_head_and_walks() {
+        let p = pool(&[("cpu", 2 * CPU), ("docker", 1)]);
+        let shape = req(&[("cpu", CPU), ("docker", 1)]);
+        let first = now(&p, &shape);
+        let mut head = queued(&p, &shape);
+        let _next = queued(&p, &cpus(2));
+        // The head waits for `docker` and is overtaken on cpu up to its
+        // limit, min(16 × 1, 4 × 2); the next cpu run is then held back.
+        assert_eq!(passes(&p, &cpus(1)), 8);
+        let mut held_back = queued(&p, &cpus(1));
+        let before = visited(&p);
+
+        drop(first);
+        let run = granted(&mut head).expect("its shape's slot came back");
+        assert_eq!(run.admitted(), Admitted::Head, "the oldest: not charged");
+        let passer = granted(&mut held_back).expect("the new head protects nothing yet");
+        assert_eq!(passer.admitted(), Admitted::Pass);
+        assert!(visited(&p) > before, "a head change walks");
+        assert_eq!(overtaken(&p, "cpu"), (CPU, 8 * CPU), "from zero");
+        assert!(settled(&p));
+    }
+
+    #[test]
+    fn a_hand_off_stops_when_the_head_is_protected() {
+        let p = pool(&[("cpu", 8 * CPU)]);
+        let wide = now(&p, &cpus(8));
+        let mut head = queued(&p, &cpus(1));
+        let mut wides: Vec<Acquire> = (0..3).map(|_| queued(&p, &cpus(8))).collect();
+        let [a, b, c] = wides.as_mut_slice() else {
+            panic!("three");
+        };
+
+        drop(wide);
+        let a = granted(a).expect("first hand-off");
+        assert!(!draining(&p), "8 of 16");
+        drop(a);
+        let b = granted(b).expect("second hand-off");
+        assert!(draining(&p), "16 of 16");
+        assert!(granted(&mut head).is_none());
+        drop(b);
+        assert!(granted(c).is_none(), "the third would take the head's cpu");
+        let head = granted(&mut head).expect("the head starts in the drained pool");
+        assert_eq!(head.admitted(), Admitted::Head);
+        drop(head);
+        assert!(granted(c).is_some(), "then the third");
+    }
+
+    #[test]
+    fn a_clamped_release_hands_off_to_an_unclamped_waiter() {
+        let p = pool(&[("cpu", 8 * CPU)]);
+        let oversize = now(&p, &cpus(16));
+        assert!(oversize.clamped());
+        let _head = queued(&p, &cpus(1));
+        let mut exact = queued(&p, &cpus(8));
+        let mut oversize_too = queued(&p, &cpus(16));
+        assert_eq!(classes(&p), 2, "clamped to 8, it is the shape of an 8");
+
+        drop(oversize);
+        let run = granted(&mut exact).expect("the clamped run's slot");
+        assert_eq!(run.admitted(), Admitted::Handoff);
+        assert!(!run.clamped(), "it asked for what it got");
+        drop(run);
+        let run = granted(&mut oversize_too).expect("and on to the next of the shape");
+        assert!(run.clamped(), "each grant keeps its own flag");
+    }
+
+    /// A managed run's grant is released in two halves, its cpu when the run
+    /// ends and its `sandbox` slot once the sandbox is removed. Each half is
+    /// offered to the shape the run was admitted as, not to the shape of the
+    /// half.
+    #[test]
+    fn each_half_of_a_split_grant_hands_off_to_its_shape() {
+        let p = pool(&[("cpu", 2 * CPU), ("sandbox", 2)]);
+        let slot = [(PoolName::sandbox(), 1)];
+        let mut run = p
+            .acquire_with(&cpus(1), &slot)
+            .unwrap()
+            .now_or_never()
+            .expect("granted at once")
+            .unwrap();
+        let _other = now(&p, &cpus(1));
+        let _head = queued(&p, &cpus(2));
+        let mut next = p.acquire_with(&cpus(1), &slot).unwrap();
+        assert!((&mut next).now_or_never().is_none(), "cpu is full");
+        let removal = run.split_off(PoolName::SANDBOX).expect("the slot");
+        assert_eq!(removal.admitted(), run.admitted());
+        let before = visited(&p);
+
+        drop(run);
+        let next = granted(&mut next).expect("the cpu half goes to the managed waiter");
+        assert_eq!(next.admitted(), Admitted::Handoff);
+        assert_eq!(visited(&p), before);
+        drop(removal);
+        assert_eq!(free(&p, "sandbox"), 1);
+        assert!(settled(&p));
+    }
+
+    // ---- Sized patience ---------------------------------------------------
+
+    #[test]
+    fn the_head_is_protected_at_sixteen_times_its_need() {
+        let p = pool(&[("cpu", 16 * CPU)]);
+        let _stays = now(&p, &cpus(15));
+        let _head = queued(&p, &cpus(2));
+        assert_eq!(passes(&p, &cpus(1)), 32, "16 × 2, under 4 × 16");
+        assert!(draining(&p));
+        assert_eq!(overtaken(&p, "cpu"), (32 * CPU, 32 * CPU));
+        assert_eq!(free(&p, "cpu"), CPU, "the freed cpu stays free");
+        assert!(settled(&p));
+    }
+
+    #[test]
+    fn a_small_head_is_overtaken_less_than_a_wide_one() {
+        // How many runs are handed a slot ahead of a head needing `head`.
+        let overtakes = |head: Demand| {
+            let p = pool(&[("cpu", 4 * CPU), ("tokens", 100)]);
+            let shape = req(&[("cpu", CPU), ("tokens", 1)]);
+            let _stays = now(&p, &cpus(3));
+            let mut running = now(&p, &shape);
+            let mut head = queued(&p, &head);
+            let waiters: Vec<Acquire> = (0..20).map(|_| queued(&p, &shape)).collect();
+            let mut waiters = waiters.into_iter();
+            let mut passed = 0;
+            loop {
+                drop(running);
+                if granted(&mut head).is_some() {
+                    return passed;
+                }
+                let mut next = waiters.next().expect("the head starts before 20 passed");
+                running = granted(&mut next).expect("a hand-off");
+                passed += 1;
+            }
+        };
+        assert_eq!(overtakes(req(&[("cpu", CPU / 10)])), 2, "2 ≥ 16 × 0.1");
+        assert_eq!(overtakes(cpus(1)), 16);
+    }
+
+    #[test]
+    fn a_wide_head_is_capped_at_four_pools() {
+        for head in [cpus(8), cpus(16)] {
+            let p = pool(&[("cpu", 8 * CPU)]);
+            let _stays = now(&p, &cpus(7));
+            let _head = queued(&p, &head);
+            assert_eq!(passes(&p, &cpus(1)), 32, "4 × 8, not 16 × 8");
+            assert_eq!(overtaken(&p, "cpu"), (32 * CPU, 32 * CPU));
+        }
+    }
+
+    #[test]
+    fn the_last_pass_may_overshoot_the_limit() {
+        let p = pool(&[("cpu", 8 * CPU)]);
+        let _stays = now(&p, &cpus(4));
+        let _head = queued(&p, &cpus(8));
+        for _ in 0..31 {
+            drop(now(&p, &cpus(1)));
+        }
+        assert_eq!(overtaken(&p, "cpu"), (31 * CPU, 32 * CPU));
+        drop(now(&p, &cpus(4)));
+        assert_eq!(overtaken(&p, "cpu"), (35 * CPU, 32 * CPU), "plus one grant");
+        let _refused = queued(&p, &cpus(1));
+        assert_eq!(overtaken(&p, "cpu").0, 35 * CPU);
+    }
+
+    #[test]
+    fn a_grant_that_leaves_room_is_never_charged() {
+        let p = pool(&[("cpu", 8 * CPU), ("docker", 1)]);
+        let _docker = now(&p, &req(&[("cpu", 0), ("docker", 1)]));
+        let _head = queued(&p, &req(&[("cpu", CPU), ("docker", 1)]));
+        for _ in 0..200 {
+            // Seven cpu at most: the head's one stays free.
+            let runs: Vec<Reservation> = (0..7).map(|_| now(&p, &cpus(1))).collect();
+            drop(runs);
+        }
+        assert_eq!(overtaken(&p, "cpu").0, 0);
+        assert!(!draining(&p));
+        let mut eighth: Vec<Reservation> = (0..7).map(|_| now(&p, &cpus(1))).collect();
+        eighth.push(now(&p, &cpus(1)));
+        assert_eq!(overtaken(&p, "cpu").0, CPU, "the eighth takes the head's");
+    }
+
+    #[test]
+    fn debt_is_per_pool_and_the_first_limit_protects() {
+        let cpu_run = cpus(1);
+        let mem_run = req(&[("cpu", 0), ("memory", GIB)]);
+        let lane = || {
+            let p = pool(&[("cpu", 2 * CPU), ("memory", 8 * GIB)]);
+            let stays = now(&p, &req(&[("cpu", CPU), ("memory", 6 * GIB)]));
+            let head = queued(&p, &req(&[("cpu", CPU), ("memory", 4 * GIB)]));
+            (p, stays, head)
+        };
+
+        let (p, _stays, _head) = lane();
+        for _ in 0..3 {
+            drop(now(&p, &cpu_run));
+        }
+        for _ in 0..2 {
+            drop(now(&p, &mem_run));
+        }
+        assert_eq!(overtaken(&p, "cpu"), (3 * CPU, 8 * CPU), "cpu runs only");
+        assert_eq!(
+            overtaken(&p, "memory"),
+            (2 * GIB, 32 * GIB),
+            "memory runs only"
+        );
+        assert_eq!(passes(&p, &cpu_run), 5, "cpu reaches its limit first");
+        assert!(draining(&p));
+        assert_eq!(overtaken(&p, "memory").0, 2 * GIB);
+        assert_eq!(passes(&p, &mem_run), 0, "and protects memory too");
+
+        let (p, _stays, _head) = lane();
+        assert_eq!(passes(&p, &mem_run), 32, "here memory does");
+        assert_eq!(overtaken(&p, "cpu").0, 0);
+        assert_eq!(passes(&p, &cpu_run), 0);
+    }
+
+    #[test]
+    fn a_pool_the_head_does_not_need_never_protects_it() {
+        let p = pool(&[("cpu", 8 * CPU), ("docker", 1)]);
+        let docker = req(&[("cpu", 0), ("docker", 1)]);
+        let _held = now(&p, &docker);
+        let _head = queued(&p, &docker);
+        for _ in 0..100 {
+            drop(now(&p, &cpus(8)));
+        }
+        let head = p.snapshot().main.head.unwrap();
+        assert_eq!(
+            head.overtaken,
+            [Overtaken {
+                pool: name("docker"),
+                by: 0,
+                limit: 4,
+            }],
+            "no debt and no limit on cpu, which it does not need"
+        );
+        assert!(!head.draining());
+    }
+
+    #[test]
+    fn a_micro_cpu_head_is_protected_after_one_charged_pass() {
+        let p = pool(&[("cpu", CPU)]);
+        let first = now(&p, &cpus(1));
+        let mut head = queued(&p, &req(&[("cpu", 1)]));
+        let mut second = queued(&p, &cpus(1));
+        let mut third = queued(&p, &cpus(1));
+
+        drop(first);
+        let run = granted(&mut second).expect("handed off");
+        assert_eq!(overtaken(&p, "cpu"), (CPU, 16));
+        assert!(draining(&p));
+        drop(run);
+        assert!(granted(&mut third).is_none(), "refused its shape's slot");
+        let _head = granted(&mut head).expect("which went to the head");
+        assert!(granted(&mut third).is_none(), "one micro-cpu short");
+    }
+
+    // ---- A protected head -------------------------------------------------
+
+    #[test]
+    fn a_protected_head_starts_on_the_release_it_waited_for() {
+        let p = pool(&[("cpu", 8 * CPU)]);
+        let one = now(&p, &cpus(1));
+        let _stays = now(&p, &cpus(6));
+        let mut head = queued(&p, &cpus(2));
+        assert_eq!(passes(&p, &cpus(1)), 32);
+        let mut held_back = queued(&p, &cpus(1));
+
+        drop(one);
+        let run = granted(&mut head).expect("the second cpu it waited for");
+        assert_eq!(run.admitted(), Admitted::Head);
+        assert!(
+            granted(&mut held_back).is_none(),
+            "the slot was its own shape's, and still went to the head"
+        );
+    }
+
+    #[test]
+    fn nothing_takes_from_a_protected_heads_pools() {
+        let p = pool(&[("cpu", 8 * CPU), ("docker", 1)]);
+        let _docker = now(&p, &req(&[("cpu", 0), ("docker", 1)]));
+        let _stays = now(&p, &cpus(4));
+        // Short of `docker` only: its 4 cpu are free.
+        let _head = queued(&p, &req(&[("cpu", 4 * CPU), ("docker", 1)]));
+        assert_eq!(passes(&p, &cpus(1)), 32);
+
+        let waiter = queued(&p, &cpus(1));
+        assert_eq!(free(&p, "cpu"), 4 * CPU, "it would leave 3 of the head's 4");
+        assert!(settled(&p));
+        drop(waiter);
+    }
+
+    #[test]
+    fn the_next_head_starts_with_no_debt() {
+        let p = pool(&[("cpu", 8 * CPU)]);
+        let one = now(&p, &cpus(1));
+        let _stays = now(&p, &cpus(6));
+        let mut first = queued(&p, &cpus(2));
+        let _second = queued(&p, &cpus(3));
+        assert_eq!(passes(&p, &cpus(1)), 32);
+
+        drop(one);
+        let run = granted(&mut first).expect("the protected head");
+        assert_eq!(overtaken(&p, "cpu"), (0, 32 * CPU), "min(16 × 3, 4 × 8)");
+        drop(run);
+        drop(now(&p, &cpus(1)));
+        assert_eq!(overtaken(&p, "cpu").0, CPU, "overtaken again");
+    }
+
+    #[test]
+    fn cancelling_the_head_moves_the_protection() {
+        let p = pool(&[("cpu", 8 * CPU)]);
+        let _stays = now(&p, &cpus(7));
+        let first = queued(&p, &cpus(2));
+        let _second = queued(&p, &cpus(3));
+        assert_eq!(passes(&p, &cpus(1)), 32);
+        let mut held_back = queued(&p, &cpus(1));
+        let behind = queued(&p, &cpus(4));
+        let before = visited(&p);
+
+        drop(behind);
+        assert_eq!(
+            visited(&p),
+            before,
+            "a waiter behind the head tests nothing"
+        );
+        assert!(granted(&mut held_back).is_none());
+
+        drop(first);
+        let run = granted(&mut held_back).expect("the new head protects nothing yet");
+        assert_eq!(run.admitted(), Admitted::Pass);
+        assert!(visited(&p) > before, "the head leaving walks");
+        assert_eq!(overtaken(&p, "cpu"), (CPU, 32 * CPU), "from zero");
+        assert!(settled(&p));
+    }
+
+    // ---- Classes ----------------------------------------------------------
+
+    #[test]
+    fn one_shape_is_granted_in_arrival_order() {
+        use std::collections::VecDeque;
+        let p = pool(&[("cpu", 4 * CPU)]);
+        let mut running: VecDeque<Reservation> = (0..4).map(|_| now(&p, &cpus(1))).collect();
+        let mut ones = VecDeque::new();
+        let mut twos = VecDeque::new();
+        for wide in [false, true, false, false, true, false, false, true, false] {
+            if wide {
+                twos.push_back(queued(&p, &cpus(2)));
+            } else {
+                ones.push_back(queued(&p, &cpus(1)));
+            }
+        }
+        let mut rounds = 0;
+        while !ones.is_empty() || !twos.is_empty() {
+            drop(
+                running
+                    .pop_front()
+                    .expect("something runs while something waits"),
+            );
+            for class in [&mut ones, &mut twos] {
+                // The granted ones are the oldest of the class.
+                while let Some(run) = class.front_mut().and_then(granted) {
+                    running.push_back(run);
+                    class.pop_front();
+                }
+                assert!(
+                    class.iter_mut().all(|w| granted(w).is_none()),
+                    "a younger waiter started first"
+                );
+            }
+            assert!(settled(&p));
+            rounds += 1;
+            assert!(rounds < 100, "the queue does not drain");
+        }
+    }
+
+    #[test]
+    fn a_need_is_one_shape_whatever_its_pool_order() {
+        let p = pool(&[("cpu", 4 * CPU), ("docker", 1)]);
+        // `cpu` is appended after `docker` in the first, declared before it
+        // in the second.
+        let implicit_cpu = req(&[("docker", 1)]);
+        let declared_cpu = req(&[("cpu", CPU), ("docker", 1)]);
+        let running = now(&p, &declared_cpu);
+        let _stays = now(&p, &cpus(3));
+        let _head = queued(&p, &cpus(4));
+        let mut older = queued(&p, &implicit_cpu);
+        let mut younger = queued(&p, &declared_cpu);
+        assert_eq!(classes(&p), 2, "the head's and one for both spellings");
+
+        drop(running);
+        let run = granted(&mut older).expect("the slot of the other spelling");
+        assert_eq!(run.admitted(), Admitted::Handoff);
+        assert!(granted(&mut younger).is_none(), "never ahead of the older");
+        drop(run);
+        let run = granted(&mut younger).expect("and back");
+        assert_eq!(run.admitted(), Admitted::Handoff);
+    }
+
+    #[test]
+    fn shapes_differing_on_an_unbounded_pool_are_two_classes() {
+        let p = ResourcePool::new([
+            (name("cpu"), Limit::Bounded(CPU)),
+            (name("tokens"), Limit::Unbounded),
+        ]);
+        let running = now(&p, &cpus(1));
+        let mut three = queued(&p, &req(&[("tokens", 3)]));
+        let mut five = queued(&p, &req(&[("tokens", 5)]));
+        assert_eq!(classes(&p), 2);
+
+        drop(running);
+        let run = granted(&mut three).unwrap();
+        assert_eq!(run.amount("tokens"), 3);
+        drop(run);
+        let run = granted(&mut five).unwrap();
+        assert_eq!(run.amount("tokens"), 5, "told its own amount");
+    }
+
+    #[test]
+    fn a_waiter_of_the_heads_shape_never_passes_it() {
+        let p = pool(&[("cpu", 4 * CPU)]);
+        let running = now(&p, &cpus(2));
+        let _stays = now(&p, &cpus(2));
+        let mut head = queued(&p, &cpus(2));
+        let mut same = queued(&p, &cpus(2));
+        assert_eq!(classes(&p), 1);
+
+        drop(running);
+        assert!(granted(&mut same).is_none());
+        let run = granted(&mut head).expect("its shape's slot goes to the oldest");
+        assert_eq!(run.admitted(), Admitted::Head);
+        drop(run);
+        assert!(granted(&mut same).is_some());
+    }
+
+    #[test]
+    fn cancelling_within_a_class_leaves_no_entry() {
+        let p = pool(&[("cpu", 3 * CPU)]);
+        let _stays = now(&p, &cpus(2));
+        let one = now(&p, &cpus(1));
+        let head = queued(&p, &cpus(3));
+        let [oldest, mut second, middle, mut last] = [(); 4].map(|()| queued(&p, &cpus(1)));
+        assert_eq!(classes(&p), 2);
+
+        drop(oldest);
+        drop(middle);
+        drop(one);
+        let run = granted(&mut second).expect("the oldest that remains");
+        assert_eq!(run.admitted(), Admitted::Handoff);
+        assert!(granted(&mut last).is_none());
+
+        drop(last);
+        assert_eq!(classes(&p), 1, "its last waiter took the class with it");
+        drop(run);
+        let fresh = now(&p, &cpus(1));
+        assert_eq!(fresh.admitted(), Admitted::Pass, "judged alone, afresh");
+
+        drop(head);
+        assert_eq!(classes(&p), 0);
+        assert_eq!(p.snapshot().main.queued, 0);
+    }
+
+    // ---- Arrivals ---------------------------------------------------------
+
+    #[test]
+    fn an_arrival_passes_like_a_queued_run() {
+        let p = pool(&[("cpu", 4 * CPU)]);
+        let _stays = now(&p, &cpus(3));
+        let _head = queued(&p, &cpus(2));
+        let run = now(&p, &cpus(1));
+        assert_eq!(run.admitted(), Admitted::Pass);
+        assert_eq!(
+            overtaken(&p, "cpu"),
+            (CPU, 16 * CPU),
+            "charged like any pass"
+        );
+        assert_eq!(classes(&p), 1, "it never queued");
+    }
+
+    #[test]
+    fn an_arrival_queues_behind_its_own_shape() {
+        let p = pool(&[("cpu", 8 * CPU), ("docker", 1)]);
+        let _docker = now(&p, &req(&[("cpu", 0), ("docker", 1)]));
+        let _stays = now(&p, &cpus(4));
+        let head = queued(&p, &req(&[("cpu", 4 * CPU), ("docker", 1)]));
+        assert_eq!(passes(&p, &cpus(1)), 32);
+        let mut older = queued(&p, &cpus(1));
+        let before = visited(&p);
+
+        // Four cpu are free. Its shape waits, so it queues behind it.
+        let mut arrival = queued(&p, &cpus(1));
+        assert_eq!(classes(&p), 2);
+        assert_eq!(arrival.wait_info().unwrap().ahead, 2);
+        assert_eq!(visited(&p), before);
+
+        drop(head);
+        assert!(granted(&mut older).is_some());
+        assert!(granted(&mut arrival).is_some());
+    }
+
+    // ---- When the walk runs, and how far ----------------------------------
+
+    #[test]
+    fn a_full_hand_off_does_not_walk() {
+        let p = pool(&[("cpu", 8 * CPU), ("docker", 1)]);
+        let _docker = now(&p, &req(&[("cpu", 0), ("docker", 1)]));
+        let running = now(&p, &cpus(4));
+        let _stays = now(&p, &cpus(4));
+        let _head = queued(&p, &req(&[("cpu", CPU), ("docker", 1)]));
+        let mut same = queued(&p, &cpus(4));
+        let _same_too = queued(&p, &cpus(4));
+        let _others = [queued(&p, &cpus(2)), queued(&p, &cpus(3))];
+        let before = visited(&p);
+
+        drop(running);
+        assert!(granted(&mut same).is_some());
+        assert_eq!(visited(&p), before, "no other class was tested");
+        assert!(settled(&p), "and none had to be");
+    }
+
+    #[test]
+    fn an_unbounded_release_does_not_walk() {
+        let p = ResourcePool::new([
+            (name("cpu"), Limit::Bounded(2 * CPU)),
+            (name("tokens"), Limit::Unbounded),
+        ]);
+        let tokens = now(&p, &req(&[("cpu", 0), ("tokens", 5)]));
+        let _stays = now(&p, &cpus(2));
+        let mut waiters = [queued(&p, &cpus(2)), queued(&p, &cpus(1))];
+        let before = visited(&p);
+
+        drop(tokens);
+        assert_eq!(visited(&p), before);
+        assert!(waiters.iter_mut().all(|w| granted(w).is_none()));
+    }
+
+    #[test]
+    fn a_refused_shape_is_tested_once_per_walk() {
+        let p = pool(&[("cpu", 8 * CPU)]);
+        let _stays = now(&p, &cpus(7));
+        let one = now(&p, &cpus(1));
+        let mut waiters: Vec<Acquire> = (0..1000).map(|i| queued(&p, &cpus(2 + i % 3))).collect();
+        assert_eq!(classes(&p), 3);
+        let before = visited(&p);
+
+        drop(one);
+        assert_eq!(
+            visited(&p) - before,
+            2,
+            "the two shapes that are not the head's"
+        );
+        assert!(waiters.iter_mut().all(|w| granted(w).is_none()));
+    }
+
+    #[test]
+    fn a_walk_refuses_at_most_64_shapes() {
+        for shapes in [100, 1000] {
+            let p = pool(&[("cpu", 8 * CPU)]);
+            let _stays = now(&p, &cpus(7));
+            let mut one = Some(now(&p, &cpus(1)));
+            // Every waiter its own shape, none of which fits one cpu.
+            let shape = |i: u64| req(&[("cpu", 2 * CPU + i)]);
+            let mut waiters: std::collections::VecDeque<Acquire> =
+                (0..shapes).map(|i| queued(&p, &shape(i))).collect();
+            assert_eq!(classes(&p), shapes as usize);
+            let tested = |event: &mut dyn FnMut()| {
+                let before = visited(&p);
+                event();
+                visited(&p) - before
+            };
+
+            assert_eq!(tested(&mut || drop(one.take())), 64, "a release");
+            let mut arrival = None;
+            let n = tested(&mut || arrival = Some(queued(&p, &shape(shapes))));
+            assert!(n <= 64, "an arrival continues the walk: {n}");
+            let n = tested(&mut || drop(waiters.pop_front()));
+            assert!(n <= 64, "a head change: {n}");
+            let n = tested(&mut || drop(waiters.pop_back()));
+            assert!(n <= 64, "a cancellation behind the head: {n}");
+            let mut passer = None;
+            let n = tested(&mut || passer = Some(now(&p, &req(&[("cpu", CPU / 2)]))));
+            assert!(n <= 64, "an arrival that passes: {n}");
+            let n = tested(&mut || drop(passer.take()));
+            assert!(n <= 64, "and its release: {n}");
+        }
+    }
+
+    #[test]
+    fn an_unfinished_walk_resumes_on_the_next_event() {
+        let p = pool(&[("cpu", 8 * CPU), ("tokens", 2)]);
+        let tokens = now(&p, &req(&[("cpu", 0), ("tokens", 2)]));
+        let running = now(&p, &cpus(4));
+        let _stays = now(&p, &cpus(4));
+        let _head = queued(&p, &cpus(8));
+        // 64 classes that never fit, then the one that will.
+        let _never: Vec<Acquire> = (1..=64)
+            .map(|i| queued(&p, &req(&[("cpu", 2 * CPU + i)])))
+            .collect();
+        let mut fits_later = queued(&p, &req(&[("cpu", 0), ("tokens", 1)]));
+        let mut same = queued(&p, &cpus(4));
+        let before = visited(&p);
+
+        drop(tokens);
+        assert_eq!(visited(&p) - before, 64, "the walk stopped at its cap");
+        assert!(
+            granted(&mut fits_later).is_none(),
+            "the 65th class was not reached"
+        );
+
+        drop(running);
+        assert!(
+            granted(&mut same).is_some(),
+            "a hand-off, which walks nothing"
+        );
+        let run = granted(&mut fits_later).expect("but continues an unfinished walk");
+        assert_eq!(run.admitted(), Admitted::Pass);
+        assert!(!draining(&p), "long before the head is protected");
+    }
+
+    #[test]
+    fn the_zero_cost_fast_path_creates_no_class() {
+        let p = ResourcePool::new([
+            (name("cpu"), Limit::Bounded(CPU)),
+            (name("tokens"), Limit::Unbounded),
+        ]);
+        let _stays = now(&p, &cpus(1));
+        let _head = queued(&p, &cpus(1));
+
+        // Nothing at all: granted and returned without the lane's lock,
+        // which this thread holds.
+        let lock = p.main.state.lock();
+        let nothing = p
+            .acquire(&req(&[("cpu", 0)]))
+            .unwrap()
+            .now_or_never()
+            .expect("granted at once")
+            .unwrap();
+        assert_eq!(nothing.admitted(), Admitted::Arrival);
+        drop(nothing);
+        drop(lock);
+
+        let unbounded = now(&p, &req(&[("cpu", 0), ("tokens", 5)]));
+        assert_eq!(classes(&p), 1, "only the head's");
+        drop(unbounded);
+        assert_eq!(classes(&p), 1);
+    }
+
+    #[test]
+    fn a_dropped_receiver_is_not_charged() {
+        // A hand-off: the slot's shape has a waiter that is gone, then one
+        // that is there.
+        let p = pool(&[("cpu", 4 * CPU)]);
+        let _stays = now(&p, &cpus(3));
+        let one = now(&p, &cpus(1));
+        let _head = queued(&p, &cpus(4));
+        let _gone = dead(queued(&p, &cpus(1)));
+        let mut there = queued(&p, &cpus(1));
+        drop(one);
+        let run = granted(&mut there).expect("the next of the class");
+        assert_eq!(run.admitted(), Admitted::Handoff);
+        assert_eq!(overtaken(&p, "cpu").0, CPU, "charged once");
+        assert_eq!(free(&p, "cpu"), 0, "and held once");
+        assert_eq!(classes(&p), 1);
+
+        // A pass, from the walk.
+        let p = pool(&[("cpu", 4 * CPU)]);
+        let _stays = now(&p, &cpus(2));
+        let two = now(&p, &cpus(2));
+        let _head = queued(&p, &cpus(4));
+        let _gone = dead(queued(&p, &cpus(1)));
+        let mut there = queued(&p, &cpus(1));
+        drop(two);
+        let run = granted(&mut there).expect("the next of the class");
+        assert_eq!(run.admitted(), Admitted::Pass);
+        assert_eq!(overtaken(&p, "cpu").0, CPU);
+        assert_eq!(free(&p, "cpu"), CPU);
+
+        // The head itself: the next oldest becomes the head, and is granted.
+        let p = pool(&[("cpu", CPU)]);
+        let one = now(&p, &cpus(1));
+        let _gone = dead(queued(&p, &cpus(1)));
+        let mut there = queued(&p, &cpus(1));
+        drop(one);
+        assert_eq!(granted(&mut there).unwrap().admitted(), Admitted::Head);
+    }
+
+    // ---- What a wait and a start say --------------------------------------
+
+    #[test]
+    fn a_reservation_says_how_it_was_admitted() {
+        let p = pool(&[("cpu", 4 * CPU)]);
+        let first = now(&p, &cpus(4));
+        assert_eq!(first.admitted(), Admitted::Arrival);
+        assert_eq!(now(&p, &req(&[("cpu", 0)])).admitted(), Admitted::Arrival);
+
+        let mut head = queued(&p, &cpus(3));
+        let mut same = queued(&p, &cpus(4));
+        drop(first);
+        let handed = granted(&mut same).unwrap();
+        assert_eq!(handed.admitted(), Admitted::Handoff);
+        drop(handed);
+        let mut oldest = granted(&mut head).unwrap();
+        assert_eq!(oldest.admitted(), Admitted::Head);
+        assert_eq!(
+            oldest.split_off("cpu").unwrap().admitted(),
+            Admitted::Head,
+            "a half says what the whole did"
+        );
+        drop(oldest);
+
+        let _stays = now(&p, &cpus(3));
+        let _head = queued(&p, &cpus(2));
+        assert_eq!(now(&p, &cpus(1)).admitted(), Admitted::Pass);
+    }
+
+    #[test]
+    fn the_head_snapshot_reports_debt_and_limit() {
+        let p = ResourcePool::new([
+            (name("cpu"), Limit::Bounded(4 * CPU)),
+            (name("tokens"), Limit::Unbounded),
+        ]);
+        let _stays = now(&p, &cpus(3));
+        let _head = queued(&p, &req(&[("cpu", 2 * CPU), ("tokens", 1)]));
+        for passed in 1..=16 {
+            let head = p.snapshot().main.head.unwrap();
+            assert!(!head.draining());
+            drop(now(&p, &cpus(1)));
+            assert_eq!(
+                p.snapshot().main.head.unwrap().overtaken,
+                [Overtaken {
+                    pool: name("cpu"),
+                    by: passed * CPU,
+                    limit: 16 * CPU,
+                }],
+                "nothing for the unbounded pool"
+            );
+        }
+        assert!(draining(&p));
+    }
+
+    #[test]
+    fn a_waiter_held_back_for_the_head_says_what_it_yields_to() {
+        let p = pool(&[("cpu", 8 * CPU), ("docker", 1)]);
+        let _docker = now(&p, &req(&[("cpu", 0), ("docker", 1)]));
+        let _stays = now(&p, &cpus(4));
+        let head = queued(&p, &req(&[("cpu", 4 * CPU), ("docker", 1)]));
+        let too_wide = queued(&p, &cpus(6));
+        assert_eq!(passes(&p, &cpus(1)), 32);
+        let fits = queued(&p, &cpus(1));
+
+        assert_eq!(
+            fits.wait_info().unwrap().yielding_to,
+            Some(YieldingTo {
+                pool: name("cpu"),
+                need: 4 * CPU,
+            })
+        );
+        assert_eq!(head.wait_info().unwrap().yielding_to, None, "the head");
+        assert_eq!(
+            too_wide.wait_info().unwrap().yielding_to,
+            None,
+            "it waits for cpu, not for the head"
+        );
+    }
+
+    #[test]
+    fn ahead_counts_earlier_waiters_after_passes() {
+        let p = pool(&[("cpu", 4 * CPU)]);
+        let _stays = now(&p, &cpus(3));
+        let head = queued(&p, &cpus(2));
+        let second = queued(&p, &cpus(3));
+        let passer = now(&p, &cpus(1));
+        let third = queued(&p, &cpus(4));
+        let mut fourth = queued(&p, &cpus(1));
+        let ahead = |a: &Acquire| a.wait_info().unwrap().ahead;
+        assert_eq!([&head, &second, &third, &fourth].map(ahead), [0, 1, 2, 3]);
+
+        drop(passer);
+        let _run = granted(&mut fourth).expect("the youngest starts first");
+        assert_eq!([&head, &second, &third].map(ahead), [0, 1, 2]);
+        assert_eq!(ahead(&queued(&p, &cpus(1))), 3, "the three older waiters");
+    }
+
+    // ---- Scripts ----------------------------------------------------------
+
+    /// Where one request of a [`Script`] stands.
+    enum Slot {
+        Waiting(Acquire),
+        Held(Reservation),
+        Over,
+    }
+
+    /// A lane driven by a seeded sequence of arrivals, releases and
+    /// cancellations, with what the test knows of every request.
+    struct Script {
+        pool: Arc<ResourcePool>,
+        shapes: Vec<Demand>,
+        /// Each of `shapes` as the lane resolves it: two that resolve alike
+        /// are one shape.
+        resolved: Vec<Vec<(usize, u64)>>,
+        /// Every request in arrival order: its shape and where it stands.
+        slots: Vec<(usize, Slot)>,
+        /// Every grant: the request and how it was admitted.
+        log: Vec<(usize, Admitted)>,
+        /// The head after the last event, when it was draining: its request
+        /// and its debts.
+        drained: Option<(usize, Vec<Overtaken>)>,
+    }
+
+    impl Script {
+        fn new(pool: Arc<ResourcePool>, shapes: Vec<Demand>) -> Self {
+            let resolved = shapes
+                .iter()
+                .map(|s| {
+                    let (mut need, _) = pool.resolve(s, &[]).unwrap();
+                    need.sort_unstable();
+                    need
+                })
+                .collect();
+            Self {
+                pool,
+                shapes,
+                resolved,
+                slots: Vec::new(),
+                log: Vec::new(),
+                drained: None,
+            }
+        }
+
+        fn count(&self, held: bool) -> usize {
+            self.slots
+                .iter()
+                .filter(|(_, s)| match s {
+                    Slot::Waiting(_) => !held,
+                    Slot::Held(_) => held,
+                    Slot::Over => false,
+                })
+                .count()
+        }
+
+        fn arrive(&mut self, shape: usize) {
+            let acquire = self.pool.acquire(&self.shapes[shape]).unwrap();
+            self.slots.push((shape, Slot::Waiting(acquire)));
+            self.observe();
+        }
+
+        /// Release the `nth` live grant, or cancel the `nth` waiter.
+        fn end(&mut self, nth: usize, held: bool) {
+            let slot = self
+                .slots
+                .iter_mut()
+                .filter(|(_, s)| match s {
+                    Slot::Waiting(_) => !held,
+                    Slot::Held(_) => held,
+                    Slot::Over => false,
+                })
+                .nth(nth)
+                .expect("a live request");
+            slot.1 = Slot::Over;
+            self.observe();
+        }
+
+        /// Note every waiter that was granted, oldest first, and check that
+        /// none started ahead of an older waiter of its shape (I4).
+        fn observe(&mut self) {
+            for i in 0..self.slots.len() {
+                let (older, rest) = self.slots.split_at_mut(i);
+                let (shape, slot) = &mut rest[0];
+                let Slot::Waiting(acquire) = slot else {
+                    continue;
+                };
+                let Some(run) = granted(acquire) else {
+                    continue;
+                };
+                let alike = &self.resolved[*shape];
+                assert!(
+                    !older.iter().any(|(s, slot)| {
+                        matches!(slot, Slot::Waiting(_)) && &self.resolved[*s] == alike
+                    }),
+                    "request {i} started ahead of an older one of its shape"
+                );
+                self.log.push((i, run.admitted()));
+                *slot = Slot::Held(run);
+            }
+        }
+
+        /// The invariants that hold after every event.
+        fn check(&mut self) {
+            let snap = self.pool.snapshot().main;
+            assert_eq!(snap.queued, self.count(false));
+            for pool in &snap.pools {
+                let live: u64 = self
+                    .slots
+                    .iter()
+                    .filter_map(|(_, s)| match s {
+                        Slot::Held(run) => Some(run.amount(pool.pool.as_str())),
+                        _ => None,
+                    })
+                    .sum();
+                assert_eq!(pool.held, live, "{}: held is the live grants", pool.pool);
+                if let Limit::Bounded(capacity) = pool.capacity {
+                    assert!(pool.held <= capacity, "{} is over capacity", pool.pool);
+                }
+            }
+            let head = self
+                .slots
+                .iter()
+                .position(|(_, s)| matches!(s, Slot::Waiting(_)));
+            let was = self.drained.take();
+            if let Some((head, snap)) = head.zip(snap.head) {
+                for o in &snap.overtaken {
+                    // I1: its limit plus one grant, the widest there is.
+                    let idx = self.pool.main.index(o.pool.as_str()).unwrap();
+                    let widest = self
+                        .resolved
+                        .iter()
+                        .map(|shape| amount_in(shape, idx))
+                        .max()
+                        .unwrap_or(0);
+                    assert!(o.by < o.limit + widest, "{o:?} is past its limit");
+                }
+                if let Some((_, debts)) = was.filter(|&(request, _)| request == head) {
+                    assert_eq!(debts, snap.overtaken, "I2: a protected head is passed");
+                }
+                if snap.draining() {
+                    self.drained = Some((head, snap.overtaken));
+                }
+            }
+            assert!(settled(&self.pool), "a full walk would grant something");
+        }
+
+        /// `events` seeded events, the invariants checked after each, then
+        /// releases until the queue is empty.
+        fn run(&mut self, seed: u64, events: usize) {
+            let mut rng = Rng(seed);
+            for _ in 0..events {
+                let (held, waiting) = (self.count(true), self.count(false));
+                match rng.below(20) {
+                    0..=6 if held > 0 => self.end(rng.below(held), true),
+                    7..=9 if waiting > 0 => self.end(rng.below(waiting), false),
+                    _ => self.arrive(rng.below(self.shapes.len())),
+                }
+                self.check();
+            }
+            while self.count(false) > 0 {
+                assert!(self.count(true) > 0, "waiters, and nothing to release");
+                self.end(0, true);
+                self.check();
+            }
+            self.slots.clear();
+            for pool in self.pool.snapshot().main.pools {
+                assert_eq!(pool.held, 0, "{} came back", pool.pool);
+            }
+            assert_eq!(classes(&self.pool), 0);
+        }
+    }
+
+    #[test]
+    fn random_events_keep_the_invariants() {
+        for seed in 0..40 {
+            let pool = ResourcePool::new([
+                (name("cpu"), Limit::Bounded(8 * CPU)),
+                (name("docker"), Limit::Bounded(2)),
+                (name("memory"), Limit::Bounded(16 * GIB)),
+                (name("tokens"), Limit::Unbounded),
+            ]);
+            let shapes = vec![
+                req(&[("cpu", CPU / 10)]),
+                req(&[("cpu", CPU / 2)]),
+                cpus(1),
+                cpus(2),
+                cpus(4),
+                cpus(8),
+                cpus(16),
+                req(&[("memory", 4 * GIB)]),
+                req(&[("memory", 16 * GIB)]),
+                req(&[("cpu", 0), ("docker", 1)]),
+                req(&[("cpu", 2 * CPU), ("docker", 1)]),
+                req(&[("docker", 1), ("cpu", 2 * CPU)]),
+                req(&[("tokens", 3)]),
+                req(&[("tokens", 5)]),
+                req(&[("cpu", 4 * CPU), ("memory", 8 * GIB), ("docker", 2)]),
+            ];
+            let mut script = Script::new(pool, shapes);
+            script.run(seed, 600);
+            let how = |a| script.log.iter().filter(|&&(_, x)| x == a).count();
+            assert!(
+                [
+                    Admitted::Arrival,
+                    Admitted::Head,
+                    Admitted::Handoff,
+                    Admitted::Pass
+                ]
+                .into_iter()
+                .all(|a| how(a) > 0),
+                "seed {seed} never took one of the four ways in"
+            );
+        }
+    }
+
+    #[test]
+    fn grants_are_deterministic() {
+        let run = || {
+            let pool = pool(&[("cpu", 8 * CPU), ("docker", 2)]);
+            let mut shapes: Vec<Demand> = (1..=20).map(|i| req(&[("cpu", i * CPU / 4)])).collect();
+            shapes.extend((1..=4).map(|i| req(&[("cpu", i * CPU), ("docker", 1)])));
+            let mut script = Script::new(pool, shapes);
+            script.run(11, 2000);
+            script.log
+        };
+        let (first, second) = (run(), run());
+        assert!(first.len() > 500, "{} grants", first.len());
+        assert_eq!(first, second);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn mixed_shapes_with_aborts_return_everything() {
+        let p = pool(&[("cpu", 4 * CPU), ("docker", 1), ("memory", 8 * GIB)]);
+        let shapes = [
+            cpus(1),
+            cpus(2),
+            cpus(4),
+            req(&[("cpu", CPU / 10)]),
+            req(&[("docker", 1)]),
+            req(&[("memory", 6 * GIB)]),
+            req(&[("cpu", 0), ("memory", 4 * GIB)]),
+        ];
+        let mut rng = Rng(7);
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut handles = Vec::new();
+        for shape in shapes.iter().cycle().take(600) {
+            let p = Arc::clone(&p);
+            let shape = shape.clone();
+            let yields = rng.below(4);
+            handles.push(tasks.spawn(async move {
+                let run = p.acquire(&shape).unwrap().await.unwrap();
+                for _ in 0..yields {
+                    tokio::task::yield_now().await;
+                }
+                drop(run);
+            }));
+        }
+        for handle in &handles {
+            if rng.below(3) == 0 {
+                handle.abort();
+                tokio::task::yield_now().await;
+            }
+        }
+        let done = tokio::time::timeout(Duration::from_secs(60), async {
+            while let Some(joined) = tasks.join_next().await {
+                if let Err(e) = joined {
+                    assert!(e.is_cancelled(), "{e}");
+                }
+            }
+        })
+        .await;
+        assert!(done.is_ok(), "waiters starved");
+        assert_eq!(
+            (free(&p, "cpu"), free(&p, "docker"), free(&p, "memory")),
+            (4 * CPU, 1, 8 * GIB)
+        );
+        assert_eq!(p.snapshot().main.queued, 0);
+        assert_eq!(classes(&p), 0);
     }
 }
