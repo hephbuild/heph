@@ -231,6 +231,20 @@ not the codegen mode, not the bytes a failure keeps — and `in_place` now write
 back after an exit code from 1 to 127, so an `in_place` transform must be
 idempotent.
 
+### Sessions
+
+Every heph process running under `tui::run_app` records itself to
+`~/.heph/sessions/<id>/` (`meta.json`, a `lock` held while alive,
+`events.ndjson`, `status.json`), so another terminal can `heph session
+list|show|attach|inflight` it. `HEPH_NO_SESSION=1` turns it off; the
+`crates/bin-e2e` `sessions` files test it as a second terminal would.
+
+Read `docs/SESSIONS.md` before touching it. The one thing to know going in:
+recording must **never change or slow the build** — a recorder failure stops
+the recorder, not the run — and the session id must **never reach a target's
+environment** (no `set_var`: a session runner or `pass_env = ["*"]` would
+carry it into targets).
+
 ### The BUILD-file LSP
 
 `heph tool build-lsp` (`crates/plugin-buildfile/src/pluginbuildfile/lsp`) owns its
