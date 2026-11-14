@@ -24,6 +24,7 @@
 //! into targets.
 
 pub mod cleanup;
+pub mod feed;
 pub mod format;
 pub mod holder;
 pub mod id;
@@ -42,9 +43,11 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
+pub use feed::{Routed, SessionFeed};
 pub use format::{
-    CAPABILITY_INFLIGHT, HeaderKind, META_FORMAT, SNAPSHOT_VERSION, SessionHeader, SessionMeta,
-    SessionRecord, SessionRecordKind, SessionSnapshot, files,
+    ApprovalPrompt, ApprovalPromptNotice, CAPABILITY_INFLIGHT, HeaderKind, META_FORMAT,
+    SNAPSHOT_VERSION, SessionHeader, SessionMeta, SessionRecord, SessionRecordKind,
+    SessionSnapshot, files,
 };
 pub use holder::{HolderNames, holder_session};
 pub use id::SessionId;
@@ -407,6 +410,25 @@ impl SessionSlot {
     pub fn record_inflight_written(&self) {
         if let Some(tap) = self.with(|s| s.session.as_ref().map(|x| x.tap())) {
             tap.inflight_written();
+        }
+    }
+
+    /// Record text the process just wrote straight to its terminal (the
+    /// failure report), so an attached viewer prints it too. One channel push;
+    /// nothing when no session is open or its recording stopped.
+    pub fn record_output(&self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if let Some(tap) = self.with(|s| s.session.as_ref().map(|x| x.tap()))
+            && !tap.is_stopped()
+        {
+            tap.view(
+                hcore::events::now_unix_ms(),
+                SessionRecordKind::Output {
+                    text: text.to_owned(),
+                },
+            );
         }
     }
 

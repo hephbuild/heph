@@ -65,6 +65,11 @@ enum Msg {
     InflightWritten {
         at_unix_ms: u64,
     },
+    /// A view record (`Label`, `Approval`, `Finished`, `Output`).
+    View {
+        at_unix_ms: u64,
+        kind: SessionRecordKind,
+    },
     End {
         at_unix_ms: u64,
         exit_code: Option<i32>,
@@ -151,6 +156,14 @@ impl SessionTap {
             level,
             msg,
         });
+    }
+
+    /// Record what the terminal showed besides build events and log lines,
+    /// so a viewer draws the same UI: a label change, the approval prompt,
+    /// the teardown instant, a failure report. `at_unix_ms` is the instant
+    /// it stands for (a `Finished`'s is the clock the summary used).
+    pub fn view(&self, at_unix_ms: u64, kind: SessionRecordKind) {
+        self.send(Msg::View { at_unix_ms, kind });
     }
 
     /// Record that `inflight.txt` was just rewritten.
@@ -463,6 +476,15 @@ impl RecorderThread {
                     SessionRecordKind::InflightWritten,
                 ))
                 .and_then(|()| self.flush()),
+            // `Finished` is small and tells a viewer when the summary was
+            // measured, so it outlives the cap like `End`.
+            Msg::View {
+                at_unix_ms,
+                kind: kind @ SessionRecordKind::Finished,
+            } => self.append(&SessionRecord::session(at_unix_ms, kind)),
+            Msg::View { at_unix_ms, kind } => {
+                self.append_capped(&SessionRecord::session(at_unix_ms, kind))
+            }
             Msg::End {
                 at_unix_ms,
                 exit_code,

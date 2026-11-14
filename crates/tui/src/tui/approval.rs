@@ -100,6 +100,25 @@ impl ApprovalCenter {
         })
     }
 
+    /// The active prompt as a session records it: no notice content, no
+    /// responder. `None` when idle, without allocating.
+    pub fn prompt(&self) -> Option<crate::tui::session::ApprovalPrompt> {
+        let inner = self.lock();
+        let front = inner.queue.front()?;
+        Some(crate::tui::session::ApprovalPrompt {
+            addr: front.addr.clone(),
+            queued_behind: u64::try_from(inner.queue.len().saturating_sub(1)).unwrap_or(u64::MAX),
+            notices: front
+                .notices
+                .iter()
+                .map(|n| crate::tui::session::ApprovalPromptNotice {
+                    name: n.name.clone(),
+                    path: n.path.clone(),
+                })
+                .collect(),
+        })
+    }
+
     /// Expand/collapse the active prompt's notice body (Enter).
     pub fn toggle_expanded(&self) {
         let mut inner = self.lock();

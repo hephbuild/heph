@@ -214,13 +214,58 @@ pub enum SessionRecordKind {
         panicked: bool,
     },
     /// `events.ndjson` reached its size cap; no build event or log line follows
-    /// (`End` and `InflightWritten` still do). `status.json` keeps updating.
+    /// (`End`, `InflightWritten` and `Finished` still do). `status.json` keeps updating.
     Truncated,
     /// The owner answered an in-flight request: `inflight.txt` is fresh.
     InflightWritten,
+    /// The TUI's label changed mid-run (`heph run` learning it invokes an
+    /// entrypoint): `meta.json`'s `label` is only the first one.
+    Label {
+        #[serde(default)]
+        label: String,
+    },
+    /// The approval prompt the TUI shows, or `None` once none is pending. The
+    /// prompt's keys act on the run, so a viewer shows it without them; a
+    /// notice's content stays out (its path is shown).
+    Approval {
+        #[serde(default)]
+        prompt: Option<Box<ApprovalPrompt>>,
+    },
+    /// The TUI was torn down at `at_unix_ms`, the instant its final summary
+    /// measured the elapsed time against. What follows (`Log`, `Output`) the
+    /// terminal printed below that summary.
+    Finished,
+    /// Text the process wrote straight to its terminal rather than through
+    /// the log: the rendered failure report. Stored verbatim, like `Log`.
+    Output {
+        #[serde(default)]
+        text: String,
+    },
     /// A record a newer heph writes.
     #[serde(other)]
     Unknown,
+}
+
+/// A pending approval prompt as [`SessionRecordKind::Approval`] records it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalPrompt {
+    #[serde(default)]
+    pub addr: String,
+    /// Prompts queued behind this one.
+    #[serde(default)]
+    pub queued_behind: u64,
+    /// Each notice the target declares, as `(name, path)`.
+    #[serde(default)]
+    pub notices: Vec<ApprovalPromptNotice>,
+}
+
+/// One notice of an [`ApprovalPrompt`]: where to read it, not what it says.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalPromptNotice {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub path: String,
 }
 
 /// `status.json`, a viewer's `--json`, and later a daemon's reply: what the
