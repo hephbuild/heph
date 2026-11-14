@@ -134,8 +134,13 @@ fn row(buf: &Buffer, y: u16) -> String {
 
 /// The view's frame as the terminal shows it: one string per row.
 fn draw(view: &TuiProgressView) -> Vec<String> {
-    let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).expect("terminal");
-    let lines = view.render("⠋", NOW, WIDTH, HEIGHT);
+    draw_at(view, WIDTH)
+}
+
+/// [`draw`] on a terminal `width` columns wide.
+fn draw_at(view: &TuiProgressView, width: u16) -> Vec<String> {
+    let mut terminal = Terminal::new(TestBackend::new(width, HEIGHT)).expect("terminal");
+    let lines = view.render("⠋", NOW, width, HEIGHT);
     terminal
         .draw(|f| f.render_widget(Paragraph::new(Text::from(lines)), f.area()))
         .expect("draw");
@@ -148,18 +153,42 @@ fn draw(view: &TuiProgressView) -> Vec<String> {
 const KEYS: &str = "  [y] approve · [n] reject · enter view";
 
 /// `attached` is `live` with the seam applied: the banner without its keys,
-/// the help row with the session hint. Everything else row for row.
-fn assert_same_but_the_seam(live: &[String], attached: &[String], id: SessionId, at: &str) {
+/// the help row with the session hint, cut where the terminal ends. Everything
+/// else row for row.
+fn assert_same_but_the_seam(
+    live: &[String],
+    attached: &[String],
+    id: SessionId,
+    width: u16,
+    at: &str,
+) {
     assert_eq!(live.len(), attached.len(), "{at}: same height");
     let (live_help, live_rows) = live.split_last().expect("a help row");
     let (attached_help, attached_rows) = attached.split_last().expect("a help row");
     let expected: Vec<String> = live_rows.iter().map(|r| r.replace(KEYS, "")).collect();
     assert_eq!(attached_rows, expected.as_slice(), "{at}: the frame");
-    assert_eq!(
-        *attached_help,
-        format!("{live_help} · session {id} · q detach"),
-        "{at}: the help row",
-    );
+    let help: String = format!("{live_help} · session {id} · q detach")
+        .chars()
+        .take(usize::from(width))
+        .collect();
+    assert_eq!(*attached_help, help.trim_end(), "{at}: the help row");
+}
+
+/// A terminal narrower than the frame wants: rows are cut, the seam still the
+/// only difference.
+const NARROW: u16 = 60;
+
+/// The frames a checkpoint compares beyond the main view at full width: the
+/// main view narrow, then the failed tab at both widths. The view is left on
+/// its main tab.
+fn draw_more(view: &mut TuiProgressView) -> [Vec<String>; 3] {
+    let narrow = draw_at(view, NARROW);
+    // Shift+Tab from the main view lands on the last tab, Failed.
+    view.tab(false);
+    let failed = draw(view);
+    let failed_narrow = draw_at(view, NARROW);
+    view.tab(true);
+    [narrow, failed, failed_narrow]
 }
 
 /// The run's view, recorded through the taps the interactive backend uses,
@@ -224,6 +253,7 @@ fn attached_view_draws_what_the_run_drew() {
     assert_eq!(rx_next.blocking_recv(), Ok(false));
     view_tap.observe(&live);
     let live_after = draw(&live);
+    let live_more = draw_more(&mut live);
 
     let finished_at = NOW + 500;
     live.set_finished(finished_at);
@@ -249,13 +279,19 @@ fn attached_view_draws_what_the_run_drew() {
             other => panic!("nothing is printed in this run: {other:?}"),
         }
         if let Some(shown) = prompt {
-            checkpoints.push((shown, draw(&attached)));
+            let frame = draw(&attached);
+            let more = (!shown).then(|| draw_more(&mut attached));
+            checkpoints.push((shown, frame, more));
         }
     }
-    let [(true, attached_prompt), (false, attached_after)] = checkpoints.as_slice() else {
+    let [
+        (true, attached_prompt, None),
+        (false, attached_after, Some(attached_more)),
+    ] = checkpoints.as_slice()
+    else {
         panic!(
             "one prompt shown, then cleared: {:?}",
-            checkpoints.iter().map(|(s, _)| s).collect::<Vec<_>>()
+            checkpoints.iter().map(|(s, ..)| s).collect::<Vec<_>>()
         );
     };
 
@@ -273,8 +309,33 @@ fn attached_view_draws_what_the_run_drew() {
     }
     assert!(live_prompt.iter().any(|r| r.contains(KEYS)), "{joined}");
 
-    assert_same_but_the_seam(&live_prompt, attached_prompt, rec.id(), "prompt shown");
-    assert_same_but_the_seam(&live_after, attached_after, rec.id(), "prompt cleared");
+    let [live_narrow, live_failed, live_failed_narrow] = &live_more;
+    let failed = live_failed.join("\n");
+    assert!(
+        failed.contains("//a:bad") && !failed.contains("//a:slow"),
+        "the failed tab lists the failure, not the running target:\n{failed}"
+    );
+    assert!(
+        live_narrow.iter().all(|r| r.chars().count() <= usize::from(NARROW)),
+        "{live_narrow:#?}"
+    );
+
+    let id = rec.id();
+    assert_same_but_the_seam(&live_prompt, attached_prompt, id, WIDTH, "prompt shown");
+    assert_same_but_the_seam(&live_after, attached_after, id, WIDTH, "prompt cleared");
+    let [attached_narrow, attached_failed, attached_failed_narrow] = attached_more;
+    // Narrow enough that the seam itself is cut, so the cut is compared too.
+    let narrow_help = attached_narrow.last().expect("a help row");
+    assert!(!narrow_help.contains("q detach"), "{narrow_help}");
+    assert_same_but_the_seam(live_narrow, attached_narrow, id, NARROW, "narrow");
+    assert_same_but_the_seam(live_failed, attached_failed, id, WIDTH, "failed tab");
+    assert_same_but_the_seam(
+        live_failed_narrow,
+        attached_failed_narrow,
+        id,
+        NARROW,
+        "failed tab, narrow",
+    );
 
     // The viewer finishes later than the run did; its summary still reads the
     // run's clock.
