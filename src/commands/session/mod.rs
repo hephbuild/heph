@@ -497,17 +497,27 @@ pub(crate) fn truncate(s: &str, max: usize) -> String {
 
 /// One line of recorded text, made safe for a terminal: SGR sequences
 /// (`ESC[…m`) are dropped, every other control character — newlines included —
-/// is escaped (`\u{1b}`, `\n`).
+/// is escaped (`\u{1b}`, `\n`). `attach` keeps SGR: see [`escape_replayed`].
 pub(crate) fn escape(s: &str) -> Cow<'_, str> {
-    escape_with(s, false)
+    escape_with(s, false, false)
 }
 
 /// [`escape`] for multi-line text: newlines and tabs are kept.
 pub(crate) fn escape_text(s: &str) -> Cow<'_, str> {
-    escape_with(s, true)
+    escape_with(s, true, false)
 }
 
-fn escape_with(s: &str, keep_lines: bool) -> Cow<'_, str> {
+/// [`escape_text`] for what a run printed to its own terminal, replayed by
+/// `attach`: a well-formed SGR sequence (colour and attributes, `ESC[` digits
+/// `;` `:` then `m`) is kept when `color` (the viewer's stream takes colour)
+/// and dropped otherwise. Everything else is escaped as [`escape_text`] does:
+/// cursor moves, clears, OSC titles, any other CSI, C1 controls, and a
+/// truncated or malformed sequence.
+pub(crate) fn escape_replayed(s: &str, color: bool) -> Cow<'_, str> {
+    escape_with(s, true, color)
+}
+
+fn escape_with(s: &str, keep_lines: bool, keep_sgr: bool) -> Cow<'_, str> {
     let kept = |c: char| keep_lines && (c == '\n' || c == '\t');
     if !s.chars().any(|c| c.is_control() && !kept(c)) {
         return Cow::Borrowed(s);
@@ -518,15 +528,20 @@ fn escape_with(s: &str, keep_lines: bool) -> Cow<'_, str> {
         if c == '\u{1b}' && chars.peek() == Some(&'[') {
             // An SGR sequence: `ESC [` parameters `m`. Anything else after
             // `ESC [` is escaped like any control character.
-            let rest: String = chars
+            let params: String = chars
                 .clone()
                 .skip(1)
                 .take_while(|c| c.is_ascii_digit() || *c == ';' || *c == ':')
                 .collect();
-            let mut probe = chars.clone().skip(1 + rest.chars().count());
+            let mut probe = chars.clone().skip(1 + params.len());
             if probe.next() == Some('m') {
-                for _ in 0..rest.chars().count() + 2 {
+                for _ in 0..params.len() + 2 {
                     chars.next();
+                }
+                if keep_sgr {
+                    out.push_str("\u{1b}[");
+                    out.push_str(&params);
+                    out.push('m');
                 }
                 continue;
             }

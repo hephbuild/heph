@@ -213,6 +213,16 @@ viewport. What was recorded after `Finished` (the failure report) is printed
 after the viewer's own teardown, below its final summary, where the run
 printed it.
 
+Replayed text keeps the run's colours: a well-formed SGR sequence (`ESC[`,
+digits, `;` and `:`, then `m`) is kept when the viewer's stderr takes colour
+and dropped when it does not (`NO_COLOR`, not a terminal). Everything else is
+escaped to visible text (`\u{1b}[2J`): cursor moves, clears, OSC titles, any
+other CSI including private modes like `ESC[?1049h`, C1 controls, and a
+truncated or malformed sequence. This reverses spec amendment A11 (drop every
+SGR on output) for `attach`'s replayed `Log` and `Output` text only; `list`,
+`show` and `inflight` still drop SGR (`escape_replayed` vs `escape_text` in
+`src/commands/session/mod.rs`).
+
 Lock holders are named as the run named them (above): the viewer scans the
 same sessions directory (`SessionSource::holder_names`), excluding the
 attached session itself. The residual: the viewer resolves a pid when it

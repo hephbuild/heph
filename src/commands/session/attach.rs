@@ -20,7 +20,7 @@ use futures::stream::BoxStream;
 use tokio::sync::mpsc;
 
 use super::show::new_view;
-use super::{SessionExit, ViewOpts, escape_text, require_known, resolve};
+use super::{SessionExit, ViewOpts, escape_replayed, require_known, resolve};
 use crate::tui::session::{
     HeaderKind, HolderNames, Routed, SessionFeed, SessionId, SessionItem, SessionMeta,
     SessionSource,
@@ -243,8 +243,13 @@ impl App for AttachApp {
                             drop(tx.send(ev));
                         }
                     }
-                    Routed::Print(text) => ctx.sink().write_diagnostic(&escape_text(&text)),
-                    Routed::AfterTeardown(text) => self.after.push(&escape_text(&text)),
+                    // The run's own colours, on a viewer that takes colour.
+                    Routed::Print(text) => ctx
+                        .sink()
+                        .write_diagnostic(&escape_replayed(&text, ctx.sink().color_enabled())),
+                    Routed::AfterTeardown(text) => self
+                        .after
+                        .push(&escape_replayed(&text, ctx.sink().color_enabled())),
                     Routed::Nothing => {}
                 },
                 SessionItem::CaughtUp { skipped } => {

@@ -707,6 +707,104 @@ fn control_bytes_escaped() {
     assert_eq!(escape("\u{1b}"), "\\u{1b}");
 }
 
+/// What `attach` replays from the run's terminal keeps its colours on a
+/// viewer that takes colour, and nothing else that would move the viewer's
+/// cursor, clear its screen or retitle it.
+#[test]
+fn replayed_text_keeps_only_sgr() {
+    const ESC: &str = "\u{1b}";
+    // (name, input, on a colour sink, on a no-colour sink)
+    let table: &[(&str, &str, &str, &str)] = &[
+        (
+            "valid SGR",
+            "a\u{1b}[31mred\u{1b}[0m\n",
+            "a\u{1b}[31mred\u{1b}[0m\n",
+            "ared\n",
+        ),
+        (
+            "SGR with many params",
+            "\u{1b}[1;4;38;2;255;128;0;48:5:17mx\u{1b}[m",
+            "\u{1b}[1;4;38;2;255;128;0;48:5:17mx\u{1b}[m",
+            "x",
+        ),
+        ("truncated ESC[", "a\u{1b}[", "a\\u{1b}[", "a\\u{1b}["),
+        (
+            "truncated SGR params",
+            "a\u{1b}[31",
+            "a\\u{1b}[31",
+            "a\\u{1b}[31",
+        ),
+        ("clear screen", "\u{1b}[2J", "\\u{1b}[2J", "\\u{1b}[2J"),
+        (
+            "cursor move",
+            "\u{1b}[10;5H",
+            "\\u{1b}[10;5H",
+            "\\u{1b}[10;5H",
+        ),
+        (
+            "OSC title, BEL-terminated",
+            "\u{1b}]0;pwned\u{7}",
+            "\\u{1b}]0;pwned\\u{7}",
+            "\\u{1b}]0;pwned\\u{7}",
+        ),
+        (
+            "OSC title, ST-terminated",
+            "\u{1b}]0;pwned\u{1b}\\",
+            "\\u{1b}]0;pwned\\u{1b}\\",
+            "\\u{1b}]0;pwned\\u{1b}\\",
+        ),
+        (
+            "alternate screen",
+            "\u{1b}[?1049h",
+            "\\u{1b}[?1049h",
+            "\\u{1b}[?1049h",
+        ),
+        ("lone ESC", "a\u{1b}", "a\\u{1b}", "a\\u{1b}"),
+        (
+            "C1 CSI, as an SGR would be",
+            "\u{9b}31mx",
+            "\\u{9b}31mx",
+            "\\u{9b}31mx",
+        ),
+        (
+            "non-ASCII between SGRs",
+            "\u{1b}[1mé ✓ 日本\u{1b}[0m\t→",
+            "\u{1b}[1mé ✓ 日本\u{1b}[0m\t→",
+            "é ✓ 日本\t→",
+        ),
+        (
+            "SGR next to an escaped sequence",
+            "\u{1b}[31m\u{1b}[2Jx\r",
+            "\u{1b}[31m\\u{1b}[2Jx\\r",
+            "\\u{1b}[2Jx\\r",
+        ),
+    ];
+    for &(name, input, color, plain) in table {
+        assert_eq!(escape_replayed(input, true), color, "{name}, colour sink");
+        assert_eq!(
+            escape_replayed(input, false),
+            plain,
+            "{name}, no-colour sink"
+        );
+        // Whatever is kept, no ESC survives that is not the start of an SGR.
+        let kept = escape_replayed(input, true);
+        for (i, _) in kept.match_indices(ESC) {
+            let tail = kept.get(i + 1..).unwrap_or_default();
+            let params = tail.strip_prefix('[').map(|t| {
+                t.trim_start_matches(|c: char| c.is_ascii_digit() || c == ';' || c == ':')
+            });
+            assert!(
+                params.is_some_and(|t| t.starts_with('m')),
+                "{name}: a raw ESC that is not an SGR in {kept:?}"
+            );
+        }
+    }
+    // A no-colour sink gets exactly what `escape_text` gave before.
+    for &(name, input, _, plain) in table {
+        assert_eq!(escape_text(input), plain, "{name}");
+    }
+}
+
 #[tokio::test]
 async fn shown_text_never_carries_control_bytes() {
     let id = SessionId::new(T0, 1);
