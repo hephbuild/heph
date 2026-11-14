@@ -83,7 +83,22 @@ decodes as `Unknown`. `session` is a `SessionRecordKind`: `Log {level, msg}`
 (`info!` and above, lossy UTF-8, stored verbatim and escaped by the viewer on
 output), `End {exit_code, panicked}`, `Truncated`, `InflightWritten`, and
 `Unknown` for anything newer. Both keys are optional; a line with neither is
-skipped. A reader skips and counts a complete line that does not decode and
+skipped.
+
+What the run's terminal showed besides events and log lines is recorded too,
+so `attach` draws it (see [Attach](#attach)):
+
+- `Label {label}`: the TUI's bottom label changed (`meta.json` holds the first).
+- `Approval {prompt}`: the approval banner changed; `prompt` is `{addr,
+  queued_behind, notices: [{name, path}]}`, or absent once nothing is pending.
+  Never the notice's content, which stays in its file.
+- `Finished`: the TUI was torn down; `at_unix_ms` is the instant its final
+  summary was measured against.
+- `Output {text}`: text the process wrote straight to its terminal, today the
+  failure report printed after the teardown.
+
+All four were added without a format bump: a heph from before them decodes
+each as `Unknown` and skips it. A reader skips and counts a complete line that does not decode and
 never stops on one, and waits for a trailing partial line to complete. `Log`
 and `End` never become `BuildEventKind` variants: a plugin hook must not
 receive them.
@@ -169,8 +184,45 @@ sessions: the view resolves the pid with the same rule as `list`/`show`
 distinct pid when that pid's first wait is folded, and keeps the answer for the
 run. A render never does IO. The directory comes from `HOME` alone, so a run
 with `HEPH_NO_SESSION` still names other sessions; with no `HOME`, or any read
-error, the notice is the pid. A session viewer (`attach`) gets no names, so it
-renders the pid, as the recorded events do.
+error, the notice is the pid.
+
+## Attach
+
+`heph session attach` draws the run's own `TuiProgressView`: the same type,
+render functions and layout, fed the recorded events. The view has one seam,
+`Role { Live, Attached }` in `crates/tui/src/tui/progress.rs`, and these are
+the only things that differ between the two:
+
+| | Live (the run) | Attached (a viewer) |
+| --- | --- | --- |
+| Approval queue | the engine's; `y`/`n`/Enter answer it | none: the keys are inert |
+| Approval banner | shared `approval_banner`, with the keys and the `enter view` preview | the same banner from the recorded `Approval`, with no keys and no preview |
+| `q` while running | nothing (Ctrl-C cancels the run) | detaches (Ctrl-C detaches too) |
+| Help row | the keys | the keys, then ` · session <id> · q detach` |
+| Bottom label | the header model's | the latest recorded `Label`, else `meta.json`'s |
+| Summary clock (`set_finished`) | the run's teardown | the recorded `Finished`, else `End` |
+
+Anything else that differs is a bug: `session/view_tests.rs` records a run's
+view, replays the recording into an attached one, and compares the two frames
+row for row with the prompt shown and after it clears.
+
+`tui::session::SessionFeed::route` is where a record becomes what the viewer
+does with it: an event is folded into the view, `Label`/`Approval`/`Finished`
+update what the view reads, and `Log`/`Output` are printed above the
+viewport. What was recorded after `Finished` (the failure report) is printed
+after the viewer's own teardown, below its final summary, where the run
+printed it.
+
+Lock holders are named as the run named them (above): the viewer scans the
+same sessions directory (`SessionSource::holder_names`), excluding the
+attached session itself. The residual: the viewer resolves a pid when it
+folds that wait, possibly long after the run did, so a holder that has
+exited by then is shown as `pid N` where the run showed its session.
+
+On a terminal, `attach` always draws the TUI, even for a session the run
+recorded with the line backend (`meta.json` `interactive: false`): the viewer's
+terminal decides, not the run's. Without a terminal it follows in line form,
+which for a line-backend session is its recorded log lines alone.
 
 ## Retention
 
