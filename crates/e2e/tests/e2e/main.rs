@@ -57,5 +57,6 @@ mod query;
 mod remote_cache;
 mod resources;
 mod run_timeout;
+mod sandbox_pool;
 mod scratch;
 mod tool_env;

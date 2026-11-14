@@ -334,16 +334,21 @@ fn build_slot_layers(
                 (list_path, abs_paths)
             });
             let content = input.artifact.content.clone();
+            // No plain file behind the blob (compressed, or inline in
+            // sqlite): every open re-reads the seek table and a read decodes
+            // a whole frame, so read whole frames and keep them.
+            let chunked = content.file_path().is_none();
             let origin_id = input.origin_id.clone();
             let opener: sandboxfuse::LayerOpener = Box::new(move || {
                 content.seekable_reader()?.ok_or_else(|| {
                     anyhow::anyhow!("seekable_reader returned None for origin_id={origin_id}")
                 })
             });
-            Ok(Some((
-                Arc::new(sandboxfuse::Layer::new(index, opener)),
-                list_write,
-            )))
+            let mut layer = sandboxfuse::Layer::new(index, opener);
+            if chunked {
+                layer = layer.with_read_chunk(sandboxfuse::COMPRESSED_READ_CHUNK);
+            }
+            Ok(Some((Arc::new(layer), list_write)))
         })
         .collect();
 

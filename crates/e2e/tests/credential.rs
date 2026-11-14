@@ -19,6 +19,7 @@
 
 mod common;
 
+use anyhow::Context as _;
 use common::Workspace;
 use std::sync::Arc;
 
@@ -795,6 +796,52 @@ async fn a_bad_field_in_a_presented_file_names_the_field() -> anyhow::Result<()>
     Ok(())
 }
 
+/// A presentation failing half-way takes the files already written with it:
+/// the first credential's token file is written, the second credential's
+/// template fails, and the failed run's sandbox, kept for diagnostics, holds
+/// no `tok`.
+#[tokio::test]
+async fn a_presentation_failing_half_way_removes_the_files_already_written() -> anyhow::Result<()> {
+    let _good = EnvVar::set("HEPH_E2E_HALF_GOOD", "half-way-material");
+    let _bad = EnvVar::set("HEPH_E2E_HALF_BAD", "v");
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "auth",
+        r#"
+target(name = "a_good", driver = "auth.credential",
+       sources = [heph.auth.env(["HEPH_E2E_HALF_GOOD"])],
+       present = {"files": {"tok": "${heph_e2e_half_good}"},
+                  "env":   {"TOK": "${file:tok}"}})
+target(name = "z_bad", driver = "auth.credential",
+       sources = [heph.auth.env(["HEPH_E2E_HALF_BAD"])],
+       present = {"files": {"f": "${missing}"},
+                  "env":   {"F": "${file:f}"}})
+"#,
+    );
+    ws.write_build_file(
+        "app",
+        r#"target(name = "a", driver = "bash", run = "true", out = [], cache = False,
+       credentials = ["//auth:a_good", "//auth:z_bad"])"#,
+    );
+    let err = expect_err(
+        ws.run("//app:a").await,
+        "the second credential's presentation fails",
+    );
+    let msg = format!("{err:#}");
+    assert!(msg.contains("missing"), "{msg}");
+
+    let sandbox = ws.engine.home.join("sandbox");
+    let left: Vec<_> = walkdir(&sandbox)
+        .into_iter()
+        .filter(|p| p.file_name().is_some_and(|n| n == "tok"))
+        .collect();
+    assert!(
+        left.is_empty(),
+        "the first credential's files outlived the failed presentation: {left:?}"
+    );
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // The chain refuses to eat itself
 // ---------------------------------------------------------------------------
@@ -1341,21 +1388,8 @@ target(name = "t", driver = "auth.credential",
 async fn lapsed_material_is_re_acquired_rather_than_handed_on() -> anyhow::Result<()> {
     let ws = Workspace::new();
     let counter = ws.dir.path().join("refreshes");
-    // A one-second lifetime. `usable_at`'s margin is `min(60s, lifetime/2)`, so
-    // this is usable for about half a second and then is not.
-    ws.write_build_file(
-        "auth",
-        &format!(
-            r#"
-target(name = "t", driver = "auth.credential",
-       sources = [heph.auth.exec(["sh", "-c",
-           "echo x >> {c}; printf '{{\"token\":\"v\",\"expires_in\":1}}'"],
-           fields = {{"token": "token"}}, expires = "expires_in")],
-       present = {{"env": {{"T": "${{token}}"}}}})
-"#,
-            c = counter.display()
-        ),
-    );
+    let expiry = ws.dir.path().join("expiry");
+    ws.write_build_file("auth", &lapsing_once_credential(&counter, &expiry));
     ws.write_build_file(
         "app",
         r#"
@@ -1365,24 +1399,65 @@ target(name = "second", driver = "bash", out = "o.txt", cache = False,
        credentials = ["//auth:t"], run = ["printf '%s' \"$T\" > o.txt"])
 "#,
     );
-    ws.run("//app:first").await?;
     assert_eq!(
-        std::fs::read_to_string(&counter)
-            .unwrap_or_default()
-            .lines()
-            .count(),
-        1
+        common::artifact_string(&*ws.run("//app:first").await?),
+        "v1"
     );
-    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
-    ws.run("//app:second").await?;
+    assert_eq!(acquisitions(&counter), 1);
+    wait_past_expiry(&expiry).await?;
     assert_eq!(
-        std::fs::read_to_string(&counter)
-            .unwrap_or_default()
-            .lines()
-            .count(),
-        2,
+        common::artifact_string(&*ws.run("//app:second").await?),
+        "v2",
         "a target starting after the material lapsed must not be handed it"
     );
+    assert_eq!(acquisitions(&counter), 2);
+    Ok(())
+}
+
+/// A credential whose first acquisition lapses a few seconds later and whose
+/// later ones live ten minutes. Each acquisition appends a line to `counter`
+/// and yields the token `v<n>`; the first writes its absolute expiry, in unix
+/// seconds, to `expiry`.
+///
+/// Three seconds is whole seconds from `date`, so a lifetime of two to three:
+/// `usable_at`'s margin (`min(60s, lifetime/2)`) leaves the material usable
+/// for at least a second after it is acquired, and certainly lapsed once the
+/// wall clock reaches what `expiry` holds.
+fn lapsing_once_credential(counter: &std::path::Path, expiry: &std::path::Path) -> String {
+    format!(
+        r#"
+target(name = "t", driver = "auth.credential",
+       sources = [heph.auth.exec(["sh", "-c",
+           "echo x >> '{c}'; n=$(($(wc -l < '{c}'))); if [ \"$n\" = 1 ]; then e=$(($(date +%s)+3)); echo $e > '{e}'; printf '{{\"token\":\"v%s\",\"expires\":\"%s\"}}' \"$n\" \"$e\"; else printf '{{\"token\":\"v%s\",\"expires\":600}}' \"$n\"; fi"],
+           fields = {{"token": "token"}}, expires = "expires")],
+       present = {{"env": {{"T": "${{token}}"}}}})
+"#,
+        c = counter.display(),
+        e = expiry.display(),
+    )
+}
+
+/// How many times the credential behind `counter` was acquired.
+fn acquisitions(counter: &std::path::Path) -> usize {
+    std::fs::read_to_string(counter)
+        .unwrap_or_default()
+        .lines()
+        .count()
+}
+
+/// Wait until the wall clock is past the unix timestamp written to `expiry`,
+/// so the material carrying it has lapsed.
+async fn wait_past_expiry(expiry: &std::path::Path) -> anyhow::Result<()> {
+    let written = std::fs::read_to_string(expiry)
+        .with_context(|| format!("read the expiry the first acquisition wrote to {expiry:?}"))?;
+    let at: u64 = written
+        .trim()
+        .parse()
+        .with_context(|| format!("parse the expiry {written:?}"))?;
+    let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(at);
+    while std::time::SystemTime::now() <= at {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
     Ok(())
 }
 
@@ -1614,6 +1689,353 @@ target(name = "t", driver = "auth.credential",
         after_second.lines().count(),
         1,
         "a cache hit must not acquire, got {after_second:?}"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// A producer runs nested inside its consumer's run
+// ---------------------------------------------------------------------------
+
+/// Bound on a run whose failure mode is a hang: a nested producer waiting on a
+/// pool its consumer holds parks forever, and that must fail the test rather
+/// than the CI job.
+const NESTED_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// A producer target behind a credential, and a sandboxed consumer of it.
+fn write_nested_producer(ws: &htestkit::Workspace) {
+    ws.write_build_file(
+        "auth",
+        r#"
+target(name = "fetch", driver = "bash", cache = False,
+       out = {"credential": "cred.json"},
+       run = ["printf '{\"token\":\"nested\",\"expires_in\":600}' > cred.json"])
+target(name = "t", driver = "auth.credential", sources = ["//auth:fetch"],
+       present = {"env": {"T": "${token}"}})
+"#,
+    );
+    ws.write_build_file(
+        "app",
+        r#"target(name = "a", driver = "bash", out = "o.txt", cache = False,
+       credentials = ["//auth:t"], run = ["printf '%s' \"$T\" > o.txt"])"#,
+    );
+}
+
+/// A workspace whose engine has a `sandbox` pool of `slots` and 4 cpus, with
+/// the buildfile provider and the managed bash driver.
+fn sandbox_pool_ws(slots: usize) -> anyhow::Result<htestkit::Workspace> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().to_path_buf();
+    let mut cfg = heph::engine::Config {
+        parallelism: Some(4),
+        ..heph::engine::Config::for_tests(root.clone())
+    };
+    cfg.resources.insert(
+        hplugin::provider::PoolName::sandbox(),
+        hcore::capacity::PoolSpec::from_written(
+            hplugin::provider::PoolName::SANDBOX,
+            None,
+            Some(&slots.to_string()),
+        )?,
+    );
+    let mut engine = heph::engine::Engine::new(cfg)?;
+    engine.register_provider(move |init| {
+        Box::new(heph::pluginbuildfile::Provider::new(
+            root,
+            init.runtime.clone(),
+            Arc::clone(&init.functions),
+        ))
+    })?;
+    engine.register_managed_driver(|_| {
+        Box::new(heph::pluginexec::Driver::new_bash().with_host_path())
+    })?;
+    let engine = Arc::new(engine);
+    engine.install_exec_runner_host();
+    Ok(htestkit::Workspace { dir, engine })
+}
+
+/// How many runs are queued for admission (cpu or a `sandbox` slot) right
+/// now; 0 before the pool is built.
+fn queued(ws: &htestkit::Workspace) -> usize {
+    ws.engine.resource_snapshot().map_or(0, |s| s.main.queued)
+}
+
+/// The consumer acquires its credential before it takes a `sandbox` slot, so
+/// with a single slot the producer gets it, runs, and gives it back before
+/// the consumer asks for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_credential_producer_runs_with_the_pool_exhausted() -> anyhow::Result<()> {
+    let ws = sandbox_pool_ws(1)?;
+    write_nested_producer(&ws);
+
+    let res = tokio::time::timeout(NESTED_DEADLINE, ws.run("//app:a"))
+        .await
+        .with_context(|| format!("the consumer hung: {:?}", ws.engine.resource_snapshot()))??;
+    assert_eq!(common::artifact_string(&res), "nested");
+    Ok(())
+}
+
+/// The producer's own uncached dep needs a `sandbox` slot too. Were the
+/// producer run inside its consumer's run, that dep would wait for the one
+/// slot the consumer holds, forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_credential_producer_with_an_uncached_dep_runs_with_one_sandbox_slot()
+-> anyhow::Result<()> {
+    let ws = sandbox_pool_ws(1)?;
+    ws.write_build_file(
+        "auth",
+        r#"
+target(name = "gen", driver = "bash", cache = False, out = "g.txt", run = ["printf x > g.txt"])
+target(name = "fetch", driver = "bash", cache = False, deps = {"g": ["//auth:gen"]},
+       out = {"credential": "cred.json"},
+       run = ["printf '{\"token\":\"nested\",\"expires_in\":600}' > cred.json"])
+target(name = "t", driver = "auth.credential", sources = ["//auth:fetch"],
+       present = {"env": {"T": "${token}"}})
+"#,
+    );
+    ws.write_build_file(
+        "app",
+        r#"target(name = "a", driver = "bash", out = "o.txt", cache = False,
+       credentials = ["//auth:t"], run = ["printf '%s' \"$T\" > o.txt"])"#,
+    );
+
+    let res = tokio::time::timeout(NESTED_DEADLINE, ws.run("//app:a"))
+        .await
+        .with_context(|| format!("the consumer hung: {:?}", ws.engine.resource_snapshot()))??;
+    assert_eq!(common::artifact_string(&res), "nested");
+    Ok(())
+}
+
+/// A plain run of the producer beside a consumer of its credential, with one
+/// `sandbox` slot. The plain run holds the producer's build lock while it
+/// waits for the slot; a consumer acquiring its credential while holding that
+/// slot would wait for the producer's build lock, and neither would move.
+///
+/// The interleaving is forced: the consumer's first credential is an `exec`
+/// source parked on a gate, the plain run starts while it is parked, and the
+/// gate opens only once the plain run is queued for admission (or done).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_plain_run_of_the_producer_beside_its_consumer_runs_with_one_sandbox_slot()
+-> anyhow::Result<()> {
+    let ws = sandbox_pool_ws(1)?;
+    let gates = tempfile::tempdir()?;
+    let parked = gates.path().join("parked");
+    let gate = gates.path().join("open");
+    write_nested_producer(&ws);
+    ws.write_build_file(
+        "gate",
+        &format!(
+            r#"
+target(name = "g", driver = "auth.credential",
+       sources = [heph.auth.exec(["sh", "-c",
+           "touch '{parked}'; while [ ! -e '{gate}' ]; do sleep 0.02; done; printf '{{\"token\":\"g\"}}'"],
+           fields = {{"token": "token"}})],
+       present = {{"env": {{"G": "${{token}}"}}}})
+"#,
+            parked = parked.display(),
+            gate = gate.display(),
+        ),
+    );
+    ws.write_build_file(
+        "app",
+        r#"target(name = "b", driver = "bash", out = "o.txt", cache = False,
+       credentials = ["//gate:g", "//auth:t"], run = ["printf '%s%s' \"$G\" \"$T\" > o.txt"])"#,
+    );
+
+    // Each run on a task of its own, so a run that parks its task cannot
+    // stall the gate opener or the deadline.
+    let ws = Arc::new(ws);
+    let consumer = tokio::spawn({
+        let ws = Arc::clone(&ws);
+        async move { ws.run("//app:b").await }
+    });
+    let scenario = async {
+        let deadline = std::time::Instant::now() + NESTED_DEADLINE;
+        while !parked.exists() {
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "the gate credential never ran"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let plain = tokio::spawn({
+            let ws = Arc::clone(&ws);
+            async move { ws.run("//auth:fetch").await }
+        });
+        while !plain.is_finished() && queued(&ws) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        std::fs::write(&gate, "")?;
+        let plain = plain.await??;
+        let consumer = consumer.await??;
+        anyhow::Ok((consumer, plain))
+    };
+    let (consumer, plain) = tokio::time::timeout(NESTED_DEADLINE, scenario)
+        .await
+        .with_context(|| {
+            format!(
+                "the consumer and the plain run hung: {:?}",
+                ws.engine.resource_snapshot()
+            )
+        })??;
+    assert_eq!(common::artifact_string(&consumer), "gnested");
+    assert!(
+        common::artifact_string(&plain).contains("nested"),
+        "the plain run built the producer"
+    );
+    Ok(())
+}
+
+/// A target-sourced credential at `-j 1`: the producer is admitted to the
+/// only cpu and gives it back before its consumer asks for it.
+#[tokio::test]
+async fn a_target_sourced_credential_runs_at_j1() -> anyhow::Result<()> {
+    let ws = Workspace::with_parallelism(1);
+    write_nested_producer(&ws);
+
+    let res = tokio::time::timeout(NESTED_DEADLINE, ws.run("//app:a"))
+        .await
+        .context("the consumer hung: its producer is waiting for cpu admission")??;
+    assert_eq!(common::artifact_string(&res), "nested");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Material that lapses while the run waits for admission
+// ---------------------------------------------------------------------------
+
+/// Material that lapses while its consumer is queued for the only `sandbox`
+/// slot is acquired again once the run is admitted, rather than handed on.
+///
+/// `//app:hold` takes the slot and parks on a gate. The consumer acquires its
+/// credential (the first acquisition, which lapses three seconds later) and
+/// queues behind it. The gate opens only once the wall clock is past that
+/// expiry, so the consumer is admitted holding lapsed material, hands
+/// everything back, acquires a second time, and runs with `v2`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn material_that_lapses_while_queued_is_acquired_again() -> anyhow::Result<()> {
+    let ws = sandbox_pool_ws(1)?;
+    let gates = tempfile::tempdir()?;
+    let started = gates.path().join("started");
+    let gate = gates.path().join("open");
+    let counter = gates.path().join("acquisitions");
+    let expiry = gates.path().join("expiry");
+    ws.write_build_file("auth", &lapsing_once_credential(&counter, &expiry));
+    ws.write_build_file(
+        "app",
+        &format!(
+            r#"
+target(name = "hold", driver = "bash", out = "o.txt", cache = False,
+       run = ["touch '{started}'; while [ ! -e '{gate}' ]; do sleep 0.02; done; printf held > o.txt"])
+target(name = "c", driver = "bash", out = "o.txt", cache = False,
+       credentials = ["//auth:t"], run = ["printf '%s' \"$T\" > o.txt"])
+"#,
+            started = started.display(),
+            gate = gate.display(),
+        ),
+    );
+
+    let ws = Arc::new(ws);
+    let hold = tokio::spawn({
+        let ws = Arc::clone(&ws);
+        async move { ws.run("//app:hold").await }
+    });
+    let scenario = async {
+        while !started.exists() {
+            anyhow::ensure!(!hold.is_finished(), "the holder ended before it started");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let consumer = tokio::spawn({
+            let ws = Arc::clone(&ws);
+            async move { ws.run("//app:c").await }
+        });
+        // Queued means admitted to nothing yet, with the credential held.
+        while queued(&ws) == 0 {
+            anyhow::ensure!(
+                !consumer.is_finished(),
+                "the consumer ended without queueing behind the holder"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        anyhow::ensure!(
+            acquisitions(&counter) == 1,
+            "the consumer queued holding its first acquisition"
+        );
+        wait_past_expiry(&expiry).await?;
+        std::fs::write(&gate, "")?;
+        hold.await??;
+        anyhow::Ok(consumer.await??)
+    };
+    let consumer = tokio::time::timeout(NESTED_DEADLINE, scenario)
+        .await
+        .with_context(|| format!("the consumer hung: {:?}", ws.engine.resource_snapshot()))??;
+    assert_eq!(
+        common::artifact_string(&consumer),
+        "v2",
+        "material that lapsed in the queue must not be handed to the run"
+    );
+    assert_eq!(
+        acquisitions(&counter),
+        2,
+        "acquired once more, and only once"
+    );
+    Ok(())
+}
+
+/// Material that is lapsed every time it is acquired fails the run after
+/// three acquisitions, naming the credential, and gives back every pool.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn material_that_keeps_lapsing_fails_the_run_after_three_rounds() -> anyhow::Result<()> {
+    let ws = sandbox_pool_ws(1)?;
+    let counter = ws.dir.path().join("acquisitions");
+    // `"1"` is a unix timestamp in 1970: lapsed the moment it is acquired.
+    ws.write_build_file(
+        "auth",
+        &format!(
+            r#"
+target(name = "t", driver = "auth.credential",
+       sources = [heph.auth.exec(["sh", "-c",
+           "echo x >> '{c}'; printf '{{\"token\":\"stale\",\"expires\":\"1\"}}'"],
+           fields = {{"token": "token"}}, expires = "expires")],
+       present = {{"env": {{"T": "${{token}}"}}}})
+"#,
+            c = counter.display()
+        ),
+    );
+    ws.write_build_file(
+        "app",
+        r#"target(name = "c", driver = "bash", out = "o.txt", cache = False,
+       credentials = ["//auth:t"], run = ["printf '%s' \"$T\" > o.txt"])"#,
+    );
+
+    let res = tokio::time::timeout(NESTED_DEADLINE, ws.run("//app:c"))
+        .await
+        .with_context(|| format!("the consumer hung: {:?}", ws.engine.resource_snapshot()))?;
+    let err = expect_err(res, "material that is always lapsed must fail the run");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("//auth:t"), "must name the credential: {msg}");
+    assert!(msg.contains("3 times in a row"), "{msg}");
+    assert_eq!(acquisitions(&counter), 3, "one acquisition per round");
+
+    let snap = ws
+        .engine
+        .resource_snapshot()
+        .context("the run was admitted, so the pool is built")?;
+    let held = |name: &str| {
+        snap.main
+            .pools
+            .iter()
+            .find(|p| p.pool.as_str() == name)
+            .map_or(0, |p| p.held)
+    };
+    assert_eq!(
+        (
+            held(hplugin::provider::PoolName::SANDBOX),
+            held(hplugin::provider::PoolName::CPU),
+            snap.main.queued
+        ),
+        (0, 0, 0),
+        "every round gave back what it was admitted to: {snap:?}"
     );
     Ok(())
 }

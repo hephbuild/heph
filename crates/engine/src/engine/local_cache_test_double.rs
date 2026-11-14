@@ -203,6 +203,10 @@ impl LocalCache for ForwardingCache {
         self.inner.exists_committed(addr, hashin, name)
     }
 
+    fn stored_size(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<Option<u64>> {
+        self.inner.stored_size(addr, hashin, name)
+    }
+
     fn delete(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<()> {
         self.inner.delete(addr, hashin, name)
     }

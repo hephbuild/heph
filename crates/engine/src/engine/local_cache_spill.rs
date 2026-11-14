@@ -6,7 +6,7 @@
 //! - a **blob** store ([`LocalCacheFS`]) holding large blobs as plain files.
 //!
 //! Routing on write (the writer holds no buffer of its own — see [`SpillWriter`]):
-//! - The manifest ([`MANIFEST_V1`]) *always* goes to the primary regardless of
+//! - A manifest ([`MANIFESTS`](crate::engine::local_cache::MANIFESTS)) *always* goes to the primary regardless of
 //!   size — GC enumerates revisions by manifest presence in the primary, so the
 //!   primary must remain the authoritative index.
 //! - Any other blob streams straight to the primary by default. The moment its
@@ -43,7 +43,7 @@
 //! ephemeral tmp store, not this one.
 
 use crate::engine::local_cache::{
-    EntryWriter, Existence, LocalCache, MANIFEST_V1, NotFoundError, SizedReader, TargetStream,
+    EntryWriter, Existence, LocalCache, NotFoundError, SizedReader, TargetStream, is_manifest_name,
 };
 use crate::engine::local_cache_fs::LocalCacheFS;
 use anyhow::{Context, Result};
@@ -77,7 +77,7 @@ impl LocalCacheSpill {
 
     /// True for the manifest blob, which must always live in the primary.
     fn is_manifest(name: &str) -> bool {
-        name == MANIFEST_V1
+        is_manifest_name(name)
     }
 }
 
@@ -194,6 +194,13 @@ impl LocalCache for LocalCacheSpill {
         // does not know which, so both are asked. Neither wait on a queue.
         Ok(self.primary.exists_committed(addr, hashin, name)?
             || self.blobs.exists_committed(addr, hashin, name)?)
+    }
+
+    fn stored_size(&self, addr: &Addr, hashin: &str, name: &str) -> Result<Option<u64>> {
+        match self.primary.stored_size(addr, hashin, name)? {
+            Some(size) => Ok(Some(size)),
+            None => self.blobs.stored_size(addr, hashin, name),
+        }
     }
 
     fn delete(&self, addr: &Addr, hashin: &str, name: &str) -> Result<()> {
@@ -387,6 +394,7 @@ impl EntryWriter for SpillWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::local_cache::{MANIFEST_V2, MANIFESTS};
     use crate::engine::local_cache_sqlite::{DEFAULT_MAX_CONCURRENT_PIPES, LocalCacheSQLite};
     use std::io::{Read, Write};
     use tempfile::tempdir;
@@ -541,7 +549,7 @@ mod tests {
         std::fs::write(&src, vec![3u8; 256]).expect("write");
 
         assert!(
-            !cache.adopt_file(&a, "h", MANIFEST_V1, &src).expect("adopt"),
+            !cache.adopt_file(&a, "h", MANIFEST_V2, &src).expect("adopt"),
             "the manifest must stay in the primary whatever its size"
         );
         assert!(src.exists());
@@ -572,9 +580,9 @@ mod tests {
         assert_eq!(std::fs::read(&path).expect("read"), large);
 
         // The manifest always stays in the primary, however big.
-        write(&cache, &a, MANIFEST_V1, &[9u8; 256]);
+        write(&cache, &a, MANIFEST_V2, &[9u8; 256]);
         assert!(
-            cache.file_path(&a, "h", MANIFEST_V1).is_none(),
+            cache.file_path(&a, "h", MANIFEST_V2).is_none(),
             "manifest never spills, so it never has a path"
         );
     }
@@ -686,11 +694,15 @@ mod tests {
         let a = addr();
 
         let big_manifest = vec![9u8; 1024]; // far over threshold
-        write(&cache, &a, MANIFEST_V1, &big_manifest);
+        // Both names: a revision an older heph also wrote has a v1 manifest,
+        // and GC enumerates it through the primary as well.
+        for name in MANIFESTS {
+            write(&cache, &a, name, &big_manifest);
 
-        assert!(sqlite.exists(&a, "h", MANIFEST_V1).expect("ex"));
-        assert!(!fs.exists(&a, "h", MANIFEST_V1).expect("ex"));
-        assert_eq!(read(&cache, &a, MANIFEST_V1), big_manifest);
+            assert!(sqlite.exists(&a, "h", name).expect("ex"), "{name}");
+            assert!(!fs.exists(&a, "h", name).expect("ex"), "{name}");
+            assert_eq!(read(&cache, &a, name), big_manifest, "{name}");
+        }
     }
 
     /// `delete` reclaims a blob no matter which backend holds it, so GC (which

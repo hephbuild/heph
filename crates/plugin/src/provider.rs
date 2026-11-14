@@ -127,6 +127,9 @@ impl PoolName {
     pub const CPU: &'static str = hcore::capacity::CPU;
     /// The memory pool, in bytes.
     pub const MEMORY: &'static str = hcore::capacity::MEMORY;
+    /// The sandbox pool, a count of build sandboxes on disk. The engine's
+    /// own: no target declares or reads it.
+    pub const SANDBOX: &'static str = hcore::capacity::SANDBOX;
 
     /// The `cpu` pool.
     pub fn cpu() -> Self {
@@ -136,6 +139,11 @@ impl PoolName {
     /// The `memory` pool.
     pub fn memory() -> Self {
         Self(Self::MEMORY.to_string())
+    }
+
+    /// The `sandbox` pool.
+    pub fn sandbox() -> Self {
+        Self(Self::SANDBOX.to_string())
     }
 
     pub fn as_str(&self) -> &str {

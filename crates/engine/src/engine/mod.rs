@@ -47,6 +47,7 @@ pub use cwd::get_cwp;
 pub use hplugin::driver;
 pub use hplugin::error;
 pub use hplugin::hook;
+mod cache_codec;
 pub mod event;
 mod labels;
 pub mod listed;

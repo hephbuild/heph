@@ -613,7 +613,7 @@ target(
     std::fs::remove_dir_all(HomeDir::for_tests(root.path()).join("cache"))?;
     let mut unreadable = 0;
     for f in walk(remote.path()) {
-        if !f.ends_with("manifest-v1.borsh") {
+        if !f.ends_with("manifest-v2.borsh") {
             let blob = remote.path().join(f);
             std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o000))?;
             // Root reads a mode-000 file anyway: the remote would serve the

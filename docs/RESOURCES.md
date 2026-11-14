@@ -99,12 +99,14 @@ and the OS. That is deliberate, and it cuts both ways: an `fs` glob costs
 nothing to admit, but a process-spawning target declared `cpu: 0` launches as
 many processes as there are such targets ready. Its unbounded amounts are
 counted as held from the grant. `cpu: 0` with `memory: "8G"` still queues on
-memory.
+memory, and a `cpu: 0` target of a managed driver queues on the
+[`sandbox`](#the-sandbox-pool) slot every managed run takes.
 
 ## Configuring pools
 
-`cpu` and `memory` always exist. Any other pool is declared in `.hephconfig`,
-one entry per pool, either in full or as a shorthand:
+`cpu`, `memory` and [`sandbox`](#the-sandbox-pool) always exist. Any other pool
+is declared in `.hephconfig`, one entry per pool, either in full or as a
+shorthand:
 
 ```yaml
 resources:
@@ -121,11 +123,12 @@ resources:
   With no `unit` the pool's default unit applies, so a new pool written
   `{value: 3}` is a count.
 - **Shorthand**: the amount alone, in the pool's default unit (`cpu` for
-  `cpu`, `bytes` for `memory`, `count` for anything else).
+  `cpu`, `bytes` for `memory`, `count` for `sandbox` and anything else).
 - **No value**: a custom pool is **unbounded**: every request is granted at
   once and nothing is clamped, but what is held is still counted and shown.
-  `cpu` and `memory` without a value keep their defaults.
-- **`0`**: "this pool exists; the caller sets its capacity per run". BUILD
+  `cpu`, `memory` and `sandbox` without a value keep their defaults.
+- **`0`** (any pool, `sandbox` included): "this pool exists; the caller sets
+  its capacity per run". BUILD
   files naming it validate on every machine, and a run that reaches a target
   needing it fails at admission, before the target runs:
 
@@ -142,11 +145,14 @@ difference between platforms is on purpose: a target that declares `memory`
 can wait in a Linux CI container limited to 8G where it ran at once on a 32G
 laptop. Set `resources: {memory: …}` to make the two agree.
 
-**Percentages** (`cpu: 50%`, `memory: 75%`, and the same on the command line)
-are of the builtin's default and exist only for `cpu` and `memory`: a custom
-pool has no default to take one of. cpu rounds to the nearest micro-CPU,
-memory floors to bytes, over 100% is an overcommit by choice, and `0%` is an
-error.
+`sandbox` is 4 per CPU of the resolved `cpu` capacity (rounded up, and at
+least 1, so a `cpu: 0` still leaves one), so `-j 2` makes it 8.
+
+**Percentages** (`cpu: 50%`, `memory: 75%`, `sandbox: 200%`, and the same on
+the command line) are of the builtin's default and exist only for the
+builtins: a custom pool has no default to take one of. cpu rounds to the nearest micro-CPU,
+memory floors to bytes, sandbox floors but is at least 1, over 100% is an
+overcommit by choice, and `0%` is an error.
 
 `resources:` merges **per pool** across `HEPH_PROFILES`: a profile that sets
 `cpu` keeps the base's other pools, and one that sets only a pool's `value`
@@ -171,6 +177,56 @@ the default.
 `-j` sizes the `cpu` pool only. The engine's own fan-outs (cache pipes, gc and
 clean loops) keep following its parallelism, and `-j 1` serialises neither
 them nor `cpu: 0` targets.
+
+### The `sandbox` pool
+
+Admission bounds what *runs*. A finished run's sandbox is removed afterwards,
+fire-and-forget, so a build of many short targets (thousands of sandboxed
+`go list` runs in a cold Go `validate`) can finish sandboxes faster than the
+disk removes them, and that backlog once filled a disk. The `sandbox` pool
+bounds the build sandboxes on disk, **running or awaiting removal**:
+
+- Every run of a managed driver (one that runs in a build sandbox the engine
+  prepares, such as `exec` and `bash`) is admitted with `sandbox: 1` on top of
+  what it declares, in the same atomic, FIFO grant as its cpu.
+- Its cpu (and every other pool) returns when the run ends; its sandbox slot
+  only once the sandbox directory has been removed.
+- Cache hits, non-managed drivers (`fs`, `group`, `template`, …) and the
+  sandboxes of `heph run` invocations take none. A failed target's sandbox,
+  kept on disk for its diagnostic, gives its slot back at once: there is at
+  most one such tree per failed target, and that target's next run removes it.
+- It is the engine's own: a target that declares it in `resources` or reads
+  `${resource:sandbox}` is refused when the def is linked. Size it with
+  `--resource sandbox=<n>`, `HEPH_RESOURCE_SANDBOX=<n>` or
+  `resources: {sandbox: <n>}`.
+- It is **always bounded**: there is no unbounded form, and a unit other
+  than `count` is refused. A pool of your own named `sandbox` must be
+  renamed. `0` follows the same rule as every pool's: `.hephconfig` may say
+  `sandbox: 0` ("the run sets it"), `--resource sandbox=0` and
+  `HEPH_RESOURCE_SANDBOX=0` are refused, and a managed run under a 0 pool
+  fails at admission, before it runs, naming how to set it.
+- Admission is strict FIFO, so a managed run at the head of the queue that
+  waits for a `sandbox` slot holds back every run behind it, including one
+  that takes no slot (a `template` target) and would fit the free cpu. This
+  is deliberate: letting such runs pass would let a stream of them starve the
+  waiting run, the same reason no other pool's head is overtaken.
+
+A `cpu: 0` managed target needs a sandbox slot, so it is no longer zero-cost
+and queues like any other run.
+
+**If builds stall on `sandbox`, sandboxes are being removed slower than runs
+create them.** Every surface names the removals still owed, the cause of the
+wait (`AdmissionWaitStart.removals_pending`, set on a `sandbox` wait only):
+
+- the wait row: `⧗ //a:b waits for sandbox 1 (0 free, 2 ahead, 41s) —
+  cleanup is behind: 3 removals pending`;
+- the TUI header, once a wait passes the notice threshold:
+  `sandbox: 4 waiting (3 removals pending)`;
+- the in-flight report's `pools` line: `…, sandbox 8/8; 4 queued; 3 removals
+  pending`.
+
+Raise the pool only if the disk can hold that many more sandboxes: the bound
+is what keeps a backlog of removals from filling it.
 
 ## Reading the allotment
 
@@ -274,11 +330,15 @@ CPUs, `bytes` human-sized, `count` as an integer), from the `units` that
 
 - The TUI header shows `cpu` as worker cells and every other pool that
   something holds as `<pool> <held>/<capacity>` (an unbounded one as just
-  `<pool> <held>`, e.g. `tokens 5`).
+  `<pool> <held>`, e.g. `tokens 5`), and a pool with announced waits with
+  their count (`gpu 1/1, 2 waiting`). `sandbox`, whose slots no running
+  target reports holding, shows only its waits: `sandbox: 4 waiting (3
+  removals pending)`.
 - A clamped run's TUI row, CI `running` line and GitHub Actions report entry
   say so: `[cpu 16→4]`, `[scratch_disk 8.0 GiB→4.0 GiB]`.
 - A wait that outlasts the notice threshold (5 s) is announced as
   `AdmissionWaitStart` / `AdmissionWaitEnd { addr, pool, need, free, ahead }`
+  (plus `removals_pending` on a `sandbox` wait, [above](#the-sandbox-pool))
   and rendered as a row in the TUI and the GitHub Actions report:
 
   ```
@@ -289,7 +349,8 @@ CPUs, `bytes` human-sized, `count` as an integer), from the `units` that
   `queued_ms`, how long the run waited, so a wait under the threshold is
   still answerable from the event stream.
 - The in-flight report (SIGQUIT) prints each pool's held/capacity in its
-  unit, the queue length, and what the head waits for and for how long.
+  unit, the queue length, the sandbox removals still owed when there are
+  any, and what the head waits for and for how long.
 
 ## Sizing a declaration
 
@@ -403,3 +464,10 @@ change (plugin ABI 0.17.3 → 0.17.4, patch, lane `^0.17.0`):
   empty allotment, so a `${resource:…}` reference fails its run.
 - **`.hephconfig`.** `resources:` is refused loudly by an older heph
   (`ConfigYaml` denies unknown fields).
+- **`sandbox` is now the engine's pool.** A pool of your own named `sandbox`
+  must be renamed: a target may no longer declare or read it, and every
+  managed run takes one slot of it. A `cpu: 0` managed target, admitted at
+  once before, now queues for its slot.
+- **`AdmissionWaitStart.removals_pending`** is a new optional event field,
+  absent from an older host's frames and omitted when unset, so a consumer
+  built against an older `hcore` decodes the new frames unchanged.

@@ -1293,6 +1293,7 @@ mod tests {
                 need: 4_000_000,
                 free: 2_000_000,
                 ahead: 6,
+                removals_pending: None,
             },
         ));
         let md = render_live(&t, &ctx("heph run //...", 600_000), COMMENT_LIMIT);
@@ -1324,6 +1325,7 @@ mod tests {
                 need: 4_000_000,
                 free: 2_000_000,
                 ahead: 6,
+                removals_pending: None,
             },
         ));
         let md = render_live(&t, &ctx("heph run //...", 600_000), COMMENT_LIMIT);
