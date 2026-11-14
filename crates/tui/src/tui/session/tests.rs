@@ -497,6 +497,62 @@ fn events_cap_truncates() {
     );
 }
 
+/// Past the cap, the view records a truncated session still needs at its end
+/// are written: the failure report, a label change, the prompt's clear and
+/// `Finished`. A prompt itself, a log line and a build event are not.
+#[test]
+fn events_cap_keeps_the_ending_view_records() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = std::fs::File::create(dir.path().join(files::EVENTS)).expect("events");
+    let rec = recorder_with(dir.path(), Box::new(file), Faults::default());
+    let tap = rec.tap();
+    let big = "x".repeat(1024 * 1024);
+    for _ in 0..70 {
+        tap.log("INFO", big.clone());
+    }
+    let prompt = SessionRecordKind::Approval {
+        prompt: Some(Box::new(ApprovalPrompt {
+            addr: "//a:gate".into(),
+            ..ApprovalPrompt::default()
+        })),
+    };
+    let kept = [
+        SessionRecordKind::Label {
+            label: "run //a:... (4 matched)".into(),
+        },
+        SessionRecordKind::Approval { prompt: None },
+        SessionRecordKind::Finished,
+        SessionRecordKind::Output {
+            text: "failed: //a:bad\n".into(),
+        },
+    ];
+    tap.view(1, prompt);
+    tap.event(events().remove(0));
+    for kind in kept.iter().cloned() {
+        tap.view(1, kind);
+    }
+    tap.log("INFO", "after the cap".into());
+    rec.finish(Some(1), false, Duration::from_secs(10));
+
+    let (records, _) = read_records(dir.path());
+    let tail: Vec<_> = records
+        .iter()
+        .skip_while(|r| r.session != Some(SessionRecordKind::Truncated))
+        .collect();
+    assert!(
+        tail.iter().all(|r| r.kind.is_none()),
+        "no build event past the cap"
+    );
+    let kinds: Vec<_> = tail.iter().filter_map(|r| r.session.clone()).collect();
+    let mut want = vec![SessionRecordKind::Truncated];
+    want.extend(kept);
+    want.push(SessionRecordKind::End {
+        exit_code: Some(1),
+        panicked: false,
+    });
+    assert_eq!(kinds, want);
+}
+
 /// A12: a taken id is skipped for a fresh draw.
 #[test]
 fn id_collision_retries() {

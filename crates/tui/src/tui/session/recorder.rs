@@ -9,7 +9,8 @@
 //!
 //! - `events.ndjson`: through a `BufWriter`, flushed 250ms after the first
 //!   unflushed byte and at exit; capped at [`EVENTS_CAP`] with a `Truncated`
-//!   record, after which only `End`/`InflightWritten` are appended.
+//!   record, after which only `End`/`InflightWritten` and the view records
+//!   [`outlives_cap`] names are appended.
 //! - `status.json`: at most once a second and only when something changed,
 //!   written to a temp file and renamed over.
 //!
@@ -355,6 +356,27 @@ fn injected_panic() {
 #[cfg(not(test))]
 fn injected_panic() {}
 
+/// View records written past the cap, like `End`: what a truncated session
+/// still needs to read right at its end. `Finished` (when the summary was
+/// measured), `Output` (the failure report, once per run), a `Label` change
+/// (one short line), and the approval prompt's *clear*, so a prompt recorded
+/// before the cap does not stay on a viewer's screen. A prompt itself carries
+/// notice paths and stays capped.
+fn outlives_cap(kind: &SessionRecordKind) -> bool {
+    match kind {
+        SessionRecordKind::Finished
+        | SessionRecordKind::Output { .. }
+        | SessionRecordKind::Label { .. }
+        | SessionRecordKind::Approval { prompt: None } => true,
+        SessionRecordKind::Approval { prompt: Some(_) }
+        | SessionRecordKind::Log { .. }
+        | SessionRecordKind::End { .. }
+        | SessionRecordKind::Truncated
+        | SessionRecordKind::InflightWritten
+        | SessionRecordKind::Unknown => false,
+    }
+}
+
 /// Test-only fault injection. Always default outside tests.
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct Faults {
@@ -601,12 +623,9 @@ impl RecorderThread {
                     SessionRecordKind::InflightWritten,
                 ))
                 .and_then(|()| self.flush()),
-            // `Finished` is small and tells a viewer when the summary was
-            // measured, so it outlives the cap like `End`.
-            Msg::View {
-                at_unix_ms,
-                kind: kind @ SessionRecordKind::Finished,
-            } => self.append(&SessionRecord::session(at_unix_ms, kind)),
+            Msg::View { at_unix_ms, kind } if outlives_cap(&kind) => {
+                self.append(&SessionRecord::session(at_unix_ms, kind))
+            }
             Msg::View { at_unix_ms, kind } => {
                 self.append_capped(&SessionRecord::session(at_unix_ms, kind))
             }
@@ -694,7 +713,8 @@ impl RecorderThread {
     }
 
     /// Append a record regardless of the cap (`End`, `Truncated`,
-    /// `InflightWritten`: small, and a viewer needs them).
+    /// `InflightWritten`, and what [`outlives_cap`] lets through: a viewer
+    /// needs them).
     fn append(&mut self, record: &impl serde::Serialize) -> io::Result<()> {
         if !self.encode(record) {
             return Ok(());

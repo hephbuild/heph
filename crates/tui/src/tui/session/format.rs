@@ -214,7 +214,8 @@ pub enum SessionRecordKind {
         panicked: bool,
     },
     /// `events.ndjson` reached its size cap; no build event or log line follows
-    /// (`End`, `InflightWritten` and `Finished` still do). `status.json` keeps updating.
+    /// (`End`, `InflightWritten`, `Finished`, `Output`, `Label` and an
+    /// `Approval` clearing the prompt still do). `status.json` keeps updating.
     Truncated,
     /// The owner answered an in-flight request: `inflight.txt` is fresh.
     InflightWritten,

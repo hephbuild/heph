@@ -178,7 +178,9 @@ included. The recorder is its own OS thread behind an unbounded channel:
   same way past 500k pending events. A stopped recorder keeps its lock until
   the process exits, so the session reads as live while it is.
 - `events.ndjson` stops at **64 MiB** with a `Truncated` record; `status.json`
-  keeps updating.
+  keeps updating. Past it, only what a viewer needs at the end is appended:
+  `End`, `InflightWritten`, `Finished`, the failure report (`Output`), a
+  `Label` change, and an `Approval` that clears the prompt.
 
 What a run loses: a process wedged before its first flush loses at most 250ms
 of events; a second Ctrl-C, `SIGTERM`/`SIGHUP` or `SIGKILL` loses what came
