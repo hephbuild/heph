@@ -973,12 +973,14 @@ fn cache_db_event(report: &CompactReport) -> BuildEventKind {
             (!complete).then(|| "stopped early; the next gc continues".to_string()),
         ),
         CompactAction::Converted { freed_bytes } => ("converted", *freed_bytes, 0, 0, None),
-        CompactAction::SkippedLocked => (
+        CompactAction::SkippedLocked { reason } => (
             "skipped",
             0,
             0,
             0,
-            Some("another heph holds the cache's migration lock".to_string()),
+            Some(format!(
+                "conversion needs the cache's migration lock: {reason}"
+            )),
         ),
         CompactAction::SkippedNeedsSpace { short } => {
             let worst = short
@@ -1004,6 +1006,13 @@ fn cache_db_event(report: &CompactReport) -> BuildEventKind {
                 Some(detail),
             )
         }
+    };
+    // Steps that failed after the pages moved ride along with the action's
+    // own detail; they never turn the pass into a failure.
+    let detail = match (detail, report.notes.is_empty()) {
+        (detail, true) => detail,
+        (None, false) => Some(report.notes.join("; ")),
+        (Some(d), false) => Some(format!("{d}; {}", report.notes.join("; "))),
     };
     BuildEventKind::GcCacheDb {
         file_bytes: s.file_bytes,
@@ -2306,7 +2315,8 @@ mod tests {
 
     // --- cache.db conversion and vacuum -----------------------------------
 
-    use crate::engine::{MaintenanceOverrides, VacuumMode};
+    use crate::engine::{CacheDbSpace, MaintenanceOverrides, VacuumMode};
+    use std::time::Duration;
 
     fn db_pragma(path: &std::path::Path, name: &str) -> i64 {
         rusqlite::Connection::open(path)
@@ -2370,10 +2380,118 @@ mod tests {
         let engine = Arc::new(Engine::new(cfg).expect("engine"));
         assert_eq!(engine.cache_db_path(), db);
         engine.set_cache_db_maintenance(MaintenanceOverrides {
-            policy: None,
             free_space,
+            ..MaintenanceOverrides::default()
         });
         (engine, dir, db)
+    }
+
+    /// The `detail` of the `GcCacheDb` event for `report`.
+    fn event_detail(report: &CompactReport) -> Option<String> {
+        let BuildEventKind::GcCacheDb { detail, .. } = cache_db_event(report) else {
+            panic!("a GcCacheDb event");
+        };
+        detail
+    }
+
+    /// Another process holding the migration lock past gc's wait skips the
+    /// conversion, and the skip carries the lock's own error, not a guess.
+    #[tokio::test]
+    async fn gc_all_skips_the_conversion_while_the_migration_lock_is_held() {
+        let (engine, _dir, db) = engine_over_db("NONE", Some(u64::MAX));
+        engine.set_cache_db_maintenance(MaintenanceOverrides {
+            free_space: Some(u64::MAX),
+            migrate_lock_timeout: Some(Duration::from_millis(50)),
+            ..MaintenanceOverrides::default()
+        });
+        let held = hwalk::migrate_lock::lock_migration(&db, Duration::from_secs(5))
+            .expect("hold the migration lock");
+
+        let stats = Arc::clone(&engine)
+            .gc_all(engine.new_state())
+            .await
+            .expect("gc_all, even with the lock held");
+        drop(held);
+
+        let report = stats.cache_db.expect("cache.db pass reported");
+        let CompactAction::SkippedLocked { reason } = &report.action else {
+            panic!("expected SkippedLocked: {report:?}");
+        };
+        assert!(
+            reason.contains("timed out") && reason.contains("-migrate.lock"),
+            "{reason}"
+        );
+        assert_eq!(db_pragma(&db, "auto_vacuum"), 0, "still NONE");
+        let detail = event_detail(&report).expect("a skip says why");
+        assert!(detail.contains(reason.as_str()), "{detail}");
+    }
+
+    /// A gc cancelled before its vacuum is done stops at a chunk boundary:
+    /// the pass reports `complete: false` and the event says so, free pages
+    /// remain, nothing is recorded — and the next gc finishes the job.
+    #[tokio::test]
+    async fn a_cancelled_gc_vacuum_stops_early_and_the_next_one_finishes() {
+        let (engine, _dir, db) = engine_over_db("INCREMENTAL", Some(0));
+        let sidecar = crate::engine::cache_db_space::sidecar_path(&db);
+        let free_before = db_pragma(&db, "freelist_count");
+        let ctoken = StdCancellationToken::new();
+        ctoken.cancel();
+
+        let report = engine
+            .sqlite_writes
+            .compact_for_gc(Box::new(move || !ctoken.is_cancelled()))
+            .expect("a cancelled pass still reports");
+
+        assert!(
+            matches!(report.action, CompactAction::Vacuumed { complete: false, .. }),
+            "{report:?}"
+        );
+        assert_eq!(db_pragma(&db, "freelist_count"), free_before, "no chunk ran");
+        assert!(!sidecar.exists(), "an unfinished vacuum records nothing");
+        let detail = event_detail(&report).expect("detail");
+        assert!(detail.contains("stopped early"), "{detail}");
+
+        let report = engine
+            .sqlite_writes
+            .compact_for_gc(Box::new(|| true))
+            .expect("the next pass");
+        assert!(
+            matches!(report.action, CompactAction::Vacuumed { complete: true, .. }),
+            "{report:?}"
+        );
+        assert_eq!(db_pragma(&db, "freelist_count"), 0);
+        assert!(sidecar.exists(), "the finished vacuum is recorded");
+        assert_eq!(event_detail(&report), None);
+    }
+
+    /// A step that failed after the pages moved rides along in the event's
+    /// detail, next to the action's own.
+    #[test]
+    fn notes_ride_along_in_the_event_detail() {
+        let report = CompactReport {
+            before: CacheDbSpace::default(),
+            after: CacheDbSpace::default(),
+            action: CompactAction::Vacuumed {
+                freed_bytes: 1,
+                complete: false,
+            },
+            notes: vec!["recording the vacuum failed: denied".to_string()],
+        };
+        assert_eq!(
+            event_detail(&report).as_deref(),
+            Some("stopped early; the next gc continues; recording the vacuum failed: denied")
+        );
+        let complete = CompactReport {
+            action: CompactAction::Vacuumed {
+                freed_bytes: 1,
+                complete: true,
+            },
+            ..report
+        };
+        assert_eq!(
+            event_detail(&complete).as_deref(),
+            Some("recording the vacuum failed: denied")
+        );
     }
 
     /// `heph tool gc` converts a `NONE` database to `INCREMENTAL` when the disk

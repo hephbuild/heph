@@ -1,5 +1,6 @@
 use crate::engine::cache_db_space::{
     self, CompactReport, JOURNAL_SIZE_LIMIT_BYTES, MaintainKind, ReclaimPolicy,
+    WRITER_BUSY_TIMEOUT,
 };
 use crate::engine::local_cache::{
     EntryWriter, Existence, LocalCache, NotFoundError, PendingWrite, SizedReader, TargetStream,
@@ -474,6 +475,21 @@ pub struct MaintenanceOverrides {
     pub policy: Option<ReclaimPolicy>,
     /// The free bytes every filesystem reports to the conversion space check.
     pub free_space: Option<u64>,
+    /// Replaces `MIGRATE_LOCK_TIMEOUT` as `heph tool gc`'s wait for the
+    /// migration lock before it skips a conversion.
+    pub migrate_lock_timeout: Option<Duration>,
+    /// Replaces [`WRITER_BUSY_TIMEOUT`] on the writer connection. Read when
+    /// the writer is spawned, i.e. by the first write.
+    pub busy_timeout: Option<Duration>,
+}
+
+/// The maintenance knobs in effect: the defaults, or a test's overrides.
+#[derive(Debug, Clone, Copy)]
+struct Knobs {
+    policy: ReclaimPolicy,
+    free_space: Option<u64>,
+    migrate_lock_timeout: Duration,
+    busy_timeout: Duration,
 }
 
 impl LocalCacheSQLite {
@@ -482,16 +498,24 @@ impl LocalCacheSQLite {
         *self.overrides.lock().expect("overrides poisoned") = o;
     }
 
-    fn maintenance_overrides(&self) -> (ReclaimPolicy, Option<u64>) {
+    fn knobs(&self) -> Knobs {
+        let k = Knobs {
+            policy: ReclaimPolicy::default(),
+            free_space: None,
+            migrate_lock_timeout: hwalk::migrate_lock::MIGRATE_LOCK_TIMEOUT,
+            busy_timeout: WRITER_BUSY_TIMEOUT,
+        };
         #[cfg(any(test, feature = "test-support"))]
-        {
+        let k = {
             let o = *self.overrides.lock().expect("overrides poisoned");
-            (o.policy.unwrap_or_default(), o.free_space)
-        }
-        #[cfg(not(any(test, feature = "test-support")))]
-        {
-            (ReclaimPolicy::default(), None)
-        }
+            Knobs {
+                policy: o.policy.unwrap_or(k.policy),
+                free_space: o.free_space,
+                migrate_lock_timeout: o.migrate_lock_timeout.unwrap_or(k.migrate_lock_timeout),
+                busy_timeout: o.busy_timeout.unwrap_or(k.busy_timeout),
+            }
+        };
+        k
     }
 
     /// Hand `kind` to the writer thread and wait for its report. Parks the
@@ -520,9 +544,8 @@ impl LocalCacheSQLite {
     /// `INCREMENTAL` database if [`ReclaimPolicy::due`], within its time
     /// budget. See [`cache_db_space`].
     pub(crate) fn reclaim_after_trim(&self) -> Result<CompactReport> {
-        let (policy, _) = self.maintenance_overrides();
         self.maintain(
-            MaintainKind::AfterTrim(policy),
+            MaintainKind::AfterTrim(self.knobs().policy),
             Box::new(|| true),
             #[cfg(test)]
             None,
@@ -539,27 +562,32 @@ impl LocalCacheSQLite {
     /// rewriting the file. A lock another process holds past the usual wait
     /// skips the conversion (and still vacuums, if the database is already
     /// `INCREMENTAL`) rather than failing the sweep.
+    ///
+    /// The lock is held for the whole pass, the conversion's `VACUUM`
+    /// included, which rewrites the file and holds its write lock throughout:
+    /// another heph process using this home meanwhile waits — its schema check
+    /// on the migration lock (up to `MIGRATE_LOCK_TIMEOUT`, only for a database
+    /// it has to migrate), its cache writes on the write lock.
     pub(crate) fn compact_for_gc(
         &self,
         keep_going: Box<dyn Fn() -> bool + Send>,
     ) -> Result<CompactReport> {
         self.ensure_schema()?;
-        let (policy, free_space_override) = self.maintenance_overrides();
-        let lock = match hwalk::migrate_lock::lock_migration(
-            &self.db_path,
-            hwalk::migrate_lock::MIGRATE_LOCK_TIMEOUT,
-        ) {
-            Ok(lock) => Some(lock),
-            Err(e) => {
-                tracing::warn!(error = %format!("{e:#}"), "cache.db conversion skipped");
-                None
-            }
-        };
+        let knobs = self.knobs();
+        let (lock, convert_blocked) =
+            match hwalk::migrate_lock::lock_migration(&self.db_path, knobs.migrate_lock_timeout) {
+                Ok(lock) => (Some(lock), None),
+                Err(e) => {
+                    let reason = format!("{e:#}");
+                    tracing::warn!(error = %reason, "cache.db conversion skipped");
+                    (None, Some(reason))
+                }
+            };
         let report = self.maintain(
             MaintainKind::Gc {
-                may_convert: lock.is_some(),
-                chunk_bytes: policy.chunk_bytes,
-                free_space_override,
+                convert_blocked,
+                chunk_bytes: knobs.policy.chunk_bytes,
+                free_space_override: knobs.free_space,
             },
             keep_going,
             #[cfg(test)]
@@ -785,8 +813,7 @@ impl LocalCacheSQLite {
         // is reset, so a large batch or a vacuum does not leave it at its
         // high-water mark.
         conn.execute_batch(&format!(
-            "PRAGMA busy_timeout = 10000;
-             PRAGMA synchronous = NORMAL;
+            "PRAGMA synchronous = NORMAL;
              PRAGMA foreign_keys = ON;
              PRAGMA temp_store = MEMORY;
              PRAGMA cache_size = -64000;
@@ -794,6 +821,8 @@ impl LocalCacheSQLite {
              PRAGMA journal_size_limit = {JOURNAL_SIZE_LIMIT_BYTES};"
         ))
         .context("configuring sqlite cache write connection")?;
+        conn.busy_timeout(self.knobs().busy_timeout)
+            .context("setting the sqlite cache writer busy timeout")?;
 
         let (tx, rx) = mpsc::channel::<WriterCmd>();
         let pending = Arc::clone(&self.pending);
@@ -3056,7 +3085,7 @@ mod tests {
         let cache = open(path)?;
         cache.set_maintenance_overrides(MaintenanceOverrides {
             policy: Some(policy),
-            free_space: None,
+            ..MaintenanceOverrides::default()
         });
         Ok(cache)
     }
@@ -3235,6 +3264,52 @@ mod tests {
         };
         let (before, after, action) = reclaim_case(policy, Some(SystemTime::now() - TWO_HOURS))?;
         assert_untouched(&before, &after, &action);
+        Ok(())
+    }
+
+    /// (6) A reclaim out of budget stops at the first chunk boundary: the pass
+    /// reports `complete: false`, the free pages stay, the sidecar does not
+    /// move (so the interval does not restart) — and the next reclaim, with
+    /// budget, finishes.
+    #[test]
+    fn a_reclaim_out_of_budget_stops_early_and_the_next_one_finishes() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("cache.db");
+        let cache = open_with(
+            &path,
+            ReclaimPolicy {
+                budget: Duration::ZERO,
+                ..small_policy()
+            },
+        )?;
+        let addr = fill_and_free(&cache, &path)?;
+        let old = SystemTime::now() - TWO_HOURS;
+        write_sidecar(&path, old)?;
+        let before = snap(&path)?;
+
+        let report = cache.reclaim_after_trim()?;
+        let after = snap(&path)?;
+        assert!(
+            matches!(
+                report.action,
+                CompactAction::Vacuumed {
+                    complete: false,
+                    ..
+                }
+            ),
+            "{report:?}"
+        );
+        assert_eq!(after.free_pages, before.free_pages, "no chunk ran");
+        assert_eq!(after.sidecar, before.sidecar, "the sidecar did not move");
+        assert_kept(&cache, &addr)?;
+
+        cache.set_maintenance_overrides(MaintenanceOverrides {
+            policy: Some(small_policy()),
+            ..MaintenanceOverrides::default()
+        });
+        let report = cache.reclaim_after_trim()?;
+        assert_vacuumed(&after, &snap(&path)?, &report.action);
+        assert_kept(&cache, &addr)?;
         Ok(())
     }
 
