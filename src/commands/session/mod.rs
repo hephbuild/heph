@@ -12,7 +12,8 @@
 //! Exit codes: 125 for this command's own failures (no such session, an
 //! ambiguous id, a format this heph cannot read, a lost session on attach, an
 //! in-flight request that went unanswered); `attach` otherwise exits with the
-//! session's exit code, and 0 on detach. See [`SessionExit`].
+//! session's exit code, and 0 on detach. A session can exit 125 too, so
+//! `attach` names a mirrored 125 on stderr. See [`SessionExit`].
 
 mod attach;
 mod list;
@@ -74,7 +75,7 @@ pub enum SessionCommands {
     ///
     /// `q` (or Ctrl-C) detaches and leaves the session running. Exits with the
     /// session's exit code once it ends, 0 on detach, and 125 when heph cannot
-    /// follow it.
+    /// follow it. A 125 that is the session's own is named on stderr.
     ///
     /// Examples:
     ///
@@ -195,8 +196,8 @@ pub struct SessionExit {
 }
 
 impl SessionExit {
-    /// The command's own failure (A14), distinct from any code a session can
-    /// mirror through `attach`.
+    /// The command's own failure (A14). A session can exit 125 as well;
+    /// `attach` says so on stderr when it mirrors one (`attach::exit_note`).
     pub const OWN_FAILURE: u8 = 125;
 
     pub fn own(error: anyhow::Error) -> Self {

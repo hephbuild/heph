@@ -78,7 +78,28 @@ pub(crate) async fn attach(
     // The run printed these below its final summary; the viewer's own summary
     // was printed at its teardown, so they land in the same place.
     sink.write_diagnostic(&after.take());
-    outcome_result(entry.id, outcome?)
+    let outcome = outcome?;
+    if let Some(note) = exit_note(entry.id, outcome) {
+        sink.write_diagnostic(&note);
+    }
+    outcome_result(entry.id, outcome)
+}
+
+/// The stderr line saying why `attach` exits as it does, when the code alone
+/// would mislead (U1): a mirrored 125 reads like this command's own failure,
+/// and a code outside 0–255 is not an exit status, so 125 stands in for it.
+/// An `End` with no code is an error of its own, rendered with its reason.
+pub(crate) fn exit_note(id: SessionId, outcome: Outcome) -> Option<String> {
+    let Outcome::Ended(Some(code)) = outcome else {
+        return None;
+    };
+    match u8::try_from(code) {
+        Ok(SessionExit::OWN_FAILURE) => Some(format!("heph: session {id} exited 125\n")),
+        Ok(_) => None,
+        Err(_) => Some(format!(
+            "heph: session {id} exited {code}, not an exit status (0-255); exiting 125\n"
+        )),
+    }
 }
 
 /// The command's result for how the follow ended (A14).

@@ -34,9 +34,15 @@ or suffix of an id; an ambiguous one lists the candidates.
 Every error of `heph session` itself exits **125**: no such session, an
 ambiguous id, a directory format newer than this heph, a lost session for
 `attach`, a session whose `End` carries no exit code, an `inflight` that is
-not answered or is asked of an ended session. 125 is outside what a session
-can mirror for a build heph ran, so an agent waiting with `attach` tells "the
-run failed" from "the wait failed".
+not answered or is asked of an ended session. By code alone 125 is ambiguous:
+a session can exit 125 itself (an entrypoint whose heph-side setup failed, or
+a tool that exits 125), and `attach` mirrors it. So whenever `attach` exits
+125 for a reason other than its own error, it says so on stderr: `heph:
+session <id> exited 125` for a mirrored 125, `heph: session <id> exited N, not
+an exit status (0-255); exiting 125` for a recorded code outside 0-255. A
+session whose `End` carries no code (killed by a signal, or it panicked) is
+reported as an error with that reason. An agent tells "the run failed" from
+"the wait failed" by that line, or by `heph session show <id> --json`.
 
 STATE is computed by the viewer, never stored: `running`; `waiting` (every
 open target is in a lock or admission wait); `stalled` (no event for longer

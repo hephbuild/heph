@@ -650,6 +650,35 @@ fn exit_code_mapping() {
     assert_eq!(code(Outcome::Ended(Some(2))), Err(Some(2)));
     assert_eq!(code(Outcome::Ended(None)), Err(Some(125)));
     assert_eq!(code(Outcome::Lost), Err(Some(125)));
+
+    // U1: a 125 that is not this command's own failure says why on stderr.
+    let note = |o| attach::exit_note(id, o);
+    assert_eq!(
+        note(Outcome::Ended(Some(125))),
+        Some(format!("heph: session {id} exited 125\n"))
+    );
+    assert_eq!(code(Outcome::Ended(Some(125))), Err(Some(125)));
+    for weird in [-1, 256, i32::MIN] {
+        assert_eq!(
+            note(Outcome::Ended(Some(weird))),
+            Some(format!(
+                "heph: session {id} exited {weird}, not an exit status (0-255); exiting 125\n"
+            )),
+        );
+        assert_eq!(code(Outcome::Ended(Some(weird))), Err(Some(125)));
+    }
+    for quiet in [
+        Outcome::Ended(Some(0)),
+        Outcome::Ended(Some(2)),
+        Outcome::Ended(Some(124)),
+        Outcome::Ended(Some(255)),
+        // These carry their reason in the error itself.
+        Outcome::Ended(None),
+        Outcome::Lost,
+        Outcome::Detached,
+    ] {
+        assert_eq!(note(quiet), None, "{quiet:?}");
+    }
 }
 
 /// `attach` on the line backend follows to the end and mirrors the exit code;
