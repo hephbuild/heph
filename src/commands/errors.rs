@@ -153,6 +153,11 @@ fn render_target_failure(f: &TargetFailure, color: bool) -> String {
     if let Some(path) = f.log.as_ref().and_then(|l| l.path()) {
         out.push_str(&format!("  full log: {}\n", path.display()));
     }
+    // Someone used to inspecting the failed sandbox learns where it went (and
+    // how to keep the next one), or where the kept one is.
+    if let Some(sandbox) = &f.sandbox {
+        out.push_str(&format!("  sandbox: {sandbox}\n"));
+    }
     if let Some(outputs) = &f.outputs {
         out.push_str(&format!("  outputs: {}\n", outputs.display()));
     }
@@ -853,7 +858,7 @@ fn render_anyhow_to_string(e: &anyhow::Error, color: bool) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::error::{LogTail, ProcessFailed};
+    use crate::engine::error::{LogTail, ProcessFailed, SandboxFate};
     use anyhow::Context as _;
     use std::sync::Arc;
 
@@ -1419,6 +1424,61 @@ mod tests {
             rendered.ends_with(&format!("  full log: {}\n", path.display())),
             "{rendered}"
         );
+    }
+
+    /// The box's `sandbox:` line, after the log footer, for each fate: removed
+    /// (naming the flag that keeps it), kept (with the path the user opted in
+    /// for), removed for credential material in spite of the flag, left
+    /// behind an abandoned run. No fate, no line.
+    #[test]
+    fn failure_box_names_a_removed_sandbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.txt");
+        std::fs::write(&path, "line\n").unwrap();
+        let log = || {
+            Some(crate::engine::error::FailureLog::open(
+                path.clone(),
+                std::fs::File::open(&path).unwrap(),
+                10,
+            ))
+        };
+        let addr = crate::htaddr::parse_addr("//p:a").unwrap();
+
+        let kept_at = dir.path().join("sandbox/p/__target_a");
+        for (fate, line) in [
+            (
+                SandboxFate::Removed,
+                "removed (rerun with --keep-failed-sandboxes to keep it)".to_owned(),
+            ),
+            (
+                SandboxFate::Kept(kept_at.clone()),
+                format!("{} (kept)", kept_at.display()),
+            ),
+            (
+                SandboxFate::RemovedMaterial,
+                "removed (credential material)".to_owned(),
+            ),
+            (
+                SandboxFate::LeftAbandoned,
+                "left (run abandoned after timeout)".to_owned(),
+            ),
+        ] {
+            let failure = TargetFailure::new(addr.clone(), None, anyhow::anyhow!("boom"))
+                .with_log(log())
+                .with_sandbox(Some(fate.clone()));
+            let rendered = render_target_failure(&failure, false);
+            assert!(
+                rendered.ends_with(&format!(
+                    "  full log: {}\n  sandbox: {line}\n",
+                    path.display()
+                )),
+                "{fate:?}: {rendered}"
+            );
+        }
+
+        let none = TargetFailure::new(addr, None, anyhow::anyhow!("boom")).with_log(log());
+        let rendered = render_target_failure(&none, false);
+        assert!(!rendered.contains("sandbox:"), "{rendered}");
     }
 
     #[test]

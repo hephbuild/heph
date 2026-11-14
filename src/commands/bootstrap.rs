@@ -261,26 +261,20 @@ fn apply_run_overrides(
     Ok(())
 }
 
-fn new_engine_with(
+/// The engine's runtime config for one command: the workspace's config file
+/// under `root`, with the run's own choices (the command line, `vars`' and the
+/// process's environment) laid over it. What [`new_engine_with`] hands
+/// `Engine::new`, and the config file it read, for the plugins.
+fn engine_config(
+    root: &std::path::Path,
     global: &super::GlobalOptions,
     bad_env: BadEnv,
-) -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
-    let root = match engine::get_root() {
-        Ok(r) => r,
-        Err(inner) => anyhow::bail!("Error: {}", inner),
-    };
-
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> anyhow::Result<(config_yaml::ConfigYaml, engine::Config)> {
     // The config file is the all-optional, profile-layered YAML; `resolve`
     // applies every default in one place and yields the engine's runtime config.
-    let file = config_yaml::load_from_root(&root)?;
-    let mut config = file.resolve(&root)?;
-
-    // Point `SIGQUIT` dumps at the resolved home as soon as it is known — before
-    // the engine is built and plugins are downloaded and loaded, which is where
-    // a startup hang is likeliest — so they land beside the stall log and the
-    // in-flight report rather than in the temp-dir fallback. Every command routes
-    // through here, so every command gets it.
-    crate::diag::set_dump_dir(&config.home_dir);
+    let file = config_yaml::load_from_root(root)?;
+    let mut config = file.resolve(root)?;
 
     // The kill switch for listed facts: every candidate a fact would have
     // decided is resolved instead. Read here, never by the engine. It is
@@ -292,11 +286,34 @@ fn new_engine_with(
         listed_facts_kill_switch(std::env::var_os("HEPH_NO_LISTED_FACTS").as_deref()),
     );
 
+    // A run's choice, like `--fail-fast`: never in the config file.
+    config.keep_failed_sandboxes = global.keep_failed_sandboxes;
+
     // Pool capacities: flag over `HEPH_RESOURCE_<NAME>` over the config file;
     // the engine supplies the default for a pool none of them names. Read here,
     // like the kill switch above, so the engine never looks at the environment.
     // Parsed against the config's units, which is why they wait until now.
-    apply_run_overrides(&mut config.resources, std::env::vars_os(), global, bad_env)?;
+    apply_run_overrides(&mut config.resources, vars, global, bad_env)?;
+    Ok((file, config))
+}
+
+fn new_engine_with(
+    global: &super::GlobalOptions,
+    bad_env: BadEnv,
+) -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
+    let root = match engine::get_root() {
+        Ok(r) => r,
+        Err(inner) => anyhow::bail!("Error: {}", inner),
+    };
+
+    let (file, config) = engine_config(&root, global, bad_env, std::env::vars_os())?;
+
+    // Point `SIGQUIT` dumps at the resolved home as soon as it is known — before
+    // the engine is built and plugins are downloaded and loaded, which is where
+    // a startup hang is likeliest — so they land beside the stall log and the
+    // in-flight report rather than in the temp-dir fallback. Every command routes
+    // through here, so every command gets it.
+    crate::diag::set_dump_dir(&config.home_dir);
 
     // Captured before `config` is moved into the engine: the nix driver's state
     // dir hangs off `home_dir`, and telemetry reports the remote-cache backend
@@ -531,6 +548,26 @@ fn hard_abort(exit: impl FnOnce(i32)) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--keep-failed-sandboxes` reaches the engine's config through the one
+    /// function every command builds it with; without it, a failed target's
+    /// sandbox is removed.
+    #[test]
+    fn keep_failed_sandboxes_reaches_the_engine_config() {
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::write(root.path().join(".hephconfig"), "").expect("write .hephconfig");
+        let config = |global: &super::super::GlobalOptions| {
+            engine_config(root.path(), global, BadEnv::Refuse, Vec::new())
+                .expect("engine config")
+                .1
+        };
+        assert!(!config(&super::super::GlobalOptions::default()).keep_failed_sandboxes);
+        let keep = super::super::GlobalOptions {
+            keep_failed_sandboxes: true,
+            ..Default::default()
+        };
+        assert!(config(&keep).keep_failed_sandboxes);
+    }
 
     #[test]
     fn listed_facts_kill_switch_values() {

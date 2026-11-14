@@ -138,9 +138,10 @@ async fn test_failing_command_returns_error() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn test_failure_surfaces_process_log_tail() -> anyhow::Result<()> {
-    // The failure diagnostic reads the last log lines lazily from the on-disk
-    // log (the sandbox of a failed target survives until its next run), so the
-    // captured output must reach the recorded failure end-to-end.
+    // The failure diagnostic reads the last log lines from the failure slot's
+    // copy of the log (the failed target's sandbox is removed once the slot is
+    // filled), so the captured output must reach the recorded failure
+    // end-to-end.
     let ws = Workspace::new();
     ws.write_build_file(
         "fail",

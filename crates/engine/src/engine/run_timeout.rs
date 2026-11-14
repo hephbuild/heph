@@ -15,7 +15,10 @@
 //! 3. The run then has [`GRACE`] to return. Whether it does or not, the
 //!    target fails with [`TimedOutError`]; a run still going after the grace
 //!    is dropped (abandoned) rather than waited on. Its process may still be
-//!    running: dropping the future stops heph waiting, not the program.
+//!    running: dropping the future stops heph waiting, not the program. So an
+//!    abandoned run's sandbox is not removed under it ([`is_abandoned`]): it
+//!    is left on disk, its `sandbox` slot back at once, for the target's next
+//!    run to reclaim. Credential material is the exception, removed anyway.
 //! 4. However [`enforce`] ends — a result, a timeout, or being dropped
 //!    unfinished (fail-fast aborting the target's memo cell) — a run that has
 //!    not returned has its token cancelled. A driver that handed the token to
@@ -93,6 +96,12 @@ impl std::error::Error for TimedOutError {}
 /// True if `e` (anywhere in its source chain) is a [`TimedOutError`].
 pub fn is_timed_out(e: &anyhow::Error) -> bool {
     timed_out(e).is_some()
+}
+
+/// `e` is a timeout whose run did not return within the grace and was
+/// abandoned: its process may still be running, and writing to its sandbox.
+pub fn is_abandoned(e: &anyhow::Error) -> bool {
+    timed_out(e).is_some_and(|t| t.abandoned_after.is_some())
 }
 
 /// The [`TimedOutError`] anywhere in `e`'s source chain.

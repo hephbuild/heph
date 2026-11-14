@@ -192,9 +192,11 @@ bounds the build sandboxes on disk, **running or awaiting removal**:
 - Its cpu (and every other pool) returns when the run ends; its sandbox slot
   only once the sandbox directory has been removed.
 - Cache hits, non-managed drivers (`fs`, `group`, `template`, …) and the
-  sandboxes of `heph run` invocations take none. A failed target's sandbox,
-  kept on disk for its diagnostic, gives its slot back at once: there is at
-  most one such tree per failed target, and that target's next run removes it.
+  sandboxes of `heph run` invocations take none. A failed target's sandbox is
+  removed once its failure slot is filled, and holds its slot until then, like
+  a passing run's. Under `--keep-failed-sandboxes` it stays on disk instead
+  and gives its slot back at once: there is at most one such tree per failed
+  target, and that target's next run removes it.
 - It is the engine's own: a target that declares it in `resources` or reads
   `${resource:sandbox}` is refused when the def is linked. Size it with
   `--resource sandbox=<n>`, `HEPH_RESOURCE_SANDBOX=<n>` or

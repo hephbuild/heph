@@ -17,17 +17,15 @@ pub struct WorkspaceBuilder {
     dir: TempDir,
     parallelism: Option<usize>,
     fs_skip: Vec<String>,
+    keep_failed_sandboxes: bool,
     setups: Vec<SetupFn>,
 }
 
 impl WorkspaceBuilder {
     pub fn new() -> anyhow::Result<Self> {
-        Ok(Self {
-            dir: tempfile::tempdir().context("create workspace tempdir")?,
-            parallelism: None,
-            fs_skip: vec![],
-            setups: vec![],
-        })
+        Ok(Self::from_dir(
+            tempfile::tempdir().context("create workspace tempdir")?,
+        ))
     }
 
     pub fn from_dir(dir: TempDir) -> Self {
@@ -35,12 +33,20 @@ impl WorkspaceBuilder {
             dir,
             parallelism: None,
             fs_skip: vec![],
+            keep_failed_sandboxes: false,
             setups: vec![],
         }
     }
 
     pub fn with_parallelism(mut self, p: usize) -> Self {
         self.parallelism = Some(p);
+        self
+    }
+
+    /// `--keep-failed-sandboxes`: a failed target's sandbox stays on disk
+    /// instead of being removed once its failure is recorded.
+    pub fn keeping_failed_sandboxes(mut self) -> Self {
+        self.keep_failed_sandboxes = true;
         self
     }
 
@@ -101,6 +107,7 @@ impl WorkspaceBuilder {
         let mut e = Engine::new(Config {
             parallelism: self.parallelism,
             fs_skip: self.fs_skip,
+            keep_failed_sandboxes: self.keep_failed_sandboxes,
             ..Config::new(
                 self.dir.path().to_path_buf(),
                 HomeDir::resolve(self.dir.path(), None)?,

@@ -78,8 +78,10 @@
 //! bounded pool now, so it queues like any other: that is the point (it is
 //! exactly the run that piled sandboxes up). Outside the bound: cache hits,
 //! non-managed drivers and invocation sandboxes take none, and a failed run's
-//! sandbox kept for its diagnostic gives its slot back at once (one tree per
-//! failed addr, removed by that addr's next run).
+//! sandbox kept by `--keep-failed-sandboxes` gives its slot back at once (one
+//! tree per failed addr, removed by that addr's next run). A failed run's
+//! sandbox that is not kept holds its slot until its removal returns, as a
+//! passing run's does.
 
 use hcore::capacity::{PoolSpec, Unit};
 use hplugin::driver::{Demand, Resources};

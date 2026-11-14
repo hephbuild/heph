@@ -2074,15 +2074,17 @@ fn classify_failure(
     };
     let log_tail = log.as_ref().and_then(|l| l.tail().ok());
     let outputs = failure_slot_out(&e);
-    let fixes = downcast_chain_ref::<crate::engine::failure_slot::FailureSlot>(&e)
-        .and_then(|s| s.fixes.clone());
+    let slot = downcast_chain_ref::<crate::engine::failure_slot::FailureSlot>(&e);
+    let fixes = slot.and_then(|s| s.fixes.clone());
+    let sandbox = slot.and_then(|s| s.sandbox.clone());
     rs.record_failure(
         addr.clone(),
         Arc::new(
             TargetFailure::new(addr.clone(), log_tail, e)
                 .with_log(log)
                 .with_outputs(outputs)
-                .with_fixes(fixes),
+                .with_fixes(fixes)
+                .with_sandbox(sandbox),
         ),
     );
     UpstreamFailed { root: addr.clone() }.into()
@@ -4900,14 +4902,34 @@ impl Engine {
                         Ok(metas) => metas,
                         Err(err) => {
                             // A target failure, like any `Err` leaving the
-                            // execute: the sandbox stays on disk for the
-                            // failure diagnostic (which reads it lazily) and
-                            // for a post-mortem of the artifacts it failed to
+                            // execute: nothing reads the sandbox past this
+                            // point, so it is removed, its slot guards first
+                            // as on the completion path below; under
+                            // `--keep-failed-sandboxes` it stays on disk for
+                            // a post-mortem of the artifacts it failed to
                             // hash. A bare `?` here would fall into the drop
                             // path, which reclaims — that path must mean
                             // cancellation only.
-                            sandbox_teardown.leave_for_diagnostics();
-                            return Err(err);
+                            drop(sandbox_guards);
+                            let fate = if engine.cfg.keep_failed_sandboxes {
+                                let kept = engine.sandbox_on_disk(sandbox_teardown.dir());
+                                sandbox_teardown.leave_for_diagnostics();
+                                hplugin::error::SandboxFate::Kept(kept)
+                            } else {
+                                let upper = engine.fuse_upper(sandbox_teardown.dir());
+                                sandbox_teardown.reclaim(upper);
+                                hplugin::error::SandboxFate::Removed
+                            };
+                            // No slot is filled for a failure past the run;
+                            // the box learns the sandbox's fate from an empty
+                            // one, for a run that had a tree.
+                            let managed = engine
+                                .drivers_by_name
+                                .get(&spec.driver)
+                                .is_some_and(|d| d.managed);
+                            let slot = crate::engine::failure_slot::FailureSlot::default()
+                                .with_sandbox(managed.then_some(fate));
+                            return Err(err.context(slot));
                         }
                     };
 
@@ -5011,11 +5033,11 @@ impl Engine {
                     //   run itself succeeded, so there is no process log tail
                     //   riding on this sandbox's survival.
                     // * A *failing target* never gets here: the run error in
-                    //   `Engine::execute` and the `artifacts_meta` error above
-                    //   both resolve as `leave_for_diagnostics`, keeping the
-                    //   sandbox (and its log) on disk for the lazily-rendered
-                    //   failure diagnostic, exactly as before teardown
-                    //   ownership existed.
+                    //   `Engine::execute` (once its failure slot is filled)
+                    //   and the `artifacts_meta` error above both `reclaim`
+                    //   the sandbox, or, under `--keep-failed-sandboxes`,
+                    //   resolve as `leave_for_diagnostics` and keep it on
+                    //   disk until the addr's next run.
                     // * A bare drop — cancellation or an unwind, and only
                     //   those — enqueues a generation-checked reclaim.
                     //

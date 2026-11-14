@@ -576,7 +576,41 @@ pub struct TargetFailure {
     /// `write_on_failure` output that failed with a process exit: the fixes
     /// it wrote, or why it wrote none. `None` for every other failure.
     pub fixes: Option<FailureFixes>,
+    /// What became of the failed run's sandbox: the box's `sandbox:` line.
+    /// `None` when there is nothing to say — the run had no sandbox (a plain
+    /// driver, a failure before its tree existed), or its removal was not a
+    /// choice (credential material without `--keep-failed-sandboxes`).
+    pub sandbox: Option<SandboxFate>,
     pub source: std::sync::Arc<anyhow::Error>,
+}
+
+/// What became of a failed run's sandbox, as the failure box reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SandboxFate {
+    /// Removed once the failure slot was filled: the default, which
+    /// `--keep-failed-sandboxes` would have changed.
+    Removed,
+    /// Left on disk under `--keep-failed-sandboxes`, at this path, until the
+    /// target's next run.
+    Kept(std::path::PathBuf),
+    /// Removed in spite of `--keep-failed-sandboxes`: the run's outputs are
+    /// credential material, which no diagnostic is worth leaving on disk.
+    RemovedMaterial,
+    /// Left on disk because the run timed out and was abandoned: its process
+    /// may still be writing to the tree, so nothing removes it under that
+    /// writer. The target's next run reclaims it.
+    LeftAbandoned,
+}
+
+impl fmt::Display for SandboxFate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Removed => f.write_str("removed (rerun with --keep-failed-sandboxes to keep it)"),
+            Self::Kept(path) => write!(f, "{} (kept)", path.display()),
+            Self::RemovedMaterial => f.write_str("removed (credential material)"),
+            Self::LeftAbandoned => f.write_str("left (run abandoned after timeout)"),
+        }
+    }
 }
 
 /// What a failed `in_place` run's write-back did to the tree (D20, D21).
@@ -622,8 +656,15 @@ impl TargetFailure {
             log: None,
             outputs: None,
             fixes: None,
+            sandbox: None,
             source: std::sync::Arc::new(source),
         }
+    }
+
+    /// The same failure, saying what became of its sandbox.
+    pub fn with_sandbox(mut self, sandbox: Option<SandboxFate>) -> Self {
+        self.sandbox = sandbox;
+        self
     }
 
     /// The same failure with what its `in_place` write-back did.

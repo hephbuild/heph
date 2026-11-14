@@ -1,6 +1,7 @@
 use crate::engine::driver::inputartifact::{InputArtifact, Type};
 use crate::engine::driver::outputartifact::OutputArtifact;
 use crate::engine::driver::{RunInput, RunRequest, RunResponse};
+use crate::engine::error::SandboxFate;
 use crate::engine::link::{LinkedTargetDef, LinkedTargetDefInput};
 use crate::engine::provider::TargetSpec;
 use crate::engine::request_state::RequestState;
@@ -168,23 +169,29 @@ impl Engine {
                 let sandbox_generation =
                     crate::engine::sandbox_cleaner::generation::claim(&sandbox_dir);
                 // From the moment the path is claimed, its teardown is owned,
-                // and every exit resolves it exactly once, three ways:
-                // completion hands the bridge's cleanup job to `complete()` in
-                // `execute_and_cache_inner`; a *failing* run resolves it as
-                // `leave_for_diagnostics` in the match below (the failure
-                // renderer reads the log tail lazily from the sandbox, so a
-                // failed target's tree must survive until its next run — its
-                // documented pre-teardown behaviour), or, for credential
-                // material, as `reclaim` once the failure slot is filled; and
-                // a bare drop —
-                // cancellation or an unwind, and only those — queues a
-                // generation-checked reclaim of the directory. Without that
-                // last leg, mass fail-fast leaves one abandoned sandbox tree
-                // per *cancelled* execute and nothing ever collects them
-                // (`gc` has no sandbox sweep).
+                // and every exit resolves it exactly once:
+                // - completion hands the bridge's cleanup job to `complete()`
+                //   in `execute_and_cache_inner`;
+                // - a *failing* run resolves it in the match below: as
+                //   `defer_for_failure` then `reclaim` once the failure slot
+                //   is filled (the slot keeps the log and `failure_out`, and
+                //   the failure box reads the tail from the slot, never from
+                //   the sandbox); as `leave_for_diagnostics` under
+                //   `--keep-failed-sandboxes` (credential material is
+                //   reclaimed regardless);
+                // - a deferred teardown dropped without its `reclaim` — a
+                //   cancellation during the fill, or a run abandoned after
+                //   its timeout — queues nothing and leaves the tree to this
+                //   addr's next run;
+                // - a bare drop of the armed teardown — cancellation or an
+                //   unwind, and only those — queues a generation-checked
+                //   reclaim of the directory. Without that leg, mass
+                //   fail-fast leaves one abandoned sandbox tree per
+                //   *cancelled* execute and nothing ever collects them (`gc`
+                //   has no sandbox sweep).
                 // The run's `sandbox` slot rides in the teardown from here:
                 // released when the removal it queues returns, or at once by
-                // `leave_for_diagnostics`.
+                // a path that queues none.
                 let mut sandbox_teardown = self.sandbox_teardown(
                     sandbox_dir.clone(),
                     sandbox_generation,
@@ -194,9 +201,14 @@ impl Engine {
 
                 // Everything fallible between the claim and the run response
                 // lives in the shared block, so an `Err` — a failing target
-                // above all — can be told apart from a drop: the error leaves
-                // the sandbox for diagnostics, the drop reclaims it.
-                let run = self
+                // above all — can be told apart from a drop: the error keeps
+                // the sandbox until the failure slot is filled, the drop
+                // reclaims it at once.
+                // Only a managed driver makes a sandbox tree (its layer
+                // creates the directory); a plain one (`fs`, `template`, …)
+                // runs with none, and its failure box has no sandbox to name.
+                let managed = driver.managed;
+                let ran = self
                     .run_in_sandbox(
                         &rs,
                         addr,
@@ -215,8 +227,13 @@ impl Engine {
                             allotment: Some(allotment),
                         },
                     )
-                    .await
-                    .and_then(|ran| ran.context("run"));
+                    .await;
+                // The outer `Err` is heph's own failure around the run: the
+                // stale removal, the credentials' presentation, the wrapper.
+                // Past it the driver was called, and a managed one has made
+                // its tree.
+                let had_sandbox = managed && ran.is_ok();
+                let run = ran.and_then(|ran| ran.context("run"));
 
                 let res = match run {
                     Ok(res) => res,
@@ -228,23 +245,56 @@ impl Engine {
                         // is left — the write-back and unpacking that tar into
                         // the slot — holds no pool.
                         drop(reservation.take());
-                        // The sandbox is kept for diagnostics: nothing may be
-                        // queued against it. The tree survives until this
-                        // target's next run, whose `remove_stale` reclaims it.
-                        // Resolved before the fill is awaited (D17): a
-                        // cancellation during the fill must not drop the
-                        // teardown and queue a reclaim under the blocking job
-                        // still unpacking the `failure_out` tar out of it.
+                        // What becomes of the sandbox is settled before the
+                        // fill is awaited (D17), and it is removed only once
+                        // the write-back and the fill are done reading it:
+                        // - credential material: always removed, the teardown
+                        //   staying armed meanwhile, since no diagnostic is
+                        //   worth the secret a kept tree would leave on disk —
+                        //   an abandoned run's included, whose removal may
+                        //   race its writer: a partial removal still beats
+                        //   leaving the credentials;
+                        // - `--keep-failed-sandboxes`: left on disk, nothing
+                        //   queued; this addr's next run reclaims it;
+                        // - a run abandoned after its timeout: left on disk,
+                        //   nothing queued, the slot back at once. Its
+                        //   process may still be writing to the tree, and a
+                        //   removal racing that writer can neither finish
+                        //   nor be counted as done; the next run's
+                        //   `remove_stale` reclaims it;
+                        // - otherwise: deferred, then removed. Deferring
+                        //   disarms the drop reclaim, so a cancellation
+                        //   during the fill queues no removal under the
+                        //   blocking job still unpacking the `failure_out`
+                        //   tar out of it; that tree is left to the next run
+                        //   instead.
+                        // A removal holds the `sandbox` slot until the tree
+                        // is gone, as a passing run's does.
                         //
-                        // Unless the outputs are material, in which case the
-                        // diagnostic is not worth the secret it would leave on
-                        // disk: torn down once the fill has read it.
-                        let material_teardown = if outputs_are_material {
-                            Some(sandbox_teardown)
-                        } else {
+                        // The failure box's `sandbox:` line comes out of the
+                        // same branch, and only for a run that had a tree.
+                        // Material says nothing unless the flag asked to keep
+                        // it: its removal is not a choice to explain.
+                        let keep = self.cfg.keep_failed_sandboxes;
+                        let (removal, fate) = if outputs_are_material {
+                            (
+                                Some(sandbox_teardown),
+                                keep.then_some(SandboxFate::RemovedMaterial),
+                            )
+                        } else if keep {
+                            let kept = self.sandbox_on_disk(&sandbox_dir);
                             sandbox_teardown.leave_for_diagnostics();
-                            None
+                            (None, Some(SandboxFate::Kept(kept)))
+                        } else if crate::engine::run_timeout::is_abandoned(&err) {
+                            drop(sandbox_teardown.defer_for_failure());
+                            (None, Some(SandboxFate::LeftAbandoned))
+                        } else {
+                            (
+                                Some(sandbox_teardown.defer_for_failure()),
+                                Some(SandboxFate::Removed),
+                            )
                         };
+                        let fate = fate.filter(|_| had_sandbox);
                         // The target failed. Keep its log and its `failure_out`
                         // in the failure slot (for material, the log's tail in
                         // memory and `out/` only) before anything is done to
@@ -259,18 +309,16 @@ impl Engine {
                         let cancelled = hplugin::error::is_cancelled(&err)
                             || (rs.ctoken().is_cancelled()
                                 && !crate::engine::run_timeout::is_timed_out(&err));
-                        let err = if cancelled {
-                            err
+                        let kept = if cancelled {
+                            None
                         } else {
                             // An `in_place` run's fixes go over the tree
-                            // first, while the left sandbox still holds their
-                            // tars (leaving it keeps the directory; only a
-                            // later run's `remove_stale` reclaims it), so the
-                            // slot can list what was written (D21).
+                            // first, while the sandbox still holds their tars
+                            // (nothing removes it before the fill is done), so
+                            // the slot can list what was written (D21).
                             let write_back = self
                                 .materialize_codegen_on_failure(&rs, def, shell, &err)
                                 .await;
-                            let err = Arc::clone(&self).reword_removed_generator(&rs, err).await;
                             let slot = self
                                 .failure_slots
                                 .fill(crate::engine::failure_slot::Fill {
@@ -282,28 +330,36 @@ impl Engine {
                                     material: outputs_are_material,
                                     fixes: write_back.fixes,
                                 })
-                                .await;
-                            let out_error = slot.out_error.clone();
-                            let err = err.context(slot);
-                            // I7: the keep failed, the failure did not.
-                            let err = match out_error {
-                                Some(e) => err.context(format!("failure_out not kept: {e}")),
-                                None => err,
-                            };
-                            // I5: a refused write-back is reported beside the
-                            // tool's own error, never in its place.
-                            match write_back.error {
-                                Some(e) => err.context(e),
-                                None => err,
-                            }
+                                .await
+                                .with_sandbox(fate);
+                            Some((slot, write_back.error))
                         };
                         // Not `complete`: a failed run handed over no bridge
-                        // job, so it would enqueue nothing and leave the
-                        // presented credentials on disk — in the FUSE upper
-                        // side, under FUSE, which goes too.
-                        if let Some(teardown) = material_teardown {
+                        // job, so it would enqueue nothing and leave the tree
+                        // (presented credentials included) on disk — in the
+                        // FUSE upper side, under FUSE, which goes too.
+                        if let Some(teardown) = removal {
                             teardown.reclaim(self.fuse_upper(&sandbox_dir));
                         }
+                        let Some((slot, write_back_error)) = kept else {
+                            return Err(err);
+                        };
+                        // Past the reclaim: it reads no sandbox, and a lookup
+                        // of the generator must not hold the `sandbox` slot.
+                        let err = Arc::clone(&self).reword_removed_generator(&rs, err).await;
+                        let out_error = slot.out_error.clone();
+                        let err = err.context(slot);
+                        // I7: the keep failed, the failure did not.
+                        let err = match out_error {
+                            Some(e) => err.context(format!("failure_out not kept: {e}")),
+                            None => err,
+                        };
+                        // I5: a refused write-back is reported beside the
+                        // tool's own error, never in its place.
+                        let err = match write_back_error {
+                            Some(e) => err.context(e),
+                            None => err,
+                        };
                         return Err(err);
                     }
                 };
@@ -385,10 +441,18 @@ impl Engine {
 
     /// The backing-side directory a run in `sandbox_dir` wrote to, when FUSE
     /// is mounted: what the FUSE bridge's cleanup job removes after a passing
-    /// run.
-    fn fuse_upper(&self, sandbox_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    /// run, and what a failed run's reclaim removes beside the plain one.
+    pub(crate) fn fuse_upper(&self, sandbox_dir: &std::path::Path) -> Option<std::path::PathBuf> {
         self.fuse_rel(sandbox_dir)
             .map(|rel| self.fuse.upper.join(rel))
+    }
+
+    /// Where a kept sandbox's files are on disk, for the failure box: the
+    /// FUSE upper side when the run went through the mount (its writes live
+    /// there), else `sandbox_dir`.
+    pub(crate) fn sandbox_on_disk(&self, sandbox_dir: &std::path::Path) -> std::path::PathBuf {
+        self.fuse_upper(sandbox_dir)
+            .unwrap_or_else(|| sandbox_dir.to_path_buf())
     }
 
     /// `sandbox_dir` relative to the plain sandbox root, when FUSE is mounted
@@ -412,7 +476,7 @@ impl Engine {
     /// further out can never pass for the tool's own exit.
     ///
     /// The lease decides what "prepare" means; resolving it after the run —
-    /// keep for diagnostics, reclaim, complete — stays with the caller, which
+    /// reclaim, keep on disk, complete — stays with the caller, which
     /// owns it ([`SandboxTeardown`](crate::engine::sandbox_cleaner::SandboxTeardown)
     /// or [`InvokeSandbox`](crate::engine::invoke_sandbox::InvokeSandbox)).
     pub(crate) async fn run_in_sandbox(
@@ -450,9 +514,10 @@ impl Engine {
 
         // Presented *inside* the sandbox lease, so the files land under a
         // directory this run owns and its teardown deletes them whatever the
-        // outcome — including a build's failure path, which deliberately keeps
-        // the rest of the sandbox for diagnostics. The log tail is what makes
-        // that useful, not the token. Only presented: the material was
+        // outcome — including a build's failure path, which keeps the rest of
+        // the sandbox while the failure slot is filled, and on disk under
+        // `--keep-failed-sandboxes`. The log is what makes that useful, not
+        // the token. Only presented: the material was
         // acquired before the run took any pool (`acquire_credentials`).
         let (credential_mounts, _credential_teardown) = self
             .present_credentials(rs, addr, &sandbox_dir, &credentials)

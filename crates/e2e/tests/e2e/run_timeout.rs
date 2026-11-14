@@ -33,7 +33,18 @@ fn engine_with(
     root: &Path,
     setup: impl FnOnce(&mut Engine) -> anyhow::Result<()>,
 ) -> anyhow::Result<Arc<Engine>> {
-    let mut e = Engine::new(Config::for_tests(root.to_path_buf()))?;
+    engine_configured(root, |_| {}, setup)
+}
+
+/// [`engine_with`], with `configure` adjusting the config first.
+fn engine_configured(
+    root: &Path,
+    configure: impl FnOnce(&mut Config),
+    setup: impl FnOnce(&mut Engine) -> anyhow::Result<()>,
+) -> anyhow::Result<Arc<Engine>> {
+    let mut cfg = Config::for_tests(root.to_path_buf());
+    configure(&mut cfg);
+    let mut e = Engine::new(cfg)?;
     let r = root.to_path_buf();
     e.register_provider(move |init| {
         Box::new(pluginbuildfile::Provider::new(
@@ -330,6 +341,11 @@ async fn a_timed_out_target_keeps_its_log() -> anyhow::Result<()> {
     let log = slot_log(&engine, "//p:slow").expect("a timed-out run fills its failure slot");
     assert!(log.contains("started"), "the log before the kill: {log:?}");
     assert!(!log.contains("done"), "{log:?}");
+    // Its sandbox is removed like any failed run's, and the recorded tail,
+    // read from the slot's copy, survives that.
+    crate::failure_slot::removed(&crate::failure_slot::sandbox_dir(&engine, "p", "slow")).await;
+    let tail = failure.log_tail.as_ref().expect("the recorded tail");
+    assert!(tail.text.contains("started"), "{tail:?}");
     Ok(())
 }
 
@@ -427,6 +443,187 @@ async fn a_run_that_ignores_its_cancellation_is_abandoned() -> anyhow::Result<()
         format!("{:#}", failure.source).contains("was abandoned"),
         "{:#}",
         failure.source
+    );
+    Ok(())
+}
+
+/// The managed bash driver, but its run is handed a token nothing cancels:
+/// a sandboxed run that ignores its timeout's cancellation, so the engine
+/// abandons it after the grace with its tree still on disk.
+struct DeafBash(pluginexec::Driver);
+
+#[async_trait::async_trait]
+impl heph::engine::driver_managed::ManagedDriver for DeafBash {
+    fn config(
+        &self,
+        _req: hplugin::driver::ConfigRequest,
+    ) -> anyhow::Result<hplugin::driver::ConfigResponse> {
+        Ok(hplugin::driver::ConfigResponse {
+            name: "deaf".to_string(),
+        })
+    }
+    fn schema(&self) -> hplugin::driver::DriverSchema {
+        heph::engine::driver_managed::ManagedDriver::schema(&self.0)
+    }
+    async fn parse(
+        &self,
+        req: hplugin::driver::ParseRequest,
+        ctoken: &(dyn hcore::hasync::Cancellable + Send + Sync),
+    ) -> anyhow::Result<hplugin::driver::ParseResponse> {
+        heph::engine::driver_managed::ManagedDriver::parse(&self.0, req, ctoken).await
+    }
+    async fn apply_transitive(
+        &self,
+        req: hplugin::driver::ApplyTransitiveRequest,
+        ctoken: &(dyn hcore::hasync::Cancellable + Send + Sync),
+    ) -> anyhow::Result<hplugin::driver::ApplyTransitiveResponse> {
+        heph::engine::driver_managed::ManagedDriver::apply_transitive(&self.0, req, ctoken).await
+    }
+    async fn run<'a, 'io>(
+        &self,
+        req: heph::engine::driver_managed::ManagedRunRequest<'a, 'io>,
+        _ctoken: &(dyn hcore::hasync::Cancellable + Send + Sync),
+    ) -> anyhow::Result<heph::engine::driver_managed::ManagedRunResponse> {
+        let deaf = heph::hasync::StdCancellationToken::new();
+        heph::engine::driver_managed::ManagedDriver::run(&self.0, req, &deaf).await
+    }
+}
+
+/// An abandoned sandboxed run of `//p:deaf`, on an engine whose sandbox
+/// removals are held by `gate` (closed) until the test opens it: a run whose
+/// failure queued a removal still holds its `sandbox` slot when this returns.
+struct Abandoned {
+    engine: Arc<Engine>,
+    failure: Arc<heph::engine::error::TargetFailure>,
+    /// The request's background work, outliving the request.
+    bg: heph::engine::sandbox_cleaner::PendingCounter,
+    gate: heph::engine::sandbox_cleaner::RemovalGate,
+}
+
+impl Abandoned {
+    async fn run(root: &Path, keep_failed_sandboxes: bool) -> anyhow::Result<Self> {
+        write_build(
+            root,
+            r#"
+target(
+    name = "deaf",
+    driver = "deaf",
+    run = "echo started; sleep 3; echo done > $OUT",
+    out = "out.txt",
+    timeout = 1,
+)
+"#,
+        );
+        let gate = heph::engine::sandbox_cleaner::RemovalGate::closed();
+        let engine = engine_configured(
+            root,
+            |cfg| cfg.keep_failed_sandboxes = keep_failed_sandboxes,
+            |e| {
+                e.set_timeout_grace(Duration::from_millis(200));
+                e.set_sandbox_removal_gate(&gate);
+                e.register_managed_driver(|_| {
+                    Box::new(DeafBash(pluginexec::Driver::new_bash().with_host_path()))
+                })
+            },
+        )?;
+        let rs = engine.new_state();
+        let res = tokio::time::timeout(
+            Duration::from_secs(30),
+            Arc::clone(&engine).result_addr(
+                rs.clone(),
+                &parse_addr("//p:deaf")?,
+                OutputMatcher::All,
+                &ResultOptions::default(),
+            ),
+        )
+        .await
+        .expect("an abandoned run does not hang the build");
+        let Err(err) = res else {
+            anyhow::bail!("//p:deaf must fail");
+        };
+        assert!(format!("{err:#}").contains("was abandoned"), "{err:#}");
+        let [failure] = <[_; 1]>::try_from(rs.take_failures())
+            .map_err(|f| anyhow::anyhow!("one failure recorded, got {}", f.len()))?;
+        Ok(Self {
+            engine,
+            failure,
+            bg: rs.bg_pending(),
+            gate,
+        })
+    }
+
+    /// What the `sandbox` pool holds right now.
+    fn sandbox_slots_held(&self) -> u64 {
+        self.engine.resource_snapshot().map_or(0, |s| {
+            s.main
+                .pools
+                .iter()
+                .find(|p| p.pool.as_str() == hplugin::provider::PoolName::SANDBOX)
+                .map_or(0, |p| p.held)
+        })
+    }
+
+    /// Open the gate and wait, bounded, for the request's background work.
+    async fn drain(&self) {
+        self.gate.open();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while self.bg.load(std::sync::atomic::Ordering::Acquire) > 0 {
+            assert!(Instant::now() < deadline, "background work never drained");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    fn sandbox_dir(&self) -> std::path::PathBuf {
+        crate::failure_slot::sandbox_dir(&self.engine, "p", "deaf")
+    }
+}
+
+/// A sandboxed run abandoned after its timeout's grace may still have a live
+/// process writing to its tree, so the failed-sandbox removal does not race
+/// it: nothing is queued, the run's `sandbox` slot is back at once (while
+/// removals are held, so a queued one would still hold it), the tree is left
+/// on disk for the next run, and the failure box says so.
+#[tokio::test]
+async fn an_abandoned_runs_sandbox_is_left_and_its_slot_returned() -> anyhow::Result<()> {
+    let ws = tempfile::tempdir()?;
+    let run = Abandoned::run(ws.path(), false).await?;
+    assert_eq!(
+        run.sandbox_slots_held(),
+        0,
+        "no removal holds the slot: {:?}",
+        run.engine.resource_snapshot()
+    );
+    run.drain().await;
+    let dir = run.sandbox_dir();
+    assert!(
+        dir.exists(),
+        "an abandoned run's tree is not removed: {}",
+        dir.display()
+    );
+    assert_eq!(
+        run.failure.sandbox,
+        Some(hplugin::error::SandboxFate::LeftAbandoned),
+        "{:#}",
+        run.failure.source
+    );
+    Ok(())
+}
+
+/// Under `--keep-failed-sandboxes` an abandoned run's tree is kept like any
+/// failed run's, and the box names where it is.
+#[tokio::test]
+async fn an_abandoned_runs_sandbox_is_kept_under_the_flag() -> anyhow::Result<()> {
+    let ws = tempfile::tempdir()?;
+    let run = Abandoned::run(ws.path(), true).await?;
+    assert_eq!(run.sandbox_slots_held(), 0);
+    run.drain().await;
+    let dir = run.sandbox_dir();
+    assert!(dir.exists(), "{}", dir.display());
+    assert_eq!(
+        run.failure.sandbox,
+        Some(hplugin::error::SandboxFate::Kept(dir)),
+        "{:#}",
+        run.failure.source
     );
     Ok(())
 }
