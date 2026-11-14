@@ -978,6 +978,16 @@ pub(crate) struct RemoteRevision {
 }
 
 impl RemoteRevision {
+    /// Whether this revision's manifest names a blob called `name`.
+    ///
+    /// A local manifest and a remote one for the same `(addr, hashin)` can name
+    /// different blobs: a `manifest-v1.borsh` an older heph mirrored names bare
+    /// blobs, while the remote now holds a v2 revision whose names are suffixed.
+    /// The caller checks this before pulling, and rebuilds when it is `false`.
+    pub(crate) fn names_blob(&self, name: &str) -> bool {
+        self.manifest.artifacts.iter().any(|a| a.name == name)
+    }
+
     /// The artifact entry for `name`, or an error if the manifest never named it
     /// — a caller asking for a blob outside the revision is a bug, not a miss.
     fn artifact(&self, name: &str) -> anyhow::Result<&RemoteManifestArtifact> {

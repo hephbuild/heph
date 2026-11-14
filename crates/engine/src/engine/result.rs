@@ -3413,6 +3413,19 @@ impl Engine {
         let Some(rev) = self.remote_revision(rs, remote, def, hashin).await? else {
             return Ok(None);
         };
+        // The local manifest and the remote one can disagree on blob names: a
+        // `manifest-v1.borsh` an older heph mirrored names bare blobs, and the
+        // remote now holds a v2 revision of the same hashin under suffixed
+        // names. Such a blob is unobtainable, not a bug: rebuild.
+        if let Some(name) = missing.iter().find(|name| !rev.names_blob(name)) {
+            tracing::debug!(
+                %addr,
+                hashin,
+                blob = %name,
+                "remote revision does not name a blob the local manifest needs; rebuilding"
+            );
+            return Ok(None);
+        }
         Ok(self
             .pull_missing_blobs(rs, addr, hashin, rev, missing)
             .await?
@@ -7884,6 +7897,78 @@ mod tests {
         assert!(
             rebuilt < execute,
             "the hit must be taken back before the rebuild starts: {events:?}"
+        );
+        Ok(())
+    }
+
+    /// A local `manifest-v1.borsh` whose blobs are not resident, over a remote
+    /// that holds a v2 revision of the same hashin, must rebuild, not fail.
+    ///
+    /// The upgrade path: an older heph mirrored the remote manifest lazily (v1,
+    /// bare blob names, no blobs), and the remote now holds this version's v2
+    /// revision under suffixed names. The remote cannot serve a bare name, so
+    /// the hit degrades to a rebuild like any other unobtainable blob.
+    #[tokio::test]
+    async fn local_v1_manifest_over_a_v2_remote_rebuilds() -> anyhow::Result<()> {
+        use crate::engine::local_cache::{MANIFEST_V1, Manifest};
+
+        let remote = tempdir()?;
+        let remote_uri = format!("file://{}", remote.path().display());
+        let addr = hmodel::htaddr::parse_addr("//pkg:t")?;
+
+        let (seeder, _seeder_home) =
+            engine_with_remote_bash(vec![out_target("//pkg:t")], &remote_uri)?;
+        let seed_rs = seeder.new_state();
+        seeder
+            .clone()
+            .result_addr(
+                seed_rs.clone(),
+                &addr,
+                OutputMatcher::All,
+                &ResultOptions::default(),
+            )
+            .await?;
+        drain_bg(seed_rs).await;
+        let hashins = seeder.local_cache.list_target_entries(&addr)?;
+        let [hashin] = hashins.as_slice() else {
+            panic!("expected one seeded revision, got {hashins:?}");
+        };
+        let seeded = Engine::read_manifest_from(&seeder.local_cache, &addr, hashin)?
+            .expect("the seeder wrote a manifest");
+
+        // What an older heph's lazy mirror left behind: a v1 manifest with the
+        // same hashouts, bare names, raw encoding, and no blobs.
+        let v1 = Manifest {
+            version: "1.0.0".to_string(),
+            artifacts: seeded
+                .artifacts
+                .iter()
+                .map(|a| {
+                    let bare = crate::engine::cache_codec::V2_SUFFIXES
+                        .iter()
+                        .find_map(|s| a.name.strip_suffix(s))
+                        .expect("every v2 name is suffixed");
+                    crate::engine::local_cache::ManifestArtifact {
+                        name: bare.to_string(),
+                        encoding: crate::engine::local_cache::ManifestArtifactEncoding::None,
+                        ..a.clone()
+                    }
+                })
+                .collect(),
+            ..seeded.clone()
+        };
+        let (engine, _home) = engine_with_remote_bash(vec![out_target("//pkg:t")], &remote_uri)?;
+        let mut w = engine.local_cache.writer(&addr, hashin, MANIFEST_V1)?;
+        borsh::to_writer(&mut w, &v1)?;
+        w.commit()?;
+
+        let (res, events) = resolve_collecting_events(&engine, &addr).await;
+        res.expect("a v1 manifest the v2 remote cannot serve must rebuild, not fail");
+        assert!(
+            events.iter().any(
+                |e| matches!(&e.kind, BuildEventKind::ExecuteStart { addr, .. } if addr == "//pkg:t")
+            ),
+            "the target must be rebuilt: {events:?}"
         );
         Ok(())
     }
