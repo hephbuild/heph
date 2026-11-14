@@ -24,7 +24,7 @@ async fn execute_async(args: Args, global: GlobalOptions) -> anyhow::Result<()> 
     // `url:` is downloaded to ~/.heph/plugins), the host dylib resolved, and the
     // cdylib load-checked over the stable ABI (`create` runs). Reaching `Ok`
     // here therefore means every configured plugin is present and loadable.
-    let (engine, _shutdown) = bootstrap::new_engine(&global)?;
+    let (engine, _shutdown) = bootstrap::new_engine(&global, None)?;
 
     let mut providers: Vec<String> = engine.providers_by_name.keys().cloned().collect();
     let mut drivers: Vec<String> = engine.drivers_by_name.keys().cloned().collect();

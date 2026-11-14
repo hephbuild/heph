@@ -188,7 +188,7 @@ struct Row {
 
 async fn status(args: StatusArgs, sink: LogSink, global: GlobalOptions) -> anyhow::Result<()> {
     let m = credential_matcher(args.matcher.as_deref())?;
-    let (engine, shutdown) = bootstrap::new_engine(&global)?;
+    let (engine, shutdown) = bootstrap::new_engine(&global, Some(sink.session()))?;
     let label = format!(
         "Checking credentials in {}",
         args.matcher.as_deref().unwrap_or("//...")
@@ -365,7 +365,7 @@ struct ExplainStep {
 async fn explain(args: ExplainArgs, sink: LogSink, global: GlobalOptions) -> anyhow::Result<()> {
     let cwp = get_cwp()?;
     let addr = hmodel::htaddr::parse_addr_with_base(&args.addr, &cwp)?;
-    let (engine, shutdown) = bootstrap::new_engine(&global)?;
+    let (engine, shutdown) = bootstrap::new_engine(&global, Some(sink.session()))?;
     let label = format!("Explaining {addr}");
     run_with_progress(label, sink, global.no_tui, shutdown, move |ctx| {
         explain_body(engine, addr, args.json, ctx)
@@ -452,7 +452,7 @@ fn render_explain(addr: &Addr, steps: &[ExplainStep], json: bool) -> anyhow::Res
 }
 
 async fn login(args: LoginArgs, sink: LogSink, global: GlobalOptions) -> anyhow::Result<()> {
-    let (engine, shutdown) = bootstrap::new_engine(&global)?;
+    let (engine, shutdown) = bootstrap::new_engine(&global, Some(sink.session()))?;
     let label = match &args.addr {
         Some(a) => format!("Signing in to {a}"),
         None => "Signing in".to_string(),
@@ -574,7 +574,7 @@ async fn login_body(
 }
 
 async fn logout(global: &GlobalOptions) -> anyhow::Result<()> {
-    let (engine, _shutdown) = bootstrap::new_engine(global)?;
+    let (engine, _shutdown) = bootstrap::new_engine(global, None)?;
     // Both tiers. The process one is empty in a fresh `heph auth logout`, but
     // clearing only the disk would make this command mean something different
     // depending on who called it.

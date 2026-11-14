@@ -37,6 +37,6 @@ pub fn execute(args: &Args, _sink: LogSink, global: &GlobalOptions) -> anyhow::R
         .build()
         .context("building tokio runtime for build-lsp")?;
     let _guard = runtime.enter();
-    let (engine, _shutdown) = bootstrap::new_engine(global)?;
+    let (engine, _shutdown) = bootstrap::new_engine(global, None)?;
     crate::pluginbuildfile::serve_stdio(engine)
 }

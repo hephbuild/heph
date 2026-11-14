@@ -466,16 +466,15 @@ impl App for EmitApp {
 }
 
 /// Run an app on the line backend against `slot`; whether it ran.
-async fn run_in(slot: &SessionSlot, records: bool) -> bool {
+async fn run_in(slot: &Arc<SessionSlot>, records: bool) -> bool {
     let ran = Arc::new(AtomicBool::new(false));
     let (shutdown, _rx) = hcore::shutdown::ShutdownTrigger::new();
-    crate::tui::run_app_in(
-        slot,
+    crate::tui::run_app(
         EmitApp {
             records,
             ran: Arc::clone(&ran),
         },
-        crate::tui::LogSink::new_direct(),
+        crate::tui::LogSink::new_direct_with(Arc::clone(slot)),
         false,
         shutdown,
     )
@@ -493,7 +492,7 @@ fn entries(p: &Path) -> usize {
 #[tokio::test]
 async fn run_app_records_through_the_slot() {
     let home = tempfile::tempdir().expect("tempdir");
-    let slot = SessionSlot::new();
+    let slot = Arc::new(SessionSlot::new());
     slot.configure(
         SessionRoot::from_env(None, Some(home.path().as_os_str())),
         vec!["heph".into()],
@@ -524,7 +523,7 @@ async fn run_app_records_through_the_slot() {
 #[tokio::test]
 async fn viewer_does_not_record_itself() {
     let home = tempfile::tempdir().expect("tempdir");
-    let slot = SessionSlot::new();
+    let slot = Arc::new(SessionSlot::new());
     slot.configure(
         SessionRoot::from_env(None, Some(home.path().as_os_str())),
         Vec::new(),
@@ -538,7 +537,7 @@ async fn viewer_does_not_record_itself() {
 #[tokio::test]
 async fn no_session_env_writes_nothing() {
     let home = tempfile::tempdir().expect("tempdir");
-    let slot = SessionSlot::new();
+    let slot = Arc::new(SessionSlot::new());
     let root = SessionRoot::from_env(Some("1".as_ref()), Some(home.path().as_os_str()));
     assert_eq!(root, Ok(None));
     slot.configure(root, Vec::new());
@@ -550,7 +549,7 @@ async fn no_session_env_writes_nothing() {
 /// A4: no `HOME` means no session, and the build still runs.
 #[tokio::test]
 async fn home_unset_runs_without_session() {
-    let slot = SessionSlot::new();
+    let slot = Arc::new(SessionSlot::new());
     let root = SessionRoot::from_env(None, None);
     assert!(root.is_err());
     slot.configure(root, Vec::new());
@@ -559,7 +558,7 @@ async fn home_unset_runs_without_session() {
     // An unwritable root behaves the same.
     let ro = tempfile::tempdir().expect("tempdir");
     std::fs::set_permissions(ro.path(), std::fs::Permissions::from_mode(0o500)).expect("chmod");
-    let slot = SessionSlot::new();
+    let slot = Arc::new(SessionSlot::new());
     slot.configure(
         Ok(Some(SessionRoot::new(ro.path().join("sessions")))),
         Vec::new(),

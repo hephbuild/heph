@@ -86,7 +86,7 @@ async fn execute_async(args: Args, _sink: LogSink, global: GlobalOptions) -> any
     let base = crate::engine::get_cwp()?;
     let addr = htaddr::parse_addr_with_base(args.addr.as_ref(), &base)
         .with_context(|| format!("parse {}", args.addr))?;
-    let (engine, _shutdown) = bootstrap::new_engine(&global)?;
+    let (engine, _shutdown) = bootstrap::new_engine(&global, None)?;
     let view = failure_view(engine.failure_slots(), &addr)?;
     print!("{}", render(&addr, view.as_ref(), args.json)?);
     Ok(())

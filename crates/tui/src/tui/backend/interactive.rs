@@ -49,9 +49,6 @@ pub async fn run<A: App + 'static>(
     let session_tap = slot
         .and_then(|s| s.open(view.session_header(), true))
         .map(|s| s.tap);
-    if let Some(tap) = &session_tap {
-        sink.set_session_tap(tap.clone());
-    }
     if let Some(slot) = slot {
         view.name_lock_holders(slot.holder_names());
     }

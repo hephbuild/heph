@@ -3,14 +3,19 @@ use tracing_subscriber::fmt;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
+use std::sync::Arc;
+
 use crate::tui::log_sink::{LogSink, MakeLogSink};
+use crate::tui::session::SessionSlot;
 
 /// Install the subscriber. `quiet` is `heph run --raw`, whose stderr carries only
 /// failures: it lowers the default to `warn`, and `HEPH_LOG` still has the last
 /// word. The filter is fixed here, so the views need no quiet form of their own:
 /// `info!` is all they print on a healthy run.
-pub fn init(quiet: bool) -> LogSink {
-    let sink = LogSink::new_direct();
+///
+/// The returned sink records into `session` once a run opens it.
+pub fn init(quiet: bool, session: Arc<SessionSlot>) -> LogSink {
+    let sink = LogSink::new_direct_with(session);
 
     // fuser is chatty at info!/warn! during mount lifecycle. Cap it at
     // error! by default so genuine failures surface but lifecycle noise

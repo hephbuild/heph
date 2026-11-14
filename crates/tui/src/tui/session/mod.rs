@@ -11,8 +11,10 @@
 //! - [`reader`]: [`RecordReader`], reading `events.ndjson` back (torn lines
 //!   wait, bad lines are skipped and counted).
 //! - [`cleanup`]: removing ended sessions, at session start only.
-//! - [`SessionSlot`]: the process's one session, opened lazily by `run_app`
-//!   and finished by `main` with the exit code.
+//! - [`SessionSlot`]: the process's one session. `main` builds it and hands it
+//!   to whoever needs it — the [`LogSink`](crate::tui::LogSink) every command
+//!   and `run_app` already receive, the diag sweeper, the error renderer — and
+//!   finishes it with the exit code. `run_app` opens it lazily.
 //!
 //! The types live here, in `tui`, rather than in `hcore`, because the snapshot
 //! is built from [`crate::tui::BuildState`] and every consumer (the root crate's
@@ -262,9 +264,14 @@ struct SlotInner {
     attempted: bool,
 }
 
-/// The process's session (design amendment A2): configured by the front end,
-/// opened lazily by the first `run_app` that records, finished by `main` with
-/// the exit code.
+/// The process's session (design amendment A2): built and configured by the
+/// front end, opened lazily by the first `run_app` that records, finished by
+/// `main` with the exit code. There is no process-wide instance: `main` owns
+/// it and hands it out.
+///
+/// Nothing may log while holding `inner`: the log sink tees `info!` lines
+/// into the open session through [`record_log`](Self::record_log), which
+/// takes the same lock.
 #[derive(Debug)]
 pub struct SessionSlot {
     inner: Mutex<Option<SlotInner>>,
@@ -342,24 +349,23 @@ impl SessionSlot {
     /// The session, opening it on the first call. `None` when recording is off,
     /// unavailable or failed to open (each said at most once).
     pub fn open(&self, header: SessionHeader, interactive: bool) -> Option<OpenedSession> {
+        // `Err(Err(why))`: unavailable, warned below — outside the lock, which
+        // the log sink's tee takes.
         let prepared = self.with(|s| {
             if let Some(session) = &s.session {
-                return Err(Some(OpenedSession {
+                return Err(Ok(Some(OpenedSession {
                     id: session.id(),
                     tap: session.tap(),
                     fresh: false,
-                }));
+                })));
             }
             if s.attempted {
-                return Err(None);
+                return Err(Ok(None));
             }
             s.attempted = true;
             match &s.setup {
-                Setup::Unconfigured | Setup::Off => Err(None),
-                Setup::Unavailable(why) => {
-                    tracing::warn!(reason = %why, "this run records no session");
-                    Err(None)
-                }
+                Setup::Unconfigured | Setup::Off => Err(Ok(None)),
+                Setup::Unavailable(why) => Err(Err(why.clone())),
                 Setup::Root(root) => Ok((
                     root.clone(),
                     SessionStart {
@@ -375,7 +381,11 @@ impl SessionSlot {
         });
         let (root, start) = match prepared {
             Ok(prepared) => prepared,
-            Err(already) => return already,
+            Err(Ok(already)) => return already,
+            Err(Err(why)) => {
+                tracing::warn!(reason = %why, "this run records no session");
+                return None;
+            }
         };
         // Opened outside the slot's lock: it does IO.
         let session = match Session::open(&root, start) {
@@ -408,10 +418,28 @@ impl SessionSlot {
         self.with(|s| s.session.as_ref().map(|x| x.id()))
     }
 
+    /// The open session's tap, if any.
+    fn tap(&self) -> Option<SessionTap> {
+        self.with(|s| s.session.as_ref().map(|x| x.tap()))
+    }
+
     /// Record that the in-flight report was just rewritten.
     pub fn record_inflight_written(&self) {
-        if let Some(tap) = self.with(|s| s.session.as_ref().map(|x| x.tap())) {
+        if let Some(tap) = self.tap() {
             tap.inflight_written();
+        }
+    }
+
+    /// Record a formatted log line of `level` (design amendment A11). Lossy
+    /// UTF-8, verbatim otherwise: a viewer escapes control bytes when it
+    /// prints. Nothing when no session is open or its recording stopped.
+    pub fn record_log(&self, level: &'static str, line: &[u8]) {
+        if let Some(tap) = self.tap()
+            && !tap.is_stopped()
+        {
+            let text = String::from_utf8_lossy(line);
+            let text = text.strip_suffix('\n').unwrap_or(&text);
+            tap.log(level, text.to_owned());
         }
     }
 
@@ -422,7 +450,7 @@ impl SessionSlot {
         if text.is_empty() {
             return;
         }
-        if let Some(tap) = self.with(|s| s.session.as_ref().map(|x| x.tap()))
+        if let Some(tap) = self.tap()
             && !tap.is_stopped()
         {
             tap.view(
@@ -449,12 +477,6 @@ impl SessionSlot {
             session.finish(None, true);
         }
     }
-}
-
-/// The process's slot.
-pub fn process() -> &'static SessionSlot {
-    static PROCESS: SessionSlot = SessionSlot::new();
-    &PROCESS
 }
 
 /// Finishes the slot's session as panicked if dropped while unwinding.

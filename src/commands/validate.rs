@@ -318,7 +318,7 @@ async fn execute_async(
         Some(s) => (htpkg::parse(&s, &get_cwp()?)?, true),
         None => (Matcher::PackagePrefix(PkgBuf::from("")), false),
     };
-    let (engine, shutdown) = bootstrap::new_engine(&global)?;
+    let (engine, shutdown) = bootstrap::new_engine(&global, Some(sink.session()))?;
     let app = ValidateApp {
         engine,
         matcher,

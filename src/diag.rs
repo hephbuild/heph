@@ -58,9 +58,11 @@
 use std::backtrace::Backtrace;
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
-use std::sync::Once;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::{Arc, Once};
 use tracing::warn;
+
+use crate::tui::session::SessionSlot;
 
 /// File descriptor the handler appends dumps to; `-1` until [`install`] opens it.
 static DIAG_FD: AtomicI32 = AtomicI32::new(-1);
@@ -80,7 +82,10 @@ static BACKTRACES: AtomicBool = AtomicBool::new(false);
 /// `backtraces` gates only the *contents*, never the handler: `SIGQUIT` always
 /// writes the in-flight report, so the always-on guarantee above still holds for
 /// the half that is safe to produce.
-pub fn install(backtraces: bool) {
+///
+/// `session` is the process's session: the sweeper answers its viewers'
+/// in-flight requests once a run has opened it.
+pub fn install(backtraces: bool, session: Arc<SessionSlot>) {
     BACKTRACES.store(backtraces, Ordering::Relaxed);
     let handler = on_sigquit as extern "C" fn(libc::c_int);
     // SAFETY: the handler only stores to an `AtomicBool` (async-signal-safe);
@@ -88,7 +93,7 @@ pub fn install(backtraces: bool) {
     unsafe {
         libc::signal(libc::SIGQUIT, handler as libc::sighandler_t);
     }
-    spawn_sweeper();
+    spawn_sweeper(session);
 }
 
 /// Set by the `SIGQUIT` handler, polled by the sweeper thread.
@@ -169,13 +174,15 @@ fn dump_path() -> std::path::PathBuf {
 /// locks. Doing it on a plain thread is also what keeps the default path — the
 /// in-flight report — entirely free of the re-entrancy hazard that put
 /// `--diag-backtrace` behind a flag (module docs).
-fn spawn_sweeper() {
+fn spawn_sweeper(session: Arc<SessionSlot>) {
+    // `install` runs once, from `main`; a second call's session is ignored
+    // along with the rest of it.
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         drop(
             std::thread::Builder::new()
                 .name("heph-diag-sweeper".to_string())
-                .spawn(|| {
+                .spawn(move || {
                     loop {
                         std::thread::sleep(std::time::Duration::from_millis(200));
                         // A request that raced the handover is dropped too:
@@ -185,10 +192,12 @@ fn spawn_sweeper() {
                         {
                             sweep(&dump_path());
                         }
-                        if let Some(dir) = crate::tui::session::process().dir() {
-                            answer_inflight_request(&dir, || {
+                        if let Some(dir) = session.dir()
+                            && answer_inflight_request(&dir, || {
                                 inventory_report(&hcore::hmemoizer::capture_report())
-                            });
+                            })
+                        {
+                            session.record_inflight_written();
                         }
                     }
                 }),
@@ -199,9 +208,9 @@ fn spawn_sweeper() {
 /// Answer a session viewer's `heph session inflight` (design amendment A13): a
 /// viewer never signals a process; it drops `inflight.request` in the session
 /// directory, and this — one `stat` per sweeper tick — writes the same
-/// in-flight report a `SIGQUIT` dump carries to `inflight.txt` (temp + rename),
-/// removes the request, and records `InflightWritten` so the viewer knows.
-/// `true` when a request was answered.
+/// in-flight report a `SIGQUIT` dump carries to `inflight.txt` (temp + rename)
+/// and removes the request. `true` when a request was answered: the caller then
+/// records `InflightWritten` so the viewer knows.
 fn answer_inflight_request(dir: &std::path::Path, render: impl FnOnce() -> String) -> bool {
     use crate::tui::session::files;
     let request = dir.join(files::INFLIGHT_REQUEST);
@@ -221,10 +230,7 @@ fn answer_inflight_request(dir: &std::path::Path, render: impl FnOnce() -> Strin
         tracing::debug!(error = %e, "cannot remove the in-flight request");
     }
     match written {
-        Ok(()) => {
-            crate::tui::session::process().record_inflight_written();
-            true
-        }
+        Ok(()) => true,
         Err(e) => {
             tracing::debug!(error = %e, "cannot write the in-flight report for a session viewer");
             false
@@ -602,9 +608,9 @@ mod tests {
 
         // The flag reaches the sweeper. Without this the gate below could be
         // wired to a constant and still pass.
-        install(true);
+        install(true, Arc::new(SessionSlot::new()));
         assert!(BACKTRACES.load(Ordering::Relaxed));
-        install(false);
+        install(false, Arc::new(SessionSlot::new()));
         assert!(!BACKTRACES.load(Ordering::Relaxed));
 
         let before = sigusr1_disposition();

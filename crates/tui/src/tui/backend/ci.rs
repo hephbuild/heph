@@ -15,16 +15,15 @@ pub async fn run<A: App + 'static>(
     // event stream and hands each event to the view.
     let mut view = app.ci_view();
     let session = slot.and_then(|s| s.open(view.session_header(), false));
-    if let Some(s) = &session {
-        // One line, stderr only (never stdout, which may be a command's
-        // document), naming the full id so it can be pasted (A12).
-        if s.fresh {
-            sink.write_diagnostic(&format!(
-                "heph: session {id} (heph session attach {id})\n",
-                id = s.id
-            ));
-        }
-        sink.set_session_tap(s.tap.clone());
+    // One line, stderr only (never stdout, which may be a command's
+    // document), naming the full id so it can be pasted (A12).
+    if let Some(s) = &session
+        && s.fresh
+    {
+        sink.write_diagnostic(&format!(
+            "heph: session {id} (heph session attach {id})\n",
+            id = s.id
+        ));
     }
     if let Some(slot) = slot {
         view.name_lock_holders(slot.holder_names());

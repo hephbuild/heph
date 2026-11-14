@@ -1,54 +1,60 @@
 use std::io::{self, Write};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
 use tracing::Level;
 use tracing_subscriber::fmt::MakeWriter;
 
-use crate::tui::session::SessionTap;
+use crate::tui::session::SessionSlot;
 
 enum Inner {
     Direct,
     Buffered { tx: mpsc::UnboundedSender<Vec<u8>> },
 }
 
+/// Where the process's terminal output goes, and the session recording it.
+///
+/// `main` builds one and hands it to the command, which hands it to
+/// [`run_app`](crate::tui::run_app): that is how the session reaches the run
+/// that opens it, and how every `info!` line reaches the session.
 #[derive(Clone)]
 pub struct LogSink {
     inner: Arc<Mutex<Inner>>,
-    /// The session's log tap (design amendment A11). Outside `Inner` because
+    /// The process's session (design amendment A11). Outside `Inner` because
     /// pausing and resuming the TUI replaces `Inner`, and a paused run must keep
-    /// recording. Set once, by the first `run_app` that opens a session.
-    tap: Arc<OnceLock<SessionTap>>,
+    /// recording.
+    session: Arc<SessionSlot>,
 }
 
 impl LogSink {
-    pub fn new_direct() -> Self {
+    /// A sink recording into `session` once a run opens it.
+    pub fn new_direct_with(session: Arc<SessionSlot>) -> Self {
         Self {
             inner: Arc::new(Mutex::new(Inner::Direct)),
-            tap: Arc::new(OnceLock::new()),
+            session,
         }
     }
 
-    /// Tee every `info!`-and-above line written through this sink into the
-    /// session. A second call is ignored: a process has one session.
-    pub fn set_session_tap(&self, tap: SessionTap) {
-        drop(self.tap.set(tap));
+    /// A sink with a session slot of its own that nobody configured: nothing
+    /// is recorded (a test, an embedder).
+    pub fn new_direct() -> Self {
+        Self::new_direct_with(Arc::new(SessionSlot::new()))
+    }
+
+    /// The session this sink's output is recorded in.
+    pub fn session(&self) -> &Arc<SessionSlot> {
+        &self.session
     }
 
     /// Record a formatted log line of `level` in the session, if the line is
-    /// one the terminal shows (`info!` and above). Lossy UTF-8, verbatim
-    /// otherwise: a viewer escapes control bytes when it prints.
+    /// one the terminal shows (`info!` and above).
     fn tee(&self, level: Option<Level>, buf: &[u8]) {
-        let (Some(level), Some(tap)) = (level, self.tap.get()) else {
-            return;
-        };
         // Ordered by verbosity: ERROR < WARN < INFO < DEBUG < TRACE.
-        if level > Level::INFO || tap.is_stopped() {
-            return;
+        if let Some(level) = level
+            && level <= Level::INFO
+        {
+            self.session.record_log(level.as_str(), buf);
         }
-        let text = String::from_utf8_lossy(buf);
-        let text = text.strip_suffix('\n').unwrap_or(&text);
-        tap.log(level.as_str(), text.to_owned());
     }
 
     /// Whether ANSI color should be emitted on this sink. The sink owns the

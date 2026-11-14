@@ -112,7 +112,7 @@ pub fn execute(args: &GcArgs, sink: LogSink, global: &GlobalOptions) -> anyhow::
 }
 
 async fn execute_async(_args: GcArgs, sink: LogSink, global: GlobalOptions) -> anyhow::Result<()> {
-    let (engine, shutdown) = bootstrap::new_engine(&global)?;
+    let (engine, shutdown) = bootstrap::new_engine(&global, Some(sink.session()))?;
     let app = GcApp {
         engine,
         fail_fast: global.fail_fast,

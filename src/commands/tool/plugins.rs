@@ -17,7 +17,7 @@ pub fn execute(args: &Args, sink: LogSink, global: &GlobalOptions) -> anyhow::Re
 }
 
 async fn execute_async(args: Args, _sink: LogSink, global: GlobalOptions) -> anyhow::Result<()> {
-    let (engine, _shutdown) = bootstrap::new_engine(&global)?;
+    let (engine, _shutdown) = bootstrap::new_engine(&global, None)?;
     let plugins = engine.plugins();
     if args.json {
         println!(

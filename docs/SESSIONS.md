@@ -151,9 +151,14 @@ error.
 
 ### Recording
 
-`tui::run_app` opens the process's session lazily (`tui::session::process()`,
-configured by `main`; a viewer's `App::records_session()` is false), and
-`main` finishes it with the exit code just before `std::process::exit`. Both
+The process's session is a `SessionSlot` that `main` owns: there is no
+process-wide instance. `main` configures it and hands it to whatever records
+into it — the `LogSink` (which every command threads into `run_app`, and
+which tees `info!` lines into the open session), `bootstrap::new_engine` (the
+workspace for `meta.json`), the diag sweeper, and the error renderer.
+`tui::run_app` opens it lazily from its sink's slot (a viewer's
+`App::records_session()` is false), and `main` finishes it with the exit code
+just before `std::process::exit`. Both
 backends consume a tapped receiver that moves each event to the recorder right
 after the view folds it, so what is recorded is what was shown, paused TUI
 included. The recorder is its own OS thread behind an unbounded channel:

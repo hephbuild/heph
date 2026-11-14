@@ -197,7 +197,7 @@ fn describe(slot: &SlotEntry) -> (String, String) {
 }
 
 async fn ls(global: &GlobalOptions) -> anyhow::Result<()> {
-    let (engine, _shutdown) = bootstrap::new_engine(global)?;
+    let (engine, _shutdown) = bootstrap::new_engine(global, None)?;
     let mut slots = engine.scratch_slots()?;
     if slots.is_empty() {
         println!("No scratch caches in this workspace.");
@@ -276,7 +276,7 @@ fn local_trace(
 }
 
 async fn head(addr: String, sink: LogSink, global: GlobalOptions) -> anyhow::Result<()> {
-    let (engine, shutdown) = bootstrap::new_engine(&global)?;
+    let (engine, shutdown) = bootstrap::new_engine(&global, Some(sink.session()))?;
     let label = format!("Resolving scratch {addr}");
     run_with_progress(
         label,
@@ -459,7 +459,7 @@ async fn head_trace(
 }
 
 async fn path(addr: &str, global: &GlobalOptions) -> anyhow::Result<()> {
-    let (engine, _shutdown) = bootstrap::new_engine(global)?;
+    let (engine, _shutdown) = bootstrap::new_engine(global, None)?;
     let slots = engine.scratch_slots()?;
     let found = slots
         .iter()
@@ -482,7 +482,7 @@ async fn rm(addr: Option<&str>, all: bool, global: &GlobalOptions) -> anyhow::Re
     if all == addr.is_some() {
         anyhow::bail!("pass either an address or --all, not both or neither");
     }
-    let (engine, _shutdown) = bootstrap::new_engine(global)?;
+    let (engine, _shutdown) = bootstrap::new_engine(global, None)?;
     let (removed, freed) = engine.scratch_remove(addr)?;
     if removed == 0 {
         println!("Nothing to remove.");
@@ -526,7 +526,7 @@ async fn push(
     producer: String,
     global: &GlobalOptions,
 ) -> anyhow::Result<()> {
-    let (engine, _shutdown) = bootstrap::new_engine(global)?;
+    let (engine, _shutdown) = bootstrap::new_engine(global, None)?;
     let selected = select(engine.scratch_slots()?, addr, all)?;
     if selected.is_empty() {
         println!("Nothing to publish.");
@@ -615,7 +615,7 @@ async fn declared_scratches(
 
 /// The caller has checked that exactly one of `addr` and `--all` was given.
 async fn pull(addr: Option<String>, sink: LogSink, global: GlobalOptions) -> anyhow::Result<()> {
-    let (engine, shutdown) = bootstrap::new_engine(&global)?;
+    let (engine, shutdown) = bootstrap::new_engine(&global, Some(sink.session()))?;
     let label = match &addr {
         Some(a) => format!("Fetching scratch {a}"),
         None => "Fetching scratch caches".to_string(),

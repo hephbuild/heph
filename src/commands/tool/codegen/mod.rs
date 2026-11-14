@@ -283,7 +283,7 @@ where
 {
     let global = global.clone();
     let res = bootstrap::block_on(async move {
-        let (engine, shutdown) = bootstrap::new_engine(&global)?;
+        let (engine, shutdown) = bootstrap::new_engine(&global, Some(sink.session()))?;
         let app = CodegenApp {
             engine,
             title,

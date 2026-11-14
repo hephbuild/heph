@@ -2,7 +2,9 @@ use clap::{CommandFactory, FromArgMatches, Parser};
 use heph::commands;
 use heph::commands::GlobalOptions;
 use heph::log;
+use heph::tui::session::{SessionRoot, SessionSlot};
 use std::process::ExitCode;
+use std::sync::Arc;
 use tracing::error;
 
 use heph::diag;
@@ -149,7 +151,12 @@ fn main() -> ExitCode {
     // Before the logger, which `run --raw` silences. A soft parse rather than a
     // look through argv: after `--`, `--raw` is the tool's.
     let soft_match = Cli::command().try_get_matches();
-    let sink = log::init(raw_requested(&soft_match));
+    // The process's session (`heph session …`): owned here and handed to what
+    // records into it — the sink (and through it every command and `run_app`),
+    // the diag sweeper, the error renderer — then finished below with the exit
+    // code. Configured once the command line is parsed.
+    let session = Arc::new(SessionSlot::new());
+    let sink = log::init(raw_requested(&soft_match), Arc::clone(&session));
     heph::tui::panic::install(sink.clone());
 
     // Self-upgrade BEFORE matching the command. A workspace can pin a newer heph
@@ -214,7 +221,7 @@ fn main() -> ExitCode {
     // lazily inside the handler.
     // Applied before any engine is constructed, since it decides whether the
     // engine resolves scratch caches at all.
-    diag::install(cli.global.diag_backtrace);
+    diag::install(cli.global.diag_backtrace, Arc::clone(&session));
 
     // `-j` / `--resource`: each engine the command builds reads them from
     // `cli.global`. Checked here too, before any work, so `-j 4 --resource
@@ -236,13 +243,13 @@ fn main() -> ExitCode {
         None => None,
     };
 
-    // Where this process records its session (`heph session …`): read from the
-    // environment once, here, and handed to the TUI's slot — never by the
-    // engine. Outside every cache key, and the session's id and directory are
-    // never exported to the environment (a target's `pass_env` would see them).
+    // Where this process records its session: read from the environment once,
+    // here, and handed to the slot — never by the engine. Outside every cache
+    // key, and the session's id and directory are never exported to the
+    // environment (a target's `pass_env` would see them).
     let home = std::env::var_os("HOME");
-    heph::tui::session::process().configure(
-        heph::tui::session::SessionRoot::from_env(
+    session.configure(
+        SessionRoot::from_env(
             std::env::var_os("HEPH_NO_SESSION").as_deref(),
             home.as_deref(),
         ),
@@ -252,9 +259,7 @@ fn main() -> ExitCode {
     );
     // A lock-wait notice names the holder's session even when this run records
     // none: `HEPH_NO_SESSION` turns recording off, not looking.
-    heph::tui::session::process().configure_lookup(heph::tui::session::SessionRoot::for_reading(
-        home.as_deref(),
-    ));
+    session.configure_lookup(SessionRoot::for_reading(home.as_deref()));
 
     let exec_result = cli.command.execute(sink, &cli.global);
     // An entrypoint's program ended without success: heph exits as it did.
@@ -284,7 +289,7 @@ fn main() -> ExitCode {
         {
             let exit = e.downcast_ref::<commands::tool::codegen::CodegenExit>();
             if let Some(err) = exit.and_then(|x| x.error.as_ref())
-                && !heph::commands::errors::render_anyhow(err)
+                && !heph::commands::errors::render_anyhow(err, &session)
             {
                 error!(error = %format!("{err:#}"), "Failed");
             }
@@ -295,7 +300,7 @@ fn main() -> ExitCode {
         Err(e) if commands::session::exit_code(e).is_some() => {
             let exit = e.downcast_ref::<commands::session::SessionExit>();
             if let Some(err) = exit.and_then(|x| x.error.as_ref())
-                && !heph::commands::errors::render_anyhow(err)
+                && !heph::commands::errors::render_anyhow(err, &session)
             {
                 error!(error = %format!("{err:#}"), "Failed");
             }
@@ -304,7 +309,7 @@ fn main() -> ExitCode {
         Err(e) if e.downcast_ref::<commands::run::InvokeFailed>().is_some() => {
             let failed = e.downcast_ref::<commands::run::InvokeFailed>();
             if let Some(f) = failed
-                && !heph::commands::errors::render_anyhow(&f.error)
+                && !heph::commands::errors::render_anyhow(&f.error, &session)
             {
                 error!(error = %format!("{:#}", f.error), "Failed");
             }
@@ -315,7 +320,7 @@ fn main() -> ExitCode {
             // (Starlark/Go diagnostics from single-error commands). The TUI is
             // already torn down here, so plain stderr output is safe. Fall back
             // to the one-line log when nothing renderable is found.
-            if !heph::commands::errors::render_anyhow(e) {
+            if !heph::commands::errors::render_anyhow(e, &session) {
                 error!(error = %format!("{:#}", e), "Failed");
             }
             1
@@ -325,7 +330,7 @@ fn main() -> ExitCode {
     // `End` and the lock release, before anything slow on the way out
     // (telemetry, the profiler). A tool killed by a signal has no exit code;
     // the process re-raises it below.
-    heph::tui::session::process().finish(match tool_exit {
+    session.finish(match tool_exit {
         Some(hcore::process::Exit::Signal(_)) => None,
         _ => Some(i32::from(code)),
     });
