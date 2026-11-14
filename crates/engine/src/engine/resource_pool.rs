@@ -234,7 +234,9 @@ impl ResourcePool {
         );
         let mut clamped = false;
         // One entry per pool: `fits` checks each entry on its own, so a pool
-        // listed twice could be granted past its capacity.
+        // listed twice could be granted past its capacity. So every pool's
+        // entry is its whole amount: the declaration (for an undeclared
+        // `cpu`, the default one CPU) plus every implicit entry naming it.
         let implicit_of = |pool: &str| {
             implicit
                 .iter()
@@ -246,23 +248,24 @@ impl ResourcePool {
             lane.grant(lane.index(pool.as_str()), amount, &mut need, &mut clamped)
                 .map_err(|e| e.naming(pool.clone()))?;
         }
+        if request.declared(PoolName::CPU).is_none() {
+            let amount = Resources::DEFAULT_CPU_MICROS.saturating_add(implicit_of(PoolName::CPU));
+            lane.grant(lane.cpu_idx, amount, &mut need, &mut clamped)
+                .map_err(|e| e.naming(PoolName::cpu()))?;
+        }
         for (i, (pool, _)) in implicit.iter().enumerate() {
-            let first = implicit.iter().position(|(p, _)| p == pool) == Some(i);
-            if !first || request.declared(pool.as_str()).is_some() {
+            // Already granted: declared (`cpu` always is, by default), or an
+            // earlier entry of `implicit` named it and took them all.
+            let earlier = implicit.iter().take(i).any(|(p, _)| p == pool);
+            if earlier
+                || pool.as_str() == PoolName::CPU
+                || request.declared(pool.as_str()).is_some()
+            {
                 continue;
             }
             let amount = implicit_of(pool.as_str());
             lane.grant(lane.index(pool.as_str()), amount, &mut need, &mut clamped)
                 .map_err(|e| e.naming(pool.clone()))?;
-        }
-        if request.declared(PoolName::CPU).is_none() {
-            lane.grant(
-                lane.cpu_idx,
-                Resources::DEFAULT_CPU_MICROS,
-                &mut need,
-                &mut clamped,
-            )
-            .map_err(|e| e.naming(PoolName::cpu()))?;
         }
         Ok((need, clamped))
     }
@@ -1695,5 +1698,58 @@ mod tests {
         let next = granted(&mut next).expect("the slot's release admits the waiter");
         drop(next);
         assert_eq!((free(&p, "cpu"), free(&p, "sandbox")), (2 * CPU, 1));
+    }
+
+    /// Every pool is one entry of the grant, its whole amount: a pool both
+    /// declared and implicit, a pool named twice in `implicit`, and an
+    /// implicit `cpu` beside the undeclared default each sum into one entry
+    /// (two entries would each be checked against the capacity alone, and be
+    /// granted past it together).
+    #[test]
+    fn implicit_amounts_sum_into_one_entry_per_pool() {
+        let p = pool(&[("cpu", 4 * CPU), ("gpu", 4), ("sandbox", 4)]);
+        let acquire = |r: &Demand, implicit: &[(&str, u64)]| {
+            let implicit: Vec<(PoolName, u64)> =
+                implicit.iter().map(|&(n, a)| (name(n), a)).collect();
+            p.acquire_with(r, &implicit)
+                .unwrap()
+                .now_or_never()
+                .expect("granted at once")
+                .unwrap()
+        };
+        let amounts = |g: &Reservation| {
+            let mut v: Vec<(String, u64)> =
+                g.iter().map(|(n, a)| (n.as_str().to_owned(), a)).collect();
+            v.sort();
+            v
+        };
+        let both = acquire(&req(&[("gpu", 1)]), &[("gpu", 2)]);
+        assert_eq!(
+            amounts(&both),
+            [("cpu".to_owned(), CPU), ("gpu".to_owned(), 3)],
+            "declared plus implicit"
+        );
+        drop(both);
+        let twice = acquire(&req(&[]), &[("sandbox", 1), ("sandbox", 2)]);
+        assert_eq!(
+            amounts(&twice),
+            [("cpu".to_owned(), CPU), ("sandbox".to_owned(), 3)],
+            "an implicit pool named twice"
+        );
+        drop(twice);
+        let cpu = acquire(&req(&[]), &[("cpu", CPU)]);
+        assert_eq!(
+            amounts(&cpu),
+            [("cpu".to_owned(), 2 * CPU)],
+            "an implicit cpu on top of the undeclared default"
+        );
+        drop(cpu);
+        let declared_cpu = acquire(&req(&[("cpu", 2 * CPU)]), &[("cpu", CPU)]);
+        assert_eq!(amounts(&declared_cpu), [("cpu".to_owned(), 3 * CPU)]);
+        drop(declared_cpu);
+        assert_eq!(
+            (free(&p, "cpu"), free(&p, "gpu"), free(&p, "sandbox")),
+            (4 * CPU, 4, 4)
+        );
     }
 }
