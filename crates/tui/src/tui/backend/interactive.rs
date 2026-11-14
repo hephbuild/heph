@@ -887,6 +887,127 @@ mod tests {
         );
     }
 
+    /// A paused run keeps recording its session (A1): an entrypoint or `--shell`
+    /// holds the terminal for the whole of its run, and `heph session attach`
+    /// must keep seeing what it builds meanwhile.
+    ///
+    /// Two halves, because `run` itself needs a real terminal. This one drives
+    /// the real recording path (`Session`, its tap, `TappedReceiver`) through a
+    /// loop shaped like `run`'s: a `Control::Pause` is taken first, then every
+    /// build event sent after it must reach `events.ndjson`.
+    /// `run_does_not_gate_the_build_event_arm_on_pause` checks that `run`'s
+    /// own build-event arm carries no pause guard, the edit that would stop
+    /// recording while this loop still passed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_paused_loop_still_records_build_events() {
+        use crate::tui::app::{Control, PauseFor};
+        use crate::tui::session::{
+            HeaderKind, HolderNames, RecordReader, Session, SessionHeader, SessionRecord,
+            SessionRoot, SessionStart, TappedReceiver, files,
+        };
+        use hcore::events::{BuildEvent, BuildEventKind};
+        use tokio::sync::{mpsc, oneshot};
+
+        const SENT: usize = 5;
+        let root = tempfile::tempdir().expect("tempdir");
+        let session = Session::open(
+            &SessionRoot::new(root.path()),
+            SessionStart {
+                header: SessionHeader {
+                    kind: HeaderKind::Build,
+                    label: "run //a:shell".into(),
+                },
+                ..SessionStart::default()
+            },
+        )
+        .expect("open");
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let mut build_events =
+            TappedReceiver::new(event_rx, Some(session.tap()), HolderNames::default());
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+
+        // The app: pause the TUI, and only once the pause is acknowledged emit
+        // the events, so every one of them arrives while paused.
+        let app = tokio::spawn(async move {
+            let (ack, acked) = oneshot::channel();
+            control_tx
+                .send(Control::Pause(ack, PauseFor::Input))
+                .expect("pause");
+            acked.await.expect("ack");
+            for i in 0..SENT {
+                let addr = format!("//a:t{i}");
+                event_tx
+                    .send(BuildEvent {
+                        at_unix_ms: 1,
+                        kind: BuildEventKind::ResultStart { addr },
+                    })
+                    .expect("send");
+            }
+            // Dropping both senders ends the loop below.
+        });
+
+        let mut paused = false;
+        let mut folded_while_paused = 0;
+        let mut control_open = true;
+        let looped = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                tokio::select! {
+                    ctrl = control_rx.recv(), if control_open => match ctrl {
+                        Some(Control::Pause(ack, _)) => {
+                            paused = true;
+                            ack.send(()).expect("ack");
+                        }
+                        Some(Control::Resume) => paused = false,
+                        None => control_open = false,
+                    },
+                    // As in `run`: no pause guard on this arm.
+                    got = build_events.recv(|_| {
+                        if paused {
+                            folded_while_paused += 1;
+                        }
+                    }) => if got.is_none() {
+                        break;
+                    },
+                }
+            }
+        })
+        .await;
+        assert!(looped.is_ok(), "the paused loop never drained the events");
+        app.await.expect("app");
+        drop(build_events);
+        session.finish(Some(0), false);
+
+        assert_eq!(folded_while_paused, SENT, "every event folded while paused");
+        let file = std::fs::File::open(session.dir().join(files::EVENTS)).expect("events");
+        let mut reader = RecordReader::new(file);
+        let recorded = std::iter::from_fn(|| reader.next_record().expect("read"))
+            .filter(|r: &SessionRecord| r.build_event().is_some())
+            .count();
+        assert_eq!(
+            recorded, SENT,
+            "every build event emitted while the TUI was paused is recorded"
+        );
+    }
+
+    /// `run`'s build-event arm must not be guarded on `paused`: with the guard,
+    /// a paused run (an entrypoint, `--shell`) stops recording its session for
+    /// as long as it holds the terminal. `run` needs a real terminal, so this
+    /// reads its source; `a_paused_loop_still_records_build_events` proves
+    /// the unguarded shape records.
+    #[test]
+    fn run_does_not_gate_the_build_event_arm_on_pause() {
+        let src = include_str!("interactive.rs");
+        let (_, arm) = src
+            .split_once("maybe_build_evt = async {")
+            .expect("run's build-event arm");
+        let (head, _) = arm.split_once("=> {").expect("the arm's body");
+        assert!(
+            !head.contains("paused"),
+            "run's build-event arm is gated on `paused`, so a paused run stops \
+             recording its session:\n{head}"
+        );
+    }
+
     /// The exit loop must not break the moment the app future resolves: it keeps
     /// rendering until the shared background-cleanup counter drains to zero. It
     /// drives the same break predicate (`bg_drained`) and drain arm
