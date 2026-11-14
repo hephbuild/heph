@@ -284,6 +284,17 @@ fn main() -> ExitCode {
             }
             exit.map_or(2, |x| x.code)
         }
+        // `heph session`: 125 for its own failures, else the code `attach`
+        // mirrors from the session it followed.
+        Err(e) if commands::session::exit_code(e).is_some() => {
+            let exit = e.downcast_ref::<commands::session::SessionExit>();
+            if let Some(err) = exit.and_then(|x| x.error.as_ref())
+                && !heph::commands::errors::render_anyhow(err)
+            {
+                error!(error = %format!("{err:#}"), "Failed");
+            }
+            commands::session::exit_code(e).unwrap_or(commands::session::SessionExit::OWN_FAILURE)
+        }
         Err(e) if e.downcast_ref::<commands::run::InvokeFailed>().is_some() => {
             let failed = e.downcast_ref::<commands::run::InvokeFailed>();
             if let Some(f) = failed
