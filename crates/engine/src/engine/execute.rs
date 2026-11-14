@@ -661,7 +661,7 @@ impl Engine {
     /// result lock, its scratch slots), none of which a producer's build
     /// takes.
     ///
-    /// **One admission for cpu and sandbox**, atomic and FIFO: a run waiting
+    /// **One admission for cpu and sandbox**, atomic: a run waiting
     /// for cleanup holds no cpu, and a run waiting for cpu holds no slot for
     /// a sandbox not yet made. Slots come back from the reclaim lane, which
     /// waits on nothing, so the wait ends.
@@ -774,7 +774,8 @@ impl Engine {
     }
 
     /// Reserve what `addr` declares (`resources`; an undeclared `cpu` is one
-    /// CPU) from the engine's pools, parking in FIFO order until it fits; a
+    /// CPU) from the engine's pools, parking until it is admitted
+    /// (`resource_pool`'s module docs say who is, and in what order); a
     /// request needing nothing of a bounded pool is granted at once. A pool whose capacity is 0 fails
     /// the target here, before it runs, naming the override that would set it.
     ///
