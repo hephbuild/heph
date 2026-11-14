@@ -3855,8 +3855,14 @@ mod tests {
             elapsed >= total,
             "given up before the deadline: {elapsed:?}"
         );
+        // A deadline restarted per batch costs at least `BATCHES` deadlines,
+        // so that is the bound. The batches' own cost is not bounded tighter:
+        // sqlite's busy handler counts its short sleeps at their nominal
+        // length, and on a loaded macOS runner each one oversleeps, so one
+        // 50ms busy timeout has taken several times that (4 batches took
+        // 2.48s there against a 1s deadline).
         assert!(
-            elapsed < total * 2,
+            elapsed < total * BATCHES,
             "{BATCHES} batches took {elapsed:?}: the deadline ({total:?}) restarted per batch"
         );
 
