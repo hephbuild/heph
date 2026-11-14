@@ -66,7 +66,9 @@
 //! claim reclaims the plain dir only. (A failed credential-material run is the
 //! exception: [`SandboxTeardown::reclaim`] removes its upper dir explicitly.)
 //! That is a known gap, independent of queue order: running the reclaim lane
-//! FIFO would not close it.
+//! FIFO would not close it. It is also outside the `sandbox` pool's bound
+//! below: such an upper dir outlives the slot its run released. Known gap; a
+//! follow-up is to be filed.
 //!
 //! Both lanes decrement the same per-request `bg_pending` counter, so the
 //! shutdown path that blocks on it drains both.
@@ -349,10 +351,9 @@ pub struct SandboxTeardown {
     /// This sandbox's slot in the engine's `sandbox` pool, split off the
     /// run's admission grant.
     slot: Option<crate::engine::resource_pool::Reservation>,
-    /// How long each removal this teardown queues sleeps first: a test
-    /// stands in a slow disk with it.
-    #[cfg(any(test, feature = "test-support"))]
-    removal_delay: std::time::Duration,
+    /// What each removal this teardown queues waits for first: a test stands
+    /// in a slow disk with it. Nothing outside tests.
+    hold: RemovalHold,
     armed: bool,
 }
 
@@ -380,7 +381,7 @@ impl std::fmt::Debug for SandboxTeardown {
 fn releasing(
     job: SandboxCleanupJob,
     slot: Option<crate::engine::resource_pool::Reservation>,
-    delay: std::time::Duration,
+    hold: RemovalHold,
 ) -> SandboxCleanupJob {
     let Some(slot) = slot else {
         return job;
@@ -389,11 +390,96 @@ fn releasing(
         // Dropped on every way out of this closure, an unwind included, and
         // with the closure when it never runs.
         let _slot = slot;
-        if !delay.is_zero() {
-            thread::sleep(delay);
-        }
+        hold.wait();
         job()
     })
+}
+
+/// What a removal holding a `sandbox` slot waits for before it runs: a test
+/// stands in a slow disk with a fixed delay ([`Engine::set_sandbox_removal_delay`])
+/// or holds removals until it says so ([`RemovalGate`]). Empty, and a no-op,
+/// outside tests.
+///
+/// [`Engine::set_sandbox_removal_delay`]: crate::engine::Engine::set_sandbox_removal_delay
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RemovalHold {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) delay: std::time::Duration,
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) gate: Option<Arc<GateState>>,
+}
+
+impl RemovalHold {
+    /// Sleep the delay, then wait for the gate to be open. Runs on a reclaim
+    /// lane thread.
+    fn wait(&self) {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            if !self.delay.is_zero() {
+                thread::sleep(self.delay);
+            }
+            if let Some(gate) = &self.gate {
+                let mut open = gate.open.lock();
+                while !*open {
+                    gate.changed.wait(&mut open);
+                }
+            }
+        }
+    }
+}
+
+/// A [`RemovalGate`]'s shared state: whether it is open, and the condition
+/// the held removals wait on.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Default)]
+pub(crate) struct GateState {
+    open: parking_lot::Mutex<bool>,
+    changed: parking_lot::Condvar,
+}
+
+/// Holds every sandbox removal that releases a `sandbox` slot until the test
+/// opens it ([`Engine::set_sandbox_removal_gate`]), so a slot stays pending
+/// removal for exactly as long as the test needs rather than for a delay it
+/// hopes is long enough. Dropping the gate opens it, so a test that fails
+/// with it closed does not leave reclaim lane threads parked for good.
+///
+/// [`Engine::set_sandbox_removal_gate`]: crate::engine::Engine::set_sandbox_removal_gate
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug)]
+pub struct RemovalGate {
+    state: Arc<GateState>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl RemovalGate {
+    /// A gate that holds removals until [`open`](Self::open).
+    pub fn closed() -> Self {
+        Self {
+            state: Arc::default(),
+        }
+    }
+
+    /// Let every held and later removal run.
+    pub fn open(&self) {
+        *self.state.open.lock() = true;
+        self.state.changed.notify_all();
+    }
+
+    /// Hold every removal that has not passed the gate yet, again.
+    pub fn close(&self) {
+        *self.state.open.lock() = false;
+    }
+
+    pub(crate) fn state(&self) -> Arc<GateState> {
+        Arc::clone(&self.state)
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for RemovalGate {
+    fn drop(&mut self) {
+        self.open();
+    }
 }
 
 impl SandboxTeardown {
@@ -406,8 +492,7 @@ impl SandboxTeardown {
             pending,
             job: None,
             slot: None,
-            #[cfg(any(test, feature = "test-support"))]
-            removal_delay: std::time::Duration::ZERO,
+            hold: RemovalHold::default(),
             armed: true,
         }
     }
@@ -422,24 +507,12 @@ impl SandboxTeardown {
         self
     }
 
-    /// Make each removal this teardown queues sleep `delay` first, so a test
-    /// can stand in a slow disk.
+    /// Make each removal this teardown queues wait for `hold` first, so a
+    /// test can stand in a slow disk.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn with_removal_delay(mut self, delay: std::time::Duration) -> Self {
-        self.removal_delay = delay;
+    pub(crate) fn with_removal_hold(mut self, hold: RemovalHold) -> Self {
+        self.hold = hold;
         self
-    }
-
-    /// The test-only removal delay; zero outside tests.
-    fn removal_delay(&self) -> std::time::Duration {
-        #[cfg(any(test, feature = "test-support"))]
-        {
-            self.removal_delay
-        }
-        #[cfg(not(any(test, feature = "test-support")))]
-        {
-            std::time::Duration::ZERO
-        }
     }
 
     /// The claimed sandbox directory.
@@ -473,7 +546,7 @@ impl SandboxTeardown {
                 releasing(
                     generation::guarded(self.dir.clone(), self.generation, job),
                     slot,
-                    self.removal_delay(),
+                    std::mem::take(&mut self.hold),
                 ),
                 Arc::clone(&self.pending),
             );
@@ -537,7 +610,7 @@ impl SandboxTeardown {
             releasing(
                 generation::guarded(self.dir.clone(), self.generation, job),
                 self.slot.take(),
-                self.removal_delay(),
+                std::mem::take(&mut self.hold),
             ),
             Arc::clone(&self.pending),
         );
@@ -552,7 +625,7 @@ impl SandboxTeardown {
             releasing(
                 Box::new(move || generation::remove_stale(&dir, generation)),
                 self.slot.take(),
-                self.removal_delay(),
+                std::mem::take(&mut self.hold),
             ),
             Arc::clone(&self.pending),
         );
@@ -1664,26 +1737,59 @@ mod tests {
                 }
             }),
             Some(slot(&pool)),
-            Duration::ZERO,
+            RemovalHold::default(),
         );
-        // A run queued behind the slot, woken by the job's release on
-        // another OS thread.
+        // A run queued behind the slot, parked in an executor on its own
+        // thread: only a wake from the job's release, on a third thread with
+        // no runtime, can finish it. `parked` is set at its first Pending.
         let mut waiter = pool
             .acquire_with(&Default::default(), &[(PoolName::sandbox(), 1)])
             .expect("acquire");
-        assert!((&mut waiter).now_or_never().is_none(), "the slot is held");
+        let parked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let waiting = std::thread::spawn({
+            let parked = Arc::clone(&parked);
+            move || {
+                futures::executor::block_on(std::future::poll_fn(|cx| {
+                    let polled = waiter.poll_unpin(cx);
+                    if polled.is_pending() {
+                        parked.store(true, Ordering::Release);
+                    }
+                    polled
+                }))
+            }
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !parked.load(Ordering::Acquire) {
+            assert!(!waiting.is_finished(), "granted while the slot is held");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the waiter never parked"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!waiting.is_finished(), "the slot is held");
         std::thread::spawn(job)
             .join()
             .expect("no panic")
             .expect("job");
         assert_eq!(*seen.lock().expect("lock"), Some(0), "held during removal");
-        let woken = futures::executor::block_on(waiter).expect("woken by the release");
+        while !waiting.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the release never woke the parked waiter"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let woken = waiting
+            .join()
+            .expect("no panic")
+            .expect("woken by the release");
         drop(woken);
 
         let panics = releasing(
             Box::new(|| panic!("removal panicked")),
             Some(slot(&pool)),
-            Duration::ZERO,
+            RemovalHold::default(),
         );
         assert!(catch_unwind(AssertUnwindSafe(panics)).is_err());
         assert_eq!(pool.available(PoolName::SANDBOX), Some(1), "after a panic");
@@ -1691,8 +1797,63 @@ mod tests {
         drop(releasing(
             Box::new(|| Ok(())),
             Some(slot(&pool)),
-            Duration::ZERO,
+            RemovalHold::default(),
         ));
         assert_eq!(pool.available(PoolName::SANDBOX), Some(1), "dropped unrun");
+    }
+
+    /// A closed [`RemovalGate`] holds a removal, and so its slot, until it is
+    /// opened, and dropping the gate opens it: a test that fails with the
+    /// gate closed does not park reclaim lane threads for good.
+    #[test]
+    fn a_removal_gate_holds_the_removal_and_its_slot_until_it_opens() {
+        use crate::engine::resource_pool::{Limit, ResourcePool};
+        use futures::FutureExt as _;
+        use hplugin::provider::PoolName;
+        let pool = ResourcePool::new([
+            (PoolName::cpu(), Limit::Bounded(4_000_000)),
+            (PoolName::sandbox(), Limit::Bounded(1)),
+        ]);
+        for by_drop in [false, true] {
+            // Opened and closed again first: a reopened gate holds anew.
+            let gate = RemovalGate::closed();
+            gate.open();
+            gate.close();
+            let mut grant = pool
+                .acquire_with(&Default::default(), &[(PoolName::sandbox(), 1)])
+                .expect("acquire")
+                .now_or_never()
+                .expect("granted at once")
+                .expect("granted");
+            let slot = grant.split_off(PoolName::SANDBOX).expect("slot");
+            let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let job = releasing(
+                Box::new({
+                    let ran = Arc::clone(&ran);
+                    move || {
+                        ran.store(true, Ordering::Release);
+                        Ok(())
+                    }
+                }),
+                Some(slot),
+                RemovalHold {
+                    gate: Some(gate.state()),
+                    ..RemovalHold::default()
+                },
+            );
+            let removing = std::thread::spawn(job);
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(!removing.is_finished(), "by_drop={by_drop}: held");
+            assert!(!ran.load(Ordering::Acquire), "by_drop={by_drop}: not run");
+            assert_eq!(pool.available(PoolName::SANDBOX), Some(0), "slot held");
+            if by_drop {
+                drop(gate);
+            } else {
+                gate.open();
+            }
+            removing.join().expect("no panic").expect("job");
+            assert!(ran.load(Ordering::Acquire), "by_drop={by_drop}: ran");
+            assert_eq!(pool.available(PoolName::SANDBOX), Some(1), "released");
+        }
     }
 }

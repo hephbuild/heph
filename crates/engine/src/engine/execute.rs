@@ -704,7 +704,7 @@ impl Engine {
             crate::engine::sandbox_cleaner::SandboxTeardown::arm(dir, generation, pending)
                 .with_sandbox_slot(slot);
         #[cfg(any(test, feature = "test-support"))]
-        let teardown = teardown.with_removal_delay(self.sandbox_removal_delay);
+        let teardown = teardown.with_removal_hold(self.sandbox_removal_hold.clone());
         teardown
     }
 

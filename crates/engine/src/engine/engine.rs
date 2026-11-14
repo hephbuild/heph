@@ -283,10 +283,11 @@ pub struct Engine {
     /// The `cpu` capacity, in CPUs (rounded up), announced to clients as the
     /// `RequestConfig` build event's `max_workers`.
     pub(crate) max_workers: usize,
-    /// How long each sandbox removal holding a `sandbox` slot sleeps first
-    /// ([`set_sandbox_removal_delay`](Self::set_sandbox_removal_delay)).
+    /// What each sandbox removal holding a `sandbox` slot waits for first
+    /// ([`set_sandbox_removal_delay`](Self::set_sandbox_removal_delay),
+    /// [`set_sandbox_removal_gate`](Self::set_sandbox_removal_gate)).
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) sandbox_removal_delay: std::time::Duration,
+    pub(crate) sandbox_removal_hold: crate::engine::sandbox_cleaner::RemovalHold,
     /// How wide the engine's own fan-outs run (top-level spawns, the gc and
     /// clean loops): `2 × parallelism`, independent of the `cpu` capacity, so
     /// `-j 1` does not serialise them.
@@ -750,7 +751,16 @@ impl Engine {
     /// wait `delay` first, so a test can stand in a slow disk.
     #[cfg(any(test, feature = "test-support"))]
     pub fn set_sandbox_removal_delay(&mut self, delay: std::time::Duration) {
-        self.sandbox_removal_delay = delay;
+        self.sandbox_removal_hold.delay = delay;
+    }
+
+    /// Hold each removal of a build sandbox that holds a `sandbox` pool slot
+    /// until `gate` opens (after any [removal
+    /// delay](Self::set_sandbox_removal_delay)), so a test keeps a slot
+    /// pending removal for exactly as long as it needs.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_sandbox_removal_gate(&mut self, gate: &crate::engine::sandbox_cleaner::RemovalGate) {
+        self.sandbox_removal_hold.gate = Some(gate.state());
     }
 
     pub fn new(cfg: Config) -> anyhow::Result<Engine> {
@@ -921,7 +931,7 @@ impl Engine {
             },
             max_workers,
             #[cfg(any(test, feature = "test-support"))]
-            sandbox_removal_delay: std::time::Duration::ZERO,
+            sandbox_removal_hold: Default::default(),
             fan_out,
             admission_notice: crate::engine::result::RESULT_LOCK_NOTICE,
             timeout_grace: crate::engine::run_timeout::GRACE,

@@ -11,11 +11,15 @@
 //!
 //! A slow disk is stood in by `Engine::set_sandbox_removal_delay`, which makes
 //! every removal that releases a slot sleep first: removal falls behind
-//! creation, which is the condition the pool's bound exists for.
+//! creation, which is the condition the pool's bound exists for. A test that
+//! needs a slot to stay pending removal while something else happens holds
+//! removals with `Engine::set_sandbox_removal_gate` instead, so no assertion
+//! rests on a delay being long enough.
 
 use hcore::capacity::PoolSpec;
 use heph::engine::request_state::RequestState;
 use heph::engine::resource_pool::{PoolSnapshot, ResourceSnapshot};
+use heph::engine::sandbox_cleaner::RemovalGate;
 use heph::engine::{Config, Engine, InvokeOutcome, InvokeRequest, OutputMatcher, ResultOptions};
 use heph::htaddr::parse_addr;
 use heph::htmatcher::Matcher;
@@ -34,6 +38,24 @@ const DEADLINE: Duration = Duration::from_secs(120);
 /// the non-managed template driver, 4 cpus and a `sandbox` pool of `slots`;
 /// every removal that releases a slot first waits `removal_delay`.
 fn engine(root: &Path, slots: usize, removal_delay: Duration) -> anyhow::Result<Arc<Engine>> {
+    engine_with(root, slots, |e| e.set_sandbox_removal_delay(removal_delay))
+}
+
+/// [`engine`] whose removals that release a slot are held by the returned
+/// gate, closed, until the test opens it: a slot stays pending removal for
+/// exactly as long as the test needs. Dropping the gate opens it.
+fn gated_engine(root: &Path, slots: usize) -> anyhow::Result<(Arc<Engine>, RemovalGate)> {
+    let gate = RemovalGate::closed();
+    let engine = engine_with(root, slots, |e| e.set_sandbox_removal_gate(&gate))?;
+    Ok((engine, gate))
+}
+
+/// The engine of [`engine`], with `stall` setting how its removals wait.
+fn engine_with(
+    root: &Path,
+    slots: usize,
+    stall: impl FnOnce(&mut Engine),
+) -> anyhow::Result<Arc<Engine>> {
     let mut cfg = Config {
         parallelism: Some(4),
         ..Config::for_tests(root.to_path_buf())
@@ -43,7 +65,7 @@ fn engine(root: &Path, slots: usize, removal_delay: Duration) -> anyhow::Result<
         PoolSpec::from_written(PoolName::SANDBOX, None, Some(&slots.to_string()))?,
     );
     let mut e = Engine::new(cfg)?;
-    e.set_sandbox_removal_delay(removal_delay);
+    stall(&mut e);
     let r = root.to_path_buf();
     e.register_provider(move |init| {
         Box::new(pluginbuildfile::Provider::new(
@@ -207,15 +229,11 @@ async fn snapshot_until(engine: &Engine, what: &str, cond: impl Fn(&ResourceSnap
     }
 }
 
-/// A slow disk for the tests that need a slot to stay pending removal while
-/// something else happens: long next to everything they do meanwhile.
-const SLOW_REMOVAL: Duration = Duration::from_secs(3);
-
 /// Build `//p:busy` in its own request and return once its run has ended and
 /// its sandbox is queued for removal: no cpu held, the only `sandbox` slot
-/// held by the pending removal. With one slot and [`SLOW_REMOVAL`], the pool
-/// is exhausted for the next few seconds. The request is returned so the
-/// caller drains it.
+/// held by the pending removal. On a [`gated_engine`] of one slot, the pool
+/// is exhausted until the gate opens. The request is returned so the caller
+/// drains it, after opening the gate.
 async fn exhaust_the_pool(engine: &Arc<Engine>) -> anyhow::Result<Arc<RequestState>> {
     let rs = engine.new_state();
     build_in(engine, &rs, &["//p:busy".to_owned()]).await?;
@@ -430,26 +448,25 @@ async fn a_cache_hit_takes_no_sandbox_slot() -> anyhow::Result<()> {
             target("busy", "echo busy > $OUT", None),
         ),
     );
-    let engine = engine(root, 1, SLOW_REMOVAL)?;
+    let (engine, gate) = gated_engine(root, 1)?;
+    gate.open();
     build(&engine, &["//p:cached".to_owned()]).await?;
     all_capacity_back(&engine).await;
+    gate.close();
 
+    // The removal is held until the gate opens, so the hit finishing at all
+    // proves it took no slot.
     let busy = exhaust_the_pool(&engine).await?;
-    let started = Instant::now();
     let rs = engine.new_state();
     build_in(&engine, &rs, &["//p:cached".to_owned()]).await?;
-    let elapsed = started.elapsed();
     assert_only_busy_pending(&engine, "after the hit");
-    assert!(
-        elapsed < SLOW_REMOVAL,
-        "the hit waited {elapsed:?}, as long as the removal"
-    );
     assert_eq!(
         std::fs::read_to_string(&runs)?.lines().count(),
         1,
         "the second build was a cache hit"
     );
 
+    gate.open();
     drain(rs).await;
     drain(busy).await;
     all_capacity_back(&engine).await;
@@ -477,19 +494,16 @@ target(name = "conf", driver = "template", src = file("conf.j2"), out = "conf",
 "#,
         ),
     );
-    let engine = engine(root, 1, SLOW_REMOVAL)?;
+    let (engine, gate) = gated_engine(root, 1)?;
 
+    // busy's removal is held until the gate opens: the template finishing at
+    // all proves it took no slot.
     let busy = exhaust_the_pool(&engine).await?;
-    let started = Instant::now();
     let rs = engine.new_state();
     build_in(&engine, &rs, &["//p:conf".to_owned()]).await?;
-    let elapsed = started.elapsed();
     assert_only_busy_pending(&engine, "after the template");
-    assert!(
-        elapsed < SLOW_REMOVAL,
-        "the template waited {elapsed:?}, as long as the removal"
-    );
 
+    gate.open();
     drain(rs).await;
     drain(busy).await;
     all_capacity_back(&engine).await;
@@ -516,10 +530,11 @@ target(name = "ep", driver = "bash", entrypoint = True,
 "#,
         ),
     );
-    let engine = engine(root, 1, SLOW_REMOVAL)?;
+    let (engine, gate) = gated_engine(root, 1)?;
 
+    // busy's removal is held until the gate opens: the invocation finishing
+    // at all proves it took no slot.
     let busy = exhaust_the_pool(&engine).await?;
-    let started = Instant::now();
     let req = InvokeRequest::new(
         parse_addr("//p:ep")?,
         root,
@@ -534,18 +549,14 @@ target(name = "ep", driver = "bash", entrypoint = True,
     )
     .await
     .map_err(|_elapsed| anyhow::anyhow!("the invocation hung"))??;
-    let elapsed = started.elapsed();
     match outcome {
         InvokeOutcome::Exited(exit) => assert_eq!(exit, hcore::process::Exit::Code(0)),
         other => panic!("the invocation did not exit cleanly: {other:?}"),
     }
     assert_eq!(std::fs::read_to_string(&out)?, "invoked\n");
     assert_only_busy_pending(&engine, "after the invocation");
-    assert!(
-        elapsed < SLOW_REMOVAL,
-        "the invocation waited {elapsed:?}, as long as the removal"
-    );
 
+    gate.open();
     drain(busy).await;
     all_capacity_back(&engine).await;
     Ok(())
@@ -568,7 +579,7 @@ async fn a_run_cancelled_while_queued_on_the_sandbox_pool_is_a_cancellation() ->
             target("parked", "echo parked > $OUT", None),
         ),
     );
-    let engine = engine(root, 1, SLOW_REMOVAL)?;
+    let (engine, gate) = gated_engine(root, 1)?;
 
     let busy = exhaust_the_pool(&engine).await?;
     let rs = engine.new_state();
@@ -586,19 +597,13 @@ async fn a_run_cancelled_while_queued_on_the_sandbox_pool_is_a_cancellation() ->
         s.main.queued == 1 && head_waits_on_sandbox(s)
     })
     .await;
-    let cancelled_at = Instant::now();
     rs.ctoken().cancel();
     let ended = tokio::time::timeout(DEADLINE, task)
         .await
         .map_err(|_elapsed| anyhow::anyhow!("a cancelled wait hung"))??;
-    let left_after = cancelled_at.elapsed();
 
-    // Back out of the queue at once, holding nothing: the only slot out is
-    // busy's, whose removal is still owed.
-    assert!(
-        left_after < SLOW_REMOVAL,
-        "the cancelled run left the queue only after {left_after:?}, once busy's slot was back"
-    );
+    // Out of the queue, holding nothing, while busy's removal is still held
+    // by the gate: the run left without its slot ever coming back.
     assert_only_busy_pending(&engine, "after the cancelled wait");
     match ended {
         Err(e) => assert!(hplugin::error::is_cancelled(&e), "{e:#}"),
@@ -614,6 +619,7 @@ async fn a_run_cancelled_while_queued_on_the_sandbox_pool_is_a_cancellation() ->
         );
     }
 
+    gate.open();
     drain(rs).await;
     drain(busy).await;
     all_capacity_back(&engine).await;
