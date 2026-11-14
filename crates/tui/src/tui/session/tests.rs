@@ -708,3 +708,74 @@ async fn file_source_follows_until_end() {
         Some(3)
     );
 }
+
+fn lock_wait(addr: &str, pid: u32) -> BuildEvent {
+    BuildEvent {
+        at_unix_ms: 1,
+        kind: BuildEventKind::ResultLockWaitStart {
+            addr: addr.into(),
+            holder_pid: Some(pid),
+            in_use_by_readers: false,
+        },
+    }
+}
+
+/// The backend's receiver resolves a holder pid before it folds the event that
+/// first carries it, so the view names the session on that very event while
+/// reading only the cache; the second event with the pid is not resolved again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn receiver_resolves_the_holder_before_the_fold() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let holder = Session::open(&SessionRoot::new(root.path()), start()).expect("holder");
+    let pid = std::process::id();
+    let names = HolderNames::new(Some(SessionRoot::new(root.path())), None);
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut events = TappedReceiver::new(rx, None, names.clone());
+    tx.send(lock_wait("//a:x", pid)).expect("send");
+    tx.send(lock_wait("//a:y", pid)).expect("send");
+
+    let mut seen = None;
+    events
+        .recv(|_| seen = Some(names.get(pid)))
+        .await
+        .expect("an event");
+    assert_eq!(seen, Some(Some(holder.id())), "named on the first fold");
+    assert!(!names.needs(pid), "resolved once, cached");
+    seen = None;
+    events
+        .recv(|_| seen = Some(names.get(pid)))
+        .await
+        .expect("an event");
+    assert_eq!(seen, Some(Some(holder.id())));
+    holder.finish(Some(0), false);
+}
+
+/// A `recv` dropped while its event's holder resolves (a `select!` arm losing)
+/// loses nothing and reorders nothing: the parked event is folded first, by the
+/// teardown drain, exactly once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn receiver_keeps_a_parked_event_across_a_dropped_recv() {
+    use futures::FutureExt as _;
+    let root = tempfile::tempdir().expect("tempdir");
+    let holder = Session::open(&SessionRoot::new(root.path()), start()).expect("holder");
+    let pid = std::process::id();
+    let names = HolderNames::new(Some(SessionRoot::new(root.path())), None);
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut events = TappedReceiver::new(rx, None, names);
+    tx.send(lock_wait("//a:parked", pid)).expect("send");
+    tx.send(lock_wait("//a:next", pid)).expect("send");
+
+    let mut folded: Vec<String> = Vec::new();
+    let addr = |ev: &BuildEvent| match &ev.kind {
+        BuildEventKind::ResultLockWaitStart { addr, .. } => addr.clone(),
+        other => panic!("only lock waits are sent: {other:?}"),
+    };
+    // One poll takes the event and parks it on the scan (or folds it, if the
+    // scan already finished); then the future is dropped.
+    let first = events.recv(|ev| folded.push(addr(ev))).now_or_never();
+    assert!(first.is_none() || folded.len() == 1, "{folded:?}");
+    drop(tx);
+    while events.try_recv(|ev| folded.push(addr(ev))).is_ok() {}
+    assert_eq!(folded, ["//a:parked", "//a:next"]);
+    holder.finish(Some(0), false);
+}

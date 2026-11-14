@@ -190,10 +190,14 @@ A run waiting on a lock names the holder in its own progress output, on both
 backends: `held by session <id> (pid N)` (the TUI row says `locked by …`) when a
 live session other than its own is recorded for the pid, and `held by pid N`
 otherwise. The events carry only the pid, so the engine stays unaware of
-sessions: the view resolves the pid with the same rule as `list`/`show`
-(`tui::session::holder_session`), scanning the sessions directory once per
-distinct pid when that pid's first wait is folded, and keeps the answer for the
-run. A render never does IO. The directory comes from `HOME` alone, so a run
+sessions: the pid is resolved with the same rule as `list`/`show` (a live
+session, not this one, whose `meta.json` names the pid). The backend's event
+receiver does it, once per distinct pid, on the blocking pool, before it folds
+the event that first carries the pid; that event waits for the scan, later
+events queue behind it, and the build itself never waits. The scan reads each
+session's `meta.json` and probes the matching one's lock, never `status.json`.
+The view only reads the cached answer, so neither the fold nor a render does
+IO. The directory comes from `HOME` alone, so a run
 with `HEPH_NO_SESSION` still names other sessions; with no `HOME`, or any read
 error, the notice is the pid.
 

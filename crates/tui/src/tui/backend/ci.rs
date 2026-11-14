@@ -25,16 +25,22 @@ pub async fn run<A: App + 'static>(
             id = s.id
         ));
     }
-    if let Some(slot) = slot {
-        view.name_lock_holders(slot.holder_names());
-    }
+    // After `open`, so the process's own session is never named as a holder.
+    let holders = app
+        .lock_holders()
+        .or_else(|| slot.map(SessionSlot::holder_names))
+        .unwrap_or_default();
+    view.name_lock_holders(holders.clone());
     view.begin();
 
     // We own the build-event channel: sender to the app via AppContext, we keep
     // the receiver, tapped into the session on its receive side.
     let (event_tx, event_rx) = mpsc::unbounded_channel();
-    let mut events: Option<TappedReceiver> =
-        Some(TappedReceiver::new(event_rx, session.map(|s| s.tap)));
+    let mut events: Option<TappedReceiver> = Some(TappedReceiver::new(
+        event_rx,
+        session.map(|s| s.tap),
+        holders,
+    ));
     // Shared with the app's request state so we can wait for fire-and-forget
     // sandbox cleanups to drain before returning (and tearing down the runtime /
     // exiting the process out from under the cleaner thread).

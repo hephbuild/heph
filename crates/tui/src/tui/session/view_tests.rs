@@ -193,7 +193,11 @@ fn attached_view_draws_what_the_run_drew() {
         label: label.clone(),
     }))
     .with_approval(center.clone());
-    live.name_lock_holders(HolderNames::new(Some(session_root.clone()), Some(rec.id())));
+    // The backend's receiver resolves the holder before the fold; the events
+    // here are applied by hand, so resolve up front.
+    let live_names = HolderNames::new(Some(session_root.clone()), Some(rec.id()));
+    live_names.resolve_blocking(std::process::id());
+    live.name_lock_holders(live_names);
     let tap = rec.tap();
     let mut view_tap = ViewTap::new(tap.clone(), &live);
 
@@ -230,7 +234,9 @@ fn attached_view_draws_what_the_run_drew() {
     // The viewer: the same view, attached, fed from the recording.
     let feed = SessionFeed::default();
     let mut attached = TuiProgressView::new("run //a:...").attached(rec.id(), feed.clone(), || {});
-    attached.name_lock_holders(FileSource::new(root.path()).holder_names(rec.id()));
+    let attached_names = FileSource::new(root.path()).holder_names(rec.id());
+    attached_names.resolve_blocking(std::process::id());
+    attached.name_lock_holders(attached_names);
     let mut checkpoints = Vec::new();
     for record in read_records(rec.dir()) {
         let prompt = match &record.session {

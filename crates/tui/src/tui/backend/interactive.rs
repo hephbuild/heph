@@ -49,9 +49,12 @@ pub async fn run<A: App + 'static>(
     let session_tap = slot
         .and_then(|s| s.open(view.session_header(), true))
         .map(|s| s.tap);
-    if let Some(slot) = slot {
-        view.name_lock_holders(slot.holder_names());
-    }
+    // After `open`, so the process's own session is never named as a holder.
+    let holders = app
+        .lock_holders()
+        .or_else(|| slot.map(SessionSlot::holder_names))
+        .unwrap_or_default();
+    view.name_lock_holders(holders.clone());
     // Size the inline viewport to ~1/3 of the terminal height. Queried before the
     // viewport is built (so the first frame is already sized); the column count is
     // re-derived from the backend below.
@@ -68,7 +71,8 @@ pub async fn run<A: App + 'static>(
     // AppContext (and into its request state); we keep the receiver.
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let mut view_tap = session_tap.clone().map(|tap| ViewTap::new(tap, &view));
-    let mut build_events: Option<TappedReceiver> = Some(TappedReceiver::new(event_rx, session_tap));
+    let mut build_events: Option<TappedReceiver> =
+        Some(TappedReceiver::new(event_rx, session_tap, holders));
     // The instant a held viewport froze its clock at; the summary uses it too.
     let mut held_at: Option<u64> = None;
 

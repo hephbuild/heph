@@ -192,16 +192,14 @@ impl App for AttachApp {
 
     fn tui_view(&self) -> Self::TuiView {
         let quit = self.quit_tx.clone();
-        let mut view = new_view(&self.meta).attached(self.id, self.feed.clone(), move || {
+        new_view(&self.meta).attached(self.id, self.feed.clone(), move || {
             // The app may already be gone; then there is nothing to detach.
             let _gone = quit.send(());
-        });
-        tui::TUIAppView::name_lock_holders(&mut view, self.holders.clone());
-        view
+        })
     }
 
     fn ci_view(&self) -> Self::CiView {
-        let mut view = if !self.meta.interactive {
+        if !self.meta.interactive {
             LineView::Quiet
         } else {
             match self.meta.header {
@@ -212,13 +210,17 @@ impl App for AttachApp {
                     LineView::Progress(Box::new(tui::CiProgressView::new(self.meta.label.clone())))
                 }
             }
-        };
-        view.name_lock_holders(self.holders.clone());
-        view
+        }
     }
 
     fn records_session(&self) -> bool {
         false
+    }
+
+    /// The backend hands these to the view and resolves through them, as it
+    /// does a run's own.
+    fn lock_holders(&self) -> Option<HolderNames> {
+        Some(self.holders.clone())
     }
 
     async fn run(mut self, ctx: AppContext) -> anyhow::Result<Outcome> {

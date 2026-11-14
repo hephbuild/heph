@@ -927,8 +927,9 @@ impl BuildState {
     }
 
     /// A lock holder as a notice names it: `session <id> (pid N)`, or `pid N`
-    /// when no live session is recorded for it. Reads what the fold resolved;
-    /// never does IO, so it is safe on every frame.
+    /// when no live session is recorded for it. Reads what the backend's
+    /// receiver resolved before the fold; never does IO, so it is safe on
+    /// every frame.
     fn holder(&self, pid: u32) -> String {
         holder_text(pid, self.holders.get(pid))
     }
@@ -1178,9 +1179,6 @@ impl BuildState {
                 holder_pid,
                 in_use_by_readers,
             } => {
-                if let Some(pid) = holder_pid {
-                    self.holders.learn(*pid);
-                }
                 self.lock_waits.insert(
                     addr.clone(),
                     (
@@ -1198,9 +1196,6 @@ impl BuildState {
                 access,
                 holder_pid,
             } => {
-                if let Some(pid) = holder_pid {
-                    self.holders.learn(*pid);
-                }
                 self.scratch_waits.insert(
                     addr.clone(),
                     ScratchWait {
@@ -3191,10 +3186,7 @@ impl CIAppView for CiProgressView {
                 in_use_by_readers,
             } => {
                 let holder = match LockHolder::of(*holder_pid, *in_use_by_readers) {
-                    LockHolder::Pid(pid) => {
-                        self.core.state.holders.learn(pid);
-                        format!("held by {}", self.core.state.holder(pid))
-                    }
+                    LockHolder::Pid(pid) => format!("held by {}", self.core.state.holder(pid)),
                     LockHolder::Readers => "in use".to_string(),
                     LockHolder::Unknown => "holder unknown".to_string(),
                 };
@@ -3207,13 +3199,10 @@ impl CIAppView for CiProgressView {
                 holder_pid,
                 ..
             } if self.scratch_wait_announced.insert(scratch.clone()) => match holder_pid {
-                Some(pid) => {
-                    self.core.state.holders.learn(*pid);
-                    tracing::info!(
-                        "waiting on scratch {scratch}, held by {}",
-                        self.core.state.holder(*pid)
-                    );
-                }
+                Some(pid) => tracing::info!(
+                    "waiting on scratch {scratch}, held by {}",
+                    self.core.state.holder(*pid)
+                ),
                 None => tracing::info!(
                     "waiting on scratch {scratch} ({access}); \
                      targets sharing it run one at a time"
@@ -3365,6 +3354,15 @@ mod tests {
         HolderNames::new(Some(crate::tui::session::SessionRoot::new(root)), None)
     }
 
+    /// Fold `e` as the backend's receiver does: its holder pid is resolved
+    /// first, so the fold only reads the answer.
+    fn resolve_then_apply(s: &mut BuildState, e: BuildEvent) {
+        if let Some(pid) = crate::tui::session::holder::event_holder_pid(&e) {
+            s.holders.resolve_blocking(pid);
+        }
+        s.apply(&e);
+    }
+
     fn line_text(line: &Line<'_>) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
     }
@@ -3378,11 +3376,14 @@ mod tests {
         let pid = std::process::id();
         let mut s = BuildState::new();
         s.name_lock_holders(names_in(root.path()));
-        s.apply(&ev(0, lock_wait_start("//pkg:a", pid)));
-        s.apply(&ev(
-            0,
-            scratch_wait("//pkg:b", "//build:c", "exclusive", Some(pid)),
-        ));
+        resolve_then_apply(&mut s, ev(0, lock_wait_start("//pkg:a", pid)));
+        resolve_then_apply(
+            &mut s,
+            ev(
+                0,
+                scratch_wait("//pkg:b", "//build:c", "exclusive", Some(pid)),
+            ),
+        );
         let id = holder.id();
         assert_eq!(
             line_text(&s.lock_wait_lines()[0]),
@@ -3407,7 +3408,7 @@ mod tests {
         let render = |names: HolderNames| {
             let mut s = BuildState::new();
             s.name_lock_holders(names);
-            s.apply(&ev(0, lock_wait_start("//pkg:a", pid)));
+            resolve_then_apply(&mut s, ev(0, lock_wait_start("//pkg:a", pid)));
             line_text(&s.lock_wait_lines()[0])
         };
 
@@ -3431,7 +3432,7 @@ mod tests {
         session.finish(Some(0), false);
     }
 
-    /// A pid is resolved when its first wait is folded, and never again: a
+    /// A pid is resolved before its first wait is folded, and never again: a
     /// session that appears later does not trigger a second scan.
     #[test]
     fn a_holder_pid_is_resolved_once() {
@@ -3439,9 +3440,10 @@ mod tests {
         let pid = std::process::id();
         let mut s = BuildState::new();
         s.name_lock_holders(names_in(root.path()));
-        s.apply(&ev(0, lock_wait_start("//pkg:a", pid)));
+        resolve_then_apply(&mut s, ev(0, lock_wait_start("//pkg:a", pid)));
         let late = live_session(root.path());
-        s.apply(&ev(1, lock_wait_start("//pkg:b", pid)));
+        assert!(!s.holders.needs(pid), "resolved, so never scanned again");
+        resolve_then_apply(&mut s, ev(1, lock_wait_start("//pkg:b", pid)));
         let lines: Vec<String> = s.lock_wait_lines().iter().map(line_text).collect();
         assert_eq!(
             lines,
@@ -4862,8 +4864,12 @@ mod tests {
             .finish();
         tracing::subscriber::with_default(subscriber, || {
             let mut v = CiProgressView::new("Running");
-            v.name_lock_holders(names);
+            v.name_lock_holders(names.clone());
             for e in events {
+                // As the backend's receiver does, before the fold.
+                if let Some(pid) = crate::tui::session::holder::event_holder_pid(e) {
+                    names.resolve_blocking(pid);
+                }
                 v.apply(e);
             }
         });

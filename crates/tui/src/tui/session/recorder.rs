@@ -39,6 +39,7 @@ use super::cleanup::{self, Retention};
 use super::format::{
     ApprovalPrompt, SessionEnd, SessionRecord, SessionRecordKind, SessionSnapshot, files,
 };
+use super::holder::{HolderNames, event_holder_pid};
 use crate::tui::app::TUIAppView;
 use crate::tui::progress::BuildState;
 
@@ -187,28 +188,83 @@ impl SessionTap {
 /// The build-event receiver a backend consumes, with the session tap on its
 /// receive side (A1): each event is handed to the recorder right after the view
 /// folded it, by move, so what is recorded is exactly what was folded.
+///
+/// It also resolves lock holders for the view: an event carrying a holder pid
+/// not yet resolved waits, parked here, while [`HolderNames::resolve_blocking`]
+/// scans the sessions directory on the blocking pool, and is folded once the
+/// answer is in the shared cache. So the view names the session on the very
+/// event that first carries the pid, never does IO itself, and the reactor
+/// never runs the scan. Each pid is scanned at most once (one event is parked
+/// at a time, and the answer is cached).
 #[derive(Debug)]
 pub struct TappedReceiver {
     rx: EventReceiver,
     tap: Option<SessionTap>,
+    holders: HolderNames,
+    /// An event taken from `rx` whose holder is being resolved. Kept here,
+    /// not in the `recv` future, so a `recv` dropped by a `select!` loses
+    /// nothing: the next call picks it up first.
+    parked: Option<Parked>,
+}
+
+#[derive(Debug)]
+struct Parked {
+    ev: BuildEvent,
+    resolving: tokio::task::JoinHandle<()>,
 }
 
 impl TappedReceiver {
-    pub fn new(rx: EventReceiver, tap: Option<SessionTap>) -> Self {
-        Self { rx, tap }
+    pub fn new(rx: EventReceiver, tap: Option<SessionTap>, holders: HolderNames) -> Self {
+        Self {
+            rx,
+            tap,
+            holders,
+            parked: None,
+        }
     }
 
     /// Await the next event, fold it with `apply`, record it. `None` once every
-    /// sender is gone. Cancel-safe: the event is taken, folded and recorded in
-    /// one poll.
+    /// sender is gone. Cancel-safe: an event is either still in the channel,
+    /// parked here while its holder resolves, or folded and recorded in the
+    /// poll that takes it out of the parking.
     pub async fn recv(&mut self, apply: impl FnOnce(&BuildEvent)) -> Option<()> {
-        let ev = self.rx.recv().await?;
-        self.fold(ev, apply);
+        if self.parked.is_none() {
+            let ev = self.rx.recv().await?;
+            match event_holder_pid(&ev).filter(|pid| self.holders.needs(*pid)) {
+                None => {
+                    self.fold(ev, apply);
+                    return Some(());
+                }
+                Some(pid) => {
+                    let holders = self.holders.clone();
+                    let resolving = tokio::task::spawn_blocking(move || {
+                        holders.resolve_blocking(pid);
+                    });
+                    self.parked = Some(Parked { ev, resolving });
+                }
+            }
+        }
+        if let Some(parked) = self.parked.as_mut() {
+            // A failed scan (a panic in the pool) leaves the pid unresolved:
+            // the notice falls back to the pid.
+            if let Err(e) = (&mut parked.resolving).await {
+                tracing::debug!(error = %e, "naming a lock holder's session");
+            }
+        }
+        if let Some(parked) = self.parked.take() {
+            self.fold(parked.ev, apply);
+        }
         Some(())
     }
 
-    /// [`Self::recv`] without waiting.
+    /// [`Self::recv`] without waiting. A parked event is folded first, named
+    /// only if its scan already finished: this drain runs at teardown, where
+    /// waiting on a scan would hold up the exit.
     pub fn try_recv(&mut self, apply: impl FnOnce(&BuildEvent)) -> Result<(), TryRecvError> {
+        if let Some(parked) = self.parked.take() {
+            self.fold(parked.ev, apply);
+            return Ok(());
+        }
         let ev = self.rx.try_recv()?;
         self.fold(ev, apply);
         Ok(())
@@ -218,7 +274,10 @@ impl TappedReceiver {
     /// folding (the line backend, after its summary) but whose process still
     /// emits.
     pub async fn recv_record_only(&mut self) -> Option<()> {
-        let ev = self.rx.recv().await?;
+        let ev = match self.parked.take() {
+            Some(parked) => parked.ev,
+            None => self.rx.recv().await?,
+        };
         if let Some(tap) = &self.tap {
             tap.event(ev);
         }

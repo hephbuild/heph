@@ -375,4 +375,12 @@ pub trait App: Send {
     fn records_session(&self) -> bool {
         true
     }
+
+    /// How this app's view names a lock holder's pid, when the app knows
+    /// better than the process's own session: a viewer names holders from the
+    /// sessions directory it watches, excluding the session it attached to.
+    /// `None`: the backend names them from the process's session slot.
+    fn lock_holders(&self) -> Option<HolderNames> {
+        None
+    }
 }
