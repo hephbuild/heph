@@ -35,6 +35,8 @@ pub mod source;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod view_tests;
 
 use std::ffi::OsStr;
 use std::fs::{DirBuilder, OpenOptions, Permissions};
