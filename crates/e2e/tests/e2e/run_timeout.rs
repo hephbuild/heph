@@ -330,6 +330,11 @@ async fn a_timed_out_target_keeps_its_log() -> anyhow::Result<()> {
     let log = slot_log(&engine, "//p:slow").expect("a timed-out run fills its failure slot");
     assert!(log.contains("started"), "the log before the kill: {log:?}");
     assert!(!log.contains("done"), "{log:?}");
+    // Its sandbox is removed like any failed run's, and the recorded tail,
+    // read from the slot's copy, survives that.
+    crate::failure_slot::removed(&crate::failure_slot::sandbox_dir(&engine, "p", "slow")).await;
+    let tail = failure.log_tail.as_ref().expect("the recorded tail");
+    assert!(tail.text.contains("started"), "{tail:?}");
     Ok(())
 }
 

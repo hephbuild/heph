@@ -303,8 +303,10 @@ automatically.
 Two more rules fall out of the same reasoning. The directory is named by the full
 sanitized *address* rather than the target name, so two credentials called `aws`
 in different packages cannot collide. And it is deleted at run end regardless of
-outcome — a failed target's sandbox is deliberately kept for diagnostics, and the
-log tail is what makes it useful, not the token.
+outcome — a failed target's sandbox can be kept for inspection with
+`--keep-failed-sandboxes`, and its log is what makes it useful, not the token. A
+target whose outputs are credential material has its failed sandbox removed even
+under that flag.
 
 ### The callback is pinned, not re-derived
 

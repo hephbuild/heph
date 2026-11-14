@@ -11,7 +11,7 @@
 )]
 
 use crate::common::{self, Workspace};
-use crate::failure_slot::{failures, files_containing, render, slot_exists};
+use crate::failure_slot::{failures, files_containing, removed, render, slot_exists};
 use heph::engine::failure_slot::{LOG, OUT};
 use heph::engine::{Engine, OutputMatcher, ResultOptions};
 use heph::htaddr::parse_addr;
@@ -162,6 +162,9 @@ async fn collected_into_slot_on_failure() -> anyhow::Result<()> {
         "{}",
         render(&f)
     );
+    // Unpacked out of the sandbox before it was removed, not raced by it.
+    removed(sandbox_ws(&ws.engine, "p", "t").parent().expect("sandbox")).await;
+    assert_eq!(read(out.join("p/report.txt")), "report-bytes");
     Ok(())
 }
 
@@ -504,7 +507,8 @@ async fn symlink_edge_cases() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn directory_is_copied_whole() -> anyhow::Result<()> {
-    let ws = Workspace::new();
+    // Kept: the slot is compared with the failed sandbox.
+    let ws = Workspace::keeping_failed_sandboxes();
     ws.write_build_file(
         "p",
         r#"target(name = "t", driver = "bash",
@@ -540,7 +544,8 @@ async fn directory_is_copied_whole() -> anyhow::Result<()> {
 /// `failure_out`.
 #[tokio::test]
 async fn odd_names() -> anyhow::Result<()> {
-    let ws = Workspace::new();
+    // Kept: the slot is compared with the failed sandbox.
+    let ws = Workspace::keeping_failed_sandboxes();
     ws.write_build_file(
         "p",
         r#"target(name = "t", driver = "bash", failure_out = ["odd"],
@@ -626,7 +631,8 @@ async fn overlapping_out_is_independent() -> anyhow::Result<()> {
 /// slot change the staged input under its key (D5).
 #[tokio::test]
 async fn matched_input_is_copied_not_linked() -> anyhow::Result<()> {
-    let ws = Workspace::new();
+    // Kept: the test reads the run's copy of the input in the failed sandbox.
+    let ws = Workspace::keeping_failed_sandboxes();
     ws.write_build_file(
         "p",
         r#"
@@ -726,7 +732,17 @@ async fn replaced_by_next_failure() -> anyhow::Result<()> {
 /// down once the slot is filled.
 #[tokio::test]
 async fn kept_for_material() -> anyhow::Result<()> {
-    let ws = Workspace::new();
+    kept_for_material_in(Workspace::new()).await
+}
+
+/// `--keep-failed-sandboxes` keeps no credential material: the material
+/// producer's sandbox is torn down all the same.
+#[tokio::test]
+async fn kept_for_material_when_keeping_failed_sandboxes() -> anyhow::Result<()> {
+    kept_for_material_in(Workspace::keeping_failed_sandboxes()).await
+}
+
+async fn kept_for_material_in(ws: Workspace) -> anyhow::Result<()> {
     ws.write_build_file(
         "auth",
         r#"

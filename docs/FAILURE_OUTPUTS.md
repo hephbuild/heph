@@ -62,8 +62,19 @@ The failure box prints where each part is:
     …
     ╰────
   full log: /ws/.heph/failures/web_e2e-…/log.txt
+  sandbox: removed (rerun with --keep-failed-sandboxes to keep it)
   outputs: /ws/.heph/failures/web_e2e-…/out
 ```
+
+### The failed sandbox
+
+The slot is what outlives a failure; the sandbox the run failed in does not.
+Once the slot is filled (and an `in_place` write-back is done), the sandbox is
+removed, like a passing run's, and the box says so. Rerun with
+`--keep-failed-sandboxes` to keep it on disk for inspection instead: it then
+stays until the target's next run, and it is outside the `sandbox` pool's cap
+(see [RESOURCES.md](RESOURCES.md)). A target whose outputs are credential
+material has its failed sandbox removed even under the flag.
 
 ## `failure_out`
 

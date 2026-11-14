@@ -648,12 +648,12 @@ async fn a_presented_file_is_never_collected_as_an_output() -> anyhow::Result<()
 ///
 /// Asserted on a **failing** target deliberately. That is the case where the
 /// captured log matters most (it is lifted into the failure event, the JSON
-/// output and the CI report) and it is also the one where the sandbox survives,
-/// so `log.txt` can be read back.
+/// output and the CI report) and it is also the one where the sandbox can
+/// survive (`--keep-failed-sandboxes`), so `log.txt` can be read back.
 #[tokio::test]
 async fn credential_material_is_scrubbed_from_a_targets_output() -> anyhow::Result<()> {
     let _guard = EnvVar::set("HEPH_E2E_LOUD_TOKEN", "extremely-secret-value");
-    let ws = Workspace::new();
+    let ws = Workspace::keeping_failed_sandboxes();
     ws.write_build_file(
         "auth",
         r#"target(name = "t", driver = "auth.credential",
@@ -798,13 +798,13 @@ async fn a_bad_field_in_a_presented_file_names_the_field() -> anyhow::Result<()>
 
 /// A presentation failing half-way takes the files already written with it:
 /// the first credential's token file is written, the second credential's
-/// template fails, and the failed run's sandbox, kept for diagnostics, holds
-/// no `tok`.
+/// template fails, and the failed run's sandbox, kept by
+/// `--keep-failed-sandboxes`, holds no `tok`.
 #[tokio::test]
 async fn a_presentation_failing_half_way_removes_the_files_already_written() -> anyhow::Result<()> {
     let _good = EnvVar::set("HEPH_E2E_HALF_GOOD", "half-way-material");
     let _bad = EnvVar::set("HEPH_E2E_HALF_BAD", "v");
-    let ws = Workspace::new();
+    let ws = Workspace::keeping_failed_sandboxes();
     ws.write_build_file(
         "auth",
         r#"

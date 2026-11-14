@@ -153,6 +153,11 @@ fn render_target_failure(f: &TargetFailure, color: bool) -> String {
     if let Some(path) = f.log.as_ref().and_then(|l| l.path()) {
         out.push_str(&format!("  full log: {}\n", path.display()));
     }
+    // Someone used to inspecting the failed sandbox learns where it went, and
+    // how to keep the next one.
+    if f.sandbox_removed {
+        out.push_str("  sandbox: removed (rerun with --keep-failed-sandboxes to keep it)\n");
+    }
     if let Some(outputs) = &f.outputs {
         out.push_str(&format!("  outputs: {}\n", outputs.display()));
     }
@@ -1419,6 +1424,40 @@ mod tests {
             rendered.ends_with(&format!("  full log: {}\n", path.display())),
             "{rendered}"
         );
+    }
+
+    /// A failure whose sandbox was removed says so under the log footer and
+    /// names the flag that keeps it; one whose sandbox was kept (or never
+    /// was the box's to explain) says nothing about it.
+    #[test]
+    fn failure_box_names_a_removed_sandbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.txt");
+        std::fs::write(&path, "line\n").unwrap();
+        let log = || {
+            Some(crate::engine::error::FailureLog::open(
+                path.clone(),
+                std::fs::File::open(&path).unwrap(),
+                10,
+            ))
+        };
+        let addr = crate::htaddr::parse_addr("//p:a").unwrap();
+
+        let removed = TargetFailure::new(addr.clone(), None, anyhow::anyhow!("boom"))
+            .with_log(log())
+            .with_sandbox_removed(true);
+        let rendered = render_target_failure(&removed, false);
+        assert!(
+            rendered.ends_with(&format!(
+                "  full log: {}\n  sandbox: removed (rerun with --keep-failed-sandboxes to keep it)\n",
+                path.display()
+            )),
+            "{rendered}"
+        );
+
+        let kept = TargetFailure::new(addr, None, anyhow::anyhow!("boom")).with_log(log());
+        let rendered = render_target_failure(&kept, false);
+        assert!(!rendered.contains("sandbox:"), "{rendered}");
     }
 
     #[test]

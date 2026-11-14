@@ -292,6 +292,9 @@ fn new_engine_with(
         listed_facts_kill_switch(std::env::var_os("HEPH_NO_LISTED_FACTS").as_deref()),
     );
 
+    // A run's choice, like `--fail-fast`: never in the config file.
+    config.keep_failed_sandboxes = global.keep_failed_sandboxes;
+
     // Pool capacities: flag over `HEPH_RESOURCE_<NAME>` over the config file;
     // the engine supplies the default for a pool none of them names. Read here,
     // like the kill switch above, so the engine never looks at the environment.

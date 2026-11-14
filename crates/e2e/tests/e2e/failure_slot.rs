@@ -44,6 +44,28 @@ pub(crate) fn slot_exists(engine: &Engine, addr: &str) -> bool {
         .exists()
 }
 
+/// `//pkg:name`'s build sandbox.
+pub(crate) fn sandbox_dir(engine: &Engine, pkg: &str, name: &str) -> PathBuf {
+    engine
+        .home
+        .join("sandbox")
+        .join(pkg)
+        .join(format!("__target_{name}"))
+}
+
+/// Wait, bounded, for the reclaim lane to remove `dir`.
+pub(crate) async fn removed(dir: &Path) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while dir.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the failed sandbox was never removed: {}",
+            dir.display()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 pub(crate) fn render(f: &[Arc<TargetFailure>]) -> String {
     heph::commands::errors::render_failures_to_string(f, false)
 }
@@ -92,6 +114,62 @@ async fn failure_box_shows_exec_log_from_slot() -> anyhow::Result<()> {
         slot_log(&ws.engine, "//p:t").as_deref(),
         Some("box-marker-line\n")
     );
+    Ok(())
+}
+
+/// A failed target's sandbox is removed once the failure arm has read it, by
+/// default: its log is in the slot, the recorded failure still carries the
+/// tail, and the box says where the sandbox went and how to keep it.
+#[tokio::test]
+async fn a_failed_targets_sandbox_is_removed() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "p",
+        r#"target(name = "t", driver = "bash", run = "echo removed-marker; exit 3")"#,
+    );
+    let f = failures(&ws.engine, "//p:t", &ResultOptions::default()).await?;
+    removed(&sandbox_dir(&ws.engine, "p", "t")).await;
+    assert_eq!(
+        slot_log(&ws.engine, "//p:t").as_deref(),
+        Some("removed-marker\n")
+    );
+    let [failure] = f.as_slice() else {
+        panic!("one failure, got {}", f.len());
+    };
+    let tail = failure.log_tail.as_ref().expect("the recorded tail");
+    assert_eq!(tail.text, "removed-marker");
+    let out = render(&f);
+    assert!(out.contains("│ removed-marker"), "{out}");
+    assert!(
+        out.contains("  sandbox: removed (rerun with --keep-failed-sandboxes to keep it)\n"),
+        "{out}"
+    );
+    Ok(())
+}
+
+/// `--keep-failed-sandboxes`: the failed sandbox stays, as before the
+/// default changed, and the box says nothing about it.
+#[tokio::test]
+async fn keep_failed_sandboxes_keeps_a_failed_targets_sandbox() -> anyhow::Result<()> {
+    let ws = Workspace::keeping_failed_sandboxes();
+    ws.write_build_file(
+        "p",
+        r#"target(name = "t", driver = "bash", run = "echo kept-marker; exit 3")"#,
+    );
+    let f = failures(&ws.engine, "//p:t", &ResultOptions::default()).await?;
+    let sandbox = sandbox_dir(&ws.engine, "p", "t");
+    assert!(
+        !files_containing(&sandbox, "kept-marker").is_empty(),
+        "the failed run's sandbox, its log included, is kept: {}",
+        sandbox.display()
+    );
+    assert_eq!(
+        slot_log(&ws.engine, "//p:t").as_deref(),
+        Some("kept-marker\n")
+    );
+    let out = render(&f);
+    assert!(out.contains("│ kept-marker"), "{out}");
+    assert!(!out.contains("sandbox:"), "{out}");
     Ok(())
 }
 
@@ -443,8 +521,8 @@ target(name = "t", driver = "auth.credential", sources = ["//auth:fetch"],
     );
     let f = failures(&ws.engine, "//app:a", &ResultOptions::default()).await?;
     assert!(!slot_exists(&ws.engine, "//auth:fetch"));
-    // The failed producer's sandbox is torn down, not kept for diagnostics:
-    // a material target's tree must not outlive its failure.
+    // The failed producer's sandbox is torn down: a material target's tree
+    // must not outlive its failure.
     let sandbox = ws.engine.home.join("sandbox/auth/__target_fetch");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while sandbox.exists() {

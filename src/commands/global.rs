@@ -217,6 +217,15 @@ pub struct GlobalOptions {
     /// matched target and reporting all failures at the end
     #[arg(long = "fail-fast", visible_alias = "ff", global = true)]
     pub fail_fast: bool,
+    /// Keep a failed target's sandbox on disk for inspection
+    ///
+    /// By default a failed target's sandbox is removed once its failure slot
+    /// holds the log and the `failure_out` matches (`heph inspect failure`).
+    /// With this flag it stays until the target's next run, outside the
+    /// `sandbox` pool's cap. A credential target's sandbox is removed either
+    /// way.
+    #[arg(long = "keep-failed-sandboxes", global = true)]
+    pub keep_failed_sandboxes: bool,
     /// Approve every `approval`-gated target without prompting. The notice (if
     /// any) is still printed in non-TUI mode.
     #[arg(long = "auto-approve", global = true)]
@@ -313,6 +322,13 @@ mod tests {
         // Opt in with the long flag or its `ff` alias.
         assert!(parse(&["heph", "--fail-fast"]).fail_fast);
         assert!(parse(&["heph", "--ff"]).fail_fast);
+    }
+
+    #[test]
+    fn keep_failed_sandboxes_is_opt_in() {
+        // Default: a failed target's sandbox is removed.
+        assert!(!parse(&["heph"]).keep_failed_sandboxes);
+        assert!(parse(&["heph", "--keep-failed-sandboxes"]).keep_failed_sandboxes);
     }
 
     #[test]

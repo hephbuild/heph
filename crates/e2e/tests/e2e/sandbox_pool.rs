@@ -56,10 +56,21 @@ fn engine_with(
     slots: usize,
     stall: impl FnOnce(&mut Engine),
 ) -> anyhow::Result<Arc<Engine>> {
+    engine_configured(root, slots, |_| {}, stall)
+}
+
+/// [`engine_with`], with `configure` adjusting the config first.
+fn engine_configured(
+    root: &Path,
+    slots: usize,
+    configure: impl FnOnce(&mut Config),
+    stall: impl FnOnce(&mut Engine),
+) -> anyhow::Result<Arc<Engine>> {
     let mut cfg = Config {
         parallelism: Some(4),
         ..Config::for_tests(root.to_path_buf())
     };
+    configure(&mut cfg);
     cfg.resources.insert(
         PoolName::sandbox(),
         PoolSpec::from_written(PoolName::SANDBOX, None, Some(&slots.to_string()))?,
@@ -340,23 +351,41 @@ async fn a_full_sandbox_pool_drains() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The failure leg: the fifth link fails. Its sandbox stays for the
-/// diagnostic, outside the bound, and its slot comes back at once: a target
-/// built afterwards with the single slot still runs.
+/// The failure leg: the fifth link fails. Its sandbox is removed like any
+/// other, its slot coming back with the removal: a target built afterwards
+/// with the single slot still runs, and no sandbox is left.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_full_sandbox_pool_drains_after_a_failure() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let root = tmp.path();
-    let mut build_file = chain(10, |i| {
-        if i == 5 {
-            "echo failing; exit 1".to_owned()
-        } else {
-            format!("echo {i} > $OUT")
-        }
-    });
-    build_file.push_str(&target("after", "echo after > $OUT", None));
-    write_build(root, "p", &build_file);
+    write_build(root, "p", &failing_chain());
     let engine = engine(root, 1, Duration::ZERO)?;
+
+    let err = build(&engine, &["//p:t9".to_owned()])
+        .await
+        .expect_err("t5 fails");
+    assert!(format!("{err:#}").contains("//p:t5"), "{err:#}");
+    all_capacity_back(&engine).await;
+    assert_eq!(sandboxes(&engine, "p"), 0, "the failed sandbox is removed");
+
+    build(&engine, &["//p:after".to_owned()]).await?;
+    all_capacity_back(&engine).await;
+    Ok(())
+}
+
+/// The failure leg under `--keep-failed-sandboxes`: the failed sandbox stays,
+/// outside the bound, and its slot comes back at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_full_sandbox_pool_drains_after_a_kept_failure() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let root = tmp.path();
+    write_build(root, "p", &failing_chain());
+    let engine = engine_configured(
+        root,
+        1,
+        |cfg| cfg.keep_failed_sandboxes = true,
+        |e| e.set_sandbox_removal_delay(Duration::ZERO),
+    )?;
 
     let err = build(&engine, &["//p:t9".to_owned()])
         .await
@@ -368,6 +397,65 @@ async fn a_full_sandbox_pool_drains_after_a_failure() -> anyhow::Result<()> {
 
     build(&engine, &["//p:after".to_owned()]).await?;
     all_capacity_back(&engine).await;
+    Ok(())
+}
+
+/// A ten-deep chain whose fifth link fails, plus an independent `//p:after`.
+fn failing_chain() -> String {
+    let mut build_file = chain(10, |i| {
+        if i == 5 {
+            "echo failing; exit 1".to_owned()
+        } else {
+            format!("echo {i} > $OUT")
+        }
+    });
+    build_file.push_str(&target("after", "echo after > $OUT", None));
+    build_file
+}
+
+/// A failed run's sandbox counts toward the cap: with removals held, its slot
+/// stays out after the run, pending the removal, and the next run waits on
+/// it; once the removal runs, the slot is back and the sandbox gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_sandbox_holds_its_slot_until_removed() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let root = tmp.path();
+    let mut build_file = target("fail", "echo failing; exit 1", None);
+    build_file.push_str(&target("after", "echo after > $OUT", None));
+    write_build(root, "p", &build_file);
+    let (engine, gate) = gated_engine(root, 1)?;
+
+    let rs = engine.new_state();
+    let err = build_in(&engine, &rs, &["//p:fail".to_owned()])
+        .await
+        .expect_err("fail fails");
+    assert!(format!("{err:#}").contains("//p:fail"), "{err:#}");
+    // The removal is queued before the execute returns, and held by the gate.
+    let s = snapshot(&engine).expect("the pool is built");
+    assert_eq!(
+        (held(&s, PoolName::SANDBOX), held(&s, PoolName::CPU)),
+        (1, 0),
+        "the failed sandbox's slot is out until it is removed: {s:?}"
+    );
+    assert_eq!(sandboxes(&engine, "p"), 1, "not removed yet");
+
+    // The next run waits on that slot.
+    let after = tokio::spawn({
+        let engine = Arc::clone(&engine);
+        async move { build(&engine, &["//p:after".to_owned()]).await }
+    });
+    snapshot_until(
+        &engine,
+        "after waiting on the sandbox pool",
+        head_waits_on_sandbox,
+    )
+    .await;
+
+    gate.open();
+    after.await??;
+    drain(rs).await;
+    all_capacity_back(&engine).await;
+    assert_eq!(sandboxes(&engine, "p"), 0, "both sandboxes are removed");
     Ok(())
 }
 

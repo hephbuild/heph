@@ -576,6 +576,10 @@ pub struct TargetFailure {
     /// `write_on_failure` output that failed with a process exit: the fixes
     /// it wrote, or why it wrote none. `None` for every other failure.
     pub fixes: Option<FailureFixes>,
+    /// The failed run's sandbox was removed once its failure slot was filled,
+    /// where `--keep-failed-sandboxes` would have left it on disk: the box
+    /// says so, and names the flag.
+    pub sandbox_removed: bool,
     pub source: std::sync::Arc<anyhow::Error>,
 }
 
@@ -622,8 +626,15 @@ impl TargetFailure {
             log: None,
             outputs: None,
             fixes: None,
+            sandbox_removed: false,
             source: std::sync::Arc::new(source),
         }
+    }
+
+    /// The same failure, saying whether its sandbox was removed.
+    pub fn with_sandbox_removed(mut self, removed: bool) -> Self {
+        self.sandbox_removed = removed;
+        self
     }
 
     /// The same failure with what its `in_place` write-back did.

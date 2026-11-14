@@ -47,7 +47,8 @@ by ignoring it:
    out.
 
 A timeout is a **failure**, not a cancellation: the failure box shows the log
-tail, the sandbox is kept for diagnostics, `--fail-fast` reacts to it, and
+tail, the log and `failure_out` are kept in the failure slot, `--fail-fast`
+reacts to it, and
 nothing is cached, so the next build runs the target again. (A cancellation
 gets no failure slot: when the request was cancelled, by `--fail-fast` or
 Ctrl-C, a run's error is treated as that cancellation unless it is a timeout,
