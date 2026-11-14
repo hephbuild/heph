@@ -1597,3 +1597,173 @@ target(name = "t", driver = "bash", out = "t.txt", resources = {"cpu": 2},
     assert_eq!(output(&engine, "//p:t").await?, "2");
     Ok(())
 }
+
+/// How a run cancelled while queued on `cpu` left the queue.
+struct CancelledWhileQueued {
+    /// The request's own outcome: its error, or the batch's error count.
+    ended: anyhow::Result<usize>,
+    failures: Vec<Arc<heph::engine::error::TargetFailure>>,
+    /// What the pool looked like once the cancelled run had left, while the
+    /// holder still ran.
+    after: ResourceSnapshot,
+    events: Vec<BuildEvent>,
+}
+
+/// `//p:busy` holds the only CPU behind a closed gate; `//p:parked` queues
+/// for it in its own request, which is cancelled once the snapshot shows it
+/// queued (and, with a `notice`, once its wait was announced). The gate stays
+/// closed until the cancelled run has ended, so the CPU never came back and
+/// ending at all proves the run did not wait for it.
+async fn cancel_while_queued_on_cpu(
+    notice: Option<Duration>,
+) -> anyhow::Result<CancelledWhileQueued> {
+    let ws = tempfile::tempdir()?;
+    let gates = tempfile::tempdir()?;
+    let gate = gates.path().join("open");
+    write_build(
+        ws.path(),
+        "p",
+        &format!(
+            "{}{}",
+            gated("busy", &gate, r#"{"cpu": 1}"#),
+            gated("parked", &gate, r#"{"cpu": 1}"#)
+        ),
+    );
+    let engine = engine_with_notice(ws.path(), caps(&[("cpu", MICROS)]), notice)?;
+
+    let busy = tokio::spawn(build(Arc::clone(&engine), vec!["//p:busy".into()], None));
+    let start = Instant::now();
+    while engine
+        .resource_snapshot()
+        .is_none_or(|s| held(&s, "cpu") < MICROS)
+    {
+        anyhow::ensure!(
+            !busy.is_finished() && start.elapsed() < DEADLINE,
+            "busy never held the cpu"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let (tx, mut rx): (_, EventReceiver) = tokio::sync::mpsc::unbounded_channel();
+    let rs = engine.new_state_with_events(false, Some(tx));
+    let parked = tokio::spawn({
+        let (engine, rs) = (Arc::clone(&engine), Arc::clone(&rs));
+        async move {
+            let m = Matcher::Addr(parse_addr("//p:parked")?);
+            Arc::clone(&engine)
+                .result(rs, &m, OutputMatcher::All, &ResultOptions::default())
+                .await
+                .map(|batch| batch.errors.len())
+        }
+    });
+    let mut events = Vec::new();
+    let start = Instant::now();
+    loop {
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        let queued = engine
+            .resource_snapshot()
+            .is_some_and(|s| s.main.queued == 1);
+        let announced = notice.is_none() || !admission_waits(&events).0.is_empty();
+        if queued && announced {
+            break;
+        }
+        anyhow::ensure!(
+            !parked.is_finished() && start.elapsed() < DEADLINE,
+            "parked never queued for the cpu (snapshot {:?})",
+            engine.resource_snapshot()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    rs.ctoken().cancel();
+    let ended = tokio::time::timeout(DEADLINE, parked)
+        .await
+        .map_err(|_elapsed| anyhow::anyhow!("a run cancelled while queued on cpu hung"))??;
+    anyhow::ensure!(
+        !busy.is_finished(),
+        "busy ended before the gate opened, so the cpu may have come back"
+    );
+    let after = engine
+        .resource_snapshot()
+        .ok_or_else(|| anyhow::anyhow!("no pool snapshot"))?;
+    let failures = rs.take_failures();
+    drop(rs);
+    while let Ok(ev) = rx.try_recv() {
+        events.push(ev);
+    }
+
+    std::fs::write(&gate, "")?;
+    tokio::time::timeout(DEADLINE, busy).await???;
+    Ok(CancelledWhileQueued {
+        ended,
+        failures,
+        after,
+        events,
+    })
+}
+
+/// Asserts the cancelled run ended as a cancellation, recorded no failure,
+/// and left the queue holding nothing, with only busy's CPU out.
+fn assert_left_as_a_cancellation(c: &CancelledWhileQueued) {
+    match &c.ended {
+        Err(e) => assert!(hplugin::error::is_cancelled(e), "{e:#}"),
+        Ok(errors) => assert!(*errors > 0, "a cancelled run did not succeed"),
+    }
+    for f in &c.failures {
+        assert!(
+            hplugin::error::is_cancelled(&f.source),
+            "{} recorded a failure, not a cancellation: {:#}",
+            f.addr.format(),
+            f.source
+        );
+    }
+    assert_eq!(c.after.main.queued, 0, "left the queue: {:?}", c.after);
+    assert_eq!(held(&c.after, "cpu"), MICROS, "only busy's cpu is out");
+    assert_eq!(held(&c.after, "sandbox"), 1, "only busy's sandbox is out");
+    assert!(
+        starts(&c.events).is_empty(),
+        "the cancelled run never started: {:?}",
+        starts(&c.events)
+    );
+}
+
+/// A run cancelled while it waits for cpu leaves the queue at once, as a
+/// cancellation, without the cpu ever coming back. Under the notice
+/// threshold, so nothing was announced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_cancelled_while_queued_on_cpu_leaves_at_once() -> anyhow::Result<()> {
+    let c = cancel_while_queued_on_cpu(None).await?;
+    assert_left_as_a_cancellation(&c);
+    assert_eq!(
+        admission_waits(&c.events),
+        (vec![], vec![]),
+        "a wait under the notice threshold announces nothing"
+    );
+    Ok(())
+}
+
+/// The same past the notice threshold: the announced wait is closed by its
+/// `AdmissionWaitEnd` when the cancellation ends it, so no consumer is left
+/// showing a run waiting that has gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancelled_announced_wait_on_cpu_is_closed() -> anyhow::Result<()> {
+    let c = cancel_while_queued_on_cpu(Some(Duration::from_millis(20))).await?;
+    assert_left_as_a_cancellation(&c);
+    let (waits, ends) = admission_waits(&c.events);
+    let waited: Vec<(&str, &str)> = waits
+        .iter()
+        .map(|(addr, pool, ..)| (addr.as_str(), pool.as_str()))
+        .collect();
+    assert_eq!(waited, [("//p:parked", "cpu")], "{waits:?}");
+    assert_eq!(ends, ["//p:parked"]);
+    let pos = |want: &dyn Fn(&BuildEventKind) -> bool| c.events.iter().position(|e| want(&e.kind));
+    let start = pos(&|k| matches!(k, BuildEventKind::AdmissionWaitStart { .. }));
+    let end = pos(&|k| matches!(k, BuildEventKind::AdmissionWaitEnd { .. }));
+    assert!(
+        start < end,
+        "the End follows its Start ({start:?}, {end:?})"
+    );
+    Ok(())
+}
