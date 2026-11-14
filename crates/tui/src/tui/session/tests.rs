@@ -766,6 +766,35 @@ async fn file_source_follows_until_end() {
     );
 }
 
+/// A live session whose owner never said it answers in-flight requests (an
+/// older heph, no `inflight` capability) is refused by name, and the viewer
+/// writes no request file into it: nobody would ever answer one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inflight_is_refused_without_the_capability() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let session = Session::open(&SessionRoot::new(root.path()), start()).expect("open");
+    let meta_path = session.dir().join(files::META);
+    let mut meta = SessionMeta::decode(&std::fs::read(&meta_path).expect("meta")).expect("meta");
+    assert!(meta.has_capability(CAPABILITY_INFLIGHT), "precondition");
+    meta.capabilities.clear();
+    std::fs::write(&meta_path, serde_json::to_vec(&meta).expect("encode")).expect("write meta");
+
+    let err = FileSource::new(root.path())
+        .inflight(session.id(), Duration::from_secs(5))
+        .await
+        .expect_err("refused");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("does not answer in-flight requests"),
+        "names the reason: {msg}"
+    );
+    assert!(
+        !session.dir().join(files::INFLIGHT_REQUEST).exists(),
+        "no request is left for an owner that never reads one"
+    );
+    session.finish(Some(0), false);
+}
+
 fn lock_wait(addr: &str, pid: u32) -> BuildEvent {
     BuildEvent {
         at_unix_ms: 1,
