@@ -179,27 +179,27 @@ impl ReclaimPolicy {
         self.cap_bytes.min(pct)
     }
 
-    /// Whether the end-of-request reclaim should run: free pages at the cap, or
-    /// the interval elapsed since the last successful vacuum and free pages at
-    /// the floor. No record of a last vacuum, or one in the future (the clock
-    /// moved back), counts as elapsed.
+    /// Whether the end-of-request reclaim should run: free pages at the floor,
+    /// and either at the cap or the interval elapsed since the last successful
+    /// vacuum. No record of a last vacuum, or one in the future (the clock
+    /// moved back), counts as elapsed. The floor holds on the cap path too: on
+    /// a small file 25 % can be a few pages, not worth a pass per request.
     pub(crate) fn due(
         &self,
         space: &CacheDbSpace,
         last_vacuum: Option<SystemTime>,
         now: SystemTime,
     ) -> bool {
-        if space.free_bytes == 0 {
+        if space.free_bytes == 0 || space.free_bytes < self.min_free_bytes {
             return false;
         }
         if space.free_bytes >= self.cap(space) {
             return true;
         }
-        let elapsed = last_vacuum.is_none_or(|t| {
+        last_vacuum.is_none_or(|t| {
             now.duration_since(t)
                 .map_or(true, |since| since >= self.interval)
-        });
-        elapsed && space.free_bytes >= self.min_free_bytes
+        })
     }
 }
 
@@ -299,7 +299,7 @@ fn incremental(
     between: &mut dyn FnMut(&mut Connection) -> bool,
 ) -> Result<bool> {
     let page_size = pragma_u64(conn, "page_size")?.max(1);
-    let chunk_pages = (chunk_bytes / page_size).max(1);
+    let chunk_pages = i64::try_from((chunk_bytes / page_size).max(1)).unwrap_or(i64::MAX);
     loop {
         if pragma_u64(conn, "freelist_count")? == 0 {
             return Ok(true);
@@ -310,7 +310,10 @@ fn incremental(
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .context("starting an incremental_vacuum transaction")?;
-        tx.execute_batch(&format!("PRAGMA incremental_vacuum({chunk_pages});"))
+        // Stepped to completion: each step of `incremental_vacuum(N)` frees
+        // one page, so `execute_batch` (one step) freed one page per chunk.
+        // `pragma` iterates the statement's rows until SQLITE_DONE.
+        tx.pragma(None, "incremental_vacuum", chunk_pages, |_| Ok(()))
             .context("running PRAGMA incremental_vacuum")?;
         tx.commit()
             .context("committing an incremental_vacuum transaction")?;
@@ -571,6 +574,9 @@ mod tests {
         assert!(p.due(&space_with(RECLAIM_CAP_BYTES, big), recent, now));
         // Interval not elapsed, at 25% of a small file.
         assert!(p.due(&space_with(100 * MIB, 300 * MIB), recent, now));
+        // A tiny file mostly free, but under the floor: the cap needs it too.
+        assert!(!p.due(&space_with(MIB, MIB), recent, now));
+        assert!(!p.due(&space_with(RECLAIM_MIN_FREE_BYTES - 1, MIB), recent, now));
         // No record, or one from the future, is due.
         assert!(p.due(&space_with(RECLAIM_MIN_FREE_BYTES, big), None, now));
         assert!(p.due(&space_with(RECLAIM_MIN_FREE_BYTES, big), future, now));

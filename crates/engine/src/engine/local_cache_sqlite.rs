@@ -3295,6 +3295,7 @@ mod tests {
         let path = dir.path().join("cache.db");
         let cache = open_with(&path, small_policy())?;
         let addr = fill_and_free(&cache, &path)?;
+        let free_before = u64::try_from(snap(&path)?.free_pages)?;
 
         // Per chunk: (index, rows named `mid` visible on the writer connection).
         let seen: Arc<Mutex<Vec<(usize, i64)>>> = Arc::default();
@@ -3356,8 +3357,80 @@ mod tests {
             seen.len() >= 4,
             "the vacuum went on for more chunks after the write: {seen:?}"
         );
+        // Whole chunks: the small write queued mid-vacuum can only take free
+        // pages, never add a chunk's worth.
+        let chunks = u64::try_from(seen.len())?;
+        assert!(
+            chunks <= free_before.div_ceil(SMALL_CHUNK_PAGES) + 1,
+            "{chunks} chunks for {free_before} free pages: {seen:?}"
+        );
         assert!(cache.exists(&addr, "h", "mid")?);
         assert_eq!(snap(&path)?.free_pages, 0);
+        Ok(())
+    }
+
+    /// Pages per chunk under [`small_policy`]: 64 KiB of 8 KiB pages.
+    const SMALL_CHUNK_PAGES: u64 = 8;
+
+    /// The free page counts the writer connection sees after each chunk.
+    fn freelist_hook(seen: &Arc<Mutex<Vec<u64>>>) -> ChunkHook {
+        let seen = Arc::clone(seen);
+        Box::new(move |_, conn: &Connection| {
+            let n: i64 = conn
+                .query_row("PRAGMA freelist_count", [], |r| r.get(0))
+                .expect("freelist_count");
+            seen.lock()
+                .expect("seen")
+                .push(u64::try_from(n).expect("non-negative"));
+        })
+    }
+
+    /// Every chunk of an incremental vacuum frees a whole chunk of pages (the
+    /// last one what is left), so a pass over `free` pages takes
+    /// `ceil(free / chunk_pages)` chunks — not one per page, which is what a
+    /// `PRAGMA incremental_vacuum(N)` stepped once does.
+    #[test]
+    fn each_vacuum_chunk_frees_a_whole_chunk() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("cache.db");
+        let cache = open_with(&path, small_policy())?;
+        fill_and_free(&cache, &path)?;
+        let free_before = u64::try_from(snap(&path)?.free_pages)?;
+        assert_eq!(small_policy().chunk_bytes / 8192, SMALL_CHUNK_PAGES);
+
+        let seen: Arc<Mutex<Vec<u64>>> = Arc::default();
+        let report = cache.maintain(
+            MaintainKind::AfterTrim(small_policy()),
+            Box::new(|| true),
+            Some(freelist_hook(&seen)),
+        )?;
+
+        assert!(
+            matches!(
+                report.action,
+                CompactAction::Vacuumed { complete: true, .. }
+            ),
+            "{report:?}"
+        );
+        let seen = seen.lock().expect("seen").clone();
+        let mut prev = free_before;
+        for &free in &seen {
+            let freed = prev.saturating_sub(free);
+            if free > 0 {
+                assert_eq!(freed, SMALL_CHUNK_PAGES, "{free_before} → {seen:?}");
+            } else {
+                assert!(
+                    (1..=SMALL_CHUNK_PAGES).contains(&freed),
+                    "{free_before} → {seen:?}"
+                );
+            }
+            prev = free;
+        }
+        assert_eq!(
+            u64::try_from(seen.len())?,
+            free_before.div_ceil(SMALL_CHUNK_PAGES),
+            "{free_before} free pages → {seen:?}"
+        );
         Ok(())
     }
 }
