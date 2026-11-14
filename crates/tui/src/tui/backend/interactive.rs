@@ -19,8 +19,9 @@ use tokio::sync::mpsc;
 use crate::tui::app::{App, AppContext, Control, TUIAppView};
 use crate::tui::log_sink::LogSink;
 use crate::tui::progress::HSCROLL_STEP;
+use crate::tui::session::{SessionSlot, TappedReceiver};
 use crate::tui::stderr_backend::StderrBackend;
-use hcore::events::{EventReceiver, now_unix_ms};
+use hcore::events::now_unix_ms;
 use hcore::shutdown::ShutdownTrigger;
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -37,11 +38,19 @@ pub async fn run<A: App + 'static>(
     app: A,
     sink: LogSink,
     shutdown: ShutdownTrigger,
+    slot: Option<&SessionSlot>,
 ) -> anyhow::Result<A::Output> {
     // The app owns its view: aggregation + rendering. It lives on the loop
     // stack so it survives pause/resume (only the terminal is rebuilt across a
     // pause cycle, not the view's aggregated state).
     let mut view = app.tui_view();
+    // No start line here: the terminal is the TUI's. `heph session list` finds it.
+    let session_tap = slot
+        .and_then(|s| s.open(view.session_header(), true))
+        .map(|s| s.tap);
+    if let Some(tap) = &session_tap {
+        sink.set_session_tap(tap.clone());
+    }
     // Size the inline viewport to ~1/3 of the terminal height. Queried before the
     // viewport is built (so the first frame is already sized); the column count is
     // re-derived from the backend below.
@@ -57,7 +66,7 @@ pub async fn run<A: App + 'static>(
     // We own the build-event channel: the sender goes to the app via
     // AppContext (and into its request state); we keep the receiver.
     let (event_tx, event_rx) = mpsc::unbounded_channel();
-    let mut build_events: Option<EventReceiver> = Some(event_rx);
+    let mut build_events: Option<TappedReceiver> = Some(TappedReceiver::new(event_rx, session_tap));
 
     record_raw_mode_restore();
     enable_raw_mode().context("enabling raw mode")?;
@@ -354,18 +363,20 @@ pub async fn run<A: App + 'static>(
                     _ => {}
                 }
             }
+            // Not gated on `!paused` (A1): `apply` never draws, so folding while
+            // the terminal is handed over costs nothing on screen, and a paused
+            // run (an entrypoint, `--shell`) must keep recording its session.
             maybe_build_evt = async {
                 match build_events.as_mut() {
-                    Some(r) => r.recv().await,
-                    None => std::future::pending().await,
-                }
-            }, if !paused => {
-                match maybe_build_evt {
                     // No per-event redraw: fold into the view here, the 80ms
                     // ticker repaints the pinned progress block.
-                    Some(e) => view.apply(&e),
+                    Some(r) => r.recv(|e| view.apply(e)).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if maybe_build_evt.is_none() {
                     // Sender dropped (request finished) — stop polling.
-                    None => build_events = None,
+                    build_events = None;
                 }
             }
             // The app is done and only background work is holding the exit:
@@ -476,9 +487,7 @@ pub async fn run<A: App + 'static>(
     // request state drops). Drain them so the final summary reflects the full
     // stream rather than the snapshot at the last tick.
     if let Some(r) = build_events.as_mut() {
-        while let Ok(e) = r.try_recv() {
-            view.apply(&e);
-        }
+        while r.try_recv(|e| view.apply(e)).is_ok() {}
     }
 
     // Persistent final summary, printed straight to stderr below the
