@@ -735,7 +735,7 @@ mod tests {
             held: 4,
             waiting: 1,
             pending_removal: 2,
-            oldest_wait: None,
+            oldest_wait: Some(std::time::Duration::from_secs(12)),
         });
         let dump = inventory_report(&snapshot, sandboxes);
         assert_eq!(
@@ -743,7 +743,11 @@ mod tests {
             hengine::engine::diag::InflightLog::render(&snapshot, sandboxes).trim()
         );
         assert!(
-            dump.contains("waiting for sandbox cleanup: 1 runs waiting"),
+            dump.contains(
+                "=== sandboxes ===\nwaiting for sandbox cleanup: 1 run waiting, 4 of 4 sandboxes \
+                 on disk, 2 awaiting removal (oldest wait 12s) — cleanup is slower than new runs \
+                 (disk-bound)\n"
+            ),
             "{dump}"
         );
     }

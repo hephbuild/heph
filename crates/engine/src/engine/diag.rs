@@ -1091,23 +1091,29 @@ fn signed(n: i64) -> String {
     format!("{n:+}")
 }
 
-/// Render a stall report as the paragraph appended to the [`StallLog`].
+/// The sandboxes on disk in one line: how many there are against the bound,
+/// how much cleanup is owed, and — when runs are parked on it — that cleanup
+/// is what they wait for.
 ///
-/// The wording deliberately avoids the vocabulary of a *failure* — no "error",
-/// no "failed". The file is read (and often catted into a CI log) on every slow
-/// build, and a log processor grepping for failure signatures must not match a
-/// progress notice. It says "no progress", never "hung": the run may well be
-/// fine.
-///
-/// The text is a diagnostic, not an interface. Nothing should parse it — that is
-/// what the machine-readable surface is for.
-/// The sandbox permit pool in one line: who waits on cleanup, and how much
-/// cleanup is owed.
+/// Worded for the reader of a slow build, not for the mechanism: a run waits
+/// because removing finished sandboxes is slower than starting new ones, and
+/// that is a disk, not a deadlock.
 pub fn render_sandbox_permits(s: &crate::engine::sandbox_permits::SandboxPermitGauge) -> String {
+    let on_disk = format!(
+        "{} of {} sandboxes on disk, {} awaiting removal",
+        s.held, s.capacity, s.pending_removal
+    );
+    if s.waiting == 0 {
+        return on_disk;
+    }
+    let runs = if s.waiting == 1 { "run" } else { "runs" };
+    let oldest = s
+        .oldest_wait
+        .map_or_else(String::new, |d| format!(" (oldest wait {})", secs(d)));
     format!(
-        "waiting for sandbox cleanup: {} runs waiting, {} sandboxes pending removal ({}/{} \
-         permits held)",
-        s.waiting, s.pending_removal, s.held, s.capacity
+        "waiting for sandbox cleanup: {} {runs} waiting, {on_disk}{oldest} — cleanup is \
+         slower than new runs (disk-bound)",
+        s.waiting
     )
 }
 
@@ -1171,6 +1177,16 @@ fn render_pools(p: &crate::engine::resource_pool::ResourceSnapshot, now: Instant
     out
 }
 
+/// Render a stall report as the paragraph appended to the [`StallLog`].
+///
+/// The wording deliberately avoids the vocabulary of a *failure* — no "error",
+/// no "failed". The file is read (and often catted into a CI log) on every slow
+/// build, and a log processor grepping for failure signatures must not match a
+/// progress notice. It says "no progress", never "hung": the run may well be
+/// fine.
+///
+/// The text is a diagnostic, not an interface. Nothing should parse it — that is
+/// what the machine-readable surface is for.
 pub fn render_stall(r: &StallReport) -> String {
     let mut out = String::new();
     // The build, on the first line, always. Every one of these reports is read
@@ -1476,10 +1492,10 @@ impl InflightLog {
     ) -> String {
         let sandboxes = match sandboxes {
             Some(s) => render_sandbox_permits(&s),
-            None => "no engine registered a sandbox permit pool".to_owned(),
+            None => "no engine is bounding sandboxes on disk".to_owned(),
         };
         format!(
-            "{}=== sandbox permits ===\n{sandboxes}\n",
+            "{}=== sandboxes ===\n{sandboxes}\n",
             hcore::hmemoizer::render_report(snapshot)
         )
     }
@@ -2509,7 +2525,7 @@ mod tests {
         assert!(text.contains("HEPH_DEBUG_MEMOIZER_CYCLE"), "{text}");
         assert!(text.contains("HEPH_PHASE_TRACE"), "{text}");
         assert!(
-            text.contains("no engine registered a sandbox permit pool"),
+            text.contains("=== sandboxes ===\nno engine is bounding sandboxes on disk\n"),
             "{text}"
         );
     }
@@ -2523,12 +2539,14 @@ mod tests {
             held: 8,
             waiting: 3,
             pending_removal: 5,
-            oldest_wait: None,
+            oldest_wait: Some(Duration::from_millis(42_900)),
         };
-        let line = "waiting for sandbox cleanup: 3 runs waiting, 5 sandboxes pending removal (8/8 \
-             permits held)";
+        let line = "waiting for sandbox cleanup: 3 runs waiting, 8 of 8 sandboxes on disk, 5 \
+                    awaiting removal (oldest wait 42s) — cleanup is slower than new runs \
+                    (disk-bound)";
         let text = InflightLog::render(&hcore::hmemoizer::capture_report(), Some(gauge));
-        assert!(text.contains(line), "{text}");
+        assert!(text.contains(&format!("=== sandboxes ===\n{line}\n")), "{text}");
+        assert!(!text.contains("permit"), "{text}");
 
         let s = std::sync::Arc::new(DiagState::new(vec![Limiter::new("workers")]));
         s.register_sandbox_permits(move || gauge);
@@ -2537,17 +2555,39 @@ mod tests {
             .expect("a zero threshold fires");
         assert!(render_stall(&r).contains(line), "{}", render_stall(&r));
 
-        let idle = crate::engine::sandbox_permits::SandboxPermitGauge {
-            waiting: 0,
+        // One run, singular; the age is whole seconds.
+        let one = crate::engine::sandbox_permits::SandboxPermitGauge {
+            waiting: 1,
+            oldest_wait: Some(Duration::from_secs(7)),
             ..gauge
         };
+        assert_eq!(
+            render_sandbox_permits(&one),
+            "waiting for sandbox cleanup: 1 run waiting, 8 of 8 sandboxes on disk, 5 awaiting \
+             removal (oldest wait 7s) — cleanup is slower than new runs (disk-bound)"
+        );
+
+        // Nobody waits: the in-flight report says how many sandboxes are on
+        // disk and nothing about cleanup; the stall paragraph says nothing.
+        let idle = crate::engine::sandbox_permits::SandboxPermitGauge {
+            capacity: 8,
+            held: 2,
+            waiting: 0,
+            pending_removal: 1,
+            oldest_wait: None,
+        };
+        let text = InflightLog::render(&hcore::hmemoizer::capture_report(), Some(idle));
+        assert!(
+            text.contains("=== sandboxes ===\n2 of 8 sandboxes on disk, 1 awaiting removal\n"),
+            "{text}"
+        );
         let s = std::sync::Arc::new(DiagState::new(vec![Limiter::new("workers")]));
         s.register_sandbox_permits(move || idle);
         let r = s
             .evaluate(s.now_ms() + 1, Duration::ZERO)
             .expect("a zero threshold fires");
         assert!(
-            !render_stall(&r).contains("sandbox cleanup"),
+            !render_stall(&r).contains("sandboxes"),
             "{}",
             render_stall(&r)
         );
