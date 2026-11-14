@@ -31,8 +31,9 @@
 //! Two more rules fall out of the same reasoning. The directory is named by the
 //! full sanitized *address* rather than the target name, so two credentials called
 //! `aws` in different packages cannot collide. And it is deleted at run end
-//! regardless of outcome — a failed target's sandbox is deliberately kept for
-//! diagnostics, and the log tail is what makes it useful, not the token.
+//! regardless of outcome — a failed target's sandbox can be kept for
+//! inspection (`--keep-failed-sandboxes`), and its log is what makes it
+//! useful, not the token.
 
 use crate::engine::Engine;
 use crate::engine::driver::targetdef::Input;
@@ -1023,8 +1024,8 @@ impl Engine {
                 None,
                 false,
                 false,
-                // The outputs are material: a failure must not leave them in a
-                // sandbox kept for diagnostics.
+                // The outputs are material: a failure removes the sandbox
+                // even under `--keep-failed-sandboxes`.
                 true,
             )
             .await;
@@ -1265,8 +1266,8 @@ impl Engine {
         let root = credential_dir(sandbox_dir);
         // Armed before the first file is written: a presentation failing
         // half-way (the second credential's template) returns by `?`, and the
-        // first credential's files must not outlive it in a sandbox kept for
-        // diagnostics.
+        // first credential's files must not outlive it in a failed sandbox
+        // kept by `--keep-failed-sandboxes`.
         let teardown = CredentialTeardown::at(root.clone());
         let mut mounts = Vec::with_capacity(credentials.held.len());
         for (rc, acquired) in &credentials.held {
@@ -1683,9 +1684,9 @@ const GENERIC_OIDC_TOKEN_FILE: &str = "HEPH_OIDC_TOKEN_FILE";
 
 /// Deletes a run's presented credential files.
 ///
-/// Fires whatever the outcome. A failed target's sandbox is deliberately kept for
-/// diagnostics — the failure paragraph reads its log tail lazily — and the log
-/// tail is what makes that useful, not the token.
+/// Fires whatever the outcome. A failed target's sandbox can be kept for
+/// inspection (`--keep-failed-sandboxes`), and also lives on while its failure
+/// slot is filled; its log is what makes it useful, not the token.
 pub struct CredentialTeardown {
     dirs: Vec<PathBuf>,
 }

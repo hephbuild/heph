@@ -28,8 +28,9 @@
 //!
 //! - **One slot per address** (variant included), filled once per `(addr,
 //!   hashin)` run: in `execute`'s failure arm, under the target's execute lock.
-//! - **Copied, never moved.** The driver's file stays where it is; the failed
-//!   sandbox is kept for diagnostics exactly as before. `std::fs::copy` reflinks
+//! - **Copied, never moved.** The driver's file stays where it is, and the
+//!   failed sandbox is removed only once the fill is done (or left on disk
+//!   under `--keep-failed-sandboxes`). `std::fs::copy` reflinks
 //!   where the filesystem can (`clonefile` on APFS, `copy_file_range` on btrfs and
 //!   XFS). A log outside the sandbox — a symlink pointing out of it included — is
 //!   not copied.
@@ -147,6 +148,21 @@ pub struct FailureSlot {
     /// What the run's `in_place` write-back on failure did, with the slot's
     /// `fixes.txt` filled in when it was kept.
     pub fixes: Option<hplugin::error::FailureFixes>,
+    /// What becomes of the run's sandbox once the fill is done, for the
+    /// failure box ([`SandboxFate`](hplugin::error::SandboxFate)). Set by the
+    /// engine ([`with_sandbox`](Self::with_sandbox)), never by the fill. A
+    /// failure after the run, while hashing its artifacts, fills no slot and
+    /// carries a default one with only this set.
+    pub sandbox: Option<hplugin::error::SandboxFate>,
+}
+
+impl FailureSlot {
+    /// The same slot, saying what becomes of the run's sandbox.
+    #[must_use]
+    pub fn with_sandbox(mut self, sandbox: Option<hplugin::error::SandboxFate>) -> Self {
+        self.sandbox = sandbox;
+        self
+    }
 }
 
 impl fmt::Display for FailureSlot {
@@ -398,6 +414,7 @@ impl FailureSlots {
             out: filled.out,
             out_error: filled.out_error,
             fixes,
+            sandbox: None,
         }
     }
 }

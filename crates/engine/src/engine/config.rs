@@ -128,6 +128,12 @@ pub struct Config {
     ///
     /// [`ListedFactsTrust`]: crate::engine::listed::ListedFactsTrust
     pub listed_facts_trust: crate::engine::listed::ListedFactsTrust,
+    /// Leave a failed target's sandbox on disk until the target's next run,
+    /// rather than removing it once the failure is recorded (the default).
+    /// Set by the front end (`--keep-failed-sandboxes`). A kept sandbox is
+    /// outside the `sandbox` pool's bound; a credential target's sandbox is
+    /// removed whatever this says.
+    pub keep_failed_sandboxes: bool,
     /// Resource pools as written, each with its unit and capacity: the config
     /// file's `resources:`, with the run's overrides (`--resource`, `-j`,
     /// `HEPH_RESOURCE_<NAME>`) laid over it by the front end. A builtin absent
@@ -186,6 +192,7 @@ impl Config {
             remote_caches: Vec::new(),
             scratch: ScratchOptions::default(),
             listed_facts_trust: Default::default(),
+            keep_failed_sandboxes: false,
             resources: BTreeMap::new(),
         }
     }
@@ -292,6 +299,8 @@ impl ConfigYamlExt for ConfigYaml {
             scratch: resolve_scratch(self.scratch.as_ref(), root),
             // Not workspace policy: the CLI sets it per invocation.
             listed_facts_trust: defaults.listed_facts_trust,
+            // A run's choice, like `--fail-fast`: the CLI sets it.
+            keep_failed_sandboxes: defaults.keep_failed_sandboxes,
             lock_backend: self
                 .lock
                 .and_then(|l| l.backend)

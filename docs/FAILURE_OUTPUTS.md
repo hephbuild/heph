@@ -62,8 +62,37 @@ The failure box prints where each part is:
     …
     ╰────
   full log: /ws/.heph/failures/web_e2e-…/log.txt
+  sandbox: removed (rerun with --keep-failed-sandboxes to keep it)
   outputs: /ws/.heph/failures/web_e2e-…/out
 ```
+
+### The failed sandbox
+
+The slot is what outlives a failure; the sandbox the run failed in does not.
+Once the slot is filled (and an `in_place` write-back is done), the sandbox is
+removed, like a passing run's, and the box says so. Rerun with
+`--keep-failed-sandboxes` to keep it on disk for inspection instead: it then
+stays until the target's next run, and it is outside the `sandbox` pool's cap
+(see [RESOURCES.md](RESOURCES.md)). A target whose outputs are credential
+material has its failed sandbox removed even under the flag.
+
+The box's `sandbox:` line, after `full log:`, says which:
+
+| Line | When |
+|---|---|
+| `sandbox: removed (rerun with --keep-failed-sandboxes to keep it)` | the default |
+| `sandbox: <path> (kept)` | under `--keep-failed-sandboxes` |
+| `sandbox: removed (credential material)` | material, under the flag |
+| `sandbox: left (run abandoned after timeout)` | the run outlived its timeout's grace (see [TIMEOUTS.md](TIMEOUTS.md)) |
+
+There is no line when the run had no sandbox (a plain driver such as
+`template` or `fs`, or a failure before the driver ran), nor for material
+without the flag. `heph inspect failure` (and its `--json`) never reports the
+sandbox: it reads the slot, and the sandbox is not part of it.
+
+When the slot's fill itself fails (an unwritable failures directory, a log
+outside the sandbox), the box falls back to the log's tail in memory, and the
+full log is gone with the sandbox unless `--keep-failed-sandboxes` kept it.
 
 ## `failure_out`
 

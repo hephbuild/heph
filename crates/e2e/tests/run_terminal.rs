@@ -217,9 +217,10 @@ target(name = "cached", driver = "bash", out = "o.txt",
 async fn plain_build_still_redacts_and_logs() -> anyhow::Result<()> {
     const VAR: &str = "HEPH_E2E_PLAIN_BUILD_TOKEN";
     let _guard = EnvVar::set(VAR);
-    let ws = Workspace::new();
+    let ws = Workspace::keeping_failed_sandboxes();
     credential_build(&ws, VAR);
-    // Failing, so that the sandbox survives and `log.txt` can be read back.
+    // Failing under `--keep-failed-sandboxes`, so that the sandbox survives
+    // and `log.txt` can be read back.
     ws.write_build_file(
         "app",
         r#"target(name = "a", driver = "bash", out = [], cache = False,
@@ -246,13 +247,13 @@ async fn plain_build_still_redacts_and_logs() -> anyhow::Result<()> {
 }
 
 /// A shell is the user's own session: it shows what they ask it to show, and
-/// nothing of it is written down. Failing, so that the sandbox survives and the
-/// absence of a `log.txt` means something.
+/// nothing of it is written down. Failing under `--keep-failed-sandboxes`, so
+/// that the sandbox survives and the absence of a `log.txt` means something.
 #[tokio::test]
 async fn build_target_shell_no_log_no_redaction() -> anyhow::Result<()> {
     const VAR: &str = "HEPH_E2E_SHELL_TOKEN";
     let _guard = EnvVar::set(VAR);
-    let ws = Workspace::new();
+    let ws = Workspace::keeping_failed_sandboxes();
     credential_build(&ws, VAR);
     ws.write_build_file(
         "app",

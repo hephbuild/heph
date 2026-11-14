@@ -150,6 +150,7 @@ pub struct Workspace {
 struct ReopenConfig {
     parallelism: Option<usize>,
     fs_skip: Vec<String>,
+    keep_failed_sandboxes: bool,
 }
 
 impl std::ops::Deref for Workspace {
@@ -165,7 +166,16 @@ impl Workspace {
     }
 
     pub fn with_parallelism(parallelism: impl Into<Option<usize>>) -> Self {
-        let p = parallelism.into();
+        Self::build(parallelism.into(), false)
+    }
+
+    /// [`new`](Self::new) under `--keep-failed-sandboxes`: a failed target's
+    /// sandbox stays on disk, for a test that reads it after the failure.
+    pub fn keeping_failed_sandboxes() -> Self {
+        Self::build(None, true)
+    }
+
+    fn build(p: Option<usize>, keep_failed_sandboxes: bool) -> Self {
         let builder = WorkspaceBuilder::new()
             .expect("workspace tempdir")
             .with_provider(|init| {
@@ -184,11 +194,17 @@ impl Workspace {
         } else {
             builder
         };
+        let builder = if keep_failed_sandboxes {
+            builder.keeping_failed_sandboxes()
+        } else {
+            builder
+        };
         Self {
             inner: builder.build().expect("build workspace"),
             reopen_with: Some(ReopenConfig {
                 parallelism: p,
                 fs_skip: Vec::new(),
+                keep_failed_sandboxes,
             }),
         }
     }
@@ -224,6 +240,7 @@ impl Workspace {
         let mut engine = Engine::new(Config {
             parallelism: cfg.parallelism,
             fs_skip: cfg.fs_skip.clone(),
+            keep_failed_sandboxes: cfg.keep_failed_sandboxes,
             scratch,
             ..Config::for_tests(root.clone())
         })

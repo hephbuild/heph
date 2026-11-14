@@ -47,7 +47,8 @@ by ignoring it:
    out.
 
 A timeout is a **failure**, not a cancellation: the failure box shows the log
-tail, the sandbox is kept for diagnostics, `--fail-fast` reacts to it, and
+tail, the log and `failure_out` are kept in the failure slot, `--fail-fast`
+reacts to it, and
 nothing is cached, so the next build runs the target again. (A cancellation
 gets no failure slot: when the request was cancelled, by `--fail-fast` or
 Ctrl-C, a run's error is treated as that cancellation unless it is a timeout,
@@ -72,6 +73,14 @@ collection stop within one chunk once the run is cancelled, so they never use
 up the grace; only the driver's process can. Leftover jobs of an abandoned run
 stop as soon as it is dropped, and each output tar is written under a name
 unique to its run, so a leftover job cannot overwrite a later run's artifact.
+
+An abandoned run's sandbox is **not removed**, even though a failed sandbox
+otherwise is (see [FAILURE_OUTPUTS.md](FAILURE_OUTPUTS.md)): its process may
+still be writing to the tree, and a removal racing that writer can neither
+finish nor be counted as done. The tree is left on disk, its `sandbox` slot is
+released at once, the target's next run reclaims it, and the failure box says
+`sandbox: left (run abandoned after timeout)`. A credential-material target's
+sandbox is removed all the same, writer or not.
 
 `--shell` is never timed: it is a person at a prompt. An entrypoint
 (`heph run //x`) is held to its `timeout` like a build, and a timed-out

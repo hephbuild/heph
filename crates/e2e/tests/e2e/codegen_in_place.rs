@@ -267,6 +267,11 @@ async fn writes_fixes_on_failure_and_fails() -> anyhow::Result<()> {
         Vec::<PathBuf>::new(),
         "a failed run's fixes never reach the cache"
     );
+    // Written back from the sandbox before it was removed, not raced by it.
+    crate::failure_slot::removed(&crate::failure_slot::sandbox_dir(
+        &ws.engine, "fix", "upper",
+    ))
+    .await;
 
     // Same inputs as the failed run: a manifest at its hashin would serve
     // this from the cache. It must run again, and fail again.
@@ -686,7 +691,8 @@ target(
 /// the tree (D16).
 #[tokio::test]
 async fn shell_exit_1_writes_nothing() -> anyhow::Result<()> {
-    let ws = Workspace::new();
+    // Kept: the test reads the edit back out of the failed sandbox.
+    let ws = Workspace::keeping_failed_sandboxes();
     ws.write_build_file("fix", &failing_build_file("in_place", "exit 1"));
     ws.write_file("fix/src.txt", "hello");
 
@@ -866,7 +872,8 @@ target(
 /// not report one written.
 #[tokio::test]
 async fn timeout_writes_nothing_back() -> anyhow::Result<()> {
-    let ws = Workspace::new();
+    // Kept: the test reads the fix back out of the failed sandbox.
+    let ws = Workspace::keeping_failed_sandboxes();
     ws.write_build_file(
         "fix",
         r#"

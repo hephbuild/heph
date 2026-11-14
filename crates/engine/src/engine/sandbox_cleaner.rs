@@ -61,10 +61,11 @@
 //!
 //! That argument covers the plain sandbox directory, which is all
 //! [`generation::remove_stale`] knows about. A FUSE run's upper side
-//! (`<fuse.upper>/<rel>`) is a separate tree, and a superseded, cancelled or
-//! failed run's upper dir is not removed by `remove_stale` — the successor's
-//! claim reclaims the plain dir only. (A failed credential-material run is the
-//! exception: [`SandboxTeardown::reclaim`] removes its upper dir explicitly.)
+//! (`<fuse.upper>/<rel>`) is a separate tree, and a superseded or cancelled
+//! run's upper dir, or a failed one kept by `--keep-failed-sandboxes`, is not
+//! removed by `remove_stale` — the successor's claim reclaims the plain dir
+//! only. (A failed run that is not kept is the exception:
+//! [`SandboxTeardown::reclaim`] removes its upper dir explicitly.)
 //! That is a known gap, independent of queue order: running the reclaim lane
 //! FIFO would not close it. It is also outside the `sandbox` pool's bound
 //! below: such an upper dir outlives the slot its run released. Known gap; a
@@ -84,9 +85,10 @@
 //! removed number at most the pool's capacity (a credential producer takes a
 //! slot too: its consumer acquires credentials before its own admission, so
 //! no run waits for a slot while holding one). When removal falls behind, new
-//! runs wait in admission instead of the disk filling. Outside the bound:
-//! failed sandboxes kept for diagnostics (one per failed addr) and invocation
-//! sandboxes.
+//! runs wait in admission instead of the disk filling. A failed run's sandbox
+//! is inside the bound too: its slot rides into the reclaim queued once the
+//! failure slot is filled. Outside the bound: failed sandboxes kept by
+//! `--keep-failed-sandboxes` (one per failed addr) and invocation sandboxes.
 use crossbeam_channel::{Sender, unbounded};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
@@ -189,7 +191,10 @@ pub enum Lane {
 /// executes themselves but not their detached jobs, and this registry is
 /// process-local. That exposure predates cancel-on-abandonment (any process
 /// exit with queued jobs had it) and is bounded by process lifetime — queued
-/// jobs die with the process that queued them.
+/// jobs die with the process that queued them. Every detached removal shares
+/// it: a passing run's bridge job, a cancelled run's drop reclaim, and a
+/// failed run's reclaim (queued once its failure slot is filled, and free to
+/// run after the execute lock is released).
 pub mod generation {
     use std::collections::HashMap;
     use std::io;
@@ -306,30 +311,28 @@ pub mod generation {
 ///   finished, or the cache write failed with an error value): the
 ///   bridge-owned cleanup job is enqueued, guarded by this run's generation.
 ///   The bridge job knows the real layout (plain dir vs FUSE upper side).
+/// * [`defer_for_failure`](Self::defer_for_failure), then
+///   [`reclaim`](Self::reclaim) — **the target failed** (an `Err` is
+///   propagating out of the execute), by default: nothing is queued while the
+///   failure arm reads the sandbox (the `in_place` write-back's tars, the
+///   failure slot's copy of the log and unpack of `failure_out`); then the
+///   generation-checked reclaim is enqueued — of the FUSE upper-side
+///   directory too, when the run wrote there. The failure box renders the log
+///   tail from the slot's copy, never from the sandbox, so the reclaim cannot
+///   race it. A material target (its sandbox holds presented credentials)
+///   takes `reclaim` too, whatever the flag says, and stays armed until then.
 /// * [`leave_for_diagnostics`](Self::leave_for_diagnostics) — **the target
-///   failed** (an `Err` is propagating out of the execute): the sandbox is
-///   left on disk, untouched, deliberately. The failure diagnostic reads the
-///   process's last log lines *lazily* from the on-disk log when it renders —
-///   a failed target's sandbox surviving until that target's next run is
-///   pre-existing, documented behaviour, and reclaiming it here turns the
-///   diagnostic into a race against its own cleanup (output present or absent
-///   depending on cleaner-lane load). The next execute's
-///   [`generation::remove_stale`] reclaims it, exactly as it always has. This
-///   is retention by design, not a leak: at most one tree per failed addr,
-///   the same bound as before teardown ownership existed.
-/// * [`reclaim`](Self::reclaim) — **a material target failed**: its sandbox
-///   holds presented credentials, so once the failure slot has read what it
-///   keeps, the generation-checked reclaim is enqueued at once — of the
-///   FUSE upper-side directory too, when the run wrote there.
+///   failed under `--keep-failed-sandboxes`**: the sandbox is left on disk,
+///   untouched, for a post-mortem. The next execute's
+///   [`generation::remove_stale`] reclaims it. At most one tree per failed
+///   addr.
 /// * `Drop` without any of these — **cancellation or abandonment only** (the future
 ///   was dropped or unwound without resolving): a generation-checked
 ///   [`generation::remove_stale`] reclaim is enqueued. If a successor already
 ///   reclaimed the path it declines; otherwise it removes this run's
 ///   half-written tree. Without this, mass fail-fast (the wedge run had 1,135
 ///   and 1,949 cancellations) leaves one abandoned sandbox tree per cancelled
-///   execute with nothing to collect them — `gc` has no sandbox sweep, and
-///   unlike a failure, a cancelled target has no failure diagnostic that
-///   needs the tree.
+///   execute with nothing to collect them — `gc` has no sandbox sweep.
 ///
 /// The drop path deliberately enqueues the reclaim rather than the bridge job:
 /// the bridge job's ordering contract (slot guards deregistered first) is
@@ -341,7 +344,8 @@ pub mod generation {
 /// ([`with_sandbox_slot`](Self::with_sandbox_slot)): every path that queues a
 /// removal moves the slot into that job, released once the removal returns,
 /// and every path that queues none — `leave_for_diagnostics`, a `complete`
-/// with no bridge job — drops it at once.
+/// with no bridge job, a drop after `defer_for_failure` (a cancellation
+/// during the fill, a run abandoned after its timeout) — drops it at once.
 pub struct SandboxTeardown {
     dir: PathBuf,
     generation: u64,
@@ -505,6 +509,7 @@ impl SandboxTeardown {
 
     /// Hand this teardown the run's `sandbox` pool slot, released when the
     /// sandbox's removal returns (or at once, when nothing will remove it).
+    #[must_use = "dropping the teardown queues its reclaim at once"]
     pub fn with_sandbox_slot(
         mut self,
         slot: Option<crate::engine::resource_pool::Reservation>,
@@ -559,29 +564,49 @@ impl SandboxTeardown {
         }
     }
 
-    /// The target failed: leave the sandbox on disk for the failure
-    /// diagnostic, which reads the process's log tail lazily from it. Nothing
-    /// is enqueued — not the bridge job, not a reclaim — and the tree survives
-    /// until this target's next run removes it, the documented pre-teardown
-    /// behaviour. See the type docs for why this must never be folded into
-    /// `Drop`: a drop-time reclaim here made the diagnostic race its own
-    /// cleanup, surfacing a failed target's exit status with its output
-    /// already deleted.
+    /// The target failed and `--keep-failed-sandboxes` asked for its sandbox:
+    /// leave it on disk for a post-mortem. Nothing is enqueued — not the
+    /// bridge job, not a reclaim — and the tree survives until this target's
+    /// next run removes it. See the type docs for why this must never be
+    /// folded into `Drop`.
     ///
-    /// The sandbox slot is released here: a sandbox kept for diagnostics is
-    /// outside the `sandbox` pool's bound, which it cannot hold — nothing
-    /// removes it until the addr runs again. It is bounded on its own, at one
-    /// tree per failed addr.
+    /// The sandbox slot is released here: a kept sandbox is outside the
+    /// `sandbox` pool's bound, which it cannot hold — nothing removes it until
+    /// the addr runs again. It is bounded on its own, at one tree per failed
+    /// addr.
     pub fn leave_for_diagnostics(mut self) {
         self.armed = false;
         self.job = None;
         self.slot = None;
     }
 
-    /// The target failed, and its sandbox must not outlive the failure (its
-    /// outputs are credential material): enqueue the generation-checked
-    /// [`generation::remove_stale`] reclaim now. Call once nothing reads the
-    /// sandbox any more — after the failure slot's fill. Not
+    /// The target failed, and its sandbox goes once the failure arm is done
+    /// reading it (the `in_place` write-back, the failure slot's fill): the
+    /// caller [`reclaim`](Self::reclaim)s it then. The default for a failed
+    /// run; `--keep-failed-sandboxes` takes
+    /// [`leave_for_diagnostics`](Self::leave_for_diagnostics) instead.
+    ///
+    /// Until that reclaim nothing is queued, and the drop reclaim is disarmed:
+    /// a cancellation while the fill is still unpacking out of the sandbox, on
+    /// a blocking thread the cancellation does not stop, must not queue a
+    /// removal under it. Such a drop leaves the tree to this addr's next run,
+    /// whose `remove_stale` reclaims it, and releases the slot at once. A run
+    /// abandoned after its timeout is dropped so on purpose: its process may
+    /// still be writing to the tree.
+    #[must_use = "dropping a deferred teardown leaves the sandbox on disk; call reclaim()"]
+    pub fn defer_for_failure(mut self) -> Self {
+        self.armed = false;
+        self.job = None;
+        self
+    }
+
+    /// The target failed and its sandbox must not outlive the failure — by
+    /// default ([`defer_for_failure`](Self::defer_for_failure)), and always
+    /// when its outputs are credential material: enqueue the
+    /// generation-checked [`generation::remove_stale`] reclaim now. The
+    /// sandbox slot rides in the job, released once the tree is gone. Call
+    /// once nothing reads the sandbox any more — after the failure slot's
+    /// fill. Not
     /// [`complete`](Self::complete): a failed run hands over no bridge job,
     /// so `complete` would enqueue nothing and leave the presented
     /// credentials on disk.
@@ -1351,45 +1376,79 @@ mod tests {
         }
     }
 
-    /// The three-way contract, failure leg: a *failed* execute leaves its
-    /// sandbox on disk, untouched — bridge job dropped unused, no reclaim
-    /// queued.
-    ///
-    /// The failure diagnostic reads the process's last log lines lazily from
-    /// the on-disk log when it renders. Folding failure into the drop-reclaim
-    /// path made that a race against the cleaner lane: with siblings running
-    /// the reclaim landed late and the tail survived; alone (and on the CI
-    /// runners) it landed first and a failing target reported its exit status
-    /// with no output (`test_failure_surfaces_process_log_tail`, e2e). The
-    /// deterministic proof here is the pending counter: it was never bumped,
-    /// so nothing was queued and nothing can delete the tree later.
-    #[test]
-    fn a_failed_execute_leaves_its_sandbox_for_diagnostics() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let sandbox = tmp.path().join("sandbox");
-        std::fs::create_dir_all(&sandbox).expect("mkdir");
+    /// A teardown armed over `sandbox`, holding a bridge job that records
+    /// whether it ran.
+    fn failed_teardown(
+        sandbox: &std::path::Path,
+        pending: &PendingCounter,
+    ) -> (SandboxTeardown, Arc<AtomicBool>) {
+        std::fs::create_dir_all(sandbox).expect("mkdir");
         std::fs::write(sandbox.join("log.txt"), b"distinctive-marker-line\n").expect("write");
-
-        let pending = counter();
-        let claim = generation::claim(&sandbox);
-        let mut teardown = SandboxTeardown::arm(sandbox.clone(), claim, Arc::clone(&pending));
-        // Even a bridge job already handed over must be dropped unused — the
-        // failure decision outranks it.
+        let claim = generation::claim(sandbox);
+        let mut teardown = SandboxTeardown::arm(sandbox.to_path_buf(), claim, Arc::clone(pending));
         let bridge_ran = Arc::new(AtomicBool::new(false));
         teardown.set_job(Some(Box::new({
-            let (bridge_ran, sandbox) = (Arc::clone(&bridge_ran), sandbox.clone());
+            let (bridge_ran, sandbox) = (Arc::clone(&bridge_ran), sandbox.to_path_buf());
             move || {
                 bridge_ran.store(true, Ordering::SeqCst);
                 std::fs::remove_dir_all(&sandbox)
             }
         })));
+        (teardown, bridge_ran)
+    }
+
+    /// The failure leg, by default: while the failure arm reads the sandbox
+    /// (the write-back's tars, the slot's fill) nothing is queued against it;
+    /// once it is done, the reclaim removes it.
+    ///
+    /// Deferring queues nothing, so a removal cannot race the fill still
+    /// unpacking out of the tree. The bridge job never runs: a failed run's
+    /// removal is the generation-checked reclaim, not the passing run's
+    /// cleanup.
+    #[test]
+    fn a_failed_execute_removes_its_sandbox_once_the_failure_is_kept() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sandbox = tmp.path().join("sandbox");
+        let pending = counter();
+        let (teardown, bridge_ran) = failed_teardown(&sandbox, &pending);
+
+        let held = teardown.defer_for_failure();
+        assert_eq!(
+            pending.load(Ordering::Acquire),
+            0,
+            "a deferred teardown must enqueue nothing while the failure is kept"
+        );
+        assert!(
+            sandbox.join("log.txt").exists(),
+            "the sandbox must still be there for the failure slot's fill"
+        );
+
+        held.reclaim(None);
+        wait_drained(&pending, Duration::from_secs(5));
+        assert!(!sandbox.exists(), "the reclaim removes the failed sandbox");
+        assert!(
+            !bridge_ran.load(Ordering::SeqCst),
+            "the bridge job must be dropped unused on the failure path"
+        );
+    }
+
+    /// The failure leg under `--keep-failed-sandboxes`: the sandbox is left
+    /// on disk, untouched — bridge job dropped unused, no reclaim queued. The
+    /// pending counter is the proof: never bumped, so nothing can delete the
+    /// tree later; this addr's next run reclaims it.
+    #[test]
+    fn a_kept_failed_execute_leaves_its_sandbox() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sandbox = tmp.path().join("sandbox");
+        let pending = counter();
+        let (teardown, bridge_ran) = failed_teardown(&sandbox, &pending);
 
         teardown.leave_for_diagnostics();
 
         assert_eq!(
             pending.load(Ordering::Acquire),
             0,
-            "a failed target's teardown must enqueue nothing — neither the \
+            "a kept sandbox's teardown must enqueue nothing — neither the \
              bridge job nor a reclaim"
         );
         assert!(
@@ -1398,8 +1457,7 @@ mod tests {
         );
         assert!(
             sandbox.join("log.txt").exists(),
-            "a failed target's sandbox (and its log) must survive for the \
-             failure diagnostic"
+            "a kept sandbox must survive until the addr's next run"
         );
     }
 
@@ -1409,8 +1467,8 @@ mod tests {
     /// 1,135 and 1,949 *cancellations*) every cancelled execute drops its
     /// `SandboxTeardown`, and each drop must queue a reclaim — `gc` has no
     /// sandbox sweep, so nothing else would ever collect these trees. A
-    /// *failed* execute is the deliberate exception: see
-    /// `a_failed_execute_leaves_its_sandbox_for_diagnostics`.
+    /// *failed* execute resolves its teardown explicitly instead: see
+    /// `a_failed_execute_removes_its_sandbox_once_the_failure_is_kept`.
     #[test]
     fn a_dropped_teardown_reclaims_its_sandbox() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1647,10 +1705,11 @@ mod tests {
     }
 
     /// Every way a teardown resolves gives its `sandbox` slot back: after the
-    /// removal for the three that queue one (complete, material reclaim, a
-    /// drop), at once for the two that queue none (left for diagnostics, a
-    /// completion with no bridge job). A leg that kept it would shrink the pool
-    /// by one for the rest of the process.
+    /// removal for the four that queue one (complete, a reclaim, a failure's
+    /// held reclaim, a drop), at once for the three that queue none (left for
+    /// diagnostics, a completion with no bridge job, a failure held then
+    /// dropped by a cancellation). A leg that kept it would shrink the pool by
+    /// one for the rest of the process.
     #[test]
     fn every_teardown_path_releases_its_sandbox_slot() {
         use crate::engine::resource_pool::{Limit, ResourcePool};
@@ -1665,7 +1724,7 @@ mod tests {
         let pending = counter();
 
         type Resolve = fn(SandboxTeardown, &std::path::Path);
-        let legs: [(&str, Resolve, bool); 5] = [
+        let legs: [(&str, Resolve, bool); 7] = [
             (
                 "complete",
                 |mut t, dir| {
@@ -1677,6 +1736,16 @@ mod tests {
             ),
             ("complete, no job", |t, _| t.complete("none".into()), false),
             ("reclaim", |t, _| t.reclaim(None), true),
+            (
+                "defer_for_failure, reclaim",
+                |t, _| t.defer_for_failure().reclaim(None),
+                true,
+            ),
+            (
+                "defer_for_failure, drop",
+                |t, _| drop(t.defer_for_failure()),
+                false,
+            ),
             ("drop", |t, _| drop(t), true),
             (
                 "leave_for_diagnostics",
