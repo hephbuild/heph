@@ -190,6 +190,25 @@ fn failed_lock_leaves_no_directory() {
     assert_eq!(entries(&sessions), 0, "a failed open leaked a directory");
 }
 
+/// An ended session whose `status.json` a newer heph wrote is listed as
+/// unreadable, never as having no status (which reads `lost`).
+#[test]
+fn newer_status_is_unreadable_not_missing() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let session = Session::open(&SessionRoot::new(root.path()), start()).expect("open");
+    session.finish(Some(0), false);
+    std::fs::write(
+        session.dir().join(files::STATUS),
+        format!(r#"{{"version": {}}}"#, SNAPSHOT_VERSION + 1),
+    )
+    .expect("write");
+    let listed = source::list_dir(root.path()).expect("list");
+    assert_eq!(listed.len(), 1);
+    assert!(!listed[0].live);
+    assert!(listed[0].status.is_none());
+    assert!(listed[0].status_unreadable);
+}
+
 /// A read-only `HOME`: the root cannot be created. The open fails naming the
 /// directory, and nothing is written. Root ignores the mode bits, so this
 /// says nothing there.

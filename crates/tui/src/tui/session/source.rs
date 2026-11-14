@@ -52,6 +52,10 @@ pub struct SessionEntry {
     pub live: bool,
     /// The latest snapshot (`status.json`), when there is one this heph reads.
     pub status: Option<SessionSnapshot>,
+    /// A `status.json` is there but this heph cannot read it (a newer
+    /// snapshot version, or a corrupt file). An ended session's state is then
+    /// unknown, not lost: its `End` may well be in the file.
+    pub status_unreadable: bool,
 }
 
 impl SessionEntry {
@@ -228,11 +232,13 @@ fn read_entry(dir: &Path, id: SessionId) -> anyhow::Result<Option<SessionEntry>>
             return Ok(None);
         }
     };
+    let mut status_unreadable = false;
     let status = match std::fs::read(dir.join(files::STATUS)) {
         Ok(b) => match SessionSnapshot::decode(&b) {
             Ok(s) => Some(s),
             Err(e) => {
                 tracing::debug!(session = %id, error = %e, "ignoring session status");
+                status_unreadable = true;
                 None
             }
         },
@@ -244,6 +250,7 @@ fn read_entry(dir: &Path, id: SessionId) -> anyhow::Result<Option<SessionEntry>>
         meta,
         live,
         status,
+        status_unreadable,
     }))
 }
 

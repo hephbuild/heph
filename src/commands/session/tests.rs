@@ -65,6 +65,7 @@ fn entry(meta: SessionMeta, live: bool, status: Option<SessionSnapshot>) -> Sess
         meta: EntryMeta::Known(Box::new(meta)),
         live,
         status,
+        status_unreadable: false,
     }
 }
 
@@ -270,6 +271,14 @@ fn state_is_derived() {
             SessionState::Lost,
         ),
         (
+            "gone, status too new to read",
+            SessionEntry {
+                status_unreadable: true,
+                ..entry(m(), false, None)
+            },
+            SessionState::Unknown,
+        ),
+        (
             "newer format",
             SessionEntry {
                 id,
@@ -279,6 +288,7 @@ fn state_is_derived() {
                 },
                 live: true,
                 status: None,
+                status_unreadable: false,
             },
             SessionState::Unknown,
         ),

@@ -289,7 +289,8 @@ impl SessionState {
 
 /// Derive a session's state from what its listing says.
 ///
-/// Ended: `ok` / `failed` from `status.json`'s `end`, `lost` without one. Live:
+/// Ended: `ok` / `failed` from `status.json`'s `end`, `lost` without one,
+/// `unknown` when `status.json` is there but unreadable (newer). Live:
 /// `waiting` when something waits and every running target is among the
 /// waiters, else `stalled` when no event came for longer than `stall`, else
 /// `running`.
@@ -302,6 +303,9 @@ pub(crate) fn derive_state(entry: &SessionEntry, now_ms: u64, stall: Duration) -
         return match status.and_then(|s| s.end.as_ref()) {
             Some(end) if end.exit_code == Some(0) && !end.panicked => SessionState::Ok,
             Some(_) => SessionState::Failed,
+            // A snapshot this heph cannot read may hold the `End`: say so
+            // rather than call the session lost.
+            None if entry.status_unreadable => SessionState::Unknown,
             None => SessionState::Lost,
         };
     }
