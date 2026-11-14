@@ -40,6 +40,7 @@ mod tests;
 #[cfg(test)]
 mod view_tests;
 
+use anyhow::Context as _;
 use std::ffi::OsStr;
 use std::fs::{DirBuilder, OpenOptions, Permissions};
 use std::io;
@@ -138,9 +139,11 @@ pub struct Session {
 }
 
 impl Session {
-    /// Create the session's directory under `root`, write `meta.json`, take the
-    /// lock, and start the recorder (which first cleans ended sessions).
-    pub fn open(root: &SessionRoot, start: SessionStart) -> io::Result<Self> {
+    /// Create the session's directory under `root`, take the lock, write
+    /// `meta.json`, and start the recorder (which first cleans ended sessions).
+    /// On a failure after the directory is made, it is removed again: a run
+    /// that cannot record leaves nothing behind.
+    pub fn open(root: &SessionRoot, start: SessionStart) -> anyhow::Result<Self> {
         Self::open_with(root, start, Retention::default(), Faults::default())
     }
 
@@ -149,22 +152,51 @@ impl Session {
         start: SessionStart,
         retention: Retention,
         faults: Faults,
-    ) -> io::Result<Self> {
+    ) -> anyhow::Result<Self> {
         let root_dir = root.path();
         DirBuilder::new()
             .recursive(true)
             .mode(0o700)
-            .create(root_dir)?;
+            .create(root_dir)
+            .with_context(|| format!("creating {}", root_dir.display()))?;
         // An existing root keeps whatever mode it had; it is ours, make it
         // user-only (I6).
-        std::fs::set_permissions(root_dir, Permissions::from_mode(0o700))?;
+        std::fs::set_permissions(root_dir, Permissions::from_mode(0o700))
+            .with_context(|| format!("making {} user-only", root_dir.display()))?;
         let started = hcore::events::now_unix_ms();
-        let (id, dir) = create_session_dir(root_dir, started, id::random_byte)?;
+        let (id, dir) =
+            create_session_dir(root_dir, started, id::random_byte).with_context(|| {
+                format!("creating a session directory under {}", root_dir.display())
+            })?;
+        Self::populate(root_dir, id, dir.clone(), start, retention, faults).inspect_err(|_| {
+            // Nothing holds it: the lock (if taken) was dropped with the error.
+            if let Err(e) = std::fs::remove_dir_all(&dir) {
+                tracing::debug!(dir = %dir.display(), error = %e, "cannot remove a session directory");
+            }
+        })
+    }
+
+    /// Fill a freshly created session directory: the lock first, so a viewer
+    /// never sees `meta.json` with a free lock and no `End` (a "lost" session)
+    /// for one being created.
+    fn populate(
+        root_dir: &Path,
+        id: SessionId,
+        dir: PathBuf,
+        start: SessionStart,
+        retention: Retention,
+        faults: Faults,
+    ) -> anyhow::Result<Self> {
+        if faults.fail_lock {
+            anyhow::bail!("taking the session's lock: injected failure");
+        }
+        let lock = lockfile::acquire_owner_lock(&dir.join(files::LOCK))
+            .context("taking the session's lock")?;
         let meta = SessionMeta {
             format: META_FORMAT,
             id,
             owner_pid: std::process::id(),
-            started_unix_ms: started,
+            started_unix_ms: id.started_unix_ms(),
             heph_version: hcore::version::current().to_owned(),
             argv: start.argv,
             cwd: start.cwd,
@@ -175,13 +207,13 @@ impl Session {
             interactive: start.interactive,
             capabilities: vec![CAPABILITY_INFLIGHT.to_owned()],
         };
-        recorder::write_atomically(&dir, files::META, &meta)?;
-        let lock = lockfile::acquire_owner_lock(&dir.join(files::LOCK))?;
+        recorder::write_atomically(&dir, files::META, &meta).context("writing meta.json")?;
         let events = OpenOptions::new()
             .create_new(true)
             .append(true)
             .mode(0o600)
-            .open(dir.join(files::EVENTS))?;
+            .open(dir.join(files::EVENTS))
+            .context("creating events.ndjson")?;
         let recorder = Recorder::spawn(RecorderStart {
             dir: dir.clone(),
             root: root_dir.to_path_buf(),
@@ -189,7 +221,8 @@ impl Session {
             events: Box::new(events),
             retention,
             faults,
-        })?;
+        })
+        .context("starting the session recorder")?;
         Ok(Self { id, dir, recorder })
     }
 
@@ -391,9 +424,10 @@ impl SessionSlot {
         let session = match Session::open(&root, start) {
             Ok(s) => std::sync::Arc::new(s),
             Err(e) => {
+                // Once per run: the slot opens at most once.
                 tracing::warn!(
                     dir = %root.path().display(),
-                    error = %e,
+                    error = %format!("{e:#}"),
                     "cannot record this run's session"
                 );
                 return None;

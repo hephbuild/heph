@@ -301,6 +301,8 @@ fn injected_panic() {}
 pub(crate) struct Faults {
     /// Panic on the first event, as a bug in the recorder would.
     pub(crate) panic_on_event: bool,
+    /// Fail to take the session's lock, as an NFS `ENOLCK` would.
+    pub(crate) fail_lock: bool,
 }
 
 /// What the recorder thread starts with.

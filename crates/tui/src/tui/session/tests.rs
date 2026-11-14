@@ -167,6 +167,50 @@ fn files_are_user_only() {
     }
 }
 
+/// A lock that cannot be taken (NFS `ENOLCK`) fails the open, says which step
+/// failed, and leaves no session directory behind — every run, not a leak each.
+#[test]
+fn failed_lock_leaves_no_directory() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let sessions = root.path().join("sessions");
+    let faults = Faults {
+        fail_lock: true,
+        ..Faults::default()
+    };
+    for _ in 0..3 {
+        let err = Session::open_with(
+            &SessionRoot::new(&sessions),
+            start(),
+            Retention::default(),
+            faults,
+        )
+        .expect_err("the lock fails");
+        assert!(format!("{err:#}").contains("lock"), "{err:#}");
+    }
+    assert_eq!(entries(&sessions), 0, "a failed open leaked a directory");
+}
+
+/// A read-only `HOME`: the root cannot be created. The open fails naming the
+/// directory, and nothing is written. Root ignores the mode bits, so this
+/// says nothing there.
+#[test]
+fn unwritable_root_fails_cleanly() {
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: root ignores directory modes");
+        return;
+    }
+    let home = tempfile::tempdir().expect("tempdir");
+    let dot_heph = home.path().join(".heph");
+    std::fs::create_dir(&dot_heph).expect("mkdir");
+    std::fs::set_permissions(&dot_heph, std::fs::Permissions::from_mode(0o500)).expect("chmod");
+    let sessions = dot_heph.join("sessions");
+    let err = Session::open(&SessionRoot::new(&sessions), start()).expect_err("unwritable");
+    std::fs::set_permissions(&dot_heph, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    assert!(format!("{err:#}").contains("creating"), "{err:#}");
+    assert!(!sessions.exists());
+}
+
 /// I2: the lock is held while the session lives, released by `finish`, and
 /// its fd (like the events fd) is close-on-exec, so no child keeps it alive.
 #[test]
@@ -377,6 +421,7 @@ fn recorder_panic_does_not_fail_app() {
         Box::new(io::sink()),
         Faults {
             panic_on_event: true,
+            ..Faults::default()
         },
     );
     let tap = rec.tap();
