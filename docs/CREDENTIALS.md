@@ -377,17 +377,33 @@ result(addr)
       → dep resolution
       → scratch acquire
       → credential resolve  (which declaration, is the set coherent?)
+      → credential acquire  ← material in memory; a producer source builds here
+      → execute lock → sandbox permit → cpu admission
+      → (material lapsed while waiting? hand all three back, acquire again)
       → sandbox claim
-      → credential acquire + present  ← files written 0600, beside the workspace dir
+      → credential present  ← files written 0600, beside the workspace dir
       → driver run
       → teardown            ← the auth directory is deleted whatever the outcome
 ```
 
-Two orderings are load-bearing. **Acquisition is after the cache decision**, which
-is what makes "zero cost on a hit" structural rather than aspirational. And it is
+Three orderings are load-bearing. **Acquisition is after the cache decision**, which
+is what makes "zero cost on a hit" structural rather than aspirational. It is
 **strictly downstream of runner preparation**: the devenv `wrap` runner captures
 its entire resolved environment into a `runner.json`, which is a cached,
 remotely-shippable artifact, so a runner capture must never see material.
+
+And **acquisition is before the run takes anything of its own** — its execute
+lock, its sandbox permit, its cpu. Acquiring can build: a producer source is an
+ordinary run, with deps, the producer's build lock, a permit and cpu. A consumer
+holding its own while it waited on that build deadlocked at `-j 1` or with one
+sandbox permit, and against a plain run of the producer, which holds the
+producer's build lock while it waits for the permit the consumer held. Only
+*presenting* happens inside the sandbox. Two costs follow: an approval prompt for
+a producer comes before the consumer's queue wait rather than after it, and
+material can lapse during that wait. Lapsed material (expired, or inside its skew
+margin) is never presented: the run hands back its lock, permit and cpu and
+acquires again, and fails naming the credential after three rounds rather than
+looping when the material lives shorter than the wait.
 
 ## Caching acquired material
 

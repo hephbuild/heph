@@ -1342,15 +1342,17 @@ target(name = "t", driver = "auth.credential",
 async fn lapsed_material_is_re_acquired_rather_than_handed_on() -> anyhow::Result<()> {
     let ws = Workspace::new();
     let counter = ws.dir.path().join("refreshes");
-    // A one-second lifetime. `usable_at`'s margin is `min(60s, lifetime/2)`, so
-    // this is usable for about half a second and then is not.
+    // A four-second lifetime. `usable_at`'s margin is `min(60s, lifetime/2)`, and
+    // expiry is whole seconds, so this is usable for one to two seconds and then
+    // is not. Shorter, and the run itself can outlast it: the material is
+    // checked again once the run has its pools, and acquired a second time.
     ws.write_build_file(
         "auth",
         &format!(
             r#"
 target(name = "t", driver = "auth.credential",
        sources = [heph.auth.exec(["sh", "-c",
-           "echo x >> {c}; printf '{{\"token\":\"v\",\"expires_in\":1}}'"],
+           "echo x >> {c}; printf '{{\"token\":\"v\",\"expires_in\":4}}'"],
            fields = {{"token": "token"}}, expires = "expires_in")],
        present = {{"env": {{"T": "${{token}}"}}}})
 "#,
@@ -1374,7 +1376,7 @@ target(name = "second", driver = "bash", out = "o.txt", cache = False,
             .count(),
         1
     );
-    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(4200)).await;
     ws.run("//app:second").await?;
     assert_eq!(
         std::fs::read_to_string(&counter)
@@ -1647,15 +1649,14 @@ target(name = "t", driver = "auth.credential", sources = ["//auth:fetch"],
     );
 }
 
-/// A credential producer runs without a sandbox permit: it runs inside its
-/// consumer's run, which already holds one. With a single permit, a producer
-/// that waited for its own would wait on its consumer forever.
-#[tokio::test]
-async fn a_credential_producer_runs_with_the_pool_exhausted() -> anyhow::Result<()> {
+/// A workspace whose engine has `permits` sandbox permits and 4 cpus, with
+/// the buildfile provider and the managed bash driver.
+fn permit_ws(permits: usize) -> anyhow::Result<htestkit::Workspace> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().to_path_buf();
     let mut engine = heph::engine::Engine::new(heph::engine::Config {
-        sandbox_permits: Some(1),
+        sandbox_permits: Some(permits),
+        parallelism: Some(4),
         ..heph::engine::Config::for_tests(root.clone())
     })?;
     engine.register_provider(move |init| {
@@ -1670,24 +1671,137 @@ async fn a_credential_producer_runs_with_the_pool_exhausted() -> anyhow::Result<
     })?;
     let engine = Arc::new(engine);
     engine.install_exec_runner_host();
-    let ws = htestkit::Workspace { dir, engine };
+    Ok(htestkit::Workspace { dir, engine })
+}
+
+/// The consumer acquires its credential before it takes a sandbox permit, so
+/// with a single permit the producer gets it, runs, and gives it back before
+/// the consumer asks for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_credential_producer_runs_with_the_pool_exhausted() -> anyhow::Result<()> {
+    let ws = permit_ws(1)?;
     write_nested_producer(&ws);
 
     let res = tokio::time::timeout(NESTED_DEADLINE, ws.run("//app:a"))
         .await
-        .context("the consumer hung: its producer is waiting for the sandbox permit it holds")??;
+        .with_context(|| format!("the consumer hung: {:?}", ws.engine.sandbox_permit_gauge()))??;
     assert_eq!(common::artifact_string(&res), "nested");
     Ok(())
 }
 
-/// A target-sourced credential at `-j 1`: the consumer holds the only cpu
-/// while its producer runs inside its run.
+/// The producer's own uncached dep needs a permit too. Were the producer run
+/// inside its consumer's run, that dep would wait for the one permit the
+/// consumer holds, forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_credential_producer_with_an_uncached_dep_runs_with_one_permit() -> anyhow::Result<()> {
+    let ws = permit_ws(1)?;
+    ws.write_build_file(
+        "auth",
+        r#"
+target(name = "gen", driver = "bash", cache = False, out = "g.txt", run = ["printf x > g.txt"])
+target(name = "fetch", driver = "bash", cache = False, deps = {"g": ["//auth:gen"]},
+       out = {"credential": "cred.json"},
+       run = ["printf '{\"token\":\"nested\",\"expires_in\":600}' > cred.json"])
+target(name = "t", driver = "auth.credential", sources = ["//auth:fetch"],
+       present = {"env": {"T": "${token}"}})
+"#,
+    );
+    ws.write_build_file(
+        "app",
+        r#"target(name = "a", driver = "bash", out = "o.txt", cache = False,
+       credentials = ["//auth:t"], run = ["printf '%s' \"$T\" > o.txt"])"#,
+    );
+
+    let res = tokio::time::timeout(NESTED_DEADLINE, ws.run("//app:a"))
+        .await
+        .with_context(|| format!("the consumer hung: {:?}", ws.engine.sandbox_permit_gauge()))??;
+    assert_eq!(common::artifact_string(&res), "nested");
+    Ok(())
+}
+
+/// A plain run of the producer beside a consumer of its credential, with one
+/// permit. The plain run holds the producer's build lock while it waits for
+/// the permit; a consumer acquiring its credential while holding that permit
+/// would wait for the producer's build lock, and neither would move.
 ///
-/// Hangs today: the consumer's `execute` is admitted before `run` reaches
-/// `acquire_and_present`, and the producer's own `execute` then waits in
-/// `admit` for the cpu its consumer holds.
+/// The interleaving is forced: the consumer's first credential is an `exec`
+/// source parked on a gate, the plain run starts while it is parked, and the
+/// gate opens only once the plain run is waiting for the permit (or done).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_plain_run_of_the_producer_beside_its_consumer_runs_with_one_permit() -> anyhow::Result<()>
+{
+    let ws = permit_ws(1)?;
+    let gates = tempfile::tempdir()?;
+    let parked = gates.path().join("parked");
+    let gate = gates.path().join("open");
+    write_nested_producer(&ws);
+    ws.write_build_file(
+        "gate",
+        &format!(
+            r#"
+target(name = "g", driver = "auth.credential",
+       sources = [heph.auth.exec(["sh", "-c",
+           "touch '{parked}'; while [ ! -e '{gate}' ]; do sleep 0.02; done; printf '{{\"token\":\"g\"}}'"],
+           fields = {{"token": "token"}})],
+       present = {{"env": {{"G": "${{token}}"}}}})
+"#,
+            parked = parked.display(),
+            gate = gate.display(),
+        ),
+    );
+    ws.write_build_file(
+        "app",
+        r#"target(name = "b", driver = "bash", out = "o.txt", cache = False,
+       credentials = ["//gate:g", "//auth:t"], run = ["printf '%s%s' \"$G\" \"$T\" > o.txt"])"#,
+    );
+
+    // Each run on a task of its own, so a run that parks its task cannot
+    // stall the gate opener or the deadline.
+    let ws = Arc::new(ws);
+    let consumer = tokio::spawn({
+        let ws = Arc::clone(&ws);
+        async move { ws.run("//app:b").await }
+    });
+    let scenario = async {
+        let deadline = std::time::Instant::now() + NESTED_DEADLINE;
+        while !parked.exists() {
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "the gate credential never ran"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let plain = tokio::spawn({
+            let ws = Arc::clone(&ws);
+            async move { ws.run("//auth:fetch").await }
+        });
+        while !plain.is_finished() && ws.engine.sandbox_permit_gauge().waiting == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        std::fs::write(&gate, "")?;
+        let plain = plain.await??;
+        let consumer = consumer.await??;
+        anyhow::Ok((consumer, plain))
+    };
+    let (consumer, plain) = tokio::time::timeout(NESTED_DEADLINE, scenario)
+        .await
+        .with_context(|| {
+            format!(
+                "the consumer and the plain run hung: {:?}",
+                ws.engine.sandbox_permit_gauge()
+            )
+        })??;
+    assert_eq!(common::artifact_string(&consumer), "gnested");
+    assert!(
+        common::artifact_string(&plain).contains("nested"),
+        "the plain run built the producer"
+    );
+    Ok(())
+}
+
+/// A target-sourced credential at `-j 1`: the producer is admitted to the
+/// only cpu and gives it back before its consumer asks for it.
 #[tokio::test]
-#[ignore = "deadlock: consumer holds its cpu admission while a credential producer waits for admission at -j 1; tracked separately"]
 async fn a_target_sourced_credential_runs_at_j1() -> anyhow::Result<()> {
     let ws = Workspace::with_parallelism(1);
     write_nested_producer(&ws);

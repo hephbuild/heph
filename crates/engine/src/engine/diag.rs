@@ -1934,6 +1934,7 @@ mod tests {
             declared: None,
             reserved: None,
             queued_ms: None,
+            sandbox_wait_ms: None,
         }));
         hook.on_event(&ev(BuildEventKind::ScratchLockWaitStart {
             addr: "//c:d".into(),
@@ -2522,6 +2523,7 @@ mod tests {
             held: 8,
             waiting: 3,
             pending_removal: 5,
+            oldest_wait: None,
         };
         let line = "waiting for sandbox cleanup: 3 runs waiting, 5 sandboxes pending removal (8/8 \
              permits held)";

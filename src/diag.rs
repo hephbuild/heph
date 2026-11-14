@@ -735,6 +735,7 @@ mod tests {
             held: 4,
             waiting: 1,
             pending_removal: 2,
+            oldest_wait: None,
         });
         let dump = inventory_report(&snapshot, sandboxes);
         assert_eq!(

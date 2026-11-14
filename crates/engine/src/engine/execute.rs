@@ -31,9 +31,6 @@ impl Engine {
         // `outputs_are_material`: this target's outputs are credential material.
         // The one thing it changes is the failure path — see the `Err` arm below.
         outputs_are_material: bool,
-        // Whether a managed run waits for a sandbox permit. `Exempt` only for
-        // a credential producer run inside its consumer's (see the acquire).
-        sandbox_permit: crate::engine::sandbox_permits::SandboxPermitPolicy,
     ) -> anyhow::Result<(
         Vec<OutputArtifact>,
         crate::engine::sandbox_cleaner::SandboxTeardown,
@@ -80,21 +77,6 @@ impl Engine {
             .await
             .with_context(|| format!("acquire scratch for {addr}"))?;
 
-        // Credentials, after scratch and after every dep has resolved.
-        //
-        // The ordering is load-bearing in two directions. **After the cache
-        // decision**, because a cache hit never reaches `execute` at all — which
-        // is what makes "zero cost on a hit" structural rather than aspirational:
-        // a fully cached build probes nothing, spawns nothing and prompts nobody.
-        // And **strictly downstream of runner preparation**, because the devenv
-        // `wrap` runner captures its entire resolved environment into a
-        // `runner.json` that is a cached, remotely-shippable artifact; a runner
-        // capture must never see material.
-        //
-        // Resolution (which declaration does this reference name, and is the set
-        // coherent?) already happened at `get_def`. What happens here is the part
-        // that costs something: walking the chain, acquiring, and writing the
-        // presented files into this run's sandbox.
         // Deferred option values. The producers are already built — they are
         // `hashed` inputs, so `hashin` waited on them — and what is left here is
         // reading their bytes. Inside `execute`, so a cache hit resolves nothing.
@@ -107,25 +89,23 @@ impl Engine {
             .await
             .with_context(|| format!("resolve deferred values for {addr}"))?;
 
-        hcore::hmemoizer::set_phase("execute:credential_acquire");
+        // Resolution (which declaration does each reference name, and is the
+        // set coherent?) already happened at `get_def`; this repeats it on the
+        // finalized def. Acquisition happens in `admit_with_credentials`.
         let resolved_credentials = self
             .resolve_credentials(&rs, addr, &def.target.inputs)
             .await
             .with_context(|| format!("resolve credentials for {addr}"))?;
 
-        // One run of this target at a time, in any process: its sandbox is per
-        // addr. After deps (holding it across a dep's build could deadlock with
-        // a forced rebuild of that dep), before the worker permit (a target
-        // parked here holds no worker). Returned to the caller, which holds it
-        // until the outputs are cached. See `ResultLock::lock_execute`.
-        hcore::hmemoizer::set_phase("execute:execute_lock");
-        let execute_guard = self
-            .acquire_with_notice(
-                &rs,
-                addr,
-                None,
-                self.result_lock().lock_execute(addr, rs.ctoken()),
-            )
+        let Admitted {
+            credentials,
+            execute_guard,
+            sandbox_permit,
+            reservation,
+            sandbox_wait_ms,
+            queued_ms,
+        } = self
+            .admit_with_credentials(&rs, addr, &driver, def, resolved_credentials)
             .await?;
 
         // This target resolves again: its last failure no longer describes it.
@@ -133,43 +113,6 @@ impl Engine {
         // this run fills a slot nothing clears behind it.
         self.failure_slots.clear(addr).await;
 
-        // The sandbox permit: a managed run's sandbox, live and then queued on
-        // the reclaim lane, holds one until its removal returns, so the
-        // sandboxes on disk number at most `S` + the credential producers in
-        // flight (`SandboxPermitPolicy::Exempt`: a producer runs inside its
-        // consumer's run, which already holds a permit — waiting for another
-        // could deadlock a pool its consumers exhausted). Failed sandboxes
-        // kept for diagnostics are outside the bound; see `sandbox_permits`.
-        //
-        // After the execute lock (one run per addr holds its sandbox path,
-        // and a target parked on the lock holds no permit), before the
-        // sandbox dir exists (the claim below), and **before** admission: a
-        // run parked here holds no cpu. Neither order can deadlock — permits
-        // come back from the reclaim lane, which waits on nothing — but after
-        // admission a run stuck behind cleanup would hold cpu it cannot use,
-        // idling the machine on a slow disk. The cost of this order: a run
-        // queued for admission holds a permit for a sandbox not yet created.
-        hcore::hmemoizer::set_phase("execute:sandbox_permit");
-        let sandbox_permit = match sandbox_permit {
-            crate::engine::sandbox_permits::SandboxPermitPolicy::Bounded if driver.managed => Some(
-                self.sandbox_permits
-                    .acquire(addr, rs.ctoken())
-                    .await
-                    .with_context(|| format!("sandbox permit for {addr}"))?,
-            ),
-            crate::engine::sandbox_permits::SandboxPermitPolicy::Bounded
-            | crate::engine::sandbox_permits::SandboxPermitPolicy::Exempt => None,
-        };
-
-        // Admission AFTER dep resolution so nothing is reserved while waiting for
-        // deps — prevents the classic diamond deadlock where mid-nodes hold
-        // capacity while waiting for a leaf that also needs some.
-        hcore::hmemoizer::set_phase("execute:semaphore_acquire");
-        let admit_started = std::time::Instant::now();
-        let reservation = self.admit(&rs, addr, &def.target.demand).await?;
-        // On `ExecuteStart`, so a wait under the notice threshold (which
-        // announces nothing) is still answerable from the stream.
-        let queued_ms = u64::try_from(admit_started.elapsed().as_millis()).unwrap_or(u64::MAX);
         // Counted once the reservation is actually in hand.
         let _running = crate::engine::diag::RunningPermit::new();
         let allotment = allotment_of(&reservation, |pool| self.pools.unit(pool));
@@ -192,6 +135,7 @@ impl Engine {
             &def.target.demand,
             &reservation,
             queued_ms,
+            sandbox_wait_ms,
         );
         // Held until the run ends; a failed run hands it back before keeping
         // what it failed with (D17).
@@ -265,7 +209,7 @@ impl Engine {
                             inputs: deps_result,
                             hashin: hashin.to_owned(),
                             scratch: scratch_mounts,
-                            credentials: resolved_credentials,
+                            credentials,
                             deferred,
                             wrapper: exec_wrapper,
                             shell,
@@ -510,9 +454,10 @@ impl Engine {
         // directory this run owns and its teardown deletes them whatever the
         // outcome — including a build's failure path, which deliberately keeps
         // the rest of the sandbox for diagnostics. The log tail is what makes
-        // that useful, not the token.
+        // that useful, not the token. Only presented: the material was
+        // acquired before the run took any pool (`acquire_credentials`).
         let (credential_mounts, _credential_teardown) = self
-            .acquire_and_present(rs, addr, &sandbox_dir, &credentials)
+            .present_credentials(rs, addr, &sandbox_dir, &credentials)
             .await
             .with_context(|| format!("credentials for {addr}"))?;
         let exec_wrapper: InteractiveWrapper = wrapper.unwrap_or_else(|| {
@@ -628,6 +573,137 @@ impl Engine {
 
         let results = crate::engine::fanout::join_all_failable(futs, fail_fast).await?;
         Ok(results.into_iter().flatten().collect())
+    }
+
+    /// Everything a run takes before its sandbox exists, in the one order
+    /// that cannot deadlock: credential material, the execute lock, a sandbox
+    /// permit (managed drivers only), then admission.
+    ///
+    /// **Material before all three.** Acquiring can build — a producer source
+    /// is an `execute` of its own, needing its deps, the producer's gateway
+    /// and execute lock, a sandbox permit and cpu — so a run holding any of
+    /// its own while it acquires can wait on itself:
+    ///
+    /// - the execute lock is a leaf (`ResultLock::lock_execute`): nothing is
+    ///   acquired under it, and a producer's gateway would be;
+    /// - the producer, or a dep of it, waits for the permit or the cpu its
+    ///   consumer holds — at once with one permit, or at `-j 1`;
+    /// - a plain run of the producer holds the producer's gateway while it
+    ///   waits for a permit the consumer holds, and the consumer waits for
+    ///   that gateway.
+    ///
+    /// Acquiring first, the consumer holds only what its caller does (its
+    /// result lock, its scratch slots), none of which a producer's build
+    /// takes.
+    ///
+    /// **The permit after the execute lock** (one run per addr owns its
+    /// sandbox path, and a target parked on the lock holds no permit) and
+    /// **before admission**, so a run parked on cleanup holds no cpu. Permits
+    /// come back from the reclaim lane, which waits on nothing, so the wait
+    /// ends; after admission, a run stuck behind cleanup would hold cpu it
+    /// cannot use, idling the machine on a slow disk. The cost of this order:
+    /// a run queued for admission holds a permit for a sandbox not yet made.
+    ///
+    /// **Material that lapsed while the run waited** (expired, or inside its
+    /// skew margin) is acquired again with all three handed back first:
+    /// re-acquiring while holding them is the deadlock above. Bounded —
+    /// material whose lifetime is shorter than the wait fails the run naming
+    /// the credential instead of looping.
+    async fn admit_with_credentials(
+        self: &Arc<Self>,
+        rs: &Arc<RequestState>,
+        addr: &Addr,
+        driver: &crate::engine::engine::Driver,
+        def: &LinkedTargetDef,
+        resolved: Vec<crate::engine::ResolvedCredential>,
+    ) -> anyhow::Result<Admitted> {
+        /// Acquisitions before a run whose material keeps lapsing fails.
+        const MAX_CREDENTIAL_ROUNDS: usize = 3;
+        let elapsed_ms = |since: std::time::Instant| {
+            u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)
+        };
+        let mut resolved = resolved;
+        let mut round = 0;
+        loop {
+            round += 1;
+            hcore::hmemoizer::set_phase("execute:credential_acquire");
+            let credentials = self
+                .acquire_credentials(rs, addr, resolved)
+                .await
+                .with_context(|| format!("credentials for {addr}"))?;
+
+            // One run of this target at a time, in any process: its sandbox
+            // is per addr. After deps and credentials (holding it across a
+            // build could deadlock with a forced rebuild of that build).
+            // Returned to the caller, which holds it until the outputs are
+            // cached. See `ResultLock::lock_execute`.
+            hcore::hmemoizer::set_phase("execute:execute_lock");
+            let execute_guard = self
+                .acquire_with_notice(
+                    rs,
+                    addr,
+                    None,
+                    self.result_lock().lock_execute(addr, rs.ctoken()),
+                )
+                .await?;
+
+            // A managed run's sandbox, live and then queued on the reclaim
+            // lane, holds a permit until its removal returns, so the
+            // sandboxes on disk number at most `S`. Failed sandboxes kept for
+            // diagnostics are outside the bound; see `sandbox_permits`.
+            hcore::hmemoizer::set_phase("execute:sandbox_permit");
+            let (sandbox_permit, sandbox_wait_ms) = if driver.managed {
+                let started = std::time::Instant::now();
+                let permit = self
+                    .sandbox_permits
+                    .acquire(addr, rs.ctoken())
+                    .await
+                    .with_context(|| format!("waiting for a sandbox for {addr}"))?;
+                (Some(permit), Some(elapsed_ms(started)))
+            } else {
+                (None, None)
+            };
+
+            // Admission AFTER dep resolution so nothing is reserved while
+            // waiting for deps — prevents the classic diamond deadlock where
+            // mid-nodes hold capacity while waiting for a leaf that also needs
+            // some.
+            hcore::hmemoizer::set_phase("execute:semaphore_acquire");
+            let admit_started = std::time::Instant::now();
+            let reservation = self.admit(rs, addr, &def.target.demand).await?;
+            // On `ExecuteStart`, so a wait under the notice threshold (which
+            // announces nothing) is still answerable from the stream.
+            let queued_ms = elapsed_ms(admit_started);
+
+            let Some(lapsed) = credentials.lapsed(std::time::SystemTime::now()) else {
+                return Ok(Admitted {
+                    credentials,
+                    execute_guard,
+                    sandbox_permit,
+                    reservation,
+                    sandbox_wait_ms,
+                    queued_ms,
+                });
+            };
+            if round >= MAX_CREDENTIAL_ROUNDS {
+                anyhow::bail!(
+                    "credential {lapsed} expired while {addr} waited to start, {round} times in a \
+                     row: its material lives shorter than the wait for a sandbox and cpu. Give it \
+                     a longer lifetime (`ttl`, or what its source reports), or build fewer \
+                     targets at once"
+                );
+            }
+            tracing::debug!(
+                addr = %addr,
+                credential = %lapsed,
+                round,
+                "credential material lapsed while the run waited to start; acquiring it again"
+            );
+            drop(reservation);
+            drop(sandbox_permit);
+            drop(execute_guard);
+            resolved = credentials.into_resolved();
+        }
     }
 
     /// Reserve what `addr` declares (`resources`; an undeclared `cpu` is one
@@ -767,6 +843,20 @@ impl<'l> SandboxLease<'l> {
     }
 }
 
+/// What [`Engine::admit_with_credentials`] took for one run, in the order it
+/// took them.
+struct Admitted {
+    credentials: crate::engine::credential::HeldCredentials,
+    execute_guard: crate::engine::result_lock::ExecuteGuard,
+    /// `None` for a non-managed driver, which makes no sandbox.
+    sandbox_permit: Option<crate::engine::sandbox_permits::SandboxPermit>,
+    reservation: crate::engine::resource_pool::Reservation,
+    /// How long the permit took; `None` when none was taken.
+    sandbox_wait_ms: Option<u64>,
+    /// How long admission took.
+    queued_ms: u64,
+}
+
 /// Everything [`Engine::run_in_sandbox`] needs besides the lease.
 pub(crate) struct SandboxRun {
     pub driver: Arc<crate::engine::engine::Driver>,
@@ -774,7 +864,8 @@ pub(crate) struct SandboxRun {
     pub inputs: Vec<RunInput>,
     pub hashin: String,
     pub scratch: Vec<crate::engine::driver::ScratchMount>,
-    pub credentials: Vec<crate::engine::ResolvedCredential>,
+    /// Acquired before the run took any pool; presented by `run_in_sandbox`.
+    pub credentials: crate::engine::credential::HeldCredentials,
     pub deferred: std::collections::BTreeMap<String, crate::engine::driver::DeferredValue>,
     pub wrapper: Option<InteractiveWrapper>,
     pub shell: bool,
@@ -858,8 +949,9 @@ pub(crate) fn entrypoint_allotment(
 
 /// The `ExecuteStart` event: what the target declared (only its declared
 /// keys, in each pool's unit's base) and what it was granted, after
-/// clamping, and how long admission took. `reserved` always carries `cpu`, 0
-/// on a zero-cost grant.
+/// clamping, how long admission took, and how long the run waited for a
+/// sandbox (`None` for a run that takes no sandbox permit). `reserved` always
+/// carries `cpu`, 0 on a zero-cost grant.
 pub(crate) fn execute_start(
     addr: String,
     driver: String,
@@ -867,6 +959,7 @@ pub(crate) fn execute_start(
     declared: &hplugin::driver::Demand,
     reservation: &crate::engine::resource_pool::Reservation,
     queued_ms: u64,
+    sandbox_wait_ms: Option<u64>,
 ) -> crate::engine::event::BuildEventKind {
     use hplugin::provider::PoolName;
     let declared = declared
@@ -885,6 +978,7 @@ pub(crate) fn execute_start(
         declared: Some(declared),
         reserved: Some(reserved),
         queued_ms: Some(queued_ms),
+        sandbox_wait_ms,
     }
 }
 
@@ -942,17 +1036,27 @@ mod tests {
             ],
             &declared,
         );
-        let ev = execute_start("//p:t".into(), "exec".into(), true, &declared, &r, 7);
+        let ev = execute_start(
+            "//p:t".into(),
+            "exec".into(),
+            true,
+            &declared,
+            &r,
+            7,
+            Some(3),
+        );
         let BuildEventKind::ExecuteStart {
             declared,
             reserved,
             queued_ms,
+            sandbox_wait_ms,
             ..
         } = ev
         else {
             panic!("wrong variant: {ev:?}");
         };
         assert_eq!(queued_ms, Some(7));
+        assert_eq!(sandbox_wait_ms, Some(3));
         assert_eq!(
             declared,
             Some(std::collections::BTreeMap::from([("cpu".into(), 16 * CPU)]))
@@ -970,7 +1074,7 @@ mod tests {
         let declared = req(&[("cpu", 0)]);
         let r = grant(&[("cpu", Limit::Bounded(4 * CPU))], &declared);
         let BuildEventKind::ExecuteStart { reserved, .. } =
-            execute_start("//p:t".into(), "exec".into(), true, &declared, &r, 0)
+            execute_start("//p:t".into(), "exec".into(), true, &declared, &r, 0, None)
         else {
             panic!("wrong variant");
         };

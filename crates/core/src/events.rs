@@ -283,6 +283,14 @@ pub enum BuildEventKind {
         /// (an entrypoint).
         #[serde(default)]
         queued_ms: Option<u64>,
+        /// How long the target waited for a sandbox, in milliseconds, before
+        /// admission: the wait for sandbox cleanup when every sandbox the
+        /// engine allows on disk is live or awaiting removal. Set for every
+        /// run that takes one (a managed driver's), 0 when one was free.
+        /// `None` from a host that predates it, and for a run that makes no
+        /// sandbox (a non-managed driver, an entrypoint).
+        #[serde(default)]
+        sandbox_wait_ms: Option<u64>,
     },
     ExecuteEnd {
         addr: String,
@@ -781,6 +789,7 @@ pub mod test_support {
             declared: None,
             reserved: None,
             queued_ms: None,
+            sandbox_wait_ms: None,
         };
         let end = |addr: &str| BuildEventKind::ResultEnd {
             addr: addr.to_string(),
@@ -1044,6 +1053,7 @@ mod tests {
                 declared: Some(BTreeMap::from([("cpu".into(), 16_000_000)])),
                 reserved: Some(BTreeMap::from([("cpu".into(), 4_000_000)])),
                 queued_ms: Some(1500),
+                sandbox_wait_ms: None,
             },
         };
         let back: BuildEvent =

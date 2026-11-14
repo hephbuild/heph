@@ -14,8 +14,12 @@
 //! [`SandboxTeardown`](crate::engine::sandbox_cleaner::SandboxTeardown) into
 //! the reclaim job, which drops it once the removal has returned. So at any
 //! moment the live and pending-removal sandboxes together number at most the
-//! capacity `S` — plus the credential producers in flight, which run exempt
-//! (see [`SandboxPermitPolicy`]).
+//! capacity `S`.
+//!
+//! Every managed run takes one, a credential producer's included: a consumer
+//! acquires its credentials before it takes its own permit
+//! (`Engine::admit_with_credentials`), so no run ever waits for a permit
+//! while it holds one.
 //!
 //! Outside the bound, deliberately: a failed target's sandbox kept for its
 //! diagnostic (`leave_for_diagnostics` drops the permit at once; there is at
@@ -33,19 +37,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// Whether an execute takes a sandbox permit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SandboxPermitPolicy {
-    /// Every execute but one: a managed driver's run waits for a permit.
-    Bounded,
-    /// A credential producer run from inside a consumer's run
-    /// (`material_from_producer`). The consumer already holds a permit and its
-    /// sandbox; were the producer to wait for one, a pool exhausted by such
-    /// consumers would never free one. The bound becomes `S` + the producers
-    /// in flight.
-    Exempt,
-}
-
 /// The engine's pool of sandbox permits. Cheap to clone; clones share the pool.
 #[derive(Clone)]
 pub struct SandboxPermits {
@@ -55,8 +46,12 @@ pub struct SandboxPermits {
 struct Inner {
     sem: Arc<tokio::sync::Semaphore>,
     capacity: usize,
-    /// Executes parked in [`SandboxPermits::acquire`].
-    waiting: AtomicUsize,
+    /// Executes parked in [`SandboxPermits::acquire`], by arrival, with when
+    /// each parked: the first entry is the oldest wait. Touched only on the
+    /// slow path, by a run that is about to park anyway.
+    waiting: parking_lot::Mutex<std::collections::BTreeMap<u64, std::time::Instant>>,
+    /// The next arrival number for `waiting`.
+    arrivals: std::sync::atomic::AtomicU64,
     /// Permits whose sandbox has been handed to the reclaim lane.
     pending_removal: AtomicUsize,
     /// How long a reclaim job sleeps before its removal, in milliseconds: a
@@ -73,6 +68,7 @@ impl std::fmt::Debug for SandboxPermits {
             .field("held", &g.held)
             .field("waiting", &g.waiting)
             .field("pending_removal", &g.pending_removal)
+            .field("oldest_wait", &g.oldest_wait)
             .finish()
     }
 }
@@ -88,18 +84,23 @@ pub struct SandboxPermitGauge {
     pub waiting: usize,
     /// Sandboxes handed to the reclaim lane and not yet removed.
     pub pending_removal: usize,
+    /// How long the longest-waiting run has waited; `None` when none waits.
+    pub oldest_wait: Option<std::time::Duration>,
 }
 
 impl SandboxPermits {
-    /// A pool of `capacity` permits; 0 is raised to 1, since a pool of none
-    /// would park every managed run forever.
+    /// A pool of `capacity` permits. 0 is raised to 1, since a pool of none
+    /// would park every managed run forever, and anything over
+    /// [`Semaphore::MAX_PERMITS`](tokio::sync::Semaphore::MAX_PERMITS) is
+    /// lowered to it, since tokio panics past it.
     pub fn new(capacity: usize) -> Self {
-        let capacity = capacity.max(1);
+        let capacity = capacity.clamp(1, tokio::sync::Semaphore::MAX_PERMITS);
         Self {
             inner: Arc::new(Inner {
                 sem: Arc::new(tokio::sync::Semaphore::new(capacity)),
                 capacity,
-                waiting: AtomicUsize::new(0),
+                waiting: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
+                arrivals: std::sync::atomic::AtomicU64::new(0),
                 pending_removal: AtomicUsize::new(0),
                 #[cfg(any(test, feature = "test-support"))]
                 removal_delay_ms: std::sync::atomic::AtomicU64::new(0),
@@ -113,11 +114,19 @@ impl SandboxPermits {
 
     pub fn gauge(&self) -> SandboxPermitGauge {
         let available = self.inner.sem.available_permits();
+        let (waiting, oldest_wait) = {
+            let waiting = self.inner.waiting.lock();
+            (
+                waiting.len(),
+                waiting.values().next().map(std::time::Instant::elapsed),
+            )
+        };
         SandboxPermitGauge {
             capacity: self.inner.capacity,
             held: self.inner.capacity.saturating_sub(available),
-            waiting: self.inner.waiting.load(Ordering::Relaxed),
+            waiting,
             pending_removal: self.inner.pending_removal.load(Ordering::Relaxed),
+            oldest_wait,
         }
     }
 
@@ -132,8 +141,9 @@ impl SandboxPermits {
     }
 
     /// Take a permit for `addr`, parking until one is free. Returns
-    /// [`CancelledError`](hplugin::error::CancelledError) as soon as `ctoken`
-    /// is cancelled, so a cancelled request never waits on the reclaim lane.
+    /// [`CancelledError`](hplugin::error::CancelledError) when `ctoken` is
+    /// already cancelled or is cancelled during the wait, so a cancelled
+    /// request neither starts a sandbox nor waits on the reclaim lane.
     /// Dropping the future mid-wait leaves the queue (tokio's semaphore).
     pub(crate) async fn acquire(
         &self,
@@ -141,6 +151,9 @@ impl SandboxPermits {
         ctoken: &hcore::hasync::StdCancellationToken,
     ) -> anyhow::Result<SandboxPermit> {
         use hcore::hasync::Cancellable;
+        if ctoken.is_cancelled() {
+            return Err(anyhow::Error::new(hplugin::error::CancelledError));
+        }
         let sem = Arc::clone(&self.inner.sem);
         let permit = match sem.try_acquire_owned() {
             Ok(permit) => permit,
@@ -151,7 +164,7 @@ impl SandboxPermits {
                     addr = %addr,
                     capacity = self.inner.capacity,
                     pending_removal = self.inner.pending_removal.load(Ordering::Relaxed),
-                    "waiting for sandbox cleanup: every sandbox permit is held"
+                    "waiting for sandbox cleanup: every sandbox is in use"
                 );
                 tokio::select! {
                     () = ctoken.cancelled() => {
@@ -173,18 +186,25 @@ impl SandboxPermits {
 
 /// Counts one parked acquire for as long as it lives, so a cancelled or
 /// dropped wait leaves the count exactly as a granted one does.
-struct Waiting<'a>(&'a Inner);
+struct Waiting<'a> {
+    inner: &'a Inner,
+    arrival: u64,
+}
 
 impl<'a> Waiting<'a> {
     fn enter(inner: &'a Inner) -> Self {
-        inner.waiting.fetch_add(1, Ordering::Relaxed);
-        Self(inner)
+        let arrival = inner.arrivals.fetch_add(1, Ordering::Relaxed);
+        inner
+            .waiting
+            .lock()
+            .insert(arrival, std::time::Instant::now());
+        Self { inner, arrival }
     }
 }
 
 impl Drop for Waiting<'_> {
     fn drop(&mut self) {
-        self.0.waiting.fetch_sub(1, Ordering::Relaxed);
+        self.inner.waiting.lock().remove(&self.arrival);
     }
 }
 
@@ -357,5 +377,56 @@ mod tests {
     #[test]
     fn a_pool_of_zero_is_a_pool_of_one() {
         assert_eq!(SandboxPermits::new(0).capacity(), 1);
+    }
+
+    /// `sandbox_permits: <huge>` in a config would panic tokio's semaphore.
+    #[test]
+    fn a_pool_past_the_semaphore_maximum_is_clamped() {
+        assert_eq!(
+            SandboxPermits::new(usize::MAX).capacity(),
+            tokio::sync::Semaphore::MAX_PERMITS
+        );
+    }
+
+    /// The fast path does not outrun cancellation: a cancelled request starts
+    /// no sandbox even with every permit free.
+    #[tokio::test]
+    async fn an_already_cancelled_token_takes_no_permit() {
+        let pool = SandboxPermits::new(1);
+        let token = hcore::hasync::StdCancellationToken::new();
+        token.cancel();
+        let err = pool.acquire(&addr(), &token).await.expect_err("cancelled");
+        assert!(hplugin::error::is_cancelled(&err), "{err:#}");
+        assert_eq!(pool.gauge().held, 0);
+    }
+
+    /// The oldest wait is reported while a run is parked, and cleared once
+    /// none is.
+    #[tokio::test]
+    async fn the_oldest_wait_is_reported_while_parked() {
+        let pool = SandboxPermits::new(1);
+        let token = hcore::hasync::StdCancellationToken::new();
+        let first = pool.acquire(&addr(), &token).await.expect("first");
+        assert_eq!(pool.gauge().oldest_wait, None);
+        let waiter = tokio::spawn({
+            let pool = pool.clone();
+            let token = token.clone();
+            async move { pool.acquire(&addr(), &token).await.map(drop) }
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while pool.gauge().waiting != 1 {
+            assert!(std::time::Instant::now() < deadline, "never parked");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let oldest = pool.gauge().oldest_wait.expect("a run is parked");
+        assert!(oldest >= Duration::from_millis(20), "{oldest:?}");
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(10), waiter)
+            .await
+            .expect("granted on release")
+            .expect("join")
+            .expect("acquire");
+        assert_eq!(pool.gauge().oldest_wait, None);
     }
 }
