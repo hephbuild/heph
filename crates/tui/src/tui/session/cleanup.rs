@@ -56,7 +56,17 @@ pub struct CleanupReport {
     /// Directories skipped because their lock is held (or another cleanup has
     /// it).
     pub live: usize,
+    /// Stale tombs removed: see [`TOMB_PREFIX`].
+    pub tombs: usize,
 }
+
+/// The name prefix of a session directory being removed (`.removing-<id>-<pid>`):
+/// [`remove`] renames it there first, then deletes it. A tomb outlives that only
+/// when the delete failed or the process died in it, and nothing else ever
+/// reads one, so a tomb last written longer than [`Retention::max_age`] ago is
+/// removed outright. One a cleanup is removing right now may be removed by
+/// two at once, which costs a `debug!` and nothing else.
+const TOMB_PREFIX: &str = ".removing-";
 
 /// Remove the ended sessions `retention` does not keep, under `root`, as of
 /// `now`. Per-directory failures are skipped (a vanished directory is another
@@ -66,17 +76,33 @@ pub fn cleanup(
     now: SystemTime,
     retention: Retention,
 ) -> std::io::Result<CleanupReport> {
-    let mut sessions: Vec<(SessionId, PathBuf)> = std::fs::read_dir(root)?
-        .filter_map(Result::ok)
-        .filter_map(|e| {
-            let id = SessionId::parse(e.file_name().to_str()?).ok()?;
-            Some((id, e.path()))
-        })
-        .collect();
+    let mut sessions: Vec<(SessionId, PathBuf)> = Vec::new();
+    let mut tombs: Vec<PathBuf> = Vec::new();
+    for entry in std::fs::read_dir(root)?.filter_map(Result::ok) {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with(TOMB_PREFIX) {
+            tombs.push(entry.path());
+        } else if let Ok(id) = SessionId::parse(name) {
+            sessions.push((id, entry.path()));
+        }
+    }
     // Newest first: an id sorts by start time.
     sessions.sort_by_key(|s| std::cmp::Reverse(s.0));
 
     let mut report = CleanupReport::default();
+    for tomb in tombs {
+        let (last_write, _) = last_write_and_size(&tomb);
+        if now.duration_since(last_write).unwrap_or(Duration::ZERO) < retention.max_age {
+            continue;
+        }
+        match std::fs::remove_dir_all(&tomb) {
+            Ok(()) => report.tombs += 1,
+            Err(err) => {
+                tracing::debug!(dir = %tomb.display(), error = %err, "cannot remove a stale tomb");
+            }
+        }
+    }
 
     // Classify, newest first, from the lock and metadata alone. Every directory
     // is probed: the byte budget counts the newest ended sessions too, and only
@@ -168,7 +194,7 @@ fn remove(root: &Path, e: &Ended) -> bool {
     // removed once even when another cleanup reached it after its lock file
     // was already unlinked by the first. The name is not an id, so no cleanup
     // or viewer reads it as a session.
-    let tomb = root.join(format!(".removing-{}-{}", e.id, std::process::id()));
+    let tomb = root.join(format!("{TOMB_PREFIX}{}-{}", e.id, std::process::id()));
     let removed = match std::fs::rename(&e.dir, &tomb) {
         Ok(()) => {
             if let Err(err) = std::fs::remove_dir_all(&tomb) {
@@ -373,6 +399,26 @@ mod tests {
         let report = cleanup(root.path(), now + 60 * MIN, Retention::default()).expect("cleanup");
         assert_eq!(report.removed, vec![id]);
         assert_eq!(remaining(root.path()), vec!["not-a-session".to_owned()]);
+    }
+
+    /// A tomb left by a removal that failed or died is removed once it is
+    /// older than retention, and kept before that (a cleanup may be removing
+    /// it right now).
+    #[test]
+    fn cleanup_removes_stale_tombs() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let now = SystemTime::now();
+        let tomb = root.path().join(format!("{TOMB_PREFIX}{}-42", SessionId::new(1, 1)));
+        std::fs::create_dir(&tomb).expect("mkdir");
+        std::fs::write(tomb.join(files::EVENTS), b"x").expect("events");
+
+        let report = cleanup(root.path(), now, Retention::default()).expect("cleanup");
+        assert_eq!(report.tombs, 0);
+        assert!(tomb.exists(), "a fresh tomb is kept");
+
+        let report = cleanup(root.path(), now + 60 * MIN, Retention::default()).expect("cleanup");
+        assert_eq!(report.tombs, 1);
+        assert!(remaining(root.path()).is_empty(), "the stale tomb is gone");
     }
 
     /// Two sessions starting at once both clean: neither errors, each dead
