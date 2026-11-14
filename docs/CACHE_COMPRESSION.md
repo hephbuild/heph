@@ -45,6 +45,13 @@ versions can share a cache directory or a bucket.
 
 - Locally, this version still reads v1 revisions, so an upgrade keeps the cache
   warm. GC deletes both manifests and the blobs each one names.
+- It never writes a v1 manifest. When the `in_place` fixpoint copies a v1
+  revision to a new key, the copy is a v2 revision: each blob is copied
+  verbatim to its `.raw` name, so the v2 manifest names no bare blob.
+- A local v1 manifest can name blobs that are not local: an older heph
+  mirrored it from the remote and fetched blobs lazily. This version cannot
+  fetch them, since the remote holds only v2 names now, so it rebuilds the
+  target.
 - On the remote, v1 (gzip) entries are not read. A fallback would add a round
   trip to every miss. The remote is cold once after an upgrade.
 

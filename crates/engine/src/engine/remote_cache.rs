@@ -97,8 +97,8 @@ pub(crate) const REVISION_BLOB_CONCURRENCY: usize = 32;
 /// Max background upload *tasks* in flight process-wide.
 ///
 /// [`Engine::spawn_remote_upload`] detaches one task per newly-cached target, so
-/// without a bound a wide build spawns hundreds at once. Each holds every one of
-/// its gzipped blobs as a temp file for its whole lifetime, and competes with the
+/// without a bound a wide build spawns hundreds at once. Each holds a copy of
+/// every one of its blobs as a temp file for its whole lifetime, and competes with the
 /// critical-path *pulls* for the same per-cache request budget
 /// ([`RemoteCacheDef::concurrency`]). Capping the task count bounds temp-disk use
 /// and keeps pushes — which are pure background work — from crowding out the
@@ -125,7 +125,7 @@ const UPLOAD_DEADLINE: Duration = Duration::from_secs(30 * 60);
 /// deadline of its own but stays fresh because a progressing transfer keeps
 /// advancing the temp's mtime, and a *stalled* one is killed by the backend's
 /// inactivity bound (see [`RemoteCacheBackend`]). Past that, plus the gap between
-/// the last byte and the decode, a file can only be residue from a run
+/// the last byte and the copy into the local cache, a file can only be residue from a run
 /// hard-killed before its [`TempBlob`] could be dropped.
 ///
 /// The value sits far above that floor on purpose, because the two directions are
@@ -142,10 +142,10 @@ const UPLOAD_DEADLINE: Duration = Duration::from_secs(30 * 60);
 /// what every pre-fix run left behind.
 const TEMP_SWEEP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// Permits for the synchronous compress/decompress + local-cache I/O that
-/// brackets every transfer.
+/// Permits for the synchronous local-cache I/O that brackets every transfer
+/// (blobs cross verbatim; nothing is compressed or decompressed here).
 ///
-/// That work is CPU-bound and runs on the blocking pool (see
+/// That work is blocking and runs on the blocking pool (see
 /// [`run_codec`]), so it is capped at the core count: enough to keep every core
 /// busy, few enough that it can't drain the blocking pool that `tokio::fs` also
 /// draws from.
@@ -157,11 +157,11 @@ static CODEC_SLOTS: LazyLock<Semaphore> = LazyLock::new(|| {
     )
 });
 
-/// Run the synchronous codec step (gzip/gunzip plus local-cache reads/writes)
-/// through `hcore::blocking::run`, bounded by [`CODEC_SLOTS`].
+/// Run the synchronous transfer step (copying a blob between the local cache
+/// and a temp file) through `hcore::blocking::run`, bounded by [`CODEC_SLOTS`].
 ///
-/// It must **not** run on a runtime worker. Compressing or decompressing a
-/// revision takes hundreds of milliseconds to seconds of straight CPU; with
+/// It must **not** run on a runtime worker. Copying a revision's blobs is
+/// blocking I/O that takes hundreds of milliseconds to seconds; with
 /// hundreds of targets pulling and pushing at once, doing it inline occupies
 /// every worker thread and the runtime stops polling *everything* — in-flight
 /// transfers, their inactivity deadlines, the TUI. The build looks hung even
@@ -214,7 +214,7 @@ const TEMP_BLOB_EXT: &str = "blob";
 /// the request was cancelled, or the whole background push was abandoned at
 /// [`UPLOAD_DEADLINE`]. A [`run_codec`] closure that nobody is waiting for is the
 /// sharp case — it still runs to completion on the blocking pool, so the
-/// abandoned encode leaves behind a *complete* file. Nothing else deletes these
+/// abandoned copy leaves behind a *complete* file. Nothing else deletes these
 /// (the age-gated [`sweep_abandoned_temps`] is a crash backstop, not a mechanism),
 /// so a missed path is disk that leaks past the process.
 #[derive(Debug)]
@@ -1298,8 +1298,8 @@ impl RemoteCacheSet {
     }
 
     /// Stream a full revision to every writable cache. `blobs` gives each
-    /// artifact's name and the temp file holding its (already gzip-compressed)
-    /// bytes. Within a cache all blobs upload concurrently and the manifest is
+    /// artifact's name and the temp file holding its bytes as the local cache
+    /// stores them. Within a cache all blobs upload concurrently and the manifest is
     /// written *last*; across caches the work runs in parallel. Best-effort: a
     /// failing cache logs a warning and does not fail the build.
     pub(crate) async fn put_revision(
@@ -1504,8 +1504,8 @@ impl RemoteCacheSet {
     }
 
     /// Stream one blob of `rev` from the cache that served its manifest into a
-    /// temp file under `dest_dir`, still in its on-remote encoding (the engine
-    /// decodes it into the local cache — see [`Engine::pull_remote_blobs`]).
+    /// temp file under `dest_dir`, as stored (the engine copies it verbatim into
+    /// the local cache — see [`Engine::pull_remote_blobs`]).
     ///
     /// `Ok(None)` when the cache no longer has the object, the transfer failed
     /// (already noted on the cache), or the request was cancelled — all of which
@@ -1908,7 +1908,7 @@ impl Engine {
         });
     }
 
-    /// The directory for transient gzip temp files — alongside the cache, so temp
+    /// The directory for transient transfer temp files — alongside the cache, so temp
     /// and final live on the same filesystem — created, and swept once per engine
     /// of anything a previous run abandoned.
     ///
@@ -1947,7 +1947,7 @@ impl Engine {
     }
 
     /// Push a just-cached revision to the writable remote caches. Reads the
-    /// local manifest + blobs, gzip-compresses each blob into a temp file, and
+    /// local manifest + blobs, copies each blob as stored into a temp file, and
     /// streams them up. Best-effort — never fails the build.
     pub(crate) async fn upload_to_remote(self: &Arc<Self>, addr: &Addr, hashin: &str) {
         if self.remote_caches.is_empty() || !self.remote_caches.has_writable() {
@@ -1987,7 +1987,7 @@ impl Engine {
         // single closure over every artifact holds one [`CODEC_SLOTS`] permit for
         // the entire revision and copies it serially, so a wide revision would
         // use one core while a critical-path download queues behind it.
-        let encodes: Vec<_> = manifest
+        let copies: Vec<_> = manifest
             .artifacts
             .iter()
             .map(|a| {
@@ -2020,13 +2020,13 @@ impl Engine {
             .collect();
         // Bounded so a revision with thousands of artifacts doesn't open a temp
         // file per artifact at once; `CODEC_SLOTS` bounds the CPU underneath.
-        let prepared: Vec<(String, TempBlob, ManifestArtifactEncoding)> = stream::iter(encodes)
+        let prepared: Vec<(String, TempBlob, ManifestArtifactEncoding)> = stream::iter(copies)
             .buffered(REVISION_BLOB_CONCURRENCY)
             .try_collect()
             .await?;
 
-        // Build the remote manifest from the local one plus the per-artifact
-        // encodings just chosen.
+        // Build the remote manifest from the local one, each artifact keeping
+        // the encoding its blob is stored in.
         let remote_manifest = RemoteManifest {
             version: REMOTE_MANIFEST_VERSION.to_string(),
             target: manifest.target.clone(),
@@ -2057,7 +2057,7 @@ impl Engine {
             .put_revision(addr, hashin, &manifest_bytes, &temps)
             .await;
 
-        // `prepared` still owns every `TempBlob`, so the encodes are unlinked
+        // `prepared` still owns every `TempBlob`, so the copies are unlinked
         // here — and equally on each `?` above, and if this whole push is
         // abandoned at `UPLOAD_DEADLINE` mid-`put_revision`.
         drop(prepared);
@@ -2176,16 +2176,16 @@ impl Engine {
         Ok(served.into_iter().all(|ok| ok))
     }
 
-    /// Stream one blob into a temp file, then decode it into the local cache. The
-    /// temp file is dropped on both paths. `Ok(false)` if the remote could not
-    /// serve it — see [`Self::pull_remote_blobs`].
+    /// Stream one blob into a temp file, then copy it verbatim into the local
+    /// cache. The temp file is dropped on both paths. `Ok(false)` if the remote
+    /// could not serve it — see [`Self::pull_remote_blobs`].
     ///
-    /// The [`TempBlob`] is handed **into** the decode closure rather than held
+    /// The [`TempBlob`] is handed **into** the copy closure rather than held
     /// here. Once [`run_codec`] has queued the job it runs whatever the caller
     /// does, so a guard left on this side would unlink the temp out from under a
-    /// decode that is about to read it — turning a served blob into a spurious
-    /// decode failure. (The local-cache writer commits only on success, so the
-    /// failed decode at least discards rather than publishing a truncated blob.)
+    /// copy that is about to read it — turning a served blob into a spurious
+    /// read failure. (The local-cache writer commits only on success, so the
+    /// failed copy at least discards rather than publishing a truncated blob.)
     async fn pull_remote_blob(
         &self,
         ctoken: &dyn Cancellable,
@@ -3703,7 +3703,7 @@ mod tests {
 
     /// The sharp edge of the blocking pool: a `run_codec` closure runs to
     /// completion whether or not anyone still wants the answer, so an abandoned
-    /// encode finishes writing a *complete* temp file after its future is gone.
+    /// copy finishes writing a *complete* temp file after its future is gone.
     /// Nothing async is left to clean that up — the guard has to travel with the
     /// value, so that dropping the unwanted answer is what unlinks the file.
     // Multi-thread: the handshake with the closure is a blocking `recv`, so the
