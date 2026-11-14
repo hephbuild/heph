@@ -236,6 +236,12 @@ pub trait TUIAppView: Send {
     /// by default for views without tabs.
     fn back_to_main(&mut self) {}
 
+    /// `q` on the main view while the run is still going. No-op by default: in
+    /// a run of this process `q` does nothing and Ctrl-C cancels. A session
+    /// viewer (`heph session attach`) detaches here, and the run it shows goes
+    /// on — a viewer never cancels anything.
+    fn quit_while_running(&mut self) {}
+
     /// Whether the view is currently capturing keystrokes into a search query
     /// (the `/` filter). While `true` the backend routes printable keys, Backspace,
     /// Enter and Esc to the search methods below instead of the normal shortcuts.

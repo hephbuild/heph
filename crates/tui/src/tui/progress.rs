@@ -2108,6 +2108,10 @@ pub struct TuiProgressView {
     /// for commands without an approval gate. When a prompt is active it is
     /// rendered at the top of the live body and `y`/`n`/Enter resolve it.
     approval: Option<crate::tui::approval::ApprovalCenter>,
+    /// What `q` on the main view does while the run is still going. `None` for
+    /// a run of this process, where `q` does nothing (Ctrl-C cancels); a
+    /// session viewer detaches here ([`Self::with_quit`]).
+    on_quit: Option<Box<dyn Fn() + Send>>,
 }
 
 impl TuiProgressView {
@@ -2129,7 +2133,38 @@ impl TuiProgressView {
             search_active: Cell::new(false),
             search_query: RefCell::new(String::new()),
             approval: None,
+            on_quit: None,
         }
+    }
+
+    /// Call `f` when `q` is pressed on the main view while the run is still
+    /// going — how `heph session attach` detaches. Never a cancel: the view has
+    /// no way to reach the run it shows.
+    pub fn with_quit(mut self, f: impl Fn() + Send + 'static) -> Self {
+        self.on_quit = Some(Box::new(f));
+        self
+    }
+
+    /// The folded state, for a caller that renders more than the view does
+    /// (`heph session show`'s stuck-on block reads its snapshot).
+    pub fn state(&self) -> &BuildState {
+        &self.state
+    }
+
+    /// One frame as plain lines, for printing once (`heph session show`): the
+    /// header, the default body (lock waits, scratch waits, long-running
+    /// targets) and the admission waits the TUI keeps on its own tab. No bottom
+    /// border, no key help, no idle art; nothing windowed. `ratatui`'s `Line`
+    /// prints its text with `Display`, styles dropped.
+    ///
+    /// `now_ms` is the clock the elapsed time and wait ages are measured
+    /// against: the viewer's now for a live session, the `End` record's time
+    /// for an ended one.
+    pub fn snapshot_lines(&self, now_ms: u64, width: u16) -> Vec<Line<'static>> {
+        let mut lines = vec![self.header_line(now_ms, width)];
+        lines.extend(self.state.body_lines(now_ms));
+        lines.extend(self.state.admission_wait_lines(now_ms, ""));
+        lines
     }
 
     /// The final summary segment, scoped to whatever the `a` toggle was left on
@@ -2432,6 +2467,12 @@ impl TUIAppView for TuiProgressView {
         crate::tui::session::SessionHeader {
             kind: self.model.session_kind(),
             label: self.model.label(),
+        }
+    }
+
+    fn quit_while_running(&mut self) {
+        if let Some(f) = &self.on_quit {
+            f();
         }
     }
 
@@ -4944,6 +4985,49 @@ mod tests {
         let text: String = help.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("scroll"), "{text}");
         assert_eq!(help.spans[0].style.fg, Some(Color::DarkGray));
+    }
+
+    /// A18: one frame as plain text — the header box line, then the lock wait
+    /// and the long-running target — with no bottom border, help row or idle
+    /// art, measured against the clock it is given.
+    #[test]
+    fn snapshot_lines_render_one_plain_frame() {
+        let mut v = TuiProgressView::new("L");
+        v.apply(&ev(0, matched(&["//a:slow", "//a:locked"], true)));
+        v.apply(&ev(0, result_start("//a:slow")));
+        v.apply(&ev(
+            0,
+            BuildEventKind::ResultLockWaitStart {
+                addr: "//a:locked".into(),
+                holder_pid: Some(4242),
+                in_use_by_readers: false,
+            },
+        ));
+        let text: Vec<String> = v
+            .snapshot_lines(65_000, 60)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let header = text.first().expect("header");
+        assert!(
+            header.starts_with("╭─ ") && header.contains("1m05s · 0 / 2 done"),
+            "{header}"
+        );
+        assert!(header.ends_with("─╮"), "{header}");
+        assert_eq!(header.chars().count(), 60, "{header}");
+        assert_eq!(
+            text.get(1).map(String::as_str),
+            Some("  🔒 //a:locked (locked by pid 4242)"),
+            "{text:?}"
+        );
+        assert!(
+            !text
+                .iter()
+                .any(|l| l.starts_with("╰") || l.contains("scroll")),
+            "no bottom border or help row: {text:?}"
+        );
+        // An empty view is just its header: nothing invented to fill rows.
+        assert_eq!(TuiProgressView::new("L").snapshot_lines(0, 60).len(), 1);
     }
 
     #[test]

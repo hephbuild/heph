@@ -557,3 +557,51 @@ async fn home_unset_runs_without_session() {
     assert!(slot.dir().is_none());
     std::fs::set_permissions(ro.path(), std::fs::Permissions::from_mode(0o700)).expect("chmod");
 }
+
+/// The file source follows a live session from its directory: the records so
+/// far, `CaughtUp`, each new record, then `Ended` with the exit code once the
+/// owner writes `End` — and `list` reads the lock, meta and status only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn file_source_follows_until_end() {
+    use futures::StreamExt as _;
+    let root = tempfile::tempdir().expect("tempdir");
+    let session = Session::open(&SessionRoot::new(root.path()), start()).expect("open");
+    let tap = session.tap();
+    let mut evs = events().into_iter();
+    tap.event(evs.next().expect("one event"));
+
+    let source = FileSource::new(root.path());
+    let listed = source.list().await.expect("list");
+    assert_eq!(listed.len(), 1);
+    let entry = listed.first().expect("entry");
+    assert!(entry.live && entry.id == session.id());
+
+    let mut stream = source.subscribe(session.id()).await.expect("subscribe");
+    let mut records = 0usize;
+    let mut caught_up = false;
+    for ev in evs {
+        tap.event(ev);
+    }
+    session.finish(Some(3), false);
+    let ended = loop {
+        match stream.next().await.expect("item").expect("ok") {
+            SessionItem::Record(_) => records += 1,
+            SessionItem::CaughtUp { skipped } => {
+                assert_eq!(skipped, 0);
+                caught_up = true;
+            }
+            SessionItem::Ended { exit, lost } => break (exit, lost),
+        }
+    };
+    assert!(caught_up);
+    assert_eq!(ended, (Some(3), false));
+    // Every event plus the `End` record.
+    assert_eq!(records, events().len() + 1);
+    let after = source.snapshot(session.id()).await.expect("snapshot");
+    let after = after.expect("still there");
+    assert!(!after.live);
+    assert_eq!(
+        after.status.and_then(|s| s.end).and_then(|e| e.exit_code),
+        Some(3)
+    );
+}
