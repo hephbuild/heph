@@ -170,7 +170,7 @@ impl SessionSource for FileSource {
     }
 }
 
-fn list_dir(root: &Path) -> anyhow::Result<Vec<SessionEntry>> {
+pub(crate) fn list_dir(root: &Path) -> anyhow::Result<Vec<SessionEntry>> {
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),

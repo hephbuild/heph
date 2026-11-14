@@ -26,6 +26,9 @@ pub async fn run<A: App + 'static>(
         }
         sink.set_session_tap(s.tap.clone());
     }
+    if let Some(slot) = slot {
+        view.name_lock_holders(slot.holder_names());
+    }
     view.begin();
 
     // We own the build-event channel: sender to the app via AppContext, we keep

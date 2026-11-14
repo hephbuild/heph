@@ -119,6 +119,12 @@ fn lock_wait_names_the_holding_session() {
     );
     assert_eq!(entry["state"], "waiting", "{entry}");
 
+    // The waiter's own line-backend notice names the holder's session too.
+    let notice = format!("held by session {} (pid {})", holder.id, holder.pid());
+    wait_until("the waiter's own notice to name its holder", SHORT, || {
+        waiter.stderr().contains(&notice)
+    });
+
     assert!(holder.wait().success(), "{}", holder.stderr());
     assert!(waiter.wait().success(), "{}", waiter.stderr());
 }

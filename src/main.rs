@@ -240,15 +240,21 @@ fn main() -> ExitCode {
     // environment once, here, and handed to the TUI's slot — never by the
     // engine. Outside every cache key, and the session's id and directory are
     // never exported to the environment (a target's `pass_env` would see them).
+    let home = std::env::var_os("HOME");
     heph::tui::session::process().configure(
         heph::tui::session::SessionRoot::from_env(
             std::env::var_os("HEPH_NO_SESSION").as_deref(),
-            std::env::var_os("HOME").as_deref(),
+            home.as_deref(),
         ),
         std::env::args_os()
             .map(|a| a.to_string_lossy().into_owned())
             .collect(),
     );
+    // A lock-wait notice names the holder's session even when this run records
+    // none: `HEPH_NO_SESSION` turns recording off, not looking.
+    heph::tui::session::process().configure_lookup(heph::tui::session::SessionRoot::for_reading(
+        home.as_deref(),
+    ));
 
     let exec_result = cli.command.execute(sink, &cli.global);
     // An entrypoint's program ended without success: heph exits as it did.

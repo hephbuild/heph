@@ -5,7 +5,7 @@ use ratatui::text::Line;
 use tokio::sync::{mpsc, oneshot};
 
 use super::log_sink::LogSink;
-use super::session::SessionHeader;
+use super::session::{HolderNames, SessionHeader};
 use hcore::events::{BuildEvent, EventSender};
 use hcore::pending::PendingCounter;
 
@@ -313,6 +313,10 @@ pub trait TUIAppView: Send {
     fn session_header(&self) -> SessionHeader {
         SessionHeader::default()
     }
+
+    /// How to name the session behind a lock holder's pid. Handed over once,
+    /// by the backend, before the first event. Ignored by default.
+    fn name_lock_holders(&mut self, _names: HolderNames) {}
 }
 
 /// Aggregates the engine's build-event stream and renders progress in non-TUI
@@ -332,6 +336,9 @@ pub trait CIAppView: Send {
     fn session_header(&self) -> SessionHeader {
         SessionHeader::default()
     }
+
+    /// See [`TUIAppView::name_lock_holders`].
+    fn name_lock_holders(&mut self, _names: HolderNames) {}
 }
 
 #[async_trait]

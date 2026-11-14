@@ -158,6 +158,20 @@ What a run loses: a process wedged before its first flush loses at most 250ms
 of events; a second Ctrl-C, `SIGTERM`/`SIGHUP` or `SIGKILL` loses what came
 after the last flush and writes no `End` (`lost`).
 
+### The run's own lock-wait notice
+
+A run waiting on a lock names the holder in its own progress output, on both
+backends: `held by session <id> (pid N)` (the TUI row says `locked by …`) when a
+live session other than its own is recorded for the pid, and `held by pid N`
+otherwise. The events carry only the pid, so the engine stays unaware of
+sessions: the view resolves the pid with the same rule as `list`/`show`
+(`tui::session::holder_session`), scanning the sessions directory once per
+distinct pid when that pid's first wait is folded, and keeps the answer for the
+run. A render never does IO. The directory comes from `HOME` alone, so a run
+with `HEPH_NO_SESSION` still names other sessions; with no `HOME`, or any read
+error, the notice is the pid. A session viewer (`attach`) gets no names, so it
+renders the pid, as the recorded events do.
+
 ## Retention
 
 Cleanup runs only at session start, on the new session's recorder thread;

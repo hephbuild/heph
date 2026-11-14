@@ -13,6 +13,7 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 
 use crate::tui::app::{CIAppView, TUIAppView};
+use crate::tui::session::{HolderNames, SessionId};
 use hcore::capacity::Unit;
 use hcore::events::{BuildEvent, BuildEventKind, CacheCounts, CacheOutcomeKind};
 
@@ -757,6 +758,10 @@ pub struct BuildState {
     /// `ResultLockWaitStart`, removed on `ResultLockWaitEnd`, so it reflects
     /// only currently-blocked waits.
     lock_waits: HashMap<String, (LockHolder, u64)>,
+    /// The session behind each holder pid a wait named, resolved once per pid
+    /// when its wait starts and only read when rendering. Given no root (the
+    /// default: a test, the recorder's own fold), it names none.
+    holders: HolderNames,
     /// Consumers blocked on a scratch slot, keyed by the *consumer* addr so a
     /// wait can be removed when its own `ScratchLockWaitEnd` lands.
     ///
@@ -913,6 +918,19 @@ impl Counts {
 impl BuildState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// How to name the session behind a lock holder's pid. See
+    /// [`HolderNames`].
+    pub fn name_lock_holders(&mut self, names: HolderNames) {
+        self.holders = names;
+    }
+
+    /// A lock holder as a notice names it: `session <id> (pid N)`, or `pid N`
+    /// when no live session is recorded for it. Reads what the fold resolved;
+    /// never does IO, so it is safe on every frame.
+    fn holder(&self, pid: u32) -> String {
+        holder_text(pid, self.holders.get(pid))
     }
 
     /// Fold a single event. Reads `ev.at_unix_ms` + `ev.kind`; no local clock.
@@ -1160,6 +1178,9 @@ impl BuildState {
                 holder_pid,
                 in_use_by_readers,
             } => {
+                if let Some(pid) = holder_pid {
+                    self.holders.learn(*pid);
+                }
                 self.lock_waits.insert(
                     addr.clone(),
                     (
@@ -1177,6 +1198,9 @@ impl BuildState {
                 access,
                 holder_pid,
             } => {
+                if let Some(pid) = holder_pid {
+                    self.holders.learn(*pid);
+                }
                 self.scratch_waits.insert(
                     addr.clone(),
                     ScratchWait {
@@ -1756,7 +1780,7 @@ impl BuildState {
                 // it" and "you declared this exclusive" are different fixes, and
                 // only the first can be pinned on a pid.
                 let detail = match g.holder_pid {
-                    Some(pid) => format!("held by pid {pid}, {waited}"),
+                    Some(pid) => format!("held by {}, {waited}", self.holder(pid)),
                     None => format!("{}, {waited}", g.access),
                 };
                 Line::from(Span::styled(
@@ -1769,8 +1793,9 @@ impl BuildState {
 
     /// Rows for addrs currently blocked on the result lock past the notice
     /// threshold, rendered like the slow-target rows but flagged locked:
-    /// `🔒 <addr> (locked by pid N)`, `(locked, in use)` when readers are
-    /// holding the revision, or `(locked, holder unknown)`.
+    /// `🔒 <addr> (locked by pid N)` — `locked by session <id> (pid N)` when a
+    /// live session is recorded for the pid — `(locked, in use)` when readers
+    /// are holding the revision, or `(locked, holder unknown)`.
     /// Sorted by addr so the order is stable across frames. Empty when nothing
     /// is blocked.
     pub fn lock_wait_lines(&self) -> Vec<Line<'static>> {
@@ -1780,7 +1805,7 @@ impl BuildState {
             .into_iter()
             .map(|(addr, (holder, _))| {
                 let holder = match holder {
-                    LockHolder::Pid(pid) => format!("locked by pid {pid}"),
+                    LockHolder::Pid(pid) => format!("locked by {}", self.holder(*pid)),
                     LockHolder::Readers => "locked, in use".to_string(),
                     LockHolder::Unknown => "locked, holder unknown".to_string(),
                 };
@@ -1885,6 +1910,14 @@ enum LockHolder {
     /// Readers of the revision — unstamped, so detectable but not nameable.
     Readers,
     Unknown,
+}
+
+/// `session <id> (pid N)`, or `pid N` when no session is known for it.
+fn holder_text(pid: u32, session: Option<SessionId>) -> String {
+    match session {
+        Some(id) => format!("session {id} (pid {pid})"),
+        None => format!("pid {pid}"),
+    }
 }
 
 impl LockHolder {
@@ -2601,6 +2634,10 @@ impl TUIAppView for TuiProgressView {
         }
     }
 
+    fn name_lock_holders(&mut self, names: HolderNames) {
+        self.state.name_lock_holders(names);
+    }
+
     fn quit_while_running(&mut self) {
         if let Some(f) = &self.on_quit {
             f();
@@ -2993,6 +3030,10 @@ impl CIAppView for CiProgressView {
         }
     }
 
+    fn name_lock_holders(&mut self, names: HolderNames) {
+        self.core.state.name_lock_holders(names);
+    }
+
     fn begin(&self) {
         tracing::info!("{}", self.core.label);
     }
@@ -3024,7 +3065,10 @@ impl CIAppView for CiProgressView {
                 in_use_by_readers,
             } => {
                 let holder = match LockHolder::of(*holder_pid, *in_use_by_readers) {
-                    LockHolder::Pid(pid) => format!("held by pid {pid}"),
+                    LockHolder::Pid(pid) => {
+                        self.core.state.holders.learn(pid);
+                        format!("held by {}", self.core.state.holder(pid))
+                    }
                     LockHolder::Readers => "in use".to_string(),
                     LockHolder::Unknown => "holder unknown".to_string(),
                 };
@@ -3037,7 +3081,13 @@ impl CIAppView for CiProgressView {
                 holder_pid,
                 ..
             } if self.scratch_wait_announced.insert(scratch.clone()) => match holder_pid {
-                Some(pid) => tracing::info!("waiting on scratch {scratch}, held by pid {pid}"),
+                Some(pid) => {
+                    self.core.state.holders.learn(*pid);
+                    tracing::info!(
+                        "waiting on scratch {scratch}, held by {}",
+                        self.core.state.holder(*pid)
+                    );
+                }
                 None => tracing::info!(
                     "waiting on scratch {scratch} ({access}); \
                      targets sharing it run one at a time"
@@ -3173,6 +3223,108 @@ mod tests {
             },
         ));
         assert!(s.lock_wait_lines().is_empty());
+    }
+
+    /// A live session recorded under `root`, owned by this test process.
+    fn live_session(root: &std::path::Path) -> crate::tui::session::Session {
+        crate::tui::session::Session::open(
+            &crate::tui::session::SessionRoot::new(root),
+            crate::tui::session::SessionStart::default(),
+        )
+        .expect("open a session")
+    }
+
+    /// Names that read sessions from `root`, with no session of their own.
+    fn names_in(root: &std::path::Path) -> HolderNames {
+        HolderNames::new(Some(crate::tui::session::SessionRoot::new(root)), None)
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    /// The lock row and the scratch row name the live session recorded for
+    /// the holder's pid, and keep the pid.
+    #[test]
+    fn lock_waits_name_the_holding_session() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let holder = live_session(root.path());
+        let pid = std::process::id();
+        let mut s = BuildState::new();
+        s.name_lock_holders(names_in(root.path()));
+        s.apply(&ev(0, lock_wait_start("//pkg:a", pid)));
+        s.apply(&ev(
+            0,
+            scratch_wait("//pkg:b", "//build:c", "exclusive", Some(pid)),
+        ));
+        let id = holder.id();
+        assert_eq!(
+            line_text(&s.lock_wait_lines()[0]),
+            format!("  🔒 //pkg:a (locked by session {id} (pid {pid}))"),
+        );
+        assert_eq!(
+            line_text(&s.scratch_wait_lines(61_000)[0]),
+            format!(
+                "  ⧗ //build:c — 1 waiting (held by session {id} (pid {pid}), {})",
+                human_elapsed(61_000)
+            ),
+        );
+        holder.finish(Some(0), false);
+    }
+
+    /// No session for the pid, an ended one, or only this process's own: the
+    /// notice is the pid alone, exactly as without sessions.
+    #[test]
+    fn lock_waits_name_only_the_pid_without_a_live_other_session() {
+        let pid = std::process::id();
+        let pid_only = format!("  🔒 //pkg:a (locked by pid {pid})");
+        let render = |names: HolderNames| {
+            let mut s = BuildState::new();
+            s.name_lock_holders(names);
+            s.apply(&ev(0, lock_wait_start("//pkg:a", pid)));
+            line_text(&s.lock_wait_lines()[0])
+        };
+
+        let empty = tempfile::tempdir().expect("tempdir");
+        assert_eq!(render(names_in(empty.path())), pid_only, "no session");
+        let missing = empty.path().join("absent");
+        assert_eq!(render(names_in(&missing)), pid_only, "no sessions dir");
+        assert_eq!(render(HolderNames::default()), pid_only, "no root");
+
+        let ended = tempfile::tempdir().expect("tempdir");
+        live_session(ended.path()).finish(Some(0), false);
+        assert_eq!(render(names_in(ended.path())), pid_only, "ended session");
+
+        let own = tempfile::tempdir().expect("tempdir");
+        let session = live_session(own.path());
+        let names = HolderNames::new(
+            Some(crate::tui::session::SessionRoot::new(own.path())),
+            Some(session.id()),
+        );
+        assert_eq!(render(names), pid_only, "this process's own session");
+        session.finish(Some(0), false);
+    }
+
+    /// A pid is resolved when its first wait is folded, and never again: a
+    /// session that appears later does not trigger a second scan.
+    #[test]
+    fn a_holder_pid_is_resolved_once() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let pid = std::process::id();
+        let mut s = BuildState::new();
+        s.name_lock_holders(names_in(root.path()));
+        s.apply(&ev(0, lock_wait_start("//pkg:a", pid)));
+        let late = live_session(root.path());
+        s.apply(&ev(1, lock_wait_start("//pkg:b", pid)));
+        let lines: Vec<String> = s.lock_wait_lines().iter().map(line_text).collect();
+        assert_eq!(
+            lines,
+            [
+                format!("  🔒 //pkg:a (locked by pid {pid})"),
+                format!("  🔒 //pkg:b (locked by pid {pid})"),
+            ],
+        );
+        late.finish(Some(0), false);
     }
 
     #[test]
@@ -4556,6 +4708,11 @@ mod tests {
 
     /// What the CI view logs for `events`, captured from its `tracing` lines.
     fn ci_view_log(events: &[BuildEvent]) -> String {
+        ci_view_log_with(HolderNames::default(), events)
+    }
+
+    /// [`ci_view_log`], naming lock holders with `names`.
+    fn ci_view_log_with(names: HolderNames, events: &[BuildEvent]) -> String {
         #[derive(Clone, Default)]
         struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
         impl std::io::Write for Buf {
@@ -4579,12 +4736,55 @@ mod tests {
             .finish();
         tracing::subscriber::with_default(subscriber, || {
             let mut v = CiProgressView::new("Running");
+            v.name_lock_holders(names);
             for e in events {
                 v.apply(e);
             }
         });
         let bytes = buf.0.lock().expect("log buffer").clone();
         String::from_utf8(bytes).expect("utf-8 log")
+    }
+
+    /// The line backend's lock and scratch notices name the live session
+    /// holding for the pid; with none recorded (here: it ended), the pid alone.
+    #[test]
+    fn ci_view_lock_notices_name_the_holding_session() {
+        let pid = std::process::id();
+        let events = [
+            ev(0, lock_wait_start("//a:b", pid)),
+            ev(
+                0,
+                scratch_wait("//a:c", "//build:gocache", "exclusive", Some(pid)),
+            ),
+        ];
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let holder = live_session(root.path());
+        let held_by = format!("held by session {} (pid {pid})", holder.id());
+        let log = ci_view_log_with(names_in(root.path()), &events);
+        assert!(
+            log.contains(&format!("waiting on result lock for //a:b ({held_by})")),
+            "{log}"
+        );
+        assert!(
+            log.contains(&format!("waiting on scratch //build:gocache, {held_by}")),
+            "{log}"
+        );
+
+        holder.finish(Some(0), false);
+        let log = ci_view_log_with(names_in(root.path()), &events);
+        assert!(
+            log.contains(&format!(
+                "waiting on result lock for //a:b (held by pid {pid})"
+            )),
+            "{log}"
+        );
+        assert!(
+            log.contains(&format!(
+                "waiting on scratch //build:gocache, held by pid {pid}\n"
+            )),
+            "{log}"
+        );
     }
 
     /// Admission waits stay off the CI log; the execute that follows still

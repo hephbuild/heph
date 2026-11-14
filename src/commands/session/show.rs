@@ -12,14 +12,13 @@ use anyhow::Context as _;
 use futures::StreamExt as _;
 use serde::Serialize;
 
-use super::list::holder_session;
 use super::{
     SessionState, ViewOpts, ago, command_line, derive_state, escape, list_all, recorded_by_newer,
     require_known, resolve,
 };
 use crate::tui::session::{
     HeaderKind, SessionEntry, SessionItem, SessionMeta, SessionRecordKind, SessionSnapshot,
-    SessionSource,
+    SessionSource, holder_session,
 };
 use crate::tui::{self, TUIAppView as _};
 
@@ -265,7 +264,7 @@ fn stuck_on<'a>(
             });
             continue;
         };
-        let Some(holder) = holder_session(every, pid, entry) else {
+        let Some(holder) = holder_session(every, pid, Some(entry.id)) else {
             block.push_str(&format!("held by pid {pid} (no session recorded)\n"));
             continue;
         };
@@ -337,7 +336,7 @@ fn follow_chain<'a>(
         };
         let Some(pid) = w.holder_pid else { break };
         block.push_str(&format!("    which waits for {}, ", escape(&w.addr)));
-        match holder_session(every, pid, at) {
+        match holder_session(every, pid, Some(at.id)) {
             Some(next) if seen.insert(next.id) => {
                 block.push_str(&format!("held by {}\n", describe(next)));
                 at = next;

@@ -51,6 +51,9 @@ pub async fn run<A: App + 'static>(
     if let Some(tap) = &session_tap {
         sink.set_session_tap(tap.clone());
     }
+    if let Some(slot) = slot {
+        view.name_lock_holders(slot.holder_names());
+    }
     // Size the inline viewport to ~1/3 of the terminal height. Queried before the
     // viewport is built (so the first frame is already sized); the column count is
     // re-derived from the backend below.

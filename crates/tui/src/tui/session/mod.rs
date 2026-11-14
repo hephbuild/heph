@@ -25,6 +25,7 @@
 
 pub mod cleanup;
 pub mod format;
+pub mod holder;
 pub mod id;
 pub mod lockfile;
 pub mod reader;
@@ -45,6 +46,7 @@ pub use format::{
     CAPABILITY_INFLIGHT, HeaderKind, META_FORMAT, SNAPSHOT_VERSION, SessionHeader, SessionMeta,
     SessionRecord, SessionRecordKind, SessionSnapshot, files,
 };
+pub use holder::{HolderNames, holder_session};
 pub use id::SessionId;
 pub use reader::RecordReader;
 pub use recorder::{Recorder, SessionTap, TappedReceiver};
@@ -86,6 +88,15 @@ impl SessionRoot {
         hcore::userdir::heph_user_dir_from(home)
             .map(|dir| Some(Self(dir.join(SESSIONS_DIR))))
             .map_err(|e| format!("{e:#}"))
+    }
+
+    /// The root other sessions are read from, from `HOME` alone:
+    /// `HEPH_NO_SESSION` turns recording off, not looking. `None` without
+    /// `HOME`.
+    pub fn for_reading(home: Option<&OsStr>) -> Option<Self> {
+        hcore::userdir::heph_user_dir_from(home)
+            .ok()
+            .map(|dir| Self(dir.join(SESSIONS_DIR)))
     }
 }
 
@@ -238,6 +249,9 @@ struct SlotInner {
     workspace_root: Option<String>,
     home_dir: Option<String>,
     session: Option<std::sync::Arc<Session>>,
+    /// Where other sessions are read from, to name a lock's holder. Set even
+    /// when this process records nothing.
+    lookup: Option<SessionRoot>,
     /// The open was attempted (successfully or not): a process opens at most
     /// one session, and warns at most once.
     attempted: bool,
@@ -289,6 +303,24 @@ impl SessionSlot {
             };
             s.argv = argv;
         });
+    }
+
+    /// Where to read other sessions from to name a lock's holder (from
+    /// [`SessionRoot::for_reading`]). Unset, the recording root is used.
+    pub fn configure_lookup(&self, root: Option<SessionRoot>) {
+        self.with(|s| s.lookup = root);
+    }
+
+    /// Names for lock holders' pids, excluding this process's own session.
+    /// Call it after [`open`](Self::open), so the own session is known.
+    pub fn holder_names(&self) -> holder::HolderNames {
+        self.with(|s| {
+            let root = s.lookup.clone().or_else(|| match &s.setup {
+                Setup::Root(root) => Some(root.clone()),
+                Setup::Unconfigured | Setup::Off | Setup::Unavailable(_) => None,
+            });
+            holder::HolderNames::new(root, s.session.as_ref().map(|x| x.id()))
+        })
     }
 
     /// The workspace, once bootstrap has resolved it. Recorded in `meta.json`

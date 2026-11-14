@@ -10,7 +10,7 @@ use serde::Serialize;
 use super::{
     SessionState, ViewOpts, Workspace, ago, command_line, derive_state, escape, list_all, truncate,
 };
-use crate::tui::session::{EntryMeta, SessionEntry, SessionSource};
+use crate::tui::session::{EntryMeta, SessionEntry, SessionSource, holder_session};
 
 /// `list --json`'s own version, bumped only on an incompatible change.
 pub const LIST_JSON_VERSION: u32 = 1;
@@ -107,7 +107,7 @@ fn write_json(
                             holder_pid: w.holder_pid,
                             holder_session: w
                                 .holder_pid
-                                .and_then(|pid| holder_session(every, pid, e))
+                                .and_then(|pid| holder_session(every, pid, Some(e.id)))
                                 .map(|h| h.id.encode()),
                         })
                         .chain(s.admission_waits.iter().map(|w| BlockedOn::Admission {
@@ -289,7 +289,7 @@ fn now_cell(
         && let Some(w) = s.lock_waits.first()
     {
         let holder = match w.holder_pid {
-            Some(pid) => match holder_session(every, pid, e) {
+            Some(pid) => match holder_session(every, pid, Some(e.id)) {
                 Some(h) => format!("held by {}", h.id),
                 None => format!("held by pid {pid}"),
             },
@@ -309,16 +309,4 @@ fn now_cell(
         ),
         None => "-".to_owned(),
     }
-}
-
-/// The live session, other than `of`, whose process is `pid`.
-pub(crate) fn holder_session<'a>(
-    every: &[&'a SessionEntry],
-    pid: u32,
-    of: &SessionEntry,
-) -> Option<&'a SessionEntry> {
-    every
-        .iter()
-        .copied()
-        .find(|h| h.live && h.id != of.id && h.known_meta().is_some_and(|m| m.owner_pid == pid))
 }
