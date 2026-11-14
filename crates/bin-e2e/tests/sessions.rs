@@ -221,6 +221,83 @@ fn no_session_env() {
     assert!(last_end(&session_of(&ws, &out)).is_some());
 }
 
+/// The shipped binary records where it ran: `meta.json` carries the
+/// workspace root and the directory heph was started in. `list` uses them:
+/// inside a workspace it shows that workspace's sessions, `--all` every one
+/// under the same `HOME`.
+#[test]
+fn list_filters_by_workspace() {
+    let dist = Dist::locate();
+    let a = workspace();
+    let b = workspace();
+    // One `HOME` for both, so both sessions land in one sessions directory.
+    let home = a.home();
+    let run_in = |ws: &Workspace, cwd: &std::path::Path, args: &[&str]| {
+        let child = ws
+            .cmd(&dist, args)
+            .current_dir(cwd)
+            .env("HEPH_CWD", cwd)
+            .env("HOME", home)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn");
+        common::wait_output(child, common::RUN_DEADLINE).expect("run")
+    };
+    let canonical = |p: &std::path::Path| std::fs::canonicalize(p).expect("canonicalize");
+
+    // Started in a package directory, so `cwd` and the root differ.
+    let mut ids = Vec::new();
+    for ws in [&a, &b] {
+        let cwd = ws.root().join("pkg");
+        let out = run_in(ws, &cwd, &["run", "//pkg:ok"]);
+        assert!(out.status.success(), "{}", describe(&out));
+        let id = id_in(&String::from_utf8_lossy(&out.stderr));
+        assert!(id.is_some(), "no session announced\n{}", describe(&out));
+        let id = id.unwrap_or_default();
+        let meta: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(sessions_dir(home).join(&id).join("meta.json")).expect("meta.json"),
+        )
+        .expect("meta.json parses");
+        for (field, want) in [("workspace_root", ws.root()), ("cwd", cwd.as_path())] {
+            let got = meta[field].as_str();
+            assert!(got.is_some(), "{field} recorded: {meta}");
+            assert_eq!(
+                canonical(std::path::Path::new(got.unwrap_or_default())),
+                canonical(want),
+                "{field}: {meta}"
+            );
+        }
+        ids.push(id);
+    }
+
+    let listed = |all: bool| -> Vec<String> {
+        let mut args = vec!["session", "list", "--json"];
+        if all {
+            args.push("--all");
+        }
+        let out = run_in(&a, a.root(), &args);
+        assert!(out.status.success(), "{}", describe(&out));
+        let list: serde_json::Value = serde_json::from_slice(&out.stdout).expect("list --json");
+        let mut ids: Vec<String> = list["sessions"]
+            .as_array()
+            .map(|all| {
+                all.iter()
+                    .filter_map(|s| s["id"].as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        ids.sort();
+        ids
+    };
+    let [in_a, in_b]: [String; 2] = ids.try_into().expect("two sessions");
+    assert_eq!(listed(false), vec![in_a.clone()], "only this workspace's");
+    let mut both = vec![in_a, in_b];
+    both.sort();
+    assert_eq!(listed(true), both, "--all lists every workspace's");
+}
+
 /// `run --raw` sets up no session: no directory, and nothing on stderr — no
 /// start line, no "records no session" warning — beside the tool's bytes.
 #[test]
