@@ -840,7 +840,8 @@ async fn follow_reads_a_lock_freed_without_end_as_lost() {
     // below is hand-made so it can die without writing `End`.
     let template = tempfile::tempdir().expect("tempdir");
     let real = Session::open(&SessionRoot::new(template.path()), start()).expect("open");
-    real.tap().event(events().into_iter().next().expect("one event"));
+    real.tap()
+        .event(events().into_iter().next().expect("one event"));
     real.finish(Some(0), false);
     let events_file = std::fs::read_to_string(real.dir().join(files::EVENTS)).expect("events");
     let first = events_file.lines().next().expect("a first record");

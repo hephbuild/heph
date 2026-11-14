@@ -316,7 +316,9 @@ fn attached_view_draws_what_the_run_drew() {
         "the failed tab lists the failure, not the running target:\n{failed}"
     );
     assert!(
-        live_narrow.iter().all(|r| r.chars().count() <= usize::from(NARROW)),
+        live_narrow
+            .iter()
+            .all(|r| r.chars().count() <= usize::from(NARROW)),
         "{live_narrow:#?}"
     );
 

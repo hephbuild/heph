@@ -408,7 +408,9 @@ mod tests {
     fn cleanup_removes_stale_tombs() {
         let root = tempfile::tempdir().expect("tempdir");
         let now = SystemTime::now();
-        let tomb = root.path().join(format!("{TOMB_PREFIX}{}-42", SessionId::new(1, 1)));
+        let tomb = root
+            .path()
+            .join(format!("{TOMB_PREFIX}{}-42", SessionId::new(1, 1)));
         std::fs::create_dir(&tomb).expect("mkdir");
         std::fs::write(tomb.join(files::EVENTS), b"x").expect("events");
 

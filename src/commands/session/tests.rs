@@ -1163,8 +1163,18 @@ fn oversized_sgr_parameters_are_escaped() {
     for params in [format!("{at_cap};"), "1;".repeat(512 * 1024)] {
         let input = format!("\u{1b}[{params}mx");
         let escaped = format!("\\u{{1b}}[{params}mx");
-        assert_eq!(escape_replayed(&input, true), escaped, "{} bytes", params.len());
-        assert_eq!(escape_replayed(&input, false), escaped, "{} bytes", params.len());
+        assert_eq!(
+            escape_replayed(&input, true),
+            escaped,
+            "{} bytes",
+            params.len()
+        );
+        assert_eq!(
+            escape_replayed(&input, false),
+            escaped,
+            "{} bytes",
+            params.len()
+        );
     }
 
     // Many sequences each just over the cap: still linear, every one escaped.
