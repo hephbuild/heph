@@ -700,8 +700,9 @@ impl Engine {
         pending: crate::engine::sandbox_cleaner::PendingCounter,
         slot: Option<crate::engine::resource_pool::Reservation>,
     ) -> crate::engine::sandbox_cleaner::SandboxTeardown {
-        let teardown = crate::engine::sandbox_cleaner::SandboxTeardown::arm(dir, generation, pending)
-            .with_sandbox_slot(slot);
+        let teardown =
+            crate::engine::sandbox_cleaner::SandboxTeardown::arm(dir, generation, pending)
+                .with_sandbox_slot(slot);
         #[cfg(any(test, feature = "test-support"))]
         let teardown = teardown.with_removal_delay(self.sandbox_removal_delay);
         teardown
@@ -747,7 +748,11 @@ impl Engine {
             .acquire_with(resources, sandbox.as_slice())
             .map_err(|err| anyhow::anyhow!("{addr} {err}"))?;
         tokio::pin!(acquire);
-        let granted: anyhow::Result<_> =
+        // Raced against the request's cancellation: a `sandbox` slot comes
+        // back only once a removal finishes, which a cancellation does not
+        // hurry, so a cancelled run must not wait for one. Dropping the
+        // acquire leaves the queue.
+        let wait = async {
             match tokio::time::timeout(self.admission_notice, &mut acquire).await {
                 Ok(granted) => granted.map_err(Into::into),
                 Err(_elapsed) => match acquire.wait_info() {
@@ -766,7 +771,18 @@ impl Engine {
                         .await
                     }
                 },
-            };
+            }
+        };
+        let granted: anyhow::Result<_> = {
+            use hcore::hasync::Cancellable as _;
+            tokio::select! {
+                biased;
+                () = rs.ctoken().cancelled() => {
+                    return Err(anyhow::Error::new(hplugin::error::CancelledError));
+                }
+                granted = wait => granted,
+            }
+        };
         let reservation = granted.with_context(|| format!("admitting {addr}"))?;
         tracing::debug!(
             addr = %addr,
