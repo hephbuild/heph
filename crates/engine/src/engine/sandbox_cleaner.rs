@@ -59,6 +59,15 @@
 //! position, so nothing there relied on FIFO. There is no ordering guarantee
 //! *between* lanes either — that is the point.
 //!
+//! That argument covers the plain sandbox directory, which is all
+//! [`generation::remove_stale`] knows about. A FUSE run's upper side
+//! (`<fuse.upper>/<rel>`) is a separate tree, and a superseded, cancelled or
+//! failed run's upper dir is not removed by `remove_stale` — the successor's
+//! claim reclaims the plain dir only. (A failed credential-material run is the
+//! exception: [`SandboxTeardown::reclaim`] removes its upper dir explicitly.)
+//! That is a known gap, independent of queue order: running the reclaim lane
+//! FIFO would not close it.
+//!
 //! Both lanes decrement the same per-request `bg_pending` counter, so the
 //! shutdown path that blocks on it drains both.
 //!
@@ -69,9 +78,10 @@
 //! permit before its sandbox exists ([`crate::engine::sandbox_permits`]), and
 //! the permit rides in that sandbox's [`SandboxTeardown`] into its removal
 //! job, released when the removal returns. Live sandboxes plus sandboxes
-//! queued or being removed number at most the engine's permit count `S`, plus
-//! the credential producers in flight (exempt, or a consumer holding the last
-//! permit could never get its credential). When removal falls behind, new
+//! queued or being removed number at most the engine's permit count `S` (a
+//! credential producer takes one too: its consumer acquires credentials before
+//! its own permit, so no run waits for a permit while holding one). When
+//! removal falls behind, new
 //! runs wait instead of the disk filling. Outside the bound: failed sandboxes
 //! kept for diagnostics (one per failed addr) and invocation sandboxes.
 use crossbeam_channel::{Sender, unbounded};
