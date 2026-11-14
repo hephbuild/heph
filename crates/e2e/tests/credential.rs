@@ -796,6 +796,52 @@ async fn a_bad_field_in_a_presented_file_names_the_field() -> anyhow::Result<()>
     Ok(())
 }
 
+/// A presentation failing half-way takes the files already written with it:
+/// the first credential's token file is written, the second credential's
+/// template fails, and the failed run's sandbox, kept for diagnostics, holds
+/// no `tok`.
+#[tokio::test]
+async fn a_presentation_failing_half_way_removes_the_files_already_written() -> anyhow::Result<()> {
+    let _good = EnvVar::set("HEPH_E2E_HALF_GOOD", "half-way-material");
+    let _bad = EnvVar::set("HEPH_E2E_HALF_BAD", "v");
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "auth",
+        r#"
+target(name = "a_good", driver = "auth.credential",
+       sources = [heph.auth.env(["HEPH_E2E_HALF_GOOD"])],
+       present = {"files": {"tok": "${heph_e2e_half_good}"},
+                  "env":   {"TOK": "${file:tok}"}})
+target(name = "z_bad", driver = "auth.credential",
+       sources = [heph.auth.env(["HEPH_E2E_HALF_BAD"])],
+       present = {"files": {"f": "${missing}"},
+                  "env":   {"F": "${file:f}"}})
+"#,
+    );
+    ws.write_build_file(
+        "app",
+        r#"target(name = "a", driver = "bash", run = "true", out = [], cache = False,
+       credentials = ["//auth:a_good", "//auth:z_bad"])"#,
+    );
+    let err = expect_err(
+        ws.run("//app:a").await,
+        "the second credential's presentation fails",
+    );
+    let msg = format!("{err:#}");
+    assert!(msg.contains("missing"), "{msg}");
+
+    let sandbox = ws.engine.home.join("sandbox");
+    let left: Vec<_> = walkdir(&sandbox)
+        .into_iter()
+        .filter(|p| p.file_name().is_some_and(|n| n == "tok"))
+        .collect();
+    assert!(
+        left.is_empty(),
+        "the first credential's files outlived the failed presentation: {left:?}"
+    );
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // The chain refuses to eat itself
 // ---------------------------------------------------------------------------
@@ -1342,23 +1388,8 @@ target(name = "t", driver = "auth.credential",
 async fn lapsed_material_is_re_acquired_rather_than_handed_on() -> anyhow::Result<()> {
     let ws = Workspace::new();
     let counter = ws.dir.path().join("refreshes");
-    // A four-second lifetime. `usable_at`'s margin is `min(60s, lifetime/2)`, and
-    // expiry is whole seconds, so this is usable for one to two seconds and then
-    // is not. Shorter, and the run itself can outlast it: the material is
-    // checked again once the run has its pools, and acquired a second time.
-    ws.write_build_file(
-        "auth",
-        &format!(
-            r#"
-target(name = "t", driver = "auth.credential",
-       sources = [heph.auth.exec(["sh", "-c",
-           "echo x >> {c}; printf '{{\"token\":\"v\",\"expires_in\":4}}'"],
-           fields = {{"token": "token"}}, expires = "expires_in")],
-       present = {{"env": {{"T": "${{token}}"}}}})
-"#,
-            c = counter.display()
-        ),
-    );
+    let expiry = ws.dir.path().join("expiry");
+    ws.write_build_file("auth", &lapsing_once_credential(&counter, &expiry));
     ws.write_build_file(
         "app",
         r#"
@@ -1368,24 +1399,65 @@ target(name = "second", driver = "bash", out = "o.txt", cache = False,
        credentials = ["//auth:t"], run = ["printf '%s' \"$T\" > o.txt"])
 "#,
     );
-    ws.run("//app:first").await?;
     assert_eq!(
-        std::fs::read_to_string(&counter)
-            .unwrap_or_default()
-            .lines()
-            .count(),
-        1
+        common::artifact_string(&*ws.run("//app:first").await?),
+        "v1"
     );
-    tokio::time::sleep(std::time::Duration::from_millis(4200)).await;
-    ws.run("//app:second").await?;
+    assert_eq!(acquisitions(&counter), 1);
+    wait_past_expiry(&expiry).await?;
     assert_eq!(
-        std::fs::read_to_string(&counter)
-            .unwrap_or_default()
-            .lines()
-            .count(),
-        2,
+        common::artifact_string(&*ws.run("//app:second").await?),
+        "v2",
         "a target starting after the material lapsed must not be handed it"
     );
+    assert_eq!(acquisitions(&counter), 2);
+    Ok(())
+}
+
+/// A credential whose first acquisition lapses a few seconds later and whose
+/// later ones live ten minutes. Each acquisition appends a line to `counter`
+/// and yields the token `v<n>`; the first writes its absolute expiry, in unix
+/// seconds, to `expiry`.
+///
+/// Three seconds is whole seconds from `date`, so a lifetime of two to three:
+/// `usable_at`'s margin (`min(60s, lifetime/2)`) leaves the material usable
+/// for at least a second after it is acquired, and certainly lapsed once the
+/// wall clock reaches what `expiry` holds.
+fn lapsing_once_credential(counter: &std::path::Path, expiry: &std::path::Path) -> String {
+    format!(
+        r#"
+target(name = "t", driver = "auth.credential",
+       sources = [heph.auth.exec(["sh", "-c",
+           "echo x >> '{c}'; n=$(($(wc -l < '{c}'))); if [ \"$n\" = 1 ]; then e=$(($(date +%s)+3)); echo $e > '{e}'; printf '{{\"token\":\"v%s\",\"expires\":\"%s\"}}' \"$n\" \"$e\"; else printf '{{\"token\":\"v%s\",\"expires\":600}}' \"$n\"; fi"],
+           fields = {{"token": "token"}}, expires = "expires")],
+       present = {{"env": {{"T": "${{token}}"}}}})
+"#,
+        c = counter.display(),
+        e = expiry.display(),
+    )
+}
+
+/// How many times the credential behind `counter` was acquired.
+fn acquisitions(counter: &std::path::Path) -> usize {
+    std::fs::read_to_string(counter)
+        .unwrap_or_default()
+        .lines()
+        .count()
+}
+
+/// Wait until the wall clock is past the unix timestamp written to `expiry`,
+/// so the material carrying it has lapsed.
+async fn wait_past_expiry(expiry: &std::path::Path) -> anyhow::Result<()> {
+    let written = std::fs::read_to_string(expiry)
+        .with_context(|| format!("read the expiry the first acquisition wrote to {expiry:?}"))?;
+    let at: u64 = written
+        .trim()
+        .parse()
+        .with_context(|| format!("parse the expiry {written:?}"))?;
+    let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(at);
+    while std::time::SystemTime::now() <= at {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
     Ok(())
 }
 
@@ -1825,5 +1897,145 @@ async fn a_target_sourced_credential_runs_at_j1() -> anyhow::Result<()> {
         .await
         .context("the consumer hung: its producer is waiting for cpu admission")??;
     assert_eq!(common::artifact_string(&res), "nested");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Material that lapses while the run waits for admission
+// ---------------------------------------------------------------------------
+
+/// Material that lapses while its consumer is queued for the only `sandbox`
+/// slot is acquired again once the run is admitted, rather than handed on.
+///
+/// `//app:hold` takes the slot and parks on a gate. The consumer acquires its
+/// credential (the first acquisition, which lapses three seconds later) and
+/// queues behind it. The gate opens only once the wall clock is past that
+/// expiry, so the consumer is admitted holding lapsed material, hands
+/// everything back, acquires a second time, and runs with `v2`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn material_that_lapses_while_queued_is_acquired_again() -> anyhow::Result<()> {
+    let ws = sandbox_pool_ws(1)?;
+    let gates = tempfile::tempdir()?;
+    let started = gates.path().join("started");
+    let gate = gates.path().join("open");
+    let counter = gates.path().join("acquisitions");
+    let expiry = gates.path().join("expiry");
+    ws.write_build_file("auth", &lapsing_once_credential(&counter, &expiry));
+    ws.write_build_file(
+        "app",
+        &format!(
+            r#"
+target(name = "hold", driver = "bash", out = "o.txt", cache = False,
+       run = ["touch '{started}'; while [ ! -e '{gate}' ]; do sleep 0.02; done; printf held > o.txt"])
+target(name = "c", driver = "bash", out = "o.txt", cache = False,
+       credentials = ["//auth:t"], run = ["printf '%s' \"$T\" > o.txt"])
+"#,
+            started = started.display(),
+            gate = gate.display(),
+        ),
+    );
+
+    let ws = Arc::new(ws);
+    let hold = tokio::spawn({
+        let ws = Arc::clone(&ws);
+        async move { ws.run("//app:hold").await }
+    });
+    let scenario = async {
+        while !started.exists() {
+            anyhow::ensure!(!hold.is_finished(), "the holder ended before it started");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let consumer = tokio::spawn({
+            let ws = Arc::clone(&ws);
+            async move { ws.run("//app:c").await }
+        });
+        // Queued means admitted to nothing yet, with the credential held.
+        while queued(&ws) == 0 {
+            anyhow::ensure!(
+                !consumer.is_finished(),
+                "the consumer ended without queueing behind the holder"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        anyhow::ensure!(
+            acquisitions(&counter) == 1,
+            "the consumer queued holding its first acquisition"
+        );
+        wait_past_expiry(&expiry).await?;
+        std::fs::write(&gate, "")?;
+        hold.await??;
+        anyhow::Ok(consumer.await??)
+    };
+    let consumer = tokio::time::timeout(NESTED_DEADLINE, scenario)
+        .await
+        .with_context(|| format!("the consumer hung: {:?}", ws.engine.resource_snapshot()))??;
+    assert_eq!(
+        common::artifact_string(&consumer),
+        "v2",
+        "material that lapsed in the queue must not be handed to the run"
+    );
+    assert_eq!(
+        acquisitions(&counter),
+        2,
+        "acquired once more, and only once"
+    );
+    Ok(())
+}
+
+/// Material that is lapsed every time it is acquired fails the run after
+/// three acquisitions, naming the credential, and gives back every pool.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn material_that_keeps_lapsing_fails_the_run_after_three_rounds() -> anyhow::Result<()> {
+    let ws = sandbox_pool_ws(1)?;
+    let counter = ws.dir.path().join("acquisitions");
+    // `"1"` is a unix timestamp in 1970: lapsed the moment it is acquired.
+    ws.write_build_file(
+        "auth",
+        &format!(
+            r#"
+target(name = "t", driver = "auth.credential",
+       sources = [heph.auth.exec(["sh", "-c",
+           "echo x >> '{c}'; printf '{{\"token\":\"stale\",\"expires\":\"1\"}}'"],
+           fields = {{"token": "token"}}, expires = "expires")],
+       present = {{"env": {{"T": "${{token}}"}}}})
+"#,
+            c = counter.display()
+        ),
+    );
+    ws.write_build_file(
+        "app",
+        r#"target(name = "c", driver = "bash", out = "o.txt", cache = False,
+       credentials = ["//auth:t"], run = ["printf '%s' \"$T\" > o.txt"])"#,
+    );
+
+    let res = tokio::time::timeout(NESTED_DEADLINE, ws.run("//app:c"))
+        .await
+        .with_context(|| format!("the consumer hung: {:?}", ws.engine.resource_snapshot()))?;
+    let err = expect_err(res, "material that is always lapsed must fail the run");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("//auth:t"), "must name the credential: {msg}");
+    assert!(msg.contains("3 times in a row"), "{msg}");
+    assert_eq!(acquisitions(&counter), 3, "one acquisition per round");
+
+    let snap = ws
+        .engine
+        .resource_snapshot()
+        .context("the run was admitted, so the pool is built")?;
+    let held = |name: &str| {
+        snap.main
+            .pools
+            .iter()
+            .find(|p| p.pool.as_str() == name)
+            .map_or(0, |p| p.held)
+    };
+    assert_eq!(
+        (
+            held(hplugin::provider::PoolName::SANDBOX),
+            held(hplugin::provider::PoolName::CPU),
+            snap.main.queued
+        ),
+        (0, 0, 0),
+        "every round gave back what it was admitted to: {snap:?}"
+    );
     Ok(())
 }
