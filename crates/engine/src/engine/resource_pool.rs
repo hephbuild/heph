@@ -323,7 +323,10 @@ pub fn resolve_capacities(
         .and_then(|s| s.capacity)
         .map_or(sandbox_default, |c| {
             c.resolve(Unit::Count, || sandbox_default)
-        });
+        })
+        // Never empty: the parser refuses 0, and this also covers a default
+        // taken of a `cpu: 0`.
+        .max(1);
     let memory = match specs.get(PoolName::MEMORY).and_then(|s| s.capacity) {
         Some(c @ hcore::capacity::Capacity::Amount(_)) => {
             Limit::Bounded(c.resolve(Unit::Bytes, || 0))
@@ -1651,6 +1654,23 @@ mod tests {
             sandbox_of(&sandbox(Capacity::Percent(200)), 2),
             Limit::Bounded(16),
             "200% of 4 x 2"
+        );
+        // Always bounded and never empty: a percentage that floors to 0, a 0
+        // that slipped past the parser, and a default taken of `cpu: 0`.
+        assert_eq!(
+            sandbox_of(&sandbox(Capacity::Percent(10)), 1),
+            Limit::Bounded(1),
+            "10% of 4 x 1 floors to 0, raised to 1"
+        );
+        assert_eq!(
+            sandbox_of(&sandbox(Capacity::Amount(0)), 1),
+            Limit::Bounded(1),
+            "0 is never an empty sandbox pool"
+        );
+        assert_eq!(
+            sandbox_of(&cpu(Capacity::Amount(0)), 1),
+            Limit::Bounded(1),
+            "a default of cpu: 0 is still one sandbox"
         );
     }
 

@@ -243,7 +243,9 @@ pub struct GlobalOptions {
     /// In the pool's unit: `cpu` in CPUs (`0.5`), `memory` as a size (`24G`),
     /// a custom pool as its configured `unit` (a count unless it says
     /// otherwise); `cpu` and `memory` also take a percentage of their default
-    /// (`memory=75%`). Above 0. Overrides `HEPH_RESOURCE_<NAME>`, which
+    /// (`memory=75%`). Above 0. `sandbox` is the engine's own pool: it bounds
+    /// sandboxes on disk (a count or a percentage of 4 per CPU, never 0).
+    /// Overrides `HEPH_RESOURCE_<NAME>`, which
     /// overrides `resources.<name>` in `.hephconfig`. A pool may be given
     /// once per command line. See `docs/RESOURCES.md`.
     #[arg(
@@ -431,6 +433,22 @@ mod tests {
         // A builtin's value is checked at parse, before any config is read.
         assert!(flags(&["-j", "abc"]).is_err());
         assert!(flags(&["--resource", "memory=lots"]).is_err());
+        // `sandbox` is the engine's own pool and always bounded: 0 is refused
+        // with what it bounds, on the flag and in the environment alike.
+        let err = flags(&["--resource", "sandbox=0"]).unwrap_err().to_string();
+        assert!(err.contains("sandboxes exist on disk"), "{err}");
+        let err = format!(
+            "{:#}",
+            env_over(Specs::new(), &[("HEPH_RESOURCE_SANDBOX", "0")]).unwrap_err()
+        );
+        assert!(
+            err.contains("HEPH_RESOURCE_SANDBOX") && err.contains("engine's own"),
+            "{err}"
+        );
+        assert_eq!(
+            overrides(&["--resource", "sandbox=10%"]).unwrap(),
+            specs(&[("sandbox", Count, Some(Capacity::Percent(10)))])
+        );
         // A custom pool's waits for its unit: `24G` is a count error, but
         // fine once the config says the pool is in bytes.
         assert!(flags(&["--resource", "vram=24G"]).is_ok());
@@ -555,6 +573,7 @@ mod tests {
             ("lic", None),             // declared with no value: unbounded
             ("slot", Some(2)),         // the run bounds an unbounded pool
             ("memory", Some(1 << 30)), // engine default
+            ("sandbox", Some(24)),     // engine default: 4 per CPU of cpu
         ]
         .into_iter()
         .map(|(p, n)| (p.to_string(), n))
@@ -571,10 +590,14 @@ mod tests {
         .unwrap();
         assert_eq!(
             limits(&none, 7),
-            [("cpu", Some(8 * CPU)), ("memory", Some(7))]
-                .into_iter()
-                .map(|(p, n)| (p.to_string(), n))
-                .collect()
+            [
+                ("cpu", Some(8 * CPU)),
+                ("memory", Some(7)),
+                ("sandbox", Some(32))
+            ]
+            .into_iter()
+            .map(|(p, n)| (p.to_string(), n))
+            .collect()
         );
         // A host whose memory could not be read: memory is unbounded.
         assert_eq!(limits(&none, 0)["memory"], None);

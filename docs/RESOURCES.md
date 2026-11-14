@@ -127,7 +127,8 @@ resources:
 - **No value**: a custom pool is **unbounded**: every request is granted at
   once and nothing is clamped, but what is held is still counted and shown.
   `cpu`, `memory` and `sandbox` without a value keep their defaults.
-- **`0`**: "this pool exists; the caller sets its capacity per run". BUILD
+- **`0`** (any pool but `sandbox`, which refuses it): "this pool exists; the
+  caller sets its capacity per run". BUILD
   files naming it validate on every machine, and a run that reaches a target
   needing it fails at admission, before the target runs:
 
@@ -150,8 +151,8 @@ makes it 8.
 **Percentages** (`cpu: 50%`, `memory: 75%`, `sandbox: 200%`, and the same on
 the command line) are of the builtin's default and exist only for the
 builtins: a custom pool has no default to take one of. cpu rounds to the nearest micro-CPU,
-memory floors to bytes, over 100% is an overcommit by choice, and `0%` is an
-error.
+memory floors to bytes, sandbox floors but is at least 1, over 100% is an
+overcommit by choice, and `0%` is an error.
 
 `resources:` merges **per pool** across `HEPH_PROFILES`: a profile that sets
 `cpu` keeps the base's other pools, and one that sets only a pool's `value`
@@ -198,6 +199,9 @@ bounds the build sandboxes on disk, **running or awaiting removal**:
   `${resource:sandbox}` is refused when the def is linked. Size it with
   `--resource sandbox=<n>`, `HEPH_RESOURCE_SANDBOX=<n>` or
   `resources: {sandbox: <n>}`.
+- It is **always bounded**: there is no unbounded form, and `0` is refused on
+  every surface (the config's "the caller sets it" included), as is a unit
+  other than `count`. A pool of your own named `sandbox` must be renamed.
 
 A `cpu: 0` managed target needs a sandbox slot, so it is no longer zero-cost
 and queues like any other run. When removal falls behind, runs wait in

@@ -1918,6 +1918,19 @@ plugins:
                 None,
             ),
             ("resources: {gpu: {}}", "gpu", Unit::Count, None),
+            // `sandbox` sized by the user, as a count or a percentage.
+            (
+                "resources: {sandbox: 8}",
+                "sandbox",
+                Unit::Count,
+                Some(Amount(8)),
+            ),
+            (
+                "resources: {sandbox: \"10%\"}",
+                "sandbox",
+                Unit::Count,
+                Some(hcore::capacity::Capacity::Percent(10)),
+            ),
         ];
         for (yaml, pool, unit, want) in ok {
             let got = resources(yaml).unwrap_or_else(|e| panic!("{yaml}: {e:#}"));
@@ -1945,6 +1958,15 @@ plugins:
             ("resources: {gpu: {unit: count, valu: 1}}", "gpu"),
             ("resources: {cpu: {unit: count, value: 2}}", "builtin"),
             ("resources: {memory: {unit: cpu}}", "builtin"),
+            // `sandbox` is the engine's: never 0 (no "the run sets it"), and
+            // a user pool of that name in another unit is told to rename.
+            ("resources: {sandbox: 0}", "engine's own"),
+            ("resources: {sandbox: {value: 0}}", "engine's own"),
+            (
+                "resources: {sandbox: {unit: bytes, value: 1G}}",
+                "rename it",
+            ),
+            ("resources: {sandbox: {unit: cpu}}", "rename it"),
         ];
         for (yaml, needle) in err {
             let e = resources(yaml).expect_err(yaml);
