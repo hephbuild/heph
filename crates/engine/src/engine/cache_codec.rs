@@ -2,18 +2,21 @@
 //!
 //! A revision written by this version stores its artifacts zstd-compressed
 //! (level [`ZSTD_LEVEL`]) under a [`MANIFEST_V2`](crate::engine::local_cache::MANIFEST_V2)
-//! manifest, and a compressed blob's entry name carries a [`ZSTD_SUFFIX`]. The
-//! remote stores the local bytes verbatim, under the same names and the same
-//! manifest name, so a transfer in either direction neither encodes nor
-//! decodes.
+//! manifest. Every blob a v2 manifest names carries a suffix saying how it is
+//! stored: [`ZSTD_SUFFIX`] when compressed, [`RAW_SUFFIX`] when verbatim (see
+//! [`entry_name`]). The remote stores the local bytes verbatim, under the same
+//! names and the same manifest name, so a transfer in either direction neither
+//! encodes nor decodes.
 //!
-//! Why two new names rather than a new value in the existing `encoding` field:
-//! a heph that predates compression reads `manifest-v1.borsh`, ignores
+//! Why new names rather than a new value in the existing `encoding` field: a
+//! heph that predates compression reads `manifest-v1.borsh`, ignores
 //! `encoding`, and would hand zstd bytes to its tar reader. It never looks up
-//! `manifest-v2.borsh`, so it misses a v2 revision and rebuilds it, writing
-//! its own v1 manifest and raw blobs under names that cannot collide with the
-//! `.zst` ones. Both binaries then keep working on one cache directory or one
-//! bucket.
+//! `manifest-v2.borsh`, so it misses a v2 revision and rebuilds it, writing its
+//! own v1 manifest and blobs under their bare names. A v2 name always ends in
+//! one of [`V2_SUFFIXES`], and a target whose artifacts would make a bare name
+//! equal a suffixed one is refused ([`suffix_collision`]), so the two sets of
+//! names cannot collide. Both binaries then keep working on one cache directory
+//! or one bucket.
 //!
 //! Why zstd at level 1: on Go package archives, Rust rlibs and native
 //! binaries it compresses as well as gzip -6 (2.5–4.6x), about 3.5x faster than
@@ -82,21 +85,60 @@ const ENTRY_SIZE: usize = 8;
 /// the cap only bounds what a corrupt table can make the reader allocate.
 const MAX_FRAME_DECODED: u64 = 64 << 20;
 
-/// Suffix of a zstd-compressed blob's entry name. Keeps compressed and raw
-/// blobs of one revision under distinct keys (see the module docs).
+/// Suffix of the entry name of a blob a v2 manifest names stored zstd-compressed.
 pub(crate) const ZSTD_SUFFIX: &str = ".zst";
+
+/// Suffix of the entry name of a blob a v2 manifest names stored verbatim (a
+/// container whose payload is already compressed, or a `tmp` revision's blob).
+///
+/// A verbatim blob needs a suffix as much as a compressed one: under its bare
+/// name it would share its local key and its remote object with an older
+/// heph's blob of the same artifact (raw locally, gzip on the remote), and
+/// either binary would then read the other's bytes under its own manifest.
+pub(crate) const RAW_SUFFIX: &str = ".raw";
+
+/// Every suffix [`entry_name`] appends. They have one length, so two distinct
+/// bases never map to one entry name (`a + s1 == b + s2` with `|s1| == |s2|`
+/// forces `a == b`): within a v2 revision a collision is unrepresentable. The
+/// one collision left is across versions, with a v1 blob whose *base* ends in
+/// a suffix; [`suffix_collision`] is what refuses it.
+pub(crate) const V2_SUFFIXES: [&str; 2] = [ZSTD_SUFFIX, RAW_SUFFIX];
 
 /// Below this size a container is compressed without scanning its content.
 /// Same reasoning as the remote's former gate: the scan saves seconds on a
 /// 500 MB image and nothing measurable on a 200 KB blob.
 const MIN_SNIFF_BYTES: u64 = 1024 * 1024;
 
-/// The entry name a blob of `base` name is stored under with `encoding`.
+/// The entry name a blob of `base` name is stored under with `encoding`. Every
+/// name a v2 manifest holds comes from here, so it ends in one of
+/// [`V2_SUFFIXES`] and never equals a v1 name of the same artifact, which is
+/// the bare base.
 pub(crate) fn entry_name(base: &str, encoding: &ManifestArtifactEncoding) -> String {
     match encoding {
         ManifestArtifactEncoding::Zstd => format!("{base}{ZSTD_SUFFIX}"),
-        ManifestArtifactEncoding::None | ManifestArtifactEncoding::Gzip => base.to_string(),
+        ManifestArtifactEncoding::None => format!("{base}{RAW_SUFFIX}"),
+        // Never written (`open_writer` refuses it); named apart from both
+        // so that nothing could ever confuse it with a blob that was.
+        ManifestArtifactEncoding::Gzip => format!("{base}.gz"),
     }
+}
+
+/// A pair of bases among one target's artifacts that an older heph and this one
+/// would store under one key: `b` and `b<suffix>`. This version stores `b` as
+/// `b<suffix>`, which is the name an older heph gives the artifact whose base is
+/// `b<suffix>` — a raw blob locally, a gzip object on the remote. Refusing the
+/// pair keeps v1 and v2 entry names of one revision disjoint.
+pub(crate) fn suffix_collision(
+    bases: &std::collections::HashSet<String>,
+) -> Option<(&str, String)> {
+    bases.iter().find_map(|base| {
+        V2_SUFFIXES.iter().find_map(|suffix| {
+            let suffixed = format!("{base}{suffix}");
+            bases
+                .contains(&suffixed)
+                .then_some((base.as_str(), suffixed))
+        })
+    })
 }
 
 /// Open a writer for `(addr, hashin, name)` that stores what it is given
@@ -115,7 +157,10 @@ pub(crate) fn open_writer(
         .with_context(|| format!("open cache writer for {addr} {name}"))?;
     match encoding {
         ManifestArtifactEncoding::None => Ok(inner),
-        ManifestArtifactEncoding::Zstd => Ok(Box::new(ZstdEntryWriter::new(inner)?)),
+        ManifestArtifactEncoding::Zstd => Ok(Box::new(
+            ZstdEntryWriter::new(inner)
+                .with_context(|| format!("open zstd writer for {addr} {name}"))?,
+        )),
         ManifestArtifactEncoding::Gzip => {
             anyhow::bail!("heph does not write gzip cache blobs ({addr} {name})")
         }
@@ -896,15 +941,85 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn entry_name_suffixes_only_compressed_blobs() {
+    fn entry_name_suffixes_every_blob() {
         assert_eq!(
             entry_name("out_a.tar", &ManifestArtifactEncoding::Zstd),
             "out_a.tar.zst"
         );
         assert_eq!(
             entry_name("out_a.tar", &ManifestArtifactEncoding::None),
-            "out_a.tar"
+            "out_a.tar.raw"
         );
+    }
+
+    /// The names a v1 manifest (bare bases) and a v2 manifest (suffixed, in
+    /// either encoding) give one target's artifacts never meet, and no two v2
+    /// names meet each other — for every base set `suffix_collision` lets
+    /// through, including bases that already end in a suffix.
+    #[test]
+    fn v1_and_v2_entry_names_are_disjoint() {
+        use std::collections::HashSet;
+        let pool = [
+            "out_a.tar",
+            "out_a",
+            "out_a.zst",
+            "out_a.raw",
+            "out_a.raw.zst",
+            "out_a.zst.raw",
+            "log_a.tar",
+            "out_.raw",
+            "out_",
+        ];
+        let mut admitted = 0;
+        // Every subset of the pool, as one target's bases.
+        for mask in 0u32..(1 << pool.len()) {
+            let bases: HashSet<String> = pool
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| mask & (1 << i) != 0)
+                .map(|(_, b)| (*b).to_string())
+                .collect();
+            if suffix_collision(&bases).is_some() {
+                continue;
+            }
+            admitted += 1;
+            let mut v2 = HashSet::new();
+            for base in &bases {
+                for enc in [
+                    ManifestArtifactEncoding::None,
+                    ManifestArtifactEncoding::Zstd,
+                ] {
+                    let name = entry_name(base, &enc);
+                    assert!(
+                        !bases.contains(&name),
+                        "{name} is also a v1 name: {bases:?}"
+                    );
+                    // One per (base, encoding): the same base in another
+                    // encoding is a different name too.
+                    assert!(v2.insert(name.clone()), "{name} named twice: {bases:?}");
+                }
+            }
+        }
+        assert!(admitted > 1, "the pool exercised nothing");
+    }
+
+    #[test]
+    fn a_base_and_its_suffixed_twin_are_refused() {
+        use std::collections::HashSet;
+        for suffix in V2_SUFFIXES {
+            let bases: HashSet<String> = ["out_a".to_string(), format!("out_a{suffix}")]
+                .into_iter()
+                .collect();
+            let (base, suffixed) = suffix_collision(&bases).expect("collision");
+            assert_eq!(
+                (base, suffixed.as_str()),
+                ("out_a", format!("out_a{suffix}").as_str())
+            );
+        }
+        let fine: HashSet<String> = ["out_a.tar".to_string(), "out_b.tar.zst".to_string()]
+            .into_iter()
+            .collect();
+        assert!(suffix_collision(&fine).is_none());
     }
 
     /// A tar file whose single member opens with `magic` and runs to `payload`

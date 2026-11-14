@@ -348,7 +348,8 @@ pub struct CacheArtifact {
     pub hashout: String,
     pub group: String,
     pub r#type: ManifestArtifactType,
-    /// Stored byte size from the manifest. Used by the engine auto-mode
+    /// Decoded byte size from the manifest (what the artifact reads back as,
+    /// not what its blob occupies at rest). Used by the engine auto-mode
     /// router to size FUSE vs unpack-copy decisions cheaply.
     pub size: u64,
 }
@@ -474,7 +475,7 @@ fn artifact_is_needed(a: &ManifestArtifact, outputs: &[String], support_needed: 
 
 /// Concurrent local pack jobs (tar/copy of one artifact into the cache).
 ///
-/// Same convention as `CODEC_SLOTS` (remote gzip) and `PKG_EVAL_SLOTS`
+/// Same convention as `CODEC_SLOTS` (remote transfer copies) and `PKG_EVAL_SLOTS`
 /// (Starlark eval): a class of hundreds-of-ms jobs on the shared, arrival-fair
 /// `hcore::blocking` run slots caps itself at the core count so it cannot fill
 /// every slot and put the sub-millisecond jobs (warm-hit manifest reads) behind
@@ -533,8 +534,9 @@ fn cache_entry_name(artifact: &outputartifact::OutputArtifact) -> String {
 /// Which of the two is decided by [`cache_codec::container_encoding`]: a
 /// container whose payload is already compressed is stored verbatim (and so
 /// can still be adopted); any other is compressed into the writer, which is a
-/// copy by construction. Returns the decoded size, the encoding, and the entry
-/// name the blob landed under.
+/// copy by construction. With `compress` false (a `tmp` revision) it is stored
+/// verbatim without a scan. Returns the decoded size, the encoding, and the
+/// entry name the blob landed under.
 fn store_container(
     cache: &dyn LocalCache,
     addr: &Addr,
@@ -542,6 +544,7 @@ fn store_container(
     base_name: &str,
     content: &outputartifact::ContentPath,
     content_type: &ManifestArtifactContentType,
+    compress: bool,
 ) -> anyhow::Result<(u64, ManifestArtifactEncoding, String)> {
     let kind = match content_type {
         ManifestArtifactContentType::Tar => "tar",
@@ -551,7 +554,11 @@ fn store_container(
     let size = std::fs::metadata(src)
         .with_context(|| format!("stat {kind} artifact {}", content.path))?
         .size();
-    let encoding = cache_codec::container_encoding(src, size, content_type);
+    let encoding = if compress {
+        cache_codec::container_encoding(src, size, content_type)
+    } else {
+        ManifestArtifactEncoding::None
+    };
     let name = cache_codec::entry_name(base_name, &encoding);
 
     if encoding == ManifestArtifactEncoding::None
@@ -581,6 +588,7 @@ impl Engine {
         addr: &Addr,
         hashin: &str,
         artifact: &outputartifact::OutputArtifact,
+        compress: bool,
     ) -> anyhow::Result<(CacheArtifact, ManifestArtifact)> {
         let hashin = hashin.to_string();
         // Waited for in async-land, before queueing — parking a run slot to
@@ -599,19 +607,19 @@ impl Engine {
         hcore::blocking::run(enclose!((cache => local_cache, addr, artifact) move || {
             let _slot = slot;
             let base_name = cache_entry_name(&artifact);
-            // What heph packs itself is always compressed: its size is unknown
-            // until packed, and a tar of small files is mostly padding.
+            // What heph packs itself is always compressed in a durable
+            // revision: its size is unknown until packed, and a tar of small
+            // files is mostly padding. A `tmp` revision is read back once, in
+            // this process, so compressing it is CPU spent for nothing.
             // Containers decide per file in `store_container`.
-            let packed_name =
-                cache_codec::entry_name(&base_name, &ManifestArtifactEncoding::Zstd);
+            let packed_encoding = if compress {
+                ManifestArtifactEncoding::Zstd
+            } else {
+                ManifestArtifactEncoding::None
+            };
+            let packed_name = cache_codec::entry_name(&base_name, &packed_encoding);
             let open_writer = |name: &str| -> anyhow::Result<Box<dyn EntryWriter>> {
-                cache_codec::open_writer(
-                    &*local_cache,
-                    &addr,
-                    &hashin,
-                    name,
-                    &ManifestArtifactEncoding::Zstd,
-                )
+                cache_codec::open_writer(&*local_cache, &addr, &hashin, name, &packed_encoding)
             };
             let name = &packed_name;
 
@@ -628,7 +636,7 @@ impl Engine {
                     cw.into_inner().commit().with_context(|| {
                         format!("commit raw artifact {addr} {name}")
                     })?;
-                    (size, hartifactcontent::Type::Tar, ManifestArtifactEncoding::Zstd, packed_name.clone())
+                    (size, hartifactcontent::Type::Tar, packed_encoding.clone(), packed_name.clone())
                 }
                 outputartifact::Content::File(file) => {
                     let mut cw = CountingWriter::new(open_writer(name)?);
@@ -644,7 +652,7 @@ impl Engine {
                     cw.into_inner().commit().with_context(|| {
                         format!("commit file artifact {addr} {name}")
                     })?;
-                    (size, hartifactcontent::Type::Tar, ManifestArtifactEncoding::Zstd, packed_name.clone())
+                    (size, hartifactcontent::Type::Tar, packed_encoding.clone(), packed_name.clone())
                 }
                 // A view normally never arrives here: `is_passthrough` diverts it
                 // before the cache write, because its whole point is to own no
@@ -666,7 +674,7 @@ impl Engine {
                     cw.into_inner().commit().with_context(|| {
                         format!("commit view artifact {addr} {name}")
                     })?;
-                    (size, hartifactcontent::Type::Tar, ManifestArtifactEncoding::Zstd, packed_name.clone())
+                    (size, hartifactcontent::Type::Tar, packed_encoding.clone(), packed_name.clone())
                 }
                 outputartifact::Content::TarPath(content) => {
                     let (size, encoding, name) = store_container(
@@ -676,6 +684,7 @@ impl Engine {
                         &base_name,
                         content,
                         &ManifestArtifactContentType::Tar,
+                        compress,
                     )?;
                     (size, hartifactcontent::Type::Tar, encoding, name)
                 }
@@ -687,6 +696,7 @@ impl Engine {
                         &base_name,
                         content,
                         &ManifestArtifactContentType::Cpio,
+                        compress,
                     )?;
                     (size, hartifactcontent::Type::Cpio, encoding, name)
                 }
@@ -754,17 +764,16 @@ impl Engine {
                     );
                 }
             }
-            // A compressed blob's entry is `<name>.zst`, so `a` compressed and a
-            // raw `a.zst` would land on one key too. Which of them compresses is
-            // decided per write, so refuse the pair whatever the outcome.
-            for name in &seen {
-                let suffixed = format!("{name}{}", cache_codec::ZSTD_SUFFIX);
-                if seen.contains(&suffixed) {
-                    anyhow::bail!(
-                        "cache entry names `{name}` and `{suffixed}` among the artifacts of \
-                         {addr} would collide once `{name}` is compressed"
-                    );
-                }
+            // Distinct bases already get distinct v2 entry names (see
+            // `cache_codec::V2_SUFFIXES`). What is left is the older heph
+            // sharing this cache: it stores `b<suffix>` under its bare name,
+            // which is the name this version gives `b`.
+            if let Some((base, suffixed)) = cache_codec::suffix_collision(&seen) {
+                anyhow::bail!(
+                    "cache entry names `{base}` and `{suffixed}` among the artifacts of {addr} \
+                     collide: this version stores `{base}` as `{suffixed}`, the name an older \
+                     heph sharing the cache gives `{suffixed}`. Rename one of the artifacts"
+                );
             }
         }
 
@@ -811,7 +820,7 @@ impl Engine {
         let key_ref = &key;
         let written = crate::engine::fanout::join_all_failable(
             artifacts.iter().map(|artifact| async move {
-                self.cache_artifact_locally(ctoken, cache, addr, key_ref, artifact)
+                self.cache_artifact_locally(ctoken, cache, addr, key_ref, artifact, !tmp)
                     .await
                     .with_context(|| format!("cache artifact {} for {addr}", artifact.name))
             }),
@@ -2222,9 +2231,97 @@ mod tests {
             ManifestArtifactEncoding::None
         );
         assert_eq!(
-            manifest.artifacts[0].name, "out_out.tar",
-            "no `.zst` suffix"
+            manifest.artifacts[0].name, "out_out.tar.raw",
+            "a verbatim blob is adopted under its v2-only name"
         );
+    }
+
+    /// A `tmp` revision (uncacheable, `--shell`) is read back once, in this
+    /// process, so it is stored verbatim — packed and container artifacts
+    /// alike — and still reads back. A durable revision of the same artifact is
+    /// compressed.
+    #[tokio::test]
+    async fn a_tmp_revision_is_stored_verbatim() {
+        let (engine, dir) = test_engine_spilling_at(64);
+        let ctoken = StdCancellationToken::new();
+        let addr = test_addr();
+
+        let src = dir.path().join("plain.tar");
+        let bytes = vec![7u8; 256 * 1024];
+        std::fs::write(&src, &bytes).expect("write tar");
+        let artifacts = || {
+            vec![
+                raw_artifact("a", b"hello"),
+                tar_artifact("c.tar", &src, false),
+            ]
+        };
+
+        let tmp = engine
+            .cache_locally(&ctoken, &addr, "HASHIN_TMP", artifacts(), true)
+            .await
+            .expect("cache_locally tmp");
+        let durable = engine
+            .cache_locally(&ctoken, &addr, "HASHIN_DURABLE", artifacts(), false)
+            .await
+            .expect("cache_locally durable");
+
+        for (tmp, durable) in tmp.iter().zip(&durable) {
+            assert_eq!(tmp.encoding, ManifestArtifactEncoding::None, "{}", tmp.name);
+            assert!(tmp.name.ends_with(cache_codec::RAW_SUFFIX), "{}", tmp.name);
+            assert_eq!(
+                durable.encoding,
+                ManifestArtifactEncoding::Zstd,
+                "{}",
+                durable.name
+            );
+            assert_eq!(
+                drain_reader(hartifactcontent::Content::reader(tmp).expect("tmp reader")),
+                drain_reader(hartifactcontent::Content::reader(durable).expect("reader")),
+                "{} reads back the same bytes",
+                tmp.name
+            );
+        }
+    }
+
+    /// Two artifacts whose bases differ by a v2 suffix (`b` and `b.raw`) are
+    /// refused before anything is written: this version stores `b` as `b.raw`,
+    /// the bare name an older heph gives the other one.
+    #[tokio::test]
+    async fn a_base_and_its_suffixed_twin_are_refused() {
+        let (engine, dir) = test_engine_spilling_at(64);
+        let ctoken = StdCancellationToken::new();
+        let addr = test_addr();
+        let src = dir.path().join("c.tar");
+        std::fs::write(&src, b"x").expect("write");
+
+        for suffix in cache_codec::V2_SUFFIXES {
+            let Err(err) = engine
+                .cache_locally(
+                    &ctoken,
+                    &addr,
+                    "HASHIN_TWIN",
+                    vec![
+                        tar_artifact("b", &src, false),
+                        tar_artifact(&format!("b{suffix}"), &src, false),
+                    ],
+                    false,
+                )
+                .await
+            else {
+                panic!("a suffixed twin must be refused");
+            };
+            assert!(
+                format!("{err:#}").contains(&format!("`out_b{suffix}`")),
+                "{err:#}"
+            );
+            assert!(
+                engine
+                    .read_manifest(&addr, "HASHIN_TWIN")
+                    .expect("read manifest")
+                    .is_none(),
+                "nothing written"
+            );
+        }
     }
 
     /// The other side of the scan: an owned container of ordinary content is

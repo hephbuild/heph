@@ -6,7 +6,9 @@ The code is `crates/engine/src/engine/cache_codec.rs`.
 ## Format
 
 - A revision is written under `manifest-v2.borsh`. Each artifact's `encoding`
-  says how its blob is stored: `Zstd` (entry name `<name>.zst`) or `None`.
+  says how its blob is stored: `Zstd` (entry name `<name>.zst`) or `None`
+  (verbatim, entry name `<name>.raw`). Every name a v2 manifest holds has one
+  of the two suffixes.
 - A `Zstd` blob is in the zstd seekable format (zstd's
   `contrib/seekable_format`). The decoded bytes are cut into 1 MiB frames,
   each compressed on its own with a checksum. A seek table in a skippable frame
@@ -19,6 +21,9 @@ The code is `crates/engine/src/engine/cache_codec.rs`.
   a tar whose payload is already compressed (an OCI image of gzip layers) is
   stored verbatim and can still be adopted by rename. Anything else is
   compressed.
+- A `tmp` revision (an uncacheable target, `--shell`) is stored verbatim. It
+  is read back once, by the process that wrote it, so compressing it would
+  only cost CPU.
 - `size` in the manifest is the decoded size.
 - The spill threshold between `cache.db` and `blobs/` applies to the stored,
   compressed bytes, so more artifacts stay inline.
@@ -29,9 +34,12 @@ The code is `crates/engine/src/engine/cache_codec.rs`.
 ## Compatibility
 
 A heph that predates this reads only `manifest-v1.borsh` and ignores
-`encoding`. It never sees a v2 revision, so it rebuilds, and its raw blobs use
-names that cannot collide with the `.zst` ones. Both versions can share a cache
-directory or a bucket.
+`encoding`. It never sees a v2 revision, so it rebuilds, and its blobs use
+their bare names. A v2 name always ends in `.zst` or `.raw`, and the two
+suffixes have one length, so distinct artifacts never share a v2 name. The
+only way a bare name could equal a suffixed one is a target with two artifacts
+`b` and `b.zst` (or `b.raw`); heph refuses to cache such a target. Both
+versions can share a cache directory or a bucket.
 
 - Locally, this version still reads v1 revisions, so an upgrade keeps the cache
   warm. GC deletes both manifests and the blobs each one names.
