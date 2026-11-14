@@ -60,7 +60,12 @@ versions can share a cache directory or a bucket.
 Its `CacheArtifact` still has a seekable reader, which decodes through the seek
 table. A FUSE slot serves the blob lazily. The tar index is built from the
 headers and decodes only the frames that hold one. A random read decodes up to
-one frame (1 MiB).
+one frame (1 MiB). Because the layer holds no open reader between reads, a
+layer with no plain file reads whole 1 MiB frames and keeps them in a
+process-wide cache of decoded chunks (32 MiB, least recently used evicted
+first, keyed by layer and frame). The kernel's 128 KiB reads of one frame then
+decode it once, not eight times. A layer backed by a plain file reads exactly
+what was asked.
 
 Two things are lost:
 

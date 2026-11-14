@@ -11,6 +11,7 @@
 //! sections. Read paths (layer bytes via tar index, upper passthrough)
 //! never touch the mutex.
 
+use crate::chunk_cache::{self, ChunkCache};
 use anyhow::Context;
 use crossbeam_channel::{Sender, unbounded};
 use fuser::{
@@ -55,27 +56,75 @@ const UPPER_FILE_MODE: u32 = 0o600;
 const UPPER_DIR_MODE: u32 = 0o700;
 
 /// Lazy opener for a layer's seekable byte source. Called per FUSE read
-/// so that we don't pin a sqlite connection (or other backing resource)
-/// for the lifetime of the mount — large dep sets would otherwise
-/// exhaust the connection pool.
+/// (per chunk load, for a layer built [`Layer::with_read_chunk`]) so that
+/// we don't pin a sqlite connection (or other backing resource) for the
+/// lifetime of the mount — large dep sets would otherwise exhaust the
+/// connection pool.
 pub type LayerOpener = Box<dyn Fn() -> anyhow::Result<Box<dyn ReadSeek + Send>> + Send + Sync>;
 
 /// One read-only layer. The `TarIndex` is built once; bytes are fetched
 /// on demand via `open`. No backing handle is held across FUSE ops, so
 /// concurrent reads are bounded by the connection pool rather than the
 /// layer count.
+///
+/// By default a FUSE read opens the source and reads exactly the requested
+/// range. A layer built [`Layer::with_read_chunk`] reads aligned chunks
+/// instead and keeps the decoded bytes in the process-wide
+/// [`ChunkCache`](crate::chunk_cache::ChunkCache), so the kernel's 128 KiB
+/// reads of a compressed blob decode each frame once rather than once per
+/// read.
 pub struct Layer {
     pub index: TarIndex,
     open: LayerOpener,
     /// Pre-computed directory children: dir path → vec of (child name, kind).
     /// Includes implicit ancestor dirs that have no explicit tar entry.
     dirs: HashMap<PathBuf, Vec<(OsString, IndexEntryKind)>>,
+    /// The layer's key in the chunk cache; unique for the process.
+    id: u64,
+    chunking: Option<Chunking>,
+}
+
+/// How a chunked layer reads: `size`-byte chunks aligned on the source's
+/// offset 0, kept in `cache`.
+struct Chunking {
+    size: u64,
+    cache: std::sync::Arc<ChunkCache>,
 }
 
 impl Layer {
     pub fn new(index: TarIndex, open: LayerOpener) -> Self {
         let dirs = build_layer_dirs(&index);
-        Self { index, open, dirs }
+        Self {
+            index,
+            open,
+            dirs,
+            id: chunk_cache::next_layer_id(),
+            chunking: None,
+        }
+    }
+
+    /// Serve FUSE reads in `chunk`-byte reads aligned on the source's start,
+    /// through the process-wide chunk cache. For a source whose every read
+    /// costs a whole block regardless of its length (a compressed blob, at
+    /// [`crate::COMPRESSED_READ_CHUNK`]). A `chunk` of 0 leaves reads exact.
+    pub fn with_read_chunk(self, chunk: usize) -> Self {
+        self.with_read_chunk_in(chunk, ChunkCache::global())
+    }
+
+    fn with_read_chunk_in(mut self, chunk: usize, cache: std::sync::Arc<ChunkCache>) -> Self {
+        self.chunking = (chunk > 0).then_some(Chunking {
+            size: chunk as u64,
+            cache,
+        });
+        self
+    }
+}
+
+impl Drop for Layer {
+    fn drop(&mut self) {
+        if let Some(c) = &self.chunking {
+            c.cache.forget_layer(self.id);
+        }
     }
 }
 
@@ -1210,10 +1259,52 @@ const ENOATTR: i32 = libc::ENODATA;
 /// zstd decoder does at every frame boundary), and the rest of the file would
 /// come back as zeros.
 fn read_layer_range(layer: &Layer, data_offset: u64, want: usize) -> std::io::Result<Vec<u8>> {
+    match &layer.chunking {
+        None => read_source(layer, data_offset, want),
+        Some(chunking) => read_chunked(layer, chunking, data_offset, want),
+    }
+}
+
+/// [`read_layer_range`] through the chunk cache: each chunk the range
+/// touches is copied from the cache, loaded with one opener call on a miss.
+fn read_chunked(
+    layer: &Layer,
+    chunking: &Chunking,
+    data_offset: u64,
+    want: usize,
+) -> std::io::Result<Vec<u8>> {
+    let size = chunking.size;
+    let end = data_offset.saturating_add(want as u64);
+    let mut out = Vec::with_capacity(want);
+    let mut pos = data_offset;
+    while pos < end {
+        let index = pos / size;
+        let start = index * size;
+        let chunk = chunking
+            .cache
+            .get_or_load(layer.id, index, || read_source(layer, start, size as usize))?;
+        let from = (pos - start) as usize;
+        let to = ((end - start) as usize).min(chunk.len());
+        let Some(bytes) = chunk.get(from..to) else {
+            // `from` is past a short (final) chunk: end of the source.
+            break;
+        };
+        out.extend_from_slice(bytes);
+        if (chunk.len() as u64) < size {
+            break;
+        }
+        pos = start + size;
+    }
+    Ok(out)
+}
+
+/// `len` bytes of the layer's source at `offset`, from a freshly opened
+/// reader; fewer only at the end of the source.
+fn read_source(layer: &Layer, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
     let mut reader =
         (layer.open)().map_err(|e| std::io::Error::other(format!("open layer reader: {e}")))?;
-    reader.seek(SeekFrom::Start(data_offset))?;
-    let mut buf = vec![0u8; want];
+    reader.seek(SeekFrom::Start(offset))?;
+    let mut buf = vec![0u8; len];
     let n = read_full(&mut reader, &mut buf)?;
     buf.truncate(n);
     Ok(buf)
@@ -1618,6 +1709,168 @@ mod tests {
         let got = read_layer_range(&layer, entry.data_offset + off as u64, want).expect("read");
         assert_eq!(got.len(), want, "short read returned as EOF");
         assert_eq!(got, content[off..off + want]);
+    }
+
+    /// A chunked layer over `bytes` (served in short reads, as a decoder
+    /// would) whose opener counts its calls.
+    fn counting_chunked_layer(
+        bytes: Vec<u8>,
+        chunk: usize,
+        cache: std::sync::Arc<ChunkCache>,
+    ) -> (
+        std::sync::Arc<Layer>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let opens = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let index = TarIndex::build(Cursor::new(bytes.clone())).expect("index");
+        let counter = std::sync::Arc::clone(&opens);
+        let opener: LayerOpener = Box::new(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Box::new(ShortReads {
+                inner: Cursor::new(bytes.clone()),
+                max: 300,
+            }))
+        });
+        let layer = Layer::new(index, opener).with_read_chunk_in(chunk, cache);
+        (std::sync::Arc::new(layer), opens)
+    }
+
+    fn file_offset(layer: &Layer, path: &str) -> u64 {
+        layer
+            .index
+            .entries
+            .get(Path::new(path))
+            .expect("entry")
+            .data_offset
+    }
+
+    #[test]
+    fn chunked_reads_within_a_chunk_open_once() {
+        let content = patterned(20_000);
+        let cache = std::sync::Arc::new(ChunkCache::new(1, 8));
+        let (layer, opens) = counting_chunked_layer(pack(&[("f.bin", &content)]), 4096, cache);
+        let base = file_offset(&layer, "f.bin");
+        // The first chunk after the file's start, read in 512-byte pieces.
+        let first = (base / 4096 + 1) * 4096 - base;
+        for i in 0..8u64 {
+            let off = first + i * 512;
+            let got = read_layer_range(&layer, base + off, 512).expect("read");
+            let off = off as usize;
+            assert_eq!(got, content[off..off + 512]);
+        }
+        assert_eq!(opens.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn chunked_read_across_chunks_opens_once_per_chunk() {
+        let content = patterned(20_000);
+        let cache = std::sync::Arc::new(ChunkCache::new(1, 8));
+        let (layer, opens) = counting_chunked_layer(pack(&[("f.bin", &content)]), 4096, cache);
+        let base = file_offset(&layer, "f.bin");
+        // 10_000 bytes from file offset 100 touch chunks
+        // (base+100)/4096 ..= (base+10_099)/4096.
+        let got = read_layer_range(&layer, base + 100, 10_000).expect("read");
+        assert_eq!(got, content[100..10_100]);
+        let chunks = (base + 10_099) / 4096 - (base + 100) / 4096 + 1;
+        assert_eq!(
+            opens.load(std::sync::atomic::Ordering::SeqCst) as u64,
+            chunks
+        );
+        // Read again: all from the cache.
+        let again = read_layer_range(&layer, base + 100, 10_000).expect("read");
+        assert_eq!(again, got);
+        assert_eq!(
+            opens.load(std::sync::atomic::Ordering::SeqCst) as u64,
+            chunks
+        );
+    }
+
+    #[test]
+    fn chunked_read_stops_at_end_of_source() {
+        let content = patterned(5000);
+        let tar = pack(&[("f.bin", &content)]);
+        let tar_len = tar.len() as u64;
+        let cache = std::sync::Arc::new(ChunkCache::new(1, 8));
+        let (layer, _) = counting_chunked_layer(tar, 4096, cache);
+        // A request running past the source's end returns what is there.
+        let got = read_layer_range(&layer, tar_len - 10, 100).expect("read");
+        assert_eq!(got.len(), 10);
+        assert!(
+            read_layer_range(&layer, tar_len + 5000, 100)
+                .expect("read")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn chunked_cache_is_bounded_and_evicts() {
+        let content = patterned(40_000);
+        let cache = std::sync::Arc::new(ChunkCache::new(1, 2));
+        let (layer, opens) = counting_chunked_layer(
+            pack(&[("f.bin", &content)]),
+            4096,
+            std::sync::Arc::clone(&cache),
+        );
+        let base = file_offset(&layer, "f.bin");
+        let opens_now = || opens.load(std::sync::atomic::Ordering::SeqCst);
+        // Read three distinct chunks, then the first again.
+        for i in [0u64, 1, 2, 0] {
+            let off = (base / 4096 + 1 + i) * 4096;
+            let got = read_layer_range(&layer, off, 16).expect("read");
+            let rel = (off - base) as usize;
+            assert_eq!(got, content[rel..rel + 16]);
+        }
+        assert_eq!(opens_now(), 4, "the first chunk was evicted");
+        drop(layer);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        // The dropped layer's chunks are gone: the cache holds nothing a
+        // later load could be confused with.
+        for i in 0..2 {
+            cache
+                .get_or_load(u64::MAX, i, || {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(vec![0])
+                })
+                .expect("load");
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn chunked_concurrent_reads_return_correct_bytes() {
+        let files: Vec<(String, Vec<u8>)> = (0..4)
+            .map(|i| {
+                let mut c = patterned(30_000 + i * 777);
+                c.rotate_left(i * 13);
+                (format!("f{i}.bin"), c)
+            })
+            .collect();
+        let refs: Vec<(&str, &[u8])> = files
+            .iter()
+            .map(|(p, c)| (p.as_str(), c.as_slice()))
+            .collect();
+        // A cache smaller than the working set, so loads and evictions race.
+        let cache = std::sync::Arc::new(ChunkCache::new(2, 2));
+        let (layer, _) = counting_chunked_layer(pack(&refs), 4096, cache);
+        std::thread::scope(|s| {
+            for t in 0..8usize {
+                let layer = &layer;
+                let files = &files;
+                s.spawn(move || {
+                    for round in 0..200usize {
+                        let (path, content) = &files[(t + round) % files.len()];
+                        let base = file_offset(layer, path);
+                        let off = (t * 1031 + round * 7919) % content.len();
+                        let want = 1 + (round * 337 + t) % 9000;
+                        let got = read_layer_range(layer, base + off as u64, want).expect("read");
+                        let end = (off + want).min(content.len());
+                        // The range may run past the file into the next
+                        // tar entry; compare the file's own bytes.
+                        assert_eq!(&got[..end - off], &content[off..end], "{path}@{off}+{want}");
+                    }
+                });
+            }
+        });
     }
 
     #[test]
