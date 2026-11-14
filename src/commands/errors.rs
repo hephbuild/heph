@@ -749,11 +749,19 @@ impl FailedTargets {
     }
 
     /// [`FailedTargets::reported`] against the real stderr — what `finalize!` uses.
+    /// What it printed is recorded in the session, so an attached viewer prints
+    /// the report too.
     pub fn reported_to_stderr(
         failures: Vec<Arc<TargetFailure>>,
         incomplete: Option<crate::engine::discovery::GapReport>,
     ) -> Self {
-        Self::reported(failures, incomplete, &mut io::stderr(), color_enabled())
+        let mut out = Vec::new();
+        let this = Self::reported(failures, incomplete, &mut out, color_enabled());
+        // Best-effort, like the write in `reported`: the exit code carries the
+        // failure out either way.
+        drop(io::Write::write_all(&mut io::stderr(), &out));
+        crate::tui::session::process().record_output(&String::from_utf8_lossy(&out));
+        this
     }
 
     pub fn failures(&self) -> &[Arc<TargetFailure>] {
@@ -798,6 +806,8 @@ pub fn render_anyhow(e: &anyhow::Error) -> bool {
     match render_anyhow_to_string(e, color_enabled()) {
         Some(out) => {
             eprint!("{out}");
+            // An attached viewer prints the report below its summary too.
+            crate::tui::session::process().record_output(&out);
             true
         }
         None => false,
