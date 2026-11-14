@@ -328,7 +328,9 @@ reservation).
     pool's capacity, nothing more is admitted that would take what it needs:
     its pools drain and it starts. A `cpu: 0.1` fetch is overtaken once or
     twice; a `cpu: 8` link on 8 CPUs by 32 CPUs' worth of targets. The next
-    oldest waiter starts from zero.
+    oldest waiter starts from zero. A request for a whole pool pays for this
+    with a longer wait than strict FIFO gave it ([Sizing a
+    declaration](#sizing-a-declaration)).
 
   What follows from them:
   - No starvation, and the same arrivals and completions give the same
@@ -381,15 +383,28 @@ CPUs, `bytes` human-sized, `count` as an integer), from the `units` that
   ⧗ //a:b waits for cpu 1 (3 free, yielding to a cpu 8 run, 41s)
   ```
 
-  The oldest waiter is the row with `0 ahead`.
+  A `yielding to` row carries no `ahead` and is never the oldest waiter's:
+  the oldest waiter is the row with `0 ahead`. `yielding to` on a waiter's
+  row is the situation the in-flight report calls `draining` on the head's
+  line. The oldest waiter's own row says neither how far it has been
+  overtaken nor that its pools are draining: the in-flight report's `head`
+  line (below) is where that shows.
 
 - `ExecuteStart` carries the `declared` and `reserved` amounts, `queued_ms`,
   how long the run waited, so a wait under the threshold is still answerable
-  from the event stream, and `admitted`, how it got in: `arrival` (it fit
-  with nobody waiting), `head` (as the oldest waiter), `handoff` (ahead of
-  an older waiter, in the slot a run of its shape released) or `pass` (ahead
-  of an older waiter, in capacity that was free). A consumer treats a value
-  it does not know (`unknown`) like an absent one.
+  from the event stream, and `admitted`, how it got in. Its four values are
+  exclusive:
+  - `arrival`: it started on arrival with nobody waiting, or it reserves
+    nothing of a bounded pool.
+  - `head`: it started as the oldest waiter.
+  - `handoff`: ahead of an older waiter, in the slot a run of its shape
+    released.
+  - `pass`: ahead of an older waiter, in capacity that was free, from the
+    queue or on arrival. An arrival that starts while another target waits
+    is `pass`, not `arrival`.
+
+  Only `handoff` and `pass` started ahead of an older waiter. A consumer
+  treats a value it does not know (`unknown`) like an absent one.
 - The in-flight report (SIGQUIT) prints each pool's held/capacity in its
   unit, the queue length, the sandbox removals still owed when there are
   any, what the oldest waiter waits for and for how long, and how far it has
@@ -415,8 +430,16 @@ target(name = "half", ..., resources = {"cpu": heph.core.resource("cpu") / 2})
 A target that asks for a whole pool starts only once the pool is empty, and
 the engine empties it only after other targets adding up to 4 times the pool
 have started ahead of it: it waits about four pool-lengths of the work that
-passes it. Declare the full width for a target that uses it, not as a way to
-run alone.
+passes it. That is the cap, and a request for the whole pool reaches it; a
+smaller request is overtaken by at most 16 times its own need
+([Admission](#admission)).
+
+So a request for a whole pool **waits longer than it did under strict
+FIFO**, and the cost falls on that target. On a replay of a busy build, a
+target asking for the whole `memory` pool waited about 94 s against about
+37 s, and the build was about 2% slower. Declare the width the target
+actually uses: the full width only for a target that uses it, never as a way
+to run alone.
 
 The intended use is exactly that, a `resources` amount. Anything else puts a
 per-machine number into driver config and so into the def hash of the target

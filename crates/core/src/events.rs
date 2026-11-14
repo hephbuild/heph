@@ -680,6 +680,11 @@ impl AdmittedKind {
 /// What a waiter that fits is held back for, carried on
 /// [`BuildEventKind::AdmissionWaitStart`]: the oldest waiter's need of the
 /// first pool where both cannot fit.
+///
+/// `pool` and `need` are permanent: no later host drops or renames them. A
+/// field added here later must be `#[serde(default)]`, because a frame that
+/// fails to decode ends a hook's stream. An inner field this build does not
+/// know is ignored.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct YieldingToData {
     /// The pool the oldest waiter needs. Not always the pool the event
@@ -1304,6 +1309,29 @@ mod tests {
                 assert_eq!((addr.as_str(), pool.as_str()), ("//a:x", "cpu"));
                 assert_eq!((need, free, ahead), (1_000_000, 3_000_000, 2));
                 assert_eq!(removals_pending, None);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// A newer host may add a field inside `yielding_to`. This build ignores
+    /// it and keeps the two it knows, so the frame decodes and a hook's
+    /// stream goes on.
+    #[test]
+    fn an_unknown_field_inside_yielding_to_is_ignored() {
+        let newer = r#"{"at_unix_ms":1,"kind":{"type":"AdmissionWaitStart","addr":"//a:x",
+            "pool":"cpu","need":1,"free":3,"ahead":2,
+            "yielding_to":{"pool":"cpu","need":1,"extra":2}}}"#;
+        let ev: BuildEvent = serde_json::from_str(newer).expect("unknown inner fields are ignored");
+        match ev.kind {
+            BuildEventKind::AdmissionWaitStart { yielding_to, .. } => {
+                assert_eq!(
+                    yielding_to,
+                    Some(YieldingToData {
+                        pool: "cpu".into(),
+                        need: 1,
+                    })
+                );
             }
             other => panic!("wrong variant: {other:?}"),
         }
