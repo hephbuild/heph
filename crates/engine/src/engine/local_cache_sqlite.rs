@@ -1,3 +1,6 @@
+use crate::engine::cache_db_space::{
+    self, CompactReport, JOURNAL_SIZE_LIMIT_BYTES, MaintainKind, ReclaimPolicy, WRITER_BUSY_TIMEOUT,
+};
 use crate::engine::local_cache::{
     EntryWriter, Existence, LocalCache, NotFoundError, PendingWrite, SizedReader, TargetStream,
 };
@@ -6,15 +9,17 @@ use hcore::hartifactcontent;
 use hmodel::htaddr::Addr;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{Connection, OpenFlags};
-use std::collections::HashMap;
+use std::cell::Cell;
+use std::collections::{HashMap, VecDeque};
 use std::future::{Future, poll_fn};
 use std::io::{self, Seek};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Poll, Waker};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tempfile::SpooledTempFile;
 
 const SPOOL_MEM_THRESHOLD: usize = 1024 * 1024;
@@ -347,9 +352,29 @@ struct DeleteJob {
     slot: Arc<PendingSlot>,
 }
 
+/// A maintenance pass (see [`cache_db_space`]) for the writer thread, which runs
+/// it on its connection — the one every cache write goes through — and sends the
+/// outcome back on `reply`.
+struct MaintainJob {
+    kind: MaintainKind,
+    /// Polled at every chunk boundary; false abandons the pass there.
+    keep_going: Box<dyn Fn() -> bool + Send>,
+    reply: mpsc::Sender<Result<CompactReport>>,
+    /// Test hook, run on the writer thread after each chunk with the chunk's
+    /// index, before the queued writes are drained.
+    #[cfg(test)]
+    on_chunk: Option<ChunkHook>,
+}
+
+#[cfg(test)]
+type ChunkHook = Box<dyn FnMut(usize, &Connection) + Send>;
+
 enum WriterCmd {
     Write(WriteJob),
     Delete(DeleteJob),
+    /// Never part of a write batch: [`collect_batch`] sets it aside, and the
+    /// writer runs it once the batch it interrupted has committed.
+    Maintain(MaintainJob),
 }
 
 /// Test-only brake on the writer thread, held closed while a test observes the
@@ -409,6 +434,9 @@ const SCHEMA_VERSION: i64 = 1;
 struct Writer {
     tx: mpsc::Sender<WriterCmd>,
     handle: JoinHandle<()>,
+    /// Set when the cache is dropped: the writer stops retrying a batch
+    /// another process's lock keeps out (see [`commit_with_retry`]).
+    closing: Arc<AtomicBool>,
 }
 
 /// The local SQLite cache.
@@ -435,9 +463,151 @@ pub struct LocalCacheSQLite {
     inline_threshold: usize,
     #[cfg(any(test, feature = "test-support"))]
     gate: Arc<WriterGate>,
+    /// Test overrides of the maintenance knobs, so a test neither waits out
+    /// the reclaim interval nor fills a disk. See
+    /// [`Self::set_maintenance_overrides`].
+    #[cfg(any(test, feature = "test-support"))]
+    overrides: Mutex<MaintenanceOverrides>,
+}
+
+/// See [`LocalCacheSQLite::set_maintenance_overrides`].
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MaintenanceOverrides {
+    /// Replaces [`ReclaimPolicy::default`] for the end-of-request reclaim, and
+    /// its chunk size for `heph tool gc`.
+    pub policy: Option<ReclaimPolicy>,
+    /// The free bytes every filesystem reports to the conversion space check.
+    pub free_space: Option<u64>,
+    /// Replaces `MIGRATE_LOCK_TIMEOUT` as `heph tool gc`'s wait for the
+    /// migration lock before it skips a conversion.
+    pub migrate_lock_timeout: Option<Duration>,
+    /// Replaces [`WRITER_BUSY_TIMEOUT`] on the writer connection. Read when
+    /// the writer is spawned, i.e. by the first write.
+    pub busy_timeout: Option<Duration>,
+    /// Replaces [`WRITE_BUSY_RETRY_TOTAL`]. Read when the writer is spawned.
+    pub busy_retry_total: Option<Duration>,
+}
+
+/// The maintenance knobs in effect: the defaults, or a test's overrides.
+#[derive(Debug, Clone, Copy)]
+struct Knobs {
+    policy: ReclaimPolicy,
+    free_space: Option<u64>,
+    migrate_lock_timeout: Duration,
+    busy_timeout: Duration,
+    busy_retry_total: Duration,
 }
 
 impl LocalCacheSQLite {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_maintenance_overrides(&self, o: MaintenanceOverrides) {
+        *self.overrides.lock().expect("overrides poisoned") = o;
+    }
+
+    fn knobs(&self) -> Knobs {
+        let k = Knobs {
+            policy: ReclaimPolicy::default(),
+            free_space: None,
+            migrate_lock_timeout: hwalk::migrate_lock::MIGRATE_LOCK_TIMEOUT,
+            busy_timeout: WRITER_BUSY_TIMEOUT,
+            busy_retry_total: WRITE_BUSY_RETRY_TOTAL,
+        };
+        #[cfg(any(test, feature = "test-support"))]
+        let k = {
+            let o = *self.overrides.lock().expect("overrides poisoned");
+            Knobs {
+                policy: o.policy.unwrap_or(k.policy),
+                free_space: o.free_space,
+                migrate_lock_timeout: o.migrate_lock_timeout.unwrap_or(k.migrate_lock_timeout),
+                busy_timeout: o.busy_timeout.unwrap_or(k.busy_timeout),
+                busy_retry_total: o.busy_retry_total.unwrap_or(k.busy_retry_total),
+            }
+        };
+        k
+    }
+
+    /// Hand `kind` to the writer thread and wait for its report. Parks the
+    /// calling thread: callers are the bookkeeping lane and a blocking task.
+    fn maintain(
+        &self,
+        kind: MaintainKind,
+        keep_going: Box<dyn Fn() -> bool + Send>,
+        #[cfg(test)] on_chunk: Option<ChunkHook>,
+    ) -> Result<CompactReport> {
+        let (reply, rx) = mpsc::channel();
+        self.writer_tx()?
+            .send(WriterCmd::Maintain(MaintainJob {
+                kind,
+                keep_going,
+                reply,
+                #[cfg(test)]
+                on_chunk,
+            }))
+            .map_err(|_closed| anyhow::anyhow!("sqlite cache writer thread is gone"))?;
+        rx.recv()
+            .context("sqlite cache writer thread exited during maintenance")?
+    }
+
+    /// The end-of-request reclaim, after the `cache.history` trim: vacuum an
+    /// `INCREMENTAL` database if [`ReclaimPolicy::due`], within its time
+    /// budget. See [`cache_db_space`].
+    pub(crate) fn reclaim_after_trim(&self) -> Result<CompactReport> {
+        self.maintain(
+            MaintainKind::AfterTrim(self.knobs().policy),
+            Box::new(|| true),
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    /// `heph tool gc`'s pass: convert a `NONE` database if the disk has room,
+    /// or vacuum an `INCREMENTAL` one completely. `keep_going` is polled
+    /// between chunks of an incremental vacuum.
+    ///
+    /// A conversion runs under the schema migration lock: changing
+    /// `auto_vacuum` is a change to the file's persistent settings, which is
+    /// what that lock serializes, and it keeps two `heph tool gc` from both
+    /// rewriting the file. A lock another process holds past the usual wait
+    /// skips the conversion (and still vacuums, if the database is already
+    /// `INCREMENTAL`) rather than failing the sweep.
+    ///
+    /// The lock is held for the whole pass, the conversion's `VACUUM`
+    /// included, which rewrites the file and holds its write lock throughout:
+    /// another heph process using this home meanwhile waits — its schema check
+    /// on the migration lock (up to `MIGRATE_LOCK_TIMEOUT`, only for a database
+    /// it has to migrate), its cache writes on the write lock, which its writer
+    /// retries for up to [`WRITE_BUSY_RETRY_TOTAL`] in all before dropping the
+    /// batches still kept out.
+    pub(crate) fn compact_for_gc(
+        &self,
+        keep_going: Box<dyn Fn() -> bool + Send>,
+    ) -> Result<CompactReport> {
+        self.ensure_schema()?;
+        let knobs = self.knobs();
+        let (lock, convert_blocked) =
+            match hwalk::migrate_lock::lock_migration(&self.db_path, knobs.migrate_lock_timeout) {
+                Ok(lock) => (Some(lock), None),
+                Err(e) => {
+                    let reason = format!("{e:#}");
+                    tracing::warn!(error = %reason, "cache.db conversion skipped");
+                    (None, Some(reason))
+                }
+            };
+        let report = self.maintain(
+            MaintainKind::Gc {
+                convert_blocked,
+                chunk_bytes: knobs.policy.chunk_bytes,
+                free_space_override: knobs.free_space,
+            },
+            keep_going,
+            #[cfg(test)]
+            None,
+        );
+        drop(lock);
+        report
+    }
+
     /// Resolve once every write queued before the call has committed.
     ///
     /// For a caller about to leave the process without the teardown that
@@ -561,6 +731,8 @@ impl LocalCacheSQLite {
             inline_threshold,
             #[cfg(any(test, feature = "test-support"))]
             gate: Arc::new(WriterGate::default()),
+            #[cfg(any(test, feature = "test-support"))]
+            overrides: Mutex::new(MaintenanceOverrides::default()),
         })
     }
 
@@ -648,18 +820,28 @@ impl LocalCacheSQLite {
             .with_context(|| format!("opening sqlite cache at {:?}", self.db_path))?;
         // Per-connection settings only; the persistent ones (journal mode,
         // auto-vacuum, page size) are the schema's, applied by `migrate_schema`.
-        conn.execute_batch(
-            "PRAGMA busy_timeout = 10000;
-             PRAGMA synchronous = NORMAL;
+        // `journal_size_limit` truncates the WAL back to that size whenever it
+        // is reset, so a large batch or a vacuum does not leave it at its
+        // high-water mark.
+        conn.execute_batch(&format!(
+            "PRAGMA synchronous = NORMAL;
              PRAGMA foreign_keys = ON;
              PRAGMA temp_store = MEMORY;
              PRAGMA cache_size = -64000;
-             PRAGMA mmap_size = 268435456;",
-        )
+             PRAGMA mmap_size = 268435456;
+             PRAGMA journal_size_limit = {JOURNAL_SIZE_LIMIT_BYTES};"
+        ))
         .context("configuring sqlite cache write connection")?;
+        let knobs = self.knobs();
+        conn.busy_timeout(knobs.busy_timeout)
+            .context("setting the sqlite cache writer busy timeout")?;
+        let busy_retry_total = knobs.busy_retry_total;
 
         let (tx, rx) = mpsc::channel::<WriterCmd>();
         let pending = Arc::clone(&self.pending);
+        let db_path = self.db_path.clone();
+        let closing = Arc::new(AtomicBool::new(false));
+        let thread_closing = Arc::clone(&closing);
         #[cfg(any(test, feature = "test-support"))]
         let gate = Arc::clone(&self.gate);
         let handle = std::thread::Builder::new()
@@ -667,14 +849,24 @@ impl LocalCacheSQLite {
             .spawn(move || {
                 writer_loop(
                     &mut conn,
-                    &rx,
-                    &pending,
-                    #[cfg(any(test, feature = "test-support"))]
-                    &gate,
+                    &WriterEnv {
+                        rx: &rx,
+                        pending: &pending,
+                        db_path: &db_path,
+                        closing: &thread_closing,
+                        busy_retry_total,
+                        busy_since: Cell::new(None),
+                        #[cfg(any(test, feature = "test-support"))]
+                        gate: &gate,
+                    },
                 )
             })
             .context("spawning sqlite writer thread")?;
-        Ok(Writer { tx, handle })
+        Ok(Writer {
+            tx,
+            handle,
+            closing,
+        })
     }
 
     fn key(addr: &Addr) -> String {
@@ -720,7 +912,15 @@ impl LocalCacheSQLite {
 impl Drop for LocalCacheSQLite {
     fn drop(&mut self) {
         // Nothing to do when nothing was ever written: no writer was spawned.
-        if let Some(Ok(Writer { tx, handle })) = self.writer.take() {
+        if let Some(Ok(Writer {
+            tx,
+            handle,
+            closing,
+        })) = self.writer.take()
+        {
+            // A batch kept out by another process's write lock gets one more
+            // attempt, not minutes of retries: the drop must not hang exit.
+            closing.store(true, Ordering::Release);
             // Close the channel so the writer thread observes a Disconnected,
             // finishes its queue and exits cleanly.
             drop(tx);
@@ -763,21 +963,36 @@ fn migrate_schema(db_path: &std::path::Path) -> Result<()> {
         // Another process migrated while this one waited for the lock.
         return Ok(());
     }
-    // Outside the transaction: neither can change inside one. Both persist in
-    // the file, and the order is load-bearing: the page size only takes effect
-    // on a database whose header is not written yet, and switching to WAL
-    // writes it — WAL first left every database at the 4 KiB default, which is
-    // what every pre-versioning database has. On such a database (version 0,
-    // already WAL) the page size is a silent no-op, which is harmless: it is a
-    // per-file setting every sqlite reads.
+    // Outside the transaction: none can change inside one. All persist in the
+    // file, and the order is load-bearing: the page size and auto-vacuum only
+    // take effect on a database whose header is not written yet, and switching
+    // to WAL writes it — WAL first left every database at the 4 KiB default
+    // and auto-vacuum NONE, which is what every pre-versioning database has.
+    // On such a database (version 0, already WAL) the page size is a silent
+    // no-op, which is harmless: it is a per-file setting every sqlite reads.
     //
-    // No `auto_vacuum`: nothing ever runs `incremental_vacuum`, so INCREMENTAL
-    // would only add pointer-map pages, and no existing database has it — the
-    // old open-time batch set it after WAL too, where it never took effect.
-    conn.execute_batch(
+    // `auto_vacuum = INCREMENTAL` only on a database with no tables yet: there
+    // it is free, and it lets the end-of-request reclaim return free pages to
+    // the filesystem (`cache_db_space`). An existing NONE database stays NONE
+    // on open — switching it takes a full `VACUUM`, a rewrite of the whole file
+    // that no open may stall on; `heph tool gc` does it when the disk has room.
+    // The mode lives in the header, so an older heph opens either kind.
+    let fresh: bool = conn
+        .query_row("SELECT count(*) = 0 FROM sqlite_master", [], |row| {
+            row.get(0)
+        })
+        .context("reading sqlite cache schema")?;
+    //
+    // Page size first: `auto_vacuum` ahead of it fixed the page size at the
+    // 4 KiB default (pinned by `a_fresh_database_gets_its_persistent_pragmas`).
+    conn.execute_batch(if fresh {
         "PRAGMA page_size = 8192;
-         PRAGMA journal_mode = WAL;",
-    )
+         PRAGMA auto_vacuum = INCREMENTAL;
+         PRAGMA journal_mode = WAL;"
+    } else {
+        "PRAGMA page_size = 8192;
+         PRAGMA journal_mode = WAL;"
+    })
     .context("setting sqlite cache persistent pragmas")?;
     conn.execute_batch(&format!(
         "BEGIN IMMEDIATE;
@@ -829,13 +1044,19 @@ impl Drop for DrainOnExit<'_> {
 fn write_bytes(cmd: &WriterCmd) -> i64 {
     match cmd {
         WriterCmd::Write(job) => job.size,
-        WriterCmd::Delete(_) => 0,
+        WriterCmd::Delete(_) | WriterCmd::Maintain(_) => 0,
     }
 }
 
 /// Take `first` plus whatever is already queued, up to [`WRITE_BATCH_MAX`] jobs
-/// or [`WRITE_BATCH_MAX_BYTES`] of blob data — whichever comes first.
-fn collect_batch(first: WriterCmd, rx: &mpsc::Receiver<WriterCmd>) -> Vec<WriterCmd> {
+/// or [`WRITE_BATCH_MAX_BYTES`] of blob data — whichever comes first. A
+/// maintenance job met on the way ends the batch and goes onto `maintenance`
+/// instead: it is not a write, and the writes queued after it wait for it.
+fn collect_batch(
+    first: WriterCmd,
+    rx: &mpsc::Receiver<WriterCmd>,
+    maintenance: &mut VecDeque<MaintainJob>,
+) -> Vec<WriterCmd> {
     let mut batch = Vec::with_capacity(WRITE_BATCH_MAX);
     let mut batch_bytes = write_bytes(&first);
     batch.push(first);
@@ -843,6 +1064,10 @@ fn collect_batch(first: WriterCmd, rx: &mpsc::Receiver<WriterCmd>) -> Vec<Writer
     // over the cap goes alone rather than dragging a second one in with it.
     while batch.len() < WRITE_BATCH_MAX && batch_bytes < WRITE_BATCH_MAX_BYTES {
         match rx.try_recv() {
+            Ok(WriterCmd::Maintain(job)) => {
+                maintenance.push_back(job);
+                break;
+            }
             Ok(cmd) => {
                 batch_bytes = batch_bytes.saturating_add(write_bytes(&cmd));
                 batch.push(cmd);
@@ -853,38 +1078,207 @@ fn collect_batch(first: WriterCmd, rx: &mpsc::Receiver<WriterCmd>) -> Vec<Writer
     batch
 }
 
-fn writer_loop(
-    conn: &mut Connection,
-    rx: &mpsc::Receiver<WriterCmd>,
-    pending: &PendingTracker,
-    #[cfg(any(test, feature = "test-support"))] gate: &WriterGate,
-) {
-    let _drain = DrainOnExit(pending);
+/// What the writer thread works with besides its connection.
+struct WriterEnv<'a> {
+    rx: &'a mpsc::Receiver<WriterCmd>,
+    pending: &'a PendingTracker,
+    db_path: &'a std::path::Path,
+    /// See [`Writer::closing`].
+    closing: &'a AtomicBool,
+    /// [`WRITE_BUSY_RETRY_TOTAL`], or a test's override of it.
+    busy_retry_total: Duration,
+    /// When another process's lock first kept a batch out, since the last
+    /// commit: the start of the writer-wide busy deadline (see
+    /// [`commit_with_retry`]). `None` while batches commit.
+    busy_since: Cell<Option<Instant>>,
+    #[cfg(any(test, feature = "test-support"))]
+    gate: &'a WriterGate,
+}
+
+fn writer_loop(conn: &mut Connection, env: &WriterEnv<'_>) {
+    let _drain = DrainOnExit(env.pending);
+    let mut maintenance: VecDeque<MaintainJob> = VecDeque::new();
     loop {
-        let first = match rx.recv() {
-            Ok(cmd) => cmd,
-            Err(_) => return,
+        let first = match maintenance.pop_front() {
+            Some(job) => WriterCmd::Maintain(job),
+            None => match env.rx.recv() {
+                Ok(cmd) => cmd,
+                Err(_) => return,
+            },
         };
 
         #[cfg(any(test, feature = "test-support"))]
-        gate.wait_while_closed();
+        env.gate.wait_while_closed();
 
-        let mut batch = collect_batch(first, rx);
-
-        if let Err(e) = process_batch(conn, &mut batch) {
-            tracing::error!(error = %format!("{e:#}"), "sqlite cache writer: batch failed");
-        }
-
-        // Whether the batch succeeded or not, the pending slots must be released so that
-        // readers don't hang. On failure the readers will simply observe NotFound from the
-        // DB, which is the correct behavior for a write that didn't land.
-        for cmd in &batch {
-            match cmd {
-                WriterCmd::Write(j) => pending.complete(&j.key, &j.slot),
-                WriterCmd::Delete(j) => pending.complete(&j.key, &j.slot),
-            }
+        match first {
+            WriterCmd::Maintain(job) => run_maintenance(conn, env, &mut maintenance, job),
+            cmd => write_batch(conn, env, &mut maintenance, cmd),
         }
     }
+}
+
+/// How long the writer keeps retrying while another process's write lock
+/// keeps its batches out (`SQLITE_BUSY` after the connection's busy timeout),
+/// counted from the first refusal since the last commit — across batches, not
+/// per batch. Long enough to outlast another process's `heph tool gc`
+/// converting a large `cache.db`, whose `VACUUM` holds the write lock for the
+/// whole rewrite; bounded so a stuck holder (a suspended gc, say) cannot park
+/// the writer, every reader of a queued key, and the owner's exit, forever.
+pub(crate) const WRITE_BUSY_RETRY_TOTAL: Duration = Duration::from_secs(5 * 60);
+/// The longest pause between two attempts of a kept-out batch.
+const WRITE_BUSY_BACKOFF_MAX: Duration = Duration::from_secs(2);
+
+/// Whether `e` is sqlite reporting another connection's lock.
+///
+/// `SQLITE_BUSY` only. Without shared-cache mode, which heph never enables,
+/// `SQLITE_LOCKED` is a conflict inside this one connection (a statement still
+/// reading a table being dropped, say): no other process releases it, so
+/// retrying it would only wait out the deadline.
+fn is_busy(e: &anyhow::Error) -> bool {
+    e.chain()
+        .filter_map(|c| c.downcast_ref::<rusqlite::Error>())
+        .any(|e| e.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy))
+}
+
+/// [`process_batch`], retried while another process's write lock keeps it
+/// out, until the cache is `closing` (dropped: it must not hang its owner's
+/// exit) or the lock has kept the writer out for [`WriterEnv::busy_retry_total`].
+///
+/// The deadline is the writer's, not the batch's: it starts at the first
+/// refusal since the last commit ([`WriterEnv::busy_since`]) and only a commit
+/// resets it. Once it has passed, each later batch gets a single attempt — one
+/// busy timeout — until one commits, so a lock that is never released costs
+/// the whole queue the deadline plus one busy timeout per batch, not the
+/// deadline per batch.
+///
+/// A failed attempt rolled back, so the next one starts from nothing; each
+/// attempt waits out the busy timeout itself, the pause between two only
+/// spaces them. A batch that is given up on is lost: normally a miss, but see
+/// the module docs of `cache_db_space` for when it is not.
+fn commit_with_retry(
+    conn: &mut Connection,
+    batch: &mut [WriterCmd],
+    env: &WriterEnv<'_>,
+) -> Result<()> {
+    let mut pause = Duration::from_millis(50);
+    let mut attempts: u32 = 0;
+    loop {
+        let err = match process_batch(conn, batch) {
+            Ok(()) => {
+                if let Some(since) = env.busy_since.take() {
+                    tracing::info!(
+                        attempts = attempts + 1,
+                        kept_out = ?since.elapsed(),
+                        "sqlite cache writer: batch committed after another process released the lock",
+                    );
+                }
+                return Ok(());
+            }
+            Err(e) => e,
+        };
+        attempts = attempts.saturating_add(1);
+        if !is_busy(&err) {
+            return Err(err.context(format!("after {attempts} attempt(s)")));
+        }
+        let since = env.busy_since.get().unwrap_or_else(|| {
+            tracing::warn!(
+                error = %format!("{err:#}"),
+                "sqlite cache writer: another process holds cache.db's write lock; retrying",
+            );
+            let now = Instant::now();
+            env.busy_since.set(Some(now));
+            now
+        });
+        let kept_out = since.elapsed();
+        if kept_out >= env.busy_retry_total || env.closing.load(Ordering::Acquire) {
+            return Err(err.context(format!(
+                "after {attempts} attempt(s); the write lock has kept the writer out for {kept_out:?}"
+            )));
+        }
+        std::thread::sleep(pause.min(env.busy_retry_total.saturating_sub(kept_out)));
+        pause = pause.saturating_mul(2).min(WRITE_BUSY_BACKOFF_MAX);
+    }
+}
+
+/// Commit `first` and the writes queued behind it as one batch.
+fn write_batch(
+    conn: &mut Connection,
+    env: &WriterEnv<'_>,
+    maintenance: &mut VecDeque<MaintainJob>,
+    first: WriterCmd,
+) {
+    let pending = env.pending;
+    let mut batch = collect_batch(first, env.rx, maintenance);
+
+    // Its slots stay pending while it is retried: a reader of one of its keys
+    // waits for the write rather than reading the key as absent.
+    if let Err(e) = commit_with_retry(conn, &mut batch, env) {
+        tracing::error!(error = %format!("{e:#}"), "sqlite cache writer: batch failed");
+    }
+
+    // Whether the batch succeeded or not, the pending slots must be released so that
+    // readers don't hang. On failure the readers will simply observe NotFound from the
+    // DB, which is the correct behavior for a write that didn't land.
+    for cmd in &batch {
+        match cmd {
+            WriterCmd::Write(j) => pending.complete(&j.key, &j.slot),
+            WriterCmd::Delete(j) => pending.complete(&j.key, &j.slot),
+            WriterCmd::Maintain(_) => {}
+        }
+    }
+}
+
+/// Run one maintenance pass, committing the writes queued meanwhile between
+/// its chunks, so a vacuum delays a cache write by at most one chunk. A failure
+/// is the requester's to report; it never touches the write path.
+fn run_maintenance(
+    conn: &mut Connection,
+    env: &WriterEnv<'_>,
+    maintenance: &mut VecDeque<MaintainJob>,
+    job: MaintainJob,
+) {
+    let MaintainJob {
+        kind,
+        keep_going,
+        reply,
+        #[cfg(test)]
+        mut on_chunk,
+    } = job;
+    #[cfg(test)]
+    let mut chunk = 0usize;
+    let mut between = |conn: &mut Connection| -> bool {
+        #[cfg(test)]
+        {
+            if let Some(hook) = on_chunk.as_mut() {
+                hook(chunk, conn);
+            }
+            chunk += 1;
+        }
+        // Commit what queued up during the chunk. A closed channel means the
+        // cache is being dropped: stop at this boundary.
+        loop {
+            match env.rx.try_recv() {
+                Ok(WriterCmd::Maintain(job)) => maintenance.push_back(job),
+                Ok(cmd) => {
+                    #[cfg(any(test, feature = "test-support"))]
+                    env.gate.wait_while_closed();
+                    write_batch(conn, env, maintenance, cmd);
+                }
+                Err(mpsc::TryRecvError::Empty) => return true,
+                Err(mpsc::TryRecvError::Disconnected) => return false,
+            }
+        }
+    };
+    let res = cache_db_space::run(conn, env.db_path, &kind, &*keep_going, &mut between);
+    if res.is_err() {
+        // Whatever failed may have left a transaction open; the next write
+        // batch must not start inside it.
+        if !conn.is_autocommit() {
+            drop(conn.execute_batch("ROLLBACK;"));
+        }
+    }
+    // The requester may have given up waiting; the report then has no reader.
+    drop(reply.send(res));
 }
 
 fn process_batch(conn: &mut Connection, batch: &mut [WriterCmd]) -> Result<()> {
@@ -932,6 +1326,8 @@ fn process_batch(conn: &mut Connection, batch: &mut [WriterCmd]) -> Result<()> {
                     )
                 })?;
             }
+            // `collect_batch` never puts one in a batch.
+            WriterCmd::Maintain(_) => {}
         }
     }
 
@@ -945,64 +1341,39 @@ impl LocalCache for LocalCacheSQLite {
         self.pending.wait_if_pending(&addr_key, hashin, name);
 
         let conn = self.read_conn()?;
-
-        let mut stmt = conn
-            .prepare_cached(
-                "SELECT rowid, length(data) FROM artifacts WHERE addr=?1 AND hashin=?2 AND name=?3",
-            )
-            .context("preparing reader lookup")?;
-        let (row_id, blob_len): (i64, usize) =
-            match stmt.query_row(rusqlite::params![addr_key, hashin, name], |row| {
-                let row_id: i64 = row.get(0)?;
-                let blob_len: i64 = row.get(1)?;
-                Ok((row_id, usize::try_from(blob_len).unwrap_or(0)))
-            }) {
-                Err(rusqlite::Error::QueryReturnedNoRows) => {
-                    return Err(anyhow::anyhow!(NotFoundError));
-                }
-                Err(e) => {
-                    return Err(e).with_context(|| {
-                        format!("looking up {name} hashin={hashin} in sqlite cache")
-                    });
-                }
-                Ok(v) => v,
-            };
-
-        let size = blob_len as u64;
+        let mut blob = open_blob(&conn, &addr_key, hashin, name)?;
+        let blob_len = blob.len();
 
         if blob_len <= self.inline_threshold {
-            let mut blob = conn
-                .blob_open(rusqlite::MAIN_DB, "artifacts", "data", row_id, true)
-                .with_context(|| format!("opening blob for {name}"))?;
             let mut buf = Vec::with_capacity(blob_len);
             io::copy(&mut blob, &mut buf)
                 .with_context(|| format!("reading small blob for {name}"))?;
             let arc: Arc<[u8]> = Arc::from(buf);
             return Ok(SizedReader {
-                size,
+                size: blob_len as u64,
                 reader: Box::new(io::Cursor::new(arc.clone())),
                 bytes: Some(arc),
             });
         }
 
-        // Release the SELECT connection before acquiring semaphore + a fresh pipe connection.
-        drop(stmt);
+        // Release the lookup's connection before acquiring semaphore + a fresh
+        // pipe connection, which looks the key up again: a rowid is only good
+        // inside the snapshot it was read in (see `open_blob`), and the key may
+        // be gone by now — a miss, then.
+        drop(blob);
         drop(conn);
 
         // Semaphore acquired before pool to bound concurrent open pipes (= open FDs).
         let permit = self.pipe_sem.acquire();
-        let conn = self.read_conn()?;
+        let mut blob = OwnedBlob::new(self.read_conn()?, &addr_key, hashin, name)?;
+        let size = blob.len() as u64;
 
         let (pipe_reader, mut pipe_writer) =
             io::pipe().with_context(|| format!("creating pipe for sqlite blob read of {name}"))?;
 
-        // Move the pooled connection into the rayon pool; returns to pool on drop.
+        // Move the blob, and the pooled connection it owns, into the rayon pool;
+        // the connection returns to the pool on drop.
         rayon::spawn(move || {
-            let mut blob =
-                match conn.blob_open(rusqlite::MAIN_DB, "artifacts", "data", row_id, true) {
-                    Ok(b) => b,
-                    Err(_) => return,
-                };
             drop(io::copy(&mut blob, &mut pipe_writer));
         });
 
@@ -1139,26 +1510,76 @@ impl LocalCache for LocalCacheSQLite {
         let addr_key = Self::key(addr);
         self.pending.wait_if_pending(&addr_key, hashin, name);
 
-        let conn = self.read_conn()?;
+        Ok(Some(Box::new(OwnedBlob::new(
+            self.read_conn()?,
+            &addr_key,
+            hashin,
+            name,
+        )?)))
+    }
+}
 
-        let mut stmt = conn
-            .prepare_cached("SELECT rowid FROM artifacts WHERE addr=?1 AND hashin=?2 AND name=?3")
-            .context("preparing seekable_reader lookup")?;
-        let row_id: i64 =
-            match stmt.query_row(rusqlite::params![addr_key, hashin, name], |row| row.get(0)) {
-                Err(rusqlite::Error::QueryReturnedNoRows) => {
-                    return Err(anyhow::anyhow!(NotFoundError));
-                }
-                Err(e) => {
-                    return Err(e).with_context(|| {
-                        format!("looking up {name} hashin={hashin} for seekable read")
-                    });
-                }
-                Ok(v) => v,
-            };
-        drop(stmt);
+/// Look up a key's row and open its blob, both in one read snapshot.
+/// [`NotFoundError`] when the key has no row.
+///
+/// A rowid names a row only inside the snapshot it was read in. Opened by
+/// rowid in a later transaction, the blob could be another key's: another
+/// process deleting the row and inserting a different key that reuses the
+/// rowid, or a `VACUUM` renumbering the rows of a table with no `INTEGER
+/// PRIMARY KEY` (as `artifacts` has none), would serve that key's bytes as
+/// this one's — a wrong cache hit.
+///
+/// So the lookup's cursor is kept open, its statement unreset, until the blob
+/// is open. A connection's read transaction — and with it, in WAL mode, its
+/// snapshot — lasts while any of its statements is active, so the lookup and
+/// the open see one snapshot; once open, the blob is that active statement,
+/// and every read through it sees the same snapshot until it is dropped.
+/// `a_blob_opened_under_the_lookup_cursor_reads_the_lookups_snapshot` pins
+/// this down.
+fn open_blob<'c>(
+    conn: &'c Connection,
+    addr_key: &str,
+    hashin: &str,
+    name: &str,
+) -> Result<rusqlite::blob::Blob<'c>> {
+    let mut stmt = conn
+        .prepare_cached("SELECT rowid FROM artifacts WHERE addr=?1 AND hashin=?2 AND name=?3")
+        .context("preparing sqlite cache lookup")?;
+    let lookup_failed = || format!("looking up {name} hashin={hashin} in sqlite cache");
+    let mut rows = stmt
+        .query(rusqlite::params![addr_key, hashin, name])
+        .with_context(lookup_failed)?;
+    // Not stepped again: a step to the end of the result would end the
+    // statement, and the read transaction with it, before the blob opens.
+    let row_id: i64 = match rows.next().with_context(lookup_failed)? {
+        Some(row) => row.get(0).with_context(lookup_failed)?,
+        None => return Err(anyhow::anyhow!(NotFoundError)),
+    };
+    #[cfg(test)]
+    after_rowid_lookup(row_id);
+    let blob = conn
+        .blob_open(rusqlite::MAIN_DB, "artifacts", "data", row_id, true)
+        .with_context(|| format!("opening blob for {name} hashin={hashin}"))?;
+    // Only now: the open blob holds the read transaction from here on.
+    drop(rows);
+    Ok(blob)
+}
 
-        Ok(Some(Box::new(OwnedBlob::new(conn, row_id)?)))
+#[cfg(test)]
+type RowidHook = Box<dyn FnOnce(i64)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook, run on the reading thread between a read's rowid lookup and
+    /// its blob open, with the rowid. Taken by its first run.
+    static AFTER_ROWID_LOOKUP: std::cell::RefCell<Option<RowidHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn after_rowid_lookup(row_id: i64) {
+    if let Some(hook) = AFTER_ROWID_LOOKUP.with_borrow_mut(Option::take) {
+        hook(row_id);
     }
 }
 
@@ -1196,14 +1617,19 @@ struct OwnedBlob {
 unsafe impl Send for OwnedBlob {}
 
 impl OwnedBlob {
-    fn new(conn: r2d2::PooledConnection<SqliteConnectionManager>, row_id: i64) -> Result<Self> {
+    /// Open the key's blob on `conn` through [`open_blob`]: [`NotFoundError`]
+    /// when the key has no row.
+    fn new(
+        conn: r2d2::PooledConnection<SqliteConnectionManager>,
+        addr_key: &str,
+        hashin: &str,
+        name: &str,
+    ) -> Result<Self> {
         // Box BEFORE borrowing: the blob captures an address that must survive
         // this struct being moved out of `new`. See the type doc.
         let conn = Box::new(conn);
         let conn_ref: &Connection = &conn;
-        let blob = conn_ref
-            .blob_open(rusqlite::MAIN_DB, "artifacts", "data", row_id, true)
-            .context("opening seekable sqlite blob")?;
+        let blob = open_blob(conn_ref, addr_key, hashin, name)?;
         // SAFETY: `blob` borrows the `Connection` inside the heap allocation
         // `conn` owns, which this struct keeps alive and never moves (moving the
         // `Box` moves the pointer, not the pointee). Field order drops `blob`
@@ -1213,6 +1639,11 @@ impl OwnedBlob {
             blob: blob_static,
             _conn: conn,
         })
+    }
+
+    /// The blob's size, in the snapshot it was opened in.
+    fn len(&self) -> usize {
+        self.blob.len()
     }
 }
 
@@ -1468,7 +1899,11 @@ mod tests {
         assert!(!open(&path)?.exists(&make_addr("pkg", "t"), "h", "a")?);
         assert_eq!(pragma::<i64>(&path, "page_size")?, 8192);
         assert_eq!(pragma::<String>(&path, "journal_mode")?, "wal");
-        assert_eq!(pragma::<i64>(&path, "auto_vacuum")?, 0, "auto_vacuum NONE");
+        assert_eq!(
+            pragma::<i64>(&path, "auto_vacuum")?,
+            2,
+            "auto_vacuum INCREMENTAL"
+        );
         Ok(())
     }
 
@@ -1614,7 +2049,11 @@ mod tests {
         Connection::open(&path)?.execute_batch(PRE_VERSIONING_DDL)?;
         assert_eq!(user_version(&path)?, SCHEMA_VERSION);
         assert_eq!(pragma::<i64>(&path, "page_size")?, 8192);
-        assert_eq!(pragma::<i64>(&path, "auto_vacuum")?, 0);
+        assert_eq!(
+            pragma::<i64>(&path, "auto_vacuum")?,
+            2,
+            "the previous binary keeps a new database INCREMENTAL"
+        );
 
         let lock = hwalk::migrate_lock::migrate_lock_path(&path);
         std::fs::remove_file(&lock)?;
@@ -1660,7 +2099,7 @@ mod tests {
         }
 
         let first = rx.recv().expect("first");
-        let batch = collect_batch(first, &rx);
+        let batch = collect_batch(first, &rx, &mut VecDeque::new());
 
         assert!(
             batch.len() < JOBS,
@@ -1684,7 +2123,7 @@ mod tests {
         tx.send(write_cmd("small", 1)).expect("send");
 
         let first = rx.recv().expect("first");
-        let batch = collect_batch(first, &rx);
+        let batch = collect_batch(first, &rx, &mut VecDeque::new());
 
         assert_eq!(
             batch.len(),
@@ -1707,7 +2146,7 @@ mod tests {
         }
 
         let first = rx.recv().expect("first");
-        let batch = collect_batch(first, &rx);
+        let batch = collect_batch(first, &rx, &mut VecDeque::new());
 
         assert_eq!(
             batch.len(),
@@ -1975,6 +2414,7 @@ mod tests {
         let slot_of = |cmd: &WriterCmd| match cmd {
             WriterCmd::Write(j) => j.slot.clone(),
             WriterCmd::Delete(j) => j.slot.clone(),
+            WriterCmd::Maintain(_) => panic!("no maintenance was queued"),
         };
         assert!(
             Arc::ptr_eq(&slot_of(&queued[0]), &first) && Arc::ptr_eq(&slot_of(&queued[1]), &second),
@@ -2588,6 +3028,178 @@ mod tests {
         assert!(err.is::<NotFoundError>(), "{err:#}");
     }
 
+    /// Arm [`AFTER_ROWID_LOOKUP`] to do what another process's delete and a
+    /// later insert reusing the rowid would: replace the looked-up row with
+    /// `other`'s, at the same rowid.
+    fn reuse_the_rowid_after_lookup(path: &std::path::Path, other: &Addr, bytes: &[u8]) {
+        let path = path.to_path_buf();
+        let other = LocalCacheSQLite::key(other);
+        let bytes = bytes.to_vec();
+        AFTER_ROWID_LOOKUP.with_borrow_mut(|hook| {
+            *hook = Some(Box::new(move |row_id| {
+                let conn = Connection::open(&path).expect("open a second connection");
+                conn.busy_timeout(Duration::from_secs(10))
+                    .expect("busy timeout");
+                // `other` too, should an earlier swap have left it behind.
+                conn.execute(
+                    "DELETE FROM artifacts WHERE rowid = ?1 OR addr = ?2",
+                    rusqlite::params![row_id, other],
+                )
+                .expect("delete the looked-up row");
+                conn.execute(
+                    "INSERT INTO artifacts (rowid, addr, hashin, name, data)
+                     VALUES (?1, ?2, 'h', 'blob', ?3)",
+                    rusqlite::params![row_id, other, bytes],
+                )
+                .expect("insert another key at the same rowid");
+            }));
+        });
+    }
+
+    /// A read whose row is replaced between its rowid lookup and its blob
+    /// open — a delete, then an insert reusing the rowid — never serves the
+    /// replacement's bytes as its own key: it serves the key's bytes from the
+    /// lookup's snapshot, or misses. Serving the other key's bytes would be a
+    /// wrong cache hit. Covers the inline, pipe and seekable paths.
+    #[test]
+    fn a_rowid_reused_between_lookup_and_open_is_never_served_as_this_key() -> Result<()> {
+        let mut wrong = Vec::new();
+        let mut outcome = |read: Result<Vec<u8>>, mine: &[u8], theirs: &[u8], path: &str| match read
+        {
+            Ok(bytes) if bytes == theirs => wrong.push(format!("{path}: another key's bytes")),
+            Ok(bytes) if bytes != mine => wrong.push(format!("{path}: neither key's bytes")),
+            Ok(_) => {}
+            Err(e) if e.is::<NotFoundError>() => {}
+            Err(e) => wrong.push(format!("{path}: {e:#}")),
+        };
+
+        for (path_name, inline_threshold) in [("inline", 1024 * 1024), ("pipe", 0)] {
+            let dir = tempdir()?;
+            let path = dir.path().join("cache.db");
+            let cache = LocalCacheSQLite::with_pipe_limit(
+                path.clone(),
+                inline_threshold,
+                DEFAULT_MAX_CONCURRENT_PIPES,
+            )?;
+            let mine = make_addr("pkg", "mine");
+            let theirs = make_addr("pkg", "theirs");
+            let (my_bytes, their_bytes) = (vec![0xaa; 4096], vec![0xbb; 4096]);
+            queued_write(&cache, &mine, "blob", &my_bytes);
+            assert!(cache.exists(&mine, "h", "blob")?, "barrier");
+
+            reuse_the_rowid_after_lookup(&path, &theirs, &their_bytes);
+            let read = cache.reader(&mine, "h", "blob").and_then(|mut r| {
+                let mut bytes = Vec::new();
+                r.reader.read_to_end(&mut bytes)?;
+                Ok(bytes)
+            });
+            outcome(read, &my_bytes, &their_bytes, path_name);
+
+            // Seekable, against the same database, with `mine` back under a
+            // fresh rowid.
+            queued_write(&cache, &mine, "blob", &my_bytes);
+            assert!(cache.exists(&mine, "h", "blob")?, "barrier");
+            reuse_the_rowid_after_lookup(&path, &theirs, &their_bytes);
+            let read = cache.seekable_reader(&mine, "h", "blob").and_then(|r| {
+                let mut bytes = Vec::new();
+                r.expect("sqlite serves a seekable reader")
+                    .read_to_end(&mut bytes)?;
+                Ok(bytes)
+            });
+            outcome(read, &my_bytes, &their_bytes, "seekable");
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        Ok(())
+    }
+
+    /// What `open_blob` rests on: with the lookup's cursor open until the blob
+    /// opens, a row another connection replaces in between at the same rowid
+    /// is invisible to the blob *and* to every other statement on the
+    /// connection while the blob is open — one snapshot — and visible once the
+    /// blob is dropped.
+    #[test]
+    fn a_blob_opened_under_the_lookup_cursor_reads_the_lookups_snapshot() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("cache.db");
+        let cache = open(&path)?;
+        let (mine, theirs) = (make_addr("pkg", "mine"), make_addr("pkg", "theirs"));
+        put(&cache, &mine, "blob", b"my bytes")?;
+        assert!(cache.exists(&mine, "h", "blob")?, "barrier");
+        let count_theirs = |conn: &Connection| -> Result<i64> {
+            Ok(conn.query_row(
+                "SELECT count(*) FROM artifacts WHERE addr = ?1",
+                [LocalCacheSQLite::key(&theirs)],
+                |r| r.get(0),
+            )?)
+        };
+
+        let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        reuse_the_rowid_after_lookup(&path, &theirs, b"their bytes");
+        let mut blob = open_blob(&conn, &LocalCacheSQLite::key(&mine), "h", "blob")?;
+        assert_eq!(
+            count_theirs(&Connection::open(&path)?)?,
+            1,
+            "the swap committed"
+        );
+        assert_eq!(count_theirs(&conn)?, 0, "the blob's snapshot predates it");
+        let mut bytes = Vec::new();
+        blob.read_to_end(&mut bytes)?;
+        assert_eq!(bytes, b"my bytes");
+        drop(blob);
+        assert_eq!(count_theirs(&conn)?, 1, "the snapshot ends with the blob");
+        Ok(())
+    }
+
+    /// A `heph tool gc` conversion (a full `VACUUM` of a NONE database) of a
+    /// table with rowid gaps keeps every rowid naming the key it named.
+    #[test]
+    fn converting_a_none_database_keeps_every_rowid_to_key_mapping() -> Result<()> {
+        type Mapping = Vec<(i64, String, String, String)>;
+        fn mapping(path: &std::path::Path) -> Result<Mapping> {
+            let conn = Connection::open(path)?;
+            let mut stmt =
+                conn.prepare("SELECT rowid, addr, hashin, name FROM artifacts ORDER BY rowid")?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+                .collect::<rusqlite::Result<Mapping>>()?;
+            Ok(rows)
+        }
+
+        let dir = tempdir()?;
+        let path = dir.path().join("cache.db");
+        let addr = make_addr("pkg", "gaps");
+        none_db(&path, &addr)?;
+        {
+            let conn = Connection::open(&path)?;
+            for i in 0..30u8 {
+                conn.execute(
+                    "INSERT INTO artifacts (addr, hashin, name, data) VALUES (?1, 'h', ?2, ?3)",
+                    rusqlite::params![LocalCacheSQLite::key(&addr), format!("n{i}"), vec![i; 4096]],
+                )?;
+            }
+            conn.execute("DELETE FROM artifacts WHERE rowid % 3 = 0", [])?;
+        }
+        let before = mapping(&path)?;
+        assert!(
+            before.windows(2).any(|w| w[1].0 - w[0].0 > 1),
+            "the table has rowid gaps: {before:?}"
+        );
+
+        let cache = open(&path)?;
+        cache.set_maintenance_overrides(MaintenanceOverrides {
+            free_space: Some(u64::MAX),
+            ..MaintenanceOverrides::default()
+        });
+        let report = cache.compact_for_gc(Box::new(|| true))?;
+        assert!(
+            matches!(report.action, CompactAction::Converted { .. }),
+            "{report:?}"
+        );
+        assert_eq!(pragma::<i64>(&path, "auto_vacuum")?, 2, "INCREMENTAL");
+        assert_eq!(mapping(&path)?, before);
+        Ok(())
+    }
+
     #[test]
     fn test_local_cache_sqlite_concurrent_readers() -> Result<()> {
         use std::sync::Arc;
@@ -2763,6 +3375,576 @@ mod tests {
         assert_eq!(
             got, "good bytes",
             "an abandoned rewrite must not replace the committed entry"
+        );
+        Ok(())
+    }
+
+    // --- cache.db space reclaim -------------------------------------------
+
+    use crate::engine::cache_db_space::{CompactAction, VacuumMode, sidecar_path};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    const KIB: u64 = 1024;
+    /// Blobs [`fill_and_free`] writes then deletes, and their size: 160 pages
+    /// of 8 KiB, i.e. 20 chunks of [`small_policy`]'s 64 KiB.
+    const BULK_BLOBS: usize = 40;
+    const BULK_BLOB_BYTES: usize = 32 * 1024;
+
+    /// A reclaim policy at test scale: a 64 KiB floor, a cap no test database
+    /// reaches (100 % of the file, at most 100 MiB), 64 KiB chunks, and a
+    /// budget no test runs out of.
+    fn small_policy() -> ReclaimPolicy {
+        ReclaimPolicy {
+            interval: Duration::from_secs(60 * 60),
+            min_free_bytes: 64 * KIB,
+            cap_bytes: 100 * 1024 * KIB,
+            cap_percent: 100,
+            chunk_bytes: 64 * KIB,
+            budget: Duration::from_secs(60),
+        }
+    }
+
+    fn open_with(path: &std::path::Path, policy: ReclaimPolicy) -> Result<LocalCacheSQLite> {
+        let cache = open(path)?;
+        cache.set_maintenance_overrides(MaintenanceOverrides {
+            policy: Some(policy),
+            ..MaintenanceOverrides::default()
+        });
+        Ok(cache)
+    }
+
+    /// Write [`BULK_BLOBS`] blobs and delete them, leaving their pages free;
+    /// checkpoint the lot into the main file, then commit one more small row
+    /// so the WAL is not empty. `keep` survives.
+    fn fill_and_free(cache: &LocalCacheSQLite, path: &std::path::Path) -> Result<Addr> {
+        let addr = make_addr("pkg", "reclaim");
+        put(cache, &addr, "keep", b"kept bytes")?;
+        let blob = vec![0x5a; BULK_BLOB_BYTES];
+        for i in 0..BULK_BLOBS {
+            put(cache, &addr, &format!("bulk{i}"), &blob)?;
+        }
+        for i in 0..BULK_BLOBS {
+            cache.delete(&addr, "h", &format!("bulk{i}"))?;
+        }
+        Connection::open(path)?.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+        put(cache, &addr, "late", b"after the checkpoint")?;
+        assert!(cache.exists(&addr, "h", "late")?, "barrier");
+        Ok(addr)
+    }
+
+    /// What a reclaim can change, read from outside the cache.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Snap {
+        file: u64,
+        wal: u64,
+        free_pages: i64,
+        sidecar: Option<String>,
+    }
+
+    fn snap(path: &std::path::Path) -> Result<Snap> {
+        let mut wal = path.as_os_str().to_owned();
+        wal.push("-wal");
+        Ok(Snap {
+            file: std::fs::metadata(path)?.len(),
+            wal: std::fs::metadata(&wal).map_or(0, |m| m.len()),
+            free_pages: pragma::<i64>(path, "freelist_count")?,
+            sidecar: std::fs::read_to_string(sidecar_path(path)).ok(),
+        })
+    }
+
+    fn unix_secs(t: SystemTime) -> u64 {
+        t.duration_since(UNIX_EPOCH)
+            .expect("after the epoch")
+            .as_secs()
+    }
+
+    fn write_sidecar(path: &std::path::Path, at: SystemTime) -> Result<()> {
+        std::fs::write(sidecar_path(path), format!("{}\n", unix_secs(at)))?;
+        Ok(())
+    }
+
+    /// The row `fill_and_free` keeps still reads back.
+    fn assert_kept(cache: &LocalCacheSQLite, addr: &Addr) -> Result<()> {
+        let mut data = Vec::new();
+        cache
+            .reader(addr, "h", "keep")?
+            .reader
+            .read_to_end(&mut data)?;
+        assert_eq!(data, b"kept bytes");
+        Ok(())
+    }
+
+    /// Run the end-of-request reclaim on a freshly filled database with the
+    /// sidecar set to `sidecar` (`None`: absent) and `policy`, and return the
+    /// state before, the state after, and what it reported.
+    fn reclaim_case(
+        policy: ReclaimPolicy,
+        sidecar: Option<SystemTime>,
+    ) -> Result<(Snap, Snap, CompactAction)> {
+        let dir = tempdir()?;
+        let path = dir.path().join("cache.db");
+        let cache = open_with(&path, policy)?;
+        let addr = fill_and_free(&cache, &path)?;
+        if let Some(at) = sidecar {
+            write_sidecar(&path, at)?;
+        }
+        let before = snap(&path)?;
+        assert!(
+            before.free_pages >= 100 && before.wal > 0,
+            "setup left free pages and a WAL: {before:?}"
+        );
+        let report = cache.reclaim_after_trim()?;
+        let after = snap(&path)?;
+        assert_kept(&cache, &addr)?;
+        Ok((before, after, report.action))
+    }
+
+    /// A reclaim that ran: the file shrank, no free page is left, the WAL is
+    /// truncated and the sidecar moved to now.
+    fn assert_vacuumed(before: &Snap, after: &Snap, action: &CompactAction) {
+        assert!(
+            after.file < before.file,
+            "file shrank: {before:?} → {after:?}"
+        );
+        assert!(
+            matches!(action, CompactAction::Vacuumed { complete: true, freed_bytes } if *freed_bytes > 0),
+            "{action:?}"
+        );
+        assert_eq!(after.free_pages, 0, "{before:?} → {after:?}");
+        assert_eq!(after.wal, 0, "WAL truncated: {before:?} → {after:?}");
+        let now = unix_secs(SystemTime::now());
+        let recorded: u64 = after
+            .sidecar
+            .as_deref()
+            .expect("sidecar written")
+            .trim()
+            .parse()
+            .expect("sidecar is unix seconds");
+        assert!(
+            after.sidecar != before.sidecar && now.abs_diff(recorded) <= 5,
+            "sidecar moved to now ({now}): {before:?} → {after:?}"
+        );
+    }
+
+    fn assert_untouched(before: &Snap, after: &Snap, action: &CompactAction) {
+        assert_eq!(*action, CompactAction::Unchanged);
+        assert_eq!(before, after, "a reclaim that is not due changes nothing");
+    }
+
+    const TEN_MIN: Duration = Duration::from_secs(10 * 60);
+    const TWO_HOURS: Duration = Duration::from_secs(2 * 60 * 60);
+
+    /// (1) The interval has not elapsed and free pages are under the cap.
+    #[test]
+    fn reclaim_waits_out_the_interval_below_the_cap() -> Result<()> {
+        let (before, after, action) =
+            reclaim_case(small_policy(), Some(SystemTime::now() - TEN_MIN))?;
+        assert_untouched(&before, &after, &action);
+        Ok(())
+    }
+
+    /// (2) The interval has elapsed and free pages are at the floor.
+    #[test]
+    fn reclaim_runs_once_the_interval_elapsed_above_the_floor() -> Result<()> {
+        let (before, after, action) =
+            reclaim_case(small_policy(), Some(SystemTime::now() - TWO_HOURS))?;
+        assert_vacuumed(&before, &after, &action);
+        Ok(())
+    }
+
+    /// (3) The interval has not elapsed, but free pages reached the cap.
+    #[test]
+    fn reclaim_runs_inside_the_interval_at_the_cap() -> Result<()> {
+        let policy = ReclaimPolicy {
+            cap_bytes: 256 * KIB,
+            ..small_policy()
+        };
+        let (before, after, action) = reclaim_case(policy, Some(SystemTime::now() - TEN_MIN))?;
+        assert_vacuumed(&before, &after, &action);
+        Ok(())
+    }
+
+    /// (4) No record of a last vacuum, or one in the future (the clock moved
+    /// back), counts as the interval elapsed.
+    #[test]
+    fn reclaim_runs_with_a_missing_or_future_sidecar() -> Result<()> {
+        let (before, after, action) = reclaim_case(small_policy(), None)?;
+        assert!(before.sidecar.is_none());
+        assert_vacuumed(&before, &after, &action);
+
+        let future = SystemTime::now() + Duration::from_secs(24 * 60 * 60);
+        let (before, after, action) = reclaim_case(small_policy(), Some(future))?;
+        assert_vacuumed(&before, &after, &action);
+        Ok(())
+    }
+
+    /// (5) The interval has elapsed but free pages are under the floor.
+    #[test]
+    fn reclaim_skips_free_pages_under_the_floor() -> Result<()> {
+        let policy = ReclaimPolicy {
+            min_free_bytes: 100 * 1024 * KIB,
+            ..small_policy()
+        };
+        let (before, after, action) = reclaim_case(policy, Some(SystemTime::now() - TWO_HOURS))?;
+        assert_untouched(&before, &after, &action);
+        Ok(())
+    }
+
+    /// (6) A reclaim out of budget stops at the first chunk boundary: the pass
+    /// reports `complete: false`, the free pages stay, the sidecar does not
+    /// move (so the interval does not restart) — and the next reclaim, with
+    /// budget, finishes.
+    #[test]
+    fn a_reclaim_out_of_budget_stops_early_and_the_next_one_finishes() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("cache.db");
+        let cache = open_with(
+            &path,
+            ReclaimPolicy {
+                budget: Duration::ZERO,
+                ..small_policy()
+            },
+        )?;
+        let addr = fill_and_free(&cache, &path)?;
+        let old = SystemTime::now() - TWO_HOURS;
+        write_sidecar(&path, old)?;
+        let before = snap(&path)?;
+
+        let report = cache.reclaim_after_trim()?;
+        let after = snap(&path)?;
+        assert!(
+            matches!(
+                report.action,
+                CompactAction::Vacuumed {
+                    complete: false,
+                    ..
+                }
+            ),
+            "{report:?}"
+        );
+        assert_eq!(after.free_pages, before.free_pages, "no chunk ran");
+        assert_eq!(after.sidecar, before.sidecar, "the sidecar did not move");
+        assert_kept(&cache, &addr)?;
+
+        cache.set_maintenance_overrides(MaintenanceOverrides {
+            policy: Some(small_policy()),
+            ..MaintenanceOverrides::default()
+        });
+        let report = cache.reclaim_after_trim()?;
+        assert_vacuumed(&after, &snap(&path)?, &report.action);
+        assert_kept(&cache, &addr)?;
+        Ok(())
+    }
+
+    /// A database from before `auto_vacuum = INCREMENTAL`, as every existing
+    /// one is: page size 8 KiB, WAL, the schema at version 1, mode NONE.
+    fn none_db(path: &std::path::Path, addr: &Addr) -> Result<()> {
+        let conn = Connection::open(path)?;
+        conn.execute_batch(
+            "PRAGMA page_size = 8192;
+             PRAGMA journal_mode = WAL;
+             CREATE TABLE artifacts (
+                 addr   TEXT NOT NULL,
+                 hashin TEXT NOT NULL,
+                 name   TEXT NOT NULL,
+                 data   BLOB NOT NULL,
+                 PRIMARY KEY (addr, hashin, name)
+             );
+             CREATE INDEX idx_artifacts_addr_hashin ON artifacts (addr, hashin);
+             PRAGMA user_version = 1;",
+        )?;
+        conn.execute(
+            "INSERT INTO artifacts (addr, hashin, name, data) VALUES (?1, 'h', 'keep', ?2)",
+            rusqlite::params![LocalCacheSQLite::key(addr), b"kept bytes".as_slice()],
+        )?;
+        Ok(())
+    }
+
+    /// The new binary leaves an existing NONE database NONE — converting it is
+    /// a full rewrite, `heph tool gc`'s to do — keeps its rows, writes to it,
+    /// and its end-of-request reclaim does nothing to it.
+    #[test]
+    fn an_existing_none_database_stays_none_and_keeps_its_rows() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("cache.db");
+        let addr = make_addr("pkg", "reclaim");
+        none_db(&path, &addr)?;
+        assert_eq!(pragma::<i64>(&path, "auto_vacuum")?, 0);
+
+        let cache = open_with(&path, small_policy())?;
+        assert_kept(&cache, &addr)?;
+        fill_and_free(&cache, &path)?;
+        assert_eq!(pragma::<i64>(&path, "auto_vacuum")?, 0, "still NONE");
+        assert_eq!(pragma::<i64>(&path, "page_size")?, 8192);
+
+        let before = snap(&path)?;
+        let report = cache.reclaim_after_trim()?;
+        assert_eq!(report.before.mode, VacuumMode::None);
+        assert_untouched(&before, &snap(&path)?, &report.action);
+        assert_kept(&cache, &addr)?;
+        Ok(())
+    }
+
+    /// A vacuum is chunked: a write queued while it runs commits at the next
+    /// chunk boundary, not after the last chunk.
+    #[test]
+    fn a_write_queued_during_a_vacuum_commits_between_chunks() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("cache.db");
+        let cache = open_with(&path, small_policy())?;
+        let addr = fill_and_free(&cache, &path)?;
+        let free_before = u64::try_from(snap(&path)?.free_pages)?;
+
+        // Per chunk: (index, rows named `mid` visible on the writer connection).
+        let seen: Arc<Mutex<Vec<(usize, i64)>>> = Arc::default();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let (queued_tx, queued_rx) = mpsc::channel::<()>();
+        let hook: ChunkHook = Box::new({
+            let seen = Arc::clone(&seen);
+            move |chunk, conn: &Connection| {
+                let n: i64 = conn
+                    .query_row(
+                        "SELECT count(*) FROM artifacts WHERE name = 'mid'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .expect("count mid");
+                seen.lock().expect("seen").push((chunk, n));
+                if chunk == 0 {
+                    go_tx.send(()).expect("signal the writer");
+                    queued_rx
+                        .recv_timeout(Duration::from_secs(30))
+                        .expect("the write was queued");
+                }
+            }
+        });
+
+        let report = std::thread::scope(|s| -> Result<CompactReport> {
+            let (cache, addr) = (&cache, &addr);
+            s.spawn(move || {
+                go_rx.recv().expect("go");
+                put(cache, addr, "mid", b"queued mid-vacuum").expect("queue mid");
+                queued_tx.send(()).expect("ack");
+            });
+            cache.maintain(
+                MaintainKind::AfterTrim(small_policy()),
+                Box::new(|| true),
+                Some(hook),
+            )
+        })?;
+
+        assert!(
+            matches!(
+                report.action,
+                CompactAction::Vacuumed { complete: true, .. }
+            ),
+            "{report:?}"
+        );
+        let seen = seen.lock().expect("seen").clone();
+        assert_eq!(
+            seen.first(),
+            Some(&(0, 0)),
+            "not committed before: {seen:?}"
+        );
+        assert_eq!(
+            seen.get(1),
+            Some(&(1, 1)),
+            "committed at the first boundary after it was queued: {seen:?}"
+        );
+        assert!(
+            seen.len() >= 4,
+            "the vacuum went on for more chunks after the write: {seen:?}"
+        );
+        // Whole chunks: the small write queued mid-vacuum can only take free
+        // pages, never add a chunk's worth.
+        let chunks = u64::try_from(seen.len())?;
+        assert!(
+            chunks <= free_before.div_ceil(SMALL_CHUNK_PAGES) + 1,
+            "{chunks} chunks for {free_before} free pages: {seen:?}"
+        );
+        assert!(cache.exists(&addr, "h", "mid")?);
+        assert_eq!(snap(&path)?.free_pages, 0);
+        Ok(())
+    }
+
+    /// A batch another connection's write lock keeps out past the busy
+    /// timeout — another process's gc converting the database, say — is
+    /// retried, not dropped: its slot stays pending meanwhile, and it commits
+    /// once the lock is released.
+    #[test]
+    fn a_batch_kept_out_past_the_busy_timeout_commits_after_release() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("cache.db");
+        let cache = open(&path)?;
+        let busy = Duration::from_millis(50);
+        cache.set_maintenance_overrides(MaintenanceOverrides {
+            busy_timeout: Some(busy),
+            ..MaintenanceOverrides::default()
+        });
+        let addr = make_addr("pkg", "busy");
+        put(&cache, &addr, "first", b"spawns the writer")?;
+        assert!(cache.exists(&addr, "h", "first")?);
+
+        let holder = Connection::open(&path)?;
+        holder.execute_batch("BEGIN IMMEDIATE;")?;
+        put(&cache, &addr, "held", b"queued behind the lock")?;
+        std::thread::sleep(busy * 10);
+        assert!(
+            cache
+                .pending
+                .pending(&LocalCacheSQLite::key(&addr), "h", "held")
+                .is_some(),
+            "still queued, not dropped, ten busy timeouts in"
+        );
+        holder.execute_batch("COMMIT;")?;
+
+        let mut data = Vec::new();
+        cache
+            .reader(&addr, "h", "held")
+            .context("committed once the lock was released")?
+            .reader
+            .read_to_end(&mut data)?;
+        assert_eq!(data, b"queued behind the lock");
+        Ok(())
+    }
+
+    /// The busy deadline is the writer's, not each batch's: with the lock held
+    /// past it, `BATCHES` queued batches are all given up on in about the
+    /// deadline plus one busy timeout per later batch — not `BATCHES` times
+    /// the deadline, which an exit waiting on the queue would sit through. A
+    /// commit after the release resets it, so the next lock is retried for a
+    /// whole deadline again.
+    #[test]
+    fn the_busy_deadline_spans_batches_and_resets_on_commit() -> Result<()> {
+        const BATCHES: u32 = 4;
+        let dir = tempdir()?;
+        let path = dir.path().join("cache.db");
+        let cache = open(&path)?;
+        let busy = Duration::from_millis(50);
+        let total = Duration::from_millis(1000);
+        cache.set_maintenance_overrides(MaintenanceOverrides {
+            busy_timeout: Some(busy),
+            busy_retry_total: Some(total),
+            ..MaintenanceOverrides::default()
+        });
+        let addr = make_addr("pkg", "deadline");
+        put(&cache, &addr, "first", b"spawns the writer")?;
+        assert!(cache.exists(&addr, "h", "first")?);
+
+        let holder = Connection::open(&path)?;
+        holder.execute_batch("BEGIN IMMEDIATE;")?;
+        // Queued behind the closed gate, so they split into whole batches of
+        // `WRITE_BATCH_MAX` instead of trickling in one by one.
+        cache.gate.close();
+        let jobs = WRITE_BATCH_MAX * usize::try_from(BATCHES)?;
+        for i in 0..jobs {
+            put(&cache, &addr, &format!("held-{i}"), b"x")?;
+        }
+        let started = Instant::now();
+        cache.gate.open();
+        // Batches drain in order: the last key's slot is released with the
+        // last batch, and then the read finds nothing.
+        assert!(
+            cache
+                .reader(&addr, "h", &format!("held-{}", jobs - 1))
+                .is_err(),
+            "the lock was never released: every batch was given up on"
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= total,
+            "given up before the deadline: {elapsed:?}"
+        );
+        assert!(
+            elapsed < total * 2,
+            "{BATCHES} batches took {elapsed:?}: the deadline ({total:?}) restarted per batch"
+        );
+
+        holder.execute_batch("COMMIT;")?;
+        put(&cache, &addr, "after", b"commits once released")?;
+        assert!(
+            cache.exists(&addr, "h", "after")?,
+            "past the deadline, the first batch after the release commits on its one attempt"
+        );
+
+        // The commit reset the deadline: a new lock is retried again, well past
+        // the single busy timeout a still-expired deadline would allow.
+        holder.execute_batch("BEGIN IMMEDIATE;")?;
+        put(&cache, &addr, "again", b"retried, not dropped")?;
+        std::thread::sleep(busy * 6);
+        assert!(
+            cache
+                .pending
+                .pending(&LocalCacheSQLite::key(&addr), "h", "again")
+                .is_some(),
+            "still retried six busy timeouts in: the deadline was reset"
+        );
+        holder.execute_batch("COMMIT;")?;
+        assert!(cache.exists(&addr, "h", "again")?);
+        Ok(())
+    }
+
+    /// Pages per chunk under [`small_policy`]: 64 KiB of 8 KiB pages.
+    const SMALL_CHUNK_PAGES: u64 = 8;
+
+    /// The free page counts the writer connection sees after each chunk.
+    fn freelist_hook(seen: &Arc<Mutex<Vec<u64>>>) -> ChunkHook {
+        let seen = Arc::clone(seen);
+        Box::new(move |_, conn: &Connection| {
+            let n: i64 = conn
+                .query_row("PRAGMA freelist_count", [], |r| r.get(0))
+                .expect("freelist_count");
+            seen.lock()
+                .expect("seen")
+                .push(u64::try_from(n).expect("non-negative"));
+        })
+    }
+
+    /// Every chunk of an incremental vacuum frees a whole chunk of pages (the
+    /// last one what is left), so a pass over `free` pages takes
+    /// `ceil(free / chunk_pages)` chunks — not one per page, which is what a
+    /// `PRAGMA incremental_vacuum(N)` stepped once does.
+    #[test]
+    fn each_vacuum_chunk_frees_a_whole_chunk() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("cache.db");
+        let cache = open_with(&path, small_policy())?;
+        fill_and_free(&cache, &path)?;
+        let free_before = u64::try_from(snap(&path)?.free_pages)?;
+        assert_eq!(small_policy().chunk_bytes / 8192, SMALL_CHUNK_PAGES);
+
+        let seen: Arc<Mutex<Vec<u64>>> = Arc::default();
+        let report = cache.maintain(
+            MaintainKind::AfterTrim(small_policy()),
+            Box::new(|| true),
+            Some(freelist_hook(&seen)),
+        )?;
+
+        assert!(
+            matches!(
+                report.action,
+                CompactAction::Vacuumed { complete: true, .. }
+            ),
+            "{report:?}"
+        );
+        let seen = seen.lock().expect("seen").clone();
+        let mut prev = free_before;
+        for &free in &seen {
+            let freed = prev.saturating_sub(free);
+            if free > 0 {
+                assert_eq!(freed, SMALL_CHUNK_PAGES, "{free_before} → {seen:?}");
+            } else {
+                assert!(
+                    (1..=SMALL_CHUNK_PAGES).contains(&freed),
+                    "{free_before} → {seen:?}"
+                );
+            }
+            prev = free;
+        }
+        assert_eq!(
+            u64::try_from(seen.len())?,
+            free_before.div_ceil(SMALL_CHUNK_PAGES),
+            "{free_before} free pages → {seen:?}"
         );
         Ok(())
     }

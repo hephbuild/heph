@@ -1167,7 +1167,9 @@ impl BuildState {
             // GC progress is tracked by GcHeader, not the build counters. The
             // elapsed-clock anchor at the top of `apply` still runs, so the
             // clock works during a gc sweep.
-            BuildEventKind::GcTargetSwept { .. } | BuildEventKind::GcFailureLogsSwept { .. } => {}
+            BuildEventKind::GcTargetSwept { .. }
+            | BuildEventKind::GcFailureLogsSwept { .. }
+            | BuildEventKind::GcCacheDb { .. } => {}
             // Emitted once at the end, after the live view; the command prints
             // its own "incomplete selection" block.
             BuildEventKind::SelectionIncomplete { .. } => {}
@@ -1886,6 +1888,9 @@ pub struct GcHeader {
     /// [`BuildEventKind::GcFailureLogsSwept`] arrives. `None` for a sweep that
     /// has none (`heph tool clean`), whose summary keeps its old shape.
     failure_logs: Option<(usize, u64)>,
+    /// The `cache.db` pass, rendered, once a [`BuildEventKind::GcCacheDb`]
+    /// arrives. `None` for a sweep that has none (`heph tool clean`).
+    cache_db: Option<String>,
 }
 
 impl GcHeader {
@@ -1896,6 +1901,7 @@ impl GcHeader {
             revisions_removed: 0,
             bytes_removed: 0,
             failure_logs: None,
+            cache_db: None,
         }
     }
 
@@ -1911,8 +1917,57 @@ impl GcHeader {
                 human_bytes(bytes)
             ));
         }
+        if let Some(db) = &self.cache_db {
+            s.push_str(" · ");
+            s.push_str(db);
+        }
         s
     }
+}
+
+/// One `GcCacheDb` event as a header segment: the file as the pass left it,
+/// then what the pass did, e.g.
+/// `cache.db 12.1 GiB (live 11.6 GiB, free 0 B, incremental): converted, freed 8.9 GiB`.
+#[expect(clippy::too_many_arguments, reason = "the event's fields, one for one")]
+fn cache_db_segment(
+    file_bytes: u64,
+    live_bytes: u64,
+    free_bytes: u64,
+    mode: &str,
+    action: &str,
+    freed_bytes: u64,
+    needed_bytes: u64,
+    available_bytes: u64,
+    detail: Option<&str>,
+) -> String {
+    if action == "failed" {
+        return format!("cache.db: vacuum failed: {}", detail.unwrap_or("unknown"));
+    }
+    let mode = if mode.is_empty() { "?" } else { mode };
+    let state = format!(
+        "cache.db {} (live {}, free {}, {mode})",
+        human_bytes(file_bytes),
+        human_bytes(live_bytes),
+        human_bytes(free_bytes),
+    );
+    let outcome = match action {
+        "converted" | "vacuumed" => {
+            let mut o = format!("{action}, freed {}", human_bytes(freed_bytes));
+            if let Some(d) = detail {
+                o.push_str(&format!(" ({d})"));
+            }
+            o
+        }
+        "skipped" if needed_bytes > 0 => format!(
+            "not converted: needs {} free, {} available",
+            human_bytes(needed_bytes),
+            human_bytes(available_bytes),
+        ),
+        "skipped" => format!("skipped: {}", detail.unwrap_or("unknown")),
+        "unchanged" | "" => "unchanged".to_string(),
+        other => other.to_string(),
+    };
+    format!("{state}: {outcome}")
 }
 
 impl ProgressHeader for GcHeader {
@@ -1934,6 +1989,30 @@ impl ProgressHeader for GcHeader {
                 *n += removed;
                 *bytes = bytes.saturating_add(*bytes_removed);
             }
+            BuildEventKind::GcCacheDb {
+                file_bytes,
+                wal_bytes: _,
+                live_bytes,
+                free_bytes,
+                mode,
+                action,
+                freed_bytes,
+                needed_bytes,
+                available_bytes,
+                detail,
+            } => {
+                self.cache_db = Some(cache_db_segment(
+                    *file_bytes,
+                    *live_bytes,
+                    *free_bytes,
+                    mode,
+                    action,
+                    *freed_bytes,
+                    *needed_bytes,
+                    *available_bytes,
+                    detail.as_deref(),
+                ));
+            }
             _ => {}
         }
     }
@@ -1947,7 +2026,10 @@ impl ProgressHeader for GcHeader {
     }
 
     fn last_render(&self, _core: &BuildState, _scope: CountScope) -> String {
-        if self.targets > 0 || self.failure_logs.is_some_and(|(n, _)| n > 0) {
+        if self.targets > 0
+            || self.failure_logs.is_some_and(|(n, _)| n > 0)
+            || self.cache_db.is_some()
+        {
             self.segment()
         } else {
             String::new()
@@ -4260,6 +4342,133 @@ mod tests {
             },
         ));
         assert!(!only.last_render(&core, CountScope::Matched).is_empty());
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "the event's fields")]
+    fn gc_cache_db(
+        file_bytes: u64,
+        live_bytes: u64,
+        free_bytes: u64,
+        mode: &str,
+        action: &str,
+        freed_bytes: u64,
+        needed_bytes: u64,
+        available_bytes: u64,
+        detail: Option<&str>,
+    ) -> BuildEventKind {
+        BuildEventKind::GcCacheDb {
+            file_bytes,
+            wal_bytes: 0,
+            live_bytes,
+            free_bytes,
+            mode: mode.to_string(),
+            action: action.to_string(),
+            freed_bytes,
+            needed_bytes,
+            available_bytes,
+            detail: detail.map(str::to_string),
+        }
+    }
+
+    /// The `cache.db` pass is the last segment, in each of its outcomes, and
+    /// alone is still worth a final line.
+    #[test]
+    fn gc_header_renders_the_cache_db_pass() {
+        const GIB: u64 = 1 << 30;
+        let core = BuildState::new();
+        let render = |kind: BuildEventKind| {
+            let mut h = GcHeader::new("GC");
+            h.apply(&ev(0, gc_swept(1, 1024)));
+            h.apply(&ev(1, kind));
+            header_text(&h.header(&core, CountScope::Matched))
+        };
+
+        assert_eq!(
+            render(gc_cache_db(
+                12 * GIB,
+                11 * GIB,
+                0,
+                "incremental",
+                "converted",
+                9 * GIB,
+                0,
+                0,
+                None
+            )),
+            "1 targets · 1.0 KiB freed · cache.db 12.0 GiB (live 11.0 GiB, free 0 B, \
+             incremental): converted, freed 9.0 GiB"
+        );
+        assert_eq!(
+            render(gc_cache_db(
+                21 * GIB,
+                12 * GIB,
+                9 * GIB,
+                "none",
+                "skipped",
+                0,
+                12 * GIB,
+                GIB,
+                Some("needs 12.0 GiB free in /h, has 1.0 GiB")
+            )),
+            "1 targets · 1.0 KiB freed · cache.db 21.0 GiB (live 12.0 GiB, free 9.0 GiB, \
+             none): not converted: needs 12.0 GiB free, 1.0 GiB available"
+        );
+        let locked = render(gc_cache_db(
+            GIB,
+            GIB,
+            0,
+            "none",
+            "skipped",
+            0,
+            0,
+            0,
+            Some("another heph holds the cache's migration lock"),
+        ));
+        assert!(
+            locked.ends_with("none): skipped: another heph holds the cache's migration lock"),
+            "{locked}"
+        );
+        let partial = render(gc_cache_db(
+            GIB,
+            GIB,
+            1024,
+            "incremental",
+            "vacuumed",
+            2048,
+            0,
+            0,
+            Some("stopped early; the next gc continues"),
+        ));
+        assert!(
+            partial.ends_with(
+                "incremental): vacuumed, freed 2.0 KiB (stopped early; the next gc continues)"
+            ),
+            "{partial}"
+        );
+        let failed = render(gc_cache_db(
+            0,
+            0,
+            0,
+            "",
+            "failed",
+            0,
+            0,
+            0,
+            Some("disk I/O error"),
+        ));
+        assert!(
+            failed.ends_with(" · cache.db: vacuum failed: disk I/O error"),
+            "{failed}"
+        );
+
+        // Nothing else swept: the cache.db line still prints.
+        let mut only = GcHeader::new("GC");
+        only.apply(&ev(
+            0,
+            gc_cache_db(GIB, GIB, 0, "incremental", "unchanged", 0, 0, 0, None),
+        ));
+        let last = only.last_render(&core, CountScope::Matched);
+        assert!(last.ends_with("incremental): unchanged"), "{last}");
     }
 
     #[test]

@@ -503,6 +503,41 @@ pub enum BuildEventKind {
         #[serde(default)]
         bytes_removed: u64,
     },
+    /// `heph tool gc`'s pass over the local cache database (`cache.db`): its
+    /// size once the pass is done and what the pass did. Emitted once per
+    /// sweep. An older consumer reads it as [`BuildEventKind::Unknown`].
+    GcCacheDb {
+        /// The database file's size on disk.
+        #[serde(default)]
+        file_bytes: u64,
+        /// Its `-wal` file's size on disk.
+        #[serde(default)]
+        wal_bytes: u64,
+        /// Bytes in pages holding data.
+        #[serde(default)]
+        live_bytes: u64,
+        /// Bytes in free pages, which only a vacuum returns to the disk.
+        #[serde(default)]
+        free_bytes: u64,
+        /// `PRAGMA auto_vacuum`: `none`, `incremental` or `full`.
+        #[serde(default)]
+        mode: String,
+        /// `converted`, `vacuumed`, `skipped`, `unchanged` or `failed`.
+        #[serde(default)]
+        action: String,
+        /// Bytes the file (and its WAL) shrank by.
+        #[serde(default)]
+        freed_bytes: u64,
+        /// `skipped` for want of space: the free bytes the conversion needs on
+        /// the filesystem that is shortest, and what it has.
+        #[serde(default)]
+        needed_bytes: u64,
+        #[serde(default)]
+        available_bytes: u64,
+        /// Why it was skipped or failed, for a person.
+        #[serde(default)]
+        detail: Option<String>,
+    },
     /// A path the codegen index excluded from a lookup (an fs `file` target,
     /// a glob) and that the user may have expected to see: `status` is the
     /// index's verdict (`generated`, `modified`), `reason` why (`recorded`,
@@ -1137,6 +1172,54 @@ mod tests {
             BuildEventKind::GcFailureLogsSwept {
                 removed: 0,
                 bytes_removed: 0
+            }
+        ));
+    }
+
+    /// `GcCacheDb` decodes with every field absent (each is defaulted), and a
+    /// full frame round-trips.
+    #[test]
+    fn gc_cache_db_frame_decodes_with_fields_absent() {
+        let bare = r#"{"at_unix_ms":1,"kind":{"type":"GcCacheDb"}}"#;
+        let ev: BuildEvent = serde_json::from_str(bare).expect("bare frame must decode");
+        match ev.kind {
+            BuildEventKind::GcCacheDb {
+                file_bytes,
+                wal_bytes,
+                live_bytes,
+                free_bytes,
+                mode,
+                action,
+                freed_bytes,
+                needed_bytes,
+                available_bytes,
+                detail,
+            } => {
+                assert_eq!(
+                    (file_bytes, wal_bytes, live_bytes, free_bytes),
+                    (0, 0, 0, 0)
+                );
+                assert_eq!((freed_bytes, needed_bytes, available_bytes), (0, 0, 0));
+                assert_eq!((mode.as_str(), action.as_str()), ("", ""));
+                assert_eq!(detail, None);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        let full = r#"{"at_unix_ms":1,"kind":{"type":"GcCacheDb","file_bytes":10,
+            "wal_bytes":1,"live_bytes":7,"free_bytes":3,"mode":"none",
+            "action":"skipped","freed_bytes":0,"needed_bytes":9,
+            "available_bytes":4,"detail":"short"}}"#;
+        let ev: BuildEvent = serde_json::from_str(full).expect("full frame must decode");
+        let back = serde_json::to_string(&ev).expect("encode");
+        let again: BuildEvent = serde_json::from_str(&back).expect("re-decode");
+        assert!(matches!(
+            again.kind,
+            BuildEventKind::GcCacheDb {
+                file_bytes: 10,
+                needed_bytes: 9,
+                available_bytes: 4,
+                ..
             }
         ));
     }
