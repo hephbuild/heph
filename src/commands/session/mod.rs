@@ -566,9 +566,27 @@ pub(crate) fn truncate(s: &str, max: usize) -> String {
     out
 }
 
+/// The longest SGR parameter list (the bytes between `ESC[` and `m`) kept as
+/// colour. Real ones are far shorter: bold, italic, underline, a truecolour
+/// foreground and background and an underline colour come to under 60 bytes.
+/// A longer list is escaped like a malformed sequence, and the scan for the
+/// `m` stops one byte past this, so a megabyte of parameters costs a bounded
+/// look-ahead and is never kept.
+const MAX_SGR_PARAMS: usize = 128;
+
+/// The bidirectional embedding, override and isolate controls (`U+202A`–`U+202E`,
+/// `U+2066`–`U+2069`). They are not control characters to `char::is_control`
+/// (they are format characters), but they reorder how the rest of a line is
+/// displayed, so recorded text could make a viewer show something it does
+/// not contain. Escaped like a control character.
+fn is_bidi_control(c: char) -> bool {
+    matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
 /// One line of recorded text, made safe for a terminal: SGR sequences
 /// (`ESC[…m`) are dropped, every other control character — newlines included —
-/// is escaped (`\u{1b}`, `\n`). `attach` keeps SGR: see [`escape_replayed`].
+/// and every bidi control is escaped (`\u{1b}`, `\n`, `\u{202e}`). `attach`
+/// keeps SGR: see [`escape_replayed`].
 pub(crate) fn escape(s: &str) -> Cow<'_, str> {
     escape_with(s, false, false)
 }
@@ -580,17 +598,19 @@ pub(crate) fn escape_text(s: &str) -> Cow<'_, str> {
 
 /// [`escape_text`] for what a run printed to its own terminal, replayed by
 /// `attach`: a well-formed SGR sequence (colour and attributes, `ESC[` digits
-/// `;` `:` then `m`) is kept when `color` (the viewer's stream takes colour)
-/// and dropped otherwise. Everything else is escaped as [`escape_text`] does:
-/// cursor moves, clears, OSC titles, any other CSI, C1 controls, and a
-/// truncated or malformed sequence.
+/// `;` `:` then `m`, at most [`MAX_SGR_PARAMS`] parameter bytes) is kept when
+/// `color` (the viewer's stream takes colour) and dropped otherwise.
+/// Everything else is escaped as [`escape_text`] does: cursor moves, clears,
+/// OSC titles, any other CSI (an intermediate byte, a private marker), C1
+/// controls, bidi controls, and a truncated, malformed or oversized sequence.
 pub(crate) fn escape_replayed(s: &str, color: bool) -> Cow<'_, str> {
     escape_with(s, true, color)
 }
 
 fn escape_with(s: &str, keep_lines: bool, keep_sgr: bool) -> Cow<'_, str> {
     let kept = |c: char| keep_lines && (c == '\n' || c == '\t');
-    if !s.chars().any(|c| c.is_control() && !kept(c)) {
+    let escaped = |c: char| (c.is_control() || is_bidi_control(c)) && !kept(c);
+    if !s.chars().any(escaped) {
         return Cow::Borrowed(s);
     }
     let mut out = String::with_capacity(s.len());
@@ -598,14 +618,18 @@ fn escape_with(s: &str, keep_lines: bool, keep_sgr: bool) -> Cow<'_, str> {
     while let Some(c) = chars.next() {
         if c == '\u{1b}' && chars.peek() == Some(&'[') {
             // An SGR sequence: `ESC [` parameters `m`. Anything else after
-            // `ESC [` is escaped like any control character.
+            // `ESC [` is escaped like any control character. A scan never
+            // reads past `MAX_SGR_PARAMS + 1` parameter bytes, and the bytes
+            // it read are not control characters, so no later scan starts
+            // inside them: linear in the input.
             let params: String = chars
                 .clone()
                 .skip(1)
                 .take_while(|c| c.is_ascii_digit() || *c == ';' || *c == ':')
+                .take(MAX_SGR_PARAMS + 1)
                 .collect();
             let mut probe = chars.clone().skip(1 + params.len());
-            if probe.next() == Some('m') {
+            if params.len() <= MAX_SGR_PARAMS && probe.next() == Some('m') {
                 for _ in 0..params.len() + 2 {
                     chars.next();
                 }
@@ -617,7 +641,7 @@ fn escape_with(s: &str, keep_lines: bool, keep_sgr: bool) -> Cow<'_, str> {
                 continue;
             }
         }
-        if c.is_control() && !kept(c) {
+        if escaped(c) {
             out.extend(c.escape_default());
         } else {
             out.push(c);

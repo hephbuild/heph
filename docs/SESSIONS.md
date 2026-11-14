@@ -286,8 +286,14 @@ Replayed text keeps the run's colours: a well-formed SGR sequence (`ESC[`,
 digits, `;` and `:`, then `m`) is kept when the viewer's stderr takes colour
 and dropped when it does not (`NO_COLOR`, not a terminal). Everything else is
 escaped to visible text (`\u{1b}[2J`): cursor moves, clears, OSC titles, any
-other CSI including private modes like `ESC[?1049h`, C1 controls, and a
-truncated or malformed sequence. This reverses spec amendment A11 (drop every
+other CSI including private modes like `ESC[?1049h` and an intermediate byte
+like `ESC[31 m`, C1 controls, DEL and NUL, the bidi embedding, override and
+isolate controls (`U+202A`–`U+202E`, `U+2066`–`U+2069`, which reorder how a
+line displays), and a truncated or malformed sequence. A parameter list over
+128 bytes is malformed too: no real SGR comes near it (a truecolour
+foreground and background with attributes is under 60 bytes), so its `ESC`
+is escaped and the rest prints as text. The scan for the `m` stops at 129
+bytes, so the check stays linear whatever the input. This reverses spec amendment A11 (drop every
 SGR on output) for `attach`'s replayed `Log` and `Output` text only; `list`,
 `show` and `inflight` still drop SGR (`escape_replayed` vs `escape_text` in
 `src/commands/session/mod.rs`).

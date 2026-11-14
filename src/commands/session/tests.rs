@@ -1096,6 +1096,32 @@ fn replayed_text_keeps_only_sgr() {
             "\u{1b}[31m\\u{1b}[2Jx\\r",
             "\\u{1b}[2Jx\\r",
         ),
+        (
+            "intermediate byte before the final m",
+            "\u{1b}[31 mx",
+            "\\u{1b}[31 mx",
+            "\\u{1b}[31 mx",
+        ),
+        (
+            "private marker",
+            "\u{1b}[<31mx",
+            "\\u{1b}[<31mx",
+            "\\u{1b}[<31mx",
+        ),
+        ("DEL", "a\u{7f}b", "a\\u{7f}b", "a\\u{7f}b"),
+        ("NUL", "a\u{0}b", "a\\u{0}b", "a\\u{0}b"),
+        (
+            "right-to-left override",
+            "ok\u{202e}txt.exe",
+            "ok\\u{202e}txt.exe",
+            "ok\\u{202e}txt.exe",
+        ),
+        (
+            "bidi isolate",
+            "a\u{2066}b\u{2069}",
+            "a\\u{2066}b\\u{2069}",
+            "a\\u{2066}b\\u{2069}",
+        ),
     ];
     for &(name, input, color, plain) in table {
         assert_eq!(escape_replayed(input, true), color, "{name}, colour sink");
@@ -1121,6 +1147,32 @@ fn replayed_text_keeps_only_sgr() {
     for &(name, input, _, plain) in table {
         assert_eq!(escape_text(input), plain, "{name}");
     }
+}
+
+/// An SGR's parameter list is kept up to 128 bytes. Past that it is no colour
+/// a terminal draws: the ESC is escaped and the rest prints as text, on either
+/// sink. A megabyte of parameters is the same, and costs one bounded scan.
+#[test]
+fn oversized_sgr_parameters_are_escaped() {
+    let at_cap = "1;".repeat(64).trim_end_matches(';').to_owned() + "0";
+    assert_eq!(at_cap.len(), 128);
+    let sgr = format!("\u{1b}[{at_cap}mx");
+    assert_eq!(escape_replayed(&sgr, true), sgr, "128 bytes: kept");
+    assert_eq!(escape_replayed(&sgr, false), "x", "128 bytes: dropped");
+
+    for params in [format!("{at_cap};"), "1;".repeat(512 * 1024)] {
+        let input = format!("\u{1b}[{params}mx");
+        let escaped = format!("\\u{{1b}}[{params}mx");
+        assert_eq!(escape_replayed(&input, true), escaped, "{} bytes", params.len());
+        assert_eq!(escape_replayed(&input, false), escaped, "{} bytes", params.len());
+    }
+
+    // Many sequences each just over the cap: still linear, every one escaped.
+    let over = format!("\u{1b}[{at_cap};m");
+    let input = over.repeat(8 * 1024);
+    let out = escape_replayed(&input, true);
+    assert!(!out.contains('\u{1b}'));
+    assert_eq!(out.matches("\\u{1b}[").count(), 8 * 1024);
 }
 
 #[tokio::test]
