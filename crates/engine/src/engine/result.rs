@@ -2076,7 +2076,7 @@ fn classify_failure(
     let outputs = failure_slot_out(&e);
     let slot = downcast_chain_ref::<crate::engine::failure_slot::FailureSlot>(&e);
     let fixes = slot.and_then(|s| s.fixes.clone());
-    let sandbox_removed = slot.is_some_and(|s| s.sandbox_removed);
+    let sandbox = slot.and_then(|s| s.sandbox.clone());
     rs.record_failure(
         addr.clone(),
         Arc::new(
@@ -2084,7 +2084,7 @@ fn classify_failure(
                 .with_log(log)
                 .with_outputs(outputs)
                 .with_fixes(fixes)
-                .with_sandbox_removed(sandbox_removed),
+                .with_sandbox(sandbox),
         ),
     );
     UpstreamFailed { root: addr.clone() }.into()
@@ -4911,13 +4911,25 @@ impl Engine {
                             // path, which reclaims — that path must mean
                             // cancellation only.
                             drop(sandbox_guards);
-                            if engine.cfg.keep_failed_sandboxes {
+                            let fate = if engine.cfg.keep_failed_sandboxes {
+                                let kept = engine.sandbox_on_disk(sandbox_teardown.dir());
                                 sandbox_teardown.leave_for_diagnostics();
+                                hplugin::error::SandboxFate::Kept(kept)
                             } else {
                                 let upper = engine.fuse_upper(sandbox_teardown.dir());
-                                sandbox_teardown.hold_for_failure().reclaim(upper);
-                            }
-                            return Err(err);
+                                sandbox_teardown.reclaim(upper);
+                                hplugin::error::SandboxFate::Removed
+                            };
+                            // No slot is filled for a failure past the run;
+                            // the box learns the sandbox's fate from an empty
+                            // one, for a run that had a tree.
+                            let managed = engine
+                                .drivers_by_name
+                                .get(&spec.driver)
+                                .is_some_and(|d| d.managed);
+                            let slot = crate::engine::failure_slot::FailureSlot::default()
+                                .with_sandbox(managed.then_some(fate));
+                            return Err(err.context(slot));
                         }
                     };
 

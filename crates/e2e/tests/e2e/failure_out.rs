@@ -732,17 +732,17 @@ async fn replaced_by_next_failure() -> anyhow::Result<()> {
 /// down once the slot is filled.
 #[tokio::test]
 async fn kept_for_material() -> anyhow::Result<()> {
-    kept_for_material_in(Workspace::new()).await
+    kept_for_material_in(Workspace::new(), false).await
 }
 
 /// `--keep-failed-sandboxes` keeps no credential material: the material
-/// producer's sandbox is torn down all the same.
+/// producer's sandbox is torn down all the same, and the box says why.
 #[tokio::test]
 async fn kept_for_material_when_keeping_failed_sandboxes() -> anyhow::Result<()> {
-    kept_for_material_in(Workspace::keeping_failed_sandboxes()).await
+    kept_for_material_in(Workspace::keeping_failed_sandboxes(), true).await
 }
 
-async fn kept_for_material_in(ws: Workspace) -> anyhow::Result<()> {
+async fn kept_for_material_in(ws: Workspace, keeping: bool) -> anyhow::Result<()> {
     ws.write_build_file(
         "auth",
         r#"
@@ -758,7 +758,18 @@ target(name = "t", driver = "auth.credential", sources = ["//auth:fetch"],
         r#"target(name = "a", driver = "bash", out = "o.txt", cache = False,
        credentials = ["//auth:t"], run = ["printf '%s' \"$T\" > o.txt"])"#,
     );
-    failures(&ws.engine, "//app:a", &ResultOptions::default()).await?;
+    let f = failures(&ws.engine, "//app:a", &ResultOptions::default()).await?;
+    let out = render(&f);
+    if keeping {
+        // Removed against the flag: the box says so, and why.
+        assert!(
+            out.contains("  sandbox: removed (credential material)\n"),
+            "{out}"
+        );
+    } else {
+        // Removed as any failed sandbox is, and not a choice to explain.
+        assert!(!out.contains("sandbox:"), "{out}");
+    }
     let addr = parse_addr("//auth:fetch")?;
     let slots = ws.engine.failure_slots();
     assert!(slots.read(&addr).is_some(), "the producer has a slot");

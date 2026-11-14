@@ -191,7 +191,10 @@ pub enum Lane {
 /// executes themselves but not their detached jobs, and this registry is
 /// process-local. That exposure predates cancel-on-abandonment (any process
 /// exit with queued jobs had it) and is bounded by process lifetime — queued
-/// jobs die with the process that queued them.
+/// jobs die with the process that queued them. Every detached removal shares
+/// it: a passing run's bridge job, a cancelled run's drop reclaim, and a
+/// failed run's reclaim (queued once its failure slot is filled, and free to
+/// run after the execute lock is released).
 pub mod generation {
     use std::collections::HashMap;
     use std::io;
@@ -308,7 +311,7 @@ pub mod generation {
 ///   finished, or the cache write failed with an error value): the
 ///   bridge-owned cleanup job is enqueued, guarded by this run's generation.
 ///   The bridge job knows the real layout (plain dir vs FUSE upper side).
-/// * [`hold_for_failure`](Self::hold_for_failure), then
+/// * [`defer_for_failure`](Self::defer_for_failure), then
 ///   [`reclaim`](Self::reclaim) — **the target failed** (an `Err` is
 ///   propagating out of the execute), by default: nothing is queued while the
 ///   failure arm reads the sandbox (the `in_place` write-back's tars, the
@@ -341,7 +344,8 @@ pub mod generation {
 /// ([`with_sandbox_slot`](Self::with_sandbox_slot)): every path that queues a
 /// removal moves the slot into that job, released once the removal returns,
 /// and every path that queues none — `leave_for_diagnostics`, a `complete`
-/// with no bridge job, a drop after `hold_for_failure` — drops it at once.
+/// with no bridge job, a drop after `defer_for_failure` (a cancellation
+/// during the fill, a run abandoned after its timeout) — drops it at once.
 pub struct SandboxTeardown {
     dir: PathBuf,
     generation: u64,
@@ -505,6 +509,7 @@ impl SandboxTeardown {
 
     /// Hand this teardown the run's `sandbox` pool slot, released when the
     /// sandbox's removal returns (or at once, when nothing will remove it).
+    #[must_use = "dropping the teardown queues its reclaim at once"]
     pub fn with_sandbox_slot(
         mut self,
         slot: Option<crate::engine::resource_pool::Reservation>,
@@ -585,15 +590,18 @@ impl SandboxTeardown {
     /// a cancellation while the fill is still unpacking out of the sandbox, on
     /// a blocking thread the cancellation does not stop, must not queue a
     /// removal under it. Such a drop leaves the tree to this addr's next run,
-    /// whose `remove_stale` reclaims it, and releases the slot at once.
-    pub fn hold_for_failure(mut self) -> Self {
+    /// whose `remove_stale` reclaims it, and releases the slot at once. A run
+    /// abandoned after its timeout is dropped so on purpose: its process may
+    /// still be writing to the tree.
+    #[must_use = "dropping a deferred teardown leaves the sandbox on disk; call reclaim()"]
+    pub fn defer_for_failure(mut self) -> Self {
         self.armed = false;
         self.job = None;
         self
     }
 
     /// The target failed and its sandbox must not outlive the failure — by
-    /// default ([`hold_for_failure`](Self::hold_for_failure)), and always
+    /// default ([`defer_for_failure`](Self::defer_for_failure)), and always
     /// when its outputs are credential material: enqueue the
     /// generation-checked [`generation::remove_stale`] reclaim now. The
     /// sandbox slot rides in the job, released once the tree is gone. Call
@@ -1393,7 +1401,7 @@ mod tests {
     /// (the write-back's tars, the slot's fill) nothing is queued against it;
     /// once it is done, the reclaim removes it.
     ///
-    /// Holding queues nothing, so a removal cannot race the fill still
+    /// Deferring queues nothing, so a removal cannot race the fill still
     /// unpacking out of the tree. The bridge job never runs: a failed run's
     /// removal is the generation-checked reclaim, not the passing run's
     /// cleanup.
@@ -1404,11 +1412,11 @@ mod tests {
         let pending = counter();
         let (teardown, bridge_ran) = failed_teardown(&sandbox, &pending);
 
-        let held = teardown.hold_for_failure();
+        let held = teardown.defer_for_failure();
         assert_eq!(
             pending.load(Ordering::Acquire),
             0,
-            "a held teardown must enqueue nothing while the failure is kept"
+            "a deferred teardown must enqueue nothing while the failure is kept"
         );
         assert!(
             sandbox.join("log.txt").exists(),
@@ -1729,13 +1737,13 @@ mod tests {
             ("complete, no job", |t, _| t.complete("none".into()), false),
             ("reclaim", |t, _| t.reclaim(None), true),
             (
-                "hold_for_failure, reclaim",
-                |t, _| t.hold_for_failure().reclaim(None),
+                "defer_for_failure, reclaim",
+                |t, _| t.defer_for_failure().reclaim(None),
                 true,
             ),
             (
-                "hold_for_failure, drop",
-                |t, _| drop(t.hold_for_failure()),
+                "defer_for_failure, drop",
+                |t, _| drop(t.defer_for_failure()),
                 false,
             ),
             ("drop", |t, _| drop(t), true),

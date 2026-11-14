@@ -148,7 +148,7 @@ async fn a_failed_targets_sandbox_is_removed() -> anyhow::Result<()> {
 }
 
 /// `--keep-failed-sandboxes`: the failed sandbox stays, as before the
-/// default changed, and the box says nothing about it.
+/// default changed, and the box says where.
 #[tokio::test]
 async fn keep_failed_sandboxes_keeps_a_failed_targets_sandbox() -> anyhow::Result<()> {
     let ws = Workspace::keeping_failed_sandboxes();
@@ -169,7 +169,30 @@ async fn keep_failed_sandboxes_keeps_a_failed_targets_sandbox() -> anyhow::Resul
     );
     let out = render(&f);
     assert!(out.contains("│ kept-marker"), "{out}");
-    assert!(!out.contains("sandbox:"), "{out}");
+    assert!(
+        out.contains(&format!("  sandbox: {} (kept)\n", sandbox.display())),
+        "{out}"
+    );
+    Ok(())
+}
+
+/// A plain driver (`template`, rendered in-process) runs in no sandbox, so a
+/// failure of its run says nothing about one, whatever the flag.
+#[tokio::test]
+async fn a_failed_run_without_a_sandbox_names_none() -> anyhow::Result<()> {
+    for ws in [Workspace::new(), Workspace::keeping_failed_sandboxes()] {
+        // Not UTF-8: the template driver's run fails reading it.
+        std::fs::create_dir_all(ws.dir.path().join("p"))?;
+        std::fs::write(ws.dir.path().join("p/conf.j2"), b"\xff\xfe")?;
+        ws.write_build_file(
+            "p",
+            r#"target(name = "conf", driver = "template", src = file("conf.j2"), out = "conf")"#,
+        );
+        let f = failures(&ws.engine, "//p:conf", &ResultOptions::default()).await?;
+        let out = render(&f);
+        assert!(out.contains("not valid UTF-8"), "the run failed: {out}");
+        assert!(!out.contains("sandbox:"), "{out}");
+    }
     Ok(())
 }
 

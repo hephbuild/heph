@@ -76,6 +76,24 @@ stays until the target's next run, and it is outside the `sandbox` pool's cap
 (see [RESOURCES.md](RESOURCES.md)). A target whose outputs are credential
 material has its failed sandbox removed even under the flag.
 
+The box's `sandbox:` line, after `full log:`, says which:
+
+| Line | When |
+|---|---|
+| `sandbox: removed (rerun with --keep-failed-sandboxes to keep it)` | the default |
+| `sandbox: <path> (kept)` | under `--keep-failed-sandboxes` |
+| `sandbox: removed (credential material)` | material, under the flag |
+| `sandbox: left (run abandoned after timeout)` | the run outlived its timeout's grace (see [TIMEOUTS.md](TIMEOUTS.md)) |
+
+There is no line when the run had no sandbox (a plain driver such as
+`template` or `fs`, or a failure before the driver ran), nor for material
+without the flag. `heph inspect failure` (and its `--json`) never reports the
+sandbox: it reads the slot, and the sandbox is not part of it.
+
+When the slot's fill itself fails (an unwritable failures directory, a log
+outside the sandbox), the box falls back to the log's tail in memory, and the
+full log is gone with the sandbox unless `--keep-failed-sandboxes` kept it.
+
 ## `failure_out`
 
 `failure_out` has the same shape as `out`: a string, a list, or a dict of group

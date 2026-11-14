@@ -148,11 +148,21 @@ pub struct FailureSlot {
     /// What the run's `in_place` write-back on failure did, with the slot's
     /// `fixes.txt` filled in when it was kept.
     pub fixes: Option<hplugin::error::FailureFixes>,
-    /// The run's sandbox is removed once the fill is done, rather than left
-    /// on disk under `--keep-failed-sandboxes`. Set by `execute`, not by the
-    /// fill; false for credential material, whose removal is not a choice
-    /// the failure box needs to explain.
-    pub sandbox_removed: bool,
+    /// What becomes of the run's sandbox once the fill is done, for the
+    /// failure box ([`SandboxFate`](hplugin::error::SandboxFate)). Set by the
+    /// engine ([`with_sandbox`](Self::with_sandbox)), never by the fill. A
+    /// failure after the run, while hashing its artifacts, fills no slot and
+    /// carries a default one with only this set.
+    pub sandbox: Option<hplugin::error::SandboxFate>,
+}
+
+impl FailureSlot {
+    /// The same slot, saying what becomes of the run's sandbox.
+    #[must_use]
+    pub fn with_sandbox(mut self, sandbox: Option<hplugin::error::SandboxFate>) -> Self {
+        self.sandbox = sandbox;
+        self
+    }
 }
 
 impl fmt::Display for FailureSlot {
@@ -404,7 +414,7 @@ impl FailureSlots {
             out: filled.out,
             out_error: filled.out_error,
             fixes,
-            sandbox_removed: false,
+            sandbox: None,
         }
     }
 }

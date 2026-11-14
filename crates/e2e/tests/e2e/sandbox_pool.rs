@@ -508,6 +508,13 @@ async fn a_full_sandbox_pool_drains_after_a_cancellation() -> anyhow::Result<()>
     );
     drain(rs).await;
     all_capacity_back(&engine).await;
+    // Whether the cancellation dropped t5's execute or exec reported it as an
+    // error of its own, its sandbox is removed, not kept as a failure's.
+    assert_eq!(
+        sandboxes(&engine, "p"),
+        0,
+        "the cancelled sandbox is removed"
+    );
 
     build(&engine, &["//p:after".to_owned()]).await?;
     all_capacity_back(&engine).await;
