@@ -209,6 +209,16 @@ impl LocalCache for LocalCacheFS {
         self.exists(addr, hashin, name)
     }
 
+    /// A `stat`, rather than the default's open.
+    fn stored_size(&self, addr: &Addr, hashin: &str, name: &str) -> Result<Option<u64>> {
+        let path = self.get_path(addr, hashin, name);
+        match fs::metadata(&path) {
+            Ok(meta) => Ok(Some(meta.len())),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("stat cache file: {path:?}")),
+        }
+    }
+
     fn delete(&self, addr: &Addr, hashin: &str, name: &str) -> Result<()> {
         let path = self.get_path(addr, hashin, name);
         if path.exists() {

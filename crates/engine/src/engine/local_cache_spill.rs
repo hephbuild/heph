@@ -196,6 +196,13 @@ impl LocalCache for LocalCacheSpill {
             || self.blobs.exists_committed(addr, hashin, name)?)
     }
 
+    fn stored_size(&self, addr: &Addr, hashin: &str, name: &str) -> Result<Option<u64>> {
+        match self.primary.stored_size(addr, hashin, name)? {
+            Some(size) => Ok(Some(size)),
+            None => self.blobs.stored_size(addr, hashin, name),
+        }
+    }
+
     fn delete(&self, addr: &Addr, hashin: &str, name: &str) -> Result<()> {
         // A blob lives in exactly one backend, but the deleter (GC) doesn't know
         // which — both deletes are no-ops on the absent side. The FS delete also

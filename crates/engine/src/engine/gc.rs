@@ -17,13 +17,13 @@
 //!   batch is drained by
 //!   [`Engine::run_trim_batch_with_delay`], which retries the contended subset.
 //!
-//! Revision recency comes from each group's `manifest-v1.borsh`
-//! (`created_at_nanos`); the full artifact name list to delete comes from the
-//! same manifest.
+//! Revision recency comes from each group's manifest (`created_at_nanos`,
+//! `manifest-v2.borsh` first, then an older heph's `manifest-v1.borsh`); the
+//! blobs to delete are the union of what every manifest the revision has names.
 
 use crate::engine::Engine;
 use crate::engine::error::TargetNotFoundError;
-use crate::engine::local_cache::{Existence, MANIFEST_V2, MANIFESTS};
+use crate::engine::local_cache::{Existence, MANIFEST_V2};
 use crate::engine::request_state::RequestState;
 use crate::engine::result_lock::TargetGuard;
 use anyhow::{Context, Result};
@@ -176,10 +176,12 @@ enum Decision {
 }
 
 impl Engine {
-    /// Delete one cache revision: every artifact named in its manifest, then the
-    /// manifest itself. Returns the bytes freed (Σ manifest artifact sizes).
-    /// Best-effort if the manifest is missing (still removes the manifest key in
-    /// case of a partial write; reports 0 bytes).
+    /// Delete one cache revision: every artifact each of its manifests names,
+    /// then the manifests. Returns the bytes freed: the stored size of every
+    /// blob actually deleted, which for a compressed blob is less than the
+    /// manifest's decoded `size`. Best-effort if no manifest is found (still
+    /// removes the [`MANIFEST_V2`] key in case of a partial write; reports 0
+    /// bytes).
     ///
     /// Shared with [`Engine::clean`]: both commands delete revisions, and only
     /// the *choice* of which ones differs. Callers must hold the addr's target
@@ -189,24 +191,30 @@ impl Engine {
         let mut bytes = 0u64;
         // Both manifests, not just the one reads prefer: a revision written by
         // an older heph and by this one has two, and each names its own blobs.
-        for (_, manifest) in Self::read_all_manifests(&self.local_cache, addr, hashin)? {
+        let manifests = Self::read_all_manifests(&self.local_cache, addr, hashin)?;
+        for (_, manifest) in &manifests {
             for a in &manifest.artifacts {
                 // A manifest can name blobs that were never downloaded (a
                 // revision mirrored from a remote materializes lazily), so only
                 // count bytes actually reclaimed.
-                let present = self
+                let stored = self
                     .local_cache
-                    .exists(addr, hashin, &a.name)
+                    .stored_size(addr, hashin, &a.name)
                     .with_context(|| format!("probe cached artifact {} for {addr}", a.name))?;
                 self.local_cache
                     .delete(addr, hashin, &a.name)
                     .with_context(|| format!("delete cached artifact {} for {addr}", a.name))?;
-                if present {
-                    bytes = bytes.saturating_add(a.size);
-                }
+                bytes = bytes.saturating_add(stored.unwrap_or(0));
             }
         }
-        for name in MANIFESTS {
+        // The manifests found, plus `MANIFEST_V2` always: the one this version
+        // writes, so the one a partial write of this version can have left
+        // behind unread. A v1 manifest is only ever written whole by an older
+        // heph, so an absent one costs no delete.
+        let found = manifests.iter().map(|(name, _)| *name);
+        let hedge =
+            (!manifests.iter().any(|(name, _)| *name == MANIFEST_V2)).then_some(MANIFEST_V2);
+        for name in found.chain(hedge) {
             self.local_cache
                 .delete(addr, hashin, name)
                 .with_context(|| format!("delete {name} for {addr} {hashin}"))?;
@@ -1058,6 +1066,14 @@ mod tests {
                 return Ok(false);
             }
             self.inner.exists_committed(addr, hashin, name)
+        }
+        fn stored_size(
+            &self,
+            addr: &Addr,
+            hashin: &str,
+            name: &str,
+        ) -> anyhow::Result<Option<u64>> {
+            self.inner.stored_size(addr, hashin, name)
         }
         fn delete(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<()> {
             self.inner.delete(addr, hashin, name)
@@ -2188,5 +2204,171 @@ mod tests {
         assert_eq!((out.removed, out.kept), (2, 1));
         assert!(present(&engine, &a, "h3"), "newest kept");
         assert!(!present(&engine, &a, "h1"));
+    }
+
+    /// Store `data` for `(addr, hashin, name)` encoded as `encoding`, through
+    /// the same writer `cache_locally` uses, and commit it.
+    fn write_encoded(
+        engine: &Engine,
+        a: &Addr,
+        hashin: &str,
+        name: &str,
+        encoding: &ManifestArtifactEncoding,
+        data: &[u8],
+    ) {
+        let mut w = crate::engine::cache_codec::open_writer(
+            &*engine.local_cache,
+            a,
+            hashin,
+            name,
+            encoding,
+        )
+        .expect("writer");
+        w.write_all(data).expect("write blob");
+        w.commit().expect("commit blob");
+    }
+
+    /// A Tar output `name` of `size` decoded bytes.
+    fn tar_artifact(name: &str, size: u64, encoding: ManifestArtifactEncoding) -> ManifestArtifact {
+        ManifestArtifact {
+            hashout: "ho".to_string(),
+            group: String::new(),
+            name: name.to_string(),
+            size,
+            r#type: ManifestArtifactType::Output,
+            content_type: ManifestArtifactContentType::Tar,
+            encoding,
+        }
+    }
+
+    /// One manifest, `manifest_name`, naming `artifact` alone.
+    fn write_manifest(
+        engine: &Engine,
+        a: &Addr,
+        hashin: &str,
+        manifest_name: &str,
+        version: &str,
+        artifact: ManifestArtifact,
+    ) {
+        let manifest = Manifest {
+            version: version.to_string(),
+            target: a.format(),
+            created_at_nanos: 100,
+            hashin: hashin.to_string(),
+            artifacts: vec![artifact],
+        };
+        let mut w = engine
+            .local_cache
+            .writer(a, hashin, manifest_name)
+            .expect("manifest writer");
+        borsh::to_writer(&mut w, &manifest).expect("write manifest");
+        w.commit().expect("commit manifest");
+    }
+
+    /// GC reports what it frees on disk: the stored, compressed bytes of a
+    /// `Zstd` blob, not the decoded `size` its manifest records.
+    #[test]
+    fn gc_entry_reports_stored_bytes_of_a_compressed_blob() {
+        let (engine, _dir) = test_engine();
+        let a = addr("t");
+        let decoded = vec![b'x'; 256 * 1024];
+        let name = "out_.tar.zst";
+        write_encoded(
+            &engine,
+            &a,
+            "h1",
+            name,
+            &ManifestArtifactEncoding::Zstd,
+            &decoded,
+        );
+        write_manifest(
+            &engine,
+            &a,
+            "h1",
+            MANIFEST_V2,
+            crate::engine::local_cache::MANIFEST_V2_VERSION,
+            tar_artifact(name, decoded.len() as u64, ManifestArtifactEncoding::Zstd),
+        );
+        let stored = engine
+            .local_cache
+            .stored_size(&a, "h1", name)
+            .expect("stored size")
+            .expect("blob present");
+        assert!(
+            stored < decoded.len() as u64,
+            "a run of one byte compresses: stored {stored}"
+        );
+
+        let bytes = engine.gc_entry(&a, "h1").expect("gc_entry");
+
+        assert_eq!(bytes, stored, "GC reports the stored bytes it freed");
+        assert!(!present(&engine, &a, "h1"));
+        assert!(!engine.local_cache.exists(&a, "h1", name).expect("exists"));
+    }
+
+    /// A revision both an older heph and this one wrote has two manifests, each
+    /// naming its own blobs. Reads prefer v2; GC removes both manifests and both
+    /// sets of blobs.
+    #[test]
+    fn revision_with_both_manifests_reads_v2_and_gc_removes_both() {
+        let (engine, _dir) = test_engine();
+        let a = addr("t");
+        let (v1_name, v2_name) = ("a.tar", "a.tar.zst");
+        let (v1_data, v2_data) = (b"older heph payload".as_slice(), b"v2 payload".as_slice());
+        write_encoded(
+            &engine,
+            &a,
+            "h1",
+            v1_name,
+            &ManifestArtifactEncoding::None,
+            v1_data,
+        );
+        write_manifest(
+            &engine,
+            &a,
+            "h1",
+            MANIFEST_V1,
+            "1.0.0",
+            tar_artifact(
+                v1_name,
+                v1_data.len() as u64,
+                ManifestArtifactEncoding::None,
+            ),
+        );
+        write_encoded(
+            &engine,
+            &a,
+            "h1",
+            v2_name,
+            &ManifestArtifactEncoding::Zstd,
+            v2_data,
+        );
+        write_manifest(
+            &engine,
+            &a,
+            "h1",
+            MANIFEST_V2,
+            crate::engine::local_cache::MANIFEST_V2_VERSION,
+            tar_artifact(
+                v2_name,
+                v2_data.len() as u64,
+                ManifestArtifactEncoding::Zstd,
+            ),
+        );
+
+        let read = engine
+            .read_manifest(&a, "h1")
+            .expect("read manifest")
+            .expect("manifest present");
+        assert_eq!(read.artifacts[0].name, v2_name, "v2 is read first");
+
+        engine.gc_entry(&a, "h1").expect("gc_entry");
+
+        for name in [MANIFEST_V1, MANIFEST_V2, v1_name, v2_name] {
+            assert!(
+                !engine.local_cache.exists(&a, "h1", name).expect("exists"),
+                "{name} must be deleted"
+            );
+        }
     }
 }

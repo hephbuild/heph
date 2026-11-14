@@ -237,6 +237,23 @@ pub trait LocalCache: Send + Sync {
     /// layer can serve is committed as far as any caller is concerned — rather
     /// than delegate blind.
     fn exists_committed(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<bool>;
+    /// The bytes the blob for `(addr, hashin, name)` occupies at rest, which for
+    /// an encoded blob is the compressed size, not the manifest's decoded
+    /// `size`. `None` when the blob is absent. What `heph clean`/`gc` report as
+    /// freed.
+    ///
+    /// The default opens a [`reader`](Self::reader) for its `size`, which is
+    /// right for a backend whose reader is cheap to open and drop. A backend
+    /// whose reader starts work (the sqlite one spawns a copy for a large blob)
+    /// overrides it, and a decorator forwards it to the layer that holds the
+    /// bytes.
+    fn stored_size(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<Option<u64>> {
+        match self.reader(addr, hashin, name) {
+            Ok(r) => Ok(Some(r.size)),
+            Err(e) if e.is::<NotFoundError>() => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
     fn delete(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<()>;
     /// Stream the distinct target address keys (`Addr::format()`, parseable via
     /// `htaddr::parse_addr`) present in the cache. Streamed rather than collected

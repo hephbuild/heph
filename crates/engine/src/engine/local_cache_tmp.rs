@@ -171,6 +171,14 @@ impl LocalCache for LocalCacheTmp {
         self.durable.exists_committed(addr, hashin, name)
     }
 
+    fn stored_size(&self, addr: &Addr, hashin: &str, name: &str) -> Result<Option<u64>> {
+        let key = Self::key(addr, hashin, name);
+        if let Some(buf) = self.store.map.read().get(&key) {
+            return Ok(Some(buf.len() as u64));
+        }
+        self.durable.stored_size(addr, hashin, name)
+    }
+
     fn delete(&self, addr: &Addr, hashin: &str, name: &str) -> Result<()> {
         let key = Self::key(addr, hashin, name);
         if let Some(v) = self.store.map.write().remove(&key) {

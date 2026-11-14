@@ -24,7 +24,9 @@ The code is `crates/engine/src/engine/cache_codec.rs`.
 - A `tmp` revision (an uncacheable target, `--shell`) is stored verbatim. It
   is read back once, by the process that wrote it, so compressing it would
   only cost CPU.
-- `size` in the manifest is the decoded size.
+- `size` in the manifest is the decoded size. `heph clean` and `heph gc`
+  report the bytes they free at rest: the stored size of each blob they
+  delete, so a compressed blob counts its compressed bytes.
 - The spill threshold between `cache.db` and `blobs/` applies to the stored,
   compressed bytes, so more artifacts stay inline.
 - The remote stores the local bytes verbatim, under the same names, with a
