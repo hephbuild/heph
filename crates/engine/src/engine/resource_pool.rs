@@ -650,32 +650,85 @@ struct Class {
     waiters: BTreeSet<u64>,
 }
 
-/// What the head has been overtaken by. It belongs to the waiter `seq`: any
-/// other head starts from nothing ([`State::sync_head`]).
+/// What the head has been overtaken by. It belongs to one waiter: any other
+/// head starts from nothing ([`State::sync_head`]).
 #[derive(Debug, Default)]
 struct Head {
-    seq: Option<u64>,
-    need: Option<Shape>,
-    /// Per entry of `need`: what was granted behind this head, on that pool,
-    /// without leaving its need there.
+    /// The oldest waiter's sequence and its need; `None` when nobody waits.
+    who: Option<(u64, Shape)>,
+    /// Per entry of the need: what was granted behind this head, on that
+    /// pool, without leaving its need there. Empty when nobody waits.
     debt: Vec<u64>,
 }
 
+/// What the admission rule says of a request, given what is free and the
+/// head ([`Head::judge`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// It does not fit what is free.
+    NoFit,
+    /// It fits, and would take what a protected head needs.
+    Yields,
+    /// It is granted. `charged`: the grant does not leave the head's need,
+    /// so it counts against the head ([`Head::charge`]).
+    Grant { charged: bool },
+}
+
 impl Head {
+    fn seq(&self) -> Option<u64> {
+        self.who.as_ref().map(|&(seq, _)| seq)
+    }
+
+    fn need(&self) -> Option<&[(usize, u64)]> {
+        self.who.as_ref().map(|(_, need)| &**need)
+    }
+
     /// Whether its debt reached its limit on a pool it needs. From then on
     /// nothing is granted that takes from what it needs.
     fn protected(&self, capacity: &[Limit]) -> bool {
-        self.need.as_deref().is_some_and(|need| {
+        self.need().is_some_and(|need| {
             need.iter().zip(&self.debt).any(|(&(idx, n), &debt)| {
                 patience(capacity.get(idx).copied(), n).is_some_and(|limit| debt >= limit)
             })
         })
     }
 
+    /// The admission rule, for a request of `need`: the waiter `seq`, or an
+    /// arrival that is not queued (`None`). The one place it is written:
+    /// an arrival, an offer and a waiter's report all ask here.
+    ///
+    /// It must fit. The head is then granted; anything else is granted when
+    /// it leaves room for the head, charged when it does not and the head is
+    /// not protected, and refused when the head is. `held` is before the
+    /// grant. Decides only: the caller charges and takes.
+    fn judge(
+        &self,
+        capacity: &[Limit],
+        held: &[u64],
+        need: &[(usize, u64)],
+        seq: Option<u64>,
+    ) -> Verdict {
+        if !fits(capacity, held, need) {
+            return Verdict::NoFit;
+        }
+        let room = match &self.who {
+            None => true,
+            Some((head, _)) if Some(*head) == seq => true,
+            Some((_, head)) => leaves_room(capacity, held, need, head),
+        };
+        if room {
+            Verdict::Grant { charged: false }
+        } else if self.protected(capacity) {
+            Verdict::Yields
+        } else {
+            Verdict::Grant { charged: true }
+        }
+    }
+
     /// Count a grant of `grant` against the head: its amount on each pool
     /// where it does not leave the head's need. `held` is before the grant.
     fn charge(&mut self, capacity: &[Limit], held: &[u64], grant: &[(usize, u64)]) {
-        let Some(need) = self.need.as_deref() else {
+        let Some((_, need)) = &self.who else {
             return;
         };
         for (&(idx, n), debt) in need.iter().zip(&mut self.debt) {
@@ -720,15 +773,14 @@ impl State {
             .waiters
             .first_key_value()
             .map(|(&seq, w)| (seq, w.class));
-        let seq = first.map(|(seq, _)| seq);
-        if self.head.seq == seq {
+        if self.head.seq() == first.map(|(seq, _)| seq) {
             return;
         }
-        self.head.seq = seq;
-        self.head.need = first
-            .and_then(|(_, class)| self.classes.get(&class))
-            .map(|c| Arc::clone(&c.need));
-        let entries = self.head.need.as_deref().map_or(0, <[_]>::len);
+        self.head.who = first.and_then(|(seq, class)| {
+            let class = self.classes.get(&class)?;
+            Some((seq, Arc::clone(&class.need)))
+        });
+        let entries = self.head.need().map_or(0, <[_]>::len);
         self.head.debt.clear();
         self.head.debt.resize(entries, 0);
     }
@@ -756,14 +808,26 @@ impl State {
         Some(waiter)
     }
 
-    /// Queue a waiter of `class`, which exists.
-    fn push(&mut self, class: u64, clamped: bool) -> (u64, oneshot::Receiver<Reservation>) {
+    /// Queue a waiter of shape `need`, whose class is `class`. The class is
+    /// entered here, with its first waiter, so no waiter is ever without
+    /// one.
+    fn push(
+        &mut self,
+        class: u64,
+        need: Shape,
+        clamped: bool,
+    ) -> (u64, oneshot::Receiver<Reservation>) {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
         let (tx, rx) = oneshot::channel();
-        if let Some(c) = self.classes.get_mut(&class) {
-            c.waiters.insert(seq);
-        }
+        self.classes
+            .entry(class)
+            .or_insert_with(|| Class {
+                need,
+                waiters: BTreeSet::new(),
+            })
+            .waiters
+            .insert(seq);
         self.waiters.insert(
             seq,
             Waiter {
@@ -906,27 +970,21 @@ impl Lane {
         let st = &mut *guard;
         // Older classes an unfinished pass has not reached go first.
         self.pass(st);
-        let class = match st.shapes.get(need.as_slice()).copied() {
-            Some(class) => class,
+        let (class, need) = match st.shapes.get_key_value(need.as_slice()) {
+            Some((shape, &class)) => (class, Arc::clone(shape)),
             None => {
                 let need: Shape = need.into();
                 st.sync_head();
-                let admitted = if !fits(&self.capacity, &st.held, &need) {
-                    None
-                } else if let Some(head) = st.head.need.as_deref() {
-                    let room = leaves_room(&self.capacity, &st.held, &need, head);
-                    if room {
-                        Some(Admitted::Pass)
-                    } else if st.head.protected(&self.capacity) {
-                        None
-                    } else {
+                if let Verdict::Grant { charged } =
+                    st.head.judge(&self.capacity, &st.held, &need, None)
+                {
+                    if charged {
                         st.head.charge(&self.capacity, &st.held, &need);
-                        Some(Admitted::Pass)
                     }
-                } else {
-                    Some(Admitted::Arrival)
-                };
-                if let Some(admitted) = admitted {
+                    let admitted = match st.head.who {
+                        Some(_) => Admitted::Pass,
+                        None => Admitted::Arrival,
+                    };
                     take(&mut st.held, &need);
                     drop(guard);
                     return Acquire {
@@ -943,17 +1001,10 @@ impl Lane {
                 let class = st.next_class;
                 st.next_class = st.next_class.wrapping_add(1);
                 st.shapes.insert(Arc::clone(&need), class);
-                st.classes.insert(
-                    class,
-                    Class {
-                        need,
-                        waiters: BTreeSet::new(),
-                    },
-                );
-                class
+                (class, need)
             }
         };
-        let (seq, rx) = st.push(class, clamped);
+        let (seq, rx) = st.push(class, need, clamped);
         drop(guard);
         Acquire {
             state: AcquireState::Waiting {
@@ -978,28 +1029,22 @@ impl Lane {
     /// charged for a waiter that was not there.
     fn offer(self: &Arc<Self>, st: &mut State, class: u64, how: Admitted) -> Offer {
         st.sync_head();
-        let (seq, need, room) = {
+        let (seq, need, charged) = {
             let Some(c) = st.classes.get(&class) else {
                 return Offer::Refused;
             };
             let Some(&seq) = c.waiters.first() else {
                 return Offer::Refused;
             };
-            if !fits(&self.capacity, &st.held, &c.need) {
+            let Verdict::Grant { charged } =
+                st.head
+                    .judge(&self.capacity, &st.held, &c.need, Some(seq))
+            else {
                 return Offer::Refused;
-            }
-            let room = st.head.seq == Some(seq)
-                || st
-                    .head
-                    .need
-                    .as_deref()
-                    .is_none_or(|head| leaves_room(&self.capacity, &st.held, &c.need, head));
-            if !room && st.head.protected(&self.capacity) {
-                return Offer::Refused;
-            }
-            (seq, Arc::clone(&c.need), room)
+            };
+            (seq, Arc::clone(&c.need), charged)
         };
-        let is_head = st.head.seq == Some(seq);
+        let is_head = st.head.seq() == Some(seq);
         let Some(waiter) = st.remove(seq) else {
             return Offer::Refused;
         };
@@ -1015,7 +1060,7 @@ impl Lane {
             unobserved.armed = false;
             return Offer::Gone;
         }
-        if !room {
+        if charged {
             st.head.charge(&self.capacity, &st.held, &need);
         }
         take(&mut st.held, &need);
@@ -1125,15 +1170,11 @@ impl Lane {
         let waiter = st.waiters.get(&seq)?;
         let need = &st.classes.get(&waiter.class)?.need;
         // It fits and still waits: only a protected head holds it back.
+        let verdict = st.head.judge(&self.capacity, &st.held, need, Some(seq));
         let yielding_to = st
             .head
-            .need
-            .as_deref()
-            .filter(|_| {
-                st.head.seq != Some(seq)
-                    && fits(&self.capacity, &st.held, need)
-                    && st.head.protected(&self.capacity)
-            })
+            .need()
+            .filter(|_| verdict == Verdict::Yields)
             .and_then(|head| {
                 need.iter().find_map(|&(idx, n)| {
                     let wanted = amount_in(head, idx);
@@ -1173,7 +1214,7 @@ impl Lane {
             .waiters
             .values()
             .next()
-            .zip(st.head.need.as_deref())
+            .zip(st.head.need())
             .map(|(w, need)| HeadSnapshot {
                 unmet: self.needs(&st.held, need, true),
                 since: w.since,
@@ -1686,10 +1727,10 @@ mod tests {
                 if !fits(&lane.capacity, &st.held, &c.need) {
                     return true;
                 }
-                let Some(head) = st.head.need.as_deref() else {
+                let Some(head) = st.head.need() else {
                     return false;
                 };
-                st.head.seq != Some(oldest)
+                st.head.seq() != Some(oldest)
                     && !leaves_room(&lane.capacity, &st.held, &c.need, head)
                     && st.head.protected(&lane.capacity)
             })
