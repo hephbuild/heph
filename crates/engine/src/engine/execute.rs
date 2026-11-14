@@ -31,6 +31,9 @@ impl Engine {
         // `outputs_are_material`: this target's outputs are credential material.
         // The one thing it changes is the failure path — see the `Err` arm below.
         outputs_are_material: bool,
+        // Whether a managed run waits for a sandbox permit. `Exempt` only for
+        // a credential producer run inside its consumer's (see the acquire).
+        sandbox_permit: crate::engine::sandbox_permits::SandboxPermitPolicy,
     ) -> anyhow::Result<(
         Vec<OutputArtifact>,
         crate::engine::sandbox_cleaner::SandboxTeardown,
@@ -130,6 +133,34 @@ impl Engine {
         // this run fills a slot nothing clears behind it.
         self.failure_slots.clear(addr).await;
 
+        // The sandbox permit: a managed run's sandbox, live and then queued on
+        // the reclaim lane, holds one until its removal returns, so the
+        // sandboxes on disk number at most `S` + the credential producers in
+        // flight (`SandboxPermitPolicy::Exempt`: a producer runs inside its
+        // consumer's run, which already holds a permit — waiting for another
+        // could deadlock a pool its consumers exhausted). Failed sandboxes
+        // kept for diagnostics are outside the bound; see `sandbox_permits`.
+        //
+        // After the execute lock (one run per addr holds its sandbox path,
+        // and a target parked on the lock holds no permit), before the
+        // sandbox dir exists (the claim below), and **before** admission: a
+        // run parked here holds no cpu. Neither order can deadlock — permits
+        // come back from the reclaim lane, which waits on nothing — but after
+        // admission a run stuck behind cleanup would hold cpu it cannot use,
+        // idling the machine on a slow disk. The cost of this order: a run
+        // queued for admission holds a permit for a sandbox not yet created.
+        hcore::hmemoizer::set_phase("execute:sandbox_permit");
+        let sandbox_permit = match sandbox_permit {
+            crate::engine::sandbox_permits::SandboxPermitPolicy::Bounded if driver.managed => Some(
+                self.sandbox_permits
+                    .acquire(addr, rs.ctoken())
+                    .await
+                    .with_context(|| format!("sandbox permit for {addr}"))?,
+            ),
+            crate::engine::sandbox_permits::SandboxPermitPolicy::Bounded
+            | crate::engine::sandbox_permits::SandboxPermitPolicy::Exempt => None,
+        };
+
         // Admission AFTER dep resolution so nothing is reserved while waiting for
         // deps — prevents the classic diamond deadlock where mid-nodes hold
         // capacity while waiting for a leaf that also needs some.
@@ -209,11 +240,15 @@ impl Engine {
                 // last leg, mass fail-fast leaves one abandoned sandbox tree
                 // per *cancelled* execute and nothing ever collects them
                 // (`gc` has no sandbox sweep).
+                // The permit rides in the teardown from here: released when
+                // the removal it queues returns, or at once by
+                // `leave_for_diagnostics`.
                 let mut sandbox_teardown = crate::engine::sandbox_cleaner::SandboxTeardown::arm(
                     sandbox_dir.clone(),
                     sandbox_generation,
                     rs.bg_pending(),
-                );
+                )
+                .with_permit(sandbox_permit);
 
                 // Everything fallible between the claim and the run response
                 // lives in the shared block, so an `Err` — a failing target

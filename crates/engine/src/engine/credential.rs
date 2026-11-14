@@ -994,6 +994,11 @@ impl Engine {
                 // The outputs are material: a failure must not leave them in a
                 // sandbox kept for diagnostics.
                 true,
+                // No sandbox permit: this runs inside the consumer's run,
+                // which holds one, and a pool its consumers exhausted would
+                // never free one for the producer. The bound is `S` plus the
+                // producers in flight.
+                crate::engine::sandbox_permits::SandboxPermitPolicy::Exempt,
             )
             .await;
 

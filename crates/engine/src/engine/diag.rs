@@ -334,7 +334,13 @@ pub struct DiagState {
     /// Reads the admission pools at this instant (`None` before the first
     /// admission built them). Sampled while a report is being rendered.
     pools: std::sync::OnceLock<PoolReader>,
+    /// Reads the sandbox permit pool at this instant. Sampled while a report
+    /// is being rendered.
+    sandboxes: std::sync::OnceLock<SandboxReader>,
 }
+
+type SandboxReader =
+    Box<dyn Fn() -> crate::engine::sandbox_permits::SandboxPermitGauge + Send + Sync>;
 
 type PoolReader =
     Box<dyn Fn() -> Option<crate::engine::resource_pool::ResourceSnapshot> + Send + Sync>;
@@ -407,7 +413,22 @@ impl DiagState {
             workers_capacity: AtomicU64::new(0),
             workers_free: std::sync::OnceLock::new(),
             pools: std::sync::OnceLock::new(),
+            sandboxes: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Register a live reader of the sandbox permit pool. Idempotent; the
+    /// first registration wins.
+    pub fn register_sandbox_permits(
+        &self,
+        read: impl Fn() -> crate::engine::sandbox_permits::SandboxPermitGauge + Send + Sync + 'static,
+    ) {
+        drop(self.sandboxes.set(Box::new(read)));
+    }
+
+    /// The sandbox permit pool now, when registered.
+    pub fn sandbox_permits(&self) -> Option<crate::engine::sandbox_permits::SandboxPermitGauge> {
+        self.sandboxes.get().map(|read| read())
     }
 
     /// Register a live reader of the admission pools. Idempotent; the first
@@ -806,6 +827,7 @@ impl DiagState {
             scratch_waits: self.scratch_waits(now_ms),
             workers: self.worker_permits(),
             pools: self.pools(),
+            sandboxes: self.sandbox_permits(),
             delta: None,
             stuck: Vec::new(),
         })
@@ -864,6 +886,8 @@ pub struct StallReport {
     pub workers: Option<WorkerPermits>,
     /// The admission pools, once an admission has built them.
     pub pools: Option<crate::engine::resource_pool::ResourceSnapshot>,
+    /// The sandbox permit pool, when an engine registered it.
+    pub sandboxes: Option<crate::engine::sandbox_permits::SandboxPermitGauge>,
     /// Incomplete memoizer cells. Filled in by [`Watchdog`] after `evaluate`,
     /// which stays pure — see its docs.
     pub stuck: Vec<hcore::hmemoizer::StuckCell>,
@@ -1077,6 +1101,16 @@ fn signed(n: i64) -> String {
 ///
 /// The text is a diagnostic, not an interface. Nothing should parse it — that is
 /// what the machine-readable surface is for.
+/// The sandbox permit pool in one line: who waits on cleanup, and how much
+/// cleanup is owed.
+pub fn render_sandbox_permits(s: &crate::engine::sandbox_permits::SandboxPermitGauge) -> String {
+    format!(
+        "waiting for sandbox cleanup: {} runs waiting, {} sandboxes pending removal ({}/{} \
+         permits held)",
+        s.waiting, s.pending_removal, s.held, s.capacity
+    )
+}
+
 /// The admission pools' lines of the report: each pool's held/capacity and
 /// the queue length, then what the head waits for and for how long. A
 /// strict-FIFO head that does not fit idles everything behind it, so its
@@ -1198,6 +1232,16 @@ pub fn render_stall(r: &StallReport) -> String {
 
     if let Some(p) = &r.pools {
         out.push_str(&render_pools(p, Instant::now()));
+    }
+
+    // Only when runs are parked on it: a full pool with nobody waiting is a
+    // busy build, not a slow disk.
+    if let Some(s) = r.sandboxes.filter(|s| s.waiting > 0) {
+        out.push_str(&format!(
+            "  {:<12} {}\n",
+            "sandboxes",
+            render_sandbox_permits(&s)
+        ));
     }
 
     if let Some((n, oldest, pid)) = r.lock_waits {
@@ -1421,8 +1465,23 @@ impl InflightLog {
     /// a statement about two functions a test can hold side by side. While the
     /// choice of renderer lived inline in `heph run`, nothing linked the two and
     /// they could drift with every test still green.
-    pub fn render(snapshot: &hcore::hmemoizer::ReportSnapshot) -> String {
-        hcore::hmemoizer::render_report(snapshot)
+    ///
+    /// `sandboxes` is the sandbox permit pool sampled with the snapshot (the
+    /// watchdog passes its report's), so both sides of a comparison render
+    /// one reading: a run waiting on the reclaim lane parks in no memoizer
+    /// phase that names it, and this line is where it shows.
+    pub fn render(
+        snapshot: &hcore::hmemoizer::ReportSnapshot,
+        sandboxes: Option<crate::engine::sandbox_permits::SandboxPermitGauge>,
+    ) -> String {
+        let sandboxes = match sandboxes {
+            Some(s) => render_sandbox_permits(&s),
+            None => "no engine registered a sandbox permit pool".to_owned(),
+        };
+        format!(
+            "{}=== sandbox permits ===\n{sandboxes}\n",
+            hcore::hmemoizer::render_report(snapshot)
+        )
     }
 
     /// Replace the file with the current in-flight report.
@@ -2442,12 +2501,54 @@ mod tests {
     /// during an incident.
     #[test]
     fn the_inflight_report_carries_every_section() {
-        let text = InflightLog::render(&hcore::hmemoizer::capture_report());
+        let text = InflightLog::render(&hcore::hmemoizer::capture_report(), None);
         assert!(text.contains("in-flight inventory"), "{text}");
         assert!(text.contains("memoizer wait-for graph"), "{text}");
         assert!(text.contains("memoizer phases"), "{text}");
         assert!(text.contains("HEPH_DEBUG_MEMOIZER_CYCLE"), "{text}");
         assert!(text.contains("HEPH_PHASE_TRACE"), "{text}");
+        assert!(
+            text.contains("no engine registered a sandbox permit pool"),
+            "{text}"
+        );
+    }
+
+    /// A run parked on the reclaim lane is named in both reports: the
+    /// in-flight one always, the stall paragraph once anything waits.
+    #[test]
+    fn runs_waiting_for_sandbox_cleanup_are_reported() {
+        let gauge = crate::engine::sandbox_permits::SandboxPermitGauge {
+            capacity: 8,
+            held: 8,
+            waiting: 3,
+            pending_removal: 5,
+        };
+        let line = "waiting for sandbox cleanup: 3 runs waiting, 5 sandboxes pending removal (8/8 \
+             permits held)";
+        let text = InflightLog::render(&hcore::hmemoizer::capture_report(), Some(gauge));
+        assert!(text.contains(line), "{text}");
+
+        let s = std::sync::Arc::new(DiagState::new(vec![Limiter::new("workers")]));
+        s.register_sandbox_permits(move || gauge);
+        let r = s
+            .evaluate(s.now_ms() + 1, Duration::ZERO)
+            .expect("a zero threshold fires");
+        assert!(render_stall(&r).contains(line), "{}", render_stall(&r));
+
+        let idle = crate::engine::sandbox_permits::SandboxPermitGauge {
+            waiting: 0,
+            ..gauge
+        };
+        let s = std::sync::Arc::new(DiagState::new(vec![Limiter::new("workers")]));
+        s.register_sandbox_permits(move || idle);
+        let r = s
+            .evaluate(s.now_ms() + 1, Duration::ZERO)
+            .expect("a zero threshold fires");
+        assert!(
+            !render_stall(&r).contains("sandbox cleanup"),
+            "{}",
+            render_stall(&r)
+        );
     }
 
     /// The measurement this exists for: permits the pool considers taken that no

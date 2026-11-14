@@ -332,15 +332,24 @@ fn ensure_private_dir(dir: &std::path::Path) -> Result<(), String> {
 /// Takes the sampling rather than doing it, so the caller that owns the timing
 /// decides when the picture is taken — and so the same picture can be handed to
 /// this and to the watchdog's renderer and the two compared.
-fn inventory_report(snapshot: &hcore::hmemoizer::ReportSnapshot) -> String {
+fn inventory_report(
+    snapshot: &hcore::hmemoizer::ReportSnapshot,
+    sandboxes: Option<hengine::engine::sandbox_permits::SandboxPermitGauge>,
+) -> String {
     // Same renderer the stall watchdog writes to its companion file, so the two
     // are byte-identical and neither is the "truncated" one. No cap: this is
     // read once, on a build that has already gone wrong.
-    format!("\n{}", hcore::hmemoizer::render_report(snapshot))
+    format!(
+        "\n{}",
+        hengine::engine::diag::InflightLog::render(snapshot, sandboxes)
+    )
 }
 
 fn write_inventory(fd: libc::c_int) {
-    let text = inventory_report(&hcore::hmemoizer::capture_report());
+    let text = inventory_report(
+        &hcore::hmemoizer::capture_report(),
+        hengine::engine::diag::global().sandbox_permits(),
+    );
     let bytes = text.as_bytes();
     // SAFETY: appending an owned, initialised byte buffer to the diag fd.
     unsafe {
@@ -519,7 +528,7 @@ mod tests {
     /// or the next reader has no way to know a deeper view exists.
     #[test]
     fn the_dump_carries_the_in_flight_state_and_names_its_gated_sections() {
-        let text = inventory_report(&hcore::hmemoizer::capture_report());
+        let text = inventory_report(&hcore::hmemoizer::capture_report(), None);
         assert!(text.contains("in-flight inventory"), "{text}");
         assert!(text.contains("memoizer wait-for graph"), "{text}");
         assert!(text.contains("memoizer phases"), "{text}");
@@ -721,9 +730,20 @@ mod tests {
     #[test]
     fn the_dump_and_the_watchdog_companion_file_render_identically() {
         let snapshot = hcore::hmemoizer::capture_report();
+        let sandboxes = Some(hengine::engine::sandbox_permits::SandboxPermitGauge {
+            capacity: 4,
+            held: 4,
+            waiting: 1,
+            pending_removal: 2,
+        });
+        let dump = inventory_report(&snapshot, sandboxes);
         assert_eq!(
-            inventory_report(&snapshot).trim(),
-            hengine::engine::diag::InflightLog::render(&snapshot).trim()
+            dump.trim(),
+            hengine::engine::diag::InflightLog::render(&snapshot, sandboxes).trim()
+        );
+        assert!(
+            dump.contains("waiting for sandbox cleanup: 1 runs waiting"),
+            "{dump}"
         );
     }
 }

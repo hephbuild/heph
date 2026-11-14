@@ -4862,7 +4862,7 @@ impl Engine {
                     // `cache_locally`, which reads the outputs out of the sandbox.
                     let (artifacts, sandbox_teardown, sandbox_guards, _execute_guard) = engine
                         .clone()
-                        .execute(rs.clone(), &addr, &spec, &def, &hashin, interactive, shell, no_scratch, false)
+                        .execute(rs.clone(), &addr, &spec, &def, &hashin, interactive, shell, no_scratch, false, crate::engine::sandbox_permits::SandboxPermitPolicy::Bounded)
                         .await
                         .with_context(|| format!("execute {addr}"))?;
 
