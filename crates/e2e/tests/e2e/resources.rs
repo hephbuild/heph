@@ -605,6 +605,46 @@ target(name = "far", driver = "bash", run = "echo $X > $OUT", out = "f.txt", env
     Ok(())
 }
 
+/// `sandbox` is the engine's pool: it always exists, but a target may neither
+/// declare it (the engine demands one per managed run on its own) nor read
+/// it (no part of the allotment). Both are link errors naming the pool and
+/// how to size it instead; neither is mistaken for an unknown pool.
+#[tokio::test]
+async fn the_sandbox_pool_is_neither_declared_nor_read_by_a_target() -> anyhow::Result<()> {
+    let ws = tempfile::tempdir()?;
+    write_build(
+        ws.path(),
+        "p",
+        r#"
+target(name = "declares", driver = "bash", run = "echo t > $OUT", out = "d.txt", resources = {"sandbox": 1})
+target(name = "reads", driver = "bash", run = "echo $S > $OUT", out = "r.txt", env = {"S": "${resource:sandbox}"})
+"#,
+    );
+    let engine = engine(ws.path(), caps(&[("cpu", MICROS)]))?;
+    let declares = link_error(&engine, "//p:declares").await?;
+    assert_has(
+        &declares,
+        &[
+            "//p:declares declares resources.sandbox",
+            "sandbox is the engine's",
+            "--resource sandbox=<n>",
+        ],
+    );
+    assert!(!declares.contains("is not a pool"), "{declares}");
+    let reads = link_error(&engine, "//p:reads").await?;
+    assert_has(
+        &reads,
+        &[
+            "//p:reads",
+            "env.S",
+            "${resource:sandbox}",
+            "sandbox is the engine's",
+        ],
+    );
+    assert!(!reads.contains("is not a pool"), "{reads}");
+    Ok(())
+}
+
 /// U5: the allotment never reaches the key. A `cpu: 4` target built under
 /// capacity 1 (told 1), then under capacity 4: the same `hashin`, and the
 /// second run is served the first's output.
@@ -1071,7 +1111,8 @@ fn announced(events: &[BuildEvent], addr: &str) -> Option<Announced> {
 /// D8: `RequestConfig` announces every pool's capacity (and `max_workers`,
 /// the cpu capacity in CPUs); `ExecuteStart` carries what the target declared
 /// and what it was granted — clamped to the pool, and `cpu: 1` for a target
-/// that declares nothing.
+/// that declares nothing. The `sandbox` slot each run also holds is the
+/// engine's, never part of `reserved`.
 #[tokio::test]
 async fn request_config_announces_pools_and_execute_start_reserved() -> anyhow::Result<()> {
     let ws = tempfile::tempdir()?;
@@ -1109,6 +1150,8 @@ target(name = "plain", driver = "bash", run = "echo plain > $OUT", out = "plain.
                 ("cpu".to_string(), Some(4 * MICROS)),
                 ("docker".to_string(), Some(2)),
                 ("memory".to_string(), Some(8 << 30)),
+                // The engine's own, at its default of 4 per cpu.
+                ("sandbox".to_string(), Some(16)),
             ])
         )],
         "one RequestConfig, every pool's capacity"

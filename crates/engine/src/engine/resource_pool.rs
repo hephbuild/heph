@@ -226,8 +226,12 @@ impl ResourcePool {
         implicit: &[(PoolName, u64)],
     ) -> Result<(Vec<(usize, u64)>, bool), AcquireError> {
         let lane = &self.main;
-        let mut need =
-            Vec::with_capacity(request.len().saturating_add(1).saturating_add(implicit.len()));
+        let mut need = Vec::with_capacity(
+            request
+                .len()
+                .saturating_add(1)
+                .saturating_add(implicit.len()),
+        );
         let mut clamped = false;
         // One entry per pool: `fits` checks each entry on its own, so a pool
         // listed twice could be granted past its capacity.
@@ -1595,5 +1599,101 @@ mod tests {
             "value 0 still errors at admission"
         );
         assert!(!now(&p, &req(&[("memory", 64 * GIB)])).clamped());
+    }
+
+    /// The `sandbox` default is [`SANDBOXES_PER_CPU`] per CPU of the resolved
+    /// `cpu` capacity, so it follows `-j` and a `cpu` override (a fractional
+    /// cpu rounds up); an explicit amount wins, and a percentage is of that
+    /// default.
+    #[test]
+    fn resolve_capacities_sandbox_default_override_and_percent() {
+        use hcore::capacity::Capacity;
+        let sandbox_of = |specs: &BTreeMap<PoolName, PoolSpec>, j: usize| {
+            resolve_capacities(specs, j, || 0)
+                .into_iter()
+                .find(|(p, _)| p.as_str() == PoolName::SANDBOX)
+                .map(|(_, l)| l)
+                .expect("the sandbox pool always exists")
+        };
+        let spec = |unit, capacity| PoolSpec { unit, capacity };
+        let none = BTreeMap::new();
+        assert_eq!(sandbox_of(&none, 4), Limit::Bounded(16), "4 x cpu");
+        assert_eq!(sandbox_of(&none, 1), Limit::Bounded(4), "scales with -j");
+        assert_eq!(sandbox_of(&none, 10), Limit::Bounded(40), "scales with -j");
+
+        let cpu = |c| BTreeMap::from([(name("cpu"), spec(Unit::Cpu, Some(c)))]);
+        assert_eq!(
+            sandbox_of(&cpu(Capacity::Amount(3 * CPU)), 8),
+            Limit::Bounded(12),
+            "a cpu override moves the default"
+        );
+        assert_eq!(
+            sandbox_of(&cpu(Capacity::Amount(CPU / 2)), 8),
+            Limit::Bounded(4),
+            "half a cpu rounds up to one"
+        );
+
+        let sandbox = |c| BTreeMap::from([(name("sandbox"), spec(Unit::Count, Some(c)))]);
+        assert_eq!(
+            sandbox_of(&sandbox(Capacity::Amount(3)), 8),
+            Limit::Bounded(3),
+            "an override wins"
+        );
+        assert_eq!(
+            sandbox_of(&sandbox(Capacity::Percent(50)), 4),
+            Limit::Bounded(8),
+            "50% of 4 x 4"
+        );
+        assert_eq!(
+            sandbox_of(&sandbox(Capacity::Percent(200)), 2),
+            Limit::Bounded(16),
+            "200% of 4 x 2"
+        );
+    }
+
+    /// The two halves of a split grant come back independently: the run's
+    /// cpu when the run ends, its `sandbox` slot only when the slot drops,
+    /// and a waiter for the slot is admitted then, not before.
+    #[test]
+    fn a_split_off_slot_is_released_independently() {
+        let p = pool(&[("cpu", 2 * CPU), ("sandbox", 1)]);
+        let slot = || [(PoolName::sandbox(), 1)];
+        let mut run = p
+            .acquire_with(&req(&[("cpu", CPU)]), &slot())
+            .unwrap()
+            .now_or_never()
+            .expect("granted at once")
+            .unwrap();
+        assert!(
+            run.split_off("memory").is_none(),
+            "nothing of an unnamed pool"
+        );
+        let held = run.split_off(PoolName::SANDBOX).expect("the slot");
+        assert!(!held.clamped());
+        assert!(
+            run.split_off(PoolName::SANDBOX).is_none(),
+            "the slot left the run's grant"
+        );
+        assert_eq!(held.iter().collect::<Vec<_>>(), [(&name("sandbox"), 1)]);
+        assert_eq!(run.iter().collect::<Vec<_>>(), [(&name("cpu"), CPU)]);
+
+        let mut next = p.acquire_with(&req(&[("cpu", CPU)]), &slot()).unwrap();
+        assert!(
+            (&mut next).now_or_never().is_none(),
+            "the only slot is held"
+        );
+
+        drop(run);
+        assert_eq!(free(&p, "cpu"), 2 * CPU, "the run's cpu is back");
+        assert_eq!(free(&p, "sandbox"), 0, "its slot is not");
+        assert!(
+            (&mut next).now_or_never().is_none(),
+            "the run's end admits nobody waiting for a slot"
+        );
+
+        drop(held);
+        let next = granted(&mut next).expect("the slot's release admits the waiter");
+        drop(next);
+        assert_eq!((free(&p, "cpu"), free(&p, "sandbox")), (2 * CPU, 1));
     }
 }
