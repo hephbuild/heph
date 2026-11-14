@@ -22,8 +22,7 @@
 //! `acquire_many` cannot grant across semaphores atomically, which is why this
 //! is not a set of semaphores.
 //!
-//! Admission is strict FIFO: the head waits until everything it needs fits,
-//! and nothing behind it is admitted meanwhile. A request for more than a
+//! A request for more than a
 //! pool's capacity is clamped to the capacity (it then runs alone in that
 //! pool) and the grant says so ([`Reservation::clamped`]). A request naming a
 //! pool whose capacity is 0 is an error, never a wait: such a pool exists so
@@ -34,24 +33,88 @@
 //!
 //! A request that needs nothing of a bounded pool — 0 of every pool (`cpu: 0`
 //! and nothing else), or non-zero amounts of unbounded pools only — is granted
-//! at once and never queues: it always fits, so making it wait behind the head
-//! would only delay it. Nothing caps how many such grants are live; a
+//! at once and never queues: it always fits, so making it wait would only
+//! delay it. Nothing caps how many such grants are live; a
 //! zero-cost target is limited by the runtime and the OS alone. Its unbounded
 //! amounts are still counted as held, for the snapshot.
+//!
+//! # Who is admitted
+//!
+//! Strict FIFO stopped every run behind the oldest waiter, so capacity sat
+//! idle whenever that waiter did not fit: a cpu-only run behind one waiting
+//! for a `sandbox` slot, three free cpu behind one that needs four. Admission
+//! keeps the machine busy instead, at a cost per event that does not grow
+//! with the queue.
+//!
+//! The amounts a request takes, after clamping, are its *shape*; the waiters
+//! of one shape are a *class*, in arrival order. The oldest waiter is the
+//! *head*. A grant *leaves room* for the head when, on every bounded pool the
+//! grant takes from, the head's whole need still fits beside it. A grant
+//! behind the head that does not leave room is *charged*: its amount on each
+//! such pool is added to the head's debt there. The head is *protected* once
+//! its debt on a pool it needs reaches its limit: [`PATIENCE`] times its own
+//! need, and never more than [`PATIENCE_POOLS`] times the pool.
+//!
+//! When a grant admitted as shape X is released:
+//!
+//! 1. **Hand-off.** The oldest waiter of X is offered the slot. A wide run
+//!    starts only in a drained pool, and this pays for the drain once per
+//!    batch of them, not once per run.
+//! 2. **Head.** While the head's whole need fits, it is granted; the next
+//!    oldest waiter becomes the head, with no debt.
+//! 3. **Pass.** Each other class, the one with the oldest waiter first, has
+//!    its oldest waiter granted while it fits and either the head is not
+//!    protected or the grant leaves room. A class that is refused is done for
+//!    the walk: what is free only shrinks during it.
+//!
+//! A waiter that is not the head always meets step 3's condition, in step 1
+//! too. An arrival queues behind a waiter of its own shape and is otherwise
+//! judged alone, by the same condition. So:
+//!
+//! - **Overtaking is bounded.** What is granted behind a head without leaving
+//!   it room adds up, on any pool it needs, to at most its limit plus one
+//!   grant. After that nothing admitted takes what it needs, and it starts
+//!   as soon as the runs holding its pools release enough.
+//! - **No starvation.** Waiters become the head in arrival order.
+//! - **One shape starts in arrival order.** Across shapes, start order does
+//!   not follow arrival.
+//! - **Idle capacity beside a protected head is deliberate**: it is draining
+//!   for a run that needs more than is free.
+//! - **Deterministic.** No clock, no randomness and no hash-map order decides
+//!   a grant.
+//! - **Nothing persistent.** Grant order reaches no hash, no run and no
+//!   format: it only changes which runs execute together.
+//!
+//! The walk runs only when something could let a waiter fit: not after a
+//! release whose slot went to its own shape with the head unchanged (that
+//! waiter takes at least what came back, so nothing is freer than before),
+//! not after a release that frees nothing bounded, not when a waiter behind
+//! the head leaves. It tests one waiter per class, never one per waiter, and
+//! at most [`WALK_CAP`] classes per event; classes it did not reach are
+//! tested by the events that follow, of any kind, until each waiting class
+//! was tested once. With more classes than that waiting, one that fits can
+//! wait a few events.
+//!
+//! A grant that was split ([`Reservation::split_off`]: a managed run's cpu
+//! and its `sandbox` slot) is released in parts. Each part is offered to the
+//! shape the whole was admitted as. That waiter needs the other part too, so
+//! unlike an unsplit hand-off it is tested for fit; it still takes at least
+//! what came back.
 //!
 //! # The grant and Drop contract
 //!
 //! - A grant is a [`Reservation`] built on the release side and sent through
 //!   a `oneshot`, so a waiter dropped after its grant was sent drops the
 //!   unobserved grant, which returns itself.
-//! - **Every** mutation of a lane's free amounts or queue ends by running the
-//!   grant chain from the head: a release, an arrival, and a waiter's drop (a
-//!   cancelled head admits its follower without waiting for the next release).
+//! - **Every** mutation of a lane's free amounts or queue ends with whatever
+//!   it made grantable granted: a release, an arrival, and a waiter's drop (a
+//!   cancelled head admits whoever its protection held back, without waiting
+//!   for the next release).
 //! - The mutex is never held across an await, and an armed `Reservation` is
-//!   never dropped under it: a `send` that fails hands the grant back, which
-//!   is disarmed and re-added under the same lock.
-//! - The arrival fast path (grant without queueing) is taken only when the
-//!   queue is empty, or an arrival racing a release would overtake.
+//!   never dropped under it: a grant is counted as held only once its `send`
+//!   succeeded, and a `send` that fails hands it back, which is disarmed.
+//! - The release path runs inside `Drop`, so it does not panic: checked
+//!   lookups and saturating arithmetic only.
 //! - Removal from the queue is by key, not a scan.
 //! - A grant can be split ([`Reservation::split_off`]); each half returns its
 //!   own amounts when it drops. A release is synchronous (the mutex and a

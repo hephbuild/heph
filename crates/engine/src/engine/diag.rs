@@ -1078,9 +1078,10 @@ fn signed(n: i64) -> String {
 /// The text is a diagnostic, not an interface. Nothing should parse it — that is
 /// what the machine-readable surface is for.
 /// The admission pools' lines of the report: each pool's held/capacity and
-/// the queue length, then what the head waits for and for how long. A
-/// strict-FIFO head that does not fit idles everything behind it, so its
-/// unmet need is the line that explains a slow build.
+/// the queue length, then what the head (the oldest waiter) waits for, for
+/// how long, and how far it has been overtaken. Once it has been overtaken
+/// as far as it may be, capacity it needs is kept free for it, so its unmet
+/// need is the line that explains idle CPUs in a slow build.
 fn render_pools(p: &crate::engine::resource_pool::ResourceSnapshot, now: Instant) -> String {
     use hcore::events::display_amount;
     let mut out = String::new();
