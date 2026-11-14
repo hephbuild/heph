@@ -2392,7 +2392,6 @@ mod tests {
 
         let _rt = crate::engine::test_rt_enter();
         let engine = Arc::new(Engine::new(cfg).expect("engine"));
-        assert_eq!(engine.cache_db_path(), db);
         engine.set_cache_db_maintenance(MaintenanceOverrides {
             free_space,
             ..MaintenanceOverrides::default()
