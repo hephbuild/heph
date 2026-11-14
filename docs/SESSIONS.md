@@ -156,7 +156,17 @@ is a live session of unknown format.
 cwd, state, started_unix_ms, last_event_unix_ms, exit_code, blocked_on}]}`,
 sorted by id, times in absolute unix ms; `blocked_on` entries are
 `{kind: "lock", addr, holder_pid, holder_session}` or `{kind: "admission",
-addr, pool}`. `show --json` is the `SessionSnapshot` plus `id` and `state`.
+addr, pool}`.
+
+`show --json` is the `SessionSnapshot` (every list in full, folded from the
+event log) plus `id`, `state`, `blocked_on` (the same entries as `list
+--json`), `chain_root` (the id of the session at the root of the first lock
+chain, `null` when no chain leads to a session) and `next: {kind, command,
+reason}`. `kind` is one of `attach`, `show_holder`, `inflight`,
+`inspect_failure`, `rerun`, `list`, `none` and may gain values; `command` is
+the command line to run, `null` for `none`. The text `Next:` line prints the
+same command alone, its reason on the line below.
+
 `inflight --json` is `{id, report}`.
 
 Field names are permanent once released: a field may be added, never renamed

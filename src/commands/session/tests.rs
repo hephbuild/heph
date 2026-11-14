@@ -522,11 +522,32 @@ async fn commands_run_against_any_source() {
         )),
         "the chain is followed to its root:\n{out}"
     );
+    // The bare command on the `Next:` line, its reason on the next.
     assert!(
         out.trim_end().ends_with(&format!(
-            "Next: heph session show {root_holder}   (what the session holding the lock is doing)"
+            "\nNext: heph session show {root_holder}\n  what the session holding the lock is doing"
         )),
         "{out}"
+    );
+
+    // show --json: list's `blocked_on`, the chain's root, a structured next.
+    let json: serde_json::Value =
+        serde_json::from_str(&run_show(&sources, &a.encode(), true).await.expect("json"))
+            .expect("json");
+    assert_eq!(json["state"], "waiting");
+    assert_eq!(json["blocked_on"][0]["kind"], "lock");
+    assert_eq!(json["blocked_on"][0]["addr"], "//go:sdk");
+    assert_eq!(json["blocked_on"][0]["holder_pid"], 300);
+    assert_eq!(json["blocked_on"][0]["holder_session"], holder.encode());
+    assert_eq!(json["chain_root"], root_holder.encode());
+    assert_eq!(json["next"]["kind"], "show_holder");
+    assert_eq!(
+        json["next"]["command"],
+        format!("heph session show {root_holder}")
+    );
+    assert_eq!(
+        json["next"]["reason"],
+        "what the session holding the lock is doing"
     );
 
     // An ended session, from the second source.
@@ -536,7 +557,7 @@ async fn commands_run_against_any_source() {
     assert!(out.contains(&format!("(session {b}, pid 200")), "{out}");
     assert!(!out.contains("Stuck on"), "{out}");
     assert!(
-        out.trim_end().ends_with("Next: nothing   (it succeeded)"),
+        out.trim_end().ends_with("\nNext: nothing\n  it succeeded"),
         "{out}"
     );
 
@@ -547,6 +568,10 @@ async fn commands_run_against_any_source() {
     assert_eq!(json["id"], b.encode());
     assert_eq!(json["end"]["exit_code"], 0);
     assert_eq!(json["counts"]["matched_done"], 1);
+    assert_eq!(json["blocked_on"], serde_json::json!([]));
+    assert_eq!(json["chain_root"], serde_json::Value::Null);
+    assert_eq!(json["next"]["kind"], "none");
+    assert_eq!(json["next"]["command"], serde_json::Value::Null);
 
     // inflight goes to the source that has the session.
     let mut out = Vec::new();
@@ -557,6 +582,99 @@ async fn commands_run_against_any_source() {
         String::from_utf8(out).expect("utf-8"),
         format!("in-flight report for {b}\n")
     );
+}
+
+/// Item 9: every state's next step, as `show --json`'s `next` and as the
+/// human `Next:` line (the bare command, the reason on its own line).
+#[tokio::test]
+async fn next_is_structured_for_every_state() {
+    let fail_records = |addr: &str| {
+        vec![
+            record(T0 + 1, BuildEventKind::ResultStart { addr: addr.into() }),
+            record(
+                T0 + 2,
+                BuildEventKind::ResultEnd {
+                    addr: addr.into(),
+                    error: Some("boom".to_owned()),
+                    upstream_of: None,
+                    exit_status: None,
+                    log_tail: None,
+                    timed_out: None,
+                },
+            ),
+        ]
+    };
+    let quiet = SessionSnapshot {
+        last_event_unix_ms: Some(NOW - 61_000),
+        ..SessionSnapshot::default()
+    };
+    let busy = SessionSnapshot {
+        last_event_unix_ms: Some(NOW - 1_000),
+        ..SessionSnapshot::default()
+    };
+    let id = SessionId::new(T0, 1);
+    let e = |live, status| entry(meta(id, 1, &["/bin/heph", "run", "//a:b"]), live, status);
+    let (attach, inflight) = (
+        format!("heph session attach {id}"),
+        format!("heph session inflight {id}"),
+    );
+    let cases: Vec<(SessionEntry, Vec<SessionRecord>, &str, Option<&str>)> = vec![
+        (e(true, Some(busy)), Vec::new(), "attach", Some(&attach)),
+        (
+            e(true, Some(quiet)),
+            Vec::new(),
+            "inflight",
+            Some(&inflight),
+        ),
+        (
+            e(false, Some(ended(Some(1), NOW))),
+            fail_records("//a:b"),
+            "inspect_failure",
+            Some("heph inspect failure //a:b"),
+        ),
+        (
+            e(false, Some(ended(Some(1), NOW))),
+            Vec::new(),
+            "rerun",
+            Some("heph run //a:b"),
+        ),
+        (
+            e(false, Some(SessionSnapshot::default())),
+            Vec::new(),
+            "rerun",
+            Some("heph run //a:b"),
+        ),
+        (
+            SessionEntry {
+                status_unreadable: true,
+                ..e(false, None)
+            },
+            Vec::new(),
+            "list",
+            Some("heph session list"),
+        ),
+        (
+            e(false, Some(ended(Some(0), NOW))),
+            Vec::new(),
+            "none",
+            None,
+        ),
+    ];
+    for (n, (session, records, kind, command)) in cases.into_iter().enumerate() {
+        let source = FakeSource {
+            sessions: vec![(session, records)],
+        };
+        let sources: [&dyn SessionSource; 1] = [&source];
+        let json: serde_json::Value =
+            serde_json::from_str(&run_show(&sources, &id.encode(), true).await.expect("json"))
+                .expect("json");
+        assert_eq!(json["next"]["kind"], kind, "case {n}: {json}");
+        assert_eq!(json["next"]["command"].as_str(), command, "case {n}");
+        let reason = json["next"]["reason"].as_str().expect("reason");
+        let out = run_show(&sources, &id.encode(), false).await.expect("show");
+        let want = format!("\nNext: {}\n  {reason}\n", command.unwrap_or("nothing"));
+        assert!(out.ends_with(&want), "case {n}: {out}");
+    }
 }
 
 #[tokio::test]
@@ -644,7 +762,10 @@ async fn status_lists_are_capped_and_show_has_them_all() {
     let mut records = Vec::with_capacity(3 * N);
     for i in 0..N {
         let addr = format!("//f:t{i:05}");
-        records.push(record(T0 + 1, BuildEventKind::ResultStart { addr: addr.clone() }));
+        records.push(record(
+            T0 + 1,
+            BuildEventKind::ResultStart { addr: addr.clone() },
+        ));
         records.push(record(
             T0 + 2,
             BuildEventKind::ResultEnd {

@@ -355,6 +355,46 @@ pub(crate) fn all_waiting(status: &crate::tui::session::SessionSnapshot) -> bool
         && status.counts.running_unblocked == 0
 }
 
+/// What one waiting target waits for, in `list --json` and `show --json`.
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum BlockedOn {
+    /// A result lock another process holds.
+    Lock {
+        addr: String,
+        holder_pid: Option<u32>,
+        /// The session of that process, when it records one.
+        holder_session: Option<String>,
+    },
+    /// Admission into a resource pool.
+    Admission { addr: String, pool: String },
+}
+
+/// Every wait in `status`, lock waits first, each holder pid mapped to the
+/// session that records it.
+pub(crate) fn blocked_on(
+    status: &crate::tui::session::SessionSnapshot,
+    entry: &SessionEntry,
+    every: &[&SessionEntry],
+) -> Vec<BlockedOn> {
+    status
+        .lock_waits
+        .iter()
+        .map(|w| BlockedOn::Lock {
+            addr: w.addr.clone(),
+            holder_pid: w.holder_pid,
+            holder_session: w
+                .holder_pid
+                .and_then(|pid| crate::tui::session::holder_session(every, pid, Some(entry.id)))
+                .map(|h| h.id.encode()),
+        })
+        .chain(status.admission_waits.iter().map(|w| BlockedOn::Admission {
+            addr: w.addr.clone(),
+            pool: w.pool.clone(),
+        }))
+        .collect()
+}
+
 /// Every session the sources know, merged: the first source to list an id
 /// wins it. Each entry keeps the index of the source it came from.
 pub(crate) async fn list_all(

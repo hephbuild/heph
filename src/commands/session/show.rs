@@ -13,8 +13,8 @@ use futures::StreamExt as _;
 use serde::Serialize;
 
 use super::{
-    SessionState, ViewOpts, ago, command_line, derive_state, escape, list_all, recorded_by_newer,
-    require_known, resolve,
+    BlockedOn, SessionState, ViewOpts, ago, blocked_on, command_line, derive_state, escape,
+    list_all, recorded_by_newer, require_known, resolve,
 };
 use crate::tui::session::{
     HeaderKind, SessionEntry, SessionItem, SessionMeta, SessionRecordKind, SessionSnapshot,
@@ -109,8 +109,45 @@ struct ShowJson<'a> {
     id: String,
     /// Viewer-computed; see [`SessionState`].
     state: SessionState,
+    /// Every wait, each holder mapped to its session: `list --json`'s shape.
+    blocked_on: Vec<BlockedOn>,
+    /// The session at the root of the first lock chain, the one the run is
+    /// really waiting for; `null` when no chain leads to a session.
+    chain_root: Option<String>,
+    next: Next,
     #[serde(flatten)]
     snapshot: &'a SessionSnapshot,
+}
+
+/// What to do next, for a person (`Next:`) and an agent (`next`).
+#[derive(Debug, Serialize)]
+struct Next {
+    kind: NextKind,
+    /// The command to run; `null` when there is nothing to do.
+    command: Option<String>,
+    /// Why, for a person.
+    reason: String,
+}
+
+/// [`Next`]'s kind. A consumer treats one it does not know as "read the
+/// reason".
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum NextKind {
+    /// Follow the session: `heph session attach`.
+    Attach,
+    /// Look at another session, the root of the lock chain: `heph session show`.
+    ShowHolder,
+    /// Ask a quiet session what it is doing: `heph session inflight`.
+    Inflight,
+    /// Read the first failed target's log: `heph inspect failure`.
+    InspectFailure,
+    /// Run the command again.
+    Rerun,
+    /// List the sessions.
+    List,
+    /// Nothing; it succeeded.
+    None,
 }
 
 pub(crate) async fn show(
@@ -128,13 +165,30 @@ pub(crate) async fn show(
     let state = derive_state(&entry, opts.now_ms, opts.stall);
 
     let folded = fold(source, &entry, meta).await?;
+    let snapshot = current_snapshot(&folded, entry.status.as_ref());
+    let every = list_all(sources).await?;
+    let every: Vec<&SessionEntry> = every.iter().map(|(_, e)| e).collect();
+    // The stuck-on block is drawn whatever the output, for the chain root.
+    let mut stuck = String::new();
+    let chain_root = if matches!(
+        state,
+        SessionState::Running | SessionState::Waiting | SessionState::Stalled
+    ) {
+        stuck_on(&mut stuck, &entry, &snapshot, &every, opts.now_ms)
+    } else {
+        None
+    };
+    let next = next_action(&entry, meta, state, &snapshot, chain_root);
+
     if json {
-        let snapshot = json_snapshot(&folded, entry.status.as_ref());
         serde_json::to_writer_pretty(
             &mut *out,
             &ShowJson {
                 id: entry.id.encode(),
                 state,
+                blocked_on: blocked_on(&snapshot, &entry, &every),
+                chain_root: chain_root.map(|r| r.id.encode()),
+                next,
                 snapshot: &snapshot,
             },
         )
@@ -181,27 +235,24 @@ pub(crate) async fn show(
         }
     }
 
-    let every = list_all(sources).await?;
-    let every: Vec<&SessionEntry> = every.iter().map(|(_, e)| e).collect();
-    let snapshot = folded.view.state().snapshot();
-    let mut chain_root = None;
-    if matches!(
-        state,
-        SessionState::Running | SessionState::Waiting | SessionState::Stalled
-    ) {
-        chain_root = stuck_on(&mut text, &entry, &snapshot, &every, opts.now_ms);
-    }
-    text.push_str(&next_action(&entry, meta, state, &snapshot, chain_root));
+    text.push_str(&stuck);
+    // The command alone on its line, so it can be copied; the reason below.
+    text.push_str(&format!(
+        "\nNext: {}\n  {}\n",
+        next.command.as_deref().unwrap_or("nothing"),
+        next.reason
+    ));
     out.write_all(text.as_bytes())
         .context("writing the session")?;
     Ok(())
 }
 
-/// The snapshot `show --json` prints: the fold of the event log, which has
-/// every list in full where `status.json` keeps only their first entries (U3).
-/// Past the event log's cap the fold is short of the run, so `status.json`,
-/// capped but current, is printed instead; its `totals` say what was cut.
-fn json_snapshot(folded: &Folded, status: Option<&SessionSnapshot>) -> SessionSnapshot {
+/// The snapshot `show` reasons from and `show --json` prints: the fold of the
+/// event log, which has every list in full where `status.json` keeps only
+/// their first entries (U3). Past the event log's cap the fold is short of the
+/// run, so `status.json`, capped but current, is used instead; its `totals`
+/// say what was cut.
+fn current_snapshot(folded: &Folded, status: Option<&SessionSnapshot>) -> SessionSnapshot {
     if folded.truncated
         && let Some(s) = status
     {
@@ -367,45 +418,68 @@ fn follow_chain<'a>(
     at
 }
 
-/// One line saying what to do next, for every state.
+/// What to do next, for every state.
 fn next_action(
     entry: &SessionEntry,
     meta: &SessionMeta,
     state: SessionState,
     snapshot: &SessionSnapshot,
     chain_root: Option<&SessionEntry>,
-) -> String {
+) -> Next {
     let id = entry.id;
-    let line = match state {
-        SessionState::Running => format!("heph session attach {id}   (follow it live)"),
-        SessionState::Waiting => match chain_root {
-            Some(root) => format!(
-                "heph session show {}   (what the session holding the lock is doing)",
-                root.id
-            ),
-            None => format!("heph session attach {id}   (follow it until the wait ends)"),
-        },
-        SessionState::Stalled => {
-            format!("heph session inflight {id}   (ask it what it is doing)")
-        }
-        SessionState::Failed => match snapshot.failed.first() {
-            Some(addr) => format!(
-                "heph inspect failure {}   (the failed target's log and outputs)",
-                escape(addr)
-            ),
-            None => format!(
-                "re-run `{}`   (it failed before any target did)",
-                command_line(&meta.argv, usize::MAX)
-            ),
-        },
-        SessionState::Lost => format!(
-            "re-run `{}`   (the process is gone)",
-            command_line(&meta.argv, usize::MAX)
-        ),
-        SessionState::Ok => "nothing   (it succeeded)".to_owned(),
-        SessionState::Unknown => {
-            format!("heph session list   (session {id} is in an unknown state)")
-        }
+    let next = |kind, command: String, reason: &str| Next {
+        kind,
+        command: Some(command),
+        reason: reason.to_owned(),
     };
-    format!("\nNext: {line}\n")
+    let rerun = |reason: &str| {
+        next(
+            NextKind::Rerun,
+            command_line(&meta.argv, usize::MAX),
+            reason,
+        )
+    };
+    match state {
+        SessionState::Running => next(
+            NextKind::Attach,
+            format!("heph session attach {id}"),
+            "follow it live",
+        ),
+        SessionState::Waiting => match chain_root {
+            Some(root) => next(
+                NextKind::ShowHolder,
+                format!("heph session show {}", root.id),
+                "what the session holding the lock is doing",
+            ),
+            None => next(
+                NextKind::Attach,
+                format!("heph session attach {id}"),
+                "follow it until the wait ends",
+            ),
+        },
+        SessionState::Stalled => next(
+            NextKind::Inflight,
+            format!("heph session inflight {id}"),
+            "ask it what it is doing",
+        ),
+        SessionState::Failed => match snapshot.failed.first() {
+            Some(addr) => next(
+                NextKind::InspectFailure,
+                format!("heph inspect failure {}", escape(addr)),
+                "the failed target's log and outputs",
+            ),
+            None => rerun("run it again: it failed before any target did"),
+        },
+        SessionState::Lost => rerun("run it again: the process is gone"),
+        SessionState::Ok => Next {
+            kind: NextKind::None,
+            command: None,
+            reason: "it succeeded".to_owned(),
+        },
+        SessionState::Unknown => next(
+            NextKind::List,
+            "heph session list".to_owned(),
+            &format!("session {id} is in an unknown state"),
+        ),
+    }
 }

@@ -8,7 +8,8 @@ use anyhow::Context as _;
 use serde::Serialize;
 
 use super::{
-    SessionState, ViewOpts, Workspace, ago, command_line, derive_state, escape, list_all, truncate,
+    BlockedOn, SessionState, ViewOpts, Workspace, ago, blocked_on, command_line, derive_state,
+    escape, list_all, truncate,
 };
 use crate::tui::session::{EntryMeta, SessionEntry, SessionSource, holder_session};
 
@@ -44,21 +45,6 @@ struct ListJsonEntry {
     /// does not read further.
     #[serde(skip_serializing_if = "Option::is_none")]
     format: Option<u32>,
-}
-
-/// What one waiting target waits for.
-#[derive(Debug, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum BlockedOn {
-    /// A result lock another process holds.
-    Lock {
-        addr: String,
-        holder_pid: Option<u32>,
-        /// The session of that process, when it records one.
-        holder_session: Option<String>,
-    },
-    /// Admission into a resource pool.
-    Admission { addr: String, pool: String },
 }
 
 pub(crate) async fn list(
@@ -98,25 +84,7 @@ fn write_json(
         .map(|e| {
             let state = derive_state(e, opts.now_ms, opts.stall);
             let status = e.status.as_ref();
-            let blocked_on = status
-                .map(|s| {
-                    s.lock_waits
-                        .iter()
-                        .map(|w| BlockedOn::Lock {
-                            addr: w.addr.clone(),
-                            holder_pid: w.holder_pid,
-                            holder_session: w
-                                .holder_pid
-                                .and_then(|pid| holder_session(every, pid, Some(e.id)))
-                                .map(|h| h.id.encode()),
-                        })
-                        .chain(s.admission_waits.iter().map(|w| BlockedOn::Admission {
-                            addr: w.addr.clone(),
-                            pool: w.pool.clone(),
-                        }))
-                        .collect()
-                })
-                .unwrap_or_default();
+            let blocked_on = status.map(|s| blocked_on(s, e, every)).unwrap_or_default();
             let exit_code = status
                 .and_then(|s| s.end.as_ref())
                 .and_then(|x| x.exit_code);
