@@ -2,23 +2,37 @@ use tokio::sync::mpsc;
 
 use crate::tui::app::{App, AppContext, CIAppView};
 use crate::tui::log_sink::LogSink;
-use hcore::events::EventReceiver;
+use crate::tui::session::{SessionSlot, TappedReceiver};
 use hcore::shutdown::ShutdownTrigger;
 
 pub async fn run<A: App + 'static>(
     app: A,
     sink: LogSink,
     _shutdown: ShutdownTrigger,
+    slot: Option<&SessionSlot>,
 ) -> anyhow::Result<A::Output> {
     // The app owns its non-TUI rendering too: the backend only drives the
     // event stream and hands each event to the view.
     let mut view = app.ci_view();
+    let session = slot.and_then(|s| s.open(view.session_header(), false));
+    if let Some(s) = &session {
+        // One line, stderr only (never stdout, which may be a command's
+        // document), naming the full id so it can be pasted (A12).
+        if s.fresh {
+            sink.write_diagnostic(&format!(
+                "heph: session {id} (heph session attach {id})\n",
+                id = s.id
+            ));
+        }
+        sink.set_session_tap(s.tap.clone());
+    }
     view.begin();
 
     // We own the build-event channel: sender to the app via AppContext, we keep
-    // the receiver.
+    // the receiver, tapped into the session on its receive side.
     let (event_tx, event_rx) = mpsc::unbounded_channel();
-    let mut events: Option<EventReceiver> = Some(event_rx);
+    let mut events: Option<TappedReceiver> =
+        Some(TappedReceiver::new(event_rx, session.map(|s| s.tap)));
     // Shared with the app's request state so we can wait for fire-and-forget
     // sandbox cleanups to drain before returning (and tearing down the runtime /
     // exiting the process out from under the cleaner thread).
@@ -71,14 +85,14 @@ pub async fn run<A: App + 'static>(
             },
             maybe_evt = async {
                 match events.as_mut() {
-                    Some(r) => r.recv().await,
+                    Some(r) => r.recv(|ev| view.apply(ev)).await,
                     None => std::future::pending().await,
                 }
             } => {
-                match maybe_evt {
-                    Some(ev) => view.apply(&ev),
+                // Folded and recorded inside `recv`.
+                if maybe_evt.is_none() {
                     // Sender dropped — stop polling, keep awaiting the app.
-                    None => events = None,
+                    events = None;
                 }
             }
         }
@@ -87,9 +101,7 @@ pub async fn run<A: App + 'static>(
     // Drain any events buffered before the sender dropped so the final
     // summary is accurate even if the app future completed first.
     if let Some(r) = events.as_mut() {
-        while let Ok(ev) = r.try_recv() {
-            view.apply(&ev);
-        }
+        while r.try_recv(|ev| view.apply(ev)).is_ok() {}
     }
 
     view.finish();
@@ -100,7 +112,7 @@ pub async fn run<A: App + 'static>(
     // we never abandon a push that is still making progress — each one carries its
     // own deadline).
     //
-    drain_background(&bg_pending).await;
+    drain_background(&bg_pending, events.as_mut()).await;
 
     result
 }
@@ -114,7 +126,14 @@ pub async fn run<A: App + 'static>(
 /// process just sits there. Saying what is outstanding, and that the count is
 /// going down, is the difference between "uploading 400 revisions" and "heph is
 /// wedged".
-async fn drain_background(pending: &hcore::pending::Pending) {
+///
+/// Events the background work still emits (a remote-cache upload) are not
+/// folded — the summary is printed — but they are recorded (A1), so a session
+/// viewer sees the uploads finish.
+async fn drain_background(
+    pending: &hcore::pending::Pending,
+    mut events: Option<&mut TappedReceiver>,
+) {
     use std::sync::atomic::Ordering;
     let started = tokio::time::Instant::now();
     let mut next_report = started + DRAIN_REPORT_EVERY;
@@ -122,6 +141,14 @@ async fn drain_background(pending: &hcore::pending::Pending) {
     loop {
         tokio::select! {
             () = pending.wait_drained() => break,
+            // A `None` (every sender gone) fails the pattern and disables this
+            // branch for the rest of the wait.
+            Some(()) = async {
+                match events.as_mut() {
+                    Some(r) => r.recv_record_only().await,
+                    None => std::future::pending().await,
+                }
+            } => {}
             () = tokio::time::sleep_until(next_report) => {
                 next_report += DRAIN_REPORT_EVERY;
                 tracing::info!(
@@ -182,7 +209,7 @@ mod tests {
             bg.fetch_sub(1, Ordering::AcqRel);
         });
         let started = tokio::time::Instant::now();
-        drain_background(&pending).await;
+        drain_background(&pending, None).await;
         assert_eq!(started.elapsed(), Duration::ZERO);
         job.await.expect("job");
     }
@@ -200,7 +227,7 @@ mod tests {
             bg.fetch_sub(1, Ordering::AcqRel);
         });
         let started = tokio::time::Instant::now();
-        drain_background(&pending).await;
+        drain_background(&pending, None).await;
         assert_eq!(
             started.elapsed(),
             finish_at,
@@ -389,6 +416,7 @@ mod tests {
             TestApp::new(view.clone(), Behavior::BlockUntilFolded),
             LogSink::new_direct(),
             shutdown,
+            None,
         )
         .await
         .expect("backend must return the app's output");
@@ -419,6 +447,7 @@ mod tests {
             TestApp::new(view.clone(), Behavior::Emit(N)),
             LogSink::new_direct(),
             shutdown,
+            None,
         )
         .await
         .expect("backend must return the app's output");
@@ -444,6 +473,7 @@ mod tests {
             TestApp::new(RecordingView::default(), Behavior::Panic),
             LogSink::new_direct(),
             shutdown,
+            None,
         ))
         .catch_unwind()
         .await;
@@ -475,6 +505,7 @@ mod tests {
             TestApp::new(view.clone(), Behavior::EmitThenFail(3)),
             LogSink::new_direct(),
             shutdown,
+            None,
         )
         .await
         .expect_err("the app's error must reach the caller");
@@ -503,6 +534,7 @@ mod tests {
             TestApp::new(RecordingView::default(), Behavior::LeavesBackgroundWork),
             LogSink::new_direct(),
             shutdown,
+            None,
         )
         .await
         .expect("backend must return the app's output");
@@ -528,6 +560,7 @@ mod tests {
                 .with_probe(DropProbe(Arc::clone(&drops))),
             LogSink::new_direct(),
             shutdown,
+            None,
         )
         .await
         .expect("backend must return the app's output");

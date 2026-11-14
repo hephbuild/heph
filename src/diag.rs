@@ -185,10 +185,51 @@ fn spawn_sweeper() {
                         {
                             sweep(&dump_path());
                         }
+                        if let Some(dir) = crate::tui::session::process().dir() {
+                            answer_inflight_request(&dir, || {
+                                inventory_report(&hcore::hmemoizer::capture_report())
+                            });
+                        }
                     }
                 }),
         );
     });
+}
+
+/// Answer a session viewer's `heph session inflight` (design amendment A13): a
+/// viewer never signals a process; it drops `inflight.request` in the session
+/// directory, and this — one `stat` per sweeper tick — writes the same
+/// in-flight report a `SIGQUIT` dump carries to `inflight.txt` (temp + rename),
+/// removes the request, and records `InflightWritten` so the viewer knows.
+/// `true` when a request was answered.
+fn answer_inflight_request(dir: &std::path::Path, render: impl FnOnce() -> String) -> bool {
+    use crate::tui::session::files;
+    let request = dir.join(files::INFLIGHT_REQUEST);
+    if !request.exists() {
+        return false;
+    }
+    let written = (|| -> std::io::Result<()> {
+        let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+        std::io::Write::write_all(tmp.as_file_mut(), render().as_bytes())?;
+        tmp.persist(dir.join(files::INFLIGHT_REPORT))
+            .map_err(|e| e.error)?;
+        Ok(())
+    })();
+    // Removed whatever happened: a request that cannot be answered must not
+    // be retried every 200ms for the rest of the run.
+    if let Err(e) = std::fs::remove_file(&request) {
+        tracing::debug!(error = %e, "cannot remove the in-flight request");
+    }
+    match written {
+        Ok(()) => {
+            crate::tui::session::process().record_inflight_written();
+            true
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "cannot write the in-flight report for a session viewer");
+            false
+        }
+    }
 }
 
 /// Max threads dumped in one sweep. A cap is not arbitrary caution: each dump is
@@ -724,6 +765,28 @@ mod tests {
         assert_eq!(
             inventory_report(&snapshot).trim(),
             hengine::engine::diag::InflightLog::render(&snapshot).trim()
+        );
+    }
+
+    /// A13: a request file is answered once — report written atomically,
+    /// request removed — and no request costs only the `stat`.
+    #[test]
+    fn an_inflight_request_is_answered_once() {
+        use crate::tui::session::files;
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(!answer_inflight_request(dir.path(), String::new));
+        std::fs::write(dir.path().join(files::INFLIGHT_REQUEST), b"").expect("request");
+        assert!(answer_inflight_request(dir.path(), || "REPORT".to_owned()));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(files::INFLIGHT_REPORT)).expect("report"),
+            "REPORT"
+        );
+        assert!(!dir.path().join(files::INFLIGHT_REQUEST).exists());
+        assert!(!answer_inflight_request(dir.path(), String::new));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(files::INFLIGHT_REPORT)).expect("report"),
+            "REPORT",
+            "not rewritten without a request"
         );
     }
 }

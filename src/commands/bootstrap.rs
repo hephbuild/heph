@@ -314,6 +314,8 @@ fn new_engine_with(
     // in-flight report rather than in the temp-dir fallback. Every command routes
     // through here, so every command gets it.
     crate::diag::set_dump_dir(&config.home_dir);
+    // The session a later `run_app` opens records which workspace it ran in.
+    crate::tui::session::process().set_workspace(&root, &config.home_dir);
 
     // Captured before `config` is moved into the engine: the nix driver's state
     // dir hangs off `home_dir`, and telemetry reports the remote-cache backend
