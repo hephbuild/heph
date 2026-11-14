@@ -1037,8 +1037,7 @@ impl Lane {
                 return Offer::Refused;
             };
             let Verdict::Grant { charged } =
-                st.head
-                    .judge(&self.capacity, &st.held, &c.need, Some(seq))
+                st.head.judge(&self.capacity, &st.held, &c.need, Some(seq))
             else {
                 return Offer::Refused;
             };
@@ -1671,6 +1670,11 @@ mod tests {
     /// How many classes the walk has tested so far.
     fn visited(p: &ResourcePool) -> u64 {
         p.main.state.lock().visited
+    }
+
+    /// Whether no pass is unfinished.
+    fn pass_done(p: &ResourcePool) -> bool {
+        matches!(p.main.state.lock().untested, Untested::Nothing)
     }
 
     /// How many classes wait. Each is findable by its shape, and no other
@@ -2786,6 +2790,98 @@ mod tests {
         assert!(settled(&p));
     }
 
+    /// A managed run: `n` cpu and the engine's `sandbox: 1`.
+    fn managed(p: &Arc<ResourcePool>, n: u64) -> Acquire {
+        p.acquire_with(&cpus(n), &[(PoolName::sandbox(), 1)])
+            .unwrap()
+    }
+
+    /// The cpu half's hand-off is judged like any other: a waiter of the
+    /// run's shape that would take a protected head's cpu is refused, and
+    /// the head starts in what came back.
+    #[test]
+    fn a_split_hand_off_yields_to_a_protected_head() {
+        let p = pool(&[("cpu", 8 * CPU), ("sandbox", 8)]);
+        let _stays = now(&p, &cpus(6));
+        let mut run = managed(&p, 1).now_or_never().unwrap().unwrap();
+        let mut head = queued(&p, &cpus(2));
+        // Runs of the managed shape pass it, one cpu each, until 16 × 2.
+        for _ in 0..32 {
+            let mut pass = managed(&p, 1).now_or_never().unwrap().unwrap();
+            let slot = pass.split_off(PoolName::SANDBOX).unwrap();
+            drop((pass, slot));
+        }
+        assert!(draining(&p));
+        let mut next = managed(&p, 1);
+        assert!(
+            (&mut next).now_or_never().is_none(),
+            "the head is protected"
+        );
+        let removal = run.split_off(PoolName::SANDBOX).unwrap();
+
+        drop(run);
+        assert!(
+            granted(&mut next).is_none(),
+            "it fits, and would take the head's cpu"
+        );
+        let head = granted(&mut head).expect("the head starts on the release");
+        assert_eq!(head.admitted(), Admitted::Head);
+        drop(removal);
+        assert!(granted(&mut next).is_none(), "the head holds the cpu");
+        drop(head);
+        assert_eq!(granted(&mut next).unwrap().admitted(), Admitted::Head);
+    }
+
+    /// The cpu half comes back while the run's `sandbox` slot is still held:
+    /// the waiter of its shape does not fit, so the walk runs and grants who
+    /// does.
+    #[test]
+    fn a_split_hand_off_that_does_not_fit_walks() {
+        let p = pool(&[("cpu", 2 * CPU), ("sandbox", 1)]);
+        let mut run = managed(&p, 1).now_or_never().unwrap().unwrap();
+        let _other = now(&p, &cpus(1));
+        let _head = queued(&p, &cpus(2));
+        let mut next = managed(&p, 1);
+        assert!((&mut next).now_or_never().is_none(), "no slot");
+        let mut half = queued(&p, &req(&[("cpu", CPU / 2)]));
+        let removal = run.split_off(PoolName::SANDBOX).unwrap();
+        let before = visited(&p);
+
+        drop(run);
+        assert!(granted(&mut next).is_none(), "the slot is still held");
+        assert_eq!(visited(&p) - before, 2, "the walk tested both classes");
+        let half = granted(&mut half).expect("the walk grants who fits");
+        assert_eq!(half.admitted(), Admitted::Pass);
+        drop(removal);
+        assert!(granted(&mut next).is_none(), "its cpu went to the pass");
+        assert!(settled(&p));
+    }
+
+    /// A gone waiter of the run's shape is skipped, uncharged, and the cpu
+    /// half goes to the next of the shape.
+    #[test]
+    fn a_split_hand_off_skips_a_dead_receiver() {
+        let p = pool(&[("cpu", 2 * CPU), ("sandbox", 3)]);
+        let mut run = managed(&p, 1).now_or_never().unwrap().unwrap();
+        let _other = now(&p, &cpus(1));
+        let _head = queued(&p, &cpus(2));
+        let _gone = dead(managed(&p, 1));
+        let mut next = managed(&p, 1);
+        assert!((&mut next).now_or_never().is_none(), "cpu is full");
+        let removal = run.split_off(PoolName::SANDBOX).unwrap();
+        let before = visited(&p);
+
+        drop(run);
+        let next = granted(&mut next).expect("the next of the shape");
+        assert_eq!(next.admitted(), Admitted::Handoff);
+        assert_eq!(visited(&p), before, "a hand-off walks nothing");
+        assert_eq!(overtaken(&p, "cpu").0, CPU, "charged once");
+        assert_eq!((free(&p, "cpu"), free(&p, "sandbox")), (0, 1));
+        assert_eq!(classes(&p), 1, "the head's");
+        drop((removal, next));
+        assert!(settled(&p));
+    }
+
     // ---- Sized patience ---------------------------------------------------
 
     #[test]
@@ -3241,9 +3337,17 @@ mod tests {
         assert!(waiters.iter_mut().all(|w| granted(w).is_none()));
     }
 
+    /// Each event tests at most 64 classes, and exactly as many as the pass
+    /// has left, up to 64. Class `i` is shape `i`; class 0 is the head's.
     #[test]
     fn a_walk_refuses_at_most_64_shapes() {
-        for shapes in [100, 1000] {
+        // Per event below. With 100 classes: the release tests 1..=64, the
+        // arrival the 35 left (65..=99), which ends the pass; the head change
+        // starts one (2..=65), the cancellation of class 99 ends it (66..=98
+        // and the arrival's class 100), the passing arrival finds no pass to
+        // continue, and its release starts another. With 1000, every event
+        // has 64 left.
+        for (shapes, expected) in [(100, [64, 35, 64, 34, 0, 64]), (1000, [64; 6])] {
             let p = pool(&[("cpu", 8 * CPU)]);
             let _stays = now(&p, &cpus(7));
             let mut one = Some(now(&p, &cpus(1)));
@@ -3258,19 +3362,22 @@ mod tests {
                 visited(&p) - before
             };
 
-            assert_eq!(tested(&mut || drop(one.take())), 64, "a release");
+            let mut counts = Vec::new();
+            counts.push(tested(&mut || drop(one.take())));
             let mut arrival = None;
-            let n = tested(&mut || arrival = Some(queued(&p, &shape(shapes))));
-            assert!(n <= 64, "an arrival continues the walk: {n}");
-            let n = tested(&mut || drop(waiters.pop_front()));
-            assert!(n <= 64, "a head change: {n}");
-            let n = tested(&mut || drop(waiters.pop_back()));
-            assert!(n <= 64, "a cancellation behind the head: {n}");
+            counts.push(tested(&mut || arrival = Some(queued(&p, &shape(shapes)))));
+            counts.push(tested(&mut || drop(waiters.pop_front())));
+            counts.push(tested(&mut || drop(waiters.pop_back())));
             let mut passer = None;
-            let n = tested(&mut || passer = Some(now(&p, &req(&[("cpu", CPU / 2)]))));
-            assert!(n <= 64, "an arrival that passes: {n}");
-            let n = tested(&mut || drop(passer.take()));
-            assert!(n <= 64, "and its release: {n}");
+            counts.push(tested(&mut || {
+                passer = Some(now(&p, &req(&[("cpu", CPU / 2)])));
+            }));
+            counts.push(tested(&mut || drop(passer.take())));
+            assert_eq!(
+                counts, expected,
+                "{shapes} classes: a release, an arrival, a head change, a \
+                 cancellation behind the head, an arrival that passes, its release"
+            );
         }
     }
 
@@ -3306,6 +3413,148 @@ mod tests {
         assert!(!draining(&p), "long before the head is protected");
     }
 
+    /// A lane of 202 waiting classes, and a pass left unfinished at class
+    /// 193: the head's class 0 (two `cpus(8)` waiters), 200 classes that
+    /// never fit, and class 151, which fits once `tokens` is released.
+    struct Ring {
+        p: Arc<ResourcePool>,
+        tokens: Option<Reservation>,
+        head: Option<Acquire>,
+        fits: Acquire,
+        /// What `fits` was granted.
+        started: Option<Reservation>,
+        /// Keeps every other waiter queued.
+        rest: Vec<Acquire>,
+        _stays: Reservation,
+    }
+
+    impl Ring {
+        /// 201 classes besides the head's.
+        const OTHERS: u64 = 201;
+
+        fn new() -> Self {
+            let p = pool(&[("cpu", 8 * CPU), ("tokens", 2)]);
+            let tokens = now(&p, &req(&[("cpu", 0), ("tokens", 2)]));
+            let stays = now(&p, &cpus(7));
+            let one = now(&p, &cpus(1));
+            let head = queued(&p, &cpus(8));
+            let mut rest = vec![queued(&p, &cpus(8))];
+            let never = |i: u64| req(&[("cpu", 2 * CPU + i)]);
+            rest.extend((1..=150).map(|i| queued(&p, &never(i))));
+            let fits = queued(&p, &req(&[("cpu", 0), ("tokens", 1)]));
+            rest.extend((151..=200).map(|i| queued(&p, &never(i))));
+            assert_eq!(classes(&p), 202);
+
+            // A release starts a pass from class 1; two arrivals of the
+            // head's shape carry it to class 193. Class 151 is tested on the
+            // way and refused: `tokens` is still held.
+            let before = visited(&p);
+            drop(one);
+            rest.push(queued(&p, &cpus(8)));
+            rest.push(queued(&p, &cpus(8)));
+            assert_eq!(visited(&p) - before, 3 * 64);
+            assert!(!pass_done(&p));
+            Self {
+                p,
+                tokens: Some(tokens),
+                head: Some(head),
+                fits,
+                started: None,
+                rest,
+                _stays: stays,
+            }
+        }
+
+        /// Run `event`; how many classes it tested.
+        fn tested(&mut self, event: impl FnOnce(&mut Self)) -> u64 {
+            let before = visited(&self.p);
+            event(self);
+            visited(&self.p) - before
+        }
+
+        /// An event that frees nothing and leaves the head as it is: an
+        /// arrival behind the head's own shape.
+        fn idle(&mut self) {
+            let waiter = queued(&self.p, &cpus(8));
+            self.rest.push(waiter);
+        }
+
+        /// After the first event of a pass, which tested `first`: idle events
+        /// until the pass could have covered every class, each one's count,
+        /// and the event (1 is the first) after which class 151 had started.
+        fn finish(&mut self, first: u64) -> (Vec<u64>, Option<u64>) {
+            let mut counts = vec![first];
+            let mut started_after = None;
+            for event in 2..=Self::OTHERS.div_ceil(64) {
+                counts.push(self.tested(Self::idle));
+                if self.started.is_none() {
+                    // Held: its release would be an event of its own.
+                    self.started = granted(&mut self.fits);
+                    started_after = self.started.as_ref().map(|run| {
+                        assert_eq!(run.admitted(), Admitted::Pass);
+                        event
+                    });
+                }
+            }
+            (counts, started_after)
+        }
+    }
+
+    /// A pass started mid-ring runs to the top, wraps to the bottom and on
+    /// up to where it started, then ends; a class that fits is reached
+    /// within ceil(classes / 64) events, wherever the cursor was.
+    #[test]
+    fn a_pass_over_more_than_64_classes_wraps_and_ends() {
+        let mut ring = Ring::new();
+        let first = ring.tested(|r| drop(r.tokens.take()));
+        assert_eq!(first, 64, "193..=201, then 1..=55");
+        assert!(
+            granted(&mut ring.fits).is_none(),
+            "class 151 is not reached"
+        );
+        assert!(!pass_done(&ring.p));
+
+        let (counts, started_after) = ring.finish(first);
+        assert_eq!(
+            counts,
+            [64, 64, 64, 9],
+            "then 56..=119, 120..=183, 184..=192"
+        );
+        assert_eq!(started_after, Some(3), "in 120..=183");
+        assert!(pass_done(&ring.p), "every class was tested once");
+        assert_eq!(counts.iter().sum::<u64>(), Ring::OTHERS);
+        assert!(settled(&ring.p));
+    }
+
+    /// The head leaving mid-pass starts the pass over from where it was, so
+    /// the classes the old pass had not reached are tested by the new one,
+    /// and so is every other class, once.
+    #[test]
+    fn a_head_change_mid_pass_leaves_no_class_untested() {
+        let mut ring = Ring::new();
+        // Released: the pass wraps and stops at class 56 of the bottom leg.
+        assert_eq!(ring.tested(|r| drop(r.tokens.take())), 64);
+        assert!(granted(&mut ring.fits).is_none());
+        assert!(!pass_done(&ring.p));
+
+        // The head leaves; the next of its shape is the head.
+        let first = ring.tested(|r| drop(r.head.take()));
+        let (counts, started_after) = ring.finish(first);
+        assert_eq!(
+            counts,
+            [64, 64, 64, 9],
+            "56..=119, 120..=183, 184..=201 and 1..=46, 47..=55"
+        );
+        assert_eq!(started_after, Some(2));
+        assert!(pass_done(&ring.p));
+        assert_eq!(
+            counts.iter().sum::<u64>(),
+            Ring::OTHERS,
+            "each class but the head's, once"
+        );
+        assert!(settled(&ring.p));
+    }
+
     #[test]
     fn the_zero_cost_fast_path_creates_no_class() {
         let p = ResourcePool::new([
@@ -3332,6 +3581,28 @@ mod tests {
         assert_eq!(classes(&p), 1, "only the head's");
         drop(unbounded);
         assert_eq!(classes(&p), 1);
+    }
+
+    /// A protected head holds back what takes from its pools, never a run
+    /// that reserves nothing of a bounded pool.
+    #[test]
+    fn a_zero_cost_arrival_starts_past_a_protected_head() {
+        let p = ResourcePool::new([
+            (name("cpu"), Limit::Bounded(16 * CPU)),
+            (name("tokens"), Limit::Unbounded),
+        ]);
+        let _stays = now(&p, &cpus(15));
+        let _head = queued(&p, &cpus(2));
+        assert_eq!(passes(&p, &cpus(1)), 32);
+        assert!(draining(&p));
+        let debt = overtaken(&p, "cpu");
+
+        for zero in [req(&[("cpu", 0)]), req(&[("cpu", 0), ("tokens", 5)])] {
+            let run = now(&p, &zero);
+            assert_eq!(run.admitted(), Admitted::Arrival);
+            assert_eq!(overtaken(&p, "cpu"), debt, "and is not charged");
+        }
+        assert_eq!(classes(&p), 1, "only the head's");
     }
 
     #[test]
@@ -3371,6 +3642,29 @@ mod tests {
         let mut there = queued(&p, &cpus(1));
         drop(one);
         assert_eq!(granted(&mut there).unwrap().admitted(), Admitted::Head);
+    }
+
+    /// Every waiter of the released shape is gone: the class leaves the lane
+    /// during the hand-off, and the release falls through to the walk, which
+    /// grants who fits.
+    #[test]
+    fn a_hand_off_to_a_class_of_dead_waiters_walks() {
+        let p = pool(&[("cpu", 4 * CPU)]);
+        let _stays = now(&p, &cpus(3));
+        let one = now(&p, &cpus(1));
+        let _head = queued(&p, &cpus(4));
+        let _gone = [dead(queued(&p, &cpus(1))), dead(queued(&p, &cpus(1)))];
+        let mut half = queued(&p, &req(&[("cpu", CPU / 2)]));
+        assert_eq!(classes(&p), 3);
+        let before = visited(&p);
+
+        drop(one);
+        let run = granted(&mut half).expect("the walk grants who fits");
+        assert_eq!(run.admitted(), Admitted::Pass);
+        assert_eq!(visited(&p) - before, 1, "the only class but the head's");
+        assert_eq!(classes(&p), 1, "the head's");
+        assert_eq!(overtaken(&p, "cpu").0, CPU / 2, "only the pass is charged");
+        assert_eq!(free(&p, "cpu"), CPU / 2);
     }
 
     // ---- What a wait and a start say --------------------------------------
@@ -3479,40 +3773,83 @@ mod tests {
         Over,
     }
 
+    /// What the engine adds to a request: `sandbox: 1` for a managed run.
+    fn implicit(managed: bool) -> &'static [(PoolName, u64)] {
+        static SLOT: std::sync::LazyLock<[(PoolName, u64); 1]> =
+            std::sync::LazyLock::new(|| [(PoolName::sandbox(), 1)]);
+        if managed { &*SLOT } else { &[] }
+    }
+
     /// A lane driven by a seeded sequence of arrivals, releases and
     /// cancellations, with what the test knows of every request.
     struct Script {
         pool: Arc<ResourcePool>,
         shapes: Vec<Demand>,
+        /// The shapes from this index on are managed runs': acquired with the
+        /// engine's `sandbox: 1`, whose slot is split off the grant and
+        /// released by an event of its own.
+        managed_from: usize,
         /// Each of `shapes` as the lane resolves it: two that resolve alike
         /// are one shape.
         resolved: Vec<Vec<(usize, u64)>>,
+        /// Whether one walk tests every class there can be: with no more
+        /// shapes than [`WALK_CAP`], no pass is ever left unfinished.
+        within_cap: bool,
         /// Every request in arrival order: its shape and where it stands.
         slots: Vec<(usize, Slot)>,
+        /// The `sandbox` halves split off managed runs' grants.
+        removals: Vec<Reservation>,
+        /// How many of them were released.
+        removed: usize,
         /// Every grant: the request and how it was admitted.
         log: Vec<(usize, Admitted)>,
         /// The head after the last event, when it was draining: its request
         /// and its debts.
         drained: Option<(usize, Vec<Overtaken>)>,
+        /// The most classes that waited at once.
+        peak_classes: usize,
+        /// After how many events a pass was left unfinished.
+        unfinished: usize,
     }
 
     impl Script {
         fn new(pool: Arc<ResourcePool>, shapes: Vec<Demand>) -> Self {
-            let resolved = shapes
+            Self::with_managed(pool, shapes, Vec::new())
+        }
+
+        /// `shapes`, then `managed` as managed runs' shapes.
+        fn with_managed(
+            pool: Arc<ResourcePool>,
+            mut shapes: Vec<Demand>,
+            managed: Vec<Demand>,
+        ) -> Self {
+            let managed_from = shapes.len();
+            shapes.extend(managed);
+            let resolved: Vec<_> = shapes
                 .iter()
-                .map(|s| {
-                    let (mut need, _) = pool.resolve(s, &[]).unwrap();
+                .enumerate()
+                .map(|(s, shape)| {
+                    let (mut need, _) = pool.resolve(shape, implicit(s >= managed_from)).unwrap();
                     need.sort_unstable();
                     need
                 })
                 .collect();
+            let mut distinct = resolved.clone();
+            distinct.sort_unstable();
+            distinct.dedup();
             Self {
                 pool,
                 shapes,
+                managed_from,
                 resolved,
+                within_cap: distinct.len() <= WALK_CAP,
                 slots: Vec::new(),
+                removals: Vec::new(),
+                removed: 0,
                 log: Vec::new(),
                 drained: None,
+                peak_classes: 0,
+                unfinished: 0,
             }
         }
 
@@ -3528,9 +3865,50 @@ mod tests {
         }
 
         fn arrive(&mut self, shape: usize) {
-            let acquire = self.pool.acquire(&self.shapes[shape]).unwrap();
+            let acquire = self
+                .pool
+                .acquire_with(&self.shapes[shape], implicit(shape >= self.managed_from))
+                .unwrap();
             self.slots.push((shape, Slot::Waiting(acquire)));
             self.observe();
+        }
+
+        /// Release the `nth` split-off `sandbox` slot: the reclaim lane
+        /// removed its sandbox.
+        fn end_removal(&mut self, nth: usize) {
+            drop(self.removals.remove(nth));
+            self.removed += 1;
+            self.observe();
+        }
+
+        /// Events that change nothing a waiter waits for, until no pass is
+        /// unfinished: the head's own shape arrives behind it and leaves. The
+        /// head stays, so each event continues the pass, which then ends
+        /// within one event per [`WALK_CAP`] classes. Then a full walk would
+        /// grant nothing.
+        fn settle(&mut self) {
+            let bound = self.shapes.len().div_ceil(WALK_CAP);
+            for _ in 0..bound {
+                if pass_done(&self.pool) {
+                    break;
+                }
+                let Some(&(shape, _)) = self
+                    .slots
+                    .iter()
+                    .find(|(_, s)| matches!(s, Slot::Waiting(_)))
+                else {
+                    break;
+                };
+                self.arrive(shape);
+                self.check();
+                let last = self.count(false) - 1;
+                self.end(last, false);
+                self.check();
+            }
+            assert!(
+                settled(&self.pool),
+                "a pass did not end within {bound} pairs of idle events"
+            );
         }
 
         /// Release the `nth` live grant, or cancel the `nth` waiter.
@@ -3558,7 +3936,7 @@ mod tests {
                 let Slot::Waiting(acquire) = slot else {
                     continue;
                 };
-                let Some(run) = granted(acquire) else {
+                let Some(mut run) = granted(acquire) else {
                     continue;
                 };
                 let alike = &self.resolved[*shape];
@@ -3569,6 +3947,12 @@ mod tests {
                     "request {i} started ahead of an older one of its shape"
                 );
                 self.log.push((i, run.admitted()));
+                if *shape >= self.managed_from {
+                    let removal = run
+                        .split_off(PoolName::SANDBOX)
+                        .expect("a managed grant holds a slot");
+                    self.removals.push(removal);
+                }
                 *slot = Slot::Held(run);
             }
         }
@@ -3582,9 +3966,11 @@ mod tests {
                     .slots
                     .iter()
                     .filter_map(|(_, s)| match s {
-                        Slot::Held(run) => Some(run.amount(pool.pool.as_str())),
+                        Slot::Held(run) => Some(run),
                         _ => None,
                     })
+                    .chain(&self.removals)
+                    .map(|run| run.amount(pool.pool.as_str()))
                     .sum();
                 assert_eq!(pool.held, live, "{}: held is the live grants", pool.pool);
                 if let Limit::Bounded(capacity) = pool.capacity {
@@ -3615,11 +4001,22 @@ mod tests {
                     self.drained = Some((head, snap.overtaken));
                 }
             }
-            assert!(settled(&self.pool), "a full walk would grant something");
+            self.peak_classes = self
+                .peak_classes
+                .max(self.pool.main.state.lock().classes.len());
+            if !pass_done(&self.pool) {
+                self.unfinished += 1;
+            }
+            // Past the cap a pass can be unfinished between events, and
+            // `settle` checks this once it ends.
+            if self.within_cap {
+                assert!(settled(&self.pool), "a full walk would grant something");
+            }
         }
 
         /// `events` seeded events, the invariants checked after each, then
-        /// releases until the queue is empty.
+        /// releases until the queue is empty. Past the walk cap, every tenth
+        /// event or so is followed by idle events until its pass ended.
         fn run(&mut self, seed: u64, events: usize) {
             let mut rng = Rng(seed);
             for _ in 0..events {
@@ -3627,13 +4024,27 @@ mod tests {
                 match rng.below(20) {
                     0..=6 if held > 0 => self.end(rng.below(held), true),
                     7..=9 if waiting > 0 => self.end(rng.below(waiting), false),
+                    10..=11 if !self.removals.is_empty() => {
+                        self.end_removal(rng.below(self.removals.len()));
+                    }
                     _ => self.arrive(rng.below(self.shapes.len())),
                 }
                 self.check();
+                if !self.within_cap && rng.below(10) == 0 {
+                    self.settle();
+                }
             }
             while self.count(false) > 0 {
-                assert!(self.count(true) > 0, "waiters, and nothing to release");
-                self.end(0, true);
+                if self.count(true) > 0 {
+                    self.end(0, true);
+                } else {
+                    assert!(!self.removals.is_empty(), "waiters, and nothing to release");
+                    self.end_removal(0);
+                }
+                self.check();
+            }
+            while !self.removals.is_empty() {
+                self.end_removal(0);
                 self.check();
             }
             self.slots.clear();
@@ -3651,6 +4062,7 @@ mod tests {
                 (name("cpu"), Limit::Bounded(8 * CPU)),
                 (name("docker"), Limit::Bounded(2)),
                 (name("memory"), Limit::Bounded(16 * GIB)),
+                (name("sandbox"), Limit::Bounded(4)),
                 (name("tokens"), Limit::Unbounded),
             ]);
             let shapes = vec![
@@ -3670,8 +4082,14 @@ mod tests {
                 req(&[("tokens", 5)]),
                 req(&[("cpu", 4 * CPU), ("memory", 8 * GIB), ("docker", 2)]),
             ];
-            let mut script = Script::new(pool, shapes);
+            let managed = vec![
+                cpus(1),
+                req(&[("cpu", 0)]),
+                req(&[("cpu", 2 * CPU), ("docker", 1)]),
+            ];
+            let mut script = Script::with_managed(pool, shapes, managed);
             script.run(seed, 600);
+            assert!(script.removed > 0, "seed {seed} released no split slot");
             let how = |a| script.log.iter().filter(|&&(_, x)| x == a).count();
             assert!(
                 [
@@ -3687,19 +4105,89 @@ mod tests {
         }
     }
 
+    /// More shapes than one walk tests: a pass is left unfinished between
+    /// events, and the invariants still hold after every one. Once the pass
+    /// ends, a full walk would grant nothing.
+    #[test]
+    fn random_events_past_the_walk_cap_keep_the_invariants() {
+        for seed in 0..6 {
+            let pool = ResourcePool::new([
+                (name("cpu"), Limit::Bounded(8 * CPU)),
+                (name("docker"), Limit::Bounded(2)),
+                (name("memory"), Limit::Bounded(16 * GIB)),
+                (name("sandbox"), Limit::Bounded(8)),
+            ]);
+            let mut shapes: Vec<Demand> = (1..=96).map(|i| req(&[("cpu", i * CPU / 12)])).collect();
+            shapes.extend([
+                req(&[("memory", 4 * GIB)]),
+                req(&[("memory", 16 * GIB)]),
+                req(&[("cpu", 0), ("docker", 1)]),
+                req(&[("cpu", 2 * CPU), ("docker", 1)]),
+            ]);
+            let managed = vec![cpus(1), req(&[("cpu", CPU / 12)]), req(&[("cpu", 0)])];
+            let mut script = Script::with_managed(pool, shapes, managed);
+            assert!(!script.within_cap);
+            // The whole cpu pool first, so nearly every shape waits.
+            script.arrive(95);
+            for shape in 0..script.shapes.len() {
+                script.arrive(shape);
+                script.check();
+            }
+            assert!(
+                script.peak_classes > WALK_CAP + 1,
+                "{} classes",
+                script.peak_classes
+            );
+            script.run(seed, 1500);
+            assert!(
+                script.unfinished > 0,
+                "seed {seed} never left a pass unfinished"
+            );
+            assert!(script.removed > 0, "seed {seed} released no split slot");
+        }
+    }
+
+    /// Grants depend on the requests alone: not on class ids, nor on what
+    /// the shape map held before. The same script, on a fresh lane and on
+    /// one where other shapes (and its own, in reverse) queued and left
+    /// first, grants the same requests the same way.
     #[test]
     fn grants_are_deterministic() {
-        let run = || {
+        let run = |history: bool| {
             let pool = pool(&[("cpu", 8 * CPU), ("docker", 2)]);
             let mut shapes: Vec<Demand> = (1..=20).map(|i| req(&[("cpu", i * CPU / 4)])).collect();
             shapes.extend((1..=4).map(|i| req(&[("cpu", i * CPU), ("docker", 1)])));
+            if history {
+                let full = [
+                    now(&pool, &cpus(8)),
+                    now(&pool, &req(&[("cpu", 0), ("docker", 2)])),
+                ];
+                // A few micro-CPUs each: no shape of the script's.
+                let others = (1..=200).map(|i| req(&[("cpu", i)]));
+                let mut waiters: Vec<Acquire> = shapes
+                    .iter()
+                    .rev()
+                    .cloned()
+                    .chain(others)
+                    .map(|shape| queued(&pool, &shape))
+                    .collect();
+                assert_eq!(classes(&pool), 224);
+                // Leave from both ends, so classes go in no single order.
+                while !waiters.is_empty() {
+                    drop(waiters.swap_remove(waiters.len() / 3));
+                }
+                drop(full);
+                assert_eq!(classes(&pool), 0);
+                assert_eq!((free(&pool, "cpu"), free(&pool, "docker")), (8 * CPU, 2));
+            }
             let mut script = Script::new(pool, shapes);
             script.run(11, 2000);
             script.log
         };
-        let (first, second) = (run(), run());
+        let (first, second, after_history) = (run(false), run(false), run(true));
         assert!(first.len() > 500, "{} grants", first.len());
         assert_eq!(first, second);
+        assert_eq!(first, after_history, "by request index");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

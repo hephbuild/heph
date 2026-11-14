@@ -1721,8 +1721,12 @@ mod tests {
         let pool = ResourcePool::new([(PoolName::cpu(), Limit::Bounded(8 * CPU))]);
         let cpus = |n: u64| Demand::try_from_pairs([("cpu".to_owned(), n * CPU)]).expect("demand");
         let acquire = |n: u64| pool.acquire(&cpus(n)).expect("acquire");
+        // Rendered at the instant the head arrived, so its wait reads `0s`
+        // however long the machine takes to get here.
         let head_line = || {
-            let text = render_pools(&pool.snapshot(), Instant::now());
+            let snap = pool.snapshot();
+            let now = snap.main.head.as_ref().expect("a head").since;
+            let text = render_pools(&snap, now);
             text.lines().nth(1).unwrap_or_default().trim().to_owned()
         };
 
@@ -1738,8 +1742,12 @@ mod tests {
             "head         waits for cpu 4 (0 free) for 0s; overtaken by 2 of 32 cpu"
         );
 
-        // Each pass frees its 2 cpu for the next, until 32 cpu went by.
-        while pool.snapshot().main.head.is_some_and(|h| !h.draining()) {
+        // Each pass frees its 2 cpu for the next: 15 more, and 32 cpu went by.
+        for pass in 2..=16 {
+            assert!(
+                pool.snapshot().main.head.is_some_and(|h| !h.draining()),
+                "at its limit before pass {pass}"
+            );
             passers.clear();
             passers.push(acquire(2).now_or_never().expect("passes").expect("granted"));
         }
