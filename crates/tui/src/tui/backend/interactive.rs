@@ -19,6 +19,7 @@ use tokio::sync::mpsc;
 use crate::tui::app::{App, AppContext, Control, TUIAppView};
 use crate::tui::log_sink::LogSink;
 use crate::tui::progress::HSCROLL_STEP;
+use crate::tui::session::recorder::ViewTap;
 use crate::tui::session::{SessionSlot, TappedReceiver};
 use crate::tui::stderr_backend::StderrBackend;
 use hcore::events::now_unix_ms;
@@ -69,7 +70,10 @@ pub async fn run<A: App + 'static>(
     // We own the build-event channel: the sender goes to the app via
     // AppContext (and into its request state); we keep the receiver.
     let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let mut view_tap = session_tap.clone().map(|tap| ViewTap::new(tap, &view));
     let mut build_events: Option<TappedReceiver> = Some(TappedReceiver::new(event_rx, session_tap));
+    // The instant a held viewport froze its clock at; the summary uses it too.
+    let mut held_at: Option<u64> = None;
 
     record_raw_mode_restore();
     enable_raw_mode().context("enabling raw mode")?;
@@ -145,7 +149,9 @@ pub async fn run<A: App + 'static>(
                     // User navigated off the main view: hold the viewport up and
                     // surface a "press q to quit" notice instead of auto-exiting.
                     held = true;
-                    view.set_finished();
+                    let at = now_unix_ms();
+                    held_at = Some(at);
+                    view.set_finished(at);
                     app_result = Some(r);
                 } else {
                     break r;
@@ -407,6 +413,12 @@ pub async fn run<A: App + 'static>(
                 // so the tick is the wake that cannot be lost; each one
                 // re-enters the loop and the next `select!` re-polls the
                 // control channel, observing any message whose wake vanished.
+                //
+                // Before the paused early-out: a label set while the terminal
+                // is handed over ("Invoking …") is still the run's.
+                if let Some(t) = view_tap.as_mut() {
+                    t.observe(&view);
+                }
                 if paused {
                     if !resume_pending {
                         continue;
@@ -496,7 +508,15 @@ pub async fn run<A: App + 'static>(
     }
 
     // Persistent final summary, printed straight to stderr below the
-    // torn-down inline viewport (interactive mode only).
+    // torn-down inline viewport (interactive mode only). Measured at the
+    // instant a held viewport froze at, else now; recorded as `Finished` so a
+    // viewer prints the same line, and so it knows what follows was printed
+    // below it.
+    let at = held_at.unwrap_or_else(now_unix_ms);
+    view.set_finished(at);
+    if let Some(t) = view_tap.as_mut() {
+        t.finished(&view, at);
+    }
     view.last_render();
 
     result

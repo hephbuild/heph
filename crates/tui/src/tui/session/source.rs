@@ -98,6 +98,15 @@ pub trait SessionSource: Send + Sync + std::fmt::Debug {
     /// it. Refused when the session does not advertise
     /// [`CAPABILITY_INFLIGHT`] or is not live.
     async fn inflight(&self, id: SessionId, timeout: Duration) -> anyhow::Result<String>;
+
+    /// How a viewer of session `attached` names a lock holder's pid: from
+    /// the sessions this source lists, never naming `attached` itself (the
+    /// run's own view never named its own session). Nothing by default: the
+    /// notice falls back to the pid.
+    fn holder_names(&self, attached: SessionId) -> super::HolderNames {
+        let _ = attached;
+        super::HolderNames::default()
+    }
 }
 
 /// The sessions recorded under one directory (`~/.heph/sessions`).
@@ -122,6 +131,10 @@ impl FileSource {
 
 #[async_trait]
 impl SessionSource for FileSource {
+    fn holder_names(&self, attached: SessionId) -> super::HolderNames {
+        super::HolderNames::new(Some(super::SessionRoot::new(&self.root)), Some(attached))
+    }
+
     async fn list(&self) -> anyhow::Result<Vec<SessionEntry>> {
         let root = self.root.clone();
         tokio::task::spawn_blocking(move || list_dir(&root))

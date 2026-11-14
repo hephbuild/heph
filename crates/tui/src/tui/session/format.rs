@@ -537,6 +537,54 @@ mod tests {
         );
     }
 
+    /// Each view record round-trips, with its wire `type` named as written; a
+    /// reader that predates one (simulated by an unknown `type`) skips it as
+    /// `Unknown` rather than failing the stream.
+    #[test]
+    fn view_records_round_trip() {
+        let prompt = ApprovalPrompt {
+            addr: "//a:gated".into(),
+            queued_behind: 2,
+            notices: vec![ApprovalPromptNotice {
+                name: "terms".into(),
+                path: "/x/terms.txt".into(),
+            }],
+        };
+        for (kind, ty) in [
+            (
+                SessionRecordKind::Label {
+                    label: "Invoking //a:b".into(),
+                },
+                "Label",
+            ),
+            (
+                SessionRecordKind::Approval {
+                    prompt: Some(Box::new(prompt)),
+                },
+                "Approval",
+            ),
+            (SessionRecordKind::Approval { prompt: None }, "Approval"),
+            (SessionRecordKind::Finished, "Finished"),
+            (
+                SessionRecordKind::Output {
+                    text: "× target failed\n\u{1b}[31mred\u{1b}[0m\n".into(),
+                },
+                "Output",
+            ),
+        ] {
+            let rec = SessionRecord::session(7, kind);
+            let json = serde_json::to_string(&rec).expect("encode");
+            assert!(json.contains(&format!(r#""type":"{ty}""#)), "{json}");
+            let back: SessionRecord = serde_json::from_str(&json).expect("decode");
+            assert_eq!(back.session, rec.session, "{json}");
+            assert_eq!(back.at_unix_ms, 7);
+            // What an older reader sees: the same record under a name it lacks.
+            let older = json.replace(&format!(r#""type":"{ty}""#), r#""type":"NotYetKnown""#);
+            let old: SessionRecord = serde_json::from_str(&older).expect("decode as unknown");
+            assert_eq!(old.session, Some(SessionRecordKind::Unknown), "{older}");
+        }
+    }
+
     /// A6/A17: the snapshot round-trips, and a newer version is refused naming
     /// both versions.
     #[test]

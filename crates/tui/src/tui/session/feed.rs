@@ -124,3 +124,100 @@ impl SessionFeed {
         s.finished_at_ms.or(s.ended_at_ms)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn log(at: u64, msg: &str) -> SessionRecord {
+        SessionRecord::session(
+            at,
+            SessionRecordKind::Log {
+                level: "INFO".into(),
+                msg: msg.into(),
+            },
+        )
+    }
+
+    fn printed(r: &Routed) -> Option<(&'static str, &str)> {
+        match r {
+            Routed::Print(t) => Some(("now", t.as_str())),
+            Routed::AfterTeardown(t) => Some(("after", t.as_str())),
+            Routed::Event(_) | Routed::Nothing => None,
+        }
+    }
+
+    /// What the run printed before its teardown prints now; what it printed
+    /// after (a late log line, the failure report) waits for the viewer's own
+    /// teardown, in order. `Finished` clears the prompt and fixes the clock,
+    /// and a later `End` does not move it.
+    #[test]
+    fn routes_by_teardown_order() {
+        let feed = SessionFeed::default();
+        let prompt = ApprovalPrompt {
+            addr: "//a:gated".into(),
+            ..ApprovalPrompt::default()
+        };
+        let label = SessionRecordKind::Label {
+            label: "Invoking //a:b".into(),
+        };
+        let approval = SessionRecordKind::Approval {
+            prompt: Some(Box::new(prompt.clone())),
+        };
+        let routed: Vec<Routed> = [
+            log(2, "before"),
+            SessionRecord::session(3, label),
+            SessionRecord::session(4, approval),
+        ]
+        .into_iter()
+        .map(|r| feed.route(r))
+        .collect();
+        assert_eq!(
+            routed.iter().filter_map(printed).collect::<Vec<_>>(),
+            [("now", "before\n")]
+        );
+        assert_eq!(feed.label().as_deref(), Some("Invoking //a:b"));
+        assert_eq!(feed.approval(), Some(prompt));
+        assert_eq!(feed.finished_at_ms(), None, "still running");
+
+        let end = SessionRecordKind::End {
+            exit_code: Some(1),
+            panicked: false,
+        };
+        let output = SessionRecordKind::Output {
+            text: "× target failed\n".into(),
+        };
+        let routed: Vec<Routed> = [
+            SessionRecord::session(10, SessionRecordKind::Finished),
+            log(11, "late"),
+            SessionRecord::session(12, output),
+            SessionRecord::session(13, end),
+        ]
+        .into_iter()
+        .map(|r| feed.route(r))
+        .collect();
+        assert_eq!(
+            routed.iter().filter_map(printed).collect::<Vec<_>>(),
+            [("after", "late\n"), ("after", "× target failed\n")]
+        );
+        assert_eq!(feed.approval(), None, "torn down: no prompt on screen");
+        assert_eq!(feed.finished_at_ms(), Some(10), "Finished, not End");
+    }
+
+    /// A run with no `Finished` (the line backend, or an older heph) is
+    /// measured at its `End`, and everything it printed prints now.
+    #[test]
+    fn end_is_the_clock_without_finished() {
+        let feed = SessionFeed::default();
+        assert!(matches!(feed.route(log(1, "x")), Routed::Print(_)));
+        let end = SessionRecordKind::End {
+            exit_code: Some(0),
+            panicked: false,
+        };
+        assert!(matches!(
+            feed.route(SessionRecord::session(9, end)),
+            Routed::Nothing
+        ));
+        assert_eq!(feed.finished_at_ms(), Some(9));
+    }
+}

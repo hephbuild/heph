@@ -2268,15 +2268,89 @@ pub struct TuiProgressView {
     /// substring matched against the target addr. Empty means no filtering.
     /// Persists after `Enter` confirms so the filtered list stays scrollable.
     search_query: RefCell<String>,
-    /// Pending approval prompts shared with the engine's approval handler. `None`
-    /// for commands without an approval gate. When a prompt is active it is
-    /// rendered at the top of the live body and `y`/`n`/Enter resolve it.
-    approval: Option<crate::tui::approval::ApprovalCenter>,
-    /// What `q` on the main view does while the run is still going. `None` for
-    /// a run of this process, where `q` does nothing (Ctrl-C cancels); a
-    /// session viewer detaches here ([`Self::with_quit`]).
-    on_quit: Option<Box<dyn Fn() + Send>>,
+    /// Whose view this is: the run's own, or a session viewer's. The one seam
+    /// between the two; everything not behind it renders identically.
+    role: Role,
 }
+
+/// Whose terminal a [`TuiProgressView`] draws on.
+///
+/// `heph session attach` draws the run's own view, so the only things that
+/// differ are here: what acts on the run (cancel, approval `y`/`n`/Enter)
+/// exists only in [`Role::Live`], and an attached view reads what the run's
+/// terminal showed besides build events (its label changes, the approval
+/// prompt, the instant its summary was measured) from the recorded
+/// [`SessionFeed`].
+///
+/// [`SessionFeed`]: crate::tui::session::SessionFeed
+enum Role {
+    /// The run of this process.
+    Live {
+        /// Pending approval prompts shared with the engine's approval handler.
+        /// `None` for commands without an approval gate. When a prompt is
+        /// active it is rendered at the top of the live body and
+        /// `y`/`n`/Enter resolve it.
+        approval: Option<crate::tui::approval::ApprovalCenter>,
+    },
+    /// A viewer of the recorded session `id`.
+    Attached {
+        id: SessionId,
+        feed: crate::tui::session::SessionFeed,
+        /// `q` on the main view while the run goes on: end this viewer. Never
+        /// a cancel: the view has no way to reach the run it shows.
+        detach: Box<dyn Fn() + Send>,
+    },
+}
+
+/// The keys an approval banner offers, when it offers any.
+struct ApprovalKeys {
+    /// Whether the notice body is expanded (`enter hide` vs `enter view`).
+    expanded: bool,
+}
+
+/// The approval banner and its notice links. Both roles draw through this, so
+/// an attached viewer shows the run's prompt as the run did, without `keys`.
+fn approval_banner<'a>(
+    addr: &str,
+    queued_behind: u64,
+    notices: impl ExactSizeIterator<Item = (&'a str, &'a str)>,
+    keys: Option<ApprovalKeys>,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::with_capacity(1 + notices.len());
+    // When more than one target is awaiting approval, show the total count so
+    // the user knows further prompts follow this one.
+    let total_pending = queued_behind.saturating_add(1);
+    let queued = if total_pending > 1 {
+        format!(" · {total_pending} pending")
+    } else {
+        String::new()
+    };
+    let keys = match keys {
+        None => String::new(),
+        // Only offer the notice-view toggle when there is a notice to view.
+        Some(_) if notices.len() == 0 => APPROVAL_KEYS.to_owned(),
+        Some(ApprovalKeys { expanded: true }) => format!("{APPROVAL_KEYS} · enter hide"),
+        Some(ApprovalKeys { expanded: false }) => format!("{APPROVAL_KEYS} · enter view"),
+    };
+    lines.push(Line::from(Span::styled(
+        format!("  ⚠ approval required: {addr}{keys}{queued}"),
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )));
+    // Always show the notice file link(s) so the user can open the full text
+    // in an editor without expanding the inline preview.
+    for (name, path) in notices {
+        lines.push(Line::from(Span::styled(
+            format!("    → {name}: {path}"),
+            Style::default().fg(Color::Cyan),
+        )));
+    }
+    lines
+}
+
+/// The approval banner's keys, which act on the run: a live view only.
+const APPROVAL_KEYS: &str = "  [y] approve · [n] reject";
 
 impl TuiProgressView {
     /// Build-counts header (run/query/inspect). The label rides the bottom border.
@@ -2296,17 +2370,44 @@ impl TuiProgressView {
             finished_at_ms: None,
             search_active: Cell::new(false),
             search_query: RefCell::new(String::new()),
-            approval: None,
-            on_quit: None,
+            role: Role::Live { approval: None },
         }
     }
 
-    /// Call `f` when `q` is pressed on the main view while the run is still
-    /// going — how `heph session attach` detaches. Never a cancel: the view has
-    /// no way to reach the run it shows.
-    pub fn with_quit(mut self, f: impl Fn() + Send + 'static) -> Self {
-        self.on_quit = Some(Box::new(f));
+    /// This view, as `heph session attach` draws session `id`: the same view
+    /// in its attached role. It reads the run's label, approval prompt and
+    /// finish instant from `feed`, offers no key that acts on the run, and
+    /// calls `detach` on `q` while the run goes on (Ctrl-C detaches through
+    /// the viewer's shutdown). Drops any approval queue it was given.
+    pub fn attached(
+        mut self,
+        id: SessionId,
+        feed: crate::tui::session::SessionFeed,
+        detach: impl Fn() + Send + 'static,
+    ) -> Self {
+        self.role = Role::Attached {
+            id,
+            feed,
+            detach: Box::new(detach),
+        };
         self
+    }
+
+    /// The label on the bottom border: the header model's, or in an attached
+    /// view the run's latest recorded one.
+    fn label(&self) -> String {
+        match &self.role {
+            Role::Attached { feed, .. } => feed.label().unwrap_or_else(|| self.model.label()),
+            Role::Live { .. } => self.model.label(),
+        }
+    }
+
+    /// The approval queue, in a live view that has one.
+    fn approval_center(&self) -> Option<&crate::tui::approval::ApprovalCenter> {
+        match &self.role {
+            Role::Live { approval } => approval.as_ref(),
+            Role::Attached { .. } => None,
+        }
     }
 
     /// The folded state, for a caller that renders more than the view does
@@ -2339,55 +2440,68 @@ impl TuiProgressView {
         self.model.last_render(&self.state, self.scope.get())
     }
 
+    /// The final summary line [`TUIAppView::last_render`] prints, `None` when
+    /// there was nothing to report. The clock is the finish instant
+    /// ([`TUIAppView::set_finished`]), matching the frozen header, so a viewer
+    /// prints the line the run printed.
+    pub fn final_line(&self) -> Option<String> {
+        let segment = self.final_summary_segment();
+        if segment.is_empty() {
+            return None;
+        }
+        let clock = self
+            .finished_at_ms
+            .unwrap_or_else(hcore::events::now_unix_ms);
+        let elapsed = human_elapsed_ms(self.state.elapsed_ms(clock));
+        Some(format!("{} · {segment}", elapsed.trim_start()))
+    }
+
     /// Attach the shared approval queue so this view renders pending prompts and
-    /// resolves them from key events. Used by commands that gate execution.
+    /// resolves them from key events. Used by commands that gate execution. A
+    /// live view's only: [`Self::attached`] drops it.
     pub fn with_approval(mut self, center: crate::tui::approval::ApprovalCenter) -> Self {
-        self.approval = Some(center);
+        if let Role::Live { approval } = &mut self.role {
+            *approval = Some(center);
+        }
         self
     }
 
     /// Body rows for the active approval prompt, or empty when idle. The banner
     /// carries the keys; when the target declares notices, each notice's file
     /// path is shown as an "open in editor" link below it, and `enter` toggles an
-    /// inline (scrollable) preview of the contents.
+    /// inline (scrollable) preview of the contents. An attached view draws the
+    /// run's recorded prompt through the same banner, without keys or preview.
     fn approval_lines(&self) -> Vec<Line<'static>> {
-        let Some(view) = self.approval.as_ref().and_then(|c| c.current()) else {
+        let center = match &self.role {
+            Role::Live { approval } => approval.as_ref(),
+            Role::Attached { feed, .. } => {
+                let Some(prompt) = feed.approval() else {
+                    return Vec::new();
+                };
+                return approval_banner(
+                    &prompt.addr,
+                    prompt.queued_behind,
+                    prompt
+                        .notices
+                        .iter()
+                        .map(|n| (n.name.as_str(), n.path.as_str())),
+                    None,
+                );
+            }
+        };
+        let Some(view) = center.and_then(|c| c.current()) else {
             return Vec::new();
         };
-        let mut lines = Vec::new();
-        // When more than one target is awaiting approval, show the total count so
-        // the user knows further prompts follow this one.
-        let total_pending = view.queued_behind + 1;
-        let queued = if total_pending > 1 {
-            format!(" · {total_pending} pending")
-        } else {
-            String::new()
-        };
-        // Only offer the notice-view toggle when there is a notice to view.
-        let action = if view.notices.is_empty() {
-            String::new()
-        } else if view.expanded {
-            " · enter hide".to_string()
-        } else {
-            " · enter view".to_string()
-        };
-        lines.push(Line::from(Span::styled(
-            format!(
-                "  ⚠ approval required: {}  [y] approve · [n] reject{action}{queued}",
-                view.addr
-            ),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )));
-        // Always show the notice file link(s) so the user can open the full text
-        // in an editor without expanding the inline preview.
-        for notice in &view.notices {
-            lines.push(Line::from(Span::styled(
-                format!("    → {}: {}", notice.name, notice.path),
-                Style::default().fg(Color::Cyan),
-            )));
-        }
+        let mut lines = approval_banner(
+            &view.addr,
+            u64::try_from(view.queued_behind).unwrap_or(u64::MAX),
+            view.notices
+                .iter()
+                .map(|n| (n.name.as_str(), n.path.as_str())),
+            Some(ApprovalKeys {
+                expanded: view.expanded,
+            }),
+        );
         if view.expanded {
             for notice in &view.notices {
                 lines.push(Line::from(Span::styled(
@@ -2483,9 +2597,14 @@ impl TuiProgressView {
         } else {
             (" · / search", " · esc back")
         };
+        // A viewer names the session it shows and how to leave it.
+        let attach_hint = match &self.role {
+            Role::Attached { id, .. } => format!(" · session {id} · q detach"),
+            Role::Live { .. } => String::new(),
+        };
         Line::from(Span::styled(
             format!(
-                "  ↑/↓ scroll · ←/→ pan · tab/⇧tab switch view · {scope_key}{search_hint}{back_hint}"
+                "  ↑/↓ scroll · ←/→ pan · tab/⇧tab switch view · {scope_key}{search_hint}{back_hint}{attach_hint}"
             ),
             Style::default()
                 .fg(Color::DarkGray)
@@ -2583,7 +2702,7 @@ impl TuiProgressView {
         let width = usize::from(width).max(MIN_BOX_WIDTH);
         // "╰─── " (5) + window + "─╯" (2) == width  ⇒  window = width - 7.
         let mut window = width.saturating_sub(7);
-        let label = self.model.label();
+        let label = self.label();
         let label_len = label.chars().count();
 
         // When the body overflows the viewport, show a scroll position indicator
@@ -2639,9 +2758,16 @@ impl TUIAppView for TuiProgressView {
     }
 
     fn quit_while_running(&mut self) {
-        if let Some(f) = &self.on_quit {
-            f();
+        match &self.role {
+            Role::Attached { detach, .. } => detach(),
+            // A run of this process: `q` does nothing, Ctrl-C cancels.
+            Role::Live { .. } => {}
         }
+    }
+
+    fn pending_approval(&self) -> Option<crate::tui::session::ApprovalPrompt> {
+        self.approval_center()
+            .and_then(crate::tui::approval::ApprovalCenter::prompt)
     }
 
     fn rows(&self, term_height: u16) -> u16 {
@@ -2718,22 +2844,26 @@ impl TUIAppView for TuiProgressView {
         self.search_query.borrow_mut().clear();
     }
 
+    // The approval keys act on the run: inert in an attached view, which has
+    // no queue (its prompt is drawn from the feed).
     fn approval_active(&self) -> bool {
-        self.approval.as_ref().is_some_and(|c| c.is_active())
+        self.approval_center().is_some_and(|c| c.is_active())
     }
 
     fn approval_respond(&mut self, approve: bool) {
-        if let Some(center) = self.approval.as_ref() {
-            center.respond(approve);
-        }
+        let Some(center) = self.approval_center() else {
+            return;
+        };
+        center.respond(approve);
         // A resolved prompt shrinks the body; reset scroll so the live rows show.
         self.scroll.set(0);
     }
 
     fn approval_toggle_notice(&mut self) {
-        if let Some(center) = self.approval.as_ref() {
-            center.toggle_expanded();
-        }
+        let Some(center) = self.approval_center() else {
+            return;
+        };
+        center.toggle_expanded();
         self.scroll.set(0);
     }
 
@@ -2901,10 +3031,15 @@ impl TUIAppView for TuiProgressView {
         self.view.get() != ViewMode::Default
     }
 
-    fn set_finished(&mut self) {
+    fn set_finished(&mut self, at_ms: u64) {
         // Freeze the elapsed clock at the finish instant; the viewport keeps
-        // rendering while held but the time must stop counting.
-        self.finished_at_ms = Some(hcore::events::now_unix_ms());
+        // rendering while held but the time must stop counting. A viewer
+        // freezes it where the run's own summary did, once it was recorded.
+        let at = match &self.role {
+            Role::Attached { feed, .. } => feed.finished_at_ms().unwrap_or(at_ms),
+            Role::Live { .. } => at_ms,
+        };
+        self.finished_at_ms = Some(at);
     }
 
     /// Final report — the elapsed clock plus the header model's summary segment,
@@ -2914,19 +3049,10 @@ impl TUIAppView for TuiProgressView {
     /// when there was nothing to report (e.g. inspect/query, or a no-op gc), in
     /// which case nothing is printed.
     fn last_render(&self) {
-        let segment = self.final_summary_segment();
-        if segment.is_empty() {
-            return;
+        if let Some(line) = self.final_line() {
+            use std::io::Write;
+            drop(writeln!(std::io::stderr().lock(), "{line}"));
         }
-        // Match the live header: a held/finished run freezes the clock at the
-        // finish instant rather than the teardown wall clock.
-        let clock = self
-            .finished_at_ms
-            .unwrap_or_else(hcore::events::now_unix_ms);
-        let elapsed = human_elapsed_ms(self.state.elapsed_ms(clock));
-        let elapsed = elapsed.trim_start();
-        use std::io::Write;
-        drop(writeln!(std::io::stderr().lock(), "{elapsed} · {segment}"));
     }
 }
 
@@ -5917,7 +6043,7 @@ mod tests {
         assert!(help.contains("scroll"), "{help}");
         assert!(!help.contains("quit"), "{help}");
 
-        v.set_finished();
+        v.set_finished(0);
         let lines = v.render("⠋", 0, 80, 8);
         let help = lines.last().expect("help");
         let text: String = help.spans.iter().map(|s| s.content.as_ref()).collect();
@@ -5938,7 +6064,7 @@ mod tests {
         assert_ne!(h(&v, 5_000), h(&v, 9_000));
 
         // Frozen: after finish the header is identical regardless of `now_ms`.
-        v.set_finished();
+        v.set_finished(50_000);
         assert_eq!(h(&v, 100_000), h(&v, 999_000));
     }
 

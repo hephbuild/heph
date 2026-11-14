@@ -297,10 +297,18 @@ pub trait TUIAppView: Send {
         false
     }
 
-    /// Mark the run as finished so the view can surface a "done — press q to
-    /// quit" notice. Called once when the viewport is being held open. No-op by
+    /// Mark the run as finished at `at_ms`, the instant its elapsed clock
+    /// freezes at and the final summary measures against. Called when the
+    /// viewport is held open (it then surfaces a "done — press q to quit"
+    /// notice) and again at teardown, before [`Self::last_render`]. No-op by
     /// default.
-    fn set_finished(&mut self) {}
+    fn set_finished(&mut self, _at_ms: u64) {}
+
+    /// The approval prompt this view shows now, as a session records it.
+    /// `None` by default (no approval gate).
+    fn pending_approval(&self) -> Option<crate::tui::session::ApprovalPrompt> {
+        None
+    }
 
     /// After the live viewport is torn down, render a final build summary
     /// directly to the terminal (stderr) so it persists in scrollback. NOT

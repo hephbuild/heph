@@ -1,10 +1,18 @@
 //! `heph session attach`: the session's own TUI (or line output), fed from its
 //! recording instead of an engine.
 //!
-//! The backends run unchanged: the app's `run` replays each record's build
-//! event into `ctx.event_sender()` and prints its log lines through the sink,
-//! then follows until `End`. `q` and Ctrl-C detach — they end this viewer, never
-//! the session — and the viewer records no session of its own.
+//! The backends run unchanged, and the TUI is the run's own
+//! [`tui::TuiProgressView`] in its attached role: the same view, render
+//! functions and layout, with only what acts on the run left out (see
+//! `Role` in `progress.rs`). The app's `run` routes each record through
+//! [`SessionFeed::route`]: a build event goes to `ctx.event_sender()`, a log
+//! line or failure report is printed through the sink, and the run's label,
+//! approval prompt and finish instant go into the feed the view reads. What
+//! the run printed below its final summary is printed below this viewer's,
+//! once its TUI is torn down. `q` and Ctrl-C detach — they end this viewer,
+//! never the session — and the viewer records no session of its own.
+
+use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
 use futures::StreamExt as _;
@@ -13,7 +21,10 @@ use tokio::sync::mpsc;
 
 use super::show::new_view;
 use super::{SessionExit, ViewOpts, escape_text, require_known, resolve};
-use crate::tui::session::{SessionItem, SessionMeta, SessionRecordKind, SessionSource};
+use crate::tui::session::{
+    HeaderKind, HolderNames, Routed, SessionFeed, SessionId, SessionItem, SessionMeta,
+    SessionSource,
+};
 use crate::tui::{self, App, AppContext, CIAppView, LogSink};
 
 /// How the follow ended.
@@ -50,23 +61,28 @@ pub(crate) async fn attach(
         }
     });
     let (quit_tx, quit_rx) = mpsc::unbounded_channel();
+    let after = AfterTeardown::default();
     let app = AttachApp {
+        id: entry.id,
         meta,
+        holders: source.holder_names(entry.id),
+        feed: SessionFeed::default(),
+        after: after.clone(),
         stream,
         detach_rx,
         quit_tx,
         quit_rx,
     };
-    let outcome = tui::run_app(app, sink, tui::should_use_tui(no_tui), shutdown).await;
+    let outcome = tui::run_app(app, sink.clone(), tui::should_use_tui(no_tui), shutdown).await;
     sigint_task.abort();
+    // The run printed these below its final summary; the viewer's own summary
+    // was printed at its teardown, so they land in the same place.
+    sink.write_diagnostic(&after.take());
     outcome_result(entry.id, outcome?)
 }
 
 /// The command's result for how the follow ended (A14).
-pub(crate) fn outcome_result(
-    id: crate::tui::session::SessionId,
-    outcome: Outcome,
-) -> anyhow::Result<()> {
+pub(crate) fn outcome_result(id: SessionId, outcome: Outcome) -> anyhow::Result<()> {
     match outcome {
         Outcome::Detached | Outcome::Ended(Some(0)) => Ok(()),
         Outcome::Ended(Some(code)) => Err(SessionExit::mirrored(code).into()),
@@ -81,38 +97,89 @@ pub(crate) fn outcome_result(
     }
 }
 
+/// Text the run printed after its TUI was torn down, held until the viewer's
+/// own TUI is: printed above a live viewport it would land above the summary.
+#[derive(Debug, Clone, Default)]
+struct AfterTeardown(Arc<Mutex<String>>);
+
+impl AfterTeardown {
+    fn push(&self, text: &str) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push_str(text);
+    }
+
+    fn take(&self) -> String {
+        std::mem::take(&mut *self.0.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+}
+
 struct AttachApp {
+    id: SessionId,
     meta: SessionMeta,
+    /// How this viewer names a lock holder's pid; the run's view named it
+    /// from its own sessions directory the same way.
+    holders: HolderNames,
+    /// What the run's terminal showed besides build events, read by the view.
+    feed: SessionFeed,
+    after: AfterTeardown,
     stream: BoxStream<'static, anyhow::Result<SessionItem>>,
     detach_rx: mpsc::UnboundedReceiver<()>,
     quit_tx: mpsc::UnboundedSender<()>,
     quit_rx: mpsc::UnboundedReceiver<()>,
 }
 
-/// The line form: a session recorded without a TUI already logged every line a
-/// line view would print, so its log records are the whole output; one that
-/// had a TUI gets the stock line view.
+/// The line form: only selects which stock line view a session gets, and
+/// renders nothing itself. A session recorded without a TUI already logged
+/// every line a line view would print, so its log records are the whole
+/// output; one that had a TUI gets the line view of its kind.
 pub(crate) enum LineView {
     Quiet,
     Progress(Box<tui::CiProgressView>),
+    Gc(Box<tui::GcCiView>),
+}
+
+impl LineView {
+    fn as_view(&mut self) -> Option<&mut dyn CIAppView> {
+        match self {
+            Self::Quiet => None,
+            Self::Progress(v) => Some(v.as_mut()),
+            Self::Gc(v) => Some(v.as_mut()),
+        }
+    }
+
+    fn as_view_ref(&self) -> Option<&dyn CIAppView> {
+        match self {
+            Self::Quiet => None,
+            Self::Progress(v) => Some(v.as_ref()),
+            Self::Gc(v) => Some(v.as_ref()),
+        }
+    }
 }
 
 impl CIAppView for LineView {
     fn begin(&self) {
-        if let Self::Progress(v) = self {
+        if let Some(v) = self.as_view_ref() {
             v.begin();
         }
     }
 
     fn apply(&mut self, ev: &hcore::events::BuildEvent) {
-        if let Self::Progress(v) = self {
+        if let Some(v) = self.as_view() {
             v.apply(ev);
         }
     }
 
     fn finish(&self) {
-        if let Self::Progress(v) = self {
+        if let Some(v) = self.as_view_ref() {
             v.finish();
+        }
+    }
+
+    fn name_lock_holders(&mut self, names: HolderNames) {
+        if let Some(v) = self.as_view() {
+            v.name_lock_holders(names);
         }
     }
 }
@@ -125,18 +192,29 @@ impl App for AttachApp {
 
     fn tui_view(&self) -> Self::TuiView {
         let quit = self.quit_tx.clone();
-        new_view(&self.meta).with_quit(move || {
+        let mut view = new_view(&self.meta).attached(self.id, self.feed.clone(), move || {
             // The app may already be gone; then there is nothing to detach.
             let _gone = quit.send(());
-        })
+        });
+        tui::TUIAppView::name_lock_holders(&mut view, self.holders.clone());
+        view
     }
 
     fn ci_view(&self) -> Self::CiView {
-        if self.meta.interactive {
-            LineView::Progress(Box::new(tui::CiProgressView::new(self.meta.label.clone())))
-        } else {
+        let mut view = if !self.meta.interactive {
             LineView::Quiet
-        }
+        } else {
+            match self.meta.header {
+                HeaderKind::Gc => {
+                    LineView::Gc(Box::new(tui::GcCiView::new(self.meta.label.clone())))
+                }
+                HeaderKind::Build | HeaderKind::Unknown => {
+                    LineView::Progress(Box::new(tui::CiProgressView::new(self.meta.label.clone())))
+                }
+            }
+        };
+        view.name_lock_holders(self.holders.clone());
+        view
     }
 
     fn records_session(&self) -> bool {
@@ -157,20 +235,18 @@ impl App for AttachApp {
                 return Ok(Outcome::Lost);
             };
             match item? {
-                SessionItem::Record(record) => {
-                    if let (Some(tx), Some(ev)) = (&events, record.build_event()) {
-                        // The renderer is gone only when the backend is
-                        // tearing down; the next select ends the loop.
-                        drop(tx.send(ev));
-                    }
-                    if let Some(SessionRecordKind::Log { msg, .. }) = &record.session {
-                        let mut line = escape_text(msg).into_owned();
-                        if !line.ends_with('\n') {
-                            line.push('\n');
+                SessionItem::Record(record) => match self.feed.route(record) {
+                    Routed::Event(ev) => {
+                        if let Some(tx) = &events {
+                            // The renderer is gone only when the backend is
+                            // tearing down; the next select ends the loop.
+                            drop(tx.send(ev));
                         }
-                        ctx.sink().write_diagnostic(&line);
                     }
-                }
+                    Routed::Print(text) => ctx.sink().write_diagnostic(&escape_text(&text)),
+                    Routed::AfterTeardown(text) => self.after.push(&escape_text(&text)),
+                    Routed::Nothing => {}
+                },
                 SessionItem::CaughtUp { skipped } => {
                     if skipped > 0 {
                         tracing::warn!(skipped, "some recorded lines could not be read");

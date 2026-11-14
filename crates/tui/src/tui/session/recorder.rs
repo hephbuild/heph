@@ -36,7 +36,10 @@ use hcore::events::{BuildEvent, EventReceiver, now_unix_ms};
 use tokio::sync::mpsc::error::TryRecvError;
 
 use super::cleanup::{self, Retention};
-use super::format::{SessionEnd, SessionRecord, SessionRecordKind, SessionSnapshot, files};
+use super::format::{
+    ApprovalPrompt, SessionEnd, SessionRecord, SessionRecordKind, SessionSnapshot, files,
+};
+use crate::tui::app::TUIAppView;
 use crate::tui::progress::BuildState;
 
 /// `events.ndjson` stops growing past this (A10).
@@ -225,6 +228,59 @@ impl TappedReceiver {
         if let Some(tap) = &self.tap {
             tap.event(ev);
         }
+    }
+}
+
+/// What the run's view showed besides build events and log lines, recorded
+/// when it changes so `heph session attach` draws it too: the label and the
+/// approval prompt, then the teardown instant. The interactive backend reads
+/// the view once per tick; a record goes out only on a change.
+#[derive(Debug)]
+pub(crate) struct ViewTap {
+    tap: SessionTap,
+    /// The label last recorded (`meta.json` holds the first).
+    label: String,
+    approval: Option<ApprovalPrompt>,
+}
+
+impl ViewTap {
+    pub(crate) fn new(tap: SessionTap, view: &impl TUIAppView) -> Self {
+        Self {
+            tap,
+            label: view.session_header().label,
+            approval: None,
+        }
+    }
+
+    /// Record the label or approval prompt if either changed.
+    pub(crate) fn observe(&mut self, view: &impl TUIAppView) {
+        let label = view.session_header().label;
+        if label != self.label {
+            self.tap.view(
+                now_unix_ms(),
+                SessionRecordKind::Label {
+                    label: label.clone(),
+                },
+            );
+            self.label = label;
+        }
+        let approval = view.pending_approval();
+        if approval != self.approval {
+            self.tap.view(
+                now_unix_ms(),
+                SessionRecordKind::Approval {
+                    prompt: approval.clone().map(Box::new),
+                },
+            );
+            self.approval = approval;
+        }
+    }
+
+    /// The TUI was torn down, its summary measured at `at_ms`: record what
+    /// changed since the last tick, then `Finished`.
+    pub(crate) fn finished(&mut self, view: &impl TUIAppView, at_ms: u64) {
+        self.observe(view);
+        self.tap.view(at_ms, SessionRecordKind::Finished);
     }
 }
 
