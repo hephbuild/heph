@@ -529,8 +529,9 @@ impl Engine {
     }
 
     /// Override `cache.db`'s maintenance knobs: the end-of-request reclaim
-    /// policy (interval, floor, cap, chunk size), so a test does not wait an
-    /// hour.
+    /// policy (interval, floor, cap, chunk size) and the free space the
+    /// `heph tool gc` conversion check sees, so a test neither waits an hour
+    /// nor fills a disk.
     pub fn set_cache_db_maintenance(
         &self,
         overrides: crate::engine::local_cache_sqlite::MaintenanceOverrides,

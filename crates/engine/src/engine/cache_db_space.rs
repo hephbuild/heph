@@ -5,21 +5,25 @@
 //! never shrinks the file on its own. One measured cache was a 21 GB file
 //! holding 11.6 GiB of live data.
 //!
-//! Everything here runs on the cache's single writer connection (the writer
-//! thread, `local_cache_sqlite::writer_loop`), so it never races a cache write:
+//! Three pieces, all run on the cache's single writer connection (the writer
+//! thread, `local_cache_sqlite::writer_loop`), so they never race a cache write:
 //!
 //! - A database created by this binary has `auto_vacuum = INCREMENTAL` (set by
 //!   `migrate_schema`). On such a database the end of a request that trimmed
 //!   something runs [`MaintainKind::AfterTrim`]: when the [`ReclaimPolicy`] says
 //!   it is due, `PRAGMA incremental_vacuum` in bounded chunks, queued cache
 //!   writes committed between chunks, then `wal_checkpoint(TRUNCATE)`.
+//! - `heph tool gc` runs [`MaintainKind::Gc`]: it converts a `NONE` database
+//!   (`auto_vacuum = INCREMENTAL` + `VACUUM`) when the disk has room for the
+//!   copies `VACUUM` makes, and vacuums an `INCREMENTAL` one fully.
 //! - Every outcome is a [`CompactReport`] with the file's [`CacheDbSpace`]
-//!   before and after.
+//!   before and after, which `heph tool gc` prints.
 //!
 //! Nothing here reaches a hash or a cache key: it moves pages, never rows.
 
 use anyhow::{Context as _, Result};
 use rusqlite::{Connection, TransactionBehavior};
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -54,6 +58,9 @@ const WRITER_BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 /// still on an older snapshot. It runs in the exit drain; a checkpoint that
 /// cannot finish is retried by the next one.
 const AFTER_TRIM_CHECKPOINT_BUSY: Duration = Duration::from_secs(1);
+/// Headroom `heph tool gc` keeps on top of what a conversion `VACUUM` writes:
+/// this, or a tenth of it, whichever is larger.
+const CONVERT_MARGIN_MIN_BYTES: u64 = 256 * MIB;
 
 /// The database's `PRAGMA auto_vacuum`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -105,6 +112,14 @@ impl CacheDbSpace {
     }
 }
 
+/// A filesystem short of the space a conversion needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpaceShortfall {
+    pub dir: PathBuf,
+    pub needed_bytes: u64,
+    pub available_bytes: u64,
+}
+
 /// What a maintenance pass did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompactAction {
@@ -115,6 +130,14 @@ pub enum CompactAction {
     /// boundary (time budget, cancellation, the cache closing) with free pages
     /// left.
     Vacuumed { freed_bytes: u64, complete: bool },
+    /// A `NONE` database was switched to `INCREMENTAL` by a full `VACUUM`.
+    Converted { freed_bytes: u64 },
+    /// A `NONE` database was left as is: the copies `VACUUM` writes would not
+    /// fit.
+    SkippedNeedsSpace { short: Vec<SpaceShortfall> },
+    /// A `NONE` database was left as is: another process holds the migration
+    /// lock, i.e. is migrating or converting the same database.
+    SkippedLocked,
 }
 
 /// One maintenance pass: the file before and after, and what was done.
@@ -186,6 +209,15 @@ pub(crate) enum MaintainKind {
     /// End of request, after the history trim: vacuum an `INCREMENTAL`
     /// database if `policy` says it is due, within `policy.budget`.
     AfterTrim(ReclaimPolicy),
+    /// `heph tool gc`: convert a `NONE` database (when `may_convert`, i.e. the
+    /// caller holds the migration lock, and the disk has room), or vacuum an
+    /// `INCREMENTAL` one completely.
+    Gc {
+        may_convert: bool,
+        chunk_bytes: u64,
+        /// Test hook: the free bytes every filesystem reports.
+        free_space_override: Option<u64>,
+    },
 }
 
 /// The file recording the last successful vacuum, as unix seconds.
@@ -353,6 +385,38 @@ pub(crate) fn run(
                 complete,
             }
         }
+        MaintainKind::Gc {
+            may_convert,
+            chunk_bytes,
+            free_space_override,
+        } => match before.mode {
+            VacuumMode::Incremental => {
+                let complete = incremental(conn, *chunk_bytes, keep_going, between)?;
+                checkpoint_truncate(conn, WRITER_BUSY_TIMEOUT)?;
+                if complete {
+                    record_vacuum(db_path, SystemTime::now())?;
+                }
+                CompactAction::Vacuumed {
+                    freed_bytes: 0,
+                    complete,
+                }
+            }
+            VacuumMode::None | VacuumMode::Full if !may_convert => CompactAction::SkippedLocked,
+            VacuumMode::None | VacuumMode::Full => {
+                let short = convert_shortfall(db_path, before.live_bytes, *free_space_override)?;
+                if !short.is_empty() {
+                    return Ok(CompactReport {
+                        before,
+                        after: before,
+                        action: CompactAction::SkippedNeedsSpace { short },
+                    });
+                }
+                convert(conn)?;
+                checkpoint_truncate(conn, WRITER_BUSY_TIMEOUT)?;
+                record_vacuum(db_path, SystemTime::now())?;
+                CompactAction::Converted { freed_bytes: 0 }
+            }
+        },
     };
     let after = space(conn, db_path)?;
     let freed = before
@@ -364,6 +428,7 @@ pub(crate) fn run(
             freed_bytes: freed,
             complete,
         },
+        CompactAction::Converted { .. } => CompactAction::Converted { freed_bytes: freed },
         other => other,
     };
     Ok(CompactReport {
@@ -371,6 +436,105 @@ pub(crate) fn run(
         after,
         action,
     })
+}
+
+/// Switch the database to `INCREMENTAL` with a full `VACUUM`.
+///
+/// `VACUUM` builds the new database as a temporary file, so the connection's
+/// `temp_store = MEMORY` would put the whole database in RAM; it is switched to
+/// `FILE` for the statement and back afterwards, whether it succeeded or not.
+fn convert(conn: &Connection) -> Result<()> {
+    conn.execute_batch("PRAGMA temp_store = FILE;")
+        .context("switching temp_store to FILE for VACUUM")?;
+    let res = conn
+        .execute_batch("PRAGMA auto_vacuum = INCREMENTAL; VACUUM;")
+        .context("converting cache.db to auto_vacuum = INCREMENTAL (VACUUM)");
+    conn.execute_batch("PRAGMA temp_store = MEMORY;")
+        .context("restoring temp_store = MEMORY after VACUUM")?;
+    res
+}
+
+/// `bytes` plus the conversion headroom.
+fn with_margin(bytes: u64) -> u64 {
+    bytes.saturating_add(CONVERT_MARGIN_MIN_BYTES.max(bytes / 10))
+}
+
+/// The directory sqlite puts its temporary files in, resolved as its unix VFS
+/// does (`unixTempFileDir`): `SQLITE_TMPDIR`, `TMPDIR`, then `/var/tmp`,
+/// `/usr/tmp`, `/tmp`, the first that is a writable directory.
+fn sqlite_temp_dir() -> Option<PathBuf> {
+    let env = ["SQLITE_TMPDIR", "TMPDIR"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .map(PathBuf::from);
+    let fixed = ["/var/tmp", "/usr/tmp", "/tmp"]
+        .into_iter()
+        .map(PathBuf::from);
+    env.chain(fixed).find(|d| {
+        d.is_dir()
+            && rustix::fs::access(
+                d,
+                rustix::fs::Access::WRITE_OK | rustix::fs::Access::EXEC_OK,
+            )
+            .is_ok()
+    })
+}
+
+fn available_bytes(dir: &Path, override_bytes: Option<u64>) -> Result<u64> {
+    if let Some(b) = override_bytes {
+        return Ok(b);
+    }
+    let st = rustix::fs::statvfs(dir).with_context(|| format!("statvfs {dir:?}"))?;
+    Ok(st.f_bavail.saturating_mul(st.f_frsize))
+}
+
+/// The filesystems a conversion `VACUUM` of `live_bytes` would run out of
+/// space on; empty when it fits.
+///
+/// `VACUUM` writes the database twice: a temporary copy in sqlite's temp
+/// directory, then (in WAL mode) every page again into the `-wal` next to the
+/// database, which the closing checkpoint folds back. The old file is only
+/// shrunk at the end, so neither write can reuse its space.
+fn convert_shortfall(
+    db_path: &Path,
+    live_bytes: u64,
+    free_space_override: Option<u64>,
+) -> Result<Vec<SpaceShortfall>> {
+    let cache_dir = db_path
+        .parent()
+        .with_context(|| format!("{db_path:?} has no parent directory"))?
+        .to_path_buf();
+    let cache_dev = std::fs::metadata(&cache_dir)
+        .with_context(|| format!("stat {cache_dir:?}"))?
+        .dev();
+    let temp_dir = sqlite_temp_dir();
+    let temp_dev = temp_dir
+        .as_deref()
+        .and_then(|d| std::fs::metadata(d).ok())
+        .map(|m| m.dev());
+
+    let mut needs: Vec<(PathBuf, u64)> = Vec::with_capacity(2);
+    match (temp_dir, temp_dev) {
+        (Some(t), Some(dev)) if dev != cache_dev => {
+            needs.push((cache_dir, with_margin(live_bytes)));
+            needs.push((t, with_margin(live_bytes)));
+        }
+        // Same filesystem (or none sqlite would use, in which case VACUUM fails
+        // on its own and says so): both copies land on the cache's.
+        _ => needs.push((cache_dir, with_margin(live_bytes.saturating_mul(2)))),
+    }
+    let mut short = Vec::new();
+    for (dir, needed) in needs {
+        let available = available_bytes(&dir, free_space_override)?;
+        if available < needed {
+            short.push(SpaceShortfall {
+                dir,
+                needed_bytes: needed,
+                available_bytes: available,
+            });
+        }
+    }
+    Ok(short)
 }
 
 #[cfg(test)]
@@ -424,6 +588,14 @@ mod tests {
         assert_eq!(last_vacuum(&db), Some(at));
         std::fs::write(sidecar_path(&db), b"garbage")?;
         assert_eq!(last_vacuum(&db), None);
+        Ok(())
+    }
+
+    #[test]
+    fn statvfs_reports_free_space_for_a_real_directory() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        assert!(available_bytes(dir.path(), None)? > 0);
+        assert_eq!(available_bytes(dir.path(), Some(7))?, 7);
         Ok(())
     }
 }

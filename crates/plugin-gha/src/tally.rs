@@ -520,7 +520,9 @@ impl Tally {
 
             // Emitted only by `heph tool gc` / `clean`, which this hook does not
             // report on — those commands have their own output.
-            BuildEventKind::GcTargetSwept { .. } | BuildEventKind::GcFailureLogsSwept { .. } => {}
+            BuildEventKind::GcTargetSwept { .. }
+            | BuildEventKind::GcFailureLogsSwept { .. }
+            | BuildEventKind::GcCacheDb { .. } => {}
 
             // The command prints its own "incomplete selection" block; the
             // job summary does not render it yet.

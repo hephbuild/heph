@@ -458,8 +458,9 @@ pub struct LocalCacheSQLite {
     inline_threshold: usize,
     #[cfg(any(test, feature = "test-support"))]
     gate: Arc<WriterGate>,
-    /// Test overrides of the maintenance knobs, so a test does not wait out
-    /// the reclaim interval. See [`Self::set_maintenance_overrides`].
+    /// Test overrides of the maintenance knobs, so a test neither waits out
+    /// the reclaim interval nor fills a disk. See
+    /// [`Self::set_maintenance_overrides`].
     #[cfg(any(test, feature = "test-support"))]
     overrides: Mutex<MaintenanceOverrides>,
 }
@@ -468,8 +469,11 @@ pub struct LocalCacheSQLite {
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct MaintenanceOverrides {
-    /// Replaces [`ReclaimPolicy::default`] for the end-of-request reclaim.
+    /// Replaces [`ReclaimPolicy::default`] for the end-of-request reclaim, and
+    /// its chunk size for `heph tool gc`.
     pub policy: Option<ReclaimPolicy>,
+    /// The free bytes every filesystem reports to the conversion space check.
+    pub free_space: Option<u64>,
 }
 
 impl LocalCacheSQLite {
@@ -478,15 +482,15 @@ impl LocalCacheSQLite {
         *self.overrides.lock().expect("overrides poisoned") = o;
     }
 
-    fn maintenance_overrides(&self) -> ReclaimPolicy {
+    fn maintenance_overrides(&self) -> (ReclaimPolicy, Option<u64>) {
         #[cfg(any(test, feature = "test-support"))]
         {
             let o = *self.overrides.lock().expect("overrides poisoned");
-            o.policy.unwrap_or_default()
+            (o.policy.unwrap_or_default(), o.free_space)
         }
         #[cfg(not(any(test, feature = "test-support")))]
         {
-            ReclaimPolicy::default()
+            (ReclaimPolicy::default(), None)
         }
     }
 
@@ -516,12 +520,53 @@ impl LocalCacheSQLite {
     /// `INCREMENTAL` database if [`ReclaimPolicy::due`], within its time
     /// budget. See [`cache_db_space`].
     pub(crate) fn reclaim_after_trim(&self) -> Result<CompactReport> {
+        let (policy, _) = self.maintenance_overrides();
         self.maintain(
-            MaintainKind::AfterTrim(self.maintenance_overrides()),
+            MaintainKind::AfterTrim(policy),
             Box::new(|| true),
             #[cfg(test)]
             None,
         )
+    }
+
+    /// `heph tool gc`'s pass: convert a `NONE` database if the disk has room,
+    /// or vacuum an `INCREMENTAL` one completely. `keep_going` is polled
+    /// between chunks of an incremental vacuum.
+    ///
+    /// A conversion runs under the schema migration lock: changing
+    /// `auto_vacuum` is a change to the file's persistent settings, which is
+    /// what that lock serializes, and it keeps two `heph tool gc` from both
+    /// rewriting the file. A lock another process holds past the usual wait
+    /// skips the conversion (and still vacuums, if the database is already
+    /// `INCREMENTAL`) rather than failing the sweep.
+    pub(crate) fn compact_for_gc(
+        &self,
+        keep_going: Box<dyn Fn() -> bool + Send>,
+    ) -> Result<CompactReport> {
+        self.ensure_schema()?;
+        let (policy, free_space_override) = self.maintenance_overrides();
+        let lock = match hwalk::migrate_lock::lock_migration(
+            &self.db_path,
+            hwalk::migrate_lock::MIGRATE_LOCK_TIMEOUT,
+        ) {
+            Ok(lock) => Some(lock),
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "cache.db conversion skipped");
+                None
+            }
+        };
+        let report = self.maintain(
+            MaintainKind::Gc {
+                may_convert: lock.is_some(),
+                chunk_bytes: policy.chunk_bytes,
+                free_space_override,
+            },
+            keep_going,
+            #[cfg(test)]
+            None,
+        );
+        drop(lock);
+        report
     }
 
     /// Resolve once every write queued before the call has committed.
@@ -3011,6 +3056,7 @@ mod tests {
         let cache = open(path)?;
         cache.set_maintenance_overrides(MaintenanceOverrides {
             policy: Some(policy),
+            free_space: None,
         });
         Ok(cache)
     }

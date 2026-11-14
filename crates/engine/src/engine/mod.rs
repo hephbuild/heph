@@ -55,7 +55,9 @@ mod local_cache_fs;
 mod local_cache_mem;
 mod local_cache_spill;
 mod local_cache_sqlite;
-pub use cache_db_space::{CacheDbSpace, CompactAction, CompactReport, ReclaimPolicy, VacuumMode};
+pub use cache_db_space::{
+    CacheDbSpace, CompactAction, CompactReport, ReclaimPolicy, SpaceShortfall, VacuumMode,
+};
 #[cfg(any(test, feature = "test-support"))]
 pub use local_cache_sqlite::MaintenanceOverrides;
 mod cache_db_space;

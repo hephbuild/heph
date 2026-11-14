@@ -22,8 +22,9 @@
 //! same manifest.
 
 use crate::engine::Engine;
-use crate::engine::cache_db_space::CompactAction;
+use crate::engine::cache_db_space::{CompactAction, CompactReport};
 use crate::engine::error::TargetNotFoundError;
+use crate::engine::event::BuildEventKind;
 use crate::engine::local_cache::{Existence, MANIFEST_V1};
 use crate::engine::request_state::RequestState;
 use crate::engine::result_lock::TargetGuard;
@@ -154,6 +155,10 @@ pub struct GcStats {
     /// (`<home>/sandbox/<pkg>/__invoke/<name>/<random>` whose `.owner` lock
     /// was free).
     pub invoke_sandboxes_removed: usize,
+    /// The sweep's last step, over `cache.db` itself: converting a database
+    /// with `auto_vacuum = NONE` or vacuuming an `INCREMENTAL` one. `None` when
+    /// the pass failed (logged, never fatal).
+    pub cache_db: Option<CompactReport>,
 }
 
 /// Per-target result of a GC pass, accumulated into [`GcStats`].
@@ -668,6 +673,39 @@ impl Engine {
             hcore::blocking::run(move || crate::engine::invoke_sandbox::sweep_all(&sandbox_root))
                 .await;
 
+        // Last, so the pages every deletion above freed are returned too.
+        // Never fatal: the sweep's work is done whether the file shrinks or not.
+        let engine = Arc::clone(&self);
+        let ctoken = rs.ctoken().clone();
+        let compacted = hcore::blocking::run(move || {
+            engine
+                .sqlite_writes
+                .compact_for_gc(Box::new(move || !ctoken.is_cancelled()))
+        })
+        .await;
+        match compacted {
+            Ok(report) => {
+                rs.emit(cache_db_event(&report));
+                stats.cache_db = Some(report);
+            }
+            Err(e) => {
+                let detail = format!("{e:#}");
+                tracing::warn!(error = %detail, "cache.db vacuum failed");
+                rs.emit(BuildEventKind::GcCacheDb {
+                    file_bytes: 0,
+                    wal_bytes: 0,
+                    live_bytes: 0,
+                    free_bytes: 0,
+                    mode: String::new(),
+                    action: "failed".to_string(),
+                    freed_bytes: 0,
+                    needed_bytes: 0,
+                    available_bytes: 0,
+                    detail: Some(detail),
+                });
+            }
+        }
+
         Ok(stats)
     }
 
@@ -915,6 +953,69 @@ impl Engine {
                 stats.errored += 1;
             }
         }
+    }
+}
+
+/// The `GcCacheDb` event for `report`: the file as the pass left it, and what
+/// the pass did.
+fn cache_db_event(report: &CompactReport) -> BuildEventKind {
+    let s = &report.after;
+    let (action, freed_bytes, needed_bytes, available_bytes, detail) = match &report.action {
+        CompactAction::Unchanged => ("unchanged", 0, 0, 0, None),
+        CompactAction::Vacuumed {
+            freed_bytes,
+            complete,
+        } => (
+            "vacuumed",
+            *freed_bytes,
+            0,
+            0,
+            (!complete).then(|| "stopped early; the next gc continues".to_string()),
+        ),
+        CompactAction::Converted { freed_bytes } => ("converted", *freed_bytes, 0, 0, None),
+        CompactAction::SkippedLocked => (
+            "skipped",
+            0,
+            0,
+            0,
+            Some("another heph holds the cache's migration lock".to_string()),
+        ),
+        CompactAction::SkippedNeedsSpace { short } => {
+            let worst = short
+                .iter()
+                .max_by_key(|s| s.needed_bytes.saturating_sub(s.available_bytes));
+            let detail = short
+                .iter()
+                .map(|s| {
+                    format!(
+                        "needs {} free in {}, has {}",
+                        hcore::units::human_bytes(s.needed_bytes),
+                        s.dir.display(),
+                        hcore::units::human_bytes(s.available_bytes),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            (
+                "skipped",
+                0,
+                worst.map_or(0, |s| s.needed_bytes),
+                worst.map_or(0, |s| s.available_bytes),
+                Some(detail),
+            )
+        }
+    };
+    BuildEventKind::GcCacheDb {
+        file_bytes: s.file_bytes,
+        wal_bytes: s.wal_bytes,
+        live_bytes: s.live_bytes,
+        free_bytes: s.free_bytes,
+        mode: s.mode.as_str().to_string(),
+        action: action.to_string(),
+        freed_bytes,
+        needed_bytes,
+        available_bytes,
+        detail,
     }
 }
 
@@ -2201,5 +2302,188 @@ mod tests {
         assert_eq!((out.removed, out.kept), (2, 1));
         assert!(present(&engine, &a, "h3"), "newest kept");
         assert!(!present(&engine, &a, "h1"));
+    }
+
+    // --- cache.db conversion and vacuum -----------------------------------
+
+    use crate::engine::{MaintenanceOverrides, VacuumMode};
+
+    fn db_pragma(path: &std::path::Path, name: &str) -> i64 {
+        rusqlite::Connection::open(path)
+            .expect("open cache.db")
+            .query_row(&format!("PRAGMA {name}"), [], |r| r.get(0))
+            .expect("read pragma")
+    }
+
+    /// The database's size on disk, main file plus WAL.
+    fn db_bytes(path: &std::path::Path) -> u64 {
+        let mut wal = path.as_os_str().to_owned();
+        wal.push("-wal");
+        std::fs::metadata(path).map_or(0, |m| m.len())
+            + std::fs::metadata(&wal).map_or(0, |m| m.len())
+    }
+
+    /// An engine over a `cache.db` written by hand before it opens: schema
+    /// version 1, `auto_vacuum` as `mode` (`NONE` is every database from before
+    /// the switch), and ~1.3 MiB of rows inserted then deleted, so its pages
+    /// are free. `free_space` overrides what the conversion's space check sees.
+    fn engine_over_db(
+        mode: &str,
+        free_space: Option<u64>,
+    ) -> (Arc<Engine>, tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = Config {
+            parallelism: None,
+            ..Config::for_tests(dir.path())
+        };
+        let db = cfg.home_dir.join("cache").join("cache.db");
+        std::fs::create_dir_all(db.parent().expect("parent")).expect("cache dir");
+        let conn = rusqlite::Connection::open(&db).expect("create cache.db");
+        conn.execute_batch(&format!(
+            "PRAGMA page_size = 8192;
+             PRAGMA auto_vacuum = {mode};
+             PRAGMA journal_mode = WAL;
+             CREATE TABLE artifacts (
+                 addr   TEXT NOT NULL,
+                 hashin TEXT NOT NULL,
+                 name   TEXT NOT NULL,
+                 data   BLOB NOT NULL,
+                 PRIMARY KEY (addr, hashin, name)
+             );
+             CREATE INDEX idx_artifacts_addr_hashin ON artifacts (addr, hashin);
+             PRAGMA user_version = 1;"
+        ))
+        .expect("schema");
+        let blob = vec![0x5a_u8; 32 * 1024];
+        for i in 0..40 {
+            conn.execute(
+                "INSERT INTO artifacts (addr, hashin, name, data) VALUES ('//bulk:x', 'h', ?1, ?2)",
+                rusqlite::params![format!("b{i}"), blob],
+            )
+            .expect("insert");
+        }
+        conn.execute("DELETE FROM artifacts", []).expect("delete");
+        drop(conn);
+        assert!(db_pragma(&db, "freelist_count") >= 160, "pages left free");
+
+        let _rt = crate::engine::test_rt_enter();
+        let engine = Arc::new(Engine::new(cfg).expect("engine"));
+        assert_eq!(engine.cache_db_path(), db);
+        engine.set_cache_db_maintenance(MaintenanceOverrides {
+            policy: None,
+            free_space,
+        });
+        (engine, dir, db)
+    }
+
+    /// `heph tool gc` converts a `NONE` database to `INCREMENTAL` when the disk
+    /// has room: the file shrinks to its live pages, and what gc kept (a
+    /// revision being read) reads back.
+    #[tokio::test]
+    async fn gc_all_converts_a_none_database() {
+        let (engine, _dir, db) = engine_over_db("NONE", Some(u64::MAX));
+        assert_eq!(db_pragma(&db, "auto_vacuum"), 0);
+        let a = addr("ghost");
+        write_revision(&engine, &a, "read", 100, &["o.tar"]);
+        let riding = engine
+            .result_lock()
+            .read(&a, "read", &StdCancellationToken::new())
+            .await
+            .expect("read");
+        let before = db_bytes(&db);
+
+        let stats = Arc::clone(&engine)
+            .gc_all(engine.new_state())
+            .await
+            .expect("gc_all");
+
+        let report = stats.cache_db.expect("cache.db pass reported");
+        assert_eq!(report.before.mode, VacuumMode::None);
+        assert_eq!(report.after.mode, VacuumMode::Incremental);
+        assert!(
+            matches!(report.action, CompactAction::Converted { freed_bytes } if freed_bytes > 0),
+            "{report:?}"
+        );
+        assert_eq!(report.after.free_bytes, 0, "{report:?}");
+        assert_eq!(db_pragma(&db, "auto_vacuum"), 2, "INCREMENTAL on disk");
+        let after = db_bytes(&db);
+        assert!(after < before, "file shrank: {before} → {after}");
+        assert!(present(&engine, &a, "read"), "the kept revision survives");
+        let mut data = Vec::new();
+        std::io::Read::read_to_end(
+            &mut engine
+                .local_cache
+                .reader(&a, "read", "o.tar")
+                .expect("reader")
+                .reader,
+            &mut data,
+        )
+        .expect("read artifact");
+        assert_eq!(data, b"data");
+        drop(riding);
+    }
+
+    /// Without room for the copies `VACUUM` writes, the conversion is skipped
+    /// — the database stays `NONE` — and the event says how much it needs.
+    #[tokio::test]
+    async fn gc_all_skips_the_conversion_without_space() {
+        let (engine, _dir, db) = engine_over_db("NONE", Some(0));
+        let stats = Arc::clone(&engine)
+            .gc_all(engine.new_state())
+            .await
+            .expect("gc_all, even without space");
+
+        let report = stats.cache_db.expect("cache.db pass reported");
+        let CompactAction::SkippedNeedsSpace { short } = &report.action else {
+            panic!("expected SkippedNeedsSpace: {report:?}");
+        };
+        assert!(!short.is_empty());
+        assert!(
+            short
+                .iter()
+                .all(|s| s.needed_bytes > report.before.live_bytes && s.available_bytes == 0),
+            "{short:?}"
+        );
+        assert_eq!(db_pragma(&db, "auto_vacuum"), 0, "still NONE");
+        assert_eq!(report.after, report.before, "nothing changed");
+
+        let BuildEventKind::GcCacheDb {
+            action,
+            needed_bytes,
+            available_bytes,
+            detail,
+            ..
+        } = cache_db_event(&report)
+        else {
+            panic!("a GcCacheDb event");
+        };
+        assert_eq!(action, "skipped");
+        assert!(needed_bytes > 0 && available_bytes == 0);
+        assert!(detail.is_some_and(|d| d.contains("needs")));
+    }
+
+    /// An `INCREMENTAL` database is vacuumed completely: no free page is left.
+    #[tokio::test]
+    async fn gc_all_vacuums_an_incremental_database() {
+        let (engine, _dir, db) = engine_over_db("INCREMENTAL", Some(0));
+        assert_eq!(db_pragma(&db, "auto_vacuum"), 2);
+        let before = db_bytes(&db);
+
+        let stats = Arc::clone(&engine)
+            .gc_all(engine.new_state())
+            .await
+            .expect("gc_all");
+
+        let report = stats.cache_db.expect("cache.db pass reported");
+        assert!(
+            matches!(
+                report.action,
+                CompactAction::Vacuumed { complete: true, freed_bytes } if freed_bytes > 0
+            ),
+            "{report:?}"
+        );
+        assert_eq!(report.after.free_bytes, 0);
+        assert_eq!(db_pragma(&db, "freelist_count"), 0);
+        assert!(db_bytes(&db) < before);
     }
 }
