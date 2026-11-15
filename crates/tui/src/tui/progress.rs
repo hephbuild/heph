@@ -727,6 +727,9 @@ pub struct BuildState {
     matched_cached: usize,
     completed: usize,
     errored: usize,
+    /// Targets a stop ended (`ResultEnd.cancelled`): not `errored`, not
+    /// `completed`.
+    cancelled: usize,
     /// Failed targets in failure order, each with its error message (if the
     /// `ResultEnd` carried one). Drives the [`ViewMode::Failed`] body.
     failed: Vec<(String, Option<String>)>,
@@ -973,6 +976,11 @@ impl BuildState {
         )
     }
 
+    /// Something failed, or a stop ended a target: the finished line's `✗`.
+    pub fn unsuccessful(&self) -> bool {
+        self.errored > 0 || self.cancelled > 0
+    }
+
     /// How to name the session behind a lock holder's pid. See
     /// [`HolderNames`].
     pub fn name_lock_holders(&mut self, names: HolderNames) {
@@ -1110,12 +1118,15 @@ impl BuildState {
                 upstream_of,
                 exit_status,
                 timed_out,
+                cancelled,
                 ..
             } => {
                 // A root failure — one no dependency caused — takes the
-                // spotlight until a newer one does. Collateral ones never do.
+                // spotlight until a newer one does. Collateral ones never do,
+                // nor a stop: Ctrl-C is not a failure to explain.
                 if let Some(err) = error
                     && upstream_of.is_none()
+                    && !cancelled
                     && self
                         .spot
                         .root_failure
@@ -1134,7 +1145,11 @@ impl BuildState {
                     });
                 }
                 if self.in_flight_results.remove(addr) {
-                    if let Some(err) = error {
+                    if error.is_some() && *cancelled {
+                        // Stopped, not failed: in neither count, and not
+                        // a row of the Failed tab.
+                        self.cancelled += 1;
+                    } else if let Some(err) = error {
                         self.errored += 1;
                         if upstream_of.is_none() {
                             self.root_failed += 1;
@@ -1803,6 +1818,7 @@ impl BuildState {
         self.matched_seen
             || self.completed > 0
             || self.errored > 0
+            || self.cancelled > 0
             || !self.in_flight_results.is_empty()
             || self.cache.consulted() > 0
     }
@@ -2664,7 +2680,11 @@ impl TuiProgressView {
             .finished_at_ms
             .unwrap_or_else(hcore::events::now_unix_ms);
         let elapsed = human_elapsed_ms(self.state.elapsed_ms(clock));
-        let mark = if self.state.errored > 0 { "✗" } else { "✓" };
+        let mark = if self.state.unsuccessful() {
+            "✗"
+        } else {
+            "✓"
+        };
         Some(format!("{mark} {} · {segment}", elapsed.trim_start()))
     }
 
@@ -2744,7 +2764,7 @@ impl TuiProgressView {
         ));
         let status = match self.finished_at_ms {
             Some(_) => line::Status::Finished {
-                failed: self.state.errored > 0,
+                failed: self.state.unsuccessful(),
             },
             None => line::Status::Running(spinner),
         };
@@ -3883,6 +3903,7 @@ mod tests {
     }
     fn result_end(addr: &str, error: Option<String>) -> BuildEventKind {
         BuildEventKind::ResultEnd {
+            cancelled: false,
             addr: addr.into(),
             error,
             upstream_of: None,

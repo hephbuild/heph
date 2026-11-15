@@ -918,6 +918,7 @@ mod tests {
             t.apply(&ev(
                 1_000,
                 BuildEventKind::ResultEnd {
+                    cancelled: false,
                     timed_out: None,
                     addr: format!("//root{i}:broken"),
                     error: Some("target failed".into()),
@@ -931,6 +932,7 @@ mod tests {
             t.apply(&ev(
                 2_000,
                 BuildEventKind::ResultEnd {
+                    cancelled: false,
                     timed_out: None,
                     addr: format!("//services/api:t{i}"),
                     error: Some("dependency failed".into()),
@@ -1029,6 +1031,7 @@ mod tests {
             t.apply(&ev(
                 1_000,
                 BuildEventKind::ResultEnd {
+                    cancelled: false,
                     timed_out: None,
                     addr: format!("//pkg{i}:broken"),
                     error: Some(format!("execute failed: {huge}")),
@@ -1062,6 +1065,7 @@ mod tests {
         t.apply(&ev(
             1_000,
             BuildEventKind::ResultEnd {
+                cancelled: false,
                 timed_out: None,
                 addr: "//a:x".into(),
                 // `format!("{e:#}")` puts the whole chain on ONE line, so a line
@@ -1083,6 +1087,7 @@ mod tests {
         t.apply(&ev(
             1_000,
             BuildEventKind::ResultEnd {
+                cancelled: false,
                 timed_out: None,
                 addr: format!("//パッケージ:{}", "名前".repeat(200)),
                 error: Some("エラー".repeat(500)),
@@ -1124,6 +1129,7 @@ mod tests {
             t.apply(&ev(
                 2,
                 BuildEventKind::ResultEnd {
+                    cancelled: false,
                     timed_out: None,
                     addr: format!("//pkg:t{i}"),
                     error: None,
@@ -1179,6 +1185,7 @@ mod tests {
         t.apply(&ev(
             252_000,
             BuildEventKind::ResultEnd {
+                cancelled: false,
                 timed_out: None,
                 addr: "//a:slow".into(),
                 error: None,
@@ -1237,6 +1244,7 @@ mod tests {
         t.apply(&ev(
             5,
             BuildEventKind::ResultEnd {
+                cancelled: false,
                 timed_out: None,
                 addr: "//a:x".into(),
                 error: None,
@@ -1413,6 +1421,7 @@ mod tests {
             t.apply(&ev(
                 1_000,
                 BuildEventKind::ResultEnd {
+                    cancelled: false,
                     timed_out: None,
                     addr: format!("//root{i}:broken"),
                     error: Some("target failed".into()),
@@ -1554,6 +1563,7 @@ mod tests {
             t.apply(&ev(
                 2,
                 BuildEventKind::ResultEnd {
+                    cancelled: false,
                     timed_out: None,
                     addr: format!("//pkg{}:t{i}", i % 50),
                     error: None,

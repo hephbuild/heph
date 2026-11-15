@@ -567,6 +567,7 @@ mod tests {
         c.observe_event(&BuildEventKind::LocalCacheMiss { addr: addr() });
         // Unrelated events must not move any counter.
         c.observe_event(&BuildEventKind::ResultEnd {
+            cancelled: false,
             addr: addr(),
             error: None,
             upstream_of: None,

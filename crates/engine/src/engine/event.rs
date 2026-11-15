@@ -49,6 +49,13 @@ pub struct ErrorDetail {
     /// [`TimedOutError`](crate::engine::run_timeout::TimedOutError) on the
     /// chain).
     pub timed_out: Option<hcore::events::TimedOutData>,
+    /// A [`CancelledError`](hplugin::error::CancelledError) is on the chain.
+    /// Not the whole answer to "was this a stop": a driver may report one as
+    /// a bare `cancelled` of its own, which only the request's token tells
+    /// apart ([`RequestState::end_is_cancelled`]).
+    ///
+    /// [`RequestState::end_is_cancelled`]: crate::engine::request_state::RequestState::end_is_cancelled
+    pub cancelled: bool,
 }
 
 impl ErrorDetail {
@@ -63,6 +70,7 @@ impl ErrorDetail {
             // Not `{e:#}`: a failure's artifacts ride the chain as an
             // empty-`Display` frame, which that would render as `: :`.
             message: hcore::hmemoizer::chain_message(e),
+            cancelled: hplugin::error::is_cancelled(e),
             ..Self::default()
         };
         for cause in e.chain() {

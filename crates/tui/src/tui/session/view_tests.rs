@@ -61,6 +61,7 @@ fn ev(at: u64, kind: BuildEventKind) -> BuildEvent {
 
 fn result_end(addr: &str, error: Option<&str>) -> BuildEventKind {
     BuildEventKind::ResultEnd {
+        cancelled: false,
         addr: addr.into(),
         error: error.map(Into::into),
         upstream_of: None,

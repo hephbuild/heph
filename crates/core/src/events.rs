@@ -324,6 +324,13 @@ pub enum BuildEventKind {
         /// reading `error`. `None` from a host that predates timeouts.
         #[serde(default)]
         timed_out: Option<TimedOutData>,
+        /// Set when `error` is a stop, not a failure: the request was
+        /// cancelled (Ctrl-C) while this target ran, or it failed only
+        /// because a cancelled one did. A consumer counts it in neither the
+        /// failed nor the roots. Absent (false) from a host that predates it,
+        /// which reported a stop as a root failure.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        cancelled: bool,
     },
     ExecuteStart {
         addr: String,
@@ -1011,6 +1018,7 @@ pub mod test_support {
             exit_status: None,
             log_tail: None,
             timed_out: None,
+            cancelled: false,
         };
         vec![
             // Local hit.
@@ -1162,8 +1170,10 @@ mod tests {
                 exit_status,
                 log_tail,
                 timed_out,
+                cancelled,
             } => {
                 assert_eq!(addr, "//a:x");
+                assert!(!cancelled, "an older host's stop reads as a failure");
                 assert_eq!(error.as_deref(), Some("boom"));
                 assert_eq!(upstream_of, None);
                 assert_eq!(exit_status, None);
@@ -1744,9 +1754,12 @@ mod tests {
                     timeout_ms: 600_000,
                     abandoned: true,
                 }),
+                cancelled: false,
             },
         };
         let json = serde_json::to_string(&ev).expect("encode");
+        // False is the default an older reader assumes: never written.
+        assert!(!json.contains("cancelled"), "{json}");
         let back: BuildEvent = serde_json::from_str(&json).expect("decode");
         match back.kind {
             BuildEventKind::ResultEnd {

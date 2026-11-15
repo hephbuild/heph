@@ -2964,9 +2964,12 @@ impl Engine {
             // belong.
             move |error| match error {
                 Some(d) => {
+                    let cancelled = end_rs.end_is_cancelled(&addr_str, &d);
                     // The final report's `took down:` row reads the same
                     // `upstream_of` the event carries.
-                    if let Some(root) = &d.upstream_of {
+                    if let Some(root) = &d.upstream_of
+                        && !cancelled
+                    {
                         end_rs.record_took_down(root, &addr_str);
                     }
                     crate::engine::event::BuildEventKind::ResultEnd {
@@ -2980,9 +2983,11 @@ impl Engine {
                             interactive,
                         ),
                         timed_out: d.timed_out,
+                        cancelled,
                     }
                 }
                 None => crate::engine::event::BuildEventKind::ResultEnd {
+                    cancelled: false,
                     addr: addr_str,
                     error: None,
                     upstream_of: None,

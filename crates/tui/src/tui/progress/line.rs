@@ -660,6 +660,7 @@ mod tests {
         v.apply(&at(
             10,
             BuildEventKind::ResultEnd {
+                cancelled: false,
                 addr: "//p:fail".into(),
                 error: Some(format!("exec failed\n{SANDBOX}/run.sh: exit status: 101")),
                 upstream_of: None,
@@ -719,6 +720,7 @@ mod tests {
         const HOME: &str = "/home/u/.heph";
         let fail =
             |addr: &str, error: String, upstream_of: Option<&str>| BuildEventKind::ResultEnd {
+                cancelled: false,
                 addr: addr.into(),
                 error: Some(error),
                 upstream_of: upstream_of.map(str::to_owned),
@@ -763,5 +765,88 @@ mod tests {
             last.contains("3 failed (1 root, 2 because of it)"),
             "{last}"
         );
+    }
+
+    fn failed_end(
+        addr: &str,
+        upstream_of: Option<&str>,
+        cancelled: bool,
+    ) -> hcore::events::BuildEventKind {
+        hcore::events::BuildEventKind::ResultEnd {
+            addr: addr.into(),
+            error: Some(if cancelled { "cancelled" } else { "boom" }.into()),
+            upstream_of: upstream_of.map(str::to_owned),
+            exit_status: (!cancelled && upstream_of.is_none()).then(|| "exit status: 1".into()),
+            log_tail: None,
+            timed_out: None,
+            cancelled,
+        }
+    }
+
+    fn all_text(lines: &[Line<'_>]) -> String {
+        lines.iter().map(text).collect()
+    }
+
+    /// Root and upstream failures during the build stay on the one row: the
+    /// failed count and the spotlight update, nothing else is drawn, and the
+    /// blocks wait for the report.
+    #[test]
+    fn failure_prints_nothing_until_report() {
+        use crate::tui::app::TUIAppView;
+        use crate::tui::progress::TuiProgressView;
+        use crate::tui::progress::test_events::{T0, at, start};
+
+        let mut v = TuiProgressView::new("Running //...");
+        for a in ["//p:root", "//p:down1", "//p:down2", "//p:other"] {
+            v.apply(&at(0, start(a)));
+        }
+        v.apply(&at(10, failed_end("//p:root", None, false)));
+        v.apply(&at(11, failed_end("//p:down1", Some("//p:root"), false)));
+        v.apply(&at(12, failed_end("//p:down2", Some("//p:root"), false)));
+        assert_eq!(v.rows(40), 1);
+        let lines = v.render("⠋", T0 + 1_000, 200, 40);
+        assert_eq!(lines.len(), 1, "one row while failures arrive");
+        let t = all_text(&lines);
+        assert!(t.contains("3 failed"), "{t}");
+        assert!(t.contains("✗ //p:root exit 1"), "{t}");
+        assert!(!t.contains("dependency"), "no block mid-build: {t}");
+    }
+
+    /// A stop is not a failure: after Ctrl-C the cancelled ends count in
+    /// neither the failed nor the roots, never take the spotlight, and the
+    /// finished line still reads ✗.
+    #[test]
+    fn a_stop_is_not_a_root_failure() {
+        use crate::tui::app::TUIAppView;
+        use crate::tui::progress::TuiProgressView;
+        use crate::tui::progress::test_events::{T0, at, start};
+
+        let mut v = TuiProgressView::new("Running //...");
+        for a in ["//p:root", "//p:down", "//p:stopped", "//p:behind"] {
+            v.apply(&at(0, start(a)));
+        }
+        v.apply(&at(10, failed_end("//p:root", None, false)));
+        v.apply(&at(11, failed_end("//p:down", Some("//p:root"), false)));
+        v.apply(&at(20, failed_end("//p:stopped", None, true)));
+        v.apply(&at(21, failed_end("//p:behind", Some("//p:stopped"), true)));
+        let t = all_text(&v.render("⠋", T0 + 1_000, 200, 40));
+        assert!(t.contains("2 failed"), "{t}");
+        assert!(t.contains("✗ //p:root"), "the stop never takes it: {t}");
+        v.set_finished(T0 + 2_000);
+        let last = v.final_line().expect("a summary");
+        assert!(
+            last.contains("2 failed (1 root, 1 because of it)"),
+            "{last}"
+        );
+
+        // Only stops: no failure to split, but not a success either.
+        let mut v = TuiProgressView::new("Running //...");
+        v.apply(&at(0, start("//p:stopped")));
+        v.apply(&at(20, failed_end("//p:stopped", None, true)));
+        v.set_finished(T0 + 2_000);
+        let last = v.final_line().expect("a summary");
+        assert!(last.starts_with("✗ "), "{last}");
+        assert!(last.contains("0 failed"), "{last}");
+        assert!(!last.contains("root"), "{last}");
     }
 }

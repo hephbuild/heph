@@ -70,6 +70,7 @@ fn events() -> Vec<BuildEvent> {
         ev(
             5,
             BuildEventKind::ResultEnd {
+                cancelled: false,
                 addr: "//a:bad".into(),
                 error: Some("boom".into()),
                 upstream_of: None,
@@ -86,6 +87,7 @@ fn big_event() -> BuildEvent {
     BuildEvent {
         at_unix_ms: 1,
         kind: BuildEventKind::ResultEnd {
+            cancelled: false,
             addr: "//a:big".into(),
             error: Some("x".repeat(1024 * 1024)),
             upstream_of: None,

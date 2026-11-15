@@ -431,6 +431,10 @@ pub struct RequestStateData {
     /// the targets whose `ResultEnd` named it as `upstream_of`. Read by the
     /// interactive failure report's `took down:` row.
     took_down: Mutex<FxHashMap<String, TookDown>>,
+    /// The targets whose failing `ResultEnd` was a stop, not a failure
+    /// ([`RequestState::end_is_cancelled`]), by formatted addr: roots and
+    /// what they took down. The report leaves them out.
+    cancelled: Mutex<FxHashSet<String>>,
     /// Decision maker for `approval`-gated targets. `None` in non-interactive
     /// contexts that never set one (gc, tests) — a target requiring approval then
     /// fails with a clear error. Shared via `Arc<RequestStateData>`, so child
@@ -984,6 +988,35 @@ impl RequestState {
             .get(root)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// Whether `addr`'s failing end, described by `d`, is a stop rather than
+    /// a failure, and remember it if so. Decided once per end, here, so the
+    /// event, the line and the report agree.
+    ///
+    /// A root is a stop when a [`CancelledError`](hplugin::error::CancelledError)
+    /// is on its chain, or when the request's token is cancelled and the run
+    /// did not time out: a driver may report a stop as a bare `cancelled` of
+    /// its own, the rule `execute` applies before filling a failure slot.
+    /// One that failed only because a dependency did is a stop when that
+    /// root was one; a root that genuinely failed before the stop keeps what
+    /// it took down. A root's end always precedes its dependents' (they end
+    /// on its result), so the set is filled before they ask.
+    pub fn end_is_cancelled(&self, addr: &str, d: &crate::engine::event::ErrorDetail) -> bool {
+        let mut set = self.data.cancelled.lock();
+        let cancelled = match &d.upstream_of {
+            Some(root) => set.contains(root),
+            None => d.cancelled || (self.ctoken().is_cancelled() && d.timed_out.is_none()),
+        };
+        if cancelled {
+            set.insert(addr.to_owned());
+        }
+        cancelled
+    }
+
+    /// Whether `addr`'s failure was a stop ([`end_is_cancelled`](Self::end_is_cancelled)).
+    pub fn was_cancelled(&self, addr: &str) -> bool {
+        self.data.cancelled.lock().contains(addr)
     }
 
     /// heph's home, while the engine is alive: what no screen or report
@@ -1552,6 +1585,7 @@ impl Engine {
             sandbox_removals: crate::engine::sandbox_cleaner::PendingCounter::default(),
             failures: Mutex::new(indexmap::IndexMap::new()),
             took_down: Mutex::new(FxHashMap::default()),
+            cancelled: Mutex::new(FxHashSet::default()),
             approval,
             hash_only,
             selection: std::sync::OnceLock::new(),
@@ -2180,6 +2214,53 @@ mod tests {
         Ok(())
     }
 
+    /// A failing end is a stop when Ctrl-C cancelled the request (a driver's
+    /// bare `cancelled` included) and it did not time out; a dependent is one
+    /// only when its root was; a root that failed before the stop keeps what
+    /// it took down.
+    #[tokio::test]
+    async fn end_is_cancelled_tells_a_stop_from_a_failure() -> anyhow::Result<()> {
+        use crate::engine::event::ErrorDetail;
+        let (_tmp, engine) = test_engine()?;
+        let rs = engine.new_state();
+        let detail = |upstream_of: Option<&str>| ErrorDetail {
+            message: "boom".into(),
+            upstream_of: upstream_of.map(str::to_owned),
+            ..ErrorDetail::default()
+        };
+
+        assert!(!rs.end_is_cancelled("//p:early", &detail(None)));
+        assert!(
+            rs.end_is_cancelled(
+                "//p:typed",
+                &ErrorDetail::from_error(&anyhow::Error::new(hplugin::error::CancelledError)),
+            ),
+            "a CancelledError is a stop whatever the token says"
+        );
+
+        engine.cancel_all_requests();
+        let timed_out = ErrorDetail {
+            timed_out: Some(hcore::events::TimedOutData {
+                timeout_ms: 1,
+                abandoned: false,
+            }),
+            ..detail(None)
+        };
+        assert!(
+            !rs.end_is_cancelled("//p:slow", &timed_out),
+            "a timeout fails"
+        );
+        assert!(rs.end_is_cancelled("//p:bare", &detail(None)));
+        assert!(rs.end_is_cancelled("//p:behind", &detail(Some("//p:bare"))));
+        assert!(
+            !rs.end_is_cancelled("//p:down", &detail(Some("//p:early"))),
+            "collateral of a real root stays collateral"
+        );
+        assert!(rs.was_cancelled("//p:bare") && rs.was_cancelled("//p:behind"));
+        assert!(!rs.was_cancelled("//p:early") && !rs.was_cancelled("//p:down"));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn fail_fast_defaults_true_overridable() -> anyhow::Result<()> {
         let (_tmp, engine) = test_engine()?;
@@ -2311,6 +2392,7 @@ mod tests {
                 addr: "//a:b".into(),
             },
             |error: Option<crate::engine::event::ErrorDetail>| BuildEventKind::ResultEnd {
+                cancelled: false,
                 addr: "//a:b".into(),
                 error: error.map(crate::engine::event::ErrorDetail::into_message),
                 upstream_of: None,
