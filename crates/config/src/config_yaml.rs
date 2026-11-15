@@ -21,9 +21,10 @@ use crate::options::Options;
 /// no such store-level cap at all.
 pub const DEFAULT_CACHE_CONCURRENCY: usize = 256;
 
-/// The `.hephconfig` file. Its [`JsonSchema`] is what the BUILD-file LSP
-/// completes, hovers and checks keys against ([`config_json_schema`]); a field's
-/// `#[schemars(description)]` replaces a doc comment written for maintainers.
+/// The `.hephconfig` file. Its [`JsonSchema`] is what `heph tool config-schema`
+/// prints for editors ([`config_json_schema`](crate::config_json_schema)); a
+/// field's `#[schemars(description)]` replaces a doc comment written for
+/// maintainers.
 #[derive(Debug, Deserialize, Default, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 #[schemars(

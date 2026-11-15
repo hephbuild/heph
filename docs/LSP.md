@@ -31,7 +31,6 @@ request ──> position.rs (UTF-16/8/32 → byte, once)
 | `position.rs` | Position encoding, converted at the request boundary and nowhere else |
 | `context.rs` | The vendored analysis's `LspContext`: load resolution, listing, evaluation for the index |
 | `diagnostics.rs` | AST checks of `target(` / `provider_state(` keyword arguments |
-| `hephconfig.rs` | `.hephconfig` documents: diagnostics, completion and hover from the config parser and schema (see below) |
 | `index.rs` | The evaluation side channel (provenance "Targets" hover, undocumented `def` signatures) and the per-document shared state |
 | `crates/vendored-starlark-lsp` | `starlark_lsp` 0.14.2's analysis modules, owned by heph; its `NOTICE` lists every divergence |
 
@@ -45,95 +44,6 @@ used. A BUILD file opened outside the repo gets the stock answers only, with
 `reason: outside_root`. The driver/provider registry is read once per server
 start; until that snapshot lands, heph answers with the stock results and
 `reason: providers_loading`.
-
-## `.hephconfig` documents
-
-The same server answers the workspace config: `.hephconfig`, the legacy
-`.hephconfig2`, and every profile laid over them (`ci.hephconfig`). The
-server picks by file name: any name ending in `.hephconfig` or `.hephconfig2`
-is served, even one the loader would never read (`old.hephconfig`).
-`hephconfig.rs` serves the document whole; the resolver, the Starlark
-analysis and the engine never see it. It works the same inside or outside the
-bound repo.
-
-### Editor wiring
-
-The editor has to send config files to `heph tool build-lsp` as well as BUILD
-files. A glob needs both `*.hephconfig` and `*.hephconfig2`: the first does
-not match the second. Neovim (0.11+):
-
-```lua
-vim.filetype.add({ pattern = { [".*%.hephconfig2?"] = "hephconfig" } })
-vim.treesitter.language.register("yaml", "hephconfig") -- YAML highlighting
-vim.lsp.config("heph", {
-  cmd = { "heph", "tool", "build-lsp" },
-  filetypes = { "bzl", "starlark", "hephconfig" },
-  root_markers = { ".hephconfig", ".hephconfig2" },
-})
-vim.lsp.enable("heph")
-```
-
-VS Code and other clients: register `heph tool build-lsp` for the documents
-matching `**/*.hephconfig` and `**/*.hephconfig2`, whatever language id they
-carry. The server routes on the URI, not the language id.
-
-Routing a file to `build-lsp` replaces a yaml-language-server for that file.
-Keep the YAML server off it: it knows no heph schema, and two servers publish
-two sets of diagnostics. The separate `hephconfig` filetype above does that
-in Neovim.
-
-### What it answers
-
-| Feature | Answer |
-|---|---|
-| Diagnostics | Every key the schema does not know, each with a did-you-mean when one is close; then the loader's own parse error (`serde_yaml` into `ConfigYaml`), at its location, unless it sits on a flagged key or names one (`unknown field`, `unknown plugin field`) |
-| Completion, key position | The keys of the enclosing mapping, minus those already written in the same mapping (two `plugins:` items are two mappings; an item with a source is offered no second one). Inserts `key: ` for a scalar and `key:` for a mapping or a list |
-| Completion, after `key: ` | The value's literals: an enum's members, `true`/`false` for a boolean or an optional boolean. The prefix filter is case-sensitive |
-| Hover | On a key or its value: the key path, its type, its doc, and its literals |
-| Definition, formatting | Nothing (`[]`, `null`) |
-
-Positions go out in the negotiated encoding, like every other answer. A
-parser location is read as line and character (after a byte-order mark), not
-as a byte offset.
-
-Two sources, each the authority on one question. **What loads** is the
-parser's: a diagnostic from it is the error `heph` would print, minus the
-`at line N column M` the range already gives. **What could go there** is the
-schema's: `hconfig::config_json_schema()`, JSON Schema derived with `schemars`
-from the parser's own types, so a field added to `ConfigYaml` completes with
-no second edit and its doc comment is its hover. The three types with a
-hand-rolled `Deserialize` (`PluginSpec`, `ResourcesConfig`, `FuseEnabled`)
-write their schema by hand in `crates/config/src/schema.rs`, next to tests
-that load every example it offers. A field whose doc comment is written for
-maintainers carries a `#[schemars(description = "…")]` for users instead.
-
-### The scanner, and what it leaves alone
-
-Where the cursor is comes from a line-based reading of YAML's block
-structure: indentation, `- ` items and `key:`, with comments and blank lines
-skipped, block scalars (`|`, `>`) read as text, and a leading byte-order mark
-skipped. It never needs the document to parse. What it cannot read for sure,
-it leaves **opaque**: no completion, no hover, and no unknown-key check
-inside it. The parser still reports what is wrong there.
-
-| Opaque | Why |
-|---|---|
-| Flow collections (`{a: 1}`, `[a]`), and quoted scalars, across lines until they close | Keys inside are not on a line of their own |
-| A key behind a tag (`!t`), an anchor (`&a`) or a `?` | Its name is not the text before `:` |
-| A tab-indented line | YAML forbids tabs there; the parser's error says so |
-| A key out of line with its siblings | Which mapping it was meant for is a guess; it is never flagged |
-
-Not checked at all, by design:
-
-| Not checked | Because |
-|---|---|
-| Keys in flow collections | Opaque, above |
-| Plugin `options:` | Open: each plugin checks its own keys at load |
-| Profile merges | They need the other files: a config whose diagnostics are clear can still fail to merge |
-
-`PluginSpec` and `ResourcesConfig` deserialize by hand, so the parser places
-their errors at the list item (`-`) or the pool's mapping, not at the key at
-fault. The unknown-key check still flags that key where it is.
 
 ## Site kinds
 
@@ -257,16 +167,6 @@ $ heph tool build-lsp --explain BUILD:12:20 --json
 ```
 
 Line and column are 1-based, the column counted in characters.
-
-On a config file it prints the config cursor instead of a site:
-
-| Field | Meaning |
-|---|---|
-| `document` | `hephconfig` |
-| `kind` | `key`, `value`, or `none` (opaque, a comment, a block scalar) |
-| `path` | The mapping a key goes in, or the key a value belongs to (`lock.backend`, `plugins[]`) |
-| `in_schema` | Whether the schema has a node at `path` |
-| `prefix` | What is typed before the cursor |
 
 ## Adding a site kind
 

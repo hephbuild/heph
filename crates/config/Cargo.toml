@@ -14,8 +14,8 @@ test-support = []
 anyhow = "1.0.102"
 hcore = { package = "core", path = "../core" }
 memoize = "0.6.0"
-# The `.hephconfig` schema the BUILD-file LSP completes, hovers and checks keys
-# from: derived from the serde types below, so it cannot drift from the parser.
+# The `.hephconfig` JSON Schema editors validate against: derived from the
+# serde types below, so it cannot drift from the parser.
 schemars = { version = "1.2.3", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"

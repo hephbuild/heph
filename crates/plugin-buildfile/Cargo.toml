@@ -35,8 +35,6 @@ starlark = "0.14.2"
 # so a bump that changes it fails there first.
 starlark_syntax = "0.14.2"
 strsim = "0.11.1"
-# `.hephconfig` diagnostics run the loader's own parse.
-serde_yaml = "0.9"
 allocative = "0.3"
 # The LSP owns its loop and vendors starlark_lsp's analysis modules
 # (`vendored-starlark-lsp`), so these pins no longer follow starlark's release
@@ -51,4 +49,5 @@ tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "macros", "sy
 
 [dev-dependencies]
 plugin-buildfile = { path = ".", features = ["test-support"] }
+serde_yaml = "0.9"
 tempfile = "3"

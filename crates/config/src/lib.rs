@@ -35,4 +35,4 @@ pub use config_yaml::*;
 pub use home_dir::{DEFAULT_HOME_DIR, HEPH_DIR_PREFIX, HomeDir, normalize};
 pub use options::{Options, decode_opt, deny_unknown};
 pub use root::{get_cwd, get_root};
-pub use schema::{config_json_schema, is_config_file_name};
+pub use schema::config_json_schema;
