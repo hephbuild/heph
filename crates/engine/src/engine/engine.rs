@@ -317,6 +317,10 @@ pub struct Engine {
     /// only — see [`crate::engine::failure_slot`].
     pub(crate) failure_slots: crate::engine::failure_slot::FailureSlots,
 
+    /// Each captured run's live log, under `<home>/runs/<id>/`. Diagnostics
+    /// only — see [`crate::engine::run_log`].
+    pub(crate) run_logs: crate::engine::run_log::RunLogs,
+
     /// Guards the execute phase so at most one execute runs per target addr at
     /// a time (cross-process with the filesystem backend, in-process with mem).
     pub(crate) result_lock: ResultLock,
@@ -950,6 +954,7 @@ impl Engine {
             plugins: HashMap::new(),
             fuse,
             failure_slots: crate::engine::failure_slot::FailureSlots::new(&home),
+            run_logs: crate::engine::run_log::RunLogs::new(&home),
             result_lock,
             scratch_lock,
             credential_cache: Default::default(),

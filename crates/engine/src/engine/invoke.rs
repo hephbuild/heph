@@ -540,6 +540,8 @@ impl Engine {
                     shell: req.shell,
                     options,
                     allotment: Some(allotment),
+                    // An entrypoint's run is never logged (R22).
+                    log: None,
                 },
             )
             .await;

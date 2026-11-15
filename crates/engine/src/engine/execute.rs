@@ -37,6 +37,9 @@ impl Engine {
         crate::engine::sandbox_cleaner::SandboxTeardown,
         Vec<hplugin::driver::SandboxGuard>,
         crate::engine::result_lock::ExecuteGuard,
+        // The live log's guard: held until the entry that replaces it is
+        // written, then dropped to unlink it.
+        Option<crate::engine::run_log::LiveGuard>,
     )> {
         let driver = self
             .drivers_by_name
@@ -147,6 +150,22 @@ impl Engine {
                 error: error.map(crate::engine::event::ErrorDetail::into_message),
             },
             async {
+                // The run's live log, created as the run starts (never on a
+                // cache hit). Not for a `--shell`, which is the user's own
+                // session (R22), nor for a credential source, whose output is
+                // material and whose log stays in its sandbox, as before.
+                // A log that cannot be created fails the run: its output
+                // would go nowhere.
+                let live = if shell || outputs_are_material {
+                    None
+                } else {
+                    let engine = Arc::clone(&self);
+                    Some(
+                        sync_fs_op_on_thread(move || engine.run_logs.create())
+                            .await
+                            .with_context(|| format!("creating the run log for {addr}"))?,
+                    )
+                };
                 let sandbox_dir = {
                     let mut dir = self.home.join("sandbox");
                     for c in addr.package.components() {
@@ -225,6 +244,7 @@ impl Engine {
                             shell,
                             options: crate::engine::driver::RunOptions::default(),
                             allotment: Some(allotment),
+                            log: live.as_ref().map(|(log, _)| Arc::clone(log)),
                         },
                     )
                     .await;
@@ -234,6 +254,17 @@ impl Engine {
                 // its tree.
                 let had_sandbox = managed && ran.is_ok();
                 let run = ran.and_then(|ran| ran.context("run"));
+                // End the live log while the sandbox still exists: an older
+                // plugin's own log is read from it.
+                let (run, live) = match live {
+                    Some((log, guard)) => {
+                        let (run, file) = self
+                            .end_run_log(addr, &log, run, self.sandbox_roots(&sandbox_dir))
+                            .await;
+                        (run, Some((log, guard, file)))
+                    }
+                    None => (run, None),
+                };
 
                 let res = match run {
                     Ok(res) => res,
@@ -319,19 +350,25 @@ impl Engine {
                             let write_back = self
                                 .materialize_codegen_on_failure(&rs, def, shell, &err)
                                 .await;
-                            let slot = self
-                                .failure_slots
-                                .fill(crate::engine::failure_slot::Fill {
-                                    addr,
-                                    hashin,
-                                    roots: self.sandbox_roots(&sandbox_dir),
-                                    err: &err,
-                                    lines: rs.log_tail_lines(),
-                                    material: outputs_are_material,
-                                    fixes: write_back.fixes,
-                                })
-                                .await
-                                .with_sandbox(fate);
+                            let fill = crate::engine::failure_slot::Fill {
+                                addr,
+                                hashin,
+                                roots: self.sandbox_roots(&sandbox_dir),
+                                err: &err,
+                                lines: rs.log_tail_lines(),
+                                material: outputs_are_material,
+                                fixes: write_back.fixes,
+                            };
+                            // A run with a live log keeps it, through the
+                            // descriptor; its guard unlinks it once the slot
+                            // is in place, at the end of this arm.
+                            let slot = match live {
+                                Some((_, _, file)) => {
+                                    self.failure_slots.fill_live(fill, file).await
+                                }
+                                None => self.failure_slots.fill(fill).await,
+                            }
+                            .with_sandbox(fate);
                             Some((slot, write_back.error))
                         };
                         // Not `complete`: a failed run handed over no bridge
@@ -373,12 +410,116 @@ impl Engine {
                 // instead. Slot guards travel with the response so result.rs
                 // can drop them before completing the teardown.
                 sandbox_teardown.set_job(res.sandbox_cleanup);
-                Ok((res.artifacts, sandbox_teardown, res.sandbox_guards))
+                let mut artifacts = res.artifacts;
+                // The live log becomes the entry's `Log` artifact, read by
+                // path while `cache_locally` packs it; the guard rides with
+                // the artifacts and unlinks it after. A `cache = false`
+                // success has no entry: its log stays readable until this
+                // heph exits.
+                let live = match live {
+                    Some((log, guard, file)) => {
+                        let written = file
+                            .as_ref()
+                            .and_then(|f| f.metadata().ok())
+                            .is_some_and(|m| m.len() > 0);
+                        if !written {
+                            Some(guard)
+                        } else if def.target.cache.enabled {
+                            // Diagnostics only: a log that cannot be named
+                            // never fails a run that passed.
+                            match live_log_artifact(log.path()) {
+                                Ok(a) => artifacts.push(a),
+                                Err(e) => tracing::warn!(addr = %addr, error = %e, "keeping the run's log"),
+                            }
+                            Some(guard)
+                        } else {
+                            guard.retain();
+                            None
+                        }
+                    }
+                    None => None,
+                };
+                Ok((artifacts, sandbox_teardown, res.sandbox_guards, live))
             },
         )
         .await;
         htelemetry::telemetry::record_execute_ms(exec_started.elapsed().as_millis() as u64);
-        res.map(|(artifacts, teardown, guards)| (artifacts, teardown, guards, execute_guard))
+        res.map(|(artifacts, teardown, guards, live)| {
+            (artifacts, teardown, guards, execute_guard, live)
+        })
+    }
+
+    /// End a run's live log, once its driver returned and while its sandbox
+    /// still exists: finalize it, fail an `Ok` run with its sticky write
+    /// error, and import the log the run returned itself, if any.
+    ///
+    /// An older plugin streams *and* returns its own log: the returned one
+    /// is complete, so it wins, imported once and scrubbed, only from a
+    /// regular file inside the sandbox or inline bytes. Every other `Log` a
+    /// run returns is dropped, so the live file is the only log that
+    /// reaches the entry or the slot. Returns the finalized file.
+    async fn end_run_log(
+        &self,
+        addr: &Addr,
+        log: &Arc<crate::engine::run_log::RunLog>,
+        run: anyhow::Result<RunResponse>,
+        roots: Vec<std::path::PathBuf>,
+    ) -> (anyhow::Result<RunResponse>, Option<std::fs::File>) {
+        use crate::engine::driver::outputartifact::Type as ArtifactType;
+        use crate::engine::run_log::{Imported, Returned};
+        let file = log.finalize();
+        let mut run = crate::engine::run_log::fail_on_write_error(log, run);
+        let returned_of = |a: &OutputArtifact| match &a.content {
+            crate::engine::driver::outputartifact::Content::File(f) => {
+                Some(Returned::File(std::path::PathBuf::from(&f.source_path)))
+            }
+            crate::engine::driver::outputartifact::Content::Raw(r) => {
+                Some(Returned::Bytes(r.data.clone()))
+            }
+            _ => None,
+        };
+        let returned = match &mut run {
+            Ok(res) => {
+                let mut first = None;
+                res.artifacts.retain(|a| {
+                    if a.r#type != ArtifactType::Log {
+                        return true;
+                    }
+                    if first.is_none() {
+                        first = Some(returned_of(a));
+                    }
+                    false
+                });
+                first.flatten()
+            }
+            Err(err) => hplugin::error::failure_log(err).and_then(returned_of),
+        };
+        let Some(mut file) = file else {
+            return (run, None);
+        };
+        let Some(source) = returned else {
+            return (run, Some(file));
+        };
+        let log = Arc::clone(log);
+        let addr = addr.format();
+        let file = hcore::blocking::run(move || {
+            match log.import(&mut file, source, &roots) {
+                Imported::Replaced => {}
+                Imported::Unavailable => tracing::warn!(
+                    addr,
+                    "log unavailable: the run returned a log heph does not read (outside its \
+                     sandbox, a symlink, or unreadable); keeping what it streamed"
+                ),
+                Imported::Failed(e) => tracing::warn!(
+                    addr,
+                    error = %e,
+                    "importing the log the run returned; the log may be incomplete"
+                ),
+            }
+            file
+        })
+        .await;
+        (run, Some(file))
     }
 
     /// The fs driver refuses a generated path naming the row's generator, but
@@ -498,6 +639,7 @@ impl Engine {
             shell,
             options,
             allotment,
+            log,
         } = run;
         // N6/N9: only an entrypoint's run is ever sent anything but the
         // default options, whichever path assembled them.
@@ -523,6 +665,13 @@ impl Engine {
             .present_credentials(rs, addr, &sandbox_dir, &credentials)
             .await
             .with_context(|| format!("credentials for {addr}"))?;
+        // The secrets the log is scrubbed of are known only once presented.
+        // Set before the run, so its first byte is scrubbed.
+        if let Some(log) = &log {
+            log.set_needles(hdriver_support::redact::Needles::new(
+                credential_mounts.iter().flat_map(|m| m.redact.iter()),
+            ));
+        }
         let exec_wrapper: InteractiveWrapper = wrapper.unwrap_or_else(|| {
             Arc::new(|inner: InteractiveInner| {
                 Box::pin(async move { inner(None, None, None, None).await })
@@ -544,10 +693,40 @@ impl Engine {
                     req.tree_root_path = engine.cfg.root.clone();
                     req.inputs = inputs;
                     req.hashin = &hashin;
+                    // A captured build run's writers are its live log, teed
+                    // into whatever sinks the wrapper handed in. Never on a
+                    // run in the caller's terminal: nothing is copied there.
+                    let (mut log_out, mut log_err) = match log.as_ref().filter(|_| !inherit) {
+                        Some(log) => (
+                            Some(crate::engine::run_log::RunLogWriter::new(
+                                Arc::clone(log),
+                                crate::engine::run_log::Stream::Stdout,
+                                stdout,
+                            )),
+                            Some(crate::engine::run_log::RunLogWriter::new(
+                                Arc::clone(log),
+                                crate::engine::run_log::Stream::Stderr,
+                                stderr,
+                            )),
+                        ),
+                        None => {
+                            if !inherit {
+                                req.stdout = stdout.map(shorten);
+                                req.stderr = stderr.map(shorten);
+                            }
+                            (None, None)
+                        }
+                    };
+                    if let (Some(out), Some(err)) = (log_out.as_mut(), log_err.as_mut()) {
+                        req.stdout = Some(out);
+                        req.stderr = Some(err);
+                        req.log_capture = true;
+                    }
                     if !inherit {
-                        req.stdin = stdin;
-                        req.stdout = stdout;
-                        req.stderr = stderr;
+                        req.stdin = stdin.map(|s| {
+                            let s: &mut (dyn tokio::io::AsyncRead + Send + Sync + Unpin) = s;
+                            s
+                        });
                         req.winsize = winsize;
                     }
                     req.scratch = scratch;
@@ -985,6 +1164,11 @@ pub(crate) struct SandboxRun {
     /// What the run is told it may use (`RunRequest.allotment`): a build's
     /// reservation, an invocation's full cpu capacity.
     pub allotment: Option<hplugin::driver::Allotment>,
+    /// The run's live log, for a captured build run: its writers go into
+    /// `RunRequest.stdout` / `stderr`, teed with the wrapper's sinks, and the
+    /// driver is told `log_capture`. `None` for an invocation, a `--shell`
+    /// and a credential source (see [`Engine::execute`]).
+    pub log: Option<Arc<crate::engine::run_log::RunLog>>,
 }
 
 /// What a managed run is admitted with on top of what it declares: one
@@ -1123,6 +1307,36 @@ pub(crate) fn execute_start(
         queued_ms: Some(queued_ms),
         admitted: Some(admitted_kind(reservation.admitted())),
     }
+}
+
+/// A sink borrowed for a shorter while: the request may also hold the run
+/// log's writers, which live only as long as the run.
+fn shorten<'s>(
+    w: &'s mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin + '_),
+) -> &'s mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin + 's) {
+    w
+}
+
+/// The `Log` artifact a successful run's live log becomes: packed into the
+/// cache entry, never passed through, and like every `Log` kept out of the
+/// output hashes.
+fn live_log_artifact(path: &std::path::Path) -> anyhow::Result<OutputArtifact> {
+    use crate::engine::driver::outputartifact::{Content, ContentFile, Type};
+    Ok(OutputArtifact {
+        group: String::new(),
+        name: "log.txt".to_owned(),
+        r#type: Type::Log,
+        content: Content::File(ContentFile {
+            source_path: path
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("the run log's path is not valid UTF-8"))?
+                .to_owned(),
+            out_path: "log.txt".to_owned(),
+            x: false,
+            passthrough: false,
+        }),
+        hashout: String::new(),
+    })
 }
 
 /// Run a synchronous `std::fs` operation through `hcore::blocking::run`.

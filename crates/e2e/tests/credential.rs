@@ -675,8 +675,13 @@ async fn credential_material_is_scrubbed_from_a_targets_output() -> anyhow::Resu
         "a token echoed by a build step must not reach the failure: {msg}"
     );
 
+    // The run's log is the engine's now: a failed run keeps it in its
+    // failure slot. A sandbox `log.txt` is a driver's own.
     let mut found = false;
-    for entry in walkdir(&ws.engine.home.join("sandbox")) {
+    let logs = ["sandbox", "failures"]
+        .into_iter()
+        .flat_map(|d| walkdir(&ws.engine.home.join(d)));
+    for entry in logs {
         if entry.file_name().is_some_and(|n| n == "log.txt") {
             let body = std::fs::read_to_string(&entry).unwrap_or_default();
             if !body.contains("using") {

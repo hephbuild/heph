@@ -4895,8 +4895,10 @@ impl Engine {
                         .with_context(|| format!("approval {addr}"))?;
                     hcore::hmemoizer::set_phase("execute_cache:engine_execute");
                     // `_execute_guard` is held to the end of this closure, past
-                    // `cache_locally`, which reads the outputs out of the sandbox.
-                    let (artifacts, sandbox_teardown, sandbox_guards, _execute_guard) = engine
+                    // `cache_locally`, which reads the outputs out of the sandbox
+                    // — and `_live_log` too, since it reads the run's live log,
+                    // which is unlinked once the entry holds it.
+                    let (artifacts, sandbox_teardown, sandbox_guards, _execute_guard, _live_log) = engine
                         .clone()
                         .execute(rs.clone(), &addr, &spec, &def, &hashin, interactive, shell, no_scratch, false)
                         .await

@@ -177,6 +177,9 @@ impl std::error::Error for FailureSlot {}
 enum LogSource {
     File(PathBuf),
     Bytes(Vec<u8>),
+    /// A run's live log, read through the descriptor its writer opened, so
+    /// it is this run's bytes whatever happens to the path.
+    Fd(std::fs::File),
 }
 
 /// One failed run, as [`FailureSlots::fill`] needs it.
@@ -291,12 +294,36 @@ impl FailureSlots {
     /// reads it back from. Never fails: whatever goes wrong is logged, and the
     /// target's own error is what surfaces.
     pub(crate) async fn fill(&self, fill: Fill<'_>) -> FailureSlot {
-        self.fill_with(fill, SlotIo::REAL).await
+        self.fill_with(fill, None, SlotIo::REAL).await
     }
 
-    /// [`fill`](Self::fill), with the file operations injected.
-    async fn fill_with(&self, fill: Fill<'_>, ops: SlotIo) -> FailureSlot {
-        let source = select_log(fill.addr, fill.err);
+    /// [`fill`](Self::fill) from the run's live log
+    /// ([`crate::engine::run_log`]), read through its open descriptor: when
+    /// the run had one, it is the log, and any `Log` the failure carries was
+    /// already imported into it or dropped. An empty live log keeps no log.
+    pub(crate) async fn fill_live(
+        &self,
+        fill: Fill<'_>,
+        live: Option<std::fs::File>,
+    ) -> FailureSlot {
+        self.fill_with(fill, Some(live), SlotIo::REAL).await
+    }
+
+    /// [`fill`](Self::fill), with the file operations injected. `live` is
+    /// `Some` for a run that had a live log, and then replaces the failure's
+    /// own `Log`.
+    async fn fill_with(
+        &self,
+        fill: Fill<'_>,
+        live: Option<Option<std::fs::File>>,
+        ops: SlotIo,
+    ) -> FailureSlot {
+        let source = match live {
+            Some(file) => file
+                .filter(|f| f.metadata().is_ok_and(|m| m.len() > 0))
+                .map(LogSource::Fd),
+            None => select_log(fill.addr, fill.err),
+        };
         let out = hplugin::error::failure_out_tar(fill.err).cloned();
         let mut fixes = fill.fixes;
         let written: Vec<String> = match &fixes {
@@ -331,7 +358,7 @@ impl FailureSlots {
                         None
                     }
                 },
-                bytes => Some(bytes),
+                other => Some(other),
             });
             let out = out.and_then(|tar| staged_out_tar(&addr, tar, &roots));
             let tail_of = |source: &LogSource| match memory_tail(source, lines) {
@@ -561,6 +588,11 @@ fn memory_tail(source: &LogSource, lines: usize) -> io::Result<LogTail> {
             let len = file.metadata()?.len();
             hplugin::error::read_tail_at(len, |buf, off| file.read_at(buf, off), lines)
         }
+        LogSource::Fd(file) => {
+            use std::os::unix::fs::FileExt as _;
+            let len = file.metadata()?.len();
+            hplugin::error::read_tail_at(len, |buf, off| file.read_at(buf, off), lines)
+        }
         LogSource::Bytes(bytes) => hplugin::error::read_tail_at(
             bytes.len() as u64,
             |buf, off| {
@@ -648,6 +680,8 @@ fn fill_slot(
                     .with_context(|| format!("copying {} to {}", from.display(), path.display()))?,
                 LogSource::Bytes(bytes) => std::fs::write(&path, bytes)
                     .with_context(|| format!("writing {}", path.display()))?,
+                LogSource::Fd(from) => copy_fd(from, &path)
+                    .with_context(|| format!("copying the live log to {}", path.display()))?,
             }
             Some(
                 std::fs::File::open(&path)
@@ -716,6 +750,20 @@ fn fill_slot(
         out_error,
         fixes: wrote_fixes.then(|| dest.join(FIXES)),
     })
+}
+
+/// Copy all of `from`, a live log's descriptor, into the new file `to`.
+/// `std::io::copy` between two files uses `copy_file_range` on Linux, which
+/// reflinks where the filesystem can.
+fn copy_fd(from: &std::fs::File, to: &Path) -> io::Result<()> {
+    use std::io::Seek as _;
+    let mut from = from;
+    from.seek(io::SeekFrom::Start(0))?;
+    let mut to = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(to)?;
+    io::copy(&mut from, &mut to).map(drop)
 }
 
 /// The manifest of the slot at `dir`, if it is complete, of a version this
@@ -1189,6 +1237,7 @@ mod tests {
                     material,
                     fixes: None,
                 },
+                None,
                 ops,
             )
             .await
@@ -1425,6 +1474,7 @@ mod tests {
                         list: None,
                     }),
                 },
+                None,
                 FAIL_UP_FRONT,
             )
             .await;
