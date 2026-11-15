@@ -1,8 +1,12 @@
-//! `heph tool config-schema` prints the `.hephconfig` JSON Schema, from
-//! anywhere: outside a workspace, and inside one whose config does not load.
+//! `heph tool config-schema` exits 0 and prints exactly
+//! `docs/hephconfig.schema.json`, outside a workspace and next to a config
+//! with a key this binary does not know.
 //!
-//! Drives the built `heph` binary, because what is under test is that the
-//! process gets past the self-upgrade's workspace check and what it prints.
+//! A cargo-built `heph` reports `DEV_VERSION`, so its self-upgrade opts out
+//! before it looks for a workspace: these tests do not reach
+//! `no_config_tolerable`, whose predicate the unit tests in `src/main.rs`
+//! cover. What they cover is the command itself: it reads no config, and its
+//! stdout is the golden schema byte for byte.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -11,8 +15,8 @@ fn heph_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_heph"))
 }
 
-/// `heph tool config-schema` run in `cwd`. The self-upgrade is left on: its
-/// refusal to run outside a workspace is part of what is tested.
+/// `heph tool config-schema` run in `cwd`, the self-upgrade left on as a user
+/// would have it.
 fn run_in(cwd: &Path) -> Output {
     let home = tempfile::tempdir().expect("home");
     Command::new(heph_bin())
@@ -56,9 +60,9 @@ fn prints_the_schema_outside_a_workspace() {
 
 #[test]
 fn prints_the_schema_without_loading_the_config() {
-    // A config with a key the parser refuses: a command that loaded it would
-    // fail, and an editor asking for the schema is often looking at exactly
-    // such a file.
+    // A config with a key this binary does not know: a command that loaded
+    // it would fail, and an editor asking for the schema is often looking at
+    // exactly such a file.
     let ws = tempfile::tempdir().expect("tempdir");
     std::fs::write(ws.path().join(".hephconfig"), "bogus: 1\n").expect("write config");
     assert_prints_the_schema(&run_in(ws.path()));

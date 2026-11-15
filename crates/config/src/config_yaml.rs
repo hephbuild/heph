@@ -90,6 +90,7 @@ pub struct ConfigYaml {
                        a `*-plugin.json` manifest. Each entry's `options:` is passed to the plugin."
     )]
     #[serde(default)]
+    #[schemars(transform = crate::schema::empty_is_null)]
     pub plugins: Vec<PluginSpec>,
     /// Byte limits of the local cache's in-memory tier. `capacityBytes: 0`
     /// disables the tier.
@@ -128,6 +129,7 @@ pub struct ConfigYaml {
                        and inherit the rest."
     )]
     #[serde(default)]
+    #[schemars(transform = crate::schema::empty_is_null)]
     pub caches: BTreeMap<String, RemoteCacheConfigPatch>,
     /// Anonymous usage telemetry; on unless `enabled: false`.
     #[serde(default)]
@@ -270,19 +272,35 @@ const POOL_VALUE_EXPECTING: &str =
 // Hand-rolled rather than `untagged`: a mapping is always the `{unit, value}`
 // form, so its own error (an unknown field, by name) reaches the user instead
 // of untagged's "matched no variant".
+//
+// What `untagged` accepted still loads: serde derive also reads a struct from a
+// sequence, so `[count, 2]` (and `[]`) is `{unit: count, value: 2}`.
 impl<'de> Deserialize<'de> for PoolValue {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         use serde::de::Error as _;
         let value = serde_yaml::Value::deserialize(d)?;
         if value.is_mapping() {
-            serde_yaml::from_value(value)
+            return serde_yaml::from_value(value)
                 .map(Self::Full)
-                .map_err(D::Error::custom)
-        } else {
-            serde_yaml::from_value(value)
+                .map_err(D::Error::custom);
+        }
+        // Which form failed says less than what was expected.
+        let expecting = |_: serde_yaml::Error| D::Error::custom(POOL_VALUE_EXPECTING);
+        match value {
+            // A `Value` reads a struct only from a mapping, so the sequence
+            // is handed to the struct as one, as `untagged` did; a third
+            // element is refused.
+            serde_yaml::Value::Sequence(items) => {
+                let seq = serde::de::value::SeqDeserializer::<_, serde_yaml::Error>::new(
+                    items.into_iter(),
+                );
+                FullDecl::deserialize(seq)
+                    .map(Self::Full)
+                    .map_err(expecting)
+            }
+            other => serde_yaml::from_value(other)
                 .map(Self::Scalar)
-                // Which scalar form failed says less than what was expected.
-                .map_err(|_scalar| D::Error::custom(POOL_VALUE_EXPECTING))
+                .map_err(expecting),
         }
     }
 }
@@ -395,7 +413,9 @@ pub struct RemoteCacheConfig {
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq, Default, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 #[schemars(
-    description = "One named remote cache. A profile may set a single field and inherit the rest."
+    description = "One named remote cache. A profile may set a single field and inherit the rest.",
+    // `remote:` with nothing after it loads as an entry that sets nothing.
+    transform = crate::schema::empty_is_null
 )]
 pub struct RemoteCacheConfigPatch {
     /// The backend, by scheme: `s3://bucket/prefix`, `gs://bucket/prefix`,
@@ -521,6 +541,7 @@ pub struct ScratchConfig {
                        in order, e.g. `[master]`. A run never writes to them."
     )]
     #[serde(default)]
+    #[schemars(transform = crate::schema::empty_is_null)]
     pub restore_scopes: Vec<String>,
     /// Copy the fallback lineage's directory into this scope on the first build
     /// after a scope change, instead of starting cold.
@@ -676,6 +697,7 @@ pub struct FsConfig {
                        directory named `.heph*` are always skipped."
     )]
     #[serde(default)]
+    #[schemars(transform = crate::schema::empty_is_null)]
     pub skip: Vec<String>,
 }
 
@@ -2066,6 +2088,16 @@ plugins:
                 Unit::Count,
                 Some(Amount(0)),
             ),
+            // `[unit, value]`: serde reads a struct from a sequence, and the
+            // `untagged` parser this replaced accepted it.
+            (
+                "resources: {gpu: [count, 2]}",
+                "gpu",
+                Unit::Count,
+                Some(Amount(2)),
+            ),
+            ("resources: {gpu: []}", "gpu", Unit::Count, None),
+            ("resources: {vram: [bytes]}", "vram", Unit::Bytes, None),
         ];
         for (yaml, pool, unit, want) in ok {
             let got = resources(yaml).unwrap_or_else(|e| panic!("{yaml}: {e:#}"));
@@ -2100,6 +2132,9 @@ plugins:
                 "rename it",
             ),
             ("resources: {sandbox: {unit: cpu}}", "rename it"),
+            ("resources: {gpu: [count, 2, 3]}", "an amount"),
+            ("resources: {gpu: [gpus, 2]}", "unknown unit"),
+            ("resources: {cpu: [count, 2]}", "builtin"),
         ];
         for (yaml, needle) in err {
             let e = resources(yaml).expect_err(yaml);

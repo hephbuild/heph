@@ -18,7 +18,6 @@
       "description": "Durable local-cache tuning. `cache: { spillThresholdBytes: N }`.",
       "properties": {
         "spillThresholdBytes": {
-          "default": null,
           "description": "Blobs strictly larger than this many bytes spill to plain files under `<home>/cache/blobs/` instead of being stored inline in the cache database. Omit for heph's default.",
           "format": "uint64",
           "minimum": 0,
@@ -66,7 +65,10 @@
           "items": {
             "type": "string"
           },
-          "type": "array"
+          "type": [
+            "array",
+            "null"
+          ]
         }
       },
       "type": "object"
@@ -224,7 +226,6 @@
       "description": "One named remote cache. A profile may set a single field and inherit the rest.",
       "properties": {
         "concurrency": {
-          "default": null,
           "description": "Max in-flight requests to this cache. Default 256.",
           "format": "uint",
           "minimum": 0,
@@ -234,7 +235,6 @@
           ]
         },
         "endpoint": {
-          "default": null,
           "description": "Base URL of an S3-compatible service to talk to instead of AWS, e.g.\n`https://<account>.r2.cloudflarestorage.com`. `s3://` caches only.",
           "type": [
             "string",
@@ -242,7 +242,6 @@
           ]
         },
         "read": {
-          "default": null,
           "description": "Consult this cache on lookups. Default `true`.",
           "type": [
             "boolean",
@@ -250,7 +249,6 @@
           ]
         },
         "region": {
-          "default": null,
           "description": "Region to sign S3 requests for. `s3://` caches only; unset leaves it to\n`AWS_REGION`, then `us-east-1`.",
           "type": [
             "string",
@@ -258,7 +256,6 @@
           ]
         },
         "uri": {
-          "default": null,
           "description": "The backend, by scheme: `s3://bucket/prefix`, `gs://bucket/prefix`,\n`memory://` or `file://`. Required once the profiles are merged.",
           "type": [
             "string",
@@ -266,7 +263,6 @@
           ]
         },
         "write": {
-          "default": null,
           "description": "Push to this cache on writes. Default `true`.",
           "type": [
             "boolean",
@@ -274,7 +270,10 @@
           ]
         }
       },
-      "type": "object"
+      "type": [
+        "object",
+        "null"
+      ]
     },
     "ResourcesConfig": {
       "additionalProperties": {
@@ -401,6 +400,37 @@
               }
             },
             "type": "object"
+          },
+          {
+            "maxItems": 2,
+            "prefixItems": [
+              {
+                "enum": [
+                  "count",
+                  "cpu",
+                  "bytes",
+                  null
+                ]
+              },
+              {
+                "anyOf": [
+                  {
+                    "anyOf": [
+                      {
+                        "$ref": "#/$defs/CpuAmount"
+                      },
+                      {
+                        "$ref": "#/$defs/ByteAmount"
+                      }
+                    ]
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            ],
+            "type": "array"
           }
         ]
       },
@@ -448,6 +478,35 @@
                 }
               },
               "type": "object"
+            },
+            {
+              "maxItems": 2,
+              "prefixItems": [
+                {
+                  "enum": [
+                    "cpu",
+                    null
+                  ]
+                },
+                {
+                  "anyOf": [
+                    {
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/CpuAmount"
+                        },
+                        {
+                          "$ref": "#/$defs/Percent"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              ],
+              "type": "array"
             }
           ],
           "description": "CPUs, or a percentage of the parallelism (`50%`)."
@@ -494,6 +553,35 @@
                 }
               },
               "type": "object"
+            },
+            {
+              "maxItems": 2,
+              "prefixItems": [
+                {
+                  "enum": [
+                    "bytes",
+                    null
+                  ]
+                },
+                {
+                  "anyOf": [
+                    {
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/ByteAmount"
+                        },
+                        {
+                          "$ref": "#/$defs/Percent"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              ],
+              "type": "array"
             }
           ],
           "description": "A size (`24G`), or a percentage of the memory this process may use (`80%`)."
@@ -540,6 +628,35 @@
                 }
               },
               "type": "object"
+            },
+            {
+              "maxItems": 2,
+              "prefixItems": [
+                {
+                  "enum": [
+                    "count",
+                    null
+                  ]
+                },
+                {
+                  "anyOf": [
+                    {
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/CountAmount"
+                        },
+                        {
+                          "$ref": "#/$defs/Percent"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              ],
+              "type": "array"
             }
           ],
           "description": "Build sandboxes on disk, live or awaiting removal: a count, or a percentage of the default."
@@ -548,7 +665,10 @@
       "propertyNames": {
         "pattern": "^[a-z][a-z0-9_]{0,63}$"
       },
-      "type": "object"
+      "type": [
+        "object",
+        "null"
+      ]
     },
     "ScratchConfig": {
       "additionalProperties": false,
@@ -560,10 +680,12 @@
           "items": {
             "type": "string"
           },
-          "type": "array"
+          "type": [
+            "array",
+            "null"
+          ]
         },
         "scope": {
-          "default": null,
           "description": "The lineage this run writes to, e.g. `${git:branch}` (heph resolves the current branch). Omitted is one lineage shared by every run.",
           "type": [
             "string",
@@ -571,7 +693,6 @@
           ]
         },
         "seedOnFork": {
-          "default": null,
           "description": "On the first build in a new `scope`, start from a copy of the lineage it restores from instead of cold. Default `true`; turn it off when a scratch cache is large and the filesystem has no reflink.",
           "type": [
             "boolean",
@@ -614,7 +735,10 @@
         "$ref": "#/$defs/RemoteCacheConfigPatch"
       },
       "description": "Named remote (shared) caches. Each entry has a `uri`, plus `read` and `write` (both default `true`). A profile may set one field of an entry and inherit the rest.",
-      "type": "object"
+      "type": [
+        "object",
+        "null"
+      ]
     },
     "fs": {
       "anyOf": [
@@ -639,7 +763,6 @@
       "description": "Sandbox FUSE overlay: `enabled: true | false | auto`. Off by default."
     },
     "homeDir": {
-      "default": null,
       "description": "The heph home (cache, sandboxes, credentials, locks, diagnostics). A relative path is under the workspace root; an absolute one is used as written. No `~` or `$VAR` expansion; `.` and `..` resolve lexically. Default `.heph`. The root itself, or anything above it, is refused.",
       "type": [
         "string",
@@ -673,7 +796,10 @@
       "items": {
         "$ref": "#/$defs/PluginSpec"
       },
-      "type": "array"
+      "type": [
+        "array",
+        "null"
+      ]
     },
     "resources": {
       "$ref": "#/$defs/ResourcesConfig",
@@ -713,7 +839,6 @@
       "description": "Byte limits of the in-memory store for uncacheable outputs; an entry that\nwould exceed `capacityBytes` spills to the durable cache."
     },
     "version": {
-      "default": null,
       "description": "The heph version this workspace expects, e.g. `v1.2.3`. When it differs from the running binary, heph downloads that release and re-execs into it. Omit to disable self-upgrade for the workspace.",
       "type": [
         "string",
@@ -721,7 +846,6 @@
       ]
     },
     "versionFlavour": {
-      "default": null,
       "description": "Release flavour to pin `version` to, e.g. `debug`. Omitted is the default build (`heph_<os>_<arch>`); a flavour downloads `heph_<flavour>_<os>_<arch>` instead.",
       "type": [
         "string",

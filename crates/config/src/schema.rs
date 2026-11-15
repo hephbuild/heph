@@ -9,6 +9,13 @@
 //! in this module check every example they offer against the real parser.
 //!
 //! The schema is advisory. The parser is the authority on what loads.
+//!
+//! The contract: the schema never rejects a config the parser loads, with one
+//! named exemption. serde_yaml reads a plain number or boolean into a string
+//! field (`version: 1`, `homeDir: 5`, `skip: [2024]`); the schema keeps
+//! `type: string` there on purpose, because a number where heph expects text
+//! is almost always a mistake (`version: 1.10` loads as `1.1`). Everywhere
+//! else the schema may be looser than the parser, never stricter.
 
 use std::borrow::Cow;
 
@@ -24,7 +31,39 @@ use crate::config_yaml::{ConfigYaml, FuseEnabled, PluginSpec, ResourcesConfig};
 /// `serde_json`'s map keeps (`preserve_order` is a feature any crate in the
 /// build can turn on).
 pub fn config_json_schema() -> serde_json::Value {
-    sorted(schemars::schema_for!(ConfigYaml).to_value())
+    let mut schema = schemars::schema_for!(ConfigYaml).to_value();
+    strip_null_defaults(&mut schema);
+    schema.sort_all_objects();
+    schema
+}
+
+/// Remove every `"default": null`. yaml-language-server inserts a key's
+/// default on completion, so `homeDir: null` would be typed for the user; a
+/// default that is not null (`telemetry.enabled: true`) stays.
+fn strip_null_defaults(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if map.get("default").is_some_and(serde_json::Value::is_null) {
+                map.remove("default");
+            }
+            map.values_mut().for_each(strip_null_defaults);
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(strip_null_defaults),
+        _ => {}
+    }
+}
+
+/// A `#[schemars(transform)]` for a collection serde_yaml also reads from an
+/// empty value: `plugins:` followed only by comments loads as no plugins, so
+/// the schema accepts `null` there too.
+pub(crate) fn empty_is_null(schema: &mut Schema) {
+    let Some(ty) = schema.get("type").and_then(serde_json::Value::as_str) else {
+        return;
+    };
+    if matches!(ty, "array" | "object") {
+        let types = serde_json::json!([ty, "null"]);
+        schema.insert("type".to_string(), types);
+    }
 }
 
 /// [`config_json_schema`] as `heph tool config-schema` prints it, and as
@@ -33,20 +72,6 @@ pub fn config_json_schema_text() -> serde_json::Result<String> {
     let mut text = serde_json::to_string_pretty(&config_json_schema())?;
     text.push('\n');
     Ok(text)
-}
-
-/// `value` with every object's keys in sorted order, at every depth.
-fn sorted(value: serde_json::Value) -> serde_json::Value {
-    use serde_json::Value;
-    match value {
-        Value::Object(map) => {
-            let mut entries: Vec<(String, Value)> = map.into_iter().collect();
-            entries.sort_by(|(a, _), (b, _)| a.cmp(b));
-            Value::Object(entries.into_iter().map(|(k, v)| (k, sorted(v))).collect())
-        }
-        Value::Array(items) => Value::Array(items.into_iter().map(sorted).collect()),
-        other => other,
-    }
 }
 
 /// Mirrors `FuseEnabled`'s `Deserialize`: a boolean, or one of its words
@@ -188,8 +213,23 @@ impl JsonSchema for Percent {
     }
 }
 
-/// Mirrors `ResourcesConfig`'s `Deserialize`: pool name to an amount, or to
-/// `{unit, value}`. The builtin pools are listed so an editor offers them.
+/// What an editor shows on hover for builtin pool `pool`.
+fn builtin_pool_description(pool: &str) -> &'static str {
+    use hcore::capacity::{CPU, MEMORY, SANDBOX};
+    match pool {
+        CPU => "CPUs, or a percentage of the parallelism (`50%`).",
+        MEMORY => "A size (`24G`), or a percentage of the memory this process may use (`80%`).",
+        SANDBOX => {
+            "Build sandboxes on disk, live or awaiting removal: a count, or a percentage of the \
+             default."
+        }
+        _ => "A builtin pool: an amount in its unit, or a percentage of its default.",
+    }
+}
+
+/// Mirrors `ResourcesConfig`'s `Deserialize`: pool name to an amount, to
+/// `{unit, value}`, or to the older `[unit, value]`. The builtin pools are
+/// listed so an editor offers them.
 ///
 /// A builtin pool's unit is fixed, and the parser checks its value while it
 /// reads the file; so does a custom pool that writes `unit:`. A custom pool
@@ -215,6 +255,19 @@ impl JsonSchema for ResourcesConfig {
         let value_description = "The pool's capacity. Omitted is unbounded; `0` is set per run \
                                  (`--resource <pool>=<n>`).";
 
+        // `[unit, value]`, each optional: what serde reads a `{unit, value}`
+        // struct from when the YAML is a sequence. Not offered, but it loads.
+        let sequence = |units: serde_json::Value, value: &serde_json::Value| {
+            serde_json::json!({
+                "type": "array",
+                "maxItems": 2,
+                "prefixItems": [
+                    { "enum": units },
+                    { "anyOf": [value, { "type": "null" }] }
+                ]
+            })
+        };
+
         // A builtin: its unit's amount or a percentage, alone or as
         // `{unit, value}` with its own unit only.
         let builtin = |unit: Unit, description: &str| {
@@ -236,7 +289,8 @@ impl JsonSchema for ResourcesConfig {
                             }
                         },
                         "additionalProperties": false
-                    }
+                    },
+                    sequence(serde_json::json!([unit.name(), null]), &value)
                 ]
             })
         };
@@ -245,6 +299,7 @@ impl JsonSchema for ResourcesConfig {
         let any_amount = serde_json::json!({ "anyOf": [cpu, bytes] });
         let mut units: Vec<serde_json::Value> = Unit::ALL.map(|u| u.name().into()).to_vec();
         units.push(serde_json::Value::Null);
+        let custom_sequence = sequence(units.clone().into(), &any_amount);
         let value_for_unit: Vec<serde_json::Value> = Unit::ALL
             .into_iter()
             .map(|unit| {
@@ -273,17 +328,26 @@ impl JsonSchema for ResourcesConfig {
                     },
                     "allOf": value_for_unit,
                     "additionalProperties": false
-                }
+                },
+                custom_sequence
             ]
         });
+        let builtins: serde_json::Map<String, serde_json::Value> = hcore::capacity::BUILTIN_POOLS
+            .into_iter()
+            .filter_map(|pool| {
+                let unit = Unit::of_builtin(pool)?;
+                Some((
+                    pool.to_string(),
+                    builtin(unit, builtin_pool_description(pool)),
+                ))
+            })
+            .collect();
         json_schema!({
             "description": "Resource pools, by name: an amount, or `{unit, value}`.",
-            "type": "object",
-            "properties": {
-                (hcore::capacity::CPU): builtin(Unit::Cpu, "CPUs, or a percentage of the parallelism (`50%`)."),
-                (hcore::capacity::MEMORY): builtin(Unit::Bytes, "A size (`24G`), or a percentage of the memory this process may use (`80%`)."),
-                (hcore::capacity::SANDBOX): builtin(Unit::Count, "Build sandboxes on disk, live or awaiting removal: a count, or a percentage of the default.")
-            },
+            // `resources:` with nothing after it (or only comments) loads as
+            // no pools.
+            "type": ["object", "null"],
+            "properties": builtins,
             "propertyNames": {
                 "pattern": format!("^[a-z][a-z0-9_]{{0,{}}}$", hcore::capacity::MAX_POOL_NAME_LEN - 1)
             },
@@ -516,8 +580,8 @@ mod tests {
         assert_eq!(units, &serde_json::json!(["count", "cpu", "bytes", null]));
     }
 
-    /// The committed copy of the schema, which is also the URL people point
-    /// their editor at.
+    /// The committed copy of the schema, so every change to it shows in
+    /// review.
     fn golden_path() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/hephconfig.schema.json")
     }
@@ -559,6 +623,11 @@ mod tests {
     /// An empty (or comment-only) document has no root node, so the editor
     /// checks nothing; it reads here as `{}`, which every schema of an
     /// all-optional object accepts.
+    ///
+    /// These tests model the editor through serde_yaml's scalar resolution,
+    /// not YAML 1.2 core's, which yaml-language-server uses: for ordinary
+    /// scalars the two agree, but an exotic one (`0b101`, `0o17`, an `!fs`
+    /// enum tag) may read as another type in the editor than here.
     fn instance(yaml: &str) -> serde_json::Value {
         let value: serde_yaml::Value = serde_yaml::from_str(yaml).expect("well-formed YAML");
         match serde_json::to_value(value).expect("YAML that JSON can hold") {
@@ -665,10 +734,21 @@ mod tests {
         "resources:\n  cpu: 8\n  memory: 24G\n  docker: 2\n  slots: {unit: cpu, value: 2}\n",
         "resources:\n  cpu: 4\n  slots: 0.5\n",
         "telemetry: ~\ncache: {spillThresholdBytes: ~}\n",
+        // A key with nothing after it but comments: serde_yaml reads the empty
+        // value as an empty sequence or map.
+        "plugins:\n  # - builtin: go\n",
+        "resources:\n  # cpu: 8\n",
+        "caches:\n",
+        "caches:\n  remote:\n",
+        "fs:\n  skip:\n",
+        "scratch:\n  restoreScopes:\n",
+        // The `[unit, value]` form the `untagged` pool parser accepted.
+        "resources: {gpu: [count, 2], vram: [bytes], cpu: [cpu, 50%], slots: []}\n",
     ];
 
     /// Every config the parser accepts, the schema accepts: an editor never
-    /// marks a config that loads.
+    /// marks a config that loads. The one exemption, a number or boolean
+    /// written into a string field, is [`STRICTER_ON_PURPOSE`]'s.
     #[test]
     fn every_config_that_parses_validates() {
         let validator = validator();
@@ -855,7 +935,8 @@ mod tests {
     }
 
     /// Where the schema is looser than the parser, on purpose: a pattern
-    /// cannot bound a number's size or a fraction's smallest step. These load
+    /// cannot bound a number's size or a fraction's smallest step, and JSON
+    /// has one `null` where YAML has `~` and an empty value. These load
     /// nowhere, and the schema lets them through.
     #[test]
     fn what_the_schema_leaves_to_the_parser() {
@@ -865,10 +946,317 @@ mod tests {
             "resources: {memory: \"99999999999999999999\"}\n",
             "resources: {memory: 99999999999T}\n",
             "resources: {sandbox: \"99999999999999999999%\"}\n",
+            // `resources:` alone loads as no pools; `~` does not, and the
+            // editor sees both as `null`.
+            "resources: ~\n",
         ] {
             let loads = serde_yaml::from_str::<ConfigYaml>(yaml).is_ok();
             assert!(!loads, "{yaml:?} loads");
             assert!(validator.is_valid(&instance(yaml)), "{yaml:?}");
         }
+    }
+
+    /// The contract's one named exemption: serde_yaml reads a plain number,
+    /// boolean or `~` into a string field, and the schema keeps
+    /// `type: string` there anyway, because a number where heph expects
+    /// text is almost always a mistake (`version: 1.10` loads as `1.1`).
+    /// The parser loads every row and the schema rejects it.
+    const STRICTER_ON_PURPOSE: &[&str] = &[
+        "version: 1\n",
+        "version: 1.10\n",
+        "homeDir: 5\n",
+        "fs:\n  skip: [2024]\n",
+        "scratch:\n  scope: true\n",
+        "caches:\n  c:\n    region: 1\n",
+        "scratch:\n  restoreScopes: [~]\n",
+    ];
+
+    #[test]
+    fn the_schema_is_stricter_on_purpose_for_strings() {
+        let validator = validator();
+        for yaml in STRICTER_ON_PURPOSE {
+            serde_yaml::from_str::<ConfigYaml>(yaml)
+                .unwrap_or_else(|e| panic!("{yaml:?} no longer loads ({e}): drop its row"));
+            assert!(
+                !validator.is_valid(&instance(yaml)),
+                "the schema now accepts {yaml:?}. Looser is allowed by the contract, so this \
+                 is not a bug: drop the row from STRICTER_ON_PURPOSE (and the exemption from \
+                 docs/CONFIG_SCHEMA.md if no row is left)"
+            );
+        }
+    }
+
+    /// One step from an object to a value inside it, with the sibling keys
+    /// (and a value for each) the object needs around that value to load.
+    #[derive(Debug, Clone, PartialEq)]
+    struct Hop {
+        step: Step,
+        siblings: Vec<(String, &'static str)>,
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    enum Step {
+        /// A listed property.
+        Key(String),
+        /// Any key of a map (`additionalProperties`), written as `x`, which
+        /// is a valid pool and cache name.
+        AnyKey,
+        /// An item of an array.
+        Item,
+    }
+
+    /// A place a value can be written, with each schema the walk found for
+    /// it (one per `anyOf` branch that reaches it).
+    #[derive(Debug)]
+    struct Position {
+        path: Vec<Hop>,
+        nodes: Vec<serde_json::Value>,
+    }
+
+    /// `node` with `$ref`s followed.
+    fn deref<'a>(
+        schema: &'a serde_json::Value,
+        node: &'a serde_json::Value,
+    ) -> &'a serde_json::Value {
+        match node["$ref"].as_str() {
+            Some(r) => deref(
+                schema,
+                schema
+                    .pointer(r.trim_start_matches('#'))
+                    .unwrap_or_else(|| panic!("{r}")),
+            ),
+            None => node,
+        }
+    }
+
+    /// The siblings `object` needs next to `key` for the entry to load: its
+    /// `required` keys, what `key` itself requires (`checksum` needs `url`),
+    /// and one of a `oneOf` of required keys (a plugin's source) unless
+    /// `key` or another sibling is one.
+    fn siblings(object: &serde_json::Value, key: &str) -> Vec<(String, &'static str)> {
+        let names = |v: &serde_json::Value| -> Vec<String> {
+            v.as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|s| s.as_str().map(str::to_string))
+                .collect()
+        };
+        let mut out: Vec<(String, &'static str)> = names(&object["required"])
+            .into_iter()
+            .filter(|r| r != key)
+            .map(|r| (r, "1"))
+            .collect();
+        out.extend(
+            names(&object["dependentRequired"][key])
+                .into_iter()
+                .map(|r| (r, "s")),
+        );
+        let one_of: Vec<String> = object["oneOf"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|alt| names(&alt["required"]))
+            .collect();
+        let covered = one_of
+            .iter()
+            .any(|k| k == key || out.iter().any(|(s, _)| s == k));
+        if let (false, Some(first)) = (covered, one_of.first()) {
+            out.push((first.clone(), "s"));
+        }
+        out
+    }
+
+    /// Every position under `node`, which sits at `path`.
+    fn walk(
+        schema: &serde_json::Value,
+        node: &serde_json::Value,
+        path: &mut Vec<Hop>,
+        out: &mut Vec<Position>,
+    ) {
+        assert!(path.len() < 10, "the walk recursed too deep at {path:?}");
+        let node = deref(schema, node);
+        for key in ["anyOf", "oneOf", "allOf"] {
+            for alt in node[key].as_array().into_iter().flatten() {
+                walk(schema, alt, path, out);
+            }
+        }
+        let mut children: Vec<(Hop, &serde_json::Value)> = Vec::new();
+        for (key, sub) in node["properties"].as_object().into_iter().flatten() {
+            let hop = Hop {
+                step: Step::Key(key.clone()),
+                siblings: siblings(node, key),
+            };
+            children.push((hop, sub));
+        }
+        for (step, sub) in [
+            (Step::AnyKey, &node["additionalProperties"]),
+            (Step::Item, &node["items"]),
+        ] {
+            if sub.is_object() {
+                let siblings = Vec::new();
+                children.push((Hop { step, siblings }, sub));
+            }
+        }
+        for (hop, sub) in children {
+            path.push(hop);
+            match out.iter_mut().find(|p| p.path == *path) {
+                Some(p) => p.nodes.push(sub.clone()),
+                None => out.push(Position {
+                    path: path.clone(),
+                    nodes: vec![sub.clone()],
+                }),
+            }
+            walk(schema, sub, path, out);
+            path.pop();
+        }
+    }
+
+    /// The YAML document that writes `sample` at `path`, block style; an
+    /// empty `sample` is a key (or `-`) with nothing after it.
+    fn document(path: &[Hop], sample: &str) -> String {
+        fn mapping(path: &[Hop], sample: &str, indent: usize, out: &mut String) {
+            let pad = " ".repeat(indent);
+            let key = match &path[0].step {
+                Step::Key(k) => k.as_str(),
+                Step::AnyKey => "x",
+                Step::Item => panic!("an item where a key belongs: {path:?}"),
+            };
+            out.push_str(&format!("{pad}{key}:"));
+            value(&path[1..], sample, indent, out);
+            for (k, v) in &path[0].siblings {
+                out.push_str(&format!("{pad}{k}: {v}\n"));
+            }
+        }
+        fn value(rest: &[Hop], sample: &str, indent: usize, out: &mut String) {
+            match rest.first().map(|h| &h.step) {
+                None if sample.is_empty() => out.push('\n'),
+                None => out.push_str(&format!(" {sample}\n")),
+                Some(Step::Item) => {
+                    out.push_str(&format!("\n{}-", " ".repeat(indent + 2)));
+                    value(&rest[1..], sample, indent + 2, out);
+                }
+                Some(_) => {
+                    out.push('\n');
+                    mapping(rest, sample, indent + 2, out);
+                }
+            }
+        }
+        let mut out = String::new();
+        mapping(path, sample, 0, &mut out);
+        out
+    }
+
+    /// Whether every schema found for a position is a plain string, `null`
+    /// aside: the field type of the named exemption.
+    fn is_plain_string(schema: &serde_json::Value, nodes: &[serde_json::Value]) -> bool {
+        nodes.iter().all(|node| {
+            let node = deref(schema, node);
+            let constrained = [
+                "enum", "const", "pattern", "format", "anyOf", "oneOf", "allOf",
+            ]
+            .iter()
+            .any(|k| node.get(*k).is_some());
+            let types: Vec<&str> = match &node["type"] {
+                serde_json::Value::String(t) => vec![t.as_str()],
+                serde_json::Value::Array(ts) => ts.iter().filter_map(|t| t.as_str()).collect(),
+                _ => Vec::new(),
+            };
+            !constrained && types.iter().filter(|t| **t != "null").eq(["string"].iter())
+        })
+    }
+
+    /// The parser's verdict, `resources:` resolved: a custom pool written
+    /// without a unit is checked only then.
+    fn parser_loads(yaml: &str) -> bool {
+        serde_yaml::from_str::<ConfigYaml>(yaml).is_ok_and(|c| c.resources.resolve().is_ok())
+    }
+
+    /// The guard that keeps the contract as fields are added: at every
+    /// position the schema describes (`$ref`s followed, into nested objects,
+    /// map values and array items), each kind of YAML value the parser loads
+    /// the schema accepts. The only exceptions are the named exemption's: a
+    /// non-string scalar at a plain string position.
+    ///
+    /// Like the other tests here, it models the editor through serde_yaml's
+    /// scalar resolution (see [`instance`]).
+    #[test]
+    fn at_every_position_what_loads_validates() {
+        const SAMPLES: &[&str] = &["1", "1.5", "\"s\"", "true", "~", "[]", "{}", ""];
+        const NON_STRING_SCALARS: &[&str] = &["1", "1.5", "true", "~", ""];
+        let schema = config_json_schema();
+        let validator = validator();
+        let mut positions = Vec::new();
+        walk(&schema, &schema, &mut Vec::new(), &mut positions);
+        // Every key at the root, both caches, every pool shape, plugins and
+        // their fields: a walker that stops following a kind of node drops
+        // well under this.
+        assert!(
+            positions.len() >= 40,
+            "the walk found only {} positions: {:#?}",
+            positions.len(),
+            positions.iter().map(|p| &p.path).collect::<Vec<_>>()
+        );
+        let (mut checked, mut exempt, mut broken) = (0, 0, Vec::new());
+        for position in &positions {
+            let string_field = is_plain_string(&schema, &position.nodes);
+            for sample in SAMPLES {
+                let yaml = document(&position.path, sample);
+                checked += 1;
+                if !parser_loads(&yaml) || validator.is_valid(&instance(&yaml)) {
+                    continue;
+                }
+                if string_field && NON_STRING_SCALARS.contains(sample) {
+                    exempt += 1;
+                } else {
+                    broken.push(yaml);
+                }
+            }
+        }
+        println!(
+            "{} positions, {checked} documents, {exempt} under the string exemption",
+            positions.len()
+        );
+        assert!(
+            broken.is_empty(),
+            "these load but the schema rejects them: {broken:#?}"
+        );
+        // The exemption is in use; if it ever is not, drop it from the docs.
+        assert!(exempt > 0, "no position used the string exemption");
+    }
+
+    /// The document writer, on each kind of step: what the walk feeds the
+    /// parser is the YAML it means.
+    #[test]
+    fn document_writes_each_kind_of_step() {
+        let key = |k: &str| Hop {
+            step: Step::Key(k.to_string()),
+            siblings: Vec::new(),
+        };
+        let any = Hop {
+            step: Step::AnyKey,
+            siblings: Vec::new(),
+        };
+        let item = Hop {
+            step: Step::Item,
+            siblings: Vec::new(),
+        };
+        let with_sibling = Hop {
+            step: Step::Key("options".to_string()),
+            siblings: vec![("builtin".to_string(), "s")],
+        };
+        assert_eq!(document(&[key("version")], "1"), "version: 1\n");
+        assert_eq!(document(&[key("caches")], ""), "caches:\n");
+        assert_eq!(
+            document(&[key("caches"), any, key("uri")], "\"s\""),
+            "caches:\n  x:\n    uri: \"s\"\n"
+        );
+        assert_eq!(
+            document(&[key("plugins"), item.clone(), with_sibling], "{}"),
+            "plugins:\n  -\n    options: {}\n    builtin: s\n"
+        );
+        assert_eq!(
+            document(&[key("fs"), key("skip"), item], "~"),
+            "fs:\n  skip:\n    - ~\n"
+        );
     }
 }

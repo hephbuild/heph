@@ -120,7 +120,13 @@ pub enum ToolCommands {
     /// For editors (map it to `.hephconfig` in yaml-language-server's
     /// `yaml.schemas`) and for CI. It comes from this binary, so a workspace
     /// that pins a version gets that version's schema; outside a workspace it
-    /// still runs. See docs/CONFIG_SCHEMA.md.
+    /// still runs.
+    ///
+    /// Stable: exit 0 and exactly one JSON document (draft 2020-12) on
+    /// stdout, which validates the config of the binary that printed it; the
+    /// parser stays the authority. Not stable: key order, `$defs` names and
+    /// layout, titles and descriptions. Treat the document as opaque and do
+    /// not `$ref` into it. See docs/CONFIG_SCHEMA.md.
     ///
     /// Example: `heph tool config-schema`
     #[command(name = "config-schema")]

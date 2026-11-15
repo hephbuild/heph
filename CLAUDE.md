@@ -269,7 +269,10 @@ removed. A site kind ships with its editor-shaped test in `tests/lsp.rs`.
 `docs/CONFIG_SCHEMA.md`. `heph tool config-schema` prints a schema derived from
 `ConfigYaml` in `crates/config/src/schema.rs`; a type with a hand-rolled
 `Deserialize` writes its schema by hand there, and `docs/hephconfig.schema.json`
-is the golden copy a test holds it to.
+is the golden copy a test holds it to. The one thing to know going in: the
+schema never rejects a config the parser loads, except a number or boolean
+written into a string field, and `at_every_position_what_loads_validates` holds
+every field, a new one included, to that.
 
 ### `heph-bench` — perf-regression harness
 
