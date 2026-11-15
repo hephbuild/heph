@@ -217,13 +217,11 @@ fn answer_inflight_request(dir: &std::path::Path, render: impl FnOnce() -> Strin
     if !request.exists() {
         return false;
     }
-    let written = (|| -> std::io::Result<()> {
-        let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
-        std::io::Write::write_all(tmp.as_file_mut(), render().as_bytes())?;
-        tmp.persist(dir.join(files::INFLIGHT_REPORT))
-            .map_err(|e| e.error)?;
-        Ok(())
-    })();
+    let written = crate::tui::session::recorder::write_bytes_atomically(
+        dir,
+        files::INFLIGHT_REPORT,
+        render().as_bytes(),
+    );
     // Removed whatever happened: a request that cannot be answered must not
     // be retried every 200ms for the rest of the run.
     if let Err(e) = std::fs::remove_file(&request) {

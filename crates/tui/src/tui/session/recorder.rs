@@ -769,8 +769,23 @@ pub(crate) fn write_atomically(
     name: &str,
     value: &impl serde::Serialize,
 ) -> io::Result<()> {
+    write_atomically_with(dir, name, |f| {
+        serde_json::to_writer(f, value).map_err(io::Error::other)
+    })
+}
+
+/// [`write_atomically`] for bytes that are not JSON (`inflight.txt`).
+pub fn write_bytes_atomically(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
+    write_atomically_with(dir, name, |f| io::Write::write_all(f, bytes))
+}
+
+fn write_atomically_with(
+    dir: &Path,
+    name: &str,
+    write: impl FnOnce(&mut std::fs::File) -> io::Result<()>,
+) -> io::Result<()> {
     let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
-    serde_json::to_writer(tmp.as_file_mut(), value).map_err(io::Error::other)?;
+    write(tmp.as_file_mut())?;
     tmp.persist(dir.join(name)).map_err(|e| e.error)?;
     Ok(())
 }
