@@ -20,7 +20,7 @@ use ratatui::{Terminal, TerminalOptions, Viewport};
 use tokio::sync::mpsc;
 
 use crate::tui::app::{App, AppContext, Control, TUIAppView};
-use crate::tui::log_sink::{LogSink, SinkLine};
+use crate::tui::log_sink::{LogSink, REPLAY_FLUSH_TIMEOUT, ReplayMark, Replayed, SinkLine};
 use crate::tui::session::recorder::ViewTap;
 use crate::tui::session::{SessionSlot, TappedReceiver};
 use crate::tui::stderr_backend::StderrBackend;
@@ -114,6 +114,54 @@ fn print_panic_report(text: &str) {
     drop(stderr.flush());
 }
 
+/// `HEPH_DEBUG_TUI_LOG=<file>`: while `<file>` exists, a thread writes one
+/// numbered heph line every 40 ms — an `INFO`, a `DEBUG` under the
+/// `heph_debug_tui_log` target, and a diagnostic, in turn — for the PTY test
+/// that checks lines written under a full screen print once each, in order,
+/// on return (`crates/bin-e2e`'s `tui_pty.rs`). In the shipped binary for the
+/// same reason as [`DebugPanic`]; unset, it costs one environment read.
+struct DebugLog {
+    stop: std::sync::Arc<AtomicBool>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl DebugLog {
+    fn from_env(sink: &LogSink) -> Option<Self> {
+        let file = std::path::PathBuf::from(std::env::var_os("HEPH_DEBUG_TUI_LOG")?);
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let thread = std::thread::Builder::new()
+            .name("heph-debug-tui-log".into())
+            .spawn({
+                let (stop, sink) = (std::sync::Arc::clone(&stop), sink.clone());
+                move || {
+                    let mut n = 0u64;
+                    while !stop.load(Ordering::Acquire) {
+                        if file.exists() {
+                            n += 1;
+                            match n % 3 {
+                                0 => sink
+                                    .write_diagnostic(&format!("heph-debug-log {n} diagnostic\n")),
+                                1 => tracing::info!("heph-debug-log {n} info"),
+                                _ => tracing::debug!(
+                                    target: "heph_debug_tui_log",
+                                    "heph-debug-log {n} debug"
+                                ),
+                            }
+                        }
+                        std::thread::sleep(Duration::from_millis(40));
+                    }
+                }
+            })
+            .ok()?;
+        Some(Self { stop, thread })
+    }
+
+    fn stop(self) {
+        self.stop.store(true, Ordering::Release);
+        drop(self.thread.join());
+    }
+}
+
 /// `HEPH_DEBUG_TUI_PANIC`: make the run panic once it ends, for the PTY tests
 /// that check the terminal comes back from a panic (`crates/bin-e2e`'s
 /// `tui_pty.rs`). Those test the shipped binary, so the knob is in it; unset,
@@ -201,6 +249,7 @@ pub async fn run<A: App + 'static>(
     terminal.autoresize()?;
     // The dashboard's screen while it is up; dropping it is the restore.
     let mut full: Option<FullScreen> = None;
+    let mut replay = Replay::default();
 
     let mut events: Option<EventStream> = Some(EventStream::new());
     let suppression = shutdown.suppression();
@@ -222,6 +271,7 @@ pub async fn run<A: App + 'static>(
     // not block this task's ticker — the renderer task is re-polled
     // on another worker and the spinner keeps ticking.
     let debug_panic = DebugPanic::from_env();
+    let debug_log = DebugLog::from_env(&sink);
     let mut app_handle = tokio::spawn(async move {
         let out = app.run(ctx).await;
         if debug_panic == Some(DebugPanic::App) {
@@ -330,7 +380,12 @@ pub async fn run<A: App + 'static>(
                             // still on: the target gets the main screen, and
                             // the next tick after the resume puts the
                             // dashboard back, since the view still has it up.
-                            full = None;
+                            // What it kept off the terminal is printed before
+                            // the target writes anything.
+                            if full.take().is_some() {
+                                replay.start(&sink);
+                            }
+                            replay.finish(&mut terminal, cols).await;
                             // Drop the EventStream *before* `clear()`. `clear()`
                             // issues a cursor DSR query (`get_cursor_position`),
                             // which reads its reply through crossterm's single
@@ -343,7 +398,7 @@ pub async fn run<A: App + 'static>(
                             // deferred like a tick-path budget would be — it's
                             // orphaned when the old `rx` is dropped. Every byte must
                             // come out now.
-                            drain_logs_to_terminal(&mut terminal, &mut rx, cols, None);
+                            drain_logs_to_terminal(&mut terminal, &mut rx, cols, None, replay.through);
                             // Collapse to the viewport origin (not `terminal.clear()`,
                             // which restores the live bottom-of-box cursor): the
                             // cooked-mode stdout write below must land at the box's
@@ -352,7 +407,7 @@ pub async fn run<A: App + 'static>(
                             collapse_inline_viewport(&mut terminal);
                             drop(terminal.show_cursor());
                             drop(disable_raw_mode());
-                            flip_sink_to_direct_draining_the_gap(&sink, &mut rx);
+                            flip_sink_to_direct_draining_the_gap(&sink, &mut rx, replay.through);
                             paused = true;
                         }
                         if ack.send(()).is_err() {
@@ -596,9 +651,24 @@ pub async fn run<A: App + 'static>(
                         // The full screen's terminal showed the cursor as it
                         // dropped; the line keeps it hidden.
                         drop(terminal.hide_cursor());
-                    } else {
+                        replay.start(&sink);
+                    } else if !replay.pending() {
+                        // Opened again before the last replay printed: it
+                        // opens once that has, so the mark below starts
+                        // after it.
+                        //
+                        // Every line queued until now is printed before the
+                        // screen goes up; from here on each is dropped as it
+                        // arrives, and the replay brings it back.
+                        let (queued, mark) = sink.replay_mark(&mut rx);
+                        for line in queued.iter().filter(|l| l.seq > replay.through) {
+                            print_log_bytes(&mut terminal, &line.bytes, cols);
+                        }
                         match FullScreen::enter() {
-                            Ok(f) => full = Some(f),
+                            Ok(f) => {
+                                full = Some(f);
+                                replay.mark = Some(mark);
+                            }
                             Err(e) => {
                                 tracing::debug!(error = %e, "full screen unavailable");
                                 view.back_to_main();
@@ -609,9 +679,9 @@ pub async fn run<A: App + 'static>(
                 spinner_idx = (spinner_idx + 1) % SPINNER_FRAMES.len();
                 let frame = SPINNER_FRAMES.get(spinner_idx).copied().unwrap_or("");
                 if let Some(f) = full.as_mut() {
-                    // heph's lines are not printed under a full screen. The
-                    // sink numbered each one as it was sent, so the numbering
-                    // stays whole for the replay on return (unit 5a part 2).
+                    // heph's lines are not printed under a full screen, nor
+                    // held: the sink numbered and recorded each one as it was
+                    // sent, and the replay reads them back on return.
                     while rx.try_recv().is_ok() {}
                     // A resize while the full screen is up re-anchors the
                     // inline rows once back on the line: `needs_resize`
@@ -650,8 +720,20 @@ pub async fn run<A: App + 'static>(
                 }
                 // Budgeted: `rx` persists across ticks (only pause/resume ever
                 // replace it), so anything left over after the budget trips just
-                // renders on the next tick — deferred, never dropped.
-                drain_logs_to_terminal(&mut terminal, &mut rx, cols, Some(LOG_DRAIN_TICK_BUDGET));
+                // renders on the next tick — deferred, never dropped. A replay
+                // still running holds live lines back, so they print after it.
+                if replay.ready() {
+                    replay.finish(&mut terminal, cols).await;
+                }
+                if !replay.pending() {
+                    drain_logs_to_terminal(
+                        &mut terminal,
+                        &mut rx,
+                        cols,
+                        Some(LOG_DRAIN_TICK_BUDGET),
+                        replay.through,
+                    );
+                }
                 let lines = view.render(frame, now_unix_ms(), cols, rows);
                 drop(terminal.draw(|f| {
                     let area = f.area();
@@ -673,16 +755,22 @@ pub async fn run<A: App + 'static>(
     //
     // Back to the main screen first (a pause already left it), so the
     // teardown and the summary below land in the scrollback.
+    if let Some(d) = debug_log {
+        d.stop();
+    }
     if full.take().is_some() {
         drop(terminal.hide_cursor());
+        replay.start(&sink);
     }
     if !paused {
+        // What the screen kept off the terminal, before the lines after it.
+        replay.finish(&mut terminal, cols).await;
         // Flush any still-buffered build-event logs into the terminal scrollback
         // *above* the viewport. This must stay on the terminal path (`insert_before`):
         // it wraps to the viewport width and skips blank lines. The post-teardown
         // `drain_logs_to_stderr` fallback writes raw bytes, so letting empties fall
         // through to it dumps stray newlines after the box.
-        drain_logs_to_terminal(&mut terminal, &mut rx, cols, None);
+        drain_logs_to_terminal(&mut terminal, &mut rx, cols, None, replay.through);
         // Collapse the viewport to its origin so the final summary (printed below)
         // lands where the box started, not below it.
         collapse_inline_viewport(&mut terminal);
@@ -695,7 +783,7 @@ pub async fn run<A: App + 'static>(
     }
     hcore::shutdown::clear_terminal_restore();
     sink.switch_to_direct();
-    drain_logs_to_stderr(&mut rx);
+    drain_logs_to_stderr(&mut rx, replay.through);
 
     // The app completing breaks the loop, but build events emitted just before
     // it returned may still be buffered (the sender closes only once the
@@ -910,34 +998,45 @@ fn collapse_inline_viewport<B: Backend>(terminal: &mut Terminal<B>) {
 /// The budget is checked between messages, never mid-message: a message already
 /// taken off the channel is always rendered in full, so a call never abandons
 /// partially-processed data.
+///
+/// A line numbered at most `through` is dropped: a replay printed it already.
 fn drain_logs_to_terminal<B: Backend>(
     terminal: &mut Terminal<B>,
     rx: &mut mpsc::UnboundedReceiver<SinkLine>,
     cols: u16,
     budget: Option<Duration>,
+    through: u64,
 ) {
-    let cols = cols.max(1);
     let deadline = budget.map(|d| Instant::now() + d);
-    while let Ok(SinkLine { bytes, .. }) = rx.try_recv() {
-        let text = bytes
-            .into_text()
-            .unwrap_or_else(|_| Text::raw(String::from_utf8_lossy(&bytes).into_owned()));
-        for line in text.lines {
-            let width = u16::try_from(line.width()).unwrap_or(u16::MAX);
-            if width == 0 {
-                continue;
-            }
-            let rows = rows_needed(width, cols);
-            drop(terminal.insert_before(rows, move |buf: &mut Buffer| {
-                let area = buf.area;
-                Paragraph::new(line)
-                    .wrap(Wrap { trim: false })
-                    .render(area, buf);
-            }));
+    while let Ok(SinkLine { seq, bytes }) = rx.try_recv() {
+        if seq > through {
+            print_log_bytes(terminal, &bytes, cols);
         }
         if deadline.is_some_and(|d| Instant::now() >= d) {
             break;
         }
+    }
+}
+
+/// One of heph's lines into the scrollback above the inline viewport,
+/// wrapped to `cols`; blank lines are skipped.
+fn print_log_bytes<B: Backend>(terminal: &mut Terminal<B>, bytes: &[u8], cols: u16) {
+    let cols = cols.max(1);
+    let text = bytes
+        .into_text()
+        .unwrap_or_else(|_| Text::raw(String::from_utf8_lossy(bytes).into_owned()));
+    for line in text.lines {
+        let width = u16::try_from(line.width()).unwrap_or(u16::MAX);
+        if width == 0 {
+            continue;
+        }
+        let rows = rows_needed(width, cols);
+        drop(terminal.insert_before(rows, move |buf: &mut Buffer| {
+            let area = buf.area;
+            Paragraph::new(line)
+                .wrap(Wrap { trim: false })
+                .render(area, buf);
+        }));
     }
 }
 
@@ -950,10 +1049,13 @@ fn rows_needed(width: u16, cols: u16) -> u16 {
     u16::try_from(rows).unwrap_or(u16::MAX).max(1)
 }
 
-fn drain_logs_to_stderr(rx: &mut mpsc::UnboundedReceiver<SinkLine>) {
+/// Like [`drain_logs_to_terminal`], raw onto stderr.
+fn drain_logs_to_stderr(rx: &mut mpsc::UnboundedReceiver<SinkLine>, through: u64) {
     let mut stderr = io::stderr().lock();
-    while let Ok(SinkLine { bytes, .. }) = rx.try_recv() {
-        drop(stderr.write_all(&bytes));
+    while let Ok(SinkLine { seq, bytes }) = rx.try_recv() {
+        if seq > through {
+            drop(stderr.write_all(&bytes));
+        }
     }
 }
 
@@ -969,9 +1071,68 @@ fn drain_logs_to_stderr(rx: &mut mpsc::UnboundedReceiver<SinkLine>) {
 fn flip_sink_to_direct_draining_the_gap(
     sink: &LogSink,
     rx: &mut mpsc::UnboundedReceiver<SinkLine>,
+    through: u64,
 ) {
     sink.switch_to_direct();
-    drain_logs_to_stderr(rx);
+    drain_logs_to_stderr(rx, through);
+}
+
+/// heph's lines a full screen kept off the terminal, printed again when it
+/// closes (I3). While a screen is up the backend holds only `mark`, never a
+/// line's text; the lines come back from the session's `events.ndjson`.
+#[derive(Default)]
+struct Replay {
+    /// Where the full screen that is up took the terminal over.
+    mark: Option<ReplayMark>,
+    /// The replay of the screen last closed, running off the render task:
+    /// it waits for the recorder's flush and reads the file.
+    running: Option<tokio::task::JoinHandle<(Vec<Vec<u8>>, Replayed)>>,
+    /// The last line a replay printed. A live line numbered at most this
+    /// was printed by it, and is dropped.
+    through: u64,
+}
+
+impl Replay {
+    /// The screen closed: replay what it kept off the terminal.
+    fn start(&mut self, sink: &LogSink) {
+        if let Some(mark) = self.mark.take() {
+            let sink = sink.clone();
+            self.running = Some(tokio::task::spawn_blocking(move || {
+                let mut lines = Vec::new();
+                let replayed = sink.replay(mark, REPLAY_FLUSH_TIMEOUT, |bytes| {
+                    lines.push(bytes.to_vec())
+                });
+                (lines, replayed)
+            }));
+        }
+    }
+
+    /// A replay is still running: live lines wait behind it, and no screen
+    /// opens until it is done.
+    fn pending(&self) -> bool {
+        self.running.is_some()
+    }
+
+    fn ready(&self) -> bool {
+        self.running.as_ref().is_some_and(|h| h.is_finished())
+    }
+
+    /// Wait for the running replay, if any, and print its lines.
+    async fn finish<B: Backend>(&mut self, terminal: &mut Terminal<B>, cols: u16) {
+        let Some(handle) = self.running.take() else {
+            return;
+        };
+        match handle.await {
+            Ok((lines, replayed)) => {
+                for bytes in &lines {
+                    print_log_bytes(terminal, bytes, cols);
+                }
+                self.through = self.through.max(replayed.through);
+            }
+            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+            Err(e) => tracing::debug!(error = %e, "log replay task"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1782,7 +1943,7 @@ mod tests {
         // fully rendered (`terminal.insert_before`, never instantaneous), so the
         // very first check is guaranteed to trip: this deterministically drains
         // exactly one message and stops, on any of the three supported targets.
-        drain_logs_to_terminal(&mut terminal, &mut rx, 80, Some(Duration::ZERO));
+        drain_logs_to_terminal(&mut terminal, &mut rx, 80, Some(Duration::ZERO), 0);
 
         let mut remaining = Vec::new();
         while let Ok(line) = rx.try_recv() {
@@ -1832,7 +1993,7 @@ mod tests {
         // each — plus one extra call to prove the channel is empty afterward,
         // not just down to one leftover message.
         for _ in 0..messages.len() {
-            drain_logs_to_terminal(&mut terminal, &mut rx, 80, Some(Duration::ZERO));
+            drain_logs_to_terminal(&mut terminal, &mut rx, 80, Some(Duration::ZERO), 0);
         }
 
         assert!(
@@ -1892,7 +2053,7 @@ mod tests {
         // Steady-state log line, drained the way the pause handler drains before
         // collapsing the viewport.
         writer.write_all(b"before pause\n").expect("write");
-        drain_logs_to_terminal(&mut terminal, &mut rx, 80, None);
+        drain_logs_to_terminal(&mut terminal, &mut rx, 80, None, 0);
         assert!(
             rx.try_recv().is_err(),
             "precondition: the steady-state drain leaves nothing behind"
@@ -1904,7 +2065,7 @@ mod tests {
         writer.write_all(b"during the gap\n").expect("write");
 
         // The fix under test: the real function `run`'s pause arm calls.
-        flip_sink_to_direct_draining_the_gap(&sink, &mut rx);
+        flip_sink_to_direct_draining_the_gap(&sink, &mut rx, 0);
 
         assert!(
             rx.try_recv().is_err(),

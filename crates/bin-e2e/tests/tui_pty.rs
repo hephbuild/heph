@@ -390,6 +390,8 @@ enum Step<'a> {
     OpenGate,
     /// Keep the rows on screen now, under this name.
     Snapshot(&'a str),
+    /// Anything else the test does between two steps.
+    Do(&'a (dyn Fn() + Sync)),
 }
 
 const TAB: &[u8] = b"\t";
@@ -453,6 +455,7 @@ impl Gated {
                 Step::Settle => std::thread::sleep(Duration::from_millis(400)),
                 Step::OpenGate => std::fs::write(&self.gate, b"").expect("open the gate"),
                 Step::Snapshot(name) => snapshots.push((*name, self.pty.rows())),
+                Step::Do(f) => f(),
             }
         }
         snapshots
@@ -592,6 +595,120 @@ fn tab_opens_and_esc_restores_scrollback() {
         contains(&out, b"\x1b[?1049l"),
         "never left with ?1049l\n{report}"
     );
+}
+
+/// The numbers of heph's debug-knob lines on screen, top to bottom.
+fn debug_log_numbers(rows: &[String]) -> Vec<u64> {
+    rows.iter()
+        .filter_map(|r| {
+            let rest = r.split("heph-debug-log ").nth(1)?;
+            rest.split_whitespace().next()?.parse().ok()
+        })
+        .collect()
+}
+
+/// I3 on the screen: heph's lines written while the dashboard is up — an
+/// `INFO`, a `DEBUG` let through by `HEPH_LOG` (the `-v` case) and a
+/// diagnostic, in turn, from a thread writing one every 40 ms from before
+/// `tab` until after `esc` — are printed on return, once each and in order,
+/// with none lost around either key. The backend drops them while the screen
+/// is up, so the only way back is the replay from `events.ndjson`. The same
+/// with `HEPH_NO_SESSION=1`, whose session directory is private.
+///
+/// Not covered here: `events.ndjson` past its cap (the binary has no knob
+/// for a small cap; `LogSink::replay` past the cap is a unit test).
+#[test]
+fn logs_while_dashboard_open_flush_in_order() {
+    let run = |name: &str, no_session: bool| {
+        let logs = tempfile::tempdir().expect("tempdir");
+        let on = logs.path().join("emit");
+        let on_str = on.to_str().expect("utf-8 path").to_owned();
+        let mut env = vec![
+            ("HEPH_DEBUG_TUI_LOG", on_str.as_str()),
+            (
+                "HEPH_LOG",
+                "info,fuser=error,object_store=warn,heph_debug_tui_log=debug",
+            ),
+        ];
+        if no_session {
+            env.push(("HEPH_NO_SESSION", "1"));
+        }
+        let mut g = Gated::start("", &env);
+        let start = || std::fs::write(&on, b"").expect("start the lines");
+        let stop = || std::fs::remove_file(&on).expect("stop the lines");
+        let shots = g.play(&[
+            Step::Until("the line", on_line),
+            // Room for every line the run prints, so the screen holds them all.
+            Step::Resize(100, 140),
+            Step::Settle,
+            Step::Until("one line at 100x140", on_line_once),
+            Step::Do(&start),
+            Step::Settle,
+            Step::Snapshot("before tab"),
+            Step::Keys(TAB),
+            Step::Until("the dashboard", on_dashboard),
+            Step::Settle,
+            Step::Settle,
+            Step::Keys(ESC),
+            Step::Until("the line, once", on_line_once),
+            Step::Settle,
+            Step::Do(&stop),
+            Step::Settle,
+            Step::Snapshot("stopped"),
+            Step::OpenGate,
+        ]);
+        let ended = g.exit();
+        assert_eq!(
+            ended,
+            common::pty::Ended::Code(0),
+            "{name}: exit\n{}",
+            g.pty.seen()
+        );
+        let [(_, before), (_, stopped)] = shots.as_slice() else {
+            panic!("two snapshots");
+        };
+        let screen = g.pty.screen();
+        let before_tab = debug_log_numbers(before).last().copied().unwrap_or(0);
+        let printed = debug_log_numbers(stopped);
+        let last = printed.last().copied().unwrap_or(0);
+        assert_eq!(
+            printed,
+            (1..=last).collect::<Vec<_>>(),
+            "{name}: heph's lines are not each printed once, in order\n{}",
+            stopped.join("\n")
+        );
+        // The dashboard was up for two settles: lines were written under it.
+        assert!(
+            last >= before_tab + 10,
+            "{name}: too few lines written while the dashboard was up \
+             ({before_tab} before tab, {last} in all)\n{screen}"
+        );
+        for kind in ["info", "debug", "diagnostic"] {
+            assert!(
+                stopped
+                    .iter()
+                    .any(|r| r.contains("heph-debug-log") && r.trim_end().ends_with(kind)),
+                "{name}: no {kind} line\n{screen}"
+            );
+        }
+        // Once heph is gone, nothing more and nothing again.
+        let rows: Vec<String> = screen.lines().map(str::to_owned).collect();
+        assert_eq!(
+            debug_log_numbers(&rows),
+            printed,
+            "{name}: lines changed after the run\n{screen}"
+        );
+        assert_restored(&g.pty, name);
+    };
+    let failed: Vec<&str> = std::thread::scope(|s| {
+        let handles = [("session", false), ("HEPH_NO_SESSION=1", true)]
+            .map(|(name, no_session)| (name, s.spawn(move || run(name, no_session))));
+        handles
+            .into_iter()
+            .filter_map(|(name, h)| h.join().is_err().then_some(name))
+            .collect()
+    });
+    assert!(failed.is_empty(), "lines lost or repeated with: {failed:?}");
 }
 
 /// The build ends with the dashboard up: it stays, saying how to leave, until
