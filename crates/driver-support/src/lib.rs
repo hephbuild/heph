@@ -11,6 +11,7 @@ pub mod driver_managed_os;
 pub mod failure_out;
 mod output_glob;
 pub mod redact;
+pub mod run_log;
 pub mod scratch;
 pub mod stage;
 pub mod stop;

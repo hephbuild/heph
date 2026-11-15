@@ -11,6 +11,8 @@ hcore = { package = "core", path = "../core" }
 hmodel = { package = "model", path = "../model" }
 hplugin = { package = "plugin", path = "../plugin" }
 hlock = { package = "lock", path = "../lock" }
+# `run_log::RunLog::pump` reads a child's `OutputReader`.
+hproc = { package = "proc", path = "../proc" }
 anyhow = "1.0.102"
 async-trait = "0.1.89"
 serde = { version = "1", features = ["derive"] }
@@ -32,3 +34,8 @@ memchr = "2.8"
 # `clonefile(2)` for staged per-file inputs (see `stage::share_file`).
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+# The `run_log` pump tests spawn a real child through the exec-runner seam.
+hexecrunner = { package = "execrunner", path = "../execrunner" }
+tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "macros", "time"] }
