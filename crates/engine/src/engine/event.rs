@@ -56,6 +56,11 @@ pub struct ErrorDetail {
     ///
     /// [`RequestState::end_is_cancelled`]: crate::engine::request_state::RequestState::end_is_cancelled
     pub cancelled: bool,
+    /// A [`FailureSlot`](crate::engine::failure_slot::FailureSlot) is on the
+    /// chain: `execute` already decided this run *failed* and kept it, so a
+    /// cancel landing after that decision (fail-fast reaping another root)
+    /// does not turn it into a stop.
+    pub kept: bool,
 }
 
 impl ErrorDetail {
@@ -71,6 +76,10 @@ impl ErrorDetail {
             // empty-`Display` frame, which that would render as `: :`.
             message: hcore::hmemoizer::chain_message(e),
             cancelled: hplugin::error::is_cancelled(e),
+            kept: hcore::hmemoizer::downcast_chain_ref::<crate::engine::failure_slot::FailureSlot>(
+                e,
+            )
+            .is_some(),
             ..Self::default()
         };
         for cause in e.chain() {

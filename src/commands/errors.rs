@@ -1299,7 +1299,7 @@ mod tests {
         assert!(out.contains("\n✗ //simple_fail:d1\n  │ boom a\n"), "{out}");
         assert!(out.contains("\n✗ //simple_fail:d2\n  │ boom b\n"), "{out}");
         assert!(!out.contains("//simple_fail:stopped"), "{out}");
-        assert!(out.contains("1 stopped by ctrl-c"), "{out}");
+        assert!(out.contains("\n1 stopped, not failed: no block\n"), "{out}");
         Ok(())
     }
 

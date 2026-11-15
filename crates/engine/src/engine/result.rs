@@ -11813,6 +11813,92 @@ mod tests {
         Ok(())
     }
 
+    /// `execute` decides once whether a failed run is a stop, before filling
+    /// its failure slot. A cancel landing after that decision — fail-fast
+    /// reaping another root while this one's slot fills — leaves it a
+    /// failure: `ResultEnd` says so, the request does not remember it as a
+    /// stop, and its failure is recorded. The hook cancels the request
+    /// synchronously on the failed `ExecuteEnd`, which is dispatched after
+    /// the decision and before `ResultEnd`: the race, every time.
+    #[tokio::test]
+    async fn a_failure_execute_kept_stays_one_when_the_request_is_cancelled_after()
+    -> anyhow::Result<()> {
+        use crate::engine::hook::Hook;
+        use hcore::hasync::StdCancellationToken;
+
+        /// Cancels the token it holds on `//pkg:a`'s failed `ExecuteEnd`.
+        #[derive(Default)]
+        struct CancelOnExecuteEnd(std::sync::OnceLock<StdCancellationToken>);
+        impl Hook for CancelOnExecuteEnd {
+            fn name(&self) -> String {
+                "cancel-on-execute-end".into()
+            }
+            fn on_event(&self, ev: &BuildEvent) {
+                if let BuildEventKind::ExecuteEnd {
+                    addr,
+                    error: Some(_),
+                } = &ev.kind
+                    && addr == "//pkg:a"
+                    && let Some(token) = self.0.get()
+                {
+                    token.cancel();
+                }
+            }
+            fn on_close(&self) {}
+        }
+
+        let root = tempdir()?;
+        let mut engine = Engine::new(Config {
+            parallelism: None,
+            ..Config::for_tests(root.path())
+        })?;
+        engine.register_managed_driver(|_| {
+            Box::new(hplugin_exec::pluginexec::Driver::new_exec().with_host_path())
+        })?;
+        let provider =
+            pluginstatictarget::Provider::new(vec![static_target_run("//pkg:a", "exit 1")])?;
+        engine.register_provider(move |_| Box::new(provider))?;
+        let hook = Arc::new(CancelOnExecuteEnd::default());
+        engine.register_hook(Arc::clone(&hook) as Arc<dyn Hook>)?;
+        let engine = Arc::new(engine);
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let rs = engine.new_state_with_events(true, Some(tx));
+        assert!(hook.0.set(rs.ctoken().clone()).is_ok(), "token set once");
+        let res = Arc::clone(&engine)
+            .result_addr(
+                rs.clone(),
+                &hmodel::htaddr::parse_addr("//pkg:a")?,
+                OutputMatcher::All,
+                &ResultOptions::default(),
+            )
+            .await;
+        assert!(res.is_err(), "exit 1 fails");
+        assert!(rs.ctoken().is_cancelled(), "the hook cancelled the request");
+
+        let mut ends = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let BuildEventKind::ResultEnd {
+                addr, cancelled, ..
+            } = ev.kind
+                && addr == "//pkg:a"
+            {
+                ends.push(cancelled);
+            }
+        }
+        assert_eq!(ends, vec![false], "one ResultEnd, and it is a failure");
+        assert!(!rs.was_cancelled("//pkg:a"), "not remembered as a stop");
+        assert_eq!(
+            rs.take_failures()
+                .iter()
+                .map(|f| f.addr.format())
+                .collect::<Vec<_>>(),
+            vec!["//pkg:a".to_owned()],
+            "the failure is recorded"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn result_emits_matched_with_resolved_set() -> anyhow::Result<()> {
         let (engine, _home) = engine_with_home(vec![

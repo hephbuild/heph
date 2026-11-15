@@ -995,9 +995,16 @@ impl RequestState {
     /// event, the line and the report agree.
     ///
     /// A root is a stop when a [`CancelledError`](hplugin::error::CancelledError)
-    /// is on its chain, or when the request's token is cancelled and the run
-    /// did not time out: a driver may report a stop as a bare `cancelled` of
-    /// its own, the rule `execute` applies before filling a failure slot.
+    /// is on its chain. Otherwise `execute` decided, once, before filling a
+    /// failure slot: a run it kept ([`ErrorDetail::kept`]) failed, whatever
+    /// the token says now — fail-fast may cancel it between that decision and
+    /// this end. Only an error that never reached that decision falls back to
+    /// the same rule `execute` applies: the request's token is cancelled and
+    /// the run did not time out (a driver may report a stop as a bare
+    /// `cancelled` of its own).
+    ///
+    /// [`ErrorDetail::kept`]: crate::engine::event::ErrorDetail::kept
+    ///
     /// One that failed only because a dependency did is a stop when that
     /// root was one; a root that genuinely failed before the stop keeps what
     /// it took down. A root's end always precedes its dependents' (they end
@@ -1006,7 +1013,9 @@ impl RequestState {
         let mut set = self.data.cancelled.lock();
         let cancelled = match &d.upstream_of {
             Some(root) => set.contains(root),
-            None => d.cancelled || (self.ctoken().is_cancelled() && d.timed_out.is_none()),
+            None => {
+                d.cancelled || (!d.kept && self.ctoken().is_cancelled() && d.timed_out.is_none())
+            }
         };
         if cancelled {
             set.insert(addr.to_owned());
@@ -2249,6 +2258,16 @@ mod tests {
         assert!(
             !rs.end_is_cancelled("//p:slow", &timed_out),
             "a timeout fails"
+        );
+        assert!(
+            !rs.end_is_cancelled(
+                "//p:kept",
+                &ErrorDetail {
+                    kept: true,
+                    ..detail(None)
+                }
+            ),
+            "execute kept it as a failure before the cancel: it stays one"
         );
         assert!(rs.end_is_cancelled("//p:bare", &detail(None)));
         assert!(rs.end_is_cancelled("//p:behind", &detail(Some("//p:bare"))));

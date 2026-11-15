@@ -121,7 +121,8 @@ impl ReportContext {
     }
 
     /// The report: a blank line, then each block; a closing line counts
-    /// the stops left out.
+    /// the stops left out. "stopped", not "by ctrl-c": fail-fast cancels
+    /// the same way, and nobody pressed anything.
     pub fn render(&self, color: bool) -> String {
         let mut out = String::new();
         for block in &self.blocks {
@@ -130,7 +131,7 @@ impl ReportContext {
         }
         if self.stopped > 0 {
             out.push_str(&format!(
-                "\n{} stopped by ctrl-c, not failed: no block\n",
+                "\n{} stopped, not failed: no block\n",
                 self.stopped
             ));
         }
