@@ -466,52 +466,69 @@ fn describe_tool_group(group: &str) -> String {
 ///
 /// - a group's root variable is another group's `TOOL_<G>` (`tools = {"": …,
 ///   "root": …}` both claim `TOOL_ROOT`): either value would replace the other;
-/// - a name the target declares (`declared`: `(where it was declared, name)`)
-///   is a group's root variable: heph's value would silently win over it.
+/// - a name the target sets (`declared`: `(what sets it, name)`) is a group's
+///   root variable: heph's value would silently win over it.
 ///
 /// `"*"` in `declared` is a passthrough wildcard, not a name, and is ignored.
-fn check_tool_root_keys<'a>(
-    addr: &str,
-    groups: impl IntoIterator<Item = &'a String>,
-    declared: impl IntoIterator<Item = (&'a str, &'a str)>,
-) -> anyhow::Result<()> {
+/// Free for a target with no tool group: `declared` is only built when there is
+/// a group to check it against. Of several violations, the first by name is
+/// reported, so the error does not follow a map's iteration order.
+fn check_tool_root_keys<'a, D>(
+    addr: &hmodel::htaddr::Addr,
+    groups: &BTreeMap<String, Vec<Input>>,
+    declared: impl FnOnce() -> D,
+) -> anyhow::Result<()>
+where
+    D: IntoIterator<Item = (&'a str, &'a str)>,
+{
     const SPELLING: &str = "Group names are uppercased and every character outside [A-Z0-9_] \
                             becomes `_`, so different spellings can reach the same name";
-    let groups: Vec<&String> = groups.into_iter().collect();
+    if groups.is_empty() {
+        return Ok(());
+    }
     let by_tool_key: HashMap<String, &str> =
-        groups.iter().map(|g| (tool_key(g), g.as_str())).collect();
+        groups.keys().map(|g| (tool_key(g), g.as_str())).collect();
     let mut by_root_key: HashMap<String, &str> = HashMap::with_capacity(groups.len());
-    for group in &groups {
+    for group in groups.keys() {
         let root_key = tool_root_key(group);
         if let Some(other) = by_tool_key.get(&root_key) {
             anyhow::bail!(
-                "{addr}: tool {} and tool {} both set `{root_key}`: it is the staged root of \
-                 the first and the tool list of the second (`tools = {{{group:?}: …, {other:?}: \
+                "{}: tool {} and tool {} both set `{root_key}`: it is the staged root of the \
+                 first and the tool list of the second (`tools = {{{group:?}: …, {other:?}: \
                  …}}`). {SPELLING}; either group may also come from a dependency's \
                  `transitive` tools. Rename one of the groups",
+                addr.format(),
                 describe_tool_group(group),
                 describe_tool_group(other),
             );
         }
         by_root_key.insert(root_key, group.as_str());
     }
-    for (field, name) in declared {
-        if name == "*" {
-            continue;
-        }
-        if let Some(group) = by_root_key.get(name) {
-            anyhow::bail!(
-                "{addr}: {field} declares `{name}`, which is the staged root heph sets for tool \
-                 {} (`tools = {{{group:?}: …}}`), so the declared value would be replaced. \
-                 {SPELLING}; the group may come from a dependency's `transitive` tools, and \
-                 the name from a dependency's `transitive` env. Drop the `{name}` entry or \
-                 rename the tool group",
-                describe_tool_group(group),
-            );
-        }
+    let first = declared()
+        .into_iter()
+        .filter(|(_, name)| *name != "*")
+        .filter_map(|(source, name)| by_root_key.get(name).map(|group| (name, source, *group)))
+        .min();
+    if let Some((name, source, group)) = first {
+        anyhow::bail!(
+            "{}: `{name}` is set by {source}, but it is the staged root heph sets for tool {} \
+             (`tools = {{{group:?}: …}}`), so that value would be replaced. {SPELLING}; the \
+             group may come from a dependency's `transitive` tools. Drop the `{name}` entry, \
+             stop passing it, or rename the tool group",
+            addr.format(),
+            describe_tool_group(group),
+        );
     }
     Ok(())
 }
+
+/// What sets a name, as [`check_tool_root_keys`] reports it.
+const SET_BY_ENV: &str = "the target's `env`";
+const SET_BY_RUNTIME_ENV: &str = "the target's `runtime_env`";
+const SET_BY_RUNTIME_PASS_ENV: &str = "the target's `runtime_pass_env`";
+const SET_BY_PASS_ENV: &str = "the host through `pass_env` (named there, or exported by the \
+                               host under `pass_env = [\"*\"]`)";
+const SET_BY_TRANSITIVE: &str = "a dependency's `transitive` env";
 
 /// Hashed and runtime-only dep groups merged so each group ends up with a
 /// single `SRC_*` covering both: `deps` first, `runtime_deps` after.
@@ -1668,28 +1685,6 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
 
         let tool_inputs = build_tool_inputs(&pkg, spec.tools)?;
         let tool_group_inputs = grouped(&tool_inputs);
-        // Before `pass_env` turns into a host snapshot: only the names the
-        // target wrote are its declarations. `apply_transitive` checks again
-        // once a dependency's tools and env have joined.
-        check_tool_root_keys(
-            &req.target_spec.addr.format(),
-            tool_group_inputs.keys(),
-            spec.env
-                .keys()
-                .map(|k| ("`env`", k.as_str()))
-                .chain(
-                    spec.runtime_env
-                        .keys()
-                        .map(|k| ("`runtime_env`", k.as_str())),
-                )
-                .chain(spec.pass_env.iter().map(|k| ("`pass_env`", k.as_str())))
-                .chain(
-                    spec.runtime_pass_env
-                        .iter()
-                        .map(|k| ("`runtime_pass_env`", k.as_str())),
-                ),
-        )?;
-
         // `"*"` is a wildcard: pass through every host env var. Snapshotted at
         // parse time and hashed like any other pass_env (so the input hash
         // captures the whole environment — only use it on uncached targets).
@@ -1701,6 +1696,27 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
                 .filter_map(|name| std::env::var(&name).ok().map(|val| (name, val)))
                 .collect()
         };
+
+        // `pass_env` by its hashed snapshot: what the host passes is what would
+        // be replaced, `"*"` included, and a name the host starts exporting
+        // moves the def hash, so this check sees it. `apply_transitive` checks
+        // again once a dependency's tools and env have joined.
+        check_tool_root_keys(&req.target_spec.addr, &tool_group_inputs, || {
+            spec.env
+                .keys()
+                .map(|k| (SET_BY_ENV, k.as_str()))
+                .chain(
+                    spec.runtime_env
+                        .keys()
+                        .map(|k| (SET_BY_RUNTIME_ENV, k.as_str())),
+                )
+                .chain(pass_env.keys().map(|k| (SET_BY_PASS_ENV, k.as_str())))
+                .chain(
+                    spec.runtime_pass_env
+                        .iter()
+                        .map(|k| (SET_BY_RUNTIME_PASS_ENV, k.as_str())),
+                )
+        })?;
 
         // Built before the def hash — `outputs` and `support_files` are part of
         // the hashed def, so they have to exist by the time we hash it.
@@ -1873,29 +1889,28 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
             &mut xdef.dep_group_inputs,
             &mut xdef.runtime_dep_group_inputs,
         );
-        // A dependency's `transitive` tools may add groups, and its env names.
-        // The target's own names are rechecked against the groups it now has;
-        // `pass_env` is a host snapshot here (all of it under `"*"`), so its
-        // names were checked at parse only.
-        check_tool_root_keys(
-            &def.addr.format(),
-            xdef.tool_group_inputs.keys(),
+        // A dependency's `transitive` tools may add groups, and its env names
+        // (a transitive `Pass` among them, whatever the host has). The
+        // target's own names, the `pass_env` snapshot included, are rechecked
+        // against the groups it now has.
+        check_tool_root_keys(&def.addr, &xdef.tool_group_inputs, || {
             req.sandbox
                 .env
                 .keys()
-                .map(|k| ("a dependency's `transitive` env", k.as_str()))
-                .chain(xdef.env.keys().map(|k| ("`env`", k.as_str())))
+                .map(|k| (SET_BY_TRANSITIVE, k.as_str()))
+                .chain(xdef.env.keys().map(|k| (SET_BY_ENV, k.as_str())))
                 .chain(
                     xdef.runtime_env
                         .keys()
-                        .map(|k| ("`runtime_env`", k.as_str())),
+                        .map(|k| (SET_BY_RUNTIME_ENV, k.as_str())),
                 )
+                .chain(xdef.pass_env.keys().map(|k| (SET_BY_PASS_ENV, k.as_str())))
                 .chain(
                     xdef.runtime_pass_env
                         .iter()
-                        .map(|k| ("`runtime_pass_env`", k.as_str())),
-                ),
-        )?;
+                        .map(|k| (SET_BY_RUNTIME_PASS_ENV, k.as_str())),
+                )
+        })?;
         // The target's own `env` names, before any transitive literal joins
         // `env`: those win over a dependency's, which only fill the rest.
         let own_env: std::collections::HashSet<String> = xdef.env.keys().cloned().collect();
@@ -2371,11 +2386,17 @@ impl Driver {
             env.insert(k.clone(), rreq.resolve(v)?.to_string());
         }
 
-        // After every passthrough, so a host `TOOL_ROOT` carried by
-        // `pass_env = ["*"]` cannot replace heph's. A declared name is refused
-        // at parse (`check_tool_root_keys`). A group with no root sets nothing.
+        // After every passthrough: heph owns these names. A declared or hashed
+        // passed name is refused at parse (`check_tool_root_keys`); this is for
+        // `runtime_pass_env = ["*"]`, whose host `TOOL_ROOT` neither replaces
+        // heph's value nor survives for a group with no root. The names a group
+        // with no root leaves unset are also taken out of an entrypoint's base
+        // env below, which `layer_env` would otherwise keep.
+        let mut unset_tool_roots: Vec<String> = Vec::new();
         for (key, roots) in tool_roots {
             if roots.is_empty() {
+                env.remove(&key);
+                unset_tool_roots.push(key);
                 continue;
             }
             let mut value = String::new();
@@ -2540,9 +2561,19 @@ impl Driver {
         // unauthenticated or against whatever ambient identity the host had.
         let env_vec = filterenv::filter_long_env(env_vec, &argv_for_filter, &credential_env_names)?;
         // The run's own layers sit on the caller's base env, which is neither
-        // filtered nor converted: it reaches the process byte for byte (E6).
+        // filtered nor converted: it reaches the process byte for byte (E6),
+        // except a `TOOL_<G>_ROOT` heph leaves unset for this run's tools: heph
+        // owns those names, so the caller's value must not stand in for one.
         let has_base_env = options.base_env.is_some();
-        let mut env_pairs = layer_env(options.base_env.unwrap_or_default(), env_vec);
+        let mut base_env = options.base_env.unwrap_or_default();
+        if !unset_tool_roots.is_empty() {
+            base_env.retain(|(k, _)| {
+                !unset_tool_roots
+                    .iter()
+                    .any(|u| k.as_os_str() == std::ffi::OsStr::new(u))
+            });
+        }
+        let mut env_pairs = layer_env(base_env, env_vec);
         if shell {
             add_shell_env(&mut env_pairs, &rreq.sandbox_dir.join("init.sh"));
         }
@@ -3377,9 +3408,13 @@ mod tests {
 
     #[test]
     fn tool_root_key_collisions_are_refused() {
+        let addr = parse_addr("//p:t").expect("addr");
         let check = |groups: &[&str], declared: &[(&'static str, &'static str)]| {
-            let groups: Vec<String> = groups.iter().map(|g| (*g).to_string()).collect();
-            check_tool_root_keys("//p:t", groups.iter(), declared.iter().copied())
+            let groups: BTreeMap<String, Vec<Input>> = groups
+                .iter()
+                .map(|g| ((*g).to_string(), Vec::new()))
+                .collect();
+            check_tool_root_keys(&addr, &groups, || declared.iter().copied())
         };
         assert_eq!(tool_root_key(""), "TOOL_ROOT");
         assert_eq!(tool_root_key("my-sdk"), "TOOL_MY_SDK_ROOT");
@@ -3400,11 +3435,11 @@ mod tests {
         check(&["", "x", "roots", "x_roo", "root_x"], &[]).expect("no collision");
 
         // A declared name that is a group's root.
-        let err = check(&["sdk"], &[("`runtime_env`", "TOOL_SDK_ROOT")])
+        let err = check(&["sdk"], &[(SET_BY_RUNTIME_ENV, "TOOL_SDK_ROOT")])
             .expect_err("declared root")
             .to_string();
         assert!(
-            err.contains("`runtime_env` declares `TOOL_SDK_ROOT`"),
+            err.contains("`TOOL_SDK_ROOT` is set by the target's `runtime_env`"),
             "{err}"
         );
         // A wildcard is not a name; a group's own `TOOL_<G>` is not its root,
@@ -3412,12 +3447,146 @@ mod tests {
         check(
             &["", "sdk"],
             &[
-                ("`pass_env`", "*"),
-                ("`env`", "TOOL_SDK"),
-                ("`env`", "TOOL_X_ROOT"),
+                (SET_BY_RUNTIME_PASS_ENV, "*"),
+                (SET_BY_ENV, "TOOL_SDK"),
+                (SET_BY_ENV, "TOOL_X_ROOT"),
             ],
         )
         .expect("no root claimed");
+        // Several violations: the first by name, whatever order they came in.
+        for declared in [
+            [(SET_BY_ENV, "TOOL_B_ROOT"), (SET_BY_ENV, "TOOL_A_ROOT")],
+            [(SET_BY_ENV, "TOOL_A_ROOT"), (SET_BY_ENV, "TOOL_B_ROOT")],
+        ] {
+            let err = check(&["a", "b"], &declared)
+                .expect_err("two declared roots")
+                .to_string();
+            assert!(err.contains("`TOOL_A_ROOT` is set by"), "{err}");
+        }
+    }
+
+    /// No tool group, no work: the declared names are never built, so a
+    /// target without `tools` pays nothing for the check.
+    #[test]
+    fn tool_root_key_check_is_free_without_tool_groups() {
+        let addr = parse_addr("//p:t").expect("addr");
+        let built = std::cell::Cell::new(false);
+        check_tool_root_keys(&addr, &BTreeMap::new(), || {
+            built.set(true);
+            [(SET_BY_ENV, "TOOL_ROOT")]
+        })
+        .expect("no group, nothing to refuse");
+        assert!(
+            !built.get(),
+            "declared names built for a target with no tools"
+        );
+    }
+
+    /// A tool group for [`tool_root_pass_env_snapshot_is_refused`].
+    fn transitive_tool_sandbox(group: &str) -> hplugin::driver::sandbox::Sandbox {
+        use hplugin::driver::sandbox::{Sandbox, Tool};
+        let mut sb = Sandbox::default();
+        sb.push_tool(Tool {
+            r#ref: TargetAddr::parse("//tools:t", &hmodel::htpkg::PkgBuf::from(""))
+                .expect("tool addr"),
+            group: group.to_string(),
+            hash: true,
+            id: "_transitive_x_0_tool_t0".to_string(),
+        });
+        sb
+    }
+
+    /// `pass_env` is checked by its hashed snapshot: a name the host passes
+    /// (named, or exported under `"*"`) is refused at parse, and after
+    /// `apply_transitive` when the group arrives only from a dependency.
+    /// Unique variable names: `set_var` is process-global.
+    #[tokio::test]
+    async fn tool_root_pass_env_snapshot_is_refused() -> anyhow::Result<()> {
+        for name in [
+            "TOOL_HEPH_UT_PASS_ROOT",
+            "TOOL_HEPH_UT_STAR_ROOT",
+            "TOOL_HEPH_UT_TRANS_ROOT",
+        ] {
+            unsafe {
+                std::env::set_var(name, "/host");
+            }
+        }
+        let list = |items: &[&str]| {
+            hcore::htvalue::Value::List(
+                items
+                    .iter()
+                    .map(|s| hcore::htvalue::Value::String((*s).to_string()))
+                    .collect(),
+            )
+        };
+        let tools = |group: &str| {
+            hcore::htvalue::Value::Map(HashMap::from([(group.to_string(), list(&["//tools:t"]))]))
+        };
+        let refused = |res: anyhow::Result<hplugin::driver::targetdef::TargetDef>| {
+            res.err()
+                .map(|e| format!("{e:#}"))
+                .ok_or_else(|| anyhow::anyhow!("parsed although the root is passed"))
+        };
+
+        // Named in `pass_env`, the host has it.
+        let err = refused(
+            parse_with(HashMap::from([
+                ("pass_env".to_string(), list(&["TOOL_HEPH_UT_PASS_ROOT"])),
+                ("tools".to_string(), tools("heph_ut_pass")),
+            ]))
+            .await,
+        )?;
+        assert!(
+            err.contains("`TOOL_HEPH_UT_PASS_ROOT` is set by the host"),
+            "{err}"
+        );
+
+        // `"*"`: the host exports it.
+        let err = refused(
+            parse_with(HashMap::from([
+                ("pass_env".to_string(), list(&["*"])),
+                ("tools".to_string(), tools("heph_ut_star")),
+            ]))
+            .await,
+        )?;
+        assert!(
+            err.contains("`TOOL_HEPH_UT_STAR_ROOT` is set by the host"),
+            "{err}"
+        );
+
+        // The group arrives only transitively: parse cannot see it.
+        let driver = Driver::new_exec();
+        let parsed = parse_with_driver(
+            &driver,
+            HashMap::from([("pass_env".to_string(), list(&["TOOL_HEPH_UT_TRANS_ROOT"]))]),
+        )
+        .await?;
+        let err = driver
+            .apply_transitive(
+                ApplyTransitiveRequest {
+                    request_id: "test".to_string(),
+                    target_def: parsed,
+                    sandbox: transitive_tool_sandbox("heph_ut_trans"),
+                },
+                &StdCancellationToken::new(),
+            )
+            .await
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("transitive group's root refused"))?;
+        let err = format!("{err:#}");
+        assert!(
+            err.contains("`TOOL_HEPH_UT_TRANS_ROOT` is set by the host"),
+            "{err}"
+        );
+
+        // `runtime_pass_env = ["*"]` is unhashed and allowed: heph's value wins
+        // at run.
+        parse_with(HashMap::from([
+            ("runtime_pass_env".to_string(), list(&["*"])),
+            ("tools".to_string(), tools("heph_ut_star")),
+        ]))
+        .await?;
+        Ok(())
     }
 
     #[test]
@@ -6051,6 +6220,62 @@ bash apply_transitive: 96d371e95980d767
             list_path: Some(list_path.clone()),
             unpack_root: list_dir.to_path_buf(),
         })
+    }
+
+    /// A tool group with no root (its files are not under its package) leaves
+    /// `TOOL_<G>_ROOT` unset, even when `runtime_pass_env = ["*"]` would carry
+    /// a host value of that name. Unique variable name: `set_var` is
+    /// process-global.
+    #[tokio::test]
+    async fn rootless_tool_group_unsets_a_passed_host_root() -> anyhow::Result<()> {
+        unsafe {
+            std::env::set_var("TOOL_HEPH_UT_ROOTLESS_ROOT", "/host");
+        }
+        let driver = Driver::new_exec().with_host_path();
+        let ctoken = StdCancellationToken::new();
+        let tmp = tempfile::tempdir()?;
+
+        // The tool's file is at `<tmp>/node`, outside `<tmp>/pkg`: no root.
+        let tool_path = make_tool_binary(tmp.path(), "node", "echo ok")?;
+        let src = Addr::new(
+            hmodel::htpkg::PkgBuf::from("pkg"),
+            "node_tool".to_string(),
+            BTreeMap::new(),
+        );
+        let origin_id = "tool|heph_ut_rootless|0";
+        let mi = make_tool_managed_input_with_source(origin_id, &tool_path, tmp.path(), src)?;
+
+        let out = tmp.path().join("seen.txt");
+        let script = format!(
+            "printf %s \"${{TOOL_HEPH_UT_ROOTLESS_ROOT-unset}}\" > {}",
+            out.display()
+        );
+        let mut target_def = make_tool_target_def(
+            vec!["sh".to_string(), "-c".to_string(), script],
+            origin_id,
+            "heph_ut_rootless",
+        );
+        let mut def = target_def.def::<TargetDef>().clone();
+        def.runtime_pass_env = vec!["*".to_string()];
+        target_def.raw_def = Arc::new(def);
+
+        let request_id = "test".to_string();
+        let req = RunRequest::new(&request_id, &target_def, tmp.path());
+        driver
+            .run(
+                ManagedRunRequest {
+                    sandbox_dir: tmp.path().to_path_buf(),
+                    sandbox_ws_dir: tmp.path().to_path_buf(),
+                    sandbox_pkg_dir: tmp.path().to_path_buf(),
+                    request: req,
+                    inputs: vec![mi],
+                },
+                &ctoken,
+            )
+            .await?;
+
+        assert_eq!(std::fs::read_to_string(&out)?, "unset");
+        Ok(())
     }
 
     fn make_tool_target_def(run: Vec<String>, origin_id: &str, group: &str) -> EngineTargetDef {

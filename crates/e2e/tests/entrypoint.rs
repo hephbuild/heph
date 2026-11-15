@@ -2463,3 +2463,30 @@ target(name = "ep", driver = "bash", entrypoint = True, tools = ["//greetsdk:sdk
     assert_eq!(got.trim(), "hello", "{got}");
     Ok(())
 }
+
+/// heph owns `TOOL_<G>_ROOT`: when a tool group has no root (a workspace
+/// source file is not under a package of its own), the caller's
+/// `TOOL_ROOT` is taken out of the entrypoint's environment, not handed on
+/// as if heph had set it.
+#[tokio::test]
+async fn entrypoint_rootless_tool_group_unsets_the_callers_tool_root() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_file("src/script.sh", "echo src\n");
+    ws.write_build_file(
+        "app",
+        r#"
+target(name = "ep", driver = "bash", entrypoint = True,
+       tools = ["//@heph/fs:file@f=src/script.sh"],
+       run = "exec > \"$HEPH_TEST_OUT\" 2>&1; echo \"${TOOL_ROOT-unset}\"")
+"#,
+    );
+    let out = ws.dir.path().join("out.txt");
+    let mut env = caller_env(&out);
+    env.push(("TOOL_ROOT".into(), "/from/caller".into()));
+    let req = InvokeRequest::new(parse_addr("//app:ep")?, ws.dir.path(), env);
+    let exit = exited(invoke(&ws.engine, req).await);
+    let got = read(&out)?;
+    assert_eq!(exit, Exit::Code(0), "{got}");
+    assert_eq!(got.trim(), "unset", "{got}");
+    Ok(())
+}

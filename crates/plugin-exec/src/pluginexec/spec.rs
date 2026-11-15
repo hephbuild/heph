@@ -108,9 +108,11 @@ pub(crate) struct TargetSpec {
     /// Refused at parse: a group whose root variable is another group's
     /// `$TOOL_<group>` (`{"": …, "root": …}` both reach `TOOL_ROOT`; names are
     /// uppercased and every character outside `[A-Z0-9_]` becomes `_`), and a
-    /// name in `env`, `runtime_env`, `pass_env`, `runtime_pass_env` or a
-    /// dependency's `transitive` env that is one of the target's root
-    /// variables. Groups from a dependency's `transitive` tools count too.
+    /// root variable named in `env`, `runtime_env`, `runtime_pass_env` or a
+    /// dependency's `transitive` env, or passed by the host through `pass_env`
+    /// (`"*"` included, when the host exports it). Groups from a dependency's
+    /// `transitive` tools count too. Under `runtime_pass_env = ["*"]` the
+    /// host's value is ignored.
     pub tools: HashMap<String, Vec<String>>,
     /// Declared outputs, grouped by name → list of output paths the target writes.
     #[spec(rename = "out")]
