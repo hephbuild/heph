@@ -534,6 +534,13 @@ impl Engine {
             .read(addr, hashin, &ctoken)
             .await
             .with_context(|| format!("taking the read lock of {addr} {hashin}"))?;
+        // One fetch per entry in this engine: a concurrent open waits here,
+        // then finds the blob below instead of pulling it again.
+        let _fetch = self
+            .log_fetches
+            .lock((addr.clone(), hashin.to_owned()), &ctoken)
+            .await
+            .with_context(|| format!("waiting for another fetch of the log of {addr} {hashin}"))?;
         // Another reader fetched it while this one waited.
         if self.exists_local(addr, hashin, name).await? {
             return Ok(Ok(()));

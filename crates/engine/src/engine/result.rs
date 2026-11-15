@@ -8093,6 +8093,9 @@ mod tests {
         metadata: AtomicUsize,
         /// GETs of a blob object: real bytes moving.
         blobs: AtomicUsize,
+        /// Milliseconds each blob GET waits before answering, so concurrent
+        /// readers overlap.
+        blob_delay_ms: std::sync::atomic::AtomicU64,
     }
 
     impl CountingRemoteBackend {
@@ -8120,6 +8123,10 @@ mod tests {
                 self.metadata.fetch_add(1, Ordering::SeqCst);
             } else {
                 self.blobs.fetch_add(1, Ordering::SeqCst);
+                let delay = self.blob_delay_ms.load(Ordering::SeqCst);
+                if delay > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                }
             }
             match std::fs::read(self.root.join(key)) {
                 Ok(bytes) => Ok(Some(Box::pin(std::io::Cursor::new(bytes)))),
@@ -8255,6 +8262,57 @@ mod tests {
             backend.metadata(),
             after_run1,
             "a fully-cached second run must issue no metadata request at all"
+        );
+        Ok(())
+    }
+
+    /// Two readers open a remote hit's log at once (a `heph log` and the
+    /// TUI's pane): the blob is pulled once, and both read it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_opens_of_a_remote_log_fetch_its_blob_once() -> anyhow::Result<()> {
+        let remote = tempdir()?;
+        let remote_uri = format!("file://{}", remote.path().display());
+        let addr = hmodel::htaddr::parse_addr("//pkg:t")?;
+        let target = || pluginstatictarget::Target {
+            run: Some("echo a log line; echo hi > $OUT".to_string()),
+            ..out_target("//pkg:t")
+        };
+
+        let (seeder, _seeder_home) = engine_with_remote_bash(vec![target()], &remote_uri)?;
+        let seed_rs = seeder.new_state();
+        resolve(&seeder, &seed_rs, &addr, OutputMatcher::All).await?;
+        drain_bg(seed_rs).await;
+
+        let backend = Arc::new(CountingRemoteBackend::new(remote.path()));
+        let (engine, _home) = engine_with_remote_bash(vec![target()], &remote_uri)?;
+        let engine = with_counting_remote(engine, backend.clone());
+        // A remote hit for the hashout only: the manifest is mirrored, the
+        // log's blob stays remote.
+        let rs = engine.new_state();
+        resolve(&engine, &rs, &addr, OutputMatcher::None).await?;
+        drain_bg(rs).await;
+
+        let before = backend.blobs();
+        backend.blob_delay_ms.store(200, Ordering::SeqCst);
+        let opts = crate::engine::log_api::LogOptions {
+            fetch_remote: true,
+            ..Default::default()
+        };
+        let (a, b) = tokio::join!(engine.open_log(&addr, &opts), engine.open_log(&addr, &opts));
+        for log in [a?, b?] {
+            let log = log.expect("a stored log");
+            assert_eq!(
+                log.info().source,
+                crate::engine::log_api::LogSource::Cache { remote: true }
+            );
+            let mut text = String::new();
+            std::io::Read::read_to_string(&mut log.reader()?, &mut text)?;
+            assert_eq!(text, "a log line\n");
+        }
+        assert_eq!(
+            backend.blobs() - before,
+            1,
+            "the second open waits for the first fetch instead of pulling again"
         );
         Ok(())
     }

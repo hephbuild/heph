@@ -320,6 +320,11 @@ pub struct Engine {
     /// Each captured run's live log, under `<home>/runs/<id>/`. Diagnostics
     /// only — see [`crate::engine::run_log`].
     pub(crate) run_logs: crate::engine::run_log::RunLogs,
+    /// One remote `Log` fetch at a time per `(addr, hashin)`, so concurrent
+    /// opens of a remote hit's log pull its blob once. In-process: another
+    /// heph's fetch is caught by the `exists_local` re-check after it.
+    pub(crate) log_fetches:
+        hlock::hlock::KeyedLock<(hmodel::htaddr::Addr, String), hlock::hlock::MemLock>,
 
     /// Guards the execute phase so at most one execute runs per target addr at
     /// a time (cross-process with the filesystem backend, in-process with mem).
@@ -973,6 +978,7 @@ impl Engine {
             fuse,
             failure_slots: crate::engine::failure_slot::FailureSlots::new(&home),
             run_logs: crate::engine::run_log::RunLogs::new(&home),
+            log_fetches: hlock::hlock::KeyedLock::new(|_| hlock::hlock::MemLock::new()),
             result_lock,
             scratch_lock,
             credential_cache: Default::default(),
