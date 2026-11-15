@@ -23,9 +23,14 @@ pub const TAB_STOP: usize = 8;
 pub const ELLIPSIS: &str = "…";
 
 /// Whether `c` is a control character a terminal could act on: C0 (but tab
-/// and newline), DEL, or C1.
+/// and newline), DEL, or C1; or a bidi embedding, override or isolate,
+/// which would make the terminal draw the text after it reordered (U+202E
+/// shows `exe.txt` for `txt.exe`).
 fn is_control(c: char) -> bool {
-    matches!(c, '\0'..='\x08' | '\x0b'..='\x1f' | '\x7f'..='\u{9f}')
+    matches!(
+        c,
+        '\0'..='\x08' | '\x0b'..='\x1f' | '\x7f'..='\u{9f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+    )
 }
 
 /// Whether a C1 character opens a string (DCS, SOS, OSC, PM, APC) that runs
@@ -169,18 +174,31 @@ pub fn width(s: &str) -> usize {
     UnicodeWidthStr::width(s)
 }
 
-/// The longest prefix of `s` at most `max` columns wide. Never cuts inside a
-/// character; combining marks stay with the character they follow.
+/// The longest prefix of `s` at most `max` columns wide, as [`width`]
+/// measures it. Never cuts inside a character; combining marks stay with the
+/// character they follow.
 pub fn take_width(s: &str, max: usize) -> &str {
     let mut used = 0;
+    let mut end = s.len();
     for (i, c) in s.char_indices() {
         let w = c.width().unwrap_or(0);
         if used + w > max {
-            return s.get(..i).unwrap_or(s);
+            end = i;
+            break;
         }
         used += w;
     }
-    s
+    let mut prefix = s.get(..end).unwrap_or(s);
+    // Per character, an emoji presentation selector adds nothing, though
+    // it widens the emoji before it (`❤️` is 2 columns, `❤` and U+FE0F sum
+    // to 1): drop characters until the prefix fits as a whole.
+    while width(prefix) > max {
+        let Some(last) = prefix.chars().next_back() else {
+            break;
+        };
+        prefix = prefix.get(..prefix.len() - last.len_utf8()).unwrap_or("");
+    }
+    prefix
 }
 
 /// `s` cut to `max` columns from the right: kept whole when it fits,
@@ -217,7 +235,14 @@ pub fn cut_left(s: &str, max: usize) -> Cow<'_, str> {
         used += w;
         start = i;
     }
-    let tail = s.get(start..).unwrap_or("");
+    let mut tail = s.get(start..).unwrap_or("");
+    // As in `take_width`: what fits per character may not as a whole.
+    while width(tail) > budget {
+        let Some(first) = tail.chars().next() else {
+            break;
+        };
+        tail = tail.get(first.len_utf8()..).unwrap_or("");
+    }
     // A tail that begins on a combining mark lost its base character.
     let tail = tail.trim_start_matches(|c: char| c.width() == Some(0));
     Cow::Owned(format!("{ELLIPSIS}{tail}"))
@@ -341,6 +366,16 @@ mod tests {
             ("宽字 e\u{301}".as_bytes(), "宽字 e\u{301}"),
             (b"unterminated \x1b]0;title", "unterminated "),
             (b"trailing esc \x1b", "trailing esc "),
+            // Every control string, by escape and by C1 introducer.
+            (b"\x1bPq#0;2;0;0;0\x1b\\dcs", "dcs"),
+            (b"\x1bXsos\x1b\\a", "a"),
+            (b"\x1b^pm\x07b", "b"),
+            (b"\x1b_apc\x1b\\c", "c"),
+            (b"\xc2\x90dcs\xc2\x9cz", "z"),
+            (b"\xc2\x98sos\xc2\x9cy", "y"),
+            // Bidi overrides, embeddings and isolates.
+            ("a\u{202e}fdp.exe".as_bytes(), "afdp.exe"),
+            ("\u{2066}x\u{2069} \u{202a}y\u{202c}".as_bytes(), "x y"),
         ];
         for (input, want) in cases {
             let got = sanitize_log(input);
@@ -379,10 +414,25 @@ mod tests {
         assert_eq!(cut_left("//ae\u{301}b", 2), "…b");
         assert_eq!(cut_left("short", 10), "short");
         assert_eq!(cut_left("short", 0), "");
-        for s in ["//宽字:目标", "//e\u{301}\u{301}x:y", "plain//addr"] {
+        // An emoji with its presentation selector is 2 columns as a whole,
+        // 1 summed per character: a cut measures it whole.
+        assert_eq!(width("⚠\u{fe0f}"), 2);
+        assert_eq!(take_width("⚠\u{fe0f} warn", 1), "⚠");
+        assert_eq!(take_width("⚠\u{fe0f} warn", 2), "⚠\u{fe0f}");
+        assert_eq!(cut_right("⚠\u{fe0f} warning", 2), "⚠…");
+        assert_eq!(cut_left("warning ⚠\u{fe0f}", 2), "…");
+        for s in [
+            "//宽字:目标",
+            "//e\u{301}\u{301}x:y",
+            "plain//addr",
+            "⚠\u{fe0f} disk ⚠\u{fe0f} low",
+            "❤\u{fe0f}❤\u{fe0f}❤\u{fe0f}",
+            "a👩\u{200d}💻b",
+        ] {
             for max in 0..12 {
                 assert!(width(&cut_left(s, max)) <= max, "{s} at {max}");
                 assert!(width(&cut_right(s, max)) <= max, "{s} at {max}");
+                assert!(width(take_width(s, max)) <= max, "{s} at {max}");
             }
         }
     }

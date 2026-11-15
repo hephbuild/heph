@@ -186,16 +186,29 @@ impl LogPane {
     }
 
     fn line_bytes(&self, k: usize) -> Vec<u8> {
-        let Some(&s) = self.starts.get(k) else {
-            return Vec::new();
-        };
+        self.line_range(k)
+            .map(|r| self.buf.range(r).copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Where held line `k` sits in `buf`, its newline left out.
+    fn line_range(&self, k: usize) -> Option<std::ops::Range<usize>> {
+        let &s = self.starts.get(k)?;
         let a = usize::try_from(s - self.base).unwrap_or(0);
         let b = self.starts.get(k + 1).map_or(self.buf.len(), |&e| {
             usize::try_from(e - self.base)
                 .unwrap_or(0)
                 .saturating_sub(1)
         });
-        self.buf.range(a..b.max(a)).copied().collect()
+        Some(a..b.max(a))
+    }
+
+    /// Whether held line `k` is only ASCII whitespace (a CR included), read
+    /// in place. A line of controls alone is not blank here, and is dropped
+    /// by the caller's check of its text.
+    fn line_is_blank(&self, k: usize) -> bool {
+        self.line_range(k)
+            .is_none_or(|r| self.buf.range(r).all(u8::is_ascii_whitespace))
     }
 
     /// Held line `k` as drawable text: controls stripped, tabs laid out,
@@ -210,6 +223,9 @@ impl LogPane {
     pub fn last_lines(&self, n: usize, redact: &Redact) -> Vec<String> {
         let mut out: Vec<String> = (0..self.line_count())
             .rev()
+            // A blank line costs no allocation: a blank log is a frame's
+            // worth of lines, every Overview frame.
+            .filter(|&k| !self.line_is_blank(k))
             .map(|k| self.line_text(k, redact))
             .filter(|l| !l.trim().is_empty())
             .take(n)
@@ -667,6 +683,26 @@ mod tests {
         assert!(p.search_hint().expect("hint").contains("· not found ·"));
     }
 
+    /// Wrapped rows hold to the column count with an emoji whose
+    /// presentation selector makes it wider than its characters sum to,
+    /// and the Overview's last lines skip blank lines.
+    #[test]
+    fn wrapped_emoji_rows_fit_and_last_lines_skip_blanks() {
+        let mut p = LogPane::default();
+        p.start_live("live".into());
+        p.append("⚠\u{fe0f}⚠\u{fe0f}⚠\u{fe0f} disk low\n\n  \n\n".as_bytes());
+        p.toggle_wrap();
+        for cols in 1..8 {
+            for row in p.rows_of(0, cols, &Redact::default()) {
+                assert!(width(&row) <= cols.max(2), "{row:?} at {cols}");
+            }
+        }
+        assert_eq!(
+            p.last_lines(3, &Redact::default()),
+            ["⚠\u{fe0f}⚠\u{fe0f}⚠\u{fe0f} disk low"]
+        );
+    }
+
     /// I13: the log-text table, drawn in the Log tab.
     #[test]
     fn control_bytes_never_reach_terminal_log_tab() {
@@ -694,6 +730,12 @@ mod tests {
             ("tabs", vec![b"a\tb\n"], Some("a       b")),
             ("long line", vec![long.as_bytes()], None),
             ("cut mid utf8", vec![b"caf\xc3", b"\xa9\n"], Some("café")),
+            ("split csi", vec![b"x\x1b[", b"2Jy\n"], Some("xy")),
+            (
+                "split osc",
+                vec![b"a\x1b]52;c;", b"Zm9v\x07b\n"],
+                Some("ab"),
+            ),
             ("spliced", vec![b"out: hal", b"err\n", b"f\n"], Some("f")),
             (
                 "wide",
