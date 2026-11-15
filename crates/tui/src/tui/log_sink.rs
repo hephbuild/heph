@@ -2,22 +2,55 @@ use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
+use tracing::Level;
 use tracing_subscriber::fmt::MakeWriter;
+
+use crate::tui::session::SessionSlot;
 
 enum Inner {
     Direct,
     Buffered { tx: mpsc::UnboundedSender<Vec<u8>> },
 }
 
+/// Where the process's terminal output goes, and the session recording it.
+///
+/// `main` builds one and hands it to the command, beside the session itself.
+/// The sink keeps its own reference to the session only to tee every `info!`
+/// line into it; the session reaches [`run_app`](crate::tui::run_app) as its own
+/// argument, never through the sink.
 #[derive(Clone)]
 pub struct LogSink {
     inner: Arc<Mutex<Inner>>,
+    /// The process's session (design amendment A11). Outside `Inner` because
+    /// pausing and resuming the TUI replaces `Inner`, and a paused run must keep
+    /// recording.
+    session: Arc<SessionSlot>,
 }
 
 impl LogSink {
-    pub fn new_direct() -> Self {
+    /// A sink recording into `session` once a run opens it. The same slot is
+    /// what the caller hands [`run_app`](crate::tui::run_app).
+    pub fn new_direct_with(session: Arc<SessionSlot>) -> Self {
         Self {
             inner: Arc::new(Mutex::new(Inner::Direct)),
+            session,
+        }
+    }
+
+    /// The session this sink tees into. Crate-private: a command gets the
+    /// session as its own argument.
+    pub(crate) fn session(&self) -> &Arc<SessionSlot> {
+        &self.session
+    }
+
+    /// Record a formatted log line of `level` in the session, if the line is
+    /// one the terminal shows (`info!` and above).
+    fn tee(&self, level: Option<Level>, buf: &[u8]) {
+        // Ordered by verbosity: ERROR < WARN < INFO < DEBUG < TRACE.
+        if let Some(level) = level
+            && level <= Level::INFO
+        {
+            self.session.record_log(level.as_str(), buf);
         }
     }
 
@@ -72,15 +105,20 @@ impl LogSink {
 
 pub struct LogSinkWriter {
     sink: LogSink,
+    /// The level of the event being written, when the formatter said
+    /// (`make_writer_for`). `None`: not a log event, never teed.
+    level: Option<Level>,
 }
 
 impl Write for LogSinkWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.sink.tee(self.level, buf);
         self.sink.write_bytes(buf)?;
         Ok(buf.len())
     }
 
     fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.sink.tee(self.level, buf);
         self.sink.write_bytes(buf)
     }
 
@@ -106,6 +144,14 @@ impl<'a> MakeWriter<'a> for MakeLogSink {
     fn make_writer(&'a self) -> Self::Writer {
         LogSinkWriter {
             sink: self.sink.clone(),
+            level: None,
+        }
+    }
+
+    fn make_writer_for(&'a self, meta: &tracing::Metadata<'_>) -> Self::Writer {
+        LogSinkWriter {
+            sink: self.sink.clone(),
+            level: Some(*meta.level()),
         }
     }
 }
@@ -116,7 +162,7 @@ mod tests {
 
     #[test]
     fn buffered_writer_pushes_bytes_through_channel() {
-        let sink = LogSink::new_direct();
+        let sink = LogSink::new_direct_with(Default::default());
         let mut rx = sink.switch_to_buffered();
 
         let make = MakeLogSink::new(sink.clone());
@@ -132,7 +178,7 @@ mod tests {
 
     #[test]
     fn direct_writer_bypasses_channel() {
-        let sink = LogSink::new_direct();
+        let sink = LogSink::new_direct_with(Default::default());
         let make = MakeLogSink::new(sink.clone());
         let mut w = make.make_writer();
         w.write_all(b"x").expect("write");

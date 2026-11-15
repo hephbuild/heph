@@ -1,3 +1,4 @@
+use crate::tui::session::SessionSlot;
 use std::collections::BTreeSet;
 use std::io::Read;
 use std::io::Write;
@@ -34,11 +35,16 @@ pub struct Args {
     pub check: bool,
 }
 
-pub fn execute(args: &Args, sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
+pub fn execute(
+    args: &Args,
+    sink: LogSink,
+    session: &Arc<SessionSlot>,
+    global: &GlobalOptions,
+) -> anyhow::Result<()> {
     if args.matcher.as_deref() == Some(STDIN_MARKER) {
         return format_stdin();
     }
-    bootstrap::block_on(execute_async(args.clone(), sink, global.clone()))?
+    bootstrap::block_on(execute_async(args.clone(), sink, session, global.clone()))?
 }
 
 /// Read Starlark from stdin, write the formatted result to stdout. The indent
@@ -183,13 +189,18 @@ fn file_label(root: &Path, path: &Path) -> String {
         .to_string()
 }
 
-async fn execute_async(args: Args, sink: LogSink, global: GlobalOptions) -> anyhow::Result<()> {
+async fn execute_async(
+    args: Args,
+    sink: LogSink,
+    session: &Arc<SessionSlot>,
+    global: GlobalOptions,
+) -> anyhow::Result<()> {
     let root = get_root()?;
     let matcher = match args.matcher {
         Some(s) => htpkg::parse(&s, &get_cwp()?)?,
         None => Matcher::PackagePrefix(PkgBuf::from("")),
     };
-    let (engine, shutdown) = bootstrap::new_engine(&global)?;
+    let (engine, shutdown) = bootstrap::new_engine(&global, session)?;
     let app = BuildFmtApp {
         engine,
         matcher,
@@ -198,5 +209,5 @@ async fn execute_async(args: Args, sink: LogSink, global: GlobalOptions) -> anyh
         fail_fast: global.fail_fast,
     };
     let interactive = tui::should_use_tui(global.no_tui);
-    tui::run_app(app, sink, interactive, shutdown).await
+    tui::run_app(app, sink, session, interactive, shutdown).await
 }

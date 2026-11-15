@@ -1,3 +1,4 @@
+use crate::tui::session::SessionSlot;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -85,18 +86,28 @@ impl App for RevdepsApp {
     }
 }
 
-pub fn execute(args: &Args, sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
-    bootstrap::block_on(execute_async(args.clone(), sink, global.clone()))?
+pub fn execute(
+    args: &Args,
+    sink: LogSink,
+    session: &Arc<SessionSlot>,
+    global: &GlobalOptions,
+) -> anyhow::Result<()> {
+    bootstrap::block_on(execute_async(args.clone(), sink, session, global.clone()))?
 }
 
-async fn execute_async(args: Args, sink: LogSink, global: GlobalOptions) -> anyhow::Result<()> {
+async fn execute_async(
+    args: Args,
+    sink: LogSink,
+    session: &Arc<SessionSlot>,
+    global: GlobalOptions,
+) -> anyhow::Result<()> {
     let addr = resolve_addr(args.addr.as_ref())?;
     let scope = match &args.scope {
         Some(s) => htpkg::parse(s.as_str(), &crate::engine::get_cwp()?)
             .with_context(|| format!("parse scope {s}"))?,
         None => Matcher::PackagePrefix(PkgBuf::from("")),
     };
-    let (engine, shutdown) = bootstrap::new_engine(&global)?;
+    let (engine, shutdown) = bootstrap::new_engine(&global, session)?;
     let app = RevdepsApp {
         engine,
         addr,
@@ -104,5 +115,5 @@ async fn execute_async(args: Args, sink: LogSink, global: GlobalOptions) -> anyh
         fail_fast: global.fail_fast,
     };
     let interactive = tui::should_use_tui(global.no_tui);
-    tui::run_app(app, sink, interactive, shutdown).await
+    tui::run_app(app, sink, session, interactive, shutdown).await
 }

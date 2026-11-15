@@ -1,6 +1,7 @@
 //! `heph tool codegen gitignore [--check] [MATCHER]`: rewrite the managed
 //! section from the defs, and nothing else.
 
+use crate::tui::session::SessionSlot;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -256,7 +257,12 @@ pub async fn gitignore(
     })
 }
 
-pub fn execute(args: &Args, sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
+pub fn execute(
+    args: &Args,
+    sink: LogSink,
+    session: &Arc<SessionSlot>,
+    global: &GlobalOptions,
+) -> anyhow::Result<()> {
     let matcher = match &args.matcher {
         Some(s) => Some(htpkg::parse(s, &get_cwp()?)?),
         None => None,
@@ -274,6 +280,7 @@ pub fn execute(args: &Args, sink: LogSink, global: &GlobalOptions) -> anyhow::Re
         title,
         args.json,
         sink,
+        session,
         global,
         move |engine, rs| async move { gitignore(&engine, &rs, &opts).await },
     )

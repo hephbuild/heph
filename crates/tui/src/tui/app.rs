@@ -5,6 +5,7 @@ use ratatui::text::Line;
 use tokio::sync::{mpsc, oneshot};
 
 use super::log_sink::LogSink;
+use super::session::{HolderNames, SessionHeader};
 use hcore::events::{BuildEvent, EventSender};
 use hcore::pending::PendingCounter;
 
@@ -80,6 +81,14 @@ impl AppContext {
 
     pub fn sink(&self) -> &LogSink {
         &self.sink
+    }
+
+    /// The session the run records into: the slot handed to
+    /// [`run_app`](crate::tui::run_app) (the sink's, which `run_app` checks is
+    /// the same one). Where a command records what it prints outside the
+    /// event stream, like the failure report on the line backend.
+    pub fn session(&self) -> &super::session::SessionSlot {
+        self.sink.session()
     }
 
     /// The build-event sender to plumb into the request state, e.g.
@@ -235,6 +244,12 @@ pub trait TUIAppView: Send {
     /// by default for views without tabs.
     fn back_to_main(&mut self) {}
 
+    /// `q` on the main view while the run is still going. No-op by default: in
+    /// a run of this process `q` does nothing and Ctrl-C cancels. A session
+    /// viewer (`heph session attach`) detaches here, and the run it shows goes
+    /// on — a viewer never cancels anything.
+    fn quit_while_running(&mut self) {}
+
     /// Whether the view is currently capturing keystrokes into a search query
     /// (the `/` filter). While `true` the backend routes printable keys, Backspace,
     /// Enter and Esc to the search methods below instead of the normal shortcuts.
@@ -290,15 +305,34 @@ pub trait TUIAppView: Send {
         false
     }
 
-    /// Mark the run as finished so the view can surface a "done — press q to
-    /// quit" notice. Called once when the viewport is being held open. No-op by
+    /// Mark the run as finished at `at_ms`, the instant its elapsed clock
+    /// freezes at and the final summary measures against. Called when the
+    /// viewport is held open (it then surfaces a "done — press q to quit"
+    /// notice) and again at teardown, before [`Self::last_render`]. No-op by
     /// default.
-    fn set_finished(&mut self) {}
+    fn set_finished(&mut self, _at_ms: u64) {}
+
+    /// The approval prompt this view shows now, as a session records it.
+    /// `None` by default (no approval gate).
+    fn pending_approval(&self) -> Option<crate::tui::session::ApprovalPrompt> {
+        None
+    }
 
     /// After the live viewport is torn down, render a final build summary
     /// directly to the terminal (stderr) so it persists in scrollback. NOT
     /// routed through the log sink. No-op by default.
     fn last_render(&self) {}
+
+    /// How a session viewer should title this run: which header it rebuilds
+    /// and the label. Recorded once in the session's `meta.json`. Default: the
+    /// build header with no label.
+    fn session_header(&self) -> SessionHeader {
+        SessionHeader::default()
+    }
+
+    /// How to name the session behind a lock holder's pid. Handed over once,
+    /// by the backend, before the first event. Ignored by default.
+    fn name_lock_holders(&mut self, _names: HolderNames) {}
 }
 
 /// Aggregates the engine's build-event stream and renders progress in non-TUI
@@ -313,6 +347,14 @@ pub trait CIAppView: Send {
 
     /// Print the final summary once the event stream ends.
     fn finish(&self) {}
+
+    /// See [`TUIAppView::session_header`].
+    fn session_header(&self) -> SessionHeader {
+        SessionHeader::default()
+    }
+
+    /// See [`TUIAppView::name_lock_holders`].
+    fn name_lock_holders(&mut self, _names: HolderNames) {}
 }
 
 #[async_trait]
@@ -334,4 +376,19 @@ pub trait App: Send {
 
     /// Run the business logic. May call `ctx.pause()` to suspend the TUI.
     async fn run(self, ctx: AppContext) -> anyhow::Result<Self::Output>;
+
+    /// Whether running this app records a session (`~/.heph/sessions/<id>/`).
+    /// True for every command; a session *viewer* says false, so watching a
+    /// session never creates another one.
+    fn records_session(&self) -> bool {
+        true
+    }
+
+    /// How this app's view names a lock holder's pid, when the app knows
+    /// better than the process's own session: a viewer names holders from the
+    /// sessions directory it watches, excluding the session it attached to.
+    /// `None`: the backend names them from the process's session slot.
+    fn lock_holders(&self) -> Option<HolderNames> {
+        None
+    }
 }

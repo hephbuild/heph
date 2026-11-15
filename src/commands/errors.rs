@@ -13,6 +13,7 @@ use crate::engine::error::{
 };
 use crate::hmemoizer::{chain_frames, downcast_chain_ref};
 use crate::tui::color::stderr_color_enabled as color_enabled;
+use crate::tui::session::SessionSlot;
 
 /// Render the cause chain of an `anyhow::Error`, dropping the leading frames that
 /// merely restate the target address (engine boundaries like `execute //addr`,
@@ -600,7 +601,9 @@ macro_rules! finalize {
                 // necessarily prints verdict-then-errors.)
                 ::anyhow::Result::<()>::Err(
                     $crate::commands::errors::FailedTargets::reported_to_stderr(
-                        failures, incomplete,
+                        failures,
+                        incomplete,
+                        $ctx.session(),
                     )
                     .into_error(),
                 )
@@ -749,11 +752,20 @@ impl FailedTargets {
     }
 
     /// [`FailedTargets::reported`] against the real stderr — what `finalize!` uses.
+    /// What it printed is recorded in `session`, so an attached viewer prints
+    /// the report too.
     pub fn reported_to_stderr(
         failures: Vec<Arc<TargetFailure>>,
         incomplete: Option<crate::engine::discovery::GapReport>,
+        session: &SessionSlot,
     ) -> Self {
-        Self::reported(failures, incomplete, &mut io::stderr(), color_enabled())
+        let mut out = Vec::new();
+        let this = Self::reported(failures, incomplete, &mut out, color_enabled());
+        // Best-effort, like the write in `reported`: the exit code carries the
+        // failure out either way.
+        drop(io::Write::write_all(&mut io::stderr(), &out));
+        session.record_output(&String::from_utf8_lossy(&out));
+        this
     }
 
     pub fn failures(&self) -> &[Arc<TargetFailure>] {
@@ -793,11 +805,13 @@ impl std::error::Error for FailedTargets {}
 /// error's cause chain is printed in the same `×` / `╰─▶` style. `false` means
 /// nothing renderable was found and the caller should fall back to its own log; a
 /// claimed error may still print nothing, when it was already reported at the
-/// failure site.
-pub fn render_anyhow(e: &anyhow::Error) -> bool {
+/// failure site. What it printed is recorded in `session`.
+pub fn render_anyhow(e: &anyhow::Error, session: &SessionSlot) -> bool {
     match render_anyhow_to_string(e, color_enabled()) {
         Some(out) => {
             eprint!("{out}");
+            // An attached viewer prints the report below its summary too.
+            session.record_output(&out);
             true
         }
         None => false,
@@ -975,7 +989,10 @@ mod tests {
             "the boxes go out at the failure site, in full"
         );
         assert_eq!(render_anyhow_to_string(&e, false), Some(String::new()));
-        assert!(render_anyhow(&e), "still counts as handled");
+        assert!(
+            render_anyhow(&e, &SessionSlot::new()),
+            "still counts as handled"
+        );
     }
 
     #[test]
@@ -1010,11 +1027,13 @@ mod tests {
     }
 
     /// `finalize!` is duck-typed over the app context and the request state — it
-    /// only ever calls `interactive()`, `pause()` and `take_failures()` — so the
+    /// only ever calls `interactive()`, `session()`, `pause()` and
+    /// `take_failures()` — so the
     /// branch it takes can be driven without an engine or a terminal.
     struct FakeCtx {
         interactive: bool,
         pauses: std::cell::Cell<usize>,
+        session: crate::tui::session::SessionSlot,
     }
 
     struct FakeGuard;
@@ -1024,10 +1043,14 @@ mod tests {
             Self {
                 interactive,
                 pauses: std::cell::Cell::new(0),
+                session: crate::tui::session::SessionSlot::new(),
             }
         }
         fn interactive(&self) -> bool {
             self.interactive
+        }
+        fn session(&self) -> &crate::tui::session::SessionSlot {
+            &self.session
         }
         async fn pause(&self) -> FakeGuard {
             self.pauses.set(self.pauses.get() + 1);
@@ -1707,7 +1730,7 @@ mod tests {
             diff: diff.to_string(),
         });
         // render_anyhow prints to stderr; assert it claims the error as handled.
-        assert!(render_anyhow(&e));
+        assert!(render_anyhow(&e, &SessionSlot::new()));
     }
 
     #[test]

@@ -17,6 +17,7 @@ mod paths;
 pub mod status;
 pub mod why;
 
+use crate::tui::session::SessionSlot;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -149,14 +150,19 @@ pub enum CodegenCommands {
 }
 
 impl CodegenArgs {
-    pub fn execute(&self, sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
+    pub fn execute(
+        &self,
+        sink: LogSink,
+        session: &Arc<SessionSlot>,
+        global: &GlobalOptions,
+    ) -> anyhow::Result<()> {
         let res = match &self.command {
-            CodegenCommands::Gitignore(a) => gitignore::execute(a, sink, global),
-            CodegenCommands::Status(a) => status::execute(a, sink, global),
-            CodegenCommands::Keep(a) => keep::execute_keep(a, sink, global),
-            CodegenCommands::Discard(a) => keep::execute_discard(a, sink, global),
-            CodegenCommands::Why(a) => why::execute(a, sink, global),
-            CodegenCommands::Import(a) => import::execute(a, sink, global),
+            CodegenCommands::Gitignore(a) => gitignore::execute(a, sink, session, global),
+            CodegenCommands::Status(a) => status::execute(a, sink, session, global),
+            CodegenCommands::Keep(a) => keep::execute_keep(a, sink, session, global),
+            CodegenCommands::Discard(a) => keep::execute_discard(a, sink, session, global),
+            CodegenCommands::Why(a) => why::execute(a, sink, session, global),
+            CodegenCommands::Import(a) => import::execute(a, sink, session, global),
         };
         wrap_exit(res)
     }
@@ -273,6 +279,7 @@ fn run_cli<R, F, Fut>(
     title: &'static str,
     json: bool,
     sink: LogSink,
+    session: &Arc<SessionSlot>,
     global: &GlobalOptions,
     job: F,
 ) -> anyhow::Result<()>
@@ -283,7 +290,7 @@ where
 {
     let global = global.clone();
     let res = bootstrap::block_on(async move {
-        let (engine, shutdown) = bootstrap::new_engine(&global)?;
+        let (engine, shutdown) = bootstrap::new_engine(&global, session)?;
         let app = CodegenApp {
             engine,
             title,
@@ -292,7 +299,7 @@ where
             job: Box::new(move |e, rs| Box::pin(job(e, rs))),
         };
         let interactive = tui::should_use_tui(global.no_tui) && !json;
-        tui::run_app(app, sink, interactive, shutdown).await
+        tui::run_app(app, sink, session, interactive, shutdown).await
     })
     .and_then(|r| r);
     // The app has ended (and `--json` never takes the TUI), so stdout is

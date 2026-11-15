@@ -1,3 +1,4 @@
+use crate::tui::session::SessionSlot;
 use std::ffi::OsString;
 use std::io;
 use std::sync::Arc;
@@ -963,11 +964,21 @@ fn quote_args(args: &[OsString]) -> String {
         .join(" ")
 }
 
-pub fn execute(args: &RunArgs, sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
-    bootstrap::block_on(execute_async(args.clone(), sink, global.clone()))?
+pub fn execute(
+    args: &RunArgs,
+    sink: LogSink,
+    session: &Arc<SessionSlot>,
+    global: &GlobalOptions,
+) -> anyhow::Result<()> {
+    bootstrap::block_on(execute_async(args.clone(), sink, session, global.clone()))?
 }
 
-async fn execute_async(args: RunArgs, sink: LogSink, global: GlobalOptions) -> anyhow::Result<()> {
+async fn execute_async(
+    args: RunArgs,
+    sink: LogSink,
+    session: &Arc<SessionSlot>,
+    global: GlobalOptions,
+) -> anyhow::Result<()> {
     refuse_raw_with_shell(args.raw, args.shell.is_some())?;
     // Raw, before anything else reads either: what an entrypoint runs with.
     // Not the engine's memoized cwd — the caller's cwd may be outside the
@@ -979,7 +990,7 @@ async fn execute_async(args: RunArgs, sink: LogSink, global: GlobalOptions) -> a
     let base_pkg = get_cwp()?;
     refuse_misplaced_tool_args(&args, &base_pkg)?;
     let m = resolve_matcher(&args.expr, &args.arg1, &args.arg2, &base_pkg, false)?;
-    let (engine, shutdown) = bootstrap::new_engine(&global)?;
+    let (engine, shutdown) = bootstrap::new_engine(&global, session)?;
     let raw = args.raw;
     let app = RunApp {
         args,
@@ -1051,7 +1062,7 @@ async fn execute_async(args: RunArgs, sink: LogSink, global: GlobalOptions) -> a
         )
     });
 
-    let result = tui::run_app(app, sink, interactive, shutdown).await;
+    let result = tui::run_app(app, sink, session, interactive, shutdown).await;
     // Stop before teardown so no paragraph races the final summary.
     if let Some(w) = &watchdog {
         w.stop();

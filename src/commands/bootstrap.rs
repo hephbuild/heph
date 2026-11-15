@@ -7,6 +7,7 @@ use tokio::sync::mpsc;
 
 use crate::engine::config::ConfigYamlExt;
 use crate::engine::config_yaml;
+use crate::tui::session::SessionSlot;
 use crate::{
     engine, pluginbuildfile, pluginexec, pluginhostbin, pluginhttp, pluginnix, plugintemplate,
     plugintextfile,
@@ -209,19 +210,24 @@ fn listed_facts_kill_switch(v: Option<&std::ffi::OsStr>) -> bool {
 
 /// Build the engine for one command. `global` is the command line's global
 /// options; the engine reads its pool overrides (`-j`, `--resource`) from it.
+/// The workspace it resolves is recorded in `session`, the process's session
+/// threaded from `main`, for the `meta.json` of the session a later `run_app`
+/// opens. Only workspace fields are stored: a command that never reaches
+/// `run_app` opens no session.
 pub fn new_engine(
     global: &super::GlobalOptions,
+    session: &SessionSlot,
 ) -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
-    new_engine_with(global, BadEnv::Refuse)
+    new_engine_with(global, BadEnv::Refuse, Some(session))
 }
 
 /// The engine for a caller with no command line of its own: shell
 /// completion and the credential helpers, which a shell or another tool runs
 /// and which execute no target. A malformed `HEPH_RESOURCE_<NAME>` is ignored
 /// with a warning there rather than breaking `<TAB>` or `git push`; the next
-/// real command still refuses it.
+/// real command still refuses it. They record no session.
 pub fn new_helper_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
-    new_engine_with(&super::GlobalOptions::default(), BadEnv::Ignore)
+    new_engine_with(&super::GlobalOptions::default(), BadEnv::Ignore, None)
 }
 
 /// What a malformed `HEPH_RESOURCE_<NAME>` does to engine construction.
@@ -300,6 +306,7 @@ fn engine_config(
 fn new_engine_with(
     global: &super::GlobalOptions,
     bad_env: BadEnv,
+    session: Option<&SessionSlot>,
 ) -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     let root = match engine::get_root() {
         Ok(r) => r,
@@ -314,6 +321,12 @@ fn new_engine_with(
     // in-flight report rather than in the temp-dir fallback. Every command routes
     // through here, so every command gets it.
     crate::diag::set_dump_dir(&config.home_dir);
+    // The session a later `run_app` opens records which workspace it ran in,
+    // and the cwd heph resolved it from (`HEPH_CWD` when set).
+    let cwd = engine::get_cwd().context("resolving the working directory")?;
+    if let Some(session) = session {
+        session.set_workspace(&cwd, &root, &config.home_dir);
+    }
 
     // Captured before `config` is moved into the engine: the nix driver's state
     // dir hangs off `home_dir`, and telemetry reports the remote-cache backend

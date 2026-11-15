@@ -1,0 +1,1315 @@
+//! The recording side, end to end through the files it writes.
+#![expect(
+    clippy::unwrap_in_result,
+    reason = "test `Write` impls; a poisoned test mutex should fail the test"
+)]
+
+use std::io::{self, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use hcore::events::{BuildEvent, BuildEventKind};
+
+use super::cleanup::Retention;
+use super::recorder::{Faults, RecorderStart};
+use super::*;
+use crate::tui::app::{App, AppContext, CIAppView, TUIAppView};
+use crate::tui::progress::BuildState;
+
+fn events() -> Vec<BuildEvent> {
+    let ev = |at, kind| BuildEvent {
+        at_unix_ms: at,
+        kind,
+    };
+    vec![
+        ev(
+            1,
+            BuildEventKind::Matched {
+                addrs: vec!["//a:ok".into(), "//a:bad".into()],
+                complete: true,
+            },
+        ),
+        ev(
+            2,
+            BuildEventKind::ResultStart {
+                addr: "//a:ok".into(),
+            },
+        ),
+        ev(
+            2,
+            BuildEventKind::ResultStart {
+                addr: "//a:bad".into(),
+            },
+        ),
+        ev(
+            3,
+            BuildEventKind::ExecuteStart {
+                addr: "//a:ok".into(),
+                driver: "exec".into(),
+                cache: true,
+                declared: None,
+                reserved: None,
+                queued_ms: None,
+            },
+        ),
+        ev(
+            4,
+            BuildEventKind::ResultLockWaitStart {
+                addr: "//a:bad".into(),
+                holder_pid: Some(77),
+                in_use_by_readers: false,
+            },
+        ),
+        ev(
+            5,
+            BuildEventKind::ResultEnd {
+                addr: "//a:bad".into(),
+                error: Some("boom".into()),
+                upstream_of: None,
+                exit_status: None,
+                log_tail: None,
+                timed_out: None,
+            },
+        ),
+    ]
+}
+
+fn read_records(dir: &Path) -> (Vec<SessionRecord>, u64) {
+    let file = std::fs::File::open(dir.join(files::EVENTS)).expect("events");
+    let mut r = RecordReader::new(file);
+    let recs = std::iter::from_fn(|| r.next_record().expect("read")).collect();
+    (recs, r.skipped())
+}
+
+fn start() -> SessionStart {
+    SessionStart {
+        header: SessionHeader {
+            kind: HeaderKind::Build,
+            label: "run //a:...".into(),
+        },
+        argv: vec!["heph".into(), "run".into()],
+        ..SessionStart::default()
+    }
+}
+
+/// Folding `events.ndjson` gives the view's state, and the session ends with
+/// `End`, a final status carrying the exit, and a released lock.
+#[test]
+fn recorder_round_trip_matches_live_view() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let session = Session::open(&SessionRoot::new(root.path()), start()).expect("open");
+    let dir = session.dir().to_path_buf();
+    let mut live = BuildState::new();
+    let tap = session.tap();
+    for ev in events() {
+        live.apply(&ev);
+        tap.event(ev);
+    }
+    tap.log("INFO", "hello\u{1b}[31m".into());
+    session.finish(Some(1), false);
+
+    let (records, skipped) = read_records(&dir);
+    assert_eq!(skipped, 0);
+    let mut replayed = BuildState::new();
+    for ev in records.iter().filter_map(SessionRecord::build_event) {
+        replayed.apply(&ev);
+    }
+    assert_eq!(replayed.snapshot(), live.snapshot(), "recorded == folded");
+    assert!(records.iter().any(|r| r.session
+        == Some(SessionRecordKind::Log {
+            level: "INFO".into(),
+            msg: "hello\u{1b}[31m".into()
+        })));
+    assert_eq!(
+        records.last().and_then(|r| r.session.clone()),
+        Some(SessionRecordKind::End {
+            exit_code: Some(1),
+            panicked: false
+        })
+    );
+    let status = SessionSnapshot::decode(&std::fs::read(dir.join(files::STATUS)).expect("status"))
+        .expect("decode");
+    assert_eq!(status.failed, vec!["//a:bad".to_owned()]);
+    assert_eq!(
+        status.lock_waits.first().and_then(|w| w.holder_pid),
+        Some(77)
+    );
+    assert_eq!(status.end.as_ref().and_then(|e| e.exit_code), Some(1));
+    let meta =
+        SessionMeta::decode(&std::fs::read(dir.join(files::META)).expect("meta")).expect("meta");
+    assert_eq!(meta.id, session.id());
+    assert_eq!(meta.owner_pid, std::process::id());
+    assert!(meta.has_capability(CAPABILITY_INFLIGHT));
+    assert!(
+        !lockfile::is_held(&dir.join(files::LOCK)).expect("probe"),
+        "released after End"
+    );
+}
+
+/// I6: the root, the session directory and every file are user-only.
+#[test]
+fn files_are_user_only() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let sessions = root.path().join("sessions");
+    let session = Session::open(&SessionRoot::new(&sessions), start()).expect("open");
+    session.tap().event(events().remove(0));
+    session.finish(Some(0), false);
+    let mode = |p: &Path| std::fs::metadata(p).expect("stat").permissions().mode() & 0o777;
+    assert_eq!(mode(&sessions), 0o700);
+    assert_eq!(mode(session.dir()), 0o700);
+    for f in [files::META, files::LOCK, files::EVENTS, files::STATUS] {
+        assert_eq!(mode(&session.dir().join(f)), 0o600, "{f}");
+    }
+}
+
+/// A lock that cannot be taken (NFS `ENOLCK`) fails the open, says which step
+/// failed, and leaves no session directory behind — every run, not a leak each.
+#[test]
+fn failed_lock_leaves_no_directory() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let sessions = root.path().join("sessions");
+    let faults = Faults {
+        fail_lock: true,
+        ..Faults::default()
+    };
+    for _ in 0..3 {
+        let err = Session::open_with(
+            &SessionRoot::new(&sessions),
+            start(),
+            Retention::default(),
+            faults,
+        )
+        .expect_err("the lock fails");
+        assert!(format!("{err:#}").contains("lock"), "{err:#}");
+    }
+    assert_eq!(entries(&sessions), 0, "a failed open leaked a directory");
+}
+
+/// An ended session whose `status.json` a newer heph wrote is listed as
+/// unreadable, never as having no status (which reads `lost`).
+#[test]
+fn newer_status_is_unreadable_not_missing() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let session = Session::open(&SessionRoot::new(root.path()), start()).expect("open");
+    session.finish(Some(0), false);
+    std::fs::write(
+        session.dir().join(files::STATUS),
+        format!(r#"{{"version": {}}}"#, SNAPSHOT_VERSION + 1),
+    )
+    .expect("write");
+    let listed = source::list_dir(root.path()).expect("list");
+    assert_eq!(listed.len(), 1);
+    assert!(!listed[0].live);
+    assert!(listed[0].status.is_none());
+    assert!(listed[0].status_unreadable);
+}
+
+/// A read-only `HOME`: the root cannot be created. The open fails naming the
+/// directory, and nothing is written. Root ignores the mode bits, so this
+/// says nothing there.
+#[test]
+fn unwritable_root_fails_cleanly() {
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: root ignores directory modes");
+        return;
+    }
+    let home = tempfile::tempdir().expect("tempdir");
+    let dot_heph = home.path().join(".heph");
+    std::fs::create_dir(&dot_heph).expect("mkdir");
+    std::fs::set_permissions(&dot_heph, std::fs::Permissions::from_mode(0o500)).expect("chmod");
+    let sessions = dot_heph.join("sessions");
+    let err = Session::open(&SessionRoot::new(&sessions), start()).expect_err("unwritable");
+    std::fs::set_permissions(&dot_heph, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    assert!(format!("{err:#}").contains("creating"), "{err:#}");
+    assert!(!sessions.exists());
+}
+
+/// I2: the lock is held while the session lives, released by `finish`, and
+/// its fd (like the events fd) is close-on-exec, so no child keeps it alive.
+#[test]
+fn lock_released_on_exit_and_not_inherited() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let lock = lockfile::acquire_owner_lock(&dir.path().join(files::LOCK)).expect("lock");
+    let events = std::fs::OpenOptions::new()
+        .create_new(true)
+        .append(true)
+        .open(dir.path().join(files::EVENTS))
+        .expect("events");
+    for fd in [lock.as_raw_fd(), events.as_raw_fd()] {
+        // SAFETY: querying the flags of an fd this test owns.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(
+            flags >= 0 && flags & libc::FD_CLOEXEC != 0,
+            "fd {fd} is CLOEXEC"
+        );
+    }
+    drop(events);
+    drop(lock);
+
+    let root = tempfile::tempdir().expect("tempdir");
+    let session = Session::open(&SessionRoot::new(root.path()), start()).expect("open");
+    let lock_path = session.dir().join(files::LOCK);
+    assert!(lockfile::is_held(&lock_path).expect("probe"));
+    // A child spawned now does not inherit it: the lock frees on finish even
+    // while the child lives.
+    let mut child = std::process::Command::new("sleep")
+        .arg("5")
+        .spawn()
+        .expect("spawn");
+    session.finish(Some(0), false);
+    assert!(
+        !lockfile::is_held(&lock_path).expect("probe"),
+        "child holds nothing"
+    );
+    child.kill().expect("kill");
+    child.wait().expect("wait");
+}
+
+/// A writer that fails like a full disk.
+struct Enospc;
+
+impl Write for Enospc {
+    fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+        Err(io::Error::from_raw_os_error(libc::ENOSPC))
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Err(io::Error::from_raw_os_error(libc::ENOSPC))
+    }
+}
+
+/// A writer that blocks until released.
+struct Blocked(Arc<(Mutex<bool>, std::sync::Condvar)>);
+
+impl Write for Blocked {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let (lock, cv) = &*self.0;
+        let mut open = lock.lock().expect("lock");
+        while !*open {
+            open = cv.wait(open).expect("wait");
+        }
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn recorder_with(dir: &Path, events: Box<dyn Write + Send>, faults: Faults) -> Recorder {
+    let lock = lockfile::acquire_owner_lock(&dir.join(files::LOCK)).expect("lock");
+    Recorder::spawn(RecorderStart {
+        dir: dir.to_path_buf(),
+        root: dir.join("no-root"),
+        lock,
+        events,
+        retention: Retention::default(),
+        faults,
+    })
+    .expect("spawn")
+}
+
+/// A `MakeWriter` collecting log output, to count warnings.
+#[derive(Clone, Default)]
+struct Captured(Arc<Mutex<Vec<u8>>>);
+
+impl Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().expect("lock").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Captured {
+    /// The log, once every subscriber writing to it is gone, so nothing more
+    /// can land in it.
+    ///
+    /// The recorder thread logs through its own clone of the test's
+    /// dispatcher, and sets the stopped latch *before* its `warn!` (A9): a
+    /// test that sees `is_stopped()` can read the log before the warning is
+    /// in it. The clone is dropped only when the thread exits, so the
+    /// subscriber (and the writer it holds) outliving the test's own
+    /// `with_default` is exactly "the recorder may still log".
+    #[track_caller]
+    fn settled_log(&self) -> String {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while Arc::strong_count(&self.0) > 1 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            Arc::strong_count(&self.0),
+            1,
+            "the recorder thread is still running"
+        );
+        String::from_utf8(self.0.lock().expect("lock").clone()).expect("utf8")
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+    type Writer = Self;
+    fn make_writer(&'a self) -> Self {
+        self.clone()
+    }
+}
+
+/// I1/A9: a full disk stops the recording with exactly one warning, the
+/// senders keep going without error, and finish still releases the lock.
+#[test]
+fn enospc_warns_once() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let captured = Captured::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(captured.clone())
+        .with_ansi(false)
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        let rec = recorder_with(dir.path(), Box::new(Enospc), Faults::default());
+        let tap = rec.tap();
+        // Past one BufWriter's worth, so the failure surfaces mid-stream.
+        for _ in 0..2000 {
+            for ev in events() {
+                tap.event(ev);
+            }
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !tap.is_stopped() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(tap.is_stopped(), "the failure latched");
+        for ev in events() {
+            tap.event(ev);
+        }
+        rec.finish(Some(0), false, Duration::from_secs(1));
+    });
+    let log = captured.settled_log();
+    assert_eq!(log.matches("WARN").count(), 1, "{log}");
+    assert!(!lockfile::is_held(&dir.path().join(files::LOCK)).expect("probe"));
+}
+
+/// A send after `finish` (a log line on the way out: `--pprof-cpu`'s, the
+/// telemetry's) is dropped silently. `End` is counted like any other message,
+/// so the pending count cannot underflow into a false "fell behind" stop.
+#[test]
+fn send_after_finish_is_dropped_silently() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let captured = Captured::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(captured.clone())
+        .with_ansi(false)
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        let rec = recorder_with(dir.path(), Box::new(io::sink()), Faults::default());
+        let tap = rec.tap();
+        tap.log("INFO", "before".into());
+        rec.finish(Some(0), false, Duration::from_secs(5));
+        tap.log("INFO", "after".into());
+        for ev in events() {
+            tap.event(ev);
+        }
+        assert!(
+            !tap.is_stopped(),
+            "a send after finish stopped the recording"
+        );
+    });
+    let log = captured.settled_log();
+    assert_eq!(log.matches("WARN").count(), 0, "{log}");
+}
+
+/// I1/A8: a write that never returns blocks neither the sender nor the
+/// finisher past its timeout.
+#[test]
+fn recorder_blocked_write_does_not_block_app() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let rec = recorder_with(
+        dir.path(),
+        Box::new(Blocked(Arc::clone(&gate))),
+        Faults::default(),
+    );
+    let tap = rec.tap();
+    let started = std::time::Instant::now();
+    for _ in 0..5000 {
+        for ev in events() {
+            tap.event(ev);
+        }
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "sends never block"
+    );
+    let finishing = std::time::Instant::now();
+    rec.finish(Some(0), false, Duration::from_millis(200));
+    assert!(
+        finishing.elapsed() < Duration::from_secs(2),
+        "finish is bounded"
+    );
+    assert!(!lockfile::is_held(&dir.path().join(files::LOCK)).expect("probe"));
+    let (lock, cv) = &*gate;
+    *lock.lock().expect("lock") = true;
+    cv.notify_all();
+}
+
+/// I1: a recorder that panics costs the recording, not the run.
+#[test]
+fn recorder_panic_does_not_fail_app() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let rec = recorder_with(
+        dir.path(),
+        Box::new(io::sink()),
+        Faults {
+            panic_on_event: true,
+            ..Faults::default()
+        },
+    );
+    let tap = rec.tap();
+    for _ in 0..100 {
+        for ev in events() {
+            tap.event(ev);
+        }
+    }
+    rec.finish(Some(0), false, Duration::from_secs(1));
+    assert!(!lockfile::is_held(&dir.path().join(files::LOCK)).expect("probe"));
+}
+
+/// A10: past the cap, one `Truncated` and nothing else but `End`.
+#[test]
+fn events_cap_truncates() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = std::fs::File::create(dir.path().join(files::EVENTS)).expect("events");
+    let rec = recorder_with(dir.path(), Box::new(file), Faults::default());
+    let tap = rec.tap();
+    let big = "x".repeat(1024 * 1024);
+    for _ in 0..70 {
+        tap.log("INFO", big.clone());
+    }
+    tap.event(events().remove(0));
+    rec.finish(Some(0), false, Duration::from_secs(10));
+    let size = std::fs::metadata(dir.path().join(files::EVENTS))
+        .expect("stat")
+        .len();
+    assert!(size <= recorder::EVENTS_CAP + 1024, "{size}");
+    let (records, _) = read_records(dir.path());
+    let kinds: Vec<_> = records
+        .iter()
+        .rev()
+        .take(2)
+        .filter_map(|r| r.session.clone())
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            SessionRecordKind::End {
+                exit_code: Some(0),
+                panicked: false
+            },
+            SessionRecordKind::Truncated
+        ]
+    );
+    let status =
+        SessionSnapshot::decode(&std::fs::read(dir.path().join(files::STATUS)).expect("status"))
+            .expect("decode");
+    assert!(status.truncated);
+    assert!(
+        status.counts.matched.is_some(),
+        "status keeps folding past the cap"
+    );
+}
+
+/// Past the cap, the view records a truncated session still needs at its end
+/// are written: the failure report, a label change, the prompt's clear and
+/// `Finished`. A prompt itself, a log line and a build event are not.
+#[test]
+fn events_cap_keeps_the_ending_view_records() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = std::fs::File::create(dir.path().join(files::EVENTS)).expect("events");
+    let rec = recorder_with(dir.path(), Box::new(file), Faults::default());
+    let tap = rec.tap();
+    let big = "x".repeat(1024 * 1024);
+    for _ in 0..70 {
+        tap.log("INFO", big.clone());
+    }
+    let prompt = SessionRecordKind::Approval {
+        prompt: Some(Box::new(ApprovalPrompt {
+            addr: "//a:gate".into(),
+            ..ApprovalPrompt::default()
+        })),
+    };
+    let kept = [
+        SessionRecordKind::Label {
+            label: "run //a:... (4 matched)".into(),
+        },
+        SessionRecordKind::Approval { prompt: None },
+        SessionRecordKind::Finished,
+        SessionRecordKind::Output {
+            text: "failed: //a:bad\n".into(),
+        },
+    ];
+    tap.view(1, prompt);
+    tap.event(events().remove(0));
+    for kind in kept.iter().cloned() {
+        tap.view(1, kind);
+    }
+    tap.log("INFO", "after the cap".into());
+    rec.finish(Some(1), false, Duration::from_secs(10));
+
+    let (records, _) = read_records(dir.path());
+    let tail: Vec<_> = records
+        .iter()
+        .skip_while(|r| r.session != Some(SessionRecordKind::Truncated))
+        .collect();
+    assert!(
+        tail.iter().all(|r| r.kind.is_none()),
+        "no build event past the cap"
+    );
+    let kinds: Vec<_> = tail.iter().filter_map(|r| r.session.clone()).collect();
+    let mut want = vec![SessionRecordKind::Truncated];
+    want.extend(kept);
+    want.push(SessionRecordKind::End {
+        exit_code: Some(1),
+        panicked: false,
+    });
+    assert_eq!(kinds, want);
+}
+
+/// `status.json` stays bounded however many targets wait: 50k lock waits and
+/// 50k admission waits through a real recorder, read back from the file it
+/// wrote — while live and after `End` — have every list cut to
+/// `STATUS_LIST_CAP` and every total and count in full.
+#[test]
+fn status_json_is_capped_through_the_recorder() {
+    const N: u64 = 50_000;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let rec = recorder_with(dir.path(), Box::new(io::sink()), Faults::default());
+    let tap = rec.tap();
+    let ev = |kind| BuildEvent {
+        at_unix_ms: 1,
+        kind,
+    };
+    // A target in flight with an open operation: it counts as running.
+    let start = |addr: &str| {
+        tap.event(ev(BuildEventKind::ResultStart { addr: addr.into() }));
+        tap.event(ev(BuildEventKind::ExecuteStart {
+            addr: addr.into(),
+            driver: "exec".into(),
+            cache: true,
+            declared: None,
+            reserved: None,
+            queued_ms: None,
+        }));
+    };
+    for i in 0..N {
+        let addr = format!("//l:t{i:05}");
+        start(&addr);
+        tap.event(ev(BuildEventKind::ResultLockWaitStart {
+            addr,
+            holder_pid: Some(4242),
+            in_use_by_readers: false,
+        }));
+        let addr = format!("//w:t{i:05}");
+        start(&addr);
+        tap.event(ev(BuildEventKind::AdmissionWaitStart {
+            addr,
+            pool: "cpu".to_owned(),
+            need: 1,
+            free: 0,
+            ahead: 0,
+            removals_pending: None,
+        }));
+    }
+    let read = || -> Option<(usize, SessionSnapshot)> {
+        let bytes = std::fs::read(dir.path().join(files::STATUS)).ok()?;
+        Some((bytes.len(), SessionSnapshot::decode(&bytes).ok()?))
+    };
+    let check = |when: &str, size: usize, s: &SessionSnapshot| {
+        assert!(size < 48 * 1024, "{when}: status.json is {size} bytes");
+        let cap = STATUS_LIST_CAP;
+        assert_eq!(s.running.len(), cap, "{when}");
+        assert_eq!(s.waiting.len(), cap, "{when}");
+        assert_eq!(s.lock_waits.len(), cap, "{when}");
+        assert_eq!(s.admission_waits.len(), cap, "{when}");
+        for (name, total, want) in [
+            ("running", s.totals.running, 2 * N),
+            ("waiting", s.totals.waiting, 2 * N),
+            ("lock_waits", s.totals.lock_waits, N),
+            ("admission_waits", s.totals.admission_waits, N),
+        ] {
+            assert_eq!(total.total, want, "{when}: {name}");
+            assert!(total.truncated, "{when}: {name}");
+        }
+        assert!(!s.totals.failed.truncated, "{when}");
+        assert_eq!(s.counts.in_flight, 2 * N, "{when}");
+        // Every running target waits: the count says so though the lists
+        // were cut.
+        assert_eq!(s.counts.running_unblocked, Some(0), "{when}");
+        assert_eq!(s.lock_waits[0].addr, "//l:t00000", "{when}");
+        assert_eq!(s.lock_waits[0].holder_pid, Some(4242), "{when}");
+    };
+
+    // Live: the periodic write, once it has folded everything.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let live = loop {
+        if let Some((size, s)) = read()
+            && s.totals.admission_waits.total == N
+        {
+            break (size, s);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the recorder never wrote a status.json with every wait"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(live.1.end.is_none());
+    check("live", live.0, &live.1);
+
+    rec.finish(Some(0), false, Duration::from_secs(30));
+    let (size, last) = read().expect("the final status.json");
+    assert!(last.end.is_some(), "the final write carries End");
+    check("after End", size, &last);
+}
+
+/// A12: a taken id is skipped for a fresh draw.
+#[test]
+fn id_collision_retries() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let taken = SessionId::new(1_000, 5);
+    std::fs::create_dir(root.path().join(taken.encode())).expect("mkdir");
+    let mut draws = [5u8, 5, 6].into_iter();
+    let (id, dir) =
+        create_session_dir(root.path(), 1_000, || draws.next().unwrap_or(0)).expect("create");
+    assert_eq!(id, SessionId::new(1_000, 6));
+    assert!(dir.is_dir());
+}
+
+#[derive(Default)]
+struct NullView;
+
+impl CIAppView for NullView {
+    fn apply(&mut self, _ev: &BuildEvent) {}
+}
+
+impl TUIAppView for NullView {
+    fn apply(&mut self, _ev: &BuildEvent) {}
+    fn rows(&self, _h: u16) -> u16 {
+        1
+    }
+    fn render(&self, _s: &str, _n: u64, _w: u16, _h: u16) -> Vec<ratatui::text::Line<'static>> {
+        Vec::new()
+    }
+}
+
+struct EmitApp {
+    records: bool,
+    ran: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl App for EmitApp {
+    type Output = ();
+    type TuiView = NullView;
+    type CiView = NullView;
+
+    fn tui_view(&self) -> NullView {
+        NullView
+    }
+    fn ci_view(&self) -> NullView {
+        NullView
+    }
+    fn records_session(&self) -> bool {
+        self.records
+    }
+    async fn run(self, ctx: AppContext) -> anyhow::Result<()> {
+        if let Some(tx) = ctx.event_sender() {
+            for ev in events() {
+                tx.send(ev).expect("send");
+            }
+        }
+        self.ran.store(true, Ordering::Release);
+        Ok(())
+    }
+}
+
+/// Run an app on the line backend against `slot`; whether it ran.
+async fn run_in(slot: &Arc<SessionSlot>, records: bool) -> bool {
+    let ran = Arc::new(AtomicBool::new(false));
+    let (shutdown, _rx) = hcore::shutdown::ShutdownTrigger::new();
+    crate::tui::run_app(
+        EmitApp {
+            records,
+            ran: Arc::clone(&ran),
+        },
+        crate::tui::LogSink::new_direct_with(Arc::clone(slot)),
+        slot,
+        false,
+        shutdown,
+    )
+    .await
+    .expect("app");
+    ran.load(Ordering::Acquire)
+}
+
+fn entries(p: &Path) -> usize {
+    std::fs::read_dir(p).map_or(0, Iterator::count)
+}
+
+/// The line backend records what the app emits, through the slot, and `finish`
+/// closes it.
+#[tokio::test]
+async fn run_app_records_through_the_slot() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let slot = Arc::new(SessionSlot::new());
+    slot.configure(
+        SessionRoot::from_env(None, Some(home.path().as_os_str())),
+        vec!["heph".into()],
+    );
+    // The cwd heph resolved (`HEPH_CWD`), not the process's own.
+    let ws = tempfile::tempdir().expect("tempdir");
+    let cwd = ws.path().join("sub");
+    slot.set_workspace(&cwd, ws.path(), &ws.path().join(".heph"));
+    assert!(run_in(&slot, true).await);
+    let dir = slot.dir().expect("a session opened");
+    assert!(dir.starts_with(home.path().join(".heph").join(SESSIONS_DIR)));
+    let meta =
+        SessionMeta::decode(&std::fs::read(dir.join(files::META)).expect("meta")).expect("meta");
+    assert_eq!(meta.cwd.as_deref(), Some(&*cwd.to_string_lossy()));
+    assert_eq!(
+        meta.workspace_root.as_deref(),
+        Some(&*ws.path().to_string_lossy())
+    );
+    slot.finish(Some(0));
+    let (records, _) = read_records(&dir);
+    assert_eq!(
+        records.iter().filter(|r| r.kind.is_some()).count(),
+        events().len()
+    );
+}
+
+/// A3: a viewer's app records nothing.
+#[tokio::test]
+async fn viewer_does_not_record_itself() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let slot = Arc::new(SessionSlot::new());
+    slot.configure(
+        SessionRoot::from_env(None, Some(home.path().as_os_str())),
+        Vec::new(),
+    );
+    assert!(run_in(&slot, false).await);
+    assert!(slot.dir().is_none());
+    assert_eq!(entries(home.path()), 0, "not even ~/.heph");
+}
+
+/// A4: `HEPH_NO_SESSION=1` writes nothing.
+#[tokio::test]
+async fn no_session_env_writes_nothing() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let slot = Arc::new(SessionSlot::new());
+    let root = SessionRoot::from_env(Some("1".as_ref()), Some(home.path().as_os_str()));
+    assert_eq!(root, Ok(None));
+    slot.configure(root, Vec::new());
+    assert!(run_in(&slot, true).await);
+    assert!(slot.dir().is_none());
+    assert_eq!(entries(home.path()), 0);
+}
+
+/// A4: no `HOME` means no session, and the build still runs.
+#[tokio::test]
+async fn home_unset_runs_without_session() {
+    let slot = Arc::new(SessionSlot::new());
+    let root = SessionRoot::from_env(None, None);
+    assert!(root.is_err());
+    slot.configure(root, Vec::new());
+    assert!(run_in(&slot, true).await);
+    assert!(slot.dir().is_none());
+    // An unwritable root behaves the same.
+    let ro = tempfile::tempdir().expect("tempdir");
+    std::fs::set_permissions(ro.path(), std::fs::Permissions::from_mode(0o500)).expect("chmod");
+    let slot = Arc::new(SessionSlot::new());
+    slot.configure(
+        Ok(Some(SessionRoot::new(ro.path().join("sessions")))),
+        Vec::new(),
+    );
+    assert!(run_in(&slot, true).await);
+    assert!(slot.dir().is_none());
+    std::fs::set_permissions(ro.path(), std::fs::Permissions::from_mode(0o700)).expect("chmod");
+}
+
+/// The file source follows a live session from its directory: the records so
+/// far, `CaughtUp`, each new record, then `Ended` with the exit code once the
+/// owner writes `End` — and `list` reads the lock, meta and status only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn file_source_follows_until_end() {
+    use futures::StreamExt as _;
+    let root = tempfile::tempdir().expect("tempdir");
+    let session = Session::open(&SessionRoot::new(root.path()), start()).expect("open");
+    let tap = session.tap();
+    let mut evs = events().into_iter();
+    tap.event(evs.next().expect("one event"));
+
+    let source = FileSource::new(root.path());
+    let listed = source.list().await.expect("list");
+    assert_eq!(listed.len(), 1);
+    let entry = listed.first().expect("entry");
+    assert!(entry.live && entry.id == session.id());
+
+    let mut stream = source.subscribe(session.id()).await.expect("subscribe");
+    let mut records = 0usize;
+    let mut caught_up = false;
+    for ev in evs {
+        tap.event(ev);
+    }
+    session.finish(Some(3), false);
+    let ended = loop {
+        match stream.next().await.expect("item").expect("ok") {
+            SessionItem::Record(_) => records += 1,
+            SessionItem::CaughtUp { skipped } => {
+                assert_eq!(skipped, 0);
+                caught_up = true;
+            }
+            SessionItem::Ended { exit, lost } => break (exit, lost),
+        }
+    };
+    assert!(caught_up);
+    assert_eq!(ended, (Some(3), false));
+    // Every event plus the `End` record.
+    assert_eq!(records, events().len() + 1);
+    let after = source.snapshot(session.id()).await.expect("snapshot");
+    let after = after.expect("still there");
+    assert!(!after.live);
+    assert_eq!(
+        after.status.and_then(|s| s.end).and_then(|e| e.exit_code),
+        Some(3)
+    );
+}
+
+/// Read a follow stream up to its `CaughtUp`, counting the records before it.
+/// An `Ended` first fails the test: the cases below need the follower to be
+/// past its first read before the owner acts.
+async fn until_caught_up(
+    stream: &mut futures::stream::BoxStream<'static, anyhow::Result<SessionItem>>,
+) -> usize {
+    use futures::StreamExt as _;
+    let mut records = 0;
+    loop {
+        match stream.next().await.expect("item").expect("ok") {
+            SessionItem::Record(_) => records += 1,
+            SessionItem::CaughtUp { skipped } => {
+                assert_eq!(skipped, 0);
+                return records;
+            }
+            SessionItem::Ended { .. } => panic!("ended before catching up"),
+        }
+    }
+}
+
+/// `End` written while the follower is already polling the tail (not found
+/// in its first read): every record after `CaughtUp` arrives, then `Ended`
+/// with the exit code, not lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn follow_sees_an_end_written_mid_follow() {
+    use futures::StreamExt as _;
+    let root = tempfile::tempdir().expect("tempdir");
+    let session = Session::open(&SessionRoot::new(root.path()), start()).expect("open");
+    let tap = session.tap();
+    let mut evs = events().into_iter();
+    tap.event(evs.next().expect("one event"));
+    // Recorded before subscribing, so the first read finds it.
+    while read_records(session.dir()).0.is_empty() {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let source = FileSource::new(root.path());
+    let mut stream = source.subscribe(session.id()).await.expect("subscribe");
+    assert_eq!(until_caught_up(&mut stream).await, 1);
+
+    // The follower is in its tail loop now; the rest of the run happens.
+    let rest = evs.len();
+    for ev in evs {
+        tap.event(ev);
+    }
+    session.finish(Some(2), false);
+
+    let mut records = 0usize;
+    let ended = loop {
+        let item = tokio::time::timeout(Duration::from_secs(10), stream.next())
+            .await
+            .expect("the follower sees the end")
+            .expect("item")
+            .expect("ok");
+        match item {
+            SessionItem::Record(_) => records += 1,
+            SessionItem::CaughtUp { .. } => panic!("caught up twice"),
+            SessionItem::Ended { exit, lost } => break (exit, lost),
+        }
+    };
+    assert_eq!(ended, (Some(2), false));
+    assert_eq!(records, rest + 1, "the remaining events plus `End`");
+}
+
+/// The owner's lock freed without an `End` while the follower polls (a
+/// `SIGKILL`ed heph): the follower keeps waiting while the lock is held, and
+/// reads the release as lost, with no exit code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn follow_reads_a_lock_freed_without_end_as_lost() {
+    use futures::StreamExt as _;
+    // A real session gives a real `meta.json` and a first record; the owner
+    // below is hand-made so it can die without writing `End`.
+    let template = tempfile::tempdir().expect("tempdir");
+    let real = Session::open(&SessionRoot::new(template.path()), start()).expect("open");
+    real.tap()
+        .event(events().into_iter().next().expect("one event"));
+    real.finish(Some(0), false);
+    let events_file = std::fs::read_to_string(real.dir().join(files::EVENTS)).expect("events");
+    let first = events_file.lines().next().expect("a first record");
+
+    let root = tempfile::tempdir().expect("tempdir");
+    let dir = root.path().join(real.id().encode());
+    std::fs::create_dir(&dir).expect("mkdir");
+    std::fs::copy(real.dir().join(files::META), dir.join(files::META)).expect("meta");
+    std::fs::write(dir.join(files::EVENTS), format!("{first}\n")).expect("events");
+    let lock = lockfile::acquire_owner_lock(&dir.join(files::LOCK)).expect("lock");
+
+    let source = FileSource::new(root.path());
+    let mut stream = source.subscribe(real.id()).await.expect("subscribe");
+    assert_eq!(until_caught_up(&mut stream).await, 1);
+    // Held: several ticks pass with nothing to say.
+    assert!(
+        tokio::time::timeout(source::FOLLOW_TICK * 3, stream.next())
+            .await
+            .is_err(),
+        "a held lock is a live session"
+    );
+
+    drop(lock);
+    let item = tokio::time::timeout(Duration::from_secs(10), stream.next())
+        .await
+        .expect("the follower sees the release")
+        .expect("item")
+        .expect("ok");
+    assert!(
+        matches!(
+            item,
+            SessionItem::Ended {
+                exit: None,
+                lost: true
+            }
+        ),
+        "{item:?}"
+    );
+}
+
+/// A live session whose owner never said it answers in-flight requests (an
+/// older heph, no `inflight` capability) is refused by name, and the viewer
+/// writes no request file into it: nobody would ever answer one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inflight_is_refused_without_the_capability() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let session = Session::open(&SessionRoot::new(root.path()), start()).expect("open");
+    let meta_path = session.dir().join(files::META);
+    let mut meta = SessionMeta::decode(&std::fs::read(&meta_path).expect("meta")).expect("meta");
+    assert!(meta.has_capability(CAPABILITY_INFLIGHT), "precondition");
+    meta.capabilities.clear();
+    std::fs::write(&meta_path, serde_json::to_vec(&meta).expect("encode")).expect("write meta");
+
+    let err = FileSource::new(root.path())
+        .inflight(session.id(), Duration::from_secs(5))
+        .await
+        .expect_err("refused");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("does not answer in-flight requests"),
+        "names the reason: {msg}"
+    );
+    assert!(
+        !session.dir().join(files::INFLIGHT_REQUEST).exists(),
+        "no request is left for an owner that never reads one"
+    );
+    session.finish(Some(0), false);
+}
+
+fn lock_wait(addr: &str, pid: u32) -> BuildEvent {
+    BuildEvent {
+        at_unix_ms: 1,
+        kind: BuildEventKind::ResultLockWaitStart {
+            addr: addr.into(),
+            holder_pid: Some(pid),
+            in_use_by_readers: false,
+        },
+    }
+}
+
+/// The backend's receiver resolves a holder pid before it folds the event that
+/// first carries it, so the view names the session on that very event while
+/// reading only the cache; the second event with the pid is not resolved again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn receiver_resolves_the_holder_before_the_fold() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let holder = Session::open(&SessionRoot::new(root.path()), start()).expect("holder");
+    let pid = std::process::id();
+    let names = HolderNames::new(Some(SessionRoot::new(root.path())), None);
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut events = TappedReceiver::new(rx, None, names.clone());
+    tx.send(lock_wait("//a:x", pid)).expect("send");
+    tx.send(lock_wait("//a:y", pid)).expect("send");
+
+    let mut seen = None;
+    events
+        .recv(|_| seen = Some(names.get(pid)))
+        .await
+        .expect("an event");
+    assert_eq!(seen, Some(Some(holder.id())), "named on the first fold");
+    assert!(!names.needs(pid), "resolved once, cached");
+    seen = None;
+    events
+        .recv(|_| seen = Some(names.get(pid)))
+        .await
+        .expect("an event");
+    assert_eq!(seen, Some(Some(holder.id())));
+    holder.finish(Some(0), false);
+}
+
+fn wait_addr(ev: &BuildEvent) -> String {
+    match &ev.kind {
+        BuildEventKind::ResultLockWaitStart { addr, .. } => addr.clone(),
+        other => panic!("only lock waits are sent: {other:?}"),
+    }
+}
+
+/// A holder lookup a test controls: it counts its calls, answers `answer`, and
+/// blocks until [`GatedLookup::open`] when built gated.
+#[derive(Clone)]
+struct GatedLookup {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
+}
+
+impl GatedLookup {
+    fn new(open: bool) -> Self {
+        Self {
+            calls: Arc::default(),
+            gate: Arc::new((Mutex::new(open), std::sync::Condvar::new())),
+        }
+    }
+
+    /// Names resolved through this lookup: `pid` maps to `answer(pid)`.
+    fn names(&self, answer: fn(u32) -> Option<SessionId>) -> HolderNames {
+        let this = self.clone();
+        HolderNames::with_lookup(super::holder::FakeLookup(Arc::new(move |pid| {
+            this.calls.fetch_add(1, Ordering::SeqCst);
+            let (open, cv) = &*this.gate;
+            let mut open = open.lock().unwrap();
+            while !*open {
+                open = cv.wait(open).unwrap();
+            }
+            answer(pid)
+        })))
+    }
+
+    fn open(&self) {
+        let (open, cv) = &*self.gate;
+        *open.lock().unwrap() = true;
+        cv.notify_all();
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+fn some_session(pid: u32) -> Option<SessionId> {
+    Some(SessionId::new(1_700_000_000_000 + u64::from(pid), 0))
+}
+
+/// Wait (bounded) until the detached scan has stored `pid`'s answer.
+async fn until_named(names: &HolderNames, pid: u32) {
+    for _ in 0..500 {
+        if names.get(pid).is_some() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("pid {pid} was never named");
+}
+
+/// A `recv` dropped while its event's holder resolves (a `select!` arm losing)
+/// loses nothing and reorders nothing: the event is parked, and once its scan
+/// has answered the teardown drain folds it first, named, exactly once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn receiver_keeps_a_parked_event_across_a_dropped_recv() {
+    use futures::FutureExt as _;
+    let lookup = GatedLookup::new(false);
+    let names = lookup.names(some_session);
+    let pid = 4242;
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut events = TappedReceiver::new(rx, None, names.clone());
+    tx.send(lock_wait("//a:parked", pid)).expect("send");
+    tx.send(lock_wait("//a:next", pid)).expect("send");
+
+    let mut folded: Vec<(String, Option<SessionId>)> = Vec::new();
+    // One poll takes the event and parks it on the gated scan; then the future
+    // is dropped.
+    let first = events
+        .recv(|ev| folded.push((wait_addr(ev), names.get(pid))))
+        .now_or_never();
+    assert!(first.is_none(), "the event is parked, not folded");
+    assert!(folded.is_empty(), "{folded:?}");
+    lookup.open();
+    until_named(&names, pid).await;
+    drop(tx);
+    while events
+        .try_recv(|ev| folded.push((wait_addr(ev), names.get(pid))))
+        .is_ok()
+    {}
+    assert_eq!(
+        folded,
+        [
+            ("//a:parked".to_owned(), some_session(pid)),
+            ("//a:next".to_owned(), some_session(pid)),
+        ]
+    );
+    assert_eq!(lookup.calls(), 1, "scanned once");
+}
+
+/// A scan that hangs (a hung `~/.heph`) holds the event for the bounded wait
+/// only: it is folded showing the pid, the pid is not rescanned on the next
+/// event, and the answer that comes later still names it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn receiver_folds_after_a_slow_scan_with_the_pid() {
+    let lookup = GatedLookup::new(false);
+    let names = lookup.names(some_session);
+    let pid = 4242;
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut events = TappedReceiver::new(rx, None, names.clone());
+    tx.send(lock_wait("//a:x", pid)).expect("send");
+    tx.send(lock_wait("//a:y", pid)).expect("send");
+
+    let started = std::time::Instant::now();
+    let mut seen = None;
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        events.recv(|_| seen = Some(names.get(pid))),
+    )
+    .await
+    .expect("the wait is bounded")
+    .expect("an event");
+    assert_eq!(seen, Some(None), "folded showing the pid");
+    assert!(
+        started.elapsed() >= super::recorder::HOLDER_SCAN_WAIT,
+        "waited for the scan first: {:?}",
+        started.elapsed()
+    );
+    // The next event with the pid is folded at once: the pid is claimed.
+    let next = std::time::Instant::now();
+    events
+        .recv(|_| seen = Some(names.get(pid)))
+        .await
+        .expect("an event");
+    assert!(next.elapsed() < super::recorder::HOLDER_SCAN_WAIT);
+    assert_eq!(lookup.calls(), 1, "not rescanned");
+    // The detached scan finishes on its own and names the pid from then on.
+    lookup.open();
+    until_named(&names, pid).await;
+    assert_eq!(lookup.calls(), 1);
+}
+
+/// A pid with no session is cached as such: the next event is not rescanned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn receiver_caches_a_negative_answer() {
+    let lookup = GatedLookup::new(true);
+    let names = lookup.names(|_| None);
+    let pid = 4242;
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut events = TappedReceiver::new(rx, None, names.clone());
+    tx.send(lock_wait("//a:x", pid)).expect("send");
+    tx.send(lock_wait("//a:y", pid)).expect("send");
+    for _ in 0..2 {
+        events.recv(|_| {}).await.expect("an event");
+    }
+    assert_eq!(lookup.calls(), 1, "scanned once");
+    assert!(!names.needs(pid), "the none is cached");
+    assert_eq!(names.get(pid), None);
+}
+
+/// Two distinct holder pids in a row: each is scanned once and named on its
+/// own first event.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn receiver_names_two_pids_in_a_row() {
+    let lookup = GatedLookup::new(true);
+    let names = lookup.names(some_session);
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut events = TappedReceiver::new(rx, None, names.clone());
+    for (addr, pid) in [("//a:x", 1), ("//a:y", 2), ("//a:z", 1)] {
+        tx.send(lock_wait(addr, pid)).expect("send");
+    }
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        events
+            .recv(|ev| {
+                let pid = super::holder::event_holder_pid(ev).expect("a lock wait");
+                seen.push(names.get(pid));
+            })
+            .await
+            .expect("an event");
+    }
+    assert_eq!(seen, [some_session(1), some_session(2), some_session(1)]);
+    assert_eq!(lookup.calls(), 2, "each pid scanned once");
+}
+
+/// `recv_record_only` (the line backend after its summary) records a parked
+/// event first, then the rest in order, without waiting on its scan.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn record_only_takes_the_parked_event_first() {
+    use futures::FutureExt as _;
+    let root = tempfile::tempdir().expect("tempdir");
+    let session = Session::open(&SessionRoot::new(root.path()), start()).expect("open");
+    let lookup = GatedLookup::new(false);
+    let names = lookup.names(some_session);
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut events = TappedReceiver::new(rx, Some(session.tap()), names);
+    tx.send(lock_wait("//a:parked", 7)).expect("send");
+    tx.send(lock_wait("//a:next", 7)).expect("send");
+    assert!(events.recv(|_| {}).now_or_never().is_none(), "parked");
+    drop(tx);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while events.recv_record_only().await.is_some() {}
+    })
+    .await
+    .expect("record-only never waits on the scan");
+    session.finish(Some(0), false);
+    lookup.open();
+    let (recs, _) = read_records(session.dir());
+    let addrs: Vec<String> = recs
+        .iter()
+        .filter_map(SessionRecord::build_event)
+        .map(|ev| wait_addr(&ev))
+        .collect();
+    assert_eq!(addrs, ["//a:parked", "//a:next"]);
+}
+
+/// An `Output` record is cut to 1 MiB with a marker, so the failure report
+/// written past the event log's cap keeps that overshoot bounded. The cut
+/// falls on a character boundary.
+#[test]
+fn output_records_are_capped() {
+    let short = "failed: //a:bad\n";
+    assert_eq!(capped_output(short), short, "a short report is verbatim");
+    // Two-byte characters after one ASCII byte: the cap falls mid-character.
+    let huge = format!("x{}", "é".repeat(OUTPUT_CAP));
+    let capped = capped_output(&huge);
+    let (kept, marker) = capped.rsplit_once("\n[session: ").expect("a marker line");
+    assert!(kept.len() <= OUTPUT_CAP && kept.len() > OUTPUT_CAP - 4);
+    assert!(huge.starts_with(kept), "the kept part is a prefix");
+    assert_eq!(
+        marker,
+        format!(
+            "output cut at 1 MiB; {} more bytes were printed but not recorded]\n",
+            huge.len() - kept.len()
+        )
+    );
+}

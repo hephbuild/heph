@@ -1,3 +1,4 @@
+use crate::tui::session::SessionSlot;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -304,13 +305,19 @@ fn finish(checks: Vec<anyhow::Result<Vec<String>>>) -> anyhow::Result<()> {
     Err(combined).context("validation failed")
 }
 
-pub fn execute(args: &ValidateArgs, sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
-    bootstrap::block_on(execute_async(args.clone(), sink, global.clone()))?
+pub fn execute(
+    args: &ValidateArgs,
+    sink: LogSink,
+    session: &Arc<SessionSlot>,
+    global: &GlobalOptions,
+) -> anyhow::Result<()> {
+    bootstrap::block_on(execute_async(args.clone(), sink, session, global.clone()))?
 }
 
 async fn execute_async(
     args: ValidateArgs,
     sink: LogSink,
+    session: &Arc<SessionSlot>,
     global: GlobalOptions,
 ) -> anyhow::Result<()> {
     let root = get_root()?;
@@ -318,7 +325,7 @@ async fn execute_async(
         Some(s) => (htpkg::parse(&s, &get_cwp()?)?, true),
         None => (Matcher::PackagePrefix(PkgBuf::from("")), false),
     };
-    let (engine, shutdown) = bootstrap::new_engine(&global)?;
+    let (engine, shutdown) = bootstrap::new_engine(&global, session)?;
     let app = ValidateApp {
         engine,
         matcher,
@@ -327,7 +334,7 @@ async fn execute_async(
         fail_fast: global.fail_fast,
     };
     let interactive = tui::should_use_tui(global.no_tui);
-    tui::run_app(app, sink, interactive, shutdown).await
+    tui::run_app(app, sink, session, interactive, shutdown).await
 }
 
 #[cfg(test)]

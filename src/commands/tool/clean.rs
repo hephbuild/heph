@@ -1,3 +1,4 @@
+use crate::tui::session::SessionSlot;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -149,13 +150,19 @@ fn print_summary(stats: &CleanStats, selection: &str) {
     }
 }
 
-pub fn execute(args: &CleanArgs, sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
-    bootstrap::block_on(execute_async(args.clone(), sink, global.clone()))?
+pub fn execute(
+    args: &CleanArgs,
+    sink: LogSink,
+    session: &Arc<SessionSlot>,
+    global: &GlobalOptions,
+) -> anyhow::Result<()> {
+    bootstrap::block_on(execute_async(args.clone(), sink, session, global.clone()))?
 }
 
 async fn execute_async(
     args: CleanArgs,
     sink: LogSink,
+    session: &Arc<SessionSlot>,
     global: GlobalOptions,
 ) -> anyhow::Result<()> {
     let cwp = get_cwp()?;
@@ -164,14 +171,14 @@ async fn execute_async(
     // selection to make — so it must not be forced through `selection`, which
     // deliberately refuses an empty one rather than wiping the target cache.
     if args.scratch && args.arg1.is_none() && args.expr.is_none() {
-        let (engine, _shutdown) = bootstrap::new_engine(&global)?;
+        let (engine, _shutdown) = bootstrap::new_engine(&global, session)?;
         let (n, freed) = engine.scratch_remove(None)?;
         println!("Removed {n} scratch cache(s), freed {freed} bytes.");
         return Ok(());
     }
 
     let matcher = selection(&args, &cwp)?;
-    let (engine, shutdown) = bootstrap::new_engine(&global)?;
+    let (engine, shutdown) = bootstrap::new_engine(&global, session)?;
     if args.scratch
         && let Some(addr) = args.arg1.as_deref()
     {
@@ -184,7 +191,7 @@ async fn execute_async(
         fail_fast: global.fail_fast,
     };
     let interactive = tui::should_use_tui(global.no_tui);
-    tui::run_app(app, sink, interactive, shutdown).await
+    tui::run_app(app, sink, session, interactive, shutdown).await
 }
 
 #[cfg(test)]

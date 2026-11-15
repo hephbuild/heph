@@ -28,6 +28,7 @@ use std::process::{Command, Output, Stdio};
 use tempfile::TempDir;
 
 pub mod pty;
+pub mod session;
 
 /// Env var naming the staged artifact directory.
 ///

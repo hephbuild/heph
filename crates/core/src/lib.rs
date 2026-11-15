@@ -33,4 +33,5 @@ pub mod shutdown;
 pub mod sysres;
 pub mod template;
 pub mod units;
+pub mod userdir;
 pub mod version;

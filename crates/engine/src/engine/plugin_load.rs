@@ -736,10 +736,8 @@ fn lock_exclusive(path: &std::path::Path) -> anyhow::Result<FileLock> {
 /// are workspace-independent, so they're cached once per user (not per repo).
 #[cfg(unix)]
 fn plugin_cache_dir() -> anyhow::Result<std::path::PathBuf> {
-    let home = std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .ok_or_else(|| anyhow::anyhow!("HOME is not set; cannot locate ~/.heph plugin cache"))?;
-    Ok(home.join(".heph").join("plugins").join(format!(
+    let user_dir = hcore::userdir::heph_user_dir().context("locating the plugin cache")?;
+    Ok(user_dir.join("plugins").join(format!(
         "{}-{}",
         std::env::consts::OS,
         std::env::consts::ARCH

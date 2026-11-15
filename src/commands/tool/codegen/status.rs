@@ -1,6 +1,7 @@
 //! `heph tool codegen status [--check]`: what needs a decision, one line per
 //! file, each ending with the command that settles it.
 
+use crate::tui::session::SessionSlot;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -433,7 +434,12 @@ pub async fn status(
     })
 }
 
-pub fn execute(args: &Args, sink: LogSink, global: &GlobalOptions) -> anyhow::Result<()> {
+pub fn execute(
+    args: &Args,
+    sink: LogSink,
+    session: &Arc<SessionSlot>,
+    global: &GlobalOptions,
+) -> anyhow::Result<()> {
     let opts = Options {
         check: args.check,
         settle: true,
@@ -443,6 +449,7 @@ pub fn execute(args: &Args, sink: LogSink, global: &GlobalOptions) -> anyhow::Re
         "Codegen status",
         args.json,
         sink,
+        session,
         global,
         move |engine, rs| async move { status(&engine, &rs, opts).await },
     )

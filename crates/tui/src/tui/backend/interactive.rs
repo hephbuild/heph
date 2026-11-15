@@ -19,8 +19,10 @@ use tokio::sync::mpsc;
 use crate::tui::app::{App, AppContext, Control, TUIAppView};
 use crate::tui::log_sink::LogSink;
 use crate::tui::progress::HSCROLL_STEP;
+use crate::tui::session::recorder::ViewTap;
+use crate::tui::session::{SessionSlot, TappedReceiver};
 use crate::tui::stderr_backend::StderrBackend;
-use hcore::events::{EventReceiver, now_unix_ms};
+use hcore::events::now_unix_ms;
 use hcore::shutdown::ShutdownTrigger;
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -37,11 +39,22 @@ pub async fn run<A: App + 'static>(
     app: A,
     sink: LogSink,
     shutdown: ShutdownTrigger,
+    slot: Option<&SessionSlot>,
 ) -> anyhow::Result<A::Output> {
     // The app owns its view: aggregation + rendering. It lives on the loop
     // stack so it survives pause/resume (only the terminal is rebuilt across a
     // pause cycle, not the view's aggregated state).
     let mut view = app.tui_view();
+    // No start line here: the terminal is the TUI's. `heph session list` finds it.
+    let session_tap = slot
+        .and_then(|s| s.open(view.session_header(), true))
+        .map(|s| s.tap);
+    // After `open`, so the process's own session is never named as a holder.
+    let holders = app
+        .lock_holders()
+        .or_else(|| slot.map(SessionSlot::holder_names))
+        .unwrap_or_default();
+    view.name_lock_holders(holders.clone());
     // Size the inline viewport to ~1/3 of the terminal height. Queried before the
     // viewport is built (so the first frame is already sized); the column count is
     // re-derived from the backend below.
@@ -57,7 +70,11 @@ pub async fn run<A: App + 'static>(
     // We own the build-event channel: the sender goes to the app via
     // AppContext (and into its request state); we keep the receiver.
     let (event_tx, event_rx) = mpsc::unbounded_channel();
-    let mut build_events: Option<EventReceiver> = Some(event_rx);
+    let mut view_tap = session_tap.clone().map(|tap| ViewTap::new(tap, &view));
+    let mut build_events: Option<TappedReceiver> =
+        Some(TappedReceiver::new(event_rx, session_tap, holders));
+    // The instant a held viewport froze its clock at; the summary uses it too.
+    let mut held_at: Option<u64> = None;
 
     record_raw_mode_restore();
     enable_raw_mode().context("enabling raw mode")?;
@@ -133,7 +150,9 @@ pub async fn run<A: App + 'static>(
                     // User navigated off the main view: hold the viewport up and
                     // surface a "press q to quit" notice instead of auto-exiting.
                     held = true;
-                    view.set_finished();
+                    let at = now_unix_ms();
+                    held_at = Some(at);
+                    view.set_finished(at);
                     app_result = Some(r);
                 } else {
                     break r;
@@ -242,6 +261,8 @@ pub async fn run<A: App + 'static>(
                         if view.is_on_main_view() {
                             if held {
                                 quit = true;
+                            } else if app_result.is_none() {
+                                view.quit_while_running();
                             }
                         } else {
                             view.back_to_main();
@@ -354,18 +375,20 @@ pub async fn run<A: App + 'static>(
                     _ => {}
                 }
             }
+            // Not gated on `!paused` (A1): `apply` never draws, so folding while
+            // the terminal is handed over costs nothing on screen, and a paused
+            // run (an entrypoint, `--shell`) must keep recording its session.
             maybe_build_evt = async {
                 match build_events.as_mut() {
-                    Some(r) => r.recv().await,
-                    None => std::future::pending().await,
-                }
-            }, if !paused => {
-                match maybe_build_evt {
                     // No per-event redraw: fold into the view here, the 80ms
                     // ticker repaints the pinned progress block.
-                    Some(e) => view.apply(&e),
+                    Some(r) => r.recv(|e| view.apply(e)).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if maybe_build_evt.is_none() {
                     // Sender dropped (request finished) — stop polling.
-                    None => build_events = None,
+                    build_events = None;
                 }
             }
             // The app is done and only background work is holding the exit:
@@ -391,6 +414,12 @@ pub async fn run<A: App + 'static>(
                 // so the tick is the wake that cannot be lost; each one
                 // re-enters the loop and the next `select!` re-polls the
                 // control channel, observing any message whose wake vanished.
+                //
+                // Before the paused early-out: a label set while the terminal
+                // is handed over ("Invoking …") is still the run's.
+                if let Some(t) = view_tap.as_mut() {
+                    t.observe(&view);
+                }
                 if paused {
                     if !resume_pending {
                         continue;
@@ -476,13 +505,19 @@ pub async fn run<A: App + 'static>(
     // request state drops). Drain them so the final summary reflects the full
     // stream rather than the snapshot at the last tick.
     if let Some(r) = build_events.as_mut() {
-        while let Ok(e) = r.try_recv() {
-            view.apply(&e);
-        }
+        while r.try_recv(|e| view.apply(e)).is_ok() {}
     }
 
     // Persistent final summary, printed straight to stderr below the
-    // torn-down inline viewport (interactive mode only).
+    // torn-down inline viewport (interactive mode only). Measured at the
+    // instant a held viewport froze at, else now; recorded as `Finished` so a
+    // viewer prints the same line, and so it knows what follows was printed
+    // below it.
+    let at = held_at.unwrap_or_else(now_unix_ms);
+    view.set_finished(at);
+    if let Some(t) = view_tap.as_mut() {
+        t.finished(&view, at);
+    }
     view.last_render();
 
     result
@@ -849,6 +884,127 @@ mod tests {
             "a paused loop whose ticker is gated off has no wake source left \
              once a cross-thread wake is dropped; the tick must stay armed \
              while paused"
+        );
+    }
+
+    /// A paused run keeps recording its session (A1): an entrypoint or `--shell`
+    /// holds the terminal for the whole of its run, and `heph session attach`
+    /// must keep seeing what it builds meanwhile.
+    ///
+    /// Two halves, because `run` itself needs a real terminal. This one drives
+    /// the real recording path (`Session`, its tap, `TappedReceiver`) through a
+    /// loop shaped like `run`'s: a `Control::Pause` is taken first, then every
+    /// build event sent after it must reach `events.ndjson`.
+    /// `run_does_not_gate_the_build_event_arm_on_pause` checks that `run`'s
+    /// own build-event arm carries no pause guard, the edit that would stop
+    /// recording while this loop still passed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_paused_loop_still_records_build_events() {
+        use crate::tui::app::{Control, PauseFor};
+        use crate::tui::session::{
+            HeaderKind, HolderNames, RecordReader, Session, SessionHeader, SessionRecord,
+            SessionRoot, SessionStart, TappedReceiver, files,
+        };
+        use hcore::events::{BuildEvent, BuildEventKind};
+        use tokio::sync::{mpsc, oneshot};
+
+        const SENT: usize = 5;
+        let root = tempfile::tempdir().expect("tempdir");
+        let session = Session::open(
+            &SessionRoot::new(root.path()),
+            SessionStart {
+                header: SessionHeader {
+                    kind: HeaderKind::Build,
+                    label: "run //a:shell".into(),
+                },
+                ..SessionStart::default()
+            },
+        )
+        .expect("open");
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let mut build_events =
+            TappedReceiver::new(event_rx, Some(session.tap()), HolderNames::default());
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+
+        // The app: pause the TUI, and only once the pause is acknowledged emit
+        // the events, so every one of them arrives while paused.
+        let app = tokio::spawn(async move {
+            let (ack, acked) = oneshot::channel();
+            control_tx
+                .send(Control::Pause(ack, PauseFor::Input))
+                .expect("pause");
+            acked.await.expect("ack");
+            for i in 0..SENT {
+                let addr = format!("//a:t{i}");
+                event_tx
+                    .send(BuildEvent {
+                        at_unix_ms: 1,
+                        kind: BuildEventKind::ResultStart { addr },
+                    })
+                    .expect("send");
+            }
+            // Dropping both senders ends the loop below.
+        });
+
+        let mut paused = false;
+        let mut folded_while_paused = 0;
+        let mut control_open = true;
+        let looped = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                tokio::select! {
+                    ctrl = control_rx.recv(), if control_open => match ctrl {
+                        Some(Control::Pause(ack, _)) => {
+                            paused = true;
+                            ack.send(()).expect("ack");
+                        }
+                        Some(Control::Resume) => paused = false,
+                        None => control_open = false,
+                    },
+                    // As in `run`: no pause guard on this arm.
+                    got = build_events.recv(|_| {
+                        if paused {
+                            folded_while_paused += 1;
+                        }
+                    }) => if got.is_none() {
+                        break;
+                    },
+                }
+            }
+        })
+        .await;
+        assert!(looped.is_ok(), "the paused loop never drained the events");
+        app.await.expect("app");
+        drop(build_events);
+        session.finish(Some(0), false);
+
+        assert_eq!(folded_while_paused, SENT, "every event folded while paused");
+        let file = std::fs::File::open(session.dir().join(files::EVENTS)).expect("events");
+        let mut reader = RecordReader::new(file);
+        let recorded = std::iter::from_fn(|| reader.next_record().expect("read"))
+            .filter(|r: &SessionRecord| r.build_event().is_some())
+            .count();
+        assert_eq!(
+            recorded, SENT,
+            "every build event emitted while the TUI was paused is recorded"
+        );
+    }
+
+    /// `run`'s build-event arm must not be guarded on `paused`: with the guard,
+    /// a paused run (an entrypoint, `--shell`) stops recording its session for
+    /// as long as it holds the terminal. `run` needs a real terminal, so this
+    /// reads its source; `a_paused_loop_still_records_build_events` proves
+    /// the unguarded shape records.
+    #[test]
+    fn run_does_not_gate_the_build_event_arm_on_pause() {
+        let src = include_str!("interactive.rs");
+        let (_, arm) = src
+            .split_once("maybe_build_evt = async {")
+            .expect("run's build-event arm");
+        let (head, _) = arm.split_once("=> {").expect("the arm's body");
+        assert!(
+            !head.contains("paused"),
+            "run's build-event arm is gated on `paused`, so a paused run stops \
+             recording its session:\n{head}"
         );
     }
 
@@ -1487,7 +1643,7 @@ mod tests {
         use std::io::Write;
         use tracing_subscriber::fmt::MakeWriter;
 
-        let sink = LogSink::new_direct();
+        let sink = LogSink::new_direct_with(Default::default());
         let mut rx = sink.switch_to_buffered();
         let mut writer = MakeLogSink::new(sink.clone()).make_writer();
 
