@@ -13,7 +13,7 @@ use super::test_events::{T0, at, start};
 use crate::tui::app::{Decide, TUIAppView};
 use crate::tui::approval::{ApprovalCenter, ApprovalNoticeView, ApprovalTicket};
 use crate::tui::dashboard::Tab;
-use crate::tui::dashboard::approval::{FLASH_MS, LOCKOUT_MS};
+use crate::tui::dashboard::approval::{FLASH_HINT, FLASH_MS, LOCKOUT_MS};
 use crate::tui::session::ApprovalStanding;
 
 const COLS: u16 = 120;
@@ -140,6 +140,12 @@ fn approve_armed_after_delay() {
     drop(frame(&mut v, T0));
     v.approval_decide(Decide::Approve, T0 + LOCKOUT_MS);
     assert_eq!(a.rx.try_recv(), Ok(true));
+    // During the flash a key is dropped, and the hint row says so.
+    let flashing = frame(&mut v, T0 + LOCKOUT_MS + 1).join("\n");
+    assert!(
+        flashing.contains(FLASH_HINT) && !flashing.contains("y approve"),
+        "{flashing}"
+    );
     let next = T0 + LOCKOUT_MS + FLASH_MS;
     v.advance(next);
     let f = frame(&mut v, next);

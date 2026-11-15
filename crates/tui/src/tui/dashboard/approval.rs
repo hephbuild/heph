@@ -33,6 +33,9 @@ pub const FLASH_MS: u64 = 1000;
 /// The decision keys' hint, greyed out during the lockout.
 pub const DECISION_HINTS: &str =
     "y approve · n reject · Y approves all, and later · N rejects all, and later (fails them)";
+/// The decision keys' place while the decision just taken shows: a key
+/// pressed then is dropped, and this says so.
+pub const FLASH_HINT: &str = "keys wait for the next request…";
 /// An attached viewer's hint in their place: it decides nothing (I11).
 pub const READ_ONLY_HINT: &str = "read only · decisions happen in the terminal that runs it";
 /// The view's other keys.
@@ -550,6 +553,8 @@ impl ApprovalScreen {
         let room = cols.saturating_sub(2);
         let keys = if self.read_only {
             READ_ONLY_HINT
+        } else if self.flash.is_some() {
+            FLASH_HINT
         } else {
             DECISION_HINTS
         };
