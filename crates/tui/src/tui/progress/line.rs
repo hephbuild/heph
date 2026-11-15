@@ -872,7 +872,7 @@ mod tests {
             (CountScope::Matched, (3, 9, 2, 2, 2)),
             (CountScope::All, (4, 10, 3, 2, 2)),
         ] {
-            v.scope.set(scope);
+            v.list.scope = scope;
             let line = all_text(&v.render("⠋", T0 + 1_000, 200, 40));
             let m = v.state.dashboard();
             let tab = |t: Tab| m.tab_len(t, scope);
