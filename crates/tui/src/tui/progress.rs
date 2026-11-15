@@ -1769,6 +1769,12 @@ pub struct TuiProgressView {
     /// for a live view ([`Self::with_log_reader`]). `None`: the column shows
     /// wait and failure text only (an attached view, until it has a reader).
     tails: Option<crate::tui::dashboard::TailReader>,
+    /// The target screen open over the dashboard (Enter / `l` on a row);
+    /// Esc closes it back to the list, its selection kept.
+    target: Option<crate::tui::dashboard::TargetScreen>,
+    /// Where a target screen reads its log and outputs
+    /// ([`Self::with_target_reader`]). `None`: Overview only.
+    target_reader: Option<std::sync::Arc<dyn crate::tui::dashboard::TargetReader>>,
     /// Whose view this is: the run's own, or a session viewer's. The one seam
     /// between the two; everything not behind it renders identically.
     role: Role,
@@ -1890,6 +1896,8 @@ impl TuiProgressView {
             list: crate::tui::dashboard::ListState::default(),
             last_lines: crate::tui::dashboard::LastLines::default(),
             tails: None,
+            target: None,
+            target_reader: None,
             role: Role::Live { approval: None },
         }
     }
@@ -2178,6 +2186,41 @@ impl TuiProgressView {
         self
     }
 
+    /// Serve the target screens' Log and Outputs tabs from `reader`, on a
+    /// thread per open screen (I4, I7).
+    pub fn with_target_reader(
+        mut self,
+        reader: std::sync::Arc<dyn crate::tui::dashboard::TargetReader>,
+    ) -> Self {
+        self.target_reader = Some(reader);
+        self
+    }
+
+    /// The open target screen's frame, under the dashboard's header.
+    fn target_lines(&mut self, now_ms: u64, cols: u16, rows: u16) -> Option<Vec<Line<'static>>> {
+        let (command, session, clock) = self.dashboard_title_parts(now_ms);
+        let scope = self.list.scope;
+        let tabs = self.state.dash.counts(scope);
+        let title = crate::tui::dashboard::Title {
+            command: &command,
+            session: session.as_deref(),
+            clock: &clock,
+            done: tabs.finished_ok(),
+            total: (scope == CountScope::All || self.state.dash.matched_seen()).then(|| tabs.all()),
+            provisional: scope == CountScope::Matched && !self.state.dash.matched_complete(),
+            standing: self.approval_standing().map(|s| s.indicator()),
+        };
+        let inputs = crate::tui::dashboard::TargetInputs {
+            model: &self.state.dash,
+            waits: &self.state,
+            redact: &self.state.redact,
+            now_ms,
+            scope,
+        };
+        let target = self.target.as_mut()?;
+        Some(target.frame(&title, &inputs, cols, rows))
+    }
+
     /// Redact `redact`'s paths (heph's home) from the error text this view
     /// draws (I9).
     pub fn with_redact(mut self, redact: crate::tui::text::Redact) -> Self {
@@ -2355,18 +2398,31 @@ impl TUIAppView for TuiProgressView {
     }
 
     fn render_full(&mut self, now_ms: u64, cols: u16, rows: u16) -> Vec<Line<'static>> {
-        self.dashboard_lines(now_ms, cols, rows)
+        match self.target_lines(now_ms, cols, rows) {
+            Some(lines) => lines,
+            None => self.dashboard_lines(now_ms, cols, rows),
+        }
+    }
+
+    fn screen_key(&mut self, key: crate::tui::app::ScreenKey) {
+        if let Some(t) = self.target.as_mut() {
+            let _bound = t.key(key, &self.state.redact);
+        }
     }
 
     fn scroll(&mut self, delta: i32) {
-        if self.dashboard_open {
+        if let Some(t) = self.target.as_mut() {
+            t.scroll(isize::try_from(delta).unwrap_or(0));
+        } else if self.dashboard_open {
             let delta = isize::try_from(delta).unwrap_or(0);
             self.list.select_move(&self.state.dash, delta);
         }
     }
 
     fn tab(&mut self, forward: bool) {
-        if self.dashboard_open {
+        if let Some(t) = self.target.as_mut() {
+            t.cycle_tab(forward);
+        } else if self.dashboard_open {
             self.list.cycle_tab(forward);
         } else if self.model.has_dashboard() {
             // From the line, either direction opens the dashboard; a command
@@ -2376,6 +2432,9 @@ impl TUIAppView for TuiProgressView {
     }
 
     fn toggle_scope(&mut self) {
+        if self.target.is_some() {
+            return;
+        }
         self.list.scope = match self.list.scope {
             CountScope::Matched => CountScope::All,
             CountScope::All => CountScope::Matched,
@@ -2387,16 +2446,31 @@ impl TUIAppView for TuiProgressView {
     }
 
     fn has_active_filter(&self) -> bool {
-        self.list.is_editing() || !self.list.filter().is_empty()
+        match &self.target {
+            Some(t) => t.has_search(),
+            None => self.list.is_editing() || !self.list.filter().is_empty(),
+        }
     }
 
     fn back_to_main(&mut self) {
-        self.dashboard_open = false;
+        // From a target screen, back to the list; from the list, the line.
+        if self.target.take().is_none() {
+            self.dashboard_open = false;
+        }
     }
 
-    fn open_selected(&mut self, _log: bool) {
-        // The target screen (Overview · Log · Outputs) is unit 5c's; until
-        // then Enter and `l` on a row do nothing.
+    fn open_selected(&mut self, log: bool) {
+        if !self.dashboard_open || self.target.is_some() {
+            return;
+        }
+        if let Some(id) = self.list.selected() {
+            self.target = Some(crate::tui::dashboard::TargetScreen::open(
+                &self.state.dash,
+                id,
+                log,
+                self.target_reader.clone(),
+            ));
+        }
     }
 
     // The approval keys act on the run: inert in an attached view, which has
@@ -2438,31 +2512,51 @@ impl TUIAppView for TuiProgressView {
     }
 
     fn is_searching(&self) -> bool {
-        self.list.is_editing()
+        match &self.target {
+            Some(t) => t.is_searching(),
+            None => self.list.is_editing(),
+        }
     }
 
     fn search_start(&mut self) {
-        // The filter is the dashboard list's; the line has none.
-        if self.dashboard_open {
+        // A target screen searches its log; the dashboard filters its list;
+        // the line has neither.
+        if let Some(t) = self.target.as_mut() {
+            t.search_start();
+        } else if self.dashboard_open {
             self.list.filter_start();
         }
     }
 
     fn search_input(&mut self, c: char) {
-        self.list.filter_input(c);
+        match self.target.as_mut() {
+            Some(t) => t.search_input(c),
+            None => self.list.filter_input(c),
+        }
     }
 
     fn search_backspace(&mut self) {
-        self.list.filter_backspace();
+        match self.target.as_mut() {
+            Some(t) => t.search_backspace(),
+            None => self.list.filter_backspace(),
+        }
     }
 
     fn search_cancel(&mut self) {
-        let _had = self.list.escape();
+        match self.target.as_mut() {
+            Some(t) => t.search_cancel(),
+            None => {
+                let _had = self.list.escape();
+            }
+        }
     }
 
     fn search_confirm(&mut self) {
-        // Leave input mode but keep the filter.
-        self.list.filter_confirm();
+        // Leave input mode but keep the filter (or the search).
+        match self.target.as_mut() {
+            Some(t) => t.search_confirm(&self.state.redact),
+            None => self.list.filter_confirm(),
+        }
     }
 
     /// The line, and above it the first row of the approval prompt while one

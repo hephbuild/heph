@@ -189,6 +189,25 @@ fn resume_inner(control: &Option<mpsc::UnboundedSender<Control>>) {
     }
 }
 
+/// A key only a full screen binds (the target Log tab's).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScreenKey {
+    /// `f`: follow the log's end again.
+    Follow,
+    /// `g`, Home.
+    Top,
+    /// `G`, End: the end, following.
+    Bottom,
+    /// `w`: wrap long lines.
+    Wrap,
+    /// `n`: the next search match.
+    Next,
+    /// `N`: the previous one.
+    Prev,
+    PageUp,
+    PageDown,
+}
+
 /// Aggregates the engine's build-event stream and renders progress in the
 /// interactive TUI. The renderer drives the terminal lifecycle and feeds events
 /// in; *what* gets drawn is entirely the view's call.
@@ -225,6 +244,10 @@ pub trait TUIAppView: Send {
     /// Enter (`log` false) or `l` (`log` true) on a full screen's selected
     /// row: open that target's screen. No-op by default.
     fn open_selected(&mut self, _log: bool) {}
+
+    /// A full screen's own key (the target Log tab's `f g G w n N`, End,
+    /// Home, Page Up/Down). No-op by default.
+    fn screen_key(&mut self, _key: ScreenKey) {}
 
     /// Cycle the body view (the `Tab` / `Shift+Tab` keys). `forward` advances to
     /// the next view, otherwise the previous. Called from the backend's key

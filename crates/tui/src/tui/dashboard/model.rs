@@ -9,6 +9,7 @@ use hcore::events::{BuildEvent, BuildEventKind, CacheOutcomeKind};
 use ratatui::style::{Color, Modifier, Style};
 
 use super::bucket::Bucket;
+use super::detail::{Detail, Details, Phase, Shape};
 use super::intern::{Id, Interner};
 use crate::tui::progress::{Boundary, CountScope, Op, event_op_boundary, failure_reason};
 use crate::tui::text::Redact;
@@ -405,6 +406,10 @@ pub struct Model {
     in_flight: usize,
     matched_seen: bool,
     matched_complete: bool,
+    /// What the target screen's Overview reads beside the record: phase
+    /// stamps, the run's driver and resources, how it was admitted and
+    /// what each cache tier said.
+    details: Details,
 }
 
 impl Model {
@@ -413,7 +418,14 @@ impl Model {
         let at = ev.at_unix_ms;
         if let Some((addr, op, boundary)) = event_op_boundary(&ev.kind) {
             let id = self.touch(addr);
+            if matches!(boundary, Boundary::Start) {
+                self.details.op_started(id, op, at);
+            }
             self.fold_op(id, op, boundary, at);
+        }
+        if let Some(addr) = Details::addr_of(&ev.kind) {
+            let id = self.touch(addr);
+            self.details.fold(id, &ev.kind, at);
         }
         match &ev.kind {
             BuildEventKind::RequestConfig { units, .. } => {
@@ -572,8 +584,32 @@ impl Model {
             let mut r = Record::new();
             r.slot = self.bucket(RowState::Queued).push(id, false);
             self.recs.push(r);
+            self.details.push();
         }
         id
+    }
+
+    /// `id`'s Overview facts beside its record.
+    pub fn detail(&self, id: Id) -> Option<&Detail> {
+        self.details.get(id)
+    }
+
+    /// The driver, resources and declared outputs of the run `d` describes.
+    pub fn shape(&self, d: &Detail) -> Option<&Shape> {
+        self.details.shape(d)
+    }
+
+    /// The pool units the request declared, for displaying amounts.
+    pub fn units(&self) -> &BTreeMap<String, String> {
+        &self.units
+    }
+
+    /// `id`'s phases on one time scale, the open one ending at `now_ms`.
+    pub fn phases(&self, id: Id, now_ms: u64) -> Vec<Phase> {
+        match (self.record(id), self.detail(id)) {
+            (Some(r), Some(d)) => self.details.phases(r, d, now_ms),
+            _ => Vec::new(),
+        }
     }
 
     fn rec_mut(&mut self, id: Id) -> Option<&mut Record> {

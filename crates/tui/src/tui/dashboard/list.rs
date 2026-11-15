@@ -427,7 +427,7 @@ fn pad(s: &str, w: usize) -> String {
 }
 
 /// A sub-minute duration with tenths (`8.2s`), else `1m05s`.
-fn secs_tenths(ms: u64) -> String {
+pub(crate) fn secs_tenths(ms: u64) -> String {
     if ms < 60_000 {
         format!("{}.{}s", ms / 1000, (ms % 1000) / 100)
     } else {

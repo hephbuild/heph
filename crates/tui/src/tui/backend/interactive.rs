@@ -19,7 +19,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::{Terminal, TerminalOptions, Viewport};
 use tokio::sync::mpsc;
 
-use crate::tui::app::{App, AppContext, Control, TUIAppView};
+use crate::tui::app::{App, AppContext, Control, ScreenKey, TUIAppView};
 use crate::tui::log_sink::{LogSink, REPLAY_FLUSH_TIMEOUT, ReplayMark, Replayed, SinkLine};
 use crate::tui::session::recorder::ViewTap;
 use crate::tui::session::{SessionSlot, TappedReceiver};
@@ -514,6 +514,16 @@ pub async fn run<A: App + 'static>(
                         kind: KeyEventKind::Press,
                         ..
                     }))) if view.full_screen() => view.open_selected(true),
+                    // A full screen's own keys (the target Log tab's).
+                    Some(Ok(Event::Key(KeyEvent {
+                        code,
+                        kind: KeyEventKind::Press,
+                        ..
+                    }))) if view.full_screen() && screen_key(code).is_some() => {
+                        if let Some(key) = screen_key(code) {
+                            view.screen_key(key);
+                        }
+                    }
                     Some(Ok(Event::Key(KeyEvent {
                         code: KeyCode::Up,
                         kind: KeyEventKind::Press,
@@ -821,6 +831,21 @@ pub async fn run<A: App + 'static>(
 /// escape bytes land in redirected output.
 /// Whether background work no longer holds the exit: the loop's break
 /// predicate once the app has finished.
+/// The full-screen key `code` stands for, if any.
+fn screen_key(code: KeyCode) -> Option<ScreenKey> {
+    Some(match code {
+        KeyCode::Char('f') => ScreenKey::Follow,
+        KeyCode::Char('g') | KeyCode::Home => ScreenKey::Top,
+        KeyCode::Char('G') | KeyCode::End => ScreenKey::Bottom,
+        KeyCode::Char('w') => ScreenKey::Wrap,
+        KeyCode::Char('n') => ScreenKey::Next,
+        KeyCode::Char('N') => ScreenKey::Prev,
+        KeyCode::PageUp => ScreenKey::PageUp,
+        KeyCode::PageDown => ScreenKey::PageDown,
+        _ => return None,
+    })
+}
+
 fn bg_drained(bg_pending: &hcore::pending::Pending) -> bool {
     bg_pending.load(std::sync::atomic::Ordering::Acquire) == 0
 }
