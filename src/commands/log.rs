@@ -601,6 +601,53 @@ fn ignore_closed(res: io::Result<()>) -> io::Result<()> {
     closed(res).map(drop)
 }
 
+/// The dashboard's LAST LINE reader over this engine's logs: local sources
+/// only (no locator, no remote fetch), as I4 asks of the list column. Called
+/// from the view's own reader thread, never a runtime worker, so it blocks on
+/// `open_log` through the runtime's handle.
+pub(crate) struct EngineTails {
+    engine: Arc<Engine>,
+    rt: tokio::runtime::Handle,
+    /// The log `size` opened, kept for the `tail` that follows it.
+    opened: std::sync::Mutex<Option<(String, crate::engine::log_api::OpenLog)>>,
+}
+
+impl EngineTails {
+    pub(crate) fn new(engine: Arc<Engine>, rt: tokio::runtime::Handle) -> Self {
+        Self {
+            engine,
+            rt,
+            opened: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn open(&self, addr: &str) -> Option<crate::engine::log_api::OpenLog> {
+        let addr = htaddr::parse_addr(addr).ok()?;
+        self.rt
+            .block_on(self.engine.open_log(&addr, &LogOptions::default()))
+            .ok()
+            .flatten()
+    }
+}
+
+impl crate::tui::dashboard::LogReader for EngineTails {
+    fn size(&self, addr: &str) -> Option<u64> {
+        let log = self.open(addr)?;
+        let len = log.len();
+        *self.opened.lock().unwrap_or_else(|e| e.into_inner()) = Some((addr.to_owned(), log));
+        Some(len)
+    }
+
+    fn tail(&self, addr: &str, max: usize) -> Option<Vec<u8>> {
+        let kept = self.opened.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let mut log = match kept {
+            Some((a, log)) if a == addr => log,
+            _ => self.open(addr)?,
+        };
+        log.tail(max).ok()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{LogSource, ended, last_lines, last_lines_start};

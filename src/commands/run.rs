@@ -690,6 +690,10 @@ impl App for RunApp {
         }))
         .with_approval(self.approval.clone())
         .with_redact(tui::text::Redact::heph_home(&self.engine.home))
+        .with_log_reader(Arc::new(crate::commands::log::EngineTails::new(
+            Arc::clone(&self.engine),
+            tokio::runtime::Handle::current(),
+        )))
     }
 
     fn ci_view(&self) -> Self::CiView {

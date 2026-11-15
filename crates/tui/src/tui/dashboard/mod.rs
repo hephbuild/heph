@@ -17,6 +17,7 @@ pub mod header;
 pub mod intern;
 pub mod list;
 pub mod model;
+pub mod tails;
 #[cfg(test)]
 mod tests;
 
@@ -28,3 +29,4 @@ pub use list::{
     list_lines, read_tails,
 };
 pub use model::{Gauge, Model, Record, RowState, Tab, TabCounts};
+pub use tails::TailReader;

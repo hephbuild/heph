@@ -1763,9 +1763,12 @@ pub struct TuiProgressView {
     /// The dashboard list's tab, selection, scroll, filter and scope. Kept
     /// while the dashboard is closed, so `Tab` reopens it where it was.
     list: crate::tui::dashboard::ListState,
-    /// The LAST LINE column's text per visible row. Nothing fills it yet:
-    /// the reader over the targets' logs comes with the target screen.
+    /// The LAST LINE column's text per visible row, as `tails` last found it.
     last_lines: crate::tui::dashboard::LastLines,
+    /// The background reader that fills `last_lines`: the run's own logs
+    /// for a live view ([`Self::with_log_reader`]). `None`: the column shows
+    /// wait and failure text only (an attached view, until it has a reader).
+    tails: Option<crate::tui::dashboard::TailReader>,
     /// Whose view this is: the run's own, or a session viewer's. The one seam
     /// between the two; everything not behind it renders identically.
     role: Role,
@@ -1886,6 +1889,7 @@ impl TuiProgressView {
             dashboard_open: false,
             list: crate::tui::dashboard::ListState::default(),
             last_lines: crate::tui::dashboard::LastLines::default(),
+            tails: None,
             role: Role::Live { approval: None },
         }
     }
@@ -2039,6 +2043,11 @@ impl TuiProgressView {
                 Role::Live { .. } => keys.into(),
             }
         };
+        // What the background reader found since the last frame, for the
+        // rows that frame showed.
+        if let Some(updates) = self.tails.as_mut().and_then(|t| t.poll()) {
+            self.last_lines.apply(updates, self.list.visible());
+        }
         let inputs = ListInputs {
             model: &self.state.dash,
             waits: &self.state,
@@ -2053,6 +2062,14 @@ impl TuiProgressView {
             cols,
             left,
         ));
+        // The rows this frame shows, for the reader to (re)read off this task.
+        if let Some(tails) = self.tails.as_mut().filter(|t| t.wants(now_ms)) {
+            tails.send(
+                self.last_lines
+                    .requests(&self.state.dash, self.list.visible()),
+                now_ms,
+            );
+        }
         out
     }
 
@@ -2147,6 +2164,17 @@ impl TuiProgressView {
         if let Role::Live { approval } = &mut self.role {
             *approval = Some(center);
         }
+        self
+    }
+
+    /// Fill the dashboard's LAST LINE column from `reader`, on a thread of
+    /// its own: a frame only hands it the visible rows and takes what it
+    /// found (I4, I7). The seam an attached view's reader plugs into too.
+    pub fn with_log_reader(
+        mut self,
+        reader: std::sync::Arc<dyn crate::tui::dashboard::LogReader>,
+    ) -> Self {
+        self.tails = crate::tui::dashboard::TailReader::spawn(reader);
         self
     }
 
@@ -5155,6 +5183,83 @@ mod tests {
         let text = lines.join("\n");
         assert!(text.contains("//a:bad"), "{text}");
         assert!(!text.contains("second line"), "{text}");
+    }
+
+    /// `frame_does_no_io`, through the view: the LAST LINE column shows a
+    /// running target's latest line, read by the view's background reader —
+    /// every call to the log reader is made off the thread drawing frames —
+    /// and read again once the log grew.
+    #[test]
+    fn last_line_column_reads_off_the_frame_thread() {
+        use std::sync::Mutex;
+        use std::time::{Duration, Instant};
+
+        #[derive(Default)]
+        struct Reader {
+            log: Mutex<Vec<u8>>,
+            threads: Mutex<Vec<std::thread::ThreadId>>,
+        }
+        impl crate::tui::dashboard::LogReader for Reader {
+            fn size(&self, addr: &str) -> Option<u64> {
+                self.threads
+                    .lock()
+                    .expect("threads")
+                    .push(std::thread::current().id());
+                (addr == "//a:run").then(|| self.log.lock().expect("log").len() as u64)
+            }
+            fn tail(&self, addr: &str, max: usize) -> Option<Vec<u8>> {
+                self.threads
+                    .lock()
+                    .expect("threads")
+                    .push(std::thread::current().id());
+                let log = self.log.lock().expect("log");
+                (addr == "//a:run").then(|| log[log.len().saturating_sub(max)..].to_vec())
+            }
+        }
+
+        let reader = std::sync::Arc::new(Reader::default());
+        reader
+            .log
+            .lock()
+            .expect("log")
+            .extend_from_slice(b"Compiling a\n");
+        let mut v = TuiProgressView::new("L").with_log_reader(reader.clone());
+        v.apply(&ev(0, result_start("//a:run")));
+        v.apply(&ev(1, execute_start("//a:run")));
+        v.open_dashboard();
+
+        // Frames a reader's interval apart, until the row shows `want`.
+        let mut now = 1_000;
+        let mut until = |v: &mut TuiProgressView, want: &str| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                now += 300;
+                let text = dash_frame(v, now).join("\n");
+                if text
+                    .lines()
+                    .any(|r| r.contains("//a:run") && r.trim_end().ends_with(want))
+                {
+                    return;
+                }
+                assert!(Instant::now() < deadline, "never showed {want:?}\n{text}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        until(&mut v, "Compiling a");
+        reader
+            .log
+            .lock()
+            .expect("log")
+            .extend_from_slice(b"Compiling b\n");
+        until(&mut v, "Compiling b");
+
+        let me = std::thread::current().id();
+        let threads = reader.threads.lock().expect("threads");
+        assert!(!threads.is_empty());
+        assert!(
+            threads.iter().all(|t| *t != me),
+            "a frame called the log reader"
+        );
     }
 
     #[test]
