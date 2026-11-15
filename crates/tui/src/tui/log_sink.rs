@@ -259,9 +259,15 @@ impl LogSink {
     }
 }
 
+/// What every encoded `Log` record contains: the recorder writes compact
+/// JSON, and `SessionRecordKind` is tagged by `type`.
+const LOG_RECORD: &[u8] = br#""type":"Log""#;
+
 /// Hand `print` each `Log` record of `events` numbered in
 /// `(mark.last_printed, through]`, from `mark`'s offset, in order and once
-/// each, with its newline back on.
+/// each, with its newline back on. Only lines holding [`LOG_RECORD`] are
+/// decoded: the build events between them, the bulk of a busy file, are
+/// passed over.
 fn read_lines(
     events: &Path,
     mark: ReplayMark,
@@ -271,9 +277,10 @@ fn read_lines(
     let mut file = std::fs::File::open(events)?;
     file.seek(SeekFrom::Start(mark.offset))?;
     let mut reader = RecordReader::new(io::BufReader::new(file));
+    let needle = memchr::memmem::Finder::new(LOG_RECORD);
     let mut last = mark.last_printed;
     let mut line = Vec::new();
-    while let Some(record) = reader.next_record()? {
+    while let Some(record) = reader.next_containing(&needle)? {
         let Some(SessionRecordKind::Log {
             msg,
             seq: Some(seq),
@@ -355,6 +362,66 @@ impl<'a> MakeWriter<'a> for MakeLogSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::session::SessionRecord;
+
+    fn log_record(seq: u64, msg: &str) -> Vec<u8> {
+        let mut line = serde_json::to_vec(&SessionRecord::session(
+            seq,
+            SessionRecordKind::Log {
+                level: "INFO".into(),
+                msg: msg.into(),
+                seq: Some(seq),
+            },
+        ))
+        .expect("encode");
+        line.push(b'\n');
+        line
+    }
+
+    /// The replay reads only the `Log` records in the range, however many
+    /// build events lie between the mark and the replay, and its prefilter
+    /// matches what the recorder writes.
+    #[test]
+    fn replay_reads_logs_through_a_large_event_volume() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("events.ndjson");
+        let mut bytes = log_record(1, "before the mark");
+        assert!(
+            memchr::memmem::find(&bytes, LOG_RECORD).is_some(),
+            "a Log record holds the prefilter's needle"
+        );
+        let offset = bytes.len() as u64;
+        // A build event naming the needle in a string is escaped, so it is
+        // passed over too.
+        let event = concat!(
+            r#"{"at_unix_ms":5,"kind":{"type":"ResultEnd","addr":"//a:b","#,
+            r#""error":"said \"type\":\"Log\""}}"#,
+            "\n"
+        );
+        for seq in 2..=5 {
+            for _ in 0..50_000 {
+                bytes.extend_from_slice(event.as_bytes());
+            }
+            bytes.extend_from_slice(&log_record(seq, &format!("line {seq}")));
+        }
+        std::fs::write(&path, &bytes).expect("write");
+
+        let mark = ReplayMark {
+            last_printed: 1,
+            offset,
+        };
+        let mut printed = Vec::new();
+        read_lines(&path, mark, 4, |line| printed.push(line.to_vec())).expect("replay");
+        assert_eq!(
+            printed,
+            vec![
+                b"line 2\n".to_vec(),
+                b"line 3\n".to_vec(),
+                b"line 4\n".to_vec()
+            ],
+            "exactly the range, in order"
+        );
+    }
 
     #[test]
     fn buffered_writer_pushes_bytes_through_channel() {

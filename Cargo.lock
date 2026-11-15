@@ -7941,6 +7941,7 @@ dependencies = [
  "crossterm",
  "futures",
  "libc",
+ "memchr",
  "proc",
  "ratatui",
  "serde",
