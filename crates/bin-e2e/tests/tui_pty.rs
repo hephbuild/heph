@@ -818,8 +818,8 @@ fn each_case<C: Sync, R: Send>(cases: &[C], name: fn(&C) -> &str, run: fn(&C) ->
 /// leaves on one press; `kill -INT` stops at once on either screen. The
 /// terminal is restored every time.
 ///
-/// Not here yet: attached (`session attach`), one press detaches and the
-/// owner keeps building. It comes with attach on the new screens (unit 5d-3).
+/// Attached (`session attach`), one press detaches and the owner keeps
+/// building: `sessions_pty::attach_detaches_without_stopping`.
 #[test]
 fn ctrl_c_twice_on_full_screens() {
     struct Case {

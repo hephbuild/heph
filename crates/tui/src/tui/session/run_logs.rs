@@ -358,9 +358,16 @@ impl LiveRunLogLocator for SessionRunLogLocator {
 /// so the LAST LINE column can ask for every visible row each batch.
 ///
 /// The rules are this module's, applied to that one session: only for the
-/// home its `meta.json` names, only while the viewer follows it (the viewer
-/// ends with it), the newest record wins, an `ExecuteEnd` after it or a file
-/// gone means ended, and `file` is opened as [`find_run_log`] opens it.
+/// home its `meta.json` names, only a live session, the newest record wins,
+/// an `ExecuteEnd` after it or a file gone means ended, and `file` is opened
+/// as [`find_run_log`] opens it.
+///
+/// "Live" is the lock probe the viewer made before it read the session
+/// (`SessionEntry::live`), taken once: a session live then is followed until
+/// it ends, and the viewer ends with it. One that was already over (crashed,
+/// or ended) answers nothing, as [`lookup_run_log`] would: its replayed
+/// records may name a file a crashed heph left behind, and that file is no
+/// run's live log.
 ///
 /// [`SessionFeed::run_log`]: super::SessionFeed::run_log
 #[derive(Debug, Clone)]
@@ -371,22 +378,30 @@ pub struct FeedRunLogLocator {
     home: PathBuf,
     /// Its `meta.json` lists [`CAPABILITY_RUN_LOGS`].
     records_run_logs: bool,
+    /// Its lock was held when the viewer probed it, before reading it.
+    live: bool,
 }
 
 impl FeedRunLogLocator {
-    pub fn new(feed: super::SessionFeed, id: SessionId, meta: &SessionMeta) -> Option<Self> {
+    pub fn new(
+        feed: super::SessionFeed,
+        id: SessionId,
+        meta: &SessionMeta,
+        live: bool,
+    ) -> Option<Self> {
         Some(Self {
             feed,
             id,
             home: PathBuf::from(meta.home_dir.as_deref()?),
             records_run_logs: meta.has_capability(CAPABILITY_RUN_LOGS),
+            live,
         })
     }
 }
 
 impl LiveRunLogLocator for FeedRunLogLocator {
     fn locate(&self, home: &Path, addr: &str) -> anyhow::Result<Option<LocatedRunLog>> {
-        if home != self.home {
+        if !self.live || home != self.home {
             return Ok(None);
         }
         let session = self.id.encode();
@@ -495,7 +510,13 @@ mod tests {
         let dir = root.join(id.encode());
         std::fs::create_dir_all(&dir).expect("session dir");
         let lock = lockfile::acquire_owner_lock(&dir.join(files::LOCK)).expect("lock");
-        let meta = SessionMeta {
+        recorder::write_atomically(&dir, files::META, &meta(id, home, caps)).expect("meta");
+        append(&dir, records);
+        (dir, lock)
+    }
+
+    fn meta(id: SessionId, home: &Path, caps: &[&str]) -> SessionMeta {
+        SessionMeta {
             format: META_FORMAT,
             id,
             owner_pid: std::process::id(),
@@ -509,10 +530,7 @@ mod tests {
             header: super::super::HeaderKind::Build,
             interactive: false,
             capabilities: caps.iter().map(|&c| c.to_owned()).collect(),
-        };
-        recorder::write_atomically(&dir, files::META, &meta).expect("meta");
-        append(&dir, records);
-        (dir, lock)
+        }
     }
 
     fn append(dir: &Path, records: &[SessionRecord]) {
@@ -772,6 +790,37 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// Attached to a session that was already over when the viewer probed
+    /// it, the LAST LINE locator names no live file: the replayed record's
+    /// file is still on disk (a crashed heph leaves it), and it is no run's
+    /// live log. The same records for a live session answer `Live`; another
+    /// home never answers.
+    #[test]
+    fn attached_dead_session_logs_read_as_absent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        live_file(&home, "runs/e/0.log", b"left behind\n");
+        let id = SessionId::new(1_800_000_000_001, 1);
+        let meta = meta(id, &home, &[CAPABILITY_RUN_LOGS]);
+        let feed = super::super::SessionFeed::default();
+        drop(feed.route(run_log(10, ADDR, "h0", "runs/e/0.log")));
+        let locate = |live: bool, home: &Path| {
+            FeedRunLogLocator::new(feed.clone(), id, &meta, live)
+                .expect("meta names a home")
+                .locate(home, ADDR)
+                .expect("locate")
+        };
+
+        let found = locate(true, &home);
+        assert!(
+            matches!(&found, Some(LocatedRunLog::Live { record, .. }) if record.hashin == "h0"),
+            "{found:?}"
+        );
+        assert!(locate(true, &tmp.path().join("other")).is_none());
+        let dead = locate(false, &home);
+        assert!(dead.is_none(), "a dead session named a log: {dead:?}");
     }
 
     /// Across sessions, the newest record wins, and the session that recorded

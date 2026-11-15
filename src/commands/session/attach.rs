@@ -72,7 +72,8 @@ pub(crate) async fn attach(
     let feed = SessionFeed::default();
     let interactive = tui::should_use_tui(no_tui);
     // Only the dashboard reads logs and outputs; the line backend needs none.
-    let readers = interactive.then(|| Readers::for_session(global, &meta, entry.id, &feed));
+    let readers =
+        interactive.then(|| Readers::for_session(global, &meta, entry.id, entry.live, &feed));
     let app = AttachApp {
         id: entry.id,
         meta,
@@ -177,8 +178,10 @@ impl AfterTeardown {
 /// recorded, so attach works from any directory) reads what that heph
 /// wrote, through the same log API and listings the run's dashboard uses.
 /// The LAST LINE column finds a running target's live file through the
-/// session's own `RunLog` records ([`FeedRunLogLocator`]); the Log tab
-/// through every session under HOME, as the run's own Log tab does.
+/// session's own `RunLog` records ([`FeedRunLogLocator`]), and only if the
+/// session was live when it was resolved; the Log tab through every live
+/// session under HOME, as the run's own Log tab does. Attached to a session
+/// that is already over, neither names a live file.
 enum Readers {
     Engine {
         tails: Arc<crate::commands::log::EngineTails>,
@@ -193,12 +196,13 @@ impl Readers {
         global: &crate::commands::GlobalOptions,
         meta: &SessionMeta,
         id: SessionId,
+        live: bool,
         feed: &SessionFeed,
     ) -> Self {
         let (Some(root), Some(home), Some(locator)) = (
             meta.workspace_root.as_deref(),
             meta.home_dir.as_deref(),
-            FeedRunLogLocator::new(feed.clone(), id, meta),
+            FeedRunLogLocator::new(feed.clone(), id, meta, live),
         ) else {
             return Self::Unavailable("the session recorded no workspace".into());
         };
