@@ -358,8 +358,9 @@ and dropped when it does not (`NO_COLOR`, not a terminal). Everything else is
 escaped to visible text (`\u{1b}[2J`): cursor moves, clears, OSC titles, any
 other CSI including private modes like `ESC[?1049h` and an intermediate byte
 like `ESC[31 m`, C1 controls, DEL and NUL, the bidi embedding, override and
-isolate controls (`U+202A`–`U+202E`, `U+2066`–`U+2069`, which reorder how a
-line displays), and a truncated or malformed sequence. A parameter list over
+isolate controls and the implicit direction marks (`U+202A`–`U+202E`,
+`U+2066`–`U+2069`, `U+200E`, `U+200F`, `U+061C`, which reorder how a line
+displays), and a truncated or malformed sequence. A parameter list over
 128 bytes is malformed too: no real SGR comes near it (a truecolour
 foreground and background with attributes is under 60 bytes), so its `ESC`
 is escaped and the rest prints as text. The scan for the `m` stops at 129

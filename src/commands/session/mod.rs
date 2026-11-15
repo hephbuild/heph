@@ -610,13 +610,17 @@ pub(crate) fn truncate(s: &str, max: usize) -> String {
 /// look-ahead and is never kept.
 const MAX_SGR_PARAMS: usize = 128;
 
-/// The bidirectional embedding, override and isolate controls (`U+202A`–`U+202E`,
-/// `U+2066`–`U+2069`). They are not control characters to `char::is_control`
-/// (they are format characters), but they reorder how the rest of a line is
-/// displayed, so recorded text could make a viewer show something it does
-/// not contain. Escaped like a control character.
+/// The bidirectional controls: the embedding, override and isolate controls
+/// (`U+202A`–`U+202E`, `U+2066`–`U+2069`) and the implicit marks (`U+200E`
+/// LRM, `U+200F` RLM, `U+061C` ALM). They are not control characters to
+/// `char::is_control` (they are format characters), but they reorder how the
+/// rest of a line is displayed, so recorded text could make a viewer show
+/// something it does not contain. Escaped like a control character.
 fn is_bidi_control(c: char) -> bool {
-    matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+    matches!(
+        c,
+        '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{200e}' | '\u{200f}' | '\u{061c}'
+    )
 }
 
 /// One line of recorded text, made safe for a terminal: SGR sequences

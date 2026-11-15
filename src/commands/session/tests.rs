@@ -1229,6 +1229,31 @@ fn replayed_text_keeps_only_sgr() {
             "a\\u{2066}b\\u{2069}",
             "a\\u{2066}b\\u{2069}",
         ),
+        (
+            "left-to-right mark",
+            "a\u{200e}b",
+            "a\\u{200e}b",
+            "a\\u{200e}b",
+        ),
+        (
+            "right-to-left mark",
+            "a\u{200f}b",
+            "a\\u{200f}b",
+            "a\\u{200f}b",
+        ),
+        (
+            "arabic letter mark",
+            "a\u{061c}b",
+            "a\\u{61c}b",
+            "a\\u{61c}b",
+        ),
+        (
+            // A zero-width joiner shapes text; it reorders nothing.
+            "zero-width joiner is kept",
+            "a\u{200d}b",
+            "a\u{200d}b",
+            "a\u{200d}b",
+        ),
     ];
     for &(name, input, color, plain) in table {
         assert_eq!(escape_replayed(input, true), color, "{name}, colour sink");
