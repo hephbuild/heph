@@ -611,13 +611,18 @@ fn whole(ms: u64) -> String {
     hcore::units::human_duration(std::time::Duration::from_millis(ms))
 }
 
+/// A LAST LINE cell whose line is unknown.
+const UNKNOWN_LINE: &str = "–";
+
 /// One row's PHASE, TIME and LAST LINE.
 fn row_words(inp: &ListInputs<'_>, id: Id, r: &Record) -> (String, String, String) {
     let m = inp.model;
-    let log = || {
-        inp.redact
-            .apply(inp.lines.get(id).unwrap_or(""))
-            .into_owned()
+    // `–` when no line is known: not read yet, no log, or none this viewer
+    // can read (an attached viewer reads its own session's logs only). A
+    // blank would read as a log that printed nothing.
+    let log = || match inp.lines.get(id) {
+        Some(line) => inp.redact.apply(line).into_owned(),
+        None => UNKNOWN_LINE.to_owned(),
     };
     match r.state {
         RowState::Queued => ("pending".into(), String::new(), String::new()),

@@ -167,7 +167,8 @@ mod tests {
             "  All 3    ▶ Running 0    ⧗ Pending 2    ✗ Failed 0    ✓ Done 1    ● Cached 0",
             "──━━━━━─────────────────────────────────────────────────────────────────────────",
             "     TARGET                        PHASE              TIME LAST LINE",
-            " ▸ ✓ //a:one                       done               0.0s",
+            // No line read yet: `–`, never a blank that reads as an empty log.
+            " ▸ ✓ //a:one                       done               0.0s –",
             "   · //a:two                       pending",
             "   · //b:three                     pending",
             "",
