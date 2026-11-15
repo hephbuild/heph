@@ -248,19 +248,27 @@ impl ManagedDriver for Driver {
                 def.image.clone(),
             ];
             let cwd = req.sandbox_ws_dir.clone();
-            let mut io = super::docker_build::ToolIo::from_request(&mut req.request);
-            super::docker_build::run_tool(argv, &cwd, "docker image inspect", &mut io, ctoken)
-                .await
-                .with_context(|| {
-                    format!(
-                        "resolving the digest of image {:?}. It must already be in the local \
+            let mut io = super::docker_build::tool_io(&mut req.request);
+            // stdout is the image digest (data), never the log.
+            super::docker_build::run_tool(
+                argv,
+                &cwd,
+                "docker image inspect",
+                hdriver_support::run_log::Streams::STDERR,
+                &mut io,
+                ctoken,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "resolving the digest of image {:?}. It must already be in the local \
                          daemon — depend on the `oci.load` target that puts it there via `deps`, \
                          so loading it is part of this runner's cache key.",
-                        def.image
-                    )
-                })?
-                .trim()
-                .to_string()
+                    def.image
+                )
+            })?
+            .trim()
+            .to_string()
         };
         if digest.is_empty() {
             anyhow::bail!(

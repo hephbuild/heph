@@ -86,6 +86,7 @@ use async_trait::async_trait;
 use hcore::debug_hash::DebugHasher;
 use hcore::hasync::Cancellable;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
+use hdriver_support::run_log::Streams;
 use hexecrunner::RunnerRef;
 use hplugin::driver::targetdef::path::{CodegenMode, Content, Path as OutPath};
 use hplugin::driver::targetdef::{Input, InputMode, Output, TargetDef};
@@ -106,78 +107,19 @@ use super::{
     ImageFormat, basename, dep_files, dep_single_file, is_addr, normalize_platform, ws_path,
 };
 
-/// The user-facing output streams a driver relays its tool's output to.
+/// Where a run's tool output goes: the run's log.
 ///
-/// Borrowed from `RunRequest` and threaded through every tool invocation, so a
-/// multi-command driver (`oci_push`'s load → tag → push) writes all three
-/// children's output to the same place, in order.
-pub(crate) struct ToolIo<'io> {
-    pub stdout: Option<&'io mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin)>,
-    pub stderr: Option<&'io mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin)>,
-    /// The target's `log.txt`, in the sandbox dir.
-    ///
-    /// This is what makes a build's progress *visible*: the engine collects that
-    /// file as the target's output artifact, renders its tail in the failure box
-    /// and serves it to `heph log`. The `stdout`/`stderr` sinks above are the
-    /// live path and are `None` outside an interactive run, so without this a
-    /// `docker buildx build` printed its whole progress log nowhere at all.
-    log: Option<std::sync::Mutex<std::fs::File>>,
-    /// Where `log` lives: what a failure hands the engine (as its `Log`
-    /// [`hplugin::error::FailureArtifacts`] entry) so the failure box renders
-    /// the tool's output as the target's log, rather than the error pasting it.
-    log_path: PathBuf,
-}
+/// Taken from `RunRequest` once and threaded through every tool invocation, so
+/// a multi-command run writes every child's output to the same log, in order.
+/// Under `log_capture` that log is the engine's writers and nothing else; on an
+/// older host it is the target's own `log.txt` in the sandbox (appended to,
+/// scrubbed of the run's credential secrets) plus the host's live sinks — the
+/// file is what the failure box renders the tail of and `heph log` serves.
+pub(crate) type ToolIo<'io> = hdriver_support::run_log::RunLog<'io>;
 
-/// The three places a tool's output goes: the user's live stdout/stderr (absent
-/// outside an interactive run) and the target's log file.
-///
-/// `&mut dyn Trait` is invariant, so the trait objects' lifetime has to stay
-/// `'io` rather than being shortened to the reborrow's.
-type Sinks<'a, 'io> = (
-    Option<&'a mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin + 'io)>,
-    Option<&'a mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin + 'io)>,
-    Option<&'a std::sync::Mutex<std::fs::File>>,
-);
-
-impl<'io> ToolIo<'io> {
-    /// Take the sinks out of a run request. They are `&mut` and single-owner, so
-    /// this consumes them for the duration of the run.
-    pub(crate) fn from_request<'a>(req: &mut hplugin::driver::RunRequest<'a, 'io>) -> Self {
-        // Appended, not truncated: one run may shell out several times
-        // (`oci_push` does load → tag → push → rmi) and each one's output
-        // belongs to the same target's log.
-        let log_path = req.sandbox_dir.join("log.txt");
-        let log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .map_err(|e| {
-                // Losing the log must not fail the build; say so once and carry
-                // on with whatever live sinks exist.
-                tracing::warn!(error = %e, "oci: could not open the target's log.txt");
-            })
-            .ok()
-            .map(std::sync::Mutex::new);
-        ToolIo {
-            stdout: req.stdout.take(),
-            stderr: req.stderr.take(),
-            log,
-            log_path,
-        }
-    }
-
-    /// Reborrow both sinks at once. Split out as a method so the two disjoint
-    /// field borrows come from a single `&mut self`, which the borrow checker
-    /// accepts where two separate `io.stdout` / `io.stderr` reborrows would not.
-    fn sinks(&mut self) -> Sinks<'_, 'io> {
-        let ToolIo {
-            stdout,
-            stderr,
-            log,
-            log_path: _,
-        } = self;
-        (stdout.as_deref_mut(), stderr.as_deref_mut(), log.as_ref())
-    }
+/// Take a run's log out of its request. See [`ToolIo`].
+pub(crate) fn tool_io<'io>(req: &mut hplugin::driver::RunRequest<'_, 'io>) -> ToolIo<'io> {
+    ToolIo::from_request(req, "log.txt")
 }
 
 /// Builds a container image from a Dockerfile with `docker buildx`. Requires a
@@ -1178,10 +1120,19 @@ impl ManagedDriver for Driver {
         );
 
         let addr = req.request.target.addr.format();
-        let mut io = ToolIo::from_request(&mut req.request);
-        run_tool(argv, &context_dir, "docker buildx build", &mut io, ctoken)
-            .await
-            .map_err(|e| build_error_hint(e, &def, &addr))?;
+        let mut io = tool_io(&mut req.request);
+        // Both streams are the builder's log: BuildKit's progress on stderr, its
+        // status lines on stdout. The digest comes from the metadata file.
+        run_tool(
+            argv,
+            &context_dir,
+            "docker buildx build",
+            Streams::BOTH,
+            &mut io,
+            ctoken,
+        )
+        .await
+        .map_err(|e| build_error_hint(e, &def, &addr))?;
 
         let metadata = tokio::fs::read_to_string(&metadata_file)
             .await
@@ -1352,57 +1303,6 @@ impl TailBuf {
     }
 }
 
-/// Relay the child's output to the user's terminal as it arrives, while keeping
-/// a bounded tail of each stream for the error message and accumulating stdout.
-///
-/// Both streams arrive interleaved through a single [`proc_exec::OutputReader`]
-/// tagged by [`proc_exec::StreamId`] — one reader, not two, is what keeps a
-/// chatty stderr from head-of-line blocking stdout on macOS.
-///
-/// Only stdout is accumulated: for every command here it is a short status line
-/// (`Loaded image: …`), while BuildKit's progress goes to stderr and would be
-/// megabytes.
-async fn tee<'w>(
-    reader: Option<proc_exec::OutputReader>,
-    // The trait objects' lifetime is a free parameter: `&mut dyn Trait` is
-    // invariant, so it cannot be shortened to the borrow's at the call site.
-    mut stdout_sink: Option<&mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin + 'w)>,
-    mut stderr_sink: Option<&mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin + 'w)>,
-    log: Option<&std::sync::Mutex<std::fs::File>>,
-    out_tail: &std::sync::Mutex<TailBuf>,
-    err_tail: &std::sync::Mutex<TailBuf>,
-    captured: &std::sync::Mutex<Vec<u8>>,
-) {
-    use std::io::Write as _;
-    use tokio::io::AsyncWriteExt as _;
-    let Some(mut reader) = reader else { return };
-    while let Ok(Some((stream, chunk))) = reader.recv().await {
-        // Both streams land in the target's log, in arrival order — the same
-        // shape `pluginexec` gives a `bash` target's output.
-        if let Some(log) = log
-            && let Ok(mut f) = log.lock()
-        {
-            drop(f.write_all(&chunk));
-        }
-        let (tail, sink) = match stream {
-            proc_exec::StreamId::Stdout => {
-                if let Ok(mut c) = captured.lock() {
-                    c.extend_from_slice(&chunk);
-                }
-                (out_tail, &mut stdout_sink)
-            }
-            proc_exec::StreamId::Stderr => (err_tail, &mut stderr_sink),
-        };
-        if let Ok(mut t) = tail.lock() {
-            t.push(&chunk);
-        }
-        if let Some(out) = sink {
-            drop(out.write_all(&chunk).await);
-            drop(out.flush().await);
-        }
-    }
-}
-
 /// Spawn a host tool, relay its output to the user, and wait for it — killing
 /// the child if the request is cancelled.
 ///
@@ -1414,11 +1314,16 @@ async fn tee<'w>(
 /// the working directory is explicit, and the wait does not ride the
 /// `spawn_blocking` waker that `hcore::blocking` documents as lossy on macOS.
 ///
-/// Returns captured stdout.
+/// Only the `streams` that are log reach `io`, as they arrive and in arrival
+/// order; a data stream (an `inspect`'s answer) is never the run's log.
+///
+/// Returns captured stdout — for every command here a short answer or status
+/// line, while BuildKit's megabytes of progress go to stderr.
 pub(crate) async fn run_tool(
     argv: Vec<String>,
     cwd: &Path,
     what: &'static str,
+    streams: Streams,
     io: &mut ToolIo<'_>,
     ctoken: &(dyn Cancellable + Send + Sync),
 ) -> anyhow::Result<String> {
@@ -1448,20 +1353,17 @@ pub(crate) async fn run_tool(
     let mut handle = spawned.map_err(|e| missing_tool_error(e, bin, what))?;
     let output_reader = handle.take_output();
 
-    let out_tail = std::sync::Mutex::new(TailBuf::default());
-    let err_tail = std::sync::Mutex::new(TailBuf::default());
-    let captured = std::sync::Mutex::new(Vec::new());
+    let mut out_tail = TailBuf::default();
+    let mut err_tail = TailBuf::default();
+    let mut captured = Vec::new();
 
-    let (stdout_sink, stderr_sink, log) = io.sinks();
-    let io_fut = tee(
-        output_reader,
-        stdout_sink,
-        stderr_sink,
-        log,
-        &out_tail,
-        &err_tail,
-        &captured,
-    );
+    let io_fut = io.pump(output_reader, streams, |stream, chunk| match stream {
+        proc_exec::StreamId::Stdout => {
+            out_tail.push(chunk);
+            captured.extend_from_slice(chunk);
+        }
+        proc_exec::StreamId::Stderr => err_tail.push(chunk),
+    });
 
     // The wait must not share a task with the reader: it parks its worker until
     // the child exits, so the pipes would stop draining and a build that fills
@@ -1481,45 +1383,34 @@ pub(crate) async fn run_tool(
     };
 
     if !status.success() {
-        let tail = err_tail
-            .lock()
-            .map(|t| t.render())
-            .unwrap_or_else(|_| String::new());
+        let tail = err_tail.render();
         let tail = if tail.trim().is_empty() {
-            out_tail
-                .lock()
-                .map(|t| t.render())
-                .unwrap_or_else(|_| String::new())
+            out_tail.render()
         } else {
             tail
         };
-        // The tool's output is in the target's log, returned as the failure's
-        // `Log` artifact, which the failure box renders the tail of — the same
-        // shape an `exec` target's failure has. Pasting it into the message as
-        // well printed BuildKit's whole progress inline with the error. Only a
-        // log that could not be opened (or named) leaves the message as the one
-        // place the output survives.
-        let log = io
-            .log
-            .as_ref()
-            .and_then(|_| hplugin::error::log_file_artifact(&io.log_path));
+        // The tool's output is in the target's log — the engine's, under
+        // `log_capture`, or the plugin's own `log.txt`, returned as the
+        // failure's `Log` artifact — and the failure box renders its tail, the
+        // same shape an `exec` target's failure has. Pasting it into the
+        // message as well printed BuildKit's whole progress inline with the
+        // error. Only an own log that could not be opened leaves the message as
+        // the one place the output survives.
+        let log = io.log_artifact();
         let failed = ToolFailed {
             what,
             status: status.to_string(),
             tail: tail.trim_end().to_string(),
-            logged: log.is_some(),
+            logged: io.is_captured() || log.is_some(),
         };
-        let Some(log) = log else {
-            return Err(anyhow::Error::msg(failed));
-        };
-        return Err(hplugin::error::with_failure_artifacts(
-            anyhow::Error::new(hplugin::error::ProcessFailed::from_status(status)),
-            vec![log],
-        )
-        .context(failed));
+        let process = anyhow::Error::new(hplugin::error::ProcessFailed::from_status(status));
+        return Err(match log {
+            Some(log) => hplugin::error::with_failure_artifacts(process, vec![log]).context(failed),
+            None if failed.logged => process.context(failed),
+            None => anyhow::Error::msg(failed),
+        });
     }
 
-    let captured = captured.into_inner().unwrap_or_default();
     Ok(String::from_utf8_lossy(&captured).into_owned())
 }
 
@@ -2973,6 +2864,199 @@ exit 0
         )
         .expect("read log");
         assert!(log.contains("failed to solve"), "log: {log:?}");
+    }
+
+    /// A run log writer the test can read while the run still holds it.
+    #[derive(Clone, Default)]
+    struct Shared(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Shared {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("lock")).into_owned()
+        }
+        /// A `'static` handle for a `RunRequest` writer slot.
+        fn writer(&self) -> &'static mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin) {
+            Box::leak(Box::new(self.clone()))
+        }
+    }
+
+    impl tokio::io::AsyncWrite for Shared {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.0.lock().expect("lock").extend_from_slice(buf);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Under `log_capture` the build's output reaches the engine's writers while
+    /// the builder is still running, and the plugin keeps no `log.txt` of its
+    /// own: the engine holds the one copy.
+    #[tokio::test]
+    async fn log_capture_streams_the_build_live_and_writes_no_file() {
+        let sbx = Sandbox::new("app");
+        std::fs::write(sbx.pkg.join("Dockerfile"), "FROM scratch\n").expect("dockerfile");
+        let resp = parse_in(&sbx, "//app:img", cfg(&[ctx()])).await;
+        let gate = sbx.dir.path().join("gate");
+        // The builder prints progress, then blocks until the test has seen that
+        // line in the writer: a log written only at exit would hang here.
+        let bin = sbx.fake(
+            "docker",
+            &format!(
+                "echo 'status-line'\necho '#1 progress' >&2\n\
+                 while [ ! -e '{g}' ]; do sleep 0.01; done\necho '#2 done' >&2\n\
+                 meta=\"\"; dest=\"\"\nwhile [ $# -gt 0 ]; do case \"$1\" in --metadata-file) \
+                 meta=\"$2\";; --output) dest=\"${{2#*dest=}}\";; esac; shift; done\n\
+                 printf '{{\"containerimage.digest\":\"sha256:deadbeef\"}}' > \"$meta\"\n\
+                 printf 'tar' > \"$dest\"\nexit 0",
+                g = gate.display()
+            ),
+        );
+        let rid = "req".to_string();
+        let mut req = run_request(&rid, "hashin", &resp.target_def, &sbx, &[]);
+        let (out, err) = (Shared::default(), Shared::default());
+        req.request.log_capture = true;
+        req.request.stdout = Some(out.writer());
+        req.request.stderr = Some(err.writer());
+        let sandbox_dir = req.sandbox_dir.clone();
+        let watcher = tokio::spawn({
+            let err = err.clone();
+            async move {
+                while !err.text().contains("#1 progress") {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                std::fs::write(&gate, b"").expect("open gate");
+            }
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            Driver::with_binary(bin).run(req, &StdCancellationToken::new()),
+        )
+        .await
+        .expect("the progress line must reach the writer while the build runs")
+        .expect("run");
+        watcher.await.expect("watcher");
+        assert_eq!(err.text(), "#1 progress\n#2 done\n");
+        assert_eq!(out.text(), "status-line\n");
+        assert!(
+            !sandbox_dir.join("log.txt").exists(),
+            "no own log under log_capture"
+        );
+    }
+
+    /// An `inspect`'s stdout is its answer, not its log: it is returned and
+    /// never written to the log, on either host. A failure under
+    /// `log_capture` names no log path — the engine already has the output.
+    #[tokio::test]
+    async fn an_inspect_answer_never_reaches_the_log() {
+        let sbx = Sandbox::new("app");
+        let bin = sbx.fake(
+            "docker",
+            "echo 'sha256:feedface'\necho 'warning: slow daemon' >&2\n[ \"$1\" = ok ]",
+        );
+        let ctoken = StdCancellationToken::new();
+        let (out, err) = (Shared::default(), Shared::default());
+        let mut io = ToolIo::captured(Some(out.writer()), Some(err.writer()));
+        let answer = run_tool(
+            vec![bin.clone(), "ok".into()],
+            &sbx.ws,
+            "docker image inspect",
+            Streams::STDERR,
+            &mut io,
+            &ctoken,
+        )
+        .await
+        .expect("inspect");
+        assert_eq!(answer, "sha256:feedface\n");
+
+        let failed = run_tool(
+            vec![bin.clone(), "fail".into()],
+            &sbx.ws,
+            "docker image inspect",
+            Streams::STDERR,
+            &mut io,
+            &ctoken,
+        )
+        .await
+        .err()
+        .expect("a non-zero exit must error");
+        drop(io);
+        assert_eq!(out.text(), "", "the answer is data, never the log");
+        assert_eq!(err.text(), "warning: slow daemon\n".repeat(2));
+        assert!(hplugin::error::failure_log(&failed).is_none(), "{failed:#}");
+        assert_eq!(
+            hplugin::error::process_exit(&failed),
+            Some(hplugin::error::Exit::Code(1))
+        );
+
+        // The own-file path keeps the answer out of `log.txt` too.
+        let path = sbx.dir.path().join("own-log.txt");
+        let mut own = ToolIo::own_file(None, None, path.clone(), None);
+        run_tool(
+            vec![bin, "ok".into()],
+            &sbx.ws,
+            "docker image inspect",
+            Streams::STDERR,
+            &mut own,
+            &ctoken,
+        )
+        .await
+        .expect("inspect");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("log"),
+            "warning: slow daemon\n"
+        );
+    }
+
+    /// On a host without `log_capture`, a credential secret the builder prints
+    /// is scrubbed out of the plugin's own `log.txt` by the shared scrubber.
+    #[tokio::test]
+    async fn own_log_scrubs_credential_secrets() {
+        let sbx = Sandbox::new("app");
+        std::fs::write(sbx.pkg.join("Dockerfile"), "FROM scratch\n").expect("dockerfile");
+        let resp = parse_in(&sbx, "//app:img", cfg(&[ctx()])).await;
+        let secret = "registry-token-0123456789abcdef";
+        let bin = sbx.fake(
+            "docker",
+            &format!(
+                "echo 'auth {secret}' >&2\n\
+                 meta=\"\"; dest=\"\"\nwhile [ $# -gt 0 ]; do case \"$1\" in --metadata-file) \
+                 meta=\"$2\";; --output) dest=\"${{2#*dest=}}\";; esac; shift; done\n\
+                 printf '{{\"containerimage.digest\":\"sha256:deadbeef\"}}' > \"$meta\"\n\
+                 printf 'tar' > \"$dest\"\nexit 0"
+            ),
+        );
+        let rid = "req".to_string();
+        let mut req = run_request(&rid, "hashin", &resp.target_def, &sbx, &[]);
+        req.request
+            .credentials
+            .push(hplugin::driver::CredentialMount {
+                addr: parse_addr("//auth:registry").expect("addr"),
+                env: BTreeMap::new(),
+                path_prefix: vec![],
+                redact: vec![secret.to_string()],
+            });
+        let sandbox_dir = req.sandbox_dir.clone();
+        Driver::with_binary(bin)
+            .run(req, &StdCancellationToken::new())
+            .await
+            .expect("run");
+        let log = std::fs::read_to_string(sandbox_dir.join("log.txt")).expect("log.txt");
+        assert_eq!(log, "auth [redacted]\n");
     }
 
     /// The plain `docker` driver has no file exporters, so a `docker_build` build
