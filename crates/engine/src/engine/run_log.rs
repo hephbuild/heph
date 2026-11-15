@@ -19,10 +19,16 @@
 //! reaches a cache key, a def hash, a sandbox, or a target's env, argv or
 //! files; the `Log` artifact type stays filtered out of every output hash.
 //!
-//! **Liveness.** `runs/<engine-id>/` is created on the first run, never on a
-//! cache hit, and holds a `lock` file locked for the engine's life: another
-//! heph's sweep removes a directory whose lock is free, never one whose lock
-//! is held. The engine removes its own directory when it is dropped.
+//! **Lazy.** A run's `<n>.log`, and `runs/<engine-id>/` with it, is created
+//! by the first byte the run writes: a run that writes nothing (an `fs` copy,
+//! a quiet tool) creates no file and unlinks none, and a warm all-hit build
+//! never touches `runs/`. A file that cannot be created is the log's sticky
+//! error, as a failed write is.
+//!
+//! **Liveness.** `runs/<engine-id>/` holds a `lock` file locked for the
+//! engine's life: another heph's sweep removes a directory whose lock is
+//! free, never one whose lock is held. The engine removes its own directory
+//! when it is dropped.
 
 use hdriver_support::redact::{Needles, Redactor};
 use std::fs::File;
@@ -42,80 +48,52 @@ pub(crate) const NEW_PREFIX: &str = ".new-";
 
 /// One engine's run logs, under `<home>/runs/<id>/`.
 pub(crate) struct RunLogs {
-    runs: PathBuf,
-    id: String,
-    /// Created on the first run.
-    dir: Mutex<Option<RunsDir>>,
+    dir: Arc<RunsDir>,
     next: AtomicU64,
 }
 
 impl std::fmt::Debug for RunLogs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RunLogs")
-            .field("runs", &self.runs)
-            .field("id", &self.id)
+            .field("dir", &self.dir.path)
             .finish_non_exhaustive()
     }
 }
 
-/// A created `runs/<id>/`, and the lock file held for its life.
+/// `runs/<id>/`, made by the first byte any run writes.
 struct RunsDir {
+    runs: PathBuf,
+    id: String,
     path: PathBuf,
-    _lock: File,
+    made: Mutex<Made>,
 }
 
-impl RunLogs {
-    pub(crate) fn new(home: &Path) -> Self {
-        Self {
-            runs: home.join(RUNS_DIR),
-            id: uuid::Uuid::new_v4().as_simple().to_string(),
-            dir: Mutex::new(None),
-            next: AtomicU64::new(0),
-        }
-    }
+enum Made {
+    Not,
+    /// Made, and the lock file held for its life.
+    Yes(File),
+    /// The engine removed it: a late first write creates nothing.
+    Removed,
+}
 
-    /// This engine's `runs/<id>/`, whether or not it exists yet.
-    #[cfg(test)]
-    pub(crate) fn dir_path(&self) -> PathBuf {
-        self.runs.join(&self.id)
-    }
-
-    /// A new live log for one run, and the guard that unlinks it.
-    ///
-    /// Blocking (a `mkdir` on the first run, an `open` on every one): call it
-    /// off the async workers.
-    pub(crate) fn create(&self) -> io::Result<(Arc<RunLog>, LiveGuard)> {
-        let dir = {
-            let mut guard = self.dir.lock().unwrap_or_else(PoisonError::into_inner);
-            match guard.as_ref() {
-                Some(d) => d.path.clone(),
-                None => {
-                    let made = self.make_dir()?;
-                    let path = made.path.clone();
-                    *guard = Some(made);
-                    path
-                }
+impl RunsDir {
+    /// Make the directory unless it is made.
+    fn ensure(&self) -> io::Result<()> {
+        let mut made = self.made.lock().unwrap_or_else(PoisonError::into_inner);
+        match *made {
+            Made::Yes(_) => Ok(()),
+            Made::Removed => Err(io::Error::other("this heph's run logs were removed")),
+            Made::Not => {
+                *made = Made::Yes(self.make()?);
+                Ok(())
             }
-        };
-        let n = self.next.fetch_add(1, Ordering::Relaxed);
-        let path = dir.join(format!("{n}.log"));
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .append(true)
-            .create_new(true)
-            .open(&path)?;
-        let log = Arc::new(RunLog::new(path.clone(), file));
-        let guard = LiveGuard {
-            log: Arc::clone(&log),
-            path: Some(path),
-        };
-        Ok((log, guard))
+        }
     }
 
     /// Set up `runs/<id>/` atomically: built under a `.new-` name with its
     /// lock already held, then renamed into place, so a sweep never sees the
-    /// directory without its lock.
-    fn make_dir(&self) -> io::Result<RunsDir> {
+    /// directory without its lock. Returns the held lock file.
+    fn make(&self) -> io::Result<File> {
         std::fs::create_dir_all(&self.runs)?;
         let tmp = self
             .runs
@@ -130,9 +108,8 @@ impl RunLogs {
                     "a new runs directory's lock is held",
                 ),
             })?;
-            let path = self.runs.join(&self.id);
-            std::fs::rename(&tmp, &path)?;
-            Ok(RunsDir { path, _lock: lock })
+            std::fs::rename(&tmp, &self.path)?;
+            Ok(lock)
         })();
         if made.is_err() {
             drop(std::fs::remove_dir_all(&tmp));
@@ -141,18 +118,53 @@ impl RunLogs {
     }
 }
 
+impl RunLogs {
+    pub(crate) fn new(home: &Path) -> Self {
+        let runs = home.join(RUNS_DIR);
+        let id = uuid::Uuid::new_v4().as_simple().to_string();
+        Self {
+            dir: Arc::new(RunsDir {
+                path: runs.join(&id),
+                runs,
+                id,
+                made: Mutex::new(Made::Not),
+            }),
+            next: AtomicU64::new(0),
+        }
+    }
+
+    /// This engine's `runs/<id>/`, whether or not it exists yet.
+    #[cfg(test)]
+    pub(crate) fn dir_path(&self) -> PathBuf {
+        self.dir.path.clone()
+    }
+
+    /// A new live log for one run, and the guard that unlinks it. Touches no
+    /// file: the log's first byte creates it.
+    pub(crate) fn create(&self) -> (Arc<RunLog>, LiveGuard) {
+        let n = self.next.fetch_add(1, Ordering::Relaxed);
+        let path = self.dir.path.join(format!("{n}.log"));
+        let log = Arc::new(RunLog::new(path, Arc::clone(&self.dir)));
+        let guard = LiveGuard {
+            log: Arc::clone(&log),
+            unlink: true,
+        };
+        (log, guard)
+    }
+}
+
 impl Drop for RunLogs {
     fn drop(&mut self) {
-        let dir = self
-            .dir
-            .get_mut()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        if let Some(dir) = dir {
+        let made = std::mem::replace(
+            &mut *self.dir.made.lock().unwrap_or_else(PoisonError::into_inner),
+            Made::Removed,
+        );
+        if let Made::Yes(lock) = made {
             // Removed while the lock is still held, so no sweep races it.
-            if let Err(e) = std::fs::remove_dir_all(&dir.path) {
-                tracing::debug!(dir = %dir.path.display(), error = %e, "removing this heph's run logs");
+            if let Err(e) = std::fs::remove_dir_all(&self.dir.path) {
+                tracing::debug!(dir = %self.dir.path.display(), error = %e, "removing this heph's run logs");
             }
+            drop(lock);
         }
     }
 }
@@ -176,6 +188,7 @@ fn write_file(file: &mut File, bytes: &[u8]) -> io::Result<()> {
 /// One run's live log.
 pub(crate) struct RunLog {
     path: PathBuf,
+    dir: Arc<RunsDir>,
     state: Mutex<State>,
     /// Set (Release) after the last write to the file; a follower loads it
     /// (Acquire) before its final read to EOF.
@@ -185,16 +198,27 @@ pub(crate) struct RunLog {
 }
 
 struct State {
-    /// `None` once finalized.
-    file: Option<File>,
+    file: Live,
+    /// Whether the file was ever created, so the guard unlinks only a file
+    /// that exists.
+    created: bool,
     needles: Option<Arc<Needles>>,
     out: Option<Redactor>,
     err: Option<Redactor>,
-    /// The first error writing the live file. Kept, because neither a
-    /// plugin's tee nor the cdylib relay reports a write error: the engine
-    /// fails the run with it once the driver returned `Ok`.
+    /// The first error creating or writing the live file. Kept, because
+    /// neither a plugin's tee nor the cdylib relay reports a write error: the
+    /// engine fails the run with it once the driver returned `Ok`.
     error: Option<io::Error>,
     write: WriteFn,
+}
+
+/// Where the live file is in its life.
+enum Live {
+    /// No byte written yet: no file.
+    Unopened,
+    Open(File),
+    /// Finalized: the file, if any, was taken.
+    Ended,
 }
 
 impl std::fmt::Debug for RunLog {
@@ -207,11 +231,13 @@ impl std::fmt::Debug for RunLog {
 }
 
 impl RunLog {
-    fn new(path: PathBuf, file: File) -> Self {
+    fn new(path: PathBuf, dir: Arc<RunsDir>) -> Self {
         Self {
             path,
+            dir,
             state: Mutex::new(State {
-                file: Some(file),
+                file: Live::Unopened,
+                created: false,
                 needles: None,
                 out: None,
                 err: None,
@@ -258,11 +284,11 @@ impl RunLog {
     fn write_chunk(&self, stream: Stream, chunk: &[u8], forward: Option<&mut Vec<u8>>) {
         let mut st = self.state();
         let st = &mut *st;
-        let Some(file) = st.file.as_mut() else {
+        if matches!(st.file, Live::Ended) {
             self.discarded
                 .fetch_add(chunk.len() as u64, Ordering::Relaxed);
             return;
-        };
+        }
         let redactor = match stream {
             Stream::Stdout => st.out.as_mut(),
             Stream::Stderr => st.err.as_mut(),
@@ -273,7 +299,7 @@ impl RunLog {
             return;
         }
         if st.error.is_none()
-            && let Err(e) = (st.write)(file, bytes)
+            && let Err(e) = self.append(st, bytes)
         {
             st.error = Some(e);
         }
@@ -282,27 +308,62 @@ impl RunLog {
         }
     }
 
+    /// Create the live file (and `runs/<id>/`) unless it exists.
+    fn create_file(&self) -> io::Result<File> {
+        self.dir.ensure()?;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create_new(true)
+            .open(&self.path)
+    }
+
+    /// Append `bytes`, creating the file on the first of them. Blocking, as
+    /// the `write(2)` itself is: one `open` (and one `mkdir`, for the
+    /// engine's first log) per run that writes anything.
+    fn append(&self, st: &mut State, bytes: &[u8]) -> io::Result<()> {
+        if let Live::Unopened = st.file {
+            st.file = Live::Open(self.create_file()?);
+            st.created = true;
+        }
+        match &mut st.file {
+            Live::Open(file) => (st.write)(file, bytes),
+            Live::Unopened | Live::Ended => Ok(()),
+        }
+    }
+
     /// End the run's log: flush both streams' held-back bytes, take the file
     /// and set `ended`. Every later write is counted and discarded. `None`
-    /// when it was already finalized.
+    /// when it was already finalized, or when the run wrote no byte.
     pub(crate) fn finalize(&self) -> Option<File> {
         let mut st = self.state();
         let st = &mut *st;
-        let mut file = st.file.take()?;
-        for r in [st.out.as_mut(), st.err.as_mut()].into_iter().flatten() {
-            let tail = r.finish();
+        if matches!(st.file, Live::Ended) {
+            return None;
+        }
+        let tails = [st.out.as_mut(), st.err.as_mut()].map(|r| r.map(Redactor::finish));
+        for tail in tails.iter().flatten() {
             if !tail.is_empty()
                 && st.error.is_none()
-                && let Err(e) = (st.write)(&mut file, &tail)
+                && let Err(e) = self.append(st, tail)
             {
                 st.error = Some(e);
             }
         }
+        let file = match std::mem::replace(&mut st.file, Live::Ended) {
+            Live::Open(file) => Some(file),
+            Live::Unopened | Live::Ended => None,
+        };
         self.ended.store(true, Ordering::Release);
-        Some(file)
+        file
     }
 
-    /// The first error writing the live file, taken.
+    /// Whether the live file was ever created.
+    fn created(&self) -> bool {
+        self.state().created
+    }
+
+    /// The first error creating or writing the live file, taken.
     pub(crate) fn take_error(&self) -> Option<io::Error> {
         self.state().error.take()
     }
@@ -310,15 +371,19 @@ impl RunLog {
     /// Replace the finalized live file's bytes with an older plugin's own
     /// log, scrubbed: the returned file is complete, so it wins over what the
     /// plugin streamed. A refused or unreadable source imports nothing and
-    /// leaves the live bytes as they are.
-    pub(crate) fn import(&self, file: &mut File, source: Returned, roots: &[PathBuf]) -> Imported {
+    /// leaves the live bytes as they are. `file` is `None` when the run
+    /// streamed nothing; a returned log with any bytes creates it, and a file
+    /// that cannot be created is the log's sticky error.
+    pub(crate) fn import(
+        &self,
+        file: &mut Option<File>,
+        source: Returned,
+        roots: &[PathBuf],
+    ) -> Imported {
         let needles = self.state().needles.clone();
         let mut redactor = needles.map(Redactor::new);
-        match source {
-            Returned::Bytes(bytes) => match replace(file, &mut redactor, &mut bytes.as_slice()) {
-                Ok(()) => Imported::Replaced,
-                Err(e) => Imported::Failed(e),
-            },
+        let replaced = match source {
+            Returned::Bytes(bytes) => self.replace(file, &mut redactor, &mut bytes.as_slice()),
             Returned::File(path) => {
                 let mut src = match open_contained(&path, roots) {
                     Ok(Some(src)) => src,
@@ -328,12 +393,65 @@ impl RunLog {
                         return Imported::Unavailable;
                     }
                 };
-                match replace(file, &mut redactor, &mut src) {
-                    Ok(()) => Imported::Replaced,
-                    Err(e) => Imported::Failed(e),
-                }
+                self.replace(file, &mut redactor, &mut src)
+            }
+        };
+        match replaced {
+            Ok(()) => Imported::Replaced,
+            Err(e) => Imported::Failed(e),
+        }
+    }
+
+    /// Truncate `file` and write `src` into it, through `redactor`, creating
+    /// the file on the first byte when there is none.
+    fn replace(
+        &self,
+        file: &mut Option<File>,
+        redactor: &mut Option<Redactor>,
+        src: &mut dyn io::Read,
+    ) -> io::Result<()> {
+        if let Some(file) = file.as_mut() {
+            file.set_len(0)?;
+        }
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = match src.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+            let chunk = buf.get(..n).unwrap_or_default();
+            match redactor.as_mut() {
+                Some(r) => self.write_late(file, &r.push(chunk))?,
+                None => self.write_late(file, chunk)?,
             }
         }
+        if let Some(r) = redactor.as_mut() {
+            self.write_late(file, &r.finish())?;
+        }
+        Ok(())
+    }
+
+    /// Write into the finalized log's file, creating it for the first byte.
+    fn write_late(&self, file: &mut Option<File>, bytes: &[u8]) -> io::Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let file = match file {
+            Some(file) => file,
+            None => {
+                let created = self.create_file().inspect_err(|e| {
+                    let mut st = self.state();
+                    if st.error.is_none() {
+                        st.error = Some(io::Error::new(e.kind(), e.to_string()));
+                    }
+                })?;
+                self.state().created = true;
+                file.insert(created)
+            }
+        };
+        file.write_all(bytes)
     }
 
     /// Test seam: how chunks reach the live file.
@@ -390,44 +508,19 @@ fn open_contained(path: &Path, roots: &[PathBuf]) -> io::Result<Option<File>> {
     Ok(Some(file))
 }
 
-/// Truncate `file` and write `src` into it, through `redactor`.
-fn replace(
-    file: &mut File,
-    redactor: &mut Option<Redactor>,
-    src: &mut dyn io::Read,
-) -> io::Result<()> {
-    file.set_len(0)?;
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let n = match src.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        };
-        let chunk = buf.get(..n).unwrap_or_default();
-        match redactor.as_mut() {
-            Some(r) => file.write_all(&r.push(chunk))?,
-            None => file.write_all(chunk)?,
-        }
-    }
-    if let Some(r) = redactor.as_mut() {
-        file.write_all(&r.finish())?;
-    }
-    Ok(())
-}
-
 /// Unlinks a run's live file once what replaces it is in place, and
-/// finalizes the log if nothing did (a dropped run).
+/// finalizes the log if nothing did (a dropped run). A run that wrote no
+/// byte has no file, and nothing is unlinked.
 pub(crate) struct LiveGuard {
     log: Arc<RunLog>,
-    path: Option<PathBuf>,
+    unlink: bool,
 }
 
 impl std::fmt::Debug for LiveGuard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LiveGuard")
-            .field("path", &self.path)
+            .field("path", &self.log.path)
+            .field("unlink", &self.unlink)
             .finish()
     }
 }
@@ -436,18 +529,20 @@ impl LiveGuard {
     /// Keep the file until the engine removes its `runs/` directory: a
     /// `cache = false` success has no entry to replace it.
     pub(crate) fn retain(mut self) {
-        self.path = None;
+        self.unlink = false;
     }
 }
 
 impl Drop for LiveGuard {
     fn drop(&mut self) {
         drop(self.log.finalize());
-        if let Some(path) = self.path.take()
-            && let Err(e) = std::fs::remove_file(&path)
+        // Finalized: no later write creates the file, so `created` is final.
+        if self.unlink
+            && self.log.created()
+            && let Err(e) = std::fs::remove_file(&self.log.path)
             && e.kind() != io::ErrorKind::NotFound
         {
-            tracing::debug!(path = %path.display(), error = %e, "removing a run's live log");
+            tracing::debug!(path = %self.log.path.display(), error = %e, "removing a run's live log");
         }
     }
 }
@@ -617,17 +712,18 @@ mod tests {
     async fn run_log_never_blocks() {
         const MB: usize = 1 << 20;
         let (_home, logs) = logs();
-        let (log, guard) = logs.create().expect("create");
+        let (log, guard) = logs.create();
         let path = log.path().to_path_buf();
         assert!(path.starts_with(logs.dir_path()), "{}", path.display());
 
-        // 8 MB streamed with a follower that opened the file and never reads:
-        // nothing the writer does waits on it.
-        let _follower = File::open(&path).expect("follower");
+        // 8 MB streamed with a follower that opened the file after the first
+        // chunk and never reads: nothing the writer does waits on it.
         let chunk = vec![b'x'; 64 * 1024];
         let mut w = RunLogWriter::new(Arc::clone(&log), Stream::Stdout, None);
+        w.write_all(&chunk).await.expect("write");
+        let _follower = File::open(&path).expect("follower");
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            for _ in 0..(8 * MB / chunk.len()) {
+            for _ in 1..(8 * MB / chunk.len()) {
                 w.write_all(&chunk).await.expect("write");
             }
         })
@@ -678,7 +774,7 @@ mod tests {
 
         // ENOSPC through the write seam: kept, and it fails a run that
         // returned Ok — never hangs, never reported by the writer.
-        let (log, _guard) = logs.create().expect("create");
+        let (log, _guard) = logs.create();
         log.set_write(enospc);
         let mut w = RunLogWriter::new(Arc::clone(&log), Stream::Stdout, None);
         w.write_all(b"no space")
@@ -697,7 +793,7 @@ mod tests {
             "{err:#}"
         );
         // A run that already failed keeps its own error.
-        let (log, _guard) = logs.create().expect("create");
+        let (log, _guard) = logs.create();
         log.set_write(enospc);
         log.write_chunk(Stream::Stdout, b"x", None);
         let own = fail_on_write_error::<()>(&log, Err(anyhow::anyhow!("the tool failed")));
@@ -714,7 +810,7 @@ mod tests {
         // between the halves, then repeated whole.
         for at in 1..SECRET.len() {
             let (head, tail) = SECRET.split_at(at);
-            let (log, _guard) = logs.create().expect("create");
+            let (log, _guard) = logs.create();
             log.set_needles(needles());
             let mut sink = Vec::new();
             {
@@ -747,7 +843,7 @@ mod tests {
         // through `finalize`: the run's end, a cancellation or an abandoned
         // run (the engine, or the guard of a dropped run), and ENOSPC (the
         // sticky error is read only after it).
-        let (log, _guard) = logs.create().expect("create");
+        let (log, _guard) = logs.create();
         log.set_needles(needles());
         log.write_chunk(Stream::Stdout, b"ends with s3cr3t", None);
         log.write_chunk(Stream::Stderr, b"; err ", None);
@@ -760,24 +856,109 @@ mod tests {
         );
 
         // A dropped run's guard finalizes it, so a later write is discarded.
-        let (log, guard) = logs.create().expect("create");
+        let (log, guard) = logs.create();
         log.set_needles(needles());
         drop(guard);
         assert!(log.ended());
         log.write_chunk(Stream::Stdout, SECRET.as_bytes(), None);
         assert_eq!(log.discarded(), SECRET.len() as u64);
 
-        // An imported log, file or inline, is scrubbed the same way.
-        let (log, _guard) = logs.create().expect("create");
+        // A stream that is only a held-back prefix creates its file at
+        // finalize, which writes it.
+        let (log, _guard) = logs.create();
         log.set_needles(needles());
-        let mut file = log.finalize().expect("file");
+        log.write_chunk(Stream::Stdout, b"s3cr", None);
+        assert!(!log.path().exists(), "held back: nothing written yet");
+        let file = log.finalize().expect("finalize writes the held-back bytes");
+        assert_eq!(read_all(&file).expect("read"), b"s3cr");
+
+        // An imported log, file or inline, is scrubbed the same way; into a
+        // run that streamed nothing, it creates the file.
+        let (log, _guard) = logs.create();
+        log.set_needles(needles());
+        let mut file = log.finalize();
+        assert!(file.is_none(), "nothing streamed, no file");
         let imported = log.import(
             &mut file,
             Returned::Bytes(format!("inline {SECRET}").into_bytes()),
             &[],
         );
         assert!(matches!(imported, Imported::Replaced), "{imported:?}");
+        let file = file.expect("the import created the file");
         assert_eq!(read_all(&file).expect("read"), b"inline [redacted]");
+    }
+
+    #[tokio::test]
+    async fn run_log_file_is_created_by_its_first_byte() {
+        let (home, logs) = logs();
+
+        // A run that writes nothing creates nothing, and its guard unlinks
+        // nothing.
+        let (log, guard) = logs.create();
+        let mut empty = RunLogWriter::new(Arc::clone(&log), Stream::Stdout, None);
+        empty.write_all(b"").await.expect("write");
+        empty.flush().await.expect("flush");
+        assert!(log.finalize().is_none());
+        drop(guard);
+        assert!(log.take_error().is_none());
+        assert!(
+            !home.path().join(RUNS_DIR).exists(),
+            "a run that writes no byte creates no file"
+        );
+
+        // A refused import into it creates nothing either; an empty inline
+        // one neither.
+        let (log, _guard) = logs.create();
+        let mut file = log.finalize();
+        let refused = log.import(
+            &mut file,
+            Returned::File(home.path().join("missing")),
+            &[home.path().to_path_buf()],
+        );
+        assert!(matches!(refused, Imported::Unavailable), "{refused:?}");
+        let empty = log.import(&mut file, Returned::Bytes(Vec::new()), &[]);
+        assert!(matches!(empty, Imported::Replaced), "{empty:?}");
+        assert!(file.is_none());
+        assert!(!home.path().join(RUNS_DIR).exists());
+
+        // The first byte creates the directory and the file.
+        let (log, guard) = logs.create();
+        log.write_chunk(Stream::Stdout, b"x", None);
+        assert!(log.path().exists());
+        drop(guard);
+        assert!(!log.path().exists(), "the guard unlinks a created file");
+    }
+
+    #[tokio::test]
+    async fn run_log_create_failure_is_sticky() {
+        let home = tempfile::tempdir().expect("tempdir");
+        // `runs` is a file: no directory can be made under it.
+        std::fs::write(home.path().join(RUNS_DIR), "not a directory").expect("write");
+        let logs = RunLogs::new(home.path());
+
+        let (log, _guard) = logs.create();
+        let mut sink = Vec::new();
+        {
+            let mut w = RunLogWriter::new(Arc::clone(&log), Stream::Stdout, Some(&mut sink));
+            w.write_all(b"to the sink")
+                .await
+                .expect("the writer reports nothing");
+            w.flush().await.expect("flush");
+        }
+        assert_eq!(sink, b"to the sink", "the sink still gets the bytes");
+        assert!(log.finalize().is_none());
+        let err = fail_on_write_error(&log, Ok(())).expect_err("creation failure fails the run");
+        assert!(
+            format!("{err:#}").contains("writing the run's log"),
+            "{err:#}"
+        );
+
+        // An import that has to create the file fails the same way.
+        let (log, _guard) = logs.create();
+        let mut file = log.finalize();
+        let imported = log.import(&mut file, Returned::Bytes(b"returned".to_vec()), &[]);
+        assert!(matches!(imported, Imported::Failed(_)), "{imported:?}");
+        assert!(fail_on_write_error(&log, Ok(())).is_err());
     }
 
     #[test]
@@ -794,28 +975,28 @@ mod tests {
         let roots = [sandbox.clone()];
 
         for refused in [outside, link, sandbox.join("missing.txt"), sandbox.clone()] {
-            let (log, _guard) = logs.create().expect("create");
+            let (log, _guard) = logs.create();
             log.write_chunk(Stream::Stdout, b"live", None);
-            let mut file = log.finalize().expect("file");
+            let mut file = log.finalize();
             let imported = log.import(&mut file, Returned::File(refused.clone()), &roots);
             assert!(
                 matches!(imported, Imported::Unavailable),
                 "{refused:?}: {imported:?}"
             );
             assert_eq!(
-                read_all(&file).expect("read"),
+                read_all(file.as_ref().expect("file")).expect("read"),
                 b"live",
                 "{refused:?}: live bytes kept"
             );
         }
 
-        let (log, _guard) = logs.create().expect("create");
+        let (log, _guard) = logs.create();
         log.write_chunk(Stream::Stdout, b"streamed, partly", None);
-        let mut file = log.finalize().expect("file");
+        let mut file = log.finalize();
         let imported = log.import(&mut file, Returned::File(inside), &roots);
         assert!(matches!(imported, Imported::Replaced), "{imported:?}");
         assert_eq!(
-            read_all(&file).expect("read"),
+            read_all(file.as_ref().expect("file")).expect("read"),
             b"returned",
             "the returned file wins"
         );
@@ -824,11 +1005,12 @@ mod tests {
     #[test]
     fn runs_dir_is_created_lazily_locked_and_removed_on_drop() {
         let (home, logs) = logs();
+        let (log, guard) = logs.create();
         assert!(
             !home.path().join(RUNS_DIR).exists(),
-            "nothing before the first run"
+            "nothing before the first byte"
         );
-        let (log, guard) = logs.create().expect("create");
+        log.write_chunk(Stream::Stdout, b"x", None);
         let dir = logs.dir_path();
         let lock = File::open(dir.join(LOCK_FILE)).expect("lock file");
         assert!(
@@ -836,8 +1018,14 @@ mod tests {
             "the directory's lock is held while the engine lives"
         );
         drop((log, guard));
+        let (late, _late_guard) = logs.create();
         drop(logs);
         assert!(!dir.exists(), "the engine removes its own directory");
         assert!(lock.try_lock().is_ok());
+        // A run that outlives the engine writes its first byte: nothing is
+        // made again, and the log keeps the error.
+        late.write_chunk(Stream::Stdout, b"late", None);
+        assert!(!dir.exists(), "a removed directory is not made again");
+        assert!(late.take_error().is_some());
     }
 }

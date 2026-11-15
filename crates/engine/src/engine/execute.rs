@@ -150,21 +150,17 @@ impl Engine {
                 error: error.map(crate::engine::event::ErrorDetail::into_message),
             },
             async {
-                // The run's live log, created as the run starts (never on a
-                // cache hit). Not for a `--shell`, which is the user's own
-                // session (R22), nor for a credential source, whose output is
-                // material and whose log stays in its sandbox, as before.
-                // A log that cannot be created fails the run: its output
-                // would go nowhere.
+                // The run's live log (never on a cache hit). Its file is
+                // created by the run's first byte, so a run that writes
+                // nothing touches no file. Not for a `--shell`, which is the
+                // user's own session (R22), nor for a credential source,
+                // whose output is material and whose log stays in its
+                // sandbox, as before. A file that cannot be created fails
+                // the run (`end_run_log`): its output would go nowhere.
                 let live = if shell || outputs_are_material {
                     None
                 } else {
-                    let engine = Arc::clone(&self);
-                    Some(
-                        sync_fs_op_on_thread(move || engine.run_logs.create())
-                            .await
-                            .with_context(|| format!("creating the run log for {addr}"))?,
-                    )
+                    Some(self.run_logs.create())
                 };
                 let sandbox_dir = {
                     let mut dir = self.home.join("sandbox");
@@ -457,18 +453,18 @@ impl Engine {
     /// is complete, so it wins, imported once and scrubbed, only from a
     /// regular file inside the sandbox or inline bytes. Every other `Log` a
     /// run returns is dropped, so the live file is the only log that
-    /// reaches the entry or the slot. Returns the finalized file.
+    /// reaches the entry or the slot. Returns the finalized file, `None` when
+    /// the run wrote no byte and imported none.
     async fn end_run_log(
         &self,
         addr: &Addr,
         log: &Arc<crate::engine::run_log::RunLog>,
-        run: anyhow::Result<RunResponse>,
+        mut run: anyhow::Result<RunResponse>,
         roots: Vec<std::path::PathBuf>,
     ) -> (anyhow::Result<RunResponse>, Option<std::fs::File>) {
         use crate::engine::driver::outputartifact::Type as ArtifactType;
-        use crate::engine::run_log::{Imported, Returned};
+        use crate::engine::run_log::Returned;
         let file = log.finalize();
-        let mut run = crate::engine::run_log::fail_on_write_error(log, run);
         let returned_of = |a: &OutputArtifact| match &a.content {
             crate::engine::driver::outputartifact::Content::File(f) => {
                 Some(Returned::File(std::path::PathBuf::from(&f.source_path)))
@@ -494,34 +490,47 @@ impl Engine {
             }
             Err(err) => hplugin::error::failure_log(err).and_then(returned_of),
         };
-        let Some(mut file) = file else {
-            return (run, None);
+        let file = match returned {
+            None => file,
+            Some(source) => import_run_log(addr, log, file, source, roots).await,
         };
-        let Some(source) = returned else {
-            return (run, Some(file));
-        };
-        let log = Arc::clone(log);
-        let addr = addr.format();
-        let file = hcore::blocking::run(move || {
-            match log.import(&mut file, source, &roots) {
-                Imported::Replaced => {}
-                Imported::Unavailable => tracing::warn!(
-                    addr,
-                    "log unavailable: the run returned a log heph does not read (outside its \
-                     sandbox, a symlink, or unreadable); keeping what it streamed"
-                ),
-                Imported::Failed(e) => tracing::warn!(
-                    addr,
-                    error = %e,
-                    "importing the log the run returned; the log may be incomplete"
-                ),
-            }
-            file
-        })
-        .await;
-        (run, Some(file))
+        let run = crate::engine::run_log::fail_on_write_error(log, run);
+        (run, file)
     }
+}
 
+/// Import a log the run returned into its finalized live file, off the async
+/// workers. Creates the file when the run streamed nothing.
+async fn import_run_log(
+    addr: &Addr,
+    log: &Arc<crate::engine::run_log::RunLog>,
+    mut file: Option<std::fs::File>,
+    source: crate::engine::run_log::Returned,
+    roots: Vec<std::path::PathBuf>,
+) -> Option<std::fs::File> {
+    use crate::engine::run_log::Imported;
+    let log = Arc::clone(log);
+    let addr = addr.format();
+    hcore::blocking::run(move || {
+        match log.import(&mut file, source, &roots) {
+            Imported::Replaced => {}
+            Imported::Unavailable => tracing::warn!(
+                addr,
+                "log unavailable: the run returned a log heph does not read (outside its \
+                     sandbox, a symlink, or unreadable); keeping what it streamed"
+            ),
+            Imported::Failed(e) => tracing::warn!(
+                addr,
+                error = %e,
+                "importing the log the run returned; the log may be incomplete"
+            ),
+        }
+        file
+    })
+    .await
+}
+
+impl Engine {
     /// The fs driver refuses a generated path naming the row's generator, but
     /// it cannot read defs, so it cannot tell a generator that still exists
     /// from one that was removed (Decision 18). On this failure path only, the

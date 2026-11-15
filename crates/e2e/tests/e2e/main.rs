@@ -56,6 +56,7 @@ mod plugin_functions;
 mod query;
 mod remote_cache;
 mod resources;
+mod run_log;
 mod run_timeout;
 mod sandbox_pool;
 mod scratch;

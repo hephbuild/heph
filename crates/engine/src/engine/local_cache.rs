@@ -920,6 +920,40 @@ impl Engine {
         Ok(res_artifacts)
     }
 
+    /// The `Log` artifact of the local cache entry for `addr` at `hashin`, as a
+    /// readable artifact. `None` when there is no entry, or it keeps no log.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn cached_log(
+        &self,
+        addr: &Addr,
+        hashin: &str,
+    ) -> anyhow::Result<Option<Arc<dyn hartifactcontent::Content>>> {
+        let Some(manifest) = self.read_manifest(addr, hashin)? else {
+            return Ok(None);
+        };
+        Ok(manifest
+            .artifacts
+            .into_iter()
+            .find(|a| matches!(a.r#type, ManifestArtifactType::Log))
+            .map(|a| -> Arc<dyn hartifactcontent::Content> {
+                Arc::new(CacheArtifact {
+                    addr: addr.clone(),
+                    hashin: hashin.to_owned(),
+                    name: a.name,
+                    cache: Arc::clone(&self.local_cache),
+                    encoding: a.encoding,
+                    content_type: match a.content_type {
+                        ManifestArtifactContentType::Tar => hartifactcontent::Type::Tar,
+                        ManifestArtifactContentType::Cpio => hartifactcontent::Type::Cpio,
+                    },
+                    r#type: a.r#type,
+                    hashout: a.hashout,
+                    group: a.group,
+                    size: a.size,
+                })
+            }))
+    }
+
     /// Read and deserialize a group's manifest. `Ok(None)` if it is absent.
     pub(crate) fn read_manifest(
         &self,
