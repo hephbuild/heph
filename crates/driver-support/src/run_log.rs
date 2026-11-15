@@ -17,6 +17,8 @@
 //! plugin's own log, and only when the host asked for one.
 
 use crate::redact::{Needles, Redactor};
+use anyhow::Context as _;
+use hcore::hasync::Cancellable;
 use hplugin::driver::RunRequest;
 use hplugin::driver::outputartifact::OutputArtifact;
 use hproc::proc_exec::{OutputReader, StreamId};
@@ -227,6 +229,40 @@ impl<'io> RunLog<'io> {
         }
     }
 
+    /// `hexecrunner::output`, with the `streams` that are log written as they
+    /// arrive: spawn `spec` under `runner`, [`pump`](Self::pump) it while it
+    /// runs, and return its status and both streams whole, as `output` would.
+    ///
+    /// For a tool whose stdout is its answer (a store path, an environment) and
+    /// whose stderr is progress worth watching while it runs.
+    pub async fn output(
+        &mut self,
+        runner: hexecrunner::RunnerRef<'_>,
+        spec: hproc::proc_exec::Spec,
+        streams: Streams,
+        ctoken: &(dyn Cancellable + Send + Sync),
+    ) -> anyhow::Result<std::process::Output> {
+        let (spawned, _) = hexecrunner::spawn_io(runner, spec, ctoken).await?;
+        // The spawn's `io::Error` stays in the chain, as `output` keeps it.
+        let mut handle = spawned?;
+        let reader = handle.take_output();
+        // The wait runs on its own task: it parks until the child exits, and a
+        // reader sharing its task would stop draining a pipe the child fills.
+        let wait = handle.spawn_wait(ctoken.clone_arc());
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        let pumped = self.pump(reader, streams, |stream, chunk| match stream {
+            StreamId::Stdout => stdout.extend_from_slice(chunk),
+            StreamId::Stderr => stderr.extend_from_slice(chunk),
+        });
+        let (status, ()) = tokio::join!(wait, pumped);
+        let status = status.context("wait task for the child")??;
+        Ok(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        })
+    }
+
     /// A fresh scrubber for one stream, on the own-file path only: under
     /// `log_capture` the engine scrubs, and scrubbing twice would only cost.
     fn redactor(&self) -> Option<Redactor> {
@@ -378,6 +414,61 @@ mod tests {
             "the caller still gets its data"
         );
         assert!(!dir.path().join("log.txt").exists());
+    }
+
+    /// `output` answers as `hexecrunner::output` does (status, both streams
+    /// whole) while only the log stream reaches the writers; a missing program
+    /// keeps its `NotFound` in the chain.
+    #[tokio::test]
+    async fn output_returns_both_streams_and_logs_only_the_log() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (out_w, err_w) = (Shared::default(), Shared::default());
+        let (mut o, mut e) = (out_w.clone(), err_w.clone());
+        let mut log = RunLog::captured(Some(&mut o), Some(&mut e));
+        let spec = |program: &str, script: &str| proc_exec::Spec {
+            program: PathBuf::from(program),
+            args: vec![OsString::from("-c"), OsString::from(script)],
+            env: vec![],
+            cwd: dir.path().to_path_buf(),
+            stdin: proc_exec::StdioSpec::Null,
+            stdout: proc_exec::StdioSpec::Piped,
+            stderr: proc_exec::StdioSpec::Piped,
+            setsid: false,
+            ctty: false,
+        };
+        let ctoken = StdCancellationToken::new();
+        let out = log
+            .output(
+                hexecrunner::RunnerRef::local(),
+                spec("/bin/sh", "echo /nix/store/abc; echo building >&2; exit 3"),
+                Streams::STDERR,
+                &ctoken,
+            )
+            .await
+            .expect("output");
+        assert_eq!(out.status.code(), Some(3));
+        assert_eq!(out.stdout, b"/nix/store/abc\n");
+        assert_eq!(out.stderr, b"building\n");
+
+        let missing = log
+            .output(
+                hexecrunner::RunnerRef::local(),
+                spec("/nonexistent/heph-no-such-tool", ""),
+                Streams::STDERR,
+                &ctoken,
+            )
+            .await
+            .expect_err("a missing program fails the spawn");
+        assert!(
+            missing
+                .chain()
+                .filter_map(|c| c.downcast_ref::<std::io::Error>())
+                .any(|e| e.kind() == std::io::ErrorKind::NotFound),
+            "{missing:#}"
+        );
+        drop(log);
+        assert_eq!(err_w.text(), "building\n");
+        assert_eq!(out_w.text(), "", "a data stream never reaches the log");
     }
 
     /// Both log streams land in one log in the order they arrived, and the

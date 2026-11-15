@@ -13,6 +13,8 @@ hplugin = { package = "plugin", path = "../plugin" }
 hlock = { package = "lock", path = "../lock" }
 # `run_log::RunLog::pump` reads a child's `OutputReader`.
 hproc = { package = "proc", path = "../proc" }
+# `run_log::RunLog::output` spawns a plugin's tool through the exec-runner seam.
+hexecrunner = { package = "execrunner", path = "../execrunner" }
 anyhow = "1.0.102"
 async-trait = "0.1.89"
 serde = { version = "1", features = ["derive"] }
@@ -36,6 +38,4 @@ memchr = "2.8"
 libc = "0.2"
 
 [dev-dependencies]
-# The `run_log` pump tests spawn a real child through the exec-runner seam.
-hexecrunner = { package = "execrunner", path = "../execrunner" }
 tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "macros", "time"] }
