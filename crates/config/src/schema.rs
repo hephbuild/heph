@@ -66,8 +66,8 @@ pub(crate) fn empty_is_null(schema: &mut Schema) {
     }
 }
 
-/// [`config_json_schema`] as `heph tool config-schema` prints it, and as
-/// `docs/hephconfig.schema.json` holds it: pretty JSON and a trailing newline.
+/// [`config_json_schema`] as `heph tool config-schema` prints it: pretty JSON
+/// and a trailing newline.
 pub fn config_json_schema_text() -> serde_json::Result<String> {
     let mut text = serde_json::to_string_pretty(&config_json_schema())?;
     text.push('\n');
@@ -578,30 +578,6 @@ mod tests {
             ["unit"]["enum"];
         // `unit: ~` is the same as no `unit:`.
         assert_eq!(units, &serde_json::json!(["count", "cpu", "bytes", null]));
-    }
-
-    /// The committed copy of the schema, so every change to it shows in
-    /// review.
-    fn golden_path() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/hephconfig.schema.json")
-    }
-
-    /// `docs/hephconfig.schema.json` is exactly what `heph tool config-schema`
-    /// prints, so every schema change shows up in review as a diff of it.
-    #[test]
-    fn golden_schema_is_current() {
-        let text = config_json_schema_text().expect("render");
-        let path = golden_path();
-        if std::env::var_os("UPDATE_GOLDEN").is_some() {
-            std::fs::write(&path, &text).expect("write the golden schema");
-            return;
-        }
-        let golden = std::fs::read_to_string(&path).unwrap_or_default();
-        assert!(
-            golden == text,
-            "docs/hephconfig.schema.json is out of date with the config types; \
-             regenerate it with `UPDATE_GOLDEN=1 cargo test -p config golden` and commit the diff"
-        );
     }
 
     /// Rendering twice gives the same bytes: no map whose order depends on

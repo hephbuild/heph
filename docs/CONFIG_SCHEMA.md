@@ -15,9 +15,8 @@ schema is the pinned version's and matches the parser that will read the file.
 The command reads no config and starts no engine, so it also runs outside a
 workspace and next to a config with keys this binary doesn't know.
 
-`docs/hephconfig.schema.json` is a copy of the current schema, committed so
-that every schema change shows up in review. A test in `crates/config` fails
-when it is stale; `UPDATE_GOLDEN=1 cargo test -p config golden` rewrites it.
+The command is the only supported source of the schema: heph publishes no
+copy of it.
 
 ## Stability
 
@@ -38,8 +37,8 @@ What a consumer may rely on:
 An editor plugin or script that runs the command should:
 
 - Use the output only if the command exits 0 **and** stdout parses as JSON
-  with a `$schema` key. Otherwise fall back, to a bundled copy or to no schema,
-  and do not retry.
+  with a `$schema` key. Otherwise fall back, to no schema or to a copy it
+  generated itself earlier, and do not retry.
 - Run it with a timeout. In a workspace that pins a version the binary may
   download that version before the command runs.
 
@@ -60,11 +59,9 @@ pin moves. Either a tracked path in the repository (for example
 outside the repository. Not `.heph/`: that is the heph home, gitignored, and
 holds the cache, locks and sandboxes.
 
-Prefer the command to a URL. A URL on `master` describes `master`'s config,
-not the one a pinned workspace runs. If you do use a URL, pin it to a tag
-(`https://raw.githubusercontent.com/hephbuild/heph/<tag>/docs/hephconfig.schema.json`),
-and treat it as best-effort: a release only has one when its source was
-tagged.
+There is no URL to point an editor at: the schema comes only from the
+command. Without a working binary, an editor gets no schema, or a copy
+generated earlier.
 
 **Neovim (0.11+, yamlls).** Treat the config files as YAML, then map the
 schema to them:
