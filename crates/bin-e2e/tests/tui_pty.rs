@@ -1561,6 +1561,8 @@ fn mouse_capture_only_on_full_screens() {
 const ENTER: &[u8] = b"\r";
 /// What the line says while Y stands.
 const AUTO_APPROVING: &str = "auto-approving (Y)";
+/// The line's words while N stands.
+const AUTO_REJECTING: &str = "auto-rejecting (N)";
 
 /// Three approval-gated dependencies of `//pkg:sum`, the run's named target.
 /// `//pkg:one`'s notice is ready at once and carries control bytes (a colour,
@@ -1804,7 +1806,8 @@ fn approval_view_decides_and_returns() {
 /// view opens on two pending requests leaves both pending, and so does a
 /// stream of y right after a decision — the presses are dropped, not queued
 /// for when the lockout ends. Esc leaves the request pending and the build
-/// waiting for it.
+/// waiting for it; N then rejects it, and the build fails with a report
+/// naming the rejection.
 #[test]
 fn held_keys_decide_nothing() {
     let mut g = Gated::start_build(approval_build, "", &[], "//pkg:sum");
@@ -1812,11 +1815,12 @@ fn held_keys_decide_nothing() {
         .wait_screen("two requests on the line", DEADLINE, |s| {
             prompted_for(s, "//pkg:one", " · 2 pending")
         });
-    // From before the first frame of the view to 0.4 s after: all of it
-    // inside the lockout, which starts at that frame.
+    // From before the first frame of the view to 0.25 s after: all of it
+    // inside the 0.5 s lockout, which starts at that frame. The 0.25 s left
+    // over is for a loaded runner reading the presses late.
     g.pty.send(ENTER);
-    hold_key(&g.pty, b"Y", 200);
-    hold_key(&g.pty, b"N", 200);
+    hold_key(&g.pty, b"Y", 125);
+    hold_key(&g.pty, b"N", 125);
     g.pty.wait_screen("the view, armed", DEADLINE, |s| {
         viewing(s, "//pkg:one", "1 of 2 pending") && decision_armed(s)
     });
@@ -1858,34 +1862,47 @@ fn held_keys_decide_nothing() {
         "the build stopped waiting after esc\n{}",
         g.pty.screen()
     );
-    // Decide it, and the third, for real.
+    // Reject it for real with N, which stands: the build fails on it, its
+    // report names the rejection, and the exit code is a failure's.
     g.pty.send(ENTER);
     g.pty.wait_screen("the view, armed", DEADLINE, |s| {
         viewing(s, "//pkg:two", "1 of 1 pending") && decision_armed(s)
     });
-    g.pty.send(b"Y");
-    g.pty
-        .wait_screen("the line, Y standing", DEADLINE, line_auto_approving);
+    g.pty.send(b"N");
+    g.pty.wait_screen("the line, N standing", DEADLINE, |s| {
+        on_line(s) && count_rows(s, AUTO_REJECTING) == 1
+    });
     g.play(&[Step::OpenGate]);
     let ended = g.exit();
-    assert_eq!(
-        ended,
-        common::pty::Ended::Code(0),
-        "the build failed\n{}",
+    let common::pty::Ended::Code(code) = ended else {
+        panic!("held keys: {ended:?}\n{}", g.pty.seen());
+    };
+    assert!(
+        code != 0 && code != 130,
+        "a rejection must fail the build, neither pass nor abort it: {code}\n{}",
+        g.pty.seen()
+    );
+    assert!(
+        g.pty.seen().contains("approval denied for //pkg:two"),
+        "the report does not name the rejection\n{}",
         g.pty.seen()
     );
     assert_restored(&g.pty, "held keys");
-    // Three decisions, the three keys that were meant: no N got through.
+    // The keys that were meant, nothing held: y approved //pkg:one (a held N
+    // deciding it would have rejected it), N rejected //pkg:two, and
+    // //pkg:three too if it asked before the build stopped.
     let lines = decision_lines(&g.pty);
-    assert_eq!(lines.len(), 3, "one line per decision: {lines:?}");
+    let approved: Vec<&String> = lines.iter().filter(|l| l.contains("✓ approved")).collect();
+    assert_eq!(approved.len(), 1, "a held key approved: {lines:?}");
     assert!(
-        lines.iter().all(|l| l.contains("✓ approved")),
-        "a held key decided: {lines:?}"
+        approved[0].contains("✓ approved //pkg:one · by key (y)"),
+        "y decided other than what it was pressed for: {lines:?}"
     );
-    assert_eq!(
-        lines.iter().filter(|l| l.contains("by key (y)")).count(),
-        1,
-        "y decided more than the one it was pressed for: {lines:?}"
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("✗ rejected //pkg:two · by standing rejection (N)")),
+        "no rejection line for //pkg:two: {lines:?}"
     );
 }
 
