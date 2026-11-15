@@ -103,7 +103,8 @@ pub struct LogOptions {
     /// Finds runs going on in other hephs on this workspace.
     pub locator: Option<Arc<dyn LiveRunLogLocator>>,
     /// Fetch a remote hit's log into the local entry. Only a reader that
-    /// shows a log asks for it; a list's last-line column never does.
+    /// shows a log asks for it; a list's last-line column never does. Only
+    /// such a reader waits, on a miss, for queued cache writes to commit.
     pub fetch_remote: bool,
     /// Only the log of the run at this input hash (`heph log --current`):
     /// every source at another hash is passed over, however new.
@@ -288,11 +289,15 @@ impl Engine {
         opts: &LogOptions,
     ) -> anyhow::Result<Option<OpenLog>> {
         let mut latest = self.latest_log_blocking(addr, opts).await?;
-        if matches!(latest, Latest::None) {
+        if matches!(latest, Latest::None) && opts.fetch_remote {
             // A remote hit's mirrored manifest is a queued write until the
             // sqlite writer commits it, and the cache listing does not wait
             // on that queue: an open right after the hit found nothing. On
             // the miss path only, let what is queued commit and look again.
+            // Only for a reader that shows a log (`fetch_remote`): the
+            // last-line column opens every visible row with no log, and
+            // waiting there on every queued write in a busy build stalls it;
+            // it looks again on its next pass anyway.
             self.sqlite_writes.drain_queued_writes().await;
             latest = self.latest_log_blocking(addr, opts).await?;
         }

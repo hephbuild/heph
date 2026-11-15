@@ -8362,6 +8362,43 @@ mod tests {
         Ok(())
     }
 
+    /// The last-line column's open (no `fetch_remote`) never waits on the
+    /// sqlite write queue: with the writer shut and a remote hit's manifest
+    /// still queued, its miss answers at once instead of waiting for every
+    /// queued write to commit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn open_log_without_fetch_does_not_wait_on_queued_writes() -> anyhow::Result<()> {
+        let remote = tempdir()?;
+        let remote_uri = format!("file://{}", remote.path().display());
+        let addr = hmodel::htaddr::parse_addr("//pkg:t")?;
+        let target = || pluginstatictarget::Target {
+            run: Some("echo a log line; echo hi > $OUT".to_string()),
+            ..out_target("//pkg:t")
+        };
+
+        let (seeder, _seeder_home) = engine_with_remote_bash(vec![target()], &remote_uri)?;
+        let seed_rs = seeder.new_state();
+        resolve(&seeder, &seed_rs, &addr, OutputMatcher::All).await?;
+        drain_bg(seed_rs).await;
+
+        let (engine, _home) = engine_with_remote_bash(vec![target()], &remote_uri)?;
+        let hold = engine.hold_local_cache_writes();
+        let rs = engine.new_state();
+        resolve(&engine, &rs, &addr, OutputMatcher::None).await?;
+        drop(rs);
+
+        let opts = crate::engine::log_api::LogOptions::default();
+        let open = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            engine.open_log(&addr, &opts),
+        )
+        .await
+        .context("a no-fetch open waited on the queued writes")??;
+        assert!(open.is_none(), "the queued manifest is not listed yet");
+        drop(hold);
+        Ok(())
+    }
+
     /// Two readers open a remote hit's log at once (a `heph log` and the
     /// TUI's pane): the blob is pulled once, and both read it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
