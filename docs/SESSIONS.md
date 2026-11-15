@@ -20,7 +20,11 @@ heph: session d1v9q02kf5 (heph session attach d1v9q02kf5)
 ```
 
 An `<id>` is the full id, the pid of a **live** session, or a unique prefix
-or suffix of an id; an ambiguous one lists the candidates.
+or suffix of an id; an ambiguous one lists the candidates. Give the suffix
+(the last 4–5 characters, `heph session attach 02kf5`) or the pid: an id
+is 42 bits of start time over 8 random bits, so its leading characters are
+the time, and two runs started within about 2 minutes share a 5-character
+prefix.
 
 ## Commands and exit codes
 

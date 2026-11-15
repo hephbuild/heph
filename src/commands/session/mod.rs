@@ -56,6 +56,10 @@ pub enum SessionCommands {
     /// Only this workspace's sessions unless `--all`. Reads each session's
     /// `meta.json` and `status.json`, never its event log.
     ///
+    /// The other commands take an id's last 4–5 characters, or a live
+    /// session's pid, in place of the full id. The leading characters are
+    /// the start time, so sessions started minutes apart share them.
+    ///
     /// Examples:
     ///
     /// `heph session list`
@@ -65,11 +69,13 @@ pub enum SessionCommands {
     /// Print a session's progress once, and what it is stuck on
     ///
     /// `<id>` is a full session id, the pid of a live session, or a unique
-    /// prefix or suffix of an id.
+    /// prefix or suffix of an id. Give the suffix (the last 4–5 characters)
+    /// or the pid: the leading characters are the start time, so sessions
+    /// started minutes apart share them.
     ///
     /// Examples:
     ///
-    /// `heph session show k7q2m`
+    /// `heph session show 02kf5`
     ///
     /// `heph session show 48213 --json`
     Show(ShowArgs),
@@ -81,7 +87,9 @@ pub enum SessionCommands {
     ///
     /// Examples:
     ///
-    /// `heph session attach k7q2m`
+    /// `heph session attach 02kf5`
+    ///
+    /// `heph session attach 48213`
     Attach(AttachArgs),
     /// Ask a running session for its in-flight report
     ///
@@ -90,7 +98,7 @@ pub enum SessionCommands {
     ///
     /// Examples:
     ///
-    /// `heph session inflight k7q2m`
+    /// `heph session inflight 02kf5`
     Inflight(InflightArgs),
 }
 
@@ -106,7 +114,8 @@ pub struct ListArgs {
 
 #[derive(Args, Clone, Debug)]
 pub struct ShowArgs {
-    /// Session id, live session pid, or unique id prefix or suffix.
+    /// Session id, its last 4–5 characters, or a live session's pid (any
+    /// unique prefix or suffix of an id works).
     pub id: String,
     /// The session's snapshot as JSON, with the viewer-computed `state`.
     #[arg(long)]
@@ -115,13 +124,15 @@ pub struct ShowArgs {
 
 #[derive(Args, Clone, Debug)]
 pub struct AttachArgs {
-    /// Session id, live session pid, or unique id prefix or suffix.
+    /// Session id, its last 4–5 characters, or a live session's pid (any
+    /// unique prefix or suffix of an id works).
     pub id: String,
 }
 
 #[derive(Args, Clone, Debug)]
 pub struct InflightArgs {
-    /// Session id, live session pid, or unique id prefix or suffix.
+    /// Session id, its last 4–5 characters, or a live session's pid (any
+    /// unique prefix or suffix of an id works).
     pub id: String,
     /// `{id, report}`.
     #[arg(long)]
@@ -483,7 +494,7 @@ fn ambiguous(arg: &str, candidates: &[&(usize, SessionEntry)], opts: ViewOpts) -
             .map_or_else(|| "-".to_owned(), |m| command_line(&m.argv, usize::MAX));
         msg.push_str(&format!("\n  {}  {:<8} {command}", e.id, state.label()));
     }
-    msg.push_str("\nGive more of the id.");
+    msg.push_str("\nGive more of the id (or its last characters).");
     anyhow::anyhow!(msg)
 }
 

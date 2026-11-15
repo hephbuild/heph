@@ -734,6 +734,10 @@ async fn ids_resolve_prefix_suffix_pid() {
     let msg = format!("{err:#}");
     assert!(msg.contains("matches 2 sessions"), "{msg}");
     assert!(msg.contains(&ae) && msg.contains(&be), "lists both: {msg}");
+    assert!(
+        msg.contains("Give more of the id (or its last characters)."),
+        "points at the suffix: {msg}"
+    );
     // The first character after the shared prefix tells them apart.
     let split = ae
         .chars()

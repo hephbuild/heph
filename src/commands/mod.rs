@@ -118,9 +118,10 @@ pub enum Commands {
     ///
     /// `heph session list` — this workspace's sessions, live first
     ///
-    /// `heph session show k7q2m` — what it is doing and what it is stuck on
+    /// `heph session show 02kf5` — what it is doing and what it is stuck on
+    /// (an id's last 4–5 characters, or a live session's pid)
     ///
-    /// `heph session attach k7q2m` — follow it; `q` detaches
+    /// `heph session attach 02kf5` — follow it; `q` detaches
     #[command(arg_required_else_help = true)]
     Session(session::SessionArgs),
     /// Developer tools
