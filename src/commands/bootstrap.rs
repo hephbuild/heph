@@ -241,7 +241,8 @@ pub fn new_reader_engine(
     global: &super::GlobalOptions,
     root: &std::path::Path,
 ) -> anyhow::Result<(Arc<engine::Engine>, std::path::PathBuf)> {
-    let (_file, config) = engine_config(root, global, BadEnv::Ignore, std::env::vars_os())?;
+    let (_file, config) = engine_config(root, global, BadEnv::Ignore, std::env::vars_os())
+        .context("resolving the recorded workspace's config")?;
     let home = config.home_dir.to_path_buf();
     let engine = engine::Engine::new(config).context("building a reader engine")?;
     Ok((Arc::new(engine), home))
