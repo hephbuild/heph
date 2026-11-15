@@ -135,7 +135,42 @@ pub struct Details {
     t0: Option<u64>,
     list: Vec<Detail>,
     shapes: Vec<Shape>,
-    index: HashMap<Shape, u32>,
+    /// A shape's hash to the indices (plus one) of the shapes with it.
+    index: HashMap<u64, Vec<u32>>,
+}
+
+/// A [`Shape`] borrowed from the event that carries it.
+#[derive(Debug, Clone, Copy)]
+struct ShapeRef<'a> {
+    driver: &'a str,
+    declared: Option<&'a BTreeMap<String, u64>>,
+    reserved: Option<&'a BTreeMap<String, u64>>,
+    outputs: &'a [String],
+}
+
+impl ShapeRef<'_> {
+    fn hash(&self) -> u64 {
+        use std::hash::{Hash as _, Hasher as _};
+        let mut h = std::hash::DefaultHasher::new();
+        (self.driver, self.declared, self.reserved, self.outputs).hash(&mut h);
+        h.finish()
+    }
+
+    fn is(&self, s: &Shape) -> bool {
+        self.driver == s.driver
+            && self.declared == s.declared.as_ref()
+            && self.reserved == s.reserved.as_ref()
+            && self.outputs == s.outputs.as_slice()
+    }
+
+    fn stored(self) -> Shape {
+        Shape {
+            driver: self.driver.to_owned(),
+            declared: self.declared.cloned(),
+            reserved: self.reserved.cloned(),
+            outputs: self.outputs.to_vec(),
+        }
+    }
 }
 
 impl Details {
@@ -241,11 +276,11 @@ impl Details {
                 output_groups,
                 ..
             } => {
-                let shape = self.intern(Shape {
-                    driver: driver.clone(),
-                    declared: declared.clone(),
-                    reserved: reserved.clone(),
-                    outputs: output_groups.clone(),
+                let shape = self.intern(ShapeRef {
+                    driver,
+                    declared: declared.as_ref(),
+                    reserved: reserved.as_ref(),
+                    outputs: output_groups,
                 });
                 if let Some(d) = self.list.get_mut(id as usize) {
                     d.shape = shape;
@@ -275,13 +310,23 @@ impl Details {
     }
 
     /// `shape`'s index plus one, storing it the first time it is seen.
-    fn intern(&mut self, shape: Shape) -> u32 {
-        if let Some(&i) = self.index.get(&shape) {
+    /// Looked up borrowed, so a start whose shape is known copies nothing,
+    /// and a shape is stored once (the index keeps only its hash).
+    fn intern(&mut self, shape: ShapeRef<'_>) -> u32 {
+        let hash = shape.hash();
+        let known = self.index.get(&hash).and_then(|candidates| {
+            candidates.iter().copied().find(|&i| {
+                i.checked_sub(1)
+                    .and_then(|k| self.shapes.get(k as usize))
+                    .is_some_and(|s| shape.is(s))
+            })
+        });
+        if let Some(i) = known {
             return i;
         }
-        self.shapes.push(shape.clone());
+        self.shapes.push(shape.stored());
         let i = u32::try_from(self.shapes.len()).unwrap_or(u32::MAX);
-        self.index.insert(shape, i);
+        self.index.entry(hash).or_default().push(i);
         i
     }
 
@@ -371,7 +416,50 @@ fn op_label(op: Op) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::Detail;
+    use super::{Detail, Details};
+    use hcore::events::BuildEventKind;
+    use std::collections::BTreeMap;
+
+    /// Runs of the same shape share one stored shape, found without
+    /// copying the event's; a shape differing in any part is its own.
+    #[test]
+    fn shapes_are_stored_once_and_told_apart() {
+        let start = |driver: &str, cpu: u64, outputs: &[&str]| BuildEventKind::ExecuteStart {
+            output_groups: outputs.iter().map(|s| (*s).to_owned()).collect(),
+            addr: "//p:x".into(),
+            driver: driver.into(),
+            cache: true,
+            declared: Some(BTreeMap::from([("cpu".to_owned(), cpu)])),
+            reserved: None,
+            queued_ms: None,
+            admitted: None,
+        };
+        let events = [
+            start("exec", 1, &["", "bin"]),
+            start("exec", 1, &["", "bin"]),
+            start("exec", 2, &["", "bin"]),
+            start("exec", 1, &["bin", ""]),
+            start("bash", 1, &["", "bin"]),
+            start("exec", 1, &["", "bin"]),
+        ];
+        let mut d = Details::default();
+        for (id, kind) in (0..).zip(&events) {
+            d.push();
+            d.fold(id, kind, 1_000);
+        }
+        let shape = |id: u32| {
+            let detail = d.get(id).expect("detail");
+            d.shape(detail).expect("shape").clone()
+        };
+        assert_eq!(d.shapes.len(), 4, "{:#?}", d.shapes);
+        assert_eq!(shape(0), shape(1));
+        assert_eq!(shape(0), shape(5));
+        for other in 2..5 {
+            assert_ne!(shape(0), shape(other), "{other}");
+        }
+        assert_eq!(shape(4).driver, "bash");
+        assert_eq!(shape(3).outputs, ["bin", ""]);
+    }
 
     #[test]
     fn detail_size_budget() {
