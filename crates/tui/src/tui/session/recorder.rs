@@ -9,8 +9,9 @@
 //!
 //! - `events.ndjson`: through a `BufWriter`, flushed 250ms after the first
 //!   unflushed byte and at exit; capped at [`EVENTS_CAP`] with a `Truncated`
-//!   record, after which only `End`/`InflightWritten`, `RunLog` and the view records
-//!   [`outlives_cap`] names are appended.
+//!   record, after which only `End`/`InflightWritten`, `RunLog`, the view records
+//!   [`outlives_cap`] names, and `Log` records up to [`LOG_CEILING`] bytes of
+//!   them, are appended.
 //! - `status.json`: at most once a second and only when something changed,
 //!   written to a temp file and renamed over.
 //!
@@ -44,8 +45,14 @@ use super::holder::{HolderNames, event_holder_pid};
 use crate::tui::app::TUIAppView;
 use crate::tui::progress::BuildState;
 
-/// `events.ndjson` stops growing past this (A10).
+/// `events.ndjson` stops growing past this (A10), except for the records a
+/// viewer needs at the end and for `Log` records, up to [`LOG_CEILING`].
 pub const EVENTS_CAP: u64 = 64 * 1024 * 1024;
+
+/// How many bytes of `Log` records are written past [`EVENTS_CAP`]. A replay
+/// after a full screen reads heph's own lines from disk, so they outlive the
+/// cap; past this they are dropped, and the replay says how many it skipped.
+pub const LOG_CEILING: u64 = 256 * 1024 * 1024;
 
 /// Messages queued and not yet taken by the recorder past which it stops: a
 /// disk slower than the event rate must not grow the process without bound.
@@ -64,8 +71,14 @@ enum Msg {
     Event(BuildEvent),
     Log {
         at_unix_ms: u64,
+        seq: u64,
         level: &'static str,
         msg: String,
+    },
+    /// Flush everything received so far, then answer whether it reached the
+    /// file. The channel is FIFO, so every record sent before this is ahead.
+    Flush {
+        ack: mpsc::SyncSender<bool>,
     },
     InflightWritten {
         at_unix_ms: u64,
@@ -100,9 +113,14 @@ struct Shared {
 }
 
 impl Shared {
+    /// Latch the failure; whether this call latched it.
+    fn latch(&self) -> bool {
+        !self.stopped.swap(true, Ordering::AcqRel)
+    }
+
     /// Latch the failure, then report it — in that order (A9).
     fn stop(&self, why: &str, error: Option<&io::Error>) {
-        if !self.stopped.swap(true, Ordering::AcqRel) {
+        if self.latch() {
             match error {
                 Some(error) => tracing::warn!(%error, "{why}; this run's session stops recording"),
                 None => tracing::warn!("{why}; this run's session stops recording"),
@@ -124,6 +142,40 @@ impl Shared {
     }
 }
 
+const FELL_BEHIND: &str = "the session recorder fell more than 500000 records behind";
+
+/// A recording stop latched by a send made inside the log sink's lock, where
+/// a `warn!` would re-enter the sink and deadlock. Its holder reports it once
+/// it has let go of the lock.
+#[derive(Debug)]
+#[must_use = "a latched stop is reported once, by its holder"]
+pub struct StopNotice(&'static str);
+
+impl StopNotice {
+    /// The one `warn!` for this stop.
+    pub fn report(self) {
+        tracing::warn!("{}; this run's session stops recording", self.0);
+    }
+}
+
+/// Why [`SessionTap::flush`] did not get the records to disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlushFailed {
+    /// The recording stopped, or the session finished.
+    Stopped,
+    /// The recorder did not answer in time.
+    TimedOut,
+}
+
+impl std::fmt::Display for FlushFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Stopped => "the session's recording stopped",
+            Self::TimedOut => "the session recorder did not flush in time",
+        })
+    }
+}
+
 /// A handle that feeds the recorder. Cheap to clone; every send is one channel
 /// push and two atomics, and never blocks.
 #[derive(Debug, Clone)]
@@ -133,22 +185,29 @@ pub struct SessionTap {
 }
 
 impl SessionTap {
-    fn send(&self, msg: Msg) {
+    /// Send `msg`; whether it was queued, and a stop this send latched, which
+    /// the caller reports (see [`StopNotice`]).
+    fn try_send(&self, msg: Msg) -> (bool, Option<StopNotice>) {
         if self.shared.is_stopped() || self.shared.finished.load(Ordering::Acquire) {
-            return;
+            return (false, None);
         }
         if self.shared.pending.fetch_add(1, Ordering::Relaxed) >= MAX_PENDING {
             self.shared.pending.fetch_sub(1, Ordering::Relaxed);
-            self.shared.stop(
-                "the session recorder fell more than 500000 records behind",
-                None,
-            );
-            return;
+            let notice = self.shared.latch().then_some(StopNotice(FELL_BEHIND));
+            return (false, notice);
         }
         if self.tx.send(msg).is_err() {
             // The thread is gone (stopped, or finished): nothing to undo but the
             // count.
             self.shared.pending.fetch_sub(1, Ordering::Relaxed);
+            return (false, None);
+        }
+        (true, None)
+    }
+
+    fn send(&self, msg: Msg) {
+        if let (_, Some(notice)) = self.try_send(msg) {
+            notice.report();
         }
     }
 
@@ -157,13 +216,41 @@ impl SessionTap {
         self.send(Msg::Event(ev));
     }
 
-    /// Record a log line the terminal showed.
-    pub fn log(&self, level: &'static str, msg: String) {
-        self.send(Msg::Log {
+    /// Record line `seq` of the log sink, a line the terminal showed. Called
+    /// inside the sink's lock, so it never logs: a stop it latched comes back
+    /// for the caller to report once it has let go.
+    #[must_use = "a latched stop must be reported outside the sink's lock"]
+    pub fn log(&self, seq: u64, level: &'static str, msg: String) -> Option<StopNotice> {
+        self.try_send(Msg::Log {
             at_unix_ms: now_unix_ms(),
+            seq,
             level,
             msg,
-        });
+        })
+        .1
+    }
+
+    /// Wait, at most `timeout`, until every record sent before this call is
+    /// in `events.ndjson`. Fails at once when the recording stopped or the
+    /// session finished: a caller must not wait on a recorder that is gone.
+    pub fn flush(&self, timeout: Duration) -> Result<(), FlushFailed> {
+        let (ack, acked) = mpsc::sync_channel(1);
+        match self.try_send(Msg::Flush { ack }) {
+            (true, _) => {}
+            (false, notice) => {
+                if let Some(notice) = notice {
+                    notice.report();
+                }
+                return Err(FlushFailed::Stopped);
+            }
+        }
+        match acked.recv_timeout(timeout) {
+            Ok(true) => Ok(()),
+            // `false`: the flush failed and stopped the recording. Disconnected:
+            // the thread stopped before it got there.
+            Ok(false) | Err(RecvTimeoutError::Disconnected) => Err(FlushFailed::Stopped),
+            Err(RecvTimeoutError::Timeout) => Err(FlushFailed::TimedOut),
+        }
     }
 
     /// Record what the terminal showed besides build events and log lines,
@@ -442,6 +529,10 @@ pub(crate) struct Faults {
     pub(crate) panic_on_event: bool,
     /// Fail to take the session's lock, as an NFS `ENOLCK` would.
     pub(crate) fail_lock: bool,
+    /// [`EVENTS_CAP`] in its place, so a test reaches it with a few records.
+    pub(crate) events_cap: Option<u64>,
+    /// [`LOG_CEILING`] in its place.
+    pub(crate) log_ceiling: Option<u64>,
 }
 
 /// What the recorder thread starts with.
@@ -452,6 +543,8 @@ pub(crate) struct RecorderStart {
     pub(crate) lock: File,
     pub(crate) events: Box<dyn Write + Send>,
     pub(crate) retention: Retention,
+    /// A private-sessions root to sweep of every ended session too.
+    pub(crate) private_root: Option<PathBuf>,
     pub(crate) faults: Faults,
 }
 
@@ -481,6 +574,7 @@ impl Recorder {
             root,
             events,
             retention,
+            private_root,
             faults,
             ..
         } = start;
@@ -495,11 +589,23 @@ impl Recorder {
                     Ok(_) => {}
                     Err(e) => tracing::debug!(error = %e, "cannot clean ended sessions"),
                 }
+                // A killed `HEPH_NO_SESSION` run's directory: nobody else
+                // reads it, so it goes whatever its age. Missing is normal.
+                if let Some(private) = &private_root
+                    && let Err(e) =
+                        cleanup::cleanup(private, SystemTime::now(), super::private_retention())
+                    && e.kind() != io::ErrorKind::NotFound
+                {
+                    tracing::debug!(error = %e, "cannot clean ended private sessions");
+                }
                 let mut thread = RecorderThread {
                     dir,
                     events: BufWriter::new(events),
                     events_bytes: 0,
+                    events_cap: faults.events_cap.unwrap_or(EVENTS_CAP),
                     truncated: false,
+                    log_bytes_past_cap: 0,
+                    log_ceiling: faults.log_ceiling.unwrap_or(LOG_CEILING),
                     unflushed_since: None,
                     state: BuildState::new(),
                     end: None,
@@ -569,7 +675,11 @@ struct RecorderThread {
     dir: PathBuf,
     events: BufWriter<Box<dyn Write + Send>>,
     events_bytes: u64,
+    events_cap: u64,
     truncated: bool,
+    /// Bytes of `Log` records written past the cap, at most `log_ceiling`.
+    log_bytes_past_cap: u64,
+    log_ceiling: u64,
     /// When the oldest unflushed byte was written.
     unflushed_since: Option<Instant>,
     state: BuildState,
@@ -666,15 +776,23 @@ impl RecorderThread {
             }
             Msg::Log {
                 at_unix_ms,
+                seq,
                 level,
                 msg,
-            } => self.append_capped(&SessionRecord::session(
+            } => self.append_log(&SessionRecord::session(
                 at_unix_ms,
                 SessionRecordKind::Log {
                     level: level.to_owned(),
                     msg,
+                    seq: Some(seq),
                 },
             )),
+            Msg::Flush { ack } => {
+                let flushed = self.flush();
+                // The asker may have timed out and gone.
+                ack.send(flushed.is_ok()).unwrap_or_default();
+                flushed
+            }
             Msg::InflightWritten { at_unix_ms } => self
                 .append(&SessionRecord::session(
                     at_unix_ms,
@@ -758,16 +876,52 @@ impl RecorderThread {
         if !self.encode(record) {
             return Ok(());
         }
-        let len = u64::try_from(self.line.len()).unwrap_or(u64::MAX);
-        if self.events_bytes.saturating_add(len) > EVENTS_CAP {
-            self.truncated = true;
-            self.dirty = true;
-            return self.append(&SessionRecord::session(
-                now_unix_ms(),
-                SessionRecordKind::Truncated,
-            ));
+        if self.over_cap() {
+            return self.truncate();
         }
         self.write_line()
+    }
+
+    /// Append a `Log` record: under the cap like any record, past it (after
+    /// the `Truncated`) while the Log bytes written past it stay within the
+    /// ceiling, and dropped beyond — a replay counts the numbers it misses.
+    fn append_log(&mut self, record: &SessionRecord) -> io::Result<()> {
+        if !self.encode(record) {
+            return Ok(());
+        }
+        if !self.truncated {
+            if !self.over_cap() {
+                return self.write_line();
+            }
+            // `truncate` reuses the line buffer: encode the Log again after.
+            self.truncate()?;
+            if !self.encode(record) {
+                return Ok(());
+            }
+        }
+        let len = u64::try_from(self.line.len()).unwrap_or(u64::MAX);
+        let past = self.log_bytes_past_cap.saturating_add(len);
+        if past > self.log_ceiling {
+            return Ok(());
+        }
+        self.log_bytes_past_cap = past;
+        self.write_line()
+    }
+
+    /// The encoded line would take the file past the cap.
+    fn over_cap(&self) -> bool {
+        let len = u64::try_from(self.line.len()).unwrap_or(u64::MAX);
+        self.events_bytes.saturating_add(len) > self.events_cap
+    }
+
+    /// Write `Truncated` in place of the first record over the cap.
+    fn truncate(&mut self) -> io::Result<()> {
+        self.truncated = true;
+        self.dirty = true;
+        self.append(&SessionRecord::session(
+            now_unix_ms(),
+            SessionRecordKind::Truncated,
+        ))
     }
 
     /// Append a record regardless of the cap (`End`, `Truncated`,

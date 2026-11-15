@@ -137,6 +137,7 @@ mod tests {
             SessionRecordKind::Log {
                 level: "INFO".into(),
                 msg: msg.into(),
+                seq: None,
             },
         )
     }

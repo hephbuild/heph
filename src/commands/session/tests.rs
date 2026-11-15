@@ -1302,6 +1302,7 @@ async fn attach_mirrors_the_session_exit() {
             SessionRecordKind::Log {
                 level: "INFO".to_owned(),
                 msg: "hello \u{1b}[2J".to_owned(),
+                seq: None,
             },
         ),
     );

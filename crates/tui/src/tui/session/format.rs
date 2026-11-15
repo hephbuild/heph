@@ -197,13 +197,20 @@ impl SessionRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum SessionRecordKind {
-    /// A log line the terminal showed (`info!` and above), lossy UTF-8 and
-    /// stored verbatim: a viewer escapes control bytes on output.
+    /// A line the terminal showed, at the terminal's filter (so `debug!` too
+    /// under `-v`), lossy UTF-8 and stored verbatim: a viewer escapes control
+    /// bytes on output. `level` is empty for a diagnostic the process wrote
+    /// to the sink itself.
     Log {
         #[serde(default)]
         level: String,
         #[serde(default)]
         msg: String,
+        /// The line's number in this process's log sink, from 1: what a
+        /// replay after a full screen selects by. Absent from a writer that
+        /// predates it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seq: Option<u64>,
     },
     /// The process is exiting. Written before the lock is released, so "lock
     /// free and no `End`" means exactly "crashed".

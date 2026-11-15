@@ -81,6 +81,21 @@ fn events() -> Vec<BuildEvent> {
     ]
 }
 
+/// A build event of about 1 MiB, to reach the cap with (a `Log` outlives it).
+fn big_event() -> BuildEvent {
+    BuildEvent {
+        at_unix_ms: 1,
+        kind: BuildEventKind::ResultEnd {
+            addr: "//a:big".into(),
+            error: Some("x".repeat(1024 * 1024)),
+            upstream_of: None,
+            exit_status: None,
+            log_tail: None,
+            timed_out: None,
+        },
+    }
+}
+
 fn read_records(dir: &Path) -> (Vec<SessionRecord>, u64) {
     let file = std::fs::File::open(dir.join(files::EVENTS)).expect("events");
     let mut r = RecordReader::new(file);
@@ -112,7 +127,7 @@ fn recorder_round_trip_matches_live_view() {
         live.apply(&ev);
         tap.event(ev);
     }
-    tap.log("INFO", "hello\u{1b}[31m".into());
+    drop(tap.log(1, "INFO", "hello\u{1b}[31m".into()));
     session.finish(Some(1), false);
 
     let (records, skipped) = read_records(&dir);
@@ -125,7 +140,8 @@ fn recorder_round_trip_matches_live_view() {
     assert!(records.iter().any(|r| r.session
         == Some(SessionRecordKind::Log {
             level: "INFO".into(),
-            msg: "hello\u{1b}[31m".into()
+            msg: "hello\u{1b}[31m".into(),
+            seq: Some(1),
         })));
     assert_eq!(
         records.last().and_then(|r| r.session.clone()),
@@ -310,6 +326,7 @@ fn recorder_with(dir: &Path, events: Box<dyn Write + Send>, faults: Faults) -> R
         lock,
         events,
         retention: Retention::default(),
+        private_root: None,
         faults,
     })
     .expect("spawn")
@@ -409,9 +426,9 @@ fn send_after_finish_is_dropped_silently() {
     tracing::subscriber::with_default(subscriber, || {
         let rec = recorder_with(dir.path(), Box::new(io::sink()), Faults::default());
         let tap = rec.tap();
-        tap.log("INFO", "before".into());
+        assert!(tap.log(1, "INFO", "before".into()).is_none());
         rec.finish(Some(0), false, Duration::from_secs(5));
-        tap.log("INFO", "after".into());
+        assert!(tap.log(2, "INFO", "after".into()).is_none());
         for ev in events() {
             tap.event(ev);
         }
@@ -487,9 +504,8 @@ fn events_cap_truncates() {
     let file = std::fs::File::create(dir.path().join(files::EVENTS)).expect("events");
     let rec = recorder_with(dir.path(), Box::new(file), Faults::default());
     let tap = rec.tap();
-    let big = "x".repeat(1024 * 1024);
     for _ in 0..70 {
-        tap.log("INFO", big.clone());
+        tap.event(big_event());
     }
     tap.event(events().remove(0));
     rec.finish(Some(0), false, Duration::from_secs(10));
@@ -526,16 +542,16 @@ fn events_cap_truncates() {
 
 /// Past the cap, the view records a truncated session still needs at its end
 /// are written: the failure report, a label change, the prompt's clear and
-/// `Finished`. A prompt itself, a log line and a build event are not.
+/// `Finished`, and log lines (a replay reads them). A prompt itself and a
+/// build event are not.
 #[test]
 fn events_cap_keeps_the_ending_view_records() {
     let dir = tempfile::tempdir().expect("tempdir");
     let file = std::fs::File::create(dir.path().join(files::EVENTS)).expect("events");
     let rec = recorder_with(dir.path(), Box::new(file), Faults::default());
     let tap = rec.tap();
-    let big = "x".repeat(1024 * 1024);
     for _ in 0..70 {
-        tap.log("INFO", big.clone());
+        tap.event(big_event());
     }
     let prompt = SessionRecordKind::Approval {
         prompt: Some(Box::new(ApprovalPrompt {
@@ -558,7 +574,7 @@ fn events_cap_keeps_the_ending_view_records() {
     for kind in kept.iter().cloned() {
         tap.view(1, kind);
     }
-    tap.log("INFO", "after the cap".into());
+    assert!(tap.log(1, "INFO", "after the cap".into()).is_none());
     rec.finish(Some(1), false, Duration::from_secs(10));
 
     let (records, _) = read_records(dir.path());
@@ -573,6 +589,11 @@ fn events_cap_keeps_the_ending_view_records() {
     let kinds: Vec<_> = tail.iter().filter_map(|r| r.session.clone()).collect();
     let mut want = vec![SessionRecordKind::Truncated];
     want.extend(kept);
+    want.push(SessionRecordKind::Log {
+        level: "INFO".into(),
+        msg: "after the cap".into(),
+        seq: Some(1),
+    });
     want.push(SessionRecordKind::End {
         exit_code: Some(1),
         panicked: false,
@@ -810,17 +831,24 @@ async fn viewer_does_not_record_itself() {
     assert_eq!(entries(home.path()), 0, "not even ~/.heph");
 }
 
-/// A4: `HEPH_NO_SESSION=1` writes nothing.
+/// `HEPH_NO_SESSION=1` records into a private directory, outside the
+/// sessions root `heph session list` reads, removed when the session finishes.
+/// (Partial `no_session_private_dir`: the list and kill -9 sweep clauses are
+/// still to be written.)
 #[tokio::test]
-async fn no_session_env_writes_nothing() {
+async fn no_session_private_dir() {
     let home = tempfile::tempdir().expect("tempdir");
     let slot = Arc::new(SessionSlot::new());
     let root = SessionRoot::from_env(Some("1".as_ref()), Some(home.path().as_os_str()));
-    assert_eq!(root, Ok(None));
+    let private = home.path().join(".heph").join(PRIVATE_SESSIONS_DIR);
+    assert_eq!(root, Ok(Some(SessionRoot::private(&private))));
     slot.configure(root, Vec::new());
     assert!(run_in(&slot, true).await);
-    assert!(slot.dir().is_none());
-    assert_eq!(entries(home.path()), 0);
+    let dir = slot.dir().expect("a private session");
+    assert!(dir.starts_with(&private), "{}", dir.display());
+    assert!(!home.path().join(".heph").join(SESSIONS_DIR).exists());
+    slot.finish(Some(0));
+    assert!(!dir.exists(), "removed at exit");
 }
 
 /// A4: no `HOME` means no session, and the build still runs.

@@ -684,10 +684,14 @@ mod tests {
                 false,
             )
             .expect("a session opened");
+        // Build events, not log lines: those outlive the cap.
         let big = "x".repeat(1024 * 1024);
         let laps = recorder::EVENTS_CAP / (1024 * 1024) + 6;
         for _ in 0..laps {
-            opened.tap.log("INFO", big.clone());
+            opened.tap.event(hcore::events::BuildEvent {
+                at_unix_ms: 1,
+                kind: hcore::events::BuildEventKind::ResultStart { addr: big.clone() },
+            });
         }
         live_file(&home, "runs/e/0.log", b"out\n");
         slot.run_log_created(RunLogRecord {

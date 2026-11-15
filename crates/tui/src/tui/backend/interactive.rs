@@ -17,7 +17,7 @@ use ratatui::{Terminal, TerminalOptions, Viewport};
 use tokio::sync::mpsc;
 
 use crate::tui::app::{App, AppContext, Control, TUIAppView};
-use crate::tui::log_sink::LogSink;
+use crate::tui::log_sink::{LogSink, SinkLine};
 use crate::tui::progress::HSCROLL_STEP;
 use crate::tui::session::recorder::ViewTap;
 use crate::tui::session::{SessionSlot, TappedReceiver};
@@ -705,13 +705,13 @@ fn collapse_inline_viewport<B: Backend>(terminal: &mut Terminal<B>) {
 /// partially-processed data.
 fn drain_logs_to_terminal<B: Backend>(
     terminal: &mut Terminal<B>,
-    rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
+    rx: &mut mpsc::UnboundedReceiver<SinkLine>,
     cols: u16,
     budget: Option<Duration>,
 ) {
     let cols = cols.max(1);
     let deadline = budget.map(|d| Instant::now() + d);
-    while let Ok(bytes) = rx.try_recv() {
+    while let Ok(SinkLine { bytes, .. }) = rx.try_recv() {
         let text = bytes
             .into_text()
             .unwrap_or_else(|_| Text::raw(String::from_utf8_lossy(&bytes).into_owned()));
@@ -743,9 +743,9 @@ fn rows_needed(width: u16, cols: u16) -> u16 {
     u16::try_from(rows).unwrap_or(u16::MAX).max(1)
 }
 
-fn drain_logs_to_stderr(rx: &mut mpsc::UnboundedReceiver<Vec<u8>>) {
+fn drain_logs_to_stderr(rx: &mut mpsc::UnboundedReceiver<SinkLine>) {
     let mut stderr = io::stderr().lock();
-    while let Ok(bytes) = rx.try_recv() {
+    while let Ok(SinkLine { bytes, .. }) = rx.try_recv() {
         drop(stderr.write_all(&bytes));
     }
 }
@@ -759,7 +759,10 @@ fn drain_logs_to_stderr(rx: &mut mpsc::UnboundedReceiver<Vec<u8>>) {
 /// is a happens-before boundary: once it returns, no writer can reach `rx`
 /// again, so draining right after it is guaranteed to catch the whole gap.
 /// Mirrors the double-drain the exit path already relies on.
-fn flip_sink_to_direct_draining_the_gap(sink: &LogSink, rx: &mut mpsc::UnboundedReceiver<Vec<u8>>) {
+fn flip_sink_to_direct_draining_the_gap(
+    sink: &LogSink,
+    rx: &mut mpsc::UnboundedReceiver<SinkLine>,
+) {
     sink.switch_to_direct();
     drain_logs_to_stderr(rx);
 }
@@ -1528,12 +1531,12 @@ mod tests {
     /// that contract.
     #[test]
     fn tick_budget_defers_excess_messages_instead_of_dropping_them() {
-        use super::drain_logs_to_terminal;
+        use super::{SinkLine, drain_logs_to_terminal};
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
         use ratatui::{TerminalOptions, Viewport};
 
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SinkLine>();
         let mut terminal = Terminal::with_options(
             TestBackend::new(80, 24),
             TerminalOptions {
@@ -1543,7 +1546,11 @@ mod tests {
         .expect("terminal");
 
         for i in 0..3 {
-            tx.send(format!("line {i}\n").into_bytes()).expect("send");
+            tx.send(SinkLine {
+                seq: i + 1,
+                bytes: format!("line {i}\n").into_bytes(),
+            })
+            .expect("send");
         }
 
         // The deadline is captured once, before the loop, as `Instant::now() +
@@ -1555,8 +1562,8 @@ mod tests {
         drain_logs_to_terminal(&mut terminal, &mut rx, 80, Some(Duration::ZERO));
 
         let mut remaining = Vec::new();
-        while let Ok(bytes) = rx.try_recv() {
-            remaining.push(bytes);
+        while let Ok(line) = rx.try_recv() {
+            remaining.push(line.bytes);
         }
         assert_eq!(
             remaining,
@@ -1575,12 +1582,12 @@ mod tests {
     /// same `rx`.
     #[test]
     fn tick_budget_converges_across_multiple_ticks_without_losing_or_reordering() {
-        use super::drain_logs_to_terminal;
+        use super::{SinkLine, drain_logs_to_terminal};
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
         use ratatui::{TerminalOptions, Viewport};
 
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SinkLine>();
         let mut terminal = Terminal::with_options(
             TestBackend::new(80, 24),
             TerminalOptions {
@@ -1590,8 +1597,12 @@ mod tests {
         .expect("terminal");
 
         let messages: Vec<Vec<u8>> = (0..5).map(|i| format!("line {i}\n").into_bytes()).collect();
-        for m in &messages {
-            tx.send(m.clone()).expect("send");
+        for (seq, m) in (1..).zip(&messages) {
+            tx.send(SinkLine {
+                seq,
+                bytes: m.clone(),
+            })
+            .expect("send");
         }
 
         // One zero-budget call per message, exactly mirroring one render tick

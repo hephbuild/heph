@@ -1,38 +1,86 @@
-use std::io::{self, Write};
-use std::sync::{Arc, Mutex};
+use std::io::{self, Seek as _, SeekFrom, Write};
+use std::path::Path;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tracing::Level;
 use tracing_subscriber::fmt::MakeWriter;
 
-use crate::tui::session::SessionSlot;
+use crate::tui::session::{RecordReader, SessionRecordKind, SessionSlot};
 
-enum Inner {
+/// One write to the sink — a formatted log line or a diagnostic — and its
+/// number, from 1, in the order the sink took them. The session's `Log`
+/// record for it carries the same number.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SinkLine {
+    pub seq: u64,
+    pub bytes: Vec<u8>,
+}
+
+enum Out {
     Direct,
-    Buffered { tx: mpsc::UnboundedSender<Vec<u8>> },
+    Buffered { tx: mpsc::UnboundedSender<SinkLine> },
+}
+
+/// Everything behind the sink's one lock: numbering a line, recording it and
+/// handing it to the printer are one critical section, so the numbers reach
+/// the recorder and the printer in the same order, with no gap and no reuse.
+struct State {
+    out: Out,
+    /// The last number handed out; 0 before the first line.
+    seq: u64,
 }
 
 /// Where the process's terminal output goes, and the session recording it.
 ///
 /// `main` builds one and hands it to the command, beside the session itself.
-/// The sink keeps its own reference to the session only to tee every `info!`
-/// line into it; the session reaches [`run_app`](crate::tui::run_app) as its own
-/// argument, never through the sink.
+/// The sink keeps its own reference to the session only to tee every line it
+/// prints into it; the session reaches [`run_app`](crate::tui::run_app) as its
+/// own argument, never through the sink.
 #[derive(Clone)]
 pub struct LogSink {
-    inner: Arc<Mutex<Inner>>,
-    /// The process's session (design amendment A11). Outside `Inner` because
-    /// pausing and resuming the TUI replaces `Inner`, and a paused run must keep
-    /// recording.
+    inner: Arc<Mutex<State>>,
+    /// The process's session (design amendment A11). Outside the swapped
+    /// output because pausing and resuming the TUI replaces it, and a paused
+    /// run must keep recording.
     session: Arc<SessionSlot>,
 }
+
+/// Where a full screen took the terminal over: the last line printed before
+/// it, and a byte offset in `events.ndjson` at or before the record of every
+/// later line. See [`LogSink::replay_mark`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplayMark {
+    pub last_printed: u64,
+    offset: u64,
+}
+
+/// What a [`LogSink::replay`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Replayed {
+    /// The last number the replay covers: the printer drops every queued line
+    /// numbered at most this, and prints the later ones.
+    pub through: u64,
+    /// Lines printed from `events.ndjson`.
+    pub printed: u64,
+    /// Lines in the range that were not on disk (past the ceiling, dropped,
+    /// or no session to read): the one `WARN` says how many.
+    pub skipped: u64,
+}
+
+/// How long a replay waits for the recorder to flush.
+pub const REPLAY_FLUSH_TIMEOUT: Duration = Duration::from_secs(3);
 
 impl LogSink {
     /// A sink recording into `session` once a run opens it. The same slot is
     /// what the caller hands [`run_app`](crate::tui::run_app).
     pub fn new_direct_with(session: Arc<SessionSlot>) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(Inner::Direct)),
+            inner: Arc::new(Mutex::new(State {
+                out: Out::Direct,
+                seq: 0,
+            })),
             session,
         }
     }
@@ -43,14 +91,141 @@ impl LogSink {
         &self.session
     }
 
-    /// Record a formatted log line of `level` in the session, if the line is
-    /// one the terminal shows (`info!` and above).
-    fn tee(&self, level: Option<Level>, buf: &[u8]) {
-        // Ordered by verbosity: ERROR < WARN < INFO < DEBUG < TRACE.
-        if let Some(level) = level
-            && level <= Level::INFO
-        {
-            self.session.record_log(level.as_str(), buf);
+    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Number `buf`, record it in the session and print it (or queue it for
+    /// the printer), all under the sink's lock. Every write to the sink is a
+    /// line the terminal shows, at the terminal's filter (the subscriber
+    /// calls the writer only for events that passed it), so each is recorded:
+    /// `level` is `None` for a diagnostic.
+    fn emit(&self, level: Option<Level>, buf: &[u8]) -> io::Result<()> {
+        let (written, stopped) = {
+            let mut state = self.lock();
+            state.seq += 1;
+            let seq = state.seq;
+            let stopped = self
+                .session
+                .record_log(seq, level.map_or("", |l| l.as_str()), buf);
+            let written = match &state.out {
+                Out::Direct => io::stderr().lock().write_all(buf),
+                Out::Buffered { tx } => {
+                    drop(tx.send(SinkLine {
+                        seq,
+                        bytes: buf.to_vec(),
+                    }));
+                    Ok(())
+                }
+            };
+            (written, stopped)
+        };
+        // Its `warn!` comes back through this sink: only once the lock is free.
+        if let Some(stopped) = stopped {
+            stopped.report();
+        }
+        written
+    }
+
+    /// Mark the point where a full screen takes the terminal over. Takes
+    /// every line still queued in `rx`, which the caller prints before it
+    /// switches, and returns the mark [`replay`](Self::replay) starts from
+    /// when the screen closes. While the screen is up the caller keeps only
+    /// the numbers of the lines it drops, never their text.
+    ///
+    /// The offset is read **before** the lock is taken: every line numbered
+    /// past the mark is numbered after it, so its record lands after every
+    /// byte already on disk. Read after, a record flushed in between would be
+    /// behind it and never replayed.
+    pub fn replay_mark(
+        &self,
+        rx: &mut mpsc::UnboundedReceiver<SinkLine>,
+    ) -> (Vec<SinkLine>, ReplayMark) {
+        let offset = self
+            .session
+            .replay_source()
+            .and_then(|(_, events)| std::fs::metadata(events).ok())
+            .map_or(0, |m| m.len());
+        let state = self.lock();
+        let mut queued = Vec::new();
+        while let Ok(line) = rx.try_recv() {
+            queued.push(line);
+        }
+        let mark = ReplayMark {
+            last_printed: state.seq,
+            offset,
+        };
+        drop(state);
+        (queued, mark)
+    }
+
+    /// The lines numbered past `mark.last_printed`, read back from the
+    /// session's `events.ndjson` and handed to `print` in order, each once,
+    /// with its newline: what a closed full screen kept off the terminal.
+    ///
+    /// It first takes the latest number, then flushes the recorder through it
+    /// (every record numbered up to it was sent before the flush asked, the
+    /// numbering and the send being one critical section), then reads from
+    /// `mark`'s offset, so it reads only what was written meanwhile. The range
+    /// is exactly `(mark.last_printed, through]`. A line in the range not on
+    /// disk — past the log ceiling, dropped by a stopped recorder, or no
+    /// session — is counted, and one `WARN` says how many were skipped; a
+    /// stopped recorder fails the flush at once rather than being waited for.
+    ///
+    /// Blocking (a flush wait of at most `flush_timeout`, and file IO): call
+    /// it off the render task. It must not be called while `print` holds
+    /// anything the sink's writers need.
+    pub fn replay(
+        &self,
+        mark: ReplayMark,
+        flush_timeout: Duration,
+        mut print: impl FnMut(&[u8]),
+    ) -> Replayed {
+        let through = self.lock().seq;
+        let wanted = through.saturating_sub(mark.last_printed);
+        if wanted == 0 {
+            return Replayed {
+                through,
+                printed: 0,
+                skipped: 0,
+            };
+        }
+        let mut printed = 0;
+        let mut why: Option<String> = None;
+        match self.session.replay_source() {
+            None => why = Some("this run records no session".to_owned()),
+            Some((tap, events)) => {
+                if let Err(e) = tap.flush(flush_timeout) {
+                    why = Some(e.to_string());
+                }
+                // What is on disk is printed even when the flush failed.
+                if let Err(e) = read_lines(&events, mark, through, |bytes| {
+                    printed += 1;
+                    print(bytes);
+                }) {
+                    why = Some(format!("reading {}: {e}", events.display()));
+                }
+            }
+        }
+        let skipped = wanted.saturating_sub(printed);
+        if skipped > 0 {
+            match why {
+                Some(why) => tracing::warn!(
+                    skipped,
+                    reason = %why,
+                    "{skipped} log lines written while the screen was up are not shown"
+                ),
+                None => tracing::warn!(
+                    skipped,
+                    "{skipped} log lines written while the screen was up are not shown: \
+                     the session dropped them"
+                ),
+            }
+        }
+        Replayed {
+            through,
+            printed,
+            skipped,
         }
     }
 
@@ -62,16 +237,14 @@ impl LogSink {
         crate::tui::color::stderr_color_enabled()
     }
 
-    pub fn switch_to_buffered(&self) -> mpsc::UnboundedReceiver<Vec<u8>> {
+    pub fn switch_to_buffered(&self) -> mpsc::UnboundedReceiver<SinkLine> {
         let (tx, rx) = mpsc::unbounded_channel();
-        let mut guard = self.inner.lock().expect("log sink poisoned");
-        *guard = Inner::Buffered { tx };
+        self.lock().out = Out::Buffered { tx };
         rx
     }
 
     pub fn switch_to_direct(&self) {
-        let mut guard = self.inner.lock().expect("log sink poisoned");
-        *guard = Inner::Direct;
+        self.lock().out = Out::Direct;
     }
 
     /// Write a diagnostic straight to the sink.
@@ -82,44 +255,67 @@ impl LogSink {
     /// and corrupting the display. Best-effort: a diagnostic must never take the
     /// run down over a broken pipe.
     pub fn write_diagnostic(&self, text: &str) {
-        drop(self.write_bytes(text.as_bytes()));
+        drop(self.emit(None, text.as_bytes()));
     }
+}
 
-    fn write_bytes(&self, buf: &[u8]) -> io::Result<()> {
-        let guard = self
-            .inner
-            .lock()
-            .map_err(|_poisoned| io::Error::other("log sink mutex poisoned"))?;
-        match &*guard {
-            Inner::Direct => {
-                let mut stderr = io::stderr().lock();
-                stderr.write_all(buf)
-            }
-            Inner::Buffered { tx } => {
-                drop(tx.send(buf.to_vec()));
-                Ok(())
-            }
+/// Hand `print` each `Log` record of `events` numbered in
+/// `(mark.last_printed, through]`, from `mark`'s offset, in order and once
+/// each, with its newline back on.
+fn read_lines(
+    events: &Path,
+    mark: ReplayMark,
+    through: u64,
+    mut print: impl FnMut(&[u8]),
+) -> io::Result<()> {
+    let mut file = std::fs::File::open(events)?;
+    file.seek(SeekFrom::Start(mark.offset))?;
+    let mut reader = RecordReader::new(io::BufReader::new(file));
+    let mut last = mark.last_printed;
+    let mut line = Vec::new();
+    while let Some(record) = reader.next_record()? {
+        let Some(SessionRecordKind::Log {
+            msg,
+            seq: Some(seq),
+            ..
+        }) = record.session
+        else {
+            continue;
+        };
+        // Numbers only grow in the file; a smaller one was printed already.
+        if seq <= last {
+            continue;
+        }
+        if seq > through {
+            break;
+        }
+        line.clear();
+        line.extend_from_slice(msg.as_bytes());
+        line.push(b'\n');
+        print(&line);
+        last = seq;
+        if seq == through {
+            break;
         }
     }
+    Ok(())
 }
 
 pub struct LogSinkWriter {
     sink: LogSink,
     /// The level of the event being written, when the formatter said
-    /// (`make_writer_for`). `None`: not a log event, never teed.
+    /// (`make_writer_for`). `None`: not a log event, recorded with no level.
     level: Option<Level>,
 }
 
 impl Write for LogSinkWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.sink.tee(self.level, buf);
-        self.sink.write_bytes(buf)?;
+        self.sink.emit(self.level, buf)?;
         Ok(buf.len())
     }
 
     fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
-        self.sink.tee(self.level, buf);
-        self.sink.write_bytes(buf)
+        self.sink.emit(self.level, buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -172,8 +368,8 @@ mod tests {
 
         let first = rx.try_recv().expect("first line");
         let second = rx.try_recv().expect("second line");
-        assert_eq!(first, b"hello\n");
-        assert_eq!(second, b"world\n");
+        assert_eq!((first.seq, &*first.bytes), (1, &b"hello\n"[..]));
+        assert_eq!((second.seq, &*second.bytes), (2, &b"world\n"[..]));
     }
 
     #[test]

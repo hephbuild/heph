@@ -210,6 +210,7 @@ mod tests {
             SessionRecordKind::Log {
                 level: "INFO".into(),
                 msg: msg.clone(),
+                seq: None,
             },
         ))
         .expect("encode");
@@ -221,7 +222,8 @@ mod tests {
             rec.session,
             Some(SessionRecordKind::Log {
                 level: "INFO".into(),
-                msg
+                msg,
+                seq: None,
             })
         );
         assert!(r.next_record().expect("read").is_none());
