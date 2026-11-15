@@ -99,7 +99,7 @@ pub mod failure_slot;
 pub mod invoke;
 pub mod log_api;
 pub use log_api::{
-    FollowStep, LogFollower, LogInfo, LogOptions, LogSource, LogUnavailable, OpenLog,
+    FollowStep, LogFollower, LogInfo, LogOptions, LogSource, LogUnavailable, NoLiveLogs, OpenLog,
 };
 pub(crate) mod run_log;
 pub mod run_timeout;

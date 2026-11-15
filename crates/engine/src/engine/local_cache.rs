@@ -2633,6 +2633,75 @@ mod tests {
         assert!(!primary_bytes.is_empty());
     }
 
+    /// A duplicate copies the source's `Log` blob only when it is present: a
+    /// remote hit's log is fetched only when someone reads it, so whether
+    /// anyone did must not decide whether an `in_place` fixpoint registers.
+    /// The duplicate names the log either way, as the source does.
+    #[tokio::test]
+    async fn duplicate_cache_entry_copies_log_only_when_present() {
+        let (engine, _dir) = test_engine();
+        let ctoken = StdCancellationToken::new();
+        let addr = test_addr();
+        let log = outputartifact::OutputArtifact {
+            r#type: outputartifact::Type::Log,
+            ..raw_artifact("log", b"the run's log\n")
+        };
+        engine
+            .cache_locally(
+                &ctoken,
+                &addr,
+                "PRIMARYHASH",
+                vec![raw_artifact("a", b"out"), log],
+                false,
+            )
+            .await
+            .expect("cache_locally");
+        let log_name = |hashin: &str| {
+            engine
+                .read_manifest(&addr, hashin)
+                .expect("read manifest")
+                .expect("manifest")
+                .artifacts
+                .into_iter()
+                .find(|a| a.r#type == ManifestArtifactType::Log)
+                .expect("the manifest names its log")
+                .name
+        };
+        let blob = |hashin: &str, name: &str| match engine.local_cache.reader(&addr, hashin, name) {
+            Ok(r) => Some(drain_reader(r.reader)),
+            Err(e) if e.is::<NotFoundError>() => None,
+            Err(e) => panic!("reading {hashin}/{name}: {e:#}"),
+        };
+
+        // Present: copied byte for byte.
+        assert!(
+            engine
+                .duplicate_cache_revision(&addr, "PRIMARYHASH", "WITHLOG")
+                .expect("duplicate")
+        );
+        let src = blob("PRIMARYHASH", &log_name("PRIMARYHASH")).expect("source log");
+        assert_eq!(blob("WITHLOG", &log_name("WITHLOG")), Some(src));
+
+        // Absent (a remote hit nobody read): the duplicate still registers,
+        // names the log, and holds no blob for it.
+        engine
+            .local_cache
+            .delete(&addr, "PRIMARYHASH", &log_name("PRIMARYHASH"))
+            .expect("drop the log blob");
+        assert!(
+            engine
+                .duplicate_cache_revision(&addr, "PRIMARYHASH", "NOLOG")
+                .expect("a missing log blob is no error")
+        );
+        assert_eq!(blob("NOLOG", &log_name("NOLOG")), None);
+        let (outs, _) = engine
+            .artifacts_from_local_cache(&ctoken, &linked_def(&addr), "NOLOG", vec!["out".into()])
+            .await
+            .expect("read duplicate")
+            .expect("duplicate present");
+        assert_eq!(outs.len(), 1);
+    }
+
     /// Plant what an older heph wrote: a [`MANIFEST_V1`] (version "1.0.0")
     /// naming one raw tar output `name` of group `out`, and its blob under that
     /// bare name, written through the cache writer.

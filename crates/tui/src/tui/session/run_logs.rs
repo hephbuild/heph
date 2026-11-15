@@ -85,6 +85,21 @@ pub struct FoundRunLog {
     pub log: SessionRunLog,
 }
 
+/// What the live sessions under a root say about an addr's run log:
+/// [`lookup_run_log`].
+#[derive(Debug)]
+pub enum RunLogLookup {
+    /// The newest trusted record of the addr, and its session.
+    Found(FoundRunLog),
+    /// No session recorded a log of the addr, but a live session of this
+    /// workspace runs a heph that records no live logs: it may be running
+    /// the addr unseen. The newest such session is named.
+    Unsupported { session: SessionId },
+    /// Nothing: no live session of this workspace, or none that recorded
+    /// the addr.
+    None,
+}
+
 /// The newest trusted run log of `addr` across every live session under
 /// `root` recorded for `home`. `None` when no such session recorded one.
 /// A session that cannot be read is skipped (logged at debug), never an
@@ -97,13 +112,25 @@ pub fn find_run_log(
     home: &Path,
     addr: &str,
 ) -> anyhow::Result<Option<FoundRunLog>> {
+    Ok(match lookup_run_log(root, home, addr)? {
+        RunLogLookup::Found(found) => Some(found),
+        RunLogLookup::Unsupported { .. } | RunLogLookup::None => None,
+    })
+}
+
+/// [`find_run_log`], also saying when nothing was found but a live session
+/// of `home` cannot record run logs ([`RunLogLookup::Unsupported`]). The
+/// trust rules are the same: such a session counts only while its lock is
+/// held and its `meta.json` names `home`.
+pub fn lookup_run_log(root: &SessionRoot, home: &Path, addr: &str) -> anyhow::Result<RunLogLookup> {
     let root = root.path();
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(RunLogLookup::None),
         Err(e) => return Err(e).with_context(|| format!("reading {}", root.display())),
     };
     let mut newest: Option<FoundRunLog> = None;
+    let mut unsupported: Option<SessionId> = None;
     for entry in entries.filter_map(Result::ok) {
         let Some(id) = entry
             .file_name()
@@ -112,9 +139,15 @@ pub fn find_run_log(
         else {
             continue;
         };
-        let log = match session_run_log(&entry.path(), home, addr) {
-            Ok(Some(log)) => log,
-            Ok(None) => continue,
+        let log = match session_lookup(&entry.path(), home, addr) {
+            Ok(SessionLookup::Log(log)) => log,
+            Ok(SessionLookup::NoRunLogs) => {
+                if unsupported.is_none_or(|u| id.encode() > u.encode()) {
+                    unsupported = Some(id);
+                }
+                continue;
+            }
+            Ok(SessionLookup::Nothing) => continue,
             Err(e) => {
                 tracing::debug!(session = %id, error = %format!("{e:#}"), "skipping session");
                 continue;
@@ -127,7 +160,19 @@ pub fn find_run_log(
             newest = Some(FoundRunLog { session: id, log });
         }
     }
-    Ok(newest)
+    Ok(match (newest, unsupported) {
+        (Some(found), _) => RunLogLookup::Found(found),
+        (None, Some(session)) => RunLogLookup::Unsupported { session },
+        (None, None) => RunLogLookup::None,
+    })
+}
+
+/// What one session says about an addr.
+enum SessionLookup {
+    Log(SessionRunLog),
+    /// Live, of this home, from a heph that records no run logs.
+    NoRunLogs,
+    Nothing,
 }
 
 /// What the session in `dir` says about `addr`'s newest run log, when it is
@@ -138,28 +183,36 @@ pub fn session_run_log(
     home: &Path,
     addr: &str,
 ) -> anyhow::Result<Option<SessionRunLog>> {
+    Ok(match session_lookup(dir, home, addr)? {
+        SessionLookup::Log(log) => Some(log),
+        SessionLookup::NoRunLogs | SessionLookup::Nothing => None,
+    })
+}
+
+fn session_lookup(dir: &Path, home: &Path, addr: &str) -> anyhow::Result<SessionLookup> {
     // First, as `list` does: an `End` written before the release is then in
     // what is read next.
     if !lockfile::is_held(&dir.join(files::LOCK)).context("probing the session's lock")? {
-        return Ok(None);
+        return Ok(SessionLookup::Nothing);
     }
     let meta = match std::fs::read(dir.join(files::META)) {
         Ok(bytes) => bytes,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(SessionLookup::Nothing),
         Err(e) => return Err(e).context("reading meta.json"),
     };
     // A newer format or a corrupt file: not one this heph follows.
     let Ok(meta) = SessionMeta::decode(&meta) else {
-        return Ok(None);
+        return Ok(SessionLookup::Nothing);
     };
-    if !meta.has_capability(CAPABILITY_RUN_LOGS)
-        || meta.home_dir.as_deref().map(Path::new) != Some(home)
-    {
-        return Ok(None);
+    if meta.home_dir.as_deref().map(Path::new) != Some(home) {
+        return Ok(SessionLookup::Nothing);
+    }
+    if !meta.has_capability(CAPABILITY_RUN_LOGS) {
+        return Ok(SessionLookup::NoRunLogs);
     }
     let events = match File::open(dir.join(files::EVENTS)) {
         Ok(f) => f,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(SessionLookup::Nothing),
         Err(e) => return Err(e).context("opening events.ndjson"),
     };
     let mut reader = RecordReader::new(events);
@@ -178,27 +231,30 @@ pub fn session_run_log(
         }
     }
     let Some((at_unix_ms, record)) = newest else {
-        return Ok(None);
+        return Ok(SessionLookup::Nothing);
     };
     if ended {
-        return Ok(Some(SessionRunLog::Ended { record, at_unix_ms }));
+        return Ok(SessionLookup::Log(SessionRunLog::Ended {
+            record,
+            at_unix_ms,
+        }));
     }
     Ok(
         match open_live(home, &record).context("opening a live run log")? {
-            Opened::File(path, file) => Some(SessionRunLog::Live {
+            Opened::File(path, file) => SessionLookup::Log(SessionRunLog::Live {
                 record,
                 at_unix_ms,
                 path,
                 file,
             }),
-            Opened::Gone => Some(SessionRunLog::Ended { record, at_unix_ms }),
-            Opened::Refused => None,
+            Opened::Gone => SessionLookup::Log(SessionRunLog::Ended { record, at_unix_ms }),
+            Opened::Refused => SessionLookup::Nothing,
         },
     )
 }
 
 /// The engine log API's [`LiveRunLogLocator`] over the sessions under one
-/// root: [`find_run_log`], and nothing else. `heph log` and the dashboard
+/// root: [`lookup_run_log`], and nothing else. `heph log` and the dashboard
 /// hand one to the engine, which cannot depend on this crate.
 #[derive(Debug, Clone)]
 pub struct SessionRunLogLocator {
@@ -213,26 +269,33 @@ impl SessionRunLogLocator {
 
 impl LiveRunLogLocator for SessionRunLogLocator {
     fn locate(&self, home: &Path, addr: &str) -> anyhow::Result<Option<LocatedRunLog>> {
-        Ok(find_run_log(&self.root, home, addr)?.map(|found| {
-            let session = found.session.encode();
-            match found.log {
-                SessionRunLog::Live {
-                    record,
-                    at_unix_ms,
-                    file,
-                    ..
-                } => LocatedRunLog::Live {
-                    record,
-                    at_unix_ms,
-                    session,
-                    file,
-                },
-                SessionRunLog::Ended { record, at_unix_ms } => LocatedRunLog::Ended {
-                    record,
-                    at_unix_ms,
-                    session,
-                },
+        let found = match lookup_run_log(&self.root, home, addr)? {
+            RunLogLookup::Found(found) => found,
+            RunLogLookup::Unsupported { session } => {
+                return Ok(Some(LocatedRunLog::Unsupported {
+                    session: session.encode(),
+                }));
             }
+            RunLogLookup::None => return Ok(None),
+        };
+        let session = found.session.encode();
+        Ok(Some(match found.log {
+            SessionRunLog::Live {
+                record,
+                at_unix_ms,
+                file,
+                ..
+            } => LocatedRunLog::Live {
+                record,
+                at_unix_ms,
+                session,
+                file,
+            },
+            SessionRunLog::Ended { record, at_unix_ms } => LocatedRunLog::Ended {
+                record,
+                at_unix_ms,
+                session,
+            },
         }))
     }
 }
@@ -465,15 +528,44 @@ mod tests {
             "a session whose lock is free (crashed or ended)"
         );
 
-        let (dir, _lock) = session(&root, 2, &home, &["inflight"], &records);
+        let (dir, lock) = session(&root, 2, &home, &["inflight"], &records);
         assert!(
             session_run_log(&dir, &home, ADDR).expect("read").is_none(),
             "a heph that does not advertise run_logs"
         );
+        let sessions = SessionRoot::new(&root);
         assert!(
-            find_run_log(&SessionRoot::new(&root), &home, ADDR)
+            find_run_log(&sessions, &home, ADDR)
                 .expect("find")
                 .is_none()
+        );
+        // ... but it is live and of this home: "records no live logs".
+        let lookup = lookup_run_log(&sessions, &home, ADDR).expect("lookup");
+        assert!(
+            matches!(&lookup, RunLogLookup::Unsupported { session } if *session == SessionId::new(1_800_000_000_002, 2)),
+            "{lookup:?}"
+        );
+        assert!(
+            matches!(
+                lookup_run_log(&sessions, &other, ADDR).expect("lookup"),
+                RunLogLookup::None
+            ),
+            "another checkout's old heph says nothing"
+        );
+        // A trusted record of the addr wins over it.
+        let (_dir3, lock3) = session(&root, 3, &home, &[CAPABILITY_RUN_LOGS], &records);
+        assert!(matches!(
+            lookup_run_log(&sessions, &home, ADDR).expect("lookup"),
+            RunLogLookup::Found(_)
+        ));
+        drop(lock3);
+        drop(lock);
+        assert!(
+            matches!(
+                lookup_run_log(&sessions, &home, ADDR).expect("lookup"),
+                RunLogLookup::None
+            ),
+            "an ended old heph says nothing"
         );
     }
 

@@ -93,12 +93,19 @@ pub enum LocatedRunLog {
         at_unix_ms: u64,
         session: String,
     },
+    /// No live session recorded a log of the addr, but `session`, a live
+    /// session of this workspace, runs a heph that records no live logs: it
+    /// may be running the addr unseen. Answered only when nothing better was
+    /// found; the UI says "records no live logs".
+    Unsupported { session: String },
 }
 
 impl LocatedRunLog {
-    pub fn record(&self) -> &RunLogRecord {
+    /// The record found; `None` for [`Self::Unsupported`].
+    pub fn record(&self) -> Option<&RunLogRecord> {
         match self {
-            Self::Live { record, .. } | Self::Ended { record, .. } => record,
+            Self::Live { record, .. } | Self::Ended { record, .. } => Some(record),
+            Self::Unsupported { .. } => None,
         }
     }
 }

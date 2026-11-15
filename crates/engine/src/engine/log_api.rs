@@ -30,7 +30,8 @@ use crate::engine::Engine;
 use crate::engine::cache_codec;
 use crate::engine::failure_slot;
 use crate::engine::local_cache::{
-    LocalCache, Manifest, ManifestArtifact, ManifestArtifactType, NotFoundError,
+    LocalCache, Manifest, ManifestArtifact, ManifestArtifactEncoding, ManifestArtifactType,
+    NotFoundError,
 };
 use crate::engine::run_log::{LiveRun, RunLog};
 use anyhow::Context as _;
@@ -172,10 +173,21 @@ impl OpenLog {
     }
 }
 
+/// No log of the address is held, and a live session of this workspace runs
+/// a heph that records no live logs: it may be running the address unseen.
+/// The UI says "records no live logs".
+#[derive(Debug, thiserror::Error)]
+#[error("no log; session {session} runs a heph that records no live logs")]
+pub struct NoLiveLogs {
+    pub session: String,
+}
+
 /// A finished log the API could read, before it is opened.
 enum Stored {
-    /// A finished live file (a `cache = false` success's).
-    Retained(LiveRun),
+    /// A finished live file (a `cache = false` success's), opened when it
+    /// was found: the file of a run whose entry is being written is
+    /// unlinked a moment later, and the open file still reads.
+    Retained(LiveRun, File),
     Slot(failure_slot::SlotManifest),
     Cache {
         manifest: Manifest,
@@ -186,10 +198,22 @@ enum Stored {
 impl Stored {
     fn at_unix_ms(&self) -> u64 {
         match self {
-            Self::Retained(run) => run.at_unix_ms,
+            Self::Retained(run, _) => run.at_unix_ms,
             Self::Slot(m) => m.failed_at,
             Self::Cache { manifest, .. } => created_ms(manifest),
         }
+    }
+}
+
+/// What a finished live file is, for the status line.
+fn retained_info(run: LiveRun) -> LogInfo {
+    LogInfo {
+        source: LogSource::Live {
+            running: false,
+            session: None,
+        },
+        hashin: run.hashin,
+        at_unix_ms: run.at_unix_ms,
     }
 }
 
@@ -218,6 +242,9 @@ enum LiveEnd {
 enum Latest {
     Running(Running),
     Stored(Stored),
+    /// Nothing, and the locator named a live session that records no live
+    /// logs.
+    Unsupported(String),
     None,
 }
 
@@ -238,6 +265,7 @@ impl Engine {
             hcore::blocking::run(move || engine.latest_log(&a, locator.as_deref())).await?;
         match latest {
             Latest::None => Ok(None),
+            Latest::Unsupported(session) => Err(NoLiveLogs { session }.into()),
             Latest::Running(run) => Ok(Some(OpenLog::plain(
                 LogInfo {
                     source: LogSource::Live {
@@ -263,7 +291,9 @@ impl Engine {
     /// end. When none is going on, `wait_for_start` waits for the next one
     /// (or for a newer finished log to appear); otherwise the newest
     /// finished log is read through once. `Ok(None)` when there is nothing
-    /// to read and nothing to wait for.
+    /// to read and nothing to wait for; [`NoLiveLogs`] when there is nothing
+    /// and a heph that records no live logs is running on this workspace,
+    /// waiting or not, since a run there would never be seen.
     pub async fn follow_log(
         self: &Arc<Self>,
         addr: &Addr,
@@ -276,6 +306,7 @@ impl Engine {
             hcore::blocking::run(move || engine.latest_log(&a, locator.as_deref())).await?;
         let state = match latest {
             Latest::Running(run) => Follow::Live(run),
+            Latest::Unsupported(session) => return Err(NoLiveLogs { session }.into()),
             Latest::Stored(stored) if wait_for_start => Follow::Waiting {
                 baseline: Some(stored.at_unix_ms()),
             },
@@ -316,10 +347,11 @@ impl Engine {
                         end: LiveEnd::InProcess(run.log),
                     }));
                 }
-            } else if run.path.exists() {
-                retained = Some(run);
+            } else if let Some(file) = open_plain(&run.path)? {
+                retained = Some((run, file));
             }
         }
+        let mut unsupported = None;
         if let Some(locator) = locator {
             match locator
                 .locate(&self.home, &addr.format())
@@ -332,7 +364,7 @@ impl Engine {
                     file,
                 }) if !retained
                     .as_ref()
-                    .is_some_and(|r| r.path == self.home.join(&record.file)) =>
+                    .is_some_and(|(r, _)| r.path == self.home.join(&record.file)) =>
                 {
                     return Ok(Latest::Running(Running {
                         file,
@@ -344,11 +376,12 @@ impl Engine {
                         },
                     }));
                 }
+                Some(LocatedRunLog::Unsupported { session }) => unsupported = Some(session),
                 // Ended: what replaced it is among the stored sources.
                 _ => {}
             }
         }
-        let mut newest = retained.map(Stored::Retained);
+        let mut newest = retained.map(|(run, file)| Stored::Retained(run, file));
         let mut consider = |s: Stored| {
             if newest
                 .as_ref()
@@ -363,7 +396,11 @@ impl Engine {
         if let Some(entry) = self.newest_cached_log(addr, None)? {
             consider(entry);
         }
-        Ok(newest.map_or(Latest::None, Latest::Stored))
+        Ok(match (newest, unsupported) {
+            (Some(stored), _) => Latest::Stored(stored),
+            (None, Some(session)) => Latest::Unsupported(session),
+            (None, None) => Latest::None,
+        })
     }
 
     /// The newest local cache entry of `addr` that keeps a `Log`, or the one
@@ -411,24 +448,8 @@ impl Engine {
         fetch_remote: bool,
     ) -> anyhow::Result<OpenLog> {
         let (manifest, log) = match stored {
-            Stored::Retained(run) => {
-                let info = LogInfo {
-                    source: LogSource::Live {
-                        running: false,
-                        session: None,
-                    },
-                    hashin: run.hashin.clone(),
-                    at_unix_ms: run.at_unix_ms,
-                };
-                return hcore::blocking::run(move || match open_plain(&run.path)? {
-                    Some(file) => Ok(OpenLog::plain(info, file)?),
-                    None => Err(LogUnavailable {
-                        info,
-                        reason: "the run's log was removed".into(),
-                    }
-                    .into()),
-                })
-                .await;
+            Stored::Retained(run, file) => {
+                return Ok(OpenLog::plain(retained_info(run), file)?);
             }
             Stored::Slot(slot) => {
                 let path = self.failure_slots.slot_dir(addr).join(failure_slot::LOG);
@@ -562,12 +583,12 @@ fn open_cached(
 ) -> anyhow::Result<OpenLog> {
     let unavailable =
         |info: LogInfo, reason: String| anyhow::Error::new(LogUnavailable { info, reason });
-    let hashin = info.hashin.clone();
-    let stored = match cache.seekable_reader(addr, &hashin, &log.name) {
+    let hashin = info.hashin.as_str();
+    let stored = match cache.seekable_reader(addr, hashin, &log.name) {
         Ok(Some(r)) => r,
         Ok(None) => {
             // Held in rows: small, read whole.
-            let sized = match cache.reader(addr, &hashin, &log.name) {
+            let sized = match cache.reader(addr, hashin, &log.name) {
                 Ok(s) => s,
                 Err(e) if e.is::<NotFoundError>() => {
                     return Err(unavailable(
@@ -605,13 +626,28 @@ fn open_cached(
         }
         Err(e) => return Err(e).with_context(|| format!("opening the log of {addr}")),
     };
-    let Some(mut decoded) = cache_codec::decode_seekable(stored, &log.encoding)
-        .with_context(|| format!("decoding the log of {addr}"))?
-    else {
-        return Err(unavailable(info, "the log's encoding has no reader".into()));
+    open_encoded(stored, &log.encoding, info)
+}
+
+/// Open a stored `Log` blob, `encoding`-encoded: decode it with random
+/// access and find its one file in the tar, reading only headers. A blob
+/// that does not decode is [`LogUnavailable`].
+fn open_encoded(
+    stored: Box<dyn ReadSeek + Send>,
+    encoding: &ManifestArtifactEncoding,
+    info: LogInfo,
+) -> anyhow::Result<OpenLog> {
+    let unavailable =
+        |info: LogInfo, reason: String| anyhow::Error::new(LogUnavailable { info, reason });
+    let mut decoded = match cache_codec::decode_seekable(stored, encoding) {
+        Ok(Some(decoded)) => decoded,
+        Ok(None) => return Err(unavailable(info, "the log's encoding has no reader".into())),
+        Err(e) => return Err(unavailable(info, format!("decoding the log: {e:#}"))),
     };
-    let index =
-        TarIndex::build(&mut decoded).with_context(|| format!("indexing the log of {addr}"))?;
+    let index = match TarIndex::build(&mut decoded) {
+        Ok(index) => index,
+        Err(e) => return Err(unavailable(info, format!("reading the log's tar: {e:#}"))),
+    };
     let member = index
         .entries
         .values()
@@ -833,19 +869,7 @@ impl LogFollower {
     fn open_local(&self, stored: Stored) -> Option<OpenLog> {
         let engine = &self.engine;
         let opened = match stored {
-            Stored::Retained(run) => open_plain(&run.path).ok().flatten().map(|f| {
-                OpenLog::plain(
-                    LogInfo {
-                        source: LogSource::Live {
-                            running: false,
-                            session: None,
-                        },
-                        hashin: run.hashin,
-                        at_unix_ms: run.at_unix_ms,
-                    },
-                    f,
-                )
-            }),
+            Stored::Retained(run, file) => Some(OpenLog::plain(retained_info(run), file)),
             Stored::Slot(slot) => {
                 let path = engine
                     .failure_slots
@@ -883,6 +907,167 @@ fn read_some(file: &mut File, buf: &mut [u8]) -> io::Result<usize> {
             // `O_NONBLOCK` on a regular file never blocks; treat as nothing yet.
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(0),
             other => return other,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::local_cache_fs::LocalCacheFS;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn info(source: LogSource) -> LogInfo {
+        LogInfo {
+            source,
+            hashin: "h".into(),
+            at_unix_ms: 1,
+        }
+    }
+
+    /// A stored blob that counts the bytes read from it.
+    struct Counting {
+        inner: File,
+        read: Arc<AtomicU64>,
+    }
+
+    impl Read for Counting {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.read.fetch_add(n as u64, Ordering::Relaxed);
+            Ok(n)
+        }
+    }
+
+    impl Seek for Counting {
+        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    /// `n` bytes zstd cannot shrink, ending in a known line.
+    fn incompressible(n: usize) -> Vec<u8> {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut out: Vec<u8> = (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x.to_le_bytes()[0]
+            })
+            .collect();
+        out.extend_from_slice(b"\nlast line\n");
+        out
+    }
+
+    /// spec `log_tail_is_bounded`: whatever is asked, a tail returns at most
+    /// [`TAIL_MAX`] bytes, reading only those: a 1 GB (sparse) slot log, and
+    /// a cached `Log` blob of many seekable-zstd frames, of which a tail
+    /// decodes about the frames that hold it, not the log. A blob that does
+    /// not decode is [`LogUnavailable`]. (The second-tail cache is the
+    /// list's, in the UI: I4.)
+    #[test]
+    fn log_tail_is_bounded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // A 1 GB log, as a failure slot's `log.txt` (sparse: no disk).
+        let path = dir.path().join("log.txt");
+        let f = File::create(&path).expect("create");
+        f.set_len(1 << 30).expect("set_len");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .and_then(|mut f| {
+                f.seek(SeekFrom::End(-5))?;
+                std::io::Write::write_all(&mut f, b"tail\n")
+            })
+            .expect("write the end");
+        let mut log = OpenLog::plain(
+            info(LogSource::FailureSlot),
+            open_plain(&path).expect("open").expect("present"),
+        )
+        .expect("open log");
+        assert_eq!(log.len(), 1 << 30);
+        let tail = log.tail(usize::MAX).expect("tail");
+        assert_eq!(tail.len(), TAIL_MAX);
+        assert!(tail.ends_with(b"tail\n"));
+        assert_eq!(log.tail(3).expect("tail"), b"il\n");
+
+        // A cached log: one tar member in seekable zstd, 8 frames.
+        let cache = LocalCacheFS::new(dir.path().join("cache")).expect("cache");
+        let addr = Addr::new(
+            hmodel::htpkg::PkgBuf::from("p"),
+            "t".into(),
+            std::collections::BTreeMap::new(),
+        );
+        let content = incompressible(8 * cache_codec::SEEKABLE_FRAME_SIZE);
+        let mut tar = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(content.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, "log.txt", content.as_slice())
+            .expect("tar");
+        let tar = tar.into_inner().expect("tar");
+        let mut w = cache_codec::open_writer(
+            &cache,
+            &addr,
+            "h",
+            "log.zst",
+            &ManifestArtifactEncoding::Zstd,
+        )
+        .expect("writer");
+        std::io::Write::write_all(&mut w, &tar).expect("write");
+        w.commit().expect("commit");
+        let stored_path = dir.path().join("stored");
+        {
+            let mut r = cache.reader(&addr, "h", "log.zst").expect("reader").reader;
+            let mut out = File::create(&stored_path).expect("stored copy");
+            io::copy(&mut r, &mut out).expect("copy");
+        }
+        let stored_len = std::fs::metadata(&stored_path).expect("stat").len();
+        let read = Arc::new(AtomicU64::new(0));
+        let counting = Counting {
+            inner: File::open(&stored_path).expect("open stored"),
+            read: Arc::clone(&read),
+        };
+        let mut log = open_encoded(
+            Box::new(counting),
+            &ManifestArtifactEncoding::Zstd,
+            info(LogSource::Cache { remote: false }),
+        )
+        .expect("open cached");
+        assert_eq!(log.len(), content.len() as u64);
+        let tail = log.tail(usize::MAX).expect("tail");
+        assert_eq!(tail.len(), TAIL_MAX);
+        assert!(tail.ends_with(b"\nlast line\n"));
+        let (_, expected) = content.split_at(content.len() - TAIL_MAX);
+        assert_eq!(tail, expected);
+        // The tar's first header, its end and the tail's frame: three frames
+        // at most of the eight, plus the seek table.
+        let frame = cache_codec::SEEKABLE_FRAME_SIZE as u64;
+        let read = read.load(Ordering::Relaxed);
+        assert!(
+            read <= 3 * frame + frame / 2,
+            "read {read} of {stored_len} stored bytes for a tail"
+        );
+
+        // Unreadable: a corrupt blob, and an encoding with no random access.
+        for (bytes, encoding) in [
+            (
+                b"not zstd at all".as_slice(),
+                ManifestArtifactEncoding::Zstd,
+            ),
+            (b"gzip".as_slice(), ManifestArtifactEncoding::Gzip),
+        ] {
+            let err = open_encoded(
+                Box::new(io::Cursor::new(bytes.to_vec())),
+                &encoding,
+                info(LogSource::Cache { remote: false }),
+            )
+            .expect_err("unreadable");
+            assert!(err.is::<LogUnavailable>(), "{err:#}");
+            assert!(format!("{err}").starts_with("log unavailable"), "{err}");
         }
     }
 }

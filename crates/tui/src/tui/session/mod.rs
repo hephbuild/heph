@@ -63,7 +63,8 @@ pub use id::SessionId;
 pub use reader::RecordReader;
 pub use recorder::{Recorder, SessionTap, TappedReceiver};
 pub use run_logs::{
-    FoundRunLog, SessionRunLog, SessionRunLogLocator, find_run_log, session_run_log,
+    FoundRunLog, RunLogLookup, SessionRunLog, SessionRunLogLocator, find_run_log, lookup_run_log,
+    session_run_log,
 };
 pub use source::{EntryMeta, FileSource, SessionEntry, SessionItem, SessionSource};
 
