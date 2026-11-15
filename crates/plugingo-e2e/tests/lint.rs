@@ -69,6 +69,85 @@ async fn test_lint_package_importing_unsafe() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The bytes of the `lint-report.json` a result holds.
+fn lint_report(result: &heph::engine::EResult) -> String {
+    use heph::hartifactcontent::WalkEntryKind;
+    let mut out = Vec::new();
+    for artifact in &result.artifacts {
+        for entry in artifact.walk().expect("walk artifacts") {
+            let entry = entry.expect("artifact entry");
+            if let (true, WalkEntryKind::File { mut data, .. }) =
+                (entry.path.ends_with("lint-report.json"), entry.kind)
+            {
+                std::io::Read::read_to_end(&mut data, &mut out).expect("read report");
+            }
+        }
+    }
+    String::from_utf8(out).expect("the report is utf8")
+}
+
+/// `addr`'s newest log, read whole, if it has one.
+async fn newest_log(ws: &htestkit::Workspace, addr: &str) -> anyhow::Result<Option<String>> {
+    let addr = heph::htaddr::parse_addr(addr)?;
+    let Some(log) = ws
+        .engine
+        .open_log(&addr, &heph::engine::LogOptions::default())
+        .await?
+    else {
+        return Ok(None);
+    };
+    let mut out = String::new();
+    std::io::Read::read_to_string(&mut log.reader()?, &mut out)?;
+    Ok(Some(out))
+}
+
+/// heph-govet's stdout is `lint-report.json`, an output the gate keys on — not
+/// its log. Under the engine's `log_capture` the report is still the analyze's
+/// output and never in its log; `lint-check` still fails on its findings; and a
+/// fix moves the report, so the gate re-runs and passes rather than replaying
+/// the failure.
+#[tokio::test]
+async fn lint_gate_keeps_its_report() -> anyhow::Result<()> {
+    require_go!();
+    let ws = common::make_workspace_tree_govet(common::fixture("with_dep")?)?;
+    // `printf`: a `%d` verb fed a string.
+    ws.write_file(
+        "lib/lib.go",
+        "package lib\n\nimport \"fmt\"\n\nfunc Greet(name string) string {\n\
+         \treturn fmt.Sprintf(\"hello, %d\", name)\n}\n",
+    );
+
+    let analyze = ws.run("//lib:_lint-analyze@v=host").await?;
+    let report = lint_report(&analyze);
+    assert!(
+        report.contains("printf"),
+        "the report holds the finding: {report}"
+    );
+    let log = newest_log(&ws, "//lib:_lint-analyze@v=host").await?;
+    assert!(
+        !log.as_deref().unwrap_or_default().contains("posn"),
+        "the report must never be the analyze's log: {log:?}"
+    );
+
+    let Err(err) = ws.run("//lib:lint-check").await else {
+        panic!("the gate fails on the report's finding");
+    };
+    let msg = format!("{err:#}");
+    assert!(msg.contains("lint found 1 issue(s)"), "{msg}");
+
+    ws.write_file(
+        "lib/lib.go",
+        "package lib\n\nimport \"fmt\"\n\nfunc Greet(name string) string {\n\
+         \treturn fmt.Sprintf(\"hello, %s\", name)\n}\n",
+    );
+    let fixed = lint_report(&*ws.run("//lib:_lint-analyze@v=host").await?);
+    assert_ne!(fixed, report, "the fix moves the report");
+    ws.run("//lib:lint-check")
+        .await
+        .expect("a clean report passes the gate");
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // `format` reads its sources through an fs glob (`format_sources_pattern`).
 // These run the tree's heph-govet: no download, and the driver and the tool

@@ -13,11 +13,13 @@
 //! (`formatters:` block), passed via `HEPH_GOVET_GOLANGCI_CONFIG` exactly like
 //! the lint config. Absent → gofmt.
 
+use crate::plugingo::tool_log::ToolLog;
 use anyhow::Context;
 use async_trait::async_trait;
 use hcore::debug_hash::DebugHasher;
 use hcore::hasync::Cancellable;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
+use hdriver_support::run_log::Streams;
 use hplugin::driver::targetdef::path::{CodegenMode, Content, Path as TPath};
 use hplugin::driver::targetdef::{CacheConfig, Input, InputMode, Output, TargetDef};
 use hplugin::driver::{
@@ -145,15 +147,17 @@ async fn exec_govet(
 }
 
 /// `heph-govet` itself failed: its output goes to the target's log, whose tail
-/// the failure box renders, rather than into the message — and to the live
-/// stderr of an interactive run, since it was captured rather than streamed.
+/// the failure box renders, rather than into the message — and, on a host
+/// without `log_capture`, to the live stderr of an interactive run, since it was
+/// captured rather than streamed (under `log_capture` the writers already have
+/// it and the echo does nothing).
 async fn govet_failed(
     req: &mut ManagedRunRequest<'_, '_>,
+    log: &mut ToolLog<'_>,
     output: &std::process::Output,
     what: &'static str,
 ) -> anyhow::Error {
-    let e = hplugin::error::ProcessFailed::from_output(&req.sandbox_dir.join("log.txt"), output)
-        .context(what);
+    let e = log.failed(output).await.context(what);
     hdriver_support::driver_managed::echo_failure_log(&mut req.request, &e).await;
     e
 }
@@ -367,9 +371,14 @@ impl ManagedDriver for GoFormatDriver {
         let args = vec![OsString::from("-format"), arg_file(pkg_dir, &files)?];
 
         let output = exec_govet(&bin, args, &env, pkg_dir, runner, ctoken).await?;
+        let mut log = ToolLog::new(&mut req.request);
         if !output.status.success() {
-            return Err(govet_failed(&mut req, &output, "heph-govet -format failed").await);
+            return Err(
+                govet_failed(&mut req, &mut log, &output, "heph-govet -format failed").await,
+            );
         }
+        // Rewriting prints only diagnostics: both streams are log.
+        log.write(&output, Streams::BOTH).await;
         // The rewritten sources are collected from the declared in_place outputs.
         Ok(ManagedRunResponse { artifacts: vec![] })
     }
@@ -493,9 +502,14 @@ impl ManagedDriver for GoFormatCheckDriver {
 
         let output = exec_govet(&bin, args, &env, pkg_dir, runner, ctoken).await?;
         let stdout = &output.stdout;
+        let mut log = ToolLog::new(&mut req.request);
+        if matches!(output.status.code(), Some(0 | 1)) {
+            log.write(&output, Streams::STDERR).await;
+        }
         match output.status.code() {
             Some(0) => Ok(ManagedRunResponse { artifacts: vec![] }),
-            // Exit 1 = files need formatting; the tool prints them to stdout.
+            // Exit 1 = files need formatting; the tool prints them to stdout —
+            // the check's answer, named in the message, never its log.
             Some(1) => {
                 let list = String::from_utf8_lossy(stdout);
                 let files: Vec<&str> = list.lines().filter(|l| !l.is_empty()).collect();
@@ -509,7 +523,13 @@ impl ManagedDriver for GoFormatCheckDriver {
                         .join("\n")
                 );
             }
-            _ => Err(govet_failed(&mut req, &output, "heph-govet -format -check failed").await),
+            _ => Err(govet_failed(
+                &mut req,
+                &mut log,
+                &output,
+                "heph-govet -format -check failed",
+            )
+            .await),
         }
     }
 }

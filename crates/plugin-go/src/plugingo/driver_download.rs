@@ -16,12 +16,14 @@
 //! (`docs/EXEC_RUNNERS.md`, "Containers").
 
 use crate::plugingo::module_fetch::{FETCH_ACCESS_ENV, add_fetch_env};
+use crate::plugingo::tool_log::ToolLog;
 use anyhow::Context;
 use async_trait::async_trait;
 use enclose::enclose;
 use hcore::debug_hash::DebugHasher;
 use hcore::hasync::Cancellable;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
+use hdriver_support::run_log::Streams;
 use hplugin::driver::targetdef::path::{CodegenMode, Content, Path as OutputPath};
 use hplugin::driver::targetdef::{CacheConfig, Input, InputMode, Output, TargetDef};
 use hplugin::driver::{
@@ -236,13 +238,12 @@ struct ModuleFetch<'a> {
     /// Outside the directory outputs are collected from, so the stub go.mod can
     /// never end up in an artifact.
     cwd: &'a Path,
-    /// The target's `log.txt`: where a failed download's output goes.
-    log: &'a Path,
 }
 
 /// Run `go mod download` for one module and return the directory `go` put it in.
 async fn fetch_module(
     fetch: ModuleFetch<'_>,
+    log: &mut ToolLog<'_>,
     runner: hexecrunner::RunnerRef<'_>,
     ctoken: &(dyn Cancellable + Send + Sync),
 ) -> anyhow::Result<PathBuf> {
@@ -253,7 +254,6 @@ async fn fetch_module(
         env,
         gomodcache,
         cwd,
-        log,
     } = fetch;
     let mod_at_ver = format!("{module}@{version}");
 
@@ -287,15 +287,17 @@ async fn fetch_module(
     if !output.status.success() {
         // What go said (the `-json` record's `Error` on stdout, `git`'s and the
         // network's complaints on stderr) goes to the target's log, whose tail
-        // the failure box renders. The message keeps heph's own hint.
-        return Err(
-            hplugin::error::ProcessFailed::from_output(log, &output).context(format!(
-                "go mod download {mod_at_ver} failed. {}",
-                passed_env_note(env)
-            )),
-        );
+        // the failure box renders. The message keeps heph's own hint. A failed
+        // download has no record to parse, so its stdout is log here.
+        return Err(log.failed(&output).await.context(format!(
+            "go mod download {mod_at_ver} failed. {}",
+            passed_env_note(env)
+        )));
     }
 
+    // A successful download's stdout is its `-json` record, parsed below: data,
+    // never the log.
+    log.write(&output, Streams::STDERR).await;
     parse_module_dir(&output.stdout, module, version, gomodcache)
 }
 
@@ -492,6 +494,7 @@ impl ManagedDriver for GoDownloadDriver {
     ) -> anyhow::Result<ManagedRunResponse> {
         let res: anyhow::Result<ManagedRunResponse> = async {
         let def = req.request.target.def_de::<GoDownloadDef>();
+        let mut log = ToolLog::new(&mut req.request);
         let runner =
             crate::plugingo::runner::runner_ref(req.request.request_id, def.runner.as_ref());
         let (goroot, go_bin) = crate::plugingo::toolchain::resolve_toolchain_go(
@@ -528,8 +531,8 @@ impl ManagedDriver for GoDownloadDriver {
                 env: &env,
                 gomodcache: &gomodcache,
                 cwd: &req.sandbox_dir,
-                log: &req.sandbox_dir.join("log.txt"),
             },
+            &mut log,
             runner,
             ctoken,
         )
@@ -950,6 +953,10 @@ mod tests {
     }
 
     async fn fetch(go: &Path, cwd: &Path) -> anyhow::Result<PathBuf> {
+        fetch_into(go, cwd, &mut ToolLog::OwnFile(cwd.join("log.txt"))).await
+    }
+
+    async fn fetch_into(go: &Path, cwd: &Path, log: &mut ToolLog<'_>) -> anyhow::Result<PathBuf> {
         let ct = hcore::hasync::StdCancellationToken::new();
         let env = HashMap::from([("GOPROXY".to_string(), "https://secret@proxy".to_string())]);
         fetch_module(
@@ -960,8 +967,8 @@ mod tests {
                 env: &env,
                 gomodcache: Path::new("/cache"),
                 cwd,
-                log: &cwd.join("log.txt"),
             },
+            log,
             hexecrunner::RunnerRef::local(),
             &ct,
         )
@@ -1015,6 +1022,49 @@ exit 1"#,
         assert!(
             !msg.contains("secret"),
             "a proxy URL can hold credentials: {msg}"
+        );
+    }
+
+    /// Under `log_capture`: a successful download's `-json` record is data and
+    /// never reaches the writers, its stderr does; a failed one writes both
+    /// streams there and names no log.
+    #[tokio::test]
+    async fn fetch_module_under_log_capture() {
+        use crate::plugingo::tool_log::test_support::Shared;
+        use hdriver_support::run_log::RunLog;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path().join("cwd");
+        std::fs::create_dir(&cwd).unwrap();
+
+        let ok = fake_go(
+            dir.path(),
+            r#"printf '{"Path":"a.b/c","Version":"v1","Dir":"/cache/c@v1"}\n'
+printf 'go: downloading a.b/c v1\n' >&2"#,
+        );
+        let (out, err) = (Shared::default(), Shared::default());
+        let mut log = ToolLog::Captured(RunLog::captured(Some(out.writer()), Some(err.writer())));
+        fetch_into(&ok, &cwd, &mut log).await.expect("fetch");
+        assert_eq!(out.text(), "", "the -json record is data");
+        assert_eq!(err.text(), "go: downloading a.b/c v1\n");
+
+        let bad = fake_go(
+            dir.path(),
+            r#"printf '{"Error":"unknown revision v1"}\n'
+printf 'dial tcp: refused\n' >&2
+exit 1"#,
+        );
+        let (out, err) = (Shared::default(), Shared::default());
+        let mut log = ToolLog::Captured(RunLog::captured(Some(out.writer()), Some(err.writer())));
+        let e = fetch_into(&bad, &cwd, &mut log).await.unwrap_err();
+        assert!(out.text().contains("unknown revision v1"), "{}", out.text());
+        assert_eq!(err.text(), "dial tcp: refused\n");
+        assert!(
+            hplugin::error::failure_log(&e).is_none(),
+            "no log path under log_capture"
+        );
+        assert!(
+            !cwd.join("log.txt").exists(),
+            "no own log under log_capture"
         );
     }
 
