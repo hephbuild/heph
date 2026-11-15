@@ -263,6 +263,10 @@ from tokens so it holds on a broken document. A feature that scans the text
 itself, or depends on the file evaluating, brings back the bugs this design
 removed. A site kind ships with its editor-shaped test in `tests/lsp.rs`.
 `heph tool build-lsp --explain FILE:LINE:COL` prints the classification.
+The same server answers `.hephconfig` (and profiles) from `hephconfig.rs`:
+completion and hover from the `schemars` schema of `ConfigYaml`
+(`crates/config/src/schema.rs`), diagnostics from the loader's own parse. A
+type with a hand-rolled `Deserialize` writes its schema by hand there.
 
 ### `heph-bench` — perf-regression harness
 

@@ -31,6 +31,7 @@ request ──> position.rs (UTF-16/8/32 → byte, once)
 | `position.rs` | Position encoding, converted at the request boundary and nowhere else |
 | `context.rs` | The vendored analysis's `LspContext`: load resolution, listing, evaluation for the index |
 | `diagnostics.rs` | AST checks of `target(` / `provider_state(` keyword arguments |
+| `hephconfig.rs` | `.hephconfig` documents: diagnostics, completion and hover from the config parser and schema (see below) |
 | `index.rs` | The evaluation side channel (provenance "Targets" hover, undocumented `def` signatures) and the per-document shared state |
 | `crates/vendored-starlark-lsp` | `starlark_lsp` 0.14.2's analysis modules, owned by heph; its `NOTICE` lists every divergence |
 
@@ -44,6 +45,44 @@ used. A BUILD file opened outside the repo gets the stock answers only, with
 `reason: outside_root`. The driver/provider registry is read once per server
 start; until that snapshot lands, heph answers with the stock results and
 `reason: providers_loading`.
+
+## `.hephconfig` documents
+
+The same server answers the workspace config: `.hephconfig`, the legacy
+`.hephconfig2`, and every profile laid over them (`ci.hephconfig`). The
+editor has to send those file names to `heph tool build-lsp` as well as BUILD
+files, e.g. a `yaml` filetype pattern for `*.hephconfig` in its client
+config. `hephconfig.rs` serves the document whole; the resolver, the Starlark
+analysis and the engine never see it. It works the same inside or outside the
+bound repo.
+
+| Feature | Answer |
+|---|---|
+| Diagnostics | Every key the schema does not know, each with a did-you-mean when one is close; then the loader's own parse error (`serde_yaml` into `ConfigYaml`), at its location, unless an unknown-key diagnostic already covers that line |
+| Completion, key position | The keys of the enclosing mapping, minus those already written in the same mapping (two `plugins:` items are two mappings). Inserts `key: ` for a scalar and `key:` for a mapping or a list |
+| Completion, after `key: ` | The value's literals: an enum's members, `true`/`false` for a boolean |
+| Hover | On a key or its value: the key path, its type, its doc, and its literals |
+| Definition, formatting | Nothing |
+
+Two sources, each the authority on one question. **What loads** is the
+parser's: a diagnostic from it is the error `heph` would print, minus the
+`at line N column M` the range already gives. **What could go there** is the
+schema's: `hconfig::config_json_schema()`, JSON Schema derived with `schemars`
+from the parser's own types, so a field added to `ConfigYaml` completes with
+no second edit and its doc comment is its hover. The three types with a
+hand-rolled `Deserialize` (`PluginSpec`, `ResourcesConfig`, `FuseEnabled`)
+write their schema by hand in `crates/config/src/schema.rs`, next to tests
+that load every example it offers. A field whose doc comment is written for
+maintainers carries a `#[schemars(description = "…")]` for users instead.
+
+Where the cursor is comes from a line-based reading of YAML's block
+structure: indentation, `- ` items and `key:`, with comments and blank lines
+skipped and block scalars (`|`, `>`) read as text. It never needs the
+document to parse. It does not look inside flow collections (`{a: 1}`,
+`[a]`), so neither completion nor the unknown-key check reaches keys written
+there; the parser still reports them. Plugin `options:` are open (each plugin
+checks its own keys at load), and so are profile merges, which need the other
+files: a config whose diagnostics are clear can still fail to merge.
 
 ## Site kinds
 

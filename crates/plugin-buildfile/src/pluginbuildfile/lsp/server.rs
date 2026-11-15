@@ -7,12 +7,16 @@
 //! policy passes it through, comes from the vendored analysis modules
 //! in-process.
 //!
+//! A `.hephconfig` (or `<profile>.hephconfig`) document never reaches the
+//! resolver or the Starlark analysis: [`super::hephconfig`] answers it whole.
+//!
 //! One thread handles every message in order. The token array is rebuilt
 //! synchronously while a `didChange` is handled, before the next message is
 //! read, so a request queued behind an edit always sees that edit's text.
 
 use super::context::HephLspContext;
 use super::handlers::{self, Ctx, Merge, Registry};
+use super::hephconfig;
 use super::index::SharedState;
 use super::lex::{self, Tokens};
 use super::position::{self, Encoding};
@@ -99,6 +103,9 @@ struct Server<'a> {
     /// answers only.
     root: Root,
     documents: HashMap<LspUri, Document>,
+    /// Open `.hephconfig` documents, by text: answered by
+    /// [`hephconfig`] alone.
+    configs: HashMap<LspUri, String>,
     registry: RegistryState,
     shutting_down: bool,
 }
@@ -238,6 +245,7 @@ pub fn run_with(
         init,
         root,
         documents: HashMap::new(),
+        configs: HashMap::new(),
         registry,
         shutting_down: false,
     };
@@ -315,6 +323,14 @@ fn uri_key(uri: &Uri) -> Option<LspUri> {
 }
 
 /// The stock hover's text, whichever shape it came in.
+/// Whether `key` names a heph config file, which [`hephconfig`] serves.
+fn is_config(key: &LspUri) -> bool {
+    key.path()
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(hconfig::is_config_file_name)
+}
+
 fn hover_text(hover: &Hover) -> String {
     let marked = |m: &MarkedString| match m {
         MarkedString::String(s) => s.clone(),
@@ -438,6 +454,12 @@ impl Server<'_> {
         let Some(key) = uri_key(&client_uri) else {
             return;
         };
+        if is_config(&key) {
+            let diagnostics = hephconfig::diagnostics(&text, self.encoding);
+            self.publish(client_uri, diagnostics, Some(version));
+            self.configs.insert(key, text);
+            return;
+        }
         // Lexed once per edit: the parse below (and its diagnostics) reads the
         // same token array the requests will.
         let tokens = Arc::new(lex::lex(&text));
@@ -497,6 +519,10 @@ impl Server<'_> {
         let Some(key) = uri_key(&client_uri) else {
             return;
         };
+        if self.configs.remove(&key).is_some() {
+            self.publish(client_uri, Vec::new(), None);
+            return;
+        }
         self.documents.remove(&key);
         self.backend.close(&key);
         self.shared.remove(&key);
@@ -620,9 +646,29 @@ impl Server<'_> {
         })
     }
 
+    /// A `.hephconfig` document's text and the request's offset in it. `None`
+    /// for any other document; `Some(None)` for a position past the end.
+    fn config_at(&self, uri: &Uri, pos: Position) -> Option<Option<(&str, usize)>> {
+        let text = self.configs.get(&uri_key(uri)?)?;
+        Some(position::to_offset(text, pos, self.encoding).map(|o| (text.as_str(), o)))
+    }
+
     fn completion(&mut self, params: CompletionParams) -> Value {
         let started = Instant::now();
         let uri = params.text_document_position.text_document.uri.clone();
+        if let Some(at) = self.config_at(&uri, params.text_document_position.position) {
+            let items = at.map_or_else(Vec::new, |(text, offset)| {
+                hephconfig::completion(text, offset, self.encoding)
+            });
+            tracing::debug!(
+                method = "completion",
+                document = "hephconfig",
+                items = items.len(),
+                elapsed_us = started.elapsed().as_micros(),
+                "lsp request"
+            );
+            return serde_json::to_value(items).unwrap_or(Value::Null);
+        }
         let Some(located) = self.locate(&uri, params.text_document_position.position) else {
             return serde_json::json!([]);
         };
@@ -722,6 +768,12 @@ impl Server<'_> {
             .text_document
             .uri
             .clone();
+        if let Some(at) = self.config_at(&uri, params.text_document_position_params.position) {
+            return at
+                .and_then(|(text, offset)| hephconfig::hover(text, offset, self.encoding))
+                .and_then(|h| serde_json::to_value(h).ok())
+                .unwrap_or(Value::Null);
+        }
         let Some(located) = self.locate(&uri, params.text_document_position_params.position) else {
             return Value::Null;
         };
@@ -805,6 +857,9 @@ impl Server<'_> {
             .text_document
             .uri
             .clone();
+        if self.config_at(&uri, Position::new(0, 0)).is_some() {
+            return serde_json::json!([]);
+        }
         let Some(located) = self.locate(&uri, params.text_document_position_params.position) else {
             return serde_json::json!([]);
         };

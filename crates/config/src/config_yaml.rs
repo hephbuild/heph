@@ -1,4 +1,5 @@
 use anyhow::Context;
+use schemars::JsonSchema;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -20,7 +21,10 @@ use crate::options::Options;
 /// no such store-level cap at all.
 pub const DEFAULT_CACHE_CONCURRENCY: usize = 256;
 
-#[derive(Debug, Deserialize, Default)]
+/// The `.hephconfig` file. Its [`JsonSchema`] is what the BUILD-file LSP
+/// completes, hovers and checks keys against ([`config_json_schema`]); a field's
+/// `#[schemars(description)]` replaces a doc comment written for maintainers.
+#[derive(Debug, Deserialize, Default, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ConfigYaml {
     /// Pinned heph version (or, in future, a version constraint) this workspace
@@ -32,6 +36,11 @@ pub struct ConfigYaml {
     /// change this field's name or type and you must change that one too, or the
     /// pin silently reads as absent and the workspace stays on the wrong binary.
     /// It is a frozen wire contract; see [`VersionPin`] before retyping it.
+    #[schemars(
+        description = "The heph version this workspace expects, e.g. `v1.2.3`. When it differs \
+                       from the running binary, heph downloads that release and re-execs into \
+                       it. Omit to disable self-upgrade for the workspace."
+    )]
     #[serde(default)]
     pub version: Option<String>,
     /// Release flavour to pin `version` to, e.g. `debug`. Selects which published
@@ -40,6 +49,11 @@ pub struct ConfigYaml {
     /// (e.g. `heph_debug_darwin_arm64`) instead.
     ///
     /// Mirrored in [`VersionPin`] — see the note on [`version`](Self::version).
+    #[schemars(
+        description = "Release flavour to pin `version` to, e.g. `debug`. Omitted is the default \
+                       build (`heph_<os>_<arch>`); a flavour downloads \
+                       `heph_<flavour>_<os>_<arch>` instead."
+    )]
     #[serde(default)]
     pub version_flavour: Option<String>,
     /// The heph home (cache, sandboxes, credentials, locks, diagnostics). A
@@ -50,6 +64,12 @@ pub struct ConfigYaml {
     /// [`DEFAULT_HOME_DIR`](crate::DEFAULT_HOME_DIR). Resolved by
     /// [`HomeDir::resolve`](crate::HomeDir::resolve), which refuses the root
     /// itself or anything above it.
+    #[schemars(
+        description = "The heph home (cache, sandboxes, credentials, locks, diagnostics). A \
+                       relative path is under the workspace root; an absolute one is used as \
+                       written. No `~` or `$VAR` expansion; `.` and `..` resolve lexically. \
+                       Default `.heph`. The root itself, or anything above it, is refused."
+    )]
     #[serde(default)]
     pub home_dir: Option<PathBuf>,
     /// Every provider/driver — built-in or external — is declared as a single
@@ -58,20 +78,28 @@ pub struct ConfigYaml {
     /// cdylib. Each carries an `options:` map passed to plugin construction.
     #[serde(default)]
     pub plugins: Vec<PluginSpec>,
+    /// Byte limits of the local cache's in-memory tier. `capacityBytes: 0`
+    /// disables the tier.
     #[serde(default)]
     pub mem_cache: Option<MemCacheConfig>,
     /// Scratch-cache policy: which lineage a run writes to and which it may read
     /// from. See [`ScratchConfig`].
     #[serde(default)]
     pub scratch: Option<ScratchConfig>,
+    /// Byte limits of the in-memory store for uncacheable outputs; an entry that
+    /// would exceed `capacityBytes` spills to the durable cache.
     #[serde(default)]
     pub tmp_cache: Option<MemCacheConfig>,
+    /// Sandbox FUSE overlay: `enabled: true | false | auto`. Off by default.
     #[serde(default)]
     pub fuse: Option<FuseConfig>,
+    /// Execute-phase lock backend: `backend: fs | mem`. Default `fs`.
     #[serde(default)]
     pub lock: Option<LockConfig>,
+    /// Filesystem-walk settings shared by every plugin that walks the tree.
     #[serde(default)]
     pub fs: Option<FsConfig>,
+    /// Durable local-cache tuning.
     #[serde(default)]
     pub cache: Option<CacheConfig>,
     /// Named remote (shared) caches. Each entry is keyed by a name and carries a
@@ -79,6 +107,7 @@ pub struct ConfigYaml {
     /// override individual fields; resolve with [`ConfigYaml::resolved_caches`].
     #[serde(default)]
     pub caches: BTreeMap<String, RemoteCacheConfigPatch>,
+    /// Anonymous usage telemetry; on unless `enabled: false`.
     #[serde(default)]
     pub telemetry: Option<TelemetryConfig>,
     /// Resource pools, one entry per pool: `{unit: <count|cpu|bytes>, value:
@@ -323,19 +352,31 @@ pub struct RemoteCacheConfig {
 /// can patch a single setting (e.g. flip `write`) without restating `uri`.
 /// Layered patches are deep-merged by [`merge`](Self::merge), then finalized into
 /// a [`RemoteCacheConfig`] by [`resolve`](Self::resolve).
-#[derive(Debug, Deserialize, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq, Default, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[schemars(
+    description = "One named remote cache. A profile may set a single field and inherit the rest."
+)]
 pub struct RemoteCacheConfigPatch {
+    /// The backend, by scheme: `s3://bucket/prefix`, `gs://bucket/prefix`,
+    /// `memory://` or `file://`. Required once the profiles are merged.
     #[serde(default)]
     pub uri: Option<String>,
+    /// Consult this cache on lookups. Default `true`.
     #[serde(default)]
     pub read: Option<bool>,
+    /// Push to this cache on writes. Default `true`.
     #[serde(default)]
     pub write: Option<bool>,
+    /// Max in-flight requests to this cache. Default 256.
     #[serde(default)]
     pub concurrency: Option<usize>,
+    /// Base URL of an S3-compatible service to talk to instead of AWS, e.g.
+    /// `https://<account>.r2.cloudflarestorage.com`. `s3://` caches only.
     #[serde(default)]
     pub endpoint: Option<String>,
+    /// Region to sign S3 requests for. `s3://` caches only; unset leaves it to
+    /// `AWS_REGION`, then `us-east-1`.
     #[serde(default)]
     pub region: Option<String>,
 }
@@ -384,7 +425,7 @@ impl RemoteCacheConfigPatch {
 }
 
 /// Durable local-cache tuning. `cache: { spillThresholdBytes: N }`.
-#[derive(Debug, Deserialize, Default, Clone, Copy)]
+#[derive(Debug, Deserialize, Default, Clone, Copy, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct CacheConfig {
     /// Blobs strictly larger than this spill to plain files under
@@ -405,7 +446,7 @@ pub struct CacheConfig {
 /// Repo/CI policy rather than a property of any target, which is why it lives
 /// here and not in a BUILD file — a per-target override would let one BUILD file
 /// opt out of the isolation the repo just configured.
-#[derive(Debug, Deserialize, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq, Default, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ScratchConfig {
     /// The lineage this run **writes** to. Supports `${git:branch}`, which heph
@@ -529,9 +570,10 @@ fn merge_plugins(base: &mut Vec<PluginSpec>, inc: Vec<PluginSpec>) {
 /// Anonymous usage telemetry. `telemetry: { enabled: false }` opts out; omitting
 /// the block (or the field) leaves telemetry on. No data here identifies a user
 /// — only os/arch/version and aggregate run counters are ever reported.
-#[derive(Debug, Deserialize, Clone, Copy)]
+#[derive(Debug, Deserialize, Clone, Copy, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct TelemetryConfig {
+    /// `false` turns anonymous usage telemetry off. Default `true`.
     #[serde(default = "default_telemetry_enabled")]
     pub enabled: bool,
 }
@@ -553,7 +595,7 @@ impl Default for TelemetryConfig {
 /// the engine resolves them to absolute paths and hands them to every plugin
 /// that walks the tree (the built-in `fs` plugin, the buildfile/go providers),
 /// so every walk prunes the same directories.
-#[derive(Debug, Deserialize, Default, Clone)]
+#[derive(Debug, Deserialize, Default, Clone, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct FsConfig {
     /// Root-relative directories and globs no tree walk enters: package
@@ -571,9 +613,10 @@ pub struct FsConfig {
 
 /// Byte limits for one in-memory cache store. Shared shape for `mem_cache`
 /// (the local-cache mem tier) and `tmp_cache` (the tmp/uncacheable store).
-#[derive(Debug, Deserialize, Clone, Copy)]
+#[derive(Debug, Deserialize, Clone, Copy, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct MemCacheConfig {
+    /// The largest single entry the store keeps, in bytes.
     pub per_entry_bytes: usize,
     /// Total byte budget. For `mem_cache`, `0` disables the layer entirely; for
     /// `tmp_cache`, entries that would exceed it spill to the durable cache.
@@ -597,9 +640,11 @@ pub enum FuseMode {
 /// Sandbox FUSE-overlay mode. `fuse: { enabled: true | false | auto }`
 /// selects mode explicitly. Omit `enabled` (or the entire `fuse:` block) to
 /// default to off; FUSE is opt-in.
-#[derive(Debug, Deserialize, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Default, Clone, Copy, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct FuseConfig {
+    /// `true`, `false`, or `auto` (decided per target from its inputs).
+    /// Default off.
     #[serde(default)]
     pub enabled: Option<FuseEnabled>,
 }
@@ -662,18 +707,22 @@ impl FuseConfig {
 
 /// Execute-phase lock backend. `lock: { backend: fs | mem }`. Omit the block (or
 /// `backend`) to default to the filesystem backend.
-#[derive(Debug, Deserialize, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Default, Clone, Copy, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct LockConfig {
+    /// `fs` (default) or `mem`.
     #[serde(default)]
     pub backend: Option<LockBackendConfig>,
 }
 
 /// YAML spelling of the lock backend. Maps to `engine::LockBackend`.
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "lowercase")]
+#[schemars(description = "Execute-phase lock backend.")]
 pub enum LockBackendConfig {
+    /// Lock files under the heph home: shared with other heph processes.
     Fs,
+    /// In-process locks: this process only.
     Mem,
 }
 

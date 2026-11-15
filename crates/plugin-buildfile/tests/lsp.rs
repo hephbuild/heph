@@ -2839,3 +2839,90 @@ fn document_outside_the_root_gets_stock_with_a_reason() {
     assert_eq!(reason(&lsp.explain(&doc)).as_deref(), Some("outside_root"));
     assert!(heph_items(&lsp.completion(&doc)).is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// `.hephconfig` documents
+// ---------------------------------------------------------------------------
+
+/// A config document is answered from the config schema and parser, not the
+/// Starlark analysis: keys complete with their colon, values from their enum,
+/// and hover carries the field's doc.
+#[test]
+fn hephconfig_completes_keys_and_values_and_hovers() {
+    let mut lsp = Lsp::start();
+    let doc = lsp.open(".hephconfig", "version: v1\ncache:\n  sp│\n");
+    let result = lsp.completion(&doc);
+    assert_eq!(labels(&result), ["spillThresholdBytes"]);
+    assert_eq!(
+        apply(&doc.text, &item(&result, "spillThresholdBytes")),
+        "version: v1\ncache:\n  spillThresholdBytes: \n"
+    );
+
+    let doc = lsp.change(&doc, "version: v1\n│\n");
+    let top = labels(&lsp.completion(&doc));
+    assert!(top.contains(&"plugins".to_string()), "{top:?}");
+    assert!(!top.contains(&"version".to_string()), "{top:?}");
+
+    // A profile is a config document too.
+    let profile = lsp.open("ci.hephconfig", "lock:\n  backend: │\n");
+    assert_eq!(labels(&lsp.completion(&profile)), ["fs", "mem"]);
+
+    let doc = lsp.change(&doc, "lock:\n  back│end: fs\n");
+    let hover = lsp.hover(&doc);
+    let text = hover["contents"]["value"].as_str().expect("markdown hover");
+    assert!(text.starts_with("`lock.backend`"), "{text}");
+    assert!(text.contains("`fs`, `mem`"), "{text}");
+    assert_eq!(lsp.definition(&doc), json!([]));
+}
+
+/// Every unknown key is published, the parser's own error lands where it
+/// points, and neither a Starlark error nor a stale diagnostic is shown.
+#[test]
+fn hephconfig_publishes_parser_and_unknown_key_diagnostics() {
+    let mut lsp = Lsp::start();
+    let doc = lsp.open(".hephconfig", "cahce:\n  x: 1\nlock:\n  backnd: fs\n");
+    lsp.barrier();
+    let diags = lsp.last_diagnostics(&doc).expect("published");
+    let got: Vec<(u64, &str)> = diags
+        .iter()
+        .map(|d| {
+            (
+                d["range"]["start"]["line"].as_u64().expect("line"),
+                d["message"].as_str().expect("message"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        got,
+        [
+            (
+                0,
+                "unknown key `cahce` at the top level: did you mean `cache`?"
+            ),
+            (3, "unknown key `backnd` in `lock`: did you mean `backend`?"),
+        ]
+    );
+    assert!(diags.iter().all(|d| d["source"] == "heph"), "{diags:?}");
+
+    let doc = lsp.change(&doc, "lock:\n  backend: disk\n");
+    lsp.barrier();
+    let diags = lsp.last_diagnostics(&doc).expect("published");
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0]["range"]["start"]["line"], 1);
+    assert!(
+        diags[0]["message"]
+            .as_str()
+            .expect("message")
+            .contains("disk"),
+        "{diags:?}"
+    );
+
+    let doc = lsp.change(&doc, "lock:\n  backend: mem\n");
+    lsp.barrier();
+    assert_eq!(lsp.last_diagnostics(&doc), Some(vec![]));
+
+    lsp.change(&doc, "cahce: 1\n");
+    lsp.close(&doc);
+    lsp.barrier();
+    assert_eq!(lsp.last_diagnostics(&doc), Some(vec![]));
+}

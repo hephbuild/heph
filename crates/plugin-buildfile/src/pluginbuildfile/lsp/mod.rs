@@ -16,6 +16,7 @@
 mod context;
 pub(crate) mod diagnostics;
 mod handlers;
+mod hephconfig;
 mod index;
 mod lex;
 mod position;
