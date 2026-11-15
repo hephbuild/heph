@@ -397,3 +397,187 @@ pub fn header_lines(
         lv,
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gauge(pool: &str, unit: Unit, held: u64, capacity: u64, waiting: u64) -> Gauge {
+        Gauge {
+            pool: pool.into(),
+            unit,
+            held,
+            capacity,
+            waiting,
+            removals_pending: 0,
+        }
+    }
+
+    /// The spec's four pools, in the gauges' fixed order; docker full with
+    /// one waiter.
+    fn pools() -> Vec<Gauge> {
+        vec![
+            gauge(hcore::capacity::CPU, Unit::Cpu, 11_000_000, 12_000_000, 0),
+            gauge(
+                hcore::capacity::MEMORY,
+                Unit::Bytes,
+                9_771_050_598,
+                16 << 30,
+                0,
+            ),
+            gauge(hcore::capacity::SANDBOX, Unit::Count, 9, 48, 0),
+            gauge("docker", Unit::Count, 2, 2, 1),
+        ]
+    }
+
+    fn text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    const COUNTS: TabCounts = TabCounts {
+        running: 5,
+        blocked: 3,
+        queued: 276,
+        failed: 0,
+        dep_failed: 0,
+        done: 32,
+        cached: 96,
+        stopped: 0,
+    };
+
+    fn title(command: &str) -> Title<'_> {
+        Title {
+            command,
+            session: Some("02kf5"),
+            clock: "1m05s",
+            done: 128,
+            total: Some(412),
+            provisional: false,
+            standing: None,
+        }
+    }
+
+    /// From 120 to 30 columns the header stays four rows that never wrap,
+    /// and each row gives way in the spec's order: the gauges move down
+    /// before the title sheds anything, lose their cells before they fold,
+    /// and fold a pool with waiters never; the tabs close their gaps, then
+    /// drop the inactive names, then show the active tab alone; the title
+    /// sheds the session, then the long done count, then cuts the command.
+    /// The clock is always there.
+    #[test]
+    fn header_narrows_in_order() {
+        let wide = format!("heph r build //{}", "x".repeat(150));
+        let cjk = format!("heph r build //{}", "日本語".repeat(40));
+        let all = pools();
+        // 3 pools: the waiter moves to sandbox so one is still never folded.
+        let mut three: Vec<Gauge> = all.iter().take(3).cloned().collect();
+        if let Some(g) = three.get_mut(2) {
+            g.waiting = 4;
+        }
+        let one: Vec<Gauge> = all.iter().take(1).cloned().collect();
+        for command in ["heph r build //...", wide.as_str(), cjk.as_str()] {
+            for pools in [&[][..], &one[..], &three[..], &all[..]] {
+                let gauges: Vec<&Gauge> = pools.iter().collect();
+                let waiter = pools.iter().find(|g| g.waiting > 0);
+                let mut prev = Levels::default();
+                for cols in (30..=120u16).rev() {
+                    let at = format!("{} pools, {cols} cols, {command:.30}", pools.len());
+                    let (rows, lv) =
+                        header_lines(&title(command), &gauges, &COUNTS, Tab::Pending, cols);
+                    let rows: Vec<String> = rows.iter().map(text).collect();
+                    for r in &rows {
+                        assert!(width(r) <= usize::from(cols), "{at}: wraps: {r:?}");
+                    }
+                    // Each step, once taken, stays taken as the screen narrows.
+                    assert!(
+                        lv.title >= prev.title
+                            && lv.gauges_down >= prev.gauges_down
+                            && lv.gauges >= prev.gauges
+                            && lv.tabs >= prev.tabs,
+                        "{at}: {prev:?} -> {lv:?}",
+                    );
+                    prev = lv;
+
+                    let [title_row, gauge_row, tab_row, _] = &rows[..] else {
+                        panic!("{at}: four rows");
+                    };
+                    assert!(title_row.contains("1m05s"), "{at}: {title_row:?}");
+
+                    // Title: session, then the done count, then the command.
+                    assert_eq!(lv.title == 0, title_row.contains("session 02kf5"), "{at}");
+                    assert_eq!(lv.title >= 2, title_row.contains("128/412"), "{at}");
+                    assert_eq!(lv.title < 2, title_row.contains("128 / 412 done"), "{at}");
+                    assert_eq!(lv.title == 3, !title_row.contains(command), "{at}");
+                    // The gauges leave the title row before it sheds anything.
+                    assert!(lv.title == 0 || lv.gauges_down || pools.is_empty(), "{at}");
+
+                    // Gauges: down, then numbers only, then folded.
+                    assert!(lv.gauges == 0 || lv.gauges_down, "{at}: {lv:?}");
+                    let gauges_text = if lv.gauges_down { gauge_row } else { title_row };
+                    if pools.is_empty() {
+                        assert!(!lv.gauges_down && gauge_row.trim().is_empty(), "{at}");
+                    } else {
+                        assert!(gauges_text.contains("cpu") || lv.gauges == 2, "{at}");
+                    }
+                    let cells = gauges_text.contains('█') || gauges_text.contains('░');
+                    assert_eq!(cells, lv.gauges == 0 && !pools.is_empty(), "{at}");
+                    assert_eq!(gauges_text.contains(" pool"), lv.gauges == 2, "{at}");
+                    if let Some(w) = waiter {
+                        let name = label(&w.pool);
+                        let mark = format!("⧗{}", w.waiting);
+                        assert!(
+                            gauges_text.contains(name) && gauges_text.contains(&mark),
+                            "{at}: the waiting pool folded: {gauges_text:?}",
+                        );
+                    }
+                    if lv.gauges == 2 && pools.len() > 1 {
+                        // cpu goes last: folded only once every other
+                        // foldable pool is.
+                        let others_shown = pools.iter().any(|g| {
+                            g.pool != hcore::capacity::CPU
+                                && g.waiting == 0
+                                && gauges_text.contains(label(&g.pool))
+                        });
+                        assert!(
+                            gauges_text.contains("cpu") || !others_shown,
+                            "{at}: cpu folded first: {gauges_text:?}",
+                        );
+                    }
+
+                    // Tabs: gaps of four, then two, then glyphs only, then
+                    // the active tab alone.
+                    assert_eq!(tab_row.contains("    ▶"), lv.tabs == 0, "{at}: {tab_row:?}");
+                    assert_eq!(
+                        tab_row.contains("Running"),
+                        lv.tabs < 2,
+                        "{at}: {tab_row:?}"
+                    );
+                    assert_eq!(tab_row.contains('‹'), lv.tabs == 3, "{at}: {tab_row:?}");
+                    assert!(tab_row.contains("⧗ Pending 279"), "{at}: {tab_row:?}");
+                }
+                // The steps all happened by 30 columns, in order, and none
+                // was needed at 120 with the short command and three pools.
+                if command == "heph r build //..." && pools.len() <= 3 {
+                    let (_, lv) =
+                        header_lines(&title(command), &gauges, &COUNTS, Tab::Pending, 120);
+                    assert_eq!(lv, Levels::default(), "{} pools at 120", pools.len());
+                }
+            }
+        }
+    }
+
+    /// The mockup's header: three pools sit beside the title, three
+    /// columns from it, down to 115 columns (the spec's "below 112" counts
+    /// no gap); a fourth moves them down even at 120.
+    #[test]
+    fn gauges_move_down_where_the_spec_says() {
+        let all = pools();
+        let three: Vec<&Gauge> = all.iter().take(3).collect();
+        let four: Vec<&Gauge> = all.iter().collect();
+        let t = title("heph r build //...");
+        let down = |g: &[&Gauge], cols| header_lines(&t, g, &COUNTS, Tab::Pending, cols).1;
+        assert!(!down(&three, 115).gauges_down);
+        assert!(down(&three, 114).gauges_down);
+        assert!(down(&four, 120).gauges_down);
+    }
+}

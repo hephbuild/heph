@@ -7036,23 +7036,43 @@ mod tests {
         /// no allocation and no destructor, so the allocator can bump it without
         /// re-entering itself.
         static ALLOCS: Cell<usize> = const { Cell::new(0) };
+        /// Bytes this thread allocated minus the bytes it freed. Signed: a
+        /// block freed here may have been allocated on another thread.
+        static LIVE: Cell<isize> = const { Cell::new(0) };
+    }
+
+    /// Moves this thread's live-byte count by `delta`.
+    fn live_add(delta: isize) {
+        LIVE.with(|c| c.set(c.get().wrapping_add(delta)));
+    }
+
+    fn signed(n: usize) -> isize {
+        isize::try_from(n).unwrap_or(isize::MAX)
     }
 
     // SAFETY: every method forwards to `System`, which upholds the `GlobalAlloc`
-    // contract; the wrapper adds no assumptions of its own. The counter is a
-    // const-initialised thread-local `Cell<usize>` — it never allocates and has
-    // no destructor, so bumping it cannot re-enter the allocator.
+    // contract; the wrapper adds no assumptions of its own. The counters are
+    // const-initialised thread-local `Cell`s — they never allocate and have
+    // no destructor, so bumping them cannot re-enter the allocator.
     unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
         unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
             ALLOCS.with(|c| c.set(c.get() + 1));
             // SAFETY: `layout` is forwarded unchanged from the caller.
-            unsafe { std::alloc::System.alloc(layout) }
+            let p = unsafe { std::alloc::System.alloc(layout) };
+            if !p.is_null() {
+                live_add(signed(layout.size()));
+            }
+            p
         }
 
         unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
             ALLOCS.with(|c| c.set(c.get() + 1));
             // SAFETY: `layout` is forwarded unchanged from the caller.
-            unsafe { std::alloc::System.alloc_zeroed(layout) }
+            let p = unsafe { std::alloc::System.alloc_zeroed(layout) };
+            if !p.is_null() {
+                live_add(signed(layout.size()));
+            }
+            p
         }
 
         unsafe fn realloc(
@@ -7063,12 +7083,17 @@ mod tests {
         ) -> *mut u8 {
             ALLOCS.with(|c| c.set(c.get() + 1));
             // SAFETY: `ptr`, `layout` and `new_size` are forwarded unchanged.
-            unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
+            let p = unsafe { std::alloc::System.realloc(ptr, layout, new_size) };
+            if !p.is_null() {
+                live_add(signed(new_size).wrapping_sub(signed(layout.size())));
+            }
+            p
         }
 
         unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
             // SAFETY: `ptr` and `layout` are forwarded unchanged from the caller.
-            unsafe { std::alloc::System.dealloc(ptr, layout) }
+            unsafe { std::alloc::System.dealloc(ptr, layout) };
+            live_add(-signed(layout.size()));
         }
     }
 
@@ -7080,6 +7105,101 @@ mod tests {
         let before = ALLOCS.with(Cell::get);
         f();
         ALLOCS.with(Cell::get).saturating_sub(before)
+    }
+
+    /// What `f` returns, and the heap bytes this thread still holds once it
+    /// has returned: what `f` built and kept, net of what it freed.
+    fn live_bytes_during<T>(f: impl FnOnce() -> T) -> (T, isize) {
+        let before = LIVE.with(Cell::get);
+        let out = f();
+        (out, LIVE.with(Cell::get).wrapping_sub(before))
+    }
+
+    /// A scripted 100k-target build, folded: the matcher streams the
+    /// addresses in batches, then each target starts, and a tenth come from
+    /// the cache while the rest run.
+    fn fold_100k(state: &mut impl FnMut(&BuildEvent)) {
+        const N: usize = 100_000;
+        const BATCH: usize = 1_000;
+        let addr = |i: usize| format!("//pkg/sub{}/dir{}:target_{i}", i % 997, i % 31);
+        let mut t = 0;
+        let mut ev = |kind: BuildEventKind| {
+            t += 1;
+            state(&BuildEvent {
+                at_unix_ms: 1_700_000_000_000 + t,
+                kind,
+            });
+        };
+        for b in 0..N / BATCH {
+            ev(BuildEventKind::Matched {
+                addrs: (b * BATCH..(b + 1) * BATCH).map(addr).collect(),
+                complete: b + 1 == N / BATCH,
+            });
+        }
+        for i in 0..N {
+            let a = addr(i);
+            ev(BuildEventKind::ResultStart { addr: a.clone() });
+            if i % 10 == 0 {
+                ev(BuildEventKind::CacheOutcome {
+                    addr: a.clone(),
+                    outcome: hcore::events::CacheOutcomeKind::LocalHit,
+                });
+            } else {
+                ev(BuildEventKind::ExecuteStart {
+                    output_groups: Vec::new(),
+                    addr: a.clone(),
+                    driver: "exec".into(),
+                    cache: true,
+                    declared: None,
+                    reserved: None,
+                    queued_ms: None,
+                    admitted: None,
+                });
+                ev(BuildEventKind::ExecuteEnd {
+                    addr: a.clone(),
+                    error: None,
+                });
+            }
+            ev(BuildEventKind::ResultEnd {
+                cancelled: false,
+                addr: a,
+                error: None,
+                upstream_of: None,
+                exit_status: None,
+                log_tail: None,
+                timed_out: None,
+            });
+        }
+    }
+
+    /// The spec's memory budget: folding a 100k-target build keeps the
+    /// dashboard's whole heap under 25 MB — counted by the allocator, not
+    /// `size_of` the record. About 15.5 MB when written.
+    ///
+    /// The dashboard `Model` alone: `BuildState` still carries the box's
+    /// String-keyed sets (`matched`, `finished`, `done`, `cache_hit`, the op
+    /// timelines), which roughly double it (35 MB when written) until the
+    /// box and those sets go.
+    #[test]
+    fn heap_at_100k_targets() {
+        const BUDGET: isize = 25 * 1024 * 1024;
+        let (model, bytes) = live_bytes_during(|| {
+            let mut m = crate::tui::dashboard::Model::default();
+            let redact = crate::tui::text::Redact::default();
+            fold_100k(&mut |e| m.apply(e, &redact));
+            m
+        });
+        assert_eq!(model.id_count(), 100_000);
+        assert_eq!(
+            model.counts(CountScope::All).finished_ok(),
+            100_000,
+            "the scripted build ran to the end",
+        );
+        assert!(
+            bytes < BUDGET,
+            "the dashboard holds {bytes} B at 100k targets (budget {BUDGET})",
+        );
+        drop(model);
     }
 
     #[test]

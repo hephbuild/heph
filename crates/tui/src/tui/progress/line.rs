@@ -787,6 +787,116 @@ mod tests {
         lines.iter().map(text).collect()
     }
 
+    /// The number the line prints before the word `noun`.
+    fn figure(line: &str, noun: &str) -> usize {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let at = words
+            .iter()
+            .position(|w| *w == noun)
+            .unwrap_or_else(|| panic!("no {noun:?} in {line}"));
+        let n = words.get(at.wrapping_sub(1)).copied().unwrap_or_default();
+        n.parse()
+            .unwrap_or_else(|_| panic!("{n:?} before {noun:?}: {line}"))
+    }
+
+    /// The line's `N / M done`.
+    fn done_of(line: &str) -> (usize, usize) {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let at = words.iter().position(|w| *w == "done").expect("done");
+        let n = |k: usize| -> usize {
+            words
+                .get(at.wrapping_sub(k))
+                .and_then(|w| w.parse().ok())
+                .unwrap_or_else(|| panic!("no N / M done in {line}"))
+        };
+        assert_eq!(words.get(at.wrapping_sub(2)), Some(&"/"), "{line}");
+        (n(3), n(1))
+    }
+
+    /// The line and the dashboard's tabs read one `Counts`: cached and
+    /// failed equal those tabs, waiting the `⧗` rows of Pending, done the
+    /// Done and Cached tabs together, in either scope.
+    #[test]
+    fn line_counts_match_tab_counts() {
+        use crate::tui::app::TUIAppView;
+        use crate::tui::dashboard::{RowState, Tab};
+        use crate::tui::progress::test_events::{T0, admission, at, end, exec, lock, start};
+        use crate::tui::progress::{CountScope, TuiProgressView};
+        use hcore::events::{BuildEventKind, CacheOutcomeKind};
+
+        let hit = |addr: &str| BuildEventKind::CacheOutcome {
+            addr: addr.into(),
+            outcome: CacheOutcomeKind::LocalHit,
+        };
+        let matched = [
+            "//p:ok",
+            "//p:hit",
+            "//p:hit2",
+            "//p:root",
+            "//p:down",
+            "//p:adm",
+            "//p:lock",
+            "//p:queued",
+            "//p:run",
+        ];
+        let mut v = TuiProgressView::new("Running //p:...");
+        let mut events = vec![BuildEventKind::Matched {
+            addrs: matched.iter().map(|a| (*a).to_owned()).collect(),
+            complete: true,
+        }];
+        for a in matched.iter().filter(|a| **a != "//p:queued") {
+            events.push(start(a));
+        }
+        events.extend([
+            exec("//p:ok"),
+            end("//p:ok", None, None),
+            hit("//p:hit"),
+            end("//p:hit", None, None),
+            hit("//p:hit2"),
+            end("//p:hit2", None, None),
+            // An unmatched dependency from the cache: All counts it.
+            start("//d:hit"),
+            hit("//d:hit"),
+            end("//d:hit", None, None),
+            failed_end("//p:root", None, false),
+            failed_end("//p:down", Some("//p:root"), false),
+            admission("//p:adm", "cpu", None, None),
+            lock("//p:lock", Some(42)),
+            exec("//p:run"),
+        ]);
+        for (i, e) in events.into_iter().enumerate() {
+            v.apply(&at(i as u64, e));
+        }
+
+        for (scope, want) in [
+            (CountScope::Matched, (3, 9, 2, 2, 2)),
+            (CountScope::All, (4, 10, 3, 2, 2)),
+        ] {
+            v.scope.set(scope);
+            let line = all_text(&v.render("⠋", T0 + 1_000, 200, 40));
+            let m = v.state.dashboard();
+            let tab = |t: Tab| m.tab_len(t, scope);
+            let blocked = m
+                .rows(Tab::Pending, scope)
+                .filter(|&id| m.record(id).is_some_and(|r| r.state == RowState::Blocked))
+                .count();
+            let (done, total) = done_of(&line);
+            let got = (
+                done,
+                total,
+                figure(&line, "cached"),
+                figure(&line, "waiting"),
+                figure(&line, "failed"),
+            );
+            assert_eq!(got, want, "{scope:?}: {line}");
+            assert_eq!(done, tab(Tab::Done) + tab(Tab::Cached), "{scope:?}: {line}");
+            assert_eq!(total, tab(Tab::All), "{scope:?}: {line}");
+            assert_eq!(got.2, tab(Tab::Cached), "{scope:?}: {line}");
+            assert_eq!(got.3, blocked, "{scope:?}: {line}");
+            assert_eq!(got.4, tab(Tab::Failed), "{scope:?}: {line}");
+        }
+    }
+
     /// Root and upstream failures during the build stay on the one row: the
     /// failed count and the spotlight update, nothing else is drawn, and the
     /// blocks wait for the report.

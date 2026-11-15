@@ -5,11 +5,14 @@
 //!   target, its address interned once, kept in per-state buckets in
 //!   activity order.
 //! - [`header::header_lines`] draws the title, gauge, tab and rule rows.
+//! - [`frame::dashboard_frame`] puts the header, the list and the key-hint
+//!   row into one frame.
 //! - [`list::list_lines`] draws the active tab's rows. Its LAST LINE column
 //!   reads [`list::LastLines`], filled off the render task by
 //!   [`list::read_tails`] over a [`list::LogReader`].
 
 mod bucket;
+pub mod frame;
 pub mod header;
 pub mod intern;
 pub mod list;
@@ -17,6 +20,7 @@ pub mod model;
 #[cfg(test)]
 mod tests;
 
+pub use frame::{DASHBOARD_HINTS, dashboard_frame};
 pub use header::{Levels, Title, header_lines};
 pub use intern::Id;
 pub use list::{
