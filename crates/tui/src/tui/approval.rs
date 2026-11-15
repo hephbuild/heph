@@ -349,8 +349,19 @@ impl ApprovalCenter {
             .collect()
     }
 
+    /// The oldest pending request's address and how many are pending: what
+    /// the prompt row and the spotlight read, several times a frame, without
+    /// copying the queue.
+    pub fn front(&self) -> Option<(String, usize)> {
+        let inner = self.lock_pruned();
+        inner
+            .queue
+            .front()
+            .map(|p| (p.addr.clone(), inner.queue.len()))
+    }
+
     /// Every pending request, oldest first, without its notices' text: what
-    /// a frame reads (the approval view reads a notice by its hash, off the
+    /// the approval view reads (it reads a notice by its hash, off the
     /// render task).
     pub fn queue(&self) -> Vec<QueuedApproval> {
         let inner = self.lock_pruned();
@@ -514,14 +525,17 @@ mod tests {
         let t1 = center.request(&build, "//a:1".to_string(), vec![]);
         let t2 = center.request(&build, "//a:2".to_string(), vec![]);
         assert_eq!(center.current().expect("active").queued_behind, 1);
+        assert_eq!(center.front(), Some(("//a:1".to_owned(), 2)));
 
         center.respond(t1.seq, false, Vec::new());
         assert!(!t1.rx.await.expect("decision"));
         // Second prompt is now active.
         assert_eq!(center.current().expect("active").addr, "//a:2");
+        assert_eq!(center.front(), Some(("//a:2".to_owned(), 1)));
         center.respond(t2.seq, true, Vec::new());
         assert!(t2.rx.await.expect("decision"));
         assert!(!center.is_active());
+        assert_eq!(center.front(), None);
     }
 
     /// Feed-level half of the spec's `y_decides_the_request_on_screen`: with

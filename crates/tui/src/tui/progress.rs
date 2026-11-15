@@ -1960,11 +1960,20 @@ impl TuiProgressView {
     /// Approvals tab and ✦ rows match the queue. Before every use of the
     /// list. `glyph`: this frame's, or `None` to keep the last frame's.
     fn sync_approvals(&mut self, glyph: Option<&'static str>) {
+        let queue = self.approval_queue();
+        self.sync_approvals_with(&queue, glyph);
+    }
+
+    /// [`Self::sync_approvals`] from a `queue` the caller already read.
+    fn sync_approvals_with(
+        &mut self,
+        queue: &[crate::tui::approval::QueuedApproval],
+        glyph: Option<&'static str>,
+    ) {
         use crate::tui::dashboard::list::ApprovalRow;
         let glyph = glyph.unwrap_or_else(|| self.list.approval_glyph());
-        let rows = self
-            .approval_queue()
-            .into_iter()
+        let rows = queue
+            .iter()
             .filter_map(|q| {
                 let id = self.state.dash.id(&q.addr)?;
                 let names: Vec<&str> = q.notices.iter().map(|n| n.name.as_str()).collect();
@@ -2229,9 +2238,8 @@ impl TuiProgressView {
     fn approval_pending(&self) -> Option<(String, u64)> {
         match &self.role {
             Role::Live { approval } => {
-                let mut queue = approval.as_ref()?.queue();
-                let pending = u64::try_from(queue.len()).unwrap_or(u64::MAX);
-                (!queue.is_empty()).then(|| (queue.swap_remove(0).addr, pending))
+                let (addr, pending) = approval.as_ref()?.front()?;
+                Some((addr, u64::try_from(pending).unwrap_or(u64::MAX)))
             }
             Role::Attached { feed, .. } => {
                 let prompt = feed.approval()?;
@@ -2388,8 +2396,8 @@ impl TuiProgressView {
     fn approval_lines(&mut self, now_ms: u64, cols: u16, rows: u16) -> Option<Vec<Line<'static>>> {
         self.approval.as_ref()?;
         let glyph = self.glyph(now_ms);
-        self.sync_approvals(Some(glyph));
         let queue = self.approval_queue();
+        self.sync_approvals_with(&queue, Some(glyph));
         let (command, session, clock) = self.dashboard_title_parts(now_ms);
         let scope = self.list.scope;
         let mut counts = self.state.dash.counts(scope);
