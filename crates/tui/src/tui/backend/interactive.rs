@@ -89,6 +89,57 @@ impl Drop for FullScreen {
         // exits with the alternate screen up.
         drop(crossterm::execute!(io::stderr(), LeaveAlternateScreen));
         ALT_SCREEN_UP.store(false, Ordering::Release);
+        // A panic unwinding [`run`] on this thread: the hook printed it onto
+        // the screen just left, so print it again where the user sees it.
+        if std::thread::panicking()
+            && let Some(text) = crate::tui::panic::take_for_current_thread()
+        {
+            print_panic_report(&text);
+        }
+    }
+}
+
+/// Print a panic's report on the main screen, below the cursor the alternate
+/// screen gave back. The line under it is stale now, so it is cleared. Raw
+/// mode may still be on, so every line ends in an explicit carriage return.
+fn print_panic_report(text: &str) {
+    let mut out = String::with_capacity(text.len() + 16);
+    out.push_str("\r\x1b[J");
+    for line in text.lines() {
+        out.push_str(line);
+        out.push_str("\r\n");
+    }
+    let mut stderr = io::stderr().lock();
+    drop(stderr.write_all(out.as_bytes()));
+    drop(stderr.flush());
+}
+
+/// `HEPH_DEBUG_TUI_PANIC`: make the run panic once it ends, for the PTY tests
+/// that check the terminal comes back from a panic (`crates/bin-e2e`'s
+/// `tui_pty.rs`). Those test the shipped binary, so the knob is in it; unset,
+/// it costs one environment read per run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DebugPanic {
+    /// The app task panics a second after it returns: the `resume_unwind`
+    /// path.
+    App,
+    /// The backend panics once the finished run has been held under the
+    /// dashboard for half a second: the unwind path.
+    Backend,
+}
+
+impl DebugPanic {
+    fn from_env() -> Option<Self> {
+        match std::env::var_os("HEPH_DEBUG_TUI_PANIC")?.to_str()? {
+            "app" => Some(Self::App),
+            "backend" => Some(Self::Backend),
+            _ => None,
+        }
+    }
+
+    #[expect(clippy::panic, reason = "a deliberate panic is the knob's whole job")]
+    fn fire(self) -> ! {
+        panic!("HEPH_DEBUG_TUI_PANIC={self:?}: a deliberate panic")
     }
 }
 
@@ -170,7 +221,17 @@ pub async fn run<A: App + 'static>(
     // (e.g. `block_in_place` for filesystem scans, Starlark eval) does
     // not block this task's ticker — the renderer task is re-polled
     // on another worker and the spinner keeps ticking.
-    let mut app_handle = tokio::spawn(app.run(ctx));
+    let debug_panic = DebugPanic::from_env();
+    let mut app_handle = tokio::spawn(async move {
+        let out = app.run(ctx).await;
+        if debug_panic == Some(DebugPanic::App) {
+            // Long enough for the resume after the named target to put the
+            // dashboard back: the panic is to land under a full screen.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            DebugPanic::App.fire();
+        }
+        out
+    });
 
     let mut ticker = tokio::time::interval(TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -228,7 +289,16 @@ pub async fn run<A: App + 'static>(
                 app_result = Some(match res {
                     Ok(inner) => inner,
                     Err(join_err) if join_err.is_panic() => {
-                        std::panic::resume_unwind(join_err.into_panic())
+                        let payload = join_err.into_panic();
+                        // The hook printed this panic, on its own thread,
+                        // onto the full screen if one is up: leave it, then
+                        // print the panic again on the main screen.
+                        if full.take().is_some()
+                            && let Some(text) = crate::tui::panic::take_for_payload(&*payload)
+                        {
+                            print_panic_report(&text);
+                        }
+                        std::panic::resume_unwind(payload)
                     }
                     Err(join_err) => Err(anyhow::Error::new(join_err).context("app task")),
                 });
@@ -553,6 +623,13 @@ pub async fn run<A: App + 'static>(
                         let lines = view.render_full(now, area.width, area.height);
                         fr.render_widget(Paragraph::new(Text::from(lines)), area);
                     }));
+                    // Under the held dashboard, once it has been up a while
+                    // (so a test sees it before the panic takes it down).
+                    if debug_panic == Some(DebugPanic::Backend)
+                        && held_at.is_some_and(|at| now.saturating_sub(at) >= 500)
+                    {
+                        DebugPanic::Backend.fire();
+                    }
                     continue;
                 }
                 // The view changed shape (a prompt came or went): re-anchor
