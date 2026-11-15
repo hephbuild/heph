@@ -41,7 +41,11 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// run. The skew, both ways: a 0.21.0 plugin is never sent it and returns its
 /// own log path as before, which the host imports (the returned file wins); a
 /// 0.21.1 plugin on a 0.21.0 host sees it absent and writes its own log. No
-/// plugin must be rebuilt.
+/// plugin must be rebuilt. Behaviour a plugin author can see, on the same
+/// host: the relay of `stdout_chunk` / `stderr_chunk` frames is bounded (a
+/// few dozen chunks), the host stops reading the plugin's stream while it is
+/// full, and a run's result waits until every relayed chunk reached the
+/// run's sinks, so a sink that stops reading holds the run open.
 ///
 /// 0.21.0 (a break): outputs from failed targets. `CODEGEN_MODE_IN_PLACE` (3)
 /// changes meaning: it now also asks the host to write back what a run that

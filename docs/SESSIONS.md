@@ -64,7 +64,12 @@ never reads that directory, so `show` and `attach` cannot name it. The run
 removes it when it finishes, and every session start, public or private,
 sweeps the private sessions a killed run left (see [Retention](#retention)).
 It is read once, by the front end, beside `HOME`; with no `HOME` it records
-nothing. With no `HOME` or an unwritable `~/.heph` a public run records
+nothing. This is a change of contract: before run logs, `HEPH_NO_SESSION=1`
+wrote nothing under `~/.heph` at all. It now writes there while the run
+lasts, so a caller that set it to keep `HOME` untouched (a read-only home, a
+sandbox that captures it) should use `--raw`, which still records nothing,
+or point `HOME` somewhere writable. With no `HOME` or an unwritable `~/.heph`
+a public run records
 nothing and says so once with a `warn!`.
 
 `heph run --raw` sets up no session at all: no directory, no recorder, no
