@@ -56,9 +56,10 @@ use std::sync::{Mutex, PoisonError};
 
 pub use feed::{Routed, SessionFeed};
 pub use format::{
-    ApprovalPrompt, ApprovalPromptNotice, CAPABILITY_INFLIGHT, CAPABILITY_RUN_LOGS, HeaderKind,
-    META_FORMAT, RunLogRecord, SNAPSHOT_VERSION, STATUS_LIST_CAP, SessionHeader, SessionMeta,
-    SessionRecord, SessionRecordKind, SessionSnapshot, files,
+    ApprovalPrompt, ApprovalPromptNotice, ApprovalStanding, CAPABILITY_INFLIGHT,
+    CAPABILITY_RUN_LOGS, HeaderKind, META_FORMAT, NoticeUnavailable, RunLogRecord,
+    SNAPSHOT_VERSION, STATUS_LIST_CAP, SessionHeader, SessionMeta, SessionRecord,
+    SessionRecordKind, SessionSnapshot, files,
 };
 pub use holder::{HolderNames, holder_session};
 pub use id::SessionId;

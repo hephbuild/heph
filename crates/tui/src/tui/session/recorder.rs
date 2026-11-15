@@ -39,7 +39,8 @@ use tokio::sync::mpsc::error::TryRecvError;
 
 use super::cleanup::{self, Retention};
 use super::format::{
-    ApprovalPrompt, SessionEnd, SessionRecord, SessionRecordKind, SessionSnapshot, files,
+    ApprovalPrompt, ApprovalStanding, SessionEnd, SessionRecord, SessionRecordKind,
+    SessionSnapshot, files,
 };
 use super::holder::{HolderNames, event_holder_pid};
 use crate::tui::app::TUIAppView;
@@ -444,6 +445,7 @@ pub(crate) struct ViewTap {
     /// The label last recorded (`meta.json` holds the first).
     label: String,
     approval: Option<ApprovalPrompt>,
+    standing: Option<ApprovalStanding>,
 }
 
 impl ViewTap {
@@ -452,6 +454,7 @@ impl ViewTap {
             tap,
             label: view.session_header().label,
             approval: None,
+            standing: None,
         }
     }
 
@@ -468,14 +471,17 @@ impl ViewTap {
             self.label = label;
         }
         let approval = view.pending_approval();
-        if approval != self.approval {
+        let standing = view.approval_standing();
+        if approval != self.approval || standing != self.standing {
             self.tap.view(
                 now_unix_ms(),
                 SessionRecordKind::Approval {
                     prompt: approval.clone().map(Box::new),
+                    standing,
                 },
             );
             self.approval = approval;
+            self.standing = standing;
         }
     }
 
@@ -500,9 +506,10 @@ fn injected_panic() {}
 /// View records written past the cap, like `End`: what a truncated session
 /// still needs to read right at its end. `Finished` (when the summary was
 /// measured), `Output` (the failure report, once per run), a `Label` change
-/// (one short line), and the approval prompt's *clear*, so a prompt recorded
-/// before the cap does not stay on a viewer's screen. A prompt itself carries
-/// notice paths and stays capped.
+/// (one short line), and every `Approval`: a few short lines per gated
+/// target, carrying the hashes its notices are read back by and the standing
+/// Y/N decision, which a viewer needs however long the build ran (and its
+/// clear, so a prompt recorded earlier does not stay on a viewer's screen).
 ///
 /// `RunLog` too: one short line per run that writes anything, and the only
 /// way a follower finds the log of a run that starts after the cap.
@@ -512,9 +519,8 @@ fn outlives_cap(kind: &SessionRecordKind) -> bool {
         | SessionRecordKind::Output { .. }
         | SessionRecordKind::Label { .. }
         | SessionRecordKind::RunLog(_)
-        | SessionRecordKind::Approval { prompt: None } => true,
-        SessionRecordKind::Approval { prompt: Some(_) }
-        | SessionRecordKind::Log { .. }
+        | SessionRecordKind::Approval { .. } => true,
+        SessionRecordKind::Log { .. }
         | SessionRecordKind::End { .. }
         | SessionRecordKind::Truncated
         | SessionRecordKind::InflightWritten

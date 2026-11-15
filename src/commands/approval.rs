@@ -6,20 +6,27 @@
 use async_trait::async_trait;
 
 use crate::engine::approval::{ApprovalHandler, ApprovalRequest};
-use crate::tui::{ApprovalCenter, ApprovalNoticeView};
+use crate::tui::{ApprovalBuild, ApprovalCenter, ApprovalNoticeView};
 use hcore::hasync::{Cancellable, StdCancellationToken};
 
 /// TUI-mode handler: register the gated target with the shared
 /// [`ApprovalCenter`] (rendered on the live view) and await the user's decision.
 /// `--auto-approve` short-circuits to yes without surfacing a prompt.
+///
+/// One handler serves one build's request (`Engine::new_state_full`),
+/// so it holds that build's scope on the center: a standing Y/N covers this
+/// build's requests only, and ends when the request (and so this handler) is
+/// dropped.
 pub struct TuiApprovalHandler {
     center: ApprovalCenter,
+    build: ApprovalBuild,
     auto_approve: bool,
 }
 
 impl TuiApprovalHandler {
     pub fn new(center: ApprovalCenter, auto_approve: bool) -> Self {
         Self {
+            build: center.build(),
             center,
             auto_approve,
         }
@@ -43,9 +50,11 @@ impl ApprovalHandler for TuiApprovalHandler {
                 name: n.name,
                 content: n.content,
                 path: n.path,
+                hash: n.hash,
             })
             .collect();
-        let rx = self.center.request(req.addr, notices);
+        // Under a standing Y/N the receiver comes back already resolved.
+        let rx = self.center.request(&self.build, req.addr, notices).rx;
         tokio::select! {
             // Sender dropped without a decision (shutdown) → treat as rejection.
             decided = rx => Ok(decided.unwrap_or(false)),
@@ -137,8 +146,8 @@ mod tests {
         // then approves it.
         let (decided, ()) = tokio::join!(handler.request_approval(req(), &ctoken), async {
             loop {
-                if center.is_active() {
-                    center.respond(true);
+                if let Some(view) = center.current() {
+                    center.respond(view.seq, true, Vec::new());
                     break;
                 }
                 tokio::task::yield_now().await;

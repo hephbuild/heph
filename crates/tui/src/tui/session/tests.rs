@@ -541,9 +541,9 @@ fn events_cap_truncates() {
 }
 
 /// Past the cap, the view records a truncated session still needs at its end
-/// are written: the failure report, a label change, the prompt's clear and
-/// `Finished`, and log lines (a replay reads them). A prompt itself and a
-/// build event are not.
+/// are written: the failure report, a label change, every approval prompt
+/// (its notice hashes, its clear, the standing decision) and `Finished`, and
+/// log lines (a replay reads them). A build event is not.
 #[test]
 fn events_cap_keeps_the_ending_view_records() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -553,23 +553,26 @@ fn events_cap_keeps_the_ending_view_records() {
     for _ in 0..70 {
         tap.event(big_event());
     }
-    let prompt = SessionRecordKind::Approval {
-        prompt: Some(Box::new(ApprovalPrompt {
-            addr: "//a:gate".into(),
-            ..ApprovalPrompt::default()
-        })),
-    };
     let kept = [
+        SessionRecordKind::Approval {
+            prompt: Some(Box::new(ApprovalPrompt {
+                addr: "//a:gate".into(),
+                ..ApprovalPrompt::default()
+            })),
+            standing: None,
+        },
         SessionRecordKind::Label {
             label: "run //a:... (4 matched)".into(),
         },
-        SessionRecordKind::Approval { prompt: None },
+        SessionRecordKind::Approval {
+            prompt: None,
+            standing: Some(ApprovalStanding::Approve),
+        },
         SessionRecordKind::Finished,
         SessionRecordKind::Output {
             text: "failed: //a:bad\n".into(),
         },
     ];
-    tap.view(1, prompt);
     tap.event(events().remove(0));
     for kind in kept.iter().cloned() {
         tap.view(1, kind);

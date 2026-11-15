@@ -693,6 +693,28 @@ mod tests {
                 kind: hcore::events::BuildEventKind::ResultStart { addr: big.clone() },
             });
         }
+        // A gated target past the cap: its prompt carries the notice's hash,
+        // which an attached viewer reads the notice back by. Recorded before
+        // the RunLog, so it has landed once the RunLog is found.
+        let hash = hcore::approval_notice::write_notice_blob(&home, "the plan").expect("notice");
+        opened.tap.view(
+            2,
+            SessionRecordKind::Approval {
+                prompt: Some(Box::new(super::super::ApprovalPrompt {
+                    addr: ADDR.into(),
+                    queued_behind: 0,
+                    notices: vec![super::super::ApprovalPromptNotice {
+                        name: "plan".into(),
+                        path: home
+                            .join("approval/plan.txt")
+                            .to_string_lossy()
+                            .into_owned(),
+                        hash: Some(hash),
+                    }],
+                })),
+                standing: None,
+            },
+        );
         live_file(&home, "runs/e/0.log", b"out\n");
         slot.run_log_created(RunLogRecord {
             addr: ADDR.into(),
@@ -720,12 +742,21 @@ mod tests {
             .filter_map(|rec| rec.session)
             .filter(|k| !matches!(k, SessionRecordKind::Log { .. }))
             .collect();
-        assert!(
-            matches!(
-                kinds.as_slice(),
-                [SessionRecordKind::Truncated, SessionRecordKind::RunLog(_)]
-            ),
-            "{kinds:?}"
+        let [
+            SessionRecordKind::Truncated,
+            SessionRecordKind::Approval {
+                prompt: Some(prompt),
+                ..
+            },
+            SessionRecordKind::RunLog(_),
+        ] = kinds.as_slice()
+        else {
+            panic!("{kinds:?}");
+        };
+        assert_eq!(
+            prompt.notices[0].read(&home).as_deref(),
+            Ok("the plan"),
+            "the notice reads back by the hash recorded past the cap"
         );
 
         slot.finish(Some(0));

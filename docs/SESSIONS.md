@@ -157,9 +157,16 @@ What the run's terminal showed besides events and log lines is recorded too,
 so `attach` draws it (see [Attach](#attach)):
 
 - `Label {label}`: the TUI's bottom label changed (`meta.json` holds the first).
-- `Approval {prompt}`: the approval banner changed; `prompt` is `{addr,
-  queued_behind, notices: [{name, path}]}`, or absent once nothing is pending.
-  Never the notice's content, which stays in its file.
+- `Approval {prompt, standing}`: the approval banner changed; `prompt` is
+  `{addr, queued_behind, notices: [{name, path, hash}]}`, or absent once
+  nothing is pending. Never the notice's content: the engine stores it at
+  gate time under `<home>/approval/notices/<hash>` (xxh3-128), and a viewer
+  reads it there by `hash`, checking the bytes against it
+  (`ApprovalPromptNotice::read`). A missing blob, a mismatch, or a record
+  from a heph without `hash` reads as "notice unavailable", never as `path`,
+  which is still written only for viewers that predate `hash`. `standing` is
+  `approve` or `reject` once Y or N set a standing decision for the build,
+  absent otherwise.
 - `Finished`: the TUI was torn down; `at_unix_ms` is the instant its final
   summary was measured against.
 - `Output {text}`: text the process wrote straight to its terminal, today the
@@ -313,7 +320,8 @@ included. The recorder is its own OS thread behind an unbounded channel:
 - `events.ndjson` stops at **64 MiB** with a `Truncated` record; `status.json`
   keeps updating. Past it, only what a viewer needs at the end is appended:
   `End`, `InflightWritten`, `Finished`, the failure report (`Output`), a
-  `Label` change, and an `Approval` that clears the prompt. An `Output`
+  `Label` change, and every `Approval` (a few short records per gated target,
+  carrying the notice hashes and the standing decision). An `Output`
   record keeps at most the first 1 MiB of its text, then a line saying how
   many bytes were left out, so the report a process prints (at most twice)
   overshoots the cap by a bounded amount. `Log` records outlive the cap too,

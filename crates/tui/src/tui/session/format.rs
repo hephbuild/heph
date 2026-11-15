@@ -234,12 +234,19 @@ pub enum SessionRecordKind {
         #[serde(default)]
         label: String,
     },
-    /// The approval prompt the TUI shows, or `None` once none is pending. The
-    /// prompt's keys act on the run, so a viewer shows it without them; a
-    /// notice's content stays out (its path is shown).
+    /// The approval prompt the TUI shows, or `None` once none is pending, and
+    /// the standing Y/N decision in force. The prompt's keys act on the run,
+    /// so a viewer shows it without them; a notice's content stays out (a
+    /// viewer reads it by the hash recorded beside it). Written past the cap,
+    /// so the notice hashes and the standing decision are there to read
+    /// however long the build ran.
     Approval {
         #[serde(default)]
         prompt: Option<Box<ApprovalPrompt>>,
+        /// Absent from a writer that predates standing decisions, and while
+        /// none stands.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        standing: Option<ApprovalStanding>,
     },
     /// The TUI was torn down at `at_unix_ms`, the instant its final summary
     /// measured the elapsed time against. What follows (`Log`, `Output`) the
@@ -281,8 +288,59 @@ pub struct ApprovalPrompt {
 pub struct ApprovalPromptNotice {
     #[serde(default)]
     pub name: String,
+    /// The legacy notice file, overwritten on each request. Still written so
+    /// an attached viewer from an older heph shows something; a viewer reads
+    /// [`Self::hash`] instead, never this.
     #[serde(default)]
     pub path: String,
+    /// The content hash the notice is stored under
+    /// ([`hcore::approval_notice::read_notice_blob`]). Absent from a writer
+    /// that predates it: the notice then reads as unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
+}
+
+impl ApprovalPromptNotice {
+    /// The notice's text, read from `home`'s store by its hash and checked
+    /// against it, or [`hcore::approval_notice::NOTICE_UNAVAILABLE`] — never
+    /// a path — when the blob is gone, does not match, or no hash was
+    /// recorded. Blocking (one file read): call it off the render task.
+    pub fn read(&self, home: &std::path::Path) -> Result<String, NoticeUnavailable> {
+        hcore::approval_notice::read_notice_blob(home, self.hash.as_deref())
+            .ok_or(NoticeUnavailable)
+    }
+}
+
+/// A recorded notice could not be read back: show
+/// [`hcore::approval_notice::NOTICE_UNAVAILABLE`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoticeUnavailable;
+
+impl std::fmt::Display for NoticeUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(hcore::approval_notice::NOTICE_UNAVAILABLE)
+    }
+}
+
+/// A standing approval decision: after Y (or N), every request of the build
+/// is approved (or rejected) without a prompt, until the build ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalStanding {
+    /// Y: shown as `auto-approving (Y)`.
+    Approve,
+    /// N: shown as `auto-rejecting (N)`.
+    Reject,
+}
+
+impl ApprovalStanding {
+    /// The indicator the line, the title row and `heph session show` print.
+    pub fn indicator(self) -> &'static str {
+        match self {
+            Self::Approve => "auto-approving (Y)",
+            Self::Reject => "auto-rejecting (N)",
+        }
+    }
 }
 
 /// The most entries each list of a `status.json` snapshot keeps (U3, which
@@ -636,6 +694,7 @@ mod tests {
             notices: vec![ApprovalPromptNotice {
                 name: "terms".into(),
                 path: "/x/terms.txt".into(),
+                hash: Some("0123456789abcdef0123456789abcdef".into()),
             }],
         };
         for (kind, ty) in [
@@ -648,10 +707,17 @@ mod tests {
             (
                 SessionRecordKind::Approval {
                     prompt: Some(Box::new(prompt)),
+                    standing: None,
                 },
                 "Approval",
             ),
-            (SessionRecordKind::Approval { prompt: None }, "Approval"),
+            (
+                SessionRecordKind::Approval {
+                    prompt: None,
+                    standing: Some(ApprovalStanding::Reject),
+                },
+                "Approval",
+            ),
             (SessionRecordKind::Finished, "Finished"),
             (
                 SessionRecordKind::Output {
@@ -679,6 +745,24 @@ mod tests {
             let old: SessionRecord = serde_json::from_str(&older).expect("decode as unknown");
             assert_eq!(old.session, Some(SessionRecordKind::Unknown), "{older}");
         }
+    }
+
+    /// An `Approval` from a heph that predates notice hashes and standing
+    /// decisions still decodes: no hash (the notice reads as unavailable,
+    /// never by its path) and nothing standing.
+    #[test]
+    fn approval_record_from_an_older_writer_decodes() {
+        let json = r#"{"at_unix_ms":3,"session":{"type":"Approval","prompt":{"addr":"//a:b","queued_behind":0,"notices":[{"name":"plan","path":"/home/approval/a_b__plan.txt"}]}}}"#;
+        let rec: SessionRecord = serde_json::from_str(json).expect("decode");
+        let Some(SessionRecordKind::Approval { prompt, standing }) = rec.session else {
+            panic!("not an Approval: {rec:?}");
+        };
+        assert_eq!(standing, None);
+        let notice = &prompt.expect("prompt").notices[0];
+        assert_eq!(notice.hash, None);
+        let home = tempfile::tempdir().expect("tempdir");
+        assert_eq!(notice.read(home.path()), Err(NoticeUnavailable));
+        assert_eq!(NoticeUnavailable.to_string(), "notice unavailable");
     }
 
     /// A6/A17: the snapshot round-trips, and a newer version is refused naming

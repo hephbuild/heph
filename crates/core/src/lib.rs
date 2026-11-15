@@ -15,6 +15,7 @@
     )
 )]
 
+pub mod approval_notice;
 pub mod blocking;
 pub mod capacity;
 pub mod debug_hash;

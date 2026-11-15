@@ -24,14 +24,16 @@ use std::io::Read;
 use std::sync::Arc;
 
 /// One rendered notice shown to the user before they approve/reject: the input
-/// group name, the concatenated text of every file that group resolves to, and
-/// the on-disk path the full text was written to (so a front-end can offer a
-/// clickable "open in editor" link rather than only an inline preview).
+/// group name, the concatenated text of every file that group resolves to, the
+/// on-disk path the full text was written to (kept for viewers that predate
+/// `hash`), and the content hash it is stored under
+/// ([`hcore::approval_notice`]), which is how a new viewer reads it back.
 #[derive(Debug, Clone)]
 pub struct ApprovalNotice {
     pub name: String,
     pub content: String,
     pub path: String,
+    pub hash: String,
 }
 
 /// A pending approval handed to the [`ApprovalHandler`]: the target being gated
@@ -164,17 +166,23 @@ impl Engine {
                 .with_context(|| {
                     format!("rendering approval notice `{name}` for {}", addr.format())
                 })?;
-            // Persist the full notice so the front-end can link to it (open in an
-            // editor) instead of relying on a scrollable inline preview.
-            let path = self
-                .write_notice_file(addr, name, &content)
-                .with_context(|| {
-                    format!("writing approval notice `{name}` for {}", addr.format())
-                })?;
+            // Persist the full notice twice: under its content hash, which is
+            // how a viewer reads it back (checked on read), and at the legacy
+            // per-(target, notice) path an older attached viewer still shows.
+            let file = notice_file(&self.home, addr, name);
+            let home = self.home.to_path_buf();
+            let (content, path, hash) = hcore::blocking::run(move || {
+                let hash = hcore::approval_notice::write_notice_blob(&home, &content)?;
+                let path = write_notice_file(&file, &content)?;
+                anyhow::Ok((content, path, hash))
+            })
+            .await
+            .with_context(|| format!("writing approval notice `{name}` for {}", addr.format()))?;
             notices.push(ApprovalNotice {
                 name: name.clone(),
                 content,
                 path,
+                hash,
             });
         }
 
@@ -243,28 +251,34 @@ impl Engine {
         }
         Ok(out)
     }
+}
 
-    /// Write a rendered notice under `<home>/approval/` and return its absolute
-    /// path. The file name is derived from the target addr + group name so it is
-    /// stable across runs (overwritten in place) and unique per (target, notice).
-    fn write_notice_file(&self, addr: &Addr, name: &str, content: &str) -> anyhow::Result<String> {
-        let dir = self.home.join("approval");
-        std::fs::create_dir_all(&dir)
+/// The legacy per-(target, notice) file of a rendered notice:
+/// `<home>/approval/<addr>__<name>.txt`, stable across runs (overwritten in
+/// place). Only an attached viewer from an older heph reads it.
+fn notice_file(home: &std::path::Path, addr: &Addr, name: &str) -> std::path::PathBuf {
+    let sanitize = |s: &str| -> String {
+        s.chars()
+            .map(|c| if c.is_alphanumeric() { c } else { '_' })
+            .collect()
+    };
+    home.join("approval").join(format!(
+        "{}__{}.txt",
+        sanitize(&addr.format()),
+        sanitize(name)
+    ))
+}
+
+/// Write a rendered notice to its legacy [`notice_file`] and return its
+/// absolute path. Blocking.
+fn write_notice_file(file: &std::path::Path, content: &str) -> anyhow::Result<String> {
+    if let Some(dir) = file.parent() {
+        std::fs::create_dir_all(dir)
             .with_context(|| format!("create approval dir {}", dir.display()))?;
-        let sanitize = |s: &str| -> String {
-            s.chars()
-                .map(|c| if c.is_alphanumeric() { c } else { '_' })
-                .collect()
-        };
-        let file = dir.join(format!(
-            "{}__{}.txt",
-            sanitize(&addr.format()),
-            sanitize(name)
-        ));
-        std::fs::write(&file, content)
-            .with_context(|| format!("write approval notice {}", file.display()))?;
-        Ok(file.to_string_lossy().into_owned())
     }
+    std::fs::write(file, content)
+        .with_context(|| format!("write approval notice {}", file.display()))?;
+    Ok(file.to_string_lossy().into_owned())
 }
 
 #[cfg(test)]

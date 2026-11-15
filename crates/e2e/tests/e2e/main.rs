@@ -17,6 +17,7 @@
 #[path = "../common/mod.rs"]
 mod common;
 
+mod approval_gate;
 mod cache_load;
 mod cache_outcome;
 mod clean;

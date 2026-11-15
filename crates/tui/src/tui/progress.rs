@@ -2811,6 +2811,13 @@ impl TUIAppView for TuiProgressView {
             .and_then(crate::tui::approval::ApprovalCenter::prompt)
     }
 
+    fn approval_standing(&self) -> Option<crate::tui::session::ApprovalStanding> {
+        match &self.role {
+            Role::Live { approval } => approval.as_ref().and_then(|c| c.standing()),
+            Role::Attached { feed, .. } => feed.approval_standing(),
+        }
+    }
+
     fn rows(&self, term_height: u16) -> u16 {
         rows_for_height(term_height)
     }
@@ -2895,7 +2902,17 @@ impl TUIAppView for TuiProgressView {
         let Some(center) = self.approval_center() else {
             return;
         };
-        center.respond(approve);
+        // The prompt on screen is the front of the queue; an expanded one had
+        // its notices read inline.
+        let Some(view) = center.current() else {
+            return;
+        };
+        let read = if view.expanded {
+            view.notices.into_iter().map(|n| n.name).collect()
+        } else {
+            Vec::new()
+        };
+        let _decided = center.respond(view.seq, approve, read);
         // A resolved prompt shrinks the body; reset scroll so the live rows show.
         self.scroll.set(0);
     }
@@ -6307,8 +6324,9 @@ mod tests {
         let center = crate::tui::approval::ApprovalCenter::new();
         // Two targets awaiting approval: the banner shows the active one plus the
         // total pending count.
-        let _r1 = center.request("//a:1".to_string(), vec![]);
-        let _r2 = center.request("//a:2".to_string(), vec![]);
+        let build = center.build();
+        let _r1 = center.request(&build, "//a:1".to_string(), vec![]);
+        let _r2 = center.request(&build, "//a:2".to_string(), vec![]);
         let view = TuiProgressView::new("run").with_approval(center);
         let lines = view.approval_lines();
         let banner: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
@@ -6319,7 +6337,7 @@ mod tests {
     #[test]
     fn approval_banner_single_has_no_pending_count() {
         let center = crate::tui::approval::ApprovalCenter::new();
-        let _r = center.request("//a:1".to_string(), vec![]);
+        let _r = center.request(&center.build(), "//a:1".to_string(), vec![]);
         let view = TuiProgressView::new("run").with_approval(center);
         let lines = view.approval_lines();
         let banner: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
