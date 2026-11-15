@@ -541,6 +541,11 @@ async fn warm_build_pays_nothing_for_logs() -> anyhow::Result<()> {
 
     let warm_seen = Arc::new(Announced::default());
     let warm = announcing_engine(ws.path(), &warm_seen)?;
+    // The warm engine's start sweep runs on the blocking pool, unawaited; it
+    // removes the cold engine's directory if that outlived the drop (a task
+    // of the cold build still holding the engine). Let it finish first, so
+    // the listing below compares the build, not the sweep.
+    warm.run_logs_start_sweep().await;
     let before = runs_entries(&warm);
     let warm_events = result_with_events(&warm, "//p:t").await?;
     assert!(
@@ -548,10 +553,12 @@ async fn warm_build_pays_nothing_for_logs() -> anyhow::Result<()> {
         "a hit announced a RunLog record"
     );
     assert!(live_files(&warm).is_empty(), "{:?}", live_files(&warm));
-    assert_eq!(
-        runs_entries(&warm),
-        before,
-        "an all-hit build touched runs/"
+    // Nothing appeared. An entry may still go: a cold-build task that held the
+    // engine past `drop(cold)` removes its directory when it ends.
+    let after = runs_entries(&warm);
+    assert!(
+        after.is_subset(&before),
+        "an all-hit build touched runs/: {before:?} -> {after:?}"
     );
     // It admitted nothing, so it reports no pool use either.
     assert!(
