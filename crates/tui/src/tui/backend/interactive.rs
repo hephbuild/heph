@@ -58,7 +58,8 @@ pub async fn run<A: App + 'static>(
     // Size the inline viewport to ~1/3 of the terminal height. Queried before the
     // viewport is built (so the first frame is already sized); the column count is
     // re-derived from the backend below.
-    let term_height = crossterm::terminal::size()
+    // Kept current from resize events: the view's row count depends on it.
+    let mut term_height = crossterm::terminal::size()
         .map(|(_, h)| h)
         .unwrap_or(24)
         .max(1);
@@ -365,11 +366,12 @@ pub async fn run<A: App + 'static>(
                             view.back_to_main();
                         }
                     }
-                    Some(Ok(Event::Resize(w, _))) => {
+                    Some(Ok(Event::Resize(w, h))) => {
                         // Cheap: just record. The terminal re-anchor (which does a
                         // DSR cursor query that must not race the EventStream) is
                         // deferred to the tick arm below.
                         cols = w.max(1);
+                        term_height = h.max(1);
                         needs_resize = true;
                     }
                     _ => {}
@@ -431,19 +433,30 @@ pub async fn run<A: App + 'static>(
                     // the terminal so `with_options`+`compute_inline_size`
                     // re-queries the cursor and positions the viewport below
                     // the printed output instead of clobbering it.
+                    // The view may have changed shape while paused (an
+                    // approval prompt came or went): rebuild at today's size.
+                    let resumed_rows = view.rows(term_height);
                     if let Ok(new_term) = Terminal::with_options(
                         StderrBackend::new(io::stderr()),
                         TerminalOptions {
-                            viewport: Viewport::Inline(rows),
+                            viewport: Viewport::Inline(resumed_rows),
                         },
                     ) {
                         terminal = new_term;
+                        rows = resumed_rows;
                     }
                     events = Some(EventStream::new());
                     rx = sink.switch_to_buffered();
                     cols = terminal_cols(&terminal);
                     paused = false;
                     resume_pending = false;
+                }
+                // The view changed shape (the line opened the box, a prompt
+                // came or went): re-anchor through the same path a resize
+                // takes, which tears the event stream down across the cursor
+                // query.
+                if view.rows(term_height) != rows {
+                    needs_resize = true;
                 }
                 if needs_resize {
                     // Re-anchor the inline viewport at the new size before drawing.
@@ -1224,6 +1237,8 @@ mod tests {
         .expect("terminal");
 
         let view = TuiProgressView::new("Running //a:b");
+        // These reflow the box, which is taller than the line.
+        view.open_box();
         draw_view(&mut terminal, &view);
 
         // Shrink the terminal, then re-anchor (the load-bearing call the fix runs
@@ -1305,6 +1320,8 @@ mod tests {
         .expect("terminal");
 
         let view = TuiProgressView::new("Running //a:b");
+        // These reflow the box, which is taller than the line.
+        view.open_box();
         let lines = view.render("⠋", 10_000, width, rows);
         terminal
             .draw(|f| f.render_widget(Paragraph::new(Text::from(lines)), f.area()))
@@ -1399,6 +1416,8 @@ mod tests {
         );
 
         let view = TuiProgressView::new("Running //a:b");
+        // These reflow the box, which is taller than the line.
+        view.open_box();
         let lines = view.render("⠋", 10_000, WIDTH, rows);
         terminal
             .draw(|f| f.render_widget(Paragraph::new(Text::from(lines)), f.area()))
@@ -1442,6 +1461,8 @@ mod tests {
         assert_eq!(rows, start_rows);
 
         let view = TuiProgressView::new("Running //a:b");
+        // These reflow the box, which is taller than the line.
+        view.open_box();
         let lines = view.render("⠋", 10_000, 50, rows);
         terminal
             .draw(|f| f.render_widget(Paragraph::new(Text::from(lines)), f.area()))
@@ -1488,6 +1509,8 @@ mod tests {
         );
 
         let view = TuiProgressView::new("Running //a:b");
+        // These reflow the box, which is taller than the line.
+        view.open_box();
         let lines = view.render("⠋", 10_000, WIDTH, rows);
         terminal
             .draw(|f| f.render_widget(Paragraph::new(Text::from(lines)), f.area()))

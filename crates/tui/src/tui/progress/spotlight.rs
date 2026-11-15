@@ -371,3 +371,214 @@ impl BuildState {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use hcore::capacity::Unit;
+    use hcore::events::{BuildEvent, BuildEventKind, YieldingToData};
+
+    use super::super::test_events::{
+        T0, admission, at, end, exec, fold, lock, lock_end, scratch, start,
+    };
+    use super::*;
+    use crate::tui::app::TUIAppView;
+    use crate::tui::approval::ApprovalCenter;
+    use crate::tui::progress::TuiProgressView;
+    use crate::tui::session::{HolderNames, Session, SessionRoot, SessionStart};
+
+    fn shown(s: &BuildState, ms: u64) -> Option<String> {
+        s.spotlight(T0 + ms).map(|s| s.text())
+    }
+
+    /// The events behind rules 2 to 4; rule 1 is the view's.
+    fn rule_events(rule: usize) -> Vec<BuildEvent> {
+        match rule {
+            2 => vec![
+                at(0, start("//r:fail")),
+                at(10, end("//r:fail", Some("boom"), None)),
+            ],
+            3 => vec![at(0, start("//r:wait")), at(20, lock("//r:wait", None))],
+            4 => vec![at(0, start("//r:run")), at(30, exec("//r:run"))],
+            _ => Vec::new(),
+        }
+    }
+
+    const ICONS: [&str; 4] = ["✦", "✗", "⧗", "▶"];
+
+    /// Approval > root failure > longest wait > longest run, for each pair,
+    /// as the line shows it.
+    #[test]
+    fn spotlight_priority() {
+        for hi in 1..=4 {
+            for lo in hi + 1..=4 {
+                let center = ApprovalCenter::new();
+                let mut v = TuiProgressView::new("L").with_approval(center.clone());
+                for e in rule_events(hi).into_iter().chain(rule_events(lo)) {
+                    v.apply(&e);
+                }
+                let build = center.build();
+                let _ticket =
+                    (hi == 1).then(|| center.request(&build, "//r:gate".into(), Vec::new()));
+                let lines = v.render("⠋", T0 + 20_000, 300, 24);
+                let line: String = lines
+                    .last()
+                    .expect("the line")
+                    .spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect();
+                let (want, not) = (ICONS[hi - 1], ICONS[lo - 1]);
+                assert!(
+                    line.contains(want) && !line.contains(not),
+                    "rule {hi} over rule {lo}: {line}"
+                );
+            }
+        }
+    }
+
+    fn cache_write(addr: &str) -> BuildEventKind {
+        BuildEventKind::LocalCacheWriteStart { addr: addr.into() }
+    }
+
+    #[test]
+    fn spotlight_cost_and_hold() {
+        // Rule 3 reads the fronts of the ordered sets: as many at 100k
+        // waiters as at 10.
+        let reads = |n: u64| {
+            let events: Vec<_> = (0..n)
+                .map(|i| at(i, admission(&format!("//w:{i}"), "cpu", None, None)))
+                .collect();
+            let s = fold(&events);
+            FRONTS_READ.with(|c| c.set(0));
+            let spot = s.spotlight(T0 + 200_000).expect("a wait");
+            assert_eq!(spot.name, "//w:0", "the oldest wait");
+            FRONTS_READ.with(std::cell::Cell::get)
+        };
+        let few = reads(10);
+        assert!(few <= 4, "{few} fronts read");
+        assert_eq!(reads(100_000), few, "constant work at 100k waiters");
+
+        // The hold, from event times alone. `r1` is picked when the wait
+        // ends at 9s; at 10s it moves on to its cache write, so its op now
+        // starts after `r2`'s, and the hold keeps it until 11s.
+        let events = vec![
+            at(0, start("//h:r1")),
+            at(0, exec("//h:r1")),
+            at(100, start("//h:w")),
+            at(100, lock("//h:w", None)),
+            at(1_000, start("//h:r2")),
+            at(1_000, exec("//h:r2")),
+            at(9_000, lock_end("//h:w")),
+            at(10_000, cache_write("//h:r1")),
+        ];
+        // A view that ran from the start, drawing frames as it went...
+        let mut live = BuildState::new();
+        for e in &events {
+            live.apply(e);
+            for frame in [0, 400, 800] {
+                drop(live.spotlight(e.at_unix_ms + frame));
+            }
+        }
+        // ...and one that attached at 10.6s and folded it all at once.
+        let late = fold(&events);
+        for s in [&live, &late] {
+            assert_eq!(shown(s, 10_600).as_deref(), Some("▶ //h:r1 0s"));
+            assert_eq!(shown(s, 11_100).as_deref(), Some("▶ //h:r2 10s"));
+        }
+        // A held target that finishes inside its hold hands over at once.
+        let mut ended = events.clone();
+        ended.push(at(10_300, end("//h:r1", None, None)));
+        assert_eq!(shown(&fold(&ended), 10_400).as_deref(), Some("▶ //h:r2 9s"));
+
+        // A root failure stays until a newer root replaces it; a failure
+        // caused by a dependency is never spotlit.
+        let mut failures = vec![
+            at(0, start("//f:a")),
+            at(1_000, end("//f:a", Some("first\nmore"), None)),
+            at(1_500, start("//f:b")),
+            at(2_000, end("//f:b", Some("dep failed"), Some("//f:a"))),
+        ];
+        assert_eq!(
+            shown(&fold(&failures), 60_000).as_deref(),
+            Some("✗ //f:a first")
+        );
+        failures.push(at(3_000, end("//f:c", Some("second"), None)));
+        assert_eq!(
+            shown(&fold(&failures), 60_000).as_deref(),
+            Some("✗ //f:c second")
+        );
+
+        // No wait event, no wait: the engine sends one past its notice
+        // threshold. A target that has run for less than the long-running
+        // threshold is not spotlit either, and an empty build shows nothing.
+        let started = fold(&[at(0, start("//q:a")), at(0, exec("//q:a"))]);
+        assert_eq!(shown(&started, LONG_RUNNING_THRESHOLD_MS - 1), None);
+        assert_eq!(shown(&BuildState::new(), 60_000), None);
+
+        // Scratch waits group by cache.
+        let grouped = fold(&[
+            at(0, scratch("//s:a", "//build:gocache")),
+            at(1_000, scratch("//s:b", "//build:gocache")),
+        ]);
+        assert_eq!(
+            shown(&grouped, 31_000).as_deref(),
+            Some("⧗ //build:gocache 2 queued 31s")
+        );
+
+        // A lock held by another session names it.
+        let root = tempfile::tempdir().expect("tempdir");
+        let sessions = SessionRoot::new(root.path());
+        let holder = Session::open(&sessions, SessionStart::default()).expect("holder");
+        let own = Session::open(&sessions, SessionStart::default()).expect("own");
+        let names = HolderNames::new(Some(sessions.clone()), Some(own.id()));
+        names.resolve_blocking(std::process::id());
+        let mut locked = BuildState::new();
+        locked.name_lock_holders(names);
+        locked.apply(&at(0, lock("//l:a", Some(std::process::id()))));
+        assert_eq!(
+            shown(&locked, 39_000),
+            Some(format!("⧗ //l:a locked by session {} 39s", holder.id()))
+        );
+        holder.finish(Some(0), false);
+        own.finish(Some(0), false);
+
+        // "N pending" counts the requests queued with the one on show.
+        assert_eq!(Spot::approval("//a:g", 3).text(), "✦ //a:g 3 pending");
+        assert_eq!(Spot::approval("//a:g", 1).text(), "✦ //a:g");
+    }
+
+    /// The spotlight's words for an admission wait are the shared
+    /// formatter's, after the address; a waiter that yields shows no queue
+    /// position, since its event carries none worth showing.
+    #[test]
+    fn wait_text_is_the_shared_formatter_spotlight() {
+        let yielding = YieldingToData {
+            pool: "memory".into(),
+            need: 1 << 30,
+        };
+        for (pool, removals, yields) in [
+            ("cpu", None, None),
+            ("cpu", None, Some(yielding)),
+            ("sandbox", Some(2), None),
+        ] {
+            let s = fold(&[at(0, admission("//w:a", pool, removals, yields.clone()))]);
+            let spot = s.spotlight(T0 + 41_000).expect("a wait");
+            let expected = hcore::events::admission_wait_text(
+                "//w:a",
+                pool,
+                Unit::default_for(pool),
+                2,
+                1,
+                3,
+                yields.as_ref().map(|y| (y, Unit::default_for(&y.pool))),
+                removals,
+                "41s",
+            );
+            assert_eq!(format!("{} {}", spot.name, spot.detail), expected);
+            assert_eq!(spot.icon, "⧗");
+            if yields.is_some() {
+                assert!(!spot.detail.contains("ahead"), "{}", spot.detail);
+            }
+        }
+    }
+}

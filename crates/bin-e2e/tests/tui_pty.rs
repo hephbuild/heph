@@ -83,9 +83,11 @@ fn tui_renders_the_run_and_restores_the_terminal() {
     // to catch it at a read boundary. (It was weakened to a raw-byte scan when
     // the box was only up for a race-length window; the fix for that was the
     // window, not the assertion.)
+    // The line: its done count, the one segment that is up for the whole run
+    // (the label shows only while the matcher streams).
     assert!(
-        session.rendered.contains("//pkg:ok"),
-        "the target never appeared in the rendered output\n{}",
+        session.rendered.contains("/ 1 done"),
+        "the line never appeared in the rendered output\n{}",
         session.report()
     );
 

@@ -193,6 +193,15 @@ fn draw_more(view: &mut TuiProgressView) -> [Vec<String>; 3] {
     [narrow, failed, failed_narrow]
 }
 
+/// The line, as the view shows it after `Esc` from the box: one string per
+/// row that has anything on it. The view is left on the box's main view.
+fn draw_line(view: &mut TuiProgressView) -> Vec<String> {
+    view.back_to_main();
+    let rows = draw(view).into_iter().filter(|r| !r.is_empty()).collect();
+    view.tab(true);
+    rows
+}
+
 /// The run's view, recorded through the taps the interactive backend uses,
 /// then replayed from `events.ndjson` into an attached view, draws the same
 /// frame at each point the approval prompt changed, and prints the same
@@ -224,6 +233,8 @@ fn attached_view_draws_what_the_run_drew() {
         label: label.clone(),
     }))
     .with_approval(center.clone());
+    // The box's frames are compared first; the line has its own checks.
+    live.open_box();
     // The backend's receiver resolves the holder before the fold; the events
     // here are applied by hand, so resolve up front.
     let live_names = HolderNames::new(Some(session_root.clone()), Some(rec.id()));
@@ -250,6 +261,7 @@ fn attached_view_draws_what_the_run_drew() {
     let next = center.request(&build, "//a:next".into(), Vec::new());
     view_tap.observe(&live);
     let live_prompt = draw(&live);
+    let live_prompt_line = draw_line(&mut live);
 
     center.respond(gate.seq, true, Vec::new());
     center.respond(next.seq, false, Vec::new());
@@ -257,6 +269,7 @@ fn attached_view_draws_what_the_run_drew() {
     assert_eq!(next.rx.blocking_recv(), Ok(false));
     view_tap.observe(&live);
     let live_after = draw(&live);
+    let live_after_line = draw_line(&mut live);
     let live_more = draw_more(&mut live);
 
     let finished_at = NOW + 500;
@@ -268,6 +281,7 @@ fn attached_view_draws_what_the_run_drew() {
     // The viewer: the same view, attached, fed from the recording.
     let feed = SessionFeed::default();
     let mut attached = TuiProgressView::new("run //a:...").attached(rec.id(), feed.clone(), || {});
+    attached.open_box();
     let attached_names = FileSource::new(root.path()).holder_names(rec.id());
     attached_names.resolve_blocking(std::process::id());
     attached.name_lock_holders(attached_names);
@@ -284,13 +298,14 @@ fn attached_view_draws_what_the_run_drew() {
         }
         if let Some(shown) = prompt {
             let frame = draw(&attached);
+            let line = draw_line(&mut attached);
             let more = (!shown).then(|| draw_more(&mut attached));
-            checkpoints.push((shown, frame, more));
+            checkpoints.push((shown, frame, line, more));
         }
     }
     let [
-        (true, attached_prompt, None),
-        (false, attached_after, Some(attached_more)),
+        (true, attached_prompt, attached_prompt_line, None),
+        (false, attached_after, attached_after_line, Some(attached_more)),
     ] = checkpoints.as_slice()
     else {
         panic!(
@@ -324,6 +339,34 @@ fn attached_view_draws_what_the_run_drew() {
             .iter()
             .all(|r| r.chars().count() <= usize::from(NARROW)),
         "{live_narrow:#?}"
+    );
+
+    // The line: the prompt row over it while the prompt is up, the
+    // approval spotlit; then the root failure.
+    let [prompt_row, line] = live_prompt_line.as_slice() else {
+        panic!("a prompt row and the line: {live_prompt_line:#?}");
+    };
+    assert!(
+        prompt_row.contains("approval required: //a:gate"),
+        "{prompt_row}"
+    );
+    assert!(line.contains("✦ //a:gate 2 pending"), "{line}");
+    assert!(line.ends_with("tab ⇥"), "{line}");
+    let [line] = live_after_line.as_slice() else {
+        panic!("the line alone: {live_after_line:#?}");
+    };
+    assert!(
+        line.contains("1 failed") && line.contains("✗ //a:bad"),
+        "{line}"
+    );
+    let expected: Vec<String> = live_prompt_line
+        .iter()
+        .map(|r| r.replace(KEYS, ""))
+        .collect();
+    assert_eq!(attached_prompt_line, &expected, "the line, prompt shown");
+    assert_eq!(
+        attached_after_line, &live_after_line,
+        "the line, prompt cleared"
     );
 
     let id = rec.id();
