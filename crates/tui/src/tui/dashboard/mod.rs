@@ -14,6 +14,8 @@ pub mod header;
 pub mod intern;
 pub mod list;
 pub mod model;
+#[cfg(test)]
+mod tests;
 
 pub use header::{Levels, Title, header_lines};
 pub use intern::Id;

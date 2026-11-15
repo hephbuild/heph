@@ -575,3 +575,308 @@ pub fn list_lines(
     out.truncate(rows);
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use hcore::events::{BuildEvent, BuildEventKind};
+
+    use super::*;
+    use crate::tui::text::Redact;
+
+    struct NoWaits;
+
+    impl Waits for NoWaits {
+        fn wait_words(&self, _: &str, _: u64) -> Option<WaitWords> {
+            None
+        }
+    }
+
+    fn apply(m: &mut Model, kind: BuildEventKind) {
+        m.apply(
+            &BuildEvent {
+                at_unix_ms: 1_000,
+                kind,
+            },
+            &Redact::default(),
+        );
+    }
+
+    fn model(addrs: &[&str]) -> Model {
+        let mut m = Model::default();
+        for a in addrs {
+            apply(&mut m, BuildEventKind::ResultStart { addr: (*a).into() });
+        }
+        m
+    }
+
+    fn frame(m: &Model, lines: &LastLines, st: &mut ListState, cols: u16) -> Vec<String> {
+        let inp = ListInputs {
+            model: m,
+            waits: &NoWaits,
+            lines,
+            now_ms: 2_000,
+        };
+        list_lines(&inp, st, cols, 20)
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
+    }
+
+    /// The addresses a frame shows, as drawn (cut).
+    fn shown(rows: &[String]) -> Vec<String> {
+        rows.iter()
+            .skip(1)
+            .filter_map(|r| {
+                r.split_whitespace()
+                    .find(|a| a.starts_with("//") || a.starts_with('…'))
+                    .map(str::to_owned)
+            })
+            .collect()
+    }
+
+    /// Cut from the left on character boundaries, marked `…`, keeping the
+    /// `:name` while the width allows; two addresses that cut alike still
+    /// select separately.
+    #[test]
+    fn address_left_cut() {
+        let addr = "//very/long/package/path:name";
+        assert_eq!(cut_left(addr, 0), "");
+        assert_eq!(cut_left(addr, 1), "…");
+        assert_eq!(cut_left(addr, 2), "…e");
+        assert_eq!(cut_left(addr, width(addr)), addr, "exactly the width");
+        let over = cut_left(addr, width(addr) - 1);
+        assert_eq!(over, "…very/long/package/path:name", "one char over");
+        for w in ":name".len() + 1..width(addr) {
+            let cut = cut_left(addr, w);
+            assert!(cut.starts_with('…') && cut.ends_with(":name"), "{w}: {cut}");
+            assert_eq!(width(&cut), w, "{cut}");
+        }
+        for multi in ["//café/ü:näme", "//日本/語:名前", "//p:e\u{301}e\u{301}"] {
+            for w in 0..=width(multi) + 1 {
+                let cut = cut_left(multi, w);
+                assert!(width(&cut) <= w, "{multi} at {w}: {cut}");
+                assert!(
+                    multi.ends_with(cut.trim_start_matches('…')),
+                    "{multi} at {w}: {cut}"
+                );
+            }
+        }
+
+        // Two addresses that cut to the same text in a 10-column TARGET.
+        let m = model(&["//aaaa/x/same/pkg:name", "//bbbb/y/same/pkg:name"]);
+        let lines = LastLines::default();
+        let mut st = ListState::default();
+        let rows = frame(&m, &lines, &mut st, 40);
+        assert_eq!(shown(&rows), ["…/pkg:name", "…/pkg:name"], "{rows:#?}");
+        let first = st.selected().expect("a selection");
+        assert!(
+            rows.get(1).is_some_and(|r| r.starts_with(" ▸ ")),
+            "{rows:#?}"
+        );
+        st.select_move(&m, 1);
+        let second = st.selected().expect("a selection");
+        assert_ne!(first, second);
+        assert_eq!(m.addr(second), "//bbbb/y/same/pkg:name");
+        let rows = frame(&m, &lines, &mut st, 40);
+        assert!(
+            rows.get(2).is_some_and(|r| r.starts_with(" ▸ ")),
+            "{rows:#?}"
+        );
+    }
+
+    /// `/` is a literal, ASCII-case-insensitive substring; empty shows all;
+    /// a selection filtered out moves to the first match; Esc clears the
+    /// filter before it closes anything; the matches are cached per filter
+    /// string, extended as targets arrive.
+    #[test]
+    fn filter_matches_literally() {
+        let all = [
+            "//p:foo",
+            "//p:FOO_bar",
+            "//p:a.b",
+            "//p:a*b",
+            "//p:x[1]",
+            "//p:café",
+            "//q:other",
+        ];
+        let mut m = model(&all);
+        let lines = LastLines::default();
+        let mut st = ListState::default();
+        let filtered = |st: &mut ListState, m: &Model, q: &str| {
+            st.escape();
+            st.filter_start();
+            for c in q.chars() {
+                st.filter_input(c);
+            }
+            shown(&frame(m, &lines, st, 100))
+        };
+        assert_eq!(
+            filtered(&mut st, &m, "").len(),
+            all.len(),
+            "empty: every row"
+        );
+        assert_eq!(filtered(&mut st, &m, "a.b"), ["//p:a.b"], "`.` is literal");
+        assert_eq!(filtered(&mut st, &m, "*"), ["//p:a*b"]);
+        assert_eq!(filtered(&mut st, &m, "x[1"), ["//p:x[1]"]);
+        assert!(filtered(&mut st, &m, ".*[").is_empty());
+        assert_eq!(filtered(&mut st, &m, "foo"), ["//p:foo", "//p:FOO_bar"]);
+        assert_eq!(filtered(&mut st, &m, "FOO"), ["//p:foo", "//p:FOO_bar"]);
+        assert_eq!(filtered(&mut st, &m, "CAFé"), ["//p:café"], "ASCII folds");
+        assert_eq!(filtered(&mut st, &m, "é"), ["//p:café"]);
+
+        // The selected row filtered out: the selection moves to the first match.
+        filtered(&mut st, &m, "");
+        st.select_move(&m, 6);
+        assert_eq!(st.selected().map(|id| m.addr(id)), Some("//q:other"));
+        filtered(&mut st, &m, "foo");
+        assert_eq!(st.selected().map(|id| m.addr(id)), Some("//p:foo"));
+
+        // Cached per filter string: a new target is the only one scanned.
+        assert_eq!(st.cache.query, "foo");
+        assert_eq!(st.cache.scanned, all.len());
+        apply(
+            &mut m,
+            BuildEventKind::ResultStart {
+                addr: "//r:food".into(),
+            },
+        );
+        let rows = shown(&frame(&m, &lines, &mut st, 100));
+        assert_eq!(
+            rows,
+            ["//p:foo", "//p:FOO_bar", "//r:food"],
+            "queued oldest first"
+        );
+        assert_eq!(st.cache.scanned, all.len() + 1);
+
+        // Esc clears the filter first, then lets the dashboard close.
+        assert!(st.escape(), "a filter to clear");
+        assert!(st.filter().is_empty() && !st.is_editing());
+        assert!(!st.escape(), "nothing left: close");
+        assert_eq!(shown(&frame(&m, &lines, &mut st, 100)).len(), all.len() + 1);
+    }
+
+    /// Counts what the list asks of the logs.
+    #[derive(Default)]
+    struct CountingReader {
+        logs: Mutex<HashMap<String, Vec<u8>>>,
+        sizes: AtomicUsize,
+        tails: AtomicUsize,
+    }
+
+    impl CountingReader {
+        fn write(&self, addr: &str, text: &str) {
+            let mut logs = self.logs.lock().expect("logs");
+            logs.entry(addr.to_owned())
+                .or_default()
+                .extend_from_slice(text.as_bytes());
+        }
+
+        fn calls(&self) -> (usize, usize) {
+            (
+                self.sizes.load(Ordering::Relaxed),
+                self.tails.load(Ordering::Relaxed),
+            )
+        }
+    }
+
+    impl LogReader for CountingReader {
+        fn size(&self, addr: &str) -> Option<u64> {
+            self.sizes.fetch_add(1, Ordering::Relaxed);
+            let logs = self.logs.lock().expect("logs");
+            logs.get(addr).map(|l| l.len() as u64)
+        }
+
+        fn tail(&self, addr: &str, max: usize) -> Option<Vec<u8>> {
+            self.tails.fetch_add(1, Ordering::Relaxed);
+            let logs = self.logs.lock().expect("logs");
+            let log = logs.get(addr)?;
+            Some(log.get(log.len().saturating_sub(max)..)?.to_vec())
+        }
+    }
+
+    /// A frame never reads a log: the tails come from the background half,
+    /// a finished row's once, a running row's again only when it grew.
+    #[test]
+    fn frame_does_no_io() {
+        let mut m = model(&["//p:run", "//p:done"]);
+        let exec = |addr: &str| BuildEventKind::ExecuteStart {
+            output_groups: Vec::new(),
+            addr: addr.into(),
+            driver: "exec".into(),
+            cache: true,
+            declared: None,
+            reserved: None,
+            queued_ms: None,
+            admitted: None,
+        };
+        apply(&mut m, exec("//p:run"));
+        apply(&mut m, exec("//p:done"));
+        apply(
+            &mut m,
+            BuildEventKind::ExecuteEnd {
+                addr: "//p:done".into(),
+                error: None,
+            },
+        );
+        apply(
+            &mut m,
+            BuildEventKind::ResultEnd {
+                cancelled: false,
+                addr: "//p:done".into(),
+                error: None,
+                upstream_of: None,
+                exit_status: None,
+                log_tail: None,
+                timed_out: None,
+            },
+        );
+        let reader = CountingReader::default();
+        reader.write("//p:run", "Compiling a\n");
+        reader.write("//p:done", "built\nFinished ok\n\n");
+        let mut lines = LastLines::default();
+        let mut st = ListState::default();
+
+        for _ in 0..5 {
+            frame(&m, &lines, &mut st, 100);
+        }
+        assert_eq!(reader.calls(), (0, 0), "frames read nothing");
+        assert_eq!(st.visible().len(), 2);
+
+        let background = |lines: &mut LastLines, st: &ListState| {
+            let requests = lines.requests(&m, st.visible());
+            let updates = read_tails(&reader, &requests);
+            lines.apply(updates, st.visible());
+            requests.len()
+        };
+        assert_eq!(background(&mut lines, &st), 2);
+        assert_eq!(reader.calls(), (2, 2));
+        let rows = frame(&m, &lines, &mut st, 100);
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("//p:run") && r.ends_with("Compiling a")),
+            "{rows:#?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("//p:done") && r.ends_with("Finished ok")),
+            "{rows:#?}"
+        );
+
+        // The finished row is never asked for again; the running one is
+        // stat'ed, and read only once its log grew.
+        assert_eq!(background(&mut lines, &st), 1);
+        assert_eq!(reader.calls(), (3, 2), "unchanged: not read");
+        reader.write("//p:run", "Compiling b\n");
+        assert_eq!(background(&mut lines, &st), 1);
+        assert_eq!(reader.calls(), (4, 3));
+        for _ in 0..5 {
+            frame(&m, &lines, &mut st, 100);
+        }
+        assert_eq!(reader.calls(), (4, 3), "frames read nothing");
+        let rows = frame(&m, &lines, &mut st, 100);
+        assert!(rows.iter().any(|r| r.ends_with("Compiling b")), "{rows:#?}");
+    }
+}
