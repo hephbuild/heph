@@ -3,6 +3,7 @@ use crate::engine::driver::targetdef::TargetDef;
 use crate::engine::error::{CycleError, TargetFailure};
 use crate::engine::meta::ResultMeta;
 use crate::engine::provider::{State, TargetSpec};
+use crate::engine::resource_pool::sampler::PoolSampler;
 use crate::engine::result::{
     ArtifactMeta, ExtendedTargetDef, LockedResolution, OutputMatcher, ResultArtifact,
 };
@@ -373,6 +374,10 @@ pub struct RequestStateData {
     /// Guards the one-shot `RequestConfig` announcement so it fires once per request
     /// regardless of which entry point (`result` / `result_addr`) is hit first.
     pub workers_announced: std::sync::atomic::AtomicBool,
+    /// The `PoolUsage` sampler, started by this request's first admission
+    /// ([`RequestState::sample_pool`]) and finished when the request's data
+    /// drops, before the hooks close. Empty for a request that admits nothing.
+    pool_sampler: std::sync::OnceLock<Arc<PoolSampler>>,
     /// Guards the `Matched` stream so only the first/top-level `result` (or the
     /// single-addr entry in `run`) announces the matched set. Inner `result`
     /// invocations sharing this request's data must stay silent — re-emitting
@@ -959,6 +964,44 @@ impl RequestState {
         self.data.dispatch(event);
     }
 
+    /// Whether anything receives this request's events: a stream or a hook.
+    /// Event data that costs something to build is built only when it does.
+    pub fn has_listeners(&self) -> bool {
+        self.data.events.is_some() || !self.data.hooks.is_empty()
+    }
+
+    /// Start this request's `PoolUsage` sampler, once, on its first admission:
+    /// call it before the acquire, so the admission is the first change it
+    /// sends. A request nobody listens to starts none.
+    pub(crate) fn sample_pool(&self, pool: &Arc<crate::engine::resource_pool::ResourcePool>) {
+        if self.data.pool_sampler.get().is_some() || !self.has_listeners() {
+            return;
+        }
+        let mut started = false;
+        let sampler = self.data.pool_sampler.get_or_init(|| {
+            started = true;
+            PoolSampler::new(Arc::clone(pool))
+        });
+        if !started {
+            return;
+        }
+        // Weak: the ticks must not keep the request alive, or its stream
+        // would never end.
+        let data = Arc::downgrade(&self.data);
+        sampler.spawn(move |sampler| {
+            let Some(data) = data.upgrade() else {
+                return std::ops::ControlFlow::Break(());
+            };
+            for kind in sampler.sample() {
+                data.dispatch(crate::engine::event::BuildEvent {
+                    at_unix_ms: crate::engine::event::now_unix_ms(),
+                    kind,
+                });
+            }
+            std::ops::ControlFlow::Continue(())
+        });
+    }
+
     /// The shared request data, for consumers that must fan an event out
     /// themselves after `self` is no longer borrowable — notably
     /// [`emit_scope`](crate::engine::event::emit_scope)'s end-of-scope drop guard,
@@ -1160,6 +1203,16 @@ impl Drop for RequestState {
 
 impl Drop for RequestStateData {
     fn drop(&mut self) {
+        // The pool's last change since the sampler's last tick, before the
+        // stream ends: the trailing edge.
+        if let Some(sampler) = self.pool_sampler.get() {
+            for kind in sampler.finish() {
+                self.dispatch(crate::engine::event::BuildEvent {
+                    at_unix_ms: crate::engine::event::now_unix_ms(),
+                    kind,
+                });
+            }
+        }
         self.ctoken.cancel();
         // Signal end-of-stream to each hook so it can flush its final state. The
         // host awaits the actual flush separately via `Engine::await_hooks`.
@@ -1393,6 +1446,7 @@ impl Engine {
             frozen: std::sync::atomic::AtomicBool::new(false),
             codegen_reported: Mutex::new(FxHashSet::default()),
             workers_announced: std::sync::atomic::AtomicBool::new(false),
+            pool_sampler: std::sync::OnceLock::new(),
             matched_announced: std::sync::atomic::AtomicBool::new(false),
             bg_pending: Arc::clone(&bg_pending),
             failures: Mutex::new(indexmap::IndexMap::new()),

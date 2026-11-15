@@ -1011,6 +1011,8 @@ impl Engine {
         } else {
             &[]
         };
+        // Before the acquire, so the sampler counts it as the first change.
+        rs.sample_pool(pool);
         let acquire = pool
             .acquire_with(resources, implicit)
             .map_err(|err| anyhow::anyhow!("{addr} {err}"))?;

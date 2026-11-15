@@ -1243,6 +1243,9 @@ impl BuildState {
             BuildEventKind::SelectionIncomplete { .. } => {}
             // Codegen index diagnostics are log lines, not build counters.
             BuildEventKind::CodegenExcluded { .. } | BuildEventKind::CodegenImported { .. } => {}
+            // The header's gauges still sum `ExecuteStart.reserved`; nothing
+            // draws the pool's own report yet.
+            BuildEventKind::PoolUsage { .. } => {}
             // An event kind newer than this build knows about. Skipped rather
             // than fatal — see `BuildEventKind::Unknown`.
             BuildEventKind::Unknown => {}

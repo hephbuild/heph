@@ -343,6 +343,41 @@ async fn result(
         .await
 }
 
+/// [`result`] in a request with an event stream, and every event of it,
+/// through its end: the stream closes when the request's data drops.
+async fn result_with_events(
+    engine: &Arc<Engine>,
+    addr: &str,
+) -> anyhow::Result<Vec<BuildEventKind>> {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let rs = engine.new_state_with_events(false, Some(tx));
+    Arc::clone(engine)
+        .result_addr(
+            rs,
+            &parse_addr(addr)?,
+            OutputMatcher::All,
+            &ResultOptions::default(),
+        )
+        .await?;
+    let mut out = Vec::new();
+    let collect = async {
+        while let Some(ev) = rx.recv().await {
+            out.push(ev.kind);
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(60), collect)
+        .await
+        .map_err(|_elapsed| anyhow::anyhow!("the request's stream never ended"))?;
+    Ok(out)
+}
+
+fn pool_usage(events: &[BuildEventKind]) -> Vec<&BuildEventKind> {
+    events
+        .iter()
+        .filter(|e| matches!(e, BuildEventKind::PoolUsage { .. }))
+        .collect()
+}
+
 /// Every `*.log` under `<home>/runs/`.
 fn live_files(engine: &Engine) -> Vec<PathBuf> {
     let mut out = Vec::new();
@@ -471,8 +506,8 @@ fn announcing_engine(root: &Path, to: &Arc<Announced>) -> anyhow::Result<Arc<Eng
 }
 
 /// A cold run announces its live log once (addr, hashin, the file relative
-/// to the home); a warm, all-hit build writes no live file and announces no
-/// `RunLog` record.
+/// to the home); a warm, all-hit build writes no live file, announces no
+/// `RunLog` record and sends no `PoolUsage`.
 #[tokio::test]
 async fn warm_build_pays_nothing_for_logs() -> anyhow::Result<()> {
     let ws = tempfile::tempdir()?;
@@ -483,7 +518,13 @@ async fn warm_build_pays_nothing_for_logs() -> anyhow::Result<()> {
     )?;
     let cold_seen = Arc::new(Announced::default());
     let cold = announcing_engine(ws.path(), &cold_seen)?;
-    result(&cold, "//p:t", &ResultOptions::default()).await?;
+    let cold_events = result_with_events(&cold, "//p:t").await?;
+    // The run was admitted, so the pool's use was reported: the warm
+    // build's silence below is not a stream that never carries it.
+    assert!(
+        !pool_usage(&cold_events).is_empty(),
+        "a cold build reported no PoolUsage"
+    );
     let hashin = Arc::clone(&cold)
         .meta(cold.new_state(), &parse_addr("//p:t")?)
         .await?
@@ -501,7 +542,7 @@ async fn warm_build_pays_nothing_for_logs() -> anyhow::Result<()> {
     let warm_seen = Arc::new(Announced::default());
     let warm = announcing_engine(ws.path(), &warm_seen)?;
     let before = runs_entries(&warm);
-    result(&warm, "//p:t", &ResultOptions::default()).await?;
+    let warm_events = result_with_events(&warm, "//p:t").await?;
     assert!(
         warm_seen.0.lock().expect("announced").is_empty(),
         "a hit announced a RunLog record"
@@ -512,7 +553,12 @@ async fn warm_build_pays_nothing_for_logs() -> anyhow::Result<()> {
         before,
         "an all-hit build touched runs/"
     );
-    // Unit 3: the warm build emits no PoolUsage event either.
+    // It admitted nothing, so it reports no pool use either.
+    assert!(
+        pool_usage(&warm_events).is_empty(),
+        "{:?}",
+        pool_usage(&warm_events)
+    );
     Ok(())
 }
 

@@ -289,6 +289,16 @@ impl ResourcePool {
         self.main.removals.load(Ordering::Acquire)
     }
 
+    /// A counter that moves on every change to what the pool holds, who
+    /// waits, or how many removals are pending; nothing else about it means
+    /// anything. A [`snapshot`](Self::snapshot) taken after reading a value
+    /// shows every change that moved the counter up to that value (see
+    /// `Lane::generation`), so a sampler that remembers the last value it
+    /// sent knows whether there is anything new without taking the lock.
+    pub fn generation(&self) -> u64 {
+        self.main.generation.load(Ordering::Acquire)
+    }
+
     /// The request plus `implicit` as `(pool index, granted amount)` in the
     /// main lane, empty when it reserves nothing anywhere; and whether any
     /// amount was clamped.
@@ -606,6 +616,16 @@ struct Lane {
     /// Live [`PendingRemoval`]s: grants a finished run still holds until its
     /// sandbox is removed. Diagnostic only; nothing is admitted by it.
     removals: AtomicU64,
+    /// [`ResourcePool::generation`]. Bumped (`Release`) while the state lock
+    /// is held, before the change it announces ([`Lane::change`]), or after
+    /// `removals` moves. A reader that loads it (`Acquire`) and then takes
+    /// the lock is ordered after the changer's lock acquisition, so it waits
+    /// for that change to finish and sees it: no change is ever announced
+    /// before it can be observed, on a weakly ordered CPU (aarch64) as on
+    /// x86_64. A change landing between the load and the lock is seen early
+    /// and announced again on the next read: at worst one redundant sample.
+    /// Never read by admission.
+    generation: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -913,7 +933,17 @@ impl Lane {
             capacity: capacity.into_boxed_slice(),
             cpu_idx,
             removals: AtomicU64::new(0),
+            generation: AtomicU64::new(0),
         })
+    }
+
+    /// The state lock, for a call that may change what is held or who
+    /// waits: announces the change on `generation` while the lock is held.
+    /// Reads take `state.lock()` directly.
+    fn change(&self) -> parking_lot::MutexGuard<'_, State> {
+        let guard = self.state.lock();
+        self.generation.fetch_add(1, Ordering::Release);
+        guard
     }
 
     fn index(&self, pool: &str) -> Option<usize> {
@@ -946,7 +976,7 @@ impl Lane {
     /// (unbounded pools only, or nothing at all); an empty one takes no lock.
     fn grant_now(self: &Arc<Self>, need: Shape, clamped: bool) -> Reservation {
         if !need.is_empty() {
-            take(&mut self.state.lock().held, &need);
+            take(&mut self.change().held, &need);
         }
         Reservation {
             lane: Arc::clone(self),
@@ -972,7 +1002,7 @@ impl Lane {
     /// and either the head is not protected or the grant leaves the head's
     /// need.
     fn enqueue(self: &Arc<Self>, need: Vec<(usize, u64)>, clamped: bool) -> Acquire {
-        let mut guard = self.state.lock();
+        let mut guard = self.change();
         let st = &mut *guard;
         // Older classes an unfinished pass has not reached go first.
         self.pass(st);
@@ -1118,7 +1148,7 @@ impl Lane {
         if granted.is_empty() {
             return;
         }
-        let mut guard = self.state.lock();
+        let mut guard = self.change();
         let st = &mut *guard;
         give(&self.capacity, &mut st.held, granted);
         if !self.frees_bounded(granted) {
@@ -1154,7 +1184,7 @@ impl Lane {
     /// another waiter start: the next head has no debt, so it protects
     /// nothing yet.
     fn cancel(self: &Arc<Self>, seq: u64) {
-        let mut guard = self.state.lock();
+        let mut guard = self.change();
         let st = &mut *guard;
         let was_head = st.head_seq() == Some(seq);
         if st.remove(seq).is_none() {
@@ -1203,15 +1233,28 @@ impl Lane {
         let mut guard = self.state.lock();
         let st = &mut *guard;
         st.sync_head();
+        // Per pool, the waiters whose need takes some of it: one pass over
+        // the classes, not the waiters.
+        let mut waiting = vec![0u64; self.names.len()];
+        for class in st.classes.values() {
+            let n = class.waiters.len() as u64;
+            for &(idx, _) in class.need.iter() {
+                if let Some(w) = waiting.get_mut(idx) {
+                    *w = w.saturating_add(n);
+                }
+            }
+        }
         let pools = self
             .names
             .iter()
             .zip(self.capacity.iter().zip(st.held.iter()))
-            .map(|(name, (&capacity, &held))| PoolSnapshot {
+            .zip(waiting)
+            .map(|((name, (&capacity, &held)), waiting)| PoolSnapshot {
                 pool: name.clone(),
                 unit: Unit::default_for(name.as_str()),
                 capacity,
                 held,
+                waiting,
             })
             .collect();
         let head = st
@@ -1425,6 +1468,7 @@ impl Reservation {
     /// release admits never sees its own wait's cause still counted.
     pub fn into_removal(self) -> PendingRemoval {
         self.lane.removals.fetch_add(1, Ordering::AcqRel);
+        self.lane.generation.fetch_add(1, Ordering::Release);
         PendingRemoval { reservation: self }
     }
 }
@@ -1439,11 +1483,11 @@ pub struct PendingRemoval {
 
 impl Drop for PendingRemoval {
     fn drop(&mut self) {
-        // Before the field drops, which is the release.
-        self.reservation
-            .lane
-            .removals
-            .fetch_sub(1, Ordering::AcqRel);
+        // Before the field drops, which is the release (and moves the
+        // generation again, under the lock).
+        let lane = &self.reservation.lane;
+        lane.removals.fetch_sub(1, Ordering::AcqRel);
+        lane.generation.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -1586,6 +1630,8 @@ pub struct PoolSnapshot {
     pub unit: Unit,
     pub capacity: Limit,
     pub held: u64,
+    /// How many queued requests need some of this pool.
+    pub waiting: u64,
 }
 
 impl PoolSnapshot {
@@ -2143,12 +2189,15 @@ mod tests {
                     unit: Unit::Cpu,
                     capacity: Limit::Bounded(4 * CPU),
                     held: 3 * CPU,
+                    waiting: 2,
                 },
                 PoolSnapshot {
                     pool: name("memory"),
                     unit: Unit::Bytes,
                     capacity: Limit::Bounded(8 * GIB),
                     held: GIB,
+                    // The head needs memory too; the follower does not.
+                    waiting: 1,
                 },
             ]
         );
@@ -4323,3 +4372,4 @@ mod tests {
 
 #[cfg(test)]
 mod admission_replay;
+pub(crate) mod sampler;

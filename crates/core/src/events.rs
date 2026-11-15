@@ -434,6 +434,33 @@ pub enum BuildEventKind {
     AdmissionWaitEnd {
         addr: String,
     },
+    /// One bounded pool's use, as the pool itself counts it: what a gauge
+    /// draws. Sent by a per-request sampler on a 250 ms tick only when the
+    /// pool changed since its last send, and once more before the request
+    /// ends if it changed since; never from inside the pool. A request that
+    /// admits nothing (an all-hit build) sends none. A consumer keeps the
+    /// latest per `pool`.
+    ///
+    /// `held` counts every grant still outstanding, so a `sandbox` slot shows
+    /// held from its run's admission until its sandbox has been removed, not
+    /// until the run ends; summing `ExecuteStart.reserved` cannot see that.
+    /// Amounts are in the base of the pool's unit (`RequestConfig.units`).
+    /// An older consumer reads it as [`BuildEventKind::Unknown`].
+    PoolUsage {
+        pool: String,
+        /// Granted and not yet returned.
+        #[serde(default)]
+        held: u64,
+        #[serde(default)]
+        capacity: u64,
+        /// Queued requests that need some of this pool.
+        #[serde(default)]
+        waiting: u64,
+        /// Finished runs whose sandbox removal has not returned, each holding
+        /// one `sandbox` slot: set on the `sandbox` pool only, 0 elsewhere.
+        #[serde(default)]
+        removals_pending: u64,
+    },
     /// Acquiring a scratch slot has been blocked past the notice threshold.
     ///
     /// Deliberately *not* folded into `ResultLockWait*`, because the two name
@@ -1709,6 +1736,81 @@ mod tests {
             }
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    /// `PoolUsage` round-trips, a frame missing its later fields decodes,
+    /// and a consumer built before it skips it as `Unknown` and reads on.
+    #[test]
+    fn pool_usage_round_trips_and_old_decoders_see_unknown() {
+        let ev = BuildEvent {
+            at_unix_ms: 4,
+            kind: BuildEventKind::PoolUsage {
+                pool: "sandbox".into(),
+                held: 9,
+                capacity: 48,
+                waiting: 2,
+                removals_pending: 3,
+            },
+        };
+        let json = serde_json::to_string(&ev).expect("encode");
+        let back: BuildEvent = serde_json::from_str(&json).expect("decode");
+        assert!(
+            matches!(
+                back.kind,
+                BuildEventKind::PoolUsage {
+                    ref pool,
+                    held: 9,
+                    capacity: 48,
+                    waiting: 2,
+                    removals_pending: 3,
+                } if pool == "sandbox"
+            ),
+            "{back:?}"
+        );
+        let sparse = r#"{"at_unix_ms":1,"kind":{"type":"PoolUsage","pool":"cpu"}}"#;
+        let ev: BuildEvent = serde_json::from_str(sparse).expect("sparse frame decodes");
+        assert!(matches!(
+            ev.kind,
+            BuildEventKind::PoolUsage {
+                held: 0,
+                waiting: 0,
+                ..
+            }
+        ));
+
+        #[derive(serde::Deserialize)]
+        struct OldEvent {
+            kind: OldKind,
+        }
+        #[derive(serde::Deserialize, Debug)]
+        #[serde(tag = "type")]
+        enum OldKind {
+            ResultStart {
+                #[expect(dead_code, reason = "decoded only to prove the shape")]
+                addr: String,
+            },
+            #[serde(other)]
+            Unknown,
+        }
+        let stream = [
+            json,
+            r#"{"at_unix_ms":5,"kind":{"type":"ResultStart","addr":"//a:x"}}"#.into(),
+        ];
+        let old: Vec<OldKind> = stream
+            .iter()
+            .map(|l| {
+                serde_json::from_str::<OldEvent>(l)
+                    .expect("old decoder")
+                    .kind
+            })
+            .collect();
+        assert!(
+            matches!(
+                old.as_slice(),
+                [OldKind::Unknown, OldKind::ResultStart { .. }]
+            ),
+            "{old:?}"
+        );
     }
 
     /// `SelectionIncomplete` survives the wire, and a consumer built before it
