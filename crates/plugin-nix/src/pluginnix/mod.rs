@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use hcore::hasync::Cancellable;
 use hcore::htvalue::signature::ParamType;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
+use hdriver_support::run_log::{RunLog, Streams};
 use hexecrunner::RunnerRef;
 use hmodel::htpkg::PkgBuf;
 use hplugin::driver::targetdef::path::{CodegenMode, Content, Path as TPath};
@@ -11,6 +12,7 @@ use hplugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
     ParseResponse, TargetAddr,
 };
+use hplugin::error::ProcessFailed;
 use hplugin::htspec::Spec;
 use hproc::proc_exec;
 use std::ffi::OsString;
@@ -139,12 +141,44 @@ fn passthrough_nix_env() -> Vec<(OsString, OsString)> {
     out
 }
 
+/// Run one `nix` invocation and return its output whole.
+///
+/// Under `log_capture` (`log` is `Some`) nix's stderr — fetching, evaluation
+/// and build progress — reaches the run's log as nix writes it. Its stdout is
+/// nix's answer (flake metadata, a store path): data, never the log, on either
+/// host. An older host keeps no log, as before: the output is captured whole.
+async fn run_nix(
+    spec: proc_exec::Spec,
+    log: Option<&mut RunLog<'_>>,
+    ctoken: &(dyn Cancellable + Send + Sync),
+) -> anyhow::Result<std::process::Output> {
+    match log {
+        Some(log) => {
+            log.output(RunnerRef::local(), spec, Streams::STDERR, ctoken)
+                .await
+        }
+        None => hexecrunner::output(RunnerRef::local(), spec, ctoken).await,
+    }
+}
+
+/// A nix invocation that exited non-zero. Under `log_capture` its stderr is
+/// already in the run's log, so the error is the exit status with no path; an
+/// older host gets nix's stderr in the message, as before.
+fn nix_failed(output: &std::process::Output, captured: bool, what: String) -> anyhow::Error {
+    if captured {
+        return anyhow::Error::new(ProcessFailed::from_status(output.status)).context(what);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    anyhow::anyhow!("{what}: {stderr}")
+}
+
 /// Resolve a (possibly mutable) flake URL to its locked form via
 /// `nix flake metadata --json`. Output `.url` is the immutable URL containing
 /// the resolved rev / narHash, suitable for `getFlake` in pure-eval mode.
 async fn lock_flake_url(
     nix_bin: &str,
     url: &str,
+    log: Option<&mut RunLog<'_>>,
     ctoken: &(dyn Cancellable + Send + Sync),
 ) -> anyhow::Result<String> {
     let args: Vec<OsString> = [
@@ -175,12 +209,16 @@ async fn lock_flake_url(
         ctty: false,
     };
 
-    let output = hexecrunner::output(RunnerRef::local(), spec, ctoken)
+    let captured = log.is_some();
+    let output = run_nix(spec, log, ctoken)
         .await
         .context("wait for nix flake metadata")?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("nix flake metadata failed for {url}: {stderr}");
+        return Err(nix_failed(
+            &output,
+            captured,
+            format!("nix flake metadata failed for {url}"),
+        ));
     }
     let v: serde_json::Value =
         serde_json::from_slice(&output.stdout).context("parse nix flake metadata json")?;
@@ -341,11 +379,17 @@ impl ManagedDriver for Driver {
 
     async fn run<'a, 'io>(
         &self,
-        req: ManagedRunRequest<'a, 'io>,
+        mut req: ManagedRunRequest<'a, 'io>,
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ManagedRunResponse> {
         let def = req.request.target.def::<NixDef>();
         let addr_str = req.request.target.addr.format();
+        // Under `log_capture` the request's writers are the run's log. An older
+        // host gets no log from this driver, as before.
+        let mut log = req
+            .request
+            .log_capture
+            .then(|| RunLog::from_request(&mut req.request, "log.txt"));
 
         // Resolve nix binary from the staged tool input list.
         let nix_bin = {
@@ -387,7 +431,7 @@ impl ManagedDriver for Driver {
         // eval cache (the single biggest avoidable eval cost — jvns).
         // `nix flake metadata --json <url>` resolves to an immutable URL
         // (containing rev / narHash) which `getFlake` accepts in pure mode.
-        let locked_flake_url = lock_flake_url(&nix_bin, &def.nixpkgs, ctoken)
+        let locked_flake_url = lock_flake_url(&nix_bin, &def.nixpkgs, log.as_mut(), ctoken)
             .await
             .with_context(|| format!("lock flake url {}", def.nixpkgs))?;
 
@@ -423,13 +467,16 @@ impl ManagedDriver for Driver {
             ctty: false,
         };
 
-        let output = hexecrunner::output(RunnerRef::local(), spec, ctoken)
+        let output = run_nix(spec, log.as_mut(), ctoken)
             .await
             .with_context(|| format!("wait for nix build for {addr_str}"))?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("nix build failed for {addr_str}: {stderr}");
+            return Err(nix_failed(
+                &output,
+                log.is_some(),
+                format!("nix build failed for {addr_str}"),
+            ));
         }
 
         let store_path = std::str::from_utf8(&output.stdout)
@@ -806,5 +853,216 @@ mod tests {
         require_nix!();
         assert_eq!(sanitize_env_name("//pkg/sub:tool"), "heph-__pkg_sub_tool");
         assert_eq!(sanitize_env_name("a-b_c.d"), "heph-a-b_c.d");
+    }
+}
+
+/// Where nix's output goes: its stderr is the run's log, its stdout (flake
+/// metadata, a store path) is data and never the log.
+#[cfg(test)]
+mod log_tests {
+    use super::*;
+    use hcore::hasync::StdCancellationToken;
+    use hcore::htvalue::Value;
+    use hdriver_support::driver_managed::ManagedRunInput;
+    use hmodel::htaddr::parse_addr;
+    use hplugin::driver::{RunInput, RunRequest, inputartifact, outputartifact};
+    use hplugin::provider::TargetSpec;
+    use std::collections::HashMap;
+
+    const STORE_TOKEN: &str = "STORE-PATH-MARKER";
+
+    /// A stand-in `nix` (shell script) plus a fake store path holding `rg`.
+    struct Fake {
+        dir: tempfile::TempDir,
+        nix: PathBuf,
+        store: PathBuf,
+    }
+
+    impl Fake {
+        /// The build prints a progress line, then the store path — or, when
+        /// `build_fails`, an error line and exits 1.
+        fn new(build_fails: bool) -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let store = dir.path().join(format!("{STORE_TOKEN}-env"));
+            std::fs::create_dir_all(store.join("bin")).expect("mkdir store");
+            std::fs::write(store.join("bin/rg"), b"").expect("write rg");
+            let build = if build_fails {
+                "echo 'error: builder for env failed' >&2; exit 1".to_string()
+            } else {
+                format!("echo '{}'", store.display())
+            };
+            let nix = dir.path().join("nix");
+            std::fs::write(
+                &nix,
+                format!(
+                    "#!/bin/sh\ncase \"$*\" in\n\
+                     *'flake metadata'*) echo 'fetching flake' >&2; \
+                     echo '{{\"url\":\"github:o/r/{STORE_TOKEN}-locked\"}}' ;;\n\
+                     *build*) echo 'building env' >&2; {build} ;;\n\
+                     esac\n"
+                ),
+            )
+            .expect("write nix");
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&nix, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+            Self { dir, nix, store }
+        }
+
+        fn sandbox(&self) -> PathBuf {
+            self.dir.path().join("sandbox")
+        }
+    }
+
+    async fn target_def() -> TargetDef {
+        let config = HashMap::from([
+            (
+                "nixpkgs".to_string(),
+                Value::String("github:o/r/main".to_string()),
+            ),
+            (
+                "packages".to_string(),
+                Value::List(vec![Value::String("pkgs.ripgrep".to_string())]),
+            ),
+            (
+                "programs".to_string(),
+                Value::List(vec![Value::String("rg".to_string())]),
+            ),
+        ]);
+        let req = ParseRequest {
+            request_id: "test".to_string(),
+            target_spec: Arc::new(TargetSpec {
+                addr: parse_addr("//pkg:t").expect("addr"),
+                driver: DRIVER_NAME.to_string(),
+                config,
+                ..Default::default()
+            }),
+        };
+        Driver::new(PathBuf::from("/nonexistent"))
+            .parse(req, &StdCancellationToken::new())
+            .await
+            .expect("parse")
+            .target_def
+    }
+
+    /// Run the driver against `fake`; returns the result and what reached the
+    /// request's stdout and stderr writers.
+    async fn run(
+        fake: &Fake,
+        log_capture: bool,
+    ) -> (anyhow::Result<ManagedRunResponse>, String, String) {
+        let def = target_def().await;
+        let id = "test".to_string();
+        let sandbox = fake.sandbox();
+        let pkg = sandbox.join("ws/pkg");
+        std::fs::create_dir_all(&pkg).expect("mkdir pkg");
+        let list = sandbox.join("nix.list");
+        std::fs::write(&list, format!("{}\n", fake.nix.display())).expect("write list");
+        let (mut out, mut err) = (Vec::<u8>::new(), Vec::<u8>::new());
+        let mut request = RunRequest::new(&id, &def, &sandbox);
+        request.log_capture = log_capture;
+        request.stdout = Some(&mut out);
+        request.stderr = Some(&mut err);
+        let req = ManagedRunRequest {
+            request,
+            sandbox_dir: sandbox.clone(),
+            sandbox_ws_dir: sandbox.join("ws"),
+            sandbox_pkg_dir: pkg,
+            inputs: vec![ManagedRunInput {
+                input: RunInput {
+                    artifact: inputartifact::InputArtifact {
+                        r#type: inputartifact::Type::Dep,
+                        origin_id: "nix".to_string(),
+                        content: Arc::new(outputartifact::OutputArtifact {
+                            group: String::new(),
+                            name: String::new(),
+                            r#type: outputartifact::Type::Output,
+                            content: outputartifact::Content::Raw(outputartifact::ContentRaw {
+                                data: vec![],
+                                path: String::new(),
+                                x: false,
+                            }),
+                            hashout: "test".to_string(),
+                        }),
+                    },
+                    origin_id: "nix".to_string(),
+                    source_addr: parse_addr("//@heph/bin:nix").expect("addr"),
+                    filters: vec![],
+                    annotations: std::collections::BTreeMap::new(),
+                },
+                list_path: Some(list),
+                unpack_root: sandbox.join("ws"),
+            }],
+        };
+        let home = fake.dir.path().join("home");
+        let res = Driver::new(home)
+            .run(req, &StdCancellationToken::new())
+            .await;
+        (
+            res,
+            String::from_utf8_lossy(&out).into_owned(),
+            String::from_utf8_lossy(&err).into_owned(),
+        )
+    }
+
+    /// Under `log_capture` the flake lock's and the build's progress reach the
+    /// log; the flake metadata and the store path (stdout) never do, and the
+    /// driver still builds from them.
+    #[tokio::test]
+    async fn nix_progress_reaches_the_log_and_its_answers_never_do() {
+        let fake = Fake::new(false);
+        let (res, out, err) = run(&fake, true).await;
+        let res = res.expect("run");
+        assert!(res.artifacts.is_empty(), "no Log artifact crosses");
+        assert_eq!(err, "fetching flake\nbuilding env\n");
+        assert_eq!(out, "", "nix's stdout is data, never the log");
+        assert!(!err.contains(STORE_TOKEN), "{err}");
+        let wrapper = std::fs::read_to_string(fake.sandbox().join("ws/pkg/bin/rg"))
+            .expect("the wrapper is built from the store path");
+        assert!(
+            wrapper.contains(&fake.store.display().to_string()),
+            "{wrapper}"
+        );
+        assert!(!fake.sandbox().join("log.txt").exists());
+    }
+
+    /// A failed build under `log_capture`: nix's stderr is in the log, and the
+    /// error is the exit status, naming no log path and not repeating it. An
+    /// older host keeps today's error, with stderr in the message, and its
+    /// writers see nothing.
+    #[tokio::test]
+    async fn a_failed_build_is_logged_under_log_capture_and_unchanged_without() {
+        let fake = Fake::new(true);
+        let (res, out, err) = run(&fake, true).await;
+        let Err(e) = res else {
+            panic!("the build fails")
+        };
+        assert!(
+            e.chain()
+                .any(|c| c.downcast_ref::<ProcessFailed>().is_some()),
+            "{e:#}"
+        );
+        assert!(hplugin::error::failure_log(&e).is_none(), "{e:#}");
+        let msg = format!("{e:#}");
+        assert!(msg.contains("nix build failed for //pkg:t"), "{msg}");
+        assert!(!msg.contains("builder for env failed"), "{msg}");
+        assert_eq!(
+            err,
+            "fetching flake\nbuilding env\nerror: builder for env failed\n"
+        );
+        assert_eq!(out, "");
+
+        let (res, out, err) = run(&fake, false).await;
+        let Err(e) = res else {
+            panic!("the build fails")
+        };
+        let msg = format!("{e:#}");
+        assert!(
+            msg.contains(
+                "nix build failed for //pkg:t: building env\nerror: builder for env failed"
+            ),
+            "{msg}"
+        );
+        assert_eq!((out.as_str(), err.as_str()), ("", ""));
+        assert!(!fake.sandbox().join("log.txt").exists());
     }
 }
