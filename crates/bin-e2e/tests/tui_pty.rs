@@ -410,6 +410,7 @@ const TARGET_OUT: &str = "tty-target-out";
 /// (ignoring the INT and TERM a stop sends, so the hard abort has something to
 /// abort), and `//pkg:ok`, the named target, holds the terminal for a second —
 /// so every run here also pauses the TUI for a target and resumes it.
+/// `//pkg:bad` fails, once the gate is open.
 fn gated_build(gate: &std::path::Path) -> String {
     format!(
         concat!(
@@ -417,6 +418,8 @@ fn gated_build(gate: &std::path::Path) -> String {
             " run = [\"trap '' INT TERM\", \"while [ ! -e {gate} ]; do sleep 0.1; done\"])\n",
             "target(name = \"ok\", driver = \"bash\", cache = False,",
             " run = [\"echo {out}\", \"sleep 1\"], deps = {{\"gate\": [\"//pkg:gate\"]}})\n",
+            "target(name = \"bad\", driver = \"bash\", cache = False,",
+            " run = [\"exit 3\"], deps = {{\"gate\": [\"//pkg:gate\"]}})\n",
         ),
         gate = gate.display(),
         out = TARGET_OUT,
@@ -434,12 +437,17 @@ impl Gated {
     /// `prelude` runs in the shell first (output above the line), then
     /// `heph run //pkg:ok` replaces it.
     fn start(prelude: &str, env: &[(&str, &str)]) -> Self {
+        Self::start_run(prelude, env, "//pkg:ok")
+    }
+
+    /// [`Self::start`], running `heph run <run_args>` (shell words) instead.
+    fn start_run(prelude: &str, env: &[(&str, &str)], run_args: &str) -> Self {
         let dist = Dist::locate();
         let ws = common::Workspace::new().expect("workspace");
         let gate = ws.root().join("gate-open");
         ws.write("pkg/BUILD", &gated_build(&gate))
             .expect("write BUILD");
-        let script = format!("{prelude}exec \"$HEPH\" run //pkg:ok");
+        let script = format!("{prelude}exec \"$HEPH\" run {run_args}");
         let pty = common::pty::Pty::script_at_cursor(&dist, ws.root(), &script, env);
         Self { pty, gate, _ws: ws }
     }
@@ -746,6 +754,378 @@ fn finish_while_dashboard_open_holds() {
     assert!(
         screen.contains(TARGET_OUT),
         "the target's output did not stay on the main screen\n{screen}"
+    );
+}
+
+/// The hint row while one ctrl-c has armed the stop on a full screen
+/// (`tui::stop_arm::ARMED_PROMPT`; this crate links no workspace crate).
+const ARMED_PROMPT: &str = "ctrl-c again to stop the build";
+const DOWN: &[u8] = b"\x1b[B";
+
+/// A full screen whose hint row asks for the second press.
+fn armed(s: &vt100::Screen) -> bool {
+    s.alternate_screen() && count_rows(s, ARMED_PROMPT) == 1
+}
+
+/// The finished line, held by `--dashboard` until q.
+fn on_held_line(s: &vt100::Screen) -> bool {
+    on_line_once(s) && count_rows(s, "q to quit") == 1
+}
+
+/// Each case on its own terminal, all at once, so a failing case is named
+/// (its panic message is printed above) rather than only the first. The
+/// result of each, by name.
+fn each_case<C: Sync, R: Send>(cases: &[C], name: fn(&C) -> &str, run: fn(&C) -> R) -> Vec<R> {
+    let results: Vec<Result<R, &str>> = std::thread::scope(|s| {
+        let handles: Vec<_> = cases
+            .iter()
+            .map(|case| (name(case), s.spawn(move || run(case))))
+            .collect();
+        handles
+            .into_iter()
+            // The panic's message was printed as it happened.
+            .map(|(name, h)| h.join().map_err(|_panic| name))
+            .collect()
+    });
+    let failed: Vec<&str> = results
+        .iter()
+        .filter_map(|r| r.as_ref().err().copied())
+        .collect();
+    assert!(failed.is_empty(), "failed: {failed:?}");
+    results.into_iter().filter_map(Result::ok).collect()
+}
+
+/// Ctrl-c on a full screen takes two presses: the first only arms the stop
+/// (the hint row asks for the second, and the build keeps running), the
+/// second within 3 s stops it with the exit code one press on the line
+/// gives. Another key, or the window lapsing, disarms; a finished build
+/// leaves on one press; `kill -INT` stops at once on either screen. The
+/// terminal is restored every time.
+///
+/// Not here yet: attached (`session attach`), one press detaches and the
+/// owner keeps building. It comes with attach on the new screens (unit 5d-3).
+#[test]
+fn ctrl_c_twice_on_full_screens() {
+    struct Case {
+        name: &'static str,
+        /// Played first; heph must still be running after them.
+        steps: &'static [Step<'static>],
+        /// Then a SIGINT to heph's pid.
+        interrupt: bool,
+        /// Then these, to the end.
+        rest: &'static [Step<'static>],
+        /// Whether the build was stopped (else it finished: code 0).
+        stops: bool,
+    }
+    const OPEN: Step<'static> = Step::Keys(TAB);
+    const STOPPED: &[Step<'static>] = &[Step::Settle, Step::Settle, Step::OpenGate];
+    const FINISH: &[Step<'static>] = &[
+        Step::OpenGate,
+        Step::Until("the finished dashboard", on_finished_dashboard),
+        Step::Keys(b"q"),
+    ];
+    let cases = [
+        Case {
+            name: "dashboard: the first press arms, the second stops",
+            steps: &[
+                Step::Until("the line", on_line),
+                OPEN,
+                Step::Until("the dashboard", on_dashboard),
+                Step::Keys(CTRL_C),
+                Step::Until("the prompt", armed),
+                Step::Settle,
+                Step::Until("the prompt, still", armed),
+            ],
+            interrupt: false,
+            rest: &[
+                Step::Keys(CTRL_C),
+                Step::Settle,
+                Step::Settle,
+                Step::OpenGate,
+            ],
+            stops: true,
+        },
+        Case {
+            name: "line: one press stops",
+            steps: &[Step::Until("the line", on_line)],
+            interrupt: false,
+            rest: &[
+                Step::Keys(CTRL_C),
+                Step::Settle,
+                Step::Settle,
+                Step::OpenGate,
+            ],
+            stops: true,
+        },
+        Case {
+            name: "another key disarms",
+            steps: &[
+                Step::Until("the line", on_line),
+                OPEN,
+                Step::Until("the dashboard", on_dashboard),
+                Step::Keys(CTRL_C),
+                Step::Until("the prompt", armed),
+                Step::Keys(DOWN),
+                Step::Until("the prompt gone", on_dashboard),
+                Step::Keys(CTRL_C),
+                Step::Until("the prompt again", armed),
+            ],
+            interrupt: false,
+            rest: FINISH,
+            stops: false,
+        },
+        Case {
+            name: "the window lapses",
+            steps: &[
+                Step::Until("the line", on_line),
+                OPEN,
+                Step::Until("the dashboard", on_dashboard),
+                Step::Keys(CTRL_C),
+                Step::Until("the prompt", armed),
+                Step::Until("the prompt gone after 3 s", on_dashboard),
+                Step::Keys(CTRL_C),
+                Step::Until("the prompt again", armed),
+            ],
+            interrupt: false,
+            rest: FINISH,
+            stops: false,
+        },
+        Case {
+            name: "finished: one press leaves",
+            steps: &[
+                Step::Until("the line", on_line),
+                OPEN,
+                Step::Until("the dashboard", on_dashboard),
+                Step::OpenGate,
+                Step::Until("the finished dashboard", on_finished_dashboard),
+            ],
+            interrupt: false,
+            rest: &[Step::Keys(CTRL_C)],
+            stops: false,
+        },
+        Case {
+            name: "kill -INT on the dashboard",
+            steps: &[
+                Step::Until("the line", on_line),
+                OPEN,
+                Step::Until("the dashboard", on_dashboard),
+            ],
+            interrupt: true,
+            rest: STOPPED,
+            stops: true,
+        },
+        Case {
+            name: "kill -INT on the line",
+            steps: &[Step::Until("the line", on_line)],
+            interrupt: true,
+            rest: STOPPED,
+            stops: true,
+        },
+    ];
+    let run = |case: &Case| -> Option<u32> {
+        let mut g = Gated::start("", &[]);
+        g.play(case.steps);
+        assert!(
+            common::alive(g.pty.pid()),
+            "{}: heph exited before the stop\n{}",
+            case.name,
+            g.pty.seen()
+        );
+        if case.interrupt {
+            common::signal(g.pty.pid(), libc::SIGINT);
+        }
+        g.play(case.rest);
+        let ended = g.exit();
+        assert_restored(&g.pty, case.name);
+        let common::pty::Ended::Code(code) = ended else {
+            panic!("{}: {ended:?}\n{}", case.name, g.pty.seen());
+        };
+        if case.stops {
+            assert_ne!(
+                code,
+                0,
+                "{}: the build was not stopped\n{}",
+                case.name,
+                g.pty.seen()
+            );
+            Some(code)
+        } else {
+            assert_eq!(code, 0, "{}: exit status\n{}", case.name, g.pty.seen());
+            None
+        }
+    };
+    let codes: Vec<(&str, u32)> = each_case(&cases, |c| c.name, run)
+        .into_iter()
+        .zip(&cases)
+        .filter_map(|(code, case)| Some((case.name, code?)))
+        .collect();
+    assert!(
+        codes.windows(2).all(|w| w[0].1 == w[1].1),
+        "every stop ends with the same code: {codes:?}"
+    );
+}
+
+/// `--dashboard`: the alternate screen is up on the first frame, and the
+/// finished build holds until q — on the dashboard, and on the line Esc
+/// steps back to (mid-run or after the end) — then exits with the build's
+/// code.
+#[test]
+fn dashboard_flag_opens_and_holds() {
+    struct Case {
+        name: &'static str,
+        target: &'static str,
+        /// From the first frame to the held screen.
+        steps: &'static [Step<'static>],
+        /// The held screen.
+        held: fn(&vt100::Screen) -> bool,
+    }
+    let cases = [
+        Case {
+            name: "held on the dashboard",
+            target: "//pkg:ok",
+            steps: &[
+                Step::OpenGate,
+                Step::Until("the main screen, for the target", paused_for_target),
+            ],
+            held: on_finished_dashboard,
+        },
+        Case {
+            name: "esc mid-run: held on the line",
+            target: "//pkg:ok",
+            steps: &[
+                Step::Keys(ESC),
+                Step::Until("the line", on_line_once),
+                Step::OpenGate,
+            ],
+            held: on_held_line,
+        },
+        Case {
+            name: "esc after the end: held on the line",
+            target: "//pkg:ok",
+            steps: &[
+                Step::OpenGate,
+                Step::Until("the finished dashboard", on_finished_dashboard),
+                Step::Keys(ESC),
+            ],
+            held: on_held_line,
+        },
+        Case {
+            name: "a failed build, held on the dashboard",
+            target: "//pkg:bad",
+            steps: &[Step::OpenGate],
+            held: on_finished_dashboard,
+        },
+    ];
+    let run = |case: &Case| {
+        let mut g = Gated::start_run("", &[], &format!("-D {}", case.target));
+        g.play(&[Step::Until("the dashboard", on_dashboard)]);
+        g.play(case.steps);
+        g.pty.wait_screen("the held screen", DEADLINE, case.held);
+        // Held: still up, and heph still running, well after the build ended.
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            common::alive(g.pty.pid()),
+            "{}: heph exited without q\n{}",
+            case.name,
+            g.pty.seen()
+        );
+        assert!(
+            g.pty.with_screen(case.held),
+            "{}: the held screen went\n{}",
+            case.name,
+            g.pty.screen()
+        );
+        g.pty.send(b"q");
+        let ended = g.exit();
+        assert_restored(&g.pty, case.name);
+        // The first frame was the dashboard's: the alternate screen went up
+        // before anything drew a done count.
+        let out = g.pty.output();
+        let alt = first_index(&out, b"\x1b[?1049h");
+        let done = first_index(&out, b" done");
+        assert!(
+            matches!((alt, done), (Some(a), Some(d)) if a < d),
+            "{}: a done count was drawn before the dashboard went up\n{}",
+            case.name,
+            g.pty.seen()
+        );
+        (case.target, ended)
+    };
+    let ended = each_case(&cases, |c| c.name, run);
+    // The build's code, however long it was held: what the same build exits
+    // with, without a terminal or -D.
+    let dist = Dist::locate();
+    for (target, code) in ended {
+        let ws = common::Workspace::new().expect("workspace");
+        let gate = ws.root().join("gate-open");
+        ws.write("pkg/BUILD", &gated_build(&gate))
+            .expect("write BUILD");
+        std::fs::write(&gate, b"").expect("open the gate");
+        let out = ws.run(&dist, &["run", target]).expect("plain run");
+        let plain = out.status.code().expect("an exit code");
+        assert_eq!(
+            code,
+            common::pty::Ended::Code(u32::try_from(plain).expect("a code")),
+            "{target}: held exit differs from the build's\n{}",
+            common::describe(&out)
+        );
+    }
+}
+
+/// `-D` without a terminal: one warning, then the plain output it would have
+/// shown anyway, no wait for q, and the build's own exit code.
+#[test]
+fn dashboard_flag_without_tty() {
+    const WARNING: &str = "--dashboard needs an interactive terminal";
+    let dist = Dist::locate();
+    let ws = common::Workspace::new().expect("workspace");
+    ws.write(
+        "pkg/BUILD",
+        concat!(
+            "target(name = \"ok\", driver = \"bash\", run = \"echo plain-ok\", cache = False)\n",
+            "target(name = \"bad\", driver = \"bash\", run = \"exit 3\", cache = False)\n",
+        ),
+    )
+    .expect("write BUILD");
+    for target in ["//pkg:ok", "//pkg:bad"] {
+        // Both streams piped; stdin is /dev/null, so a wait for q would hang
+        // until the run deadline kills it.
+        let plain = ws.run(&dist, &["run", target]).expect("plain run");
+        let flagged = ws.run(&dist, &["run", "-D", target]).expect("-D run");
+        assert_eq!(
+            flagged.status.code(),
+            plain.status.code(),
+            "{target}: exit code\n{}",
+            common::describe(&flagged)
+        );
+        let stderr = String::from_utf8_lossy(&flagged.stderr);
+        assert_eq!(
+            stderr.matches(WARNING).count(),
+            1,
+            "{target}: the warning, once\n{stderr}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&plain.stderr).contains(WARNING),
+            "{target}: warned without -D"
+        );
+        assert_eq!(flagged.stdout, plain.stdout, "{target}: stdout");
+    }
+    // Stderr a terminal, stdout a pipe: still no TUI, so still the warning,
+    // and no alternate screen.
+    let session = run_in_pty_piped(&dist, ws.root(), &["run", "-D", "//pkg:ok"]);
+    assert!(session.status_success, "{}", session.report());
+    assert!(
+        !contains(&session.raw, b"\x1b[?1049h"),
+        "a piped stdout still opened the dashboard\n{}",
+        session.report()
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&session.raw)
+            .matches(WARNING)
+            .count(),
+        1,
+        "the warning, once\n{}",
+        session.report()
     );
 }
 
@@ -1153,4 +1533,8 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 
 fn last_index(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).rposition(|w| w == needle)
+}
+
+fn first_index(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
 }

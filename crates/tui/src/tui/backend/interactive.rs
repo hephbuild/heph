@@ -347,14 +347,17 @@ pub async fn run<A: App + 'static>(
         // App finished and the background queue is empty — decide whether to exit.
         if let Some(r) = app_result.take() {
             if bg_drained(&bg_pending) {
+                // A stop under way (a ctrl-c that stopped, or a signal: INT,
+                // TERM, HUP) is never held: it ends the run on any screen.
+                let stopping = shutdown.fired();
                 if held {
                     // Held open after finish — exit on an explicit quit, or
                     // once the user has closed the dashboard back to the line.
-                    if quit || !view.hold_after_finish() {
+                    if quit || stopping || !view.hold_after_finish() {
                         break r;
                     }
                     app_result = Some(r);
-                } else if view.hold_after_finish() {
+                } else if view.hold_after_finish() && !stopping {
                     // User navigated off the main view: hold the viewport up and
                     // surface a "press q to quit" notice instead of auto-exiting.
                     held = true;
