@@ -237,7 +237,8 @@ pub enum SessionRecordKind {
     /// terminal printed below that summary.
     Finished,
     /// Text the process wrote straight to its terminal rather than through
-    /// the log: the rendered failure report. Stored verbatim, like `Log`.
+    /// the log: the rendered failure report. Stored verbatim, like `Log`, up
+    /// to its first 1 MiB; past that, cut with a marker line.
     Output {
         #[serde(default)]
         text: String,

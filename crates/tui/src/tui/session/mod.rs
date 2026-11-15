@@ -475,7 +475,9 @@ impl SessionSlot {
 
     /// Record text the process just wrote straight to its terminal (the
     /// failure report), so an attached viewer prints it too. One channel push;
-    /// nothing when no session is open or its recording stopped.
+    /// nothing when no session is open or its recording stopped. Cut to
+    /// [`OUTPUT_CAP`] bytes with a marker: `Output` is written past the event
+    /// log's cap, so this keeps that overshoot bounded.
     pub fn record_output(&self, text: &str) {
         if text.is_empty() {
             return;
@@ -486,7 +488,7 @@ impl SessionSlot {
             tap.view(
                 hcore::events::now_unix_ms(),
                 SessionRecordKind::Output {
-                    text: text.to_owned(),
+                    text: capped_output(text),
                 },
             );
         }
@@ -507,6 +509,32 @@ impl SessionSlot {
             session.finish(None, true);
         }
     }
+}
+
+/// The most bytes of text one `Output` record keeps. A failure report is
+/// written past the event log's cap (it is what a viewer needs at the end),
+/// so without this a huge report would make the cap no bound at all.
+pub(crate) const OUTPUT_CAP: usize = 1024 * 1024;
+
+/// `text` cut to its first [`OUTPUT_CAP`] bytes (at a character boundary),
+/// with a line saying how much was left out.
+fn capped_output(text: &str) -> String {
+    if text.len() <= OUTPUT_CAP {
+        return text.to_owned();
+    }
+    let kept = text
+        .get(..text.floor_char_boundary(OUTPUT_CAP))
+        .unwrap_or_default();
+    let mut out = String::with_capacity(kept.len() + 96);
+    out.push_str(kept);
+    if !kept.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "[session: output cut at 1 MiB; {} more bytes were printed but not recorded]\n",
+        text.len() - kept.len()
+    ));
+    out
 }
 
 /// Finishes the slot's session as panicked if dropped while unwinding.

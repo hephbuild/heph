@@ -153,7 +153,8 @@ so `attach` draws it (see [Attach](#attach)):
 - `Finished`: the TUI was torn down; `at_unix_ms` is the instant its final
   summary was measured against.
 - `Output {text}`: text the process wrote straight to its terminal, today the
-  failure report printed after the teardown.
+  failure report printed after the teardown; its first 1 MiB, with a marker
+  line when it was cut.
 
 All four were added without a format bump: a heph from before them decodes
 each as `Unknown` and skips it. A reader skips and counts a complete line that does not decode and
@@ -293,7 +294,10 @@ included. The recorder is its own OS thread behind an unbounded channel:
 - `events.ndjson` stops at **64 MiB** with a `Truncated` record; `status.json`
   keeps updating. Past it, only what a viewer needs at the end is appended:
   `End`, `InflightWritten`, `Finished`, the failure report (`Output`), a
-  `Label` change, and an `Approval` that clears the prompt.
+  `Label` change, and an `Approval` that clears the prompt. An `Output`
+  record keeps at most the first 1 MiB of its text, then a line saying how
+  many bytes were left out, so the report a process prints (at most twice)
+  overshoots the cap by a bounded amount.
 
 What a run loses: a process wedged before its first flush loses at most 250ms
 of events; a second Ctrl-C, `SIGTERM`/`SIGHUP` or `SIGKILL` loses what came

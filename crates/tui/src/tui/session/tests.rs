@@ -1169,3 +1169,25 @@ async fn record_only_takes_the_parked_event_first() {
         .collect();
     assert_eq!(addrs, ["//a:parked", "//a:next"]);
 }
+
+/// An `Output` record is cut to 1 MiB with a marker, so the failure report
+/// written past the event log's cap keeps that overshoot bounded. The cut
+/// falls on a character boundary.
+#[test]
+fn output_records_are_capped() {
+    let short = "failed: //a:bad\n";
+    assert_eq!(capped_output(short), short, "a short report is verbatim");
+    // Two-byte characters after one ASCII byte: the cap falls mid-character.
+    let huge = format!("x{}", "é".repeat(OUTPUT_CAP));
+    let capped = capped_output(&huge);
+    let (kept, marker) = capped.rsplit_once("\n[session: ").expect("a marker line");
+    assert!(kept.len() <= OUTPUT_CAP && kept.len() > OUTPUT_CAP - 4);
+    assert!(huge.starts_with(kept), "the kept part is a prefix");
+    assert_eq!(
+        marker,
+        format!(
+            "output cut at 1 MiB; {} more bytes were printed but not recorded]\n",
+            huge.len() - kept.len()
+        )
+    );
+}
