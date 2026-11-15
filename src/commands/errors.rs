@@ -165,6 +165,14 @@ fn render_target_failure(f: &TargetFailure, color: bool) -> String {
     if let Some(fixes) = &f.fixes {
         render_fixes(&mut out, fixes);
     }
+    // Last, and only beside a `full log:`: the command that reads the log
+    // without its path, which an agent can run as-is (two-mode TUI I8).
+    if f.log.as_ref().and_then(|l| l.path()).is_some() {
+        out.push_str(&format!(
+            "  log: heph log {}\n",
+            shell_quote(&f.addr.format())
+        ));
+    }
     out
 }
 
@@ -1410,9 +1418,51 @@ mod tests {
         assert!(rendered.contains("2 │ this run's line"), "{rendered}");
         assert!(!rendered.contains("another run"), "{rendered}");
         assert!(
-            rendered.ends_with(&format!("  full log: {}\n", path.display())),
+            rendered.ends_with(&format!(
+                "  full log: {}\n  log: heph log //p:a\n",
+                path.display()
+            )),
             "{rendered}"
         );
+    }
+
+    /// I8: the CI box gains `log: heph log <addr>` as its very last line,
+    /// after the fixes, exactly where a `full log:` line is printed; a
+    /// failure with no kept log (its tail in memory only) gets none.
+    #[test]
+    fn ci_report_names_heph_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.txt");
+        std::fs::write(&path, "line\n").unwrap();
+        let log = crate::engine::error::FailureLog::open(
+            path.clone(),
+            std::fs::File::open(&path).unwrap(),
+            10,
+        );
+        let addr = crate::htaddr::parse_addr("//web:lint").unwrap();
+        let with_log = TargetFailure::new(addr.clone(), None, anyhow::anyhow!("boom"))
+            .with_log(Some(log))
+            .with_fixes(Some(FailureFixes::NotWritten(FixesNotWritten::Signal(9))));
+        let rendered = render_failures_to_string(&[Arc::new(with_log)], false);
+        assert!(
+            rendered.ends_with(&format!(
+                "  full log: {}\n  fixes not written: killed by signal 9\n  log: heph log //web:lint\n",
+                path.display()
+            )),
+            "{rendered}"
+        );
+
+        let tail_only = TargetFailure::new(
+            addr,
+            Some(crate::engine::error::LogTail {
+                text: "line\n".into(),
+                start_line: 1,
+            }),
+            anyhow::anyhow!("boom"),
+        );
+        let rendered = render_failures_to_string(&[Arc::new(tail_only)], false);
+        assert!(!rendered.contains("full log:"), "{rendered}");
+        assert!(!rendered.contains("heph log"), "{rendered}");
     }
 
     /// The box's `sandbox:` line, after the log footer, for each fate: removed
@@ -1458,7 +1508,7 @@ mod tests {
             let rendered = render_target_failure(&failure, false);
             assert!(
                 rendered.ends_with(&format!(
-                    "  full log: {}\n  sandbox: {line}\n",
+                    "  full log: {}\n  sandbox: {line}\n  log: heph log //p:a\n",
                     path.display()
                 )),
                 "{fate:?}: {rendered}"

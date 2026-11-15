@@ -72,7 +72,13 @@ The failure box prints where each part is:
   full log: /ws/.heph/failures/web_e2e-…/log.txt
   sandbox: removed (rerun with --keep-failed-sandboxes to keep it)
   outputs: /ws/.heph/failures/web_e2e-…/out
+  log: heph log //web:e2e
 ```
+
+This is the box of a non-interactive run (CI, a pipe). Its last line, printed
+only when there is a `full log:` line, is the command that prints the log
+without naming where it lives. An interactive run prints the failure report
+instead: one block per root failure, naming no path into heph's home.
 
 ### The failed sandbox
 
