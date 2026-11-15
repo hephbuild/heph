@@ -2389,10 +2389,14 @@ impl Driver {
         // After every passthrough: heph owns these names. A declared or hashed
         // passed name is refused at parse (`check_tool_root_keys`); this is for
         // `runtime_pass_env = ["*"]`, whose host `TOOL_ROOT` neither replaces
-        // heph's value nor survives for a group with no root.
+        // heph's value nor survives for a group with no root. The names a group
+        // with no root leaves unset are also taken out of an entrypoint's base
+        // env below, which `layer_env` would otherwise keep.
+        let mut unset_tool_roots: Vec<String> = Vec::new();
         for (key, roots) in tool_roots {
             if roots.is_empty() {
                 env.remove(&key);
+                unset_tool_roots.push(key);
                 continue;
             }
             let mut value = String::new();
@@ -2557,9 +2561,19 @@ impl Driver {
         // unauthenticated or against whatever ambient identity the host had.
         let env_vec = filterenv::filter_long_env(env_vec, &argv_for_filter, &credential_env_names)?;
         // The run's own layers sit on the caller's base env, which is neither
-        // filtered nor converted: it reaches the process byte for byte (E6).
+        // filtered nor converted: it reaches the process byte for byte (E6),
+        // except a `TOOL_<G>_ROOT` heph leaves unset for this run's tools: heph
+        // owns those names, so the caller's value must not stand in for one.
         let has_base_env = options.base_env.is_some();
-        let mut env_pairs = layer_env(options.base_env.unwrap_or_default(), env_vec);
+        let mut base_env = options.base_env.unwrap_or_default();
+        if !unset_tool_roots.is_empty() {
+            base_env.retain(|(k, _)| {
+                !unset_tool_roots
+                    .iter()
+                    .any(|u| k.as_os_str() == std::ffi::OsStr::new(u))
+            });
+        }
+        let mut env_pairs = layer_env(base_env, env_vec);
         if shell {
             add_shell_env(&mut env_pairs, &rreq.sandbox_dir.join("init.sh"));
         }
@@ -6206,6 +6220,62 @@ bash apply_transitive: 96d371e95980d767
             list_path: Some(list_path.clone()),
             unpack_root: list_dir.to_path_buf(),
         })
+    }
+
+    /// A tool group with no root (its files are not under its package) leaves
+    /// `TOOL_<G>_ROOT` unset, even when `runtime_pass_env = ["*"]` would carry
+    /// a host value of that name. Unique variable name: `set_var` is
+    /// process-global.
+    #[tokio::test]
+    async fn rootless_tool_group_unsets_a_passed_host_root() -> anyhow::Result<()> {
+        unsafe {
+            std::env::set_var("TOOL_HEPH_UT_ROOTLESS_ROOT", "/host");
+        }
+        let driver = Driver::new_exec().with_host_path();
+        let ctoken = StdCancellationToken::new();
+        let tmp = tempfile::tempdir()?;
+
+        // The tool's file is at `<tmp>/node`, outside `<tmp>/pkg`: no root.
+        let tool_path = make_tool_binary(tmp.path(), "node", "echo ok")?;
+        let src = Addr::new(
+            hmodel::htpkg::PkgBuf::from("pkg"),
+            "node_tool".to_string(),
+            BTreeMap::new(),
+        );
+        let origin_id = "tool|heph_ut_rootless|0";
+        let mi = make_tool_managed_input_with_source(origin_id, &tool_path, tmp.path(), src)?;
+
+        let out = tmp.path().join("seen.txt");
+        let script = format!(
+            "printf %s \"${{TOOL_HEPH_UT_ROOTLESS_ROOT-unset}}\" > {}",
+            out.display()
+        );
+        let mut target_def = make_tool_target_def(
+            vec!["sh".to_string(), "-c".to_string(), script],
+            origin_id,
+            "heph_ut_rootless",
+        );
+        let mut def = target_def.def::<TargetDef>().clone();
+        def.runtime_pass_env = vec!["*".to_string()];
+        target_def.raw_def = Arc::new(def);
+
+        let request_id = "test".to_string();
+        let req = RunRequest::new(&request_id, &target_def, tmp.path());
+        driver
+            .run(
+                ManagedRunRequest {
+                    sandbox_dir: tmp.path().to_path_buf(),
+                    sandbox_ws_dir: tmp.path().to_path_buf(),
+                    sandbox_pkg_dir: tmp.path().to_path_buf(),
+                    request: req,
+                    inputs: vec![mi],
+                },
+                &ctoken,
+            )
+            .await?;
+
+        assert_eq!(std::fs::read_to_string(&out)?, "unset");
+        Ok(())
     }
 
     fn make_tool_target_def(run: Vec<String>, origin_id: &str, group: &str) -> EngineTargetDef {
