@@ -55,6 +55,7 @@ fn events() -> Vec<BuildEvent> {
                 declared: None,
                 reserved: None,
                 queued_ms: None,
+                admitted: None,
             },
         ),
         ev(
@@ -602,6 +603,7 @@ fn status_json_is_capped_through_the_recorder() {
             declared: None,
             reserved: None,
             queued_ms: None,
+            admitted: None,
         }));
     };
     for i in 0..N {
@@ -621,6 +623,7 @@ fn status_json_is_capped_through_the_recorder() {
             free: 0,
             ahead: 0,
             removals_pending: None,
+            yielding_to: None,
         }));
     }
     let read = || -> Option<(usize, SessionSnapshot)> {

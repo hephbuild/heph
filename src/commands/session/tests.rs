@@ -1137,6 +1137,7 @@ async fn status_lists_are_capped_and_show_has_them_all() {
                 free: 0,
                 ahead: 0,
                 removals_pending: None,
+                yielding_to: None,
             },
         ));
     }

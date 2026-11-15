@@ -101,6 +101,7 @@ fn events(holder_pid: u32) -> Vec<BuildEvent> {
                 declared: None,
                 reserved: None,
                 queued_ms: None,
+                admitted: None,
             },
         ),
         ev(BASE + 7, start("//a:locked")),
