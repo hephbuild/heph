@@ -638,6 +638,11 @@ pub struct TargetFailure {
     /// driver, a failure before its tree existed), or its removal was not a
     /// choice (credential material without `--keep-failed-sandboxes`).
     pub sandbox: Option<SandboxFate>,
+    /// Whether the engine can open a log for this target without fetching
+    /// (its log API over local sources), asked once when the run ends: what
+    /// decides between `heph log <addr>` and "none kept". `None` when nobody
+    /// asked; a renderer then falls back to whether `log` has a path.
+    pub log_readable: Option<bool>,
     pub source: std::sync::Arc<anyhow::Error>,
 }
 
@@ -714,8 +719,22 @@ impl TargetFailure {
             outputs: None,
             fixes: None,
             sandbox: None,
+            log_readable: None,
             source: std::sync::Arc::new(source),
         }
+    }
+
+    /// The same failure, saying whether the engine can open its log.
+    pub fn with_log_readable(mut self, readable: bool) -> Self {
+        self.log_readable = Some(readable);
+        self
+    }
+
+    /// Whether to point at `heph log <addr>`: the engine's answer when it
+    /// gave one, else whether the slot kept the log on disk.
+    pub fn points_at_log(&self) -> bool {
+        self.log_readable
+            .unwrap_or_else(|| self.log.as_ref().and_then(|l| l.path()).is_some())
     }
 
     /// The same failure, saying what became of its sandbox.

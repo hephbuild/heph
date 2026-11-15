@@ -238,21 +238,28 @@ impl ReportContext {
             )),
             Some(SandboxFate::Removed | SandboxFate::RemovedMaterial) | None => {}
         }
-        if f.log.as_ref().and_then(|l| l.path()).is_some() {
+        // Whenever the engine can open a log for it, on disk or not (a
+        // failure nobody asked about: when the slot kept one on disk); its
+        // length when the tail tells it.
+        if f.points_at_log() {
             let lines = block
                 .tail
                 .as_ref()
-                .map(|(text, start)| start.saturating_sub(1) + text.lines().count())
-                .unwrap_or(0);
+                .map(|(text, start)| start.saturating_sub(1) + text.lines().count());
             rows.push((
                 "full log:",
-                format!(
-                    "heph log {} ({} {})",
-                    shell_quote(&addr),
-                    thousands(lines),
-                    if lines == 1 { "line" } else { "lines" }
-                ),
+                match lines {
+                    Some(lines) => format!(
+                        "heph log {} ({} {})",
+                        shell_quote(&addr),
+                        thousands(lines),
+                        if lines == 1 { "line" } else { "lines" }
+                    ),
+                    None => format!("heph log {}", shell_quote(&addr)),
+                },
             ));
+        } else if f.log_readable == Some(false) {
+            rows.push(("full log:", "none kept".to_owned()));
         }
 
         let head = match &status {

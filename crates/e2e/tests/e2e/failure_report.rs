@@ -30,7 +30,7 @@ async fn run_report(engine: &Arc<Engine>, addr: &str) -> anyhow::Result<String> 
         )
         .await;
     assert!(res.is_err(), "{addr} must fail");
-    let failures = rs.take_failures();
+    let failures = rs.take_failures_with_logs().await;
     let home = rs.heph_home();
     Ok(ReportContext::gather(
         &failures,
@@ -72,6 +72,71 @@ fn ends_with_log(report: &str, addr: &str) {
         last.starts_with("  ╰ full log:") && last.contains(&format!("heph log {addr} (")),
         "{report}"
     );
+}
+
+/// The pointer follows what `heph log` would find, not a path on disk: a
+/// failure whose only log is a remote hit's (in the engine's index, not
+/// fetched, no path anywhere) still ends with `heph log <addr>`, and one
+/// with no log at all says "none kept" — in the report and in the CI box
+/// alike, the box's other lines unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failure_report_points_at_any_log_the_engine_holds() -> anyhow::Result<()> {
+    use crate::common::{build_engine, run_drain};
+    use heph::commands::errors::FailedTargets;
+    use heph::engine::error::TargetFailure;
+
+    let remote = tempfile::tempdir()?;
+    let uri = format!("file://{}", remote.path().display());
+    let (producer, reader) = (tempfile::tempdir()?, tempfile::tempdir()?);
+    let body = r#"target(name = "t", driver = "bash", out = "t.txt", run = "echo a log line; echo hi > t.txt")"#;
+    for ws in [&producer, &reader] {
+        crate::log_api::write_build(ws.path(), body)?;
+    }
+    run_drain(&build_engine(producer.path(), &uri), "//p:t").await;
+    let engine = build_engine(reader.path(), &uri);
+    run_drain(&engine, "//p:t").await;
+
+    let rs = engine.new_state();
+    for addr in ["//p:t", "//p:never"] {
+        let a = parse_addr(addr)?;
+        rs.record_failure(
+            a.clone(),
+            Arc::new(TargetFailure::new(a, None, anyhow::anyhow!("boom"))),
+        );
+    }
+    let failures = rs.take_failures_with_logs().await;
+    let readable: Vec<_> = failures
+        .iter()
+        .map(|f| (f.addr.format(), f.log_readable))
+        .collect();
+    assert_eq!(
+        readable,
+        vec![
+            ("//p:t".to_owned(), Some(true)),
+            ("//p:never".to_owned(), Some(false))
+        ]
+    );
+
+    let report =
+        ReportContext::gather(&failures, |a| rs.took_down(a), |_| false, None).render(false);
+    assert!(
+        report.contains("\n✗ //p:t\n  │ boom\n  ╰ full log: heph log //p:t\n"),
+        "{report}"
+    );
+    assert!(
+        report.contains("\n✗ //p:never\n  │ boom\n  ╰ full log: none kept\n"),
+        "{report}"
+    );
+
+    let mut boxes = Vec::new();
+    drop(FailedTargets::reported(failures, None, &mut boxes, false));
+    let boxes = String::from_utf8(boxes)?;
+    assert!(
+        boxes.contains("╰─▶ boom\n  log: heph log //p:t\n"),
+        "{boxes}"
+    );
+    assert!(boxes.contains("╰─▶ boom\n  log: none kept\n"), "{boxes}");
+    Ok(())
 }
 
 /// A failed `in_place` target with `failure_out`: the block names the fixes

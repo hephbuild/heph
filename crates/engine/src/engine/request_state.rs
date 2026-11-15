@@ -960,6 +960,41 @@ impl RequestState {
             .collect()
     }
 
+    /// [`take_failures`](Self::take_failures), each failure saying whether
+    /// the engine can open its log ([`TargetFailure::log_readable`]): the
+    /// log API over local sources, never fetching (a remote hit's log it
+    /// would fetch counts: `heph log` does). What the report and the
+    /// CI box decide `heph log <addr>` against, so neither points at a log
+    /// `heph log` would not find, nor leaves out one it would. Without the
+    /// engine (gone), the failures are returned unasked.
+    pub async fn take_failures_with_logs(&self) -> Vec<Arc<TargetFailure>> {
+        use futures::StreamExt as _;
+        let failures = self.take_failures();
+        let Some(engine) = self.data.engine.upgrade() else {
+            return failures;
+        };
+        let opts = crate::engine::log_api::LogOptions::default();
+        futures::stream::iter(failures)
+            .map(|f| {
+                let (engine, opts) = (&engine, &opts);
+                async move {
+                    use crate::engine::log_api::{LogSource, LogUnavailable};
+                    let readable = match engine.open_log(&f.addr, opts).await {
+                        Ok(found) => found.is_some(),
+                        // A remote hit's log, not fetched: `heph log`
+                        // fetches it.
+                        Err(e) => e
+                            .downcast_ref::<LogUnavailable>()
+                            .is_some_and(|u| u.info.source == LogSource::Cache { remote: true }),
+                    };
+                    Arc::new(f.as_ref().clone().with_log_readable(readable))
+                }
+            })
+            .buffered(crate::engine::fanout::discovery_concurrency())
+            .collect()
+            .await
+    }
+
     /// Non-draining lookup of a single recorded failure by addr. Used by the
     /// outermost `result_addr` frame to surface the rich root-cause diagnostic
     /// to its direct caller in place of the `UpstreamFailed` marker.

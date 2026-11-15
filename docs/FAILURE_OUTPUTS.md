@@ -75,10 +75,13 @@ The failure box prints where each part is:
   log: heph log //web:e2e
 ```
 
-This is the box of a non-interactive run (CI, a pipe). Its last line, printed
-only when there is a `full log:` line, is the command that prints the log
-without naming where it lives. An interactive run prints the failure report
-instead: one block per root failure, naming no path into heph's home.
+This is the box of a non-interactive run (CI, a pipe). Its last line is the
+command that prints the log without naming where it lives, printed whenever
+heph can open a log for the target — on disk or not, a remote hit's log it
+would fetch included — and `log: none kept` when it cannot. An interactive run
+prints the failure report instead: one block per root failure, naming no path
+into heph's home, each ending with the same answer as `full log: heph log
+<addr>` or `full log: none kept`.
 
 ### The failed sandbox
 

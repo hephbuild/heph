@@ -168,13 +168,17 @@ fn render_target_failure(f: &TargetFailure, color: bool) -> String {
     if let Some(fixes) = &f.fixes {
         render_fixes(&mut out, fixes);
     }
-    // Last, and only beside a `full log:`: the command that reads the log
-    // without its path, which an agent can run as-is (two-mode TUI I8).
-    if f.log.as_ref().and_then(|l| l.path()).is_some() {
+    // Last: the command that reads the log without its path, which an agent
+    // can run as-is (two-mode TUI I8), whenever the engine can open one — a
+    // log with no path on disk included; "none kept" when it cannot. A
+    // failure nobody asked the engine about points only beside `full log:`.
+    if f.points_at_log() {
         out.push_str(&format!(
             "  log: heph log {}\n",
             shell_quote(&f.addr.format())
         ));
+    } else if f.log_readable == Some(false) {
+        out.push_str("  log: none kept\n");
     }
     out
 }
@@ -574,7 +578,9 @@ macro_rules! finalize {
         if let Some(report) = &incomplete {
             ($announce)(report);
         }
-        let failures = $rs.take_failures();
+        // Each saying whether `heph log <addr>` would find its log: the
+        // report and the CI box point at it on the same answer.
+        let failures = $rs.take_failures_with_logs().await;
         if !failures.is_empty() {
             // `res` is a collateral marker here — dropped either way.
             if $ctx.interactive() {
@@ -1182,7 +1188,9 @@ mod tests {
                 Vec::new(),
             )
         }
-        fn take_failures(&self) -> Vec<Arc<TargetFailure>> {
+        /// No engine to ask: the failures as recorded, as the real one
+        /// returns them once the engine is gone.
+        async fn take_failures_with_logs(&self) -> Vec<Arc<TargetFailure>> {
             std::mem::take(&mut *self.0.borrow_mut())
         }
         fn emit(&self, kind: crate::engine::event::BuildEventKind) {
@@ -1527,9 +1535,24 @@ mod tests {
             }),
             anyhow::anyhow!("boom"),
         );
-        let rendered = render_failures_to_string(&[Arc::new(tail_only)], false);
+        let rendered = render_failures_to_string(&[Arc::new(tail_only.clone())], false);
         assert!(!rendered.contains("full log:"), "{rendered}");
         assert!(!rendered.contains("heph log"), "{rendered}");
+
+        // Once the engine has answered, its answer decides, path or not:
+        // only the last line moves.
+        let readable = render_failures_to_string(
+            &[Arc::new(tail_only.clone().with_log_readable(true))],
+            false,
+        );
+        assert_eq!(
+            readable,
+            format!("{rendered}  log: heph log //web:lint\n"),
+            "{readable}"
+        );
+        let none =
+            render_failures_to_string(&[Arc::new(tail_only.with_log_readable(false))], false);
+        assert_eq!(none, format!("{rendered}  log: none kept\n"), "{none}");
     }
 
     /// The box's `sandbox:` line, after the log footer, for each fate: removed
