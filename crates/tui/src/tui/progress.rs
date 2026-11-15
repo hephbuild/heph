@@ -807,6 +807,33 @@ pub struct BuildState {
     /// The line's spotlight: the waits and runs ordered by start, the root
     /// failure on show, and the hold. See [`spotlight`].
     spot: spotlight::SpotIndex,
+    /// Failures with no `upstream_of`: the roots. `errored` less this is
+    /// what they took down, as the finished line splits it.
+    root_failed: usize,
+    /// heph's home, redacted from every error text this state keeps (I9).
+    redact: crate::tui::text::Redact,
+}
+
+/// The finished line's split of the failed count, from
+/// [`BuildState::failure_split`]: ` (1 root, 2 because of it)`, ` (2 roots)`;
+/// empty when nothing failed.
+fn failure_split_text((roots, took_down): (usize, usize)) -> String {
+    let named = match roots {
+        0 => None,
+        1 => Some("1 root".to_owned()),
+        n => Some(format!("{n} roots")),
+    };
+    let blame = match roots {
+        0 => "a dependency",
+        1 => "it",
+        _ => "them",
+    };
+    match (named, took_down) {
+        (None, 0) => String::new(),
+        (Some(named), 0) => format!(" ({named})"),
+        (Some(named), n) => format!(" ({named}, {n} because of {blame})"),
+        (None, n) => format!(" ({n} because of {blame})"),
+    }
 }
 
 /// One pool as the header shows it.
@@ -930,6 +957,20 @@ impl Counts {
 impl BuildState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Redact `redact`'s paths from every error text kept from here on.
+    pub fn set_redact(&mut self, redact: crate::tui::text::Redact) {
+        self.redact = redact;
+    }
+
+    /// `(roots, took down)`: the failures that are their own, and those
+    /// that failed only because a dependency did.
+    pub fn failure_split(&self) -> (usize, usize) {
+        (
+            self.root_failed,
+            self.errored.saturating_sub(self.root_failed),
+        )
     }
 
     /// How to name the session behind a lock holder's pid. See
@@ -1088,13 +1129,19 @@ impl BuildState {
                             err,
                             exit_status.as_deref(),
                             timed_out.as_ref(),
+                            &self.redact,
                         ),
                     });
                 }
                 if self.in_flight_results.remove(addr) {
                     if let Some(err) = error {
                         self.errored += 1;
-                        self.failed.push((addr.clone(), Some(err.clone())));
+                        if upstream_of.is_none() {
+                            self.root_failed += 1;
+                        }
+                        // The Failed tab draws this text: no home in it (I9).
+                        let err = self.redact.apply(err).into_owned();
+                        self.failed.push((addr.clone(), Some(err)));
                     } else {
                         self.completed += 1;
                         self.done.push(addr.clone());
@@ -1454,12 +1501,14 @@ impl BuildState {
         (counts.done_segment(), counts.cached, counts.failed)
     }
 
-    /// The textual count segment shared by the live header and the final
-    /// summary: `D / ~N done · C cached · F failed`. No elapsed clock, no worker
+    /// The final summary's count segment: `D / ~N done · C cached · F
+    /// failed`, the failures split into roots and what they took down
+    /// (`3 failed (1 root, 2 because of it)`). No elapsed clock, no worker
     /// braille — callers prepend the elapsed field themselves.
     pub fn counts_segment(&self, scope: CountScope) -> String {
         let (done, cached, failed) = self.count_fields(scope);
-        format!("{done} · {cached} · {failed}")
+        let split = failure_split_text(self.failure_split());
+        format!("{done} · {cached} · {failed}{split}")
     }
 
     /// Body rows for the [`ViewMode::Failed`] view: one row per failed target,
@@ -2743,6 +2792,13 @@ impl TuiProgressView {
         if let Role::Live { approval } = &mut self.role {
             *approval = Some(center);
         }
+        self
+    }
+
+    /// Redact `redact`'s paths (heph's home) from the error text this view
+    /// draws (I9).
+    pub fn with_redact(mut self, redact: crate::tui::text::Redact) -> Self {
+        self.state.set_redact(redact);
         self
     }
 

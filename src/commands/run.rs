@@ -689,6 +689,7 @@ impl App for RunApp {
             label: self.label.clone(),
         }))
         .with_approval(self.approval.clone())
+        .with_redact(tui::text::Redact::heph_home(&self.engine.home))
     }
 
     fn ci_view(&self) -> Self::CiView {

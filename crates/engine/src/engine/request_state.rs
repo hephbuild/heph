@@ -272,6 +272,19 @@ impl DepDag {
     }
 }
 
+/// The targets one root failure took down: the first few by name, in the
+/// order they failed, and how many in all.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TookDown {
+    pub named: Vec<String>,
+    pub total: usize,
+}
+
+impl TookDown {
+    /// How many a root keeps by name; the report says `+N more` past them.
+    pub const NAMED: usize = 5;
+}
+
 /// Shared mutable state for a request — common across all child RequestStates.
 pub struct RequestStateData {
     pub engine: Weak<Engine>,
@@ -414,6 +427,10 @@ pub struct RequestStateData {
     /// at the end of execution for rendering. Shared via `Arc<RequestStateData>`,
     /// so `with_parent` / `with_skip_provider` children record into the same map.
     pub failures: Mutex<indexmap::IndexMap<Addr, Arc<TargetFailure>>>,
+    /// What each root failure took down, keyed by the root's formatted addr:
+    /// the targets whose `ResultEnd` named it as `upstream_of`. Read by the
+    /// interactive failure report's `took down:` row.
+    took_down: Mutex<FxHashMap<String, TookDown>>,
     /// Decision maker for `approval`-gated targets. `None` in non-interactive
     /// contexts that never set one (gc, tests) — a target requiring approval then
     /// fails with a clear error. Shared via `Arc<RequestStateData>`, so child
@@ -944,6 +961,35 @@ impl RequestState {
     /// to its direct caller in place of the `UpstreamFailed` marker.
     pub fn get_failure(&self, addr: &Addr) -> Option<Arc<TargetFailure>> {
         self.data.failures.lock().get(addr).cloned()
+    }
+
+    /// Note that `addr` failed only because `root` did. Bounded per root: the
+    /// first [`TookDown::NAMED`] addrs and a count, so a root that takes
+    /// down thousands costs no more than one that takes down a few.
+    pub fn record_took_down(&self, root: &str, addr: &str) {
+        let mut map = self.data.took_down.lock();
+        let entry = map.entry(root.to_owned()).or_default();
+        entry.total = entry.total.saturating_add(1);
+        if entry.named.len() < TookDown::NAMED {
+            entry.named.push(addr.to_owned());
+        }
+    }
+
+    /// What `root` took down, as [`record_took_down`](Self::record_took_down)
+    /// noted it; empty when it took down nothing.
+    pub fn took_down(&self, root: &str) -> TookDown {
+        self.data
+            .took_down
+            .lock()
+            .get(root)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// heph's home, while the engine is alive: what no screen or report
+    /// shows (sandboxes live under it).
+    pub fn heph_home(&self) -> Option<std::path::PathBuf> {
+        self.data.engine.upgrade().map(|e| e.home.to_path_buf())
     }
 
     /// The first recorded failure in insertion order, if any. Fallback for
@@ -1505,6 +1551,7 @@ impl Engine {
             bg_pending: Arc::clone(&bg_pending),
             sandbox_removals: crate::engine::sandbox_cleaner::PendingCounter::default(),
             failures: Mutex::new(indexmap::IndexMap::new()),
+            took_down: Mutex::new(FxHashMap::default()),
             approval,
             hash_only,
             selection: std::sync::OnceLock::new(),

@@ -705,4 +705,63 @@ mod tests {
         assert!(t.contains("✗ //p:fail exit 101"), "{t}");
         assert!(!t.contains(HOME), "{t}");
     }
+
+    /// I9's error-text clause: a root failure with no exit status is named
+    /// by its error's first line, with heph's home redacted; the finished
+    /// line splits roots from what they took down.
+    #[test]
+    fn no_home_path_in_a_failure_with_no_exit() {
+        use crate::tui::app::TUIAppView;
+        use crate::tui::progress::TuiProgressView;
+        use crate::tui::progress::test_events::{T0, at, start};
+        use hcore::events::BuildEventKind;
+
+        const HOME: &str = "/home/u/.heph";
+        let fail =
+            |addr: &str, error: String, upstream_of: Option<&str>| BuildEventKind::ResultEnd {
+                addr: addr.into(),
+                error: Some(error),
+                upstream_of: upstream_of.map(str::to_owned),
+                exit_status: None,
+                log_tail: None,
+                timed_out: None,
+            };
+        let mut v = TuiProgressView::new("Running //...")
+            .with_redact(crate::tui::text::Redact::of([HOME.into()]));
+        for a in ["//p:root", "//p:down1", "//p:down2"] {
+            v.apply(&at(0, start(a)));
+        }
+        v.apply(&at(
+            10,
+            fail(
+                "//p:root",
+                format!("staging {HOME}/sandbox/ab/in: denied\nmore"),
+                None,
+            ),
+        ));
+        v.apply(&at(
+            11,
+            fail("//p:down1", "dependency failed".into(), Some("//p:root")),
+        ));
+        v.apply(&at(
+            12,
+            fail("//p:down2", "dependency failed".into(), Some("//p:root")),
+        ));
+        let t: String = v
+            .render("⠋", T0 + 1_000, 300, 24)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(
+            t.contains("✗ //p:root staging <heph home>/sandbox/ab/in: denied"),
+            "{t}"
+        );
+        assert!(!t.contains(HOME), "{t}");
+        v.set_finished(T0 + 2_000);
+        let last = v.final_line().expect("a summary");
+        assert!(
+            last.contains("3 failed (1 root, 2 because of it)"),
+            "{last}"
+        );
+    }
 }

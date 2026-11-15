@@ -2952,6 +2952,7 @@ impl Engine {
     ) -> anyhow::Result<(MemoResult, Option<Arc<ResultReadGuard>>)> {
         let addr_str = addr.format();
         let interactive = opts.interactive.is_some();
+        let end_rs = Arc::clone(&rs);
         crate::engine::event::emit_scope(
             &rs,
             crate::engine::event::BuildEventKind::ResultStart {
@@ -2962,18 +2963,25 @@ impl Engine {
             // (root vs collateral), the exit status, the log tail and a timeout
             // belong.
             move |error| match error {
-                Some(d) => crate::engine::event::BuildEventKind::ResultEnd {
-                    addr: addr_str,
-                    error: Some(d.message),
-                    upstream_of: d.upstream_of,
-                    exit_status: d.exit_status,
-                    log_tail: crate::engine::event::ErrorDetail::result_log_tail(
-                        d.log_tail,
-                        d.log.as_ref(),
-                        interactive,
-                    ),
-                    timed_out: d.timed_out,
-                },
+                Some(d) => {
+                    // The final report's `took down:` row reads the same
+                    // `upstream_of` the event carries.
+                    if let Some(root) = &d.upstream_of {
+                        end_rs.record_took_down(root, &addr_str);
+                    }
+                    crate::engine::event::BuildEventKind::ResultEnd {
+                        addr: addr_str,
+                        error: Some(d.message),
+                        upstream_of: d.upstream_of,
+                        exit_status: d.exit_status,
+                        log_tail: crate::engine::event::ErrorDetail::result_log_tail(
+                            d.log_tail,
+                            d.log.as_ref(),
+                            interactive,
+                        ),
+                        timed_out: d.timed_out,
+                    }
+                }
                 None => crate::engine::event::BuildEventKind::ResultEnd {
                     addr: addr_str,
                     error: None,

@@ -223,6 +223,88 @@ pub fn cut_left(s: &str, max: usize) -> Cow<'_, str> {
     Cow::Owned(format!("{ELLIPSIS}{tail}"))
 }
 
+/// What a screen shows in place of heph's home (I9).
+pub const HOME_TOKEN: &str = "<heph home>";
+
+/// Paths no screen shows (I9): heph's home, and with it every sandbox, which
+/// lives under it. Error text is how they reach a screen, so it passes
+/// through [`Redact::apply`] before it is drawn.
+#[derive(Debug, Clone, Default)]
+pub struct Redact {
+    /// Longest first, so a root that extends another is matched whole.
+    roots: Vec<String>,
+}
+
+impl Redact {
+    /// heph's home as given and as the filesystem resolves it (`/var` and
+    /// `/private/var` on macOS): an error can name either. Reads the
+    /// filesystem once, so it is built before the first frame, never in one.
+    pub fn heph_home(home: &std::path::Path) -> Self {
+        let mut roots = vec![home.to_path_buf()];
+        if let Ok(canonical) = std::fs::canonicalize(home)
+            && canonical != home
+        {
+            roots.push(canonical);
+        }
+        Self::of(roots)
+    }
+
+    /// Redact each of `roots`. `/` and empty roots are dropped: they would
+    /// redact every path.
+    pub fn of(roots: impl IntoIterator<Item = std::path::PathBuf>) -> Self {
+        let mut roots: Vec<String> = roots
+            .into_iter()
+            .filter_map(|p| {
+                let s = p.to_string_lossy().trim_end_matches('/').to_owned();
+                (!s.is_empty()).then_some(s)
+            })
+            .collect();
+        roots.sort_by_key(|r| std::cmp::Reverse(r.len()));
+        roots.dedup();
+        Self { roots }
+    }
+
+    /// `s` with every whole-path occurrence of a root replaced by
+    /// [`HOME_TOKEN`]. `/h/.heph` in `/h/.heph2` or `/x/h/.heph` names
+    /// another directory and is kept. Borrows when nothing matches.
+    pub fn apply<'a>(&self, s: &'a str) -> Cow<'a, str> {
+        let mut out = Cow::Borrowed(s);
+        for root in &self.roots {
+            if out.contains(root.as_str()) {
+                out = Cow::Owned(replace_path(&out, root));
+            }
+        }
+        out
+    }
+}
+
+/// A character that continues a path component: a root followed or
+/// preceded by one is part of a longer name.
+fn is_path_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | '~' | '+' | '@' | '/')
+}
+
+fn replace_path(s: &str, root: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find(root) {
+        let (before, from) = rest.split_at(i);
+        let after = from.get(root.len()..).unwrap_or("");
+        out.push_str(before);
+        // `before` is checked against what was already written, so a match
+        // right after a replaced one sees the token's `>`, not a path char.
+        let starts = out.chars().next_back().is_none_or(|c| !is_path_char(c));
+        let ends = after
+            .chars()
+            .next()
+            .is_none_or(|c| c == '/' || !is_path_char(c));
+        out.push_str(if starts && ends { HOME_TOKEN } else { root });
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,5 +385,36 @@ mod tests {
                 assert!(width(&cut_right(s, max)) <= max, "{s} at {max}");
             }
         }
+    }
+
+    /// I9: heph's home, and every sandbox under it, is replaced as a whole
+    /// path; a near-miss directory is another path and stays.
+    #[test]
+    fn redact_replaces_whole_home_paths_only() {
+        let r = Redact::of([
+            std::path::PathBuf::from("/h/.heph/"),
+            std::path::PathBuf::from("/private/h/.heph"),
+            std::path::PathBuf::from("/"),
+        ]);
+        let cases = [
+            (
+                "open /h/.heph/sandbox/ab/run.sh: denied",
+                "open <heph home>/sandbox/ab/run.sh: denied",
+            ),
+            ("/h/.heph", "<heph home>"),
+            ("'/h/.heph/x'", "'<heph home>/x'"),
+            ("/private/h/.heph/x", "<heph home>/x"),
+            ("/h/.heph2/x", "/h/.heph2/x"),
+            ("/x/h/.heph/y", "/x/h/.heph/y"),
+            ("a /h/.heph b /h/.heph/c", "a <heph home> b <heph home>/c"),
+            ("/h/.hephé/x", "/h/.hephé/x"),
+            ("no path", "no path"),
+            ("", ""),
+        ];
+        for (input, want) in cases {
+            assert_eq!(r.apply(input), want, "{input:?}");
+        }
+        assert!(matches!(r.apply("no path"), Cow::Borrowed(_)));
+        assert_eq!(Redact::default().apply("/h/.heph"), "/h/.heph");
     }
 }

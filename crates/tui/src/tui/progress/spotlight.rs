@@ -61,11 +61,14 @@ pub(super) struct RootFailure {
 }
 
 impl RootFailure {
-    /// The spotlight's reason for a failed `ResultEnd`.
+    /// The spotlight's reason for a failed `ResultEnd`: its exit, its
+    /// timeout, or else its error's first line, with heph's home redacted
+    /// (I9).
     pub(super) fn reason(
         error: &str,
         exit_status: Option<&str>,
         timed_out: Option<&hcore::events::TimedOutData>,
+        redact: &crate::tui::text::Redact,
     ) -> String {
         if let Some(t) = timed_out {
             return format!(
@@ -78,7 +81,7 @@ impl RootFailure {
                 Some(code) => Cow::Owned(format!("exit {code}")),
                 None => Cow::Borrowed(s),
             },
-            None => Cow::Borrowed(error.lines().next().unwrap_or("")),
+            None => redact.apply(error.lines().next().unwrap_or("")),
         };
         let clean = clean_inline(&text);
         crate::tui::text::cut_right(&clean, REASON_MAX).into_owned()
