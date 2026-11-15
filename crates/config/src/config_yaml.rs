@@ -28,6 +28,9 @@ pub const DEFAULT_CACHE_CONCURRENCY: usize = 256;
 #[derive(Debug, Deserialize, Default, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 #[schemars(
+    // What yaml-language-server shows as the hover heading and in type
+    // errors (`object(.hephconfig)`); the Rust name would leak otherwise.
+    title = ".hephconfig",
     description = "heph workspace configuration: the base `.hephconfig`, or a profile \
                    (`<profile>.hephconfig`) laid over it."
 )]

@@ -729,6 +729,6 @@
       ]
     }
   },
-  "title": "ConfigYaml",
+  "title": ".hephconfig",
   "type": "object"
 }
