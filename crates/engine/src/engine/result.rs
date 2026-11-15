@@ -8291,6 +8291,12 @@ mod tests {
         let rs = engine.new_state();
         resolve(&engine, &rs, &addr, OutputMatcher::None).await?;
         drain_bg(rs).await;
+        // The mirrored manifest is a queued write until the writer commits
+        // it, and `list_target_entries`, which `open_log` finds entries by,
+        // does not wait on the queue (see
+        // `a_queued_revision_is_invisible_to_list_target_entries_and_awaited_by_exists`).
+        // A slow commit (linux/amd64 CI) left the entry unlisted.
+        engine.sqlite_writes.drain_queued_writes().await;
 
         let before = backend.blobs();
         backend.blob_delay_ms.store(200, Ordering::SeqCst);
