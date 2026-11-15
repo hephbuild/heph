@@ -274,11 +274,12 @@ pub enum BuildEventKind {
         addr: String,
     },
     /// What a finished target produced, by output group: sent right before
-    /// its successful `ResultEnd`, whether it ran or was a cache hit (then
-    /// the restored entry's groups). Every declared output group the entry
-    /// holds, not only the ones this request asked for; log and support
-    /// files are not outputs and are left out. Not sent for a failure, nor to
-    /// a request nobody listens to.
+    /// the successful `ResultEnd` of a target that ran. Every output group
+    /// the run produced, not only the ones this request asked for; log and
+    /// support files are not outputs and are left out. Not sent for a cache
+    /// hit (a warm build pays nothing for it; a consumer reads a hit's
+    /// groups from `Engine::output_listing`), for a failure, nor to a request
+    /// nobody listens to.
     ///
     /// Per-file rows are not here: an artifact is a group's packed tree, and
     /// listing it reads the cache entry, which a consumer asks for off its

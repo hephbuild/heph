@@ -1,6 +1,6 @@
 //! What a finished target produced, for a viewer's Outputs tab: the
-//! `ResultOutputs` event an executed target and a cache hit both send before
-//! their `ResultEnd`, the declared group names on `ExecuteStart`, and the
+//! `ResultOutputs` event an executed target sends before its `ResultEnd` (a
+//! cache hit sends none), the declared group names on `ExecuteStart`, and the
 //! per-file rows `Engine::output_listing` and `Engine::failure_outputs` read
 //! from the cache entry and the failure slot.
 
@@ -99,12 +99,12 @@ const BUILD: &str = r#"target(name = "t", driver = "bash",
     run = "printf aaaa > a.txt; mkdir -p b/sub empty; printf 1 > b/one.txt; printf 22 > b/sub/two.txt")"#;
 
 /// A run sends the declared group names on `ExecuteStart` and every group,
-/// with its stored size and hash, on `ResultOutputs`; a cache hit asked for
-/// one group sends the same groups, restored from the entry; the listing
-/// reads each file's path, size and content hash, and no row for a
-/// directory that holds files.
+/// with its stored size and hash, on `ResultOutputs`; a cache hit sends none;
+/// the listing holds the groups the run reported and reads each file's path,
+/// size and content hash, with no row for a directory that holds files.
 #[tokio::test]
-async fn executed_and_hit_send_result_outputs_and_the_listing_reads_files() -> anyhow::Result<()> {
+async fn executed_sends_result_outputs_a_hit_none_and_the_listing_reads_files()
+-> anyhow::Result<()> {
     let ws = Workspace::new();
     ws.write_build_file("p", BUILD);
 
@@ -128,7 +128,8 @@ async fn executed_and_hit_send_result_outputs_and_the_listing_reads_files() -> a
         assert!(g.hash.as_ref().is_some_and(|h| !h.is_empty()), "{g:?}");
     }
 
-    // A hit, asked for one group only: still every group of the entry.
+    // A hit sends none: a warm build pays nothing for it. Its outputs are
+    // read on demand, from the listing below.
     let (res, hit) = events(&ws.engine, "//p:t", OutputMatcher::Exact(vec!["a".into()])).await?;
     res?;
     assert!(
@@ -136,12 +137,14 @@ async fn executed_and_hit_send_result_outputs_and_the_listing_reads_files() -> a
             .any(|e| matches!(e, BuildEventKind::ExecuteStart { .. })),
         "a cache hit: {hit:#?}"
     );
-    assert_eq!(
-        result_outputs(&hit, "//p:t"),
-        executed.as_slice(),
-        "the hit restores what the run wrote"
+    assert!(
+        !hit.iter()
+            .any(|e| matches!(e, BuildEventKind::ResultOutputs { .. })),
+        "a hit sends no ResultOutputs: {hit:#?}"
     );
 
+    // The listing of the hit's entry, asked for one group: every group of
+    // the entry, as the run reported them.
     let addr = parse_addr("//p:t")?;
     let listing = ws
         .engine

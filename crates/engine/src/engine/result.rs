@@ -3433,25 +3433,16 @@ impl Engine {
             .await?;
 
         // Inside `inner_result_addr`'s scope, so it lands right before this
-        // target's `ResultEnd`. Every group the entry holds, whichever this
-        // caller asked for: what ran (`executed`), or the hit's manifest.
-        // Only the no-manifest fallback is limited to this caller's groups.
-        if rs.has_listeners() {
-            let groups = match (&locked.executed, &locked.manifest) {
-                (Some(ex), _) => summarize_outputs(ex.cached.iter().map(result_artifact_output)),
-                (None, Some(manifest)) => {
-                    summarize_outputs(manifest.artifacts.iter().map(|a| OutputRow {
-                        group: &a.group,
-                        r#type: &a.r#type,
-                        size: Some(a.size),
-                        hash: Some(a.hashout.clone()),
-                    }))
-                }
-                (None, None) => summarize_outputs(cached.iter().map(result_artifact_output)),
-            };
+        // target's `ResultEnd`. Every group the run produced, whichever this
+        // caller asked for. Only for a run that executed: a hit sends none, so
+        // a warm build pays nothing for it, and a reader that wants a hit's
+        // outputs asks `Engine::output_listing`.
+        if let Some(ex) = &locked.executed
+            && rs.has_listeners()
+        {
             rs.emit(crate::engine::event::BuildEventKind::ResultOutputs {
                 addr: def.target.addr.format(),
-                groups,
+                groups: summarize_outputs(ex.cached.iter().map(result_artifact_output)),
             });
         }
 
