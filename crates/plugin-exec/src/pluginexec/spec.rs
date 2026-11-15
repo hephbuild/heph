@@ -39,7 +39,7 @@ impl Codegen {
 /// dict).
 #[derive(Spec)]
 pub(crate) struct TargetSpec {
-    /// Command to execute, as an argv list. `$OUT`, `$SRC_<group>`, `$TOOL_<group>` and declared env vars are available.
+    /// Command to execute, as an argv list. `$OUT`, `$SRC_<group>`, `$TOOL_<group>`, `$TOOL_<group>_ROOT` and declared env vars are available.
     ///
     /// An element may carry a `${read://pkg:name}` reference — the contents of
     /// that target's single output, resolved by the host before the command
@@ -87,7 +87,30 @@ pub(crate) struct TargetSpec {
     /// whose output depends on *who* ran it is not cacheable, and says so with
     /// `cache = False`.
     pub credentials: Vec<String>,
-    /// Build tools, grouped by name → list of target addresses; symlinked under `tools/`.
+    /// Build tools, grouped by name → list of target addresses. Each tool's
+    /// outputs are put on `PATH` and listed in `$TOOL_<group>` (`$TOOL` for the
+    /// unnamed group). `$TOOL_<group>_ROOT` (`$TOOL_ROOT`) is each tool's package
+    /// directory as staged for this target, holding its outputs and its
+    /// `support_files` at the paths its BUILD file declares them: a tool in
+    /// `sdk/` with `support_files = "include/"` is read as `$TOOL_ROOT/include`.
+    /// Several tools in one group are space-joined in `$TOOL_<group>`.
+    ///
+    /// `$TOOL_<group>_ROOT` has one entry per distinct tool package that holds
+    /// staged files, sorted and space-joined; a `group` used as a tool counts
+    /// each member's package. Use it as a single path only when the group has
+    /// one tool package. A workspace source file, a host binary, or a tool
+    /// whose outputs are not under its own package adds no entry, so the
+    /// variable can be unset. A tool in the root package roots the whole tool
+    /// tree. The value is an absolute, machine-specific path: if outputs could
+    /// embed it, strip it with a prefix-map flag (`-ffile-prefix-map`,
+    /// `-trimpath`) to keep them reproducible.
+    ///
+    /// Refused at parse: a group whose root variable is another group's
+    /// `$TOOL_<group>` (`{"": …, "root": …}` both reach `TOOL_ROOT`; names are
+    /// uppercased and every character outside `[A-Z0-9_]` becomes `_`), and a
+    /// name in `env`, `runtime_env`, `pass_env`, `runtime_pass_env` or a
+    /// dependency's `transitive` env that is one of the target's root
+    /// variables. Groups from a dependency's `transitive` tools count too.
     pub tools: HashMap<String, Vec<String>>,
     /// Declared outputs, grouped by name → list of output paths the target writes.
     #[spec(rename = "out")]
