@@ -211,7 +211,83 @@ fn front(set: &BTreeSet<(u64, String)>) -> Option<&(u64, String)> {
     set.first()
 }
 
+/// The dashboard's blocked rows read the same wait maps, in the same words:
+/// an admission wait's are `admission_wait_text`'s, a lock's name the
+/// holder's session as the spotlight does.
+impl crate::tui::dashboard::Waits for BuildState {
+    fn wait_words(&self, addr: &str, now_ms: u64) -> Option<crate::tui::dashboard::WaitWords> {
+        use crate::tui::dashboard::WaitWords;
+        if let Some(w) = self.admission_waits.get(addr) {
+            let text = self.admission_text(addr, now_ms)?;
+            // `<addr> waits for <pool> <need> (<free>, <queue>, <waited>)[ —
+            // cleanup …]`: PHASE is `waits <pool> <need>` (`waits sandbox`,
+            // whose need is always one slot), LAST LINE the rest.
+            let rest = text.strip_prefix(addr).unwrap_or(&text).trim_start();
+            let rest = rest.strip_prefix("waits for ").unwrap_or(rest);
+            let (head, detail) = rest.split_once(" (").unwrap_or((rest, ""));
+            let phase = if w.pool == hcore::capacity::SANDBOX {
+                format!("waits {}", w.pool)
+            } else {
+                format!("waits {head}")
+            };
+            return Some(WaitWords {
+                phase,
+                detail: format!("({detail}"),
+                waited_ms: now_ms.saturating_sub(w.since_ms),
+            });
+        }
+        if let Some((holder, since)) = self.lock_waits.get(addr) {
+            let (phase, detail) = match holder {
+                LockHolder::Pid(pid) => match self.holders.get(*pid) {
+                    Some(id) => (
+                        format!("locked: {id}"),
+                        format!("held by session {id} (pid {pid})"),
+                    ),
+                    None => ("locked".to_owned(), format!("held by pid {pid}")),
+                },
+                LockHolder::Readers => ("locked".to_owned(), "in use by readers".to_owned()),
+                LockHolder::Unknown => ("locked".to_owned(), "holder unknown".to_owned()),
+            };
+            return Some(WaitWords {
+                phase,
+                detail,
+                waited_ms: now_ms.saturating_sub(*since),
+            });
+        }
+        let w = self.scratch_waits.get(addr)?;
+        let detail = match w.holder_pid {
+            Some(pid) => format!("held by {}", self.holder(pid)),
+            None => "queued".to_owned(),
+        };
+        Some(WaitWords {
+            phase: format!("waits {}", w.scratch),
+            detail,
+            waited_ms: now_ms.saturating_sub(w.since_ms),
+        })
+    }
+}
+
 impl BuildState {
+    /// `addr`'s admission wait in the shared formatter's words, waited up
+    /// to `now_ms`.
+    fn admission_text(&self, addr: &str, now_ms: u64) -> Option<String> {
+        let w = self.admission_waits.get(addr)?;
+        let waited = elapsed(now_ms.saturating_sub(w.since_ms));
+        Some(hcore::events::admission_wait_text(
+            addr,
+            &w.pool,
+            self.unit_of(&w.pool),
+            w.need,
+            w.free,
+            w.ahead,
+            w.yielding_to
+                .as_ref()
+                .map(|to| (to, self.unit_of(&to.pool))),
+            w.removals_pending,
+            &waited,
+        ))
+    }
+
     /// Rule 2: the root failure on show, if any.
     pub(super) fn spot_failure(&self) -> Option<Spot> {
         let f = self.spot.root_failure.as_ref()?;
@@ -297,21 +373,7 @@ impl BuildState {
         }
         match self.spot_pick(now_ms)? {
             SpotRef::Admission(addr) => {
-                let w = self.admission_waits.get(addr)?;
-                let waited = elapsed(now_ms.saturating_sub(w.since_ms));
-                let text = hcore::events::admission_wait_text(
-                    addr,
-                    &w.pool,
-                    self.unit_of(&w.pool),
-                    w.need,
-                    w.free,
-                    w.ahead,
-                    w.yielding_to
-                        .as_ref()
-                        .map(|to| (to, self.unit_of(&to.pool))),
-                    w.removals_pending,
-                    &waited,
-                );
+                let text = self.admission_text(addr, now_ms)?;
                 // The shared formatter's words, after the address it starts
                 // with, which the line may shorten on its own.
                 let detail = text.strip_prefix(addr).unwrap_or(&text).trim_start();

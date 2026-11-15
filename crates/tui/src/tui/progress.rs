@@ -809,17 +809,10 @@ pub struct BuildState {
     /// blocked for three minutes between them is the whole reason the build was
     /// slow, and by the time anyone reads the summary every wait has ended.
     scratch_wait_totals: HashMap<String, (u64, u64)>,
-    /// Every pool: its unit and capacity as `RequestConfig` announced them,
-    /// and what the running targets hold of it. `held` is the sum of
-    /// `running_reserved`, kept at Start/End so the header reads it without
-    /// walking the targets. A pool a target reserves that was never announced
-    /// (a host that announces no pools) is added with its default unit and no
-    /// capacity.
-    pools: BTreeMap<String, PoolView>,
-    /// What each running target reserved, by addr, between its
-    /// `ExecuteStart` and `ExecuteEnd`: the key that makes a repeated Start
-    /// count once and an unpaired End subtract nothing.
-    running_reserved: HashMap<String, BTreeMap<String, u64>>,
+    /// Every pool's unit as `RequestConfig` announced it, for the words of a
+    /// clamp and an admission wait. What a pool holds is its own report
+    /// (`PoolUsage`, in [`Self::dash`]), never a sum of reservations.
+    units: BTreeMap<String, Unit>,
     /// Targets whose admission has waited past the notice threshold, by
     /// addr. Added on `AdmissionWaitStart`, removed on `AdmissionWaitEnd`.
     admission_waits: HashMap<String, AdmissionWait>,
@@ -835,6 +828,10 @@ pub struct BuildState {
     root_failed: usize,
     /// heph's home, redacted from every error text this state keeps (I9).
     redact: crate::tui::text::Redact,
+    /// The dashboard's fold: one record per target in per-state buckets,
+    /// and each bounded pool's latest `PoolUsage`. The one source of the
+    /// line's and the box's counts and gauges.
+    dash: crate::tui::dashboard::Model,
 }
 
 /// A root failure's reason, as the line's spotlight and the dashboard's
@@ -868,50 +865,6 @@ fn failure_split_text((roots, took_down): (usize, usize)) -> String {
         (Some(named), 0) => format!(" ({named})"),
         (Some(named), n) => format!(" ({named}, {n} because of {blame})"),
         (None, n) => format!(" ({n} because of {blame})"),
-    }
-}
-
-/// One pool as the header shows it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PoolView {
-    unit: Unit,
-    /// `None`: unbounded, or never announced.
-    capacity: Option<u64>,
-    /// What the running targets hold, in the unit's base.
-    held: u64,
-    /// How many announced admission waits name this pool: the count of
-    /// `admission_waits` on it, kept at Start/End. It is how a pool no
-    /// running target reports holding shows at all: `sandbox`, whose slot is
-    /// the engine's and never in `reserved`.
-    waiting: u64,
-    /// The `removals_pending` of the latest `AdmissionWaitStart` on this
-    /// pool that carried one (`sandbox` only): finished runs whose sandbox
-    /// was not removed yet, the cause of a `sandbox` wait. Shown beside
-    /// `waiting` while that is above 0.
-    removals_pending: u64,
-}
-
-impl PoolView {
-    fn of(pool: &str) -> Self {
-        Self {
-            unit: Unit::default_for(pool),
-            capacity: None,
-            held: 0,
-            waiting: 0,
-            removals_pending: 0,
-        }
-    }
-}
-
-/// What an `ExecuteStart` reserved; a frame without `reserved` (an older
-/// host) counts as one CPU, which is what such a host reserved.
-fn reserved_of(reserved: Option<&BTreeMap<String, u64>>) -> BTreeMap<String, u64> {
-    match reserved {
-        None => BTreeMap::from([(
-            hcore::capacity::CPU.to_owned(),
-            hcore::capacity::MICROS_PER_CPU,
-        )]),
-        Some(r) => r.clone(),
     }
 }
 
@@ -1042,6 +995,7 @@ impl BuildState {
             self.last_event_ms
                 .map_or(ev.at_unix_ms, |t| t.max(ev.at_unix_ms)),
         );
+        self.dash.apply(ev, &self.redact);
         // Generic op timeline: any event that is an op boundary folds here,
         // independent of the counter side effects handled in the match below.
         if let Some((addr, op, boundary)) = event_op_boundary(&ev.kind) {
@@ -1111,11 +1065,9 @@ impl BuildState {
                 ..
             } => {
                 self.max_workers = Some(*count);
-                for (pool, &capacity) in resources {
-                    let view = self.pool_mut(pool);
-                    view.unit = hcore::events::unit_of(units, pool);
-                    // An unbounded pool has no capacity to show a share of.
-                    view.capacity = capacity;
+                for pool in resources.keys() {
+                    self.units
+                        .insert(pool.clone(), hcore::events::unit_of(units, pool));
                 }
             }
             BuildEventKind::Matched { addrs, complete } => {
@@ -1250,24 +1202,10 @@ impl BuildState {
                         self.clamped.remove(addr);
                     }
                 }
-                let held = reserved_of(reserved.as_ref());
-                for (pool, &amount) in &held {
-                    let view = self.pool_mut(pool);
-                    view.held = view.held.saturating_add(amount);
-                }
-                // A repeated Start replaces, rather than adds to, what the
-                // addr holds.
-                if let Some(prev) = self.running_reserved.insert(addr.clone(), held) {
-                    self.release(&prev);
-                }
             }
             BuildEventKind::ExecuteEnd { addr, error } => {
                 if error.is_none() {
                     self.executed += 1;
-                }
-                // An End with no Start releases nothing.
-                if let Some(held) = self.running_reserved.remove(addr) {
-                    self.release(&held);
                 }
                 self.clamped.remove(addr);
             }
@@ -1282,11 +1220,6 @@ impl BuildState {
             } => {
                 // A repeated Start replaces the wait, so it counts once.
                 self.end_admission_wait(addr);
-                let view = self.pool_mut(pool);
-                view.waiting = view.waiting.saturating_add(1);
-                if let Some(n) = *removals_pending {
-                    view.removals_pending = n;
-                }
                 self.admission_waits.insert(
                     addr.clone(),
                     AdmissionWait {
@@ -1406,8 +1339,7 @@ impl BuildState {
             BuildEventKind::SelectionIncomplete { .. } => {}
             // Codegen index diagnostics are log lines, not build counters.
             BuildEventKind::CodegenExcluded { .. } | BuildEventKind::CodegenImported { .. } => {}
-            // The header's gauges still sum `ExecuteStart.reserved`; nothing
-            // draws the pool's own report yet.
+            // Folded by `dash`: the gauges are the pool's own report.
             BuildEventKind::PoolUsage { .. } => {}
             // The Outputs tab's groups; nothing draws the tab yet.
             BuildEventKind::ResultOutputs { .. } => {}
@@ -1508,33 +1440,38 @@ impl BuildState {
         ))
     }
 
-    /// The count fields for one frame — see [`Counts`]. `O(1)`: every field is
-    /// either a `len()` or a counter folded in [`BuildState::apply`], so this is
-    /// four reads and the `format!`s, with no walk of any target set.
+    /// The count fields for one frame — see [`Counts`]. `O(1)`: every field
+    /// is a bucket length in the dashboard's fold, the one source of the
+    /// line's, the box's and the tabs' counts.
     pub fn counts(&self, scope: CountScope) -> Counts {
-        let (done, total) = match scope {
-            // All-targets scope: every observed target (`finished ∪ in_flight`),
-            // with the finished count over that running total. No `~` — the total
-            // grows as deps stream rather than resolving to a fixed matched set.
-            CountScope::All => {
-                let done = self.finished.len();
-                let total = done + self.in_flight_results.len();
-                (done.to_string(), Some(total.to_string()))
+        self.counts_of(&self.dash.counts(scope), scope)
+    }
+
+    /// [`Counts`] from the tabs' counts. Done is Done + Cached (a failure is
+    /// not done); the total is every target in scope, `~`-prefixed while
+    /// the matcher streams. Before any `Matched` event the matched scope has
+    /// no total: `{done} done`.
+    fn counts_of(&self, tabs: &crate::tui::dashboard::TabCounts, scope: CountScope) -> Counts {
+        let total = match scope {
+            // Every observed target: it grows as deps stream rather than
+            // resolving to a fixed set, so it is never provisional.
+            CountScope::All => Some(tabs.all().to_string()),
+            CountScope::Matched if self.dash.matched_seen() => {
+                let tilde = if self.dash.matched_complete() {
+                    ""
+                } else {
+                    "~"
+                };
+                Some(format!("{tilde}{}", tabs.all()))
             }
-            CountScope::Matched => match self.matched_progress() {
-                Some((done, total, complete)) => {
-                    let tilde = if complete { "" } else { "~" };
-                    (done.to_string(), Some(format!("{tilde}{total}")))
-                }
-                None => (self.executed.to_string(), None),
-            },
+            CountScope::Matched => None,
         };
         Counts {
-            done,
+            done: tabs.finished_ok().to_string(),
             total,
-            cached: format!("{} cached", self.cached_count(scope)),
-            waiting: format!("{} waiting", self.admission_waits.len()),
-            failed: format!("{} failed", self.errored),
+            cached: format!("{} cached", tabs.cached),
+            waiting: format!("{} waiting", tabs.blocked),
+            failed: format!("{} failed", tabs.failed_total()),
         }
     }
 
@@ -1554,7 +1491,9 @@ impl BuildState {
     /// braille — callers prepend the elapsed field themselves.
     pub fn counts_segment(&self, scope: CountScope) -> String {
         let (done, cached, failed) = self.count_fields(scope);
-        let split = failure_split_text(self.failure_split());
+        // Split in the same scope as the count it splits.
+        let tabs = self.dash.counts(scope);
+        let split = failure_split_text((tabs.failed, tabs.dep_failed));
         format!("{done} · {cached} · {failed}{split}")
     }
 
@@ -1704,26 +1643,12 @@ impl BuildState {
         self.max_workers
     }
 
-    /// Take a finished target's reservation off the running sums. Saturating:
-    /// a sum can never go below zero, whatever order the events came in.
-    fn release(&mut self, held: &BTreeMap<String, u64>) {
-        for (pool, &amount) in held {
-            if let Some(view) = self.pools.get_mut(pool) {
-                view.held = view.held.saturating_sub(amount);
-            }
-        }
-    }
-
-    /// Drop `addr`'s announced admission wait, if any, and its count on the
-    /// pool it named. Saturating, like [`release`](Self::release).
+    /// Drop `addr`'s announced admission wait, if any.
     fn end_admission_wait(&mut self, addr: &str) {
         let Some(w) = self.admission_waits.remove(addr) else {
             return;
         };
         self.spot.admission.remove(&(w.since_ms, addr.to_owned()));
-        if let Some(view) = self.pools.get_mut(&w.pool) {
-            view.waiting = view.waiting.saturating_sub(1);
-        }
     }
 
     /// Take a scratch wait that ended or was replaced out of the spotlight's
@@ -1739,58 +1664,53 @@ impl BuildState {
         }
     }
 
-    /// Pool `pool`'s entry, added with its default unit and no capacity when
-    /// it was never announced.
-    fn pool_mut(&mut self, pool: &str) -> &mut PoolView {
-        self.pools
-            .entry(pool.to_owned())
-            .or_insert_with(|| PoolView::of(pool))
-    }
-
     /// Pool `pool`'s unit: as announced, else its default.
     fn unit_of(&self, pool: &str) -> Unit {
-        self.pools
+        self.units
             .get(pool)
-            .map_or_else(|| Unit::default_for(pool), |v| v.unit)
+            .copied()
+            .unwrap_or_else(|| Unit::default_for(pool))
     }
 
-    /// The cpu the running targets hold, in CPUs (rounded up). Kept at
-    /// `ExecuteStart`/`ExecuteEnd`; reading it walks nothing.
+    /// The dashboard's fold: records, buckets and gauges.
+    pub fn dashboard(&self) -> &crate::tui::dashboard::Model {
+        &self.dash
+    }
+
+    /// The cpu pool holds, in CPUs (rounded up), as its latest `PoolUsage`
+    /// reported it. Reading it walks nothing.
     pub fn busy_cpus(&self) -> usize {
-        let held = self.pools.get(hcore::capacity::CPU).map_or(0, |v| v.held);
+        let held = self.dash.pool(hcore::capacity::CPU).map_or(0, |g| g.held);
         usize::try_from(held.div_ceil(hcore::capacity::MICROS_PER_CPU)).unwrap_or(usize::MAX)
     }
 
-    /// One `<pool> <held>/<capacity>` segment per pool other than `cpu`
-    /// (which the worker cells show) that a running target holds some of,
-    /// in name order and in the pool's unit: `memory 2.0 GiB/16.0 GiB`,
-    /// `gpu 1/2`. An unbounded pool has no capacity: `tokens 5`. A pool that
-    /// announced admission waits name adds how many: `gpu 2/2, 3 waiting`;
-    /// one no running target reports holding shows by its waits alone:
-    /// `sandbox: 3 waiting` (its slots are the engine's, in no `reserved`).
-    /// Walks the pools, never the targets.
+    /// One `<pool> <held>/<capacity>` segment per bounded pool other than
+    /// `cpu` (which the worker cells show) that holds some of itself or has
+    /// waiters, from the pool's own `PoolUsage`, in the gauges' fixed order
+    /// (memory, sandbox, then declared pools by name) and the pool's unit:
+    /// `memory 2.0 GiB/16.0 GiB`, `gpu 2/2, 3 waiting`, `sandbox: 3 waiting
+    /// (2 removals pending)`. Walks the pools, never the targets.
     pub fn pool_segments(&self) -> impl Iterator<Item = String> + '_ {
-        self.pools
-            .iter()
-            .filter(|(pool, v)| {
-                pool.as_str() != hcore::capacity::CPU && (v.held > 0 || v.waiting > 0)
-            })
-            .map(|(pool, v)| {
-                let held = hcore::events::display_amount(v.unit, v.held);
-                let base = match (v.held, v.capacity) {
-                    (0, _) => format!("{pool}:"),
-                    (_, Some(cap)) => format!(
-                        "{pool} {held}/{}",
-                        hcore::events::display_amount(v.unit, cap)
+        self.dash
+            .gauges()
+            .into_iter()
+            .filter(|g| g.pool != hcore::capacity::CPU && (g.held > 0 || g.waiting > 0))
+            .map(|g| {
+                let pool = &g.pool;
+                let base = match g.held {
+                    0 => format!("{pool}:"),
+                    held => format!(
+                        "{pool} {}/{}",
+                        hcore::events::display_amount(g.unit, held),
+                        hcore::events::display_amount(g.unit, g.capacity)
                     ),
-                    (_, None) => format!("{pool} {held}"),
                 };
-                let waiting = match v.waiting {
+                let waiting = match g.waiting {
                     0 => return base,
-                    n if v.held == 0 => format!("{base} {n} waiting"),
+                    n if g.held == 0 => format!("{base} {n} waiting"),
                     n => format!("{base}, {n} waiting"),
                 };
-                match v.removals_pending {
+                match g.removals_pending {
                     0 => waiting,
                     1 => format!("{waiting} (1 removal pending)"),
                     n => format!("{waiting} ({n} removals pending)"),
@@ -2771,20 +2691,15 @@ impl TuiProgressView {
         }
     }
 
-    /// The CPU the running targets reserved, of the pool's capacity:
-    /// `cpu 11/12`. `None` before the pool is announced and while nothing
-    /// holds any of an unbounded one.
+    /// What the cpu pool holds, of its capacity, as its latest `PoolUsage`
+    /// reported it: `cpu 11/12`. `None` before the first report.
     fn cpu_segment(&self) -> Option<String> {
-        let v = self.state.pools.get(hcore::capacity::CPU)?;
-        let held = hcore::events::display_amount(v.unit, v.held);
-        match v.capacity {
-            Some(cap) => Some(format!(
-                "cpu {held}/{}",
-                hcore::events::display_amount(v.unit, cap)
-            )),
-            None if v.held > 0 => Some(format!("cpu {held}")),
-            None => None,
-        }
+        let g = self.state.dash.pool(hcore::capacity::CPU)?;
+        Some(format!(
+            "cpu {}/{}",
+            hcore::events::display_amount(g.unit, g.held),
+            hcore::events::display_amount(g.unit, g.capacity)
+        ))
     }
 
     /// The line at `now_ms`, `width` columns wide.
@@ -2803,14 +2718,16 @@ impl TuiProgressView {
         let dashboard = self.model.has_dashboard();
         let scope = self.scope.get();
         let body = if dashboard {
-            let Counts { done, total, .. } = self.state.counts(scope);
-            let s = &self.state;
+            // The same `TabCounts` the dashboard's tabs read, so the line
+            // and the tabs cannot disagree.
+            let tabs = self.state.dash.counts(scope);
+            let Counts { done, total, .. } = self.state.counts_of(&tabs, scope);
             line::Body::Build(line::BuildCounts {
                 done,
                 total,
-                cached: s.cached_count(scope),
-                waiting: s.admission_waits.len() + s.lock_waits.len() + s.scratch_waits.len(),
-                failed: s.errored,
+                cached: tabs.cached,
+                waiting: tabs.blocked,
+                failed: tabs.failed_total(),
                 cpu: self.cpu_segment(),
             })
         } else {
@@ -4048,227 +3965,121 @@ mod tests {
         );
     }
 
-    #[test]
-    fn busy_cpu_tracks_start_and_end() {
-        let mut s = BuildState::new();
-        s.apply(&ev(
-            0,
-            execute_start_reserving("//a:x", &[("cpu", 3 * CPU)]),
-        ));
-        s.apply(&ev(
-            0,
-            execute_start_reserving("//a:y", &[("cpu", CPU / 2)]),
-        ));
-        assert_eq!(s.busy_cpus(), 4, "3 + 0.5 rounds up");
-        s.apply(&ev(1, execute_end("//a:x")));
-        assert_eq!(s.busy_cpus(), 1);
-        s.apply(&ev(2, execute_end("//a:y")));
-        assert_eq!(s.busy_cpus(), 0);
-    }
-
-    #[test]
-    fn an_unpaired_end_saturates() {
-        let mut s = BuildState::new();
-        s.apply(&ev(0, execute_start_reserving("//a:x", &[("cpu", CPU)])));
-        s.apply(&ev(1, execute_end("//a:never-started")));
-        assert_eq!(s.busy_cpus(), 1, "an End with no Start releases nothing");
-        s.apply(&ev(2, execute_end("//a:x")));
-        s.apply(&ev(3, execute_end("//a:x")));
-        assert_eq!(s.busy_cpus(), 0);
-    }
-
-    #[test]
-    fn a_double_start_counts_once() {
-        let mut s = BuildState::new();
-        s.apply(&ev(
-            0,
-            execute_start_reserving("//a:x", &[("cpu", 2 * CPU)]),
-        ));
-        s.apply(&ev(
-            1,
-            execute_start_reserving("//a:x", &[("cpu", 2 * CPU)]),
-        ));
-        assert_eq!(s.busy_cpus(), 2);
-        s.apply(&ev(2, execute_end("//a:x")));
-        assert_eq!(s.busy_cpus(), 0);
-    }
-
-    #[test]
-    fn frames_without_reserved_count_as_one() {
-        let mut s = BuildState::new();
-        s.apply(&ev(0, execute_start("//a:x")));
-        s.apply(&ev(0, execute_start("//a:y")));
-        assert_eq!(s.busy_cpus(), 2);
-    }
-
-    /// Every pool but `cpu` shows only while some running target holds it,
-    /// in its announced unit; an unbounded pool shows no capacity; a pool
-    /// that was never announced still shows what is held of it.
-    #[test]
-    fn pool_segments_show_each_held_pool_in_its_unit() {
-        let mut s = BuildState::new();
-        s.apply(&ev(
-            0,
-            BuildEventKind::RequestConfig {
-                max_workers: 4,
-                fail_fast: false,
-                scratch_disabled: false,
-                resources: [
-                    ("cpu".into(), Some(4 * CPU)),
-                    ("gpu".into(), Some(2)),
-                    ("memory".into(), Some(16 << 30)),
-                    ("tokens".into(), None),
-                ]
-                .into(),
-                units: [
-                    ("cpu".into(), "cpu".into()),
-                    ("gpu".into(), "count".into()),
-                    ("memory".into(), "bytes".into()),
-                    ("tokens".into(), "count".into()),
-                ]
-                .into(),
-            },
-        ));
-        let segments = |s: &BuildState| s.pool_segments().collect::<Vec<_>>();
-        s.apply(&ev(0, execute_start("//a:x")));
-        assert!(segments(&s).is_empty(), "cpu is the worker cells");
-        s.apply(&ev(
-            0,
-            execute_start_reserving("//a:y", &[("cpu", CPU), ("memory", 2 << 30)]),
-        ));
-        assert_eq!(segments(&s), ["memory 2.0 GiB/16.0 GiB"]);
-        s.apply(&ev(
-            0,
-            execute_start_reserving("//a:z", &[("cpu", CPU), ("gpu", 1), ("tokens", 5)]),
-        ));
-        assert_eq!(
-            segments(&s),
-            ["gpu 1/2", "memory 2.0 GiB/16.0 GiB", "tokens 5"]
-        );
-        s.apply(&ev(1, execute_end("//a:y")));
-        assert_eq!(segments(&s), ["gpu 1/2", "tokens 5"]);
-        s.apply(&ev(
-            1,
-            execute_start_reserving("//a:w", &[("cpu", CPU), ("licenses", 3)]),
-        ));
-        assert_eq!(segments(&s), ["gpu 1/2", "licenses 3", "tokens 5"]);
-        s.apply(&ev(2, execute_end("//a:z")));
-        s.apply(&ev(2, execute_end("//a:w")));
-        assert!(segments(&s).is_empty(), "{:?}", segments(&s));
-    }
-
-    /// The per-pool sum holds under what an event stream can do: two holders
-    /// of one non-cpu pool add up and release separately, a repeated Start
-    /// replaces what the addr held instead of adding to it, and an End with
-    /// no Start (or a second End) releases nothing.
-    #[test]
-    fn pool_sums_survive_shared_holders_repeats_and_unpaired_ends() {
-        let mut s = BuildState::new();
-        s.apply(&ev(
-            0,
-            BuildEventKind::RequestConfig {
-                max_workers: 4,
-                fail_fast: false,
-                scratch_disabled: false,
-                resources: [("cpu".into(), Some(4 * CPU)), ("gpu".into(), Some(4))].into(),
-                units: [("cpu".into(), "cpu".into()), ("gpu".into(), "count".into())].into(),
-            },
-        ));
-        let segments = |s: &BuildState| s.pool_segments().collect::<Vec<_>>();
-        let gpu = |n: u64| [("cpu", CPU), ("gpu", n)];
-
-        // Two holders of gpu.
-        s.apply(&ev(0, execute_start_reserving("//a:x", &gpu(1))));
-        s.apply(&ev(0, execute_start_reserving("//a:y", &gpu(2))));
-        assert_eq!(segments(&s), ["gpu 3/4"]);
-        assert_eq!(s.busy_cpus(), 2);
-
-        // A repeated Start for //a:x replaces its 1 with 1, not 2.
-        s.apply(&ev(1, execute_start_reserving("//a:x", &gpu(1))));
-        assert_eq!(segments(&s), ["gpu 3/4"], "a repeated Start replaces");
-        assert_eq!(s.busy_cpus(), 2);
-
-        // An End for an addr that never started releases nothing.
-        s.apply(&ev(1, execute_end("//a:never")));
-        assert_eq!(segments(&s), ["gpu 3/4"], "an unpaired End");
-
-        s.apply(&ev(2, execute_end("//a:y")));
-        assert_eq!(segments(&s), ["gpu 1/4"]);
-        // A second End for //a:y is unpaired too.
-        s.apply(&ev(2, execute_end("//a:y")));
-        assert_eq!(segments(&s), ["gpu 1/4"], "a second End");
-
-        s.apply(&ev(3, execute_end("//a:x")));
-        assert!(segments(&s).is_empty(), "{:?}", segments(&s));
-        assert_eq!(s.busy_cpus(), 0);
-    }
-
-    /// The `sandbox` slot is in no `ExecuteStart.reserved`, so the pool shows
-    /// by its announced waits: `sandbox: N waiting` while runs wait for
-    /// cleanup, gone once they are admitted. A held pool adds its waits to
-    /// its usual segment. A repeated Start counts once, and an End or the
-    /// waiter's own `ExecuteStart` takes it off.
-    #[test]
-    fn pool_segments_show_runs_waiting_on_a_pool() {
-        let mut s = BuildState::new();
-        s.apply(&ev(
-            0,
-            BuildEventKind::RequestConfig {
-                max_workers: 4,
-                fail_fast: false,
-                scratch_disabled: false,
-                resources: [
-                    ("cpu".into(), Some(4 * CPU)),
-                    ("gpu".into(), Some(1)),
-                    ("sandbox".into(), Some(16)),
-                ]
-                .into(),
-                units: [
-                    ("cpu".into(), "cpu".into()),
-                    ("gpu".into(), "count".into()),
-                    ("sandbox".into(), "count".into()),
-                ]
-                .into(),
-            },
-        ));
-        let segments = |s: &BuildState| s.pool_segments().collect::<Vec<_>>();
-        let wait = |addr: &str, pool: &str| BuildEventKind::AdmissionWaitStart {
-            addr: addr.into(),
+    /// A pool's report, as the engine sends it on every change.
+    fn pool_usage(pool: &str, held: u64, capacity: u64, waiting: u64) -> BuildEventKind {
+        BuildEventKind::PoolUsage {
             pool: pool.into(),
-            need: 1,
-            free: 0,
-            ahead: 0,
-            removals_pending: None,
-            yielding_to: None,
-        };
-        let end = |addr: &str| BuildEventKind::AdmissionWaitEnd { addr: addr.into() };
+            held,
+            capacity,
+            waiting,
+            removals_pending: 0,
+        }
+    }
 
-        s.apply(&ev(0, execute_start("//a:running")));
-        assert!(segments(&s).is_empty(), "a running slot is not shown");
-        s.apply(&ev(1, wait("//a:x", "sandbox")));
-        s.apply(&ev(1, wait("//a:y", "sandbox")));
-        assert_eq!(segments(&s), ["sandbox: 2 waiting"]);
-        s.apply(&ev(2, wait("//a:y", "sandbox")));
-        assert_eq!(segments(&s), ["sandbox: 2 waiting"], "a repeated Start");
-
+    /// Every gauge — the line's `cpu`, the box's cells and pool segments,
+    /// the dashboard's header — is the pool's own latest `PoolUsage`:
+    /// sandbox draws like any pool, a pool with waiters turns yellow and
+    /// shows `⧗N`, and an `ExecuteStart.reserved` moves nothing.
+    #[test]
+    fn gauges_follow_pool_usage() {
+        let mut s = BuildState::new();
         s.apply(&ev(
-            2,
-            execute_start_reserving("//a:g", &[("cpu", CPU), ("gpu", 1)]),
+            0,
+            BuildEventKind::RequestConfig {
+                max_workers: 4,
+                fail_fast: false,
+                scratch_disabled: false,
+                resources: [
+                    ("cpu".into(), Some(12 * CPU)),
+                    ("memory".into(), Some(16 << 30)),
+                    ("sandbox".into(), Some(48)),
+                    ("docker".into(), Some(2)),
+                ]
+                .into(),
+                units: [
+                    ("cpu".into(), "cpu".into()),
+                    ("memory".into(), "bytes".into()),
+                    ("sandbox".into(), "count".into()),
+                    ("docker".into(), "count".into()),
+                ]
+                .into(),
+            },
         ));
-        s.apply(&ev(2, wait("//a:z", "gpu")));
-        assert_eq!(segments(&s), ["gpu 1/1, 1 waiting", "sandbox: 2 waiting"]);
+        // Reservations alone draw nothing: no pool has reported.
+        s.apply(&ev(
+            1,
+            execute_start_reserving("//a:x", &[("cpu", 3 * CPU), ("docker", 1)]),
+        ));
+        assert_eq!(s.busy_cpus(), 0, "nothing derived from reserved");
+        assert!(s.dashboard().gauges().is_empty());
+        assert!(s.pool_segments().next().is_none());
 
-        s.apply(&ev(3, end("//a:x")));
-        // A lost End: the waiter's ExecuteStart takes the wait off.
-        s.apply(&ev(3, execute_start("//a:y")));
-        s.apply(&ev(3, end("//a:never")));
-        assert_eq!(segments(&s), ["gpu 1/1, 1 waiting"]);
-        s.apply(&ev(4, end("//a:z")));
-        assert_eq!(segments(&s), ["gpu 1/1"]);
+        s.apply(&ev(2, pool_usage("cpu", 11 * CPU + CPU / 2, 12 * CPU, 0)));
+        s.apply(&ev(2, pool_usage("memory", 9 << 30, 16 << 30, 0)));
+        s.apply(&ev(2, pool_usage("sandbox", 9, 48, 0)));
+        s.apply(&ev(2, pool_usage("docker", 2, 2, 1)));
+        assert_eq!(s.busy_cpus(), 12, "11.5 rounds up");
+        assert_eq!(
+            s.pool_segments().collect::<Vec<_>>(),
+            [
+                "memory 9.0 GiB/16.0 GiB",
+                "sandbox 9/48",
+                "docker 2/2, 1 waiting"
+            ]
+        );
+        let gauges = s.dashboard().gauges();
+        assert_eq!(
+            gauges.iter().map(|g| g.pool.as_str()).collect::<Vec<_>>(),
+            ["cpu", "memory", "sandbox", "docker"],
+            "one gauge per bounded pool, in the fixed order"
+        );
+        let title = crate::tui::dashboard::Title {
+            command: "heph r build //...",
+            session: None,
+            clock: "1m05s",
+            done: 0,
+            total: None,
+            provisional: false,
+            standing: None,
+        };
+        let (rows, _) = crate::tui::dashboard::header_lines(
+            &title,
+            &gauges,
+            &s.dashboard().counts(CountScope::Matched),
+            crate::tui::dashboard::Tab::All,
+            200,
+        );
+        let text = |l: &Line<'_>| {
+            l.spans
+                .iter()
+                .map(|sp| sp.content.as_ref())
+                .collect::<String>()
+        };
+        let header = rows.iter().map(text).collect::<Vec<_>>().join("\n");
+        for want in ["11.5/12", "mem ██▎░ 9/16G", "sandbox ▊░░░ 9/48", "2/2 ⧗1"] {
+            assert!(header.contains(want), "{want} in\n{header}");
+        }
+        let docker = rows
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|sp| sp.content.contains("⧗1"))
+            .expect("docker's waiters");
+        assert_eq!(docker.style.fg, Some(Color::Yellow), "{docker:?}");
+
+        // The next report replaces the last; a run's end moves nothing.
+        s.apply(&ev(3, execute_end("//a:x")));
+        assert_eq!(s.busy_cpus(), 12);
+        s.apply(&ev(4, pool_usage("cpu", 0, 12 * CPU, 0)));
+        s.apply(&ev(4, pool_usage("docker", 1, 2, 0)));
+        assert_eq!(s.busy_cpus(), 0);
+        assert_eq!(
+            s.pool_segments().collect::<Vec<_>>(),
+            ["memory 9.0 GiB/16.0 GiB", "sandbox 9/48", "docker 1/2"]
+        );
     }
 
     /// A `sandbox` wait names its cause in the header: how many finished
-    /// runs' sandboxes were still being removed, as of the latest notice.
+    /// runs' sandboxes were still being removed, as the pool reports it.
     #[test]
     fn pool_segments_show_removals_pending_on_a_sandbox_wait() {
         let mut s = BuildState::new();
@@ -4282,11 +4093,21 @@ mod tests {
             removals_pending: Some(pending),
             yielding_to: None,
         };
+        let usage = |waiting, removals_pending| BuildEventKind::PoolUsage {
+            pool: "sandbox".into(),
+            held: 0,
+            capacity: 16,
+            waiting,
+            removals_pending,
+        };
         s.apply(&ev(1, wait("//a:x", 0)));
+        s.apply(&ev(1, usage(1, 0)));
         assert_eq!(segments(&s), ["sandbox: 1 waiting"], "none pending");
         s.apply(&ev(1, wait("//a:y", 1)));
+        s.apply(&ev(1, usage(2, 1)));
         assert_eq!(segments(&s), ["sandbox: 2 waiting (1 removal pending)"]);
         s.apply(&ev(2, wait("//a:z", 3)));
+        s.apply(&ev(2, usage(3, 3)));
         assert_eq!(segments(&s), ["sandbox: 3 waiting (3 removals pending)"]);
         let row: String = s.admission_wait_lines(2, "")[2]
             .spans
@@ -4303,6 +4124,7 @@ mod tests {
                 BuildEventKind::AdmissionWaitEnd { addr: addr.into() },
             ));
         }
+        s.apply(&ev(3, usage(0, 0)));
         assert!(segments(&s).is_empty(), "{:?}", segments(&s));
     }
 
@@ -5234,7 +5056,9 @@ mod tests {
         // One real build (execute end ok), one cache hit, one running, one failed.
         v.apply(&ev(0, execute_start("//a:built")));
         v.apply(&ev(1, execute_end("//a:built")));
+        v.apply(&ev(1, result_end("//a:built", None)));
         v.apply(&ev(2, local_cache_hit("//a:cached")));
+        v.apply(&ev(2, result_end("//a:cached", None)));
         v.apply(&ev(3, result_start("//a:running")));
         v.apply(&ev(4, result_start("//a:failed")));
         v.apply(&ev(5, result_end("//a:failed", Some("boom".into()))));
@@ -5243,7 +5067,8 @@ mod tests {
             "{}",
             v.render_box("⠋", 100, 120, 8).first().expect("header")
         );
-        assert!(header.contains("1 done"), "{header}");
+        // Done is Done + Cached, as the line and the tabs count it.
+        assert!(header.contains("2 done"), "{header}");
         assert!(header.contains("1 cached"), "{header}");
         assert!(header.contains("1 failed"), "{header}");
         // The "running" count was dropped in favour of the worker braille.
@@ -5280,6 +5105,7 @@ mod tests {
         let mut v = TuiProgressView::new("L");
         v.apply(&ev(0, max_workers(8)));
         v.apply(&ev(1, execute_start("//a:b")));
+        v.apply(&ev(1, pool_usage("cpu", CPU, 8 * CPU, 0)));
         let header = format!(
             "{}",
             v.render_box("⠋", 100, 120, 8).first().expect("header")
@@ -5303,6 +5129,7 @@ mod tests {
         v.apply(&ev(0, max_workers(8)));
         // One busy worker → first cell shows the 1-dot glyph, in the header.
         v.apply(&ev(1, execute_start("//a:b")));
+        v.apply(&ev(1, pool_usage("cpu", CPU, 8 * CPU, 0)));
         let header = format!(
             "{}",
             v.render_box("⠋", 120, 120, 8).first().expect("header")
@@ -5633,6 +5460,7 @@ mod tests {
         let mut core = BuildState::new();
         core.apply(&ev(0, max_workers(8)));
         core.apply(&ev(1, execute_start("//a:b")));
+        core.apply(&ev(1, pool_usage("cpu", CPU, 8 * CPU, 0)));
         // A gc event must not perturb the build counters.
         core.apply(&ev(2, gc_swept(9, 9)));
 
@@ -5895,11 +5723,13 @@ mod tests {
         // frame precisely so the header does not re-derive them.
         let mut s = BuildState::new();
 
-        // Before any Matched event: the done segment falls back to `{executed} done`
-        // with no denominator, and cached falls back to raw hit counts.
+        // Before any Matched event: the done segment has no denominator, and
+        // done is Done + Cached of every target.
         s.apply(&ev(0, execute_start("//a:built")));
         s.apply(&ev(1, execute_end("//a:built")));
+        s.apply(&ev(1, result_end("//a:built", None)));
         s.apply(&ev(2, local_cache_hit("//a:cached")));
+        s.apply(&ev(2, result_end("//a:cached", None)));
         s.apply(&ev(3, result_start("//a:failed")));
         s.apply(&ev(4, result_end("//a:failed", Some("boom".into()))));
         for scope in [CountScope::Matched, CountScope::All] {
@@ -5909,16 +5739,16 @@ mod tests {
         // pin it to a literal rather than only cross-checking it.
         assert_eq!(
             header_count_fields(&s, CountScope::Matched),
-            fields("1 done", "1 cached", "1 failed"),
+            fields("2 done", "1 cached", "1 failed"),
         );
         assert_eq!(
             header_count_fields(&s, CountScope::All),
-            fields("1 / 1 done", "1 cached", "1 failed"),
+            fields("2 / 3 done", "1 cached", "1 failed"),
         );
 
-        // Provisional matched total (`~`): three matched, one finished, two of
-        // them cached. The distinct cached/failed counts keep a transposition of
-        // the two fields visible.
+        // Provisional matched total (`~`): three matched, one finished from
+        // cache, one with a hit still running. A hit counts once its target
+        // ends; the unmatched failure is out of the matched scope.
         s.apply(&ev(5, matched(&["//m:x", "//m:y", "//m:z"], false)));
         s.apply(&ev(6, result_start("//m:x")));
         s.apply(&ev(7, local_cache_hit("//m:x")));
@@ -5930,7 +5760,11 @@ mod tests {
         }
         assert_eq!(
             header_count_fields(&s, CountScope::Matched),
-            fields("1 / ~3 done", "2 cached", "1 failed"),
+            fields("1 / ~3 done", "1 cached", "0 failed"),
+        );
+        assert_eq!(
+            header_count_fields(&s, CountScope::All),
+            fields("3 / 6 done", "2 cached", "1 failed"),
         );
 
         // Matcher resolves: the `~` drops on both paths.
@@ -5940,7 +5774,7 @@ mod tests {
         }
         assert_eq!(
             header_count_fields(&s, CountScope::Matched),
-            fields("1 / 3 done", "2 cached", "1 failed"),
+            fields("1 / 3 done", "1 cached", "0 failed"),
         );
     }
 
