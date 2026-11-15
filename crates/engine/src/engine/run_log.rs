@@ -32,6 +32,7 @@
 //! the sweep, so a killed heph's directory (a `cache = false` success's
 //! retained live file with it) is removed by the next heph to look.
 
+use hcore::session_record::{RunLogAnnouncer, RunLogRecord};
 use hdriver_support::redact::{Needles, Redactor};
 use std::fs::File;
 use std::io::{self, Write as _};
@@ -43,7 +44,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime};
 
 /// The directory under the home holding every engine's run logs.
-pub(crate) const RUNS_DIR: &str = "runs";
+pub(crate) const RUNS_DIR: &str = hcore::session_record::RUNS_DIR;
 /// The file in `runs/<engine-id>/` whose lock says the directory is in use.
 pub(crate) const LOCK_FILE: &str = "lock";
 /// The prefix of a `runs/<engine-id>/` directory still being set up.
@@ -60,6 +61,8 @@ pub(crate) struct RunLogs {
     next: AtomicU64,
     /// The sweep this engine started when it was made, until it is awaited.
     start_sweep: Mutex<Option<tokio::task::JoinHandle<usize>>>,
+    /// Told of each live file when its first byte creates it (the session).
+    announcer: Option<Arc<dyn RunLogAnnouncer>>,
 }
 
 impl std::fmt::Debug for RunLogs {
@@ -141,7 +144,13 @@ impl RunLogs {
             }),
             next: AtomicU64::new(0),
             start_sweep: Mutex::new(None),
+            announcer: None,
         }
+    }
+
+    /// Announce each live file to `announcer` when it is created.
+    pub(crate) fn set_announcer(&mut self, announcer: Arc<dyn RunLogAnnouncer>) {
+        self.announcer = Some(announcer);
     }
 
     /// The [`sweep`] of every other heph's directory, as a job for the
@@ -183,12 +192,34 @@ impl RunLogs {
         self.dir.path.clone()
     }
 
-    /// A new live log for one run, and the guard that unlinks it. Touches no
-    /// file: the log's first byte creates it.
+    /// A new live log for one run, unannounced.
+    #[cfg(test)]
     pub(crate) fn create(&self) -> (Arc<RunLog>, LiveGuard) {
+        let addr = hmodel::htaddr::parse_addr("//test:run").expect("addr");
+        self.create_for(&addr, "hashin")
+    }
+
+    /// A new live log for `addr`'s run at `hashin`, and the guard that
+    /// unlinks it. Touches no file: the log's first byte creates it, and
+    /// announces it as `runs/<id>/<n>.log` (relative to the home) when an
+    /// announcer is set. Allocates nothing for the announcement otherwise.
+    pub(crate) fn create_for(
+        &self,
+        addr: &hmodel::htaddr::Addr,
+        hashin: &str,
+    ) -> (Arc<RunLog>, LiveGuard) {
         let n = self.next.fetch_add(1, Ordering::Relaxed);
-        let path = self.dir.path.join(format!("{n}.log"));
-        let log = Arc::new(RunLog::new(path, Arc::clone(&self.dir)));
+        let name = format!("{n}.log");
+        let announce = self.announcer.as_ref().map(|to| Announce {
+            to: Arc::clone(to),
+            record: RunLogRecord {
+                addr: addr.format(),
+                hashin: hashin.to_owned(),
+                file: format!("{RUNS_DIR}/{}/{name}", self.dir.id),
+            },
+        });
+        let path = self.dir.path.join(name);
+        let log = Arc::new(RunLog::new(path, Arc::clone(&self.dir), announce));
         let guard = LiveGuard {
             log: Arc::clone(&log),
             unlink: true,
@@ -341,6 +372,14 @@ struct State {
     /// engine fails the run with it once the driver returned `Ok`.
     error: Option<io::Error>,
     write: WriteFn,
+    /// Sent when the file is created, then gone: one record per run.
+    announce: Option<Announce>,
+}
+
+/// A live file's announcement, waiting for the byte that creates the file.
+struct Announce {
+    to: Arc<dyn RunLogAnnouncer>,
+    record: RunLogRecord,
 }
 
 /// Where the live file is in its life.
@@ -362,7 +401,7 @@ impl std::fmt::Debug for RunLog {
 }
 
 impl RunLog {
-    fn new(path: PathBuf, dir: Arc<RunsDir>) -> Self {
+    fn new(path: PathBuf, dir: Arc<RunsDir>, announce: Option<Announce>) -> Self {
         Self {
             path,
             dir,
@@ -374,6 +413,7 @@ impl RunLog {
                 err: None,
                 error: None,
                 write: write_file,
+                announce,
             }),
             ended: AtomicBool::new(false),
             discarded: AtomicU64::new(0),
@@ -451,11 +491,15 @@ impl RunLog {
 
     /// Append `bytes`, creating the file on the first of them. Blocking, as
     /// the `write(2)` itself is: one `open` (and one `mkdir`, for the
-    /// engine's first log) per run that writes anything.
+    /// engine's first log) per run that writes anything. Creating the file
+    /// announces it (one channel send), before its first byte is written.
     fn append(&self, st: &mut State, bytes: &[u8]) -> io::Result<()> {
         if let Live::Unopened = st.file {
             st.file = Live::Open(self.create_file()?);
             st.created = true;
+            if let Some(Announce { to, record }) = st.announce.take() {
+                to.run_log_created(record);
+            }
         }
         match &mut st.file {
             Live::Open(file) => (st.write)(file, bytes),
@@ -1017,6 +1061,42 @@ mod tests {
         assert!(matches!(imported, Imported::Replaced), "{imported:?}");
         let file = file.expect("the import created the file");
         assert_eq!(read_all(&file).expect("read"), b"inline [redacted]");
+    }
+
+    #[derive(Debug, Default)]
+    struct Announced(Mutex<Vec<RunLogRecord>>);
+
+    impl RunLogAnnouncer for Announced {
+        fn run_log_created(&self, record: RunLogRecord) {
+            self.0.lock().expect("announced").push(record);
+        }
+    }
+
+    /// A live file is announced once, by the byte that creates it, as its
+    /// path relative to the home; a run that writes nothing announces
+    /// nothing.
+    #[test]
+    fn run_log_is_announced_by_its_first_byte() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let mut logs = RunLogs::new(home.path());
+        let announced = Arc::new(Announced::default());
+        logs.set_announcer(Arc::clone(&announced) as Arc<dyn RunLogAnnouncer>);
+        let addr = hmodel::htaddr::parse_addr("//p:t").expect("addr");
+
+        let (quiet, _quiet_guard) = logs.create_for(&addr, "h0");
+        drop(quiet.finalize());
+        let (log, _guard) = logs.create_for(&addr, "h1");
+        assert!(announced.0.lock().expect("announced").is_empty());
+        log.write_chunk(Stream::Stdout, b"a", None);
+        log.write_chunk(Stream::Stderr, b"b", None);
+        drop(log.finalize());
+
+        let records = announced.0.lock().expect("announced").clone();
+        assert_eq!(records.len(), 1, "{records:?}");
+        let rec = records.first().expect("one record");
+        assert_eq!((rec.addr.as_str(), rec.hashin.as_str()), ("//p:t", "h1"));
+        let rel = rec.relative_file().expect("a well-formed file field");
+        assert_eq!(home.path().join(rel), log.path());
     }
 
     #[tokio::test]

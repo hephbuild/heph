@@ -9,7 +9,7 @@
 //!
 //! - `events.ndjson`: through a `BufWriter`, flushed 250ms after the first
 //!   unflushed byte and at exit; capped at [`EVENTS_CAP`] with a `Truncated`
-//!   record, after which only `End`/`InflightWritten` and the view records
+//!   record, after which only `End`/`InflightWritten`, `RunLog` and the view records
 //!   [`outlives_cap`] names are appended.
 //! - `status.json`: at most once a second and only when something changed,
 //!   written to a temp file and renamed over.
@@ -70,7 +70,8 @@ enum Msg {
     InflightWritten {
         at_unix_ms: u64,
     },
-    /// A view record (`Label`, `Approval`, `Finished`, `Output`).
+    /// A view record (`Label`, `Approval`, `Finished`, `Output`), or a
+    /// `RunLog`: a session record the build itself did not emit.
     View {
         at_unix_ms: u64,
         kind: SessionRecordKind,
@@ -171,6 +172,14 @@ impl SessionTap {
     /// it stands for (a `Finished`'s is the clock the summary used).
     pub fn view(&self, at_unix_ms: u64, kind: SessionRecordKind) {
         self.send(Msg::View { at_unix_ms, kind });
+    }
+
+    /// Record that a run's live log was created, past the cap too.
+    pub fn run_log(&self, record: hcore::session_record::RunLogRecord) {
+        self.send(Msg::View {
+            at_unix_ms: now_unix_ms(),
+            kind: SessionRecordKind::RunLog(Box::new(record)),
+        });
     }
 
     /// Record that `inflight.txt` was just rewritten.
@@ -407,11 +416,15 @@ fn injected_panic() {}
 /// (one short line), and the approval prompt's *clear*, so a prompt recorded
 /// before the cap does not stay on a viewer's screen. A prompt itself carries
 /// notice paths and stays capped.
+///
+/// `RunLog` too: one short line per run that writes anything, and the only
+/// way a follower finds the log of a run that starts after the cap.
 fn outlives_cap(kind: &SessionRecordKind) -> bool {
     match kind {
         SessionRecordKind::Finished
         | SessionRecordKind::Output { .. }
         | SessionRecordKind::Label { .. }
+        | SessionRecordKind::RunLog(_)
         | SessionRecordKind::Approval { prompt: None } => true,
         SessionRecordKind::Approval { prompt: Some(_) }
         | SessionRecordKind::Log { .. }

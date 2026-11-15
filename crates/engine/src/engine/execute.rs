@@ -160,7 +160,7 @@ impl Engine {
                 let live = if shell || outputs_are_material {
                     None
                 } else {
-                    Some(self.run_logs.create())
+                    Some(self.run_logs.create_for(addr, hashin))
                 };
                 let sandbox_dir = {
                     let mut dir = self.home.join("sandbox");

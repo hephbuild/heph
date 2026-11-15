@@ -94,7 +94,9 @@ impl SessionFeed {
                 s.ended_at_ms = Some(at);
                 return Routed::Nothing;
             }
-            SessionRecordKind::Truncated
+            // Where a run's log is, for a log reader; nothing a TUI prints.
+            SessionRecordKind::RunLog(_)
+            | SessionRecordKind::Truncated
             | SessionRecordKind::InflightWritten
             | SessionRecordKind::Unknown => return Routed::Nothing,
         };

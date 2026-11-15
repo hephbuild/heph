@@ -778,6 +778,17 @@ impl Engine {
         self.sandbox_removal_hold.gate = Some(gate.state());
     }
 
+    /// Announce each run's live log to `announcer` (the process's session)
+    /// when the run's first byte creates it: addr, hashin and the file
+    /// relative to the home. Diagnostics only: nothing announced reaches a
+    /// hash or a target.
+    pub fn set_run_log_announcer(
+        &mut self,
+        announcer: Arc<dyn hcore::session_record::RunLogAnnouncer>,
+    ) {
+        self.run_logs.set_announcer(announcer);
+    }
+
     /// Wait for the sweep of other hephs' run logs this engine started when it
     /// was made; how many directories it removed.
     #[cfg(any(test, feature = "test-support"))]

@@ -1,0 +1,602 @@
+//! Finding a running target's live log through the sessions that recorded it.
+//!
+//! A heph that runs a target announces its live log as a `RunLog` record
+//! (`addr`, `hashin`, `file` relative to its home). A reader in another
+//! process (the log API's follower, `heph log`, an attached dashboard) finds
+//! it here. The rules (spec I4, "Who is followed"):
+//!
+//! - **Only this workspace.** Sessions are per user, across checkouts: a
+//!   session counts only when its `meta.json` names the reader's own home,
+//!   exactly, and lists [`CAPABILITY_RUN_LOGS`]. A build of the same address
+//!   in another checkout never answers.
+//! - **Only a live session.** A record is trusted only while the session's
+//!   lock is held (probed before anything is read, as `list` does): a
+//!   crashed or ended heph's records read as absent.
+//! - **The newest run.** The last `RunLog` for the addr is the one; an
+//!   `ExecuteEnd` for the addr after it means that run ended.
+//! - **A file gone means ended.** The live file is unlinked once what
+//!   replaces it (the cache entry's `Log`, the failure slot) is in place,
+//!   and the `ExecuteEnd` can land up to 250 ms later: a record still open
+//!   over a missing file is [`SessionRunLog::Ended`], never "no log".
+//! - **`file` cannot leave `<home>/runs/`.** It must be `runs/<dir>/<name>`
+//!   ([`RunLogRecord::relative_file`]); `runs/` and `runs/<dir>/` must be
+//!   real directories, not symlinks; the file is opened `O_NOFOLLOW` (and
+//!   `O_NONBLOCK`, so a planted FIFO cannot hang the reader) and must be a
+//!   regular file. Anything else reads as absent.
+//!
+//! Past the event log's 64 MiB cap, `RunLog` is still written but
+//! `ExecuteEnd` is not, so there a run's end shows only as its file being
+//! gone (or, for a `cache = false` success, whose file stays until the heph
+//! exits, as the session ending).
+
+use std::fs::{File, OpenOptions};
+use std::io;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
+
+use anyhow::Context as _;
+use hcore::events::BuildEventKind;
+
+use super::format::{CAPABILITY_RUN_LOGS, RunLogRecord, SessionMeta, SessionRecordKind, files};
+use super::{RecordReader, SessionId, SessionRoot, lockfile};
+
+/// What a live session says about an addr's newest run log.
+#[derive(Debug)]
+pub enum SessionRunLog {
+    /// The run is going on: its live file, opened. Read it to EOF and keep
+    /// following until the run ends.
+    Live {
+        record: RunLogRecord,
+        /// When the record was written.
+        at_unix_ms: u64,
+        /// `<home>/<file>`.
+        path: PathBuf,
+        file: File,
+    },
+    /// The run ended: an `ExecuteEnd` for the addr followed its record, or
+    /// its live file is gone. What replaced the file is found by
+    /// `record.hashin` (the cache entry's `Log`, else the failure slot).
+    Ended {
+        record: RunLogRecord,
+        at_unix_ms: u64,
+    },
+}
+
+impl SessionRunLog {
+    pub fn record(&self) -> &RunLogRecord {
+        match self {
+            Self::Live { record, .. } | Self::Ended { record, .. } => record,
+        }
+    }
+
+    pub fn at_unix_ms(&self) -> u64 {
+        match self {
+            Self::Live { at_unix_ms, .. } | Self::Ended { at_unix_ms, .. } => *at_unix_ms,
+        }
+    }
+}
+
+/// A run log found by [`find_run_log`], and the session that recorded it
+/// (the status line names it).
+#[derive(Debug)]
+pub struct FoundRunLog {
+    pub session: SessionId,
+    pub log: SessionRunLog,
+}
+
+/// The newest trusted run log of `addr` across every live session under
+/// `root` recorded for `home`. `None` when no such session recorded one.
+/// A session that cannot be read is skipped (logged at debug), never an
+/// error: only an unreadable `root` is.
+///
+/// Blocking: probes each session's lock and reads the `events.ndjson` of
+/// those that are live and in this workspace.
+pub fn find_run_log(
+    root: &SessionRoot,
+    home: &Path,
+    addr: &str,
+) -> anyhow::Result<Option<FoundRunLog>> {
+    let root = root.path();
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", root.display())),
+    };
+    let mut newest: Option<FoundRunLog> = None;
+    for entry in entries.filter_map(Result::ok) {
+        let Some(id) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| SessionId::parse(s).ok())
+        else {
+            continue;
+        };
+        let log = match session_run_log(&entry.path(), home, addr) {
+            Ok(Some(log)) => log,
+            Ok(None) => continue,
+            Err(e) => {
+                tracing::debug!(session = %id, error = %format!("{e:#}"), "skipping session");
+                continue;
+            }
+        };
+        let newer = newest.as_ref().is_none_or(|n| {
+            (log.at_unix_ms(), id.encode()) > (n.log.at_unix_ms(), n.session.encode())
+        });
+        if newer {
+            newest = Some(FoundRunLog { session: id, log });
+        }
+    }
+    Ok(newest)
+}
+
+/// What the session in `dir` says about `addr`'s newest run log, when it is
+/// live, was recorded for `home` and records run logs. See the module docs
+/// for every rule; `None` is "this session has no trusted log of `addr`".
+pub fn session_run_log(
+    dir: &Path,
+    home: &Path,
+    addr: &str,
+) -> anyhow::Result<Option<SessionRunLog>> {
+    // First, as `list` does: an `End` written before the release is then in
+    // what is read next.
+    if !lockfile::is_held(&dir.join(files::LOCK)).context("probing the session's lock")? {
+        return Ok(None);
+    }
+    let meta = match std::fs::read(dir.join(files::META)) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).context("reading meta.json"),
+    };
+    // A newer format or a corrupt file: not one this heph follows.
+    let Ok(meta) = SessionMeta::decode(&meta) else {
+        return Ok(None);
+    };
+    if !meta.has_capability(CAPABILITY_RUN_LOGS)
+        || meta.home_dir.as_deref().map(Path::new) != Some(home)
+    {
+        return Ok(None);
+    }
+    let events = match File::open(dir.join(files::EVENTS)) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).context("opening events.ndjson"),
+    };
+    let mut reader = RecordReader::new(events);
+    let mut newest: Option<(u64, RunLogRecord)> = None;
+    let mut ended = false;
+    while let Some(rec) = reader.next_record().context("reading events.ndjson")? {
+        match (rec.kind, rec.session) {
+            (_, Some(SessionRecordKind::RunLog(run)))
+                if run.addr == addr && run.relative_file().is_some() =>
+            {
+                newest = Some((rec.at_unix_ms, *run));
+                ended = false;
+            }
+            (Some(BuildEventKind::ExecuteEnd { addr: a, .. }), _) if a == addr => ended = true,
+            _ => {}
+        }
+    }
+    let Some((at_unix_ms, record)) = newest else {
+        return Ok(None);
+    };
+    if ended {
+        return Ok(Some(SessionRunLog::Ended { record, at_unix_ms }));
+    }
+    Ok(
+        match open_live(home, &record).context("opening a live run log")? {
+            Opened::File(path, file) => Some(SessionRunLog::Live {
+                record,
+                at_unix_ms,
+                path,
+                file,
+            }),
+            Opened::Gone => Some(SessionRunLog::Ended { record, at_unix_ms }),
+            Opened::Refused => None,
+        },
+    )
+}
+
+/// What opening a record's `file` under the home came to.
+#[derive(Debug)]
+enum Opened {
+    File(PathBuf, File),
+    /// The file (or its directory) is not there: the run ended.
+    Gone,
+    /// Not a plain file under real `runs/` directories: absent.
+    Refused,
+}
+
+/// Open `record.file` under `home` without following a symlink on the way.
+fn open_live(home: &Path, record: &RunLogRecord) -> io::Result<Opened> {
+    let Some(rel) = record.relative_file() else {
+        return Ok(Opened::Refused);
+    };
+    let Some(parent) = rel.parent() else {
+        return Ok(Opened::Refused);
+    };
+    // `runs/`, then `runs/<dir>/`: each a real directory.
+    let mut dir = home.to_path_buf();
+    for part in parent.components() {
+        dir.push(part);
+        match std::fs::symlink_metadata(&dir) {
+            Ok(m) if m.file_type().is_dir() => {}
+            Ok(_) => return Ok(Opened::Refused),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Opened::Gone),
+            Err(e) => return Err(e),
+        }
+    }
+    let path = home.join(rel);
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&path)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Opened::Gone),
+        // A symlink in the file's place.
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Ok(Opened::Refused),
+        Err(e) => return Err(e),
+    };
+    if !file.metadata()?.file_type().is_file() {
+        return Ok(Opened::Refused);
+    }
+    Ok(Opened::File(path, file))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write as _;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use hcore::events::BuildEventKind;
+    use hcore::session_record::RunLogAnnouncer as _;
+
+    use super::super::format::{META_FORMAT, SessionRecord};
+    use super::super::{SessionHeader, SessionSlot, recorder};
+    use super::*;
+
+    const ADDR: &str = "//p:t";
+
+    /// A session directory as a recording heph leaves it: `meta.json` for
+    /// `home` with `caps`, `events.ndjson` holding `records`, and its lock,
+    /// held while the returned file is.
+    fn session(
+        root: &Path,
+        n: u8,
+        home: &Path,
+        caps: &[&str],
+        records: &[SessionRecord],
+    ) -> (PathBuf, File) {
+        let id = SessionId::new(1_800_000_000_000 + u64::from(n), n);
+        let dir = root.join(id.encode());
+        std::fs::create_dir_all(&dir).expect("session dir");
+        let lock = lockfile::acquire_owner_lock(&dir.join(files::LOCK)).expect("lock");
+        let meta = SessionMeta {
+            format: META_FORMAT,
+            id,
+            owner_pid: std::process::id(),
+            started_unix_ms: id.started_unix_ms(),
+            heph_version: "test".into(),
+            argv: Vec::new(),
+            cwd: None,
+            workspace_root: None,
+            home_dir: Some(home.to_string_lossy().into_owned()),
+            label: String::new(),
+            header: super::super::HeaderKind::Build,
+            interactive: false,
+            capabilities: caps.iter().map(|&c| c.to_owned()).collect(),
+        };
+        recorder::write_atomically(&dir, files::META, &meta).expect("meta");
+        append(&dir, records);
+        (dir, lock)
+    }
+
+    fn append(dir: &Path, records: &[SessionRecord]) {
+        let mut f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join(files::EVENTS))
+            .expect("events");
+        for r in records {
+            writeln!(f, "{}", serde_json::to_string(r).expect("encode")).expect("write");
+        }
+    }
+
+    fn run_log(at: u64, addr: &str, hashin: &str, file: &str) -> SessionRecord {
+        SessionRecord::session(
+            at,
+            SessionRecordKind::RunLog(Box::new(RunLogRecord {
+                addr: addr.into(),
+                hashin: hashin.into(),
+                file: file.into(),
+            })),
+        )
+    }
+
+    fn execute_end(at: u64, addr: &str) -> SessionRecord {
+        SessionRecord {
+            at_unix_ms: at,
+            kind: Some(BuildEventKind::ExecuteEnd {
+                addr: addr.into(),
+                error: None,
+            }),
+            session: None,
+        }
+    }
+
+    /// `<home>/<rel>` with `bytes`.
+    fn live_file(home: &Path, rel: &str, bytes: &[u8]) -> PathBuf {
+        let path = home.join(rel);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("runs dir");
+        std::fs::write(&path, bytes).expect("live file");
+        path
+    }
+
+    fn hashin_of(log: Option<SessionRunLog>) -> Option<(bool, String)> {
+        log.map(|l| {
+            (
+                matches!(l, SessionRunLog::Live { .. }),
+                l.record().hashin.clone(),
+            )
+        })
+    }
+
+    /// I4: the newest `RunLog` of the addr is the one; an `ExecuteEnd` after
+    /// it, or its file gone, is "ended"; other addrs' records are not read
+    /// as this one's.
+    #[test]
+    fn run_log_reader_follows_the_newest_run() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let root = tmp.path().join("sessions");
+        live_file(&home, "runs/e/1.log", b"second\n");
+        let (dir, _lock) = session(
+            &root,
+            1,
+            &home,
+            &[CAPABILITY_RUN_LOGS],
+            &[
+                run_log(10, ADDR, "h0", "runs/e/0.log"),
+                execute_end(11, ADDR),
+                run_log(12, ADDR, "h1", "runs/e/1.log"),
+                run_log(13, "//p:tt", "other", "runs/e/2.log"),
+                execute_end(14, "//p:tt"),
+            ],
+        );
+        let log = session_run_log(&dir, &home, ADDR).expect("read");
+        let Some(SessionRunLog::Live {
+            path, at_unix_ms, ..
+        }) = &log
+        else {
+            panic!("{log:?}");
+        };
+        assert_eq!((path.clone(), *at_unix_ms), (home.join("runs/e/1.log"), 12));
+        // A near-miss addr never answers for this one.
+        assert_eq!(
+            hashin_of(session_run_log(&dir, &home, "//p:").expect("read")),
+            None
+        );
+
+        // Its file gone while no end is recorded yet: ended, not absent.
+        std::fs::remove_file(home.join("runs/e/1.log")).expect("unlink");
+        assert_eq!(
+            hashin_of(session_run_log(&dir, &home, ADDR).expect("read")),
+            Some((false, "h1".into()))
+        );
+        live_file(&home, "runs/e/1.log", b"again\n");
+        append(&dir, &[execute_end(15, ADDR)]);
+        assert_eq!(
+            hashin_of(session_run_log(&dir, &home, ADDR).expect("read")),
+            Some((false, "h1".into())),
+            "an ExecuteEnd after the record ends the run, file or not"
+        );
+        // A later run of the addr is live again.
+        live_file(&home, "runs/e/3.log", b"third\n");
+        append(&dir, &[run_log(16, ADDR, "h2", "runs/e/3.log")]);
+        assert_eq!(
+            hashin_of(session_run_log(&dir, &home, ADDR).expect("read")),
+            Some((true, "h2".into()))
+        );
+    }
+
+    /// I4: a record is trusted only while the session's lock is held; a
+    /// session of another home (another checkout), or one whose heph does not
+    /// record run logs, never answers.
+    #[test]
+    fn run_log_reader_trusts_only_live_sessions_of_this_home() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let other = tmp.path().join("other").join("home");
+        let root = tmp.path().join("sessions");
+        live_file(&home, "runs/e/0.log", b"x");
+        let records = [run_log(10, ADDR, "h0", "runs/e/0.log")];
+
+        let (dir, lock) = session(&root, 1, &home, &[CAPABILITY_RUN_LOGS], &records);
+        assert!(session_run_log(&dir, &home, ADDR).expect("read").is_some());
+        assert!(
+            session_run_log(&dir, &other, ADDR).expect("read").is_none(),
+            "another checkout's home"
+        );
+        drop(lock);
+        assert!(
+            session_run_log(&dir, &home, ADDR).expect("read").is_none(),
+            "a session whose lock is free (crashed or ended)"
+        );
+
+        let (dir, _lock) = session(&root, 2, &home, &["inflight"], &records);
+        assert!(
+            session_run_log(&dir, &home, ADDR).expect("read").is_none(),
+            "a heph that does not advertise run_logs"
+        );
+        assert!(
+            find_run_log(&SessionRoot::new(&root), &home, ADDR)
+                .expect("find")
+                .is_none()
+        );
+    }
+
+    /// Across sessions, the newest record wins, and the session that recorded
+    /// it is named.
+    #[test]
+    fn find_run_log_picks_the_newest_session() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let root = tmp.path().join("sessions");
+        live_file(&home, "runs/a/0.log", b"older");
+        live_file(&home, "runs/b/0.log", b"newer");
+        let (_d1, _l1) = session(
+            &root,
+            1,
+            &home,
+            &[CAPABILITY_RUN_LOGS],
+            &[run_log(20, ADDR, "h-new", "runs/b/0.log")],
+        );
+        let (_d2, _l2) = session(
+            &root,
+            2,
+            &home,
+            &[CAPABILITY_RUN_LOGS],
+            &[run_log(10, ADDR, "h-old", "runs/a/0.log")],
+        );
+        let found = find_run_log(&SessionRoot::new(&root), &home, ADDR)
+            .expect("find")
+            .expect("found");
+        assert_eq!(found.session, SessionId::new(1_800_000_000_001, 1));
+        assert_eq!(found.log.record().hashin, "h-new");
+        assert!(
+            find_run_log(&SessionRoot::new(tmp.path().join("none")), &home, ADDR)
+                .expect("a missing root is no session")
+                .is_none()
+        );
+    }
+
+    /// A `RunLog` whose `file` has `..`, is absolute, or resolves through a
+    /// symlink on the way (`runs/`, `runs/<dir>/`, the file itself) reads as
+    /// absent and is never opened; a FIFO in its place neither hangs the
+    /// reader nor reads as a log.
+    #[test]
+    fn run_log_file_field_cannot_escape_home() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("sessions");
+        let outside = tmp.path().join("outside");
+        live_file(&outside, "e/0.log", b"secret");
+
+        let absent = |n: u8, home: &Path, file: &str| {
+            let (dir, _lock) = session(
+                &root,
+                n,
+                home,
+                &[CAPABILITY_RUN_LOGS],
+                &[run_log(10, ADDR, "h", file)],
+            );
+            let log = session_run_log(&dir, home, ADDR).expect("read");
+            assert!(log.is_none(), "{file:?} under {}: {log:?}", home.display());
+        };
+
+        let home = tmp.path().join("h1");
+        live_file(&home, "runs/e/0.log", b"mine");
+        let escaped = outside.join("e/0.log");
+        absent(1, &home, "runs/../../outside/e/0.log");
+        absent(2, &home, &escaped.to_string_lossy());
+        absent(3, &home, "runs/e/../e/0.log");
+
+        // `runs/` itself a symlink out of the home.
+        let home = tmp.path().join("h2");
+        std::fs::create_dir_all(&home).expect("home");
+        std::os::unix::fs::symlink(&outside, home.join("runs")).expect("symlink");
+        absent(4, &home, "runs/e/0.log");
+
+        // `runs/<dir>/` a symlink.
+        let home = tmp.path().join("h3");
+        std::fs::create_dir_all(home.join("runs")).expect("runs");
+        std::os::unix::fs::symlink(outside.join("e"), home.join("runs/e")).expect("symlink");
+        absent(5, &home, "runs/e/0.log");
+
+        // The file a symlink.
+        let home = tmp.path().join("h4");
+        std::fs::create_dir_all(home.join("runs/e")).expect("runs");
+        std::os::unix::fs::symlink(&escaped, home.join("runs/e/0.log")).expect("symlink");
+        absent(6, &home, "runs/e/0.log");
+
+        // A FIFO: opened non-blocking, refused as not a regular file.
+        let home = tmp.path().join("h5");
+        std::fs::create_dir_all(home.join("runs/e")).expect("runs");
+        let fifo = home.join("runs/e/0.log");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).expect("cstr");
+        // SAFETY: `c` is a valid NUL-terminated path for the call.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo");
+        absent(7, &home, "runs/e/0.log");
+    }
+
+    /// Past the 64 MiB cap (`Truncated` written), a run that starts still
+    /// writes its `RunLog` record through the session slot, and a follower
+    /// finds it; once the session ends, it reads as absent.
+    #[test]
+    fn run_log_record_outlives_cap() {
+        let user = tempfile::tempdir().expect("tempdir");
+        let ws = tempfile::tempdir().expect("tempdir");
+        let home = ws.path().join(".heph");
+        let slot = Arc::new(SessionSlot::new());
+        let root = SessionRoot::from_env(None, Some(user.path().as_os_str()));
+        let sessions = root.clone().expect("root").expect("recording on");
+        slot.configure(root, vec!["heph".into()]);
+        slot.set_workspace(ws.path(), ws.path(), &home);
+        let opened = slot
+            .open(
+                SessionHeader {
+                    kind: super::super::HeaderKind::Build,
+                    label: "run".into(),
+                },
+                false,
+            )
+            .expect("a session opened");
+        let big = "x".repeat(1024 * 1024);
+        let laps = recorder::EVENTS_CAP / (1024 * 1024) + 6;
+        for _ in 0..laps {
+            opened.tap.log("INFO", big.clone());
+        }
+        live_file(&home, "runs/e/0.log", b"out\n");
+        slot.run_log_created(RunLogRecord {
+            addr: ADDR.into(),
+            hashin: "h0".into(),
+            file: "runs/e/0.log".into(),
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let found = loop {
+            if let Some(found) = find_run_log(&sessions, &home, ADDR).expect("find") {
+                break found;
+            }
+            assert!(Instant::now() < deadline, "the RunLog record never landed");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(found.session, opened.id);
+        assert!(
+            matches!(&found.log, SessionRunLog::Live { record, .. } if record.hashin == "h0"),
+            "{found:?}"
+        );
+        let dir = slot.dir().expect("dir");
+        let file = File::open(dir.join(files::EVENTS)).expect("events");
+        let mut r = RecordReader::new(file);
+        let kinds: Vec<_> = std::iter::from_fn(|| r.next_record().expect("read"))
+            .filter_map(|rec| rec.session)
+            .filter(|k| !matches!(k, SessionRecordKind::Log { .. }))
+            .collect();
+        assert!(
+            matches!(
+                kinds.as_slice(),
+                [SessionRecordKind::Truncated, SessionRecordKind::RunLog(_)]
+            ),
+            "{kinds:?}"
+        );
+
+        slot.finish(Some(0));
+        assert!(
+            find_run_log(&sessions, &home, ADDR)
+                .expect("find")
+                .is_none(),
+            "an ended session's records are not trusted"
+        );
+    }
+}

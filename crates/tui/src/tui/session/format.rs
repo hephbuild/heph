@@ -19,6 +19,7 @@
 use std::fmt;
 
 use hcore::events::{BuildEvent, BuildEventKind};
+pub use hcore::session_record::{CAPABILITY_RUN_LOGS, RunLogRecord};
 use serde::{Deserialize, Serialize};
 
 use super::id::SessionId;
@@ -214,8 +215,9 @@ pub enum SessionRecordKind {
         panicked: bool,
     },
     /// `events.ndjson` reached its size cap; no build event or log line follows
-    /// (`End`, `InflightWritten`, `Finished`, `Output`, `Label` and an
-    /// `Approval` clearing the prompt still do). `status.json` keeps updating.
+    /// (`End`, `InflightWritten`, `Finished`, `Output`, `Label`, `RunLog` and
+    /// an `Approval` clearing the prompt still do). `status.json` keeps
+    /// updating.
     Truncated,
     /// The owner answered an in-flight request: `inflight.txt` is fresh.
     InflightWritten,
@@ -243,6 +245,12 @@ pub enum SessionRecordKind {
         #[serde(default)]
         text: String,
     },
+    /// A run's live log was created: where its output is going while it
+    /// runs (`file`, relative to `meta.json`'s home). Written past the cap,
+    /// so a follower finds a run that starts after it. Trusted only while
+    /// the session's lock is held and no `ExecuteEnd` for the addr follows
+    /// it; read through [`super::run_logs`], never by joining `file` itself.
+    RunLog(Box<RunLogRecord>),
     /// A record a newer heph writes.
     #[serde(other)]
     Unknown,
@@ -643,6 +651,14 @@ mod tests {
                     text: "× target failed\n\u{1b}[31mred\u{1b}[0m\n".into(),
                 },
                 "Output",
+            ),
+            (
+                SessionRecordKind::RunLog(Box::new(RunLogRecord {
+                    addr: "//a:b".into(),
+                    hashin: "abc123".into(),
+                    file: "runs/02kf5/17.log".into(),
+                })),
+                "RunLog",
             ),
         ] {
             let rec = SessionRecord::session(7, kind);

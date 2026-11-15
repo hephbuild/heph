@@ -156,6 +156,15 @@ so `attach` draws it (see [Attach](#attach)):
   failure report printed after the teardown; its first 1 MiB, with a marker
   line when it was cut.
 
+`RunLog {addr, hashin, file}` says where a running target's live log is:
+`file` is relative to `meta.json`'s home (`runs/<id>/<n>.log`), written when
+the run's first byte creates it, and past the cap. `meta.json` lists the
+`run_logs` capability. A reader (`tui::session::find_run_log`) trusts it
+only for a session whose `meta.json` names its own home, while that
+session's lock is held and no `ExecuteEnd` for the addr follows it; a file
+gone under such a record means the run ended. `file` must be
+`runs/<dir>/<name>`, reached through no symlink, or it reads as absent.
+
 All four were added without a format bump: a heph from before them decodes
 each as `Unknown` and skips it. A reader skips and counts a complete line that does not decode and
 never stops on one, and waits for a trailing partial line to complete. `Log`

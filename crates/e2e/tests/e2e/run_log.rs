@@ -444,6 +444,78 @@ target(name = "d", driver = "bash", out = "d.txt", deps = [":t"],
     Ok(())
 }
 
+/// The `RunLog` records an engine announced.
+#[derive(Debug, Default)]
+struct Announced(std::sync::Mutex<Vec<hcore::session_record::RunLogRecord>>);
+
+impl hcore::session_record::RunLogAnnouncer for Announced {
+    fn run_log_created(&self, record: hcore::session_record::RunLogRecord) {
+        self.0.lock().expect("announced").push(record);
+    }
+}
+
+/// The `bash`-only engine over `root`, announcing its live logs to `to`.
+fn announcing_engine(root: &Path, to: &Arc<Announced>) -> anyhow::Result<Arc<Engine>> {
+    let mut e = Engine::new(heph::engine::Config::for_tests(root.to_path_buf()))?;
+    e.set_run_log_announcer(Arc::clone(to) as _);
+    let r = root.to_path_buf();
+    e.register_provider(move |init| {
+        Box::new(pluginbuildfile::Provider::new(
+            r,
+            init.runtime.clone(),
+            Arc::clone(&init.functions),
+        ))
+    })?;
+    e.register_managed_driver(|_| Box::new(pluginexec::Driver::new_bash().with_host_path()))?;
+    Ok(Arc::new(e))
+}
+
+/// A cold run announces its live log once (addr, hashin, the file relative
+/// to the home); a warm, all-hit build writes no live file and announces no
+/// `RunLog` record.
+#[tokio::test]
+async fn warm_build_pays_nothing_for_logs() -> anyhow::Result<()> {
+    let ws = tempfile::tempdir()?;
+    std::fs::create_dir_all(ws.path().join("p"))?;
+    std::fs::write(
+        ws.path().join("p").join("BUILD"),
+        r#"target(name = "t", driver = "bash", out = "t.txt", run = ["echo hi", "printf t > t.txt"])"#,
+    )?;
+    let cold_seen = Arc::new(Announced::default());
+    let cold = announcing_engine(ws.path(), &cold_seen)?;
+    result(&cold, "//p:t", &ResultOptions::default()).await?;
+    let hashin = Arc::clone(&cold)
+        .meta(cold.new_state(), &parse_addr("//p:t")?)
+        .await?
+        .hashin;
+    let records = cold_seen.0.lock().expect("announced").clone();
+    assert_eq!(records.len(), 1, "{records:?}");
+    let rec = records.first().expect("one record");
+    assert_eq!(
+        (rec.addr.as_str(), rec.hashin.as_str()),
+        ("//p:t", &*hashin)
+    );
+    assert!(rec.relative_file().is_some(), "{rec:?}");
+    drop(cold);
+
+    let warm_seen = Arc::new(Announced::default());
+    let warm = announcing_engine(ws.path(), &warm_seen)?;
+    let before = runs_entries(&warm);
+    result(&warm, "//p:t", &ResultOptions::default()).await?;
+    assert!(
+        warm_seen.0.lock().expect("announced").is_empty(),
+        "a hit announced a RunLog record"
+    );
+    assert!(live_files(&warm).is_empty(), "{:?}", live_files(&warm));
+    assert_eq!(
+        runs_entries(&warm),
+        before,
+        "an all-hit build touched runs/"
+    );
+    // Unit 3: the warm build emits no PoolUsage event either.
+    Ok(())
+}
+
 /// The names under `<home>/runs/`.
 fn runs_entries(engine: &Engine) -> std::collections::BTreeSet<std::ffi::OsString> {
     std::fs::read_dir(engine.home.join("runs"))

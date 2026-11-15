@@ -29,6 +29,7 @@ pub mod htvalue;
 pub mod paths;
 pub mod pending;
 pub mod process;
+pub mod session_record;
 pub mod shutdown;
 pub mod sysres;
 pub mod template;

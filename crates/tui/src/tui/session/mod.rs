@@ -11,6 +11,8 @@
 //! - [`reader`]: [`RecordReader`], reading `events.ndjson` back (torn lines
 //!   wait, bad lines are skipped and counted).
 //! - [`cleanup`]: removing ended sessions, at session start only.
+//! - [`run_logs`]: finding a running target's live log through the sessions
+//!   that recorded it ([`find_run_log`]).
 //! - [`SessionSlot`]: the process's one session. `main` builds it and hands it
 //!   to whoever needs it — every command, which passes it to `new_engine` and
 //!   `run_app` as their own argument; the [`LogSink`](crate::tui::LogSink),
@@ -34,6 +36,7 @@ pub mod id;
 pub mod lockfile;
 pub mod reader;
 pub mod recorder;
+pub mod run_logs;
 pub mod source;
 
 #[cfg(test)]
@@ -51,14 +54,15 @@ use std::sync::{Mutex, PoisonError};
 
 pub use feed::{Routed, SessionFeed};
 pub use format::{
-    ApprovalPrompt, ApprovalPromptNotice, CAPABILITY_INFLIGHT, HeaderKind, META_FORMAT,
-    SNAPSHOT_VERSION, STATUS_LIST_CAP, SessionHeader, SessionMeta, SessionRecord,
-    SessionRecordKind, SessionSnapshot, files,
+    ApprovalPrompt, ApprovalPromptNotice, CAPABILITY_INFLIGHT, CAPABILITY_RUN_LOGS, HeaderKind,
+    META_FORMAT, RunLogRecord, SNAPSHOT_VERSION, STATUS_LIST_CAP, SessionHeader, SessionMeta,
+    SessionRecord, SessionRecordKind, SessionSnapshot, files,
 };
 pub use holder::{HolderNames, holder_session};
 pub use id::SessionId;
 pub use reader::RecordReader;
 pub use recorder::{Recorder, SessionTap, TappedReceiver};
+pub use run_logs::{FoundRunLog, SessionRunLog, find_run_log, session_run_log};
 pub use source::{EntryMeta, FileSource, SessionEntry, SessionItem, SessionSource};
 
 use cleanup::Retention;
@@ -206,7 +210,10 @@ impl Session {
             label: start.header.label,
             header: start.header.kind,
             interactive: start.interactive,
-            capabilities: vec![CAPABILITY_INFLIGHT.to_owned()],
+            capabilities: vec![
+                CAPABILITY_INFLIGHT.to_owned(),
+                CAPABILITY_RUN_LOGS.to_owned(),
+            ],
         };
         recorder::write_atomically(&dir, files::META, &meta).context("writing meta.json")?;
         let events = OpenOptions::new()
@@ -507,6 +514,19 @@ impl SessionSlot {
     pub fn finish_panicked(&self) {
         if let Some(session) = self.with(|s| s.session.clone()) {
             session.finish(None, true);
+        }
+    }
+}
+
+/// The engine announces each run's live log here
+/// (`Engine::set_run_log_announcer`); it is recorded as a `RunLog` record of
+/// the open session, past the cap too. One channel push; nothing when no
+/// session is open or its recording stopped. Carries no session id: the
+/// engine never learns it (I1).
+impl hcore::session_record::RunLogAnnouncer for SessionSlot {
+    fn run_log_created(&self, record: RunLogRecord) {
+        if let Some(tap) = self.tap() {
+            tap.run_log(record);
         }
     }
 }
