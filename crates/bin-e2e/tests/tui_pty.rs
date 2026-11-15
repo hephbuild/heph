@@ -6,10 +6,12 @@
 //! only a terminal can show: that the TUI builds its viewport, renders the run
 //! to actual cells, and hands the terminal back on exit.
 //!
-//! The TUI uses a ratatui *inline* viewport, not the alternate screen — it
-//! draws in place below the prompt and clears itself on exit. So the signals
-//! are the inline handshake (a cursor-position query the terminal must answer)
-//! and the cursor hide/show pair, not `?1049h`.
+//! The line is a ratatui *inline* viewport — it draws in place below the
+//! prompt and clears itself on exit — so its signals are the inline handshake
+//! (a cursor-position query the terminal must answer) and the cursor hide/show
+//! pair. The dashboard (`tab`) is a full screen on the alternate screen, and
+//! the tests from [`Step`] on drive it as a person would: wait for a screen,
+//! type, resize, and read the vt100 cells left behind.
 //!
 //! Terminal restore is the one that matters most in practice. A TUI that exits
 //! leaving the cursor hidden and the viewport painted leaves the user's shell a
@@ -369,6 +371,443 @@ fn ctrl_c_cancels_a_run_whose_target_holds_the_terminal() {
         shown > hid,
         "cancelled run exited with the cursor still hidden\n{}",
         session.report()
+    );
+}
+
+/// What a test does at the terminal, one step at a time.
+enum Step<'a> {
+    /// Block until the screen as it is now passes the check, named for the
+    /// failure message.
+    Until(&'a str, fn(&vt100::Screen) -> bool),
+    /// Type these bytes.
+    Keys(&'a [u8]),
+    /// Resize the window, as a terminal emulator does.
+    Resize(u16, u16),
+    /// Let a few frame ticks pass: after a resize, so that a check that the
+    /// stale screen already passes is made against a redrawn one.
+    Settle,
+    /// Open the gate the build's dependency waits on: the build may finish.
+    OpenGate,
+    /// Keep the rows on screen now, under this name.
+    Snapshot(&'a str),
+}
+
+const TAB: &[u8] = b"\t";
+const ESC: &[u8] = b"\x1b";
+const CTRL_C: &[u8] = b"\x03";
+/// The dashboard's hint row starts with this, live or finished, at any width
+/// these tests use; nothing on the line says it.
+const DASHBOARD_HINT: &str = "↑/↓ select";
+/// The hint row once the run has finished under the dashboard.
+const FINISHED_HINT: &str = "q or esc leave";
+/// What the named target prints, on the main screen, while the TUI is paused
+/// for it.
+const TARGET_OUT: &str = "tty-target-out";
+
+/// A build that waits for the test: `//pkg:gate` loops until its file exists
+/// (ignoring the INT and TERM a stop sends, so the hard abort has something to
+/// abort), and `//pkg:ok`, the named target, holds the terminal for a second —
+/// so every run here also pauses the TUI for a target and resumes it.
+fn gated_build(gate: &std::path::Path) -> String {
+    format!(
+        concat!(
+            "target(name = \"gate\", driver = \"bash\", cache = False,",
+            " run = [\"trap '' INT TERM\", \"while [ ! -e {gate} ]; do sleep 0.1; done\"])\n",
+            "target(name = \"ok\", driver = \"bash\", cache = False,",
+            " run = [\"echo {out}\", \"sleep 1\"], deps = {{\"gate\": [\"//pkg:gate\"]}})\n",
+        ),
+        gate = gate.display(),
+        out = TARGET_OUT,
+    )
+}
+
+/// A terminal with a gated build in it.
+struct Gated {
+    pty: common::pty::Pty,
+    gate: std::path::PathBuf,
+    _ws: common::Workspace,
+}
+
+impl Gated {
+    /// `prelude` runs in the shell first (output above the line), then
+    /// `heph run //pkg:ok` replaces it.
+    fn start(prelude: &str, env: &[(&str, &str)]) -> Self {
+        let dist = Dist::locate();
+        let ws = common::Workspace::new().expect("workspace");
+        let gate = ws.root().join("gate-open");
+        ws.write("pkg/BUILD", &gated_build(&gate))
+            .expect("write BUILD");
+        let script = format!("{prelude}exec \"$HEPH\" run //pkg:ok");
+        let pty = common::pty::Pty::script_at_cursor(&dist, ws.root(), &script, env);
+        Self { pty, gate, _ws: ws }
+    }
+
+    /// Play `steps`; the snapshots they took, by name.
+    fn play<'a>(&self, steps: &[Step<'a>]) -> Vec<(&'a str, Vec<String>)> {
+        let mut snapshots = Vec::new();
+        for step in steps {
+            match step {
+                Step::Until(what, ok) => self.pty.wait_screen(what, DEADLINE, ok),
+                Step::Keys(bytes) => self.pty.send(bytes),
+                Step::Resize(rows, cols) => self.pty.resize(*rows, *cols),
+                Step::Settle => std::thread::sleep(Duration::from_millis(400)),
+                Step::OpenGate => std::fs::write(&self.gate, b"").expect("open the gate"),
+                Step::Snapshot(name) => snapshots.push((*name, self.pty.rows())),
+            }
+        }
+        snapshots
+    }
+
+    /// Wait for heph to exit, then make sure the gate's loop ends too: a run
+    /// that died before opening it leaves the dependency running.
+    fn exit(&mut self) -> common::pty::Ended {
+        let ended = self.pty.wait_exit(DEADLINE);
+        drop(std::fs::write(&self.gate, b""));
+        ended
+    }
+}
+
+fn rows_of(s: &vt100::Screen) -> impl Iterator<Item = String> + '_ {
+    s.rows(0, s.size().1)
+}
+
+fn count_rows(s: &vt100::Screen, needle: &str) -> usize {
+    rows_of(s).filter(|r| r.contains(needle)).count()
+}
+
+/// The line is up: the main screen, with its done count.
+fn on_line(s: &vt100::Screen) -> bool {
+    !s.alternate_screen() && count_rows(s, " done") > 0
+}
+
+/// The line is up exactly once, and no dashboard row was left behind.
+fn on_line_once(s: &vt100::Screen) -> bool {
+    !s.alternate_screen() && count_rows(s, " done") == 1 && count_rows(s, DASHBOARD_HINT) == 0
+}
+
+fn on_dashboard(s: &vt100::Screen) -> bool {
+    s.alternate_screen() && count_rows(s, DASHBOARD_HINT) == 1
+}
+
+/// The dashboard fills the window it has now: its hint row is the last row,
+/// and there is one of it.
+fn dashboard_fits(s: &vt100::Screen) -> bool {
+    let last = rows_of(s).last().unwrap_or_default();
+    on_dashboard(s) && last.contains(DASHBOARD_HINT)
+}
+
+fn on_finished_dashboard(s: &vt100::Screen) -> bool {
+    s.alternate_screen() && count_rows(s, FINISHED_HINT) == 1
+}
+
+/// Paused for the named target: the main screen, with what it printed.
+fn paused_for_target(s: &vt100::Screen) -> bool {
+    !s.alternate_screen() && count_rows(s, TARGET_OUT) > 0
+}
+
+/// Once heph is gone: the main screen, a visible cursor, no mouse mode, and
+/// none of the dashboard drawn into the scrollback.
+fn assert_restored(pty: &common::pty::Pty, case: &str) {
+    let screen = pty.screen();
+    pty.with_screen(|s| {
+        assert!(
+            !s.alternate_screen(),
+            "{case}: left on the alternate screen\n{screen}"
+        );
+        assert!(!s.hide_cursor(), "{case}: cursor left hidden\n{screen}");
+        assert_eq!(
+            s.mouse_protocol_mode(),
+            vt100::MouseProtocolMode::None,
+            "{case}: mouse capture left on\n{screen}"
+        );
+        assert_eq!(
+            count_rows(s, DASHBOARD_HINT),
+            0,
+            "{case}: the dashboard was drawn into the scrollback\n{screen}"
+        );
+    });
+}
+
+/// `tab` puts the dashboard on the alternate screen and `esc` takes it off,
+/// and the main screen comes back cell for cell: what was printed above the
+/// line, and the line on the same row.
+///
+/// It is also the Q11 proof, as far as an emulator goes: the sequence pair is
+/// `?1049h`/`?1049l` (save the cursor and switch; switch back and restore it),
+/// sent while an inline viewport owns the bottom of the main screen. The line
+/// coming back on its own row is what says the inline viewport's idea of where
+/// it is survived the switch. vt100 implements xterm's 1049; tmux and the
+/// macOS Terminal are not emulated here.
+#[test]
+fn tab_opens_and_esc_restores_scrollback() {
+    let mut g = Gated::start("printf 'scrollback-%s\\n' 1 2 3 4 5; ", &[]);
+    let shots = g.play(&[
+        Step::Until("the line", on_line),
+        Step::Snapshot("before"),
+        Step::Keys(TAB),
+        Step::Until("the dashboard", on_dashboard),
+        Step::Keys(ESC),
+        Step::Until("the line, once", on_line_once),
+        Step::Snapshot("after"),
+        Step::OpenGate,
+    ]);
+    let ended = g.exit();
+    assert_eq!(ended, common::pty::Ended::Code(0), "{}", g.pty.seen());
+    assert_restored(&g.pty, "esc then build end");
+
+    let [(_, before), (_, after)] = shots.as_slice() else {
+        panic!("two snapshots");
+    };
+    let report = format!(
+        "--- before ---\n{}\n--- after ---\n{}",
+        before.join("\n"),
+        after.join("\n")
+    );
+    // Above the line: the prelude, where the shell printed it. Its last row
+    // being found at all says the line anchored below it, not over it.
+    let above = before
+        .iter()
+        .position(|r| r.contains("scrollback-5"))
+        .unwrap_or_else(|| panic!("the prelude is not on screen\n{report}"));
+    assert_eq!(
+        before.get(..=above),
+        after.get(..=above),
+        "the main screen above the line changed across the dashboard\n{report}"
+    );
+    let line_row = |rows: &[String]| rows.iter().position(|r| r.contains(" done"));
+    assert_eq!(
+        line_row(before),
+        line_row(after),
+        "the line came back on another row\n{report}"
+    );
+
+    // Q11: the sequences the switch used. Bytes, not cells, because the
+    // question is which sequence it was.
+    let out = g.pty.output();
+    assert!(
+        contains(&out, b"\x1b[?1049h"),
+        "never entered with ?1049h\n{report}"
+    );
+    assert!(
+        contains(&out, b"\x1b[?1049l"),
+        "never left with ?1049l\n{report}"
+    );
+}
+
+/// The build ends with the dashboard up: it stays, saying how to leave, until
+/// `q` — which exits 0 and prints the summary. On the way, the named target
+/// took the terminal: the dashboard left for it and came back.
+#[test]
+fn finish_while_dashboard_open_holds() {
+    let mut g = Gated::start("", &[]);
+    g.play(&[
+        Step::Until("the line", on_line),
+        Step::Keys(TAB),
+        Step::Until("the dashboard", on_dashboard),
+        Step::OpenGate,
+        Step::Until("the main screen, for the target", paused_for_target),
+        Step::Until("the finished dashboard", on_finished_dashboard),
+    ]);
+    // Held: still up, and heph still running, well after the build ended.
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        common::alive(g.pty.pid()),
+        "heph exited under the dashboard"
+    );
+    assert!(
+        g.pty.alternate_screen(),
+        "the dashboard closed on its own\n{}",
+        g.pty.screen()
+    );
+
+    g.pty.send(b"q");
+    let ended = g.exit();
+    assert_eq!(ended, common::pty::Ended::Code(0), "{}", g.pty.seen());
+    assert_restored(&g.pty, "q after finish");
+    let screen = g.pty.screen();
+    assert!(screen.contains("1 / 1 done"), "no summary\n{screen}");
+    assert!(
+        screen.contains(TARGET_OUT),
+        "the target's output did not stay on the main screen\n{screen}"
+    );
+}
+
+/// Shrink and grow on the line and on the dashboard: each redraw fills the
+/// window it has, once, with nothing left over from the old size.
+#[test]
+fn resize_in_each_mode() {
+    let mut g = Gated::start("", &[]);
+    g.play(&[
+        Step::Until("the line", on_line),
+        Step::Resize(20, 80),
+        Step::Settle,
+        Step::Until("one line at 20x80", on_line_once),
+        Step::Resize(40, 140),
+        Step::Settle,
+        Step::Until("one line at 40x140", on_line_once),
+        Step::Keys(TAB),
+        Step::Until("the dashboard", on_dashboard),
+        Step::Resize(20, 80),
+        Step::Until("the dashboard filling 20x80", dashboard_fits),
+        Step::Resize(40, 140),
+        Step::Until("the dashboard filling 40x140", dashboard_fits),
+        Step::Resize(24, 100),
+        Step::Keys(ESC),
+        Step::Settle,
+        Step::Until("one line at 24x100, after the dashboard", on_line_once),
+        Step::OpenGate,
+    ]);
+    let ended = g.exit();
+    assert_eq!(ended, common::pty::Ended::Code(0), "{}", g.pty.seen());
+    assert_restored(&g.pty, "after resizes");
+}
+
+/// Every way out of a run with the dashboard up hands the terminal back: the
+/// main screen, a visible cursor, no mouse mode, and no dashboard in the
+/// scrollback.
+#[test]
+fn terminal_restored_on_every_exit() {
+    struct Case {
+        name: &'static str,
+        env: &'static [(&'static str, &'static str)],
+        steps: &'static [Step<'static>],
+        /// The exit status, when the case fixes one.
+        code: Option<u32>,
+        /// What must be on the main screen once heph is gone.
+        shows: &'static [&'static str],
+    }
+    const OPEN: &[Step<'static>] = &[
+        Step::Until("the line", on_line),
+        Step::Keys(TAB),
+        Step::Until("the dashboard", on_dashboard),
+    ];
+    let cases = [
+        Case {
+            name: "q",
+            env: &[],
+            steps: &[
+                Step::OpenGate,
+                Step::Until("the finished dashboard", on_finished_dashboard),
+                Step::Keys(b"q"),
+            ],
+            code: Some(0),
+            shows: &["1 / 1 done"],
+        },
+        Case {
+            name: "esc after the build ends",
+            env: &[],
+            steps: &[
+                Step::OpenGate,
+                Step::Until("the finished dashboard", on_finished_dashboard),
+                Step::Keys(ESC),
+            ],
+            code: Some(0),
+            shows: &["1 / 1 done"],
+        },
+        Case {
+            name: "the build's end, back on the line",
+            env: &[],
+            steps: &[
+                Step::Keys(ESC),
+                Step::Until("the line", on_line_once),
+                Step::OpenGate,
+            ],
+            code: Some(0),
+            shows: &["1 / 1 done"],
+        },
+        Case {
+            name: "pause for the target and resume",
+            env: &[],
+            steps: &[
+                Step::OpenGate,
+                Step::Until("the main screen, for the target", paused_for_target),
+                Step::Until("the dashboard back", on_finished_dashboard),
+                Step::Keys(b"q"),
+            ],
+            code: Some(0),
+            shows: &[TARGET_OUT],
+        },
+        Case {
+            name: "ctrl-c",
+            env: &[],
+            // The gate ignores the stop; opening it lets the stop finish.
+            steps: &[Step::Keys(CTRL_C), Step::OpenGate],
+            code: None,
+            shows: &[],
+        },
+        Case {
+            name: "hard abort (ctrl-c past the stop)",
+            env: &[],
+            steps: &[Step::Keys(CTRL_C), Step::Settle, Step::Keys(CTRL_C)],
+            code: Some(130),
+            shows: &["aborted (second Ctrl-C)"],
+        },
+        Case {
+            name: "a panic in the app task",
+            env: &[("HEPH_DEBUG_TUI_PANIC", "app")],
+            // The panic lands a second after the build: under the dashboard
+            // again, not in the pause for the target (where the hook's own
+            // print is already on the main screen and proves nothing).
+            steps: &[
+                Step::OpenGate,
+                Step::Until("the main screen, for the target", paused_for_target),
+                Step::Until("the dashboard back", on_dashboard),
+            ],
+            code: Some(101),
+            shows: &["HEPH_DEBUG_TUI_PANIC=App: a deliberate panic"],
+        },
+        Case {
+            name: "a panic in the backend",
+            env: &[("HEPH_DEBUG_TUI_PANIC", "backend")],
+            steps: &[
+                Step::OpenGate,
+                Step::Until("the main screen, for the target", paused_for_target),
+                Step::Until("the finished dashboard", on_finished_dashboard),
+            ],
+            code: Some(101),
+            shows: &["HEPH_DEBUG_TUI_PANIC=Backend: a deliberate panic"],
+        },
+    ];
+    let run = |case: &Case| {
+        let mut g = Gated::start("", case.env);
+        g.play(OPEN);
+        g.play(case.steps);
+        let ended = g.exit();
+        if let Some(code) = case.code {
+            assert_eq!(
+                ended,
+                common::pty::Ended::Code(code),
+                "{}: exit status\n{}",
+                case.name,
+                g.pty.seen()
+            );
+        }
+        assert_restored(&g.pty, case.name);
+        let screen = g.pty.screen();
+        for text in case.shows {
+            assert_eq!(
+                screen.matches(text).count(),
+                1,
+                "{}: {text:?} not on the main screen once\n{screen}",
+                case.name
+            );
+        }
+    };
+    // Each case on its own terminal, all at once; every failing case is
+    // named (its panic message is printed above), not only the first.
+    let failed: Vec<&str> = std::thread::scope(|s| {
+        let handles: Vec<_> = cases
+            .iter()
+            .map(|case| (case.name, s.spawn(move || run(case))))
+            .collect();
+        handles
+            .into_iter()
+            .filter_map(|(name, h)| h.join().is_err().then_some(name))
+            .collect()
+    });
+    assert!(
+        failed.is_empty(),
+        "the terminal was not restored after: {failed:?}"
     );
 }
 
