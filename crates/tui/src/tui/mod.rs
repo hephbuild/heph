@@ -84,7 +84,8 @@ fn tui_allowed(
 ///
 /// `session` is the process's one session, threaded from `main` as its own
 /// argument. `sink` must be the sink built over the same slot (it tees log
-/// lines into it); a debug build checks that they are one slot.
+/// lines into it); two different slots are a bug in the caller, and the run is
+/// refused with an error before anything starts, in every build.
 pub async fn run_app<A: App + 'static>(
     app: A,
     sink: LogSink,
@@ -92,10 +93,7 @@ pub async fn run_app<A: App + 'static>(
     interactive: bool,
     shutdown: hcore::shutdown::ShutdownTrigger,
 ) -> anyhow::Result<A::Output> {
-    debug_assert!(
-        std::sync::Arc::ptr_eq(session, sink.session()),
-        "run_app's session and its sink's session must be the same slot"
-    );
+    check_one_slot(session, &sink)?;
     // A viewer never records itself (A3). The slot opens the process's session
     // on the first recording run, once the backend has built its view (the
     // view names the header a viewer rebuilds).
@@ -120,9 +118,35 @@ pub async fn run_app<A: App + 'static>(
     .await
 }
 
+/// `run_app`'s session and its sink's must be one slot: otherwise the log
+/// lines would be teed into a session other than the one recorded.
+fn check_one_slot(
+    session: &std::sync::Arc<session::SessionSlot>,
+    sink: &LogSink,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        std::sync::Arc::ptr_eq(session, sink.session()),
+        "bug: run_app was given a session slot other than its log sink's; \
+         the run would record its log lines into the wrong session"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::tui_allowed;
+
+    /// Two slots are refused in every build, not only under `debug_assert!`.
+    #[test]
+    fn run_app_refuses_a_sink_over_another_slot() {
+        let session = std::sync::Arc::new(super::session::SessionSlot::new());
+        let other = std::sync::Arc::new(super::session::SessionSlot::new());
+        let sink = super::LogSink::new_direct_with(other);
+        let err = super::check_one_slot(&session, &sink).expect_err("refused");
+        assert!(format!("{err:#}").contains("bug: run_app"), "{err:#}");
+        let sink = super::LogSink::new_direct_with(std::sync::Arc::clone(&session));
+        super::check_one_slot(&session, &sink).expect("one slot");
+    }
 
     #[test]
     fn should_use_tui_foreground_table() {
