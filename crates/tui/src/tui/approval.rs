@@ -50,6 +50,8 @@ struct Pending {
     build: u64,
     /// When the build started, for the decision line's `at`.
     started: Instant,
+    /// When the request was queued: how long it has waited.
+    queued: Instant,
     addr: String,
     notices: Vec<ApprovalNoticeView>,
     responder: oneshot::Sender<bool>,
@@ -216,6 +218,24 @@ pub struct ApprovalView {
     pub queued_behind: usize,
 }
 
+/// One pending request as a frame reads it: its number, target, notices by
+/// name and content hash, and how long it has waited.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueuedApproval {
+    pub seq: u64,
+    pub addr: String,
+    pub notices: Vec<NoticeRef>,
+    pub waited: Duration,
+}
+
+/// A notice by name and the content hash it is stored under. `None`: no
+/// hash was recorded (an older session), so it reads "notice unavailable".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NoticeRef {
+    pub name: String,
+    pub hash: Option<String>,
+}
+
 impl ApprovalCenter {
     pub fn new() -> Self {
         Self::default()
@@ -268,6 +288,7 @@ impl ApprovalCenter {
                 seq,
                 build: build.id,
                 started: build.started,
+                queued: Instant::now(),
                 addr,
                 notices,
                 responder: tx,
@@ -326,6 +347,30 @@ impl ApprovalCenter {
                 notices: p.notices.clone(),
                 expanded: inner.expanded == Some(p.seq),
                 queued_behind: len - i - 1,
+            })
+            .collect()
+    }
+
+    /// Every pending request, oldest first, without its notices' text: what
+    /// a frame reads (the approval view reads a notice by its hash, off the
+    /// render task).
+    pub fn queue(&self) -> Vec<QueuedApproval> {
+        let inner = self.lock_pruned();
+        inner
+            .queue
+            .iter()
+            .map(|p| QueuedApproval {
+                seq: p.seq,
+                addr: p.addr.clone(),
+                notices: p
+                    .notices
+                    .iter()
+                    .map(|n| NoticeRef {
+                        name: n.name.clone(),
+                        hash: Some(n.hash.clone()),
+                    })
+                    .collect(),
+                waited: p.queued.elapsed(),
             })
             .collect()
     }

@@ -248,11 +248,17 @@ fn tabs_row(
     let mut out = vec![Span::raw("  ")];
     let mut at = 2;
     let mut range = 0..0;
-    let mut hits = TabHits::with_capacity(Tab::LIST.len());
+    let mut hits = TabHits::with_capacity(Tab::LIST.len() + 1);
     let gap = if level == 0 { "    " } else { "  " };
+    let approvals = counts.approvals > 0;
     let tab_text = |tab: Tab, named: bool| -> String {
         let n = counts.tab(tab);
-        match (tab.glyph(), named) {
+        // The Approvals tab's glyph flashes: the frame's, not the tab's.
+        let glyph = match tab {
+            Tab::Approvals if !counts.approval_glyph.is_empty() => Some(counts.approval_glyph),
+            _ => tab.glyph(),
+        };
+        match (glyph, named) {
             (None, _) => format!("{} {n}", tab.name()),
             (Some(g), true) => format!("{g} {} {n}", tab.name()),
             (Some(g), false) => format!("{g} {n}"),
@@ -275,13 +281,13 @@ fn tabs_row(
         let text = format!("‹ {} ›", tab_text(active, true));
         range = at..at + width(&text);
         let last = range.end.saturating_sub(1);
-        hits.push((cols_of(at..at + 1), active.cycle(false)));
+        hits.push((cols_of(at..at + 1), active.cycle(false, approvals)));
         hits.push((cols_of(at + 1..last), active));
-        hits.push((cols_of(last..range.end), active.cycle(true)));
+        hits.push((cols_of(last..range.end), active.cycle(true, approvals)));
         out.push(Span::styled(text, style(active)));
         return (out, range, hits);
     }
-    for (i, &tab) in Tab::LIST.iter().enumerate() {
+    for (i, tab) in Tab::shown(approvals).enumerate() {
         if i > 0 {
             out.push(Span::raw(gap));
             at += gap.len();
@@ -473,6 +479,8 @@ mod tests {
         done: 32,
         cached: 96,
         stopped: 0,
+        approvals: 0,
+        approval_glyph: "",
     };
 
     fn title(command: &str) -> Title<'_> {

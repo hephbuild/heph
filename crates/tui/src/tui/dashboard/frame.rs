@@ -31,7 +31,9 @@ pub fn dashboard_frame(
     rows: u16,
 ) -> Vec<Line<'static>> {
     let gauges = inp.model.gauges();
-    let counts = inp.model.counts(st.scope);
+    let mut counts = inp.model.counts(st.scope);
+    counts.approvals = st.approvals().len();
+    counts.approval_glyph = st.approval_glyph();
     let (header, _, tabs) = header_lines_hits(title, &gauges, &counts, st.tab(), cols);
     let mut out: Vec<Line<'static>> = header.into_iter().collect();
     let list_rows = rows.saturating_sub(CHROME_ROWS);

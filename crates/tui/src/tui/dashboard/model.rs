@@ -97,10 +97,13 @@ impl RowState {
     }
 }
 
-/// A list tab. The approvals unit adds `Approvals` after `Cached`.
+/// A list tab. `Approvals` is shown, right after All, only while a request
+/// is pending; the model holds no row of it (the view lays the pending
+/// requests over the list, see `ListState::set_approvals`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Tab {
     All,
+    Approvals,
     Running,
     Pending,
     Failed,
@@ -126,7 +129,8 @@ impl Seg {
 }
 
 impl Tab {
-    /// Every tab, in the tab row's order.
+    /// Every tab of the model's, in the tab row's order. `Approvals` is not
+    /// one: [`Tab::shown`] puts it after All while it is up.
     pub const LIST: [Tab; 6] = [
         Tab::All,
         Tab::Running,
@@ -136,9 +140,21 @@ impl Tab {
         Tab::Cached,
     ];
 
+    /// The tabs the tab row draws, in order: `Approvals` right after All
+    /// while `approvals` (a request is pending).
+    pub fn shown(approvals: bool) -> impl Iterator<Item = Tab> {
+        let (first, rest) = Tab::LIST.split_at(1);
+        first
+            .iter()
+            .copied()
+            .chain(approvals.then_some(Tab::Approvals))
+            .chain(rest.iter().copied())
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Tab::All => "All",
+            Tab::Approvals => "Approvals",
             Tab::Running => "Running",
             Tab::Pending => "Pending",
             Tab::Failed => "Failed",
@@ -151,6 +167,7 @@ impl Tab {
     pub fn glyph(self) -> Option<&'static str> {
         let state = match self {
             Tab::All => return None,
+            Tab::Approvals => return Some(APPROVAL_GLYPH),
             Tab::Running => RowState::Running,
             Tab::Pending => RowState::Blocked,
             Tab::Failed => RowState::Failed,
@@ -163,6 +180,7 @@ impl Tab {
     pub fn style(self) -> Style {
         match self {
             Tab::All => Style::default(),
+            Tab::Approvals => Style::default().fg(Color::Yellow),
             Tab::Running => RowState::Running.style(),
             Tab::Pending => RowState::Blocked.style(),
             Tab::Failed => Style::default().fg(Color::Red),
@@ -171,16 +189,17 @@ impl Tab {
         }
     }
 
-    /// The next tab (`forward`) or the previous one, wrapping.
-    pub fn cycle(self, forward: bool) -> Tab {
-        let i = Tab::LIST.iter().position(|&t| t == self).unwrap_or(0);
-        let n = Tab::LIST.len();
+    /// The next tab (`forward`) or the previous one, wrapping, among the
+    /// tabs [`Tab::shown`] draws.
+    pub fn cycle(self, forward: bool, approvals: bool) -> Tab {
+        let n = Tab::shown(approvals).count();
+        let i = Tab::shown(approvals).position(|t| t == self).unwrap_or(0);
         let j = if forward {
             (i + 1) % n
         } else {
             (i + n - 1) % n
         };
-        Tab::LIST.get(j).copied().unwrap_or(Tab::All)
+        Tab::shown(approvals).nth(j).unwrap_or(Tab::All)
     }
 
     /// The tab's rows, in order: All by activity (running, waiting, failed,
@@ -197,6 +216,7 @@ impl Tab {
                 Seg::Recent,
                 Seg::State(S::Queued),
             ],
+            Tab::Approvals => &[],
             Tab::Running => &[Seg::State(S::Running)],
             Tab::Pending => &[Seg::State(S::Blocked), Seg::State(S::Queued)],
             Tab::Failed => &[Seg::State(S::Failed), Seg::State(S::DepFailed)],
@@ -318,6 +338,27 @@ pub struct TabCounts {
     pub done: usize,
     pub cached: usize,
     pub stopped: usize,
+    /// Pending approval requests: the view's, not the model's (0 from
+    /// [`Model::counts`]). Not a state, so not in [`Self::all`].
+    pub approvals: usize,
+    /// The glyph the Approvals tab draws this frame: `✦` or `❖` while it
+    /// flashes. Empty reads as `✦`.
+    pub approval_glyph: &'static str,
+}
+
+/// The approval glyph. While a request is pending it flashes with
+/// [`APPROVAL_GLYPH_ALT`] once a second, unless motion is reduced.
+pub const APPROVAL_GLYPH: &str = "✦";
+pub const APPROVAL_GLYPH_ALT: &str = "❖";
+
+/// The approval glyph at `now_ms`: `✦` and `❖` swap once a second; always
+/// `✦` when `motion` is off (reduced motion).
+pub fn approval_glyph(now_ms: u64, motion: bool) -> &'static str {
+    if motion && (now_ms / 1000) % 2 == 1 {
+        APPROVAL_GLYPH_ALT
+    } else {
+        APPROVAL_GLYPH
+    }
 }
 
 impl TabCounts {
@@ -351,6 +392,7 @@ impl TabCounts {
     pub fn tab(&self, tab: Tab) -> usize {
         match tab {
             Tab::All => self.all(),
+            Tab::Approvals => self.approvals,
             Tab::Running => self.running,
             Tab::Pending => self.blocked + self.queued,
             Tab::Failed => self.failed_total(),
@@ -886,6 +928,8 @@ impl Model {
             done: n(RowState::Done),
             cached: n(RowState::Cached),
             stopped: n(RowState::Stopped),
+            approvals: 0,
+            approval_glyph: APPROVAL_GLYPH,
         }
     }
 

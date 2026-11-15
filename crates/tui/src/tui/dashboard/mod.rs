@@ -11,6 +11,7 @@
 //!   reads [`list::LastLines`], filled off the render task by
 //!   [`list::read_tails`] over a [`list::LogReader`].
 
+pub mod approval;
 mod bucket;
 pub mod detail;
 pub mod feed;

@@ -238,6 +238,25 @@ pub struct ListState {
     page: usize,
     /// Where the last frame drew the tabs and the rows, for a click.
     pub(crate) drawn: Drawn,
+    /// The pending approval requests, oldest first, as the view last set
+    /// them: the Approvals tab's rows, and the rows that lead All.
+    approvals: Vec<ApprovalRow>,
+    /// Where each of `approvals`' targets sits in the model's All, sorted:
+    /// All skips them there, since they lead it.
+    skips: Vec<usize>,
+    /// The approval glyph this frame (`✦`/`❖`).
+    glyph: &'static str,
+}
+
+/// A pending approval request's row: its target, its number, how long it
+/// has waited and what notices it declared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalRow {
+    pub id: Id,
+    pub seq: u64,
+    pub waited_ms: u64,
+    /// `notices: plan, changelog`, or empty.
+    pub notices: String,
 }
 
 /// Where a dashboard frame put what a click can hit, in the frame's rows.
@@ -272,6 +291,9 @@ impl Default for ListState {
             visible: Vec::new(),
             page: 1,
             drawn: Drawn::default(),
+            approvals: Vec::new(),
+            skips: Vec::new(),
+            glyph: super::model::APPROVAL_GLYPH,
         }
     }
 }
@@ -282,6 +304,9 @@ impl ListState {
     }
 
     pub fn set_tab(&mut self, tab: Tab) {
+        if tab == Tab::Approvals && self.approvals.is_empty() {
+            return;
+        }
         if tab != self.tab {
             self.tab = tab;
             self.offset = 0;
@@ -289,7 +314,54 @@ impl ListState {
     }
 
     pub fn cycle_tab(&mut self, forward: bool) {
-        self.set_tab(self.tab.cycle(forward));
+        self.set_tab(self.tab.cycle(forward, !self.approvals.is_empty()));
+    }
+
+    /// The pending approval requests, oldest first, and this frame's
+    /// approval glyph. Set before every frame and key that reads the list:
+    /// the requests lead All and make the Approvals tab. With none left the
+    /// Approvals tab goes, back to All.
+    pub fn set_approvals(&mut self, model: &Model, rows: Vec<ApprovalRow>, glyph: &'static str) {
+        self.glyph = glyph;
+        self.approvals = rows;
+        if self.approvals.is_empty() && self.tab == Tab::Approvals {
+            self.tab = Tab::All;
+            self.offset = 0;
+        }
+        self.skips.clear();
+        if self.tab == Tab::All {
+            let (approvals, skips) = (&self.approvals, &mut self.skips);
+            skips.extend(
+                approvals
+                    .iter()
+                    .filter_map(|a| model.index_of(Tab::All, self.scope, a.id)),
+            );
+            skips.sort_unstable();
+        }
+    }
+
+    /// The pending requests, oldest first.
+    pub fn approvals(&self) -> &[ApprovalRow] {
+        &self.approvals
+    }
+
+    /// This frame's approval glyph.
+    pub fn approval_glyph(&self) -> &'static str {
+        self.glyph
+    }
+
+    /// The approval request `id`'s row shows, when it is one.
+    pub fn approval_of(&self, id: Id) -> Option<&ApprovalRow> {
+        self.approvals.iter().find(|a| a.id == id)
+    }
+
+    /// The rows that lead this tab: every pending request on All and on
+    /// Approvals, none elsewhere.
+    fn lead(&self) -> &[ApprovalRow] {
+        match self.tab {
+            Tab::All | Tab::Approvals => &self.approvals,
+            _ => &[],
+        }
     }
 
     pub fn selected(&self) -> Option<Id> {
@@ -340,26 +412,44 @@ impl ListState {
     /// Rows in the list as the last frame filtered it.
     fn len(&self, model: &Model) -> usize {
         if self.filter.is_empty() {
-            model.tab_len(self.tab, self.scope)
+            (model.tab_len(self.tab, self.scope) + self.lead().len())
+                .saturating_sub(self.skips.len())
         } else {
             self.matches.len()
         }
     }
 
     fn row(&self, model: &Model, k: usize) -> Option<Id> {
-        if self.filter.is_empty() {
-            model.row(self.tab, self.scope, k)
-        } else {
-            self.matches.get(k).copied()
+        if !self.filter.is_empty() {
+            return self.matches.get(k).copied();
         }
+        let lead = self.lead();
+        if let Some(a) = lead.get(k) {
+            return Some(a.id);
+        }
+        // Past the lead, the model's rows with the lead's own skipped.
+        let mut at = k - lead.len();
+        for &s in &self.skips {
+            if s <= at {
+                at += 1;
+            } else {
+                break;
+            }
+        }
+        model.row(self.tab, self.scope, at)
     }
 
     fn index_of(&self, model: &Model, id: Id) -> Option<usize> {
-        if self.filter.is_empty() {
-            model.index_of(self.tab, self.scope, id)
-        } else {
-            self.matches.iter().position(|&m| m == id)
+        if !self.filter.is_empty() {
+            return self.matches.iter().position(|&m| m == id);
         }
+        let lead = self.lead();
+        if let Some(k) = lead.iter().position(|a| a.id == id) {
+            return Some(k);
+        }
+        let at = model.index_of(self.tab, self.scope, id)?;
+        let skipped = self.skips.iter().filter(|&&s| s < at).count();
+        Some(at - skipped + lead.len())
     }
 
     /// Move the selection by `delta` rows.
@@ -420,9 +510,25 @@ impl ListState {
     fn settle(&mut self, model: &Model, rows: usize) -> usize {
         if !self.filter.is_empty() {
             self.cache.sync(&self.filter, model);
-            let Self { cache, matches, .. } = self;
+            let Self {
+                cache,
+                matches,
+                approvals,
+                tab,
+                ..
+            } = self;
             matches.clear();
-            matches.extend(model.rows(self.tab, self.scope).filter(|&id| cache.hit(id)));
+            let tab = *tab;
+            let lead = matches!(tab, Tab::All | Tab::Approvals);
+            let led = |id: Id| lead && approvals.iter().any(|a| a.id == id);
+            if lead {
+                matches.extend(approvals.iter().map(|a| a.id).filter(|&id| cache.hit(id)));
+            }
+            matches.extend(
+                model
+                    .rows(tab, self.scope)
+                    .filter(|&id| cache.hit(id) && !led(id)),
+            );
         }
         let len = self.len(model);
         let at = match self.selected.and_then(|id| self.index_of(model, id)) {
@@ -549,6 +655,36 @@ fn dim() -> Style {
     Style::default().fg(Color::DarkGray)
 }
 
+/// A pending approval's row: `✦ //x  awaits approval  12s notices: plan`,
+/// its glyph the frame's.
+fn approval_row(
+    inp: &ListInputs<'_>,
+    a: &ApprovalRow,
+    glyph: &'static str,
+    selected: bool,
+    c: Columns,
+) -> Line<'static> {
+    let addr = clean_inline(inp.model.addr(a.id));
+    let target = cut_left(&addr, c.target);
+    let target_gap = c.target.saturating_sub(width(&target));
+    let yellow = Style::default().fg(Color::Yellow);
+    let row_style = if selected {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    let last = cut_right(&clean_inline(&a.notices), c.last.saturating_sub(1)).into_owned();
+    Line::from(vec![
+        Span::styled(if selected { " ▸ " } else { "   " }, row_style),
+        Span::styled(glyph, yellow.add_modifier(Modifier::BOLD)),
+        Span::raw(" "),
+        Span::styled(format!("{target}{} ", " ".repeat(target_gap)), row_style),
+        Span::styled(pad("awaits approval", c.phase), yellow),
+        Span::raw(format!("{:>tw$} ", whole(a.waited_ms), tw = c.time - 1)),
+        Span::styled(last, dim()),
+    ])
+}
+
 /// The list for `st`'s tab, `cols` wide and `rows` tall: the column titles,
 /// the rows, a blank and the position (or the filter's count).
 pub fn list_lines(
@@ -586,6 +722,10 @@ pub fn list_lines(
         };
         st.visible.push(id);
         let selected = st.selected == Some(id);
+        if let Some(a) = st.approval_of(id) {
+            out.push(approval_row(inp, a, st.glyph, selected, c));
+            continue;
+        }
         let (phase, time, last) = row_words(inp, id, r);
         let addr = clean_inline(inp.model.addr(id));
         let target = cut_left(&addr, c.target);
@@ -619,7 +759,8 @@ pub fn list_lines(
     if rows >= 3 {
         out.push(Line::default());
         let shown = st.visible.len();
-        let total = inp.model.tab_len(st.tab, st.scope);
+        let total =
+            (inp.model.tab_len(st.tab, st.scope) + st.lead().len()).saturating_sub(st.skips.len());
         let text = if !st.filter.is_empty() {
             format!("{len} of {total} match")
         } else if shown == 0 {
