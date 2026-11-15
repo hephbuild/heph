@@ -53,7 +53,14 @@ pub fn install() {
 /// output flags only: the keyboard stays raw (a caught panic's TUI keeps
 /// reading keys as they are pressed), and they are put back as they were.
 fn with_newlines(f: impl FnOnce()) {
-    let fd = libc::STDERR_FILENO;
+    with_newlines_on(libc::STDERR_FILENO, f);
+}
+
+/// [`with_newlines`] on `fd`. The output flags are put back only while the
+/// keyboard is still raw: a backend that tore down meanwhile (another task's
+/// caught panic, printing while the TUI exits normally) left cooked mode,
+/// and raw output flags over it would staircase the user's shell.
+fn with_newlines_on(fd: libc::c_int, f: impl FnOnce()) {
     let oflag = |t: &mut libc::termios| {
         // SAFETY: `t` points at valid, correctly-sized storage; a non-tty fd
         // fails with ENOTTY and writes nothing that is read.
@@ -68,9 +75,11 @@ fn with_newlines(f: impl FnOnce()) {
         unsafe { libc::tcsetattr(fd, libc::TCSANOW, &t) };
     }
     f();
-    // Put back only the output flags, onto whatever the terminal holds now.
+    // Put back only the output flags, onto whatever the terminal holds now,
+    // and only if that is still raw.
     if let Some(saved) = saved
         && oflag(&mut t).is_some()
+        && t.c_lflag & libc::ICANON == 0
     {
         t.c_oflag = saved;
         // SAFETY: as above.
@@ -127,13 +136,20 @@ pub(crate) fn take_for_current_thread() -> Option<String> {
 }
 
 /// The text of the panic whose payload is being resumed on another thread
-/// (an app task's, through its `JoinError`). Matched on the payload's text;
-/// without a hook record, the payload's own text, so the message still shows.
-pub(crate) fn take_for_payload(payload: &(dyn Any + Send)) -> Option<String> {
+/// (an app task's, through its `JoinError`). Matched on the payload's text,
+/// and a payload with none (`panic_any(5)`) on a record with none; without a
+/// matching record, the payload's own text, or a line saying it had none, so
+/// something always shows once the full screen it was printed on is gone.
+pub(crate) fn take_for_payload(payload: &(dyn Any + Send)) -> String {
     let message = payload_message(payload);
-    take_if(|r| message.is_some() && r.message.as_deref() == message)
-        .or_else(|| message.map(|m| format!("heph panicked:\n{m}")))
+    take_if(|r| r.message.as_deref() == message).unwrap_or_else(|| match message {
+        Some(m) => format!("heph panicked:\n{m}"),
+        None => NO_TEXT.to_owned(),
+    })
 }
+
+/// What [`take_for_payload`] says of a payload with no text and no record.
+const NO_TEXT: &str = "heph panicked (the panic carried no message)";
 
 #[cfg(test)]
 mod tests {
@@ -163,23 +179,110 @@ mod tests {
             "another thread's panic is not this one's"
         );
         assert_eq!(
-            take_for_payload(&*other).as_deref(),
-            Some("heph panicked:\nother"),
+            take_for_payload(&*other),
+            "heph panicked:\nother",
             "a payload that does not match prints its own text"
         );
         assert_eq!(
-            take_for_payload(&*boom).as_deref(),
-            Some("thread 'worker-7' panicked at src/a.rs:1:2:\nboom 42"),
+            take_for_payload(&*boom),
+            "thread 'worker-7' panicked at src/a.rs:1:2:\nboom 42",
         );
         assert_eq!(
-            take_for_payload(&*boom).as_deref(),
-            Some("heph panicked:\nboom 42"),
+            take_for_payload(&*boom),
+            "heph panicked:\nboom 42",
             "taken once"
         );
-        assert_eq!(take_for_payload(&*opaque), None);
+        assert_eq!(
+            take_for_payload(&*opaque),
+            NO_TEXT,
+            "no text and no record still says something"
+        );
+        std::thread::Builder::new()
+            .name("worker-8".into())
+            .spawn(|| record(&7_u8, Some("src/b.rs:3:4".into())))
+            .expect("spawn")
+            .join()
+            .expect("join");
+        assert_eq!(
+            take_for_payload(&*opaque),
+            "thread 'worker-8' panicked at src/b.rs:3:4:\nBox<dyn Any>",
+            "a payload with no text takes the record with none"
+        );
 
         record(&"here", None);
         let text = take_for_current_thread().expect("this thread's report");
         assert!(text.ends_with("panicked at <unknown>:\nhere"), "{text}");
+    }
+
+    /// A pty's follower in raw mode, as the interactive backend leaves stderr.
+    fn raw_pty() -> (std::fs::File, std::fs::File) {
+        use std::os::fd::FromRawFd as _;
+        let (mut leader, mut follower) = (0, 0);
+        // SAFETY: two valid out-pointers; null name, termios and winsize.
+        let rc = unsafe {
+            libc::openpty(
+                &mut leader,
+                &mut follower,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, 0, "openpty");
+        // SAFETY: `openpty` returned this fd; this test now owns it.
+        let leader = unsafe { std::fs::File::from_raw_fd(leader) };
+        // SAFETY: as above.
+        let follower = unsafe { std::fs::File::from_raw_fd(follower) };
+        let mut t = termios(&follower);
+        // SAFETY: `t` was filled by `tcgetattr`.
+        unsafe { libc::cfmakeraw(&mut t) };
+        set(&follower, &t);
+        (leader, follower)
+    }
+
+    fn termios(f: &std::fs::File) -> libc::termios {
+        use std::os::fd::AsRawFd as _;
+        // SAFETY: plain old data, filled by `tcgetattr` before it is read.
+        let mut t: libc::termios = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid fd and valid storage.
+        assert_eq!(unsafe { libc::tcgetattr(f.as_raw_fd(), &mut t) }, 0);
+        t
+    }
+
+    fn set(f: &std::fs::File, t: &libc::termios) {
+        use std::os::fd::AsRawFd as _;
+        // SAFETY: a valid fd and settings read from it.
+        let rc = unsafe { libc::tcsetattr(f.as_raw_fd(), libc::TCSANOW, t) };
+        assert_eq!(rc, 0, "tcsetattr");
+    }
+
+    /// The hook prints with output processing on and puts raw output back
+    /// while the terminal is still raw; once the backend restored cooked
+    /// mode meanwhile, it leaves the cooked flags alone.
+    #[test]
+    fn newlines_restore_raw_output_only_onto_a_raw_terminal() {
+        use std::os::fd::AsRawFd as _;
+        let (_leader, follower) = raw_pty();
+        let fd = follower.as_raw_fd();
+
+        with_newlines_on(fd, || {
+            assert_ne!(termios(&follower).c_oflag & libc::OPOST, 0, "printing");
+        });
+        assert_eq!(
+            termios(&follower).c_oflag & libc::OPOST,
+            0,
+            "still raw: raw output put back"
+        );
+
+        with_newlines_on(fd, || {
+            // The backend tears down while the hook prints.
+            let mut cooked = termios(&follower);
+            cooked.c_lflag |= libc::ICANON | libc::ECHO;
+            cooked.c_oflag |= libc::OPOST | libc::ONLCR;
+            set(&follower, &cooked);
+        });
+        let after = termios(&follower);
+        assert_ne!(after.c_oflag & libc::OPOST, 0, "cooked output kept");
+        assert_ne!(after.c_lflag & libc::ICANON, 0);
     }
 }

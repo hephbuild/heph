@@ -425,10 +425,8 @@ pub async fn run<A: App + 'static>(
                         // The hook printed this panic, on its own thread,
                         // onto the full screen if one is up: leave it, then
                         // print the panic again on the main screen.
-                        if full.take().is_some()
-                            && let Some(text) = crate::tui::panic::take_for_payload(&*payload)
-                        {
-                            print_panic_report(&text);
+                        if full.take().is_some() {
+                            print_panic_report(&crate::tui::panic::take_for_payload(&*payload));
                         }
                         std::panic::resume_unwind(payload)
                     }
@@ -938,19 +936,6 @@ pub async fn run<A: App + 'static>(
     result
 }
 
-/// Capture stderr's pre-raw-mode `termios` and register a restore closure
-/// with `hcore::shutdown` before raw mode mutates it. The closure is the
-/// only thing that still runs if the run ends via `bootstrap`'s hard abort
-/// on the second Ctrl-C (`std::process::exit`, which skips destructors) — it
-/// restores cooked mode and re-shows the cursor with direct syscalls only,
-/// never crossterm: the abort path must not risk contending crossterm's own
-/// raw-mode mutex, which a concurrently-aborting thread could already hold.
-///
-/// A failed `tcgetattr` (stderr is not a tty — output redirected) records
-/// nothing, so a non-interactive run's hard abort stays a no-op: no stray
-/// escape bytes land in redirected output.
-/// Whether background work no longer holds the exit: the loop's break
-/// predicate once the app has finished.
 /// What a captured mouse event means to a full screen: a left press or a
 /// wheel step. Releases (mode 1000 reports them), other buttons and
 /// modified presses mean nothing.
@@ -974,7 +959,6 @@ fn mouse_input(m: MouseEvent) -> Option<MouseInput> {
     }
 }
 
-/// The full-screen key `code` stands for, if any.
 /// The decision `key` asks for: `y`/`n`/`Y`/`N` pressed (without ctrl)
 /// while the approval view is up. Anywhere else no key decides, so `n`
 /// stays a log search's next match.
@@ -991,6 +975,7 @@ pub(crate) fn decision_key(key: &KeyEvent, in_approval_view: bool) -> Option<Dec
     }
 }
 
+/// The full-screen key `code` stands for, if any.
 pub(crate) fn screen_key(code: KeyCode) -> Option<ScreenKey> {
     Some(match code {
         KeyCode::Char('f') => ScreenKey::Follow,
@@ -1005,6 +990,8 @@ pub(crate) fn screen_key(code: KeyCode) -> Option<ScreenKey> {
     })
 }
 
+/// Whether background work no longer holds the exit: the loop's break
+/// predicate once the app has finished.
 fn bg_drained(bg_pending: &hcore::pending::Pending) -> bool {
     bg_pending.load(std::sync::atomic::Ordering::Acquire) == 0
 }
@@ -1022,6 +1009,17 @@ async fn exit_drain_wake(app_done: bool, bg_pending: &hcore::pending::Pending) {
     }
 }
 
+/// Capture stderr's pre-raw-mode `termios` and register a restore closure
+/// with `hcore::shutdown` before raw mode mutates it. The closure is the
+/// only thing that still runs if the run ends via `bootstrap`'s hard abort
+/// on the second Ctrl-C (`std::process::exit`, which skips destructors) — it
+/// restores cooked mode and re-shows the cursor with direct syscalls only,
+/// never crossterm: the abort path must not risk contending crossterm's own
+/// raw-mode mutex, which a concurrently-aborting thread could already hold.
+///
+/// A failed `tcgetattr` (stderr is not a tty — output redirected) records
+/// nothing, so a non-interactive run's hard abort stays a no-op: no stray
+/// escape bytes land in redirected output.
 fn record_raw_mode_restore() {
     let fd = io::stderr().as_raw_fd();
     let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
