@@ -2,7 +2,7 @@
 //! buckets in activity order. Folding an event is `O(log n)` at most; no
 //! frame sorts or walks the targets.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use hcore::capacity::Unit;
 use hcore::events::{BuildEvent, BuildEventKind, CacheOutcomeKind};
@@ -213,6 +213,8 @@ const REMOTE_HIT: u8 = 1 << 2;
 const STARTED: u8 = 1 << 3;
 const OP_OPEN: u8 = 1 << 4;
 const ENDED: u8 = 1 << 5;
+/// Between its `ResultStart` and its `ResultEnd`.
+const IN_FLIGHT: u8 = 1 << 6;
 
 /// Wait bits.
 const WAIT_ADMISSION: u8 = 1;
@@ -340,6 +342,11 @@ impl TabCounts {
         self.failed + self.dep_failed
     }
 
+    /// Every target that reached its `ResultEnd`, whatever its outcome.
+    pub fn ended(&self) -> usize {
+        self.finished_ok() + self.failed_total() + self.stopped
+    }
+
     pub fn tab(&self, tab: Tab) -> usize {
         match tab {
             Tab::All => self.all(),
@@ -390,6 +397,12 @@ pub struct Model {
     /// The latest report of each bounded pool.
     pools: BTreeMap<String, Gauge>,
     units: BTreeMap<String, String>,
+    /// The targets with an op open: what the slow rows, the busy-worker
+    /// count and a session's running list walk, bounded by what runs rather
+    /// than by the build. Follows `OP_OPEN` at its every change.
+    open: HashSet<Id>,
+    /// How many records carry `IN_FLIGHT`.
+    in_flight: usize,
     matched_seen: bool,
     matched_complete: bool,
 }
@@ -417,7 +430,13 @@ impl Model {
                 }
             }
             BuildEventKind::ResultStart { addr } => {
-                self.touch(addr);
+                let id = self.touch(addr);
+                if let Some(r) = self.rec_mut(id)
+                    && r.flags & (ENDED | IN_FLIGHT) == 0
+                {
+                    r.flags |= IN_FLIGHT;
+                    self.in_flight += 1;
+                }
             }
             BuildEventKind::AdmissionWaitStart { addr, .. } => {
                 self.wait(addr, WAIT_ADMISSION, true);
@@ -490,10 +509,15 @@ impl Model {
                 if r.flags & ENDED != 0 {
                     return;
                 }
-                r.flags = (r.flags | ENDED) & !OP_OPEN;
+                let was_in_flight = r.flags & IN_FLIGHT != 0;
+                r.flags = (r.flags | ENDED) & !(OP_OPEN | IN_FLIGHT);
                 r.waits = 0;
                 r.end_ms = at;
                 let cached = r.flags & CACHE_HIT != 0;
+                self.open.remove(&id);
+                if was_in_flight {
+                    self.in_flight -= 1;
+                }
                 let state = match (error, upstream_of) {
                     (Some(_), _) if *cancelled => RowState::Stopped,
                     (Some(_), Some(root)) => {
@@ -577,6 +601,45 @@ impl Model {
         self.names.len()
     }
 
+    /// The targets with an op open, in no order. Bounded by what runs.
+    pub fn open_ops(&self) -> impl Iterator<Item = (Id, &Record)> + '_ {
+        self.open
+            .iter()
+            .filter_map(|&id| Some((id, self.record(id)?)))
+    }
+
+    /// When `addr`'s open op started; `None` with no op open.
+    pub fn open_since(&self, addr: &str) -> Option<u64> {
+        let r = self.record(self.names.get(addr)?)?;
+        r.op_open().then_some(r.op_since_ms)
+    }
+
+    /// Whether `addr` is between its `ResultStart` and its `ResultEnd`.
+    pub fn in_flight(&self, addr: &str) -> bool {
+        self.names
+            .get(addr)
+            .and_then(|id| self.record(id))
+            .is_some_and(|r| r.flags & IN_FLIGHT != 0)
+    }
+
+    /// How many targets are between their `ResultStart` and `ResultEnd`.
+    pub fn in_flight_count(&self) -> usize {
+        self.in_flight
+    }
+
+    /// The failures, roots and the ones they took down alike, in the order
+    /// they ended. Walks the two failed buckets: `O(failed)`.
+    pub fn failures(&self) -> impl Iterator<Item = Id> + '_ {
+        let end = |id: &Id| self.record(*id).map_or(u64::MAX, |r| r.end_ms);
+        let mut roots = self.bucket_ref(RowState::Failed).ids().peekable();
+        let mut deps = self.bucket_ref(RowState::DepFailed).ids().peekable();
+        std::iter::from_fn(move || match (roots.peek(), deps.peek()) {
+            (Some(a), Some(b)) if end(b) < end(a) => deps.next(),
+            (Some(_), _) => roots.next(),
+            (None, _) => deps.next(),
+        })
+    }
+
     /// A root failure's PHASE text.
     pub fn reason(&self, id: Id) -> Option<&str> {
         self.reasons.get(&id).map(|r| &**r)
@@ -635,11 +698,13 @@ impl Model {
                 r.op = op.order() + 1;
                 r.op_since_ms = at;
                 r.flags |= OP_OPEN | STARTED;
+                self.open.insert(id);
             }
             Boundary::End => {
                 if r.flags & OP_OPEN != 0 && r.op() == Some(op) {
                     r.add_op_ms(op, at.saturating_sub(r.op_since_ms));
                     r.flags &= !OP_OPEN;
+                    self.open.remove(&id);
                 }
             }
         }
@@ -747,6 +812,12 @@ impl Model {
     /// The matcher finished: the total is final.
     pub fn matched_complete(&self) -> bool {
         self.matched_complete
+    }
+
+    /// How many targets are matched; `None` before any `Matched` event.
+    pub fn matched_total(&self) -> Option<usize> {
+        self.matched_seen
+            .then(|| self.counts(CountScope::Matched).all())
     }
 
     /// Every state's count in `scope`. `O(1)`.

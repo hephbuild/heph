@@ -539,7 +539,8 @@ pub struct SnapshotCounts {
     /// Matched targets that finished.
     #[serde(default)]
     pub matched_done: u64,
-    /// Matched targets that were cache hits.
+    /// Matched targets that finished from the cache (a hit announced on a
+    /// target still running counts once it ends).
     #[serde(default)]
     pub matched_cached: u64,
     /// Every target that finished, matched or not.

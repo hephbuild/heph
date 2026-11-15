@@ -328,7 +328,7 @@ impl BuildState {
             SpotRef::Admission(a) => self.admission_waits.contains_key(a),
             SpotRef::Lock(a) => self.lock_waits.contains_key(a),
             SpotRef::Scratch(c) => self.spot.by_cache.get(c).is_some_and(|s| !s.is_empty()),
-            SpotRef::Run(a) => self.open_ops.contains(a),
+            SpotRef::Run(a) => self.dash.open_since(a).is_some(),
         }
     }
 
@@ -425,7 +425,7 @@ impl BuildState {
                 })
             }
             SpotRef::Run(addr) => {
-                let start = self.ops.get(addr)?.active?.1;
+                let start = self.dash.open_since(addr)?;
                 Some(Spot {
                     icon: "▶",
                     style: Style::default().fg(Color::Cyan),

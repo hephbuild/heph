@@ -14,7 +14,7 @@ use ratatui::text::{Line, Span};
 use crate::tui::app::{CIAppView, TUIAppView};
 use crate::tui::session::{HolderNames, SessionId};
 use hcore::capacity::Unit;
-use hcore::events::{BuildEvent, BuildEventKind, CacheCounts, CacheOutcomeKind};
+use hcore::events::{BuildEvent, BuildEventKind, CacheCounts};
 
 mod line;
 mod spotlight;
@@ -336,18 +336,6 @@ pub(crate) enum Boundary {
     End,
 }
 
-/// The per-target operation timeline: how long each [`Op`] has taken (completed
-/// runs summed) plus the currently-open op and its start timestamp. This is the
-/// paved road — every op a target passes through folds in here, and the slow-row
-/// renderer reads the breakdown straight off it.
-#[derive(Debug, Default)]
-struct OpTimeline {
-    /// op → summed elapsed (ms) of its finished runs on this target.
-    completed: HashMap<Op, u64>,
-    /// the currently-open op and its server start timestamp, if any.
-    active: Option<(Op, u64)>,
-}
-
 /// Map an individually-typed engine event to the op-timeline boundary it
 /// represents, if any. This is where the well-defined engine events are collapsed
 /// into the shared per-target timeline; a new op needs one arm here.
@@ -385,61 +373,21 @@ pub(crate) fn event_op_boundary(kind: &BuildEventKind) -> Option<(&str, Op, Boun
 
 /// Folds the engine's build-progress event stream into renderable state.
 #[derive(Debug, Default)]
+///
+/// Per target it keeps nothing of its own: every target's state, op times,
+/// matched and cached bits live in [`Self::dash`]'s fixed-size records,
+/// named by an interned id. What is keyed by address here is bounded by
+/// what is waiting or running right now (the wait maps, the clamps, the
+/// spotlight's orderings), or by the caches a build declares.
 pub struct BuildState {
-    /// Addrs between `ResultStart` and `ResultEnd` — the "running" set.
-    in_flight_results: HashSet<String>,
-    /// addr → per-target operation timeline. Drives the worker braille (count of
-    /// targets whose active op is `Execute`) and the slow-target breakdown rows.
-    /// An entry persists only while its target can still be "slow": completed
-    /// durations are kept alongside a later active op so the breakdown stays
-    /// right, but the whole entry is dropped once the target's `ResultEnd`
-    /// arrives (see the `ResultEnd` arm of [`BuildState::apply`]) — by then every
-    /// op has closed and nothing will ever read it again, so keeping it would be
-    /// a per-target allocation for the rest of the request at 100k-target scale.
-    ops: HashMap<String, OpTimeline>,
-    /// The addrs in `ops` whose timeline has an op open right now — the live
-    /// subset the render path cares about.
-    ///
-    /// Walking all of `ops` to find the few with an open op cost ~2 ms in the
-    /// worker braille and ~3 ms in the slow rows on *every* frame at 100k
-    /// targets. This set is bounded by what is in flight instead. Maintained at
-    /// the one place `OpTimeline::active` changes, so it cannot drift from it.
-    open_ops: HashSet<String>,
-    /// The matched top-level target set, accumulated as the matcher streams.
-    matched: HashSet<String>,
-    /// Whether any `Matched` event has been seen (gates display of the line).
-    matched_seen: bool,
-    /// Whether the matched set is final (matcher fully resolved). While false
-    /// the total is provisional and rendered with a `~` prefix.
-    matched_complete: bool,
-    /// Every addr that reached `ResultEnd` (deduped). Matched progress is
-    /// `matched ∩ finished` — order-independent, since `Matched` events can
-    /// arrive after some matched results already finished.
-    finished: HashSet<String>,
-    /// `|matched ∩ finished|`, folded incrementally by [`BuildState::apply`].
-    ///
-    /// The header reads this on every frame, and rescanning `matched` there cost
-    /// ~21-24 ms at 100k targets. Maintained at **both** edges of the
-    /// intersection — a `Matched` event that names an already-finished addr, and
-    /// a `ResultEnd` for an already-matched addr — because neither event is
-    /// guaranteed to arrive first. Each edge fires only when its `HashSet::insert`
-    /// reports the addr was new, so duplicate events cannot double-count.
-    matched_finished: usize,
-    /// `|matched ∩ cache_hit|`, folded on the same two-edge rule as
-    /// [`BuildState::matched_finished`].
-    matched_cached: usize,
+    /// `ResultEnd`s of targets that had started, by outcome: no error,
+    /// an error, a stop. Counted once each, as the model's in-flight bit
+    /// says.
     completed: usize,
     errored: usize,
     /// Targets a stop ended (`ResultEnd.cancelled`): not `errored`, not
     /// `completed`.
     cancelled: usize,
-    /// Failed targets in failure order, each with its error message (if the
-    /// `ResultEnd` carried one). Drives the [`ViewMode::Failed`] body.
-    failed: Vec<(String, Option<String>)>,
-    /// Successfully completed targets in completion order (cache hits included —
-    /// any `ResultEnd` with no error). Drives the [`ViewMode::Done`] body; the
-    /// `Matched` scope filters this against `matched`.
-    done: Vec<String>,
     /// Targets whose driver actually ran to success (`ExecuteEnd` with no error).
     /// Distinct from `completed`, which includes cache hits that never executed.
     executed: usize,
@@ -447,16 +395,6 @@ pub struct BuildState {
     /// `CacheHitRebuilt` — the same fold the GHA report and telemetry use, so
     /// the summary line agrees with them. The tier events are not counted.
     cache: CacheCounts,
-    /// Addrs whose cache outcome was a hit that still stands. The header's
-    /// "cached" count is `matched ∩ cache_hit` so it tracks matched targets
-    /// only, not the transitive deps that also hit cache.
-    ///
-    /// A hit can be **retracted**: the engine decides a hit from the revision's
-    /// manifest, and a manifest can outlive its blobs (a local GC, an
-    /// object-store lifecycle rule, or simply a revision whose blobs were never
-    /// pulled on a run that is now offline). The engine then rebuilds the target
-    /// and says so with `CacheHitRebuilt`.
-    cache_hit: HashSet<String>,
     /// Worker capacity announced by the engine via `RequestConfig`. `None` until
     /// the event lands (no worker indicator rendered before then).
     max_workers: Option<usize>,
@@ -678,65 +616,28 @@ impl BuildState {
             self.last_event_ms
                 .map_or(ev.at_unix_ms, |t| t.max(ev.at_unix_ms)),
         );
+        // The op timeline is the model's (one record per target); what this
+        // state keeps of it is the spotlight's run order, which follows the
+        // record's open op across the fold. A `ResultEnd` closes it too.
+        let op_addr = match &ev.kind {
+            BuildEventKind::ResultEnd { addr, .. } => Some(addr.as_str()),
+            kind => event_op_boundary(kind).map(|(addr, ..)| addr),
+        };
+        let open_before = op_addr.and_then(|addr| self.dash.open_since(addr));
+        // Counted once per started target: the model clears the bit below.
+        let was_in_flight = match &ev.kind {
+            BuildEventKind::ResultEnd { addr, .. } => self.dash.in_flight(addr),
+            _ => false,
+        };
         self.dash.apply(ev, &self.redact);
-        // Generic op timeline: any event that is an op boundary folds here,
-        // independent of the counter side effects handled in the match below.
-        if let Some((addr, op, boundary)) = event_op_boundary(&ev.kind) {
-            let tl = self.ops.entry(addr.to_string()).or_default();
-            let started_before = tl.active.map(|(_, at)| at);
-            match boundary {
-                Boundary::Start => {
-                    // Overlap guard: if an op is somehow still open (a missing or
-                    // reordered end), fold it into completed before opening the new
-                    // one so durations stay bounded and `active` reflects reality.
-                    if let Some((prev_op, prev_start)) = tl.active.take() {
-                        *tl.completed.entry(prev_op).or_insert(0) +=
-                            ev.at_unix_ms.saturating_sub(prev_start);
-                    }
-                    tl.active = Some((op, ev.at_unix_ms));
-                }
-                Boundary::End => {
-                    // Ignore a mismatched/duplicate close: only the currently-open
-                    // op can end.
-                    if let Some((active_op, start)) = tl.active
-                        && active_op == op
-                    {
-                        *tl.completed.entry(op).or_insert(0) += ev.at_unix_ms.saturating_sub(start);
-                        tl.active = None;
-                    }
-                }
-            }
-            // Mirror the transition into the live index the frame path walks. Kept
-            // here, at the sole writer of `active`, so the two cannot disagree.
-            // The spotlight's run order follows the same transition.
-            let started_after = tl.active.map(|(_, at)| at);
-            let open = tl.active.is_some();
-            if started_before != started_after {
-                if let Some(at) = started_before {
+        if let Some(addr) = op_addr {
+            let open_after = self.dash.open_since(addr);
+            if open_before != open_after {
+                if let Some(at) = open_before {
                     self.spot.running.remove(&(at, addr.to_owned()));
                 }
-                if let Some(at) = started_after {
+                if let Some(at) = open_after {
                     self.spot.running.insert((at, addr.to_owned()));
-                }
-            }
-            if open {
-                if !self.open_ops.contains(addr) {
-                    self.open_ops.insert(addr.to_string());
-                }
-            } else {
-                self.open_ops.remove(addr);
-                // Retention tail: `RemoteCacheWrite` is pushed from a detached
-                // background task (`Engine::spawn_remote_upload`), which the
-                // engine deliberately does not await inside the `ResultEnd` scope
-                // (see its doc comment in `remote_cache.rs`) — so its Start/End
-                // can arrive for an addr *after* that addr's `ResultEnd` already
-                // fired and removed the entry below. When that happens this Start
-                // recreates the entry (`entry().or_default()` above); nothing
-                // would ever remove it again unless caught here. Whichever
-                // closing edge is actually last — `ResultEnd` or this trailing
-                // End — is the one that reclaims it.
-                if self.finished.contains(addr) {
-                    self.ops.remove(addr);
                 }
             }
         }
@@ -753,32 +654,8 @@ impl BuildState {
                         .insert(pool.clone(), hcore::events::unit_of(units, pool));
                 }
             }
-            BuildEventKind::Matched { addrs, complete } => {
-                self.matched_seen = true;
-                // The loop below replaced an `extend`, which reserved off the
-                // iterator's size hint; keep that so a wide `Matched` batch does
-                // not rehash its way up.
-                self.matched.reserve(addrs.len());
-                for addr in addrs {
-                    // The matched-set edge of both intersections: an addr can be
-                    // named here *after* it finished or hit cache, so fold those
-                    // in now. `insert` guards against a repeated addr.
-                    if self.matched.insert(addr.clone()) {
-                        if self.finished.contains(addr) {
-                            self.matched_finished += 1;
-                        }
-                        if self.cache_hit.contains(addr) {
-                            self.matched_cached += 1;
-                        }
-                    }
-                }
-                if *complete {
-                    self.matched_complete = true;
-                }
-            }
-            BuildEventKind::ResultStart { addr } => {
-                self.in_flight_results.insert(addr.clone());
-            }
+            // Folded by `dash`: the matched bit and the in-flight bit.
+            BuildEventKind::Matched { .. } | BuildEventKind::ResultStart { .. } => {}
             BuildEventKind::ResultEnd {
                 addr,
                 error,
@@ -811,56 +688,20 @@ impl BuildState {
                         ),
                     });
                 }
-                if self.in_flight_results.remove(addr) {
+                if was_in_flight {
                     if error.is_some() && *cancelled {
                         // Stopped, not failed: in neither count, and not
                         // a row of the Failed tab.
                         self.cancelled += 1;
-                    } else if let Some(err) = error {
+                    } else if error.is_some() {
                         self.errored += 1;
                         if upstream_of.is_none() {
                             self.root_failed += 1;
                         }
-                        // The Failed tab draws this text: no home in it (I9).
-                        let err = self.redact.apply(err).into_owned();
-                        self.failed.push((addr.clone(), Some(err)));
                     } else {
                         self.completed += 1;
-                        self.done.push(addr.clone());
                     }
                 }
-                // Record every terminal addr. This is the result edge of
-                // `matched ∩ finished`; the `Matched` arm covers the other one,
-                // so the count is right whichever event arrives first.
-                if self.finished.insert(addr.clone()) && self.matched.contains(addr) {
-                    self.matched_finished += 1;
-                }
-                // Retention: `ResultEnd` is emitted by the drop guard wrapping the
-                // whole `inner_result_addr` scope, so by the time it fires,
-                // Execute/LocalCacheWrite/RemoteCacheRead have all closed for this
-                // addr (they run awaited inside that scope) and neither reader
-                // walks a closed entry — keeping it around would be unbounded
-                // per-target memory for the rest of the run. `open_ops.remove` is
-                // normally a no-op here (the entry left it already) but guards
-                // against a dangling index entry if `active` were somehow still
-                // open at this point.
-                //
-                // `RemoteCacheWrite` is the one op this does NOT catch:
-                // `Engine::spawn_remote_upload` pushes it from a detached
-                // background task the engine deliberately does not await inside
-                // this scope, so its Start/End can arrive after this removal has
-                // already run. The `Boundary::End` arm above closes that tail —
-                // it checks `self.finished` and reclaims the (re-created) entry
-                // itself once that trailing op closes, so whichever event is
-                // actually last is the one that frees it.
-                if let Some(OpTimeline {
-                    active: Some((_, at)),
-                    ..
-                }) = self.ops.remove(addr)
-                {
-                    self.spot.running.remove(&(at, addr.clone()));
-                }
-                self.open_ops.remove(addr);
             }
             // The op timeline (folded above) tracks Execute's duration; here we
             // keep only the `executed` counter side effect on a successful end.
@@ -926,21 +767,15 @@ impl BuildState {
             | BuildEventKind::LocalCacheMiss { .. }
             | BuildEventKind::RemoteCacheHit { .. }
             | BuildEventKind::RemoteCacheMiss { .. } => {}
-            BuildEventKind::CacheOutcome { addr, outcome } => {
+            // The per-target hit bit is the model's; a retracted hit clears it.
+            BuildEventKind::CacheOutcome { .. } => {
                 self.cache.apply(&ev.kind);
-                if matches!(
-                    outcome,
-                    CacheOutcomeKind::LocalHit | CacheOutcomeKind::RemoteHit
-                ) {
-                    self.note_cache_hit(addr);
-                }
             }
-            BuildEventKind::CacheHitRebuilt { addr, .. } => {
+            BuildEventKind::CacheHitRebuilt { .. } => {
                 // A rebuild whose `was` this build does not know moves nothing
-                // in the fold, so it must not move the header's set either.
+                // in the fold.
                 if CacheCounts::delta(&ev.kind).is_some() {
                     self.cache.apply(&ev.kind);
-                    self.retract_cache_hit(addr);
                 }
             }
             BuildEventKind::ResultLockWaitStart {
@@ -1033,29 +868,6 @@ impl BuildState {
         self.fold_spotlight(ev.at_unix_ms);
     }
 
-    /// Record a hit outcome (local or remote). This is the cache edge of
-    /// `matched ∩ cache_hit`; the `Matched` arm of [`BuildState::apply`] covers
-    /// the other one, so the count is right whichever event arrives first. A
-    /// repeat hit on an addr already in the set does not re-count.
-    fn note_cache_hit(&mut self, addr: &str) {
-        if self.cache_hit.insert(addr.to_string()) && self.matched.contains(addr) {
-            self.matched_cached += 1;
-        }
-    }
-
-    /// Undo [`note_cache_hit`](Self::note_cache_hit) on a `CacheHitRebuilt`:
-    /// the target is about to build after all. The counts themselves moved in
-    /// [`CacheCounts`]; this is the header's set and its folded intersection.
-    ///
-    /// Dropping the addr from `cache_hit` alone is not enough: `matched_cached`
-    /// is folded, not rescanned, so it has to be decremented in the same breath
-    /// or the header keeps reporting a target as cached while it builds.
-    fn retract_cache_hit(&mut self, addr: &str) {
-        if self.cache_hit.remove(addr) && self.matched.contains(addr) {
-            self.matched_cached = self.matched_cached.saturating_sub(1);
-        }
-    }
-
     /// Targets whose *currently-active* op has run longer than `threshold_ms`,
     /// with the per-op breakdown for that target. Returns
     /// `(addr, active_elapsed_ms, breakdown)` sorted by active elapsed descending
@@ -1064,26 +876,27 @@ impl BuildState {
     /// with no active op is never slow (it dropped off when its last op ended).
     fn long_running(&self, now_ms: u64, threshold_ms: u64) -> Vec<SlowTarget> {
         // Walks only the targets with an op open, not every target the run has
-        // touched — see [`BuildState::open_ops`]. This runs on every frame of the
-        // live view.
+        // touched. This runs on every frame of the live view.
         let mut out: Vec<SlowTarget> = self
-            .open_ops
-            .iter()
-            .filter_map(|addr| {
-                let tl = self.ops.get(addr)?;
-                let (active_op, active_start) = tl.active?;
-                let active_elapsed = now_ms.saturating_sub(active_start);
+            .dash
+            .open_ops()
+            .filter_map(|(id, r)| {
+                let active_op = r.op()?;
+                let active_elapsed = now_ms.saturating_sub(r.op_since_ms);
                 if active_elapsed <= threshold_ms {
                     return None;
                 }
-                // Merge completed durations with the live active op, drop sub-second
-                // ops, and order the breakdown by pipeline position.
-                let mut durs = tl.completed.clone();
-                *durs.entry(active_op).or_insert(0) += active_elapsed;
-                let mut breakdown: Vec<(Op, u64)> =
-                    durs.into_iter().filter(|&(_, ms)| ms >= 1000).collect();
-                breakdown.sort_by_key(|&(op, _)| op.order());
-                Some((addr.clone(), active_elapsed, breakdown))
+                // The finished runs plus the live one, sub-second ops dropped,
+                // in pipeline order.
+                let breakdown: Vec<(Op, u64)> = Op::BY_ORDER
+                    .iter()
+                    .map(|&op| {
+                        let live = if op == active_op { active_elapsed } else { 0 };
+                        (op, r.op_ms(op) + live)
+                    })
+                    .filter(|&(_, ms)| ms >= 1000)
+                    .collect();
+                Some((self.dash.addr(id).to_owned(), active_elapsed, breakdown))
             })
             .collect();
         out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
@@ -1093,7 +906,7 @@ impl BuildState {
     /// Number of matched top-level targets seen so far (provisional until the
     /// matcher fully resolves). `None` if no `Matched` event has arrived.
     pub fn matched_total(&self) -> Option<usize> {
-        self.matched_seen.then_some(self.matched.len())
+        self.dash.matched_total()
     }
 
     /// Matched-target progress as `(done, total, complete)`: how many matched
@@ -1101,26 +914,13 @@ impl BuildState {
     /// matcher fully resolved (`false` ⇒ the total is provisional). `None` until
     /// a `Matched` event arrives (e.g. a single-target `result_addr` entry).
     ///
-    /// `O(1)` — the intersection is folded in [`BuildState::apply`], not scanned
-    /// here. This runs on every frame.
+    /// `O(1)`: bucket lengths in the model.
     pub fn matched_progress(&self) -> Option<(usize, usize, bool)> {
-        if !self.matched_seen {
+        if !self.dash.matched_seen() {
             return None;
         }
-        // A subset-count that has drifted above the set it counts into is the
-        // observable symptom of a missed fold edge. Free in release; turns a
-        // desync into a failure across the whole suite, not just one test.
-        debug_assert!(
-            self.matched_finished <= self.matched.len(),
-            "matched_finished {} exceeds matched {}",
-            self.matched_finished,
-            self.matched.len(),
-        );
-        Some((
-            self.matched_finished,
-            self.matched.len(),
-            self.matched_complete,
-        ))
+        let tabs = self.dash.counts(CountScope::Matched);
+        Some((tabs.ended(), tabs.all(), self.dash.matched_complete()))
     }
 
     /// The count fields for one frame — see [`Counts`]. `O(1)`: every field
@@ -1180,54 +980,16 @@ impl BuildState {
         format!("{done} · {cached} · {failed}{split}")
     }
 
-    /// The header's cached count: matched targets that hit cache
-    /// (`matched ∩ cache_hit`), falling back to all cache hits before any
-    /// `Matched` event arrives, or to every cached addr under
-    /// [`CountScope::All`].
-    ///
-    /// `O(1)` — the intersection is folded in [`BuildState::apply`], not scanned
-    /// here. This runs on every frame.
-    pub fn cached_count(&self, scope: CountScope) -> usize {
-        match scope {
-            // All-targets scope: every addr that hit cache (deduped), deps included.
-            CountScope::All => self.cache_hit.len(),
-            CountScope::Matched if self.matched_seen => {
-                debug_assert!(
-                    self.matched_cached <= self.matched.len(),
-                    "matched_cached {} exceeds matched {}",
-                    self.matched_cached,
-                    self.matched.len(),
-                );
-                self.matched_cached
-            }
-            CountScope::Matched => usize::try_from(self.cache.hits()).unwrap_or(usize::MAX),
-        }
-    }
-
     /// Workers currently holding an execute slot (targets whose active op is
     /// `Execute`). This is the semaphore-bound busy count, not `running` (which
     /// includes targets blocked on deps without a permit).
     ///
-    /// Bounded by what is in flight, not by the run: it walks [`Self::open_ops`],
-    /// not every target that has ever run an op. The header calls this on every
-    /// frame in every view.
+    /// Bounded by what is in flight, not by the run: it walks the model's
+    /// open ops, not every target that has ever run an op.
     pub fn busy_workers(&self) -> usize {
-        // A stale entry here would be silently skipped by this filter and by
-        // `long_running`'s `?`, under-reporting the worker count rather than
-        // failing. `O(in-flight)`, and free in release.
-        debug_assert!(
-            self.open_ops
-                .iter()
-                .all(|addr| self.ops.get(addr).is_some_and(|tl| tl.active.is_some())),
-            "open_ops holds an addr whose timeline has no op open",
-        );
-        self.open_ops
-            .iter()
-            .filter(|addr| {
-                self.ops
-                    .get(*addr)
-                    .is_some_and(|tl| matches!(tl.active, Some((Op::Execute, _))))
-            })
+        self.dash
+            .open_ops()
+            .filter(|(_, r)| r.op() == Some(Op::Execute))
             .count()
     }
 
@@ -1360,11 +1122,11 @@ impl BuildState {
     /// Whether any build activity was observed. Used to suppress an all-zero
     /// final summary for commands that emit no build events (inspect/query).
     pub fn has_activity(&self) -> bool {
-        self.matched_seen
+        self.dash.matched_seen()
             || self.completed > 0
             || self.errored > 0
             || self.cancelled > 0
-            || !self.in_flight_results.is_empty()
+            || self.dash.in_flight_count() > 0
             || self.cache.consulted() > 0
     }
 
@@ -1387,7 +1149,7 @@ impl BuildState {
             "{matched}done {}, err {}, running {}, cache {} hit / {} miss",
             self.completed,
             self.errored,
-            self.in_flight_results.len(),
+            self.dash.in_flight_count(),
             hits,
             misses,
         )
@@ -1538,13 +1300,10 @@ impl BuildState {
             SessionSnapshot, SnapshotCounts,
         };
         let count = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
-        let mut running: Vec<(&String, _, u64)> = self
-            .open_ops
-            .iter()
-            .filter_map(|addr| {
-                let (op, since) = self.ops.get(addr)?.active?;
-                Some((addr, op, since))
-            })
+        let mut running: Vec<(&str, Op, u64)> = self
+            .dash
+            .open_ops()
+            .filter_map(|(id, r)| Some((self.dash.addr(id), r.op()?, r.op_since_ms)))
             .collect();
         running.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(b.0)));
         let running_unblocked = running
@@ -1553,6 +1312,11 @@ impl BuildState {
                 !self.lock_waits.contains_key(*addr) && !self.admission_waits.contains_key(*addr)
             })
             .count();
+        let all = self.dash.counts(CountScope::All);
+        let matched = self
+            .dash
+            .matched_seen()
+            .then(|| self.dash.counts(CountScope::Matched));
         let mut lock_waits: Vec<(&String, &(LockHolder, u64))> = self.lock_waits.iter().collect();
         lock_waits.sort_by(|a, b| a.0.cmp(b.0));
         let mut admission_waits: Vec<(&String, &AdmissionWait)> =
@@ -1568,7 +1332,7 @@ impl BuildState {
         let totals = ListTotals {
             running: ListTotal::of(running.len(), cap),
             waiting: ListTotal::of(waiting.len(), cap),
-            failed: ListTotal::of(self.failed.len(), cap),
+            failed: ListTotal::of(all.failed_total(), cap),
             lock_waits: ListTotal::of(lock_waits.len(), cap),
             admission_waits: ListTotal::of(admission_waits.len(), cap),
         };
@@ -1576,7 +1340,7 @@ impl BuildState {
             .into_iter()
             .take(cap)
             .map(|(addr, op, since)| RunningTarget {
-                addr: addr.clone(),
+                addr: addr.to_owned(),
                 op: op.name().to_owned(),
                 since_unix_ms: since,
             })
@@ -1611,12 +1375,12 @@ impl BuildState {
             first_event_unix_ms: self.started_at_ms,
             last_event_unix_ms: self.last_event_ms,
             counts: SnapshotCounts {
-                matched: self.matched_seen.then(|| count(self.matched.len())),
-                matched_complete: self.matched_complete,
-                matched_done: count(self.matched_finished),
-                matched_cached: count(self.matched_cached),
-                finished: count(self.finished.len()),
-                in_flight: count(self.in_flight_results.len()),
+                matched: matched.map(|m| count(m.all())),
+                matched_complete: self.dash.matched_complete(),
+                matched_done: count(matched.map_or(0, |m| m.ended())),
+                matched_cached: count(matched.map_or(0, |m| m.cached)),
+                finished: count(all.ended()),
+                in_flight: count(self.dash.in_flight_count()),
                 executed: count(self.executed),
                 failed: count(self.errored),
                 running_unblocked: Some(count(running_unblocked)),
@@ -1624,10 +1388,10 @@ impl BuildState {
             running,
             waiting,
             failed: self
-                .failed
-                .iter()
+                .dash
+                .failures()
                 .take(cap)
-                .map(|(addr, _)| addr.clone())
+                .map(|id| self.dash.addr(id).to_owned())
                 .collect(),
             lock_waits,
             admission_waits,
@@ -2358,7 +2122,7 @@ impl TuiProgressView {
             )))
         };
         // What the run is resolving, while the matcher streams.
-        let resolving = (dashboard && !self.state.matched_complete)
+        let resolving = (dashboard && !self.state.dash.matched_complete())
             .then(|| self.label())
             .filter(|l| !l.is_empty())
             .map(Cow::Owned);
@@ -2955,6 +2719,7 @@ impl CIAppView for GcCiView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hcore::events::CacheOutcomeKind;
 
     fn ev(at_unix_ms: u64, kind: BuildEventKind) -> BuildEvent {
         BuildEvent { at_unix_ms, kind }
@@ -3660,9 +3425,10 @@ mod tests {
         s.apply(&ev(0, execute_start("//a:b")));
         s.apply(&ev(3_000, local_write_start("//a:b")));
 
-        let tl = s.ops.get("//a:b").expect("timeline");
-        assert_eq!(tl.completed.get(&Op::Execute).copied(), Some(3_000));
-        assert_eq!(tl.active, Some((Op::LocalCacheWrite, 3_000)));
+        let r = rec(&s, "//a:b");
+        assert_eq!(r.op_ms(Op::Execute), 3_000);
+        assert_eq!((r.op(), r.op_open()), (Some(Op::LocalCacheWrite), true));
+        assert_eq!(r.op_since_ms, 3_000);
     }
 
     #[test]
@@ -3672,109 +3438,60 @@ mod tests {
         s.apply(&ev(0, execute_start("//a:b")));
         s.apply(&ev(1_000, local_write_end("//a:b")));
 
-        let tl = s.ops.get("//a:b").expect("timeline");
-        assert_eq!(tl.active, Some((Op::Execute, 0)));
-        assert!(tl.completed.is_empty());
+        let r = rec(&s, "//a:b");
+        assert_eq!(
+            (r.op(), r.op_open(), r.op_since_ms),
+            (Some(Op::Execute), true, 0)
+        );
+        assert_eq!(r.total_ms(), 0);
+    }
+
+    /// `addr`'s record in the model.
+    fn rec<'a>(s: &'a BuildState, addr: &str) -> &'a crate::tui::dashboard::Record {
+        s.dash
+            .id(addr)
+            .and_then(|id| s.dash.record(id))
+            .expect("a record")
+    }
+
+    /// The addrs the open-op index holds, sorted.
+    fn open_addrs(s: &BuildState) -> Vec<&str> {
+        let mut v: Vec<&str> = s.dash.open_ops().map(|(id, _)| s.dash.addr(id)).collect();
+        v.sort_unstable();
+        v
     }
 
     #[test]
-    fn op_timeline_dropped_from_ops_once_result_ends() {
-        // `ops` must not retain a finished target's timeline forever — that is
-        // unbounded per-target memory over the life of a run. By the time
-        // `ResultEnd` fires, Execute (and any local-cache-write) has already
-        // closed for the addr, so the entry is dead weight: neither
-        // `long_running` nor `busy_workers` reads a closed-op entry (both walk
-        // `open_ops`, and `long_running`'s `?` already skips an addr with no
-        // active op). Retention should reclaim it here.
-        let mut s = BuildState::new();
-        s.apply(&ev(0, execute_start("//a:b")));
-        s.apply(&ev(1_000, execute_end("//a:b")));
-        assert!(s.ops.contains_key("//a:b"));
-
-        s.apply(&ev(2_000, result_end("//a:b", None)));
-        assert!(
-            !s.ops.contains_key("//a:b"),
-            "ops must drop a target's timeline once its ResultEnd arrives"
-        );
-        assert!(
-            !s.open_ops.contains("//a:b"),
-            "open_ops must not disagree with ops once the entry is gone"
-        );
+    fn a_result_end_closes_its_open_op_even_a_failing_one() {
+        // A `ResultEnd` with an op still open (a lost End) must not leave the
+        // target in the index the slow rows and busy count walk.
+        for error in [None, Some("boom".to_owned())] {
+            let mut s = BuildState::new();
+            s.apply(&ev(0, execute_start("//a:b")));
+            assert_eq!(open_addrs(&s), ["//a:b"]);
+            s.apply(&ev(2_000, result_end("//a:b", error)));
+            assert!(open_addrs(&s).is_empty());
+            assert!(s.long_running(99_000, 0).is_empty());
+        }
     }
 
     #[test]
-    fn op_timeline_reclaimed_when_remote_cache_write_trails_result_end() {
+    fn a_remote_cache_write_that_trails_result_end_opens_and_closes() {
         // `RemoteCacheWrite` is pushed from a detached background task
         // (`Engine::spawn_remote_upload`) that the engine does not await inside
         // the `ResultEnd` scope, so its Start/End can legitimately arrive after
-        // `ResultEnd` already removed the entry. The Start recreates it
-        // (`ops.entry(..).or_default()`); if nothing then reclaimed it, every
-        // remote-cache-uploading target would leak one `OpTimeline` forever —
-        // the exact unbounded growth this retention is meant to fix, just gated
-        // on remote caching instead of run size. The trailing End must be the
-        // one that frees it this time.
+        // `ResultEnd`. It shows while open and leaves the index at its End.
         let mut s = BuildState::new();
         s.apply(&ev(0, execute_start("//a:b")));
         s.apply(&ev(1_000, execute_end("//a:b")));
         s.apply(&ev(2_000, result_end("//a:b", None)));
-        assert!(!s.ops.contains_key("//a:b"), "gone after ResultEnd");
+        assert!(open_addrs(&s).is_empty());
 
-        // The background upload starts after ResultEnd already fired.
         s.apply(&ev(3_000, remote_write_start("//a:b")));
-        assert!(
-            s.ops.contains_key("//a:b"),
-            "the trailing op legitimately recreates the entry"
-        );
-        assert!(s.open_ops.contains("//a:b"));
+        assert_eq!(open_addrs(&s), ["//a:b"]);
 
         s.apply(&ev(4_000, remote_write_end("//a:b")));
-        assert!(
-            !s.ops.contains_key("//a:b"),
-            "the trailing RemoteCacheWriteEnd must reclaim it since ResultEnd already fired"
-        );
-        assert!(!s.open_ops.contains("//a:b"));
-    }
-
-    #[test]
-    fn op_timeline_dropped_from_ops_on_a_failing_result_end_too() {
-        // The removal in the `ResultEnd` arm runs unconditionally, before the
-        // success/error branch is even inspected — a failed target must not keep
-        // its timeline around any more than a successful one does.
-        let mut s = BuildState::new();
-        s.apply(&ev(0, execute_start("//a:b")));
-        s.apply(&ev(1_000, execute_end("//a:b")));
-
-        s.apply(&ev(2_000, result_end("//a:b", Some("boom".into()))));
-        assert!(
-            !s.ops.contains_key("//a:b"),
-            "a failing ResultEnd must drop the timeline too"
-        );
-    }
-
-    #[test]
-    fn ops_map_does_not_grow_unbounded_over_a_large_run() {
-        // The retention regression guard at the scale the field doc calls out:
-        // before this fix `ops` gained one `OpTimeline` per target for the life
-        // of the request, so a 100k-target run held 100k never-freed entries
-        // (each carrying its own `completed: HashMap<Op, u64>`). A wall-clock
-        // measurement of that is noisy under load on this box; the retained
-        // entry count is not — every target below fully completes, so the
-        // post-run count is the deterministic before/after number: unbounded
-        // (100_000) without the fix, 0 with it.
-        let mut s = BuildState::new();
-        for i in 0..100_000 {
-            let addr = format!("//pkg{i}:t");
-            s.apply(&ev(0, result_start(&addr)));
-            s.apply(&ev(0, execute_start(&addr)));
-            s.apply(&ev(1, execute_end(&addr)));
-            s.apply(&ev(1, result_end(&addr, None)));
-        }
-        assert_eq!(s.completed, 100_000);
-        assert_eq!(
-            s.ops.len(),
-            0,
-            "ops retained every finished target instead of freeing them"
-        );
+        assert!(open_addrs(&s).is_empty());
     }
 
     #[test]
@@ -3802,11 +3519,19 @@ mod tests {
     fn result_start_then_ok_end_completes_and_clears_in_flight() {
         let mut s = BuildState::new();
         s.apply(&ev(1, result_start("//a:b")));
-        assert_eq!(s.in_flight_results.len(), 1);
+        assert_eq!(s.dash.in_flight_count(), 1);
         s.apply(&ev(2, result_end("//a:b", None)));
         assert_eq!(s.completed, 1);
         assert_eq!(s.errored, 0);
-        assert_eq!(s.in_flight_results.len(), 0);
+        assert_eq!(s.dash.in_flight_count(), 0);
+    }
+
+    #[test]
+    fn a_result_end_with_no_start_is_not_counted() {
+        let mut s = BuildState::new();
+        s.apply(&ev(2, result_end("//a:b", None)));
+        assert_eq!((s.completed, s.errored), (0, 0));
+        assert_eq!(s.dash.in_flight_count(), 0);
     }
 
     #[test]
@@ -3816,7 +3541,7 @@ mod tests {
         s.apply(&ev(2, result_end("//a:b", Some("boom".into()))));
         assert_eq!(s.errored, 1);
         assert_eq!(s.completed, 0);
-        assert_eq!(s.in_flight_results.len(), 0);
+        assert_eq!(s.dash.in_flight_count(), 0);
     }
 
     #[test]
@@ -3824,13 +3549,15 @@ mod tests {
         let mut s = BuildState::new();
         s.apply(&ev(1, result_start("//a:b")));
         s.apply(&ev(1, result_start("//a:b")));
-        assert_eq!(s.in_flight_results.len(), 1);
+        assert_eq!(s.dash.in_flight_count(), 1);
         s.apply(&ev(2, result_end("//a:b", None)));
         // Second ResultEnd for an already-removed addr must not double-count.
         s.apply(&ev(3, result_end("//a:b", Some("late".into()))));
+        // Nor does a start after the end reopen it.
+        s.apply(&ev(4, result_start("//a:b")));
         assert_eq!(s.completed, 1);
         assert_eq!(s.errored, 0);
-        assert_eq!(s.in_flight_results.len(), 0);
+        assert_eq!(s.dash.in_flight_count(), 0);
     }
 
     #[test]
@@ -3894,20 +3621,6 @@ mod tests {
             "{}",
             s.summary()
         );
-        assert_eq!(
-            s.cached_count(CountScope::All),
-            usize::try_from(l + r).expect("small"),
-            "the rebuilt hits are no longer listed as cached"
-        );
-    }
-
-    /// Before any `Matched` event the header falls back to the fold's hits,
-    /// and a remote hit is one of them.
-    #[test]
-    fn cached_count_falls_back_to_the_fold_before_matched() {
-        let mut s = BuildState::new();
-        s.apply(&ev(1, remote_cache_hit("//a:r")));
-        assert_eq!(s.cached_count(CountScope::Matched), 1);
     }
 
     /// A cache hit the engine later has to rebuild must stop counting as a hit.
@@ -3922,21 +3635,16 @@ mod tests {
     #[test]
     fn a_hit_that_rebuilds_stops_counting_as_a_hit() {
         let mut s = BuildState::new();
-        // `matched_cached` is folded at both edges — a hit can be announced
-        // before or after its addr is matched — so retraction has to survive
-        // both orders. `//a:local` and `//a:stands` are matched first and hit
-        // after; `//a:remote` hits first and is matched after.
+        // A hit can be announced before or after its addr is matched, so
+        // retraction has to survive both orders. `//a:local` and `//a:stands`
+        // are matched first and hit after; `//a:remote` hits first and is
+        // matched after.
         s.apply(&ev(1, matched(&["//a:local", "//a:stands"], false)));
         s.apply(&ev(2, local_cache_hit("//a:local")));
         s.apply(&ev(3, remote_cache_hit("//a:remote")));
         s.apply(&ev(4, local_cache_hit("//a:stands")));
         s.apply(&ev(5, matched(&["//a:remote"], true)));
         assert_eq!(cache3(&s), (2, 1, 0));
-        assert_eq!(
-            s.cached_count(CountScope::Matched),
-            3,
-            "all three matched targets are announced cached to begin with"
-        );
 
         // Two of the three revisions turn out to be unreadable and get rebuilt.
         use hcore::events::CacheHitKind;
@@ -3958,29 +3666,23 @@ mod tests {
             s.summary()
         );
         assert_eq!(s.executed, 2);
-        // Through the header's own accessors, not the raw counters: these are the
-        // numbers the user reads, and the point is that `executed + cached` (2 + 1)
-        // does not exceed the three targets seen.
+        for addr in ["//a:local", "//a:remote", "//a:stands"] {
+            s.apply(&ev(10, result_end(addr, None)));
+        }
+        // Through the counts the user reads: `executed + cached` (2 + 1) does
+        // not exceed the three targets seen, in either scope.
+        for scope in [CountScope::All, CountScope::Matched] {
+            let tabs = s.dash.counts(scope);
+            assert_eq!(
+                (tabs.done, tabs.cached),
+                (2, 1),
+                "{scope:?}: only the hit that stood may still be reported as cached"
+            );
+        }
+        assert_eq!(s.counts(CountScope::Matched).cached, "1 cached");
         assert_eq!(
-            s.cached_count(CountScope::All),
-            1,
-            "only the hit that stood may still be reported as cached"
-        );
-        assert_eq!(
-            s.cached_count(CountScope::Matched),
-            1,
-            "the folded `matched ∩ cache_hit` counter must be decremented too — \
-             dropping the addr from the set alone leaves the count stale"
-        );
-        assert_eq!(
-            s.cached_count(CountScope::Matched),
-            scan_matched(&s).1,
-            "the folded counter must still agree with the set it stands in for"
-        );
-        assert!(
-            !s.cache_hit.contains("//a:local") && s.cache_hit.contains("//a:stands"),
-            "only the rebuilt addrs are retracted: {:?}",
-            s.cache_hit
+            rec(&s, "//a:stands").state,
+            crate::tui::dashboard::RowState::Cached
         );
     }
 
@@ -4832,32 +4534,37 @@ mod tests {
         )
     }
 
-    /// The two matched intersections computed the slow way, straight off the
-    /// sets. The oracle for the counters folded in `apply`.
+    /// The two matched intersections (finished, finished from the cache)
+    /// computed the slow way, over every record. The oracle for the bucket
+    /// counts the model keeps.
     fn scan_matched(s: &BuildState) -> (usize, usize) {
+        use crate::tui::dashboard::RowState as S;
+        let recs: Vec<_> = (0..s.dash.id_count())
+            .filter_map(|id| s.dash.record(u32::try_from(id).ok()?))
+            .filter(|r| r.matched())
+            .collect();
         (
-            s.matched.iter().filter(|a| s.finished.contains(*a)).count(),
-            s.matched
-                .iter()
-                .filter(|a| s.cache_hit.contains(*a))
+            recs.iter()
+                .filter(|r| !matches!(r.state, S::Queued | S::Blocked | S::Running))
                 .count(),
+            recs.iter().filter(|r| r.state == S::Cached).count(),
         )
     }
 
     /// The same two intersections as the render path reports them.
     fn rendered_matched(s: &BuildState) -> (usize, usize) {
         let (done, _, _) = s.matched_progress().expect("a Matched event has landed");
-        (done, s.cached_count(CountScope::Matched))
+        (done, s.dash.counts(CountScope::Matched).cached)
     }
 
     #[test]
     fn matched_counters_track_the_full_scan_under_out_of_order_events() {
-        // `matched ∩ finished` and `matched ∩ cache_hit` are folded incrementally
-        // rather than rescanned every frame, so they have to be maintained at
-        // *both* edges of each intersection. `Engine::result` really does emit a
-        // target's `ResultEnd` before the `Matched` event that names it, so a
-        // counter folded only on the result edge undercounts. Pin both against a
-        // full scan of the same sets, after every interleaving.
+        // `matched ∩ finished` and `matched ∩ cached` are bucket counts kept
+        // as events fold rather than rescanned every frame, so they have to
+        // move at *both* edges of each intersection. `Engine::result` really
+        // does emit a target's `ResultEnd` before the `Matched` event that
+        // names it, so a count kept only on the result edge undercounts. Pin
+        // both against a full scan of the records, after every interleaving.
         let mut s = BuildState::new();
         let mut clock = 0u64;
         let mut apply = |s: &mut BuildState, kind| {
@@ -4902,25 +4609,24 @@ mod tests {
         );
         assert_eq!(rendered_matched(&s), (3, 2));
 
-        // A cache hit on a matched target that has not finished: the cached
-        // counter moves, the done counter does not.
+        // A cache hit on a matched target that has not finished moves
+        // neither: cached is a target finished from the cache.
         apply(&mut s, local_cache_hit("//late:d"));
         assert_eq!(
             rendered_matched(&s),
             scan_matched(&s),
             "cache hit, no result"
         );
-        assert_eq!(rendered_matched(&s), (3, 3));
+        assert_eq!(rendered_matched(&s), (3, 2));
 
         // A matched target that *fails* still advances the done count — the
-        // header reads `4 / 5 done · … · 1 failed`, and `finished` is recorded
-        // outside the success branch precisely so it does. The scan oracle cannot
-        // see a regression here (it reads the same `finished` set), so this one
+        // header reads `4 / 5 done · … · 1 failed`. The scan oracle cannot
+        // see a regression here (it reads the same states), so this one
         // needs the literal.
         apply(&mut s, result_start("//late:e"));
         apply(&mut s, result_end("//late:e", Some("boom".into())));
         assert_eq!(rendered_matched(&s), scan_matched(&s), "matched failure");
-        assert_eq!(rendered_matched(&s), (4, 3));
+        assert_eq!(rendered_matched(&s), (4, 2));
 
         // Repeats on every path are idempotent: a duplicate `ResultEnd`, a second
         // cache hit on an already-cached addr, and a `Matched` event re-naming an
@@ -4929,7 +4635,7 @@ mod tests {
         apply(&mut s, remote_cache_hit("//early:a"));
         apply(&mut s, matched(&["//early:a", "//late:c"], true));
         assert_eq!(rendered_matched(&s), scan_matched(&s), "duplicate events");
-        assert_eq!(rendered_matched(&s), (4, 3));
+        assert_eq!(rendered_matched(&s), (4, 2));
     }
 
     #[test]
@@ -5453,9 +5159,9 @@ mod tests {
 
     #[test]
     fn the_live_op_index_holds_only_open_ops_not_the_whole_run() {
-        // `ops` keeps a target's timeline until its `ResultEnd` (none of these
-        // 2,000 targets get one here); the frame path used to walk `ops` itself
-        // on every frame. The index it walks instead stays in-flight-sized.
+        // The model keeps every target's record (none of these 2,000 get a
+        // `ResultEnd` here, so all stay Running); the frame path walks the
+        // open-op index instead, which stays in-flight-sized.
         let mut s = BuildState::new();
         for i in 0..2_000 {
             let addr = format!("//pkg{i}:t");
@@ -5467,14 +5173,10 @@ mod tests {
         s.apply(&ev(2, execute_start("//live:b")));
         s.apply(&ev(2, local_write_start("//live:c")));
 
+        assert_eq!(s.dash.counts(CountScope::All).running, 2_003);
         assert_eq!(
-            s.ops.len(),
-            2_003,
-            "no ResultEnd fired, so nothing is retired"
-        );
-        assert_eq!(
-            s.open_ops.len(),
-            3,
+            open_addrs(&s),
+            ["//live:a", "//live:b", "//live:c"],
             "the frame path only walks the live ops"
         );
         assert_eq!(s.busy_workers(), 2, "only Execute holds a worker slot");
@@ -5484,12 +5186,23 @@ mod tests {
 
     #[test]
     fn open_op_index_survives_duplicate_and_mismatched_boundaries() {
-        // The index is maintained beside `OpTimeline::active`; every event order
-        // the fold tolerates must leave the two agreeing.
+        // The index is maintained beside each record's open-op bit; every
+        // event order the fold tolerates must leave the two agreeing.
+        let open_recs = |s: &BuildState| -> Vec<(u32, Option<Op>)> {
+            let mut v: Vec<_> = (0..s.dash.id_count())
+                .filter_map(|id| {
+                    let id = u32::try_from(id).ok()?;
+                    let r = s.dash.record(id)?;
+                    r.op_open().then(|| (id, r.op()))
+                })
+                .collect();
+            v.sort_unstable_by_key(|&(id, _)| id);
+            v
+        };
         let rescan = |s: &BuildState| {
-            s.ops
-                .values()
-                .filter(|tl| matches!(tl.active, Some((Op::Execute, _))))
+            open_recs(s)
+                .iter()
+                .filter(|(_, op)| *op == Some(Op::Execute))
                 .count()
         };
         let mut s = BuildState::new();
@@ -5512,15 +5225,18 @@ mod tests {
         for (i, kind) in steps.into_iter().enumerate() {
             s.apply(&ev(i as u64, kind));
             assert_eq!(s.busy_workers(), rescan(&s), "after step {i}");
+            let mut index: Vec<(u32, Option<Op>)> =
+                s.dash.open_ops().map(|(id, r)| (id, r.op())).collect();
+            index.sort_unstable_by_key(|&(id, _)| id);
             assert_eq!(
-                s.open_ops.len(),
-                s.ops.values().filter(|tl| tl.active.is_some()).count(),
-                "index drifted from the timelines after step {i}",
+                index,
+                open_recs(&s),
+                "index drifted from the records after step {i}"
             );
         }
         assert_eq!(s.busy_workers(), 0);
-        assert!(s.open_ops.is_empty(), "nothing left open");
-        assert_eq!(s.ops.len(), 2, "both targets stay in the history");
+        assert!(open_addrs(&s).is_empty(), "nothing left open");
+        assert_eq!(s.dash.id_count(), 2, "both targets stay in the history");
     }
 
     /// `System` with a per-thread allocation counter. Test binary only — the
@@ -5537,11 +5253,18 @@ mod tests {
         /// Bytes this thread allocated minus the bytes it freed. Signed: a
         /// block freed here may have been allocated on another thread.
         static LIVE: Cell<isize> = const { Cell::new(0) };
+        /// The most `LIVE` has been since [`live_bytes_during`] last reset it.
+        static PEAK: Cell<isize> = const { Cell::new(0) };
     }
 
     /// Moves this thread's live-byte count by `delta`.
     fn live_add(delta: isize) {
-        LIVE.with(|c| c.set(c.get().wrapping_add(delta)));
+        let live = LIVE.with(|c| {
+            let live = c.get().wrapping_add(delta);
+            c.set(live);
+            live
+        });
+        PEAK.with(|p| p.set(p.get().max(live)));
     }
 
     fn signed(n: usize) -> isize {
@@ -5605,12 +5328,18 @@ mod tests {
         ALLOCS.with(Cell::get).saturating_sub(before)
     }
 
-    /// What `f` returns, and the heap bytes this thread still holds once it
-    /// has returned: what `f` built and kept, net of what it freed.
-    fn live_bytes_during<T>(f: impl FnOnce() -> T) -> (T, isize) {
+    /// What `f` returns, the heap bytes this thread still holds once it has
+    /// returned (what `f` built and kept, net of what it freed), and the most
+    /// it held at any point while it ran.
+    fn live_bytes_during<T>(f: impl FnOnce() -> T) -> (T, isize, isize) {
         let before = LIVE.with(Cell::get);
+        PEAK.with(|p| p.set(before));
         let out = f();
-        (out, LIVE.with(Cell::get).wrapping_sub(before))
+        (
+            out,
+            LIVE.with(Cell::get).wrapping_sub(before),
+            PEAK.with(Cell::get).wrapping_sub(before),
+        )
     }
 
     /// A scripted 100k-target build, folded: the matcher streams the
@@ -5634,9 +5363,14 @@ mod tests {
                 complete: b + 1 == N / BATCH,
             });
         }
+        // Every target's result starts before any runs, as the engine starts
+        // a dependent's while it waits on its deps: the peak in flight is the
+        // whole build.
+        for i in 0..N {
+            ev(BuildEventKind::ResultStart { addr: addr(i) });
+        }
         for i in 0..N {
             let a = addr(i);
-            ev(BuildEventKind::ResultStart { addr: a.clone() });
             if i % 10 == 0 {
                 ev(BuildEventKind::CacheOutcome {
                     addr: a.clone(),
@@ -5671,33 +5405,33 @@ mod tests {
     }
 
     /// The spec's memory budget: folding a 100k-target build keeps the
-    /// dashboard's whole heap under 25 MB — counted by the allocator, not
-    /// `size_of` the record. About 15.5 MB when written.
-    ///
-    /// The dashboard `Model` alone: `BuildState` still carries the box's
-    /// String-keyed sets (`matched`, `finished`, `done`, `cache_hit`, the op
-    /// timelines), which roughly double it (35 MB when written) until the
-    /// box and those sets go.
+    /// view's whole heap under 25 MB — counted by the allocator, not
+    /// `size_of` the record. The whole [`BuildState`], the dashboard's model
+    /// in it, at the end of the build and at its peak (every result in
+    /// flight). 15.5 MB at the end and 16.2 MB at the peak when written
+    /// (35 MB at the end while the box's String-keyed sets were still here).
     #[test]
     fn heap_at_100k_targets() {
         const BUDGET: isize = 25 * 1024 * 1024;
-        let (model, bytes) = live_bytes_during(|| {
-            let mut m = crate::tui::dashboard::Model::default();
-            let redact = crate::tui::text::Redact::default();
-            fold_100k(&mut |e| m.apply(e, &redact));
-            m
+        let (state, end, peak) = live_bytes_during(|| {
+            let mut s = BuildState::new();
+            fold_100k(&mut |e| s.apply(e));
+            s
         });
-        assert_eq!(model.id_count(), 100_000);
+        assert_eq!(state.dash.id_count(), 100_000);
         assert_eq!(
-            model.counts(CountScope::All).finished_ok(),
+            state.dash.counts(CountScope::All).finished_ok(),
             100_000,
             "the scripted build ran to the end",
         );
-        assert!(
-            bytes < BUDGET,
-            "the dashboard holds {bytes} B at 100k targets (budget {BUDGET})",
-        );
-        drop(model);
+        assert_eq!(state.completed, 100_000);
+        for (when, bytes) in [("at the end", end), ("at the peak", peak)] {
+            assert!(
+                bytes < BUDGET,
+                "the view holds {bytes} B {when} of a 100k-target build (budget {BUDGET})",
+            );
+        }
+        drop(state);
     }
 
     #[test]
