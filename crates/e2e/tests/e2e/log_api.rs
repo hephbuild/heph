@@ -858,12 +858,46 @@ async fn log_remote_fetch_on_demand() -> anyhow::Result<()> {
         .await
         .expect_err("not fetched");
     assert_eq!(unavailable(err).0, LogSource::Cache { remote: true });
-    // Unit 5: scrolling the dashboard over remote-hit rows fetches nothing.
-
-    // Opened: fetched, once; the next open reads the local copy.
+    // The dashboard's LAST LINE column over the remote-hit row (what a
+    // scroll over it does, on the reader's thread) fetches nothing.
+    let tails =
+        heph::commands::log::EngineTails::new(Arc::clone(&warm), tokio::runtime::Handle::current());
+    let (size, tail) = tokio::task::spawn_blocking(move || {
+        use heph::tui::dashboard::LogReader as _;
+        (tails.size("//p:t"), tails.tail("//p:t", 4096))
+    })
+    .await?;
     assert_eq!(
-        open(&warm, "//p:t", &fetch).await?,
-        Some((LogSource::Cache { remote: true }, log.clone()))
+        (size, tail),
+        (None, None),
+        "the column reads local logs only"
+    );
+    let err = open(&warm, "//p:t", &no_fetch)
+        .await
+        .expect_err("still not fetched");
+    assert_eq!(unavailable(err).0, LogSource::Cache { remote: true });
+
+    // The target screen's Log tab: fetched, once; the next open reads the
+    // local copy.
+    let screen = heph::commands::log::EngineTargetReader::new(
+        Arc::clone(&warm),
+        tokio::runtime::Handle::current(),
+    );
+    let opened = tokio::task::spawn_blocking(move || {
+        use heph::tui::dashboard::{LogOpened, TargetReader as _};
+        match screen.open_log("//p:t") {
+            LogOpened::Tail { bytes, len, about } => Ok((bytes, len, about)),
+            other => Err(anyhow::anyhow!("not a tail: {other:?}")),
+        }
+    })
+    .await??;
+    assert_eq!(
+        opened,
+        (
+            log.clone().into_bytes(),
+            log.len() as u64,
+            "from the remote cache".to_owned()
+        )
     );
     assert_eq!(
         open(&warm, "//p:t", &no_fetch).await?,

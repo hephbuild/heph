@@ -605,7 +605,7 @@ fn ignore_closed(res: io::Result<()>) -> io::Result<()> {
 /// only (no locator, no remote fetch), as I4 asks of the list column. Called
 /// from the view's own reader thread, never a runtime worker, so it blocks on
 /// `open_log` through the runtime's handle.
-pub(crate) struct EngineTails {
+pub struct EngineTails {
     engine: Arc<Engine>,
     rt: tokio::runtime::Handle,
     /// The log `size` opened, kept for the `tail` that follows it.
@@ -613,7 +613,7 @@ pub(crate) struct EngineTails {
 }
 
 impl EngineTails {
-    pub(crate) fn new(engine: Arc<Engine>, rt: tokio::runtime::Handle) -> Self {
+    pub fn new(engine: Arc<Engine>, rt: tokio::runtime::Handle) -> Self {
         Self {
             engine,
             rt,
@@ -645,6 +645,163 @@ impl crate::tui::dashboard::LogReader for EngineTails {
             _ => self.open(addr)?,
         };
         log.tail(max).ok()
+    }
+}
+
+/// The target screen's reader in `heph run`'s dashboard: the target's log
+/// through the engine's log API, a remote hit's fetched when the Log tab
+/// first shows it, and what it produced. Runs on the screen's own thread
+/// ([`crate::tui::dashboard::feed`]), so it blocks on the runtime there.
+#[derive(Clone)]
+pub struct EngineTargetReader {
+    engine: Arc<Engine>,
+    rt: tokio::runtime::Handle,
+    /// Runs going on in other hephs, found through the sessions under HOME.
+    locator: Option<Arc<dyn hcore::session_record::LiveRunLogLocator>>,
+}
+
+impl EngineTargetReader {
+    pub fn new(engine: Arc<Engine>, rt: tokio::runtime::Handle) -> Self {
+        let locator = SessionRoot::for_reading(std::env::var_os("HOME").as_deref())
+            .map(|root| Arc::new(SessionRunLogLocator::new(root)) as _);
+        Self {
+            engine,
+            rt,
+            locator,
+        }
+    }
+
+    fn opts(&self) -> LogOptions {
+        LogOptions {
+            locator: self.locator.clone(),
+            fetch_remote: true,
+            ..LogOptions::default()
+        }
+    }
+}
+
+/// An error from the log API, as the Log tab says it.
+fn log_error(e: &anyhow::Error) -> crate::tui::dashboard::LogOpened {
+    use crate::tui::dashboard::LogOpened;
+    if let Some(e) = e.downcast_ref::<LogUnavailable>() {
+        LogOpened::Unavailable(e.to_string())
+    } else if let Some(e) = e.downcast_ref::<NoLiveLogs>() {
+        LogOpened::Nothing(e.to_string())
+    } else {
+        LogOpened::Unavailable(format!("log unavailable: {e:#}"))
+    }
+}
+
+/// Where a finished log was read from, in the Log tab's words.
+fn about(source: &LogSource) -> &'static str {
+    match source {
+        LogSource::Live { running: true, .. } => "live",
+        LogSource::Live { running: false, .. } => "kept from the run",
+        LogSource::FailureSlot => "from the failure slot",
+        LogSource::Cache { remote: false } => "from the cache",
+        LogSource::Cache { remote: true } => "from the remote cache",
+    }
+}
+
+/// A run's log followed for the Log tab.
+struct EngineFeed(LogFollower);
+
+impl crate::tui::dashboard::LogFeed for EngineFeed {
+    fn poll(&mut self) -> crate::tui::dashboard::FeedStep {
+        use crate::tui::dashboard::FeedStep;
+        match self.0.poll() {
+            Ok(FollowStep::Bytes(b)) => FeedStep::Bytes(b),
+            Ok(FollowStep::Idle) => FeedStep::Idle,
+            Ok(FollowStep::End) => FeedStep::End,
+            Err(e) => FeedStep::Failed(format!("following the log failed: {e:#}")),
+        }
+    }
+}
+
+fn listed_file(f: crate::engine::ListedFile) -> crate::tui::dashboard::OutputFile {
+    use crate::engine::ListedKind;
+    use crate::tui::dashboard::FileKind;
+    crate::tui::dashboard::OutputFile {
+        path: f.path.to_string_lossy().into_owned(),
+        kind: match f.kind {
+            ListedKind::File => FileKind::File,
+            ListedKind::Symlink(to) => FileKind::Symlink(to.to_string_lossy().into_owned()),
+            ListedKind::Dir => FileKind::Dir,
+        },
+        size: f.size,
+        hash: f.hash,
+    }
+}
+
+impl crate::tui::dashboard::TargetReader for EngineTargetReader {
+    fn open_log(&self, addr: &str) -> crate::tui::dashboard::LogOpened {
+        use crate::tui::dashboard::LogOpened;
+        let addr = match htaddr::parse_addr(addr) {
+            Ok(a) => a,
+            Err(e) => return LogOpened::Unavailable(format!("log unavailable: {e:#}")),
+        };
+        let opts = self.opts();
+        let mut log = match self.rt.block_on(self.engine.open_log(&addr, &opts)) {
+            Ok(Some(log)) => log,
+            Ok(None) => return LogOpened::Nothing("no log yet: the target has not run".into()),
+            Err(e) => return log_error(&e),
+        };
+        if matches!(log.info().source, LogSource::Live { running: true, .. }) {
+            // A run going on: followed from its first byte, on into what
+            // replaces its live file when it ends.
+            drop(log);
+            return match self
+                .rt
+                .block_on(self.engine.follow_log(&addr, &opts, false))
+            {
+                Ok(Some(f)) => LogOpened::Follow {
+                    feed: Box::new(EngineFeed(f)),
+                    about: "live".into(),
+                },
+                Ok(None) => LogOpened::Nothing("no log yet: the target has not run".into()),
+                Err(e) => log_error(&e),
+            };
+        }
+        let about = about(&log.info().source).to_owned();
+        let len = log.len();
+        match log.tail(TAIL_MAX) {
+            Ok(bytes) => LogOpened::Tail { bytes, len, about },
+            Err(e) => LogOpened::Unavailable(format!("log unavailable: reading it failed: {e}")),
+        }
+    }
+
+    fn outputs(&self, addr: &str, failed: bool) -> crate::tui::dashboard::OutputsFound {
+        use crate::tui::dashboard::{OutputGroup, OutputsFound};
+        let addr = match htaddr::parse_addr(addr) {
+            Ok(a) => a,
+            Err(e) => return OutputsFound::Unavailable(format!("{e:#}")),
+        };
+        if failed {
+            return match self.engine.failure_outputs(&addr) {
+                Ok(Some(f)) => OutputsFound::Failure {
+                    kept: f.kept.into_iter().map(listed_file).collect(),
+                    fixes: f.fixes,
+                },
+                Ok(None) => OutputsFound::Nothing,
+                Err(e) => OutputsFound::Unavailable(format!("outputs unavailable: {e:#}")),
+            };
+        }
+        match self.engine.output_listing(&addr, None) {
+            Ok(Some(l)) => OutputsFound::Listing(
+                l.groups
+                    .into_iter()
+                    .map(|g| OutputGroup {
+                        name: g.group,
+                        size: g.size,
+                        hash: g.hash,
+                        files: g.files.into_iter().map(listed_file).collect(),
+                        unavailable: g.unavailable,
+                    })
+                    .collect(),
+            ),
+            Ok(None) => OutputsFound::Nothing,
+            Err(e) => OutputsFound::Unavailable(format!("outputs unavailable: {e:#}")),
+        }
     }
 }
 

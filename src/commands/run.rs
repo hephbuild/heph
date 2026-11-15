@@ -694,6 +694,10 @@ impl App for RunApp {
             Arc::clone(&self.engine),
             tokio::runtime::Handle::current(),
         )))
+        .with_target_reader(Arc::new(crate::commands::log::EngineTargetReader::new(
+            Arc::clone(&self.engine),
+            tokio::runtime::Handle::current(),
+        )))
     }
 
     fn ci_view(&self) -> Self::CiView {
