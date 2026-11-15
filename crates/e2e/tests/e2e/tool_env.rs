@@ -151,3 +151,99 @@ target(
     assert_eq!(content.trim(), "hello", "got: {content:?}");
     Ok(())
 }
+
+/// Shaped like `protoc`: a binary plus a data directory the consumer passes on
+/// its command line. `greet` prints `$1/greeting.txt`.
+const GREET_SDK_BUILD: &str = r#"
+target(
+    name = "sdk",
+    driver = "bash",
+    run = [
+        "mkdir -p sdk/bin sdk/include",
+        "echo hello > sdk/include/greeting.txt",
+        "printf '#!/bin/sh\\ncat \"$1/greeting.txt\"\\n' > sdk/bin/greet",
+        "chmod +x sdk/bin/greet",
+    ],
+    out = "sdk/bin/greet",
+    support_files = "sdk/include/",
+)
+"#;
+
+/// `$TOOL_ROOT` / `$TOOL_<G>_ROOT` name the tool's package directory as staged
+/// for the consumer, so a path the tool's BUILD file declares (`sdk/include`)
+/// is found without knowing where heph stages tools.
+#[tokio::test]
+async fn tool_root_names_the_tools_support_files() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file("greetsdk", GREET_SDK_BUILD);
+    ws.write_build_file(
+        "greetuse",
+        r#"
+target(
+    name = "unnamed",
+    driver = "bash",
+    tools = ["//greetsdk:sdk"],
+    run = "greet $TOOL_ROOT/sdk/include > $OUT",
+    out = "out.txt",
+)
+target(
+    name = "named",
+    driver = "bash",
+    tools = {"my-sdk": ["//greetsdk:sdk"]},
+    run = "[[ $TOOL_MY_SDK_ROOT == /* ]] && greet $TOOL_MY_SDK_ROOT/sdk/include > $OUT",
+    out = "out.txt",
+)
+"#,
+    );
+
+    for addr in ["//greetuse:unnamed", "//greetuse:named"] {
+        let result = ws.run(addr).await?;
+        let content = common::artifact_string(&result);
+        assert_eq!(content.trim(), "hello", "{addr}: got {content:?}");
+    }
+    Ok(())
+}
+
+/// One entry per tool package: two outputs of one tool share a root, a second
+/// tool adds its own, and a workspace source file (no package of its own)
+/// adds nothing.
+#[tokio::test]
+async fn tool_root_lists_each_tool_package_once() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "multi",
+        r#"
+target(
+    name = "two",
+    driver = "bash",
+    run = "echo a > one; echo b > two",
+    out = {"one": "one", "two": "two"},
+)
+"#,
+    );
+    ws.write_build_file("greetsdk", GREET_SDK_BUILD);
+    ws.write_file("src/script.sh", "echo src\n");
+    ws.write_build_file(
+        "rootuse",
+        r#"
+target(
+    name = "consumer",
+    driver = "bash",
+    tools = {"x": [
+        "//multi:two|one",
+        "//multi:two|two",
+        "//greetsdk:sdk",
+        "//@heph/fs:file@f=src/script.sh",
+    ]},
+    run = "for r in $TOOL_X_ROOT; do echo \"${r##*/}\"; done > $OUT",
+    out = "out.txt",
+)
+"#,
+    );
+
+    let result = ws.run("//rootuse:consumer").await?;
+    let content = common::artifact_string(&result);
+    let roots: Vec<&str> = content.lines().collect();
+    assert_eq!(roots, ["multi", "greetsdk"], "got {content:?}");
+    Ok(())
+}

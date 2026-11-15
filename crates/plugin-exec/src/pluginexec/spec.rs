@@ -39,7 +39,7 @@ impl Codegen {
 /// dict).
 #[derive(Spec)]
 pub(crate) struct TargetSpec {
-    /// Command to execute, as an argv list. `$OUT`, `$SRC_<group>`, `$TOOL_<group>` and declared env vars are available.
+    /// Command to execute, as an argv list. `$OUT`, `$SRC_<group>`, `$TOOL_<group>`, `$TOOL_<group>_ROOT` and declared env vars are available.
     ///
     /// An element may carry a `${read://pkg:name}` reference — the contents of
     /// that target's single output, resolved by the host before the command
@@ -87,7 +87,13 @@ pub(crate) struct TargetSpec {
     /// whose output depends on *who* ran it is not cacheable, and says so with
     /// `cache = False`.
     pub credentials: Vec<String>,
-    /// Build tools, grouped by name → list of target addresses; symlinked under `tools/`.
+    /// Build tools, grouped by name → list of target addresses. Each tool's
+    /// outputs are put on `PATH` and listed in `$TOOL_<group>` (`$TOOL` for the
+    /// unnamed group). `$TOOL_<group>_ROOT` (`$TOOL_ROOT`) is each tool's package
+    /// directory as staged for this target, holding its outputs and its
+    /// `support_files` at the paths its BUILD file declares them: a tool in
+    /// `sdk/` with `support_files = "include/"` is read as `$TOOL_ROOT/include`.
+    /// Several tools in one group are space-joined in both variables.
     pub tools: HashMap<String, Vec<String>>,
     /// Declared outputs, grouped by name → list of output paths the target writes.
     #[spec(rename = "out")]

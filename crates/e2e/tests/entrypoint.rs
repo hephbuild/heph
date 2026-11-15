@@ -2424,3 +2424,42 @@ target(name = "ep", driver = "bash", entrypoint = True, tools = ["//sdktool:tool
     assert_eq!(got.trim(), "hello", "{got}");
     Ok(())
 }
+
+/// An entrypoint gets `$TOOL_ROOT` as a build does
+/// (`tool_env::tool_root_names_the_tools_support_files`): it passes a data
+/// directory its tool ships on the tool's command line.
+#[tokio::test]
+async fn entrypoint_tool_root_names_the_tools_support_files() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "greetsdk",
+        r#"
+target(
+    name = "sdk",
+    driver = "bash",
+    run = [
+        "mkdir -p sdk/bin sdk/include",
+        "echo hello > sdk/include/greeting.txt",
+        "printf '#!/bin/sh\\ncat \"$1/greeting.txt\"\\n' > sdk/bin/greet",
+        "chmod +x sdk/bin/greet",
+    ],
+    out = "sdk/bin/greet",
+    support_files = "sdk/include/",
+)
+"#,
+    );
+    ws.write_build_file(
+        "app",
+        r#"
+target(name = "ep", driver = "bash", entrypoint = True, tools = ["//greetsdk:sdk"],
+       run = "exec > \"$HEPH_TEST_OUT\" 2>&1; greet \"$TOOL_ROOT/sdk/include\"")
+"#,
+    );
+    let out = ws.dir.path().join("out.txt");
+    let outcome = invoke(&ws.engine, request("//app:ep", ws.dir.path(), &[], &out)?).await;
+    let exit = exited(outcome);
+    let got = read(&out)?;
+    assert_eq!(exit, Exit::Code(0), "{got}");
+    assert_eq!(got.trim(), "hello", "{got}");
+    Ok(())
+}

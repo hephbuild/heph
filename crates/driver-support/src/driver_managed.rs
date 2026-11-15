@@ -865,7 +865,9 @@ pub async fn detect_output_collisions_blocking(
 /// `hbuiltins::pluginfs::is_fs_addr`.
 const FS_PROVIDER_PKG: &str = "@heph/fs";
 
-fn is_fs_source(addr: &Addr) -> bool {
+/// Whether `addr` is an fs provider `file`/`glob` target: workspace source,
+/// whose package is the provider's rather than the directory it lives in.
+pub fn is_fs_source(addr: &Addr) -> bool {
     addr.package.as_str() == FS_PROVIDER_PKG
 }
 

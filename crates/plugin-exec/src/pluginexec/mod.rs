@@ -447,6 +447,29 @@ pub(crate) fn tool_key(group: &str) -> String {
     }
 }
 
+/// `TOOL_ROOT`/`TOOL_<GROUP>_ROOT`: where a tool group's packages were staged.
+pub(crate) fn tool_root_key(group: &str) -> String {
+    format!("{}_ROOT", tool_key(group))
+}
+
+/// Refuse a tool group whose `_ROOT` variable is another group's `TOOL_*`
+/// variable (`tools = {"": …, "root": …}` both claim `TOOL_ROOT`). Either value
+/// would silently replace the other.
+fn check_tool_root_keys<'g>(
+    groups: impl Iterator<Item = &'g String> + Clone,
+) -> anyhow::Result<()> {
+    for group in groups.clone() {
+        let root_key = tool_root_key(group);
+        if let Some(other) = groups.clone().find(|g| tool_key(g) == root_key) {
+            anyhow::bail!(
+                "tool groups {group:?} and {other:?} both set `{root_key}`: it is the root of \
+                 group {group:?} and the binary of group {other:?}. Rename one of the groups"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Hashed and runtime-only dep groups merged so each group ends up with a
 /// single `SRC_*` covering both: `deps` first, `runtime_deps` after.
 pub(crate) fn merged_dep_groups<'d>(
@@ -2121,8 +2144,19 @@ impl Driver {
             // same list file. engine/link.rs validates 1 FilePath per output.
             let mut linked: std::collections::HashSet<std::ffi::OsString> =
                 std::collections::HashSet::new();
+            check_tool_root_keys(def.tool_group_inputs.keys())?;
             for (group, inputs) in &def.tool_group_inputs {
                 let tool_key = tool_key(group);
+                // `$TOOL_<G>_ROOT`: each tool's package directory in the tree
+                // it was staged into, so a consumer can name a file the tool
+                // ships (`$TOOL_ROOT/sdk/include`) without knowing where heph
+                // stages tools. Its outputs and `support_files` share that
+                // tree. Space-joined and deduped per group, like `$TOOL_<G>`.
+                // A workspace source file has no package of its own to root,
+                // so it adds nothing.
+                let root_key = tool_root_key(group);
+                let mut root_seen: std::collections::HashSet<std::path::PathBuf> =
+                    std::collections::HashSet::new();
                 // Per-group dedup for $TOOL_<G> values. `linked` is process-wide
                 // (avoids EEXIST on symlink); `group_seen` is per-group so each
                 // TOOL_<G> reflects that group's references without duplicates
@@ -2142,6 +2176,20 @@ impl Driver {
                     }) else {
                         continue;
                     };
+                    if !hdriver_support::driver_managed::is_fs_source(&m.input.source_addr) {
+                        let root = m.unpack_root.join(m.input.source_addr.package.as_str());
+                        let root_str = root.to_str().ok_or_else(|| {
+                            anyhow::anyhow!("tool root is not valid UTF-8: {:?}", root)
+                        })?;
+                        if !root_seen.contains(&root) {
+                            let entry = env.entry(root_key.clone()).or_default();
+                            if !entry.is_empty() {
+                                entry.push(' ');
+                            }
+                            entry.push_str(root_str);
+                            root_seen.insert(root);
+                        }
+                    }
                     let list_path = m.require_list_path()?;
                     let list_f = std::fs::File::open(list_path).with_context(|| {
                         format!(
@@ -3197,6 +3245,24 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn tool_root_key_collisions_are_refused() {
+        let check = |groups: &[&str]| {
+            let groups: Vec<String> = groups.iter().map(|g| (*g).to_string()).collect();
+            check_tool_root_keys(groups.iter())
+        };
+        assert_eq!(tool_root_key(""), "TOOL_ROOT");
+        assert_eq!(tool_root_key("my-sdk"), "TOOL_MY_SDK_ROOT");
+        // The unnamed group's root is group `root`'s binary.
+        let err = check(&["", "root"]).expect_err("TOOL_ROOT claimed twice");
+        assert!(err.to_string().contains("`TOOL_ROOT`"), "{err}");
+        // Sanitizing reaches the same name from a different spelling.
+        let err = check(&["x", "x.root"]).expect_err("TOOL_X_ROOT claimed twice");
+        assert!(err.to_string().contains("`TOOL_X_ROOT`"), "{err}");
+        // Near misses are distinct names.
+        check(&["", "x", "roots", "x_roo", "root_x"]).expect("no collision");
     }
 
     #[test]
