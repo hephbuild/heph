@@ -1,0 +1,734 @@
+{
+  "$defs": {
+    "ByteAmount": {
+      "anyOf": [
+        {
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "pattern": "^[0-9]+([bB]|[kKmMgGtT]([bB]|[iI][bB])?)?$",
+          "type": "string"
+        }
+      ],
+      "description": "Bytes, as a whole number or a size: `1024`, `512M`, `24G`, `1GiB`."
+    },
+    "CacheConfig": {
+      "additionalProperties": false,
+      "description": "Durable local-cache tuning. `cache: { spillThresholdBytes: N }`.",
+      "properties": {
+        "spillThresholdBytes": {
+          "default": null,
+          "description": "Blobs strictly larger than this many bytes spill to plain files under `<home>/cache/blobs/` instead of being stored inline in the cache database. Omit for heph's default.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "CountAmount": {
+      "anyOf": [
+        {
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "pattern": "^[0-9]+$",
+          "type": "string"
+        }
+      ],
+      "description": "A whole number: `2`."
+    },
+    "CpuAmount": {
+      "anyOf": [
+        {
+          "minimum": 0,
+          "type": "number"
+        },
+        {
+          "pattern": "^[0-9]+(\\.[0-9]+)?$",
+          "type": "string"
+        }
+      ],
+      "description": "CPUs, a decimal in steps of 0.000001: `2`, `0.5`."
+    },
+    "FsConfig": {
+      "additionalProperties": false,
+      "description": "Filesystem-walk settings shared by every plugin that walks the tree.",
+      "properties": {
+        "skip": {
+          "default": [],
+          "description": "Root-relative directories and globs no tree walk enters: package discovery, `fs` globs and the Go provider alike. `.git` and every directory named `.heph*` are always skipped.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "FuseConfig": {
+      "additionalProperties": false,
+      "description": "Sandbox FUSE-overlay mode. `fuse: { enabled: true | false | auto }`\nselects mode explicitly. Omit `enabled` (or the entire `fuse:` block) to\ndefault to off; FUSE is opt-in.",
+      "properties": {
+        "enabled": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FuseEnabled"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "`true`, `false`, or `auto` (decided per target from its inputs).\nDefault off."
+        }
+      },
+      "type": "object"
+    },
+    "FuseEnabled": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "enum": [
+            "auto",
+            "on",
+            "off",
+            "true",
+            "false"
+          ]
+        }
+      ],
+      "description": "`true`, `false`, or `auto` (decided per target from its inputs)."
+    },
+    "LockBackendConfig": {
+      "description": "Execute-phase lock backend.",
+      "oneOf": [
+        {
+          "const": "fs",
+          "description": "Lock files under the heph home: shared with other heph processes.",
+          "type": "string"
+        },
+        {
+          "const": "mem",
+          "description": "In-process locks: this process only.",
+          "type": "string"
+        }
+      ]
+    },
+    "LockConfig": {
+      "additionalProperties": false,
+      "description": "Execute-phase lock backend. `lock: { backend: fs | mem }`. Omit the block (or\n`backend`) to default to the filesystem backend.",
+      "properties": {
+        "backend": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LockBackendConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "`fs` (default) or `mem`."
+        }
+      },
+      "type": "object"
+    },
+    "MemCacheConfig": {
+      "additionalProperties": false,
+      "description": "Byte limits of one in-memory cache store. Both fields are required.",
+      "properties": {
+        "capacityBytes": {
+          "description": "Total byte budget. Under `memCache`, `0` disables the tier; under `tmpCache`, an entry that would exceed it spills to the durable cache.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "perEntryBytes": {
+          "description": "The largest single entry the store keeps, in bytes.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "perEntryBytes",
+        "capacityBytes"
+      ],
+      "type": "object"
+    },
+    "Percent": {
+      "description": "A percentage of the pool's default capacity, at least `1%`; over `100%` overcommits.",
+      "pattern": "^[0-9]*[1-9][0-9]*%$",
+      "type": "string"
+    },
+    "PluginSpec": {
+      "additionalProperties": false,
+      "dependentRequired": {
+        "checksum": [
+          "url"
+        ]
+      },
+      "description": "One plugin: exactly one of `builtin`, `path` or `url`, plus its `options`.",
+      "oneOf": [
+        {
+          "required": [
+            "builtin"
+          ]
+        },
+        {
+          "required": [
+            "path"
+          ]
+        },
+        {
+          "required": [
+            "url"
+          ]
+        }
+      ],
+      "properties": {
+        "builtin": {
+          "description": "A compiled-in plugin, by name (`buildfile`, `exec`, `go`, …).",
+          "type": "string"
+        },
+        "checksum": {
+          "description": "`sha256:<hex>` of the manifest a `url:` source downloads. Only valid with `url:`.",
+          "type": "string"
+        },
+        "options": {
+          "description": "Passed to the plugin's construction; each plugin checks its own keys.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "path": {
+          "description": "A local `*-plugin.json` manifest, relative to the workspace root.",
+          "type": "string"
+        },
+        "url": {
+          "description": "A remote `*-plugin.json` manifest.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "RemoteCacheConfigPatch": {
+      "additionalProperties": false,
+      "description": "One named remote cache. A profile may set a single field and inherit the rest.",
+      "properties": {
+        "concurrency": {
+          "default": null,
+          "description": "Max in-flight requests to this cache. Default 256.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "endpoint": {
+          "default": null,
+          "description": "Base URL of an S3-compatible service to talk to instead of AWS, e.g.\n`https://<account>.r2.cloudflarestorage.com`. `s3://` caches only.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "read": {
+          "default": null,
+          "description": "Consult this cache on lookups. Default `true`.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "region": {
+          "default": null,
+          "description": "Region to sign S3 requests for. `s3://` caches only; unset leaves it to\n`AWS_REGION`, then `us-east-1`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "uri": {
+          "default": null,
+          "description": "The backend, by scheme: `s3://bucket/prefix`, `gs://bucket/prefix`,\n`memory://` or `file://`. Required once the profiles are merged.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "write": {
+          "default": null,
+          "description": "Push to this cache on writes. Default `true`.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "ResourcesConfig": {
+      "additionalProperties": {
+        "anyOf": [
+          {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/CpuAmount"
+              },
+              {
+                "$ref": "#/$defs/ByteAmount"
+              }
+            ]
+          },
+          {
+            "additionalProperties": false,
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "unit": {
+                      "const": "count"
+                    }
+                  },
+                  "required": [
+                    "unit"
+                  ]
+                },
+                "then": {
+                  "properties": {
+                    "value": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/CountAmount"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "unit": {
+                      "const": "cpu"
+                    }
+                  },
+                  "required": [
+                    "unit"
+                  ]
+                },
+                "then": {
+                  "properties": {
+                    "value": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/CpuAmount"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "unit": {
+                      "const": "bytes"
+                    }
+                  },
+                  "required": [
+                    "unit"
+                  ]
+                },
+                "then": {
+                  "properties": {
+                    "value": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/ByteAmount"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            ],
+            "properties": {
+              "unit": {
+                "description": "How the pool's amounts are written: `count` (a whole number), `cpu` (CPUs, a decimal), `bytes` (a size such as `24G`).",
+                "enum": [
+                  "count",
+                  "cpu",
+                  "bytes",
+                  null
+                ]
+              },
+              "value": {
+                "anyOf": [
+                  {
+                    "anyOf": [
+                      {
+                        "$ref": "#/$defs/CpuAmount"
+                      },
+                      {
+                        "$ref": "#/$defs/ByteAmount"
+                      }
+                    ]
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "The pool's capacity. Omitted is unbounded; `0` is set per run (`--resource <pool>=<n>`)."
+              }
+            },
+            "type": "object"
+          }
+        ]
+      },
+      "description": "Resource pools, by name: an amount, or `{unit, value}`.",
+      "properties": {
+        "cpu": {
+          "anyOf": [
+            {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/CpuAmount"
+                },
+                {
+                  "$ref": "#/$defs/Percent"
+                }
+              ]
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "unit": {
+                  "description": "A builtin pool's unit is always `cpu`.",
+                  "enum": [
+                    "cpu",
+                    null
+                  ]
+                },
+                "value": {
+                  "anyOf": [
+                    {
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/CpuAmount"
+                        },
+                        {
+                          "$ref": "#/$defs/Percent"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "The pool's capacity. Omitted is unbounded; `0` is set per run (`--resource <pool>=<n>`)."
+                }
+              },
+              "type": "object"
+            }
+          ],
+          "description": "CPUs, or a percentage of the parallelism (`50%`)."
+        },
+        "memory": {
+          "anyOf": [
+            {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ByteAmount"
+                },
+                {
+                  "$ref": "#/$defs/Percent"
+                }
+              ]
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "unit": {
+                  "description": "A builtin pool's unit is always `bytes`.",
+                  "enum": [
+                    "bytes",
+                    null
+                  ]
+                },
+                "value": {
+                  "anyOf": [
+                    {
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/ByteAmount"
+                        },
+                        {
+                          "$ref": "#/$defs/Percent"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "The pool's capacity. Omitted is unbounded; `0` is set per run (`--resource <pool>=<n>`)."
+                }
+              },
+              "type": "object"
+            }
+          ],
+          "description": "A size (`24G`), or a percentage of the memory this process may use (`80%`)."
+        },
+        "sandbox": {
+          "anyOf": [
+            {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/CountAmount"
+                },
+                {
+                  "$ref": "#/$defs/Percent"
+                }
+              ]
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "unit": {
+                  "description": "A builtin pool's unit is always `count`.",
+                  "enum": [
+                    "count",
+                    null
+                  ]
+                },
+                "value": {
+                  "anyOf": [
+                    {
+                      "anyOf": [
+                        {
+                          "$ref": "#/$defs/CountAmount"
+                        },
+                        {
+                          "$ref": "#/$defs/Percent"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "The pool's capacity. Omitted is unbounded; `0` is set per run (`--resource <pool>=<n>`)."
+                }
+              },
+              "type": "object"
+            }
+          ],
+          "description": "Build sandboxes on disk, live or awaiting removal: a count, or a percentage of the default."
+        }
+      },
+      "propertyNames": {
+        "pattern": "^[a-z][a-z0-9_]{0,63}$"
+      },
+      "type": "object"
+    },
+    "ScratchConfig": {
+      "additionalProperties": false,
+      "description": "Scratch-cache policy: which lineage a run writes to (`scope`), and which lineages it may read from when its own has nothing (`restoreScopes`).",
+      "properties": {
+        "restoreScopes": {
+          "default": [],
+          "description": "Lineages this run may read from when its own `scope` has nothing, tried in order, e.g. `[master]`. A run never writes to them.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "scope": {
+          "default": null,
+          "description": "The lineage this run writes to, e.g. `${git:branch}` (heph resolves the current branch). Omitted is one lineage shared by every run.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "seedOnFork": {
+          "default": null,
+          "description": "On the first build in a new `scope`, start from a copy of the lineage it restores from instead of cold. Default `true`; turn it off when a scratch cache is large and the filesystem has no reflink.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "TelemetryConfig": {
+      "additionalProperties": false,
+      "description": "Anonymous usage telemetry. `telemetry: { enabled: false }` opts out; omitting\nthe block (or the field) leaves telemetry on. No data here identifies a user\n— only os/arch/version and aggregate run counters are ever reported.",
+      "properties": {
+        "enabled": {
+          "default": true,
+          "description": "`false` turns anonymous usage telemetry off. Default `true`.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "heph workspace configuration: the base `.hephconfig`, or a profile (`<profile>.hephconfig`) laid over it.",
+  "properties": {
+    "cache": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/CacheConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Durable local-cache tuning."
+    },
+    "caches": {
+      "additionalProperties": {
+        "$ref": "#/$defs/RemoteCacheConfigPatch"
+      },
+      "description": "Named remote (shared) caches. Each entry has a `uri`, plus `read` and `write` (both default `true`). A profile may set one field of an entry and inherit the rest.",
+      "type": "object"
+    },
+    "fs": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/FsConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Filesystem-walk settings shared by every plugin that walks the tree."
+    },
+    "fuse": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/FuseConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Sandbox FUSE overlay: `enabled: true | false | auto`. Off by default."
+    },
+    "homeDir": {
+      "default": null,
+      "description": "The heph home (cache, sandboxes, credentials, locks, diagnostics). A relative path is under the workspace root; an absolute one is used as written. No `~` or `$VAR` expansion; `.` and `..` resolve lexically. Default `.heph`. The root itself, or anything above it, is refused.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "lock": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/LockConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Execute-phase lock backend: `backend: fs | mem`. Default `fs`."
+    },
+    "memCache": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/MemCacheConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Byte limits of the local cache's in-memory tier. `capacityBytes: 0`\ndisables the tier."
+    },
+    "plugins": {
+      "description": "The plugins this workspace loads: every provider and driver comes from one. `builtin:` names one compiled into heph; `path:` or `url:` points at a `*-plugin.json` manifest. Each entry's `options:` is passed to the plugin.",
+      "items": {
+        "$ref": "#/$defs/PluginSpec"
+      },
+      "type": "array"
+    },
+    "resources": {
+      "$ref": "#/$defs/ResourcesConfig",
+      "description": "Resource pools, one entry per pool: `{unit: <count|cpu|bytes>, value:\n<amount>}`, or the amount alone for `cpu` (CPUs, or `50%` of the\nparallelism), `memory` (a size, or a percentage of the memory this\nprocess may use) and a `count` pool (`docker: 2`). A pool with no value\nis unbounded; `0` declares a pool whose capacity each run sets\n(`--resource gpu=<n>` or `HEPH_RESOURCE_GPU=<n>`). A profile overrides\nper pool; a pool's unit cannot change across profiles."
+    },
+    "scratch": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ScratchConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Scratch-cache policy: which lineage a run writes to, and which it may read from."
+    },
+    "telemetry": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TelemetryConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Anonymous usage telemetry; on unless `enabled: false`."
+    },
+    "tmpCache": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/MemCacheConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Byte limits of the in-memory store for uncacheable outputs; an entry that\nwould exceed `capacityBytes` spills to the durable cache."
+    },
+    "version": {
+      "default": null,
+      "description": "The heph version this workspace expects, e.g. `v1.2.3`. When it differs from the running binary, heph downloads that release and re-execs into it. Omit to disable self-upgrade for the workspace.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "versionFlavour": {
+      "default": null,
+      "description": "Release flavour to pin `version` to, e.g. `debug`. Omitted is the default build (`heph_<os>_<arch>`); a flavour downloads `heph_<flavour>_<os>_<arch>` instead.",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "title": "ConfigYaml",
+  "type": "object"
+}

@@ -4,6 +4,7 @@ mod cache;
 mod clean;
 pub mod codegen;
 mod completions;
+mod config_schema;
 mod coreutils;
 pub mod gc;
 mod plugins;
@@ -114,6 +115,16 @@ pub enum ToolCommands {
     ///
     /// Example: `heph tool completions bash`
     Completions(completions::Args),
+    /// Print the JSON Schema of `.hephconfig`
+    ///
+    /// For editors (map it to `.hephconfig` in yaml-language-server's
+    /// `yaml.schemas`) and for CI. It comes from this binary, so a workspace
+    /// that pins a version gets that version's schema; outside a workspace it
+    /// still runs. See docs/CONFIG_SCHEMA.md.
+    ///
+    /// Example: `heph tool config-schema`
+    #[command(name = "config-schema")]
+    ConfigSchema(config_schema::Args),
     /// Format BUILD files
     ///
     /// Reformats the Starlark `BUILD` files of every package, or only those
@@ -184,6 +195,7 @@ impl ToolCommands {
             ToolCommands::Cache(args) => args.execute(sink, session, global),
             ToolCommands::Coreutils(args) => args.execute(),
             ToolCommands::Completions(args) => completions::execute(args),
+            ToolCommands::ConfigSchema(args) => config_schema::execute(args),
             ToolCommands::BuildFmt(args) => build_fmt::execute(args, sink, session, global),
             ToolCommands::BuildLsp(args) => build_lsp::execute(args, sink, session, global),
             ToolCommands::ResolvePlugins(args) => {

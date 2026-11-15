@@ -497,10 +497,13 @@ fn parse_supervisor_args() -> Option<i32> {
     args.next()?.parse::<i32>().ok()
 }
 
-/// Commands that run outside a workspace. They neither read `.hephconfig` nor
-/// touch the build graph, so a missing workspace must not block them: `version`
-/// prints the build string, `gen-docs` emits the CLI reference from clap.
-const NO_CONFIG_COMMANDS: &[&str] = &["version", "gen-docs"];
+/// Commands that run outside a workspace, each as its subcommand path. They
+/// neither read `.hephconfig` nor touch the build graph, so a missing workspace
+/// must not block them: `version` prints the build string, `gen-docs` emits the
+/// CLI reference from clap, `tool config-schema` prints the config's JSON
+/// Schema. Inside a workspace the self-upgrade still runs first, which is what
+/// makes a pinned workspace's schema its own version's.
+const NO_CONFIG_COMMANDS: &[&[&str]] = &[&["version"], &["gen-docs"], &["tool", "config-schema"]];
 
 fn raw_requested(soft_match: &Result<clap::ArgMatches, clap::Error>) -> bool {
     soft_match.as_ref().is_ok_and(|m| {
@@ -519,11 +522,21 @@ fn raw_requested(soft_match: &Result<clap::ArgMatches, clap::Error>) -> bool {
 /// legitimately needs a workspace, so its `NoConfig` stays fatal.
 fn no_config_tolerable(soft_match: &Result<clap::ArgMatches, clap::Error>) -> bool {
     match soft_match {
-        Ok(m) => m
-            .subcommand_name()
-            .is_some_and(|name| NO_CONFIG_COMMANDS.contains(&name)),
+        Ok(m) => NO_CONFIG_COMMANDS.iter().any(|path| names_command(m, path)),
         Err(_) => true,
     }
+}
+
+/// Whether `m`'s subcommands, outermost first, are exactly `path`.
+fn names_command(m: &clap::ArgMatches, path: &[&str]) -> bool {
+    let mut at = m;
+    for name in path {
+        match at.subcommand() {
+            Some((got, sub)) if got == *name => at = sub,
+            _ => return false,
+        }
+    }
+    at.subcommand().is_none()
 }
 
 #[cfg(test)]
@@ -609,6 +622,20 @@ mod tests {
     fn gen_docs_tolerates_missing_workspace() {
         // `heph gen-docs` only renders clap's CLI reference — no workspace needed.
         assert!(no_config_tolerable(&soft(&["heph", "gen-docs"])));
+    }
+
+    #[test]
+    fn config_schema_tolerates_missing_workspace() {
+        // The schema is the binary's own; an editor setup may ask for it from
+        // anywhere.
+        assert!(no_config_tolerable(&soft(&[
+            "heph",
+            "tool",
+            "config-schema"
+        ])));
+        // Only that tool command: its siblings read the workspace.
+        assert!(!no_config_tolerable(&soft(&["heph", "tool", "gc"])));
+        assert!(!no_config_tolerable(&soft(&["heph", "tool"])));
     }
 
     #[test]

@@ -24,6 +24,7 @@ mod build_fmt_cli;
 mod cache_tier_gate;
 mod ci_gate;
 mod codegen_removed_cli;
+mod config_schema_cli;
 mod coreutils_cli;
 mod darwin_linker;
 mod execrunner_gate;
