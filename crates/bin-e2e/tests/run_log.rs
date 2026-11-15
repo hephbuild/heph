@@ -11,8 +11,11 @@
 mod common;
 
 use common::{BASE_CONFIG, Dist, Workspace, describe, sha256_file, wait_output, wait_until};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Child, ChildStdout, Output, Stdio};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 /// What the `stream` driver writes, phase by phase, interleaved in the order
@@ -60,10 +63,99 @@ fn workspace(dist: &Dist) -> Workspace {
     ws
 }
 
+/// A `heph log -f` started mid-run. Its stdout is read on the test thread, so
+/// a write it could not make (EPIPE) or a follow that never ends fails the
+/// test instead of hiding in a helper thread. A watchdog SIGKILLs it past
+/// [`common::RUN_DEADLINE`], which ends a blocked read with EOF.
+struct Follower {
+    child: Child,
+    stdout: ChildStdout,
+    seen: Vec<u8>,
+    stop: mpsc::Sender<()>,
+    watchdog: JoinHandle<()>,
+}
+
+impl Follower {
+    fn spawn(ws: &Workspace, dist: &Dist, addr: &str) -> Self {
+        let mut child = ws
+            .cmd(dist, &["log", "-f", addr])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn heph log -f");
+        let stdout = child.stdout.take().expect("heph log -f stdout");
+        let pid = i32::try_from(child.id()).expect("pid");
+        let (stop, rx) = mpsc::channel();
+        let watchdog = std::thread::spawn(move || {
+            if rx.recv_timeout(common::RUN_DEADLINE) == Err(RecvTimeoutError::Timeout) {
+                // SAFETY: a plain syscall on integers; the child is reaped
+                // only after this thread is joined, so the pid is still ours.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+        });
+        Self {
+            child,
+            stdout,
+            seen: Vec::new(),
+            stop,
+            watchdog,
+        }
+    }
+
+    /// Read until it has printed as many bytes as `want`, which they must be.
+    fn expect(&mut self, want: &str) {
+        let mut buf = [0u8; 256];
+        while self.seen.len() < want.len() {
+            let n = self.stdout.read(&mut buf).expect("read heph log -f");
+            assert!(
+                n > 0,
+                "heph log -f closed stdout at {:?}, before {want:?}",
+                String::from_utf8_lossy(&self.seen)
+            );
+            self.seen
+                .extend_from_slice(buf.get(..n).unwrap_or_default());
+        }
+        assert_eq!(
+            String::from_utf8_lossy(&self.seen),
+            want,
+            "heph log -f prints the chunks in order"
+        );
+    }
+
+    /// Read to EOF and reap it; `stdout` is everything it printed.
+    fn finish(self) -> Output {
+        let Self {
+            child,
+            mut stdout,
+            mut seen,
+            stop,
+            watchdog,
+        } = self;
+        let read = stdout.read_to_end(&mut seen);
+        drop(stop);
+        watchdog.join().expect("watchdog");
+        let mut out = child.wait_with_output().expect("reap heph log -f");
+        out.stdout = seen;
+        assert!(
+            read.is_ok(),
+            "read heph log -f: {read:?}\n{}",
+            describe(&out)
+        );
+        out
+    }
+}
+
 /// Run `name` and walk it through its phases: after each, the one live file
-/// holds exactly what was written so far, then its gate opens. Returns the
-/// finished run.
-fn run_through_phases(ws: &Workspace, dist: &Dist, name: &str) -> std::process::Output {
+/// holds exactly what was written so far, then its gate opens. With `follow`,
+/// a `heph log -f` started once phase 1 is live must print each phase before
+/// its gate opens. Returns the finished run, and the follower's.
+fn run_through_phases(
+    ws: &Workspace,
+    dist: &Dist,
+    name: &str,
+    follow: bool,
+) -> (Output, Option<Output>) {
     let home = ws.root().join(".heph");
     let addr = format!("//app:{name}");
     let child = ws
@@ -76,6 +168,7 @@ fn run_through_phases(ws: &Workspace, dist: &Dist, name: &str) -> std::process::
 
     let mut want = String::new();
     let mut live: Option<PathBuf> = None;
+    let mut follower: Option<Follower> = None;
     for (phase, lines) in (1..).zip(PHASES) {
         want.push_str(lines);
         wait_until(
@@ -95,6 +188,11 @@ fn run_through_phases(ws: &Workspace, dist: &Dist, name: &str) -> std::process::
             assert_eq!(&logs, std::slice::from_ref(first), "{addr}: one live file");
         }
         live = logs.into_iter().next();
+        if follow {
+            follower
+                .get_or_insert_with(|| Follower::spawn(ws, dist, &addr))
+                .expect(&want);
+        }
         ws.write(format!("app/{name}.{phase}"), "")
             .expect("open the gate");
     }
@@ -105,26 +203,47 @@ fn run_through_phases(ws: &Workspace, dist: &Dist, name: &str) -> std::process::
         "{addr}: the live file outlived its run: {left:?}\n{}",
         describe(&out)
     );
-    out
+    (out, follower.map(Follower::finish))
 }
 
 /// **A real cdylib driver given `log_capture` streams its log live.** Its
 /// interleaved stdout and stderr reach one live file under `<home>/runs/` in
 /// write order while the run lasts; the file grows in place, and is gone once
-/// the run ends. On failure, the slot's log is the same bytes.
-///
-/// The success half stops at the live file: no command reads a cache entry's
-/// `Log` yet, and `crates/e2e`'s `run_log.rs` asserts the promotion in-process.
+/// the run ends. A `heph log -f` started mid-run prints each chunk as it lands
+/// and exits 0 when the run ends; after a success, `heph log` prints the same
+/// bytes from the cache entry's `Log`. On failure, the slot's log is the same
+/// bytes.
 #[test]
 fn log_capture_streams_live() {
     let dist = Dist::locate();
     let ws = workspace(&dist);
     let full: String = PHASES.concat();
 
-    let out = run_through_phases(&ws, &dist, "ok");
+    let (out, followed) = run_through_phases(&ws, &dist, "ok", true);
     assert!(out.status.success(), "//app:ok: {}", describe(&out));
+    let followed = followed.expect("a follower");
+    assert!(
+        followed.status.success(),
+        "heph log -f //app:ok: {}",
+        describe(&followed)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&followed.stdout),
+        full,
+        "heph log -f //app:ok prints the run's whole log, and nothing after it"
+    );
 
-    let out = run_through_phases(&ws, &dist, "fail");
+    let shown = ws
+        .run(&dist, &["log", "//app:ok"])
+        .expect("heph log //app:ok");
+    assert!(shown.status.success(), "{}", describe(&shown));
+    assert_eq!(
+        String::from_utf8_lossy(&shown.stdout),
+        full,
+        "heph log prints the cached run's log, and only it, on stdout"
+    );
+
+    let (out, _) = run_through_phases(&ws, &dist, "fail", false);
     assert!(!out.status.success(), "//app:fail must fail");
     let inspect = ws
         .run(&dist, &["inspect", "failure", "--json", "//app:fail"])

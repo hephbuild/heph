@@ -35,7 +35,7 @@ use hcore::hasync::Cancellable;
 use hcore::process::Exit;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
 use hplugin::driver::targetdef::path::{CodegenMode, Content, Path};
-use hplugin::driver::targetdef::{Entrypoint, Output, TargetDef, Workdir};
+use hplugin::driver::targetdef::{CacheConfig, Entrypoint, Output, TargetDef, Workdir};
 use hplugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, DriverSchema,
     ParseRequest, ParseResponse, Resources, RunStdio,
@@ -255,6 +255,8 @@ const STREAM_PHASES: [(&[u8], &[u8]); 2] = [(b"out-1\n", b"err-1\n"), (b"out-2\n
 /// to stdout and one to stderr through the run's writers and waits for the
 /// gate `<root>/<pkg>/<name>.<phase>` to exist, so a test can read the live
 /// log between phases. A target whose name starts with `fail` then fails.
+/// Its targets are cached (locally), so a success's log is promoted into the
+/// cache entry's `Log`, where another heph (`heph log`) reads it.
 struct Stream;
 
 #[async_trait::async_trait]
@@ -278,6 +280,7 @@ impl ManagedDriver for Stream {
             target_def: TargetDef {
                 addr: req.target_spec.addr.clone(),
                 hash: b"entrypoint-test-stream".to_vec(),
+                cache: CacheConfig::on(false),
                 ..Default::default()
             },
         })
