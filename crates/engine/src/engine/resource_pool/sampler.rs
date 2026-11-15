@@ -11,7 +11,8 @@
 //! lost, and a request that admitted nothing never starts a sampler at all.
 //!
 //! What it costs the pool: one atomic increment per locked change, and a
-//! snapshot (one lock, one pass over the pools and the waiting classes) at
+//! snapshot (one lock, one pass over the pools; the waiting counts are kept
+//! as waiters join and leave, so it does not grow with the queue) at
 //! most once per tick per request. Admission never reads the generation.
 
 use super::{Limit, ResourcePool};

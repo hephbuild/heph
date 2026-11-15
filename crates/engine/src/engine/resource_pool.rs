@@ -633,6 +633,11 @@ struct State {
     /// What is granted and not yet released, indexed like `Lane::names`.
     /// Counted for an unbounded pool too, which only the snapshot reads.
     held: Box<[u64]>,
+    /// Per pool, indexed like `held`: the queued waiters whose need takes
+    /// some of it. Kept by [`State::push`] and [`State::remove`], the only
+    /// ways into and out of the queue, so the snapshot reads it without a
+    /// pass over the classes. Only the snapshot reads it.
+    waiting: Box<[u64]>,
     /// The queue: arrival sequence → waiter. The first entry is the head;
     /// removal is by key.
     waiters: BTreeMap<u64, Waiter>,
@@ -820,6 +825,7 @@ impl State {
         let waiter = self.waiters.remove(&seq)?;
         if let btree_map::Entry::Occupied(mut class) = self.classes.entry(waiter.class) {
             class.get_mut().waiters.remove(&seq);
+            count_waiting(&mut self.waiting, &class.get().need, false);
             if class.get().waiters.is_empty() {
                 let class = class.remove();
                 self.shapes.remove(&class.need);
@@ -842,6 +848,7 @@ impl State {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
         let (tx, rx) = oneshot::channel();
+        count_waiting(&mut self.waiting, &need, true);
         match self.classes.entry(class) {
             btree_map::Entry::Occupied(mut occupied) => {
                 occupied.get_mut().waiters.insert(seq);
@@ -917,6 +924,7 @@ impl Lane {
         Arc::new(Self {
             state: Mutex::new(State {
                 held: vec![0; capacity.len()].into_boxed_slice(),
+                waiting: vec![0; capacity.len()].into_boxed_slice(),
                 waiters: BTreeMap::new(),
                 next_seq: 0,
                 shapes: FxHashMap::default(),
@@ -1233,22 +1241,11 @@ impl Lane {
         let mut guard = self.state.lock();
         let st = &mut *guard;
         st.sync_head();
-        // Per pool, the waiters whose need takes some of it: one pass over
-        // the classes, not the waiters.
-        let mut waiting = vec![0u64; self.names.len()];
-        for class in st.classes.values() {
-            let n = class.waiters.len() as u64;
-            for &(idx, _) in class.need.iter() {
-                if let Some(w) = waiting.get_mut(idx) {
-                    *w = w.saturating_add(n);
-                }
-            }
-        }
         let pools = self
             .names
             .iter()
             .zip(self.capacity.iter().zip(st.held.iter()))
-            .zip(waiting)
+            .zip(st.waiting.iter().copied())
             .map(|((name, (&capacity, &held)), waiting)| PoolSnapshot {
                 pool: name.clone(),
                 unit: Unit::default_for(name.as_str()),
@@ -1372,6 +1369,20 @@ fn take(held: &mut [u64], need: &[(usize, u64)]) {
     for &(idx, n) in need {
         if let Some(h) = held.get_mut(idx) {
             *h = h.saturating_add(n);
+        }
+    }
+}
+
+/// Count one waiter of `need` into (`joins`) or out of `State::waiting`: one
+/// per pool its need names.
+fn count_waiting(waiting: &mut [u64], need: &[(usize, u64)], joins: bool) {
+    for &(idx, _) in need {
+        if let Some(w) = waiting.get_mut(idx) {
+            *w = if joins {
+                w.saturating_add(1)
+            } else {
+                w.saturating_sub(1)
+            };
         }
     }
 }
@@ -2167,6 +2178,87 @@ mod tests {
         drop(head);
         drop(granted(c).expect("then the follower"));
         assert_eq!(free(&p, "cpu"), u64::MAX);
+    }
+
+    /// The snapshot's per-pool waiting count is kept as waiters join and
+    /// leave, not counted: across arrivals that queue or start, grants on
+    /// release, and cancellations, it always equals a recount over the
+    /// waiting classes, and returns to zero with the queue.
+    #[test]
+    fn waiting_count_matches_a_recount() {
+        fn recount(p: &ResourcePool) -> Vec<u64> {
+            let st = p.main.state.lock();
+            let mut waiting = vec![0u64; st.held.len()];
+            for class in st.classes.values() {
+                for &(idx, _) in class.need.iter() {
+                    waiting[idx] += class.waiters.len() as u64;
+                }
+            }
+            waiting
+        }
+        fn snapshot_waiting(p: &ResourcePool) -> Vec<u64> {
+            p.snapshot().main.pools.iter().map(|s| s.waiting).collect()
+        }
+
+        let p = pool(&[("cpu", 4 * CPU), ("memory", 8 * GIB)]);
+        let shapes = [
+            req(&[("cpu", CPU)]),
+            req(&[("cpu", 2 * CPU)]),
+            req(&[("cpu", CPU), ("memory", 2 * GIB)]),
+            req(&[("memory", 4 * GIB)]),
+            req(&[("cpu", 4 * CPU), ("memory", GIB)]),
+        ];
+        let mut running: Vec<Reservation> = Vec::new();
+        let mut waiting: Vec<Acquire> = Vec::new();
+        // A fixed LCG: the same sequence every run.
+        let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = |n: usize| {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            usize::try_from(seed >> 33).unwrap() % n
+        };
+        let (mut queued_n, mut granted_n, mut cancelled_n) = (0, 0, 0);
+        for _ in 0..2_000 {
+            match next(3) {
+                0 => {
+                    let mut a = p.acquire(&shapes[next(shapes.len())]).unwrap();
+                    match (&mut a).now_or_never() {
+                        Some(r) => running.push(r.unwrap()),
+                        None => {
+                            queued_n += 1;
+                            waiting.push(a);
+                        }
+                    }
+                }
+                1 if !running.is_empty() => drop(running.swap_remove(next(running.len()))),
+                2 if !waiting.is_empty() => {
+                    cancelled_n += 1;
+                    drop(waiting.swap_remove(next(waiting.len())));
+                }
+                _ => {}
+            }
+            // Collect what the last release granted.
+            let mut i = 0;
+            while i < waiting.len() {
+                if let Some(r) = granted(&mut waiting[i]) {
+                    granted_n += 1;
+                    running.push(r);
+                    drop(waiting.swap_remove(i));
+                } else {
+                    i += 1;
+                }
+            }
+            assert_eq!(snapshot_waiting(&p), recount(&p));
+        }
+        assert!(
+            queued_n > 100 && granted_n > 50 && cancelled_n > 50,
+            "the sequence exercises every path: {queued_n} queued, {granted_n} granted, {cancelled_n} cancelled"
+        );
+        drop(waiting);
+        assert_eq!(snapshot_waiting(&p), [0, 0]);
+        drop(running);
+        assert_eq!(snapshot_waiting(&p), [0, 0]);
     }
 
     #[test]
