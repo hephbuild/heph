@@ -191,6 +191,10 @@ struct DebugLog {
 impl DebugLog {
     fn from_env(sink: &LogSink) -> Option<Self> {
         let file = std::path::PathBuf::from(std::env::var_os("HEPH_DEBUG_TUI_LOG")?);
+        tracing::warn!(
+            var = "HEPH_DEBUG_TUI_LOG",
+            "a test-only knob is set: this run writes test lines; unset it"
+        );
         let stop = std::sync::Arc::new(AtomicBool::new(false));
         let thread = std::thread::Builder::new()
             .name("heph-debug-tui-log".into())
@@ -244,12 +248,18 @@ enum DebugPanic {
 
 impl DebugPanic {
     fn from_env() -> Option<Self> {
-        match std::env::var_os("HEPH_DEBUG_TUI_PANIC")?.to_str()? {
-            "app" => Some(Self::App),
-            "backend" => Some(Self::Backend),
-            "caught" => Some(Self::Caught),
-            _ => None,
-        }
+        let knob = match std::env::var_os("HEPH_DEBUG_TUI_PANIC")?.to_str()? {
+            "app" => Self::App,
+            "backend" => Self::Backend,
+            "caught" => Self::Caught,
+            _ => return None,
+        };
+        tracing::warn!(
+            var = "HEPH_DEBUG_TUI_PANIC",
+            ?knob,
+            "a test-only knob is set: this run panics on purpose; unset it"
+        );
+        Some(knob)
     }
 
     #[expect(clippy::panic, reason = "a deliberate panic is the knob's whole job")]
