@@ -10,6 +10,7 @@ pub mod pty_session;
 pub mod session;
 pub mod stderr_backend;
 pub mod stdout_buffer;
+pub mod text;
 pub mod tty;
 
 use std::io::{self, IsTerminal};

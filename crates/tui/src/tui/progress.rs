@@ -17,6 +17,10 @@ use crate::tui::session::{HolderNames, SessionId};
 use hcore::capacity::Unit;
 use hcore::events::{BuildEvent, BuildEventKind, CacheCounts, CacheOutcomeKind};
 
+mod spotlight;
+
+pub use spotlight::{HOLD_MS, Spot};
+
 /// Floor on the pinned viewport row count. The viewport targets one third of the
 /// terminal height (see [`rows_for_height`]) but never shrinks below this, which
 /// is the minimum that fits the box: top border + 1 body row + bottom border +
@@ -797,6 +801,9 @@ pub struct BuildState {
     /// `cpu 16→4` their row shows. Set at `ExecuteStart`, cleared at
     /// `ExecuteEnd`; a target that got what it asked for is not here.
     clamped: HashMap<String, String>,
+    /// The line's spotlight: the waits and runs ordered by start, the root
+    /// failure on show, and the hold. See [`spotlight`].
+    spot: spotlight::SpotIndex,
 }
 
 /// One pool as the header shows it.
@@ -955,6 +962,7 @@ impl BuildState {
         // independent of the counter side effects handled in the match below.
         if let Some((addr, op, boundary)) = event_op_boundary(&ev.kind) {
             let tl = self.ops.entry(addr.to_string()).or_default();
+            let started_before = tl.active.map(|(_, at)| at);
             match boundary {
                 Boundary::Start => {
                     // Overlap guard: if an op is somehow still open (a missing or
@@ -979,7 +987,17 @@ impl BuildState {
             }
             // Mirror the transition into the live index the frame path walks. Kept
             // here, at the sole writer of `active`, so the two cannot disagree.
+            // The spotlight's run order follows the same transition.
+            let started_after = tl.active.map(|(_, at)| at);
             let open = tl.active.is_some();
+            if started_before != started_after {
+                if let Some(at) = started_before {
+                    self.spot.running.remove(&(at, addr.to_owned()));
+                }
+                if let Some(at) = started_after {
+                    self.spot.running.insert((at, addr.to_owned()));
+                }
+            }
             if open {
                 if !self.open_ops.contains(addr) {
                     self.open_ops.insert(addr.to_string());
@@ -1042,7 +1060,34 @@ impl BuildState {
             BuildEventKind::ResultStart { addr } => {
                 self.in_flight_results.insert(addr.clone());
             }
-            BuildEventKind::ResultEnd { addr, error, .. } => {
+            BuildEventKind::ResultEnd {
+                addr,
+                error,
+                upstream_of,
+                exit_status,
+                timed_out,
+                ..
+            } => {
+                // A root failure — one no dependency caused — takes the
+                // spotlight until a newer one does. Collateral ones never do.
+                if let Some(err) = error
+                    && upstream_of.is_none()
+                    && self
+                        .spot
+                        .root_failure
+                        .as_ref()
+                        .is_none_or(|f| f.is_replaced_by(ev.at_unix_ms, addr))
+                {
+                    self.spot.root_failure = Some(spotlight::RootFailure {
+                        at_ms: ev.at_unix_ms,
+                        addr: addr.clone(),
+                        reason: spotlight::RootFailure::reason(
+                            err,
+                            exit_status.as_deref(),
+                            timed_out.as_ref(),
+                        ),
+                    });
+                }
                 if self.in_flight_results.remove(addr) {
                     if let Some(err) = error {
                         self.errored += 1;
@@ -1076,7 +1121,13 @@ impl BuildState {
                 // it checks `self.finished` and reclaims the (re-created) entry
                 // itself once that trailing op closes, so whichever event is
                 // actually last is the one that frees it.
-                self.ops.remove(addr);
+                if let Some(OpTimeline {
+                    active: Some((_, at)),
+                    ..
+                }) = self.ops.remove(addr)
+                {
+                    self.spot.running.remove(&(at, addr.clone()));
+                }
                 self.open_ops.remove(addr);
             }
             // The op timeline (folded above) tracks Execute's duration; here we
@@ -1151,6 +1202,7 @@ impl BuildState {
                         since_ms: ev.at_unix_ms,
                     },
                 );
+                self.spot.admission.insert((ev.at_unix_ms, addr.clone()));
             }
             BuildEventKind::AdmissionWaitEnd { addr } => {
                 self.end_admission_wait(addr);
@@ -1183,16 +1235,21 @@ impl BuildState {
                 holder_pid,
                 in_use_by_readers,
             } => {
-                self.lock_waits.insert(
+                if let Some((_, since)) = self.lock_waits.insert(
                     addr.clone(),
                     (
                         LockHolder::of(*holder_pid, *in_use_by_readers),
                         ev.at_unix_ms,
                     ),
-                );
+                ) {
+                    self.spot.lock.remove(&(since, addr.clone()));
+                }
+                self.spot.lock.insert((ev.at_unix_ms, addr.clone()));
             }
             BuildEventKind::ResultLockWaitEnd { addr } => {
-                self.lock_waits.remove(addr);
+                if let Some((_, since)) = self.lock_waits.remove(addr) {
+                    self.spot.lock.remove(&(since, addr.clone()));
+                }
             }
             BuildEventKind::ScratchLockWaitStart {
                 addr,
@@ -1200,7 +1257,7 @@ impl BuildState {
                 access,
                 holder_pid,
             } => {
-                self.scratch_waits.insert(
+                if let Some(prev) = self.scratch_waits.insert(
                     addr.clone(),
                     ScratchWait {
                         scratch: scratch.clone(),
@@ -1208,7 +1265,15 @@ impl BuildState {
                         holder_pid: *holder_pid,
                         since_ms: ev.at_unix_ms,
                     },
-                );
+                ) {
+                    self.unindex_scratch_wait(addr, &prev);
+                }
+                self.spot.scratch.insert((ev.at_unix_ms, addr.clone()));
+                self.spot
+                    .by_cache
+                    .entry(scratch.clone())
+                    .or_default()
+                    .insert((ev.at_unix_ms, addr.clone()));
             }
             // The prepare span is folded into the op timeline above, and its
             // outcome is reported by the CI view rather than counted here — a
@@ -1218,6 +1283,7 @@ impl BuildState {
             | BuildEventKind::ScratchPrepareEnd { .. } => {}
             BuildEventKind::ScratchLockWaitEnd { addr, .. } => {
                 if let Some(w) = self.scratch_waits.remove(addr) {
+                    self.unindex_scratch_wait(addr, &w);
                     let e = self.scratch_wait_totals.entry(w.scratch).or_insert((0, 0));
                     e.0 += 1;
                     e.1 += ev.at_unix_ms.saturating_sub(w.since_ms);
@@ -1252,6 +1318,7 @@ impl BuildState {
             // than fatal — see `BuildEventKind::Unknown`.
             BuildEventKind::Unknown => {}
         }
+        self.fold_spotlight(ev.at_unix_ms);
     }
 
     /// Record a hit outcome (local or remote). This is the cache edge of
@@ -1551,10 +1618,25 @@ impl BuildState {
     /// Drop `addr`'s announced admission wait, if any, and its count on the
     /// pool it named. Saturating, like [`release`](Self::release).
     fn end_admission_wait(&mut self, addr: &str) {
-        if let Some(w) = self.admission_waits.remove(addr)
-            && let Some(view) = self.pools.get_mut(&w.pool)
-        {
+        let Some(w) = self.admission_waits.remove(addr) else {
+            return;
+        };
+        self.spot.admission.remove(&(w.since_ms, addr.to_owned()));
+        if let Some(view) = self.pools.get_mut(&w.pool) {
             view.waiting = view.waiting.saturating_sub(1);
+        }
+    }
+
+    /// Take a scratch wait that ended or was replaced out of the spotlight's
+    /// order, dropping its cache's group once the last waiter leaves it.
+    fn unindex_scratch_wait(&mut self, addr: &str, w: &ScratchWait) {
+        let key = (w.since_ms, addr.to_owned());
+        self.spot.scratch.remove(&key);
+        if let Some(group) = self.spot.by_cache.get_mut(&w.scratch) {
+            group.remove(&key);
+            if group.is_empty() {
+                self.spot.by_cache.remove(&w.scratch);
+            }
         }
     }
 
