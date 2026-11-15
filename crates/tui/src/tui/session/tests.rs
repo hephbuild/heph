@@ -553,6 +553,103 @@ fn events_cap_keeps_the_ending_view_records() {
     assert_eq!(kinds, want);
 }
 
+/// `status.json` stays bounded however many targets wait: 50k lock waits and
+/// 50k admission waits through a real recorder, read back from the file it
+/// wrote — while live and after `End` — have every list cut to
+/// `STATUS_LIST_CAP` and every total and count in full.
+#[test]
+fn status_json_is_capped_through_the_recorder() {
+    const N: u64 = 50_000;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let rec = recorder_with(dir.path(), Box::new(io::sink()), Faults::default());
+    let tap = rec.tap();
+    let ev = |kind| BuildEvent {
+        at_unix_ms: 1,
+        kind,
+    };
+    // A target in flight with an open operation: it counts as running.
+    let start = |addr: &str| {
+        tap.event(ev(BuildEventKind::ResultStart { addr: addr.into() }));
+        tap.event(ev(BuildEventKind::ExecuteStart {
+            addr: addr.into(),
+            driver: "exec".into(),
+            cache: true,
+            declared: None,
+            reserved: None,
+            queued_ms: None,
+        }));
+    };
+    for i in 0..N {
+        let addr = format!("//l:t{i:05}");
+        start(&addr);
+        tap.event(ev(BuildEventKind::ResultLockWaitStart {
+            addr,
+            holder_pid: Some(4242),
+            in_use_by_readers: false,
+        }));
+        let addr = format!("//w:t{i:05}");
+        start(&addr);
+        tap.event(ev(BuildEventKind::AdmissionWaitStart {
+            addr,
+            pool: "cpu".to_owned(),
+            need: 1,
+            free: 0,
+            ahead: 0,
+            removals_pending: None,
+        }));
+    }
+    let read = || -> Option<(usize, SessionSnapshot)> {
+        let bytes = std::fs::read(dir.path().join(files::STATUS)).ok()?;
+        Some((bytes.len(), SessionSnapshot::decode(&bytes).ok()?))
+    };
+    let check = |when: &str, size: usize, s: &SessionSnapshot| {
+        assert!(size < 48 * 1024, "{when}: status.json is {size} bytes");
+        let cap = STATUS_LIST_CAP;
+        assert_eq!(s.running.len(), cap, "{when}");
+        assert_eq!(s.waiting.len(), cap, "{when}");
+        assert_eq!(s.lock_waits.len(), cap, "{when}");
+        assert_eq!(s.admission_waits.len(), cap, "{when}");
+        for (name, total, want) in [
+            ("running", s.totals.running, 2 * N),
+            ("waiting", s.totals.waiting, 2 * N),
+            ("lock_waits", s.totals.lock_waits, N),
+            ("admission_waits", s.totals.admission_waits, N),
+        ] {
+            assert_eq!(total.total, want, "{when}: {name}");
+            assert!(total.truncated, "{when}: {name}");
+        }
+        assert!(!s.totals.failed.truncated, "{when}");
+        assert_eq!(s.counts.in_flight, 2 * N, "{when}");
+        // Every running target waits: the count says so though the lists
+        // were cut.
+        assert_eq!(s.counts.running_unblocked, Some(0), "{when}");
+        assert_eq!(s.lock_waits[0].addr, "//l:t00000", "{when}");
+        assert_eq!(s.lock_waits[0].holder_pid, Some(4242), "{when}");
+    };
+
+    // Live: the periodic write, once it has folded everything.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let live = loop {
+        if let Some((size, s)) = read()
+            && s.totals.admission_waits.total == N
+        {
+            break (size, s);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the recorder never wrote a status.json with every wait"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(live.1.end.is_none());
+    check("live", live.0, &live.1);
+
+    rec.finish(Some(0), false, Duration::from_secs(30));
+    let (size, last) = read().expect("the final status.json");
+    assert!(last.end.is_some(), "the final write carries End");
+    check("after End", size, &last);
+}
+
 /// A12: a taken id is skipped for a fresh draw.
 #[test]
 fn id_collision_retries() {
