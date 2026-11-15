@@ -5332,6 +5332,7 @@ dependencies = [
  "plugin",
  "plugin-sdk",
  "stabby",
+ "tokio",
  "tracing",
 ]
 

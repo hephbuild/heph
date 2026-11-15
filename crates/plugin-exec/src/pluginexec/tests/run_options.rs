@@ -985,3 +985,66 @@ async fn shell_env_stays_out_of_a_plain_run() {
     .await;
     assert_eq!(ran.ok(), "[mine][unset][unset]");
 }
+
+/// Under `log_capture` the host's writers are the log: each stream reaches its
+/// writer, and the driver keeps no `log.txt` and returns no `Log` artifact —
+/// not on success, and not riding the error on failure.
+#[tokio::test]
+async fn log_capture_writes_only_the_writers() -> anyhow::Result<()> {
+    use hplugin::driver::outputartifact::Type as ArtifactType;
+
+    let exec = Driver::new_exec().with_host_path();
+    for (script, fails) in [
+        ("printf out; printf err >&2", false),
+        ("printf out; printf err >&2; exit 3", true),
+    ] {
+        let sbx = Sandbox::new()?;
+        let def = sh(script);
+        let request_id = "log-capture".to_string();
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        let mut req = RunRequest::new(&request_id, &def, &sbx.dir);
+        req.log_capture = true;
+        req.stdout = Some(&mut stdout);
+        req.stderr = Some(&mut stderr);
+        let result = exec
+            .run(
+                ManagedRunRequest {
+                    request: req,
+                    sandbox_dir: sbx.dir.clone(),
+                    sandbox_ws_dir: sbx.ws.clone(),
+                    sandbox_pkg_dir: sbx.pkg.clone(),
+                    inputs: vec![],
+                },
+                &StdCancellationToken::new(),
+            )
+            .await;
+        match (&result, fails) {
+            (Ok(res), false) => assert!(
+                res.artifacts.iter().all(|a| a.r#type != ArtifactType::Log),
+                "{script}: no Log artifact"
+            ),
+            (Err(err), true) => assert!(
+                hplugin::error::failure_log(err).is_none(),
+                "{script}: no Log on the error: {err:#}"
+            ),
+            _ => panic!("{script}: unexpected outcome {:?}", result.err()),
+        }
+        assert_eq!(stdout, b"out", "{script}: stdout reached its writer");
+        assert_eq!(stderr, b"err", "{script}: stderr reached its writer");
+        assert!(
+            !sbx.dir.join("log.txt").exists(),
+            "{script}: no sandbox log.txt under log_capture"
+        );
+    }
+
+    // Without it, the same captured run keeps its own log: the contrast that
+    // makes the row above mean something.
+    let (ran, sbx) = run_opts(&exec, &sh("printf out"), RunOptions::default()).await;
+    let res = ran.result.as_ref().map_err(|e| anyhow::anyhow!("{e:#}"))?;
+    assert!(sbx.dir.join("log.txt").exists(), "own log.txt");
+    assert!(
+        res.artifacts.iter().any(|a| a.r#type == ArtifactType::Log),
+        "own Log artifact"
+    );
+    Ok(())
+}

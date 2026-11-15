@@ -9,6 +9,9 @@
 //! what lets `allotment_crosses_the_plugin_seam` see the field across a real
 //! `dlopen`, which a `convert.rs` round-trip cannot.
 //!
+//! The third, `stream`, writes its log through the writers of a run handed
+//! `log_capture` in gated phases, for `run_log.rs`'s `log_capture_streams_live`.
+//!
 //! The first driver, `tool`: its own `parse` declares the entrypoint (no exec
 //! underneath), and its `run` spawns `/bin/sh -c SCRIPT sh <args>` through the
 //! SDK's foreground spawn with everything the run's `RunOptions` carry. It is
@@ -239,6 +242,118 @@ impl ManagedDriver for Allot {
     }
 }
 
+/// How long a `stream` run waits for each gate before it gives up: a test that
+/// never opens one fails on the error rather than hanging its heph.
+const STREAM_GATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The `stream` driver's lines, one pair per phase: what `log_capture_streams_live`
+/// expects the live file, and then the stored log, to hold.
+const STREAM_PHASES: [(&[u8], &[u8]); 2] = [(b"out-1\n", b"err-1\n"), (b"out-2\n", b"err-2\n")];
+
+/// The third driver, `stream`: the run's log as the host captures it. It
+/// refuses a run not handed `log_capture`, then for each phase writes a line
+/// to stdout and one to stderr through the run's writers and waits for the
+/// gate `<root>/<pkg>/<name>.<phase>` to exist, so a test can read the live
+/// log between phases. A target whose name starts with `fail` then fails.
+struct Stream;
+
+#[async_trait::async_trait]
+impl ManagedDriver for Stream {
+    fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
+        Ok(ConfigResponse {
+            name: "stream".to_string(),
+        })
+    }
+
+    fn schema(&self) -> DriverSchema {
+        DriverSchema::default()
+    }
+
+    async fn parse(
+        &self,
+        req: ParseRequest,
+        _ctoken: &(dyn Cancellable + Send + Sync),
+    ) -> anyhow::Result<ParseResponse> {
+        Ok(ParseResponse {
+            target_def: TargetDef {
+                addr: req.target_spec.addr.clone(),
+                hash: b"entrypoint-test-stream".to_vec(),
+                ..Default::default()
+            },
+        })
+    }
+
+    async fn apply_transitive(
+        &self,
+        req: ApplyTransitiveRequest,
+        _ctoken: &(dyn Cancellable + Send + Sync),
+    ) -> anyhow::Result<ApplyTransitiveResponse> {
+        Ok(ApplyTransitiveResponse {
+            target_def: req.target_def,
+        })
+    }
+
+    async fn run<'a, 'io>(
+        &self,
+        req: ManagedRunRequest<'a, 'io>,
+        _ctoken: &(dyn Cancellable + Send + Sync),
+    ) -> anyhow::Result<ManagedRunResponse> {
+        use tokio::io::AsyncWriteExt as _;
+
+        let mut request = req.request;
+        anyhow::ensure!(
+            request.log_capture,
+            "stream: the host did not hand this run log_capture"
+        );
+        let stdout = request.stdout.take().context("stream: no stdout writer")?;
+        let stderr = request.stderr.take().context("stream: no stderr writer")?;
+        let addr = &request.target.addr;
+        let gates = request.tree_root_path.join(addr.package.as_str());
+        for (phase, (out, err)) in (1..).zip(STREAM_PHASES) {
+            stdout
+                .write_all(out)
+                .await
+                .context("stream: write stdout")?;
+            stdout.flush().await.context("stream: flush stdout")?;
+            stderr
+                .write_all(err)
+                .await
+                .context("stream: write stderr")?;
+            stderr.flush().await.context("stream: flush stderr")?;
+            wait_for_gate(gates.join(format!("{}.{phase}", addr.name))).await?;
+        }
+        if addr.name.starts_with("fail") {
+            let exit = Exit::Code(3);
+            return Err(hplugin::error::ProcessFailed::new(format!("{exit:?}"), Some(exit)).into());
+        }
+        Ok(ManagedRunResponse { artifacts: vec![] })
+    }
+}
+
+/// Wait until `gate` exists, polled on a thread of its own: the cdylib's
+/// runtime has no timer, and blocking the task would block a host worker.
+async fn wait_for_gate(gate: std::path::PathBuf) -> anyhow::Result<()> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        let found = loop {
+            if gate.exists() {
+                break Ok(());
+            }
+            if started.elapsed() > STREAM_GATE_TIMEOUT {
+                break Err(anyhow::anyhow!(
+                    "stream: {} never appeared within {STREAM_GATE_TIMEOUT:?}",
+                    gate.display()
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        // The run gone means nobody is waiting any more.
+        drop(tx.send(found));
+    });
+    rx.await.context("stream: the gate thread ended")?
+}
+
 /// Stable ABI create entry. The create config also records the host's
 /// capabilities for the SDK, which refuses an entrypoint on a host without
 /// them.
@@ -248,8 +363,13 @@ pub extern "C" fn heph_plugin_create(
     _functions: DynFunctionRegistry,
 ) -> PluginComponents {
     let mut drivers = stabby::vec::Vec::new();
-    let created = create_config_from_bytes(&cfg)
-        .and_then(|_| Ok([named_managed_driver(Tool)?, named_managed_driver(Allot)?]));
+    let created = create_config_from_bytes(&cfg).and_then(|_| {
+        Ok([
+            named_managed_driver(Tool)?,
+            named_managed_driver(Allot)?,
+            named_managed_driver(Stream)?,
+        ])
+    });
     match created {
         Ok(created) => created.into_iter().for_each(|d| drivers.push(d)),
         // The create entry cannot fail across the ABI; the workspace then fails
