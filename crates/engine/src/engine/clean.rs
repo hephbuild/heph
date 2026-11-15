@@ -70,6 +70,10 @@ pub struct CleanStats {
     /// Selected targets whose deletion failed. Each is logged and the run keeps
     /// going — one unwritable entry never aborts the rest.
     pub errored: usize,
+    /// `<home>/runs/<id>/` run-log directories of hephs that ended without
+    /// removing them (their `lock` was free). Swept whatever the selection:
+    /// they belong to no target.
+    pub run_log_dirs_removed: usize,
 }
 
 /// The in-flight state of one [`Engine::clean`] run: the bounded set of delete
@@ -194,6 +198,8 @@ impl Engine {
         while !run.set.is_empty() {
             Self::drain_one_clean(&mut run.set, &rs, &mut run.stats).await;
         }
+        // Ended hephs' run logs; a live heph holds its directory's lock.
+        run.stats.run_log_dirs_removed = hcore::blocking::run(self.run_logs.sweeper()).await;
         Ok(run.stats)
     }
 

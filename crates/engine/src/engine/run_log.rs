@@ -26,9 +26,11 @@
 //! error, as a failed write is.
 //!
 //! **Liveness.** `runs/<engine-id>/` holds a `lock` file locked for the
-//! engine's life: another heph's sweep removes a directory whose lock is
+//! engine's life: another heph's [`sweep`] removes a directory whose lock is
 //! free, never one whose lock is held. The engine removes its own directory
-//! when it is dropped.
+//! when it is dropped. `heph tool gc`, `heph tool clean` and every engine's start run
+//! the sweep, so a killed heph's directory (a `cache = false` success's
+//! retained live file with it) is removed by the next heph to look.
 
 use hdriver_support::redact::{Needles, Redactor};
 use std::fs::File;
@@ -38,6 +40,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
+use std::time::{Duration, SystemTime};
 
 /// The directory under the home holding every engine's run logs.
 pub(crate) const RUNS_DIR: &str = "runs";
@@ -45,11 +48,18 @@ pub(crate) const RUNS_DIR: &str = "runs";
 pub(crate) const LOCK_FILE: &str = "lock";
 /// The prefix of a `runs/<engine-id>/` directory still being set up.
 pub(crate) const NEW_PREFIX: &str = ".new-";
+/// The prefix a swept `runs/<engine-id>/` is renamed to before it is deleted.
+pub(crate) const TOMB_PREFIX: &str = ".tomb-";
+/// How old a `.new-` or tomb directory is before a sweep takes it as a
+/// crashed heph's leftover. A live one exists for a rename's length.
+const STALE_AFTER: Duration = Duration::from_secs(10 * 60);
 
 /// One engine's run logs, under `<home>/runs/<id>/`.
 pub(crate) struct RunLogs {
     dir: Arc<RunsDir>,
     next: AtomicU64,
+    /// The sweep this engine started when it was made, until it is awaited.
+    start_sweep: Mutex<Option<tokio::task::JoinHandle<usize>>>,
 }
 
 impl std::fmt::Debug for RunLogs {
@@ -130,6 +140,40 @@ impl RunLogs {
                 made: Mutex::new(Made::Not),
             }),
             next: AtomicU64::new(0),
+            start_sweep: Mutex::new(None),
+        }
+    }
+
+    /// The [`sweep`] of every other heph's directory, as a job for the
+    /// blocking pool. Never touches this engine's own directory.
+    pub(crate) fn sweeper(&self) -> impl FnOnce() -> usize + Send + 'static {
+        let dir = Arc::clone(&self.dir);
+        move || sweep(&dir.runs, Some(&dir.id))
+    }
+
+    /// Start the session-start sweep on `rt`'s blocking pool, never waited
+    /// for by a build: ended hephs' directories go without the first build
+    /// step paying for it.
+    pub(crate) fn start_sweep(&self, rt: &tokio::runtime::Handle) {
+        let handle = rt.spawn_blocking(self.sweeper());
+        *self
+            .start_sweep
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(handle);
+    }
+
+    /// Wait for the start sweep; how many directories it removed (0 when it
+    /// was already awaited).
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) async fn start_sweep_done(&self) -> usize {
+        let handle = self
+            .start_sweep
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        match handle {
+            Some(h) => h.await.unwrap_or(0),
+            None => 0,
         }
     }
 
@@ -167,6 +211,93 @@ impl Drop for RunLogs {
             drop(lock);
         }
     }
+}
+
+/// Remove every `<runs>/<id>/` whose lock is free or missing (a killed heph's,
+/// or one whose removal was cut short), except `own`, and every `.new-` or
+/// tomb directory older than [`STALE_AFTER`]. A directory whose lock is held
+/// is never touched. Best-effort: a failure is logged and the sweep goes on.
+/// Returns how many directories it removed.
+pub(crate) fn sweep(runs: &Path, own: Option<&str>) -> usize {
+    let Ok(entries) = std::fs::read_dir(runs) else {
+        return 0;
+    };
+    let now = SystemTime::now();
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        // Not followed: a symlink is not a heph directory.
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let name = entry.file_name();
+        let bytes = name.as_encoded_bytes();
+        let path = entry.path();
+        let swept = if bytes.starts_with(NEW_PREFIX.as_bytes())
+            || bytes.starts_with(TOMB_PREFIX.as_bytes())
+        {
+            if !is_stale(&path, now) {
+                continue;
+            }
+            std::fs::remove_dir_all(&path).map(|()| true)
+        } else if bytes.starts_with(b".") || own.is_some_and(|o| bytes == o.as_bytes()) {
+            continue;
+        } else {
+            sweep_one(runs, &path, bytes)
+        };
+        match swept {
+            Ok(true) => removed += 1,
+            Ok(false) => {}
+            // Another sweep took it first.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::debug!(dir = %path.display(), error = %e, "sweeping run logs");
+            }
+        }
+    }
+    removed
+}
+
+/// Remove `dir` unless its lock is held: take the lock, rename the directory
+/// to a tomb, delete the tomb, then let the lock go. `Ok(false)` when it is
+/// held.
+fn sweep_one(runs: &Path, dir: &Path, name: &[u8]) -> io::Result<bool> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let lock = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(dir.join(LOCK_FILE))
+    {
+        Ok(lock) => Some(lock),
+        // The lock file is made before the directory gets its name, so one
+        // without it is a removal cut short.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e),
+    };
+    if let Some(lock) = &lock {
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::fs::TryLockError::Error(e)) => return Err(e),
+        }
+    }
+    // Renamed first, so a half-deleted directory never sits under a live
+    // name: a crash mid-delete leaves a tomb the next sweep removes.
+    let tomb = runs.join(format!(
+        "{TOMB_PREFIX}{}-{}",
+        String::from_utf8_lossy(name),
+        std::process::id()
+    ));
+    std::fs::rename(dir, &tomb)?;
+    std::fs::remove_dir_all(&tomb)?;
+    drop(lock);
+    Ok(true)
+}
+
+/// Whether `dir` was last changed at least [`STALE_AFTER`] before `now`.
+fn is_stale(dir: &Path, now: SystemTime) -> bool {
+    std::fs::symlink_metadata(dir)
+        .and_then(|m| m.modified())
+        .is_ok_and(|t| now.duration_since(t).is_ok_and(|age| age >= STALE_AFTER))
 }
 
 /// Which of a run's streams a chunk came from. Each has its own redaction

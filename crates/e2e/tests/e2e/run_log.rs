@@ -473,3 +473,128 @@ async fn a_quiet_run_creates_no_live_file() -> anyhow::Result<()> {
     assert_eq!(cached_log(&engine, "//p:q").await?, None);
     Ok(())
 }
+
+/// Older than a sweep's ten-minute grace for `.new-` and tomb directories.
+const STALE: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+
+/// What a dead heph leaves in `runs/`, every one of which a sweep removes: a
+/// directory whose lock nobody holds, one with no lock file at all (a removal
+/// cut short), and a stale `.new-` and tomb. Plus a fresh `.new-`, which is
+/// another engine setting up its directory right now and is kept.
+fn seed_dead(runs: &Path) -> anyhow::Result<()> {
+    for (name, lock) in [("released", true), ("lockless", false)] {
+        let d = runs.join(name);
+        std::fs::create_dir_all(&d)?;
+        std::fs::write(d.join("0.log"), "dead")?;
+        if lock {
+            std::fs::File::create(d.join("lock"))?;
+        }
+    }
+    for name in [".new-stale-1", ".tomb-stale-1"] {
+        let d = runs.join(name);
+        std::fs::create_dir_all(&d)?;
+        std::fs::write(d.join("0.log"), "dead")?;
+        std::fs::File::open(&d)?.set_modified(std::time::SystemTime::now() - STALE)?;
+    }
+    std::fs::create_dir_all(runs.join(".new-fresh-2"))?;
+    Ok(())
+}
+
+fn names<'a>(
+    it: impl IntoIterator<Item = &'a str>,
+) -> std::collections::BTreeSet<std::ffi::OsString> {
+    it.into_iter().map(std::ffi::OsString::from).collect()
+}
+
+/// gc, clean and an engine's start sweep remove a `runs/<id>/` whose own
+/// lock is free (a killed heph's, its `cache = false` live files with it) and
+/// keep it while the lock is held, a live engine's own directory included.
+/// The owning engine's drop removes its own directory.
+#[tokio::test]
+async fn runs_dir_gc_respects_its_lock() -> anyhow::Result<()> {
+    let ws = tempfile::tempdir()?;
+    std::fs::create_dir_all(ws.path().join("p"))?;
+    std::fs::write(
+        ws.path().join("p").join("BUILD"),
+        r#"target(name = "t", driver = "bash", cache = False, out = "t.txt",
+       run = "echo live; printf t > t.txt")"#,
+    )?;
+    let first = engine(ws.path())?;
+    assert_eq!(
+        first.run_logs_start_sweep().await,
+        0,
+        "nothing to sweep yet"
+    );
+    let runs = first.home.join("runs");
+
+    // Another heph, alive: its directory's lock is held.
+    let held = runs.join("held");
+    std::fs::create_dir_all(&held)?;
+    std::fs::write(held.join("0.log"), "alive")?;
+    let held_lock = std::fs::File::create(held.join("lock"))?;
+    held_lock.try_lock()?;
+    seed_dead(&runs)?;
+
+    // A second engine's start sweep.
+    let second = engine(ws.path())?;
+    assert_eq!(second.run_logs_start_sweep().await, 4);
+    assert_eq!(runs_entries(&second), names(["held", ".new-fresh-2"]));
+
+    // A cache = false success keeps its live file in the engine's own
+    // directory, held for the engine's life.
+    drop(result(&second, "//p:t", &ResultOptions::default()).await?);
+    let own: Vec<_> = runs_entries(&second)
+        .into_iter()
+        .filter(|n| n != "held" && n != ".new-fresh-2")
+        .collect();
+    let [own] = own.as_slice() else {
+        panic!("one directory of the second engine's own: {own:?}");
+    };
+    let own_dir = runs.join(own);
+    let retained: Vec<_> = live_files(&second)
+        .into_iter()
+        .filter(|f| f.starts_with(&own_dir))
+        .collect();
+    assert_eq!(retained.len(), 1, "the retained live file: {retained:?}");
+    let alive = |at: &str| {
+        let mut want = names(["held", ".new-fresh-2"]);
+        want.insert(own.clone());
+        assert_eq!(runs_entries(&second), want, "after {at}");
+    };
+
+    seed_dead(&runs)?;
+    let gc = Arc::clone(&second).gc_all(second.new_state()).await?;
+    assert_eq!(gc.run_log_dirs_removed, 4, "{gc:?}");
+    alive("gc");
+
+    seed_dead(&runs)?;
+    let cleaned = Arc::clone(&second)
+        .clean(
+            second.new_state(),
+            &heph::htmatcher::Matcher::Addr(parse_addr("//p:t")?),
+            heph::engine::Discovery::Complete,
+        )
+        .await?;
+    assert_eq!(cleaned.run_log_dirs_removed, 4, "{cleaned:?}");
+    alive("clean");
+
+    seed_dead(&runs)?;
+    let third = engine(ws.path())?;
+    assert_eq!(third.run_logs_start_sweep().await, 4);
+    alive("a third engine's start sweep");
+
+    // Released, the other heph's directory goes at the next sweep.
+    drop(held_lock);
+    let gc = Arc::clone(&third).gc_all(third.new_state()).await?;
+    assert_eq!(gc.run_log_dirs_removed, 1, "{gc:?}");
+    assert!(!held.exists());
+    assert!(own_dir.exists(), "the second engine is alive");
+
+    // The second engine's own drop removes its directory.
+    let second = Arc::try_unwrap(second)
+        .map_err(|_shared| anyhow::anyhow!("the second engine is still shared"))?;
+    drop(second);
+    assert!(!own_dir.exists(), "an engine removes its own directory");
+    assert_eq!(runs_entries(&third), names([".new-fresh-2"]));
+    Ok(())
+}

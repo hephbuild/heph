@@ -397,6 +397,34 @@ minutes, left by a removal that failed or died, is deleted outright with no
 lock. Two cleanups can race on that one, both deleting the same tomb, which is
 harmless: one finishes, the other sees it gone.
 
+## Run logs
+
+A run's live log is not in the session directory. It lives in the workspace's
+home, beside the cache and the failure slots: `<home>/runs/<id>/<n>.log`, one
+directory per engine (a random id, not the session id) and one file per run
+(`crates/engine/src/engine/run_log.rs`).
+
+- **Created lazily.** A run's first output byte creates its file, and the
+  first file the directory. A run that prints nothing, and a warm all-hit
+  build, never touch `runs/`.
+- **Its own lock.** The directory is built as `runs/.new-<id>-<pid>/` with its
+  `lock` file already `flock`ed, then renamed into place, and the engine holds
+  that lock for its whole life. Liveness is that lock, never the session's:
+  with `HEPH_NO_SESSION=1` there is no session lock to look at, and a live
+  build's logs must still not be deleted.
+- **Lifetime.** A run's file goes once the cache entry or failure slot that
+  replaces it is in place. A `cache = false` success keeps its file until the
+  engine exits. At a normal exit the engine removes its own directory, lock
+  still held.
+- **Cleanup.** `heph tool gc`, `heph tool clean` (whatever the selection) and the
+  start of every engine sweep `runs/`, the last off the build's path. A
+  directory whose `lock` is free or missing (a killed heph's, its
+  `cache = false` leftovers with it) is locked, renamed to a tomb
+  (`.tomb-<id>-<pid>`) and deleted; one whose lock is held is never touched. A
+  `.new-` or tomb directory older than 10 minutes is a crashed set-up or
+  removal and is deleted outright. `GcStats.run_log_dirs_removed` and
+  `CleanStats.run_log_dirs_removed` count what went.
+
 ## The daemon
 
 A future daemon that holds the graph and runs builds replaces the transport,

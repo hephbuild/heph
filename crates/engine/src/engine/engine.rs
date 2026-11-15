@@ -778,6 +778,13 @@ impl Engine {
         self.sandbox_removal_hold.gate = Some(gate.state());
     }
 
+    /// Wait for the sweep of other hephs' run logs this engine started when it
+    /// was made; how many directories it removed.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn run_logs_start_sweep(&self) -> usize {
+        self.run_logs.start_sweep_done().await
+    }
+
     pub fn new(cfg: Config) -> anyhow::Result<Engine> {
         let home = cfg.home_dir.clone();
         ensure_home(&home)?;
@@ -966,6 +973,8 @@ impl Engine {
             remote_tmp_ready: tokio::sync::OnceCell::new(),
             scratch_audit_ready: tokio::sync::OnceCell::new(),
         };
+        // Ended hephs' run logs, off the hot path: never awaited by a build.
+        engine.run_logs.start_sweep(&engine.runtime);
         engine.register_plugin("group", |_| {
             Ok(PluginParts::default().with_driver(Box::new(hbuiltins::plugingroup::Driver)))
         })?;

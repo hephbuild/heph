@@ -552,6 +552,12 @@ tee**, before any byte reaches `log.txt`. Redacting at render would be too late:
 captured log is packed into the cache as an artifact and lifted into the failure
 event, the JSON output and the CI report.
 
+There is one scrubber, `hdriver_support::redact`, and the **engine** applies it,
+not each driver: to every chunk a run streams into its live run log
+(`<home>/runs/<id>/<n>.log`, one carry per stream), and to every `Log` artifact
+a run returns, including the log file an older plugin hands back. A driver
+cannot opt out of it by writing its own log.
+
 The scrubber holds back `len(longest secret) - 1` bytes across every read
 boundary, because a token can arrive split across two chunks with nothing wrong
 with either half — and per-chunk scanning would let exactly that one through,
