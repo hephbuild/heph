@@ -221,10 +221,11 @@ pub enum SessionRecordKind {
         #[serde(default)]
         panicked: bool,
     },
-    /// `events.ndjson` reached its size cap; no build event or log line follows
-    /// (`End`, `InflightWritten`, `Finished`, `Output`, `Label`, `RunLog` and
-    /// an `Approval` clearing the prompt still do). `status.json` keeps
-    /// updating.
+    /// `events.ndjson` reached its size cap; no build event follows (`End`,
+    /// `InflightWritten`, `Finished`, `Output`, `Label`, `RunLog` and an
+    /// `Approval` clearing the prompt still do). `Log` records follow it
+    /// until the bytes they add past the cap reach `LOG_CEILING` (256 MiB),
+    /// and are dropped beyond. `status.json` keeps updating.
     Truncated,
     /// The owner answered an in-flight request: `inflight.txt` is fresh.
     InflightWritten,
@@ -244,8 +245,13 @@ pub enum SessionRecordKind {
         #[serde(default)]
         prompt: Option<Box<ApprovalPrompt>>,
         /// Absent from a writer that predates standing decisions, and while
-        /// none stands.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// none stands. A value this heph does not know reads as `None`
+        /// rather than dropping the whole record (and with it the prompt).
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "lenient_standing"
+        )]
         standing: Option<ApprovalStanding>,
     },
     /// The TUI was torn down at `at_unix_ms`, the instant its final summary
@@ -331,6 +337,24 @@ pub enum ApprovalStanding {
     Approve,
     /// N: shown as `auto-rejecting (N)`.
     Reject,
+}
+
+/// `Approval.standing` as this heph knows it: a value a newer writer added
+/// decodes as `None`.
+fn lenient_standing<'de, D>(d: D) -> Result<Option<ApprovalStanding>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Lenient {
+        Known(ApprovalStanding),
+        Unknown(serde::de::IgnoredAny),
+    }
+    Ok(match Option::<Lenient>::deserialize(d)? {
+        Some(Lenient::Known(s)) => Some(s),
+        Some(Lenient::Unknown(_)) | None => None,
+    })
 }
 
 impl ApprovalStanding {
@@ -763,6 +787,31 @@ mod tests {
         let home = tempfile::tempdir().expect("tempdir");
         assert_eq!(notice.read(home.path()), Err(NoticeUnavailable));
         assert_eq!(NoticeUnavailable.to_string(), "notice unavailable");
+    }
+
+    /// An `Approval` from a newer writer whose standing decision this heph
+    /// does not know keeps its prompt: only the standing reads as `None`.
+    #[test]
+    fn approval_record_with_an_unknown_standing_keeps_its_prompt() {
+        for standing in [r#""approve_once""#, r#"{"later":1}"#, "7"] {
+            let json = format!(
+                r#"{{"at_unix_ms":3,"session":{{"type":"Approval","prompt":{{"addr":"//a:b","queued_behind":0,"notices":[]}},"standing":{standing}}}}}"#
+            );
+            let rec: SessionRecord = serde_json::from_str(&json).expect("decode");
+            let Some(SessionRecordKind::Approval { prompt, standing }) = rec.session else {
+                panic!("not an Approval: {rec:?}");
+            };
+            assert_eq!(standing, None, "{json}");
+            assert_eq!(prompt.expect("the prompt survives").addr, "//a:b");
+        }
+        // A known value still decodes.
+        let json =
+            r#"{"at_unix_ms":3,"session":{"type":"Approval","prompt":null,"standing":"reject"}}"#;
+        let rec: SessionRecord = serde_json::from_str(json).expect("decode");
+        let Some(SessionRecordKind::Approval { standing, .. }) = rec.session else {
+            panic!("not an Approval: {rec:?}");
+        };
+        assert_eq!(standing, Some(ApprovalStanding::Reject));
     }
 
     /// A6/A17: the snapshot round-trips, and a newer version is refused naming
