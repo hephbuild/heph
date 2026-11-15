@@ -388,20 +388,24 @@ CPUs, `bytes` human-sized, `count` as an integer), from the `units` that
   row is the situation the in-flight report calls `draining` on the head's
   line. The oldest waiter's own row says neither how far it has been
   overtaken nor that its pools are draining: the in-flight report's `head`
-  line (below) is where that shows.
+  line (below) is where that shows, and only while the target waits. No
+  event carries the count. After the fact, the `handoff` and `pass` starts in
+  the `queued_ms` before a target's own `ExecuteStart`, with their
+  `reserved` amounts, are an upper bound on what overtook it.
 
 - `ExecuteStart` carries the `declared` and `reserved` amounts, `queued_ms`,
   how long the run waited, so a wait under the threshold is still answerable
   from the event stream, and `admitted`, how it got in. Its four values are
   exclusive:
   - `arrival`: it started on arrival with nobody waiting, or it reserves
-    nothing of a bounded pool.
+    nothing of a bounded pool. A zero-cost request is always `arrival`,
+    whoever waits.
   - `head`: it started as the oldest waiter.
   - `handoff`: ahead of an older waiter, in the slot a run of its shape
     released.
   - `pass`: ahead of an older waiter, in capacity that was free, from the
-    queue or on arrival. An arrival that starts while another target waits
-    is `pass`, not `arrival`.
+    queue or on arrival. An arrival that reserves something of a bounded
+    pool and starts while another target waits is `pass`, not `arrival`.
 
   Only `handoff` and `pass` started ahead of an older waiter. A consumer
   treats a value it does not know (`unknown`) like an absent one.
@@ -430,16 +434,22 @@ target(name = "half", ..., resources = {"cpu": heph.core.resource("cpu") / 2})
 A target that asks for a whole pool starts only once the pool is empty, and
 the engine empties it only after other targets adding up to 4 times the pool
 have started ahead of it: it waits about four pool-lengths of the work that
-passes it. That is the cap, and a request for the whole pool reaches it; a
-smaller request is overtaken by at most 16 times its own need
-([Admission](#admission)).
+passes it. That is the cap, and a request for the whole pool reaches it. The
+cap bounds any request of a quarter of the pool or more; a smaller one is
+overtaken by at most 16 times its own need ([Admission](#admission)).
 
 So a request for a whole pool **waits longer than it did under strict
-FIFO**, and the cost falls on that target. On a replay of a busy build, a
+FIFO**, and the cost falls on that target. On one replayed busy build, a
 target asking for the whole `memory` pool waited about 94 s against about
-37 s, and the build was about 2% slower. Declare the width the target
-actually uses: the full width only for a target that uses it, never as a way
-to run alone.
+37 s, and the build's wall time was about 2% longer. Any target that is
+overtaken can wait longer than strict FIFO made it wait, up to its bound;
+the whole-pool request is the one that reaches it.
+
+Declare the width the target actually uses: the full width only for a target
+that uses it, never as a way to run alone. A target that sat behind its own
+`"memory": heph.core.resource("memory")` and uses half of that declares
+`heph.core.resource("memory") / 2`: it starts as soon as half the pool is
+free, instead of once the pool is empty.
 
 The intended use is exactly that, a `resources` amount. Anything else puts a
 per-machine number into driver config and so into the def hash of the target
