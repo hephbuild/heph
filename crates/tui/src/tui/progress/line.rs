@@ -34,6 +34,8 @@ const SPOT_DETAIL_MIN: usize = 8;
 const SEP: &str = " · ";
 const HINT: &str = "tab ⇥";
 const HINT_GLYPH: &str = "⇥";
+/// After the counts of a finished run `--dashboard` holds.
+const HELD: &str = "q to quit · tab dashboard";
 
 /// How the run stands: still going (with this frame's spinner), or over.
 #[derive(Debug, Clone, Copy)]
@@ -78,6 +80,8 @@ pub(super) struct LineModel<'a> {
     pub(super) spot: Option<Spot>,
     /// Whether the command has a dashboard for `tab` to open.
     pub(super) hint: bool,
+    /// The finished run is held (`--dashboard`): the line says how to leave.
+    pub(super) held: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -333,6 +337,9 @@ fn layout(m: &LineModel<'_>, tier: Tier, cols: usize) -> Option<Line<'static>> {
         segs.insert(1, r);
     }
     segs.extend(spot_seg);
+    if m.held && !running && joined_width(&segs, sep) + sep_w + width(HELD) <= room {
+        segs.push(Seg::styled(HELD.to_owned(), dim()));
+    }
 
     let mut spans = Vec::with_capacity(segs.len() * 3 + 2);
     let mut used = 0;
@@ -396,6 +403,7 @@ mod tests {
             standing: None,
             spot,
             hint: true,
+            held: false,
         }
     }
 
@@ -457,6 +465,17 @@ mod tests {
             text(&render(&m, 120)),
             "✗ 1m05s · 128 / 412 done · 96 cached · 3 failed"
         );
+        // Held by `--dashboard`: how to leave, when it fits.
+        m.held = true;
+        assert_eq!(
+            text(&render(&m, 120)),
+            "✗ 1m05s · 128 / 412 done · 96 cached · 3 failed · q to quit · tab dashboard"
+        );
+        let narrow = text(&render(&m, 60));
+        assert!(
+            !narrow.contains("q to quit") && narrow.contains("3 fail"),
+            "dropped before a count: {narrow}"
+        );
     }
 
     #[test]
@@ -498,6 +517,7 @@ mod tests {
             standing: None,
             spot: None,
             hint: false,
+            held: false,
         };
         for cols in 1..=120_u16 {
             let t = text(&render(&m, cols));

@@ -1,12 +1,6 @@
 use std::any::Any;
-use std::io;
 use std::sync::Mutex;
 use std::thread::ThreadId;
-
-use crossterm::execute;
-use crossterm::terminal::disable_raw_mode;
-
-use super::log_sink::LogSink;
 
 /// The last panic the hook saw: what the default hook printed, kept so the
 /// interactive backend can print it again once it has left the alternate
@@ -29,10 +23,15 @@ struct PanicReport {
     text: String,
 }
 
-/// Install a panic hook that restores the terminal and switches the log sink
-/// back to direct stderr passthrough before invoking the previous hook, so
-/// the panic message always reaches the user even if a TUI was active.
-pub fn install(sink: LogSink) {
+/// Install a panic hook that records the panic (see [`LAST_PANIC`]) and
+/// invokes the previous hook.
+///
+/// It touches neither the terminal nor the sink (I12): it also fires for a
+/// panic that is caught, under a TUI that stays up and must keep its raw mode,
+/// its hidden cursor and its buffered sink. A panic that unwinds the
+/// interactive backend is restored by the backend's guards on the way out;
+/// one that aborts goes through `hcore::shutdown`'s restore closure.
+pub fn install() {
     static INSTALLED: Mutex<bool> = Mutex::new(false);
     {
         let mut guard = INSTALLED.lock().expect("panic hook mutex");
@@ -45,15 +44,38 @@ pub fn install(sink: LogSink) {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         record(info.payload(), info.location().map(ToString::to_string));
-        // A tool's PTY session is not restored here. This hook also fires for a
-        // panic tokio catches, which would leave the terminal cooked under a live
-        // tool. An uncaught panic unwinds into `RawTerminal`'s `Drop` instead, and
-        // a panic that aborts leaves the terminal raw until `reset`.
-        drop(disable_raw_mode());
-        drop(execute!(io::stderr(), crossterm::cursor::Show));
-        sink.switch_to_direct();
-        previous(info);
+        with_newlines(|| previous(info));
     }));
+}
+
+/// Run `f` with stderr's output processing on, when raw mode turned it off,
+/// so the default hook's `\n` starts a new line instead of a staircase. The
+/// output flags only: the keyboard stays raw (a caught panic's TUI keeps
+/// reading keys as they are pressed), and they are put back as they were.
+fn with_newlines(f: impl FnOnce()) {
+    let fd = libc::STDERR_FILENO;
+    let oflag = |t: &mut libc::termios| {
+        // SAFETY: `t` points at valid, correctly-sized storage; a non-tty fd
+        // fails with ENOTTY and writes nothing that is read.
+        (unsafe { libc::tcgetattr(fd, t) } == 0).then_some(t.c_oflag)
+    };
+    // SAFETY: plain old data; read only after `tcgetattr` filled it.
+    let mut t: libc::termios = unsafe { std::mem::zeroed() };
+    let saved = oflag(&mut t).filter(|o| o & libc::OPOST == 0);
+    if saved.is_some() {
+        t.c_oflag |= libc::OPOST | libc::ONLCR;
+        // SAFETY: `t` is the terminal's own settings, read just above.
+        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &t) };
+    }
+    f();
+    // Put back only the output flags, onto whatever the terminal holds now.
+    if let Some(saved) = saved
+        && oflag(&mut t).is_some()
+    {
+        t.c_oflag = saved;
+        // SAFETY: as above.
+        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &t) };
+    }
 }
 
 /// The text a panic payload carries: `panic!("…")` with or without

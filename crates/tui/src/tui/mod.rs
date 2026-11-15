@@ -11,6 +11,7 @@ pub mod pty_session;
 pub mod session;
 pub mod stderr_backend;
 pub mod stdout_buffer;
+pub mod stop_arm;
 pub mod text;
 pub mod tty;
 
@@ -98,6 +99,26 @@ pub async fn run_app<A: App + 'static>(
     interactive: bool,
     shutdown: hcore::shutdown::ShutdownTrigger,
 ) -> anyhow::Result<A::Output> {
+    run_app_with(app, sink, session, interactive, false, shutdown).await
+}
+
+/// [`run_app`], with `--dashboard`: on a terminal, the dashboard is up from
+/// the first frame and the finished run holds until `q`. Without one there is
+/// nothing to hold: one warning, then the plain output, and the run's own
+/// result (a script passing the flag everywhere must not hang or fail).
+pub async fn run_app_with<A: App + 'static>(
+    app: A,
+    sink: LogSink,
+    session: &std::sync::Arc<session::SessionSlot>,
+    interactive: bool,
+    dashboard: bool,
+    shutdown: hcore::shutdown::ShutdownTrigger,
+) -> anyhow::Result<A::Output> {
+    if dashboard && !interactive {
+        tracing::warn!(
+            "--dashboard needs an interactive terminal: showing the plain output instead"
+        );
+    }
     check_one_slot(session, &sink)?;
     // A viewer never records itself (A3). The slot opens the process's session
     // on the first recording run, once the backend has built its view (the
@@ -115,7 +136,7 @@ pub async fn run_app<A: App + 'static>(
     // the receiver for rendering. This auto-plumbs the bus into every command.
     hcore::hmemoizer::with_cycle_ctx(async move {
         if interactive {
-            backend::interactive::run(app, sink, shutdown, slot).await
+            backend::interactive::run(app, sink, shutdown, slot, dashboard).await
         } else {
             backend::ci::run(app, sink, shutdown, slot).await
         }

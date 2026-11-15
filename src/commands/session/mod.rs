@@ -217,6 +217,12 @@ fn execute(
             bootstrap::block_on(inflight(&sources, opts, &a.id, a.json, &mut stdout))?
         }
         SessionCommands::Attach(a) => {
+            // A viewer draws another process's build: there is nothing for
+            // it to open from the start or hold at the end.
+            anyhow::ensure!(
+                !global.dashboard,
+                "--dashboard does not apply to `session attach`: Tab opens the dashboard once attached"
+            );
             drop(stdout);
             bootstrap::block_on(attach::attach(
                 &sources,

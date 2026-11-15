@@ -847,17 +847,40 @@ fn terminal_restored_on_every_exit() {
         Case {
             name: "ctrl-c",
             env: &[],
-            // The gate ignores the stop; opening it lets the stop finish.
-            steps: &[Step::Keys(CTRL_C), Step::OpenGate],
+            // Two presses on a full screen: the first only arms. The gate
+            // ignores the stop; opening it lets the stop finish.
+            steps: &[Step::Keys(CTRL_C), Step::Keys(CTRL_C), Step::OpenGate],
             code: None,
             shows: &[],
         },
         Case {
             name: "hard abort (ctrl-c past the stop)",
             env: &[],
-            steps: &[Step::Keys(CTRL_C), Step::Settle, Step::Keys(CTRL_C)],
+            // Arm, stop, then one press past the stop: it goes direct.
+            steps: &[
+                Step::Keys(CTRL_C),
+                Step::Keys(CTRL_C),
+                Step::Settle,
+                Step::Keys(CTRL_C),
+            ],
             code: Some(130),
             shows: &["aborted (second Ctrl-C)"],
+        },
+        Case {
+            name: "a panic caught elsewhere",
+            env: &[("HEPH_DEBUG_TUI_PANIC", "caught")],
+            // The panic lands as the dashboard goes up and is caught; the
+            // screen stays, and Esc is read as one key (raw mode), not held
+            // for a newline.
+            steps: &[
+                Step::Settle,
+                Step::Until("the dashboard, still up", on_dashboard),
+                Step::Keys(ESC),
+                Step::Until("the line, by a key read in raw mode", on_line_once),
+                Step::OpenGate,
+            ],
+            code: Some(0),
+            shows: &["1 / 1 done"],
         },
         Case {
             name: "a panic in the app task",

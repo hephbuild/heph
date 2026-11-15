@@ -24,6 +24,7 @@ use crate::tui::log_sink::{LogSink, REPLAY_FLUSH_TIMEOUT, ReplayMark, Replayed, 
 use crate::tui::session::recorder::ViewTap;
 use crate::tui::session::{SessionSlot, TappedReceiver};
 use crate::tui::stderr_backend::StderrBackend;
+use crate::tui::stop_arm::{self, CtrlC};
 use hcore::events::now_unix_ms;
 use hcore::shutdown::ShutdownTrigger;
 
@@ -95,6 +96,27 @@ impl Drop for FullScreen {
             && let Some(text) = crate::tui::panic::take_for_current_thread()
         {
             print_panic_report(&text);
+        }
+    }
+}
+
+/// What a panic unwinding [`run`] must undo besides the alternate screen:
+/// raw mode, the hidden cursor, and the sink holding heph's lines for a
+/// terminal nobody draws any more. The panic hook used to do this, for every
+/// panic, so a panic caught elsewhere (a tokio task's) left a live dashboard
+/// reading keys line-buffered. Only an unwind reaches here; every other exit
+/// tears the terminal down in order at the end of [`run`], and the hard abort
+/// through `hcore::shutdown`'s restore closure.
+struct UnwindRestore {
+    sink: LogSink,
+}
+
+impl Drop for UnwindRestore {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            drop(disable_raw_mode());
+            drop(crossterm::execute!(io::stderr(), crossterm::cursor::Show));
+            self.sink.switch_to_direct();
         }
     }
 }
@@ -174,6 +196,9 @@ enum DebugPanic {
     /// The backend panics once the finished run has been held under the
     /// dashboard for half a second: the unwind path.
     Backend,
+    /// A task of its own panics, once, as the first full screen goes up, and
+    /// tokio catches it: the run goes on, and so must the screen and raw mode.
+    Caught,
 }
 
 impl DebugPanic {
@@ -181,6 +206,7 @@ impl DebugPanic {
         match std::env::var_os("HEPH_DEBUG_TUI_PANIC")?.to_str()? {
             "app" => Some(Self::App),
             "backend" => Some(Self::Backend),
+            "caught" => Some(Self::Caught),
             _ => None,
         }
     }
@@ -196,11 +222,17 @@ pub async fn run<A: App + 'static>(
     sink: LogSink,
     shutdown: ShutdownTrigger,
     slot: Option<&SessionSlot>,
+    dashboard: bool,
 ) -> anyhow::Result<A::Output> {
     // The app owns its view: aggregation + rendering. It lives on the loop
     // stack so it survives pause/resume (only the terminal is rebuilt across a
     // pause cycle, not the view's aggregated state).
     let mut view = app.tui_view();
+    if dashboard {
+        // Up before the first frame: the first tick enters the full screen
+        // before anything is drawn on the line.
+        view.pin_dashboard();
+    }
     // No start line here: the terminal is the TUI's. `heph session list` finds it.
     let session_tap = slot
         .and_then(|s| s.open(view.session_header(), true))
@@ -235,6 +267,9 @@ pub async fn run<A: App + 'static>(
 
     record_raw_mode_restore();
     enable_raw_mode().context("enabling raw mode")?;
+    // Declared before the full screen's guard, so it drops after it: the
+    // alternate screen is left first, in raw mode, as on every other exit.
+    let _unwind = UnwindRestore { sink: sink.clone() };
     // StderrBackend wraps CrosstermBackend<Stderr> and overrides
     // get_cursor_position so the DSR query goes to stderr instead of
     // crossterm's hardcoded `io::stdout()`. Otherwise `cmd | wc -l`
@@ -271,6 +306,7 @@ pub async fn run<A: App + 'static>(
     // not block this task's ticker — the renderer task is re-polled
     // on another worker and the spinner keeps ticking.
     let debug_panic = DebugPanic::from_env();
+    let mut caught_fired = false;
     let debug_log = DebugLog::from_env(&sink);
     let mut app_handle = tokio::spawn(async move {
         let out = app.run(ctx).await;
@@ -430,16 +466,21 @@ pub async fn run<A: App + 'static>(
                     None => std::future::pending().await,
                 }
             }, if !paused => {
+                if let Some(Ok(ev)) = &maybe_evt
+                    && stop_arm::disarms(ev)
+                {
+                    view.disarm_stop();
+                }
                 match maybe_evt {
-                    Some(Ok(Event::Key(KeyEvent {
-                        code: KeyCode::Char('c'),
-                        modifiers,
-                        kind: KeyEventKind::Press,
-                        ..
-                    }))) if modifiers.contains(KeyModifiers::CONTROL) => {
-                        shutdown.trigger();
-                        // Also quits a viewport held open after the run finished.
-                        quit = true;
+                    Some(Ok(ev)) if stop_arm::is_ctrl_c(&ev) => {
+                        // On a full screen the first press only arms; the
+                        // view says which (`stop_arm`'s one rule).
+                        let finished = held || app_result.is_some();
+                        if view.ctrl_c(now_unix_ms(), finished, shutdown.fired()) == CtrlC::Stop {
+                            shutdown.trigger();
+                            // Also quits a viewport held open after the run finished.
+                            quit = true;
+                        }
                     }
                     // `q` off the main view returns to it (like Esc); on the main
                     // view it quits a held (finished) viewport. Ignored mid-search
@@ -709,6 +750,11 @@ pub async fn run<A: App + 'static>(
                         && held_at.is_some_and(|at| now.saturating_sub(at) >= 500)
                     {
                         DebugPanic::Backend.fire();
+                    }
+                    if debug_panic == Some(DebugPanic::Caught) && !caught_fired {
+                        caught_fired = true;
+                        // The handle is dropped: nobody resumes the panic.
+                        drop(tokio::spawn(async { DebugPanic::Caught.fire() }));
                     }
                     continue;
                 }

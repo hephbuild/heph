@@ -21,6 +21,8 @@ use tokio::sync::mpsc;
 pub struct ShutdownTrigger {
     tx: mpsc::UnboundedSender<()>,
     suppressed: Arc<AtomicBool>,
+    /// Set by the first press that got through: a stop is under way.
+    fired: Arc<AtomicBool>,
 }
 
 impl ShutdownTrigger {
@@ -31,6 +33,7 @@ impl ShutdownTrigger {
             Self {
                 tx,
                 suppressed: Arc::new(AtomicBool::new(false)),
+                fired: Arc::new(AtomicBool::new(false)),
             },
             rx,
         )
@@ -40,7 +43,15 @@ impl ShutdownTrigger {
         if self.suppressed.load(Ordering::Acquire) || is_transparent() {
             return;
         }
+        self.fired.store(true, Ordering::Release);
         _ = self.tx.send(());
+    }
+
+    /// Whether a press has got through to the consumer, from any producer (a
+    /// key or a SIGINT): a stop is under way, and the TUI's two-press guard
+    /// on its full screens no longer arms.
+    pub fn fired(&self) -> bool {
+        self.fired.load(Ordering::Acquire)
     }
 
     pub fn suppression(&self) -> SuppressionHandle {

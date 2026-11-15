@@ -4,6 +4,8 @@
 //! The body comes from folding `events.ndjson` into the same view the TUI
 //! draws, up to what was recorded when the command ran (A18); an ended session
 //! is drawn at the time of its `End`, so its elapsed times stay what they were.
+//! It is the line, then the dashboard's All list capped at 15 rows, then what
+//! the run is stuck on and what to do next.
 
 use std::collections::HashSet;
 use std::io::Write;
@@ -176,7 +178,11 @@ pub(crate) async fn show(
         .context("the session's source went missing")?;
     let state = derive_state(&entry, opts.now_ms, opts.stall);
 
-    let folded = fold(source, &entry, meta).await?;
+    let mut folded = fold(source, &entry, meta).await?;
+    // An ended session's line reads as its finished line did.
+    if let Some(end) = &folded.end {
+        folded.view.set_finished(end.at_unix_ms);
+    }
     let snapshot = current_snapshot(&folded, entry.status.as_ref());
     let every = list_all(sources).await?;
     let every: Vec<&SessionEntry> = every.iter().map(|(_, e)| e).collect();

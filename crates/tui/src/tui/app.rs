@@ -241,6 +241,27 @@ pub trait TUIAppView: Send {
         Vec::new()
     }
 
+    /// A ctrl-c key at `now_ms`: whether it stops (see
+    /// [`crate::tui::stop_arm`]). `finished` and `stopping` are the
+    /// backend's: the build has ended, a stop is already under way. One
+    /// press stops by default: a view with no full screen.
+    fn ctrl_c(
+        &mut self,
+        _now_ms: u64,
+        _finished: bool,
+        _stopping: bool,
+    ) -> crate::tui::stop_arm::CtrlC {
+        crate::tui::stop_arm::CtrlC::Stop
+    }
+
+    /// Any other key: an armed stop is off. No-op by default.
+    fn disarm_stop(&mut self) {}
+
+    /// `--dashboard`: open the dashboard before the first frame and hold the
+    /// finished run until `q`, on whichever screen is up. No-op by default,
+    /// and for a command with no dashboard (the line only).
+    fn pin_dashboard(&mut self) {}
+
     /// Enter (`log` false) or `l` (`log` true) on a full screen's selected
     /// row: open that target's screen. No-op by default.
     fn open_selected(&mut self, _log: bool) {}

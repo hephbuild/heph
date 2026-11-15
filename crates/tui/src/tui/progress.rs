@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use ratatui::style::{Color, Modifier, Style, Stylize};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::tui::app::{CIAppView, TUIAppView};
@@ -25,6 +25,9 @@ pub use spotlight::{HOLD_MS, Spot};
 
 /// The dashboard's key hints once the build has ended and the dashboard
 /// holds it on screen: nothing is left to stop, and `q` leaves.
+/// The most list rows `heph session show` prints.
+pub const SNAPSHOT_ROWS: u16 = 15;
+
 const FINISHED_DASHBOARD_HINTS: &str = "↑/↓ select · enter details · l log · tab/⇧tab list · / filter · a all targets · q or esc leave";
 
 /// A target is considered "taking long" once its execute span exceeds this.
@@ -43,21 +46,6 @@ const WORKERS_PER_CELL: usize = 8;
 /// empty/idle cell (the caller paints it grey); the lit progression follows the
 /// pinned UI rule `⠁ ⠃ ⠇ ⠧ ⠷ ⠿ … ⣿` with the 7-dot step filled in.
 const BRAILLE_FILL: [char; WORKERS_PER_CELL + 1] = ['⣿', '⠁', '⠃', '⠇', '⡇', '⣇', '⣧', '⣷', '⣿'];
-
-/// Below this width the box-drawing math has no room; we clamp up to it.
-const MIN_BOX_WIDTH: usize = 16;
-
-/// Visible column count of a span run. Every glyph we emit (box-drawing,
-/// braille, ASCII, `·`) is single-width, so a char count is exact.
-fn spans_width(spans: &[Span<'_>]) -> usize {
-    spans.iter().map(|s| s.content.chars().count()).sum()
-}
-
-/// Paint a header span as the active tab: a blue background with white text so
-/// the selected view reads as highlighted in the status line.
-fn highlight_span(s: &Span<'static>) -> Span<'static> {
-    Span::styled(s.content.clone(), s.style.bg(Color::Blue).fg(Color::White))
-}
 
 /// One braille cell per group of [`WORKERS_PER_CELL`] worker slots. Busy slots
 /// fill left-to-right across cells; an all-idle cell is dim grey, any-busy cell
@@ -198,23 +186,13 @@ pub enum HeaderItem {
 /// view. `Some(mode)` makes the part a tab — selectable via `Tab` and
 /// highlighted while `mode` is the active view; `None` is inert connective text.
 pub struct HeaderPart {
-    mode: Option<ViewMode>,
     spans: Vec<Span<'static>>,
 }
 
 impl HeaderPart {
-    /// An inert (non-selectable) text part.
+    /// A text part.
     fn text(s: impl Into<String>) -> Self {
         HeaderPart {
-            mode: None,
-            spans: vec![Span::raw(s.into())],
-        }
-    }
-
-    /// A text part bound to a body view.
-    fn tab(mode: ViewMode, s: impl Into<String>) -> Self {
-        HeaderPart {
-            mode: Some(mode),
             spans: vec![Span::raw(s.into())],
         }
     }
@@ -1524,11 +1502,11 @@ impl ProgressHeader for BuildHeader {
         // view). The connective ` / ` and trailing ` done` are inert text. Before
         // any `Matched` event there is no denominator, so it reads `{executed} done`
         // with only the Done tab.
-        let mut done_parts = vec![HeaderPart::tab(ViewMode::Done, done)];
+        let mut done_parts = vec![HeaderPart::text(done)];
         match total {
             Some(total) => {
                 done_parts.push(HeaderPart::text(" / "));
-                done_parts.push(HeaderPart::tab(ViewMode::Matched, total));
+                done_parts.push(HeaderPart::text(total));
                 done_parts.push(HeaderPart::text(" done"));
             }
             None => done_parts.push(HeaderPart::text(" done")),
@@ -1778,6 +1756,10 @@ pub struct TuiProgressView {
     /// Whose view this is: the run's own, or a session viewer's. The one seam
     /// between the two; everything not behind it renders identically.
     role: Role,
+    /// The first of two ctrl-c on a full screen.
+    stop_arm: crate::tui::stop_arm::StopArm,
+    /// `--dashboard`: the finished run holds until `q` on any screen.
+    pinned: bool,
 }
 
 /// Whose terminal a [`TuiProgressView`] draws on.
@@ -1899,6 +1881,8 @@ impl TuiProgressView {
             target: None,
             target_reader: None,
             role: Role::Live { approval: None },
+            stop_arm: crate::tui::stop_arm::StopArm::default(),
+            pinned: false,
         }
     }
 
@@ -1945,18 +1929,35 @@ impl TuiProgressView {
     }
 
     /// One frame as plain lines, for printing once (`heph session show`): the
-    /// header, the default body (lock waits, scratch waits, long-running
-    /// targets) and the admission waits the TUI keeps on its own tab. No bottom
-    /// border, no key help, no idle art; nothing windowed. `ratatui`'s `Line`
+    /// line, then the dashboard's All list, at most [`SNAPSHOT_ROWS`] rows,
+    /// with its column titles and position. No key hints. `ratatui`'s `Line`
     /// prints its text with `Display`, styles dropped.
     ///
     /// `now_ms` is the clock the elapsed time and wait ages are measured
     /// against: the viewer's now for a live session, the `End` record's time
-    /// for an ended one.
+    /// for an ended one ([`TUIAppView::set_finished`] it first, so the line
+    /// reads as finished).
     pub fn snapshot_lines(&self, now_ms: u64, width: u16) -> Vec<Line<'static>> {
-        let mut lines = vec![self.header_line(now_ms, width)];
-        lines.extend(self.state.body_lines(now_ms));
-        lines.extend(self.state.admission_wait_lines(now_ms, ""));
+        use crate::tui::dashboard::{LastLines, ListInputs, ListState, list::list_lines};
+        let mut lines = vec![self.line("▶", now_ms, width, false)];
+        if self.model.has_dashboard() {
+            let mut list = ListState::default();
+            list.scope = self.list.scope;
+            let inputs = ListInputs {
+                model: &self.state.dash,
+                waits: &self.state,
+                lines: &LastLines::default(),
+                now_ms,
+                redact: &self.state.redact,
+            };
+            // The titles, the rows and the position; not the rows the list
+            // pads its window with, which a print has no window for.
+            lines.extend(
+                list_lines(&inputs, &mut list, width, SNAPSHOT_ROWS + 3)
+                    .into_iter()
+                    .filter(|l| l.spans.iter().any(|s| !s.content.trim().is_empty())),
+            );
+        }
         lines
     }
 
@@ -1993,6 +1994,18 @@ impl TuiProgressView {
     #[cfg(test)]
     pub(crate) fn open_dashboard(&mut self) {
         self.tab(true);
+    }
+
+    /// The clock and the header model's items, as the box's top border
+    /// carried them: what the header tests read since the box went.
+    #[cfg(test)]
+    fn header_line(&self, now_ms: u64, _width: u16) -> String {
+        let clock = self.finished_at_ms.unwrap_or(now_ms);
+        format!(
+            "{} · {}",
+            human_elapsed(self.state.elapsed_ms(clock)),
+            header_text(self.model.header(&self.state, self.list.scope))
+        )
     }
 
     /// The dashboard's title row: the command, the clock and how far along
@@ -2115,7 +2128,10 @@ impl TuiProgressView {
     }
 
     /// The line at `now_ms`, `width` columns wide.
-    fn line(&self, spinner: &str, now_ms: u64, width: u16) -> Line<'static> {
+    /// The line. `live`: drawn on a terminal heph reads keys from, so it
+    /// carries their hints (`tab ⇥`, and `q to quit` while `--dashboard`
+    /// holds the finished run); a printed one (`heph session show`) has none.
+    fn line(&self, spinner: &str, now_ms: u64, width: u16, live: bool) -> Line<'static> {
         use std::borrow::Cow;
         let clock_at = self.finished_at_ms.unwrap_or(now_ms);
         let clock = hcore::units::human_duration(std::time::Duration::from_millis(
@@ -2161,7 +2177,8 @@ impl TuiProgressView {
             spot: self
                 .approval_spot()
                 .or_else(|| self.state.spotlight(now_ms)),
-            hint: dashboard,
+            hint: dashboard && live,
+            held: live && self.pinned && self.finished_at_ms.is_some(),
         };
         line::render(&model, width)
     }
@@ -2274,81 +2291,6 @@ impl TuiProgressView {
         }
         lines
     }
-
-    /// Render the header model's items into a flat span run: items joined by
-    /// ` · `, with the [`HeaderItem::Tab`] matching the active view highlighted
-    /// (reversed background). This is the one place the ` · ` separator lives.
-    fn header_item_spans(&self) -> Vec<Span<'static>> {
-        // A printed frame has no tab on show.
-        let active = ViewMode::Default;
-        let items = self.model.header(&self.state, self.list.scope);
-        let mut spans: Vec<Span<'static>> = Vec::with_capacity(items.len() * 2);
-        for (i, item) in items.iter().enumerate() {
-            if i > 0 {
-                spans.push(Span::raw(" · "));
-            }
-            match item {
-                HeaderItem::Text(item_spans) => spans.extend(item_spans.iter().cloned()),
-                HeaderItem::Tab {
-                    mode,
-                    spans: item_spans,
-                } if *mode == active => {
-                    // Active tab: paint a background so the selected view reads
-                    // as highlighted in the header.
-                    spans.extend(item_spans.iter().map(highlight_span));
-                }
-                HeaderItem::Tab {
-                    spans: item_spans, ..
-                } => spans.extend(item_spans.iter().cloned()),
-                // A split segment renders its parts back-to-back with no ` · `
-                // between them; each tab-bound part highlights independently when
-                // its own view is active.
-                HeaderItem::Split(parts) => {
-                    for part in parts {
-                        if part.mode == Some(active) {
-                            spans.extend(part.spans.iter().map(highlight_span));
-                        } else {
-                            spans.extend(part.spans.iter().cloned());
-                        }
-                    }
-                }
-            }
-        }
-        spans
-    }
-
-    /// The rounded top border:
-    /// `╭─ 1m05s · D / N done · N cached · N waiting · N failed · <workers> ──╮`.
-    /// The leading field is the elapsed-time clock. "done" shows matched progress
-    /// `done / total` (total prefixed `~` while the matcher is still resolving),
-    /// falling back to the executed count before any match streams. The "running"
-    /// count is omitted — the worker braille (flush right) conveys concurrency.
-    fn header_line(&self, now_ms: u64, width: u16) -> Line<'static> {
-        let width = usize::from(width).max(MIN_BOX_WIDTH);
-        // Once finished, the clock is frozen at the finish instant rather than
-        // advancing with the live render wall clock.
-        let clock = self.finished_at_ms.unwrap_or(now_ms);
-        let elapsed = human_elapsed(self.state.elapsed_ms(clock));
-
-        let mut left: Vec<Span<'static>> = Vec::with_capacity(5);
-        left.push(Span::raw("╭─ "));
-        left.push(Span::from(elapsed).bold());
-        // The status segment (counts + worker braille, or gc sweep stats) is
-        // supplied by the header model; the view owns only the leading clock.
-        left.push(Span::raw(" · "));
-        left.extend(self.header_item_spans());
-        // Space between the segment and the dash fill.
-        left.push(Span::raw(" "));
-
-        let left_w = spans_width(&left);
-        // Trailing "─╮" closes the border.
-        let fill = width.saturating_sub(left_w + 2);
-
-        let mut spans = left;
-        spans.push(Span::raw("─".repeat(fill)));
-        spans.push(Span::raw("─╮"));
-        Line::from(spans)
-    }
 }
 
 impl TUIAppView for TuiProgressView {
@@ -2399,9 +2341,46 @@ impl TUIAppView for TuiProgressView {
     }
 
     fn render_full(&mut self, now_ms: u64, cols: u16, rows: u16) -> Vec<Line<'static>> {
-        match self.target_lines(now_ms, cols, rows) {
+        let mut lines = match self.target_lines(now_ms, cols, rows) {
             Some(lines) => lines,
             None => self.dashboard_lines(now_ms, cols, rows),
+        };
+        // An armed stop takes the hint row, the last on every full screen.
+        if let Some(prompt) = self.stop_arm.prompt(now_ms)
+            && let Some(last) = lines.last_mut()
+        {
+            let prompt = crate::tui::text::cut_right(&prompt, usize::from(cols).saturating_sub(2));
+            *last = Line::styled(
+                format!("  {prompt}"),
+                ratatui::style::Style::default().fg(ratatui::style::Color::Yellow),
+            );
+        }
+        lines
+    }
+
+    fn ctrl_c(
+        &mut self,
+        now_ms: u64,
+        finished: bool,
+        stopping: bool,
+    ) -> crate::tui::stop_arm::CtrlC {
+        let at = crate::tui::stop_arm::Press {
+            full_screen: self.dashboard_open,
+            attached: matches!(self.role, Role::Attached { .. }),
+            finished: finished || self.finished_at_ms.is_some(),
+            stopping,
+        };
+        self.stop_arm.press(at, now_ms)
+    }
+
+    fn disarm_stop(&mut self) {
+        self.stop_arm.disarm();
+    }
+
+    fn pin_dashboard(&mut self) {
+        if self.model.has_dashboard() {
+            self.dashboard_open = true;
+            self.pinned = true;
         }
     }
 
@@ -2576,15 +2555,15 @@ impl TUIAppView for TuiProgressView {
         if self.approval_spot().is_some() {
             lines.extend(self.approval_lines().into_iter().take(1));
         }
-        lines.push(self.line(spinner, now_ms, width));
+        lines.push(self.line(spinner, now_ms, width, true));
         lines
     }
 
     fn hold_after_finish(&self) -> bool {
         // Auto-exit only from the line; while the dashboard is up, keep it
         // until the user leaves (I: closing it under their cursor loses
-        // their place).
-        self.dashboard_open
+        // their place). `--dashboard` holds on every screen.
+        self.dashboard_open || self.pinned
     }
 
     fn set_finished(&mut self, at_ms: u64) {
@@ -2596,6 +2575,8 @@ impl TUIAppView for TuiProgressView {
             Role::Live { .. } => at_ms,
         };
         self.finished_at_ms = Some(at);
+        // Nothing is left to stop: an armed prompt would ask for nothing.
+        self.stop_arm.disarm();
     }
 
     /// Final report — the elapsed clock plus the header model's summary segment,
@@ -3483,7 +3464,7 @@ mod tests {
     #[test]
     fn the_session_header_counts_waiting_between_cached_and_failed() {
         let v = TuiProgressView::new("L");
-        let header = format!("{}", v.header_line(0, 100));
+        let header = v.header_line(0, 100);
         assert!(
             header.contains("0 cached · 0 waiting · 0 failed"),
             "{header}"
@@ -4174,8 +4155,6 @@ mod tests {
         assert!(header.contains("1 failed"), "{header}");
         // The "running" count was dropped in favour of the worker braille.
         assert!(!header.contains("running"), "{header}");
-        // A space separates the counts from the dash fill.
-        assert!(header.contains("failed "), "{header}");
     }
 
     #[test]
@@ -5003,9 +4982,9 @@ mod tests {
         assert_eq!(active[1].style.fg, Some(Color::DarkGray));
     }
 
-    /// A18: one frame as plain text — the header box line, then the lock wait
-    /// and the long-running target — with no bottom border, help row or idle
-    /// art, measured against the clock it is given.
+    /// `heph session show`'s frame: the line, then the dashboard's All list
+    /// with its titles, capped at 15 rows, no key hints, measured against
+    /// the clock it is given.
     #[test]
     fn snapshot_lines_render_one_plain_frame() {
         let mut v = TuiProgressView::new("L");
@@ -5020,30 +4999,46 @@ mod tests {
             },
         ));
         let text: Vec<String> = v
-            .snapshot_lines(65_000, 60)
+            .snapshot_lines(65_000, 100)
             .iter()
             .map(ToString::to_string)
             .collect();
-        let header = text.first().expect("header");
+        let line = text.first().expect("the line");
+        assert!(line.contains("1m05s · 0 / 2 done"), "{line}");
+        assert!(!line.contains('⇥'), "no key hint on a print: {line}");
         assert!(
-            header.starts_with("╭─ ") && header.contains("1m05s · 0 / 2 done"),
-            "{header}"
-        );
-        assert!(header.ends_with("─╮"), "{header}");
-        assert_eq!(header.chars().count(), 60, "{header}");
-        assert_eq!(
-            text.get(1).map(String::as_str),
-            Some("  🔒 //a:locked (locked by pid 4242)"),
+            text.get(1).is_some_and(|t| t.contains("TARGET")),
             "{text:?}"
+        );
+        for addr in ["//a:slow", "//a:locked"] {
+            assert_eq!(
+                text.iter().skip(1).filter(|l| l.contains(addr)).count(),
+                1,
+                "{addr} listed once: {text:?}"
+            );
+        }
+        assert!(
+            text.iter().all(|l| !l.trim().is_empty()),
+            "no padding rows: {text:?}"
         );
         assert!(
             !text
                 .iter()
-                .any(|l| l.starts_with("╰") || l.contains("scroll")),
-            "no bottom border or help row: {text:?}"
+                .any(|l| l.contains("esc") || l.contains("ctrl-c")),
+            "no hint row: {text:?}"
         );
-        // An empty view is just its header: nothing invented to fill rows.
-        assert_eq!(TuiProgressView::new("L").snapshot_lines(0, 60).len(), 1);
+
+        // Capped at 15 rows, whatever the build's size.
+        let mut big = TuiProgressView::new("L");
+        let addrs: Vec<String> = (0..40).map(|i| format!("//b:t{i:02}")).collect();
+        let refs: Vec<&str> = addrs.iter().map(String::as_str).collect();
+        big.apply(&ev(0, matched(&refs, true)));
+        let rows = big
+            .snapshot_lines(1_000, 100)
+            .iter()
+            .filter(|l| l.to_string().contains("//b:t"))
+            .count();
+        assert_eq!(rows, usize::from(SNAPSHOT_ROWS));
     }
 
     fn lock_wait_start(addr: &str, pid: u32) -> BuildEventKind {

@@ -1067,7 +1067,8 @@ async fn execute_async(
         )
     });
 
-    let result = tui::run_app(app, sink, session, interactive, shutdown).await;
+    let result =
+        tui::run_app_with(app, sink, session, interactive, global.dashboard, shutdown).await;
     // Stop before teardown so no paragraph races the final summary.
     if let Some(w) = &watchdog {
         w.stop();

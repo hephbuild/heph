@@ -163,7 +163,7 @@ fn main() -> ExitCode {
     // warning. The log's quiet filter is the same flag.
     let raw = raw_requested(&soft_match);
     let sink = log::init(raw, Arc::clone(&session));
-    heph::tui::panic::install(sink.clone());
+    heph::tui::panic::install();
 
     // Self-upgrade BEFORE matching the command. A workspace can pin a newer heph
     // that defines subcommands this binary doesn't, and `get_matches()` below
