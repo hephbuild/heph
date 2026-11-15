@@ -158,17 +158,9 @@ impl SessionSource for FileSource {
         id: SessionId,
     ) -> anyhow::Result<BoxStream<'static, anyhow::Result<SessionItem>>> {
         let dir = self.dir(id);
-        // Refuse a format this heph cannot read before reading any record.
-        let meta = std::fs::read(dir.join(files::META))
-            .with_context(|| format!("reading session {id}'s meta.json"))?;
-        SessionMeta::decode(&meta).with_context(|| format!("session {id}"))?;
-        let events = match File::open(dir.join(files::EVENTS)) {
-            Ok(f) => Some(f),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-            Err(e) => {
-                return Err(e).with_context(|| format!("opening session {id}'s events.ndjson"));
-            }
-        };
+        let (dir, events) = tokio::task::spawn_blocking(move || open_follow(dir, id))
+            .await
+            .context("opening a session to follow")??;
         // Bounded, so a slow consumer holds the follower back rather than
         // buffering a whole 64 MiB log in memory.
         let (tx, mut rx) = tokio::sync::mpsc::channel(256);
@@ -185,6 +177,22 @@ impl SessionSource for FileSource {
             .await
             .context("asking for the in-flight report")?
     }
+}
+
+/// `subscribe`'s blocking half: refuse a format this heph cannot read before
+/// reading any record, then open the event log (absent: nothing recorded yet).
+fn open_follow(dir: PathBuf, id: SessionId) -> anyhow::Result<(PathBuf, Option<File>)> {
+    let meta = std::fs::read(dir.join(files::META))
+        .with_context(|| format!("reading session {id}'s meta.json"))?;
+    SessionMeta::decode(&meta).with_context(|| format!("session {id}"))?;
+    let events = match File::open(dir.join(files::EVENTS)) {
+        Ok(f) => Some(f),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => {
+            return Err(e).with_context(|| format!("opening session {id}'s events.ndjson"));
+        }
+    };
+    Ok((dir, events))
 }
 
 pub(crate) fn list_dir(root: &Path) -> anyhow::Result<Vec<SessionEntry>> {
