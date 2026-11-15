@@ -63,6 +63,47 @@ pub(crate) struct RunLogs {
     start_sweep: Mutex<Option<tokio::task::JoinHandle<usize>>>,
     /// Told of each live file when its first byte creates it (the session).
     announcer: Option<Arc<dyn RunLogAnnouncer>>,
+    /// This engine's live files, by address: the log API's in-process source.
+    live: Arc<LiveRuns>,
+}
+
+/// This engine's runs whose live file was created, one per address (the
+/// newest run's). An entry is added when the run's first byte creates its
+/// file, and removed when the file is unlinked; a `cache = false` success's
+/// retained file keeps its entry. Read by the log API only.
+#[derive(Debug, Default)]
+pub(crate) struct LiveRuns(Mutex<std::collections::HashMap<hmodel::htaddr::Addr, LiveRun>>);
+
+/// One run's live file, as the log API finds it in-process.
+#[derive(Debug, Clone)]
+pub(crate) struct LiveRun {
+    /// Gone once the run is over and nothing holds its log.
+    pub(crate) log: std::sync::Weak<RunLog>,
+    pub(crate) path: PathBuf,
+    pub(crate) hashin: String,
+    /// When the file was created, in milliseconds since the epoch.
+    pub(crate) at_unix_ms: u64,
+}
+
+impl LiveRuns {
+    fn map(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<hmodel::htaddr::Addr, LiveRun>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// `addr`'s newest live file in this engine, if one exists.
+    pub(crate) fn get(&self, addr: &hmodel::htaddr::Addr) -> Option<LiveRun> {
+        self.map().get(addr).cloned()
+    }
+}
+
+/// What a run's log registers in [`LiveRuns`] when its file is created.
+struct Registration {
+    live: Arc<LiveRuns>,
+    addr: hmodel::htaddr::Addr,
+    hashin: String,
+    me: std::sync::Weak<RunLog>,
 }
 
 impl std::fmt::Debug for RunLogs {
@@ -145,7 +186,13 @@ impl RunLogs {
             next: AtomicU64::new(0),
             start_sweep: Mutex::new(None),
             announcer: None,
+            live: Arc::default(),
         }
+    }
+
+    /// This engine's live files, by address.
+    pub(crate) fn live(&self) -> &LiveRuns {
+        &self.live
     }
 
     /// Announce each live file to `announcer` when it is created.
@@ -219,7 +266,16 @@ impl RunLogs {
             },
         });
         let path = self.dir.path.join(name);
-        let log = Arc::new(RunLog::new(path, Arc::clone(&self.dir), announce));
+        let log = Arc::new_cyclic(|me| {
+            let mut log = RunLog::new(path, Arc::clone(&self.dir), announce);
+            log.registration = Some(Registration {
+                live: Arc::clone(&self.live),
+                addr: addr.clone(),
+                hashin: hashin.to_owned(),
+                me: me.clone(),
+            });
+            log
+        });
         let guard = LiveGuard {
             log: Arc::clone(&log),
             unlink: true,
@@ -357,6 +413,8 @@ pub(crate) struct RunLog {
     ended: AtomicBool,
     /// Bytes written after the log was finalized, and dropped.
     discarded: AtomicU64,
+    /// Where the file is registered for the log API once it is created.
+    registration: Option<Registration>,
 }
 
 struct State {
@@ -417,6 +475,42 @@ impl RunLog {
             }),
             ended: AtomicBool::new(false),
             discarded: AtomicU64::new(0),
+            registration: None,
+        }
+    }
+
+    /// Put the just-created file in [`LiveRuns`], replacing the addr's
+    /// previous run.
+    fn register(&self) {
+        let Some(reg) = &self.registration else {
+            return;
+        };
+        let at_unix_ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        reg.live.map().insert(
+            reg.addr.clone(),
+            LiveRun {
+                log: reg.me.clone(),
+                path: self.path.clone(),
+                hashin: reg.hashin.clone(),
+                at_unix_ms,
+            },
+        );
+    }
+
+    /// Take the unlinked file out of [`LiveRuns`], unless a newer run of the
+    /// addr replaced it there.
+    fn unregister(&self) {
+        let Some(reg) = &self.registration else {
+            return;
+        };
+        let mut map = reg.live.map();
+        if map
+            .get(&reg.addr)
+            .is_some_and(|run| std::sync::Weak::ptr_eq(&run.log, &reg.me))
+        {
+            map.remove(&reg.addr);
         }
     }
 
@@ -430,7 +524,6 @@ impl RunLog {
     }
 
     /// Whether the run's last byte is written.
-    #[cfg_attr(not(test), expect(dead_code, reason = "read by the log API (unit 2)"))]
     pub(crate) fn ended(&self) -> bool {
         self.ended.load(Ordering::Acquire)
     }
@@ -497,6 +590,7 @@ impl RunLog {
         if let Live::Unopened = st.file {
             st.file = Live::Open(self.create_file()?);
             st.created = true;
+            self.register();
             if let Some(Announce { to, record }) = st.announce.take() {
                 to.run_log_created(record);
             }
@@ -712,12 +806,13 @@ impl Drop for LiveGuard {
     fn drop(&mut self) {
         drop(self.log.finalize());
         // Finalized: no later write creates the file, so `created` is final.
-        if self.unlink
-            && self.log.created()
-            && let Err(e) = std::fs::remove_file(&self.log.path)
-            && e.kind() != io::ErrorKind::NotFound
-        {
-            tracing::debug!(path = %self.log.path.display(), error = %e, "removing a run's live log");
+        if self.unlink && self.log.created() {
+            if let Err(e) = std::fs::remove_file(&self.log.path)
+                && e.kind() != io::ErrorKind::NotFound
+            {
+                tracing::debug!(path = %self.log.path.display(), error = %e, "removing a run's live log");
+            }
+            self.log.unregister();
         }
     }
 }

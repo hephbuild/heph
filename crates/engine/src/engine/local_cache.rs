@@ -1085,13 +1085,27 @@ impl Engine {
             } else {
                 artifact.name.clone()
             };
-            let mut reader = self
-                .local_cache
-                .reader(addr, src_key, &artifact.name)
-                .with_context(|| {
-                    format!("open source blob {} for {addr} {src_key}", artifact.name)
-                })?
-                .reader;
+            let mut reader = match self.local_cache.reader(addr, src_key, &artifact.name) {
+                Ok(r) => r.reader,
+                // A remote hit's log is fetched only when someone reads it,
+                // so its blob may be absent: the duplicate names it as the
+                // source does, and whether anyone read a log never changes
+                // what a later run finds.
+                Err(e)
+                    if artifact.r#type == ManifestArtifactType::Log && e.is::<NotFoundError>() =>
+                {
+                    dup_artifacts.push(ManifestArtifact {
+                        name: dst_name,
+                        ..artifact.clone()
+                    });
+                    continue;
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("open source blob {} for {addr} {src_key}", artifact.name)
+                    });
+                }
+            };
             let mut writer = self
                 .local_cache
                 .writer(addr, dst_key, &dst_name)

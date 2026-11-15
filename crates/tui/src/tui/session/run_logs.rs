@@ -36,6 +36,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use hcore::events::BuildEventKind;
+use hcore::session_record::{LiveRunLogLocator, LocatedRunLog};
 
 use super::format::{CAPABILITY_RUN_LOGS, RunLogRecord, SessionMeta, SessionRecordKind, files};
 use super::{RecordReader, SessionId, SessionRoot, lockfile};
@@ -194,6 +195,46 @@ pub fn session_run_log(
             Opened::Refused => None,
         },
     )
+}
+
+/// The engine log API's [`LiveRunLogLocator`] over the sessions under one
+/// root: [`find_run_log`], and nothing else. `heph log` and the dashboard
+/// hand one to the engine, which cannot depend on this crate.
+#[derive(Debug, Clone)]
+pub struct SessionRunLogLocator {
+    root: SessionRoot,
+}
+
+impl SessionRunLogLocator {
+    pub fn new(root: SessionRoot) -> Self {
+        Self { root }
+    }
+}
+
+impl LiveRunLogLocator for SessionRunLogLocator {
+    fn locate(&self, home: &Path, addr: &str) -> anyhow::Result<Option<LocatedRunLog>> {
+        Ok(find_run_log(&self.root, home, addr)?.map(|found| {
+            let session = found.session.encode();
+            match found.log {
+                SessionRunLog::Live {
+                    record,
+                    at_unix_ms,
+                    file,
+                    ..
+                } => LocatedRunLog::Live {
+                    record,
+                    at_unix_ms,
+                    session,
+                    file,
+                },
+                SessionRunLog::Ended { record, at_unix_ms } => LocatedRunLog::Ended {
+                    record,
+                    at_unix_ms,
+                    session,
+                },
+            }
+        }))
+    }
 }
 
 /// What opening a record's `file` under the home came to.

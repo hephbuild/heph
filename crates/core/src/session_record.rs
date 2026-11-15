@@ -71,6 +71,50 @@ pub trait RunLogAnnouncer: Send + Sync + std::fmt::Debug {
     fn run_log_created(&self, record: RunLogRecord);
 }
 
+/// What the live sessions of this workspace say about an address's newest
+/// run log: what a [`LiveRunLogLocator`] answers.
+#[derive(Debug)]
+pub enum LocatedRunLog {
+    /// The run is going on: its live file, opened (regular, not followed
+    /// through a symlink). Read it to EOF and keep following until the run
+    /// ends.
+    Live {
+        record: RunLogRecord,
+        /// When the record was written, in milliseconds since the epoch.
+        at_unix_ms: u64,
+        /// The session that recorded it, for a human to read.
+        session: String,
+        file: std::fs::File,
+    },
+    /// The run ended (its end was recorded, or its live file is gone): what
+    /// replaced the file is found by `record.hashin`.
+    Ended {
+        record: RunLogRecord,
+        at_unix_ms: u64,
+        session: String,
+    },
+}
+
+impl LocatedRunLog {
+    pub fn record(&self) -> &RunLogRecord {
+        match self {
+            Self::Live { record, .. } | Self::Ended { record, .. } => record,
+        }
+    }
+}
+
+/// Finds a running target's live log through the sessions that recorded it,
+/// in this process or another heph on the same workspace. The session
+/// reader implements it; the engine's log API takes one so it never depends
+/// on the crate that records sessions.
+///
+/// Blocking: an implementation reads session files. It applies the trust
+/// rules itself (only live sessions of `home`, `file` kept under
+/// `<home>/runs/`), so `None` is "no trusted record of `addr`".
+pub trait LiveRunLogLocator: Send + Sync + std::fmt::Debug {
+    fn locate(&self, home: &Path, addr: &str) -> anyhow::Result<Option<LocatedRunLog>>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

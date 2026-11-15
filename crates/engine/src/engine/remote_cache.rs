@@ -2242,7 +2242,7 @@ impl Engine {
 
 /// The local view of a remote manifest: the same artifacts under the same
 /// names and encodings, since a download stores the remote bytes verbatim.
-fn local_manifest_from_remote(remote: &RemoteManifest, hashin: &str) -> Manifest {
+pub(crate) fn local_manifest_from_remote(remote: &RemoteManifest, hashin: &str) -> Manifest {
     Manifest {
         version: MANIFEST_V2_VERSION.to_string(),
         target: remote.target.clone(),
