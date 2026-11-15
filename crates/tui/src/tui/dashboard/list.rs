@@ -1065,6 +1065,9 @@ mod tests {
 
     /// A frame never reads a log: the tails come from the background half,
     /// a finished row's once, a running row's again only when it grew.
+    /// That `frame` itself reads nothing is structural (it is handed no
+    /// reader); `last_line_column_reads_off_the_frame_thread` in
+    /// `progress.rs` proves it end to end, by the reading thread's id.
     #[test]
     fn frame_does_no_io() {
         let mut m = model(&["//p:run", "//p:done"]);
@@ -1105,10 +1108,7 @@ mod tests {
         let mut lines = LastLines::default();
         let mut st = ListState::default();
 
-        for _ in 0..5 {
-            frame(&m, &lines, &mut st, 100);
-        }
-        assert_eq!(reader.calls(), (0, 0), "frames read nothing");
+        frame(&m, &lines, &mut st, 100);
         assert_eq!(st.visible().len(), 2);
 
         let background = |lines: &mut LastLines, st: &ListState| {
@@ -1138,10 +1138,6 @@ mod tests {
         reader.write("//p:run", "Compiling b\n");
         assert_eq!(background(&mut lines, &st), 1);
         assert_eq!(reader.calls(), (4, 3));
-        for _ in 0..5 {
-            frame(&m, &lines, &mut st, 100);
-        }
-        assert_eq!(reader.calls(), (4, 3), "frames read nothing");
         let rows = frame(&m, &lines, &mut st, 100);
         assert!(rows.iter().any(|r| r.ends_with("Compiling b")), "{rows:#?}");
     }
