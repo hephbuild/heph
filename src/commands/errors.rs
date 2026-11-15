@@ -15,6 +15,9 @@ use crate::hmemoizer::{chain_frames, downcast_chain_ref};
 use crate::tui::color::stderr_color_enabled as color_enabled;
 use crate::tui::session::SessionSlot;
 
+mod report;
+pub use report::ReportContext;
+
 /// Render the cause chain of an `anyhow::Error`, dropping the leading frames that
 /// merely restate the target address (engine boundaries like `execute //addr`,
 /// already shown in the title) and joining the rest the way anyhow's `{:#}`
@@ -234,20 +237,22 @@ fn render_fixes(out: &mut String, fixes: &FailureFixes) {
             }
         }
         FailureFixes::NotWritten(reason) => {
-            let reason = match reason {
-                FixesNotWritten::Signal(sig) => format!("killed by signal {sig}"),
-                FixesNotWritten::HighExit(code) => {
-                    format!("exit {code} (128+, treated as a signal)")
-                }
-                FixesNotWritten::MovedSource => {
-                    "an in_place source changed while the target ran".to_string()
-                }
-                FixesNotWritten::Frozen => {
-                    "--frozen checks the tree, it never writes it".to_string()
-                }
-            };
-            out.push_str(&format!("  fixes not written: {reason}\n"));
+            out.push_str(&format!(
+                "  fixes not written: {}\n",
+                not_written_reason(reason)
+            ));
         }
+    }
+}
+
+/// Why a failed `in_place` run wrote nothing back, as the box and the
+/// report say it.
+fn not_written_reason(reason: &FixesNotWritten) -> String {
+    match reason {
+        FixesNotWritten::Signal(sig) => format!("killed by signal {sig}"),
+        FixesNotWritten::HighExit(code) => format!("exit {code} (128+, treated as a signal)"),
+        FixesNotWritten::MovedSource => "an in_place source changed while the target ran".into(),
+        FixesNotWritten::Frozen => "--frozen checks the tree, it never writes it".into(),
     }
 }
 
@@ -577,9 +582,19 @@ macro_rules! finalize {
                 // resume re-anchor and the final viewport collapse would wipe the
                 // boxes off screen. Carry the failures out; `render_anyhow` in
                 // `main` prints them once the viewport is fully torn down.
+                // As the report: everything it reads from disk is read
+                // here, never at the render (two-mode TUI I7).
+                let home = $rs.heph_home();
+                let report = $crate::commands::errors::ReportContext::gather(
+                    &failures,
+                    |addr| $rs.took_down(addr),
+                    |addr| $rs.was_cancelled(addr),
+                    home.as_deref(),
+                );
                 ::anyhow::Result::<()>::Err(
                     $crate::commands::errors::FailedTargets::deferred(failures)
                         .with_incomplete(incomplete)
+                        .with_report(report)
                         .into_error(),
                 )
             } else {
@@ -687,6 +702,9 @@ pub struct FailedTargets {
     incomplete: Option<crate::engine::discovery::GapReport>,
     /// Already printed at the failure site; `render_anyhow` must not print twice.
     rendered: bool,
+    /// The interactive report, gathered where the failures were collected:
+    /// when set, it is printed instead of the boxes.
+    report: Option<ReportContext>,
 }
 
 impl FailedTargets {
@@ -696,7 +714,15 @@ impl FailedTargets {
             failures,
             incomplete: None,
             rendered: false,
+            report: None,
         }
+    }
+
+    /// Print `report` (one block per root) instead of the boxes: what an
+    /// interactive run shows once its TUI is gone.
+    pub fn with_report(mut self, report: ReportContext) -> Self {
+        self.report = Some(report);
+        self
     }
 
     /// Attach the walk's skips to a [`deferred`](Self::deferred) set.
@@ -711,7 +737,10 @@ impl FailedTargets {
     /// Everything this error prints: the boxes, then any incomplete-selection
     /// block.
     fn render_to_string(&self, color: bool) -> String {
-        let mut out = render_failures_to_string(&self.failures, color);
+        let mut out = match &self.report {
+            Some(report) => report.render(color),
+            None => render_failures_to_string(&self.failures, color),
+        };
         if let Some(report) = &self.incomplete {
             out.push('\n');
             out.push_str(&render_incomplete(report, true, color));
@@ -736,6 +765,7 @@ impl FailedTargets {
             failures,
             incomplete,
             rendered: true,
+            report: None,
         };
         // A failed write to the terminal is not actionable, and the exit code still
         // has to carry the failure out.
@@ -1140,6 +1170,8 @@ mod tests {
     struct FakeRs(
         std::cell::RefCell<Vec<Arc<TargetFailure>>>,
         std::cell::RefCell<Vec<crate::engine::event::BuildEventKind>>,
+        /// The addrs whose failure was a stop.
+        Vec<&'static str>,
     );
 
     impl FakeRs {
@@ -1147,6 +1179,7 @@ mod tests {
             Self(
                 std::cell::RefCell::new(failures),
                 std::cell::RefCell::new(Vec::new()),
+                Vec::new(),
             )
         }
         fn take_failures(&self) -> Vec<Arc<TargetFailure>> {
@@ -1154,6 +1187,15 @@ mod tests {
         }
         fn emit(&self, kind: crate::engine::event::BuildEventKind) {
             self.1.borrow_mut().push(kind);
+        }
+        fn took_down(&self, _root: &str) -> crate::engine::request_state::TookDown {
+            crate::engine::request_state::TookDown::default()
+        }
+        fn was_cancelled(&self, addr: &str) -> bool {
+            self.2.contains(&addr)
+        }
+        fn heph_home(&self) -> Option<std::path::PathBuf> {
+            None
         }
     }
 
@@ -1238,6 +1280,29 @@ mod tests {
         );
     }
 
+    /// I8: after a Ctrl-C stop with two root failures seen, the interactive
+    /// report prints and lists both; a target the stop ended is no block.
+    #[tokio::test]
+    async fn report_after_ctrl_c_lists_every_root() -> anyhow::Result<()> {
+        let ctx = FakeCtx::new(true);
+        let mut failures = two_failures();
+        failures.push(Arc::new(TargetFailure::new(
+            crate::htaddr::parse_addr("//simple_fail:stopped")?,
+            None,
+            anyhow::anyhow!("cancelled"),
+        )));
+        let mut rs = FakeRs::new(failures);
+        rs.2.push("//simple_fail:stopped");
+        let res: anyhow::Result<()> = Err(anyhow::Error::new(CancelledError));
+        let e = finalize!(ctx, rs, res).unwrap_err();
+        let out = render_anyhow_to_string(&e, false).expect("claimed");
+        assert!(out.contains("\n✗ //simple_fail:d1\n  │ boom a\n"), "{out}");
+        assert!(out.contains("\n✗ //simple_fail:d2\n  │ boom b\n"), "{out}");
+        assert!(!out.contains("//simple_fail:stopped"), "{out}");
+        assert!(out.contains("1 stopped by ctrl-c"), "{out}");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn points_at_failures_only_when_one_is_registered() -> anyhow::Result<()> {
         let ctx = FakeCtx::new(true);
@@ -1246,9 +1311,11 @@ mod tests {
         let res: anyhow::Result<u8> = Ok(1);
         let e = finalize!(ctx, rs, res, gaps = &gaps).unwrap_err();
         let out = render_anyhow_to_string(&e, false).expect("claimed");
-        let boxes = out.find("× target failed").expect("boxes first");
+        // Interactive: the report's blocks, not the boxes.
+        let boxes = out.find("\n✗ ").expect("report blocks first");
         let block = out.find("! selection incomplete").expect("then the block");
         assert!(boxes < block, "{out}");
+        assert!(!out.contains("× target failed"), "{out}");
         assert!(
             out.contains("Target failures above may be the cause."),
             "{out}"
