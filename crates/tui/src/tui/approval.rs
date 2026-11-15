@@ -153,21 +153,22 @@ pub struct ApprovalDecision {
 
 impl ApprovalDecision {
     /// The scrollback line recording this decision, e.g.
-    /// `✓ approved //x · by Y at 2m16s · notices not read`.
+    /// `✓ approved //x · by standing approval (Y) after 2m16s · notices not
+    /// read`. The duration is how long the prompt waited for the decision.
     pub fn line(&self) -> String {
         let (mark, verb) = if self.approved {
             ("✓", "approved")
         } else {
             ("✗", "rejected")
         };
-        let key = match (self.by, self.approved) {
-            (DecidedBy::Key, true) => "y",
-            (DecidedBy::Key, false) => "n",
-            (DecidedBy::Standing, true) => "Y",
-            (DecidedBy::Standing, false) => "N",
+        let by = match (self.by, self.approved) {
+            (DecidedBy::Key, true) => "key (y)",
+            (DecidedBy::Key, false) => "key (n)",
+            (DecidedBy::Standing, true) => "standing approval (Y)",
+            (DecidedBy::Standing, false) => "standing rejection (N)",
         };
         let mut line = format!(
-            "{mark} {verb} {} · by {key} at {}",
+            "{mark} {verb} {} · by {by} after {}",
             self.addr,
             hcore::units::human_duration(self.at)
         );
@@ -452,7 +453,7 @@ mod tests {
         assert!(!center.is_active());
         assert!(t.rx.await.expect("decision"));
         assert!(
-            d.line().starts_with("✓ approved //a:b · by y at "),
+            d.line().starts_with("✓ approved //a:b · by key (y) after "),
             "{}",
             d.line()
         );
@@ -551,7 +552,9 @@ mod tests {
         assert_eq!(t1.rx.try_recv(), Ok(true));
         assert_eq!(t2.rx.try_recv(), Ok(true));
         assert!(
-            decided[0].line().starts_with("✓ approved //a:1 · by Y at ")
+            decided[0]
+                .line()
+                .starts_with("✓ approved //a:1 · by standing approval (Y) after ")
                 && decided[0].line().ends_with(" · notices not read"),
             "{}",
             decided[0].line()
@@ -575,7 +578,9 @@ mod tests {
         assert!(
             rejected[0]
                 .line()
-                .starts_with("✗ rejected //b:1 · by N at ")
+                .starts_with("✗ rejected //b:1 · by standing rejection (N) after "),
+            "{}",
+            rejected[0].line()
         );
         assert_eq!(foreign.rx.try_recv(), Ok(false));
         let mut later = center.request(&other, "//b:2".into(), vec![]);
