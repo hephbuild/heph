@@ -102,6 +102,9 @@ pub struct LogOptions {
     /// Fetch a remote hit's log into the local entry. Only a reader that
     /// shows a log asks for it; a list's last-line column never does.
     pub fetch_remote: bool,
+    /// Only the log of the run at this input hash (`heph log --current`):
+    /// every source at another hash is passed over, however new.
+    pub hashin: Option<String>,
 }
 
 /// One log, opened: a snapshot of its length at open.
@@ -260,9 +263,11 @@ impl Engine {
         opts: &LogOptions,
     ) -> anyhow::Result<Option<OpenLog>> {
         let engine = Arc::clone(self);
-        let (a, locator) = (addr.clone(), opts.locator.clone());
-        let latest =
-            hcore::blocking::run(move || engine.latest_log(&a, locator.as_deref())).await?;
+        let (a, locator, hashin) = (addr.clone(), opts.locator.clone(), opts.hashin.clone());
+        let latest = hcore::blocking::run(move || {
+            engine.latest_log(&a, locator.as_deref(), hashin.as_deref())
+        })
+        .await?;
         match latest {
             Latest::None => Ok(None),
             Latest::Unsupported(session) => Err(NoLiveLogs { session }.into()),
@@ -301,9 +306,11 @@ impl Engine {
         wait_for_start: bool,
     ) -> anyhow::Result<Option<LogFollower>> {
         let engine = Arc::clone(self);
-        let (a, locator) = (addr.clone(), opts.locator.clone());
-        let latest =
-            hcore::blocking::run(move || engine.latest_log(&a, locator.as_deref())).await?;
+        let (a, locator, hashin) = (addr.clone(), opts.locator.clone(), opts.hashin.clone());
+        let latest = hcore::blocking::run(move || {
+            engine.latest_log(&a, locator.as_deref(), hashin.as_deref())
+        })
+        .await?;
         let state = match latest {
             Latest::Running(run) => Follow::Live(run),
             Latest::Unsupported(session) => return Err(NoLiveLogs { session }.into()),
@@ -320,20 +327,28 @@ impl Engine {
             engine: Arc::clone(self),
             addr: addr.clone(),
             locator: opts.locator.clone(),
+            hashin: opts.hashin.clone(),
             state,
             offset: 0,
             checked: None,
         }))
     }
 
-    /// The newest of `addr`'s logs. Blocking: reads the slot's manifest and
-    /// the cache entries' manifests, and asks the locator.
+    /// The newest of `addr`'s logs, or of its logs at `hashin` when given.
+    /// Blocking: reads the slot's manifest and the cache entries' manifests,
+    /// and asks the locator.
     fn latest_log(
         &self,
         addr: &Addr,
         locator: Option<&dyn LiveRunLogLocator>,
+        hashin: Option<&str>,
     ) -> anyhow::Result<Latest> {
-        let own = self.run_logs.live().get(addr);
+        let wanted = |h: &str| hashin.is_none_or(|w| w == h);
+        let own = self
+            .run_logs
+            .live()
+            .get(addr)
+            .filter(|run| wanted(&run.hashin));
         let mut retained = None;
         if let Some(run) = own {
             if run.log.upgrade().is_some_and(|log| !log.ended()) {
@@ -362,9 +377,10 @@ impl Engine {
                     at_unix_ms,
                     session,
                     file,
-                }) if !retained
-                    .as_ref()
-                    .is_some_and(|(r, _)| r.path == self.home.join(&record.file)) =>
+                }) if wanted(&record.hashin)
+                    && !retained
+                        .as_ref()
+                        .is_some_and(|(r, _)| r.path == self.home.join(&record.file)) =>
                 {
                     return Ok(Latest::Running(Running {
                         file,
@@ -390,10 +406,10 @@ impl Engine {
                 newest = Some(s);
             }
         };
-        if let Some(slot) = self.failure_slots.read(addr) {
+        if let Some(slot) = self.failure_slots.read(addr).filter(|m| wanted(&m.hashin)) {
             consider(Stored::Slot(slot));
         }
-        if let Some(entry) = self.newest_cached_log(addr, None)? {
+        if let Some(entry) = self.newest_cached_log(addr, hashin)? {
             consider(entry);
         }
         Ok(match (newest, unsupported) {
@@ -694,6 +710,8 @@ pub struct LogFollower {
     engine: Arc<Engine>,
     addr: Addr,
     locator: Option<Arc<dyn LiveRunLogLocator>>,
+    /// [`LogOptions::hashin`]: the only run a wait accepts.
+    hashin: Option<String>,
     state: Follow,
     /// Bytes returned so far from the current run's log.
     offset: u64,
@@ -738,9 +756,11 @@ impl LogFollower {
                     if !self.due() {
                         return Ok(FollowStep::Idle);
                     }
-                    let latest = self
-                        .engine
-                        .latest_log(&self.addr, self.locator.as_deref())?;
+                    let latest = self.engine.latest_log(
+                        &self.addr,
+                        self.locator.as_deref(),
+                        self.hashin.as_deref(),
+                    )?;
                     self.state = match latest {
                         Latest::Running(run) => Follow::Live(run),
                         Latest::Stored(s) if baseline.is_none_or(|b| s.at_unix_ms() > b) => {

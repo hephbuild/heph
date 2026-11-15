@@ -36,6 +36,24 @@ impl Engine {
         Ok(res)
     }
 
+    /// How many distinct targets [`meta`](Self::meta) needs the results of
+    /// before it can hash `addr`: what it builds, or finds cached. The
+    /// expansion is memoized in `rs`, so a `meta` on the same state that
+    /// follows does not expand the inputs again.
+    pub async fn hash_dep_count(
+        self: Arc<Self>,
+        rs: Arc<RequestState>,
+        addr: &Addr,
+    ) -> anyhow::Result<usize> {
+        let inputs = self.expanded_inputs_for(rs, addr).await?;
+        Ok(inputs
+            .iter()
+            .filter(|input| input.hashed)
+            .map(|input| &input.r#ref.r#ref)
+            .collect::<std::collections::HashSet<_>>()
+            .len())
+    }
+
     #[async_recursion]
     async fn inner_meta(
         self: Arc<Self>,

@@ -46,6 +46,7 @@ mod inspect_failure;
 mod label_select;
 mod listed_facts;
 mod log_api;
+mod log_cmd;
 mod oci;
 mod oci_docker;
 mod oci_image;

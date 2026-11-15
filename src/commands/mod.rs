@@ -7,6 +7,7 @@ pub mod errors;
 pub mod gendocs;
 mod global;
 pub mod inspect;
+pub mod log;
 mod progress_app;
 pub mod query;
 pub mod run;
@@ -83,6 +84,26 @@ pub enum Commands {
     /// `heph query -e '//cmd/... && !label(slow)'` — select via a query
     #[command(visible_alias = "q")]
     Query(query::Args),
+    /// Print a target's log
+    ///
+    /// The log bytes go to stdout, and one status line saying when the run was
+    /// and where the log is from goes to stderr, so a pipe sees only the log.
+    /// By default it shows the latest log heph holds for the address, from the
+    /// run going on, the failure slot or the cache, without building anything.
+    /// Exits 0 when it printed a log, whatever the target's outcome, and 1
+    /// when there is none or the command failed.
+    ///
+    /// Examples:
+    ///
+    /// `heph log //cmd/server:bin` — the latest log
+    ///
+    /// `heph log -f //cmd/server:bin` — follow its run until it ends
+    ///
+    /// `heph log -n 20 //cmd/server:bin` — the last 20 lines
+    ///
+    /// `heph log --current //cmd/server:bin` — the log of the run matching its
+    /// current inputs
+    Log(log::Args),
     /// Validate all targets (link graph + check codegen outputs)
     #[command(visible_alias = "v")]
     Validate(validate::ValidateArgs),
@@ -145,6 +166,7 @@ impl Commands {
             Commands::Run(args) => run::execute(args, sink, session, global),
             Commands::Inspect(args) => args.execute(sink, session, global),
             Commands::Query(args) => query::execute(args, sink, session, global),
+            Commands::Log(args) => log::execute(args, session, global),
             Commands::Validate(args) => validate::execute(args, sink, session, global),
             Commands::Version(args) => version::execute(args),
             Commands::Auth(args) => args.execute(sink, session, global),

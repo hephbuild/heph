@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// The `bash`-only engine over `root`, announcing its live logs to `slot`.
-fn engine(root: &Path, slot: Option<&Arc<SessionSlot>>) -> anyhow::Result<Arc<Engine>> {
+pub(crate) fn engine(root: &Path, slot: Option<&Arc<SessionSlot>>) -> anyhow::Result<Arc<Engine>> {
     let mut e = Engine::new(heph::engine::Config::for_tests(root.to_path_buf()))?;
     if let Some(slot) = slot {
         e.set_run_log_announcer(Arc::clone(slot) as _);
@@ -44,14 +44,14 @@ fn engine(root: &Path, slot: Option<&Arc<SessionSlot>>) -> anyhow::Result<Arc<En
     Ok(Arc::new(e))
 }
 
-fn write_build(root: &Path, body: &str) -> anyhow::Result<()> {
+pub(crate) fn write_build(root: &Path, body: &str) -> anyhow::Result<()> {
     std::fs::create_dir_all(root.join("p"))?;
     std::fs::write(root.join("p").join("BUILD"), body)?;
     Ok(())
 }
 
 /// Build `addr`, dropping its result (it holds a read lock).
-async fn build(engine: &Arc<Engine>, addr: &str) -> anyhow::Result<()> {
+pub(crate) async fn build(engine: &Arc<Engine>, addr: &str) -> anyhow::Result<()> {
     let rs = engine.new_state();
     let res = Arc::clone(engine)
         .result_addr(
@@ -405,7 +405,7 @@ async fn follow_survives_live_file_unlink() -> anyhow::Result<()> {
         let other = engine(ws.path(), None)?;
         let located = LogOptions {
             locator: Some(Arc::new(SessionRunLogLocator::new(sessions.clone()))),
-            fetch_remote: false,
+            ..LogOptions::default()
         };
         let mut f = other
             .follow_log(&parse_addr(&addr)?, &located, false)
@@ -523,7 +523,7 @@ async fn log_follow_across_engines() -> anyhow::Result<()> {
     open_session(&slot_b, &b, ws.path());
     let located = LogOptions {
         locator: Some(Arc::new(SessionRunLogLocator::new(sessions.clone()))),
-        fetch_remote: false,
+        ..LogOptions::default()
     };
 
     // B follows A's run, which B's engine knows nothing of, to its end.
@@ -679,8 +679,8 @@ async fn log_remote_fetch_on_demand() -> anyhow::Result<()> {
     };
     let no_fetch = LogOptions::default();
     let fetch = LogOptions {
-        locator: None,
         fetch_remote: true,
+        ..LogOptions::default()
     };
     let err = open(&warm, "//p:t", &no_fetch)
         .await
