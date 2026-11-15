@@ -30,6 +30,11 @@ pub use spotlight::{HOLD_MS, Spot};
 /// help row.
 pub const MIN_PROGRESS_ROWS: u16 = 4;
 
+/// The dashboard's key hints once the build has ended and the dashboard
+/// holds it on screen: nothing is left to stop, and `q` leaves.
+const FINISHED_DASHBOARD_HINTS: &str =
+    "↑/↓ select · enter details · l log · tab/⇧tab list · / filter · a all targets · q or esc leave";
+
 /// Pinned viewport rows for a given terminal height: one third of the terminal,
 /// clamped up to [`MIN_PROGRESS_ROWS`]. The box grows the body (slow/lock rows)
 /// to fill whatever rows it is given.
@@ -2395,36 +2400,20 @@ pub struct TuiProgressView {
     state: BuildState,
     /// Per-command header content (build counts vs gc sweep stats).
     model: Box<dyn ProgressHeader>,
-    /// Body scroll offset (rows from the top of the combined body list). Held in
-    /// a `Cell` so `render` can clamp it against the live row count while staying
-    /// `&self`; `scroll()` mutates it from key events.
-    scroll: Cell<usize>,
-    /// Body horizontal pan offset in columns, for lines wider than the viewport.
-    /// Clamped in `render` against the widest body line; `hscroll()` mutates it.
-    hscroll: Cell<usize>,
-    /// The active body view. `Tab` cycles it through [`ViewMode::Default`] plus
-    /// every tab the header model exposes.
-    view: Cell<ViewMode>,
-    /// Which target set the header counters cover. `a` toggles matched ⇄ all.
-    /// Held in a `Cell` so `render`/`header_item_spans` read it through `&self`.
-    scope: Cell<CountScope>,
     /// Server-wall timestamp captured when the run finished and the viewport was
-    /// held open (user navigated off the main view). `Some` drives the green
-    /// "press q to quit" notice and freezes the elapsed clock at this instant.
+    /// held open (the dashboard was up). `Some` freezes the elapsed clock at
+    /// this instant.
     finished_at_ms: Option<u64>,
-    /// Whether the `/` filter is capturing keystrokes. While `true` printable keys
-    /// edit [`Self::search_query`] instead of triggering the normal shortcuts.
-    /// Only meaningful on the `Done`/`Failed` tabs.
-    search_active: Cell<bool>,
-    /// The active filter for the `Done`/`Failed` bodies: a case-insensitive
-    /// substring matched against the target addr. Empty means no filtering.
-    /// Persists after `Enter` confirms so the filtered list stays scrollable.
-    search_query: RefCell<String>,
-    /// Whether the view is the line (one row, plus the approval prompt while
-    /// one is pending) rather than the box. A run starts on the line; `Tab`
-    /// opens the box, and `Esc` on the box's main view returns to the line.
-    /// A `Cell` so a test can open the box through `&self`.
-    line_mode: Cell<bool>,
+    /// Whether the dashboard is up (full screen, on the alternate screen)
+    /// rather than the line. A run starts on the line; `Tab` opens the
+    /// dashboard and `Esc` with no filter closes it.
+    dashboard_open: bool,
+    /// The dashboard list's tab, selection, scroll, filter and scope. Kept
+    /// while the dashboard is closed, so `Tab` reopens it where it was.
+    list: crate::tui::dashboard::ListState,
+    /// The LAST LINE column's text per visible row. Nothing fills it yet:
+    /// the reader over the targets' logs comes with the target screen.
+    last_lines: crate::tui::dashboard::LastLines,
     /// Whose view this is: the run's own, or a session viewer's. The one seam
     /// between the two; everything not behind it renders identically.
     role: Role,
@@ -2541,14 +2530,10 @@ impl TuiProgressView {
         Self {
             state: BuildState::new(),
             model,
-            scroll: Cell::new(0),
-            hscroll: Cell::new(0),
-            view: Cell::new(ViewMode::Default),
-            scope: Cell::new(CountScope::Matched),
             finished_at_ms: None,
-            search_active: Cell::new(false),
-            search_query: RefCell::new(String::new()),
-            line_mode: Cell::new(true),
+            dashboard_open: false,
+            list: crate::tui::dashboard::ListState::default(),
+            last_lines: crate::tui::dashboard::LastLines::default(),
             role: Role::Live { approval: None },
         }
     }
@@ -2616,7 +2601,7 @@ impl TuiProgressView {
     /// teardown. Split out from [`TUIAppView::last_render`], which writes it
     /// straight to stderr and so cannot be asserted on.
     fn final_summary_segment(&self) -> String {
-        self.model.last_render(&self.state, self.scope.get())
+        self.model.last_render(&self.state, self.list.scope)
     }
 
     /// The final summary line [`TUIAppView::last_render`] prints, `None` when
@@ -2640,34 +2625,82 @@ impl TuiProgressView {
         Some(format!("{mark} {} · {segment}", elapsed.trim_start()))
     }
 
-    /// Open the box, as `Tab` from the line does, for a test that compares
-    /// box frames.
+    /// Open the dashboard, as `Tab` from the line does.
     #[cfg(test)]
-    pub(crate) fn open_box(&self) {
-        self.line_mode.set(false);
+    pub(crate) fn open_dashboard(&mut self) {
+        self.tab(true);
     }
 
-    /// [`TUIAppView::render`] of the box.
-    #[cfg(test)]
-    fn render_box(
-        &self,
-        spinner: &str,
-        now_ms: u64,
-        width: u16,
-        height: u16,
-    ) -> Vec<Line<'static>> {
-        self.open_box();
-        self.render(spinner, now_ms, width, height)
+    /// The dashboard's title row: the command, the clock and how far along
+    /// the run is, in the line's own figures.
+    fn dashboard_title_parts(&self, now_ms: u64) -> (String, Option<String>, String) {
+        let clock_at = self.finished_at_ms.unwrap_or(now_ms);
+        let clock = hcore::units::human_duration(std::time::Duration::from_millis(
+            self.state.elapsed_ms(clock_at),
+        ));
+        let session = match &self.role {
+            Role::Attached { id, .. } => Some(id.to_string()),
+            Role::Live { .. } => None,
+        };
+        (self.label(), session, clock)
     }
 
-    /// The box's main view, with the per-tab state a `Tab` switch resets:
-    /// scroll, pan, and any filter scoped to the tab being left.
-    fn back_to_box_main(&self) {
-        self.view.set(ViewMode::Default);
-        self.scroll.set(0);
-        self.hscroll.set(0);
-        self.search_active.set(false);
-        self.search_query.borrow_mut().clear();
+    /// One dashboard frame, `cols` × `rows`: the pending approval's banner
+    /// (and its notices, when expanded) on top while one is pending, then
+    /// [`crate::tui::dashboard::dashboard_frame`] in the rows left.
+    fn dashboard_lines(&mut self, now_ms: u64, cols: u16, rows: u16) -> Vec<Line<'static>> {
+        use crate::tui::dashboard::{DASHBOARD_HINTS, ListInputs, Title, dashboard_frame};
+        let mut out = self.approval_lines();
+        // The banner never takes more than half the screen: the list is what
+        // the dashboard is for.
+        out.truncate(usize::from(rows / 2));
+        let left = rows.saturating_sub(u16::try_from(out.len()).unwrap_or(rows));
+        let (command, session, clock) = self.dashboard_title_parts(now_ms);
+        let scope = self.list.scope;
+        let tabs = self.state.dash.counts(scope);
+        let title = Title {
+            command: &command,
+            session: session.as_deref(),
+            clock: &clock,
+            done: tabs.finished_ok(),
+            total: (scope == CountScope::All || self.state.dash.matched_seen())
+                .then(|| tabs.all()),
+            provisional: scope == CountScope::Matched && !self.state.dash.matched_complete(),
+            standing: self.approval_standing().map(|s| s.indicator()),
+        };
+        // The filter, while one is typed or kept, replaces the key hints.
+        let filter = self.list.filter();
+        let hints: std::borrow::Cow<'_, str> = if self.list.is_editing() {
+            format!("/{filter}▏  enter keep · esc clear").into()
+        } else if !filter.is_empty() {
+            format!("filter: {filter} · / edit · esc clear").into()
+        } else {
+            let keys = if self.finished_at_ms.is_some() {
+                FINISHED_DASHBOARD_HINTS
+            } else {
+                DASHBOARD_HINTS
+            };
+            match &self.role {
+                // A viewer leaves with `q`, and stops nothing.
+                Role::Attached { .. } => format!("{} · q detach", keys.trim_end_matches(" · ctrl-c stop")).into(),
+                Role::Live { .. } => keys.into(),
+            }
+        };
+        let inputs = ListInputs {
+            model: &self.state.dash,
+            waits: &self.state,
+            lines: &self.last_lines,
+            now_ms,
+        };
+        out.extend(dashboard_frame(
+            &title,
+            &inputs,
+            &mut self.list,
+            &hints,
+            cols,
+            left,
+        ));
+        out
     }
 
     /// The spotlight's rule 1: the pending approval on show, with how many
@@ -2716,7 +2749,7 @@ impl TuiProgressView {
             None => line::Status::Running(spinner),
         };
         let dashboard = self.model.has_dashboard();
-        let scope = self.scope.get();
+        let scope = self.list.scope;
         let body = if dashboard {
             // The same `TabCounts` the dashboard's tabs read, so the line
             // and the tabs cannot disagree.
@@ -2817,108 +2850,13 @@ impl TuiProgressView {
         lines
     }
 
-    /// The selectable body views in cycle order: [`ViewMode::Default`] first,
-    /// then one entry per [`HeaderItem::Tab`] the header model exposes, in header
-    /// order. `Tab` walks this list.
-    fn view_modes(&self) -> Vec<ViewMode> {
-        let mut modes = vec![ViewMode::Default];
-        for item in self.model.header(&self.state, self.scope.get()) {
-            match item {
-                HeaderItem::Tab { mode, .. } => modes.push(mode),
-                // A split segment contributes each of its tab-bound parts, in
-                // order — so `X / Y done` yields Done then Matched.
-                HeaderItem::Split(parts) => {
-                    modes.extend(parts.into_iter().filter_map(|p| p.mode));
-                }
-                HeaderItem::Text(_) => {}
-            }
-        }
-        modes
-    }
-
-    /// The help row pinned under the box. While held open after the run finishes
-    /// it turns into a green "press q to quit" notice; otherwise it lists the keys
-    /// the viewport responds to.
-    fn help_line(&self) -> Line<'static> {
-        // While typing a filter the help row becomes the search prompt with a
-        // block cursor; Enter keeps it, Esc clears it.
-        if self.search_active.get() {
-            let query = self.search_query.borrow();
-            return Line::from(vec![
-                Span::styled(format!("  /{query}▏"), Style::default().fg(Color::Yellow)),
-                Span::styled(
-                    "  enter keep · esc clear",
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::DIM),
-                ),
-            ]);
-        }
-        // A confirmed (but still applied) filter: show it with the clear hint.
-        {
-            let query = self.search_query.borrow();
-            if !query.is_empty() {
-                return Line::from(vec![
-                    Span::styled(
-                        format!("  filter: {query}"),
-                        Style::default().fg(Color::Yellow),
-                    ),
-                    Span::styled(
-                        "  ↑/↓ scroll · / edit · esc clear",
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::DIM),
-                    ),
-                ]);
-            }
-        }
-        if self.finished_at_ms.is_some() {
-            // Off the main view `q`/esc step back to it (which then auto-exits);
-            // on the main view they quit. Reflect that in the notice.
-            let notice = if self.view.get() == ViewMode::Default {
-                "  ✓ finished — press q or Ctrl-C to quit"
-            } else {
-                "  ✓ finished — esc/q back to main · Ctrl-C to quit"
-            };
-            return Line::from(Span::styled(
-                notice,
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        }
-        // The `a` hint reads as the *action*: it names the scope you switch to.
-        let scope_key = match self.scope.get() {
-            CountScope::Matched => "a all",
-            CountScope::All => "a matched",
-        };
-        // `/` filters and `esc` steps back — both only apply off the live view.
-        let (search_hint, back_hint) = if self.view.get() == ViewMode::Default {
-            ("", "")
-        } else {
-            (" · / search", " · esc back")
-        };
-        // A viewer names the session it shows and how to leave it.
-        let attach_hint = match &self.role {
-            Role::Attached { id, .. } => format!(" · session {id} · q detach"),
-            Role::Live { .. } => String::new(),
-        };
-        Line::from(Span::styled(
-            format!(
-                "  ↑/↓ scroll · ←/→ pan · tab/⇧tab switch view · {scope_key}{search_hint}{back_hint}{attach_hint}"
-            ),
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::DIM),
-        ))
-    }
-
     /// Render the header model's items into a flat span run: items joined by
     /// ` · `, with the [`HeaderItem::Tab`] matching the active view highlighted
     /// (reversed background). This is the one place the ` · ` separator lives.
     fn header_item_spans(&self) -> Vec<Span<'static>> {
-        let active = self.view.get();
-        let items = self.model.header(&self.state, self.scope.get());
+        // A printed frame has no tab on show.
+        let active = ViewMode::Default;
+        let items = self.model.header(&self.state, self.list.scope);
         let mut spans: Vec<Span<'static>> = Vec::with_capacity(items.len() * 2);
         for (i, item) in items.iter().enumerate() {
             if i > 0 {
@@ -3078,90 +3016,59 @@ impl TUIAppView for TuiProgressView {
         }
     }
 
-    fn rows(&self, term_height: u16) -> u16 {
-        if !self.line_mode.get() {
-            return rows_for_height(term_height);
-        }
+    fn rows(&self, _term_height: u16) -> u16 {
         // The line, and the approval prompt above it while one is pending.
+        // The dashboard is drawn on the alternate screen, never here.
         1 + u16::from(self.approval_spot().is_some())
     }
 
-    fn scroll(&mut self, delta: i32) {
-        let cur = self.scroll.get();
-        let mag = delta.unsigned_abs() as usize;
-        let next = if delta >= 0 {
-            cur.saturating_add(mag)
-        } else {
-            cur.saturating_sub(mag)
-        };
-        self.scroll.set(next);
+    fn full_screen(&self) -> bool {
+        self.dashboard_open
     }
 
-    fn hscroll(&mut self, delta: i32) {
-        let cur = self.hscroll.get();
-        let mag = delta.unsigned_abs() as usize;
-        let next = if delta >= 0 {
-            cur.saturating_add(mag)
-        } else {
-            cur.saturating_sub(mag)
-        };
-        self.hscroll.set(next);
+    fn render_full(&mut self, now_ms: u64, cols: u16, rows: u16) -> Vec<Line<'static>> {
+        self.dashboard_lines(now_ms, cols, rows)
+    }
+
+    fn scroll(&mut self, delta: i32) {
+        if self.dashboard_open {
+            let delta = isize::try_from(delta).unwrap_or(0);
+            self.list.select_move(&self.state.dash, delta);
+        }
     }
 
     fn tab(&mut self, forward: bool) {
-        if self.line_mode.get() {
-            // From the line, either direction opens the box on its main view;
-            // a command with no dashboard has nothing to open.
-            if self.model.has_dashboard() {
-                self.line_mode.set(false);
-                self.back_to_box_main();
-            }
-            return;
+        if self.dashboard_open {
+            self.list.cycle_tab(forward);
+        } else if self.model.has_dashboard() {
+            // From the line, either direction opens the dashboard; a command
+            // with no dashboard has nothing to open.
+            self.dashboard_open = true;
         }
-        let modes = self.view_modes();
-        let len = modes.len().max(1);
-        let cur = self.view.get();
-        let idx = modes.iter().position(|&m| m == cur).unwrap_or(0);
-        // Step forward or backward with wrap. `modes` always holds at least
-        // `Default`, so the index is in-bounds; the `.get`/fallback keeps it
-        // panic-free regardless.
-        let step = if forward { 1 } else { len - 1 };
-        let next = modes
-            .get((idx + step) % len)
-            .copied()
-            .unwrap_or(ViewMode::Default);
-        self.view.set(next);
-        // Switching views resets the scroll so the new body starts at the
-        // top-left, and drops any active filter (it was scoped to the old tab).
-        self.scroll.set(0);
-        self.hscroll.set(0);
-        self.search_active.set(false);
-        self.search_query.borrow_mut().clear();
     }
 
     fn toggle_scope(&mut self) {
-        let next = match self.scope.get() {
+        self.list.scope = match self.list.scope {
             CountScope::Matched => CountScope::All,
             CountScope::All => CountScope::Matched,
         };
-        self.scope.set(next);
     }
 
     fn is_on_main_view(&self) -> bool {
-        self.line_mode.get() || self.view.get() == ViewMode::Default
+        !self.dashboard_open
     }
 
     fn has_active_filter(&self) -> bool {
-        self.search_active.get() || !self.search_query.borrow().is_empty()
+        self.list.is_editing() || !self.list.filter().is_empty()
     }
 
     fn back_to_main(&mut self) {
-        // The box's main view goes back to the line; any other tab goes to
-        // the box's main view.
-        if self.view.get() == ViewMode::Default {
-            self.line_mode.set(true);
-        }
-        self.back_to_box_main();
+        self.dashboard_open = false;
+    }
+
+    fn open_selected(&mut self, _log: bool) {
+        // The target screen (Overview · Log · Outputs) is unit 5c's; until
+        // then Enter and `l` on a row do nothing.
     }
 
     // The approval keys act on the run: inert in an attached view, which has
@@ -3185,195 +3092,69 @@ impl TUIAppView for TuiProgressView {
             Vec::new()
         };
         let _decided = center.respond(view.seq, approve, read);
-        // A resolved prompt shrinks the body; reset scroll so the live rows show.
-        self.scroll.set(0);
     }
 
     fn approval_toggle_notice(&mut self) {
-        let Some(center) = self.approval_center() else {
+        if self.approval_center().is_none() {
             return;
-        };
-        // The notice shows in the box: from the line, Enter opens it there.
-        if self.line_mode.get() {
-            self.line_mode.set(false);
-            self.back_to_box_main();
         }
-        center.toggle_expanded();
-        self.scroll.set(0);
+        // The notices show on the dashboard, above the list, until the
+        // approval view (unit 6) has a screen of its own: from the line,
+        // Enter opens it there.
+        if self.model.has_dashboard() {
+            self.dashboard_open = true;
+        }
+        if let Some(center) = self.approval_center() {
+            center.toggle_expanded();
+        }
     }
 
     fn is_searching(&self) -> bool {
-        self.search_active.get()
+        self.list.is_editing()
     }
 
     fn search_start(&mut self) {
-        // Search only filters the list tabs; ignore `/` on the live Default view.
-        if self.view.get() == ViewMode::Default {
-            return;
+        // The filter is the dashboard list's; the line has none.
+        if self.dashboard_open {
+            self.list.filter_start();
         }
-        // Re-entering search keeps any confirmed query so `/` resumes editing.
-        self.search_active.set(true);
-        self.scroll.set(0);
-        self.hscroll.set(0);
     }
 
     fn search_input(&mut self, c: char) {
-        self.search_query.borrow_mut().push(c);
-        // A changed filter reshapes the list; restart from the top.
-        self.scroll.set(0);
+        self.list.filter_input(c);
     }
 
     fn search_backspace(&mut self) {
-        self.search_query.borrow_mut().pop();
-        self.scroll.set(0);
+        self.list.filter_backspace();
     }
 
     fn search_cancel(&mut self) {
-        self.search_active.set(false);
-        self.search_query.borrow_mut().clear();
-        self.scroll.set(0);
-        self.hscroll.set(0);
+        let _had = self.list.escape();
     }
 
     fn search_confirm(&mut self) {
-        // Leave input mode but keep the filter so the list stays scrollable.
-        self.search_active.set(false);
+        // Leave input mode but keep the filter.
+        self.list.filter_confirm();
     }
 
-    /// Layout (top to bottom), a rounded box sized to `height` rows (one third of
-    /// the terminal, see [`rows_for_height`]), with a dim help row pinned beneath:
-    /// ```text
-    /// ╭─ 1m05s · D / N done · N cached · N waiting · N failed ── <workers> ─╮
-    ///   <slow rows + lock waits, scrollable>
-    /// ╰─── <label> ───────────────────────────────────────────────────────╯
-    ///   ↑/↓ scroll
-    /// ```
-    /// The body grows to fill the available rows; when it overflows it scrolls and
-    /// the last visible row collapses the remainder. When nothing is slow the body
-    /// shows a dim, slowly-drifting abstract field instead of blank rows. The
-    /// `spinner` is unused — liveness is conveyed by the worker braille, the
-    /// scrolling label, and the idle art.
-    fn render(&self, spinner: &str, now_ms: u64, width: u16, height: u16) -> Vec<Line<'static>> {
-        if self.line_mode.get() {
-            // The prompt's first row only: its notice links and preview are
-            // the box's.
-            let mut lines: Vec<Line<'static>> = Vec::with_capacity(2);
-            if self.approval_spot().is_some() {
-                lines.extend(self.approval_lines().into_iter().take(1));
-            }
-            lines.push(self.line(spinner, now_ms, width));
-            return lines;
+    /// The line, and above it the first row of the approval prompt while one
+    /// is pending. `height` is the rows [`Self::rows`] asked for.
+    fn render(&self, spinner: &str, now_ms: u64, width: u16, _height: u16) -> Vec<Line<'static>> {
+        // The prompt's first row only: its notice links and preview are the
+        // dashboard's.
+        let mut lines: Vec<Line<'static>> = Vec::with_capacity(2);
+        if self.approval_spot().is_some() {
+            lines.extend(self.approval_lines().into_iter().take(1));
         }
-        let height = usize::from(height.max(MIN_PROGRESS_ROWS));
-        // height = 1 header + body_rows + 1 bottom border + 1 help row.
-        let body_rows = height - 3;
-        let mut lines = Vec::with_capacity(height);
-        lines.push(self.header_line(now_ms, width));
-        let view = self.view.get();
-        // The `/` filter only applies to the list tabs; the Default body ignores it.
-        let query = self.search_query.borrow();
-        let filter: &str = query.as_str();
-        let body = match view {
-            // Pending approval prompts ride at the very top of the live body so a
-            // gated run is impossible to miss; the slow/lock rows follow.
-            ViewMode::Default => {
-                let mut b = self.approval_lines();
-                b.extend(self.state.body_lines(now_ms));
-                Body::Lines(b)
-            }
-            ViewMode::Done => Body::Rows(self.state.done_rows(self.scope.get(), filter)),
-            ViewMode::Matched => Body::Rows(self.state.matched_rows(filter)),
-            ViewMode::Cached => Body::Rows(self.state.cached_rows(self.scope.get(), filter)),
-            // Bounded by what is queued right now, like the live body.
-            ViewMode::Waiting => Body::Lines(self.state.admission_wait_lines(now_ms, filter)),
-            ViewMode::Failed => Body::Rows(self.state.failed_rows(filter)),
-        };
-        let total = body.len();
-        let filtering = !filter.is_empty();
-        if total == 0 {
-            self.scroll.set(0);
-            self.hscroll.set(0);
-            match view {
-                // Default view: the dim drifting idle field.
-                ViewMode::Default => {
-                    lines.extend(art_lines(now_ms, usize::from(width.max(1)), body_rows))
-                }
-                // List tabs with an active filter that matched nothing.
-                _ if filtering => lines.push(Line::from(Span::styled(
-                    format!("  no targets match \"{filter}\""),
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::DIM),
-                ))),
-                // Done view with nothing completed: a single dim placeholder.
-                ViewMode::Done => lines.push(Line::from(Span::styled(
-                    "  no completed targets",
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::DIM),
-                ))),
-                // Matched view before any match streamed: a dim placeholder.
-                ViewMode::Matched => lines.push(Line::from(Span::styled(
-                    "  no matched targets",
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::DIM),
-                ))),
-                // Cached view with nothing cached: a dim placeholder.
-                ViewMode::Cached => lines.push(Line::from(Span::styled(
-                    "  no cached targets",
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::DIM),
-                ))),
-                // Waiting view with nothing held at admission: a dim placeholder.
-                ViewMode::Waiting => lines.push(Line::from(Span::styled(
-                    "  no waiting targets",
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::DIM),
-                ))),
-                // Failed view with nothing failed: a single dim placeholder.
-                ViewMode::Failed => lines.push(Line::from(Span::styled(
-                    "  no failed targets",
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::DIM),
-                ))),
-            }
-        } else {
-            // Clamp the horizontal pan against the widest body line so panning
-            // stops once the longest line's tail reaches the right edge. Measured
-            // over the whole list, not just the window, so the clamp does not
-            // shift as you scroll — which means measuring every row. An unpanned
-            // body clamps to 0 whatever the widest row is, so skip the walk
-            // entirely in that case; it is every frame the user has not panned.
-            let hscroll = match self.hscroll.get() {
-                0 => 0,
-                pan => {
-                    let avail = usize::from(width.max(1));
-                    pan.min(body.max_width().saturating_sub(avail))
-                }
-            };
-            self.hscroll.set(hscroll);
-
-            let (window, scroll) = body.window(body_rows, self.scroll.get());
-            self.scroll.set(scroll);
-            lines.extend(window.into_iter().map(|l| hscroll_line(l, hscroll)));
-        }
-        // Pad the body so the bottom border always pins to the same row.
-        while lines.len() < body_rows + 1 {
-            lines.push(Line::from(""));
-        }
-        lines.push(self.bottom_line(now_ms, width, self.scroll.get(), total, body_rows));
-        lines.push(self.help_line());
+        lines.push(self.line(spinner, now_ms, width));
         lines
     }
 
     fn hold_after_finish(&self) -> bool {
-        // Auto-exit only from the line; if the user is reading the box, keep
-        // it up until they quit.
-        !self.line_mode.get()
+        // Auto-exit only from the line; while the dashboard is up, keep it
+        // until the user leaves (I: closing it under their cursor loses
+        // their place).
+        self.dashboard_open
     }
 
     fn set_finished(&mut self, at_ms: u64) {

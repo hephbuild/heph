@@ -208,9 +208,23 @@ pub trait TUIAppView: Send {
     /// tick. No-op by default for views without a scrollable body.
     fn scroll(&mut self, _delta: i32) {}
 
-    /// Pan the body horizontally by `delta` columns (negative = left, positive =
-    /// right) for content wider than the viewport. No-op by default.
-    fn hscroll(&mut self, _delta: i32) {}
+    /// Whether a full screen (the dashboard) is up rather than the inline
+    /// rows. The backend draws it on the alternate screen with
+    /// [`Self::render_full`] and keeps the inline rows as they were.
+    /// `false` by default: a view with no full screen.
+    fn full_screen(&self) -> bool {
+        false
+    }
+
+    /// One frame of the full screen, exactly `rows` lines of at most `cols`
+    /// columns. Called every render tick while [`Self::full_screen`].
+    fn render_full(&mut self, _now_ms: u64, _cols: u16, _rows: u16) -> Vec<Line<'static>> {
+        Vec::new()
+    }
+
+    /// Enter (`log` false) or `l` (`log` true) on a full screen's selected
+    /// row: open that target's screen. No-op by default.
+    fn open_selected(&mut self, _log: bool) {}
 
     /// Cycle the body view (the `Tab` / `Shift+Tab` keys). `forward` advances to
     /// the next view, otherwise the previous. Called from the backend's key
