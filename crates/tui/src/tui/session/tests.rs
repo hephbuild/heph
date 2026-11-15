@@ -952,32 +952,220 @@ async fn receiver_resolves_the_holder_before_the_fold() {
     holder.finish(Some(0), false);
 }
 
+fn wait_addr(ev: &BuildEvent) -> String {
+    match &ev.kind {
+        BuildEventKind::ResultLockWaitStart { addr, .. } => addr.clone(),
+        other => panic!("only lock waits are sent: {other:?}"),
+    }
+}
+
+/// A holder lookup a test controls: it counts its calls, answers `answer`, and
+/// blocks until [`GatedLookup::open`] when built gated.
+#[derive(Clone)]
+struct GatedLookup {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
+}
+
+impl GatedLookup {
+    fn new(open: bool) -> Self {
+        Self {
+            calls: Arc::default(),
+            gate: Arc::new((Mutex::new(open), std::sync::Condvar::new())),
+        }
+    }
+
+    /// Names resolved through this lookup: `pid` maps to `answer(pid)`.
+    fn names(&self, answer: fn(u32) -> Option<SessionId>) -> HolderNames {
+        let this = self.clone();
+        HolderNames::with_lookup(super::holder::FakeLookup(Arc::new(move |pid| {
+            this.calls.fetch_add(1, Ordering::SeqCst);
+            let (open, cv) = &*this.gate;
+            let mut open = open.lock().unwrap();
+            while !*open {
+                open = cv.wait(open).unwrap();
+            }
+            answer(pid)
+        })))
+    }
+
+    fn open(&self) {
+        let (open, cv) = &*self.gate;
+        *open.lock().unwrap() = true;
+        cv.notify_all();
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+fn some_session(pid: u32) -> Option<SessionId> {
+    Some(SessionId::new(1_700_000_000_000 + u64::from(pid), 0))
+}
+
+/// Wait (bounded) until the detached scan has stored `pid`'s answer.
+async fn until_named(names: &HolderNames, pid: u32) {
+    for _ in 0..500 {
+        if names.get(pid).is_some() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("pid {pid} was never named");
+}
+
 /// A `recv` dropped while its event's holder resolves (a `select!` arm losing)
-/// loses nothing and reorders nothing: the parked event is folded first, by the
-/// teardown drain, exactly once.
+/// loses nothing and reorders nothing: the event is parked, and once its scan
+/// has answered the teardown drain folds it first, named, exactly once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn receiver_keeps_a_parked_event_across_a_dropped_recv() {
     use futures::FutureExt as _;
-    let root = tempfile::tempdir().expect("tempdir");
-    let holder = Session::open(&SessionRoot::new(root.path()), start()).expect("holder");
-    let pid = std::process::id();
-    let names = HolderNames::new(Some(SessionRoot::new(root.path())), None);
+    let lookup = GatedLookup::new(false);
+    let names = lookup.names(some_session);
+    let pid = 4242;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut events = TappedReceiver::new(rx, None, names);
+    let mut events = TappedReceiver::new(rx, None, names.clone());
     tx.send(lock_wait("//a:parked", pid)).expect("send");
     tx.send(lock_wait("//a:next", pid)).expect("send");
 
-    let mut folded: Vec<String> = Vec::new();
-    let addr = |ev: &BuildEvent| match &ev.kind {
-        BuildEventKind::ResultLockWaitStart { addr, .. } => addr.clone(),
-        other => panic!("only lock waits are sent: {other:?}"),
-    };
-    // One poll takes the event and parks it on the scan (or folds it, if the
-    // scan already finished); then the future is dropped.
-    let first = events.recv(|ev| folded.push(addr(ev))).now_or_never();
-    assert!(first.is_none() || folded.len() == 1, "{folded:?}");
+    let mut folded: Vec<(String, Option<SessionId>)> = Vec::new();
+    // One poll takes the event and parks it on the gated scan; then the future
+    // is dropped.
+    let first = events
+        .recv(|ev| folded.push((wait_addr(ev), names.get(pid))))
+        .now_or_never();
+    assert!(first.is_none(), "the event is parked, not folded");
+    assert!(folded.is_empty(), "{folded:?}");
+    lookup.open();
+    until_named(&names, pid).await;
     drop(tx);
-    while events.try_recv(|ev| folded.push(addr(ev))).is_ok() {}
-    assert_eq!(folded, ["//a:parked", "//a:next"]);
-    holder.finish(Some(0), false);
+    while events
+        .try_recv(|ev| folded.push((wait_addr(ev), names.get(pid))))
+        .is_ok()
+    {}
+    assert_eq!(
+        folded,
+        [
+            ("//a:parked".to_owned(), some_session(pid)),
+            ("//a:next".to_owned(), some_session(pid)),
+        ]
+    );
+    assert_eq!(lookup.calls(), 1, "scanned once");
+}
+
+/// A scan that hangs (a hung `~/.heph`) holds the event for the bounded wait
+/// only: it is folded showing the pid, the pid is not rescanned on the next
+/// event, and the answer that comes later still names it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn receiver_folds_after_a_slow_scan_with_the_pid() {
+    let lookup = GatedLookup::new(false);
+    let names = lookup.names(some_session);
+    let pid = 4242;
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut events = TappedReceiver::new(rx, None, names.clone());
+    tx.send(lock_wait("//a:x", pid)).expect("send");
+    tx.send(lock_wait("//a:y", pid)).expect("send");
+
+    let started = std::time::Instant::now();
+    let mut seen = None;
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        events.recv(|_| seen = Some(names.get(pid))),
+    )
+    .await
+    .expect("the wait is bounded")
+    .expect("an event");
+    assert_eq!(seen, Some(None), "folded showing the pid");
+    assert!(
+        started.elapsed() >= super::recorder::HOLDER_SCAN_WAIT,
+        "waited for the scan first: {:?}",
+        started.elapsed()
+    );
+    // The next event with the pid is folded at once: the pid is claimed.
+    let next = std::time::Instant::now();
+    events
+        .recv(|_| seen = Some(names.get(pid)))
+        .await
+        .expect("an event");
+    assert!(next.elapsed() < super::recorder::HOLDER_SCAN_WAIT);
+    assert_eq!(lookup.calls(), 1, "not rescanned");
+    // The detached scan finishes on its own and names the pid from then on.
+    lookup.open();
+    until_named(&names, pid).await;
+    assert_eq!(lookup.calls(), 1);
+}
+
+/// A pid with no session is cached as such: the next event is not rescanned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn receiver_caches_a_negative_answer() {
+    let lookup = GatedLookup::new(true);
+    let names = lookup.names(|_| None);
+    let pid = 4242;
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut events = TappedReceiver::new(rx, None, names.clone());
+    tx.send(lock_wait("//a:x", pid)).expect("send");
+    tx.send(lock_wait("//a:y", pid)).expect("send");
+    for _ in 0..2 {
+        events.recv(|_| {}).await.expect("an event");
+    }
+    assert_eq!(lookup.calls(), 1, "scanned once");
+    assert!(!names.needs(pid), "the none is cached");
+    assert_eq!(names.get(pid), None);
+}
+
+/// Two distinct holder pids in a row: each is scanned once and named on its
+/// own first event.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn receiver_names_two_pids_in_a_row() {
+    let lookup = GatedLookup::new(true);
+    let names = lookup.names(some_session);
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut events = TappedReceiver::new(rx, None, names.clone());
+    for (addr, pid) in [("//a:x", 1), ("//a:y", 2), ("//a:z", 1)] {
+        tx.send(lock_wait(addr, pid)).expect("send");
+    }
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        events
+            .recv(|ev| {
+                let pid = super::holder::event_holder_pid(ev).expect("a lock wait");
+                seen.push(names.get(pid));
+            })
+            .await
+            .expect("an event");
+    }
+    assert_eq!(seen, [some_session(1), some_session(2), some_session(1)]);
+    assert_eq!(lookup.calls(), 2, "each pid scanned once");
+}
+
+/// `recv_record_only` (the line backend after its summary) records a parked
+/// event first, then the rest in order, without waiting on its scan.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn record_only_takes_the_parked_event_first() {
+    use futures::FutureExt as _;
+    let root = tempfile::tempdir().expect("tempdir");
+    let session = Session::open(&SessionRoot::new(root.path()), start()).expect("open");
+    let lookup = GatedLookup::new(false);
+    let names = lookup.names(some_session);
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut events = TappedReceiver::new(rx, Some(session.tap()), names);
+    tx.send(lock_wait("//a:parked", 7)).expect("send");
+    tx.send(lock_wait("//a:next", 7)).expect("send");
+    assert!(events.recv(|_| {}).now_or_never().is_none(), "parked");
+    drop(tx);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while events.recv_record_only().await.is_some() {}
+    })
+    .await
+    .expect("record-only never waits on the scan");
+    session.finish(Some(0), false);
+    lookup.open();
+    let (recs, _) = read_records(session.dir());
+    let addrs: Vec<String> = recs
+        .iter()
+        .filter_map(SessionRecord::build_event)
+        .map(|ev| wait_addr(&ev))
+        .collect();
+    assert_eq!(addrs, ["//a:parked", "//a:next"]);
 }

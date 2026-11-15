@@ -191,12 +191,19 @@ impl SessionTap {
 /// folded it, by move, so what is recorded is exactly what was folded.
 ///
 /// It also resolves lock holders for the view: an event carrying a holder pid
-/// not yet resolved waits, parked here, while [`HolderNames::resolve_blocking`]
-/// scans the sessions directory on the blocking pool, and is folded once the
+/// not yet claimed waits, parked here, while [`HolderNames::resolve_blocking`]
+/// scans the sessions directory on a thread of its own, and is folded once the
 /// answer is in the shared cache. So the view names the session on the very
 /// event that first carries the pid, never does IO itself, and the reactor
-/// never runs the scan. Each pid is scanned at most once (one event is parked
-/// at a time, and the answer is cached).
+/// never runs the scan. Each pid is scanned at most once (it is claimed before
+/// its scan starts, and the answer is cached).
+///
+/// The wait is bounded by [`HOLDER_SCAN_WAIT`]: past it the event is folded
+/// showing the pid, and the scan is left to finish on its own. It runs on a
+/// detached thread rather than the blocking pool, because a runtime's shutdown
+/// waits for its blocking tasks, and a hung `~/.heph` (NFS) would hold up the
+/// exit. The pid stays claimed, so it is not rescanned on every later event;
+/// a late answer still lands in the cache and names the pid from then on.
 #[derive(Debug)]
 pub struct TappedReceiver {
     rx: EventReceiver,
@@ -208,10 +215,42 @@ pub struct TappedReceiver {
     parked: Option<Parked>,
 }
 
+/// How long the receiver holds an event for its holder's scan before folding
+/// it with the pid alone.
+pub(crate) const HOLDER_SCAN_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
+
 #[derive(Debug)]
 struct Parked {
     ev: BuildEvent,
-    resolving: tokio::task::JoinHandle<()>,
+    /// Completes when the scan has stored its answer (or its thread is gone).
+    /// `None` when the thread could not be started.
+    resolving: Option<tokio::sync::oneshot::Receiver<()>>,
+    /// When to stop waiting, fixed at parking so a dropped `recv` does not
+    /// restart the clock.
+    deadline: tokio::time::Instant,
+}
+
+/// Scan for `pid`'s session on a detached thread; the receiver completes once
+/// the answer is cached.
+fn spawn_scan(holders: HolderNames, pid: u32) -> Option<tokio::sync::oneshot::Receiver<()>> {
+    let (done, resolving) = tokio::sync::oneshot::channel();
+    let spawned = std::thread::Builder::new()
+        .name("heph-holder-scan".to_owned())
+        .spawn(move || {
+            holders.resolve_blocking(pid);
+            if done.send(()).is_err() {
+                // The receiver gave up waiting: the answer is in the cache.
+                tracing::trace!(pid, "a lock holder's session scan finished late");
+            }
+        });
+    match spawned {
+        Ok(_detached) => Some(resolving),
+        Err(error) => {
+            // The pid stays claimed and unnamed: the notice shows the pid.
+            tracing::debug!(%error, "naming a lock holder's session");
+            None
+        }
+    }
 }
 
 impl TappedReceiver {
@@ -227,29 +266,35 @@ impl TappedReceiver {
     /// Await the next event, fold it with `apply`, record it. `None` once every
     /// sender is gone. Cancel-safe: an event is either still in the channel,
     /// parked here while its holder resolves, or folded and recorded in the
-    /// poll that takes it out of the parking.
+    /// poll that takes it out of the parking. A parked event waits at most
+    /// [`HOLDER_SCAN_WAIT`] from when it was parked.
     pub async fn recv(&mut self, apply: impl FnOnce(&BuildEvent)) -> Option<()> {
         if self.parked.is_none() {
             let ev = self.rx.recv().await?;
-            match event_holder_pid(&ev).filter(|pid| self.holders.needs(*pid)) {
+            match event_holder_pid(&ev).filter(|pid| self.holders.claim(*pid)) {
                 None => {
                     self.fold(ev, apply);
                     return Some(());
                 }
                 Some(pid) => {
-                    let holders = self.holders.clone();
-                    let resolving = tokio::task::spawn_blocking(move || {
-                        holders.resolve_blocking(pid);
+                    self.parked = Some(Parked {
+                        ev,
+                        resolving: spawn_scan(self.holders.clone(), pid),
+                        deadline: tokio::time::Instant::now() + HOLDER_SCAN_WAIT,
                     });
-                    self.parked = Some(Parked { ev, resolving });
                 }
             }
         }
-        if let Some(parked) = self.parked.as_mut() {
-            // A failed scan (a panic in the pool) leaves the pid unresolved:
-            // the notice falls back to the pid.
-            if let Err(e) = (&mut parked.resolving).await {
-                tracing::debug!(error = %e, "naming a lock holder's session");
+        if let Some(Parked {
+            resolving: Some(resolving),
+            deadline,
+            ..
+        }) = self.parked.as_mut()
+        {
+            // A scan past its wait, or whose thread died, leaves the pid
+            // unnamed: the notice falls back to the pid.
+            if tokio::time::timeout_at(*deadline, resolving).await.is_err() {
+                tracing::debug!("a lock holder's session scan is slow; showing the pid");
             }
         }
         if let Some(parked) = self.parked.take() {

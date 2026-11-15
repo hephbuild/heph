@@ -284,9 +284,14 @@ live session other than its own is recorded for the pid, and `held by pid N`
 otherwise. The events carry only the pid, so the engine stays unaware of
 sessions: the pid is resolved with the same rule as `list`/`show` (a live
 session, not this one, whose `meta.json` names the pid). The backend's event
-receiver does it, once per distinct pid, on the blocking pool, before it folds
+receiver does it, once per distinct pid, on a detached thread, before it folds
 the event that first carries the pid; that event waits for the scan, later
-events queue behind it, and the build itself never waits. The scan reads each
+events queue behind it, and the build itself never waits. The wait is at most
+200ms: past it (a hung `~/.heph` on NFS) the event is folded with the pid, the
+pid is not scanned again, and an answer that comes later still names it from
+then on. The thread is detached rather than on the blocking pool because a
+runtime's shutdown waits for its blocking tasks: a hung scan never holds up the
+exit. The scan reads each
 session's `meta.json` and probes the matching one's lock, never `status.json`.
 The view only reads the cached answer, so neither the fold nor a render does
 IO. The directory comes from `HOME` alone, so a run

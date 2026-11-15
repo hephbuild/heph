@@ -48,14 +48,21 @@ pub(crate) fn event_holder_pid(ev: &BuildEvent) -> Option<u32> {
 /// the view that renders see the same answers. [`resolve_blocking`] scans the
 /// sessions directory the first time a pid is asked about and keeps the answer
 /// — a session or none — for the rest of the run; it does IO, so the backend
-/// calls it on the blocking pool, never on the reactor. [`get`] only reads the
-/// cache, so rendering never does IO. With no root (no `HOME`, or a view that
-/// was never given one) nothing is looked up. An unreadable directory is the
-/// same as no session: the notice falls back to the pid, and the build is
-/// never failed or held up by it.
+/// calls it off the reactor, never on it. [`get`] only reads the cache, so
+/// rendering never does IO. With no root (no `HOME`, or a view that was never
+/// given one) nothing is looked up. An unreadable directory is the same as no
+/// session: the notice falls back to the pid, and the build is never failed or
+/// held up by it.
+///
+/// A pid is [`claim`]ed before its scan starts, and a claimed pid is never
+/// scanned again, even while its scan is still running: a scan that outlives
+/// the receiver's wait (a hung `~/.heph` on NFS) is not restarted on every
+/// later event. Its answer, if it ever comes, still lands in the cache, and
+/// names the pid from then on.
 ///
 /// [`resolve_blocking`]: Self::resolve_blocking
 /// [`get`]: Self::get
+/// [`claim`]: Self::claim
 #[derive(Debug, Clone, Default)]
 pub struct HolderNames {
     inner: Arc<Inner>,
@@ -66,7 +73,32 @@ struct Inner {
     root: Option<SessionRoot>,
     /// This process's own session, never named as a holder.
     own: Option<SessionId>,
-    known: Mutex<HashMap<u32, Option<SessionId>>>,
+    known: Mutex<HashMap<u32, Answer>>,
+    /// A test's stand-in for the directory scan.
+    #[cfg(test)]
+    fake: Option<FakeLookup>,
+}
+
+/// What is known about one pid.
+#[derive(Debug, Clone, Copy)]
+enum Answer {
+    /// Its scan is running (or could not be started): not named, and not
+    /// scanned again.
+    Resolving,
+    /// Its scan finished: the session, or none.
+    Found(Option<SessionId>),
+}
+
+/// A test's stand-in for the directory scan, so a test can make it slow.
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct FakeLookup(pub(crate) Arc<dyn Fn(u32) -> Option<SessionId> + Send + Sync>);
+
+#[cfg(test)]
+impl std::fmt::Debug for FakeLookup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FakeLookup")
+    }
 }
 
 impl HolderNames {
@@ -76,39 +108,94 @@ impl HolderNames {
                 root,
                 own,
                 known: Mutex::new(HashMap::new()),
+                #[cfg(test)]
+                fake: None,
             }),
         }
     }
 
-    /// Whether `pid` still needs a scan: there is a root to look in, and it
-    /// has not been resolved yet. Never does IO.
-    pub fn needs(&self, pid: u32) -> bool {
-        self.inner.root.is_some() && !self.known().contains_key(&pid)
+    /// Names resolved by `lookup` instead of a directory scan.
+    #[cfg(test)]
+    pub(crate) fn with_lookup(lookup: FakeLookup) -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                root: None,
+                own: None,
+                known: Mutex::new(HashMap::new()),
+                fake: Some(lookup),
+            }),
+        }
     }
 
-    /// The session holding for `pid`, scanning the sessions directory if this
-    /// pid has not been resolved yet. Blocking: reads each session's
+    fn can_look(&self) -> bool {
+        #[cfg(test)]
+        if self.inner.fake.is_some() {
+            return true;
+        }
+        self.inner.root.is_some()
+    }
+
+    /// Whether `pid` still needs a scan: there is a root to look in, and it
+    /// has been neither claimed nor resolved. Never does IO.
+    pub fn needs(&self, pid: u32) -> bool {
+        self.can_look() && !self.known().contains_key(&pid)
+    }
+
+    /// Claim `pid`'s scan: true when it [`needs`](Self::needs) one, and from
+    /// then on it no longer does, whether or not the scan ever finishes.
+    /// Never does IO.
+    pub fn claim(&self, pid: u32) -> bool {
+        if !self.can_look() {
+            return false;
+        }
+        let mut known = self.known();
+        if known.contains_key(&pid) {
+            return false;
+        }
+        known.insert(pid, Answer::Resolving);
+        true
+    }
+
+    /// The session holding for `pid`, scanning the sessions directory unless
+    /// this pid has been resolved already. Blocking: reads each session's
     /// `meta.json` and probes the lock of the one whose pid matches, never
     /// `status.json` or `events.ndjson`.
     pub fn resolve_blocking(&self, pid: u32) -> Option<SessionId> {
-        if let Some(known) = self.known().get(&pid) {
-            return *known;
+        if let Some(Answer::Found(found)) = self.known().get(&pid) {
+            return *found;
         }
-        let found = self
-            .inner
+        let found = self.lookup(pid);
+        match *self.known().entry(pid).or_insert(Answer::Resolving) {
+            // Another scan of the pid finished first: keep its answer.
+            Answer::Found(first) => first,
+            ref mut slot @ Answer::Resolving => {
+                *slot = Answer::Found(found);
+                found
+            }
+        }
+    }
+
+    fn lookup(&self, pid: u32) -> Option<SessionId> {
+        #[cfg(test)]
+        if let Some(fake) = &self.inner.fake {
+            return (fake.0)(pid);
+        }
+        self.inner
             .root
             .as_ref()
-            .and_then(|root| scan(root.path(), pid, self.inner.own));
-        *self.known().entry(pid).or_insert(found)
+            .and_then(|root| scan(root.path(), pid, self.inner.own))
     }
 
     /// What [`resolve_blocking`](Self::resolve_blocking) found for `pid`.
     /// Never does IO.
     pub fn get(&self, pid: u32) -> Option<SessionId> {
-        self.known().get(&pid).copied().flatten()
+        match self.known().get(&pid) {
+            Some(Answer::Found(found)) => *found,
+            Some(Answer::Resolving) | None => None,
+        }
     }
 
-    fn known(&self) -> std::sync::MutexGuard<'_, HashMap<u32, Option<SessionId>>> {
+    fn known(&self) -> std::sync::MutexGuard<'_, HashMap<u32, Answer>> {
         self.inner
             .known
             .lock()
