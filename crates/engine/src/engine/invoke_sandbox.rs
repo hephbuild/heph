@@ -59,9 +59,17 @@ pub(crate) const BUILD_SANDBOX_PREFIX: &str = "__target_";
 const OWNER: &str = ".owner";
 /// The lock file's name until it is held.
 const OWNER_PENDING: &str = ".owner-pending";
-/// How many names an exclusive create tries before giving up. Each retry needs
-/// a 128-bit random name to be taken already.
+/// How many taken names an exclusive create skips before giving up. Each one
+/// needs a 128-bit random name to be taken already.
 const CREATE_ATTEMPTS: usize = 8;
+/// How many fresh sandboxes a create may lose to a concurrent sweep before
+/// giving up. Kept apart from [`CREATE_ATTEMPTS`]: losing is an ordinary race
+/// (a sweep that reaches `.owner-pending` between its create and its lock),
+/// not a name collision, and a creator descheduled in that window under load
+/// loses several in a row — 8 shared with collisions was exhausted on a busy
+/// CI runner. The bound only stops a create spinning against a sweep that
+/// never ends.
+const SWEPT_ATTEMPTS: usize = 64;
 
 /// `<home>/sandbox/<pkg>/__invoke/<name>`: the parent of every invocation
 /// sandbox of `addr`. Nested rather than `__invoke_<name>`, so the siblings
@@ -118,11 +126,17 @@ impl InvokeSandbox {
     ) -> anyhow::Result<Self> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create invocation sandbox parent {}", parent.display()))?;
-        for name in names.into_iter().take(CREATE_ATTEMPTS) {
+        let (mut taken, mut swept) = (0, 0);
+        let mut names = names.into_iter();
+        while taken < CREATE_ATTEMPTS && swept < SWEPT_ATTEMPTS {
+            let Some(name) = names.next() else { break };
             let dir = parent.join(&name);
             match std::fs::create_dir(&dir) {
                 Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    taken += 1;
+                    continue;
+                }
                 Err(e) => {
                     return Err(e)
                         .with_context(|| format!("create invocation sandbox {}", dir.display()));
@@ -140,6 +154,7 @@ impl InvokeSandbox {
                         io::ErrorKind::WouldBlock | io::ErrorKind::NotFound
                     ) =>
                 {
+                    swept += 1;
                     continue;
                 }
                 Err(e) => {
@@ -156,8 +171,8 @@ impl InvokeSandbox {
             });
         }
         anyhow::bail!(
-            "could not create a fresh invocation sandbox under {}: {CREATE_ATTEMPTS} names were \
-             all taken",
+            "could not create a fresh invocation sandbox under {}: {taken} names were taken, \
+             {swept} lost to a concurrent sweep",
             parent.display()
         )
     }
