@@ -209,6 +209,100 @@ impl ManagedDriver for Legacy {
     }
 }
 
+/// A workspace whose `legacy` driver is [`Legacy`], beside plain `bash`.
+fn legacy_workspace(outside: &Path) -> anyhow::Result<htestkit::Workspace> {
+    htestkit::WorkspaceBuilder::new()?
+        .with_provider(|init| {
+            Box::new(pluginbuildfile::Provider::new(
+                init.root.to_path_buf(),
+                init.runtime.clone(),
+                Arc::clone(&init.functions),
+            ))
+        })
+        .with_managed_driver(Box::new(pluginexec::Driver::new_bash().with_host_path()))
+        .with_managed_driver(Box::new(Legacy {
+            bash: pluginexec::Driver::new_bash().with_host_path(),
+            outside: outside.join("logs"),
+        }))
+        .build()
+}
+
+/// A follower of an older plugin's run reads what it streamed, and the run
+/// then returns a longer log of its own, which is imported. The follower
+/// sees one log whole, the streamed one or the imported one, never the
+/// streamed bytes continued by the imported log's rest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_follower_of_a_legacy_import_never_sees_a_splice() -> anyhow::Result<()> {
+    use heph::engine::{FollowStep, LogOptions};
+    let outside = tempfile::tempdir()?;
+    let gate = tempfile::tempdir()?;
+    let gate = gate.path().join("gate");
+    let ws = legacy_workspace(outside.path())?;
+    ws.write_build_file(
+        "app",
+        &format!(
+            r#"target(name = "raw_gated", driver = "legacy", out = "o.txt",
+       run = ["echo s", "while [ ! -e {} ]; do sleep 0.02; done", "printf ok > o.txt"])
+"#,
+            gate.display()
+        ),
+    );
+    let addr = parse_addr("//app:raw_gated")?;
+    let mut f = ws
+        .engine
+        .follow_log(&addr, &LogOptions::default(), true)
+        .await?
+        .expect("a follower");
+    let run = tokio::spawn({
+        let engine = Arc::clone(&ws.engine);
+        let addr = addr.clone();
+        async move {
+            let rs = engine.new_state();
+            Arc::clone(&engine)
+                .result_addr(rs, &addr, OutputMatcher::All, &ResultOptions::default())
+                .await
+                .map(drop)
+        }
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut got = Vec::new();
+    let mut gated = false;
+    loop {
+        match f.poll()? {
+            FollowStep::Bytes(b) => got.extend_from_slice(&b),
+            FollowStep::End => break,
+            FollowStep::Idle => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "stalled at {:?}",
+                    String::from_utf8_lossy(&got)
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+        // The streamed bytes are read: let the run end, and its log be
+        // imported under the follower.
+        if !gated && got == b"s\n" {
+            std::fs::write(&gate, "")?;
+            gated = true;
+        }
+    }
+    run.await??;
+    let streamed = "s\n";
+    let imported = format!("{RETURNED}{SECRET}\n");
+    let got = String::from_utf8(got)?;
+    assert!(
+        got == streamed || got == imported,
+        "one log whole, not a splice: {got:?}"
+    );
+    assert_eq!(
+        cached_log(&ws.engine, "//app:raw_gated").await?.as_deref(),
+        Some(imported.as_str()),
+        "the returned log wins in the entry"
+    );
+    Ok(())
+}
+
 /// A failure slot's `log.txt`, when the slot is complete.
 fn slot_log(engine: &Engine, addr: &str) -> Option<String> {
     let addr = parse_addr(addr).expect("addr");
@@ -226,20 +320,7 @@ fn slot_log(engine: &Engine, addr: &str) -> Option<String> {
 #[tokio::test]
 async fn legacy_plugin_log_imported() -> anyhow::Result<()> {
     let outside = tempfile::tempdir()?;
-    let ws = htestkit::WorkspaceBuilder::new()?
-        .with_provider(|init| {
-            Box::new(pluginbuildfile::Provider::new(
-                init.root.to_path_buf(),
-                init.runtime.clone(),
-                Arc::clone(&init.functions),
-            ))
-        })
-        .with_managed_driver(Box::new(pluginexec::Driver::new_bash().with_host_path()))
-        .with_managed_driver(Box::new(Legacy {
-            bash: pluginexec::Driver::new_bash().with_host_path(),
-            outside: outside.path().join("logs"),
-        }))
-        .build()?;
+    let ws = legacy_workspace(outside.path())?;
     ws.write_build_file(
         "auth",
         &format!(
@@ -507,7 +588,7 @@ fn announcing_engine(root: &Path, to: &Arc<Announced>) -> anyhow::Result<Arc<Eng
 
 /// A cold run announces its live log once (addr, hashin, the file relative
 /// to the home); a warm, all-hit build writes no live file, announces no
-/// `RunLog` record and sends no `PoolUsage`.
+/// `RunLog` record and sends no `PoolUsage` and no `ResultOutputs`.
 #[tokio::test]
 async fn warm_build_pays_nothing_for_logs() -> anyhow::Result<()> {
     let ws = tempfile::tempdir()?;
@@ -566,6 +647,16 @@ async fn warm_build_pays_nothing_for_logs() -> anyhow::Result<()> {
         "{:?}",
         pool_usage(&warm_events)
     );
+    // Nor what a hit holds: a viewer reads that on demand. The cold run sent
+    // one, so the silence is not a stream that never carries it.
+    let result_outputs = |events: &[BuildEventKind]| {
+        events
+            .iter()
+            .filter(|e| matches!(e, BuildEventKind::ResultOutputs { .. }))
+            .count()
+    };
+    assert_eq!(result_outputs(&cold_events), 1, "{cold_events:?}");
+    assert_eq!(result_outputs(&warm_events), 0, "{warm_events:?}");
     Ok(())
 }
 
