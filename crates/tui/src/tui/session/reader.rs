@@ -59,7 +59,7 @@ impl<R: Read> RecordReader<R> {
                 self.start = end + 1;
                 self.scanned = self.start;
                 match decoded {
-                    Some(Decoded::Record(r)) => return Ok(Some(r)),
+                    Some(Decoded::Record(r)) => return Ok(Some(*r)),
                     Some(Decoded::Empty) | None => {}
                     Some(Decoded::Bad) => self.skipped += 1,
                 }
@@ -112,7 +112,8 @@ impl<R: Read> RecordReader<R> {
 }
 
 enum Decoded {
-    Record(SessionRecord),
+    /// Boxed: a record is an order of magnitude bigger than the other two.
+    Record(Box<SessionRecord>),
     /// Blank, or a record that carries neither key.
     Empty,
     Bad,
@@ -124,7 +125,7 @@ fn decode_line(line: &[u8]) -> Decoded {
     }
     match serde_json::from_slice::<SessionRecord>(line) {
         Ok(r) if r.kind.is_none() && r.session.is_none() => Decoded::Empty,
-        Ok(r) => Decoded::Record(r),
+        Ok(r) => Decoded::Record(Box::new(r)),
         Err(_) => Decoded::Bad,
     }
 }

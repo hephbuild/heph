@@ -549,6 +549,10 @@ impl Tally {
             // A live gauge's sample; the summary is written once, at the end.
             BuildEventKind::PoolUsage { .. } => {}
 
+            // A target's output groups, for a viewer's Outputs tab; the
+            // summary lists no outputs.
+            BuildEventKind::ResultOutputs { .. } => {}
+
             // An event kind from a host newer than this plugin. Skipping it keeps
             // the rest of the stream flowing; the alternative is a decode failure,
             // which the SDK treats as end-of-stream and would silently truncate
@@ -942,6 +946,7 @@ mod tests {
         t.apply(&ev(
             start,
             BuildEventKind::ExecuteStart {
+                output_groups: Vec::new(),
                 addr: addr.into(),
                 driver: "exec".into(),
                 cache: false,
@@ -1050,6 +1055,7 @@ mod tests {
         t.apply(&ev(
             2,
             BuildEventKind::ExecuteStart {
+                output_groups: Vec::new(),
                 addr: "//a:x".into(),
                 driver: "exec".into(),
                 cache: true,
@@ -1180,6 +1186,7 @@ mod tests {
             t.apply(&ev(
                 i,
                 BuildEventKind::ExecuteStart {
+                    output_groups: Vec::new(),
                     addr: format!("//a:t{i}"),
                     driver: "exec".into(),
                     cache: false,

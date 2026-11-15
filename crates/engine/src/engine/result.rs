@@ -1451,6 +1451,53 @@ fn build_eresult(
     }
 }
 
+/// One artifact as `ResultOutputs` counts it.
+struct OutputRow<'a> {
+    group: &'a str,
+    r#type: &'a ManifestArtifactType,
+    size: Option<u64>,
+    hash: Option<String>,
+}
+
+fn result_artifact_output(a: &ResultArtifact) -> OutputRow<'_> {
+    OutputRow {
+        group: &a.group,
+        r#type: &a.r#type,
+        size: a.content.byte_size(),
+        // Stored on every artifact that reaches here (a cache artifact's
+        // manifest entry, a passthrough's expected hash): no read.
+        hash: a.content.hashout().ok(),
+    }
+}
+
+/// `ResultOutputs`' groups: the `Output` artifacts by group, in name order.
+/// A group of one artifact carries its hash; sizes add up, unknown if any is.
+fn summarize_outputs<'a>(
+    rows: impl Iterator<Item = OutputRow<'a>>,
+) -> Vec<hcore::events::OutputGroupSummary> {
+    let mut groups: std::collections::BTreeMap<&str, hcore::events::OutputGroupSummary> =
+        std::collections::BTreeMap::new();
+    for row in rows.filter(|r| *r.r#type == ManifestArtifactType::Output) {
+        match groups.entry(row.group) {
+            std::collections::btree_map::Entry::Vacant(v) => {
+                v.insert(hcore::events::OutputGroupSummary {
+                    group: row.group.to_owned(),
+                    size: row.size,
+                    hash: row.hash,
+                    artifacts: 1,
+                });
+            }
+            std::collections::btree_map::Entry::Occupied(mut o) => {
+                let g = o.get_mut();
+                g.size = g.size.zip(row.size).map(|(a, b)| a.saturating_add(b));
+                g.hash = None;
+                g.artifacts = g.artifacts.saturating_add(1);
+            }
+        }
+    }
+    groups.into_values().collect()
+}
+
 /// A caller's copy of a memoized `eresult`, every artifact carrying `read` —
 /// the read lock on the revision — for as long as that artifact is alive.
 fn guard_eresult(eresult: &EResult, read: &Arc<ResultReadGuard>) -> EResult {
@@ -3384,6 +3431,29 @@ impl Engine {
         // with the write.
         self.materialize_codegen(&rs, opts, &locked, &cached)
             .await?;
+
+        // Inside `inner_result_addr`'s scope, so it lands right before this
+        // target's `ResultEnd`. Every group the entry holds, whichever this
+        // caller asked for: what ran (`executed`), or the hit's manifest.
+        // Only the no-manifest fallback is limited to this caller's groups.
+        if rs.has_listeners() {
+            let groups = match (&locked.executed, &locked.manifest) {
+                (Some(ex), _) => summarize_outputs(ex.cached.iter().map(result_artifact_output)),
+                (None, Some(manifest)) => {
+                    summarize_outputs(manifest.artifacts.iter().map(|a| OutputRow {
+                        group: &a.group,
+                        r#type: &a.r#type,
+                        size: Some(a.size),
+                        hash: Some(a.hashout.clone()),
+                    }))
+                }
+                (None, None) => summarize_outputs(cached.iter().map(result_artifact_output)),
+            };
+            rs.emit(crate::engine::event::BuildEventKind::ResultOutputs {
+                addr: def.target.addr.format(),
+                groups,
+            });
+        }
 
         Ok((
             MemoResult {

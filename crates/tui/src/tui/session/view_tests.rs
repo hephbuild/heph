@@ -95,6 +95,7 @@ fn events(holder_pid: u32) -> Vec<BuildEvent> {
         ev(
             BASE + 6,
             BuildEventKind::ExecuteStart {
+                output_groups: Vec::new(),
                 addr: "//a:slow".into(),
                 driver: "exec".into(),
                 cache: true,

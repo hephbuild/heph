@@ -273,6 +273,22 @@ pub enum BuildEventKind {
     ResultStart {
         addr: String,
     },
+    /// What a finished target produced, by output group: sent right before
+    /// its successful `ResultEnd`, whether it ran or was a cache hit (then
+    /// the restored entry's groups). Every declared output group the entry
+    /// holds, not only the ones this request asked for; log and support
+    /// files are not outputs and are left out. Not sent for a failure, nor to
+    /// a request nobody listens to.
+    ///
+    /// Per-file rows are not here: an artifact is a group's packed tree, and
+    /// listing it reads the cache entry, which a consumer asks for off its
+    /// render path (`Engine::output_listing`). An older consumer reads it as
+    /// [`BuildEventKind::Unknown`].
+    ResultOutputs {
+        addr: String,
+        #[serde(default)]
+        groups: Vec<OutputGroupSummary>,
+    },
     ResultEnd {
         addr: String,
         /// The failure, flattened by `format!("{e:#}")` — the whole cause chain
@@ -334,6 +350,11 @@ pub enum BuildEventKind {
         /// Treat [`AdmittedKind::Unknown`] like `None`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         admitted: Option<AdmittedKind>,
+        /// The output group names the target declares, in declaration order:
+        /// what it will write, before it has. Empty from a host that predates
+        /// it, and for a target that declares no output.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        output_groups: Vec<String>,
     },
     ExecuteEnd {
         addr: String,
@@ -710,6 +731,25 @@ pub struct LogTailData {
     pub start_line: usize,
 }
 
+/// One output group of a finished target, carried on `ResultOutputs`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OutputGroupSummary {
+    /// The group's name; empty for the target's unnamed group.
+    pub group: String,
+    /// The group's bytes as stored (an artifact's packed size, summed over
+    /// the group's artifacts). `None` when any of them does not know its
+    /// size (an uncached passthrough file).
+    #[serde(default)]
+    pub size: Option<u64>,
+    /// The group's content hash (`hashout`), when the group is one artifact,
+    /// which it is unless a driver splits one.
+    #[serde(default)]
+    pub hash: Option<String>,
+    /// How many artifacts the group is: 1 unless a driver splits one.
+    #[serde(default)]
+    pub artifacts: u32,
+}
+
 /// A run stopped at its target's `timeout`, carried on `ResultEnd`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TimedOutData {
@@ -958,6 +998,7 @@ pub mod test_support {
             reserved: None,
             queued_ms: None,
             admitted: None,
+            output_groups: Vec::new(),
         };
         let end = |addr: &str| BuildEventKind::ResultEnd {
             addr: addr.to_string(),
@@ -1304,6 +1345,7 @@ mod tests {
                 reserved: None,
                 queued_ms: Some(3),
                 admitted: Some(AdmittedKind::Handoff),
+                output_groups: vec!["out".into()],
             },
         })
         .expect("encode");
@@ -1508,6 +1550,7 @@ mod tests {
                 reserved: Some(BTreeMap::from([("cpu".into(), 4_000_000)])),
                 queued_ms: Some(1500),
                 admitted: None,
+                output_groups: Vec::new(),
             },
         };
         let back: BuildEvent =
@@ -1736,6 +1779,119 @@ mod tests {
             }
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    /// `ResultOutputs` round-trips, a frame missing its groups decodes, a
+    /// consumer built before it skips it as `Unknown` and reads on, and
+    /// `ExecuteStart.output_groups` is absent from the wire when empty and
+    /// read back when not, by a decoder that predates it too.
+    #[test]
+    fn result_outputs_round_trips_and_old_decoders_see_unknown() {
+        let groups = vec![
+            OutputGroupSummary {
+                group: String::new(),
+                size: Some(12),
+                hash: Some("ab12".into()),
+                artifacts: 1,
+            },
+            OutputGroupSummary {
+                group: "rust".into(),
+                size: None,
+                hash: None,
+                artifacts: 2,
+            },
+        ];
+        let ev = BuildEvent {
+            at_unix_ms: 4,
+            kind: BuildEventKind::ResultOutputs {
+                addr: "//a:x".into(),
+                groups: groups.clone(),
+            },
+        };
+        let json = serde_json::to_string(&ev).expect("encode");
+        let back: BuildEvent = serde_json::from_str(&json).expect("decode");
+        assert!(
+            matches!(
+                &back.kind,
+                BuildEventKind::ResultOutputs { addr, groups: g } if addr == "//a:x" && *g == groups
+            ),
+            "{back:?}"
+        );
+        let sparse = r#"{"at_unix_ms":1,"kind":{"type":"ResultOutputs","addr":"//a:x"}}"#;
+        let ev: BuildEvent = serde_json::from_str(sparse).expect("sparse frame decodes");
+        assert!(
+            matches!(ev.kind, BuildEventKind::ResultOutputs { ref groups, .. } if groups.is_empty())
+        );
+
+        let start = |output_groups: Vec<String>| {
+            serde_json::to_string(&BuildEvent {
+                at_unix_ms: 2,
+                kind: BuildEventKind::ExecuteStart {
+                    addr: "//a:x".into(),
+                    driver: "exec".into(),
+                    cache: true,
+                    declared: None,
+                    reserved: None,
+                    queued_ms: None,
+                    admitted: None,
+                    output_groups,
+                },
+            })
+            .expect("encode")
+        };
+        assert!(!start(Vec::new()).contains("output_groups"));
+        let named = start(vec!["out".into(), "gen".into()]);
+        let back: BuildEvent = serde_json::from_str(&named).expect("decode");
+        assert!(
+            matches!(
+                &back.kind,
+                BuildEventKind::ExecuteStart { output_groups, .. } if output_groups == &["out", "gen"]
+            ),
+            "{back:?}"
+        );
+
+        #[derive(serde::Deserialize)]
+        struct OldEvent {
+            kind: OldKind,
+        }
+        #[derive(serde::Deserialize, Debug)]
+        #[serde(tag = "type")]
+        enum OldKind {
+            ResultStart {
+                #[expect(dead_code, reason = "decoded only to prove the shape")]
+                addr: String,
+            },
+            ExecuteStart {
+                #[expect(dead_code, reason = "decoded only to prove the shape")]
+                addr: String,
+            },
+            #[serde(other)]
+            Unknown,
+        }
+        let stream = [
+            json,
+            named,
+            r#"{"at_unix_ms":5,"kind":{"type":"ResultStart","addr":"//a:x"}}"#.into(),
+        ];
+        let old: Vec<OldKind> = stream
+            .iter()
+            .map(|l| {
+                serde_json::from_str::<OldEvent>(l)
+                    .expect("old decoder")
+                    .kind
+            })
+            .collect();
+        assert!(
+            matches!(
+                old.as_slice(),
+                [
+                    OldKind::Unknown,
+                    OldKind::ExecuteStart { .. },
+                    OldKind::ResultStart { .. }
+                ]
+            ),
+            "{old:?}"
+        );
     }
 
     /// `PoolUsage` round-trips, a frame missing its later fields decodes,

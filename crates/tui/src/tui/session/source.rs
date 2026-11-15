@@ -70,8 +70,9 @@ impl SessionEntry {
 /// One item of a [`SessionSource::subscribe`] stream.
 #[derive(Debug, Clone)]
 pub enum SessionItem {
-    /// A record, in the order the owner wrote it.
-    Record(SessionRecord),
+    /// A record, in the order the owner wrote it. Boxed: a record is an order
+    /// of magnitude bigger than the other items.
+    Record(Box<SessionRecord>),
     /// Everything recorded so far has been sent. `skipped`: lines that did not
     /// decode, so far.
     CaughtUp { skipped: u64 },
@@ -289,7 +290,10 @@ fn follow(
                         if let Some(SessionRecordKind::End { exit_code, .. }) = &record.session {
                             end = Some(*exit_code);
                         }
-                        if tx.blocking_send(Ok(SessionItem::Record(record))).is_err() {
+                        if tx
+                            .blocking_send(Ok(SessionItem::Record(Box::new(record))))
+                            .is_err()
+                        {
                             return;
                         }
                     }

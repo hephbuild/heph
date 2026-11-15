@@ -138,6 +138,13 @@ impl Engine {
             &def.target.demand,
             &reservation,
             queued_ms,
+            // Only an event reads them: a request nobody listens to pays no
+            // allocation.
+            if rs.has_listeners() {
+                def.target.output_names()
+            } else {
+                Vec::new()
+            },
         );
         // Held until the run ends; a failed run hands it back before keeping
         // what it failed with (D17).
@@ -1290,7 +1297,9 @@ pub(crate) fn entrypoint_allotment(
 /// The `ExecuteStart` event: what the target declared (only its declared
 /// keys, in each pool's unit's base) and what it was granted, after
 /// clamping, how long admission took and how the grant came about.
-/// `reserved` always carries `cpu`, 0 on a zero-cost grant.
+/// `reserved` always carries `cpu`, 0 on a zero-cost grant. `output_groups`
+/// is the target's declared group names, for a consumer to show before the
+/// run has written any.
 pub(crate) fn execute_start(
     addr: String,
     driver: String,
@@ -1298,6 +1307,7 @@ pub(crate) fn execute_start(
     declared: &hplugin::driver::Demand,
     reservation: &crate::engine::resource_pool::Reservation,
     queued_ms: u64,
+    output_groups: Vec<String>,
 ) -> crate::engine::event::BuildEventKind {
     use hplugin::provider::PoolName;
     let declared = declared
@@ -1317,6 +1327,7 @@ pub(crate) fn execute_start(
         reserved: Some(reserved),
         queued_ms: Some(queued_ms),
         admitted: Some(admitted_kind(reservation.admitted())),
+        output_groups,
     }
 }
 
@@ -1406,7 +1417,15 @@ mod tests {
             ],
             &declared,
         );
-        let ev = execute_start("//p:t".into(), "exec".into(), true, &declared, &r, 7);
+        let ev = execute_start(
+            "//p:t".into(),
+            "exec".into(),
+            true,
+            &declared,
+            &r,
+            7,
+            Vec::new(),
+        );
         let BuildEventKind::ExecuteStart {
             declared,
             reserved,
@@ -1446,6 +1465,7 @@ mod tests {
             &one,
             r,
             0,
+            Vec::new(),
         ) {
             BuildEventKind::ExecuteStart { admitted, .. } => admitted,
             other => panic!("wrong variant: {other:?}"),
@@ -1534,9 +1554,15 @@ mod tests {
     fn a_zero_cost_grant_reserves_zero_cpu_and_is_told_one() {
         let declared = req(&[("cpu", 0)]);
         let r = grant(&[("cpu", Limit::Bounded(4 * CPU))], &declared);
-        let BuildEventKind::ExecuteStart { reserved, .. } =
-            execute_start("//p:t".into(), "exec".into(), true, &declared, &r, 0)
-        else {
+        let BuildEventKind::ExecuteStart { reserved, .. } = execute_start(
+            "//p:t".into(),
+            "exec".into(),
+            true,
+            &declared,
+            &r,
+            0,
+            Vec::new(),
+        ) else {
             panic!("wrong variant");
         };
         assert_eq!(

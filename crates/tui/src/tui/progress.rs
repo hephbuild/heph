@@ -1246,6 +1246,8 @@ impl BuildState {
             // The header's gauges still sum `ExecuteStart.reserved`; nothing
             // draws the pool's own report yet.
             BuildEventKind::PoolUsage { .. } => {}
+            // The Outputs tab's groups; nothing draws the tab yet.
+            BuildEventKind::ResultOutputs { .. } => {}
             // An event kind newer than this build knows about. Skipped rather
             // than fatal — see `BuildEventKind::Unknown`.
             BuildEventKind::Unknown => {}
@@ -3556,6 +3558,7 @@ mod tests {
     }
     fn execute_start(addr: &str) -> BuildEventKind {
         BuildEventKind::ExecuteStart {
+            output_groups: Vec::new(),
             addr: addr.into(),
             driver: "exec".into(),
             cache: true,
@@ -3568,6 +3571,7 @@ mod tests {
 
     fn execute_start_reserving(addr: &str, reserved: &[(&str, u64)]) -> BuildEventKind {
         BuildEventKind::ExecuteStart {
+            output_groups: Vec::new(),
             addr: addr.into(),
             driver: "exec".into(),
             cache: true,
@@ -3586,6 +3590,7 @@ mod tests {
     #[test]
     fn a_clamped_target_row_shows_declared_to_reserved() {
         let start = |addr: &str, declared: u64, reserved: u64| BuildEventKind::ExecuteStart {
+            output_groups: Vec::new(),
             addr: addr.into(),
             driver: "exec".into(),
             cache: true,
@@ -3639,6 +3644,7 @@ mod tests {
         s.apply(&ev(
             1,
             BuildEventKind::ExecuteStart {
+                output_groups: Vec::new(),
                 addr: "//p:big".into(),
                 driver: "exec".into(),
                 cache: true,

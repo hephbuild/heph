@@ -952,6 +952,7 @@ mod tests {
             t.apply(&ev(
                 0,
                 BuildEventKind::ExecuteStart {
+                    output_groups: Vec::new(),
                     addr: format!("//pkg{}:running{i}", i % 50),
                     driver: "exec".into(),
                     cache: false,
@@ -1157,6 +1158,7 @@ mod tests {
         t.apply(&ev(
             0,
             BuildEventKind::ExecuteStart {
+                output_groups: Vec::new(),
                 addr: "//a:slow".into(),
                 driver: "exec".into(),
                 cache: false,
@@ -1340,6 +1342,7 @@ mod tests {
         t.apply(&ev(
             600_000,
             BuildEventKind::ExecuteStart {
+                output_groups: Vec::new(),
                 addr: "//a:b".into(),
                 driver: "exec".into(),
                 cache: true,
@@ -1532,6 +1535,7 @@ mod tests {
             t.apply(&ev(
                 i,
                 BuildEventKind::ExecuteStart {
+                    output_groups: Vec::new(),
                     addr: format!("//services/api:image{i}"),
                     driver: "exec".into(),
                     cache: false,

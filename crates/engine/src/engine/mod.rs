@@ -101,6 +101,8 @@ pub mod log_api;
 pub use log_api::{
     FollowStep, LogFollower, LogInfo, LogOptions, LogSource, LogUnavailable, NoLiveLogs, OpenLog,
 };
+pub mod output_listing;
+pub use output_listing::{FailureOutputs, ListedFile, ListedGroup, ListedKind, OutputListing};
 pub(crate) mod run_log;
 pub mod run_timeout;
 pub use invoke::{InvokeOutcome, InvokeRequest};
