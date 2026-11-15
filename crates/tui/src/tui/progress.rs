@@ -1749,6 +1749,9 @@ pub struct TuiProgressView {
     /// for a live view ([`Self::with_log_reader`]). `None`: the column shows
     /// wait and failure text only (an attached view, until it has a reader).
     tails: Option<crate::tui::dashboard::TailReader>,
+    /// The reader [`Self::tails`] starts on, held until the first dashboard
+    /// frame: a run nobody presses Tab on starts no thread.
+    tail_source: Option<std::sync::Arc<dyn crate::tui::dashboard::LogReader>>,
     /// The target screen open over the dashboard (Enter / `l` on a row);
     /// Esc closes it back to the list, its selection kept.
     target: Option<crate::tui::dashboard::TargetScreen>,
@@ -1917,6 +1920,7 @@ impl TuiProgressView {
             list: crate::tui::dashboard::ListState::default(),
             last_lines: crate::tui::dashboard::LastLines::default(),
             tails: None,
+            tail_source: None,
             target: None,
             target_reader: None,
             role: Role::Live { approval: None },
@@ -2199,6 +2203,11 @@ impl TuiProgressView {
                 Role::Live { .. } => keys.into(),
             }
         };
+        // The reader's thread starts with the first frame that shows the
+        // column.
+        if let Some(reader) = self.tail_source.take() {
+            self.tails = crate::tui::dashboard::TailReader::spawn(reader);
+        }
         // What the background reader found since the last frame, for the
         // rows that frame showed.
         if let Some(updates) = self.tails.as_mut().and_then(|t| t.poll()) {
@@ -2327,13 +2336,15 @@ impl TuiProgressView {
     }
 
     /// Fill the dashboard's LAST LINE column from `reader`, on a thread of
-    /// its own: a frame only hands it the visible rows and takes what it
-    /// found (I4, I7). The seam an attached view's reader plugs into too.
+    /// its own started by the first dashboard frame: a frame only hands it
+    /// the visible rows and takes what it found (I4, I7). The seam an
+    /// attached view's reader plugs into too.
     pub fn with_log_reader(
         mut self,
         reader: std::sync::Arc<dyn crate::tui::dashboard::LogReader>,
     ) -> Self {
-        self.tails = crate::tui::dashboard::TailReader::spawn(reader);
+        self.tails = None;
+        self.tail_source = Some(reader);
         self
     }
 
@@ -5585,6 +5596,12 @@ mod tests {
         let mut v = TuiProgressView::new("L").with_log_reader(reader.clone());
         v.apply(&ev(0, result_start("//a:run")));
         v.apply(&ev(1, execute_start("//a:run")));
+        // The line alone starts no reader thread; the first dashboard frame does.
+        let _line = v.render("⠋", 0, 120, 4);
+        assert!(
+            v.tails.is_none(),
+            "a reader thread before any dashboard frame"
+        );
         v.open_dashboard();
 
         // Frames a reader's interval apart, until the row shows `want`.
