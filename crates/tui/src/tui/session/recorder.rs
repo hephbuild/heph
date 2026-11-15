@@ -902,6 +902,10 @@ impl RecorderThread {
         let len = u64::try_from(self.line.len()).unwrap_or(u64::MAX);
         let past = self.log_bytes_past_cap.saturating_add(len);
         if past > self.log_ceiling {
+            // Latched: a shorter line after this one would still fit, but
+            // the ceiling is where Log records stop, not a gap they resume
+            // after — the numbers on disk past the cap stay a prefix.
+            self.log_bytes_past_cap = u64::MAX;
             return Ok(());
         }
         self.log_bytes_past_cap = past;

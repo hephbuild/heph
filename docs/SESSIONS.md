@@ -56,9 +56,16 @@ quiet too, and `show` says "no events for 1m05s; N targets still running");
 written; `lost` when the lock is free and there is no `End` (killed, or
 crashed).
 
-`HEPH_NO_SESSION=1` records nothing: no directory, no start line. It is read
-once, by the front end, beside `HOME`; with no `HOME` or an unwritable
-`~/.heph` the run records nothing and says so once with a `warn!`.
+`HEPH_NO_SESSION=1` makes the session private: no start line, and nothing
+another terminal can see. It is still recorded, into
+`~/.heph/private-sessions/<id>/` instead of `sessions/`, because a closed full
+screen replays its log lines from there (see [Recording](#recording)); `list`
+never reads that directory, so `show` and `attach` cannot name it. The run
+removes it when it finishes, and every session start, public or private,
+sweeps the private sessions a killed run left (see [Retention](#retention)).
+It is read once, by the front end, beside `HOME`; with no `HOME` it records
+nothing. With no `HOME` or an unwritable `~/.heph` a public run records
+nothing and says so once with a `warn!`.
 
 `heph run --raw` sets up no session at all: no directory, no recorder, no
 start line, and no warning, so its stderr carries only the tool's bytes and
@@ -137,9 +144,12 @@ One line of `events.ndjson` is
 
 `kind` is a `BuildEventKind` byte for byte as on the plugin wire
 (`crates/core/src/events.rs`), with the same skew rules: an unknown variant
-decodes as `Unknown`. `session` is a `SessionRecordKind`: `Log {level, msg}`
-(`info!` and above, lossy UTF-8, stored verbatim and escaped by the viewer on
-output), `End {exit_code, panicked}`, `Truncated`, `InflightWritten`, and
+decodes as `Unknown`. `session` is a `SessionRecordKind`: `Log {level, msg,
+seq}` (every line the terminal shows, at the terminal's own filter, so
+`debug!` lines under `-v` too, and diagnostics with an empty `level`; lossy
+UTF-8, stored verbatim and escaped by the viewer on output; `seq` numbers the
+sink's lines from 1, absent in records from before it), `End {exit_code,
+panicked}`, `Truncated`, `InflightWritten`, and
 `Unknown` for anything newer. Both keys are optional; a line with neither is
 skipped.
 
@@ -282,7 +292,7 @@ The process's session is a `SessionSlot` that `main` owns: there is no
 process-wide instance. `main` configures it and hands it to whatever records
 into it — every command, as its own argument beside the sink;
 `bootstrap::new_engine` (the workspace for `meta.json`); the `LogSink`, which
-keeps a reference only to tee `info!` lines into the open session; the diag
+keeps a reference only to tee its lines into the open session; the diag
 sweeper; and the error renderer. `tui::run_app` takes the session as an
 explicit argument (a debug build asserts it is the sink's slot) and opens it
 lazily (a viewer's `App::records_session()` is false), and `main` finishes it with the exit code
@@ -306,7 +316,25 @@ included. The recorder is its own OS thread behind an unbounded channel:
   `Label` change, and an `Approval` that clears the prompt. An `Output`
   record keeps at most the first 1 MiB of its text, then a line saying how
   many bytes were left out, so the report a process prints (at most twice)
-  overshoots the cap by a bounded amount.
+  overshoots the cap by a bounded amount. `Log` records outlive the cap too,
+  up to **256 MiB** of them past it; the first one over that ceiling ends
+  them, and no later line is written even if it would fit.
+- The `LogSink` numbers every line it takes, a log line at the terminal's
+  filter or a diagnostic, and records it as `Log {seq}`. Numbering, sending
+  the record and handing the line to the printer are one critical section of
+  the sink's lock, so the printer and `events.ndjson` see the same numbers in
+  the same order, none reused or skipped.
+- `SessionTap::flush` waits (bounded) until every record sent before it is on
+  disk, and fails at once on a stopped or finished recorder rather than
+  waiting for it.
+- While a full screen is up the printer keeps only line numbers. Closing it
+  replays from disk (`LogSink::replay`): take the latest number, flush through
+  it, then read `Log` records from the offset noted when the screen opened
+  and print exactly those numbered after the last line printed and up to that
+  latest, once each. Lines missing from disk (past the ceiling, dropped by a
+  stopped recorder) are counted, and one `WARN` says how many were skipped.
+  This holds under `HEPH_NO_SESSION=1`, whose private session is what the
+  replay reads.
 
 What a run loses: a process wedged before its first flush loses at most 250ms
 of events; a second Ctrl-C, `SIGTERM`/`SIGHUP` or `SIGKILL` loses what came
@@ -406,6 +434,11 @@ minutes, left by a removal that failed or died, is deleted outright with no
 lock. Two cleanups can race on that one, both deleting the same tomb, which is
 harmless: one finishes, the other sees it gone.
 
+Every start also cleans `~/.heph/private-sessions/` with nothing kept: an
+ended private session (lock free, so a killed run's) goes whatever its age,
+a live one is never touched, and one still being created is left alone as
+above.
+
 ## Run logs
 
 A run's live log is not in the session directory. It lives in the workspace's
@@ -419,8 +452,8 @@ directory per engine (a random id, not the session id) and one file per run
 - **Its own lock.** The directory is built as `runs/.new-<id>-<pid>/` with its
   `lock` file already `flock`ed, then renamed into place, and the engine holds
   that lock for its whole life. Liveness is that lock, never the session's:
-  with `HEPH_NO_SESSION=1` there is no session lock to look at, and a live
-  build's logs must still not be deleted.
+  with `HEPH_NO_SESSION=1` the session is private and nobody looks it up,
+  and a live build's logs must still not be deleted.
 - **Lifetime.** A run's file goes once the cache entry or failure slot that
   replaces it is in place. A `cache = false` success keeps its file until the
   engine exits. At a normal exit the engine removes its own directory, lock

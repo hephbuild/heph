@@ -96,14 +96,14 @@ fn big_event() -> BuildEvent {
     }
 }
 
-fn read_records(dir: &Path) -> (Vec<SessionRecord>, u64) {
+pub(super) fn read_records(dir: &Path) -> (Vec<SessionRecord>, u64) {
     let file = std::fs::File::open(dir.join(files::EVENTS)).expect("events");
     let mut r = RecordReader::new(file);
     let recs = std::iter::from_fn(|| r.next_record().expect("read")).collect();
     (recs, r.skipped())
 }
 
-fn start() -> SessionStart {
+pub(super) fn start() -> SessionStart {
     SessionStart {
         header: SessionHeader {
             kind: HeaderKind::Build,
@@ -334,7 +334,7 @@ fn recorder_with(dir: &Path, events: Box<dyn Write + Send>, faults: Faults) -> R
 
 /// A `MakeWriter` collecting log output, to count warnings.
 #[derive(Clone, Default)]
-struct Captured(Arc<Mutex<Vec<u8>>>);
+pub(super) struct Captured(Arc<Mutex<Vec<u8>>>);
 
 impl Write for Captured {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
@@ -357,7 +357,7 @@ impl Captured {
     /// subscriber (and the writer it holds) outliving the test's own
     /// `with_default` is exactly "the recorder may still log".
     #[track_caller]
-    fn settled_log(&self) -> String {
+    pub(super) fn settled_log(&self) -> String {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while Arc::strong_count(&self.0) > 1 && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(1));
@@ -831,11 +831,25 @@ async fn viewer_does_not_record_itself() {
     assert_eq!(entries(home.path()), 0, "not even ~/.heph");
 }
 
-/// `HEPH_NO_SESSION=1` records into a private directory, outside the
-/// sessions root `heph session list` reads, removed when the session finishes.
-/// (Partial `no_session_private_dir`: the list and kill -9 sweep clauses are
-/// still to be written.)
-#[tokio::test]
+/// What a `kill -9` leaves of a private session: its directory, a free lock,
+/// records and no `End`.
+fn killed_private_session(private: &Path) -> std::path::PathBuf {
+    let id = SessionId::new(hcore::events::now_unix_ms(), 7);
+    let dir = private.join(id.encode());
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(dir.join(files::LOCK), b"").expect("lock");
+    std::fs::write(dir.join(files::EVENTS), b"{}\n").expect("events");
+    dir
+}
+
+/// `HEPH_NO_SESSION=1` (injected through `from_env`: never `set_var` in a
+/// shared test binary) records into a private directory, outside the
+/// sessions root the session list reads, so it is not listed, even beside a
+/// public session that is; a public start leaves it alone while it is live,
+/// and it is removed when the session finishes. After a `kill -9` (its
+/// directory left with the lock free), the next start sweeps it, whether
+/// that run records publicly or privately.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn no_session_private_dir() {
     let home = tempfile::tempdir().expect("tempdir");
     let slot = Arc::new(SessionSlot::new());
@@ -847,8 +861,33 @@ async fn no_session_private_dir() {
     let dir = slot.dir().expect("a private session");
     assert!(dir.starts_with(&private), "{}", dir.display());
     assert!(!home.path().join(".heph").join(SESSIONS_DIR).exists());
+
+    let public = SessionRoot::for_reading(Some(home.path().as_os_str())).expect("home");
+    let other = Session::open(&public, start()).expect("open");
+    let listed = FileSource::new(public.path()).list().await.expect("list");
+    let ids: Vec<SessionId> = listed.iter().map(|e| e.id).collect();
+    assert_eq!(ids, vec![other.id()], "only the public session is listed");
+    // `End` is acknowledged after the start's sweep, which ran first.
+    other.finish(Some(0), false);
+    assert!(dir.exists(), "a live private session is never swept");
+
     slot.finish(Some(0));
     assert!(!dir.exists(), "removed at exit");
+
+    for next in [public, SessionRoot::private(&private)] {
+        let killed = killed_private_session(&private);
+        let session = Session::open(&next, start()).expect("open");
+        session.finish(Some(0), false);
+        assert!(
+            !killed.exists(),
+            "a {} start sweeps a killed private session",
+            if next.is_private() {
+                "private"
+            } else {
+                "public"
+            }
+        );
+    }
 }
 
 /// A4: no `HOME` means no session, and the build still runs.

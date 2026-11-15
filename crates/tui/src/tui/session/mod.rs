@@ -40,6 +40,8 @@ pub mod run_logs;
 pub mod source;
 
 #[cfg(test)]
+mod replay_tests;
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod view_tests;
@@ -543,6 +545,16 @@ impl SessionSlot {
         };
         self.with(|s| s.session = Some(session));
         Some(opened)
+    }
+
+    /// Hold `session` as [`open`](Self::open) would: a test's session opened
+    /// with injected faults.
+    #[cfg(test)]
+    pub(crate) fn install(&self, session: Session) {
+        self.with(|s| {
+            s.attempted = true;
+            s.session = Some(std::sync::Arc::new(session));
+        });
     }
 
     /// The open session's directory, if any.
