@@ -83,6 +83,13 @@ prints the failure report instead: one block per root failure, naming no path
 into heph's home, each ending with the same answer as `full log: heph log
 <addr>` or `full log: none kept`.
 
+A script reading either shape can rely on the order of the rows and on their
+labels (`full log:`, `outputs:`, `took down:`, `fixes written:`, …): those
+are stable. The whitespace is not. A report's labels are padded to line up
+with each other, so the indentation and the gap after a label change with
+which rows a failure prints. Match a label with its colon and trim what
+follows it.
+
 ### The failed sandbox
 
 The slot is what outlives a failure; the sandbox the run failed in does not.

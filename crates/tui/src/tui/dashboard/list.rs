@@ -2,6 +2,12 @@
 //! LAST LINE, for the active tab. A frame reads the fold and the last-line
 //! cache, and does no IO: the cache is filled off the render task from the
 //! rows the last frame showed.
+//!
+//! The tab counts do not sum to All's, by design. A pending approval request
+//! (`✦`) leads All and makes the Approvals tab, while its target also stays
+//! in its own state's tab (Pending or Running): it is counted once in All
+//! and twice across the other tabs. A stopped target (`○`) is the other way
+//! round, in All only.
 
 use std::collections::HashMap;
 

@@ -572,6 +572,10 @@ pub struct SnapshotCounts {
     /// Targets whose driver ran to success.
     #[serde(default)]
     pub executed: u64,
+    /// Targets that failed. A target a stop ended (Ctrl-C, or fail-fast
+    /// after another target failed) is not one and is not in the snapshot's
+    /// `failed` list either; it counts only in `finished`. A writer before
+    /// the dashboard counted those here.
     #[serde(default)]
     pub failed: u64,
     /// Running targets that are in no lock or admission wait. Counted over the
