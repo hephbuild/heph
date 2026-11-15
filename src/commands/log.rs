@@ -610,6 +610,8 @@ pub struct EngineTails {
     rt: tokio::runtime::Handle,
     /// The log `size` opened, kept for the `tail` that follows it.
     opened: std::sync::Mutex<Option<(String, crate::engine::log_api::OpenLog)>>,
+    /// Never a remote fetch; a locator only when one is cheap per row.
+    opts: LogOptions,
 }
 
 impl EngineTails {
@@ -618,13 +620,26 @@ impl EngineTails {
             engine,
             rt,
             opened: std::sync::Mutex::new(None),
+            opts: LogOptions::default(),
         }
+    }
+
+    /// Also find runs going on in another heph through `locator`, which is
+    /// asked once per visible row each batch: `heph session attach` hands
+    /// its session's own index (`FeedRunLogLocator`), never a scan of every
+    /// session.
+    pub fn with_locator(
+        mut self,
+        locator: Arc<dyn hcore::session_record::LiveRunLogLocator>,
+    ) -> Self {
+        self.opts.locator = Some(locator);
+        self
     }
 
     fn open(&self, addr: &str) -> Option<crate::engine::log_api::OpenLog> {
         let addr = htaddr::parse_addr(addr).ok()?;
         self.rt
-            .block_on(self.engine.open_log(&addr, &LogOptions::default()))
+            .block_on(self.engine.open_log(&addr, &self.opts))
             .ok()
             .flatten()
     }

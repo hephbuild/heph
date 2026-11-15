@@ -26,8 +26,8 @@ use tokio::task::JoinHandle;
 use super::show::new_view;
 use super::{SessionExit, ViewOpts, escape_replayed, require_known, resolve};
 use crate::tui::session::{
-    HeaderKind, HolderNames, Routed, SessionFeed, SessionId, SessionItem, SessionMeta,
-    SessionSource,
+    FeedRunLogLocator, HeaderKind, HolderNames, Routed, SessionFeed, SessionId, SessionItem,
+    SessionMeta, SessionSource,
 };
 use crate::tui::{self, App, AppContext, CIAppView, LogSink};
 
@@ -48,8 +48,9 @@ pub(crate) async fn attach(
     arg: &str,
     sink: LogSink,
     session: &Arc<SessionSlot>,
-    no_tui: bool,
+    global: &crate::commands::GlobalOptions,
 ) -> anyhow::Result<()> {
+    let no_tui = global.no_tui;
     let (i, entry) = resolve(sources, arg, opts).await?;
     let meta = require_known(&entry)?.clone();
     let source = *sources
@@ -68,25 +69,23 @@ pub(crate) async fn attach(
     };
     let (quit_tx, quit_rx) = mpsc::unbounded_channel();
     let after = AfterTeardown::default();
+    let feed = SessionFeed::default();
+    let interactive = tui::should_use_tui(no_tui);
+    // Only the dashboard reads logs and outputs; the line backend needs none.
+    let readers = interactive.then(|| Readers::for_session(global, &meta, entry.id, &feed));
     let app = AttachApp {
         id: entry.id,
         meta,
         holders: source.holder_names(entry.id),
-        feed: SessionFeed::default(),
+        feed,
+        readers,
         after: after.clone(),
         stream,
         detach_rx,
         quit_tx,
         quit_rx,
     };
-    let outcome = tui::run_app(
-        app,
-        sink.clone(),
-        session,
-        tui::should_use_tui(no_tui),
-        shutdown,
-    )
-    .await;
+    let outcome = tui::run_app(app, sink.clone(), session, interactive, shutdown).await;
     if let Some(task) = sigint_task {
         task.abort();
     }
@@ -171,6 +170,85 @@ impl AfterTeardown {
     }
 }
 
+/// What the attached dashboard reads logs and outputs through.
+///
+/// The viewer runs nothing, so it has no in-process run to read: an engine
+/// over the run's own home (built from the workspace root the session
+/// recorded, so attach works from any directory) reads what that heph
+/// wrote, through the same log API and listings the run's dashboard uses.
+/// The LAST LINE column finds a running target's live file through the
+/// session's own `RunLog` records ([`FeedRunLogLocator`]); the Log tab
+/// through every session under HOME, as the run's own Log tab does.
+enum Readers {
+    Engine {
+        tails: Arc<crate::commands::log::EngineTails>,
+        target: Arc<crate::commands::log::EngineTargetReader>,
+    },
+    /// No engine reads that home from here: why, in the tabs' words.
+    Unavailable(String),
+}
+
+impl Readers {
+    fn for_session(
+        global: &crate::commands::GlobalOptions,
+        meta: &SessionMeta,
+        id: SessionId,
+        feed: &SessionFeed,
+    ) -> Self {
+        let (Some(root), Some(home), Some(locator)) = (
+            meta.workspace_root.as_deref(),
+            meta.home_dir.as_deref(),
+            FeedRunLogLocator::new(feed.clone(), id, meta),
+        ) else {
+            return Self::Unavailable("the session recorded no workspace".into());
+        };
+        let (engine, resolved) =
+            match crate::commands::bootstrap::new_reader_engine(global, std::path::Path::new(root))
+            {
+                Ok(built) => built,
+                Err(e) => {
+                    tracing::debug!(error = %format!("{e:#}"), "no reader engine for the session");
+                    return Self::Unavailable(format!("{e:#}"));
+                }
+            };
+        // The same workspace can resolve another home here (`HEPH_HOME`,
+        // a profile, a moved checkout): its cache is not the run's, so
+        // reading it would show another build's logs.
+        if resolved != std::path::Path::new(home) {
+            return Self::Unavailable(
+                "this terminal resolves the workspace to another heph home than the run's".into(),
+            );
+        }
+        let rt = tokio::runtime::Handle::current();
+        Self::Engine {
+            tails: Arc::new(
+                crate::commands::log::EngineTails::new(Arc::clone(&engine), rt.clone())
+                    .with_locator(Arc::new(locator)),
+            ),
+            target: Arc::new(crate::commands::log::EngineTargetReader::new(engine, rt)),
+        }
+    }
+}
+
+/// The target screen's reader when no engine reads the run's home.
+struct NotAttached(String);
+
+impl tui::dashboard::TargetReader for NotAttached {
+    fn open_log(&self, _addr: &str) -> tui::dashboard::LogOpened {
+        tui::dashboard::LogOpened::Unavailable(format!(
+            "log not available when attached: {}",
+            self.0
+        ))
+    }
+
+    fn outputs(&self, _addr: &str, _failed: bool) -> tui::dashboard::OutputsFound {
+        tui::dashboard::OutputsFound::Unavailable(format!(
+            "outputs not available when attached: {}",
+            self.0
+        ))
+    }
+}
+
 struct AttachApp {
     id: SessionId,
     meta: SessionMeta,
@@ -179,6 +257,8 @@ struct AttachApp {
     holders: HolderNames,
     /// What the run's terminal showed besides build events, read by the view.
     feed: SessionFeed,
+    /// The dashboard's log and output readers; `None` on the line backend.
+    readers: Option<Readers>,
     after: AfterTeardown,
     stream: BoxStream<'static, anyhow::Result<SessionItem>>,
     detach_rx: mpsc::UnboundedReceiver<()>,
@@ -248,10 +328,19 @@ impl App for AttachApp {
 
     fn tui_view(&self) -> Self::TuiView {
         let quit = self.quit_tx.clone();
-        new_view(&self.meta).attached(self.id, self.feed.clone(), move || {
+        let view = new_view(&self.meta).attached(self.id, self.feed.clone(), move || {
             // The app may already be gone; then there is nothing to detach.
             let _gone = quit.send(());
-        })
+        });
+        match &self.readers {
+            Some(Readers::Engine { tails, target }) => view
+                .with_log_reader(Arc::clone(tails) as _)
+                .with_target_reader(Arc::clone(target) as _),
+            Some(Readers::Unavailable(why)) => {
+                view.with_target_reader(Arc::new(NotAttached(why.clone())))
+            }
+            None => view,
+        }
     }
 
     fn ci_view(&self) -> Self::CiView {

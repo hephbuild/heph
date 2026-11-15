@@ -540,7 +540,7 @@ pub async fn run<A: App + 'static>(
                             // The run ended under an open dashboard: `q`
                             // leaves, from whichever screen is up.
                             quit = true;
-                        } else if view.is_on_main_view() {
+                        } else if view.is_on_main_view() || view.quits_from_any_screen() {
                             if app_result.is_none() {
                                 view.quit_while_running();
                             }

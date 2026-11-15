@@ -71,6 +71,9 @@ pub struct TargetInputs<'a> {
     pub now_ms: u64,
     /// The dashboard list's count scope, for the header's counts.
     pub scope: CountScope,
+    /// Drawn for `heph session attach`: the hints end in `q detach`, as the
+    /// list's do there (I11).
+    pub detach: bool,
 }
 
 /// One open target screen. Dropping it ends its reader thread and closes
@@ -434,6 +437,13 @@ impl TargetScreen {
                     OUTPUTS_HINTS.to_owned(),
                 )
             }
+        };
+        // A search's own hints say what its keys do; `q` types into it.
+        let searching = self.tab == TargetTab::Log && self.pane.search_hint().is_some();
+        let hints = if inp.detach && !searching {
+            format!("{hints} · q detach")
+        } else {
+            hints
         };
         let (tabs, rule) = tab_rows(addr, self.tab, &status, c, &mut self.drawn.tabs);
         out.push(tabs);

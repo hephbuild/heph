@@ -158,6 +158,7 @@ fn target_frame(s: &BuildState, t: &mut TargetScreen, now: u64, redact: &Redact)
         redact,
         now_ms: T0 + now,
         scope: CountScope::Matched,
+        detach: false,
     };
     t.frame(&title(), &inp, 120, 30).iter().map(text).collect()
 }

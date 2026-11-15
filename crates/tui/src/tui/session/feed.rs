@@ -14,7 +14,11 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use hcore::events::BuildEvent;
 
-use super::format::{ApprovalPrompt, ApprovalStanding, SessionRecord, SessionRecordKind};
+use hcore::events::BuildEventKind;
+
+use super::format::{
+    ApprovalPrompt, ApprovalStanding, RunLogRecord, SessionRecord, SessionRecordKind,
+};
 
 /// The recorded view state an attached [`TuiProgressView`] reads while it
 /// renders. Cloned between the app that routes records and the view.
@@ -36,6 +40,21 @@ struct FeedState {
     /// `End`'s time: the fallback clock when no `Finished` was recorded (a
     /// line-backend run, or a heph from before `Finished`).
     ended_at_ms: Option<u64>,
+    /// Each addr's newest `RunLog`, for the viewer's log readers: the same
+    /// records `heph log` finds the run's live file through, read off the
+    /// stream the viewer follows anyway instead of rescanning the session's
+    /// `events.ndjson` per lookup. One entry per target that ran.
+    run_logs: std::collections::HashMap<String, FeedRunLog>,
+}
+
+/// An addr's newest `RunLog` in the followed session.
+#[derive(Debug, Clone)]
+pub struct FeedRunLog {
+    pub record: RunLogRecord,
+    /// When the record was written.
+    pub at_unix_ms: u64,
+    /// An `ExecuteEnd` for the addr followed the record.
+    pub ended: bool,
 }
 
 /// What to do with one record.
@@ -62,6 +81,12 @@ impl SessionFeed {
     pub fn route(&self, record: SessionRecord) -> Routed {
         let at = record.at_unix_ms;
         if let Some(kind) = record.kind {
+            // The run whose log was announced is over (`run_logs.rs`'s rule).
+            if let BuildEventKind::ExecuteEnd { addr, .. } = &kind
+                && let Some(run) = self.lock().run_logs.get_mut(addr)
+            {
+                run.ended = true;
+            }
             return Routed::Event(BuildEvent {
                 at_unix_ms: at,
                 kind,
@@ -100,8 +125,21 @@ impl SessionFeed {
                 return Routed::Nothing;
             }
             // Where a run's log is, for a log reader; nothing a TUI prints.
-            SessionRecordKind::RunLog(_)
-            | SessionRecordKind::Truncated
+            SessionRecordKind::RunLog(run) => {
+                // A path that could leave `<home>/runs/` is never kept.
+                if run.relative_file().is_some() {
+                    s.run_logs.insert(
+                        run.addr.clone(),
+                        FeedRunLog {
+                            record: *run,
+                            at_unix_ms: at,
+                            ended: false,
+                        },
+                    );
+                }
+                return Routed::Nothing;
+            }
+            SessionRecordKind::Truncated
             | SessionRecordKind::InflightWritten
             | SessionRecordKind::Unknown => return Routed::Nothing,
         };
@@ -127,6 +165,11 @@ impl SessionFeed {
     /// The standing Y/N decision in force, for the indicator.
     pub fn approval_standing(&self) -> Option<ApprovalStanding> {
         self.lock().standing
+    }
+
+    /// `addr`'s newest announced run log, as far as the stream has been read.
+    pub fn run_log(&self, addr: &str) -> Option<FeedRunLog> {
+        self.lock().run_logs.get(addr).cloned()
     }
 
     /// The instant the run's final summary was measured against: its

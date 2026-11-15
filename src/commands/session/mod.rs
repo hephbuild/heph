@@ -235,14 +235,7 @@ fn execute(
         SessionCommands::Attach(a) => {
             a.refuse_dashboard()?;
             drop(stdout);
-            bootstrap::block_on(attach::attach(
-                &sources,
-                opts,
-                &a.id,
-                sink,
-                session,
-                global.no_tui,
-            ))?
+            bootstrap::block_on(attach::attach(&sources, opts, &a.id, sink, session, global))?
         }
     }
 }

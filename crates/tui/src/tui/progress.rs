@@ -1817,16 +1817,19 @@ fn approval_banner<'a>(
     } else {
         String::new()
     };
-    let keys = match keys {
-        None => String::new(),
+    let tail = match keys {
+        // A viewer decides nothing: it says where the decision is made.
+        None => format!("{queued}{APPROVAL_ELSEWHERE}"),
         // Only offer the notice-view toggle when there is a notice to view.
-        Some(_) if notices.len() == 0 => APPROVAL_KEYS.to_owned(),
-        Some(ApprovalKeys { expanded: true }) => format!("{APPROVAL_KEYS} · enter hide"),
-        Some(ApprovalKeys { expanded: false }) => format!("{APPROVAL_KEYS} · enter view"),
+        Some(_) if notices.len() == 0 => format!("{APPROVAL_KEYS}{queued}"),
+        Some(ApprovalKeys { expanded: true }) => format!("{APPROVAL_KEYS} · enter hide{queued}"),
+        Some(ApprovalKeys { expanded: false }) => {
+            format!("{APPROVAL_KEYS} · enter view{queued}")
+        }
     };
     lines.push(Line::from(Span::styled(
         format!(
-            "  ⚠ approval required: {}{keys}{queued}",
+            "  ⚠ approval required: {}{tail}",
             crate::tui::text::clean_inline(addr)
         ),
         Style::default()
@@ -1846,6 +1849,9 @@ fn approval_banner<'a>(
 
 /// The approval banner's keys, which act on the run: a live view only.
 const APPROVAL_KEYS: &str = "  [y] approve · [n] reject";
+
+/// What an attached viewer's banner says in place of the keys (I11).
+const APPROVAL_ELSEWHERE: &str = " · decide in the terminal that runs it";
 
 /// A header's items as plain text, joined as the box joins them.
 fn header_text(items: Vec<HeaderItem>) -> String {
@@ -2183,6 +2189,7 @@ impl TuiProgressView {
                 .approval_spot()
                 .or_else(|| self.state.spotlight(now_ms)),
             hint: dashboard && live,
+            detach: matches!(self.role, Role::Attached { .. }),
             held: live && self.pinned && self.finished_at_ms.is_some(),
         };
         line::render(&model, width)
@@ -2239,6 +2246,7 @@ impl TuiProgressView {
             redact: &self.state.redact,
             now_ms,
             scope,
+            detach: matches!(self.role, Role::Attached { .. }),
         };
         let target = self.target.as_mut()?;
         Some(target.frame(&title, &inputs, cols, rows))
@@ -2321,6 +2329,10 @@ impl TUIAppView for TuiProgressView {
             // A run of this process: `q` does nothing, Ctrl-C cancels.
             Role::Live { .. } => {}
         }
+    }
+
+    fn quits_from_any_screen(&self) -> bool {
+        matches!(self.role, Role::Attached { .. })
     }
 
     fn pending_approval(&self) -> Option<crate::tui::session::ApprovalPrompt> {
@@ -2604,8 +2616,10 @@ impl TUIAppView for TuiProgressView {
     fn hold_after_finish(&self) -> bool {
         // Auto-exit only from the line; while the dashboard is up, keep it
         // until the user leaves (I: closing it under their cursor loses
-        // their place). `--dashboard` holds on every screen.
-        self.dashboard_open || self.pinned
+        // their place). `--dashboard` holds on every screen. A viewer never
+        // holds: the session's end prints its summary and report, and attach
+        // exits with its code (I11).
+        !matches!(self.role, Role::Attached { .. }) && (self.dashboard_open || self.pinned)
     }
 
     fn set_finished(&mut self, at_ms: u64) {

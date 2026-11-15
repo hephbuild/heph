@@ -35,11 +35,17 @@ const LONG_RUNNING_MS: u64 = 30_000;
 
 /// The view a session is drawn with: `gc`'s sweep header, or the build one.
 pub(crate) fn new_view(meta: &SessionMeta) -> tui::TuiProgressView {
-    match meta.header {
+    let view = match meta.header {
         HeaderKind::Gc => {
             tui::TuiProgressView::with_header(Box::new(tui::GcHeader::new(meta.label.clone())))
         }
         HeaderKind::Build | HeaderKind::Unknown => tui::TuiProgressView::new(meta.label.clone()),
+    };
+    // The paths in what the run drew are under the run's home, which may
+    // not be the one this terminal resolves: redact the one it recorded (I9).
+    match meta.home_dir.as_deref() {
+        Some(home) => view.with_redact(tui::text::Redact::heph_home(std::path::Path::new(home))),
+        None => view,
     }
 }
 

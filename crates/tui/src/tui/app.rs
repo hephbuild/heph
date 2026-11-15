@@ -323,6 +323,13 @@ pub trait TUIAppView: Send {
     /// on — a viewer never cancels anything.
     fn quit_while_running(&mut self) {}
 
+    /// Whether `q` leaves from every screen, not only the main view: a
+    /// session viewer, where `q` detaches from the dashboard and the target
+    /// screens too (I11). Default `false`: off the main view `q` goes back.
+    fn quits_from_any_screen(&self) -> bool {
+        false
+    }
+
     /// Whether the view is currently capturing keystrokes into a search query
     /// (the `/` filter). While `true` the backend routes printable keys, Backspace,
     /// Enter and Esc to the search methods below instead of the normal shortcuts.

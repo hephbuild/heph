@@ -352,6 +352,73 @@ impl LiveRunLogLocator for SessionRunLogLocator {
     }
 }
 
+/// The log API's [`LiveRunLogLocator`] for `heph session attach`: the one
+/// session it follows, answered from the `RunLog` records its stream already
+/// carried ([`SessionFeed::run_log`]) instead of rescanning `events.ndjson`,
+/// so the LAST LINE column can ask for every visible row each batch.
+///
+/// The rules are this module's, applied to that one session: only for the
+/// home its `meta.json` names, only while the viewer follows it (the viewer
+/// ends with it), the newest record wins, an `ExecuteEnd` after it or a file
+/// gone means ended, and `file` is opened as [`find_run_log`] opens it.
+///
+/// [`SessionFeed::run_log`]: super::SessionFeed::run_log
+#[derive(Debug, Clone)]
+pub struct FeedRunLogLocator {
+    feed: super::SessionFeed,
+    id: SessionId,
+    /// The session's home, from its `meta.json`.
+    home: PathBuf,
+    /// Its `meta.json` lists [`CAPABILITY_RUN_LOGS`].
+    records_run_logs: bool,
+}
+
+impl FeedRunLogLocator {
+    pub fn new(feed: super::SessionFeed, id: SessionId, meta: &SessionMeta) -> Option<Self> {
+        Some(Self {
+            feed,
+            id,
+            home: PathBuf::from(meta.home_dir.as_deref()?),
+            records_run_logs: meta.has_capability(CAPABILITY_RUN_LOGS),
+        })
+    }
+}
+
+impl LiveRunLogLocator for FeedRunLogLocator {
+    fn locate(&self, home: &Path, addr: &str) -> anyhow::Result<Option<LocatedRunLog>> {
+        if home != self.home {
+            return Ok(None);
+        }
+        let session = self.id.encode();
+        if !self.records_run_logs {
+            return Ok(Some(LocatedRunLog::Unsupported { session }));
+        }
+        let Some(run) = self.feed.run_log(addr) else {
+            return Ok(None);
+        };
+        let ended = LocatedRunLog::Ended {
+            record: run.record.clone(),
+            at_unix_ms: run.at_unix_ms,
+            session: session.clone(),
+        };
+        if run.ended {
+            return Ok(Some(ended));
+        }
+        Ok(
+            match open_live(home, &run.record).context("opening a live run log")? {
+                Opened::File(_, file) => Some(LocatedRunLog::Live {
+                    record: run.record,
+                    at_unix_ms: run.at_unix_ms,
+                    session,
+                    file,
+                }),
+                Opened::Gone => Some(ended),
+                Opened::Refused => None,
+            },
+        )
+    }
+}
+
 /// What opening a record's `file` under the home came to.
 #[derive(Debug)]
 enum Opened {

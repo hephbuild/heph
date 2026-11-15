@@ -34,6 +34,8 @@ const SPOT_DETAIL_MIN: usize = 8;
 const SEP: &str = " · ";
 const HINT: &str = "tab ⇥";
 const HINT_GLYPH: &str = "⇥";
+/// [`HINT`] on an attached viewer, from 70 columns up.
+const HINT_DETACH: &str = "q detach · tab ⇥";
 /// After the counts of a finished run `--dashboard` holds.
 const HELD: &str = "q to quit · tab dashboard";
 
@@ -80,6 +82,9 @@ pub(super) struct LineModel<'a> {
     pub(super) spot: Option<Spot>,
     /// Whether the command has a dashboard for `tab` to open.
     pub(super) hint: bool,
+    /// An attached viewer (`heph session attach`): the hint says `q`
+    /// detaches, where there is room for it.
+    pub(super) detach: bool,
     /// The finished run is held (`--dashboard`): the line says how to leave.
     pub(super) held: bool,
 }
@@ -286,6 +291,7 @@ fn layout(m: &LineModel<'_>, tier: Tier, cols: usize) -> Option<Line<'static>> {
     let hint = match (running && m.hint, tier) {
         (false, _) => None,
         (true, Tier::Compact) if cols <= HINT_GLYPH_AT => Some(HINT_GLYPH),
+        (true, Tier::Full | Tier::NoSpot) if m.detach => Some(HINT_DETACH),
         (true, _) => Some(HINT),
     };
     // The hint keeps at least one blank column between it and the rest.
@@ -403,7 +409,29 @@ mod tests {
             standing: None,
             spot,
             hint: true,
+            detach: false,
             held: false,
+        }
+    }
+
+    /// An attached viewer's line says `q` detaches where the full hint fits,
+    /// and narrows to the live line's hint below that: the rest is the same.
+    #[test]
+    fn attached_line_hint_says_detach() {
+        let live = model(Some(run_spot("//a:b")));
+        let attached = LineModel {
+            detach: true,
+            ..model(Some(run_spot("//a:b")))
+        };
+        let at = |m: &LineModel<'_>, cols: u16| text(&render(m, cols));
+        let wide = at(&attached, 120);
+        assert!(wide.ends_with(HINT_DETACH), "{wide}");
+        assert_eq!(
+            wide.trim_end_matches(HINT_DETACH).trim_end(),
+            at(&live, 120).trim_end_matches(HINT).trim_end()
+        );
+        for cols in [60, 40, 25] {
+            assert_eq!(at(&attached, cols), at(&live, cols), "{cols}");
         }
     }
 
@@ -517,6 +545,7 @@ mod tests {
             standing: None,
             spot: None,
             hint: false,
+            detach: false,
             held: false,
         };
         for cols in 1..=120_u16 {

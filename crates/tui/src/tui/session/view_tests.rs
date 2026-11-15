@@ -159,6 +159,123 @@ fn draw_at(view: &mut TuiProgressView, width: u16) -> Vec<String> {
 }
 
 const KEYS: &str = "  [y] approve · [n] reject · enter view";
+/// What a viewer's approval banner says in place of [`KEYS`], after the
+/// pending count.
+const ELSEWHERE: &str = " · decide in the terminal that runs it";
+/// The line's hint on a viewer, and on the run.
+const DETACH_HINT: &str = "q detach · tab ⇥";
+const HINT: &str = "tab ⇥";
+
+/// A line row of the viewer, with its seam undone: its banner wording and
+/// its hint read as the run's, runs of spaces as one.
+fn line_as_live(row: &str) -> String {
+    squash(&row.replace(ELSEWHERE, "").replace(DETACH_HINT, HINT))
+}
+
+/// A target screen's `attached` frame is `live`'s, apart from the title
+/// naming the session and the hints ending in `q detach`.
+fn assert_same_target_frame(live: &[String], attached: &[String], id: SessionId, at: &str) {
+    assert_eq!(live.len(), attached.len(), "{at}: same height");
+    let (live_help, live_rows) = live.split_last().expect("a help row");
+    let (attached_help, attached_rows) = attached.split_last().expect("a help row");
+    let session = format!("  session {id}");
+    for (i, (live_row, attached_row)) in live_rows.iter().zip(attached_rows).enumerate() {
+        if attached_row.contains(&session) {
+            assert_eq!(
+                squash(&attached_row.replace(&session, "")),
+                squash(live_row),
+                "{at}: the title, row {i}"
+            );
+        } else {
+            assert_eq!(attached_row, live_row, "{at}: row {i}");
+        }
+    }
+    assert_eq!(
+        *attached_help,
+        format!("{live_help} · q detach"),
+        "{at}: the help row"
+    );
+}
+
+/// The log both views' Log tab reads for the failed target.
+const BAD_LOG: &str = "compile error: boom\n";
+/// The fix both views' Outputs tab lists for it.
+const BAD_FIX: &str = "src/fixed.rs";
+/// The LAST LINE both views' list shows for the running target.
+const SLOW_LINE: &str = "Compiling slow";
+
+/// The run's own readers and the viewer's answer the same: what differs
+/// between them in `heph session attach` is where they read, not the view.
+struct SameReader;
+
+impl crate::tui::dashboard::TargetReader for SameReader {
+    fn open_log(&self, _addr: &str) -> crate::tui::dashboard::LogOpened {
+        crate::tui::dashboard::LogOpened::Tail {
+            bytes: BAD_LOG.as_bytes().to_vec(),
+            len: BAD_LOG.len() as u64,
+            about: "from the failure slot".into(),
+        }
+    }
+
+    fn outputs(&self, _addr: &str, _failed: bool) -> crate::tui::dashboard::OutputsFound {
+        crate::tui::dashboard::OutputsFound::Failure {
+            kept: Vec::new(),
+            fixes: vec![BAD_FIX.into()],
+        }
+    }
+}
+
+impl crate::tui::dashboard::LogReader for SameReader {
+    fn size(&self, addr: &str) -> Option<u64> {
+        (addr == "//a:slow").then_some(SLOW_LINE.len() as u64 + 1)
+    }
+
+    fn tail(&self, addr: &str, _max: usize) -> Option<Vec<u8>> {
+        (addr == "//a:slow").then(|| format!("{SLOW_LINE}\n").into_bytes())
+    }
+}
+
+/// [`draw`] until `needle` shows (a reader answers off the frame's thread),
+/// failing after 10 s.
+fn draw_until(view: &mut TuiProgressView, needle: &str) -> Vec<String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let frame = draw(view);
+        if frame.iter().any(|r| r.contains(needle)) {
+            return frame;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{needle:?} never showed:\n{}",
+            frame.join("\n")
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// With readers given, the list's LAST LINE column and the failed target's
+/// three screens, as `view` draws them: All tab, then Overview, Log and
+/// Outputs of `//a:bad`. The view is left on the list's All tab.
+fn draw_screens(view: &mut TuiProgressView) -> [Vec<String>; 4] {
+    let list = draw_until(view, SLOW_LINE);
+    // All · Running · Pending · Failed, and the failed target is the row.
+    for _ in 0..3 {
+        view.tab(true);
+    }
+    // A failed target opens on its Log.
+    view.open_selected(false);
+    let log = draw_until(view, BAD_LOG.trim_end());
+    view.tab(true);
+    let outputs = draw_until(view, BAD_FIX);
+    view.tab(true);
+    let overview = draw_until(view, "//a:bad");
+    // From the target screen, back to the list.
+    view.back_to_main();
+    for _ in 0..3 {
+        view.tab(false);
+    }
+    [list, overview, log, outputs]
+}
 
 /// Runs of spaces as one: a title whose session segment is gone pads its
 /// right-aligned gauges wider, and that padding is not the seam.
@@ -191,7 +308,7 @@ fn assert_same_but_the_seam(
             );
         } else {
             assert_eq!(
-                *attached_row,
+                attached_row.replace(ELSEWHERE, ""),
                 live_row.replace(KEYS, "").trim_end(),
                 "{at}: row {i}"
             );
@@ -248,7 +365,7 @@ fn draw_line(view: &mut TuiProgressView) -> Vec<String> {
 /// frame at each point the approval prompt changed, and prints the same
 /// final line.
 #[test]
-fn attached_view_draws_what_the_run_drew() {
+fn attached_frames_match_live() {
     let root = tempfile::tempdir().expect("tempdir");
     let session_root = SessionRoot::new(root.path());
     // Another session of this process holds the lock, so both views name it.
@@ -312,6 +429,10 @@ fn attached_view_draws_what_the_run_drew() {
     let live_after = draw(&mut live);
     let live_after_line = draw_line(&mut live);
     let live_more = draw_more(&mut live);
+    let mut live = live
+        .with_log_reader(Arc::new(SameReader))
+        .with_target_reader(Arc::new(SameReader));
+    let live_screens = draw_screens(&mut live);
 
     let finished_at = NOW + 500;
     live.set_finished(finished_at);
@@ -401,13 +522,30 @@ fn attached_view_draws_what_the_run_drew() {
         line.contains("1 failed") && line.contains("✗ //a:bad"),
         "{line}"
     );
+    // The viewer's seam on the line: the banner says where to decide, the
+    // hint that `q` detaches.
+    let [attached_prompt_row, attached_line] = attached_prompt_line.as_slice() else {
+        panic!("a prompt row and the line: {attached_prompt_line:#?}");
+    };
+    assert!(
+        attached_prompt_row.ends_with(&format!("2 pending{ELSEWHERE}")),
+        "{attached_prompt_row}"
+    );
+    assert!(attached_line.ends_with(DETACH_HINT), "{attached_line}");
+    let as_live = |rows: &[String]| rows.iter().map(|r| line_as_live(r)).collect::<Vec<_>>();
     let expected: Vec<String> = live_prompt_line
         .iter()
-        .map(|r| r.replace(KEYS, ""))
+        .map(|r| squash(&r.replace(KEYS, "")))
         .collect();
-    assert_eq!(attached_prompt_line, &expected, "the line, prompt shown");
     assert_eq!(
-        attached_after_line, &live_after_line,
+        as_live(attached_prompt_line),
+        expected,
+        "the line, prompt shown"
+    );
+    let expected: Vec<String> = live_after_line.iter().map(|r| squash(r)).collect();
+    assert_eq!(
+        as_live(attached_after_line),
+        expected,
         "the line, prompt cleared"
     );
 
@@ -427,6 +565,23 @@ fn attached_view_draws_what_the_run_drew() {
         NARROW,
         "failed tab, narrow",
     );
+
+    // Given the same readers, the LAST LINE column and the target screens
+    // match too: the reader seam is where attach differs, not the view.
+    let mut attached = attached
+        .with_log_reader(Arc::new(SameReader))
+        .with_target_reader(Arc::new(SameReader));
+    let attached_screens = draw_screens(&mut attached);
+    let [live_list, live_target @ ..] = &live_screens;
+    let [attached_list, attached_target @ ..] = &attached_screens;
+    assert_same_but_the_seam(live_list, attached_list, id, WIDTH, "LAST LINE");
+    for ((live, attached), tab) in live_target
+        .iter()
+        .zip(attached_target)
+        .zip(["Overview", "Log", "Outputs"])
+    {
+        assert_same_target_frame(live, attached, id, tab);
+    }
 
     // The viewer finishes later than the run did; its summary still reads the
     // run's clock.

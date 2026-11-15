@@ -231,6 +231,22 @@ pub fn new_helper_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigg
     new_engine_with(&super::GlobalOptions::default(), BadEnv::Ignore, None)
 }
 
+/// An engine over `root`'s home that only reads what other hephs wrote
+/// there, for `heph session attach`'s log and output readers: the config
+/// resolved from `root` (not the cwd), no plugin loaded, no hook, no SIGINT
+/// handler (attach's own Ctrl-C detaches, and must not cancel or hard-exit
+/// through an engine's), no session. Returns the home it resolved, which
+/// the caller checks against the one the session recorded.
+pub fn new_reader_engine(
+    global: &super::GlobalOptions,
+    root: &std::path::Path,
+) -> anyhow::Result<(Arc<engine::Engine>, std::path::PathBuf)> {
+    let (_file, config) = engine_config(root, global, BadEnv::Ignore, std::env::vars_os())?;
+    let home = config.home_dir.to_path_buf();
+    let engine = engine::Engine::new(config).context("building a reader engine")?;
+    Ok((Arc::new(engine), home))
+}
+
 /// What a malformed `HEPH_RESOURCE_<NAME>` does to engine construction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BadEnv {

@@ -1330,7 +1330,10 @@ async fn attach_mirrors_the_session_exit() {
                 &id.encode(),
                 crate::tui::LogSink::new_direct_with(std::sync::Arc::clone(slot)),
                 slot,
-                true,
+                &crate::commands::GlobalOptions {
+                    no_tui: true,
+                    ..Default::default()
+                },
             )
             .await
         }
