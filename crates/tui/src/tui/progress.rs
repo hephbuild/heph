@@ -16,6 +16,8 @@ use crate::tui::session::{HolderNames, SessionId};
 use hcore::capacity::Unit;
 use hcore::events::{BuildEvent, BuildEventKind, CacheCounts};
 
+#[cfg(test)]
+mod approval_tests;
 mod line;
 mod spotlight;
 #[cfg(test)]
@@ -1760,16 +1762,22 @@ pub struct TuiProgressView {
     stop_arm: crate::tui::stop_arm::StopArm,
     /// `--dashboard`: the finished run holds until `q` on any screen.
     pinned: bool,
-    /// The rows the approval banner took above the last dashboard frame:
-    /// where that frame's own rows start, for a click.
-    dash_top: u16,
+    /// The approval view, over whichever screen opened it (the line, the
+    /// dashboard or a target screen); closing it returns there.
+    approval: Option<crate::tui::dashboard::approval::ApprovalScreen>,
+    /// Where the approval view reads notices: heph's home's
+    /// content-addressed store ([`Self::with_notice_home`]).
+    notices: Option<crate::tui::dashboard::approval::NoticeStore>,
+    /// Whether the approval glyph flashes (`✦`/`❖`). Off under reduced
+    /// motion, which is `NO_COLOR` alone: there is no config key for it.
+    motion: bool,
 }
 
 /// Whose terminal a [`TuiProgressView`] draws on.
 ///
 /// `heph session attach` draws the run's own view, so the only things that
-/// differ are here: what acts on the run (cancel, approval `y`/`n`/Enter)
-/// exists only in [`Role::Live`], and an attached view reads what the run's
+/// differ are here: what acts on the run (cancel, the approval view's
+/// decisions) exists only in [`Role::Live`], and an attached view reads what the run's
 /// terminal showed besides build events (its label changes, the approval
 /// prompt, the instant its summary was measured) from the recorded
 /// [`SessionFeed`].
@@ -1779,9 +1787,9 @@ enum Role {
     /// The run of this process.
     Live {
         /// Pending approval prompts shared with the engine's approval handler.
-        /// `None` for commands without an approval gate. When a prompt is
-        /// active it is rendered at the top of the live body and
-        /// `y`/`n`/Enter resolve it.
+        /// `None` for commands without an approval gate. While one is
+        /// pending the line shows its prompt row, and the approval view
+        /// decides it.
         approval: Option<crate::tui::approval::ApprovalCenter>,
     },
     /// A viewer of the recorded session `id`.
@@ -1794,63 +1802,44 @@ enum Role {
     },
 }
 
-/// The keys an approval banner offers, when it offers any.
-struct ApprovalKeys {
-    /// Whether the notice body is expanded (`enter hide` vs `enter view`).
-    expanded: bool,
-}
-
-/// The approval banner and its notice links. Both roles draw through this, so
-/// an attached viewer shows the run's prompt as the run did, without `keys`.
-fn approval_banner<'a>(
-    addr: &str,
-    queued_behind: u64,
-    notices: impl ExactSizeIterator<Item = &'a str>,
-    keys: Option<ApprovalKeys>,
-) -> Vec<Line<'static>> {
-    let mut lines = Vec::with_capacity(1 + notices.len());
-    // When more than one target is awaiting approval, show the total count so
-    // the user knows further prompts follow this one.
-    let total_pending = queued_behind.saturating_add(1);
-    let queued = if total_pending > 1 {
-        format!(" · {total_pending} pending")
+/// The prompt row above the line while a request is pending:
+/// `✦ approval required: //x · 2 pending · enter to review`. Both roles draw
+/// through this; a viewer (`live` false) says where the decision is made
+/// instead of offering a key (I11). Never a notice's path.
+fn approval_prompt_row(glyph: &'static str, addr: &str, pending: u64, live: bool) -> Line<'static> {
+    let queued = if pending > 1 {
+        format!(" · {pending} pending")
     } else {
         String::new()
     };
-    let tail = match keys {
-        // A viewer decides nothing: it says where the decision is made.
-        None => format!("{queued}{APPROVAL_ELSEWHERE}"),
-        // Only offer the notice-view toggle when there is a notice to view.
-        Some(_) if notices.len() == 0 => format!("{APPROVAL_KEYS}{queued}"),
-        Some(ApprovalKeys { expanded: true }) => format!("{APPROVAL_KEYS} · enter hide{queued}"),
-        Some(ApprovalKeys { expanded: false }) => {
-            format!("{APPROVAL_KEYS} · enter view{queued}")
-        }
+    let tail = if live {
+        APPROVAL_REVIEW
+    } else {
+        APPROVAL_ELSEWHERE
     };
-    lines.push(Line::from(Span::styled(
-        format!(
-            "  ⚠ approval required: {}{tail}",
-            crate::tui::text::clean_inline(addr)
+    let style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    Line::from(vec![
+        Span::styled(glyph, style),
+        Span::styled(
+            format!(
+                " approval required: {}{queued}{tail}",
+                crate::tui::text::clean_inline(addr)
+            ),
+            style,
         ),
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
-    )));
-    // Name every notice the target declares; the text itself is the inline
-    // preview's (no notice is written to a file to open).
-    for name in notices {
-        lines.push(Line::from(Span::styled(
-            format!("    → notice: {name}"),
-            Style::default().fg(Color::Cyan),
-        )));
-    }
-    lines
+    ])
 }
 
-/// The approval banner's keys, which act on the run: a live view only.
-const APPROVAL_KEYS: &str = "  [y] approve · [n] reject";
+/// The prompt row's key, in the run's own view: Enter opens the approval
+/// view, the only place that decides.
+const APPROVAL_REVIEW: &str = " · enter to review";
 
-/// What an attached viewer's banner says in place of the keys (I11).
+/// The dashboard's hint for the approval view while a request is pending.
+const APPROVAL_OPEN_HINT: &str = "v review approval";
+
+/// What an attached viewer's prompt row says in place of the key (I11).
 const APPROVAL_ELSEWHERE: &str = " · decide in the terminal that runs it";
 
 /// A header's items as plain text, joined as the box joins them.
@@ -1892,8 +1881,77 @@ impl TuiProgressView {
             role: Role::Live { approval: None },
             stop_arm: crate::tui::stop_arm::StopArm::default(),
             pinned: false,
-            dash_top: 0,
+            approval: None,
+            notices: None,
+            motion: std::env::var_os("NO_COLOR").is_none(),
         }
+    }
+
+    /// Read the approval view's notices from heph's home, `home`, by their
+    /// content hash. Without it every notice reads "notice unavailable".
+    pub fn with_notice_home(mut self, home: impl Into<std::path::PathBuf>) -> Self {
+        self.notices = Some(crate::tui::dashboard::approval::NoticeStore::new(home));
+        self
+    }
+
+    /// The approval glyph at `now_ms`, flashing unless motion is reduced.
+    fn glyph(&self, now_ms: u64) -> &'static str {
+        crate::tui::dashboard::model::approval_glyph(now_ms, self.motion)
+    }
+
+    /// The pending requests, oldest first: a live view's queue; a viewer's
+    /// is empty (it decides nothing, and draws the run's prompt from the
+    /// feed).
+    fn approval_queue(&self) -> Vec<crate::tui::approval::QueuedApproval> {
+        self.approval_center()
+            .map(crate::tui::approval::ApprovalCenter::queue)
+            .unwrap_or_default()
+    }
+
+    /// Hand the list this frame's (or key's) pending requests, so its
+    /// Approvals tab and ✦ rows match the queue. Before every use of the
+    /// list. `glyph`: this frame's, or `None` to keep the last frame's.
+    fn sync_approvals(&mut self, glyph: Option<&'static str>) {
+        use crate::tui::dashboard::list::ApprovalRow;
+        let glyph = glyph.unwrap_or_else(|| self.list.approval_glyph());
+        let rows = self
+            .approval_queue()
+            .into_iter()
+            .filter_map(|q| {
+                let id = self.state.dash.id(&q.addr)?;
+                let names: Vec<&str> = q.notices.iter().map(|n| n.name.as_str()).collect();
+                Some(ApprovalRow {
+                    id,
+                    seq: q.seq,
+                    waited_ms: u64::try_from(q.waited.as_millis()).unwrap_or(u64::MAX),
+                    notices: if names.is_empty() {
+                        String::new()
+                    } else {
+                        format!("notices: {}", names.join(", "))
+                    },
+                })
+            })
+            .collect();
+        self.list.set_approvals(&self.state.dash, rows, glyph);
+    }
+
+    /// Open the approval view on request `seq`, when it is still pending
+    /// (or on the oldest, for `None`). `false`: nothing to open.
+    fn open_approval(&mut self, seq: Option<u64>) -> bool {
+        let queue = self.approval_queue();
+        let req = match seq {
+            Some(seq) => queue.into_iter().find(|q| q.seq == seq),
+            None => queue.into_iter().next(),
+        };
+        let Some(req) = req else {
+            return false;
+        };
+        self.approval = Some(crate::tui::dashboard::approval::ApprovalScreen::open(
+            req,
+            self.notices.clone(),
+            &self.state.redact,
+        ));
+        true
     }
 
     /// This view, as `heph session attach` draws session `id`: the same view
@@ -2032,17 +2090,12 @@ impl TuiProgressView {
         (self.label(), session, clock)
     }
 
-    /// One dashboard frame, `cols` × `rows`: the pending approval's banner
-    /// (and its notices, when expanded) on top while one is pending, then
-    /// [`crate::tui::dashboard::dashboard_frame`] in the rows left.
+    /// One dashboard frame, `cols` × `rows`:
+    /// [`crate::tui::dashboard::dashboard_frame`], its pending requests
+    /// leading All and on the Approvals tab.
     fn dashboard_lines(&mut self, now_ms: u64, cols: u16, rows: u16) -> Vec<Line<'static>> {
         use crate::tui::dashboard::{DASHBOARD_HINTS, ListInputs, Title, dashboard_frame};
-        let mut out = self.approval_lines();
-        // The banner never takes more than half the screen: the list is what
-        // the dashboard is for.
-        out.truncate(usize::from(rows / 2));
-        self.dash_top = u16::try_from(out.len()).unwrap_or(rows);
-        let left = rows.saturating_sub(self.dash_top);
+        self.sync_approvals(Some(self.glyph(now_ms)));
         let (command, session, clock) = self.dashboard_title_parts(now_ms);
         let scope = self.list.scope;
         let tabs = self.state.dash.counts(scope);
@@ -2072,6 +2125,9 @@ impl TuiProgressView {
                 Role::Attached { .. } => {
                     format!("{} · q detach", keys.trim_end_matches(" · ctrl-c stop")).into()
                 }
+                Role::Live { .. } if !self.list.approvals().is_empty() => {
+                    format!("{APPROVAL_OPEN_HINT} · {keys}").into()
+                }
                 Role::Live { .. } => keys.into(),
             }
         };
@@ -2087,14 +2143,7 @@ impl TuiProgressView {
             now_ms,
             redact: &self.state.redact,
         };
-        out.extend(dashboard_frame(
-            &title,
-            &inputs,
-            &mut self.list,
-            &hints,
-            cols,
-            left,
-        ));
+        let out = dashboard_frame(&title, &inputs, &mut self.list, &hints, cols, rows);
         // The rows this frame shows, for the reader to (re)read off this task.
         if let Some(tails) = self.tails.as_mut().filter(|t| t.wants(now_ms)) {
             tails.send(
@@ -2107,22 +2156,27 @@ impl TuiProgressView {
     }
 
     /// The spotlight's rule 1: the pending approval on show, with how many
-    /// are pending. The run's from its queue, a viewer's from the feed.
-    fn approval_spot(&self) -> Option<Spot> {
+    /// are pending. The run's from its queue, a viewer's from the feed. Its
+    /// ✦ flashes with the frame's glyph at `now_ms`.
+    fn approval_spot(&self, now_ms: u64) -> Option<Spot> {
+        let (addr, pending) = self.approval_pending()?;
+        let mut spot = Spot::approval(&addr, pending);
+        spot.icon = self.glyph(now_ms);
+        Some(spot)
+    }
+
+    /// The request the prompt row names (the oldest pending) and how many
+    /// are pending: the run's from its queue, a viewer's from the feed.
+    fn approval_pending(&self) -> Option<(String, u64)> {
         match &self.role {
             Role::Live { approval } => {
-                let view = approval.as_ref()?.current()?;
-                let pending = u64::try_from(view.queued_behind)
-                    .unwrap_or(u64::MAX)
-                    .saturating_add(1);
-                Some(Spot::approval(&view.addr, pending))
+                let mut queue = approval.as_ref()?.queue();
+                let pending = u64::try_from(queue.len()).unwrap_or(u64::MAX);
+                (!queue.is_empty()).then(|| (queue.swap_remove(0).addr, pending))
             }
             Role::Attached { feed, .. } => {
                 let prompt = feed.approval()?;
-                Some(Spot::approval(
-                    &prompt.addr,
-                    prompt.queued_behind.saturating_add(1),
-                ))
+                Some((prompt.addr, prompt.queued_behind.saturating_add(1)))
             }
         }
     }
@@ -2186,7 +2240,7 @@ impl TuiProgressView {
             body,
             standing: self.approval_standing(),
             spot: self
-                .approval_spot()
+                .approval_spot(now_ms)
                 .or_else(|| self.state.spotlight(now_ms)),
             hint: dashboard && live,
             detach: matches!(self.role, Role::Attached { .. }),
@@ -2259,50 +2313,49 @@ impl TuiProgressView {
         self
     }
 
-    /// Body rows for the active approval prompt, or empty when idle. The banner
-    /// carries the keys; when the target declares notices, each is named below
-    /// it, and `enter` toggles an inline (scrollable) preview of the contents. An attached view draws the
-    /// run's recorded prompt through the same banner, without keys or preview.
-    fn approval_lines(&self) -> Vec<Line<'static>> {
-        let center = match &self.role {
-            Role::Live { approval } => approval.as_ref(),
-            Role::Attached { feed, .. } => {
-                let Some(prompt) = feed.approval() else {
-                    return Vec::new();
-                };
-                return approval_banner(
-                    &prompt.addr,
-                    prompt.queued_behind,
-                    prompt.notices.iter().map(|n| n.name.as_str()),
-                    None,
-                );
-            }
+    /// The prompt row above the line while a request is pending, `None`
+    /// when none is.
+    fn approval_prompt(&self, now_ms: u64) -> Option<Line<'static>> {
+        let (addr, pending) = self.approval_pending()?;
+        Some(approval_prompt_row(
+            self.glyph(now_ms),
+            &addr,
+            pending,
+            matches!(self.role, Role::Live { .. }),
+        ))
+    }
+
+    /// The open approval view's frame, under the dashboard's header.
+    fn approval_lines(&mut self, now_ms: u64, cols: u16, rows: u16) -> Option<Vec<Line<'static>>> {
+        self.approval.as_ref()?;
+        let glyph = self.glyph(now_ms);
+        self.sync_approvals(Some(glyph));
+        let queue = self.approval_queue();
+        let (command, session, clock) = self.dashboard_title_parts(now_ms);
+        let scope = self.list.scope;
+        let mut counts = self.state.dash.counts(scope);
+        counts.approvals = queue.len();
+        counts.approval_glyph = glyph;
+        let title = crate::tui::dashboard::Title {
+            command: &command,
+            session: session.as_deref(),
+            clock: &clock,
+            done: counts.finished_ok(),
+            total: (scope == CountScope::All || self.state.dash.matched_seen())
+                .then(|| counts.all()),
+            provisional: scope == CountScope::Matched && !self.state.dash.matched_complete(),
+            standing: self.approval_standing().map(|s| s.indicator()),
         };
-        let Some(view) = center.and_then(|c| c.current()) else {
-            return Vec::new();
+        let gauges = self.state.dash.gauges();
+        let inputs = crate::tui::dashboard::approval::ApprovalInputs {
+            title: &title,
+            gauges: &gauges,
+            counts: &counts,
+            queue: &queue,
+            glyph,
+            now_ms,
         };
-        let mut lines = approval_banner(
-            &view.addr,
-            u64::try_from(view.queued_behind).unwrap_or(u64::MAX),
-            view.notices.iter().map(|n| n.name.as_str()),
-            Some(ApprovalKeys {
-                expanded: view.expanded,
-            }),
-        );
-        if view.expanded {
-            for notice in &view.notices {
-                lines.push(Line::from(Span::styled(
-                    format!("  ── {} ──", notice.name),
-                    Style::default().fg(Color::Cyan),
-                )));
-                // The handler's capped read from the store (truncation line
-                // included), or "notice unavailable".
-                for raw in notice.content.lines() {
-                    lines.push(Line::from(format!("  {raw}")));
-                }
-            }
-        }
-        lines
+        Some(self.approval.as_mut()?.frame(&inputs, cols, rows))
     }
 }
 
@@ -2350,17 +2403,21 @@ impl TUIAppView for TuiProgressView {
     fn rows(&self, _term_height: u16) -> u16 {
         // The line, and the approval prompt above it while one is pending.
         // The dashboard is drawn on the alternate screen, never here.
-        1 + u16::from(self.approval_spot().is_some())
+        1 + u16::from(self.approval_pending().is_some())
     }
 
     fn full_screen(&self) -> bool {
-        self.dashboard_open
+        self.dashboard_open || self.approval.is_some()
     }
 
     fn render_full(&mut self, now_ms: u64, cols: u16, rows: u16) -> Vec<Line<'static>> {
-        let mut lines = match self.target_lines(now_ms, cols, rows) {
+        // The approval view overlays whichever screen opened it.
+        let mut lines = match self.approval_lines(now_ms, cols, rows) {
             Some(lines) => lines,
-            None => self.dashboard_lines(now_ms, cols, rows),
+            None => match self.target_lines(now_ms, cols, rows) {
+                Some(lines) => lines,
+                None => self.dashboard_lines(now_ms, cols, rows),
+            },
         };
         // An armed stop takes the hint row, the last on every full screen.
         if let Some(prompt) = self.stop_arm.prompt(now_ms)
@@ -2382,7 +2439,7 @@ impl TUIAppView for TuiProgressView {
         stopping: bool,
     ) -> crate::tui::stop_arm::CtrlC {
         let at = crate::tui::stop_arm::Press {
-            full_screen: self.dashboard_open,
+            full_screen: self.full_screen(),
             attached: matches!(self.role, Role::Attached { .. }),
             finished: finished || self.finished_at_ms.is_some(),
             stopping,
@@ -2402,6 +2459,18 @@ impl TUIAppView for TuiProgressView {
     }
 
     fn screen_key(&mut self, key: crate::tui::app::ScreenKey) {
+        use crate::tui::app::ScreenKey;
+        if let Some(a) = self.approval.as_mut() {
+            // The notice's own movement; `n`/`N` decide here, upstream.
+            match key {
+                ScreenKey::PageUp => a.scroll(-a.page()),
+                ScreenKey::PageDown => a.scroll(a.page()),
+                ScreenKey::Top => a.scroll(isize::MIN),
+                ScreenKey::Bottom => a.scroll(isize::MAX),
+                ScreenKey::Follow | ScreenKey::Wrap | ScreenKey::Next | ScreenKey::Prev => {}
+            }
+            return;
+        }
         if let Some(t) = self.target.as_mut() {
             let _bound = t.key(key, &self.state.redact);
         }
@@ -2409,10 +2478,25 @@ impl TUIAppView for TuiProgressView {
 
     fn mouse(&mut self, input: crate::tui::app::MouseInput) {
         use crate::tui::app::MouseInput;
+        use crate::tui::dashboard::approval::ApprovalClick;
         use crate::tui::dashboard::{ListHit, TargetClick, WHEEL_ROWS};
+        // The approval view: its breadcrumb and notice tabs. No click
+        // decides.
+        if let Some(a) = self.approval.as_mut() {
+            match input {
+                MouseInput::Click { col, row } => {
+                    if a.click(col, row) == ApprovalClick::Back {
+                        self.approval = None;
+                    }
+                }
+                MouseInput::Wheel { down, .. } => a.wheel(down),
+            }
+            return;
+        }
         if !self.dashboard_open {
             return;
         }
+        self.sync_approvals(None);
         match (input, self.target.as_mut()) {
             (MouseInput::Click { col, row }, Some(t)) => {
                 if t.click(col, row) == TargetClick::Back {
@@ -2420,12 +2504,9 @@ impl TUIAppView for TuiProgressView {
                 }
             }
             (MouseInput::Wheel { down, .. }, Some(t)) => t.wheel(down),
-            // The approval banner above the list takes no click: approve
-            // and reject stay on y/n.
+            // A ✦ row opens its approval view, as Enter does; it never
+            // decides.
             (MouseInput::Click { col, row }, None) => {
-                let Some(row) = row.checked_sub(self.dash_top) else {
-                    return;
-                };
                 match self.list.hit(col, row) {
                     Some(ListHit::Tab(tab)) => self.list.set_tab(tab),
                     // A second click on the selected row opens it, like
@@ -2445,18 +2526,24 @@ impl TUIAppView for TuiProgressView {
     }
 
     fn scroll(&mut self, delta: i32) {
-        if let Some(t) = self.target.as_mut() {
+        if let Some(a) = self.approval.as_mut() {
+            a.scroll(isize::try_from(delta).unwrap_or(0));
+        } else if let Some(t) = self.target.as_mut() {
             t.scroll(isize::try_from(delta).unwrap_or(0));
         } else if self.dashboard_open {
             let delta = isize::try_from(delta).unwrap_or(0);
+            self.sync_approvals(None);
             self.list.select_move(&self.state.dash, delta);
         }
     }
 
     fn tab(&mut self, forward: bool) {
-        if let Some(t) = self.target.as_mut() {
+        if let Some(a) = self.approval.as_mut() {
+            a.cycle_notice(forward);
+        } else if let Some(t) = self.target.as_mut() {
             t.cycle_tab(forward);
         } else if self.dashboard_open {
+            self.sync_approvals(None);
             self.list.cycle_tab(forward);
         } else if self.model.has_dashboard() {
             // From the line, either direction opens the dashboard; a command
@@ -2466,7 +2553,7 @@ impl TUIAppView for TuiProgressView {
     }
 
     fn toggle_scope(&mut self) {
-        if self.target.is_some() {
+        if self.target.is_some() || self.approval.is_some() {
             return;
         }
         self.list.scope = match self.list.scope {
@@ -2476,10 +2563,13 @@ impl TUIAppView for TuiProgressView {
     }
 
     fn is_on_main_view(&self) -> bool {
-        !self.dashboard_open
+        !self.full_screen()
     }
 
     fn has_active_filter(&self) -> bool {
+        if self.approval.is_some() {
+            return false;
+        }
         match &self.target {
             Some(t) => t.has_search(),
             None => self.list.is_editing() || !self.list.filter().is_empty(),
@@ -2487,14 +2577,19 @@ impl TUIAppView for TuiProgressView {
     }
 
     fn back_to_main(&mut self) {
-        // From a target screen, back to the list; from the list, the line.
+        // From the approval view, back to the screen that opened it (the
+        // request stays pending); from a target screen, the list; from the
+        // list, the line.
+        if self.approval.take().is_some() {
+            return;
+        }
         if self.target.take().is_none() {
             self.dashboard_open = false;
         }
     }
 
     fn open_selected(&mut self, log: bool) {
-        if !self.dashboard_open {
+        if !self.dashboard_open || self.approval.is_some() {
             return;
         }
         if let Some(t) = &mut self.target {
@@ -2504,7 +2599,13 @@ impl TUIAppView for TuiProgressView {
             }
             return;
         }
+        self.sync_approvals(None);
         if let Some(id) = self.list.selected() {
+            // A ✦ row: Enter opens its approval view, on that request.
+            if !log && let Some(seq) = self.list.approval_of(id).map(|a| a.seq) {
+                let _opened = self.open_approval(Some(seq));
+                return;
+            }
             self.target = Some(crate::tui::dashboard::TargetScreen::open(
                 &self.state.dash,
                 id,
@@ -2514,45 +2615,81 @@ impl TUIAppView for TuiProgressView {
         }
     }
 
-    // The approval keys act on the run: inert in an attached view, which has
-    // no queue (its prompt is drawn from the feed).
-    fn approval_active(&self) -> bool {
-        self.approval_center().is_some_and(|c| c.is_active())
+    // The approval view acts on the run: an attached view has no queue (its
+    // prompt is drawn from the feed), so it opens nothing and decides
+    // nothing.
+    fn approval_open(&mut self) -> bool {
+        self.approval.is_none() && self.open_approval(None)
     }
 
-    fn approval_respond(&mut self, approve: bool) {
-        let Some(center) = self.approval_center() else {
-            return;
-        };
-        // The prompt on screen is the front of the queue; an expanded one had
-        // its notices read inline.
-        let Some(view) = center.current() else {
-            return;
-        };
-        let read = if view.expanded {
-            view.notices.into_iter().map(|n| n.name).collect()
-        } else {
-            Vec::new()
-        };
-        let _decided = center.respond(view.seq, approve, read);
+    fn in_approval_view(&self) -> bool {
+        self.approval.is_some()
     }
 
-    fn approval_toggle_notice(&mut self) {
-        if self.approval_center().is_none() {
+    fn approval_decide(&mut self, decide: crate::tui::app::Decide, now_ms: u64) {
+        use crate::tui::app::Decide;
+        use crate::tui::session::ApprovalStanding;
+        let Some(screen) = self.approval.as_mut() else {
+            return;
+        };
+        let Some(center) = (match &self.role {
+            Role::Live { approval } => approval.as_ref(),
+            Role::Attached { .. } => None,
+        }) else {
+            return;
+        };
+        // Locked out: dropped, never queued for when it arms.
+        if !screen.armed(now_ms) {
             return;
         }
-        // The notices show on the dashboard, above the list, until the
-        // approval view (unit 6) has a screen of its own: from the line,
-        // Enter opens it there.
-        if self.model.has_dashboard() {
-            self.dashboard_open = true;
+        let seq = screen.seq();
+        // The center prints each decision's scrollback line; the view only
+        // shows it in its header.
+        let approved = match decide {
+            Decide::Approve | Decide::Reject => {
+                let approve = decide == Decide::Approve;
+                center
+                    .respond(seq, approve, screen.read_names())
+                    .map(|d| d.approved)
+            }
+            Decide::ApproveAll | Decide::RejectAll => {
+                let standing = if decide == Decide::ApproveAll {
+                    ApprovalStanding::Approve
+                } else {
+                    ApprovalStanding::Reject
+                };
+                center
+                    .set_standing(seq, standing)
+                    .into_iter()
+                    .find(|d| d.seq == seq)
+                    .map(|d| d.approved)
+            }
+        };
+        if let Some(approved) = approved {
+            screen.decided(approved, now_ms);
         }
-        if let Some(center) = self.approval_center() {
-            center.toggle_expanded();
+    }
+
+    fn advance(&mut self, now_ms: u64) {
+        let Some(screen) = self.approval.as_mut() else {
+            return;
+        };
+        let queue = match &self.role {
+            Role::Live { approval } => approval
+                .as_ref()
+                .map(crate::tui::approval::ApprovalCenter::queue)
+                .unwrap_or_default(),
+            Role::Attached { .. } => Vec::new(),
+        };
+        if !screen.advance(now_ms, &queue) {
+            self.approval = None;
         }
     }
 
     fn is_searching(&self) -> bool {
+        if self.approval.is_some() {
+            return false;
+        }
         match &self.target {
             Some(t) => t.is_searching(),
             None => self.list.is_editing(),
@@ -2561,7 +2698,10 @@ impl TUIAppView for TuiProgressView {
 
     fn search_start(&mut self) {
         // A target screen searches its log; the dashboard filters its list;
-        // the line has neither.
+        // the line and the approval view have neither.
+        if self.approval.is_some() {
+            return;
+        }
         if let Some(t) = self.target.as_mut() {
             t.search_start();
         } else if self.dashboard_open {
@@ -2600,15 +2740,11 @@ impl TUIAppView for TuiProgressView {
         }
     }
 
-    /// The line, and above it the first row of the approval prompt while one
-    /// is pending. `height` is the rows [`Self::rows`] asked for.
+    /// The line, and above it the approval prompt row while a request is
+    /// pending. `height` is the rows [`Self::rows`] asked for.
     fn render(&self, spinner: &str, now_ms: u64, width: u16, _height: u16) -> Vec<Line<'static>> {
-        // The prompt's first row only: its notice links and preview are the
-        // dashboard's.
         let mut lines: Vec<Line<'static>> = Vec::with_capacity(2);
-        if self.approval_spot().is_some() {
-            lines.extend(self.approval_lines().into_iter().take(1));
-        }
+        lines.extend(self.approval_prompt(now_ms));
         lines.push(self.line(spinner, now_ms, width, true));
         lines
     }
@@ -2619,7 +2755,7 @@ impl TUIAppView for TuiProgressView {
         // their place). `--dashboard` holds on every screen. A viewer never
         // holds: the session's end prints its summary and report, and attach
         // exits with its code (I11).
-        !matches!(self.role, Role::Attached { .. }) && (self.dashboard_open || self.pinned)
+        !matches!(self.role, Role::Attached { .. }) && (self.full_screen() || self.pinned)
     }
 
     fn set_finished(&mut self, at_ms: u64) {
@@ -5220,29 +5356,34 @@ mod tests {
         assert_eq!(header(&v, 100_000), header(&v, 999_000));
     }
 
+    /// The prompt row names the oldest request and how many are pending,
+    /// and offers Enter; its ✦ flashes once a second unless motion is
+    /// reduced.
     #[test]
-    fn approval_banner_shows_pending_count() {
+    fn approval_prompt_row_names_the_oldest_and_counts() {
         let center = crate::tui::approval::ApprovalCenter::new();
-        // Two targets awaiting approval: the banner shows the active one plus the
-        // total pending count.
         let build = center.build();
-        let _r1 = center.request(&build, "//a:1".to_string(), vec![]);
+        let r1 = center.request(&build, "//a:1".to_string(), vec![]);
         let _r2 = center.request(&build, "//a:2".to_string(), vec![]);
-        let view = TuiProgressView::new("run").with_approval(center);
-        let lines = view.approval_lines();
-        let banner: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(banner.contains("//a:1"), "active prompt: {banner}");
-        assert!(banner.contains("2 pending"), "count: {banner}");
-    }
-
-    #[test]
-    fn approval_banner_single_has_no_pending_count() {
-        let center = crate::tui::approval::ApprovalCenter::new();
-        let _r = center.request(&center.build(), "//a:1".to_string(), vec![]);
-        let view = TuiProgressView::new("run").with_approval(center);
-        let lines = view.approval_lines();
-        let banner: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(!banner.contains("pending"), "no count for one: {banner}");
+        let mut view = TuiProgressView::new("run").with_approval(center.clone());
+        view.motion = true;
+        let row = |v: &TuiProgressView, now: u64| v.render("⠋", now, 200, 2)[0].to_string();
+        assert_eq!(
+            row(&view, 0),
+            "✦ approval required: //a:1 · 2 pending · enter to review"
+        );
+        assert!(row(&view, 1_000).starts_with("❖ "), "{}", row(&view, 1_000));
+        view.motion = false;
+        assert!(
+            row(&view, 1_000).starts_with("✦ "),
+            "reduced motion: static"
+        );
+        let _decided = center.respond(r1.seq, true, Vec::new());
+        assert_eq!(
+            row(&view, 0),
+            "✦ approval required: //a:2 · enter to review",
+            "no count for one"
+        );
     }
 
     /// The Done and Cached tabs list matched targets only, until `a` widens

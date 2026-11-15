@@ -15,7 +15,7 @@ use ratatui::widgets::Paragraph;
 
 use super::recorder::ViewTap;
 use super::*;
-use crate::tui::app::TUIAppView;
+use crate::tui::app::{Decide, TUIAppView};
 use crate::tui::approval::{ApprovalCenter, ApprovalNoticeView};
 use crate::tui::progress::{
     BuildHeader, BuildState, CountScope, HeaderItem, ProgressHeader, TuiProgressView,
@@ -158,9 +158,9 @@ fn draw_at(view: &mut TuiProgressView, width: u16) -> Vec<String> {
     paint(lines, width)
 }
 
-const KEYS: &str = "  [y] approve · [n] reject · enter view";
-/// What a viewer's approval banner says in place of [`KEYS`], after the
-/// pending count.
+const KEYS: &str = " · enter to review";
+/// What a viewer's approval prompt row says in place of [`KEYS`], after
+/// the pending count.
 const ELSEWHERE: &str = " · decide in the terminal that runs it";
 /// The line's hint on a viewer, and on the run.
 const DETACH_HINT: &str = "q detach · tab ⇥";
@@ -479,9 +479,6 @@ fn attached_frames_match_live() {
     // The frame shows what it should, so equality below is not vacuous.
     let joined = live_prompt.join("\n");
     for needle in [
-        "approval required: //a:gate",
-        "2 pending",
-        "notice: plan",
         "//a:slow",
         // The dashboard's LAST LINE for a lock wait names the holder.
         &format!("held by session {}", holder.id()),
@@ -489,7 +486,9 @@ fn attached_frames_match_live() {
     ] {
         assert!(joined.contains(needle), "{needle:?} in\n{joined}");
     }
-    assert!(live_prompt.iter().any(|r| r.contains(KEYS)), "{joined}");
+    // The prompt is the line's and the Approvals tab's: the dashboard has
+    // no banner, and never a notice's path.
+    assert!(!joined.contains("/ws/.heph"), "{joined}");
 
     let [live_narrow, live_failed, live_failed_narrow] = &live_more;
     let failed = live_failed.join("\n");
@@ -510,7 +509,8 @@ fn attached_frames_match_live() {
         panic!("a prompt row and the line: {live_prompt_line:#?}");
     };
     assert!(
-        prompt_row.contains("approval required: //a:gate"),
+        prompt_row.contains("approval required: //a:gate · 2 pending")
+            && prompt_row.ends_with(KEYS),
         "{prompt_row}"
     );
     assert!(line.contains("✦ //a:gate 2 pending"), "{line}");
@@ -600,8 +600,14 @@ fn only_the_live_view_acts_on_the_run() {
     let mut rx = center
         .request(&center.build(), "//a:gate".into(), Vec::new())
         .rx;
-    assert!(live.approval_active());
-    live.approval_respond(true);
+    assert!(
+        live.approval_open(),
+        "the run's view opens the approval view"
+    );
+    assert!(live.in_approval_view());
+    // The lockout runs from the first frame that drew the request.
+    drop(live.render_full(1_000, 100, 24));
+    live.approval_decide(Decide::Approve, 1_500);
     assert_eq!(rx.try_recv(), Ok(true), "the run's view answers the prompt");
 
     let center = ApprovalCenter::new();
@@ -616,10 +622,23 @@ fn only_the_live_view_acts_on_the_run() {
     let mut rx = center
         .request(&center.build(), "//a:gate".into(), Vec::new())
         .rx;
-    assert!(!attached.approval_active(), "a viewer holds no queue");
-    attached.approval_respond(true);
-    attached.approval_toggle_notice();
+    assert!(
+        !attached.approval_open(),
+        "a viewer holds no queue: no approval view opens"
+    );
+    assert!(!attached.in_approval_view());
+    drop(attached.render_full(1_000, 100, 24));
+    for decide in [
+        Decide::Approve,
+        Decide::Reject,
+        Decide::ApproveAll,
+        Decide::RejectAll,
+    ] {
+        attached.approval_decide(decide, 9_000);
+    }
+    attached.advance(9_000);
     assert!(center.is_active(), "the prompt is still pending");
+    assert!(center.standing().is_none(), "no standing decision either");
     assert!(
         matches!(
             rx.try_recv(),

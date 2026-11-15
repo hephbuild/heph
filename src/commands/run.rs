@@ -697,6 +697,7 @@ impl App for RunApp {
             label: self.label.clone(),
         }))
         .with_approval(self.approval.clone())
+        .with_notice_home(self.engine.home.as_ref())
         .with_redact(tui::text::Redact::heph_home(&self.engine.home))
         .with_log_reader(Arc::new(crate::commands::log::EngineTails::new(
             Arc::clone(&self.engine),

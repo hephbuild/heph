@@ -1211,23 +1211,37 @@ fn mouse_clicks_hit_the_drawn_element() {
 }
 
 /// No click anywhere decides an approval: a pending request survives a
-/// click on every cell of every screen the clicks reach, and a row under
-/// the approval banner is hit where it is drawn.
+/// click on every cell of every screen the clicks reach (its ✦ row opens
+/// the approval view, whose breadcrumb goes back), and a row under the ✦
+/// row that leads All is hit where it is drawn.
 #[test]
 fn mouse_clicks_never_decide_an_approval() {
+    use crate::tui::app::TUIAppView;
     let center = crate::tui::approval::ApprovalCenter::new();
-    let ticket = center.request(&center.build(), "//m:gate".into(), Vec::new());
+    let ticket = center.request(&center.build(), "//m:c".into(), Vec::new());
     let mut v = mouse_view().with_approval(center.clone());
     let (cols, rows) = (100, 24);
 
-    // Under the banner, the list's rows are where they are drawn.
+    // Under the ✦ row, the list's rows are where they are drawn.
     let f = view_frame(&mut v, cols, rows);
-    let c = cell_of(&f, "//m:c ");
-    assert!(c.1 > 5, "the banner is above the list: {f:#?}");
-    assert!(!f[usize::from(c.1)].starts_with(" ▸"), "{f:#?}");
-    click(&mut v, c);
+    let gate = cell_of(&f, "awaits approval");
+    let a = cell_of(&f, "//m:a ");
+    assert!(a.1 > gate.1, "the ✦ row leads All: {f:#?}");
+    assert!(!f[usize::from(a.1)].starts_with(" ▸"), "{f:#?}");
+    click(&mut v, a);
     let f = view_frame(&mut v, cols, rows);
-    assert!(f[usize::from(c.1)].starts_with(" ▸"), "{f:#?}");
+    assert!(f[usize::from(a.1)].starts_with(" ▸"), "{f:#?}");
+
+    // The ✦ row, clicked as a row is opened, opens its approval view.
+    click(&mut v, gate);
+    click(&mut v, gate);
+    assert!(
+        v.in_approval_view(),
+        "{:#?}",
+        view_frame(&mut v, cols, rows)
+    );
+    let f = view_frame(&mut v, cols, rows);
+    assert!(f[2].contains("//m:c"), "{f:#?}");
 
     for row in 0..rows {
         for col in 0..cols {
@@ -1236,10 +1250,7 @@ fn mouse_clicks_never_decide_an_approval() {
         }
     }
     assert!(center.is_active(), "the request is still pending");
-    assert_eq!(
-        center.current().map(|c| c.addr),
-        Some("//m:gate".to_owned())
-    );
+    assert_eq!(center.current().map(|c| c.addr), Some("//m:c".to_owned()));
     drop(ticket);
 }
 

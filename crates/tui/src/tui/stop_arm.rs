@@ -135,12 +135,34 @@ mod tests {
     /// After the confirming press every further ctrl-c goes to the shutdown
     /// without arming, so the hard abort keeps its press count; a build that
     /// finishes inside the window leaves the arming moot; a mouse event or a
-    /// resize does not disarm, any key does.
-    ///
-    /// The approval view arms like the other full screens: that clause comes
-    /// with the approval view itself (unit 6).
+    /// resize does not disarm, any key does; and the approval view, opened
+    /// from the line, arms like the other full screens.
     #[test]
     fn ctrl_c_after_stop_goes_direct() {
+        // The approval view is a full screen: the first press arms, the
+        // second stops; closed, the line stops at once.
+        {
+            use crate::tui::app::TUIAppView;
+            let center = crate::tui::approval::ApprovalCenter::new();
+            let _ticket = center.request(&center.build(), "//a:gate".into(), Vec::new());
+            let mut v = crate::tui::TuiProgressView::new("run").with_approval(center);
+            assert!(v.approval_open());
+            assert!(v.full_screen() && !v.is_on_main_view());
+            assert_eq!(v.ctrl_c(0, false, false), CtrlC::Arm, "the view arms");
+            assert!(v.in_approval_view(), "arming leaves the view up");
+            assert_eq!(v.ctrl_c(1_000, false, false), CtrlC::Stop);
+            let center = crate::tui::approval::ApprovalCenter::new();
+            let _ticket = center.request(&center.build(), "//a:gate".into(), Vec::new());
+            let mut v = crate::tui::TuiProgressView::new("run").with_approval(center);
+            assert!(v.approval_open());
+            v.back_to_main();
+            assert_eq!(
+                v.ctrl_c(0, false, false),
+                CtrlC::Stop,
+                "the line: one press"
+            );
+        }
+
         let mut s = StopArm::default();
         assert_eq!(s.press(DASH, 0), CtrlC::Arm);
         assert_eq!(s.press(DASH, 2_999), CtrlC::Stop, "inside the window");

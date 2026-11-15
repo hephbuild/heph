@@ -61,9 +61,6 @@ struct Pending {
 struct Inner {
     /// Gated targets awaiting a decision, oldest first.
     queue: VecDeque<Pending>,
-    /// The request whose notice body is expanded (Enter toggles), by number:
-    /// the next request at the front starts collapsed.
-    expanded: Option<u64>,
     /// The last sequence number handed out; numbers start at 1.
     last_seq: u64,
     /// The last build number handed out.
@@ -213,7 +210,6 @@ pub struct ApprovalView {
     pub seq: u64,
     pub addr: String,
     pub notices: Vec<ApprovalNoticeView>,
-    pub expanded: bool,
     /// How many further targets are queued behind this one.
     pub queued_behind: usize,
 }
@@ -328,7 +324,6 @@ impl ApprovalCenter {
             seq: front.seq,
             addr: front.addr.clone(),
             notices: front.notices.clone(),
-            expanded: inner.expanded == Some(front.seq),
             queued_behind: inner.queue.len().saturating_sub(1),
         })
     }
@@ -345,7 +340,6 @@ impl ApprovalCenter {
                 seq: p.seq,
                 addr: p.addr.clone(),
                 notices: p.notices.clone(),
-                expanded: inner.expanded == Some(p.seq),
                 queued_behind: len - i - 1,
             })
             .collect()
@@ -397,19 +391,6 @@ impl ApprovalCenter {
                 })
                 .collect(),
         })
-    }
-
-    /// Expand/collapse the front request's notice body (Enter).
-    pub fn toggle_expanded(&self) {
-        let mut inner = self.lock_pruned();
-        let Some(front) = inner.queue.front().map(|p| p.seq) else {
-            return;
-        };
-        inner.expanded = if inner.expanded == Some(front) {
-            None
-        } else {
-            Some(front)
-        };
     }
 
     /// Decide request `seq`, having read the notices named in `read`, and log
@@ -487,10 +468,6 @@ mod tests {
         assert_eq!(view.addr, "//a:b");
         assert_eq!(view.seq, t.seq);
         assert_eq!(view.notices.len(), 1);
-        assert!(!view.expanded);
-
-        center.toggle_expanded();
-        assert!(center.current().expect("active").expanded);
 
         let d = center
             .respond(t.seq, true, vec!["plan".into()])

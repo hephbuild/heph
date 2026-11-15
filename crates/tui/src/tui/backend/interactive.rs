@@ -22,7 +22,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::{Terminal, TerminalOptions, Viewport};
 use tokio::sync::mpsc;
 
-use crate::tui::app::{App, AppContext, Control, MouseInput, ScreenKey, TUIAppView};
+use crate::tui::app::{App, AppContext, Control, Decide, MouseInput, ScreenKey, TUIAppView};
 use crate::tui::log_sink::{LogSink, REPLAY_FLUSH_TIMEOUT, ReplayMark, Replayed, SinkLine};
 use crate::tui::session::recorder::ViewTap;
 use crate::tui::session::{SessionSlot, TappedReceiver};
@@ -548,26 +548,43 @@ pub async fn run<A: App + 'static>(
                             view.back_to_main();
                         }
                     }
-                    // Approval prompt active: `y`/`n` resolve the gated target and
-                    // Enter expands/collapses its notice. These precede the normal
-                    // shortcuts so a gated run is resolvable without other keys
-                    // (e.g. `n`/`a`) being intercepted first.
+                    // The approval view is the only place that decides:
+                    // `y`/`n`/`Y`/`N` there, nowhere else (a `y` typed for
+                    // something else never approves; `n` stays search's).
+                    // These precede every other arm while it is up.
+                    Some(Ok(Event::Key(key)))
+                        if decision_key(&key, view.in_approval_view()).is_some() =>
+                    {
+                        if let Some(decide) = decision_key(&key, true) {
+                            view.approval_decide(decide, now_unix_ms());
+                        }
+                    }
+                    // ←/→ switch notices; Enter decides nothing there.
                     Some(Ok(Event::Key(KeyEvent {
-                        code: KeyCode::Char('y'),
+                        code: code @ (KeyCode::Left | KeyCode::Right),
                         kind: KeyEventKind::Press,
                         ..
-                    }))) if view.approval_active() => view.approval_respond(true),
-                    Some(Ok(Event::Key(KeyEvent {
-                        code: KeyCode::Char('n'),
-                        kind: KeyEventKind::Press,
-                        ..
-                    }))) if view.approval_active() => view.approval_respond(false),
+                    }))) if view.in_approval_view() => view.tab(code == KeyCode::Right),
                     Some(Ok(Event::Key(KeyEvent {
                         code: KeyCode::Enter,
                         kind: KeyEventKind::Press,
                         ..
-                    }))) if view.approval_active() && !view.is_searching() => {
-                        view.approval_toggle_notice()
+                    }))) if view.in_approval_view() => {}
+                    // Enter on the line's prompt row, and `v` on any full
+                    // screen, open the oldest pending request.
+                    Some(Ok(Event::Key(KeyEvent {
+                        code: KeyCode::Enter,
+                        kind: KeyEventKind::Press,
+                        ..
+                    }))) if !view.full_screen() && !view.is_searching() => {
+                        let _opened = view.approval_open();
+                    }
+                    Some(Ok(Event::Key(KeyEvent {
+                        code: KeyCode::Char('v'),
+                        kind: KeyEventKind::Press,
+                        ..
+                    }))) if view.full_screen() && !view.is_searching() => {
+                        let _opened = view.approval_open();
                     }
                     // While the `/` filter captures input, printable keys, Backspace
                     // and Enter edit the query instead of firing the shortcuts
@@ -749,6 +766,9 @@ pub async fn run<A: App + 'static>(
                     paused = false;
                     resume_pending = false;
                 }
+                // The approval view's flash, and a request that left the
+                // queue: either can close it, so before the check below.
+                view.advance(now_unix_ms());
                 // The view opened or closed its full screen.
                 if view.full_screen() != full.is_some() {
                     if full.take().is_some() {
@@ -955,7 +975,23 @@ fn mouse_input(m: MouseEvent) -> Option<MouseInput> {
 }
 
 /// The full-screen key `code` stands for, if any.
-fn screen_key(code: KeyCode) -> Option<ScreenKey> {
+/// The decision `key` asks for: `y`/`n`/`Y`/`N` pressed (without ctrl)
+/// while the approval view is up. Anywhere else no key decides, so `n`
+/// stays a log search's next match.
+pub(crate) fn decision_key(key: &KeyEvent, in_approval_view: bool) -> Option<Decide> {
+    if !in_approval_view
+        || key.kind != KeyEventKind::Press
+        || key.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char(c) => Decide::of(c),
+        _ => None,
+    }
+}
+
+pub(crate) fn screen_key(code: KeyCode) -> Option<ScreenKey> {
     Some(match code {
         KeyCode::Char('f') => ScreenKey::Follow,
         KeyCode::Char('g') | KeyCode::Home => ScreenKey::Top,

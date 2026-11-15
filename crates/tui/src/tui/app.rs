@@ -208,6 +208,32 @@ pub enum ScreenKey {
     PageDown,
 }
 
+/// A decision key in the approval view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decide {
+    /// `y`: approve the request on screen.
+    Approve,
+    /// `n`: reject it.
+    Reject,
+    /// `Y`: approve every request of its build, pending and later.
+    ApproveAll,
+    /// `N`: reject them all.
+    RejectAll,
+}
+
+impl Decide {
+    /// The decision `c` asks for, when it is a decision key.
+    pub fn of(c: char) -> Option<Self> {
+        Some(match c {
+            'y' => Self::Approve,
+            'n' => Self::Reject,
+            'Y' => Self::ApproveAll,
+            'N' => Self::RejectAll,
+            _ => return None,
+        })
+    }
+}
+
 /// A mouse event on a full screen, at a cell of the last frame drawn
 /// (column, row; 0-based). Only presses and the wheel are captured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -355,21 +381,27 @@ pub trait TUIAppView: Send {
     /// can be scrolled (the `Enter` key). No-op by default.
     fn search_confirm(&mut self) {}
 
-    /// Whether an approval-gated target is currently awaiting a decision. While
-    /// `true` the backend routes `y`/`n`/Enter to the approval methods below so
-    /// the user can resolve the prompt. Default `false` for views without an
-    /// approval gate.
-    fn approval_active(&self) -> bool {
+    /// Open the approval view on the oldest pending request (Enter on the
+    /// line's prompt row, `v` on a full screen). `false`: nothing pending,
+    /// or a view that decides nothing (an attached one). Default `false`.
+    fn approval_open(&mut self) -> bool {
         false
     }
 
-    /// Resolve the active approval prompt: `approve = true` runs the target,
-    /// `false` rejects it (failing the target). No-op by default.
-    fn approval_respond(&mut self, _approve: bool) {}
+    /// Whether the approval view is up: the only screen whose `y`/`n`/`Y`/`N`
+    /// decide. Default `false`.
+    fn in_approval_view(&self) -> bool {
+        false
+    }
 
-    /// Expand/collapse the active prompt's notice body (the Enter key). No-op by
-    /// default.
-    fn approval_toggle_notice(&mut self) {}
+    /// A decision key in the approval view, pressed at `now_ms`. Dropped
+    /// while the request on screen is locked out. No-op by default.
+    fn approval_decide(&mut self, _decide: Decide, _now_ms: u64) {}
+
+    /// Move the view's state on to `now_ms` (the approval view's decision
+    /// flash, a request that left the queue). Called each tick, before the
+    /// backend checks [`Self::full_screen`]. No-op by default.
+    fn advance(&mut self, _now_ms: u64) {}
 
     /// The lines for the pinned viewport, including the spinner row built from
     /// `spinner`. Called every render tick. `width` is the current terminal
