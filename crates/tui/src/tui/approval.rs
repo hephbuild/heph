@@ -52,6 +52,9 @@ struct Pending {
     started: Instant,
     /// When the request was queued: how long it has waited.
     queued: Instant,
+    /// The same instant on the wall clock, for the session record: an
+    /// attached viewer measures the wait from it.
+    queued_unix_ms: u64,
     addr: String,
     notices: Vec<ApprovalNoticeView>,
     responder: oneshot::Sender<bool>,
@@ -285,6 +288,7 @@ impl ApprovalCenter {
                 build: build.id,
                 started: build.started,
                 queued: Instant::now(),
+                queued_unix_ms: hcore::events::now_unix_ms(),
                 addr,
                 notices,
                 responder: tx,
@@ -374,9 +378,12 @@ impl ApprovalCenter {
         self.lock().standing.first().map(|&(_, s)| s)
     }
 
-    /// The front request as a session records it: no notice content, no
-    /// responder. `None` when idle, without allocating.
+    /// The front request as a session records it, and every pending request
+    /// by number and notice hash (what an attached viewer's approval view
+    /// reads): no notice content, no responder. `None` when idle, without
+    /// allocating.
     pub fn prompt(&self) -> Option<crate::tui::session::ApprovalPrompt> {
+        use crate::tui::session::{ApprovalPromptNotice, ApprovalQueued};
         let inner = self.lock_pruned();
         let front = inner.queue.front()?;
         Some(crate::tui::session::ApprovalPrompt {
@@ -385,9 +392,27 @@ impl ApprovalCenter {
             notices: front
                 .notices
                 .iter()
-                .map(|n| crate::tui::session::ApprovalPromptNotice {
+                .map(|n| ApprovalPromptNotice {
                     name: n.name.clone(),
                     sources: n.sources.clone(),
+                })
+                .collect(),
+            queue: inner
+                .queue
+                .iter()
+                .map(|p| ApprovalQueued {
+                    seq: p.seq,
+                    addr: p.addr.clone(),
+                    queued_at_unix_ms: p.queued_unix_ms,
+                    notices: p
+                        .notices
+                        .iter()
+                        .map(|n| ApprovalPromptNotice {
+                            name: n.name.clone(),
+                            path: String::new(),
+                            hash: Some(n.hash.clone()),
+                        })
+                        .collect(),
                 })
                 .collect(),
         })

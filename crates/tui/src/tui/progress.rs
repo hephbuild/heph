@@ -1832,6 +1832,47 @@ fn approval_prompt_row(glyph: &'static str, addr: &str, pending: u64, live: bool
     ])
 }
 
+/// The pending requests a session recorded, as an attached viewer's queue,
+/// their waits measured at `now_unix_ms`. A writer that predates
+/// [`ApprovalPrompt::queue`] recorded the front request only: it is the
+/// whole queue then, with no number and no wait.
+///
+/// [`ApprovalPrompt::queue`]: crate::tui::session::ApprovalPrompt::queue
+fn recorded_queue(
+    prompt: crate::tui::session::ApprovalPrompt,
+    now_unix_ms: u64,
+) -> Vec<crate::tui::approval::QueuedApproval> {
+    use crate::tui::approval::{NoticeRef, QueuedApproval};
+    let notices = |ns: Vec<crate::tui::session::ApprovalPromptNotice>| {
+        ns.into_iter()
+            .map(|n| NoticeRef {
+                name: n.name,
+                hash: n.hash,
+            })
+            .collect()
+    };
+    if prompt.queue.is_empty() {
+        return vec![QueuedApproval {
+            seq: 0,
+            addr: prompt.addr,
+            notices: notices(prompt.notices),
+            waited: std::time::Duration::ZERO,
+        }];
+    }
+    prompt
+        .queue
+        .into_iter()
+        .map(|q| QueuedApproval {
+            seq: q.seq,
+            addr: q.addr,
+            notices: notices(q.notices),
+            waited: std::time::Duration::from_millis(
+                now_unix_ms.saturating_sub(q.queued_at_unix_ms),
+            ),
+        })
+        .collect()
+}
+
 /// The prompt row's key, in the run's own view: Enter opens the approval
 /// view, the only place that decides.
 const APPROVAL_REVIEW: &str = " · enter to review";
@@ -1900,12 +1941,19 @@ impl TuiProgressView {
     }
 
     /// The pending requests, oldest first: a live view's queue; a viewer's
-    /// is empty (it decides nothing, and draws the run's prompt from the
-    /// feed).
+    /// as the run last recorded it, by number and notice hash (it reads, and
+    /// decides nothing).
     fn approval_queue(&self) -> Vec<crate::tui::approval::QueuedApproval> {
-        self.approval_center()
-            .map(crate::tui::approval::ApprovalCenter::queue)
-            .unwrap_or_default()
+        match &self.role {
+            Role::Live { approval } => approval
+                .as_ref()
+                .map(crate::tui::approval::ApprovalCenter::queue)
+                .unwrap_or_default(),
+            Role::Attached { feed, .. } => feed
+                .approval()
+                .map(|p| recorded_queue(p, hcore::events::now_unix_ms()))
+                .unwrap_or_default(),
+        }
     }
 
     /// Hand the list this frame's (or key's) pending requests, so its
@@ -1946,11 +1994,16 @@ impl TuiProgressView {
         let Some(req) = req else {
             return false;
         };
-        self.approval = Some(crate::tui::dashboard::approval::ApprovalScreen::open(
+        let screen = crate::tui::dashboard::approval::ApprovalScreen::open(
             req,
             self.notices.clone(),
             &self.state.redact,
-        ));
+        );
+        // A viewer reads the notices; the terminal that runs it decides (I11).
+        self.approval = Some(match self.role {
+            Role::Live { .. } => screen,
+            Role::Attached { .. } => screen.read_only(),
+        });
         true
     }
 
@@ -2123,7 +2176,13 @@ impl TuiProgressView {
             match &self.role {
                 // A viewer leaves with `q`, and stops nothing.
                 Role::Attached { .. } => {
-                    format!("{} · q detach", keys.trim_end_matches(" · ctrl-c stop")).into()
+                    let keys = keys.trim_end_matches(" · ctrl-c stop");
+                    if self.list.approvals().is_empty() {
+                        format!("{keys} · q detach").into()
+                    } else {
+                        // Read-only there: its own hint says so.
+                        format!("{APPROVAL_OPEN_HINT} · {keys} · q detach").into()
+                    }
                 }
                 Role::Live { .. } if !self.list.approvals().is_empty() => {
                     format!("{APPROVAL_OPEN_HINT} · {keys}").into()
@@ -2615,9 +2674,8 @@ impl TUIAppView for TuiProgressView {
         }
     }
 
-    // The approval view acts on the run: an attached view has no queue (its
-    // prompt is drawn from the feed), so it opens nothing and decides
-    // nothing.
+    // The approval view acts on the run only in a live view: an attached
+    // view opens it read-only on the recorded queue, and decides nothing.
     fn approval_open(&mut self) -> bool {
         self.approval.is_none() && self.open_approval(None)
     }
@@ -2671,15 +2729,14 @@ impl TUIAppView for TuiProgressView {
     }
 
     fn advance(&mut self, now_ms: u64) {
+        if self.approval.is_none() {
+            return;
+        }
+        // A viewer's request leaves the queue when the run's terminal
+        // decides it: the view moves on as a live one does.
+        let queue = self.approval_queue();
         let Some(screen) = self.approval.as_mut() else {
             return;
-        };
-        let queue = match &self.role {
-            Role::Live { approval } => approval
-                .as_ref()
-                .map(crate::tui::approval::ApprovalCenter::queue)
-                .unwrap_or_default(),
-            Role::Attached { .. } => Vec::new(),
         };
         if !screen.advance(now_ms, &queue) {
             self.approval = None;

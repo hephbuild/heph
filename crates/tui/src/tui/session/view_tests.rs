@@ -327,6 +327,42 @@ fn assert_same_but_the_seam(
     }
 }
 
+/// The decision keys' hint, and what a viewer reads in its place.
+const DECISION: &str = "y approve";
+const READ_ONLY: &str = "decisions happen in the terminal that runs it";
+
+/// The approval view as a viewer draws it is the run's, apart from the title
+/// naming the session and the hint row: the decision keys there, the
+/// read-only hint here (I11).
+fn assert_same_approval_view(live: &[String], attached: &[String], id: SessionId) {
+    assert_eq!(live.len(), attached.len(), "approval view: same height");
+    let session = format!("  session {id}");
+    let mut hints = 0;
+    for (i, (live_row, attached_row)) in live.iter().zip(attached).enumerate() {
+        if live_row.contains(DECISION) {
+            hints += 1;
+            assert!(
+                attached_row.contains(READ_ONLY) && !attached_row.contains(DECISION),
+                "approval view: the hint row\n{attached_row}"
+            );
+        } else if attached_row.contains(&session) {
+            assert_eq!(
+                squash(&attached_row.replace(&session, "")),
+                squash(live_row),
+                "approval view: the title, row {i}"
+            );
+        } else {
+            assert_eq!(attached_row, live_row, "approval view: row {i}");
+        }
+    }
+    assert_eq!(hints, 1, "one hint row:\n{}", live.join("\n"));
+    let joined = live.join("\n");
+    assert!(
+        joined.contains("//a:gate") && joined.contains("1 of 3 pending"),
+        "{joined}"
+    );
+}
+
 /// A terminal narrower than the frame wants: rows are cut, the seam still the
 /// only difference.
 const NARROW: u16 = 60;
@@ -417,14 +453,21 @@ fn attached_frames_match_live() {
         }],
     );
     let next = center.request(&build, "//a:next".into(), Vec::new());
+    // One with a row of its own in the model: the ✦ row and Approvals tab.
+    let slow = center.request(&build, "//a:slow".into(), Vec::new());
     view_tap.observe(&live);
     let live_prompt = draw(&mut live);
     let live_prompt_line = draw_line(&mut live);
+    assert!(live.approval_open());
+    let live_view = draw(&mut live);
+    live.back_to_main();
 
     center.respond(gate.seq, true, Vec::new());
     center.respond(next.seq, false, Vec::new());
+    center.respond(slow.seq, true, Vec::new());
     assert_eq!(gate.rx.blocking_recv(), Ok(true));
     assert_eq!(next.rx.blocking_recv(), Ok(false));
+    assert_eq!(slow.rx.blocking_recv(), Ok(true));
     view_tap.observe(&live);
     let live_after = draw(&mut live);
     let live_after_line = draw_line(&mut live);
@@ -462,12 +505,19 @@ fn attached_frames_match_live() {
             let frame = draw(&mut attached);
             let line = draw_line(&mut attached);
             let more = (!shown).then(|| draw_more(&mut attached));
-            checkpoints.push((shown, frame, line, more));
+            // The approval view opens, read-only, while one is pending.
+            let view = attached.approval_open().then(|| {
+                let view = draw(&mut attached);
+                attached.back_to_main();
+                view
+            });
+            assert_eq!(view.is_some(), shown, "a view opens while one is pending");
+            checkpoints.push((shown, frame, line, more, view));
         }
     }
     let [
-        (true, attached_prompt, attached_prompt_line, None),
-        (false, attached_after, attached_after_line, Some(attached_more)),
+        (true, attached_prompt, attached_prompt_line, None, Some(attached_view)),
+        (false, attached_after, attached_after_line, Some(attached_more), None),
     ] = checkpoints.as_slice()
     else {
         panic!(
@@ -483,6 +533,8 @@ fn attached_frames_match_live() {
         // The dashboard's LAST LINE for a lock wait names the holder.
         &format!("held by session {}", holder.id()),
         "(4 matched)",
+        // The pending request with a model row: its ✦ row.
+        "awaits approval",
     ] {
         assert!(joined.contains(needle), "{needle:?} in\n{joined}");
     }
@@ -509,11 +561,11 @@ fn attached_frames_match_live() {
         panic!("a prompt row and the line: {live_prompt_line:#?}");
     };
     assert!(
-        prompt_row.contains("approval required: //a:gate · 2 pending")
+        prompt_row.contains("approval required: //a:gate · 3 pending")
             && prompt_row.ends_with(KEYS),
         "{prompt_row}"
     );
-    assert!(line.contains("✦ //a:gate 2 pending"), "{line}");
+    assert!(line.contains("✦ //a:gate 3 pending"), "{line}");
     assert!(line.ends_with("tab ⇥"), "{line}");
     let [line] = live_after_line.as_slice() else {
         panic!("the line alone: {live_after_line:#?}");
@@ -528,7 +580,7 @@ fn attached_frames_match_live() {
         panic!("a prompt row and the line: {attached_prompt_line:#?}");
     };
     assert!(
-        attached_prompt_row.ends_with(&format!("2 pending{ELSEWHERE}")),
+        attached_prompt_row.ends_with(&format!("3 pending{ELSEWHERE}")),
         "{attached_prompt_row}"
     );
     assert!(attached_line.ends_with(DETACH_HINT), "{attached_line}");
@@ -552,6 +604,7 @@ fn attached_frames_match_live() {
     let id = rec.id();
     assert_same_but_the_seam(&live_prompt, attached_prompt, id, WIDTH, "prompt shown");
     assert_same_but_the_seam(&live_after, attached_after, id, WIDTH, "prompt cleared");
+    assert_same_approval_view(&live_view, attached_view, id);
     let [attached_narrow, attached_failed, attached_failed_narrow] = attached_more;
     // Narrow enough that the seam itself is cut, so the cut is compared too.
     let narrow_help = attached_narrow.last().expect("a help row");
@@ -624,7 +677,7 @@ fn only_the_live_view_acts_on_the_run() {
         .rx;
     assert!(
         !attached.approval_open(),
-        "a viewer holds no queue: no approval view opens"
+        "a viewer holds no queue: its feed recorded no request"
     );
     assert!(!attached.in_approval_view());
     drop(attached.render_full(1_000, 100, 24));
@@ -659,4 +712,184 @@ fn only_the_live_view_acts_on_the_run() {
         1,
         "q detaches the viewer",
     );
+}
+
+/// `prompt` routed into `feed` as the run's recorder writes it.
+fn record_prompt(feed: &SessionFeed, prompt: Option<ApprovalPrompt>) {
+    let routed = feed.route(SessionRecord::session(
+        BASE,
+        SessionRecordKind::Approval {
+            prompt: prompt.map(Box::new),
+            standing: None,
+        },
+    ));
+    assert!(matches!(routed, Routed::Nothing), "{routed:?}");
+}
+
+/// A notice stored in `home` by its content hash, as the gate stores it;
+/// its legacy file path under `home` too, which no screen may show.
+fn stored(home: &Path, name: &str, content: &str) -> ApprovalNoticeView {
+    ApprovalNoticeView {
+        name: name.into(),
+        content: content.into(),
+        path: home.join("approval").join(name).display().to_string(),
+        hash: hcore::approval_notice::write_notice_blob(home, content).expect("notice blob"),
+    }
+}
+
+/// Where `stored` put a notice's blob, to remove or rewrite it.
+fn blob(home: &Path, n: &ApprovalNoticeView) -> std::path::PathBuf {
+    home.join("approval").join("notices").join(&n.hash)
+}
+
+/// A viewer of a session whose notices are in `home`'s store.
+fn viewer(feed: &SessionFeed, home: Option<&Path>) -> TuiProgressView {
+    let view = TuiProgressView::new("run").attached(SessionId::new(BASE, 7), feed.clone(), || {});
+    match home {
+        Some(home) => view.with_notice_home(home),
+        None => view,
+    }
+}
+
+/// No row names heph's home or a notice's file.
+fn assert_no_path(frame: &[String], home: &Path) {
+    let joined = frame.join("\n");
+    let home = home.display().to_string();
+    assert!(
+        !joined.contains(&home) && !joined.contains("approval/"),
+        "a path on screen:\n{joined}"
+    );
+}
+
+/// An attached viewer opens a pending request read-only and reads its
+/// notice from the run's store by the hash the session recorded, though the
+/// file the run wrote is gone; y/n/Y/N decide nothing and it stays pending,
+/// until the run's terminal decides it and the view closes.
+#[test]
+fn attached_reads_notice_by_hash() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let center = ApprovalCenter::new();
+    let build = center.build();
+    let plan = stored(home.path(), "plan", "drop the table");
+    assert!(
+        !Path::new(&plan.path).exists(),
+        "no notice file: only the store"
+    );
+    let mut gate = center.request(&build, "//a:gate".into(), vec![plan]);
+    let feed = SessionFeed::default();
+    record_prompt(&feed, center.prompt());
+
+    let mut attached = viewer(&feed, Some(home.path()));
+    assert!(attached.approval_open(), "Enter/v open the view");
+    let frame = draw_until(&mut attached, "drop the table");
+    let joined = frame.join("\n");
+    assert!(
+        joined.contains("//a:gate") && joined.contains("1 of 1 pending"),
+        "{joined}"
+    );
+    assert!(
+        joined.contains(READ_ONLY) && !joined.contains(DECISION),
+        "no decision key, the read-only hint:\n{joined}"
+    );
+    assert_no_path(&frame, home.path());
+
+    // Long past any lockout: still nothing decides.
+    for (i, decide) in [
+        Decide::Approve,
+        Decide::Reject,
+        Decide::ApproveAll,
+        Decide::RejectAll,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        attached.approval_decide(decide, NOW + 10_000 * (1 + i as u64));
+        attached.advance(NOW + 10_000 * (1 + i as u64));
+    }
+    let after = draw(&mut attached).join("\n");
+    assert!(
+        after.contains("drop the table")
+            && !after.contains("approved //")
+            && !after.contains("rejected //"),
+        "the same request, no decision shown:\n{after}"
+    );
+    assert!(
+        matches!(
+            gate.rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ),
+        "still pending"
+    );
+    assert!(center.standing().is_none(), "no standing decision either");
+
+    // The run's terminal decides it: the viewer's view closes with it.
+    let _decided = center.respond(gate.seq, true, Vec::new());
+    record_prompt(&feed, center.prompt());
+    attached.advance(NOW + 60_000);
+    assert!(!attached.in_approval_view());
+}
+
+/// The screen clause of `notice_unavailable_never_a_path`: a notice whose
+/// blob is gone, whose blob no longer matches its hash, one an older session
+/// recorded with no hash, and any notice of a viewer that does not read the
+/// run's home, each read "notice unavailable", and no path shows.
+#[test]
+fn notice_unavailable_never_a_path() {
+    use crate::tui::session::{ApprovalPrompt, ApprovalPromptNotice};
+    let home = tempfile::tempdir().expect("tempdir");
+    let center = ApprovalCenter::new();
+    let build = center.build();
+    let plan = stored(home.path(), "plan", "the plan");
+    let gone = stored(home.path(), "gone", "removed below");
+    let tampered = stored(home.path(), "tampered", "rewritten below");
+    std::fs::remove_file(blob(home.path(), &gone)).expect("remove a blob");
+    std::fs::write(blob(home.path(), &tampered), "not what was hashed").expect("rewrite a blob");
+    let gate = center.request(&build, "//a:gate".into(), vec![plan, gone, tampered]);
+    let feed = SessionFeed::default();
+    record_prompt(&feed, center.prompt());
+
+    let mut attached = viewer(&feed, Some(home.path()));
+    assert!(attached.approval_open());
+    let frame = draw_until(&mut attached, "the plan");
+    assert_no_path(&frame, home.path());
+    for tab in ["gone", "tampered"] {
+        attached.tab(true);
+        let frame = draw_until(&mut attached, "notice unavailable");
+        assert!(frame.join("\n").contains("//a:gate"), "{tab}");
+        assert!(!frame.join("\n").contains("the plan"), "{tab}");
+        assert_no_path(&frame, home.path());
+    }
+
+    // A viewer that does not read the run's home: nothing is readable.
+    let mut elsewhere = viewer(&feed, None);
+    assert!(elsewhere.approval_open());
+    let frame = draw_until(&mut elsewhere, "notice unavailable");
+    assert!(!frame.join("\n").contains("the plan"));
+    assert_no_path(&frame, home.path());
+
+    // An older heph recorded the front request alone, with its notice's
+    // file and no hash: the view shows it, never that file.
+    drop(gate);
+    record_prompt(
+        &feed,
+        Some(ApprovalPrompt {
+            addr: "//a:legacy".into(),
+            queued_behind: 0,
+            notices: vec![ApprovalPromptNotice {
+                name: "plan".into(),
+                path: home.path().join("approval/plan.txt").display().to_string(),
+                hash: None,
+            }],
+            queue: Vec::new(),
+        }),
+    );
+    attached.advance(NOW + 1_000);
+    assert!(
+        attached.in_approval_view(),
+        "it moves on to the legacy request"
+    );
+    let frame = draw_until(&mut attached, "notice unavailable");
+    let joined = frame.join("\n");
+    assert!(joined.contains("//a:legacy"), "{joined}");
+    assert_no_path(&frame, home.path());
 }

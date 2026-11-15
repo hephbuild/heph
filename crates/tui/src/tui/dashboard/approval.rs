@@ -33,6 +33,8 @@ pub const FLASH_MS: u64 = 1000;
 /// The decision keys' hint, greyed out during the lockout.
 pub const DECISION_HINTS: &str =
     "y approve · n reject · Y approves all, and later · N rejects all, and later (fails them)";
+/// An attached viewer's hint in their place: it decides nothing (I11).
+pub const READ_ONLY_HINT: &str = "read only · decisions happen in the terminal that runs it";
 /// The view's other keys.
 pub const VIEW_HINTS: &str = "←/→ notice · ↑/↓ scroll · esc back";
 
@@ -177,6 +179,8 @@ pub struct ApprovalScreen {
     tabs: Vec<(Range<u16>, usize)>,
     rows: u16,
     body_rows: usize,
+    /// An attached viewer's: no decision key (see [`Self::read_only`]).
+    read_only: bool,
 }
 
 impl ApprovalScreen {
@@ -198,6 +202,7 @@ impl ApprovalScreen {
             tabs: Vec::new(),
             rows: 0,
             body_rows: 0,
+            read_only: false,
         }
     }
 
@@ -210,10 +215,20 @@ impl ApprovalScreen {
         &self.req.addr
     }
 
+    /// This view in an attached viewer: it shows the request and its
+    /// notices, offers no decision key and never arms; its hint says where
+    /// the decision is made (I11).
+    pub fn read_only(mut self) -> Self {
+        self.read_only = true;
+        self
+    }
+
     /// Whether a decision key acts at `now_ms`: the request has been on
-    /// screen for [`LOCKOUT_MS`], and no decision is showing.
+    /// screen for [`LOCKOUT_MS`], and no decision is showing. Never in a
+    /// [`Self::read_only`] view.
     pub fn armed(&self, now_ms: u64) -> bool {
-        self.flash.is_none()
+        !self.read_only
+            && self.flash.is_none()
             && self
                 .shown_since
                 .is_some_and(|t| now_ms.saturating_sub(t) >= LOCKOUT_MS)
@@ -254,7 +269,14 @@ impl ApprovalScreen {
         match &self.flash {
             Some(f) if now_ms < f.until_ms => return true,
             Some(_) => self.flash = None,
-            None if queue.iter().any(|q| q.seq == self.req.seq) => return true,
+            // The addr too: an older session's recorded request has no
+            // number, so each front request reads as `0`.
+            None if queue
+                .iter()
+                .any(|q| q.seq == self.req.seq && q.addr == self.req.addr) =>
+            {
+                return true;
+            }
             None => {}
         }
         let Some(next) = queue.first() else {
@@ -526,9 +548,15 @@ impl ApprovalScreen {
     /// out (no countdown), then the view's own keys.
     fn hints(&self, now_ms: u64, cols: usize) -> Line<'static> {
         let room = cols.saturating_sub(2);
-        let decision = cut_right(DECISION_HINTS, room).into_owned();
+        let keys = if self.read_only {
+            READ_ONLY_HINT
+        } else {
+            DECISION_HINTS
+        };
+        let decision = cut_right(keys, room).into_owned();
         let left = room.saturating_sub(width(&decision));
-        let decision_style = if self.armed(now_ms) {
+        // A read-only hint is never greyed: it is not a key that arms.
+        let decision_style = if self.read_only || self.armed(now_ms) {
             Style::default().fg(Color::Yellow)
         } else {
             Style::default().fg(Color::DarkGray)

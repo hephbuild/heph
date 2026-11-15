@@ -287,6 +287,26 @@ pub struct ApprovalPrompt {
     /// Each notice the target declares.
     #[serde(default)]
     pub notices: Vec<ApprovalPromptNotice>,
+    /// Every pending request, oldest first, this one included: what an
+    /// attached viewer's Approvals tab and approval view show. Empty from a
+    /// writer that predates it; the viewer then knows the front request only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queue: Vec<ApprovalQueued>,
+}
+
+/// One pending request of [`ApprovalPrompt::queue`]: its number, target and
+/// notices by where their text is kept, never the text itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalQueued {
+    #[serde(default)]
+    pub seq: u64,
+    #[serde(default)]
+    pub addr: String,
+    /// When the request was queued: the viewer measures its wait from it.
+    #[serde(default)]
+    pub queued_at_unix_ms: u64,
+    #[serde(default)]
+    pub notices: Vec<ApprovalPromptNotice>,
 }
 
 /// One notice of an [`ApprovalPrompt`]: where its text is kept, not what it
@@ -743,6 +763,15 @@ mod tests {
                         },
                     },
                 ],
+            }],
+            queue: vec![ApprovalQueued {
+                seq: 4,
+                addr: "//a:gated".into(),
+                queued_at_unix_ms: 1_700_000_000_000,
+                notices: vec![ApprovalPromptNotice {
+                    name: "terms".into(),
+                    sources: Vec::new(),
+                }],
             }],
         };
         for (kind, ty) in [

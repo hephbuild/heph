@@ -1107,6 +1107,84 @@ async fn empty_events_say_no_events_recorded() {
     assert!(out.contains("\nno events recorded\n"), "{out}");
 }
 
+/// The `heph session show` clause of `standing_yes_covers_later_requests`:
+/// a Y (or N) the run's terminal set is printed, and in `--json`, for as
+/// long as it acts; a build with none, and a build that is over, print none.
+#[tokio::test]
+async fn show_prints_the_standing_decision() {
+    use crate::tui::session::ApprovalStanding;
+    let approval = |at: u64, standing| {
+        SessionRecord::session(
+            at,
+            SessionRecordKind::Approval {
+                prompt: None,
+                standing,
+            },
+        )
+    };
+    let running = SessionSnapshot {
+        last_event_unix_ms: Some(NOW - 1_000),
+        ..SessionSnapshot::default()
+    };
+    for (standing, line, json) in [
+        (
+            Some(ApprovalStanding::Approve),
+            Some("auto-approving (Y) · approval requests are approved without a prompt"),
+            Some("\"approval_standing\": \"approve\""),
+        ),
+        (
+            Some(ApprovalStanding::Reject),
+            Some("auto-rejecting (N) · approval requests are rejected (their targets fail)"),
+            Some("\"approval_standing\": \"reject\""),
+        ),
+        (None, None, None),
+    ] {
+        let id = SessionId::new(T0, 1);
+        let mut records = build_records("//a:gated", T0, None);
+        records.push(approval(T0 + 20, standing));
+        let source = FakeSource {
+            sessions: vec![(
+                entry(
+                    meta(id, 1, &["heph", "run", "//a:gated"]),
+                    true,
+                    Some(running.clone()),
+                ),
+                records.clone(),
+            )],
+        };
+        let sources: [&dyn SessionSource; 1] = [&source];
+        let out = run_show(&sources, &id.encode(), false).await.expect("show");
+        let out_json = run_show(&sources, &id.encode(), true).await.expect("show");
+        match (line, json) {
+            (Some(line), Some(json)) => {
+                assert!(out.contains(line), "{standing:?}: {out}");
+                assert!(out_json.contains(json), "{standing:?}: {out_json}");
+            }
+            _ => {
+                assert!(!out.contains("auto-"), "{out}");
+                assert!(!out_json.contains("approval_standing"), "{out_json}");
+            }
+        }
+
+        // The build ended: the decision acts on nothing any more.
+        records.push(SessionRecord::session(T0 + 50, SessionRecordKind::Finished));
+        records.extend(build_records("//a:gated", T0 + 60, Some(0)).pop());
+        let source = FakeSource {
+            sessions: vec![(
+                entry(
+                    meta(id, 1, &["heph", "run", "//a:gated"]),
+                    false,
+                    Some(ended(Some(0), T0 + 1_060)),
+                ),
+                records,
+            )],
+        };
+        let sources: [&dyn SessionSource; 1] = [&source];
+        let out = run_show(&sources, &id.encode(), false).await.expect("show");
+        assert!(!out.contains("auto-"), "{standing:?}, ended: {out}");
+    }
+}
+
 /// U3: `status.json` keeps the first entries of each list, with the full count;
 /// `show` folds the event log and has them all.
 #[tokio::test]

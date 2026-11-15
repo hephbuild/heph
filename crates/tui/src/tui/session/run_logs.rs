@@ -969,6 +969,7 @@ mod tests {
                         name: "plan".into(),
                         sources: sources.clone(),
                     }],
+                    queue: Vec::new(),
                 })),
                 standing: None,
             },
