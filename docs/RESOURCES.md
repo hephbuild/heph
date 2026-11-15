@@ -93,7 +93,7 @@ never hashed. Undeclared `memory` and custom pools cost 0.
 **Zero-cost targets are unbounded.** A request with no bounded need — 0 of
 every bounded pool (`cpu: 0` and nothing else, or `cpu: 0` plus amounts of
 unbounded pools only) — always fits, so it is granted **at once**: it never
-queues, never waits behind the FIFO's head, and nothing caps how many such
+queues, never waits behind another target, and nothing caps how many such
 targets run together. Their concurrency is limited only by the tokio runtime
 and the OS. That is deliberate, and it cuts both ways: an `fs` glob costs
 nothing to admit, but a process-spawning target declared `cpu: 0` launches as
@@ -188,7 +188,7 @@ bounds the build sandboxes on disk, **running or awaiting removal**:
 
 - Every run of a managed driver (one that runs in a build sandbox the engine
   prepares, such as `exec` and `bash`) is admitted with `sandbox: 1` on top of
-  what it declares, in the same atomic, FIFO grant as its cpu.
+  what it declares, in the same atomic grant as its cpu.
 - Its cpu (and every other pool) returns when the run ends; its sandbox slot
   only once the sandbox directory has been removed.
 - Cache hits, non-managed drivers (`fs`, `group`, `template`, …) and the
@@ -207,11 +207,10 @@ bounds the build sandboxes on disk, **running or awaiting removal**:
   `sandbox: 0` ("the run sets it"), `--resource sandbox=0` and
   `HEPH_RESOURCE_SANDBOX=0` are refused, and a managed run under a 0 pool
   fails at admission, before it runs, naming how to set it.
-- Admission is strict FIFO, so a managed run at the head of the queue that
-  waits for a `sandbox` slot holds back every run behind it, including one
-  that takes no slot (a `template` target) and would fit the free cpu. This
-  is deliberate: letting such runs pass would let a stream of them starve the
-  waiting run, the same reason no other pool's head is overtaken.
+- A managed run that waits for a `sandbox` slot does not hold back a run
+  that takes none: a `template` target, or any run of a non-managed driver,
+  starts in the free cpu ([Admission](#admission)). So cpu throughput is not
+  tied to how fast sandboxes are removed.
 
 A `cpu: 0` managed target needs a sandbox slot, so it is no longer zero-cost
 and queues like any other run.
@@ -314,11 +313,36 @@ Each execute reserves its amounts in every pool it names before it runs and
 releases them when the run ends (the cache write after it is outside the
 reservation).
 
-- **Strict FIFO.** The head of the queue waits until every pool it needs fits
-  at once, and nothing behind it is admitted while it waits. No starvation,
-  deterministic, at the cost of idle capacity while a large request waits.
-  The one exception is a zero-cost request (nothing on a bounded pool), which
-  always fits and so is granted on arrival, past the queue.
+- **Whatever fits runs, and the oldest waiter is overtaken only so far.**
+  Targets that reserve the same amounts have the same *shape*. Three rules
+  decide who starts:
+  - *Hand-off.* When a run ends, its slot goes to the oldest waiter of its
+    own shape. A wide target starts only in a drained pool, so this pays for
+    the drain once per batch of wide targets, not once per target.
+  - *First fit.* Any waiter whose amounts fit what is free starts, the shape
+    with the oldest waiter first. A target that fits on arrival starts on
+    arrival, unless a target of its shape already waits.
+  - *Sized patience.* A start that takes capacity the oldest waiter needs is
+    counted against it, per pool. Once the count on a pool reaches 16 times
+    what the oldest waiter needs of it, and never more than 4 times the
+    pool's capacity, nothing more is admitted that would take what it needs:
+    its pools drain and it starts. A `cpu: 0.1` fetch is overtaken once or
+    twice; a `cpu: 8` link on 8 CPUs by 32 CPUs' worth of targets. The next
+    oldest waiter starts from zero. A request for a whole pool pays for this
+    with a longer wait than strict FIFO gave it ([Sizing a
+    declaration](#sizing-a-declaration)).
+
+  What follows from them:
+  - No starvation, and the same arrivals and completions give the same
+    starts.
+  - **Idle capacity beside a waiting target is deliberate.** Once the oldest
+    waiter has been overtaken as far as it may be, free CPUs it needs stay
+    free until it fits. The wait row of a target held back this way says
+    `yielding to`, and the in-flight report says `draining`.
+  - **Start order follows arrival only within a shape.** Across shapes, a
+    younger target that fits starts before an older one that does not.
+  - A zero-cost request (nothing on a bounded pool) always fits and is
+    granted on arrival, past the queue.
 - **Atomic.** A grant covers every pool or none, so a target never holds its
   CPUs while it waits for memory.
 - **Clamped.** A request above a pool's capacity is reduced to the capacity:
@@ -347,12 +371,52 @@ CPUs, `bytes` human-sized, `count` as an integer), from the `units` that
   ⧗ //a:b waits for cpu 4 (2 free, 6 ahead, 41s)
   ```
 
-- `ExecuteStart` carries the `declared` and `reserved` amounts and
-  `queued_ms`, how long the run waited, so a wait under the threshold is
-  still answerable from the event stream.
+  `ahead` is how many targets were queued before this one when the notice
+  fired. It is a snapshot, and not a promise that they start first: a
+  younger target that fits can start before an older one.
+
+  A target that fits what is free and still waits is held back for the
+  oldest waiter, and its row names what it yields to (`yielding_to` on the
+  event: the pool and the oldest waiter's need of it):
+
+  ```
+  ⧗ //a:b waits for cpu 1 (3 free, yielding to a cpu 8 run, 41s)
+  ```
+
+  A `yielding to` row carries no `ahead` and is never the oldest waiter's:
+  the oldest waiter is the row with `0 ahead`. `yielding to` on a waiter's
+  row is the situation the in-flight report calls `draining` on the head's
+  line. The oldest waiter's own row says neither how far it has been
+  overtaken nor that its pools are draining: the in-flight report's `head`
+  line (below) is where that shows, and only while the target waits. No
+  event carries the count. After the fact, the `handoff` and `pass` starts in
+  the `queued_ms` before a target's own `ExecuteStart`, with their
+  `reserved` amounts, are an upper bound on what overtook it.
+
+- `ExecuteStart` carries the `declared` and `reserved` amounts, `queued_ms`,
+  how long the run waited, so a wait under the threshold is still answerable
+  from the event stream, and `admitted`, how it got in. Its four values are
+  exclusive:
+  - `arrival`: it started on arrival with nobody waiting, or it reserves
+    nothing of a bounded pool. A zero-cost request is always `arrival`,
+    whoever waits.
+  - `head`: it started as the oldest waiter.
+  - `handoff`: ahead of an older waiter, in the slot a run of its shape
+    released.
+  - `pass`: ahead of an older waiter, in capacity that was free, from the
+    queue or on arrival. An arrival that reserves something of a bounded
+    pool and starts while another target waits is `pass`, not `arrival`.
+
+  Only `handoff` and `pass` started ahead of an older waiter. A consumer
+  treats a value it does not know (`unknown`) like an absent one.
 - The in-flight report (SIGQUIT) prints each pool's held/capacity in its
   unit, the queue length, the sandbox removals still owed when there are
-  any, and what the head waits for and for how long.
+  any, what the oldest waiter waits for and for how long, and how far it has
+  been overtaken:
+
+  ```
+  head         waits for cpu 8 (3 free) for 41s; overtaken by 32 of 32 cpu, draining
+  ```
 
 ## Sizing a declaration
 
@@ -366,6 +430,28 @@ so any other name is an error.
 target(name = "link", ..., resources = {"cpu": heph.core.resource("cpu")})       # full width
 target(name = "half", ..., resources = {"cpu": heph.core.resource("cpu") / 2})
 ```
+
+A target that asks for a whole pool starts only once the pool is empty, and
+the engine empties it only after other targets adding up to 4 times the pool
+have started ahead of it: it waits about four pool-lengths of the work that
+passes it. That is the cap, and a request for the whole pool reaches it. The
+cap bounds any request of a quarter of the pool or more; a smaller one is
+overtaken by at most 16 times its own need ([Admission](#admission)).
+
+So a request for a whole pool **waits longer than it did under strict
+FIFO**, and the cost falls on that target. On one replayed busy build, a
+target asking for the whole `memory` pool waited about 94 s against about
+37 s, and the build's wall time was about 2% longer. Any target that is
+overtaken can wait longer than strict FIFO made it wait, up to its bound;
+the whole-pool request is the one that reaches it.
+
+Declare the width the target actually uses: the full width only for a target
+that uses it, never as a way to run alone. A target that sat behind its own
+`"memory": heph.core.resource("memory")` and uses half of that declares
+`heph.core.resource("memory") / 2`: it starts once half the pool is free at
+the same time, not the whole pool. Until then it is overtaken under the same
+cap, so what it gains is a shorter drain, and a start whenever half happens
+to be free.
 
 The intended use is exactly that, a `resources` amount. Anything else puts a
 per-machine number into driver config and so into the def hash of the target
@@ -473,3 +559,12 @@ change (plugin ABI 0.17.3 → 0.17.4, patch, lane `^0.17.0`):
 - **`AdmissionWaitStart.removals_pending`** is a new optional event field,
   absent from an older host's frames and omitted when unset, so a consumer
   built against an older `hcore` decodes the new frames unchanged.
+- **Admission is no longer strict FIFO.** Targets of different shapes can
+  start out of arrival order ([Admission](#admission)); nothing a hermetic
+  target may depend on changes, and nothing about the order reaches a hash,
+  the plugin ABI, a proto or an on-disk format. A request for a whole pool
+  waits longer than it did.
+- **`ExecuteStart.admitted` and `AdmissionWaitStart.yielding_to`** are new
+  optional event fields, absent from an older host's frames and omitted when
+  unset. An older consumer ignores them and prints the wait row without the
+  `yielding to` clause.

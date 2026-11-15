@@ -170,10 +170,16 @@ release-gated decision, not a routine one.
 A target declares `resources = {"cpu": 2, "memory": "4G", "docker": 1}`
 (an undeclared `cpu` costs 1; a driver advertises its own cost as an ordinary
 `resources` entry the target's declaration overrides: 0.1 for the IO-bound
-`http`/OCI/`go.download` drivers, 0 for `fs`/relocating `group`); the engine admits executes in strict FIFO order so the sum
+`http`/OCI/`go.download` drivers, 0 for `fs`/relocating `group`); the engine admits executes so the sum
 of what runs fits each pool's capacity, except a request needing nothing of a bounded pool, which is granted at once and uncapped (`.hephconfig` `resources:`, `-j`,
 `--resource`, `HEPH_RESOURCE_<NAME>`). A target reads what it got only by
 naming it, `${resource:<pool>}`; heph exports nothing to its environment.
+
+Admission is not FIFO: a finished run's slot goes to the next waiter that
+reserves the same amounts, any waiter that fits what is free starts, and the
+oldest waiter is overtaken by at most 16 times its own need of a pool (never
+more than 4 times the pool) before its pools drain for it. Start order follows
+arrival only among targets reserving the same amounts.
 
 Read `docs/RESOURCES.md` before touching it. The one thing to know going in:
 nothing about resources reaches any hash — the declaration is driver config

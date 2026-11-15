@@ -71,6 +71,23 @@ two commits without **interleaving** the runs invents differences that disappear
 alternate, and `stall_ms` reads like continuous starvation when the median gap is healthy — use
 `over_10ms` and `max_us`.
 
+`crates/engine/src/engine/resource_pool/admission_replay.rs` is the other one. It replays seeded
+workloads through the real `ResourcePool` under tokio's paused clock, against a strict-FIFO
+admission ported into the harness, and prints wall time, cpu utilization and how grants came
+about for each workload; then it times each kind of admission event, in real time, with 10,000
+waiters queued. It is what the admission rule's constants (`PATIENCE`, `PATIENCE_POOLS`,
+`WALK_CAP`) are judged against, so run it before changing any of them. It is `#[ignore]`d and
+must stay that way: it asserts no threshold, and its output is tables a human reads.
+
+```bash
+cargo test --release -p engine --lib admission_replay -- --ignored --nocapture
+HEPH_REPLAY_SEEDS=100 cargo test --release -p engine --lib admission_replay -- --ignored --nocapture
+```
+
+The default is 10 seeds. A row that moves by 2% or less needs the 100-seed run before it is
+believed, and a whole-pool wait is an exponential draw whose 10-seed mean is off by tens of
+seconds.
+
 Anything asserting behaviour rather than measuring it is a test and belongs above.
 
 ## Test Isolation

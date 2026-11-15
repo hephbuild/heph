@@ -1782,3 +1782,295 @@ async fn a_cancelled_announced_wait_on_cpu_is_closed() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// How long a run that should start at once may take to end. Short on
+/// purpose: where the run would instead wait for a gate the test has not
+/// opened, the test fails here rather than at its runner's timeout.
+const PASS_DEADLINE: Duration = Duration::from_secs(20);
+
+/// Poll the pool snapshot until `cond` holds. `false` when it has not by
+/// `deadline`, or once `gave_up` says there is nothing left to wait for.
+async fn snapshot_within(
+    engine: &Engine,
+    deadline: Duration,
+    cond: impl Fn(&ResourceSnapshot) -> bool,
+    gave_up: impl Fn() -> bool,
+) -> bool {
+    let start = Instant::now();
+    loop {
+        if engine.resource_snapshot().is_some_and(|s| cond(&s)) {
+            return true;
+        }
+        if gave_up() || start.elapsed() > deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// Whether the oldest waiter waits on `pool`.
+fn head_waits_on(snap: &ResourceSnapshot, pool: &str) -> bool {
+    snap.main
+        .head
+        .as_ref()
+        .is_some_and(|h| h.unmet.iter().any(|n| n.pool.as_str() == pool))
+}
+
+/// Wait for every build in `builds`, each bounded by [`DEADLINE`].
+async fn join_all(
+    builds: &mut tokio::task::JoinSet<anyhow::Result<()>>,
+    what: &str,
+) -> anyhow::Result<()> {
+    while let Some(ended) = tokio::time::timeout(DEADLINE, builds.join_next())
+        .await
+        .map_err(|_elapsed| anyhow::anyhow!("{what} hung past {DEADLINE:?}"))?
+    {
+        ended??;
+    }
+    Ok(())
+}
+
+/// A waiter that fits what is free starts ahead of the oldest waiter. `hold`
+/// has the only `docker` slot behind a closed gate and `next` queues for it:
+/// it is the head, and what it waits for is `docker`, with three cpus free.
+/// `small` takes a tenth of a cpu and no `docker`, so it takes nothing the
+/// head is short of: built as its own request, it ends while the gate is
+/// still closed. Under strict FIFO it sat behind `next` until the gate
+/// opened, which here is the [`PASS_DEADLINE`] failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cpu_only_target_runs_while_the_head_waits_on_a_custom_pool() -> anyhow::Result<()> {
+    let ws = tempfile::tempdir()?;
+    let gates = tempfile::tempdir()?;
+    let gate = gates.path().join("open");
+    write_build(
+        ws.path(),
+        "p",
+        &format!(
+            "{}{}{}",
+            gated("hold", &gate, r#"{"docker": 1}"#),
+            gated("next", &gate, r#"{"docker": 1}"#),
+            r#"
+target(
+    name = "small",
+    driver = "bash",
+    run = "echo small > $OUT",
+    out = "small.txt",
+    resources = {"cpu": 0.1},
+)
+"#,
+        ),
+    );
+    let engine = engine(ws.path(), caps(&[("cpu", 4 * MICROS), ("docker", 1)]))?;
+
+    // The gate opens whatever was seen, so a failed stage leaves no build
+    // waiting on it; what was seen is judged after.
+    let mut gated_builds = tokio::task::JoinSet::new();
+    let seen: anyhow::Result<()> = async {
+        // Stage 1: the only docker slot is held.
+        gated_builds.spawn(build(Arc::clone(&engine), vec!["//p:hold".into()], None));
+        anyhow::ensure!(
+            snapshot_within(&engine, DEADLINE, |s| held(s, "docker") == 1, || false).await,
+            "hold never held the docker slot (snapshot {:?})",
+            engine.resource_snapshot()
+        );
+        // Stage 2: a second docker target queues, at the head.
+        gated_builds.spawn(build(Arc::clone(&engine), vec!["//p:next".into()], None));
+        let next_is_the_head =
+            |s: &ResourceSnapshot| s.main.queued == 1 && head_waits_on(s, "docker");
+        anyhow::ensure!(
+            snapshot_within(&engine, DEADLINE, next_is_the_head, || false).await,
+            "next never queued for docker (snapshot {:?})",
+            engine.resource_snapshot()
+        );
+        // Stage 3: the cpu-only target, as its own build.
+        let small = build(Arc::clone(&engine), vec!["//p:small".into()], None);
+        tokio::time::timeout(PASS_DEADLINE, small)
+            .await
+            .map_err(|_elapsed| {
+                anyhow::anyhow!(
+                    "small fits the free cpu and takes no docker, and still waited \
+                     {PASS_DEADLINE:?} behind the head (snapshot {:?})",
+                    engine.resource_snapshot()
+                )
+            })??;
+        let after = engine
+            .resource_snapshot()
+            .ok_or_else(|| anyhow::anyhow!("no pool snapshot"))?;
+        anyhow::ensure!(
+            next_is_the_head(&after) && held(&after, "docker") == 1,
+            "small ended, but not while the head waited on docker: {after:?}"
+        );
+        anyhow::ensure!(
+            gated_builds.try_join_next().is_none(),
+            "a gated build ended before the gate opened"
+        );
+        Ok(())
+    }
+    .await;
+    std::fs::write(&gate, "")?;
+    let ended = join_all(&mut gated_builds, "a gated build").await;
+    seen?;
+    ended
+}
+
+/// One step of [`a_wide_target_starts_after_exactly_its_patience`]'s chains:
+/// a `cpu: 1` bash target after `dep` that marks its own start in `dir`,
+/// then runs until the file `until` is there, or `drain` is.
+fn zipper_step(name: &str, dep: Option<&str>, dir: &Path, until: Option<&str>) -> String {
+    let dir = dir.display();
+    let deps = dep.map_or_else(String::new, |d| format!(r#"deps = {{"d": ["//p:{d}"]}},"#));
+    let wait = until.map_or_else(String::new, |u| {
+        format!("while [ ! -e '{dir}/{u}' ] && [ ! -e '{dir}/drain' ]; do sleep 0.02; done; ")
+    });
+    format!(
+        r#"
+target(
+    name = "{name}",
+    driver = "bash",
+    run = ": > '{dir}/{name}'; {wait}echo {name} > $OUT",
+    out = "{name}.txt",
+    {deps}
+    resources = {{"cpu": 1}},
+)
+"#
+    )
+}
+
+/// The oldest waiter is overtaken by exactly its patience, then the pool
+/// drains for it. Two cpus (what `-j 2` resolves to), two chains `a1..a10`
+/// and `b1..b10` of `cpu: 1` steps, and `wide`, which needs both cpus and is
+/// submitted once `a1` and `b1` hold them. Every later step fits the one cpu
+/// its predecessor freed, so each start takes a cpu `wide` needs and is
+/// charged to it: `wide` starts after min(16 × 2, 4 × 2) = 8 cpus' worth,
+/// eight steps. Strict FIFO starts none of them ahead of it and unbounded
+/// first fit all eighteen.
+///
+/// The chains are zipped so the count rests on no timing. `a1` runs until
+/// the gate opens, each `b` step until the next `a` step has started, and
+/// each later `a` step until the `b` step of its own rank has: one step
+/// always holds a cpu, so `wide` never fits early because both chains
+/// happened to be between steps. The steps therefore start in one order,
+/// `a2 b2 a3 b3 …`. Once a step that fits the free cpu is left queued behind
+/// `wide`, the test opens `drain`, which ends every wait.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wide_target_starts_after_exactly_its_patience() -> anyhow::Result<()> {
+    const STEPS: usize = 10;
+    let ws = tempfile::tempdir()?;
+    let files = tempfile::tempdir()?;
+    let dir = files.path();
+    let mut content = String::from(
+        r#"
+target(
+    name = "wide",
+    driver = "bash",
+    run = "echo wide > $OUT",
+    out = "wide.txt",
+    resources = {"cpu": 2},
+)
+"#,
+    );
+    for k in 1..=STEPS {
+        let a_dep = (k > 1).then(|| format!("a{}", k - 1));
+        let b_dep = (k > 1).then(|| format!("b{}", k - 1));
+        let a_until = if k == 1 {
+            "open".to_string()
+        } else {
+            format!("b{k}")
+        };
+        // The last `b` step has no `a` step to wait for: under unbounded
+        // first fit the chains run to their end instead of hanging.
+        let b_until = (k < STEPS).then(|| format!("a{}", k + 1));
+        content.push_str(&zipper_step(
+            &format!("a{k}"),
+            a_dep.as_deref(),
+            dir,
+            Some(&a_until),
+        ));
+        content.push_str(&zipper_step(
+            &format!("b{k}"),
+            b_dep.as_deref(),
+            dir,
+            b_until.as_deref(),
+        ));
+    }
+    write_build(ws.path(), "p", &content);
+    // Room for every sandbox the test creates: a step never waits on, and is
+    // never charged for, anything but cpu.
+    let engine = engine(ws.path(), caps(&[("cpu", 2 * MICROS), ("sandbox", 64)]))?;
+
+    // Both requests send into one channel. A step started ahead of `wide`
+    // sent its `ExecuteStart` before it ran, and `wide` is granted only once
+    // every such step has ended, so stream order is start order around it.
+    let (tx, mut rx): (_, EventReceiver) = tokio::sync::mpsc::unbounded_channel();
+    let mut builds = tokio::task::JoinSet::new();
+    let seen: anyhow::Result<()> = async {
+        let chains = builds.spawn(build(
+            Arc::clone(&engine),
+            vec![format!("//p:a{STEPS}"), format!("//p:b{STEPS}")],
+            Some(tx.clone()),
+        ));
+        let both_cpus_held = |s: &ResourceSnapshot| held(s, "cpu") == 2 * MICROS;
+        anyhow::ensure!(
+            snapshot_within(&engine, DEADLINE, both_cpus_held, || false).await,
+            "a1 and b1 never held both cpus (snapshot {:?})",
+            engine.resource_snapshot()
+        );
+        builds.spawn(build(
+            Arc::clone(&engine),
+            vec!["//p:wide".into()],
+            Some(tx),
+        ));
+        anyhow::ensure!(
+            snapshot_within(&engine, DEADLINE, |s| s.main.queued == 1, || false).await,
+            "wide never queued for the cpus (snapshot {:?})",
+            engine.resource_snapshot()
+        );
+        std::fs::write(dir.join("open"), "")?;
+        // A step that fits the free cpu and is left queued behind `wide`:
+        // nothing more is admitted ahead of it. Not asserted, only waited
+        // for: whatever happened, the starts below say it.
+        snapshot_within(
+            &engine,
+            PASS_DEADLINE,
+            |s| s.main.queued == 2 && held(s, "cpu") == MICROS,
+            || chains.is_finished(),
+        )
+        .await;
+        Ok(())
+    }
+    .await;
+    std::fs::write(dir.join("open"), "")?;
+    std::fs::write(dir.join("drain"), "")?;
+    let ended = join_all(&mut builds, "a build").await;
+    seen?;
+    ended?;
+
+    let mut events = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        events.push(ev);
+    }
+    let trace = starts(&events);
+    assert_eq!(trace.len(), 2 * STEPS + 1, "every target ran: {trace:?}");
+    let wide_at = trace
+        .iter()
+        .position(|a| *a == "//p:wide")
+        .expect("wide started");
+    // `a1` and `b1` held the cpus before `wide` was submitted, and nothing
+    // else could start until the gate opened, which was after it queued:
+    // told apart by name, so no start is counted by when it was observed.
+    let ahead: Vec<&str> = trace
+        .iter()
+        .take(wide_at)
+        .copied()
+        .filter(|a| !matches!(*a, "//p:a1" | "//p:b1"))
+        .collect();
+    assert_eq!(
+        ahead,
+        [
+            "//p:a2", "//p:b2", "//p:a3", "//p:b3", "//p:a4", "//p:b4", "//p:a5", "//p:b5"
+        ],
+        "exactly min(16 × 2, 4 × 2) = 8 steps start between wide queuing and starting \
+         (all starts: {trace:?})"
+    );
+    Ok(())
+}
