@@ -442,11 +442,20 @@ impl Gated {
 
     /// [`Self::start`], running `heph run <run_args>` (shell words) instead.
     fn start_run(prelude: &str, env: &[(&str, &str)], run_args: &str) -> Self {
+        Self::start_build(gated_build, prelude, env, run_args)
+    }
+
+    /// [`Self::start_run`] with `build(gate)` as `pkg/BUILD`.
+    fn start_build(
+        build: fn(&std::path::Path) -> String,
+        prelude: &str,
+        env: &[(&str, &str)],
+        run_args: &str,
+    ) -> Self {
         let dist = Dist::locate();
         let ws = common::Workspace::new().expect("workspace");
         let gate = ws.root().join("gate-open");
-        ws.write("pkg/BUILD", &gated_build(&gate))
-            .expect("write BUILD");
+        ws.write("pkg/BUILD", &build(&gate)).expect("write BUILD");
         let script = format!("{prelude}exec \"$HEPH\" run {run_args}");
         let pty = common::pty::Pty::script_at_cursor(&dist, ws.root(), &script, env);
         Self { pty, gate, _ws: ws }
@@ -1546,6 +1555,337 @@ fn mouse_capture_only_on_full_screens() {
                 case.name
             );
         },
+    );
+}
+
+const ENTER: &[u8] = b"\r";
+/// What the line says while Y stands.
+const AUTO_APPROVING: &str = "auto-approving (Y)";
+
+/// Three approval-gated dependencies of `//pkg:sum`, the run's named target.
+/// `//pkg:one`'s notice is ready at once and carries control bytes (a colour,
+/// a bell, a screen clear); `//pkg:two`'s takes a second, so the two queue
+/// in that order; `//pkg:three` asks only once the gate is open.
+fn approval_build(gate: &std::path::Path) -> String {
+    format!(
+        concat!(
+            "target(name = \"gate\", driver = \"bash\", cache = False,",
+            " run = [\"trap '' INT TERM\", \"while [ ! -e {gate} ]; do sleep 0.1; done\"])\n",
+            "target(name = \"plan_ctl\", driver = \"bash\", cache = False, out = \"plan.txt\",",
+            " run = \"printf 'deploy \\\\033[31mALERT\\\\033[0m bell\\\\007 \\\\033[2J end\\\\n' > $OUT\")\n",
+            "target(name = \"plan\", driver = \"bash\", cache = False, out = \"plan.txt\",",
+            " run = [\"sleep 1\", \"echo 'push api:prod' > $OUT\"])\n",
+            "target(name = \"one\", driver = \"bash\", cache = False, run = \"true\",",
+            " deps = {{\"plan\": \":plan_ctl\"}},",
+            " approval = {{\"required\": True, \"notice\": [\"plan\"]}})\n",
+            "target(name = \"two\", driver = \"bash\", cache = False, run = \"true\",",
+            " deps = {{\"plan\": \":plan\"}},",
+            " approval = {{\"required\": True, \"notice\": [\"plan\"]}})\n",
+            "target(name = \"three\", driver = \"bash\", cache = False, run = \"true\",",
+            " deps = {{\"plan\": \":plan\", \"gate\": \":gate\"}},",
+            " approval = {{\"required\": True, \"notice\": [\"plan\"]}})\n",
+            "target(name = \"sum\", driver = \"bash\", cache = False, run = [\"echo {out}\"],",
+            " deps = {{\"one\": \":one\", \"two\": \":two\", \"three\": \":three\"}})\n",
+        ),
+        gate = gate.display(),
+        out = TARGET_OUT,
+    )
+}
+
+/// The approval view's notice-tab row (`◂ esc  ✦ //x  │  plan   1 of 2
+/// pending`), while the view is up.
+fn approval_tabs(s: &vt100::Screen) -> Option<String> {
+    if !s.alternate_screen() {
+        return None;
+    }
+    rows_of(s).find(|r| r.contains("◂ esc"))
+}
+
+/// The view shows `addr`'s request, with `status` on the right of its tab
+/// row: `1 of 2 pending`, or the decision just taken.
+fn viewing(s: &vt100::Screen, addr: &str, status: &str) -> bool {
+    approval_tabs(s).is_some_and(|r| r.contains(&format!("{addr} ")) && r.contains(status))
+}
+
+/// The decision keys' hint is drawn yellow: the lockout is over.
+fn decision_armed(s: &vt100::Screen) -> bool {
+    approval_tabs(s).is_some()
+        && find_cell(s, "y approve")
+            .and_then(|(row, col)| s.cell(row, col))
+            .is_some_and(|c| c.fgcolor() == vt100::Color::Idx(3))
+}
+
+/// The line's prompt row names `addr`, the oldest pending request.
+fn prompted_for(s: &vt100::Screen, addr: &str, pending: &str) -> bool {
+    !s.alternate_screen()
+        && rows_of(s).any(|r| r.contains(&format!("approval required: {addr}{pending}")))
+}
+
+/// The line, saying Y stands.
+fn line_auto_approving(s: &vt100::Screen) -> bool {
+    on_line(s) && count_rows(s, AUTO_APPROVING) == 1
+}
+
+/// The dashboard, its list led by both requests' `✦` rows.
+fn dashboard_with_requests(s: &vt100::Screen) -> bool {
+    on_dashboard(s) && count_rows(s, "awaits approval") == 2
+}
+
+/// The run's scrollback once heph has exited: the rows that record a
+/// decision, which only the run's own log prints.
+fn decision_lines(pty: &common::pty::Pty) -> Vec<String> {
+    pty.rows()
+        .into_iter()
+        .filter(|r| r.contains("approved //pkg:") || r.contains("rejected //pkg:"))
+        .collect()
+}
+
+/// Type `key` every 20 ms for `for_ms`.
+fn hold_key(pty: &common::pty::Pty, key: &[u8], for_ms: u64) {
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_millis(for_ms) {
+        pty.send(key);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The approval view decides what it shows and returns to where it was
+/// opened. y, once the lockout is over, approves the request on screen; the
+/// tab row flashes the decision, then the next request shows with its own
+/// lockout; Y approves it, and the one that arrives after; the view closes
+/// to the screen that opened it, and the line (and the dashboard's title
+/// row) say `auto-approving (Y)` while the build runs. Each decision is one
+/// scrollback line, read notices named, `notices not read` for those Y
+/// decided. A notice's control bytes reach the screen as text, never as a
+/// colour.
+#[test]
+fn approval_view_decides_and_returns() {
+    struct Case {
+        name: &'static str,
+        /// From the line's prompt to the view.
+        open: &'static [Step<'static>],
+        /// The screen that opened the view, once it has closed: Y stands.
+        origin: fn(&vt100::Screen) -> bool,
+        /// From there back to the line.
+        back: &'static [Step<'static>],
+    }
+    let cases = [
+        Case {
+            name: "from the line",
+            open: &[Step::Keys(ENTER)],
+            origin: line_auto_approving,
+            back: &[],
+        },
+        Case {
+            name: "from the dashboard",
+            open: &[
+                Step::Keys(TAB),
+                Step::Until("the dashboard, with the requests", dashboard_with_requests),
+                Step::Keys(b"v"),
+            ],
+            // Its title row says so.
+            origin: |s| on_dashboard(s) && count_rows(s, AUTO_APPROVING) == 1,
+            back: &[
+                Step::Keys(ESC),
+                Step::Until("the line, Y standing", line_auto_approving),
+            ],
+        },
+    ];
+    let run = |case: &Case| {
+        let mut g = Gated::start_build(approval_build, "", &[], "//pkg:sum");
+        g.pty
+            .wait_screen("two requests on the line", DEADLINE, |s| {
+                prompted_for(s, "//pkg:one", " · 2 pending")
+            });
+        g.play(case.open);
+        g.pty.wait_screen("the view, on the oldest", DEADLINE, |s| {
+            viewing(s, "//pkg:one", "1 of 2 pending")
+        });
+        g.pty
+            .wait_screen("the decision keys, armed", DEADLINE, decision_armed);
+        // The notice is on screen as text: its escape drew no colour, and
+        // its bell and screen clear left the row whole.
+        g.pty.with_screen(|s| {
+            let (row, col) = find_cell(s, "ALERT").expect("the notice's text on screen");
+            let row_text = rows_of(s).nth(usize::from(row)).unwrap_or_default();
+            assert!(
+                row_text.contains("deploy") && row_text.contains("end"),
+                "{}: the notice's row was cut: {row_text:?}",
+                case.name
+            );
+            let fg = s.cell(row, col).map(vt100::Cell::fgcolor);
+            assert_ne!(
+                fg,
+                Some(vt100::Color::Idx(1)),
+                "{}: the notice's escape coloured it",
+                case.name
+            );
+        });
+        g.pty.send(b"y");
+        g.pty.wait_screen("the decision, flashed", DEADLINE, |s| {
+            viewing(s, "//pkg:one", "✓ approved //pkg:one")
+        });
+        g.pty.wait_screen("the next request", DEADLINE, |s| {
+            viewing(s, "//pkg:two", "1 of 1 pending")
+        });
+        g.pty
+            .wait_screen("its decision keys, armed", DEADLINE, decision_armed);
+        g.pty.send(b"Y");
+        g.pty.wait_screen("Y, flashed", DEADLINE, |s| {
+            viewing(s, "//pkg:two", "✓ approved //pkg:two")
+        });
+        // Nothing left: back where it was opened, saying Y stands.
+        g.pty
+            .wait_screen("the screen that opened it", DEADLINE, case.origin);
+        g.play(case.back);
+        assert!(
+            g.pty
+                .with_screen(|s| count_rows(s, "approval required") == 0),
+            "{}: a prompt row with nothing pending\n{}",
+            case.name,
+            g.pty.screen()
+        );
+        // The third asks after Y: approved as it arrives, no prompt.
+        g.play(&[Step::OpenGate]);
+        let ended = g.exit();
+        assert_eq!(
+            ended,
+            common::pty::Ended::Code(0),
+            "{}: the build failed\n{}",
+            case.name,
+            g.pty.seen()
+        );
+        assert!(
+            !g.pty.seen().contains("approval required: //pkg:three"),
+            "{}: //pkg:three prompted under Y\n{}",
+            case.name,
+            g.pty.seen()
+        );
+        assert_restored(&g.pty, case.name);
+        let lines = decision_lines(&g.pty);
+        let expect: [(&str, &[&str]); 3] = [
+            (
+                "✓ approved //pkg:one · by key (y) after ",
+                &[" · read plan"],
+            ),
+            (
+                "✓ approved //pkg:two · by standing approval (Y) after ",
+                &[" · notices not read"],
+            ),
+            (
+                "✓ approved //pkg:three · by standing approval (Y) after ",
+                &[" · notices not read"],
+            ),
+        ];
+        assert_eq!(
+            lines.len(),
+            expect.len(),
+            "{}: one line per decision: {lines:?}",
+            case.name
+        );
+        for (head, tails) in expect {
+            let line = lines
+                .iter()
+                .find(|l| l.contains(head))
+                .unwrap_or_else(|| panic!("{}: no `{head}` line in {lines:?}", case.name));
+            for tail in tails {
+                assert!(
+                    line.ends_with(tail),
+                    "{}: `{line}` does not end `{tail}`",
+                    case.name
+                );
+            }
+        }
+    };
+    each_case(&cases, |c| c.name, run);
+}
+
+/// Decision keys held down decide nothing: a stream of Y, then of N, as the
+/// view opens on two pending requests leaves both pending, and so does a
+/// stream of y right after a decision — the presses are dropped, not queued
+/// for when the lockout ends. Esc leaves the request pending and the build
+/// waiting for it.
+#[test]
+fn held_keys_decide_nothing() {
+    let mut g = Gated::start_build(approval_build, "", &[], "//pkg:sum");
+    g.pty
+        .wait_screen("two requests on the line", DEADLINE, |s| {
+            prompted_for(s, "//pkg:one", " · 2 pending")
+        });
+    // From before the first frame of the view to 0.4 s after: all of it
+    // inside the lockout, which starts at that frame.
+    g.pty.send(ENTER);
+    hold_key(&g.pty, b"Y", 200);
+    hold_key(&g.pty, b"N", 200);
+    g.pty.wait_screen("the view, armed", DEADLINE, |s| {
+        viewing(s, "//pkg:one", "1 of 2 pending") && decision_armed(s)
+    });
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(
+        g.pty
+            .with_screen(|s| viewing(s, "//pkg:one", "1 of 2 pending")),
+        "held Y/N decided something\n{}",
+        g.pty.screen()
+    );
+    // A decision, then y held through its flash: the next request keeps
+    // its own lockout, and nothing pressed before it ends decides it.
+    g.pty.send(b"y");
+    g.pty.wait_screen("the decision, flashed", DEADLINE, |s| {
+        viewing(s, "//pkg:one", "✓ approved //pkg:one")
+    });
+    hold_key(&g.pty, b"y", 400);
+    g.pty.wait_screen("the next request, armed", DEADLINE, |s| {
+        viewing(s, "//pkg:two", "1 of 1 pending") && decision_armed(s)
+    });
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(
+        g.pty
+            .with_screen(|s| viewing(s, "//pkg:two", "1 of 1 pending")),
+        "a held y was queued for the next request\n{}",
+        g.pty.screen()
+    );
+    // Esc: back on the line, the request still pending, the build waiting.
+    g.pty.send(ESC);
+    g.pty
+        .wait_screen("the line, still prompting", DEADLINE, |s| {
+            prompted_for(s, "//pkg:two", " · enter to review")
+        });
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        common::alive(g.pty.pid())
+            && g.pty
+                .with_screen(|s| prompted_for(s, "//pkg:two", " · enter to review")),
+        "the build stopped waiting after esc\n{}",
+        g.pty.screen()
+    );
+    // Decide it, and the third, for real.
+    g.pty.send(ENTER);
+    g.pty.wait_screen("the view, armed", DEADLINE, |s| {
+        viewing(s, "//pkg:two", "1 of 1 pending") && decision_armed(s)
+    });
+    g.pty.send(b"Y");
+    g.pty
+        .wait_screen("the line, Y standing", DEADLINE, line_auto_approving);
+    g.play(&[Step::OpenGate]);
+    let ended = g.exit();
+    assert_eq!(
+        ended,
+        common::pty::Ended::Code(0),
+        "the build failed\n{}",
+        g.pty.seen()
+    );
+    assert_restored(&g.pty, "held keys");
+    // Three decisions, the three keys that were meant: no N got through.
+    let lines = decision_lines(&g.pty);
+    assert_eq!(lines.len(), 3, "one line per decision: {lines:?}");
+    assert!(
+        lines.iter().all(|l| l.contains("✓ approved")),
+        "a held key decided: {lines:?}"
+    );
+    assert_eq!(
+        lines.iter().filter(|l| l.contains("by key (y)")).count(),
+        1,
+        "y decided more than the one it was pressed for: {lines:?}"
     );
 }
 
