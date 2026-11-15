@@ -466,7 +466,7 @@ pub enum ViewMode {
 /// Compares in place. Lower-casing both sides allocated two `String`s per row,
 /// and the filter has to be tried against *every* row to know how many matched —
 /// so at 100k targets that was 200k allocations on every frame.
-fn addr_matches(addr: &str, filter: &str) -> bool {
+pub(crate) fn addr_matches(addr: &str, filter: &str) -> bool {
     if filter.is_empty() {
         return true;
     }
@@ -570,7 +570,7 @@ impl HeaderItem {
 /// (plus a mapping arm) when a new typed span event should appear in the
 /// breakdown — e.g. remote read/write once their events land.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum Op {
+pub(crate) enum Op {
     RemoteCacheRead,
     /// Warming a scratch directory — seeding a lineage from a fallback scope, or
     /// pulling a snapshot from the remote.
@@ -584,7 +584,7 @@ impl Op {
     /// Single glyph shown before the op's elapsed time. Must stay **BMP
     /// single-width** (plain-text rows; a double-width glyph would clip). Remote
     /// ops use `↓`/`↑` (U+2193/2191), never the emoji `⬇`/`⬆`.
-    fn icon(self) -> char {
+    pub(crate) fn icon(self) -> char {
         match self {
             Op::RemoteCacheRead => '↓',
             Op::ScratchPrepare => '↺',
@@ -610,13 +610,33 @@ impl Op {
     /// remote download → scratch warm → execute → local-cache write → remote
     /// upload. This is the order the engine runs them in, so a row reads
     /// left-to-right as the target's own history.
-    fn order(self) -> u8 {
+    pub(crate) fn order(self) -> u8 {
         match self {
             Op::RemoteCacheRead => 0,
             Op::ScratchPrepare => 1,
             Op::Execute => 2,
             Op::LocalCacheWrite => 3,
             Op::RemoteCacheWrite => 4,
+        }
+    }
+
+    /// Every op, indexed by [`Op::order`].
+    pub(crate) const BY_ORDER: [Op; 5] = [
+        Op::RemoteCacheRead,
+        Op::ScratchPrepare,
+        Op::Execute,
+        Op::LocalCacheWrite,
+        Op::RemoteCacheWrite,
+    ];
+
+    /// The dashboard's PHASE words for a target in this op.
+    pub(crate) fn phase(self) -> &'static str {
+        match self {
+            Op::RemoteCacheRead => "download",
+            Op::ScratchPrepare => "scratch",
+            Op::Execute => "execute",
+            Op::LocalCacheWrite => "cache write",
+            Op::RemoteCacheWrite => "upload",
         }
     }
 }
@@ -628,7 +648,7 @@ type SlowTarget = (String, u64, Vec<(Op, u64)>);
 
 /// Which edge of an [`Op`] span an event represents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Boundary {
+pub(crate) enum Boundary {
     Start,
     End,
 }
@@ -648,7 +668,7 @@ struct OpTimeline {
 /// Map an individually-typed engine event to the op-timeline boundary it
 /// represents, if any. This is where the well-defined engine events are collapsed
 /// into the shared per-target timeline; a new op needs one arm here.
-fn event_op_boundary(kind: &BuildEventKind) -> Option<(&str, Op, Boundary)> {
+pub(crate) fn event_op_boundary(kind: &BuildEventKind) -> Option<(&str, Op, Boundary)> {
     match kind {
         BuildEventKind::ExecuteStart { addr, .. } => Some((addr, Op::Execute, Boundary::Start)),
         BuildEventKind::ExecuteEnd { addr, .. } => Some((addr, Op::Execute, Boundary::End)),
@@ -815,6 +835,18 @@ pub struct BuildState {
     root_failed: usize,
     /// heph's home, redacted from every error text this state keeps (I9).
     redact: crate::tui::text::Redact,
+}
+
+/// A root failure's reason, as the line's spotlight and the dashboard's
+/// PHASE column show it: `exit 101`, `timed out 10m`, or the error's first
+/// line, cleaned and redacted.
+pub(crate) fn failure_reason(
+    error: &str,
+    exit_status: Option<&str>,
+    timed_out: Option<&hcore::events::TimedOutData>,
+    redact: &crate::tui::text::Redact,
+) -> String {
+    spotlight::RootFailure::reason(error, exit_status, timed_out, redact)
 }
 
 /// The finished line's split of the failed count, from

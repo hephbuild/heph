@@ -7940,6 +7940,7 @@ dependencies = [
  "core",
  "crossterm",
  "futures",
+ "hashbrown 0.16.1",
  "libc",
  "memchr",
  "proc",

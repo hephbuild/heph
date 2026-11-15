@@ -17,6 +17,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 async-trait = "0.1.89"
 libc = "0.2"
 unicode-width = "0.2"
+# The dashboard's address interner: a table of `u32` ids hashed by the
+# address they name, so each address is stored once (already in the tree).
+hashbrown = { version = "0.16", default-features = false }
 ansi-to-tui = "8"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm", "macros", "scrolling-regions"] }
 crossterm = { version = "0.29", features = ["event-stream"] }

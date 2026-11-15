@@ -2,6 +2,7 @@ pub mod app;
 pub mod approval;
 mod backend;
 pub mod color;
+pub mod dashboard;
 pub mod log_sink;
 pub mod panic;
 pub mod paused;
