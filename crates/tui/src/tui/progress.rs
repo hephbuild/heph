@@ -2061,6 +2061,7 @@ impl TuiProgressView {
             waits: &self.state,
             lines: &self.last_lines,
             now_ms,
+            redact: &self.state.redact,
         };
         out.extend(dashboard_frame(
             &title,
@@ -2460,7 +2461,14 @@ impl TUIAppView for TuiProgressView {
     }
 
     fn open_selected(&mut self, log: bool) {
-        if !self.dashboard_open || self.target.is_some() {
+        if !self.dashboard_open {
+            return;
+        }
+        if let Some(t) = &mut self.target {
+            // Enter on an open target screen: expand a folded output group.
+            if !log {
+                t.enter();
+            }
             return;
         }
         if let Some(id) = self.list.selected() {

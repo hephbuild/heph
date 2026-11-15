@@ -3,13 +3,14 @@
 //! only the model; Log and Outputs read through a [`TargetFeed`], off the
 //! render task (I7). Nothing drawn names a path into heph's home (I9).
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use hcore::events::{AdmittedKind, display_amount, unit_of};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use super::detail::Phase;
+use super::detail::{Detail, Phase};
 use super::feed::{
     FeedMsg, FileKind, LogOpened, OutputFile, OutputsFound, TargetFeed, TargetReader,
 };
@@ -24,7 +25,8 @@ use crate::tui::text::{Redact, clean_inline, cut_left, cut_right, width};
 
 pub const OVERVIEW_HINTS: &str = "tab/⇧tab switch tab · esc back to the list";
 pub const LOG_HINTS: &str = "↑/↓ scroll (stops following) · f follow · / search · n/N next/prev · g/G top/bottom · w wrap · esc back";
-pub const OUTPUTS_HINTS: &str = "↑/↓ scroll · tab/⇧tab switch tab · esc back to the list";
+pub const OUTPUTS_HINTS: &str =
+    "↑/↓ scroll · enter expand a folded group · tab/⇧tab switch tab · esc back to the list";
 
 /// Files a group lists before folding the rest into "… N more".
 const FOLD_AT: usize = 3;
@@ -86,6 +88,12 @@ pub struct TargetScreen {
     outputs_asked: Option<u64>,
     /// Overview's and Outputs' first body row.
     scroll: usize,
+    /// Outputs groups shown whole rather than folded.
+    expanded: BTreeSet<String>,
+    /// The last Outputs frame's folded groups, by body row, and how many
+    /// body rows it showed: what Enter expands.
+    folds: Vec<(usize, String)>,
+    body_rows: usize,
 }
 
 impl TargetScreen {
@@ -109,7 +117,26 @@ impl TargetScreen {
             outputs: None,
             outputs_asked: None,
             scroll: 0,
+            expanded: BTreeSet::new(),
+            folds: Vec::new(),
+            body_rows: 0,
         }
+    }
+
+    /// Enter on Outputs: expand the first folded group in view; with none
+    /// in view, fold every group again. `false` on another tab.
+    pub fn enter(&mut self) -> bool {
+        if self.tab != TargetTab::Outputs {
+            return false;
+        }
+        let view = self.scroll..self.scroll.saturating_add(self.body_rows);
+        match self.folds.iter().find(|(row, _)| view.contains(row)) {
+            Some((_, group)) => {
+                self.expanded.insert(group.clone());
+            }
+            None => self.expanded.clear(),
+        }
+        true
     }
 
     pub fn id(&self) -> Id {
@@ -276,7 +303,11 @@ impl TargetScreen {
             (TargetTab::Log, Some(r)) => {
                 let mut body = Vec::new();
                 if r.state == RowState::Failed {
-                    let (words, style) = state_words(m, self.id, &r, inp);
+                    let (mut words, style) = state_words(m, self.id, &r, inp);
+                    if let Some(took) = took_down_text(m, self.id) {
+                        words = format!("{words} · {took}");
+                    }
+                    let words = inp.redact.apply(&clean_inline(&words)).into_owned();
                     body.push(Line::styled(
                         cut_right(&format!(" {words}"), c).into_owned(),
                         style,
@@ -292,7 +323,22 @@ impl TargetScreen {
                 (self.pane.status(), body, hints)
             }
             (TargetTab::Outputs, Some(r)) => {
-                let (summary, body) = outputs(m, self.id, &r, self.outputs.as_ref(), inp, c);
+                let mut folds = std::mem::take(&mut self.folds);
+                folds.clear();
+                let (summary, body) = outputs(
+                    m,
+                    self.id,
+                    &r,
+                    self.outputs.as_ref(),
+                    Fold {
+                        expanded: &self.expanded,
+                        folds: &mut folds,
+                    },
+                    inp,
+                    c,
+                );
+                self.folds = folds;
+                self.body_rows = body_rows;
                 (
                     summary,
                     self.window(body, body_rows),
@@ -399,7 +445,13 @@ fn state_words(m: &Model, id: Id, r: &Record, inp: &TargetInputs<'_>) -> (String
             None => ("⧗ waiting".into(), Style::default().fg(Color::Yellow)),
         },
         RowState::Running => {
-            let first = m.phases(id, inp.now_ms).first().map(|p| p.start_ms);
+            // From the first op: a wait for admission or the lock is not
+            // running.
+            let first = m
+                .phases(id, inp.now_ms)
+                .iter()
+                .find(|p| !matches!(p.label, "queued" | "lock wait"))
+                .map(|p| p.start_ms);
             let so_far = first.map_or(0, |s| inp.now_ms.saturating_sub(s));
             (
                 format!("▶ running · {} so far", secs_tenths(so_far)),
@@ -427,6 +479,23 @@ fn state_words(m: &Model, id: Id, r: &Record, inp: &TargetInputs<'_>) -> (String
         },
         RowState::Stopped => ("○ stopped".into(), dim()),
     }
+}
+
+/// Names shown in "took down …" before the rest is counted.
+const TOOK_DOWN_NAMED: usize = 3;
+
+/// `took down //a, //b and 4 more`: what a root failure stopped from
+/// building; `None` when it took nothing down.
+fn took_down_text(m: &Model, id: Id) -> Option<String> {
+    let (names, n) = m.took_down(id, TOOK_DOWN_NAMED);
+    if n == 0 {
+        return None;
+    }
+    let named = names.join(", ");
+    Some(match n - names.len() {
+        0 => format!("took down {named}"),
+        rest => format!("took down {named} and {rest} more"),
+    })
 }
 
 /// A label column and its value.
@@ -482,6 +551,19 @@ fn overview(
     if !resources.is_empty() {
         out.push(row("resources", &resources, cols));
     }
+    // The timeout is known once the run hit it: `ExecuteStart` does not
+    // carry it, so a run going on shows no time left.
+    if let Some(abandoned) = d.and_then(Detail::timed_out) {
+        let reason = m.reason(id).unwrap_or("timed out");
+        let text = if abandoned {
+            format!(
+                "{reason} · abandoned: heph stopped waiting after the grace, its process may still be running"
+            )
+        } else {
+            format!("{reason} · stopped")
+        };
+        out.push(row("timeout", &text, cols));
+    }
     // Waiting now: the shared formatter's words, as the Pending row and
     // the spotlight say them. Admitted: how long and how.
     if r.state == RowState::Blocked
@@ -492,7 +574,7 @@ fn overview(
         } else {
             format!("{} {}", w.phase, w.detail)
         };
-        out.push(row("waiting", &text, cols));
+        out.push(row("waiting", &inp.redact.apply(&text), cols));
     } else if let Some(d) = d.filter(|d| d.ran()) {
         let how = match d.admitted() {
             Some(AdmittedKind::Arrival) => Some("at once"),
@@ -534,6 +616,12 @@ fn overview(
     {
         out.push(row("root", &format!("{root} (heph log {root})"), cols));
     }
+    if r.state == RowState::Failed
+        && let Some(took) = took_down_text(m, id)
+    {
+        let names = took.strip_prefix("took down ").unwrap_or(&took);
+        out.push(row("took down", names, cols));
+    }
     out.push(Line::default());
     out.extend(timeline_lines(&m.phases(id, inp.now_ms), cols));
     out.push(Line::default());
@@ -543,7 +631,9 @@ fn overview(
         PaneState::Ended(_) | PaneState::Read(_) => {
             format!("log · {} · tab to open", pane.status())
         }
-        PaneState::Nothing(why) | PaneState::Unavailable(why) => format!("log · {why}"),
+        PaneState::Nothing(why) | PaneState::Unavailable(why) => {
+            format!("log · {}", inp.redact.apply(&clean_inline(why)))
+        }
     };
     out.push(Line::styled(
         cut_right(&format!(" {log}"), cols).into_owned(),
@@ -628,12 +718,20 @@ pub fn timeline_lines(phases: &[Phase], cols: usize) -> Vec<Line<'static>> {
     out
 }
 
+/// Which groups show whole, and where the folded ones' "… N more" rows
+/// landed.
+struct Fold<'a> {
+    expanded: &'a BTreeSet<String>,
+    folds: &'a mut Vec<(usize, String)>,
+}
+
 /// The Outputs tab's summary (the tab row's right side) and body.
 fn outputs(
     m: &Model,
     id: Id,
     r: &Record,
     found: Option<&OutputsFound>,
+    mut fold: Fold<'_>,
     inp: &TargetInputs<'_>,
     cols: usize,
 ) -> (String, Vec<Line<'static>>) {
@@ -676,7 +774,7 @@ fn outputs(
                 if !kept.is_empty() || !fixes.is_empty() =>
             {
                 let mut out = vec![header_row(cols)];
-                list_files("failure_out", kept, &mut out, cols);
+                list_files("failure_out", kept, &mut out, cols, &mut fold);
                 for (i, f) in fixes.iter().enumerate() {
                     let label = if i == 0 { "fixes" } else { "" };
                     out.push(file_row(
@@ -719,7 +817,7 @@ fn outputs(
                         None if g.files.is_empty() => {
                             out.push(file_row(name, "(nothing written)", None, None, cols));
                         }
-                        None => list_files(name, &g.files, &mut out, cols),
+                        None => list_files(name, &g.files, &mut out, cols, &mut fold),
                     }
                 }
                 out.push(Line::default());
@@ -782,7 +880,8 @@ fn file_row_styled(
     cols: usize,
     style: Style,
 ) -> Line<'static> {
-    let path_w = cols.saturating_sub(3 + GROUP_W + 1 + SIZE_W + 2 + HASH_W);
+    // Indent, group, space, path, space, size, two spaces, hash.
+    let path_w = cols.saturating_sub(3 + GROUP_W + 1 + 1 + SIZE_W + 2 + HASH_W);
     let group = cut_right(&clean_inline(group), GROUP_W).into_owned();
     let path = cut_left(&clean_inline(path), path_w).into_owned();
     let hash: String = hash.unwrap_or("").chars().take(HASH_W).collect();
@@ -797,9 +896,21 @@ fn file_row_styled(
     Line::styled(cut_right(&text, cols).into_owned(), style)
 }
 
-/// A group's files, the first [`FOLD_AT`] then "… N more files".
-fn list_files(group: &str, files: &[OutputFile], out: &mut Vec<Line<'static>>, cols: usize) {
-    for (i, f) in files.iter().take(FOLD_AT).enumerate() {
+/// A group's files: the first [`FOLD_AT`] then "… N more files", or all of
+/// them once Enter expanded the group.
+fn list_files(
+    group: &str,
+    files: &[OutputFile],
+    out: &mut Vec<Line<'static>>,
+    cols: usize,
+    fold: &mut Fold<'_>,
+) {
+    let shown = if fold.expanded.contains(group) {
+        files.len()
+    } else {
+        FOLD_AT
+    };
+    for (i, f) in files.iter().take(shown).enumerate() {
         let label = if i == 0 { group } else { "" };
         let path = match &f.kind {
             FileKind::File => f.path.clone(),
@@ -809,8 +920,10 @@ fn list_files(group: &str, files: &[OutputFile], out: &mut Vec<Line<'static>>, c
         let size = (f.kind == FileKind::File).then_some(f.size);
         out.push(file_row(label, &path, size, f.hash.as_deref(), cols));
     }
-    if let Some(rest) = files.get(FOLD_AT..).filter(|r| !r.is_empty()) {
+    if let Some(rest) = files.get(shown..).filter(|r| !r.is_empty()) {
         let size = rest.iter().map(|f| f.size).sum();
+        // `out` is the body from its first row: the fold row's index.
+        fold.folds.push((out.len(), group.to_owned()));
         out.push(file_row(
             "",
             &format!("… {} more files", rest.len()),

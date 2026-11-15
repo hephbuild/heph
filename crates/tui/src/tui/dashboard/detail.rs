@@ -22,21 +22,39 @@ const REBUILT: u8 = 1 << 4;
 /// The run's result is not cached (`cache = False`).
 const NOT_CACHED: u8 = 1 << 5;
 
-/// One target's Overview facts. 32 bytes.
+/// End bits: how the run ended, and whether it waits on the result lock.
+const TIMED_OUT: u8 = 1;
+/// Timed out, and heph stopped waiting for it after the grace.
+const ABANDONED: u8 = 1 << 1;
+/// A result-lock wait is going on.
+const LOCK_OPEN: u8 = 1 << 2;
+
+/// One target's Overview facts. 40 bytes.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Detail {
     /// Each op's first start, in ms after [`Details`]' first stamp, plus
     /// one; 0 when it never started. By [`Op::order`].
     op_start: [u32; 5],
+    /// The first wait on the result's lock, and the last one's end, on the
+    /// same scale as `op_start`; 0 when there was none (or none ended).
+    lock_start: u32,
+    lock_end: u32,
     /// How long the run waited at admission (`ExecuteStart.queued_ms`).
     queued_ms: u32,
     /// The run's [`Shape`], plus one; 0 before it ran.
     shape: u32,
     admitted: Option<AdmittedKind>,
     cache: u8,
+    end: u8,
 }
 
 impl Detail {
+    /// The run hit its `timeout`: `Some(abandoned)`, true when heph
+    /// stopped waiting for it and its process may still be running.
+    pub fn timed_out(&self) -> Option<bool> {
+        (self.end & TIMED_OUT != 0).then_some(self.end & ABANDONED != 0)
+    }
+
     pub fn admitted(&self) -> Option<AdmittedKind> {
         self.admitted
     }
@@ -144,17 +162,25 @@ impl Details {
             | BuildEventKind::RemoteCacheHit { addr }
             | BuildEventKind::RemoteCacheMiss { addr }
             | BuildEventKind::CacheOutcome { addr, .. }
-            | BuildEventKind::CacheHitRebuilt { addr, .. } => Some(addr),
+            | BuildEventKind::CacheHitRebuilt { addr, .. }
+            | BuildEventKind::ResultLockWaitStart { addr, .. }
+            | BuildEventKind::ResultLockWaitEnd { addr }
+            | BuildEventKind::ResultEnd { addr, .. } => Some(addr),
             _ => None,
         }
     }
 
+    /// `at` on the stamps' scale, plus one (0 is "never").
+    fn rel(&mut self, at: u64) -> u32 {
+        let t0 = *self.t0.get_or_insert(at);
+        u32::try_from(at.saturating_sub(t0))
+            .unwrap_or(u32::MAX - 1)
+            .saturating_add(1)
+    }
+
     /// `op` started on `id` at `at`: kept when it is the op's first start.
     pub(super) fn op_started(&mut self, id: Id, op: Op, at: u64) {
-        let t0 = *self.t0.get_or_insert(at);
-        let rel = u32::try_from(at.saturating_sub(t0))
-            .unwrap_or(u32::MAX - 1)
-            .saturating_add(1);
+        let rel = self.rel(at);
         if let Some(slot) = self
             .list
             .get_mut(id as usize)
@@ -165,7 +191,45 @@ impl Details {
         }
     }
 
-    pub(super) fn fold(&mut self, id: Id, kind: &BuildEventKind, _at: u64) {
+    pub(super) fn fold(&mut self, id: Id, kind: &BuildEventKind, at: u64) {
+        let end_bits = match kind {
+            BuildEventKind::ResultLockWaitStart { .. } => {
+                let rel = self.rel(at);
+                if let Some(d) = self.list.get_mut(id as usize) {
+                    if d.lock_start == 0 {
+                        d.lock_start = rel;
+                    }
+                    d.end |= LOCK_OPEN;
+                }
+                return;
+            }
+            BuildEventKind::ResultLockWaitEnd { .. } => {
+                let rel = self.rel(at);
+                if let Some(d) = self.list.get_mut(id as usize)
+                    && d.end & LOCK_OPEN != 0
+                {
+                    d.lock_end = rel;
+                    d.end &= !LOCK_OPEN;
+                }
+                return;
+            }
+            BuildEventKind::ResultEnd { timed_out, .. } => match timed_out {
+                Some(t) if t.abandoned => TIMED_OUT | ABANDONED,
+                Some(_) => TIMED_OUT,
+                None => 0,
+            },
+            _ => 0,
+        };
+        if let BuildEventKind::ResultEnd { .. } = kind {
+            let rel = self.rel(at);
+            if let Some(d) = self.list.get_mut(id as usize) {
+                if d.end & LOCK_OPEN != 0 {
+                    d.lock_end = rel;
+                }
+                d.end = (d.end & !LOCK_OPEN) | end_bits;
+            }
+            return;
+        }
         let bit = match kind {
             BuildEventKind::ExecuteStart {
                 driver,
@@ -233,6 +297,25 @@ impl Details {
     /// open op runs to `now_ms`.
     pub(super) fn phases(&self, r: &Record, d: &Detail, now_ms: u64) -> Vec<Phase> {
         let mut out = Vec::new();
+        // The wait on the result's lock (another heph building it): from
+        // the first wait to the last one's end.
+        if let (Some(t0), Some(first)) = (self.t0, d.lock_start.checked_sub(1)) {
+            let start = t0.saturating_add(u64::from(first));
+            let open = d.end & LOCK_OPEN != 0;
+            let end = match d.lock_end.checked_sub(1) {
+                _ if open => now_ms.max(start),
+                Some(e) => t0.saturating_add(u64::from(e)).max(start),
+                None => start,
+            };
+            out.push(Phase {
+                glyph: '⧖',
+                label: "lock wait",
+                start_ms: start,
+                end_ms: end,
+                ms: end - start,
+                open,
+            });
+        }
         if let Some(exec) = self.start_of(d, Op::Execute)
             && d.queued_ms > 0
         {
@@ -294,7 +377,7 @@ mod tests {
     fn detail_size_budget() {
         // With the 56-byte record, under the spec's 100 bytes a target.
         assert!(
-            std::mem::size_of::<Detail>() <= 32,
+            std::mem::size_of::<Detail>() <= 40,
             "Detail is {} bytes",
             std::mem::size_of::<Detail>()
         );

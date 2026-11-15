@@ -391,6 +391,8 @@ pub struct ListInputs<'a> {
     pub waits: &'a dyn Waits,
     pub lines: &'a LastLines,
     pub now_ms: u64,
+    /// Takes heph's home out of the LAST LINE column (I9).
+    pub redact: &'a crate::tui::text::Redact,
 }
 
 /// Column widths for a `cols`-wide list.
@@ -442,7 +444,11 @@ fn whole(ms: u64) -> String {
 /// One row's PHASE, TIME and LAST LINE.
 fn row_words(inp: &ListInputs<'_>, id: Id, r: &Record) -> (String, String, String) {
     let m = inp.model;
-    let log = || inp.lines.get(id).unwrap_or("").to_owned();
+    let log = || {
+        inp.redact
+            .apply(inp.lines.get(id).unwrap_or(""))
+            .into_owned()
+    };
     match r.state {
         RowState::Queued => ("pending".into(), String::new(), String::new()),
         RowState::Blocked => match inp.waits.wait_words(m.addr(id), inp.now_ms) {
@@ -618,6 +624,7 @@ mod tests {
             waits: &NoWaits,
             lines,
             now_ms: 2_000,
+            redact: &Redact::default(),
         };
         list_lines(&inp, st, cols, 20)
             .iter()
@@ -635,6 +642,66 @@ mod tests {
                     .map(str::to_owned)
             })
             .collect()
+    }
+
+    /// I13: the log-text table, as the last-line column keeps it. What
+    /// `last_line` returns is all the column draws (cut further to it).
+    #[test]
+    fn control_bytes_never_reach_terminal_last_line() {
+        let long = "z".repeat(1 << 20);
+        // Name, the tail, the line kept (`None`: only checked for control).
+        let cases: Vec<(&str, Vec<u8>, Option<&str>)> = vec![
+            ("empty", b"".to_vec(), Some("")),
+            ("blank lines", b"\n\n\n".to_vec(), Some("")),
+            ("no newline", b"a\nlast".to_vec(), Some("last")),
+            ("crlf", b"one\r\n".to_vec(), Some("one")),
+            ("cr progress", b"10%\r20%\r30%\n".to_vec(), Some("30%")),
+            (
+                "modes",
+                b"a\x1b[?1049lb\x1b[?1003hc\x1b[2Jd\n".to_vec(),
+                Some("abcd"),
+            ),
+            (
+                "osc",
+                b"\x1b]8;;http://x\x07link\x1b]8;;\x07 \x1b]52;c;Zm9v\x07ok\n".to_vec(),
+                Some("link ok"),
+            ),
+            ("lone csi", b"x\x9by\n".to_vec(), None),
+            ("invalid utf8", b"a\xffb\n".to_vec(), Some("a\u{fffd}b")),
+            ("nul", b"a\0b\n".to_vec(), Some("ab")),
+            ("tabs", b"a\tb\n".to_vec(), Some("a       b")),
+            ("long line", long.clone().into_bytes(), None),
+            ("cut mid utf8 at the start", b"\xa9 tail\n".to_vec(), None),
+            ("cut mid utf8 at the end", b"caf\xc3".to_vec(), None),
+            (
+                "spliced",
+                b"out: hal".iter().chain(b"err\nf\n").copied().collect(),
+                Some("f"),
+            ),
+            (
+                "wide",
+                "日本語 e\u{301}\n".as_bytes().to_vec(),
+                Some("日本語 e\u{301}"),
+            ),
+        ];
+        for (name, tail, want) in cases {
+            let line = last_line(&tail);
+            assert!(
+                !line.chars().any(char::is_control),
+                "{name}: control kept: {line:?}"
+            );
+            assert!(
+                crate::tui::text::width(&line) <= LINE_KEEP_COLS,
+                "{name}: {} wide",
+                crate::tui::text::width(&line)
+            );
+            if let Some(want) = want {
+                assert_eq!(&*line, want, "{name}");
+            }
+        }
+        assert!(last_line(long.as_bytes()).chars().all(|c| c == 'z'));
+        assert!(last_line(b"\xa9 tail\n").ends_with(" tail"));
+        assert!(last_line(b"caf\xc3").starts_with("caf"));
     }
 
     /// Cut from the left on character boundaries, marked `…`, keeping the

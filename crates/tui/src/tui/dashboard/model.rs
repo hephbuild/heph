@@ -687,6 +687,23 @@ impl Model {
         (root != NO_ROOT).then(|| self.names.addr(root))
     }
 
+    /// The targets `root`'s failure took down: the first `max` by the
+    /// order they ended, and how many there are in all. Walks the
+    /// dependency failures, so a target screen calls it, never a list row.
+    pub fn took_down(&self, root: Id, max: usize) -> (Vec<&str>, usize) {
+        let mut names = Vec::new();
+        let mut n = 0;
+        for id in self.bucket_ref(RowState::DepFailed).ids() {
+            if self.record(id).is_some_and(|r| r.root == root) {
+                if names.len() < max {
+                    names.push(self.names.addr(id));
+                }
+                n += 1;
+            }
+        }
+        (names, n)
+    }
+
     fn bucket(&mut self, s: RowState) -> &mut Bucket {
         pick_mut(&mut self.buckets, s)
     }

@@ -5,8 +5,12 @@ use hcore::capacity::Unit;
 use hcore::events::{BuildEvent, BuildEventKind, CacheOutcomeKind, TimedOutData, YieldingToData};
 use ratatui::text::Line;
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
 use super::*;
 use crate::tui::progress::{BuildState, CountScope};
+use crate::tui::text::Redact;
 
 const T0: u64 = 1_700_000_000_000;
 const CPU: u64 = hcore::capacity::MICROS_PER_CPU;
@@ -112,15 +116,143 @@ fn text(l: &Line<'_>) -> String {
 
 /// One frame of `tab`'s list at `T0 + now`, 120 columns by 20 rows.
 fn frame(s: &BuildState, st: &mut ListState, tab: Tab, now: u64) -> Vec<String> {
+    frame_with(s, st, tab, now, &LastLines::default(), &Redact::default())
+}
+
+fn frame_with(
+    s: &BuildState,
+    st: &mut ListState,
+    tab: Tab,
+    now: u64,
+    lines: &LastLines,
+    redact: &Redact,
+) -> Vec<String> {
     st.set_tab(tab);
-    let lines = LastLines::default();
     let inp = ListInputs {
         model: s.dashboard(),
         waits: s,
-        lines: &lines,
+        lines,
         now_ms: T0 + now,
+        redact,
     };
     list_lines(&inp, st, 120, 20).iter().map(text).collect()
+}
+
+fn title() -> Title<'static> {
+    Title {
+        command: "heph r build //...",
+        session: None,
+        clock: "1s",
+        done: 0,
+        total: None,
+        provisional: false,
+        standing: None,
+    }
+}
+
+/// One frame of target screen `t` at `T0 + now`, 120 × 30.
+fn target_frame(s: &BuildState, t: &mut TargetScreen, now: u64, redact: &Redact) -> Vec<String> {
+    let inp = TargetInputs {
+        model: s.dashboard(),
+        waits: s,
+        redact,
+        now_ms: T0 + now,
+        scope: CountScope::Matched,
+    };
+    t.frame(&title(), &inp, 120, 30).iter().map(text).collect()
+}
+
+/// Frames until `ready` holds (the feed thread answers between frames),
+/// failing after 10s.
+fn target_frame_until(
+    s: &BuildState,
+    t: &mut TargetScreen,
+    redact: &Redact,
+    ready: impl Fn(&[String]) -> bool,
+) -> Vec<String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let f = target_frame(s, t, 10_000, redact);
+        if ready(&f) {
+            return f;
+        }
+        assert!(std::time::Instant::now() < deadline, "{f:#?}");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// `addr`'s screen, on `tab`.
+fn open_on(
+    s: &BuildState,
+    addr: &str,
+    tab: TargetTab,
+    reader: Option<Arc<StubReader>>,
+) -> TargetScreen {
+    let m = s.dashboard();
+    let id = id_of(s, addr);
+    let mut t = TargetScreen::open(m, id, false, reader.map(|r| r as Arc<dyn TargetReader>));
+    while t.tab() != tab {
+        t.cycle_tab(true);
+    }
+    t
+}
+
+/// A [`TargetReader`] answering from memory, recording each call's thread.
+#[derive(Default)]
+struct StubReader {
+    logs: Mutex<HashMap<String, Vec<u8>>>,
+    outputs: Mutex<HashMap<String, OutputsFound>>,
+    threads: Mutex<Vec<std::thread::ThreadId>>,
+}
+
+impl StubReader {
+    fn set_log(&self, addr: &str, bytes: &[u8]) {
+        self.logs
+            .lock()
+            .expect("lock")
+            .insert(addr.into(), bytes.to_vec());
+    }
+
+    fn set_outputs(&self, addr: &str, found: OutputsFound) {
+        self.outputs
+            .lock()
+            .expect("lock")
+            .insert(addr.into(), found);
+    }
+
+    fn threads(&self) -> Vec<std::thread::ThreadId> {
+        self.threads.lock().expect("lock").clone()
+    }
+}
+
+impl TargetReader for StubReader {
+    fn open_log(&self, addr: &str) -> LogOpened {
+        self.threads
+            .lock()
+            .expect("lock")
+            .push(std::thread::current().id());
+        match self.logs.lock().expect("lock").get(addr) {
+            Some(b) => LogOpened::Tail {
+                bytes: b.clone(),
+                len: b.len() as u64,
+                about: "from the cache".into(),
+            },
+            None => LogOpened::Nothing("no log yet: the target has not run".into()),
+        }
+    }
+
+    fn outputs(&self, addr: &str, _failed: bool) -> OutputsFound {
+        self.threads
+            .lock()
+            .expect("lock")
+            .push(std::thread::current().id());
+        self.outputs
+            .lock()
+            .expect("lock")
+            .get(addr)
+            .cloned()
+            .unwrap_or(OutputsFound::Nothing)
+    }
 }
 
 /// The rows of a frame that name a target, in order, as their addresses.
@@ -394,5 +526,513 @@ fn timed_out_root_reads_as_failure_failed_tab() {
     assert!(
         row.contains("✗ //t:slow") && row.contains("timed out 10m"),
         "{row}"
+    );
+}
+
+fn id_of(s: &BuildState, addr: &str) -> Id {
+    let m = s.dashboard();
+    (0..m.id_count())
+        .filter_map(|i| Id::try_from(i).ok())
+        .find(|&i| m.addr(i) == addr)
+        .expect("the target")
+}
+
+fn op(addr: &str, kind: &str) -> BuildEventKind {
+    let addr = addr.to_owned();
+    match kind {
+        "lock" => BuildEventKind::ResultLockWaitStart {
+            addr,
+            holder_pid: None,
+            in_use_by_readers: true,
+        },
+        "unlock" => BuildEventKind::ResultLockWaitEnd { addr },
+        "write" => BuildEventKind::LocalCacheWriteStart { addr },
+        _ => BuildEventKind::LocalCacheWriteEnd { addr, error: None },
+    }
+}
+
+/// The Overview's bars come from the op Start/End stamps: a finished run's
+/// admission wait, execute and local write, and a running target's lock
+/// wait and open execute bar, drawn on one scale.
+#[test]
+fn timeline_from_events() {
+    let mut queued = exec("//t:a");
+    if let BuildEventKind::ExecuteStart { queued_ms, .. } = &mut queued {
+        *queued_ms = Some(500);
+    }
+    let s = fold(&[
+        at(0, start("//t:a")),
+        at(0, start("//t:run")),
+        at(100, op("//t:run", "lock")),
+        at(600, op("//t:run", "unlock")),
+        at(1_000, queued),
+        at(1_000, exec("//t:run")),
+        at(4_000, exec_end("//t:a")),
+        at(4_000, op("//t:a", "write")),
+        at(4_500, op("//t:a", "written")),
+        at(4_600, end("//t:a", None, None)),
+    ]);
+    let m = s.dashboard();
+    let brief = |p: &detail::Phase| (p.label, p.start_ms - T0, p.end_ms - T0, p.ms, p.open);
+    let done: Vec<_> = m
+        .phases(id_of(&s, "//t:a"), T0 + 3_000)
+        .iter()
+        .map(brief)
+        .collect();
+    assert_eq!(
+        done,
+        [
+            ("queued", 500, 1_000, 500, false),
+            ("execute", 1_000, 4_000, 3_000, false),
+            ("local write", 4_000, 4_500, 500, false),
+        ]
+    );
+    let running: Vec<_> = m
+        .phases(id_of(&s, "//t:run"), T0 + 3_000)
+        .iter()
+        .map(brief)
+        .collect();
+    assert_eq!(
+        running,
+        [
+            ("lock wait", 100, 600, 500, false),
+            ("execute", 1_000, 3_000, 2_000, true),
+        ]
+    );
+
+    // One scale: 40 bar columns over the 4s from 0.5s to 4.5s.
+    let lines = target::timeline_lines(&m.phases(id_of(&s, "//t:a"), T0 + 3_000), 65);
+    assert!(text(&lines[0]).contains("timeline") && text(&lines[0]).ends_with("4.0s"));
+    let bars: Vec<(usize, usize)> = lines[1..]
+        .iter()
+        .map(|l| {
+            let bar = l.spans.last().expect("a bar").content.to_string();
+            let lead = bar.chars().take_while(|&c| c == ' ').count();
+            (lead, bar.chars().filter(|&c| c == '█').count())
+        })
+        .collect();
+    assert_eq!(bars, [(0, 5), (5, 30), (35, 5)]);
+    // The running bar ends in ▶ at now.
+    let lines = target::timeline_lines(&m.phases(id_of(&s, "//t:run"), T0 + 3_000), 65);
+    let exec_bar = lines
+        .last()
+        .expect("execute")
+        .spans
+        .last()
+        .expect("bar")
+        .content
+        .to_string();
+    assert!(exec_bar.ends_with('▶'), "{exec_bar:?}");
+    assert_eq!(exec_bar.chars().count(), 40, "{exec_bar:?}");
+
+    // On the Overview: the bars, and running time from the first op.
+    let mut t = open_on(&s, "//t:run", TargetTab::Overview, None);
+    let f = target_frame(&s, &mut t, 3_000, &Redact::default());
+    assert!(
+        f.iter().any(|r| r.contains("▶ running · 2.0s so far")),
+        "{f:#?}"
+    );
+    assert!(f.iter().any(|r| r.contains("⧖ lock wait")), "{f:#?}");
+    assert!(
+        f.iter().any(|r| r.contains("execute") && r.ends_with('▶')),
+        "{f:#?}"
+    );
+}
+
+fn file(path: &str, size: u64) -> OutputFile {
+    OutputFile {
+        path: path.into(),
+        kind: FileKind::File,
+        size,
+        hash: Some(format!("{size:012}abcd")),
+    }
+}
+
+/// Outputs lists a finished target's groups with path, size and hash,
+/// folding past three files (Enter expands, Enter again folds); a cache
+/// hit shows the restored list; a running target only its declared group
+/// names; a failed one what its slot kept, or that the run failed.
+#[test]
+fn outputs_tab_by_group() {
+    let mut declared = exec("//o:run");
+    if let BuildEventKind::ExecuteStart { output_groups, .. } = &mut declared {
+        *output_groups = vec!["bin".into(), String::new()];
+    }
+    let s = fold(&[
+        at(0, start("//o:done")),
+        at(0, exec("//o:done")),
+        at(1_000, exec_end("//o:done")),
+        at(1_000, end("//o:done", None, None)),
+        at(0, start("//o:hit")),
+        at(10, hit("//o:hit")),
+        at(20, end("//o:hit", None, None)),
+        at(0, start("//o:run")),
+        at(0, declared),
+        at(0, start("//o:fail")),
+        at(0, exec("//o:fail")),
+        at(500, end("//o:fail", Some("boom"), None)),
+        at(0, start("//o:bare")),
+        at(0, exec("//o:bare")),
+        at(500, end("//o:bare", Some("boom"), None)),
+    ]);
+    let reader = Arc::new(StubReader::default());
+    let rust: Vec<OutputFile> = (1..=5)
+        .map(|i| file(&format!("gen/f{i}.rs"), i * 1_000))
+        .collect();
+    let listing = OutputsFound::Listing(vec![
+        OutputGroup {
+            name: "rust".into(),
+            size: 15_000,
+            hash: None,
+            files: rust,
+            unavailable: None,
+        },
+        OutputGroup {
+            name: "docs".into(),
+            size: 300,
+            hash: Some("93c751b0be4f0000".into()),
+            files: vec![OutputFile {
+                path: "gen/docs".into(),
+                kind: FileKind::Dir,
+                size: 0,
+                hash: None,
+            }],
+            unavailable: None,
+        },
+    ]);
+    reader.set_outputs("//o:done", listing.clone());
+    reader.set_outputs("//o:hit", listing);
+    reader.set_outputs(
+        "//o:fail",
+        OutputsFound::Failure {
+            kept: vec![file("out/report.xml", 42)],
+            fixes: vec!["src/lib.rs".into()],
+        },
+    );
+    let r = Redact::default();
+
+    let mut t = open_on(&s, "//o:done", TargetTab::Outputs, Some(reader.clone()));
+    let f = target_frame_until(&s, &mut t, &r, |f| {
+        f.iter().any(|l| l.contains("more files"))
+    });
+    let rows = f.join("\n");
+    for want in [
+        "rust",
+        "gen/f1.rs",
+        "gen/f3.rs",
+        "… 2 more files",
+        "docs",
+        "gen/docs/",
+        "000000003000",
+    ] {
+        assert!(rows.contains(want), "{want}: {rows}");
+    }
+    assert!(!rows.contains("gen/f4.rs"), "{rows}");
+    assert!(
+        rows.contains("✓ done") && rows.contains("2 groups · 6 files"),
+        "{rows}"
+    );
+    assert!(rows.contains("heph inspect outputs //o:done"), "{rows}");
+    assert!(t.enter(), "Enter acts on Outputs");
+    let rows = target_frame(&s, &mut t, 10_000, &r).join("\n");
+    assert!(
+        rows.contains("gen/f4.rs") && rows.contains("gen/f5.rs"),
+        "{rows}"
+    );
+    assert!(!rows.contains("more files"), "{rows}");
+    t.enter();
+    let rows = target_frame(&s, &mut t, 10_000, &r).join("\n");
+    assert!(
+        rows.contains("… 2 more files") && !rows.contains("gen/f4.rs"),
+        "{rows}"
+    );
+
+    let mut t = open_on(&s, "//o:hit", TargetTab::Outputs, Some(reader.clone()));
+    let f = target_frame_until(&s, &mut t, &r, |f| {
+        f.iter().any(|l| l.contains("gen/f1.rs"))
+    });
+    assert!(
+        f.iter().any(|l| l.contains("● cached · 2 groups")),
+        "{f:#?}"
+    );
+
+    let mut t = open_on(&s, "//o:run", TargetTab::Outputs, Some(reader.clone()));
+    let calls = reader.threads().len();
+    let rows = target_frame(&s, &mut t, 10_000, &r).join("\n");
+    assert!(rows.contains("bin") && rows.contains("(unnamed)"), "{rows}");
+    assert_eq!(rows.matches("not written yet").count(), 2, "{rows}");
+    assert_eq!(
+        reader.threads().len(),
+        calls,
+        "a running target's outputs are not read"
+    );
+
+    let mut t = open_on(&s, "//o:fail", TargetTab::Outputs, Some(reader.clone()));
+    let f = target_frame_until(&s, &mut t, &r, |f| {
+        f.iter().any(|l| l.contains("report.xml"))
+    });
+    let rows = f.join("\n");
+    assert!(
+        rows.contains("failure_out") && rows.contains("out/report.xml"),
+        "{rows}"
+    );
+    assert!(rows.contains("src/lib.rs (written back)"), "{rows}");
+    assert!(rows.contains("heph inspect failure //o:fail"), "{rows}");
+
+    let mut t = open_on(&s, "//o:bare", TargetTab::Outputs, Some(reader));
+    target_frame_until(&s, &mut t, &r, |f| {
+        f.iter().any(|l| l.contains("no outputs: the run failed"))
+    });
+}
+
+/// The Overview's waiting row says what the Pending row and the spotlight
+/// say: the shared formatter's phase and detail.
+#[test]
+fn wait_text_is_the_shared_formatter_overview() {
+    let yielding = YieldingToData {
+        pool: "memory".into(),
+        need: 1 << 30,
+    };
+    for (pool, removals, yields) in [
+        ("cpu", None, None),
+        ("cpu", None, Some(yielding)),
+        ("sandbox", Some(2), None),
+    ] {
+        let s = fold(&[
+            at(0, start("//w:a")),
+            at(1_000, admission("//w:a", pool, removals, yields)),
+        ]);
+        let words = s.wait_words("//w:a", T0 + 42_000).expect("a wait");
+        let mut t = open_on(&s, "//w:a", TargetTab::Overview, None);
+        let f = target_frame(&s, &mut t, 42_000, &Redact::default());
+        let row = f
+            .iter()
+            .find(|r| r.trim_start().starts_with("waiting"))
+            .expect("a waiting row");
+        let value = row
+            .trim_start()
+            .strip_prefix("waiting")
+            .expect("label")
+            .trim();
+        let whole = format!("{} {}", words.phase, words.detail);
+        let shown = value.trim_end_matches('…');
+        assert!(whole.starts_with(shown), "{value:?} vs {whole:?}");
+        assert!(shown.len() > words.phase.len(), "{value:?}");
+        assert!(
+            f.iter().any(|r| r.contains(&format!("⧗ {}", words.phase))),
+            "{f:#?}"
+        );
+    }
+
+    // A lock held by readers: the same words.
+    let s = fold(&[at(0, start("//w:l")), at(1_000, op("//w:l", "lock"))]);
+    let words = s.wait_words("//w:l", T0 + 42_000).expect("a lock wait");
+    let mut t = open_on(&s, "//w:l", TargetTab::Overview, None);
+    let f = target_frame(&s, &mut t, 42_000, &Redact::default());
+    let want = format!("{} {}", words.phase, words.detail);
+    assert!(f.iter().any(|r| r.contains(&want)), "{want:?} in {f:#?}");
+}
+
+/// A root failure names what it took down, on the Overview and above
+/// its Log; a timed-out run says so, and that it was abandoned.
+#[test]
+fn overview_took_down_and_timeout() {
+    let s = fold(&[
+        at(0, start("//f:root")),
+        at(0, exec("//f:root")),
+        at(0, start("//f:d1")),
+        at(0, start("//f:d2")),
+        at(500, end("//f:root", Some("boom"), None)),
+        at(501, end("//f:d1", Some("dep"), Some("//f:root"))),
+        at(502, end("//f:d2", Some("dep"), Some("//f:root"))),
+        at(0, start("//f:slow")),
+        at(0, exec("//f:slow")),
+        at(
+            600_000,
+            BuildEventKind::ResultEnd {
+                cancelled: false,
+                addr: "//f:slow".into(),
+                error: Some("timed out after 10m".into()),
+                upstream_of: None,
+                exit_status: None,
+                log_tail: None,
+                timed_out: Some(TimedOutData {
+                    timeout_ms: 600_000,
+                    abandoned: true,
+                }),
+            },
+        ),
+    ]);
+    let r = Redact::default();
+    let mut t = open_on(&s, "//f:root", TargetTab::Overview, None);
+    let f = target_frame(&s, &mut t, 1_000, &r);
+    assert!(
+        f.iter()
+            .any(|l| l.contains("took down") && l.contains("//f:d1, //f:d2")),
+        "{f:#?}"
+    );
+    let mut t = open_on(&s, "//f:root", TargetTab::Log, None);
+    let f = target_frame(&s, &mut t, 1_000, &r);
+    assert!(
+        f.iter().any(|l| l.contains("✗ failed after")
+            && l.contains("exit 101")
+            && l.contains("took down //f:d1, //f:d2")),
+        "{f:#?}"
+    );
+    let mut t = open_on(&s, "//f:slow", TargetTab::Overview, None);
+    let f = target_frame(&s, &mut t, 700_000, &r);
+    let row = f
+        .iter()
+        .find(|l| l.trim_start().starts_with("timeout"))
+        .expect("a timeout row");
+    assert!(
+        row.contains("timed out 10m") && row.contains("abandoned"),
+        "{row}"
+    );
+}
+
+/// I9: a stream whose failure, log, outputs and unavailable texts name
+/// heph's home: no dashboard tab, LAST LINE column or target screen shows
+/// it.
+#[test]
+fn no_home_path_on_any_screen_dashboard_and_target() {
+    let home = "/home/u/.heph";
+    let redact = Redact::of([std::path::PathBuf::from(home)]);
+    let fail = |addr: &str| BuildEventKind::ResultEnd {
+        cancelled: false,
+        addr: addr.into(),
+        error: Some(format!("{home}/sandbox/x/run.sh: not found")),
+        upstream_of: None,
+        exit_status: None,
+        log_tail: None,
+        timed_out: None,
+    };
+    let mut s = BuildState::new();
+    s.set_redact(redact.clone());
+    for e in [
+        at(
+            0,
+            matched(&["//h:fail", "//h:dep", "//h:done", "//h:gone", "//h:wait"]),
+        ),
+        at(0, start("//h:fail")),
+        at(0, exec("//h:fail")),
+        at(0, start("//h:dep")),
+        at(0, start("//h:done")),
+        at(0, exec("//h:done")),
+        at(0, start("//h:gone")),
+        at(0, exec("//h:gone")),
+        at(0, start("//h:wait")),
+        at(100, admission("//h:wait", "cpu", None, None)),
+        at(500, fail("//h:fail")),
+        at(501, end("//h:dep", Some("dep"), Some("//h:fail"))),
+        at(600, end("//h:done", None, None)),
+        at(600, end("//h:gone", None, None)),
+    ] {
+        s.apply(&e);
+    }
+    let reader = Arc::new(StubReader::default());
+    let log = format!("compiling\nerror: {home}/sandbox/x/main.rs:3: bad\n");
+    reader.set_log("//h:fail", log.as_bytes());
+    reader.set_log("//h:done", log.as_bytes());
+    reader.set_outputs(
+        "//h:fail",
+        OutputsFound::Unavailable(format!(
+            "outputs unavailable: cannot list {home}/failures/x"
+        )),
+    );
+    reader.set_outputs(
+        "//h:done",
+        OutputsFound::Listing(vec![OutputGroup {
+            name: "out".into(),
+            size: 1,
+            hash: None,
+            files: Vec::new(),
+            unavailable: Some(format!("not in the local cache: {home}/cache/x")),
+        }]),
+    );
+
+    let mut seen = Vec::new();
+    // The dashboard, every tab, with the log's last line in the column.
+    let mut lines = LastLines::default();
+    let mut st = ListState::default();
+    for tab in [Tab::All, Tab::Failed, Tab::Pending] {
+        frame_with(&s, &mut st, tab, 1_000, &lines, &redact);
+        let ids: Vec<Id> = st.visible().to_vec();
+        lines.apply(
+            ids.iter()
+                .map(|&id| TailUpdate {
+                    id,
+                    finished: true,
+                    size: Some(log.len() as u64),
+                    line: Some(list::last_line(log.as_bytes())),
+                })
+                .collect(),
+            &ids,
+        );
+        let f = frame_with(&s, &mut st, tab, 1_000, &lines, &redact);
+        if tab != Tab::Pending {
+            assert!(f.iter().any(|r| r.contains("main.rs:3")), "{tab:?}: {f:#?}");
+        }
+        seen.extend(f);
+    }
+    // Each target screen, every tab, its feed answered.
+    for addr in ["//h:fail", "//h:dep", "//h:done", "//h:gone", "//h:wait"] {
+        for tab in [TargetTab::Overview, TargetTab::Log, TargetTab::Outputs] {
+            let mut t = open_on(&s, addr, tab, Some(reader.clone()));
+            let f = target_frame_until(&s, &mut t, &redact, |f| {
+                !f.iter()
+                    .any(|l| l.contains("opening the log") || l.contains("reading "))
+            });
+            seen.extend(f);
+        }
+    }
+    let all = seen.join("\n");
+    assert!(
+        all.contains("main.rs:3") && all.contains("not in the local cache"),
+        "{all}"
+    );
+    assert!(!all.contains(home), "{all}");
+    assert!(!all.contains("/home/u"), "{all}");
+}
+
+/// Target screens never read on the frame's thread: the log and the
+/// outputs are read by the screen's own thread, and a frame only takes
+/// what it found.
+#[test]
+fn frame_does_no_io_target_screens() {
+    let s = fold(&[
+        at(0, start("//n:a")),
+        at(0, exec("//n:a")),
+        at(1_000, exec_end("//n:a")),
+        at(1_000, end("//n:a", None, None)),
+    ]);
+    let reader = Arc::new(StubReader::default());
+    reader.set_log("//n:a", b"one\ntwo\n");
+    reader.set_outputs("//n:a", OutputsFound::Nothing);
+    let r = Redact::default();
+    let mut t = open_on(&s, "//n:a", TargetTab::Overview, Some(reader.clone()));
+    for _ in 0..5 {
+        target_frame(&s, &mut t, 2_000, &r);
+    }
+    assert!(reader.threads().is_empty(), "Overview reads nothing");
+    t.cycle_tab(true);
+    target_frame_until(&s, &mut t, &r, |f| f.iter().any(|l| l.contains("two")));
+    t.cycle_tab(true);
+    target_frame_until(&s, &mut t, &r, |f| {
+        f.iter().any(|l| l.contains("no outputs held"))
+    });
+    for _ in 0..5 {
+        target_frame(&s, &mut t, 2_000, &r);
+    }
+    let threads = reader.threads();
+    assert_eq!(
+        threads.len(),
+        2,
+        "one log open, one outputs read: {threads:?}"
+    );
+    let me = std::thread::current().id();
+    assert!(
+        threads.iter().all(|&th| th != me),
+        "read on the frame's thread"
     );
 }
