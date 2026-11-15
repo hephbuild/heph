@@ -31,7 +31,8 @@ use crate::engine::{
     OpenLog,
 };
 use crate::htaddr::{self, Addr};
-use crate::tui::session::{SessionRoot, SessionRunLogLocator, SessionSlot};
+use crate::tui::session::format::files;
+use crate::tui::session::{SessionId, SessionMeta, SessionRoot, SessionRunLogLocator, SessionSlot};
 
 #[derive(clap::Args, Clone, Debug)]
 pub struct Args {
@@ -56,11 +57,14 @@ pub struct Args {
 }
 
 /// What [`show`] is asked for: the flags, without the address.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Request {
     pub follow: bool,
     pub lines: Option<usize>,
     pub current: bool,
+    /// Where the sessions are, to name a running log's command and pid on
+    /// its status line. `None`: the line names the session only.
+    pub sessions: Option<SessionRoot>,
 }
 
 /// What [`show`] did.
@@ -108,7 +112,9 @@ async fn execute_async(
     let (engine, _shutdown) = bootstrap::new_engine(&global, session)?;
     // Runs going on in other hephs: found through the sessions under HOME.
     // `HEPH_NO_SESSION` turns recording off, not looking.
-    let locator = SessionRoot::for_reading(std::env::var_os("HOME").as_deref())
+    let sessions = SessionRoot::for_reading(std::env::var_os("HOME").as_deref());
+    let locator = sessions
+        .clone()
         .map(|root| Arc::new(SessionRunLogLocator::new(root)) as _);
     let opts = LogOptions {
         locator,
@@ -119,6 +125,7 @@ async fn execute_async(
         follow: args.follow,
         lines: args.lines,
         current: args.current,
+        sessions,
     };
     // Cancelled by the first ctrl-c, as every request of the engine is.
     let rs = engine.new_state();
@@ -182,19 +189,21 @@ where
                 say(
                     &mut err,
                     &format!(
-                        "heph: no log for {addr}; session {} runs a heph that records no live logs",
+                        "heph: no log for {addr}: session {} runs a heph that records no live logs; read it in that session's terminal, or upgrade that heph",
                         e.session
                     ),
                 );
                 return Ok(Shown::Nothing);
             }
             if let Some(e) = e.downcast_ref::<LogUnavailable>() {
+                let status = Status::new(&e.info, req.sessions.as_ref());
                 say(
                     &mut err,
                     &format!(
-                        "{} · log unavailable: {}",
-                        status(addr, &e.info, hcore::events::now_unix_ms()),
-                        e.reason
+                        "heph: log unavailable for {addr}: {} ({}); {}",
+                        e.reason,
+                        status.describe(hcore::events::now_unix_ms()),
+                        unavailable_next_step(&e.info.source),
                     ),
                 );
                 return Ok(Shown::Nothing);
@@ -203,6 +212,7 @@ where
         }
     };
     let (addr, ctoken) = (addr.clone(), rs.ctoken().clone());
+    let sessions = req.sessions;
     // A follow lasts as long as the run, and stdout may block on a slow
     // reader: a thread of its own, not one of the engine's bounded blocking
     // jobs.
@@ -211,13 +221,15 @@ where
             let info = log.info().clone();
             say(
                 &mut err,
-                &status(&addr, &info, hcore::events::now_unix_ms()),
+                &Status::new(&info, sessions.as_ref()).line(&addr, hcore::events::now_unix_ms()),
             );
             print_open(log, req.lines, out)
                 .with_context(|| format!("printing the log of {addr}"))?;
             Ok(Shown::Log(info))
         }
-        Found::Follow(f) => print_followed(f, &addr, req.lines, &ctoken, out, err),
+        Found::Follow(f) => {
+            print_followed(f, &addr, req.lines, sessions.as_ref(), &ctoken, out, err)
+        }
     })
     .await
     .context("printing the log")?
@@ -266,23 +278,28 @@ fn print_followed(
     mut f: LogFollower,
     addr: &Addr,
     lines: Option<usize>,
+    sessions: Option<&SessionRoot>,
     ctoken: &StdCancellationToken,
     mut out: impl Write,
     mut err: impl Write,
 ) -> anyhow::Result<Shown> {
     let mut found = f.info();
     match &found {
-        Some(info) => say(&mut err, &following(addr, info)),
+        Some(info) => say(&mut err, &following(addr, info, sessions)),
         None => say(&mut err, &format!("{addr} · waiting for a run to start")),
     }
     // `-n`: the bytes already there, held until caught up, then only their
     // last N lines printed.
     let mut held = lines.map(|_| Vec::new());
-    let mut live = found.as_ref().is_some_and(is_running);
+    // The start of the run being followed, while one is.
+    let mut live = found.as_ref().and_then(run_start);
     loop {
         if ctoken.is_cancelled() {
             return Ok(match found {
-                Some(info) => Shown::Log(info),
+                Some(info) => {
+                    say(&mut err, &format!("{addr} · stopped following"));
+                    Shown::Log(info)
+                }
                 None => {
                     say(&mut err, &format!("{addr} · stopped before a run started"));
                     Shown::Nothing
@@ -295,8 +312,8 @@ fn print_followed(
         if found.is_none()
             && let Some(info) = f.info()
         {
-            say(&mut err, &following(addr, &info));
-            live = is_running(&info);
+            say(&mut err, &following(addr, &info, sessions));
+            live = run_start(&info);
             found = Some(info);
         }
         let caught_up = !matches!(step, FollowStep::Bytes(_));
@@ -327,8 +344,9 @@ fn print_followed(
             },
             FollowStep::Idle => std::thread::sleep(IDLE),
             FollowStep::End => {
-                if live {
-                    say(&mut err, &format!("{addr} · the run ended"));
+                if let Some(start) = live {
+                    let took = since(start, hcore::events::now_unix_ms());
+                    say(&mut err, &ended(addr, f.replaced_by(), &took));
                 }
                 break;
             }
@@ -337,54 +355,161 @@ fn print_followed(
     Ok(found.map_or(Shown::Nothing, Shown::Log))
 }
 
-fn is_running(info: &LogInfo) -> bool {
-    matches!(info.source, LogSource::Live { running: true, .. })
+/// When the run `info` is the live file of started, if it is still going on.
+fn run_start(info: &LogInfo) -> Option<u64> {
+    matches!(info.source, LogSource::Live { running: true, .. }).then_some(info.at_unix_ms)
 }
 
-fn following(addr: &Addr, info: &LogInfo) -> String {
-    let line = status(addr, info, hcore::events::now_unix_ms());
-    if is_running(info) {
-        format!("{line} · following")
-    } else {
-        line
+/// The line `-f` ends a followed run with: how it ended, read from what
+/// replaced its live file, and after how long.
+fn ended(addr: &Addr, replaced_by: Option<&LogSource>, took: &str) -> String {
+    match replaced_by {
+        Some(LogSource::FailureSlot) => format!("{addr} · ✗ failed after {took}"),
+        Some(LogSource::Cache { .. }) => format!("{addr} · ✓ done after {took}"),
+        Some(LogSource::Live { .. }) | None => format!("{addr} · the run ended after {took}"),
     }
 }
 
-/// The status line: where the log is from, and when. For people; not a
-/// stable format.
-fn status(addr: &Addr, info: &LogInfo, now_ms: u64) -> String {
-    let age = hcore::units::human_duration(Duration::from_millis(
-        now_ms.saturating_sub(info.at_unix_ms),
-    ));
-    match &info.source {
-        LogSource::Live {
-            running: true,
-            session: Some(session),
-        } => format!("{addr} · running {age} in session {session}"),
-        LogSource::Live {
-            running: true,
-            session: None,
-        } => format!("{addr} · running {age}"),
-        LogSource::Live { running: false, .. } => {
-            format!("{addr} · ran {age} ago, not cached")
+fn following(addr: &Addr, info: &LogInfo, sessions: Option<&SessionRoot>) -> String {
+    let line = Status::new(info, sessions).line(addr, hcore::events::now_unix_ms());
+    if run_start(info).is_some() {
+        format!("{line} · following")
+    } else {
+        format!("{line} · not running; showing the latest log")
+    }
+}
+
+/// `start` to `now`, both in unix milliseconds, for people.
+fn since(start: u64, now_ms: u64) -> String {
+    hcore::units::human_duration(Duration::from_millis(now_ms.saturating_sub(start)))
+}
+
+/// A unix-millisecond time as the local date and time of day.
+fn local_time(ms: u64) -> Option<String> {
+    let at = chrono::DateTime::from_timestamp_millis(i64::try_from(ms).ok()?)?;
+    Some(
+        at.with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string(),
+    )
+}
+
+/// What the status line says about a log. For people; not a stable format.
+struct Status<'a> {
+    info: &'a LogInfo,
+    /// A running log's session's command and pid, when its `meta.json` says.
+    owner: Option<String>,
+}
+
+impl<'a> Status<'a> {
+    fn new(info: &'a LogInfo, sessions: Option<&SessionRoot>) -> Self {
+        let owner = match (&info.source, sessions) {
+            (
+                LogSource::Live {
+                    running: true,
+                    session: Some(session),
+                },
+                Some(root),
+            ) => session_owner(root, session),
+            _ => None,
+        };
+        Self { info, owner }
+    }
+
+    /// `{addr} · {describe}`.
+    fn line(&self, addr: &Addr, now_ms: u64) -> String {
+        format!("{addr} · {}", self.describe(now_ms))
+    }
+
+    /// Where the log is from, and when: how long ago, and the local time.
+    fn describe(&self, now_ms: u64) -> String {
+        let info = self.info;
+        let age = since(info.at_unix_ms, now_ms);
+        let local = local_time(info.at_unix_ms);
+        let at = local
+            .as_ref()
+            .map_or_else(String::new, |t| format!(" ({t})"));
+        match &info.source {
+            LogSource::Live {
+                running: true,
+                session,
+            } => {
+                let mut s = match &local {
+                    Some(t) => format!("running {age}, since {t}"),
+                    None => format!("running {age}"),
+                };
+                if let Some(session) = session {
+                    s.push_str(&format!(" in session {session}"));
+                    if let Some(owner) = &self.owner {
+                        s.push_str(&format!(" ({owner})"));
+                    }
+                }
+                s
+            }
+            LogSource::Live { running: false, .. } => format!("ran {age} ago{at}, not cached"),
+            LogSource::FailureSlot => format!("failed {age} ago{at}"),
+            LogSource::Cache { remote } => format!(
+                "cached · from the run that filled the {}entry, {age} ago{at}",
+                if *remote { "remote " } else { "" }
+            ),
         }
-        LogSource::FailureSlot => format!("{addr} · failed {age} ago"),
-        LogSource::Cache { remote } => format!(
-            "{addr} · cached · from the run that filled the {}entry, {age} ago",
-            if *remote { "remote " } else { "" }
-        ),
+    }
+}
+
+/// The longest command the status line repeats, in characters.
+const OWNER_COMMAND_MAX: usize = 80;
+
+/// `heph run //p:t, pid 4242`: the command and pid `session`'s `meta.json`
+/// records, `None` when it cannot be read.
+fn session_owner(root: &SessionRoot, session: &str) -> Option<String> {
+    let id = SessionId::parse(session).ok()?;
+    let meta = std::fs::read(root.path().join(id.encode()).join(files::META)).ok()?;
+    let meta = SessionMeta::decode(&meta).ok()?;
+    let mut argv = meta.argv.iter();
+    // The program as its name, not the path it was started by.
+    let program = argv.next().map(|p| {
+        std::path::Path::new(p)
+            .file_name()
+            .map_or_else(|| p.clone(), |n| n.to_string_lossy().into_owned())
+    });
+    let command = program.into_iter().chain(argv.cloned()).collect::<Vec<_>>();
+    let mut command = command.join(" ");
+    if command.chars().count() > OWNER_COMMAND_MAX {
+        command = command.chars().take(OWNER_COMMAND_MAX - 1).collect();
+        command.push('…');
+    }
+    Some(if command.is_empty() {
+        format!("pid {}", meta.owner_pid)
+    } else {
+        format!("{command}, pid {}", meta.owner_pid)
+    })
+}
+
+/// What to do about a log that exists but cannot be read.
+fn unavailable_next_step(source: &LogSource) -> &'static str {
+    match source {
+        LogSource::FailureSlot => "run the target again to see its output",
+        LogSource::Cache { remote: true } => {
+            "check that the remote cache is reachable, then try again"
+        }
+        LogSource::Cache { remote: false } | LogSource::Live { .. } => {
+            "a run that misses the cache records a new one"
+        }
     }
 }
 
 fn no_log(addr: &Addr, hashin: Option<&str>) -> String {
-    match hashin {
-        None => format!(
-            "heph: no log for {addr}: it has not run in this workspace, and no cache entry for it kept one"
-        ),
+    let what = match hashin {
+        None => format!("heph: no log for {addr}: none is kept here, nor in a cache entry"),
         Some(h) => format!(
-            "heph: no log for {addr} at its current inputs ({h}): it has not run with them here, and no cache entry for them kept one"
+            "heph: no log for {addr} at its current inputs ({h}): none is kept here, nor in their cache entry"
         ),
-    }
+    };
+    format!(
+        "{what}\n  A run that was not cached keeps its log only until its heph exits, a run \
+         under HEPH_NO_SESSION=1 cannot be read from another terminal, and a credential's \
+         run keeps none.\n  To produce one: heph run {addr}"
+    )
 }
 
 fn plural<'a>(n: usize, one: &'a str, many: &'a str) -> &'a str {
@@ -452,7 +577,25 @@ fn ignore_closed(res: io::Result<()>) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{last_lines, last_lines_start};
+    use super::{LogSource, ended, last_lines, last_lines_start};
+    use crate::htaddr::parse_addr;
+
+    /// How `-f` says a run ended, from what replaced its live file.
+    #[test]
+    fn ended_reads_the_outcome_from_the_replacement() {
+        let addr = parse_addr("//p:t").expect("addr");
+        let cases = [
+            (Some(LogSource::FailureSlot), "//p:t · ✗ failed after 3s"),
+            (
+                Some(LogSource::Cache { remote: false }),
+                "//p:t · ✓ done after 3s",
+            ),
+            (None, "//p:t · the run ended after 3s"),
+        ];
+        for (source, want) in cases {
+            assert_eq!(ended(&addr, source.as_ref(), "3s"), want);
+        }
+    }
 
     fn tail(buf: &[u8], n: usize) -> &[u8] {
         buf.get(last_lines_start(buf, n).unwrap_or(0)..)

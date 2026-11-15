@@ -332,6 +332,7 @@ impl Engine {
             state,
             offset: 0,
             checked: None,
+            replaced_by: None,
         }))
     }
 
@@ -730,6 +731,9 @@ pub struct LogFollower {
     offset: u64,
     /// When the locator or the stored sources were last looked at.
     checked: Option<Instant>,
+    /// What replaced the followed run's live file once it ended (the cache
+    /// entry's `Log`, the failure slot), even when it held no byte more.
+    replaced_by: Option<LogSource>,
 }
 
 impl std::fmt::Debug for LogFollower {
@@ -914,7 +918,7 @@ impl LogFollower {
 
     /// Where to go on once the run at `hashin` ended: what replaced its live
     /// file, from the byte reached, when it holds more; else the end.
-    fn replacement(&self, hashin: &str) -> Follow {
+    fn replacement(&mut self, hashin: &str) -> Follow {
         let stored = match self.engine.newest_cached_log(&self.addr, Some(hashin)) {
             Ok(Some(s)) => Some(s),
             Ok(None) | Err(_) => self
@@ -924,10 +928,21 @@ impl LogFollower {
                 .filter(|m| m.hashin == hashin)
                 .map(Stored::Slot),
         };
-        match stored.and_then(|s| self.open_local(s)) {
+        let opened = stored.and_then(|s| self.open_local(s));
+        self.replaced_by = opened.as_ref().map(|log| log.info().source.clone());
+        match opened {
             Some(log) if log.len() > self.offset => Follow::Stored(log),
             _ => Follow::Done,
         }
+    }
+
+    /// Once a followed run ended: where its log went, and so how it ended
+    /// (`FailureSlot`: it failed; `Cache`: it succeeded and was cached).
+    /// `None` while it runs, when the follow never saw a run going on, or
+    /// when nothing replaced its live file (an uncached success, a run whose
+    /// heph keeps it until it exits).
+    pub fn replaced_by(&self) -> Option<&LogSource> {
+        self.replaced_by.as_ref()
     }
 
     /// Open a finished log with what is on disk, never fetching.
