@@ -90,6 +90,10 @@ struct ReturnsLog {
     bash: pluginexec::Driver,
     /// Where the `outside` variant's file lives.
     outside: PathBuf,
+    /// `returns_log`; `silent` for the one that declares it does not stream
+    /// its log, as the host's proxy over a plugin that does not read
+    /// `log_capture` does.
+    name: &'static str,
 }
 
 /// A file named `name` under `dir` holding the returned log.
@@ -162,8 +166,11 @@ impl ManagedDriver for ReturnsLog {
         _req: hplugin::driver::ConfigRequest,
     ) -> anyhow::Result<hplugin::driver::ConfigResponse> {
         Ok(hplugin::driver::ConfigResponse {
-            name: "returns_log".to_string(),
+            name: self.name.to_string(),
         })
+    }
+    fn streams_log(&self) -> bool {
+        self.name != "silent"
     }
     fn schema(&self) -> hplugin::driver::DriverSchema {
         ManagedDriver::schema(&self.bash)
@@ -209,9 +216,14 @@ impl ManagedDriver for ReturnsLog {
     }
 }
 
-/// A workspace whose `returns_log` driver is [`ReturnsLog`], beside plain
-/// `bash`.
+/// A workspace whose `returns_log` and `silent` drivers are [`ReturnsLog`],
+/// beside plain `bash`.
 fn returns_log_workspace(outside: &Path) -> anyhow::Result<htestkit::Workspace> {
+    let returns_log = |name| ReturnsLog {
+        bash: pluginexec::Driver::new_bash().with_host_path(),
+        outside: outside.join("logs"),
+        name,
+    };
     htestkit::WorkspaceBuilder::new()?
         .with_provider(|init| {
             Box::new(pluginbuildfile::Provider::new(
@@ -221,11 +233,142 @@ fn returns_log_workspace(outside: &Path) -> anyhow::Result<htestkit::Workspace> 
             ))
         })
         .with_managed_driver(Box::new(pluginexec::Driver::new_bash().with_host_path()))
-        .with_managed_driver(Box::new(ReturnsLog {
-            bash: pluginexec::Driver::new_bash().with_host_path(),
-            outside: outside.join("logs"),
-        }))
+        .with_managed_driver(Box::new(returns_log("returns_log")))
+        .with_managed_driver(Box::new(returns_log("silent")))
         .build()
+}
+
+/// spec `returned_log_imported`, its live clause: a run on a driver that
+/// does not stream its log, and writes nothing to its writers, starts with
+/// `log_not_streamed`; while it runs, a reader in another engine finds it
+/// through the session and is told "this target's driver does not stream
+/// its log" (`LogNotStreamed`), not "no log"; once it ends, the log it
+/// returned is imported and read from the cache.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_silent_driver_reads_not_streamed_until_its_log_is_imported() -> anyhow::Result<()> {
+    use heph::engine::{LogNotStreamed, LogOptions, LogSource};
+    use heph::tui::session::{HeaderKind, SessionHeader, SessionRunLogLocator, SessionSlot};
+    let outside = tempfile::tempdir()?;
+    let gate = tempfile::tempdir()?;
+    let gate = gate.path().join("gate");
+    let user = tempfile::tempdir()?;
+    let ws = returns_log_workspace(outside.path())?;
+    ws.write_build_file(
+        "app",
+        &format!(
+            r#"target(name = "raw_silent", driver = "silent", out = "o.txt",
+       run = ["while [ ! -e {} ]; do sleep 0.02; done", "printf ok > o.txt"])
+"#,
+            gate.display()
+        ),
+    );
+    let slot = Arc::new(SessionSlot::new());
+    let root = heph::tui::session::SessionRoot::from_env(None, Some(user.path().as_os_str()));
+    let sessions = root.clone().expect("root").expect("recording on");
+    slot.configure(root, vec!["heph".into()]);
+    slot.set_workspace(ws.dir.path(), ws.dir.path(), &ws.engine.home);
+    let opened = slot
+        .open(
+            SessionHeader {
+                kind: HeaderKind::Build,
+                label: "run".into(),
+            },
+            false,
+        )
+        .expect("a session opened");
+    let located = LogOptions {
+        locator: Some(Arc::new(SessionRunLogLocator::new(sessions))),
+        ..LogOptions::default()
+    };
+
+    // The run's events reach its session, as `heph run`'s view hands them on.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let rs = ws.engine.new_state_with_events(false, Some(tx));
+    let tap = opened.tap.clone();
+    let forward = tokio::spawn(async move {
+        let mut start = None;
+        while let Some(ev) = rx.recv().await {
+            if let BuildEventKind::ExecuteStart {
+                log_not_streamed, ..
+            } = &ev.kind
+            {
+                start = Some(*log_not_streamed);
+            }
+            tap.event(ev);
+        }
+        start
+    });
+    let addr = parse_addr("//app:raw_silent")?;
+    let run = tokio::spawn({
+        let engine = Arc::clone(&ws.engine);
+        let addr = addr.clone();
+        async move {
+            Arc::clone(&engine)
+                .result_addr(rs, &addr, OutputMatcher::All, &ResultOptions::default())
+                .await
+                .map(drop)
+        }
+    });
+
+    // Another engine on the same home, as `heph log` is.
+    let reader = Engine::new(heph::engine::Config::for_tests(ws.dir.path().to_path_buf()))?;
+    let reader = Arc::new(reader);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let err = loop {
+        match reader.open_log(&addr, &located).await {
+            Err(e) if e.is::<LogNotStreamed>() => break e,
+            Ok(None) => {}
+            other => panic!("before the run ends: {:?}", other.map(|l| l.is_some())),
+        }
+        assert!(std::time::Instant::now() < deadline, "never NotStreamed");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    };
+    let e = err
+        .downcast_ref::<LogNotStreamed>()
+        .expect("LogNotStreamed");
+    assert_eq!(e.session, Some(opened.id.encode()));
+    // The engine running it says so too, in-process and with no session:
+    // "does not stream" outranks "no output yet" for its own run.
+    let own = ws
+        .engine
+        .open_log(&addr, &LogOptions::default())
+        .await
+        .map(|l| l.is_some())
+        .expect_err("its own run, not streamed");
+    assert_eq!(
+        own.downcast_ref::<LogNotStreamed>()
+            .map(|e| e.session.clone()),
+        Some(None),
+        "{own:#}"
+    );
+    assert!(
+        reader
+            .follow_log(&addr, &located, true)
+            .await
+            .is_err_and(|e| e.is::<LogNotStreamed>()),
+        "a follow is told the same"
+    );
+    // Asked for a hashin, the start (which names none) says nothing.
+    let hashed = LogOptions {
+        hashin: Some("h-other".into()),
+        ..located.clone()
+    };
+    assert!(reader.open_log(&addr, &hashed).await?.is_none());
+
+    std::fs::write(&gate, "")?;
+    run.await??;
+    assert_eq!(
+        forward.await?,
+        Some(true),
+        "ExecuteStart{{log_not_streamed}}"
+    );
+    let log = reader.open_log(&addr, &located).await?.expect("the log");
+    assert_eq!(log.info().source, LogSource::Cache { remote: false });
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut log.reader()?, &mut text)?;
+    assert!(text.starts_with(RETURNED), "the imported log: {text:?}");
+    slot.finish(Some(0));
+    Ok(())
 }
 
 /// A follower of a run that streams and then returns a longer log of its own,

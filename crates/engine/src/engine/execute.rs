@@ -131,7 +131,7 @@ impl Engine {
         // Telemetry: per-target execute wall time. This path runs only on a real
         // execution (cache misses), so it captures exactly the executed targets.
         let exec_started = std::time::Instant::now();
-        let start = execute_start(
+        let mut start = execute_start(
             addr_str.clone(),
             driver.name.clone(),
             def.target.cache.enabled,
@@ -148,6 +148,13 @@ impl Engine {
         );
         // Held until the run ends; a failed run hands it back before keeping
         // what it failed with (D17).
+        if let crate::engine::event::BuildEventKind::ExecuteStart {
+            log_not_streamed, ..
+        } = &mut start
+        {
+            // Diagnostics only: a reader's wording while no byte has arrived.
+            *log_not_streamed = !driver.driver.streams_log();
+        }
         let mut reservation = Some(reservation);
         let res = crate::engine::event::emit_scope(
             &rs,
@@ -167,7 +174,11 @@ impl Engine {
                 let live = if shell || outputs_are_material {
                     None
                 } else {
-                    Some(self.run_logs.create_for(addr, hashin))
+                    Some(self.run_logs.create_for_driver(
+                        addr,
+                        hashin,
+                        driver.driver.streams_log(),
+                    ))
                 };
                 let sandbox_dir = {
                     let mut dir = self.home.join("sandbox");
@@ -1343,6 +1354,7 @@ pub(crate) fn execute_start(
         queued_ms: Some(queued_ms),
         admitted: Some(admitted_kind(reservation.admitted())),
         output_groups,
+        log_not_streamed: false,
     }
 }
 

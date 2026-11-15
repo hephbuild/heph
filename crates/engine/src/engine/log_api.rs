@@ -200,6 +200,23 @@ fn running_where(session: Option<&str>) -> String {
     }
 }
 
+/// The address is running on a driver that returns its log when the run
+/// ends instead of streaming it, no byte of it has arrived, and nothing
+/// stored is newer. The UI says "this target's driver does not stream its
+/// log".
+/// Outranks [`NoOutputYet`]: such a run is started too. For another
+/// session's run, only when no hashin was asked for, since the run's start
+/// does not say which hashin it runs.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "no live log; the run {} is on a driver that does not stream its log",
+    running_where(.session.as_deref())
+)]
+pub struct LogNotStreamed {
+    /// The session it runs in; `None` for a run of this engine.
+    pub session: Option<String>,
+}
+
 /// A finished log the API could read, before it is opened.
 enum Stored {
     /// A finished live file (a `cache = false` success's), opened when it
@@ -262,6 +279,10 @@ enum Latest {
     /// Running, in this engine or another session, nothing written yet.
     Started(NoOutputYet),
     Stored(Stored),
+    /// This engine (`None`) or the locator's session is running the addr on
+    /// a driver that returns its log when the run ends instead of streaming
+    /// it, and nothing stored is newer than that run's start.
+    NotStreamed(Option<String>),
     None,
 }
 
@@ -304,6 +325,7 @@ impl Engine {
         match latest {
             Latest::None => Ok(None),
             Latest::Started(started) => Err(started.into()),
+            Latest::NotStreamed(session) => Err(LogNotStreamed { session }.into()),
             Latest::Running(run) => Ok(Some(OpenLog::plain(
                 LogInfo {
                     source: LogSource::Live {
@@ -346,6 +368,7 @@ impl Engine {
                 baseline: Some(started.at_unix_ms),
                 started: Some(started),
             },
+            Latest::NotStreamed(session) => return Err(LogNotStreamed { session }.into()),
             Latest::Stored(stored) if wait_for_start => Follow::Waiting {
                 baseline: Some(stored.at_unix_ms()),
                 started: None,
@@ -426,12 +449,18 @@ impl Engine {
         }
         // Going on, its file not created yet (or created a moment ago, and
         // the next look reads it): newer than anything retained or stored.
+        // A driver that does not stream its log outranks "no output yet":
+        // its bytes come only as the run ends.
         if let Some(run) = started {
+            if run.not_streamed {
+                return Ok(Latest::NotStreamed(None));
+            }
             return Ok(Latest::Started(NoOutputYet {
                 session: None,
                 at_unix_ms: run.at_unix_ms,
             }));
         }
+        let mut not_streamed = None;
         if let Some(locator) = locator {
             match locator
                 .locate(&self.home, &addr.format())
@@ -469,6 +498,11 @@ impl Engine {
                         at_unix_ms,
                     }));
                 }
+                // The start names no hashin: only an unfiltered ask matches.
+                Some(LocatedRunLog::NotStreamed {
+                    session,
+                    at_unix_ms,
+                }) if hashin.is_none() => not_streamed = Some((session, at_unix_ms)),
                 // Ended: what replaced it is among the stored sources.
                 _ => {}
             }
@@ -487,6 +521,11 @@ impl Engine {
         }
         if let Some(entry) = self.newest_cached_log(addr, hashin)? {
             consider(entry);
+        }
+        if let Some((session, at)) = not_streamed
+            && newest.as_ref().is_none_or(|n| n.at_unix_ms() <= at)
+        {
+            return Ok(Latest::NotStreamed(Some(session)));
         }
         Ok(newest.map_or(Latest::None, Latest::Stored))
     }

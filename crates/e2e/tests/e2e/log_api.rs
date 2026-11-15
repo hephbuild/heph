@@ -761,6 +761,7 @@ async fn log_follow_across_engines() -> anyhow::Result<()> {
             queued_ms: None,
             admitted: None,
             output_groups: Vec::new(),
+            log_not_streamed: false,
         }),
     );
     let err = b

@@ -51,6 +51,10 @@ struct FeedState {
     /// run that has written nothing yet is "started", not absent. One entry
     /// per target running now.
     started: std::collections::HashMap<String, u64>,
+    /// Addrs running on a driver that does not stream its log, with their
+    /// `ExecuteStart`'s time, until the run's first byte (its `RunLog`) or
+    /// its `ExecuteEnd`: `run_logs.rs`'s rule, off the same stream.
+    not_streamed: std::collections::HashMap<String, u64>,
 }
 
 /// An addr's newest `RunLog` in the followed session.
@@ -88,14 +92,23 @@ impl SessionFeed {
         let at = record.at_unix_ms;
         if let Some(kind) = record.kind {
             match &kind {
-                BuildEventKind::ExecuteStart { addr, .. } => {
-                    self.lock().started.insert(addr.clone(), at);
+                BuildEventKind::ExecuteStart {
+                    addr,
+                    log_not_streamed,
+                    ..
+                } => {
+                    let mut s = self.lock();
+                    s.started.insert(addr.clone(), at);
+                    if *log_not_streamed {
+                        s.not_streamed.insert(addr.clone(), at);
+                    }
                 }
                 // The run whose log was announced is over (`run_logs.rs`'s
                 // rule).
                 BuildEventKind::ExecuteEnd { addr, .. } => {
                     let mut s = self.lock();
                     s.started.remove(addr);
+                    s.not_streamed.remove(addr);
                     if let Some(run) = s.run_logs.get_mut(addr) {
                         run.ended = true;
                     }
@@ -144,6 +157,7 @@ impl SessionFeed {
             SessionRecordKind::RunLog(run) => {
                 // A path that could leave `<home>/runs/` is never kept.
                 if run.relative_file().is_some() {
+                    s.not_streamed.remove(&run.addr);
                     s.run_logs.insert(
                         run.addr.clone(),
                         FeedRunLog {
@@ -192,6 +206,12 @@ impl SessionFeed {
     /// read; `None` once it ended.
     pub fn started_at(&self, addr: &str) -> Option<u64> {
         self.lock().started.get(addr).copied()
+    }
+
+    /// When `addr`'s current run started, if it runs on a driver that does
+    /// not stream its log and no byte of it has arrived yet.
+    pub fn not_streamed(&self, addr: &str) -> Option<u64> {
+        self.lock().not_streamed.get(addr).copied()
     }
 
     /// The instant the run's final summary was measured against: its

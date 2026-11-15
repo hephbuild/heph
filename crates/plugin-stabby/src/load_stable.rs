@@ -1083,6 +1083,10 @@ impl ManagedDriver for StableRemoteManagedDriver {
         }
     }
 
+    fn streams_log(&self) -> bool {
+        self.log_capture
+    }
+
     fn supports_shell(&self) -> bool {
         // Report no native shell so the host's ManagedDriverBridge dispatches
         // `--shell` to its pluginexec fallback (an interactive bash in the

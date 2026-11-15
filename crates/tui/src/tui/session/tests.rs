@@ -50,6 +50,7 @@ fn events() -> Vec<BuildEvent> {
             3,
             BuildEventKind::ExecuteStart {
                 output_groups: Vec::new(),
+                log_not_streamed: false,
                 addr: "//a:ok".into(),
                 driver: "exec".into(),
                 cache: true,
@@ -630,6 +631,7 @@ fn status_json_is_capped_through_the_recorder() {
         tap.event(ev(BuildEventKind::ResultStart { addr: addr.into() }));
         tap.event(ev(BuildEventKind::ExecuteStart {
             output_groups: Vec::new(),
+            log_not_streamed: false,
             addr: addr.into(),
             driver: "exec".into(),
             cache: true,

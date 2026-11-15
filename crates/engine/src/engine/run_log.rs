@@ -94,6 +94,8 @@ pub(crate) struct StartedRun {
     pub(crate) hashin: String,
     /// When its log was made, in milliseconds since the epoch.
     pub(crate) at_unix_ms: u64,
+    /// Its driver does not stream its log: it returns it as the run ends.
+    pub(crate) not_streamed: bool,
 }
 
 /// One run's live file, as the log API finds it in-process.
@@ -294,14 +296,29 @@ impl RunLogs {
         self.create_for(&addr, "hashin")
     }
 
-    /// A new live log for `addr`'s run at `hashin`, and the guard that
-    /// unlinks it. Touches no file: the log's first byte creates it, and
-    /// announces it as `runs/<id>/<n>.log` (relative to the home) when an
-    /// announcer is set. Allocates nothing for the announcement otherwise.
+    /// [`Self::create_for_driver`], for a driver that streams its log.
+    #[cfg(test)]
     pub(crate) fn create_for(
         &self,
         addr: &hmodel::htaddr::Addr,
         hashin: &str,
+    ) -> (Arc<RunLog>, LiveGuard) {
+        self.create_for_driver(addr, hashin, true)
+    }
+
+    /// A new live log for `addr`'s run at `hashin`, and the guard that
+    /// unlinks it. Touches no file: the log's first byte creates it, and
+    /// announces it as `runs/<id>/<n>.log` (relative to the home) when an
+    /// announcer is set. Allocates nothing for the announcement otherwise.
+    ///
+    /// `streams_log`: whether the run's driver streams its log. One that
+    /// does not writes it only as the run ends, and until a byte arrives
+    /// the log API says so instead of "no output yet".
+    pub(crate) fn create_for_driver(
+        &self,
+        addr: &hmodel::htaddr::Addr,
+        hashin: &str,
+        streams_log: bool,
     ) -> (Arc<RunLog>, LiveGuard) {
         let n = self.next.fetch_add(1, Ordering::Relaxed);
         let name = format!("{n}.log");
@@ -330,6 +347,7 @@ impl RunLogs {
                 log: Arc::downgrade(&log),
                 hashin: hashin.to_owned(),
                 at_unix_ms: unix_ms_now(),
+                not_streamed: !streams_log,
             },
         );
         let guard = LiveGuard {

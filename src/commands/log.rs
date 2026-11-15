@@ -27,8 +27,8 @@ use crate::commands::completion::complete_target_addr;
 use crate::engine::log_api::TAIL_MAX;
 use crate::engine::request_state::RequestState;
 use crate::engine::{
-    Engine, FollowStep, LogFollower, LogInfo, LogOptions, LogSource, LogUnavailable, NoOutputYet,
-    OpenLog,
+    Engine, FollowStep, LogFollower, LogInfo, LogNotStreamed, LogOptions, LogSource,
+    LogUnavailable, NoOutputYet, OpenLog,
 };
 use crate::htaddr::{self, Addr};
 use crate::tui::session::format::files;
@@ -190,7 +190,17 @@ where
                     &mut err,
                     &format!(
                         "heph: no output yet for {addr}: running {} and nothing written; heph log -f {addr} follows it",
-                        running_where(e)
+                        running_where(e.session.as_deref())
+                    ),
+                );
+                return Ok(Shown::Nothing);
+            }
+            if let Some(e) = e.downcast_ref::<LogNotStreamed>() {
+                say(
+                    &mut err,
+                    &format!(
+                        "heph: no live log for {addr}: it is running {}, and {NOT_STREAMED}",
+                        running_where(e.session.as_deref())
                     ),
                 );
                 return Ok(Shown::Nothing);
@@ -285,7 +295,7 @@ fn print_followed(
 ) -> anyhow::Result<Shown> {
     let mut found = f.info();
     // Following a run that has written nothing yet.
-    let started = f.started().map(running_where);
+    let started = f.started().map(|s| running_where(s.session.as_deref()));
     match (&found, &started) {
         (Some(info), _) => say(&mut err, &following(addr, info, sessions)),
         (None, Some(running)) => say(
@@ -378,9 +388,10 @@ fn ended(addr: &Addr, replaced_by: Option<&LogSource>, took: &str) -> String {
     }
 }
 
-/// Where a run that has written nothing yet is going on.
-fn running_where(started: &NoOutputYet) -> String {
-    match &started.session {
+/// Where a run that has written nothing yet is going on: in `session`, or
+/// in this heph (`None`).
+fn running_where(session: Option<&str>) -> String {
+    match session {
         Some(session) => format!("in session {session}"),
         None => "in this heph".to_owned(),
     }
@@ -718,10 +729,18 @@ fn log_error(e: &anyhow::Error) -> crate::tui::dashboard::LogOpened {
     use crate::tui::dashboard::LogOpened;
     if let Some(e) = e.downcast_ref::<LogUnavailable>() {
         LogOpened::Unavailable(e.to_string())
+    } else if e.downcast_ref::<LogNotStreamed>().is_some() {
+        LogOpened::Nothing(NOT_STREAMED.to_owned())
     } else {
         LogOpened::Unavailable(format!("log unavailable: {e:#}"))
     }
 }
+
+/// What `heph log` and the Log tab say of a run on a driver that returns its
+/// log when the run ends instead of streaming it. The tab asks again when
+/// the row's state changes, so the log shows once the run ends.
+const NOT_STREAMED: &str =
+    "this target's driver does not stream its log; it appears when the run ends";
 
 /// Where a finished log was read from, in the Log tab's words.
 fn about(source: &LogSource) -> &'static str {
@@ -839,6 +858,28 @@ impl crate::tui::dashboard::TargetReader for EngineTargetReader {
 mod tests {
     use super::{LogSource, ended, last_lines, last_lines_start};
     use crate::htaddr::parse_addr;
+
+    /// The Log tab says a run on a driver that does not stream its log is
+    /// "this target's driver does not stream its log", not "log
+    /// unavailable".
+    #[test]
+    fn the_log_tab_says_a_driver_does_not_stream_its_log() {
+        use crate::tui::dashboard::LogOpened;
+        let nothing = |e: anyhow::Error| match super::log_error(&e) {
+            LogOpened::Nothing(why) => why,
+            _ => panic!("not Nothing for {e:#}"),
+        };
+        let why = nothing(
+            super::LogNotStreamed {
+                session: Some("s".into()),
+            }
+            .into(),
+        );
+        assert!(
+            why.starts_with("this target's driver does not stream its log"),
+            "{why}"
+        );
+    }
 
     /// How `-f` says a run ended, from what replaced its live file.
     #[test]

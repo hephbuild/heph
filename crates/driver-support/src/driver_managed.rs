@@ -118,6 +118,10 @@ pub trait ManagedDriver: Send + Sync {
     fn supports_shell(&self) -> bool {
         false
     }
+    /// [`hplugin::driver::Driver::streams_log`], for a managed driver.
+    fn streams_log(&self) -> bool {
+        true
+    }
     async fn run_shell<'a, 'io>(
         &self,
         _req: ManagedRunRequest<'a, 'io>,

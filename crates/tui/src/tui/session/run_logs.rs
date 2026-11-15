@@ -98,6 +98,11 @@ pub enum RunLogLookup {
         /// When its `ExecuteStart` was recorded.
         at_unix_ms: u64,
     },
+    /// The newest word on the addr: `session` started running it at
+    /// `at_unix_ms` on a driver that returns its log when the run ends
+    /// instead of streaming it, and no byte of it has arrived. Chosen over a
+    /// [`Self::Found`] only when it is newer.
+    NotStreamed { session: SessionId, at_unix_ms: u64 },
     /// Nothing: no live session of this workspace, or none that recorded
     /// the addr.
     None,
@@ -117,7 +122,9 @@ pub fn find_run_log(
 ) -> anyhow::Result<Option<FoundRunLog>> {
     Ok(match lookup_run_log(root, home, addr)? {
         RunLogLookup::Found(found) => Some(found),
-        RunLogLookup::Started { .. } | RunLogLookup::None => None,
+        RunLogLookup::Started { .. } | RunLogLookup::NotStreamed { .. } | RunLogLookup::None => {
+            None
+        }
     })
 }
 
@@ -132,6 +139,7 @@ pub fn lookup_run_log(root: &SessionRoot, home: &Path, addr: &str) -> anyhow::Re
     };
     let mut newest: Option<FoundRunLog> = None;
     let mut started: Option<(u64, SessionId)> = None;
+    let mut not_streamed: Option<(u64, SessionId)> = None;
     for entry in entries.filter_map(Result::ok) {
         let Some(id) = entry
             .file_name()
@@ -148,6 +156,12 @@ pub fn lookup_run_log(root: &SessionRoot, home: &Path, addr: &str) -> anyhow::Re
                 }
                 continue;
             }
+            Ok(SessionLookup::NotStreamed(at)) => {
+                if not_streamed.is_none_or(|(n_at, n)| (at, id.encode()) > (n_at, n.encode())) {
+                    not_streamed = Some((at, id));
+                }
+                continue;
+            }
             Ok(SessionLookup::Nothing) => continue,
             Err(e) => {
                 tracing::debug!(session = %id, error = %format!("{e:#}"), "skipping session");
@@ -160,6 +174,21 @@ pub fn lookup_run_log(root: &SessionRoot, home: &Path, addr: &str) -> anyhow::Re
         if newer {
             newest = Some(FoundRunLog { session: id, log });
         }
+    }
+    // A run that started after the newest log was written, on a driver that
+    // does not stream, is the addr's current run: its log is not here yet.
+    // It outranks a start no newer than it: "no output yet" would promise
+    // bytes that come only at its end.
+    if let Some((at_unix_ms, session)) = not_streamed
+        && newest
+            .as_ref()
+            .is_none_or(|n| at_unix_ms >= n.log.at_unix_ms())
+        && started.as_ref().is_none_or(|(s_at, _)| at_unix_ms >= *s_at)
+    {
+        return Ok(RunLogLookup::NotStreamed {
+            session,
+            at_unix_ms,
+        });
     }
     Ok(match (newest, started) {
         // A run that started after the newest record is going on, with
@@ -184,6 +213,9 @@ enum SessionLookup {
     Log(SessionRunLog),
     /// Running here since the `ExecuteStart` at this time, nothing written.
     Started(u64),
+    /// The session's newest word on the addr is an `ExecuteStart` (at this
+    /// time) on a driver that does not stream its log: no byte has arrived.
+    NotStreamed(u64),
     Nothing,
 }
 
@@ -197,7 +229,7 @@ pub fn session_run_log(
 ) -> anyhow::Result<Option<SessionRunLog>> {
     Ok(match session_lookup(dir, home, addr)? {
         SessionLookup::Log(log) => Some(log),
-        SessionLookup::Started(_) | SessionLookup::Nothing => None,
+        SessionLookup::Started(_) | SessionLookup::NotStreamed(_) | SessionLookup::Nothing => None,
     })
 }
 
@@ -230,6 +262,9 @@ fn session_lookup(dir: &Path, home: &Path, addr: &str) -> anyhow::Result<Session
     // The `ExecuteStart` of a run of the addr not followed by its end: it
     // is going on, and has written nothing unless a record came after.
     let mut started: Option<u64> = None;
+    // Set by a start on a driver that does not stream its log; cleared by
+    // the run's first byte (its `RunLog` record) or its end.
+    let mut not_streamed: Option<u64> = None;
     while let Some(rec) = reader.next_record().context("reading events.ndjson")? {
         match (rec.kind, rec.session) {
             (_, Some(SessionRecordKind::RunLog(run)))
@@ -237,16 +272,31 @@ fn session_lookup(dir: &Path, home: &Path, addr: &str) -> anyhow::Result<Session
             {
                 newest = Some((rec.at_unix_ms, *run));
                 ended = false;
+                not_streamed = None;
             }
-            (Some(BuildEventKind::ExecuteStart { addr: a, .. }), _) if a == addr => {
+            (
+                Some(BuildEventKind::ExecuteStart {
+                    addr: a,
+                    log_not_streamed,
+                    ..
+                }),
+                _,
+            ) if a == addr => {
                 started = Some(rec.at_unix_ms);
+                not_streamed = log_not_streamed.then_some(rec.at_unix_ms);
             }
             (Some(BuildEventKind::ExecuteEnd { addr: a, .. }), _) if a == addr => {
                 ended = true;
                 started = None;
+                not_streamed = None;
             }
             _ => {}
         }
+    }
+    // A start on a driver that does not stream, no byte since: outranks
+    // "started", whose wording promises bytes before the end.
+    if let Some(at) = not_streamed {
+        return Ok(SessionLookup::NotStreamed(at));
     }
     // A record not ended is the run going on, whichever of its record and
     // its start was written first; a start after an ended run is a new run
@@ -299,6 +349,15 @@ impl LiveRunLogLocator for SessionRunLogLocator {
                 return Ok(Some(LocatedRunLog::Started {
                     at_unix_ms,
                     session: session.encode(),
+                }));
+            }
+            RunLogLookup::NotStreamed {
+                session,
+                at_unix_ms,
+            } => {
+                return Ok(Some(LocatedRunLog::NotStreamed {
+                    session: session.encode(),
+                    at_unix_ms,
                 }));
             }
             RunLogLookup::None => return Ok(None),
@@ -375,6 +434,14 @@ impl LiveRunLogLocator for FeedRunLogLocator {
             return Ok(None);
         }
         let session = self.id.encode();
+        // A start on a driver that does not stream, no byte since: outranks
+        // "started".
+        if let Some(at_unix_ms) = self.feed.not_streamed(addr) {
+            return Ok(Some(LocatedRunLog::NotStreamed {
+                session,
+                at_unix_ms,
+            }));
+        }
         // A record not ended is the run going on, whichever of its record
         // and its start came first; a start with no record after it, or
         // after an ended one, has written nothing yet.
@@ -539,7 +606,7 @@ mod tests {
         }
     }
 
-    fn execute_start(at: u64, addr: &str) -> SessionRecord {
+    fn execute_start(at: u64, addr: &str, log_not_streamed: bool) -> SessionRecord {
         SessionRecord {
             at_unix_ms: at,
             kind: Some(BuildEventKind::ExecuteStart {
@@ -551,6 +618,7 @@ mod tests {
                 queued_ms: None,
                 admitted: None,
                 output_groups: Vec::new(),
+                log_not_streamed,
             }),
             session: None,
         }
@@ -686,7 +754,7 @@ mod tests {
         let sessions = SessionRoot::new(&root);
         // Another live session on the same workspace, with nothing of the addr.
         let (_old, _old_lock) = session(&root, 1, &home, &[]);
-        let (dir, _lock) = session(&root, 2, &home, &[execute_start(10, ADDR)]);
+        let (dir, _lock) = session(&root, 2, &home, &[execute_start(10, ADDR, false)]);
         let lookup = lookup_run_log(&sessions, &home, ADDR).expect("lookup");
         let ours = SessionId::new(1_800_000_000_002, 2);
         assert!(
@@ -708,7 +776,10 @@ mod tests {
         ));
         // Ended, then a new run that has written nothing: started again,
         // over the older record.
-        append(&dir, &[execute_end(12, ADDR), execute_start(13, ADDR)]);
+        append(
+            &dir,
+            &[execute_end(12, ADDR), execute_start(13, ADDR, false)],
+        );
         assert!(matches!(
             lookup_run_log(&sessions, &home, ADDR).expect("lookup"),
             RunLogLookup::Started { at_unix_ms: 13, .. }
@@ -725,7 +796,7 @@ mod tests {
             &dir,
             &[
                 run_log(15, ADDR, "h1", "runs/e/0.log"),
-                execute_start(16, ADDR),
+                execute_start(16, ADDR, false),
             ],
         );
         assert!(matches!(
@@ -793,18 +864,18 @@ mod tests {
             }
         };
 
-        drop(feed.route(execute_start(10, ADDR)));
+        drop(feed.route(execute_start(10, ADDR, false)));
         let got = locate(true);
         assert!(started(10)(&got), "{got:?}");
         assert!(locate(false).is_none(), "a dead session started nothing");
-        drop(feed.route(execute_start(11, "//p:other")));
+        drop(feed.route(execute_start(11, "//p:other", false)));
         assert!(started(10)(&locate(true)), "another addr's start");
 
         drop(feed.route(run_log(12, ADDR, "h0", "runs/e/0.log")));
         assert!(matches!(locate(true), Some(LocatedRunLog::Live { .. })));
         drop(feed.route(execute_end(13, ADDR)));
         assert!(matches!(locate(true), Some(LocatedRunLog::Ended { .. })));
-        drop(feed.route(execute_start(14, ADDR)));
+        drop(feed.route(execute_start(14, ADDR, false)));
         let got = locate(true);
         assert!(started(14)(&got), "{got:?}");
         drop(feed.route(execute_end(15, ADDR)));
@@ -842,6 +913,117 @@ mod tests {
                 .expect("a missing root is no session")
                 .is_none()
         );
+    }
+
+    /// A start on a driver that does not stream its log is the addr's word
+    /// until the run's first byte (its `RunLog`) or its end; it outranks an
+    /// older run's log in another session but not a newer one; a streaming
+    /// start, or another addr's, says nothing.
+    #[test]
+    fn a_start_that_does_not_stream_reads_not_streamed_until_a_byte_or_the_end() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let root = tmp.path().join("sessions");
+        let sessions = SessionRoot::new(&root);
+        live_file(&home, "runs/a/0.log", b"older run\n");
+        let (old, _l1) = session(
+            &root,
+            1,
+            &home,
+            &[run_log(10, ADDR, "h-old", "runs/a/0.log")],
+        );
+        let (dir, _l2) = session(
+            &root,
+            2,
+            &home,
+            &[
+                execute_start(20, ADDR, true),
+                execute_start(21, "//p:tt", false),
+            ],
+        );
+        let id = SessionId::new(1_800_000_000_002, 2);
+        let not_streamed = |lookup: RunLogLookup| match lookup {
+            RunLogLookup::NotStreamed {
+                session,
+                at_unix_ms,
+            } => Some((session, at_unix_ms)),
+            _ => None,
+        };
+        let lookup = || lookup_run_log(&sessions, &home, ADDR).expect("lookup");
+        assert_eq!(not_streamed(lookup()), Some((id, 20)));
+        assert!(
+            find_run_log(&sessions, &home, ADDR)
+                .expect("find")
+                .is_none(),
+            "no log to read"
+        );
+        assert!(session_run_log(&dir, &home, ADDR).expect("read").is_none());
+        assert_eq!(
+            SessionRunLogLocator::new(sessions.clone())
+                .locate(&home, ADDR)
+                .expect("locate")
+                .map(|l| matches!(l, LocatedRunLog::NotStreamed { at_unix_ms: 20, .. })),
+            Some(true)
+        );
+        // A near-miss addr, and the other addr's streaming start: nothing.
+        assert!(not_streamed(lookup_run_log(&sessions, &home, "//p:").expect("lookup")).is_none());
+        assert!(
+            not_streamed(lookup_run_log(&sessions, &home, "//p:tt").expect("lookup")).is_none()
+        );
+
+        // A newer run of the addr elsewhere wins over it.
+        live_file(&home, "runs/a/1.log", b"newer run\n");
+        append(&old, &[run_log(30, ADDR, "h-new", "runs/a/1.log")]);
+        assert!(matches!(lookup(), RunLogLookup::Found(f) if f.log.record().hashin == "h-new"));
+        append(&old, &[execute_end(31, ADDR)]);
+        std::fs::remove_file(home.join("runs/a/1.log")).expect("unlink");
+        std::fs::remove_file(home.join("runs/a/0.log")).expect("unlink");
+
+        // The run's first byte: its log, found.
+        append(
+            &dir,
+            &[execute_end(40, ADDR), execute_start(41, ADDR, true)],
+        );
+        assert_eq!(not_streamed(lookup()), Some((id, 41)));
+        live_file(&home, "runs/b/0.log", b"late\n");
+        append(&dir, &[run_log(42, ADDR, "h", "runs/b/0.log")]);
+        assert!(matches!(
+            session_run_log(&dir, &home, ADDR).expect("read"),
+            Some(SessionRunLog::Live { at_unix_ms: 42, .. })
+        ));
+        // A start without a byte, then its end: not NotStreamed any more.
+        append(
+            &dir,
+            &[execute_start(50, ADDR, true), execute_end(51, ADDR)],
+        );
+        assert!(not_streamed(lookup()).is_none());
+        // A streaming start says nothing either.
+        append(&dir, &[execute_start(60, ADDR, false)]);
+        assert!(not_streamed(lookup()).is_none());
+
+        // `heph session attach`'s locator, off the stream it follows: the
+        // same rule.
+        let feed = super::super::SessionFeed::default();
+        let attached = || {
+            FeedRunLogLocator::new(feed.clone(), id, &meta(id, &home), true)
+                .expect("meta names a home")
+                .locate(&home, ADDR)
+                .expect("locate")
+        };
+        drop(feed.route(execute_start(70, ADDR, true)));
+        assert!(
+            matches!(
+                attached(),
+                Some(LocatedRunLog::NotStreamed { at_unix_ms: 70, .. })
+            ),
+            "{:?}",
+            attached()
+        );
+        drop(feed.route(run_log(71, ADDR, "h", "runs/b/0.log")));
+        assert!(matches!(attached(), Some(LocatedRunLog::Live { .. })));
+        drop(feed.route(execute_start(72, ADDR, true)));
+        drop(feed.route(execute_end(73, ADDR)));
+        assert!(matches!(attached(), Some(LocatedRunLog::Ended { .. })));
     }
 
     /// A `RunLog` whose `file` has `..`, is absolute, or resolves through a

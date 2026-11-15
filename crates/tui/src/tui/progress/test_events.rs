@@ -35,6 +35,7 @@ pub(crate) fn end(addr: &str, error: Option<&str>, upstream_of: Option<&str>) ->
 pub(crate) fn exec(addr: &str) -> BuildEventKind {
     BuildEventKind::ExecuteStart {
         output_groups: Vec::new(),
+        log_not_streamed: false,
         addr: addr.into(),
         driver: "exec".into(),
         cache: true,

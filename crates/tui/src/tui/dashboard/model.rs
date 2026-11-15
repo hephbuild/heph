@@ -1173,6 +1173,7 @@ mod tests {
             4 => BuildEventKind::AdmissionWaitEnd { addr: addr(rng) },
             5 | 6 => BuildEventKind::ExecuteStart {
                 output_groups: Vec::new(),
+                log_not_streamed: false,
                 addr: addr(rng),
                 driver: "exec".into(),
                 cache: true,
