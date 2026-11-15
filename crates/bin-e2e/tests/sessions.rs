@@ -12,7 +12,8 @@ use common::session::{Bg, SHORT, id_in, last_end, list_entry, lock_free, session
 use common::{Dist, Workspace, describe, signal, wait_until};
 
 /// `exit3` is an entrypoint, so heph exits with its tool's code — 3, which no
-/// failure of heph's own produces. `long` is killed or interrupted before it
+/// failure of heph's own produces; `exit125` exits with the code heph's own
+/// failures use, which `attach` must say is the session's. `long` is killed or interrupted before it
 /// ends; `held` is built by two
 /// runs at once, the second waiting on the first's result lock, which it
 /// announces only past the engine's 5s notice.
@@ -20,6 +21,7 @@ const BUILD: &str = r#"
 target(name = "ok", driver = "bash", run = "true", cache = False)
 target(name = "fail", driver = "bash", run = "exit 1", cache = False)
 target(name = "exit3", driver = "bash", entrypoint = True, run = "sleep 2; exit 3")
+target(name = "exit125", driver = "bash", entrypoint = True, run = "sleep 2; exit 125")
 target(name = "slowfail", driver = "bash", run = "sleep 4; exit 1", cache = False)
 target(name = "long", driver = "bash", run = "sleep 60", cache = False)
 target(name = "held", driver = "bash", run = "sleep 12")
@@ -142,6 +144,26 @@ fn attach_exit_codes() {
         .expect("attach");
     assert_eq!(out.status.code(), Some(3), "{}", describe(&out));
     assert_eq!(run.wait().code(), Some(3), "{}", run.stderr());
+
+    // A mirrored 125 reads like attach's own failure, so attach says whose it
+    // is — on stderr, leaving stdout clean.
+    let mut run = Bg::spawn(&ws, &dist, &["run", "//pkg:exit125"]);
+    let out = ws
+        .run(&dist, &["session", "attach", &run.id])
+        .expect("attach");
+    assert_eq!(out.status.code(), Some(125), "{}", describe(&out));
+    assert_eq!(run.wait().code(), Some(125), "{}", run.stderr());
+    let note = format!("heph: session {} exited 125\n", run.id);
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains(&note),
+        "no {note:?} on stderr\n{}",
+        describe(&out)
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "stdout not clean\n{}",
+        describe(&out)
+    );
 
     let out = ws
         .run(&dist, &["session", "attach", "zzzzzzzzzz"])
@@ -296,6 +318,36 @@ fn list_filters_by_workspace() {
     let mut both = vec![in_a, in_b];
     both.sort();
     assert_eq!(listed(true), both, "--all lists every workspace's");
+
+    // Outside a workspace (the temp `HOME` has no `.hephconfig` above it),
+    // `list` widens on its own and says so — on stderr only, so `--json`
+    // stdout still parses as one document.
+    let out = run_in(&a, home, &["session", "list", "--json"]);
+    assert!(out.status.success(), "{}", describe(&out));
+    const NOTE: &str = "heph: not in a workspace; listing the sessions of every workspace";
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains(NOTE),
+        "the note leaked onto stdout\n{}",
+        describe(&out)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains(NOTE),
+        "no scope note on stderr\n{}",
+        describe(&out)
+    );
+    let list: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("stdout is not JSON: {e}\n{}", describe(&out)));
+    let mut widened: Vec<String> = list["sessions"]
+        .as_array()
+        .map(|all| {
+            all.iter()
+                .filter_map(|s| s["id"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    widened.sort();
+    assert_eq!(widened, both, "outside a workspace lists every workspace's");
 }
 
 /// `run --raw` sets up no session: no directory, and nothing on stderr — no
