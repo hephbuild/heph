@@ -103,8 +103,8 @@ const BUILD: &str = r#"target(name = "t", driver = "bash",
 /// the listing holds the groups the run reported and reads each file's path,
 /// size and content hash, with no row for a directory that holds files.
 #[tokio::test]
-async fn executed_sends_result_outputs_a_hit_none_and_the_listing_reads_files()
--> anyhow::Result<()> {
+async fn executed_sends_result_outputs_a_hit_none_and_the_listing_reads_files() -> anyhow::Result<()>
+{
     let ws = Workspace::new();
     ws.write_build_file("p", BUILD);
 

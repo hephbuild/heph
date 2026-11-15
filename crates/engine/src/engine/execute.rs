@@ -787,6 +787,14 @@ impl Engine {
                             .await
                         }
                     };
+                    // The run returned: each stream's held-back tail goes to
+                    // the sinks as well as the file. Not after an abandoned
+                    // run, whose process may still be writing.
+                    if !matches!(&res, Err(e) if crate::engine::run_timeout::is_abandoned(e)) {
+                        for w in [log_out.as_mut(), log_err.as_mut()].into_iter().flatten() {
+                            w.finish().await;
+                        }
+                    }
                     drop(tx.send(res));
                     Ok(())
                 })

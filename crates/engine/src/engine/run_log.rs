@@ -587,6 +587,33 @@ impl RunLog {
         }
     }
 
+    /// End `stream`: append the bytes its redactor held back as a possible
+    /// secret's start, and add them to `forward` when given, so the sink the
+    /// writer tees into ends where the file does. Nothing once the log is
+    /// finalized: [`Self::take_file`] flushed the tail into the file then.
+    fn finish_stream(&self, stream: Stream, forward: Option<&mut Vec<u8>>) {
+        let mut st = self.state();
+        let st = &mut *st;
+        if matches!(st.file, Live::Ended) {
+            return;
+        }
+        let redactor = match stream {
+            Stream::Stdout => st.out.as_mut(),
+            Stream::Stderr => st.err.as_mut(),
+        };
+        let Some(tail) = redactor.map(Redactor::finish).filter(|t| !t.is_empty()) else {
+            return;
+        };
+        if st.error.is_none()
+            && let Err(e) = self.append(st, &tail)
+        {
+            st.error = Some(e);
+        }
+        if let Some(forward) = forward {
+            forward.extend_from_slice(&tail);
+        }
+    }
+
     /// Create the live file (and `runs/<id>/`) unless it exists.
     fn create_file(&self) -> io::Result<File> {
         self.dir.ensure()?;
@@ -984,6 +1011,20 @@ impl<'io> RunLogWriter<'io> {
         }
     }
 
+    /// End this stream once the run returned: its redactor's held-back tail
+    /// goes to the file and the inner sink, which is then flushed. Without
+    /// it a stream ending in a secret's prefix (`s3cr`) reaches the file at
+    /// finalize but never the sink. A sink error is not the run's, and is
+    /// dropped: the log has the bytes. Not for an abandoned run, whose
+    /// plugin may still write.
+    pub(crate) async fn finish(&mut self) {
+        let forward = self.inner.is_some().then_some(&mut self.pending);
+        self.log.finish_stream(self.stream, forward);
+        if let Err(e) = tokio::io::AsyncWriteExt::flush(self).await {
+            tracing::debug!(path = %self.log.path.display(), error = %e, "flushing a run's output sink");
+        }
+    }
+
     /// Push the pending bytes into the inner sink. On an error they are
     /// dropped: the sink refused them, the log has them.
     fn poll_drain(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -1282,6 +1323,36 @@ mod tests {
         assert!(matches!(imported, Imported::Replaced), "{imported:?}");
         let file = file.expect("the import created the file");
         assert_eq!(read_all(&file).expect("read"), b"inline [redacted]");
+    }
+
+    /// A stream that ends in what could be a secret's start holds it back;
+    /// the writer's `finish` sends it to the sink as well as the file, so
+    /// the terminal does not lose a stream's last bytes that the log keeps.
+    #[tokio::test]
+    async fn writer_finish_forwards_the_held_back_tail() {
+        let (_home, logs) = logs();
+        let (log, _guard) = logs.create();
+        log.set_needles(Needles::new(["s3cr3t-T0KEN-value"]));
+        let mut out_sink = Vec::new();
+        let mut err_sink = Vec::new();
+        {
+            let mut out = RunLogWriter::new(Arc::clone(&log), Stream::Stdout, Some(&mut out_sink));
+            let mut err = RunLogWriter::new(Arc::clone(&log), Stream::Stderr, Some(&mut err_sink));
+            out.write_all(b"out s3cr").await.expect("w");
+            err.write_all(b"err ").await.expect("w");
+            out.flush().await.expect("flush");
+            // `s3cr` is held back here: a flush does not end the stream.
+            out.finish().await;
+            err.finish().await;
+        }
+        assert_eq!(out_sink, b"out s3cr", "the tail reached the sink");
+        assert_eq!(err_sink, b"err ");
+        let file = log.finalize().expect("file");
+        assert_eq!(
+            read_all(&file).expect("read"),
+            b"out err s3cr",
+            "the tail reached the file once, before finalize"
+        );
     }
 
     #[derive(Debug, Default)]
