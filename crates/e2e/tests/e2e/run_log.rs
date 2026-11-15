@@ -726,6 +726,13 @@ fn names<'a>(
 /// lock is free (a killed heph's, its `cache = false` live files with it) and
 /// keep it while the lock is held, a live engine's own directory included.
 /// The owning engine's drop removes its own directory.
+///
+/// This is also the `HEPH_NO_SESSION=1` case, with no `set_var`: the lock
+/// is the engine's (`RunLogs`, made with `runs/<id>/` by the first byte),
+/// not the session's, and these engines announce their live files to no
+/// session, as a heph under `HEPH_NO_SESSION` does (its slot records
+/// nothing). Such a heph still holds its directory's lock, so no sweep
+/// removes its live files.
 #[tokio::test]
 async fn runs_dir_gc_respects_its_lock() -> anyhow::Result<()> {
     let ws = tempfile::tempdir()?;
