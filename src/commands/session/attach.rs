@@ -67,25 +67,17 @@ pub(crate) async fn attach(
             None
         }
     };
-    let (quit_tx, quit_rx) = mpsc::unbounded_channel();
-    let after = AfterTeardown::default();
-    let feed = SessionFeed::default();
     let interactive = tui::should_use_tui(no_tui);
-    // Only the dashboard reads logs and outputs; the line backend needs none.
-    let readers =
-        interactive.then(|| Readers::for_session(global, &meta, entry.id, entry.live, &feed));
-    let app = AttachApp {
-        id: entry.id,
+    let app = AttachApp::new(
+        global,
         meta,
-        holders: source.holder_names(entry.id),
-        feed,
-        readers,
-        after: after.clone(),
+        entry.live,
+        source.holder_names(entry.id),
         stream,
         detach_rx,
-        quit_tx,
-        quit_rx,
-    };
+        interactive,
+    );
+    let after = app.after.clone();
     let outcome = tui::run_app(app, sink.clone(), session, interactive, shutdown).await;
     if let Some(task) = sigint_task {
         task.abort();
@@ -257,7 +249,7 @@ impl tui::dashboard::TargetReader for NotAttached {
     }
 }
 
-struct AttachApp {
+pub(super) struct AttachApp {
     id: SessionId,
     meta: SessionMeta,
     /// How this viewer names a lock holder's pid; the run's view named it
@@ -272,6 +264,45 @@ struct AttachApp {
     detach_rx: mpsc::UnboundedReceiver<()>,
     quit_tx: mpsc::UnboundedSender<()>,
     quit_rx: mpsc::UnboundedReceiver<()>,
+}
+
+impl AttachApp {
+    /// The viewer of `meta`'s session, following `stream`. Only the
+    /// dashboard (`interactive`) reads logs, outputs and notices; the line
+    /// backend needs no reader.
+    pub(super) fn new(
+        global: &crate::commands::GlobalOptions,
+        meta: SessionMeta,
+        live: bool,
+        holders: HolderNames,
+        stream: BoxStream<'static, anyhow::Result<SessionItem>>,
+        detach_rx: mpsc::UnboundedReceiver<()>,
+        interactive: bool,
+    ) -> Self {
+        let (quit_tx, quit_rx) = mpsc::unbounded_channel();
+        let feed = SessionFeed::default();
+        let readers =
+            interactive.then(|| Readers::for_session(global, &meta, meta.id, live, &feed));
+        Self {
+            id: meta.id,
+            meta,
+            holders,
+            feed,
+            readers,
+            after: AfterTeardown::default(),
+            stream,
+            detach_rx,
+            quit_tx,
+            quit_rx,
+        }
+    }
+
+    /// The feed `run` routes each record into, for a test to route a
+    /// recorded session through without a backend.
+    #[cfg(test)]
+    pub(super) fn feed(&self) -> &SessionFeed {
+        &self.feed
+    }
 }
 
 /// The line form: only selects which stock line view a session gets, and

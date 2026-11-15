@@ -1445,6 +1445,107 @@ async fn detach_listener_is_armed_before_its_task_runs() {
     task.abort();
 }
 
+/// Attach's own wiring of the approval view: a recorded session with a
+/// pending request, followed from its directory into the viewer's feed, and
+/// the viewer built as `attach` builds it. With the run's home recorded, the
+/// view reads the notice from that home's store by the hash the session
+/// recorded; with another home recorded, the readers are unavailable and
+/// the notice reads "notice unavailable", never its text.
+#[tokio::test(flavor = "multi_thread")]
+async fn attach_reads_a_pending_notice_from_the_run_home() {
+    use crate::tui::session::{ApprovalPrompt, ApprovalPromptNotice, FileSource};
+    use crate::tui::{App as _, TUIAppView as _};
+
+    const NOTICE: &str = "drop the table";
+    let ws = tempfile::tempdir().expect("tempdir");
+    std::fs::write(ws.path().join(".hephconfig"), "").expect("write .hephconfig");
+    let global = crate::commands::GlobalOptions::default();
+    let (_engine, home) =
+        crate::commands::bootstrap::new_reader_engine(&global, ws.path()).expect("reader engine");
+    let hash = hcore::approval_notice::write_notice_blob(&home, NOTICE).expect("notice blob");
+    let elsewhere = tempfile::tempdir().expect("tempdir");
+    let sessions = tempfile::tempdir().expect("tempdir");
+
+    for (pid, recorded_home, shows) in [
+        (1_u32, home.as_path(), NOTICE),
+        (2, elsewhere.path(), "notice unavailable"),
+    ] {
+        let id = SessionId::new(T0 + u64::from(pid), 7);
+        let mut m = meta(id, pid, &["heph", "run"]);
+        m.interactive = true;
+        m.workspace_root = Some(ws.path().display().to_string());
+        m.home_dir = Some(recorded_home.display().to_string());
+        let prompt = ApprovalPrompt {
+            addr: "//a:gate".to_owned(),
+            queued_behind: 0,
+            notices: vec![ApprovalPromptNotice {
+                name: "plan".to_owned(),
+                path: String::new(),
+                hash: Some(hash.clone()),
+            }],
+            queue: Vec::new(),
+        };
+        let records = [SessionRecord::session(
+            T0,
+            SessionRecordKind::Approval {
+                prompt: Some(Box::new(prompt)),
+                standing: None,
+            },
+        )];
+        let dir = write_session(sessions.path(), &m, &records, None);
+        let _live = hold_lock(&dir);
+
+        let source = FileSource::new(sessions.path());
+        let (_detach_tx, detach_rx) = tokio::sync::mpsc::unbounded_channel();
+        let app = attach::AttachApp::new(
+            &global,
+            m,
+            true,
+            source.holder_names(id),
+            futures::stream::empty().boxed(),
+            detach_rx,
+            true,
+        );
+        // What `run` does with each record, up to the end of what is recorded.
+        let mut follow = source.subscribe(id).await.expect("subscribe");
+        while let Some(item) = follow.next().await {
+            match item.expect("item") {
+                SessionItem::Record(r) => drop(app.feed().route(*r)),
+                SessionItem::CaughtUp { .. } => break,
+                SessionItem::Ended { .. } => panic!("the session is live"),
+            }
+        }
+
+        let mut view = app.tui_view();
+        assert!(view.approval_open(), "a pending request opens");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let frame: String = view
+                .render_full(NOW, 120, 40)
+                .iter()
+                .map(|l| {
+                    let mut row: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+                    row.push('\n');
+                    row
+                })
+                .collect();
+            if frame.contains(shows) {
+                assert!(
+                    pid == 1 || !frame.contains(NOTICE),
+                    "another home never shows the notice:\n{frame}"
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{shows:?} never showed (home {}):\n{frame}",
+                recorded_home.display()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+}
+
 #[test]
 fn control_bytes_escaped() {
     assert_eq!(escape("plain"), "plain");
