@@ -283,30 +283,87 @@ target(
     Ok(())
 }
 
-/// The target's own `env` naming a root heph sets is refused rather than
-/// silently replaced.
+/// The target's own `env`, `runtime_env` or `runtime_pass_env` naming a root
+/// heph sets is refused rather than silently replaced. (`pass_env` is refused
+/// by its host snapshot, which needs the host to export the name:
+/// `pluginexec`'s `tool_root_pass_env_snapshot_is_refused`, since `set_var` is
+/// process-global and this binary is shared.)
 #[tokio::test]
 async fn tool_root_claimed_by_own_env_is_refused() -> anyhow::Result<()> {
-    let ws = Workspace::new();
-    ws.write_build_file("x", PLAIN_TOOL_BUILD);
-    ws.write_build_file(
-        "use",
-        r#"
+    for (field, decl) in [
+        ("env", r#"env = {"TOOL_ROOT": "/x"}"#),
+        ("runtime_env", r#"runtime_env = {"TOOL_ROOT": "/x"}"#),
+        ("runtime_pass_env", r#"runtime_pass_env = ["TOOL_ROOT"]"#),
+    ] {
+        let ws = Workspace::new();
+        ws.write_build_file("x", PLAIN_TOOL_BUILD);
+        ws.write_build_file(
+            "use",
+            &format!(
+                r#"
 target(
     name = "c",
     driver = "bash",
     tools = ["//x:t"],
-    env = {"TOOL_ROOT": "/x"},
+    {decl},
+    run = "echo $TOOL_ROOT > $OUT",
+    out = "out.txt",
+)
+"#
+            ),
+        );
+        let Err(err) = ws.run("//use:c").await else {
+            anyhow::bail!("built although `{field}` claims TOOL_ROOT");
+        };
+        let err = format!("{err:#}");
+        assert!(
+            err.contains(&format!("`TOOL_ROOT` is set by the target's `{field}`")),
+            "{field}: {err}"
+        );
+    }
+    Ok(())
+}
+
+/// A group from a dependency's `transitive` tools collides like one of the
+/// target's own: the unnamed group's root is `TOOL_ROOT`, which is also the
+/// transitive group `root`'s tool list. Only `apply_transitive` sees both.
+#[tokio::test]
+async fn tool_root_colliding_with_a_transitive_group_is_refused() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "x",
+        r#"
+target(name = "t", driver = "bash", run = "echo hi > $OUT", out = "t")
+target(name = "u", driver = "bash", run = "echo hi > $OUT", out = "u")
+"#,
+    );
+    ws.write_build_file(
+        "use",
+        r#"
+target(
+    name = "lib",
+    driver = "bash",
+    run = "echo lib > $OUT",
+    out = "lib.txt",
+    transitive = {"tools": {"root": ["//x:u"]}},
+)
+target(
+    name = "c",
+    driver = "bash",
+    deps = ["//use:lib"],
+    tools = ["//x:t"],
     run = "echo $TOOL_ROOT > $OUT",
     out = "out.txt",
 )
 "#,
     );
     let Err(err) = ws.run("//use:c").await else {
-        anyhow::bail!("built although `env` claims TOOL_ROOT");
+        anyhow::bail!("built although a transitive group claims TOOL_ROOT");
     };
     let err = format!("{err:#}");
-    assert!(err.contains("`env` declares `TOOL_ROOT`"), "{err}");
+    assert!(err.contains("`TOOL_ROOT`"), "{err}");
+    assert!(err.contains("the unnamed group"), "{err}");
+    assert!(err.contains("group \"root\""), "{err}");
     Ok(())
 }
 
@@ -342,7 +399,7 @@ target(
     let err = format!("{err:#}");
     assert!(err.contains("`TOOL_ROOT`"), "{err}");
     assert!(
-        err.contains("a dependency's `transitive` env declares"),
+        err.contains("`TOOL_ROOT` is set by a dependency's `transitive` env"),
         "{err}"
     );
     Ok(())
