@@ -195,6 +195,9 @@ fn execute(
                 Some(w) => Workspace::Only(w),
                 None => Workspace::All,
             };
+            if let Some(note) = list::scope_note(a.all, workspace.as_deref()) {
+                sink.write_diagnostic(note);
+            }
             bootstrap::block_on(list::list(&sources, opts, filter, a.json, &mut stdout))?
         }
         SessionCommands::Show(a) => {

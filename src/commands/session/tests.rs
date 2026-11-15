@@ -476,6 +476,10 @@ async fn commands_run_against_any_source() {
         run_list(&sources, Workspace::Only("/elsewhere"), false)
             .await
             .trim(),
+        "no sessions in this workspace (--all for every workspace)"
+    );
+    assert_eq!(
+        run_list(&[], Workspace::All, false).await.trim(),
         "no sessions"
     );
 
@@ -597,6 +601,18 @@ async fn commands_run_against_any_source() {
         String::from_utf8(out).expect("utf-8"),
         format!("in-flight report for {b}\n")
     );
+}
+
+/// Item 12: outside a workspace `list` widens to every workspace on its own,
+/// and says so on stderr; `--all`, or a workspace to narrow to, says nothing.
+#[test]
+fn list_notes_when_it_widens_outside_a_workspace() {
+    assert_eq!(
+        list::scope_note(false, None),
+        Some("heph: not in a workspace; listing the sessions of every workspace\n")
+    );
+    assert_eq!(list::scope_note(true, None), None);
+    assert_eq!(list::scope_note(false, Some("/w/pacu")), None);
 }
 
 /// Item 9: every state's next step, as `show --json`'s `next` and as the

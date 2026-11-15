@@ -114,8 +114,15 @@ pub(crate) async fn list(
     if json {
         write_json(&shown, &every, opts, out)
     } else {
-        write_table(&shown, &every, opts, out)
+        write_table(&shown, &every, workspace, opts, out)
     }
+}
+
+/// The stderr line saying `list` widened to every workspace on its own: it
+/// was not given `--all`, but there is no workspace here to narrow to.
+pub(crate) fn scope_note(all: bool, workspace: Option<&str>) -> Option<&'static str> {
+    (!all && workspace.is_none())
+        .then_some("heph: not in a workspace; listing the sessions of every workspace\n")
 }
 
 fn write_json(
@@ -194,11 +201,16 @@ const HEADERS: [&str; 7] = [
 fn write_table(
     shown: &[&SessionEntry],
     every: &[&SessionEntry],
+    workspace: Workspace<'_>,
     opts: ViewOpts,
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
     if shown.is_empty() {
-        writeln!(out, "no sessions").context("writing the session list")?;
+        let empty = match workspace {
+            Workspace::Only(_) => "no sessions in this workspace (--all for every workspace)",
+            Workspace::All => "no sessions",
+        };
+        writeln!(out, "{empty}").context("writing the session list")?;
         return Ok(());
     }
     // Live first, then ended; each by start.

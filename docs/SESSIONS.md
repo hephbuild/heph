@@ -30,7 +30,7 @@ prefix.
 
 | Command | Does | Exit |
 | --- | --- | --- |
-| `list` | One row per session of this workspace (`--all`: every workspace; outside a workspace, every one), live first: ID, WORKTREE, COMMAND, STATE, EXIT, PROGRESS, NOW. Reads `meta.json` and `status.json` only. | 0 |
+| `list` | One row per session of this workspace (`--all`: every workspace; outside a workspace, every one, with a note on stderr), live first: ID, WORKTREE, COMMAND, STATE, EXIT, PROGRESS, NOW. Reads `meta.json` and `status.json` only. | 0 |
 | `show <id>` | The TUI's frame printed once as text, then a "Stuck on" block: lock waits naming the session that holds the lock (followed to the root of the chain, falling back to the pid), admission waits, targets running over 30s, and one `Next:` line. | 0 |
 | `attach <id>` | The interactive TUI on the session, following it until it ends; `q` or Ctrl-C detaches and never cancels it. Without a terminal it follows in line form. | the session's exit code; 0 on detach |
 | `inflight <id>` | The session's in-flight report (what the `SIGQUIT` dump carries), asked for through the session directory; waits 5s. | 0 |
