@@ -1760,6 +1760,9 @@ pub struct TuiProgressView {
     stop_arm: crate::tui::stop_arm::StopArm,
     /// `--dashboard`: the finished run holds until `q` on any screen.
     pinned: bool,
+    /// The rows the approval banner took above the last dashboard frame:
+    /// where that frame's own rows start, for a click.
+    dash_top: u16,
 }
 
 /// Whose terminal a [`TuiProgressView`] draws on.
@@ -1883,6 +1886,7 @@ impl TuiProgressView {
             role: Role::Live { approval: None },
             stop_arm: crate::tui::stop_arm::StopArm::default(),
             pinned: false,
+            dash_top: 0,
         }
     }
 
@@ -2031,7 +2035,8 @@ impl TuiProgressView {
         // The banner never takes more than half the screen: the list is what
         // the dashboard is for.
         out.truncate(usize::from(rows / 2));
-        let left = rows.saturating_sub(u16::try_from(out.len()).unwrap_or(rows));
+        self.dash_top = u16::try_from(out.len()).unwrap_or(rows);
+        let left = rows.saturating_sub(self.dash_top);
         let (command, session, clock) = self.dashboard_title_parts(now_ms);
         let scope = self.list.scope;
         let tabs = self.state.dash.counts(scope);
@@ -2387,6 +2392,43 @@ impl TUIAppView for TuiProgressView {
     fn screen_key(&mut self, key: crate::tui::app::ScreenKey) {
         if let Some(t) = self.target.as_mut() {
             let _bound = t.key(key, &self.state.redact);
+        }
+    }
+
+    fn mouse(&mut self, input: crate::tui::app::MouseInput) {
+        use crate::tui::app::MouseInput;
+        use crate::tui::dashboard::{ListHit, TargetClick, WHEEL_ROWS};
+        if !self.dashboard_open {
+            return;
+        }
+        match (input, self.target.as_mut()) {
+            (MouseInput::Click { col, row }, Some(t)) => {
+                if t.click(col, row) == TargetClick::Back {
+                    self.back_to_main();
+                }
+            }
+            (MouseInput::Wheel { down, .. }, Some(t)) => t.wheel(down),
+            // The approval banner above the list takes no click: approve
+            // and reject stay on y/n.
+            (MouseInput::Click { col, row }, None) => {
+                let Some(row) = row.checked_sub(self.dash_top) else {
+                    return;
+                };
+                match self.list.hit(col, row) {
+                    Some(ListHit::Tab(tab)) => self.list.set_tab(tab),
+                    // A second click on the selected row opens it, like
+                    // enter: no double-click timing.
+                    Some(ListHit::Row(id)) if self.list.selected() == Some(id) => {
+                        self.open_selected(false);
+                    }
+                    Some(ListHit::Row(id)) => self.list.select(id),
+                    None => {}
+                }
+            }
+            (MouseInput::Wheel { down, .. }, None) => {
+                let delta = if down { WHEEL_ROWS } else { -WHEEL_ROWS };
+                self.list.wheel(&self.state.dash, delta);
+            }
         }
     }
 

@@ -236,6 +236,26 @@ pub struct ListState {
     visible: Vec<Id>,
     /// Rows the last frame had room for.
     page: usize,
+    /// Where the last frame drew the tabs and the rows, for a click.
+    pub(crate) drawn: Drawn,
+}
+
+/// Where a dashboard frame put what a click can hit, in the frame's rows.
+#[derive(Debug, Default)]
+pub(crate) struct Drawn {
+    /// The tab row, when the frame had room for it, and its tabs' columns.
+    pub tabs_row: Option<u16>,
+    pub tabs: super::header::TabHits,
+    /// The row of the first entry of [`ListState::visible`]; the rest
+    /// follow one per row.
+    pub rows_top: u16,
+}
+
+/// What a click on the dashboard landed on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListHit {
+    Tab(Tab),
+    Row(Id),
 }
 
 impl Default for ListState {
@@ -251,6 +271,7 @@ impl Default for ListState {
             matches: Vec::new(),
             visible: Vec::new(),
             page: 1,
+            drawn: Drawn::default(),
         }
     }
 }
@@ -354,6 +375,43 @@ impl ListState {
             .unwrap_or(0);
         let to = at.saturating_add_signed(delta).min(len - 1);
         self.selected = self.row(model, to);
+    }
+
+    /// A click selected `id`.
+    pub fn select(&mut self, id: Id) {
+        self.selected = Some(id);
+    }
+
+    /// The wheel: move the window by `delta` rows, and the selection with
+    /// it only as far as keeps it on screen.
+    pub fn wheel(&mut self, model: &Model, delta: isize) {
+        let len = self.len(model);
+        self.offset = self
+            .offset
+            .saturating_add_signed(delta)
+            .min(len.saturating_sub(self.page));
+        let Some(at) = self.selected.and_then(|id| self.index_of(model, id)) else {
+            return;
+        };
+        let last = (self.offset + self.page).min(len).saturating_sub(1);
+        let keep = at.clamp(self.offset, last.max(self.offset));
+        if keep != at {
+            self.selected = self.row(model, keep);
+        }
+    }
+
+    /// What the last frame drew at `(col, row)` of the frame.
+    pub fn hit(&self, col: u16, row: u16) -> Option<ListHit> {
+        let d = &self.drawn;
+        if d.tabs_row == Some(row) {
+            return d
+                .tabs
+                .iter()
+                .find(|(cols, _)| cols.contains(&col))
+                .map(|&(_, tab)| ListHit::Tab(tab));
+        }
+        let k = usize::from(row.checked_sub(d.rows_top)?);
+        self.visible.get(k).map(|&id| ListHit::Row(id))
     }
 
     /// Thin the tab by the filter (cached per filter string) and settle the

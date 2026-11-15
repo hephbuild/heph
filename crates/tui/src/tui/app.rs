@@ -208,6 +208,16 @@ pub enum ScreenKey {
     PageDown,
 }
 
+/// A mouse event on a full screen, at a cell of the last frame drawn
+/// (column, row; 0-based). Only presses and the wheel are captured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseInput {
+    /// The left button went down.
+    Click { col: u16, row: u16 },
+    /// One wheel step, `down` (towards the end) or up.
+    Wheel { col: u16, row: u16, down: bool },
+}
+
 /// Aggregates the engine's build-event stream and renders progress in the
 /// interactive TUI. The renderer drives the terminal lifecycle and feeds events
 /// in; *what* gets drawn is entirely the view's call.
@@ -269,6 +279,11 @@ pub trait TUIAppView: Send {
     /// A full screen's own key (the target Log tab's `f g G w n N`, End,
     /// Home, Page Up/Down). No-op by default.
     fn screen_key(&mut self, _key: ScreenKey) {}
+
+    /// A click or a wheel step on the full screen, matched against what the
+    /// last [`Self::render_full`] drew. Everything a click does has a key;
+    /// no click decides an approval. No-op by default.
+    fn mouse(&mut self, _input: MouseInput) {}
 
     /// Cycle the body view (the `Tab` / `Shift+Tab` keys). `forward` advances to
     /// the next view, otherwise the previous. Called from the backend's key

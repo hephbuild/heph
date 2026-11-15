@@ -5,7 +5,10 @@ use std::time::{Duration, Instant};
 
 use ansi_to_tui::IntoText;
 use anyhow::Context;
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
@@ -19,7 +22,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::{Terminal, TerminalOptions, Viewport};
 use tokio::sync::mpsc;
 
-use crate::tui::app::{App, AppContext, Control, ScreenKey, TUIAppView};
+use crate::tui::app::{App, AppContext, Control, MouseInput, ScreenKey, TUIAppView};
 use crate::tui::log_sink::{LogSink, REPLAY_FLUSH_TIMEOUT, ReplayMark, Replayed, SinkLine};
 use crate::tui::session::recorder::ViewTap;
 use crate::tui::session::{SessionSlot, TappedReceiver};
@@ -48,6 +51,31 @@ static ALT_SCREEN_UP: AtomicBool = AtomicBool::new(false);
 /// saved it. The byte string the hard abort writes with `libc::write`.
 const LEAVE_ALT_SCREEN: &[u8] = b"\x1b[?1049l";
 
+/// Whether heph has the mouse captured, as [`ALT_SCREEN_UP`] is for the
+/// screen: set (Release) before the capture is written, cleared (Release)
+/// after it is turned off, read (Acquire) by the hard abort. A race costs
+/// at worst one extra "off", never a capture left on.
+static MOUSE_UP: AtomicBool = AtomicBool::new(false);
+
+/// Button presses (1000) reported in SGR encoding (1006). Not crossterm's
+/// `EnableMouseCapture`, which also turns on any-motion reporting (1003): an
+/// event for every cell the pointer crosses.
+const MOUSE_ON: &[u8] = b"\x1b[?1000h\x1b[?1006h";
+/// Both modes off; also what the hard abort writes.
+const MOUSE_OFF: &[u8] = b"\x1b[?1000l\x1b[?1006l";
+
+/// Whether the full screens capture the mouse: yes, unless `HEPH_NO_MOUSE`
+/// is set to anything but `0` or nothing. No config key (spec decision).
+fn mouse_wanted() -> bool {
+    std::env::var_os("HEPH_NO_MOUSE").is_none_or(|v| v.is_empty() || v == "0")
+}
+
+fn write_stderr(bytes: &[u8]) -> io::Result<()> {
+    let mut e = io::stderr().lock();
+    e.write_all(bytes)?;
+    e.flush()
+}
+
 /// A full screen while it is up: the alternate screen, and a full-screen
 /// terminal drawing on it.
 ///
@@ -66,9 +94,10 @@ struct FullScreen {
 }
 
 impl FullScreen {
-    /// Switch to the alternate screen. A full-screen viewport asks the
-    /// terminal nothing (its size is an ioctl), so this sends no query.
-    fn enter() -> anyhow::Result<Self> {
+    /// Switch to the alternate screen, and capture the mouse on it when
+    /// `mouse`. A full-screen viewport asks the terminal nothing (its size
+    /// is an ioctl), so this sends no query.
+    fn enter(mouse: bool) -> anyhow::Result<Self> {
         let terminal = Terminal::with_options(
             StderrBackend::new(io::stderr()),
             TerminalOptions {
@@ -76,18 +105,30 @@ impl FullScreen {
             },
         )
         .context("building the full-screen terminal")?;
+        // Each flag goes up before its write, so a hard abort in between
+        // undoes a mode that may not be on yet rather than miss one that is.
+        ALT_SCREEN_UP.store(true, Ordering::Release);
+        // Built before the write: from here on dropping it is the restore,
+        // the `?` below included.
+        let screen = Self { terminal };
         crossterm::execute!(io::stderr(), EnterAlternateScreen)
             .context("entering the alternate screen")?;
-        ALT_SCREEN_UP.store(true, Ordering::Release);
-        Ok(Self { terminal })
+        if mouse {
+            MOUSE_UP.store(true, Ordering::Release);
+            write_stderr(MOUSE_ON).context("capturing the mouse")?;
+        }
+        Ok(screen)
     }
 }
 
 impl Drop for FullScreen {
     fn drop(&mut self) {
-        // Cleared after the write, so a hard abort racing this drop writes a
-        // second `?1049l` at worst — harmless on the main screen — and never
-        // exits with the alternate screen up.
+        // The mouse off before the screen is left, both written whether or
+        // not they were turned on (harmless when off). Each flag is cleared
+        // after its write, so a hard abort racing this drop writes a second
+        // "off" at worst and never exits with either mode on.
+        drop(write_stderr(MOUSE_OFF));
+        MOUSE_UP.store(false, Ordering::Release);
         drop(crossterm::execute!(io::stderr(), LeaveAlternateScreen));
         ALT_SCREEN_UP.store(false, Ordering::Release);
         // A panic unwinding [`run`] on this thread: the hook printed it onto
@@ -284,6 +325,8 @@ pub async fn run<A: App + 'static>(
     terminal.autoresize()?;
     // The dashboard's screen while it is up; dropping it is the restore.
     let mut full: Option<FullScreen> = None;
+    // Read once: whether the full screens capture the mouse.
+    let mouse = mouse_wanted();
     let mut replay = Replay::default();
 
     let mut events: Option<EventStream> = Some(EventStream::new());
@@ -613,6 +656,14 @@ pub async fn run<A: App + 'static>(
                             view.back_to_main();
                         }
                     }
+                    // The mouse, captured only while a full screen is up: a
+                    // report still in flight as it closed lands here with
+                    // the line up, and is dropped.
+                    Some(Ok(Event::Mouse(m))) if full.is_some() => {
+                        if let Some(input) = mouse_input(m) {
+                            view.mouse(input);
+                        }
+                    }
                     Some(Ok(Event::Resize(w, h))) => {
                         // Cheap: just record. The terminal re-anchor (which does a
                         // DSR cursor query that must not race the EventStream) is
@@ -718,7 +769,7 @@ pub async fn run<A: App + 'static>(
                         for line in queued.iter().filter(|l| l.seq > replay.through) {
                             print_log_bytes(&mut terminal, &line.bytes, cols);
                         }
-                        match FullScreen::enter() {
+                        match FullScreen::enter(mouse) {
                             Ok(f) => {
                                 full = Some(f);
                                 replay.mark = Some(mark);
@@ -880,6 +931,29 @@ pub async fn run<A: App + 'static>(
 /// escape bytes land in redirected output.
 /// Whether background work no longer holds the exit: the loop's break
 /// predicate once the app has finished.
+/// What a captured mouse event means to a full screen: a left press or a
+/// wheel step. Releases (mode 1000 reports them), other buttons and
+/// modified presses mean nothing.
+fn mouse_input(m: MouseEvent) -> Option<MouseInput> {
+    let (col, row) = (m.column, m.row);
+    match m.kind {
+        MouseEventKind::Down(MouseButton::Left) if m.modifiers.is_empty() => {
+            Some(MouseInput::Click { col, row })
+        }
+        MouseEventKind::ScrollUp => Some(MouseInput::Wheel {
+            col,
+            row,
+            down: false,
+        }),
+        MouseEventKind::ScrollDown => Some(MouseInput::Wheel {
+            col,
+            row,
+            down: true,
+        }),
+        _ => None,
+    }
+}
+
 /// The full-screen key `code` stands for, if any.
 fn screen_key(code: KeyCode) -> Option<ScreenKey> {
     Some(match code {
@@ -925,9 +999,18 @@ fn record_raw_mode_restore() {
     // SAFETY: `tcgetattr` returned success above, so `termios` is initialized.
     let termios = unsafe { termios.assume_init() };
     hcore::shutdown::set_terminal_restore(move || {
-        // The dashboard's alternate screen first: `process::exit` runs no
-        // destructor, so [`FullScreen`]'s drop never will. Leaving it puts
-        // the main screen and its scrollback back before the notice below.
+        // The dashboard's mouse capture and alternate screen first:
+        // `process::exit` runs no destructor, so [`FullScreen`]'s drop never
+        // will. A capture left on would turn every click in the user's
+        // shell into escape codes; leaving the screen puts the main screen
+        // and its scrollback back before the notice below.
+        if MOUSE_UP.load(Ordering::Acquire) {
+            // SAFETY: as for the notice below — a valid pointer for exactly
+            // its own length, and a short write is ignored.
+            unsafe {
+                libc::write(fd, MOUSE_OFF.as_ptr().cast(), MOUSE_OFF.len());
+            }
+        }
         if ALT_SCREEN_UP.load(Ordering::Acquire) {
             // SAFETY: as for the notice below — a valid pointer for exactly
             // its own length, and a short write is ignored.

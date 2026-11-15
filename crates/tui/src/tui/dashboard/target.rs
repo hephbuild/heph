@@ -4,6 +4,7 @@
 //! render task (I7). Nothing drawn names a path into heph's home (I9).
 
 use std::collections::BTreeSet;
+use std::ops::Range;
 use std::sync::Arc;
 
 use hcore::events::{AdmittedKind, display_amount, unit_of};
@@ -94,6 +95,46 @@ pub struct TargetScreen {
     /// body rows it showed: what Enter expands.
     folds: Vec<(usize, String)>,
     body_rows: usize,
+    /// Where the last frame drew what a click can hit.
+    drawn: Drawn,
+}
+
+/// The breadcrumb that starts the tab row; a click on it goes back.
+const BACK: &str = " ◂ esc  ";
+/// The tab row's place in the frame, and the first body row's.
+const TABS_ROW: u16 = 2;
+const BODY_TOP: u16 = 4;
+/// Rows one wheel step moves.
+pub const WHEEL_ROWS: isize = 3;
+
+/// Where a target frame put the tab row's labels, how tall it was, and how
+/// many body rows it filled.
+#[derive(Debug)]
+struct Drawn {
+    tabs: [(Range<u16>, TargetTab); 3],
+    rows: u16,
+    body_shown: usize,
+}
+
+impl Default for Drawn {
+    fn default() -> Self {
+        Self {
+            tabs: TargetTab::ALL.map(|t| (0..0, t)),
+            rows: 0,
+            body_shown: 0,
+        }
+    }
+}
+
+/// What a click on a target screen did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetClick {
+    /// The breadcrumb: back to the list, like esc.
+    Back,
+    /// A tab switched, or a folded group expanded.
+    Done,
+    /// Nothing there.
+    Nothing,
 }
 
 impl TargetScreen {
@@ -120,7 +161,55 @@ impl TargetScreen {
             expanded: BTreeSet::new(),
             folds: Vec::new(),
             body_rows: 0,
+            drawn: Drawn::default(),
         }
+    }
+
+    /// A click at `(col, row)` of the last frame: the breadcrumb, a tab, or
+    /// a folded group's "… N more files" row on Outputs.
+    pub fn click(&mut self, col: u16, row: u16) -> TargetClick {
+        let d = &self.drawn;
+        // The tab row is there while the hint row still fits under it.
+        if row == TABS_ROW && d.rows > TABS_ROW + 1 {
+            if usize::from(col) < width(BACK.trim_end()) {
+                return TargetClick::Back;
+            }
+            let Some(&(_, tab)) = d.tabs.iter().find(|(cols, _)| cols.contains(&col)) else {
+                return TargetClick::Nothing;
+            };
+            if tab != self.tab {
+                self.pane.search_cancel();
+                self.tab = tab;
+                self.scroll = 0;
+            }
+            return TargetClick::Done;
+        }
+        if self.tab != TargetTab::Outputs {
+            return TargetClick::Nothing;
+        }
+        let Some(k) = row.checked_sub(BODY_TOP).map(usize::from) else {
+            return TargetClick::Nothing;
+        };
+        if k >= d.body_shown {
+            return TargetClick::Nothing;
+        }
+        let at = self.scroll + k;
+        match self.folds.iter().find(|(r, _)| *r == at) {
+            Some((_, group)) => {
+                self.expanded.insert(group.clone());
+                TargetClick::Done
+            }
+            None => TargetClick::Nothing,
+        }
+    }
+
+    /// One wheel step, `down` or up: the Log pane (up stops following, as
+    /// ↑ does; down while following stays at the end), else the body.
+    pub fn wheel(&mut self, down: bool) {
+        if down && self.tab == TargetTab::Log && self.pane.following() {
+            return;
+        }
+        self.scroll(if down { WHEEL_ROWS } else { -WHEEL_ROWS });
     }
 
     /// Enter on Outputs: expand the first folded group in view; with none
@@ -346,9 +435,11 @@ impl TargetScreen {
                 )
             }
         };
-        let (tabs, rule) = tab_rows(addr, self.tab, &status, c);
+        let (tabs, rule) = tab_rows(addr, self.tab, &status, c, &mut self.drawn.tabs);
         out.push(tabs);
         out.push(rule);
+        self.drawn.rows = rows;
+        self.drawn.body_shown = body.len().min(body_rows);
         out.extend(body.into_iter().take(body_rows));
         while out.len() < usize::from(rows.saturating_sub(2)) {
             out.push(Line::default());
@@ -383,10 +474,11 @@ fn tab_rows(
     active: TargetTab,
     status: &str,
     cols: usize,
+    hits: &mut [(Range<u16>, TargetTab); 3],
 ) -> (Line<'static>, Line<'static>) {
     let addr = cut_left(&clean_inline(addr), cols / 2).into_owned();
     let mut spans = vec![
-        Span::styled(" ◂ esc  ", dim()),
+        Span::styled(BACK, dim()),
         Span::styled(addr, Style::default().add_modifier(Modifier::BOLD)),
         Span::styled("  │  ", dim()),
     ];
@@ -398,6 +490,10 @@ fn tab_rows(
             at += 4;
         }
         let name = t.name();
+        if let Some(h) = hits.get_mut(i) {
+            let col = |c: usize| u16::try_from(c.min(cols)).unwrap_or(u16::MAX);
+            *h = (col(at)..col(at + width(name)), t);
+        }
         if t == active {
             mark = (at, width(name));
             spans.push(Span::styled(

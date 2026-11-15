@@ -32,9 +32,9 @@ pub use frame::{DASHBOARD_HINTS, dashboard_frame};
 pub use header::{Levels, Title, header_lines};
 pub use intern::Id;
 pub use list::{
-    LastLines, ListInputs, ListState, LogReader, TailRequest, TailUpdate, WaitWords, Waits,
-    list_lines, read_tails,
+    LastLines, ListHit, ListInputs, ListState, LogReader, TailRequest, TailUpdate, WaitWords,
+    Waits, list_lines, read_tails,
 };
 pub use model::{Gauge, Model, Record, RowState, Tab, TabCounts};
 pub use tails::TailReader;
-pub use target::{TargetInputs, TargetScreen, TargetTab};
+pub use target::{TargetClick, TargetInputs, TargetScreen, TargetTab, WHEEL_ROWS};

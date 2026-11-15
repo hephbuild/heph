@@ -229,15 +229,26 @@ fn title_spans(t: &Title<'_>, level: u8, command_cols: Option<usize>) -> Vec<Spa
     out
 }
 
-/// The tab row at `level`, and the active tab's columns for the rule.
+/// Where a click on the tab row lands: the columns each tab label covers,
+/// in the row's own columns. At the narrowest level, where only the active
+/// tab is drawn as `‹ Name n ›`, the arrows stand for the tabs either side.
+pub type TabHits = Vec<(std::ops::Range<u16>, Tab)>;
+
+fn cols_of(r: std::ops::Range<usize>) -> std::ops::Range<u16> {
+    u16::try_from(r.start).unwrap_or(u16::MAX)..u16::try_from(r.end).unwrap_or(u16::MAX)
+}
+
+/// The tab row at `level`, the active tab's columns for the rule, and every
+/// drawn tab's columns for a click.
 fn tabs_row(
     counts: &TabCounts,
     active: Tab,
     level: u8,
-) -> (Vec<Span<'static>>, std::ops::Range<usize>) {
+) -> (Vec<Span<'static>>, std::ops::Range<usize>, TabHits) {
     let mut out = vec![Span::raw("  ")];
     let mut at = 2;
     let mut range = 0..0;
+    let mut hits = TabHits::with_capacity(Tab::LIST.len());
     let gap = if level == 0 { "    " } else { "  " };
     let tab_text = |tab: Tab, named: bool| -> String {
         let n = counts.tab(tab);
@@ -263,8 +274,12 @@ fn tabs_row(
     if level >= 3 {
         let text = format!("‹ {} ›", tab_text(active, true));
         range = at..at + width(&text);
+        let last = range.end.saturating_sub(1);
+        hits.push((cols_of(at..at + 1), active.cycle(false)));
+        hits.push((cols_of(at + 1..last), active));
+        hits.push((cols_of(last..range.end), active.cycle(true)));
         out.push(Span::styled(text, style(active)));
-        return (out, range);
+        return (out, range, hits);
     }
     for (i, &tab) in Tab::LIST.iter().enumerate() {
         if i > 0 {
@@ -276,10 +291,11 @@ fn tabs_row(
         if tab == active {
             range = at..at + w;
         }
+        hits.push((cols_of(at..at + w), tab));
         at += w;
         out.push(Span::styled(text, style(tab)));
     }
-    (out, range)
+    (out, range, hits)
 }
 
 fn rule(cols: usize, active: std::ops::Range<usize>) -> Line<'static> {
@@ -304,6 +320,19 @@ pub fn header_lines(
     active: Tab,
     cols: u16,
 ) -> ([Line<'static>; 4], Levels) {
+    let (lines, lv, _) = header_lines_hits(title, gauges, counts, active, cols);
+    (lines, lv)
+}
+
+/// [`header_lines`], and where each tab on its third row (the tab row) is,
+/// for a click.
+pub fn header_lines_hits(
+    title: &Title<'_>,
+    gauges: &[&Gauge],
+    counts: &TabCounts,
+    active: Tab,
+    cols: u16,
+) -> ([Line<'static>; 4], Levels, TabHits) {
     let cols = usize::from(cols);
     // The title and gauge rows start one column in.
     let inner = cols.saturating_sub(1);
@@ -373,7 +402,7 @@ pub fn header_lines(
     };
 
     // Tab row.
-    let mut tabs = (Vec::new(), 0..0);
+    let mut tabs = (Vec::new(), 0..0, TabHits::new());
     for level in 0..=3u8 {
         tabs = tabs_row(counts, active, level);
         lv.tabs = level;
@@ -395,6 +424,7 @@ pub fn header_lines(
             rule,
         ],
         lv,
+        tabs.2,
     )
 }
 

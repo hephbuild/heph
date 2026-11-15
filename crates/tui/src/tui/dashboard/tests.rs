@@ -1036,3 +1036,278 @@ fn frame_does_no_io_target_screens() {
         "read on the frame's thread"
     );
 }
+
+/// One full-screen frame of the whole view, `cols` × `rows`, at `T0 + 10s`.
+fn view_frame(v: &mut crate::tui::TuiProgressView, cols: u16, rows: u16) -> Vec<String> {
+    use crate::tui::app::TUIAppView;
+    v.render_full(T0 + 10_000, cols, rows)
+        .iter()
+        .map(text)
+        .collect()
+}
+
+/// The cell where `needle` first starts on frame row `row`, if it is there.
+fn cell_in(f: &[String], row: usize, needle: &str) -> Option<(u16, u16)> {
+    let line = f.get(row)?;
+    let at = line.find(needle)?;
+    let col = crate::tui::text::width(line.get(..at)?);
+    Some((u16::try_from(col).ok()?, u16::try_from(row).ok()?))
+}
+
+/// The cell where `needle` first starts on any row.
+fn cell_of(f: &[String], needle: &str) -> (u16, u16) {
+    (0..f.len())
+        .find_map(|r| cell_in(f, r, needle))
+        .unwrap_or_else(|| panic!("{needle} in {f:#?}"))
+}
+
+/// The columns the rule under a tab row marks heavy: the active tab.
+fn heavy(rule: &str) -> std::ops::Range<u16> {
+    let mut cols = rule
+        .chars()
+        .enumerate()
+        .filter(|&(_, c)| c == '━')
+        .filter_map(|(i, _)| u16::try_from(i).ok());
+    let start = cols.next().unwrap_or(0);
+    start..cols.last().unwrap_or(start) + 1
+}
+
+fn click(v: &mut crate::tui::TuiProgressView, (col, row): (u16, u16)) {
+    use crate::tui::app::{MouseInput, TUIAppView};
+    v.mouse(MouseInput::Click { col, row });
+}
+
+fn wheel(v: &mut crate::tui::TuiProgressView, down: bool) {
+    use crate::tui::app::{MouseInput, TUIAppView};
+    v.mouse(MouseInput::Wheel {
+        col: 10,
+        row: 10,
+        down,
+    });
+}
+
+/// Three targets (done, running, pending) and a reader whose done target
+/// has a folded output group.
+fn mouse_view() -> crate::tui::TuiProgressView {
+    let reader = Arc::new(StubReader::default());
+    let files: Vec<OutputFile> = (1..=5)
+        .map(|i| file(&format!("gen/f{i}.rs"), i * 1_000))
+        .collect();
+    reader.set_outputs(
+        "//m:a",
+        OutputsFound::Listing(vec![OutputGroup {
+            name: "rust".into(),
+            size: 15_000,
+            hash: None,
+            files,
+            unavailable: None,
+        }]),
+    );
+    let mut v = crate::tui::TuiProgressView::new("heph r build //m:...")
+        .with_target_reader(reader as Arc<dyn TargetReader>);
+    for e in [
+        at(0, matched(&["//m:a", "//m:b", "//m:c"])),
+        at(0, start("//m:a")),
+        at(0, exec("//m:a")),
+        at(1_000, exec_end("//m:a")),
+        at(1_000, end("//m:a", None, None)),
+        at(0, start("//m:b")),
+        at(0, exec("//m:b")),
+    ] {
+        crate::tui::app::TUIAppView::apply(&mut v, &e);
+    }
+    v.open_dashboard();
+    v
+}
+
+/// Clicks do what the keys do, on the element the last frame drew there:
+/// each dashboard tab, a row (once selects, again opens), the target tabs,
+/// the breadcrumb, a folded output group; after a resize, the new layout.
+/// No click anywhere resolves an approval.
+#[test]
+fn mouse_clicks_hit_the_drawn_element() {
+    let (cols, rows) = (120, 30);
+    let mut v = mouse_view();
+
+    // Each dashboard tab, by its label on the tab row.
+    for name in ["Running", "Pending", "Failed", "Done", "Cached", "All"] {
+        let f = view_frame(&mut v, cols, rows);
+        let at = cell_in(&f, 2, name).unwrap_or_else(|| panic!("{name}: {f:#?}"));
+        click(&mut v, at);
+        let f = view_frame(&mut v, cols, rows);
+        assert!(heavy(&f[3]).contains(&at.0), "{name}: {f:#?}");
+    }
+
+    // A row: the first click selects it, the second opens it.
+    let f = view_frame(&mut v, cols, rows);
+    let c = cell_of(&f, "//m:c");
+    assert!(!f[usize::from(c.1)].starts_with(" ▸"), "{f:#?}");
+    click(&mut v, c);
+    let f = view_frame(&mut v, cols, rows);
+    assert!(f[usize::from(c.1)].starts_with(" ▸"), "selected: {f:#?}");
+    assert!(cell_in(&f, 2, "◂ esc").is_none(), "one click opens nothing");
+    click(&mut v, c);
+    let f = view_frame(&mut v, cols, rows);
+    assert!(
+        cell_in(&f, 2, "◂ esc").is_some() && f[2].contains("//m:c"),
+        "the second click opens it: {f:#?}"
+    );
+
+    // The target screen's tabs, then the breadcrumb back to the list.
+    for name in ["Log", "Outputs", "Overview"] {
+        let at = cell_in(&f, 2, name).unwrap_or_else(|| panic!("{name}: {f:#?}"));
+        click(&mut v, at);
+        let g = view_frame(&mut v, cols, rows);
+        assert!(heavy(&g[3]).contains(&at.0), "{name}: {g:#?}");
+    }
+    click(&mut v, cell_of(&f, "◂ esc"));
+    let f = view_frame(&mut v, cols, rows);
+    assert!(
+        cell_in(&f, 2, "◂ esc").is_none() && f.iter().any(|l| l.contains("TARGET")),
+        "back on the list: {f:#?}"
+    );
+
+    // A folded group on the done target's Outputs.
+    let a = cell_of(&f, "//m:a");
+    click(&mut v, a);
+    click(&mut v, a);
+    let f = view_frame(&mut v, cols, rows);
+    click(&mut v, cell_in(&f, 2, "Outputs").expect("Outputs tab"));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let f = loop {
+        let f = view_frame(&mut v, cols, rows);
+        if f.iter().any(|l| l.contains("more files")) {
+            break f;
+        }
+        assert!(std::time::Instant::now() < deadline, "{f:#?}");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    assert!(!f.iter().any(|l| l.contains("gen/f4.rs")), "{f:#?}");
+    // Off the fold's row: nothing expands.
+    click(&mut v, (5, u16::try_from(f.len() - 3).unwrap_or(0)));
+    assert!(
+        !view_frame(&mut v, cols, rows)
+            .iter()
+            .any(|l| l.contains("gen/f4.rs"))
+    );
+    click(&mut v, cell_of(&f, "more files"));
+    let f = view_frame(&mut v, cols, rows);
+    assert!(
+        f.iter().any(|l| l.contains("gen/f4.rs")) && !f.iter().any(|l| l.contains("more files")),
+        "expanded: {f:#?}"
+    );
+    click(&mut v, cell_of(&f, "◂ esc"));
+
+    // A narrower terminal draws the tabs elsewhere; a click reads the
+    // frame it drew.
+    let wide = view_frame(&mut v, cols, rows);
+    let narrow = view_frame(&mut v, 60, rows);
+    let failed = cell_in(&narrow, 2, "✗").unwrap_or_else(|| panic!("{narrow:#?}"));
+    assert_ne!(Some(failed), cell_in(&wide, 2, "✗"), "the layout moved");
+    click(&mut v, failed);
+    let f = view_frame(&mut v, 60, rows);
+    assert!(heavy(&f[3]).contains(&failed.0), "{f:#?}");
+}
+
+/// No click anywhere decides an approval: a pending request survives a
+/// click on every cell of every screen the clicks reach, and a row under
+/// the approval banner is hit where it is drawn.
+#[test]
+fn mouse_clicks_never_decide_an_approval() {
+    let center = crate::tui::approval::ApprovalCenter::new();
+    let ticket = center.request(&center.build(), "//m:gate".into(), Vec::new());
+    let mut v = mouse_view().with_approval(center.clone());
+    let (cols, rows) = (100, 24);
+
+    // Under the banner, the list's rows are where they are drawn.
+    let f = view_frame(&mut v, cols, rows);
+    let c = cell_of(&f, "//m:c ");
+    assert!(c.1 > 5, "the banner is above the list: {f:#?}");
+    assert!(!f[usize::from(c.1)].starts_with(" ▸"), "{f:#?}");
+    click(&mut v, c);
+    let f = view_frame(&mut v, cols, rows);
+    assert!(f[usize::from(c.1)].starts_with(" ▸"), "{f:#?}");
+
+    for row in 0..rows {
+        for col in 0..cols {
+            click(&mut v, (col, row));
+            drop(view_frame(&mut v, cols, rows));
+        }
+    }
+    assert!(center.is_active(), "the request is still pending");
+    assert_eq!(
+        center.current().map(|c| c.addr),
+        Some("//m:gate".to_owned())
+    );
+    drop(ticket);
+}
+
+/// The wheel scrolls the list with the selection kept on screen, and the
+/// Log; up in a following Log stops following, down leaves it following.
+#[test]
+fn wheel_scrolls_and_stops_following() {
+    // The list: 40 pending targets in a 14-row frame.
+    let addrs: Vec<String> = (0..40).map(|i| format!("//w:t{i:02}")).collect();
+    let refs: Vec<&str> = addrs.iter().map(String::as_str).collect();
+    let mut v = crate::tui::TuiProgressView::new("heph r build //w:...");
+    crate::tui::app::TUIAppView::apply(&mut v, &at(0, matched(&refs)));
+    v.open_dashboard();
+    let selected = |f: &[String]| -> Option<String> {
+        f.iter()
+            .find(|l| l.starts_with(" ▸"))
+            .and_then(|l| l.split_whitespace().find(|w| w.starts_with("//")))
+            .map(str::to_owned)
+    };
+    let f = view_frame(&mut v, 100, 14);
+    assert!(f.iter().any(|l| l.contains("1–5 of 40")), "{f:#?}");
+    assert_eq!(selected(&f).as_deref(), Some("//w:t00"));
+    wheel(&mut v, true);
+    let f = view_frame(&mut v, 100, 14);
+    assert!(f.iter().any(|l| l.contains("4–8 of 40")), "{f:#?}");
+    assert_eq!(selected(&f).as_deref(), Some("//w:t03"), "kept on screen");
+    for _ in 0..20 {
+        wheel(&mut v, true);
+    }
+    let f = view_frame(&mut v, 100, 14);
+    assert!(
+        f.iter().any(|l| l.contains("36–40 of 40")),
+        "the end: {f:#?}"
+    );
+    wheel(&mut v, false);
+    let f = view_frame(&mut v, 100, 14);
+    assert!(f.iter().any(|l| l.contains("33–37 of 40")), "{f:#?}");
+    // t35 is still in the window (32–36): the wheel leaves it selected.
+    assert_eq!(selected(&f).as_deref(), Some("//w:t35"), "still on screen");
+
+    // The Log: 200 lines, following its end.
+    let s = fold(&[
+        at(0, start("//w:log")),
+        at(0, exec("//w:log")),
+        at(1_000, exec_end("//w:log")),
+        at(1_000, end("//w:log", None, None)),
+    ]);
+    let reader = Arc::new(StubReader::default());
+    let log: String = (1..=200).map(|i| format!("line {i}\n")).collect();
+    reader.set_log("//w:log", log.as_bytes());
+    let r = Redact::default();
+    let mut t = open_on(&s, "//w:log", TargetTab::Log, Some(reader));
+    let shows = |f: &[String], n: u32| {
+        f.iter()
+            .any(|l| l.trim_end().ends_with(&format!("line {n}")))
+    };
+    let f = target_frame_until(&s, &mut t, &r, |f| shows(f, 200));
+    let first = (1..=200).find(|&n| shows(&f, n)).expect("a line in view");
+    t.wheel(true);
+    let f = target_frame(&s, &mut t, 10_000, &r);
+    assert!(
+        shows(&f, 200),
+        "down while following stays at the end: {f:#?}"
+    );
+    t.wheel(false);
+    let f = target_frame(&s, &mut t, 10_000, &r);
+    assert!(!shows(&f, 200), "up stops following: {f:#?}");
+    assert!(shows(&f, first - 3), "three lines up: {f:#?}");
+    t.wheel(true);
+    let f = target_frame(&s, &mut t, 10_000, &r);
+    assert!(shows(&f, first), "down scrolls back: {f:#?}");
+}
