@@ -411,6 +411,11 @@ pub(crate) struct RunLog {
     /// Set (Release) after the last write to the file; a follower loads it
     /// (Acquire) before its final read to EOF.
     ended: AtomicBool,
+    /// Set (Release) when an imported log was renamed over the live path,
+    /// before `ended`: a follower that saw `ended` reads it to tell that the
+    /// file it holds is one whole log, streamed or imported, and must not be
+    /// continued in the entry.
+    replaced: AtomicBool,
     /// Bytes written after the log was finalized, and dropped.
     discarded: AtomicU64,
     /// Where the file is registered for the log API once it is created.
@@ -422,6 +427,9 @@ struct State {
     /// Whether the file was ever created, so the guard unlinks only a file
     /// that exists.
     created: bool,
+    /// The guard dropped: the live path is unlinked, or about to be, and an
+    /// import still running must not rename a file back over it.
+    abandoned: bool,
     needles: Option<Arc<Needles>>,
     out: Option<Redactor>,
     err: Option<Redactor>,
@@ -466,6 +474,7 @@ impl RunLog {
             state: Mutex::new(State {
                 file: Live::Unopened,
                 created: false,
+                abandoned: false,
                 needles: None,
                 out: None,
                 err: None,
@@ -474,6 +483,7 @@ impl RunLog {
                 announce,
             }),
             ended: AtomicBool::new(false),
+            replaced: AtomicBool::new(false),
             discarded: AtomicU64::new(0),
             registration: None,
         }
@@ -528,8 +538,13 @@ impl RunLog {
         self.ended.load(Ordering::Acquire)
     }
 
+    /// Whether an imported log replaced the streamed one. Read after
+    /// [`Self::ended`]: stored before it.
+    pub(crate) fn replaced(&self) -> bool {
+        self.replaced.load(Ordering::Acquire)
+    }
+
     /// Bytes written after the log was finalized, and dropped.
-    #[cfg_attr(not(test), expect(dead_code, reason = "read by the log API (unit 2)"))]
     pub(crate) fn discarded(&self) -> u64 {
         self.discarded.load(Ordering::Relaxed)
     }
@@ -601,10 +616,25 @@ impl RunLog {
         }
     }
 
-    /// End the run's log: flush both streams' held-back bytes, take the file
-    /// and set `ended`. Every later write is counted and discarded. `None`
-    /// when it was already finalized, or when the run wrote no byte.
+    /// End the run's log: [`Self::take_file`], then [`Self::mark_ended`].
     pub(crate) fn finalize(&self) -> Option<File> {
+        let file = self.take_file();
+        self.mark_ended();
+        file
+    }
+
+    /// Set `ended`: the file a follower holds has its last byte. After an
+    /// import, so a follower never takes the streamed file for finished while
+    /// the imported one is being renamed over it.
+    pub(crate) fn mark_ended(&self) {
+        self.ended.store(true, Ordering::Release);
+    }
+
+    /// Close the run's writes: flush both streams' held-back bytes and take
+    /// the file. Every later write is counted and discarded. `None` when it
+    /// was already taken, or when the run wrote no byte. Does not set
+    /// `ended` ([`Self::mark_ended`]).
+    pub(crate) fn take_file(&self) -> Option<File> {
         let mut st = self.state();
         let st = &mut *st;
         if matches!(st.file, Live::Ended) {
@@ -619,17 +649,10 @@ impl RunLog {
                 st.error = Some(e);
             }
         }
-        let file = match std::mem::replace(&mut st.file, Live::Ended) {
+        match std::mem::replace(&mut st.file, Live::Ended) {
             Live::Open(file) => Some(file),
             Live::Unopened | Live::Ended => None,
-        };
-        self.ended.store(true, Ordering::Release);
-        file
-    }
-
-    /// Whether the live file was ever created.
-    fn created(&self) -> bool {
-        self.state().created
+        }
     }
 
     /// The first error creating or writing the live file, taken.
@@ -637,12 +660,20 @@ impl RunLog {
         self.state().error.take()
     }
 
-    /// Replace the finalized live file's bytes with an older plugin's own
-    /// log, scrubbed: the returned file is complete, so it wins over what the
-    /// plugin streamed. A refused or unreadable source imports nothing and
-    /// leaves the live bytes as they are. `file` is `None` when the run
-    /// streamed nothing; a returned log with any bytes creates it, and a file
-    /// that cannot be created is the log's sticky error.
+    /// Replace the closed live file with an older plugin's own log, scrubbed:
+    /// the returned file is complete, so it wins over what the plugin
+    /// streamed. It is written whole into a sibling `<n>.log.import`, then
+    /// renamed over the live path, so the path, and a follower's open file,
+    /// is one whole log at every moment: the streamed one or the imported
+    /// one, never the streamed head continued by the imported rest.
+    ///
+    /// A refused or unreadable source imports nothing, and a failure part
+    /// way keeps the streamed bytes: the sibling is removed. An empty
+    /// returned log over a streamed one still wins. `file` is `None` when the
+    /// run streamed nothing; a returned log with any bytes then creates it,
+    /// and a file that cannot be created is the log's sticky error. Once
+    /// replaced, `file` is the imported file. Between [`Self::take_file`] and
+    /// [`Self::mark_ended`].
     pub(crate) fn import(
         &self,
         file: &mut Option<File>,
@@ -651,8 +682,14 @@ impl RunLog {
     ) -> Imported {
         let needles = self.state().needles.clone();
         let mut redactor = needles.map(Redactor::new);
-        let replaced = match source {
-            Returned::Bytes(bytes) => self.replace(file, &mut redactor, &mut bytes.as_slice()),
+        let mut tmp = ImportFile {
+            log: self,
+            path: self.import_path(),
+            file: None,
+            sticky: file.is_none(),
+        };
+        let copied = match source {
+            Returned::Bytes(bytes) => tmp.copy(&mut redactor, &mut bytes.as_slice()),
             Returned::File(path) => {
                 let mut src = match open_contained(&path, roots) {
                     Ok(Some(src)) => src,
@@ -662,26 +699,100 @@ impl RunLog {
                         return Imported::Unavailable;
                     }
                 };
-                self.replace(file, &mut redactor, &mut src)
+                tmp.copy(&mut redactor, &mut src)
             }
         };
-        match replaced {
-            Ok(()) => Imported::Replaced,
-            Err(e) => Imported::Failed(e),
+        // Nothing returned over something streamed: the empty log wins.
+        let copied = copied.and_then(|()| match file {
+            Some(_) => tmp.file().map(|_| ()),
+            None => Ok(()),
+        });
+        if let Err(e) = copied {
+            tmp.discard();
+            return Imported::Failed(e);
         }
+        let Some(imported) = tmp.file.take() else {
+            // Nothing streamed and nothing returned: still no file.
+            return Imported::Replaced;
+        };
+        // Under the lock, against the guard: either it dropped first and
+        // unlinked the live path, and nothing is renamed back over it, or the
+        // rename lands first and the guard sees `created` and unlinks it.
+        let mut st = self.state();
+        if st.abandoned {
+            drop(st);
+            tmp.discard();
+            return Imported::Abandoned;
+        }
+        if let Err(e) = std::fs::rename(&tmp.path, &self.path) {
+            drop(st);
+            tmp.discard();
+            return Imported::Failed(e);
+        }
+        st.created = true;
+        self.replaced.store(true, Ordering::Release);
+        drop(st);
+        *file = Some(imported);
+        Imported::Replaced
     }
 
-    /// Truncate `file` and write `src` into it, through `redactor`, creating
-    /// the file on the first byte when there is none.
-    fn replace(
-        &self,
-        file: &mut Option<File>,
-        redactor: &mut Option<Redactor>,
-        src: &mut dyn io::Read,
-    ) -> io::Result<()> {
-        if let Some(file) = file.as_mut() {
-            file.set_len(0)?;
+    /// Where an import is written before it is renamed over the live path.
+    fn import_path(&self) -> PathBuf {
+        let mut path = self.path.clone().into_os_string();
+        path.push(".import");
+        PathBuf::from(path)
+    }
+
+    /// Test seam: how chunks reach the live file.
+    #[cfg(test)]
+    fn set_write(&self, write: WriteFn) {
+        self.state().write = write;
+    }
+}
+
+/// The sibling file an import is written into, created by its first byte.
+struct ImportFile<'a> {
+    log: &'a RunLog,
+    path: PathBuf,
+    file: Option<File>,
+    /// The run streamed nothing: failing to create this file is the log's
+    /// sticky error, as failing to create the live file is.
+    sticky: bool,
+}
+
+impl ImportFile<'_> {
+    /// The file, created (and `runs/<id>/` with it) unless it is.
+    fn file(&mut self) -> io::Result<&mut File> {
+        if self.file.is_none() {
+            let created = self.log.dir.ensure().and_then(|()| {
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .open(&self.path)
+            });
+            let created = created.inspect_err(|e| {
+                let mut st = self.log.state();
+                if self.sticky && st.error.is_none() {
+                    st.error = Some(io::Error::new(e.kind(), e.to_string()));
+                }
+            })?;
+            self.file = Some(created);
         }
+        self.file
+            .as_mut()
+            .ok_or_else(|| io::Error::other("the import file was just created"))
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        self.file()?.write_all(bytes)
+    }
+
+    /// Write `src` through `redactor`.
+    fn copy(&mut self, redactor: &mut Option<Redactor>, src: &mut dyn io::Read) -> io::Result<()> {
         let mut buf = vec![0u8; 64 * 1024];
         loop {
             let n = match src.read(&mut buf) {
@@ -692,41 +803,23 @@ impl RunLog {
             };
             let chunk = buf.get(..n).unwrap_or_default();
             match redactor.as_mut() {
-                Some(r) => self.write_late(file, &r.push(chunk))?,
-                None => self.write_late(file, chunk)?,
+                Some(r) => self.write(&r.push(chunk))?,
+                None => self.write(chunk)?,
             }
         }
         if let Some(r) = redactor.as_mut() {
-            self.write_late(file, &r.finish())?;
+            self.write(&r.finish())?;
         }
         Ok(())
     }
 
-    /// Write into the finalized log's file, creating it for the first byte.
-    fn write_late(&self, file: &mut Option<File>, bytes: &[u8]) -> io::Result<()> {
-        if bytes.is_empty() {
-            return Ok(());
+    /// Remove the file, if it was made.
+    fn discard(self) {
+        if let Err(e) = std::fs::remove_file(&self.path)
+            && e.kind() != io::ErrorKind::NotFound
+        {
+            tracing::debug!(path = %self.path.display(), error = %e, "removing an unused log import");
         }
-        let file = match file {
-            Some(file) => file,
-            None => {
-                let created = self.create_file().inspect_err(|e| {
-                    let mut st = self.state();
-                    if st.error.is_none() {
-                        st.error = Some(io::Error::new(e.kind(), e.to_string()));
-                    }
-                })?;
-                self.state().created = true;
-                file.insert(created)
-            }
-        };
-        file.write_all(bytes)
-    }
-
-    /// Test seam: how chunks reach the live file.
-    #[cfg(test)]
-    fn set_write(&self, write: WriteFn) {
-        self.state().write = write;
     }
 }
 
@@ -744,8 +837,11 @@ pub(crate) enum Imported {
     /// Outside the sandbox, a symlink, not a regular file, or unreadable:
     /// "log unavailable", and nothing imported.
     Unavailable,
-    /// Reading or writing failed part way.
+    /// Reading or writing failed part way: the streamed bytes are kept.
     Failed(io::Error),
+    /// The run was dropped while its log was imported: its live file is
+    /// unlinked, and the import is not put back in its place.
+    Abandoned,
 }
 
 /// `path`, opened, if it is a regular file (not a symlink) inside one of
@@ -766,10 +862,16 @@ fn open_contained(path: &Path, roots: &[PathBuf]) -> io::Result<Option<File>> {
         tracing::debug!(path = %path.display(), "a returned log outside the sandbox; not read");
         return Ok(None);
     }
-    // No-follow, so a file swapped for a link after the check is refused.
+    // No-follow, so a file swapped for a link after the check is refused;
+    // non-blocking, so one swapped for a FIFO is opened without waiting for a
+    // writer, then refused below (the flag changes nothing for a regular
+    // file's reads). A directory above it swapped for a link between the
+    // check and the open is not caught: the sandbox is the run's own tree,
+    // and its run has returned, so only the plugin that wrote the log could
+    // race it, and it could have written the bytes it wanted read instead.
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(&real)?;
     if !file.metadata()?.is_file() {
         return Ok(None);
@@ -805,8 +907,23 @@ impl LiveGuard {
 impl Drop for LiveGuard {
     fn drop(&mut self) {
         drop(self.log.finalize());
-        // Finalized: no later write creates the file, so `created` is final.
-        if self.unlink && self.log.created() {
+        // Finalized, and marked abandoned under the lock an import renames
+        // under: no later write or import creates the file, so `created` is
+        // final.
+        let created = {
+            let mut st = self.log.state();
+            st.abandoned = true;
+            st.created
+        };
+        let discarded = self.log.discarded();
+        if discarded > 0 {
+            tracing::warn!(
+                path = %self.log.path.display(),
+                discarded,
+                "bytes written after the run's log was closed were dropped"
+            );
+        }
+        if self.unlink && created {
             if let Err(e) = std::fs::remove_file(&self.log.path)
                 && e.kind() != io::ErrorKind::NotFound
             {
@@ -822,7 +939,16 @@ pub(crate) fn fail_on_write_error<T>(log: &RunLog, run: anyhow::Result<T>) -> an
     match (run, log.take_error()) {
         (Ok(_), Some(e)) => Err(anyhow::Error::new(e)
             .context(format!("writing the run's log {}", log.path().display()))),
-        (run, _) => run,
+        // The run's own error wins, but the log is still incomplete: say so.
+        (Err(run), Some(e)) => {
+            tracing::warn!(
+                path = %log.path().display(),
+                error = %e,
+                "writing the run's log; the log may be incomplete"
+            );
+            Err(run)
+        }
+        (run, None) => run,
     }
 }
 
@@ -1306,6 +1432,51 @@ mod tests {
             b"returned",
             "the returned file wins"
         );
+        assert!(log.replaced());
+        assert_eq!(std::fs::read(log.path()).expect("read"), b"returned");
+        assert!(!log.import_path().exists(), "renamed into place");
+    }
+
+    /// The import is renamed over the live path whole: the streamed file a
+    /// follower holds keeps the streamed bytes, never a mix; an empty
+    /// returned log still wins.
+    #[test]
+    fn import_replaces_the_live_file_whole() {
+        let (_home, logs) = logs();
+        let (log, _guard) = logs.create();
+        log.write_chunk(Stream::Stdout, b"streamed", None);
+        let mut file = log.take_file();
+        let held = File::open(log.path()).expect("a follower's open file");
+        let imported = log.import(&mut file, Returned::Bytes(b"imported".to_vec()), &[]);
+        assert!(matches!(imported, Imported::Replaced), "{imported:?}");
+        assert!(!log.ended(), "ended only once marked");
+        assert_eq!(read_all(&held).expect("read"), b"streamed");
+        assert_eq!(std::fs::read(log.path()).expect("read"), b"imported");
+
+        let (log, _guard) = logs.create();
+        log.write_chunk(Stream::Stdout, b"streamed", None);
+        let mut file = log.take_file();
+        let empty = log.import(&mut file, Returned::Bytes(Vec::new()), &[]);
+        assert!(matches!(empty, Imported::Replaced), "{empty:?}");
+        assert_eq!(std::fs::read(log.path()).expect("read"), b"");
+        assert!(log.replaced());
+    }
+
+    /// A run dropped while its log is imported: the guard unlinked the live
+    /// file, and the import leaves neither it nor its sibling behind.
+    #[test]
+    fn an_abandoned_import_leaves_no_file() {
+        let (_home, logs) = logs();
+        let (log, guard) = logs.create();
+        log.write_chunk(Stream::Stdout, b"streamed", None);
+        let mut file = log.take_file();
+        drop(guard);
+        assert!(!log.path().exists(), "the guard unlinked it");
+        let imported = log.import(&mut file, Returned::Bytes(b"imported".to_vec()), &[]);
+        assert!(matches!(imported, Imported::Abandoned), "{imported:?}");
+        assert!(!log.path().exists(), "not renamed back");
+        assert!(!log.import_path().exists(), "no import file left");
+        assert!(!log.replaced());
     }
 
     #[test]

@@ -471,7 +471,10 @@ impl Engine {
     ) -> (anyhow::Result<RunResponse>, Option<std::fs::File>) {
         use crate::engine::driver::outputartifact::Type as ArtifactType;
         use crate::engine::run_log::Returned;
-        let file = log.finalize();
+        // Closed for writes now; `ended` only once the import is in place,
+        // so a follower never finishes on the streamed file while the
+        // returned one is renamed over it.
+        let file = log.take_file();
         let returned_of = |a: &OutputArtifact| match &a.content {
             crate::engine::driver::outputartifact::Content::File(f) => {
                 Some(Returned::File(std::path::PathBuf::from(&f.source_path)))
@@ -501,6 +504,7 @@ impl Engine {
             None => file,
             Some(source) => import_run_log(addr, log, file, source, roots).await,
         };
+        log.mark_ended();
         let run = crate::engine::run_log::fail_on_write_error(log, run);
         (run, file)
     }
@@ -520,7 +524,7 @@ async fn import_run_log(
     let addr = addr.format();
     hcore::blocking::run(move || {
         match log.import(&mut file, source, &roots) {
-            Imported::Replaced => {}
+            Imported::Replaced | Imported::Abandoned => {}
             Imported::Unavailable => tracing::warn!(
                 addr,
                 "log unavailable: the run returned a log heph does not read (outside its \

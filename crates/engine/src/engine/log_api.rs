@@ -544,7 +544,9 @@ impl Engine {
             .await
             .with_context(|| format!("fetching the remote manifest of {addr} {hashin}"))?
         else {
-            return Ok(Err("no remote cache holds the entry any more".into()));
+            return Ok(Err(
+                "the log was never fetched for this entry, and no remote cache holds it".into(),
+            ));
         };
         let remote = crate::engine::remote_cache::local_manifest_from_remote(&rev.manifest, hashin);
         if !same_revision(local, &remote)? {
@@ -794,8 +796,20 @@ impl LogFollower {
                     run.file
                         .read_to_end(&mut rest)
                         .with_context(|| format!("reading the live log of {}", self.addr))?;
+                    // This engine's run whose returned log was renamed over
+                    // the streamed one: the file read is one whole log,
+                    // either of them, and continuing in the entry from its
+                    // offset would splice the two. A run gone from memory
+                    // is done too: past `ended`, the file read here is the
+                    // one its entry or slot copied.
+                    let whole = matches!(&run.end,
+                        LiveEnd::InProcess(log) if log.upgrade().is_none_or(|log| log.replaced()));
                     let hashin = run.hashin.clone();
-                    self.state = self.replacement(&hashin);
+                    self.state = if whole {
+                        Follow::Done
+                    } else {
+                        self.replacement(&hashin)
+                    };
                     if !rest.is_empty() {
                         self.offset += rest.len() as u64;
                         return Ok(FollowStep::Bytes(rest));
@@ -846,7 +860,14 @@ impl LogFollower {
             LiveEnd::InProcess(log) => Ok(log.upgrade().is_none_or(|log| log.ended())),
             LiveEnd::Located { file, .. } => {
                 use std::os::unix::fs::MetadataExt as _;
-                // Unlinked once what replaces it is in place.
+                // Unlinked once what replaces it is in place. Across
+                // processes, an older plugin's returned log renamed over the
+                // streamed one drops this inode's nlink to 0 as well: the
+                // follower then goes on in the cache entry from its offset,
+                // which can splice the streamed head onto the imported rest.
+                // Accepted: it takes an older plugin that both streams and
+                // returns a log, followed from another heph, and the entry
+                // holds the whole imported log.
                 if run.file.metadata()?.nlink() == 0 {
                     return Ok(true);
                 }
