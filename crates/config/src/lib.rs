@@ -29,8 +29,10 @@ mod config_yaml;
 mod home_dir;
 mod options;
 mod root;
+mod schema;
 
 pub use config_yaml::*;
 pub use home_dir::{DEFAULT_HOME_DIR, HEPH_DIR_PREFIX, HomeDir, normalize};
 pub use options::{Options, decode_opt, deny_unknown};
 pub use root::{get_cwd, get_root};
+pub use schema::{config_json_schema, config_json_schema_text};

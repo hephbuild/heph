@@ -14,9 +14,16 @@ test-support = []
 anyhow = "1.0.102"
 hcore = { package = "core", path = "../core" }
 memoize = "0.6.0"
+# The `.hephconfig` JSON Schema editors validate against: derived from the
+# serde types, except four hand-written impls (`src/schema.rs`); the schema's
+# tests against the parser are what keep the two from drifting.
+schemars = { version = "1.2.3", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
+# `Value::sort_all_objects` (1.0.129).
+serde_json = "1.0.129"
 serde_yaml = "0.9"
 tracing = "0.1"
 
 [dev-dependencies]
+jsonschema = { version = "0.61.2", default-features = false }
 tempfile = "3.27"

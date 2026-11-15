@@ -264,6 +264,16 @@ itself, or depends on the file evaluating, brings back the bugs this design
 removed. A site kind ships with its editor-shaped test in `tests/lsp.rs`.
 `heph tool build-lsp --explain FILE:LINE:COL` prints the classification.
 
+### The `.hephconfig` schema
+
+`docs/CONFIG_SCHEMA.md`. `heph tool config-schema` prints a schema derived from
+`ConfigYaml` in `crates/config/src/schema.rs`; a type with a hand-rolled
+`Deserialize` writes its schema by hand there. No copy of the schema is
+committed; the command is its only source. The one thing to know going in: the
+schema never rejects a config the parser loads, except a number or boolean
+written into a string field, and `at_every_position_what_loads_validates` holds
+every field, a new one included, to that.
+
 ### `heph-bench` — perf-regression harness
 
 `crates/bench-corpus` (deterministic synthetic corpus generator) + `crates/bench` (`heph-bench` binary: `corpus`/`run inprocess`/`run dist`/`compare`). Times `heph` scenarios in-process (Tier A, no process spawn, no plugin cdylib) or against the real prebuilt binary + plugin cdylib (Tier B, the seam only a real `dlopen` can exercise), then decides regression from a baseline-vs-candidate comparison.

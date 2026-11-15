@@ -23,6 +23,10 @@ pub const MEMORY: &str = "memory";
 /// declares or reads it.
 pub const SANDBOX: &str = "sandbox";
 
+/// Every builtin pool: the names [`Unit::of_builtin`] gives a unit, in the
+/// order a person reads them. A test holds the two together.
+pub const BUILTIN_POOLS: [&str; 3] = [CPU, MEMORY, SANDBOX];
+
 /// The longest a pool name may be.
 pub const MAX_POOL_NAME_LEN: usize = 64;
 
@@ -290,6 +294,28 @@ fn whole(s: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `BUILTIN_POOLS` and `Unit::of_builtin` name the same pools, so a list
+    /// built from one (the `.hephconfig` schema's) cannot miss a pool the
+    /// other knows.
+    #[test]
+    fn builtin_pools_are_the_pools_with_a_builtin_unit() {
+        for name in BUILTIN_POOLS {
+            assert!(Unit::of_builtin(name).is_some(), "{name}");
+        }
+        for name in [
+            "gpu",
+            "docker",
+            "count",
+            "bytes",
+            "cpus",
+            "mem",
+            "sandboxes",
+            "",
+        ] {
+            assert_eq!(Unit::of_builtin(name), None, "{name}");
+        }
+    }
 
     #[test]
     fn pool_names() {

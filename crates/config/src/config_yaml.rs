@@ -1,4 +1,5 @@
 use anyhow::Context;
+use schemars::JsonSchema;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -20,8 +21,19 @@ use crate::options::Options;
 /// no such store-level cap at all.
 pub const DEFAULT_CACHE_CONCURRENCY: usize = 256;
 
-#[derive(Debug, Deserialize, Default)]
+/// The `.hephconfig` file. Its [`JsonSchema`] is what `heph tool config-schema`
+/// prints for editors ([`config_json_schema`](crate::config_json_schema)); a
+/// field's `#[schemars(description)]` replaces a doc comment written for
+/// maintainers.
+#[derive(Debug, Deserialize, Default, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[schemars(
+    // What yaml-language-server shows as the hover heading and in type
+    // errors (`object(.hephconfig)`); the Rust name would leak otherwise.
+    title = ".hephconfig",
+    description = "heph workspace configuration: the base `.hephconfig`, or a profile \
+                   (`<profile>.hephconfig`) laid over it."
+)]
 pub struct ConfigYaml {
     /// Pinned heph version (or, in future, a version constraint) this workspace
     /// expects. When set and it differs from the running binary, the self-upgrade
@@ -32,6 +44,11 @@ pub struct ConfigYaml {
     /// change this field's name or type and you must change that one too, or the
     /// pin silently reads as absent and the workspace stays on the wrong binary.
     /// It is a frozen wire contract; see [`VersionPin`] before retyping it.
+    #[schemars(
+        description = "The heph version this workspace expects, e.g. `v1.2.3`. When it differs \
+                       from the running binary, heph downloads that release and re-execs into \
+                       it. Omit to disable self-upgrade for the workspace."
+    )]
     #[serde(default)]
     pub version: Option<String>,
     /// Release flavour to pin `version` to, e.g. `debug`. Selects which published
@@ -40,6 +57,11 @@ pub struct ConfigYaml {
     /// (e.g. `heph_debug_darwin_arm64`) instead.
     ///
     /// Mirrored in [`VersionPin`] — see the note on [`version`](Self::version).
+    #[schemars(
+        description = "Release flavour to pin `version` to, e.g. `debug`. Omitted is the default \
+                       build (`heph_<os>_<arch>`); a flavour downloads \
+                       `heph_<flavour>_<os>_<arch>` instead."
+    )]
     #[serde(default)]
     pub version_flavour: Option<String>,
     /// The heph home (cache, sandboxes, credentials, locks, diagnostics). A
@@ -50,35 +72,66 @@ pub struct ConfigYaml {
     /// [`DEFAULT_HOME_DIR`](crate::DEFAULT_HOME_DIR). Resolved by
     /// [`HomeDir::resolve`](crate::HomeDir::resolve), which refuses the root
     /// itself or anything above it.
+    #[schemars(
+        description = "The heph home (cache, sandboxes, credentials, locks, diagnostics). A \
+                       relative path is under the workspace root; an absolute one is used as \
+                       written. No `~` or `$VAR` expansion; `.` and `..` resolve lexically. \
+                       Default `.heph`. The root itself, or anything above it, is refused."
+    )]
     #[serde(default)]
     pub home_dir: Option<PathBuf>,
     /// Every provider/driver — built-in or external — is declared as a single
     /// `plugin`. A `builtin:` entry selects a compiled-in plugin by name; a
     /// `path:`/`url:` entry points at a `*-plugin.json` manifest for a loadable
     /// cdylib. Each carries an `options:` map passed to plugin construction.
+    #[schemars(
+        description = "The plugins this workspace loads: every provider and driver comes from \
+                       one. `builtin:` names one compiled into heph; `path:` or `url:` points at \
+                       a `*-plugin.json` manifest. Each entry's `options:` is passed to the plugin."
+    )]
     #[serde(default)]
+    #[schemars(transform = crate::schema::empty_is_null)]
     pub plugins: Vec<PluginSpec>,
+    /// Byte limits of the local cache's in-memory tier. `capacityBytes: 0`
+    /// disables the tier.
     #[serde(default)]
     pub mem_cache: Option<MemCacheConfig>,
     /// Scratch-cache policy: which lineage a run writes to and which it may read
     /// from. See [`ScratchConfig`].
+    #[schemars(
+        description = "Scratch-cache policy: which lineage a run writes to, and which it may \
+                       read from."
+    )]
     #[serde(default)]
     pub scratch: Option<ScratchConfig>,
+    /// Byte limits of the in-memory store for uncacheable outputs; an entry that
+    /// would exceed `capacityBytes` spills to the durable cache.
     #[serde(default)]
     pub tmp_cache: Option<MemCacheConfig>,
+    /// Sandbox FUSE overlay: `enabled: true | false | auto`. Off by default.
     #[serde(default)]
     pub fuse: Option<FuseConfig>,
+    /// Execute-phase lock backend: `backend: fs | mem`. Default `fs`.
     #[serde(default)]
     pub lock: Option<LockConfig>,
+    /// Filesystem-walk settings shared by every plugin that walks the tree.
     #[serde(default)]
     pub fs: Option<FsConfig>,
+    /// Durable local-cache tuning.
     #[serde(default)]
     pub cache: Option<CacheConfig>,
     /// Named remote (shared) caches. Each entry is keyed by a name and carries a
     /// `uri` plus `read`/`write` permissions. Parsed as patches so a profile can
     /// override individual fields; resolve with [`ConfigYaml::resolved_caches`].
+    #[schemars(
+        description = "Named remote (shared) caches. Each entry has a `uri`, plus `read` and \
+                       `write` (both default `true`). A profile may set one field of an entry \
+                       and inherit the rest."
+    )]
     #[serde(default)]
+    #[schemars(transform = crate::schema::empty_is_null)]
     pub caches: BTreeMap<String, RemoteCacheConfigPatch>,
+    /// Anonymous usage telemetry; on unless `enabled: false`.
     #[serde(default)]
     pub telemetry: Option<TelemetryConfig>,
     /// Resource pools, one entry per pool: `{unit: <count|cpu|bytes>, value:
@@ -208,14 +261,48 @@ impl<'de> Deserialize<'de> for ResourcesConfig {
 }
 
 /// One pool as YAML spells it: the amount alone, or `{unit, value}`.
-#[derive(Deserialize)]
-#[serde(
-    untagged,
-    expecting = "an amount (2, 0.5, \"24G\", \"50%\") or {unit: <count|cpu|bytes>, value: <amount>}"
-)]
 enum PoolValue {
     Scalar(Scalar),
     Full(FullDecl),
+}
+
+const POOL_VALUE_EXPECTING: &str =
+    "an amount (2, 0.5, \"24G\", \"50%\") or {unit: <count|cpu|bytes>, value: <amount>}";
+
+// Hand-rolled rather than `untagged`: a mapping is always the `{unit, value}`
+// form, so its own error (an unknown field, by name) reaches the user instead
+// of untagged's "matched no variant".
+//
+// What `untagged` accepted still loads: serde derive also reads a struct from a
+// sequence, so `[count, 2]` (and `[]`) is `{unit: count, value: 2}`.
+impl<'de> Deserialize<'de> for PoolValue {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let value = serde_yaml::Value::deserialize(d)?;
+        if value.is_mapping() {
+            return serde_yaml::from_value(value)
+                .map(Self::Full)
+                .map_err(D::Error::custom);
+        }
+        // Which form failed says less than what was expected.
+        let expecting = |_: serde_yaml::Error| D::Error::custom(POOL_VALUE_EXPECTING);
+        match value {
+            // A `Value` reads a struct only from a mapping, so the sequence
+            // is handed to the struct as one, as `untagged` did; a third
+            // element is refused.
+            serde_yaml::Value::Sequence(items) => {
+                let seq = serde::de::value::SeqDeserializer::<_, serde_yaml::Error>::new(
+                    items.into_iter(),
+                );
+                FullDecl::deserialize(seq)
+                    .map(Self::Full)
+                    .map_err(expecting)
+            }
+            other => serde_yaml::from_value(other)
+                .map(Self::Scalar)
+                .map_err(expecting),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -323,19 +410,33 @@ pub struct RemoteCacheConfig {
 /// can patch a single setting (e.g. flip `write`) without restating `uri`.
 /// Layered patches are deep-merged by [`merge`](Self::merge), then finalized into
 /// a [`RemoteCacheConfig`] by [`resolve`](Self::resolve).
-#[derive(Debug, Deserialize, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq, Default, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[schemars(
+    description = "One named remote cache. A profile may set a single field and inherit the rest.",
+    // `remote:` with nothing after it loads as an entry that sets nothing.
+    transform = crate::schema::empty_is_null
+)]
 pub struct RemoteCacheConfigPatch {
+    /// The backend, by scheme: `s3://bucket/prefix`, `gs://bucket/prefix`,
+    /// `memory://` or `file://`. Required once the profiles are merged.
     #[serde(default)]
     pub uri: Option<String>,
+    /// Consult this cache on lookups. Default `true`.
     #[serde(default)]
     pub read: Option<bool>,
+    /// Push to this cache on writes. Default `true`.
     #[serde(default)]
     pub write: Option<bool>,
+    /// Max in-flight requests to this cache. Default 256.
     #[serde(default)]
     pub concurrency: Option<usize>,
+    /// Base URL of an S3-compatible service to talk to instead of AWS, e.g.
+    /// `https://<account>.r2.cloudflarestorage.com`. `s3://` caches only.
     #[serde(default)]
     pub endpoint: Option<String>,
+    /// Region to sign S3 requests for. `s3://` caches only; unset leaves it to
+    /// `AWS_REGION`, then `us-east-1`.
     #[serde(default)]
     pub region: Option<String>,
 }
@@ -384,12 +485,17 @@ impl RemoteCacheConfigPatch {
 }
 
 /// Durable local-cache tuning. `cache: { spillThresholdBytes: N }`.
-#[derive(Debug, Deserialize, Default, Clone, Copy)]
+#[derive(Debug, Deserialize, Default, Clone, Copy, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct CacheConfig {
     /// Blobs strictly larger than this spill to plain files under
     /// `<home>/cache/blobs/` instead of being stored inline in the sqlite DB.
     /// Manifests always stay in sqlite. Omit to use the engine default.
+    #[schemars(
+        description = "Blobs strictly larger than this many bytes spill to plain files under \
+                       `<home>/cache/blobs/` instead of being stored inline in the cache \
+                       database. Omit for heph's default."
+    )]
     #[serde(default)]
     pub spill_threshold_bytes: Option<u64>,
 }
@@ -405,8 +511,12 @@ pub struct CacheConfig {
 /// Repo/CI policy rather than a property of any target, which is why it lives
 /// here and not in a BUILD file — a per-target override would let one BUILD file
 /// opt out of the isolation the repo just configured.
-#[derive(Debug, Deserialize, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq, Default, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[schemars(
+    description = "Scratch-cache policy: which lineage a run writes to (`scope`), and which \
+                   lineages it may read from when its own has nothing (`restoreScopes`)."
+)]
 pub struct ScratchConfig {
     /// The lineage this run **writes** to. Supports `${git:branch}`, which heph
     /// resolves itself so a developer gets branch scoping without wiring
@@ -414,6 +524,10 @@ pub struct ScratchConfig {
     ///
     /// Empty (the default) means one shared lineage — today's behaviour, and the
     /// right answer for a single long-lived branch.
+    #[schemars(
+        description = "The lineage this run writes to, e.g. `${git:branch}` (heph resolves the \
+                       current branch). Omitted is one lineage shared by every run."
+    )]
     #[serde(default)]
     pub scope: Option<String>,
     /// Lineages this run may **read** from when its own scope has nothing, tried
@@ -422,7 +536,12 @@ pub struct ScratchConfig {
     ///
     /// Writes never go here — that isolation is what makes the feature safe to
     /// enable on untrusted PR CI at all.
+    #[schemars(
+        description = "Lineages this run may read from when its own `scope` has nothing, tried \
+                       in order, e.g. `[master]`. A run never writes to them."
+    )]
     #[serde(default)]
+    #[schemars(transform = crate::schema::empty_is_null)]
     pub restore_scopes: Vec<String>,
     /// Copy the fallback lineage's directory into this scope on the first build
     /// after a scope change, instead of starting cold.
@@ -433,6 +552,11 @@ pub struct ScratchConfig {
     /// branch scoping just makes every branch switch cold — which is worse than
     /// not scoping at all. Turn it off if a slot is large and the filesystem has
     /// no reflink.
+    #[schemars(
+        description = "On the first build in a new `scope`, start from a copy of the lineage \
+                       it restores from instead of cold. Default `true`; turn it off when a \
+                       scratch cache is large and the filesystem has no reflink."
+    )]
     #[serde(default)]
     pub seed_on_fork: Option<bool>,
 }
@@ -529,9 +653,10 @@ fn merge_plugins(base: &mut Vec<PluginSpec>, inc: Vec<PluginSpec>) {
 /// Anonymous usage telemetry. `telemetry: { enabled: false }` opts out; omitting
 /// the block (or the field) leaves telemetry on. No data here identifies a user
 /// — only os/arch/version and aggregate run counters are ever reported.
-#[derive(Debug, Deserialize, Clone, Copy)]
+#[derive(Debug, Deserialize, Clone, Copy, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct TelemetryConfig {
+    /// `false` turns anonymous usage telemetry off. Default `true`.
     #[serde(default = "default_telemetry_enabled")]
     pub enabled: bool,
 }
@@ -553,8 +678,9 @@ impl Default for TelemetryConfig {
 /// the engine resolves them to absolute paths and hands them to every plugin
 /// that walks the tree (the built-in `fs` plugin, the buildfile/go providers),
 /// so every walk prunes the same directories.
-#[derive(Debug, Deserialize, Default, Clone)]
+#[derive(Debug, Deserialize, Default, Clone, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[schemars(description = "Filesystem-walk settings shared by every plugin that walks the tree.")]
 pub struct FsConfig {
     /// Root-relative directories and globs no tree walk enters: package
     /// discovery, `fs` globs and the Go provider alike.
@@ -565,18 +691,30 @@ pub struct FsConfig {
     /// such as `.heph-gocache`). A directory named `.heph*` is never source — a
     /// `BUILD` file inside one is not a package, and an address in one does not
     /// resolve.
+    #[schemars(
+        description = "Root-relative directories and globs no tree walk enters: package \
+                       discovery, `fs` globs and the Go provider alike. `.git` and every \
+                       directory named `.heph*` are always skipped."
+    )]
     #[serde(default)]
+    #[schemars(transform = crate::schema::empty_is_null)]
     pub skip: Vec<String>,
 }
 
 /// Byte limits for one in-memory cache store. Shared shape for `mem_cache`
 /// (the local-cache mem tier) and `tmp_cache` (the tmp/uncacheable store).
-#[derive(Debug, Deserialize, Clone, Copy)]
+#[derive(Debug, Deserialize, Clone, Copy, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[schemars(description = "Byte limits of one in-memory cache store. Both fields are required.")]
 pub struct MemCacheConfig {
+    /// The largest single entry the store keeps, in bytes.
     pub per_entry_bytes: usize,
     /// Total byte budget. For `mem_cache`, `0` disables the layer entirely; for
     /// `tmp_cache`, entries that would exceed it spill to the durable cache.
+    #[schemars(
+        description = "Total byte budget. Under `memCache`, `0` disables the tier; under \
+                       `tmpCache`, an entry that would exceed it spills to the durable cache."
+    )]
     pub capacity_bytes: u64,
 }
 
@@ -597,9 +735,11 @@ pub enum FuseMode {
 /// Sandbox FUSE-overlay mode. `fuse: { enabled: true | false | auto }`
 /// selects mode explicitly. Omit `enabled` (or the entire `fuse:` block) to
 /// default to off; FUSE is opt-in.
-#[derive(Debug, Deserialize, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Default, Clone, Copy, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct FuseConfig {
+    /// `true`, `false`, or `auto` (decided per target from its inputs).
+    /// Default off.
     #[serde(default)]
     pub enabled: Option<FuseEnabled>,
 }
@@ -662,18 +802,22 @@ impl FuseConfig {
 
 /// Execute-phase lock backend. `lock: { backend: fs | mem }`. Omit the block (or
 /// `backend`) to default to the filesystem backend.
-#[derive(Debug, Deserialize, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Default, Clone, Copy, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct LockConfig {
+    /// `fs` (default) or `mem`.
     #[serde(default)]
     pub backend: Option<LockBackendConfig>,
 }
 
 /// YAML spelling of the lock backend. Maps to `engine::LockBackend`.
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "lowercase")]
+#[schemars(description = "Execute-phase lock backend.")]
 pub enum LockBackendConfig {
+    /// Lock files under the heph home: shared with other heph processes.
     Fs,
+    /// In-process locks: this process only.
     Mem,
 }
 
@@ -1944,6 +2088,16 @@ plugins:
                 Unit::Count,
                 Some(Amount(0)),
             ),
+            // `[unit, value]`: serde reads a struct from a sequence, and the
+            // `untagged` parser this replaced accepted it.
+            (
+                "resources: {gpu: [count, 2]}",
+                "gpu",
+                Unit::Count,
+                Some(Amount(2)),
+            ),
+            ("resources: {gpu: []}", "gpu", Unit::Count, None),
+            ("resources: {vram: [bytes]}", "vram", Unit::Bytes, None),
         ];
         for (yaml, pool, unit, want) in ok {
             let got = resources(yaml).unwrap_or_else(|e| panic!("{yaml}: {e:#}"));
@@ -1978,6 +2132,9 @@ plugins:
                 "rename it",
             ),
             ("resources: {sandbox: {unit: cpu}}", "rename it"),
+            ("resources: {gpu: [count, 2, 3]}", "an amount"),
+            ("resources: {gpu: [gpus, 2]}", "unknown unit"),
+            ("resources: {cpu: [count, 2]}", "builtin"),
         ];
         for (yaml, needle) in err {
             let e = resources(yaml).expect_err(yaml);
