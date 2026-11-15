@@ -24,6 +24,10 @@ tokio = { version = "1.52.3", features = ["rt", "io-util", "fs", "process"] }
 # A fresh, uniquely named file per collected output tar (see
 # `driver_managed::pack_to_artifact_tar`).
 tempfile = "3"
+# Substring search for the credential-output scrubber (`redact`): a needle there
+# is a whole session token, so the naive scan it replaced cost ~1000
+# byte-comparisons per output byte on every credentialed target.
+memchr = "2.8"
 
 # `clonefile(2)` for staged per-file inputs (see `stage::share_file`).
 [target.'cfg(target_os = "macos")'.dependencies]

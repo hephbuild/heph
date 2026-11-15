@@ -342,6 +342,63 @@ impl ProcessFailed {
             vec![log],
         )
     }
+
+    /// [`from_output`](Self::from_output) for a driver that has the run's
+    /// request: under [`RunRequest::log_capture`] the output goes to the run's
+    /// own log — stdout to `req.stdout`, stderr to `req.stderr`, where the
+    /// host scrubs and stores it — and the failure carries no `Log` artifact.
+    /// Otherwise it is `from_output(log_path, output)`, whose log (a file, or
+    /// inline bytes when the file cannot be written) the host scrubs like any
+    /// returned `Log` artifact.
+    ///
+    /// A write to the request's writers that fails falls back to an inline
+    /// `Log` artifact holding the whole output, so the output is not lost.
+    pub async fn from_run_output(
+        req: &mut crate::driver::RunRequest<'_, '_>,
+        log_path: &std::path::Path,
+        output: &std::process::Output,
+    ) -> anyhow::Error {
+        use tokio::io::AsyncWriteExt as _;
+        if !req.log_capture {
+            return Self::from_output(log_path, output);
+        }
+        let mut streamed = true;
+        for (writer, bytes) in [
+            (req.stdout.as_deref_mut(), &output.stdout),
+            (req.stderr.as_deref_mut(), &output.stderr),
+        ] {
+            if bytes.is_empty() {
+                continue;
+            }
+            let Some(w) = writer else {
+                streamed = false;
+                break;
+            };
+            let wrote = match w.write_all(bytes).await {
+                Ok(()) => w.flush().await,
+                Err(e) => Err(e),
+            };
+            if wrote.is_err() {
+                streamed = false;
+                break;
+            }
+        }
+        let err = anyhow::Error::new(Self::from_status(output.status));
+        if streamed {
+            return err;
+        }
+        let mut data = Vec::with_capacity(output.stdout.len() + output.stderr.len());
+        data.extend_from_slice(&output.stdout);
+        data.extend_from_slice(&output.stderr);
+        with_failure_artifacts(
+            err,
+            vec![log_artifact(OaContent::Raw(ContentRaw {
+                data,
+                path: LOG_NAME.to_string(),
+                x: false,
+            }))],
+        )
+    }
 }
 
 /// The name a run's log artifact has: the target's `log.txt`.
@@ -1003,6 +1060,106 @@ mod tests {
         )
         .expect("read");
         assert_eq!(text, "kept\n");
+    }
+
+    fn sh_output(script: &str) -> std::process::Output {
+        std::process::Command::new("sh")
+            .args(["-c", script])
+            .output()
+            .expect("run sh")
+    }
+
+    /// Under `log_capture` the output is the run's log: each stream goes to its
+    /// own writer, the failure carries no `Log` artifact, and no file is written.
+    #[tokio::test]
+    async fn from_run_output_under_log_capture_writes_the_writers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log_path = dir.path().join("log.txt");
+        let output = sh_output("echo on-stdout; echo on-stderr >&2; exit 3");
+        let (id, target) = (
+            String::from("r"),
+            crate::driver::targetdef::TargetDef::default(),
+        );
+        let (mut out, mut errw) = (Vec::<u8>::new(), Vec::<u8>::new());
+        let mut req = crate::driver::RunRequest::new(&id, &target, dir.path());
+        req.stdout = Some(&mut out);
+        req.stderr = Some(&mut errw);
+        req.log_capture = true;
+
+        let err = ProcessFailed::from_run_output(&mut req, &log_path, &output).await;
+        drop(req);
+        assert_eq!(process_exit(&err), Some(Exit::Code(3)));
+        assert!(failure_log(&err).is_none(), "the writers are the log");
+        assert!(!log_path.exists(), "no own log file under log_capture");
+        assert_eq!(out, b"on-stdout\n");
+        assert_eq!(errw, b"on-stderr\n");
+    }
+
+    /// Without `log_capture` it is `from_output`: the log file, attached.
+    #[tokio::test]
+    async fn from_run_output_without_log_capture_writes_its_own_log() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log_path = dir.path().join("log.txt");
+        let output = sh_output("echo kept; exit 2");
+        let (id, target) = (
+            String::from("r"),
+            crate::driver::targetdef::TargetDef::default(),
+        );
+        let mut out = Vec::<u8>::new();
+        let mut req = crate::driver::RunRequest::new(&id, &target, dir.path());
+        req.stdout = Some(&mut out);
+
+        let err = ProcessFailed::from_run_output(&mut req, &log_path, &output).await;
+        drop(req);
+        assert!(out.is_empty(), "the writers are not the log");
+        assert_eq!(std::fs::read_to_string(&log_path).expect("log"), "kept\n");
+        assert!(matches!(
+            failure_log(&err).map(|a| &a.content),
+            Some(OaContent::File(_))
+        ));
+    }
+
+    /// A writer that fails does not lose the output: it rides inline instead.
+    #[tokio::test]
+    async fn from_run_output_falls_back_inline_when_a_writer_fails() {
+        struct Broken;
+        impl tokio::io::AsyncWrite for Broken {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                _: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                std::task::Poll::Ready(Err(std::io::ErrorKind::StorageFull.into()))
+            }
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let output = sh_output("echo a; echo b >&2; exit 1");
+        let (id, target) = (
+            String::from("r"),
+            crate::driver::targetdef::TargetDef::default(),
+        );
+        let (mut out, mut errw) = (Vec::<u8>::new(), Broken);
+        let mut req = crate::driver::RunRequest::new(&id, &target, dir.path());
+        req.stdout = Some(&mut out);
+        req.stderr = Some(&mut errw);
+        req.log_capture = true;
+
+        let err =
+            ProcessFailed::from_run_output(&mut req, &dir.path().join("log.txt"), &output).await;
+        let log = failure_log(&err).expect("an inline log");
+        assert!(matches!(&log.content, OaContent::Raw(r) if r.data == b"a\nb\n"));
     }
 
     fn raw(name: &str, data: &str) -> OutputArtifact {

@@ -1,5 +1,9 @@
 //! Scrubbing credential material out of a captured target's output, at the tee.
 //!
+//! One scrubber, shared: the engine's run log and a plugin's own-file path (a
+//! plugin on a host that predates `log_capture` still writes its own log) both
+//! go through it, so redaction does not depend on which side wrote the bytes.
+//!
 //! An interactive run has no tee, so none of this applies to it: every entrypoint
 //! run and a build target's `--shell` go unscrubbed and unlogged, and `env` in such
 //! a shell prints the tokens it holds. See `docs/CREDENTIALS.md`, "Redaction".
@@ -296,6 +300,72 @@ mod tests {
         let mut r = Redactor::new(needles(&["s3cr3t-value"]));
         // `s3cx` is not a prefix of the needle, but shares its first byte.
         assert_eq!(r.push(b"tok=s3cx"), b"tok=s3cx");
+    }
+
+    /// The carry between writes never exceeds `len(longest secret) - 1` bytes,
+    /// whatever the chunking: that bound is what makes a live log trail the
+    /// process by at most one secret's worth of bytes.
+    #[test]
+    fn the_carry_is_at_most_the_longest_secret_minus_one() {
+        let long = "a-very-long-session-token-value";
+        let mut r = Redactor::new(needles(&["s3cr3t-value", long]));
+        // Every proper prefix of each secret, as the end of a chunk: the worst
+        // case for the hold-back.
+        for secret in ["s3cr3t-value", long] {
+            for cut in 1..secret.len() {
+                let chunk = format!("x{}", secret.get(..cut).expect("ascii"));
+                r.push(chunk.as_bytes());
+                assert!(
+                    r.buf.len() < long.len(),
+                    "carried {} bytes after `{chunk}`",
+                    r.buf.len()
+                );
+            }
+        }
+        // A chunk of nothing but secret prefixes stacked end to end still keeps
+        // only one partial match.
+        r.push(
+            long.get(..long.len() - 1)
+                .expect("ascii")
+                .repeat(4)
+                .as_bytes(),
+        );
+        assert!(r.buf.len() < long.len());
+    }
+
+    /// stdout and stderr each carry their own tail: a half secret on one stream
+    /// and its other half on the other is two unrelated streams, not a secret,
+    /// and a secret split within either stream is still caught while the other
+    /// stream's writes interleave with it.
+    #[test]
+    fn each_stream_carries_independently() {
+        let n = needles(&["s3cr3t-value"]);
+        let mut out = Redactor::new(n.clone());
+        let mut err = Redactor::new(n);
+
+        let mut o = out.push(b"out=s3cr");
+        let mut e = err.push(b"err=s3cr");
+        o.extend(out.push(b"3t-value\n"));
+        // stderr's carry is untouched by stdout completing its secret.
+        assert_eq!(err.buf, b"s3cr");
+        e.extend(err.push(b"3t-xxxxx\n"));
+        o.extend(out.finish());
+        e.extend(err.finish());
+
+        assert_eq!(o, b"out=[redacted]\n");
+        assert_eq!(e, b"err=s3cr3t-xxxxx\n");
+
+        // Halves across the two streams are not joined into a secret.
+        let n = needles(&["s3cr3t-value"]);
+        let (mut out, mut err) = (Redactor::new(n.clone()), Redactor::new(n));
+        let mut o = out.push(b"s3cr");
+        let mut e = err.push(b"3t-value");
+        o.extend(out.finish());
+        e.extend(err.finish());
+        assert_eq!(
+            (o.as_slice(), e.as_slice()),
+            (&b"s3cr"[..], &b"3t-value"[..])
+        );
     }
 
     #[test]

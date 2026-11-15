@@ -541,6 +541,11 @@ fn decode_list_package_item(b: &[u8]) -> anyhow::Result<ListPackageResponse> {
     })
 }
 
+/// How many relayed chunks may wait for the run's sinks before the drain
+/// thread stops reading the plugin's stream. A chunk is one `FrameSink`
+/// write, so this bounds the host's buffering per run to a few of them.
+const RELAY_QUEUE: usize = 64;
+
 /// Which of the target's two streams a forwarded chunk belongs to.
 enum Chunk {
     Stdout(Vec<u8>),
@@ -559,9 +564,13 @@ enum Chunk {
 /// request. Forwarding them as they arrive rather than at the end is the whole
 /// point — a `docker buildx build` or a `go build` should print while it runs,
 /// not in one burst after it finishes.
+///
+/// The channel is bounded ([`RELAY_QUEUE`]): a full queue blocks this thread,
+/// which stops reading the plugin's stream, so the plugin's `FrameSink`
+/// waits instead of the host's memory growing behind a slow sink.
 fn drain_run(
     stream: DynItemStream,
-    chunks: &tokio::sync::mpsc::UnboundedSender<Chunk>,
+    chunks: &tokio::sync::mpsc::Sender<Chunk>,
 ) -> anyhow::Result<ManagedRunResponse> {
     loop {
         let bytes = stream.next();
@@ -592,15 +601,16 @@ fn drain_run(
                 return Err(convert::run_failure_from_pb(*f));
             }
             // A dropped receiver means the caller stopped reading; keep draining
-            // so the run still reaches its result.
+            // so the run still reaches its result. A plain thread, never a
+            // runtime worker, so blocking on a full queue is allowed here.
             Some(pb::run_out_frame::Msg::StdoutChunk(b)) => {
-                drop(chunks.send(Chunk::Stdout(b)));
+                drop(chunks.blocking_send(Chunk::Stdout(b)));
             }
             Some(pb::run_out_frame::Msg::StderrChunk(b)) => {
-                drop(chunks.send(Chunk::Stderr(b)));
+                drop(chunks.blocking_send(Chunk::Stderr(b)));
             }
             Some(pb::run_out_frame::Msg::Stopped(_)) => {
-                drop(chunks.send(Chunk::Stopped));
+                drop(chunks.blocking_send(Chunk::Stopped));
             }
             None => {}
         }
@@ -910,6 +920,10 @@ pub struct StableRemoteManagedDriver {
     /// run is cancelled by its `request_id`, which trips every call of this
     /// driver in flight under the request.
     cancel_keys: bool,
+    /// The plugin reads `ManagedRunRequest.log_capture` (ABI 0.21.1 and
+    /// later). An older one is never sent it: it keeps writing and returning
+    /// its own log, which the host imports.
+    log_capture: bool,
 }
 
 impl StableRemoteManagedDriver {
@@ -930,16 +944,19 @@ impl StableRemoteManagedDriver {
             name,
             schema: Arc::new(schema),
             cancel_keys: true,
+            log_capture: true,
         })
     }
 
     /// The ABI version the plugin reported at load (`None`: it reported none).
     /// Decides how a run is cancelled across the seam: by its own
     /// `cancel_key` from [`plugin_abi::CANCEL_KEY_SINCE`] on, by `request_id`
-    /// before it.
+    /// before it; and whether a run is sent `log_capture`, from
+    /// [`plugin_abi::LOG_CAPTURE_SINCE`] on.
     #[must_use]
     pub fn with_plugin_abi(mut self, reported: Option<&str>) -> Self {
         self.cancel_keys = reported.is_some_and(reads_cancel_key);
+        self.log_capture = reported.is_some_and(reads_log_capture);
         self
     }
 }
@@ -947,9 +964,20 @@ impl StableRemoteManagedDriver {
 /// Whether a plugin reporting ABI `reported` reads `ManagedRunRequest.cancel_key`.
 /// A version that does not parse is taken not to.
 fn reads_cancel_key(reported: &str) -> bool {
+    abi_at_least(reported, plugin_abi::CANCEL_KEY_SINCE)
+}
+
+/// Whether a plugin reporting ABI `reported` reads `ManagedRunRequest.log_capture`.
+/// A version that does not parse is taken not to.
+fn reads_log_capture(reported: &str) -> bool {
+    abi_at_least(reported, plugin_abi::LOG_CAPTURE_SINCE)
+}
+
+/// `reported >= since`, as semver; `false` when either does not parse.
+fn abi_at_least(reported: &str, since: &str) -> bool {
     match (
         semver::Version::parse(reported),
-        semver::Version::parse(plugin_abi::CANCEL_KEY_SINCE),
+        semver::Version::parse(since),
     ) {
         (Ok(plugin), Ok(since)) => plugin >= since,
         _ => false,
@@ -1150,6 +1178,9 @@ impl StableRemoteManagedDriver {
                 .map(convert::allotment_to_pb)
                 .unwrap_or_default(),
             cancel_key: cancel_key.clone(),
+            // Only to a plugin that reads it, and only when set: absent reads
+            // as `false` on the plugin's side either way.
+            log_capture: (self.log_capture && req.request.log_capture).then_some(true),
             ..Default::default()
         };
         // `run` is bidi: the request stream carries the run request (RunInFrame),
@@ -1189,10 +1220,12 @@ impl StableRemoteManagedDriver {
         // a dedicated thread and bridge the result back — while watching `ct` so a
         // cancel trips the plugin's run token (which stops the subprocess).
         let (tx, rx) = futures::channel::oneshot::channel();
-        let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel::<Chunk>();
+        let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::channel::<Chunk>(RELAY_QUEUE);
         std::thread::spawn(move || {
             // Receiver dropped only if the caller gave up; ignore send failure.
             drop(tx.send(drain_run(resp_stream, &chunk_tx)));
+            // `chunk_tx` drops here, after the result is sent: that close is
+            // what tells the pump every chunk before the terminal frame is in.
         });
 
         // Relay the driver's output to the target's own stdio while the run is
@@ -1200,12 +1233,18 @@ impl StableRemoteManagedDriver {
         // here rather than on the drain thread.
         let mut stdout = req.request.stdout.take();
         let mut stderr = req.request.stderr.take();
+        let driver = self.name.as_str();
         let pump = async {
             use tokio::io::AsyncWriteExt as _;
+            // The first sink error, kept to warn about once: a sink that fails
+            // keeps being written (it may be a tee whose other half still
+            // works), and the run is not failed for it.
+            let mut first_error: Option<(&'static str, std::io::Error)> = None;
+            let mut unwritten: usize = 0;
             while let Some(chunk) = chunk_rx.recv().await {
-                let (sink, bytes) = match chunk {
-                    Chunk::Stdout(b) => (stdout.as_deref_mut(), b),
-                    Chunk::Stderr(b) => (stderr.as_deref_mut(), b),
+                let (stream, sink, bytes) = match chunk {
+                    Chunk::Stdout(b) => ("stdout", stdout.as_deref_mut(), b),
+                    Chunk::Stderr(b) => ("stderr", stderr.as_deref_mut(), b),
                     Chunk::Stopped => {
                         if let Some(stops) = &stops {
                             let _reported = stops.send(());
@@ -1213,16 +1252,28 @@ impl StableRemoteManagedDriver {
                         continue;
                     }
                 };
-                if let Some(w) = sink {
-                    drop(w.write_all(&bytes).await);
-                    drop(w.flush().await);
+                let Some(w) = sink else { continue };
+                let wrote = match w.write_all(&bytes).await {
+                    Ok(()) => w.flush().await,
+                    Err(e) => Err(e),
+                };
+                if let Err(e) = wrote {
+                    unwritten = unwritten.saturating_add(bytes.len());
+                    first_error.get_or_insert((stream, e));
                 }
             }
-            // The drain thread dropped its sender, so no more output is coming.
-            // Park rather than resolve: the run's terminal result is what ends
-            // the select below. `Infallible` says that in the type, so the
-            // select's other arm needs no unreachable branch.
-            std::future::pending::<std::convert::Infallible>().await
+            // The drain thread dropped its sender after the terminal frame, so
+            // every chunk the plugin wrote before it has been relayed.
+            if let Some((stream, error)) = first_error {
+                tracing::warn!(
+                    driver,
+                    request_id = %request_id,
+                    stream,
+                    %error,
+                    unwritten_bytes = unwritten,
+                    "a plugin run's output did not all reach its sink"
+                );
+            }
         };
 
         // Forward each relayed signal as a frame. Parks, holding `in_tx`, once
@@ -1267,8 +1318,6 @@ impl StableRemoteManagedDriver {
         };
 
         let result = {
-            let background = futures::future::join(pump, relay);
-            futures::pin_mut!(background);
             // By the run's own key when it has one: `ct` is this run's token
             // (a timed run's own, a request cancel forwarded into it), so its
             // firing names this run, not every run of the request. The plugin
@@ -1279,15 +1328,20 @@ impl StableRemoteManagedDriver {
                 run_cancel(&self.inner, ct, cancel_key.as_deref(), &request_id),
                 rx,
             );
-            futures::pin_mut!(run);
-            // `pump` and `relay` never complete; the run's terminal result ends
-            // the select, which drops `relay` and with it `in_tx`, ending the
-            // request stream after the terminal frame (N11).
-            match futures::future::select(run, background).await {
-                futures::future::Either::Left((out, _)) => out,
-                // Both resolve to `Infallible`, so this arm is uninhabited:
-                // only the run's terminal result can win the select.
-                futures::future::Either::Right(((never, _), _)) => match never {},
+            // The run's result and the pump's end, together: the pump ends
+            // only once the drain thread has sent the result and closed the
+            // queue, so the run returns after every chunk queued before its
+            // terminal frame reached the sinks — not with some still queued.
+            let drained = futures::future::join(run, pump);
+            futures::pin_mut!(drained, relay);
+            // `relay` never completes; the drained run ends the select, which
+            // drops `relay` and with it `in_tx`, ending the request stream
+            // after the terminal frame (N11).
+            match futures::future::select(drained, relay).await {
+                futures::future::Either::Left(((out, ()), _)) => out,
+                // `relay` resolves to `Infallible`, so this arm is
+                // uninhabited: only the drained run can win the select.
+                futures::future::Either::Right((never, _)) => match never {},
             }
         };
         match result {
@@ -1593,6 +1647,22 @@ mod tests {
             ("not a version", false),
         ] {
             assert_eq!(reads_cancel_key(v), reads, "{v}");
+        }
+    }
+
+    /// `log_capture` is sent only to a plugin from 0.21.1 on; an older one, or
+    /// one whose version does not parse, keeps writing its own log.
+    #[test]
+    fn only_a_plugin_from_0_21_1_reads_log_capture() {
+        for (v, reads) in [
+            ("0.21.0", false),
+            ("0.21.1-rc.1", false),
+            ("0.21.1", true),
+            ("0.21.10", true),
+            (plugin_abi::ABI_SEMVER, true),
+            ("not a version", false),
+        ] {
+            assert_eq!(reads_log_capture(v), reads, "{v}");
         }
     }
 

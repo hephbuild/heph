@@ -1,6 +1,5 @@
 mod entrypoint_mode;
 mod filterenv;
-pub mod redact;
 mod spec;
 
 use anyhow::Context;
@@ -8,6 +7,7 @@ use async_trait::async_trait;
 use hcore::debug_hash::DebugHasher;
 use hcore::hasync::Cancellable;
 use hdriver_support::driver_managed::{ManagedRunRequest, ManagedRunResponse};
+use hdriver_support::redact;
 use hexecrunner::RunnerRef;
 use hplugin::driver::sandbox::EnvValue;
 use hplugin::driver::targetdef::path::{CodegenMode, Content, Path};
