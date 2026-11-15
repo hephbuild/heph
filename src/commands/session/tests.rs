@@ -1813,3 +1813,52 @@ async fn list_shows_newer_format_placeholder() {
         "{msg}"
     );
 }
+
+/// The whole command line, as `main` parses it.
+#[derive(clap::Parser)]
+struct TestCli {
+    #[command(flatten)]
+    _global: crate::commands::global::GlobalOptions,
+    #[command(subcommand)]
+    cmd: crate::commands::Commands,
+}
+
+/// `-D` belongs to `run`: on `session attach` it parses only to be refused
+/// with the reason, before anything is opened; elsewhere clap refuses it.
+#[test]
+fn attach_refuses_dashboard() {
+    use clap::Parser as _;
+    let attach = |argv: &[&str]| -> AttachArgs {
+        let cli = TestCli::try_parse_from(argv).expect("parse");
+        match cli.cmd {
+            crate::commands::Commands::Session(SessionArgs {
+                command: SessionCommands::Attach(a),
+            }) => a,
+            _ => panic!("not `session attach`"),
+        }
+    };
+    for argv in [
+        &["heph", "session", "attach", "-D", "02kf5"][..],
+        &["heph", "session", "attach", "02kf5", "--dashboard"],
+    ] {
+        let err = attach(argv)
+            .refuse_dashboard()
+            .expect_err("attach -D is refused");
+        assert!(
+            format!("{err:#}").contains("--dashboard does not apply to `session attach`"),
+            "{argv:?}: {err:#}"
+        );
+    }
+    attach(&["heph", "session", "attach", "02kf5"])
+        .refuse_dashboard()
+        .expect("attach without -D");
+    for argv in [
+        &["heph", "session", "list", "-D"][..],
+        &["heph", "-D", "run", "//p:t"],
+    ] {
+        assert!(
+            TestCli::try_parse_from(argv).is_err(),
+            "{argv:?}: -D is no global flag"
+        );
+    }
+}

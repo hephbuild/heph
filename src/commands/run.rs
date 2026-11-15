@@ -131,6 +131,14 @@ pub struct RunArgs {
     /// diagnostic box. The full log is always saved as the `log.txt` artifact.
     #[arg(long = "log-lines", value_name = "N", default_value_t = 10)]
     pub log_lines: usize,
+    /// Open the dashboard from the start, and hold the finished build until q
+    ///
+    /// The run starts on the dashboard instead of the line. When it ends,
+    /// whichever screen is up stays until you press q (Esc still steps back
+    /// to the line, which holds too); the exit code is the build's. Without a
+    /// terminal it prints one warning and runs with the plain output.
+    #[arg(short = 'D', long = "dashboard")]
+    pub dashboard: bool,
     /// Print only what the target prints: no TUI, no progress, stderr only for failures
     ///
     /// On an entrypoint, the program runs on your terminal's own fds rather than
@@ -997,6 +1005,7 @@ async fn execute_async(
     let m = resolve_matcher(&args.expr, &args.arg1, &args.arg2, &base_pkg, false)?;
     let (engine, shutdown) = bootstrap::new_engine(&global, session)?;
     let raw = args.raw;
+    let dashboard = args.dashboard;
     let app = RunApp {
         args,
         engine: std::sync::Arc::clone(&engine),
@@ -1067,8 +1076,7 @@ async fn execute_async(
         )
     });
 
-    let result =
-        tui::run_app_with(app, sink, session, interactive, global.dashboard, shutdown).await;
+    let result = tui::run_app_with(app, sink, session, interactive, dashboard, shutdown).await;
     // Stop before teardown so no paragraph races the final summary.
     if let Some(w) = &watchdog {
         w.stop();
@@ -1100,6 +1108,28 @@ mod tests {
         Cli::try_parse_from(std::iter::once("run").chain(argv.iter().copied()))
             .expect("parse")
             .run
+    }
+
+    /// `-D` is the run's own flag, in either place on the label form
+    /// (`r build -D //...`) and the address form; off unless given.
+    #[test]
+    fn dashboard_flag_parses_on_run() {
+        for argv in [
+            &["build", "-D", "//..."][..],
+            &["build", "//...", "-D"],
+            &["-D", "//p:t"],
+            &["--dashboard", "//p:t"],
+        ] {
+            assert!(parse(argv).dashboard, "{argv:?}");
+        }
+        let args = parse(&["build", "-D", "//..."]);
+        assert_eq!(args.arg1.as_deref(), Some("build"));
+        assert_eq!(args.arg2.as_deref(), Some("//..."));
+        assert!(!parse(&["//p:t"]).dashboard);
+        assert!(
+            parse(&["//t:go", "--", "-D"]).args == [OsString::from("-D")],
+            "after `--`, -D is the program's"
+        );
     }
 
     /// Everything after `--` is the program's, in order and verbatim — heph's

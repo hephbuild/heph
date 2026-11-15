@@ -213,14 +213,6 @@ pub struct GlobalOptions {
     /// Disable the interactive TUI (force CI/log-only output)
     #[arg(long = "no-tui", global = true)]
     pub no_tui: bool,
-    /// Open the dashboard from the start, and hold the finished build until q
-    ///
-    /// The run starts on the dashboard instead of the line. When it ends,
-    /// whichever screen is up stays until you press q (Esc still steps back
-    /// to the line, which holds too); the exit code is the build's. Without a
-    /// terminal it prints one warning and runs with the plain output.
-    #[arg(short = 'D', long = "dashboard", global = true)]
-    pub dashboard: bool,
     /// Fail fast: stop at the first target failure instead of running every
     /// matched target and reporting all failures at the end
     #[arg(long = "fail-fast", visible_alias = "ff", global = true)]
