@@ -26,6 +26,10 @@ pub const DEFAULT_CACHE_CONCURRENCY: usize = 256;
 /// `#[schemars(description)]` replaces a doc comment written for maintainers.
 #[derive(Debug, Deserialize, Default, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[schemars(
+    description = "heph workspace configuration: the base `.hephconfig`, or a profile \
+                   (`<profile>.hephconfig`) laid over it."
+)]
 pub struct ConfigYaml {
     /// Pinned heph version (or, in future, a version constraint) this workspace
     /// expects. When set and it differs from the running binary, the self-upgrade
@@ -76,6 +80,11 @@ pub struct ConfigYaml {
     /// `plugin`. A `builtin:` entry selects a compiled-in plugin by name; a
     /// `path:`/`url:` entry points at a `*-plugin.json` manifest for a loadable
     /// cdylib. Each carries an `options:` map passed to plugin construction.
+    #[schemars(
+        description = "The plugins this workspace loads: every provider and driver comes from \
+                       one. `builtin:` names one compiled into heph; `path:` or `url:` points at \
+                       a `*-plugin.json` manifest. Each entry's `options:` is passed to the plugin."
+    )]
     #[serde(default)]
     pub plugins: Vec<PluginSpec>,
     /// Byte limits of the local cache's in-memory tier. `capacityBytes: 0`
@@ -84,6 +93,10 @@ pub struct ConfigYaml {
     pub mem_cache: Option<MemCacheConfig>,
     /// Scratch-cache policy: which lineage a run writes to and which it may read
     /// from. See [`ScratchConfig`].
+    #[schemars(
+        description = "Scratch-cache policy: which lineage a run writes to, and which it may \
+                       read from."
+    )]
     #[serde(default)]
     pub scratch: Option<ScratchConfig>,
     /// Byte limits of the in-memory store for uncacheable outputs; an entry that
@@ -105,6 +118,11 @@ pub struct ConfigYaml {
     /// Named remote (shared) caches. Each entry is keyed by a name and carries a
     /// `uri` plus `read`/`write` permissions. Parsed as patches so a profile can
     /// override individual fields; resolve with [`ConfigYaml::resolved_caches`].
+    #[schemars(
+        description = "Named remote (shared) caches. Each entry has a `uri`, plus `read` and \
+                       `write` (both default `true`). A profile may set one field of an entry \
+                       and inherit the rest."
+    )]
     #[serde(default)]
     pub caches: BTreeMap<String, RemoteCacheConfigPatch>,
     /// Anonymous usage telemetry; on unless `enabled: false`.
@@ -237,14 +255,32 @@ impl<'de> Deserialize<'de> for ResourcesConfig {
 }
 
 /// One pool as YAML spells it: the amount alone, or `{unit, value}`.
-#[derive(Deserialize)]
-#[serde(
-    untagged,
-    expecting = "an amount (2, 0.5, \"24G\", \"50%\") or {unit: <count|cpu|bytes>, value: <amount>}"
-)]
 enum PoolValue {
     Scalar(Scalar),
     Full(FullDecl),
+}
+
+const POOL_VALUE_EXPECTING: &str =
+    "an amount (2, 0.5, \"24G\", \"50%\") or {unit: <count|cpu|bytes>, value: <amount>}";
+
+// Hand-rolled rather than `untagged`: a mapping is always the `{unit, value}`
+// form, so its own error (an unknown field, by name) reaches the user instead
+// of untagged's "matched no variant".
+impl<'de> Deserialize<'de> for PoolValue {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let value = serde_yaml::Value::deserialize(d)?;
+        if value.is_mapping() {
+            serde_yaml::from_value(value)
+                .map(Self::Full)
+                .map_err(D::Error::custom)
+        } else {
+            serde_yaml::from_value(value)
+                .map(Self::Scalar)
+                // Which scalar form failed says less than what was expected.
+                .map_err(|_scalar| D::Error::custom(POOL_VALUE_EXPECTING))
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -431,6 +467,11 @@ pub struct CacheConfig {
     /// Blobs strictly larger than this spill to plain files under
     /// `<home>/cache/blobs/` instead of being stored inline in the sqlite DB.
     /// Manifests always stay in sqlite. Omit to use the engine default.
+    #[schemars(
+        description = "Blobs strictly larger than this many bytes spill to plain files under \
+                       `<home>/cache/blobs/` instead of being stored inline in the cache \
+                       database. Omit for heph's default."
+    )]
     #[serde(default)]
     pub spill_threshold_bytes: Option<u64>,
 }
@@ -448,6 +489,10 @@ pub struct CacheConfig {
 /// opt out of the isolation the repo just configured.
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq, Default, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[schemars(
+    description = "Scratch-cache policy: which lineage a run writes to (`scope`), and which \
+                   lineages it may read from when its own has nothing (`restoreScopes`)."
+)]
 pub struct ScratchConfig {
     /// The lineage this run **writes** to. Supports `${git:branch}`, which heph
     /// resolves itself so a developer gets branch scoping without wiring
@@ -455,6 +500,10 @@ pub struct ScratchConfig {
     ///
     /// Empty (the default) means one shared lineage — today's behaviour, and the
     /// right answer for a single long-lived branch.
+    #[schemars(
+        description = "The lineage this run writes to, e.g. `${git:branch}` (heph resolves the \
+                       current branch). Omitted is one lineage shared by every run."
+    )]
     #[serde(default)]
     pub scope: Option<String>,
     /// Lineages this run may **read** from when its own scope has nothing, tried
@@ -463,6 +512,10 @@ pub struct ScratchConfig {
     ///
     /// Writes never go here — that isolation is what makes the feature safe to
     /// enable on untrusted PR CI at all.
+    #[schemars(
+        description = "Lineages this run may read from when its own `scope` has nothing, tried \
+                       in order, e.g. `[master]`. A run never writes to them."
+    )]
     #[serde(default)]
     pub restore_scopes: Vec<String>,
     /// Copy the fallback lineage's directory into this scope on the first build
@@ -474,6 +527,11 @@ pub struct ScratchConfig {
     /// branch scoping just makes every branch switch cold — which is worse than
     /// not scoping at all. Turn it off if a slot is large and the filesystem has
     /// no reflink.
+    #[schemars(
+        description = "On the first build in a new `scope`, start from a copy of the lineage \
+                       it restores from instead of cold. Default `true`; turn it off when a \
+                       scratch cache is large and the filesystem has no reflink."
+    )]
     #[serde(default)]
     pub seed_on_fork: Option<bool>,
 }
@@ -597,6 +655,7 @@ impl Default for TelemetryConfig {
 /// so every walk prunes the same directories.
 #[derive(Debug, Deserialize, Default, Clone, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[schemars(description = "Filesystem-walk settings shared by every plugin that walks the tree.")]
 pub struct FsConfig {
     /// Root-relative directories and globs no tree walk enters: package
     /// discovery, `fs` globs and the Go provider alike.
@@ -607,6 +666,11 @@ pub struct FsConfig {
     /// such as `.heph-gocache`). A directory named `.heph*` is never source — a
     /// `BUILD` file inside one is not a package, and an address in one does not
     /// resolve.
+    #[schemars(
+        description = "Root-relative directories and globs no tree walk enters: package \
+                       discovery, `fs` globs and the Go provider alike. `.git` and every \
+                       directory named `.heph*` are always skipped."
+    )]
     #[serde(default)]
     pub skip: Vec<String>,
 }
@@ -615,11 +679,16 @@ pub struct FsConfig {
 /// (the local-cache mem tier) and `tmp_cache` (the tmp/uncacheable store).
 #[derive(Debug, Deserialize, Clone, Copy, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[schemars(description = "Byte limits of one in-memory cache store. Both fields are required.")]
 pub struct MemCacheConfig {
     /// The largest single entry the store keeps, in bytes.
     pub per_entry_bytes: usize,
     /// Total byte budget. For `mem_cache`, `0` disables the layer entirely; for
     /// `tmp_cache`, entries that would exceed it spill to the durable cache.
+    #[schemars(
+        description = "Total byte budget. Under `memCache`, `0` disables the tier; under \
+                       `tmpCache`, an entry that would exceed it spills to the durable cache."
+    )]
     pub capacity_bytes: u64,
 }
 

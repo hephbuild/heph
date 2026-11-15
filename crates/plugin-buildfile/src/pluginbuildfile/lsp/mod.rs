@@ -84,6 +84,14 @@ pub fn explain(target: &str, json: bool) -> anyhow::Result<String> {
         .parse()
         .with_context(|| format!("column {col:?} in {target:?}"))?;
     let text = std::fs::read_to_string(file).with_context(|| format!("reading {file}"))?;
+    let pos = lsp_types::Position::new(line.saturating_sub(1), col.saturating_sub(1));
+    let is_config = std::path::Path::new(file)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(hconfig::is_config_file_name);
+    if is_config {
+        return explain_config(file, line, col, &text, pos, json);
+    }
     let tokens = lex::lex(&text);
     let parsed = starlark::syntax::AstModule::parse(
         file,
@@ -92,7 +100,6 @@ pub fn explain(target: &str, json: bool) -> anyhow::Result<String> {
     )
     .ok();
     let overlay = parsed.as_ref().map(site::overlay_of);
-    let pos = lsp_types::Position::new(line.saturating_sub(1), col.saturating_sub(1));
     let resolution = match position::to_offset(&text, pos, position::Encoding::Utf32) {
         Some(offset) => site::resolve(
             &site::Doc {
@@ -145,6 +152,36 @@ pub fn explain(target: &str, json: bool) -> anyhow::Result<String> {
         .flatten()
     {
         out.push_str(&format!("\n  degraded: {d}"));
+    }
+    Ok(out)
+}
+
+/// [`explain`] for a `.hephconfig` document: the config cursor's
+/// classification (key or value position, its path, the prefix typed) instead
+/// of a Starlark site.
+fn explain_config(
+    file: &str,
+    line: u32,
+    col: u32,
+    text: &str,
+    pos: lsp_types::Position,
+    json: bool,
+) -> anyhow::Result<String> {
+    use anyhow::Context as _;
+    let offset = position::to_offset(text, pos, position::Encoding::Utf32);
+    let value = hephconfig::explain(text, offset);
+    if json {
+        let mut out = serde_json::json!({ "file": file, "line": line, "col": col });
+        if let (Some(map), serde_json::Value::Object(r)) = (out.as_object_mut(), value) {
+            map.extend(r);
+        }
+        return serde_json::to_string_pretty(&out).context("rendering the classification");
+    }
+    let mut out = format!("{file}:{line}:{col}\n  document: hephconfig");
+    for key in ["kind", "path", "prefix", "in_schema"] {
+        if let Some(v) = value.get(key).filter(|v| !v.is_null()) {
+            out.push_str(&format!("\n  {key}: {v}"));
+        }
     }
     Ok(out)
 }

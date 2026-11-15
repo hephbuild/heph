@@ -19,8 +19,12 @@
 //! Where the cursor is comes from [`Scan`], a line-based reading of YAML's
 //! block structure (indentation, `- ` items, `key:`), so it answers on a
 //! document that does not parse, which is most of the time someone is typing.
-//! Flow collections (`{a: 1}`, `[a]`) and multi-line plain scalars are values
-//! it does not look inside; block scalars (`|`, `>`) are skipped.
+//! What it cannot read it leaves opaque rather than guess at: flow collections
+//! (`{a: 1}`, `[a]`) and quoted scalars, including the lines they continue
+//! onto; block scalars (`|`, `>`); a key behind a tag, an anchor or `?`; a line
+//! indented with a tab; and a key out of line with its siblings. Nothing under
+//! an opaque line is completed or checked, so the parser's error, when there
+//! is one, is the only word on it.
 
 use std::sync::LazyLock;
 
@@ -35,15 +39,20 @@ use super::position::{self, Encoding};
 /// Built once per server: the schema never changes under a running binary.
 static SCHEMA: LazyLock<Value> = LazyLock::new(hconfig::config_json_schema);
 
-/// One step of a key path: a mapping key, or a sequence item.
+/// A plugin entry's source keys: an entry sets exactly one.
+const PLUGIN_SOURCES: [&str; 3] = ["builtin", "path", "url"];
+
+/// One step of a key path: a mapping key, a sequence item, or a line the
+/// scanner could not read, beneath which nothing is the schema's.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Seg {
     Key(String),
     Item,
+    Opaque,
 }
 
 /// An open mapping key or sequence item, while scanning.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct Frame {
     /// The column of the key, or of the `-`.
     indent: usize,
@@ -53,10 +62,12 @@ struct Frame {
     open: bool,
     /// Tells two items of one sequence apart, so their keys are not siblings.
     id: usize,
+    /// The column of its first child key, which every later one must share.
+    child: Option<usize>,
 }
 
 /// One `key:` of the document, with where it sits.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct KeyEntry {
     line_start: usize,
     /// Byte span of the key (quotes included), absolute.
@@ -71,6 +82,8 @@ struct KeyEntry {
 #[derive(Debug, Default)]
 struct Shape<'a> {
     indent: usize,
+    /// The indentation holds a tab, which YAML refuses: the line is not read.
+    tab: bool,
     /// Column of each `- ` before the content.
     dashes: Vec<usize>,
     /// Column where the content after indentation and dashes starts.
@@ -90,8 +103,12 @@ struct KeyTok<'a> {
 
 fn shape(line: &str) -> Shape<'_> {
     let bytes = line.as_bytes();
-    let mut i = bytes.iter().take_while(|b| **b == b' ').count();
-    let indent = i;
+    let indent = bytes
+        .iter()
+        .take_while(|b| matches!(b, b' ' | b'\t'))
+        .count();
+    let tab = bytes.get(..indent).is_some_and(|l| l.contains(&b'\t'));
+    let mut i = indent;
     let mut dashes = Vec::new();
     while bytes.get(i) == Some(&b'-') && matches!(bytes.get(i + 1), None | Some(b' ' | b'\t')) {
         dashes.push(i);
@@ -101,7 +118,7 @@ fn shape(line: &str) -> Shape<'_> {
         }
     }
     let content = i;
-    let key = key_at(line, content);
+    let key = if tab { None } else { key_at(line, content) };
     let value = key.as_ref().and_then(|k| {
         let mut v = k.colon + 1;
         while matches!(bytes.get(v), Some(b' ' | b'\t')) {
@@ -112,6 +129,7 @@ fn shape(line: &str) -> Shape<'_> {
     });
     Shape {
         indent,
+        tab,
         dashes,
         content,
         key,
@@ -121,7 +139,8 @@ fn shape(line: &str) -> Shape<'_> {
 
 /// The `key:` starting at column `at`, if one does: a plain key ends at the
 /// first `:` followed by a blank or the line's end; a quoted one at its
-/// closing quote, which a `:` must follow.
+/// closing quote, which a `:` must follow. A key behind a tag, an anchor or a
+/// `?`, and a `:` with no key before it, are not read.
 fn key_at(line: &str, at: usize) -> Option<KeyTok<'_>> {
     let bytes = line.as_bytes();
     let first = *bytes.get(at)?;
@@ -141,14 +160,17 @@ fn key_at(line: &str, at: usize) -> Option<KeyTok<'_>> {
             name: line.get(at + 1..close).unwrap_or_default(),
         });
     }
-    if matches!(first, b'#' | b'{' | b'[' | b'&' | b'*' | b'!' | b'|' | b'>') {
+    if matches!(
+        first,
+        b'#' | b'{' | b'[' | b'&' | b'*' | b'!' | b'|' | b'>' | b'?'
+    ) {
         return None;
     }
     let mut j = at;
     while let Some(&b) = bytes.get(j) {
         if colon_ok(j) {
             let name = line.get(at..j)?.trim_end();
-            return Some(KeyTok {
+            return (!name.is_empty()).then_some(KeyTok {
                 start: at,
                 end: at + name.len(),
                 colon: j,
@@ -163,30 +185,93 @@ fn key_at(line: &str, at: usize) -> Option<KeyTok<'_>> {
     None
 }
 
+/// What a line leaves open for the lines after it: flow-collection brackets,
+/// a quoted scalar, and whether a plain scalar is still running.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Flow {
+    depth: usize,
+    quote: Option<u8>,
+    plain: bool,
+}
+
+impl Flow {
+    fn open(&self) -> bool {
+        self.depth > 0 || self.quote.is_some()
+    }
+}
+
+/// Read `text` on from `flow`: the state at its end, and where a comment
+/// starts, if one does. A quote or a bracket opens something only where a
+/// scalar could start (`it's` and `a[0]` are plain text); a `#` is a comment
+/// only outside quotes and after a blank.
+fn read_flow(text: &str, mut flow: Flow) -> (Flow, Option<usize>) {
+    let bytes = text.as_bytes();
+    let mut escaped = false;
+    let mut prev_blank = true;
+    for (i, &b) in bytes.iter().enumerate() {
+        let blank = b == b' ' || b == b'\t';
+        match flow.quote {
+            Some(b'"') => {
+                if escaped {
+                    escaped = false;
+                } else if b == b'\\' {
+                    escaped = true;
+                } else if b == b'"' {
+                    flow.quote = None;
+                }
+            }
+            Some(q) => {
+                if b == q {
+                    flow.quote = None;
+                }
+            }
+            None if b == b'#' && prev_blank => return (flow, Some(i)),
+            None if blank => {}
+            None if flow.plain => {
+                // A plain scalar runs on to a flow indicator (inside a
+                // collection) or to `: `.
+                if flow.depth > 0 && matches!(b, b',' | b']' | b'}') {
+                    flow.plain = false;
+                    if b != b',' {
+                        flow.depth = flow.depth.saturating_sub(1);
+                    }
+                } else if b == b':' && matches!(bytes.get(i + 1), None | Some(b' ' | b'\t')) {
+                    flow.plain = false;
+                }
+            }
+            None => match b {
+                b'"' | b'\'' => flow.quote = Some(b),
+                b'[' | b'{' => flow.depth += 1,
+                b']' | b'}' => flow.depth = flow.depth.saturating_sub(1),
+                b',' | b':' | b'?' => {}
+                _ => flow.plain = true,
+            },
+        }
+        prev_blank = blank;
+    }
+    (flow, None)
+}
+
 /// `text` up to a ` #` comment that is not inside quotes.
 fn strip_comment(text: &str) -> &str {
-    let mut quote: Option<u8> = None;
-    let mut prev_blank = true;
-    for (i, b) in text.bytes().enumerate() {
-        match quote {
-            Some(q) if b == q => quote = None,
-            Some(_) => {}
-            None if b == b'"' || b == b'\'' => quote = Some(b),
-            None if b == b'#' && prev_blank => return text.get(..i).unwrap_or(text),
-            None => {}
-        }
-        prev_blank = b == b' ' || b == b'\t';
+    match read_flow(text, Flow::default()).1 {
+        Some(i) => text.get(..i).unwrap_or(text),
+        None => text,
     }
-    text
 }
 
 /// The block structure above a position: the stack of open keys and items.
 #[derive(Default)]
 struct Scan {
     stack: Vec<Frame>,
+    /// The column of the first top-level key.
+    root_child: Option<usize>,
     /// Inside a block scalar opened by a key at this column: lines deeper than
     /// it are text.
     block_scalar: Option<usize>,
+    /// Inside a flow collection or quoted scalar an earlier line opened: lines
+    /// are opaque until it closes.
+    cont: Option<Flow>,
     next_id: usize,
 }
 
@@ -198,6 +283,7 @@ impl Scan {
             seg,
             open,
             id: self.next_id,
+            child: None,
         });
     }
 
@@ -221,6 +307,22 @@ impl Scan {
         }
     }
 
+    /// Whether a key at column `k` lines up with its siblings: a mapping's
+    /// first key sets the column, and YAML refuses a later one elsewhere.
+    fn aligned(&mut self, k: usize) -> bool {
+        let slot = match self.stack.last_mut() {
+            Some(top) => &mut top.child,
+            None => &mut self.root_child,
+        };
+        match *slot {
+            Some(c) => c == k,
+            None => {
+                *slot = Some(k);
+                true
+            }
+        }
+    }
+
     fn path(&self) -> Vec<Seg> {
         self.stack.iter().map(|f| f.seg.clone()).collect()
     }
@@ -229,11 +331,12 @@ impl Scan {
         self.stack.iter().map(|f| f.id).collect()
     }
 
-    /// Whether a line at this indent is block-scalar text. Closes the scalar
-    /// at the first line that is not.
-    fn in_block_scalar(&mut self, s: &Shape<'_>, blank: bool) -> bool {
+    /// Whether a line is block-scalar text: blank, or deeper than the key that
+    /// opened the scalar (`indent`: the line's, or a blank line's cursor
+    /// column). Closes the scalar at the first line that is not.
+    fn in_block_scalar(&mut self, indent: usize, blank: bool) -> bool {
         match self.block_scalar {
-            Some(k) if blank || s.indent > k => true,
+            Some(k) if blank || indent > k => true,
             Some(_) => {
                 self.block_scalar = None;
                 false
@@ -244,18 +347,38 @@ impl Scan {
 
     /// Feed one whole line; the key it declares, if any.
     fn feed(&mut self, line_start: usize, line: &str) -> Option<KeyEntry> {
-        let s = shape(line);
-        let blank =
-            s.dashes.is_empty() && matches!(line.as_bytes().get(s.content), None | Some(b'#'));
-        if self.in_block_scalar(&s, blank) || blank {
+        if let Some(open) = self.cont {
+            let (flow, _) = read_flow(line, open);
+            self.cont = flow.open().then_some(flow);
             return None;
         }
+        let s = shape(line);
+        let rest = line.get(s.content..).unwrap_or_default();
+        let empty = rest.is_empty() || rest.starts_with('#');
+        let blank = s.dashes.is_empty() && empty;
+        if self.in_block_scalar(s.indent, blank) || blank {
+            return None;
+        }
+        let (flow, _) = read_flow(rest, Flow::default());
+        self.cont = flow.open().then_some(flow);
         for &d in &s.dashes {
             self.pop_for_dash(d);
             self.push(d, Seg::Item, true);
         }
-        let key = s.key?;
+        let Some(key) = s.key else {
+            // Content the scanner cannot read as a key: whatever sits under
+            // it is not the schema's to judge.
+            if !empty {
+                self.pop_for_key(s.content);
+                self.push(s.content, Seg::Opaque, false);
+            }
+            return None;
+        };
         self.pop_for_key(key.start);
+        if !self.aligned(key.start) {
+            self.push(key.start, Seg::Opaque, false);
+            return None;
+        }
         let entry = KeyEntry {
             line_start,
             start: line_start + key.start,
@@ -274,14 +397,27 @@ impl Scan {
     }
 }
 
+/// A leading byte-order mark's length: the text starts after it.
+fn bom(text: &str) -> usize {
+    if text.starts_with('\u{feff}') {
+        '\u{feff}'.len_utf8()
+    } else {
+        0
+    }
+}
+
 /// Each line with its absolute start, without its line break.
 fn lines(text: &str) -> impl Iterator<Item = (usize, &str)> {
-    let mut start = 0;
-    text.split_inclusive('\n').map(move |l| {
-        let s = start;
-        start += l.len();
-        (s, l.trim_end_matches(['\n', '\r']))
-    })
+    let skip = bom(text);
+    let mut start = skip;
+    text.get(skip..)
+        .unwrap_or_default()
+        .split_inclusive('\n')
+        .map(move |l| {
+            let s = start;
+            start += l.len();
+            (s, l.trim_end_matches(['\n', '\r']))
+        })
 }
 
 /// Every key of the document, in order.
@@ -295,10 +431,19 @@ fn keys(text: &str) -> Vec<KeyEntry> {
 /// The line holding `offset`: its start and its text.
 fn line_at(text: &str, offset: usize) -> Option<(usize, &str)> {
     let before = text.get(..offset)?;
-    let start = before.rfind('\n').map_or(0, |i| i + 1);
+    let start = before.rfind('\n').map_or_else(|| bom(text), |i| i + 1);
     let rest = text.get(start..)?;
     let end = rest.find('\n').unwrap_or(rest.len());
     Some((start, rest.get(..end)?.trim_end_matches('\r')))
+}
+
+/// The block structure above the line starting at `line_start`.
+fn scan_to(text: &str, line_start: usize) -> Option<Scan> {
+    let mut scan = Scan::default();
+    for (start, l) in lines(text.get(..line_start)?) {
+        scan.feed(start, l);
+    }
+    Some(scan)
 }
 
 /// What the cursor is on.
@@ -332,17 +477,21 @@ fn is_key_char(b: u8) -> bool {
 }
 
 /// Classify `offset`. `None` inside a block scalar, a flow collection, a
-/// comment, or after a scalar list item: no key or value of the schema's.
+/// quoted scalar, a comment, a tab-indented line, or after a scalar list item:
+/// no key or value of the schema's.
 pub(crate) fn cursor(text: &str, offset: usize) -> Option<Cursor> {
     let (line_start, line) = line_at(text, offset)?;
-    let col = offset - line_start;
-    let mut scan = Scan::default();
-    for (start, l) in lines(text.get(..line_start)?) {
-        scan.feed(start, l);
+    let col = offset.checked_sub(line_start)?;
+    let mut scan = scan_to(text, line_start)?;
+    if scan.cont.is_some() {
+        return None;
     }
     let full = shape(line);
-    let blank = matches!(line.as_bytes().get(full.content), None | Some(b'#'));
-    if scan.in_block_scalar(&full, blank && full.dashes.is_empty()) {
+    let blank =
+        full.dashes.is_empty() && matches!(line.as_bytes().get(full.content), None | Some(b'#'));
+    // On a blank line the cursor's column is what a typed character's
+    // indentation would be.
+    if scan.in_block_scalar(if blank { col } else { full.indent }, false) || full.tab {
         return None;
     }
     let bytes = line.as_bytes();
@@ -412,6 +561,27 @@ pub(crate) fn cursor(text: &str, offset: usize) -> Option<Cursor> {
     })
 }
 
+/// `--explain` for a config document: the cursor's classification, as one
+/// JSON object. `offset` is `None` for a position past the end.
+pub(crate) fn explain(text: &str, offset: Option<usize>) -> Value {
+    let (kind, path, prefix) = match offset.and_then(|o| cursor(text, o)) {
+        Some(Cursor::Key {
+            parent_path,
+            prefix,
+            ..
+        }) => ("key", Some(parent_path), Some(prefix)),
+        Some(Cursor::Value { path, prefix, .. }) => ("value", Some(path), Some(prefix)),
+        None => ("none", None, None),
+    };
+    serde_json::json!({
+        "document": "hephconfig",
+        "kind": kind,
+        "path": path.as_deref().map(display_path),
+        "in_schema": path.as_deref().is_some_and(|p| node_at(p).is_some()),
+        "prefix": prefix,
+    })
+}
+
 /// The schema node at `path`, from the root.
 fn node_at<'a>(path: &[Seg]) -> Option<&'a Value> {
     path.iter().try_fold(&*SCHEMA, |node, seg| child(node, seg))
@@ -429,12 +599,17 @@ fn deref(v: &Value) -> &Value {
 }
 
 /// `v` and every alternative it allows (`anyOf`/`oneOf`), refs followed and
-/// `null` left out.
+/// `null` left out. Each node is visited once, so a `$ref` cycle ends.
 fn branches(v: &Value) -> Vec<&Value> {
     let mut out = Vec::new();
+    let mut seen: Vec<&Value> = Vec::new();
     let mut todo = vec![v];
     while let Some(v) = todo.pop() {
         let v = deref(v);
+        if seen.iter().any(|s| std::ptr::eq(*s, v)) {
+            continue;
+        }
+        seen.push(v);
         if v.get("type").and_then(Value::as_str) == Some("null") {
             continue;
         }
@@ -460,6 +635,7 @@ fn child<'a>(node: &'a Value, seg: &Seg) -> Option<&'a Value> {
             .and_then(|p| p.get(k))
             .or_else(|| b.get("additionalProperties").filter(|a| a.is_object())),
         Seg::Item => b.get("items"),
+        Seg::Opaque => None,
     })
 }
 
@@ -493,6 +669,16 @@ fn closed(node: &Value) -> bool {
             .all(|b| b.get("additionalProperties") == Some(&Value::Bool(false)))
 }
 
+/// Whether `b` allows `ty`: `"type": "<ty>"`, or a list holding it (how
+/// schemars writes an `Option`, `["boolean", "null"]`).
+fn allows_type(b: &Value, ty: &str) -> bool {
+    match b.get("type") {
+        Some(Value::String(s)) => s == ty,
+        Some(Value::Array(a)) => a.iter().any(|t| t.as_str() == Some(ty)),
+        _ => false,
+    }
+}
+
 /// The literal values `node` allows, with their descriptions.
 fn values(node: &Value) -> Vec<(String, Option<&str>)> {
     fn add<'a>(out: &mut Vec<(String, Option<&'a str>)>, v: String, d: Option<&'a str>) {
@@ -516,7 +702,7 @@ fn values(node: &Value) -> Vec<(String, Option<&str>)> {
                 add(&mut out, e, None);
             }
         }
-        if b.get("type").and_then(Value::as_str) == Some("boolean") {
+        if allows_type(b, "boolean") {
             add(&mut out, "true".to_string(), None);
             add(&mut out, "false".to_string(), None);
         }
@@ -573,51 +759,82 @@ fn description(node: &Value) -> Option<String> {
         .map(clean_doc)
 }
 
-/// A doc comment as Markdown for an editor: rustdoc intra-doc links
-/// (`` [`X`] ``, `` [`x`](Self::x) ``) become their text, URLs stay links.
+/// A doc comment as Markdown for an editor: a rustdoc intra-doc link
+/// (`` [`X`] ``, `` [`x`](Self::x) ``, `[text](crate::X)`) becomes its text,
+/// a URL stays a link, and everything else, inline code and plain brackets
+/// (`a[0]`) included, is left as written.
 fn clean_doc(doc: &str) -> String {
     let mut out = String::with_capacity(doc.len());
     let mut rest = doc;
-    while let Some(open) = rest.find('[') {
-        out.push_str(rest.get(..open).unwrap_or_default());
-        let after = rest.get(open + 1..).unwrap_or_default();
-        let Some(close) = after.find(']') else {
-            out.push_str(rest.get(open..).unwrap_or_default());
-            return out;
-        };
-        let inner = after.get(..close).unwrap_or_default();
-        let tail = after.get(close + 1..).unwrap_or_default();
-        if let Some(target) = tail.strip_prefix('(')
-            && let Some(end) = target.find(')')
-        {
-            let url = target.get(..end).unwrap_or_default();
-            if url.starts_with("http") {
-                out.push_str(&format!("[{inner}]({url})"));
-            } else {
-                out.push_str(inner);
+    while let Some(i) = rest.find(['`', '[']) {
+        out.push_str(rest.get(..i).unwrap_or_default());
+        let tail = rest.get(i..).unwrap_or_default();
+        if tail.starts_with('`') {
+            // Inline code, verbatim through its closing backtick.
+            let code_len = tail
+                .get(1..)
+                .and_then(|t| t.find('`'))
+                .map_or(tail.len(), |j| j + 2);
+            out.push_str(tail.get(..code_len).unwrap_or(tail));
+            rest = tail.get(code_len..).unwrap_or_default();
+            continue;
+        }
+        match intra_doc_link(tail) {
+            Some((text, len)) => {
+                out.push_str(text);
+                rest = tail.get(len..).unwrap_or_default();
             }
-            rest = target.get(end + 1..).unwrap_or_default();
-        } else {
-            out.push_str(inner);
-            rest = tail;
+            None => {
+                out.push('[');
+                rest = tail.get(1..).unwrap_or_default();
+            }
         }
     }
     out.push_str(rest);
     out
 }
 
+/// At a `[`: the text an intra-doc link renders as and the link's length in
+/// `tail`, or `None` when the bracket is not one (prose, or a URL link).
+fn intra_doc_link(tail: &str) -> Option<(&str, usize)> {
+    let close = tail.find(']')?;
+    let inner = tail.get(1..close)?;
+    let after = tail.get(close + 1..).unwrap_or_default();
+    if let Some(target) = after.strip_prefix('(') {
+        let end = target.find(')')?;
+        let url = target.get(..end)?;
+        if url.is_empty() || url.contains(char::is_whitespace) {
+            return None;
+        }
+        if url.starts_with("http://") || url.starts_with("https://") {
+            return None;
+        }
+        // `[text](target)`: the text, the target dropped.
+        return Some((inner, close + 2 + end + 1));
+    }
+    // `` [`X`] ``: the code span alone.
+    let code = inner.len() >= 3
+        && inner.starts_with('`')
+        && inner.ends_with('`')
+        && inner.matches('`').count() == 2;
+    code.then_some((inner, close + 1))
+}
+
 fn display_path(path: &[Seg]) -> String {
     let mut out = String::new();
     for seg in path {
-        match seg {
-            Seg::Key(k) => {
-                if !out.is_empty() {
-                    out.push('.');
-                }
-                out.push_str(k);
+        let name = match seg {
+            Seg::Key(k) => k.as_str(),
+            Seg::Opaque => "?",
+            Seg::Item => {
+                out.push_str("[]");
+                continue;
             }
-            Seg::Item => out.push_str("[]"),
+        };
+        if !out.is_empty() {
+            out.push('.');
         }
+        out.push_str(name);
     }
     out
 }
@@ -659,16 +876,30 @@ pub(crate) fn completion(text: &str, offset: usize, enc: Encoding) -> Vec<Comple
                 .filter(|k| k.parent_ids == parent_ids && k.line_start != line_start)
                 .map(|k| k.name)
                 .collect();
+            // A plugin entry sets exactly one source: once it has one, the
+            // other two are not offered.
+            let has_source = display_path(&parent_path) == "plugins[]"
+                && present.iter().any(|p| PLUGIN_SOURCES.contains(&p.as_str()));
+            // Right after a `-`, the key needs a blank before it.
+            let gap = if start > 0 && text.as_bytes().get(start - 1) == Some(&b'-') {
+                " "
+            } else {
+                ""
+            };
             properties(parent)
                 .into_iter()
-                .filter(|(k, _)| k.starts_with(prefix.as_str()) && !present.iter().any(|p| p == k))
+                .filter(|(k, _)| {
+                    k.starts_with(prefix.as_str())
+                        && !present.iter().any(|p| p == k)
+                        && !(has_source && PLUGIN_SOURCES.contains(k))
+                })
                 .map(|(k, schema)| {
                     let ty = type_summary(schema);
                     let nested = ["object", "list", "map"].contains(&ty.as_str());
                     let new_text = match (has_colon, nested) {
-                        (true, _) => k.to_string(),
-                        (false, true) => format!("{k}:"),
-                        (false, false) => format!("{k}: "),
+                        (true, _) => format!("{gap}{k}"),
+                        (false, true) => format!("{gap}{k}:"),
+                        (false, false) => format!("{gap}{k}: "),
                     };
                     CompletionItem {
                         label: k.to_string(),
@@ -718,10 +949,7 @@ pub(crate) fn completion(text: &str, offset: usize, enc: Encoding) -> Vec<Comple
 /// The hover at `offset`: the key on its line, from the key to the line's end.
 pub(crate) fn hover(text: &str, offset: usize, enc: Encoding) -> Option<Hover> {
     let (line_start, line) = line_at(text, offset)?;
-    let mut scan = Scan::default();
-    for (start, l) in lines(text.get(..line_start)?) {
-        scan.feed(start, l);
-    }
+    let mut scan = scan_to(text, line_start)?;
     let entry = scan.feed(line_start, line).filter(|e| offset >= e.start)?;
     let (start, end) = (entry.start, entry.end);
     let mut path = entry.parent_path;
@@ -750,10 +978,12 @@ pub(crate) fn hover(text: &str, offset: usize, enc: Encoding) -> Option<Hover> {
     })
 }
 
-/// The parser's error, if the document does not load, then every key the
-/// schema does not know.
+/// Every key the schema does not know, then the parser's error if the
+/// document does not load and that error is not one of those keys again.
 pub(crate) fn diagnostics(text: &str, enc: Encoding) -> Vec<Diagnostic> {
     let mut out: Vec<Diagnostic> = Vec::new();
+    // Each flagged key: its start, and its name.
+    let mut flagged: Vec<(usize, String)> = Vec::new();
     for k in keys(text) {
         let Some(parent) = node_at(&k.parent_path) else {
             continue;
@@ -788,37 +1018,67 @@ pub(crate) fn diagnostics(text: &str, enc: Encoding) -> Vec<Diagnostic> {
             message,
             ..Default::default()
         });
+        flagged.push((k.start, k.name));
     }
     // An empty file is the default config, as the loader reads it.
     if text.is_empty() {
         return out;
     }
     if let Err(e) = serde_yaml::from_str::<hconfig::ConfigYaml>(text) {
-        let at = e.location().map_or(0, |l| l.index()).min(text.len());
-        let pos = position::to_position(text, at, enc);
-        // The unknown-key check already said it, with a suggestion.
-        if out.iter().any(|d| d.range.start.line == pos.line) {
-            return out;
+        let at = parser_offset(text, &e);
+        let msg = e.to_string();
+        let named = unknown_field(&msg);
+        // The unknown-key check already said it, with a suggestion: the error
+        // sits on that key, or names it (a hand-rolled type's error sits on
+        // its mapping instead).
+        let said = flagged
+            .iter()
+            .any(|(start, name)| *start == at || named == Some(name.as_str()));
+        if !said {
+            let token = text.get(at..).map_or(0, |r| {
+                r.find(|c: char| c.is_whitespace()).unwrap_or(r.len())
+            });
+            out.push(Diagnostic {
+                range: range(text, at, at + token, enc),
+                severity: Some(DiagnosticSeverity::ERROR),
+                source: Some("heph".to_string()),
+                message: parser_message(&msg),
+                ..Default::default()
+            });
         }
-        let token = text.get(at..).map_or(0, |r| {
-            r.find(|c: char| c.is_whitespace()).unwrap_or(r.len())
-        });
-        out.push(Diagnostic {
-            range: range(text, at, at + token, enc),
-            severity: Some(DiagnosticSeverity::ERROR),
-            source: Some("heph".to_string()),
-            message: parser_message(&e),
-            ..Default::default()
-        });
     }
     out.sort_by_key(|d| (d.range.start.line, d.range.start.character));
     out
 }
 
+/// The byte offset of the parser's error, from its line and column (a column
+/// counts characters, after any byte-order mark).
+fn parser_offset(text: &str, e: &serde_yaml::Error) -> usize {
+    let Some(loc) = e.location() else {
+        return 0;
+    };
+    lines(text)
+        .nth(loc.line().saturating_sub(1))
+        .map_or(text.len(), |(start, line)| {
+            start
+                + line
+                    .char_indices()
+                    .nth(loc.column().saturating_sub(1))
+                    .map_or(line.len(), |(i, _)| i)
+        })
+}
+
+/// The key a serde unknown-field error names: `` unknown field `X` ``, or the
+/// plugin entry's `` unknown plugin field `X` ``.
+fn unknown_field(msg: &str) -> Option<&str> {
+    ["unknown field `", "unknown plugin field `"]
+        .iter()
+        .find_map(|p| msg.split_once(p)?.1.split_once('`').map(|(name, _)| name))
+}
+
 /// The parser's message without its ` at line N column M` suffix: the
 /// diagnostic's range already says where.
-fn parser_message(e: &serde_yaml::Error) -> String {
-    let msg = e.to_string();
+fn parser_message(msg: &str) -> String {
     match msg.rfind(" at line ") {
         Some(i)
             if msg.get(i + " at line ".len()..).is_some_and(|t| {
@@ -826,272 +1086,11 @@ fn parser_message(e: &serde_yaml::Error) -> String {
                     .all(|b| b.is_ascii_digit() || b" column".contains(&b))
             }) =>
         {
-            msg.get(..i).unwrap_or(&msg).to_string()
+            msg.get(..i).unwrap_or(msg).to_string()
         }
-        _ => msg,
+        _ => msg.to_string(),
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    const ENC: Encoding = Encoding::Utf8;
-
-    /// `text` with `|` marking the cursor: the text without it, and the offset.
-    fn at(marked: &str) -> (String, usize) {
-        let offset = marked.find('|').expect("cursor mark");
-        (marked.replacen('|', "", 1), offset)
-    }
-
-    fn labels(marked: &str) -> Vec<String> {
-        let (text, offset) = at(marked);
-        completion(&text, offset, ENC)
-            .into_iter()
-            .map(|i| i.label)
-            .collect()
-    }
-
-    fn key(k: &str) -> Seg {
-        Seg::Key(k.to_string())
-    }
-
-    fn cursor_path(marked: &str) -> Option<(Vec<Seg>, String, bool)> {
-        let (text, offset) = at(marked);
-        match cursor(&text, offset)? {
-            Cursor::Key {
-                parent_path,
-                prefix,
-                ..
-            } => Some((parent_path, prefix, true)),
-            Cursor::Value { path, prefix, .. } => Some((path, prefix, false)),
-        }
-    }
-
-    /// Where a cursor lands: the path, the prefix, and whether it is a key.
-    type Landing<'a> = Option<(Vec<Seg>, &'a str, bool)>;
-
-    /// The adversarial table: each row is a cursor, and where it must land.
-    #[test]
-    fn cursor_classification() {
-        let rows: Vec<(&str, Landing<'_>)> = vec![
-            ("|", Some((vec![], "", true))),
-            ("ca|", Some((vec![], "ca", true))),
-            ("cache:\n  sp|", Some((vec![key("cache")], "sp", true))),
-            ("cache:\n|", Some((vec![], "", true))),
-            ("cache:\n  |", Some((vec![key("cache")], "", true))),
-            // A sibling at the parent's column closes it.
-            ("cache:\n  a: 1\nlo|", Some((vec![], "lo", true))),
-            (
-                "lock:\n  backend: f|",
-                Some((vec![key("lock"), key("backend")], "f", false)),
-            ),
-            (
-                "lock:\n  backend: |",
-                Some((vec![key("lock"), key("backend")], "", false)),
-            ),
-            (
-                "lock:\n  backend: \"m|\"",
-                Some((vec![key("lock"), key("backend")], "m", false)),
-            ),
-            // A sequence at the key's own column, and indented.
-            (
-                "plugins:\n- bu|",
-                Some((vec![key("plugins"), Seg::Item], "bu", true)),
-            ),
-            (
-                "plugins:\n  - bu|",
-                Some((vec![key("plugins"), Seg::Item], "bu", true)),
-            ),
-            (
-                "plugins:\n  - builtin: x\n    op|",
-                Some((vec![key("plugins"), Seg::Item], "op", true)),
-            ),
-            // The second item is its own mapping.
-            (
-                "plugins:\n  - builtin: x\n  - |",
-                Some((vec![key("plugins"), Seg::Item], "", true)),
-            ),
-            // Comments and blank lines change nothing.
-            (
-                "cache:\n  # note\n\n  sp|",
-                Some((vec![key("cache")], "sp", true)),
-            ),
-            // A block scalar's text is not structure (`>` here: `|` is the
-            // cursor mark).
-            ("version: >\n  ca|", None),
-            ("version: >-\n  text\n\n  ca|", None),
-            ("version: >\n  text\nca|", Some((vec![], "ca", true))),
-            // Flow collections and comments are not looked inside.
-            ("fuse: {ena|", None),
-            ("# ca|", None),
-            // A quoted key.
-            ("\"cache\":\n  sp|", Some((vec![key("cache")], "sp", true))),
-            // CRLF line ends.
-            ("cache:\r\n  sp|", Some((vec![key("cache")], "sp", true))),
-            // A value containing `:` is not a second key, nor a value the
-            // schema could complete.
-            ("caches:\n  main:\n    uri: s3://b|", None),
-            (
-                "caches:\n  main:\n    uri: s3|",
-                Some((vec![key("caches"), key("main"), key("uri")], "s3", false)),
-            ),
-            // `key:` with no blank after it is not yet a value position.
-            ("lock:\n  backend:|", None),
-            // Past a scalar list item.
-            ("fs:\n  skip:\n    - a b|", None),
-        ];
-        for (marked, want) in rows {
-            let got = cursor_path(marked);
-            let want = want.map(|(p, s, k)| (p, s.to_string(), k));
-            assert_eq!(got, want, "{marked:?}");
-        }
-    }
-
-    #[test]
-    fn completes_top_level_keys_minus_present() {
-        let got = labels("version: v1\n|");
-        assert!(got.contains(&"cache".to_string()), "{got:?}");
-        assert!(got.contains(&"plugins".to_string()), "{got:?}");
-        assert!(!got.contains(&"version".to_string()), "{got:?}");
-    }
-
-    #[test]
-    fn completes_nested_keys_and_inserts_a_colon() {
-        let (text, offset) = at("cache:\n  sp|");
-        let items = completion(&text, offset, ENC);
-        assert_eq!(
-            items.iter().map(|i| i.label.as_str()).collect::<Vec<_>>(),
-            ["spillThresholdBytes"]
-        );
-        let Some(CompletionTextEdit::Edit(edit)) = &items[0].text_edit else {
-            panic!("no edit")
-        };
-        assert_eq!(edit.new_text, "spillThresholdBytes: ");
-    }
-
-    #[test]
-    fn item_keys_are_per_item() {
-        let got = labels("plugins:\n  - builtin: a\n  - |");
-        assert!(got.contains(&"builtin".to_string()), "{got:?}");
-        let got = labels("plugins:\n  - builtin: a\n    |");
-        assert!(!got.contains(&"builtin".to_string()), "{got:?}");
-        assert!(got.contains(&"options".to_string()), "{got:?}");
-    }
-
-    #[test]
-    fn completes_enum_and_boolean_values() {
-        assert_eq!(labels("lock:\n  backend: |"), ["fs", "mem"]);
-        assert_eq!(labels("lock:\n  backend: m|"), ["mem"]);
-        assert_eq!(labels("telemetry:\n  enabled: |"), ["true", "false"]);
-        let fuse = labels("fuse:\n  enabled: |");
-        assert!(fuse.contains(&"auto".to_string()), "{fuse:?}");
-        assert!(fuse.contains(&"true".to_string()), "{fuse:?}");
-        assert_eq!(
-            labels("resources:\n  gpu:\n    unit: |"),
-            ["count", "cpu", "bytes"]
-        );
-    }
-
-    #[test]
-    fn map_values_complete_their_entry_schema() {
-        let got = labels("caches:\n  main:\n    |");
-        assert!(got.contains(&"uri".to_string()), "{got:?}");
-        assert!(got.contains(&"region".to_string()), "{got:?}");
-        let got = labels("resources:\n  |");
-        assert!(got.contains(&"cpu".to_string()), "{got:?}");
-        assert!(got.contains(&"memory".to_string()), "{got:?}");
-    }
-
-    #[test]
-    fn hover_shows_the_field_doc() {
-        let (text, offset) = at("cache:\n  spill|ThresholdBytes: 10\n");
-        let h = hover(&text, offset, ENC).expect("hover");
-        let HoverContents::Markup(m) = h.contents else {
-            panic!("markup")
-        };
-        assert!(
-            m.value.starts_with("`cache.spillThresholdBytes`: integer"),
-            "{}",
-            m.value
-        );
-        assert!(m.value.contains("spill to plain files"), "{}", m.value);
-        let (text, offset) = at("lock:\n  back|end: fs\n");
-        let HoverContents::Markup(m) = hover(&text, offset, ENC).expect("hover").contents else {
-            panic!("markup")
-        };
-        assert!(m.value.contains("One of `fs`, `mem`."), "{}", m.value);
-    }
-
-    #[test]
-    fn hover_cleans_intra_doc_links() {
-        assert_eq!(clean_doc("See [`ScratchConfig`]."), "See `ScratchConfig`.");
-        assert_eq!(clean_doc("a [`x`](Self::x) b"), "a `x` b");
-        assert_eq!(
-            clean_doc("[docs](https://example.com)"),
-            "[docs](https://example.com)"
-        );
-        assert_eq!(clean_doc("unclosed [a"), "unclosed [a");
-    }
-
-    fn messages(text: &str) -> Vec<String> {
-        diagnostics(text, ENC)
-            .into_iter()
-            .map(|d| {
-                format!(
-                    "{}:{} {}",
-                    d.range.start.line, d.range.start.character, d.message
-                )
-            })
-            .collect()
-    }
-
-    #[test]
-    fn valid_configs_have_no_diagnostics() {
-        for text in [
-            "",
-            "version: v1.2.3\n",
-            "plugins:\n- builtin: exec\n  options:\n    anything: 1\n",
-            "caches:\n  main:\n    uri: s3://b/p\n    read: true\n",
-            "resources:\n  cpu: 50%\n  gpu:\n    unit: count\n    value: 2\n",
-            "scratch:\n  restoreScopes:\n    - master\n",
-            // Block-scalar text that looks like a key is text.
-            "version: |\n  notakey: x\n",
-            "# only a comment\nversion: v1 # trailing\n",
-        ] {
-            assert_eq!(messages(text), Vec::<String>::new(), "{text:?}");
-        }
-    }
-
-    #[test]
-    fn every_unknown_key_is_flagged_with_a_suggestion() {
-        let got = messages("cahce:\n  x: 1\nlock:\n  backnd: fs\n");
-        assert_eq!(
-            got,
-            [
-                "0:0 unknown key `cahce` at the top level: did you mean `cache`?",
-                "3:2 unknown key `backnd` in `lock`: did you mean `backend`?",
-            ]
-        );
-    }
-
-    #[test]
-    fn parser_errors_land_on_their_location() {
-        let got = messages("lock:\n  backend: disk\n");
-        assert_eq!(got.len(), 1, "{got:?}");
-        assert!(got[0].starts_with("1:"), "{got:?}");
-        assert!(got[0].contains("disk"), "{got:?}");
-        assert!(!got[0].contains(" at line "), "{got:?}");
-        let got = messages("resources:\n  Bad: 1\n");
-        assert_eq!(got.len(), 1, "{got:?}");
-        assert!(got[0].contains("not a valid pool name"), "{got:?}");
-        let got = messages("plugins:\n- builtin: a\n  path: b\n");
-        assert!(got.iter().any(|m| m.contains("exactly one")), "{got:?}");
-    }
-
-    #[test]
-    fn syntax_errors_are_reported() {
-        let got = messages("cache: [\n");
-        assert_eq!(got.len(), 1, "{got:?}");
-    }
-}
+mod tests;

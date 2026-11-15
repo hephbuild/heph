@@ -322,7 +322,6 @@ fn uri_key(uri: &Uri) -> Option<LspUri> {
     LspUri::try_from(uri.clone()).ok()
 }
 
-/// The stock hover's text, whichever shape it came in.
 /// Whether `key` names a heph config file, which [`hephconfig`] serves.
 fn is_config(key: &LspUri) -> bool {
     key.path()
@@ -331,6 +330,7 @@ fn is_config(key: &LspUri) -> bool {
         .is_some_and(hconfig::is_config_file_name)
 }
 
+/// The stock hover's text, whichever shape it came in.
 fn hover_text(hover: &Hover) -> String {
     let marked = |m: &MarkedString| match m {
         MarkedString::String(s) => s.clone(),
@@ -407,6 +407,12 @@ impl Server<'_> {
             })),
             #[cfg(feature = "test-support")]
             "heph/explain" => parse::<lsp_types::TextDocumentPositionParams>(&req).map(|p| {
+                if let Some(at) = self.config_at(&p.text_document.uri, p.position) {
+                    return match at {
+                        Some((text, offset)) => hephconfig::explain(text, Some(offset)),
+                        None => hephconfig::explain("", None),
+                    };
+                }
                 self.locate(&p.text_document.uri, p.position)
                     .map_or(Value::Null, |l| l.resolution.to_json())
             }),
