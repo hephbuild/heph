@@ -455,8 +455,10 @@ pub struct SnapshotCounts {
     /// Running targets that are in no lock or admission wait. Counted over the
     /// full lists, so a viewer can tell "every running target waits" from a
     /// capped `status.json`, whose `running` and `waiting` may each be cut.
+    /// `None` when the writer predates the field: a viewer falls back to
+    /// comparing the lists.
     #[serde(default)]
-    pub running_unblocked: u64,
+    pub running_unblocked: Option<u64>,
 }
 
 /// A target with an operation open.

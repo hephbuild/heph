@@ -321,7 +321,7 @@ fn now_cell(
     every: &[&SessionEntry],
     opts: ViewOpts,
 ) -> String {
-    if s.counts.running_unblocked == 0
+    if super::every_running_waits(s)
         && let Some(w) = s.lock_waits.first()
     {
         let holder = match w.holder_pid {

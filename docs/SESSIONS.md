@@ -110,7 +110,9 @@ workspace rooted at `$HOME`, whose home is `~/.heph`.
 build that fails wide would otherwise rewrite megabytes every second, and
 `list` reads it for every session. The counts (`counts`, including
 `running_unblocked`, which `waiting` is derived from) are over the full
-lists. `list` reads only `status.json` and stays cheap; `show` (text and
+lists. A `status.json` without `running_unblocked` (a writer from before the
+field) is read by comparing the `running` and `waiting` lists, as it was
+before the cap. `list` reads only `status.json` and stays cheap; `show` (text and
 `--json`) and `attach` fold `events.ndjson` and have every entry. Past the
 event log's 64 MiB cap a fold is short of the run, so `show --json` prints
 `status.json` instead, capped, and its `totals` say so.

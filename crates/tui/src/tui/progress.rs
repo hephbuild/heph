@@ -1913,7 +1913,7 @@ impl BuildState {
                 in_flight: count(self.in_flight_results.len()),
                 executed: count(self.executed),
                 failed: count(self.errored),
-                running_unblocked: count(running_unblocked),
+                running_unblocked: Some(count(running_unblocked)),
             },
             running,
             waiting,

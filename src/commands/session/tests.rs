@@ -209,7 +209,7 @@ fn state_is_derived() {
                 running: vec![running("//a:b", NOW - 5_000), running("//a:d", NOW)],
                 waiting: vec!["//a:b".to_owned()],
                 counts: SnapshotCounts {
-                    running_unblocked: 1,
+                    running_unblocked: Some(1),
                     ..SnapshotCounts::default()
                 },
                 ..SessionSnapshot::default()
@@ -222,6 +222,10 @@ fn state_is_derived() {
             live(fresh(SessionSnapshot {
                 running: vec![running("//z:z", NOW - 5_000)],
                 waiting: vec!["//a:a".to_owned()],
+                counts: SnapshotCounts {
+                    running_unblocked: Some(0),
+                    ..SnapshotCounts::default()
+                },
                 totals: crate::tui::session::format::ListTotals {
                     waiting: crate::tui::session::format::ListTotal {
                         total: 500,
@@ -329,6 +333,40 @@ fn state_is_derived() {
     // Unknown is what a newer heph's state decodes as.
     let s: SessionState = serde_json::from_str("\"hibernating\"").expect("decode");
     assert_eq!(s, SessionState::Unknown);
+}
+
+/// A `status.json` from a writer without `running_unblocked` (a dev build)
+/// does not read as `waiting` by default: the lists are compared instead.
+#[test]
+fn status_without_running_unblocked_compares_the_lists() {
+    let id = SessionId::new(T0, 1);
+    let status = |running: &[&str], waiting: &[&str]| {
+        let running: Vec<_> = running
+            .iter()
+            .map(|a| serde_json::json!({"addr": a, "op": "execute", "since_unix_ms": NOW - 5_000}))
+            .collect();
+        let json = serde_json::json!({
+            "version": 1,
+            "last_event_unix_ms": NOW - 1_000,
+            "counts": {"in_flight": running.len()},
+            "running": running,
+            "waiting": waiting,
+        });
+        let s: SessionSnapshot = serde_json::from_value(json).expect("an old status.json");
+        assert_eq!(s.counts.running_unblocked, None);
+        entry(meta(id, 10, &["heph", "run"]), true, Some(s))
+    };
+    let state = |e: &SessionEntry| derive_state(e, NOW, Duration::from_secs(60));
+    assert_eq!(
+        state(&status(&["//a:b", "//a:c"], &["//a:b"])),
+        SessionState::Running,
+        "one target runs outside a wait"
+    );
+    assert_eq!(
+        state(&status(&["//a:b"], &["//a:b"])),
+        SessionState::Waiting,
+        "every running target waits"
+    );
 }
 
 #[tokio::test]

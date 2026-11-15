@@ -369,8 +369,20 @@ pub(crate) fn derive_state(entry: &SessionEntry, now_ms: u64, stall: Duration) -
 /// counts, which cover the full lists, never from the lists themselves: in
 /// `status.json` `running` and `waiting` are each cut to their first entries.
 pub(crate) fn all_waiting(status: &crate::tui::session::SessionSnapshot) -> bool {
-    (!status.waiting.is_empty() || status.totals.waiting.total > 0)
-        && status.counts.running_unblocked == 0
+    (!status.waiting.is_empty() || status.totals.waiting.total > 0) && every_running_waits(status)
+}
+
+/// No running target is outside a wait: from `running_unblocked`, or, from a
+/// writer that predates the count, by comparing the lists (exact when neither
+/// was cut).
+pub(crate) fn every_running_waits(status: &crate::tui::session::SessionSnapshot) -> bool {
+    match status.counts.running_unblocked {
+        Some(n) => n == 0,
+        None => status
+            .running
+            .iter()
+            .all(|r| status.waiting.contains(&r.addr)),
+    }
 }
 
 /// What one waiting target waits for, in `list --json` and `show --json`.
