@@ -21,8 +21,10 @@
 //!
 //! The lock state is read with a shared probe, released at once; a directory
 //! removed is then locked exclusively by this process, so two cleanups racing
-//! each other never both act on one directory, and a session cannot start
-//! inside a directory being removed (ids are never reused).
+//! each other never both remove one session, and a session cannot start
+//! inside a directory being removed (ids are never reused). A stale tomb
+//! (see [`TOMB_PREFIX`]) is deleted with no lock, so two cleanups can both
+//! delete one; that is harmless, one of them finds it gone.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

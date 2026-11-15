@@ -547,7 +547,7 @@ async fn commands_run_against_any_source() {
         "{a_json}"
     );
     assert_eq!(a_json["progress"]["total"], serde_json::Value::Null);
-    assert_eq!(a_json["progress"]["running"], 0);
+    assert_eq!(a_json["progress"]["running_ops"], 0);
     assert_eq!(a_json["panicked"], false);
     assert!(a_json.get("format").is_none(), "only on too-new rows");
     let b_json = &json["sessions"][1];
@@ -556,7 +556,7 @@ async fn commands_run_against_any_source() {
     assert_eq!(b_json["now"], serde_json::Value::Null, "it ended");
     assert_eq!(
         b_json["progress"],
-        serde_json::json!({"done": 1, "total": 1, "total_complete": true, "running": 0, "failed": 0})
+        serde_json::json!({"done": 1, "total": 1, "total_complete": true, "running_ops": 0, "failed": 0})
     );
 
     // show: header, folded body, the stuck-on chain, one next action.

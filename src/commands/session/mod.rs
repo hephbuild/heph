@@ -56,6 +56,16 @@ pub enum SessionCommands {
     /// Only this workspace's sessions unless `--all`. Reads each session's
     /// `meta.json` and `status.json`, never its event log.
     ///
+    /// STATE is computed by this viewer:
+    ///
+    /// - `running`: live, with a target working.
+    /// - `waiting`: live, every open target in a lock or admission wait.
+    /// - `quiet`: live, no event for longer than `--stall-notice` (60s when
+    ///   it is off); not a verdict, a long compile is quiet too.
+    /// - `ok` / `failed`: ended, by its exit code.
+    /// - `lost`: the process went away without recording its end.
+    /// - `unknown`: a session this heph cannot read.
+    ///
     /// The other commands take an id's last 4–5 characters, or a live
     /// session's pid, in place of the full id. The leading characters are
     /// the start time, so sessions started minutes apart share them.

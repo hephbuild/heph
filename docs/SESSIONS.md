@@ -80,6 +80,11 @@ other. Where it lands depends on what the target passes through:
   nested heph writes to the real `~/.heph/sessions`, beside the outer run's.
   `heph session list` shows it as one more session, and retention removes it
   like any other.
+- With `HOME` pointed inside the target's sandbox (a test that gives heph a
+  scratch home), the nested heph writes `.heph/sessions/<id>/` there, inside
+  the sandbox. A directory or glob output that covers it captures the session
+  directory into the target's outputs, and with it a fresh id and timestamps
+  on every run. Set `HEPH_NO_SESSION=1`, or use `--raw`.
 
 Either way the outer run is unaffected: nothing about its session reaches the
 target (I1), so the nested run is a separate session, never a child of the
@@ -168,9 +173,13 @@ incompatible change:
   `meta.heph_version` warns that the session may be shown incomplete;
   `list`, `attach` and `inflight` do not warn.
 - **`SessionSnapshot.version`** versions `status.json` and `show --json`.
-  The list cap and `totals` came without a bump: they are new fields, and a
-  reader that ignores them reads the lists it gets correctly, as the first
-  entries of each (no heph had shipped a snapshot without them).
+  It is still 1 with the list cap and `totals`, because no heph has shipped a
+  snapshot yet: version 1 is what the first release carries, cap included.
+  The cap is not an additive change, since it changes what the existing lists
+  mean (the first 100 entries, not all of them), so a reader that ignored
+  `totals` would misread a cut list as whole. From the first release on, a
+  change of meaning like that bumps the version; only new fields come without
+  one.
 - **`events.ndjson`** only grows additively: new record kinds and fields,
   never a changed meaning.
 
@@ -187,13 +196,21 @@ cwd, state, started_unix_ms, last_event_unix_ms, exit_code, panicked,
 progress, now, blocked_on, format}]}`, sorted by id, times in absolute unix
 ms:
 
-- `progress` is PROGRESS as numbers, `{done, total, total_complete, running,
-  failed}`: `total` is the matched targets (`null` before the matcher
-  reported, provisional until `total_complete`), and `done` counts matched
-  targets that finished once `total` is known, every finished target before.
-  `progress` is `null` before the session wrote its first `status.json`.
+- `progress` is PROGRESS as numbers, `{done, total, total_complete,
+  running_ops, failed}`, `null` before the session wrote its first
+  `status.json`:
+  - `total` is the matched targets: `null` before the matcher reported,
+    provisional until `total_complete`.
+  - `done` is `counts.matched_done` (matched targets that finished) once
+    `total` is known, and `counts.finished` (every finished target, matched or
+    not) before that.
+  - `running_ops` is the targets with an operation open (executing, reading
+    or writing a cache), counted in full. It is not `counts.in_flight`, which
+    also counts a target between its result's start and end with no operation
+    open, such as one waiting on a lock or on its deps.
 - `now` is NOW for a live session (the lock or pool it waits on, else its
-  oldest running target); `null` once it ended.
+  oldest running target); `null` once it ended. It is human text and may
+  change wording: an agent reads `blocked_on` and `progress` instead.
 - `panicked` is true when the session ended in a panic, whatever its
   `exit_code`.
 - `blocked_on` entries are `{kind: "lock", addr, holder_pid, holder_session}`
@@ -204,11 +221,15 @@ ms:
   `argv`, `null` progress and `state: "unknown"`. `owner_pid` is never `null`
   otherwise.
 
-`show --json` is the `SessionSnapshot` (every list in full, folded from the
-event log) plus `id`, `state`, `blocked_on` (the same entries as `list
---json`), `chain_root` (the id of the session at the root of the first lock
-chain, `null` when no chain leads to a session) and `next: {kind, command,
-argv, cwd, reason}`. `kind` is one of `attach`, `show_holder`, `inflight`,
+`show --json` is the `SessionSnapshot` plus `id`, `state`, `blocked_on`,
+`chain_root`, and `next`. The snapshot is folded from the event log, every
+list in full, unless the log reached its 64 MiB cap: then it is `status.json`,
+each list capped at 100 entries, and `totals` says which were cut.
+`blocked_on` has `list --json`'s shape, but from that same snapshot, so it is
+in full where `list`'s, which comes from `status.json`, has at most 100
+entries of each kind. `chain_root` is the id of the session at the root of
+the first lock chain, `null` when no chain leads to a session. `next` is
+`{kind, command, argv, cwd, reason}`; `kind` is one of `attach`, `show_holder`, `inflight`,
 `inspect_failure`, `rerun`, `list`, `none` and may gain values.
 
 - `command` is display text for a person: each word shell-quoted where it
@@ -364,7 +385,12 @@ the **20** most recent ended sessions; then the oldest ended ones go until
 the ended sessions total at most **256 MiB**. A live session is never removed
 or counted. A directory with no `lock` yet, younger than 10 minutes, is a
 session being created and is left alone. Removal takes the session's lock
-exclusively, so two cleanups racing never both act on one directory.
+exclusively, so two cleanups racing never both remove one session: the
+second finds the lock taken and moves on. A removal renames the directory to
+a tomb (`.removing-<id>-<pid>`) and then deletes it; a tomb older than 10
+minutes, left by a removal that failed or died, is deleted outright with no
+lock. Two cleanups can race on that one, both deleting the same tomb, which is
+harmless: one finishes, the other sees it gone.
 
 ## The daemon
 

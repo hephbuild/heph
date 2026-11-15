@@ -48,6 +48,8 @@ struct ListJsonEntry {
     progress: Option<Progress>,
     /// The NOW column for a live session: the lock or pool it waits on, else
     /// its oldest running target. `null` once it ended, or with nothing on.
+    /// Human text, not a stable field: an agent reads `blocked_on` and
+    /// `progress`.
     now: Option<String>,
     blocked_on: Vec<BlockedOn>,
     /// Set only for a session in a newer directory format, which this heph
@@ -66,8 +68,11 @@ struct Progress {
     total: Option<u64>,
     /// Whether `total` is final (the table marks a provisional one `~`).
     total_complete: bool,
-    /// Targets with an operation open now.
-    running: u64,
+    /// Targets with an operation open now (executing, reading or writing a
+    /// cache): `status.json`'s `running`, in full. Not `counts.in_flight`,
+    /// which also counts targets between their result's start and end that
+    /// have no operation open, such as one waiting on a lock or its deps.
+    running_ops: u64,
     failed: u64,
 }
 
@@ -82,7 +87,7 @@ impl Progress {
             },
             total: c.matched,
             total_complete: c.matched_complete,
-            running: s
+            running_ops: s
                 .totals
                 .running
                 .total
