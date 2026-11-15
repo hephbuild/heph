@@ -327,6 +327,31 @@ impl Write for Captured {
     }
 }
 
+impl Captured {
+    /// The log, once every subscriber writing to it is gone, so nothing more
+    /// can land in it.
+    ///
+    /// The recorder thread logs through its own clone of the test's
+    /// dispatcher, and sets the stopped latch *before* its `warn!` (A9): a
+    /// test that sees `is_stopped()` can read the log before the warning is
+    /// in it. The clone is dropped only when the thread exits, so the
+    /// subscriber (and the writer it holds) outliving the test's own
+    /// `with_default` is exactly "the recorder may still log".
+    #[track_caller]
+    fn settled_log(&self) -> String {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while Arc::strong_count(&self.0) > 1 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            Arc::strong_count(&self.0),
+            1,
+            "the recorder thread is still running"
+        );
+        String::from_utf8(self.0.lock().expect("lock").clone()).expect("utf8")
+    }
+}
+
 impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
     type Writer = Self;
     fn make_writer(&'a self) -> Self {
@@ -363,7 +388,7 @@ fn enospc_warns_once() {
         }
         rec.finish(Some(0), false, Duration::from_secs(1));
     });
-    let log = String::from_utf8(captured.0.lock().expect("lock").clone()).expect("utf8");
+    let log = captured.settled_log();
     assert_eq!(log.matches("WARN").count(), 1, "{log}");
     assert!(!lockfile::is_held(&dir.path().join(files::LOCK)).expect("probe"));
 }
@@ -393,7 +418,7 @@ fn send_after_finish_is_dropped_silently() {
             "a send after finish stopped the recording"
         );
     });
-    let log = String::from_utf8(captured.0.lock().expect("lock").clone()).expect("utf8");
+    let log = captured.settled_log();
     assert_eq!(log.matches("WARN").count(), 0, "{log}");
 }
 
