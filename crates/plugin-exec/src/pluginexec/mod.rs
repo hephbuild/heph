@@ -452,18 +452,61 @@ pub(crate) fn tool_root_key(group: &str) -> String {
     format!("{}_ROOT", tool_key(group))
 }
 
-/// Refuse a tool group whose `_ROOT` variable is another group's `TOOL_*`
-/// variable (`tools = {"": …, "root": …}` both claim `TOOL_ROOT`). Either value
-/// would silently replace the other.
-fn check_tool_root_keys<'g>(
-    groups: impl Iterator<Item = &'g String> + Clone,
+/// How a tool group is named in an error: the unnamed group has no name to quote.
+fn describe_tool_group(group: &str) -> String {
+    if group.is_empty() {
+        "the unnamed group (`\"\"`)".to_string()
+    } else {
+        format!("group {group:?}")
+    }
+}
+
+/// Refuse a target whose `$TOOL_<G>_ROOT` would be ambiguous, at parse rather
+/// than at run, so `heph query`/`inspect` report it too. Two rules:
+///
+/// - a group's root variable is another group's `TOOL_<G>` (`tools = {"": …,
+///   "root": …}` both claim `TOOL_ROOT`): either value would replace the other;
+/// - a name the target declares (`declared`: `(where it was declared, name)`)
+///   is a group's root variable: heph's value would silently win over it.
+///
+/// `"*"` in `declared` is a passthrough wildcard, not a name, and is ignored.
+fn check_tool_root_keys<'a>(
+    addr: &str,
+    groups: impl IntoIterator<Item = &'a String>,
+    declared: impl IntoIterator<Item = (&'a str, &'a str)>,
 ) -> anyhow::Result<()> {
-    for group in groups.clone() {
+    const SPELLING: &str = "Group names are uppercased and every character outside [A-Z0-9_] \
+                            becomes `_`, so different spellings can reach the same name";
+    let groups: Vec<&String> = groups.into_iter().collect();
+    let by_tool_key: HashMap<String, &str> =
+        groups.iter().map(|g| (tool_key(g), g.as_str())).collect();
+    let mut by_root_key: HashMap<String, &str> = HashMap::with_capacity(groups.len());
+    for group in &groups {
         let root_key = tool_root_key(group);
-        if let Some(other) = groups.clone().find(|g| tool_key(g) == root_key) {
+        if let Some(other) = by_tool_key.get(&root_key) {
             anyhow::bail!(
-                "tool groups {group:?} and {other:?} both set `{root_key}`: it is the root of \
-                 group {group:?} and the binary of group {other:?}. Rename one of the groups"
+                "{addr}: tool {} and tool {} both set `{root_key}`: it is the staged root of \
+                 the first and the tool list of the second (`tools = {{{group:?}: …, {other:?}: \
+                 …}}`). {SPELLING}; either group may also come from a dependency's \
+                 `transitive` tools. Rename one of the groups",
+                describe_tool_group(group),
+                describe_tool_group(other),
+            );
+        }
+        by_root_key.insert(root_key, group.as_str());
+    }
+    for (field, name) in declared {
+        if name == "*" {
+            continue;
+        }
+        if let Some(group) = by_root_key.get(name) {
+            anyhow::bail!(
+                "{addr}: {field} declares `{name}`, which is the staged root heph sets for tool \
+                 {} (`tools = {{{group:?}: …}}`), so the declared value would be replaced. \
+                 {SPELLING}; the group may come from a dependency's `transitive` tools, and \
+                 the name from a dependency's `transitive` env. Drop the `{name}` entry or \
+                 rename the tool group",
+                describe_tool_group(group),
             );
         }
     }
@@ -1625,6 +1668,27 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
 
         let tool_inputs = build_tool_inputs(&pkg, spec.tools)?;
         let tool_group_inputs = grouped(&tool_inputs);
+        // Before `pass_env` turns into a host snapshot: only the names the
+        // target wrote are its declarations. `apply_transitive` checks again
+        // once a dependency's tools and env have joined.
+        check_tool_root_keys(
+            &req.target_spec.addr.format(),
+            tool_group_inputs.keys(),
+            spec.env
+                .keys()
+                .map(|k| ("`env`", k.as_str()))
+                .chain(
+                    spec.runtime_env
+                        .keys()
+                        .map(|k| ("`runtime_env`", k.as_str())),
+                )
+                .chain(spec.pass_env.iter().map(|k| ("`pass_env`", k.as_str())))
+                .chain(
+                    spec.runtime_pass_env
+                        .iter()
+                        .map(|k| ("`runtime_pass_env`", k.as_str())),
+                ),
+        )?;
 
         // `"*"` is a wildcard: pass through every host env var. Snapshotted at
         // parse time and hashed like any other pass_env (so the input hash
@@ -1809,6 +1873,29 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
             &mut xdef.dep_group_inputs,
             &mut xdef.runtime_dep_group_inputs,
         );
+        // A dependency's `transitive` tools may add groups, and its env names.
+        // The target's own names are rechecked against the groups it now has;
+        // `pass_env` is a host snapshot here (all of it under `"*"`), so its
+        // names were checked at parse only.
+        check_tool_root_keys(
+            &def.addr.format(),
+            xdef.tool_group_inputs.keys(),
+            req.sandbox
+                .env
+                .keys()
+                .map(|k| ("a dependency's `transitive` env", k.as_str()))
+                .chain(xdef.env.keys().map(|k| ("`env`", k.as_str())))
+                .chain(
+                    xdef.runtime_env
+                        .keys()
+                        .map(|k| ("`runtime_env`", k.as_str())),
+                )
+                .chain(
+                    xdef.runtime_pass_env
+                        .iter()
+                        .map(|k| ("`runtime_pass_env`", k.as_str())),
+                ),
+        )?;
         // The target's own `env` names, before any transitive literal joins
         // `env`: those win over a dependency's, which only fill the rest.
         let own_env: std::collections::HashSet<String> = xdef.env.keys().cloned().collect();
@@ -2125,6 +2212,8 @@ impl Driver {
             }
         }
 
+        // `$TOOL_<G>_ROOT` per group, set into `env` once passthrough is applied.
+        let mut tool_roots: BTreeMap<String, std::collections::BTreeSet<PathBuf>> = BTreeMap::new();
         let tool_bin_dir = if !def.tool_group_inputs.is_empty() {
             let bin_dir = req.sandbox_dir.join("bin");
             std::fs::create_dir_all(&bin_dir)
@@ -2144,19 +2233,16 @@ impl Driver {
             // same list file. engine/link.rs validates 1 FilePath per output.
             let mut linked: std::collections::HashSet<std::ffi::OsString> =
                 std::collections::HashSet::new();
-            check_tool_root_keys(def.tool_group_inputs.keys())?;
             for (group, inputs) in &def.tool_group_inputs {
                 let tool_key = tool_key(group);
                 // `$TOOL_<G>_ROOT`: each tool's package directory in the tree
                 // it was staged into, so a consumer can name a file the tool
                 // ships (`$TOOL_ROOT/sdk/include`) without knowing where heph
                 // stages tools. Its outputs and `support_files` share that
-                // tree. Space-joined and deduped per group, like `$TOOL_<G>`.
-                // A workspace source file has no package of its own to root,
-                // so it adds nothing.
-                let root_key = tool_root_key(group);
-                let mut root_seen: std::collections::HashSet<std::path::PathBuf> =
-                    std::collections::HashSet::new();
+                // tree. A set, so the value depends on which packages the
+                // group holds and never on their order, which is not in the
+                // cache key.
+                let roots = tool_roots.entry(tool_root_key(group)).or_default();
                 // Per-group dedup for $TOOL_<G> values. `linked` is process-wide
                 // (avoids EEXIST on symlink); `group_seen` is per-group so each
                 // TOOL_<G> reflects that group's references without duplicates
@@ -2167,27 +2253,36 @@ impl Driver {
                     // Filter to Dep-type — Support inputs that travel with the
                     // tool target's deps share its origin_id but must not be
                     // symlinked into bin/.
-                    let Some(m) = req.inputs.iter().find(|m| {
+                    //
+                    // Every member, not the first: a `group` used as a tool
+                    // expands into members sharing its origin_id, each with its
+                    // own `source_addr`, all appending to the one list file.
+                    let mut members = req.inputs.iter().filter(|m| {
                         m.input.origin_id == input.origin_id
                             && matches!(
                                 m.input.artifact.r#type,
                                 hplugin::driver::inputartifact::Type::Dep
                             )
-                    }) else {
+                    });
+                    let Some(m) = members.next() else {
                         continue;
                     };
-                    if !hdriver_support::driver_managed::is_fs_source(&m.input.source_addr) {
-                        let root = m.unpack_root.join(m.input.source_addr.package.as_str());
-                        let root_str = root.to_str().ok_or_else(|| {
-                            anyhow::anyhow!("tool root is not valid UTF-8: {:?}", root)
-                        })?;
-                        if !root_seen.contains(&root) {
-                            let entry = env.entry(root_key.clone()).or_default();
-                            if !entry.is_empty() {
-                                entry.push(' ');
-                            }
-                            entry.push_str(root_str);
-                            root_seen.insert(root);
+                    // Each member's package directory, kept (below) only when a
+                    // staged file is under it. A workspace source file
+                    // (`@heph/fs`), a host binary (`__heph/hostbin/`) or a
+                    // driver writing outside its package has none there. The
+                    // root package's directory is the whole tree, spelled
+                    // without the trailing slash `join("")` would add.
+                    let mut candidates: Vec<(PathBuf, bool)> = Vec::new();
+                    for member in std::iter::once(m).chain(members) {
+                        let pkg = member.input.source_addr.package.as_str();
+                        let root = if pkg.is_empty() {
+                            member.unpack_root.clone()
+                        } else {
+                            member.unpack_root.join(pkg)
+                        };
+                        if !candidates.iter().any(|(r, _)| *r == root) {
+                            candidates.push((root, false));
                         }
                     }
                     let list_path = m.require_list_path()?;
@@ -2205,6 +2300,14 @@ impl Driver {
                             continue;
                         }
                         any = true;
+                        // Component-wise: `exec_tools/sdk` is not a prefix of
+                        // `exec_tools/sdkx/…`. List lines are absolute paths
+                        // under the unpack root, in OS and FUSE staging alike.
+                        for (root, holds_files) in &mut candidates {
+                            if !*holds_files && std::path::Path::new(&file_path).starts_with(root) {
+                                *holds_files = true;
+                            }
+                        }
                         let filename = std::path::Path::new(&file_path)
                             .file_name()
                             .ok_or_else(|| {
@@ -2238,6 +2341,11 @@ impl Driver {
                     if !any {
                         anyhow::bail!("tool '{}' produced no files", input.origin_id);
                     }
+                    roots.extend(
+                        candidates
+                            .into_iter()
+                            .filter_map(|(root, holds_files)| holds_files.then_some(root)),
+                    );
                 }
             }
 
@@ -2261,6 +2369,26 @@ impl Driver {
 
         for (k, v) in &def.runtime_env {
             env.insert(k.clone(), rreq.resolve(v)?.to_string());
+        }
+
+        // After every passthrough, so a host `TOOL_ROOT` carried by
+        // `pass_env = ["*"]` cannot replace heph's. A declared name is refused
+        // at parse (`check_tool_root_keys`). A group with no root sets nothing.
+        for (key, roots) in tool_roots {
+            if roots.is_empty() {
+                continue;
+            }
+            let mut value = String::new();
+            for root in &roots {
+                let root = root
+                    .to_str()
+                    .ok_or_else(|| anyhow::anyhow!("tool root is not valid UTF-8: {root:?}"))?;
+                if !value.is_empty() {
+                    value.push(' ');
+                }
+                value.push_str(root);
+            }
+            env.insert(key, value);
         }
 
         // Scratch caches: each declaration names the variable its tool reads the
@@ -3249,20 +3377,47 @@ mod tests {
 
     #[test]
     fn tool_root_key_collisions_are_refused() {
-        let check = |groups: &[&str]| {
+        let check = |groups: &[&str], declared: &[(&'static str, &'static str)]| {
             let groups: Vec<String> = groups.iter().map(|g| (*g).to_string()).collect();
-            check_tool_root_keys(groups.iter())
+            check_tool_root_keys("//p:t", groups.iter(), declared.iter().copied())
         };
         assert_eq!(tool_root_key(""), "TOOL_ROOT");
         assert_eq!(tool_root_key("my-sdk"), "TOOL_MY_SDK_ROOT");
         // The unnamed group's root is group `root`'s binary.
-        let err = check(&["", "root"]).expect_err("TOOL_ROOT claimed twice");
-        assert!(err.to_string().contains("`TOOL_ROOT`"), "{err}");
+        let err = check(&["", "root"], &[])
+            .expect_err("TOOL_ROOT claimed twice")
+            .to_string();
+        assert!(err.contains("`TOOL_ROOT`"), "{err}");
+        assert!(err.contains("//p:t"), "{err}");
+        assert!(err.contains("the unnamed group"), "{err}");
+        assert!(err.contains("group \"root\""), "{err}");
         // Sanitizing reaches the same name from a different spelling.
-        let err = check(&["x", "x.root"]).expect_err("TOOL_X_ROOT claimed twice");
+        let err = check(&["x", "x.root"], &[]).expect_err("TOOL_X_ROOT claimed twice");
+        assert!(err.to_string().contains("`TOOL_X_ROOT`"), "{err}");
+        let err = check(&["x", "x_root"], &[]).expect_err("TOOL_X_ROOT claimed twice");
         assert!(err.to_string().contains("`TOOL_X_ROOT`"), "{err}");
         // Near misses are distinct names.
-        check(&["", "x", "roots", "x_roo", "root_x"]).expect("no collision");
+        check(&["", "x", "roots", "x_roo", "root_x"], &[]).expect("no collision");
+
+        // A declared name that is a group's root.
+        let err = check(&["sdk"], &[("`runtime_env`", "TOOL_SDK_ROOT")])
+            .expect_err("declared root")
+            .to_string();
+        assert!(
+            err.contains("`runtime_env` declares `TOOL_SDK_ROOT`"),
+            "{err}"
+        );
+        // A wildcard is not a name; a group's own `TOOL_<G>` is not its root,
+        // and a root of a group the target does not have is just a name.
+        check(
+            &["", "sdk"],
+            &[
+                ("`pass_env`", "*"),
+                ("`env`", "TOOL_SDK"),
+                ("`env`", "TOOL_X_ROOT"),
+            ],
+        )
+        .expect("no root claimed");
     }
 
     #[test]

@@ -204,9 +204,9 @@ target(
     Ok(())
 }
 
-/// One entry per tool package: two outputs of one tool share a root, a second
-/// tool adds its own, and a workspace source file (no package of its own)
-/// adds nothing.
+/// One entry per tool package, sorted: two outputs of one tool share a root, a
+/// second tool adds its own, and a workspace source file (no staged file under
+/// its `@heph/fs` package) adds nothing.
 #[tokio::test]
 async fn tool_root_lists_each_tool_package_once() -> anyhow::Result<()> {
     let ws = Workspace::new();
@@ -244,6 +244,285 @@ target(
     let result = ws.run("//rootuse:consumer").await?;
     let content = common::artifact_string(&result);
     let roots: Vec<&str> = content.lines().collect();
-    assert_eq!(roots, ["multi", "greetsdk"], "got {content:?}");
+    assert_eq!(roots, ["greetsdk", "multi"], "got {content:?}");
+    Ok(())
+}
+
+/// A tool target for the collision tests: one file, nothing else.
+const PLAIN_TOOL_BUILD: &str = r#"
+target(name = "t", driver = "bash", run = "echo hi > $OUT", out = "t")
+"#;
+
+/// `tools = {"": …, "root": …}`: the unnamed group's root and group `root`'s
+/// tool list are both `TOOL_ROOT`. Refused when the target is parsed, naming
+/// both groups the way the BUILD file spells them.
+#[tokio::test]
+async fn tool_root_colliding_with_a_group_is_refused() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file("x", PLAIN_TOOL_BUILD);
+    ws.write_build_file(
+        "use",
+        r#"
+target(
+    name = "c",
+    driver = "bash",
+    tools = {"": ["//x:t"], "root": ["//x:t"]},
+    run = "echo $TOOL_ROOT > $OUT",
+    out = "out.txt",
+)
+"#,
+    );
+    let Err(err) = ws.run("//use:c").await else {
+        anyhow::bail!("built although TOOL_ROOT is claimed twice");
+    };
+    let err = format!("{err:#}");
+    assert!(err.contains("`TOOL_ROOT`"), "{err}");
+    assert!(err.contains("the unnamed group"), "{err}");
+    assert!(err.contains("group \"root\""), "{err}");
+    assert!(err.contains("//use:c"), "{err}");
+    Ok(())
+}
+
+/// The target's own `env` naming a root heph sets is refused rather than
+/// silently replaced.
+#[tokio::test]
+async fn tool_root_claimed_by_own_env_is_refused() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file("x", PLAIN_TOOL_BUILD);
+    ws.write_build_file(
+        "use",
+        r#"
+target(
+    name = "c",
+    driver = "bash",
+    tools = ["//x:t"],
+    env = {"TOOL_ROOT": "/x"},
+    run = "echo $TOOL_ROOT > $OUT",
+    out = "out.txt",
+)
+"#,
+    );
+    let Err(err) = ws.run("//use:c").await else {
+        anyhow::bail!("built although `env` claims TOOL_ROOT");
+    };
+    let err = format!("{err:#}");
+    assert!(err.contains("`env` declares `TOOL_ROOT`"), "{err}");
+    Ok(())
+}
+
+/// A dependency's `transitive` env literal reaches the consumer's env after
+/// parse; it is refused once applied, saying where the name came from.
+#[tokio::test]
+async fn tool_root_claimed_by_transitive_env_is_refused() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file("x", PLAIN_TOOL_BUILD);
+    ws.write_build_file(
+        "use",
+        r#"
+target(
+    name = "lib",
+    driver = "bash",
+    run = "echo lib > $OUT",
+    out = "lib.txt",
+    transitive = {"env": {"TOOL_ROOT": "/x"}},
+)
+target(
+    name = "c",
+    driver = "bash",
+    deps = ["//use:lib"],
+    tools = ["//x:t"],
+    run = "echo $TOOL_ROOT > $OUT",
+    out = "out.txt",
+)
+"#,
+    );
+    let Err(err) = ws.run("//use:c").await else {
+        anyhow::bail!("built although a transitive env claims TOOL_ROOT");
+    };
+    let err = format!("{err:#}");
+    assert!(err.contains("`TOOL_ROOT`"), "{err}");
+    assert!(
+        err.contains("a dependency's `transitive` env declares"),
+        "{err}"
+    );
+    Ok(())
+}
+
+/// Prints each root of `$TOOL_SDKS_ROOT` relative to the staged tool tree, so
+/// two consumers' values compare without their sandbox paths.
+const PRINT_SDKS_ROOTS: &str =
+    r#"for r in $TOOL_SDKS_ROOT; do echo "${r#*/exec_tools/}"; done > $OUT"#;
+
+/// A `group` used as a tool contributes every member's package, and the value
+/// does not depend on the order the group lists them in.
+#[tokio::test]
+async fn tool_root_of_a_group_tool_lists_every_member() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "a",
+        r#"target(name = "t", driver = "bash", run = "echo a > $OUT", out = "a_tool")"#,
+    );
+    ws.write_build_file(
+        "b",
+        r#"target(name = "t", driver = "bash", run = "echo b > $OUT", out = "b_tool")"#,
+    );
+    ws.write_build_file(
+        "t",
+        &format!(
+            r#"
+target(name = "sdks", driver = "group", deps = ["//a:t", "//b:t"])
+target(name = "sdks_rev", driver = "group", deps = ["//b:t", "//a:t"])
+target(
+    name = "c",
+    driver = "bash",
+    tools = {{"sdks": ["//t:sdks"]}},
+    run = '{PRINT_SDKS_ROOTS}',
+    out = "out.txt",
+)
+target(
+    name = "c_rev",
+    driver = "bash",
+    tools = {{"sdks": ["//t:sdks_rev"]}},
+    run = '{PRINT_SDKS_ROOTS}',
+    out = "out.txt",
+)
+"#
+        ),
+    );
+
+    let result = ws.run("//t:c").await?;
+    let content = common::artifact_string(&result);
+    assert_eq!(
+        content.lines().collect::<Vec<_>>(),
+        ["a", "b"],
+        "got {content:?}"
+    );
+    let result = ws.run("//t:c_rev").await?;
+    let reversed = common::artifact_string(&result);
+    assert_eq!(reversed, content, "member order changed the value");
+    Ok(())
+}
+
+/// A tool handed down through a dependency's `transitive` tools gets a root
+/// in the consumer like a tool it declares itself.
+#[tokio::test]
+async fn tool_root_of_a_transitive_tool() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file("greetsdk", GREET_SDK_BUILD);
+    ws.write_build_file(
+        "tr",
+        r#"
+target(
+    name = "a",
+    driver = "bash",
+    run = "echo a > $OUT",
+    out = "a.txt",
+    transitive = {"tools": {"sdk": ["//greetsdk:sdk"]}},
+)
+target(
+    name = "c",
+    driver = "bash",
+    deps = ["//tr:a"],
+    run = "greet $TOOL_SDK_ROOT/sdk/include > $OUT",
+    out = "out.txt",
+)
+"#,
+    );
+    let result = ws.run("//tr:c").await?;
+    let content = common::artifact_string(&result);
+    assert_eq!(content.trim(), "hello", "got {content:?}");
+    Ok(())
+}
+
+/// A tool in the root package roots the whole staged tree, spelled without a
+/// trailing slash.
+#[tokio::test]
+async fn tool_root_of_a_root_package_tool() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "",
+        r#"
+target(
+    name = "tool",
+    driver = "bash",
+    run = [
+        "mkdir -p data",
+        "echo hello > data/greeting.txt",
+        "echo tool > rtool",
+    ],
+    out = "rtool",
+    support_files = "data/",
+)
+"#,
+    );
+    ws.write_build_file(
+        "use",
+        r#"
+target(
+    name = "c",
+    driver = "bash",
+    tools = ["//:tool"],
+    run = 'case "$TOOL_ROOT" in */) exit 1;; esac; [[ "${TOOL_ROOT##*/}" == exec_tools ]] && cat $TOOL_ROOT/data/greeting.txt > $OUT',
+    out = "out.txt",
+)
+"#,
+    );
+    let result = ws.run("//use:c").await?;
+    let content = common::artifact_string(&result);
+    assert_eq!(content.trim(), "hello", "got {content:?}");
+    Ok(())
+}
+
+/// A host binary (`//@heph/bin:<name>`) is staged under `__heph/hostbin/`, not
+/// under its package: it adds no root, alone or beside a tool that does.
+#[tokio::test]
+async fn tool_root_skips_a_host_binary() -> anyhow::Result<()> {
+    let ws = htestkit::WorkspaceBuilder::new()?
+        .with_provider(|init| {
+            Box::new(heph::pluginbuildfile::Provider::new(
+                init.root.to_path_buf(),
+                init.runtime.clone(),
+                std::sync::Arc::clone(&init.functions),
+            ))
+        })
+        .with_managed_driver(Box::new(
+            heph::pluginexec::Driver::new_bash().with_host_path(),
+        ))
+        .with_plugin(heph::pluginhostbin::PLUGIN_NAME, |_| {
+            Ok(heph::engine::PluginParts::default()
+                .with_provider(Box::new(heph::pluginhostbin::Provider))
+                .with_driver(Box::new(heph::pluginhostbin::Driver)))
+        })
+        .build()?;
+    ws.write_build_file("greetsdk", GREET_SDK_BUILD);
+    ws.write_build_file(
+        "use",
+        r#"
+target(
+    name = "alone",
+    driver = "bash",
+    tools = {"h": ["//@heph/bin:sh"]},
+    run = '[[ -z "${TOOL_H_ROOT+set}" && -n "$TOOL_H" ]] && echo unset > $OUT',
+    out = "out.txt",
+)
+target(
+    name = "beside",
+    driver = "bash",
+    tools = {"x": ["//@heph/bin:sh", "//greetsdk:sdk"]},
+    run = 'for r in $TOOL_X_ROOT; do echo "${r##*/}"; done > $OUT',
+    out = "out.txt",
+)
+"#,
+    );
+    let result = ws.run("//use:alone").await?;
+    let alone = htestkit::artifact_string(&result);
+    assert_eq!(alone.trim(), "unset", "got {alone:?}");
+    let result = ws.run("//use:beside").await?;
+    let beside = htestkit::artifact_string(&result);
+    assert_eq!(
+        beside.lines().collect::<Vec<_>>(),
+        ["greetsdk"],
+        "got {beside:?}"
+    );
     Ok(())
 }
