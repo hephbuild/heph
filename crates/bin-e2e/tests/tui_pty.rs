@@ -516,6 +516,22 @@ fn paused_for_target(s: &vt100::Screen) -> bool {
     !s.alternate_screen() && count_rows(s, TARGET_OUT) > 0
 }
 
+/// The mouse is captured the way the full screens capture it: press and
+/// release reports (`?1000h`), SGR-encoded (`?1006h`).
+fn mouse_captured(s: &vt100::Screen) -> bool {
+    s.mouse_protocol_mode() == vt100::MouseProtocolMode::PressRelease
+        && s.mouse_protocol_encoding() == vt100::MouseProtocolEncoding::Sgr
+}
+
+fn no_mouse(s: &vt100::Screen) -> bool {
+    s.mouse_protocol_mode() == vt100::MouseProtocolMode::None
+}
+
+/// The dashboard is up and has the mouse.
+fn dashboard_captured(s: &vt100::Screen) -> bool {
+    on_dashboard(s) && mouse_captured(s)
+}
+
 /// Once heph is gone: the main screen, a visible cursor, no mouse mode, and
 /// none of the dashboard drawn into the scrollback.
 fn assert_restored(pty: &common::pty::Pty, case: &str) {
@@ -1173,10 +1189,12 @@ fn terminal_restored_on_every_exit() {
         /// What must be on the main screen once heph is gone.
         shows: &'static [&'static str],
     }
+    // The mouse is captured before any way out is taken, so that "no mouse
+    // mode" afterwards says the exit released it.
     const OPEN: &[Step<'static>] = &[
         Step::Until("the line", on_line),
         Step::Keys(TAB),
-        Step::Until("the dashboard", on_dashboard),
+        Step::Until("the dashboard, mouse captured", dashboard_captured),
     ];
     let cases = [
         Case {
@@ -1328,6 +1346,206 @@ fn terminal_restored_on_every_exit() {
     assert!(
         failed.is_empty(),
         "the terminal was not restored after: {failed:?}"
+    );
+}
+
+/// Where `needle` starts on screen, as a cell (row, col): a wide glyph before
+/// it counts as the two columns it takes.
+fn find_cell(s: &vt100::Screen, needle: &str) -> Option<(u16, u16)> {
+    let (rows, cols) = s.size();
+    (0..rows).find_map(|row| {
+        let mut text = String::new();
+        let mut cols_at = Vec::new();
+        for col in 0..cols {
+            let Some(cell) = s.cell(row, col) else {
+                continue;
+            };
+            if cell.is_wide_continuation() {
+                continue;
+            }
+            cols_at.push((text.len(), col));
+            text.push_str(match cell.contents() {
+                "" => " ",
+                c => c,
+            });
+        }
+        let at = text.find(needle)?;
+        let col = cols_at.iter().find(|(byte, _)| *byte == at)?.1;
+        Some((row, col))
+    })
+}
+
+/// The cell's text, or "" off screen.
+fn cell_text(s: &vt100::Screen, row: u16, col: u16) -> String {
+    s.cell(row, col)
+        .map(|c| c.contents().to_owned())
+        .unwrap_or_default()
+}
+
+/// The dashboard tab whose label is clicked, and its label's text there.
+const CLICKED_TAB: &str = "Done";
+
+/// Click (SGR press, then release) the dashboard tab labelled [`CLICKED_TAB`]
+/// and wait for the rule under the tab row to mark it active: the bytes a
+/// terminal sends, read by the shipped binary's own input parser.
+fn click_tab(pty: &common::pty::Pty, case: &str) {
+    let found = pty.with_screen(|s| find_cell(s, CLICKED_TAB));
+    assert!(
+        found.is_some(),
+        "{case}: no {CLICKED_TAB:?} tab on the dashboard\n{}",
+        pty.screen()
+    );
+    let (row, col) = found.expect("asserted above");
+    let rule = row + 1;
+    let marked = |s: &vt100::Screen| cell_text(s, rule, col + 1) == "━";
+    assert!(
+        !pty.with_screen(marked),
+        "{case}: {CLICKED_TAB:?} already active before the click\n{}",
+        pty.screen()
+    );
+    // SGR is 1-based; click inside the label, not on its first cell.
+    let (x, y) = (col + 2, row + 1);
+    pty.send(format!("\x1b[<0;{x};{y}M\x1b[<0;{x};{y}m").as_bytes());
+    pty.wait_screen(
+        &format!("{case}: the rule under {CLICKED_TAB:?} after the click"),
+        DEADLINE,
+        marked,
+    );
+}
+
+/// The line, with the mouse released.
+fn line_without_mouse(s: &vt100::Screen) -> bool {
+    on_line_once(s) && no_mouse(s)
+}
+
+/// The line has come up, before any full screen: no mouse yet.
+fn line_up_without_mouse(s: &vt100::Screen) -> bool {
+    on_line(s) && no_mouse(s)
+}
+
+/// The dashboard up without the mouse (`HEPH_NO_MOUSE`).
+fn dashboard_without_mouse(s: &vt100::Screen) -> bool {
+    on_dashboard(s) && no_mouse(s)
+}
+
+/// Paused for the named target, with the mouse released: a target that holds
+/// the terminal gets it without heph's mouse reports.
+fn paused_without_mouse(s: &vt100::Screen) -> bool {
+    paused_for_target(s) && no_mouse(s)
+}
+
+fn finished_dashboard_captured(s: &vt100::Screen) -> bool {
+    on_finished_dashboard(s) && mouse_captured(s)
+}
+
+/// The mouse is captured only while a full screen is up: on after Tab (press
+/// and release, SGR), off on the line, after esc, while a target holds the
+/// terminal, after ctrl-c and once heph is gone. Motion tracking (`?1003h`,
+/// `?1002h`) is never asked for. `HEPH_NO_MOUSE=1` keeps it off throughout.
+/// A click on a tab label, as a terminal encodes it, makes that tab active.
+#[test]
+fn mouse_capture_only_on_full_screens() {
+    struct Case {
+        name: &'static str,
+        env: &'static [(&'static str, &'static str)],
+        /// Played after the line is up, with the mouse not yet captured.
+        steps: &'static [Step<'static>],
+        /// Then a click on a tab label, when set.
+        click: bool,
+        /// Then these, to the end.
+        rest: &'static [Step<'static>],
+        /// Whether the mouse may ever be captured.
+        mouse: bool,
+    }
+    const OPEN: &[Step<'static>] = &[
+        Step::Keys(TAB),
+        Step::Until("the dashboard, mouse captured", dashboard_captured),
+    ];
+    let cases = [
+        Case {
+            name: "tab, a click, esc",
+            env: &[],
+            steps: OPEN,
+            click: true,
+            rest: &[
+                Step::Keys(ESC),
+                Step::Until("the line, mouse released", line_without_mouse),
+                Step::OpenGate,
+            ],
+            mouse: true,
+        },
+        Case {
+            name: "a target holds the terminal",
+            env: &[],
+            steps: OPEN,
+            click: false,
+            rest: &[
+                Step::OpenGate,
+                Step::Until("the target, mouse released", paused_without_mouse),
+                Step::Until(
+                    "the finished dashboard, mouse captured again",
+                    finished_dashboard_captured,
+                ),
+                Step::Keys(b"q"),
+            ],
+            mouse: true,
+        },
+        Case {
+            name: "ctrl-c on the dashboard",
+            env: &[],
+            steps: OPEN,
+            click: false,
+            rest: &[Step::Keys(CTRL_C), Step::Keys(CTRL_C), Step::OpenGate],
+            mouse: true,
+        },
+        Case {
+            name: "HEPH_NO_MOUSE=1",
+            env: &[("HEPH_NO_MOUSE", "1")],
+            steps: &[
+                Step::Keys(TAB),
+                Step::Until("the dashboard", on_dashboard),
+                Step::Settle,
+                Step::Until("the dashboard, mouse not captured", dashboard_without_mouse),
+                Step::Keys(ESC),
+                Step::Until("the line", line_without_mouse),
+            ],
+            click: false,
+            rest: &[Step::OpenGate],
+            mouse: false,
+        },
+    ];
+    each_case(
+        &cases,
+        |c| c.name,
+        |case| {
+            let mut g = Gated::start("", case.env);
+            g.play(&[Step::Until(
+                "the line, mouse not captured",
+                line_up_without_mouse,
+            )]);
+            g.play(case.steps);
+            if case.click {
+                click_tab(&g.pty, case.name);
+            }
+            g.play(case.rest);
+            g.exit();
+            assert_restored(&g.pty, case.name);
+            let out = g.pty.output();
+            for motion in [&b"\x1b[?1003h"[..], b"\x1b[?1002h"] {
+                assert!(
+                    !contains(&out, motion),
+                    "{}: motion tracking {:?} was asked for",
+                    case.name,
+                    String::from_utf8_lossy(motion)
+                );
+            }
+            assert_eq!(
+                contains(&out, b"\x1b[?1000h"),
+                case.mouse,
+                "{}: whether the mouse was ever captured",
+                case.name
+            );
+        },
     );
 }
 
