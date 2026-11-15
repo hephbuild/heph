@@ -162,8 +162,9 @@ incompatible change:
 - **`meta.json` `format`** versions the directory contract: file names, the
   lock, the id scheme, cleanup. `show`/`attach`/`inflight` refuse a newer
   format naming both versions; `list` shows a placeholder row ("format N,
-  needs newer heph") and exits 0. A viewer older than `meta.heph_version`
-  warns that the session may be shown incomplete.
+  needs newer heph") and exits 0. `show` run by a heph older than
+  `meta.heph_version` warns that the session may be shown incomplete;
+  `list`, `attach` and `inflight` do not warn.
 - **`SessionSnapshot.version`** versions `status.json` and `show --json`.
   The list cap and `totals` came without a bump: they are new fields, and a
   reader that ignores them reads the lists it gets correctly, as the first
