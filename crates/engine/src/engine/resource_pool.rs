@@ -2801,6 +2801,32 @@ mod tests {
             .unwrap()
     }
 
+    /// The `sandbox` half is offered to the run's shape too: a managed
+    /// waiter short of a slot only, behind an older waiter, takes the slot
+    /// as a hand-off, with no walk.
+    #[test]
+    fn the_sandbox_half_of_a_split_grant_hands_off_to_its_shape() {
+        let p = pool(&[("cpu", 3 * CPU), ("sandbox", 1)]);
+        let mut run = managed(&p, 1).now_or_never().unwrap().unwrap();
+        let _other = now(&p, &cpus(1));
+        let _head = queued(&p, &cpus(2));
+        let mut next = managed(&p, 1);
+        assert!(
+            (&mut next).now_or_never().is_none(),
+            "a cpu is free, no slot is"
+        );
+        let removal = run.split_off(PoolName::SANDBOX).unwrap();
+        let before = visited(&p);
+
+        drop(removal);
+        let next = granted(&mut next).expect("the slot goes to the managed waiter");
+        assert_eq!(next.admitted(), Admitted::Handoff);
+        assert_eq!(visited(&p), before, "a hand-off walks nothing");
+        assert_eq!((free(&p, "cpu"), free(&p, "sandbox")), (0, 0));
+        drop(run);
+        assert!(settled(&p));
+    }
+
     /// The cpu half's hand-off is judged like any other: a waiter of the
     /// run's shape that would take a protected head's cpu is refused, and
     /// the head starts in what came back.
@@ -3351,7 +3377,9 @@ mod tests {
         // starts one (2..=65), the cancellation of class 99 ends it (66..=98
         // and the arrival's class 100), the passing arrival finds no pass to
         // continue, and its release starts another. With 1000, every event
-        // has 64 left.
+        // has 64 left. The counts are exact on purpose: they pin the cap and
+        // where a pass ends, so a change to batching that moves them changes
+        // what an event may cost.
         for (shapes, expected) in [(100, [64, 35, 64, 34, 0, 64]), (1000, [64; 6])] {
             let p = pool(&[("cpu", 8 * CPU)]);
             let _stays = now(&p, &cpus(7));
@@ -3556,6 +3584,40 @@ mod tests {
             counts.iter().sum::<u64>(),
             Ring::OTHERS,
             "each class but the head's, once"
+        );
+        assert!(settled(&ring.p));
+    }
+
+    /// A pass is bounded by class ids, not by classes that must still wait:
+    /// the class it stops at and the class it resumes from can both lose
+    /// their last waiter mid-pass, and every class left is still tested
+    /// once.
+    #[test]
+    fn a_pass_outlives_the_classes_that_bound_it() {
+        let mut ring = Ring::new();
+        let mut counts = vec![ring.tested(|r| drop(r.tokens.take()))];
+        assert!(!pass_done(&ring.p), "stopped at class 56, to end at 193");
+
+        // Class 193, where the pass ends: `rest[i]` is class `i` up to 150,
+        // and class `i + 1` after.
+        counts.push(ring.tested(|r| drop(r.rest.remove(192))));
+        // Class 120, where it resumes.
+        counts.push(ring.tested(|r| drop(r.rest.remove(120))));
+        let run = granted(&mut ring.fits).expect("class 151 is reached");
+        assert_eq!(run.admitted(), Admitted::Pass);
+        counts.push(ring.tested(Ring::idle));
+        assert!(pass_done(&ring.p));
+        counts.push(ring.tested(Ring::idle));
+
+        assert_eq!(
+            counts,
+            [64, 64, 64, 8, 0],
+            "193..=201 and 1..=55, 56..=119, 121..=184, 185..=192"
+        );
+        assert_eq!(
+            counts.iter().sum::<u64>(),
+            Ring::OTHERS - 1,
+            "class 120 left before its turn"
         );
         assert!(settled(&ring.p));
     }
@@ -3806,6 +3868,8 @@ mod tests {
         removals: Vec<Reservation>,
         /// How many of them were released.
         removed: usize,
+        /// How many managed runs started in a slot handed off to their shape.
+        managed_handoffs: usize,
         /// Every grant: the request and how it was admitted.
         log: Vec<(usize, Admitted)>,
         /// The head after the last event, when it was draining: its request
@@ -3851,6 +3915,7 @@ mod tests {
                 slots: Vec::new(),
                 removals: Vec::new(),
                 removed: 0,
+                managed_handoffs: 0,
                 log: Vec::new(),
                 drained: None,
                 peak_classes: 0,
@@ -3953,6 +4018,7 @@ mod tests {
                 );
                 self.log.push((i, run.admitted()));
                 if *shape >= self.managed_from {
+                    self.managed_handoffs += usize::from(run.admitted() == Admitted::Handoff);
                     let removal = run
                         .split_off(PoolName::SANDBOX)
                         .expect("a managed grant holds a slot");
@@ -4062,6 +4128,7 @@ mod tests {
 
     #[test]
     fn random_events_keep_the_invariants() {
+        let mut managed_handoffs = 0;
         for seed in 0..40 {
             let pool = ResourcePool::new([
                 (name("cpu"), Limit::Bounded(8 * CPU)),
@@ -4095,6 +4162,7 @@ mod tests {
             let mut script = Script::with_managed(pool, shapes, managed);
             script.run(seed, 600);
             assert!(script.removed > 0, "seed {seed} released no split slot");
+            managed_handoffs += script.managed_handoffs;
             let how = |a| script.log.iter().filter(|&&(_, x)| x == a).count();
             assert!(
                 [
@@ -4108,6 +4176,9 @@ mod tests {
                 "seed {seed} never took one of the four ways in"
             );
         }
+        // Over the seeds, not per seed: a managed waiter is seldom the next
+        // of its shape when a half comes back, and some seeds have none.
+        assert!(managed_handoffs > 0, "no seed handed a split grant off");
     }
 
     /// More shapes than one walk tests: a pass is left unfinished between
@@ -4152,10 +4223,14 @@ mod tests {
         }
     }
 
-    /// Grants depend on the requests alone: not on class ids, nor on what
-    /// the shape map held before. The same script, on a fresh lane and on
-    /// one where other shapes (and its own, in reverse) queued and left
-    /// first, grants the same requests the same way.
+    /// With no more classes than one walk tests ([`WALK_CAP`]), grants
+    /// depend on the requests alone: not on class ids, nor on what the shape
+    /// map held before. The same script, on a fresh lane and on one where
+    /// other shapes (and its own, in reverse) queued and left first, grants
+    /// the same requests the same way. Past the cap a walk takes classes by
+    /// id from its cursor, so which class it reaches first follows the
+    /// lane's history: the same arrivals and completions still give the same
+    /// starts, from the same lane.
     #[test]
     fn grants_are_deterministic() {
         let run = |history: bool| {
