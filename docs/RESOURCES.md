@@ -448,8 +448,10 @@ the whole-pool request is the one that reaches it.
 Declare the width the target actually uses: the full width only for a target
 that uses it, never as a way to run alone. A target that sat behind its own
 `"memory": heph.core.resource("memory")` and uses half of that declares
-`heph.core.resource("memory") / 2`: it starts as soon as half the pool is
-free, instead of once the pool is empty.
+`heph.core.resource("memory") / 2`: it starts once half the pool is free at
+the same time, not the whole pool. Until then it is overtaken under the same
+cap, so what it gains is a shorter drain, and a start whenever half happens
+to be free.
 
 The intended use is exactly that, a `resources` amount. Anything else puts a
 per-machine number into driver config and so into the def hash of the target
