@@ -23,7 +23,9 @@ use std::sync::Arc;
 use crossterm::style::Stylize;
 
 use super::{FIXES_SHOWN, cause_chain, not_written_reason, shell_quote};
-use crate::engine::error::{FailureFixes, FrozenCheckError, SandboxFate, TargetFailure};
+use crate::engine::error::{
+    FailureFixes, FrozenCheckError, ProcessFailed, SandboxFate, TargetFailure,
+};
 use crate::engine::request_state::TookDown;
 use crate::hmemoizer::downcast_chain_ref;
 use crate::tui::text::{Redact, clean_inline, cut_right, expand_tabs, sanitize_log};
@@ -86,7 +88,14 @@ impl ReportContext {
                 failure: Arc::clone(f),
                 took_down: took_down(&f.addr.format()),
                 tail: read_tail(f),
-                kept: f.outputs.as_deref().map(kept_groups).unwrap_or_default(),
+                // `failure_out` is package-relative and the slot mirrors the
+                // workspace, so every kept file is under `out/<package>/`:
+                // grouped from there, `//web:lint` reads `report/`, not `web/`.
+                kept: f
+                    .outputs
+                    .as_deref()
+                    .map(|out| kept_groups(&out.join(&f.addr.package)))
+                    .unwrap_or_default(),
             })
             .collect();
         Self {
@@ -155,7 +164,11 @@ impl ReportContext {
             body.extend(fc.diff.lines().map(|l| self.cut_row(l)));
             Some("generated output differs from tree".to_owned())
         } else {
-            crate::engine::event::ErrorDetail::from_error(&f.source).exit_status
+            // Through the memoizer's shared wrapper: a recorded failure's
+            // source is one, and `ErrorDetail`'s plain chain walk stops at it.
+            downcast_chain_ref::<ProcessFailed>(&f.source)
+                .map(|p| p.status.clone())
+                .or_else(|| crate::engine::event::ErrorDetail::from_error(&f.source).exit_status)
         };
         if status.is_none() {
             // No status to name it: the error says what went wrong.
@@ -337,8 +350,8 @@ fn read_tail(f: &TargetFailure) -> Option<(String, usize)> {
     Some((tail.text, tail.start_line))
 }
 
-/// The files under `out` (the slot's kept `failure_out`), grouped by first
-/// path component: `report/` with its file count, or a top-level file on
+/// The files under `out` (the slot's kept `failure_out`, at the target's
+/// package), grouped by first path component: `report/` with its file count, or a top-level file on
 /// its own. Sorted by name. An unreadable directory reads as empty.
 fn kept_groups(out: &Path) -> Vec<(String, usize)> {
     let mut groups: HashMap<String, usize> = HashMap::new();

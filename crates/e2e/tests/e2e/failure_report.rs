@@ -1,0 +1,326 @@
+//! The interactive failure report (`ReportContext`) over real failures: an
+//! engine runs targets that keep `failure_out` files, write `in_place` fixes,
+//! are killed, time out or are abandoned, and the test reads the block each
+//! one gets. The pure rendering rules are unit tests in
+//! `src/commands/errors/report.rs`; this is what a real failure slot, fixes
+//! list and sandbox fate make of them.
+#![expect(
+    clippy::panic,
+    clippy::panic_in_result_fn,
+    reason = "restriction/style lints scoped to production code; tests are exempt"
+)]
+
+use crate::common::Workspace;
+use heph::commands::errors::ReportContext;
+use heph::engine::{Engine, OutputMatcher, ResultOptions};
+use heph::htaddr::parse_addr;
+use std::sync::Arc;
+
+/// Resolve `addr`, which must fail, and render the report its request
+/// would print: `took_down`, `was_cancelled` and the home all from the
+/// request, as `finalize!` gathers them.
+async fn run_report(engine: &Arc<Engine>, addr: &str) -> anyhow::Result<String> {
+    let rs = engine.new_state();
+    let res = Arc::clone(engine)
+        .result_addr(
+            rs.clone(),
+            &parse_addr(addr)?,
+            OutputMatcher::All,
+            &ResultOptions::default(),
+        )
+        .await;
+    assert!(res.is_err(), "{addr} must fail");
+    let failures = rs.take_failures();
+    let home = rs.heph_home();
+    Ok(ReportContext::gather(
+        &failures,
+        |a| rs.took_down(a),
+        |a| rs.was_cancelled(a),
+        home.as_deref(),
+    )
+    .render(false))
+}
+
+/// The line of `report` whose row is `label`, or a panic naming the report.
+fn row<'a>(report: &'a str, label: &str) -> &'a str {
+    report
+        .lines()
+        .find(|l| l.contains(label))
+        .unwrap_or_else(|| panic!("no {label:?} row:\n{report}"))
+}
+
+/// No line names the slot, its fixes list or a sandbox the report did not
+/// keep: the only way into heph's home is a `heph` command.
+fn names_no_home_path(engine: &Engine, addr: &str, report: &str) {
+    let slot = engine
+        .failure_slots()
+        .slot_dir(&parse_addr(addr).expect("addr"));
+    for needle in [
+        "fixes.txt".to_owned(),
+        slot.display().to_string(),
+        engine.home.display().to_string(),
+        "sandbox".to_owned(),
+    ] {
+        assert!(!report.contains(&needle), "{needle:?} in:\n{report}");
+    }
+}
+
+/// The block ends with its log, named by `heph log <addr>`.
+fn ends_with_log(report: &str, addr: &str) {
+    let last = report.lines().last().unwrap_or_default();
+    assert!(
+        last.starts_with("  ╰ full log:") && last.contains(&format!("heph log {addr} (")),
+        "{report}"
+    );
+}
+
+/// A failed `in_place` target with `failure_out`: the block names the fixes
+/// written, a restore command quoting a path with a space and a non-ASCII
+/// one, and the kept files grouped with `heph inspect failure`; it ends with
+/// `heph log`, and no line points into heph's home.
+#[tokio::test]
+async fn failure_report_failure_outputs() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "web",
+        r#"
+target(
+    name = "lint",
+    driver = "bash",
+    deps = [file("a b.txt"), file("é.txt")],
+    out = ["a b.txt", "é.txt"],
+    codegen = "in_place",
+    failure_out = ["report/*.txt", "summary.txt"],
+    run = "for f in 'a b.txt' 'é.txt'; do up=$(tr a-z A-Z < \"$f\"); printf '%s' \"$up\" > \"$f\"; done; mkdir -p report; printf 1 > report/1.txt; printf 2 > report/2.txt; printf s > summary.txt; echo lint-marker; exit 1",
+)
+"#,
+    );
+    ws.write_file("web/a b.txt", "a");
+    ws.write_file("web/é.txt", "e");
+
+    let addr = "//web:lint";
+    let report = run_report(&ws.engine, addr).await?;
+    // The exit status read through the memoizer's shared wrapper, which
+    // every recorded failure's source is.
+    assert!(
+        report.starts_with(&format!("\n✗ {addr} · exit status: 1\n")),
+        "{report}"
+    );
+    assert!(report.contains("  │ lint-marker\n"), "{report}");
+    assert!(
+        row(&report, "fixes written:")
+            .ends_with("web/a b.txt, web/é.txt · the target still failed; re-run to verify"),
+        "{report}"
+    );
+    assert!(
+        row(&report, "restore:")
+            .ends_with("--literal-pathspecs checkout -- 'web/a b.txt' 'web/é.txt'"),
+        "{report}"
+    );
+    // Grouped from the package, not the workspace: `report/`, not `web/`.
+    assert!(
+        row(&report, "kept:").ends_with(&format!(
+            "report/ (2 files), summary.txt · heph inspect failure {addr}"
+        )),
+        "{report}"
+    );
+    ends_with_log(&report, addr);
+    names_no_home_path(&ws.engine, addr, &report);
+    Ok(())
+}
+
+/// An `in_place` target in `fix/` that uppercases `n` files and fails.
+fn n_fixes_build_file(n: usize) -> String {
+    let files: Vec<String> = (1..=n).map(|i| format!("f{i:02}.txt")).collect();
+    let quoted = |f: &String| format!("{f:?}");
+    format!(
+        r#"
+target(
+    name = "upper",
+    driver = "bash",
+    deps = [{deps}],
+    out = [{outs}],
+    codegen = "in_place",
+    run = "for f in {list}; do up=$(tr a-z A-Z < $f); printf '%s' \"$up\" > $f; done; echo fixed; exit 1",
+)
+"#,
+        deps = files
+            .iter()
+            .map(|f| format!("file({})", quoted(f)))
+            .collect::<Vec<_>>()
+            .join(", "),
+        outs = files.iter().map(quoted).collect::<Vec<_>>().join(", "),
+        list = files.join(" "),
+    )
+}
+
+/// A workspace whose `//fix:upper` writes `n` fixes and fails.
+fn n_fixes(n: usize) -> Workspace {
+    let ws = Workspace::new();
+    ws.write_build_file("fix", &n_fixes_build_file(n));
+    for i in 1..=n {
+        ws.write_file(&format!("fix/f{i:02}.txt"), "x");
+    }
+    ws
+}
+
+/// Ten fixes are all named, and restored by name; an eleventh is `+1 more`,
+/// and the restore goes through the list `heph inspect failure` names. A
+/// target with no `failure_out` has no `kept:` row.
+#[tokio::test]
+async fn failure_report_fix_counts() -> anyhow::Result<()> {
+    let addr = "//fix:upper";
+
+    let ws = n_fixes(10);
+    let report = run_report(&ws.engine, addr).await?;
+    let all: Vec<String> = (1..=10).map(|i| format!("fix/f{i:02}.txt")).collect();
+    assert!(
+        row(&report, "fixes written:").ends_with(&format!(
+            "{} · the target still failed; re-run to verify",
+            all.join(", ")
+        )),
+        "{report}"
+    );
+    assert!(
+        row(&report, "restore:").ends_with(&format!("checkout -- {}", all.join(" "))),
+        "{report}"
+    );
+    assert!(!report.contains("kept:"), "{report}");
+    ends_with_log(&report, addr);
+    names_no_home_path(&ws.engine, addr, &report);
+
+    let ws = n_fixes(11);
+    let report = run_report(&ws.engine, addr).await?;
+    assert!(
+        row(&report, "fixes written:").ends_with(&format!(
+            "{} +1 more · the target still failed; re-run to verify",
+            all.join(", ")
+        )),
+        "{report}"
+    );
+    assert!(!report.contains("fix/f11.txt"), "{report}");
+    assert!(
+        row(&report, "restore:").ends_with(&format!(
+            "--literal-pathspecs checkout \
+             --pathspec-from-file=<the fixes file heph inspect failure {addr} names>"
+        )),
+        "{report}"
+    );
+    assert!(!report.contains("kept:"), "{report}");
+    ends_with_log(&report, addr);
+    names_no_home_path(&ws.engine, addr, &report);
+    Ok(())
+}
+
+/// `//fix:upper`: uppercases `fix/src.txt` in place, then runs `tail`.
+fn in_place_then(tail: &str) -> String {
+    format!(
+        r#"
+target(
+    name = "upper",
+    driver = "bash",
+    deps = [file("src.txt")],
+    out = "src.txt",
+    codegen = "in_place",
+    failure_out = "report.txt",
+    run = "up=$(tr a-z A-Z < src.txt); printf '%s' \"$up\" > $OUT; printf r > report.txt; echo fixed; {tail}",
+)
+"#
+    )
+}
+
+/// A run killed by signal 9 wrote no fixes, and says why.
+#[tokio::test]
+async fn failure_report_killed_by_signal() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file("fix", &in_place_then("kill -9 $$"));
+    ws.write_file("fix/src.txt", "hello");
+
+    let addr = "//fix:upper";
+    let report = run_report(&ws.engine, addr).await?;
+    assert!(
+        row(&report, "fixes not written:").ends_with("fixes not written: killed by signal 9"),
+        "{report}"
+    );
+    assert!(!report.contains("restore:"), "{report}");
+    // A signal still keeps `failure_out`.
+    assert!(
+        row(&report, "kept:").ends_with(&format!("report.txt · heph inspect failure {addr}")),
+        "{report}"
+    );
+    ends_with_log(&report, addr);
+    names_no_home_path(&ws.engine, addr, &report);
+    Ok(())
+}
+
+/// `--keep-failed-sandboxes` adds one `sandbox kept:` row, and it is the only
+/// line naming a sandbox, or anything else in heph's home.
+#[tokio::test]
+async fn failure_report_kept_sandbox() -> anyhow::Result<()> {
+    let ws = Workspace::keeping_failed_sandboxes();
+    ws.write_build_file("fix", &in_place_then("exit 1"));
+    ws.write_file("fix/src.txt", "hello");
+
+    let addr = "//fix:upper";
+    let report = run_report(&ws.engine, addr).await?;
+    let kept: Vec<&str> = report
+        .lines()
+        .filter(|l| l.contains("sandbox kept:"))
+        .collect();
+    let [kept] = kept.as_slice() else {
+        panic!("one sandbox kept row:\n{report}");
+    };
+    let path = kept
+        .split_once("sandbox kept:")
+        .map(|(_, p)| p.trim())
+        .unwrap_or_default();
+    assert!(
+        std::path::Path::new(path).is_dir(),
+        "the kept sandbox is on disk: {path}"
+    );
+    let rest: String = report
+        .lines()
+        .filter(|l| !l.contains("sandbox kept:"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        row(&report, "kept:").contains("heph inspect failure"),
+        "{report}"
+    );
+    ends_with_log(&report, addr);
+    names_no_home_path(&ws.engine, addr, &rest);
+    Ok(())
+}
+
+/// A run abandoned after its timeout's grace says so, and that its sandbox
+/// was left behind, without naming it.
+#[tokio::test]
+async fn failure_report_abandoned_timeout_leaves_sandbox() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let run = crate::run_timeout::Abandoned::run(root.path(), false).await?;
+    let report = ReportContext::gather(
+        std::slice::from_ref(&run.failure),
+        |_| Default::default(),
+        |_| false,
+        Some(&run.engine.home),
+    )
+    .render(false);
+    run.drain().await;
+    assert!(
+        report.starts_with("\n✗ //p:deaf · timed out after 1s (its timeout)\n"),
+        "{report}"
+    );
+    assert!(
+        row(&report, "abandoned:").contains("was abandoned"),
+        "{report}"
+    );
+    assert!(
+        row(&report, "sandbox left:").ends_with("the run was abandoned after its timeout"),
+        "{report}"
+    );
+    assert!(!report.contains("sandbox kept:"), "{report}");
+    for needle in [run.engine.home.display().to_string(), "fixes.txt".into()] {
+        assert!(!report.contains(&needle), "{needle:?} in:\n{report}");
+    }
+    Ok(())
+}

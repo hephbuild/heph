@@ -492,16 +492,16 @@ impl heph::engine::driver_managed::ManagedDriver for DeafBash {
 /// An abandoned sandboxed run of `//p:deaf`, on an engine whose sandbox
 /// removals are held by `gate` (closed) until the test opens it: a run whose
 /// failure queued a removal still holds its `sandbox` slot when this returns.
-struct Abandoned {
-    engine: Arc<Engine>,
-    failure: Arc<heph::engine::error::TargetFailure>,
+pub(crate) struct Abandoned {
+    pub(crate) engine: Arc<Engine>,
+    pub(crate) failure: Arc<heph::engine::error::TargetFailure>,
     /// The request's background work, outliving the request.
     bg: heph::engine::sandbox_cleaner::PendingCounter,
     gate: heph::engine::sandbox_cleaner::RemovalGate,
 }
 
 impl Abandoned {
-    async fn run(root: &Path, keep_failed_sandboxes: bool) -> anyhow::Result<Self> {
+    pub(crate) async fn run(root: &Path, keep_failed_sandboxes: bool) -> anyhow::Result<Self> {
         write_build(
             root,
             r#"
@@ -564,7 +564,7 @@ target(
     }
 
     /// Open the gate and wait, bounded, for the request's background work.
-    async fn drain(&self) {
+    pub(crate) async fn drain(&self) {
         self.gate.open();
         let deadline = Instant::now() + Duration::from_secs(30);
         while self.bg.load(std::sync::atomic::Ordering::Acquire) > 0 {
