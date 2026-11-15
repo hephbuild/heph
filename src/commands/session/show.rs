@@ -123,8 +123,20 @@ struct ShowJson<'a> {
 #[derive(Debug, Serialize)]
 struct Next {
     kind: NextKind,
-    /// The command to run; `null` when there is nothing to do.
+    /// Display text for a person: each word shell-quoted when it needs it, so
+    /// the line pastes back into a shell, then escaped for the terminal; the
+    /// program of a `rerun` is its file name. `null` when there is nothing to
+    /// do. An agent runs [`Next::argv`] instead.
     command: Option<String>,
+    /// What an agent runs: the exact words, unquoted and unescaped. For
+    /// `rerun`, the recorded `argv` with the program as recorded; otherwise
+    /// `heph` and its arguments. `null` when there is nothing to do.
+    argv: Option<Vec<String>>,
+    /// The directory to run `argv` in: the recorded `cwd` for the commands
+    /// that depend on it (`rerun`, `inspect_failure`, `list`); `null` for the
+    /// ones that take a session id and run from anywhere, or when no `cwd` was
+    /// recorded.
+    cwd: Option<String>,
     /// Why, for a person.
     reason: String,
 }
@@ -444,46 +456,60 @@ fn next_action(
     snapshot: &SessionSnapshot,
     chain_root: Option<&SessionEntry>,
 ) -> Next {
-    let id = entry.id;
-    let next = |kind, command: String, reason: &str| Next {
-        kind,
-        command: Some(command),
+    let id = entry.id.encode();
+    // A `heph` command; `in_cwd` when it depends on the directory it runs in.
+    let heph = |kind, args: &[&str], in_cwd: bool, reason: &str| {
+        let argv: Vec<String> = std::iter::once("heph")
+            .chain(args.iter().copied())
+            .map(str::to_owned)
+            .collect();
+        Next {
+            kind,
+            command: Some(shell_line(&argv)),
+            argv: Some(argv),
+            cwd: in_cwd.then(|| meta.cwd.clone()).flatten(),
+            reason: reason.to_owned(),
+        }
+    };
+    let rerun = |reason: &str| Next {
+        kind: NextKind::Rerun,
+        command: Some(shell_line(&meta.argv)),
+        argv: Some(meta.argv.clone()),
+        cwd: meta.cwd.clone(),
         reason: reason.to_owned(),
     };
-    let rerun = |reason: &str| {
-        next(
-            NextKind::Rerun,
-            command_line(&meta.argv, usize::MAX),
-            reason,
-        )
-    };
     match state {
-        SessionState::Running => next(
+        SessionState::Running => heph(
             NextKind::Attach,
-            format!("heph session attach {id}"),
+            &["session", "attach", &id],
+            false,
             "follow it live",
         ),
         SessionState::Waiting => match chain_root {
-            Some(root) => next(
+            Some(root) => heph(
                 NextKind::ShowHolder,
-                format!("heph session show {}", root.id),
+                &["session", "show", &root.id.encode()],
+                false,
                 "what the session holding the lock is doing",
             ),
-            None => next(
+            None => heph(
                 NextKind::Attach,
-                format!("heph session attach {id}"),
+                &["session", "attach", &id],
+                false,
                 "follow it until the wait ends",
             ),
         },
-        SessionState::Quiet => next(
+        SessionState::Quiet => heph(
             NextKind::Inflight,
-            format!("heph session inflight {id}"),
+            &["session", "inflight", &id],
+            false,
             "ask it what it is doing",
         ),
         SessionState::Failed => match snapshot.failed.first() {
-            Some(addr) => next(
+            Some(addr) => heph(
                 NextKind::InspectFailure,
-                format!("heph inspect failure {}", escape(addr)),
+                &["inspect", "failure", addr],
+                true,
                 "the failed target's log and outputs",
             ),
             None => rerun("run it again: it failed before any target did"),
@@ -492,12 +518,34 @@ fn next_action(
         SessionState::Ok => Next {
             kind: NextKind::None,
             command: None,
+            argv: None,
+            cwd: None,
             reason: "it succeeded".to_owned(),
         },
-        SessionState::Unknown => next(
+        SessionState::Unknown => heph(
             NextKind::List,
-            "heph session list".to_owned(),
+            &["session", "list"],
+            true,
             &format!("session {id} is in an unknown state"),
         ),
     }
+}
+
+/// `argv` as a line a shell reads back into the same words: the program by its
+/// file name, each word quoted when it needs it, then escaped for the terminal
+/// (a word with a NUL, which no shell can take, is left unquoted).
+fn shell_line(argv: &[String]) -> String {
+    let mut words = argv.iter();
+    let mut line = String::new();
+    if let Some(program) = words.next() {
+        let name = std::path::Path::new(program)
+            .file_name()
+            .map_or_else(|| program.clone(), |f| f.to_string_lossy().into_owned());
+        line.push_str(&shlex::try_quote(&name).unwrap_or(std::borrow::Cow::Borrowed(&name)));
+    }
+    for w in words {
+        line.push(' ');
+        line.push_str(&shlex::try_quote(w).unwrap_or(std::borrow::Cow::Borrowed(w)));
+    }
+    escape(&line).into_owned()
 }

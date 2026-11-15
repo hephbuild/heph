@@ -206,10 +206,21 @@ ms:
 event log) plus `id`, `state`, `blocked_on` (the same entries as `list
 --json`), `chain_root` (the id of the session at the root of the first lock
 chain, `null` when no chain leads to a session) and `next: {kind, command,
-reason}`. `kind` is one of `attach`, `show_holder`, `inflight`,
-`inspect_failure`, `rerun`, `list`, `none` and may gain values; `command` is
-the command line to run, `null` for `none`. The text `Next:` line prints the
-same command alone, its reason on the line below.
+argv, cwd, reason}`. `kind` is one of `attach`, `show_holder`, `inflight`,
+`inspect_failure`, `rerun`, `list`, `none` and may gain values.
+
+- `command` is display text for a person: each word shell-quoted where it
+  needs it, so it pastes back into a shell, then escaped for the terminal; a
+  `rerun` names its program by file name. Don't parse it.
+- `argv` is what an agent runs: the exact words, unquoted and unescaped. For
+  `rerun` it is the recorded `argv`, the program as recorded; for the others,
+  `heph` and its arguments.
+- `cwd` is the directory to run `argv` in: the recorded `cwd` for `rerun`,
+  `inspect_failure` and `list`, which depend on it; `null` for the commands
+  that take a session id and run from anywhere, or when no `cwd` was recorded.
+- All three are `null` for `none`.
+
+The text `Next:` line prints `command` alone, its reason on the line below.
 
 `inflight --json` is `{id, report}`.
 

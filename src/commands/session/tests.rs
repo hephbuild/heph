@@ -701,6 +701,25 @@ async fn next_is_structured_for_every_state() {
                 .expect("json");
         assert_eq!(json["next"]["kind"], kind, "case {n}: {json}");
         assert_eq!(json["next"]["command"].as_str(), command, "case {n}");
+        // `argv` is what an agent runs: the recorded argv for a rerun (program
+        // as recorded), `heph …` otherwise; `cwd` where it depends on one.
+        let (want_argv, want_cwd): (serde_json::Value, serde_json::Value) = match kind {
+            "rerun" => (
+                serde_json::json!(["/bin/heph", "run", "//a:b"]),
+                serde_json::json!("/w/pacu/sub"),
+            ),
+            "none" => (serde_json::Value::Null, serde_json::Value::Null),
+            "inspect_failure" | "list" => (
+                serde_json::json!(command.expect("command").split(' ').collect::<Vec<_>>()),
+                serde_json::json!("/w/pacu/sub"),
+            ),
+            _ => (
+                serde_json::json!(command.expect("command").split(' ').collect::<Vec<_>>()),
+                serde_json::Value::Null,
+            ),
+        };
+        assert_eq!(json["next"]["argv"], want_argv, "case {n}: {json}");
+        assert_eq!(json["next"]["cwd"], want_cwd, "case {n}: {json}");
         let reason = json["next"]["reason"].as_str().expect("reason");
         let out = run_show(&sources, &id.encode(), false).await.expect("show");
         let want = format!("\nNext: {}\n  {reason}\n", command.unwrap_or("nothing"));
@@ -714,6 +733,36 @@ async fn next_is_structured_for_every_state() {
             );
         }
     }
+}
+
+/// A rerun of an argument with a space and a quote: `argv` is exact, and the
+/// `Next:` line is shell-quoted so it pastes back into the same words.
+#[tokio::test]
+async fn next_rerun_argv_is_exact_and_its_line_is_quoted() {
+    let id = SessionId::new(T0, 1);
+    let argv = ["/opt/bin/heph", "run", "//go:test x", "it's"];
+    let source = FakeSource {
+        sessions: vec![(
+            entry(meta(id, 1, &argv), false, Some(ended(Some(1), NOW))),
+            Vec::new(),
+        )],
+    };
+    let sources: [&dyn SessionSource; 1] = [&source];
+    let json: serde_json::Value =
+        serde_json::from_str(&run_show(&sources, &id.encode(), true).await.expect("json"))
+            .expect("json");
+    assert_eq!(json["next"]["kind"], "rerun", "{json}");
+    assert_eq!(json["next"]["argv"], serde_json::json!(argv), "{json}");
+    assert_eq!(json["next"]["cwd"], "/w/pacu/sub", "{json}");
+    let command = json["next"]["command"].as_str().expect("command");
+    assert_eq!(command, r#"heph run '//go:test x' "it's""#);
+    // The line reads back into the recorded words (the program by its name).
+    assert_eq!(
+        shlex::split(command).expect("a shell reads it"),
+        ["heph", "run", "//go:test x", "it's"]
+    );
+    let out = run_show(&sources, &id.encode(), false).await.expect("show");
+    assert!(out.contains(&format!("\nNext: {command}\n")), "{out}");
 }
 
 #[tokio::test]
