@@ -72,7 +72,13 @@ pub(crate) struct RunLogs {
 /// file, and removed when the file is unlinked; a `cache = false` success's
 /// retained file keeps its entry. Read by the log API only.
 #[derive(Debug, Default)]
-pub(crate) struct LiveRuns(Mutex<std::collections::HashMap<hmodel::htaddr::Addr, LiveRun>>);
+pub(crate) struct LiveRuns {
+    runs: Mutex<std::collections::HashMap<hmodel::htaddr::Addr, LiveRun>>,
+    /// The one retained file per address: retaining a newer run's file
+    /// unlinks the previous one, so a `cache = false` target run N times in
+    /// one engine (a watch loop, a server) keeps one file, not N.
+    retained: Mutex<std::collections::HashMap<hmodel::htaddr::Addr, PathBuf>>,
+}
 
 /// One run's live file, as the log API finds it in-process.
 #[derive(Debug, Clone)]
@@ -89,7 +95,17 @@ impl LiveRuns {
     fn map(
         &self,
     ) -> std::sync::MutexGuard<'_, std::collections::HashMap<hmodel::htaddr::Addr, LiveRun>> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+        self.runs.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Record `path` as `addr`'s retained file, and return the previous one
+    /// unless it is the same.
+    fn retain(&self, addr: &hmodel::htaddr::Addr, path: &Path) -> Option<PathBuf> {
+        self.retained
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(addr.clone(), path.to_path_buf())
+            .filter(|previous| previous != path)
     }
 
     /// `addr`'s newest live file in this engine, if one exists.
@@ -524,6 +540,21 @@ impl RunLog {
         }
     }
 
+    /// Keep the created file as its addr's retained one, unlinking the file
+    /// an earlier run of the addr retained. That run's [`LiveRuns`] entry is
+    /// already this one's: this run's first byte registered it.
+    fn keep_retained(&self) {
+        let Some(reg) = &self.registration else {
+            return;
+        };
+        if let Some(previous) = reg.live.retain(&reg.addr, &self.path)
+            && let Err(e) = std::fs::remove_file(&previous)
+            && e.kind() != io::ErrorKind::NotFound
+        {
+            tracing::debug!(path = %previous.display(), error = %e, "removing a superseded retained run log");
+        }
+    }
+
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -950,13 +981,18 @@ impl Drop for LiveGuard {
                 "bytes written after the run's log was closed were dropped"
             );
         }
-        if self.unlink && created {
+        if !created {
+            return;
+        }
+        if self.unlink {
             if let Err(e) = std::fs::remove_file(&self.log.path)
                 && e.kind() != io::ErrorKind::NotFound
             {
                 tracing::debug!(path = %self.log.path.display(), error = %e, "removing a run's live log");
             }
             self.log.unregister();
+        } else {
+            self.log.keep_retained();
         }
     }
 }
@@ -1531,6 +1567,35 @@ mod tests {
         assert!(matches!(empty, Imported::Replaced), "{empty:?}");
         assert_eq!(std::fs::read(log.path()).expect("read"), b"");
         assert!(log.replaced());
+    }
+
+    /// A `cache = false` target run twice in one engine keeps one retained
+    /// file: the newer run's, which the log API finds; another addr's
+    /// retained file is untouched.
+    #[test]
+    fn retaining_a_newer_run_unlinks_the_previous_retained_file() {
+        let (_home, logs) = logs();
+        let addr = hmodel::htaddr::parse_addr("//pkg:serve").expect("addr");
+        let other = hmodel::htaddr::parse_addr("//pkg:other").expect("addr");
+        let run = |addr: &hmodel::htaddr::Addr, text: &[u8]| {
+            let (log, guard) = logs.create_for(addr, "hashin");
+            log.write_chunk(Stream::Stdout, text, None);
+            drop(log.finalize());
+            guard.retain();
+            log.path().to_path_buf()
+        };
+        let first = run(&addr, b"first");
+        let kept = run(&other, b"other");
+        let second = run(&addr, b"second");
+        assert_ne!(first, second);
+        assert!(!first.exists(), "the superseded retained file is unlinked");
+        assert_eq!(std::fs::read(&second).expect("read"), b"second");
+        assert_eq!(std::fs::read(&kept).expect("read"), b"other");
+        assert_eq!(
+            logs.live().get(&addr).expect("registered").path,
+            second,
+            "the log API finds the newer run"
+        );
     }
 
     /// A run dropped while its log is imported: the guard unlinked the live
