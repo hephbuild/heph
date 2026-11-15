@@ -135,15 +135,9 @@ fn row(buf: &Buffer, y: u16) -> String {
         .to_owned()
 }
 
-/// The view's frame as the terminal shows it: one string per row.
-fn draw(view: &TuiProgressView) -> Vec<String> {
-    draw_at(view, WIDTH)
-}
-
-/// [`draw`] on a terminal `width` columns wide.
-fn draw_at(view: &TuiProgressView, width: u16) -> Vec<String> {
+/// `lines` as a `width` × [`HEIGHT`] terminal shows them: one string per row.
+fn paint(lines: Vec<ratatui::text::Line<'static>>, width: u16) -> Vec<String> {
     let mut terminal = Terminal::new(TestBackend::new(width, HEIGHT)).expect("terminal");
-    let lines = view.render("⠋", NOW, width, HEIGHT);
     terminal
         .draw(|f| f.render_widget(Paragraph::new(Text::from(lines)), f.area()))
         .expect("draw");
@@ -153,11 +147,29 @@ fn draw_at(view: &TuiProgressView, width: u16) -> Vec<String> {
         .collect()
 }
 
+/// The dashboard as the alternate screen shows it: one string per row.
+fn draw(view: &mut TuiProgressView) -> Vec<String> {
+    draw_at(view, WIDTH)
+}
+
+/// [`draw`] on a terminal `width` columns wide.
+fn draw_at(view: &mut TuiProgressView, width: u16) -> Vec<String> {
+    let lines = view.render_full(NOW, width, HEIGHT);
+    paint(lines, width)
+}
+
 const KEYS: &str = "  [y] approve · [n] reject · enter view";
 
+/// Runs of spaces as one: a title whose session segment is gone pads its
+/// right-aligned gauges wider, and that padding is not the seam.
+fn squash(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// `attached` is `live` with the seam applied: the banner without its keys,
-/// the help row with the session hint, cut where the terminal ends. Everything
-/// else row for row.
+/// the title naming the session (while it fits), the help row ending in
+/// `q detach` instead of `ctrl-c stop`, cut where the terminal ends.
+/// Everything else row for row.
 fn assert_same_but_the_seam(
     live: &[String],
     attached: &[String],
@@ -168,37 +180,65 @@ fn assert_same_but_the_seam(
     assert_eq!(live.len(), attached.len(), "{at}: same height");
     let (live_help, live_rows) = live.split_last().expect("a help row");
     let (attached_help, attached_rows) = attached.split_last().expect("a help row");
-    let expected: Vec<String> = live_rows.iter().map(|r| r.replace(KEYS, "")).collect();
-    assert_eq!(attached_rows, expected.as_slice(), "{at}: the frame");
-    let help: String = format!("{live_help} · session {id} · q detach")
-        .chars()
-        .take(usize::from(width))
-        .collect();
-    assert_eq!(*attached_help, help.trim_end(), "{at}: the help row");
+    let session = format!("  session {id}");
+    for (i, (live_row, attached_row)) in live_rows.iter().zip(attached_rows).enumerate() {
+        if attached_row.contains(&session) {
+            // The title row: the session named, the rest the run's title.
+            assert_eq!(
+                squash(&attached_row.replace(&session, "")),
+                squash(live_row),
+                "{at}: the title, row {i}"
+            );
+        } else {
+            assert_eq!(
+                *attached_row,
+                live_row.replace(KEYS, "").trim_end(),
+                "{at}: row {i}"
+            );
+        }
+    }
+    if live_help.ends_with(" · ctrl-c stop") {
+        let help = format!(
+            "{} · q detach",
+            live_help.trim_end_matches(" · ctrl-c stop")
+        );
+        let help: String = help.chars().take(usize::from(width)).collect();
+        assert_eq!(*attached_help, help.trim_end(), "{at}: the help row");
+    } else {
+        // Cut before the keys that differ: the live row, cut the same.
+        assert_eq!(*attached_help, *live_help, "{at}: the help row, cut");
+    }
 }
 
 /// A terminal narrower than the frame wants: rows are cut, the seam still the
 /// only difference.
 const NARROW: u16 = 60;
 
-/// The frames a checkpoint compares beyond the main view at full width: the
-/// main view narrow, then the failed tab at both widths. The view is left on
-/// its main tab.
+/// The frames a checkpoint compares beyond the All tab at full width: the
+/// All tab narrow, then the Failed tab at both widths. The view is left on
+/// the All tab.
 fn draw_more(view: &mut TuiProgressView) -> [Vec<String>; 3] {
     let narrow = draw_at(view, NARROW);
-    // Shift+Tab from the main view lands on the last tab, Failed.
-    view.tab(false);
+    // All · Running · Pending · Failed: three Tabs to Failed.
+    for _ in 0..3 {
+        view.tab(true);
+    }
     let failed = draw(view);
     let failed_narrow = draw_at(view, NARROW);
-    view.tab(true);
+    for _ in 0..3 {
+        view.tab(false);
+    }
     [narrow, failed, failed_narrow]
 }
 
-/// The line, as the view shows it after `Esc` from the box: one string per
-/// row that has anything on it. The view is left on the box's main view.
+/// The line, as the view shows it after `Esc` from the dashboard: one string
+/// per row that has anything on it. The view is left with the dashboard open.
 fn draw_line(view: &mut TuiProgressView) -> Vec<String> {
     view.back_to_main();
-    let rows = draw(view).into_iter().filter(|r| !r.is_empty()).collect();
+    let rows = paint(view.render("⠋", NOW, WIDTH, HEIGHT), WIDTH)
+        .into_iter()
+        .filter(|r| !r.is_empty())
+        .collect();
     view.tab(true);
     rows
 }
@@ -234,8 +274,8 @@ fn attached_view_draws_what_the_run_drew() {
         label: label.clone(),
     }))
     .with_approval(center.clone());
-    // The box's frames are compared first; the line has its own checks.
-    live.open_box();
+    // The dashboard's frames are compared first; the line has its own checks.
+    live.open_dashboard();
     // The backend's receiver resolves the holder before the fold; the events
     // here are applied by hand, so resolve up front.
     let live_names = HolderNames::new(Some(session_root.clone()), Some(rec.id()));
@@ -261,7 +301,7 @@ fn attached_view_draws_what_the_run_drew() {
     );
     let next = center.request(&build, "//a:next".into(), Vec::new());
     view_tap.observe(&live);
-    let live_prompt = draw(&live);
+    let live_prompt = draw(&mut live);
     let live_prompt_line = draw_line(&mut live);
 
     center.respond(gate.seq, true, Vec::new());
@@ -269,7 +309,7 @@ fn attached_view_draws_what_the_run_drew() {
     assert_eq!(gate.rx.blocking_recv(), Ok(true));
     assert_eq!(next.rx.blocking_recv(), Ok(false));
     view_tap.observe(&live);
-    let live_after = draw(&live);
+    let live_after = draw(&mut live);
     let live_after_line = draw_line(&mut live);
     let live_more = draw_more(&mut live);
 
@@ -282,7 +322,7 @@ fn attached_view_draws_what_the_run_drew() {
     // The viewer: the same view, attached, fed from the recording.
     let feed = SessionFeed::default();
     let mut attached = TuiProgressView::new("run //a:...").attached(rec.id(), feed.clone(), || {});
-    attached.open_box();
+    attached.open_dashboard();
     let attached_names = FileSource::new(root.path()).holder_names(rec.id());
     attached_names.resolve_blocking(std::process::id());
     attached.name_lock_holders(attached_names);
@@ -298,7 +338,7 @@ fn attached_view_draws_what_the_run_drew() {
             other => panic!("nothing is printed in this run: {other:?}"),
         }
         if let Some(shown) = prompt {
-            let frame = draw(&attached);
+            let frame = draw(&mut attached);
             let line = draw_line(&mut attached);
             let more = (!shown).then(|| draw_more(&mut attached));
             checkpoints.push((shown, frame, line, more));
@@ -322,7 +362,8 @@ fn attached_view_draws_what_the_run_drew() {
         "2 pending",
         "notice: plan",
         "//a:slow",
-        &format!("locked by session {}", holder.id()),
+        // The dashboard's LAST LINE for a lock wait names the holder.
+        &format!("held by session {}", holder.id()),
         "(4 matched)",
     ] {
         assert!(joined.contains(needle), "{needle:?} in\n{joined}");

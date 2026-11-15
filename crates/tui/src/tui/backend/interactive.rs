@@ -1318,7 +1318,6 @@ mod tests {
     #[test]
     fn resize_reanchors_inline_viewport_and_reflows() {
         use super::reanchor_terminal;
-        use crate::tui::progress::MIN_PROGRESS_ROWS;
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
         use ratatui::buffer::Buffer;
@@ -1336,7 +1335,7 @@ mod tests {
 
         fn draw_view(terminal: &mut Terminal<TestBackend>) {
             let cols = terminal.size().expect("size").width;
-            let lines = box_lines(cols, MIN_PROGRESS_ROWS);
+            let lines = box_lines(cols, MIN_ROWS);
             terminal
                 .draw(|f| {
                     f.render_widget(Paragraph::new(Text::from(lines)), f.area());
@@ -1347,7 +1346,7 @@ mod tests {
         let mut terminal = Terminal::with_options(
             TestBackend::new(80, 24),
             TerminalOptions {
-                viewport: Viewport::Inline(MIN_PROGRESS_ROWS),
+                viewport: Viewport::Inline(MIN_ROWS),
             },
         )
         .expect("terminal");
@@ -1360,7 +1359,7 @@ mod tests {
         // header that overflows has no closing corner to look for.
         terminal.backend_mut().resize(56, 24);
         reanchor_terminal(&mut terminal);
-        draw_view(&mut terminal, &view);
+        draw_view(&mut terminal);
 
         let buf = terminal.backend().buffer();
         // Buffers re-anchored to the new width, not stale 80.
@@ -1391,6 +1390,37 @@ mod tests {
         );
     }
 
+    /// The fewest rows [`box_lines`] draws a box in: top, one body row, bottom,
+    /// and a row under it.
+    const MIN_ROWS: u16 = 4;
+
+    /// A view's rows for a terminal height, for the re-anchor tests: a third of
+    /// the terminal, at least [`MIN_ROWS`], so 24 and 60 rows differ.
+    fn rows_for_height(term_height: u16) -> u16 {
+        (term_height / 3).max(MIN_ROWS)
+    }
+
+    /// A `cols` × `rows` box: `╭─…─╮`, `│ … │` rows, `╰─…─╯`. A stand-in for an
+    /// inline view taller than one row, every row of it painted, its right
+    /// edge on the last column.
+    fn box_lines(cols: u16, rows: u16) -> Vec<ratatui::text::Line<'static>> {
+        let inner = usize::from(cols.saturating_sub(2));
+        let edge = |l: char, fill: char, r: char| {
+            let mut s = String::with_capacity((inner + 2) * 3);
+            s.push(l);
+            s.extend(std::iter::repeat_n(fill, inner));
+            s.push(r);
+            ratatui::text::Line::from(s)
+        };
+        (0..rows)
+            .map(|i| match i {
+                0 => edge('╭', '─', '╮'),
+                i if i + 1 == rows => edge('╰', '─', '╯'),
+                _ => edge('│', ' ', '│'),
+            })
+            .collect()
+    }
+
     /// Rows carrying at least one non-blank cell. The box is the only thing ever
     /// drawn in these tests, so this is "where the box is" — and, more usefully,
     /// "where anything the box left behind is".
@@ -1410,8 +1440,6 @@ mod tests {
         origin_row: u16,
         rows: u16,
     ) -> ratatui::Terminal<ratatui::backend::TestBackend> {
-        use crate::tui::app::TUIAppView;
-        use crate::tui::progress::TuiProgressView;
         use ratatui::backend::{Backend, TestBackend};
         use ratatui::layout::Position;
         use ratatui::text::Text;
@@ -1432,10 +1460,7 @@ mod tests {
         )
         .expect("terminal");
 
-        let view = TuiProgressView::new("Running //a:b");
-        // These reflow the box, which is taller than the line.
-        view.open_box();
-        let lines = view.render("⠋", 10_000, width, rows);
+        let lines = box_lines(width, rows);
         terminal
             .draw(|f| f.render_widget(Paragraph::new(Text::from(lines)), f.area()))
             .expect("draw");
@@ -1459,8 +1484,6 @@ mod tests {
     #[test]
     fn resize_rebuild_anchors_at_the_old_origin_not_the_live_cursor() {
         use super::reanchor_inline;
-        use crate::tui::app::TUIAppView;
-        use crate::tui::progress::{TuiProgressView, rows_for_height};
         use ratatui::Terminal;
         use ratatui::backend::{Backend, TestBackend};
         use ratatui::layout::Position;
@@ -1528,10 +1551,7 @@ mod tests {
              live cursor walks it down the screen instead"
         );
 
-        let view = TuiProgressView::new("Running //a:b");
-        // These reflow the box, which is taller than the line.
-        view.open_box();
-        let lines = view.render("⠋", 10_000, WIDTH, rows);
+        let lines = box_lines(WIDTH, rows);
         terminal
             .draw(|f| f.render_widget(Paragraph::new(Text::from(lines)), f.area()))
             .expect("redraw");
@@ -1548,8 +1568,6 @@ mod tests {
     #[test]
     fn width_only_resize_reflows_without_rebuilding() {
         use super::reanchor_inline;
-        use crate::tui::app::TUIAppView;
-        use crate::tui::progress::{TuiProgressView, rows_for_height};
         use ratatui::backend::Backend;
         use ratatui::text::Text;
         use ratatui::widgets::Paragraph;
@@ -1573,10 +1591,7 @@ mod tests {
         assert_eq!(rebuilds, 0, "no row-count change, no rebuild");
         assert_eq!(rows, start_rows);
 
-        let view = TuiProgressView::new("Running //a:b");
-        // These reflow the box, which is taller than the line.
-        view.open_box();
-        let lines = view.render("⠋", 10_000, 50, rows);
+        let lines = box_lines(50, rows);
         terminal
             .draw(|f| f.render_widget(Paragraph::new(Text::from(lines)), f.area()))
             .expect("redraw");
@@ -1594,8 +1609,6 @@ mod tests {
     #[test]
     fn failed_rebuild_keeps_the_old_terminal_usable() {
         use super::reanchor_inline;
-        use crate::tui::app::TUIAppView;
-        use crate::tui::progress::{TuiProgressView, rows_for_height};
         use ratatui::backend::Backend;
         use ratatui::text::Text;
         use ratatui::widgets::Paragraph;
@@ -1621,10 +1634,7 @@ mod tests {
             "a failed rebuild leaves the viewport where the collapse parked it"
         );
 
-        let view = TuiProgressView::new("Running //a:b");
-        // These reflow the box, which is taller than the line.
-        view.open_box();
-        let lines = view.render("⠋", 10_000, WIDTH, rows);
+        let lines = box_lines(WIDTH, rows);
         terminal
             .draw(|f| f.render_widget(Paragraph::new(Text::from(lines)), f.area()))
             .expect("redraw");

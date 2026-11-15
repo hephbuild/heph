@@ -23,22 +23,9 @@ mod test_events;
 
 pub use spotlight::{HOLD_MS, Spot};
 
-/// Floor on the pinned viewport row count. The viewport targets one third of the
-/// terminal height (see [`rows_for_height`]) but never shrinks below this, which
-/// is the minimum that fits the box: top border + 1 body row + bottom border +
-/// help row.
-pub const MIN_PROGRESS_ROWS: u16 = 4;
-
 /// The dashboard's key hints once the build has ended and the dashboard
 /// holds it on screen: nothing is left to stop, and `q` leaves.
 const FINISHED_DASHBOARD_HINTS: &str = "↑/↓ select · enter details · l log · tab/⇧tab list · / filter · a all targets · q or esc leave";
-
-/// Pinned viewport rows for a given terminal height: one third of the terminal,
-/// clamped up to [`MIN_PROGRESS_ROWS`]. The box grows the body (slow/lock rows)
-/// to fill whatever rows it is given.
-pub fn rows_for_height(term_height: u16) -> u16 {
-    (term_height / 3).max(MIN_PROGRESS_ROWS)
-}
 
 /// A target is considered "taking long" once its execute span exceeds this.
 pub const LONG_RUNNING_THRESHOLD_MS: u64 = 5_000;
@@ -5180,15 +5167,6 @@ mod tests {
         assert_eq!(active[1].style.fg, Some(Color::DarkGray));
     }
 
-    #[test]
-    fn rows_for_height_is_one_third_clamped_to_min() {
-        assert_eq!(rows_for_height(30), 10);
-        assert_eq!(rows_for_height(24), 8);
-        // Tiny terminals clamp up to the minimum box height.
-        assert_eq!(rows_for_height(3), MIN_PROGRESS_ROWS);
-        assert_eq!(rows_for_height(0), MIN_PROGRESS_ROWS);
-    }
-
     /// A18: one frame as plain text — the header box line, then the lock wait
     /// and the long-running target — with no bottom border, help row or idle
     /// art, measured against the clock it is given.
@@ -5314,15 +5292,23 @@ mod tests {
     #[test]
     fn finished_dashboard_hints_say_how_to_leave() {
         use crate::tui::app::TUIAppView;
+        // Wide enough for the whole hint row: at 100 columns it is cut before
+        // `ctrl-c stop`.
+        fn hints(v: &mut TuiProgressView) -> String {
+            v.render_full(0, 140, 14)
+                .last()
+                .map(ToString::to_string)
+                .unwrap_or_default()
+        }
         let mut v = TuiProgressView::new("L");
         v.open_dashboard();
         // While the run is live, the hint row offers to stop it.
-        let hints = dash_frame(&mut v, 0).last().cloned().unwrap_or_default();
-        assert!(hints.contains("ctrl-c stop"), "{hints}");
+        let live = hints(&mut v);
+        assert!(live.contains("ctrl-c stop"), "{live}");
 
         // Once it has ended there is nothing to stop: `q` leaves.
         v.set_finished(0);
-        let hints = dash_frame(&mut v, 0).last().cloned().unwrap_or_default();
+        let hints = hints(&mut v);
         assert!(hints.contains("q or esc leave"), "{hints}");
         assert!(!hints.contains("ctrl-c"), "{hints}");
     }

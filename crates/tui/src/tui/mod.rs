@@ -25,7 +25,7 @@ pub use log_sink::LogSink;
 pub use paused::paused;
 pub use progress::{
     BuildHeader, BuildState, CiProgressView, CountScope, GcCiView, GcHeader, HeaderItem,
-    MIN_PROGRESS_ROWS, ProgressHeader, TuiProgressView, ViewMode, human_bytes, rows_for_height,
+    ProgressHeader, TuiProgressView, ViewMode, human_bytes,
 };
 pub use pty_session::{PtyEnds, PtySession};
 pub use stdout_buffer::BufferedStdout;
