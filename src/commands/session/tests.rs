@@ -330,6 +330,60 @@ fn state_is_derived() {
         stall_threshold(Duration::from_secs(5)),
         Duration::from_secs(5)
     );
+    // `quiet` is strictly past the threshold, under the default (no
+    // `--stall-notice`) and under a custom one.
+    let quiet_for = |ms: u64| {
+        live(SessionSnapshot {
+            last_event_unix_ms: Some(NOW - ms),
+            ..SessionSnapshot::default()
+        })
+    };
+    let thresholds: &[(&str, Duration, u64, SessionState)] = &[
+        (
+            "default, exactly 60s",
+            Duration::ZERO,
+            60_000,
+            SessionState::Running,
+        ),
+        (
+            "default, 60s + 1ms",
+            Duration::ZERO,
+            60_001,
+            SessionState::Quiet,
+        ),
+        (
+            "--stall-notice 5s, 4.999s",
+            Duration::from_secs(5),
+            4_999,
+            SessionState::Running,
+        ),
+        (
+            "--stall-notice 5s, exactly 5s",
+            Duration::from_secs(5),
+            5_000,
+            SessionState::Running,
+        ),
+        (
+            "--stall-notice 5s, 5.001s",
+            Duration::from_secs(5),
+            5_001,
+            SessionState::Quiet,
+        ),
+        // A custom threshold above the default holds a session past 60s.
+        (
+            "--stall-notice 5m, 61s",
+            Duration::from_secs(300),
+            61_000,
+            SessionState::Running,
+        ),
+    ];
+    for &(name, notice, ms, want) in thresholds {
+        assert_eq!(
+            derive_state(&quiet_for(ms), NOW, stall_threshold(notice)),
+            want,
+            "{name}"
+        );
+    }
     // Unknown is what a newer heph's state decodes as.
     let s: SessionState = serde_json::from_str("\"hibernating\"").expect("decode");
     assert_eq!(s, SessionState::Unknown);
@@ -687,31 +741,70 @@ async fn next_is_structured_for_every_state() {
         format!("heph session attach {id}"),
         format!("heph session inflight {id}"),
     );
-    let cases: Vec<(SessionEntry, Vec<SessionRecord>, &str, Option<&str>)> = vec![
-        (e(true, Some(busy)), Vec::new(), "attach", Some(&attach)),
+    // Waiting on a lock whose holder records no session: there is no chain
+    // root to point at, so the next step falls back to following the run.
+    let waits_on_a_stranger = |last: u64| SessionSnapshot {
+        last_event_unix_ms: Some(last),
+        waiting: vec!["//go:sdk".to_owned()],
+        lock_waits: vec![LockWaitEntry {
+            addr: "//go:sdk".to_owned(),
+            holder_pid: Some(999),
+            in_use_by_readers: false,
+            since_unix_ms: NOW - 90_000,
+        }],
+        ..SessionSnapshot::default()
+    };
+    let stranger_records = vec![record(
+        NOW - 90_000,
+        BuildEventKind::ResultLockWaitStart {
+            addr: "//go:sdk".into(),
+            holder_pid: Some(999),
+            in_use_by_readers: false,
+        },
+    )];
+    /// (session, records, next kind, next command, state)
+    type Case<'a> = (
+        SessionEntry,
+        Vec<SessionRecord>,
+        &'a str,
+        Option<&'a str>,
+        &'a str,
+    );
+    let cases: Vec<Case<'_>> = vec![
+        (
+            e(true, Some(busy)),
+            Vec::new(),
+            "attach",
+            Some(&attach),
+            "running",
+        ),
         (
             e(true, Some(quiet)),
             Vec::new(),
             "inflight",
             Some(&inflight),
+            "quiet",
         ),
         (
             e(false, Some(ended(Some(1), NOW))),
             fail_records("//a:b"),
             "inspect_failure",
             Some("heph inspect failure //a:b"),
+            "failed",
         ),
         (
             e(false, Some(ended(Some(1), NOW))),
             Vec::new(),
             "rerun",
             Some("heph run //a:b"),
+            "failed",
         ),
         (
             e(false, Some(SessionSnapshot::default())),
             Vec::new(),
             "rerun",
             Some("heph run //a:b"),
+            "lost",
         ),
         (
             SessionEntry {
@@ -721,15 +814,41 @@ async fn next_is_structured_for_every_state() {
             Vec::new(),
             "list",
             Some("heph session list"),
+            "unknown",
         ),
         (
             e(false, Some(ended(Some(0), NOW))),
             Vec::new(),
             "none",
             None,
+            "ok",
+        ),
+        // Waiting with no chain root: attach, not show_holder.
+        (
+            e(true, Some(waits_on_a_stranger(NOW - 1_000))),
+            stranger_records.clone(),
+            "attach",
+            Some(&attach),
+            "waiting",
+        ),
+        // Waiting and quiet both apply: waiting wins, a wait explains the quiet.
+        (
+            e(true, Some(waits_on_a_stranger(NOW - 61_000))),
+            stranger_records,
+            "attach",
+            Some(&attach),
+            "waiting",
+        ),
+        // Failed and quiet both apply: an ended session is never quiet.
+        (
+            e(false, Some(ended(Some(1), NOW - 61_000))),
+            fail_records("//a:b"),
+            "inspect_failure",
+            Some("heph inspect failure //a:b"),
+            "failed",
         ),
     ];
-    for (n, (session, records, kind, command)) in cases.into_iter().enumerate() {
+    for (n, (session, records, kind, command, state)) in cases.into_iter().enumerate() {
         let source = FakeSource {
             sessions: vec![(session, records)],
         };
@@ -737,8 +856,13 @@ async fn next_is_structured_for_every_state() {
         let json: serde_json::Value =
             serde_json::from_str(&run_show(&sources, &id.encode(), true).await.expect("json"))
                 .expect("json");
+        assert_eq!(json["state"], state, "case {n}: {json}");
         assert_eq!(json["next"]["kind"], kind, "case {n}: {json}");
         assert_eq!(json["next"]["command"].as_str(), command, "case {n}");
+        if state == "waiting" {
+            assert_eq!(json["chain_root"], serde_json::Value::Null, "case {n}");
+            assert_eq!(json["blocked_on"][0]["holder_pid"], 999, "case {n}: {json}");
+        }
         // `argv` is what an agent runs: the recorded argv for a rerun (program
         // as recorded), `heph …` otherwise; `cwd` where it depends on one.
         let (want_argv, want_cwd): (serde_json::Value, serde_json::Value) = match kind {
@@ -801,6 +925,101 @@ async fn next_rerun_argv_is_exact_and_its_line_is_quoted() {
     );
     let out = run_show(&sources, &id.encode(), false).await.expect("show");
     assert!(out.contains(&format!("\nNext: {command}\n")), "{out}");
+}
+
+/// A lock cycle: A waits on a lock B holds, and B on one A holds. Showing
+/// either names the other as the chain root and points `next` at it; the
+/// chain stops at the cycle after one hop instead of going round.
+#[tokio::test]
+async fn a_lock_cycle_keeps_the_chain_root_and_next_bounded() {
+    let a = SessionId::new(T0, 1);
+    let b = SessionId::new(T0 + 5_000, 2);
+    let (a_pid, b_pid) = (100, 200);
+    // `status.json` (what `list` and the chain walk read) and the event log
+    // (what `show` folds for the session shown) say the same wait.
+    let waits_on = |addr: &str, holder: u32| {
+        let status = SessionSnapshot {
+            last_event_unix_ms: Some(NOW - 1_000),
+            waiting: vec![addr.to_owned()],
+            lock_waits: vec![LockWaitEntry {
+                addr: addr.to_owned(),
+                holder_pid: Some(holder),
+                in_use_by_readers: false,
+                since_unix_ms: NOW - 30_000,
+            }],
+            ..SessionSnapshot::default()
+        };
+        let records = vec![record(
+            NOW - 30_000,
+            BuildEventKind::ResultLockWaitStart {
+                addr: addr.into(),
+                holder_pid: Some(holder),
+                in_use_by_readers: false,
+            },
+        )];
+        (status, records)
+    };
+    let (a_status, a_records) = waits_on("//go:sdk", b_pid);
+    let (b_status, b_records) = waits_on("//go:base", a_pid);
+    let source = FakeSource {
+        sessions: vec![
+            (
+                entry(
+                    meta(a, a_pid, &["heph", "run", "//a:x"]),
+                    true,
+                    Some(a_status),
+                ),
+                a_records,
+            ),
+            (
+                entry(
+                    meta(b, b_pid, &["heph", "run", "//b:x"]),
+                    true,
+                    Some(b_status),
+                ),
+                b_records,
+            ),
+        ],
+    };
+    let sources: [&dyn SessionSource; 1] = [&source];
+    for (shown, other) in [(a, b), (b, a)] {
+        let shown_id = shown.encode();
+        let run = run_show(&sources, &shown_id, true);
+        let json: serde_json::Value = serde_json::from_str(
+            &tokio::time::timeout(Duration::from_secs(10), run)
+                .await
+                .expect("show on a cycle returns")
+                .expect("json"),
+        )
+        .expect("json");
+        assert_eq!(json["state"], "waiting", "{json}");
+        assert_eq!(json["chain_root"], other.encode(), "{json}");
+        assert_eq!(
+            json["blocked_on"][0]["holder_session"],
+            other.encode(),
+            "{json}"
+        );
+        assert_eq!(json["next"]["kind"], "show_holder", "{json}");
+        let argv = ["heph", "session", "show", &other.encode()].map(str::to_owned);
+        assert_eq!(json["next"]["argv"], serde_json::json!(argv), "{json}");
+        assert_eq!(json["next"]["command"], argv.join(" "), "{json}");
+
+        let out = run_show(&sources, &shown.encode(), false)
+            .await
+            .expect("show");
+        assert_eq!(
+            out.matches("    which waits for ").count(),
+            1,
+            "one hop, then the cycle: {out}"
+        );
+        assert!(out.contains(" — a cycle\n"), "{out}");
+        assert!(
+            out.ends_with(&format!(
+                "\nNext: heph session show {other}\n  what the session holding the lock is doing\n"
+            )),
+            "{out}"
+        );
+    }
 }
 
 #[tokio::test]
