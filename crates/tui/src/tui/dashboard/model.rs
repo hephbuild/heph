@@ -1038,4 +1038,210 @@ mod tests {
             std::mem::size_of::<Record>()
         );
     }
+
+    /// xorshift64*: the churn's seeded randomness.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn below(&mut self, n: usize) -> usize {
+            usize::try_from(self.next() % n as u64).unwrap_or(0)
+        }
+    }
+
+    /// The tabs as plain lists: each state's targets in the order they
+    /// entered it, and the recent ones, maintained from nothing but each
+    /// record's state after every event — no slot, no count.
+    #[derive(Default)]
+    struct Naive {
+        states: HashMap<RowState, Vec<Id>>,
+        recent: Vec<Id>,
+        last: Vec<RowState>,
+    }
+
+    impl Naive {
+        fn follow(&mut self, m: &Model) {
+            for id in 0..m.id_count() {
+                let id = Id::try_from(id).unwrap_or(Id::MAX);
+                let now = m.record(id).expect("a record per id").state;
+                let before = match self.last.get(id as usize) {
+                    Some(&s) => s,
+                    None => {
+                        self.last.push(RowState::Queued);
+                        self.states.entry(RowState::Queued).or_default().push(id);
+                        RowState::Queued
+                    }
+                };
+                if before == now {
+                    continue;
+                }
+                self.states.entry(before).or_default().retain(|&x| x != id);
+                self.states.entry(now).or_default().push(id);
+                if before.recent() && !now.recent() {
+                    self.recent.retain(|&x| x != id);
+                }
+                if now.recent() && !before.recent() {
+                    self.recent.push(id);
+                }
+                self.last[id as usize] = now;
+            }
+        }
+
+        fn rows(&self, m: &Model, tab: Tab, scope: CountScope) -> Vec<Id> {
+            let only = m.matched_only(scope);
+            let mut out = Vec::new();
+            for &seg in tab.segs() {
+                let ids = match seg {
+                    Seg::State(s) => self.states.get(&s).map_or(&[][..], Vec::as_slice),
+                    Seg::Recent => &self.recent,
+                };
+                let keep = |id: &&Id| !only || m.record(**id).is_some_and(Record::matched);
+                if seg.rev() {
+                    out.extend(ids.iter().rev().filter(keep));
+                } else {
+                    out.extend(ids.iter().filter(keep));
+                }
+            }
+            out
+        }
+    }
+
+    /// One random event for one of `n` targets: arrival in a `Matched`
+    /// batch, a start, waits on and off, an execute, a cache hit and its
+    /// rebuild, and every kind of end.
+    fn churn_event(rng: &mut Rng, n: usize) -> BuildEventKind {
+        let addr = |rng: &mut Rng| format!("//c:t{}", rng.below(n));
+        match rng.below(12) {
+            0 => BuildEventKind::Matched {
+                addrs: (0..1 + rng.below(8)).map(|_| addr(rng)).collect(),
+                complete: false,
+            },
+            1 => BuildEventKind::ResultStart { addr: addr(rng) },
+            2 | 3 => BuildEventKind::AdmissionWaitStart {
+                addr: addr(rng),
+                pool: "cpu".into(),
+                need: 2,
+                free: 1,
+                ahead: 0,
+                removals_pending: None,
+                yielding_to: None,
+            },
+            4 => BuildEventKind::AdmissionWaitEnd { addr: addr(rng) },
+            5 | 6 => BuildEventKind::ExecuteStart {
+                output_groups: Vec::new(),
+                addr: addr(rng),
+                driver: "exec".into(),
+                cache: true,
+                declared: None,
+                reserved: None,
+                queued_ms: None,
+                admitted: None,
+            },
+            7 => BuildEventKind::CacheOutcome {
+                addr: addr(rng),
+                outcome: CacheOutcomeKind::LocalHit,
+            },
+            8 => BuildEventKind::CacheHitRebuilt {
+                addr: addr(rng),
+                was: hcore::events::CacheHitKind::Local,
+            },
+            k => {
+                let (error, upstream_of, cancelled) = match k {
+                    9 => (None, None, false),
+                    10 => (Some("boom".to_owned()), None, rng.below(3) == 0),
+                    _ => (Some("boom".to_owned()), Some(addr(rng)), false),
+                };
+                BuildEventKind::ResultEnd {
+                    cancelled,
+                    addr: addr(rng),
+                    error,
+                    upstream_of,
+                    exit_status: None,
+                    log_tail: None,
+                    timed_out: None,
+                }
+            }
+        }
+    }
+
+    /// Seeded churn over 300 targets: after every event, each tab in both
+    /// scopes has the naive list's length, its `k`-th row is the list's
+    /// `k`-th, every target's `index_of` is its place in the list (or none),
+    /// and `rows` walks the list. Buckets compact many times on the way (the
+    /// queued one alone fills to 300 and drains), so a slot left stale by a
+    /// compaction shows up as a wrong row or index. (Not the recent bucket:
+    /// a finished target never leaves it, so no event vacates a slot there.)
+    #[test]
+    fn churn_keeps_rows_and_indexes_in_step_with_a_naive_list() {
+        use crate::tui::progress::CountScope;
+        const TARGETS: usize = 300;
+        let redact = Redact::default();
+        let mut compactions = 0;
+        for seed in 1..=4u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let mut m = Model::default();
+            let mut naive = Naive::default();
+            for step in 0..2_000u64 {
+                let kind = churn_event(&mut rng, TARGETS);
+                let slots_before: usize = m.buckets.iter().map(|b| b.slots().len()).sum();
+                m.apply(
+                    &BuildEvent {
+                        at_unix_ms: 1_000 + step,
+                        kind: kind.clone(),
+                    },
+                    &redact,
+                );
+                let slots_after: usize = m.buckets.iter().map(|b| b.slots().len()).sum();
+                if slots_after < slots_before {
+                    compactions += 1;
+                }
+                naive.follow(&m);
+                for tab in Tab::LIST {
+                    for scope in [CountScope::Matched, CountScope::All] {
+                        let want = naive.rows(&m, tab, scope);
+                        let ctx =
+                            || format!("seed {seed} step {step} {tab:?} {scope:?} after {kind:?}");
+                        assert_eq!(m.tab_len(tab, scope), want.len(), "len, {}", ctx());
+                        let rows: Vec<Id> = (0..want.len())
+                            .map(|k| m.row(tab, scope, k).unwrap_or(Id::MAX))
+                            .collect();
+                        assert_eq!(rows, want, "row(k), {}", ctx());
+                        assert_eq!(
+                            m.row(tab, scope, want.len()),
+                            None,
+                            "past the end, {}",
+                            ctx()
+                        );
+                        assert_eq!(
+                            m.rows(tab, scope).collect::<Vec<_>>(),
+                            want,
+                            "rows, {}",
+                            ctx()
+                        );
+                        let mut place = vec![None; m.id_count()];
+                        for (k, &id) in want.iter().enumerate() {
+                            place[id as usize] = Some(k);
+                        }
+                        for (id, &want) in place.iter().enumerate() {
+                            let id = Id::try_from(id).unwrap_or(Id::MAX);
+                            assert_eq!(
+                                m.index_of(tab, scope, id),
+                                want,
+                                "index_of({id}), {}",
+                                ctx()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            compactions > 6,
+            "the churn compacted only {compactions} times"
+        );
+    }
 }
