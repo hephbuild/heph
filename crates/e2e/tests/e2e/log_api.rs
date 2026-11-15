@@ -718,3 +718,71 @@ async fn log_remote_fetch_on_demand() -> anyhow::Result<()> {
     assert_eq!(unavailable(err).0, LogSource::Cache { remote: true });
     Ok(())
 }
+
+/// A follow waiting for the next run, which turns out to be another
+/// engine's remote hit: its log is not on disk and never gets there by
+/// itself. A follow that may fetch reads it through; one that may not fails
+/// with `LogUnavailable` rather than wait on it forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_waiting_follow_that_ends_in_a_remote_hit_fetches_or_fails() -> anyhow::Result<()> {
+    let remote = tempfile::tempdir()?;
+    let uri = format!("file://{}", remote.path().display());
+    let (producer, reader) = (tempfile::tempdir()?, tempfile::tempdir()?);
+    let body = r#"target(name = "t", driver = "bash", out = "t.txt", run = "echo remote-log; echo x > t.txt")"#;
+    for ws in [&producer, &reader] {
+        write_build(ws.path(), body)?;
+    }
+    let cold = build_engine(producer.path(), &uri);
+    run_drain(&cold, "//p:t").await;
+    drop(cold);
+
+    let t = parse_addr("//p:t")?;
+    let follower = build_engine(reader.path(), &uri);
+    let fetch = LogOptions {
+        fetch_remote: true,
+        ..LogOptions::default()
+    };
+    let mut fetching = follower
+        .follow_log(&t, &fetch, true)
+        .await?
+        .expect("a follower");
+    let mut refusing = follower
+        .follow_log(&t, &LogOptions::default(), true)
+        .await?
+        .expect("a follower");
+    assert_eq!(fetching.poll()?, FollowStep::Idle, "no run yet");
+    assert_eq!(refusing.poll()?, FollowStep::Idle, "no run yet");
+
+    let builder = build_engine(reader.path(), &uri);
+    run_drain(&builder, "//p:t").await;
+
+    // The refusing follow first: once the other fetched, the log is local.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let err = loop {
+        match refusing.poll() {
+            Err(e) => break e,
+            Ok(FollowStep::Idle) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "the follow waits on a remote log"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Ok(step) => panic!("a remote log read without fetching: {step:?}"),
+        }
+    };
+    let unavailable = err
+        .downcast::<LogUnavailable>()
+        .map_err(|e| e.context("not LogUnavailable"))?;
+    assert_eq!(unavailable.info.source, LogSource::Cache { remote: true });
+
+    let mut got = Vec::new();
+    assert!(poll_until(&mut fetching, &mut got, |_| false).await);
+    assert_eq!(String::from_utf8(got)?, "remote-log\n");
+    assert_eq!(
+        fetching.info(),
+        None,
+        "done: the fetched log was read through"
+    );
+    Ok(())
+}

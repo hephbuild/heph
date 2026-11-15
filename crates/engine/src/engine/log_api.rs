@@ -328,6 +328,7 @@ impl Engine {
             addr: addr.clone(),
             locator: opts.locator.clone(),
             hashin: opts.hashin.clone(),
+            fetch_remote: opts.fetch_remote,
             state,
             offset: 0,
             checked: None,
@@ -721,6 +722,9 @@ pub struct LogFollower {
     locator: Option<Arc<dyn LiveRunLogLocator>>,
     /// [`LogOptions::hashin`]: the only run a wait accepts.
     hashin: Option<String>,
+    /// [`LogOptions::fetch_remote`]: a wait that ends in a remote hit's
+    /// entry fetches its log, or fails, rather than wait on it forever.
+    fetch_remote: bool,
     state: Follow,
     /// Bytes returned so far from the current run's log.
     offset: u64,
@@ -773,9 +777,22 @@ impl LogFollower {
                     self.state = match latest {
                         Latest::Running(run) => Follow::Live(run),
                         Latest::Stored(s) if baseline.is_none_or(|b| s.at_unix_ms() > b) => {
-                            match self.open_local(s) {
-                                Some(log) => Follow::Stored(log),
-                                None => return Ok(FollowStep::Idle),
+                            // A cache entry whose log is not on disk is a
+                            // remote hit's: it never becomes local by
+                            // itself, so it is fetched or refused, never
+                            // waited on.
+                            let entry = match &s {
+                                Stored::Cache { manifest, log } => {
+                                    Some((manifest.clone(), log.clone()))
+                                }
+                                Stored::Retained(..) | Stored::Slot(_) => None,
+                            };
+                            match (self.open_local(s), entry) {
+                                (Some(log), _) => Follow::Stored(log),
+                                (None, Some((manifest, log))) => {
+                                    Follow::Stored(self.open_entry(manifest, log)?)
+                                }
+                                (None, None) => return Ok(FollowStep::Idle),
                             }
                         }
                         _ => return Ok(FollowStep::Idle),
@@ -944,6 +961,24 @@ impl LogFollower {
             }
         };
         opened.and_then(Result::ok)
+    }
+
+    /// Open a cache entry's log that is not on disk as [`Engine::open_log`]
+    /// does: fetched when the follow asked for it, else [`LogUnavailable`].
+    /// `poll` is sync and may be called from inside the runtime, so the
+    /// fetch is driven by the engine's runtime on a scoped thread.
+    fn open_entry(&self, manifest: Manifest, log: ManifestArtifact) -> anyhow::Result<OpenLog> {
+        let (engine, addr, fetch) = (&self.engine, &self.addr, self.fetch_remote);
+        let stored = Stored::Cache { manifest, log };
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                engine
+                    .runtime
+                    .block_on(engine.open_stored(addr, stored, fetch))
+            })
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        })
     }
 }
 
