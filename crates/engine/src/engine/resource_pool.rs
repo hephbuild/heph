@@ -808,9 +808,11 @@ impl State {
         Some(waiter)
     }
 
-    /// Queue a waiter of shape `need`, whose class is `class`. The class is
-    /// entered here, with its first waiter, so no waiter is ever without
-    /// one.
+    /// Queue a waiter of shape `need`, whose class is `class`: the id
+    /// `shapes` holds for `need`, or a fresh one. A fresh class is entered
+    /// here with its first waiter, in `classes` and in `shapes` together as
+    /// [`State::remove`] takes it out of both, so no waiter is without a
+    /// class and no class without the entry that finds it by shape.
     fn push(
         &mut self,
         class: u64,
@@ -820,14 +822,18 @@ impl State {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
         let (tx, rx) = oneshot::channel();
-        self.classes
-            .entry(class)
-            .or_insert_with(|| Class {
-                need,
-                waiters: BTreeSet::new(),
-            })
-            .waiters
-            .insert(seq);
+        match self.classes.entry(class) {
+            btree_map::Entry::Occupied(mut occupied) => {
+                occupied.get_mut().waiters.insert(seq);
+            }
+            btree_map::Entry::Vacant(vacant) => {
+                self.shapes.insert(Arc::clone(&need), class);
+                vacant.insert(Class {
+                    need,
+                    waiters: BTreeSet::from([seq]),
+                });
+            }
+        }
         self.waiters.insert(
             seq,
             Waiter {
@@ -1000,7 +1006,6 @@ impl Lane {
                 }
                 let class = st.next_class;
                 st.next_class = st.next_class.wrapping_add(1);
-                st.shapes.insert(Arc::clone(&need), class);
                 (class, need)
             }
         };
