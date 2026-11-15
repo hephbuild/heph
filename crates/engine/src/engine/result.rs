@@ -8308,6 +8308,60 @@ mod tests {
         Ok(())
     }
 
+    /// An open right after a remote hit, while the mirrored manifest is still
+    /// a queued sqlite write: the listing misses it, so `open_log` lets the
+    /// queue commit and looks again instead of answering "no log".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn open_log_after_a_remote_hit_waits_for_the_queued_manifest() -> anyhow::Result<()> {
+        let remote = tempdir()?;
+        let remote_uri = format!("file://{}", remote.path().display());
+        let addr = hmodel::htaddr::parse_addr("//pkg:t")?;
+        let target = || pluginstatictarget::Target {
+            run: Some("echo a log line; echo hi > $OUT".to_string()),
+            ..out_target("//pkg:t")
+        };
+
+        let (seeder, _seeder_home) = engine_with_remote_bash(vec![target()], &remote_uri)?;
+        let seed_rs = seeder.new_state();
+        resolve(&seeder, &seed_rs, &addr, OutputMatcher::All).await?;
+        drain_bg(seed_rs).await;
+
+        let (engine, _home) = engine_with_remote_bash(vec![target()], &remote_uri)?;
+        // The writer stays shut through the hit, so the mirrored manifest is
+        // queued, not listed, when the open starts.
+        let hold = engine.hold_local_cache_writes();
+        let rs = engine.new_state();
+        resolve(&engine, &rs, &addr, OutputMatcher::None).await?;
+        drop(rs);
+
+        let opener = tokio::spawn({
+            let engine = Arc::clone(&engine);
+            let addr = addr.clone();
+            async move {
+                let opts = crate::engine::log_api::LogOptions {
+                    fetch_remote: true,
+                    ..Default::default()
+                };
+                engine.open_log(&addr, &opts).await
+            }
+        });
+        // Long enough for the open's first look to have missed.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        drop(hold);
+        let log = tokio::time::timeout(std::time::Duration::from_secs(30), opener)
+            .await
+            .context("open_log never returned")???
+            .expect("the hit's log, once the queued manifest committed");
+        assert_eq!(
+            log.info().source,
+            crate::engine::log_api::LogSource::Cache { remote: true }
+        );
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut log.reader()?, &mut text)?;
+        assert_eq!(text, "a log line\n");
+        Ok(())
+    }
+
     /// Two readers open a remote hit's log at once (a `heph log` and the
     /// TUI's pane): the blob is pulled once, and both read it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

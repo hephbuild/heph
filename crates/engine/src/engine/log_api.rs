@@ -287,12 +287,15 @@ impl Engine {
         addr: &Addr,
         opts: &LogOptions,
     ) -> anyhow::Result<Option<OpenLog>> {
-        let engine = Arc::clone(self);
-        let (a, locator, hashin) = (addr.clone(), opts.locator.clone(), opts.hashin.clone());
-        let latest = hcore::blocking::run(move || {
-            engine.latest_log(&a, locator.as_deref(), hashin.as_deref())
-        })
-        .await?;
+        let mut latest = self.latest_log_blocking(addr, opts).await?;
+        if matches!(latest, Latest::None) {
+            // A remote hit's mirrored manifest is a queued write until the
+            // sqlite writer commits it, and the cache listing does not wait
+            // on that queue: an open right after the hit found nothing. On
+            // the miss path only, let what is queued commit and look again.
+            self.sqlite_writes.drain_queued_writes().await;
+            latest = self.latest_log_blocking(addr, opts).await?;
+        }
         match latest {
             Latest::None => Ok(None),
             Latest::Started(started) => Err(started.into()),
@@ -331,12 +334,7 @@ impl Engine {
         opts: &LogOptions,
         wait_for_start: bool,
     ) -> anyhow::Result<Option<LogFollower>> {
-        let engine = Arc::clone(self);
-        let (a, locator, hashin) = (addr.clone(), opts.locator.clone(), opts.hashin.clone());
-        let latest = hcore::blocking::run(move || {
-            engine.latest_log(&a, locator.as_deref(), hashin.as_deref())
-        })
-        .await?;
+        let latest = self.latest_log_blocking(addr, opts).await?;
         let state = match latest {
             Latest::Running(run) => Follow::Live(run),
             // A run going on that has written nothing: wait for its first
@@ -371,6 +369,18 @@ impl Engine {
             checked: None,
             replaced_by: None,
         }))
+    }
+
+    /// [`latest_log`](Self::latest_log), off the runtime's workers.
+    async fn latest_log_blocking(
+        self: &Arc<Self>,
+        addr: &Addr,
+        opts: &LogOptions,
+    ) -> anyhow::Result<Latest> {
+        let engine = Arc::clone(self);
+        let (a, locator, hashin) = (addr.clone(), opts.locator.clone(), opts.hashin.clone());
+        hcore::blocking::run(move || engine.latest_log(&a, locator.as_deref(), hashin.as_deref()))
+            .await
     }
 
     /// The newest of `addr`'s logs, or of its logs at `hashin` when given.
