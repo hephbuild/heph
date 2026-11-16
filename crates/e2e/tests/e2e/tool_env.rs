@@ -531,7 +531,8 @@ target(
 }
 
 /// A host binary (`//@heph/bin:<name>`) is staged under `__heph/hostbin/`, not
-/// under its package: it adds no root, alone or beside a tool that does.
+/// under its package: it adds no root, alone or beside a tool that does. It is
+/// still a staged tool, so alone it gets `$HEPH_TOOLS_DIR`.
 #[tokio::test]
 async fn tool_root_skips_a_host_binary() -> anyhow::Result<()> {
     let ws = htestkit::WorkspaceBuilder::new()?
@@ -559,7 +560,7 @@ target(
     name = "alone",
     driver = "bash",
     tools = {"h": ["//@heph/bin:sh"]},
-    run = '[[ -z "${TOOL_H_ROOT+set}" && -n "$TOOL_H" ]] && echo unset > $OUT',
+    run = '[[ -z "${TOOL_H_ROOT+set}" && -n "$TOOL_H" && "$HEPH_TOOLS_DIR" == /* && -d "$HEPH_TOOLS_DIR" ]] && echo unset > $OUT',
     out = "out.txt",
 )
 target(
@@ -581,5 +582,123 @@ target(
         ["greetsdk"],
         "got {beside:?}"
     );
+    Ok(())
+}
+
+/// Shaped like an npm CLI wrapper: a launcher script that reads a file shipped
+/// beside it, finding it through `$HEPH_TOOLS_DIR` and its own package path.
+const GREET_LAUNCHER_BUILD: &str = r#"
+target(
+    name = "cli",
+    driver = "bash",
+    run = [
+        "mkdir -p lib",
+        "echo hello > lib/data.txt",
+        "printf '#!/bin/sh\\ncat \"$HEPH_TOOLS_DIR/greetcli/lib/data.txt\"\\n' > greet",
+        "chmod +x greet",
+    ],
+    out = "greet",
+    support_files = "lib/",
+)
+"#;
+
+/// `$HEPH_TOOLS_DIR` does not depend on how a consumer lists the tool: alone in
+/// the unnamed group, beside another tool, under a named group, and reached
+/// through another tool's `transitive` tools, the same launcher finds its
+/// files. `$TOOL_ROOT` fails the second (a space-joined list) and the third
+/// (unset).
+#[tokio::test]
+async fn tools_dir_finds_a_launchers_files_however_it_is_listed() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file("greetcli", GREET_LAUNCHER_BUILD);
+    ws.write_build_file("x", PLAIN_TOOL_BUILD);
+    ws.write_build_file(
+        "wrap",
+        r#"
+target(
+    name = "wrap",
+    driver = "bash",
+    run = ["printf '#!/bin/sh\\nexec greet\\n' > wrap", "chmod +x wrap"],
+    out = "wrap",
+    transitive = {"tools": ["//greetcli:cli"]},
+)
+"#,
+    );
+    ws.write_build_file(
+        "app",
+        r#"
+target(name = "only_tool", driver = "bash", run = "greet > $OUT",
+       tools = ["//greetcli:cli"], out = "out.txt")
+target(name = "two_tools", driver = "bash", run = "greet > $OUT",
+       tools = ["//greetcli:cli", "//x:t"], out = "out.txt")
+target(name = "named_group", driver = "bash", run = "greet > $OUT",
+       tools = {"greeter": "//greetcli:cli"}, out = "out.txt")
+target(name = "tool_of_a_tool", driver = "bash", run = "wrap > $OUT",
+       tools = ["//wrap:wrap"], out = "out.txt")
+"#,
+    );
+
+    for name in ["only_tool", "two_tools", "named_group", "tool_of_a_tool"] {
+        let addr = format!("//app:{name}");
+        let result = ws.run(&addr).await?;
+        let content = common::artifact_string(&result);
+        assert_eq!(content.trim(), "hello", "{addr}: got {content:?}");
+    }
+    Ok(())
+}
+
+/// heph owns `HEPH_TOOLS_DIR` for a target with tools: the target's own `env`
+/// naming it is refused at parse rather than silently replaced. (The other
+/// ways of setting it share `TOOL_<G>_ROOT`'s check, unit-tested in
+/// `pluginexec`.)
+#[tokio::test]
+async fn tools_dir_claimed_by_own_env_is_refused() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file("x", PLAIN_TOOL_BUILD);
+    ws.write_build_file(
+        "use",
+        r#"
+target(
+    name = "c",
+    driver = "bash",
+    tools = {"named": ["//x:t"]},
+    env = {"HEPH_TOOLS_DIR": "/x"},
+    run = "echo $HEPH_TOOLS_DIR > $OUT",
+    out = "out.txt",
+)
+"#,
+    );
+    let Err(err) = ws.run("//use:c").await else {
+        anyhow::bail!("built although `env` claims HEPH_TOOLS_DIR");
+    };
+    let err = format!("{err:#}");
+    assert!(
+        err.contains("`HEPH_TOOLS_DIR` is set by the target's `env`"),
+        "{err}"
+    );
+    assert!(err.contains("//use:c"), "{err}");
+    Ok(())
+}
+
+/// A target without tools is not heph's to police: its own `HEPH_TOOLS_DIR`
+/// reaches its command unchanged.
+#[tokio::test]
+async fn tools_dir_is_the_targets_own_without_tools() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "use",
+        r#"
+target(
+    name = "c",
+    driver = "bash",
+    env = {"HEPH_TOOLS_DIR": "/mine"},
+    run = "echo $HEPH_TOOLS_DIR > $OUT",
+    out = "out.txt",
+)
+"#,
+    );
+    let result = ws.run("//use:c").await?;
+    let content = common::artifact_string(&result);
+    assert_eq!(content.trim(), "/mine", "got {content:?}");
     Ok(())
 }

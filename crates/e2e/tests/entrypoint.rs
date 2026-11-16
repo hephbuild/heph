@@ -2464,6 +2464,75 @@ target(name = "ep", driver = "bash", entrypoint = True, tools = ["//greetsdk:sdk
     Ok(())
 }
 
+/// An entrypoint gets `$HEPH_TOOLS_DIR` as a build does
+/// (`tool_env::tools_dir_finds_a_launchers_files_however_it_is_listed`): a
+/// launcher listed under a named group, where `$TOOL_ROOT` is unset, finds the
+/// file shipped beside it.
+#[tokio::test]
+async fn entrypoint_tools_dir_finds_a_launchers_files() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "greetcli",
+        r#"
+target(
+    name = "cli",
+    driver = "bash",
+    run = [
+        "mkdir -p lib",
+        "echo hello > lib/data.txt",
+        "printf '#!/bin/sh\\ncat \"$HEPH_TOOLS_DIR/greetcli/lib/data.txt\"\\n' > greet",
+        "chmod +x greet",
+    ],
+    out = "greet",
+    support_files = "lib/",
+)
+"#,
+    );
+    ws.write_build_file(
+        "app",
+        r#"
+target(name = "ep", driver = "bash", entrypoint = True,
+       tools = {"greeter": ["//greetcli:cli"]},
+       run = "exec > \"$HEPH_TEST_OUT\" 2>&1; greet")
+"#,
+    );
+    let out = ws.dir.path().join("out.txt");
+    let mut env = caller_env(&out);
+    env.push(("HEPH_TOOLS_DIR".into(), "/from/caller".into()));
+    let req = InvokeRequest::new(parse_addr("//app:ep")?, ws.dir.path(), env);
+    let exit = exited(invoke(&ws.engine, req).await);
+    let got = read(&out)?;
+    assert_eq!(exit, Exit::Code(0), "{got}");
+    assert_eq!(got.trim(), "hello", "{got}");
+    Ok(())
+}
+
+/// heph owns `HEPH_TOOLS_DIR` for a target with tools: when its only tool is
+/// an empty `group`, nothing is staged, and the caller's value is taken out of
+/// the entrypoint's environment rather than handed on as if heph had set it.
+#[tokio::test]
+async fn entrypoint_unstaged_tools_unset_the_callers_tools_dir() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "app",
+        r#"
+target(name = "empty", driver = "group")
+target(name = "ep", driver = "bash", entrypoint = True,
+       tools = ["//app:empty"],
+       run = "exec > \"$HEPH_TEST_OUT\" 2>&1; echo \"${HEPH_TOOLS_DIR-unset}\"")
+"#,
+    );
+    let out = ws.dir.path().join("out.txt");
+    let mut env = caller_env(&out);
+    env.push(("HEPH_TOOLS_DIR".into(), "/from/caller".into()));
+    let req = InvokeRequest::new(parse_addr("//app:ep")?, ws.dir.path(), env);
+    let exit = exited(invoke(&ws.engine, req).await);
+    let got = read(&out)?;
+    assert_eq!(exit, Exit::Code(0), "{got}");
+    assert_eq!(got.trim(), "unset", "{got}");
+    Ok(())
+}
+
 /// heph owns `TOOL_<G>_ROOT`: when a tool group has no root (a workspace
 /// source file is not under a package of its own), the caller's
 /// `TOOL_ROOT` is taken out of the entrypoint's environment, not handed on
