@@ -37,6 +37,21 @@ trait Chunks {
 /// A failed read, and the stream it ended.
 type ReadError = (StreamId, std::io::Error);
 
+/// The longest a drain may run once the child is reaped, however much of it
+/// was spent waiting. The waiting budget alone ([`proc_exec::DRAIN_DEADLINE`])
+/// never runs out against a descendant that keeps the pipe full (`yes >&2 &`):
+/// every read is ready at once, and the drain would copy its output forever.
+const DRAIN_WALL_CAP: std::time::Duration = proc_exec::DRAIN_DEADLINE.saturating_mul(10);
+
+/// Why a drain after the reap was cut short.
+#[derive(Debug, Clone, Copy)]
+enum Abandoned {
+    /// The pipe stayed open and quiet for the whole waiting budget.
+    Quiet,
+    /// The pipe kept producing past [`DRAIN_WALL_CAP`].
+    Flooded,
+}
+
 impl Chunks for OutputReader {
     async fn next_chunk(&mut self) -> Result<Option<(StreamId, Vec<u8>)>, ReadError> {
         self.recv_tagged().await
@@ -217,7 +232,8 @@ impl<'io> RunLog<'io> {
     /// descendant that inherited the pipe (an ssh `ControlPersist` master, a
     /// shell's background job) would otherwise hold the run open for as long as
     /// it lives. The deadline counts only time spent waiting for output, not
-    /// time spent writing it to the log. A wait that ends in cancellation (or
+    /// time spent writing it to the log; a descendant that keeps the pipe full
+    /// is cut off instead by a wall-clock cap of ten deadlines. A wait that ends in cancellation (or
     /// fails) skips the drain altogether; one that returned a status always
     /// drains, even if the token was cancelled after the reap.
     ///
@@ -273,7 +289,9 @@ impl<'io> RunLog<'io> {
         let mut status = None;
         // What is left of the drain deadline once the child is reaped.
         let mut budget = proc_exec::DRAIN_DEADLINE;
-        let mut abandoned = false;
+        // When the drain after the reap began, for the wall-clock cap.
+        let mut drain_started = None;
+        let mut abandoned = None;
         loop {
             let next = match &status {
                 // `next_chunk` is cancel-safe on both OSes, so the wait winning
@@ -291,13 +309,17 @@ impl<'io> RunLog<'io> {
                 // is already available is read even once the budget is spent.
                 Some(Ok(Ok(_))) => {
                     let started = std::time::Instant::now();
+                    if drain_started.get_or_insert(started).elapsed() >= DRAIN_WALL_CAP {
+                        abandoned = Some(Abandoned::Flooded);
+                        break;
+                    }
                     match tokio::time::timeout(budget, chunks.next_chunk()).await {
                         Ok(next) => {
                             budget = budget.saturating_sub(started.elapsed());
                             next
                         }
                         Err(_) => {
-                            abandoned = true;
+                            abandoned = Some(Abandoned::Quiet);
                             break;
                         }
                     }
@@ -326,12 +348,18 @@ impl<'io> RunLog<'io> {
             Some(status) => status,
             None => wait.await,
         };
-        if abandoned {
-            tracing::warn!(
+        match abandoned {
+            Some(Abandoned::Quiet) => tracing::warn!(
                 deadline = ?proc_exec::DRAIN_DEADLINE,
                 "a process exited but its output pipe is still open; abandoning the drain \
                  (a surviving descendant holds the write end)"
-            );
+            ),
+            Some(Abandoned::Flooded) => tracing::warn!(
+                cap = ?DRAIN_WALL_CAP,
+                "a process exited but its output pipe kept producing; abandoning the drain \
+                 (a surviving descendant is still writing to it)"
+            ),
+            None => {}
         }
         // The held-back tails, after the drain however it ended, or the last
         // bytes of the output disappear.
@@ -648,6 +676,127 @@ mod tests {
         assert_eq!(seen, "before s3cr");
         drop(log);
         assert_eq!(std::fs::read_to_string(&path).expect("log"), "before s3cr");
+    }
+
+    /// A pipe that is always ready after exit (a descendant keeping it full)
+    /// spends none of the waiting budget, so only the wall-clock cap ends the
+    /// drain. Without the cap this drained forever: every read was ready at
+    /// once and the time went to writing the log.
+    #[tokio::test]
+    async fn a_pipe_that_keeps_producing_after_exit_is_cut_off() {
+        let mut slow = SlowWriter::default();
+        let mut log = RunLog::captured(None, Some(&mut slow));
+        let mut bytes = 0usize;
+        let started = std::time::Instant::now();
+        let res = tokio::time::timeout(
+            DRAIN_WALL_CAP * 6,
+            log.drive_chunks(
+                &mut Flood,
+                std::future::ready(Ok(exited(0))),
+                Streams::STDERR,
+                &mut |_, c: &[u8]| bytes += c.len(),
+            ),
+        )
+        .await
+        .expect("a flooding pipe must not drain forever");
+        let took = started.elapsed();
+        assert!(res.expect("drive").expect("wait").success());
+        assert!(bytes > 0);
+        assert!(took >= DRAIN_WALL_CAP, "took {took:?}");
+        assert!(
+            took < DRAIN_WALL_CAP + proc_exec::DRAIN_DEADLINE * 4,
+            "took {took:?}"
+        );
+    }
+
+    /// The same against a real child: a background `yes` that keeps the
+    /// stderr pipe full after the shell exits does not hold the run open.
+    #[test]
+    fn drive_returns_when_a_descendant_floods_the_pipe() {
+        // The drive runs on its own thread and runtime, watched from here: a
+        // drain whose every read is ready never yields to a tokio timeout, so
+        // a regression would hang rather than fail.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let started = std::time::Instant::now();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let res = rt.block_on(async {
+                let ctoken = StdCancellationToken::new();
+                let dir = tempfile::tempdir().expect("tempdir");
+                let (spawned, _) = hexecrunner::spawn_io(
+                    hexecrunner::RunnerRef::local(),
+                    sh(dir.path(), "yes >&2 & exit 0"),
+                    &ctoken,
+                )
+                .await
+                .expect("spawn");
+                let mut log = RunLog::captured(None, None);
+                let mut bytes = 0usize;
+                let status = log
+                    .drive(
+                        spawned.expect("spawned"),
+                        Streams::STDERR,
+                        &ctoken,
+                        |_, c| bytes += c.len(),
+                    )
+                    .await
+                    .expect("drive");
+                (status, bytes)
+            });
+            // The watcher gone means it already failed the test.
+            if tx.send(res).is_err() {
+                tracing::debug!("the watcher gave up on the drive");
+            }
+        });
+        let (status, bytes) = rx
+            .recv_timeout(DRAIN_WALL_CAP * 6)
+            .expect("drive must not copy the background job's output forever");
+        let took = started.elapsed();
+        assert!(status.expect("wait").success());
+        assert!(bytes > 0);
+        assert!(
+            took < DRAIN_WALL_CAP + std::time::Duration::from_secs(5),
+            "took {took:?}"
+        );
+    }
+
+    /// A chunk source that is always ready, as a pipe a descendant keeps full.
+    struct Flood;
+
+    impl Chunks for Flood {
+        async fn next_chunk(&mut self) -> Result<Option<(StreamId, Vec<u8>)>, ReadError> {
+            Ok(Some((StreamId::Stderr, b"y\n".repeat(64))))
+        }
+    }
+
+    /// A writer that takes a millisecond per write, discarding what it is given.
+    #[derive(Default)]
+    struct SlowWriter {
+        sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+    }
+
+    impl tokio::io::AsyncWrite for SlowWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let sleep = self.sleep.get_or_insert_with(|| {
+                Box::pin(tokio::time::sleep(std::time::Duration::from_millis(1)))
+            });
+            std::task::ready!(sleep.as_mut().poll(cx));
+            self.sleep = None;
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
     }
 
     /// A wait that ended in cancellation skips the drain: the pipe a
