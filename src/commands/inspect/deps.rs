@@ -20,6 +20,8 @@ pub struct Args {
     /// Explore the dependency tree in an interactive TUI (requires a terminal)
     #[arg(short = 'i', long = "interactive")]
     pub interactive: bool,
+    #[command(flatten)]
+    pub dashboard: crate::commands::progress_app::DashboardArgs,
 }
 
 struct DepsApp {
@@ -91,5 +93,13 @@ async fn execute_async(
         addr,
         fail_fast: global.fail_fast,
     };
-    tui::run_app(app, sink, session, interactive, shutdown).await
+    tui::run_app_with(
+        app,
+        sink,
+        session,
+        interactive,
+        args.dashboard.dashboard,
+        shutdown,
+    )
+    .await
 }

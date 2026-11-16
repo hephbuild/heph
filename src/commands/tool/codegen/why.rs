@@ -29,6 +29,8 @@ pub struct Args {
     /// Print the result as JSON
     #[arg(long)]
     pub json: bool,
+    #[command(flatten)]
+    pub dashboard: crate::commands::progress_app::DashboardArgs,
 }
 
 /// The row that decided, as `why` shows it.
@@ -357,6 +359,7 @@ pub fn execute(
     run_cli(
         "Explaining",
         args.json,
+        args.dashboard.dashboard,
         sink,
         session,
         global,

@@ -21,6 +21,8 @@ pub struct Args {
     /// Emit JSON instead of one path per line
     #[arg(long)]
     pub json: bool,
+    #[command(flatten)]
+    pub dashboard: crate::commands::progress_app::DashboardArgs,
 }
 
 #[derive(Serialize)]
@@ -134,5 +136,13 @@ async fn execute_async(
         no_scratch: global.no_scratch,
     };
     let interactive = tui::should_use_tui(global.no_tui);
-    tui::run_app(app, sink, session, interactive, shutdown).await
+    tui::run_app_with(
+        app,
+        sink,
+        session,
+        interactive,
+        args.dashboard.dashboard,
+        shutdown,
+    )
+    .await
 }

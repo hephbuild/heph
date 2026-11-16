@@ -23,7 +23,7 @@
 
 use crate::commands::GlobalOptions;
 use crate::commands::bootstrap;
-use crate::commands::progress_app::{request_state, run_with_progress};
+use crate::commands::progress_app::{DashboardArgs, request_state, run_with_progress};
 use crate::engine::credential::{Chain, source_login};
 use crate::engine::{Engine, get_cwp};
 use crate::tui::session::SessionSlot;
@@ -102,6 +102,8 @@ pub struct StatusArgs {
     /// Machine-readable output: `addr`, `state`, `source`, `expires_at`, `login`.
     #[arg(long)]
     pub json: bool,
+    #[command(flatten)]
+    pub dashboard: DashboardArgs,
 }
 
 #[derive(Args, Clone)]
@@ -111,6 +113,8 @@ pub struct ExplainArgs {
     pub addr: String,
     #[arg(long)]
     pub json: bool,
+    #[command(flatten)]
+    pub dashboard: DashboardArgs,
 }
 
 #[derive(Args, Clone)]
@@ -123,6 +127,8 @@ pub struct LoginArgs {
     /// session is broken in a way heph cannot see.
     #[arg(long, short)]
     pub force: bool,
+    #[command(flatten)]
+    pub dashboard: DashboardArgs,
 }
 
 impl AuthArgs {
@@ -206,9 +212,16 @@ async fn status(
         "Checking credentials in {}",
         args.matcher.as_deref().unwrap_or("//...")
     );
-    run_with_progress(label, sink, session, global.no_tui, shutdown, move |ctx| {
-        status_body(engine, args, m, global.fail_fast, ctx)
-    })
+    let dashboard = args.dashboard.dashboard;
+    run_with_progress(
+        label,
+        sink,
+        session,
+        global.no_tui,
+        dashboard,
+        shutdown,
+        move |ctx| status_body(engine, args, m, global.fail_fast, ctx),
+    )
     .await
 }
 
@@ -385,9 +398,16 @@ async fn explain(
     let addr = hmodel::htaddr::parse_addr_with_base(&args.addr, &cwp)?;
     let (engine, shutdown) = bootstrap::new_engine(&global, session)?;
     let label = format!("Explaining {addr}");
-    run_with_progress(label, sink, session, global.no_tui, shutdown, move |ctx| {
-        explain_body(engine, addr, args.json, ctx)
-    })
+    let dashboard = args.dashboard.dashboard;
+    run_with_progress(
+        label,
+        sink,
+        session,
+        global.no_tui,
+        dashboard,
+        shutdown,
+        move |ctx| explain_body(engine, addr, args.json, ctx),
+    )
     .await
 }
 
@@ -484,9 +504,16 @@ async fn login(
         Some(raw) => Wanted::One(hmodel::htaddr::parse_addr_with_base(raw, &get_cwp()?)?),
         None => Wanted::All(credential_matcher(None)?),
     };
-    run_with_progress(label, sink, session, global.no_tui, shutdown, move |ctx| {
-        login_body(engine, wanted, args.force, global.fail_fast, ctx)
-    })
+    let dashboard = args.dashboard.dashboard;
+    run_with_progress(
+        label,
+        sink,
+        session,
+        global.no_tui,
+        dashboard,
+        shutdown,
+        move |ctx| login_body(engine, wanted, args.force, global.fail_fast, ctx),
+    )
     .await
 }
 
@@ -867,10 +894,11 @@ mod tests {
         let args = StatusArgs {
             matcher: None,
             json,
+            dashboard: DashboardArgs::default(),
         };
         let session = Arc::new(SessionSlot::new());
         let sink = LogSink::new_direct_with(Arc::clone(&session));
-        run_with_progress("t", sink, &session, true, shutdown, move |ctx| {
+        run_with_progress("t", sink, &session, true, false, shutdown, move |ctx| {
             status_body(
                 engine,
                 args,
@@ -912,7 +940,7 @@ mod tests {
         let (shutdown, _rx) = hcore::shutdown::ShutdownTrigger::new();
         let session = Arc::new(SessionSlot::new());
         let sink = LogSink::new_direct_with(Arc::clone(&session));
-        run_with_progress("t", sink, &session, true, shutdown, move |ctx| {
+        run_with_progress("t", sink, &session, true, false, shutdown, move |ctx| {
             explain_body(engine, token(), json, ctx)
         })
         .await
@@ -944,7 +972,7 @@ mod tests {
         let (shutdown, _rx) = hcore::shutdown::ShutdownTrigger::new();
         let session = Arc::new(SessionSlot::new());
         let sink = LogSink::new_direct_with(Arc::clone(&session));
-        run_with_progress("t", sink, &session, true, shutdown, move |ctx| {
+        run_with_progress("t", sink, &session, true, false, shutdown, move |ctx| {
             login_body(engine, Wanted::One(token()), force, false, ctx)
         })
         .await

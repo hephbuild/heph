@@ -32,6 +32,8 @@ pub struct Args {
     /// change. Omit to rewrite the whole section.
     #[arg(value_name = "PACKAGE_MATCHER")]
     pub matcher: Option<String>,
+    #[command(flatten)]
+    pub dashboard: crate::commands::progress_app::DashboardArgs,
 }
 
 /// What the command is asked to do, parsed.
@@ -279,6 +281,7 @@ pub fn execute(
     run_cli(
         title,
         args.json,
+        args.dashboard.dashboard,
         sink,
         session,
         global,

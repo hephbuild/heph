@@ -34,6 +34,8 @@ pub struct KeepArgs {
     /// Print the result as JSON
     #[arg(long)]
     pub json: bool,
+    #[command(flatten)]
+    pub dashboard: crate::commands::progress_app::DashboardArgs,
 }
 
 #[derive(clap::Args, Clone, Debug, Default)]
@@ -57,6 +59,8 @@ pub struct DiscardArgs {
     /// Print the result as JSON
     #[arg(long)]
     pub json: bool,
+    #[command(flatten)]
+    pub dashboard: crate::commands::progress_app::DashboardArgs,
 }
 
 /// One path's result.
@@ -618,6 +622,7 @@ pub fn execute_keep(
     run_cli(
         "Keeping generated files",
         args.json,
+        args.dashboard.dashboard,
         sink,
         session,
         global,
@@ -644,6 +649,7 @@ pub fn execute_discard(
     run_cli(
         "Discarding generated files",
         args.json,
+        args.dashboard.dashboard,
         sink,
         session,
         global,

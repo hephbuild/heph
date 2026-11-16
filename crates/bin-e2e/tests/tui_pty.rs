@@ -452,11 +452,22 @@ impl Gated {
         env: &[(&str, &str)],
         run_args: &str,
     ) -> Self {
+        Self::start_cmd(build, prelude, env, &format!("run {run_args}"))
+    }
+
+    /// [`Self::start_build`], running `heph <args>` (shell words): a command
+    /// other than `run`.
+    fn start_cmd(
+        build: fn(&std::path::Path) -> String,
+        prelude: &str,
+        env: &[(&str, &str)],
+        args: &str,
+    ) -> Self {
         let dist = Dist::locate();
         let ws = common::Workspace::new().expect("workspace");
         let gate = ws.root().join("gate-open");
         ws.write("pkg/BUILD", &build(&gate)).expect("write BUILD");
-        let script = format!("{prelude}exec \"$HEPH\" run {run_args}");
+        let script = format!("{prelude}exec \"$HEPH\" {args}");
         let pty = common::pty::Pty::script_at_cursor(&dist, ws.root(), &script, env);
         Self { pty, gate, _ws: ws }
     }
@@ -1097,8 +1108,45 @@ fn dashboard_flag_opens_and_holds() {
     }
 }
 
+/// `-D` on a command other than `run` that builds (`inspect outputs`): the
+/// same dashboard from the first frame, held after the build until q, and the
+/// command's own exit code.
+#[test]
+fn dashboard_flag_on_a_non_run_command() {
+    let mut g = Gated::start_cmd(gated_build, "", &[], "inspect outputs -D //pkg:gate");
+    g.play(&[
+        Step::Until("the dashboard", on_dashboard),
+        Step::OpenGate,
+        Step::Until("the finished dashboard", on_finished_dashboard),
+    ]);
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        common::alive(g.pty.pid()),
+        "heph exited without q\n{}",
+        g.pty.seen()
+    );
+    assert!(
+        g.pty.with_screen(on_finished_dashboard),
+        "the held dashboard went\n{}",
+        g.pty.screen()
+    );
+    g.pty.send(b"q");
+    let ended = g.exit();
+    assert_restored(&g.pty, "inspect outputs -D");
+    assert_eq!(ended, common::pty::Ended::Code(0), "{}", g.pty.seen());
+    let out = g.pty.output();
+    let alt = first_index(&out, b"\x1b[?1049h");
+    let done = first_index(&out, b" done");
+    assert!(
+        matches!((alt, done), (Some(a), Some(d)) if a < d),
+        "a done count was drawn before the dashboard went up\n{}",
+        g.pty.seen()
+    );
+}
+
 /// `-D` without a terminal: one warning, then the plain output it would have
-/// shown anyway, no wait for q, and the build's own exit code.
+/// shown anyway, no wait for q, and the build's own exit code — on `run` and
+/// on a command other than `run`.
 #[test]
 fn dashboard_flag_without_tty() {
     const WARNING: &str = "--dashboard needs an interactive terminal";
@@ -1112,11 +1160,20 @@ fn dashboard_flag_without_tty() {
         ),
     )
     .expect("write BUILD");
-    for target in ["//pkg:ok", "//pkg:bad"] {
+    for (cmd, target) in [
+        (&["run"][..], "//pkg:ok"),
+        (&["run"], "//pkg:bad"),
+        (&["inspect", "outputs"], "//pkg:ok"),
+        (&["inspect", "outputs"], "//pkg:bad"),
+    ] {
         // Both streams piped; stdin is /dev/null, so a wait for q would hang
         // until the run deadline kills it.
-        let plain = ws.run(&dist, &["run", target]).expect("plain run");
-        let flagged = ws.run(&dist, &["run", "-D", target]).expect("-D run");
+        let argv = |flag: &[&'static str]| -> Vec<&str> {
+            cmd.iter().chain(flag).copied().chain([target]).collect()
+        };
+        let target = format!("{cmd:?} {target}");
+        let plain = ws.run(&dist, &argv(&[])).expect("plain run");
+        let flagged = ws.run(&dist, &argv(&["-D"])).expect("-D run");
         assert_eq!(
             flagged.status.code(),
             plain.status.code(),

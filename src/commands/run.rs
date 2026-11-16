@@ -131,14 +131,8 @@ pub struct RunArgs {
     /// diagnostic box. The full log is always saved as the `log.txt` artifact.
     #[arg(long = "log-lines", value_name = "N", default_value_t = 10)]
     pub log_lines: usize,
-    /// Open the dashboard from the start, and hold the finished build until q
-    ///
-    /// The run starts on the dashboard instead of the line. When it ends,
-    /// whichever screen is up stays until you press q (Esc still steps back
-    /// to the line, which holds too); the exit code is the build's. Without a
-    /// terminal it prints one warning and runs with the plain output.
-    #[arg(short = 'D', long = "dashboard")]
-    pub dashboard: bool,
+    #[command(flatten)]
+    pub dashboard: crate::commands::progress_app::DashboardArgs,
     /// Print only what the target prints: no TUI, no progress, stderr only for failures
     ///
     /// On an entrypoint, the program runs on your terminal's own fds rather than
@@ -1021,7 +1015,7 @@ async fn execute_async(
     let m = resolve_matcher(&args.expr, &args.arg1, &args.arg2, &base_pkg, false)?;
     let (engine, shutdown) = bootstrap::new_engine(&global, session)?;
     let raw = args.raw;
-    let dashboard = args.dashboard;
+    let dashboard = args.dashboard.dashboard;
     let app = RunApp {
         args,
         engine: std::sync::Arc::clone(&engine),
@@ -1136,12 +1130,12 @@ mod tests {
             &["-D", "//p:t"],
             &["--dashboard", "//p:t"],
         ] {
-            assert!(parse(argv).dashboard, "{argv:?}");
+            assert!(parse(argv).dashboard.dashboard, "{argv:?}");
         }
         let args = parse(&["build", "-D", "//..."]);
         assert_eq!(args.arg1.as_deref(), Some("build"));
         assert_eq!(args.arg2.as_deref(), Some("//..."));
-        assert!(!parse(&["//p:t"]).dashboard);
+        assert!(!parse(&["//p:t"]).dashboard.dashboard);
         assert!(
             parse(&["//t:go", "--", "-D"]).args == [OsString::from("-D")],
             "after `--`, -D is the program's"

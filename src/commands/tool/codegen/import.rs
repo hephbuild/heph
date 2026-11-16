@@ -21,6 +21,8 @@ pub struct Args {
     /// Print the result as JSON
     #[arg(long)]
     pub json: bool,
+    #[command(flatten)]
+    pub dashboard: crate::commands::progress_app::DashboardArgs,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -153,6 +155,7 @@ pub fn execute(
     run_cli(
         "Importing codegen xattrs",
         args.json,
+        args.dashboard.dashboard,
         sink,
         session,
         global,
