@@ -780,6 +780,31 @@ async fn log_follow_across_engines() -> anyhow::Result<()> {
         .expect_err("running, nothing written");
     let yet = err.downcast_ref::<NoOutputYet>().expect("NoOutputYet");
     assert_eq!(yet.session, Some(id_a.encode()));
+    // The dashboard's Log tab follows it: the pane says "no output yet",
+    // never "records no live logs" nor "unavailable".
+    let screen = heph::commands::log::EngineTargetReader::with_locator(
+        Arc::clone(&b),
+        tokio::runtime::Handle::current(),
+        located.locator.clone(),
+    );
+    let shown = tokio::task::spawn_blocking(move || {
+        use heph::tui::dashboard::{FeedStep, LogOpened, TargetReader as _, logpane::LogPane};
+        match screen.open_log("//p:quiet") {
+            LogOpened::Follow { mut feed, about } => {
+                assert!(matches!(feed.poll(), FeedStep::Idle), "nothing written");
+                let mut pane = LogPane::default();
+                pane.start_live(about);
+                Ok(pane
+                    .body(40, 3, &Default::default())
+                    .iter()
+                    .map(|l| l.to_string().trim().to_owned())
+                    .collect::<Vec<_>>())
+            }
+            other => Err(anyhow::anyhow!("not followed: {other:?}")),
+        }
+    })
+    .await??;
+    assert_eq!(shown, ["no output yet"]);
     // Followed, it waits for the run's first byte, and ends with the run
     // when it writes none.
     let mut f = b

@@ -679,6 +679,16 @@ impl EngineTargetReader {
     pub fn new(engine: Arc<Engine>, rt: tokio::runtime::Handle) -> Self {
         let locator = SessionRoot::for_reading(std::env::var_os("HOME").as_deref())
             .map(|root| Arc::new(SessionRunLogLocator::new(root)) as _);
+        Self::with_locator(engine, rt, locator)
+    }
+
+    /// A reader that finds other hephs' runs through `locator` rather than
+    /// the sessions under HOME.
+    pub fn with_locator(
+        engine: Arc<Engine>,
+        rt: tokio::runtime::Handle,
+        locator: Option<Arc<dyn hcore::session_record::LiveRunLogLocator>>,
+    ) -> Self {
         Self {
             engine,
             rt,
@@ -691,6 +701,24 @@ impl EngineTargetReader {
             locator: self.locator.clone(),
             fetch_remote: true,
             ..LogOptions::default()
+        }
+    }
+
+    /// The Log tab following `addr`'s run; `otherwise` says what it shows
+    /// when there is nothing to follow (`None`) or following failed.
+    fn follow(
+        &self,
+        addr: &Addr,
+        opts: &LogOptions,
+        otherwise: impl FnOnce(Option<anyhow::Error>) -> crate::tui::dashboard::LogOpened,
+    ) -> crate::tui::dashboard::LogOpened {
+        match self.rt.block_on(self.engine.follow_log(addr, opts, false)) {
+            Ok(Some(f)) => crate::tui::dashboard::LogOpened::Follow {
+                feed: Box::new(EngineFeed(f)),
+                about: "live".into(),
+            },
+            Ok(None) => otherwise(None),
+            Err(e) => otherwise(Some(e)),
         }
     }
 }
@@ -759,23 +787,23 @@ impl crate::tui::dashboard::TargetReader for EngineTargetReader {
         let mut log = match self.rt.block_on(self.engine.open_log(&addr, &opts)) {
             Ok(Some(log)) => log,
             Ok(None) => return LogOpened::Nothing("no log yet: the target has not run".into()),
+            // Running, nothing written yet: followed, it waits for the first
+            // byte, and the pane says "no output yet" meanwhile.
+            Err(e) if e.is::<NoOutputYet>() => {
+                return self.follow(&addr, &opts, |_| {
+                    LogOpened::Nothing("running · no output yet".into())
+                });
+            }
             Err(e) => return log_error(&e),
         };
         if matches!(log.info().source, LogSource::Live { running: true, .. }) {
             // A run going on: followed from its first byte, on into what
             // replaces its live file when it ends.
             drop(log);
-            return match self
-                .rt
-                .block_on(self.engine.follow_log(&addr, &opts, false))
-            {
-                Ok(Some(f)) => LogOpened::Follow {
-                    feed: Box::new(EngineFeed(f)),
-                    about: "live".into(),
-                },
-                Ok(None) => LogOpened::Nothing("no log yet: the target has not run".into()),
-                Err(e) => log_error(&e),
-            };
+            return self.follow(&addr, &opts, |e| match e {
+                Some(e) => log_error(&e),
+                None => LogOpened::Nothing("no log yet: the target has not run".into()),
+            });
         }
         let about = about(&log.info().source).to_owned();
         let len = log.len();
