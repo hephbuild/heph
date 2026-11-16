@@ -102,6 +102,8 @@ pub struct OutputGroup {
     pub name: String,
     /// Stored bytes.
     pub size: u64,
+    /// The group's `hashout`, when it is one artifact. Files carry none:
+    /// listing them reads only the tar headers.
     pub hash: Option<String>,
     pub files: Vec<OutputFile>,
     /// Why the files are not listed (`not in the local cache`).
@@ -114,7 +116,6 @@ pub struct OutputFile {
     pub path: String,
     pub kind: FileKind,
     pub size: u64,
-    pub hash: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

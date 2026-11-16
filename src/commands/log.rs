@@ -772,7 +772,6 @@ fn listed_file(f: crate::engine::ListedFile) -> crate::tui::dashboard::OutputFil
             ListedKind::Dir => FileKind::Dir,
         },
         size: f.size,
-        hash: f.hash,
     }
 }
 

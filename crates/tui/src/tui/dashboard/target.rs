@@ -878,7 +878,7 @@ fn outputs(
                 if !kept.is_empty() || !fixes.is_empty() =>
             {
                 let mut out = vec![header_row(cols)];
-                list_files("failure_out", kept, &mut out, cols, &mut fold);
+                list_files("failure_out", None, kept, &mut out, cols, &mut fold);
                 for (i, f) in fixes.iter().enumerate() {
                     let label = if i == 0 { "fixes" } else { "" };
                     out.push(file_row(
@@ -921,7 +921,9 @@ fn outputs(
                         None if g.files.is_empty() => {
                             out.push(file_row(name, "(nothing written)", None, None, cols));
                         }
-                        None => list_files(name, &g.files, &mut out, cols, &mut fold),
+                        None => {
+                            list_files(name, g.hash.as_deref(), &g.files, &mut out, cols, &mut fold)
+                        }
                     }
                 }
                 out.push(Line::default());
@@ -1001,9 +1003,11 @@ fn file_row_styled(
 }
 
 /// A group's files: the first [`FOLD_AT`] then "… N more files", or all of
-/// them once Enter expanded the group.
+/// them once Enter expanded the group. The group's hash, when it has one,
+/// sits on its first row, beside its name; files have no hash of their own.
 fn list_files(
     group: &str,
+    group_hash: Option<&str>,
     files: &[OutputFile],
     out: &mut Vec<Line<'static>>,
     cols: usize,
@@ -1015,14 +1019,18 @@ fn list_files(
         FOLD_AT
     };
     for (i, f) in files.iter().take(shown).enumerate() {
-        let label = if i == 0 { group } else { "" };
+        let (label, hash) = if i == 0 {
+            (group, group_hash)
+        } else {
+            ("", None)
+        };
         let path = match &f.kind {
             FileKind::File => f.path.clone(),
             FileKind::Symlink(to) => format!("{} → {to}", f.path),
             FileKind::Dir => format!("{}/", f.path.trim_end_matches('/')),
         };
         let size = (f.kind == FileKind::File).then_some(f.size);
-        out.push(file_row(label, &path, size, f.hash.as_deref(), cols));
+        out.push(file_row(label, &path, size, hash, cols));
     }
     if let Some(rest) = files.get(shown..).filter(|r| !r.is_empty()) {
         let size = rest.iter().map(|f| f.size).sum();

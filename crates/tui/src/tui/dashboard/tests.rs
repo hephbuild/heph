@@ -694,12 +694,11 @@ fn file(path: &str, size: u64) -> OutputFile {
         path: path.into(),
         kind: FileKind::File,
         size,
-        hash: Some(format!("{size:012}abcd")),
     }
 }
 
-/// Outputs lists a finished target's groups with path, size and hash,
-/// folding past three files (Enter expands, Enter again folds); a cache
+/// Outputs lists a finished target's groups with each file's path and size
+/// and the group's hash on its first row, folding past three files (Enter expands, Enter again folds); a cache
 /// hit shows the restored list; a running target only its declared group
 /// names; a failed one what its slot kept, or that the run failed.
 #[test]
@@ -745,7 +744,6 @@ fn outputs_tab_by_group() {
                 path: "gen/docs".into(),
                 kind: FileKind::Dir,
                 size: 0,
-                hash: None,
             }],
             unavailable: None,
         },
@@ -773,7 +771,7 @@ fn outputs_tab_by_group() {
         "… 2 more files",
         "docs",
         "gen/docs/",
-        "000000003000",
+        "93c751b0be4f",
     ] {
         assert!(rows.contains(want), "{want}: {rows}");
     }
