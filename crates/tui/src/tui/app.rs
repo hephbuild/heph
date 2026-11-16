@@ -431,6 +431,12 @@ pub trait TUIAppView: Send {
     /// [`Self::last_render`]. No-op by default.
     fn set_stopped(&mut self) {}
 
+    /// Whether [`Self::set_stopped`] was called (or, for a viewer, the run
+    /// it follows recorded a stop): what `Finished` records.
+    fn stopped(&self) -> bool {
+        false
+    }
+
     /// The approval prompt this view shows now, as a session records it.
     /// `None` by default (no approval gate).
     fn pending_approval(&self) -> Option<crate::tui::session::ApprovalPrompt> {

@@ -257,7 +257,14 @@ pub enum SessionRecordKind {
     /// The TUI was torn down at `at_unix_ms`, the instant its final summary
     /// measured the elapsed time against. What follows (`Log`, `Output`) the
     /// terminal printed below that summary.
-    Finished,
+    Finished {
+        /// The user stopped the run, so its summary said `stopped`. Absent
+        /// (and so `false`) from a writer that predates it, and when not
+        /// stopped: such a record reads `{"type":"Finished"}` as it always
+        /// did, and an older reader ignores the field.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        stopped: bool,
+    },
     /// Text the process wrote straight to its terminal rather than through
     /// the log: the rendered failure report. Stored verbatim, like `Log`, up
     /// to its first 1 MiB; past that, cut with a marker line.
@@ -799,7 +806,8 @@ mod tests {
                 },
                 "Approval",
             ),
-            (SessionRecordKind::Finished, "Finished"),
+            (SessionRecordKind::Finished { stopped: false }, "Finished"),
+            (SessionRecordKind::Finished { stopped: true }, "Finished"),
             (
                 SessionRecordKind::Output {
                     text: "× target failed\n\u{1b}[31mred\u{1b}[0m\n".into(),
@@ -826,6 +834,39 @@ mod tests {
             let old: SessionRecord = serde_json::from_str(&older).expect("decode as unknown");
             assert_eq!(old.session, Some(SessionRecordKind::Unknown), "{older}");
         }
+    }
+
+    /// `Finished` gains `stopped` additively: unstopped it encodes exactly as
+    /// before, a record from a writer that predates it reads unstopped, and
+    /// a reader that predates it (a unit `Finished`) still decodes a stopped
+    /// one.
+    #[test]
+    fn finished_stopped_is_additive() {
+        let plain = SessionRecord::session(7, SessionRecordKind::Finished { stopped: false });
+        let json = serde_json::to_string(&plain).expect("encode");
+        assert!(json.ends_with(r#""session":{"type":"Finished"}}"#), "{json}");
+        let old: SessionRecord =
+            serde_json::from_str(r#"{"at_unix_ms":7,"session":{"type":"Finished"}}"#)
+                .expect("decode an older writer's");
+        assert_eq!(
+            old.session,
+            Some(SessionRecordKind::Finished { stopped: false })
+        );
+
+        #[derive(serde::Deserialize, Debug, PartialEq)]
+        #[serde(tag = "type")]
+        enum OlderKind {
+            Finished,
+        }
+        #[derive(serde::Deserialize, Debug)]
+        struct OlderRecord {
+            session: OlderKind,
+        }
+        let stopped = SessionRecord::session(7, SessionRecordKind::Finished { stopped: true });
+        let json = serde_json::to_string(&stopped).expect("encode");
+        assert!(json.contains(r#""stopped":true"#), "{json}");
+        let older: OlderRecord = serde_json::from_str(&json).expect("an older reader decodes it");
+        assert_eq!(older.session, OlderKind::Finished);
     }
 
     /// A notice whose record names no input — any record without `sources`

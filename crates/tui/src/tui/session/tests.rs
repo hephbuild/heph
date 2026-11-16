@@ -570,7 +570,7 @@ fn events_cap_keeps_the_ending_view_records() {
             prompt: None,
             standing: Some(ApprovalStanding::Approve),
         },
-        SessionRecordKind::Finished,
+        SessionRecordKind::Finished { stopped: true },
         SessionRecordKind::Output {
             text: "failed: //a:bad\n".into(),
         },

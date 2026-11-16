@@ -107,7 +107,13 @@ async fn fold(
                         folded.standing = standing;
                     }
                     // The build a standing decision covered is over.
-                    Some(SessionRecordKind::Finished) => folded.standing = None,
+                    Some(SessionRecordKind::Finished { stopped }) => {
+                        folded.standing = None;
+                        // The run's line said "stopped": so does this one.
+                        if stopped {
+                            folded.view.set_stopped();
+                        }
+                    }
                     _ => {}
                 }
             }

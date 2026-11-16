@@ -1167,7 +1167,10 @@ async fn show_prints_the_standing_decision() {
         }
 
         // The build ended: the decision acts on nothing any more.
-        records.push(SessionRecord::session(T0 + 50, SessionRecordKind::Finished));
+        records.push(SessionRecord::session(
+            T0 + 50,
+            SessionRecordKind::Finished { stopped: false },
+        ));
         records.extend(build_records("//a:gated", T0 + 60, Some(0)).pop());
         let source = FakeSource {
             sessions: vec![(

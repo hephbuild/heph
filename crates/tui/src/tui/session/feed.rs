@@ -37,6 +37,8 @@ struct FeedState {
     standing: Option<ApprovalStanding>,
     /// `Finished`'s time: the clock the run's final summary used.
     finished_at_ms: Option<u64>,
+    /// `Finished` said the user stopped the run.
+    stopped: bool,
     /// `End`'s time: the fallback clock when no `Finished` was recorded (a
     /// line-backend run, or a heph from before `Finished`).
     ended_at_ms: Option<u64>,
@@ -125,8 +127,9 @@ impl SessionFeed {
                 s.standing = standing;
                 return Routed::Nothing;
             }
-            SessionRecordKind::Finished => {
+            SessionRecordKind::Finished { stopped } => {
                 s.finished_at_ms = Some(at);
+                s.stopped = stopped;
                 // Torn down: no prompt is on screen any more, and the build
                 // a standing decision covered is over.
                 s.approval = None;
@@ -197,6 +200,11 @@ impl SessionFeed {
         let s = self.lock();
         s.finished_at_ms.or(s.ended_at_ms)
     }
+
+    /// Whether the run's `Finished` recorded a user stop.
+    pub fn stopped(&self) -> bool {
+        self.lock().stopped
+    }
 }
 
 #[cfg(test)]
@@ -265,7 +273,7 @@ mod tests {
             text: "× target failed\n".into(),
         };
         let routed: Vec<Routed> = [
-            SessionRecord::session(10, SessionRecordKind::Finished),
+            SessionRecord::session(10, SessionRecordKind::Finished { stopped: true }),
             log(11, "late"),
             SessionRecord::session(12, output),
             SessionRecord::session(13, end),
@@ -280,6 +288,7 @@ mod tests {
         assert_eq!(feed.approval(), None, "torn down: no prompt on screen");
         assert_eq!(feed.approval_standing(), None, "the build is over");
         assert_eq!(feed.finished_at_ms(), Some(10), "Finished, not End");
+        assert!(feed.stopped(), "the run's stop, as Finished recorded it");
     }
 
     /// A run with no `Finished` (the line backend, or an older heph) is

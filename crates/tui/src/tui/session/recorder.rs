@@ -489,7 +489,12 @@ impl ViewTap {
     /// changed since the last tick, then `Finished`.
     pub(crate) fn finished(&mut self, view: &impl TUIAppView, at_ms: u64) {
         self.observe(view);
-        self.tap.view(at_ms, SessionRecordKind::Finished);
+        self.tap.view(
+            at_ms,
+            SessionRecordKind::Finished {
+                stopped: view.stopped(),
+            },
+        );
     }
 }
 
@@ -515,7 +520,7 @@ fn injected_panic() {}
 /// way a follower finds the log of a run that starts after the cap.
 fn outlives_cap(kind: &SessionRecordKind) -> bool {
     match kind {
-        SessionRecordKind::Finished
+        SessionRecordKind::Finished { .. }
         | SessionRecordKind::Output { .. }
         | SessionRecordKind::Label { .. }
         | SessionRecordKind::RunLog(_)

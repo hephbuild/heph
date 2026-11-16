@@ -43,7 +43,9 @@ const HELD: &str = "q to quit · tab dashboard";
 #[derive(Debug, Clone, Copy)]
 pub(super) enum Status<'a> {
     Running(&'a str),
-    Finished { failed: bool },
+    /// `stopped`: the user stopped it; the head says so, as the final
+    /// summary does.
+    Finished { failed: bool, stopped: bool },
 }
 
 /// What a build's line counts. Strings where the box's header already
@@ -172,8 +174,11 @@ pub(super) fn render(m: &LineModel<'_>, cols: u16) -> Line<'static> {
 fn head(m: &LineModel<'_>) -> Seg {
     let (glyph, style) = match m.status {
         Status::Running(spinner) => (clean_inline(spinner).into_owned(), Style::default()),
-        Status::Finished { failed: false } => ("✓".to_owned(), Style::default().fg(Color::Green)),
-        Status::Finished { failed: true } => (
+        Status::Finished {
+            failed: false,
+            stopped: false,
+        } => ("✓".to_owned(), Style::default().fg(Color::Green)),
+        Status::Finished { .. } => (
             "✗".to_owned(),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ),
@@ -182,11 +187,19 @@ fn head(m: &LineModel<'_>) -> Seg {
         m.clock.clone(),
         Style::default().add_modifier(Modifier::BOLD),
     );
-    Seg {
-        width: width(&glyph) + 1 + width(&m.clock),
-        spans: vec![Span::styled(glyph, style), Span::raw(" "), clock],
+    let mut spans = vec![Span::styled(glyph.clone(), style), Span::raw(" ")];
+    let mut w = width(&glyph) + 1 + width(&m.clock);
+    if matches!(m.status, Status::Finished { stopped: true, .. }) {
+        spans.push(Span::styled(STOPPED, style));
+        spans.push(Span::raw(" · "));
+        w += width(STOPPED) + 3;
     }
+    spans.push(clock);
+    Seg { width: w, spans }
 }
+
+/// What a stopped run's head says before its clock.
+const STOPPED: &str = "stopped";
 
 /// The required segments of `tier`, after the head: counts, CPU, standing.
 fn counts(m: &LineModel<'_>, tier: Tier) -> Vec<Seg> {
@@ -485,11 +498,23 @@ mod tests {
     #[test]
     fn finished_line_is_the_summary() {
         let mut m = model(Some(run_spot("//a:b")));
-        m.status = Status::Finished { failed: true };
+        m.status = Status::Finished {
+            failed: true,
+            stopped: true,
+        };
         m.standing = Some(ApprovalStanding::Approve);
         if let Body::Build(c) = &mut m.body {
             c.failed = 3;
         }
+        // A stopped run's line says so, as its summary did.
+        assert_eq!(
+            text(&render(&m, 120)),
+            "✗ stopped · 1m05s · 128 / 412 done · 96 cached · 3 failed"
+        );
+        m.status = Status::Finished {
+            failed: true,
+            stopped: false,
+        };
         assert_eq!(
             text(&render(&m, 120)),
             "✗ 1m05s · 128 / 412 done · 96 cached · 3 failed"

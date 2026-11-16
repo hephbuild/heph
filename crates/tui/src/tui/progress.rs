@@ -2297,6 +2297,7 @@ impl TuiProgressView {
         let status = match self.finished_at_ms {
             Some(_) => line::Status::Finished {
                 failed: self.state.unsuccessful(),
+                stopped: self.stopped,
             },
             None => line::Status::Running(spinner),
         };
@@ -2860,12 +2861,20 @@ impl TUIAppView for TuiProgressView {
         self.stopped = true;
     }
 
+    fn stopped(&self) -> bool {
+        self.stopped
+    }
+
     fn set_finished(&mut self, at_ms: u64) {
         // Freeze the elapsed clock at the finish instant; the viewport keeps
         // rendering while held but the time must stop counting. A viewer
-        // freezes it where the run's own summary did, once it was recorded.
+        // freezes it where the run's own summary did, once it was recorded,
+        // and says "stopped" if the run's did.
         let at = match &self.role {
-            Role::Attached { feed, .. } => feed.finished_at_ms().unwrap_or(at_ms),
+            Role::Attached { feed, .. } => {
+                self.stopped |= feed.stopped();
+                feed.finished_at_ms().unwrap_or(at_ms)
+            }
             Role::Live { .. } => at_ms,
         };
         self.finished_at_ms = Some(at);
