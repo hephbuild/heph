@@ -99,7 +99,11 @@ impl SessionFeed {
                 } => {
                     let mut s = self.lock();
                     s.started.insert(addr.clone(), at);
-                    if *log_not_streamed {
+                    // A `RunLog` stamped at or after the start is this run's
+                    // first byte, even when it was written before the start.
+                    if *log_not_streamed
+                        && s.run_logs.get(addr).is_none_or(|run| run.at_unix_ms < at)
+                    {
                         s.not_streamed.insert(addr.clone(), at);
                     }
                 }

@@ -263,7 +263,9 @@ fn session_lookup(dir: &Path, home: &Path, addr: &str) -> anyhow::Result<Session
     // is going on, and has written nothing unless a record came after.
     let mut started: Option<u64> = None;
     // Set by a start on a driver that does not stream its log; cleared by
-    // the run's first byte (its `RunLog` record) or its end.
+    // the run's first byte (its `RunLog` record) or its end. A `RunLog`
+    // stamped at or after the start clears it whichever is written first:
+    // the two come from different writers, so file order is not run order.
     let mut not_streamed: Option<u64> = None;
     while let Some(rec) = reader.next_record().context("reading events.ndjson")? {
         match (rec.kind, rec.session) {
@@ -283,7 +285,10 @@ fn session_lookup(dir: &Path, home: &Path, addr: &str) -> anyhow::Result<Session
                 _,
             ) if a == addr => {
                 started = Some(rec.at_unix_ms);
-                not_streamed = log_not_streamed.then_some(rec.at_unix_ms);
+                let byte_seen = newest
+                    .as_ref()
+                    .is_some_and(|(log_at, _)| *log_at >= rec.at_unix_ms);
+                not_streamed = (log_not_streamed && !byte_seen).then_some(rec.at_unix_ms);
             }
             (Some(BuildEventKind::ExecuteEnd { addr: a, .. }), _) if a == addr => {
                 ended = true;
@@ -1024,6 +1029,45 @@ mod tests {
         drop(feed.route(execute_start(72, ADDR, true)));
         drop(feed.route(execute_end(73, ADDR)));
         assert!(matches!(attached(), Some(LocatedRunLog::Ended { .. })));
+    }
+
+    /// The run's `RunLog` and its start come from different writers, so the
+    /// log can be written first. One stamped at or after the start is that
+    /// run's first byte whatever the file order: the label does not stick. An
+    /// older run's log, written before the start, does not clear it.
+    #[test]
+    fn a_run_log_written_before_its_start_still_clears_not_streamed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let root = tmp.path().join("sessions");
+        live_file(&home, "runs/b/0.log", b"early\n");
+        let (dir, _l) = session(
+            &root,
+            1,
+            &home,
+            &[
+                run_log(20, ADDR, "h", "runs/b/0.log"),
+                execute_start(20, ADDR, true),
+            ],
+        );
+        assert!(matches!(
+            session_run_log(&dir, &home, ADDR).expect("read"),
+            Some(SessionRunLog::Live { at_unix_ms: 20, .. })
+        ));
+        // A later start that does not stream outranks the older run's log.
+        append(&dir, &[execute_start(30, ADDR, true)]);
+        let sessions = SessionRoot::new(&root);
+        assert!(matches!(
+            lookup_run_log(&sessions, &home, ADDR).expect("lookup"),
+            RunLogLookup::NotStreamed { at_unix_ms: 30, .. }
+        ));
+
+        let feed = super::super::SessionFeed::default();
+        drop(feed.route(run_log(40, ADDR, "h", "runs/b/0.log")));
+        drop(feed.route(execute_start(40, ADDR, true)));
+        assert_eq!(feed.not_streamed(ADDR), None);
+        drop(feed.route(execute_start(50, ADDR, true)));
+        assert_eq!(feed.not_streamed(ADDR), Some(50));
     }
 
     /// A `RunLog` whose `file` has `..`, is absolute, or resolves through a
