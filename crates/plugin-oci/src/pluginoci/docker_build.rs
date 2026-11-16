@@ -3062,6 +3062,81 @@ exit 0
         assert!(format!("{failed:#}").contains("out-tail"), "{failed:#}");
     }
 
+    /// Run `def` on `driver` under `log_capture`: the run's result, then what
+    /// reached the stdout and stderr writers.
+    async fn captured_run(
+        driver: &dyn ManagedDriver,
+        sbx: &Sandbox,
+        def: &TargetDef,
+    ) -> (anyhow::Result<()>, String, String) {
+        let rid = "req".to_string();
+        let mut req = run_request(&rid, "hashin", def, sbx, &[]);
+        let (out, err) = (Shared::default(), Shared::default());
+        req.request.log_capture = true;
+        req.request.stdout = Some(out.writer());
+        req.request.stderr = Some(err.writer());
+        let res = driver
+            .run(req, &StdCancellationToken::new())
+            .await
+            .map(drop);
+        (res, out.text(), err.text())
+    }
+
+    /// `oci.builder_platform` asks `docker buildx inspect`: its stdout is the
+    /// answer written to `platform.txt`, never the log; its stderr is log.
+    #[tokio::test]
+    async fn the_platform_probe_keeps_its_answer_out_of_the_log() {
+        let sbx = Sandbox::new("app");
+        let bin = sbx.fake(
+            "docker",
+            "echo 'Name: default'\necho 'Platforms: linux/arm64'\necho 'booting' >&2",
+        );
+        let driver = super::super::platform::Driver::with_binary(bin);
+        let def = driver
+            .parse(
+                parse_req("//app:platform", HashMap::new()),
+                &StdCancellationToken::new(),
+            )
+            .await
+            .expect("parse")
+            .target_def;
+        let (res, out, err) = captured_run(&driver, &sbx, &def).await;
+        res.expect("run");
+        assert_eq!(out, "", "the probe's answer is data, never the log");
+        assert_eq!(err, "booting\n");
+        assert_eq!(
+            std::fs::read_to_string(sbx.pkg.join("platform.txt")).expect("platform.txt"),
+            "linux/arm64"
+        );
+    }
+
+    /// `oci.runner` asks `docker image inspect` for the image's digest: the
+    /// digest reaches the fingerprint, never the log; its stderr is log.
+    #[tokio::test]
+    async fn the_runner_digest_stays_out_of_the_log() {
+        let sbx = Sandbox::new("app");
+        let bin = sbx.fake("docker", "echo 'sha256:feedface'\necho 'slow daemon' >&2");
+        let driver =
+            super::super::runner::Driver::new(sbx.dir.path().join("home")).with_docker_bin(bin);
+        let def = driver
+            .parse(
+                parse_req(
+                    "//app:runner",
+                    cfg(&[("image", Value::String("img:latest".to_string()))]),
+                ),
+                &StdCancellationToken::new(),
+            )
+            .await
+            .expect("parse")
+            .target_def;
+        let (res, out, err) = captured_run(&driver, &sbx, &def).await;
+        res.expect("run");
+        assert_eq!(out, "", "the digest is data, never the log");
+        assert_eq!(err, "slow daemon\n");
+        let doc = std::fs::read_to_string(sbx.pkg.join("runner.json")).expect("runner.json");
+        assert!(doc.contains("oci:sha256:feedface"), "{doc}");
+    }
+
     /// On a host without `log_capture`, a credential secret the builder prints
     /// is scrubbed out of the plugin's own `log.txt` by the shared scrubber.
     #[tokio::test]
