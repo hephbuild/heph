@@ -1635,8 +1635,178 @@ fn mouse_capture_only_on_full_screens() {
                 "{}: whether the mouse was ever captured",
                 case.name
             );
+            // Alternate scroll off with the capture, so no terminal turns
+            // the wheel into ↑/↓ on the full screen.
+            assert_eq!(
+                contains(&out, b"\x1b[?1007l"),
+                case.mouse,
+                "{}: whether alternate scroll was turned off",
+                case.name
+            );
         },
     );
+}
+
+/// `//pkg:chatty` prints [`CHATTY_LINES`] numbered lines and waits on the
+/// gate; sixty targets wait on it, so the list is taller than the window and
+/// the Log longer than its pane.
+fn scrolling_build(gate: &std::path::Path) -> String {
+    let mut b = format!(
+        concat!(
+            "target(name = \"chatty\", driver = \"bash\", cache = False, run = [\"trap '' INT TERM\",",
+            " \"i=1; while [ $i -le {n} ]; do echo scroll-line-$i; i=$((i+1)); done\",",
+            " \"while [ ! -e {gate} ]; do sleep 0.1; done\"])\n",
+        ),
+        n = CHATTY_LINES,
+        gate = gate.display(),
+    );
+    let mut deps = String::new();
+    for i in 0..60 {
+        b.push_str(&format!(
+            "target(name = \"f{i:02}\", driver = \"bash\", cache = False, run = \"true\", deps = {{\"c\": \":chatty\"}})\n"
+        ));
+        deps.push_str(&format!("\"f{i:02}\": \":f{i:02}\", "));
+    }
+    b.push_str(&format!(
+        "target(name = \"sum\", driver = \"bash\", cache = False, run = \"true\", deps = {{{deps}}})\n"
+    ));
+    b
+}
+
+const CHATTY_LINES: u32 = 200;
+
+/// The list's `first–last of total` range, while the dashboard is up.
+fn list_range(s: &vt100::Screen) -> Option<(usize, usize)> {
+    rows_of(s).find_map(|r| {
+        let (before, after) = r.split_once('–')?;
+        let first = before
+            .rsplit(|c: char| !c.is_ascii_digit())
+            .next()?
+            .parse()
+            .ok()?;
+        let (last, _) = after.split_once(" of ")?;
+        Some((first, last.trim().parse().ok()?))
+    })
+}
+
+/// The address on the list's selected (`▸`) row.
+fn selected_addr(s: &vt100::Screen) -> Option<String> {
+    rows_of(s)
+        .find(|r| r.trim_start().starts_with('▸'))
+        .and_then(|r| {
+            r.split_whitespace()
+                .find(|w| w.starts_with("//"))
+                .map(str::to_owned)
+        })
+}
+
+/// Whether a row ends with chatty's line `n` (not a longer number).
+fn shows_line(s: &vt100::Screen, n: u32) -> bool {
+    let line = format!("scroll-line-{n}");
+    rows_of(s).any(|r| r.trim_end().ends_with(&line))
+}
+
+/// One wheel step (SGR button 64 up, 65 down) over cell `(row, col)`.
+fn wheel_at(pty: &common::pty::Pty, row: u16, col: u16, down: bool) {
+    let button = if down { 65 } else { 64 };
+    let (x, y) = (col + 1, row + 1);
+    pty.send(format!("\x1b[<{button};{x};{y}M").as_bytes());
+}
+
+/// The wheel, as a terminal encodes it, scrolls what is under it: on the
+/// list it moves the window and leaves the selection on its row while that
+/// row stays on screen; on the Log tab, up scrolls back and stops following.
+#[test]
+fn wheel_scrolls_the_view() {
+    let mut g = Gated::start_build(scrolling_build, "", &[], "//pkg:sum");
+    g.play(&[
+        Step::Until("the line", on_line),
+        Step::Keys(TAB),
+        Step::Until("the dashboard, mouse captured", dashboard_captured),
+        // `a`: every target, not only the one matched, so the list is
+        // taller than the window.
+        Step::Keys(b"a"),
+        Step::Until("a list taller than the window", |s| {
+            rows_of(s).any(|r| r.contains(" of ") && r.trim_end().ends_with(" ↓"))
+        }),
+    ]);
+    // Select a row in the middle of the window: one click selects it (a
+    // second would open it).
+    let pick = g
+        .pty
+        .with_screen(|s| {
+            rows_of(s)
+                .filter_map(|r| {
+                    r.split_whitespace()
+                        .find(|w| w.starts_with("//pkg:f"))
+                        .map(str::to_owned)
+                })
+                .nth(10)
+        })
+        .unwrap_or_else(|| panic!("ten fillers on the list\n{}", g.pty.screen()));
+    let pick = pick.as_str();
+    let (row, col) = g
+        .pty
+        .with_screen(|s| find_cell(s, pick))
+        .expect("on screen");
+    let (x, y) = (col + 3, row + 1);
+    g.pty
+        .send(format!("\x1b[<0;{x};{y}M\x1b[<0;{x};{y}m").as_bytes());
+    g.pty
+        .wait_screen(&format!("{pick} selected"), DEADLINE, |s| {
+            selected_addr(s).as_deref() == Some(pick)
+        });
+    let before = g.pty.with_screen(list_range).expect("a range");
+    wheel_at(&g.pty, row, col, true);
+    g.pty.wait_screen("the list scrolled down", DEADLINE, |s| {
+        list_range(s).is_some_and(|r| r.0 > before.0)
+    });
+    assert_eq!(
+        g.pty.with_screen(selected_addr).as_deref(),
+        Some(pick),
+        "the wheel moved the selection off a row still on screen\n{}",
+        g.pty.screen()
+    );
+    wheel_at(&g.pty, row, col, false);
+    g.pty.wait_screen("the list scrolled back", DEADLINE, |s| {
+        list_range(s) == Some(before)
+    });
+
+    // The Log: chatty selected, `l` opens it there, following its end.
+    let chatty = "//pkg:chatty";
+    let (row, col) = g
+        .pty
+        .with_screen(|s| find_cell(s, chatty))
+        .expect("chatty on the list");
+    let (x, y) = (col + 3, row + 1);
+    g.pty
+        .send(format!("\x1b[<0;{x};{y}M\x1b[<0;{x};{y}m").as_bytes());
+    g.pty.wait_screen("chatty selected", DEADLINE, |s| {
+        selected_addr(s).as_deref() == Some(chatty)
+    });
+    g.pty.send(b"l");
+    // The Log pane itself, following: the list's LAST LINE column also
+    // ends with the last line, and a wheel step sent while the list is
+    // still up lands on the pane before it has read anything.
+    g.pty.wait_screen("the Log at its end", DEADLINE, |s| {
+        rows_of(s).any(|r| r.contains("● following")) && shows_line(s, CHATTY_LINES)
+    });
+    let first = g
+        .pty
+        .with_screen(|s| (1..=CHATTY_LINES).find(|&n| shows_line(s, n)))
+        .expect("a line in view");
+    wheel_at(&g.pty, 20, 20, false);
+    g.pty.wait_screen("the Log three lines up", DEADLINE, |s| {
+        !shows_line(s, CHATTY_LINES) && shows_line(s, first - 3)
+    });
+    wheel_at(&g.pty, 20, 20, true);
+    g.pty.wait_screen("the Log back down", DEADLINE, |s| {
+        shows_line(s, CHATTY_LINES)
+    });
+
+    g.play(&[Step::Keys(CTRL_C), Step::Keys(CTRL_C), Step::OpenGate]);
+    g.exit();
+    assert_restored(&g.pty, "wheel");
 }
 
 const ENTER: &[u8] = b"\r";

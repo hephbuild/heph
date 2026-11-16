@@ -60,8 +60,18 @@ static MOUSE_UP: AtomicBool = AtomicBool::new(false);
 /// Button presses (1000) reported in SGR encoding (1006). Not crossterm's
 /// `EnableMouseCapture`, which also turns on any-motion reporting (1003): an
 /// event for every cell the pointer crosses.
-const MOUSE_ON: &[u8] = b"\x1b[?1000h\x1b[?1006h";
-/// Both modes off; also what the hard abort writes.
+///
+/// Then alternate scroll (1007) off: a terminal with it on turns the wheel
+/// into ↑/↓ on the alternate screen, which would move the selection instead
+/// of scrolling the view. Most terminals already send wheel reports once
+/// 1000 is on; this is for the ones that let 1007 win. Nothing turns it back
+/// on at leave: whether it was on is learnt only by a query (DECRQM), and the
+/// input stream is live by then. Mode 1007 only acts on the alternate
+/// screen, so leaving it off changes nothing on the main screen; the cost
+/// is a later full-screen program without mouse reporting (`less`) whose
+/// wheel no longer scrolls in a terminal that had 1007 on.
+const MOUSE_ON: &[u8] = b"\x1b[?1000h\x1b[?1006h\x1b[?1007l";
+/// Both capture modes off; also what the hard abort writes.
 const MOUSE_OFF: &[u8] = b"\x1b[?1000l\x1b[?1006l";
 
 /// Whether the full screens capture the mouse: yes, unless `HEPH_NO_MOUSE`

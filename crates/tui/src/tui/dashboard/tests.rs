@@ -202,6 +202,8 @@ fn open_on(
 #[derive(Default)]
 struct StubReader {
     logs: Mutex<HashMap<String, Vec<u8>>>,
+    /// Logs followed live: their bytes come in one chunk, then nothing.
+    live: Mutex<HashMap<String, Vec<u8>>>,
     outputs: Mutex<HashMap<String, OutputsFound>>,
     threads: Mutex<Vec<std::thread::ThreadId>>,
 }
@@ -209,6 +211,13 @@ struct StubReader {
 impl StubReader {
     fn set_log(&self, addr: &str, bytes: &[u8]) {
         self.logs
+            .lock()
+            .expect("lock")
+            .insert(addr.into(), bytes.to_vec());
+    }
+
+    fn set_live(&self, addr: &str, bytes: &[u8]) {
+        self.live
             .lock()
             .expect("lock")
             .insert(addr.into(), bytes.to_vec());
@@ -232,6 +241,19 @@ impl TargetReader for StubReader {
             .lock()
             .expect("lock")
             .push(std::thread::current().id());
+        if let Some(b) = self.live.lock().expect("lock").get(addr) {
+            /// One chunk, then a run still going.
+            struct Once(Option<Vec<u8>>);
+            impl LogFeed for Once {
+                fn poll(&mut self) -> FeedStep {
+                    self.0.take().map_or(FeedStep::Idle, FeedStep::Bytes)
+                }
+            }
+            return LogOpened::Follow {
+                feed: Box::new(Once(Some(b.clone()))),
+                about: "live".into(),
+            };
+        }
         match self.logs.lock().expect("lock").get(addr) {
             Some(b) => LogOpened::Tail {
                 bytes: b.clone(),
@@ -1322,4 +1344,47 @@ fn wheel_scrolls_and_stops_following() {
     t.wheel(true);
     let f = target_frame(&s, &mut t, 10_000, &r);
     assert!(shows(&f, first), "down scrolls back: {f:#?}");
+
+    // Through the whole view, as the terminal drives it: `l` on a running
+    // target, frames until its end shows, one wheel step up.
+    let reader = Arc::new(StubReader::default());
+    reader.set_live("//w:live", log.as_bytes());
+    let mut v = crate::tui::TuiProgressView::new("heph r build //w:...")
+        .with_target_reader(reader as Arc<dyn TargetReader>);
+    for e in [
+        at(0, matched(&["//w:live"])),
+        at(0, start("//w:live")),
+        at(0, exec("//w:live")),
+    ] {
+        crate::tui::app::TUIAppView::apply(&mut v, &e);
+    }
+    v.open_dashboard();
+    drop(view_frame(&mut v, 140, 40));
+    crate::tui::app::TUIAppView::open_selected(&mut v, true);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let f = loop {
+        let f = view_frame(&mut v, 140, 40);
+        if shows(&f, 200) {
+            break f;
+        }
+        assert!(std::time::Instant::now() < deadline, "{f:#?}");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let first = (1..=200).find(|&n| shows(&f, n)).expect("a line in view");
+    wheel(&mut v, false);
+    let f = view_frame(&mut v, 140, 40);
+    assert!(!shows(&f, 200), "up stops following, view: {f:#?}");
+    assert!(shows(&f, first - 3), "three lines up, view: {f:#?}");
+
+    // The same on a log still being written, followed live.
+    let s = fold(&[at(0, start("//w:live")), at(0, exec("//w:live"))]);
+    let reader = Arc::new(StubReader::default());
+    reader.set_live("//w:live", log.as_bytes());
+    let mut t = open_on(&s, "//w:live", TargetTab::Log, Some(reader));
+    let f = target_frame_until(&s, &mut t, &r, |f| shows(f, 200));
+    let first = (1..=200).find(|&n| shows(&f, n)).expect("a line in view");
+    t.wheel(false);
+    let f = target_frame(&s, &mut t, 10_000, &r);
+    assert!(!shows(&f, 200), "up stops following: {f:#?}");
+    assert!(shows(&f, first - 3), "three lines up, live: {f:#?}");
 }
