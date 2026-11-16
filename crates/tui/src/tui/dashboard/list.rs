@@ -28,6 +28,9 @@ pub struct WaitWords {
     pub phase: String,
     /// The rest: `(2 free, 41s)`, `held by session d1v9q (pid 4121)`.
     pub detail: String,
+    /// `detail` without the waited time, for the list row whose TIME column
+    /// already shows it: `(2 free)`, `(3 free, yielding to a cpu 8 run)`.
+    pub row_detail: String,
     pub waited_ms: u64,
 }
 
@@ -641,7 +644,7 @@ fn row_words(inp: &ListInputs<'_>, id: Id, r: &Record) -> (String, String, Strin
     match r.state {
         RowState::Queued => ("pending".into(), String::new(), String::new()),
         RowState::Blocked => match inp.waits.wait_words(m.addr(id), inp.now_ms) {
-            Some(w) => (w.phase, whole(w.waited_ms), w.detail),
+            Some(w) => (w.phase, whole(w.waited_ms), w.row_detail),
             None => ("waiting".into(), String::new(), String::new()),
         },
         RowState::Running => {

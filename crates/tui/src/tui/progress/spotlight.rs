@@ -229,10 +229,16 @@ impl crate::tui::dashboard::Waits for BuildState {
             } else {
                 format!("waits {head}")
             };
+            let waited_ms = now_ms.saturating_sub(w.since_ms);
+            let detail = format!("({detail}");
+            // The row's TIME column already says how long: its LAST LINE
+            // drops the formatter's trailing `, <waited>`.
+            let row_detail = detail.replacen(&format!(", {})", elapsed(waited_ms)), ")", 1);
             return Some(WaitWords {
                 phase,
-                detail: format!("({detail}"),
-                waited_ms: now_ms.saturating_sub(w.since_ms),
+                detail,
+                row_detail,
+                waited_ms,
             });
         }
         if let Some((holder, since)) = self.lock_waits.get(addr) {
@@ -249,6 +255,7 @@ impl crate::tui::dashboard::Waits for BuildState {
             };
             return Some(WaitWords {
                 phase,
+                row_detail: detail.clone(),
                 detail,
                 waited_ms: now_ms.saturating_sub(*since),
             });
@@ -260,6 +267,7 @@ impl crate::tui::dashboard::Waits for BuildState {
         };
         Some(WaitWords {
             phase: format!("waits {}", w.scratch),
+            row_detail: detail.clone(),
             detail,
             waited_ms: now_ms.saturating_sub(w.since_ms),
         })

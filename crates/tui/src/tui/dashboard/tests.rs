@@ -336,7 +336,9 @@ fn dashboard_lists_every_state() {
     assert_eq!(counts.tab(Tab::Pending), counts.blocked + counts.queued);
     let b = row(&pending, "//t:b");
     assert!(b.contains("⧗ //t:b") && b.contains("waits cpu 4"), "{b}");
-    assert!(b.contains("(2 free, 41s)"), "{b}");
+    // The elapsed time once, in TIME; LAST LINE keeps the rest.
+    assert!(b.contains("(2 free)"), "{b}");
+    assert_eq!(b.matches("41s").count(), 1, "{b}");
     let q = row(&pending, "//t:q");
     assert!(q.contains("· //t:q") && q.contains("pending"), "{q}");
 
@@ -460,12 +462,37 @@ fn wait_text_is_the_shared_formatter_pending_row() {
             "{words:?} vs {expected}"
         );
         assert_eq!(words.waited_ms, 41_000);
+        // The row's LAST LINE is the formatter's words less the elapsed
+        // time, which the TIME column shows: the time once per row.
+        assert_eq!(
+            words.row_detail,
+            words.detail.replacen(", 41s)", ")", 1),
+            "{words:?}"
+        );
+        assert!(!words.row_detail.contains("41s"), "{words:?}");
+        match (pool, &yields) {
+            ("cpu", None) => assert_eq!(words.row_detail, "(2 free)"),
+            (_, Some(_)) => assert!(
+                words
+                    .row_detail
+                    .starts_with("(2 free, yielding to a memory ")
+                    && words.row_detail.ends_with(" run)"),
+                "{words:?}"
+            ),
+            _ => assert!(
+                words
+                    .row_detail
+                    .ends_with(") — cleanup is behind: 2 removals pending"),
+                "{words:?}"
+            ),
+        }
         let mut st = ListState::default();
         let rows = frame(&s, &mut st, Tab::Pending, 42_000);
         let row = rows.iter().find(|r| r.contains("//w:a")).expect("the row");
         assert!(row.contains(&words.phase), "{row}");
-        let shown: String = words.detail.chars().take(20).collect();
+        let shown: String = words.row_detail.chars().take(20).collect();
         assert!(row.contains(&shown), "{row}");
+        assert_eq!(row.matches("41s").count(), 1, "{row}");
     }
 
     // A lock held by another heph: its session, as the spotlight names it.
