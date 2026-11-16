@@ -41,8 +41,6 @@ const FALLBACK_WIDTH: usize = 120;
 #[derive(Debug)]
 pub struct ReportContext {
     blocks: Vec<Block>,
-    /// Failures that were a stop (Ctrl-C), not a failure: counted, no block.
-    stopped: usize,
     /// heph's home, redacted from every error text and log line.
     redact: Redact,
     /// The terminal's width: a tail line is cut to it.
@@ -76,14 +74,10 @@ impl ReportContext {
             .ok()
             .filter(|w| *w > 0)
             .unwrap_or(FALLBACK_WIDTH);
-        let mut stopped = 0;
+        // A target a stop ended did not fail: no block, and no word about it.
         let blocks = failures
             .iter()
-            .filter(|f| {
-                let stop = was_cancelled(&f.addr.format());
-                stopped += usize::from(stop);
-                !stop
-            })
+            .filter(|f| !was_cancelled(&f.addr.format()))
             .map(|f| Block {
                 failure: Arc::clone(f),
                 took_down: took_down(&f.addr.format()),
@@ -100,7 +94,6 @@ impl ReportContext {
             .collect();
         Self {
             blocks,
-            stopped,
             redact: home.map(Redact::heph_home).unwrap_or_default(),
             width,
         }
@@ -120,20 +113,13 @@ impl ReportContext {
         self
     }
 
-    /// The report: a blank line, then each block; a closing line counts
-    /// the stops left out. "stopped", not "by ctrl-c": fail-fast cancels
-    /// the same way, and nobody pressed anything.
+    /// The report: a blank line, then each root failure's block. A stop is
+    /// not a failure: the targets it ended get no block and no line.
     pub fn render(&self, color: bool) -> String {
         let mut out = String::new();
         for block in &self.blocks {
             out.push('\n');
             self.render_block(&mut out, block, color);
-        }
-        if self.stopped > 0 {
-            out.push_str(&format!(
-                "\n{} stopped, not failed: no block\n",
-                self.stopped
-            ));
         }
         out
     }

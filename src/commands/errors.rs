@@ -1289,7 +1289,8 @@ mod tests {
     }
 
     /// I8: after a Ctrl-C stop with two root failures seen, the interactive
-    /// report prints and lists both; a target the stop ended is no block.
+    /// report prints and lists both; a target the stop ended is no block, and
+    /// nothing says it stopped.
     #[tokio::test]
     async fn report_after_ctrl_c_lists_every_root() -> anyhow::Result<()> {
         let ctx = FakeCtx::new(true);
@@ -1307,7 +1308,26 @@ mod tests {
         assert!(out.contains("\n✗ //simple_fail:d1\n  │ boom a\n"), "{out}");
         assert!(out.contains("\n✗ //simple_fail:d2\n  │ boom b\n"), "{out}");
         assert!(!out.contains("//simple_fail:stopped"), "{out}");
-        assert!(out.contains("\n1 stopped, not failed: no block\n"), "{out}");
+        assert!(!out.contains("stopped"), "{out}");
+        Ok(())
+    }
+
+    /// A stop with no root failure: the report has no block and no line.
+    #[tokio::test]
+    async fn report_after_ctrl_c_without_a_root_is_empty() -> anyhow::Result<()> {
+        let ctx = FakeCtx::new(true);
+        let failures = vec![Arc::new(TargetFailure::new(
+            crate::htaddr::parse_addr("//simple_fail:stopped")?,
+            None,
+            anyhow::anyhow!("cancelled"),
+        ))];
+        let mut rs = FakeRs::new(failures);
+        rs.2.push("//simple_fail:stopped");
+        let res: anyhow::Result<()> = Err(anyhow::Error::new(CancelledError));
+        let e = finalize!(ctx, rs, res).unwrap_err();
+        let out = render_anyhow_to_string(&e, false).unwrap_or_default();
+        assert!(!out.contains("✗"), "{out}");
+        assert!(!out.contains("stopped"), "{out}");
         Ok(())
     }
 
