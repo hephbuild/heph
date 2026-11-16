@@ -38,7 +38,13 @@ pub struct ErrorDetail {
     pub upstream_of: Option<String>,
     /// The subprocess's exit status as the OS reported it.
     pub exit_status: Option<String>,
+    /// The tail a recorded [`TargetFailure`](hplugin::error::TargetFailure)
+    /// on the chain already read.
     pub log_tail: Option<hcore::events::LogTailData>,
+    /// The log `execute` kept in the failure slot, not read yet: only
+    /// `ResultEnd` reads its tail ([`result_log_tail`](Self::result_log_tail)),
+    /// so the inner scopes, which report only the message, pay no IO for it.
+    pub log: Option<hplugin::error::FailureLog>,
     /// The run outlasted the target's `timeout` (a
     /// [`TimedOutError`](crate::engine::run_timeout::TimedOutError) on the
     /// chain).
@@ -65,11 +71,6 @@ impl ErrorDetail {
             {
                 d.upstream_of = Some(u.root.format());
             }
-            if d.exit_status.is_none()
-                && let Some(p) = cause.downcast_ref::<ProcessFailed>()
-            {
-                d.exit_status = Some(p.status.clone());
-            }
             if d.log_tail.is_none()
                 && let Some(t) = cause.downcast_ref::<TargetFailure>()
                 && let Some(tail) = &t.log_tail
@@ -79,6 +80,17 @@ impl ErrorDetail {
                     start_line: tail.start_line,
                 });
             }
+        }
+        // Through the memoizer's shared wrappers: a run's own failure reaches
+        // `ResultEnd` from the `execute` memoizer, so its `ProcessFailed` and
+        // the slot `execute` filled sit behind a `SharedAnyhow` a plain chain
+        // walk stops at.
+        d.exit_status =
+            hcore::hmemoizer::downcast_chain_ref::<ProcessFailed>(e).map(|p| p.status.clone());
+        if d.log_tail.is_none() {
+            d.log =
+                hcore::hmemoizer::downcast_chain_ref::<crate::engine::failure_slot::FailureSlot>(e)
+                    .and_then(|s| s.log.clone());
         }
         // Through the memoizer's shared wrappers too: a recorded failure
         // reaches `ResultEnd` behind `TargetFailure`'s source.
@@ -97,6 +109,28 @@ impl ErrorDetail {
     /// inner spans would only duplicate it.
     pub fn into_message(self) -> String {
         self.message
+    }
+
+    /// The log tail `ResultEnd` carries: the recorded failure's, or else the
+    /// last lines of the failure slot's log — one seek-based read bounded by
+    /// the request's `--log-lines`, the same read the recorded failure makes.
+    /// None for an interactive target, whose output already went straight to
+    /// the terminal (as `classify_failure` drops it from the box).
+    pub fn result_log_tail(
+        log_tail: Option<hcore::events::LogTailData>,
+        log: Option<&hplugin::error::FailureLog>,
+        interactive: bool,
+    ) -> Option<hcore::events::LogTailData> {
+        if interactive {
+            return None;
+        }
+        log_tail.or_else(|| {
+            let tail = log?.tail().ok()?;
+            Some(hcore::events::LogTailData {
+                text: tail.text,
+                start_line: tail.start_line,
+            })
+        })
     }
 }
 

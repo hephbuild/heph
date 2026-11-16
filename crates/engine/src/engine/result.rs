@@ -2927,6 +2927,7 @@ impl Engine {
         opts: &ResultOptions,
     ) -> anyhow::Result<(MemoResult, Option<Arc<ResultReadGuard>>)> {
         let addr_str = addr.format();
+        let interactive = opts.interactive.is_some();
         crate::engine::event::emit_scope(
             &rs,
             crate::engine::event::BuildEventKind::ResultStart {
@@ -2942,7 +2943,11 @@ impl Engine {
                     error: Some(d.message),
                     upstream_of: d.upstream_of,
                     exit_status: d.exit_status,
-                    log_tail: d.log_tail,
+                    log_tail: crate::engine::event::ErrorDetail::result_log_tail(
+                        d.log_tail,
+                        d.log.as_ref(),
+                        interactive,
+                    ),
                     timed_out: d.timed_out,
                 },
                 None => crate::engine::event::BuildEventKind::ResultEnd {

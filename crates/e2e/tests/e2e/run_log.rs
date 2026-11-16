@@ -670,6 +670,66 @@ fn runs_entries(engine: &Engine) -> std::collections::BTreeSet<std::ffi::OsStrin
         .collect()
 }
 
+/// A failing captured run's `ResultEnd` says how its process exited and
+/// carries the last lines of its log: what the line backend prints live as
+/// the target fails. The run streams into the engine's live log, so the tail
+/// comes from the failure slot's copy, not from anything the driver returned.
+#[tokio::test]
+async fn a_failed_run_result_end_carries_its_exit_and_log_tail() -> anyhow::Result<()> {
+    let ws = tempfile::tempdir()?;
+    std::fs::create_dir_all(ws.path().join("p"))?;
+    std::fs::write(
+        ws.path().join("p").join("BUILD"),
+        r#"target(name = "f", driver = "bash", out = "f.txt", run = "for i in $(seq 1 30); do echo line $i; done; echo to-stderr >&2; exit 3")"#,
+    )?;
+    let engine = engine(ws.path())?;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let rs = engine.new_state_with_events(false, Some(tx));
+    let res = Arc::clone(&engine)
+        .result_addr(
+            rs,
+            &parse_addr("//p:f")?,
+            OutputMatcher::All,
+            &ResultOptions::default(),
+        )
+        .await;
+    assert!(res.is_err(), "the target fails");
+    drop(res);
+    let mut ends = Vec::new();
+    let collect = async {
+        while let Some(ev) = rx.recv().await {
+            if let BuildEventKind::ResultEnd {
+                addr,
+                exit_status,
+                log_tail,
+                ..
+            } = ev.kind
+                && addr == "//p:f"
+            {
+                ends.push((exit_status, log_tail));
+            }
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(60), collect)
+        .await
+        .map_err(|_elapsed| anyhow::anyhow!("the request's stream never ended"))?;
+    let [(exit_status, log_tail)] = ends.as_slice() else {
+        panic!("one ResultEnd for //p:f, got {}", ends.len());
+    };
+    assert_eq!(exit_status.as_deref(), Some("exit status: 3"));
+    let tail = log_tail.as_ref().expect("the log's tail");
+    let lines: Vec<&str> = tail.text.lines().collect();
+    assert_eq!(
+        lines.len(),
+        Engine::DEFAULT_LOG_TAIL_LINES,
+        "bounded to the request's tail size: {lines:?}"
+    );
+    assert_eq!(lines.last(), Some(&"to-stderr"), "{lines:?}");
+    assert_eq!(lines.first(), Some(&"line 22"), "{lines:?}");
+    assert_eq!(tail.start_line, 22);
+    Ok(())
+}
+
 /// A run that writes no byte creates no live file, and no `Log` reaches its
 /// cache entry.
 #[tokio::test]
