@@ -3005,24 +3005,12 @@ impl CIAppView for CiProgressView {
         tracing::info!("{}", self.core.label);
     }
 
-    /// "Not chatty" policy: one line only for cacheable executes (the 1:1
-    /// replacement for the old `tracing::info!(… "run")` — cache hits
-    /// short-circuit before execute, so they stay silent).
+    /// "Not chatty" policy: an execute starting logs nothing — a line per
+    /// target is noise on a busy build, and the summary counts them. Only
+    /// what the reader must act on or explain (lock waits, scratch notices)
+    /// gets a line.
     fn apply(&mut self, ev: &BuildEvent) {
         match &ev.kind {
-            BuildEventKind::ExecuteStart {
-                addr,
-                driver,
-                cache: true,
-                declared,
-                reserved,
-                ..
-            } => match hcore::events::clamp_text(declared.as_ref(), reserved.as_ref(), |p| {
-                self.core.state.unit_of(p)
-            }) {
-                Some(clamp) => tracing::info!("running {addr} [{driver}] ({clamp})"),
-                None => tracing::info!("running {addr} [{driver}]"),
-            },
             // Admission waits stay off the CI log: a line per wait is noise
             // on a busy build, and the live views (the TUI's waiting tab, the
             // GHA live report) show them as they happen.
@@ -4617,8 +4605,8 @@ mod tests {
         );
     }
 
-    /// Admission waits stay off the CI log; the execute that follows still
-    /// logs, which also proves the capture sees the view's lines.
+    /// Admission waits stay off the CI log, and so does the execute that
+    /// follows: no per-target "running" line.
     #[test]
     fn ci_view_logs_nothing_for_an_admission_wait() {
         let log = ci_view_log(&[
@@ -4636,8 +4624,7 @@ mod tests {
             ev(1_000, admission_wait_start("//a:b")),
             ev(2_000, execute_start("//a:b")),
         ]);
-        assert!(!log.contains('⧗'), "{log}");
-        assert!(log.contains("running //a:b [exec]"), "{log}");
+        assert_eq!(log, "", "an execute start logged: {log}");
     }
 
     /// A stop reads first on the CI summary line, as on the TUI's final
