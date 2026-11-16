@@ -75,7 +75,8 @@ pub(super) struct LineModel<'a> {
     pub(super) status: Status<'a>,
     /// Unpadded: `1m05s`.
     pub(super) clock: String,
-    /// What the run is resolving, while the matcher streams. Dropped first.
+    /// What the run is resolving, while the matcher streams, or what is about
+    /// to take the terminal ("Invoking …"). Dropped first.
     pub(super) resolving: Option<Cow<'a, str>>,
     pub(super) body: Body<'a>,
     pub(super) standing: Option<ApprovalStanding>,

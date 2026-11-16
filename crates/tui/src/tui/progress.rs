@@ -1454,6 +1454,12 @@ pub trait ProgressHeader: Send {
     fn header(&self, core: &BuildState, scope: CountScope) -> Vec<HeaderItem>;
     /// The bottom-border label.
     fn label(&self) -> String;
+    /// Whether the line keeps [`label`](Self::label) up once the matcher has
+    /// completed, not only while it streams: an entrypoint's "Invoking …",
+    /// which names what is about to take the terminal.
+    fn label_stands(&self) -> bool {
+        false
+    }
     /// Final summary segment printed after the run (after the elapsed clock).
     /// Empty ⇒ nothing is printed. `scope` is the count scope the view was left
     /// on (the `a` toggle), so the printed summary matches the header the user
@@ -2304,8 +2310,13 @@ impl TuiProgressView {
                 self.model.header(&self.state, scope),
             )))
         };
-        // What the run is resolving, while the matcher streams.
-        let resolving = (dashboard && !self.state.dash.matched_complete())
+        // What the run is resolving, while the matcher streams; or, until the
+        // run ends, a label the header keeps up ("Invoking …": what is about
+        // to take the terminal, on the line while its dependencies build).
+        let stands = self.finished_at_ms.is_none()
+            && matches!(self.role, Role::Live { .. })
+            && self.model.label_stands();
+        let resolving = (dashboard && (stands || !self.state.dash.matched_complete()))
             .then(|| self.label())
             .filter(|l| !l.is_empty())
             .map(Cow::Owned);
@@ -4823,6 +4834,45 @@ mod tests {
         BuildEventKind::Matched {
             addrs: addrs.iter().map(|s| (*s).to_string()).collect(),
             complete,
+        }
+    }
+
+    /// An entrypoint's "Invoking …" stays on the line after the matcher
+    /// completed, while its dependencies build and up to the pause that hands
+    /// it the terminal; an ordinary label leaves with the matcher, and a
+    /// standing one with the run's end.
+    #[test]
+    fn a_standing_label_outlives_the_matcher() {
+        struct Invoking(bool);
+        impl ProgressHeader for Invoking {
+            fn header(&self, core: &BuildState, scope: CountScope) -> Vec<HeaderItem> {
+                BuildHeader::new(String::new()).header(core, scope)
+            }
+            fn label(&self) -> String {
+                "Invoking //app:tty".to_owned()
+            }
+            fn label_stands(&self) -> bool {
+                self.0
+            }
+            fn last_render(&self, core: &BuildState, scope: CountScope) -> String {
+                BuildHeader::new(String::new()).last_render(core, scope)
+            }
+        }
+        let text = |v: &TuiProgressView| line_text(&v.line("⠋", 1, 200, true));
+        for stands in [true, false] {
+            let mut v = TuiProgressView::with_header(Box::new(Invoking(stands)));
+            v.apply(&ev(0, matched(&["//app:tty"], false)));
+            assert!(text(&v).contains("Invoking //app:tty"), "{}", text(&v));
+            v.apply(&ev(1, matched(&[], true)));
+            v.apply(&ev(2, result_start("//dep:slow")));
+            assert_eq!(
+                text(&v).contains("Invoking //app:tty"),
+                stands,
+                "stands={stands}: {}",
+                text(&v)
+            );
+            v.set_finished(3);
+            assert!(!text(&v).contains("Invoking"), "{}", text(&v));
         }
     }
 

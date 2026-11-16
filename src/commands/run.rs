@@ -464,19 +464,29 @@ impl std::error::Error for InvokeFailed {}
 /// The header label, shared with the TUI view so it can change once the run
 /// learns it is invoking an entrypoint rather than building (R20).
 #[derive(Clone)]
-struct SharedLabel(Arc<std::sync::Mutex<String>>);
+struct SharedLabel(Arc<std::sync::Mutex<(String, bool)>>);
 
 impl SharedLabel {
     fn new(label: String) -> Self {
-        Self(Arc::new(std::sync::Mutex::new(label)))
+        Self(Arc::new(std::sync::Mutex::new((label, false))))
     }
 
+    /// A label shown only while the matcher streams.
     fn set(&self, label: String) {
-        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = label;
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = (label, false);
+    }
+
+    /// A label the line keeps up until the run ends ("Invoking …").
+    fn set_standing(&self, label: String) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = (label, true);
     }
 
     fn get(&self) -> String {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).0.clone()
+    }
+
+    fn stands(&self) -> bool {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).1
     }
 }
 
@@ -493,6 +503,10 @@ impl tui::ProgressHeader for RunHeader {
 
     fn label(&self) -> String {
         self.label.get()
+    }
+
+    fn label_stands(&self) -> bool {
+        self.label.stands()
     }
 
     fn last_render(&self, core: &tui::BuildState, scope: tui::CountScope) -> String {
@@ -560,7 +574,8 @@ impl RunApp {
         rs: Arc<crate::engine::request_state::RequestState>,
         addr: crate::htaddr::Addr,
     ) -> anyhow::Result<Option<hcore::process::Exit>> {
-        self.label.set(format!("Invoking {}", addr.format()));
+        self.label
+            .set_standing(format!("Invoking {}", addr.format()));
         let engine = Arc::downgrade(&self.engine);
         let (relay, signals) = bootstrap::signal_relay(move || {
             if let Some(e) = engine.upgrade() {
