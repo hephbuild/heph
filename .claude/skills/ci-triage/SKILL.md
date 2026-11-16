@@ -28,8 +28,13 @@ take a minute to appear, and `gh pr checks` meanwhile prints "no checks reported
 Wait with `gh run watch "$RUN" --exit-status`, using `run_in_background`, never a sleep loop. Read the
 result from `gh run view "$RUN" --json conclusion,jobs`, not from the watcher alone.
 
-If the run was skipped, the PR is stacked (its base is not `master`): the `gate` job skips it,
-so no checks ran. The fix is the `ci/force-ci` label, not a rerun.
+If the run was skipped, the PR is a middle layer of a stack: its base is not `master`, and another
+open PR is stacked on it. The `gate` job's notice names that PR. Its run builds this layer's
+changes too, so triage that PR instead. Don't rerun the skip, and don't add `ci/force-ci`: Actions
+concurrency is limited, and a forced middle layer is one more full run in the queue that tells you
+nothing new (see CLAUDE.md, "Stacked PRs"). If the top was skipped, the gate's answer is stale: it
+was decided while a PR above it was still open. `gh run rerun <run-id>` fixes it: the gate lists
+the stacked PRs again, live.
 
 ## 2. Save the failed logs to a file
 

@@ -1,13 +1,18 @@
 //! Guards on the CI gate — which pull requests get a build at all.
 //!
-//! `heph.yml` deliberately does not build a stacked PR (one whose base is
-//! another PR's branch rather than the default branch) unless it carries the
-//! `ci/force-ci` label. That saves a deep stack's CI cost times its depth, and
-//! it is safe for one reason and one reason only: the `master` repository
+//! `heph.yml` deliberately does not build the middle layers of a stack: a PR
+//! whose base is another PR's branch rather than the default branch, and on
+//! which another open PR is stacked. The bottom builds (it targets master), and
+//! so does the top, whose tree contains every layer below it. Actions
+//! concurrency is limited — one run is more jobs than the account can run at
+//! once — so a stack costs two runs per push instead of one per layer. The
+//! `ci/force-ci` label builds a middle layer anyway.
+//!
+//! It is safe for one reason and one reason only: the `master` repository
 //! ruleset — where the required status checks live — has condition
 //! `~DEFAULT_BRANCH`, so it applies to exactly the PRs whose base is master,
-//! which is exactly the set the gate lets through. Nothing reaches master
-//! without first being a PR that targets master, and those always build.
+//! and the gate builds every one of those unconditionally. Nothing reaches
+//! master without first being a PR that targets master.
 //!
 //! Every assertion below protects a way that reasoning can be broken silently,
 //! in the direction where nothing goes red:
@@ -16,6 +21,12 @@
 //!     and no check ever complains;
 //!   - dropping `labeled` from the trigger list leaves `ci/force-ci` inert —
 //!     the label is accepted, and simply never starts a run;
+//!   - dropping `unlabeled` means taking the label off a middle layer no
+//!     longer stops its build, which keeps a whole run in the queue for the
+//!     account's limited concurrent jobs;
+//!   - a gate script that decides wrongly — skips a master PR or the top of a
+//!     stack, builds a middle layer — which `the_gate_script_decides_*` runs
+//!     case by case rather than reading;
 //!   - dropping `edited` reopens the one seam in the argument above. A job
 //!     skipped by an `if:` concludes `skipped`, which branch protection reads
 //!     as a pass. GitHub retargets a child PR at master by itself when the
@@ -287,20 +298,37 @@ fn a_label_or_a_retarget_can_start_a_run() {
                  cannot start a run"
             )
         });
+    // Whole tokens: `unlabeled` contains `labeled`, so a substring check would
+    // pass with `labeled` itself gone.
+    let listed: Vec<&str> = types
+        .trim_start_matches("types:")
+        .trim()
+        .trim_matches(|c| c == '[' || c == ']')
+        .split(',')
+        .map(str::trim)
+        .collect();
+    let types = listed.join(", ");
     assert!(
-        types.contains("labeled"),
+        listed.contains(&"labeled"),
         "`on.pull_request.types` omits `labeled`, so adding `ci/force-ci` to a \
          stacked PR queues nothing. Found: {types}"
     );
     assert!(
-        types.contains("edited"),
+        listed.contains(&"unlabeled"),
+        "`on.pull_request.types` omits `unlabeled`, so removing `ci/force-ci` \
+         from a stacked PR leaves its forced run building to completion, \
+         holding a whole run's worth of the account's concurrent jobs. \
+         Found: {types}"
+    );
+    assert!(
+        listed.contains(&"edited"),
         "`on.pull_request.types` omits `edited`, so GitHub's automatic \
          retarget of a stacked PR onto master queues no run and the PR stays \
          mergeable on its stale `skipped` checks. Found: {types}"
     );
     for required in ["opened", "synchronize", "reopened"] {
         assert!(
-            types.contains(required),
+            listed.contains(&required),
             "`on.pull_request.types` omits `{required}`. Naming any `types:` \
              replaces the default set, so the omitted event now gets no CI at \
              all. Found: {types}"
@@ -549,6 +577,273 @@ fn coords(job: &Value) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// What the fake `gh` answers when the gate lists the PRs stacked on this one.
+#[derive(Debug, Clone, Copy)]
+enum Lookup {
+    /// `gh` prints this (what the real one prints after `--jq`: `#12 #34`, or
+    /// nothing for no children).
+    Children(&'static str),
+    /// `gh` exits 1, as on an API outage or a token without `pull-requests`.
+    Fails,
+}
+
+/// What a run of the gate script did.
+#[derive(Debug)]
+struct GateRun {
+    run: String,
+    reason: String,
+    /// The fake `gh`'s argv, one per line, or `None` when it was never called.
+    gh_args: Option<String>,
+}
+
+/// Runs the gate's `Decide` step as Actions would (`bash -e -o pipefail`),
+/// with `env` as its whole environment and a fake `gh` first on `PATH`.
+fn run_gate(script: &str, env: &[(&str, &str)], lookup: Lookup) -> GateRun {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output = dir.path().join("github_output");
+    let gh_args = dir.path().join("gh_args");
+    let bin = dir.path().join("bin");
+    std::fs::create_dir(&bin).expect("creating the fake gh's directory");
+    let gh = bin.join("gh");
+    std::fs::write(
+        &gh,
+        "#!/bin/sh\n\
+         printf '%s\\n' \"$@\" > \"$FAKE_GH_ARGS\"\n\
+         [ -n \"$FAKE_GH_FAIL\" ] && exit 1\n\
+         printf '%s' \"$FAKE_GH_CHILDREN\"\n",
+    )
+    .expect("writing the fake gh");
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755))
+        .expect("making the fake gh executable");
+    let script_path = dir.path().join("decide.sh");
+    std::fs::write(&script_path, script).expect("writing the gate script");
+
+    let mut path = std::ffi::OsString::from(&bin);
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap_or_default());
+    let mut cmd = std::process::Command::new("bash");
+    cmd.args(["--noprofile", "--norc", "-e", "-o", "pipefail"])
+        .arg(&script_path)
+        .env_clear()
+        .env("PATH", path)
+        .env("GITHUB_OUTPUT", &output)
+        .env("FAKE_GH_ARGS", &gh_args)
+        .envs(env.iter().copied());
+    match lookup {
+        Lookup::Children(children) => cmd.env("FAKE_GH_CHILDREN", children),
+        Lookup::Fails => cmd.env("FAKE_GH_FAIL", "1"),
+    };
+    let status = cmd.output().expect("running the gate script with bash");
+    assert!(
+        status.status.success(),
+        "the gate script failed for {env:?}: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let written = std::fs::read_to_string(&output).expect("reading $GITHUB_OUTPUT");
+    // A missing key reads as "", which the caller's assertions reject.
+    let out = |key: &str| {
+        written
+            .lines()
+            .find_map(|l| l.strip_prefix(key)?.strip_prefix('='))
+            .unwrap_or_default()
+            .to_string()
+    };
+    GateRun {
+        run: out("run"),
+        reason: out("reason"),
+        gh_args: std::fs::read_to_string(&gh_args).ok(),
+    }
+}
+
+/// One row of the gate's decision table.
+struct Case {
+    what: &'static str,
+    event: &'static str,
+    base: &'static str,
+    default: &'static str,
+    forced: bool,
+    lookup: Lookup,
+    builds: bool,
+    /// Whether the gate should ask GitHub which PRs are stacked on this one.
+    asks: bool,
+}
+
+/// The gate's decision, case by case, from the script itself.
+///
+/// The shape checks above prove the gate *reads* the base and the label; this
+/// proves what it does with them. Actions concurrency is limited: one run is
+/// more jobs than the account can run at once, so every extra build queues. A
+/// stack builds its bottom (it targets master, its checks are required) and
+/// its top (nothing is stacked on it, and its tree holds every layer), and
+/// skips every layer between. A gate that builds a middle layer costs a run
+/// per push; one that skips the top leaves the stack untested; one that skips
+/// a master-targeting PR lets its required checks conclude `skipped`, which
+/// branch protection reads as a pass — so those never wait on the API at all.
+#[test]
+fn the_gate_script_decides_who_builds() {
+    let wf = parsed();
+    let gate = job(&wf, "gate").expect("`heph.yml` has a `gate` job");
+    let decide = steps(gate)
+        .into_iter()
+        .find(|s| field(s, "id") == "decide")
+        .expect("the `gate` job has a step with `id: decide`");
+    assert_eq!(
+        env_of(decide, "FORCED"),
+        Some("${{ contains(github.event.pull_request.labels.*.name, 'ci/force-ci') }}"),
+        "`FORCED` must be exactly whether the PR's *current* labels include \
+         `ci/force-ci` — on `unlabeled` too, where the payload's label list \
+         no longer has it."
+    );
+    assert_eq!(
+        env_of(decide, "HEAD"),
+        Some("${{ github.event.pull_request.head.ref }}"),
+        "the PRs stacked on this one are the ones based on its *head* branch"
+    );
+    assert_eq!(
+        gate.get("permissions")
+            .and_then(|p| p.get("pull-requests"))
+            .and_then(Value::as_str),
+        Some("read"),
+        "the gate lists open PRs, so its token needs `pull-requests: read`; \
+         without it every lookup fails and every middle layer builds"
+    );
+    let script = field(decide, "run");
+
+    let stacked = |what, forced, lookup, builds| Case {
+        what,
+        event: "pull_request",
+        base: "feat/base",
+        default: "master",
+        forced,
+        lookup,
+        builds,
+        asks: !forced,
+    };
+    let unstacked = |what, event, base, default, builds| Case {
+        what,
+        event,
+        base,
+        default,
+        forced: false,
+        // Would make it skip, if the gate asked.
+        lookup: Lookup::Children("#2"),
+        builds,
+        asks: false,
+    };
+    let cases = [
+        unstacked("a push to master", "push", "", "master", true),
+        unstacked("a master PR", "pull_request", "master", "master", true),
+        unstacked(
+            "a default branch not named master",
+            "pull_request",
+            "main",
+            "main",
+            true,
+        ),
+        Case {
+            forced: true,
+            ..unstacked(
+                "a master PR with the label",
+                "pull_request",
+                "master",
+                "master",
+                true,
+            )
+        },
+        stacked("the top of a stack", false, Lookup::Children(""), true),
+        stacked("a middle layer", false, Lookup::Children("#7"), false),
+        stacked(
+            "a layer under two PRs",
+            false,
+            Lookup::Children("#7 #8"),
+            false,
+        ),
+        stacked("a forced middle layer", true, Lookup::Children("#7"), true),
+        stacked("a failed lookup", false, Lookup::Fails, true),
+        Case {
+            base: "main",
+            ..stacked(
+                "a base merely named like a trunk",
+                false,
+                Lookup::Children("#7"),
+                false,
+            )
+        },
+        Case {
+            base: "master-next",
+            ..stacked(
+                "a base that starts with the default's name",
+                false,
+                Lookup::Children("#7"),
+                false,
+            )
+        },
+    ];
+    for case in cases {
+        let Case {
+            what,
+            event,
+            base,
+            default,
+            forced,
+            lookup,
+            builds,
+            asks,
+        } = case;
+        let forced_s = if forced { "true" } else { "false" };
+        let got = run_gate(
+            script,
+            &[
+                ("EVENT", event),
+                ("BASE", base),
+                ("HEAD", "feat/this"),
+                ("DEFAULT_BRANCH", default),
+                ("FORCED", forced_s),
+                ("GH_TOKEN", "fake"),
+                ("GH_REPO", "owner/repo"),
+            ],
+            lookup,
+        );
+        let GateRun {
+            run,
+            reason,
+            gh_args,
+        } = got;
+        assert_eq!(
+            run,
+            builds.to_string(),
+            "{what}: event={event} base={base} default={default} forced={forced} \
+             lookup={lookup:?} should {}build; the gate said: {reason}",
+            if builds { "" } else { "not " }
+        );
+        assert!(!reason.is_empty(), "{what}: the gate gave no reason");
+        assert_eq!(
+            gh_args.is_some(),
+            asks,
+            "{what}: the gate {} GitHub for the PRs stacked on it",
+            if asks { "should ask" } else { "must not ask" }
+        );
+        if let Some(args) = gh_args {
+            let args: Vec<&str> = args.lines().collect();
+            assert!(
+                args.windows(2).any(|w| w == ["--base", "feat/this"])
+                    && args.windows(2).any(|w| w == ["--state", "open"]),
+                "{what}: the gate must list the *open* PRs based on its head \
+                 branch. It ran: gh {args:?}"
+            );
+        }
+        if !builds {
+            assert!(
+                reason.contains("is stacked on it") && reason.contains("ci/force-ci"),
+                "{what}: a skip must name the PR stacked on this one, whose run \
+                 to read, and the label that overrides it. Got: {reason}"
+            );
+        }
+    }
 }
 
 const PLATFORMS: [&str; 3] = ["darwin/arm64", "linux/amd64", "linux/arm64"];
