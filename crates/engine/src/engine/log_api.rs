@@ -55,6 +55,12 @@ const CHUNK: usize = 64 * 1024;
 /// How often a follower asks the locator, or looks at the stored sources,
 /// while it waits: each costs reading files.
 const RECHECK: Duration = Duration::from_millis(250);
+/// How long a follow waiting on a run that does not stream its log looks
+/// for its stored log once the run is over, before ending with none. The
+/// session says the run is over once its result is (`ResultEnd`), after the
+/// store; the store's sqlite write can still be queued then, unseen by
+/// another heph, for a moment.
+const NOT_STREAMED_SETTLE: Duration = Duration::from_secs(2);
 /// Largest stored blob read into memory when its backend has no seekable
 /// reader (a blob under the spill threshold, held in sqlite).
 const IN_MEMORY_MAX: u64 = 64 << 20;
@@ -357,7 +363,8 @@ impl Engine {
     /// finished log is read through once. `Ok(None)` when there is nothing
     /// to read and nothing to wait for. A run on a driver that does not
     /// stream its log is waited on, as a live run is followed, until its log
-    /// is stored ([`LogFollower::not_streamed`] says so meanwhile).
+    /// is stored ([`LogFollower::not_streamed`] says so meanwhile), or until
+    /// it is over with none stored (cancelled, `cache = false`).
     pub async fn follow_log(
         self: &Arc<Self>,
         addr: &Addr,
@@ -374,6 +381,7 @@ impl Engine {
                 baseline: Some(started.at_unix_ms),
                 started: Some(started),
                 not_streamed: None,
+                over_since: None,
             },
             // A run is going on, as for `Running`, so the follow waits for it
             // whatever `wait_for_start` says: its log is the first stored one
@@ -385,16 +393,19 @@ impl Engine {
                 baseline: Some(at_unix_ms),
                 started: None,
                 not_streamed: Some(LogNotStreamed { session }),
+                over_since: None,
             },
             Latest::Stored(stored) if wait_for_start => Follow::Waiting {
                 baseline: Some(stored.at_unix_ms()),
                 started: None,
                 not_streamed: None,
+                over_since: None,
             },
             Latest::None if wait_for_start => Follow::Waiting {
                 baseline: None,
                 started: None,
                 not_streamed: None,
+                over_since: None,
             },
             Latest::None => return Ok(None),
             Latest::Stored(stored) => {
@@ -710,7 +721,7 @@ impl Engine {
 
 /// Whether two manifests name the same revision: target, input hash and
 /// every artifact, whenever each was written.
-/// Whether a run that started at `start_ms` on a plugin that does not stream
+/// Whether a run that started at `start_ms` on a driver that does not stream
 /// its log is the answer over the newest stored log, stamped `stored_ms`. A
 /// stored log from the same millisecond is an older run's (this run stores its
 /// log only when it ends, after its start), so the start wins the tie; only a
@@ -856,6 +867,9 @@ enum Follow {
         /// Waiting on a run, in this engine or another session, on a driver
         /// that does not stream its log (`baseline` is then its start).
         not_streamed: Option<LogNotStreamed>,
+        /// When that not-streamed run was first seen over with no newer log
+        /// stored.
+        over_since: Option<Instant>,
     },
     Live(Running),
     Stored(OpenLog),
@@ -919,9 +933,17 @@ impl LogFollower {
                     return Ok(FollowStep::Bytes(bytes));
                 }
                 Follow::Waiting {
-                    baseline, started, ..
+                    baseline,
+                    started,
+                    not_streamed,
+                    over_since,
                 } => {
-                    let (baseline, on_a_run) = (*baseline, started.is_some());
+                    let (baseline, on_a_run, waits_on_run, over_since) = (
+                        *baseline,
+                        started.is_some(),
+                        not_streamed.is_some(),
+                        *over_since,
+                    );
                     if !self.due() {
                         return Ok(FollowStep::Idle);
                     }
@@ -951,8 +973,23 @@ impl LogFollower {
                                 (None, None) => return Ok(FollowStep::Idle),
                             }
                         }
-                        Latest::Started(_) | Latest::NotStreamed { .. } => {
+                        Latest::Started(_) => return Ok(FollowStep::Idle),
+                        Latest::NotStreamed { .. } => {
+                            self.set_over_since(None);
                             return Ok(FollowStep::Idle);
+                        }
+                        // The run waited on is over (its result ended, or its
+                        // session did) and no newer log is stored: once the
+                        // store's write has had time to land, none will be (a
+                        // cancelled run, a `cache = false` success). The
+                        // follow ends, as a streamed run's does.
+                        _ if waits_on_run => {
+                            let since = over_since.unwrap_or_else(Instant::now);
+                            if since.elapsed() < NOT_STREAMED_SETTLE {
+                                self.set_over_since(Some(since));
+                                return Ok(FollowStep::Idle);
+                            }
+                            Follow::Done
                         }
                         // The run waited on ended without writing a byte.
                         _ if on_a_run => Follow::Done,
@@ -1052,6 +1089,13 @@ impl LogFollower {
                 ..
             } => Some(not_streamed),
             _ => None,
+        }
+    }
+
+    /// Record when the not-streamed run waited on was first seen over.
+    fn set_over_since(&mut self, at: Option<Instant>) {
+        if let Follow::Waiting { over_since, .. } = &mut self.state {
+            *over_since = at;
         }
     }
 

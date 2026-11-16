@@ -263,7 +263,7 @@ fn session_lookup(dir: &Path, home: &Path, addr: &str) -> anyhow::Result<Session
     // is going on, and has written nothing unless a record came after.
     let mut started: Option<u64> = None;
     // Set by a start on a driver that does not stream its log; cleared by
-    // the run's first byte (its `RunLog` record) or its end. A `RunLog`
+    // the run's first byte (its `RunLog` record) or its `ResultEnd`. A `RunLog`
     // stamped at or after the start clears it whichever is written first:
     // the two come from different writers, so file order is not run order.
     let mut not_streamed: Option<u64> = None;
@@ -274,6 +274,14 @@ fn session_lookup(dir: &Path, home: &Path, addr: &str) -> anyhow::Result<Session
             {
                 newest = Some((rec.at_unix_ms, *run));
                 ended = false;
+                not_streamed = None;
+            }
+            // A run that does not stream is over for a reader once its
+            // result is: its log is stored by then (the cache entry, the
+            // failure slot), or never will be (cancelled, `cache = false`),
+            // and a follower waiting on it can end. Its `ExecuteEnd` comes
+            // before the store, so it cannot say that.
+            (Some(BuildEventKind::ResultEnd { addr: a, .. }), _) if a == addr => {
                 not_streamed = None;
             }
             (
@@ -293,7 +301,6 @@ fn session_lookup(dir: &Path, home: &Path, addr: &str) -> anyhow::Result<Session
             (Some(BuildEventKind::ExecuteEnd { addr: a, .. }), _) if a == addr => {
                 ended = true;
                 started = None;
-                not_streamed = None;
             }
             _ => {}
         }
@@ -624,6 +631,23 @@ mod tests {
                 admitted: None,
                 output_groups: Vec::new(),
                 log_not_streamed,
+            }),
+            session: None,
+        }
+    }
+
+    fn result_end(at: u64, addr: &str) -> SessionRecord {
+        SessionRecord {
+            at_unix_ms: at,
+            kind: Some(BuildEventKind::ResultEnd {
+                addr: addr.into(),
+                error: None,
+                upstream_of: None,
+                exit_status: None,
+                log_tail: None,
+                timed_out: None,
+                cancelled: false,
+                left_behind: None,
             }),
             session: None,
         }
@@ -996,11 +1020,15 @@ mod tests {
             session_run_log(&dir, &home, ADDR).expect("read"),
             Some(SessionRunLog::Live { at_unix_ms: 42, .. })
         ));
-        // A start without a byte, then its end: not NotStreamed any more.
+        // A start without a byte, then its execute's end: still NotStreamed,
+        // since its log is stored only after that.
         append(
             &dir,
             &[execute_start(50, ADDR, true), execute_end(51, ADDR)],
         );
+        assert_eq!(not_streamed(lookup()), Some((id, 50)));
+        // Its result's end: not NotStreamed any more.
+        append(&dir, &[result_end(52, ADDR)]);
         assert!(not_streamed(lookup()).is_none());
         // A streaming start says nothing either.
         append(&dir, &[execute_start(60, ADDR, false)]);
@@ -1028,6 +1056,11 @@ mod tests {
         assert!(matches!(attached(), Some(LocatedRunLog::Live { .. })));
         drop(feed.route(execute_start(72, ADDR, true)));
         drop(feed.route(execute_end(73, ADDR)));
+        assert!(matches!(
+            attached(),
+            Some(LocatedRunLog::NotStreamed { at_unix_ms: 72, .. })
+        ));
+        drop(feed.route(result_end(74, ADDR)));
         assert!(matches!(attached(), Some(LocatedRunLog::Ended { .. })));
     }
 

@@ -53,7 +53,7 @@ struct FeedState {
     started: std::collections::HashMap<String, u64>,
     /// Addrs running on a driver that does not stream its log, with their
     /// `ExecuteStart`'s time, until the run's first byte (its `RunLog`) or
-    /// its `ExecuteEnd`: `run_logs.rs`'s rule, off the same stream.
+    /// its `ResultEnd`: `run_logs.rs`'s rule, off the same stream.
     not_streamed: std::collections::HashMap<String, u64>,
 }
 
@@ -112,10 +112,14 @@ impl SessionFeed {
                 BuildEventKind::ExecuteEnd { addr, .. } => {
                     let mut s = self.lock();
                     s.started.remove(addr);
-                    s.not_streamed.remove(addr);
                     if let Some(run) = s.run_logs.get_mut(addr) {
                         run.ended = true;
                     }
+                }
+                // Not streamed: over for a reader once its result is
+                // (`run_logs.rs`'s rule).
+                BuildEventKind::ResultEnd { addr, .. } => {
+                    self.lock().not_streamed.remove(addr);
                 }
                 _ => {}
             }

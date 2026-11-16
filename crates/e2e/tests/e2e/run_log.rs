@@ -398,6 +398,102 @@ async fn a_silent_driver_reads_not_streamed_until_its_log_is_imported() -> anyho
     Ok(())
 }
 
+/// A follow (`heph log -f`) waiting on a run that does not stream its log
+/// ends when that run is cancelled, storing nothing, as a streamed run's
+/// follow does; it does not wait on forever for a log that never comes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_follow_of_a_cancelled_silent_run_ends() -> anyhow::Result<()> {
+    use heph::engine::{FollowStep, LogOptions};
+    use heph::tui::session::{HeaderKind, SessionHeader, SessionRunLogLocator, SessionSlot};
+    let outside = tempfile::tempdir()?;
+    let gate = tempfile::tempdir()?;
+    let gate = gate.path().join("gate");
+    let user = tempfile::tempdir()?;
+    let ws = returns_log_workspace(outside.path())?;
+    ws.write_build_file(
+        "app",
+        &format!(
+            r#"target(name = "raw_silent", driver = "silent", out = "o.txt",
+       run = ["while [ ! -e {} ]; do sleep 0.02; done", "printf ok > o.txt"])
+"#,
+            gate.display()
+        ),
+    );
+    let slot = Arc::new(SessionSlot::new());
+    let root = heph::tui::session::SessionRoot::from_env(None, Some(user.path().as_os_str()));
+    let sessions = root.clone().expect("root").expect("recording on");
+    slot.configure(root, vec!["heph".into()]);
+    slot.set_workspace(ws.dir.path(), ws.dir.path(), &ws.engine.home);
+    let opened = slot
+        .open(
+            SessionHeader {
+                kind: HeaderKind::Build,
+                label: "run".into(),
+            },
+            false,
+        )
+        .expect("a session opened");
+    let located = LogOptions {
+        locator: Some(Arc::new(SessionRunLogLocator::new(sessions))),
+        ..LogOptions::default()
+    };
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let rs = ws.engine.new_state_with_events(false, Some(tx));
+    let ctoken = rs.ctoken().clone();
+    let tap = opened.tap.clone();
+    let forward = tokio::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            tap.event(ev);
+        }
+    });
+    let addr = parse_addr("//app:raw_silent")?;
+    let run = tokio::spawn({
+        let engine = Arc::clone(&ws.engine);
+        let addr = addr.clone();
+        async move {
+            Arc::clone(&engine)
+                .result_addr(rs, &addr, OutputMatcher::All, &ResultOptions::default())
+                .await
+                .map(drop)
+        }
+    });
+
+    let reader = Arc::new(Engine::new(heph::engine::Config::for_tests(
+        ws.dir.path().to_path_buf(),
+    ))?);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut follower = loop {
+        if let Some(f) = reader.follow_log(&addr, &located, false).await?
+            && f.not_streamed().is_some()
+        {
+            break f;
+        }
+        assert!(std::time::Instant::now() < deadline, "never NotStreamed");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    };
+
+    ctoken.cancel();
+    assert!(run.await?.is_err(), "the run was cancelled");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match follower.poll()? {
+            FollowStep::Bytes(b) => panic!("a cancelled run stored no log: {b:?}"),
+            FollowStep::Idle => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the follow of a cancelled run never ended"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            FollowStep::End => break,
+        }
+    }
+    assert!(follower.not_streamed().is_none());
+    slot.finish(Some(1));
+    drop(forward);
+    Ok(())
+}
+
 /// A follower of a run that streams and then returns a longer log of its own,
 /// which is imported, reads what it streamed. The follower sees one log
 /// whole, the streamed one or the imported one, never the streamed bytes
