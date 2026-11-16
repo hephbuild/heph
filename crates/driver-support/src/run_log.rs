@@ -904,6 +904,115 @@ mod tests {
         assert_eq!(sink.text(), file);
     }
 
+    /// A writer that refuses every write.
+    struct Refusing;
+
+    impl tokio::io::AsyncWrite for Refusing {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Err(std::io::Error::other("writer gone")))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A script of raw byte chunks, for output that is not UTF-8.
+    fn raw(items: &[(StreamId, &[u8])]) -> Script {
+        Script {
+            items: items.iter().map(|(s, b)| Ok((*s, b.to_vec()))).collect(),
+            hang: false,
+        }
+    }
+
+    /// A writer that refuses output does not fail the run: the own file still
+    /// gets every byte, the other stream's writer still gets its own, and a
+    /// last line with no trailing newline is kept as it came.
+    #[tokio::test]
+    async fn a_refusing_writer_fails_nothing_and_the_own_file_is_whole() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("log.txt");
+        let out_w = Shared::default();
+        let (mut o, mut refusing) = (out_w.clone(), Refusing);
+        let mut log = RunLog::own_file(Some(&mut o), Some(&mut refusing), path.clone(), None);
+        let script = Script::new(
+            [
+                Ok((StreamId::Stderr, "a\n")),
+                Ok((StreamId::Stdout, "b\n")),
+                Ok((StreamId::Stderr, "c")),
+            ],
+            false,
+        );
+        let ctoken = StdCancellationToken::new();
+        let (res, _, seen) =
+            drive_scripted(&mut log, script, Streams::BOTH, exited(0), &ctoken).await;
+        assert!(res.expect("drive").expect("wait").success());
+        assert_eq!(seen, "a\nb\nc");
+        log.write(StreamId::Stderr, b"d").await;
+        drop(log);
+        assert_eq!(std::fs::read_to_string(&path).expect("log"), "a\nb\ncd");
+        assert_eq!(out_w.text(), "b\n");
+    }
+
+    /// Bytes reach the log as the child wrote them: invalid UTF-8 untouched,
+    /// and a multibyte character split across reads rejoined, on the scrubbed
+    /// own-file path as under `log_capture`.
+    #[tokio::test]
+    async fn non_utf8_and_split_multibyte_output_reach_the_log_unchanged() {
+        let chunks: [(StreamId, &[u8]); 3] = [
+            (StreamId::Stderr, b"\xff\xfe bad\n"),
+            (StreamId::Stderr, b"caf\xc3"),
+            (StreamId::Stderr, b"\xa9\n"),
+        ];
+        let want: &[u8] = b"\xff\xfe bad\ncaf\xc3\xa9\n";
+        let ctoken = StdCancellationToken::new();
+
+        let sink = Shared::default();
+        let mut s = sink.clone();
+        let mut log = RunLog::captured(None, Some(&mut s));
+        let (res, _, _) =
+            drive_scripted(&mut log, raw(&chunks), Streams::BOTH, exited(0), &ctoken).await;
+        assert!(res.expect("drive").expect("wait").success());
+        drop(log);
+        assert_eq!(sink.0.lock().expect("lock").as_slice(), want);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("log.txt");
+        let needles = Needles::new(["a-secret-that-never-appears"]);
+        let mut log = RunLog::own_file(None, None, path.clone(), needles);
+        let (res, _, _) =
+            drive_scripted(&mut log, raw(&chunks), Streams::BOTH, exited(0), &ctoken).await;
+        assert!(res.expect("drive").expect("wait").success());
+        drop(log);
+        assert_eq!(std::fs::read(&path).expect("log"), want);
+    }
+
+    /// A child that prints nothing leaves an empty log and an untouched
+    /// writer; an empty write is no write.
+    #[tokio::test]
+    async fn empty_output_writes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("log.txt");
+        let sink = Shared::default();
+        let mut s = sink.clone();
+        let mut log = RunLog::own_file(None, Some(&mut s), path.clone(), None);
+        let ctoken = StdCancellationToken::new();
+        let (res, _, seen) =
+            drive_scripted(&mut log, raw(&[]), Streams::BOTH, exited(0), &ctoken).await;
+        assert!(res.expect("drive").expect("wait").success());
+        assert_eq!(seen, "");
+        log.write(StreamId::Stderr, b"").await;
+        drop(log);
+        assert_eq!(std::fs::read(&path).expect("log"), b"");
+        assert_eq!(sink.text(), "");
+    }
+
     /// Under `log_capture` the plugin does not scrub: the engine's writers do,
     /// and the bytes reach them as written.
     #[tokio::test]
