@@ -674,13 +674,16 @@ fn runs_entries(engine: &Engine) -> std::collections::BTreeSet<std::ffi::OsStrin
 /// carries the last lines of its log: what the line backend prints live as
 /// the target fails. The run streams into the engine's live log, so the tail
 /// comes from the failure slot's copy, not from anything the driver returned.
+/// stdout and stderr are two pipes read independently, so the target pauses
+/// before its stderr line: without it the stderr read can overtake the
+/// unread stdout lines and land anywhere in the tail.
 #[tokio::test]
 async fn a_failed_run_result_end_carries_its_exit_and_log_tail() -> anyhow::Result<()> {
     let ws = tempfile::tempdir()?;
     std::fs::create_dir_all(ws.path().join("p"))?;
     std::fs::write(
         ws.path().join("p").join("BUILD"),
-        r#"target(name = "f", driver = "bash", out = "f.txt", run = "for i in $(seq 1 30); do echo line $i; done; echo to-stderr >&2; exit 3")"#,
+        r#"target(name = "f", driver = "bash", out = "f.txt", run = "for i in $(seq 1 30); do echo line $i; done; sleep 0.5; echo to-stderr >&2; exit 3")"#,
     )?;
     let engine = engine(ws.path())?;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
