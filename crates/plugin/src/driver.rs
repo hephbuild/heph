@@ -3117,6 +3117,11 @@ pub trait Driver: Send + Sync {
     /// against an ABI before `LOG_CAPTURE_SINCE`): it may still write there,
     /// or may write nothing until it returns its log. Diagnostics only (what a
     /// reader says while no byte has arrived); it never reaches a hash.
+    ///
+    /// The answer is declared (for a cdylib, derived from the ABI version it
+    /// reports), never observed: a driver that answers true and then ignores
+    /// `log_capture` is not detected, and reads as a silent streaming run
+    /// until it returns.
     fn streams_log(&self) -> bool {
         true
     }
