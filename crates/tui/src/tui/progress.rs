@@ -1783,8 +1783,8 @@ pub struct TuiProgressView {
     /// The approval view, over whichever screen opened it (the line, the
     /// dashboard or a target screen); closing it returns there.
     approval: Option<crate::tui::dashboard::approval::ApprovalScreen>,
-    /// Where the approval view reads notices: heph's home's
-    /// content-addressed store ([`Self::with_notice_home`]).
+    /// Where the approval view reads notices: the run's store
+    /// ([`Self::with_notices`]).
     notices: Option<crate::tui::dashboard::approval::NoticeStore>,
     /// Whether the approval glyph flashes (`✦`/`❖`). Off under reduced
     /// motion, which is `NO_COLOR` alone: there is no config key for it.
@@ -1866,7 +1866,7 @@ fn recorded_queue(
         ns.into_iter()
             .map(|n| NoticeRef {
                 name: n.name,
-                hash: n.hash,
+                sources: n.sources,
             })
             .collect()
     };
@@ -1949,10 +1949,18 @@ impl TuiProgressView {
         }
     }
 
-    /// Read the approval view's notices from heph's home, `home`, by their
-    /// content hash. Without it every notice reads "notice unavailable".
-    pub fn with_notice_home(mut self, home: impl Into<std::path::PathBuf>) -> Self {
-        self.notices = Some(crate::tui::dashboard::approval::NoticeStore::new(home));
+    /// Read the approval view's notices from the store under `roots` (heph's
+    /// home and the workspace root) through `read`, the engine's capped
+    /// `read_notice_from_store`. Without it every notice reads "notice
+    /// unavailable".
+    pub fn with_notices(
+        mut self,
+        roots: hcore::approval_notice::NoticeRoots,
+        read: hcore::approval_notice::ReadNotice,
+    ) -> Self {
+        self.notices = Some(crate::tui::dashboard::approval::NoticeStore::new(
+            roots, read,
+        ));
         self
     }
 
@@ -1962,7 +1970,7 @@ impl TuiProgressView {
     }
 
     /// The pending requests, oldest first: a live view's queue; a viewer's
-    /// as the run last recorded it, by number and notice hash (it reads, and
+    /// as the run last recorded it, by number and notice sources (it reads, and
     /// decides nothing).
     fn approval_queue(&self) -> Vec<crate::tui::approval::QueuedApproval> {
         match &self.role {

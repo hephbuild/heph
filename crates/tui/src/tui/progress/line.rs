@@ -756,9 +756,15 @@ mod tests {
             "//p:gate".into(),
             vec![ApprovalNoticeView {
                 name: "plan".into(),
-                content: "drop the table".into(),
-                path: format!("{HOME}/approval/notices/plan.txt"),
-                hash: hcore::approval_notice::notice_hash(b"drop the table"),
+                sources: vec![hcore::approval_notice::NoticeSource {
+                    addr: "//p:plan".into(),
+                    origin: hcore::approval_notice::NoticeOrigin::File {
+                        path: format!("{HOME}/plan.txt"),
+                        out_path: "plan.txt".into(),
+                        x: false,
+                        hashout: "0f0f".into(),
+                    },
+                }],
             }],
         );
         let second = center.request(&build, "//p:next".into(), Vec::new());

@@ -178,9 +178,10 @@ enum Readers {
     Engine {
         tails: Arc<crate::commands::log::EngineTails>,
         target: Arc<crate::commands::log::EngineTargetReader>,
-        /// The run's home, as this terminal resolves it too: the approval
-        /// view reads notices from its store by content hash (read-only).
-        home: std::path::PathBuf,
+        /// The run's home, as this terminal resolves it too, and its
+        /// workspace root: the approval view reads notices from the store
+        /// under them by the sources the session recorded (read-only).
+        notices: hcore::approval_notice::NoticeRoots,
     },
     /// No engine reads that home from here: why, in the tabs' words.
     Unavailable(String),
@@ -225,7 +226,10 @@ impl Readers {
                     .with_locator(Arc::new(locator)),
             ),
             target: Arc::new(crate::commands::log::EngineTargetReader::new(engine, rt)),
-            home: resolved,
+            notices: hcore::approval_notice::NoticeRoots {
+                home: resolved,
+                root: std::path::PathBuf::from(root),
+            },
         }
     }
 }
@@ -377,11 +381,14 @@ impl App for AttachApp {
             Some(Readers::Engine {
                 tails,
                 target,
-                home,
+                notices,
             }) => view
                 .with_log_reader(Arc::clone(tails) as _)
                 .with_target_reader(Arc::clone(target) as _)
-                .with_notice_home(home),
+                .with_notices(
+                    notices.clone(),
+                    crate::engine::approval::read_notice_from_store,
+                ),
             Some(Readers::Unavailable(why)) => {
                 view.with_target_reader(Arc::new(NotAttached(why.clone())))
             }

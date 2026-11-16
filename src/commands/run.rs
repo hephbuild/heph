@@ -706,7 +706,13 @@ impl App for RunApp {
             label: self.label.clone(),
         }))
         .with_approval(self.approval.clone())
-        .with_notice_home(self.engine.home.as_ref())
+        .with_notices(
+            hcore::approval_notice::NoticeRoots {
+                home: self.engine.home.to_path_buf(),
+                root: self.engine.root().to_path_buf(),
+            },
+            crate::engine::approval::read_notice_from_store,
+        )
         .with_redact(tui::text::Redact::heph_home(&self.engine.home))
         .with_log_reader(Arc::new(crate::commands::log::EngineTails::new(
             Arc::clone(&self.engine),

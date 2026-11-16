@@ -5,15 +5,17 @@
 //! decision. Every decision key is locked out for [`LOCKOUT_MS`] after a
 //! request first appears on screen, and a press then is dropped, not queued.
 //!
-//! A notice is read by its content hash ([`NoticeStore`]) on a thread of its
-//! own, never on the render task, and drawn sanitized (I13) with heph's home
-//! redacted (I9). A notice that cannot be read shows
-//! [`hcore::approval_notice::NOTICE_UNAVAILABLE`], never a path.
+//! A notice is read from the store by the sources recorded for it
+//! ([`NoticeStore`], the one capped reader every viewer uses) on a thread of
+//! its own, never on the render task, only once it is on screen, and drawn
+//! sanitized (I13) with heph's home redacted (I9). A notice that cannot be
+//! read shows [`hcore::approval_notice::NOTICE_UNAVAILABLE`], never a path.
 
 use std::collections::HashMap;
 use std::ops::Range;
-use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+
+use hcore::approval_notice::{NoticeRoots, NoticeSource, ReadNotice};
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -49,21 +51,36 @@ const TABS_ROW: u16 = 2;
 /// Rows one wheel step moves.
 const WHEEL_ROWS: isize = 3;
 
-/// Where notices are read from: heph's home's content-addressed store.
-#[derive(Debug, Clone)]
+/// Where notices are read from: the run's store under `roots` (heph's home
+/// and the workspace root), through `read` — the engine's
+/// `read_notice_from_store`, which this crate cannot reach.
+#[derive(Clone)]
 pub struct NoticeStore {
-    home: PathBuf,
+    roots: NoticeRoots,
+    read: ReadNotice,
+}
+
+impl std::fmt::Debug for NoticeStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NoticeStore")
+            .field("roots", &self.roots)
+            .finish_non_exhaustive()
+    }
 }
 
 impl NoticeStore {
-    pub fn new(home: impl Into<PathBuf>) -> Self {
-        Self { home: home.into() }
+    pub fn new(roots: NoticeRoots, read: ReadNotice) -> Self {
+        Self { roots, read }
     }
 
-    /// The text stored under `hash`, checked against it; `None` when it is
-    /// gone, does not match or no hash was recorded. Blocking.
-    pub fn read(&self, hash: Option<&str>) -> Option<String> {
-        hcore::approval_notice::read_notice_blob(&self.home, hash)
+    /// The notice kept in `sources`, at most `NOTICE_READ_CAP` bytes plus the
+    /// truncation line; `None` when a source is not where it was recorded or
+    /// there is none. Blocking.
+    pub fn read(&self, sources: &[NoticeSource]) -> Option<String> {
+        if sources.is_empty() {
+            return None;
+        }
+        (self.read)(&self.roots, sources)
     }
 }
 
@@ -75,25 +92,33 @@ enum NoticeText {
     Lines(Vec<String>),
 }
 
-/// The notice reader's thread: a hash in, the drawable lines out.
+/// Which notice a text is: the request's number and target, and the
+/// notice's place among the request's notices.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct NoticeKey {
+    seq: u64,
+    addr: String,
+    index: usize,
+}
+
+/// The notice reader's thread: a notice's sources in, the drawable lines
+/// out.
 #[derive(Debug)]
 struct NoticeFeed {
-    ask: Sender<Option<String>>,
-    found: Receiver<(Option<String>, Option<Vec<String>>)>,
+    ask: Sender<(NoticeKey, Vec<NoticeSource>)>,
+    found: Receiver<(NoticeKey, Option<Vec<String>>)>,
 }
 
 impl NoticeFeed {
     fn spawn(store: NoticeStore, redact: Redact) -> Option<Self> {
-        let (ask, todo) = mpsc::channel::<Option<String>>();
+        let (ask, todo) = mpsc::channel::<(NoticeKey, Vec<NoticeSource>)>();
         let (send, found) = mpsc::channel();
         std::thread::Builder::new()
             .name("heph-notice".into())
             .spawn(move || {
-                while let Ok(hash) = todo.recv() {
-                    let lines = store
-                        .read(hash.as_deref())
-                        .map(|text| drawable(&text, &redact));
-                    if send.send((hash, lines)).is_err() {
+                while let Ok((key, sources)) = todo.recv() {
+                    let lines = store.read(&sources).map(|text| drawable(&text, &redact));
+                    if send.send((key, lines)).is_err() {
                         break;
                     }
                 }
@@ -174,7 +199,7 @@ pub struct ApprovalScreen {
     /// The notices drawn, by index: what a `y`/`n` line says was read.
     read: Vec<bool>,
     flash: Option<Flash>,
-    texts: HashMap<Option<String>, NoticeText>,
+    texts: HashMap<NoticeKey, NoticeText>,
     feed: Option<NoticeFeed>,
     /// The current notice wrapped at a width: `(cols, notice, rows)`.
     wrapped: Option<(usize, usize, Vec<String>)>,
@@ -292,12 +317,21 @@ impl ApprovalScreen {
         self.read = vec![false; self.req.notices.len()];
         self.wrapped = None;
         // Notices of requests no longer queued are not read again.
-        let keep: Vec<Option<String>> = queue
-            .iter()
-            .flat_map(|q| q.notices.iter().map(|n| n.hash.clone()))
-            .collect();
-        self.texts.retain(|h, _| keep.contains(h));
+        self.texts.retain(|k, _| {
+            queue
+                .iter()
+                .any(|q| q.seq == k.seq && q.addr == k.addr && k.index < q.notices.len())
+        });
         true
+    }
+
+    /// The key of the notice on screen, `None` when the request has none.
+    fn notice_key(&self) -> Option<NoticeKey> {
+        (self.notice < self.req.notices.len()).then(|| NoticeKey {
+            seq: self.req.seq,
+            addr: self.req.addr.clone(),
+            index: self.notice,
+        })
     }
 
     /// ←/→ (and tab): the next or previous notice. The lockout runs on.
@@ -353,9 +387,9 @@ impl ApprovalScreen {
         if let Some(feed) = &self.feed {
             loop {
                 match feed.found.try_recv() {
-                    Ok((hash, lines)) => {
+                    Ok((key, lines)) => {
                         let text = lines.map_or(NoticeText::Unavailable, NoticeText::Lines);
-                        self.texts.insert(hash, text);
+                        self.texts.insert(key, text);
                     }
                     Err(TryRecvError::Empty) => break,
                     // The thread is gone: what it was reading never comes.
@@ -371,33 +405,34 @@ impl ApprovalScreen {
                 }
             }
         }
-        let Some(hash) = self.req.notices.get(self.notice).map(|n| n.hash.clone()) else {
+        let (Some(key), Some(n)) = (self.notice_key(), self.req.notices.get(self.notice)) else {
             return;
         };
-        if self.texts.contains_key(&hash) {
+        if self.texts.contains_key(&key) {
             return;
         }
-        let asked = hash.is_some()
+        // A notice that names no source is unavailable without asking.
+        let asked = !n.sources.is_empty()
             && self
                 .feed
                 .as_ref()
-                .is_some_and(|f| f.ask.send(hash.clone()).is_ok());
+                .is_some_and(|f| f.ask.send((key.clone(), n.sources.clone())).is_ok());
         let text = if asked {
             NoticeText::Reading
         } else {
             NoticeText::Unavailable
         };
-        self.texts.insert(hash, text);
+        self.texts.insert(key, text);
     }
 
     /// The body: the current notice wrapped to `cols`, or why it is not
     /// there.
     fn body(&mut self, cols: usize) -> Vec<Line<'static>> {
         let dim = Style::default().fg(Color::DarkGray);
-        let Some(n) = self.req.notices.get(self.notice) else {
+        let Some(key) = self.notice_key() else {
             return vec![Line::styled("  this target declares no notice", dim)];
         };
-        match self.texts.get(&n.hash) {
+        match self.texts.get(&key) {
             None | Some(NoticeText::Reading) => vec![Line::styled("  reading the notice…", dim)],
             Some(NoticeText::Unavailable) => vec![Line::styled(
                 format!("  {}", hcore::approval_notice::NOTICE_UNAVAILABLE),
@@ -573,5 +608,74 @@ impl ApprovalScreen {
             spans.push(Span::styled(rest, Style::default().fg(Color::DarkGray)));
         }
         Line::from(spans)
+    }
+}
+
+/// A store as the tests keep one, in place of the engine's reader, which
+/// this crate cannot reach: each source a file under the workspace root,
+/// read only while it still hashes to the `hashout` recorded for it.
+#[cfg(test)]
+pub(crate) mod test_store {
+    use std::hash::{Hash as _, Hasher as _};
+    use std::path::{Path, PathBuf};
+
+    use hcore::approval_notice::{NoticeOrigin, NoticeRoots, NoticeSource};
+
+    use crate::tui::approval::ApprovalNoticeView;
+
+    fn digest(text: &str) -> String {
+        let mut h = std::hash::DefaultHasher::new();
+        text.hash(&mut h);
+        format!("{:016x}", h.finish())
+    }
+
+    /// The reader: every source's file, concatenated; `None` when one is
+    /// missing or changed. Matches [`hcore::approval_notice::ReadNotice`].
+    pub fn read(roots: &NoticeRoots, sources: &[NoticeSource]) -> Option<String> {
+        let mut text = String::new();
+        for s in sources {
+            let NoticeOrigin::File { path, hashout, .. } = &s.origin else {
+                return None;
+            };
+            let body = std::fs::read_to_string(roots.root.join(path)).ok()?;
+            if digest(&body) != *hashout {
+                return None;
+            }
+            text.push_str(&body);
+        }
+        Some(text)
+    }
+
+    /// The roots of a run whose home and workspace are both `dir`.
+    pub fn roots(dir: &Path) -> NoticeRoots {
+        NoticeRoots {
+            home: dir.to_path_buf(),
+            root: dir.to_path_buf(),
+        }
+    }
+
+    /// Where [`kept`] keeps notice `name` under `dir`, to remove or rewrite.
+    pub fn file(dir: &Path, name: &str) -> PathBuf {
+        dir.join("store").join(name)
+    }
+
+    /// Notice `name`, its text `content` kept in the store under `dir`.
+    pub fn kept(dir: &Path, name: &str, content: &str) -> ApprovalNoticeView {
+        let path = file(dir, name);
+        std::fs::create_dir_all(dir.join("store")).expect("store dir");
+        std::fs::write(&path, content).expect("notice source");
+        let rel = format!("store/{name}");
+        ApprovalNoticeView {
+            name: name.into(),
+            sources: vec![NoticeSource {
+                addr: format!("//n:{name}"),
+                origin: NoticeOrigin::File {
+                    path: rel.clone(),
+                    out_path: rel,
+                    x: false,
+                    hashout: digest(content),
+                },
+            }],
+        }
     }
 }

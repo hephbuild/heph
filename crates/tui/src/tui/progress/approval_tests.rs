@@ -13,7 +13,7 @@ use super::test_events::{T0, at, start};
 use crate::tui::app::{Decide, TUIAppView};
 use crate::tui::approval::{ApprovalCenter, ApprovalNoticeView, ApprovalTicket};
 use crate::tui::dashboard::Tab;
-use crate::tui::dashboard::approval::{FLASH_HINT, FLASH_MS, LOCKOUT_MS};
+use crate::tui::dashboard::approval::{FLASH_HINT, FLASH_MS, LOCKOUT_MS, test_store};
 use crate::tui::session::ApprovalStanding;
 
 const COLS: u16 = 120;
@@ -47,16 +47,14 @@ fn pending(t: &mut ApprovalTicket) -> bool {
     matches!(t.rx.try_recv(), Err(TryRecvError::Empty))
 }
 
-/// A notice stored by content under `home`, as the engine stores it at
-/// gate time; its `path` names the home, which no screen may show.
+/// A notice kept in the store under `home`.
 fn notice(home: &Path, name: &str, content: &str) -> ApprovalNoticeView {
-    let hash = hcore::approval_notice::write_notice_blob(home, content).expect("notice blob");
-    ApprovalNoticeView {
-        name: name.into(),
-        content: content.into(),
-        path: home.join("approval").join(name).display().to_string(),
-        hash,
-    }
+    test_store::kept(home, name, content)
+}
+
+/// A view reading its notices from the store under `home`.
+fn with_store(v: TuiProgressView, home: &Path) -> TuiProgressView {
+    v.with_notices(test_store::roots(home), test_store::read)
 }
 
 /// Frames at `now` until the notice reader has answered (it reads on a
@@ -135,7 +133,7 @@ fn approve_armed_after_delay() {
             notice(home.path(), "changelog", "the changes"),
         ],
     );
-    let mut v = view(&center).with_notice_home(home.path());
+    let mut v = with_store(view(&center), home.path());
     assert!(v.approval_open());
     drop(frame(&mut v, T0));
     v.approval_decide(Decide::Approve, T0 + LOCKOUT_MS);
@@ -375,7 +373,7 @@ fn control_bytes_never_reach_terminal_notice() {
             "//p:gate".into(),
             vec![notice(home.path(), "plan", &content)],
         );
-        let mut v = view(&center).with_notice_home(home.path());
+        let mut v = with_store(view(&center), home.path());
         assert!(v.approval_open());
         let lines = settled(&mut v, T0, cols, ROWS);
         for line in &lines {
@@ -397,7 +395,7 @@ fn control_bytes_never_reach_terminal_notice() {
 }
 
 /// I9 on the approval view: a notice naming heph's home shows it redacted,
-/// a notice whose blob is gone reads "notice unavailable", and neither the
+/// a notice whose source is gone reads "notice unavailable", and neither the
 /// view, the prompt row nor the line ever shows a notice's path.
 #[test]
 fn no_home_path_on_any_screen_approval_view() {
@@ -406,15 +404,14 @@ fn no_home_path_on_any_screen_approval_view() {
     let center = ApprovalCenter::new();
     let build = center.build();
     let text = format!("writes {home_str}/cache/out and nothing else");
-    let mut gone = notice(home.path(), "changelog", "deleted below");
-    gone.hash = hcore::approval_notice::notice_hash(b"never stored");
+    let gone = notice(home.path(), "changelog", "deleted below");
+    std::fs::remove_file(test_store::file(home.path(), "changelog")).expect("remove a source");
     let _t = center.request(
         &build,
         "//p:gate".into(),
         vec![notice(home.path(), "plan", &text), gone],
     );
-    let mut v = view(&center)
-        .with_notice_home(home.path())
+    let mut v = with_store(view(&center), home.path())
         .with_redact(crate::tui::text::Redact::heph_home(home.path()));
     let line = texts(&v.render("⠋", T0, COLS, 2)).join("\n");
     assert!(!line.contains(&home_str), "{line}");

@@ -1454,9 +1454,10 @@ async fn detach_listener_is_armed_before_its_task_runs() {
 /// Attach's own wiring of the approval view: a recorded session with a
 /// pending request, followed from its directory into the viewer's feed, and
 /// the viewer built as `attach` builds it. With the run's home recorded, the
-/// view reads the notice from that home's store by the hash the session
-/// recorded; with another home recorded, the readers are unavailable and
-/// the notice reads "notice unavailable", never its text.
+/// view reads the notice from the run's store (here a workspace source file)
+/// by the sources the session recorded, through the engine's reader; with
+/// another home recorded, the readers are unavailable and the notice reads
+/// "notice unavailable", never its text.
 #[tokio::test(flavor = "multi_thread")]
 async fn attach_reads_a_pending_notice_from_the_run_home() {
     use crate::tui::session::{ApprovalPrompt, ApprovalPromptNotice, FileSource};
@@ -1468,7 +1469,19 @@ async fn attach_reads_a_pending_notice_from_the_run_home() {
     let global = crate::commands::GlobalOptions::default();
     let (_engine, home) =
         crate::commands::bootstrap::new_reader_engine(&global, ws.path()).expect("reader engine");
-    let hash = hcore::approval_notice::write_notice_blob(&home, NOTICE).expect("notice blob");
+    std::fs::write(ws.path().join("PLAN"), NOTICE).expect("write the notice source");
+    let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+    hasher.update(NOTICE.as_bytes());
+    hasher.update(&[0]);
+    let sources = vec![hcore::approval_notice::NoticeSource {
+        addr: "//a:plan".to_owned(),
+        origin: hcore::approval_notice::NoticeOrigin::File {
+            path: "PLAN".to_owned(),
+            out_path: "PLAN".to_owned(),
+            x: false,
+            hashout: format!("{:x}", hasher.digest()),
+        },
+    }];
     let elsewhere = tempfile::tempdir().expect("tempdir");
     let sessions = tempfile::tempdir().expect("tempdir");
 
@@ -1486,8 +1499,7 @@ async fn attach_reads_a_pending_notice_from_the_run_home() {
             queued_behind: 0,
             notices: vec![ApprovalPromptNotice {
                 name: "plan".to_owned(),
-                path: String::new(),
-                hash: Some(hash.clone()),
+                sources: sources.clone(),
             }],
             queue: Vec::new(),
         };

@@ -17,6 +17,7 @@ use super::recorder::ViewTap;
 use super::*;
 use crate::tui::app::{Decide, TUIAppView};
 use crate::tui::approval::{ApprovalCenter, ApprovalNoticeView};
+use crate::tui::dashboard::approval::test_store;
 use crate::tui::progress::{
     BuildHeader, BuildState, CountScope, HeaderItem, ProgressHeader, TuiProgressView,
 };
@@ -449,7 +450,6 @@ fn attached_frames_match_live() {
         "//a:gate".into(),
         vec![ApprovalNoticeView {
             name: "plan".into(),
-            content: "drop the table".into(),
             sources: Vec::new(),
         }],
     );
@@ -727,55 +727,40 @@ fn record_prompt(feed: &SessionFeed, prompt: Option<ApprovalPrompt>) {
     assert!(matches!(routed, Routed::Nothing), "{routed:?}");
 }
 
-/// A notice stored in `home` by its content hash, as the gate stores it;
-/// its legacy file path under `home` too, which no screen may show.
+/// A notice kept in the store under `home`.
 fn stored(home: &Path, name: &str, content: &str) -> ApprovalNoticeView {
-    ApprovalNoticeView {
-        name: name.into(),
-        content: content.into(),
-        path: home.join("approval").join(name).display().to_string(),
-        hash: hcore::approval_notice::write_notice_blob(home, content).expect("notice blob"),
-    }
-}
-
-/// Where `stored` put a notice's blob, to remove or rewrite it.
-fn blob(home: &Path, n: &ApprovalNoticeView) -> std::path::PathBuf {
-    home.join("approval").join("notices").join(&n.hash)
+    test_store::kept(home, name, content)
 }
 
 /// A viewer of a session whose notices are in `home`'s store.
 fn viewer(feed: &SessionFeed, home: Option<&Path>) -> TuiProgressView {
     let view = TuiProgressView::new("run").attached(SessionId::new(BASE, 7), feed.clone(), || {});
     match home {
-        Some(home) => view.with_notice_home(home),
+        Some(home) => view.with_notices(test_store::roots(home), test_store::read),
         None => view,
     }
 }
 
-/// No row names heph's home or a notice's file.
+/// No row names heph's home or a notice's source.
 fn assert_no_path(frame: &[String], home: &Path) {
     let joined = frame.join("\n");
     let home = home.display().to_string();
     assert!(
-        !joined.contains(&home) && !joined.contains("approval/"),
+        !joined.contains(&home) && !joined.contains("store/"),
         "a path on screen:\n{joined}"
     );
 }
 
 /// An attached viewer opens a pending request read-only and reads its
-/// notice from the run's store by the hash the session recorded, though the
-/// file the run wrote is gone; y/n/Y/N decide nothing and it stays pending,
-/// until the run's terminal decides it and the view closes.
+/// notice from the run's store by the sources the session recorded; y/n/Y/N
+/// decide nothing and it stays pending, until the run's terminal decides it
+/// and the view closes.
 #[test]
-fn attached_reads_notice_by_hash() {
+fn attached_reads_notice_from_the_store() {
     let home = tempfile::tempdir().expect("tempdir");
     let center = ApprovalCenter::new();
     let build = center.build();
     let plan = stored(home.path(), "plan", "drop the table");
-    assert!(
-        !Path::new(&plan.path).exists(),
-        "no notice file: only the store"
-    );
     let mut gate = center.request(&build, "//a:gate".into(), vec![plan]);
     let feed = SessionFeed::default();
     record_prompt(&feed, center.prompt());
@@ -831,9 +816,9 @@ fn attached_reads_notice_by_hash() {
 }
 
 /// The screen clause of `notice_unavailable_never_a_path`: a notice whose
-/// blob is gone, whose blob no longer matches its hash, one an older session
-/// recorded with no hash, and any notice of a viewer that does not read the
-/// run's home, each read "notice unavailable", and no path shows.
+/// source is gone, whose source no longer matches its hashout, one recorded
+/// with no source, and any notice of a viewer that does not read the run's
+/// store, each read "notice unavailable", and no path shows.
 #[test]
 fn notice_unavailable_never_a_path() {
     use crate::tui::session::{ApprovalPrompt, ApprovalPromptNotice};
@@ -843,8 +828,12 @@ fn notice_unavailable_never_a_path() {
     let plan = stored(home.path(), "plan", "the plan");
     let gone = stored(home.path(), "gone", "removed below");
     let tampered = stored(home.path(), "tampered", "rewritten below");
-    std::fs::remove_file(blob(home.path(), &gone)).expect("remove a blob");
-    std::fs::write(blob(home.path(), &tampered), "not what was hashed").expect("rewrite a blob");
+    std::fs::remove_file(test_store::file(home.path(), "gone")).expect("remove a source");
+    std::fs::write(
+        test_store::file(home.path(), "tampered"),
+        "not what was hashed",
+    )
+    .expect("rewrite a source");
     let gate = center.request(&build, "//a:gate".into(), vec![plan, gone, tampered]);
     let feed = SessionFeed::default();
     record_prompt(&feed, center.prompt());
@@ -868,8 +857,8 @@ fn notice_unavailable_never_a_path() {
     assert!(!frame.join("\n").contains("the plan"));
     assert_no_path(&frame, home.path());
 
-    // An older heph recorded the front request alone, with its notice's
-    // file and no hash: the view shows it, never that file.
+    // A front request recorded alone, its notice with no source: the view
+    // shows it as unavailable.
     drop(gate);
     record_prompt(
         &feed,
@@ -878,8 +867,7 @@ fn notice_unavailable_never_a_path() {
             queued_behind: 0,
             notices: vec![ApprovalPromptNotice {
                 name: "plan".into(),
-                path: home.path().join("approval/plan.txt").display().to_string(),
-                hash: None,
+                sources: Vec::new(),
             }],
             queue: Vec::new(),
         }),

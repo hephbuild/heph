@@ -33,17 +33,14 @@ use crate::tui::LogSink;
 
 pub use crate::tui::session::ApprovalStanding;
 
-/// One rendered notice for display: the input group name, its text, and the
-/// sources it was read from (`hcore::approval_notice`), which is what a
-/// session records for a viewer in another process to read it again.
+/// One notice of a request: the input group name and the sources its text is
+/// kept in (`hcore::approval_notice`). Never the text: the approval view
+/// reads it from the store when it is on screen, through the one capped
+/// reader every viewer uses, and a session records the same sources for a
+/// viewer in another process.
 #[derive(Clone, Debug)]
 pub struct ApprovalNoticeView {
     pub name: String,
-    /// The text as the handler read it from the store, through the same
-    /// capped reader every viewer uses (`engine::read_notice_from_store`):
-    /// at most `NOTICE_READ_CAP` bytes plus the truncation line, or
-    /// "notice unavailable". Never written anywhere.
-    pub content: String,
     pub sources: Vec<hcore::approval_notice::NoticeSource>,
 }
 
@@ -243,7 +240,7 @@ pub struct ApprovalView {
 }
 
 /// One pending request as a frame reads it: its number, target, notices by
-/// name and content hash, and how long it has waited.
+/// name and sources, and how long it has waited.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QueuedApproval {
     pub seq: u64,
@@ -252,12 +249,12 @@ pub struct QueuedApproval {
     pub waited: Duration,
 }
 
-/// A notice by name and the content hash it is stored under. `None`: no
-/// hash was recorded (an older session), so it reads "notice unavailable".
+/// A notice by name and the sources its text is kept in. None: it reads
+/// "notice unavailable".
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NoticeRef {
     pub name: String,
-    pub hash: Option<String>,
+    pub sources: Vec<hcore::approval_notice::NoticeSource>,
 }
 
 impl ApprovalCenter {
@@ -399,8 +396,8 @@ impl ApprovalCenter {
     }
 
     /// Every pending request, oldest first, without its notices' text: what
-    /// the approval view reads (it reads a notice by its hash, off the
-    /// render task).
+    /// the approval view reads (it reads a notice from the store by its
+    /// sources, off the render task).
     pub fn queue(&self) -> Vec<QueuedApproval> {
         let inner = self.lock_pruned();
         inner
@@ -414,7 +411,7 @@ impl ApprovalCenter {
                     .iter()
                     .map(|n| NoticeRef {
                         name: n.name.clone(),
-                        hash: Some(n.hash.clone()),
+                        sources: n.sources.clone(),
                     })
                     .collect(),
                 waited: p.queued.elapsed(),
@@ -428,7 +425,7 @@ impl ApprovalCenter {
     }
 
     /// The front request as a session records it, and every pending request
-    /// by number and notice hash (what an attached viewer's approval view
+    /// by number and notice sources (what an attached viewer's approval view
     /// reads): no notice content, no responder. `None` when idle, without
     /// allocating.
     pub fn prompt(&self) -> Option<crate::tui::session::ApprovalPrompt> {
@@ -458,8 +455,7 @@ impl ApprovalCenter {
                         .iter()
                         .map(|n| ApprovalPromptNotice {
                             name: n.name.clone(),
-                            path: String::new(),
-                            hash: Some(n.hash.clone()),
+                            sources: n.sources.clone(),
                         })
                         .collect(),
                 })
@@ -527,7 +523,6 @@ mod tests {
     fn notice(name: &str) -> ApprovalNoticeView {
         ApprovalNoticeView {
             name: name.to_string(),
-            content: format!("{name} body"),
             sources: Vec::new(),
         }
     }
