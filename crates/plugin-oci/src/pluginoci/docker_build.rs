@@ -1350,30 +1350,27 @@ pub(crate) async fn run_tool(
     // invokes for itself, not the target's command, so it does not inherit the
     // target's execution environment.
     let (spawned, _) = hexecrunner::spawn_io(RunnerRef::local(), spec, ctoken).await?;
-    let mut handle = spawned.map_err(|e| missing_tool_error(e, bin, what))?;
-    let output_reader = handle.take_output();
+    let handle = spawned.map_err(|e| missing_tool_error(e, bin, what))?;
 
     let mut out_tail = TailBuf::default();
     let mut err_tail = TailBuf::default();
     let mut captured = Vec::new();
 
-    let io_fut = io.pump(output_reader, streams, |stream, chunk| match stream {
-        proc_exec::StreamId::Stdout => {
-            out_tail.push(chunk);
-            captured.extend_from_slice(chunk);
-        }
-        proc_exec::StreamId::Stderr => err_tail.push(chunk),
-    });
+    // `drive` waits on its own task (the cancellation escalation, SIGINT →
+    // grace → SIGKILL, rides inside it) and bounds the drain once the child
+    // exits, so a helper buildx left holding the pipe cannot hold the run.
+    let wait_res = io
+        .drive(handle, streams, ctoken, |stream, chunk| match stream {
+            proc_exec::StreamId::Stdout => {
+                out_tail.push(chunk);
+                captured.extend_from_slice(chunk);
+            }
+            proc_exec::StreamId::Stderr => err_tail.push(chunk),
+        })
+        .await
+        .with_context(|| format!("run {what}"))?;
 
-    // The wait must not share a task with the reader: it parks its worker until
-    // the child exits, so the pipes would stop draining and a build that fills
-    // one would wedge forever. `spawn_wait` is the only public wait for exactly
-    // that reason, and it carries the cancellation escalation
-    // (SIGINT → grace → SIGKILL) inside the spawned task.
-    let wait_handle = handle.spawn_wait(ctoken.clone_arc());
-    let (wait_res, ()) = tokio::join!(wait_handle, io_fut);
-
-    let status = match wait_res.context("wait task for the child")? {
+    let status = match wait_res {
         Ok(s) => s,
         Err(e) if ctoken.is_cancelled() => {
             return Err(anyhow::Error::new(hplugin::error::CancelledError))

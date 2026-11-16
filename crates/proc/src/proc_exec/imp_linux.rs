@@ -69,6 +69,15 @@ impl OutputReader {
     /// nothing when its branch is dropped, so an abandoned `recv` can be
     /// retried without a gap in the stream.
     pub async fn recv(&mut self) -> io::Result<Option<(StreamId, Vec<u8>)>> {
+        self.recv_tagged().await.map_err(|(_, e)| e)
+    }
+
+    /// [`recv`](Self::recv), with a read error naming the stream it ended:
+    /// a caller for which one stream is data and the other log treats the
+    /// two differently. Same cancel-safety.
+    pub async fn recv_tagged(
+        &mut self,
+    ) -> Result<Option<(StreamId, Vec<u8>)>, (StreamId, io::Error)> {
         loop {
             let (id, res) = match (self.stdout.as_mut(), self.stderr.as_mut()) {
                 (None, None) => return Ok(None),
@@ -85,7 +94,7 @@ impl OutputReader {
                 Ok(None) => self.close(id),
                 Err(e) => {
                     self.close(id);
-                    return Err(e);
+                    return Err((id, e));
                 }
             }
         }

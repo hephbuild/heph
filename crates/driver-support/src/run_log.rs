@@ -21,10 +21,35 @@ use anyhow::Context as _;
 use hcore::hasync::Cancellable;
 use hplugin::driver::RunRequest;
 use hplugin::driver::outputartifact::OutputArtifact;
-use hproc::proc_exec::{OutputReader, StreamId};
+use hproc::proc_exec::{self, OutputReader, StreamId};
 use std::path::PathBuf;
+use std::process::ExitStatus;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt as _;
+
+/// A child's merged output, one chunk at a time, a read error naming its
+/// stream. [`OutputReader`] in a run; a scripted sequence in a test, since a
+/// pipe that fails to read or never reaches EOF cannot be had on demand.
+trait Chunks {
+    async fn next_chunk(&mut self) -> Result<Option<(StreamId, Vec<u8>)>, ReadError>;
+}
+
+/// A failed read, and the stream it ended.
+type ReadError = (StreamId, std::io::Error);
+
+impl Chunks for OutputReader {
+    async fn next_chunk(&mut self) -> Result<Option<(StreamId, Vec<u8>)>, ReadError> {
+        self.recv_tagged().await
+    }
+}
+
+/// One scrubber per stream, never shared: the held-back tail belongs to one
+/// byte sequence, and two streams through one buffer would splice. `None` under
+/// `log_capture`.
+struct Redactors {
+    out: Option<Redactor>,
+    err: Option<Redactor>,
+}
 
 /// The writer type `RunRequest` carries for `stdout` / `stderr`.
 pub type Writer<'io> = &'io mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin);
@@ -179,32 +204,130 @@ impl<'io> RunLog<'io> {
             .await;
     }
 
-    /// Copy a running child's output to the log as it arrives, in arrival order.
+    /// Wait for a spawned child while copying its output to the log as it
+    /// arrives, in arrival order, and return the wait's result.
     ///
     /// Only the streams in `streams` are written; every chunk of both streams,
     /// log or data, is first passed to `observe` unchanged (to keep a tail for an
-    /// error message, or to collect the data stream). Returns when both streams
-    /// have ended. A read error on one stream is warned and the other is still
-    /// read: stopping would truncate the log and SIGPIPE the child.
+    /// error message, or to collect the data stream).
     ///
-    /// The wait for the child must run on another task (`Handle::spawn_wait`),
-    /// joined with this future, or a child that fills a pipe never exits.
-    pub async fn pump(
+    /// The drain is bounded the way `proc_exec::output` bounds it, on both OSes:
+    /// once the child has exited, the streams get [`proc_exec::DRAIN_DEADLINE`]
+    /// more to reach EOF, after which they are abandoned with a warning — a
+    /// descendant that inherited the pipe (an ssh `ControlPersist` master, a
+    /// shell's background job) would otherwise hold the run open for as long as
+    /// it lives. A cancelled wait skips the drain altogether.
+    ///
+    /// A read error on a log stream is warned and the other stream is still
+    /// read (stopping would SIGPIPE the child). One on a data stream fails the
+    /// call: the caller's answer would be truncated, and a truncated answer
+    /// must never pass for a whole one.
+    ///
+    /// The outer error is a failed read of a data stream or a lost wait task;
+    /// the inner one is the wait's own (a cancellation among them), left for the
+    /// caller to describe.
+    pub async fn drive(
         &mut self,
-        reader: Option<OutputReader>,
+        mut handle: proc_exec::Handle,
         streams: Streams,
+        ctoken: &(dyn Cancellable + Send + Sync),
         mut observe: impl FnMut(StreamId, &[u8]),
+    ) -> anyhow::Result<std::io::Result<ExitStatus>> {
+        let reader = handle.take_output();
+        // The wait runs on its own task: it parks until the child exits, and a
+        // reader sharing its task would stop draining a pipe the child fills.
+        let wait = handle.spawn_wait(ctoken.clone_arc());
+        match reader {
+            Some(mut reader) => {
+                self.drive_chunks(&mut reader, wait, streams, ctoken, &mut observe)
+                    .await
+            }
+            None => wait.await.context("wait task for the child"),
+        }
+    }
+
+    /// [`drive`](Self::drive) over any chunk source and wait, so the drain's
+    /// bound and its error handling are testable without a real pipe.
+    async fn drive_chunks(
+        &mut self,
+        chunks: &mut impl Chunks,
+        wait: impl Future<Output = Result<std::io::Result<ExitStatus>, tokio::task::JoinError>>,
+        streams: Streams,
+        ctoken: &(dyn Cancellable + Send + Sync),
+        observe: &mut impl FnMut(StreamId, &[u8]),
+    ) -> anyhow::Result<std::io::Result<ExitStatus>> {
+        let mut reds = Redactors {
+            out: self.redactor(),
+            err: self.redactor(),
+        };
+        let mut data_error = None;
+        let (status, abandoned) = {
+            let pumped = self.pump_chunks(chunks, streams, observe, &mut reds, &mut data_error);
+            let mut pumped = std::pin::pin!(pumped);
+            let mut wait = std::pin::pin!(wait);
+            let mut drained = false;
+            let status = tokio::select! {
+                status = &mut wait => status,
+                () = &mut pumped => {
+                    drained = true;
+                    wait.await
+                }
+            };
+            // The child is reaped: anything it wrote is read or sitting in the
+            // pipe, so EOF is moments away unless a descendant holds the write
+            // end. The timer is armed only when the run was not cancelled, as in
+            // `proc_exec::output`, which keeps `tokio::time` off a cancelled
+            // run's teardown.
+            if !drained && !ctoken.is_cancelled() {
+                drained = tokio::time::timeout(proc_exec::DRAIN_DEADLINE, &mut pumped)
+                    .await
+                    .is_ok();
+            }
+            (status, !drained && !ctoken.is_cancelled())
+        };
+        if abandoned {
+            tracing::warn!(
+                deadline = ?proc_exec::DRAIN_DEADLINE,
+                "a process exited but its output pipe is still open; abandoning the drain \
+                 (a surviving descendant holds the write end)"
+            );
+        }
+        // The held-back tails, after the drain however it ended, or the last
+        // bytes of the output disappear.
+        self.flush(reds).await;
+        let status = status.context("wait task for the child")?;
+        if status.is_ok()
+            && let Some((stream, e)) = data_error
+        {
+            return Err(anyhow::Error::new(e))
+                .with_context(|| format!("reading the child's {stream}, which is its answer"));
+        }
+        Ok(status)
+    }
+
+    /// Copy chunks to the log until both streams end (see [`drive`](Self::drive)
+    /// for which are written and what a read error does). Records the first
+    /// data-stream read error in `data_error`. Leaves the redactors' held-back
+    /// tails for [`flush`](Self::flush), so a drain cut short still writes them.
+    async fn pump_chunks(
+        &mut self,
+        chunks: &mut impl Chunks,
+        streams: Streams,
+        observe: &mut impl FnMut(StreamId, &[u8]),
+        reds: &mut Redactors,
+        data_error: &mut Option<ReadError>,
     ) {
-        let Some(mut reader) = reader else { return };
-        // One redactor per stream, never shared: the held-back tail belongs to
-        // one byte sequence, and two streams through one buffer would splice.
-        let (mut red_out, mut red_err) = (self.redactor(), self.redactor());
         loop {
-            let (stream, chunk) = match reader.recv().await {
+            let (stream, chunk) = match chunks.next_chunk().await {
                 Ok(Some(c)) => c,
                 Ok(None) => break,
-                Err(e) => {
-                    tracing::warn!(error = %e, "stopped reading one of a child's output streams");
+                Err((stream, e)) if streams.includes(stream) => {
+                    tracing::warn!(error = %e, %stream, "stopped reading a child's log stream");
+                    continue;
+                }
+                Err((stream, e)) => {
+                    tracing::debug!(error = %e, %stream, "a child's data stream failed to read");
+                    data_error.get_or_insert((stream, e));
                     continue;
                 }
             };
@@ -213,15 +336,18 @@ impl<'io> RunLog<'io> {
                 continue;
             }
             let redactor = match stream {
-                StreamId::Stdout => red_out.as_mut(),
-                StreamId::Stderr => red_err.as_mut(),
+                StreamId::Stdout => reds.out.as_mut(),
+                StreamId::Stderr => reds.err.as_mut(),
             };
             let scrubbed = redactor.map(|r| r.push(&chunk));
             self.emit(stream, scrubbed.as_deref().unwrap_or(&chunk))
                 .await;
         }
-        // The held-back tails, or the last bytes of the output disappear.
-        for (stream, red) in [(StreamId::Stdout, red_out), (StreamId::Stderr, red_err)] {
+    }
+
+    /// Write the redactors' held-back tails.
+    async fn flush(&mut self, reds: Redactors) {
+        for (stream, red) in [(StreamId::Stdout, reds.out), (StreamId::Stderr, reds.err)] {
             if let Some(mut r) = red {
                 let tail = r.finish();
                 self.emit(stream, &tail).await;
@@ -230,32 +356,36 @@ impl<'io> RunLog<'io> {
     }
 
     /// `hexecrunner::output`, with the `streams` that are log written as they
-    /// arrive: spawn `spec` under `runner`, [`pump`](Self::pump) it while it
-    /// runs, and return its status and both streams whole, as `output` would.
+    /// arrive: spawn `spec` under `runner`, [`drive`](Self::drive) it, and
+    /// return its status and both streams whole, as `output` would.
     ///
     /// For a tool whose stdout is its answer (a store path, an environment) and
     /// whose stderr is progress worth watching while it runs.
     pub async fn output(
         &mut self,
         runner: hexecrunner::RunnerRef<'_>,
-        spec: hproc::proc_exec::Spec,
+        spec: proc_exec::Spec,
         streams: Streams,
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<std::process::Output> {
-        let (spawned, _) = hexecrunner::spawn_io(runner, spec, ctoken).await?;
-        // The spawn's `io::Error` stays in the chain, as `output` keeps it.
-        let mut handle = spawned?;
-        let reader = handle.take_output();
-        // The wait runs on its own task: it parks until the child exits, and a
-        // reader sharing its task would stop draining a pipe the child fills.
-        let wait = handle.spawn_wait(ctoken.clone_arc());
+        let (spawned, spawned_as) = hexecrunner::spawn_io(runner, spec, ctoken).await?;
+        // The spawn's `io::Error` stays in the chain, as `output` keeps it, and
+        // a named runner says what it actually executed, as `output` does.
+        let handle = spawned.map_err(|e| match runner.addr {
+            Some(addr) => anyhow::Error::new(e).context(format!(
+                "exec runner {} spawned {:?}",
+                addr.format(),
+                spawned_as.program
+            )),
+            None => anyhow::Error::new(e),
+        })?;
         let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
-        let pumped = self.pump(reader, streams, |stream, chunk| match stream {
-            StreamId::Stdout => stdout.extend_from_slice(chunk),
-            StreamId::Stderr => stderr.extend_from_slice(chunk),
-        });
-        let (status, ()) = tokio::join!(wait, pumped);
-        let status = status.context("wait task for the child")??;
+        let status = self
+            .drive(handle, streams, ctoken, |stream, chunk| match stream {
+                StreamId::Stdout => stdout.extend_from_slice(chunk),
+                StreamId::Stderr => stderr.extend_from_slice(chunk),
+            })
+            .await??;
         Ok(std::process::Output {
             status,
             stdout,
@@ -304,7 +434,7 @@ impl<'io> RunLog<'io> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hcore::hasync::{Cancellable, StdCancellationToken};
+    use hcore::hasync::StdCancellationToken;
     use hproc::proc_exec;
     use std::ffi::OsString;
     use std::pin::Pin;
@@ -338,39 +468,286 @@ mod tests {
         }
     }
 
-    /// Run `script` under `/bin/sh`, pumping its output into `log`; returns
-    /// what `observe` saw of each stream.
-    async fn pump_script(log: &mut RunLog<'_>, script: &str, streams: Streams) -> (String, String) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let spec = proc_exec::Spec {
+    fn sh(dir: &std::path::Path, script: &str) -> proc_exec::Spec {
+        proc_exec::Spec {
             program: PathBuf::from("/bin/sh"),
             args: vec![OsString::from("-c"), OsString::from(script)],
             env: vec![],
-            cwd: dir.path().to_path_buf(),
+            cwd: dir.to_path_buf(),
             stdin: proc_exec::StdioSpec::Null,
             stdout: proc_exec::StdioSpec::Piped,
             stderr: proc_exec::StdioSpec::Piped,
             setsid: false,
             ctty: false,
-        };
-        let ctoken = StdCancellationToken::new();
-        let (spawned, _) = hexecrunner::spawn_io(hexecrunner::RunnerRef::local(), spec, &ctoken)
-            .await
-            .expect("spawn");
-        let mut handle = spawned.expect("spawned");
-        let reader = handle.take_output();
-        let wait = handle.spawn_wait(ctoken.clone_arc());
+        }
+    }
+
+    /// Run `script` under `/bin/sh`, driving its output into `log`; returns
+    /// the wait's result and what `observe` saw of each stream.
+    async fn drive_script_with(
+        log: &mut RunLog<'_>,
+        script: &str,
+        streams: Streams,
+        ctoken: &StdCancellationToken,
+    ) -> (std::io::Result<ExitStatus>, String, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (spawned, _) = hexecrunner::spawn_io(
+            hexecrunner::RunnerRef::local(),
+            sh(dir.path(), script),
+            ctoken,
+        )
+        .await
+        .expect("spawn");
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let pumped = log.pump(reader, streams, |s, c| match s {
-            StreamId::Stdout => out.extend_from_slice(c),
-            StreamId::Stderr => err.extend_from_slice(c),
-        });
-        let (status, ()) = tokio::join!(wait, pumped);
-        assert!(status.expect("join").expect("wait").success());
+        let status = log
+            .drive(spawned.expect("spawned"), streams, ctoken, |s, c| match s {
+                StreamId::Stdout => out.extend_from_slice(c),
+                StreamId::Stderr => err.extend_from_slice(c),
+            })
+            .await
+            .expect("drive");
         (
+            status,
             String::from_utf8_lossy(&out).into_owned(),
             String::from_utf8_lossy(&err).into_owned(),
         )
+    }
+
+    async fn pump_script(log: &mut RunLog<'_>, script: &str, streams: Streams) -> (String, String) {
+        let ctoken = StdCancellationToken::new();
+        let (status, out, err) = drive_script_with(log, script, streams, &ctoken).await;
+        assert!(status.expect("wait").success());
+        (out, err)
+    }
+
+    /// A scripted chunk source: its items in order, then EOF — or, with
+    /// `hang`, a pipe some descendant never closes.
+    struct Script {
+        items: std::collections::VecDeque<Result<(StreamId, Vec<u8>), ReadError>>,
+        hang: bool,
+    }
+
+    impl Script {
+        fn new(
+            items: impl IntoIterator<Item = Result<(StreamId, &'static str), StreamId>>,
+            hang: bool,
+        ) -> Self {
+            let items = items
+                .into_iter()
+                .map(|i| match i {
+                    Ok((s, text)) => Ok((s, text.as_bytes().to_vec())),
+                    Err(s) => Err((s, std::io::Error::other("injected read error"))),
+                })
+                .collect();
+            Self { items, hang }
+        }
+    }
+
+    impl Chunks for Script {
+        async fn next_chunk(&mut self) -> Result<Option<(StreamId, Vec<u8>)>, ReadError> {
+            match self.items.pop_front() {
+                Some(item) => item.map(Some),
+                None if self.hang => std::future::pending().await,
+                None => Ok(None),
+            }
+        }
+    }
+
+    fn exited(code: i32) -> std::io::Result<ExitStatus> {
+        Ok(std::os::unix::process::ExitStatusExt::from_raw(code << 8))
+    }
+
+    /// Drive `script` with a wait that has already resolved to `status`;
+    /// returns the result, the time it took and what the observer saw.
+    async fn drive_scripted(
+        log: &mut RunLog<'_>,
+        mut script: Script,
+        streams: Streams,
+        status: std::io::Result<ExitStatus>,
+        ctoken: &StdCancellationToken,
+    ) -> (
+        anyhow::Result<std::io::Result<ExitStatus>>,
+        std::time::Duration,
+        String,
+    ) {
+        let mut seen = Vec::new();
+        let started = std::time::Instant::now();
+        let res = log
+            .drive_chunks(
+                &mut script,
+                std::future::ready(Ok(status)),
+                streams,
+                ctoken,
+                &mut |_, c: &[u8]| seen.extend_from_slice(c),
+            )
+            .await;
+        (
+            res,
+            started.elapsed(),
+            String::from_utf8_lossy(&seen).into_owned(),
+        )
+    }
+
+    /// Once the child has exited, a pipe that never reaches EOF is read for
+    /// `DRAIN_DEADLINE` more and then abandoned, on every OS — the bytes read
+    /// before are kept, the redactor's held-back tail included.
+    #[tokio::test]
+    async fn drive_abandons_a_pipe_left_open_after_exit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("log.txt");
+        let mut log = RunLog::own_file(None, None, path.clone(), Needles::new(["s3cr3t-x"]));
+        let ctoken = StdCancellationToken::new();
+        let script = Script::new([Ok((StreamId::Stderr, "before s3cr"))], true);
+        let (res, took, seen) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            drive_scripted(&mut log, script, Streams::BOTH, exited(0), &ctoken).await
+        })
+        .await
+        .expect("the drain after exit must be bounded");
+        assert!(res.expect("drive").expect("wait").success());
+        assert!(took >= proc_exec::DRAIN_DEADLINE, "took {took:?}");
+        assert!(took < proc_exec::DRAIN_DEADLINE * 4, "took {took:?}");
+        assert_eq!(seen, "before s3cr");
+        drop(log);
+        assert_eq!(std::fs::read_to_string(&path).expect("log"), "before s3cr");
+    }
+
+    /// A cancelled run skips the drain: the pipe a descendant holds is not
+    /// waited on at all.
+    #[tokio::test]
+    async fn drive_skips_the_drain_on_cancel() {
+        let mut log = RunLog::captured(None, None);
+        let ctoken = StdCancellationToken::new();
+        ctoken.cancel();
+        let script = Script::new([Ok((StreamId::Stdout, "partial"))], true);
+        let (res, took, _) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            drive_scripted(
+                &mut log,
+                script,
+                Streams::STDERR,
+                Err(std::io::Error::other("cancelled")),
+                &ctoken,
+            )
+            .await
+        })
+        .await
+        .expect("a cancelled run must not drain");
+        assert!(
+            res.expect("drive").is_err(),
+            "the wait's cancellation is the caller's"
+        );
+        assert!(took < proc_exec::DRAIN_DEADLINE, "took {took:?}");
+    }
+
+    /// A real child that exits while a background job holds its stdout
+    /// returns within the drain deadline (plus whatever the OS's own reap
+    /// takes), not when the job ends; what it printed before exit is kept.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn drive_returns_when_a_descendant_holds_the_pipe() {
+        let mut log = RunLog::captured(None, None);
+        let ctoken = StdCancellationToken::new();
+        let started = std::time::Instant::now();
+        let (status, out, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(25),
+            drive_script_with(
+                &mut log,
+                "echo before; sleep 30 & exit 0",
+                Streams::STDERR,
+                &ctoken,
+            ),
+        )
+        .await
+        .expect("drive must not wait for the background job");
+        assert!(status.expect("wait").success());
+        assert_eq!(out, "before\n");
+        let took = started.elapsed();
+        assert!(took < std::time::Duration::from_secs(10), "took {took:?}");
+    }
+
+    /// Cancelling a real child whose descendant holds the pipe returns once
+    /// the cancellation escalation is done, not when the descendant ends.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn drive_cancel_returns_promptly() {
+        let out_w = Shared::default();
+        let mut o = out_w.clone();
+        let mut log = RunLog::captured(None, Some(&mut o));
+        let ctoken = StdCancellationToken::new();
+        let canceller = {
+            let (out_w, ctoken) = (out_w.clone(), ctoken.clone());
+            tokio::spawn(async move {
+                while !out_w.text().contains("started") {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                ctoken.cancel();
+            })
+        };
+        let started = std::time::Instant::now();
+        let (status, _, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(25),
+            drive_script_with(
+                &mut log,
+                "sleep 30 & echo started >&2; wait",
+                Streams::BOTH,
+                &ctoken,
+            ),
+        )
+        .await
+        .expect("a cancelled drive must return");
+        canceller.await.expect("canceller");
+        assert!(status.is_err(), "a cancelled wait is an error");
+        let took = started.elapsed();
+        assert!(
+            took < proc_exec::CANCEL_GRACE + std::time::Duration::from_secs(8),
+            "took {took:?}"
+        );
+    }
+
+    /// A read error on a data stream fails the call — the answer would be
+    /// truncated — while one on a log stream is only warned.
+    #[tokio::test]
+    async fn a_data_stream_read_error_fails_and_a_log_one_does_not() {
+        let ctoken = StdCancellationToken::new();
+        let err_w = Shared::default();
+        let mut e = err_w.clone();
+        let mut log = RunLog::captured(None, Some(&mut e));
+        let script = Script::new(
+            [
+                Ok((StreamId::Stdout, "PATH=/nix/st")),
+                Err(StreamId::Stdout),
+                Ok((StreamId::Stderr, "progress\n")),
+            ],
+            false,
+        );
+        let (res, _, _) =
+            drive_scripted(&mut log, script, Streams::STDERR, exited(0), &ctoken).await;
+        let err = res.expect_err("a truncated data stream must not pass for a whole one");
+        assert!(format!("{err:#}").contains("stdout"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("injected read error"),
+            "{err:#}"
+        );
+
+        let script = Script::new(
+            [
+                Ok((StreamId::Stdout, "/nix/store/abc\n")),
+                Ok((StreamId::Stderr, "progress\n")),
+                Err(StreamId::Stderr),
+            ],
+            false,
+        );
+        let (res, _, seen) =
+            drive_scripted(&mut log, script, Streams::STDERR, exited(0), &ctoken).await;
+        assert!(
+            res.expect("a log stream's read error is a warning")
+                .expect("wait")
+                .success()
+        );
+        assert_eq!(seen, "/nix/store/abc\nprogress\n");
+        drop(log);
+        assert_eq!(
+            err_w.text(),
+            "progress\nprogress\n",
+            "the log stream was still written"
+        );
     }
 
     /// Under `log_capture` the log streams reach the writers while the child is
@@ -508,13 +885,17 @@ mod tests {
         let mut s = sink.clone();
         let needles = Needles::new([secret]);
         let mut log = RunLog::own_file(None, Some(&mut s), path.clone(), needles);
-        let (head, tail) = secret.split_at(10);
-        pump_script(
-            &mut log,
-            &format!("printf 'a {head}' >&2; sleep 0.05; printf '{tail} b' >&2"),
-            Streams::BOTH,
-        )
-        .await;
+        // The secret split across two chunks, deterministically.
+        let script = Script::new(
+            [
+                Ok((StreamId::Stderr, "a s3cr3t-tok")),
+                Ok((StreamId::Stderr, "en-value-0123456789 b")),
+            ],
+            false,
+        );
+        let ctoken = StdCancellationToken::new();
+        let (res, _, _) = drive_scripted(&mut log, script, Streams::BOTH, exited(0), &ctoken).await;
+        assert!(res.expect("drive").expect("wait").success());
         log.write(StreamId::Stderr, format!(" {secret}\n").as_bytes())
             .await;
         drop(log);

@@ -24,7 +24,9 @@ glob = "0.3"
 walkdir = "2"
 tracing = "0.1"
 xxhash-rust = { version = "0.8.15", features = ["xxh3", "std"] }
-tokio = { version = "1.52.3", features = ["rt", "io-util", "fs", "process"] }
+# `macros`/`time`: `RunLog::drive` bounds the drain after a child exits, as
+# `proc_exec::output` does (hproc enables both already).
+tokio = { version = "1.52.3", features = ["rt", "io-util", "fs", "process", "macros", "time"] }
 # A fresh, uniquely named file per collected output tar (see
 # `driver_managed::pack_to_artifact_tar`).
 tempfile = "3"
