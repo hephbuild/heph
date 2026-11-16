@@ -3020,6 +3020,48 @@ exit 0
         );
     }
 
+    /// A failure whose stderr is empty takes its tail from stdout. When stdout
+    /// is not one of the log streams (an `inspect`'s answer) that tail never
+    /// reached the log, so the message is the one place it survives: it is
+    /// printed, under `log_capture` as on the own-file path.
+    #[tokio::test]
+    async fn a_tail_from_a_data_stream_stays_in_the_message() {
+        let sbx = Sandbox::new("app");
+        let bin = sbx.fake("docker", "echo 'out-tail'\nexit 1");
+        let ctoken = StdCancellationToken::new();
+        let (out, err) = (Shared::default(), Shared::default());
+        let mut io = ToolIo::captured(Some(out.writer()), Some(err.writer()));
+        let failed = run_tool(
+            vec![bin.clone()],
+            &sbx.ws,
+            "docker image inspect",
+            Streams::STDERR,
+            &mut io,
+            &ctoken,
+        )
+        .await
+        .err()
+        .expect("a non-zero exit must error");
+        drop(io);
+        assert_eq!(out.text(), "", "the answer is data, never the log");
+        assert!(format!("{failed:#}").contains("out-tail"), "{failed:#}");
+
+        let path = sbx.dir.path().join("own-log.txt");
+        let mut own = ToolIo::own_file(None, None, path, None);
+        let failed = run_tool(
+            vec![bin],
+            &sbx.ws,
+            "docker image inspect",
+            Streams::STDERR,
+            &mut own,
+            &ctoken,
+        )
+        .await
+        .err()
+        .expect("a non-zero exit must error");
+        assert!(format!("{failed:#}").contains("out-tail"), "{failed:#}");
+    }
+
     /// On a host without `log_capture`, a credential secret the builder prints
     /// is scrubbed out of the plugin's own `log.txt` by the shared scrubber.
     #[tokio::test]
