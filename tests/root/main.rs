@@ -31,6 +31,7 @@ mod execrunner_gate;
 mod gc_cli;
 mod lint_gate;
 mod lsp_lifecycle;
+mod publish_manifests;
 mod resources_gate;
 mod target_dir_script;
 mod test_layout;
