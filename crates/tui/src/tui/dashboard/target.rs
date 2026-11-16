@@ -647,7 +647,7 @@ fn overview(
     let package = m.addr(id).rsplit_once(':').map_or(m.addr(id), |(p, _)| p);
     out.push(row("package", package, cols));
     if let Some(words) = d.and_then(|d| d.cache_words()) {
-        out.push(row("cache", &words, cols));
+        out.push(row("cache", words, cols));
     }
     let resources = match shape {
         Some(s) => resources(s.declared.as_ref(), s.reserved.as_ref(), m),

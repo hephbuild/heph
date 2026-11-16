@@ -1,6 +1,6 @@
 //! What the target screen's Overview reads beside the per-target record:
 //! when each phase first started, how long the run waited at admission and
-//! how it got its slot, what each cache tier said, and the run's shape
+//! how it got its slot, its cache outcome, and the run's shape
 //! (driver, resources, declared outputs). Fixed-size per target; a shape is
 //! stored once however many runs share it, which is nearly all of them.
 
@@ -12,11 +12,13 @@ use super::intern::Id;
 use super::model::Record;
 use crate::tui::progress::Op;
 
-/// Cache bits: what each tier said.
+/// Cache bits: the target's `CacheOutcome`, and whether its hit was rebuilt.
+/// Folded from the per-target events only, never the tier events: a target
+/// served from the remote is also a local miss, so the tier events are not a
+/// target's outcome (`tests/root/cache_tier_gate.rs`).
 const LOCAL_HIT: u8 = 1;
-const LOCAL_MISS: u8 = 1 << 1;
+const MISS: u8 = 1 << 1;
 const REMOTE_HIT: u8 = 1 << 2;
-const REMOTE_MISS: u8 = 1 << 3;
 /// A hit that was rebuilt anyway.
 const REBUILT: u8 = 1 << 4;
 /// The run's result is not cached (`cache = False`).
@@ -68,36 +70,21 @@ impl Detail {
         self.shape != 0
     }
 
-    /// The cache row's words: hit or miss, and which tiers were asked.
-    pub fn cache_words(&self) -> Option<String> {
+    /// The cache row's words: hit (and from which tier) or miss.
+    pub fn cache_words(&self) -> Option<&'static str> {
         let c = self.cache;
         if c & REBUILT != 0 {
-            return Some("hit, rebuilt anyway".to_owned());
-        }
-        if c & REMOTE_HIT != 0 {
-            return Some(
-                if c & LOCAL_MISS != 0 {
-                    "hit: remote, after a local miss"
-                } else {
-                    "hit: remote"
-                }
-                .to_owned(),
-            );
-        }
-        if c & LOCAL_HIT != 0 {
-            return Some("hit: local".to_owned());
-        }
-        let tiers = match (c & LOCAL_MISS != 0, c & REMOTE_MISS != 0) {
-            (true, true) => Some("miss: local, then remote"),
-            (true, false) => Some("miss: local"),
-            (false, true) => Some("miss: remote"),
-            (false, false) => None,
-        };
-        match (tiers, c & NOT_CACHED != 0) {
-            (Some(t), true) => Some(format!("{t} · not cached (cache = False)")),
-            (Some(t), false) => Some(t.to_owned()),
-            (None, true) => Some("not cached (cache = False)".to_owned()),
-            (None, false) => None,
+            Some("hit, rebuilt anyway")
+        } else if c & REMOTE_HIT != 0 {
+            Some("hit: remote")
+        } else if c & LOCAL_HIT != 0 {
+            Some("hit: local")
+        } else if c & MISS != 0 {
+            Some("miss")
+        } else if c & NOT_CACHED != 0 {
+            Some("not cached (cache = False)")
+        } else {
+            None
         }
     }
 }
@@ -192,10 +179,6 @@ impl Details {
     pub(super) fn addr_of(kind: &BuildEventKind) -> Option<&str> {
         match kind {
             BuildEventKind::ExecuteStart { addr, .. }
-            | BuildEventKind::LocalCacheHit { addr }
-            | BuildEventKind::LocalCacheMiss { addr }
-            | BuildEventKind::RemoteCacheHit { addr }
-            | BuildEventKind::RemoteCacheMiss { addr }
             | BuildEventKind::CacheOutcome { addr, .. }
             | BuildEventKind::CacheHitRebuilt { addr, .. }
             | BuildEventKind::ResultLockWaitStart { addr, .. }
@@ -289,18 +272,12 @@ impl Details {
                 }
                 if *cache { 0 } else { NOT_CACHED }
             }
-            BuildEventKind::LocalCacheHit { .. }
-            | BuildEventKind::CacheOutcome {
-                outcome: CacheOutcomeKind::LocalHit,
-                ..
-            } => LOCAL_HIT,
-            BuildEventKind::LocalCacheMiss { .. } => LOCAL_MISS,
-            BuildEventKind::RemoteCacheHit { .. }
-            | BuildEventKind::CacheOutcome {
-                outcome: CacheOutcomeKind::RemoteHit,
-                ..
-            } => REMOTE_HIT,
-            BuildEventKind::RemoteCacheMiss { .. } => REMOTE_MISS,
+            BuildEventKind::CacheOutcome { outcome, .. } => match outcome {
+                CacheOutcomeKind::LocalHit => LOCAL_HIT,
+                CacheOutcomeKind::RemoteHit => REMOTE_HIT,
+                CacheOutcomeKind::Miss => MISS,
+                CacheOutcomeKind::Unknown => 0,
+            },
             BuildEventKind::CacheHitRebuilt { .. } => REBUILT,
             _ => 0,
         };
@@ -459,6 +436,62 @@ mod tests {
         }
         assert_eq!(shape(4).driver, "bash");
         assert_eq!(shape(3).outputs, ["bin", ""]);
+    }
+
+    /// The cache row is the target's `CacheOutcome`: a remote hit reads as a
+    /// hit though a local miss preceded it, a full miss is one miss, and the
+    /// tier events beside them change nothing.
+    #[test]
+    fn the_cache_row_reads_the_outcome_not_the_tiers() {
+        use hcore::events::{CacheHitKind, CacheOutcomeKind};
+        let a = || "//p:x".to_owned();
+        let outcome = |outcome| BuildEventKind::CacheOutcome { addr: a(), outcome };
+        let cases = [
+            (
+                vec![
+                    BuildEventKind::LocalCacheMiss { addr: a() },
+                    BuildEventKind::RemoteCacheHit { addr: a() },
+                    outcome(CacheOutcomeKind::RemoteHit),
+                ],
+                Some("hit: remote"),
+            ),
+            (
+                vec![
+                    BuildEventKind::LocalCacheMiss { addr: a() },
+                    BuildEventKind::RemoteCacheMiss { addr: a() },
+                    outcome(CacheOutcomeKind::Miss),
+                ],
+                Some("miss"),
+            ),
+            (
+                vec![
+                    BuildEventKind::LocalCacheHit { addr: a() },
+                    outcome(CacheOutcomeKind::LocalHit),
+                    BuildEventKind::CacheHitRebuilt {
+                        addr: a(),
+                        was: CacheHitKind::Local,
+                    },
+                ],
+                Some("hit, rebuilt anyway"),
+            ),
+            // Tier events alone are not an outcome.
+            (
+                vec![
+                    BuildEventKind::LocalCacheMiss { addr: a() },
+                    BuildEventKind::RemoteCacheMiss { addr: a() },
+                ],
+                None,
+            ),
+        ];
+        for (events, want) in cases {
+            let mut d = Details::default();
+            d.push();
+            // As the model folds: only the events `addr_of` routes here.
+            for kind in events.iter().filter(|k| Details::addr_of(k).is_some()) {
+                d.fold(0, kind, 1_000);
+            }
+            assert_eq!(d.get(0).expect("detail").cache_words(), want, "{events:?}");
+        }
     }
 
     #[test]
