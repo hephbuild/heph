@@ -531,7 +531,8 @@ target(
 }
 
 /// A host binary (`//@heph/bin:<name>`) is staged under `__heph/hostbin/`, not
-/// under its package: it adds no root, alone or beside a tool that does.
+/// under its package: it adds no root, alone or beside a tool that does. It is
+/// still a staged tool, so alone it gets `$HEPH_TOOLS_DIR`.
 #[tokio::test]
 async fn tool_root_skips_a_host_binary() -> anyhow::Result<()> {
     let ws = htestkit::WorkspaceBuilder::new()?
@@ -559,7 +560,7 @@ target(
     name = "alone",
     driver = "bash",
     tools = {"h": ["//@heph/bin:sh"]},
-    run = '[[ -z "${TOOL_H_ROOT+set}" && -n "$TOOL_H" ]] && echo unset > $OUT',
+    run = '[[ -z "${TOOL_H_ROOT+set}" && -n "$TOOL_H" && "$HEPH_TOOLS_DIR" == /* && -d "$HEPH_TOOLS_DIR" ]] && echo unset > $OUT',
     out = "out.txt",
 )
 target(
@@ -676,5 +677,28 @@ target(
         "{err}"
     );
     assert!(err.contains("//use:c"), "{err}");
+    Ok(())
+}
+
+/// A target without tools is not heph's to police: its own `HEPH_TOOLS_DIR`
+/// reaches its command unchanged.
+#[tokio::test]
+async fn tools_dir_is_the_targets_own_without_tools() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "use",
+        r#"
+target(
+    name = "c",
+    driver = "bash",
+    env = {"HEPH_TOOLS_DIR": "/mine"},
+    run = "echo $HEPH_TOOLS_DIR > $OUT",
+    out = "out.txt",
+)
+"#,
+    );
+    let result = ws.run("//use:c").await?;
+    let content = common::artifact_string(&result);
+    assert_eq!(content.trim(), "/mine", "got {content:?}");
     Ok(())
 }

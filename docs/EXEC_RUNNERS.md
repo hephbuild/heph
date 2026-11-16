@@ -159,16 +159,19 @@ the target's environment in this order — **a later row replaces an earlier one
   │   │   `"*"` = every host variable, over all of the above     │         │
   │ 8 │ `runtime_env`            │ literal                      │   no    │
   │   │   + producers' unhashed `transitive` values              │         │
-  │ 9 │ scratch declarations     │ its `env` → the slot dir     │   no    │
-  │10 │ credentials              │ the presented variables      │   no    │
+  │ 9 │ heph, target with tools  │ TOOL_*_ROOT  HEPH_TOOLS_DIR  │   no    │
+  │10 │ scratch declarations     │ its `env` → the slot dir     │   no    │
+  │11 │ credentials              │ the presented variables      │   no    │
   └───┴──────────────────────────┴──────────────────────────────┴─────────┘
-     rows 9 and 10 never replace: a key set above with a different
-     value is an ERROR naming both, not a silent winner
+     row 9 names are refused at parse when set by rows 4, 6, 7 or 8,
+     and `"*"` never carries HEPH_TOOLS_DIR; rows 10 and 11 never
+     replace: a key set above with a different value is an ERROR
+     naming both, not a silent winner
 ```
 
 So a producer's `transitive` env (rows 6–8) outranks the consumer's own `env`
 (row 4), and `runtime_pass_env = ["*"]` outranks every row before it — including
-`PATH`, `OUT` and `SRC_*`.
+`PATH`, `OUT` and `SRC_*` — but not heph's tool roots after it.
 
 That map is the **target's half**. A runner then lays it over the environment
 it runs in, and every runner follows the same rule — **the environment is the
@@ -195,7 +198,7 @@ base, the target's half goes on top**:
 
 A target that declares a variable gets what it declared even when the
 environment has an opinion, and so a runner can never replace a credential or
-scratch variable behind the collision check rows 9 and 10 perform.
+scratch variable behind the collision check rows 10 and 11 perform.
 
 ### `PATH`
 

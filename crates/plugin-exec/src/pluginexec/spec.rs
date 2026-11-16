@@ -106,15 +106,31 @@ pub(crate) struct TargetSpec {
     /// `-trimpath`) to keep them reproducible.
     ///
     /// `$HEPH_TOOLS_DIR` is the directory every tool of the target is staged
-    /// under, set whenever the target has tools. A tool always sits at `<its
-    /// package>/<its path>` below it, whichever group it is listed in and
-    /// whatever else that group holds, so it is the variable for a tool that
-    /// is a launcher script finding the files shipped beside it: a tool in
-    /// `cli/` with `support_files = "lib/"` reads `$HEPH_TOOLS_DIR/cli/lib`.
-    /// The tool's tools, through its `transitive` tools, are staged in the
-    /// same tree. Nothing checks the path before the run. Like the roots, the
-    /// value is absolute, machine-specific and not hashed, and setting it
-    /// yourself is refused at parse, by the same rules.
+    /// under. It is the variable for a tool that is a launcher script finding
+    /// the files shipped beside it: the launcher runs as part of a target that
+    /// lists it in `tools`, so it sees the variable. Below it, a tool target's
+    /// outputs and `support_files` sit at `<its package>/<its path>` (the
+    /// package without `//`; nothing in front for the root package), whichever
+    /// group the tool is listed in and whatever else that group holds. A tool
+    /// in package `cli` with `out = "greet"` and `support_files = "lib/"`
+    /// ships a launcher that reads
+    /// `cat "$HEPH_TOOLS_DIR/cli/lib/data.txt"`. Tools a tool brings through
+    /// its `transitive` tools are staged in the same tree. A relocating
+    /// `group` (`prefix`, `strip_prefix`, `rename`), a workspace source file
+    /// and a host binary are not under a package of their own there.
+    ///
+    /// Set for a target with tools, and unset when none of them staged a file
+    /// (an empty `group`). A target without tools gets nothing from heph and
+    /// its own `HEPH_TOOLS_DIR`, if it sets one, is left alone. Nothing checks
+    /// a launcher's path before the run: a wrong one fails inside the launcher
+    /// with "No such file or directory" naming the full path; `ls
+    /// "$HEPH_TOOLS_DIR"` from the consumer's `run` shows what was staged.
+    /// Like the roots, the value is absolute, machine-specific and not hashed.
+    /// For a target with tools heph owns the name: setting it is refused at
+    /// parse by the same rules as a root, and heph's value replaces an
+    /// entrypoint caller's. For any target, a `"*"` passthrough (`pass_env`
+    /// or `runtime_pass_env`) never carries the host's `HEPH_TOOLS_DIR`: it
+    /// names the tools of another heph target this one runs inside.
     ///
     /// Refused at parse: a group whose root variable is another group's
     /// `$TOOL_<group>` (`{"": …, "root": …}` both reach `TOOL_ROOT`; names are

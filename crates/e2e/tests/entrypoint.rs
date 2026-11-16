@@ -2507,6 +2507,32 @@ target(name = "ep", driver = "bash", entrypoint = True,
     Ok(())
 }
 
+/// heph owns `HEPH_TOOLS_DIR` for a target with tools: when its only tool is
+/// an empty `group`, nothing is staged, and the caller's value is taken out of
+/// the entrypoint's environment rather than handed on as if heph had set it.
+#[tokio::test]
+async fn entrypoint_unstaged_tools_unset_the_callers_tools_dir() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file(
+        "app",
+        r#"
+target(name = "empty", driver = "group")
+target(name = "ep", driver = "bash", entrypoint = True,
+       tools = ["//app:empty"],
+       run = "exec > \"$HEPH_TEST_OUT\" 2>&1; echo \"${HEPH_TOOLS_DIR-unset}\"")
+"#,
+    );
+    let out = ws.dir.path().join("out.txt");
+    let mut env = caller_env(&out);
+    env.push(("HEPH_TOOLS_DIR".into(), "/from/caller".into()));
+    let req = InvokeRequest::new(parse_addr("//app:ep")?, ws.dir.path(), env);
+    let exit = exited(invoke(&ws.engine, req).await);
+    let got = read(&out)?;
+    assert_eq!(exit, Exit::Code(0), "{got}");
+    assert_eq!(got.trim(), "unset", "{got}");
+    Ok(())
+}
+
 /// heph owns `TOOL_<G>_ROOT`: when a tool group has no root (a workspace
 /// source file is not under a package of its own), the caller's
 /// `TOOL_ROOT` is taken out of the entrypoint's environment, not handed on
