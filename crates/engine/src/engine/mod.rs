@@ -99,7 +99,8 @@ pub mod failure_slot;
 pub mod invoke;
 pub mod log_api;
 pub use log_api::{
-    FollowStep, LogFollower, LogInfo, LogOptions, LogSource, LogUnavailable, NoLiveLogs, OpenLog,
+    FollowStep, LogFollower, LogInfo, LogOptions, LogSource, LogUnavailable, NoLiveLogs,
+    NoOutputYet, OpenLog,
 };
 pub mod output_listing;
 pub use output_listing::{FailureOutputs, ListedFile, ListedGroup, ListedKind, OutputListing};

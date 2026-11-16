@@ -91,9 +91,17 @@ pub struct FoundRunLog {
 pub enum RunLogLookup {
     /// The newest trusted record of the addr, and its session.
     Found(FoundRunLog),
-    /// No session recorded a log of the addr, but a live session of this
-    /// workspace runs a heph that records no live logs: it may be running
-    /// the addr unseen. The newest such session is named.
+    /// The addr is running in `session`, which records run logs, and has
+    /// written nothing yet. Answered over an older [`Self::Found`], and
+    /// always over [`Self::Unsupported`].
+    Started {
+        session: SessionId,
+        /// When its `ExecuteStart` was recorded.
+        at_unix_ms: u64,
+    },
+    /// No session recorded a log of the addr or is running it, but a live
+    /// session of this workspace runs a heph that records no live logs: it
+    /// may be running the addr unseen. The newest such session is named.
     Unsupported { session: SessionId },
     /// Nothing: no live session of this workspace, or none that recorded
     /// the addr.
@@ -114,7 +122,9 @@ pub fn find_run_log(
 ) -> anyhow::Result<Option<FoundRunLog>> {
     Ok(match lookup_run_log(root, home, addr)? {
         RunLogLookup::Found(found) => Some(found),
-        RunLogLookup::Unsupported { .. } | RunLogLookup::None => None,
+        RunLogLookup::Started { .. } | RunLogLookup::Unsupported { .. } | RunLogLookup::None => {
+            None
+        }
     })
 }
 
@@ -130,6 +140,7 @@ pub fn lookup_run_log(root: &SessionRoot, home: &Path, addr: &str) -> anyhow::Re
         Err(e) => return Err(e).with_context(|| format!("reading {}", root.display())),
     };
     let mut newest: Option<FoundRunLog> = None;
+    let mut started: Option<(u64, SessionId)> = None;
     let mut unsupported: Option<SessionId> = None;
     for entry in entries.filter_map(Result::ok) {
         let Some(id) = entry
@@ -147,6 +158,12 @@ pub fn lookup_run_log(root: &SessionRoot, home: &Path, addr: &str) -> anyhow::Re
                 }
                 continue;
             }
+            Ok(SessionLookup::Started(at)) => {
+                if started.is_none_or(|(t, s)| (at, id.encode()) > (t, s.encode())) {
+                    started = Some((at, id));
+                }
+                continue;
+            }
             Ok(SessionLookup::Nothing) => continue,
             Err(e) => {
                 tracing::debug!(session = %id, error = %format!("{e:#}"), "skipping session");
@@ -160,16 +177,30 @@ pub fn lookup_run_log(root: &SessionRoot, home: &Path, addr: &str) -> anyhow::Re
             newest = Some(FoundRunLog { session: id, log });
         }
     }
-    Ok(match (newest, unsupported) {
-        (Some(found), _) => RunLogLookup::Found(found),
-        (None, Some(session)) => RunLogLookup::Unsupported { session },
-        (None, None) => RunLogLookup::None,
+    Ok(match (newest, started, unsupported) {
+        // A run that started after the newest record is going on, with
+        // nothing written yet.
+        (found, Some((at_unix_ms, session)), _)
+            if found
+                .as_ref()
+                .is_none_or(|f| at_unix_ms > f.log.at_unix_ms()) =>
+        {
+            RunLogLookup::Started {
+                session,
+                at_unix_ms,
+            }
+        }
+        (Some(found), _, _) => RunLogLookup::Found(found),
+        (None, _, Some(session)) => RunLogLookup::Unsupported { session },
+        (None, _, None) => RunLogLookup::None,
     })
 }
 
 /// What one session says about an addr.
 enum SessionLookup {
     Log(SessionRunLog),
+    /// Running here since the `ExecuteStart` at this time, nothing written.
+    Started(u64),
     /// Live, of this home, from a heph that records no run logs.
     NoRunLogs,
     Nothing,
@@ -185,7 +216,7 @@ pub fn session_run_log(
 ) -> anyhow::Result<Option<SessionRunLog>> {
     Ok(match session_lookup(dir, home, addr)? {
         SessionLookup::Log(log) => Some(log),
-        SessionLookup::NoRunLogs | SessionLookup::Nothing => None,
+        SessionLookup::Started(_) | SessionLookup::NoRunLogs | SessionLookup::Nothing => None,
     })
 }
 
@@ -218,6 +249,9 @@ fn session_lookup(dir: &Path, home: &Path, addr: &str) -> anyhow::Result<Session
     let mut reader = RecordReader::new(events);
     let mut newest: Option<(u64, RunLogRecord)> = None;
     let mut ended = false;
+    // The `ExecuteStart` of a run of the addr not followed by its end: it
+    // is going on, and has written nothing unless a record came after.
+    let mut started: Option<u64> = None;
     while let Some(rec) = reader.next_record().context("reading events.ndjson")? {
         match (rec.kind, rec.session) {
             (_, Some(SessionRecordKind::RunLog(run)))
@@ -226,12 +260,21 @@ fn session_lookup(dir: &Path, home: &Path, addr: &str) -> anyhow::Result<Session
                 newest = Some((rec.at_unix_ms, *run));
                 ended = false;
             }
-            (Some(BuildEventKind::ExecuteEnd { addr: a, .. }), _) if a == addr => ended = true,
+            (Some(BuildEventKind::ExecuteStart { addr: a, .. }), _) if a == addr => {
+                started = Some(rec.at_unix_ms);
+            }
+            (Some(BuildEventKind::ExecuteEnd { addr: a, .. }), _) if a == addr => {
+                ended = true;
+                started = None;
+            }
             _ => {}
         }
     }
-    let Some((at_unix_ms, record)) = newest else {
-        return Ok(SessionLookup::Nothing);
+    // A record not ended is the run going on, whichever of its record and
+    // its start was written first; a start after an ended run is a new run
+    // that has written nothing yet.
+    let Some((at_unix_ms, record)) = newest.filter(|_| !ended || started.is_none()) else {
+        return Ok(started.map_or(SessionLookup::Nothing, SessionLookup::Started));
     };
     if ended {
         return Ok(SessionLookup::Log(SessionRunLog::Ended {
@@ -271,6 +314,15 @@ impl LiveRunLogLocator for SessionRunLogLocator {
     fn locate(&self, home: &Path, addr: &str) -> anyhow::Result<Option<LocatedRunLog>> {
         let found = match lookup_run_log(&self.root, home, addr)? {
             RunLogLookup::Found(found) => found,
+            RunLogLookup::Started {
+                session,
+                at_unix_ms,
+            } => {
+                return Ok(Some(LocatedRunLog::Started {
+                    at_unix_ms,
+                    session: session.encode(),
+                }));
+            }
             RunLogLookup::Unsupported { session } => {
                 return Ok(Some(LocatedRunLog::Unsupported {
                     session: session.encode(),
@@ -429,6 +481,23 @@ mod tests {
         }
     }
 
+    fn execute_start(at: u64, addr: &str) -> SessionRecord {
+        SessionRecord {
+            at_unix_ms: at,
+            kind: Some(BuildEventKind::ExecuteStart {
+                addr: addr.into(),
+                driver: "exec".into(),
+                cache: true,
+                declared: None,
+                reserved: None,
+                queued_ms: None,
+                admitted: None,
+                output_groups: Vec::new(),
+            }),
+            session: None,
+        }
+    }
+
     /// `<home>/<rel>` with `bytes`.
     fn live_file(home: &Path, rel: &str, bytes: &[u8]) -> PathBuf {
         let path = home.join(rel);
@@ -567,6 +636,75 @@ mod tests {
             ),
             "an ended old heph says nothing"
         );
+    }
+
+    /// A run going on in a session that records run logs, before its first
+    /// byte (no file, no `RunLog` record yet), is "running, nothing written":
+    /// never "records no live logs" because some other live session of the
+    /// workspace runs an older heph.
+    #[test]
+    fn a_started_run_that_wrote_nothing_is_not_unsupported() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let root = tmp.path().join("sessions");
+        let sessions = SessionRoot::new(&root);
+        // An older heph, live on the same workspace.
+        let (_old, _old_lock) = session(&root, 1, &home, &["inflight"], &[]);
+        let (dir, _lock) = session(
+            &root,
+            2,
+            &home,
+            &[CAPABILITY_RUN_LOGS],
+            &[execute_start(10, ADDR)],
+        );
+        let lookup = lookup_run_log(&sessions, &home, ADDR).expect("lookup");
+        let ours = SessionId::new(1_800_000_000_002, 2);
+        assert!(
+            matches!(&lookup, RunLogLookup::Started { session, at_unix_ms: 10 } if *session == ours),
+            "{lookup:?}"
+        );
+        // Not another addr's start, nor a near miss.
+        assert!(matches!(
+            lookup_run_log(&sessions, &home, "//p:").expect("lookup"),
+            RunLogLookup::Unsupported { .. }
+        ));
+
+        // Its first byte: the record makes it live.
+        live_file(&home, "runs/e/0.log", b"x");
+        append(&dir, &[run_log(11, ADDR, "h0", "runs/e/0.log")]);
+        assert!(matches!(
+            lookup_run_log(&sessions, &home, ADDR).expect("lookup"),
+            RunLogLookup::Found(_)
+        ));
+        // Ended, then a new run that has written nothing: started again,
+        // over the older record.
+        append(&dir, &[execute_end(12, ADDR), execute_start(13, ADDR)]);
+        assert!(matches!(
+            lookup_run_log(&sessions, &home, ADDR).expect("lookup"),
+            RunLogLookup::Started { at_unix_ms: 13, .. }
+        ));
+        // That run ended without a byte: the older record, ended.
+        append(&dir, &[execute_end(14, ADDR)]);
+        let lookup = lookup_run_log(&sessions, &home, ADDR).expect("lookup");
+        assert!(
+            matches!(&lookup, RunLogLookup::Found(f) if matches!(f.log, SessionRunLog::Ended { .. })),
+            "{lookup:?}"
+        );
+        // A record written before its run's start is still that run's.
+        append(
+            &dir,
+            &[
+                run_log(15, ADDR, "h1", "runs/e/0.log"),
+                execute_start(16, ADDR),
+            ],
+        );
+        assert!(matches!(
+            lookup_run_log(&sessions, &home, ADDR).expect("lookup"),
+            RunLogLookup::Found(FoundRunLog {
+                log: SessionRunLog::Live { .. },
+                ..
+            })
+        ));
     }
 
     /// Across sessions, the newest record wins, and the session that recorded

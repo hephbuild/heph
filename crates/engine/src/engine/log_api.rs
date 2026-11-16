@@ -185,6 +185,17 @@ pub struct NoLiveLogs {
     pub session: String,
 }
 
+/// The address is running in `session` and has written nothing yet: there
+/// is no log to open, and following it waits for its first byte. The UI
+/// says "running · no output yet".
+#[derive(Debug, thiserror::Error)]
+#[error("no output yet; the run in session {session} has written nothing")]
+pub struct NoOutputYet {
+    pub session: String,
+    /// When the run started, in milliseconds since the epoch.
+    pub at_unix_ms: u64,
+}
+
 /// A finished log the API could read, before it is opened.
 enum Stored {
     /// A finished live file (a `cache = false` success's), opened when it
@@ -244,6 +255,8 @@ enum LiveEnd {
 /// What [`Engine::latest_log`] found.
 enum Latest {
     Running(Running),
+    /// Running in another session, nothing written yet.
+    Started(NoOutputYet),
     Stored(Stored),
     /// Nothing, and the locator named a live session that records no live
     /// logs.
@@ -270,6 +283,7 @@ impl Engine {
         .await?;
         match latest {
             Latest::None => Ok(None),
+            Latest::Started(started) => Err(started.into()),
             Latest::Unsupported(session) => Err(NoLiveLogs { session }.into()),
             Latest::Running(run) => Ok(Some(OpenLog::plain(
                 LogInfo {
@@ -313,11 +327,22 @@ impl Engine {
         .await?;
         let state = match latest {
             Latest::Running(run) => Follow::Live(run),
+            // A run going on that has written nothing: wait for its first
+            // byte, and end with it if it ends without one. Anything stored
+            // newer than its start is its own.
+            Latest::Started(started) => Follow::Waiting {
+                baseline: Some(started.at_unix_ms),
+                started: Some(started.session),
+            },
             Latest::Unsupported(session) => return Err(NoLiveLogs { session }.into()),
             Latest::Stored(stored) if wait_for_start => Follow::Waiting {
                 baseline: Some(stored.at_unix_ms()),
+                started: None,
             },
-            Latest::None if wait_for_start => Follow::Waiting { baseline: None },
+            Latest::None if wait_for_start => Follow::Waiting {
+                baseline: None,
+                started: None,
+            },
             Latest::None => return Ok(None),
             Latest::Stored(stored) => {
                 Follow::Stored(self.open_stored(addr, stored, opts.fetch_remote).await?)
@@ -392,6 +417,18 @@ impl Engine {
                             file: record.file,
                             session,
                         },
+                    }));
+                }
+                // Going on, nothing written: newer than anything stored. Its
+                // input hash is not known until its first byte, so a wait
+                // for one hash does not take it.
+                Some(LocatedRunLog::Started {
+                    at_unix_ms,
+                    session,
+                }) if hashin.is_none() => {
+                    return Ok(Latest::Started(NoOutputYet {
+                        session,
+                        at_unix_ms,
                     }));
                 }
                 Some(LocatedRunLog::Unsupported { session }) => unsupported = Some(session),
@@ -706,6 +743,9 @@ enum Follow {
     /// between two polls.
     Waiting {
         baseline: Option<u64>,
+        /// Waiting on a run going on in this session that has written
+        /// nothing yet: when it ends without a byte, so does the follow.
+        started: Option<String>,
     },
     Live(Running),
     Stored(OpenLog),
@@ -768,8 +808,8 @@ impl LogFollower {
                     self.offset += bytes.len() as u64;
                     return Ok(FollowStep::Bytes(bytes));
                 }
-                Follow::Waiting { baseline } => {
-                    let baseline = *baseline;
+                Follow::Waiting { baseline, started } => {
+                    let (baseline, on_a_run) = (*baseline, started.is_some());
                     if !self.due() {
                         return Ok(FollowStep::Idle);
                     }
@@ -799,6 +839,9 @@ impl LogFollower {
                                 (None, None) => return Ok(FollowStep::Idle),
                             }
                         }
+                        Latest::Started(_) => return Ok(FollowStep::Idle),
+                        // The run waited on ended without writing a byte.
+                        _ if on_a_run => Follow::Done,
                         _ => return Ok(FollowStep::Idle),
                     };
                     self.offset = 0;
@@ -863,6 +906,18 @@ impl LogFollower {
             }),
             Follow::Stored(log) => Some(log.info().clone()),
             Follow::Waiting { .. } | Follow::Done => None,
+        }
+    }
+
+    /// The session of the run being waited on, while it is going on and has
+    /// written nothing yet; `None` otherwise.
+    pub fn started_in(&self) -> Option<&str> {
+        match &self.state {
+            Follow::Waiting {
+                started: Some(session),
+                ..
+            } => Some(session),
+            _ => None,
         }
     }
 

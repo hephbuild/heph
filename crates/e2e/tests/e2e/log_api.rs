@@ -9,9 +9,10 @@
 )]
 
 use crate::common::{build_engine, drain, run_drain};
+use hcore::events::BuildEventKind;
 use heph::engine::{
-    Engine, FollowStep, LogFollower, LogOptions, LogSource, LogUnavailable, NoLiveLogs, OpenLog,
-    OutputMatcher, ResultOptions,
+    Engine, FollowStep, LogFollower, LogOptions, LogSource, LogUnavailable, NoLiveLogs,
+    NoOutputYet, OpenLog, OutputMatcher, ResultOptions,
 };
 use heph::hartifactcontent::WalkEntryKind;
 use heph::htaddr::parse_addr;
@@ -631,6 +632,57 @@ async fn log_follow_across_engines() -> anyhow::Result<()> {
     assert_eq!(
         open(&b, "//p:g", &located).await?,
         Some((LogSource::Cache { remote: false }, "one\ntwo\n".into()))
+    );
+    // So does a run going on in A that has written nothing yet: "no output
+    // yet", never "records no live logs".
+    let quiet = parse_addr("//p:quiet")?;
+    let execute = |kind| SessionRecord {
+        at_unix_ms: hcore::events::now_unix_ms(),
+        kind: Some(kind),
+        session: None,
+    };
+    append_record(
+        &dir_a,
+        &execute(BuildEventKind::ExecuteStart {
+            addr: quiet.format(),
+            driver: "bash".into(),
+            cache: true,
+            declared: None,
+            reserved: None,
+            queued_ms: None,
+            admitted: None,
+            output_groups: Vec::new(),
+        }),
+    );
+    let err = b
+        .open_log(&quiet, &located)
+        .await
+        .expect_err("running, nothing written");
+    let yet = err.downcast_ref::<NoOutputYet>().expect("NoOutputYet");
+    assert_eq!(yet.session, id_a.encode());
+    // Followed, it waits for the run's first byte, and ends with the run
+    // when it writes none.
+    let mut f = b
+        .follow_log(&quiet, &located, false)
+        .await?
+        .expect("a follower");
+    assert_eq!(f.started_in(), Some(id_a.encode().as_str()));
+    assert_eq!(f.poll()?, FollowStep::Idle);
+    append_record(
+        &dir_a,
+        &execute(BuildEventKind::ExecuteEnd {
+            addr: quiet.format(),
+            error: None,
+        }),
+    );
+    let mut got = Vec::new();
+    assert!(poll_until(&mut f, &mut got, |_| false).await);
+    assert!(got.is_empty());
+    assert!(
+        b.open_log(&quiet, &located)
+            .await
+            .is_err_and(|e| e.is::<NoLiveLogs>()),
+        "the run over, the old heph is all that is left"
     );
     drop(held);
     assert_eq!(open(&b, "//p:never", &located).await?, None);

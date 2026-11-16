@@ -28,7 +28,7 @@ use crate::engine::log_api::TAIL_MAX;
 use crate::engine::request_state::RequestState;
 use crate::engine::{
     Engine, FollowStep, LogFollower, LogInfo, LogOptions, LogSource, LogUnavailable, NoLiveLogs,
-    OpenLog,
+    NoOutputYet, OpenLog,
 };
 use crate::htaddr::{self, Addr};
 use crate::tui::session::format::files;
@@ -185,6 +185,16 @@ where
             return Ok(Shown::Nothing);
         }
         Err(e) => {
+            if let Some(e) = e.downcast_ref::<NoOutputYet>() {
+                say(
+                    &mut err,
+                    &format!(
+                        "heph: no output yet for {addr}: running in session {} and nothing written; heph log -f {addr} follows it",
+                        e.session
+                    ),
+                );
+                return Ok(Shown::Nothing);
+            }
             if let Some(e) = e.downcast_ref::<NoLiveLogs>() {
                 say(
                     &mut err,
@@ -284,9 +294,15 @@ fn print_followed(
     mut err: impl Write,
 ) -> anyhow::Result<Shown> {
     let mut found = f.info();
-    match &found {
-        Some(info) => say(&mut err, &following(addr, info, sessions)),
-        None => say(&mut err, &format!("{addr} · waiting for a run to start")),
+    // Following a run that has written nothing yet.
+    let started = f.started_in().map(str::to_owned);
+    match (&found, &started) {
+        (Some(info), _) => say(&mut err, &following(addr, info, sessions)),
+        (None, Some(session)) => say(
+            &mut err,
+            &format!("{addr} · running in session {session} · no output yet · following"),
+        ),
+        (None, None) => say(&mut err, &format!("{addr} · waiting for a run to start")),
     }
     // `-n`: the bytes already there, held until caught up, then only their
     // last N lines printed.
@@ -347,6 +363,8 @@ fn print_followed(
                 if let Some(start) = live {
                     let took = since(start, hcore::events::now_unix_ms());
                     say(&mut err, &ended(addr, f.replaced_by(), &took));
+                } else if found.is_none() && started.is_some() {
+                    say(&mut err, &format!("{addr} · the run ended with no output"));
                 }
                 break;
             }

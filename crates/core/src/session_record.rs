@@ -93,6 +93,16 @@ pub enum LocatedRunLog {
         at_unix_ms: u64,
         session: String,
     },
+    /// The addr is running in `session`, which records run logs, and has
+    /// written nothing yet: no live file, no record. Its first byte makes it
+    /// [`Self::Live`]. Beats [`Self::Unsupported`]: a run seen going on is
+    /// never "records no live logs" because another heph is.
+    Started {
+        /// When its `ExecuteStart` was recorded, in milliseconds since the
+        /// epoch.
+        at_unix_ms: u64,
+        session: String,
+    },
     /// No live session recorded a log of the addr, but `session`, a live
     /// session of this workspace, runs a heph that records no live logs: it
     /// may be running the addr unseen. Answered only when nothing better was
@@ -101,11 +111,12 @@ pub enum LocatedRunLog {
 }
 
 impl LocatedRunLog {
-    /// The record found; `None` for [`Self::Unsupported`].
+    /// The record found; `None` for [`Self::Started`] and
+    /// [`Self::Unsupported`].
     pub fn record(&self) -> Option<&RunLogRecord> {
         match self {
             Self::Live { record, .. } | Self::Ended { record, .. } => Some(record),
-            Self::Unsupported { .. } => None,
+            Self::Started { .. } | Self::Unsupported { .. } => None,
         }
     }
 }
