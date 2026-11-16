@@ -562,11 +562,16 @@ impl ManagedDriver for GoGolistDriver {
         .with_context(|| format!("wait for go list for {}", def.import_path))?;
 
         // stderr is log; stdout is the package graph parsed below — data, never
-        // the log. A failure's stderr also reaches the message as a tail, as
-        // before; an older host keeps no log of `go list`.
-        ToolLog::new(&mut req.request)
-            .write(&output, Streams::STDERR)
-            .await;
+        // the log. A failed `go list` has no answer, so both streams are its
+        // account and reach the log (`tool_log.rs`'s rule); its stderr also
+        // reaches the message as a tail, as before. An older host keeps no
+        // log of `go list`.
+        let streams = if output.status.success() {
+            Streams::STDERR
+        } else {
+            Streams::BOTH
+        };
+        ToolLog::new(&mut req.request).write(&output, streams).await;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1211,6 +1216,31 @@ mod tests {
         /// `log_capture`. The real driver runs a stand-in `go` from the SDK.
         #[tokio::test]
         async fn go_list_json_never_reaches_the_log() {
+            let (res, out, err) = run_go_list(
+                "printf '{\"ImportPath\":\"example.com/mylib\",\"Name\":\"mylib\"}\\n'\n\
+                 echo 'go: finding example.com/mylib' >&2",
+            )
+            .await;
+            assert_eq!(err, "go: finding example.com/mylib\n", "run: {res:?}");
+            assert_eq!(out, "", "the package graph is data, never the log");
+        }
+
+        /// A failed `go list` has no answer: both its streams are its account
+        /// and reach the log, and the message keeps its stderr tail.
+        #[tokio::test]
+        async fn a_failed_go_list_logs_both_streams() {
+            let (res, out, err) =
+                run_go_list("echo 'partial-graph'\necho 'go: no such package' >&2\nexit 1").await;
+            assert_eq!(err, "go: no such package\n", "run: {res:?}");
+            assert_eq!(out, "partial-graph\n", "a failure's stdout is its account");
+            let e = res.expect_err("a failed go list fails the run");
+            assert!(format!("{e:#}").contains("go: no such package"), "{e:#}");
+        }
+
+        /// Runs the real golist driver under `log_capture` with a stand-in `go`
+        /// running `script`; returns the run's result and what reached the
+        /// stdout and stderr writers.
+        async fn run_go_list(script: &str) -> (anyhow::Result<()>, String, String) {
             let ct = noop_ctoken();
             let version = crate::plugingo::toolchain::DEFAULT_GO_VERSION;
             let sdk_addr = crate::plugingo::toolchain::toolchain_addr(version);
@@ -1245,11 +1275,7 @@ mod tests {
                 artifact: InputArtifact {
                     r#type: Type::Dep,
                     origin_id: sdk_input.origin_id.clone(),
-                    content: fake_sdk_with(
-                        &goroot,
-                        "printf '{\"ImportPath\":\"example.com/mylib\",\"Name\":\"mylib\"}\\n'\n\
-                         echo 'go: finding example.com/mylib' >&2",
-                    ),
+                    content: fake_sdk_with(&goroot, script),
                 },
                 origin_id: sdk_input.origin_id.clone(),
                 source_addr: sdk_addr,
@@ -1275,13 +1301,7 @@ mod tests {
             // Whether the stand-in's package survives the driver's checks is
             // not what is tested: the log is written as soon as `go list` exits.
             let res = os.run_inner(run, &ct, false).await.map(drop);
-
-            assert_eq!(
-                err.text(),
-                "go: finding example.com/mylib\n",
-                "run: {res:?}"
-            );
-            assert_eq!(out.text(), "", "the package graph is data, never the log");
+            (res, out.text(), err.text())
         }
     }
 
