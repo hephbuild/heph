@@ -9,7 +9,7 @@ use std::sync::Arc;
 use crossterm::style::Stylize;
 
 use crate::engine::error::{
-    CancelledError, FailureFixes, FixesNotWritten, FrozenCheckError, TargetFailure,
+    CancelledError, FailureFixes, FixesNotWritten, FrozenCheckError, SandboxFate, TargetFailure,
 };
 use crate::hmemoizer::{chain_frames, downcast_chain_ref};
 use crate::tui::color::stderr_color_enabled as color_enabled;
@@ -173,10 +173,13 @@ fn render_target_failure_with(f: &TargetFailure, color: bool, tail: LogTailIn) -
     if let Some(path) = f.log.as_ref().and_then(|l| l.path()) {
         out.push_str(&format!("  full log: {}\n", path.display()));
     }
-    // Someone used to inspecting the failed sandbox learns where it went (and
-    // how to keep the next one), or where the kept one is.
-    if let Some(sandbox) = &f.sandbox {
-        out.push_str(&format!("  sandbox: {sandbox}\n"));
+    // Only a sandbox whose fate is out of the ordinary gets a line: the one
+    // kept, the one removed in spite of the flag, the one left behind an
+    // abandoned run. Removing a failed sandbox is the default and goes
+    // unsaid, as in the interactive report.
+    match &f.sandbox {
+        Some(SandboxFate::Removed) | None => {}
+        Some(sandbox) => out.push_str(&format!("  sandbox: {sandbox}\n")),
     }
     if let Some(outputs) = &f.outputs {
         out.push_str(&format!("  outputs: {}\n", outputs.display()));
@@ -929,7 +932,7 @@ fn render_anyhow_to_string(e: &anyhow::Error, color: bool) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::error::{LogTail, ProcessFailed, SandboxFate};
+    use crate::engine::error::{LogTail, ProcessFailed};
     use anyhow::Context as _;
     use std::sync::Arc;
 
@@ -1643,12 +1646,12 @@ mod tests {
         assert!(boxed.contains("2 │ last words"), "{boxed}");
     }
 
-    /// The box's `sandbox:` line, after the log footer, for each fate: removed
-    /// (naming the flag that keeps it), kept (with the path the user opted in
-    /// for), removed for credential material in spite of the flag, left
-    /// behind an abandoned run. No fate, no line.
+    /// The box's `sandbox:` line, after the log footer, for each fate out of
+    /// the ordinary: kept (with the path the user opted in for), removed for
+    /// credential material in spite of the flag, left behind an abandoned
+    /// run. A sandbox removed as the default, or no fate, gets no line.
     #[test]
-    fn failure_box_names_a_removed_sandbox() {
+    fn failure_box_names_an_unusual_sandbox_fate() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("log.txt");
         std::fs::write(&path, "line\n").unwrap();
@@ -1663,10 +1666,6 @@ mod tests {
 
         let kept_at = dir.path().join("sandbox/p/__target_a");
         for (fate, line) in [
-            (
-                SandboxFate::Removed,
-                "removed (rerun with --keep-failed-sandboxes to keep it)".to_owned(),
-            ),
             (
                 SandboxFate::Kept(kept_at.clone()),
                 format!("{} (kept)", kept_at.display()),
@@ -1693,9 +1692,19 @@ mod tests {
             );
         }
 
-        let none = TargetFailure::new(addr, None, anyhow::anyhow!("boom")).with_log(log());
-        let rendered = render_target_failure(&none, false);
-        assert!(!rendered.contains("sandbox:"), "{rendered}");
+        for fate in [Some(SandboxFate::Removed), None] {
+            let failure = TargetFailure::new(addr.clone(), None, anyhow::anyhow!("boom"))
+                .with_log(log())
+                .with_sandbox(fate.clone());
+            let rendered = render_target_failure(&failure, false);
+            assert!(
+                rendered.ends_with(&format!(
+                    "  full log: {}\n  log: heph log //p:a\n",
+                    path.display()
+                )),
+                "{fate:?}: {rendered}"
+            );
+        }
     }
 
     #[test]

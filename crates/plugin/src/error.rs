@@ -650,7 +650,8 @@ pub struct TargetFailure {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SandboxFate {
     /// Removed once the failure slot was filled: the default, which
-    /// `--keep-failed-sandboxes` would have changed.
+    /// `--keep-failed-sandboxes` would have changed. Neither the box nor the
+    /// report says anything about it.
     Removed,
     /// Left on disk under `--keep-failed-sandboxes`, at this path, until the
     /// target's next run.
@@ -667,7 +668,7 @@ pub enum SandboxFate {
 impl fmt::Display for SandboxFate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Removed => f.write_str("removed (rerun with --keep-failed-sandboxes to keep it)"),
+            Self::Removed => f.write_str("removed"),
             Self::Kept(path) => write!(f, "{} (kept)", path.display()),
             Self::RemovedMaterial => f.write_str("removed (credential material)"),
             Self::LeftAbandoned => f.write_str("left (run abandoned after timeout)"),
