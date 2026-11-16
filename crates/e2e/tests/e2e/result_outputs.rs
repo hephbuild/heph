@@ -12,7 +12,7 @@
 use crate::common::Workspace;
 use hcore::events::OutputGroupSummary;
 use heph::engine::event::BuildEventKind;
-use heph::engine::{Engine, ListedFile, ListedKind, OutputListing, OutputMatcher, ResultOptions};
+use heph::engine::{Engine, ListedKind, OutputListing, OutputMatcher, ResultOptions};
 use heph::htaddr::parse_addr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -89,11 +89,6 @@ fn rows(listing: &OutputListing, group: &str) -> Vec<(PathBuf, ListedKind, u64)>
         .collect()
 }
 
-/// A content hash as the listing renders it: 16 hex digits.
-fn is_hash(h: Option<&str>) -> bool {
-    h.is_some_and(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
-}
-
 const BUILD: &str = r#"target(name = "t", driver = "bash",
     out = {"a": "a.txt", "b": "b/", "e": "empty/"},
     run = "printf aaaa > a.txt; mkdir -p b/sub empty; printf 1 > b/one.txt; printf 22 > b/sub/two.txt")"#;
@@ -101,7 +96,8 @@ const BUILD: &str = r#"target(name = "t", driver = "bash",
 /// A run sends the declared group names on `ExecuteStart` and every group,
 /// with its stored size and hash, on `ResultOutputs`; a cache hit sends none;
 /// the listing holds the groups the run reported and reads each file's path,
-/// size and content hash, with no row for a directory that holds files.
+/// kind and size from the tar headers, with no row for a directory that holds
+/// files.
 #[tokio::test]
 async fn executed_sends_result_outputs_a_hit_none_and_the_listing_reads_files() -> anyhow::Result<()>
 {
@@ -180,21 +176,6 @@ async fn executed_sends_result_outputs_a_hit_none_and_the_listing_reads_files() 
         [],
         "the packer keeps no entry for an empty directory: its group is listed, with no rows"
     );
-    let two: &ListedFile = listing
-        .groups
-        .iter()
-        .flat_map(|g| &g.files)
-        .find(|f| f.path.ends_with("two.txt"))
-        .expect("two.txt");
-    let one = listing
-        .groups
-        .iter()
-        .flat_map(|g| &g.files)
-        .find(|f| f.path.ends_with("one.txt"))
-        .expect("one.txt");
-    assert!(is_hash(two.hash.as_deref()) && is_hash(one.hash.as_deref()));
-    assert_ne!(two.hash, one.hash, "a hash of each file's own bytes");
-
     // By input hash: the same entry; an unknown one is none.
     let same = ws
         .engine
@@ -256,7 +237,6 @@ async fn a_failure_sends_none_and_its_kept_files_are_listed() -> anyhow::Result<
             (PathBuf::from("p/report.txt"), ListedKind::File, 6),
         ]
     );
-    assert!(kept.kept.iter().all(|f| is_hash(f.hash.as_deref())));
     assert!(kept.fixes.is_empty(), "not an in_place run");
     assert_eq!(ws.engine.output_listing(&addr, None)?, None, "no entry");
     Ok(())

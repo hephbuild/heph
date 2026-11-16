@@ -7,16 +7,16 @@
 //! asks for them here, off its render task, for the one target it shows.
 //!
 //! - [`Engine::output_listing`]: a local cache entry's output groups, each
-//!   file's path, size and content hash, read from the tar headers and the
-//!   file bytes. A group whose blob is not local (a remote hit that did not
-//!   pull it) is listed with why, never fetched.
+//!   file's path, kind and size, read from the tar headers alone: no file's
+//!   bytes are read. A group carries its `hashout` from the manifest. A group
+//!   whose blob is not local (a remote hit that did not pull it) is listed
+//!   with why, never fetched.
 //! - [`Engine::failure_outputs`]: what a failed run kept, from its failure
 //!   slot: the `failure_out` matches under `out/` and the fixes an `in_place`
 //!   run wrote back.
 //!
-//! **Reading never builds**: no resolve, no hash of any input, no lock of any
-//! target, no run. Nothing here reaches a hash: the per-file hashes are for a
-//! human to compare, computed here and nowhere else.
+//! **Reading never builds**: no resolve, no hash of any input or file, no
+//! lock of any target, no run.
 //!
 //! **Blocking.** Both read files; call them through `hcore::blocking`.
 
@@ -29,19 +29,15 @@ use crate::engine::local_cache::{
 };
 use anyhow::Context as _;
 use hcore::hartifactcontent::ReadSeek;
-use hcore::hartifactcontent::tar_index::{IndexEntry, IndexEntryKind, TarIndex};
+use hcore::hartifactcontent::tar_index::{IndexEntryKind, TarIndex};
 use hmodel::htaddr::Addr;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Largest stored blob read into memory when its backend has no seekable
 /// reader (a blob under the spill threshold, held in sqlite).
 const IN_MEMORY_MAX: u64 = 64 << 20;
-/// File bytes one listing hashes at most. A file that does not fit what is
-/// left has `hash: None`: a listing of a multi-gigabyte output stays mostly
-/// a header read.
-pub const HASH_BUDGET: u64 = 256 << 20;
 
 /// A cache entry's outputs, by group.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,9 +76,6 @@ pub struct ListedFile {
     pub kind: ListedKind,
     /// The file's bytes; 0 for a symlink or a directory.
     pub size: u64,
-    /// xxh3-64 of the file's bytes, 16 hex digits. `None` for a symlink, a
-    /// directory, or a file past [`HASH_BUDGET`].
-    pub hash: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,7 +111,6 @@ impl Engine {
         let Some(manifest) = self.listed_manifest(addr, hashin)? else {
             return Ok(None);
         };
-        let mut budget = HASH_BUDGET;
         let mut groups: Vec<ListedGroup> = Vec::new();
         let mut outputs: Vec<&ManifestArtifact> = manifest
             .artifacts
@@ -144,13 +136,7 @@ impl Engine {
                     groups.last_mut().context("a group was just pushed")?
                 }
             };
-            match list_artifact(
-                self.local_cache.as_ref(),
-                addr,
-                &manifest.hashin,
-                artifact,
-                &mut budget,
-            ) {
+            match list_artifact(self.local_cache.as_ref(), addr, &manifest.hashin, artifact) {
                 Ok(files) => group.files.extend(files),
                 Err(Unavailable(reason)) => {
                     group.unavailable.get_or_insert(reason);
@@ -176,14 +162,8 @@ impl Engine {
         };
         let slot = self.failure_slots.slot_dir(addr);
         let mut kept = Vec::new();
-        let mut budget = HASH_BUDGET;
-        walk_kept(
-            &slot.join(failure_slot::OUT),
-            Path::new(""),
-            &mut budget,
-            &mut kept,
-        )
-        .with_context(|| format!("listing what the failed run of {addr} kept"))?;
+        walk_kept(&slot.join(failure_slot::OUT), Path::new(""), &mut kept)
+            .with_context(|| format!("listing what the failed run of {addr} kept"))?;
         kept.sort_by(|a, b| a.path.cmp(&b.path));
         let fixes = match std::fs::read_to_string(slot.join(failure_slot::FIXES)) {
             Ok(text) => text
@@ -237,14 +217,12 @@ impl Engine {
 /// Why a group's files could not be read.
 struct Unavailable(String);
 
-/// The rows of one stored artifact: its tar's headers, and the bytes of each
-/// file while `budget` lasts.
+/// The rows of one stored artifact, from its tar's headers.
 fn list_artifact(
     cache: &dyn LocalCache,
     addr: &Addr,
     hashin: &str,
     artifact: &ManifestArtifact,
-    budget: &mut u64,
 ) -> Result<Vec<ListedFile>, Unavailable> {
     if artifact.content_type != ManifestArtifactContentType::Tar {
         return Err(Unavailable("a cpio artifact cannot be listed".into()));
@@ -294,24 +272,18 @@ fn list_artifact(
     };
     let index = TarIndex::build(&mut decoded)
         .map_err(|e| Unavailable(format!("reading the tar: {e:#}")))?;
-    rows(&index, |entry| {
-        hash_member(&mut decoded, entry, budget)
-            .map_err(|e| Unavailable(format!("reading a file of the tar: {e}")))
-    })
+    Ok(rows(&index))
 }
 
 /// The rows of a tar index, in path order: every file and symlink, and each
-/// directory nothing is under. `hash` reads one file's hash.
-fn rows<E>(
-    index: &TarIndex,
-    mut hash: impl FnMut(&IndexEntry) -> Result<Option<String>, E>,
-) -> Result<Vec<ListedFile>, E> {
+/// directory nothing is under.
+fn rows(index: &TarIndex) -> Vec<ListedFile> {
     let mut out = Vec::new();
     let mut entries = index.entries.iter().peekable();
     while let Some((path, entry)) = entries.next() {
-        let (kind, size, h) = match &entry.kind {
-            IndexEntryKind::File => (ListedKind::File, entry.size, hash(entry)?),
-            IndexEntryKind::Symlink(target) => (ListedKind::Symlink(target.clone()), 0, None),
+        let (kind, size) = match &entry.kind {
+            IndexEntryKind::File => (ListedKind::File, entry.size),
+            IndexEntryKind::Symlink(target) => (ListedKind::Symlink(target.clone()), 0),
             // Paths sort by component, so whatever is under a directory
             // follows it at once.
             IndexEntryKind::Dir => {
@@ -321,66 +293,21 @@ fn rows<E>(
                 {
                     continue;
                 }
-                (ListedKind::Dir, 0, None)
+                (ListedKind::Dir, 0)
             }
         };
         out.push(ListedFile {
             path: path.clone(),
             kind,
             size,
-            hash: h,
         });
     }
-    Ok(out)
-}
-
-/// xxh3-64 of a tar member's bytes, or `None` once `budget` is spent.
-fn hash_member(
-    src: &mut (impl Read + Seek),
-    entry: &IndexEntry,
-    budget: &mut u64,
-) -> io::Result<Option<String>> {
-    if !spend(budget, entry.size) {
-        return Ok(None);
-    }
-    src.seek(SeekFrom::Start(entry.data_offset))?;
-    hash_reader(src.take(entry.size)).map(Some)
-}
-
-/// Take `size` bytes from what is left to hash, if that much is left. A file
-/// too big for what is left is not hashed; smaller ones after it still are.
-fn spend(budget: &mut u64, size: u64) -> bool {
-    match budget.checked_sub(size) {
-        Some(left) => {
-            *budget = left;
-            true
-        }
-        None => false,
-    }
-}
-
-fn hash_reader(mut r: impl Read) -> io::Result<String> {
-    let mut h = xxhash_rust::xxh3::Xxh3::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        match r.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => h.update(buf.get(..n).unwrap_or_default()),
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(format!("{:016x}", h.digest()))
+    out
 }
 
 /// The files under a slot's `out/` (only regular files are unpacked there),
 /// as workspace-relative rows. A missing `out/` is no rows.
-fn walk_kept(
-    dir: &Path,
-    rel: &Path,
-    budget: &mut u64,
-    out: &mut Vec<ListedFile>,
-) -> io::Result<()> {
+fn walk_kept(dir: &Path, rel: &Path, out: &mut Vec<ListedFile>) -> io::Result<()> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -391,19 +318,12 @@ fn walk_kept(
         let path = rel.join(entry.file_name());
         let ty = entry.file_type()?;
         if ty.is_dir() {
-            walk_kept(&entry.path(), &path, budget, out)?;
+            walk_kept(&entry.path(), &path, out)?;
         } else if ty.is_file() {
-            let size = entry.metadata()?.len();
-            let hash = if spend(budget, size) {
-                Some(hash_reader(std::fs::File::open(entry.path())?)?)
-            } else {
-                None
-            };
             out.push(ListedFile {
                 path,
                 kind: ListedKind::File,
-                size,
-                hash,
+                size: entry.metadata()?.len(),
             });
         }
     }
