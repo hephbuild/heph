@@ -1381,24 +1381,25 @@ pub(crate) async fn run_tool(
 
     if !status.success() {
         let tail = err_tail.render();
-        let tail = if tail.trim().is_empty() {
-            out_tail.render()
+        let (tail, tail_logged) = if tail.trim().is_empty() {
+            (out_tail.render(), streams.stdout)
         } else {
-            tail
+            (tail, streams.stderr)
         };
         // The tool's output is in the target's log — the engine's, under
         // `log_capture`, or the plugin's own `log.txt`, returned as the
         // failure's `Log` artifact — and the failure box renders its tail, the
         // same shape an `exec` target's failure has. Pasting it into the
         // message as well printed BuildKit's whole progress inline with the
-        // error. Only an own log that could not be opened leaves the message as
-        // the one place the output survives.
+        // error. Only an own log that could not be opened, or a tail from a
+        // stream that is not log (a failed `inspect`'s stdout), leaves the
+        // message as the one place the output survives.
         let log = io.log_artifact();
         let failed = ToolFailed {
             what,
             status: status.to_string(),
             tail: tail.trim_end().to_string(),
-            logged: io.is_captured() || log.is_some(),
+            logged: tail_logged && (io.is_captured() || log.is_some()),
         };
         let process = anyhow::Error::new(hplugin::error::ProcessFailed::from_status(status));
         return Err(match log {
