@@ -28,7 +28,9 @@ use crate::engine::error::{
 };
 use crate::engine::request_state::TookDown;
 use crate::hmemoizer::downcast_chain_ref;
-use crate::tui::text::{Redact, clean_inline, cut_right, expand_tabs, sanitize_log};
+use crate::tui::text::{
+    Redact, clean_inline, cut_right, expand_tabs, fit_styled, sanitize_log, sanitize_log_keep_sgr,
+};
 
 /// How many kept `failure_out` groups a block names before `+N more`.
 const KEPT_GROUPS_SHOWN: usize = 5;
@@ -169,6 +171,13 @@ impl ReportContext {
         }
         match &block.tail {
             Some((text, _)) if text.trim().is_empty() => body.push("empty log".to_owned()),
+            // In colour, the target's own SGRs stay (I13's exception, user
+            // decision 2026-11-16); heph adds none.
+            Some((text, _)) if color => body.extend(
+                sanitize_log_keep_sgr(text.as_bytes())
+                    .lines()
+                    .map(|l| self.cut_styled_row(l)),
+            ),
             Some((text, _)) => body.extend(
                 sanitize_log(text.as_bytes())
                     .lines()
@@ -304,7 +313,26 @@ impl ReportContext {
 
     /// One `│` row: tabs expanded, cut to the width past its 4-column gutter.
     fn cut_row(&self, line: &str) -> String {
-        cut_right(&expand_tabs(line), self.width.saturating_sub(4).max(1)).into_owned()
+        cut_right(&expand_tabs(line), self.row_width()).into_owned()
+    }
+
+    /// A `│` row of a tail line that kept the target's SGRs, laid out by its
+    /// text alone. A line naming heph's home loses its colours: an SGR
+    /// inside the path would hide it from the redaction (I9 wins).
+    fn cut_styled_row(&self, line: &str) -> String {
+        if !line.contains('\x1b') {
+            return self.cut_row(&self.redact.apply(line));
+        }
+        let plain = sanitize_log(line.as_bytes());
+        match self.redact.apply(&plain) {
+            std::borrow::Cow::Borrowed(_) => fit_styled(line, self.row_width()),
+            std::borrow::Cow::Owned(redacted) => self.cut_row(&redacted),
+        }
+    }
+
+    /// The columns a `│` row's text has past its 4-column gutter.
+    fn row_width(&self) -> usize {
+        self.width.saturating_sub(4).max(1)
     }
 }
 
@@ -558,6 +586,75 @@ mod tests {
             )),
             "{colored:?}"
         );
+        let stripped: String = colored
+            .split_inclusive('\n')
+            .map(|l| {
+                let (line, nl) = l.strip_suffix('\n').map_or((l, ""), |s| (s, "\n"));
+                format!("{}{nl}", clean_inline(line))
+            })
+            .collect();
+        assert_eq!(stripped, plain);
+    }
+
+    /// In colour, a tail line keeps the target's own SGRs and ends with a
+    /// reset; every other escape still goes, a long line is cut by its text,
+    /// and a line naming heph's home is redacted and loses its colours.
+    /// Without colour, the tail is what it always was: no escape at all.
+    /// With every escape taken off, the coloured report is the plain one.
+    #[test]
+    fn report_tail_keeps_target_colours_only_in_colour() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let long = format!("\x1b[33m{}\x1b[0m", "w".repeat(80));
+        let home = format!("\x1b[1m{HOME}\x1b[0m/sandbox/x");
+        let lines = [
+            "\x1b[31merror: bad\x1b[0m",
+            "\x1b[2Jcleared\x1b[H \x1b]52;c;aGk=\x07\u{9b}31mz",
+            "plain",
+            long.as_str(),
+            home.as_str(),
+        ];
+        let failure = || exited(dir.path(), "//p:t", &lines, 10);
+        let plain = report_in(vec![failure()], &[], false);
+        let colored = report_in(vec![failure()], &[], true);
+
+        assert!(!plain.contains('\x1b'), "{plain:?}");
+        assert!(plain.contains("  │ error: bad\n"), "{plain:?}");
+        assert!(plain.contains("  │ cleared z\n"), "{plain:?}");
+
+        let bar = "│".dim();
+        assert!(
+            colored.contains(&format!("  {bar} \x1b[31merror: bad\x1b[0m\x1b[0m\n")),
+            "{colored:?}"
+        );
+        assert!(
+            colored.contains(&format!("  {bar} cleared z\n")),
+            "{colored:?}"
+        );
+        assert!(colored.contains(&format!("  {bar} plain\n")), "{colored:?}");
+        assert!(
+            colored.contains(&format!(
+                "  {bar} \x1b[33m{}…\x1b[0m\x1b[0m\n",
+                "w".repeat(55)
+            )),
+            "{colored:?}"
+        );
+        assert!(
+            colored.contains(&format!("  {bar} <heph home>/sandbox/x\n")),
+            "{colored:?}"
+        );
+        assert!(!colored.contains(HOME), "{colored:?}");
+        // No escape but SGRs: each ESC opens an `ESC [ digits/; m`.
+        for (i, _) in colored.match_indices('\x1b') {
+            let rest = colored.get(i + 1..).unwrap_or("");
+            let end = rest.find('m').expect("an SGR ends with m");
+            let params = rest.get(1..end).unwrap_or("");
+            assert!(
+                rest.starts_with('[') && params.chars().all(|c| c.is_ascii_digit() || c == ';'),
+                "{rest:?}"
+            );
+        }
+        assert!(!colored.contains('\u{9b}'), "{colored:?}");
+
         let stripped: String = colored
             .split_inclusive('\n')
             .map(|l| {

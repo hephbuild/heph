@@ -8,6 +8,11 @@
 //! output cannot leave the alternate screen and an OSC 52 cannot write the
 //! clipboard. Only `heph log` writes a log as it is, to its own stdout.
 //!
+//! I13's one exception (user decision 2026-11-16): the failure report's tail,
+//! when the report is drawn in colour, keeps the target's own SGR colours
+//! through [`sanitize_log_keep_sgr`] — SGR only, each line reset at its end.
+//! The dashboard's Log tab and LAST LINE keep stripping everything.
+//!
 //! Widths are display widths (`unicode-width`): a CJK character takes two
 //! columns, a combining mark none, and a cut never lands inside a character
 //! or between a character and its combining marks.
@@ -39,22 +44,37 @@ fn opens_string(c: char) -> bool {
     matches!(c, '\u{90}' | '\u{98}' | '\u{9d}' | '\u{9e}' | '\u{9f}')
 }
 
+/// The longest SGR parameter run [`sanitize_log_keep_sgr`] keeps: a
+/// truecolor foreground and background with attributes fit with room to
+/// spare; a longer run is not a colour a target meant, and goes whole.
+const SGR_PARAMS_MAX: usize = 64;
+
+/// The reset a line that kept an SGR ends with, so its colour never reaches
+/// what is drawn after it.
+pub const SGR_RESET: &str = "\x1b[0m";
+
 /// Strip control characters from `s`, keeping tab and newline. An escape
 /// sequence goes whole: CSI (`ESC [` or U+009B) up to its final byte, and a
 /// control string (OSC, DCS, SOS, PM, APC) up to BEL or ST. A sequence that
 /// breaks off early loses only its introducer, and its remaining text stays.
-fn strip_controls(s: &str, out: &mut String) {
+///
+/// With `keep_sgr`, an `ESC [ <params> m` whose params are digits and `;`
+/// only, at most [`SGR_PARAMS_MAX`] of them, is written as it is. Returns
+/// whether one was.
+fn strip_controls(s: &str, out: &mut String, keep_sgr: bool) -> bool {
+    let mut kept = false;
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if !is_control(c) {
             out.push(c);
             continue;
         }
-        let csi = match c {
+        // Whether the CSI may be an SGR to keep: `ESC [` only, never U+009B.
+        let sgr_candidate = match c {
             '\x1b' => match chars.peek() {
                 Some('[') => {
                     chars.next();
-                    true
+                    keep_sgr
                 }
                 Some(']' | 'P' | 'X' | '^' | '_') => {
                     chars.next();
@@ -70,29 +90,43 @@ fn strip_controls(s: &str, out: &mut String) {
                 }
                 _ => continue,
             },
-            '\u{9b}' => true,
+            '\u{9b}' => false,
             c if opens_string(c) => {
                 skip_string(&mut chars);
                 continue;
             }
             _ => continue,
         };
-        if csi {
-            // Parameters and intermediates, then one final byte.
-            while let Some(&n) = chars.peek() {
-                match n {
-                    '\x20'..='\x3f' => {
-                        chars.next();
+        // Parameters and intermediates, then one final byte. While it may
+        // still be an SGR, its parameters are kept aside: `params` holds
+        // only digits and `;`, so it is never more than SGR_PARAMS_MAX long.
+        let mut params = String::new();
+        let mut sgr = sgr_candidate;
+        while let Some(&n) = chars.peek() {
+            match n {
+                '\x20'..='\x3f' => {
+                    chars.next();
+                    if sgr && (n.is_ascii_digit() || n == ';') && params.len() < SGR_PARAMS_MAX {
+                        params.push(n);
+                    } else {
+                        sgr = false;
                     }
-                    '\x40'..='\x7e' => {
-                        chars.next();
-                        break;
-                    }
-                    _ => break,
                 }
+                '\x40'..='\x7e' => {
+                    chars.next();
+                    if sgr && n == 'm' {
+                        out.push_str("\x1b[");
+                        out.push_str(&params);
+                        out.push('m');
+                        kept = true;
+                    }
+                    break;
+                }
+                _ => break,
             }
         }
     }
+    kept
 }
 
 /// Skip a control string's body up to and including its terminator: BEL,
@@ -120,15 +154,111 @@ fn skip_string(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
 /// - Every other C0 and C1 control is removed, escape sequences whole. Tab
 ///   and newline stay; [`expand_tabs`] lays tabs out for a cell grid.
 pub fn sanitize_log(bytes: &[u8]) -> String {
+    sanitize(bytes, false)
+}
+
+/// Log bytes as [`sanitize_log`] makes them, except that the target's own
+/// colours stay: an SGR (`ESC [ <params> m`, params digits and `;` only, at
+/// most [`SGR_PARAMS_MAX`]) is kept, and a line that kept one ends with
+/// [`SGR_RESET`]. Every other escape goes, `CSI m` by U+009B included.
+///
+/// I13's one exception, for the failure report's tail when it is drawn in
+/// colour (user decision 2026-11-16). Cut such a line with [`fit_styled`],
+/// which never counts or splits an SGR.
+pub fn sanitize_log_keep_sgr(bytes: &[u8]) -> String {
+    sanitize(bytes, true)
+}
+
+fn sanitize(bytes: &[u8], keep_sgr: bool) -> String {
     let text = String::from_utf8_lossy(bytes);
     let mut out = String::with_capacity(text.len());
     let mut lines = text.split('\n').peekable();
     while let Some(line) = lines.next() {
         let line = line.strip_suffix('\r').unwrap_or(line);
         let shown = line.rsplit('\r').next().unwrap_or(line);
-        strip_controls(shown, &mut out);
+        if strip_controls(shown, &mut out, keep_sgr) {
+            out.push_str(SGR_RESET);
+        }
         if lines.peek().is_some() {
             out.push('\n');
+        }
+    }
+    out
+}
+
+/// A line from [`sanitize_log_keep_sgr`] split into its pieces: `true` for
+/// an SGR, `false` for text. Its only ESC opens a kept SGR, which runs to
+/// its `m`.
+fn styled_pieces(line: &str) -> impl Iterator<Item = (bool, &str)> {
+    let mut rest = line;
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        let (piece, sgr) = if rest.starts_with('\x1b') {
+            let end = rest.find('m').map_or(rest.len(), |i| i + 1);
+            (rest.split_at(end), true)
+        } else {
+            let end = rest.find('\x1b').unwrap_or(rest.len());
+            (rest.split_at(end), false)
+        };
+        rest = piece.1;
+        Some((sgr, piece.0))
+    })
+}
+
+/// A line from [`sanitize_log_keep_sgr`] laid out as [`expand_tabs`] then
+/// [`cut_right`] lay out its text: tabs expanded and the text cut to `max`
+/// columns, measured without the SGRs. Every SGR stays, a cut's ellipsis
+/// sitting where the text stopped, so the line still ends with its reset.
+pub fn fit_styled(line: &str, max: usize) -> String {
+    let mut expanded = String::with_capacity(line.len());
+    let mut visible = String::with_capacity(line.len());
+    let mut col = 0;
+    for (sgr, piece) in styled_pieces(line) {
+        if sgr {
+            expanded.push_str(piece);
+            continue;
+        }
+        for c in piece.chars() {
+            if c == '\t' {
+                let pad = TAB_STOP - col % TAB_STOP;
+                expanded.extend(std::iter::repeat_n(' ', pad));
+                visible.extend(std::iter::repeat_n(' ', pad));
+                col += pad;
+            } else {
+                expanded.push(c);
+                visible.push(c);
+                col += c.width().unwrap_or(0);
+            }
+        }
+    }
+    if width(&visible) <= max {
+        return expanded;
+    }
+    // Bytes of visible text to keep: `take_width` decides, as `cut_right`.
+    let mut left = if max == 0 {
+        0
+    } else {
+        take_width(&visible, max - 1).len()
+    };
+    let mut cut = false;
+    let mut out = String::with_capacity(expanded.len());
+    for (sgr, piece) in styled_pieces(&expanded) {
+        if sgr {
+            out.push_str(piece);
+        } else if !cut {
+            if piece.len() <= left {
+                out.push_str(piece);
+                left -= piece.len();
+            } else {
+                out.push_str(piece.get(..left).unwrap_or(""));
+                if max > 0 {
+                    out.push_str(ELLIPSIS);
+                }
+                cut = true;
+                left = 0;
+            }
         }
     }
     out
@@ -144,7 +274,7 @@ pub fn clean_inline(s: &str) -> Cow<'_, str> {
         return Cow::Borrowed(s);
     }
     let mut stripped = String::with_capacity(s.len());
-    strip_controls(s, &mut stripped);
+    strip_controls(s, &mut stripped, false);
     Cow::Owned(stripped.replace(['\t', '\n'], " "))
 }
 
@@ -385,6 +515,96 @@ mod tests {
         // A megabyte with no newline comes through whole, and clean.
         let big = vec![b'x'; 1 << 20];
         assert_eq!(sanitize_log(&big).len(), 1 << 20);
+    }
+
+    /// I13's exception: the keep-SGR sanitizer keeps a target's colours and
+    /// nothing else a terminal would act on, and resets every line that kept
+    /// one. The adversarial rows: other CSIs, control strings, a sequence
+    /// split across lines, an over-long or non-numeric parameter run, and the
+    /// C1 introducer.
+    #[test]
+    fn keep_sgr_keeps_colours_and_strips_every_other_escape() {
+        let long = format!("\x1b[{}mx", "1;".repeat(SGR_PARAMS_MAX));
+        let at_max = format!("\x1b[{}mx", "1".repeat(SGR_PARAMS_MAX));
+        let cases: &[(&[u8], &str)] = &[
+            (b"plain", "plain"),
+            (b"\x1b[31mred\x1b[0m", "\x1b[31mred\x1b[0m\x1b[0m"),
+            (b"\x1b[mbare", "\x1b[mbare\x1b[0m"),
+            (b"\x1b[1;31mbold red", "\x1b[1;31mbold red\x1b[0m"),
+            (b"\x1b[38;5;196m256", "\x1b[38;5;196m256\x1b[0m"),
+            (
+                b"\x1b[38;2;255;0;0;48;2;0;0;255mtrue",
+                "\x1b[38;2;255;0;0;48;2;0;0;255mtrue\x1b[0m",
+            ),
+            // CSIs that are not SGR: cursor moves, clear, modes.
+            (b"a\x1b[2Jb\x1b[Hc\x1b[5Ad\x1b[?1049le", "abcde"),
+            // A private or colon-parameter `m` is not a plain SGR.
+            (b"\x1b[?31mx\x1b[38:2:255:0:0my\x1b[>4;2mz", "xyz"),
+            // An intermediate byte before `m`.
+            (b"\x1b[31 mx", "x"),
+            // OSC, DCS and friends.
+            (b"\x1b]8;;https://e.x\x1b\\link\x1b]8;;\x1b\\", "link"),
+            (b"\x1b]52;c;aGk=\x07after", "after"),
+            (b"\x1bPq#0;2\x1b\\dcs", "dcs"),
+            // Other escapes: reset, save cursor.
+            (b"\x1bcx\x1b7y", "xy"),
+            // C1 CSI, even one shaped as an SGR.
+            (b"\xc2\x9b31mc1", "c1"),
+            // An SGR split across lines is neither line's.
+            (b"a\x1b[3\n1mb", "a\n1mb"),
+            (b"trailing \x1b[31", "trailing "),
+            // CR keeps the last segment, colours of earlier segments gone.
+            (b"\x1b[31m10%\r\x1b[32m20%", "\x1b[32m20%\x1b[0m"),
+            (long.as_bytes(), "x"),
+            (
+                at_max.as_bytes(),
+                &format!("\x1b[{}mx\x1b[0m", "1".repeat(SGR_PARAMS_MAX)),
+            ),
+            // Lines that kept nothing get no reset.
+            (b"\x1b[31mr\nplain\n", "\x1b[31mr\x1b[0m\nplain\n"),
+        ];
+        for (input, want) in cases {
+            let got = sanitize_log_keep_sgr(input);
+            assert_eq!(got, *want, "input {input:?}");
+            // Stripping the kept SGRs leaves exactly what sanitize_log does,
+            // and no control at all.
+            let plain = sanitize_log(got.as_bytes());
+            assert_eq!(plain, sanitize_log(input), "input {input:?}");
+            assert!(!has_control(&plain), "{input:?}: {plain:?}");
+        }
+    }
+
+    /// A styled line is laid out by its text alone: tabs and the cut ignore
+    /// the SGRs, which all stay, and the reset still ends the line.
+    #[test]
+    fn fit_styled_measures_text_and_keeps_every_sgr() {
+        let red = "\x1b[31m";
+        let line = format!("{red}abcdef{SGR_RESET}");
+        assert_eq!(fit_styled(&line, 6), line);
+        assert_eq!(fit_styled(&line, 4), format!("{red}abc…{SGR_RESET}"));
+        assert_eq!(fit_styled(&line, 1), format!("{red}…{SGR_RESET}"));
+        assert_eq!(fit_styled(&line, 0), format!("{red}{SGR_RESET}"));
+        // A cut inside the second run: the first run's SGR, its text, then
+        // the cut, and the SGRs after it.
+        let two = format!("{red}ab\x1b[32mcd\x1b[1mef{SGR_RESET}");
+        assert_eq!(
+            fit_styled(&two, 4),
+            format!("{red}ab\x1b[32mc…\x1b[1m{SGR_RESET}")
+        );
+        // Tabs expand by visible column.
+        assert_eq!(
+            fit_styled(&format!("{red}a\tb{SGR_RESET}"), 20),
+            format!("{red}a       b{SGR_RESET}")
+        );
+        // Wide characters are measured by display width.
+        assert_eq!(
+            fit_styled(&format!("{red}宽字宽{SGR_RESET}"), 4),
+            format!("{red}宽…{SGR_RESET}")
+        );
+        // Unstyled, it is cut_right of expand_tabs.
+        for (s, max) in [("a\tbcdefghijkl", 9), ("宽字宽字", 5), ("short", 10)] {
+            assert_eq!(fit_styled(s, max), cut_right(&expand_tabs(s), max));
+        }
     }
 
     #[test]
