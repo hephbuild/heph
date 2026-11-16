@@ -5,21 +5,21 @@ use hcore::events::{BuildEvent, BuildEventKind, YieldingToData};
 use super::BuildState;
 
 /// The stream's first instant.
-pub(super) const T0: u64 = 1_700_000_000_000;
+pub(crate) const T0: u64 = 1_700_000_000_000;
 
 /// `kind` at `T0 + ms`.
-pub(super) fn at(ms: u64, kind: BuildEventKind) -> BuildEvent {
+pub(crate) fn at(ms: u64, kind: BuildEventKind) -> BuildEvent {
     BuildEvent {
         at_unix_ms: T0 + ms,
         kind,
     }
 }
 
-pub(super) fn start(addr: &str) -> BuildEventKind {
+pub(crate) fn start(addr: &str) -> BuildEventKind {
     BuildEventKind::ResultStart { addr: addr.into() }
 }
 
-pub(super) fn end(addr: &str, error: Option<&str>, upstream_of: Option<&str>) -> BuildEventKind {
+pub(crate) fn end(addr: &str, error: Option<&str>, upstream_of: Option<&str>) -> BuildEventKind {
     BuildEventKind::ResultEnd {
         left_behind: None,
         cancelled: false,
@@ -32,7 +32,7 @@ pub(super) fn end(addr: &str, error: Option<&str>, upstream_of: Option<&str>) ->
     }
 }
 
-pub(super) fn exec(addr: &str) -> BuildEventKind {
+pub(crate) fn exec(addr: &str) -> BuildEventKind {
     BuildEventKind::ExecuteStart {
         output_groups: Vec::new(),
         addr: addr.into(),

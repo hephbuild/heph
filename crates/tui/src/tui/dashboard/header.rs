@@ -626,6 +626,37 @@ mod tests {
         }
     }
 
+    /// A finished run's verdict is never what the title sheds: at every
+    /// width the header supports, and whatever the command, it is on the
+    /// title row whole, with the clock after it.
+    #[test]
+    fn the_verdict_survives_every_width() {
+        let wide = format!("heph r build //{}", "x".repeat(150));
+        let all = pools();
+        let gauges: Vec<&Gauge> = all.iter().collect();
+        for (verdict, ok) in [
+            ("✓ done", true),
+            ("✗ 12 failed", false),
+            ("✗ stopped", false),
+        ] {
+            for command in ["heph r build //...", wide.as_str()] {
+                let mut t = title(command);
+                t.verdict = Some(Verdict {
+                    text: verdict.to_owned(),
+                    ok,
+                });
+                for cols in 30..=120u16 {
+                    let (rows, _) = header_lines(&t, &gauges, &COUNTS, Tab::All, cols);
+                    let row = text(&rows[0]);
+                    assert!(
+                        row.contains(&format!("{verdict} · 1m05s")),
+                        "{cols} cols, {command:.30}: {row:?}"
+                    );
+                }
+            }
+        }
+    }
+
     /// The mockup's header: three pools sit beside the title, three
     /// columns from it, down to 115 columns (the spec's "below 112" counts
     /// no gap); a fourth moves them down even at 120.

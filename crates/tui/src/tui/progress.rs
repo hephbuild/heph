@@ -21,7 +21,7 @@ mod approval_tests;
 mod line;
 mod spotlight;
 #[cfg(test)]
-mod test_events;
+pub(crate) mod test_events;
 
 pub use spotlight::{HOLD_MS, Spot};
 
@@ -2236,10 +2236,17 @@ impl TuiProgressView {
         )
     }
 
+    /// The instant the run's times are measured to: `now_ms` while it runs,
+    /// the finish once it has ended, so every clock on screen stops there
+    /// (a target still open when the run ended included).
+    fn clock_at(&self, now_ms: u64) -> u64 {
+        self.finished_at_ms.unwrap_or(now_ms)
+    }
+
     /// The dashboard's title row: the command, the clock and how far along
     /// the run is, in the line's own figures.
     fn dashboard_title_parts(&self, now_ms: u64) -> (String, Option<String>, String) {
-        let clock_at = self.finished_at_ms.unwrap_or(now_ms);
+        let clock_at = self.clock_at(now_ms);
         let clock = hcore::units::human_duration(std::time::Duration::from_millis(
             self.state.elapsed_ms(clock_at),
         ));
@@ -2312,7 +2319,7 @@ impl TuiProgressView {
             model: &self.state.dash,
             waits: &self.state,
             lines: &self.last_lines,
-            now_ms,
+            now_ms: self.clock_at(now_ms),
             redact: &self.state.redact,
         };
         let out = dashboard_frame(&title, &inputs, &mut self.list, &hints, cols, rows);
@@ -2373,7 +2380,7 @@ impl TuiProgressView {
     /// holds the finished run); a printed one (`heph session show`) has none.
     fn line(&self, spinner: &str, now_ms: u64, width: u16, live: bool) -> Line<'static> {
         use std::borrow::Cow;
-        let clock_at = self.finished_at_ms.unwrap_or(now_ms);
+        let clock_at = self.clock_at(now_ms);
         let clock = hcore::units::human_duration(std::time::Duration::from_millis(
             self.state.elapsed_ms(clock_at),
         ));
@@ -2423,7 +2430,7 @@ impl TuiProgressView {
             standing: self.approval_standing(),
             spot: self
                 .approval_spot(now_ms)
-                .or_else(|| self.state.spotlight(now_ms)),
+                .or_else(|| self.state.spotlight(clock_at)),
             hint: dashboard && live,
             detach: matches!(self.role, Role::Attached { .. }),
             held: live && self.pinned && self.finished_at_ms.is_some(),
@@ -2483,7 +2490,7 @@ impl TuiProgressView {
             model: &self.state.dash,
             waits: &self.state,
             redact: &self.state.redact,
-            now_ms,
+            now_ms: self.clock_at(now_ms),
             scope,
             detach: matches!(self.role, Role::Attached { .. }),
         };
@@ -5981,6 +5988,32 @@ mod tests {
         v.set_finished(50_000);
         assert_eq!(title(&mut v, 100_000), title(&mut v, 999_000));
         assert_eq!(header(&v, 100_000), header(&v, 999_000));
+    }
+
+    /// A target still open when the run ended (a stopped run) stops counting
+    /// with the run's clock: on the dashboard's rows, on its target screen,
+    /// and on the line's spotlight.
+    #[test]
+    fn an_open_target_stops_counting_when_the_run_ends() {
+        use crate::tui::app::TUIAppView;
+        let mut v = TuiProgressView::new("L");
+        v.apply(&ev(0, execute_start("//a:b")));
+        v.set_stopped();
+        v.set_finished(20_000);
+        let line = |v: &TuiProgressView, now: u64| v.render("⠋", now, 120, 1)[0].to_string();
+        assert_eq!(line(&v, 30_000), line(&v, 90_000), "the line's spotlight");
+        v.open_dashboard();
+        assert_eq!(
+            dash_frame(&mut v, 30_000),
+            dash_frame(&mut v, 90_000),
+            "the list"
+        );
+        v.open_selected(false);
+        assert_eq!(
+            dash_frame(&mut v, 30_000),
+            dash_frame(&mut v, 90_000),
+            "the target screen"
+        );
     }
 
     /// The prompt row names the oldest request and how many are pending,

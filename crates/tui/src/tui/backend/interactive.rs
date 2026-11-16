@@ -323,8 +323,6 @@ pub async fn run<A: App + 'static>(
     let mut view_tap = session_tap.clone().map(|tap| ViewTap::new(tap, &view));
     let mut build_events: Option<TappedReceiver> =
         Some(TappedReceiver::new(event_rx, session_tap, holders));
-    // The instant a held viewport froze its clock at; the summary uses it too.
-    let mut held_at: Option<u64> = None;
 
     record_raw_mode_restore();
     enable_raw_mode().context("enabling raw mode")?;
@@ -398,52 +396,20 @@ pub async fn run<A: App + 'static>(
     // blocking DSR query per event.
     let mut needs_resize = false;
 
-    // Holds the app's result once its future resolves. We don't break the loop
-    // here: the TUI stays up, rendering, until background cleanups drain too.
-    let mut app_result: Option<anyhow::Result<A::Output>> = None;
-    // Whether a stop (a ctrl-c that stopped, or a signal) had reached the run
-    // when the app ended: the final line then says "stopped". Read at that
-    // instant, so the ctrl-c that quits a held, finished run is not one.
-    let mut stopped_before_finish = false;
-    // Latched once the finished run is held open on a non-main view: the viewport
-    // keeps rendering until the user quits explicitly (`q` / Ctrl-C).
-    let mut held = false;
-    // Set by `q` / Ctrl-C to break out of a held viewport.
-    let mut quit = false;
+    // The app's result once its future resolves. We don't break the loop
+    // there: the TUI stays up, rendering, until background cleanups drain too.
+    let mut end: RunEnd<anyhow::Result<A::Output>> = RunEnd::new();
     let result: anyhow::Result<A::Output> = loop {
-        // App finished and the background queue is empty — decide whether to exit.
-        if let Some(r) = app_result.take() {
-            if bg_drained(&bg_pending) {
-                // A stop under way (a ctrl-c that stopped, or a signal: INT,
-                // TERM, HUP) is never held: it ends the run on any screen.
-                let stopping = shutdown.fired();
-                if held {
-                    // Held open after finish — exit on an explicit quit, or
-                    // once the user has closed the dashboard back to the line.
-                    if quit || stopping || !view.hold_after_finish() {
-                        break r;
-                    }
-                    app_result = Some(r);
-                } else if view.hold_after_finish() && !stopping {
-                    // User navigated off the main view: hold the viewport up and
-                    // surface a "press q to quit" notice instead of auto-exiting.
-                    held = true;
-                    let at = now_unix_ms();
-                    held_at = Some(at);
-                    view.set_finished(at);
-                    app_result = Some(r);
-                } else {
-                    break r;
-                }
-            } else {
-                // Background cleanups still draining — keep the result, keep rendering.
-                app_result = Some(r);
-            }
+        // App finished and the background queue is empty — decide whether to
+        // exit. A stop under way (a ctrl-c that stopped, or a signal: INT,
+        // TERM, HUP) is never held: it ends the run on any screen.
+        if let Some(r) = end.exit(bg_drained(&bg_pending), shutdown.fired(), &view) {
+            break r;
         }
         tokio::select! {
-            res = &mut app_handle, if app_result.is_none() => {
-                stopped_before_finish = shutdown.fired();
-                app_result = Some(match res {
+            res = &mut app_handle, if !end.app_finished() => {
+                let stopped = shutdown.fired();
+                let res = match res {
                     Ok(inner) => inner,
                     Err(join_err) if join_err.is_panic() => {
                         let payload = join_err.into_panic();
@@ -456,7 +422,8 @@ pub async fn run<A: App + 'static>(
                         std::panic::resume_unwind(payload)
                     }
                     Err(join_err) => Err(anyhow::Error::new(join_err).context("app task")),
-                });
+                };
+                end.app_done(res, now_unix_ms(), stopped, &mut view);
             }
             ctrl = control_rx.recv() => {
                 match ctrl {
@@ -544,11 +511,11 @@ pub async fn run<A: App + 'static>(
                     Some(Ok(ev)) if stop_arm::is_ctrl_c(&ev) => {
                         // On a full screen the first press only arms; the
                         // view says which (`stop_arm`'s one rule).
-                        let finished = held || app_result.is_some();
+                        let finished = end.app_finished();
                         if view.ctrl_c(now_unix_ms(), finished, shutdown.fired()) == CtrlC::Stop {
                             shutdown.trigger();
                             // Also quits a viewport held open after the run finished.
-                            quit = true;
+                            end.quit = true;
                         }
                     }
                     // `q` off the main view returns to it (like Esc); on the main
@@ -559,12 +526,13 @@ pub async fn run<A: App + 'static>(
                         kind: KeyEventKind::Press,
                         ..
                     }))) if !view.is_searching() => {
-                        if held {
+                        if end.holds(&view) {
                             // The run ended under an open dashboard: `q`
-                            // leaves, from whichever screen is up.
-                            quit = true;
+                            // leaves, from whichever screen is up, once
+                            // background work has drained.
+                            end.quit = true;
                         } else if view.is_on_main_view() || view.quits_from_any_screen() {
-                            if app_result.is_none() {
+                            if !end.app_finished() {
                                 view.quit_while_running();
                             }
                         } else {
@@ -733,7 +701,7 @@ pub async fn run<A: App + 'static>(
             }
             // The app is done and only background work is holding the exit:
             // wake on the last decrement instead of the next `TICK`.
-            () = exit_drain_wake(app_result.is_some(), &bg_pending) => {}
+            () = exit_drain_wake(end.app_finished(), &bg_pending) => {}
             _ = ticker.tick() => {
                 // Deliberately NOT gated on `!paused`. While paused, the tick
                 // draws nothing — the terminal belongs to the interactive
@@ -844,7 +812,8 @@ pub async fn run<A: App + 'static>(
                     // Under the held dashboard, once it has been up a while
                     // (so a test sees it before the panic takes it down).
                     if debug_panic == Some(DebugPanic::Backend)
-                        && held_at.is_some_and(|at| now.saturating_sub(at) >= 500)
+                        && end.held
+                        && end.at.is_some_and(|at| now.saturating_sub(at) >= 500)
                     {
                         DebugPanic::Backend.fire();
                     }
@@ -948,11 +917,11 @@ pub async fn run<A: App + 'static>(
 
     // Persistent final summary, printed straight to stderr below the
     // torn-down inline viewport (interactive mode only). Measured at the
-    // instant a held viewport froze at, else now; recorded as `Finished` so a
-    // viewer prints the same line, and so it knows what follows was printed
-    // below it.
-    let at = held_at.unwrap_or_else(now_unix_ms);
-    if stopped_before_finish {
+    // instant the app ended, the clock the screens froze at; recorded as
+    // `Finished` so a viewer prints the same line, and so it knows what
+    // follows was printed below it.
+    let at = end.at.unwrap_or_else(now_unix_ms);
+    if end.stopped {
         view.set_stopped();
     }
     view.set_finished(at);
@@ -1034,6 +1003,85 @@ async fn exit_drain_wake(app_done: bool, bg_pending: &hcore::pending::Pending) {
         bg_pending.wait_drained().await;
     } else {
         std::future::pending::<()>().await;
+    }
+}
+
+/// The run's end, as the loop sees it: the app's result once its future
+/// resolved, and whether the finished run is held on screen.
+struct RunEnd<R> {
+    /// The app's result, from the moment its future resolved until the
+    /// loop leaves with it.
+    result: Option<R>,
+    /// When the app's future resolved: the instant the run ended.
+    at: Option<u64>,
+    /// A stop (a ctrl-c that stopped, or a signal: INT, TERM, HUP) had
+    /// reached the run when the app ended: the final line says "stopped".
+    /// Read at that instant, so the ctrl-c that quits a held, finished run
+    /// is not one.
+    stopped: bool,
+    /// Latched once the finished run is held open on a full screen: the
+    /// viewport keeps rendering until the user quits explicitly.
+    held: bool,
+    /// Set by `q` / Ctrl-C to break out of a held viewport.
+    quit: bool,
+}
+
+impl<R> RunEnd<R> {
+    fn new() -> Self {
+        Self {
+            result: None,
+            at: None,
+            stopped: false,
+            held: false,
+            quit: false,
+        }
+    }
+
+    /// The app's future resolved at `at` with `result`: the run is over,
+    /// whatever background work (sandbox removal, cache uploads) is still
+    /// draining. The view says so now: the dashboard's title takes the
+    /// verdict and every clock on screen stops at `at`, rather than counting
+    /// on, verdict-less, until the drain lets the loop leave.
+    fn app_done(&mut self, result: R, at: u64, stopped: bool, view: &mut impl TUIAppView) {
+        if stopped {
+            view.set_stopped();
+        }
+        view.set_finished(at);
+        self.result = Some(result);
+        self.at = Some(at);
+        self.stopped = stopped;
+    }
+
+    /// Whether the app has finished: its result is in hand.
+    fn app_finished(&self) -> bool {
+        self.result.is_some()
+    }
+
+    /// Whether the finished run is, or will be once background work
+    /// drains, held on screen: `q` then leaves from whichever screen is up.
+    fn holds(&self, view: &impl TUIAppView) -> bool {
+        self.held || (self.app_finished() && view.hold_after_finish())
+    }
+
+    /// The app's result once the loop is to leave with it: background work
+    /// drained (`drained`), and the run not held on screen. A run ended on
+    /// a full screen is held until an explicit quit, a stop under way
+    /// (`stopping`), or the user closing the dashboard back to the line.
+    fn exit(&mut self, drained: bool, stopping: bool, view: &impl TUIAppView) -> Option<R> {
+        if !drained || self.result.is_none() {
+            return None;
+        }
+        if self.held {
+            if self.quit || stopping || !view.hold_after_finish() {
+                return self.result.take();
+            }
+            return None;
+        }
+        if view.hold_after_finish() && !stopping && !self.quit {
+            self.held = true;
+            return None;
+        }
+        self.result.take()
     }
 }
 
@@ -1365,7 +1413,7 @@ impl Replay {
 
 #[cfg(test)]
 mod tests {
-    use super::{IntoText, TICK, bg_drained, exit_drain_wake, rows_needed};
+    use super::{IntoText, RunEnd, TICK, bg_drained, exit_drain_wake, rows_needed};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -1767,6 +1815,56 @@ mod tests {
             ticks_after_finish >= 3,
             "held viewport must keep rendering until explicit quit; got {ticks_after_finish}"
         );
+    }
+
+    /// The run ends when the app does, not when its background work (sandbox
+    /// removal, cache uploads) has drained: from that instant the dashboard's
+    /// title carries the verdict and every clock on screen stops, the line's
+    /// included. Regression: both waited for the drain, so a run whose
+    /// targets were all done kept counting, verdict-less, for as long as its
+    /// sandboxes took to remove.
+    #[test]
+    fn the_run_ends_on_screen_when_the_app_does_not_when_background_work_drains() {
+        use crate::tui::app::TUIAppView;
+        use crate::tui::progress::TuiProgressView;
+        use crate::tui::progress::test_events::{T0, at, end, exec, start};
+
+        for (error, verdict) in [(None, "✓ done"), (Some("exit 3"), "✗ 1 failed")] {
+            let mut view = TuiProgressView::new("Running //p:t");
+            view.apply(&at(0, start("//p:t")));
+            view.apply(&at(0, exec("//p:t")));
+            view.apply(&at(2_000, end("//p:t", error, None)));
+            view.open_dashboard();
+            let title =
+                |v: &mut TuiProgressView, now: u64| v.render_full(now, 100, 14)[0].to_string();
+            let line = |v: &TuiProgressView, now: u64| v.render("⠋", now, 100, 1)[0].to_string();
+
+            let mut run = RunEnd::new();
+            run.app_done((), T0 + 2_000, false, &mut view);
+            // Background work outstanding: the loop stays up.
+            assert_eq!(run.exit(false, false, &view), None);
+            let shown = title(&mut view, T0 + 7_000);
+            assert!(shown.contains(verdict), "no {verdict:?} in {shown:?}");
+            assert!(shown.contains(" 2s "), "clock not frozen at 2s: {shown:?}");
+            assert_eq!(
+                title(&mut view, T0 + 60_000),
+                shown,
+                "the clock kept counting"
+            );
+            assert_eq!(
+                line(&view, T0 + 7_000),
+                line(&view, T0 + 60_000),
+                "the line's clock kept counting"
+            );
+            // `q` leaves even before the drain: the run is over.
+            assert!(run.holds(&view));
+
+            // Drained: held on the dashboard, as it was, until `q`.
+            assert_eq!(run.exit(true, false, &view), None);
+            assert_eq!(title(&mut view, T0 + 90_000), shown);
+            run.quit = true;
+            assert_eq!(run.exit(true, false, &view), Some(()));
+        }
     }
 
     /// Regression: resizing the terminal broke inline-viewport rendering. The
