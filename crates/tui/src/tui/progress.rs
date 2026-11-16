@@ -2115,7 +2115,8 @@ impl TuiProgressView {
     /// prints the line the run printed.
     pub fn final_line(&self) -> Option<String> {
         let segment = self.final_summary_segment();
-        if segment.is_empty() {
+        // A stop always says so, even before anything matched.
+        if segment.is_empty() && !self.stopped {
             return None;
         }
         let clock = self
@@ -2126,6 +2127,9 @@ impl TuiProgressView {
         // A user stop is never a success, whatever finished before it; the
         // word says why the counts stop short.
         if self.stopped {
+            if segment.is_empty() {
+                return Some(format!("✗ stopped · {elapsed}"));
+            }
             return Some(format!("✗ stopped · {elapsed} · {segment}"));
         }
         let mark = if self.state.unsuccessful() {

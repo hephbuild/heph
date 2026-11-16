@@ -985,13 +985,12 @@ fn ctrl_c_twice_on_full_screens() {
                 g.pty.seen()
             );
             // The final line says why the build ended short, whichever
-            // producer (key or signal) stopped it. A stop that lands before
-            // the targets were matched ends with the cancellation report and
-            // no final line at all; either way, no summary may read as an
-            // ordinary `✗ <clock>` failure.
+            // producer (key or signal) stopped it, even one that lands
+            // before the targets were matched (no counts follow then); no
+            // summary may read as an ordinary `✗ <clock>` failure.
             let seen = g.pty.seen();
             assert!(
-                seen.contains("✗ stopped · ") || seen.contains("× cancelled"),
+                seen.contains("✗ stopped · "),
                 "{}: the final line does not say stopped\n{seen}",
                 case.name
             );

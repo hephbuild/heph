@@ -1055,5 +1055,19 @@ mod tests {
         v.set_finished(T0 + 2_000);
         let last = v.final_line().expect("a summary");
         assert!(last.starts_with("✗ stopped · 2.000s · "), "{last}");
+
+        // A stop before anything matched: the line still says so, with no
+        // counts to follow; with no stop, such a run prints nothing.
+        let mut v = TuiProgressView::new("Running //...");
+        v.set_stopped();
+        v.set_finished(T0 + 2_000);
+        let last = v.final_line().expect("a line for the stop");
+        assert!(
+            last.starts_with("✗ stopped · ") && !last.ends_with(" · "),
+            "{last}"
+        );
+        let mut v = TuiProgressView::new("Running //...");
+        v.set_finished(T0 + 2_000);
+        assert_eq!(v.final_line(), None);
     }
 }
