@@ -1043,6 +1043,15 @@ fn record_raw_mode_restore() {
     // SAFETY: `tcgetattr` returned success above, so `termios` is initialized.
     let termios = unsafe { termios.assume_init() };
     hcore::shutdown::set_terminal_restore(move || {
+        // Nothing else reaches the terminal from here to `process::exit`:
+        // the render loop keeps drawing on its own thread until then, and a
+        // frame flushed after the bytes below hides the cursor again (and
+        // can draw the dashboard over the main screen). Every frame goes
+        // through `io::Stderr`, so holding its lock, never released, stops
+        // them; a frame being written finishes first. The writes below are
+        // `libc::write`s, which do not take it. (A task, not a signal
+        // handler: allocating here is fine.)
+        let _held: &'static mut io::StderrLock<'static> = Box::leak(Box::new(io::stderr().lock()));
         // The dashboard's mouse capture and alternate screen first:
         // `process::exit` runs no destructor, so [`FullScreen`]'s drop never
         // will. A capture left on would turn every click in the user's
