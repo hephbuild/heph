@@ -2353,7 +2353,7 @@ struct ApprovalKeys {
 fn approval_banner<'a>(
     addr: &str,
     queued_behind: u64,
-    notices: impl ExactSizeIterator<Item = (&'a str, &'a str)>,
+    notices: impl ExactSizeIterator<Item = &'a str>,
     keys: Option<ApprovalKeys>,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::with_capacity(1 + notices.len());
@@ -2378,11 +2378,11 @@ fn approval_banner<'a>(
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD),
     )));
-    // Always show the notice file link(s) so the user can open the full text
-    // in an editor without expanding the inline preview.
-    for (name, path) in notices {
+    // Name every notice the target declares; the text itself is the inline
+    // preview's (no notice is written to a file to open).
+    for name in notices {
         lines.push(Line::from(Span::styled(
-            format!("    → {name}: {path}"),
+            format!("    → notice: {name}"),
             Style::default().fg(Color::Cyan),
         )));
     }
@@ -2507,9 +2507,8 @@ impl TuiProgressView {
     }
 
     /// Body rows for the active approval prompt, or empty when idle. The banner
-    /// carries the keys; when the target declares notices, each notice's file
-    /// path is shown as an "open in editor" link below it, and `enter` toggles an
-    /// inline (scrollable) preview of the contents. An attached view draws the
+    /// carries the keys; when the target declares notices, each is named below
+    /// it, and `enter` toggles an inline (scrollable) preview of the contents. An attached view draws the
     /// run's recorded prompt through the same banner, without keys or preview.
     fn approval_lines(&self) -> Vec<Line<'static>> {
         let center = match &self.role {
@@ -2521,10 +2520,7 @@ impl TuiProgressView {
                 return approval_banner(
                     &prompt.addr,
                     prompt.queued_behind,
-                    prompt
-                        .notices
-                        .iter()
-                        .map(|n| (n.name.as_str(), n.path.as_str())),
+                    prompt.notices.iter().map(|n| n.name.as_str()),
                     None,
                 );
             }
@@ -2535,9 +2531,7 @@ impl TuiProgressView {
         let mut lines = approval_banner(
             &view.addr,
             u64::try_from(view.queued_behind).unwrap_or(u64::MAX),
-            view.notices
-                .iter()
-                .map(|n| (n.name.as_str(), n.path.as_str())),
+            view.notices.iter().map(|n| n.name.as_str()),
             Some(ApprovalKeys {
                 expanded: view.expanded,
             }),
@@ -2548,6 +2542,8 @@ impl TuiProgressView {
                     format!("  ── {} ──", notice.name),
                     Style::default().fg(Color::Cyan),
                 )));
+                // The handler's capped read from the store (truncation line
+                // included), or "notice unavailable".
                 for raw in notice.content.lines() {
                     lines.push(Line::from(format!("  {raw}")));
                 }

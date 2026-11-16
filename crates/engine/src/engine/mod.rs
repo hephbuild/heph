@@ -27,7 +27,7 @@ pub use plugin_load::{clear_plugin_cache, sweep_checksum_stamps};
 pub mod approval;
 pub mod diag;
 pub mod execrunner_host;
-pub use approval::{ApprovalHandler, ApprovalNotice, ApprovalRequest};
+pub use approval::{ApprovalHandler, ApprovalNotice, ApprovalRequest, read_notice_from_store};
 pub mod codegen_lock;
 pub mod credential;
 pub mod credential_store;

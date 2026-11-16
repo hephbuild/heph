@@ -461,6 +461,8 @@ pub struct LocalCacheSQLite {
     pending: Arc<PendingTracker>,
     pipe_sem: Arc<PipeSemaphore>,
     inline_threshold: usize,
+    /// Set by [`Self::open_read_only`]: no schema migration, no writer.
+    read_only: bool,
     #[cfg(any(test, feature = "test-support"))]
     gate: Arc<WriterGate>,
     /// Test overrides of the maintenance knobs, so a test neither waits out
@@ -729,11 +731,32 @@ impl LocalCacheSQLite {
             pending: Arc::new(PendingTracker::default()),
             pipe_sem: PipeSemaphore::new(pipe_limit),
             inline_threshold,
+            read_only: false,
             #[cfg(any(test, feature = "test-support"))]
             gate: Arc::new(WriterGate::default()),
             #[cfg(any(test, feature = "test-support"))]
             overrides: Mutex::new(MaintenanceOverrides::default()),
         })
+    }
+
+    /// A handle that only reads the database at `db_path`, for a process that
+    /// is not building — an attached viewer reading an approval notice back.
+    /// It never creates, migrates or writes the database: one that is missing
+    /// or below [`SCHEMA_VERSION`] is unavailable, and every write errors.
+    ///
+    /// Every blob is read inline, on the caller's thread: such a reader reads
+    /// a few small blobs whole, and has no business starting the pipe copy's
+    /// thread pool.
+    pub(crate) fn open_read_only(db_path: PathBuf) -> Result<Self> {
+        let mut cache = Self::with_pool_config(
+            db_path,
+            usize::MAX,
+            1,
+            read_pool_headroom(1),
+            READ_POOL_TIMEOUT,
+        )?;
+        cache.read_only = true;
+        Ok(cache)
     }
 
     /// The brake on this cache's writer thread. See [`WriterGate`]. It lives on
@@ -780,6 +803,9 @@ impl LocalCacheSQLite {
                         .ok()
                 })
                 .is_some_and(|version| version >= SCHEMA_VERSION);
+        if !current && self.read_only {
+            anyhow::bail!("absent or not current, and this handle only reads");
+        }
         if !current {
             migrate_schema(&self.db_path)?;
             // Leave one read connection idle in the pool, as the check above
@@ -807,6 +833,9 @@ impl LocalCacheSQLite {
     /// The writer channel, spawning the writer thread (and opening the
     /// read-write connection) on first use.
     fn writer_tx(&self) -> Result<&mpsc::Sender<WriterCmd>> {
+        if self.read_only {
+            anyhow::bail!("sqlite cache {:?} is opened read-only", self.db_path);
+        }
         self.ensure_schema()?;
         self.writer
             .get_or_init(|| self.spawn_writer().map_err(|e| format!("{e:#}")))
@@ -1803,6 +1832,32 @@ mod tests {
             cache.writer.get().is_none(),
             "a read-only use must not spawn the writer"
         );
+        Ok(())
+    }
+
+    /// A read-only handle reads what a writer committed, and never creates,
+    /// migrates or writes the database: a missing one stays missing.
+    #[test]
+    fn a_read_only_handle_reads_and_never_writes() -> Result<()> {
+        let dir = tempdir()?;
+        let missing = dir.path().join("none").join("cache.db");
+        let ro = LocalCacheSQLite::open_read_only(missing.clone())?;
+        let addr = make_addr("pkg", "t");
+        assert!(ro.reader(&addr, "h", "a").is_err());
+        assert!(ro.writer(&addr, "h", "a").is_err());
+        assert!(!missing.exists(), "a read-only handle created the database");
+
+        let path = dir.path().join("cache.db");
+        put(&open(&path)?, &addr, "a", b"bytes")?;
+        let ro = LocalCacheSQLite::open_read_only(path)?;
+        let mut read = Vec::new();
+        ro.reader(&addr, "h", "a")?.reader.read_to_end(&mut read)?;
+        assert_eq!(read, b"bytes");
+        assert!(
+            ro.writer(&addr, "h", "b").is_err(),
+            "a read-only handle wrote"
+        );
+        assert!(ro.writer.get().is_none(), "nor spawned the writer");
         Ok(())
     }
 

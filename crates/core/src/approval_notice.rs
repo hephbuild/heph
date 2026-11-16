@@ -1,138 +1,83 @@
-//! Approval notices stored by content.
+//! Approval notices, read from the artifact store.
 //!
-//! At gate time the engine writes each rendered notice to
-//! `<home>/approval/notices/<hash>`, `hash` being the xxh3-128 of its bytes,
-//! and the session records that hash beside the notice. A reader — the live
-//! approval view or an attached one — reads it back through
-//! [`read_notice_blob`], which checks the hash: a blob that is gone or does
-//! not match reads as [`NOTICE_UNAVAILABLE`], never as a path to go and open.
+//! No notice is ever written to disk, and none is held whole in memory. At
+//! gate time the engine records, per notice, where its text is kept — a
+//! [`NoticeSource`] per artifact of the input groups it names — after moving
+//! any of them that lived only in the run's memory (an uncached input) into
+//! heph's local cache. Every reader, the live approval view included, renders
+//! the text from those sources, read-only, through a [`ReadNotice`] the host
+//! supplies (the engine's, which this crate cannot reach), and stops at
+//! [`NOTICE_READ_CAP`] bytes. A source it cannot read reads as
+//! [`NOTICE_UNAVAILABLE`].
 //!
 //! **Diagnostics only.** A notice is shown to a person deciding an approval;
 //! nothing here reaches a cache key, a def hash, a sandbox, or a target's env,
 //! argv or files.
 
-use anyhow::Context;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
-/// The directory under the heph home that holds notice blobs.
-pub const NOTICES_DIR: &str = "approval/notices";
-
-/// What a reader shows in place of a notice it cannot read back: its blob is
-/// gone, does not match its hash, or the session predates notice hashes.
+/// What a reader shows in place of a notice it cannot render: an artifact is
+/// not in the local store (a gc'd or a remote-only revision), a source file
+/// changed or went away, or the record names no source at all.
 pub const NOTICE_UNAVAILABLE: &str = "notice unavailable";
 
-/// The content hash a notice is stored under: xxh3-128 of its bytes, 32
-/// lowercase hex digits.
-pub fn notice_hash(content: &[u8]) -> String {
-    format!("{:032x}", xxhash_rust::xxh3::xxh3_128(content))
+/// The most of a notice's text a reader renders, in bytes. Past it the text
+/// ends with a line saying how much there was and where to read all of it, so
+/// a notice whose input is a large artifact is never loaded whole.
+pub const NOTICE_READ_CAP: usize = 4 << 20;
+
+/// One artifact a notice is rendered from: the input target it was resolved
+/// for, as the gated target declared it, and where its bytes are kept. A
+/// notice's text is its sources' files, concatenated in order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoticeSource {
+    /// The input target. Named in the truncation line, as what to inspect
+    /// for the full text.
+    pub addr: String,
+    pub origin: NoticeOrigin,
 }
 
-/// Whether `hash` has the shape [`notice_hash`] produces, so joining it under
-/// [`NOTICES_DIR`] cannot leave that directory.
-fn is_notice_hash(hash: &str) -> bool {
-    hash.len() == 32
-        && hash
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+/// Where a [`NoticeSource`]'s bytes are kept.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum NoticeOrigin {
+    /// The entry whose hashout is `hashout` in revision `revision` of target
+    /// `addr` in the local cache. `revision` is the hashin, or for an uncached
+    /// input its `{hashin}_{nanos}` key — which no later run looks up, so it
+    /// is never a cache hit.
+    Cache {
+        addr: String,
+        revision: String,
+        hashout: String,
+    },
+    /// A source file read in place — the user's file, never copied into a
+    /// cache. `path` is relative to the workspace root; the file reads as the
+    /// single entry `out_path`, and only while it still hashes to `hashout`.
+    File {
+        path: String,
+        out_path: String,
+        x: bool,
+        hashout: String,
+    },
+    /// A path-rewriting view of `source` (a `group` target's relocation):
+    /// the `(source path, path)` pairs it keeps, in source order.
+    View {
+        source: Box<NoticeOrigin>,
+        paths: Vec<(String, String)>,
+    },
 }
 
-fn blob_path(home: &Path, hash: &str) -> PathBuf {
-    home.join(NOTICES_DIR).join(hash)
+/// Where a reader finds a notice's sources: heph's `home` (its local cache)
+/// and the workspace `root` (source files read in place).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoticeRoots {
+    pub home: PathBuf,
+    pub root: PathBuf,
 }
 
-/// Write `content` under its content hash in `home` and return the hash.
-/// Blocking. The blob is written to a temporary name and renamed into place,
-/// so a reader never sees half of it; a blob already there is replaced by the
-/// same bytes.
-pub fn write_notice_blob(home: &Path, content: &str) -> anyhow::Result<String> {
-    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
-    let hash = notice_hash(content.as_bytes());
-    let dir = home.join(NOTICES_DIR);
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("creating approval notice dir {}", dir.display()))?;
-    let tmp = dir.join(format!(
-        ".{hash}.{}.{}.tmp",
-        std::process::id(),
-        // A counter, not ordering: Relaxed only keeps two writers in one
-        // process off the same temporary name.
-        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::write(&tmp, content)
-        .with_context(|| format!("writing approval notice {}", tmp.display()))?;
-    let dst = blob_path(home, &hash);
-    if let Err(e) = std::fs::rename(&tmp, &dst) {
-        // Best effort: the rename's error is the one worth reporting.
-        let _removed = std::fs::remove_file(&tmp);
-        return Err(e).with_context(|| format!("storing approval notice {}", dst.display()));
-    }
-    Ok(hash)
-}
-
-/// Read the notice stored under `hash` in `home`, checking it still hashes to
-/// `hash`. Blocking (one file read): call it off the render task. `None` —
-/// show [`NOTICE_UNAVAILABLE`] — when `hash` is absent (a session from a heph
-/// that predates notice hashes), malformed, its blob is gone or unreadable, or
-/// the bytes no longer match.
-pub fn read_notice_blob(home: &Path, hash: Option<&str>) -> Option<String> {
-    let hash = hash.filter(|h| is_notice_hash(h))?;
-    let bytes = std::fs::read(blob_path(home, hash)).ok()?;
-    if notice_hash(&bytes) != hash {
-        return None;
-    }
-    String::from_utf8(bytes).ok()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn written_notice_reads_back_by_its_hash() {
-        let home = tempfile::tempdir().expect("tempdir");
-        let hash = write_notice_blob(home.path(), "push api:prod\n").expect("write");
-        assert_eq!(hash, notice_hash(b"push api:prod\n"));
-        assert_eq!(
-            read_notice_blob(home.path(), Some(&hash)).as_deref(),
-            Some("push api:prod\n")
-        );
-        // Same content, same blob: a second write replaces it in place.
-        assert_eq!(
-            write_notice_blob(home.path(), "push api:prod\n").expect("rewrite"),
-            hash
-        );
-        let names: Vec<_> = std::fs::read_dir(home.path().join(NOTICES_DIR))
-            .expect("read dir")
-            .map(|e| e.expect("entry").file_name())
-            .collect();
-        assert_eq!(
-            names,
-            vec![std::ffi::OsString::from(&hash)],
-            "no temporary left behind"
-        );
-    }
-
-    #[test]
-    fn notice_unavailable_never_a_path() {
-        let home = tempfile::tempdir().expect("tempdir");
-        let hash = write_notice_blob(home.path(), "the plan").expect("write");
-
-        // An older session: no hash recorded.
-        assert_eq!(read_notice_blob(home.path(), None), None);
-        // A hash that does not name a blob, or tries to leave the directory.
-        for bad in [
-            "",
-            "../../etc/passwd",
-            &hash.to_uppercase(),
-            &format!("{hash}0"),
-        ] {
-            assert_eq!(read_notice_blob(home.path(), Some(bad)), None, "{bad:?}");
-        }
-        // Bytes that no longer match their hash.
-        std::fs::write(home.path().join(NOTICES_DIR).join(&hash), "another plan").expect("tamper");
-        assert_eq!(read_notice_blob(home.path(), Some(&hash)), None);
-        // The blob is gone.
-        std::fs::remove_file(home.path().join(NOTICES_DIR).join(&hash)).expect("remove");
-        assert_eq!(read_notice_blob(home.path(), Some(&hash)), None);
-    }
-}
+/// Render a notice from its sources, read-only — no build, no fetch, no
+/// write — capped at [`NOTICE_READ_CAP`] bytes. `None` — show
+/// [`NOTICE_UNAVAILABLE`] — when `sources` is empty or any of them cannot be
+/// read. Blocking: call it off the render task.
+pub type ReadNotice = fn(roots: &NoticeRoots, sources: &[NoticeSource]) -> Option<String>;

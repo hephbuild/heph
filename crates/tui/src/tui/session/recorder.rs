@@ -507,7 +507,7 @@ fn injected_panic() {}
 /// still needs to read right at its end. `Finished` (when the summary was
 /// measured), `Output` (the failure report, once per run), a `Label` change
 /// (one short line), and every `Approval`: a few short lines per gated
-/// target, carrying the hashes its notices are read back by and the standing
+/// target, carrying the sources its notices are rendered again from and the standing
 /// Y/N decision, which a viewer needs however long the build ran (and its
 /// clear, so a prompt recorded earlier does not stay on a viewer's screen).
 ///

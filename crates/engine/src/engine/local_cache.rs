@@ -346,6 +346,16 @@ pub(crate) const MANIFEST_V2_VERSION: &str = "2.0.0";
 /// Every manifest name a revision can have, newest first: the read order.
 pub(crate) const MANIFESTS: [&str; 2] = [MANIFEST_V2, MANIFEST_V1];
 
+/// The durable cache's sqlite database under a heph `home`.
+pub(crate) fn cache_db_path(home: &std::path::Path) -> std::path::PathBuf {
+    home.join("cache").join("cache.db")
+}
+
+/// The durable cache's directory of spilled blobs under a heph `home`.
+pub(crate) fn cache_blobs_dir(home: &std::path::Path) -> std::path::PathBuf {
+    home.join("cache").join("blobs")
+}
+
 /// Whether `name` is a manifest rather than an artifact blob.
 pub(crate) fn is_manifest_name(name: &str) -> bool {
     MANIFESTS.contains(&name)
@@ -369,6 +379,33 @@ pub struct CacheArtifact {
     /// not what its blob occupies at rest). Used by the engine auto-mode
     /// router to size FUSE vs unpack-copy decisions cheaply.
     pub size: u64,
+}
+
+impl CacheArtifact {
+    /// The artifact a manifest entry of revision `(addr, hashin)` names, read
+    /// through `cache`.
+    pub(crate) fn from_manifest(
+        addr: &Addr,
+        hashin: &str,
+        artifact: &ManifestArtifact,
+        cache: Arc<dyn LocalCache>,
+    ) -> Self {
+        Self {
+            addr: addr.clone(),
+            hashin: hashin.to_string(),
+            name: artifact.name.clone(),
+            cache,
+            encoding: artifact.encoding.clone(),
+            content_type: match artifact.content_type {
+                ManifestArtifactContentType::Tar => hartifactcontent::Type::Tar,
+                ManifestArtifactContentType::Cpio => hartifactcontent::Type::Cpio,
+            },
+            r#type: artifact.r#type.clone(),
+            hashout: artifact.hashout.clone(),
+            group: artifact.group.clone(),
+            size: artifact.size,
+        }
+    }
 }
 
 impl hartifactcontent::Content for CacheArtifact {
@@ -396,6 +433,17 @@ impl hartifactcontent::Content for CacheArtifact {
 
     fn hashout(&self) -> anyhow::Result<String> {
         Ok(self.hashout.clone())
+    }
+
+    /// This entry, by revision key and hashout. For an uncached revision the
+    /// key is the `{hashin}_{nanos}` one, and its bytes may still be only in
+    /// the tmp tier's memory: see [`super::local_cache_tmp::LocalCacheTmp::persist_revision`].
+    fn origin(&self) -> Option<hartifactcontent::Origin> {
+        Some(hartifactcontent::Origin::Cache {
+            addr: self.addr.format(),
+            revision: self.hashin.clone(),
+            hashout: self.hashout.clone(),
+        })
     }
 
     fn entry_paths(&self) -> anyhow::Result<Vec<std::path::PathBuf>> {
@@ -809,8 +857,10 @@ impl Engine {
         // `local_cache_tmp` — small entries stay in memory and skip the SQLite
         // WAL write. `CacheArtifact` carries the cache it was written to, so
         // reads resolve against the same store.
+        let tmp_cache: Arc<dyn LocalCache>;
         let cache = if tmp {
-            &self.local_cache_tmp
+            tmp_cache = self.local_cache_tmp.clone();
+            &tmp_cache
         } else {
             &self.local_cache
         };
@@ -1373,21 +1423,12 @@ impl Engine {
                 return Ok(None);
             }
 
-            results.push(CacheArtifact {
-                addr: addr.clone(),
-                hashin: hashin.to_string(),
-                name: artifact.name.clone(),
-                cache: local_cache.clone(),
-                encoding: artifact.encoding.clone(),
-                content_type: match artifact.content_type {
-                    ManifestArtifactContentType::Tar => hartifactcontent::Type::Tar,
-                    ManifestArtifactContentType::Cpio => hartifactcontent::Type::Cpio,
-                },
-                r#type: artifact.r#type.clone(),
-                hashout: artifact.hashout.clone(),
-                group: artifact.group.clone(),
-                size: artifact.size,
-            });
+            results.push(CacheArtifact::from_manifest(
+                addr,
+                hashin,
+                artifact,
+                local_cache.clone(),
+            ));
         }
 
         Ok(Some((results, result_meta)))

@@ -31,16 +31,18 @@ use tokio::sync::oneshot;
 
 pub use crate::tui::session::ApprovalStanding;
 
-/// One rendered notice for display: the input group name, its text, the
-/// legacy on-disk path an older attached viewer shows, and the content hash it
-/// is stored under (`hcore::approval_notice`), which is what a session records
-/// for a viewer to read it back by.
+/// One rendered notice for display: the input group name, its text, and the
+/// sources it was read from (`hcore::approval_notice`), which is what a
+/// session records for a viewer in another process to read it again.
 #[derive(Clone, Debug)]
 pub struct ApprovalNoticeView {
     pub name: String,
+    /// The text as the handler read it from the store, through the same
+    /// capped reader every viewer uses (`engine::read_notice_from_store`):
+    /// at most `NOTICE_READ_CAP` bytes plus the truncation line, or
+    /// "notice unavailable". Never written anywhere.
     pub content: String,
-    pub path: String,
-    pub hash: String,
+    pub sources: Vec<hcore::approval_notice::NoticeSource>,
 }
 
 struct Pending {
@@ -346,8 +348,7 @@ impl ApprovalCenter {
                 .iter()
                 .map(|n| crate::tui::session::ApprovalPromptNotice {
                     name: n.name.clone(),
-                    path: n.path.clone(),
-                    hash: Some(n.hash.clone()),
+                    sources: n.sources.clone(),
                 })
                 .collect(),
         })
@@ -427,8 +428,7 @@ mod tests {
         ApprovalNoticeView {
             name: name.to_string(),
             content: format!("{name} body"),
-            path: format!("/home/approval/{name}.txt"),
-            hash: hcore::approval_notice::notice_hash(format!("{name} body").as_bytes()),
+            sources: Vec::new(),
         }
     }
 

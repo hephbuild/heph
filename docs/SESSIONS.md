@@ -163,13 +163,26 @@ so `attach` draws it (see [Attach](#attach)):
 
 - `Label {label}`: the TUI's bottom label changed (`meta.json` holds the first).
 - `Approval {prompt, standing}`: the approval banner changed; `prompt` is
-  `{addr, queued_behind, notices: [{name, path, hash}]}`, or absent once
-  nothing is pending. Never the notice's content: the engine stores it at
-  gate time under `<home>/approval/notices/<hash>` (xxh3-128), and a viewer
-  reads it there by `hash`, checking the bytes against it
-  (`ApprovalPromptNotice::read`). A missing blob, a mismatch, or a record
-  from a heph without `hash` reads as "notice unavailable", never as `path`,
-  which is still written only for viewers that predate `hash`. `standing` is
+  `{addr, queued_behind, notices: [{name, sources: [{addr, origin}]}]}`, or
+  absent once nothing is pending. `origin` says where one artifact's bytes
+  are kept, tagged by `kind`: `cache {addr, revision, hashout}` (an entry of
+  the local cache under the run's home), `file {path, out_path, x, hashout}`
+  (a source file read in place, `path` relative to the workspace root), or
+  `view {source, paths}` (a `group` relocation of another origin, as
+  `(source path, path)` pairs). Never the notice's content, and no notice is
+  written anywhere or held whole in memory: the running process and every
+  viewer read it from the store by `sources`, through the same reader
+  (`ApprovalPromptNotice::read` with the engine's `read_notice_from_store`:
+  read-only, no build, no fetch, no write), rooted at the session's home and
+  at `meta.workspace_root`. A `cache = False` input, whose revision would
+  otherwise live only in the run's memory, is spilled into the durable local
+  cache before the gate asks, under its own `{hashin}_{nanos}` key, which no
+  lookup hits. The reader stops at 4 MiB (`NOTICE_READ_CAP`); past it the
+  text ends with `… notice truncated: N of M bytes shown; full text: heph
+  inspect outputs <addr>`. A source not where it was recorded — a revision
+  gc'd since, a source file changed or gone — or a record with no `sources`
+  reads as "notice unavailable". A record from an older heph, whose sources
+  have another shape, does not decode: there is no fallback. `standing` is
   `approve` or `reject` once Y or N set a standing decision for the build,
   absent otherwise.
 - `Finished`: the TUI was torn down; `at_unix_ms` is the instant its final
@@ -326,7 +339,7 @@ included. The recorder is its own OS thread behind an unbounded channel:
   keeps updating. Past it, only what a viewer needs at the end is appended:
   `End`, `InflightWritten`, `Finished`, the failure report (`Output`), a
   `Label` change, and every `Approval` (a few short records per gated target,
-  carrying the notice hashes and the standing decision). An `Output`
+  carrying the notices' sources and the standing decision). An `Output`
   record keeps at most the first 1 MiB of its text, then a line saying how
   many bytes were left out, so the report a process prints (at most twice)
   overshoots the cap by a bounded amount. `Log` records outlive the cap too,

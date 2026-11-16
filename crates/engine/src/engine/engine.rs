@@ -204,8 +204,9 @@ pub struct Engine {
     pub(crate) local_cache: Arc<dyn LocalCache>,
     /// Mem-only store for `tmp`/uncacheable revisions. Small entries live in
     /// memory and never touch the SQLite WAL; entries over the per-entry cap
-    /// spill to `local_cache`. See [`LocalCacheTmp`].
-    pub(crate) local_cache_tmp: Arc<dyn LocalCache>,
+    /// spill to `local_cache`. See [`LocalCacheTmp`]. Concrete, for the
+    /// approval gate's [`LocalCacheTmp::persist_revision`].
+    pub(crate) local_cache_tmp: Arc<crate::engine::local_cache_tmp::LocalCacheTmp>,
     /// The durable tier's sqlite store, also inside `local_cache`, kept by its
     /// concrete type so [`Engine::invoke`] can drain its write-behind queue
     /// before an entrypoint's tool starts (D43).
@@ -811,7 +812,7 @@ impl Engine {
         let parallelism = cfg.parallelism.unwrap_or_else(hcore::sysres::host_cpus);
 
         let sqlite = LocalCacheSQLite::with_pipe_limit(
-            home.join("cache").join("cache.db"),
+            crate::engine::local_cache::cache_db_path(&home),
             cfg.mem_cache.per_entry_bytes,
             2 * parallelism,
         )?;
@@ -822,7 +823,7 @@ impl Engine {
         // Durable tier: manifests + small/medium blobs in sqlite, large blobs
         // spilled to plain files. The mem tier (below) fronts both.
         let blobs = Arc::new(crate::engine::local_cache_fs::LocalCacheFS::new(
-            home.join("cache").join("blobs"),
+            crate::engine::local_cache::cache_blobs_dir(&home),
         )?);
         let durable: Arc<dyn LocalCache> =
             Arc::new(crate::engine::local_cache_spill::LocalCacheSpill::new(
@@ -842,12 +843,11 @@ impl Engine {
 
         // Mem-only tier for tmp/uncacheable revisions; spills oversized or
         // over-budget entries to the durable cache so a reader never misses.
-        let local_cache_tmp: Arc<dyn LocalCache> =
-            Arc::new(crate::engine::local_cache_tmp::LocalCacheTmp::new(
-                local_cache.clone(),
-                cfg.tmp_cache.per_entry_bytes,
-                cfg.tmp_cache.capacity_bytes,
-            ));
+        let local_cache_tmp = Arc::new(crate::engine::local_cache_tmp::LocalCacheTmp::new(
+            local_cache.clone(),
+            cfg.tmp_cache.per_entry_bytes,
+            cfg.tmp_cache.capacity_bytes,
+        ));
 
         // Best-effort sweep of stale `sandboxfuse<pid>` dirs from crashed runs.
         sweep_stale_sandboxfuse_dirs(&home);

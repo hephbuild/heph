@@ -647,6 +647,9 @@ impl Content for GuardedArtifact {
     fn file_path(&self) -> Option<std::path::PathBuf> {
         self.inner.file_path()
     }
+    fn origin(&self) -> Option<hcore::hartifactcontent::Origin> {
+        self.inner.origin()
+    }
 }
 
 /// One produced output of a target as it travels the result pipeline: an opaque
@@ -737,7 +740,7 @@ impl ResultArtifact {
 /// `seekable_reader`/`file_path` stay `None` (Content defaults): the FUSE
 /// tar-index path is bypassed and every consumer materializes via `walk()`, so
 /// the verifying reader is always on the materialization path.
-struct PassthroughContent {
+pub(crate) struct PassthroughContent {
     source_path: String,
     out_path: String,
     x: bool,
@@ -749,6 +752,18 @@ struct PassthroughContent {
 }
 
 impl PassthroughContent {
+    /// The source file at `source_path`, presented as the entry `out_path`,
+    /// verified against `expected` as it is read — what an approval notice
+    /// reader opens a recorded source file as ([`crate::engine::approval`]).
+    pub(crate) fn new(source_path: String, out_path: String, x: bool, expected: String) -> Self {
+        Self {
+            source_path,
+            out_path,
+            x,
+            expected,
+        }
+    }
+
     fn verifying_reader(&self) -> anyhow::Result<VerifyingReader> {
         Ok(self.open()?.0)
     }
@@ -807,6 +822,15 @@ impl Content for PassthroughContent {
         // One file, at `out_path`: no need to open the source, as the
         // `walk`-based default would.
         Ok(vec![std::path::PathBuf::from(&self.out_path)])
+    }
+
+    fn origin(&self) -> Option<hcore::hartifactcontent::Origin> {
+        Some(hcore::hartifactcontent::Origin::File {
+            path: std::path::PathBuf::from(&self.source_path),
+            out_path: self.out_path.clone(),
+            x: self.x,
+            hashout: self.expected.clone(),
+        })
     }
 }
 

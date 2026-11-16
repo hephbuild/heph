@@ -238,9 +238,9 @@ pub enum SessionRecordKind {
     /// The approval prompt the TUI shows, or `None` once none is pending, and
     /// the standing Y/N decision in force. The prompt's keys act on the run,
     /// so a viewer shows it without them; a notice's content stays out (a
-    /// viewer reads it by the hash recorded beside it). Written past the cap,
-    /// so the notice hashes and the standing decision are there to read
-    /// however long the build ran.
+    /// viewer reads it from the store by the sources recorded instead).
+    /// Written past the cap, so the notice sources and the standing decision
+    /// are there to read however long the build ran.
     Approval {
         #[serde(default)]
         prompt: Option<Box<ApprovalPrompt>>,
@@ -284,36 +284,39 @@ pub struct ApprovalPrompt {
     /// Prompts queued behind this one.
     #[serde(default)]
     pub queued_behind: u64,
-    /// Each notice the target declares, as `(name, path)`.
+    /// Each notice the target declares.
     #[serde(default)]
     pub notices: Vec<ApprovalPromptNotice>,
 }
 
-/// One notice of an [`ApprovalPrompt`]: where to read it, not what it says.
+/// One notice of an [`ApprovalPrompt`]: where its text is kept, not what it
+/// says. No notice is written anywhere; a reader reads it from the store
+/// (heph's local cache, or a source file in the workspace) by these sources.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalPromptNotice {
     #[serde(default)]
     pub name: String,
-    /// The legacy notice file, overwritten on each request. Still written so
-    /// an attached viewer from an older heph shows something; a viewer reads
-    /// [`Self::hash`] instead, never this.
+    /// The artifacts the notice's text is kept in, in order.
     #[serde(default)]
-    pub path: String,
-    /// The content hash the notice is stored under
-    /// ([`hcore::approval_notice::read_notice_blob`]). Absent from a writer
-    /// that predates it: the notice then reads as unavailable.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hash: Option<String>,
+    pub sources: Vec<hcore::approval_notice::NoticeSource>,
 }
 
 impl ApprovalPromptNotice {
-    /// The notice's text, read from `home`'s store by its hash and checked
-    /// against it, or [`hcore::approval_notice::NOTICE_UNAVAILABLE`] — never
-    /// a path — when the blob is gone, does not match, or no hash was
-    /// recorded. Blocking (one file read): call it off the render task.
-    pub fn read(&self, home: &std::path::Path) -> Result<String, NoticeUnavailable> {
-        hcore::approval_notice::read_notice_blob(home, self.hash.as_deref())
-            .ok_or(NoticeUnavailable)
+    /// The notice's text, read by `read` (the engine's
+    /// `read_notice_from_store`, capped) from [`Self::sources`] under
+    /// `roots` — the session's home and its `meta.workspace_root` — or
+    /// [`hcore::approval_notice::NOTICE_UNAVAILABLE`] when a source is not
+    /// where it was recorded or the record names none. Blocking: call it off
+    /// the render task.
+    pub fn read(
+        &self,
+        roots: &hcore::approval_notice::NoticeRoots,
+        read: hcore::approval_notice::ReadNotice,
+    ) -> Result<String, NoticeUnavailable> {
+        if self.sources.is_empty() {
+            return Err(NoticeUnavailable);
+        }
+        read(roots, &self.sources).ok_or(NoticeUnavailable)
     }
 }
 
@@ -717,8 +720,28 @@ mod tests {
             queued_behind: 2,
             notices: vec![ApprovalPromptNotice {
                 name: "terms".into(),
-                path: "/x/terms.txt".into(),
-                hash: Some("0123456789abcdef0123456789abcdef".into()),
+                sources: vec![
+                    hcore::approval_notice::NoticeSource {
+                        addr: "//a:terms".into(),
+                        origin: hcore::approval_notice::NoticeOrigin::Cache {
+                            addr: "//a:terms".into(),
+                            revision: "abc123_1700000000000000000".into(),
+                            hashout: "def456".into(),
+                        },
+                    },
+                    hcore::approval_notice::NoticeSource {
+                        addr: "//@heph/fs:file@f=a/TERMS".into(),
+                        origin: hcore::approval_notice::NoticeOrigin::View {
+                            source: Box::new(hcore::approval_notice::NoticeOrigin::File {
+                                path: "a/TERMS".into(),
+                                out_path: "a/TERMS".into(),
+                                x: false,
+                                hashout: "0f0f".into(),
+                            }),
+                            paths: vec![("a/TERMS".into(), "TERMS".into())],
+                        },
+                    },
+                ],
             }],
         };
         for (kind, ty) in [
@@ -771,22 +794,55 @@ mod tests {
         }
     }
 
-    /// An `Approval` from a heph that predates notice hashes and standing
-    /// decisions still decodes: no hash (the notice reads as unavailable,
-    /// never by its path) and nothing standing.
+    /// A notice whose record names no input — any record without `sources`
+    /// decodes as one — reads as unavailable without asking the store, and
+    /// one that names inputs is read from them.
     #[test]
-    fn approval_record_from_an_older_writer_decodes() {
-        let json = r#"{"at_unix_ms":3,"session":{"type":"Approval","prompt":{"addr":"//a:b","queued_behind":0,"notices":[{"name":"plan","path":"/home/approval/a_b__plan.txt"}]}}}"#;
+    fn notice_reads_through_the_store_by_its_sources() {
+        use hcore::approval_notice::{NoticeOrigin, NoticeRoots, NoticeSource};
+        fn store(roots: &NoticeRoots, sources: &[NoticeSource]) -> Option<String> {
+            assert!(
+                !sources.is_empty(),
+                "a notice with no sources reaches the store"
+            );
+            let NoticeOrigin::Cache { revision, .. } = &sources[0].origin else {
+                panic!("not a cache origin: {sources:?}");
+            };
+            Some(format!(
+                "{}@{revision} in {}",
+                sources[0].addr,
+                roots.home.display()
+            ))
+        }
+        fn never(_: &NoticeRoots, _: &[NoticeSource]) -> Option<String> {
+            None
+        }
+        let json = r#"{"at_unix_ms":3,"session":{"type":"Approval","prompt":{"addr":"//a:b","queued_behind":0,"notices":[{"name":"plan"}]}}}"#;
         let rec: SessionRecord = serde_json::from_str(json).expect("decode");
-        let Some(SessionRecordKind::Approval { prompt, standing }) = rec.session else {
+        let Some(SessionRecordKind::Approval { prompt, .. }) = rec.session else {
             panic!("not an Approval: {rec:?}");
         };
-        assert_eq!(standing, None);
-        let notice = &prompt.expect("prompt").notices[0];
-        assert_eq!(notice.hash, None);
-        let home = tempfile::tempdir().expect("tempdir");
-        assert_eq!(notice.read(home.path()), Err(NoticeUnavailable));
+        let mut notice = prompt.expect("prompt").notices[0].clone();
+        let roots = NoticeRoots {
+            home: "/nonexistent-heph-home".into(),
+            root: "/nonexistent-heph-root".into(),
+        };
+        assert_eq!(notice.read(&roots, store), Err(NoticeUnavailable));
         assert_eq!(NoticeUnavailable.to_string(), "notice unavailable");
+
+        notice.sources = vec![NoticeSource {
+            addr: "//a:plan".into(),
+            origin: NoticeOrigin::Cache {
+                addr: "//a:plan".into(),
+                revision: "h1".into(),
+                hashout: "o1".into(),
+            },
+        }];
+        assert_eq!(
+            notice.read(&roots, store).as_deref(),
+            Ok("//a:plan@h1 in /nonexistent-heph-home")
+        );
+        assert_eq!(notice.read(&roots, never), Err(NoticeUnavailable));
     }
 
     /// An `Approval` from a newer writer whose standing decision this heph

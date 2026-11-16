@@ -542,7 +542,7 @@ fn events_cap_truncates() {
 
 /// Past the cap, the view records a truncated session still needs at its end
 /// are written: the failure report, a label change, every approval prompt
-/// (its notice hashes, its clear, the standing decision) and `Finished`, and
+/// (its notices' sources, its clear, the standing decision) and `Finished`, and
 /// log lines (a replay reads them). A build event is not.
 #[test]
 fn events_cap_keeps_the_ending_view_records() {

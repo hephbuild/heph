@@ -831,10 +831,18 @@ mod tests {
                 kind: hcore::events::BuildEventKind::ResultStart { addr: big.clone() },
             });
         }
-        // A gated target past the cap: its prompt carries the notice's hash,
-        // which an attached viewer reads the notice back by. Recorded before
-        // the RunLog, so it has landed once the RunLog is found.
-        let hash = hcore::approval_notice::write_notice_blob(&home, "the plan").expect("notice");
+        // A gated target past the cap: its prompt carries the notice's
+        // sources, which an attached viewer renders the notice again from.
+        // Recorded before the RunLog, so it has landed once the RunLog is
+        // found.
+        let sources = vec![hcore::approval_notice::NoticeSource {
+            addr: "//a:plan".into(),
+            origin: hcore::approval_notice::NoticeOrigin::Cache {
+                addr: "//a:plan".into(),
+                revision: "h1".into(),
+                hashout: "o1".into(),
+            },
+        }];
         opened.tap.view(
             2,
             SessionRecordKind::Approval {
@@ -843,11 +851,7 @@ mod tests {
                     queued_behind: 0,
                     notices: vec![super::super::ApprovalPromptNotice {
                         name: "plan".into(),
-                        path: home
-                            .join("approval/plan.txt")
-                            .to_string_lossy()
-                            .into_owned(),
-                        hash: Some(hash),
+                        sources: sources.clone(),
                     }],
                 })),
                 standing: None,
@@ -892,9 +896,8 @@ mod tests {
             panic!("{kinds:?}");
         };
         assert_eq!(
-            prompt.notices[0].read(&home).as_deref(),
-            Ok("the plan"),
-            "the notice reads back by the hash recorded past the cap"
+            prompt.notices[0].sources, sources,
+            "the notice's sources are recorded past the cap"
         );
 
         slot.finish(Some(0));

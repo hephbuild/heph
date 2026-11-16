@@ -91,6 +91,61 @@ impl LocalCacheTmp {
     fn key(addr: &Addr, hashin: &str, name: &str) -> Key {
         (addr.format(), hashin.to_string(), name.to_string())
     }
+
+    /// Spill every entry of revision `(addr, hashin)` this tier holds in memory
+    /// to the durable cache — the path an entry over a limit takes — manifest
+    /// last, so a reader that finds it finds the rest. A revision with nothing
+    /// in memory (it spilled already, or it is not a tmp revision) is left
+    /// alone. Each entry stays readable throughout: it is queued on the
+    /// durable cache before it leaves the map.
+    ///
+    /// What the approval gate calls on a notice input, so another process can
+    /// read it ([`crate::engine::approval`]). The key is unchanged, so the
+    /// spilled revision is never a cache hit; like any spilled tmp revision it
+    /// stays until `heph gc` trims the target or `heph clean` drops it.
+    /// Returns how many entries moved.
+    pub(crate) fn persist_revision(&self, addr: &Addr, hashin: &str) -> Result<usize> {
+        let addr_key = addr.format();
+        let mut names: Vec<String> = self
+            .store
+            .map
+            .read()
+            .keys()
+            .filter(|(a, h, _)| *a == addr_key && h == hashin)
+            .map(|(_, _, n)| n.clone())
+            .collect();
+        // The manifest is a revision's commit record: last.
+        names.sort_by_key(|n| crate::engine::local_cache::is_manifest_name(n));
+        for name in &names {
+            let key = (addr_key.clone(), hashin.to_string(), name.clone());
+            let Some(buf) = self.store.map.read().get(&key).cloned() else {
+                continue;
+            };
+            spill(&self.durable, addr, hashin, name, &buf)?;
+            if let Some(v) = self.store.map.write().remove(&key) {
+                self.store.used.fetch_sub(v.len() as u64, Ordering::Relaxed);
+            }
+        }
+        Ok(names.len())
+    }
+}
+
+/// Write `bytes` as entry `(addr, hashin, name)` of `durable`: an entry over
+/// a limit, at commit or on [`LocalCacheTmp::persist_revision`].
+fn spill(
+    durable: &Arc<dyn LocalCache>,
+    addr: &Addr,
+    hashin: &str,
+    name: &str,
+    bytes: &[u8],
+) -> Result<()> {
+    let mut w = durable
+        .writer(addr, hashin, name)
+        .with_context(|| format!("open durable writer for tmp cache entry {name}"))?;
+    w.write_all(bytes)
+        .with_context(|| format!("spill tmp cache entry {name} to durable"))?;
+    w.commit()
+        .with_context(|| format!("commit spilled tmp cache entry {name}"))
 }
 
 impl LocalCache for LocalCacheTmp {
@@ -307,14 +362,13 @@ impl EntryWriter for TmpWriter {
             return Ok(());
         }
         // Over the capacity budget: spill to durable instead of mem.
-        let mut w = self
-            .durable
-            .writer(&self.addr, &self.hashin, &self.name)
-            .with_context(|| format!("open durable writer for tmp cache entry {}", self.name))?;
-        w.write_all(&self.buf)
-            .with_context(|| format!("spill tmp cache entry {} to durable", self.name))?;
-        w.commit()
-            .with_context(|| format!("commit spilled tmp cache entry {}", self.name))
+        spill(
+            &self.durable,
+            &self.addr,
+            &self.hashin,
+            &self.name,
+            &self.buf,
+        )
     }
 }
 

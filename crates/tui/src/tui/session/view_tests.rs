@@ -244,8 +244,7 @@ fn attached_view_draws_what_the_run_drew() {
         vec![ApprovalNoticeView {
             name: "plan".into(),
             content: "drop the table".into(),
-            path: "/ws/.heph/notices/plan.txt".into(),
-            hash: hcore::approval_notice::notice_hash(b"drop the table"),
+            sources: Vec::new(),
         }],
     );
     let next = center.request(&build, "//a:next".into(), Vec::new());
@@ -305,7 +304,7 @@ fn attached_view_draws_what_the_run_drew() {
     for needle in [
         "approval required: //a:gate",
         "2 pending",
-        "plan: /ws/.heph/notices/plan.txt",
+        "notice: plan",
         "//a:slow",
         &format!("locked by session {}", holder.id()),
         "(4 matched)",

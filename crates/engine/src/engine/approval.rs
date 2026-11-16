@@ -5,43 +5,49 @@
 //! between the engine and the front-end (the interactive TUI, a stdin prompt, or
 //! `--auto-approve`); the engine itself stays UI-agnostic.
 //!
-//! The notice — the rendered contents of the input groups named in
-//! `approval.notice` — is computed here (the engine is the only place that can
-//! resolve and read an input's artifacts) and handed to the handler ready to
-//! display.
+//! The notice — the contents of the input groups named in `approval.notice` —
+//! is never rendered here, written anywhere, or held in memory. At gate time
+//! the engine resolves those inputs (it is the only place that can) and hands
+//! the handler where each artifact's bytes are kept: a [`NoticeSource`] per
+//! artifact. An artifact that lived only in this process's memory — the tmp
+//! tier's copy of a `cache = False` input — is first spilled into the durable
+//! local cache under its own `{hashin}_{nanos}` key. Every reader, the live
+//! view and another process alike, then renders the text from the store with
+//! [`read_notice_from_store`], capped (see [`hcore::approval_notice`]).
+//! Diagnostics only: none of it reaches a hash, a sandbox, an env or an argv.
 
 use crate::engine::Engine;
 use crate::engine::link::LinkedTargetDef;
+use crate::engine::local_cache::{CacheArtifact, LocalCache, MANIFEST_V2, ManifestArtifactType};
 use crate::engine::provider::TargetSpec;
 use crate::engine::request_state::RequestState;
-use crate::engine::result::{OutputMatcher, ResultOptions};
+use crate::engine::result::{OutputMatcher, PassthroughContent, ResultOptions};
 use anyhow::Context;
 use async_trait::async_trait;
-use hcore::hartifactcontent::WalkEntryKind;
+use hcore::approval_notice::{NOTICE_READ_CAP, NoticeOrigin, NoticeRoots, NoticeSource};
+use hcore::hartifactcontent::{Content, Origin, WalkEntryKind};
 use hcore::hasync::StdCancellationToken;
-use hmodel::htaddr::Addr;
+use hmodel::htaddr::{Addr, parse_addr};
 use std::io::Read;
+use std::path::Path;
 use std::sync::Arc;
 
-/// One rendered notice shown to the user before they approve/reject: the input
-/// group name, the concatenated text of every file that group resolves to, the
-/// on-disk path the full text was written to (kept for viewers that predate
-/// `hash`), and the content hash it is stored under
-/// ([`hcore::approval_notice`]), which is how a new viewer reads it back.
+/// One notice shown to the user before they approve/reject: the input group
+/// name and where its text is kept, artifact by artifact, in order. Never the
+/// text: a reader renders it with [`read_notice_from_store`].
 #[derive(Debug, Clone)]
 pub struct ApprovalNotice {
     pub name: String,
-    pub content: String,
-    pub path: String,
-    pub hash: String,
+    pub sources: Vec<NoticeSource>,
 }
 
-/// A pending approval handed to the [`ApprovalHandler`]: the target being gated
-/// plus its (possibly empty) rendered notices.
+/// A pending approval handed to the [`ApprovalHandler`]: the target being gated,
+/// its (possibly empty) notices, and where their sources are read from.
 #[derive(Debug, Clone)]
 pub struct ApprovalRequest {
     pub addr: String,
     pub notices: Vec<ApprovalNotice>,
+    pub roots: NoticeRoots,
 }
 
 /// Host-side decision maker for approval-gated targets. Implemented by the CLI
@@ -56,45 +62,6 @@ pub trait ApprovalHandler: Send + Sync {
         req: ApprovalRequest,
         ctoken: &StdCancellationToken,
     ) -> anyhow::Result<bool>;
-}
-
-/// [`read_notice_text`] on the blocking pool.
-///
-/// Rendering a notice walks every file of every matched artifact and pulls its
-/// bytes out of the cache, which additionally parks the calling thread on any
-/// queued sqlite write to those keys. The artifacts are `Arc`s, so the job owns
-/// them outright and survives a dropped caller future.
-///
-/// A named wrapper rather than an inline `hcore::blocking::run`, so the
-/// "off the worker" property has something a test can hold — see
-/// `notice_rendering_runs_off_the_runtime_workers`.
-async fn read_notice_text_blocking(
-    artifacts: Vec<Arc<dyn hcore::hartifactcontent::Content>>,
-) -> anyhow::Result<String> {
-    hcore::blocking::run(move || read_notice_text(&artifacts)).await
-}
-
-/// Concatenate the UTF-8 text of every file in `artifacts`. Binary bytes are
-/// rendered lossily — a notice is shown to a human, not parsed.
-///
-/// Synchronous and byte-moving: called only through
-/// [`read_notice_text_blocking`].
-fn read_notice_text(
-    artifacts: &[Arc<dyn hcore::hartifactcontent::Content>],
-) -> anyhow::Result<String> {
-    let mut out = String::new();
-    for art in artifacts {
-        for entry in art.walk().context("walk notice artifact")? {
-            let entry = entry.context("read notice artifact entry")?;
-            if let WalkEntryKind::File { mut data, .. } = entry.kind {
-                let mut bytes = Vec::new();
-                data.read_to_end(&mut bytes)
-                    .context("reading notice file")?;
-                out.push_str(&String::from_utf8_lossy(&bytes));
-            }
-        }
-    }
-    Ok(out)
 }
 
 /// Whether an input belongs to the notice group `name`. An input's `origin_id`
@@ -132,11 +99,11 @@ impl Engine {
     }
 
     /// Gate a target's execution on user approval. A no-op unless
-    /// `spec.approval.required`. Renders the notice inputs, asks the request's
-    /// [`ApprovalHandler`], and returns an [`ApprovalDeniedError`] if the user
-    /// (or auto-approve policy) says no. Errors if a target requires approval but
-    /// no handler is configured for the request — better to fail loudly than to
-    /// silently run a gated target.
+    /// `spec.approval.required`. Collects the notice inputs' sources, asks the
+    /// request's [`ApprovalHandler`], and returns an [`ApprovalDeniedError`] if
+    /// the user (or auto-approve policy) says no. Errors if a target requires
+    /// approval but no handler is configured for the request — better to fail
+    /// loudly than to silently run a gated target.
     ///
     /// [`ApprovalDeniedError`]: crate::engine::error::ApprovalDeniedError
     pub(crate) async fn gate_approval(
@@ -159,36 +126,26 @@ impl Engine {
 
         let mut notices = Vec::with_capacity(spec.approval.notice.len());
         for name in &spec.approval.notice {
-            let content = self
+            let sources = self
                 .clone()
-                .render_notice(rs, def, name)
+                .notice_sources(rs, def, name)
                 .await
                 .with_context(|| {
-                    format!("rendering approval notice `{name}` for {}", addr.format())
+                    format!("collecting approval notice `{name}` for {}", addr.format())
                 })?;
-            // Persist the full notice twice: under its content hash, which is
-            // how a viewer reads it back (checked on read), and at the legacy
-            // per-(target, notice) path an older attached viewer still shows.
-            let file = notice_file(&self.home, addr, name);
-            let home = self.home.to_path_buf();
-            let (content, path, hash) = hcore::blocking::run(move || {
-                let hash = hcore::approval_notice::write_notice_blob(&home, &content)?;
-                let path = write_notice_file(&file, &content)?;
-                anyhow::Ok((content, path, hash))
-            })
-            .await
-            .with_context(|| format!("writing approval notice `{name}` for {}", addr.format()))?;
             notices.push(ApprovalNotice {
                 name: name.clone(),
-                content,
-                path,
-                hash,
+                sources,
             });
         }
 
         let req = ApprovalRequest {
             addr: addr.format(),
             notices,
+            roots: NoticeRoots {
+                home: self.home.to_path_buf(),
+                root: self.root().to_path_buf(),
+            },
         };
         // Counted before the prompt so a cancelled/errored gate still registers
         // as requested even when no decision lands.
@@ -207,16 +164,24 @@ impl Engine {
     }
 
     /// Resolve every input group whose `origin_id` matches `name` (see
-    /// [`input_in_group`]) and concatenate the UTF-8 text of their files. Binary
-    /// bytes are rendered lossily. The notice name is validated up front by
-    /// [`Self::validate_approval`]; an empty match here would mean the input set
-    /// changed between link and execute, which is still surfaced as an error.
-    async fn render_notice(
+    /// [`input_in_group`]) and return where each of their artifacts is kept,
+    /// in order. The notice name is validated up front by
+    /// [`Self::validate_approval`]; an empty match here would mean the input
+    /// set changed between link and execute, which is still surfaced as an
+    /// error.
+    ///
+    /// Every source is readable from the store once this returns: a revision
+    /// the tmp tier held in memory is spilled into the durable cache, and the
+    /// manifest of every cache revision named is waited out of the write
+    /// queue and checked present; a source file is checked present in the
+    /// workspace. An artifact with no nameable origin is an error, not a
+    /// silently unreadable notice.
+    async fn notice_sources(
         self: Arc<Self>,
         rs: &Arc<RequestState>,
         def: &LinkedTargetDef,
         name: &str,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<Vec<NoticeSource>> {
         let inputs: Vec<_> = def
             .inputs
             .iter()
@@ -229,163 +194,389 @@ impl Engine {
             );
         }
 
-        let mut out = String::new();
+        let mut sources = Vec::new();
         for input in inputs {
+            let addr = &input.target.addr;
             let res = self
                 .clone()
                 .result_addr(
                     rs.clone(),
-                    &input.target.addr,
+                    addr,
                     OutputMatcher::Exact(input.output_names.clone()),
                     &ResultOptions::default(),
                 )
                 .await
-                .with_context(|| {
-                    format!("resolving notice input {}", input.target.addr.format())
+                .with_context(|| format!("resolving notice input {}", addr.format()))?;
+            for artifact in &res.artifacts {
+                let origin = artifact.origin().with_context(|| {
+                    format!(
+                        "notice input {} has an artifact no reader can find again",
+                        addr.format()
+                    )
                 })?;
-            let addr = input.target.addr.format();
-            let text = read_notice_text_blocking(res.artifacts.clone())
-                .await
-                .with_context(|| format!("reading notice input {addr}"))?;
-            out.push_str(&text);
+                self.persist_origin(&origin)
+                    .await
+                    .with_context(|| format!("storing notice input {}", addr.format()))?;
+                sources.push(NoticeSource {
+                    addr: addr.format(),
+                    origin: self.notice_origin(origin)?,
+                });
+            }
         }
-        Ok(out)
+        Ok(sources)
+    }
+
+    /// Make `origin` readable by another process: spill a tmp revision it
+    /// names into the durable cache, then wait its manifest out of the write
+    /// queue. A source file is the workspace's own and is only checked
+    /// present.
+    async fn persist_origin(&self, origin: &Origin) -> anyhow::Result<()> {
+        match origin {
+            Origin::Cache { addr, revision, .. } => {
+                let addr = parse_addr(addr).with_context(|| format!("parsing {addr}"))?;
+                let tmp = Arc::clone(&self.local_cache_tmp);
+                let (a, r) = (addr.clone(), revision.clone());
+                // Off the workers: it moves bytes into the durable cache.
+                hcore::blocking::run(move || tmp.persist_revision(&a, &r)).await?;
+                // The manifest is a revision's last write, so once it is
+                // committed so are its blobs.
+                if !self.exists_local(&addr, revision, MANIFEST_V2).await? {
+                    anyhow::bail!("revision {revision} of {addr} is not in the local cache");
+                }
+                Ok(())
+            }
+            Origin::File { path, .. } => {
+                if !path.is_file() {
+                    anyhow::bail!("source file {} is gone", path.display());
+                }
+                Ok(())
+            }
+            Origin::View { source, .. } => Box::pin(self.persist_origin(source)).await,
+        }
+    }
+
+    /// `origin` as a session records it: a source file relative to the
+    /// workspace root, the rest as they are.
+    fn notice_origin(&self, origin: Origin) -> anyhow::Result<NoticeOrigin> {
+        Ok(match origin {
+            Origin::Cache {
+                addr,
+                revision,
+                hashout,
+            } => NoticeOrigin::Cache {
+                addr,
+                revision,
+                hashout,
+            },
+            Origin::File {
+                path,
+                out_path,
+                x,
+                hashout,
+            } => {
+                let rel = path.strip_prefix(self.root()).with_context(|| {
+                    format!("source file {} is outside the workspace", path.display())
+                })?;
+                NoticeOrigin::File {
+                    path: rel.to_string_lossy().into_owned(),
+                    out_path,
+                    x,
+                    hashout,
+                }
+            }
+            Origin::View { source, paths } => NoticeOrigin::View {
+                source: Box::new(self.notice_origin(*source)?),
+                paths: paths
+                    .into_iter()
+                    .map(|(s, d)| {
+                        (
+                            s.to_string_lossy().into_owned(),
+                            d.to_string_lossy().into_owned(),
+                        )
+                    })
+                    .collect(),
+            },
+        })
     }
 }
 
-/// The legacy per-(target, notice) file of a rendered notice:
-/// `<home>/approval/<addr>__<name>.txt`, stable across runs (overwritten in
-/// place). Only an attached viewer from an older heph reads it.
-fn notice_file(home: &std::path::Path, addr: &Addr, name: &str) -> std::path::PathBuf {
-    let sanitize = |s: &str| -> String {
-        s.chars()
-            .map(|c| if c.is_alphanumeric() { c } else { '_' })
-            .collect()
+/// Render a notice from its [`NoticeSource`]s, read-only: no engine, no
+/// build, no fetch, no write — what every reader does, the live view and an
+/// attached viewer in another process alike. Capped at [`NOTICE_READ_CAP`]
+/// bytes (see [`read_notice_capped`]). Matches
+/// [`hcore::approval_notice::ReadNotice`].
+pub fn read_notice_from_store(roots: &NoticeRoots, sources: &[NoticeSource]) -> Option<String> {
+    read_notice_capped(roots, sources, NOTICE_READ_CAP)
+}
+
+/// [`read_notice_from_store`] with a cap of `cap` bytes. The files of the
+/// sources are concatenated in order, rendered lossily (a notice is shown to a
+/// human, not parsed); past `cap` bytes no file is read further, and the text
+/// ends with a line naming the total size and the input to
+/// `heph inspect outputs` for the rest.
+///
+/// `None` — show [`hcore::approval_notice::NOTICE_UNAVAILABLE`] — when there
+/// are no sources, or any of them is not where it was recorded: a revision
+/// gc'd since, a hashout the revision no longer holds, a source file that is
+/// gone or (read through to its end) no longer hashes to what was recorded.
+/// Blocking: call it off the render task.
+pub fn read_notice_capped(
+    roots: &NoticeRoots,
+    sources: &[NoticeSource],
+    cap: usize,
+) -> Option<String> {
+    if sources.is_empty() {
+        return None;
+    }
+    let mut store = Store { roots, cache: None };
+    let mut text = CappedText::new(cap);
+    let mut read = || -> anyhow::Result<bool> {
+        for source in sources {
+            let found = store.each_file(&source.origin, &mut |_, data, size| {
+                text.file(data, size, &source.addr)
+            })?;
+            if !found {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     };
-    home.join("approval").join(format!(
-        "{}__{}.txt",
-        sanitize(&addr.format()),
-        sanitize(name)
-    ))
+    match read() {
+        Ok(true) => Some(text.finish()),
+        Ok(false) => None,
+        Err(e) => {
+            tracing::debug!(error = %format!("{e:#}"), "approval notice unavailable");
+            None
+        }
+    }
 }
 
-/// Write a rendered notice to its legacy [`notice_file`] and return its
-/// absolute path. Blocking.
-fn write_notice_file(file: &std::path::Path, content: &str) -> anyhow::Result<String> {
-    if let Some(dir) = file.parent() {
-        std::fs::create_dir_all(dir)
-            .with_context(|| format!("create approval dir {}", dir.display()))?;
+/// Where one read of a notice finds its sources: the roots, and the local
+/// cache, opened on first use.
+struct Store<'a> {
+    roots: &'a NoticeRoots,
+    cache: Option<Arc<dyn LocalCache>>,
+}
+
+/// Called with a file's path, its bytes (unread) and its size.
+type EachFile<'f> = dyn FnMut(&Path, Box<dyn Read>, u64) -> anyhow::Result<()> + 'f;
+
+impl Store<'_> {
+    /// Call `f` with each file `origin` names, in order: its path (what a
+    /// view maps), its bytes (unread) and its size. `Ok(false)` when it is not
+    /// where it was recorded.
+    fn each_file(&mut self, origin: &NoticeOrigin, f: &mut EachFile<'_>) -> anyhow::Result<bool> {
+        if let NoticeOrigin::View { source, paths } = origin {
+            let paths: std::collections::HashMap<&Path, &Path> = paths
+                .iter()
+                .map(|(s, d)| (Path::new(s.as_str()), Path::new(d.as_str())))
+                .collect();
+            return self.each_file(source, &mut |path, data, size| match paths.get(path) {
+                Some(dst) => f(dst, data, size),
+                None => Ok(()),
+            });
+        }
+        let Some(content) = self.open(origin)? else {
+            return Ok(false);
+        };
+        for entry in content.walk().context("walk notice artifact")? {
+            let entry = entry.context("read notice artifact entry")?;
+            if let WalkEntryKind::File { data, size, .. } = entry.kind {
+                f(&entry.path, data, size)?;
+            }
+        }
+        Ok(true)
     }
-    std::fs::write(file, content)
-        .with_context(|| format!("write approval notice {}", file.display()))?;
-    Ok(file.to_string_lossy().into_owned())
+
+    /// The content a cache entry or a source file names, or `None` when it
+    /// is not there.
+    fn open(&mut self, origin: &NoticeOrigin) -> anyhow::Result<Option<Arc<dyn Content>>> {
+        Ok(match origin {
+            NoticeOrigin::Cache {
+                addr,
+                revision,
+                hashout,
+            } => {
+                let addr = parse_addr(addr).with_context(|| format!("parsing {addr}"))?;
+                let Some(cache) = self.cache()? else {
+                    return Ok(None);
+                };
+                let Some(manifest) = Engine::read_manifest_from(&cache, &addr, revision)? else {
+                    return Ok(None);
+                };
+                manifest
+                    .artifacts
+                    .iter()
+                    .find(|a| a.r#type == ManifestArtifactType::Output && &a.hashout == hashout)
+                    .map(|a| -> Arc<dyn Content> {
+                        Arc::new(CacheArtifact::from_manifest(&addr, revision, a, cache))
+                    })
+            }
+            NoticeOrigin::File {
+                path,
+                out_path,
+                x,
+                hashout,
+            } => {
+                let path = self.roots.root.join(path);
+                if !path.is_file() {
+                    return Ok(None);
+                }
+                Some(Arc::new(PassthroughContent::new(
+                    path.to_string_lossy().into_owned(),
+                    out_path.clone(),
+                    *x,
+                    hashout.clone(),
+                )))
+            }
+            // Walked through its source by `each_file`.
+            NoticeOrigin::View { .. } => None,
+        })
+    }
+
+    /// The local cache under `home`, read-only, opened once. `None` when the
+    /// home has no cache: a read-only handle never creates the database, so
+    /// that is checked first and answered at once rather than through the
+    /// pool's open retry.
+    fn cache(&mut self) -> anyhow::Result<Option<Arc<dyn LocalCache>>> {
+        if let Some(cache) = &self.cache {
+            return Ok(Some(Arc::clone(cache)));
+        }
+        let home = &self.roots.home;
+        let db = crate::engine::local_cache::cache_db_path(home);
+        if !db.exists() {
+            return Ok(None);
+        }
+        let sqlite: Arc<dyn LocalCache> = Arc::new(
+            crate::engine::local_cache_sqlite::LocalCacheSQLite::open_read_only(db)
+                .context("opening the local cache read-only")?,
+        );
+        let blobs = Arc::new(crate::engine::local_cache_fs::LocalCacheFS::new(
+            crate::engine::local_cache::cache_blobs_dir(home),
+        )?);
+        // The threshold only routes writes, and this handle makes none.
+        let cache: Arc<dyn LocalCache> = Arc::new(
+            crate::engine::local_cache_spill::LocalCacheSpill::new(sqlite, blobs, usize::MAX),
+        );
+        self.cache = Some(Arc::clone(&cache));
+        Ok(Some(cache))
+    }
+}
+
+/// A notice's text, up to `cap` bytes: each file rendered lossily, and past
+/// the cap only counted, never read.
+struct CappedText {
+    out: String,
+    cap: usize,
+    /// Bytes read into `out` so far (before lossy rendering).
+    read: u64,
+    /// Bytes of every file seen, read or not.
+    total: u64,
+    /// The input whose file the cap fell in.
+    truncated_in: Option<String>,
+}
+
+impl CappedText {
+    fn new(cap: usize) -> Self {
+        Self {
+            out: String::new(),
+            cap,
+            read: 0,
+            total: 0,
+            truncated_in: None,
+        }
+    }
+
+    fn file(&mut self, data: Box<dyn Read>, size: u64, addr: &str) -> anyhow::Result<()> {
+        self.total = self.total.saturating_add(size);
+        let room = (self.cap as u64).saturating_sub(self.read);
+        if room > 0 {
+            let mut bytes = Vec::new();
+            data.take(room)
+                .read_to_end(&mut bytes)
+                .context("reading notice file")?;
+            self.read = self.read.saturating_add(bytes.len() as u64);
+            self.out.push_str(&String::from_utf8_lossy(&bytes));
+        }
+        if size > room && self.truncated_in.is_none() {
+            self.truncated_in = Some(addr.to_owned());
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> String {
+        if let Some(addr) = self.truncated_in {
+            if !self.out.is_empty() && !self.out.ends_with('\n') {
+                self.out.push('\n');
+            }
+            self.out.push_str(&format!(
+                "… notice truncated: {} of {} bytes shown; full text: heph inspect outputs {addr}\n",
+                self.read, self.total
+            ));
+        }
+        self.out
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{input_in_group, read_notice_text, read_notice_text_blocking};
-    use hcore::hartifactcontent::{Content, WalkEntry};
-    use std::sync::Arc;
+    use super::{CappedText, input_in_group};
 
-    /// A tar of `(path, bytes)` pairs, as a `Content`.
-    struct TarBytes(Vec<u8>);
-
-    impl Content for TarBytes {
-        fn reader(&self) -> anyhow::Result<Box<dyn std::io::Read>> {
-            Ok(Box::new(std::io::Cursor::new(self.0.clone())))
+    fn render(cap: usize, files: &[(&str, &[u8])]) -> String {
+        let mut text = CappedText::new(cap);
+        for (addr, body) in files {
+            text.file(
+                Box::new(std::io::Cursor::new(body.to_vec())),
+                body.len() as u64,
+                addr,
+            )
+            .expect("file");
         }
-        fn walk(&self) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<WalkEntry>> + '_>> {
-            Ok(Box::new(hcore::hartifactcontent::tar::TarWalker::new(
-                std::io::Cursor::new(self.0.clone()),
-            )?))
-        }
-        fn hashout(&self) -> anyhow::Result<String> {
-            Ok(String::new())
-        }
-    }
-
-    fn tar_of(files: &[(&str, &[u8])]) -> Arc<dyn Content> {
-        let mut packer = hcore::hartifactcontent::tar::TarPacker::new();
-        for (rel, body) in files {
-            packer.create_raw(body.to_vec(), *rel, false);
-        }
-        let mut bytes = Vec::new();
-        packer.pack(&mut bytes).expect("pack");
-        Arc::new(TarBytes(bytes))
+        text.finish()
     }
 
     /// The notice is the text a human reads before approving a target, so it
-    /// concatenates every file of every matched artifact in order, and never
-    /// fails on bytes that are not UTF-8 — a notice that errored out would block
-    /// the approval rather than merely look odd.
-    /// Rendering a notice must not run on a tokio worker: it walks every file of
-    /// every matched artifact and reads its bytes out of the cache, and that read
-    /// parks the calling thread on any queued sqlite write to those keys.
-    ///
-    /// The content records whether it was walked inside a `blocking::run` job
-    /// (`hcore::blocking::in_blocking_job` is the witness — tokio's blocking
-    /// threads carry no distinguishing name). Asserted positively — "not on a
-    /// worker" would pass vacuously, since `#[tokio::test]` runs the body on
-    /// the test thread.
-    #[tokio::test]
-    async fn notice_rendering_runs_off_the_runtime_workers() {
-        struct ThreadRecordingTar {
-            inner: TarBytes,
-            in_job: Arc<std::sync::Mutex<Option<bool>>>,
-        }
-
-        impl Content for ThreadRecordingTar {
-            fn reader(&self) -> anyhow::Result<Box<dyn std::io::Read>> {
-                self.inner.reader()
-            }
-            fn walk(
-                &self,
-            ) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<WalkEntry>> + '_>>
-            {
-                let mut slot = self.in_job.lock().unwrap_or_else(|e| e.into_inner());
-                *slot = Some(hcore::blocking::in_blocking_job());
-                drop(slot);
-                self.inner.walk()
-            }
-            fn hashout(&self) -> anyhow::Result<String> {
-                self.inner.hashout()
-            }
-        }
-
-        let mut packer = hcore::hartifactcontent::tar::TarPacker::new();
-        packer.create_raw(b"notice body\n".to_vec(), "NOTICE.txt", false);
-        let mut bytes = Vec::new();
-        packer.pack(&mut bytes).expect("pack");
-        let in_job = Arc::new(std::sync::Mutex::new(None));
-        let artifacts: Vec<Arc<dyn Content>> = vec![Arc::new(ThreadRecordingTar {
-            inner: TarBytes(bytes),
-            in_job: Arc::clone(&in_job),
-        })];
-
-        let out = read_notice_text_blocking(artifacts).await.expect("render");
-
-        assert_eq!(out, "notice body\n", "the notice must still be rendered");
-        let recorded = *in_job.lock().unwrap_or_else(|e| e.into_inner());
-        assert_eq!(
-            recorded,
-            Some(true),
-            "notice rendering must run inside a blocking::run job (None = never walked)"
-        );
-    }
-
+    /// concatenates every file in order, and never fails on bytes that are not
+    /// UTF-8 — a notice that errored out would block the approval rather than
+    /// merely look odd.
     #[test]
     fn notice_text_concatenates_every_file_and_survives_binary_bytes() {
-        let artifacts = vec![
-            tar_of(&[("a.txt", b"first\n"), ("b.txt", b"second\n")]),
-            tar_of(&[("c.bin", &[0xff, 0xfe])]),
-        ];
-
-        let out = read_notice_text(&artifacts).expect("render");
-
+        let out = render(
+            1 << 20,
+            &[
+                ("//p:a", b"first\n"),
+                ("//p:a", b"second\n"),
+                ("//p:b", &[0xff, 0xfe]),
+            ],
+        );
         assert!(out.starts_with("first\nsecond\n"), "got {out:?}");
         assert!(
             out.contains('\u{fffd}'),
             "non-UTF-8 bytes must render lossily rather than fail: {out:?}"
+        );
+        assert!(!out.contains("truncated"), "under the cap: {out:?}");
+    }
+
+    /// Past the cap no file is read further, and the text says so: how much
+    /// there was, and which input to inspect for the rest. A notice exactly at
+    /// the cap is whole.
+    #[test]
+    fn notice_text_stops_at_the_cap_and_says_where_the_rest_is() {
+        assert_eq!(
+            render(
+                10,
+                &[
+                    ("//p:a", b"0123"),
+                    ("//p:b", b"456789abcd"),
+                    ("//p:c", b"xyz")
+                ]
+            ),
+            "0123456789\n… notice truncated: 10 of 17 bytes shown; full text: heph inspect outputs //p:b\n"
+        );
+        assert_eq!(render(4, &[("//p:a", b"0123")]), "0123");
+        assert_eq!(
+            render(0, &[("//p:a", b"0123")]),
+            "… notice truncated: 0 of 4 bytes shown; full text: heph inspect outputs //p:a\n"
         );
     }
 
