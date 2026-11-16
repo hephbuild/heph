@@ -258,8 +258,8 @@ impl Engine {
                 // its tree.
                 let had_sandbox = managed && ran.is_ok();
                 let run = ran.and_then(|ran| ran.context("run"));
-                // End the live log while the sandbox still exists: an older
-                // plugin's own log is read from it.
+                // End the live log while the sandbox still exists: a log the
+                // driver returned as an artifact is read from it.
                 let (run, live) = match live {
                     Some((log, guard)) => {
                         let (run, file) = self
@@ -457,8 +457,9 @@ impl Engine {
     /// still exists: finalize it, fail an `Ok` run with its sticky write
     /// error, and import the log the run returned itself, if any.
     ///
-    /// An older plugin streams *and* returns its own log: the returned one
-    /// is complete, so it wins, imported once and scrubbed, only from a
+    /// A driver may return its log as an artifact at the end of the run
+    /// instead of streaming it, or do both: the returned one is complete, so
+    /// it wins, imported once and scrubbed, only from a
     /// regular file inside the sandbox or inline bytes. Every other `Log` a
     /// run returns is dropped, so the live file is the only log that
     /// reaches the entry or the slot. Returns the finalized file, `None` when

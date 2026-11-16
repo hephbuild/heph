@@ -980,12 +980,12 @@ impl LogFollower {
             LiveEnd::Located { file, .. } => {
                 use std::os::unix::fs::MetadataExt as _;
                 // Unlinked once what replaces it is in place. Across
-                // processes, an older plugin's returned log renamed over the
+                // processes, a driver's returned log renamed over the
                 // streamed one drops this inode's nlink to 0 as well: the
                 // follower then goes on in the cache entry from its offset,
                 // which can splice the streamed head onto the imported rest.
-                // Accepted: it takes an older plugin that both streams and
-                // returns a log, followed from another heph, and the entry
+                // Accepted: it takes a driver that both streams and returns
+                // a log, followed from another heph, and the entry
                 // holds the whole imported log.
                 if run.file.metadata()?.nlink() == 0 {
                     return Ok(true);

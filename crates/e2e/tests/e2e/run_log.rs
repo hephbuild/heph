@@ -1,6 +1,6 @@
 //! A run's live log (`<home>/runs/<engine-id>/<n>.log`) as the engine keeps
-//! it: what an older plugin's returned log does to it, and that it reaches no
-//! hash. The writer, scrubber and file life are unit-tested in
+//! it: what a log a driver returns as an artifact at the end of the run does
+//! to it, and that it reaches no hash. The writer, scrubber and file life are unit-tested in
 //! `crates/engine/src/engine/run_log.rs`.
 
 #![expect(
@@ -19,9 +19,9 @@ use hplugin::driver::outputartifact::{self, OutputArtifact};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// The credential every `legacy` target is handed: what a leaky older plugin
+/// The credential every `returns_log` target is handed: what a leaky driver
 /// writes into the log it returns.
-const SECRET: &str = "legacy-plugin-s3cr3t-value";
+const SECRET: &str = "returned-log-s3cr3t-value";
 
 const RETURNED: &str = "returned log with ";
 
@@ -44,7 +44,7 @@ async fn cached_log(engine: &Arc<Engine>, addr: &str) -> anyhow::Result<Option<S
     Ok(Some(String::from_utf8(out)?))
 }
 
-/// How a `legacy` target returns its log, from its name's prefix.
+/// How a `returns_log` target returns its log, from its name's prefix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Returns {
     /// A regular file inside the sandbox: imported.
@@ -83,10 +83,10 @@ impl Returns {
     }
 }
 
-/// An older plugin: the bash driver, which streams to the writers it is
-/// handed, and then returns a log of its own as well, as a plugin from before
-/// `log_capture` did.
-struct Legacy {
+/// A driver that returns its log as an artifact at the end of the run: the
+/// bash driver, which streams to the writers it is handed, and then returns a
+/// log of its own as well.
+struct ReturnsLog {
     bash: pluginexec::Driver,
     /// Where the `outside` variant's file lives.
     outside: PathBuf,
@@ -121,12 +121,12 @@ fn file_content(path: &Path) -> anyhow::Result<outputartifact::Content> {
     }))
 }
 
-impl Legacy {
+impl ReturnsLog {
     /// The log this run returns, made once the run is over and while its
     /// sandbox exists.
     fn returned(&self, returns: Returns, sandbox: &Path) -> anyhow::Result<OutputArtifact> {
         let content = match returns {
-            Returns::Inside => file_content(&returned_file(sandbox, "legacy.log")?)?,
+            Returns::Inside => file_content(&returned_file(sandbox, "returned.log")?)?,
             Returns::Raw => outputartifact::Content::Raw(outputartifact::ContentRaw {
                 data: format!("{RETURNED}{SECRET}\n").into_bytes(),
                 path: "log.txt".to_string(),
@@ -134,16 +134,16 @@ impl Legacy {
             }),
             Returns::Outside => {
                 std::fs::create_dir_all(&self.outside)?;
-                file_content(&returned_file(&self.outside, "legacy.log")?)?
+                file_content(&returned_file(&self.outside, "returned.log")?)?
             }
             Returns::Symlink => {
-                let target = returned_file(sandbox, "legacy-target.log")?;
-                let link = sandbox.join("legacy.log");
+                let target = returned_file(sandbox, "returned-target.log")?;
+                let link = sandbox.join("returned.log");
                 std::os::unix::fs::symlink(&target, &link)?;
                 file_content(&link)?
             }
             Returns::Unreadable => {
-                let path = returned_file(sandbox, "legacy.log")?;
+                let path = returned_file(sandbox, "returned.log")?;
                 std::fs::set_permissions(
                     &path,
                     std::os::unix::fs::PermissionsExt::from_mode(0o000),
@@ -156,13 +156,13 @@ impl Legacy {
 }
 
 #[async_trait::async_trait]
-impl ManagedDriver for Legacy {
+impl ManagedDriver for ReturnsLog {
     fn config(
         &self,
         _req: hplugin::driver::ConfigRequest,
     ) -> anyhow::Result<hplugin::driver::ConfigResponse> {
         Ok(hplugin::driver::ConfigResponse {
-            name: "legacy".to_string(),
+            name: "returns_log".to_string(),
         })
     }
     fn schema(&self) -> hplugin::driver::DriverSchema {
@@ -209,8 +209,9 @@ impl ManagedDriver for Legacy {
     }
 }
 
-/// A workspace whose `legacy` driver is [`Legacy`], beside plain `bash`.
-fn legacy_workspace(outside: &Path) -> anyhow::Result<htestkit::Workspace> {
+/// A workspace whose `returns_log` driver is [`ReturnsLog`], beside plain
+/// `bash`.
+fn returns_log_workspace(outside: &Path) -> anyhow::Result<htestkit::Workspace> {
     htestkit::WorkspaceBuilder::new()?
         .with_provider(|init| {
             Box::new(pluginbuildfile::Provider::new(
@@ -220,28 +221,28 @@ fn legacy_workspace(outside: &Path) -> anyhow::Result<htestkit::Workspace> {
             ))
         })
         .with_managed_driver(Box::new(pluginexec::Driver::new_bash().with_host_path()))
-        .with_managed_driver(Box::new(Legacy {
+        .with_managed_driver(Box::new(ReturnsLog {
             bash: pluginexec::Driver::new_bash().with_host_path(),
             outside: outside.join("logs"),
         }))
         .build()
 }
 
-/// A follower of an older plugin's run reads what it streamed, and the run
-/// then returns a longer log of its own, which is imported. The follower
-/// sees one log whole, the streamed one or the imported one, never the
-/// streamed bytes continued by the imported log's rest.
+/// A follower of a run that streams and then returns a longer log of its own,
+/// which is imported, reads what it streamed. The follower sees one log
+/// whole, the streamed one or the imported one, never the streamed bytes
+/// continued by the imported log's rest.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_follower_of_a_legacy_import_never_sees_a_splice() -> anyhow::Result<()> {
+async fn a_follower_of_a_returned_log_import_never_sees_a_splice() -> anyhow::Result<()> {
     use heph::engine::{FollowStep, LogOptions};
     let outside = tempfile::tempdir()?;
     let gate = tempfile::tempdir()?;
     let gate = gate.path().join("gate");
-    let ws = legacy_workspace(outside.path())?;
+    let ws = returns_log_workspace(outside.path())?;
     ws.write_build_file(
         "app",
         &format!(
-            r#"target(name = "raw_gated", driver = "legacy", out = "o.txt",
+            r#"target(name = "raw_gated", driver = "returns_log", out = "o.txt",
        run = ["echo s", "while [ ! -e {} ]; do sleep 0.02; done", "printf ok > o.txt"])
 "#,
             gate.display()
@@ -311,16 +312,17 @@ fn slot_log(engine: &Engine, addr: &str) -> Option<String> {
     std::fs::read_to_string(slots.slot_dir(&addr).join("log.txt")).ok()
 }
 
-/// An older plugin streams *and* returns its own log. A returned regular file
+/// A driver that streams *and* returns its own log as an artifact at the end
+/// of the run. A returned regular file
 /// inside the sandbox, or an inline log, is imported, scrubbed, and replaces
 /// what it streamed, in the cache entry on success and the failure slot on
 /// failure. A returned path outside the sandbox, a symlink, or an unreadable
 /// file is "log unavailable": the streamed bytes are kept and nothing of the
 /// returned log is.
 #[tokio::test]
-async fn legacy_plugin_log_imported() -> anyhow::Result<()> {
+async fn returned_log_imported() -> anyhow::Result<()> {
     let outside = tempfile::tempdir()?;
-    let ws = legacy_workspace(outside.path())?;
+    let ws = returns_log_workspace(outside.path())?;
     ws.write_build_file(
         "auth",
         &format!(
@@ -335,7 +337,7 @@ async fn legacy_plugin_log_imported() -> anyhow::Result<()> {
     for returns in Returns::ALL {
         for (suffix, exit) in [("ok", "0"), ("fail", "3")] {
             build.push_str(&format!(
-                r#"target(name = "{name}_{suffix}", driver = "legacy", out = "o.txt",
+                r#"target(name = "{name}_{suffix}", driver = "returns_log", out = "o.txt",
        credentials = ["//auth:t"],
        run = ["echo \"streamed-out $TOKEN\"", "echo streamed-err >&2",
               "printf ok > o.txt", "exit {exit}"])

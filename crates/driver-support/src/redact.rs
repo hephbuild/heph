@@ -1,8 +1,9 @@
 //! Scrubbing credential material out of a captured target's output, at the tee.
 //!
-//! One scrubber, shared: the engine's run log and a plugin's own-file path (a
-//! plugin on a host that predates `log_capture` still writes its own log) both
-//! go through it, so redaction does not depend on which side wrote the bytes.
+//! One scrubber, shared: the engine's run log and a driver's own log file (a
+//! driver may return its log as an artifact at the end of the run instead of
+//! streaming it) both go through it, so redaction does not depend on which
+//! side wrote the bytes.
 //!
 //! An interactive run has no tee, so none of this applies to it: every entrypoint
 //! run and a build target's `--shell` go unscrubbed and unlogged, and `env` in such

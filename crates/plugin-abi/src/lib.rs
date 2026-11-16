@@ -349,8 +349,9 @@ pub const MIN_PLUGIN_ABI: &str = "0.21.0";
 pub const ABI_SEMVER_C: &std::ffi::CStr = c"0.21.1";
 
 /// The first plugin ABI that reads `ManagedRunRequest.log_capture`. The host
-/// sends it only to a plugin at this version or later; an older one writes and
-/// returns its own log, which the host imports.
+/// sends it only to a plugin at this version or later; an older one returns
+/// its log as an artifact at the end of the run, a mode any driver may use,
+/// which the host imports.
 pub const LOG_CAPTURE_SINCE: &str = "0.21.1";
 
 /// The first plugin ABI that reads `ManagedRunRequest.cancel_key`. The host

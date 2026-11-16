@@ -778,9 +778,9 @@ impl RunLog {
         self.state().error.take()
     }
 
-    /// Replace the closed live file with an older plugin's own log, scrubbed:
-    /// the returned file is complete, so it wins over what the plugin
-    /// streamed. It is written whole into a sibling `<n>.log.import`, then
+    /// Replace the closed live file with the log the run returned as an
+    /// artifact at its end, scrubbed: the returned file is complete, so it
+    /// wins over whatever the driver streamed. It is written whole into a sibling `<n>.log.import`, then
     /// renamed over the live path, so the path, and a follower's open file,
     /// is one whole log at every moment: the streamed one or the imported
     /// one, never the streamed head continued by the imported rest.
@@ -941,7 +941,8 @@ impl ImportFile<'_> {
     }
 }
 
-/// A log a run returned itself, as an older plugin does.
+/// A log a run returned itself: a driver that returns its log as an artifact
+/// at the end of the run instead of streaming it.
 #[derive(Debug)]
 pub(crate) enum Returned {
     File(PathBuf),

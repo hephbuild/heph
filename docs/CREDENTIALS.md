@@ -555,7 +555,8 @@ event, the JSON output and the CI report.
 There is one scrubber, `hdriver_support::redact`, and the **engine** applies it,
 not each driver: to every chunk a run streams into its live run log
 (`<home>/runs/<id>/<n>.log`, one carry per stream), and to every `Log` artifact
-a run returns, including the log file an older plugin hands back. A driver
+a run returns, including the log file a driver hands back at the end of the
+run instead of streaming it. A driver
 cannot opt out of it by writing its own log.
 
 The scrubber holds back `len(longest secret) - 1` bytes across every read
