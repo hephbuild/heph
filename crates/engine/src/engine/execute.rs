@@ -219,6 +219,7 @@ impl Engine {
                     sandbox_generation,
                     rs.bg_pending(),
                     sandbox_slot,
+                    rs.sandbox_removals(),
                 );
 
                 // Everything fallible between the claim and the run response
@@ -980,10 +981,11 @@ impl Engine {
         generation: u64,
         pending: crate::engine::sandbox_cleaner::PendingCounter,
         slot: Option<crate::engine::resource_pool::Reservation>,
+        removals: crate::engine::sandbox_cleaner::PendingCounter,
     ) -> crate::engine::sandbox_cleaner::SandboxTeardown {
         let teardown =
             crate::engine::sandbox_cleaner::SandboxTeardown::arm(dir, generation, pending)
-                .with_sandbox_slot(slot);
+                .with_sandbox_slot(slot, removals);
         #[cfg(any(test, feature = "test-support"))]
         let teardown = teardown.with_removal_hold(self.sandbox_removal_hold.clone());
         teardown

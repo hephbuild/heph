@@ -652,6 +652,49 @@ async fn sandbox_usage_held_until_removal() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The request ends while its run's removal is still held: the stream stays
+/// open until the removal returns the slot, and the last `PoolUsage` it ends
+/// on shows the slot free — not the 1/N the request's end saw.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_last_pool_report_follows_removals_after_the_request() -> anyhow::Result<()> {
+    use heph::engine::event::BuildEventKind;
+    let tmp = tempfile::tempdir()?;
+    let root = tmp.path();
+    write_build(root, "p", &target("t", "echo t > $OUT", None));
+    let (engine, gate) = gated_engine(root, 4)?;
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let rs = engine.new_state_with_events(false, Some(tx));
+    build_in(&engine, &rs, &["//p:t".to_owned()]).await?;
+    let bg = rs.bg_pending();
+    // The request ends with the removal still held.
+    drop(rs);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        held(&snapshot(&engine).expect("built"), PoolName::SANDBOX),
+        1,
+        "the removal still holds the slot"
+    );
+    gate.open();
+    let mut last = None;
+    while let Some(ev) = next(&mut rx).await {
+        if let BuildEventKind::PoolUsage {
+            pool,
+            held,
+            removals_pending,
+            ..
+        } = ev.kind
+            && pool == PoolName::SANDBOX
+        {
+            last = Some((held, removals_pending));
+        }
+    }
+    assert_eq!(last, Some((0, 0)), "the stream ended on the slot free");
+    bg.wait_drained().await;
+    all_capacity_back(&engine).await;
+    Ok(())
+}
+
 /// A non-managed driver (`template`, rendered in-process) creates no
 /// sandbox, so it takes no slot either: its first run completes while the
 /// only slot is pending removal.

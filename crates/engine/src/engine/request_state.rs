@@ -404,6 +404,11 @@ pub struct RequestStateData {
     ///
     /// [`sandbox_cleaner::enqueue`]: crate::engine::sandbox_cleaner::enqueue
     pub bg_pending: crate::engine::sandbox_cleaner::PendingCounter,
+    /// This request's sandbox removals that still hold a `sandbox` pool slot:
+    /// one per queued removal, dropped once its slot is back. The last
+    /// `PoolUsage` waits for it (bounded), so the report a request ends on
+    /// shows the slots its runs freed.
+    sandbox_removals: crate::engine::sandbox_cleaner::PendingCounter,
     /// Per-request registry of genuinely-failing targets, keyed by addr. Populated
     /// by the `result_addr` classifier (first-writer-wins dedup) and drained once
     /// at the end of execution for rendering. Shared via `Arc<RequestStateData>`,
@@ -821,6 +826,12 @@ impl RequestState {
         Arc::clone(&self.data.bg_pending)
     }
 
+    /// The request's count of sandbox removals still holding a `sandbox`
+    /// slot, for the teardown whose removal carries one.
+    pub(crate) fn sandbox_removals(&self) -> crate::engine::sandbox_cleaner::PendingCounter {
+        Arc::clone(&self.data.sandbox_removals)
+    }
+
     /// Record a post-write `cache.history` trim for `addr`, to run once this
     /// request's cache read guards are released. `hashin` is the revision just
     /// written, which the trim will preserve. See [`DeferredTrims`] for why it
@@ -1201,17 +1212,60 @@ impl Drop for RequestState {
     }
 }
 
+impl RequestStateData {
+    /// The request's sandbox removals return their slots after it ends: hand
+    /// the stream to a task that reports them as they do
+    /// ([`PoolSampler::trail`]), so the report it ends on is the pool's real
+    /// state rather than the slots the removals still held. The stream stays
+    /// open for at most [`REMOVALS_WAIT`] more; hooks are closed now as
+    /// before, so they see the state at the request's end. With nothing
+    /// pending, no stream, or no runtime to wait on, the stream ends here.
+    ///
+    /// [`REMOVALS_WAIT`]: crate::engine::resource_pool::sampler::REMOVALS_WAIT
+    fn trail_removals(&mut self, sampler: &Arc<PoolSampler>) {
+        use crate::engine::resource_pool::sampler::REMOVALS_WAIT;
+        if self.sandbox_removals.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let runtime = tokio::runtime::Handle::try_current()
+            .ok()
+            .or_else(|| self.engine.upgrade().map(|e| e.runtime.clone()));
+        let Some(runtime) = runtime else {
+            return;
+        };
+        let Some(tx) = self.events.take() else {
+            return;
+        };
+        let sampler = Arc::clone(sampler);
+        let removals = Arc::clone(&self.sandbox_removals);
+        runtime.spawn(async move {
+            sampler
+                .trail(&removals, REMOVALS_WAIT, |kinds| {
+                    for kind in kinds {
+                        // Best-effort, as every send on this stream.
+                        drop(tx.send(crate::engine::event::BuildEvent {
+                            at_unix_ms: crate::engine::event::now_unix_ms(),
+                            kind,
+                        }));
+                    }
+                })
+                .await;
+        });
+    }
+}
+
 impl Drop for RequestStateData {
     fn drop(&mut self) {
         // The pool's last change since the sampler's last tick, before the
         // stream ends: the trailing edge.
-        if let Some(sampler) = self.pool_sampler.get() {
+        if let Some(sampler) = self.pool_sampler.get().cloned() {
             for kind in sampler.finish() {
                 self.dispatch(crate::engine::event::BuildEvent {
                     at_unix_ms: crate::engine::event::now_unix_ms(),
                     kind,
                 });
             }
+            self.trail_removals(&sampler);
         }
         self.ctoken.cancel();
         // Signal end-of-stream to each hook so it can flush its final state. The
@@ -1449,6 +1503,7 @@ impl Engine {
             pool_sampler: std::sync::OnceLock::new(),
             matched_announced: std::sync::atomic::AtomicBool::new(false),
             bg_pending: Arc::clone(&bg_pending),
+            sandbox_removals: crate::engine::sandbox_cleaner::PendingCounter::default(),
             failures: Mutex::new(indexmap::IndexMap::new()),
             approval,
             hash_only,

@@ -9,6 +9,10 @@
 //! pool. The request's last sample is taken when it ends
 //! ([`PoolSampler::finish`]), so the last change after a quiet spell is never
 //! lost, and a request that admitted nothing never starts a sampler at all.
+//! A run's `sandbox` slot outlives the request until its sandbox is removed in
+//! the background, so a request that ends with removals pending keeps its
+//! stream open while they return their slots ([`PoolSampler::trail`]),
+//! bounded by [`REMOVALS_WAIT`].
 //!
 //! What it costs the pool: one atomic increment per locked change, and a
 //! snapshot (one lock, one pass over the pools; the waiting counts are kept
@@ -17,6 +21,7 @@
 
 use super::{Limit, ResourcePool};
 use crate::engine::event::BuildEventKind;
+use hcore::pending::Pending;
 use hplugin::provider::PoolName;
 use parking_lot::Mutex;
 use std::ops::ControlFlow;
@@ -25,6 +30,10 @@ use std::time::Duration;
 
 /// How often a request looks at the pool.
 pub(crate) const TICK: Duration = Duration::from_millis(250);
+
+/// How long a request's last report waits, after the request ends, for its
+/// sandbox removals to return their slots ([`PoolSampler::trail`]).
+pub(crate) const REMOVALS_WAIT: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 pub(crate) struct PoolSampler {
@@ -109,12 +118,41 @@ impl PoolSampler {
     }
 
     /// Stop the ticks and take the last sample: what changed since the last
-    /// send, if anything did. Called once, before the request's stream ends.
+    /// send, if anything did. Called once, when the request ends.
     pub(crate) fn finish(&self) -> Vec<BuildEventKind> {
         if let Some(task) = self.task.lock().take() {
             task.abort();
         }
         self.sample()
+    }
+
+    /// After [`finish`](Self::finish), while `removals` — the request's
+    /// removals still holding a `sandbox` slot — is above zero: hand `send`
+    /// what changed every [`TICK`], and once more when it drains, for at most
+    /// `bound`. A removal still pending at the bound leaves its slot reported
+    /// held, which is what the pool holds.
+    pub(crate) async fn trail(
+        &self,
+        removals: &Pending,
+        bound: Duration,
+        mut send: impl FnMut(Vec<BuildEventKind>),
+    ) {
+        let deadline = tokio::time::Instant::now() + bound;
+        loop {
+            let wake = (tokio::time::Instant::now() + TICK).min(deadline);
+            // A removal releases its slot before it leaves the count, so a
+            // sample after the drain sees every slot back.
+            let drained = tokio::time::timeout_at(wake, removals.wait_drained())
+                .await
+                .is_ok();
+            let events = self.sample();
+            if !events.is_empty() {
+                send(events);
+            }
+            if drained || tokio::time::Instant::now() >= deadline {
+                return;
+            }
+        }
     }
 }
 
@@ -241,5 +279,78 @@ mod tests {
         let after = sampler.sample();
         assert_eq!(held(&after, "sandbox"), Some((0, 0, 0)));
         assert!(sampler.sample().is_empty(), "nothing moved since");
+    }
+
+    /// A slot pending removal, counted in `removals` as the sandbox cleaner
+    /// counts it.
+    fn pending_removal(
+        pool: &Arc<ResourcePool>,
+        removals: &Pending,
+    ) -> super::super::PendingRemoval {
+        let mut grant = now(pool, &cpus(1), &[(PoolName::sandbox(), 1)]);
+        let slot = grant.split_off(PoolName::SANDBOX).expect("a sandbox slot");
+        drop(grant);
+        removals.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        slot.into_removal()
+    }
+
+    /// The request ended with a removal pending: its last reports follow the
+    /// removal, and the one after it returns shows the slot free; the wait
+    /// ends with the drain, not at the bound.
+    #[tokio::test(start_paused = true)]
+    async fn trail_reports_the_slot_a_removal_returns() {
+        let pool = pool();
+        let removals = Pending::new_counter();
+        let sampler = PoolSampler::new(Arc::clone(&pool));
+        let removal = pending_removal(&pool, &removals);
+        let end = sampler.finish();
+        assert_eq!(held(&end, "sandbox"), Some((1, 0, 1)), "held at the end");
+
+        let start = tokio::time::Instant::now();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let trail = tokio::spawn({
+            let sampler = Arc::clone(&sampler);
+            let removals = Arc::clone(&removals);
+            async move {
+                sampler
+                    .trail(&removals, REMOVALS_WAIT, |e| drop(tx.send(e)))
+                    .await;
+            }
+        });
+        tokio::time::sleep(3 * TICK).await;
+        // Slot first, then the count, as `CountedRemoval` drops.
+        drop(removal);
+        removals.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        trail.await.expect("trail");
+        assert!(
+            start.elapsed() < REMOVALS_WAIT,
+            "ended with the drain: {:?}",
+            start.elapsed()
+        );
+        let mut last = None;
+        while let Ok(events) = rx.try_recv() {
+            last = held(&events, "sandbox");
+        }
+        assert_eq!(last, Some((0, 0, 0)), "the last report shows it free");
+    }
+
+    /// A removal stuck past the bound: the wait ends at the bound, and what
+    /// was last reported is the slot still held.
+    #[tokio::test(start_paused = true)]
+    async fn trail_ends_at_its_bound() {
+        let pool = pool();
+        let removals = Pending::new_counter();
+        let sampler = PoolSampler::new(Arc::clone(&pool));
+        let _stuck = pending_removal(&pool, &removals);
+        let end = sampler.finish();
+        assert_eq!(held(&end, "sandbox"), Some((1, 0, 1)));
+
+        let start = tokio::time::Instant::now();
+        let mut sent = Vec::new();
+        sampler
+            .trail(&removals, REMOVALS_WAIT, |e| sent.push(e))
+            .await;
+        assert_eq!(start.elapsed(), REMOVALS_WAIT, "ended at the bound");
+        assert!(sent.is_empty(), "nothing moved, nothing re-sent: {sent:?}");
     }
 }
