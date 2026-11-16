@@ -146,20 +146,66 @@ async fn exec_govet(
         .context("wait for heph-govet -format")
 }
 
-/// `heph-govet` itself failed: its output goes to the target's log, whose tail
-/// the failure box renders, rather than into the message — and, on a host
-/// without `log_capture`, to the live stderr of an interactive run, since it was
-/// captured rather than streamed (under `log_capture` the writers already have
-/// it and the echo does nothing).
-async fn govet_failed(
-    req: &mut ManagedRunRequest<'_, '_>,
+/// What a run makes of `heph-govet -format`'s exit. Rewriting prints only
+/// diagnostics, so on success both streams are log; a failure is
+/// [`ToolLog::failed`]'s (both streams, and the own `log.txt` on an older host).
+async fn format_outcome(
     log: &mut ToolLog<'_>,
     output: &std::process::Output,
-    what: &'static str,
-) -> anyhow::Error {
-    let e = log.failed(output).await.context(what);
-    hdriver_support::driver_managed::echo_failure_log(&mut req.request, &e).await;
-    e
+) -> anyhow::Result<()> {
+    if !output.status.success() {
+        return Err(log
+            .failed(output)
+            .await
+            .context("heph-govet -format failed"));
+    }
+    log.write(output, Streams::BOTH).await;
+    Ok(())
+}
+
+/// What a run makes of `heph-govet -format -check`'s exit. Exit 0 or 1 is an
+/// answer: stderr is log, and exit 1's stdout — the files that need
+/// formatting — is the check's answer, named in the message and never the log.
+/// Any other exit is the tool failing, [`ToolLog::failed`]'s.
+async fn check_outcome(log: &mut ToolLog<'_>, output: &std::process::Output) -> anyhow::Result<()> {
+    if matches!(output.status.code(), Some(0 | 1)) {
+        log.write(output, Streams::STDERR).await;
+    }
+    match output.status.code() {
+        Some(0) => Ok(()),
+        Some(1) => {
+            let list = String::from_utf8_lossy(&output.stdout);
+            let files: Vec<&str> = list.lines().filter(|l| !l.is_empty()).collect();
+            anyhow::bail!(
+                "{} file(s) need formatting (run the `format` target):\n{}",
+                files.len(),
+                files
+                    .iter()
+                    .map(|f| format!("  {}", basename(f)))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+        }
+        _ => Err(log
+            .failed(output)
+            .await
+            .context("heph-govet -format -check failed")),
+    }
+}
+
+/// A failed run's output goes to the target's log, whose tail the failure box
+/// renders, rather than into the message — and, on a host without
+/// `log_capture`, to the live stderr of an interactive run, since it was
+/// captured rather than streamed (under `log_capture` the writers already have
+/// it, and an error with no `Log` artifact echoes nothing).
+async fn echo_failure(
+    req: &mut ManagedRunRequest<'_, '_>,
+    res: anyhow::Result<()>,
+) -> anyhow::Result<ManagedRunResponse> {
+    if let Err(e) = &res {
+        hdriver_support::driver_managed::echo_failure_log(&mut req.request, e).await;
+    }
+    res.map(|()| ManagedRunResponse { artifacts: vec![] })
 }
 
 /// Shared config for both format drivers.
@@ -372,15 +418,9 @@ impl ManagedDriver for GoFormatDriver {
 
         let output = exec_govet(&bin, args, &env, pkg_dir, runner, ctoken).await?;
         let mut log = ToolLog::new(&mut req.request);
-        if !output.status.success() {
-            return Err(
-                govet_failed(&mut req, &mut log, &output, "heph-govet -format failed").await,
-            );
-        }
-        // Rewriting prints only diagnostics: both streams are log.
-        log.write(&output, Streams::BOTH).await;
+        let res = format_outcome(&mut log, &output).await;
         // The rewritten sources are collected from the declared in_place outputs.
-        Ok(ManagedRunResponse { artifacts: vec![] })
+        echo_failure(&mut req, res).await
     }
 }
 
@@ -501,36 +541,9 @@ impl ManagedDriver for GoFormatCheckDriver {
         ];
 
         let output = exec_govet(&bin, args, &env, pkg_dir, runner, ctoken).await?;
-        let stdout = &output.stdout;
         let mut log = ToolLog::new(&mut req.request);
-        if matches!(output.status.code(), Some(0 | 1)) {
-            log.write(&output, Streams::STDERR).await;
-        }
-        match output.status.code() {
-            Some(0) => Ok(ManagedRunResponse { artifacts: vec![] }),
-            // Exit 1 = files need formatting; the tool prints them to stdout —
-            // the check's answer, named in the message, never its log.
-            Some(1) => {
-                let list = String::from_utf8_lossy(stdout);
-                let files: Vec<&str> = list.lines().filter(|l| !l.is_empty()).collect();
-                anyhow::bail!(
-                    "{} file(s) need formatting (run the `format` target):\n{}",
-                    files.len(),
-                    files
-                        .iter()
-                        .map(|f| format!("  {}", basename(f)))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                );
-            }
-            _ => Err(govet_failed(
-                &mut req,
-                &mut log,
-                &output,
-                "heph-govet -format -check failed",
-            )
-            .await),
-        }
+        let res = check_outcome(&mut log, &output).await;
+        echo_failure(&mut req, res).await
     }
 }
 
@@ -620,6 +633,109 @@ mod tests {
             "build".to_string(),
             Default::default(),
         )
+    }
+
+    fn output(code: i32, stdout: &str, stderr: &str) -> std::process::Output {
+        std::process::Output {
+            status: std::os::unix::process::ExitStatusExt::from_raw(code << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    /// A `log_capture` host's log, and its two writers to read back.
+    fn captured() -> (
+        ToolLog<'static>,
+        crate::plugingo::tool_log::test_support::Shared,
+        crate::plugingo::tool_log::test_support::Shared,
+    ) {
+        use crate::plugingo::tool_log::test_support::Shared;
+        let (out, err) = (Shared::default(), Shared::default());
+        let log = ToolLog::Captured(hdriver_support::run_log::RunLog::captured(
+            Some(out.writer()),
+            Some(err.writer()),
+        ));
+        (log, out, err)
+    }
+
+    /// `-format -check` exit 1: the file list is the check's answer — in the
+    /// error, never in the log — and stderr is logged. Exit 2 is the tool
+    /// failing: both streams are logged, and under `log_capture` the error
+    /// carries no log path.
+    #[tokio::test]
+    async fn check_keeps_the_file_list_out_of_the_log() {
+        let (mut log, out, err) = captured();
+        let e = check_outcome(&mut log, &output(1, "/s/pkg/a.go\n/s/pkg/b.go\n", "note\n"))
+            .await
+            .expect_err("exit 1 fails the check");
+        let msg = format!("{e:#}");
+        assert!(msg.contains("2 file(s) need formatting"), "{msg}");
+        assert!(msg.contains("  a.go") && msg.contains("  b.go"), "{msg}");
+        assert_eq!(out.text(), "", "the file list is data, never the log");
+        assert_eq!(err.text(), "note\n");
+
+        let (mut log, out, err) = captured();
+        let e = check_outcome(&mut log, &output(2, "partial\n", "panic: boom\n"))
+            .await
+            .expect_err("exit 2 is the tool failing");
+        assert!(
+            hplugin::error::failure_log(&e).is_none(),
+            "no path under log_capture"
+        );
+        assert!(format!("{e:#}").contains("heph-govet -format -check failed"));
+        assert_eq!(
+            out.text(),
+            "partial\n",
+            "a failed tool has no answer: both streams"
+        );
+        assert_eq!(err.text(), "panic: boom\n");
+
+        let (mut log, out, err) = captured();
+        check_outcome(&mut log, &output(0, "", "ok\n"))
+            .await
+            .expect("exit 0 passes");
+        assert_eq!((out.text().as_str(), err.text().as_str()), ("", "ok\n"));
+    }
+
+    /// `-format` prints only diagnostics: on success both streams are logged
+    /// under `log_capture`.
+    #[tokio::test]
+    async fn format_logs_both_streams() {
+        let (mut log, out, err) = captured();
+        format_outcome(&mut log, &output(0, "rewrote a.go\n", "warn\n"))
+            .await
+            .expect("format");
+        assert_eq!(out.text(), "rewrote a.go\n");
+        assert_eq!(err.text(), "warn\n");
+    }
+
+    /// On an older host nothing is logged of a success or of exit 1, and a
+    /// failed tool writes the target's own `log.txt` and returns it.
+    #[tokio::test]
+    async fn an_older_host_keeps_its_own_log_of_a_failure_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("log.txt");
+        let mut log = ToolLog::OwnFile(path.clone());
+        format_outcome(&mut log, &output(0, "rewrote\n", "warn\n"))
+            .await
+            .expect("format");
+        check_outcome(&mut log, &output(1, "/s/a.go\n", ""))
+            .await
+            .expect_err("exit 1");
+        assert!(
+            !path.exists(),
+            "no log of a success or of the check's answer"
+        );
+
+        let e = check_outcome(&mut log, &output(2, "partial\n", "panic\n"))
+            .await
+            .expect_err("exit 2");
+        assert!(
+            hplugin::error::failure_log(&e).is_some(),
+            "the own log is returned"
+        );
+        let text = std::fs::read_to_string(&path).expect("log.txt");
+        assert!(text.contains("partial") && text.contains("panic"), "{text}");
     }
 
     fn params<'a>(g: &'a Addr, cfg: Option<&'a Addr>) -> FormatParams<'a> {
