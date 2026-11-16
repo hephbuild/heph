@@ -2,7 +2,7 @@
 //! buckets in activity order. Folding an event is `O(log n)` at most; no
 //! frame sorts or walks the targets.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use hcore::capacity::Unit;
 use hcore::events::{BuildEvent, BuildEventKind, CacheOutcomeKind};
@@ -439,6 +439,10 @@ pub struct Model {
     reasons: HashMap<Id, Box<str>>,
     /// The latest report of each bounded pool.
     pools: BTreeMap<String, Gauge>,
+    /// The pools in play this build: one an `ExecuteStart` declared or
+    /// reserved, or whose `PoolUsage` showed some held or waiting. Only
+    /// these get a gauge, and a pool never leaves.
+    in_play: BTreeSet<String>,
     units: BTreeMap<String, String>,
     /// The targets with an op open: what the slow rows, the busy-worker
     /// count and a session's running list walk, bounded by what runs rather
@@ -506,7 +510,21 @@ impl Model {
             BuildEventKind::ScratchLockWaitEnd { addr, .. } => {
                 self.wait(addr, WAIT_SCRATCH, false);
             }
-            BuildEventKind::ExecuteStart { addr, reserved, .. } => {
+            BuildEventKind::ExecuteStart {
+                addr,
+                declared,
+                reserved,
+                ..
+            } => {
+                // Every pool it declared or reserved is in play; a host
+                // predating resources counts it as one CPU.
+                match reserved {
+                    Some(r) => self.play(r.keys()),
+                    None => self.play([hcore::capacity::CPU]),
+                }
+                if let Some(d) = declared {
+                    self.play(d.keys());
+                }
                 // A target that runs is no longer waiting at admission.
                 let id = self.touch(addr);
                 let cpu = reserved
@@ -599,6 +617,9 @@ impl Model {
                 waiting,
                 removals_pending,
             } => {
+                if *held > 0 || *waiting > 0 {
+                    self.play(std::iter::once(pool));
+                }
                 let unit = hcore::events::unit_of(&self.units, pool);
                 let gauge = Gauge {
                     pool: pool.clone(),
@@ -1002,11 +1023,16 @@ impl Model {
             .filter(move |&id| !m || self.record(id).is_some_and(Record::matched))
     }
 
-    /// One gauge per pool that reported, cpu, memory and sandbox first, then
-    /// declared pools by name. None before any report: an older session, or
-    /// nothing admitted.
+    /// One gauge per pool in play that reported, cpu, memory and sandbox
+    /// first, then declared pools by name. None before any report (an older
+    /// session) or before anything ran or waited; a pool this build never
+    /// touched has none.
     pub fn gauges(&self) -> Vec<&Gauge> {
-        let mut gauges: Vec<&Gauge> = self.pools.values().collect();
+        let mut gauges: Vec<&Gauge> = self
+            .pools
+            .values()
+            .filter(|g| self.in_play(&g.pool))
+            .collect();
         let rank = |g: &Gauge| {
             hcore::capacity::BUILTIN_POOLS
                 .iter()
@@ -1021,6 +1047,22 @@ impl Model {
     /// The latest report of `pool`.
     pub fn pool(&self, pool: &str) -> Option<&Gauge> {
         self.pools.get(pool)
+    }
+
+    /// Whether `pool` is in play this build: some run declared or reserved
+    /// it, or it held or had waiters.
+    pub fn in_play(&self, pool: &str) -> bool {
+        self.in_play.contains(pool)
+    }
+
+    /// Puts `pools` in play, allocating only for one not seen yet.
+    fn play<S: AsRef<str>>(&mut self, pools: impl IntoIterator<Item = S>) {
+        for p in pools {
+            let p = p.as_ref();
+            if !self.in_play.contains(p) {
+                self.in_play.insert(p.to_owned());
+            }
+        }
     }
 }
 

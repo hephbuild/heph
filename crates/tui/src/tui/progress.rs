@@ -2311,9 +2311,13 @@ impl TuiProgressView {
     }
 
     /// What the cpu pool holds, of its capacity, as its latest `PoolUsage`
-    /// reported it: `cpu 11/12`. `None` before the first report.
+    /// reported it: `cpu 11/12`. `None` before the first report, and before
+    /// anything ran: a pool not in play has no gauge here either.
     fn cpu_segment(&self) -> Option<String> {
-        let g = self.state.dash.pool(hcore::capacity::CPU)?;
+        let dash = &self.state.dash;
+        let g = dash
+            .pool(hcore::capacity::CPU)
+            .filter(|_| dash.in_play(hcore::capacity::CPU))?;
         Some(format!(
             "cpu {}/{}",
             hcore::events::display_amount(g.unit, g.held),
@@ -3526,6 +3530,7 @@ mod tests {
                     ("memory".into(), Some(16 << 30)),
                     ("sandbox".into(), Some(48)),
                     ("docker".into(), Some(2)),
+                    ("gpu".into(), Some(4)),
                 ]
                 .into(),
                 units: [
@@ -3533,23 +3538,37 @@ mod tests {
                     ("memory".into(), "bytes".into()),
                     ("sandbox".into(), "count".into()),
                     ("docker".into(), "count".into()),
+                    ("gpu".into(), "count".into()),
                 ]
                 .into(),
             },
         ));
-        // Reservations alone draw nothing: no pool has reported.
+        // Idle reports before anything ran draw nothing: no pool is in play.
+        s.apply(&ev(1, pool_usage("cpu", 0, 12 * CPU, 0)));
+        s.apply(&ev(1, pool_usage("gpu", 0, 4, 0)));
+        assert!(s.dashboard().gauges().is_empty());
+        // A run puts what it reserved in play; a reservation moves no
+        // gauge, and a pool that has not reported has none.
         s.apply(&ev(
             1,
             execute_start_reserving("//a:x", &[("cpu", 3 * CPU), ("docker", 1)]),
         ));
         assert_eq!(s.busy_cpus(), 0, "nothing derived from reserved");
-        assert!(s.dashboard().gauges().is_empty());
+        let pools = |s: &BuildState| {
+            s.dashboard()
+                .gauges()
+                .iter()
+                .map(|g| g.pool.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(pools(&s), ["cpu"]);
         assert!(s.pool_segments().next().is_none());
 
         s.apply(&ev(2, pool_usage("cpu", 11 * CPU + CPU / 2, 12 * CPU, 0)));
         s.apply(&ev(2, pool_usage("memory", 9 << 30, 16 << 30, 0)));
         s.apply(&ev(2, pool_usage("sandbox", 9, 48, 0)));
         s.apply(&ev(2, pool_usage("docker", 2, 2, 1)));
+        s.apply(&ev(2, pool_usage("gpu", 0, 4, 0)));
         assert_eq!(s.busy_cpus(), 12, "11.5 rounds up");
         assert_eq!(
             s.pool_segments().collect::<Vec<_>>(),
@@ -3563,7 +3582,7 @@ mod tests {
         assert_eq!(
             gauges.iter().map(|g| g.pool.as_str()).collect::<Vec<_>>(),
             ["cpu", "memory", "sandbox", "docker"],
-            "one gauge per bounded pool, in the fixed order"
+            "one gauge per pool in play, in the fixed order; never gpu"
         );
         let title = crate::tui::dashboard::Title {
             command: "heph r build //...",
@@ -3608,6 +3627,22 @@ mod tests {
             s.pool_segments().collect::<Vec<_>>(),
             ["memory 9.0 GiB/16.0 GiB", "sandbox 9/48", "docker 1/2"]
         );
+
+        // A pool in play stays, idle or not; one never touched stays out.
+        s.apply(&ev(5, pool_usage("memory", 0, 16 << 30, 0)));
+        s.apply(&ev(5, pool_usage("docker", 0, 2, 0)));
+        assert_eq!(pools(&s), ["cpu", "memory", "sandbox", "docker"]);
+    }
+
+    /// The line's `cpu` segment, like the header's gauge, waits for
+    /// something to run: an idle report alone draws nothing.
+    #[test]
+    fn the_line_shows_cpu_once_anything_runs() {
+        let mut v = TuiProgressView::new("L");
+        v.apply(&ev(1, pool_usage("cpu", 0, 12 * CPU, 0)));
+        assert_eq!(v.cpu_segment(), None);
+        v.apply(&ev(2, execute_start_reserving("//a:x", &[("cpu", 0)])));
+        assert_eq!(v.cpu_segment().as_deref(), Some("cpu 0/12"));
     }
 
     /// A `sandbox` wait names its cause in the header: how many finished
