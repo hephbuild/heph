@@ -139,7 +139,7 @@ pub(crate) struct RootFailure {
 }
 
 /// A target whose admission has waited past the notice threshold for what it
-/// reserves to fit. `free` and `ahead` are as of the notice.
+/// reserves to fit. `free` is as of the notice.
 #[derive(Debug, Clone)]
 pub(crate) struct AdmissionWait {
     pub addr: String,
@@ -148,7 +148,6 @@ pub(crate) struct AdmissionWait {
     pub unit: hcore::capacity::Unit,
     pub need: u64,
     pub free: u64,
-    pub ahead: u64,
     /// On a `sandbox` wait: finished runs whose sandbox was not removed yet.
     pub removals_pending: Option<u64>,
     /// The oldest waiter's need this one is held back for, when it is, with
@@ -158,7 +157,7 @@ pub(crate) struct AdmissionWait {
 }
 
 impl AdmissionWait {
-    /// `//a:b waits for cpu 4 (2 free, 6 ahead, 41s)`, the TUI's row text.
+    /// `//a:b waits for cpu 4 (2 free, 41s)`, the TUI's row text.
     pub(crate) fn text(&self, now_ms: u64) -> String {
         hcore::events::admission_wait_text(
             &self.addr,
@@ -166,7 +165,6 @@ impl AdmissionWait {
             self.unit,
             self.need,
             self.free,
-            self.ahead,
             self.yielding_to.as_ref().map(|(to, unit)| (to, *unit)),
             self.removals_pending,
             &hcore::units::human_duration(std::time::Duration::from_millis(
@@ -492,9 +490,9 @@ impl Tally {
                 pool,
                 need,
                 free,
-                ahead,
                 removals_pending,
                 yielding_to,
+                ..
             } => {
                 self.admission_waits.insert(
                     addr.as_str().into(),
@@ -504,7 +502,6 @@ impl Tally {
                         unit: hcore::events::unit_of(&self.pool_units, pool),
                         need: *need,
                         free: *free,
-                        ahead: *ahead,
                         removals_pending: *removals_pending,
                         yielding_to: yielding_to.as_ref().map(|to| {
                             let unit = hcore::events::unit_of(&self.pool_units, &to.pool);
@@ -1495,8 +1492,8 @@ mod tests {
         assert_eq!(
             rows,
             [
-                "//a:b waits for cpu 4 (2 free, 6 ahead, 41s)",
-                "//a:c waits for cpu 0.5 (2 free, 6 ahead, 37s)",
+                "//a:b waits for cpu 4 (2 free, 41s)",
+                "//a:c waits for cpu 0.5 (2 free, 37s)",
             ],
             "longest first"
         );
@@ -1550,7 +1547,7 @@ mod tests {
         let (waits, _) = t.admission_waits(5);
         assert_eq!(
             waits.iter().map(|w| w.text(2_000)).collect::<Vec<_>>(),
-            ["//a:b waits for scratch_disk 4.0 GiB (1.0 GiB free, 0 ahead, 1s)"]
+            ["//a:b waits for scratch_disk 4.0 GiB (1.0 GiB free, 1s)"]
         );
     }
 

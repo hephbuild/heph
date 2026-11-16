@@ -134,11 +134,15 @@ pub fn clamp_text(
 }
 
 /// The text of an admission-wait row, after its `⧗`:
-/// `//a:b waits for cpu 4 (2 free, 6 ahead, 41s)`. `waited` is the elapsed
-/// time as the renderer spells it; `unit` is `pool`'s. A waiter that fits
-/// what is free and is held back for the oldest one (`yielding_to`, with the
-/// unit of *its* pool, which need not be `pool`) says so in place of the
-/// queue: `//a:b waits for cpu 1 (3 free, yielding to a cpu 8 run, 41s)`.
+/// `//a:b waits for cpu 4 (2 free, 41s)`. `waited` is the elapsed time as the
+/// renderer spells it; `unit` is `pool`'s. A waiter that fits what is free and
+/// is held back for the oldest one (`yielding_to`, with the unit of *its*
+/// pool, which need not be `pool`) says so:
+/// `//a:b waits for cpu 1 (3 free, yielding to a cpu 8 run, 41s)`.
+///
+/// The event's `ahead` is not shown: admission is not FIFO, so a count of
+/// older waiters frozen when the notice fired is no queue position, and it
+/// is never updated.
 /// With removals pending (`removals_pending` above 0, only ever set on a
 /// `sandbox` wait), the cause is named:
 /// `… — cleanup is behind: 3 removals pending`.
@@ -153,21 +157,20 @@ pub fn admission_wait_text(
     unit: Unit,
     need: u64,
     free: u64,
-    ahead: u64,
     yielding_to: Option<(&YieldingToData, Unit)>,
     removals_pending: Option<u64>,
     waited: &str,
 ) -> String {
-    let queue = match yielding_to {
+    let yielding = match yielding_to {
         Some((to, to_unit)) => format!(
-            "yielding to a {} {} run",
+            "yielding to a {} {} run, ",
             to.pool,
             display_amount(to_unit, to.need)
         ),
-        None => format!("{ahead} ahead"),
+        None => String::new(),
     };
     let text = format!(
-        "{addr} waits for {pool} {} ({} free, {queue}, {waited})",
+        "{addr} waits for {pool} {} ({} free, {yielding}{waited})",
         display_amount(unit, need),
         display_amount(unit, free)
     );
@@ -1177,19 +1180,9 @@ mod tests {
     #[test]
     fn admission_wait_text_names_pending_removals_only_when_there_are_some() {
         let text = |pending| {
-            admission_wait_text(
-                "//a:b",
-                "sandbox",
-                Unit::Count,
-                1,
-                0,
-                2,
-                None,
-                pending,
-                "41s",
-            )
+            admission_wait_text("//a:b", "sandbox", Unit::Count, 1, 0, None, pending, "41s")
         };
-        let plain = "//a:b waits for sandbox 1 (0 free, 2 ahead, 41s)";
+        let plain = "//a:b waits for sandbox 1 (0 free, 41s)";
         assert_eq!(text(None), plain);
         assert_eq!(text(Some(0)), plain);
         assert_eq!(
@@ -1219,8 +1212,8 @@ mod tests {
         assert!(!json.contains("removals_pending"), "{json}");
     }
 
-    /// A waiter held back for the oldest one names it in place of the queue,
-    /// each amount in its own pool's unit; the cleanup cause still follows.
+    /// A waiter held back for the oldest one names it, each amount in its own
+    /// pool's unit; the cleanup cause still follows.
     #[test]
     fn the_wait_text_names_what_it_yields_to() {
         let to = |pool: &str, need| YieldingToData {
@@ -1235,12 +1228,11 @@ mod tests {
                 Unit::Cpu,
                 4 * cpu,
                 2 * cpu,
-                6,
                 None,
                 None,
                 "41s"
             ),
-            "//a:b waits for cpu 4 (2 free, 6 ahead, 41s)",
+            "//a:b waits for cpu 4 (2 free, 41s)",
             "unchanged without it"
         );
         assert_eq!(
@@ -1250,7 +1242,6 @@ mod tests {
                 Unit::Cpu,
                 cpu,
                 3 * cpu,
-                6,
                 Some((&to("cpu", 8 * cpu), Unit::Cpu)),
                 None,
                 "41s"
@@ -1265,7 +1256,6 @@ mod tests {
                 Unit::Cpu,
                 cpu,
                 3 * cpu,
-                0,
                 Some((&to("memory", 2 << 30), Unit::Bytes)),
                 None,
                 "41s"
@@ -1279,7 +1269,6 @@ mod tests {
                 Unit::Count,
                 1,
                 2,
-                1,
                 Some((&to("cpu", 8 * cpu), Unit::Cpu)),
                 Some(3),
                 "41s"

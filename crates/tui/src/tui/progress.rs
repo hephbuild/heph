@@ -1618,8 +1618,8 @@ impl BuildState {
     }
 
     /// Rows for targets whose admission has waited past the notice
-    /// threshold: `⧗ //a:b waits for cpu 4 (2 free, 6 ahead, 41s)`. What was
-    /// free and ahead is as of the notice. Sorted by addr so the order is
+    /// threshold: `⧗ //a:b waits for cpu 4 (2 free, 41s)`. What was free is
+    /// as of the notice. Sorted by addr so the order is
     /// stable across frames. The body of the [`ViewMode::Waiting`] tab, thinned
     /// by the `/` filter like the other list tabs.
     pub fn admission_wait_lines(&self, now_ms: u64, filter: &str) -> Vec<Line<'static>> {
@@ -1642,7 +1642,6 @@ impl BuildState {
                             self.unit_of(&w.pool),
                             w.need,
                             w.free,
-                            w.ahead,
                             w.yielding_to
                                 .as_ref()
                                 .map(|to| (to, self.unit_of(&to.pool))),
@@ -3955,7 +3954,7 @@ mod tests {
             .iter()
             .map(|sp| sp.content.as_ref())
             .collect();
-        assert_eq!(text, "  ⧗ //a:b waits for cpu 4 (2 free, 6 ahead, 41s)");
+        assert_eq!(text, "  ⧗ //a:b waits for cpu 4 (2 free, 41s)");
         s.apply(&ev(
             43_000,
             BuildEventKind::AdmissionWaitEnd {
@@ -4030,13 +4029,13 @@ mod tests {
         assert!(!live.contains("//a:b"), "{live}");
         assert!(live.contains("1 waiting"), "{live}");
 
-        // …the Waiting tab does, with pool, need, free, ahead and elapsed.
+        // …the Waiting tab does, with pool, need, free and elapsed.
         v.view.set(ViewMode::Waiting);
         let waiting = frame(&v, 42_000);
         assert!(
             waiting
                 .iter()
-                .any(|l| l == "  ⧗ //a:b waits for cpu 4 (2 free, 6 ahead, 41s)"),
+                .any(|l| l == "  ⧗ //a:b waits for cpu 4 (2 free, 41s)"),
             "{waiting:#?}"
         );
         // The `/` filter thins it like the other list tabs.

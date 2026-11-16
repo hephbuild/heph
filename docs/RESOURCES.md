@@ -219,7 +219,7 @@ and queues like any other run.
 create them.** Every surface names the removals still owed, the cause of the
 wait (`AdmissionWaitStart.removals_pending`, set on a `sandbox` wait only):
 
-- the wait row: `⧗ //a:b waits for sandbox 1 (0 free, 2 ahead, 41s) —
+- the wait row: `⧗ //a:b waits for sandbox 1 (0 free, 41s) —
   cleanup is behind: 3 removals pending`;
 - the TUI header, once a wait passes the notice threshold:
   `sandbox: 4 waiting (3 removals pending)`;
@@ -368,12 +368,13 @@ CPUs, `bytes` human-sized, `count` as an integer), from the `units` that
   and rendered as a row in the TUI and the GitHub Actions report:
 
   ```
-  ⧗ //a:b waits for cpu 4 (2 free, 6 ahead, 41s)
+  ⧗ //a:b waits for cpu 4 (2 free, 41s)
   ```
 
-  `ahead` is how many targets were queued before this one when the notice
-  fired. It is a snapshot, and not a promise that they start first: a
-  younger target that fits can start before an older one.
+  The event's `ahead` is how many targets were queued before this one when
+  the notice fired. The row does not show it: admission is not FIFO, so it
+  is no queue position (a younger target that fits can start before an
+  older one), and it is never updated after the notice.
 
   A target that fits what is free and still waits is held back for the
   oldest waiter, and its row names what it yields to (`yielding_to` on the
@@ -383,8 +384,7 @@ CPUs, `bytes` human-sized, `count` as an integer), from the `units` that
   ⧗ //a:b waits for cpu 1 (3 free, yielding to a cpu 8 run, 41s)
   ```
 
-  A `yielding to` row carries no `ahead` and is never the oldest waiter's:
-  the oldest waiter is the row with `0 ahead`. `yielding to` on a waiter's
+  A `yielding to` row is never the oldest waiter's. `yielding to` on a waiter's
   row is the situation the in-flight report calls `draining` on the head's
   line. The oldest waiter's own row says neither how far it has been
   overtaken nor that its pools are draining: the in-flight report's `head`
