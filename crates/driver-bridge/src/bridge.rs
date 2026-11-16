@@ -394,3 +394,64 @@ mod pick_tests {
         assert!(matches!(bridge.pick(&req), Ok(Pick::Os)));
     }
 }
+
+#[cfg(test)]
+mod streams_log_tests {
+    use super::*;
+    use hdriver_support::driver_managed::{ManagedRunRequest, ManagedRunResponse};
+    use shell_fallback_tests::NoShellDriver;
+
+    /// A managed driver that does not stream its log; everything else is
+    /// `NoShellDriver`'s.
+    struct Silent;
+
+    #[async_trait]
+    impl ManagedDriver for Silent {
+        fn config(&self, req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
+            NoShellDriver.config(req)
+        }
+        fn schema(&self) -> hplugin::driver::DriverSchema {
+            NoShellDriver.schema()
+        }
+        async fn parse(
+            &self,
+            req: ParseRequest,
+            ctoken: &(dyn Cancellable + Send + Sync),
+        ) -> anyhow::Result<ParseResponse> {
+            NoShellDriver.parse(req, ctoken).await
+        }
+        async fn apply_transitive(
+            &self,
+            req: ApplyTransitiveRequest,
+            ctoken: &(dyn Cancellable + Send + Sync),
+        ) -> anyhow::Result<ApplyTransitiveResponse> {
+            NoShellDriver.apply_transitive(req, ctoken).await
+        }
+        async fn run<'a, 'io>(
+            &self,
+            req: ManagedRunRequest<'a, 'io>,
+            ctoken: &(dyn Cancellable + Send + Sync),
+        ) -> anyhow::Result<ManagedRunResponse> {
+            NoShellDriver.run(req, ctoken).await
+        }
+        fn streams_log(&self) -> bool {
+            false
+        }
+    }
+
+    fn bridge(driver: Box<dyn ManagedDriver>) -> ManagedDriverBridge {
+        let fallback = Arc::new(ShellFallback {
+            driver: Arc::new(NoShellDriver),
+            spec_template: Arc::new(hplugin::provider::TargetSpec::default()),
+        });
+        ManagedDriverBridge::new_os_for_test_with_shell_fallback(driver, fallback)
+    }
+
+    /// The bridge answers `streams_log` with its managed driver's answer: the
+    /// engine reads it off the bridge, never off the managed driver.
+    #[test]
+    fn the_bridge_forwards_streams_log() {
+        assert!(!bridge(Box::new(Silent)).streams_log());
+        assert!(bridge(Box::new(NoShellDriver)).streams_log());
+    }
+}
