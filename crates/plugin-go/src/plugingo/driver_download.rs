@@ -23,7 +23,6 @@ use enclose::enclose;
 use hcore::debug_hash::DebugHasher;
 use hcore::hasync::Cancellable;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
-use hdriver_support::run_log::Streams;
 use hplugin::driver::targetdef::path::{CodegenMode, Content, Path as OutputPath};
 use hplugin::driver::targetdef::{CacheConfig, Input, InputMode, Output, TargetDef};
 use hplugin::driver::{
@@ -295,9 +294,10 @@ async fn fetch_module(
         )));
     }
 
-    // A successful download's stdout is its `-json` record, parsed below: data,
-    // never the log.
-    log.write(&output, Streams::STDERR).await;
+    // A successful download logs nothing: its stdout is the `-json` record
+    // parsed below (data), and its stderr ran under the fetch environment,
+    // whose values (a `GOPROXY` with userinfo, `GOAUTH`) are not scrubbed and
+    // would reach a cached, uploaded log. Only credential secrets are.
     parse_module_dir(&output.stdout, module, version, gomodcache)
 }
 
@@ -1025,9 +1025,10 @@ exit 1"#,
         );
     }
 
-    /// Under `log_capture`: a successful download's `-json` record is data and
-    /// never reaches the writers, its stderr does; a failed one writes both
-    /// streams there and names no log.
+    /// Under `log_capture`: a successful download writes nothing to the
+    /// writers (its `-json` record is data, its stderr ran under the
+    /// unscrubbed fetch environment and the log is cached); a failed one,
+    /// which is not cached, writes both streams there and names no log.
     #[tokio::test]
     async fn fetch_module_under_log_capture() {
         use crate::plugingo::tool_log::test_support::Shared;
@@ -1039,13 +1040,13 @@ exit 1"#,
         let ok = fake_go(
             dir.path(),
             r#"printf '{"Path":"a.b/c","Version":"v1","Dir":"/cache/c@v1"}\n'
-printf 'go: downloading a.b/c v1\n' >&2"#,
+printf 'go: downloading a.b/c v1 from https://user:pw@proxy\n' >&2"#,
         );
         let (out, err) = (Shared::default(), Shared::default());
         let mut log = ToolLog::Captured(RunLog::captured(Some(out.writer()), Some(err.writer())));
         fetch_into(&ok, &cwd, &mut log).await.expect("fetch");
         assert_eq!(out.text(), "", "the -json record is data");
-        assert_eq!(err.text(), "go: downloading a.b/c v1\n");
+        assert_eq!(err.text(), "", "a success's stderr is not logged");
 
         let bad = fake_go(
             dir.path(),

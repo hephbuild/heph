@@ -16,6 +16,12 @@
 //! never written to the log on either host while it is the process's answer.
 //! Once the process has failed it has no answer, and what it printed is the only
 //! account of why, so [`ToolLog::failed`] writes both streams.
+//!
+//! A process that runs under the module fetch environment (`go list`, `go mod
+//! download`) logs nothing on success, under either host: that environment's
+//! values (a `GOPROXY` with userinfo, `GOAUTH`) are not scrubbed, and a
+//! success's log is cached and uploaded. A failure is not cached, so it keeps
+//! both streams.
 
 use hdriver_support::run_log::{RunLog, Streams};
 use hplugin::driver::RunRequest;

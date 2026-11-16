@@ -561,19 +561,17 @@ impl ManagedDriver for GoGolistDriver {
         .await
         .with_context(|| format!("wait for go list for {}", def.import_path))?;
 
-        // stderr is log; stdout is the package graph parsed below — data, never
-        // the log. A failed `go list` has no answer, so both streams are its
-        // account and reach the log (`tool_log.rs`'s rule); its stderr also
-        // reaches the message as a tail, as before. An older host keeps no
-        // log of `go list`.
-        let streams = if output.status.success() {
-            Streams::STDERR
-        } else {
-            Streams::BOTH
-        };
-        ToolLog::new(&mut req.request).write(&output, streams).await;
-
+        // A successful `go list` logs nothing: its stdout is the package graph
+        // parsed below (data), and its stderr ran under the fetch environment,
+        // whose values (a `GOPROXY` with userinfo, `GOAUTH`) are not scrubbed
+        // and would reach a cached, uploaded log. A failed one is not cached and
+        // has no answer, so both streams are its account and reach the log
+        // (`tool_log.rs`'s rule); its stderr also reaches the message as a
+        // tail, as before. An older host keeps no log of `go list`.
         if !output.status.success() {
+            ToolLog::new(&mut req.request)
+                .write(&output, Streams::BOTH)
+                .await;
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(crate::plugingo::errors::GoListError {
                 import_path: def.import_path.clone(),
@@ -1211,17 +1209,18 @@ mod tests {
             assert!(staged_go, "the staged SDK survives the sandbox's removal");
         }
 
-        /// `go list -json`'s stdout is the package graph — data — and never
-        /// reaches the log; its stderr is log and reaches the writers under
-        /// `log_capture`. The real driver runs a stand-in `go` from the SDK.
+        /// A successful `go list` writes nothing to the log under
+        /// `log_capture`: its stdout is the package graph — data — and its
+        /// stderr ran under the unscrubbed fetch environment, which must not
+        /// reach a cached log. The real driver runs a stand-in `go` from the SDK.
         #[tokio::test]
-        async fn go_list_json_never_reaches_the_log() {
+        async fn a_successful_go_list_logs_nothing() {
             let (res, out, err) = run_go_list(
                 "printf '{\"ImportPath\":\"example.com/mylib\",\"Name\":\"mylib\"}\\n'\n\
-                 echo 'go: finding example.com/mylib' >&2",
+                 echo 'go: finding example.com/mylib via https://user:pw@proxy' >&2",
             )
             .await;
-            assert_eq!(err, "go: finding example.com/mylib\n", "run: {res:?}");
+            assert_eq!(err, "", "a success's stderr is not logged; run: {res:?}");
             assert_eq!(out, "", "the package graph is data, never the log");
         }
 
