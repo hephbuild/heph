@@ -3017,8 +3017,9 @@ pub(crate) fn prepare_note(
             format!("scratch {scratch}: could not prepare ({err})"),
             true,
         ),
-        // The common case, and the whole point of staying quiet.
-        (None, "" | "warm") => return None,
+        // The common case, and the whole point of staying quiet. A cold cache
+        // is the normal first run, nothing to act on: also silent.
+        (None, "" | "warm" | "cold") => return None,
         (None, "pulled") => (
             format!(
                 "scratch {scratch}: pulled {} from the remote",
@@ -3033,10 +3034,6 @@ pub(crate) fn prepare_note(
         (None, "dropped_over_max") => (
             format!("scratch {scratch}: over its max_size — dropped whole, this build runs cold"),
             true,
-        ),
-        (None, "cold") => (
-            format!("scratch {scratch}: cold, nothing to restore from"),
-            false,
         ),
         (None, "audit") => (
             format!("scratch {scratch}: --no-scratch, running against an empty cache"),
@@ -4439,13 +4436,15 @@ mod tests {
         );
     }
 
-    /// The contract that keeps a CI log readable: a warm cache says nothing.
+    /// The contract that keeps a CI log readable: a warm cache says nothing,
+    /// and neither does a cold one — the normal first run.
     ///
     /// Every target that uses a cache emits a prepare span, so a regression here
     /// puts one line per target into a GitHub log — thousands on a real build.
     #[test]
-    fn a_warm_prepare_logs_nothing() {
+    fn a_warm_or_cold_prepare_logs_nothing() {
         assert_eq!(prepare_note("//build:c", "warm", 0, None), None);
+        assert_eq!(prepare_note("//build:c", "cold", 0, None), None);
         assert_eq!(
             prepare_note("//build:c", "", 0, None),
             None,
@@ -4464,7 +4463,6 @@ mod tests {
         );
         assert!(!note("pulled").warn);
         assert!(note("seeded").text.contains("seeded"));
-        assert!(note("cold").text.contains("cold"));
         assert!(note("audit").text.contains("--no-scratch"));
         assert!(
             note("dropped_over_max").warn,
