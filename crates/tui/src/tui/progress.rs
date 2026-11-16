@@ -3104,9 +3104,9 @@ fn live_failure_block(
     out
 }
 
-/// The paved-road [`CIAppView`]: a one-line label header, a concise per-execute
-/// line, and a final one-line summary plus per-error lines — all through the
-/// log sink. Used by every command's `ci_view`.
+/// The paved-road [`CIAppView`]: no header line, a concise per-execute line,
+/// and a final one-line summary plus per-error lines — all through the log
+/// sink. Used by every command's `ci_view`.
 pub struct CiProgressView {
     core: ProgressCore,
     /// Caches whose contention has already been announced.
@@ -3179,9 +3179,9 @@ impl CIAppView for CiProgressView {
         self.core.state.name_lock_holders(names);
     }
 
-    fn begin(&self) {
-        tracing::info!("{}", self.core.label);
-    }
+    // No `begin`: the run opens with no "Running …" header line. The command
+    // that names it is the line above in any log; the label lives on as the
+    // session's.
 
     /// "Not chatty" policy: an execute starting logs nothing — a line per
     /// target is noise on a busy build, and the summary counts them. Only
@@ -4791,6 +4791,8 @@ mod tests {
             .without_time()
             .finish();
         tracing::subscriber::with_default(subscriber, || {
+            // As the backend does, before any event.
+            v.begin();
             v.name_lock_holders(names.clone());
             for e in events {
                 // As the backend's receiver does, before the fold.
@@ -4802,6 +4804,22 @@ mod tests {
         });
         let bytes = buf.0.lock().expect("log buffer").clone();
         String::from_utf8(bytes).expect("utf-8 log")
+    }
+
+    /// The CI view opens with no header line: its label ("Running //p:chatty")
+    /// is not logged, and a run whose targets start and pass logs nothing
+    /// before its summary.
+    #[test]
+    fn ci_view_prints_no_label_header() {
+        let log = ci_view_log_of(
+            CiProgressView::new("Running //p:chatty"),
+            HolderNames::default(),
+            &[
+                ev(1, result_start("//p:chatty")),
+                ev(2, result_end("//p:chatty", None)),
+            ],
+        );
+        assert_eq!(log, "", "{log}");
     }
 
     /// The line backend's lock and scratch notices name the live session
