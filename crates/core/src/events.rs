@@ -331,6 +331,12 @@ pub enum BuildEventKind {
         /// which reported a stop as a root failure.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         cancelled: bool,
+        /// What the failed run left behind and where to read it: the rows the
+        /// failure box ends with, so a consumer printing the failure as it
+        /// happens prints them too. Only on a failure; `None` from a host that
+        /// predates it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        left_behind: Option<Box<LeftBehindData>>,
     },
     ExecuteStart {
         addr: String,
@@ -761,6 +767,52 @@ pub struct OutputGroupSummary {
     pub artifacts: u32,
 }
 
+/// What a failed run left behind, carried on `ResultEnd`: the failure box's
+/// last rows (`full log:`, `sandbox:`, `outputs:`, the write-back, `log:`).
+///
+/// A mirror of what `hplugin::error::TargetFailure` holds, in strings, for the
+/// reason [`LogTailData`] is one.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LeftBehindData {
+    /// The failure slot's copy of the log, when it is on disk.
+    #[serde(default)]
+    pub log_path: Option<String>,
+    /// What became of the sandbox, when out of the ordinary (kept, removed in
+    /// spite of the flag, left behind an abandoned run). A removal, the
+    /// default, is `None`.
+    #[serde(default)]
+    pub sandbox: Option<String>,
+    /// The slot's `out/`, when the run kept `failure_out` matches there.
+    #[serde(default)]
+    pub outputs: Option<String>,
+    /// What a failed `in_place` run's write-back did.
+    #[serde(default)]
+    pub fixes: Option<FixesData>,
+    /// Whether the engine can open a log for the target (what `heph log`
+    /// would find), asked when it failed. `None` when nobody asked: a reader
+    /// then goes by whether `log_path` is set.
+    #[serde(default)]
+    pub log_readable: Option<bool>,
+}
+
+/// What a failed `in_place` run's write-back did, on [`LeftBehindData`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FixesData {
+    /// Fixes written over the tree while the target still failed.
+    Written {
+        /// The workspace root the paths are relative to.
+        root: String,
+        /// Every path written, sorted; empty when the fixes matched the tree.
+        paths: Vec<String>,
+        /// The slot's `fixes.txt` listing `paths`, when kept.
+        #[serde(default)]
+        list: Option<String>,
+    },
+    /// Nothing was written, and why, in words.
+    NotWritten { reason: String },
+}
+
 /// A run stopped at its target's `timeout`, carried on `ResultEnd`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TimedOutData {
@@ -1012,6 +1064,7 @@ pub mod test_support {
             output_groups: Vec::new(),
         };
         let end = |addr: &str| BuildEventKind::ResultEnd {
+            left_behind: None,
             addr: addr.to_string(),
             error: None,
             upstream_of: None,
@@ -1171,6 +1224,7 @@ mod tests {
                 log_tail,
                 timed_out,
                 cancelled,
+                left_behind,
             } => {
                 assert_eq!(addr, "//a:x");
                 assert!(!cancelled, "an older host's stop reads as a failure");
@@ -1179,6 +1233,7 @@ mod tests {
                 assert_eq!(exit_status, None);
                 assert_eq!(log_tail, None);
                 assert_eq!(timed_out, None);
+                assert_eq!(left_behind, None);
             }
             other => panic!("wrong variant: {other:?}"),
         }
@@ -1742,6 +1797,7 @@ mod tests {
         let ev = BuildEvent {
             at_unix_ms: 7,
             kind: BuildEventKind::ResultEnd {
+                left_behind: None,
                 addr: "//a:x".into(),
                 error: Some("target failed".into()),
                 upstream_of: Some("//base:proto".into()),

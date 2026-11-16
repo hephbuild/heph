@@ -1,6 +1,6 @@
 use tokio::sync::mpsc;
 
-use crate::tui::app::{App, AppContext, CIAppView};
+use crate::tui::app::{App, AppContext, CIAppView, PrintedQuery};
 use crate::tui::log_sink::LogSink;
 use crate::tui::session::{SessionSlot, TappedReceiver};
 use hcore::shutdown::ShutdownTrigger;
@@ -47,7 +47,15 @@ pub async fn run<A: App + 'static>(
     // sandbox cleanups to drain before returning (and tearing down the runtime /
     // exiting the process out from under the cleaner thread).
     let bg_pending = hcore::pending::Pending::new_counter();
-    let ctx = AppContext::direct(sink, Some(event_tx), std::sync::Arc::clone(&bg_pending));
+    // Which failures the view printed live, asked by the app at its end; an
+    // arm of the loop below answers.
+    let (printed_tx, mut printed_rx) = mpsc::unbounded_channel::<PrintedQuery>();
+    let ctx = AppContext::direct(
+        sink,
+        Some(event_tx),
+        std::sync::Arc::clone(&bg_pending),
+        printed_tx,
+    );
     // App runs on its own task, as on the interactive backend. Sharing one task
     // with the loop below means every synchronous stretch inside the app — a
     // filesystem walk, Starlark eval, a cache-warm `result_addr` descent — stalls
@@ -107,6 +115,16 @@ pub async fn run<A: App + 'static>(
                     // Sender dropped — stop polling, keep awaiting the app.
                     events = None;
                 }
+            }
+            // Fold everything queued first: an event sent before the query
+            // is in the channel by now, and the answer has to cover it.
+            // `None` (the app's context gone) disables the arm.
+            Some(reply) = printed_rx.recv() => {
+                if let Some(r) = events.as_mut() {
+                    while r.try_recv(|ev| view.apply(ev)).is_ok() {}
+                }
+                // The app stopped waiting: nothing to tell.
+                drop(reply.send(view.failures_printed()));
             }
         }
     };

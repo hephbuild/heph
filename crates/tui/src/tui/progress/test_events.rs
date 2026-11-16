@@ -21,6 +21,7 @@ pub(super) fn start(addr: &str) -> BuildEventKind {
 
 pub(super) fn end(addr: &str, error: Option<&str>, upstream_of: Option<&str>) -> BuildEventKind {
     BuildEventKind::ResultEnd {
+        left_behind: None,
         cancelled: false,
         addr: addr.into(),
         error: error.map(Into::into),

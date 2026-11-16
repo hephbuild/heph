@@ -3088,6 +3088,7 @@ mod tests {
         }));
         assert_eq!(s.open_count(Op::Result), 1);
         h.on_event(&ev(BuildEventKind::ResultEnd {
+            left_behind: None,
             cancelled: false,
             addr: "//a:b".into(),
             error: Some("boom".into()),

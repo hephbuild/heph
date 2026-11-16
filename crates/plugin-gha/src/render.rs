@@ -918,6 +918,7 @@ mod tests {
             t.apply(&ev(
                 1_000,
                 BuildEventKind::ResultEnd {
+                    left_behind: None,
                     cancelled: false,
                     timed_out: None,
                     addr: format!("//root{i}:broken"),
@@ -932,6 +933,7 @@ mod tests {
             t.apply(&ev(
                 2_000,
                 BuildEventKind::ResultEnd {
+                    left_behind: None,
                     cancelled: false,
                     timed_out: None,
                     addr: format!("//services/api:t{i}"),
@@ -1031,6 +1033,7 @@ mod tests {
             t.apply(&ev(
                 1_000,
                 BuildEventKind::ResultEnd {
+                    left_behind: None,
                     cancelled: false,
                     timed_out: None,
                     addr: format!("//pkg{i}:broken"),
@@ -1065,6 +1068,7 @@ mod tests {
         t.apply(&ev(
             1_000,
             BuildEventKind::ResultEnd {
+                left_behind: None,
                 cancelled: false,
                 timed_out: None,
                 addr: "//a:x".into(),
@@ -1087,6 +1091,7 @@ mod tests {
         t.apply(&ev(
             1_000,
             BuildEventKind::ResultEnd {
+                left_behind: None,
                 cancelled: false,
                 timed_out: None,
                 addr: format!("//パッケージ:{}", "名前".repeat(200)),
@@ -1129,6 +1134,7 @@ mod tests {
             t.apply(&ev(
                 2,
                 BuildEventKind::ResultEnd {
+                    left_behind: None,
                     cancelled: false,
                     timed_out: None,
                     addr: format!("//pkg:t{i}"),
@@ -1185,6 +1191,7 @@ mod tests {
         t.apply(&ev(
             252_000,
             BuildEventKind::ResultEnd {
+                left_behind: None,
                 cancelled: false,
                 timed_out: None,
                 addr: "//a:slow".into(),
@@ -1244,6 +1251,7 @@ mod tests {
         t.apply(&ev(
             5,
             BuildEventKind::ResultEnd {
+                left_behind: None,
                 cancelled: false,
                 timed_out: None,
                 addr: "//a:x".into(),
@@ -1421,6 +1429,7 @@ mod tests {
             t.apply(&ev(
                 1_000,
                 BuildEventKind::ResultEnd {
+                    left_behind: None,
                     cancelled: false,
                     timed_out: None,
                     addr: format!("//root{i}:broken"),
@@ -1563,6 +1572,7 @@ mod tests {
             t.apply(&ev(
                 2,
                 BuildEventKind::ResultEnd {
+                    left_behind: None,
                     cancelled: false,
                     timed_out: None,
                     addr: format!("//pkg{}:t{i}", i % 50),

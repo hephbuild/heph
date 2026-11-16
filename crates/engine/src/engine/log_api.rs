@@ -283,6 +283,18 @@ impl Engine {
     ///
     /// Never builds. A remote hit's log is fetched only when `fetch_remote`
     /// is set, and then once: the next open reads the local copy.
+    /// Whether `heph log <addr>` would find a log for `addr`: the log API
+    /// over local sources, never fetching, with a remote hit's log (which
+    /// `heph log` fetches) counted. What a failure's `log:` row is decided on.
+    pub async fn log_readable(self: &Arc<Self>, addr: &Addr) -> bool {
+        match self.open_log(addr, &LogOptions::default()).await {
+            Ok(found) => found.is_some(),
+            Err(e) => e
+                .downcast_ref::<LogUnavailable>()
+                .is_some_and(|u| u.info.source == LogSource::Cache { remote: true }),
+        }
+    }
+
     pub async fn open_log(
         self: &Arc<Self>,
         addr: &Addr,

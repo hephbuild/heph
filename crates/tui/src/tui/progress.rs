@@ -3053,13 +3053,20 @@ pub(crate) fn prepare_note(
 /// ```text
 /// ✗ //web:lint · exit status: 1
 ///   │ web/a.ts:14:3  error  'useState' is defined but never used
+///   full log: /home/u/.heph/failures/…/log.txt
+///   log: heph log //web:lint
 /// ```
 ///
 /// The header names the exit status or the timeout as the report's block
 /// header does; a failure with neither shows its error as a body row, as the
 /// report's body does. Then the last `log_lines` lines of the tail the event
 /// carries (never a file read on the event path), sanitized, redacted and
-/// plain. No trailing newline: the log line adds one.
+/// plain. Then the CI box's last rows ([`left_behind_rows`]) from what the
+/// event says the run left behind: the block stands in for the box, which the
+/// end of the run leaves out for it. No trailing newline: the log line adds
+/// one.
+///
+/// [`left_behind_rows`]: crate::tui::failure_rows::left_behind_rows
 fn live_failure_block(
     addr: &str,
     error: &str,
@@ -3102,6 +3109,24 @@ fn live_failure_block(
         out.push_str(line);
     }
     out
+}
+
+/// `block` followed by the box's last rows, so the end of the run need not
+/// print the box. Not redacted: they are paths to open and commands to run,
+/// which the box prints whole too.
+fn with_left_behind(
+    mut block: String,
+    addr: &str,
+    left_behind: Option<&hcore::events::LeftBehindData>,
+) -> String {
+    if let Some(left) = left_behind {
+        let rows = crate::tui::failure_rows::left_behind_rows(addr, left);
+        if !rows.is_empty() {
+            block.push('\n');
+            block.push_str(rows.trim_end_matches('\n'));
+        }
+    }
+    block
 }
 
 /// The paved-road [`CIAppView`]: no header line, a concise per-execute line,
@@ -3179,6 +3204,10 @@ impl CIAppView for CiProgressView {
         self.core.state.name_lock_holders(names);
     }
 
+    fn failures_printed(&self) -> HashSet<String> {
+        self.failures_printed.clone()
+    }
+
     // No `begin`: the run opens with no "Running …" header line. The command
     // that names it is the line above in any log; the label lives on as the
     // session's.
@@ -3253,16 +3282,21 @@ impl CIAppView for CiProgressView {
                 log_tail,
                 timed_out,
                 cancelled: false,
+                left_behind,
             } if !self.failures_printed.contains(addr) => {
                 self.failures_printed.insert(addr.clone());
-                let block = live_failure_block(
+                let block = with_left_behind(
+                    live_failure_block(
+                        addr,
+                        error,
+                        exit_status.as_deref(),
+                        timed_out.as_ref(),
+                        log_tail.as_ref().map(|t| t.text.as_str()),
+                        self.log_lines,
+                        &self.core.state.redact,
+                    ),
                     addr,
-                    error,
-                    exit_status.as_deref(),
-                    timed_out.as_ref(),
-                    log_tail.as_ref().map(|t| t.text.as_str()),
-                    self.log_lines,
-                    &self.core.state.redact,
+                    left_behind.as_deref(),
                 );
                 tracing::error!("{block}");
             }
@@ -3537,6 +3571,7 @@ mod tests {
     }
     fn result_end(addr: &str, error: Option<String>) -> BuildEventKind {
         BuildEventKind::ResultEnd {
+            left_behind: None,
             cancelled: false,
             addr: addr.into(),
             error,
@@ -4894,6 +4929,7 @@ mod tests {
         tail: Option<&str>,
     ) -> BuildEventKind {
         BuildEventKind::ResultEnd {
+            left_behind: None,
             addr: addr.into(),
             error: Some(format!("{addr}: exit status: 1")),
             upstream_of: upstream_of.map(Into::into),
@@ -4961,6 +4997,7 @@ mod tests {
     #[test]
     fn ci_view_live_block_words_and_sanitizing() {
         let timed_out = BuildEventKind::ResultEnd {
+            left_behind: None,
             addr: "//e2e:it".into(),
             error: Some("timed out".into()),
             upstream_of: None,
@@ -4991,6 +5028,7 @@ mod tests {
         );
 
         let no_status = BuildEventKind::ResultEnd {
+            left_behind: None,
             addr: "//a:\x1b[2Jb".into(),
             error: Some("staging\x1b[2J failed".into()),
             upstream_of: None,
@@ -6365,6 +6403,7 @@ mod tests {
                 });
             }
             ev(BuildEventKind::ResultEnd {
+                left_behind: None,
                 cancelled: false,
                 addr: a,
                 error: None,

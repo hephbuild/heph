@@ -7947,6 +7947,7 @@ dependencies = [
  "ratatui",
  "serde",
  "serde_json",
+ "shlex",
  "telemetry",
  "tempfile",
  "tokio",

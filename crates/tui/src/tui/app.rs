@@ -49,19 +49,29 @@ pub struct AppContext {
     /// the app builds. The backend owns the other clone and polls it on exit so
     /// the renderer stays up until fire-and-forget cleanups have drained.
     bg_pending: PendingCounter,
+    /// Asks the line backend which failures its view printed as they failed
+    /// ([`failures_printed`](Self::failures_printed)). `None` on the
+    /// interactive backend, whose view prints none.
+    printed: Option<mpsc::UnboundedSender<PrintedQuery>>,
 }
+
+/// A [`AppContext::failures_printed`] query: the backend folds what is queued,
+/// then answers with [`CIAppView::failures_printed`].
+pub(crate) type PrintedQuery = oneshot::Sender<std::collections::HashSet<String>>;
 
 impl AppContext {
     pub(crate) fn direct(
         sink: LogSink,
         events: Option<EventSender>,
         bg_pending: PendingCounter,
+        printed: mpsc::UnboundedSender<PrintedQuery>,
     ) -> Self {
         Self {
             sink,
             control: None,
             events,
             bg_pending,
+            printed: Some(printed),
         }
     }
 
@@ -76,7 +86,26 @@ impl AppContext {
             control: Some(control),
             events,
             bg_pending,
+            printed: None,
         }
+    }
+
+    /// The addrs whose failure the line backend's view printed the moment it
+    /// failed ([`CIAppView::failures_printed`]), answered once the view has
+    /// folded every event sent before this call: a failure recorded by then
+    /// had its `ResultEnd` sent first, so the answer covers it. What the end
+    /// of a CI run leaves out of its failure boxes — only what was printed,
+    /// never what was merely expected to be. Empty on the interactive backend
+    /// and when the backend cannot answer, so nothing is left out.
+    pub async fn failures_printed(&self) -> std::collections::HashSet<String> {
+        let Some(tx) = &self.printed else {
+            return std::collections::HashSet::new();
+        };
+        let (reply, answer) = oneshot::channel();
+        if tx.send(reply).is_err() {
+            return std::collections::HashSet::new();
+        }
+        answer.await.unwrap_or_default()
     }
 
     pub fn sink(&self) -> &LogSink {
@@ -489,6 +518,13 @@ pub trait CIAppView: Send {
 
     /// See [`TUIAppView::name_lock_holders`].
     fn name_lock_holders(&mut self, _names: HolderNames) {}
+
+    /// The addrs whose failure this view has printed as it failed, with the
+    /// rows the end-of-run box would have carried: the box leaves them out
+    /// ([`AppContext::failures_printed`]). A view that prints none says so.
+    fn failures_printed(&self) -> std::collections::HashSet<String> {
+        std::collections::HashSet::new()
+    }
 }
 
 #[async_trait]

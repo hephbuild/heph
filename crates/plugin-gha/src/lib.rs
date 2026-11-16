@@ -1128,6 +1128,7 @@ mod tests {
         hook.on_event(&ev(
             5,
             BuildEventKind::ResultEnd {
+                left_behind: None,
                 cancelled: false,
                 timed_out: None,
                 addr: "//a:x".into(),
@@ -1260,6 +1261,7 @@ mod tests {
         hook.on_event(&ev(
             1_000,
             BuildEventKind::ResultEnd {
+                left_behind: None,
                 cancelled: false,
                 timed_out: None,
                 addr: "//a:x".into(),
@@ -1310,6 +1312,7 @@ mod tests {
         hook.on_event(&ev(
             10,
             BuildEventKind::ResultEnd {
+                left_behind: None,
                 cancelled: false,
                 timed_out: None,
                 addr: "//base:proto".into(),
@@ -1323,6 +1326,7 @@ mod tests {
             hook.on_event(&ev(
                 20,
                 BuildEventKind::ResultEnd {
+                    left_behind: None,
                     cancelled: false,
                     timed_out: None,
                     addr: format!("//svc:t{i}"),

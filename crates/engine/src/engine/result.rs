@@ -2062,76 +2062,11 @@ fn classify_failure(
     interactive: bool,
     e: anyhow::Error,
 ) -> anyhow::Error {
-    // Cancellation: propagate unchanged, never record.
-    if downcast_chain_ref::<CancelledError>(&e).is_some() {
-        return e;
-    }
-
-    // Cyclic dependency: a structural error detected at potentially many nodes
-    // of the cycle, not a single target's own work failing. Propagate unchanged
-    // so the cycle surfaces directly to the caller (and never gets masked behind
-    // an `UpstreamFailed` marker or duplicated into the failure registry).
-    if downcast_chain_ref::<CycleError>(&e).is_some() {
-        return e;
-    }
-
-    // "This hash-only request may not build" is a property of the request, not a
-    // failure of the target. Nothing is wrong with the dep; we simply declined to
-    // build it. Propagate unchanged so the caller can recognise it — the fixpoint
-    // recompute treats it as "skip", and the in_place write-back guard needs to
-    // say "could not confirm", not "dependency failed".
-    if downcast_chain_ref::<HashUnknownError>(&e).is_some() {
-        return e;
-    }
-
-    // "--shell needs one target" is a property of the request, not a failure of
-    // the target that raised it — nothing ran. Propagate unchanged so a group
-    // nested inside a single-member group doesn't record the user's own input
-    // error as a failed target and render a failure box for something that never
-    // executed.
-    if downcast_chain_ref::<ShellNeedsSingleTarget>(&e).is_some() {
-        return e;
-    }
-
-    // Already a collateral marker: reuse the existing root, do not record.
-    if let Some(uf) = downcast_chain_ref::<UpstreamFailed>(&e) {
-        return UpstreamFailed {
-            root: uf.root.clone(),
-        }
-        .into();
-    }
-
-    // Aggregation of child failures. If *every* child is already a recorded
-    // collateral marker (or a cancellation), the real root causes live in the
-    // registry downstream — this target has no own work to blame, so collapse to
-    // a cheap marker without recording. But if any child is a genuine,
-    // unrecorded cause (e.g. a `TargetNotFound` raised while resolving an input's
-    // def in `link`/`meta`, which never passes through `result_addr`), fall
-    // through and record the whole aggregation against this target so the detail
-    // (every broken input) isn't lost.
-    if let Some(multi) = downcast_chain_ref::<MultiError>(&e) {
-        // A request-shape error aggregated with `fail_fast = false` is still a
-        // request error, not this target's failure. Surface it alone: every
-        // sibling raised the identical one.
-        for inner in &multi.0 {
-            if let Some(shell) = downcast_chain_ref::<ShellNeedsSingleTarget>(inner) {
-                return anyhow::Error::new(shell.clone());
-            }
-        }
-        let all_collateral = multi.0.iter().all(|inner| {
-            downcast_chain_ref::<UpstreamFailed>(inner).is_some()
-                || downcast_chain_ref::<CancelledError>(inner).is_some()
-        });
-        if all_collateral {
-            let root = multi
-                .0
-                .iter()
-                .find_map(|inner| {
-                    downcast_chain_ref::<UpstreamFailed>(inner).map(|u| u.root.clone())
-                })
-                .unwrap_or_else(|| addr.clone());
-            return UpstreamFailed { root }.into();
-        }
+    match failure_fate(addr, &e) {
+        FailureFate::Propagate => return e,
+        FailureFate::Upstream(root) => return UpstreamFailed { root }.into(),
+        FailureFate::Shell(shell) => return anyhow::Error::new(shell.clone()),
+        FailureFate::Own => {}
     }
 
     // This target's own failure (or an aggregation of unrecorded causes): record
@@ -2159,6 +2094,114 @@ fn classify_failure(
         ),
     );
     UpstreamFailed { root: addr.clone() }.into()
+}
+
+/// What [`classify_failure`] does with an error, decided on a borrow so the
+/// end of a target's scope can ask too (whether to learn if its log can be
+/// read) without taking the error.
+enum FailureFate<'a> {
+    /// Not a target's failure (a stop, a cycle, a request-shape error):
+    /// propagated unchanged, never recorded.
+    Propagate,
+    /// Collateral: a fresh marker naming the root, never recorded.
+    Upstream(Addr),
+    /// A request-shape error aggregated with its identical siblings,
+    /// surfaced alone.
+    Shell(&'a ShellNeedsSingleTarget),
+    /// This target's own failure: recorded.
+    Own,
+}
+
+fn failure_fate<'a>(addr: &Addr, e: &'a anyhow::Error) -> FailureFate<'a> {
+    // Cancellation: propagate unchanged, never record.
+    if downcast_chain_ref::<CancelledError>(e).is_some() {
+        return FailureFate::Propagate;
+    }
+
+    // Cyclic dependency: a structural error detected at potentially many nodes
+    // of the cycle, not a single target's own work failing. Propagate unchanged
+    // so the cycle surfaces directly to the caller (and never gets masked behind
+    // an `UpstreamFailed` marker or duplicated into the failure registry).
+    if downcast_chain_ref::<CycleError>(e).is_some() {
+        return FailureFate::Propagate;
+    }
+
+    // "This hash-only request may not build" is a property of the request, not a
+    // failure of the target. Nothing is wrong with the dep; we simply declined to
+    // build it. Propagate unchanged so the caller can recognise it — the fixpoint
+    // recompute treats it as "skip", and the in_place write-back guard needs to
+    // say "could not confirm", not "dependency failed".
+    if downcast_chain_ref::<HashUnknownError>(e).is_some() {
+        return FailureFate::Propagate;
+    }
+
+    // "--shell needs one target" is a property of the request, not a failure of
+    // the target that raised it — nothing ran. Propagate unchanged so a group
+    // nested inside a single-member group doesn't record the user's own input
+    // error as a failed target and render a failure box for something that never
+    // executed.
+    if downcast_chain_ref::<ShellNeedsSingleTarget>(e).is_some() {
+        return FailureFate::Propagate;
+    }
+
+    // Already a collateral marker: reuse the existing root, do not record.
+    if let Some(uf) = downcast_chain_ref::<UpstreamFailed>(e) {
+        return FailureFate::Upstream(uf.root.clone());
+    }
+
+    // Aggregation of child failures. If *every* child is already a recorded
+    // collateral marker (or a cancellation), the real root causes live in the
+    // registry downstream — this target has no own work to blame, so collapse to
+    // a cheap marker without recording. But if any child is a genuine,
+    // unrecorded cause (e.g. a `TargetNotFound` raised while resolving an input's
+    // def in `link`/`meta`, which never passes through `result_addr`), fall
+    // through and record the whole aggregation against this target so the detail
+    // (every broken input) isn't lost.
+    if let Some(multi) = downcast_chain_ref::<MultiError>(e) {
+        // A request-shape error aggregated with `fail_fast = false` is still a
+        // request error, not this target's failure. Surface it alone: every
+        // sibling raised the identical one.
+        for inner in &multi.0 {
+            if let Some(shell) = downcast_chain_ref::<ShellNeedsSingleTarget>(inner) {
+                return FailureFate::Shell(shell);
+            }
+        }
+        let all_collateral = multi.0.iter().all(|inner| {
+            downcast_chain_ref::<UpstreamFailed>(inner).is_some()
+                || downcast_chain_ref::<CancelledError>(inner).is_some()
+        });
+        if all_collateral {
+            let root = multi
+                .0
+                .iter()
+                .find_map(|inner| {
+                    downcast_chain_ref::<UpstreamFailed>(inner).map(|u| u.root.clone())
+                })
+                .unwrap_or_else(|| addr.clone());
+            return FailureFate::Upstream(root);
+        }
+    }
+
+    FailureFate::Own
+}
+
+/// `ResultEnd`'s `left_behind`: what the failure slot holds, plus whether the
+/// log can be read when that was asked. The log's path is left out for an
+/// interactive target, as [`classify_failure`] leaves it out of the box.
+fn left_behind(
+    slot: Option<hcore::events::LeftBehindData>,
+    log_readable: Option<bool>,
+    interactive: bool,
+) -> Option<Box<hcore::events::LeftBehindData>> {
+    if slot.is_none() && log_readable.is_none() {
+        return None;
+    }
+    let mut left = slot.unwrap_or_default();
+    if interactive {
+        left.log_path = None;
+    }
+    left.log_readable = log_readable;
+    Some(Box::new(left))
 }
 
 /// The log `execute` kept for this failure: its [`FailureSlot`] on the chain,
@@ -2953,7 +2996,15 @@ impl Engine {
         let addr_str = addr.format();
         let interactive = opts.interactive.is_some();
         let end_rs = Arc::clone(&rs);
-        crate::engine::event::emit_scope(
+        // Whether `heph log` would find this target's log, asked when its own
+        // failure ends the scope: `ResultEnd` carries the answer, so a
+        // consumer printing the failure as it happens points at the log on
+        // the answer the end-of-run box would have used. Never on success, and
+        // never for collateral (a marker, thousands of them).
+        let readable: Arc<std::sync::OnceLock<bool>> = Arc::default();
+        let end_readable = Arc::clone(&readable);
+        let log_engine = Arc::clone(&self);
+        crate::engine::event::emit_scope_with(
             &rs,
             crate::engine::event::BuildEventKind::ResultStart {
                 addr: addr_str.clone(),
@@ -2984,6 +3035,11 @@ impl Engine {
                         ),
                         timed_out: d.timed_out,
                         cancelled,
+                        left_behind: left_behind(
+                            d.left_behind,
+                            end_readable.get().copied(),
+                            interactive,
+                        ),
                     }
                 }
                 None => crate::engine::event::BuildEventKind::ResultEnd {
@@ -2994,7 +3050,15 @@ impl Engine {
                     exit_status: None,
                     log_tail: None,
                     timed_out: None,
+                    left_behind: None,
                 },
+            },
+            |e| {
+                matches!(failure_fate(addr, e), FailureFate::Own).then(|| async move {
+                    // Set once: this scope ends once.
+                    let _first: Result<(), bool> =
+                        readable.set(log_engine.log_readable(addr).await);
+                })
             },
             async {
                 // Use _no_track: result_addr set parent=addr before entering the memoizer,

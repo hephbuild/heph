@@ -1162,6 +1162,7 @@ mod tests {
         apply(
             &mut m,
             BuildEventKind::ResultEnd {
+                left_behind: None,
                 cancelled: false,
                 addr: "//p:done".into(),
                 error: None,

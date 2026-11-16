@@ -1198,6 +1198,7 @@ mod tests {
                     _ => (Some("boom".to_owned()), Some(addr(rng)), false),
                 };
                 BuildEventKind::ResultEnd {
+                    left_behind: None,
                     cancelled,
                     addr: addr(rng),
                     error,

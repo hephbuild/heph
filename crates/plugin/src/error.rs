@@ -711,6 +711,18 @@ pub enum FixesNotWritten {
     Frozen,
 }
 
+/// Why nothing was written, as the box and the report say it.
+impl fmt::Display for FixesNotWritten {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Signal(sig) => write!(f, "killed by signal {sig}"),
+            Self::HighExit(code) => write!(f, "exit {code} (128+, treated as a signal)"),
+            Self::MovedSource => f.write_str("an in_place source changed while the target ran"),
+            Self::Frozen => f.write_str("--frozen checks the tree, it never writes it"),
+        }
+    }
+}
+
 impl TargetFailure {
     pub fn new(addr: Addr, log_tail: Option<LogTail>, source: anyhow::Error) -> Self {
         Self {
@@ -760,6 +772,52 @@ impl TargetFailure {
     pub fn with_outputs(mut self, outputs: Option<std::path::PathBuf>) -> Self {
         self.outputs = outputs;
         self
+    }
+
+    /// What this failure left behind, as the failure box's last rows read it.
+    pub fn left_behind(&self) -> hcore::events::LeftBehindData {
+        left_behind(
+            self.log.as_ref(),
+            self.sandbox.as_ref(),
+            self.outputs.as_deref(),
+            self.fixes.as_ref(),
+            self.log_readable,
+        )
+    }
+}
+
+/// What a failed run left behind, in the event's terms: the one conversion
+/// both the recorded failure ([`TargetFailure::left_behind`]) and the
+/// engine's `ResultEnd` (from the failure slot) go through, so the box and a
+/// live printer say the same thing.
+pub fn left_behind(
+    log: Option<&FailureLog>,
+    sandbox: Option<&SandboxFate>,
+    outputs: Option<&std::path::Path>,
+    fixes: Option<&FailureFixes>,
+    log_readable: Option<bool>,
+) -> hcore::events::LeftBehindData {
+    hcore::events::LeftBehindData {
+        log_path: log
+            .and_then(FailureLog::path)
+            .map(|p| p.display().to_string()),
+        sandbox: sandbox.and_then(|s| match s {
+            // The default: neither the box nor the report says anything.
+            SandboxFate::Removed => None,
+            other => Some(other.to_string()),
+        }),
+        outputs: outputs.map(|p| p.display().to_string()),
+        fixes: fixes.map(|f| match f {
+            FailureFixes::Written { root, paths, list } => hcore::events::FixesData::Written {
+                root: root.to_string_lossy().into_owned(),
+                paths: paths.clone(),
+                list: list.as_ref().map(|l| l.to_string_lossy().into_owned()),
+            },
+            FailureFixes::NotWritten(reason) => hcore::events::FixesData::NotWritten {
+                reason: reason.to_string(),
+            },
+        }),
+        log_readable,
     }
 }
 

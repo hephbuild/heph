@@ -104,6 +104,7 @@ mod tests {
             ev(BuildEventKind::ResultStart { addr: a.into() });
         }
         ev(BuildEventKind::ResultEnd {
+            left_behind: None,
             cancelled: false,
             addr: "//a:one".into(),
             error: None,

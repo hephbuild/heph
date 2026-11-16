@@ -380,6 +380,9 @@ impl Tally {
                 // CI output is unchanged (two-mode TUI I8): a stop still
                 // reports as the failure it did before the field existed.
                 cancelled: _,
+                // The job summary names the failure; where its log is
+                // stays in the step's own output.
+                left_behind: _,
             } => {
                 self.finish(
                     addr,
@@ -966,6 +969,7 @@ mod tests {
         t.apply(&ev(
             end,
             BuildEventKind::ResultEnd {
+                left_behind: None,
                 cancelled: false,
                 timed_out: None,
                 addr: addr.into(),
@@ -985,6 +989,7 @@ mod tests {
         t.apply(&ev(
             10,
             BuildEventKind::ResultEnd {
+                left_behind: None,
                 cancelled: false,
                 timed_out: None,
                 addr: "//base:proto".into(),
@@ -998,6 +1003,7 @@ mod tests {
             t.apply(&ev(
                 20,
                 BuildEventKind::ResultEnd {
+                    left_behind: None,
                     cancelled: false,
                     timed_out: None,
                     addr: format!("//services/api:t{i}"),
@@ -1033,6 +1039,7 @@ mod tests {
             t.apply(&ev(
                 5,
                 BuildEventKind::ResultEnd {
+                    left_behind: None,
                     cancelled: false,
                     timed_out: None,
                     addr: "//a:x".into(),
@@ -1616,6 +1623,7 @@ mod tests {
         t.apply(&ev(
             5,
             BuildEventKind::ResultEnd {
+                left_behind: None,
                 cancelled: false,
                 timed_out: None,
                 addr: "//a:x".into(),
@@ -1635,6 +1643,7 @@ mod tests {
             t.apply(&ev(
                 0,
                 BuildEventKind::ResultEnd {
+                    left_behind: None,
                     cancelled: false,
                     timed_out: None,
                     addr: format!("//a:t{i}"),
@@ -1658,6 +1667,7 @@ mod tests {
             t.apply(&ev(
                 0,
                 BuildEventKind::ResultEnd {
+                    left_behind: None,
                     cancelled: false,
                     timed_out: None,
                     addr: addr.into(),
@@ -1680,6 +1690,7 @@ mod tests {
         t.apply(&ev(
             10,
             BuildEventKind::ResultEnd {
+                left_behind: None,
                 cancelled: false,
                 timed_out: None,
                 addr: "//services/api:test".into(),
@@ -1726,6 +1737,7 @@ mod tests {
         t.apply(&ev(
             5_000,
             BuildEventKind::ResultEnd {
+                left_behind: None,
                 cancelled: false,
                 timed_out: None,
                 addr: "//a:x".into(),

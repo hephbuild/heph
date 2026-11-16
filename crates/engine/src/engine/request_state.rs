@@ -968,25 +968,30 @@ impl RequestState {
     /// `heph log` would not find, nor leaves out one it would. Without the
     /// engine (gone), the failures are returned unasked.
     pub async fn take_failures_with_logs(&self) -> Vec<Arc<TargetFailure>> {
+        self.take_failures_with_logs_where(|_| true).await
+    }
+
+    /// [`take_failures_with_logs`](Self::take_failures_with_logs), asking
+    /// only for the failures `wanted` picks; the rest are returned unasked.
+    /// The CI end of run asks only for the failures it is about to print:
+    /// those printed as they failed carried the answer then.
+    pub async fn take_failures_with_logs_where(
+        &self,
+        wanted: impl Fn(&TargetFailure) -> bool,
+    ) -> Vec<Arc<TargetFailure>> {
         use futures::StreamExt as _;
         let failures = self.take_failures();
         let Some(engine) = self.data.engine.upgrade() else {
             return failures;
         };
-        let opts = crate::engine::log_api::LogOptions::default();
         futures::stream::iter(failures)
             .map(|f| {
-                let (engine, opts) = (&engine, &opts);
+                let (engine, wanted) = (&engine, &wanted);
                 async move {
-                    use crate::engine::log_api::{LogSource, LogUnavailable};
-                    let readable = match engine.open_log(&f.addr, opts).await {
-                        Ok(found) => found.is_some(),
-                        // A remote hit's log, not fetched: `heph log`
-                        // fetches it.
-                        Err(e) => e
-                            .downcast_ref::<LogUnavailable>()
-                            .is_some_and(|u| u.info.source == LogSource::Cache { remote: true }),
-                    };
+                    if !wanted(&f) {
+                        return f;
+                    }
+                    let readable = engine.log_readable(&f.addr).await;
                     Arc::new(f.as_ref().clone().with_log_readable(readable))
                 }
             })
@@ -2446,6 +2451,7 @@ mod tests {
                 addr: "//a:b".into(),
             },
             |error: Option<crate::engine::event::ErrorDetail>| BuildEventKind::ResultEnd {
+                left_behind: None,
                 cancelled: false,
                 addr: "//a:b".into(),
                 error: error.map(crate::engine::event::ErrorDetail::into_message),

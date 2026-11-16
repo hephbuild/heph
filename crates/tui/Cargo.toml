@@ -31,6 +31,9 @@ serde_json = "1"
 # The replay's prefilter: only `Log` records are decoded.
 memchr = "2"
 tempfile = "3"
+# A failure's `log:` row quotes the addr and the restore hint its paths, as
+# the CI box does (`failure_rows`).
+shlex = "2"
 uuid = { version = "1.23.3", features = ["v4"] }
 
 # With stdin not a terminal, crossterm reads /dev/tty, and macOS kqueue refuses

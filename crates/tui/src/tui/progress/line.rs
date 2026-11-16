@@ -740,6 +740,7 @@ mod tests {
         v.apply(&at(
             10,
             BuildEventKind::ResultEnd {
+                left_behind: None,
                 cancelled: false,
                 addr: "//p:fail".into(),
                 error: Some(format!("exec failed\n{SANDBOX}/run.sh: exit status: 101")),
@@ -800,6 +801,7 @@ mod tests {
         const HOME: &str = "/home/u/.heph";
         let fail =
             |addr: &str, error: String, upstream_of: Option<&str>| BuildEventKind::ResultEnd {
+                left_behind: None,
                 cancelled: false,
                 addr: addr.into(),
                 error: Some(error),
@@ -853,6 +855,7 @@ mod tests {
         cancelled: bool,
     ) -> hcore::events::BuildEventKind {
         hcore::events::BuildEventKind::ResultEnd {
+            left_behind: None,
             addr: addr.into(),
             error: Some(if cancelled { "cancelled" } else { "boom" }.into()),
             upstream_of: upstream_of.map(str::to_owned),

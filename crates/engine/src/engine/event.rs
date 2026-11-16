@@ -61,6 +61,11 @@ pub struct ErrorDetail {
     /// cancel landing after that decision (fail-fast reaping another root)
     /// does not turn it into a stop.
     pub kept: bool,
+    /// What the run left in its failure slot (the log's path, the sandbox's
+    /// fate, `out/`, the write-back): `ResultEnd`'s `left_behind`, before it
+    /// learns whether the log can be read. Paths and clones off the slot on
+    /// the chain, no IO.
+    pub left_behind: Option<hcore::events::LeftBehindData>,
 }
 
 impl ErrorDetail {
@@ -71,15 +76,23 @@ impl ErrorDetail {
     /// internal engine error is neither upstream damage nor a subprocess.
     pub fn from_error(e: &anyhow::Error) -> Self {
         use hplugin::error::{ProcessFailed, TargetFailure, UpstreamFailed};
+        let slot =
+            hcore::hmemoizer::downcast_chain_ref::<crate::engine::failure_slot::FailureSlot>(e);
         let mut d = Self {
             // Not `{e:#}`: a failure's artifacts ride the chain as an
             // empty-`Display` frame, which that would render as `: :`.
             message: hcore::hmemoizer::chain_message(e),
             cancelled: hplugin::error::is_cancelled(e),
-            kept: hcore::hmemoizer::downcast_chain_ref::<crate::engine::failure_slot::FailureSlot>(
-                e,
-            )
-            .is_some(),
+            kept: slot.is_some(),
+            left_behind: slot.map(|s| {
+                hplugin::error::left_behind(
+                    s.log.as_ref(),
+                    s.sandbox.as_ref(),
+                    s.out.as_deref(),
+                    s.fixes.as_ref(),
+                    None,
+                )
+            }),
             ..Self::default()
         };
         for cause in e.chain() {
@@ -105,9 +118,7 @@ impl ErrorDetail {
         d.exit_status =
             hcore::hmemoizer::downcast_chain_ref::<ProcessFailed>(e).map(|p| p.status.clone());
         if d.log_tail.is_none() {
-            d.log =
-                hcore::hmemoizer::downcast_chain_ref::<crate::engine::failure_slot::FailureSlot>(e)
-                    .and_then(|s| s.log.clone());
+            d.log = slot.and_then(|s| s.log.clone());
         }
         // Through the memoizer's shared wrappers too: a recorded failure
         // reaches `ResultEnd` behind `TargetFailure`'s source.
@@ -181,6 +192,21 @@ pub async fn emit_scope<T>(
     make_end: impl FnOnce(Option<ErrorDetail>) -> BuildEventKind + Send + 'static,
     fut: impl Future<Output = anyhow::Result<T>>,
 ) -> anyhow::Result<T> {
+    emit_scope_with(rs, start, make_end, |_| None::<std::future::Ready<()>>, fut).await
+}
+
+/// [`emit_scope`], awaiting what `on_error` returns for a failure before the
+/// end event is built: for an end that carries something only an await can
+/// learn, which `on_error` leaves where `make_end` reads it. The failure is
+/// recorded first, so a scope cancelled during that await still ends as the
+/// failure it was, without what the await would have added.
+pub async fn emit_scope_with<T, F: Future<Output = ()>>(
+    rs: &RequestState,
+    start: BuildEventKind,
+    make_end: impl FnOnce(Option<ErrorDetail>) -> BuildEventKind + Send + 'static,
+    on_error: impl FnOnce(&anyhow::Error) -> Option<F>,
+    fut: impl Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
     rs.emit(start);
     let mut guard = EndGuard {
         data: Some(rs.data()),
@@ -190,6 +216,9 @@ pub async fn emit_scope<T>(
     let out = fut.await; // guard still armed if this is cancelled mid-await
     if let Err(e) = &out {
         guard.error = Some(ErrorDetail::from_error(e));
+        if let Some(more) = on_error(e) {
+            more.await;
+        }
     }
     out // guard drops here → emits *End
 }
