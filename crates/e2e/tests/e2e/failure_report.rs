@@ -129,7 +129,13 @@ async fn failure_report_points_at_any_log_the_engine_holds() -> anyhow::Result<(
     );
 
     let mut boxes = Vec::new();
-    drop(FailedTargets::reported(failures, None, &mut boxes, false));
+    drop(FailedTargets::reported(
+        failures,
+        None,
+        &std::collections::HashSet::new(),
+        &mut boxes,
+        false,
+    ));
     let boxes = String::from_utf8(boxes)?;
     assert!(
         boxes.contains("╰─▶ boom\n  log: heph log //p:t\n"),

@@ -22,6 +22,7 @@
 
 mod build_fmt_cli;
 mod cache_tier_gate;
+mod ci_failure_output;
 mod ci_gate;
 mod codegen_removed_cli;
 mod config_schema_cli;

@@ -3,16 +3,16 @@
 //! hand-rolled format: a `×` title, a `╰─▶` cause line, and (when present) the
 //! process log tail in a framed `log` box.
 
+use std::collections::HashSet;
 use std::io;
 use std::sync::Arc;
 
 use crossterm::style::Stylize;
 
-use crate::engine::error::{
-    CancelledError, FailureFixes, FixesNotWritten, FrozenCheckError, SandboxFate, TargetFailure,
-};
+use crate::engine::error::{CancelledError, FrozenCheckError, TargetFailure};
 use crate::hmemoizer::{chain_frames, downcast_chain_ref};
 use crate::tui::color::stderr_color_enabled as color_enabled;
+use crate::tui::failure_rows::left_behind_rows;
 use crate::tui::session::SessionSlot;
 
 mod report;
@@ -114,24 +114,9 @@ fn render_diff_box(out: &mut String, diff: &str, color: bool) {
     }
 }
 
-/// Whether a failure box frames the log's tail.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LogTailIn {
-    /// The box: every caller but the line backend's end of run.
-    Box,
-    /// Already printed: the line backend printed each root failure's tail
-    /// the moment it failed, so the box at the end leaves it out.
-    PrintedLive,
-}
-
 /// Render a single target failure to a string. The `×` and `╰─▶` markers are red
 /// when `color`.
 fn render_target_failure(f: &TargetFailure, color: bool) -> String {
-    render_target_failure_with(f, color, LogTailIn::Box)
-}
-
-/// [`render_target_failure`], with the tail framed or left out (`tail`).
-fn render_target_failure_with(f: &TargetFailure, color: bool, tail: LogTailIn) -> String {
     let cross = if color {
         format!("{}", "×".red())
     } else {
@@ -162,142 +147,35 @@ fn render_target_failure_with(f: &TargetFailure, color: bool, tail: LogTailIn) -
     }
     // The tail is read from the slot's log through the handle the engine kept
     // open, so a rerun replacing the slot meanwhile cannot swap this run's box.
-    let tail = match (tail, &f.log) {
-        (LogTailIn::PrintedLive, _) => None,
-        (LogTailIn::Box, Some(log)) => log.tail().ok().or_else(|| f.log_tail.clone()),
-        (LogTailIn::Box, None) => f.log_tail.clone(),
+    let tail = match &f.log {
+        Some(log) => log.tail().ok().or_else(|| f.log_tail.clone()),
+        None => f.log_tail.clone(),
     };
     if let Some(log) = &tail {
         render_log_box(&mut out, &log.text, log.start_line, color);
     }
-    if let Some(path) = f.log.as_ref().and_then(|l| l.path()) {
-        out.push_str(&format!("  full log: {}\n", path.display()));
-    }
-    // Only a sandbox whose fate is out of the ordinary gets a line: the one
-    // kept, the one removed in spite of the flag, the one left behind an
-    // abandoned run. Removing a failed sandbox is the default and goes
-    // unsaid, as in the interactive report.
-    match &f.sandbox {
-        Some(SandboxFate::Removed) | None => {}
-        Some(sandbox) => out.push_str(&format!("  sandbox: {sandbox}\n")),
-    }
-    if let Some(outputs) = &f.outputs {
-        out.push_str(&format!("  outputs: {}\n", outputs.display()));
-    }
-    if let Some(fixes) = &f.fixes {
-        render_fixes(&mut out, fixes);
-    }
-    // Last: the command that reads the log without its path, which an agent
-    // can run as-is (two-mode TUI I8), whenever the engine can open one — a
-    // log with no path on disk included; "none kept" when it cannot. A
-    // failure nobody asked the engine about points only beside `full log:`.
-    if f.points_at_log() {
-        out.push_str(&format!(
-            "  log: heph log {}\n",
-            shell_quote(&f.addr.format())
-        ));
-    } else if f.log_readable == Some(false) {
-        out.push_str("  log: none kept\n");
-    }
+    // The rows the line backend's live block ends with too, from the one
+    // function both call, so the two cannot word them differently.
+    out.push_str(&left_behind_rows(&f.addr.format(), &f.left_behind()));
     out
-}
-
-/// How many written-back paths the box names before it points at `fixes.txt`.
-const FIXES_SHOWN: usize = 10;
-
-/// The box's account of a failed `in_place` run's write-back (D20): the files
-/// it changed and how to undo that, or why it changed nothing. A write-back
-/// that matched the tree already says nothing.
-///
-/// The restore hint runs git in the root the fixes were written under (`-C`),
-/// since the paths are workspace-relative and the user's cwd may be anywhere,
-/// and with
-/// `--literal-pathspecs`, since git reads a pathspec as a glob: `web/[id].ts`
-/// would also revert `web/i.ts`. It restores the index version, so it says
-/// that uncommitted edits to those files go with it.
-fn render_fixes(out: &mut String, fixes: &FailureFixes) {
-    const RESTORE: &str =
-        "  restore with (takes the index version; uncommitted edits to these files are lost):\n";
-    match fixes {
-        FailureFixes::Written { paths, .. } if paths.is_empty() => {}
-        FailureFixes::Written { root, paths, list } => {
-            let git = format!(
-                "git -C {} --literal-pathspecs checkout",
-                shell_quote(&root.to_string_lossy())
-            );
-            out.push_str(
-                "  fixes written, target still failed (re-run to verify; \
-                 codegen = \"in_place_on_success\" opts out):\n",
-            );
-            for p in paths.iter().take(FIXES_SHOWN) {
-                out.push_str(&format!("    {p}\n"));
-            }
-            let more = paths.len().saturating_sub(FIXES_SHOWN);
-            match list {
-                Some(list) if more > 0 => {
-                    out.push_str(&format!(
-                        "    +{more} more (full list: {})\n",
-                        list.display()
-                    ));
-                    // The list is one path per line, which is what git's
-                    // `--pathspec-from-file` reads: no xargs word splitting.
-                    out.push_str(RESTORE);
-                    out.push_str(&format!(
-                        "    {git} --pathspec-from-file={}\n",
-                        shell_quote(&list.to_string_lossy())
-                    ));
-                }
-                _ => {
-                    if more > 0 {
-                        out.push_str(&format!("    +{more} more\n"));
-                    }
-                    // With no list to point at, the hint names every path:
-                    // a truncated restore would silently leave files behind.
-                    let quoted: Vec<_> = paths.iter().map(|p| shell_quote(p)).collect();
-                    out.push_str(RESTORE);
-                    out.push_str(&format!("    {git} -- {}\n", quoted.join(" ")));
-                }
-            }
-        }
-        FailureFixes::NotWritten(reason) => {
-            out.push_str(&format!(
-                "  fixes not written: {}\n",
-                not_written_reason(reason)
-            ));
-        }
-    }
-}
-
-/// Why a failed `in_place` run wrote nothing back, as the box and the
-/// report say it.
-fn not_written_reason(reason: &FixesNotWritten) -> String {
-    match reason {
-        FixesNotWritten::Signal(sig) => format!("killed by signal {sig}"),
-        FixesNotWritten::HighExit(code) => format!("exit {code} (128+, treated as a signal)"),
-        FixesNotWritten::MovedSource => "an in_place source changed while the target ran".into(),
-        FixesNotWritten::Frozen => "--frozen checks the tree, it never writes it".into(),
-    }
-}
-
-/// `s` as one shell word, so a restore hint pastes as-is. A path that cannot
-/// be quoted (a NUL byte) is printed raw: it could not be passed to git either.
-fn shell_quote(s: &str) -> std::borrow::Cow<'_, str> {
-    shlex::try_quote(s).unwrap_or(std::borrow::Cow::Borrowed(s))
 }
 
 /// Render each recorded target failure, separated by a blank line. Pure, so the
 /// exact bytes the user sees are assertable without capturing stderr.
 pub fn render_failures_to_string(failures: &[Arc<TargetFailure>], color: bool) -> String {
-    render_failures(failures, color, LogTailIn::Box)
+    render_failures(failures.iter(), color)
 }
 
-fn render_failures(failures: &[Arc<TargetFailure>], color: bool, tail: LogTailIn) -> String {
+fn render_failures<'a>(
+    failures: impl Iterator<Item = &'a Arc<TargetFailure>>,
+    color: bool,
+) -> String {
     let mut out = String::new();
-    for (i, f) in failures.iter().enumerate() {
+    for (i, f) in failures.enumerate() {
         if i > 0 {
             out.push('\n');
         }
-        out.push_str(&render_target_failure_with(f, color, tail));
+        out.push_str(&render_target_failure(f, color));
     }
     out
 }
@@ -601,9 +479,18 @@ macro_rules! finalize {
         if let Some(report) = &incomplete {
             ($announce)(report);
         }
+        // The failures the line backend printed as they failed, box rows
+        // included: their boxes are left out below. Asked before the
+        // failures are taken, so the answer covers every one of them; empty
+        // on the interactive backend, whose report is unchanged.
+        let printed_live = $ctx.failures_printed().await;
         // Each saying whether `heph log <addr>` would find its log: the
-        // report and the CI box point at it on the same answer.
-        let failures = $rs.take_failures_with_logs().await;
+        // report and the CI box point at it on the same answer. One printed
+        // live carried that answer then and is not asked again — but it is
+        // still taken, so the exit code and telemetry count it.
+        let failures = $rs
+            .take_failures_with_logs_where(|f| !printed_live.contains(&f.addr.format()))
+            .await;
         if !failures.is_empty() {
             // `res` is a collateral marker here — dropped either way.
             if $ctx.interactive() {
@@ -639,6 +526,7 @@ macro_rules! finalize {
                     $crate::commands::errors::FailedTargets::reported_to_stderr(
                         failures,
                         incomplete,
+                        &printed_live,
                         $ctx.session(),
                     )
                     .into_error(),
@@ -766,28 +654,38 @@ impl FailedTargets {
     /// Everything this error prints: the boxes, then any incomplete-selection
     /// block.
     fn render_to_string(&self, color: bool) -> String {
-        // Reported at the failure site means the line backend: its view
-        // printed each root failure's tail as it failed (every command that
-        // records target failures runs it, `CiProgressView`), and the same
-        // tail, read from the same slot log, would only repeat it here.
-        let tail = if self.rendered {
-            LogTailIn::PrintedLive
-        } else {
-            LogTailIn::Box
-        };
+        self.render_except(&HashSet::new(), color)
+    }
+
+    /// [`render_to_string`](Self::render_to_string), leaving out the box of
+    /// each failure in `printed_live`: the line backend printed its block,
+    /// tail and box rows included, the moment it failed, and the box would
+    /// only say it again. The failure stays in [`failures`](Self::failures)
+    /// all the same, so the exit code and telemetry still count it.
+    fn render_except(&self, printed_live: &HashSet<String>, color: bool) -> String {
         let mut out = match &self.report {
             Some(report) => report.render(color),
-            None => render_failures(&self.failures, color, tail),
+            None => render_failures(
+                self.failures
+                    .iter()
+                    .filter(|f| !printed_live.contains(&f.addr.format())),
+                color,
+            ),
         };
         if let Some(report) = &self.incomplete {
-            out.push('\n');
+            if !out.is_empty() {
+                out.push('\n');
+            }
             out.push_str(&render_incomplete(report, true, color));
         }
         out
     }
 
     /// Print the failures to `out` and record that it happened, so
-    /// [`render_anyhow`] stays quiet later.
+    /// [`render_anyhow`] stays quiet later. A failure in `printed_live` gets
+    /// no box: its live block was printed (tracked by the line backend's view,
+    /// [`AppContext::failures_printed`](crate::tui::app::AppContext::failures_printed),
+    /// never assumed), and it ends with the box's rows.
     ///
     /// Printing lives *in* the constructor on purpose: `rendered` is a promise
     /// about what is already on the terminal, and a caller that sets it without
@@ -796,6 +694,7 @@ impl FailedTargets {
     pub fn reported(
         failures: Vec<Arc<TargetFailure>>,
         incomplete: Option<crate::engine::discovery::GapReport>,
+        printed_live: &HashSet<String>,
         out: &mut dyn io::Write,
         color: bool,
     ) -> Self {
@@ -807,7 +706,7 @@ impl FailedTargets {
         };
         // A failed write to the terminal is not actionable, and the exit code still
         // has to carry the failure out.
-        drop(write!(out, "{}", this.render_to_string(color)));
+        drop(write!(out, "{}", this.render_except(printed_live, color)));
         this
     }
 
@@ -817,14 +716,24 @@ impl FailedTargets {
     pub fn reported_to_stderr(
         failures: Vec<Arc<TargetFailure>>,
         incomplete: Option<crate::engine::discovery::GapReport>,
+        printed_live: &HashSet<String>,
         session: &SessionSlot,
     ) -> Self {
         let mut out = Vec::new();
-        let this = Self::reported(failures, incomplete, &mut out, color_enabled());
-        // Best-effort, like the write in `reported`: the exit code carries the
-        // failure out either way.
-        drop(io::Write::write_all(&mut io::stderr(), &out));
-        session.record_output(&String::from_utf8_lossy(&out));
+        let this = Self::reported(
+            failures,
+            incomplete,
+            printed_live,
+            &mut out,
+            color_enabled(),
+        );
+        // Every failure printed live leaves nothing to print.
+        if !out.is_empty() {
+            // Best-effort, like the write in `reported`: the exit code carries
+            // the failure out either way.
+            drop(io::Write::write_all(&mut io::stderr(), &out));
+            session.record_output(&String::from_utf8_lossy(&out));
+        }
         this
     }
 
@@ -932,7 +841,9 @@ fn render_anyhow_to_string(e: &anyhow::Error, color: bool) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::error::{LogTail, ProcessFailed};
+    use crate::engine::error::{
+        FailureFixes, FixesNotWritten, LogTail, ProcessFailed, SandboxFate,
+    };
     use anyhow::Context as _;
     use std::sync::Arc;
 
@@ -1040,7 +951,8 @@ mod tests {
         // for the exit code, and `render_anyhow` must claim it — but print nothing,
         // or every failing CI run shows its diagnostics twice.
         let mut sink: Vec<u8> = Vec::new();
-        let e = FailedTargets::reported(two_failures(), None, &mut sink, false).into_error();
+        let e = FailedTargets::reported(two_failures(), None, &HashSet::new(), &mut sink, false)
+            .into_error();
         // The constructor is what printed them — the only way to make the `rendered`
         // promise — so the flag cannot drift from what is actually on the terminal.
         assert_eq!(
@@ -1094,6 +1006,7 @@ mod tests {
         interactive: bool,
         pauses: std::cell::Cell<usize>,
         session: crate::tui::session::SessionSlot,
+        printed_live: HashSet<String>,
     }
 
     struct FakeGuard;
@@ -1104,10 +1017,19 @@ mod tests {
                 interactive,
                 pauses: std::cell::Cell::new(0),
                 session: crate::tui::session::SessionSlot::new(),
+                printed_live: HashSet::new(),
             }
+        }
+        /// A line backend that printed the live blocks of `addrs`.
+        fn printed_live(mut self, addrs: &[&str]) -> Self {
+            self.printed_live = addrs.iter().map(|a| (*a).to_owned()).collect();
+            self
         }
         fn interactive(&self) -> bool {
             self.interactive
+        }
+        async fn failures_printed(&self) -> HashSet<String> {
+            self.printed_live.clone()
         }
         fn session(&self) -> &crate::tui::session::SessionSlot {
             &self.session
@@ -1220,9 +1142,12 @@ mod tests {
                 Vec::new(),
             )
         }
-        /// No engine to ask: the failures as recorded, as the real one
-        /// returns them once the engine is gone.
-        async fn take_failures_with_logs(&self) -> Vec<Arc<TargetFailure>> {
+        /// No engine to ask: every failure as recorded, wanted or not, as
+        /// the real one returns them once the engine is gone.
+        async fn take_failures_with_logs_where(
+            &self,
+            _wanted: impl Fn(&TargetFailure) -> bool,
+        ) -> Vec<Arc<TargetFailure>> {
             std::mem::take(&mut *self.0.borrow_mut())
         }
         fn emit(&self, kind: crate::engine::event::BuildEventKind) {
@@ -1411,12 +1336,37 @@ mod tests {
     #[test]
     fn reported_failures_print_the_block_after_the_boxes() {
         let mut sink: Vec<u8> = Vec::new();
-        let ft =
-            FailedTargets::reported(two_failures(), Some(some_gaps().report()), &mut sink, false);
+        let ft = FailedTargets::reported(
+            two_failures(),
+            Some(some_gaps().report()),
+            &HashSet::new(),
+            &mut sink,
+            false,
+        );
         let out = String::from_utf8(sink).expect("utf8");
         let boxes = out.find("× target failed").expect("boxes");
         let block = out.find("! selection incomplete").expect("block");
         assert!(boxes < block, "{out}");
+        assert!(
+            out.contains("Target failures above may be the cause."),
+            "{out}"
+        );
+
+        // Every failure printed live: the block alone, still pointing up at
+        // them, with no blank line standing in for the boxes.
+        let mut sink: Vec<u8> = Vec::new();
+        drop(FailedTargets::reported(
+            two_failures(),
+            Some(some_gaps().report()),
+            &["//simple_fail:d1", "//simple_fail:d2"]
+                .map(str::to_owned)
+                .into(),
+            &mut sink,
+            false,
+        ));
+        let out = String::from_utf8(sink).expect("utf8");
+        assert!(out.starts_with("! selection incomplete"), "{out}");
+        assert!(!out.contains("× target failed"), "{out}");
         assert!(
             out.contains("Target failures above may be the cause."),
             "{out}"
@@ -1607,43 +1557,68 @@ mod tests {
         assert_eq!(none, format!("{rendered}  log: none kept\n"), "{none}");
     }
 
-    /// The box a non-interactive run prints at its end leaves out the log's
-    /// tail, which the line backend printed as the target failed, and keeps
-    /// every other row; a box rendered anywhere else still frames it.
+    /// The end of a non-interactive run prints no box for a failure whose
+    /// live block the line backend printed — the block carried its tail and
+    /// its rows — and the full box, tail framed, for one it did not; both
+    /// stay in the error for the exit code.
     #[test]
-    fn ci_box_leaves_out_the_tail_printed_live() {
+    fn ci_end_leaves_out_a_failure_printed_live() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("log.txt");
         std::fs::write(&path, "first\nlast words\n").unwrap();
-        let log = crate::engine::error::FailureLog::open(
-            path.clone(),
-            std::fs::File::open(&path).unwrap(),
-            10,
-        );
-        let addr = crate::htaddr::parse_addr("//web:lint").unwrap();
-        let f = Arc::new(
-            TargetFailure::new(addr, None, anyhow::anyhow!("boom"))
-                .with_log(Some(log))
+        let log = || {
+            crate::engine::error::FailureLog::open(
+                path.clone(),
+                std::fs::File::open(&path).unwrap(),
+                10,
+            )
+        };
+        let failure = |addr: &str| {
+            Arc::new(
+                TargetFailure::new(
+                    crate::htaddr::parse_addr(addr).unwrap(),
+                    None,
+                    anyhow::anyhow!("boom"),
+                )
+                .with_log(Some(log()))
                 .with_log_readable(true),
-        );
+            )
+        };
+        let (live, not_live) = (failure("//web:lint"), failure("//web:test"));
 
         let mut sink: Vec<u8> = Vec::new();
-        drop(FailedTargets::reported(
-            vec![Arc::clone(&f)],
+        let ft = FailedTargets::reported(
+            vec![Arc::clone(&live), Arc::clone(&not_live)],
             None,
+            &HashSet::from(["//web:lint".to_owned()]),
             &mut sink,
             false,
-        ));
+        );
         assert_eq!(
             String::from_utf8(sink).expect("utf8"),
-            format!(
-                "× target failed: //web:lint\n╰─▶ boom\n  full log: {}\n  log: heph log //web:lint\n",
-                path.display()
-            )
+            render_failures_to_string(&[not_live], false),
         );
+        assert_eq!(ft.failures().len(), 2, "the exit code counts both");
 
-        let boxed = render_failures_to_string(&[f], false);
+        let boxed = render_failures_to_string(&[live], false);
         assert!(boxed.contains("2 │ last words"), "{boxed}");
+        assert!(boxed.contains("  log: heph log //web:lint\n"), "{boxed}");
+    }
+
+    /// `finalize!` on the line backend asks which failures were printed live
+    /// before taking them: a failure printed live is taken all the same, so
+    /// the run still exits non-zero for it.
+    #[tokio::test]
+    async fn finalize_counts_a_failure_printed_live() -> anyhow::Result<()> {
+        let ctx = FakeCtx::new(false).printed_live(&["//simple_fail:d1", "//simple_fail:d2"]);
+        let rs = FakeRs::new(two_failures());
+        let res: anyhow::Result<u8> = Ok(1);
+        let e = finalize!(ctx, rs, res, _v => { Ok(()) }).unwrap_err();
+        let ft = downcast_chain_ref::<FailedTargets>(&e).expect("carried out");
+        assert!(ft.rendered);
+        assert_eq!(ft.failures().len(), 2);
+        assert!(downcast_chain_ref::<TargetFailure>(&e).is_some(), "{e:#}");
+        Ok(())
     }
 
     /// The box's `sandbox:` line, after the log footer, for each fate out of

@@ -4974,6 +4974,52 @@ mod tests {
         assert_eq!(ci_live_log(0, &[end]), "ERROR ✗ //a:b · exit status: 1\n");
     }
 
+    /// The block ends with the rows the end-of-run box would have carried,
+    /// after the tail and in the box's order, and the view says it printed
+    /// it: the end of the run then leaves the box out. A collateral failure
+    /// and a stop print nothing, so the box stays theirs.
+    #[test]
+    fn ci_view_live_block_carries_the_box_rows() {
+        let end = BuildEventKind::ResultEnd {
+            addr: "//a:b".into(),
+            error: Some("//a:b: exit status: 1".into()),
+            upstream_of: None,
+            exit_status: Some("exit status: 1".into()),
+            log_tail: Some(hcore::events::LogTailData {
+                text: TAIL.into(),
+                start_line: 1,
+            }),
+            timed_out: None,
+            cancelled: false,
+            left_behind: Some(Box::new(hcore::events::LeftBehindData {
+                log_path: Some("/h/failures/a_b/log.txt".into()),
+                sandbox: None,
+                outputs: Some("/h/failures/a_b/out".into()),
+                fixes: None,
+                log_readable: Some(true),
+            })),
+        };
+        assert_eq!(
+            ci_live_log(2, std::slice::from_ref(&end)),
+            "ERROR ✗ //a:b · exit status: 1\
+             \n  │ four\
+             \n  │ five\
+             \n  full log: /h/failures/a_b/log.txt\
+             \n  outputs: /h/failures/a_b/out\
+             \n  log: heph log //a:b\n",
+        );
+
+        let mut view = CiProgressView::new("Running");
+        for kind in [
+            end,
+            failed_end("//a:c", Some("//a:b"), false, Some(TAIL)),
+            failed_end("//a:d", None, true, Some(TAIL)),
+        ] {
+            view.apply(&ev(1_000, kind));
+        }
+        assert_eq!(view.failures_printed(), HashSet::from(["//a:b".to_owned()]));
+    }
+
     /// A same-addr `ResultEnd` double-fire prints one block.
     #[test]
     fn ci_view_prints_a_root_failure_once() {

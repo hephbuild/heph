@@ -22,12 +22,13 @@ use std::sync::Arc;
 
 use crossterm::style::Stylize;
 
-use super::{FIXES_SHOWN, cause_chain, not_written_reason, shell_quote};
+use super::cause_chain;
 use crate::engine::error::{
     FailureFixes, FrozenCheckError, ProcessFailed, SandboxFate, TargetFailure,
 };
 use crate::engine::request_state::TookDown;
 use crate::hmemoizer::downcast_chain_ref;
+use crate::tui::failure_rows::{FIXES_SHOWN, shell_quote};
 use crate::tui::text::{
     Redact, clean_inline, cut_right, expand_tabs, fit_styled, sanitize_log, sanitize_log_keep_sgr,
 };
@@ -429,7 +430,7 @@ fn fix_rows(rows: &mut Vec<Row>, fixes: &FailureFixes, addr: &str) {
             rows.push(Row::plain("restore:", restore));
         }
         FailureFixes::NotWritten(reason) => {
-            rows.push(Row::plain("fixes not written:", not_written_reason(reason)));
+            rows.push(Row::plain("fixes not written:", reason.to_string()));
         }
     }
 }

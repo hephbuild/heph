@@ -62,26 +62,30 @@ engine imports it, scrubbed the same way, provided it is a regular file inside
 the run's sandbox, and the returned file wins over anything streamed.
 
 A non-interactive run (CI, a pipe) prints a root failure's block the moment
-it fails, with the last `--log-lines` lines of its log:
+it fails, with the last `--log-lines` lines of its log, then where each part
+is:
 
 ```
 ERROR ✗ //web:e2e · exit status: 1
   │ …
   │ 3 failed, 41 passed
-```
-
-and, at the end of the run, the failure box, which prints where each part is.
-The tail is not repeated there:
-
-```
-× target failed: //web:e2e
-╰─▶ process exited with status: exit status: 1
   full log: /ws/.heph/failures/web_e2e-…/log.txt
   outputs: /ws/.heph/failures/web_e2e-…/out
   log: heph log //web:e2e
 ```
 
-The box's last line is the
+The end of the run does not say it again. A failure that printed no block as
+it failed — one that never reached its run, such as a dependency that does
+not exist — gets the failure box at the end instead, with the same rows:
+
+```
+× target failed: //web:e2e
+╰─▶ get_def: //web:e2e: get spec: //web:nope: target not found: //web:nope
+  log: none kept
+```
+
+A box also frames the log's tail, when there is one. Either way the last row
+is the
 command that prints the log without naming where it lives, printed whenever
 heph can open a log for the target — on disk or not, a remote hit's log it
 would fetch included — and `log: none kept` when it cannot. An interactive run
