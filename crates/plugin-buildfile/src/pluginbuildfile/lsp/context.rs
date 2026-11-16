@@ -117,6 +117,34 @@ impl HephLspContext {
         rel.to_string_lossy().replace('\\', "/")
     }
 
+    /// The 0-based line in `file` of the outermost call that declared target
+    /// `name` when `text` (that file's contents) is evaluated as package
+    /// `pkg`: `tool("go")` for a target a helper declares, the `target(` call
+    /// for a direct one. `None` when the file does not evaluate or declares no
+    /// such target. Evaluation only enriches the answer: the caller falls back
+    /// to reading the tokens.
+    pub(crate) fn declaring_line(
+        &self,
+        file: &Path,
+        text: String,
+        pkg: &str,
+        name: &str,
+    ) -> Option<u32> {
+        let filename = file.to_string_lossy();
+        // A helper loaded from another file may reach the walk, which needs a
+        // runtime context (see `list_packages`).
+        let _rt = self.runtime.enter();
+        let result = eval_source(&filename, text, pkg, &self.loader()).ok()?;
+        let target = result.targets.iter().find(|t| t.name == name)?;
+        // The call stack is outermost first, so the first frame in this file
+        // is the call the package itself made.
+        target
+            .provenance
+            .iter()
+            .find(|f| f.file == filename)
+            .map(|f| f.line_start.saturating_sub(1))
+    }
+
     fn loader(&self) -> BuildFileLoader {
         let walker = Arc::new(hwalk::CachedWalker::disabled());
         BuildFileLoader::new(

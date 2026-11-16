@@ -1163,6 +1163,60 @@ fn completion_and_definition_on_colon_and_slash_addresses() {
     );
 }
 
+/// A target a helper declares has no `name = "…"` of its own to land on:
+/// definition goes to the call in the package that declared it, found by
+/// evaluating the package — a local helper with a positional name, a loaded
+/// one, and a name the helper computes.
+#[test]
+fn definition_on_an_address_lands_on_the_declaring_call() {
+    let mut lsp = Lsp::workspace();
+    lsp.write(
+        "defs/rules.star",
+        "def gqlgen(name = \"gqlgen\"):\n    return target(\n        name = name,\n        driver = \"exec\",\n        scratch = [target(name = \"_\" + name + \"_cache\", driver = \"exec\")],\n    )\n",
+    );
+    lsp.write(
+        "tools/heph/BUILD",
+        "load(\"//defs/rules.star\", \"gqlgen\")\n\ndef tool(name):\n    return target(name = name, driver = \"exec\", cmd = \"true\")\n\ntool(\"go\")\ntool(\"gofumpt\")\n\ngqlgen()\n",
+    );
+    for (addr, line) in [
+        ("//tools/heph:g│o", 5),
+        ("//tools/heph:gof│umpt", 6),
+        ("//tools/heph:gql│gen", 8),
+        ("//tools/heph:_gqlgen_c│ache", 8),
+    ] {
+        let doc = lsp.open(
+            "user/BUILD",
+            &format!("def g():\n    return target(name = \"x\", tools = [\"{addr}\"])\n"),
+        );
+        let found = targets(&lsp.definition(&doc));
+        assert_eq!(found, vec![(lsp.uri("tools/heph/BUILD"), line)], "{addr}");
+    }
+
+    // `:name` in the open document, declared by a helper the document defines.
+    let doc = lsp.open(
+        "here/BUILD",
+        "def tool(name):\n    return target(name = name, driver = \"exec\", deps = [\":t│wo\"])\n\ntool(\"one\")\ntool(\"two\")\n",
+    );
+    let found = targets(&lsp.definition(&doc));
+    assert_eq!(found, vec![(lsp.uri("here/BUILD"), 4)], "relative");
+}
+
+/// A package that does not evaluate still answers from its tokens: the
+/// `name = "…"` line, then the BUILD file itself.
+#[test]
+fn definition_on_an_address_in_a_package_that_fails_to_evaluate() {
+    let mut lsp = Lsp::start();
+    lsp.write(
+        "broken/BUILD",
+        "fail(\"boom\")\ntarget(name = \"util\", driver = \"exec\")\ntool(\"go\")\n",
+    );
+    for (addr, line) in [("//broken:ut│il", 1), ("//broken:g│o", 0)] {
+        let doc = lsp.open("user/BUILD", &format!("x = [\"{addr}\"]\n"));
+        let found = targets(&lsp.definition(&doc));
+        assert_eq!(found, vec![(lsp.uri("broken/BUILD"), line)], "{addr}");
+    }
+}
+
 #[test]
 fn definition_on_load_symbol_lands_on_the_def_line() {
     let mut lsp = Lsp::start();
