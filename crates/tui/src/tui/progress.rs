@@ -4958,9 +4958,16 @@ mod tests {
             cancelled: false,
         };
         assert_eq!(
-            ci_live_log(10, &[timed_out]),
+            ci_live_log(10, std::slice::from_ref(&timed_out)),
             "ERROR ✗ //e2e:it · timed out after 10m (its timeout)\
              \n  │ ared\
+             \n  │ bell\
+             \n  │ 20%\n",
+        );
+        // A timeout's tail is held to --log-lines like any failure's.
+        assert_eq!(
+            ci_live_log(2, &[timed_out]),
+            "ERROR ✗ //e2e:it · timed out after 10m (its timeout)\
              \n  │ bell\
              \n  │ 20%\n",
         );

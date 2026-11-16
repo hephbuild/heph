@@ -932,7 +932,8 @@ async fn a_process_past_its_timeout_times_out_after_a_slow_preparation() -> anyh
 }
 
 /// The `ResultEnd` of `addr`'s timed-out run: its typed timeout and the log
-/// tail it carries.
+/// tail it carries. It is a root failure, not a stop: the CI view prints
+/// nothing live for a stop.
 fn timed_out_end(
     events: &[BuildEvent],
     addr: &str,
@@ -947,8 +948,14 @@ fn timed_out_end(
                 addr: a,
                 timed_out,
                 log_tail,
+                upstream_of,
+                cancelled,
                 ..
-            } if a == addr => Some((timed_out.clone(), log_tail.clone())),
+            } if a == addr => {
+                assert_eq!(upstream_of, &None, "{addr} is the root");
+                assert!(!cancelled, "{addr} timed out, it was not stopped");
+                Some((timed_out.clone(), log_tail.clone()))
+            }
             _ => None,
         })
         .collect();
