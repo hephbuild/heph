@@ -1100,8 +1100,9 @@ pub(crate) fn definition(site: &Site, ctx: &Ctx<'_>) -> Option<Vec<LocationLink>
     }
 }
 
-/// `//pkg:name` → the line of the target's `name = "name"` in the package's
-/// BUILD files; `//pkg` → the BUILD file; `:name` → this package.
+/// `//pkg:name` → the line of the call that declared the target, from
+/// evaluating the package's BUILD files, else of its `name = "name"`;
+/// `//pkg` → the BUILD file; `:name` → this package.
 fn address_definition(value: &Str, ctx: &Ctx<'_>) -> Option<LocationLink> {
     let origin = ctx.range(&value.token);
     let literal = value.content.as_str();
@@ -1116,13 +1117,27 @@ fn address_definition(value: &Str, ctx: &Ctx<'_>) -> Option<LocationLink> {
     let dir = ctx.shared.root.join(&pkg);
     let files = package_build_files(&dir, &ctx.shared.patterns);
     if let Some(name) = name {
-        for file in &files {
-            // The open document's text wins over the file on disk.
-            let text = match (ctx.path(), file) {
-                (Some(open), f) if open == f.as_path() => Some(ctx.text.to_string()),
-                _ => std::fs::read_to_string(file).ok(),
-            };
-            if let Some(line) = text.as_deref().and_then(|t| target_line(t, name)) {
+        // The open document's text wins over the file on disk.
+        let texts: Vec<(&PathBuf, String)> = files
+            .iter()
+            .filter_map(|file| {
+                let text = match ctx.path() {
+                    Some(open) if open == file.as_path() => Some(ctx.text.to_string()),
+                    _ => std::fs::read_to_string(file).ok(),
+                }?;
+                Some((file, text))
+            })
+            .collect();
+        // The call that declared it, from evaluation: it finds a target a
+        // helper declares (`tool("go")`) or whose name is computed.
+        for (file, text) in &texts {
+            if let Some(line) = ctx.listing.declaring_line(file, text.clone(), &pkg, name) {
+                return link(origin, file, line);
+            }
+        }
+        // A file that does not evaluate still answers from its tokens.
+        for (file, text) in &texts {
+            if let Some(line) = target_line(text, name) {
                 return link(origin, file, line);
             }
         }

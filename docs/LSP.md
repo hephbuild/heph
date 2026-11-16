@@ -58,13 +58,22 @@ start; until that snapshot lands, heph answers with the stock results and
 | `arg_key` | a keyword-name position inside a call to any other plain-named function (`my_rule(`, `glob(`; not `x.f(`, not a `def`'s parameters) | the callee's unwritten parameters, each inserting `name = `, ranked first; then stock (see below) | stock | stock |
 | `plugin_namespace` | after `heph.` | plugins and `core` | — | — |
 | `plugin_member` | after `heph.<plugin>.`, or on the function name | the plugin's functions | the function's signature and doc | — |
-| `address` | a string starting `//` or `:`, inside a call or not | packages, then targets, both forms | — | the target's line, or the package's BUILD file |
+| `address` | a string starting `//` or `:`, inside a call or not | packages, then targets, both forms | — | the call that declared the target (see below), or the package's BUILD file |
 | `load_path` | the first argument of `load(` | package paths | — | the loaded file |
 | `load_symbol` | a later string argument of `load(` | the loaded file's exported `def`s | — | the `def` line, from the loaded file's AST |
 | `none` | anything else | stock | stock, plus the evaluation's "Targets" block | stock, plus a loaded name's `def` across the package's files |
 
 `—` means heph answers with nothing there (an empty list, a null hover), not
 the stock answer.
+
+An address's definition evaluates the package's BUILD files (the open
+document's text wins over the file on disk) and lands on the outermost call
+in that file that declared the target. That is `tool("go")` for a target a
+helper declares, including one loaded from another file or one whose name
+the helper computes, and the `target(` call for a direct one. Evaluation
+only enriches the answer. In a package that does not evaluate, the
+definition falls back to the line of the target's `name = "…"`, read from the
+tokens, and then to the BUILD file.
 
 ## The merge policy
 
