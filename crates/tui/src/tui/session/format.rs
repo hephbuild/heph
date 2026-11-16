@@ -19,7 +19,7 @@
 use std::fmt;
 
 use hcore::events::{BuildEvent, BuildEventKind};
-pub use hcore::session_record::{CAPABILITY_RUN_LOGS, RunLogRecord};
+pub use hcore::session_record::RunLogRecord;
 use serde::{Deserialize, Serialize};
 
 use super::id::SessionId;

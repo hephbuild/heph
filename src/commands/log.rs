@@ -27,8 +27,8 @@ use crate::commands::completion::complete_target_addr;
 use crate::engine::log_api::TAIL_MAX;
 use crate::engine::request_state::RequestState;
 use crate::engine::{
-    Engine, FollowStep, LogFollower, LogInfo, LogOptions, LogSource, LogUnavailable, NoLiveLogs,
-    NoOutputYet, OpenLog,
+    Engine, FollowStep, LogFollower, LogInfo, LogOptions, LogSource, LogUnavailable, NoOutputYet,
+    OpenLog,
 };
 use crate::htaddr::{self, Addr};
 use crate::tui::session::format::files;
@@ -191,16 +191,6 @@ where
                     &format!(
                         "heph: no output yet for {addr}: running {} and nothing written; heph log -f {addr} follows it",
                         running_where(e)
-                    ),
-                );
-                return Ok(Shown::Nothing);
-            }
-            if let Some(e) = e.downcast_ref::<NoLiveLogs>() {
-                say(
-                    &mut err,
-                    &format!(
-                        "heph: no log for {addr}: session {} runs a heph that records no live logs; read it in that session's terminal, or upgrade that heph",
-                        e.session
                     ),
                 );
                 return Ok(Shown::Nothing);
@@ -728,8 +718,6 @@ fn log_error(e: &anyhow::Error) -> crate::tui::dashboard::LogOpened {
     use crate::tui::dashboard::LogOpened;
     if let Some(e) = e.downcast_ref::<LogUnavailable>() {
         LogOpened::Unavailable(e.to_string())
-    } else if let Some(e) = e.downcast_ref::<NoLiveLogs>() {
-        LogOpened::Nothing(e.to_string())
     } else {
         LogOpened::Unavailable(format!("log unavailable: {e:#}"))
     }

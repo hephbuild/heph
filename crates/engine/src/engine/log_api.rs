@@ -180,15 +180,6 @@ impl OpenLog {
     }
 }
 
-/// No log of the address is held, and a live session of this workspace runs
-/// a heph that records no live logs: it may be running the address unseen.
-/// The UI says "records no live logs".
-#[derive(Debug, thiserror::Error)]
-#[error("no log; session {session} runs a heph that records no live logs")]
-pub struct NoLiveLogs {
-    pub session: String,
-}
-
 /// The address is running and has written nothing yet: there is no log to
 /// open, and following it waits for its first byte. The UI says
 /// "running · no output yet".
@@ -271,9 +262,6 @@ enum Latest {
     /// Running, in this engine or another session, nothing written yet.
     Started(NoOutputYet),
     Stored(Stored),
-    /// Nothing, and the locator named a live session that records no live
-    /// logs.
-    Unsupported(String),
     None,
 }
 
@@ -316,7 +304,6 @@ impl Engine {
         match latest {
             Latest::None => Ok(None),
             Latest::Started(started) => Err(started.into()),
-            Latest::Unsupported(session) => Err(NoLiveLogs { session }.into()),
             Latest::Running(run) => Ok(Some(OpenLog::plain(
                 LogInfo {
                     source: LogSource::Live {
@@ -342,9 +329,7 @@ impl Engine {
     /// end. When none is going on, `wait_for_start` waits for the next one
     /// (or for a newer finished log to appear); otherwise the newest
     /// finished log is read through once. `Ok(None)` when there is nothing
-    /// to read and nothing to wait for; [`NoLiveLogs`] when there is nothing
-    /// and a heph that records no live logs is running on this workspace,
-    /// waiting or not, since a run there would never be seen.
+    /// to read and nothing to wait for.
     pub async fn follow_log(
         self: &Arc<Self>,
         addr: &Addr,
@@ -361,7 +346,6 @@ impl Engine {
                 baseline: Some(started.at_unix_ms),
                 started: Some(started),
             },
-            Latest::Unsupported(session) => return Err(NoLiveLogs { session }.into()),
             Latest::Stored(stored) if wait_for_start => Follow::Waiting {
                 baseline: Some(stored.at_unix_ms()),
                 started: None,
@@ -448,7 +432,6 @@ impl Engine {
                 at_unix_ms: run.at_unix_ms,
             }));
         }
-        let mut unsupported = None;
         if let Some(locator) = locator {
             match locator
                 .locate(&self.home, &addr.format())
@@ -486,7 +469,6 @@ impl Engine {
                         at_unix_ms,
                     }));
                 }
-                Some(LocatedRunLog::Unsupported { session }) => unsupported = Some(session),
                 // Ended: what replaced it is among the stored sources.
                 _ => {}
             }
@@ -506,11 +488,7 @@ impl Engine {
         if let Some(entry) = self.newest_cached_log(addr, hashin)? {
             consider(entry);
         }
-        Ok(match (newest, unsupported) {
-            (Some(stored), _) => Latest::Stored(stored),
-            (None, Some(session)) => Latest::Unsupported(session),
-            (None, None) => Latest::None,
-        })
+        Ok(newest.map_or(Latest::None, Latest::Stored))
     }
 
     /// The newest local cache entry of `addr` that keeps a `Log`, or the one

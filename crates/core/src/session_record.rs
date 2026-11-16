@@ -18,11 +18,6 @@ use std::path::Path;
 /// (`<home>/runs/<engine-id>/<n>.log`).
 pub const RUNS_DIR: &str = "runs";
 
-/// The capability a session's `meta.json` lists when its heph records
-/// [`RunLogRecord`]s, so a reader tells "that heph records no logs" from
-/// "this target has no log".
-pub const CAPABILITY_RUN_LOGS: &str = "run_logs";
-
 /// A run's live log came into being: `addr` is running at `hashin`, and its
 /// output is being appended to `file`.
 ///
@@ -95,28 +90,21 @@ pub enum LocatedRunLog {
     },
     /// The addr is running in `session`, which records run logs, and has
     /// written nothing yet: no live file, no record. Its first byte makes it
-    /// [`Self::Live`]. Beats [`Self::Unsupported`]: a run seen going on is
-    /// never "records no live logs" because another heph is.
+    /// [`Self::Live`].
     Started {
         /// When its `ExecuteStart` was recorded, in milliseconds since the
         /// epoch.
         at_unix_ms: u64,
         session: String,
     },
-    /// No live session recorded a log of the addr, but `session`, a live
-    /// session of this workspace, runs a heph that records no live logs: it
-    /// may be running the addr unseen. Answered only when nothing better was
-    /// found; the UI says "records no live logs".
-    Unsupported { session: String },
 }
 
 impl LocatedRunLog {
-    /// The record found; `None` for [`Self::Started`] and
-    /// [`Self::Unsupported`].
+    /// The record found; `None` for [`Self::Started`].
     pub fn record(&self) -> Option<&RunLogRecord> {
         match self {
             Self::Live { record, .. } | Self::Ended { record, .. } => Some(record),
-            Self::Started { .. } | Self::Unsupported { .. } => None,
+            Self::Started { .. } => None,
         }
     }
 }

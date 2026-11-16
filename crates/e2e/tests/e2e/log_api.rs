@@ -11,8 +11,8 @@
 use crate::common::{build_engine, drain, run_drain};
 use hcore::events::BuildEventKind;
 use heph::engine::{
-    Engine, FollowStep, LogFollower, LogOptions, LogSource, LogUnavailable, NoLiveLogs,
-    NoOutputYet, OpenLog, OutputMatcher, ResultOptions,
+    Engine, FollowStep, LogFollower, LogOptions, LogSource, LogUnavailable, NoOutputYet, OpenLog,
+    OutputMatcher, ResultOptions,
 };
 use heph::hartifactcontent::WalkEntryKind;
 use heph::htaddr::parse_addr;
@@ -626,8 +626,7 @@ fn append_record(dir: &Path, record: &SessionRecord) {
 /// session. The second follows a run in the first to its end through the
 /// first's `RunLog` record; a record left by a killed process (lock free)
 /// reads as absent; a session whose `meta.json` names another workspace is
-/// ignored; a session from a heph without the `run_logs` capability reads
-/// "records no live logs".
+/// ignored; a live session that recorded no `RunLog` reads as no log.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn log_follow_across_engines() -> anyhow::Result<()> {
     let ws = tempfile::tempdir()?;
@@ -729,32 +728,22 @@ async fn log_follow_across_engines() -> anyhow::Result<()> {
     }
     assert_eq!(open(&b, "//p:elsewhere", &located).await?, None);
 
-    // A live session of this workspace from a heph that records no live logs.
+    // A live session of this workspace that recorded no `RunLog` (an older
+    // heph's): nothing of it is followed, and no log reads as no log.
     let old = copy_session(&dir_a, &sessions, SessionId::new(1_700_000_000_001, 8));
-    let meta_path = old.join(heph::tui::session::files::META);
-    let mut meta: serde_json::Value = serde_json::from_slice(&std::fs::read(&meta_path)?)?;
-    meta["capabilities"] = serde_json::json!([]);
-    std::fs::write(&meta_path, serde_json::to_vec(&meta)?)?;
     let held = hold_lock(&old);
-    let err = b
-        .open_log(&parse_addr("//p:never")?, &located)
-        .await
-        .expect_err("records no live logs");
-    let no = err.downcast_ref::<NoLiveLogs>().expect("NoLiveLogs");
-    assert_eq!(no.session, SessionId::new(1_700_000_000_001, 8).encode());
-    assert!(err.to_string().contains("records no live logs"), "{err}");
+    assert_eq!(open(&b, "//p:never", &located).await?, None);
     assert!(
-        b.follow_log(&parse_addr("//p:never")?, &located, true)
-            .await
-            .is_err_and(|e| e.is::<NoLiveLogs>())
+        b.follow_log(&parse_addr("//p:never")?, &located, false)
+            .await?
+            .is_none()
     );
-    // A log heph holds still wins over it.
+    // A log heph holds is read beside it.
     assert_eq!(
         open(&b, "//p:g", &located).await?,
         Some((LogSource::Cache { remote: false }, "one\ntwo\n".into()))
     );
-    // So does a run going on in A that has written nothing yet: "no output
-    // yet", never "records no live logs".
+    // A run going on in A that has written nothing yet: "no output yet".
     let quiet = parse_addr("//p:quiet")?;
     let execute = |kind| SessionRecord {
         at_unix_ms: hcore::events::now_unix_ms(),
@@ -781,7 +770,7 @@ async fn log_follow_across_engines() -> anyhow::Result<()> {
     let yet = err.downcast_ref::<NoOutputYet>().expect("NoOutputYet");
     assert_eq!(yet.session, Some(id_a.encode()));
     // The dashboard's Log tab follows it: the pane says "no output yet",
-    // never "records no live logs" nor "unavailable".
+    // never "unavailable".
     let screen = heph::commands::log::EngineTargetReader::with_locator(
         Arc::clone(&b),
         tokio::runtime::Handle::current(),
@@ -823,11 +812,10 @@ async fn log_follow_across_engines() -> anyhow::Result<()> {
     let mut got = Vec::new();
     assert!(poll_until(&mut f, &mut got, |_| false).await);
     assert!(got.is_empty());
-    assert!(
-        b.open_log(&quiet, &located)
-            .await
-            .is_err_and(|e| e.is::<NoLiveLogs>()),
-        "the run over, the old heph is all that is left"
+    assert_eq!(
+        open(&b, "//p:quiet", &located).await?,
+        None,
+        "the run over without a byte, there is no log"
     );
     drop(held);
     assert_eq!(open(&b, "//p:never", &located).await?, None);

@@ -194,8 +194,9 @@ so `attach` draws it (see [Attach](#attach)):
 
 `RunLog {addr, hashin, file}` says where a running target's live log is:
 `file` is relative to `meta.json`'s home (`runs/<id>/<n>.log`), written when
-the run's first byte creates it, and past the cap. `meta.json` lists the
-`run_logs` capability. A reader (`tui::session::find_run_log`) trusts it
+the run's first byte creates it, and past the cap. A session with no
+`RunLog` of an addr (a heph from before them, say) simply has no live log
+of it. A reader (`tui::session::find_run_log`) trusts it
 only for a session whose `meta.json` names its own home, while that
 session's lock is held and no `ExecuteEnd` for the addr follows it; a file
 gone under such a record means the run ended. `file` must be
