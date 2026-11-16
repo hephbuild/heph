@@ -461,13 +461,19 @@ fn describe_tool_group(group: &str) -> String {
     }
 }
 
+/// `HEPH_TOOLS_DIR`: the directory every tool of a target is staged under. A
+/// tool sits at `<its package>/<its path>` below it whatever group a consumer
+/// lists it in, so a launcher script can name the files shipped beside it.
+pub(crate) const TOOLS_DIR_KEY: &str = "HEPH_TOOLS_DIR";
+
 /// Refuse a target whose `$TOOL_<G>_ROOT` would be ambiguous, at parse rather
 /// than at run, so `heph query`/`inspect` report it too. Two rules:
 ///
 /// - a group's root variable is another group's `TOOL_<G>` (`tools = {"": …,
 ///   "root": …}` both claim `TOOL_ROOT`): either value would replace the other;
 /// - a name the target sets (`declared`: `(what sets it, name)`) is a group's
-///   root variable: heph's value would silently win over it.
+///   root variable or [`TOOLS_DIR_KEY`]: heph's value would silently win over
+///   it.
 ///
 /// `"*"` in `declared` is a passthrough wildcard, not a name, and is ignored.
 /// Free for a target with no tool group: `declared` is only built when there is
@@ -507,9 +513,24 @@ where
     let first = declared()
         .into_iter()
         .filter(|(_, name)| *name != "*")
-        .filter_map(|(source, name)| by_root_key.get(name).map(|group| (name, source, *group)))
+        .filter_map(|(source, name)| {
+            if name == TOOLS_DIR_KEY {
+                return Some((name, source, None));
+            }
+            by_root_key
+                .get(name)
+                .map(|group| (name, source, Some(*group)))
+        })
         .min();
     if let Some((name, source, group)) = first {
+        let Some(group) = group else {
+            anyhow::bail!(
+                "{}: `{name}` is set by {source}, but heph sets it to the directory this \
+                 target's tools are staged under, so that value would be replaced. Drop the \
+                 `{name}` entry or stop passing it",
+                addr.format(),
+            );
+        };
         anyhow::bail!(
             "{}: `{name}` is set by {source}, but it is the staged root heph sets for tool {} \
              (`tools = {{{group:?}: …}}`), so that value would be replaced. {SPELLING}; the \
@@ -2229,6 +2250,9 @@ impl Driver {
 
         // `$TOOL_<G>_ROOT` per group, set into `env` once passthrough is applied.
         let mut tool_roots: BTreeMap<String, std::collections::BTreeSet<PathBuf>> = BTreeMap::new();
+        // `$HEPH_TOOLS_DIR`: the tree every tool is staged into. Every tool
+        // input carries the same `unpack_root`, so any member's is the one.
+        let mut tools_dir: Option<PathBuf> = None;
         let tool_bin_dir = if !def.tool_group_inputs.is_empty() {
             let bin_dir = req.sandbox_dir.join("bin");
             std::fs::create_dir_all(&bin_dir)
@@ -2282,6 +2306,9 @@ impl Driver {
                     let Some(m) = members.next() else {
                         continue;
                     };
+                    if tools_dir.is_none() {
+                        tools_dir = Some(m.unpack_root.clone());
+                    }
                     // Each member's package directory, kept (below) only when a
                     // staged file is under it. A workspace source file
                     // (`@heph/fs`), a host binary (`__heph/hostbin/`) or a
@@ -2410,6 +2437,21 @@ impl Driver {
                 value.push_str(root);
             }
             env.insert(key, value);
+        }
+        // Heph's name for a target with tools, as the roots are: a target
+        // without tools is not checked at parse, so its own value stands.
+        match tools_dir {
+            Some(dir) => {
+                let dir = dir.into_os_string().into_string().map_err(|dir| {
+                    anyhow::anyhow!("tools directory is not valid UTF-8: {dir:?}")
+                })?;
+                env.insert(TOOLS_DIR_KEY.to_string(), dir);
+            }
+            None if !def.tool_group_inputs.is_empty() => {
+                env.remove(TOOLS_DIR_KEY);
+                unset_tool_roots.push(TOOLS_DIR_KEY.to_string());
+            }
+            None => {}
         }
 
         // Scratch caches: each declaration names the variable its tool reads the
@@ -2562,8 +2604,9 @@ impl Driver {
         let env_vec = filterenv::filter_long_env(env_vec, &argv_for_filter, &credential_env_names)?;
         // The run's own layers sit on the caller's base env, which is neither
         // filtered nor converted: it reaches the process byte for byte (E6),
-        // except a `TOOL_<G>_ROOT` heph leaves unset for this run's tools: heph
-        // owns those names, so the caller's value must not stand in for one.
+        // except a `TOOL_<G>_ROOT` (or `HEPH_TOOLS_DIR`) heph leaves unset for
+        // this run's tools: heph owns those names, so the caller's value must
+        // not stand in for one.
         let has_base_env = options.base_env.is_some();
         let mut base_env = options.base_env.unwrap_or_default();
         if !unset_tool_roots.is_empty() {
@@ -3453,6 +3496,18 @@ mod tests {
             ],
         )
         .expect("no root claimed");
+        // `HEPH_TOOLS_DIR` is heph's for any target with tools, named group or not.
+        for groups in [&[""][..], &["greeter"]] {
+            let err = check(groups, &[(SET_BY_PASS_ENV, "HEPH_TOOLS_DIR")])
+                .expect_err("declared tools dir")
+                .to_string();
+            assert!(
+                err.contains("`HEPH_TOOLS_DIR` is set by the host through `pass_env`"),
+                "{err}"
+            );
+            assert!(err.contains("//p:t"), "{err}");
+        }
+        check(&["sdk"], &[(SET_BY_ENV, "HEPH_TOOLS_DIRS")]).expect("near miss is a name");
         // Several violations: the first by name, whatever order they came in.
         for declared in [
             [(SET_BY_ENV, "TOOL_B_ROOT"), (SET_BY_ENV, "TOOL_A_ROOT")],

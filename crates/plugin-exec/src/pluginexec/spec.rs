@@ -105,6 +105,17 @@ pub(crate) struct TargetSpec {
     /// embed it, strip it with a prefix-map flag (`-ffile-prefix-map`,
     /// `-trimpath`) to keep them reproducible.
     ///
+    /// `$HEPH_TOOLS_DIR` is the directory every tool of the target is staged
+    /// under, set whenever the target has tools. A tool always sits at `<its
+    /// package>/<its path>` below it, whichever group it is listed in and
+    /// whatever else that group holds, so it is the variable for a tool that
+    /// is a launcher script finding the files shipped beside it: a tool in
+    /// `cli/` with `support_files = "lib/"` reads `$HEPH_TOOLS_DIR/cli/lib`.
+    /// The tool's tools, through its `transitive` tools, are staged in the
+    /// same tree. Nothing checks the path before the run. Like the roots, the
+    /// value is absolute, machine-specific and not hashed, and setting it
+    /// yourself is refused at parse, by the same rules.
+    ///
     /// Refused at parse: a group whose root variable is another group's
     /// `$TOOL_<group>` (`{"": …, "root": …}` both reach `TOOL_ROOT`; names are
     /// uppercased and every character outside `[A-Z0-9_]` becomes `_`), and a
