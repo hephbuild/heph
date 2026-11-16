@@ -56,7 +56,7 @@ pub type Writer<'io> = &'io mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin
 
 /// Which of a child's streams are the run's log.
 ///
-/// A stream left out is the process's data: [`RunLog::pump`] hands it to the
+/// A stream left out is the process's data: [`RunLog::drive`] hands it to the
 /// caller's observer and writes it nowhere else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Streams {
@@ -216,7 +216,10 @@ impl<'io> RunLog<'io> {
     /// more to reach EOF, after which they are abandoned with a warning — a
     /// descendant that inherited the pipe (an ssh `ControlPersist` master, a
     /// shell's background job) would otherwise hold the run open for as long as
-    /// it lives. A cancelled wait skips the drain altogether.
+    /// it lives. The deadline counts only time spent waiting for output, not
+    /// time spent writing it to the log. A wait that ends in cancellation (or
+    /// fails) skips the drain altogether; one that returned a status always
+    /// drains, even if the token was cancelled after the reap.
     ///
     /// A read error on a log stream is warned and the other stream is still
     /// read (stopping would SIGPIPE the child). One on a data stream fails the
@@ -239,7 +242,7 @@ impl<'io> RunLog<'io> {
         let wait = handle.spawn_wait(ctoken.clone_arc());
         match reader {
             Some(mut reader) => {
-                self.drive_chunks(&mut reader, wait, streams, ctoken, &mut observe)
+                self.drive_chunks(&mut reader, wait, streams, &mut observe)
                     .await
             }
             None => wait.await.context("wait task for the child"),
@@ -248,12 +251,17 @@ impl<'io> RunLog<'io> {
 
     /// [`drive`](Self::drive) over any chunk source and wait, so the drain's
     /// bound and its error handling are testable without a real pipe.
+    ///
+    /// Whether to drain after the reap is decided by the wait's result, never
+    /// by the token: a cancel that lands after the wait returned a status must
+    /// not cut the answer short. The deadline bounds the time spent waiting for
+    /// the next chunk, not writing one to the log, so a slow writer cannot cost
+    /// the data stream either.
     async fn drive_chunks(
         &mut self,
         chunks: &mut impl Chunks,
         wait: impl Future<Output = Result<std::io::Result<ExitStatus>, tokio::task::JoinError>>,
         streams: Streams,
-        ctoken: &(dyn Cancellable + Send + Sync),
         observe: &mut impl FnMut(StreamId, &[u8]),
     ) -> anyhow::Result<std::io::Result<ExitStatus>> {
         let mut reds = Redactors {
@@ -261,29 +269,62 @@ impl<'io> RunLog<'io> {
             err: self.redactor(),
         };
         let mut data_error = None;
-        let (status, abandoned) = {
-            let pumped = self.pump_chunks(chunks, streams, observe, &mut reds, &mut data_error);
-            let mut pumped = std::pin::pin!(pumped);
-            let mut wait = std::pin::pin!(wait);
-            let mut drained = false;
-            let status = tokio::select! {
-                status = &mut wait => status,
-                () = &mut pumped => {
-                    drained = true;
-                    wait.await
+        let mut wait = std::pin::pin!(wait);
+        let mut status = None;
+        // What is left of the drain deadline once the child is reaped.
+        let mut budget = proc_exec::DRAIN_DEADLINE;
+        let mut abandoned = false;
+        loop {
+            let next = match &status {
+                // `next_chunk` is cancel-safe on both OSes, so the wait winning
+                // the race loses no chunk.
+                None => tokio::select! {
+                    s = &mut wait => {
+                        status = Some(s);
+                        continue;
+                    }
+                    next = chunks.next_chunk() => next,
+                },
+                // The child is reaped: anything it wrote is read or sitting in
+                // the pipe, so EOF is moments away unless a descendant holds the
+                // write end. `timeout` polls the read before the delay, so what
+                // is already available is read even once the budget is spent.
+                Some(Ok(Ok(_))) => {
+                    let started = std::time::Instant::now();
+                    match tokio::time::timeout(budget, chunks.next_chunk()).await {
+                        Ok(next) => {
+                            budget = budget.saturating_sub(started.elapsed());
+                            next
+                        }
+                        Err(_) => {
+                            abandoned = true;
+                            break;
+                        }
+                    }
                 }
+                // A wait that returned no status (a cancellation, a failed wait,
+                // a lost task) skips the drain, as in `proc_exec::output`, which
+                // keeps `tokio::time` off a cancelled run's teardown.
+                Some(_) => break,
             };
-            // The child is reaped: anything it wrote is read or sitting in the
-            // pipe, so EOF is moments away unless a descendant holds the write
-            // end. The timer is armed only when the run was not cancelled, as in
-            // `proc_exec::output`, which keeps `tokio::time` off a cancelled
-            // run's teardown.
-            if !drained && !ctoken.is_cancelled() {
-                drained = tokio::time::timeout(proc_exec::DRAIN_DEADLINE, &mut pumped)
-                    .await
-                    .is_ok();
+            match next {
+                Ok(Some((stream, chunk))) => {
+                    self.take_chunk(stream, &chunk, streams, observe, &mut reds)
+                        .await;
+                }
+                Ok(None) => break,
+                Err((stream, e)) if streams.includes(stream) => {
+                    tracing::warn!(error = %e, %stream, "stopped reading a child's log stream");
+                }
+                Err((stream, e)) => {
+                    tracing::debug!(error = %e, %stream, "a child's data stream failed to read");
+                    data_error.get_or_insert((stream, e));
+                }
             }
-            (status, !drained && !ctoken.is_cancelled())
+        }
+        let status = match status {
+            Some(status) => status,
+            None => wait.await,
         };
         if abandoned {
             tracing::warn!(
@@ -305,44 +346,28 @@ impl<'io> RunLog<'io> {
         Ok(status)
     }
 
-    /// Copy chunks to the log until both streams end (see [`drive`](Self::drive)
-    /// for which are written and what a read error does). Records the first
-    /// data-stream read error in `data_error`. Leaves the redactors' held-back
-    /// tails for [`flush`](Self::flush), so a drain cut short still writes them.
-    async fn pump_chunks(
+    /// Hand one chunk to `observe` and, when its stream is log, to the log.
+    /// Leaves the redactors' held-back tails for [`flush`](Self::flush), so a
+    /// drain cut short still writes them.
+    async fn take_chunk(
         &mut self,
-        chunks: &mut impl Chunks,
+        stream: StreamId,
+        chunk: &[u8],
         streams: Streams,
         observe: &mut impl FnMut(StreamId, &[u8]),
         reds: &mut Redactors,
-        data_error: &mut Option<ReadError>,
     ) {
-        loop {
-            let (stream, chunk) = match chunks.next_chunk().await {
-                Ok(Some(c)) => c,
-                Ok(None) => break,
-                Err((stream, e)) if streams.includes(stream) => {
-                    tracing::warn!(error = %e, %stream, "stopped reading a child's log stream");
-                    continue;
-                }
-                Err((stream, e)) => {
-                    tracing::debug!(error = %e, %stream, "a child's data stream failed to read");
-                    data_error.get_or_insert((stream, e));
-                    continue;
-                }
-            };
-            observe(stream, &chunk);
-            if !streams.includes(stream) {
-                continue;
-            }
-            let redactor = match stream {
-                StreamId::Stdout => reds.out.as_mut(),
-                StreamId::Stderr => reds.err.as_mut(),
-            };
-            let scrubbed = redactor.map(|r| r.push(&chunk));
-            self.emit(stream, scrubbed.as_deref().unwrap_or(&chunk))
-                .await;
+        observe(stream, chunk);
+        if !streams.includes(stream) {
+            return;
         }
+        let redactor = match stream {
+            StreamId::Stdout => reds.out.as_mut(),
+            StreamId::Stderr => reds.err.as_mut(),
+        };
+        let scrubbed = redactor.map(|r| r.push(chunk));
+        self.emit(stream, scrubbed.as_deref().unwrap_or(chunk))
+            .await;
     }
 
     /// Write the redactors' held-back tails.
@@ -525,6 +550,9 @@ mod tests {
     struct Script {
         items: std::collections::VecDeque<Result<(StreamId, Vec<u8>), ReadError>>,
         hang: bool,
+        /// Yield once before the first item, so a wait that is already
+        /// resolved wins the race and every item is still queued after it.
+        gated: bool,
     }
 
     impl Script {
@@ -539,12 +567,26 @@ mod tests {
                     Err(s) => Err((s, std::io::Error::other("injected read error"))),
                 })
                 .collect();
-            Self { items, hang }
+            Self {
+                items,
+                hang,
+                gated: false,
+            }
+        }
+
+        fn gated(self) -> Self {
+            Self {
+                gated: true,
+                ..self
+            }
         }
     }
 
     impl Chunks for Script {
         async fn next_chunk(&mut self) -> Result<Option<(StreamId, Vec<u8>)>, ReadError> {
+            if std::mem::take(&mut self.gated) {
+                tokio::task::yield_now().await;
+            }
             match self.items.pop_front() {
                 Some(item) => item.map(Some),
                 None if self.hang => std::future::pending().await,
@@ -564,7 +606,6 @@ mod tests {
         mut script: Script,
         streams: Streams,
         status: std::io::Result<ExitStatus>,
-        ctoken: &StdCancellationToken,
     ) -> (
         anyhow::Result<std::io::Result<ExitStatus>>,
         std::time::Duration,
@@ -577,7 +618,6 @@ mod tests {
                 &mut script,
                 std::future::ready(Ok(status)),
                 streams,
-                ctoken,
                 &mut |_, c: &[u8]| seen.extend_from_slice(c),
             )
             .await;
@@ -596,10 +636,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("log.txt");
         let mut log = RunLog::own_file(None, None, path.clone(), Needles::new(["s3cr3t-x"]));
-        let ctoken = StdCancellationToken::new();
         let script = Script::new([Ok((StreamId::Stderr, "before s3cr"))], true);
         let (res, took, seen) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            drive_scripted(&mut log, script, Streams::BOTH, exited(0), &ctoken).await
+            drive_scripted(&mut log, script, Streams::BOTH, exited(0)).await
         })
         .await
         .expect("the drain after exit must be bounded");
@@ -611,13 +650,11 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).expect("log"), "before s3cr");
     }
 
-    /// A cancelled run skips the drain: the pipe a descendant holds is not
-    /// waited on at all.
+    /// A wait that ended in cancellation skips the drain: the pipe a
+    /// descendant holds is not waited on at all.
     #[tokio::test]
     async fn drive_skips_the_drain_on_cancel() {
         let mut log = RunLog::captured(None, None);
-        let ctoken = StdCancellationToken::new();
-        ctoken.cancel();
         let script = Script::new([Ok((StreamId::Stdout, "partial"))], true);
         let (res, took, _) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
             drive_scripted(
@@ -625,7 +662,6 @@ mod tests {
                 script,
                 Streams::STDERR,
                 Err(std::io::Error::other("cancelled")),
-                &ctoken,
             )
             .await
         })
@@ -636,6 +672,100 @@ mod tests {
             "the wait's cancellation is the caller's"
         );
         assert!(took < proc_exec::DRAIN_DEADLINE, "took {took:?}");
+    }
+
+    /// A cancel that lands after the child was reaped does not skip the drain:
+    /// the wait returned a status, so every chunk still queued is read. Skipping
+    /// on the token returned `Ok` with a truncated answer.
+    #[tokio::test]
+    async fn a_cancel_after_the_reap_still_drains() {
+        let mut log = RunLog::captured(None, None);
+        let ctoken = StdCancellationToken::new();
+        let mut script = Script::new(
+            [
+                Ok((StreamId::Stdout, "KEY=a\0")),
+                Ok((StreamId::Stdout, "LAST=b\0")),
+            ],
+            false,
+        )
+        .gated();
+        let mut seen = Vec::new();
+        let wait = async {
+            ctoken.cancel();
+            Ok(exited(0))
+        };
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            log.drive_chunks(&mut script, wait, Streams::STDERR, &mut |_, c: &[u8]| {
+                seen.extend_from_slice(c)
+            }),
+        )
+        .await
+        .expect("the drain must end at EOF");
+        assert!(res.expect("drive").expect("wait").success());
+        assert_eq!(String::from_utf8_lossy(&seen), "KEY=a\0LAST=b\0");
+    }
+
+    /// A log writer that stalls for longer than the drain deadline does not
+    /// cost the data stream: the deadline bounds waiting for the next chunk,
+    /// not writing one to the log.
+    #[tokio::test]
+    async fn a_slow_log_writer_does_not_truncate_the_data_stream() {
+        let err_w = Shared::default();
+        let mut stall = Stall {
+            sleep: None,
+            armed: false,
+            out: err_w.clone(),
+        };
+        let mut log = RunLog::captured(None, Some(&mut stall));
+        let script = Script::new(
+            [
+                Ok((StreamId::Stderr, "progress\n")),
+                Ok((StreamId::Stdout, "answer-1 ")),
+                Ok((StreamId::Stdout, "answer-2")),
+            ],
+            false,
+        )
+        .gated();
+        let (res, _, seen) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            drive_scripted(&mut log, script, Streams::STDERR, exited(0)).await
+        })
+        .await
+        .expect("the drain must end at EOF");
+        assert!(res.expect("drive").expect("wait").success());
+        assert_eq!(seen, "progress\nanswer-1 answer-2");
+        drop(log);
+        assert_eq!(err_w.text(), "progress\n");
+    }
+
+    /// A writer whose first write stalls for twice the drain deadline.
+    struct Stall {
+        sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+        armed: bool,
+        out: Shared,
+    }
+
+    impl tokio::io::AsyncWrite for Stall {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if !std::mem::replace(&mut self.armed, true) {
+                self.sleep = Some(Box::pin(tokio::time::sleep(proc_exec::DRAIN_DEADLINE * 2)));
+            }
+            if let Some(sleep) = self.sleep.as_mut() {
+                std::task::ready!(sleep.as_mut().poll(cx));
+                self.sleep = None;
+            }
+            Pin::new(&mut self.out).poll_write(cx, buf)
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
     }
 
     /// A real child that exits while a background job holds its stdout
@@ -705,7 +835,6 @@ mod tests {
     /// truncated — while one on a log stream is only warned.
     #[tokio::test]
     async fn a_data_stream_read_error_fails_and_a_log_one_does_not() {
-        let ctoken = StdCancellationToken::new();
         let err_w = Shared::default();
         let mut e = err_w.clone();
         let mut log = RunLog::captured(None, Some(&mut e));
@@ -717,8 +846,7 @@ mod tests {
             ],
             false,
         );
-        let (res, _, _) =
-            drive_scripted(&mut log, script, Streams::STDERR, exited(0), &ctoken).await;
+        let (res, _, _) = drive_scripted(&mut log, script, Streams::STDERR, exited(0)).await;
         let err = res.expect_err("a truncated data stream must not pass for a whole one");
         assert!(format!("{err:#}").contains("stdout"), "{err:#}");
         assert!(
@@ -734,8 +862,7 @@ mod tests {
             ],
             false,
         );
-        let (res, _, seen) =
-            drive_scripted(&mut log, script, Streams::STDERR, exited(0), &ctoken).await;
+        let (res, _, seen) = drive_scripted(&mut log, script, Streams::STDERR, exited(0)).await;
         assert!(
             res.expect("a log stream's read error is a warning")
                 .expect("wait")
@@ -893,8 +1020,7 @@ mod tests {
             ],
             false,
         );
-        let ctoken = StdCancellationToken::new();
-        let (res, _, _) = drive_scripted(&mut log, script, Streams::BOTH, exited(0), &ctoken).await;
+        let (res, _, _) = drive_scripted(&mut log, script, Streams::BOTH, exited(0)).await;
         assert!(res.expect("drive").expect("wait").success());
         log.write(StreamId::Stderr, format!(" {secret}\n").as_bytes())
             .await;
@@ -928,6 +1054,7 @@ mod tests {
         Script {
             items: items.iter().map(|(s, b)| Ok((*s, b.to_vec()))).collect(),
             hang: false,
+            gated: false,
         }
     }
 
@@ -949,9 +1076,7 @@ mod tests {
             ],
             false,
         );
-        let ctoken = StdCancellationToken::new();
-        let (res, _, seen) =
-            drive_scripted(&mut log, script, Streams::BOTH, exited(0), &ctoken).await;
+        let (res, _, seen) = drive_scripted(&mut log, script, Streams::BOTH, exited(0)).await;
         assert!(res.expect("drive").expect("wait").success());
         assert_eq!(seen, "a\nb\nc");
         log.write(StreamId::Stderr, b"d").await;
@@ -971,13 +1096,11 @@ mod tests {
             (StreamId::Stderr, b"\xa9\n"),
         ];
         let want: &[u8] = b"\xff\xfe bad\ncaf\xc3\xa9\n";
-        let ctoken = StdCancellationToken::new();
 
         let sink = Shared::default();
         let mut s = sink.clone();
         let mut log = RunLog::captured(None, Some(&mut s));
-        let (res, _, _) =
-            drive_scripted(&mut log, raw(&chunks), Streams::BOTH, exited(0), &ctoken).await;
+        let (res, _, _) = drive_scripted(&mut log, raw(&chunks), Streams::BOTH, exited(0)).await;
         assert!(res.expect("drive").expect("wait").success());
         drop(log);
         assert_eq!(sink.0.lock().expect("lock").as_slice(), want);
@@ -986,8 +1109,7 @@ mod tests {
         let path = dir.path().join("log.txt");
         let needles = Needles::new(["a-secret-that-never-appears"]);
         let mut log = RunLog::own_file(None, None, path.clone(), needles);
-        let (res, _, _) =
-            drive_scripted(&mut log, raw(&chunks), Streams::BOTH, exited(0), &ctoken).await;
+        let (res, _, _) = drive_scripted(&mut log, raw(&chunks), Streams::BOTH, exited(0)).await;
         assert!(res.expect("drive").expect("wait").success());
         drop(log);
         assert_eq!(std::fs::read(&path).expect("log"), want);
@@ -1002,9 +1124,7 @@ mod tests {
         let sink = Shared::default();
         let mut s = sink.clone();
         let mut log = RunLog::own_file(None, Some(&mut s), path.clone(), None);
-        let ctoken = StdCancellationToken::new();
-        let (res, _, seen) =
-            drive_scripted(&mut log, raw(&[]), Streams::BOTH, exited(0), &ctoken).await;
+        let (res, _, seen) = drive_scripted(&mut log, raw(&[]), Streams::BOTH, exited(0)).await;
         assert!(res.expect("drive").expect("wait").success());
         assert_eq!(seen, "");
         log.write(StreamId::Stderr, b"").await;
