@@ -166,11 +166,13 @@ mod tests {
             "",
             "  All 3    ▶ Running 0    ⧗ Pending 2    ✗ Failed 0    ✓ Done 1    ● Cached 0",
             "──━━━━━─────────────────────────────────────────────────────────────────────────",
-            "     TARGET                        PHASE              TIME LAST LINE",
+            // TARGET as wide as the longest address on screen; LAST LINE
+            // takes the rest.
+            "     TARGET    PHASE              TIME LAST LINE",
             // No line read yet: `–`, never a blank that reads as an empty log.
-            " ▸ ✓ //a:one                       done               0.0s –",
-            "   · //a:two                       pending",
-            "   · //b:three                     pending",
+            " ▸ ✓ //a:one   done               0.0s –",
+            "   · //a:two   pending",
+            "   · //b:three pending",
             "",
             "",
             "",

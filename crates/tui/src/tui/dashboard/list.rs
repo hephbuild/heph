@@ -577,12 +577,26 @@ struct Columns {
 /// `▸ ▶ ` before the target.
 const LEAD: usize = 5;
 
+/// The narrowest LAST LINE column worth drawing: under it, the column goes
+/// and TARGET takes its room.
+const MIN_LAST: usize = 12;
+
 impl Columns {
-    fn of(cols: usize) -> Self {
+    /// TARGET sized to `longest`, the widest address on screen, and LAST
+    /// LINE the remainder. Past 60% of the width an address is cut while
+    /// LAST LINE keeps [`MIN_LAST`]; short of that, LAST LINE shrinks and
+    /// goes before any address is cut.
+    fn fit(cols: usize, longest: usize) -> Self {
         let phase = 18;
         let time = 6;
         let rest = cols.saturating_sub(LEAD + phase + time + 1);
-        let target = (rest / 2 + 4).clamp(rest.min(10), 45).min(rest);
+        let want = longest.max(width("TARGET"));
+        let cap = cols * 3 / 5;
+        let target = if want > cap && rest.saturating_sub(cap) >= MIN_LAST {
+            cap
+        } else {
+            want.min(rest)
+        };
         Self {
             target,
             phase,
@@ -708,30 +722,41 @@ pub fn list_lines(
     let rows = usize::from(rows);
     let body = rows.saturating_sub(3).max(usize::from(rows > 0));
     let len = st.settle(inp.model, body);
-    let c = Columns::of(cols);
-    let mut out = Vec::with_capacity(rows);
-    if rows > 1 {
-        out.push(Line::styled(
-            format!(
-                "{}{} {}{:>tw$} LAST LINE",
-                " ".repeat(LEAD),
-                pad("TARGET", c.target),
-                pad("PHASE", c.phase),
-                "TIME",
-                tw = c.time - 1,
-            ),
-            dim(),
-        ));
-    }
     st.visible.clear();
     for k in st.offset..(st.offset + body).min(len) {
         let Some(id) = st.row(inp.model, k) else {
             break;
         };
+        if inp.model.record(id).is_some() {
+            st.visible.push(id);
+        }
+    }
+    let longest = st
+        .visible
+        .iter()
+        .map(|&id| width(&clean_inline(inp.model.addr(id))))
+        .max()
+        .unwrap_or(0);
+    let c = Columns::fit(cols, longest);
+    let mut out = Vec::with_capacity(rows);
+    if rows > 1 {
+        out.push(Line::styled(
+            format!(
+                "{}{} {}{:>tw$} {}",
+                " ".repeat(LEAD),
+                pad("TARGET", c.target),
+                pad("PHASE", c.phase),
+                "TIME",
+                cut_right("LAST LINE", c.last.saturating_sub(1)),
+                tw = c.time - 1,
+            ),
+            dim(),
+        ));
+    }
+    for &id in &st.visible {
         let Some(r) = inp.model.record(id) else {
             continue;
         };
-        st.visible.push(id);
         let selected = st.selected == Some(id);
         if let Some(a) = st.approval_of(id) {
             out.push(approval_row(inp, a, st.glyph, selected, c));
@@ -962,6 +987,32 @@ mod tests {
             rows.get(2).is_some_and(|r| r.starts_with(" ▸ ")),
             "{rows:#?}"
         );
+
+        // TARGET has priority over LAST LINE: as the width narrows, LAST
+        // LINE shrinks, then goes, and only then is an address cut.
+        let long = "//crates/plugin-buildfile/src/lsp:analysis_test";
+        let m = model(&[long, "//a:b"]);
+        let lines = LastLines::default();
+        let mut st = ListState::default();
+        let chrome = LEAD + 18 + 6 + 1;
+        let full = chrome + width(long);
+        for (cols, header) in [(full + MIN_LAST + 20, true), (full + 3, false), (full, false)] {
+            let rows = frame(&m, &lines, &mut st, u16::try_from(cols).expect("cols"));
+            assert_eq!(shown(&rows), [long, "//a:b"], "{cols} cols: {rows:#?}");
+            assert_eq!(
+                rows.first().is_some_and(|h| h.ends_with("LAST LINE")),
+                header,
+                "{cols} cols: {rows:#?}"
+            );
+        }
+        let rows = frame(&m, &lines, &mut st, u16::try_from(full - 1).expect("cols"));
+        assert!(shown(&rows)[0].starts_with('…'), "{rows:#?}");
+        // Past 60% of a wide window, the address is cut and LAST LINE kept.
+        let huge = format!("//{}:x", "p/".repeat(60));
+        let m = model(&[&huge]);
+        let rows = frame(&m, &lines, &mut st, 120);
+        assert_eq!(width(&shown(&rows)[0]), 120 * 3 / 5, "{rows:#?}");
+        assert!(rows[0].ends_with("LAST LINE"), "{rows:#?}");
     }
 
     /// `/` is a literal, ASCII-case-insensitive substring; empty shows all;
