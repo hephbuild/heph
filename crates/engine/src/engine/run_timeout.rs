@@ -33,12 +33,15 @@
 //! failed; the failure artifacts it carried (exec's log) are kept on the
 //! [`TimedOutError`], so the failure box shows what the run printed.
 //!
-//! The clock starts when the driver's `run` is called — not the queue for
-//! admission, not dependency resolution, not the engine's sandbox lease and
-//! credentials before it. For a managed driver (`exec`, `bash`) `run` is the
-//! whole managed layer, so the clock **does** cover staging the inputs into
-//! the sandbox and collecting the outputs, not just the command. `--shell`
-//! never gets one: it is a person at a prompt.
+//! The clock covers the target's own process. A driver that
+//! [arms the run clock](hplugin::driver::Driver::arms_run_clock) (`exec`,
+//! `bash`) starts it right after spawning the process and stops it when the
+//! process exits, so staging the inputs, preparing the runner and collecting
+//! the outputs are not timed, any more than the queue for admission,
+//! dependency resolution, or the engine's sandbox lease and credentials before
+//! `run`. A driver that does not arm it (a cdylib's, whose run the clock does
+//! not cross the seam into) is timed from the call to its `run` to its return.
+//! `--shell` never gets one: it is a person at a prompt.
 //!
 //! Nothing here reaches a hash. A limit does not change what a run that
 //! finishes within it produces, so changing it never rebuilds anything. That
@@ -48,10 +51,11 @@
 
 use hcore::hasync::{Cancellable as _, StdCancellationToken};
 use hmodel::htaddr::Addr;
-use hplugin::driver::Timeout;
+use hplugin::driver::{RunClockState, Timeout};
 use std::fmt;
 use std::future::Future;
 use std::time::Duration;
+use tokio::sync::watch;
 
 /// How long a run past its timeout has, once cancelled, to return before the
 /// engine stops waiting for it.
@@ -128,6 +132,51 @@ impl Drop for CancelOnDrop<'_> {
     }
 }
 
+/// Resolves when the run has been on its clock for `timeout`; never, when the
+/// run has not started its clock or has stopped it.
+///
+/// With no `clock` (a driver that does not arm one) the whole run is on it, so
+/// this is `timeout` from now. With one, it waits for the driver to start it,
+/// then gives the process `timeout`, unless the driver stops it first. A run
+/// that dropped its clock running is still on it: only a stop ends it.
+async fn deadline(clock: Option<watch::Receiver<RunClockState>>, timeout: Duration) {
+    let Some(mut clock) = clock else {
+        return tokio::time::sleep(timeout).await;
+    };
+    loop {
+        // Copied out, so the channel's read guard is not held across an await.
+        let state = *clock.borrow_and_update();
+        match state {
+            RunClockState::Running => break,
+            RunClockState::Stopped => return std::future::pending().await,
+            RunClockState::Idle => {}
+        }
+        if clock.changed().await.is_err() {
+            // Dropped unstarted: the process never ran, so it cannot outlast
+            // its timeout. The run is about to return anyway.
+            return std::future::pending().await;
+        }
+    }
+    let stopped = async {
+        loop {
+            let state = *clock.borrow_and_update();
+            if state == RunClockState::Stopped {
+                break;
+            }
+            if clock.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    // Biased toward the stop: a process that exited in the same poll the
+    // deadline came due finished within its limit.
+    tokio::select! {
+        biased;
+        () = stopped => std::future::pending().await,
+        () = tokio::time::sleep(timeout) => {}
+    }
+}
+
 /// Await `run`, which was started with `run_token`, holding it to `timeout`.
 ///
 /// `parent` (the request's token) cancelling is forwarded into `run_token`,
@@ -137,6 +186,11 @@ impl Drop for CancelOnDrop<'_> {
 /// dropped; either way the result is [`TimedOutError`], carrying the failure
 /// artifacts of whatever the run returned. Dropped before it finishes,
 /// `run_token` is cancelled.
+///
+/// `clock` is the engine's end of the run's
+/// [`RunClock`](hplugin::driver::RunClock) when the driver arms one: the
+/// timeout then runs only while the driver says its process runs. `None`
+/// times the whole of `run`.
 pub(crate) async fn enforce<T>(
     run: impl Future<Output = anyhow::Result<T>>,
     run_token: &StdCancellationToken,
@@ -144,6 +198,7 @@ pub(crate) async fn enforce<T>(
     addr: &Addr,
     timeout: Timeout,
     grace: Duration,
+    clock: Option<watch::Receiver<RunClockState>>,
 ) -> anyhow::Result<T> {
     let mut guard = CancelOnDrop {
         token: run_token,
@@ -166,7 +221,7 @@ pub(crate) async fn enforce<T>(
             guard.armed = false;
             return out;
         }
-        () = tokio::time::sleep(timeout.duration()) => {}
+        () = deadline(clock, timeout.duration()) => {}
     }
 
     // Timed out, and the token says so: the managed layer keeps a timed-out
@@ -250,6 +305,7 @@ mod tests {
             &addr(),
             secs(10),
             GRACE,
+            None,
         )
         .await;
         assert!(out.is_ok(), "{out:?}");
@@ -267,6 +323,7 @@ mod tests {
             &addr(),
             secs(10),
             GRACE,
+            None,
         )
         .await
         .expect_err("fails");
@@ -286,6 +343,7 @@ mod tests {
             &addr(),
             secs(90),
             GRACE,
+            None,
         )
         .await
         .expect_err("times out");
@@ -316,7 +374,7 @@ mod tests {
                 vec![log_artifact("started\n")],
             ))
         };
-        let err = enforce(run, &token, &parent, &addr(), secs(1), GRACE)
+        let err = enforce(run, &token, &parent, &addr(), secs(1), GRACE, None)
             .await
             .expect_err("times out");
         assert!(is_timed_out(&err), "{err:#}");
@@ -335,7 +393,7 @@ mod tests {
             token.cancelled().await;
             anyhow::Ok(())
         };
-        let err = enforce(run, &token, &parent, &addr(), secs(5), GRACE)
+        let err = enforce(run, &token, &parent, &addr(), secs(5), GRACE, None)
             .await
             .expect_err("times out");
         let te = timed_out(&err).expect("timed out");
@@ -359,7 +417,7 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(3600)).await;
             anyhow::Ok(())
         };
-        let err = enforce(run, &token, &parent, &addr(), secs(10), GRACE)
+        let err = enforce(run, &token, &parent, &addr(), secs(10), GRACE, None)
             .await
             .expect_err("times out");
         assert!(parent.is_cancelled());
@@ -391,6 +449,7 @@ mod tests {
             &addr(),
             secs(60),
             Duration::from_secs(10),
+            None,
         )
         .await
         .expect_err("times out");
@@ -421,6 +480,7 @@ mod tests {
             &addr(),
             secs(60),
             GRACE,
+            None,
         )
         .await
         .expect_err("cancelled");
@@ -444,7 +504,7 @@ mod tests {
             seen.store(!token.is_cancelled(), Ordering::SeqCst);
             anyhow::Ok(())
         };
-        let out = enforce(run, &token, &parent, &addr(), secs(60), GRACE).await;
+        let out = enforce(run, &token, &parent, &addr(), secs(60), GRACE, None).await;
         assert!(out.is_ok(), "{out:?}");
         assert!(
             !live_on_first_poll.load(Ordering::SeqCst),
@@ -468,6 +528,7 @@ mod tests {
             &addr,
             secs(60),
             GRACE,
+            None,
         );
         // Started, then abandoned well before the deadline.
         let polled = tokio::time::timeout(Duration::from_secs(1), fut).await;
@@ -490,8 +551,113 @@ mod tests {
             &addr(),
             longest,
             GRACE,
+            None,
         )
         .await;
         assert!(out.is_ok(), "{out:?}");
+    }
+
+    /// A clocked run: `before` of staging, the process (which honours its
+    /// token) for `work`, then `after` of collecting outputs.
+    async fn clocked(
+        clock: hplugin::driver::RunClock,
+        token: &StdCancellationToken,
+        before: Duration,
+        work: Duration,
+        after: Duration,
+    ) -> anyhow::Result<()> {
+        tokio::time::sleep(before).await;
+        clock.start();
+        let out = polite(token, work).await;
+        clock.stop();
+        out?;
+        tokio::time::sleep(after).await;
+        Ok(())
+    }
+
+    /// The clock covers the process alone: a run whose staging and output
+    /// collection each take far longer than its timeout, but whose process
+    /// is quick, finishes.
+    #[tokio::test(start_paused = true)]
+    async fn staging_and_collection_are_not_timed() {
+        let parent = StdCancellationToken::new();
+        let token = StdCancellationToken::new();
+        let (clock, reader) = hplugin::driver::RunClock::new();
+        let started = tokio::time::Instant::now();
+        let out = enforce(
+            clocked(
+                clock,
+                &token,
+                Duration::from_secs(100),
+                Duration::from_secs(5),
+                Duration::from_secs(100),
+            ),
+            &token,
+            &parent,
+            &addr(),
+            secs(10),
+            GRACE,
+            Some(reader),
+        )
+        .await;
+        assert!(out.is_ok(), "{out:?}");
+        assert_eq!(started.elapsed(), Duration::from_secs(205));
+        assert!(
+            !token.is_cancelled(),
+            "a finished run's token is left alone"
+        );
+    }
+
+    /// The process is held to its timeout from its spawn, not from `run`:
+    /// 100s of staging, then a process that would take an hour, stops at
+    /// 110s, timed out exactly as an unclocked run is.
+    #[tokio::test(start_paused = true)]
+    async fn a_process_past_its_timeout_is_timed_out_from_its_spawn() {
+        let parent = StdCancellationToken::new();
+        let token = StdCancellationToken::new();
+        let (clock, reader) = hplugin::driver::RunClock::new();
+        let started = tokio::time::Instant::now();
+        let err = enforce(
+            clocked(
+                clock,
+                &token,
+                Duration::from_secs(100),
+                Duration::from_secs(3600),
+                Duration::ZERO,
+            ),
+            &token,
+            &parent,
+            &addr(),
+            secs(10),
+            GRACE,
+            Some(reader),
+        )
+        .await
+        .expect_err("times out");
+        assert_eq!(started.elapsed(), Duration::from_secs(110));
+        assert!(token.timed_out(), "told why: its timeout");
+        assert!(is_timed_out(&err), "{err:#}");
+        assert!(!hplugin::error::is_cancelled(&err), "{err:#}");
+        assert_eq!(timed_out(&err).expect("timed out").abandoned_after, None);
+    }
+
+    /// A driver that started its clock and then dropped it without stopping
+    /// it is still on the clock: only a stop ends it.
+    #[tokio::test(start_paused = true)]
+    async fn a_clock_dropped_while_running_keeps_running() {
+        let parent = StdCancellationToken::new();
+        let token = StdCancellationToken::new();
+        let (clock, reader) = hplugin::driver::RunClock::new();
+        let run = async {
+            clock.start();
+            drop(clock);
+            polite(&token, Duration::from_secs(3600)).await
+        };
+        let started = tokio::time::Instant::now();
+        let err = enforce(run, &token, &parent, &addr(), secs(10), GRACE, Some(reader))
+            .await
+            .expect_err("times out");
+        assert_eq!(started.elapsed(), Duration::from_secs(10));
+        assert!(is_timed_out(&err), "{err:#}");
     }
 }

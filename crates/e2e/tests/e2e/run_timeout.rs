@@ -788,3 +788,145 @@ target(name = "c", driver = "drops", run = "echo $T; sleep 60; echo done > $OUT"
     assert!(started.elapsed() < Duration::from_secs(9));
     Ok(())
 }
+
+/// The managed bash driver with heph's own work around its process made
+/// slow: `before` inside `run` ahead of the spawn (what slow staging or a
+/// slow runner preparation costs) and `after` once the process has exited
+/// (what slow output collection costs). It arms the run clock exactly as bash
+/// does, so the timeout sees what it would see on a real slow tree.
+struct PaddedBash {
+    inner: pluginexec::Driver,
+    before: Duration,
+    after: Duration,
+}
+
+#[async_trait::async_trait]
+impl heph::engine::driver_managed::ManagedDriver for PaddedBash {
+    fn config(
+        &self,
+        _req: hplugin::driver::ConfigRequest,
+    ) -> anyhow::Result<hplugin::driver::ConfigResponse> {
+        Ok(hplugin::driver::ConfigResponse {
+            name: "padded".to_string(),
+        })
+    }
+    fn schema(&self) -> hplugin::driver::DriverSchema {
+        heph::engine::driver_managed::ManagedDriver::schema(&self.inner)
+    }
+    async fn parse(
+        &self,
+        req: hplugin::driver::ParseRequest,
+        ctoken: &(dyn hcore::hasync::Cancellable + Send + Sync),
+    ) -> anyhow::Result<hplugin::driver::ParseResponse> {
+        heph::engine::driver_managed::ManagedDriver::parse(&self.inner, req, ctoken).await
+    }
+    async fn apply_transitive(
+        &self,
+        req: hplugin::driver::ApplyTransitiveRequest,
+        ctoken: &(dyn hcore::hasync::Cancellable + Send + Sync),
+    ) -> anyhow::Result<hplugin::driver::ApplyTransitiveResponse> {
+        heph::engine::driver_managed::ManagedDriver::apply_transitive(&self.inner, req, ctoken)
+            .await
+    }
+    async fn run<'a, 'io>(
+        &self,
+        req: heph::engine::driver_managed::ManagedRunRequest<'a, 'io>,
+        ctoken: &(dyn hcore::hasync::Cancellable + Send + Sync),
+    ) -> anyhow::Result<heph::engine::driver_managed::ManagedRunResponse> {
+        tokio::time::sleep(self.before).await;
+        let out = heph::engine::driver_managed::ManagedDriver::run(&self.inner, req, ctoken).await;
+        tokio::time::sleep(self.after).await;
+        out
+    }
+    fn arms_run_clock(&self) -> bool {
+        heph::engine::driver_managed::ManagedDriver::arms_run_clock(&self.inner)
+    }
+}
+
+/// An engine over `root` whose `padded` driver spends `before` and `after`
+/// around the target's process.
+fn padded_engine(root: &Path, before: Duration, after: Duration) -> anyhow::Result<Arc<Engine>> {
+    engine_with(root, |e| {
+        e.register_managed_driver(move |_| {
+            Box::new(PaddedBash {
+                inner: pluginexec::Driver::new_bash().with_host_path(),
+                before,
+                after,
+            })
+        })
+    })
+}
+
+fn padded(run: &str) -> String {
+    format!(
+        r#"
+target(
+    name = "padded",
+    driver = "padded",
+    run = "{run}",
+    out = "out.txt",
+    timeout = 1,
+)
+"#
+    )
+}
+
+/// The timeout covers the target's process, not heph's preparation of it: 3s
+/// spent before the spawn does not time out a 1s target whose process is
+/// quick.
+#[tokio::test]
+async fn slow_preparation_does_not_count_against_the_timeout() -> anyhow::Result<()> {
+    let ws = tempfile::tempdir()?;
+    write_build(ws.path(), &padded("echo ok > $OUT"));
+    let engine = padded_engine(ws.path(), Duration::from_secs(3), Duration::ZERO)?;
+    assert_eq!(build(&engine, "//p:padded").await?, "ok");
+    Ok(())
+}
+
+/// Nor does what heph does once the process has exited: 3s after it does not
+/// time out a 1s target.
+#[tokio::test]
+async fn slow_collection_does_not_count_against_the_timeout() -> anyhow::Result<()> {
+    let ws = tempfile::tempdir()?;
+    write_build(ws.path(), &padded("echo ok > $OUT"));
+    let engine = padded_engine(ws.path(), Duration::ZERO, Duration::from_secs(3))?;
+    assert_eq!(build(&engine, "//p:padded").await?, "ok");
+    Ok(())
+}
+
+/// A process that outlasts its timeout still times out after a slow
+/// preparation, from its spawn, and fails exactly as any timed-out target:
+/// a failure, recorded, stopped through its own cancellation (not abandoned).
+#[tokio::test]
+async fn a_process_past_its_timeout_times_out_after_a_slow_preparation() -> anyhow::Result<()> {
+    let ws = tempfile::tempdir()?;
+    write_build(
+        ws.path(),
+        &padded("echo started; sleep 60; echo done > $OUT"),
+    );
+    let engine = padded_engine(ws.path(), Duration::from_secs(2), Duration::ZERO)?;
+    let started = Instant::now();
+    let err = build(&engine, "//p:padded")
+        .await
+        .expect_err("a 60s process under a 1s timeout fails");
+    let elapsed = started.elapsed();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("//p:padded timed out after 1s"), "{msg}");
+    assert!(
+        msg.contains("failure //p:padded"),
+        "recorded as a failure: {msg}"
+    );
+    assert!(
+        !msg.contains("abandoned"),
+        "the driver stopped when cancelled: {msg}"
+    );
+    assert!(
+        elapsed >= Duration::from_secs(3),
+        "the 2s before the spawn were not on the clock: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(11),
+        "stopped at the timeout, not after the sleep or the grace: {elapsed:?}"
+    );
+    Ok(())
+}

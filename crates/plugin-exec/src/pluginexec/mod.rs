@@ -2020,6 +2020,13 @@ impl hdriver_support::driver_managed::ManagedDriver for Driver {
     ) -> anyhow::Result<ManagedRunResponse> {
         self.run_inner(req, ctoken, true).await
     }
+
+    /// The clock runs from the spawn to the exit of the target's process, so
+    /// staging, the runner's preparation and collecting the outputs are not
+    /// timed (`docs/TIMEOUTS.md`).
+    fn arms_run_clock(&self) -> bool {
+        true
+    }
 }
 
 impl Driver {
@@ -2081,6 +2088,9 @@ impl Driver {
         // for every build; honoured field by field below, never by asking what
         // kind of target this is (N8).
         let options = std::mem::take(&mut rreq.options);
+        // The target's `timeout` runs from the spawn below to the process's
+        // exit: everything before and after is heph's work, not the target's.
+        let clock = std::mem::take(&mut rreq.clock);
         let def = rreq.target.def::<TargetDef>();
 
         // Resolved here, by the host's map, and nowhere else — a driver that
@@ -2752,14 +2762,16 @@ impl Driver {
                 hexecrunner::foreground::spawn_foreground(runner_ref, cmd, &path_policy, ctoken)
                     .await?;
             let child = spawned.map_err(|e| spawn_error(e, &spawned_as))?;
+            clock.start();
             hcore::hmemoizer::set_phase("pluginexec:wait_subprocess");
-            let exit = match pty_channels {
+            let waited = match pty_channels {
                 Some((stops, continues)) => {
                     child.wait_pty(fg.signals, stops, continues, ctoken).await
                 }
                 None => child.wait(fg.signals, ctoken).await,
-            }
-            .context("wait for child process")?;
+            };
+            clock.stop();
+            let exit = waited.context("wait for child process")?;
             if ctoken.is_cancelled() {
                 anyhow::bail!("cancelled");
             }
@@ -2857,6 +2869,7 @@ impl Driver {
         let (spawned, spawned_as) =
             hexecrunner::spawn_io_with_path(runner_ref, spec, &path_policy, ctoken).await?;
         let mut handle = spawned.map_err(|e| spawn_error(e, &spawned_as))?;
+        clock.start();
 
         // Drop the parent's copy of the slave so the master sees EOF when the
         // child exits.
@@ -2990,7 +3003,15 @@ impl Driver {
         // panic this design avoids). `ctoken` is a borrowed trait object, so we
         // hand the task an owned `clone_arc`; the original borrow stays usable
         // below for the post-wait cancellation check.
-        let wait_handle = handle.spawn_wait(ctoken.clone_arc());
+        //
+        // The clock stops as the wait returns, before the post-wait drain: the
+        // process has exited, and what is left is heph's.
+        let wait_task = handle.spawn_wait(ctoken.clone_arc());
+        let wait_handle = async {
+            let waited = wait_task.await;
+            clock.stop();
+            waited
+        };
         tokio::pin!(wait_handle);
 
         // Drive the IO pumps alongside the wait. On a clean exit we briefly

@@ -112,6 +112,10 @@ impl Driver for ManagedDriverBridge {
         self.os.driver.supports_shell()
     }
 
+    fn arms_run_clock(&self) -> bool {
+        self.os.driver.arms_run_clock()
+    }
+
     async fn run<'a, 'io>(
         &self,
         req: RunRequest<'a, 'io>,

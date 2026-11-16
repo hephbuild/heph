@@ -2276,6 +2276,75 @@ pub struct RunRequest<'a, 'io> {
     /// Crosses the plugin seam as
     /// `ManagedRunRequest.allotment` (since 0.17.4).
     pub allotment: Option<Allotment>,
+    /// The clock the target's `timeout` runs on, for a driver that
+    /// [arms it](Driver::arms_run_clock). Inert (the default) for every other
+    /// run: a target with no timeout, a `--shell`, a driver that does not arm
+    /// it. In-process only: it never crosses the plugin seam, so a cdylib
+    /// driver's run is timed whole.
+    pub clock: RunClock,
+}
+
+/// Where a run is on the clock its target's `timeout` runs on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunClockState {
+    /// The target's process has not been spawned yet: staging the inputs,
+    /// preparing the runner. Not timed.
+    Idle,
+    /// The target's process is running. Timed.
+    Running,
+    /// The target's process has exited: what the driver does after it
+    /// (collecting the outputs) is not timed.
+    Stopped,
+}
+
+/// A run's handle on the clock its target's `timeout` runs on.
+///
+/// The engine holds a target to its `timeout` while its process runs, not
+/// while heph prepares or tidies up after it. A driver that spawns the
+/// target's process says so with [`Driver::arms_run_clock`], then calls
+/// [`start`](Self::start) right after the spawn and [`stop`](Self::stop) once
+/// the process has exited; the engine's deadline runs between the two. A
+/// driver that does not arm it has its whole `run` timed.
+///
+/// Each call is idempotent, and a [`start`](Self::start) after a
+/// [`stop`](Self::stop) does nothing: the clock runs once per run. The
+/// default is inert: both calls do nothing.
+///
+/// Nothing here reaches the run: the driver must not tell the process when
+/// its clock started, any more than its limit (`docs/TIMEOUTS.md`).
+#[derive(Debug, Clone, Default)]
+pub struct RunClock(Option<std::sync::Arc<tokio::sync::watch::Sender<RunClockState>>>);
+
+impl RunClock {
+    /// A live clock, and the engine's end of it.
+    pub fn new() -> (Self, tokio::sync::watch::Receiver<RunClockState>) {
+        let (tx, rx) = tokio::sync::watch::channel(RunClockState::Idle);
+        (Self(Some(std::sync::Arc::new(tx))), rx)
+    }
+
+    /// The target's process has been spawned: its timeout runs from here.
+    pub fn start(&self) {
+        if let Some(tx) = &self.0 {
+            tx.send_if_modified(|s| {
+                let idle = *s == RunClockState::Idle;
+                if idle {
+                    *s = RunClockState::Running;
+                }
+                idle
+            });
+        }
+    }
+
+    /// The target's process has exited: its timeout no longer runs.
+    pub fn stop(&self) {
+        if let Some(tx) = &self.0 {
+            tx.send_if_modified(|s| {
+                let changed = *s != RunClockState::Stopped;
+                *s = RunClockState::Stopped;
+                changed
+            });
+        }
+    }
 }
 
 /// The parts of a run that come from the caller rather than the def.
@@ -2672,6 +2741,7 @@ impl<'a, 'io> RunRequest<'a, 'io> {
             options: RunOptions::default(),
             winsize: None,
             allotment: None,
+            clock: RunClock::default(),
         }
     }
 
@@ -2699,6 +2769,7 @@ impl<'a, 'io> RunRequest<'a, 'io> {
             options: self.options,
             winsize: self.winsize,
             allotment: self.allotment,
+            clock: self.clock,
         }
     }
 
@@ -3030,4 +3101,11 @@ pub trait Driver: Send + Sync {
         req: RunRequest<'a, 'io>,
         ctoken: &(dyn hasync::Cancellable + Send + Sync),
     ) -> anyhow::Result<RunResponse>;
+    /// Whether this driver's `run` starts and stops its [`RunRequest::clock`]
+    /// around the target's process, so that a `timeout` covers the process
+    /// alone. False (the default): the engine times the whole `run`. A driver
+    /// that says true and never starts the clock is never timed out.
+    fn arms_run_clock(&self) -> bool {
+        false
+    }
 }
