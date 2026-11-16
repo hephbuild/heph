@@ -147,9 +147,11 @@ async fn poll_until(
 async fn wait_running(engine: &Arc<Engine>, addr: &str, len: usize) -> String {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        let seen = open(engine, addr, &LogOptions::default())
-            .await
-            .expect("open");
+        // Before its first byte, the run is "no output yet".
+        let seen = match open(engine, addr, &LogOptions::default()).await {
+            Err(e) if e.is::<NoOutputYet>() => None,
+            seen => seen.expect("open"),
+        };
         if let Some((LogSource::Live { running: true, .. }, text)) = &seen
             && text.len() >= len
         {
@@ -331,6 +333,124 @@ async fn log_api_follow_ends_with_run() -> anyhow::Result<()> {
     assert_eq!(String::from_utf8(got)?, "three\nfour\n");
     assert_eq!(f.poll()?, FollowStep::End, "an ended follower stays ended");
     run.await??;
+    Ok(())
+}
+
+/// Wait for a file the target touches once it is running.
+async fn wait_file(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "{} never appeared",
+            path.display()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// A run of this engine that has written nothing is "no output yet", with
+/// no session at all: the engine knows its own runs, so neither
+/// `HEPH_NO_SESSION` nor a session not found reads it as "has not run".
+/// Followed, it waits for the first byte, or ends with a run that writes
+/// none; once over, the old answers hold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn own_quiet_run_is_started_without_a_session() -> anyhow::Result<()> {
+    let ws = tempfile::tempdir()?;
+    let c = tempfile::tempdir()?;
+    let cp = c.path().display();
+    write_build(
+        ws.path(),
+        &format!(
+            r#"target(name = "quiet", driver = "bash", out = "q.txt", run = "touch {cp}/quiet.started; while [ ! -e {cp}/quiet.gate ]; do sleep 0.02; done; echo first; while [ ! -e {cp}/quiet.gate2 ]; do sleep 0.02; done; echo second; printf x > q.txt")
+target(name = "silent", driver = "bash", out = "s.txt", run = "touch {cp}/silent.started; while [ ! -e {cp}/silent.gate ]; do sleep 0.02; done; printf x > s.txt")
+"#
+        ),
+    )?;
+    // No announcer, no locator: no session anywhere.
+    let e = engine(ws.path(), None)?;
+    let none = LogOptions::default();
+
+    // Running, nothing written: "no output yet", here and at its own
+    // hashin, never at another one.
+    let quiet = parse_addr("//p:quiet")?;
+    let run = tokio::spawn({
+        let e = Arc::clone(&e);
+        async move { build(&e, "//p:quiet").await }
+    });
+    wait_file(&c.path().join("quiet.started")).await;
+    let err = e
+        .open_log(&quiet, &none)
+        .await
+        .expect_err("running, nothing written");
+    let yet = err.downcast_ref::<NoOutputYet>().expect("NoOutputYet");
+    assert_eq!(yet.session, None, "this engine's own run");
+    assert!(err.to_string().contains("in this heph"), "{err}");
+    let hashin = Arc::clone(&e).meta(e.new_state(), &quiet).await?.hashin;
+    let at = |h: &str| LogOptions {
+        hashin: Some(h.to_owned()),
+        ..LogOptions::default()
+    };
+    assert!(
+        e.open_log(&quiet, &at(&hashin))
+            .await
+            .is_err_and(|e| e.is::<NoOutputYet>())
+    );
+    assert!(e.open_log(&quiet, &at("other")).await?.is_none());
+
+    // Followed: waits for the first byte, then reads the run to its end.
+    let mut f = e
+        .follow_log(&quiet, &none, false)
+        .await?
+        .expect("a follower");
+    assert!(f.info().is_none(), "nothing to read yet: {:?}", f.info());
+    assert!(f.started().is_some_and(|s| s.session.is_none()));
+    assert_eq!(f.started_in(), None);
+    assert_eq!(f.poll()?, FollowStep::Idle);
+    std::fs::write(c.path().join("quiet.gate"), "")?;
+    let mut got = Vec::new();
+    assert!(!poll_until(&mut f, &mut got, |g| g == b"first\n").await);
+    assert!(matches!(
+        f.info().map(|i| i.source),
+        Some(LogSource::Live {
+            running: true,
+            session: None
+        })
+    ));
+    std::fs::write(c.path().join("quiet.gate2"), "")?;
+    assert!(poll_until(&mut f, &mut got, |_| false).await);
+    assert_eq!(String::from_utf8(got)?, "first\nsecond\n");
+    run.await??;
+    // Over: its cache entry's log.
+    assert_eq!(
+        open(&e, "//p:quiet", &none).await?,
+        Some((LogSource::Cache { remote: false }, "first\nsecond\n".into()))
+    );
+
+    // A run that ends without a byte ends its follower, and leaves no log.
+    let silent = parse_addr("//p:silent")?;
+    let run = tokio::spawn({
+        let e = Arc::clone(&e);
+        async move { build(&e, "//p:silent").await }
+    });
+    wait_file(&c.path().join("silent.started")).await;
+    assert!(
+        e.open_log(&silent, &none)
+            .await
+            .is_err_and(|e| e.is::<NoOutputYet>())
+    );
+    let mut f = e
+        .follow_log(&silent, &none, false)
+        .await?
+        .expect("a follower");
+    assert_eq!(f.poll()?, FollowStep::Idle);
+    std::fs::write(c.path().join("silent.gate"), "")?;
+    let mut got = Vec::new();
+    assert!(poll_until(&mut f, &mut got, |_| false).await);
+    assert!(got.is_empty(), "{:?}", String::from_utf8_lossy(&got));
+    run.await??;
+    assert_eq!(open(&e, "//p:silent", &none).await?, None);
+    assert!(e.follow_log(&silent, &none, false).await?.is_none());
     Ok(())
 }
 
@@ -659,7 +779,7 @@ async fn log_follow_across_engines() -> anyhow::Result<()> {
         .await
         .expect_err("running, nothing written");
     let yet = err.downcast_ref::<NoOutputYet>().expect("NoOutputYet");
-    assert_eq!(yet.session, id_a.encode());
+    assert_eq!(yet.session, Some(id_a.encode()));
     // Followed, it waits for the run's first byte, and ends with the run
     // when it writes none.
     let mut f = b

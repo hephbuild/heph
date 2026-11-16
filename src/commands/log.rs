@@ -189,8 +189,8 @@ where
                 say(
                     &mut err,
                     &format!(
-                        "heph: no output yet for {addr}: running in session {} and nothing written; heph log -f {addr} follows it",
-                        e.session
+                        "heph: no output yet for {addr}: running {} and nothing written; heph log -f {addr} follows it",
+                        running_where(e)
                     ),
                 );
                 return Ok(Shown::Nothing);
@@ -295,12 +295,12 @@ fn print_followed(
 ) -> anyhow::Result<Shown> {
     let mut found = f.info();
     // Following a run that has written nothing yet.
-    let started = f.started_in().map(str::to_owned);
+    let started = f.started().map(running_where);
     match (&found, &started) {
         (Some(info), _) => say(&mut err, &following(addr, info, sessions)),
-        (None, Some(session)) => say(
+        (None, Some(running)) => say(
             &mut err,
-            &format!("{addr} · running in session {session} · no output yet · following"),
+            &format!("{addr} · running {running} · no output yet · following"),
         ),
         (None, None) => say(&mut err, &format!("{addr} · waiting for a run to start")),
     }
@@ -385,6 +385,14 @@ fn ended(addr: &Addr, replaced_by: Option<&LogSource>, took: &str) -> String {
         Some(LogSource::FailureSlot) => format!("{addr} · ✗ failed after {took}"),
         Some(LogSource::Cache { .. }) => format!("{addr} · ✓ done after {took}"),
         Some(LogSource::Live { .. }) | None => format!("{addr} · the run ended after {took}"),
+    }
+}
+
+/// Where a run that has written nothing yet is going on.
+fn running_where(started: &NoOutputYet) -> String {
+    match &started.session {
+        Some(session) => format!("in session {session}"),
+        None => "in this heph".to_owned(),
     }
 }
 

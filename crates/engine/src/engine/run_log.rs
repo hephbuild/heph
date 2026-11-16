@@ -78,6 +78,22 @@ pub(crate) struct LiveRuns {
     /// unlinks the previous one, so a `cache = false` target run N times in
     /// one engine (a watch loop, a server) keeps one file, not N.
     retained: Mutex<std::collections::HashMap<hmodel::htaddr::Addr, PathBuf>>,
+    /// This engine's runs going on, one per address (the newest run's),
+    /// from the moment their log is made, before any byte, to their
+    /// guard's drop: how the log API tells a quiet run of this engine from
+    /// one that has not run, with no session. In memory only: a run that
+    /// writes nothing still touches no file.
+    started: Mutex<std::collections::HashMap<hmodel::htaddr::Addr, StartedRun>>,
+}
+
+/// One run of this engine going on, its file created or not.
+#[derive(Debug, Clone)]
+pub(crate) struct StartedRun {
+    /// Gone once the run is over and nothing holds its log.
+    pub(crate) log: std::sync::Weak<RunLog>,
+    pub(crate) hashin: String,
+    /// When its log was made, in milliseconds since the epoch.
+    pub(crate) at_unix_ms: u64,
 }
 
 /// One run's live file, as the log API finds it in-process.
@@ -111,6 +127,22 @@ impl LiveRuns {
     /// `addr`'s newest live file in this engine, if one exists.
     pub(crate) fn get(&self, addr: &hmodel::htaddr::Addr) -> Option<LiveRun> {
         self.map().get(addr).cloned()
+    }
+
+    fn started_map(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<hmodel::htaddr::Addr, StartedRun>>
+    {
+        self.started.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// `addr`'s newest run going on in this engine, if its log is not yet
+    /// final, written to or not.
+    pub(crate) fn started(&self, addr: &hmodel::htaddr::Addr) -> Option<StartedRun> {
+        self.started_map()
+            .get(addr)
+            .filter(|run| run.log.upgrade().is_some_and(|log| !log.ended()))
+            .cloned()
     }
 }
 
@@ -292,6 +324,14 @@ impl RunLogs {
             });
             log
         });
+        self.live.started_map().insert(
+            addr.clone(),
+            StartedRun {
+                log: Arc::downgrade(&log),
+                hashin: hashin.to_owned(),
+                at_unix_ms: unix_ms_now(),
+            },
+        );
         let guard = LiveGuard {
             log: Arc::clone(&log),
             unlink: true,
@@ -394,6 +434,13 @@ fn sweep_one(runs: &Path, dir: &Path, name: &[u8]) -> io::Result<bool> {
     std::fs::remove_dir_all(&tomb)?;
     drop(lock);
     Ok(true)
+}
+
+/// Now, in milliseconds since the epoch.
+fn unix_ms_now() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// Whether `dir` was last changed at least [`STALE_AFTER`] before `now`.
@@ -511,9 +558,7 @@ impl RunLog {
         let Some(reg) = &self.registration else {
             return;
         };
-        let at_unix_ms = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        let at_unix_ms = unix_ms_now();
         reg.live.map().insert(
             reg.addr.clone(),
             LiveRun {
@@ -532,6 +577,21 @@ impl RunLog {
             return;
         };
         let mut map = reg.live.map();
+        if map
+            .get(&reg.addr)
+            .is_some_and(|run| std::sync::Weak::ptr_eq(&run.log, &reg.me))
+        {
+            map.remove(&reg.addr);
+        }
+    }
+
+    /// Take the run out of [`LiveRuns`]' runs going on, unless a newer run
+    /// of the addr replaced it there.
+    fn unregister_started(&self) {
+        let Some(reg) = &self.registration else {
+            return;
+        };
+        let mut map = reg.live.started_map();
         if map
             .get(&reg.addr)
             .is_some_and(|run| std::sync::Weak::ptr_eq(&run.log, &reg.me))
@@ -965,6 +1025,7 @@ impl LiveGuard {
 impl Drop for LiveGuard {
     fn drop(&mut self) {
         drop(self.log.finalize());
+        self.log.unregister_started();
         // Finalized, and marked abandoned under the lock an import renames
         // under: no later write or import creates the file, so `created` is
         // final.

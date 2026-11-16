@@ -6,7 +6,10 @@
 //! - **a run going on**: its live file, `<home>/runs/<engine-id>/<n>.log`,
 //!   found in this engine's own [`LiveRuns`] or, for another heph on the same
 //!   workspace, through a [`LiveRunLogLocator`] (the session records, which
-//!   the engine cannot read itself); a running run is always the newest;
+//!   the engine cannot read itself); a running run is always the newest.
+//!   One that has written nothing has no file, and is [`NoOutputYet`]:
+//!   this engine knows its own from the moment its log is made, with or
+//!   without a session;
 //! - **a `cache = false` success**: its live file, kept until its heph exits;
 //! - **a failure**: the failure slot's `log.txt`;
 //! - **a success or a local hit**: the cache entry's `Log` artifact, a tar of
@@ -185,15 +188,24 @@ pub struct NoLiveLogs {
     pub session: String,
 }
 
-/// The address is running in `session` and has written nothing yet: there
-/// is no log to open, and following it waits for its first byte. The UI
-/// says "running · no output yet".
+/// The address is running and has written nothing yet: there is no log to
+/// open, and following it waits for its first byte. The UI says
+/// "running · no output yet".
 #[derive(Debug, thiserror::Error)]
-#[error("no output yet; the run in session {session} has written nothing")]
+#[error("no output yet; the run {} has written nothing", running_where(.session.as_deref()))]
 pub struct NoOutputYet {
-    pub session: String,
+    /// The session it runs in; `None` for a run of this engine, known
+    /// in-process whether or not a session records it.
+    pub session: Option<String>,
     /// When the run started, in milliseconds since the epoch.
     pub at_unix_ms: u64,
+}
+
+fn running_where(session: Option<&str>) -> String {
+    match session {
+        Some(session) => format!("in session {session}"),
+        None => "in this heph".to_owned(),
+    }
 }
 
 /// A finished log the API could read, before it is opened.
@@ -255,7 +267,7 @@ enum LiveEnd {
 /// What [`Engine::latest_log`] found.
 enum Latest {
     Running(Running),
-    /// Running in another session, nothing written yet.
+    /// Running, in this engine or another session, nothing written yet.
     Started(NoOutputYet),
     Stored(Stored),
     /// Nothing, and the locator named a live session that records no live
@@ -332,7 +344,7 @@ impl Engine {
             // newer than its start is its own.
             Latest::Started(started) => Follow::Waiting {
                 baseline: Some(started.at_unix_ms),
-                started: Some(started.session),
+                started: Some(started),
             },
             Latest::Unsupported(session) => return Err(NoLiveLogs { session }.into()),
             Latest::Stored(stored) if wait_for_start => Follow::Waiting {
@@ -371,6 +383,14 @@ impl Engine {
         hashin: Option<&str>,
     ) -> anyhow::Result<Latest> {
         let wanted = |h: &str| hashin.is_none_or(|w| w == h);
+        // This engine's own run going on, before its first byte or after:
+        // known in-process, so no session is needed to tell it from a
+        // target that has not run.
+        let started = self
+            .run_logs
+            .live()
+            .started(addr)
+            .filter(|run| wanted(&run.hashin));
         let own = self
             .run_logs
             .live()
@@ -392,6 +412,14 @@ impl Engine {
             } else if let Some(file) = open_plain(&run.path)? {
                 retained = Some((run, file));
             }
+        }
+        // Going on, its file not created yet (or created a moment ago, and
+        // the next look reads it): newer than anything retained or stored.
+        if let Some(run) = started {
+            return Ok(Latest::Started(NoOutputYet {
+                session: None,
+                at_unix_ms: run.at_unix_ms,
+            }));
         }
         let mut unsupported = None;
         if let Some(locator) = locator {
@@ -427,7 +455,7 @@ impl Engine {
                     session,
                 }) if hashin.is_none() => {
                     return Ok(Latest::Started(NoOutputYet {
-                        session,
+                        session: Some(session),
                         at_unix_ms,
                     }));
                 }
@@ -743,9 +771,10 @@ enum Follow {
     /// between two polls.
     Waiting {
         baseline: Option<u64>,
-        /// Waiting on a run going on in this session that has written
-        /// nothing yet: when it ends without a byte, so does the follow.
-        started: Option<String>,
+        /// Waiting on a run going on, in this engine or another session,
+        /// that has written nothing yet: when it ends without a byte, so
+        /// does the follow.
+        started: Option<NoOutputYet>,
     },
     Live(Running),
     Stored(OpenLog),
@@ -909,16 +938,23 @@ impl LogFollower {
         }
     }
 
-    /// The session of the run being waited on, while it is going on and has
-    /// written nothing yet; `None` otherwise.
-    pub fn started_in(&self) -> Option<&str> {
+    /// The run being waited on, while it is going on and has written
+    /// nothing yet; `None` otherwise.
+    pub fn started(&self) -> Option<&NoOutputYet> {
         match &self.state {
             Follow::Waiting {
-                started: Some(session),
+                started: Some(started),
                 ..
-            } => Some(session),
+            } => Some(started),
             _ => None,
         }
+    }
+
+    /// The session of the run being waited on, while it is going on in
+    /// another session and has written nothing yet; `None` otherwise (and
+    /// for a run of this engine: see [`Self::started`]).
+    pub fn started_in(&self) -> Option<&str> {
+        self.started().and_then(|s| s.session.as_deref())
     }
 
     /// Whether a rate-limited check is due, marking it done.
