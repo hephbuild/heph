@@ -408,7 +408,19 @@ impl LiveRunLogLocator for FeedRunLogLocator {
         if !self.records_run_logs {
             return Ok(Some(LocatedRunLog::Unsupported { session }));
         }
-        let Some(run) = self.feed.run_log(addr) else {
+        // A record not ended is the run going on, whichever of its record
+        // and its start came first; a start with no record after it, or
+        // after an ended one, has written nothing yet.
+        let run = self.feed.run_log(addr);
+        if run.as_ref().is_none_or(|r| r.ended)
+            && let Some(at_unix_ms) = self.feed.started_at(addr)
+        {
+            return Ok(Some(LocatedRunLog::Started {
+                at_unix_ms,
+                session,
+            }));
+        }
+        let Some(run) = run else {
             return Ok(None);
         };
         let ended = LocatedRunLog::Ended {
@@ -821,6 +833,49 @@ mod tests {
         assert!(locate(true, &tmp.path().join("other")).is_none());
         let dead = locate(false, &home);
         assert!(dead.is_none(), "a dead session named a log: {dead:?}");
+    }
+
+    /// Attached, a run that has written nothing yet is `Started`, as the
+    /// session lookup answers it: never nothing, so the LAST LINE and Log
+    /// tab read "no output yet". Its record makes it live, its end ends it,
+    /// and a new start over the ended record is started again.
+    #[test]
+    fn attached_started_run_reads_as_started() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        live_file(&home, "runs/e/0.log", b"x");
+        let id = SessionId::new(1_800_000_000_001, 1);
+        let meta = meta(id, &home, &[CAPABILITY_RUN_LOGS]);
+        let feed = super::super::SessionFeed::default();
+        let locate = |live: bool| {
+            FeedRunLogLocator::new(feed.clone(), id, &meta, live)
+                .expect("meta names a home")
+                .locate(&home, ADDR)
+                .expect("locate")
+        };
+        let started = |at: u64| {
+            move |l: &Option<LocatedRunLog>| {
+                matches!(l, Some(LocatedRunLog::Started { at_unix_ms, session })
+                    if *at_unix_ms == at && *session == id.encode())
+            }
+        };
+
+        drop(feed.route(execute_start(10, ADDR)));
+        let got = locate(true);
+        assert!(started(10)(&got), "{got:?}");
+        assert!(locate(false).is_none(), "a dead session started nothing");
+        drop(feed.route(execute_start(11, "//p:other")));
+        assert!(started(10)(&locate(true)), "another addr's start");
+
+        drop(feed.route(run_log(12, ADDR, "h0", "runs/e/0.log")));
+        assert!(matches!(locate(true), Some(LocatedRunLog::Live { .. })));
+        drop(feed.route(execute_end(13, ADDR)));
+        assert!(matches!(locate(true), Some(LocatedRunLog::Ended { .. })));
+        drop(feed.route(execute_start(14, ADDR)));
+        let got = locate(true);
+        assert!(started(14)(&got), "{got:?}");
+        drop(feed.route(execute_end(15, ADDR)));
+        assert!(matches!(locate(true), Some(LocatedRunLog::Ended { .. })));
     }
 
     /// Across sessions, the newest record wins, and the session that recorded

@@ -45,6 +45,10 @@ struct FeedState {
     /// stream the viewer follows anyway instead of rescanning the session's
     /// `events.ndjson` per lookup. One entry per target that ran.
     run_logs: std::collections::HashMap<String, FeedRunLog>,
+    /// Each running addr's `ExecuteStart` time, until its `ExecuteEnd`: a
+    /// run that has written nothing yet is "started", not absent. One entry
+    /// per target running now.
+    started: std::collections::HashMap<String, u64>,
 }
 
 /// An addr's newest `RunLog` in the followed session.
@@ -81,11 +85,20 @@ impl SessionFeed {
     pub fn route(&self, record: SessionRecord) -> Routed {
         let at = record.at_unix_ms;
         if let Some(kind) = record.kind {
-            // The run whose log was announced is over (`run_logs.rs`'s rule).
-            if let BuildEventKind::ExecuteEnd { addr, .. } = &kind
-                && let Some(run) = self.lock().run_logs.get_mut(addr)
-            {
-                run.ended = true;
+            match &kind {
+                BuildEventKind::ExecuteStart { addr, .. } => {
+                    self.lock().started.insert(addr.clone(), at);
+                }
+                // The run whose log was announced is over (`run_logs.rs`'s
+                // rule).
+                BuildEventKind::ExecuteEnd { addr, .. } => {
+                    let mut s = self.lock();
+                    s.started.remove(addr);
+                    if let Some(run) = s.run_logs.get_mut(addr) {
+                        run.ended = true;
+                    }
+                }
+                _ => {}
             }
             return Routed::Event(BuildEvent {
                 at_unix_ms: at,
@@ -170,6 +183,12 @@ impl SessionFeed {
     /// `addr`'s newest announced run log, as far as the stream has been read.
     pub fn run_log(&self, addr: &str) -> Option<FeedRunLog> {
         self.lock().run_logs.get(addr).cloned()
+    }
+
+    /// When `addr`'s run going on started, as far as the stream has been
+    /// read; `None` once it ended.
+    pub fn started_at(&self, addr: &str) -> Option<u64> {
+        self.lock().started.get(addr).copied()
     }
 
     /// The instant the run's final summary was measured against: its
