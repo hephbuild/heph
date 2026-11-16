@@ -196,13 +196,7 @@ where
                 return Ok(Shown::Nothing);
             }
             if let Some(e) = e.downcast_ref::<LogNotStreamed>() {
-                say(
-                    &mut err,
-                    &format!(
-                        "heph: no live log for {addr}: it is running {}, and {NOT_STREAMED}",
-                        running_where(e.session.as_deref())
-                    ),
-                );
+                say(&mut err, &not_streamed(addr, e.session.as_deref()));
                 return Ok(Shown::Nothing);
             }
             if let Some(e) = e.downcast_ref::<LogUnavailable>() {
@@ -295,14 +289,26 @@ fn print_followed(
 ) -> anyhow::Result<Shown> {
     let mut found = f.info();
     // Following a run that has written nothing yet.
-    let started = f.started().map(|s| running_where(s.session.as_deref()));
-    match (&found, &started) {
-        (Some(info), _) => say(&mut err, &following(addr, info, sessions)),
-        (None, Some(running)) => say(
+    let started = f.started().is_some();
+    match (&found, f.not_streamed(), f.started()) {
+        (Some(info), _, _) => say(&mut err, &following(addr, info, sessions)),
+        // A run on a driver that does not stream its log: its log comes
+        // when it ends. Outranks "no output yet".
+        (None, Some(not_streamed), _) => say(
             &mut err,
-            &format!("{addr} · running {running} · no output yet · following"),
+            &format!(
+                "{addr} · running {} on a driver that does not stream its log; waiting for the run to end",
+                running_where(not_streamed.session.as_deref())
+            ),
         ),
-        (None, None) => say(&mut err, &format!("{addr} · waiting for a run to start")),
+        (None, None, Some(started)) => say(
+            &mut err,
+            &format!(
+                "{addr} · running {} · no output yet · following",
+                running_where(started.session.as_deref())
+            ),
+        ),
+        (None, None, None) => say(&mut err, &format!("{addr} · waiting for a run to start")),
     }
     // `-n`: the bytes already there, held until caught up, then only their
     // last N lines printed.
@@ -363,7 +369,7 @@ fn print_followed(
                 if let Some(start) = live {
                     let took = since(start, hcore::events::now_unix_ms());
                     say(&mut err, &ended(addr, f.replaced_by(), &took));
-                } else if found.is_none() && started.is_some() {
+                } else if found.is_none() && started {
                     say(&mut err, &format!("{addr} · the run ended with no output"));
                 }
                 break;
@@ -736,11 +742,19 @@ fn log_error(e: &anyhow::Error) -> crate::tui::dashboard::LogOpened {
     }
 }
 
-/// What `heph log` and the Log tab say of a run on a driver that returns its
-/// log when the run ends instead of streaming it. The tab asks again when
-/// the row's state changes, so the log shows once the run ends.
-const NOT_STREAMED: &str =
-    "this target's driver does not stream its log; it appears when the run ends";
+/// What the Log tab says of a run on a driver that returns its log when the
+/// run ends instead of streaming it, and the next step. The tab asks again
+/// when the row's state changes, so the log shows there once the run ends.
+const NOT_STREAMED: &str = "this target's driver does not stream its log; it shows here once the run ends, or `heph log -f` waits for it";
+
+/// What `heph log` says of the same, with the next step: `-f` waits for the
+/// run and prints its log, where a plain `heph log` exits 1 at once.
+fn not_streamed(addr: &Addr, session: Option<&str>) -> String {
+    format!(
+        "heph: no live log for {addr}: it is running {} on a driver that does not stream its log; run `heph log {addr}` again once the run ends, or `heph log -f {addr}` to wait for it",
+        running_where(session)
+    )
+}
 
 /// Where a finished log was read from, in the Log tab's words.
 fn about(source: &LogSource) -> &'static str {
@@ -879,6 +893,25 @@ mod tests {
             why.starts_with("this target's driver does not stream its log"),
             "{why}"
         );
+        assert!(why.contains("`heph log -f`"), "names the next step: {why}");
+    }
+
+    /// A plain `heph log` of a run on a driver that does not stream its log
+    /// keeps its stable prefix and names both next steps, with the addr.
+    #[test]
+    fn not_streamed_names_the_next_step() {
+        let addr = parse_addr("//app:img").expect("addr");
+        let msg = super::not_streamed(&addr, Some("s1"));
+        assert!(
+            msg.starts_with("heph: no live log for //app:img: "),
+            "{msg}"
+        );
+        assert!(msg.contains("session s1"), "{msg}");
+        assert!(
+            msg.contains("`heph log //app:img` again once the run ends"),
+            "{msg}"
+        );
+        assert!(msg.contains("`heph log -f //app:img` to wait"), "{msg}");
     }
 
     /// How `-f` says a run ended, from what replaced its live file.

@@ -341,12 +341,20 @@ async fn a_silent_driver_reads_not_streamed_until_its_log_is_imported() -> anyho
         Some(None),
         "{own:#}"
     );
+    // A follow (`heph log -f`) waits for the run instead, saying why, and
+    // reads the imported log once it is stored — waiting for a start or not.
+    let mut follower = reader
+        .follow_log(&addr, &located, false)
+        .await?
+        .expect("a follow waits for the run");
+    assert_eq!(
+        follower.not_streamed().map(|n| n.session.clone()),
+        Some(Some(opened.id.encode()))
+    );
+    assert!(follower.info().is_none());
     assert!(
-        reader
-            .follow_log(&addr, &located, true)
-            .await
-            .is_err_and(|e| e.is::<LogNotStreamed>()),
-        "a follow is told the same"
+        matches!(follower.poll()?, heph::engine::FollowStep::Idle),
+        "nothing to read while the run goes on"
     );
     // Asked for a hashin, the start (which names none) says nothing.
     let hashed = LogOptions {
@@ -367,6 +375,25 @@ async fn a_silent_driver_reads_not_streamed_until_its_log_is_imported() -> anyho
     let mut text = String::new();
     std::io::Read::read_to_string(&mut log.reader()?, &mut text)?;
     assert!(text.starts_with(RETURNED), "the imported log: {text:?}");
+
+    // The follower started mid-run reads the same log, then ends.
+    let mut followed = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        match follower.poll()? {
+            heph::engine::FollowStep::Bytes(b) => followed.extend_from_slice(&b),
+            heph::engine::FollowStep::Idle => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the follow never ended"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            heph::engine::FollowStep::End => break,
+        }
+    }
+    assert_eq!(String::from_utf8_lossy(&followed), text);
+    assert!(follower.not_streamed().is_none());
     slot.finish(Some(0));
     Ok(())
 }
