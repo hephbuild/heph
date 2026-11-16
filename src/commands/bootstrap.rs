@@ -398,12 +398,24 @@ fn new_engine_with(
 /// Ctrl-C while the TUI is in raw mode (ISIG cleared), in which case this
 /// task never fires and the TUI's key handler drives the trigger instead.
 /// Both producers are gated by the same `SuppressionHandle`.
+///
+/// The listener is armed here, before the task is spawned: `ctrl_c()` arms
+/// nothing until it is first polled, so a spawned task that had not run yet
+/// left SIGINT's default action in place, and a ctrl-c pressed once the
+/// command was already printing (`heph log -f`'s "waiting for a run to
+/// start") killed heph by the signal instead of cancelling it.
 fn spawn_sigint_producer(trigger: ShutdownTrigger) {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut sigint = match signal(SignalKind::interrupt()) {
+        Ok(sigint) => sigint,
+        Err(e) => {
+            tracing::warn!(error = %e, "listening for ctrl-c; it will kill heph instead of cancelling");
+            return;
+        }
+    };
     tokio::spawn(async move {
-        loop {
-            if tokio::signal::ctrl_c().await.is_err() {
-                return;
-            }
+        while sigint.recv().await.is_some() {
             trigger.trigger();
         }
     });
