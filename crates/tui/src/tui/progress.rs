@@ -736,7 +736,6 @@ impl BuildState {
                         since_ms: ev.at_unix_ms,
                     },
                 );
-                self.spot.admission.insert((ev.at_unix_ms, addr.clone()));
             }
             BuildEventKind::AdmissionWaitEnd { addr } => {
                 self.end_admission_wait(addr);
@@ -980,10 +979,7 @@ impl BuildState {
 
     /// Drop `addr`'s announced admission wait, if any.
     fn end_admission_wait(&mut self, addr: &str) {
-        let Some(w) = self.admission_waits.remove(addr) else {
-            return;
-        };
-        self.spot.admission.remove(&(w.since_ms, addr.to_owned()));
+        self.admission_waits.remove(addr);
     }
 
     /// Take a scratch wait that ended or was replaced out of the spotlight's

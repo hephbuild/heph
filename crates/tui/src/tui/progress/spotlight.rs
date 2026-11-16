@@ -5,8 +5,12 @@
 //!
 //! 1. a pending approval (the view's, not the fold's: it is not an event);
 //! 2. the newest root failure — the first one, until a newer one replaces it;
-//! 3. the longest wait: admission, result lock or scratch lock;
-//! 4. the longest-running target, past [`LONG_RUNNING_THRESHOLD_MS`].
+//! 3. the longest-running target, past [`LONG_RUNNING_THRESHOLD_MS`];
+//! 4. only while nothing runs, the longest wait: result lock or scratch lock.
+//!
+//! An admission (pool) wait never takes the spotlight: it is the build
+//! working through its own pools, which the cpu segment already shows, not
+//! something it is stuck on.
 //!
 //! Rules 3 and 4 read the front of a set kept ordered by start time as each
 //! event is folded, so a frame does constant work however many targets wait
@@ -33,8 +37,6 @@ const REASON_MAX: usize = 120;
 /// What the spotlight orders by start time, kept as events fold.
 #[derive(Debug, Default)]
 pub(super) struct SpotIndex {
-    /// `(since, addr)` of every admission wait.
-    pub(super) admission: BTreeSet<(u64, String)>,
     /// `(since, addr)` of every result-lock wait.
     pub(super) lock: BTreeSet<(u64, String)>,
     /// `(since, consumer addr)` of every scratch-lock wait.
@@ -97,7 +99,6 @@ impl RootFailure {
 /// What rules 3 and 4 hold.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SpotKey {
-    Admission(String),
     Lock(String),
     /// By cache: scratch waits are grouped.
     Scratch(String),
@@ -107,7 +108,6 @@ enum SpotKey {
 /// A [`SpotKey`] borrowed from the fold, so a frame allocates no key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SpotRef<'a> {
-    Admission(&'a str),
     Lock(&'a str),
     Scratch(&'a str),
     Run(&'a str),
@@ -117,14 +117,13 @@ impl SpotRef<'_> {
     /// The rule: lower is higher priority.
     fn rule(self) -> u8 {
         match self {
-            Self::Admission(_) | Self::Lock(_) | Self::Scratch(_) => 3,
-            Self::Run(_) => 4,
+            Self::Run(_) => 3,
+            Self::Lock(_) | Self::Scratch(_) => 4,
         }
     }
 
     fn owned(self) -> SpotKey {
         match self {
-            Self::Admission(a) => SpotKey::Admission(a.to_owned()),
             Self::Lock(a) => SpotKey::Lock(a.to_owned()),
             Self::Scratch(c) => SpotKey::Scratch(c.to_owned()),
             Self::Run(a) => SpotKey::Run(a.to_owned()),
@@ -135,7 +134,6 @@ impl SpotRef<'_> {
 impl SpotKey {
     fn as_ref(&self) -> SpotRef<'_> {
         match self {
-            Self::Admission(a) => SpotRef::Admission(a),
             Self::Lock(a) => SpotRef::Lock(a),
             Self::Scratch(c) => SpotRef::Scratch(c),
             Self::Run(a) => SpotRef::Run(a),
@@ -299,33 +297,31 @@ impl BuildState {
         })
     }
 
-    /// Rules 3 and 4 without the hold: the oldest wait, else the target whose
-    /// open op started first once it is past the long-running threshold. Ties
-    /// on start break on address.
+    /// Rules 3 and 4 without the hold: the target whose open op started first
+    /// once it is past the long-running threshold; while nothing runs, the
+    /// oldest lock or scratch wait. Ties on start break on address.
     fn spot_raw(&self, now_ms: u64) -> Option<SpotRef<'_>> {
         let i = &self.spot;
-        let admission = front(&i.admission).map(|(t, a)| (*t, a.as_str(), SpotRef::Admission(a)));
+        if let Some((start, addr)) = front(&i.running) {
+            return (now_ms.saturating_sub(*start) > LONG_RUNNING_THRESHOLD_MS)
+                .then_some(SpotRef::Run(addr));
+        }
         let lock = front(&i.lock).map(|(t, a)| (*t, a.as_str(), SpotRef::Lock(a)));
         let scratch = front(&i.scratch).and_then(|(t, a)| {
             let w = self.scratch_waits.get(a)?;
             Some((*t, a.as_str(), SpotRef::Scratch(w.scratch.as_str())))
         });
-        let wait = [admission, lock, scratch]
+        let (_, _, key) = [lock, scratch]
             .into_iter()
             .flatten()
-            .min_by(|x, y| (x.0, x.1).cmp(&(y.0, y.1)));
-        if let Some((_, _, key)) = wait {
-            return Some(key);
-        }
-        let (start, addr) = front(&i.running)?;
-        (now_ms.saturating_sub(*start) > LONG_RUNNING_THRESHOLD_MS).then_some(SpotRef::Run(addr))
+            .min_by(|x, y| (x.0, x.1).cmp(&(y.0, y.1)))?;
+        Some(key)
     }
 
     /// Whether `key` still waits or runs: a held target that stopped hands
     /// over at once.
     fn spot_alive(&self, key: SpotRef<'_>) -> bool {
         match key {
-            SpotRef::Admission(a) => self.admission_waits.contains_key(a),
             SpotRef::Lock(a) => self.lock_waits.contains_key(a),
             SpotRef::Scratch(c) => self.spot.by_cache.get(c).is_some_and(|s| !s.is_empty()),
             SpotRef::Run(a) => self.dash.open_since(a).is_some(),
@@ -372,18 +368,6 @@ impl BuildState {
             return Some(f);
         }
         match self.spot_pick(now_ms)? {
-            SpotRef::Admission(addr) => {
-                let text = self.admission_text(addr, now_ms)?;
-                // The shared formatter's words, after the address it starts
-                // with, which the line may shorten on its own.
-                let detail = text.strip_prefix(addr).unwrap_or(&text).trim_start();
-                Some(Spot {
-                    icon: "⧗",
-                    style: wait_style(),
-                    name: clean_inline(addr).into_owned(),
-                    detail: clean_inline(detail).into_owned(),
-                })
-            }
             SpotRef::Lock(addr) => {
                 let (holder, since) = self.lock_waits.get(addr)?;
                 let waited = elapsed(now_ms.saturating_sub(*since));
@@ -462,16 +446,16 @@ mod tests {
                 at(0, start("//r:fail")),
                 at(10, end("//r:fail", Some("boom"), None)),
             ],
-            3 => vec![at(0, start("//r:wait")), at(20, lock("//r:wait", None))],
-            4 => vec![at(0, start("//r:run")), at(30, exec("//r:run"))],
+            3 => vec![at(0, start("//r:run")), at(30, exec("//r:run"))],
+            4 => vec![at(0, start("//r:wait")), at(20, lock("//r:wait", None))],
             _ => Vec::new(),
         }
     }
 
-    const ICONS: [&str; 4] = ["✦", "✗", "⧗", "▶"];
+    const ICONS: [&str; 4] = ["✦", "✗", "▶", "⧗"];
 
-    /// Approval > root failure > longest wait > longest run, for each pair,
-    /// as the line shows it.
+    /// Approval > root failure > longest run > longest lock or scratch wait,
+    /// for each pair, as the line shows it.
     #[test]
     fn spotlight_priority() {
         for hi in 1..=4 {
@@ -507,11 +491,11 @@ mod tests {
 
     #[test]
     fn spotlight_cost_and_hold() {
-        // Rule 3 reads the fronts of the ordered sets: as many at 100k
+        // Rule 4 reads the fronts of the ordered sets: as many at 100k
         // waiters as at 10.
         let reads = |n: u64| {
             let events: Vec<_> = (0..n)
-                .map(|i| at(i, admission(&format!("//w:{i}"), "cpu", None, None)))
+                .map(|i| at(i, lock(&format!("//w:{i}"), None)))
                 .collect();
             let s = fold(&events);
             FRONTS_READ.with(|c| c.set(0));
@@ -523,9 +507,10 @@ mod tests {
         assert!(few <= 4, "{few} fronts read");
         assert_eq!(reads(100_000), few, "constant work at 100k waiters");
 
-        // The hold, from event times alone. `r1` is picked when the wait
-        // ends at 9s; at 10s it moves on to its cache write, so its op now
-        // starts after `r2`'s, and the hold keeps it until 11s.
+        // The hold, from event times alone. `w`'s wait never shows, since
+        // targets run. `r1` is picked at the first event past the
+        // long-running threshold, 9s; at 10s it moves on to its cache write,
+        // so its op now starts after `r2`'s, and the hold keeps it until 11s.
         let events = vec![
             at(0, start("//h:r1")),
             at(0, exec("//h:r1")),
@@ -579,6 +564,18 @@ mod tests {
         let started = fold(&[at(0, start("//q:a")), at(0, exec("//q:a"))]);
         assert_eq!(shown(&started, LONG_RUNNING_THRESHOLD_MS - 1), None);
         assert_eq!(shown(&BuildState::new(), 60_000), None);
+        // A lock wait shows only while nothing runs: a running target keeps
+        // it off the line even before that target is spotlit itself.
+        let wait_and_run = fold(&[
+            at(0, lock("//q:w", None)),
+            at(0, start("//q:a")),
+            at(0, exec("//q:a")),
+        ]);
+        assert_eq!(shown(&wait_and_run, LONG_RUNNING_THRESHOLD_MS - 1), None);
+        assert_eq!(
+            shown(&fold(&[at(0, lock("//q:w", None))]), 31_000).as_deref(),
+            Some("⧗ //q:w locked, holder unknown 31s")
+        );
 
         // Scratch waits group by cache.
         let grouped = fold(&[
@@ -612,11 +609,11 @@ mod tests {
         assert_eq!(Spot::approval("//a:g", 1).text(), "✦ //a:g");
     }
 
-    /// The spotlight's words for an admission wait are the shared
-    /// formatter's, after the address; a waiter that yields shows no queue
-    /// position, since its event carries none worth showing.
+    /// An admission (pool) wait never takes the spotlight, of any pool,
+    /// however long it waits and whether or not anything runs; a lock wait
+    /// that started later still shows once nothing runs.
     #[test]
-    fn wait_text_is_the_shared_formatter_spotlight() {
+    fn admission_waits_never_take_the_spotlight() {
         let yielding = YieldingToData {
             pool: "memory".into(),
             need: 1 << 30,
@@ -626,24 +623,14 @@ mod tests {
             ("cpu", None, Some(yielding)),
             ("sandbox", Some(2), None),
         ] {
-            let s = fold(&[at(0, admission("//w:a", pool, removals, yields.clone()))]);
-            let spot = s.spotlight(T0 + 41_000).expect("a wait");
-            let expected = hcore::events::admission_wait_text(
-                "//w:a",
-                pool,
-                Unit::default_for(pool),
-                2,
-                1,
-                3,
-                yields.as_ref().map(|y| (y, Unit::default_for(&y.pool))),
-                removals,
-                "41s",
-            );
-            assert_eq!(format!("{} {}", spot.name, spot.detail), expected);
-            assert_eq!(spot.icon, "⧗");
-            if yields.is_some() {
-                assert!(!spot.detail.contains("ahead"), "{}", spot.detail);
-            }
+            let alone = fold(&[at(0, admission("//w:a", pool, removals, yields.clone()))]);
+            assert_eq!(shown(&alone, 600_000), None, "{pool}");
+            let with_lock = fold(&[
+                at(0, admission("//w:a", pool, removals, yields)),
+                at(1_000, lock("//w:b", None)),
+            ]);
+            let spot = with_lock.spotlight(T0 + 41_000).expect("the lock wait");
+            assert_eq!(spot.name, "//w:b", "{pool}");
         }
     }
 }
