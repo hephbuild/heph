@@ -1738,6 +1738,9 @@ pub struct TuiProgressView {
     /// held open (the dashboard was up). `Some` freezes the elapsed clock at
     /// this instant.
     finished_at_ms: Option<u64>,
+    /// The user stopped the run ([`TUIAppView::set_stopped`]): the final line
+    /// reads `✗ stopped · …`.
+    stopped: bool,
     /// Whether the dashboard is up (full screen, on the alternate screen)
     /// rather than the line. A run starts on the line; `Tab` opens the
     /// dashboard and `Esc` with no filter closes it.
@@ -1918,6 +1921,7 @@ impl TuiProgressView {
             state: BuildState::new(),
             model,
             finished_at_ms: None,
+            stopped: false,
             dashboard_open: false,
             list: crate::tui::dashboard::ListState::default(),
             last_lines: crate::tui::dashboard::LastLines::default(),
@@ -2118,12 +2122,18 @@ impl TuiProgressView {
             .finished_at_ms
             .unwrap_or_else(hcore::events::now_unix_ms);
         let elapsed = human_elapsed_ms(self.state.elapsed_ms(clock));
+        let elapsed = elapsed.trim_start();
+        // A user stop is never a success, whatever finished before it; the
+        // word says why the counts stop short.
+        if self.stopped {
+            return Some(format!("✗ stopped · {elapsed} · {segment}"));
+        }
         let mark = if self.state.unsuccessful() {
             "✗"
         } else {
             "✓"
         };
-        Some(format!("{mark} {} · {segment}", elapsed.trim_start()))
+        Some(format!("{mark} {elapsed} · {segment}"))
     }
 
     /// Open the dashboard, as `Tab` from the line does.
@@ -2842,6 +2852,10 @@ impl TUIAppView for TuiProgressView {
         !matches!(self.role, Role::Attached { .. }) && (self.full_screen() || self.pinned)
     }
 
+    fn set_stopped(&mut self) {
+        self.stopped = true;
+    }
+
     fn set_finished(&mut self, at_ms: u64) {
         // Freeze the elapsed clock at the finish instant; the viewport keeps
         // rendering while held but the time must stop counting. A viewer
@@ -2950,6 +2964,9 @@ pub struct CiProgressView {
     /// first names the problem, and [`finish`](CIAppView::finish) reports the
     /// total it cost.
     scratch_wait_announced: HashSet<String>,
+    /// The user stopped the run ([`CIAppView::set_stopped`]): the summary
+    /// line starts `stopped · `, as the TUI's final line does.
+    stopped: bool,
 }
 
 impl CiProgressView {
@@ -2957,6 +2974,17 @@ impl CiProgressView {
         Self {
             core: ProgressCore::new(label),
             scratch_wait_announced: HashSet::new(),
+            stopped: false,
+        }
+    }
+
+    /// The summary line [`CIAppView::finish`] logs last.
+    fn summary_line(&self) -> String {
+        let summary = self.core.state.summary();
+        if self.stopped {
+            format!("stopped · {summary}")
+        } else {
+            summary
         }
     }
 }
@@ -3062,7 +3090,11 @@ impl CIAppView for CiProgressView {
             let total = human_elapsed(total_ms);
             tracing::info!("scratch {scratch} serialized {waiters} targets, {total} of total wait");
         }
-        tracing::info!("{}", self.core.state.summary());
+        tracing::info!("{}", self.summary_line());
+    }
+
+    fn set_stopped(&mut self) {
+        self.stopped = true;
     }
 }
 
@@ -4606,6 +4638,18 @@ mod tests {
         ]);
         assert!(!log.contains('⧗'), "{log}");
         assert!(log.contains("running //a:b [exec]"), "{log}");
+    }
+
+    /// A stop reads first on the CI summary line, as on the TUI's final
+    /// line; without one the summary is unchanged.
+    #[test]
+    fn ci_summary_says_stopped_after_a_stop() {
+        let mut v = CiProgressView::new("Running");
+        v.apply(&ev(1_000, execute_start("//a:b")));
+        let plain = v.summary_line();
+        assert!(plain.starts_with("done "), "{plain}");
+        v.set_stopped();
+        assert_eq!(v.summary_line(), format!("stopped · {plain}"));
     }
 
     #[test]

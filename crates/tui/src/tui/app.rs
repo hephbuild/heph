@@ -424,6 +424,13 @@ pub trait TUIAppView: Send {
     /// default.
     fn set_finished(&mut self, _at_ms: u64) {}
 
+    /// The user stopped the run before it finished — a ctrl-c key that
+    /// stopped it, or SIGINT/SIGTERM/SIGHUP — so the final summary says
+    /// "stopped". Not called for fail-fast cancellation, which also cancels
+    /// targets but is the build's own doing. Called before
+    /// [`Self::last_render`]. No-op by default.
+    fn set_stopped(&mut self) {}
+
     /// The approval prompt this view shows now, as a session records it.
     /// `None` by default (no approval gate).
     fn pending_approval(&self) -> Option<crate::tui::session::ApprovalPrompt> {
@@ -465,6 +472,9 @@ pub trait CIAppView: Send {
 
     /// Print the final summary once the event stream ends.
     fn finish(&self) {}
+
+    /// See [`TUIAppView::set_stopped`]; called before [`Self::finish`].
+    fn set_stopped(&mut self) {}
 
     /// See [`TUIAppView::session_header`].
     fn session_header(&self) -> SessionHeader {

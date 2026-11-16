@@ -984,9 +984,34 @@ fn ctrl_c_twice_on_full_screens() {
                 case.name,
                 g.pty.seen()
             );
+            // The final line says why the build ended short, whichever
+            // producer (key or signal) stopped it. A stop that lands before
+            // the targets were matched ends with the cancellation report and
+            // no final line at all; either way, no summary may read as an
+            // ordinary `✗ <clock>` failure.
+            let seen = g.pty.seen();
+            assert!(
+                seen.contains("✗ stopped · ") || seen.contains("× cancelled"),
+                "{}: the final line does not say stopped\n{seen}",
+                case.name
+            );
+            assert!(
+                !seen.lines().any(|l| l
+                    .strip_prefix("✗ ")
+                    .is_some_and(|r| r.starts_with(|c: char| c.is_ascii_digit()))),
+                "{}: a summary without \"stopped\"\n{seen}",
+                case.name
+            );
             Some(code)
         } else {
             assert_eq!(code, 0, "{}: exit status\n{}", case.name, g.pty.seen());
+            // The ctrl-c that quits a held, finished run stops nothing.
+            let seen = g.pty.seen();
+            assert!(
+                !seen.contains("✗ stopped"),
+                "{}: a finished run says stopped\n{seen}",
+                case.name
+            );
             None
         }
     };

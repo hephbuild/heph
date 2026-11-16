@@ -1012,4 +1012,48 @@ mod tests {
         assert!(last.contains("0 failed"), "{last}");
         assert!(!last.contains("root"), "{last}");
     }
+
+    /// A user stop (a ctrl-c that stopped, or a signal) says so first, keeps
+    /// the clock, and still reports the roots that failed before it. The
+    /// same cancelled ends with no user stop (fail-fast) do not say it.
+    #[test]
+    fn a_user_stop_says_stopped() {
+        use crate::tui::app::TUIAppView;
+        use crate::tui::progress::TuiProgressView;
+        use crate::tui::progress::test_events::{T0, at, start};
+
+        let run = || {
+            let mut v = TuiProgressView::new("Running //...");
+            for a in ["//p:a", "//p:b", "//p:c"] {
+                v.apply(&at(0, start(a)));
+            }
+            v.apply(&at(10, failed_end("//p:a", None, false)));
+            v.apply(&at(11, failed_end("//p:b", None, false)));
+            v.apply(&at(20, failed_end("//p:c", None, true)));
+            v
+        };
+
+        let mut v = run();
+        v.set_stopped();
+        v.set_finished(T0 + 2_000);
+        let last = v.final_line().expect("a summary");
+        assert!(last.starts_with("✗ stopped · 2.000s · "), "{last}");
+        assert!(last.contains("2 failed (2 roots)"), "{last}");
+
+        // Fail-fast cancelled `//p:c` too, but nobody stopped the run.
+        let mut v = run();
+        v.set_finished(T0 + 2_000);
+        let last = v.final_line().expect("a summary");
+        assert!(last.starts_with("✗ 2.000s · "), "{last}");
+        assert!(!last.contains("stopped"), "{last}");
+
+        // A stop with nothing failed is still not a success.
+        let mut v = TuiProgressView::new("Running //...");
+        v.apply(&at(0, start("//p:a")));
+        v.apply(&at(5, failed_end("//p:a", None, true)));
+        v.set_stopped();
+        v.set_finished(T0 + 2_000);
+        let last = v.final_line().expect("a summary");
+        assert!(last.starts_with("✗ stopped · 2.000s · "), "{last}");
+    }
 }

@@ -391,6 +391,10 @@ pub async fn run<A: App + 'static>(
     // Holds the app's result once its future resolves. We don't break the loop
     // here: the TUI stays up, rendering, until background cleanups drain too.
     let mut app_result: Option<anyhow::Result<A::Output>> = None;
+    // Whether a stop (a ctrl-c that stopped, or a signal) had reached the run
+    // when the app ended: the final line then says "stopped". Read at that
+    // instant, so the ctrl-c that quits a held, finished run is not one.
+    let mut stopped_before_finish = false;
     // Latched once the finished run is held open on a non-main view: the viewport
     // keeps rendering until the user quits explicitly (`q` / Ctrl-C).
     let mut held = false;
@@ -428,6 +432,7 @@ pub async fn run<A: App + 'static>(
         }
         tokio::select! {
             res = &mut app_handle, if app_result.is_none() => {
+                stopped_before_finish = shutdown.fired();
                 app_result = Some(match res {
                     Ok(inner) => inner,
                     Err(join_err) if join_err.is_panic() => {
@@ -937,6 +942,9 @@ pub async fn run<A: App + 'static>(
     // viewer prints the same line, and so it knows what follows was printed
     // below it.
     let at = held_at.unwrap_or_else(now_unix_ms);
+    if stopped_before_finish {
+        view.set_stopped();
+    }
     view.set_finished(at);
     if let Some(t) = view_tap.as_mut() {
         t.finished(&view, at);
