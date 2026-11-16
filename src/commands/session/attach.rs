@@ -397,9 +397,11 @@ impl App for AttachApp {
                 HeaderKind::Gc => {
                     LineView::Gc(Box::new(tui::GcCiView::new(self.meta.label.clone())))
                 }
-                HeaderKind::Build | HeaderKind::Unknown => {
-                    LineView::Progress(Box::new(tui::CiProgressView::new(self.meta.label.clone())))
-                }
+                // A failure's tail as the run carried it: already cut to the
+                // run's own --log-lines.
+                HeaderKind::Build | HeaderKind::Unknown => LineView::Progress(Box::new(
+                    tui::CiProgressView::new(self.meta.label.clone()).with_log_lines(usize::MAX),
+                )),
             }
         }
     }

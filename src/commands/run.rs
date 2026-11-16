@@ -720,6 +720,8 @@ impl App for RunApp {
 
     fn ci_view(&self) -> Self::CiView {
         tui::CiProgressView::new(self.progress_label())
+            .with_log_lines(self.args.log_lines)
+            .with_redact(tui::text::Redact::heph_home(&self.engine.home))
     }
 
     async fn run(self, ctx: AppContext) -> anyhow::Result<Option<hcore::process::Exit>> {

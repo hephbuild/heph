@@ -3047,6 +3047,63 @@ pub(crate) fn prepare_note(
     Some(Note { text, warn })
 }
 
+/// A root failure's block in the CI log, printed the moment it fails, in the
+/// failure report's words (`src/commands/errors/report.rs`):
+///
+/// ```text
+/// ✗ //web:lint · exit status: 1
+///   │ web/a.ts:14:3  error  'useState' is defined but never used
+/// ```
+///
+/// The header names the exit status or the timeout as the report's block
+/// header does; a failure with neither shows its error as a body row, as the
+/// report's body does. Then the last `log_lines` lines of the tail the event
+/// carries (never a file read on the event path), sanitized, redacted and
+/// plain. No trailing newline: the log line adds one.
+fn live_failure_block(
+    addr: &str,
+    error: &str,
+    exit_status: Option<&str>,
+    timed_out: Option<&hcore::events::TimedOutData>,
+    tail: Option<&str>,
+    log_lines: usize,
+    redact: &crate::tui::text::Redact,
+) -> String {
+    use crate::tui::text::{clean_inline, expand_tabs, sanitize_log};
+    let row = |line: &str| expand_tabs(&redact.apply(line)).into_owned();
+
+    let mut out = format!("✗ {}", clean_inline(addr));
+    let mut body: Vec<String> = Vec::new();
+    if let Some(t) = timed_out {
+        out.push_str(" · timed out after ");
+        out.push_str(&hcore::units::format_duration(
+            std::time::Duration::from_millis(t.timeout_ms),
+        ));
+        out.push_str(" (its timeout)");
+    } else if let Some(status) = exit_status {
+        out.push_str(" · ");
+        out.push_str(clean_inline(status).trim_end());
+    } else {
+        body.extend(sanitize_log(error.as_bytes()).lines().map(row));
+    }
+    if log_lines > 0
+        && let Some(text) = tail
+    {
+        if text.trim().is_empty() {
+            body.push("empty log".to_owned());
+        } else {
+            let clean = sanitize_log(text.as_bytes());
+            let n = clean.lines().count();
+            body.extend(clean.lines().skip(n.saturating_sub(log_lines)).map(row));
+        }
+    }
+    for line in &body {
+        out.push_str("\n  │ ");
+        out.push_str(line);
+    }
+    out
+}
+
 /// The paved-road [`CIAppView`]: a one-line label header, a concise per-execute
 /// line, and a final one-line summary plus per-error lines — all through the
 /// log sink. Used by every command's `ci_view`.
@@ -3062,7 +3119,17 @@ pub struct CiProgressView {
     /// The user stopped the run ([`CIAppView::set_stopped`]): the summary
     /// line starts `stopped · `, as the TUI's final line does.
     stopped: bool,
+    /// How many of a root failure's last log lines it prints the moment it
+    /// fails (`--log-lines`).
+    log_lines: usize,
+    /// Root failures already printed: a same-addr `ResultEnd` double-fire
+    /// prints one block, not two.
+    failures_printed: HashSet<String>,
 }
+
+/// `heph run --log-lines`' default: how many tail lines a failure prints live
+/// when the command has no such flag.
+const DEFAULT_LOG_LINES: usize = 10;
 
 impl CiProgressView {
     pub fn new(label: impl Into<String>) -> Self {
@@ -3070,7 +3137,23 @@ impl CiProgressView {
             core: ProgressCore::new(label),
             scratch_wait_announced: HashSet::new(),
             stopped: false,
+            log_lines: DEFAULT_LOG_LINES,
+            failures_printed: HashSet::new(),
         }
+    }
+
+    /// Print `n` tail lines per root failure instead of [`DEFAULT_LOG_LINES`].
+    #[must_use]
+    pub fn with_log_lines(mut self, n: usize) -> Self {
+        self.log_lines = n;
+        self
+    }
+
+    /// Redact `redact` (heph's home) from every error text and log line.
+    #[must_use]
+    pub fn with_redact(mut self, redact: crate::tui::text::Redact) -> Self {
+        self.core.state.set_redact(redact);
+        self
     }
 
     /// The summary line [`CIAppView::finish`] logs last.
@@ -3157,6 +3240,31 @@ impl CIAppView for CiProgressView {
                         tracing::info!("{}", note.text);
                     }
                 }
+            }
+            // A root failure's block, the moment it fails: a CI log otherwise
+            // says why only once the whole build is over. A collateral
+            // failure and a stop print nothing — the root's block explains
+            // them, and Ctrl-C is not a failure.
+            BuildEventKind::ResultEnd {
+                addr,
+                error: Some(error),
+                upstream_of: None,
+                exit_status,
+                log_tail,
+                timed_out,
+                cancelled: false,
+            } if !self.failures_printed.contains(addr) => {
+                self.failures_printed.insert(addr.clone());
+                let block = live_failure_block(
+                    addr,
+                    error,
+                    exit_status.as_deref(),
+                    timed_out.as_ref(),
+                    log_tail.as_ref().map(|t| t.text.as_str()),
+                    self.log_lines,
+                    &self.core.state.redact,
+                );
+                tracing::error!("{block}");
             }
             _ => {}
         }
@@ -4655,6 +4763,11 @@ mod tests {
 
     /// [`ci_view_log`], naming lock holders with `names`.
     fn ci_view_log_with(names: HolderNames, events: &[BuildEvent]) -> String {
+        ci_view_log_of(CiProgressView::new("Running"), names, events)
+    }
+
+    /// [`ci_view_log`] of a view built by the test.
+    fn ci_view_log_of(mut v: CiProgressView, names: HolderNames, events: &[BuildEvent]) -> String {
         #[derive(Clone, Default)]
         struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
         impl std::io::Write for Buf {
@@ -4674,10 +4787,10 @@ mod tests {
         let subscriber = tracing_subscriber::fmt()
             .with_writer(move || sink.clone())
             .with_ansi(false)
+            .with_target(false)
             .without_time()
             .finish();
         tracing::subscriber::with_default(subscriber, || {
-            let mut v = CiProgressView::new("Running");
             v.name_lock_holders(names.clone());
             for e in events {
                 // As the backend's receiver does, before the fold.
@@ -4753,6 +4866,123 @@ mod tests {
             ev(2_000, execute_start("//a:b")),
         ]);
         assert_eq!(log, "", "an execute start logged: {log}");
+    }
+
+    /// A failing `ResultEnd` with a status and a log tail.
+    fn failed_end(
+        addr: &str,
+        upstream_of: Option<&str>,
+        cancelled: bool,
+        tail: Option<&str>,
+    ) -> BuildEventKind {
+        BuildEventKind::ResultEnd {
+            addr: addr.into(),
+            error: Some(format!("{addr}: exit status: 1")),
+            upstream_of: upstream_of.map(Into::into),
+            exit_status: Some("exit status: 1".into()),
+            log_tail: tail.map(|text| hcore::events::LogTailData {
+                text: text.into(),
+                start_line: 1,
+            }),
+            timed_out: None,
+            cancelled,
+        }
+    }
+
+    /// What the CI view logs for `events` with `--log-lines n`.
+    fn ci_live_log(n: usize, events: &[BuildEventKind]) -> String {
+        let events: Vec<BuildEvent> = events.iter().cloned().map(|k| ev(1_000, k)).collect();
+        ci_view_log_of(
+            CiProgressView::new("Running").with_log_lines(n),
+            HolderNames::default(),
+            &events,
+        )
+    }
+
+    const TAIL: &str = "one\ntwo\nthree\nfour\nfive\n";
+
+    /// A root failure prints its block the moment it fails: the report's
+    /// header, then exactly the last `--log-lines` lines of its tail.
+    #[test]
+    fn ci_view_prints_a_root_failures_tail_as_it_fails() {
+        let end = failed_end("//a:b", None, false, Some(TAIL));
+        assert_eq!(
+            ci_live_log(3, &[result_start("//a:b"), end.clone()]),
+            "ERROR ✗ //a:b · exit status: 1\
+             \n  │ three\
+             \n  │ four\
+             \n  │ five\n",
+        );
+        // A tail shorter than --log-lines: what the event carried.
+        let log = ci_live_log(50, std::slice::from_ref(&end));
+        assert_eq!(log.matches("  │ ").count(), 5, "{log}");
+        // --log-lines 0: the header alone.
+        assert_eq!(ci_live_log(0, &[end]), "ERROR ✗ //a:b · exit status: 1\n");
+    }
+
+    /// A same-addr `ResultEnd` double-fire prints one block.
+    #[test]
+    fn ci_view_prints_a_root_failure_once() {
+        let end = failed_end("//a:b", None, false, Some(TAIL));
+        let log = ci_live_log(1, &[end.clone(), end]);
+        assert_eq!(log.matches('✗').count(), 1, "{log}");
+    }
+
+    /// Collateral failures and stops print nothing live: the root's block
+    /// explains the first, and a stop is not a failure.
+    #[test]
+    fn ci_view_prints_nothing_for_an_upstream_failure_or_a_stop() {
+        let upstream = failed_end("//a:c", Some("//a:b"), false, Some(TAIL));
+        let stopped = failed_end("//a:d", None, true, Some(TAIL));
+        assert_eq!(ci_live_log(10, &[upstream, stopped]), "");
+    }
+
+    /// A timeout names its limit as the report does; a failure with no
+    /// status shows its error; control bytes in the tail, the address and
+    /// the error never reach the log.
+    #[test]
+    fn ci_view_live_block_words_and_sanitizing() {
+        let timed_out = BuildEventKind::ResultEnd {
+            addr: "//e2e:it".into(),
+            error: Some("timed out".into()),
+            upstream_of: None,
+            exit_status: None,
+            log_tail: Some(hcore::events::LogTailData {
+                text: "a\x1b[31mred\x1b[0m\r\nb\x07ell\n10%\r20%\n".into(),
+                start_line: 1,
+            }),
+            timed_out: Some(hcore::events::TimedOutData {
+                timeout_ms: 600_000,
+                abandoned: false,
+            }),
+            cancelled: false,
+        };
+        assert_eq!(
+            ci_live_log(10, &[timed_out]),
+            "ERROR ✗ //e2e:it · timed out after 10m (its timeout)\
+             \n  │ ared\
+             \n  │ bell\
+             \n  │ 20%\n",
+        );
+
+        let no_status = BuildEventKind::ResultEnd {
+            addr: "//a:\x1b[2Jb".into(),
+            error: Some("staging\x1b[2J failed".into()),
+            upstream_of: None,
+            exit_status: None,
+            log_tail: Some(hcore::events::LogTailData {
+                text: "\n\n".into(),
+                start_line: 1,
+            }),
+            timed_out: None,
+            cancelled: false,
+        };
+        assert_eq!(
+            ci_live_log(10, &[no_status]),
+            "ERROR ✗ //a:b\
+             \n  │ staging failed\
+             \n  │ empty log\n",
+        );
     }
 
     /// A stop reads first on the CI summary line, as on the TUI's final
