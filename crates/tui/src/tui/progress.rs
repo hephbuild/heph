@@ -447,6 +447,16 @@ pub(crate) fn failure_reason(
     spotlight::RootFailure::reason(error, exit_status, timed_out, redact)
 }
 
+/// How a finished run ended: the final line's mark and the dashboard title
+/// row's verdict both say this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    Done,
+    Failed,
+    /// A user stop, whatever finished before it.
+    Stopped,
+}
+
 /// The finished line's split of the failed count, from
 /// [`BuildState::failure_split`]: ` (1 root, 2 because of it)`, ` (2 roots)`;
 /// empty when nothing failed.
@@ -2160,21 +2170,52 @@ impl TuiProgressView {
             .unwrap_or_else(hcore::events::now_unix_ms);
         let elapsed = human_elapsed_ms(self.state.elapsed_ms(clock));
         let elapsed = paint(elapsed.trim_start(), |s| s.bold());
-        // A user stop is never a success, whatever finished before it; the
-        // word says why the counts stop short.
-        if self.stopped {
-            let stopped = paint("✗ stopped", red_bold);
-            if segment.is_empty() {
-                return Some(format!("{stopped} · {elapsed}"));
+        let mark = match self.outcome() {
+            // A user stop is never a success, whatever finished before it;
+            // the word says why the counts stop short.
+            Outcome::Stopped => {
+                let stopped = paint("✗ stopped", red_bold);
+                if segment.is_empty() {
+                    return Some(format!("{stopped} · {elapsed}"));
+                }
+                return Some(format!("{stopped} · {elapsed} · {segment}"));
             }
-            return Some(format!("{stopped} · {elapsed} · {segment}"));
-        }
-        let mark = if self.state.unsuccessful() {
-            paint("✗", red_bold)
-        } else {
-            paint("✓", |s| s.green().bold())
+            Outcome::Failed => paint("✗", red_bold),
+            Outcome::Done => paint("✓", |s| s.green().bold()),
         };
         Some(format!("{mark} {elapsed} · {segment}"))
+    }
+
+    /// How the run ended, as the final line's mark says it.
+    fn outcome(&self) -> Outcome {
+        if self.stopped {
+            Outcome::Stopped
+        } else if self.state.unsuccessful() {
+            Outcome::Failed
+        } else {
+            Outcome::Done
+        }
+    }
+
+    /// The dashboard title row's verdict once the run has finished, worded
+    /// as the final line is: `✓ done`, `✗ 2 failed` (the line's failed
+    /// count; `✗ cancelled` when nothing failed outright) or `✗ stopped`.
+    /// `None` while it runs.
+    fn verdict(&self) -> Option<crate::tui::dashboard::Verdict> {
+        self.finished_at_ms?;
+        let (text, ok) = match self.outcome() {
+            Outcome::Stopped => ("✗ stopped".to_owned(), false),
+            Outcome::Failed => {
+                let (_, _, failed) = self.state.count_fields(self.list.scope);
+                if failed.starts_with("0 ") {
+                    ("✗ cancelled".to_owned(), false)
+                } else {
+                    (format!("✗ {failed}"), false)
+                }
+            }
+            Outcome::Done => ("✓ done".to_owned(), true),
+        };
+        Some(crate::tui::dashboard::Verdict { text, ok })
     }
 
     /// Open the dashboard, as `Tab` from the line does.
@@ -2226,6 +2267,7 @@ impl TuiProgressView {
             total: (scope == CountScope::All || self.state.dash.matched_seen()).then(|| tabs.all()),
             provisional: scope == CountScope::Matched && !self.state.dash.matched_complete(),
             standing: self.approval_standing().map(|s| s.indicator()),
+            verdict: self.verdict(),
         };
         // The filter, while one is typed or kept, replaces the key hints.
         let filter = self.list.filter();
@@ -2435,6 +2477,7 @@ impl TuiProgressView {
             total: (scope == CountScope::All || self.state.dash.matched_seen()).then(|| tabs.all()),
             provisional: scope == CountScope::Matched && !self.state.dash.matched_complete(),
             standing: self.approval_standing().map(|s| s.indicator()),
+            verdict: self.verdict(),
         };
         let inputs = crate::tui::dashboard::TargetInputs {
             model: &self.state.dash,
@@ -2487,6 +2530,7 @@ impl TuiProgressView {
                 .then(|| counts.all()),
             provisional: scope == CountScope::Matched && !self.state.dash.matched_complete(),
             standing: self.approval_standing().map(|s| s.indicator()),
+            verdict: self.verdict(),
         };
         let gauges = self.state.dash.gauges();
         let inputs = crate::tui::dashboard::approval::ApprovalInputs {
@@ -3592,6 +3636,7 @@ mod tests {
             total: None,
             provisional: false,
             standing: None,
+            verdict: None,
         };
         let (rows, _) = crate::tui::dashboard::header_lines(
             &title,

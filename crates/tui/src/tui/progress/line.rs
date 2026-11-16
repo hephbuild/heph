@@ -1098,6 +1098,81 @@ mod tests {
         assert_eq!(v.final_line(), None);
     }
 
+    /// Finished on the dashboard, its title row says how, worded as the
+    /// line's last line: `✓ done` green bold, `✗ 2 failed` or `✗ stopped`
+    /// red bold, ahead of the frozen clock. Nothing while the run goes on.
+    #[test]
+    fn the_dashboard_title_says_the_run_finished() {
+        use crate::tui::app::TUIAppView;
+        use crate::tui::progress::TuiProgressView;
+        use crate::tui::progress::test_events::{T0, at, end, start};
+        use ratatui::style::{Color, Modifier};
+
+        let title = |v: &mut TuiProgressView| {
+            v.render_full(T0 + 3_000, 120, 30)
+                .into_iter()
+                .next()
+                .expect("a title row")
+        };
+        let verdict = |row: &Line<'_>| {
+            row.spans
+                .iter()
+                .find(|s| s.content.contains('✓') || s.content.contains('✗'))
+                .map(|s| {
+                    (
+                        s.content.trim().to_owned(),
+                        s.style.fg,
+                        s.style.add_modifier.contains(Modifier::BOLD),
+                    )
+                })
+        };
+
+        let mut v = TuiProgressView::new("Running //...");
+        v.apply(&at(0, start("//p:ok")));
+        v.apply(&at(10, end("//p:ok", None, None)));
+        v.open_dashboard();
+        let row = title(&mut v);
+        assert_eq!(verdict(&row), None, "running: {}", text(&row));
+        v.set_finished(T0 + 2_000);
+        let row = title(&mut v);
+        assert_eq!(
+            verdict(&row),
+            Some(("✓ done".to_owned(), Some(Color::Green), true)),
+            "{}",
+            text(&row)
+        );
+        assert!(text(&row).contains("✓ done · 2"), "{}", text(&row));
+
+        let mut v = TuiProgressView::new("Running //...");
+        for a in ["//p:root", "//p:down"] {
+            v.apply(&at(0, start(a)));
+        }
+        v.apply(&at(10, failed_end("//p:root", None, false)));
+        v.apply(&at(11, failed_end("//p:down", Some("//p:root"), false)));
+        v.open_dashboard();
+        v.set_finished(T0 + 2_000);
+        let row = title(&mut v);
+        assert_eq!(
+            verdict(&row),
+            Some(("✗ 2 failed".to_owned(), Some(Color::Red), true)),
+            "{}",
+            text(&row)
+        );
+        assert!(
+            v.final_line().expect("a summary").contains("2 failed"),
+            "the line's own words"
+        );
+
+        v.set_stopped();
+        let row = title(&mut v);
+        assert_eq!(
+            verdict(&row),
+            Some(("✗ stopped".to_owned(), Some(Color::Red), true)),
+            "{}",
+            text(&row)
+        );
+    }
+
     /// With colour the finished line is painted as the spec's mockup: ✓
     /// green bold, or ✗ red bold with the failed count red bold and its
     /// split dim, the clock bold. Without colour it is `final_line`, which

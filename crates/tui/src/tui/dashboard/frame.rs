@@ -145,6 +145,7 @@ mod tests {
             total: Some(3),
             provisional: false,
             standing: None,
+            verdict: None,
         };
         let mut st = ListState::default();
         let frame = dashboard_frame(&title, &inp, &mut st, DASHBOARD_HINTS, COLS, ROWS);

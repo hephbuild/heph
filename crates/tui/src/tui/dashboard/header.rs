@@ -23,6 +23,17 @@ pub struct Title<'a> {
     pub provisional: bool,
     /// `auto-approving (Y)` / `auto-rejecting (N)`; never dropped.
     pub standing: Option<&'a str>,
+    /// How the run ended, once it has; `None` while it runs.
+    pub verdict: Option<Verdict>,
+}
+
+/// A finished run's verdict, as the line's final line words it: `✓ done`
+/// (`ok`), `✗ 2 failed` or `✗ stopped`. Leads the clock on the title row,
+/// green bold when `ok`, red bold otherwise.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Verdict {
+    pub text: String,
+    pub ok: bool,
 }
 
 /// The steps the header took, for the narrowing test.
@@ -219,7 +230,17 @@ fn title_spans(t: &Title<'_>, level: u8, command_cols: Option<usize>) -> Vec<Spa
         (None, _) => format!("{} done", t.done),
     };
     let lead = if out.is_empty() { "" } else { "   " };
-    out.push(Span::raw(format!("{lead}{} · {done}", t.clock)));
+    match &t.verdict {
+        Some(v) => {
+            let color = if v.ok { Color::Green } else { Color::Red };
+            out.push(Span::styled(
+                format!("{lead}{}", v.text),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ));
+            out.push(Span::raw(format!(" · {} · {done}", t.clock)));
+        }
+        None => out.push(Span::raw(format!("{lead}{} · {done}", t.clock))),
+    }
     if let Some(s) = t.standing {
         out.push(Span::styled(
             format!("   {}", clean_inline(s)),
@@ -492,6 +513,7 @@ mod tests {
             total: Some(412),
             provisional: false,
             standing: None,
+            verdict: None,
         }
     }
 

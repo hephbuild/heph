@@ -30,7 +30,7 @@ pub use feed::{
     FeedStep, FileKind, LogFeed, LogOpened, OutputFile, OutputGroup, OutputsFound, TargetReader,
 };
 pub use frame::{DASHBOARD_HINTS, dashboard_frame};
-pub use header::{Levels, Title, header_lines};
+pub use header::{Levels, Title, Verdict, header_lines};
 pub use intern::Id;
 pub use list::{
     LastLines, ListHit, ListInputs, ListState, LogReader, TailRequest, TailUpdate, WaitWords,

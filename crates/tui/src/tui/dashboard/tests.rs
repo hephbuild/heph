@@ -147,6 +147,7 @@ fn title() -> Title<'static> {
         total: None,
         provisional: false,
         standing: None,
+        verdict: None,
     }
 }
 
