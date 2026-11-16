@@ -844,7 +844,10 @@ mod tests {
     fn finished_stopped_is_additive() {
         let plain = SessionRecord::session(7, SessionRecordKind::Finished { stopped: false });
         let json = serde_json::to_string(&plain).expect("encode");
-        assert!(json.ends_with(r#""session":{"type":"Finished"}}"#), "{json}");
+        assert!(
+            json.ends_with(r#""session":{"type":"Finished"}}"#),
+            "{json}"
+        );
         let old: SessionRecord =
             serde_json::from_str(r#"{"at_unix_ms":7,"session":{"type":"Finished"}}"#)
                 .expect("decode an older writer's");

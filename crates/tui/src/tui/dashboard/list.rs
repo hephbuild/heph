@@ -996,7 +996,11 @@ mod tests {
         let mut st = ListState::default();
         let chrome = LEAD + 18 + 6 + 1;
         let full = chrome + width(long);
-        for (cols, header) in [(full + MIN_LAST + 20, true), (full + 3, false), (full, false)] {
+        for (cols, header) in [
+            (full + MIN_LAST + 20, true),
+            (full + 3, false),
+            (full, false),
+        ] {
             let rows = frame(&m, &lines, &mut st, u16::try_from(cols).expect("cols"));
             assert_eq!(shown(&rows), [long, "//a:b"], "{cols} cols: {rows:#?}");
             assert_eq!(
