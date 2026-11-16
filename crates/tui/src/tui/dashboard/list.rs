@@ -26,7 +26,7 @@ use crate::tui::text::{clean_inline, cut_left, cut_right, expand_tabs, sanitize_
 pub struct WaitWords {
     /// `waits cpu 4`, `waits sandbox`, `locked: d1v9q`.
     pub phase: String,
-    /// The rest: `(2 free, 6 ahead, 41s)`, `held by session d1v9q (pid 4121)`.
+    /// The rest: `(2 free, 41s)`, `held by session d1v9q (pid 4121)`.
     pub detail: String,
     pub waited_ms: u64,
 }

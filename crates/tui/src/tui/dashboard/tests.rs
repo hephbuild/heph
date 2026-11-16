@@ -336,7 +336,7 @@ fn dashboard_lists_every_state() {
     assert_eq!(counts.tab(Tab::Pending), counts.blocked + counts.queued);
     let b = row(&pending, "//t:b");
     assert!(b.contains("⧗ //t:b") && b.contains("waits cpu 4"), "{b}");
-    assert!(b.contains("(2 free, 6 ahead, 41s)"), "{b}");
+    assert!(b.contains("(2 free, 41s)"), "{b}");
     let q = row(&pending, "//t:q");
     assert!(q.contains("· //t:q") && q.contains("pending"), "{q}");
 
@@ -422,7 +422,7 @@ fn all_tab_activity_order() {
 }
 
 /// A Pending row says what the wait event carried, in the words of
-/// `admission_wait_text` (no queue position for a yielding waiter), and a
+/// `admission_wait_text`, and a
 /// lock held by another heph names its session.
 #[test]
 fn wait_text_is_the_shared_formatter_pending_row() {
@@ -446,7 +446,6 @@ fn wait_text_is_the_shared_formatter_pending_row() {
             Unit::default_for(pool),
             4 * CPU,
             2 * CPU,
-            6,
             yields.as_ref().map(|y| (y, Unit::default_for(&y.pool))),
             removals,
             "41s",
@@ -461,9 +460,6 @@ fn wait_text_is_the_shared_formatter_pending_row() {
             "{words:?} vs {expected}"
         );
         assert_eq!(words.waited_ms, 41_000);
-        if yields.is_some() {
-            assert!(!words.detail.contains("ahead"), "{words:?}");
-        }
         let mut st = ListState::default();
         let rows = frame(&s, &mut st, Tab::Pending, 42_000);
         let row = rows.iter().find(|r| r.contains("//w:a")).expect("the row");

@@ -217,9 +217,10 @@ impl crate::tui::dashboard::Waits for BuildState {
         use crate::tui::dashboard::WaitWords;
         if let Some(w) = self.admission_waits.get(addr) {
             let text = self.admission_text(addr, now_ms)?;
-            // `<addr> waits for <pool> <need> (<free>, <queue>, <waited>)[ —
-            // cleanup …]`: PHASE is `waits <pool> <need>` (`waits sandbox`,
-            // whose need is always one slot), LAST LINE the rest.
+            // `<addr> waits for <pool> <need> (<free>, [yielding to …, ]
+            // <waited>)[ — cleanup …]`: PHASE is `waits <pool> <need>`
+            // (`waits sandbox`, whose need is always one slot), LAST LINE the
+            // rest.
             let rest = text.strip_prefix(addr).unwrap_or(&text).trim_start();
             let rest = rest.strip_prefix("waits for ").unwrap_or(rest);
             let (head, detail) = rest.split_once(" (").unwrap_or((rest, ""));
@@ -277,7 +278,6 @@ impl BuildState {
             self.unit_of(&w.pool),
             w.need,
             w.free,
-            w.ahead,
             w.yielding_to
                 .as_ref()
                 .map(|to| (to, self.unit_of(&to.pool))),

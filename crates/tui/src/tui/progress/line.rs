@@ -619,9 +619,8 @@ mod tests {
                 icon: "⧗",
                 style: Style::default(),
                 name: "//中文:目标".to_owned(),
-                detail:
-                    "waits for cpu 2 (1 free, 3 ahead, 41s) — cleanup is behind: 2 removals pending"
-                        .to_owned(),
+                detail: "waits for cpu 2 (1 free, 41s) — cleanup is behind: 2 removals pending"
+                    .to_owned(),
             },
         ];
         for spot in spots {
