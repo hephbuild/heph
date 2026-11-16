@@ -2306,20 +2306,21 @@ impl TuiProgressView {
                 self.model.header(&self.state, scope),
             )))
         };
-        // What the run is resolving, while the matcher streams; or, until the
-        // run ends, a label the header keeps up ("Invoking …": what is about
-        // to take the terminal, on the line while its dependencies build).
+        // Until the run ends, a label the header keeps up ("Invoking …": what
+        // is about to take the terminal, on the line while its dependencies
+        // build). The view's own label ("Running //…") is not repeated: the
+        // command it names is on the row above.
         let stands = self.finished_at_ms.is_none()
             && matches!(self.role, Role::Live { .. })
             && self.model.label_stands();
-        let resolving = (dashboard && (stands || !self.state.dash.matched_complete()))
+        let label = (dashboard && stands)
             .then(|| self.label())
             .filter(|l| !l.is_empty())
             .map(Cow::Owned);
         let model = line::LineModel {
             status,
             clock,
-            resolving,
+            label,
             body,
             standing: self.approval_standing(),
             spot: self
@@ -4833,10 +4834,11 @@ mod tests {
         }
     }
 
-    /// An entrypoint's "Invoking …" stays on the line after the matcher
-    /// completed, while its dependencies build and up to the pause that hands
-    /// it the terminal; an ordinary label leaves with the matcher, and a
-    /// standing one with the run's end.
+    /// An entrypoint's "Invoking …" is on the line while the matcher streams
+    /// and after it completed, while its dependencies build and up to the
+    /// pause that hands it the terminal, and leaves with the run's end. An
+    /// ordinary label ("Running //…") is never on the line: the command
+    /// above already names it.
     #[test]
     fn a_standing_label_outlives_the_matcher() {
         struct Invoking(bool);
@@ -4858,7 +4860,12 @@ mod tests {
         for stands in [true, false] {
             let mut v = TuiProgressView::with_header(Box::new(Invoking(stands)));
             v.apply(&ev(0, matched(&["//app:tty"], false)));
-            assert!(text(&v).contains("Invoking //app:tty"), "{}", text(&v));
+            assert_eq!(
+                text(&v).contains("Invoking //app:tty"),
+                stands,
+                "streaming, stands={stands}: {}",
+                text(&v)
+            );
             v.apply(&ev(1, matched(&[], true)));
             v.apply(&ev(2, result_start("//dep:slow")));
             assert_eq!(
