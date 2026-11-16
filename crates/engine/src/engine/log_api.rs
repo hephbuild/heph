@@ -545,7 +545,7 @@ impl Engine {
             consider(entry);
         }
         if let Some((session, at)) = not_streamed
-            && newest.as_ref().is_none_or(|n| n.at_unix_ms() <= at)
+            && start_outranks(newest.as_ref().map(Stored::at_unix_ms), at)
         {
             return Ok(Latest::NotStreamed {
                 session: Some(session),
@@ -710,6 +710,15 @@ impl Engine {
 
 /// Whether two manifests name the same revision: target, input hash and
 /// every artifact, whenever each was written.
+/// Whether a run that started at `start_ms` on a plugin that does not stream
+/// its log is the answer over the newest stored log, stamped `stored_ms`. A
+/// stored log from the same millisecond is an older run's (this run stores its
+/// log only when it ends, after its start), so the start wins the tie; only a
+/// strictly newer stored log outranks it.
+fn start_outranks(stored_ms: Option<u64>, start_ms: u64) -> bool {
+    stored_ms.is_none_or(|stored| stored <= start_ms)
+}
+
 fn same_revision(a: &Manifest, b: &Manifest) -> anyhow::Result<bool> {
     let key = |m: &Manifest| borsh::to_vec(&(&m.target, &m.hashin, &m.artifacts));
     Ok(key(a).context("encoding a manifest")? == key(b).context("encoding a manifest")?)
@@ -1194,6 +1203,17 @@ mod tests {
     use super::*;
     use crate::engine::local_cache_fs::LocalCacheFS;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A not-streamed start against the newest stored log: no stored log, an
+    /// older one, and one from the same millisecond all read as NotStreamed;
+    /// a strictly newer stored log wins.
+    #[test]
+    fn a_not_streamed_start_wins_a_same_millisecond_tie() {
+        assert!(start_outranks(None, 100));
+        assert!(start_outranks(Some(99), 100));
+        assert!(start_outranks(Some(100), 100));
+        assert!(!start_outranks(Some(101), 100));
+    }
 
     fn info(source: LogSource) -> LogInfo {
         LogInfo {
