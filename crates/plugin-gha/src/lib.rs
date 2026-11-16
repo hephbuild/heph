@@ -808,7 +808,7 @@ impl GhaHook {
                 "annotations",
             ],
         )?;
-        tracing::info!("gha hook loaded");
+        tracing::debug!("gha hook loaded");
         let refresh_secs: u64 = decode_opt(opts, "gha hook", "refreshSecs")?
             .unwrap_or(30)
             .max(1);
