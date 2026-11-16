@@ -914,6 +914,36 @@ fn overview_took_down_and_timeout() {
     );
 }
 
+/// The Overview's resources row is what a run reserved: a cache hit, a
+/// pending target and a dependency failure never ran, so they have none.
+#[test]
+fn overview_resources_only_for_a_run() {
+    let s = fold(&[
+        at(0, start("//r:ran")),
+        at(0, exec("//r:ran")),
+        at(100, exec_end("//r:ran")),
+        at(100, end("//r:ran", None, None)),
+        at(0, start("//r:hit")),
+        at(10, hit("//r:hit")),
+        at(10, end("//r:hit", None, None)),
+        at(0, start("//r:pending")),
+        at(0, start("//r:dep")),
+        at(200, end("//r:dep", Some("dep"), Some("//r:ran"))),
+    ]);
+    let r = Redact::default();
+    let resources_row = |addr: &str| {
+        let mut t = open_on(&s, addr, TargetTab::Overview, None);
+        let f = target_frame(&s, &mut t, 1_000, &r);
+        f.into_iter()
+            .find(|l| l.trim_start().starts_with("resources"))
+    };
+    let ran = resources_row("//r:ran").expect("a resources row for a run");
+    assert!(ran.contains("cpu"), "{ran}");
+    for addr in ["//r:hit", "//r:pending", "//r:dep"] {
+        assert_eq!(resources_row(addr), None, "{addr}");
+    }
+}
+
 /// I9: a stream whose failure, log, outputs and unavailable texts name
 /// heph's home: no dashboard tab, LAST LINE column or target screen shows
 /// it.

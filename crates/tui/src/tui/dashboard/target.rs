@@ -649,13 +649,11 @@ fn overview(
     if let Some(words) = d.and_then(|d| d.cache_words()) {
         out.push(row("cache", words, cols));
     }
-    let resources = match shape {
-        Some(s) => resources(s.declared.as_ref(), s.reserved.as_ref(), m),
-        None if r.state == RowState::Cached => "none reserved (no run)".to_owned(),
-        None => String::new(),
-    };
-    if !resources.is_empty() {
-        out.push(row("resources", &resources, cols));
+    // Resources are what a run reserved: a target with no run (a cache
+    // hit, one still pending, a dependency failure) has no row.
+    if let Some(s) = shape {
+        let text = resources(s.declared.as_ref(), s.reserved.as_ref(), m);
+        out.push(row("resources", &text, cols));
     }
     // The timeout is known once the run hit it: `ExecuteStart` does not
     // carry it, so a run going on shows no time left.
