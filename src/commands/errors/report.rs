@@ -127,17 +127,14 @@ impl ReportContext {
     fn render_block(&self, out: &mut String, block: &Block, color: bool) {
         let f = &block.failure;
         let addr = f.addr.format();
-        let cross = if color {
-            format!("{}", "✗".red().bold())
-        } else {
-            "✗".to_owned()
-        };
-        let mut rows: Vec<(&'static str, String)> = Vec::new();
+        let mut rows: Vec<Row> = Vec::new();
         let mut body: Vec<String> = Vec::new();
 
-        let status = if let Some(t) = crate::engine::run_timeout::timed_out(&f.source) {
+        let status: Option<Value> = if let Some(t) =
+            crate::engine::run_timeout::timed_out(&f.source)
+        {
             if let Some(grace) = t.abandoned_after {
-                rows.push((
+                rows.push(Row::plain(
                     "abandoned:",
                     format!(
                         "the run did not stop within {} of being cancelled and was abandoned, \
@@ -146,16 +143,20 @@ impl ReportContext {
                     ),
                 ));
             }
-            Some(format!("timed out after {} (its timeout)", t.timeout))
+            Some(vec![
+                (format!("timed out after {}", t.timeout), Tone::Red),
+                (" (its timeout)".to_owned(), Tone::Dim),
+            ])
         } else if let Some(fc) = downcast_chain_ref::<FrozenCheckError>(&f.source) {
             body.extend(fc.diff.lines().map(|l| self.cut_row(l)));
-            Some("generated output differs from tree".to_owned())
+            Some(plain("generated output differs from tree".to_owned()))
         } else {
             // Through the memoizer's shared wrapper: a recorded failure's
             // source is one, and `ErrorDetail`'s plain chain walk stops at it.
             downcast_chain_ref::<ProcessFailed>(&f.source)
                 .map(|p| p.status.clone())
                 .or_else(|| crate::engine::event::ErrorDetail::from_error(&f.source).exit_status)
+                .map(plain)
         };
         if status.is_none() {
             // No status to name it: the error says what went wrong.
@@ -183,7 +184,7 @@ impl ReportContext {
             if more > 0 {
                 named.push_str(&format!(" +{more} more"));
             }
-            rows.push(("took down:", named));
+            rows.push(Row::plain("took down:", named));
         }
         if let Some(fixes) = &f.fixes {
             fix_rows(&mut rows, fixes, &addr);
@@ -203,22 +204,25 @@ impl ReportContext {
             if more > 0 {
                 groups.push(format!("+{more} more"));
             }
-            rows.push((
-                "kept:",
-                format!(
-                    "{} · heph inspect failure {}",
-                    groups.join(", "),
-                    shell_quote(&addr)
-                ),
-            ));
+            rows.push(Row {
+                label: "kept:",
+                value: vec![
+                    (groups.join(", "), Tone::Plain),
+                    (" · ".to_owned(), Tone::Dim),
+                    (
+                        format!("heph inspect failure {}", shell_quote(&addr)),
+                        Tone::Bold,
+                    ),
+                ],
+            });
         }
         match &f.sandbox {
             // The one path into heph's home a report shows: the user asked
             // for it with --keep-failed-sandboxes (I9).
             Some(SandboxFate::Kept(path)) => {
-                rows.push(("sandbox kept:", path.display().to_string()));
+                rows.push(Row::plain("sandbox kept:", path.display().to_string()));
             }
-            Some(SandboxFate::LeftAbandoned) => rows.push((
+            Some(SandboxFate::LeftAbandoned) => rows.push(Row::plain(
                 "sandbox left:",
                 "the run was abandoned after its timeout".to_owned(),
             )),
@@ -232,57 +236,69 @@ impl ReportContext {
                 .tail
                 .as_ref()
                 .map(|(text, start)| start.saturating_sub(1) + text.lines().count());
-            rows.push((
-                "full log:",
-                match lines {
-                    Some(lines) => format!(
-                        "heph log {} ({} {})",
-                        shell_quote(&addr),
+            let mut value = vec![(format!("heph log {}", shell_quote(&addr)), Tone::Bold)];
+            if let Some(lines) = lines {
+                value.push((
+                    format!(
+                        " ({} {})",
                         thousands(lines),
                         if lines == 1 { "line" } else { "lines" }
                     ),
-                    None => format!("heph log {}", shell_quote(&addr)),
-                },
-            ));
+                    Tone::Dim,
+                ));
+            }
+            rows.push(Row {
+                label: "full log:",
+                value,
+            });
         } else if f.log_readable == Some(false) {
-            rows.push(("full log:", "none kept".to_owned()));
+            rows.push(Row::plain("full log:", "none kept".to_owned()));
         }
 
-        let head = match &status {
-            Some(s) => format!("{cross} {addr} · {}\n", clean_inline(s)),
-            None => format!("{cross} {addr}\n"),
-        };
-        out.push_str(&clean_inline(head.trim_end()));
-        out.push('\n');
-        let gutter = |s: &'static str| {
-            if color {
-                format!("{}", s.dim())
-            } else {
-                s.to_owned()
+        // Each piece cleaned before it is painted, so the paint survives.
+        out.push_str(&paint(
+            &format!("✗ {}", clean_inline(&addr)),
+            Tone::RedBold,
+            color,
+        ));
+        if let Some(status) = &status {
+            out.push_str(" · ");
+            let last = status.len().saturating_sub(1);
+            for (i, (text, tone)) in status.iter().enumerate() {
+                let text = clean_inline(text);
+                let text = if i == last { text.trim_end() } else { &text };
+                out.push_str(&paint(text, *tone, color));
             }
-        };
+        }
+        out.push('\n');
         for line in &body {
-            out.push_str(&format!("  {} {line}\n", gutter("│")));
+            out.push_str(&format!("  {} {line}\n", paint("│", Tone::Dim, color)));
         }
         let pad = rows
             .iter()
-            .map(|(l, _)| l.chars().count())
+            .map(|r| r.label.chars().count())
             .max()
             .unwrap_or(0);
         let last = rows.len().saturating_sub(1);
-        for (i, (label, value)) in rows.iter().enumerate() {
+        for (i, row) in rows.iter().enumerate() {
             let mark = if i == last { "╰" } else { "├" };
-            let value = clean_inline(value);
-            let value = if *label == "sandbox kept:" {
-                value
-            } else {
-                std::borrow::Cow::Owned(self.redact.apply(&value).into_owned())
-            };
-            out.push_str(&format!(
-                "  {} {label:<pad$} {value}\n",
-                gutter(mark),
-                pad = pad
+            out.push_str("  ");
+            out.push_str(&paint(
+                &format!("{mark} {:<pad$}", row.label, pad = pad),
+                Tone::Dim,
+                color,
             ));
+            out.push(' ');
+            for (text, tone) in &row.value {
+                let text = clean_inline(text);
+                let text = if row.label == "sandbox kept:" {
+                    text
+                } else {
+                    std::borrow::Cow::Owned(self.redact.apply(&text).into_owned())
+                };
+                out.push_str(&paint(&text, *tone, color));
+            }
+            out.push('\n');
         }
     }
 
@@ -292,8 +308,56 @@ impl ReportContext {
     }
 }
 
+/// How a piece of a report line is painted when colour is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tone {
+    Plain,
+    Dim,
+    Bold,
+    Red,
+    RedBold,
+}
+
+/// A line's pieces, each with its tone; concatenated, the plain report.
+type Value = Vec<(String, Tone)>;
+
+fn plain(s: String) -> Value {
+    vec![(s, Tone::Plain)]
+}
+
+/// One `├ label: value` row.
+#[derive(Debug)]
+struct Row {
+    label: &'static str,
+    value: Value,
+}
+
+impl Row {
+    fn plain(label: &'static str, value: String) -> Self {
+        Self {
+            label,
+            value: plain(value),
+        }
+    }
+}
+
+/// `s` in `tone` when `color`, as is otherwise: the plain report is the
+/// pieces concatenated, byte for byte.
+fn paint(s: &str, tone: Tone, color: bool) -> String {
+    if !color || s.is_empty() {
+        return s.to_owned();
+    }
+    match tone {
+        Tone::Plain => s.to_owned(),
+        Tone::Dim => s.dim().to_string(),
+        Tone::Bold => s.bold().to_string(),
+        Tone::Red => s.red().to_string(),
+        Tone::RedBold => s.red().bold().to_string(),
+    }
+}
+
 /// The `fixes written:` / `restore:` or `fixes not written:` rows.
-fn fix_rows(rows: &mut Vec<(&'static str, String)>, fixes: &FailureFixes, addr: &str) {
+fn fix_rows(rows: &mut Vec<Row>, fixes: &FailureFixes, addr: &str) {
     match fixes {
         FailureFixes::Written { paths, .. } if paths.is_empty() => {}
         FailureFixes::Written { root, paths, list } => {
@@ -307,8 +371,16 @@ fn fix_rows(rows: &mut Vec<(&'static str, String)>, fixes: &FailureFixes, addr: 
             if more > 0 {
                 named.push_str(&format!(" +{more} more"));
             }
-            named.push_str(" · the target still failed; re-run to verify");
-            rows.push(("fixes written:", named));
+            rows.push(Row {
+                label: "fixes written:",
+                value: vec![
+                    (named, Tone::Plain),
+                    (
+                        " · the target still failed; re-run to verify".to_owned(),
+                        Tone::Dim,
+                    ),
+                ],
+            });
             let git = format!(
                 "git -C {} --literal-pathspecs checkout",
                 shell_quote(&root.to_string_lossy())
@@ -326,10 +398,10 @@ fn fix_rows(rows: &mut Vec<(&'static str, String)>, fixes: &FailureFixes, addr: 
                 let quoted: Vec<_> = paths.iter().map(|p| shell_quote(p)).collect();
                 format!("{git} -- {}", quoted.join(" "))
             };
-            rows.push(("restore:", restore));
+            rows.push(Row::plain("restore:", restore));
         }
         FailureFixes::NotWritten(reason) => {
-            rows.push(("fixes not written:", not_written_reason(reason)));
+            rows.push(Row::plain("fixes not written:", not_written_reason(reason)));
         }
     }
 }
@@ -425,6 +497,14 @@ mod tests {
     }
 
     fn report(failures: Vec<TargetFailure>, took: &[(&str, &[&str], usize)]) -> String {
+        report_in(failures, took, false)
+    }
+
+    fn report_in(
+        failures: Vec<TargetFailure>,
+        took: &[(&str, &[&str], usize)],
+        color: bool,
+    ) -> String {
         let failures: Vec<_> = failures.into_iter().map(Arc::new).collect();
         ReportContext::gather(
             &failures,
@@ -442,7 +522,50 @@ mod tests {
         )
         .with_width(60)
         .with_redact(Redact::of([HOME.into()]))
-        .render(false)
+        .render(color)
+    }
+
+    /// With colour on, the report is painted as the spec's mockup — the ✗
+    /// and address red bold, the gutters and labels dim, the `heph log`
+    /// command bold, its line count dim — and with the paint taken off it
+    /// is the plain report, byte for byte.
+    #[test]
+    fn failure_report_colors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let failure = || exited(dir.path(), "//p:t", &["one", "two"], 3);
+        let took: &[(&str, &[&str], usize)] = &[("//p:t", &["//p:u"], 1)];
+        let plain = report_in(vec![failure()], took, false);
+        let colored = report_in(vec![failure()], took, true);
+        assert!(!plain.contains('\x1b'), "{plain:?}");
+        let head = format!("{}", "✗ //p:t".red().bold());
+        assert!(
+            colored.contains(&format!("\n{head} · exit status: 101\n")),
+            "{colored:?}"
+        );
+        assert!(
+            colored.contains(&format!("  {} one\n", "│".dim())),
+            "{colored:?}"
+        );
+        assert!(
+            colored.contains(&format!("  {} //p:u\n", "├ took down:".dim())),
+            "{colored:?}"
+        );
+        assert!(
+            colored.contains(&format!(
+                "{}{}",
+                "heph log //p:t".bold(),
+                " (2 lines)".dim()
+            )),
+            "{colored:?}"
+        );
+        let stripped: String = colored
+            .split_inclusive('\n')
+            .map(|l| {
+                let (line, nl) = l.strip_suffix('\n').map_or((l, ""), |s| (s, "\n"));
+                format!("{}{nl}", clean_inline(line))
+            })
+            .collect();
+        assert_eq!(stripped, plain);
     }
 
     /// One root with what it took down and a capped tail, then a second

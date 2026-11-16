@@ -813,6 +813,9 @@ impl App for RunApp {
         // resolve it; otherwise the notice prints to stderr and the decision is
         // read from the terminal (or auto-approved).
         let approval: Arc<dyn crate::engine::approval::ApprovalHandler> = if ctx.interactive() {
+            // Decision lines straight to the TUI's sink, so they keep their
+            // colour and carry no log level.
+            self.approval.set_log_sink(ctx.sink().clone());
             Arc::new(crate::commands::approval::TuiApprovalHandler::new(
                 self.approval.clone(),
                 self.auto_approve,

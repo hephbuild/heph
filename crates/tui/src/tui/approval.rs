@@ -29,6 +29,8 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::oneshot;
 
+use crate::tui::LogSink;
+
 pub use crate::tui::session::ApprovalStanding;
 
 /// One rendered notice for display: the input group name, its text, and the
@@ -68,6 +70,8 @@ struct Inner {
     last_seq: u64,
     /// The last build number handed out.
     last_build: u64,
+    /// Where decision lines go in the interactive TUI; `None`: `tracing`.
+    log: Option<LogSink>,
     /// Standing decisions by build. A center serves one build in practice,
     /// so a list beats a map.
     standing: Vec<(u64, ApprovalStanding)>,
@@ -160,10 +164,18 @@ impl ApprovalDecision {
     /// `✓ approved //x · by standing approval (Y) after 2m16s · notices not
     /// read`. The duration is how long the prompt waited for the decision.
     pub fn line(&self) -> String {
-        let (mark, verb) = if self.approved {
-            ("✓", "approved")
+        self.line_in(false)
+    }
+
+    /// [`line`](Self::line), painted as the spec's mockup when `color`: `✓
+    /// approved` green bold or `✗ rejected` red bold, the address plain, the
+    /// details after it dim.
+    pub fn line_in(&self, color: bool) -> String {
+        use crossterm::style::Stylize;
+        let decided = if self.approved {
+            "✓ approved"
         } else {
-            ("✗", "rejected")
+            "✗ rejected"
         };
         let by = match (self.by, self.approved) {
             (DecidedBy::Key, true) => "key (y)",
@@ -171,20 +183,24 @@ impl ApprovalDecision {
             (DecidedBy::Standing, true) => "standing approval (Y)",
             (DecidedBy::Standing, false) => "standing rejection (N)",
         };
-        let mut line = format!(
-            "{mark} {verb} {} · by {by} after {}",
-            self.addr,
-            hcore::units::human_duration(self.at)
-        );
+        let mut details = format!(" · by {by} after {}", hcore::units::human_duration(self.at));
         if self.notices > 0 {
             if self.read.is_empty() {
-                line.push_str(" · notices not read");
+                details.push_str(" · notices not read");
             } else {
-                line.push_str(" · read ");
-                line.push_str(&self.read.join(", "));
+                details.push_str(" · read ");
+                details.push_str(&self.read.join(", "));
             }
         }
-        line
+        if !color {
+            return format!("{decided} {}{details}", self.addr);
+        }
+        let decided = if self.approved {
+            decided.green().bold()
+        } else {
+            decided.red().bold()
+        };
+        format!("{decided} {}{}", self.addr, details.dim())
     }
 
     fn of(p: &Pending, approved: bool, by: DecidedBy, read: Vec<String>) -> Self {
@@ -200,10 +216,19 @@ impl ApprovalDecision {
     }
 }
 
-/// Log each decision's line. Called with the center's lock released.
-fn record(decisions: &[ApprovalDecision]) {
+/// Put each decision's line in the scrollback. Called with the center's lock
+/// released.
+///
+/// With a sink (the interactive TUI, [`ApprovalCenter::set_log_sink`]) the
+/// line goes to it as written, painted when the sink has colour: `tracing`
+/// would escape the paint and prefix a level. Without one it is an INFO
+/// event, as it always was.
+fn record(sink: Option<&LogSink>, decisions: &[ApprovalDecision]) {
     for d in decisions {
-        tracing::info!("{}", d.line());
+        match sink {
+            Some(sink) => sink.write_diagnostic(&format!("{}\n", d.line_in(sink.color_enabled()))),
+            None => tracing::info!("{}", d.line()),
+        }
     }
 }
 
@@ -238,6 +263,19 @@ pub struct NoticeRef {
 impl ApprovalCenter {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Write decision lines to `sink`, the interactive TUI's, instead of
+    /// through `tracing`: the line is the spec's, painted when the sink has
+    /// colour, with no level in front.
+    pub fn set_log_sink(&self, sink: LogSink) {
+        self.lock().log = Some(sink);
+    }
+
+    /// Record `decisions`' lines; the lock is taken only to read the sink.
+    fn record(&self, decisions: &[ApprovalDecision]) {
+        let sink = self.lock().log.clone();
+        record(sink.as_ref(), decisions);
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -310,7 +348,7 @@ impl ApprovalCenter {
             (seq, decided)
         };
         if let Some(d) = decided {
-            record(std::slice::from_ref(&d));
+            self.record(std::slice::from_ref(&d));
         }
         ApprovalTicket { seq, rx }
     }
@@ -442,7 +480,7 @@ impl ApprovalCenter {
             pending.responder.send(approve).ok()?;
             decision
         };
-        record(std::slice::from_ref(&decision));
+        self.record(std::slice::from_ref(&decision));
         Some(decision)
     }
 
@@ -477,7 +515,7 @@ impl ApprovalCenter {
             inner.queue = kept;
             decided
         };
-        record(&decided);
+        self.record(&decided);
         decided
     }
 }
@@ -516,6 +554,62 @@ mod tests {
             d.line()
         );
         assert!(d.line().ends_with(" · read plan"), "{}", d.line());
+    }
+
+    /// With a sink (the interactive TUI) a decision's line goes to it as
+    /// written, one line, with no log level in front.
+    #[tokio::test]
+    async fn decision_line_goes_to_the_sink() {
+        let sink = LogSink::new_direct_with(Arc::new(crate::tui::session::SessionSlot::new()));
+        let mut rx = sink.switch_to_buffered();
+        let center = ApprovalCenter::new();
+        center.set_log_sink(sink.clone());
+        let build = center.build();
+        let t = center.request(&build, "//a:b".to_string(), vec![]);
+        let d = center.respond(t.seq, true, Vec::new()).expect("decided");
+        let got = rx.try_recv().expect("a line");
+        // Colour follows the test's stderr; the paint taken off, the line.
+        let text = String::from_utf8(got.bytes).expect("utf-8");
+        assert_eq!(
+            crate::tui::text::clean_inline(text.trim_end_matches('\n')),
+            d.line()
+        );
+        assert!(text.ends_with('\n'), "{text:?}");
+    }
+
+    /// With colour the decision line is painted as the spec's mockup — the
+    /// verdict green or red bold, the details dim — and without it is the
+    /// plain line, which CI and the log record keep.
+    #[test]
+    fn decision_line_colours() {
+        use crossterm::style::Stylize;
+        let d = ApprovalDecision {
+            seq: 1,
+            addr: "//a:b".into(),
+            approved: true,
+            by: DecidedBy::Key,
+            at: Duration::from_secs(3),
+            notices: 1,
+            read: vec!["plan".into()],
+        };
+        assert_eq!(d.line_in(false), d.line());
+        assert!(!d.line().contains('\x1b'), "{:?}", d.line());
+        let details = d.line().replacen("✓ approved //a:b", "", 1);
+        assert_eq!(
+            d.line_in(true),
+            format!("{} //a:b{}", "✓ approved".green().bold(), details.dim())
+        );
+        let rejected = ApprovalDecision {
+            approved: false,
+            ..d
+        };
+        assert!(
+            rejected
+                .line_in(true)
+                .starts_with(&format!("{} //a:b", "✗ rejected".red().bold())),
+            "{:?}",
+            rejected.line_in(true)
+        );
     }
 
     #[tokio::test]

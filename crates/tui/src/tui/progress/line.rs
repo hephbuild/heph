@@ -45,7 +45,10 @@ pub(super) enum Status<'a> {
     Running(&'a str),
     /// `stopped`: the user stopped it; the head says so, as the final
     /// summary does.
-    Finished { failed: bool, stopped: bool },
+    Finished {
+        failed: bool,
+        stopped: bool,
+    },
 }
 
 /// What a build's line counts. Strings where the box's header already
@@ -1094,5 +1097,63 @@ mod tests {
         let mut v = TuiProgressView::new("Running //...");
         v.set_finished(T0 + 2_000);
         assert_eq!(v.final_line(), None);
+    }
+
+    /// With colour the finished line is painted as the spec's mockup: ✓
+    /// green bold, or ✗ red bold with the failed count red bold and its
+    /// split dim, the clock bold. Without colour it is `final_line`, which
+    /// session viewers compare, with no escape at all.
+    #[test]
+    fn the_final_line_is_coloured_only_with_colour() {
+        use crate::tui::app::TUIAppView;
+        use crate::tui::progress::TuiProgressView;
+        use crate::tui::progress::test_events::{T0, at, end, start};
+        use crossterm::style::Stylize;
+
+        let mut v = TuiProgressView::new("Running //...");
+        v.apply(&at(0, start("//p:ok")));
+        v.apply(&at(10, end("//p:ok", None, None)));
+        v.set_finished(T0 + 2_000);
+        let plain = v.final_line().expect("a summary");
+        assert_eq!(v.final_line_in(false).as_deref(), Some(plain.as_str()));
+        assert!(!plain.contains('\x1b'), "{plain:?}");
+        let colored = v.final_line_in(true).expect("a summary");
+        assert!(
+            colored.starts_with(&format!("{} {} · ", "✓".green().bold(), "2.000s".bold())),
+            "{colored:?}"
+        );
+        assert!(colored.ends_with(" · 0 failed"), "{colored:?}");
+
+        let mut v = TuiProgressView::new("Running //...");
+        for a in ["//p:root", "//p:down"] {
+            v.apply(&at(0, start(a)));
+        }
+        v.apply(&at(10, failed_end("//p:root", None, false)));
+        v.apply(&at(11, failed_end("//p:down", Some("//p:root"), false)));
+        v.set_finished(T0 + 2_000);
+        let plain = v.final_line().expect("a summary");
+        assert!(!plain.contains('\x1b'), "{plain:?}");
+        let colored = v.final_line_in(true).expect("a summary");
+        assert!(
+            colored.starts_with(&format!("{} {} · ", "✗".red().bold(), "2.000s".bold())),
+            "{colored:?}"
+        );
+        assert!(
+            colored.ends_with(&format!(
+                "{}{}",
+                "2 failed".red().bold(),
+                " (1 root, 1 because of it)".dim()
+            )),
+            "{colored:?}"
+        );
+        assert_eq!(crate::tui::text::clean_inline(&colored), plain);
+
+        // A stop says so in red.
+        v.set_stopped();
+        let colored = v.final_line_in(true).expect("a summary");
+        assert!(
+            colored.starts_with(&format!("{} · ", "✗ stopped".red().bold())),
+            "{colored:?}"
+        );
     }
 }

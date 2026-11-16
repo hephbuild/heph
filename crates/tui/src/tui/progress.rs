@@ -1825,18 +1825,19 @@ fn approval_prompt_row(glyph: &'static str, addr: &str, pending: u64, live: bool
     } else {
         APPROVAL_ELSEWHERE
     };
-    let style = Style::default()
-        .fg(Color::Yellow)
-        .add_modifier(Modifier::BOLD);
+    // As the spec's mockup: the request yellow bold, the rest yellow.
+    let yellow = Style::default().fg(Color::Yellow);
+    let style = yellow.add_modifier(Modifier::BOLD);
     Line::from(vec![
         Span::styled(glyph, style),
         Span::styled(
             format!(
-                " approval required: {}{queued}{tail}",
+                " approval required: {}",
                 crate::tui::text::clean_inline(addr)
             ),
             style,
         ),
+        Span::styled(format!("{queued}{tail}"), yellow),
     ])
 }
 
@@ -2114,7 +2115,42 @@ impl TuiProgressView {
     /// ([`TUIAppView::set_finished`]), matching the frozen header, so a viewer
     /// prints the line the run printed.
     pub fn final_line(&self) -> Option<String> {
+        self.final_line_in(false)
+    }
+
+    /// [`final_line`](Self::final_line), painted as the spec's mockup when
+    /// `color`: the ✓ green bold or the ✗ (and `stopped`) red bold, the clock
+    /// bold, a non-zero failed count red bold and its split dim. Without
+    /// colour it is `final_line`, byte for byte; only the terminal gets the
+    /// paint, never a session viewer.
+    fn final_line_in(&self, color: bool) -> Option<String> {
+        use crossterm::style::Stylize;
+        let paint = |s: &str, f: fn(String) -> crossterm::style::StyledContent<String>| {
+            if color {
+                f(s.to_owned()).to_string()
+            } else {
+                s.to_owned()
+            }
+        };
+        let red_bold = |s: String| s.red().bold();
         let segment = self.final_summary_segment();
+        // The failed count and its split, as `counts_segment` wrote them.
+        let segment = {
+            let (_, _, failed) = self.state.count_fields(self.list.scope);
+            let tabs = self.state.dash.counts(self.list.scope);
+            let split = failure_split_text((tabs.failed, tabs.dep_failed));
+            let whole = format!("{failed}{split}");
+            match segment.split_once(&whole) {
+                Some((before, after)) if color && !failed.starts_with("0 ") => {
+                    format!(
+                        "{before}{}{}{after}",
+                        paint(&failed, red_bold),
+                        paint(&split, |s| s.dim())
+                    )
+                }
+                _ => segment,
+            }
+        };
         // A stop always says so, even before anything matched.
         if segment.is_empty() && !self.stopped {
             return None;
@@ -2123,19 +2159,20 @@ impl TuiProgressView {
             .finished_at_ms
             .unwrap_or_else(hcore::events::now_unix_ms);
         let elapsed = human_elapsed_ms(self.state.elapsed_ms(clock));
-        let elapsed = elapsed.trim_start();
+        let elapsed = paint(elapsed.trim_start(), |s| s.bold());
         // A user stop is never a success, whatever finished before it; the
         // word says why the counts stop short.
         if self.stopped {
+            let stopped = paint("✗ stopped", red_bold);
             if segment.is_empty() {
-                return Some(format!("✗ stopped · {elapsed}"));
+                return Some(format!("{stopped} · {elapsed}"));
             }
-            return Some(format!("✗ stopped · {elapsed} · {segment}"));
+            return Some(format!("{stopped} · {elapsed} · {segment}"));
         }
         let mark = if self.state.unsuccessful() {
-            "✗"
+            paint("✗", red_bold)
         } else {
-            "✓"
+            paint("✓", |s| s.green().bold())
         };
         Some(format!("{mark} {elapsed} · {segment}"))
     }
@@ -2889,7 +2926,7 @@ impl TUIAppView for TuiProgressView {
     /// when there was nothing to report (e.g. inspect/query, or a no-op gc), in
     /// which case nothing is printed.
     fn last_render(&self) {
-        if let Some(line) = self.final_line() {
+        if let Some(line) = self.final_line_in(crate::tui::color::stderr_color_enabled()) {
             use std::io::Write;
             drop(writeln!(std::io::stderr().lock(), "{line}"));
         }
@@ -5544,6 +5581,30 @@ mod tests {
         assert_eq!(
             row(&view, 0),
             "✦ approval required: //a:1 · 2 pending · enter to review"
+        );
+        // Yellow throughout; bold up to the address, as the mockup.
+        let spans = &view.render("⠋", 0, 200, 2)[0].spans;
+        let bold = Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD);
+        let styled: Vec<(&str, Style)> = spans
+            .iter()
+            .filter(|s| !s.content.is_empty())
+            .map(|s| (s.content.as_ref(), s.style))
+            .collect();
+        assert_eq!(
+            styled.get(..3),
+            Some(
+                &[
+                    ("✦", bold),
+                    (" approval required: //a:1", bold),
+                    (
+                        " · 2 pending · enter to review",
+                        Style::default().fg(Color::Yellow)
+                    ),
+                ][..]
+            ),
+            "{styled:?}"
         );
         assert!(row(&view, 1_000).starts_with("❖ "), "{}", row(&view, 1_000));
         view.motion = false;
