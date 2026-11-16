@@ -424,25 +424,16 @@ impl ApprovalCenter {
         self.lock().standing.first().map(|&(_, s)| s)
     }
 
-    /// The front request as a session records it, and every pending request
-    /// by number and notice sources (what an attached viewer's approval view
-    /// reads): no notice content, no responder. `None` when idle, without
-    /// allocating.
+    /// Every pending request as a session records it, by number and notice
+    /// sources (what an attached viewer's approval view reads): no notice
+    /// content, no responder. `None` when idle, without allocating.
     pub fn prompt(&self) -> Option<crate::tui::session::ApprovalPrompt> {
         use crate::tui::session::{ApprovalPromptNotice, ApprovalQueued};
         let inner = self.lock_pruned();
-        let front = inner.queue.front()?;
+        if inner.queue.is_empty() {
+            return None;
+        }
         Some(crate::tui::session::ApprovalPrompt {
-            addr: front.addr.clone(),
-            queued_behind: u64::try_from(inner.queue.len().saturating_sub(1)).unwrap_or(u64::MAX),
-            notices: front
-                .notices
-                .iter()
-                .map(|n| ApprovalPromptNotice {
-                    name: n.name.clone(),
-                    sources: n.sources.clone(),
-                })
-                .collect(),
             queue: inner
                 .queue
                 .iter()

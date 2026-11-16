@@ -92,12 +92,11 @@ enum NoticeText {
     Lines(Vec<String>),
 }
 
-/// Which notice a text is: the request's number and target, and the
-/// notice's place among the request's notices.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// Which notice a text is: the request's number, and the notice's place
+/// among the request's notices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct NoticeKey {
     seq: u64,
-    addr: String,
     index: usize,
 }
 
@@ -297,14 +296,7 @@ impl ApprovalScreen {
         match &self.flash {
             Some(f) if now_ms < f.until_ms => return true,
             Some(_) => self.flash = None,
-            // The addr too: an older session's recorded request has no
-            // number, so each front request reads as `0`.
-            None if queue
-                .iter()
-                .any(|q| q.seq == self.req.seq && q.addr == self.req.addr) =>
-            {
-                return true;
-            }
+            None if queue.iter().any(|q| q.seq == self.req.seq) => return true,
             None => {}
         }
         let Some(next) = queue.first() else {
@@ -320,16 +312,15 @@ impl ApprovalScreen {
         self.texts.retain(|k, _| {
             queue
                 .iter()
-                .any(|q| q.seq == k.seq && q.addr == k.addr && k.index < q.notices.len())
+                .any(|q| q.seq == k.seq && k.index < q.notices.len())
         });
         true
     }
 
     /// The key of the notice on screen, `None` when the request has none.
     fn notice_key(&self) -> Option<NoticeKey> {
-        (self.notice < self.req.notices.len()).then(|| NoticeKey {
+        (self.notice < self.req.notices.len()).then_some(NoticeKey {
             seq: self.req.seq,
-            addr: self.req.addr.clone(),
             index: self.notice,
         })
     }
@@ -416,7 +407,7 @@ impl ApprovalScreen {
             && self
                 .feed
                 .as_ref()
-                .is_some_and(|f| f.ask.send((key.clone(), n.sources.clone())).is_ok());
+                .is_some_and(|f| f.ask.send((key, n.sources.clone())).is_ok());
         let text = if asked {
             NoticeText::Reading
         } else {

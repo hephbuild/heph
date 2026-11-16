@@ -207,10 +207,9 @@ pub enum SessionRecordKind {
         #[serde(default)]
         msg: String,
         /// The line's number in this process's log sink, from 1: what a
-        /// replay after a full screen selects by. Absent from a writer that
-        /// predates it.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        seq: Option<u64>,
+        /// replay after a full screen selects by.
+        #[serde(default)]
+        seq: u64,
     },
     /// The process is exiting. Written before the lock is released, so "lock
     /// free and no `End`" means exactly "crashed".
@@ -244,8 +243,7 @@ pub enum SessionRecordKind {
     Approval {
         #[serde(default)]
         prompt: Option<Box<ApprovalPrompt>>,
-        /// Absent from a writer that predates standing decisions, and while
-        /// none stands. A value this heph does not know reads as `None`
+        /// Absent while none stands. A value this heph does not know reads as `None`
         /// rather than dropping the whole record (and with it the prompt).
         #[serde(
             default,
@@ -259,9 +257,7 @@ pub enum SessionRecordKind {
     /// terminal printed below that summary.
     Finished {
         /// The user stopped the run, so its summary said `stopped`. Absent
-        /// (and so `false`) from a writer that predates it, and when not
-        /// stopped: such a record reads `{"type":"Finished"}` as it always
-        /// did, and an older reader ignores the field.
+        /// (and so `false`) when not stopped.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         stopped: bool,
     },
@@ -286,18 +282,11 @@ pub enum SessionRecordKind {
 /// A pending approval prompt as [`SessionRecordKind::Approval`] records it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalPrompt {
+    /// Every pending request, oldest first: the front one is what the prompt
+    /// row names, and the whole queue is what an attached viewer's Approvals
+    /// tab and approval view show. Never empty in a written record: no
+    /// request pending is an absent prompt.
     #[serde(default)]
-    pub addr: String,
-    /// Prompts queued behind this one.
-    #[serde(default)]
-    pub queued_behind: u64,
-    /// Each notice the target declares.
-    #[serde(default)]
-    pub notices: Vec<ApprovalPromptNotice>,
-    /// Every pending request, oldest first, this one included: what an
-    /// attached viewer's Approvals tab and approval view show. Empty from a
-    /// writer that predates it; the viewer then knows the front request only.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub queue: Vec<ApprovalQueued>,
 }
 
@@ -748,40 +737,34 @@ mod tests {
     #[test]
     fn view_records_round_trip() {
         let prompt = ApprovalPrompt {
-            addr: "//a:gated".into(),
-            queued_behind: 2,
-            notices: vec![ApprovalPromptNotice {
-                name: "terms".into(),
-                sources: vec![
-                    hcore::approval_notice::NoticeSource {
-                        addr: "//a:terms".into(),
-                        origin: hcore::approval_notice::NoticeOrigin::Cache {
-                            addr: "//a:terms".into(),
-                            revision: "abc123_1700000000000000000".into(),
-                            hashout: "def456".into(),
-                        },
-                    },
-                    hcore::approval_notice::NoticeSource {
-                        addr: "//@heph/fs:file@f=a/TERMS".into(),
-                        origin: hcore::approval_notice::NoticeOrigin::View {
-                            source: Box::new(hcore::approval_notice::NoticeOrigin::File {
-                                path: "a/TERMS".into(),
-                                out_path: "a/TERMS".into(),
-                                x: false,
-                                hashout: "0f0f".into(),
-                            }),
-                            paths: vec![("a/TERMS".into(), "TERMS".into())],
-                        },
-                    },
-                ],
-            }],
             queue: vec![ApprovalQueued {
                 seq: 4,
                 addr: "//a:gated".into(),
                 queued_at_unix_ms: 1_700_000_000_000,
                 notices: vec![ApprovalPromptNotice {
                     name: "terms".into(),
-                    sources: Vec::new(),
+                    sources: vec![
+                        hcore::approval_notice::NoticeSource {
+                            addr: "//a:terms".into(),
+                            origin: hcore::approval_notice::NoticeOrigin::Cache {
+                                addr: "//a:terms".into(),
+                                revision: "abc123_1700000000000000000".into(),
+                                hashout: "def456".into(),
+                            },
+                        },
+                        hcore::approval_notice::NoticeSource {
+                            addr: "//@heph/fs:file@f=a/TERMS".into(),
+                            origin: hcore::approval_notice::NoticeOrigin::View {
+                                source: Box::new(hcore::approval_notice::NoticeOrigin::File {
+                                    path: "a/TERMS".into(),
+                                    out_path: "a/TERMS".into(),
+                                    x: false,
+                                    hashout: "0f0f".into(),
+                                }),
+                                paths: vec![("a/TERMS".into(), "TERMS".into())],
+                            },
+                        },
+                    ],
                 }],
             }],
         };
@@ -836,40 +819,28 @@ mod tests {
         }
     }
 
-    /// `Finished` gains `stopped` additively: unstopped it encodes exactly as
-    /// before, a record from a writer that predates it reads unstopped, and
-    /// a reader that predates it (a unit `Finished`) still decodes a stopped
-    /// one.
+    /// `Finished` writes `stopped` only when set: unstopped it is a bare
+    /// `{"type":"Finished"}`, which reads back unstopped, and a stopped one
+    /// round-trips.
     #[test]
-    fn finished_stopped_is_additive() {
+    fn finished_writes_stopped_only_when_set() {
         let plain = SessionRecord::session(7, SessionRecordKind::Finished { stopped: false });
         let json = serde_json::to_string(&plain).expect("encode");
         assert!(
             json.ends_with(r#""session":{"type":"Finished"}}"#),
             "{json}"
         );
-        let old: SessionRecord =
-            serde_json::from_str(r#"{"at_unix_ms":7,"session":{"type":"Finished"}}"#)
-                .expect("decode an older writer's");
+        let back: SessionRecord = serde_json::from_str(&json).expect("decode");
         assert_eq!(
-            old.session,
+            back.session,
             Some(SessionRecordKind::Finished { stopped: false })
         );
 
-        #[derive(serde::Deserialize, Debug, PartialEq)]
-        #[serde(tag = "type")]
-        enum OlderKind {
-            Finished,
-        }
-        #[derive(serde::Deserialize, Debug)]
-        struct OlderRecord {
-            session: OlderKind,
-        }
         let stopped = SessionRecord::session(7, SessionRecordKind::Finished { stopped: true });
         let json = serde_json::to_string(&stopped).expect("encode");
         assert!(json.contains(r#""stopped":true"#), "{json}");
-        let older: OlderRecord = serde_json::from_str(&json).expect("an older reader decodes it");
-        assert_eq!(older.session, OlderKind::Finished);
+        let back: SessionRecord = serde_json::from_str(&json).expect("decode");
+        assert_eq!(back.session, stopped.session);
     }
 
     /// A notice whose record names no input — any record without `sources`
@@ -895,12 +866,12 @@ mod tests {
         fn never(_: &NoticeRoots, _: &[NoticeSource]) -> Option<String> {
             None
         }
-        let json = r#"{"at_unix_ms":3,"session":{"type":"Approval","prompt":{"addr":"//a:b","queued_behind":0,"notices":[{"name":"plan"}]}}}"#;
+        let json = r#"{"at_unix_ms":3,"session":{"type":"Approval","prompt":{"queue":[{"seq":1,"addr":"//a:b","notices":[{"name":"plan"}]}]}}}"#;
         let rec: SessionRecord = serde_json::from_str(json).expect("decode");
         let Some(SessionRecordKind::Approval { prompt, .. }) = rec.session else {
             panic!("not an Approval: {rec:?}");
         };
-        let mut notice = prompt.expect("prompt").notices[0].clone();
+        let mut notice = prompt.expect("prompt").queue[0].notices[0].clone();
         let roots = NoticeRoots {
             home: "/nonexistent-heph-home".into(),
             root: "/nonexistent-heph-root".into(),
@@ -929,14 +900,14 @@ mod tests {
     fn approval_record_with_an_unknown_standing_keeps_its_prompt() {
         for standing in [r#""approve_once""#, r#"{"later":1}"#, "7"] {
             let json = format!(
-                r#"{{"at_unix_ms":3,"session":{{"type":"Approval","prompt":{{"addr":"//a:b","queued_behind":0,"notices":[]}},"standing":{standing}}}}}"#
+                r#"{{"at_unix_ms":3,"session":{{"type":"Approval","prompt":{{"queue":[{{"seq":1,"addr":"//a:b"}}]}},"standing":{standing}}}}}"#
             );
             let rec: SessionRecord = serde_json::from_str(&json).expect("decode");
             let Some(SessionRecordKind::Approval { prompt, standing }) = rec.session else {
                 panic!("not an Approval: {rec:?}");
             };
             assert_eq!(standing, None, "{json}");
-            assert_eq!(prompt.expect("the prompt survives").addr, "//a:b");
+            assert_eq!(prompt.expect("the prompt survives").queue[0].addr, "//a:b");
         }
         // A known value still decodes.
         let json =

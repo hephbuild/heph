@@ -516,11 +516,9 @@ impl Model {
                 reserved,
                 ..
             } => {
-                // Every pool it declared or reserved is in play; a host
-                // predating resources counts it as one CPU.
-                match reserved {
-                    Some(r) => self.play(r.keys()),
-                    None => self.play([hcore::capacity::CPU]),
+                // Every pool it declared or reserved is in play.
+                if let Some(r) = reserved {
+                    self.play(r.keys());
                 }
                 if let Some(d) = declared {
                     self.play(d.keys());
@@ -1024,8 +1022,8 @@ impl Model {
     }
 
     /// One gauge per pool in play that reported, cpu, memory and sandbox
-    /// first, then declared pools by name. None before any report (an older
-    /// session) or before anything ran or waited; a pool this build never
+    /// first, then declared pools by name. None before any report or before
+    /// anything ran or waited; a pool this build never
     /// touched has none.
     pub fn gauges(&self) -> Vec<&Gauge> {
         let mut gauges: Vec<&Gauge> = self

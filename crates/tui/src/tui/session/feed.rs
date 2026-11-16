@@ -217,7 +217,7 @@ mod tests {
             SessionRecordKind::Log {
                 level: "INFO".into(),
                 msg: msg.into(),
-                seq: None,
+                seq: 0,
             },
         )
     }
@@ -238,8 +238,11 @@ mod tests {
     fn routes_by_teardown_order() {
         let feed = SessionFeed::default();
         let prompt = ApprovalPrompt {
-            addr: "//a:gated".into(),
-            ..ApprovalPrompt::default()
+            queue: vec![crate::tui::session::ApprovalQueued {
+                seq: 1,
+                addr: "//a:gated".into(),
+                ..Default::default()
+            }],
         };
         let label = SessionRecordKind::Label {
             label: "Invoking //a:b".into(),

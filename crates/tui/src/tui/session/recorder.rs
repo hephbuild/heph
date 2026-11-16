@@ -795,7 +795,7 @@ impl RecorderThread {
                 SessionRecordKind::Log {
                     level: level.to_owned(),
                     msg,
-                    seq: Some(seq),
+                    seq,
                 },
             )),
             Msg::Flush { ack } => {

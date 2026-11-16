@@ -821,7 +821,7 @@ fn attached_reads_notice_from_the_store() {
 /// store, each read "notice unavailable", and no path shows.
 #[test]
 fn notice_unavailable_never_a_path() {
-    use crate::tui::session::{ApprovalPrompt, ApprovalPromptNotice};
+    use crate::tui::session::{ApprovalPrompt, ApprovalPromptNotice, ApprovalQueued};
     let home = tempfile::tempdir().expect("tempdir");
     let center = ApprovalCenter::new();
     let build = center.build();
@@ -857,28 +857,30 @@ fn notice_unavailable_never_a_path() {
     assert!(!frame.join("\n").contains("the plan"));
     assert_no_path(&frame, home.path());
 
-    // A front request recorded alone, its notice with no source: the view
-    // shows it as unavailable.
+    // A request whose notice names no source: the view shows it as
+    // unavailable.
     drop(gate);
     record_prompt(
         &feed,
         Some(ApprovalPrompt {
-            addr: "//a:legacy".into(),
-            queued_behind: 0,
-            notices: vec![ApprovalPromptNotice {
-                name: "plan".into(),
-                sources: Vec::new(),
+            queue: vec![ApprovalQueued {
+                seq: 2,
+                addr: "//a:sourceless".into(),
+                queued_at_unix_ms: 0,
+                notices: vec![ApprovalPromptNotice {
+                    name: "plan".into(),
+                    sources: Vec::new(),
+                }],
             }],
-            queue: Vec::new(),
         }),
     );
     attached.advance(NOW + 1_000);
     assert!(
         attached.in_approval_view(),
-        "it moves on to the legacy request"
+        "it moves on to the next request"
     );
     let frame = draw_until(&mut attached, "notice unavailable");
     let joined = frame.join("\n");
-    assert!(joined.contains("//a:legacy"), "{joined}");
+    assert!(joined.contains("//a:sourceless"), "{joined}");
     assert_no_path(&frame, home.path());
 }

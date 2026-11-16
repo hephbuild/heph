@@ -145,7 +145,7 @@ fn recorder_round_trip_matches_live_view() {
         == Some(SessionRecordKind::Log {
             level: "INFO".into(),
             msg: "hello\u{1b}[31m".into(),
-            seq: Some(1),
+            seq: 1,
         })));
     assert_eq!(
         records.last().and_then(|r| r.session.clone()),
@@ -560,8 +560,11 @@ fn events_cap_keeps_the_ending_view_records() {
     let kept = [
         SessionRecordKind::Approval {
             prompt: Some(Box::new(ApprovalPrompt {
-                addr: "//a:gate".into(),
-                ..ApprovalPrompt::default()
+                queue: vec![crate::tui::session::ApprovalQueued {
+                    seq: 1,
+                    addr: "//a:gate".into(),
+                    ..Default::default()
+                }],
             })),
             standing: None,
         },
@@ -599,7 +602,7 @@ fn events_cap_keeps_the_ending_view_records() {
     want.push(SessionRecordKind::Log {
         level: "INFO".into(),
         msg: "after the cap".into(),
-        seq: Some(1),
+        seq: 1,
     });
     want.push(SessionRecordKind::End {
         exit_code: Some(1),

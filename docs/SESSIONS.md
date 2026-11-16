@@ -153,7 +153,7 @@ decodes as `Unknown`. `session` is a `SessionRecordKind`: `Log {level, msg,
 seq}` (every line the terminal shows, at the terminal's own filter, so
 `debug!` lines under `-v` too, and diagnostics with an empty `level`; lossy
 UTF-8, stored verbatim and escaped by the viewer on output; `seq` numbers the
-sink's lines from 1, absent in records from before it), `End {exit_code,
+sink's lines from 1), `End {exit_code,
 panicked}`, `Truncated`, `InflightWritten`, and
 `Unknown` for anything newer. Both keys are optional; a line with neither is
 skipped.
@@ -163,8 +163,9 @@ so `attach` draws it (see [Attach](#attach)):
 
 - `Label {label}`: the TUI's bottom label changed (`meta.json` holds the first).
 - `Approval {prompt, standing}`: the approval banner changed; `prompt` is
-  `{addr, queued_behind, notices: [{name, sources: [{addr, origin}]}]}`, or
-  absent once nothing is pending. `origin` says where one artifact's bytes
+  `{queue: [{seq, addr, queued_at_unix_ms, notices: [{name, sources: [{addr,
+  origin}]}]}]}`, every pending request oldest first (the front one is what
+  the banner names), or absent once nothing is pending. `origin` says where one artifact's bytes
   are kept, tagged by `kind`: `cache {addr, revision, hashout}` (an entry of
   the local cache under the run's home), `file {path, out_path, x, hashout}`
   (a source file read in place, `path` relative to the workspace root), or

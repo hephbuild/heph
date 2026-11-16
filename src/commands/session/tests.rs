@@ -1389,7 +1389,7 @@ async fn attach_mirrors_the_session_exit() {
             SessionRecordKind::Log {
                 level: "INFO".to_owned(),
                 msg: "hello \u{1b}[2J".to_owned(),
-                seq: None,
+                seq: 0,
             },
         ),
     );
@@ -1460,7 +1460,7 @@ async fn detach_listener_is_armed_before_its_task_runs() {
 /// "notice unavailable", never its text.
 #[tokio::test(flavor = "multi_thread")]
 async fn attach_reads_a_pending_notice_from_the_run_home() {
-    use crate::tui::session::{ApprovalPrompt, ApprovalPromptNotice, FileSource};
+    use crate::tui::session::{ApprovalPrompt, ApprovalPromptNotice, ApprovalQueued, FileSource};
     use crate::tui::{App as _, TUIAppView as _};
 
     const NOTICE: &str = "drop the table";
@@ -1495,13 +1495,15 @@ async fn attach_reads_a_pending_notice_from_the_run_home() {
         m.workspace_root = Some(ws.path().display().to_string());
         m.home_dir = Some(recorded_home.display().to_string());
         let prompt = ApprovalPrompt {
-            addr: "//a:gate".to_owned(),
-            queued_behind: 0,
-            notices: vec![ApprovalPromptNotice {
-                name: "plan".to_owned(),
-                sources: sources.clone(),
+            queue: vec![ApprovalQueued {
+                seq: 1,
+                addr: "//a:gate".to_owned(),
+                queued_at_unix_ms: T0,
+                notices: vec![ApprovalPromptNotice {
+                    name: "plan".to_owned(),
+                    sources: sources.clone(),
+                }],
             }],
-            queue: Vec::new(),
         };
         let records = [SessionRecord::session(
             T0,

@@ -1018,13 +1018,15 @@ mod tests {
             2,
             SessionRecordKind::Approval {
                 prompt: Some(Box::new(super::super::ApprovalPrompt {
-                    addr: ADDR.into(),
-                    queued_behind: 0,
-                    notices: vec![super::super::ApprovalPromptNotice {
-                        name: "plan".into(),
-                        sources: sources.clone(),
+                    queue: vec![super::super::ApprovalQueued {
+                        seq: 1,
+                        addr: ADDR.into(),
+                        queued_at_unix_ms: 0,
+                        notices: vec![super::super::ApprovalPromptNotice {
+                            name: "plan".into(),
+                            sources: sources.clone(),
+                        }],
                     }],
-                    queue: Vec::new(),
                 })),
                 standing: None,
             },
@@ -1068,7 +1070,7 @@ mod tests {
             panic!("{kinds:?}");
         };
         assert_eq!(
-            prompt.notices[0].sources, sources,
+            prompt.queue[0].notices[0].sources, sources,
             "the notice's sources are recorded past the cap"
         );
 

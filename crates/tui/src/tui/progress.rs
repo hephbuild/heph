@@ -1852,11 +1852,7 @@ fn approval_prompt_row(glyph: &'static str, addr: &str, pending: u64, live: bool
 }
 
 /// The pending requests a session recorded, as an attached viewer's queue,
-/// their waits measured at `now_unix_ms`. A writer that predates
-/// [`ApprovalPrompt::queue`] recorded the front request only: it is the
-/// whole queue then, with no number and no wait.
-///
-/// [`ApprovalPrompt::queue`]: crate::tui::session::ApprovalPrompt::queue
+/// their waits measured at `now_unix_ms`.
 fn recorded_queue(
     prompt: crate::tui::session::ApprovalPrompt,
     now_unix_ms: u64,
@@ -1870,14 +1866,6 @@ fn recorded_queue(
             })
             .collect()
     };
-    if prompt.queue.is_empty() {
-        return vec![QueuedApproval {
-            seq: 0,
-            addr: prompt.addr,
-            notices: notices(prompt.notices),
-            waited: std::time::Duration::ZERO,
-        }];
-    }
     prompt
         .queue
         .into_iter()
@@ -2361,8 +2349,10 @@ impl TuiProgressView {
                 Some((addr, u64::try_from(pending).unwrap_or(u64::MAX)))
             }
             Role::Attached { feed, .. } => {
-                let prompt = feed.approval()?;
-                Some((prompt.addr, prompt.queued_behind.saturating_add(1)))
+                let queue = feed.approval()?.queue;
+                let pending = u64::try_from(queue.len()).unwrap_or(u64::MAX);
+                let front = queue.into_iter().next()?;
+                Some((front.addr, pending))
             }
         }
     }
