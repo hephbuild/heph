@@ -11,11 +11,16 @@ on:
   # is visible, explainable, and opt-outable.
   #
   # Naming `types:` replaces the default set, so the three default events are
-  # spelled out and two more are added. Both additions exist for the gate:
+  # spelled out and three more are added. All three exist for the gate:
   #
   #   - `labeled`, so adding `ci/force-ci` starts a run by itself rather than
   #     needing a push to notice the label. (It also makes `ci/perf-test`
   #     self-triggering, which it previously was not.)
+  #   - `unlabeled`, so removing `ci/force-ci` from a middle layer *stops* its
+  #     build. The new run lands in the same concurrency group, cancels the
+  #     forced run in flight, and the gate then skips. Without it the forced
+  #     run went on to completion: a whole run of ~29 jobs held against the
+  #     account's concurrent-job limit for nothing.
   #   - `edited`, so the base-branch change GitHub performs *itself* when a
   #     stack's base merges — retargeting the child at master — starts a run.
   #     Nothing else reports that: a retarget fires no `synchronize`, so
@@ -23,13 +28,15 @@ on:
   #     `skipped` checks from its stacked days, which branch protection reads
   #     as success. That is code reaching master with nothing ever built.
   #
-  # Both fire on things that are not code changes — any label, any title or
-  # body edit — and the gate cannot suppress those without concluding "skip"
-  # on a master-targeting PR, which would replace its green required checks
-  # with skipped ones. Re-running is the safe direction, so the cost is real
-  # and taken deliberately: **a label or a body edit on a master-targeting PR
-  # runs CI again, and because this workflow cancels in-progress PR runs, doing
-  # either mid-run kills that run and restarts it from zero.** In practice the
+  # All three fire on things that are not code changes — any label added or
+  # removed, any title or body edit — and the gate cannot suppress those
+  # without concluding "skip" on a master-targeting PR, which would replace its
+  # green required checks with skipped ones. Re-running is the safe direction,
+  # so the cost is real and taken deliberately: **adding or removing a label,
+  # or editing the body, on a master-targeting PR runs CI again, and because
+  # this workflow cancels in-progress PR runs, doing it mid-run kills that run
+  # and restarts it from zero.** So `ci/force-ci` is never added to or removed
+  # from a master-targeting PR: it does nothing there. In practice the
   # dominant case is `gh stack submit`, which pushes and rewrites PR bodies
   # seconds apart — same concurrency group, so those collapse into one run.
   #
@@ -37,7 +44,7 @@ on:
   # master, so it keeps working on a stacked PR and reports the ABI delta for
   # that layer alone.
   pull_request:
-    types: [opened, synchronize, reopened, labeled, edited]
+    types: [opened, synchronize, reopened, labeled, unlabeled, edited]
 
 # PR: cancel superseded runs so a new push doesn't leave the old run burning
 # runners (and showing up as a noisy "cancelled"). master: every commit gets
@@ -82,15 +89,29 @@ jobs:
   # deep stack's CI cost by its depth to produce results that were, at best,
   # about a tree nobody would ever merge.
   #
-  # So: a push, or a PR targeting the default branch, builds. Anything else
-  # builds only when the PR carries the `ci/force-ci` label — for the times a
-  # mid-stack change is worth testing on its own (a big refactor low in the
-  # stack, a platform-specific change, a flake hunt).
+  # So: a push builds, a PR targeting the default branch builds, and so does
+  # the **top of a stack** — a stacked PR with no open PR based on its head
+  # branch. Only the middle layers skip. The `ci/force-ci` label builds a
+  # middle layer anyway; it is rarely the right call.
+  #
+  # Why skip the middle at all: Actions concurrency is limited. One run is
+  # ~29 jobs, more than the account can run at once, so a second run queues
+  # behind the first. A `gh stack sync` pushes every layer at once, and
+  # building each of them would put the stack's depth in runs in that queue.
+  # The top layer's tree contains every layer below it, so one run there tests
+  # the whole stack. A stack therefore costs two runs per push, whatever its
+  # depth: the bottom (required, it targets master) and the top.
+  #
+  # The top is found by asking, at run time, which open PRs are based on this
+  # PR's head branch. That answer can go stale with no event on this PR: a new
+  # layer opened on top leaves this layer's run going, and closing the top
+  # leaves the layer below it unbuilt until its next push or edit. Both cost
+  # time, not correctness — nothing here is a required check.
   #
   # This does not let untested code reach master. Required status checks live
   # in the `master` repository ruleset, whose condition is `~DEFAULT_BRANCH` —
-  # it applies to exactly the PRs whose base is master, which is exactly the
-  # set this gate lets through. A stacked PR merges with skipped checks
+  # it applies to exactly the PRs whose base is master, and the gate builds
+  # every one of those, unconditionally. A stacked PR merges with skipped checks
   # because GitHub asks nothing of a PR that does not target a protected
   # branch. The stack stays mergeable bottom-up with no manual override and no
   # ruleset change.
@@ -109,6 +130,10 @@ jobs:
     name: Gate
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # Exhaustive for this job: listing the PRs stacked on this one is all the
+    # gate reads, and it writes nothing.
+    permissions:
+      pull-requests: read
     outputs:
       run: ${{ steps.decide.outputs.run }}
       reason: ${{ steps.decide.outputs.reason }}
@@ -118,8 +143,11 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
           BASE: ${{ github.event.pull_request.base.ref }}
+          HEAD: ${{ github.event.pull_request.head.ref }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           FORCED: ${{ contains(github.event.pull_request.labels.*.name, 'ci/force-ci') }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           if [ "$EVENT" != "pull_request" ]; then
@@ -131,9 +159,18 @@ jobs:
           elif [ "$FORCED" = "true" ]; then
             run=true
             why="this PR carries the 'ci/force-ci' label."
+          # Asked only here, so a master-targeting PR's verdict never waits on
+          # (or fails with) the API. A failed lookup builds: a wasted run is
+          # recoverable, a top of stack nobody built is not.
+          elif ! children=$(gh pr list --base "$HEAD" --state open --json number --jq 'map("#\(.number)") | join(" ")'); then
+            run=true
+            why="this PR targets '$BASE', and listing the PRs stacked on it failed, so it builds rather than risk skipping the top of the stack."
+          elif [ -z "$children" ]; then
+            run=true
+            why="this PR targets '$BASE' and nothing is stacked on it: it is the top of its stack, and its run tests every layer below it."
           else
             run=false
-            why="this PR targets '$BASE', not '$DEFAULT_BRANCH' — it is stacked on another branch, so it cannot merge until the layer below it does, and it will get a full run as soon as it is rebased onto '$DEFAULT_BRANCH'. Add the 'ci/force-ci' label to build it anyway; 'ci/perf-test' alone will not, because perfbench needs the build this gate skipped."
+            why="this PR targets '$BASE' and $children is stacked on it — a middle layer. The top of the stack builds this layer's changes along with its own, so read that run. This one gets its own full run once it reaches '$DEFAULT_BRANCH'. 'ci/force-ci' builds it anyway, at the cost of one more full run in the queue for the account's limited concurrent jobs."
           fi
           echo "run=$run" >> "$GITHUB_OUTPUT"
           echo "reason=$why" >> "$GITHUB_OUTPUT"
@@ -1788,9 +1825,9 @@ jobs:
   #     whether perf runs at all. Labelling an already-open PR does start a
   #     run on its own — `labeled` is in this workflow's `pull_request` types
   #     (added for the gate's `ci/force-ci`), so no push or manual re-run is
-  #     needed. On a *stacked* PR it still gets nothing: this job needs
-  #     `build`, which the gate skipped, so `ci/perf-test` there wants
-  #     `ci/force-ci` alongside it.
+  #     needed. On a *middle* layer of a stack it still gets nothing: this
+  #     job needs `build`, which the gate skipped there. On the top of a
+  #     stack, which the gate builds, it runs.
   #   - `push` to `master`: nothing is blocked at this point (the merge
   #     already happened) — this is continuous monitoring, and a regression
   #     instead files a GitHub issue.
