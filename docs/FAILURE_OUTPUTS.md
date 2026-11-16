@@ -61,21 +61,28 @@ unlinked. A plugin built before log streaming returns a log file instead: the
 engine imports it, scrubbed the same way, provided it is a regular file inside
 the run's sandbox, and the returned file wins over anything streamed.
 
-The failure box prints where each part is:
+A non-interactive run (CI, a pipe) prints a root failure's block the moment
+it fails, with the last `--log-lines` lines of its log:
+
+```
+ERROR ✗ //web:e2e · exit status: 1
+  │ …
+  │ 3 failed, 41 passed
+```
+
+and, at the end of the run, the failure box, which prints where each part is.
+The tail is not repeated there:
 
 ```
 × target failed: //web:e2e
 ╰─▶ process exited with status: exit status: 1
-    ╭─[log]
-    …
-    ╰────
   full log: /ws/.heph/failures/web_e2e-…/log.txt
   sandbox: removed (rerun with --keep-failed-sandboxes to keep it)
   outputs: /ws/.heph/failures/web_e2e-…/out
   log: heph log //web:e2e
 ```
 
-This is the box of a non-interactive run (CI, a pipe). Its last line is the
+The box's last line is the
 command that prints the log without naming where it lives, printed whenever
 heph can open a log for the target — on disk or not, a remote hit's log it
 would fetch included — and `log: none kept` when it cannot. An interactive run
@@ -115,7 +122,7 @@ without the flag. `heph inspect failure` (and its `--json`) never reports the
 sandbox: it reads the slot, and the sandbox is not part of it.
 
 When the slot's fill itself fails (an unwritable failures directory, a log
-outside the sandbox), the box falls back to the log's tail in memory, and the
+outside the sandbox), the tail shown falls back to the log's tail in memory, and the
 full log is gone with the sandbox unless `--keep-failed-sandboxes` kept it.
 
 ## `failure_out`

@@ -114,9 +114,24 @@ fn render_diff_box(out: &mut String, diff: &str, color: bool) {
     }
 }
 
+/// Whether a failure box frames the log's tail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogTailIn {
+    /// The box: every caller but the line backend's end of run.
+    Box,
+    /// Already printed: the line backend printed each root failure's tail
+    /// the moment it failed, so the box at the end leaves it out.
+    PrintedLive,
+}
+
 /// Render a single target failure to a string. The `×` and `╰─▶` markers are red
 /// when `color`.
 fn render_target_failure(f: &TargetFailure, color: bool) -> String {
+    render_target_failure_with(f, color, LogTailIn::Box)
+}
+
+/// [`render_target_failure`], with the tail framed or left out (`tail`).
+fn render_target_failure_with(f: &TargetFailure, color: bool, tail: LogTailIn) -> String {
     let cross = if color {
         format!("{}", "×".red())
     } else {
@@ -147,9 +162,10 @@ fn render_target_failure(f: &TargetFailure, color: bool) -> String {
     }
     // The tail is read from the slot's log through the handle the engine kept
     // open, so a rerun replacing the slot meanwhile cannot swap this run's box.
-    let tail = match &f.log {
-        Some(log) => log.tail().ok().or_else(|| f.log_tail.clone()),
-        None => f.log_tail.clone(),
+    let tail = match (tail, &f.log) {
+        (LogTailIn::PrintedLive, _) => None,
+        (LogTailIn::Box, Some(log)) => log.tail().ok().or_else(|| f.log_tail.clone()),
+        (LogTailIn::Box, None) => f.log_tail.clone(),
     };
     if let Some(log) = &tail {
         render_log_box(&mut out, &log.text, log.start_line, color);
@@ -269,12 +285,16 @@ fn shell_quote(s: &str) -> std::borrow::Cow<'_, str> {
 /// Render each recorded target failure, separated by a blank line. Pure, so the
 /// exact bytes the user sees are assertable without capturing stderr.
 pub fn render_failures_to_string(failures: &[Arc<TargetFailure>], color: bool) -> String {
+    render_failures(failures, color, LogTailIn::Box)
+}
+
+fn render_failures(failures: &[Arc<TargetFailure>], color: bool, tail: LogTailIn) -> String {
     let mut out = String::new();
     for (i, f) in failures.iter().enumerate() {
         if i > 0 {
             out.push('\n');
         }
-        out.push_str(&render_target_failure(f, color));
+        out.push_str(&render_target_failure_with(f, color, tail));
     }
     out
 }
@@ -743,9 +763,18 @@ impl FailedTargets {
     /// Everything this error prints: the boxes, then any incomplete-selection
     /// block.
     fn render_to_string(&self, color: bool) -> String {
+        // Reported at the failure site means the line backend: its view
+        // printed each root failure's tail as it failed (every command that
+        // records target failures runs it, `CiProgressView`), and the same
+        // tail, read from the same slot log, would only repeat it here.
+        let tail = if self.rendered {
+            LogTailIn::PrintedLive
+        } else {
+            LogTailIn::Box
+        };
         let mut out = match &self.report {
             Some(report) => report.render(color),
-            None => render_failures_to_string(&self.failures, color),
+            None => render_failures(&self.failures, color, tail),
         };
         if let Some(report) = &self.incomplete {
             out.push('\n');
@@ -1573,6 +1602,45 @@ mod tests {
         let none =
             render_failures_to_string(&[Arc::new(tail_only.with_log_readable(false))], false);
         assert_eq!(none, format!("{rendered}  log: none kept\n"), "{none}");
+    }
+
+    /// The box a non-interactive run prints at its end leaves out the log's
+    /// tail, which the line backend printed as the target failed, and keeps
+    /// every other row; a box rendered anywhere else still frames it.
+    #[test]
+    fn ci_box_leaves_out_the_tail_printed_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.txt");
+        std::fs::write(&path, "first\nlast words\n").unwrap();
+        let log = crate::engine::error::FailureLog::open(
+            path.clone(),
+            std::fs::File::open(&path).unwrap(),
+            10,
+        );
+        let addr = crate::htaddr::parse_addr("//web:lint").unwrap();
+        let f = Arc::new(
+            TargetFailure::new(addr, None, anyhow::anyhow!("boom"))
+                .with_log(Some(log))
+                .with_log_readable(true),
+        );
+
+        let mut sink: Vec<u8> = Vec::new();
+        drop(FailedTargets::reported(
+            vec![Arc::clone(&f)],
+            None,
+            &mut sink,
+            false,
+        ));
+        assert_eq!(
+            String::from_utf8(sink).expect("utf8"),
+            format!(
+                "× target failed: //web:lint\n╰─▶ boom\n  full log: {}\n  log: heph log //web:lint\n",
+                path.display()
+            )
+        );
+
+        let boxed = render_failures_to_string(&[f], false);
+        assert!(boxed.contains("2 │ last words"), "{boxed}");
     }
 
     /// The box's `sandbox:` line, after the log footer, for each fate: removed
