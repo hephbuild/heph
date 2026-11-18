@@ -33,14 +33,15 @@ pub enum GoPackageKind {
     },
 }
 
-/// Maps heph packages to Go packages for one workspace, memoizing both the
-/// decode and the `go.mod` lookup it rests on. Owned by the provider, so the
-/// memo lives exactly as long as the provider that relies on it, and two
-/// providers (or two tests) never share one.
+/// Maps heph packages to Go packages for one workspace, memoizing the
+/// first-party decode and the `go.mod` lookup it rests on. Owned by one cache
+/// scope of the provider (`GoScope`): both maps read the filesystem and cache
+/// negative answers (no `go.mod` above a directory), which hold for one
+/// snapshot of the workspace, not for the provider's life.
 ///
-/// Both maps are pure functions of the workspace plus filesystem state that is
-/// stable for the duration of a build. They are race-tolerant: a concurrent
-/// miss computes the same value twice and the first insert wins.
+/// Stdlib and thirdparty addresses decode from the string alone and are not
+/// memoized. The maps are race-tolerant: a concurrent miss computes the same
+/// value twice and the first insert wins.
 #[derive(Debug)]
 pub struct GoPkgResolver {
     workspace_root: PathBuf,
@@ -64,6 +65,11 @@ impl GoPkgResolver {
     /// Decode a heph package address into its Go package kind.
     /// Returns None if the address doesn't correspond to a Go package.
     pub fn decode(&self, pkg: &PkgBuf) -> Option<Arc<GoPackageKind>> {
+        // Stdlib and thirdparty addresses decode from the string alone: a pure
+        // function, so no lock and no memo entry.
+        if let Some(kind) = self.decode_virtual(pkg.as_str()) {
+            return kind.map(Arc::new);
+        }
         if let Some(cached) = self.decoded.lock().get(pkg) {
             return cached.clone();
         }
@@ -77,27 +83,31 @@ impl GoPkgResolver {
             .clone()
     }
 
-    fn decode_uncached(&self, pkg: &PkgBuf) -> Option<GoPackageKind> {
-        let workspace_root = self.workspace_root.as_path();
-        let s = pkg.as_str();
-
+    /// The stdlib/thirdparty decode, from the address string alone. `None`
+    /// for a first-party candidate; `Some(None)` for a malformed virtual one.
+    fn decode_virtual(&self, s: &str) -> Option<Option<GoPackageKind>> {
         if let Some(rest) = s.strip_prefix(STD_PREFIX) {
-            return Some(GoPackageKind::Stdlib {
+            return Some(Some(GoPackageKind::Stdlib {
                 import_path: rest.to_string(),
-            });
+            }));
         }
 
         // Thirdparty — two formats:
         // 1. "@heph/go/thirdparty/..."          → base_pkg = "" → module_root = workspace_root
         // 2. "{base_pkg}/@heph/go/thirdparty/..." → module_root = workspace_root/base_pkg
         if let Some(rest) = s.strip_prefix(THIRD_PREFIX) {
-            let module_root = workspace_root.to_path_buf();
-            return parse_thirdparty(rest, module_root);
+            return Some(parse_thirdparty(rest, self.workspace_root.clone()));
         }
         if let Some((base_pkg, rest)) = s.split_once(THIRD_SEPARATOR) {
-            let module_root = workspace_root.join(base_pkg);
-            return parse_thirdparty(rest, module_root);
+            return Some(parse_thirdparty(rest, self.workspace_root.join(base_pkg)));
         }
+        None
+    }
+
+    /// The first-party decode: needs the `go.mod` above the package.
+    fn decode_uncached(&self, pkg: &PkgBuf) -> Option<GoPackageKind> {
+        let workspace_root = self.workspace_root.as_path();
+        let s = pkg.as_str();
 
         // First-party: any dir under a go.mod ancestor is a candidate, even if the
         // dir doesn't exist on disk yet — generated subpackages (codegen output)
