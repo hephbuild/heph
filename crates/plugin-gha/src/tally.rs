@@ -950,6 +950,7 @@ mod tests {
             start,
             BuildEventKind::ExecuteStart {
                 output_groups: Vec::new(),
+                log_not_streamed: false,
                 addr: addr.into(),
                 driver: "exec".into(),
                 cache: false,
@@ -1067,6 +1068,7 @@ mod tests {
             2,
             BuildEventKind::ExecuteStart {
                 output_groups: Vec::new(),
+                log_not_streamed: false,
                 addr: "//a:x".into(),
                 driver: "exec".into(),
                 cache: true,
@@ -1198,6 +1200,7 @@ mod tests {
                 i,
                 BuildEventKind::ExecuteStart {
                     output_groups: Vec::new(),
+                    log_not_streamed: false,
                     addr: format!("//a:t{i}"),
                     driver: "exec".into(),
                     cache: false,

@@ -2,12 +2,14 @@ use crate::plugingo::module_fetch::{add_fetch_env, is_settled_package_error};
 use crate::plugingo::pkg_analysis::{
     GoPackage, encode_go_package, encode_package_addrs, resolve_package_addrs,
 };
+use crate::plugingo::tool_log::ToolLog;
 use anyhow::Context;
 use async_trait::async_trait;
 use hcore::debug_hash::DebugHasher;
 use hcore::hasync::Cancellable;
 use hcore::htvalue::signature::ParamType;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
+use hdriver_support::run_log::Streams;
 use hplugin::driver::targetdef::path::{CodegenMode, Content, Path};
 use hplugin::driver::targetdef::{CacheConfig, Input, InputMode, Output, TargetDef};
 use hplugin::driver::{
@@ -451,7 +453,7 @@ impl ManagedDriver for GoGolistDriver {
 
     async fn run<'a, 'io>(
         &self,
-        req: ManagedRunRequest<'a, 'io>,
+        mut req: ManagedRunRequest<'a, 'io>,
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ManagedRunResponse> {
         let def = req.request.target.def_de::<GoGolistDef>();
@@ -559,7 +561,17 @@ impl ManagedDriver for GoGolistDriver {
         .await
         .with_context(|| format!("wait for go list for {}", def.import_path))?;
 
+        // A successful `go list` logs nothing: its stdout is the package graph
+        // parsed below (data), and its stderr ran under the fetch environment,
+        // whose values (a `GOPROXY` with userinfo, `GOAUTH`) are not scrubbed
+        // and would reach a cached, uploaded log. A failed one is not cached and
+        // has no answer, so both streams are its account and reach the log
+        // (`tool_log.rs`'s rule); its stderr also reaches the message as a
+        // tail, as before. An older host keeps no log of `go list`.
         if !output.status.success() {
+            ToolLog::new(&mut req.request)
+                .write(&output, Streams::BOTH)
+                .await;
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(crate::plugingo::errors::GoListError {
                 import_path: def.import_path.clone(),
@@ -986,6 +998,7 @@ mod tests {
     #[cfg(unix)]
     mod sdk_staging {
         use super::*;
+        use crate::plugingo::tool_log::test_support::Shared;
         use hcore::hartifactcontent::tar::{TarPacker, TarWalker};
         use hcore::hartifactcontent::{Content as ArtifactContent, WalkEntry};
         use hdriver_support::driver_managed::ShellFallback;
@@ -1028,8 +1041,17 @@ mod tests {
         /// The hermetic SDK's shape: everything under
         /// `<toolchain pkg>/go/`, with a `bin/go` and many small `src/` files.
         fn fake_sdk(goroot: &str) -> Arc<dyn ArtifactContent> {
+            fake_sdk_with(goroot, "")
+        }
+
+        /// [`fake_sdk`] whose `bin/go` runs `go_body`.
+        fn fake_sdk_with(goroot: &str, go_body: &str) -> Arc<dyn ArtifactContent> {
             let mut packer = TarPacker::new();
-            packer.create_raw(b"#!/bin/sh\n".to_vec(), format!("{goroot}/bin/go"), true);
+            packer.create_raw(
+                format!("#!/bin/sh\n{go_body}\n").into_bytes(),
+                format!("{goroot}/bin/go"),
+                true,
+            );
             packer.create_raw(b"go1.0".to_vec(), format!("{goroot}/VERSION"), false);
             for i in 0..SDK_FILES {
                 packer.create_raw(
@@ -1185,6 +1207,100 @@ mod tests {
                 .filter_map(Result::ok)
                 .any(|entry| entry.path().join(&goroot).join("bin/go").is_file());
             assert!(staged_go, "the staged SDK survives the sandbox's removal");
+        }
+
+        /// A successful `go list` writes nothing to the log under
+        /// `log_capture`: its stdout is the package graph — data — and its
+        /// stderr ran under the unscrubbed fetch environment, which must not
+        /// reach a cached log. The real driver runs a stand-in `go` from the SDK.
+        #[tokio::test]
+        async fn a_successful_go_list_logs_nothing() {
+            let (res, out, err) = run_go_list(
+                "printf '{\"ImportPath\":\"example.com/mylib\",\"Name\":\"mylib\"}\\n'\n\
+                 echo 'go: finding example.com/mylib via https://user:pw@proxy' >&2",
+            )
+            .await;
+            assert_eq!(err, "", "a success's stderr is not logged; run: {res:?}");
+            assert_eq!(out, "", "the package graph is data, never the log");
+        }
+
+        /// A failed `go list` has no answer: both its streams are its account
+        /// and reach the log, and the message keeps its stderr tail.
+        #[tokio::test]
+        async fn a_failed_go_list_logs_both_streams() {
+            let (res, out, err) =
+                run_go_list("echo 'partial-graph'\necho 'go: no such package' >&2\nexit 1").await;
+            assert_eq!(err, "go: no such package\n", "run: {res:?}");
+            assert_eq!(out, "partial-graph\n", "a failure's stdout is its account");
+            let e = res.expect_err("a failed go list fails the run");
+            assert!(format!("{e:#}").contains("go: no such package"), "{e:#}");
+        }
+
+        /// Runs the real golist driver under `log_capture` with a stand-in `go`
+        /// running `script`; returns the run's result and what reached the
+        /// stdout and stderr writers.
+        async fn run_go_list(script: &str) -> (anyhow::Result<()>, String, String) {
+            let ct = noop_ctoken();
+            let version = crate::plugingo::toolchain::DEFAULT_GO_VERSION;
+            let sdk_addr = crate::plugingo::toolchain::toolchain_addr(version);
+            let req = make_parse_request(
+                "mylib",
+                "example.com/mylib",
+                vec![("gosdk", vec![sdk_addr.format().as_str()])],
+            );
+            let mut def = driver().parse(req, &ct).await.expect("parse").target_def;
+            let sdk_input = def
+                .inputs
+                .iter()
+                .find(|i| i.origin_id == "dep|gosdk|0")
+                .expect("gosdk input")
+                .clone();
+            def.outputs.clear();
+
+            let home = tempfile::tempdir().expect("home");
+            let sandbox = home.path().join("sandbox/mylib/__target__golist");
+            let goroot = crate::plugingo::toolchain::staged_goroot(version);
+            let os = ManagedDriverOs {
+                driver: Arc::new(Box::new(driver())),
+                shell_fallback: Arc::new(ShellFallback {
+                    driver: Arc::new(NoopRun),
+                    spec_template: Arc::new(hplugin::provider::TargetSpec::default()),
+                }),
+                stage_dir: Some(home.path().join("stage")),
+            };
+            let request_id = "test".to_string();
+            let mut run = RunRequest::new(&request_id, &def, sandbox);
+            run.inputs = vec![RunInput {
+                artifact: InputArtifact {
+                    r#type: Type::Dep,
+                    origin_id: sdk_input.origin_id.clone(),
+                    content: fake_sdk_with(&goroot, script),
+                },
+                origin_id: sdk_input.origin_id.clone(),
+                source_addr: sdk_addr,
+                filters: vec![],
+                annotations: sdk_input.annotations.clone(),
+            }];
+            let gocache = home.path().join("gocache");
+            std::fs::create_dir(&gocache).expect("gocache");
+            run.scratch = vec![hplugin::driver::ScratchMount {
+                addr: hmodel::htaddr::Addr::new(
+                    PkgBuf::from("x"),
+                    "gocache".to_string(),
+                    Default::default(),
+                ),
+                path: "gocache".to_string(),
+                env: "GOCACHE".to_string(),
+                dir: gocache,
+            }];
+            let (out, err) = (Shared::default(), Shared::default());
+            run.log_capture = true;
+            run.stdout = Some(out.writer());
+            run.stderr = Some(err.writer());
+            // Whether the stand-in's package survives the driver's checks is
+            // not what is tested: the log is written as soon as `go list` exits.
+            let res = os.run_inner(run, &ct, false).await.map(drop);
+            (res, out.text(), err.text())
         }
     }
 

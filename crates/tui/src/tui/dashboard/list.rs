@@ -1142,6 +1142,7 @@ mod tests {
         let mut m = model(&["//p:run", "//p:done"]);
         let exec = |addr: &str| BuildEventKind::ExecuteStart {
             output_groups: Vec::new(),
+            log_not_streamed: false,
             addr: addr.into(),
             driver: "exec".into(),
             cache: true,

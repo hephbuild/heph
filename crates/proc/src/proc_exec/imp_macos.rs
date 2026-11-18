@@ -323,9 +323,18 @@ impl OutputReader {
     /// Cancel-safe: there is no suspension point between taking a message off
     /// the channel and returning it, so a dropped `recv` cannot lose a chunk.
     pub async fn recv(&mut self) -> io::Result<Option<(StreamId, Vec<u8>)>> {
+        self.recv_tagged().await.map_err(|(_, e)| e)
+    }
+
+    /// [`recv`](Self::recv), with a read error naming the stream it ended:
+    /// a caller for which one stream is data and the other log treats the
+    /// two differently. Same cancel-safety.
+    pub async fn recv_tagged(
+        &mut self,
+    ) -> Result<Option<(StreamId, Vec<u8>)>, (StreamId, io::Error)> {
         match self.recv_msg().await {
             Some(DrainMsg::Chunk(id, chunk)) => Ok(Some((id, chunk))),
-            Some(DrainMsg::Err(id, e)) => Err(stream_error(id, e)),
+            Some(DrainMsg::Err(id, e)) => Err((id, stream_error(id, e))),
             None => Ok(None),
         }
     }

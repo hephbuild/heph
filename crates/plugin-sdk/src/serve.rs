@@ -4570,6 +4570,31 @@ mod tests {
         }
     }
 
+    /// The host proxy says its driver streams its log exactly when the plugin
+    /// reads `log_capture`: a 0.21.0 plugin does not, so a reader of its live
+    /// log says "this target's driver does not stream its log" until the run
+    /// ends.
+    #[test]
+    fn a_plugin_streams_its_log_from_log_capture_on() {
+        for (abi, streams) in [
+            ("0.21.0", false),
+            (plugin_abi::LOG_CAPTURE_SINCE, true),
+            ("0.21.1", true),
+            (plugin_abi::ABI_SEMVER, true),
+        ] {
+            let (host, _saw) = log_harness(abi, 1);
+            assert_eq!(host.streams_log(), streams, "abi {abi}");
+        }
+        let dynd = make_dyn_managed_driver(Arc::new(LogDriver {
+            chunks: 1,
+            saw_log_capture: tokio::sync::mpsc::unbounded_channel().0,
+        }) as Arc<dyn ManagedDriver>);
+        let unreported = hplugin_stabby::load_stable::StableRemoteManagedDriver::new(dynd, "x")
+            .expect("load")
+            .with_plugin_abi(None);
+        assert!(!unreported.streams_log(), "no reported ABI");
+    }
+
     /// Every chunk the plugin wrote before its terminal frame reaches the
     /// host's sinks before `run` returns, in order per stream — including the
     /// ones still queued behind a slow sink when the result arrived.

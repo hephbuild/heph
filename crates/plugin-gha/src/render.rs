@@ -957,6 +957,7 @@ mod tests {
                 0,
                 BuildEventKind::ExecuteStart {
                     output_groups: Vec::new(),
+                    log_not_streamed: false,
                     addr: format!("//pkg{}:running{i}", i % 50),
                     driver: "exec".into(),
                     cache: false,
@@ -1171,6 +1172,7 @@ mod tests {
             0,
             BuildEventKind::ExecuteStart {
                 output_groups: Vec::new(),
+                log_not_streamed: false,
                 addr: "//a:slow".into(),
                 driver: "exec".into(),
                 cache: false,
@@ -1359,6 +1361,7 @@ mod tests {
             600_000,
             BuildEventKind::ExecuteStart {
                 output_groups: Vec::new(),
+                log_not_streamed: false,
                 addr: "//a:b".into(),
                 driver: "exec".into(),
                 cache: true,
@@ -1554,6 +1557,7 @@ mod tests {
                 i,
                 BuildEventKind::ExecuteStart {
                     output_groups: Vec::new(),
+                    log_not_streamed: false,
                     addr: format!("//services/api:image{i}"),
                     driver: "exec".into(),
                     cache: false,

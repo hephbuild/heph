@@ -11,6 +11,10 @@ hcore = { package = "core", path = "../core" }
 hmodel = { package = "model", path = "../model" }
 hplugin = { package = "plugin", path = "../plugin" }
 hlock = { package = "lock", path = "../lock" }
+# `run_log::RunLog::pump` reads a child's `OutputReader`.
+hproc = { package = "proc", path = "../proc" }
+# `run_log::RunLog::output` spawns a plugin's tool through the exec-runner seam.
+hexecrunner = { package = "execrunner", path = "../execrunner" }
 anyhow = "1.0.102"
 async-trait = "0.1.89"
 serde = { version = "1", features = ["derive"] }
@@ -20,7 +24,9 @@ glob = "0.3"
 walkdir = "2"
 tracing = "0.1"
 xxhash-rust = { version = "0.8.15", features = ["xxh3", "std"] }
-tokio = { version = "1.52.3", features = ["rt", "io-util", "fs", "process"] }
+# `macros`/`time`: `RunLog::drive` bounds the drain after a child exits, as
+# `proc_exec::output` does (hproc enables both already).
+tokio = { version = "1.52.3", features = ["rt", "io-util", "fs", "process", "macros", "time"] }
 # A fresh, uniquely named file per collected output tar (see
 # `driver_managed::pack_to_artifact_tar`).
 tempfile = "3"
@@ -32,3 +38,6 @@ memchr = "2.8"
 # `clonefile(2)` for staged per-file inputs (see `stage::share_file`).
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "macros", "time"] }

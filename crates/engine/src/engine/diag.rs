@@ -2016,6 +2016,7 @@ mod tests {
         let hook = DiagHook::new(std::sync::Arc::clone(&s));
         hook.on_event(&ev(BuildEventKind::ExecuteStart {
             output_groups: Vec::new(),
+            log_not_streamed: false,
             addr: "//a:b".into(),
             driver: "bash".into(),
             cache: true,

@@ -17,11 +17,13 @@ use crate::plugingo::embed;
 use crate::plugingo::factors::BuildMode;
 use crate::plugingo::listed;
 use crate::plugingo::pkg_analysis::decode_go_package;
+use crate::plugingo::tool_log::ToolLog;
 use anyhow::Context;
 use async_trait::async_trait;
 use hcore::debug_hash::DebugHasher;
 use hcore::hasync::Cancellable;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
+use hdriver_support::run_log::Streams;
 use hplugin::driver::targetdef::path::{CodegenMode, Content, Path};
 use hplugin::driver::targetdef::{CacheConfig, Input, InputMode, Output, TargetDef};
 use hplugin::driver::{
@@ -467,7 +469,7 @@ impl ManagedDriver for GoCompileDriver {
         let res: anyhow::Result<ManagedRunResponse> = async {
             let def = req.request.target.def_de::<GoCompileDef>();
             let pkg_dir = &req.sandbox_pkg_dir;
-            let log = req.sandbox_dir.join("log.txt");
+            let mut log = ToolLog::new(&mut req.request);
             let ws_root = req.sandbox_ws_dir.to_string_lossy().into_owned();
 
             // GOROOT / go binary for the selected toolchain — host, target-ref, or
@@ -613,7 +615,7 @@ impl ManagedDriver for GoCompileDriver {
                     run_go(args),
                     &env,
                     pkg_dir,
-                    &log,
+                    &mut log,
                     runner,
                     ctoken,
                     "asm -gensymabis",
@@ -660,7 +662,7 @@ impl ManagedDriver for GoCompileDriver {
                 run_go(cargs),
                 &env,
                 pkg_dir,
-                &log,
+                &mut log,
                 runner,
                 ctoken,
                 "compile",
@@ -693,7 +695,7 @@ impl ManagedDriver for GoCompileDriver {
                         run_go(args),
                         &env,
                         pkg_dir,
-                        &log,
+                        &mut log,
                         runner,
                         ctoken,
                         "asm",
@@ -714,7 +716,7 @@ impl ManagedDriver for GoCompileDriver {
                     run_go(pargs),
                     &env,
                     pkg_dir,
-                    &log,
+                    &mut log,
                     runner,
                     ctoken,
                     "pack",
@@ -726,6 +728,8 @@ impl ManagedDriver for GoCompileDriver {
         }
         .await;
         // `go tool` output is captured, not streamed: see `echo_failure_log`.
+        // Under `log_capture` the output already went to the writers, the
+        // failure carries no log, and this does nothing.
         if let Err(e) = &res {
             hdriver_support::driver_managed::echo_failure_log(&mut req.request, e).await;
         }
@@ -847,7 +851,7 @@ impl GoCompileDriver {
         args: Vec<OsString>,
         env: &HashMap<String, String>,
         cwd: &std::path::Path,
-        log: &std::path::Path,
+        log: &mut ToolLog<'_>,
         runner: hexecrunner::RunnerRef<'_>,
         ctoken: &(dyn Cancellable + Send + Sync),
         step: &str,
@@ -874,9 +878,14 @@ impl GoCompileDriver {
             // Both streams go to the target's log, which the failure box renders
             // the tail of — `go tool` writes diagnostics to stderr, but some
             // failures print on stdout. Not pasted into the message.
-            return Err(hplugin::error::ProcessFailed::from_output(log, &output)
+            return Err(log
+                .failed(&output)
+                .await
                 .context(format!("go {step} failed")));
         }
+        // Both streams are log: a successful step's warnings reach the log
+        // under `log_capture`.
+        log.write(&output, Streams::BOTH).await;
         Ok(())
     }
 }
@@ -1040,6 +1049,117 @@ pub fn build_compile_spec(p: CompileParams) -> TargetSpec {
         config,
         labels: listed::owned(listed::BUILD),
         ..Default::default()
+    }
+}
+
+/// A `go tool` step's output reaches the run's log: the request's writers under
+/// `log_capture`, the target's own `log.txt` on an older host.
+#[cfg(test)]
+mod log_tests {
+    use super::*;
+    use crate::plugingo::tool_log::test_support::Shared;
+    use hdriver_support::run_log::RunLog;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    /// A `go` stand-in, in shell builtins only.
+    fn fake_go(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+        let go = dir.join("go");
+        std::fs::write(&go, format!("#!/bin/sh\n{body}\n")).expect("write fake go");
+        std::fs::set_permissions(&go, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        go
+    }
+
+    async fn step(
+        go: &std::path::Path,
+        cwd: &std::path::Path,
+        log: &mut ToolLog<'_>,
+    ) -> anyhow::Result<()> {
+        let ct = hcore::hasync::StdCancellationToken::new();
+        GoCompileDriver::new()
+            .exec_go(
+                go,
+                vec![OsString::from("tool"), OsString::from("compile")],
+                &HashMap::new(),
+                cwd,
+                log,
+                hexecrunner::RunnerRef::local(),
+                &ct,
+                "compile",
+            )
+            .await
+    }
+
+    fn captured(out: &Shared, err: &Shared) -> ToolLog<'static> {
+        ToolLog::Captured(RunLog::captured(Some(out.writer()), Some(err.writer())))
+    }
+
+    #[tokio::test]
+    async fn a_compiles_log_reaches_the_writers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let go = fake_go(dir.path(), "echo 'note: inlining'\necho 'warning: x' >&2");
+        let (out, err) = (Shared::default(), Shared::default());
+        step(&go, dir.path(), &mut captured(&out, &err))
+            .await
+            .expect("step");
+        assert_eq!(out.text(), "note: inlining\n");
+        assert_eq!(err.text(), "warning: x\n");
+        assert!(
+            !dir.path().join("log.txt").exists(),
+            "no own log under log_capture"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_compile_under_log_capture_names_no_log() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let go = fake_go(dir.path(), "echo 'a.go:1: undefined: x' >&2\nexit 2");
+        let (out, err) = (Shared::default(), Shared::default());
+        let e = step(&go, dir.path(), &mut captured(&out, &err))
+            .await
+            .expect_err("the step fails");
+        assert_eq!(err.text(), "a.go:1: undefined: x\n");
+        assert!(
+            hplugin::error::failure_log(&e).is_none(),
+            "no Log artifact crosses the boundary under log_capture"
+        );
+        assert_eq!(
+            hplugin::error::process_exit(&e),
+            Some(hplugin::error::Exit::Code(2))
+        );
+        assert!(format!("{e:#}").contains("go compile failed"), "{e:#}");
+        assert!(
+            !dir.path().join("log.txt").exists(),
+            "no own log under log_capture"
+        );
+    }
+
+    /// An older host: nothing is logged on success, and a failure appends both
+    /// streams to `log.txt` and returns it, as before.
+    #[tokio::test]
+    async fn an_older_host_keeps_its_own_log_on_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log_path = dir.path().join("log.txt");
+        let ok = fake_go(dir.path(), "echo quiet >&2");
+        step(&ok, dir.path(), &mut ToolLog::OwnFile(log_path.clone()))
+            .await
+            .expect("step");
+        assert!(
+            !log_path.exists(),
+            "a success keeps no log on an older host"
+        );
+
+        let bad = fake_go(dir.path(), "echo out\necho err >&2\nexit 1");
+        let e = step(&bad, dir.path(), &mut ToolLog::OwnFile(log_path.clone()))
+            .await
+            .expect_err("the step fails");
+        assert_eq!(
+            std::fs::read_to_string(&log_path).expect("log.txt"),
+            "out\nerr\n"
+        );
+        assert!(
+            hplugin::error::failure_log(&e).is_some(),
+            "the failure carries log.txt"
+        );
     }
 }
 

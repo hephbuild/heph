@@ -55,6 +55,12 @@ const CHUNK: usize = 64 * 1024;
 /// How often a follower asks the locator, or looks at the stored sources,
 /// while it waits: each costs reading files.
 const RECHECK: Duration = Duration::from_millis(250);
+/// How long a follow waiting on a run that does not stream its log looks
+/// for its stored log once the run is over, before ending with none. The
+/// session says the run is over once its result is (`ResultEnd`), after the
+/// store; the store's sqlite write can still be queued then, unseen by
+/// another heph, for a moment.
+const NOT_STREAMED_SETTLE: Duration = Duration::from_secs(2);
 /// Largest stored blob read into memory when its backend has no seekable
 /// reader (a blob under the spill threshold, held in sqlite).
 const IN_MEMORY_MAX: u64 = 64 << 20;
@@ -200,6 +206,24 @@ fn running_where(session: Option<&str>) -> String {
     }
 }
 
+/// The address is running on a driver that returns its log when the run
+/// ends instead of streaming it, no byte of it has arrived, and nothing
+/// stored is newer. The UI says "this target's driver does not stream its
+/// log".
+/// Outranks [`NoOutputYet`]: such a run is started too. For another
+/// session's run, only when no hashin was asked for, since the run's start
+/// does not say which hashin it runs. Only [`Engine::open_log`] returns it: a
+/// follow waits for the run instead.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "no live log; the run {} is on a driver that does not stream its log",
+    running_where(.session.as_deref())
+)]
+pub struct LogNotStreamed {
+    /// The session it runs in; `None` for a run of this engine.
+    pub session: Option<String>,
+}
+
 /// A finished log the API could read, before it is opened.
 enum Stored {
     /// A finished live file (a `cache = false` success's), opened when it
@@ -262,6 +286,13 @@ enum Latest {
     /// Running, in this engine or another session, nothing written yet.
     Started(NoOutputYet),
     Stored(Stored),
+    /// This engine (`session: None`) or the locator's session is running the
+    /// addr on a driver that returns its log when the run ends instead of
+    /// streaming it, and nothing stored is newer than that run's start.
+    NotStreamed {
+        session: Option<String>,
+        at_unix_ms: u64,
+    },
     None,
 }
 
@@ -304,6 +335,7 @@ impl Engine {
         match latest {
             Latest::None => Ok(None),
             Latest::Started(started) => Err(started.into()),
+            Latest::NotStreamed { session, .. } => Err(LogNotStreamed { session }.into()),
             Latest::Running(run) => Ok(Some(OpenLog::plain(
                 LogInfo {
                     source: LogSource::Live {
@@ -329,7 +361,10 @@ impl Engine {
     /// end. When none is going on, `wait_for_start` waits for the next one
     /// (or for a newer finished log to appear); otherwise the newest
     /// finished log is read through once. `Ok(None)` when there is nothing
-    /// to read and nothing to wait for.
+    /// to read and nothing to wait for. A run on a driver that does not
+    /// stream its log is waited on, as a live run is followed, until its log
+    /// is stored ([`LogFollower::not_streamed`] says so meanwhile), or until
+    /// it is over with none stored (cancelled, `cache = false`).
     pub async fn follow_log(
         self: &Arc<Self>,
         addr: &Addr,
@@ -345,14 +380,32 @@ impl Engine {
             Latest::Started(started) => Follow::Waiting {
                 baseline: Some(started.at_unix_ms),
                 started: Some(started),
+                not_streamed: None,
+                over_since: None,
+            },
+            // A run is going on, as for `Running`, so the follow waits for it
+            // whatever `wait_for_start` says: its log is the first stored one
+            // newer than its start.
+            Latest::NotStreamed {
+                session,
+                at_unix_ms,
+            } => Follow::Waiting {
+                baseline: Some(at_unix_ms),
+                started: None,
+                not_streamed: Some(LogNotStreamed { session }),
+                over_since: None,
             },
             Latest::Stored(stored) if wait_for_start => Follow::Waiting {
                 baseline: Some(stored.at_unix_ms()),
                 started: None,
+                not_streamed: None,
+                over_since: None,
             },
             Latest::None if wait_for_start => Follow::Waiting {
                 baseline: None,
                 started: None,
+                not_streamed: None,
+                over_since: None,
             },
             Latest::None => return Ok(None),
             Latest::Stored(stored) => {
@@ -426,12 +479,21 @@ impl Engine {
         }
         // Going on, its file not created yet (or created a moment ago, and
         // the next look reads it): newer than anything retained or stored.
+        // A driver that does not stream its log outranks "no output yet":
+        // its bytes come only as the run ends.
         if let Some(run) = started {
+            if run.not_streamed {
+                return Ok(Latest::NotStreamed {
+                    session: None,
+                    at_unix_ms: run.at_unix_ms,
+                });
+            }
             return Ok(Latest::Started(NoOutputYet {
                 session: None,
                 at_unix_ms: run.at_unix_ms,
             }));
         }
+        let mut not_streamed = None;
         if let Some(locator) = locator {
             match locator
                 .locate(&self.home, &addr.format())
@@ -469,6 +531,11 @@ impl Engine {
                         at_unix_ms,
                     }));
                 }
+                // The start names no hashin: only an unfiltered ask matches.
+                Some(LocatedRunLog::NotStreamed {
+                    session,
+                    at_unix_ms,
+                }) if hashin.is_none() => not_streamed = Some((session, at_unix_ms)),
                 // Ended: what replaced it is among the stored sources.
                 _ => {}
             }
@@ -487,6 +554,14 @@ impl Engine {
         }
         if let Some(entry) = self.newest_cached_log(addr, hashin)? {
             consider(entry);
+        }
+        if let Some((session, at)) = not_streamed
+            && start_outranks(newest.as_ref().map(Stored::at_unix_ms), at)
+        {
+            return Ok(Latest::NotStreamed {
+                session: Some(session),
+                at_unix_ms: at,
+            });
         }
         Ok(newest.map_or(Latest::None, Latest::Stored))
     }
@@ -646,6 +721,15 @@ impl Engine {
 
 /// Whether two manifests name the same revision: target, input hash and
 /// every artifact, whenever each was written.
+/// Whether a run that started at `start_ms` on a driver that does not stream
+/// its log is the answer over the newest stored log, stamped `stored_ms`. A
+/// stored log from the same millisecond is an older run's (this run stores its
+/// log only when it ends, after its start), so the start wins the tie; only a
+/// strictly newer stored log outranks it.
+fn start_outranks(stored_ms: Option<u64>, start_ms: u64) -> bool {
+    stored_ms.is_none_or(|stored| stored <= start_ms)
+}
+
 fn same_revision(a: &Manifest, b: &Manifest) -> anyhow::Result<bool> {
     let key = |m: &Manifest| borsh::to_vec(&(&m.target, &m.hashin, &m.artifacts));
     Ok(key(a).context("encoding a manifest")? == key(b).context("encoding a manifest")?)
@@ -780,6 +864,12 @@ enum Follow {
         /// that has written nothing yet: when it ends without a byte, so
         /// does the follow.
         started: Option<NoOutputYet>,
+        /// Waiting on a run, in this engine or another session, on a driver
+        /// that does not stream its log (`baseline` is then its start).
+        not_streamed: Option<LogNotStreamed>,
+        /// When that not-streamed run was first seen over with no newer log
+        /// stored.
+        over_since: Option<Instant>,
     },
     Live(Running),
     Stored(OpenLog),
@@ -842,8 +932,18 @@ impl LogFollower {
                     self.offset += bytes.len() as u64;
                     return Ok(FollowStep::Bytes(bytes));
                 }
-                Follow::Waiting { baseline, started } => {
-                    let (baseline, on_a_run) = (*baseline, started.is_some());
+                Follow::Waiting {
+                    baseline,
+                    started,
+                    not_streamed,
+                    over_since,
+                } => {
+                    let (baseline, on_a_run, waits_on_run, over_since) = (
+                        *baseline,
+                        started.is_some(),
+                        not_streamed.is_some(),
+                        *over_since,
+                    );
                     if !self.due() {
                         return Ok(FollowStep::Idle);
                     }
@@ -874,6 +974,23 @@ impl LogFollower {
                             }
                         }
                         Latest::Started(_) => return Ok(FollowStep::Idle),
+                        Latest::NotStreamed { .. } => {
+                            self.set_over_since(None);
+                            return Ok(FollowStep::Idle);
+                        }
+                        // The run waited on is over (its result ended, or its
+                        // session did) and no newer log is stored: once the
+                        // store's write has had time to land, none will be (a
+                        // cancelled run, a `cache = false` success). The
+                        // follow ends, as a streamed run's does.
+                        _ if waits_on_run => {
+                            let since = over_since.unwrap_or_else(Instant::now);
+                            if since.elapsed() < NOT_STREAMED_SETTLE {
+                                self.set_over_since(Some(since));
+                                return Ok(FollowStep::Idle);
+                            }
+                            Follow::Done
+                        }
                         // The run waited on ended without writing a byte.
                         _ if on_a_run => Follow::Done,
                         _ => return Ok(FollowStep::Idle),
@@ -960,6 +1077,26 @@ impl LogFollower {
     /// for a run of this engine: see [`Self::started`]).
     pub fn started_in(&self) -> Option<&str> {
         self.started().and_then(|s| s.session.as_deref())
+    }
+
+    /// The run on a driver that does not stream its log, while the follow
+    /// waits for that run to end and its log to be stored
+    /// ([`LogNotStreamed`], followed); `None` otherwise.
+    pub fn not_streamed(&self) -> Option<&LogNotStreamed> {
+        match &self.state {
+            Follow::Waiting {
+                not_streamed: Some(not_streamed),
+                ..
+            } => Some(not_streamed),
+            _ => None,
+        }
+    }
+
+    /// Record when the not-streamed run waited on was first seen over.
+    fn set_over_since(&mut self, at: Option<Instant>) {
+        if let Follow::Waiting { over_since, .. } = &mut self.state {
+            *over_since = at;
+        }
     }
 
     /// Whether a rate-limited check is due, marking it done.
@@ -1110,6 +1247,17 @@ mod tests {
     use super::*;
     use crate::engine::local_cache_fs::LocalCacheFS;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A not-streamed start against the newest stored log: no stored log, an
+    /// older one, and one from the same millisecond all read as NotStreamed;
+    /// a strictly newer stored log wins.
+    #[test]
+    fn a_not_streamed_start_wins_a_same_millisecond_tie() {
+        assert!(start_outranks(None, 100));
+        assert!(start_outranks(Some(99), 100));
+        assert!(start_outranks(Some(100), 100));
+        assert!(!start_outranks(Some(101), 100));
+    }
 
     fn info(source: LogSource) -> LogInfo {
         LogInfo {

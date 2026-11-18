@@ -372,6 +372,13 @@ pub enum BuildEventKind {
         /// it, and for a target that declares no output.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         output_groups: Vec<String>,
+        /// The driver does not stream its log (`Driver::streams_log`): it
+        /// returns its log when the run ends, and may write nothing to the
+        /// run's writers before. A reader says "this target's driver does
+        /// not stream its log" while no byte has arrived.
+        /// Diagnostics only; false from a host that predates it.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        log_not_streamed: bool,
     },
     ExecuteEnd {
         addr: String,
@@ -1062,6 +1069,7 @@ pub mod test_support {
             queued_ms: None,
             admitted: None,
             output_groups: Vec::new(),
+            log_not_streamed: false,
         };
         let end = |addr: &str| BuildEventKind::ResultEnd {
             left_behind: None,
@@ -1401,6 +1409,7 @@ mod tests {
                 queued_ms: Some(3),
                 admitted: Some(AdmittedKind::Handoff),
                 output_groups: vec!["out".into()],
+                log_not_streamed: false,
             },
         })
         .expect("encode");
@@ -1606,6 +1615,7 @@ mod tests {
                 queued_ms: Some(1500),
                 admitted: None,
                 output_groups: Vec::new(),
+                log_not_streamed: false,
             },
         };
         let back: BuildEvent =
@@ -1894,6 +1904,7 @@ mod tests {
                     queued_ms: None,
                     admitted: None,
                     output_groups,
+                    log_not_streamed: false,
                 },
             })
             .expect("encode")
@@ -1950,6 +1961,65 @@ mod tests {
                 ]
             ),
             "{old:?}"
+        );
+    }
+
+    /// `ExecuteStart.log_not_streamed` is absent from the wire when false,
+    /// read back when true, defaults to false in a frame from a host that
+    /// predates it, and a decoder that predates it reads the start anyway.
+    #[test]
+    fn execute_start_log_not_streamed_is_additive() {
+        let start = |log_not_streamed: bool| {
+            serde_json::to_string(&BuildEvent {
+                at_unix_ms: 2,
+                kind: BuildEventKind::ExecuteStart {
+                    addr: "//a:x".into(),
+                    driver: "exec".into(),
+                    cache: true,
+                    declared: None,
+                    reserved: None,
+                    queued_ms: None,
+                    admitted: None,
+                    output_groups: Vec::new(),
+                    log_not_streamed,
+                },
+            })
+            .expect("encode")
+        };
+        assert!(!start(false).contains("log_not_streamed"));
+        let set = start(true);
+        assert!(set.contains(r#""log_not_streamed":true"#), "{set}");
+        let read = |line: &str| match serde_json::from_str::<BuildEvent>(line)
+            .expect("decode")
+            .kind
+        {
+            BuildEventKind::ExecuteStart {
+                log_not_streamed, ..
+            } => log_not_streamed,
+            other => panic!("{other:?}"),
+        };
+        assert!(read(&set));
+        let older = r#"{"at_unix_ms":1,"kind":{"type":"ExecuteStart","addr":"//a:x","driver":"exec","cache":true}}"#;
+        assert!(!read(older));
+
+        #[derive(serde::Deserialize)]
+        struct OldEvent {
+            kind: OldKind,
+        }
+        #[derive(serde::Deserialize, Debug)]
+        #[serde(tag = "type")]
+        enum OldKind {
+            ExecuteStart {
+                addr: String,
+            },
+            #[serde(other)]
+            Unknown,
+        }
+        let old: OldEvent = serde_json::from_str(&set).expect("old decoder");
+        assert!(
+            matches!(&old.kind, OldKind::ExecuteStart { addr } if addr == "//a:x"),
+            "{:?}",
+            old.kind
         );
     }
 

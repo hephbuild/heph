@@ -24,6 +24,7 @@ mod target_modfiles;
 mod target_std;
 mod target_test;
 mod thirdparty;
+mod tool_log;
 mod toolchain;
 mod variant;
 

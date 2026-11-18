@@ -27,11 +27,13 @@
 //! which export-data-only linting cannot do.
 
 use crate::plugingo::deps::{DepGroups, dep_origin};
+use crate::plugingo::tool_log::ToolLog;
 use anyhow::Context;
 use async_trait::async_trait;
 use hcore::debug_hash::DebugHasher;
 use hcore::hasync::Cancellable;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
+use hdriver_support::run_log::Streams;
 use hplugin::driver::targetdef::path::{CodegenMode, Content, Path as TPath};
 use hplugin::driver::targetdef::{CacheConfig, Input, InputMode, Output, TargetDef};
 use hplugin::driver::{
@@ -365,6 +367,7 @@ impl ManagedDriver for GoLintDriver {
     ) -> anyhow::Result<ManagedRunResponse> {
         let res: anyhow::Result<ManagedRunResponse> = async {
         let def = req.request.target.def_de::<GoLintDef>();
+        let mut log = ToolLog::new(&mut req.request);
         let pkg_dir = &req.sandbox_pkg_dir;
 
         // The govet binary (single staged file in its group).
@@ -464,7 +467,7 @@ impl ManagedDriver for GoLintDriver {
                 ],
                 &env,
                 pkg_dir,
-                &req.sandbox_dir.join("log.txt"),
+                &mut log,
                 super::runner::runner_ref(req.request.request_id, def.runner.as_ref()),
                 ctoken,
             )
@@ -534,7 +537,7 @@ impl GoLintDriver {
         args: Vec<OsString>,
         env: &HashMap<String, String>,
         cwd: &std::path::Path,
-        log: &std::path::Path,
+        log: &mut ToolLog<'_>,
         runner: hexecrunner::RunnerRef<'_>,
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<Vec<u8>> {
@@ -559,9 +562,11 @@ impl GoLintDriver {
         if !output.status.success() {
             // The tool's output goes to the target's log, whose tail the
             // failure box renders, rather than into the message.
-            return Err(hplugin::error::ProcessFailed::from_output(log, &output)
-                .context("heph-govet failed"));
+            return Err(log.failed(&output).await.context("heph-govet failed"));
         }
+        // stdout is the `-json` report — the target's `lint-report.json`, which
+        // `go_lint_gate` keys on — so it is data and never the log.
+        log.write(&output, Streams::STDERR).await;
         Ok(output.stdout)
     }
 }
@@ -1469,6 +1474,41 @@ mod tests {
     use hmodel::htpkg::PkgBuf;
 
     const V: &str = crate::plugingo::toolchain::DEFAULT_GO_VERSION;
+
+    /// heph-govet's stdout is the report it returns — `lint-report.json` — and
+    /// never the log; its stderr reaches the writers under `log_capture`.
+    #[tokio::test]
+    async fn govet_report_is_returned_and_its_stderr_is_the_log() {
+        use crate::plugingo::tool_log::test_support::Shared;
+        use hdriver_support::run_log::RunLog;
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let govet = dir.path().join("heph-govet");
+        std::fs::write(
+            &govet,
+            "#!/bin/sh\nprintf '{\"a\":{}}'\necho 'loading analyzers' >&2\n",
+        )
+        .expect("write fake govet");
+        std::fs::set_permissions(&govet, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let (out, err) = (Shared::default(), Shared::default());
+        let mut log = ToolLog::Captured(RunLog::captured(Some(out.writer()), Some(err.writer())));
+        let ct = hcore::hasync::StdCancellationToken::new();
+        let report = GoLintDriver::new()
+            .exec_govet(
+                &govet,
+                vec![OsString::from("-json")],
+                &HashMap::new(),
+                dir.path(),
+                &mut log,
+                hexecrunner::RunnerRef::local(),
+                &ct,
+            )
+            .await
+            .expect("govet");
+        assert_eq!(report, b"{\"a\":{}}");
+        assert_eq!(out.text(), "", "the report is data, never the log");
+        assert_eq!(err.text(), "loading analyzers\n");
+    }
 
     fn factors() -> Factors {
         Factors {

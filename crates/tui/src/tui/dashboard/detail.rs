@@ -403,6 +403,7 @@ mod tests {
     fn shapes_are_stored_once_and_told_apart() {
         let start = |driver: &str, cpu: u64, outputs: &[&str]| BuildEventKind::ExecuteStart {
             output_groups: outputs.iter().map(|s| (*s).to_owned()).collect(),
+            log_not_streamed: false,
             addr: "//p:x".into(),
             driver: driver.into(),
             cache: true,

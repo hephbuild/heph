@@ -378,11 +378,13 @@ impl ManagedDriver for Driver {
             argv.push(builder.clone());
         }
 
-        let mut io = super::docker_build::ToolIo::from_request(&mut req.request);
+        let mut io = super::docker_build::tool_io(&mut req.request);
+        // stdout is the answer (it becomes `platform.txt`), never the log.
         let stdout = super::docker_build::run_tool(
             argv,
             &cwd,
             "docker buildx inspect",
+            hdriver_support::run_log::Streams::STDERR,
             &mut io,
             ctoken,
         )

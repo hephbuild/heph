@@ -3589,6 +3589,7 @@ mod tests {
     fn execute_start(addr: &str) -> BuildEventKind {
         BuildEventKind::ExecuteStart {
             output_groups: Vec::new(),
+            log_not_streamed: false,
             addr: addr.into(),
             driver: "exec".into(),
             cache: true,
@@ -3602,6 +3603,7 @@ mod tests {
     fn execute_start_reserving(addr: &str, reserved: &[(&str, u64)]) -> BuildEventKind {
         BuildEventKind::ExecuteStart {
             output_groups: Vec::new(),
+            log_not_streamed: false,
             addr: addr.into(),
             driver: "exec".into(),
             cache: true,
@@ -3621,6 +3623,7 @@ mod tests {
     fn a_clamped_target_row_shows_declared_to_reserved() {
         let start = |addr: &str, declared: u64, reserved: u64| BuildEventKind::ExecuteStart {
             output_groups: Vec::new(),
+            log_not_streamed: false,
             addr: addr.into(),
             driver: "exec".into(),
             cache: true,
@@ -3675,6 +3678,7 @@ mod tests {
             1,
             BuildEventKind::ExecuteStart {
                 output_groups: Vec::new(),
+                log_not_streamed: false,
                 addr: "//p:big".into(),
                 driver: "exec".into(),
                 cache: true,
@@ -6466,6 +6470,7 @@ mod tests {
             } else {
                 ev(BuildEventKind::ExecuteStart {
                     output_groups: Vec::new(),
+                    log_not_streamed: false,
                     addr: a.clone(),
                     driver: "exec".into(),
                     cache: true,

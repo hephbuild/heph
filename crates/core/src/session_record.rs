@@ -97,14 +97,22 @@ pub enum LocatedRunLog {
         at_unix_ms: u64,
         session: String,
     },
+    /// `session`, a live session of this workspace, is running the addr
+    /// (started at `at_unix_ms`) on a driver that returns its log when the
+    /// run ends instead of streaming it, and no byte of its log has arrived.
+    /// The UI says "this target's driver does not stream its log".
+    /// Beats [`Self::Started`]: such a run is started too, but "no output
+    /// yet" would promise bytes that come only at its end.
+    NotStreamed { session: String, at_unix_ms: u64 },
 }
 
 impl LocatedRunLog {
-    /// The record found; `None` for [`Self::Started`].
+    /// The record found; `None` for [`Self::Started`] and
+    /// [`Self::NotStreamed`].
     pub fn record(&self) -> Option<&RunLogRecord> {
         match self {
             Self::Live { record, .. } | Self::Ended { record, .. } => Some(record),
-            Self::Started { .. } => None,
+            Self::Started { .. } | Self::NotStreamed { .. } => None,
         }
     }
 }

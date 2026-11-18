@@ -51,6 +51,7 @@ use async_trait::async_trait;
 use hcore::hasync::Cancellable;
 use hcore::htvalue::signature::ParamType;
 use hdriver_support::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
+use hdriver_support::run_log::{RunLog, Streams};
 use hexecrunner::RunnerRef;
 use hplugin::driver::targetdef::path::{CodegenMode, Content, Path as OutPath};
 use hplugin::driver::targetdef::{CacheConfig, Input, InputMode, Output, TargetDef};
@@ -58,6 +59,7 @@ use hplugin::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
     ParseResponse, TargetAddr,
 };
+use hplugin::error::ProcessFailed;
 use hplugin::htspec::{FromSpecValue, Spec};
 use hproc::proc_exec;
 use std::collections::BTreeMap;
@@ -398,10 +400,16 @@ impl ManagedDriver for Driver {
 
     async fn run<'a, 'io>(
         &self,
-        req: ManagedRunRequest<'a, 'io>,
+        mut req: ManagedRunRequest<'a, 'io>,
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ManagedRunResponse> {
         let def = req.request.target.def_de::<DevenvDef>().clone();
+        // Under `log_capture` the request's writers are the run's log. An older
+        // host gets no log from this driver, as before.
+        let mut log = req
+            .request
+            .log_capture
+            .then(|| RunLog::from_request(&mut req.request, "log.txt"));
 
         // The devenv root, inside the sandbox: the declared deps were
         // materialized here, so this is the copy whose content the build
@@ -413,7 +421,7 @@ impl ManagedDriver for Driver {
         };
 
         let captured = self
-            .capture_env(&root, &def, ctoken)
+            .capture_env(&root, &def, log.as_mut(), ctoken)
             .await
             .with_context(|| {
                 format!(
@@ -503,10 +511,17 @@ impl Driver {
     /// `env -0`, not `env`: a value may legitimately contain a newline, and a
     /// line-split capture would tear it in half and hand targets a truncated
     /// variable.
+    ///
+    /// Under `log_capture` (`log` is `Some`) devenv's stderr — building the
+    /// shell — reaches the run's log as it is written, and a failure is the exit
+    /// status with no log path. Its stdout is the environment: data, never the
+    /// log on either host (it can hold any `pass_env` value). An older host
+    /// keeps no log, as before.
     async fn capture_env(
         &self,
         root: &std::path::Path,
         def: &DevenvDef,
+        log: Option<&mut RunLog<'_>>,
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<BTreeMap<String, String>> {
         let mut args: Vec<OsString> = Vec::new();
@@ -538,12 +553,24 @@ impl Driver {
             ctty: false,
         };
 
-        let out = hexecrunner::output(RunnerRef::local(), spec, ctoken)
-            .await
-            .with_context(|| format!("run `{} shell -- env -0`", self.devenv_bin))?;
+        let captured = log.is_some();
+        let out = match log {
+            Some(log) => {
+                log.output(RunnerRef::local(), spec, Streams::STDERR, ctoken)
+                    .await
+            }
+            None => hexecrunner::output(RunnerRef::local(), spec, ctoken).await,
+        }
+        .with_context(|| format!("run `{} shell -- env -0`", self.devenv_bin))?;
         if !out.status.success() {
+            let what = format!("`{} shell` failed in {root:?}", self.devenv_bin);
+            if captured {
+                return Err(
+                    anyhow::Error::new(ProcessFailed::from_status(out.status)).context(what)
+                );
+            }
             let stderr = String::from_utf8_lossy(&out.stderr);
-            anyhow::bail!("`{} shell` failed in {root:?}: {stderr}", self.devenv_bin);
+            anyhow::bail!("{what}: {stderr}");
         }
         Ok(parse_env0(&out.stdout))
     }
@@ -851,5 +878,135 @@ mod tests {
         let mut bad = hplugin::config::Options::new();
         bad.insert("bogus".to_string(), serde_yaml::Value::Bool(true));
         Driver::from_options(&bad).expect_err("unknown key must be rejected");
+    }
+}
+
+/// Where devenv's output goes: its stderr is the run's log, its stdout (the
+/// environment) is data and never the log.
+#[cfg(test)]
+mod log_tests {
+    use super::*;
+    use hcore::hasync::StdCancellationToken;
+    use hplugin::driver::RunRequest;
+    use std::sync::Arc;
+
+    /// A stand-in `devenv` running `body` under `/bin/sh`.
+    fn fake(dir: &std::path::Path, body: &str) -> Driver {
+        let bin = dir.join("devenv");
+        std::fs::write(&bin, format!("#!/bin/sh\n{body}\n")).expect("write devenv");
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        Driver {
+            devenv_bin: bin.to_string_lossy().into_owned(),
+        }
+    }
+
+    /// Run `driver`; returns the result and what reached the request's stdout
+    /// and stderr writers.
+    async fn run(
+        driver: &Driver,
+        dir: &std::path::Path,
+        log_capture: bool,
+    ) -> (anyhow::Result<ManagedRunResponse>, String, String) {
+        let parse = ParseRequest {
+            request_id: "test".to_string(),
+            target_spec: Arc::new(hplugin::provider::TargetSpec {
+                addr: hmodel::htaddr::parse_addr("//pkg:env").expect("addr"),
+                driver: "devenv_runner".to_string(),
+                ..Default::default()
+            }),
+        };
+        let ctoken = StdCancellationToken::new();
+        let def = driver
+            .parse(parse, &ctoken)
+            .await
+            .expect("parse")
+            .target_def;
+        let id = "test".to_string();
+        let sandbox = dir.join("sandbox");
+        let pkg = sandbox.join("ws/pkg");
+        std::fs::create_dir_all(&pkg).expect("mkdir pkg");
+        let (mut out, mut err) = (Vec::<u8>::new(), Vec::<u8>::new());
+        let mut request = RunRequest::new(&id, &def, &sandbox);
+        request.tree_root_path = dir.join("ws");
+        request.log_capture = log_capture;
+        request.stdout = Some(&mut out);
+        request.stderr = Some(&mut err);
+        let req = ManagedRunRequest {
+            request,
+            sandbox_dir: sandbox.clone(),
+            sandbox_ws_dir: sandbox.join("ws"),
+            sandbox_pkg_dir: pkg,
+            inputs: vec![],
+        };
+        let res = driver.run(req, &ctoken).await;
+        (
+            res,
+            String::from_utf8_lossy(&out).into_owned(),
+            String::from_utf8_lossy(&err).into_owned(),
+        )
+    }
+
+    /// Under `log_capture` building the shell reaches the log; the environment
+    /// (stdout, which may hold a secret) never does, and still becomes the
+    /// runner config.
+    #[tokio::test]
+    async fn devenv_progress_reaches_the_log_and_the_environment_never_does() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let driver = fake(
+            dir.path(),
+            "echo 'building shell' >&2; printf 'APP_CHANNEL=stable\\0TOKEN=env-secret-value\\0'",
+        );
+        let (res, out, err) = run(&driver, dir.path(), true).await;
+        let res = res.expect("run");
+        assert!(res.artifacts.is_empty(), "no Log artifact crosses");
+        assert_eq!(err, "building shell\n");
+        assert_eq!(out, "", "the environment is data, never the log");
+        let doc = std::fs::read_to_string(dir.path().join("sandbox/ws/pkg").join(OUT_FILE))
+            .expect("runner.json");
+        assert!(
+            doc.contains("env-secret-value"),
+            "the capture still lands: {doc}"
+        );
+        assert!(!dir.path().join("sandbox/log.txt").exists());
+    }
+
+    /// A failed shell under `log_capture`: devenv's stderr is in the log, and
+    /// the error is the exit status, naming no log path and not repeating it.
+    /// An older host keeps today's error, with stderr in the message, and its
+    /// writers see nothing.
+    #[tokio::test]
+    async fn a_failed_shell_is_logged_under_log_capture_and_unchanged_without() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let driver = fake(
+            dir.path(),
+            "echo 'error: devenv.nix is broken' >&2; printf 'PARTIAL=env\\0'; exit 1",
+        );
+        let (res, out, err) = run(&driver, dir.path(), true).await;
+        let Err(e) = res else {
+            panic!("the shell fails")
+        };
+        assert!(
+            e.chain()
+                .any(|c| c.downcast_ref::<ProcessFailed>().is_some()),
+            "{e:#}"
+        );
+        assert!(hplugin::error::failure_log(&e).is_none(), "{e:#}");
+        let msg = format!("{e:#}");
+        assert!(msg.contains("shell` failed in"), "{msg}");
+        assert!(!msg.contains("devenv.nix is broken"), "{msg}");
+        assert_eq!(err, "error: devenv.nix is broken\n");
+        assert_eq!(out, "", "even a failed shell's stdout is never the log");
+
+        let (res, out, err) = run(&driver, dir.path(), false).await;
+        let Err(e) = res else {
+            panic!("the shell fails")
+        };
+        let msg = format!("{e:#}");
+        assert!(
+            msg.contains("failed in") && msg.contains("devenv.nix is broken"),
+            "{msg}"
+        );
+        assert_eq!((out.as_str(), err.as_str()), ("", ""));
     }
 }

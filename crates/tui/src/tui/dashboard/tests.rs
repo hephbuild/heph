@@ -36,6 +36,7 @@ fn start(addr: &str) -> BuildEventKind {
 fn exec(addr: &str) -> BuildEventKind {
     BuildEventKind::ExecuteStart {
         output_groups: Vec::new(),
+        log_not_streamed: false,
         addr: addr.into(),
         driver: "exec".into(),
         cache: true,
@@ -258,6 +259,11 @@ impl TargetReader for StubReader {
             };
         }
         match self.logs.lock().expect("lock").get(addr) {
+            // An empty log stands for a run on a driver that does not stream
+            // its log, as `heph`'s reader words `LogNotStreamed`.
+            Some(b) if b.is_empty() => LogOpened::Nothing(
+                "this target's driver does not stream its log; it appears when the run ends".into(),
+            ),
             Some(b) => LogOpened::Tail {
                 bytes: b.clone(),
                 len: b.len() as u64,
@@ -1078,6 +1084,33 @@ fn no_home_path_on_any_screen_dashboard_and_target() {
 /// Target screens never read on the frame's thread: the log and the
 /// outputs are read by the screen's own thread, and a frame only takes
 /// what it found.
+/// The Log tab of a run on a driver that does not stream its log says so
+/// while it runs, and shows the log once the run ends: the tab asks again
+/// when the row's state moves on.
+#[test]
+fn log_tab_says_a_driver_does_not_stream_its_log_until_the_run_ends() {
+    let running = [at(0, start("//n:a")), at(0, exec("//n:a"))];
+    let s = fold(&running);
+    let reader = Arc::new(StubReader::default());
+    reader.set_log("//n:a", b"");
+    let r = Redact::default();
+    let mut t = open_on(&s, "//n:a", TargetTab::Log, Some(reader.clone()));
+    target_frame_until(&s, &mut t, &r, |f| {
+        f.iter()
+            .any(|l| l.contains("this target's driver does not stream its log"))
+    });
+
+    reader.set_log("//n:a", b"imported line\n");
+    let mut ended = running.to_vec();
+    ended.push(at(1_000, exec_end("//n:a")));
+    ended.push(at(1_000, end("//n:a", None, None)));
+    let s = fold(&ended);
+    let f = target_frame_until(&s, &mut t, &r, |f| {
+        f.iter().any(|l| l.contains("imported line"))
+    });
+    assert!(!f.iter().any(|l| l.contains("does not stream")), "{f:#?}");
+}
+
 #[test]
 fn frame_does_no_io_target_screens() {
     let s = fold(&[
