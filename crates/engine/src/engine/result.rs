@@ -414,16 +414,16 @@ impl ProviderExecutor for EngineProviderExecutor {
                             let list_iter = provider
                                 .provider
                                 .list(
-                                    ListRequest {
-                                        request_id: rs.request_id().to_string(),
-                                        package: pkg.clone(),
-                                        states: states
+                                    ListRequest::new(
+                                        rs.request_id(),
+                                        pkg.clone(),
+                                        states
                                             .iter()
                                             .filter(|s| s.provider == provider.name)
                                             .cloned()
                                             .collect(),
-                                        executor: Arc::clone(&executor),
-                                    },
+                                        Arc::clone(&executor),
+                                    ),
                                     rs.ctoken(),
                                 )
                                 .await?;
@@ -6262,10 +6262,7 @@ impl Engine {
                     let res = provider
                         .provider
                         .probe(
-                            ProbeRequest {
-                                request_id: rs.request_id().to_string(),
-                                package: pkg.clone(),
-                            },
+                            ProbeRequest::new(rs.request_id(), pkg.clone()),
                             rs.ctoken(),
                         )
                         .await
@@ -6337,16 +6334,16 @@ impl Engine {
             let spec = match provider
                 .provider
                 .get(
-                    GetRequest {
-                        request_id: rs.request_id().to_string(),
-                        addr: addr.clone(),
-                        states: states
+                    GetRequest::new(
+                        rs.request_id(),
+                        addr.clone(),
+                        states
                             .iter()
                             .filter(|s| s.provider == provider.name)
                             .cloned()
                             .collect(),
-                        executor: Arc::clone(&executor),
-                    },
+                        Arc::clone(&executor),
+                    ),
                     rs.ctoken(),
                 )
                 .await

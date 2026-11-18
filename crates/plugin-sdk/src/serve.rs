@@ -22,7 +22,7 @@ use hplugin::function::{FnArgs, FnCallContext, FnOutcome, FunctionCaller, Plugin
 use hplugin::hook::Hook;
 use hplugin::provider::{
     ConfigRequest, GetError, GetRequest, ListPackagesRequest, ListRequest, ProbeRequest, Provider,
-    ProviderExecutor,
+    ProviderExecutor, ScopeEnded, ScopeEndedAck, ScopeId,
 };
 use hplugin_stabby::abi::{
     DynExecutor, DynFunctionRegistry, DynItemStream, DynPluginFunctions, NamedFunction,
@@ -43,6 +43,7 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The cdylib's own tokio runtime. A loaded cdylib's statically-linked tokio is a
 /// separate instance from the host's, so async work that touches the reactor (a
@@ -334,6 +335,7 @@ pub fn make_dyn_provider(provider: Arc<dyn Provider>) -> hplugin_stabby::abi::Dy
         provider,
         name,
         cancels: Arc::new(CancelRegistry::default()),
+        warned_unscoped: AtomicBool::new(false),
     }))
 }
 
@@ -578,6 +580,35 @@ pub struct StableProviderImpl {
     /// Provider name, for seam diagnostics (panic/abort error messages).
     name: Arc<str>,
     cancels: Arc<CancelRegistry>,
+    /// Set by the first request that arrived with no cache scope, so the
+    /// unscoped fallback is reported once per provider, not per call.
+    warned_unscoped: AtomicBool,
+}
+
+impl StableProviderImpl {
+    /// Report, once per provider, a request that carried no cache scope: the
+    /// host predates scopes (0.21.1), so the provider answers every call from
+    /// its one unscoped cache, which never evicts. Runs in the dispatch, on the
+    /// calling thread, before the body is spawned.
+    fn note_scope(&self, scope: Option<u64>, method: &'static str) {
+        if scope.is_none() && !self.warned_unscoped.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                provider = %self.name,
+                method,
+                "provider request carried no cache scope (host older than plugin ABI 0.21.1); \
+                 its caches fall back to one unscoped bucket that is never released",
+            );
+        }
+    }
+}
+
+/// A request's `cache_scope` as the SDK decodes it: absent is no scope (a host
+/// before 0.21.1), and a present 0 is refused, since scopes are minted from 1.
+fn decode_scope(raw: Option<u64>, field: &str) -> Result<Option<ScopeId>> {
+    raw.map(|raw| {
+        ScopeId::new(raw).with_context(|| format!("{field} is 0; cache scopes are minted from 1"))
+    })
+    .transpose()
 }
 
 impl StableCancel for StableProviderImpl {
@@ -615,12 +646,14 @@ async fn provider_list_stream(
     let tok = StdCancellationToken::new();
     let executor: Arc<dyn ProviderExecutor> = Arc::new(GuestExecutor::new(exec));
     let lreq = (|| -> Result<ListRequest> {
-        Ok(ListRequest {
-            request_id: required(req.request_id, "ListRequest.request_id")?,
-            package: PkgBuf::from(required(req.package, "ListRequest.package")?),
-            states: convert::states_from_pb(req.states)?,
+        let scope = decode_scope(req.cache_scope, "ListRequest.cache_scope")?;
+        Ok(ListRequest::new(
+            required(req.request_id, "ListRequest.request_id")?,
+            PkgBuf::from(required(req.package, "ListRequest.package")?),
+            convert::states_from_pb(req.states)?,
             executor,
-        })
+        )
+        .with_decoded_scope(scope))
     })();
     let lreq = match lreq {
         Ok(r) => r,
@@ -644,12 +677,16 @@ async fn provider_list_packages_stream(
     req: pb::ListPackagesRequest,
 ) -> DynItemStream {
     let tok = StdCancellationToken::new();
-    let prefix = match required(req.prefix, "ListPackagesRequest.prefix") {
-        Ok(p) => p,
+    let lreq = (|| -> Result<ListPackagesRequest> {
+        let prefix = required(req.prefix, "ListPackagesRequest.prefix")?;
+        let scope = decode_scope(req.cache_scope, "ListPackagesRequest.cache_scope")?;
+        // Optional: a host before 0.21.1 sends none.
+        let request_id = req.request_id.unwrap_or_default();
+        Ok(ListPackagesRequest::new(request_id, PkgBuf::from(prefix)).with_decoded_scope(scope))
+    })();
+    let lreq = match lreq {
+        Ok(r) => r,
         Err(e) => return error_item_stream(err_message(&e)),
-    };
-    let lreq = ListPackagesRequest {
-        prefix: PkgBuf::from(prefix),
     };
     match provider.list_packages(lreq, &tok).await {
         Ok(iter) => make_item_stream(frame_iter(iter, |lpr| {
@@ -671,12 +708,14 @@ async fn provider_get(
 ) -> SVec<u8> {
     let executor: Arc<dyn ProviderExecutor> = Arc::new(GuestExecutor::new(exec));
     let greq = (|| -> Result<GetRequest> {
-        Ok(GetRequest {
-            request_id: required(req.request_id, "GetRequest.request_id")?,
-            addr: convert::addr_field(req.addr, "GetRequest.addr")?,
-            states: convert::states_from_pb(req.states)?,
+        let scope = decode_scope(req.cache_scope, "GetRequest.cache_scope")?;
+        Ok(GetRequest::new(
+            required(req.request_id, "GetRequest.request_id")?,
+            convert::addr_field(req.addr, "GetRequest.addr")?,
+            convert::states_from_pb(req.states)?,
             executor,
-        })
+        )
+        .with_decoded_scope(scope))
     })();
     let greq = match greq {
         Ok(r) => r,
@@ -708,10 +747,12 @@ async fn provider_probe(
     cancels: Arc<CancelRegistry>,
 ) -> SVec<u8> {
     let preq = (|| -> Result<ProbeRequest> {
-        Ok(ProbeRequest {
-            request_id: required(req.request_id, "ProbeRequest.request_id")?,
-            package: PkgBuf::from(required(req.package, "ProbeRequest.package")?),
-        })
+        let scope = decode_scope(req.cache_scope, "ProbeRequest.cache_scope")?;
+        Ok(ProbeRequest::new(
+            required(req.request_id, "ProbeRequest.request_id")?,
+            PkgBuf::from(required(req.package, "ProbeRequest.package")?),
+        )
+        .with_decoded_scope(scope))
     })();
     let preq = match preq {
         Ok(r) => r,
@@ -721,6 +762,28 @@ async fn provider_probe(
     let body = match provider.probe(preq, guard.token()).await {
         Ok(pr) => Body::from(pb::ProbeResponse {
             states: pr.states.iter().map(convert::state_to_pb).collect(),
+            ..Default::default()
+        }),
+        Err(e) => err_body(err_message(&e)),
+    };
+    unary(body)
+}
+
+/// Decode a `ScopeEndedRequest`: both fields required, and `scope` never 0.
+fn scope_ended_from_pb(req: pb::ScopeEndedRequest) -> Result<ScopeEnded> {
+    let raw = required(req.scope, "ScopeEndedRequest.scope")?;
+    let scope = ScopeId::new(raw)
+        .context("ScopeEndedRequest.scope is 0; cache scopes are minted from 1")?;
+    let ended_below = required(req.ended_below, "ScopeEndedRequest.ended_below")?;
+    Ok(ScopeEnded::new(scope, ended_below))
+}
+
+/// Serve `PROVIDER_METHOD_SCOPE_ENDED`: tell the provider the scope ended, and
+/// answer whether it released anything per scope.
+async fn provider_scope_ended(provider: Arc<dyn Provider>, ended: ScopeEnded) -> SVec<u8> {
+    let body = match provider.scope_ended(ended).await {
+        Ok(ack) => Body::from(pb::ScopeEndedResponse {
+            released: Some(ack == ScopeEndedAck::Released),
             ..Default::default()
         }),
         Err(e) => err_body(err_message(&e)),
@@ -962,12 +1025,31 @@ impl StableProvider for StableProviderImpl {
                         return dynify(stabby::boxed::Box::new(async move { body }));
                     }
                 };
+                self.note_scope(req.cache_scope, "probe");
                 let key = req.package.clone().unwrap_or_default();
                 dynify(stabby::boxed::Box::new(spawn_seam(
                     &self.name,
                     "probe",
                     key,
                     provider_probe(provider, req, Arc::clone(&self.cancels)),
+                    |m| unary(err_body(m)),
+                )))
+            }
+            Some(pb::ProviderMethod::ScopeEnded) => {
+                let ended = decode_req::<pb::ScopeEndedRequest>(&req[..], "ScopeEndedRequest")
+                    .and_then(scope_ended_from_pb);
+                let ended = match ended {
+                    Ok(e) => e,
+                    Err(e) => {
+                        let body = unary(err_body(err_message(&e)));
+                        return dynify(stabby::boxed::Box::new(async move { body }));
+                    }
+                };
+                dynify(stabby::boxed::Box::new(spawn_seam(
+                    &self.name,
+                    "scope_ended",
+                    ended.scope.to_string(),
+                    provider_scope_ended(provider, ended),
                     |m| unary(err_body(m)),
                 )))
             }
@@ -994,6 +1076,7 @@ impl StableProvider for StableProviderImpl {
                             return dynify(stabby::boxed::Box::new(async move { stream }));
                         }
                     };
+                self.note_scope(req.cache_scope, "list_packages");
                 let key = req.prefix.clone().unwrap_or_default();
                 dynify(stabby::boxed::Box::new(spawn_seam(
                     &self.name,
@@ -1025,6 +1108,7 @@ impl StableProvider for StableProviderImpl {
                         return dynify(stabby::boxed::Box::new(async move { stream }));
                     }
                 };
+                self.note_scope(req.cache_scope, "list");
                 let key = req.package.clone().unwrap_or_default();
                 dynify(stabby::boxed::Box::new(spawn_seam(
                     &self.name,
@@ -1077,6 +1161,7 @@ impl StableProvider for StableProviderImpl {
                         return dynify(stabby::boxed::Box::new(async move { body }));
                     }
                 };
+                self.note_scope(req.cache_scope, "get");
                 let key = pb_addr_key(req.addr.as_option());
                 dynify(stabby::boxed::Box::new(spawn_seam(
                     &self.name,
@@ -2612,10 +2697,7 @@ mod tests {
         let host = StableRemoteProvider::new(make_dyn_provider(Arc::new(BlockingProbe)), "blocker")
             .expect("load");
         let ct = StdCancellationToken::new();
-        let preq = ProbeRequest {
-            request_id: "rq-1".into(),
-            package: PkgBuf::from("p"),
-        };
+        let preq = ProbeRequest::new("rq-1", PkgBuf::from("p"));
         // Drive the probe and the cancel concurrently; completing at all proves the
         // cancel unblocked the provider.
         let out = futures::executor::block_on(async {
@@ -2697,12 +2779,12 @@ mod tests {
         let host = StableRemoteProvider::new(dynp, "lister").expect("load");
         let tok = StdCancellationToken::new();
         let iter = futures::executor::block_on(host.list(
-            ListRequest {
-                request_id: String::new(),
-                package: PkgBuf::from("p"),
-                states: vec![],
-                executor: Arc::new(hplugin::provider::NoopExecutor),
-            },
+            ListRequest::new(
+                String::new(),
+                PkgBuf::from("p"),
+                vec![],
+                Arc::new(hplugin::provider::NoopExecutor),
+            ),
             &tok,
         ))
         .expect("list ok");
@@ -4730,13 +4812,9 @@ mod tests {
         let host =
             StableRemoteProvider::new(make_dyn_provider(Arc::new(Boomer)), "boomer").expect("load");
         let ct = StdCancellationToken::new();
-        let msg = match futures::executor::block_on(host.probe(
-            ProbeRequest {
-                request_id: String::new(),
-                package: PkgBuf::from("p"),
-            },
-            &ct,
-        )) {
+        let msg = match futures::executor::block_on(
+            host.probe(ProbeRequest::new(String::new(), PkgBuf::from("p")), &ct),
+        ) {
             Ok(_) => panic!("panic must surface as an error, not success"),
             Err(e) => format!("{e:#}"),
         };
@@ -4947,12 +5025,12 @@ mod tests {
                 Box::pin(async move {
                     let host = self.host.get().expect("host handle wired");
                     let ct = StdCancellationToken::new();
-                    let req = GetRequest {
-                        request_id: String::new(),
-                        addr: addr.clone(),
-                        states: vec![],
-                        executor: Arc::new(NoopExecutor),
-                    };
+                    let req = GetRequest::new(
+                        String::new(),
+                        addr.clone(),
+                        vec![],
+                        Arc::new(NoopExecutor),
+                    );
                     match host.get(req, &ct).await {
                         Err(GetError::NotFound) => Ok(Arc::new(hplugin::eresult::EResult {
                             artifacts: vec![],
@@ -4996,12 +5074,12 @@ mod tests {
                 tokio::time::timeout(
                     Duration::from_secs(30),
                     host.get(
-                        GetRequest {
-                            request_id: "rq-top".into(),
-                            addr: Addr::new(PkgBuf::from("p"), "top".into(), Default::default()),
-                            states: vec![],
-                            executor: exec.clone() as Arc<dyn ProviderExecutor>,
-                        },
+                        GetRequest::new(
+                            "rq-top",
+                            Addr::new(PkgBuf::from("p"), "top".into(), Default::default()),
+                            vec![],
+                            exec.clone() as Arc<dyn ProviderExecutor>,
+                        ),
                         &ct,
                     ),
                 )
@@ -5019,5 +5097,548 @@ mod tests {
             Err(GetError::NotFound) => panic!("top get must run the nested body"),
             Ok(_) => panic!("top get returns the marker error"),
         }
+    }
+
+    // ---- Cache scopes (ABI 0.21.1) ----
+
+    use hplugin::provider::CacheScope;
+    use hplugin::provider::ScopeMap;
+    use hplugin_stabby::abi::StableProviderDyn;
+    use hplugin_stabby::load_stable::StableRemoteProvider;
+    use std::sync::atomic::AtomicUsize;
+
+    /// One scope's cache in [`ScopedProvider`]: how many calls it answered.
+    #[derive(Default)]
+    struct Bucket {
+        calls: AtomicUsize,
+    }
+
+    /// What one call to [`ScopedProvider`] saw.
+    #[derive(Debug, Clone, PartialEq)]
+    struct Seen {
+        method: &'static str,
+        scope: Option<ScopeId>,
+        request_id: String,
+        /// Calls the bucket had answered before this one: 0 is a fresh bucket.
+        prior: usize,
+    }
+
+    /// A provider that keys a cache by scope through a [`ScopeMap`], as a real
+    /// one does, and records the scope and bucket each call landed in.
+    struct ScopedProvider {
+        buckets: ScopeMap<Bucket>,
+        seen: Mutex<Vec<Seen>>,
+        ended: AtomicUsize,
+    }
+
+    impl ScopedProvider {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                buckets: ScopeMap::new("scoped"),
+                seen: Mutex::new(Vec::new()),
+                ended: AtomicUsize::new(0),
+            })
+        }
+
+        fn record(&self, method: &'static str, scope: Option<ScopeId>, request_id: &str) {
+            let bucket = self.buckets.enter(scope);
+            let prior = bucket.calls.fetch_add(1, Ordering::Relaxed);
+            self.seen.lock().expect("seen").push(Seen {
+                method,
+                scope,
+                request_id: request_id.to_string(),
+                prior,
+            });
+        }
+
+        fn seen(&self) -> Vec<Seen> {
+            self.seen.lock().expect("seen").clone()
+        }
+    }
+
+    impl Provider for ScopedProvider {
+        fn config(&self, _r: ConfigRequest) -> Result<ConfigResponse> {
+            Ok(ConfigResponse {
+                name: "scoped".into(),
+            })
+        }
+        fn list<'a>(
+            &'a self,
+            r: ListRequest,
+            _c: &'a (dyn Cancellable + Send + Sync),
+        ) -> futures::future::BoxFuture<
+            'a,
+            Result<Box<dyn Iterator<Item = Result<ListResponse>> + Send>>,
+        > {
+            self.record("list", r.cache_scope(), &r.request_id);
+            Box::pin(async { Ok(Box::new(std::iter::empty()) as Box<_>) })
+        }
+        fn list_packages<'a>(
+            &'a self,
+            r: ListPackagesRequest,
+            _c: &'a (dyn Cancellable + Send + Sync),
+        ) -> futures::future::BoxFuture<
+            'a,
+            Result<Box<dyn Iterator<Item = Result<ListPackageResponse>> + Send>>,
+        > {
+            self.record("list_packages", r.cache_scope(), &r.request_id);
+            let pkg = ListPackageResponse {
+                pkg: PkgBuf::from("p"),
+            };
+            Box::pin(async move { Ok(Box::new(std::iter::once(Ok(pkg))) as Box<_>) })
+        }
+        fn get<'a>(
+            &'a self,
+            r: GetRequest,
+            _c: &'a (dyn Cancellable + Send + Sync),
+        ) -> futures::future::BoxFuture<'a, std::result::Result<GetResponse, GetError>> {
+            self.record("get", r.cache_scope(), &r.request_id);
+            Box::pin(async { Err(GetError::NotFound) })
+        }
+        fn probe<'a>(
+            &'a self,
+            r: ProbeRequest,
+            _c: &'a (dyn Cancellable + Send + Sync),
+        ) -> futures::future::BoxFuture<'a, Result<ProbeResponse>> {
+            self.record("probe", r.cache_scope(), &r.request_id);
+            Box::pin(async { Ok(ProbeResponse { states: vec![] }) })
+        }
+        fn scope_ended<'a>(
+            &'a self,
+            ended: ScopeEnded,
+        ) -> futures::future::BoxFuture<'a, Result<ScopeEndedAck>> {
+            Box::pin(async move {
+                self.ended.fetch_add(1, Ordering::Relaxed);
+                self.buckets.end(ended).await;
+                Ok(ScopeEndedAck::Released)
+            })
+        }
+    }
+
+    fn scoped_host(p: &Arc<ScopedProvider>) -> StableRemoteProvider {
+        StableRemoteProvider::new(
+            make_dyn_provider(Arc::clone(p) as Arc<dyn Provider>),
+            "scoped",
+        )
+        .expect("load")
+    }
+
+    fn noop_exec() -> Arc<dyn ProviderExecutor> {
+        Arc::new(hplugin::provider::NoopExecutor)
+    }
+
+    fn probe_req(scope: Option<&CacheScope>) -> ProbeRequest {
+        let req = ProbeRequest::new("rq", PkgBuf::from("p"));
+        match scope {
+            Some(s) => req.with_cache_scope(s),
+            None => req,
+        }
+    }
+
+    /// Every frame a response stream yields, decoded.
+    fn drain(stream: DynItemStream) -> Vec<Body> {
+        std::iter::from_fn(|| {
+            let bytes = stream.next();
+            (!bytes.is_empty()).then(|| {
+                pb::Frame::decode_from_slice(&bytes[..])
+                    .expect("frame")
+                    .body
+                    .expect("body")
+            })
+        })
+        .collect()
+    }
+
+    fn unary_body(bytes: &SVec<u8>) -> Body {
+        pb::Frame::decode_from_slice(&bytes[..])
+            .expect("frame")
+            .body
+            .expect("body")
+    }
+
+    /// A host before 0.21.1 sends no scope: every method decodes it as `None`,
+    /// and those calls share the one unscoped bucket; a scoped call never
+    /// answers from it.
+    #[test]
+    fn missing_scope_falls_back_to_unscoped() {
+        let p = ScopedProvider::new();
+        let host = scoped_host(&p);
+        let ct = StdCancellationToken::new();
+        let addr = hmodel::htaddr::Addr::new(PkgBuf::from("p"), "t".into(), Default::default());
+        futures::executor::block_on(async {
+            host.probe(probe_req(None), &ct).await.expect("probe");
+            let _ = host
+                .list(
+                    ListRequest::new("rq", PkgBuf::from("p"), vec![], noop_exec()),
+                    &ct,
+                )
+                .await
+                .expect("list")
+                .count();
+            let _ = host
+                .list_packages(ListPackagesRequest::new("rq", PkgBuf::from("")), &ct)
+                .await
+                .expect("list_packages")
+                .count();
+            assert!(matches!(
+                host.get(GetRequest::new("rq", addr, vec![], noop_exec()), &ct)
+                    .await,
+                Err(GetError::NotFound)
+            ));
+        });
+        let scope = CacheScope::mint(|_, _| {});
+        futures::executor::block_on(host.probe(probe_req(Some(&scope)), &ct)).expect("probe");
+
+        let seen = p.seen();
+        let methods: Vec<_> = seen.iter().map(|s| s.method).collect();
+        assert_eq!(methods, ["probe", "list", "list_packages", "get", "probe"]);
+        for (i, s) in seen.iter().take(4).enumerate() {
+            assert_eq!(s.scope, None, "{s:?}");
+            assert_eq!(s.prior, i, "unscoped calls share one bucket: {s:?}");
+        }
+        assert_eq!(seen[4].scope, Some(scope.id()));
+        assert_eq!(seen[4].prior, 0, "a scoped call gets its own bucket");
+        assert_eq!(p.buckets.live_scopes(), 1);
+    }
+
+    #[derive(Clone, Default)]
+    struct Warnings(Arc<Mutex<Vec<String>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Warnings {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Message(String);
+            impl tracing::field::Visit for Message {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            if *event.metadata().level() == tracing::Level::WARN {
+                let mut m = Message(String::new());
+                event.record(&mut m);
+                self.0.lock().expect("warnings").push(m.0);
+            }
+        }
+    }
+
+    /// The unscoped fallback is reported once per provider, not once per call
+    /// or per method; a second provider reports its own.
+    #[test]
+    fn unscoped_fallback_warns_once_per_provider() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let warnings = Warnings::default();
+        let sub = tracing_subscriber::registry().with(warnings.clone());
+        let (a, b) = (ScopedProvider::new(), ScopedProvider::new());
+        let (host_a, host_b) = (scoped_host(&a), scoped_host(&b));
+        let ct = StdCancellationToken::new();
+        let scope = CacheScope::mint(|_, _| {});
+        tracing::subscriber::with_default(sub, || {
+            futures::executor::block_on(async {
+                for host in [&host_a, &host_a, &host_b] {
+                    host.probe(probe_req(None), &ct).await.expect("probe");
+                    let _ = host
+                        .list_packages(ListPackagesRequest::new("rq", PkgBuf::from("")), &ct)
+                        .await
+                        .expect("list_packages")
+                        .count();
+                }
+                host_b
+                    .probe(probe_req(Some(&scope)), &ct)
+                    .await
+                    .expect("probe");
+            });
+        });
+        let fallbacks = warnings
+            .0
+            .lock()
+            .expect("warnings")
+            .iter()
+            .filter(|m| m.contains("carried no cache scope"))
+            .count();
+        assert_eq!(fallbacks, 2, "one per provider");
+    }
+
+    /// Ended is final: a call that arrives for a scope after its end is
+    /// answered from a throwaway bucket, and never recreates the scope's.
+    #[test]
+    fn late_entry_after_scope_end_is_uncached() {
+        let p = ScopedProvider::new();
+        let host = scoped_host(&p);
+        let ct = StdCancellationToken::new();
+        let scope = CacheScope::mint(|_, _| {});
+        futures::executor::block_on(async {
+            host.probe(probe_req(Some(&scope)), &ct)
+                .await
+                .expect("probe");
+            host.probe(probe_req(Some(&scope)), &ct)
+                .await
+                .expect("probe");
+            assert_eq!(p.buckets.live_scopes(), 1);
+
+            let ack = host
+                .scope_ended(ScopeEnded::new(scope.id(), 1))
+                .await
+                .expect("scope_ended");
+            assert_eq!(ack, ScopeEndedAck::Released);
+            assert_eq!(p.buckets.live_scopes(), 0, "the end dropped the bucket");
+
+            host.probe(probe_req(Some(&scope)), &ct)
+                .await
+                .expect("late probe");
+            host.probe(probe_req(Some(&scope)), &ct)
+                .await
+                .expect("late probe");
+        });
+        let priors: Vec<_> = p.seen().iter().map(|s| s.prior).collect();
+        assert_eq!(priors, [0, 1, 0, 0], "late calls never share a bucket");
+        assert_eq!(p.buckets.live_scopes(), 0, "no late call recreated it");
+    }
+
+    /// A host before 0.21.1 sends `ListPackagesRequest` with a prefix only: it
+    /// decodes, with an empty request id and no scope.
+    #[test]
+    fn old_host_listpackages_without_request_id_decodes() {
+        let p = ScopedProvider::new();
+        let dynp = make_dyn_provider(Arc::clone(&p) as Arc<dyn Provider>);
+        let req = pb::ListPackagesRequest {
+            prefix: Some(String::new()),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let stream = futures::executor::block_on(dynp.invoke_server_stream(
+            pb::ProviderMethod::ListPackages as u32,
+            SVec::from(req.as_slice()),
+        ));
+        let frames = drain(stream);
+        assert!(
+            matches!(frames.as_slice(), [Body::StreamItem(_)]),
+            "one package, no error: {frames:?}"
+        );
+        assert_eq!(
+            p.seen(),
+            [Seen {
+                method: "list_packages",
+                scope: None,
+                request_id: String::new(),
+                prior: 0,
+            }]
+        );
+    }
+
+    /// Absent `cache_scope` is no scope; a present 0 is refused before the
+    /// provider runs, as is a `ScopeEndedRequest` whose scope is 0 or absent.
+    #[test]
+    fn empty_or_zero_cache_scope_is_refused_or_absent() {
+        let p = ScopedProvider::new();
+        let dynp = make_dyn_provider(Arc::clone(&p) as Arc<dyn Provider>);
+        let probe = |scope: Option<u64>| {
+            let req = pb::ProbeRequest {
+                request_id: Some("rq".into()),
+                package: Some("p".into()),
+                cache_scope: scope,
+                ..Default::default()
+            }
+            .encode_to_vec();
+            unary_body(&futures::executor::block_on(dynp.invoke(
+                pb::ProviderMethod::Probe as u32,
+                SVec::from(req.as_slice()),
+            )))
+        };
+
+        assert!(matches!(probe(None), Body::ProbeResp(_)));
+        match probe(Some(0)) {
+            Body::Error(e) => assert!(
+                e.message
+                    .as_deref()
+                    .is_some_and(|m| m.contains("ProbeRequest.cache_scope is 0")),
+                "{e:?}"
+            ),
+            other => panic!("a zero scope must be refused, got {other:?}"),
+        }
+        assert!(matches!(probe(Some(9)), Body::ProbeResp(_)));
+
+        let req = pb::ListPackagesRequest {
+            prefix: Some(String::new()),
+            cache_scope: Some(0),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let frames = drain(futures::executor::block_on(dynp.invoke_server_stream(
+            pb::ProviderMethod::ListPackages as u32,
+            SVec::from(req.as_slice()),
+        )));
+        assert!(
+            matches!(frames.as_slice(), [Body::StreamEnd(end)]
+                if format!("{end:?}").contains("ListPackagesRequest.cache_scope is 0")),
+            "{frames:?}"
+        );
+
+        let scope_ended = |scope: Option<u64>| {
+            let req = pb::ScopeEndedRequest {
+                scope,
+                ended_below: Some(1),
+                ..Default::default()
+            }
+            .encode_to_vec();
+            unary_body(&futures::executor::block_on(dynp.invoke(
+                pb::ProviderMethod::ScopeEnded as u32,
+                SVec::from(req.as_slice()),
+            )))
+        };
+        assert!(matches!(scope_ended(Some(0)), Body::Error(_)));
+        assert!(matches!(scope_ended(None), Body::Error(_)));
+        assert_eq!(
+            p.ended.load(Ordering::Relaxed),
+            0,
+            "never reached the provider"
+        );
+
+        let seen: Vec<_> = p.seen().iter().map(|s| s.scope).collect();
+        assert_eq!(seen, [None, ScopeId::new(9)], "refused calls never ran");
+    }
+
+    /// The skew a 0.21.0 plugin sees: the new fields are ones it does not
+    /// know, and protobuf skips them. A 0.21.0 `ListPackagesRequest` was
+    /// `string prefix = 1` alone — the shape of `ListPackageResponse` — and
+    /// reads a 0.21.1 request as its prefix. This SDK in turn skips a field a
+    /// later host adds.
+    #[test]
+    fn old_plugin_ignores_new_fields() {
+        let new_req = pb::ListPackagesRequest {
+            prefix: Some("a/b".into()),
+            request_id: Some("rq".into()),
+            cache_scope: Some(7),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let as_old = pb::ListPackageResponse::decode_from_slice(&new_req)
+            .expect("a 0.21.0 decoder reads a 0.21.1 request");
+        assert_eq!(as_old.pkg.as_deref(), Some("a/b"));
+
+        let p = ScopedProvider::new();
+        let dynp = make_dyn_provider(Arc::clone(&p) as Arc<dyn Provider>);
+        let mut req = pb::ProbeRequest {
+            request_id: Some("rq".into()),
+            package: Some("p".into()),
+            cache_scope: Some(5),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        // Field 15, varint 1: one this build has never heard of.
+        req.extend_from_slice(&[15 << 3, 1]);
+        let body = unary_body(&futures::executor::block_on(
+            dynp.invoke(pb::ProviderMethod::Probe as u32, SVec::from(req.as_slice())),
+        ));
+        assert!(matches!(body, Body::ProbeResp(_)), "{body:?}");
+        assert_eq!(p.seen()[0].scope, ScopeId::new(5));
+    }
+
+    /// What a plugin built before method 10 answers to it: `Unimplemented`.
+    /// Every method is unimplemented here; only `invoke` is reached.
+    struct PreScopeSdk;
+
+    impl StableMeta for PreScopeSdk {
+        extern "C" fn meta(&self, _kind: u32) -> SVec<u8> {
+            SVec::new()
+        }
+    }
+
+    impl StableCancel for PreScopeSdk {
+        extern "C" fn cancel(&self, _request_id: stabby::string::String) {}
+        extern "C" fn cancel_timed_out(&self, _cancel_key: stabby::string::String) {}
+    }
+
+    impl StableProvider for PreScopeSdk {
+        extern "C" fn invoke<'a>(&'a self, method: u32, _req: SVec<u8>) -> DynFuture<'a, SVec<u8>> {
+            dynify(stabby::boxed::Box::new(
+                async move { unimplemented(method) },
+            ))
+        }
+        extern "C" fn invoke_server_stream<'a>(
+            &'a self,
+            method: u32,
+            _req: SVec<u8>,
+        ) -> DynFuture<'a, DynItemStream> {
+            dynify(stabby::boxed::Box::new(async move {
+                unimplemented_item_stream(method)
+            }))
+        }
+        extern "C" fn invoke_client_stream<'a>(
+            &'a self,
+            method: u32,
+            _req: DynItemStream,
+        ) -> DynFuture<'a, SVec<u8>> {
+            dynify(stabby::boxed::Box::new(
+                async move { unimplemented(method) },
+            ))
+        }
+        extern "C" fn invoke_bidi<'a>(
+            &'a self,
+            method: u32,
+            _req: DynItemStream,
+        ) -> DynFuture<'a, DynItemStream> {
+            dynify(stabby::boxed::Box::new(async move {
+                unimplemented_item_stream(method)
+            }))
+        }
+        extern "C" fn invoke_exec<'a>(
+            &'a self,
+            method: u32,
+            _req: SVec<u8>,
+            _exec: DynExecutor,
+        ) -> DynFuture<'a, SVec<u8>> {
+            dynify(stabby::boxed::Box::new(
+                async move { unimplemented(method) },
+            ))
+        }
+        extern "C" fn invoke_exec_server_stream<'a>(
+            &'a self,
+            method: u32,
+            _req: SVec<u8>,
+            _exec: DynExecutor,
+        ) -> DynFuture<'a, DynItemStream> {
+            dynify(stabby::boxed::Box::new(async move {
+                unimplemented_item_stream(method)
+            }))
+        }
+    }
+
+    /// A plugin that reports 0.21.1 but answers method 10 `Unimplemented` is
+    /// not an error: the scope's end is a no-op, read as `Unsupported`.
+    #[test]
+    fn scope_ended_unimplemented_is_a_no_op() {
+        let dynp: hplugin_stabby::abi::DynProvider = dynify(stabby::boxed::Box::new(PreScopeSdk));
+        let host = StableRemoteProvider::new(dynp, "pre-scope")
+            .expect("load")
+            .with_plugin_abi(Some("0.21.1"));
+        let scope = ScopeId::new(3).expect("non-zero");
+        let ack = futures::executor::block_on(host.scope_ended(ScopeEnded::new(scope, 1)))
+            .expect("Unimplemented is ignored, not an error");
+        assert_eq!(ack, ScopeEndedAck::Unsupported);
+    }
+
+    /// A 0.21.0 plugin is never sent method 10; one at 0.21.1 is.
+    #[test]
+    fn scope_ended_not_sent_to_0_21_0_plugin() {
+        let ended = ScopeEnded::new(ScopeId::new(3).expect("non-zero"), 1);
+        let ask = |abi: Option<&str>| {
+            let p = ScopedProvider::new();
+            let host = scoped_host(&p).with_plugin_abi(abi);
+            let ack = futures::executor::block_on(host.scope_ended(ended)).expect("scope_ended");
+            (ack, p.ended.load(Ordering::Relaxed))
+        };
+        assert_eq!(ask(Some("0.21.0")), (ScopeEndedAck::Unsupported, 0));
+        assert_eq!(ask(None), (ScopeEndedAck::Unsupported, 0));
+        assert_eq!(ask(Some("0.21.1")), (ScopeEndedAck::Released, 1));
     }
 }

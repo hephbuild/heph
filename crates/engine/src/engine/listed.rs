@@ -267,16 +267,16 @@ impl Engine {
             let items = provider
                 .provider
                 .list(
-                    ListRequest {
-                        request_id: rs.request_id().to_string(),
-                        package: pkg.clone(),
-                        states: states
+                    ListRequest::new(
+                        rs.request_id(),
+                        pkg.clone(),
+                        states
                             .iter()
                             .filter(|s| s.provider == provider.name)
                             .cloned()
                             .collect(),
-                        executor: Arc::clone(&executor),
-                    },
+                        Arc::clone(&executor),
+                    ),
                     rs.ctoken(),
                 )
                 .await?;

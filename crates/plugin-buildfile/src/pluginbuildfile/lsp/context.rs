@@ -186,9 +186,7 @@ impl HephLspContext {
         let provider = self.provider();
         let ctoken = StdCancellationToken::new();
         let fut = provider.list_packages(
-            ListPackagesRequest {
-                prefix: PkgBuf::from(prefix),
-            },
+            ListPackagesRequest::new("lsp", PkgBuf::from(prefix)),
             &ctoken,
         );
         // Entered, not spawned: this runs on the LSP server's sync request
@@ -219,12 +217,12 @@ impl HephLspContext {
         let provider = self.provider();
         let ctoken = StdCancellationToken::new();
         let fut = provider.list(
-            ListRequest {
-                request_id: "lsp".to_string(),
-                package: PkgBuf::from(package),
-                states: vec![],
-                executor: std::sync::Arc::new(hplugin::provider::NoopExecutor),
-            },
+            ListRequest::new(
+                "lsp",
+                PkgBuf::from(package),
+                vec![],
+                std::sync::Arc::new(hplugin::provider::NoopExecutor),
+            ),
             &ctoken,
         );
         // Same contract as `list_packages`: the provider may reach

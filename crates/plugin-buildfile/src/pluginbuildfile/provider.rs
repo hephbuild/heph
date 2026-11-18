@@ -800,12 +800,7 @@ mod tests {
 
         let ctoken = StdCancellationToken::new();
         let listed: Vec<String> = provider
-            .list_packages(
-                ListPackagesRequest {
-                    prefix: PkgBuf::from(""),
-                },
-                &ctoken,
-            )
+            .list_packages(ListPackagesRequest::new("test", PkgBuf::from("")), &ctoken)
             .await
             .unwrap()
             .map(|r| r.unwrap().pkg.to_string())
@@ -850,12 +845,7 @@ mod tests {
         let list = |p: Provider| async move {
             let ctoken = StdCancellationToken::new();
             let res = p
-                .list_packages(
-                    ListPackagesRequest {
-                        prefix: PkgBuf::from(""),
-                    },
-                    &ctoken,
-                )
+                .list_packages(ListPackagesRequest::new("test", PkgBuf::from("")), &ctoken)
                 .await
                 .unwrap();
             // Drop the always-present synthetic LSP package; this test covers the
@@ -920,12 +910,7 @@ mod tests {
         };
         let ctoken = StdCancellationToken::new();
         let listed: Vec<String> = provider
-            .list_packages(
-                ListPackagesRequest {
-                    prefix: PkgBuf::from(""),
-                },
-                &ctoken,
-            )
+            .list_packages(ListPackagesRequest::new("test", PkgBuf::from("")), &ctoken)
             .await
             .unwrap()
             .map(|r| r.unwrap().pkg.to_string())
@@ -1092,12 +1077,12 @@ mod tests {
     }
 
     fn get_req(pkg: &str, name: &str) -> GetRequest {
-        GetRequest {
-            request_id: "test".to_string(),
-            addr: Addr::new(PkgBuf::from(pkg), name.to_string(), Default::default()),
-            states: vec![],
-            executor: Arc::new(NoopExecutor),
-        }
+        GetRequest::new(
+            "test",
+            Addr::new(PkgBuf::from(pkg), name.to_string(), Default::default()),
+            vec![],
+            Arc::new(NoopExecutor),
+        )
     }
 
     #[test]
@@ -1213,12 +1198,7 @@ mod tests {
 
         let ctoken = StdCancellationToken::new();
         let res = provider
-            .list_packages(
-                ListPackagesRequest {
-                    prefix: PkgBuf::from(""),
-                },
-                &ctoken,
-            )
+            .list_packages(ListPackagesRequest::new("test", PkgBuf::from("")), &ctoken)
             .await
             .unwrap();
         let packages: Vec<String> = res.map(|r| r.unwrap().pkg.to_string()).collect();
@@ -1259,12 +1239,7 @@ mod tests {
 
         let ctoken = StdCancellationToken::new();
         let res = provider
-            .list_packages(
-                ListPackagesRequest {
-                    prefix: PkgBuf::from(""),
-                },
-                &ctoken,
-            )
+            .list_packages(ListPackagesRequest::new("test", PkgBuf::from("")), &ctoken)
             .await
             .unwrap();
         let packages: Vec<String> = res.map(|r| r.unwrap().pkg.to_string()).collect();
@@ -1304,12 +1279,7 @@ mod tests {
 
         let ctoken = StdCancellationToken::new();
         let res = provider
-            .list_packages(
-                ListPackagesRequest {
-                    prefix: PkgBuf::from(""),
-                },
-                &ctoken,
-            )
+            .list_packages(ListPackagesRequest::new("test", PkgBuf::from("")), &ctoken)
             .await
             .unwrap();
         let packages: Vec<String> = res.map(|r| r.unwrap().pkg.to_string()).collect();
@@ -1353,12 +1323,12 @@ mod tests {
 
         let listed = provider
             .list(
-                ListRequest {
-                    request_id: "test".to_string(),
-                    package: PkgBuf::from("vendor/dep"),
-                    states: vec![],
-                    executor: std::sync::Arc::new(hplugin::provider::NoopExecutor),
-                },
+                ListRequest::new(
+                    "test",
+                    PkgBuf::from("vendor/dep"),
+                    vec![],
+                    std::sync::Arc::new(hplugin::provider::NoopExecutor),
+                ),
                 &ctoken,
             )
             .await
@@ -1394,9 +1364,7 @@ mod tests {
             ..Provider::default()
         };
 
-        let req = ListPackagesRequest {
-            prefix: PkgBuf::from(""),
-        };
+        let req = ListPackagesRequest::new("test", PkgBuf::from(""));
         let ctoken = StdCancellationToken::new();
         let res = provider.list_packages(req, &ctoken).await.unwrap();
         let packages: Vec<String> = res.map(|r| r.unwrap().pkg.to_string()).collect();
@@ -1459,12 +1427,7 @@ mod tests {
         };
         let ctoken = StdCancellationToken::new();
         let err = provider
-            .list_packages(
-                ListPackagesRequest {
-                    prefix: PkgBuf::from(""),
-                },
-                &ctoken,
-            )
+            .list_packages(ListPackagesRequest::new("test", PkgBuf::from("")), &ctoken)
             .await
             .err()
             .expect("a package dir heph cannot name must fail, not disappear from the list");
@@ -1496,12 +1459,7 @@ mod tests {
         };
         let ctoken = StdCancellationToken::new();
         let err = provider
-            .list_packages(
-                ListPackagesRequest {
-                    prefix: PkgBuf::from(""),
-                },
-                &ctoken,
-            )
+            .list_packages(ListPackagesRequest::new("test", PkgBuf::from("")), &ctoken)
             .await
             .err()
             .expect("two directories that render to one lossy name must not become one package");
@@ -1558,12 +1516,7 @@ mod tests {
         };
         let ctoken = StdCancellationToken::new();
         let res = provider
-            .list_packages(
-                ListPackagesRequest {
-                    prefix: PkgBuf::from(""),
-                },
-                &ctoken,
-            )
+            .list_packages(ListPackagesRequest::new("test", PkgBuf::from("")), &ctoken)
             .await
             .unwrap();
         let packages: Vec<String> = res.map(|r| r.unwrap().pkg.to_string()).collect();
@@ -1603,9 +1556,7 @@ mod tests {
             ..Provider::default()
         };
 
-        let req = ListPackagesRequest {
-            prefix: PkgBuf::from(""),
-        };
+        let req = ListPackagesRequest::new("test", PkgBuf::from(""));
         let ctoken = StdCancellationToken::new();
         let res = provider.list_packages(req, &ctoken).await.unwrap();
         let packages: Vec<String> = res.map(|r| r.unwrap().pkg.to_string()).collect();
@@ -1646,9 +1597,7 @@ mod tests {
             ..Provider::default()
         };
 
-        let req = ListPackagesRequest {
-            prefix: PkgBuf::from(""),
-        };
+        let req = ListPackagesRequest::new("test", PkgBuf::from(""));
         let ctoken = StdCancellationToken::new();
         let res = provider.list_packages(req, &ctoken).await.unwrap();
         let packages: Vec<String> = res.map(|r| r.unwrap().pkg.to_string()).collect();
@@ -1686,9 +1635,7 @@ mod tests {
             ..Provider::default()
         };
 
-        let req = ListPackagesRequest {
-            prefix: PkgBuf::from(""),
-        };
+        let req = ListPackagesRequest::new("test", PkgBuf::from(""));
         let ctoken = StdCancellationToken::new();
         let res = provider.list_packages(req, &ctoken).await.unwrap();
         let packages: Vec<String> = res.map(|r| r.unwrap().pkg.to_string()).collect();
@@ -1746,13 +1693,7 @@ provider_state(provider = "go", root = "src", strict = True)
 
         let ctoken = StdCancellationToken::new();
         let res = provider
-            .probe(
-                ProbeRequest {
-                    request_id: "test".to_string(),
-                    package: PkgBuf::from(pkg_name),
-                },
-                &ctoken,
-            )
+            .probe(ProbeRequest::new("test", PkgBuf::from(pkg_name)), &ctoken)
             .await
             .unwrap();
 
@@ -1779,13 +1720,7 @@ provider_state(provider = "go", root = "src", strict = True)
         };
         let ctoken = StdCancellationToken::new();
         let err = match provider
-            .probe(
-                ProbeRequest {
-                    request_id: "test".to_string(),
-                    package: PkgBuf::from(pkg_name),
-                },
-                &ctoken,
-            )
+            .probe(ProbeRequest::new("test", PkgBuf::from(pkg_name)), &ctoken)
             .await
         {
             Ok(_) => panic!("missing provider must error"),

@@ -4989,12 +4989,12 @@ mod tests {
     }
 
     fn make_get_req(addr: Addr, workspace_root: &std::path::Path) -> GetRequest {
-        GetRequest {
-            request_id: "test".to_string(),
+        GetRequest::new(
+            "test",
             addr,
-            states: vec![host_variant_state()],
-            executor: test_executor(workspace_root),
-        }
+            vec![host_variant_state()],
+            test_executor(workspace_root),
+        )
     }
 
     async fn provider_get(p: &Provider, addr: Addr) -> Result<GetResponse, GetError> {
@@ -5083,16 +5083,16 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         // _golist should return a spec without calling executor
         let ctoken = StdCancellationToken::new();
-        let req = GetRequest {
-            request_id: "test".to_string(),
-            addr: make_addr("", "_golist"),
-            states: vec![host_variant_state()],
-            executor: Arc::new(GoListTestExecutor {
+        let req = GetRequest::new(
+            "test",
+            make_addr("", "_golist"),
+            vec![host_variant_state()],
+            Arc::new(GoListTestExecutor {
                 workspace_root: sandbox.path().to_path_buf(),
                 source_map: HashMap::new(),
                 states: vec![host_variant_state()],
             }),
-        };
+        );
         let resp = p.get(req, &ctoken).await.unwrap();
         assert_eq!(resp.target_spec.driver, "go.golist");
         let out = match resp.target_spec.config.get("out").unwrap() {
@@ -5207,12 +5207,12 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             calls: Arc::clone(&calls),
         });
         let ctoken = StdCancellationToken::new();
-        let req = GetRequest {
-            request_id: "test".to_string(),
-            addr: make_addr("", "codegen_gen"),
-            states: vec![host_variant_state()],
+        let req = GetRequest::new(
+            "test",
+            make_addr("", "codegen_gen"),
+            vec![host_variant_state()],
             executor,
-        };
+        );
 
         let res = p.get(req, &ctoken).await;
         assert!(
@@ -5280,12 +5280,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             inner: test_executor(&workspace),
             seen: Arc::clone(&seen),
         });
-        let req = GetRequest {
-            request_id: "test".to_string(),
-            addr,
-            states: vec![host_variant_state()],
-            executor,
-        };
+        let req = GetRequest::new("test", addr, vec![host_variant_state()], executor);
         (
             async move {
                 let ctoken = StdCancellationToken::new();
@@ -5748,16 +5743,16 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let ctoken = StdCancellationToken::new();
         let workspace = p.inner.workspace_root.clone();
         p.get(
-            GetRequest {
-                request_id: "test".to_string(),
+            GetRequest::new(
+                "test",
                 addr,
-                states: states.clone(),
-                executor: Arc::new(GoListTestExecutor {
+                states.clone(),
+                Arc::new(GoListTestExecutor {
                     workspace_root: workspace,
                     source_map: HashMap::new(),
                     states,
                 }),
-            },
+            ),
             &ctoken,
         )
         .await
@@ -5933,12 +5928,12 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
                 ])),
             )]),
         }];
-        let req = ListRequest {
-            request_id: "test".to_string(),
-            package: PkgBuf::from("cmd"),
+        let req = ListRequest::new(
+            "test",
+            PkgBuf::from("cmd"),
             states,
-            executor: test_executor(&p.inner.workspace_root),
-        };
+            test_executor(&p.inner.workspace_root),
+        );
         let addrs: Vec<Addr> = p
             .list(req, &StdCancellationToken::new())
             .await
@@ -6748,12 +6743,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             "build_lib".to_string(),
             VariantRef::new("x", "").to_args(),
         );
-        let req = GetRequest {
-            request_id: "test".to_string(),
-            addr,
-            states: vec![state],
-            executor: test_executor(sandbox.path()),
-        };
+        let req = GetRequest::new("test", addr, vec![state], test_executor(sandbox.path()));
         let resp = p.get(req, &StdCancellationToken::new()).await.unwrap();
         let cfg = &resp.target_spec.config;
         assert!(matches!(cfg.get("goos"), Some(Value::String(s)) if s == "linux"));
@@ -6919,16 +6909,16 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         states: Vec<State>,
     ) -> Vec<String> {
         let ctoken = StdCancellationToken::new();
-        let req = ListRequest {
-            request_id: "test".to_string(),
-            package: PkgBuf::from(package),
-            states: states.clone(),
-            executor: Arc::new(GoListTestExecutor {
+        let req = ListRequest::new(
+            "test",
+            PkgBuf::from(package),
+            states.clone(),
+            Arc::new(GoListTestExecutor {
                 workspace_root: p.inner.workspace_root.clone(),
                 source_map: HashMap::new(),
                 states,
             }),
-        };
+        );
         p.list(req, &ctoken)
             .await
             .unwrap()
@@ -6985,12 +6975,8 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             }
         }
 
-        let req = ListRequest {
-            request_id: "test".to_string(),
-            package: PkgBuf::from(""),
-            states: vec![], // no ancestry variants for this package
-            executor: Arc::new(SiblingUniverse),
-        };
+        // No ancestry variants for this package.
+        let req = ListRequest::new("test", PkgBuf::from(""), vec![], Arc::new(SiblingUniverse));
         let addrs: Vec<Addr> = p
             .list(req, &StdCancellationToken::new())
             .await
@@ -7077,12 +7063,7 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             }
         }
 
-        let req = ListRequest {
-            request_id: "test".to_string(),
-            package: PkgBuf::from(""),
-            states: vec![],
-            executor: Arc::new(NestedUniverse),
-        };
+        let req = ListRequest::new("test", PkgBuf::from(""), vec![], Arc::new(NestedUniverse));
         let addrs: Vec<Addr> = p
             .list(req, &StdCancellationToken::new())
             .await
@@ -8291,15 +8272,15 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let sandbox = copy_fixture("with_test");
         let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let ctoken = StdCancellationToken::new();
-        let req = ListRequest {
-            request_id: "test".to_string(),
-            package: PkgBuf::from("pkg"),
-            states: vec![
+        let req = ListRequest::new(
+            "test",
+            PkgBuf::from("pkg"),
+            vec![
                 with_recursive(state_with_test_skip("", true)),
                 host_variant_state(),
             ],
-            executor: test_executor(sandbox.path()),
-        };
+            test_executor(sandbox.path()),
+        );
         let names: Vec<String> = p
             .list(req, &ctoken)
             .await
@@ -8399,12 +8380,12 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             }
         }
 
-        let req = ListRequest {
-            request_id: "test".to_string(),
-            package: PkgBuf::from("pkg"),
-            states: vec![two.clone()],
-            executor: Arc::new(TwoVariantUniverse(two)),
-        };
+        let req = ListRequest::new(
+            "test",
+            PkgBuf::from("pkg"),
+            vec![two.clone()],
+            Arc::new(TwoVariantUniverse(two)),
+        );
         let addrs: Vec<Addr> = p
             .list(req, &StdCancellationToken::new())
             .await
@@ -8494,12 +8475,12 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
                 )])),
             )]),
         };
-        let req = GetRequest {
-            request_id: "test".to_string(),
-            addr: Addr::new(PkgBuf::from("cmd"), "build".to_string(), Default::default()),
-            states: vec![cross],
-            executor: test_executor(sandbox.path()),
-        };
+        let req = GetRequest::new(
+            "test",
+            Addr::new(PkgBuf::from("cmd"), "build".to_string(), Default::default()),
+            vec![cross],
+            test_executor(sandbox.path()),
+        );
         let res = p.get(req, &StdCancellationToken::new()).await;
         assert!(
             matches!(res, Err(GetError::NotFound)),
@@ -8578,15 +8559,15 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let ctoken = StdCancellationToken::new();
         for name in ["test", "build_test", "xtest", "build_xtest"] {
-            let req = GetRequest {
-                request_id: "test".to_string(),
-                addr: make_addr("pkg", name),
-                states: vec![
+            let req = GetRequest::new(
+                "test",
+                make_addr("pkg", name),
+                vec![
                     with_recursive(state_with_test_skip("", true)),
                     host_variant_state(),
                 ],
-                executor: test_executor(sandbox.path()),
-            };
+                test_executor(sandbox.path()),
+            );
             let res = p.get(req, &ctoken).await;
             assert!(
                 matches!(res, Err(GetError::NotFound)),
@@ -8601,16 +8582,16 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         let sandbox = copy_fixture("with_test");
         let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
         let ctoken = StdCancellationToken::new();
-        let req = GetRequest {
-            request_id: "test".to_string(),
-            addr: make_addr("pkg", "build_test"),
-            states: vec![
+        let req = GetRequest::new(
+            "test",
+            make_addr("pkg", "build_test"),
+            vec![
                 with_recursive(state_with_test_skip("", true)),
                 state_with_test_skip("pkg", false),
                 host_variant_state(),
             ],
-            executor: test_executor(sandbox.path()),
-        };
+            test_executor(sandbox.path()),
+        );
         let res = p.get(req, &ctoken).await;
         assert!(res.is_ok(), "deeper test.skip=False must override");
     }
@@ -8637,16 +8618,16 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         require_go!();
         let sandbox = copy_fixture("simple_lib");
         let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
-        let req = GetRequest {
-            request_id: "test".to_string(),
-            addr: make_addr("", "_golist"),
-            states: vec![host_variant_state()],
-            executor: Arc::new(GoListTestExecutor {
+        let req = GetRequest::new(
+            "test",
+            make_addr("", "_golist"),
+            vec![host_variant_state()],
+            Arc::new(GoListTestExecutor {
                 workspace_root: sandbox.path().to_path_buf(),
                 source_map: HashMap::new(),
                 states: vec![host_variant_state()],
             }),
-        };
+        );
         let resp = p.get(req, &StdCancellationToken::new()).await.unwrap();
         let srcfiles = extract_srcfiles(&resp);
         let go_src_query = srcfiles
@@ -8685,16 +8666,16 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             provider: "go".to_string(),
             state: state_map,
         };
-        let req = GetRequest {
-            request_id: "test".to_string(),
-            addr: make_addr("", "_golist"),
-            states: vec![state, host_variant_state()],
-            executor: Arc::new(GoListTestExecutor {
+        let req = GetRequest::new(
+            "test",
+            make_addr("", "_golist"),
+            vec![state, host_variant_state()],
+            Arc::new(GoListTestExecutor {
                 workspace_root: sandbox.path().to_path_buf(),
                 source_map: HashMap::new(),
                 states: vec![host_variant_state()],
             }),
-        };
+        );
         let resp = p.get(req, &StdCancellationToken::new()).await.unwrap();
         let srcfiles = extract_srcfiles(&resp);
         let go_src_query = srcfiles
@@ -8872,16 +8853,16 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
             provider: "go".to_string(),
             state: state_map,
         };
-        let req = GetRequest {
-            request_id: "test".to_string(),
-            addr: make_addr("", "_golist"),
-            states: vec![state, host_variant_state()],
-            executor: Arc::new(GoListTestExecutor {
+        let req = GetRequest::new(
+            "test",
+            make_addr("", "_golist"),
+            vec![state, host_variant_state()],
+            Arc::new(GoListTestExecutor {
                 workspace_root: sandbox.path().to_path_buf(),
                 source_map: HashMap::new(),
                 states: vec![host_variant_state()],
             }),
-        };
+        );
         let resp = p.get(req, &StdCancellationToken::new()).await.unwrap();
         let srcfiles = extract_srcfiles(&resp);
         assert!(

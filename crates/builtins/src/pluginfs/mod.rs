@@ -1680,12 +1680,12 @@ mod tests {
     }
 
     fn make_get_req(addr_str: &str) -> GetRequest {
-        GetRequest {
-            request_id: "test".to_string(),
-            addr: parse_addr(addr_str).unwrap(),
-            states: vec![],
-            executor: Arc::new(NoopExecutor),
-        }
+        GetRequest::new(
+            "test",
+            parse_addr(addr_str).unwrap(),
+            vec![],
+            Arc::new(NoopExecutor),
+        )
     }
 
     // ─── Exposed-function (glob) tests ─────────────────────────────────────
@@ -3186,12 +3186,7 @@ mod tests {
         let addr = file_addr("README.md");
         let result = p
             .get(
-                GetRequest {
-                    request_id: "test".to_string(),
-                    addr,
-                    states: vec![],
-                    executor: Arc::new(NoopExecutor),
-                },
+                GetRequest::new("test", addr, vec![], Arc::new(NoopExecutor)),
                 &ctoken(),
             )
             .await
@@ -4003,12 +3998,7 @@ mod tests {
         let addr = glob_addr("**/*.rs", &[]);
         let result = p
             .get(
-                GetRequest {
-                    request_id: "test".to_string(),
-                    addr,
-                    states: vec![],
-                    executor: Arc::new(NoopExecutor),
-                },
+                GetRequest::new("test", addr, vec![], Arc::new(NoopExecutor)),
                 &ctoken(),
             )
             .await
