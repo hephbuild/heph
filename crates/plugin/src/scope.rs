@@ -21,6 +21,7 @@
 //! Nothing about a scope may reach a hash, a target's env or its argv: two
 //! scopes over an unchanged tree give the same answers.
 
+use parking_lot::RwLock;
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::num::NonZeroU64;
@@ -99,6 +100,13 @@ static REGISTRY: Mutex<Registry> = Mutex::new(Registry {
 
 fn registry() -> MutexGuard<'static, Registry> {
     REGISTRY.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Whether any scope minted in this process is still live. A plugin cdylib has
+/// its own copy of the registry, which the host never mints into, so there it
+/// is always false.
+fn any_scope_live() -> bool {
+    !registry().live.is_empty()
 }
 
 impl Registry {
@@ -212,12 +220,19 @@ impl Drop for ScopeInner {
 /// - `None` (no scope sent) shares one unscoped bucket that never evicts:
 ///   today's behaviour, for a call that is not the engine's or an old host.
 ///
+/// The lock is a read-write lock: an `enter` whose bucket exists (every call
+/// of a scope but its first) takes only the read side, so the provider's
+/// calls do not serialize on it.
+///
 /// Ended ids are remembered as a watermark (every id below it ended, from the
-/// host's `ended_below`) plus the out-of-order ids above it, so the set stays
-/// as small as the number of scopes alive at once.
+/// host's `ended_below`) plus the out-of-order ids above it. The registry is
+/// process-wide and its watermark is the oldest live scope, so the set holds
+/// the scopes ended since the oldest still-live one was minted: one long-lived
+/// root request pins the watermark, and every scope that ends after it stays
+/// in the set until it does.
 pub struct ScopeMap<T> {
     owner: Arc<str>,
-    inner: Mutex<MapInner<T>>,
+    inner: RwLock<MapInner<T>>,
 }
 
 struct MapInner<T> {
@@ -240,7 +255,7 @@ impl<T: Send + Sync + 'static> ScopeMap<T> {
     pub fn new(owner: impl Into<Arc<str>>) -> Self {
         Self {
             owner: owner.into(),
-            inner: Mutex::new(MapInner {
+            inner: RwLock::new(MapInner {
                 live: HashMap::new(),
                 unscoped: None,
                 watermark: 1,
@@ -249,16 +264,50 @@ impl<T: Send + Sync + 'static> ScopeMap<T> {
         }
     }
 
-    fn lock(&self) -> MutexGuard<'_, MapInner<T>> {
-        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
     /// The bucket for `scope`, made with `make` when there is none. A call
     /// for an ended scope gets a fresh `make()` that is never stored.
     pub fn enter_with(&self, scope: Option<ScopeId>, make: impl FnOnce() -> T) -> Arc<T> {
-        let mut inner = self.lock();
+        // Fast path: the bucket exists. `live` never holds an ended scope —
+        // `end` removes a bucket under the write lock in the same critical
+        // section that records the scope ended — so a hit here is exactly the
+        // answer the write path would give.
+        {
+            let inner = self.inner.read();
+            let hit = match scope {
+                None => inner.unscoped.as_ref(),
+                Some(scope) => inner.live.get(&scope),
+            };
+            if let Some(bucket) = hit {
+                return Arc::clone(bucket);
+            }
+        }
+
+        let mut inner = self.inner.write();
         let Some(scope) = scope else {
-            return Arc::clone(inner.unscoped.get_or_insert_with(|| Arc::new(make())));
+            if let Some(bucket) = &inner.unscoped {
+                return Arc::clone(bucket);
+            }
+            let bucket = Arc::clone(inner.unscoped.insert(Arc::new(make())));
+            // Has this map been sent a scope before? A host that sends scopes
+            // and then a call without one is a caller that bypasses them.
+            let saw_scopes =
+                !inner.live.is_empty() || inner.watermark > 1 || !inner.ended.is_empty();
+            drop(inner);
+            if saw_scopes || any_scope_live() {
+                tracing::warn!(
+                    owner = %self.owner,
+                    "provider called without a cache scope while scopes are in use: this call and \
+                     every later unscoped one share a cache that is never released, so they can \
+                     see workspace state older than the current request",
+                );
+            } else {
+                tracing::debug!(
+                    owner = %self.owner,
+                    "unscoped cache first used: calls without a cache scope share one cache that \
+                     is never released",
+                );
+            }
+            return bucket;
         };
         if inner.is_ended(scope) {
             drop(inner);
@@ -269,7 +318,18 @@ impl<T: Send + Sync + 'static> ScopeMap<T> {
             );
             return Arc::new(make());
         }
-        Arc::clone(inner.live.entry(scope).or_insert_with(|| Arc::new(make())))
+        if let Some(bucket) = inner.live.get(&scope) {
+            return Arc::clone(bucket);
+        }
+        let bucket = Arc::new(make());
+        inner.live.insert(scope, Arc::clone(&bucket));
+        drop(inner);
+        tracing::debug!(
+            owner = %self.owner,
+            scope = scope.get(),
+            "cache scope first used",
+        );
+        bucket
     }
 
     /// [`enter_with`](Self::enter_with) for a `T` with a default.
@@ -292,7 +352,7 @@ impl<T: Send + Sync + 'static> ScopeMap<T> {
     /// Needs a tokio runtime context, as `hcore::blocking::run` does.
     pub async fn end(&self, ended: ScopeEnded) -> usize {
         let released = {
-            let mut inner = self.lock();
+            let mut inner = self.inner.write();
             let mut released: Vec<Arc<T>> = inner.live.remove(&ended.scope).into_iter().collect();
             if ended.ended_below > inner.watermark {
                 let w = ended.ended_below;
@@ -320,12 +380,12 @@ impl<T: Send + Sync + 'static> ScopeMap<T> {
 
     /// How many scope buckets are live (the unscoped one not counted).
     pub fn live_scopes(&self) -> usize {
-        self.lock().live.len()
+        self.inner.read().live.len()
     }
 
     /// How many ended ids this map remembers above its watermark.
     pub fn remembered_ended(&self) -> usize {
-        self.lock().ended.len()
+        self.inner.read().ended.len()
     }
 }
 
@@ -439,7 +499,7 @@ mod tests {
                 .map
                 .get()
                 .and_then(Weak::upgrade)
-                .is_some_and(|m| m.inner.try_lock().is_ok());
+                .is_some_and(|m| m.inner.try_write().is_some());
             *self.seen.lock().unwrap() = Some((unlocked, hcore::blocking::in_blocking_job()));
         }
     }

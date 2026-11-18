@@ -190,7 +190,7 @@ async fn drain_background(
                 tracing::info!(
                     pending = pending.load(Ordering::Acquire),
                     elapsed_secs = started.elapsed().as_secs(),
-                    "waiting for background cache uploads, history trims and sandbox cleanup to finish",
+                    "waiting for background cache uploads, history trims, sandbox cleanup and provider cache-scope hooks to finish",
                 );
                 announced = true;
             }

@@ -233,32 +233,38 @@ pub fn staged_goroot(version: &str) -> String {
 /// about which `go` a host build used.
 ///
 /// One probe is a subprocess per target, which for a `go list`-heavy build is
-/// the wrong order of magnitude — hence the cache. It holds a single slot: one
-/// build uses one toolchain in one environment, so a single entry is very nearly
-/// a 100% hit rate and cannot grow, and a key that does not match simply
-/// re-probes. The lock is held **across** the probe so concurrent targets at
-/// build start queue behind the first rather than each spawning their own.
+/// the wrong order of magnitude — hence the cache. Concurrent targets of one
+/// request at build start wait on the same entry rather than each spawning
+/// their own probe.
 ///
-/// **Lifetime: cleared when a cache scope ends.** The environment can change
-/// between two builds of a long-lived engine (the BUILD-file LSP) without its
-/// runner address changing — a `devenv.nix` edit swaps the `go` behind the same
-/// `//tools/devenv:runner` — so an answer must not outlive the request that
-/// probed it. The Go provider and its three drivers that run `go` (`golist`,
-/// `compile`, `download`) share **one** `Arc` of this cache, built by the
-/// provider ([`crate::plugingo::Provider::host_go`]); the drivers' run requests
-/// carry no scope, so the provider's `scope_ended` hook is what clears it.
+/// **Keyed on (runner, request id): one probe per root request, no reuse
+/// across requests.** The environment can change between two builds of a
+/// long-lived engine (the BUILD-file LSP) without its runner address changing —
+/// a `devenv.nix` edit swaps the `go` behind the same `//tools/devenv:runner`.
+/// The runner's fingerprint, which is in every consumer's cache key, is read
+/// within a request; the `GOROOT` a target compiles with must come from the
+/// same request, or a request overlapping (or following) the swap could compile
+/// with the old `go` and cache the result under the new fingerprint's key. A
+/// root request and its `with_parent`/speculative children share one request
+/// id ([`hexecrunner::RunnerRef::request_id`]), so they share one probe; any
+/// other request probes for itself. The local runner (`None`) carries no
+/// request id and resolves from heph's own `PATH`, which no request changes.
 ///
-/// - Sequential requests re-probe: each new scope pays one probe.
-/// - Overlapping scopes may share a probe: a request that starts while another
-///   is still running reads the slot the other filled, and the first of them to
-///   end clears it for both — the survivor's next target re-probes. Either way
-///   no answer survives every scope that could have seen it.
+/// The Go provider and its three drivers that run `go` (`golist`, `compile`,
+/// `download`) share **one** `Arc` of this cache, built by the provider
+/// ([`crate::plugingo::Provider::host_go`]). The provider's `scope_ended` hook
+/// [`clear`](Self::clear)s it — memory hygiene only, so entries of finished
+/// requests do not accumulate; correctness rests on the key.
 ///
 /// It holds paths only, never a request handle, so it cannot keep a scope alive.
 #[derive(Default)]
 pub struct HostGoCache {
-    slot: tokio::sync::Mutex<Option<(String, (std::path::PathBuf, std::path::PathBuf))>>,
+    slots: parking_lot::Mutex<std::collections::HashMap<HostGoKey, Arc<HostGoSlot>>>,
 }
+
+/// `(runner address or "local", request id)`.
+type HostGoKey = (String, String);
+type HostGoSlot = tokio::sync::OnceCell<(std::path::PathBuf, std::path::PathBuf)>;
 
 impl std::fmt::Debug for HostGoCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -267,11 +273,14 @@ impl std::fmt::Debug for HostGoCache {
 }
 
 impl HostGoCache {
-    /// Forget the probed toolchain, so the next `resolve` asks the environment
-    /// again. Waits for a probe in flight rather than racing it: that probe's
-    /// answer is dropped here too, instead of landing after the clear.
-    pub(crate) async fn clear(&self) {
-        *self.slot.lock().await = None;
+    /// Forget every probed toolchain. Memory hygiene: the key already keeps one
+    /// request's answer from serving another, so this only stops finished
+    /// requests' entries from accumulating. A probe in flight lands in an entry
+    /// that is no longer in the map and serves only the targets of its own
+    /// request already waiting on it; a later target of a still-live request
+    /// re-probes.
+    pub(crate) fn clear(&self) {
+        self.slots.lock().clear();
     }
 
     async fn resolve(
@@ -280,21 +289,21 @@ impl HostGoCache {
         driver: &str,
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<(std::path::PathBuf, std::path::PathBuf)> {
-        // Two host builds under different runners are different toolchains, so
-        // the runner is the key. `None` is the local host.
-        let key = runner
-            .addr
-            .map(hmodel::htaddr::Addr::format)
-            .unwrap_or_else(|| "local".to_string());
-        let mut slot = self.slot.lock().await;
-        if let Some((cached_key, resolved)) = slot.as_ref()
-            && cached_key == &key
-        {
-            return Ok(resolved.clone());
-        }
-        let resolved = probe_host_go(runner, driver, ctoken).await?;
-        *slot = Some((key, resolved.clone()));
-        Ok(resolved)
+        // Two host builds under different runners are different toolchains, and
+        // two requests may see different environments behind the same runner,
+        // so both are the key. `None` is the local host.
+        let key = (
+            runner
+                .addr
+                .map(hmodel::htaddr::Addr::format)
+                .unwrap_or_else(|| "local".to_string()),
+            runner.request_id.to_string(),
+        );
+        let slot = Arc::clone(self.slots.lock().entry(key).or_default());
+        // A failed probe leaves the cell empty, so the next target retries.
+        slot.get_or_try_init(|| probe_host_go(runner, driver, ctoken))
+            .await
+            .cloned()
     }
 }
 
@@ -892,7 +901,7 @@ mod host_go_tests {
         assert_eq!(probes.load(Ordering::SeqCst), 1);
     }
 
-    /// One probe serves the whole build. Without this a `go list`-heavy build
+    /// One probe serves the whole request. Without this a `go list`-heavy build
     /// pays a subprocess per package for a value that cannot change within it.
     #[tokio::test]
     async fn the_probe_is_paid_once_per_environment() {
@@ -973,11 +982,62 @@ mod host_go_tests {
         assert_eq!(probes.load(Ordering::SeqCst), 2);
     }
 
-    /// **The cache lives for a scope, not for the process.** The drivers hold
-    /// the provider's cache, and the provider's `scope_ended` clears it, so a
-    /// later request asks the environment again — a `devenv.nix` edit that
-    /// swapped the `go` behind the same runner address is seen at the next
-    /// build of a long-lived engine. Within the scope one probe still serves.
+    /// **One request's probe never serves another.** A `devenv.nix` edit can
+    /// swap the `go` behind the same runner address between (or during) two
+    /// requests of a long-lived engine; each request reads the runner's
+    /// fingerprint for its cache keys, so its `GOROOT` must come from its own
+    /// probe. Here the two requests' environments answer differently and run
+    /// at once, each with several targets: each must get its own answer, and
+    /// each request pays exactly one probe. A cache keyed on the runner alone
+    /// hands the second request the first one's `GOROOT`.
+    #[tokio::test]
+    async fn concurrent_requests_never_share_a_probe() {
+        const REQ_A: &str = "req-concurrent-a";
+        const REQ_B: &str = "req-concurrent-b";
+        let dir_a = tempfile::tempdir().expect("tempdir");
+        let dir_b = tempfile::tempdir().expect("tempdir");
+        let probes_a = Arc::new(AtomicUsize::new(0));
+        let probes_b = Arc::new(AtomicUsize::new(0));
+        hexecrunner::install_host(Arc::new(FakeEnv {
+            go: fake_go(dir_a.path(), "/env/old"),
+            probes: Arc::clone(&probes_a),
+            request_id: REQ_A.to_string(),
+        }));
+        hexecrunner::install_host(Arc::new(FakeEnv {
+            go: fake_go(dir_b.path(), "/env/new"),
+            probes: Arc::clone(&probes_b),
+            request_id: REQ_B.to_string(),
+        }));
+
+        let ct = hcore::hasync::StdCancellationToken::new();
+        let a = addr();
+        let cache = HostGoCache::default();
+        let resolve = |req| cache.resolve(RunnerRef::target(req, &a), "go.golist", &ct);
+        let (a1, b1, a2, b2) = tokio::join!(
+            resolve(REQ_A),
+            resolve(REQ_B),
+            resolve(REQ_A),
+            resolve(REQ_B)
+        );
+
+        for got in [a1, a2] {
+            assert_eq!(got.expect("a").0, std::path::PathBuf::from("/env/old"));
+        }
+        for got in [b1, b2] {
+            assert_eq!(
+                got.expect("b").0,
+                std::path::PathBuf::from("/env/new"),
+                "a request must never be served another request's probe"
+            );
+        }
+        assert_eq!(probes_a.load(Ordering::SeqCst), 1, "request A probes once");
+        assert_eq!(probes_b.load(Ordering::SeqCst), 1, "request B probes once");
+    }
+
+    /// **Scope end clears the cache, as memory hygiene.** The drivers hold the
+    /// provider's cache, and the provider's `scope_ended` drops every entry, so
+    /// finished requests' probes do not accumulate in a long-lived engine.
+    /// Within a request one probe still serves.
     #[tokio::test]
     async fn host_go_cache_is_cleared_on_scope_end() {
         use hplugin::provider::{Provider as _, ScopeEnded, ScopeEndedAck, ScopeId};
@@ -1003,8 +1063,8 @@ mod host_go_tests {
         let a = addr();
         let resolve = || cache.resolve(RunnerRef::target(REQ, &a), "go.golist", &ct);
         resolve().await.expect("first");
-        resolve().await.expect("same scope");
-        assert_eq!(probes.load(Ordering::SeqCst), 1, "one probe per scope");
+        resolve().await.expect("same request");
+        assert_eq!(probes.load(Ordering::SeqCst), 1, "one probe per request");
 
         let scope = ScopeId::new(1).expect("scope id");
         let ack = provider
@@ -1013,11 +1073,13 @@ mod host_go_tests {
             .expect("scope_ended");
         assert!(matches!(ack, ScopeEndedAck::Released));
 
-        resolve().await.expect("next scope");
+        // The same request id re-probes only because the entry is gone: that
+        // is what shows the clear dropped it rather than keeping it alive.
+        resolve().await.expect("after the clear");
         assert_eq!(
             probes.load(Ordering::SeqCst),
             2,
-            "the next request after a scope ended must re-probe the environment"
+            "scope end must drop the cached probes"
         );
     }
 }

@@ -11,7 +11,8 @@
 //! synchronously inside a `Drop` — of a request state, on whatever thread let
 //! go of it last — so it only counts the job on the request's `bg_pending` and
 //! spawns it on the engine's runtime. The process-exit drain waits on that
-//! counter, so a hook in flight is not cut off by exit.
+//! counter, so a hook in flight is not cut off by exit; each provider's call is
+//! bounded by `SCOPE_ENDED_TIMEOUT`, so a hung one cannot hold exit either.
 //!
 //! Nothing about a scope reaches a hash, a target's env or its argv.
 
@@ -23,6 +24,7 @@ use hplugin::scope::{CacheScope, ScopeEnded, ScopeEndedAck};
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 impl Engine {
     /// A new cache scope for a root request whose background work is counted
@@ -76,17 +78,36 @@ fn end_scope(engine: &Weak<Engine>, bg_pending: &PendingCounter, ended: ScopeEnd
     }));
 }
 
-/// Tell every provider that `ended` ended, concurrently. One provider erroring
-/// or panicking is logged and does not stop the others.
+/// How long one provider's `scope_ended` may take before the hook gives up on
+/// it. The hook is counted on the request's background counter, which process
+/// exit drains, so a provider whose `scope_ended` never returns would otherwise
+/// hold `heph query` (and every other command) open at exit.
+const SCOPE_ENDED_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Tell every provider that `ended` ended, concurrently. One provider erroring,
+/// panicking or overrunning [`SCOPE_ENDED_TIMEOUT`] is logged and does not stop
+/// the others.
 async fn send_scope_ended(providers: &[Arc<Provider>], ended: ScopeEnded) {
     let scope = ended.scope.get();
     futures::future::join_all(providers.iter().map(|provider| async move {
         // The call itself inside the guarded future, so a provider that
         // panics before returning its future is caught too.
-        let outcome = AssertUnwindSafe(async { provider.provider.scope_ended(ended).await })
-            .catch_unwind()
-            .await;
+        let outcome = tokio::time::timeout(
+            SCOPE_ENDED_TIMEOUT,
+            AssertUnwindSafe(async { provider.provider.scope_ended(ended).await }).catch_unwind(),
+        )
+        .await;
         let name = provider.name.as_str();
+        let Ok(outcome) = outcome else {
+            tracing::warn!(
+                scope,
+                provider = name,
+                timeout_secs = SCOPE_ENDED_TIMEOUT.as_secs(),
+                "provider {name} did not finish ending cache scope {scope} in time; gave up \
+                 waiting, it may keep that scope's caches"
+            );
+            return;
+        };
         match outcome {
             Ok(Ok(ScopeEndedAck::Unsupported)) => {
                 tracing::debug!(
@@ -101,8 +122,8 @@ async fn send_scope_ended(providers: &[Arc<Provider>], ended: ScopeEnded) {
                 {
                     tracing::debug!(
                         provider = name,
-                        "provider does not implement scope_ended; caches it keeps are never \
-                         told to drop"
+                        "provider {name} does not implement scope_ended; caches it keeps are \
+                         never told to drop"
                     );
                 }
             }
@@ -650,6 +671,41 @@ mod tests {
             .await
             .expect("the drain finishes once the hook does");
         assert_eq!(log.ended_count(scope), 1);
+        Ok(())
+    }
+
+    /// A provider whose `scope_ended` never returns cannot hold the drain: the
+    /// hook gives up on it after `SCOPE_ENDED_TIMEOUT` and retires its slot on
+    /// the background counter, so process exit (`heph query` among them) is
+    /// not held open. The clock is paused once the walk is done, so the
+    /// timeout elapses in virtual time, deterministically.
+    #[tokio::test]
+    async fn hung_scope_hook_times_out_and_retires_its_slot() -> anyhow::Result<()> {
+        // Never given a permit: the provider's `scope_ended` hangs for good.
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let (engine, _root, mut logs) = engine_with(vec![Faults {
+            scope_ended_gate: Some(Arc::clone(&gate)),
+            ..Default::default()
+        }])?;
+        let log = logs.pop().expect("one provider");
+        let rs = engine.new_state();
+        let scope = rs.cache_scope().id();
+        let bg = rs.bg_pending();
+        touch(&engine, &rs).await;
+
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        drop(rs);
+        assert!(bg.load(Ordering::Acquire) >= 1, "the hook is not counted");
+        tokio::time::timeout(SCOPE_ENDED_TIMEOUT * 4, bg.wait_drained())
+            .await
+            .expect("a hung scope_ended must not hold the drain past its timeout");
+        assert!(
+            started.elapsed() >= SCOPE_ENDED_TIMEOUT,
+            "the drain finished before the hook timed out: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(log.ended_count(scope), 1, "the provider was called");
         Ok(())
     }
 

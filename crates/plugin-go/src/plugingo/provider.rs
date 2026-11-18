@@ -163,9 +163,10 @@ pub(crate) struct ProviderInner {
     walker: Arc<CachedWalker>,
     /// See [`Config::foreign_name_guard`].
     foreign_name_guard: bool,
-    /// The host `go` the drivers probed, shared with them ([`Provider::host_go`])
-    /// and cleared whenever a scope ends. Not per-scope: the drivers' run
-    /// requests carry no scope to pick a bucket with.
+    /// The host `go` the drivers probed, shared with them ([`Provider::host_go`]).
+    /// Keyed on the request id rather than the scope (the drivers' run requests
+    /// carry no scope to pick a bucket with); cleared whenever a scope ends so
+    /// finished requests' entries do not accumulate.
     host_go: Arc<HostGoCache>,
 }
 
@@ -456,7 +457,7 @@ impl Provider {
 
     /// The host-toolchain cache the `golist`, `compile` and `download` drivers
     /// must be built with, so this provider's `scope_ended` clears what they
-    /// probed. See [`HostGoCache`] for the lifetime.
+    /// probed. See [`HostGoCache`] for the key and the lifetime.
     pub fn host_go(&self) -> Arc<HostGoCache> {
         Arc::clone(&self.inner.host_go)
     }
@@ -1264,14 +1265,15 @@ impl ProviderInner {
     }
 
     /// Drop the scope's bucket (and every bucket below the host's watermark),
-    /// and forget the drivers' host-`go` probe, which is keyed on no scope.
+    /// and forget the drivers' host-`go` probes. The probes are keyed on the
+    /// request, not the scope, so clearing them is memory hygiene only.
     fn scope_ended<'a>(
         &'a self,
         ended: ScopeEnded,
     ) -> BoxFuture<'a, anyhow::Result<ScopeEndedAck>> {
         Box::pin(async move {
+            self.host_go.clear();
             let released = self.scopes.end(ended).await;
-            self.host_go.clear().await;
             tracing::debug!(
                 provider = "go",
                 scope = ended.scope.get(),
