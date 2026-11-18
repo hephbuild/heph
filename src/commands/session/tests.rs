@@ -9,7 +9,7 @@ use futures::StreamExt as _;
 use futures::stream::BoxStream;
 use hcore::events::BuildEventKind;
 
-use super::attach::{Outcome, outcome_result};
+use super::attach::{Outcome, outcome_result, trigger_on};
 use super::*;
 use crate::tui::session::format::{
     LockWaitEntry, RunningTarget, SessionEnd, SnapshotCounts, files,
@@ -1331,6 +1331,29 @@ async fn attach_mirrors_the_session_exit() {
     assert_eq!(exit_code(&err), Some(3));
     let err = run(lost).await.expect_err("lost");
     assert_eq!(exit_code(&err), Some(125));
+}
+
+/// The detach listener is armed when `trigger_on` returns, not when its task
+/// is first polled: the signal is raised on this current-thread runtime
+/// before it yields, so the task cannot have run yet. With the listener
+/// created inside the task (what `ctrl_c()` amounts to), the signal keeps its
+/// default action and kills the test binary. SIGALRM stands in for SIGINT
+/// because nothing else in this binary listens for it, and a SIGINT would
+/// detach every `attach` running in parallel in this process.
+#[tokio::test]
+async fn detach_listener_is_armed_before_its_task_runs() {
+    let (trigger, mut rx) = hcore::shutdown::ShutdownTrigger::new();
+    let task = trigger_on(tokio::signal::unix::SignalKind::alarm(), trigger)
+        .expect("listening for SIGALRM");
+    // SAFETY: `raise` only delivers a signal to this thread; the handler was
+    // installed by `trigger_on` above.
+    let rc = unsafe { libc::raise(libc::SIGALRM) };
+    assert_eq!(rc, 0, "raise(SIGALRM)");
+    tokio::time::timeout(Duration::from_secs(10), rx.recv())
+        .await
+        .expect("the signal raised before the task ran still pulls the trigger")
+        .expect("trigger alive");
+    task.abort();
 }
 
 #[test]

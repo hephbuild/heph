@@ -18,7 +18,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 use async_trait::async_trait;
 use futures::StreamExt as _;
 use futures::stream::BoxStream;
+use hcore::shutdown::ShutdownTrigger;
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 use super::show::new_view;
 use super::{SessionExit, ViewOpts, escape_replayed, require_known, resolve};
@@ -55,13 +58,14 @@ pub(crate) async fn attach(
     let stream = source.subscribe(entry.id).await?;
 
     // Ctrl-C, from the TUI's key handler or a SIGINT, detaches.
-    let (shutdown, detach_rx) = hcore::shutdown::ShutdownTrigger::new();
-    let sigint = shutdown.clone();
-    let sigint_task = tokio::spawn(async move {
-        while tokio::signal::ctrl_c().await.is_ok() {
-            sigint.trigger();
+    let (shutdown, detach_rx) = ShutdownTrigger::new();
+    let sigint_task = match trigger_on(SignalKind::interrupt(), shutdown.clone()) {
+        Ok(task) => Some(task),
+        Err(e) => {
+            tracing::warn!(error = %e, "listening for ctrl-c; it will kill heph instead of detaching");
+            None
         }
-    });
+    };
     let (quit_tx, quit_rx) = mpsc::unbounded_channel();
     let after = AfterTeardown::default();
     let app = AttachApp {
@@ -83,7 +87,9 @@ pub(crate) async fn attach(
         shutdown,
     )
     .await;
-    sigint_task.abort();
+    if let Some(task) = sigint_task {
+        task.abort();
+    }
     // The run printed these below its final summary; the viewer's own summary
     // was printed at its teardown, so they land in the same place.
     sink.write_diagnostic(&after.take());
@@ -92,6 +98,26 @@ pub(crate) async fn attach(
         sink.write_diagnostic(&note);
     }
     outcome_result(entry.id, outcome)
+}
+
+/// Pulls `trigger` on every `kind` signal, from a spawned task.
+///
+/// The listener is armed here, on the calling thread, before the task is
+/// spawned: `tokio::signal::ctrl_c()` arms nothing until it is first polled,
+/// so a ctrl-c that landed before a worker polled the task kept SIGINT's
+/// default action and killed heph instead of detaching. The kind is a
+/// parameter only so the test can prove this with a signal nobody else in
+/// the test binary listens for.
+pub(crate) fn trigger_on(
+    kind: SignalKind,
+    trigger: ShutdownTrigger,
+) -> std::io::Result<JoinHandle<()>> {
+    let mut sig = signal(kind)?;
+    Ok(tokio::spawn(async move {
+        while sig.recv().await.is_some() {
+            trigger.trigger();
+        }
+    }))
 }
 
 /// The stderr line saying why `attach` exits as it does, when the code alone
