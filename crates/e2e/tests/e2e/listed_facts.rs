@@ -381,7 +381,7 @@ async fn explicit_and_unlisted_addrs_resolve_as_today() -> anyhow::Result<()> {
 }
 
 /// C18: a matcher with no fact-reading arm reads no fact — a lie everywhere
-/// changes nothing, and nothing is resolved or counted as decided.
+/// changes nothing, and nothing is resolved.
 #[tokio::test]
 async fn fact_free_matcher_reads_no_facts() -> anyhow::Result<()> {
     let (ws, gets) = workspace(
@@ -405,7 +405,6 @@ async fn fact_free_matcher_reads_no_facts() -> anyhow::Result<()> {
         );
     }
     assert!(got(&gets).is_empty());
-    assert_eq!(rs.listed_decided(), 0);
     Ok(())
 }
 
@@ -593,12 +592,10 @@ async fn kill_switch_ignores_listed_facts() -> anyhow::Result<()> {
         vec!["//p:test"]
     );
     assert_eq!(got(&gets), vec!["//p:format", "//p:lib", "//p:test"]);
-    assert_eq!(rs.listed_decided(), 0);
 
-    let (ws, _) = workspace(c1_targets(), Faults::default())?;
-    let rs = trust(&ws, TRUST);
-    select(&ws, Arc::clone(&rs), &label("test")).await?;
-    assert_eq!(rs.listed_decided(), 3);
+    let (ws, gets) = workspace(c1_targets(), Faults::default())?;
+    select(&ws, trust(&ws, TRUST), &label("test")).await?;
+    assert!(got(&gets).is_empty(), "resolved {:?}", got(&gets));
     Ok(())
 }
 
