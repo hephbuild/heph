@@ -1071,7 +1071,7 @@ mod log_tests {
         log: &mut ToolLog<'_>,
     ) -> anyhow::Result<()> {
         let ct = hcore::hasync::StdCancellationToken::new();
-        GoCompileDriver::new()
+        GoCompileDriver::new(Default::default())
             .exec_go(
                 go,
                 vec![OsString::from("tool"), OsString::from("compile")],
