@@ -63,16 +63,31 @@ is no workspace-wide default yet.
 
 ## What the clock covers
 
-The driver's `run`: not the wait for admission (`resources`), not building
-dependencies. A target queued behind others does not burn its timeout while it
+The target's own process, from the moment it is spawned until it exits.
+Nothing heph does for it counts: not the wait for admission (`resources`), not
+building dependencies, not staging the inputs into the sandbox, mounting
+scratch caches, presenting credentials or preparing the runner, and not
+collecting the outputs once the process has exited. A target queued behind
+others, or with a large tree to stage, does not burn its timeout while it
 waits.
 
-For `exec`/`bash` (managed drivers), `run` includes staging the inputs into the
-sandbox and collecting the outputs, so those count. Heph's own staging and
-collection stop within one chunk once the run is cancelled, so they never use
-up the grace; only the driver's process can. Leftover jobs of an abandoned run
-stop as soon as it is dropped, and each output tar is written under a name
-unique to its run, so a leftover job cannot overwrite a later run's artifact.
+Under a runner the spawned process is the runner's wrapper (`docs/EXEC_RUNNERS.md`),
+so whatever that wrapper does before it starts the target's command is on the
+clock; what heph does to prepare the runner before the spawn is not.
+
+The driver marks the two moments: it says it does
+(`Driver::arms_run_clock`), starts the run's `RunClock` right after the spawn,
+and stops it when the process exits. `exec` and `bash` do. A driver that does
+not is timed over its whole `run`, preparation and collection included; that
+is every cdylib driver, since the clock does not cross the plugin ABI. A
+driver that arms the clock and never starts it (its spawn failed) is never
+timed out; the run returns with its own error.
+
+Heph's own staging and collection stop within one chunk once the run is
+cancelled, so they never use up the grace; only the driver's process can.
+Leftover jobs of an abandoned run stop as soon as it is dropped, and each
+output tar is written under a name unique to its run, so a leftover job cannot
+overwrite a later run's artifact.
 
 An abandoned run's sandbox is **not removed**, even though a failed sandbox
 otherwise is (see [FAILURE_OUTPUTS.md](FAILURE_OUTPUTS.md)): its process may

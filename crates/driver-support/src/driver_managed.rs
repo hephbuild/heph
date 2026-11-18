@@ -127,6 +127,14 @@ pub trait ManagedDriver: Send + Sync {
             "run_shell called on a ManagedDriver with supports_shell()=false; the bridge must dispatch to the shell fallback"
         )
     }
+    /// Whether `run` starts and stops `req.request.clock` around the
+    /// target's process. Forwarded by the bridge's
+    /// [`Driver::arms_run_clock`](hplugin::driver::Driver::arms_run_clock),
+    /// which has the contract. Default false: the whole `run`, staging and
+    /// collection included, is timed.
+    fn arms_run_clock(&self) -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------

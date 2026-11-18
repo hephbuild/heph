@@ -567,6 +567,14 @@ impl Engine {
                         None => driver.driver.run(req, rs.ctoken()).await,
                         Some(timeout) => {
                             let run_token = hcore::hasync::StdCancellationToken::new();
+                            // A driver that arms the clock is timed from its
+                            // process's spawn to its exit; any other, over
+                            // its whole `run`.
+                            let clock = driver.driver.arms_run_clock().then(|| {
+                                let (clock, reader) = hplugin::driver::RunClock::new();
+                                req.clock = clock;
+                                reader
+                            });
                             let run = driver.driver.run(req, &run_token);
                             crate::engine::run_timeout::enforce(
                                 run,
@@ -575,6 +583,7 @@ impl Engine {
                                 &target.addr,
                                 timeout,
                                 engine.timeout_grace,
+                                clock,
                             )
                             .await
                         }
