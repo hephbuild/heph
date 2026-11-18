@@ -43,6 +43,9 @@ pub use codegen::{
     CodegenFileError, CodegenFileErrorKind, CodegenReport, FsCodegen, NoReport, exclusion_summary,
     reason_str, status_str, unrecorded_message,
 };
+mod request_cache;
+pub use request_cache::LiveRequests;
+use request_cache::RequestCache;
 
 /// wax's escape, for a caller building an fs glob pattern from a literal path.
 pub use wax::escape;
@@ -962,15 +965,11 @@ fn strip_literal_prefix<'r>(rel: &'r std::path::Path, prefix: &str) -> Option<&'
 /// Within a request, targets sharing the same excludes (common when a rule
 /// template fans out across packages) reuse one `wax::any` regex union. Built-in
 /// excludes are constant and prepended on build, so the user set alone keys the
-/// inner entry.
-/// One request's excludes: sorted-exclude-set key → compiled `Any`.
-type ExcludeBucket = FxHashMap<String, Arc<wax::Any<'static>>>;
-/// request_id → its [`ExcludeBucket`].
-type ExcludeCache = FxHashMap<String, ExcludeBucket>;
-
-fn exclude_any_cache() -> &'static RwLock<ExcludeCache> {
-    static CACHE: OnceLock<RwLock<ExcludeCache>> = OnceLock::new();
-    CACHE.get_or_init(|| RwLock::new(ExcludeCache::default()))
+/// inner entry. A request's bucket goes once the request has ended (see
+/// [`request_cache`]).
+fn exclude_any_cache() -> &'static RequestCache<Arc<wax::Any<'static>>> {
+    static CACHE: OnceLock<RequestCache<Arc<wax::Any<'static>>>> = OnceLock::new();
+    CACHE.get_or_init(RequestCache::new)
 }
 
 /// Per-request cache of glob walk results.
@@ -980,14 +979,11 @@ fn exclude_any_cache() -> &'static RwLock<ExcludeCache> {
 /// tree is immutable, so the artifact set for a given `(root, pattern, excludes)`
 /// is stable — memoize it and skip the walk on repeat calls. Keyed by
 /// `request_id` (outer) and `(root, pattern, excludes)` (inner) so it never
-/// reuses a stale tree across requests.
-type GlobResultBucket = FxHashMap<String, Arc<Vec<OutputArtifact>>>;
-/// request_id → its [`GlobResultBucket`].
-type GlobResultCache = FxHashMap<String, GlobResultBucket>;
-
-fn glob_result_cache() -> &'static RwLock<GlobResultCache> {
-    static CACHE: OnceLock<RwLock<GlobResultCache>> = OnceLock::new();
-    CACHE.get_or_init(|| RwLock::new(GlobResultCache::default()))
+/// reuses a stale tree across requests; a request's bucket goes once the
+/// request has ended (see [`request_cache`]).
+fn glob_result_cache() -> &'static RequestCache<Arc<Vec<OutputArtifact>>> {
+    static CACHE: OnceLock<RequestCache<Arc<Vec<OutputArtifact>>>> = OnceLock::new();
+    CACHE.get_or_init(RequestCache::new)
 }
 
 /// Returns the compiled exclude `Any` (engine ignore globs + user `exclude`) for
@@ -995,6 +991,7 @@ fn glob_result_cache() -> &'static RwLock<GlobResultCache> {
 /// non-empty; the no-exclude case reuses the ignore's file matcher directly.
 fn cached_exclude_any(
     skip: &Ignore,
+    live: Option<&Arc<dyn LiveRequests>>,
     request_id: &str,
     exclude: &[String],
 ) -> anyhow::Result<Arc<wax::Any<'static>>> {
@@ -1002,12 +999,8 @@ fn cached_exclude_any(
     sorted.sort_unstable();
     let key = sorted.join("\0");
 
-    if let Some(a) = exclude_any_cache()
-        .read()
-        .get(request_id)
-        .and_then(|m| m.get(&key))
-    {
-        return Ok(a.clone());
+    if let Some(a) = exclude_any_cache().get(request_id, &key) {
+        return Ok(a);
     }
 
     let patterns: Vec<String> = skip
@@ -1018,13 +1011,7 @@ fn cached_exclude_any(
         .collect();
     let any = compile_any(&patterns)?;
 
-    Ok(exclude_any_cache()
-        .write()
-        .entry(request_id.to_owned())
-        .or_default()
-        .entry(key)
-        .or_insert(any)
-        .clone())
+    Ok(exclude_any_cache().insert(live, request_id, key, any))
 }
 
 #[derive(serde::Serialize)]
@@ -1042,6 +1029,18 @@ enum FsDef {
 
 fn compile_glob(
     skip: &Arc<Ignore>,
+    request_id: &str,
+    pattern: &str,
+    exclude: &[String],
+) -> anyhow::Result<CompiledGlob> {
+    compile_glob_with(skip, None, request_id, pattern, exclude)
+}
+
+/// [`compile_glob`], its exclude cached for `request_id` until `live` says the
+/// request ended.
+fn compile_glob_with(
+    skip: &Arc<Ignore>,
+    live: Option<&Arc<dyn LiveRequests>>,
     request_id: &str,
     pattern: &str,
     exclude: &[String],
@@ -1081,7 +1080,7 @@ fn compile_glob(
     let not = if exclude.is_empty() {
         ignore_any.clone()
     } else {
-        cached_exclude_any(skip, request_id, exclude)?
+        cached_exclude_any(skip, live, request_id, exclude)?
     };
 
     Ok(CompiledGlob {
@@ -1294,27 +1293,19 @@ fn glob_walk_key(root: &std::path::Path, pattern: &str, exclude: &[String]) -> S
 /// Cross-run reuse of readdir + file hashes happens inside the shared
 /// [`CachedWalker`].
 fn memoized_glob_walk(request_id: &str, key: &str) -> Option<Arc<Vec<OutputArtifact>>> {
-    glob_result_cache()
-        .read()
-        .get(request_id)
-        .and_then(|m| m.get(key))
-        .cloned()
+    glob_result_cache().get(request_id, key)
 }
 
 /// Memoizes `artifacts` under `key` within `request_id`. A concurrent walk of
-/// the same key that landed first wins, so every caller sees one list.
+/// the same key that landed first wins, so every caller sees one list. A walk
+/// that finishes after its request ended (`live` says so) is not stored.
 fn memoize_glob_walk(
+    live: Option<&Arc<dyn LiveRequests>>,
     request_id: &str,
     key: String,
     artifacts: Vec<OutputArtifact>,
 ) -> Arc<Vec<OutputArtifact>> {
-    glob_result_cache()
-        .write()
-        .entry(request_id.to_owned())
-        .or_default()
-        .entry(key)
-        .or_insert_with(|| Arc::new(artifacts))
-        .clone()
+    glob_result_cache().insert(live, request_id, key, Arc::new(artifacts))
 }
 
 /// The single artifact of the fs `file` target over `path` under `root`, or
@@ -1390,6 +1381,9 @@ pub struct Driver {
     /// The codegen index the globs and file targets read, and where they
     /// report what it excluded.
     codegen: FsCodegen,
+    /// Which requests are live, so the per-request caches drop a bucket once
+    /// its request ended. `None` (no engine) keeps every bucket.
+    live: Option<Arc<dyn LiveRequests>>,
 }
 
 impl Default for Driver {
@@ -1398,6 +1392,7 @@ impl Default for Driver {
             skip: Arc::default(),
             walker: Arc::new(CachedWalker::disabled()),
             codegen: FsCodegen::default(),
+            live: None,
         }
     }
 }
@@ -1408,7 +1403,15 @@ impl Driver {
             skip,
             walker,
             codegen: FsCodegen::default(),
+            live: None,
         }
+    }
+
+    /// Drop a request's cached globs once `live` says it ended.
+    #[must_use]
+    pub fn with_live_requests(mut self, live: Arc<dyn LiveRequests>) -> Self {
+        self.live = Some(live);
+        self
     }
 
     /// Read generated files through `codegen` (without it, nothing is).
@@ -1499,8 +1502,9 @@ impl hplugin::driver::Driver for Driver {
                 }
                 let hash = format!("{:x}", h.digest()).into_bytes();
 
-                let compiled = Arc::new(compile_glob(
+                let compiled = Arc::new(compile_glob_with(
                     &self.skip,
+                    self.live.as_ref(),
                     &req.request_id,
                     &pattern,
                     &exclude,
@@ -1621,7 +1625,7 @@ impl hplugin::driver::Driver for Driver {
                                 exclusion_summary(&excluded)
                             );
                         }
-                        memoize_glob_walk(req.request_id, key, walked)
+                        memoize_glob_walk(self.live.as_ref(), req.request_id, key, walked)
                     }
                 };
 

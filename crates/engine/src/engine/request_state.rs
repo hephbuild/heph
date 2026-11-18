@@ -1442,6 +1442,21 @@ impl Drop for RequestStateData {
 pub type RequestRegistry =
     Arc<std::sync::Mutex<std::collections::HashMap<String, Weak<RequestState>>>>;
 
+/// Which requests are live, for the fs plugin's per-request glob caches (see
+/// `hbuiltins::pluginfs::LiveRequests`): a request is live while its
+/// [`RequestStateData`] is, which is what keeps its id in the registry.
+pub(crate) struct EngineLiveRequests(pub(crate) RequestRegistry);
+
+impl hbuiltins::pluginfs::LiveRequests for EngineLiveRequests {
+    fn is_live(&self, request_id: &str) -> bool {
+        // A poisoned registry answers "live": a kept bucket is memory, a
+        // wrongly dropped one is a re-walk mid-request.
+        self.0
+            .lock()
+            .map_or(true, |requests| requests.contains_key(request_id))
+    }
+}
+
 /// Where the fs plugin's codegen reads report (see
 /// [`hbuiltins::pluginfs::CodegenReport`]): an event goes on the stream of the
 /// request whose id it names, and a key fires once per request. A read with no
@@ -1626,7 +1641,10 @@ impl Engine {
     /// `root` is the request it is nested inside. The new request inherits its
     /// provider cache scope, so BUILD files and package listings are not
     /// re-evaluated per in_place target; it gets a request id of its own, so
-    /// `@heph/fs` (whose glob caches key by request id) re-stats the tree.
+    /// `@heph/fs` (whose glob caches key by request id) re-stats the tree. Those
+    /// caches are not pruned when this state drops: the fs plugin sweeps the
+    /// buckets of ended requests on later inserts, asking the request registry
+    /// ([`EngineLiveRequests`]).
     pub fn new_hash_only_state(
         self: &Arc<Self>,
         root: &RequestState,

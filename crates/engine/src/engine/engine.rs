@@ -1030,6 +1030,10 @@ impl Engine {
         let codegen_report: Arc<dyn hbuiltins::pluginfs::CodegenReport> = Arc::new(
             crate::engine::request_state::EngineCodegenReport::new(Arc::clone(&engine.requests)),
         );
+        // The driver's per-request glob caches drop an ended request's bucket.
+        let live_requests: Arc<dyn hbuiltins::pluginfs::LiveRequests> = Arc::new(
+            crate::engine::request_state::EngineLiveRequests(Arc::clone(&engine.requests)),
+        );
         engine.register_plugin("fs", |init| {
             let ignore = Arc::new(hwalk::Ignore::new(&init.skip_dirs, &init.skip_globs)?);
             let codegen = hbuiltins::pluginfs::FsCodegen::new(
@@ -1045,7 +1049,8 @@ impl Engine {
                 ))
                 .with_driver(Box::new(
                     hbuiltins::pluginfs::Driver::new(Arc::clone(&ignore), init.walker.clone())
-                        .with_codegen(codegen),
+                        .with_codegen(codegen)
+                        .with_live_requests(live_requests),
                 )))
         })?;
 

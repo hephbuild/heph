@@ -11,7 +11,6 @@ use crate::pluginbuildfile::run_file::{
     BuildFileLoader, build_globals, eval_source, resolve_load_target,
 };
 use hcore::hasync::StdCancellationToken;
-use hcore::hmemoizer::Memoizer;
 use hmodel::htpkg::PkgBuf;
 use hplugin::function::FunctionRegistry;
 use hplugin::lsp::LspEngine;
@@ -265,7 +264,7 @@ fn build_listing_provider(
     let provider = Provider {
         root: root.to_path_buf(),
         build_file_patterns: patterns.to_vec(),
-        ..Provider::base(Memoizer::with_tag_task("buildfile_pkg", runtime))
+        ..Provider::base(runtime)
     }
     .with_function_registry(Arc::clone(registry));
     Arc::new(provider)
