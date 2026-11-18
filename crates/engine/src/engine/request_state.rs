@@ -344,9 +344,6 @@ pub struct RequestStateData {
     /// and the query-target walk (`EngineProviderExecutor::query`). Never read
     /// by `states_under`, `Engine::states`, `get_spec` or `Selection::selects`.
     pub listed_facts_trust: crate::engine::listed::ListedFactsTrust,
-    /// How many candidates `Engine::query` decided from listed facts alone,
-    /// across every walk of this request. For "why did nothing match?".
-    pub listed_decided: std::sync::atomic::AtomicUsize,
     /// Optional one-way build-progress event stream. Lives in the shared
     /// `Arc<RequestStateData>`, so `with_parent` / `with_skip_provider` children
     /// inherit it for free.
@@ -805,14 +802,6 @@ impl RequestState {
     /// Whether this request's query walks trust listed facts.
     pub fn listed_facts_trust(&self) -> crate::engine::listed::ListedFactsTrust {
         self.data.listed_facts_trust
-    }
-
-    /// How many candidates this request's selection walks decided from listed
-    /// facts alone, without resolving them.
-    pub fn listed_decided(&self) -> usize {
-        self.data
-            .listed_decided
-            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Trailing process-log lines to render in a failure box (see
@@ -1399,7 +1388,6 @@ impl Engine {
             fail_fast,
             log_tail_lines,
             listed_facts_trust,
-            listed_decided: std::sync::atomic::AtomicUsize::new(0),
             events,
             hooks: self.hooks(),
             frozen: std::sync::atomic::AtomicBool::new(false),

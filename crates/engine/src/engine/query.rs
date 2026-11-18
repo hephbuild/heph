@@ -489,14 +489,6 @@ impl Engine {
                 for Candidate { addr, facts, .. } in candidates {
                     let facts = if facts_usable { &facts } else { &ListedFacts::UNKNOWN };
                     let verdict = m.matches_listed(&addr, facts);
-                    if facts_usable
-                        && verdict != MatchResult::MatchShrug
-                        && m.matches_addr(&addr) == MatchResult::MatchShrug
-                    {
-                        rs.data
-                            .listed_decided
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
                     match verdict {
                         MatchResult::MatchYes => {
                             if seen.insert(addr.clone()) { yield addr; }

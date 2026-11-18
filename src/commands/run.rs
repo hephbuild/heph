@@ -861,11 +861,7 @@ impl App for RunApp {
                 // walk skipped something: then the skips are the answer, not
                 // "check your selector".
                 .and_then(|results| {
-                    crate::commands::errors::require_non_empty_unless_incomplete(
-                        results,
-                        &gaps,
-                        rs.listed_decided(),
-                    )
+                    crate::commands::errors::require_non_empty_unless_incomplete(results, &gaps)
                 }),
         };
 
