@@ -95,6 +95,7 @@ fn events(holder_pid: u32) -> Vec<BuildEvent> {
         ev(
             BASE + 6,
             BuildEventKind::ExecuteStart {
+                output_groups: Vec::new(),
                 addr: "//a:slow".into(),
                 driver: "exec".into(),
                 cache: true,
@@ -236,22 +237,24 @@ fn attached_view_draws_what_the_run_drew() {
         tap.event(e);
     }
     *label.lock().unwrap_or_else(PoisonError::into_inner) = "run //a:... (4 matched)".into();
-    let rx_gate = center.request(
+    let build = center.build();
+    let gate = center.request(
+        &build,
         "//a:gate".into(),
         vec![ApprovalNoticeView {
             name: "plan".into(),
             content: "drop the table".into(),
-            path: "/ws/.heph/notices/plan.txt".into(),
+            sources: Vec::new(),
         }],
     );
-    let rx_next = center.request("//a:next".into(), Vec::new());
+    let next = center.request(&build, "//a:next".into(), Vec::new());
     view_tap.observe(&live);
     let live_prompt = draw(&live);
 
-    center.respond(true);
-    center.respond(false);
-    assert_eq!(rx_gate.blocking_recv(), Ok(true));
-    assert_eq!(rx_next.blocking_recv(), Ok(false));
+    center.respond(gate.seq, true, Vec::new());
+    center.respond(next.seq, false, Vec::new());
+    assert_eq!(gate.rx.blocking_recv(), Ok(true));
+    assert_eq!(next.rx.blocking_recv(), Ok(false));
     view_tap.observe(&live);
     let live_after = draw(&live);
     let live_more = draw_more(&mut live);
@@ -271,7 +274,7 @@ fn attached_view_draws_what_the_run_drew() {
     let mut checkpoints = Vec::new();
     for record in read_records(rec.dir()) {
         let prompt = match &record.session {
-            Some(SessionRecordKind::Approval { prompt }) => Some(prompt.is_some()),
+            Some(SessionRecordKind::Approval { prompt, .. }) => Some(prompt.is_some()),
             _ => None,
         };
         match feed.route(record) {
@@ -301,7 +304,7 @@ fn attached_view_draws_what_the_run_drew() {
     for needle in [
         "approval required: //a:gate",
         "2 pending",
-        "plan: /ws/.heph/notices/plan.txt",
+        "notice: plan",
         "//a:slow",
         &format!("locked by session {}", holder.id()),
         "(4 matched)",
@@ -354,7 +357,9 @@ fn attached_view_draws_what_the_run_drew() {
 fn only_the_live_view_acts_on_the_run() {
     let center = ApprovalCenter::new();
     let mut live = TuiProgressView::new("run").with_approval(center.clone());
-    let mut rx = center.request("//a:gate".into(), Vec::new());
+    let mut rx = center
+        .request(&center.build(), "//a:gate".into(), Vec::new())
+        .rx;
     assert!(live.approval_active());
     live.approval_respond(true);
     assert_eq!(rx.try_recv(), Ok(true), "the run's view answers the prompt");
@@ -368,7 +373,9 @@ fn only_the_live_view_acts_on_the_run() {
         .attached(id, SessionFeed::default(), move || {
             *count.lock().unwrap_or_else(PoisonError::into_inner) += 1;
         });
-    let mut rx = center.request("//a:gate".into(), Vec::new());
+    let mut rx = center
+        .request(&center.build(), "//a:gate".into(), Vec::new())
+        .rx;
     assert!(!attached.approval_active(), "a viewer holds no queue");
     attached.approval_respond(true);
     attached.approval_toggle_notice();

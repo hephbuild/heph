@@ -15,7 +15,10 @@ pub mod tty;
 use std::io::{self, IsTerminal};
 
 pub use app::{App, AppContext, CIAppView, PauseFor, PauseGuard, TUIAppView};
-pub use approval::{ApprovalCenter, ApprovalNoticeView, ApprovalView};
+pub use approval::{
+    ApprovalBuild, ApprovalCenter, ApprovalDecision, ApprovalNoticeView, ApprovalTicket,
+    ApprovalView, DecidedBy,
+};
 pub use log_sink::LogSink;
 pub use paused::paused;
 pub use progress::{

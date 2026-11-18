@@ -1644,12 +1644,14 @@ mod tests {
                         unit: Unit::Cpu,
                         capacity: Limit::Bounded(8 * cpu),
                         held: 6 * cpu,
+                        waiting: 7,
                     },
                     PoolSnapshot {
                         pool: name("memory"),
                         unit: Unit::Bytes,
                         capacity: Limit::Bounded(16 << 30),
                         held: 2 << 30,
+                        waiting: 0,
                     },
                 ],
                 queued: 7,
@@ -1679,12 +1681,14 @@ mod tests {
             unit: Unit::Bytes,
             capacity: Limit::Bounded(8 << 30),
             held: 1 << 30,
+            waiting: 0,
         });
         snap.main.pools.push(PoolSnapshot {
             pool: name("tokens"),
             unit: Unit::Count,
             capacity: Limit::Unbounded,
             held: 5,
+            waiting: 0,
         });
         if let Some(head) = &mut snap.main.head {
             head.unmet = vec![PoolNeed {
@@ -2011,6 +2015,7 @@ mod tests {
         let s = state();
         let hook = DiagHook::new(std::sync::Arc::clone(&s));
         hook.on_event(&ev(BuildEventKind::ExecuteStart {
+            output_groups: Vec::new(),
             addr: "//a:b".into(),
             driver: "bash".into(),
             cache: true,

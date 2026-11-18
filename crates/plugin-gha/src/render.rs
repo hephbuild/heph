@@ -578,7 +578,7 @@ fn push_lock_waits(b: &mut Budgeted, t: &Tally, ctx: &RenderCtx<'_>) {
 }
 
 /// Targets waiting for their resources to fit, as the TUI's `⧗` rows:
-/// `⧗ //a:b waits for cpu 4 (2 free, 6 ahead, 41s)`. The engine announces only
+/// `⧗ //a:b waits for cpu 4 (2 free, 41s)`. The engine announces only
 /// waits past its notice threshold, so every open one is shown (up to the cap).
 fn push_admission_waits(b: &mut Budgeted, t: &Tally, ctx: &RenderCtx<'_>) {
     let (waits, total) = t.admission_waits(LIVE_LOCK_ROWS);
@@ -952,6 +952,7 @@ mod tests {
             t.apply(&ev(
                 0,
                 BuildEventKind::ExecuteStart {
+                    output_groups: Vec::new(),
                     addr: format!("//pkg{}:running{i}", i % 50),
                     driver: "exec".into(),
                     cache: false,
@@ -1157,6 +1158,7 @@ mod tests {
         t.apply(&ev(
             0,
             BuildEventKind::ExecuteStart {
+                output_groups: Vec::new(),
                 addr: "//a:slow".into(),
                 driver: "exec".into(),
                 cache: false,
@@ -1302,7 +1304,7 @@ mod tests {
         let md = render_live(&t, &ctx("heph run //...", 600_000), COMMENT_LIMIT);
         assert!(md.contains("1 target waiting for resources"), "{md}");
         assert!(
-            md.contains("- ⧗ //a:b waits for cpu 4 (2 free, 6 ahead, 41s)\n"),
+            md.contains("- ⧗ //a:b waits for cpu 4 (2 free, 41s)\n"),
             "{md}"
         );
         t.apply(&ev(
@@ -1334,12 +1336,13 @@ mod tests {
         ));
         let md = render_live(&t, &ctx("heph run //...", 600_000), COMMENT_LIMIT);
         assert!(
-            md.contains("- ⧗ //a:b waits for cpu 4 (2 free, 6 ahead, 41s)\n"),
+            md.contains("- ⧗ //a:b waits for cpu 4 (2 free, 41s)\n"),
             "{md}"
         );
         t.apply(&ev(
             600_000,
             BuildEventKind::ExecuteStart {
+                output_groups: Vec::new(),
                 addr: "//a:b".into(),
                 driver: "exec".into(),
                 cache: true,
@@ -1532,6 +1535,7 @@ mod tests {
             t.apply(&ev(
                 i,
                 BuildEventKind::ExecuteStart {
+                    output_groups: Vec::new(),
                     addr: format!("//services/api:image{i}"),
                     driver: "exec".into(),
                     cache: false,

@@ -17,6 +17,7 @@
 #[path = "../common/mod.rs"]
 mod common;
 
+mod approval_gate;
 mod cache_load;
 mod cache_outcome;
 mod clean;
@@ -45,6 +46,8 @@ mod http_fetch;
 mod inspect_failure;
 mod label_select;
 mod listed_facts;
+mod log_api;
+mod log_cmd;
 mod oci;
 mod oci_docker;
 mod oci_image;
@@ -56,6 +59,8 @@ mod plugin_functions;
 mod query;
 mod remote_cache;
 mod resources;
+mod result_outputs;
+mod run_log;
 mod run_timeout;
 mod sandbox_pool;
 mod scratch;

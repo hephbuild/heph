@@ -17,18 +17,22 @@
 )]
 
 use execrunner::agent::{
-    ExecOutcome, ExecRequest, exec_via_agent, serve_for_test, start_via_agent,
+    ExecOutcome, ExecRequest, InFlight, exec_via_agent, serve_for_test, start_via_agent,
 };
 use std::ffi::OsString;
 use std::io::{Read as _, Seek as _};
 use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// An agent serving on a socket in a temp dir, for the life of the test.
 struct Agent {
     _dir: tempfile::TempDir,
     socket: PathBuf,
+    /// This agent's own registry, so a test can run its teardown without
+    /// reaching any other test's targets.
+    in_flight: Arc<InFlight>,
 }
 
 impl Agent {
@@ -38,15 +42,21 @@ impl Agent {
         // most of that already.
         let socket = dir.path().join("a.sock");
         let s = socket.clone();
+        let in_flight = Arc::new(InFlight::default());
+        let served = Arc::clone(&in_flight);
         std::thread::spawn(move || {
             // Runs until the test process exits.
-            let _ = serve_for_test(&s);
+            let _ = serve_for_test(&s, served);
         });
 
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
             if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
-                return Agent { _dir: dir, socket };
+                return Agent {
+                    _dir: dir,
+                    socket,
+                    in_flight,
+                };
             }
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -422,6 +432,48 @@ fn a_disconnect_kills_what_is_left_of_the_targets_group() {
     );
 }
 
+/// The agent's teardown — what it runs when heph is gone — kills every target
+/// still in flight, and everything in each target's group.
+///
+/// Each target runs in a session of its own, so the agent's `killpg` on its own
+/// group never reached one. A target that timed out under a session runner
+/// whose heph exited inside the agent's cancel grace (or a heph hard-killed
+/// mid-run) was left running with its workers, reparented to init.
+///
+/// The client stays connected throughout: what is under test is the agent's
+/// own way out, not the per-target cancel a disconnect starts — which would
+/// end the target on its own after the grace and make the test pass either way.
+#[test]
+fn the_agents_teardown_kills_every_target_in_flight() {
+    let agent = Agent::start();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (req, pidfile, gpidfile) = target_with_a_sigint_ignoring_grandchild(dir.path());
+    let out = capture();
+
+    let devnull = std::fs::File::open("/dev/null").expect("/dev/null");
+    let conn = start_via_agent(
+        &agent.socket,
+        &req,
+        [devnull.as_fd(), out.as_fd(), out.as_fd()],
+    )
+    .expect("handshake");
+    let pid = wait_for_pid(&pidfile).expect("the target should have started");
+    let gpid = wait_for_pid(&gpidfile).expect("the grandchild should have started");
+
+    agent.in_flight.kill_all();
+
+    assert!(
+        wait_until_dead(pid, Duration::from_secs(10)),
+        "the target (pid {pid}) outlived the agent's teardown"
+    );
+    assert!(
+        wait_until_dead(gpid, Duration::from_secs(10)),
+        "the grandchild (pid {gpid}) outlived the agent's teardown"
+    );
+    // A client still listening hears how its target ended.
+    assert_eq!(await_reply(conn), ExecOutcome::Signaled(libc::SIGKILL));
+}
+
 /// Two targets in flight at once must each get their own descriptors. If the
 /// agent let one request's stdio leak into the next fork, heph's reader would
 /// never see EOF on the first — the stray-descendant hang `setsid` exists to
@@ -527,7 +579,6 @@ fn a_session_whose_launch_dies_fails_fast() {
     use execrunner::registry::{RunnerCtx, RunnerRegistry};
     use execrunner::session::SessionRunner;
     use hcore::hasync::StdCancellationToken;
-    use std::sync::Arc;
 
     // Under `/tmp`, because macOS caps `sun_path` at 104 bytes and a `$TMPDIR`
     // is most of that already.

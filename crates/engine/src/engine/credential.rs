@@ -1030,7 +1030,8 @@ impl Engine {
             )
             .await;
 
-        let (artifacts, teardown, guards, _execute_guard) = match run {
+        // A credential source has no live log (its output is material).
+        let (artifacts, teardown, guards, _execute_guard, _live_log) = match run {
             Ok(v) => v,
             Err(e) => {
                 return Err(e).with_context(|| format!("run credential source {target}"));

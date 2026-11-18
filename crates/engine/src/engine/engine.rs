@@ -204,8 +204,9 @@ pub struct Engine {
     pub(crate) local_cache: Arc<dyn LocalCache>,
     /// Mem-only store for `tmp`/uncacheable revisions. Small entries live in
     /// memory and never touch the SQLite WAL; entries over the per-entry cap
-    /// spill to `local_cache`. See [`LocalCacheTmp`].
-    pub(crate) local_cache_tmp: Arc<dyn LocalCache>,
+    /// spill to `local_cache`. See [`LocalCacheTmp`]. Concrete, for the
+    /// approval gate's [`LocalCacheTmp::persist_revision`].
+    pub(crate) local_cache_tmp: Arc<crate::engine::local_cache_tmp::LocalCacheTmp>,
     /// The durable tier's sqlite store, also inside `local_cache`, kept by its
     /// concrete type so [`Engine::invoke`] can drain its write-behind queue
     /// before an entrypoint's tool starts (D43).
@@ -316,6 +317,15 @@ pub struct Engine {
     /// Each target's last failure log, under `<home>/failures/`. Diagnostics
     /// only — see [`crate::engine::failure_slot`].
     pub(crate) failure_slots: crate::engine::failure_slot::FailureSlots,
+
+    /// Each captured run's live log, under `<home>/runs/<id>/`. Diagnostics
+    /// only — see [`crate::engine::run_log`].
+    pub(crate) run_logs: crate::engine::run_log::RunLogs,
+    /// One remote `Log` fetch at a time per `(addr, hashin)`, so concurrent
+    /// opens of a remote hit's log pull its blob once. In-process: another
+    /// heph's fetch is caught by the `exists_local` re-check after it.
+    pub(crate) log_fetches:
+        hlock::hlock::KeyedLock<(hmodel::htaddr::Addr, String), hlock::hlock::MemLock>,
 
     /// Guards the execute phase so at most one execute runs per target addr at
     /// a time (cross-process with the filesystem backend, in-process with mem).
@@ -774,6 +784,24 @@ impl Engine {
         self.sandbox_removal_hold.gate = Some(gate.state());
     }
 
+    /// Announce each run's live log to `announcer` (the process's session)
+    /// when the run's first byte creates it: addr, hashin and the file
+    /// relative to the home. Diagnostics only: nothing announced reaches a
+    /// hash or a target.
+    pub fn set_run_log_announcer(
+        &mut self,
+        announcer: Arc<dyn hcore::session_record::RunLogAnnouncer>,
+    ) {
+        self.run_logs.set_announcer(announcer);
+    }
+
+    /// Wait for the sweep of other hephs' run logs this engine started when it
+    /// was made; how many directories it removed.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn run_logs_start_sweep(&self) -> usize {
+        self.run_logs.start_sweep_done().await
+    }
+
     pub fn new(cfg: Config) -> anyhow::Result<Engine> {
         let home = cfg.home_dir.clone();
         ensure_home(&home)?;
@@ -784,7 +812,7 @@ impl Engine {
         let parallelism = cfg.parallelism.unwrap_or_else(hcore::sysres::host_cpus);
 
         let sqlite = LocalCacheSQLite::with_pipe_limit(
-            home.join("cache").join("cache.db"),
+            crate::engine::local_cache::cache_db_path(&home),
             cfg.mem_cache.per_entry_bytes,
             2 * parallelism,
         )?;
@@ -795,7 +823,7 @@ impl Engine {
         // Durable tier: manifests + small/medium blobs in sqlite, large blobs
         // spilled to plain files. The mem tier (below) fronts both.
         let blobs = Arc::new(crate::engine::local_cache_fs::LocalCacheFS::new(
-            home.join("cache").join("blobs"),
+            crate::engine::local_cache::cache_blobs_dir(&home),
         )?);
         let durable: Arc<dyn LocalCache> =
             Arc::new(crate::engine::local_cache_spill::LocalCacheSpill::new(
@@ -815,12 +843,11 @@ impl Engine {
 
         // Mem-only tier for tmp/uncacheable revisions; spills oversized or
         // over-budget entries to the durable cache so a reader never misses.
-        let local_cache_tmp: Arc<dyn LocalCache> =
-            Arc::new(crate::engine::local_cache_tmp::LocalCacheTmp::new(
-                local_cache.clone(),
-                cfg.tmp_cache.per_entry_bytes,
-                cfg.tmp_cache.capacity_bytes,
-            ));
+        let local_cache_tmp = Arc::new(crate::engine::local_cache_tmp::LocalCacheTmp::new(
+            local_cache.clone(),
+            cfg.tmp_cache.per_entry_bytes,
+            cfg.tmp_cache.capacity_bytes,
+        ));
 
         // Best-effort sweep of stale `sandboxfuse<pid>` dirs from crashed runs.
         sweep_stale_sandboxfuse_dirs(&home);
@@ -950,6 +977,8 @@ impl Engine {
             plugins: HashMap::new(),
             fuse,
             failure_slots: crate::engine::failure_slot::FailureSlots::new(&home),
+            run_logs: crate::engine::run_log::RunLogs::new(&home),
+            log_fetches: hlock::hlock::KeyedLock::new(|_| hlock::hlock::MemLock::new()),
             result_lock,
             scratch_lock,
             credential_cache: Default::default(),
@@ -961,6 +990,8 @@ impl Engine {
             remote_tmp_ready: tokio::sync::OnceCell::new(),
             scratch_audit_ready: tokio::sync::OnceCell::new(),
         };
+        // Ended hephs' run logs, off the hot path: never awaited by a build.
+        engine.run_logs.start_sweep(&engine.runtime);
         engine.register_plugin("group", |_| {
             Ok(PluginParts::default().with_driver(Box::new(hbuiltins::plugingroup::Driver)))
         })?;

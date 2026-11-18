@@ -49,6 +49,7 @@ fn events() -> Vec<BuildEvent> {
         ev(
             3,
             BuildEventKind::ExecuteStart {
+                output_groups: Vec::new(),
                 addr: "//a:ok".into(),
                 driver: "exec".into(),
                 cache: true,
@@ -80,14 +81,29 @@ fn events() -> Vec<BuildEvent> {
     ]
 }
 
-fn read_records(dir: &Path) -> (Vec<SessionRecord>, u64) {
+/// A build event of about 1 MiB, to reach the cap with (a `Log` outlives it).
+fn big_event() -> BuildEvent {
+    BuildEvent {
+        at_unix_ms: 1,
+        kind: BuildEventKind::ResultEnd {
+            addr: "//a:big".into(),
+            error: Some("x".repeat(1024 * 1024)),
+            upstream_of: None,
+            exit_status: None,
+            log_tail: None,
+            timed_out: None,
+        },
+    }
+}
+
+pub(super) fn read_records(dir: &Path) -> (Vec<SessionRecord>, u64) {
     let file = std::fs::File::open(dir.join(files::EVENTS)).expect("events");
     let mut r = RecordReader::new(file);
     let recs = std::iter::from_fn(|| r.next_record().expect("read")).collect();
     (recs, r.skipped())
 }
 
-fn start() -> SessionStart {
+pub(super) fn start() -> SessionStart {
     SessionStart {
         header: SessionHeader {
             kind: HeaderKind::Build,
@@ -111,7 +127,7 @@ fn recorder_round_trip_matches_live_view() {
         live.apply(&ev);
         tap.event(ev);
     }
-    tap.log("INFO", "hello\u{1b}[31m".into());
+    drop(tap.log(1, "INFO", "hello\u{1b}[31m".into()));
     session.finish(Some(1), false);
 
     let (records, skipped) = read_records(&dir);
@@ -124,7 +140,8 @@ fn recorder_round_trip_matches_live_view() {
     assert!(records.iter().any(|r| r.session
         == Some(SessionRecordKind::Log {
             level: "INFO".into(),
-            msg: "hello\u{1b}[31m".into()
+            msg: "hello\u{1b}[31m".into(),
+            seq: Some(1),
         })));
     assert_eq!(
         records.last().and_then(|r| r.session.clone()),
@@ -309,6 +326,7 @@ fn recorder_with(dir: &Path, events: Box<dyn Write + Send>, faults: Faults) -> R
         lock,
         events,
         retention: Retention::default(),
+        private_root: None,
         faults,
     })
     .expect("spawn")
@@ -316,7 +334,7 @@ fn recorder_with(dir: &Path, events: Box<dyn Write + Send>, faults: Faults) -> R
 
 /// A `MakeWriter` collecting log output, to count warnings.
 #[derive(Clone, Default)]
-struct Captured(Arc<Mutex<Vec<u8>>>);
+pub(super) struct Captured(Arc<Mutex<Vec<u8>>>);
 
 impl Write for Captured {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
@@ -339,7 +357,7 @@ impl Captured {
     /// subscriber (and the writer it holds) outliving the test's own
     /// `with_default` is exactly "the recorder may still log".
     #[track_caller]
-    fn settled_log(&self) -> String {
+    pub(super) fn settled_log(&self) -> String {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while Arc::strong_count(&self.0) > 1 && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(1));
@@ -408,9 +426,9 @@ fn send_after_finish_is_dropped_silently() {
     tracing::subscriber::with_default(subscriber, || {
         let rec = recorder_with(dir.path(), Box::new(io::sink()), Faults::default());
         let tap = rec.tap();
-        tap.log("INFO", "before".into());
+        assert!(tap.log(1, "INFO", "before".into()).is_none());
         rec.finish(Some(0), false, Duration::from_secs(5));
-        tap.log("INFO", "after".into());
+        assert!(tap.log(2, "INFO", "after".into()).is_none());
         for ev in events() {
             tap.event(ev);
         }
@@ -486,9 +504,8 @@ fn events_cap_truncates() {
     let file = std::fs::File::create(dir.path().join(files::EVENTS)).expect("events");
     let rec = recorder_with(dir.path(), Box::new(file), Faults::default());
     let tap = rec.tap();
-    let big = "x".repeat(1024 * 1024);
     for _ in 0..70 {
-        tap.log("INFO", big.clone());
+        tap.event(big_event());
     }
     tap.event(events().remove(0));
     rec.finish(Some(0), false, Duration::from_secs(10));
@@ -524,40 +541,43 @@ fn events_cap_truncates() {
 }
 
 /// Past the cap, the view records a truncated session still needs at its end
-/// are written: the failure report, a label change, the prompt's clear and
-/// `Finished`. A prompt itself, a log line and a build event are not.
+/// are written: the failure report, a label change, every approval prompt
+/// (its notices' sources, its clear, the standing decision) and `Finished`, and
+/// log lines (a replay reads them). A build event is not.
 #[test]
 fn events_cap_keeps_the_ending_view_records() {
     let dir = tempfile::tempdir().expect("tempdir");
     let file = std::fs::File::create(dir.path().join(files::EVENTS)).expect("events");
     let rec = recorder_with(dir.path(), Box::new(file), Faults::default());
     let tap = rec.tap();
-    let big = "x".repeat(1024 * 1024);
     for _ in 0..70 {
-        tap.log("INFO", big.clone());
+        tap.event(big_event());
     }
-    let prompt = SessionRecordKind::Approval {
-        prompt: Some(Box::new(ApprovalPrompt {
-            addr: "//a:gate".into(),
-            ..ApprovalPrompt::default()
-        })),
-    };
     let kept = [
+        SessionRecordKind::Approval {
+            prompt: Some(Box::new(ApprovalPrompt {
+                addr: "//a:gate".into(),
+                ..ApprovalPrompt::default()
+            })),
+            standing: None,
+        },
         SessionRecordKind::Label {
             label: "run //a:... (4 matched)".into(),
         },
-        SessionRecordKind::Approval { prompt: None },
+        SessionRecordKind::Approval {
+            prompt: None,
+            standing: Some(ApprovalStanding::Approve),
+        },
         SessionRecordKind::Finished,
         SessionRecordKind::Output {
             text: "failed: //a:bad\n".into(),
         },
     ];
-    tap.view(1, prompt);
     tap.event(events().remove(0));
     for kind in kept.iter().cloned() {
         tap.view(1, kind);
     }
-    tap.log("INFO", "after the cap".into());
+    assert!(tap.log(1, "INFO", "after the cap".into()).is_none());
     rec.finish(Some(1), false, Duration::from_secs(10));
 
     let (records, _) = read_records(dir.path());
@@ -572,6 +592,11 @@ fn events_cap_keeps_the_ending_view_records() {
     let kinds: Vec<_> = tail.iter().filter_map(|r| r.session.clone()).collect();
     let mut want = vec![SessionRecordKind::Truncated];
     want.extend(kept);
+    want.push(SessionRecordKind::Log {
+        level: "INFO".into(),
+        msg: "after the cap".into(),
+        seq: Some(1),
+    });
     want.push(SessionRecordKind::End {
         exit_code: Some(1),
         panicked: false,
@@ -597,6 +622,7 @@ fn status_json_is_capped_through_the_recorder() {
     let start = |addr: &str| {
         tap.event(ev(BuildEventKind::ResultStart { addr: addr.into() }));
         tap.event(ev(BuildEventKind::ExecuteStart {
+            output_groups: Vec::new(),
             addr: addr.into(),
             driver: "exec".into(),
             cache: true,
@@ -808,17 +834,63 @@ async fn viewer_does_not_record_itself() {
     assert_eq!(entries(home.path()), 0, "not even ~/.heph");
 }
 
-/// A4: `HEPH_NO_SESSION=1` writes nothing.
-#[tokio::test]
-async fn no_session_env_writes_nothing() {
+/// What a `kill -9` leaves of a private session: its directory, a free lock,
+/// records and no `End`.
+fn killed_private_session(private: &Path) -> std::path::PathBuf {
+    let id = SessionId::new(hcore::events::now_unix_ms(), 7);
+    let dir = private.join(id.encode());
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(dir.join(files::LOCK), b"").expect("lock");
+    std::fs::write(dir.join(files::EVENTS), b"{}\n").expect("events");
+    dir
+}
+
+/// `HEPH_NO_SESSION=1` (injected through `from_env`: never `set_var` in a
+/// shared test binary) records into a private directory, outside the
+/// sessions root the session list reads, so it is not listed, even beside a
+/// public session that is; a public start leaves it alone while it is live,
+/// and it is removed when the session finishes. After a `kill -9` (its
+/// directory left with the lock free), the next start sweeps it, whether
+/// that run records publicly or privately.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_session_private_dir() {
     let home = tempfile::tempdir().expect("tempdir");
     let slot = Arc::new(SessionSlot::new());
     let root = SessionRoot::from_env(Some("1".as_ref()), Some(home.path().as_os_str()));
-    assert_eq!(root, Ok(None));
+    let private = home.path().join(".heph").join(PRIVATE_SESSIONS_DIR);
+    assert_eq!(root, Ok(Some(SessionRoot::private(&private))));
     slot.configure(root, Vec::new());
     assert!(run_in(&slot, true).await);
-    assert!(slot.dir().is_none());
-    assert_eq!(entries(home.path()), 0);
+    let dir = slot.dir().expect("a private session");
+    assert!(dir.starts_with(&private), "{}", dir.display());
+    assert!(!home.path().join(".heph").join(SESSIONS_DIR).exists());
+
+    let public = SessionRoot::for_reading(Some(home.path().as_os_str())).expect("home");
+    let other = Session::open(&public, start()).expect("open");
+    let listed = FileSource::new(public.path()).list().await.expect("list");
+    let ids: Vec<SessionId> = listed.iter().map(|e| e.id).collect();
+    assert_eq!(ids, vec![other.id()], "only the public session is listed");
+    // `End` is acknowledged after the start's sweep, which ran first.
+    other.finish(Some(0), false);
+    assert!(dir.exists(), "a live private session is never swept");
+
+    slot.finish(Some(0));
+    assert!(!dir.exists(), "removed at exit");
+
+    for next in [public, SessionRoot::private(&private)] {
+        let killed = killed_private_session(&private);
+        let session = Session::open(&next, start()).expect("open");
+        session.finish(Some(0), false);
+        assert!(
+            !killed.exists(),
+            "a {} start sweeps a killed private session",
+            if next.is_private() {
+                "private"
+            } else {
+                "public"
+            }
+        );
+    }
 }
 
 /// A4: no `HOME` means no session, and the build still runs.

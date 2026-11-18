@@ -169,6 +169,9 @@ pub struct GcStats {
     /// (`<home>/sandbox/<pkg>/__invoke/<name>/<random>` whose `.owner` lock
     /// was free).
     pub invoke_sandboxes_removed: usize,
+    /// `<home>/runs/<id>/` run-log directories of hephs that ended without
+    /// removing them (their `lock` was free), and stale `.new-`/tomb leftovers.
+    pub run_log_dirs_removed: usize,
     /// The sweep's last step, over `cache.db` itself: converting a database
     /// with `auto_vacuum = NONE` or vacuuming an `INCREMENTAL` one. `None` when
     /// the pass failed (logged, never fatal).
@@ -699,6 +702,10 @@ impl Engine {
         stats.invoke_sandboxes_removed =
             hcore::blocking::run(move || crate::engine::invoke_sandbox::sweep_all(&sandbox_root))
                 .await;
+
+        // Run logs of hephs that have ended (or were killed): a live one
+        // holds its directory's lock and is skipped.
+        stats.run_log_dirs_removed = hcore::blocking::run(self.run_logs.sweeper()).await;
 
         // Last, so the pages every deletion above freed are returned too.
         // Never fatal: the sweep's work is done whether the file shrinks or not.

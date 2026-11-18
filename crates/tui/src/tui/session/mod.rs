@@ -11,6 +11,8 @@
 //! - [`reader`]: [`RecordReader`], reading `events.ndjson` back (torn lines
 //!   wait, bad lines are skipped and counted).
 //! - [`cleanup`]: removing ended sessions, at session start only.
+//! - [`run_logs`]: finding a running target's live log through the sessions
+//!   that recorded it ([`find_run_log`]).
 //! - [`SessionSlot`]: the process's one session. `main` builds it and hands it
 //!   to whoever needs it — every command, which passes it to `new_engine` and
 //!   `run_app` as their own argument; the [`LogSink`](crate::tui::LogSink),
@@ -34,8 +36,11 @@ pub mod id;
 pub mod lockfile;
 pub mod reader;
 pub mod recorder;
+pub mod run_logs;
 pub mod source;
 
+#[cfg(test)]
+mod replay_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -51,14 +56,19 @@ use std::sync::{Mutex, PoisonError};
 
 pub use feed::{Routed, SessionFeed};
 pub use format::{
-    ApprovalPrompt, ApprovalPromptNotice, CAPABILITY_INFLIGHT, HeaderKind, META_FORMAT,
+    ApprovalPrompt, ApprovalPromptNotice, ApprovalStanding, CAPABILITY_INFLIGHT,
+    CAPABILITY_RUN_LOGS, HeaderKind, META_FORMAT, NoticeUnavailable, RunLogRecord,
     SNAPSHOT_VERSION, STATUS_LIST_CAP, SessionHeader, SessionMeta, SessionRecord,
     SessionRecordKind, SessionSnapshot, files,
 };
 pub use holder::{HolderNames, holder_session};
 pub use id::SessionId;
 pub use reader::RecordReader;
-pub use recorder::{Recorder, SessionTap, TappedReceiver};
+pub use recorder::{FlushFailed, Recorder, SessionTap, StopNotice, TappedReceiver};
+pub use run_logs::{
+    FoundRunLog, RunLogLookup, SessionRunLog, SessionRunLogLocator, find_run_log, lookup_run_log,
+    session_run_log,
+};
 pub use source::{EntryMeta, FileSource, SessionEntry, SessionItem, SessionSource};
 
 use cleanup::Retention;
@@ -67,22 +77,59 @@ use recorder::{Faults, RecorderStart};
 /// The directory under `~/.heph` holding every session.
 pub const SESSIONS_DIR: &str = "sessions";
 
+/// The directory under `~/.heph` holding the private sessions of runs with
+/// `HEPH_NO_SESSION` set. No viewer reads it.
+pub const PRIVATE_SESSIONS_DIR: &str = "private-sessions";
+
 /// The directory sessions are recorded under (`~/.heph/sessions` in the
-/// binary; a temp dir in a test).
+/// binary; a temp dir in a test), or the private one.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionRoot(PathBuf);
+pub struct SessionRoot {
+    path: PathBuf,
+    private: bool,
+}
 
 impl SessionRoot {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self(path.into())
+        Self {
+            path: path.into(),
+            private: false,
+        }
+    }
+
+    /// A root for private sessions (`HEPH_NO_SESSION=1`): what is recorded
+    /// there serves only this process — its replay of its own lines after a
+    /// full screen — and is removed at exit. `heph session list` and
+    /// `attach` never read it, and an ended one is swept by the next session
+    /// that starts, whatever its age.
+    pub fn private(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            private: true,
+        }
     }
 
     pub fn path(&self) -> &Path {
-        &self.0
+        &self.path
+    }
+
+    pub fn is_private(&self) -> bool {
+        self.private
+    }
+
+    /// Where private sessions go beside this public root, to be swept.
+    fn private_sibling(&self) -> Option<PathBuf> {
+        if self.private {
+            return None;
+        }
+        self.path
+            .parent()
+            .map(|parent| parent.join(PRIVATE_SESSIONS_DIR))
     }
 
     /// The root from the two environment values the front end read:
-    /// `HEPH_NO_SESSION` and `HOME`. `Ok(None)`: recording is switched off.
+    /// `HEPH_NO_SESSION` and `HOME`. `HEPH_NO_SESSION` makes it a private
+    /// root (or `Ok(None)` without `HOME`, which then records nothing).
     /// `Err`: it cannot be recorded (no `HOME`), said once at the first run.
     ///
     /// `HEPH_NO_SESSION` is off when unset, empty, `0`, or `false`/`no`/`off` in
@@ -92,10 +139,12 @@ impl SessionRoot {
         home: Option<&OsStr>,
     ) -> Result<Option<Self>, String> {
         if switched_on(no_session) {
-            return Ok(None);
+            return Ok(hcore::userdir::heph_user_dir_from(home)
+                .ok()
+                .map(|dir| Self::private(dir.join(PRIVATE_SESSIONS_DIR))));
         }
         hcore::userdir::heph_user_dir_from(home)
-            .map(|dir| Some(Self(dir.join(SESSIONS_DIR))))
+            .map(|dir| Some(Self::new(dir.join(SESSIONS_DIR))))
             .map_err(|e| format!("{e:#}"))
     }
 
@@ -105,7 +154,17 @@ impl SessionRoot {
     pub fn for_reading(home: Option<&OsStr>) -> Option<Self> {
         hcore::userdir::heph_user_dir_from(home)
             .ok()
-            .map(|dir| Self(dir.join(SESSIONS_DIR)))
+            .map(|dir| Self::new(dir.join(SESSIONS_DIR)))
+    }
+}
+
+/// What a private root's cleanup keeps: no ended session, whatever its age.
+/// A directory still being created (no lock yet, young) is left alone.
+fn private_retention() -> Retention {
+    Retention {
+        max_ended: 0,
+        max_bytes: 0,
+        ..Retention::default()
     }
 }
 
@@ -137,6 +196,17 @@ pub struct Session {
     id: SessionId,
     dir: PathBuf,
     recorder: Recorder,
+    /// Under a private root: removed when finished.
+    private: bool,
+}
+
+/// What a new session's recorder cleans before it records.
+struct Cleanups {
+    /// For the session's own root.
+    retention: Retention,
+    /// The private root beside a public one, swept of every ended session: a
+    /// killed `HEPH_NO_SESSION` run's directory goes at the next start.
+    private_root: Option<PathBuf>,
 }
 
 impl Session {
@@ -169,7 +239,15 @@ impl Session {
             create_session_dir(root_dir, started, id::random_byte).with_context(|| {
                 format!("creating a session directory under {}", root_dir.display())
             })?;
-        Self::populate(root_dir, id, dir.clone(), start, retention, faults).inspect_err(|_| {
+        let cleanups = Cleanups {
+            retention: if root.is_private() {
+                private_retention()
+            } else {
+                retention
+            },
+            private_root: root.private_sibling(),
+        };
+        Self::populate(root, id, dir.clone(), start, cleanups, faults).inspect_err(|_| {
             // Nothing holds it: the lock (if taken) was dropped with the error.
             if let Err(e) = std::fs::remove_dir_all(&dir) {
                 tracing::debug!(dir = %dir.display(), error = %e, "cannot remove a session directory");
@@ -181,11 +259,11 @@ impl Session {
     /// never sees `meta.json` with a free lock and no `End` (a "lost" session)
     /// for one being created.
     fn populate(
-        root_dir: &Path,
+        root: &SessionRoot,
         id: SessionId,
         dir: PathBuf,
         start: SessionStart,
-        retention: Retention,
+        cleanups: Cleanups,
         faults: Faults,
     ) -> anyhow::Result<Self> {
         if faults.fail_lock {
@@ -206,7 +284,10 @@ impl Session {
             label: start.header.label,
             header: start.header.kind,
             interactive: start.interactive,
-            capabilities: vec![CAPABILITY_INFLIGHT.to_owned()],
+            capabilities: vec![
+                CAPABILITY_INFLIGHT.to_owned(),
+                CAPABILITY_RUN_LOGS.to_owned(),
+            ],
         };
         recorder::write_atomically(&dir, files::META, &meta).context("writing meta.json")?;
         let events = OpenOptions::new()
@@ -217,14 +298,20 @@ impl Session {
             .context("creating events.ndjson")?;
         let recorder = Recorder::spawn(RecorderStart {
             dir: dir.clone(),
-            root: root_dir.to_path_buf(),
+            root: root.path().to_path_buf(),
             lock,
             events: Box::new(events),
-            retention,
+            retention: cleanups.retention,
+            private_root: cleanups.private_root,
             faults,
         })
         .context("starting the session recorder")?;
-        Ok(Self { id, dir, recorder })
+        Ok(Self {
+            id,
+            dir,
+            recorder,
+            private: root.is_private(),
+        })
     }
 
     pub fn id(&self) -> SessionId {
@@ -239,10 +326,23 @@ impl Session {
         self.recorder.tap()
     }
 
-    /// Write `End` and release the lock. See [`Recorder::finish`].
+    /// Write `End` and release the lock. See [`Recorder::finish`]. A private
+    /// session's directory is then removed: nothing reads it after its owner.
     pub fn finish(&self, exit_code: Option<i32>, panicked: bool) {
         self.recorder
             .finish(exit_code, panicked, recorder::FINISH_TIMEOUT);
+        if self.private
+            && let Err(e) = std::fs::remove_dir_all(&self.dir)
+            && e.kind() != io::ErrorKind::NotFound
+        {
+            // The next session's start sweeps it.
+            tracing::debug!(dir = %self.dir.display(), error = %e, "cannot remove a private session");
+        }
+    }
+
+    /// Whether this session is private (`HEPH_NO_SESSION`).
+    pub fn is_private(&self) -> bool {
+        self.private
     }
 }
 
@@ -318,6 +418,9 @@ pub struct OpenedSession {
     pub tap: SessionTap,
     /// This call opened it (the first `run_app` of the process).
     pub fresh: bool,
+    /// A private session (`HEPH_NO_SESSION`): no other terminal can attach
+    /// to it, so its id is not worth printing.
+    pub private: bool,
 }
 
 impl Default for SessionSlot {
@@ -362,8 +465,8 @@ impl SessionSlot {
     pub fn holder_names(&self) -> holder::HolderNames {
         self.with(|s| {
             let root = s.lookup.clone().or_else(|| match &s.setup {
-                Setup::Root(root) => Some(root.clone()),
-                Setup::Unconfigured | Setup::Off | Setup::Unavailable(_) => None,
+                Setup::Root(root) if !root.is_private() => Some(root.clone()),
+                Setup::Root(_) | Setup::Unconfigured | Setup::Off | Setup::Unavailable(_) => None,
             });
             holder::HolderNames::new(root, s.session.as_ref().map(|x| x.id()))
         })
@@ -391,6 +494,7 @@ impl SessionSlot {
                     id: session.id(),
                     tap: session.tap(),
                     fresh: false,
+                    private: session.is_private(),
                 })));
             }
             if s.attempted {
@@ -438,9 +542,20 @@ impl SessionSlot {
             id: session.id(),
             tap: session.tap(),
             fresh: true,
+            private: session.is_private(),
         };
         self.with(|s| s.session = Some(session));
         Some(opened)
+    }
+
+    /// Hold `session` as [`open`](Self::open) would: a test's session opened
+    /// with injected faults.
+    #[cfg(test)]
+    pub(crate) fn install(&self, session: Session) {
+        self.with(|s| {
+            s.attempted = true;
+            s.session = Some(std::sync::Arc::new(session));
+        });
     }
 
     /// The open session's directory, if any.
@@ -460,17 +575,30 @@ impl SessionSlot {
         }
     }
 
-    /// Record a formatted log line of `level` (design amendment A11). Lossy
-    /// UTF-8, verbatim otherwise: a viewer escapes control bytes when it
-    /// prints. Nothing when no session is open or its recording stopped.
-    pub fn record_log(&self, level: &'static str, line: &[u8]) {
-        if let Some(tap) = self.tap()
-            && !tap.is_stopped()
-        {
-            let text = String::from_utf8_lossy(line);
-            let text = text.strip_suffix('\n').unwrap_or(&text);
-            tap.log(level, text.to_owned());
+    /// Record line `seq` of the log sink, formatted, of `level` (empty for a
+    /// diagnostic; design amendment A11). Lossy UTF-8, verbatim otherwise: a
+    /// viewer escapes control bytes when it prints. Nothing when no session
+    /// is open or its recording stopped. Called inside the sink's lock, so it
+    /// never logs: a stop it latched is returned for the sink to report.
+    #[must_use = "a latched stop must be reported outside the sink's lock"]
+    pub fn record_log(&self, seq: u64, level: &'static str, line: &[u8]) -> Option<StopNotice> {
+        let tap = self.tap()?;
+        if tap.is_stopped() {
+            return None;
         }
+        let text = String::from_utf8_lossy(line);
+        let text = text.strip_suffix('\n').unwrap_or(&text);
+        tap.log(seq, level, text.to_owned())
+    }
+
+    /// The open session's tap and its `events.ndjson`, for a replay of the
+    /// sink's lines. `None` when no session is open.
+    pub(crate) fn replay_source(&self) -> Option<(SessionTap, PathBuf)> {
+        self.with(|s| {
+            s.session
+                .as_ref()
+                .map(|x| (x.tap(), x.dir().join(files::EVENTS)))
+        })
     }
 
     /// Record text the process just wrote straight to its terminal (the
@@ -507,6 +635,19 @@ impl SessionSlot {
     pub fn finish_panicked(&self) {
         if let Some(session) = self.with(|s| s.session.clone()) {
             session.finish(None, true);
+        }
+    }
+}
+
+/// The engine announces each run's live log here
+/// (`Engine::set_run_log_announcer`); it is recorded as a `RunLog` record of
+/// the open session, past the cap too. One channel push; nothing when no
+/// session is open or its recording stopped. Carries no session id: the
+/// engine never learns it (I1).
+impl hcore::session_record::RunLogAnnouncer for SessionSlot {
+    fn run_log_created(&self, record: RunLogRecord) {
+        if let Some(tap) = self.tap() {
+            tap.run_log(record);
         }
     }
 }

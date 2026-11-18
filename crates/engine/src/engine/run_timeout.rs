@@ -177,6 +177,15 @@ async fn deadline(clock: Option<watch::Receiver<RunClockState>>, timeout: Durati
     }
 }
 
+/// Aborts [`enforce`]'s watchdog task however `enforce` ends.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Await `run`, which was started with `run_token`, holding it to `timeout`.
 ///
 /// `parent` (the request's token) cancelling is forwarded into `run_token`,
@@ -204,12 +213,33 @@ pub(crate) async fn enforce<T>(
         token: run_token,
         armed: true,
     };
+    // The deadline and the request's cancellation are also watched from a
+    // task of their own. A run may hold its thread rather than return
+    // `Pending` — exec's output tee on macOS parks in `block_in_place` while
+    // the target's pipes are open — and then the `select!` below is not
+    // polled until it lets go: without the watchdog a run was stopped only
+    // once it closed its output, and one that returned in that same poll
+    // was reported as its own result. Cancelling the token is what makes
+    // such a run let go (exec's process wait, on a task of its own, kills
+    // the process group). Aborted when `enforce` ends, so it never touches
+    // the token of a run that finished. It waits on the same deadline as the
+    // `select!`, on its own receiver of the run's clock: a clock that never
+    // starts, or stops, never times the run out from here either.
+    let _watchdog = AbortOnDrop(tokio::spawn(enclose::enclose!(
+        (run_token => token, parent, clock => watched) async move {
+            tokio::select! {
+                biased;
+                () = parent.cancelled() => token.cancel(),
+                () = deadline(watched, timeout.duration()) => token.cancel_timed_out(),
+            }
+        }
+    )));
     tokio::pin!(run);
     // Biased, the request's cancellation first: a request already cancelled
     // never gives the driver a poll with a live token. Then the run, so a run
     // that finished is reported as finished however late the timeout became
-    // ready in the same poll.
-    tokio::select! {
+    // ready in the same poll — unless the watchdog had already stopped it.
+    let stopped = tokio::select! {
         biased;
         () = parent.cancelled() => {
             run_token.cancel();
@@ -219,16 +249,26 @@ pub(crate) async fn enforce<T>(
         }
         out = &mut run => {
             guard.armed = false;
-            return out;
+            // The watchdog cancelled it at its timeout while it held its
+            // thread: it returned because it was stopped. A request cancel
+            // the watchdog forwarded is not a timeout, and is returned as is.
+            if !run_token.timed_out() {
+                return out;
+            }
+            Some(out)
         }
-        () = deadline(clock, timeout.duration()) => {}
-    }
+        () = deadline(clock, timeout.duration()) => None,
+    };
 
     // Timed out, and the token says so: the managed layer keeps a timed-out
     // run's `failure_out` and nothing of a cancelled one's, and a cdylib's
     // token hears it across the seam (`StableCancel::cancel_timed_out`).
     run_token.cancel_timed_out();
-    let (abandoned_after, artifacts) = match tokio::time::timeout(grace, &mut run).await {
+    let returned = match stopped {
+        Some(out) => Ok(out),
+        None => tokio::time::timeout(grace, &mut run).await,
+    };
+    let (abandoned_after, artifacts) = match returned {
         // Even an `Ok` is a timeout: the run returned only because it was
         // stopped, and whatever it produced is not what a finished run would.
         Ok(Ok(_discarded)) => (None, Vec::new()),
@@ -535,6 +575,141 @@ mod tests {
         assert!(polled.is_err(), "still running at 1s");
         assert!(held.is_cancelled(), "dropping enforce cancels the run");
         assert!(!parent.is_cancelled(), "only this run, not the request");
+    }
+
+    /// A run that holds its thread until its token is cancelled, as exec's
+    /// output tee does on macOS: it parks in `block_in_place` on a condvar
+    /// that re-checks a flag, and is never `Pending` while the target's pipes
+    /// are open. `at_most` bounds it, so a test that regresses fails rather
+    /// than hangs.
+    fn parked(token: &StdCancellationToken, at_most: Duration) -> anyhow::Result<()> {
+        let until = std::time::Instant::now() + at_most;
+        tokio::task::block_in_place(|| {
+            while !token.is_cancelled() && std::time::Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        if token.is_cancelled() {
+            Err(hplugin::error::CancelledError.into())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// A run that never yields still has its token cancelled at its timeout,
+    /// and fails as timed out: the clock does not wait for the run to give
+    /// `enforce` a poll. Before, a macOS exec run was stopped only once its
+    /// output pipes closed, and one that ran on past its timeout and then
+    /// returned in a single poll was reported as its own result.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_run_that_holds_its_thread_is_stopped_at_its_timeout() {
+        let parent = StdCancellationToken::new();
+        let token = StdCancellationToken::new();
+        let started = std::time::Instant::now();
+        let err = enforce(
+            async { parked(&token, Duration::from_secs(30)) },
+            &token,
+            &parent,
+            &addr(),
+            Timeout::from_millis(200).expect("timeout"),
+            GRACE,
+            None,
+        )
+        .await
+        .expect_err("times out");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "stopped at its timeout, not when the run let go: {:?}",
+            started.elapsed()
+        );
+        assert!(token.timed_out(), "told why: its timeout");
+        assert!(is_timed_out(&err), "{err:#}");
+        assert!(!is_abandoned(&err), "it returned once told: {err:#}");
+        assert!(!hplugin::error::is_cancelled(&err), "{err:#}");
+    }
+
+    /// The request's cancellation reaches a timed run that never yields, as
+    /// it reaches an untimed one (handed the request's token directly): it
+    /// is not held until the run lets go of its thread.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_cancel_reaches_a_run_that_holds_its_thread() {
+        let parent = StdCancellationToken::new();
+        let token = StdCancellationToken::new();
+        let canceller = parent.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            canceller.cancel();
+        });
+        let started = std::time::Instant::now();
+        let err = enforce(
+            async { parked(&token, Duration::from_secs(30)) },
+            &token,
+            &parent,
+            &addr(),
+            secs(3600),
+            GRACE,
+            None,
+        )
+        .await
+        .expect_err("cancelled");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(token.is_cancelled() && !token.timed_out());
+        assert!(!is_timed_out(&err), "a cancel, not a timeout: {err:#}");
+        assert!(hplugin::error::is_cancelled(&err), "{err:#}");
+    }
+
+    /// The watchdog runs on the run's clock: a run that holds its thread
+    /// after starting its clock is stopped at its timeout from the start, and
+    /// one that holds it after stopping its clock is never timed out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_watchdog_runs_on_the_run_clock() {
+        let parent = StdCancellationToken::new();
+        let token = StdCancellationToken::new();
+        let (clock, reader) = hplugin::driver::RunClock::new();
+        let started = std::time::Instant::now();
+        let err = enforce(
+            async {
+                clock.start();
+                parked(&token, Duration::from_secs(30))
+            },
+            &token,
+            &parent,
+            &addr(),
+            Timeout::from_millis(200).expect("timeout"),
+            GRACE,
+            Some(reader),
+        )
+        .await
+        .expect_err("times out");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "stopped at its timeout, not when the run let go: {:?}",
+            started.elapsed()
+        );
+        assert!(is_timed_out(&err), "{err:#}");
+
+        let token = StdCancellationToken::new();
+        let (clock, reader) = hplugin::driver::RunClock::new();
+        let out = enforce(
+            async {
+                clock.start();
+                clock.stop();
+                parked(&token, Duration::from_millis(600))
+            },
+            &token,
+            &parent,
+            &addr(),
+            Timeout::from_millis(200).expect("timeout"),
+            GRACE,
+            Some(reader),
+        )
+        .await;
+        assert!(out.is_ok(), "a stopped clock never times out: {out:?}");
+        assert!(!token.is_cancelled());
     }
 
     /// The longest timeout the wire can carry does not overflow the deadline

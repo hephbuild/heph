@@ -48,18 +48,40 @@ impl<R: Read> RecordReader<R> {
     /// The next complete record, or `None` when the source has nothing more
     /// right now (a trailing partial line stays buffered for the next call).
     pub fn next_record(&mut self) -> io::Result<Option<SessionRecord>> {
+        self.next_filtered(None)
+    }
+
+    /// [`next_record`](Self::next_record), passing over every complete line
+    /// in which `needle` finds nothing without decoding it (nor counting it
+    /// as skipped). A cheap prefilter for a reader after one kind of record:
+    /// a line it does find in is decoded as usual, so a false positive costs
+    /// a decode and never a wrong record.
+    pub fn next_containing(
+        &mut self,
+        needle: &memchr::memmem::Finder<'_>,
+    ) -> io::Result<Option<SessionRecord>> {
+        self.next_filtered(Some(needle))
+    }
+
+    fn next_filtered(
+        &mut self,
+        needle: Option<&memchr::memmem::Finder<'_>>,
+    ) -> io::Result<Option<SessionRecord>> {
         loop {
             let newline = self
                 .buf
                 .get(self.scanned..)
-                .and_then(|rest| rest.iter().position(|&b| b == b'\n'));
+                .and_then(|rest| memchr::memchr(b'\n', rest));
             if let Some(rel) = newline {
                 let end = self.scanned + rel;
-                let decoded = self.buf.get(self.start..end).map(decode_line);
+                let decoded = self.buf.get(self.start..end).map(|line| match needle {
+                    Some(needle) if needle.find(line).is_none() => Decoded::Empty,
+                    _ => decode_line(line),
+                });
                 self.start = end + 1;
                 self.scanned = self.start;
                 match decoded {
-                    Some(Decoded::Record(r)) => return Ok(Some(r)),
+                    Some(Decoded::Record(r)) => return Ok(Some(*r)),
                     Some(Decoded::Empty) | None => {}
                     Some(Decoded::Bad) => self.skipped += 1,
                 }
@@ -112,7 +134,8 @@ impl<R: Read> RecordReader<R> {
 }
 
 enum Decoded {
-    Record(SessionRecord),
+    /// Boxed: a record is an order of magnitude bigger than the other two.
+    Record(Box<SessionRecord>),
     /// Blank, or a record that carries neither key.
     Empty,
     Bad,
@@ -124,7 +147,7 @@ fn decode_line(line: &[u8]) -> Decoded {
     }
     match serde_json::from_slice::<SessionRecord>(line) {
         Ok(r) if r.kind.is_none() && r.session.is_none() => Decoded::Empty,
-        Ok(r) => Decoded::Record(r),
+        Ok(r) => Decoded::Record(Box::new(r)),
         Err(_) => Decoded::Bad,
     }
 }
@@ -200,6 +223,26 @@ mod tests {
         );
     }
 
+    /// `next_containing` never decodes a line its needle misses: a bad line
+    /// without it is not counted as skipped, one with it is, and a record
+    /// carrying the needle is returned.
+    #[test]
+    fn next_containing_decodes_only_what_the_needle_finds() {
+        let bytes = concat!(
+            "{\"at_unix_ms\":1,\"kind\":{\"type\":\"ResultStart\",\"addr\":\"//a:b\"}}\n",
+            "not json, no needle\n",
+            "not json, but \"type\":\"Log\"\n",
+            "{\"at_unix_ms\":2,\"session\":{\"type\":\"Log\",\"level\":\"INFO\",\"msg\":\"m\"}}\n",
+            "{\"at_unix_ms\":3,\"session\":{\"type\":\"Truncated\"}}\n",
+        );
+        let needle = memchr::memmem::Finder::new(br#""type":"Log""#);
+        let mut r = RecordReader::new(std::io::Cursor::new(bytes.as_bytes().to_vec()));
+        let rec = r.next_containing(&needle).expect("read").expect("the Log");
+        assert_eq!(rec.at_unix_ms, 2);
+        assert!(r.next_containing(&needle).expect("read").is_none());
+        assert_eq!(r.skipped(), 1, "only the bad line the needle found");
+    }
+
     /// No truncating cap: a record far longer than a read chunk is one record.
     #[test]
     fn a_line_over_one_mib_is_parsed() {
@@ -209,6 +252,7 @@ mod tests {
             SessionRecordKind::Log {
                 level: "INFO".into(),
                 msg: msg.clone(),
+                seq: None,
             },
         ))
         .expect("encode");
@@ -220,7 +264,8 @@ mod tests {
             rec.session,
             Some(SessionRecordKind::Log {
                 level: "INFO".into(),
-                msg
+                msg,
+                seq: None,
             })
         );
         assert!(r.next_record().expect("read").is_none());

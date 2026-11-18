@@ -23,3 +23,6 @@ stabby = "72.1.8"
 anyhow = "1.0.102"
 async-trait = "0.1"
 tracing = "0.1"
+# `stream`: its writers are `AsyncWrite`s, and its gate waits on a thread whose
+# answer comes back through a oneshot — a cdylib has no reactor for a timer.
+tokio = { version = "1.52", features = ["sync", "io-util"] }

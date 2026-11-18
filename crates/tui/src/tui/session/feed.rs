@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use hcore::events::BuildEvent;
 
-use super::format::{ApprovalPrompt, SessionRecord, SessionRecordKind};
+use super::format::{ApprovalPrompt, ApprovalStanding, SessionRecord, SessionRecordKind};
 
 /// The recorded view state an attached [`TuiProgressView`] reads while it
 /// renders. Cloned between the app that routes records and the view.
@@ -29,6 +29,8 @@ struct FeedState {
     /// own label, from `meta.json`, stands).
     label: Option<String>,
     approval: Option<ApprovalPrompt>,
+    /// The standing Y/N decision, from the press until the build ends.
+    standing: Option<ApprovalStanding>,
     /// `Finished`'s time: the clock the run's final summary used.
     finished_at_ms: Option<u64>,
     /// `End`'s time: the fallback clock when no `Finished` was recorded (a
@@ -80,21 +82,26 @@ impl SessionFeed {
                 s.label = Some(label);
                 return Routed::Nothing;
             }
-            SessionRecordKind::Approval { prompt } => {
+            SessionRecordKind::Approval { prompt, standing } => {
                 s.approval = prompt.map(|p| *p);
+                s.standing = standing;
                 return Routed::Nothing;
             }
             SessionRecordKind::Finished => {
                 s.finished_at_ms = Some(at);
-                // Torn down: no prompt is on screen any more.
+                // Torn down: no prompt is on screen any more, and the build
+                // a standing decision covered is over.
                 s.approval = None;
+                s.standing = None;
                 return Routed::Nothing;
             }
             SessionRecordKind::End { .. } => {
                 s.ended_at_ms = Some(at);
                 return Routed::Nothing;
             }
-            SessionRecordKind::Truncated
+            // Where a run's log is, for a log reader; nothing a TUI prints.
+            SessionRecordKind::RunLog(_)
+            | SessionRecordKind::Truncated
             | SessionRecordKind::InflightWritten
             | SessionRecordKind::Unknown => return Routed::Nothing,
         };
@@ -117,6 +124,11 @@ impl SessionFeed {
         self.lock().approval.clone()
     }
 
+    /// The standing Y/N decision in force, for the indicator.
+    pub fn approval_standing(&self) -> Option<ApprovalStanding> {
+        self.lock().standing
+    }
+
     /// The instant the run's final summary was measured against: its
     /// `Finished`, else its `End`. `None` while the run goes on.
     pub fn finished_at_ms(&self) -> Option<u64> {
@@ -135,6 +147,7 @@ mod tests {
             SessionRecordKind::Log {
                 level: "INFO".into(),
                 msg: msg.into(),
+                seq: None,
             },
         )
     }
@@ -163,6 +176,7 @@ mod tests {
         };
         let approval = SessionRecordKind::Approval {
             prompt: Some(Box::new(prompt.clone())),
+            standing: Some(ApprovalStanding::Approve),
         };
         let routed: Vec<Routed> = [
             log(2, "before"),
@@ -178,6 +192,7 @@ mod tests {
         );
         assert_eq!(feed.label().as_deref(), Some("Invoking //a:b"));
         assert_eq!(feed.approval(), Some(prompt));
+        assert_eq!(feed.approval_standing(), Some(ApprovalStanding::Approve));
         assert_eq!(feed.finished_at_ms(), None, "still running");
 
         let end = SessionRecordKind::End {
@@ -201,6 +216,7 @@ mod tests {
             [("after", "late\n"), ("after", "× target failed\n")]
         );
         assert_eq!(feed.approval(), None, "torn down: no prompt on screen");
+        assert_eq!(feed.approval_standing(), None, "the build is over");
         assert_eq!(feed.finished_at_ms(), Some(10), "Finished, not End");
     }
 

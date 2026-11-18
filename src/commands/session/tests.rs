@@ -133,8 +133,12 @@ impl SessionSource for FakeSource {
             Some(SessionRecordKind::End { exit_code, .. }) => Some(exit_code),
             _ => None,
         });
-        let mut items: Vec<SessionItem> =
-            records.iter().cloned().map(SessionItem::Record).collect();
+        let mut items: Vec<SessionItem> = records
+            .iter()
+            .cloned()
+            .map(Box::new)
+            .map(SessionItem::Record)
+            .collect();
         items.push(SessionItem::CaughtUp { skipped: 0 });
         match (exit, e.live) {
             (Some(exit), _) => items.push(SessionItem::Ended { exit, lost: false }),
@@ -1298,6 +1302,7 @@ async fn attach_mirrors_the_session_exit() {
             SessionRecordKind::Log {
                 level: "INFO".to_owned(),
                 msg: "hello \u{1b}[2J".to_owned(),
+                seq: None,
             },
         ),
     );

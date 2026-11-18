@@ -930,3 +930,203 @@ async fn a_process_past_its_timeout_times_out_after_a_slow_preparation() -> anyh
     );
     Ok(())
 }
+
+/// The `ResultEnd` of `addr`'s timed-out run: its typed timeout and the log
+/// tail it carries.
+fn timed_out_end(
+    events: &[BuildEvent],
+    addr: &str,
+) -> (
+    Option<hcore::events::TimedOutData>,
+    Option<hcore::events::LogTailData>,
+) {
+    let ends: Vec<_> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            BuildEventKind::ResultEnd {
+                addr: a,
+                timed_out,
+                log_tail,
+                ..
+            } if a == addr => Some((timed_out.clone(), log_tail.clone())),
+            _ => None,
+        })
+        .collect();
+    let [end] = ends.as_slice() else {
+        panic!("one ResultEnd for {addr}, got {}", ends.len());
+    };
+    end.clone()
+}
+
+/// What a run prints before it outlasts its timeout: the lines the CI view
+/// shows under the failure's header.
+const CHATTY: &str = "for i in $(seq 1 30); do echo line $i; done; sleep 60; echo done > $OUT";
+
+/// A timed-out run's `ResultEnd` carries the last lines of what it printed,
+/// as any failure's does: the line backend prints them live under the
+/// "timed out" header. Stopped within its grace, the run fills its failure
+/// slot, and the tail comes from there.
+#[tokio::test]
+async fn a_timed_out_result_end_carries_its_log_tail() -> anyhow::Result<()> {
+    let ws = tempfile::tempdir()?;
+    write_build(
+        ws.path(),
+        &format!(
+            r#"target(name = "chatty", driver = "bash", run = "{CHATTY}", out = "out.txt", timeout = 1)"#
+        ),
+    );
+    let engine = engine(ws.path())?;
+
+    let (res, events) =
+        crate::common::run_drain_events(&engine, &Matcher::Addr(parse_addr("//p:chatty")?)).await;
+    assert!(res.is_err() || res.is_ok_and(|b| !b.errors.is_empty()));
+    let (timed_out, tail) = timed_out_end(&events, "//p:chatty");
+    assert_eq!(
+        timed_out,
+        Some(hcore::events::TimedOutData {
+            timeout_ms: 1000,
+            abandoned: false,
+        })
+    );
+    let tail = tail.expect("a timed-out run's tail");
+    let lines: Vec<&str> = tail.text.lines().collect();
+    assert_eq!(lines.last(), Some(&"line 30"), "{lines:?}");
+    assert_eq!(
+        lines.len(),
+        Engine::DEFAULT_LOG_TAIL_LINES,
+        "bounded to the request's tail size: {lines:?}"
+    );
+    Ok(())
+}
+
+/// An abandoned run's `ResultEnd` carries the last lines it printed before it
+/// was abandoned, read from its live log: the run never returned, so nothing
+/// it handed back can hold them.
+#[tokio::test]
+async fn an_abandoned_result_end_carries_its_log_tail() -> anyhow::Result<()> {
+    let ws = tempfile::tempdir()?;
+    write_build(
+        ws.path(),
+        &format!(
+            r#"target(name = "deaf", driver = "deaf", run = "{CHATTY}", out = "out.txt", timeout = 1)"#
+        ),
+    );
+    let engine = engine_with(ws.path(), |e| {
+        e.set_timeout_grace(Duration::from_millis(200));
+        e.register_managed_driver(|_| {
+            Box::new(DeafBash(pluginexec::Driver::new_bash().with_host_path()))
+        })
+    })?;
+
+    let (res, events) = tokio::time::timeout(
+        Duration::from_secs(30),
+        crate::common::run_drain_events(&engine, &Matcher::Addr(parse_addr("//p:deaf")?)),
+    )
+    .await
+    .expect("an abandoned run does not hang the build");
+    assert!(res.is_err() || res.is_ok_and(|b| !b.errors.is_empty()));
+    let (timed_out, tail) = timed_out_end(&events, "//p:deaf");
+    assert_eq!(
+        timed_out,
+        Some(hcore::events::TimedOutData {
+            timeout_ms: 1000,
+            abandoned: true,
+        })
+    );
+    let tail = tail.expect("an abandoned run's tail");
+    let lines: Vec<&str> = tail.text.lines().collect();
+    assert_eq!(lines.last(), Some(&"line 30"), "{lines:?}");
+    assert_eq!(lines.len(), Engine::DEFAULT_LOG_TAIL_LINES, "{lines:?}");
+    Ok(())
+}
+
+/// Build a bash target running `script` under a 1s timeout, as the binary
+/// does: on a multi-thread runtime. Returns how long the build took and the
+/// `ResultEnd`'s timeout and tail.
+///
+/// The other tests here run on a current-thread runtime, where exec's output
+/// tee awaits rather than parks, and so never saw that on macOS a run whose
+/// pipes stay open used to be stopped only once it closed them: `sleep 60`
+/// ran its minute, then failed as "timed out after 1s".
+async fn timed_out_on_multi_thread(
+    script: &str,
+) -> anyhow::Result<(
+    Duration,
+    Option<hcore::events::TimedOutData>,
+    Option<hcore::events::LogTailData>,
+)> {
+    let ws = tempfile::tempdir()?;
+    write_build(
+        ws.path(),
+        &format!(
+            "target(name = \"t\", driver = \"bash\", run = '''{script}''', out = \"out.txt\", timeout = 1)"
+        ),
+    );
+    let engine = engine(ws.path())?;
+    let started = Instant::now();
+    let (res, events) = tokio::time::timeout(
+        Duration::from_secs(120),
+        crate::common::run_drain_events(&engine, &Matcher::Addr(parse_addr("//p:t")?)),
+    )
+    .await
+    .expect("the build ends");
+    let took = started.elapsed();
+    assert!(res.is_err() || res.is_ok_and(|b| !b.errors.is_empty()));
+    let (timed_out, tail) = timed_out_end(&events, "//p:t");
+    Ok((took, timed_out, tail))
+}
+
+/// Well inside the engine's grace, and far from the minute the run would take.
+const STOPPED_WITHIN: Duration = Duration::from_secs(15);
+
+/// A run that keeps its pipes open is stopped at its timeout on the binary's
+/// runtime, not when it closes them, and keeps what it printed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_holding_its_pipes_is_stopped_at_its_timeout_on_a_multi_thread_runtime()
+-> anyhow::Result<()> {
+    let (took, timed_out, tail) =
+        timed_out_on_multi_thread("for i in $(seq 1 30); do echo line $i; done; sleep 60").await?;
+    assert!(
+        took < STOPPED_WITHIN,
+        "stopped at its timeout: took {took:?}"
+    );
+    assert_eq!(
+        timed_out,
+        Some(hcore::events::TimedOutData {
+            timeout_ms: 1000,
+            abandoned: false,
+        })
+    );
+    let tail = tail.expect("its tail");
+    assert_eq!(tail.text.lines().last(), Some("line 30"), "{tail:?}");
+    Ok(())
+}
+
+/// The shape of a test runner: a parent waiting on workers that share its
+/// output, and print on their way out when interrupted. Their lines, the
+/// last ones printed after the cancel included, reach the tail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_runners_workers_output_survives_its_timeout_on_a_multi_thread_runtime()
+-> anyhow::Result<()> {
+    let (took, timed_out, tail) = timed_out_on_multi_thread(
+        "( trap 'echo worker interrupted; exit 1' INT; \
+         for i in $(seq 1 30); do echo worker $i; done; sleep 60 & wait ) & wait",
+    )
+    .await?;
+    assert!(
+        took < STOPPED_WITHIN,
+        "stopped at its timeout: took {took:?}"
+    );
+    assert!(
+        timed_out.as_ref().is_some_and(|t| !t.abandoned),
+        "{timed_out:?}"
+    );
+    let tail = tail.expect("its tail");
+    assert!(tail.text.contains("worker 30"), "{tail:?}");
+    assert_eq!(
+        tail.text.lines().last(),
+        Some("worker interrupted"),
+        "{tail:?}"
+    );
+    Ok(())
+}

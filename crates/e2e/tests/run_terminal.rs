@@ -111,9 +111,12 @@ async fn run_with(ws: &Workspace, addr: &str, opts: ResultOptions) -> anyhow::Re
         .map(drop)
 }
 
+/// Every `log.txt` a run left: one a driver wrote in its sandbox, or the
+/// failure slot's copy of the engine's run log.
 fn log_files(ws: &Workspace) -> Vec<PathBuf> {
-    walk(&ws.engine.home.join("sandbox"))
+    ["sandbox", "failures"]
         .into_iter()
+        .flat_map(|d| walk(&ws.engine.home.join(d)))
         .filter(|p| p.file_name().is_some_and(|n| n == "log.txt"))
         .collect()
 }

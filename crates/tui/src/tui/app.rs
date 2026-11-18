@@ -318,6 +318,12 @@ pub trait TUIAppView: Send {
         None
     }
 
+    /// The standing Y/N approval decision in force, as a session records it.
+    /// `None` by default (no approval gate).
+    fn approval_standing(&self) -> Option<crate::tui::session::ApprovalStanding> {
+        None
+    }
+
     /// After the live viewport is torn down, render a final build summary
     /// directly to the terminal (stderr) so it persists in scrollback. NOT
     /// routed through the log sink. No-op by default.

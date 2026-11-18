@@ -355,6 +355,10 @@ pub struct SandboxTeardown {
     /// This sandbox's slot in the engine's `sandbox` pool, split off the
     /// run's admission grant.
     slot: Option<crate::engine::resource_pool::Reservation>,
+    /// The request's count of removals still holding a `sandbox` slot
+    /// (`RequestStateData::sandbox_removals`), counted into by the removal
+    /// that carries `slot`.
+    removals: Option<PendingCounter>,
     /// What each removal this teardown queues waits for first: a test stands
     /// in a slow disk with it. Nothing outside tests.
     hold: RemovalHold,
@@ -385,17 +389,21 @@ impl std::fmt::Debug for SandboxTeardown {
 /// a queued tokio waiter (`resource_pool`'s module docs).
 ///
 /// [`ResourcePool::removals_pending`]: crate::engine::resource_pool::ResourcePool::removals_pending
+///
+/// `removals`, when given, is the request's own count of such removals: one
+/// more from now until the slot is released.
 fn releasing(
     job: SandboxCleanupJob,
     slot: Option<crate::engine::resource_pool::Reservation>,
     hold: RemovalHold,
+    removals: Option<PendingCounter>,
 ) -> SandboxCleanupJob {
     let Some(slot) = slot else {
         return job;
     };
     // Counted as a pending removal from the moment it is queued, through the
     // hold and the removal itself, until the slot is released.
-    let slot = slot.into_removal();
+    let slot = CountedRemoval::new(slot.into_removal(), removals);
     Box::new(move || {
         // Dropped on every way out of this closure, an unwind included, and
         // with the closure when it never runs.
@@ -403,6 +411,39 @@ fn releasing(
         hold.wait();
         job()
     })
+}
+
+/// A pending removal's slot and its request's count of them. The slot is
+/// released before the count drops, so whoever sees the count reach zero
+/// samples a pool that already has every one of the request's slots back.
+#[derive(Debug)]
+struct CountedRemoval {
+    slot: Option<crate::engine::resource_pool::PendingRemoval>,
+    removals: Option<PendingCounter>,
+}
+
+impl CountedRemoval {
+    fn new(
+        slot: crate::engine::resource_pool::PendingRemoval,
+        removals: Option<PendingCounter>,
+    ) -> Self {
+        if let Some(n) = &removals {
+            n.fetch_add(1, Ordering::AcqRel);
+        }
+        Self {
+            slot: Some(slot),
+            removals,
+        }
+    }
+}
+
+impl Drop for CountedRemoval {
+    fn drop(&mut self) {
+        drop(self.slot.take());
+        if let Some(n) = &self.removals {
+            n.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
 }
 
 /// What a removal holding a `sandbox` slot waits for before it runs: a test
@@ -502,6 +543,7 @@ impl SandboxTeardown {
             pending,
             job: None,
             slot: None,
+            removals: None,
             hold: RemovalHold::default(),
             armed: true,
         }
@@ -509,12 +551,16 @@ impl SandboxTeardown {
 
     /// Hand this teardown the run's `sandbox` pool slot, released when the
     /// sandbox's removal returns (or at once, when nothing will remove it).
+    /// `removals` is the request's count of removals still holding a slot:
+    /// the removal that carries this one counts in it until it releases.
     #[must_use = "dropping the teardown queues its reclaim at once"]
     pub fn with_sandbox_slot(
         mut self,
         slot: Option<crate::engine::resource_pool::Reservation>,
+        removals: PendingCounter,
     ) -> Self {
         self.slot = slot;
+        self.removals = Some(removals);
         self
     }
 
@@ -558,6 +604,7 @@ impl SandboxTeardown {
                     generation::guarded(self.dir.clone(), self.generation, job),
                     slot,
                     std::mem::take(&mut self.hold),
+                    self.removals.take(),
                 ),
                 Arc::clone(&self.pending),
             );
@@ -642,6 +689,7 @@ impl SandboxTeardown {
                 generation::guarded(self.dir.clone(), self.generation, job),
                 self.slot.take(),
                 std::mem::take(&mut self.hold),
+                self.removals.take(),
             ),
             Arc::clone(&self.pending),
         );
@@ -657,6 +705,7 @@ impl SandboxTeardown {
                 Box::new(move || generation::remove_stale(&dir, generation)),
                 self.slot.take(),
                 std::mem::take(&mut self.hold),
+                self.removals.take(),
             ),
             Arc::clone(&self.pending),
         );
@@ -1771,7 +1820,7 @@ mod tests {
             assert_eq!(pool.available(PoolName::SANDBOX), Some(0), "{leg}");
             let claim = generation::claim(&sandbox);
             let teardown = SandboxTeardown::arm(sandbox.clone(), claim, Arc::clone(&pending))
-                .with_sandbox_slot(Some(slot));
+                .with_sandbox_slot(Some(slot), PendingCounter::default());
             resolve(teardown, &sandbox);
             wait_drained(&pending, Duration::from_secs(30));
             assert_eq!(pool.available(PoolName::SANDBOX), Some(1), "{leg}");
@@ -1801,6 +1850,9 @@ mod tests {
             grant.split_off(PoolName::SANDBOX).expect("slot")
         };
 
+        // The request's count of removals holding a slot: it drops only
+        // once the slot is back, on every way out.
+        let removals = PendingCounter::default();
         let seen = Arc::new(std::sync::Mutex::new(None));
         let job = releasing(
             Box::new({
@@ -1813,6 +1865,7 @@ mod tests {
             }),
             Some(slot(&pool)),
             RemovalHold::default(),
+            None,
         );
         // A run queued behind the slot, parked in an executor on its own
         // thread: only a wake from the job's release, on a third thread with
@@ -1865,16 +1918,21 @@ mod tests {
             Box::new(|| panic!("removal panicked")),
             Some(slot(&pool)),
             RemovalHold::default(),
+            Some(Arc::clone(&removals)),
         );
+        assert_eq!(removals.load(Ordering::Acquire), 1, "counted while queued");
         assert!(catch_unwind(AssertUnwindSafe(panics)).is_err());
         assert_eq!(pool.available(PoolName::SANDBOX), Some(1), "after a panic");
+        assert_eq!(removals.load(Ordering::Acquire), 0, "after a panic");
 
         drop(releasing(
             Box::new(|| Ok(())),
             Some(slot(&pool)),
             RemovalHold::default(),
+            Some(Arc::clone(&removals)),
         ));
         assert_eq!(pool.available(PoolName::SANDBOX), Some(1), "dropped unrun");
+        assert_eq!(removals.load(Ordering::Acquire), 0, "dropped unrun");
     }
 
     /// A closed [`RemovalGate`] holds a removal, and so its slot, until it is
@@ -1915,6 +1973,7 @@ mod tests {
                     gate: Some(gate.state()),
                     ..RemovalHold::default()
                 },
+                None,
             );
             let removing = std::thread::spawn(job);
             std::thread::sleep(Duration::from_millis(50));
@@ -1970,6 +2029,7 @@ mod tests {
                 gate: Some(gate.state()),
                 ..RemovalHold::default()
             },
+            None,
         );
         assert_eq!(pool.removals_pending(), 1, "queued");
         assert_eq!(pool.snapshot().main.removals_pending, 1, "in the snapshot");
@@ -1987,12 +2047,18 @@ mod tests {
             Box::new(|| panic!("removal panicked")),
             Some(slot()),
             RemovalHold::default(),
+            None,
         );
         assert_eq!(pool.removals_pending(), 1);
         assert!(catch_unwind(AssertUnwindSafe(panics)).is_err());
         assert_eq!(pool.removals_pending(), 0, "after a panic");
 
-        let unrun = releasing(Box::new(|| Ok(())), Some(slot()), RemovalHold::default());
+        let unrun = releasing(
+            Box::new(|| Ok(())),
+            Some(slot()),
+            RemovalHold::default(),
+            None,
+        );
         assert_eq!(pool.removals_pending(), 1);
         drop(unrun);
         assert_eq!(pool.removals_pending(), 0, "dropped unrun");

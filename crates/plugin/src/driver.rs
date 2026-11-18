@@ -2282,6 +2282,19 @@ pub struct RunRequest<'a, 'io> {
     /// it. In-process only: it never crosses the plugin seam, so a cdylib
     /// driver's run is timed whole.
     pub clock: RunClock,
+    /// The [`stdout`](Self::stdout) / [`stderr`](Self::stderr) writers *are*
+    /// the run's log: the host scrubs secrets out of them, stores the bytes
+    /// and serves them, so the driver writes everything it would have logged
+    /// there and returns no log file of its own.
+    ///
+    /// `false` (the default): the writers are a live view at most, and a
+    /// driver that keeps a log returns it as an artifact at the end of the
+    /// run instead of streaming it, which the host imports and scrubs.
+    /// Only ever set on a captured run. Never hashed. Crosses the plugin seam
+    /// as `ManagedRunRequest.log_capture` (since 0.21.1); a plugin older than
+    /// that is never sent it and keeps writing its own log, which the host
+    /// imports.
+    pub log_capture: bool,
 }
 
 /// Where a run is on the clock its target's `timeout` runs on.
@@ -2742,6 +2755,7 @@ impl<'a, 'io> RunRequest<'a, 'io> {
             winsize: None,
             allotment: None,
             clock: RunClock::default(),
+            log_capture: false,
         }
     }
 
@@ -2770,6 +2784,7 @@ impl<'a, 'io> RunRequest<'a, 'io> {
             winsize: self.winsize,
             allotment: self.allotment,
             clock: self.clock,
+            log_capture: self.log_capture,
         }
     }
 

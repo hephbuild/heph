@@ -293,7 +293,7 @@ impl App for AttachApp {
                 return Ok(Outcome::Lost);
             };
             match item? {
-                SessionItem::Record(record) => match self.feed.route(record) {
+                SessionItem::Record(record) => match self.feed.route(*record) {
                     Routed::Event(ev) => {
                         if let Some(tx) = &events {
                             // The renderer is gone only when the backend is

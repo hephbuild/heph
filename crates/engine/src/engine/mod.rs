@@ -27,7 +27,7 @@ pub use plugin_load::{clear_plugin_cache, sweep_checksum_stamps};
 pub mod approval;
 pub mod diag;
 pub mod execrunner_host;
-pub use approval::{ApprovalHandler, ApprovalNotice, ApprovalRequest};
+pub use approval::{ApprovalHandler, ApprovalNotice, ApprovalRequest, read_notice_from_store};
 pub mod codegen_lock;
 pub mod credential;
 pub mod credential_store;
@@ -97,6 +97,14 @@ mod execute;
 pub mod failure_gc;
 pub mod failure_slot;
 pub mod invoke;
+pub mod log_api;
+pub use log_api::{
+    FollowStep, LogFollower, LogInfo, LogOptions, LogSource, LogUnavailable, NoLiveLogs,
+    NoOutputYet, OpenLog,
+};
+pub mod output_listing;
+pub use output_listing::{FailureOutputs, ListedFile, ListedGroup, ListedKind, OutputListing};
+pub(crate) mod run_log;
 pub mod run_timeout;
 pub use invoke::{InvokeOutcome, InvokeRequest};
 pub(crate) mod invoke_sandbox;

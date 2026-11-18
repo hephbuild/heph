@@ -1766,6 +1766,7 @@ dependencies = [
  "glob",
  "libc",
  "lock",
+ "memchr",
  "model",
  "plugin",
  "serde",
@@ -5331,6 +5332,7 @@ dependencies = [
  "plugin",
  "plugin-sdk",
  "stabby",
+ "tokio",
  "tracing",
 ]
 
@@ -5346,7 +5348,6 @@ dependencies = [
  "execrunner",
  "glob",
  "libc",
- "memchr",
  "minijinja",
  "model",
  "plugin",
@@ -7940,6 +7941,7 @@ dependencies = [
  "crossterm",
  "futures",
  "libc",
+ "memchr",
  "proc",
  "ratatui",
  "serde",

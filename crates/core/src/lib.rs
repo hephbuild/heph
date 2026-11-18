@@ -15,6 +15,7 @@
     )
 )]
 
+pub mod approval_notice;
 pub mod blocking;
 pub mod capacity;
 pub mod debug_hash;
@@ -29,6 +30,7 @@ pub mod htvalue;
 pub mod paths;
 pub mod pending;
 pub mod process;
+pub mod session_record;
 pub mod shutdown;
 pub mod sysres;
 pub mod template;

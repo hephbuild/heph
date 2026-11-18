@@ -134,11 +134,15 @@ pub fn clamp_text(
 }
 
 /// The text of an admission-wait row, after its `⧗`:
-/// `//a:b waits for cpu 4 (2 free, 6 ahead, 41s)`. `waited` is the elapsed
-/// time as the renderer spells it; `unit` is `pool`'s. A waiter that fits
-/// what is free and is held back for the oldest one (`yielding_to`, with the
-/// unit of *its* pool, which need not be `pool`) says so in place of the
-/// queue: `//a:b waits for cpu 1 (3 free, yielding to a cpu 8 run, 41s)`.
+/// `//a:b waits for cpu 4 (2 free, 41s)`. `waited` is the elapsed time as the
+/// renderer spells it; `unit` is `pool`'s. A waiter that fits what is free and
+/// is held back for the oldest one (`yielding_to`, with the unit of *its*
+/// pool, which need not be `pool`) says so:
+/// `//a:b waits for cpu 1 (3 free, yielding to a cpu 8 run, 41s)`.
+///
+/// The event's `ahead` is not shown: admission is not FIFO, so a count of
+/// older waiters frozen when the notice fired is no queue position, and it
+/// is never updated.
 /// With removals pending (`removals_pending` above 0, only ever set on a
 /// `sandbox` wait), the cause is named:
 /// `… — cleanup is behind: 3 removals pending`.
@@ -153,21 +157,20 @@ pub fn admission_wait_text(
     unit: Unit,
     need: u64,
     free: u64,
-    ahead: u64,
     yielding_to: Option<(&YieldingToData, Unit)>,
     removals_pending: Option<u64>,
     waited: &str,
 ) -> String {
-    let queue = match yielding_to {
+    let yielding = match yielding_to {
         Some((to, to_unit)) => format!(
-            "yielding to a {} {} run",
+            "yielding to a {} {} run, ",
             to.pool,
             display_amount(to_unit, to.need)
         ),
-        None => format!("{ahead} ahead"),
+        None => String::new(),
     };
     let text = format!(
-        "{addr} waits for {pool} {} ({} free, {queue}, {waited})",
+        "{addr} waits for {pool} {} ({} free, {yielding}{waited})",
         display_amount(unit, need),
         display_amount(unit, free)
     );
@@ -273,6 +276,23 @@ pub enum BuildEventKind {
     ResultStart {
         addr: String,
     },
+    /// What a finished target produced, by output group: sent right before
+    /// the successful `ResultEnd` of a target that ran. Every output group
+    /// the run produced, not only the ones this request asked for; log and
+    /// support files are not outputs and are left out. Not sent for a cache
+    /// hit (a warm build pays nothing for it; a consumer reads a hit's
+    /// groups from `Engine::output_listing`), for a failure, nor to a request
+    /// nobody listens to.
+    ///
+    /// Per-file rows are not here: an artifact is a group's packed tree, and
+    /// listing it reads the cache entry, which a consumer asks for off its
+    /// render path (`Engine::output_listing`). An older consumer reads it as
+    /// [`BuildEventKind::Unknown`].
+    ResultOutputs {
+        addr: String,
+        #[serde(default)]
+        groups: Vec<OutputGroupSummary>,
+    },
     ResultEnd {
         addr: String,
         /// The failure, flattened by `format!("{e:#}")` — the whole cause chain
@@ -334,6 +354,11 @@ pub enum BuildEventKind {
         /// Treat [`AdmittedKind::Unknown`] like `None`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         admitted: Option<AdmittedKind>,
+        /// The output group names the target declares, in declaration order:
+        /// what it will write, before it has. Empty from a host that predates
+        /// it, and for a target that declares no output.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        output_groups: Vec<String>,
     },
     ExecuteEnd {
         addr: String,
@@ -433,6 +458,33 @@ pub enum BuildEventKind {
     /// The admission wait ended (granted, or the wait was cancelled).
     AdmissionWaitEnd {
         addr: String,
+    },
+    /// One bounded pool's use, as the pool itself counts it: what a gauge
+    /// draws. Sent by a per-request sampler on a 250 ms tick only when the
+    /// pool changed since its last send, and once more before the request
+    /// ends if it changed since; never from inside the pool. A request that
+    /// admits nothing (an all-hit build) sends none. A consumer keeps the
+    /// latest per `pool`.
+    ///
+    /// `held` counts every grant still outstanding, so a `sandbox` slot shows
+    /// held from its run's admission until its sandbox has been removed, not
+    /// until the run ends; summing `ExecuteStart.reserved` cannot see that.
+    /// Amounts are in the base of the pool's unit (`RequestConfig.units`).
+    /// An older consumer reads it as [`BuildEventKind::Unknown`].
+    PoolUsage {
+        pool: String,
+        /// Granted and not yet returned.
+        #[serde(default)]
+        held: u64,
+        #[serde(default)]
+        capacity: u64,
+        /// Queued requests that need some of this pool.
+        #[serde(default)]
+        waiting: u64,
+        /// Finished runs whose sandbox removal has not returned, each holding
+        /// one `sandbox` slot: set on the `sandbox` pool only, 0 elsewhere.
+        #[serde(default)]
+        removals_pending: u64,
     },
     /// Acquiring a scratch slot has been blocked past the notice threshold.
     ///
@@ -683,6 +735,25 @@ pub struct LogTailData {
     pub start_line: usize,
 }
 
+/// One output group of a finished target, carried on `ResultOutputs`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OutputGroupSummary {
+    /// The group's name; empty for the target's unnamed group.
+    pub group: String,
+    /// The group's bytes as stored (an artifact's packed size, summed over
+    /// the group's artifacts). `None` when any of them does not know its
+    /// size (an uncached passthrough file).
+    #[serde(default)]
+    pub size: Option<u64>,
+    /// The group's content hash (`hashout`), when the group is one artifact,
+    /// which it is unless a driver splits one.
+    #[serde(default)]
+    pub hash: Option<String>,
+    /// How many artifacts the group is: 1 unless a driver splits one.
+    #[serde(default)]
+    pub artifacts: u32,
+}
+
 /// A run stopped at its target's `timeout`, carried on `ResultEnd`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TimedOutData {
@@ -931,6 +1002,7 @@ pub mod test_support {
             reserved: None,
             queued_ms: None,
             admitted: None,
+            output_groups: Vec::new(),
         };
         let end = |addr: &str| BuildEventKind::ResultEnd {
             addr: addr.to_string(),
@@ -1108,19 +1180,9 @@ mod tests {
     #[test]
     fn admission_wait_text_names_pending_removals_only_when_there_are_some() {
         let text = |pending| {
-            admission_wait_text(
-                "//a:b",
-                "sandbox",
-                Unit::Count,
-                1,
-                0,
-                2,
-                None,
-                pending,
-                "41s",
-            )
+            admission_wait_text("//a:b", "sandbox", Unit::Count, 1, 0, None, pending, "41s")
         };
-        let plain = "//a:b waits for sandbox 1 (0 free, 2 ahead, 41s)";
+        let plain = "//a:b waits for sandbox 1 (0 free, 41s)";
         assert_eq!(text(None), plain);
         assert_eq!(text(Some(0)), plain);
         assert_eq!(
@@ -1150,8 +1212,8 @@ mod tests {
         assert!(!json.contains("removals_pending"), "{json}");
     }
 
-    /// A waiter held back for the oldest one names it in place of the queue,
-    /// each amount in its own pool's unit; the cleanup cause still follows.
+    /// A waiter held back for the oldest one names it, each amount in its own
+    /// pool's unit; the cleanup cause still follows.
     #[test]
     fn the_wait_text_names_what_it_yields_to() {
         let to = |pool: &str, need| YieldingToData {
@@ -1166,12 +1228,11 @@ mod tests {
                 Unit::Cpu,
                 4 * cpu,
                 2 * cpu,
-                6,
                 None,
                 None,
                 "41s"
             ),
-            "//a:b waits for cpu 4 (2 free, 6 ahead, 41s)",
+            "//a:b waits for cpu 4 (2 free, 41s)",
             "unchanged without it"
         );
         assert_eq!(
@@ -1181,7 +1242,6 @@ mod tests {
                 Unit::Cpu,
                 cpu,
                 3 * cpu,
-                6,
                 Some((&to("cpu", 8 * cpu), Unit::Cpu)),
                 None,
                 "41s"
@@ -1196,7 +1256,6 @@ mod tests {
                 Unit::Cpu,
                 cpu,
                 3 * cpu,
-                0,
                 Some((&to("memory", 2 << 30), Unit::Bytes)),
                 None,
                 "41s"
@@ -1210,7 +1269,6 @@ mod tests {
                 Unit::Count,
                 1,
                 2,
-                1,
                 Some((&to("cpu", 8 * cpu), Unit::Cpu)),
                 Some(3),
                 "41s"
@@ -1277,6 +1335,7 @@ mod tests {
                 reserved: None,
                 queued_ms: Some(3),
                 admitted: Some(AdmittedKind::Handoff),
+                output_groups: vec!["out".into()],
             },
         })
         .expect("encode");
@@ -1481,6 +1540,7 @@ mod tests {
                 reserved: Some(BTreeMap::from([("cpu".into(), 4_000_000)])),
                 queued_ms: Some(1500),
                 admitted: None,
+                output_groups: Vec::new(),
             },
         };
         let back: BuildEvent =
@@ -1709,6 +1769,194 @@ mod tests {
             }
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    /// `ResultOutputs` round-trips, a frame missing its groups decodes, a
+    /// consumer built before it skips it as `Unknown` and reads on, and
+    /// `ExecuteStart.output_groups` is absent from the wire when empty and
+    /// read back when not, by a decoder that predates it too.
+    #[test]
+    fn result_outputs_round_trips_and_old_decoders_see_unknown() {
+        let groups = vec![
+            OutputGroupSummary {
+                group: String::new(),
+                size: Some(12),
+                hash: Some("ab12".into()),
+                artifacts: 1,
+            },
+            OutputGroupSummary {
+                group: "rust".into(),
+                size: None,
+                hash: None,
+                artifacts: 2,
+            },
+        ];
+        let ev = BuildEvent {
+            at_unix_ms: 4,
+            kind: BuildEventKind::ResultOutputs {
+                addr: "//a:x".into(),
+                groups: groups.clone(),
+            },
+        };
+        let json = serde_json::to_string(&ev).expect("encode");
+        let back: BuildEvent = serde_json::from_str(&json).expect("decode");
+        assert!(
+            matches!(
+                &back.kind,
+                BuildEventKind::ResultOutputs { addr, groups: g } if addr == "//a:x" && *g == groups
+            ),
+            "{back:?}"
+        );
+        let sparse = r#"{"at_unix_ms":1,"kind":{"type":"ResultOutputs","addr":"//a:x"}}"#;
+        let ev: BuildEvent = serde_json::from_str(sparse).expect("sparse frame decodes");
+        assert!(
+            matches!(ev.kind, BuildEventKind::ResultOutputs { ref groups, .. } if groups.is_empty())
+        );
+
+        let start = |output_groups: Vec<String>| {
+            serde_json::to_string(&BuildEvent {
+                at_unix_ms: 2,
+                kind: BuildEventKind::ExecuteStart {
+                    addr: "//a:x".into(),
+                    driver: "exec".into(),
+                    cache: true,
+                    declared: None,
+                    reserved: None,
+                    queued_ms: None,
+                    admitted: None,
+                    output_groups,
+                },
+            })
+            .expect("encode")
+        };
+        assert!(!start(Vec::new()).contains("output_groups"));
+        let named = start(vec!["out".into(), "gen".into()]);
+        let back: BuildEvent = serde_json::from_str(&named).expect("decode");
+        assert!(
+            matches!(
+                &back.kind,
+                BuildEventKind::ExecuteStart { output_groups, .. } if output_groups == &["out", "gen"]
+            ),
+            "{back:?}"
+        );
+
+        #[derive(serde::Deserialize)]
+        struct OldEvent {
+            kind: OldKind,
+        }
+        #[derive(serde::Deserialize, Debug)]
+        #[serde(tag = "type")]
+        enum OldKind {
+            ResultStart {
+                #[expect(dead_code, reason = "decoded only to prove the shape")]
+                addr: String,
+            },
+            ExecuteStart {
+                #[expect(dead_code, reason = "decoded only to prove the shape")]
+                addr: String,
+            },
+            #[serde(other)]
+            Unknown,
+        }
+        let stream = [
+            json,
+            named,
+            r#"{"at_unix_ms":5,"kind":{"type":"ResultStart","addr":"//a:x"}}"#.into(),
+        ];
+        let old: Vec<OldKind> = stream
+            .iter()
+            .map(|l| {
+                serde_json::from_str::<OldEvent>(l)
+                    .expect("old decoder")
+                    .kind
+            })
+            .collect();
+        assert!(
+            matches!(
+                old.as_slice(),
+                [
+                    OldKind::Unknown,
+                    OldKind::ExecuteStart { .. },
+                    OldKind::ResultStart { .. }
+                ]
+            ),
+            "{old:?}"
+        );
+    }
+
+    /// `PoolUsage` round-trips, a frame missing its later fields decodes,
+    /// and a consumer built before it skips it as `Unknown` and reads on.
+    #[test]
+    fn pool_usage_round_trips_and_old_decoders_see_unknown() {
+        let ev = BuildEvent {
+            at_unix_ms: 4,
+            kind: BuildEventKind::PoolUsage {
+                pool: "sandbox".into(),
+                held: 9,
+                capacity: 48,
+                waiting: 2,
+                removals_pending: 3,
+            },
+        };
+        let json = serde_json::to_string(&ev).expect("encode");
+        let back: BuildEvent = serde_json::from_str(&json).expect("decode");
+        assert!(
+            matches!(
+                back.kind,
+                BuildEventKind::PoolUsage {
+                    ref pool,
+                    held: 9,
+                    capacity: 48,
+                    waiting: 2,
+                    removals_pending: 3,
+                } if pool == "sandbox"
+            ),
+            "{back:?}"
+        );
+        let sparse = r#"{"at_unix_ms":1,"kind":{"type":"PoolUsage","pool":"cpu"}}"#;
+        let ev: BuildEvent = serde_json::from_str(sparse).expect("sparse frame decodes");
+        assert!(matches!(
+            ev.kind,
+            BuildEventKind::PoolUsage {
+                held: 0,
+                waiting: 0,
+                ..
+            }
+        ));
+
+        #[derive(serde::Deserialize)]
+        struct OldEvent {
+            kind: OldKind,
+        }
+        #[derive(serde::Deserialize, Debug)]
+        #[serde(tag = "type")]
+        enum OldKind {
+            ResultStart {
+                #[expect(dead_code, reason = "decoded only to prove the shape")]
+                addr: String,
+            },
+            #[serde(other)]
+            Unknown,
+        }
+        let stream = [
+            json,
+            r#"{"at_unix_ms":5,"kind":{"type":"ResultStart","addr":"//a:x"}}"#.into(),
+        ];
+        let old: Vec<OldKind> = stream
+            .iter()
+            .map(|l| {
+                serde_json::from_str::<OldEvent>(l)
+                    .expect("old decoder")
+                    .kind
+            })
+            .collect();
+        assert!(
+            matches!(
+                old.as_slice(),
+                [OldKind::Unknown, OldKind::ResultStart { .. }]
+            ),
+            "{old:?}"
+        );
     }
 
     /// `SelectionIncomplete` survives the wire, and a consumer built before it

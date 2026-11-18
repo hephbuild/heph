@@ -19,6 +19,7 @@
 use std::fmt;
 
 use hcore::events::{BuildEvent, BuildEventKind};
+pub use hcore::session_record::{CAPABILITY_RUN_LOGS, RunLogRecord};
 use serde::{Deserialize, Serialize};
 
 use super::id::SessionId;
@@ -196,13 +197,20 @@ impl SessionRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum SessionRecordKind {
-    /// A log line the terminal showed (`info!` and above), lossy UTF-8 and
-    /// stored verbatim: a viewer escapes control bytes on output.
+    /// A line the terminal showed, at the terminal's filter (so `debug!` too
+    /// under `-v`), lossy UTF-8 and stored verbatim: a viewer escapes control
+    /// bytes on output. `level` is empty for a diagnostic the process wrote
+    /// to the sink itself.
     Log {
         #[serde(default)]
         level: String,
         #[serde(default)]
         msg: String,
+        /// The line's number in this process's log sink, from 1: what a
+        /// replay after a full screen selects by. Absent from a writer that
+        /// predates it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seq: Option<u64>,
     },
     /// The process is exiting. Written before the lock is released, so "lock
     /// free and no `End`" means exactly "crashed".
@@ -213,9 +221,11 @@ pub enum SessionRecordKind {
         #[serde(default)]
         panicked: bool,
     },
-    /// `events.ndjson` reached its size cap; no build event or log line follows
-    /// (`End`, `InflightWritten`, `Finished`, `Output`, `Label` and an
-    /// `Approval` clearing the prompt still do). `status.json` keeps updating.
+    /// `events.ndjson` reached its size cap; no build event follows (`End`,
+    /// `InflightWritten`, `Finished`, `Output`, `Label`, `RunLog` and an
+    /// `Approval` clearing the prompt still do). `Log` records follow it
+    /// until the bytes they add past the cap reach `LOG_CEILING` (256 MiB),
+    /// and are dropped beyond. `status.json` keeps updating.
     Truncated,
     /// The owner answered an in-flight request: `inflight.txt` is fresh.
     InflightWritten,
@@ -225,12 +235,24 @@ pub enum SessionRecordKind {
         #[serde(default)]
         label: String,
     },
-    /// The approval prompt the TUI shows, or `None` once none is pending. The
-    /// prompt's keys act on the run, so a viewer shows it without them; a
-    /// notice's content stays out (its path is shown).
+    /// The approval prompt the TUI shows, or `None` once none is pending, and
+    /// the standing Y/N decision in force. The prompt's keys act on the run,
+    /// so a viewer shows it without them; a notice's content stays out (a
+    /// viewer reads it from the store by the sources recorded instead).
+    /// Written past the cap, so the notice sources and the standing decision
+    /// are there to read however long the build ran.
     Approval {
         #[serde(default)]
         prompt: Option<Box<ApprovalPrompt>>,
+        /// Absent from a writer that predates standing decisions, and while
+        /// none stands. A value this heph does not know reads as `None`
+        /// rather than dropping the whole record (and with it the prompt).
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "lenient_standing"
+        )]
+        standing: Option<ApprovalStanding>,
     },
     /// The TUI was torn down at `at_unix_ms`, the instant its final summary
     /// measured the elapsed time against. What follows (`Log`, `Output`) the
@@ -243,6 +265,12 @@ pub enum SessionRecordKind {
         #[serde(default)]
         text: String,
     },
+    /// A run's live log was created: where its output is going while it
+    /// runs (`file`, relative to `meta.json`'s home). Written past the cap,
+    /// so a follower finds a run that starts after it. Trusted only while
+    /// the session's lock is held and no `ExecuteEnd` for the addr follows
+    /// it; read through [`super::run_logs`], never by joining `file` itself.
+    RunLog(Box<RunLogRecord>),
     /// A record a newer heph writes.
     #[serde(other)]
     Unknown,
@@ -256,18 +284,90 @@ pub struct ApprovalPrompt {
     /// Prompts queued behind this one.
     #[serde(default)]
     pub queued_behind: u64,
-    /// Each notice the target declares, as `(name, path)`.
+    /// Each notice the target declares.
     #[serde(default)]
     pub notices: Vec<ApprovalPromptNotice>,
 }
 
-/// One notice of an [`ApprovalPrompt`]: where to read it, not what it says.
+/// One notice of an [`ApprovalPrompt`]: where its text is kept, not what it
+/// says. No notice is written anywhere; a reader reads it from the store
+/// (heph's local cache, or a source file in the workspace) by these sources.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalPromptNotice {
     #[serde(default)]
     pub name: String,
+    /// The artifacts the notice's text is kept in, in order.
     #[serde(default)]
-    pub path: String,
+    pub sources: Vec<hcore::approval_notice::NoticeSource>,
+}
+
+impl ApprovalPromptNotice {
+    /// The notice's text, read by `read` (the engine's
+    /// `read_notice_from_store`, capped) from [`Self::sources`] under
+    /// `roots` — the session's home and its `meta.workspace_root` — or
+    /// [`hcore::approval_notice::NOTICE_UNAVAILABLE`] when a source is not
+    /// where it was recorded or the record names none. Blocking: call it off
+    /// the render task.
+    pub fn read(
+        &self,
+        roots: &hcore::approval_notice::NoticeRoots,
+        read: hcore::approval_notice::ReadNotice,
+    ) -> Result<String, NoticeUnavailable> {
+        if self.sources.is_empty() {
+            return Err(NoticeUnavailable);
+        }
+        read(roots, &self.sources).ok_or(NoticeUnavailable)
+    }
+}
+
+/// A recorded notice could not be read back: show
+/// [`hcore::approval_notice::NOTICE_UNAVAILABLE`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoticeUnavailable;
+
+impl std::fmt::Display for NoticeUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(hcore::approval_notice::NOTICE_UNAVAILABLE)
+    }
+}
+
+/// A standing approval decision: after Y (or N), every request of the build
+/// is approved (or rejected) without a prompt, until the build ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalStanding {
+    /// Y: shown as `auto-approving (Y)`.
+    Approve,
+    /// N: shown as `auto-rejecting (N)`.
+    Reject,
+}
+
+/// `Approval.standing` as this heph knows it: a value a newer writer added
+/// decodes as `None`.
+fn lenient_standing<'de, D>(d: D) -> Result<Option<ApprovalStanding>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Lenient {
+        Known(ApprovalStanding),
+        Unknown(serde::de::IgnoredAny),
+    }
+    Ok(match Option::<Lenient>::deserialize(d)? {
+        Some(Lenient::Known(s)) => Some(s),
+        Some(Lenient::Unknown(_)) | None => None,
+    })
+}
+
+impl ApprovalStanding {
+    /// The indicator the line, the title row and `heph session show` print.
+    pub fn indicator(self) -> &'static str {
+        match self {
+            Self::Approve => "auto-approving (Y)",
+            Self::Reject => "auto-rejecting (N)",
+        }
+    }
 }
 
 /// The most entries each list of a `status.json` snapshot keeps (U3, which
@@ -620,7 +720,28 @@ mod tests {
             queued_behind: 2,
             notices: vec![ApprovalPromptNotice {
                 name: "terms".into(),
-                path: "/x/terms.txt".into(),
+                sources: vec![
+                    hcore::approval_notice::NoticeSource {
+                        addr: "//a:terms".into(),
+                        origin: hcore::approval_notice::NoticeOrigin::Cache {
+                            addr: "//a:terms".into(),
+                            revision: "abc123_1700000000000000000".into(),
+                            hashout: "def456".into(),
+                        },
+                    },
+                    hcore::approval_notice::NoticeSource {
+                        addr: "//@heph/fs:file@f=a/TERMS".into(),
+                        origin: hcore::approval_notice::NoticeOrigin::View {
+                            source: Box::new(hcore::approval_notice::NoticeOrigin::File {
+                                path: "a/TERMS".into(),
+                                out_path: "a/TERMS".into(),
+                                x: false,
+                                hashout: "0f0f".into(),
+                            }),
+                            paths: vec![("a/TERMS".into(), "TERMS".into())],
+                        },
+                    },
+                ],
             }],
         };
         for (kind, ty) in [
@@ -633,16 +754,31 @@ mod tests {
             (
                 SessionRecordKind::Approval {
                     prompt: Some(Box::new(prompt)),
+                    standing: None,
                 },
                 "Approval",
             ),
-            (SessionRecordKind::Approval { prompt: None }, "Approval"),
+            (
+                SessionRecordKind::Approval {
+                    prompt: None,
+                    standing: Some(ApprovalStanding::Reject),
+                },
+                "Approval",
+            ),
             (SessionRecordKind::Finished, "Finished"),
             (
                 SessionRecordKind::Output {
                     text: "× target failed\n\u{1b}[31mred\u{1b}[0m\n".into(),
                 },
                 "Output",
+            ),
+            (
+                SessionRecordKind::RunLog(Box::new(RunLogRecord {
+                    addr: "//a:b".into(),
+                    hashin: "abc123".into(),
+                    file: "runs/02kf5/17.log".into(),
+                })),
+                "RunLog",
             ),
         ] {
             let rec = SessionRecord::session(7, kind);
@@ -656,6 +792,82 @@ mod tests {
             let old: SessionRecord = serde_json::from_str(&older).expect("decode as unknown");
             assert_eq!(old.session, Some(SessionRecordKind::Unknown), "{older}");
         }
+    }
+
+    /// A notice whose record names no input — any record without `sources`
+    /// decodes as one — reads as unavailable without asking the store, and
+    /// one that names inputs is read from them.
+    #[test]
+    fn notice_reads_through_the_store_by_its_sources() {
+        use hcore::approval_notice::{NoticeOrigin, NoticeRoots, NoticeSource};
+        fn store(roots: &NoticeRoots, sources: &[NoticeSource]) -> Option<String> {
+            assert!(
+                !sources.is_empty(),
+                "a notice with no sources reaches the store"
+            );
+            let NoticeOrigin::Cache { revision, .. } = &sources[0].origin else {
+                panic!("not a cache origin: {sources:?}");
+            };
+            Some(format!(
+                "{}@{revision} in {}",
+                sources[0].addr,
+                roots.home.display()
+            ))
+        }
+        fn never(_: &NoticeRoots, _: &[NoticeSource]) -> Option<String> {
+            None
+        }
+        let json = r#"{"at_unix_ms":3,"session":{"type":"Approval","prompt":{"addr":"//a:b","queued_behind":0,"notices":[{"name":"plan"}]}}}"#;
+        let rec: SessionRecord = serde_json::from_str(json).expect("decode");
+        let Some(SessionRecordKind::Approval { prompt, .. }) = rec.session else {
+            panic!("not an Approval: {rec:?}");
+        };
+        let mut notice = prompt.expect("prompt").notices[0].clone();
+        let roots = NoticeRoots {
+            home: "/nonexistent-heph-home".into(),
+            root: "/nonexistent-heph-root".into(),
+        };
+        assert_eq!(notice.read(&roots, store), Err(NoticeUnavailable));
+        assert_eq!(NoticeUnavailable.to_string(), "notice unavailable");
+
+        notice.sources = vec![NoticeSource {
+            addr: "//a:plan".into(),
+            origin: NoticeOrigin::Cache {
+                addr: "//a:plan".into(),
+                revision: "h1".into(),
+                hashout: "o1".into(),
+            },
+        }];
+        assert_eq!(
+            notice.read(&roots, store).as_deref(),
+            Ok("//a:plan@h1 in /nonexistent-heph-home")
+        );
+        assert_eq!(notice.read(&roots, never), Err(NoticeUnavailable));
+    }
+
+    /// An `Approval` from a newer writer whose standing decision this heph
+    /// does not know keeps its prompt: only the standing reads as `None`.
+    #[test]
+    fn approval_record_with_an_unknown_standing_keeps_its_prompt() {
+        for standing in [r#""approve_once""#, r#"{"later":1}"#, "7"] {
+            let json = format!(
+                r#"{{"at_unix_ms":3,"session":{{"type":"Approval","prompt":{{"addr":"//a:b","queued_behind":0,"notices":[]}},"standing":{standing}}}}}"#
+            );
+            let rec: SessionRecord = serde_json::from_str(&json).expect("decode");
+            let Some(SessionRecordKind::Approval { prompt, standing }) = rec.session else {
+                panic!("not an Approval: {rec:?}");
+            };
+            assert_eq!(standing, None, "{json}");
+            assert_eq!(prompt.expect("the prompt survives").addr, "//a:b");
+        }
+        // A known value still decodes.
+        let json =
+            r#"{"at_unix_ms":3,"session":{"type":"Approval","prompt":null,"standing":"reject"}}"#;
+        let rec: SessionRecord = serde_json::from_str(json).expect("decode");
+        let Some(SessionRecordKind::Approval { standing, .. }) = rec.session else {
+            panic!("not an Approval: {rec:?}");
+        };
+        assert_eq!(standing, Some(ApprovalStanding::Reject));
     }
 
     /// A6/A17: the snapshot round-trips, and a newer version is refused naming

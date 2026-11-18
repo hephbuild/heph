@@ -369,13 +369,12 @@ fn stuck_on<'a>(
     more(&mut block, snapshot.lock_waits.len());
     for w in snapshot.admission_waits.iter().take(MAX_ROWS) {
         block.push_str(&format!(
-            "  {}   waiting {} for {} {} ({} free, {} ahead)\n",
+            "  {}   waiting {} for {} {} ({} free)\n",
             escape(&w.addr),
             ago(now_ms, w.since_unix_ms),
             w.need,
             escape(&w.pool),
-            w.free,
-            w.ahead
+            w.free
         ));
     }
     more(&mut block, snapshot.admission_waits.len());

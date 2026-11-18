@@ -1243,6 +1243,11 @@ impl BuildState {
             BuildEventKind::SelectionIncomplete { .. } => {}
             // Codegen index diagnostics are log lines, not build counters.
             BuildEventKind::CodegenExcluded { .. } | BuildEventKind::CodegenImported { .. } => {}
+            // The header's gauges still sum `ExecuteStart.reserved`; nothing
+            // draws the pool's own report yet.
+            BuildEventKind::PoolUsage { .. } => {}
+            // The Outputs tab's groups; nothing draws the tab yet.
+            BuildEventKind::ResultOutputs { .. } => {}
             // An event kind newer than this build knows about. Skipped rather
             // than fatal — see `BuildEventKind::Unknown`.
             BuildEventKind::Unknown => {}
@@ -1613,8 +1618,8 @@ impl BuildState {
     }
 
     /// Rows for targets whose admission has waited past the notice
-    /// threshold: `⧗ //a:b waits for cpu 4 (2 free, 6 ahead, 41s)`. What was
-    /// free and ahead is as of the notice. Sorted by addr so the order is
+    /// threshold: `⧗ //a:b waits for cpu 4 (2 free, 41s)`. What was free is
+    /// as of the notice. Sorted by addr so the order is
     /// stable across frames. The body of the [`ViewMode::Waiting`] tab, thinned
     /// by the `/` filter like the other list tabs.
     pub fn admission_wait_lines(&self, now_ms: u64, filter: &str) -> Vec<Line<'static>> {
@@ -1637,7 +1642,6 @@ impl BuildState {
                             self.unit_of(&w.pool),
                             w.need,
                             w.free,
-                            w.ahead,
                             w.yielding_to
                                 .as_ref()
                                 .map(|to| (to, self.unit_of(&to.pool))),
@@ -2349,7 +2353,7 @@ struct ApprovalKeys {
 fn approval_banner<'a>(
     addr: &str,
     queued_behind: u64,
-    notices: impl ExactSizeIterator<Item = (&'a str, &'a str)>,
+    notices: impl ExactSizeIterator<Item = &'a str>,
     keys: Option<ApprovalKeys>,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::with_capacity(1 + notices.len());
@@ -2374,11 +2378,11 @@ fn approval_banner<'a>(
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD),
     )));
-    // Always show the notice file link(s) so the user can open the full text
-    // in an editor without expanding the inline preview.
-    for (name, path) in notices {
+    // Name every notice the target declares; the text itself is the inline
+    // preview's (no notice is written to a file to open).
+    for name in notices {
         lines.push(Line::from(Span::styled(
-            format!("    → {name}: {path}"),
+            format!("    → notice: {name}"),
             Style::default().fg(Color::Cyan),
         )));
     }
@@ -2503,9 +2507,8 @@ impl TuiProgressView {
     }
 
     /// Body rows for the active approval prompt, or empty when idle. The banner
-    /// carries the keys; when the target declares notices, each notice's file
-    /// path is shown as an "open in editor" link below it, and `enter` toggles an
-    /// inline (scrollable) preview of the contents. An attached view draws the
+    /// carries the keys; when the target declares notices, each is named below
+    /// it, and `enter` toggles an inline (scrollable) preview of the contents. An attached view draws the
     /// run's recorded prompt through the same banner, without keys or preview.
     fn approval_lines(&self) -> Vec<Line<'static>> {
         let center = match &self.role {
@@ -2517,10 +2520,7 @@ impl TuiProgressView {
                 return approval_banner(
                     &prompt.addr,
                     prompt.queued_behind,
-                    prompt
-                        .notices
-                        .iter()
-                        .map(|n| (n.name.as_str(), n.path.as_str())),
+                    prompt.notices.iter().map(|n| n.name.as_str()),
                     None,
                 );
             }
@@ -2531,9 +2531,7 @@ impl TuiProgressView {
         let mut lines = approval_banner(
             &view.addr,
             u64::try_from(view.queued_behind).unwrap_or(u64::MAX),
-            view.notices
-                .iter()
-                .map(|n| (n.name.as_str(), n.path.as_str())),
+            view.notices.iter().map(|n| n.name.as_str()),
             Some(ApprovalKeys {
                 expanded: view.expanded,
             }),
@@ -2544,6 +2542,8 @@ impl TuiProgressView {
                     format!("  ── {} ──", notice.name),
                     Style::default().fg(Color::Cyan),
                 )));
+                // The handler's capped read from the store (truncation line
+                // included), or "notice unavailable".
                 for raw in notice.content.lines() {
                     lines.push(Line::from(format!("  {raw}")));
                 }
@@ -2806,6 +2806,13 @@ impl TUIAppView for TuiProgressView {
             .and_then(crate::tui::approval::ApprovalCenter::prompt)
     }
 
+    fn approval_standing(&self) -> Option<crate::tui::session::ApprovalStanding> {
+        match &self.role {
+            Role::Live { approval } => approval.as_ref().and_then(|c| c.standing()),
+            Role::Attached { feed, .. } => feed.approval_standing(),
+        }
+    }
+
     fn rows(&self, term_height: u16) -> u16 {
         rows_for_height(term_height)
     }
@@ -2890,7 +2897,17 @@ impl TUIAppView for TuiProgressView {
         let Some(center) = self.approval_center() else {
             return;
         };
-        center.respond(approve);
+        // The prompt on screen is the front of the queue; an expanded one had
+        // its notices read inline.
+        let Some(view) = center.current() else {
+            return;
+        };
+        let read = if view.expanded {
+            view.notices.into_iter().map(|n| n.name).collect()
+        } else {
+            Vec::new()
+        };
+        let _decided = center.respond(view.seq, approve, read);
         // A resolved prompt shrinks the body; reset scroll so the live rows show.
         self.scroll.set(0);
     }
@@ -3553,6 +3570,7 @@ mod tests {
     }
     fn execute_start(addr: &str) -> BuildEventKind {
         BuildEventKind::ExecuteStart {
+            output_groups: Vec::new(),
             addr: addr.into(),
             driver: "exec".into(),
             cache: true,
@@ -3565,6 +3583,7 @@ mod tests {
 
     fn execute_start_reserving(addr: &str, reserved: &[(&str, u64)]) -> BuildEventKind {
         BuildEventKind::ExecuteStart {
+            output_groups: Vec::new(),
             addr: addr.into(),
             driver: "exec".into(),
             cache: true,
@@ -3583,6 +3602,7 @@ mod tests {
     #[test]
     fn a_clamped_target_row_shows_declared_to_reserved() {
         let start = |addr: &str, declared: u64, reserved: u64| BuildEventKind::ExecuteStart {
+            output_groups: Vec::new(),
             addr: addr.into(),
             driver: "exec".into(),
             cache: true,
@@ -3636,6 +3656,7 @@ mod tests {
         s.apply(&ev(
             1,
             BuildEventKind::ExecuteStart {
+                output_groups: Vec::new(),
                 addr: "//p:big".into(),
                 driver: "exec".into(),
                 cache: true,
@@ -3929,7 +3950,7 @@ mod tests {
             .iter()
             .map(|sp| sp.content.as_ref())
             .collect();
-        assert_eq!(text, "  ⧗ //a:b waits for cpu 4 (2 free, 6 ahead, 41s)");
+        assert_eq!(text, "  ⧗ //a:b waits for cpu 4 (2 free, 41s)");
         s.apply(&ev(
             43_000,
             BuildEventKind::AdmissionWaitEnd {
@@ -4004,13 +4025,13 @@ mod tests {
         assert!(!live.contains("//a:b"), "{live}");
         assert!(live.contains("1 waiting"), "{live}");
 
-        // …the Waiting tab does, with pool, need, free, ahead and elapsed.
+        // …the Waiting tab does, with pool, need, free and elapsed.
         v.view.set(ViewMode::Waiting);
         let waiting = frame(&v, 42_000);
         assert!(
             waiting
                 .iter()
-                .any(|l| l == "  ⧗ //a:b waits for cpu 4 (2 free, 6 ahead, 41s)"),
+                .any(|l| l == "  ⧗ //a:b waits for cpu 4 (2 free, 41s)"),
             "{waiting:#?}"
         );
         // The `/` filter thins it like the other list tabs.
@@ -6298,8 +6319,9 @@ mod tests {
         let center = crate::tui::approval::ApprovalCenter::new();
         // Two targets awaiting approval: the banner shows the active one plus the
         // total pending count.
-        let _r1 = center.request("//a:1".to_string(), vec![]);
-        let _r2 = center.request("//a:2".to_string(), vec![]);
+        let build = center.build();
+        let _r1 = center.request(&build, "//a:1".to_string(), vec![]);
+        let _r2 = center.request(&build, "//a:2".to_string(), vec![]);
         let view = TuiProgressView::new("run").with_approval(center);
         let lines = view.approval_lines();
         let banner: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
@@ -6310,7 +6332,7 @@ mod tests {
     #[test]
     fn approval_banner_single_has_no_pending_count() {
         let center = crate::tui::approval::ApprovalCenter::new();
-        let _r = center.request("//a:1".to_string(), vec![]);
+        let _r = center.request(&center.build(), "//a:1".to_string(), vec![]);
         let view = TuiProgressView::new("run").with_approval(center);
         let lines = view.approval_lines();
         let banner: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();

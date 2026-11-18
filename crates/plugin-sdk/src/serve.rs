@@ -1721,6 +1721,9 @@ struct RunStart {
     channels: convert::RunChannels,
     /// What the host reserved for the run; `None` from a host before 0.17.4.
     allotment: Option<hplugin::driver::Allotment>,
+    /// The run's stdout/stderr frames are its log (see
+    /// [`RunRequest::log_capture`]); `false` from a host before 0.21.1.
+    log_capture: bool,
 }
 
 impl RunStart {
@@ -1738,6 +1741,7 @@ impl RunStart {
             allotment: convert::allotment_from_pb(req.allotment)
                 .context("decoding the run's allotment")?,
             shell: req.shell.unwrap_or(false),
+            log_capture: req.log_capture.unwrap_or(false),
             target: convert::target_def_from_pb(required_msg(
                 req.target,
                 "ManagedRunRequest.target",
@@ -1802,9 +1806,13 @@ async fn run_once(
     rr.hashin = start.hashin.as_str();
     // A run in the caller's terminal has no output to carry: the process
     // writes to the fds it inherited.
+    // `log_capture` says the writers are the log, so it holds only where there
+    // are writers: a host that set it on a run in the caller's terminal would
+    // otherwise have the driver drop its log into writers that do not exist.
     if matches!(start.options.stdio, hplugin::driver::RunStdio::Captured) {
         rr.stdout = Some(&mut stdout_sink);
         rr.stderr = Some(&mut stderr_sink);
+        rr.log_capture = start.log_capture;
     }
     rr.scratch = start.scratch;
     rr.credentials = start.credentials;
@@ -4411,6 +4419,229 @@ mod tests {
             .await
             .expect("runs ended in time");
         });
+    }
+
+    /// A cdylib driver that reports the `log_capture` it was handed, then
+    /// writes `chunks` numbered lines to each stream (stdout and stderr
+    /// interleaved) and returns at once.
+    struct LogDriver {
+        chunks: usize,
+        saw_log_capture: tokio::sync::mpsc::UnboundedSender<bool>,
+    }
+
+    #[async_trait::async_trait]
+    impl ManagedDriver for LogDriver {
+        fn config(
+            &self,
+            _req: hplugin::driver::ConfigRequest,
+        ) -> Result<hplugin::driver::ConfigResponse> {
+            Ok(hplugin::driver::ConfigResponse {
+                name: "logdrv".into(),
+            })
+        }
+        fn schema(&self) -> hplugin::driver::DriverSchema {
+            hplugin::driver::DriverSchema::default()
+        }
+        async fn parse(
+            &self,
+            _req: hplugin::driver::ParseRequest,
+            _ct: &(dyn Cancellable + Send + Sync),
+        ) -> Result<hplugin::driver::ParseResponse> {
+            anyhow::bail!("unused")
+        }
+        async fn apply_transitive(
+            &self,
+            _req: hplugin::driver::ApplyTransitiveRequest,
+            _ct: &(dyn Cancellable + Send + Sync),
+        ) -> Result<hplugin::driver::ApplyTransitiveResponse> {
+            anyhow::bail!("unused")
+        }
+        async fn run<'a, 'io>(
+            &self,
+            mut req: hdriver_support::driver_managed::ManagedRunRequest<'a, 'io>,
+            _ct: &(dyn Cancellable + Send + Sync),
+        ) -> Result<hdriver_support::driver_managed::ManagedRunResponse> {
+            use tokio::io::AsyncWriteExt as _;
+            let _reported = self.saw_log_capture.send(req.request.log_capture);
+            for i in 0..self.chunks {
+                for (w, name) in [
+                    (req.request.stdout.as_deref_mut(), "out"),
+                    (req.request.stderr.as_deref_mut(), "err"),
+                ] {
+                    let w = w.context("a captured run has writers")?;
+                    w.write_all(format!("{name} {i}\n").as_bytes()).await?;
+                    w.flush().await?;
+                }
+            }
+            Ok(hdriver_support::driver_managed::ManagedRunResponse { artifacts: vec![] })
+        }
+    }
+
+    /// The host proxy over [`LogDriver`] through the real stable seam, for a
+    /// plugin reporting ABI `plugin_abi`.
+    fn log_harness(
+        plugin_abi: &str,
+        chunks: usize,
+    ) -> (
+        hplugin_stabby::load_stable::StableRemoteManagedDriver,
+        tokio::sync::mpsc::UnboundedReceiver<bool>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let dynd = make_dyn_managed_driver(Arc::new(LogDriver {
+            chunks,
+            saw_log_capture: tx,
+        }) as Arc<dyn ManagedDriver>);
+        let host = hplugin_stabby::load_stable::StableRemoteManagedDriver::new(dynd, "logdrv")
+            .expect("load")
+            .with_plugin_abi(Some(plugin_abi));
+        (host, rx)
+    }
+
+    /// The lines [`LogDriver`] writes to stream `name`, in order.
+    fn log_lines(name: &str, chunks: usize) -> Vec<u8> {
+        (0..chunks)
+            .flat_map(|i| format!("{name} {i}\n").into_bytes())
+            .collect()
+    }
+
+    /// A host sink that yields before every write, so the relay falls behind
+    /// the plugin and chunks are still queued when the terminal frame arrives.
+    #[derive(Default)]
+    struct SlowSink {
+        bytes: Vec<u8>,
+        yielded: bool,
+    }
+
+    impl tokio::io::AsyncWrite for SlowSink {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            if !std::mem::replace(&mut self.yielded, true) {
+                cx.waker().wake_by_ref();
+                return std::task::Poll::Pending;
+            }
+            self.yielded = false;
+            self.bytes.extend_from_slice(buf);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// `log_capture` crosses the seam to a plugin from
+    /// [`plugin_abi::LOG_CAPTURE_SINCE`] on, and only when the host set it; a
+    /// 0.21.0 plugin is never sent it, so it keeps writing its own log.
+    #[test]
+    fn log_capture_reaches_only_a_plugin_that_reads_it() {
+        let target = convert::target_def_from_pb(wire_target()).expect("def");
+        let id = "req-1".to_string();
+        for (abi, set, seen) in [
+            (plugin_abi::LOG_CAPTURE_SINCE, true, true),
+            (plugin_abi::ABI_SEMVER, true, true),
+            (plugin_abi::LOG_CAPTURE_SINCE, false, false),
+            ("0.21.0", true, false),
+        ] {
+            let (host, mut saw) = log_harness(abi, 1);
+            let (mut out, mut err) = (Vec::<u8>::new(), Vec::<u8>::new());
+            let mut req = wait_run(&id, &target, "a");
+            req.request.stdout = Some(&mut out);
+            req.request.stderr = Some(&mut err);
+            req.request.log_capture = set;
+            let ct = StdCancellationToken::new();
+            host_runtime().block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(30), host.run(req, &ct))
+                    .await
+                    .expect("run ended in time")
+                    .expect("run succeeds");
+            });
+            assert_eq!(saw.try_recv().ok(), Some(seen), "abi {abi}, set {set}");
+        }
+    }
+
+    /// Every chunk the plugin wrote before its terminal frame reaches the
+    /// host's sinks before `run` returns, in order per stream — including the
+    /// ones still queued behind a slow sink when the result arrived.
+    #[test]
+    fn the_relay_delivers_every_chunk_before_the_run_returns() {
+        const CHUNKS: usize = 2_000;
+        let (host, _saw) = log_harness(plugin_abi::ABI_SEMVER, CHUNKS);
+        let target = convert::target_def_from_pb(wire_target()).expect("def");
+        let id = "req-1".to_string();
+        let (mut out, mut err) = (SlowSink::default(), SlowSink::default());
+        let mut req = wait_run(&id, &target, "a");
+        req.request.stdout = Some(&mut out);
+        req.request.stderr = Some(&mut err);
+        let ct = StdCancellationToken::new();
+        host_runtime().block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(60), host.run(req, &ct))
+                .await
+                .expect("run ended in time")
+                .expect("run succeeds");
+        });
+        assert_eq!(
+            String::from_utf8_lossy(&out.bytes),
+            String::from_utf8_lossy(&log_lines("out", CHUNKS))
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&err.bytes),
+            String::from_utf8_lossy(&log_lines("err", CHUNKS))
+        );
+    }
+
+    /// A host sink that fails does not fail the run or starve the other
+    /// stream: the relay keeps the error to warn about and keeps draining.
+    #[test]
+    fn a_failing_sink_neither_fails_the_run_nor_starves_the_other_stream() {
+        struct Broken;
+        impl tokio::io::AsyncWrite for Broken {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                std::task::Poll::Ready(Err(std::io::ErrorKind::StorageFull.into()))
+            }
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+        const CHUNKS: usize = 200;
+        let (host, _saw) = log_harness(plugin_abi::ABI_SEMVER, CHUNKS);
+        let target = convert::target_def_from_pb(wire_target()).expect("def");
+        let id = "req-1".to_string();
+        let (mut out, mut err) = (Vec::<u8>::new(), Broken);
+        let mut req = wait_run(&id, &target, "a");
+        req.request.stdout = Some(&mut out);
+        req.request.stderr = Some(&mut err);
+        let ct = StdCancellationToken::new();
+        host_runtime().block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(60), host.run(req, &ct))
+                .await
+                .expect("run ended in time")
+                .expect("a sink error does not fail the run");
+        });
+        assert_eq!(out, log_lines("out", CHUNKS));
     }
 
     /// Base provider for the seam tests below: every method is a benign stub;

@@ -56,9 +56,21 @@ quiet too, and `show` says "no events for 1m05s; N targets still running");
 written; `lost` when the lock is free and there is no `End` (killed, or
 crashed).
 
-`HEPH_NO_SESSION=1` records nothing: no directory, no start line. It is read
-once, by the front end, beside `HOME`; with no `HOME` or an unwritable
-`~/.heph` the run records nothing and says so once with a `warn!`.
+`HEPH_NO_SESSION=1` makes the session private: no start line, and nothing
+another terminal can see. It is still recorded, into
+`~/.heph/private-sessions/<id>/` instead of `sessions/`, because a closed full
+screen replays its log lines from there (see [Recording](#recording)); `list`
+never reads that directory, so `show` and `attach` cannot name it. The run
+removes it when it finishes, and every session start, public or private,
+sweeps the private sessions a killed run left (see [Retention](#retention)).
+It is read once, by the front end, beside `HOME`; with no `HOME` it records
+nothing. This is a change of contract: before run logs, `HEPH_NO_SESSION=1`
+wrote nothing under `~/.heph` at all. It now writes there while the run
+lasts, so a caller that set it to keep `HOME` untouched (a read-only home, a
+sandbox that captures it) should use `--raw`, which still records nothing,
+or point `HOME` somewhere writable. With no `HOME` or an unwritable `~/.heph`
+a public run records
+nothing and says so once with a `warn!`.
 
 `heph run --raw` sets up no session at all: no directory, no recorder, no
 start line, and no warning, so its stderr carries only the tool's bytes and
@@ -137,9 +149,12 @@ One line of `events.ndjson` is
 
 `kind` is a `BuildEventKind` byte for byte as on the plugin wire
 (`crates/core/src/events.rs`), with the same skew rules: an unknown variant
-decodes as `Unknown`. `session` is a `SessionRecordKind`: `Log {level, msg}`
-(`info!` and above, lossy UTF-8, stored verbatim and escaped by the viewer on
-output), `End {exit_code, panicked}`, `Truncated`, `InflightWritten`, and
+decodes as `Unknown`. `session` is a `SessionRecordKind`: `Log {level, msg,
+seq}` (every line the terminal shows, at the terminal's own filter, so
+`debug!` lines under `-v` too, and diagnostics with an empty `level`; lossy
+UTF-8, stored verbatim and escaped by the viewer on output; `seq` numbers the
+sink's lines from 1, absent in records from before it), `End {exit_code,
+panicked}`, `Truncated`, `InflightWritten`, and
 `Unknown` for anything newer. Both keys are optional; a line with neither is
 skipped.
 
@@ -147,14 +162,43 @@ What the run's terminal showed besides events and log lines is recorded too,
 so `attach` draws it (see [Attach](#attach)):
 
 - `Label {label}`: the TUI's bottom label changed (`meta.json` holds the first).
-- `Approval {prompt}`: the approval banner changed; `prompt` is `{addr,
-  queued_behind, notices: [{name, path}]}`, or absent once nothing is pending.
-  Never the notice's content, which stays in its file.
+- `Approval {prompt, standing}`: the approval banner changed; `prompt` is
+  `{addr, queued_behind, notices: [{name, sources: [{addr, origin}]}]}`, or
+  absent once nothing is pending. `origin` says where one artifact's bytes
+  are kept, tagged by `kind`: `cache {addr, revision, hashout}` (an entry of
+  the local cache under the run's home), `file {path, out_path, x, hashout}`
+  (a source file read in place, `path` relative to the workspace root), or
+  `view {source, paths}` (a `group` relocation of another origin, as
+  `(source path, path)` pairs). Never the notice's content, and no notice is
+  written anywhere or held whole in memory: the running process and every
+  viewer read it from the store by `sources`, through the same reader
+  (`ApprovalPromptNotice::read` with the engine's `read_notice_from_store`:
+  read-only, no build, no fetch, no write), rooted at the session's home and
+  at `meta.workspace_root`. A `cache = False` input, whose revision would
+  otherwise live only in the run's memory, is spilled into the durable local
+  cache before the gate asks, under its own `{hashin}_{nanos}` key, which no
+  lookup hits. The reader stops at 4 MiB (`NOTICE_READ_CAP`); past it the
+  text ends with `… notice truncated: N of M bytes shown; full text: heph
+  inspect outputs <addr>`. A source not where it was recorded — a revision
+  gc'd since, a source file changed or gone — or a record with no `sources`
+  reads as "notice unavailable". A record from an older heph, whose sources
+  have another shape, does not decode: there is no fallback. `standing` is
+  `approve` or `reject` once Y or N set a standing decision for the build,
+  absent otherwise.
 - `Finished`: the TUI was torn down; `at_unix_ms` is the instant its final
   summary was measured against.
 - `Output {text}`: text the process wrote straight to its terminal, today the
   failure report printed after the teardown; its first 1 MiB, with a marker
   line when it was cut.
+
+`RunLog {addr, hashin, file}` says where a running target's live log is:
+`file` is relative to `meta.json`'s home (`runs/<id>/<n>.log`), written when
+the run's first byte creates it, and past the cap. `meta.json` lists the
+`run_logs` capability. A reader (`tui::session::find_run_log`) trusts it
+only for a session whose `meta.json` names its own home, while that
+session's lock is held and no `ExecuteEnd` for the addr follows it; a file
+gone under such a record means the run ended. `file` must be
+`runs/<dir>/<name>`, reached through no symlink, or it reads as absent.
 
 All four were added without a format bump: a heph from before them decodes
 each as `Unknown` and skips it. A reader skips and counts a complete line that does not decode and
@@ -273,7 +317,7 @@ The process's session is a `SessionSlot` that `main` owns: there is no
 process-wide instance. `main` configures it and hands it to whatever records
 into it — every command, as its own argument beside the sink;
 `bootstrap::new_engine` (the workspace for `meta.json`); the `LogSink`, which
-keeps a reference only to tee `info!` lines into the open session; the diag
+keeps a reference only to tee its lines into the open session; the diag
 sweeper; and the error renderer. `tui::run_app` takes the session as an
 explicit argument (a debug build asserts it is the sink's slot) and opens it
 lazily (a viewer's `App::records_session()` is false), and `main` finishes it with the exit code
@@ -294,10 +338,29 @@ included. The recorder is its own OS thread behind an unbounded channel:
 - `events.ndjson` stops at **64 MiB** with a `Truncated` record; `status.json`
   keeps updating. Past it, only what a viewer needs at the end is appended:
   `End`, `InflightWritten`, `Finished`, the failure report (`Output`), a
-  `Label` change, and an `Approval` that clears the prompt. An `Output`
+  `Label` change, and every `Approval` (a few short records per gated target,
+  carrying the notices' sources and the standing decision). An `Output`
   record keeps at most the first 1 MiB of its text, then a line saying how
   many bytes were left out, so the report a process prints (at most twice)
-  overshoots the cap by a bounded amount.
+  overshoots the cap by a bounded amount. `Log` records outlive the cap too,
+  up to **256 MiB** of them past it; the first one over that ceiling ends
+  them, and no later line is written even if it would fit.
+- The `LogSink` numbers every line it takes, a log line at the terminal's
+  filter or a diagnostic, and records it as `Log {seq}`. Numbering, sending
+  the record and handing the line to the printer are one critical section of
+  the sink's lock, so the printer and `events.ndjson` see the same numbers in
+  the same order, none reused or skipped.
+- `SessionTap::flush` waits (bounded) until every record sent before it is on
+  disk, and fails at once on a stopped or finished recorder rather than
+  waiting for it.
+- While a full screen is up the printer keeps only line numbers. Closing it
+  replays from disk (`LogSink::replay`): take the latest number, flush through
+  it, then read `Log` records from the offset noted when the screen opened
+  and print exactly those numbered after the last line printed and up to that
+  latest, once each. Lines missing from disk (past the ceiling, dropped by a
+  stopped recorder) are counted, and one `WARN` says how many were skipped.
+  This holds under `HEPH_NO_SESSION=1`, whose private session is what the
+  replay reads.
 
 What a run loses: a process wedged before its first flush loses at most 250ms
 of events; a second Ctrl-C, `SIGTERM`/`SIGHUP` or `SIGKILL` loses what came
@@ -396,6 +459,39 @@ a tomb (`.removing-<id>-<pid>`) and then deletes it; a tomb older than 10
 minutes, left by a removal that failed or died, is deleted outright with no
 lock. Two cleanups can race on that one, both deleting the same tomb, which is
 harmless: one finishes, the other sees it gone.
+
+Every start also cleans `~/.heph/private-sessions/` with nothing kept: an
+ended private session (lock free, so a killed run's) goes whatever its age,
+a live one is never touched, and one still being created is left alone as
+above.
+
+## Run logs
+
+A run's live log is not in the session directory. It lives in the workspace's
+home, beside the cache and the failure slots: `<home>/runs/<id>/<n>.log`, one
+directory per engine (a random id, not the session id) and one file per run
+(`crates/engine/src/engine/run_log.rs`).
+
+- **Created lazily.** A run's first output byte creates its file, and the
+  first file the directory. A run that prints nothing, and a warm all-hit
+  build, never touch `runs/`.
+- **Its own lock.** The directory is built as `runs/.new-<id>-<pid>/` with its
+  `lock` file already `flock`ed, then renamed into place, and the engine holds
+  that lock for its whole life. Liveness is that lock, never the session's:
+  with `HEPH_NO_SESSION=1` the session is private and nobody looks it up,
+  and a live build's logs must still not be deleted.
+- **Lifetime.** A run's file goes once the cache entry or failure slot that
+  replaces it is in place. A `cache = false` success keeps its file until the
+  engine exits. At a normal exit the engine removes its own directory, lock
+  still held.
+- **Cleanup.** `heph tool gc`, `heph tool clean` (whatever the selection) and the
+  start of every engine sweep `runs/`, the last off the build's path. A
+  directory whose `lock` is free or missing (a killed heph's, its
+  `cache = false` leftovers with it) is locked, renamed to a tomb
+  (`.tomb-<id>-<pid>`) and deleted; one whose lock is held is never touched. A
+  `.new-` or tomb directory older than 10 minutes is a crashed set-up or
+  removal and is deleted outright. `GcStats.run_log_dirs_removed` and
+  `CleanStats.run_log_dirs_removed` count what went.
 
 ## The daemon
 

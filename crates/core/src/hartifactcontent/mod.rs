@@ -62,6 +62,37 @@ pub enum WalkEntryKind {
     },
 }
 
+/// Where a [`Content`]'s bytes are kept, named so that a reader holding only
+/// this value can read them again — in another process included. See
+/// [`Content::origin`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Origin {
+    /// The entry whose hashout is `hashout` in revision `revision` (a hashin,
+    /// or the `{hashin}_{nanos}` key of an uncached revision) of target
+    /// `addr`, in heph's local cache.
+    Cache {
+        addr: String,
+        revision: String,
+        hashout: String,
+    },
+    /// A file read in place, never copied into a cache: `path` is the file,
+    /// absolute; the content presents it as the single entry `out_path`, with
+    /// exec bit `x` and the hashout recorded when it was hashed.
+    File {
+        path: PathBuf,
+        out_path: String,
+        x: bool,
+        hashout: String,
+    },
+    /// A path-rewriting view of `source`: each `(source path, path)` pair is an
+    /// entry of the source the view keeps and the path it presents it at, in
+    /// source order. Entries of the source not listed are dropped.
+    View {
+        source: Box<Origin>,
+        paths: Vec<(PathBuf, PathBuf)>,
+    },
+}
+
 #[derive(Clone, Copy)]
 pub enum Type {
     Tar,
@@ -134,6 +165,19 @@ pub trait Content: Send + Sync {
     /// What backs rule 1 is per-implementation; the engine's cache artifacts
     /// document their own guarantee, and it is not the same for every `Content`.
     fn file_path(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+    /// Where this content's bytes are kept, for a reader that will hold
+    /// nothing but the answer — the approval notice a session records
+    /// ([`crate::approval_notice`]). `None` (the default): nowhere such a
+    /// reader can name — in memory, or a stream.
+    ///
+    /// Naming the place does not keep the bytes there: an uncached revision
+    /// may still be only in this process's memory (the engine moves it into
+    /// the local cache before handing an origin out), and a cache entry can
+    /// be gc'd. A reader degrades to "unavailable", never to other bytes: a
+    /// cache entry is matched by hashout, a file by its recorded hash.
+    fn origin(&self) -> Option<Origin> {
         None
     }
 }

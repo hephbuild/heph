@@ -346,6 +346,16 @@ pub(crate) const MANIFEST_V2_VERSION: &str = "2.0.0";
 /// Every manifest name a revision can have, newest first: the read order.
 pub(crate) const MANIFESTS: [&str; 2] = [MANIFEST_V2, MANIFEST_V1];
 
+/// The durable cache's sqlite database under a heph `home`.
+pub(crate) fn cache_db_path(home: &std::path::Path) -> std::path::PathBuf {
+    home.join("cache").join("cache.db")
+}
+
+/// The durable cache's directory of spilled blobs under a heph `home`.
+pub(crate) fn cache_blobs_dir(home: &std::path::Path) -> std::path::PathBuf {
+    home.join("cache").join("blobs")
+}
+
 /// Whether `name` is a manifest rather than an artifact blob.
 pub(crate) fn is_manifest_name(name: &str) -> bool {
     MANIFESTS.contains(&name)
@@ -369,6 +379,33 @@ pub struct CacheArtifact {
     /// not what its blob occupies at rest). Used by the engine auto-mode
     /// router to size FUSE vs unpack-copy decisions cheaply.
     pub size: u64,
+}
+
+impl CacheArtifact {
+    /// The artifact a manifest entry of revision `(addr, hashin)` names, read
+    /// through `cache`.
+    pub(crate) fn from_manifest(
+        addr: &Addr,
+        hashin: &str,
+        artifact: &ManifestArtifact,
+        cache: Arc<dyn LocalCache>,
+    ) -> Self {
+        Self {
+            addr: addr.clone(),
+            hashin: hashin.to_string(),
+            name: artifact.name.clone(),
+            cache,
+            encoding: artifact.encoding.clone(),
+            content_type: match artifact.content_type {
+                ManifestArtifactContentType::Tar => hartifactcontent::Type::Tar,
+                ManifestArtifactContentType::Cpio => hartifactcontent::Type::Cpio,
+            },
+            r#type: artifact.r#type.clone(),
+            hashout: artifact.hashout.clone(),
+            group: artifact.group.clone(),
+            size: artifact.size,
+        }
+    }
 }
 
 impl hartifactcontent::Content for CacheArtifact {
@@ -396,6 +433,17 @@ impl hartifactcontent::Content for CacheArtifact {
 
     fn hashout(&self) -> anyhow::Result<String> {
         Ok(self.hashout.clone())
+    }
+
+    /// This entry, by revision key and hashout. For an uncached revision the
+    /// key is the `{hashin}_{nanos}` one, and its bytes may still be only in
+    /// the tmp tier's memory: see [`super::local_cache_tmp::LocalCacheTmp::persist_revision`].
+    fn origin(&self) -> Option<hartifactcontent::Origin> {
+        Some(hartifactcontent::Origin::Cache {
+            addr: self.addr.format(),
+            revision: self.hashin.clone(),
+            hashout: self.hashout.clone(),
+        })
     }
 
     fn entry_paths(&self) -> anyhow::Result<Vec<std::path::PathBuf>> {
@@ -809,8 +857,10 @@ impl Engine {
         // `local_cache_tmp` — small entries stay in memory and skip the SQLite
         // WAL write. `CacheArtifact` carries the cache it was written to, so
         // reads resolve against the same store.
+        let tmp_cache: Arc<dyn LocalCache>;
         let cache = if tmp {
-            &self.local_cache_tmp
+            tmp_cache = self.local_cache_tmp.clone();
+            &tmp_cache
         } else {
             &self.local_cache
         };
@@ -918,6 +968,40 @@ impl Engine {
         // (see `Engine::spawn_remote_upload`), not here — it must not block the
         // build's critical path on the network.
         Ok(res_artifacts)
+    }
+
+    /// The `Log` artifact of the local cache entry for `addr` at `hashin`, as a
+    /// readable artifact. `None` when there is no entry, or it keeps no log.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn cached_log(
+        &self,
+        addr: &Addr,
+        hashin: &str,
+    ) -> anyhow::Result<Option<Arc<dyn hartifactcontent::Content>>> {
+        let Some(manifest) = self.read_manifest(addr, hashin)? else {
+            return Ok(None);
+        };
+        Ok(manifest
+            .artifacts
+            .into_iter()
+            .find(|a| matches!(a.r#type, ManifestArtifactType::Log))
+            .map(|a| -> Arc<dyn hartifactcontent::Content> {
+                Arc::new(CacheArtifact {
+                    addr: addr.clone(),
+                    hashin: hashin.to_owned(),
+                    name: a.name,
+                    cache: Arc::clone(&self.local_cache),
+                    encoding: a.encoding,
+                    content_type: match a.content_type {
+                        ManifestArtifactContentType::Tar => hartifactcontent::Type::Tar,
+                        ManifestArtifactContentType::Cpio => hartifactcontent::Type::Cpio,
+                    },
+                    r#type: a.r#type,
+                    hashout: a.hashout,
+                    group: a.group,
+                    size: a.size,
+                })
+            }))
     }
 
     /// Read and deserialize a group's manifest. `Ok(None)` if it is absent.
@@ -1051,13 +1135,27 @@ impl Engine {
             } else {
                 artifact.name.clone()
             };
-            let mut reader = self
-                .local_cache
-                .reader(addr, src_key, &artifact.name)
-                .with_context(|| {
-                    format!("open source blob {} for {addr} {src_key}", artifact.name)
-                })?
-                .reader;
+            let mut reader = match self.local_cache.reader(addr, src_key, &artifact.name) {
+                Ok(r) => r.reader,
+                // A remote hit's log is fetched only when someone reads it,
+                // so its blob may be absent: the duplicate names it as the
+                // source does, and whether anyone read a log never changes
+                // what a later run finds.
+                Err(e)
+                    if artifact.r#type == ManifestArtifactType::Log && e.is::<NotFoundError>() =>
+                {
+                    dup_artifacts.push(ManifestArtifact {
+                        name: dst_name,
+                        ..artifact.clone()
+                    });
+                    continue;
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("open source blob {} for {addr} {src_key}", artifact.name)
+                    });
+                }
+            };
             let mut writer = self
                 .local_cache
                 .writer(addr, dst_key, &dst_name)
@@ -1325,21 +1423,12 @@ impl Engine {
                 return Ok(None);
             }
 
-            results.push(CacheArtifact {
-                addr: addr.clone(),
-                hashin: hashin.to_string(),
-                name: artifact.name.clone(),
-                cache: local_cache.clone(),
-                encoding: artifact.encoding.clone(),
-                content_type: match artifact.content_type {
-                    ManifestArtifactContentType::Tar => hartifactcontent::Type::Tar,
-                    ManifestArtifactContentType::Cpio => hartifactcontent::Type::Cpio,
-                },
-                r#type: artifact.r#type.clone(),
-                hashout: artifact.hashout.clone(),
-                group: artifact.group.clone(),
-                size: artifact.size,
-            });
+            results.push(CacheArtifact::from_manifest(
+                addr,
+                hashin,
+                artifact,
+                local_cache.clone(),
+            ));
         }
 
         Ok(Some((results, result_meta)))
@@ -2583,6 +2672,75 @@ mod tests {
         );
         assert_eq!(primary_bytes, extra_bytes);
         assert!(!primary_bytes.is_empty());
+    }
+
+    /// A duplicate copies the source's `Log` blob only when it is present: a
+    /// remote hit's log is fetched only when someone reads it, so whether
+    /// anyone did must not decide whether an `in_place` fixpoint registers.
+    /// The duplicate names the log either way, as the source does.
+    #[tokio::test]
+    async fn duplicate_cache_entry_copies_log_only_when_present() {
+        let (engine, _dir) = test_engine();
+        let ctoken = StdCancellationToken::new();
+        let addr = test_addr();
+        let log = outputartifact::OutputArtifact {
+            r#type: outputartifact::Type::Log,
+            ..raw_artifact("log", b"the run's log\n")
+        };
+        engine
+            .cache_locally(
+                &ctoken,
+                &addr,
+                "PRIMARYHASH",
+                vec![raw_artifact("a", b"out"), log],
+                false,
+            )
+            .await
+            .expect("cache_locally");
+        let log_name = |hashin: &str| {
+            engine
+                .read_manifest(&addr, hashin)
+                .expect("read manifest")
+                .expect("manifest")
+                .artifacts
+                .into_iter()
+                .find(|a| a.r#type == ManifestArtifactType::Log)
+                .expect("the manifest names its log")
+                .name
+        };
+        let blob = |hashin: &str, name: &str| match engine.local_cache.reader(&addr, hashin, name) {
+            Ok(r) => Some(drain_reader(r.reader)),
+            Err(e) if e.is::<NotFoundError>() => None,
+            Err(e) => panic!("reading {hashin}/{name}: {e:#}"),
+        };
+
+        // Present: copied byte for byte.
+        assert!(
+            engine
+                .duplicate_cache_revision(&addr, "PRIMARYHASH", "WITHLOG")
+                .expect("duplicate")
+        );
+        let src = blob("PRIMARYHASH", &log_name("PRIMARYHASH")).expect("source log");
+        assert_eq!(blob("WITHLOG", &log_name("WITHLOG")), Some(src));
+
+        // Absent (a remote hit nobody read): the duplicate still registers,
+        // names the log, and holds no blob for it.
+        engine
+            .local_cache
+            .delete(&addr, "PRIMARYHASH", &log_name("PRIMARYHASH"))
+            .expect("drop the log blob");
+        assert!(
+            engine
+                .duplicate_cache_revision(&addr, "PRIMARYHASH", "NOLOG")
+                .expect("a missing log blob is no error")
+        );
+        assert_eq!(blob("NOLOG", &log_name("NOLOG")), None);
+        let (outs, _) = engine
+            .artifacts_from_local_cache(&ctoken, &linked_def(&addr), "NOLOG", vec!["out".into()])
+            .await
+            .expect("read duplicate")
+            .expect("duplicate present");
+        assert_eq!(outs.len(), 1);
     }
 
     /// Plant what an older heph wrote: a [`MANIFEST_V1`] (version "1.0.0")

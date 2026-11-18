@@ -213,10 +213,11 @@ fn listed_facts_kill_switch(v: Option<&std::ffi::OsStr>) -> bool {
 /// The workspace it resolves is recorded in `session`, the process's session
 /// threaded from `main`, for the `meta.json` of the session a later `run_app`
 /// opens. Only workspace fields are stored: a command that never reaches
-/// `run_app` opens no session.
+/// `run_app` opens no session. The engine announces each run's live log to
+/// the same slot, recorded once a session is open.
 pub fn new_engine(
     global: &super::GlobalOptions,
-    session: &SessionSlot,
+    session: &Arc<SessionSlot>,
 ) -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     new_engine_with(global, BadEnv::Refuse, Some(session))
 }
@@ -306,7 +307,7 @@ fn engine_config(
 fn new_engine_with(
     global: &super::GlobalOptions,
     bad_env: BadEnv,
-    session: Option<&SessionSlot>,
+    session: Option<&Arc<SessionSlot>>,
 ) -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     let root = match engine::get_root() {
         Ok(r) => r,
@@ -339,6 +340,12 @@ fn new_engine_with(
         .collect();
 
     let mut e = engine::Engine::new(config)?;
+    // Each run's live log becomes a `RunLog` record of the session, so
+    // another terminal can follow it. The slot carries no session id to the
+    // engine (I1).
+    if let Some(session) = session {
+        e.set_run_log_announcer(Arc::clone(session) as _);
+    }
 
     // Always on, never gated. The diagnostic that needs a flag is the one you did
     // not pass on the run that hung — the whole reason this exists. Its `on_event`
@@ -391,12 +398,24 @@ fn new_engine_with(
 /// Ctrl-C while the TUI is in raw mode (ISIG cleared), in which case this
 /// task never fires and the TUI's key handler drives the trigger instead.
 /// Both producers are gated by the same `SuppressionHandle`.
+///
+/// The listener is armed here, before the task is spawned: `ctrl_c()` arms
+/// nothing until it is first polled, so a spawned task that had not run yet
+/// left SIGINT's default action in place, and a ctrl-c pressed once the
+/// command was already printing (`heph log -f`'s "waiting for a run to
+/// start") killed heph by the signal instead of cancelling it.
 fn spawn_sigint_producer(trigger: ShutdownTrigger) {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut sigint = match signal(SignalKind::interrupt()) {
+        Ok(sigint) => sigint,
+        Err(e) => {
+            tracing::warn!(error = %e, "listening for ctrl-c; it will kill heph instead of cancelling");
+            return;
+        }
+    };
     tokio::spawn(async move {
-        loop {
-            if tokio::signal::ctrl_c().await.is_err() {
-                return;
-            }
+        while sigint.recv().await.is_some() {
             trigger.trigger();
         }
     });

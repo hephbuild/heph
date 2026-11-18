@@ -476,6 +476,13 @@ at process exit whether or not any destructor runs, so it covers a panic, a
 inherited, for the same reason in reverse — an agent that co-owned heph's own
 descriptors would outlive it and hang anything reading heph's output to EOF.
 
+Whichever way the agent goes — that EOF, or the `SIGTERM` heph's tidy shutdown
+sends its group — it first `SIGKILL`s the process group of every target still in
+flight. Each target runs in a session of its own, so nothing aimed at the
+agent's group reaches it: before this, a target that ignored its cancel (a hung
+`vitest` and its workers) and timed out just before heph exited was left
+running, reparented to init, after the build.
+
 ## Plugins
 
 A driver in a **cdylib** plugin runs its target under a runner the same way a

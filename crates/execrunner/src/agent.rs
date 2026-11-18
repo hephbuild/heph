@@ -529,9 +529,73 @@ pub fn start_via_agent(
 /// The real agent is a subcommand of the heph binary; this is the same
 /// [`serve`] loop without the process boundary, so a test can exercise the
 /// descriptor handshake, the fork, and the cancellation escalation without a
-/// release build.
-pub fn serve_for_test(socket: &Path) -> anyhow::Result<()> {
-    serve(socket)
+/// release build. `in_flight` is the registry the agent's own teardown kills
+/// (see [`InFlight::kill_all`]); a test holds a handle to it to do the same.
+pub fn serve_for_test(socket: &Path, in_flight: Arc<InFlight>) -> anyhow::Result<()> {
+    serve(socket, in_flight)
+}
+
+/// The process groups of the targets an agent has started and not yet
+/// finished with: what its teardown kills on the way out.
+///
+/// Every target runs in a session of its own (`setsid` in [`run_one`]), so a
+/// `killpg` on the agent's own group reaches none of them. Without this, an
+/// agent that exits while a target is still running — heph gone, hard-killed
+/// or simply finished while a timed-out target sat inside the agent's cancel
+/// grace — leaves the target and every worker it forked reparented and running,
+/// holding heph's pipes and writing into a sandbox that is being deleted.
+#[derive(Debug, Default)]
+pub struct InFlight(std::sync::Mutex<Vec<i32>>);
+
+impl InFlight {
+    /// Record `pgid` until the returned guard is dropped.
+    fn track(self: &Arc<Self>, pgid: i32) -> Tracked {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(pgid);
+        Tracked {
+            set: Arc::clone(self),
+            pgid,
+        }
+    }
+
+    /// `SIGKILL` the process group of every target in flight.
+    ///
+    /// No `SIGINT` and grace first: this runs on the agent's way out, and
+    /// nothing is left to escalate once the agent is gone. A group stays
+    /// listed until [`run_one`] is done with it, which is after its leader is
+    /// reaped — the same "right after the reap" window `proc_exec`'s own
+    /// group kill accepts. The lock is held throughout, so no entry is
+    /// removed mid-walk.
+    pub fn kill_all(&self) {
+        let groups = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for &pgid in groups.iter() {
+            killpg(pgid, libc::SIGKILL);
+        }
+    }
+}
+
+/// One entry in an [`InFlight`], removed when dropped.
+struct Tracked {
+    set: Arc<InFlight>,
+    pgid: i32,
+}
+
+impl Drop for Tracked {
+    fn drop(&mut self) {
+        let mut groups = self
+            .set
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(i) = groups.iter().position(|&p| p == self.pgid) {
+            groups.swap_remove(i);
+        }
+    }
 }
 
 /// Exit exactly the way the target did.
@@ -584,9 +648,11 @@ pub fn agent_main(socket: PathBuf) -> ! {
     // Only here, never in `serve` — `serve_for_test` shares that loop in-process,
     // and a test harness's stdin is closed, so watching it there would read EOF
     // immediately and kill the test runner's own process group.
-    watch_parent(socket.clone());
+    let in_flight = Arc::new(InFlight::default());
+    watch_parent(socket.clone(), Arc::clone(&in_flight));
+    on_sigterm(socket.clone(), Arc::clone(&in_flight));
 
-    let code = match serve(&socket) {
+    let code = match serve(&socket, in_flight) {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("heph {AGENT_SUBCOMMAND}: {e:#}");
@@ -625,7 +691,7 @@ fn reset_inherited_signal_state() {
     unsafe { libc::sigprocmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut()) };
 }
 
-fn serve(socket: &Path) -> anyhow::Result<()> {
+fn serve(socket: &Path, in_flight: Arc<InFlight>) -> anyhow::Result<()> {
     reset_inherited_signal_state();
 
     // Dispatched at the top of `main`, the agent never reaches heph's own
@@ -670,7 +736,7 @@ fn serve(socket: &Path) -> anyhow::Result<()> {
                 continue;
             }
         };
-        rt.spawn(handle_conn(conn, fds));
+        rt.spawn(handle_conn(conn, fds, Arc::clone(&in_flight)));
     }
     Ok(())
 }
@@ -687,9 +753,8 @@ fn serve(socket: &Path) -> anyhow::Result<()> {
 /// survivor holds a socket, its own process group, and whatever descriptors it
 /// was handed, and they accumulate one per build.
 ///
-/// `killpg` on our own group on the way out, so targets mid-flight go too
-/// rather than being reparented and left running.
-fn watch_parent(socket: PathBuf) {
+/// The way out is [`teardown`].
+fn watch_parent(socket: PathBuf, in_flight: Arc<InFlight>) {
     std::thread::spawn(move || {
         let mut sink = [0u8; 64];
         loop {
@@ -701,14 +766,112 @@ fn watch_parent(socket: PathBuf) {
                 Err(_) => break,
             }
         }
-        _ = std::fs::remove_file(&socket);
-        // SAFETY: reads this process's own process-group id.
-        let pgrp = unsafe { libc::getpgrp() };
-        // SAFETY: our own process group, which `setsid` in the parent made us
-        // the leader of.
-        unsafe { libc::killpg(pgrp, libc::SIGTERM) };
-        std::process::exit(0);
+        teardown(&socket, &in_flight);
     });
+}
+
+/// The write end of the pipe [`on_sigterm`]'s thread reads, for the handler to
+/// reach. As with [`SIGNAL_SOCKET`], a handler may do little more than one
+/// `write(2)`, so the fd travels through an atomic.
+static SIGTERM_PIPE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+extern "C" fn sigterm_to_pipe(_sig: i32) {
+    let fd = SIGTERM_PIPE.load(std::sync::atomic::Ordering::Relaxed);
+    if fd < 0 {
+        return;
+    }
+    // SAFETY: `write` is async-signal-safe, and the fd is this process's own
+    // pipe, never closed once published. A second SIGTERM finding the pipe
+    // full loses nothing: the first byte already started the teardown.
+    unsafe {
+        libc::write(fd, [1u8].as_ptr().cast(), 1);
+    }
+}
+
+/// Run [`teardown`] on `SIGTERM` rather than dying of it.
+///
+/// `SIGTERM` to the agent's group is heph's tidy shutdown of a session (and
+/// what [`teardown`] sends that group itself). Its default action ends the
+/// agent without a word to the targets in flight, which are in sessions of
+/// their own and so never get the signal: the same leak as an agent exiting on
+/// a closed stdin without killing them.
+///
+/// The handler only writes a byte to a pipe; a thread reads it and does the
+/// work, which takes a lock and so cannot happen in the handler. If the pipe
+/// cannot be made, the default action stays, which is what it was before.
+fn on_sigterm(socket: PathBuf, in_flight: Arc<InFlight>) {
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: `fds` is a live two-element array, as `pipe` requires.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        tracing::warn!(
+            error = %std::io::Error::last_os_error(),
+            "exec-runner agent: no SIGTERM pipe; a SIGTERM will not reach the targets in flight"
+        );
+        return;
+    }
+    use std::os::fd::FromRawFd as _;
+    let [read, write] = fds;
+    // SAFETY: `pipe` just returned this descriptor, owned by nobody else.
+    let read = unsafe { OwnedFd::from_raw_fd(read) };
+    // SAFETY: as above.
+    let write = unsafe { OwnedFd::from_raw_fd(write) };
+    // Close-on-exec, or every target inherits both ends.
+    for fd in [&read, &write] {
+        if rustix::io::fcntl_setfd(fd, rustix::io::FdFlags::CLOEXEC).is_err() {
+            return;
+        }
+    }
+    // Published for the life of the process: the handler may run at any time,
+    // so the descriptor is never closed.
+    SIGTERM_PIPE.store(
+        std::os::fd::IntoRawFd::into_raw_fd(write),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    // SAFETY: the handler only loads an atomic and calls `write`, both
+    // async-signal-safe.
+    unsafe {
+        libc::signal(
+            libc::SIGTERM,
+            sigterm_to_pipe as extern "C" fn(libc::c_int) as libc::sighandler_t,
+        );
+    }
+    std::thread::spawn(move || {
+        let mut read = std::fs::File::from(read);
+        let mut byte = [0u8; 1];
+        loop {
+            match read.read(&mut byte) {
+                Ok(0) => return,
+                Ok(_) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return,
+            }
+        }
+        teardown(&socket, &in_flight);
+    });
+}
+
+/// The agent's one way out, whichever way it is told to go.
+///
+/// Every target still in flight is killed first: each runs in a session of its
+/// own, so nothing aimed at the agent's group reaches it. Then the agent's own
+/// group — the launch wrapper with it — so nothing it started is reparented
+/// and left running.
+fn teardown(socket: &Path, in_flight: &InFlight) {
+    // Once only: the `killpg` below delivers a SIGTERM to this process too,
+    // which with [`on_sigterm`] installed comes back here on another thread,
+    // and two threads must not race to `exit`.
+    static TORN_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if TORN_DOWN.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    _ = std::fs::remove_file(socket);
+    in_flight.kill_all();
+    // SAFETY: reads this process's own process-group id.
+    let pgrp = unsafe { libc::getpgrp() };
+    // SAFETY: our own process group, which `setsid` in the parent made us
+    // the leader of.
+    unsafe { libc::killpg(pgrp, libc::SIGTERM) };
+    std::process::exit(0);
 }
 
 fn raise_fd_limit() {
@@ -724,9 +887,9 @@ fn raise_fd_limit() {
     }
 }
 
-async fn handle_conn(conn: UnixStream, fds: [OwnedFd; 3]) {
+async fn handle_conn(conn: UnixStream, fds: [OwnedFd; 3], in_flight: Arc<InFlight>) {
     let mut conn = conn;
-    let outcome = match run_one(&mut conn, fds).await {
+    let outcome = match run_one(&mut conn, fds, &in_flight).await {
         Ok(o) => o,
         Err(e) => ExecOutcome::Failed(format!("{e:#}")),
     };
@@ -778,7 +941,11 @@ fn agent_environment(request: Vec<(OsString, OsString)>) -> Vec<(OsString, OsStr
     env
 }
 
-async fn run_one(conn: &mut UnixStream, fds: [OwnedFd; 3]) -> anyhow::Result<ExecOutcome> {
+async fn run_one(
+    conn: &mut UnixStream,
+    fds: [OwnedFd; 3],
+    in_flight: &Arc<InFlight>,
+) -> anyhow::Result<ExecOutcome> {
     let body = read_frame(conn).map_err(|e| anyhow::anyhow!("read exec request: {e}"))?;
     let req = ExecRequest::decode(&body[..]).map_err(|e| anyhow::anyhow!("decode request: {e}"))?;
 
@@ -816,6 +983,10 @@ async fn run_one(conn: &mut UnixStream, fds: [OwnedFd; 3]) -> anyhow::Result<Exe
     let handle =
         proc_exec::spawn(spec).map_err(|e| anyhow::anyhow!("spawn {:?}: {e}", req.program))?;
     let pgid = handle.pid();
+    // Listed until this function returns — after the last `killpg` below — so
+    // the agent's teardown reaches the group for as long as anything here
+    // might still have to.
+    let _tracked = in_flight.track(pgid);
 
     let cancel = Arc::new(hcore::hasync::StdCancellationToken::new());
     let waiter = handle.spawn_wait(cancel.clone());

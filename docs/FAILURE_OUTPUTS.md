@@ -53,6 +53,14 @@ There is one slot per address (per variant). It has no history:
   its next run starts. A passing run therefore leaves no slot behind.
 - `heph tool gc --failure-max-age-days N` drops old slots, 7 days by default.
 
+`log.txt` is the engine's own copy of the run's output. A plugin streams its
+output into the engine's live run log (`<home>/runs/<id>/<n>.log`, see
+`docs/SESSIONS.md`), scrubbed of credential values as it arrives; when the run
+fails, that file is copied into the slot through its open descriptor and then
+unlinked. A plugin built before log streaming returns a log file instead: the
+engine imports it, scrubbed the same way, provided it is a regular file inside
+the run's sandbox, and the returned file wins over anything streamed.
+
 The failure box prints where each part is:
 
 ```

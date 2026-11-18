@@ -711,6 +711,22 @@ impl Content for ViewContent {
         Ok(self.mapping()?.0.values().cloned().collect())
     }
 
+    /// The source's origin, plus the mapping this view applies to it. `None`
+    /// when the source has none, or the transform does not resolve.
+    fn origin(&self) -> Option<super::Origin> {
+        let source = self.source.origin()?;
+        let paths = self
+            .mapping()
+            .ok()?
+            .pairs()
+            .map(|(s, d)| (s.to_path_buf(), d.to_path_buf()))
+            .collect();
+        Some(super::Origin::View {
+            source: Box::new(source),
+            paths,
+        })
+    }
+
     /// Deliberately `None` (the trait default) for both this and
     /// [`Content::file_path`]: the backing bytes are a container whose internal
     /// paths are *not* the ones this view presents, so handing a caller the raw

@@ -1,6 +1,5 @@
 mod entrypoint_mode;
 mod filterenv;
-pub mod redact;
 mod spec;
 
 use anyhow::Context;
@@ -8,6 +7,7 @@ use async_trait::async_trait;
 use hcore::debug_hash::DebugHasher;
 use hcore::hasync::Cancellable;
 use hdriver_support::driver_managed::{ManagedRunRequest, ManagedRunResponse};
+use hdriver_support::redact;
 use hexecrunner::RunnerRef;
 use hplugin::driver::sandbox::EnvValue;
 use hplugin::driver::targetdef::path::{CodegenMode, Content, Path};
@@ -1176,7 +1176,7 @@ async fn pty_session_output(
 /// [`SinkLoss`] exists to make visible.
 async fn flush_redacted(
     redactor: &mut Option<redact::Redactor>,
-    log: &Arc<std::sync::Mutex<std::fs::File>>,
+    log: Option<&Arc<std::sync::Mutex<std::fs::File>>>,
     sink: &mut Option<&mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin)>,
     lost: &mut SinkLoss,
 ) {
@@ -1187,7 +1187,7 @@ async fn flush_redacted(
     if tail.is_empty() {
         return;
     }
-    if let Ok(mut g) = log.lock() {
+    if let Some(Ok(mut g)) = log.map(|l| l.lock()) {
         drop(g.write_all(&tail));
     }
     if let Some(out) = sink {
@@ -1273,13 +1273,16 @@ impl SinkLoss {
 /// `stdout_bytes`/`stderr_bytes` mirror `tee_stream`'s `bytes_read`: a
 /// post-wait drain timeout reports how much of each stream it actually got
 /// before giving up, rather than just "it timed out".
+///
+/// `log` is `None` under `log_capture`: the sinks *are* the log then, and the
+/// host scrubs them, so `needles` is `None` too.
 #[expect(
     clippy::too_many_arguments,
     reason = "one tee over both streams: two sinks, two counters, and redaction"
 )]
 async fn tee_output<'io>(
     reader: Option<proc_exec::OutputReader>,
-    log: Arc<std::sync::Mutex<std::fs::File>>,
+    log: Option<Arc<std::sync::Mutex<std::fs::File>>>,
     // One lifetime for both: the loop reborrows whichever sink the current
     // chunk belongs to, so the two must be interchangeable.
     mut stdout: Option<&'io mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin)>,
@@ -1308,8 +1311,8 @@ async fn tee_output<'io>(
                 // target's output disappear. A refused write is recorded rather
                 // than dropped, for the same reason every other sink write here
                 // is — see [`SinkLoss`].
-                flush_redacted(&mut red_out, &log, &mut stdout, &mut lost_stdout).await;
-                flush_redacted(&mut red_err, &log, &mut stderr, &mut lost_stderr).await;
+                flush_redacted(&mut red_out, log.as_ref(), &mut stdout, &mut lost_stdout).await;
+                flush_redacted(&mut red_err, log.as_ref(), &mut stderr, &mut lost_stderr).await;
                 break;
             }
             // One reader now carries both streams, so treating a read error as
@@ -1343,7 +1346,7 @@ async fn tee_output<'io>(
         if chunk.is_empty() {
             continue;
         }
-        if let Ok(mut g) = log.lock() {
+        if let Some(Ok(mut g)) = log.as_ref().map(|l| l.lock()) {
             drop(g.write_all(chunk));
         }
         let sink = match stream {
@@ -2564,7 +2567,15 @@ impl Driver {
         // reaches `log.txt` — which is packed into the cache as an artifact and
         // lifted into the failure event. `None` for every target that declares no
         // credentials.
-        let needles = redact::Needles::new(rreq.credentials.iter().flat_map(|m| m.redact.iter()));
+        //
+        // Under `log_capture` the host's writers are the log: it scrubs them
+        // itself, so nothing is scrubbed (or written) here.
+        let log_capture = rreq.log_capture;
+        let needles = if log_capture {
+            None
+        } else {
+            redact::Needles::new(rreq.credentials.iter().flat_map(|m| m.redact.iter()))
+        };
 
         // The target's own tools lead, wherever it ends up running — composed by
         // `hexecrunner` rather than spliced into the string here, because under
@@ -2611,8 +2622,11 @@ impl Driver {
 
         // Created for a captured run only. Nothing is teed from a run on the
         // caller's terminal, inherited or on a PTY, and a `--shell` is
-        // interactive: no log, no redaction, and so no artifact (R22).
-        let writes_log = !shell && matches!(options.stdio, hplugin::driver::RunStdio::Captured);
+        // interactive: no log, no redaction, and so no artifact (R22). Under
+        // `log_capture` the host keeps the log from the writers, so the
+        // driver writes and returns none of its own.
+        let captured = !shell && matches!(options.stdio, hplugin::driver::RunStdio::Captured);
+        let writes_log = captured && !log_capture;
         let output_log_path = req.sandbox_dir.join("log.txt");
         let output_log = writes_log
             .then(|| std::fs::File::create(&output_log_path).with_context(|| "create log file"))
@@ -2964,9 +2978,11 @@ impl Driver {
         } else {
             let stdin_pump = handle.take_stdin();
             let output_reader = handle.take_output();
-            let log_for_out = output_log_file
-                .clone()
-                .context("a captured run has a log file")?;
+            let log_for_out = output_log_file.clone();
+            anyhow::ensure!(
+                log_for_out.is_some() || log_capture,
+                "a captured run has a log file"
+            );
             let output_fut = Box::pin(tee_output(
                 output_reader,
                 log_for_out,

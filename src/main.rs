@@ -316,6 +316,8 @@ fn main() -> ExitCode {
             }
             commands::session::exit_code(e).unwrap_or(commands::session::SessionExit::OWN_FAILURE)
         }
+        // `heph log` found no log: its status line already said so.
+        Err(e) if e.downcast_ref::<commands::log::NoLog>().is_some() => 1,
         Err(e) if e.downcast_ref::<commands::run::InvokeFailed>().is_some() => {
             let failed = e.downcast_ref::<commands::run::InvokeFailed>();
             if let Some(f) = failed

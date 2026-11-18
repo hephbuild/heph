@@ -239,6 +239,93 @@ target(
     }
 }
 
+/// A target that times out under a session runner takes its whole process tree
+/// with it, even when it ignores the cancel and heph exits right after.
+///
+/// The shape of a hung vitest: a parent that ignores SIGINT and SIGTERM, with
+/// workers that ignore them too and never exit. The agent escalates to SIGKILL
+/// only after its own grace, and heph — done once the timed-out target is
+/// reported — shuts the session down inside that grace. The agent died of the
+/// SIGTERM without a word to the target, which runs in a session of its own,
+/// so the whole tree was reparented and kept running after the build.
+#[test]
+fn a_timed_out_target_under_a_session_runner_leaves_nothing_running() {
+    let dist = Dist::locate();
+    let ws = Workspace::new().expect("workspace");
+    let pidfile = ws.root().join("target.pid");
+    let wpidfile = ws.root().join("worker.pid");
+
+    let mut build = passthrough_runner("runner");
+    build.push_str(&format!(
+        r#"
+target(
+    name = "hang",
+    driver = "bash",
+    run = """/bin/sh -c 'trap "" INT TERM HUP; echo $$ > {wpid}; while :; do /bin/sleep 1; done' &
+trap "" INT TERM
+echo $$ > {pid}
+echo started
+wait""",
+    out = [],
+    runner = "//xr:runner",
+    timeout = "2s",
+)
+"#,
+        pid = pidfile.display(),
+        wpid = wpidfile.display(),
+    ));
+    ws.write("xr/BUILD", &build).expect("write BUILD");
+
+    let out = ws.run(&dist, &["run", "//xr:hang"]).expect("run");
+    assert!(!out.status.success(), "{}", describe(&out));
+
+    let read_pid = |p: &std::path::Path| -> i32 {
+        std::fs::read_to_string(p)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "{} was never written ({e})\n{}",
+                    p.display(),
+                    describe(&out)
+                )
+            })
+            .trim()
+            .parse()
+            .expect("a pid")
+    };
+    let (pid, wpid) = (read_pid(&pidfile), read_pid(&wpidfile));
+    // Whatever the verdict, nothing this test started outlives it. The target
+    // leads its own group, which the worker is in.
+    struct KillGroup(i32);
+    impl Drop for KillGroup {
+        fn drop(&mut self) {
+            // SAFETY: plain syscall; at worst the group is already gone.
+            unsafe { libc::killpg(self.0, libc::SIGKILL) };
+        }
+    }
+    let _cleanup = KillGroup(pid);
+
+    // Gone, or a zombie no one has reaped yet: either way, no longer running.
+    let alive = |pid: i32| -> bool {
+        // SAFETY: signal 0 only probes for the process's existence.
+        let exists = unsafe { libc::kill(pid, 0) } == 0;
+        exists
+            && !std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .is_ok_and(|s| s.rsplit_once(") ").is_some_and(|(_, r)| r.starts_with('Z')))
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while (alive(pid) || alive(wpid)) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(
+        !alive(pid) && !alive(wpid),
+        "the timed-out target (pid {pid}, alive: {}) or its worker (pid {wpid}, alive: {}) \
+         outlived the run\n{}",
+        alive(pid),
+        alive(wpid),
+        describe(&out)
+    );
+}
+
 /// A session runner whose launch script sets up an environment before handing
 /// over to the agent.
 ///

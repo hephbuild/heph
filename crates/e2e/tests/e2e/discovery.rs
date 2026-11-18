@@ -207,8 +207,13 @@ async fn validate_reports_skips_and_still_checks_the_rest() -> anyhow::Result<()
 /// cancelled, and the skips are not reported as an incomplete selection.
 #[tokio::test]
 async fn ctrl_c_with_skips_exits_as_cancelled() -> anyhow::Result<()> {
+    // Waits 30s in bash alone: this harness puts no coreutils on the target's
+    // `PATH`, and `sleep 30` there exits 127 at once. A target that fails
+    // before the cancel lands makes the run a plain failure, `Ok` with
+    // `fail_fast` off, so the test raced the cancel against that exit.
+    let wait_30s = r#"coproc { read -r _; }; read -r -t 30 -u "${COPROC[0]}" _; echo t > $OUT"#;
     let ws = workspace(
-        vec![bash("//slow:t", "sleep 30; echo t > $OUT", &[], &["x"])],
+        vec![bash("//slow:t", wait_30s, &[], &["x"])],
         None,
         &["//broken:x"],
     )?;

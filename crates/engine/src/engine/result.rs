@@ -647,6 +647,9 @@ impl Content for GuardedArtifact {
     fn file_path(&self) -> Option<std::path::PathBuf> {
         self.inner.file_path()
     }
+    fn origin(&self) -> Option<hcore::hartifactcontent::Origin> {
+        self.inner.origin()
+    }
 }
 
 /// One produced output of a target as it travels the result pipeline: an opaque
@@ -737,7 +740,7 @@ impl ResultArtifact {
 /// `seekable_reader`/`file_path` stay `None` (Content defaults): the FUSE
 /// tar-index path is bypassed and every consumer materializes via `walk()`, so
 /// the verifying reader is always on the materialization path.
-struct PassthroughContent {
+pub(crate) struct PassthroughContent {
     source_path: String,
     out_path: String,
     x: bool,
@@ -749,6 +752,18 @@ struct PassthroughContent {
 }
 
 impl PassthroughContent {
+    /// The source file at `source_path`, presented as the entry `out_path`,
+    /// verified against `expected` as it is read — what an approval notice
+    /// reader opens a recorded source file as ([`crate::engine::approval`]).
+    pub(crate) fn new(source_path: String, out_path: String, x: bool, expected: String) -> Self {
+        Self {
+            source_path,
+            out_path,
+            x,
+            expected,
+        }
+    }
+
     fn verifying_reader(&self) -> anyhow::Result<VerifyingReader> {
         Ok(self.open()?.0)
     }
@@ -807,6 +822,15 @@ impl Content for PassthroughContent {
         // One file, at `out_path`: no need to open the source, as the
         // `walk`-based default would.
         Ok(vec![std::path::PathBuf::from(&self.out_path)])
+    }
+
+    fn origin(&self) -> Option<hcore::hartifactcontent::Origin> {
+        Some(hcore::hartifactcontent::Origin::File {
+            path: std::path::PathBuf::from(&self.source_path),
+            out_path: self.out_path.clone(),
+            x: self.x,
+            hashout: self.expected.clone(),
+        })
     }
 }
 
@@ -1449,6 +1473,53 @@ fn build_eresult(
         support_artifacts,
         artifacts_meta,
     }
+}
+
+/// One artifact as `ResultOutputs` counts it.
+struct OutputRow<'a> {
+    group: &'a str,
+    r#type: &'a ManifestArtifactType,
+    size: Option<u64>,
+    hash: Option<String>,
+}
+
+fn result_artifact_output(a: &ResultArtifact) -> OutputRow<'_> {
+    OutputRow {
+        group: &a.group,
+        r#type: &a.r#type,
+        size: a.content.byte_size(),
+        // Stored on every artifact that reaches here (a cache artifact's
+        // manifest entry, a passthrough's expected hash): no read.
+        hash: a.content.hashout().ok(),
+    }
+}
+
+/// `ResultOutputs`' groups: the `Output` artifacts by group, in name order.
+/// A group of one artifact carries its hash; sizes add up, unknown if any is.
+fn summarize_outputs<'a>(
+    rows: impl Iterator<Item = OutputRow<'a>>,
+) -> Vec<hcore::events::OutputGroupSummary> {
+    let mut groups: std::collections::BTreeMap<&str, hcore::events::OutputGroupSummary> =
+        std::collections::BTreeMap::new();
+    for row in rows.filter(|r| *r.r#type == ManifestArtifactType::Output) {
+        match groups.entry(row.group) {
+            std::collections::btree_map::Entry::Vacant(v) => {
+                v.insert(hcore::events::OutputGroupSummary {
+                    group: row.group.to_owned(),
+                    size: row.size,
+                    hash: row.hash,
+                    artifacts: 1,
+                });
+            }
+            std::collections::btree_map::Entry::Occupied(mut o) => {
+                let g = o.get_mut();
+                g.size = g.size.zip(row.size).map(|(a, b)| a.saturating_add(b));
+                g.hash = None;
+                g.artifacts = g.artifacts.saturating_add(1);
+            }
+        }
+    }
+    groups.into_values().collect()
 }
 
 /// A caller's copy of a memoized `eresult`, every artifact carrying `read` —
@@ -2880,6 +2951,7 @@ impl Engine {
         opts: &ResultOptions,
     ) -> anyhow::Result<(MemoResult, Option<Arc<ResultReadGuard>>)> {
         let addr_str = addr.format();
+        let interactive = opts.interactive.is_some();
         crate::engine::event::emit_scope(
             &rs,
             crate::engine::event::BuildEventKind::ResultStart {
@@ -2895,7 +2967,11 @@ impl Engine {
                     error: Some(d.message),
                     upstream_of: d.upstream_of,
                     exit_status: d.exit_status,
-                    log_tail: d.log_tail,
+                    log_tail: crate::engine::event::ErrorDetail::result_log_tail(
+                        d.log_tail,
+                        d.log.as_ref(),
+                        interactive,
+                    ),
                     timed_out: d.timed_out,
                 },
                 None => crate::engine::event::BuildEventKind::ResultEnd {
@@ -3384,6 +3460,20 @@ impl Engine {
         // with the write.
         self.materialize_codegen(&rs, opts, &locked, &cached)
             .await?;
+
+        // Inside `inner_result_addr`'s scope, so it lands right before this
+        // target's `ResultEnd`. Every group the run produced, whichever this
+        // caller asked for. Only for a run that executed: a hit sends none, so
+        // a warm build pays nothing for it, and a reader that wants a hit's
+        // outputs asks `Engine::output_listing`.
+        if let Some(ex) = &locked.executed
+            && rs.has_listeners()
+        {
+            rs.emit(crate::engine::event::BuildEventKind::ResultOutputs {
+                addr: def.target.addr.format(),
+                groups: summarize_outputs(ex.cached.iter().map(result_artifact_output)),
+            });
+        }
 
         Ok((
             MemoResult {
@@ -4895,8 +4985,10 @@ impl Engine {
                         .with_context(|| format!("approval {addr}"))?;
                     hcore::hmemoizer::set_phase("execute_cache:engine_execute");
                     // `_execute_guard` is held to the end of this closure, past
-                    // `cache_locally`, which reads the outputs out of the sandbox.
-                    let (artifacts, sandbox_teardown, sandbox_guards, _execute_guard) = engine
+                    // `cache_locally`, which reads the outputs out of the sandbox
+                    // — and `_live_log` too, since it reads the run's live log,
+                    // which is unlinked once the entry holds it.
+                    let (artifacts, sandbox_teardown, sandbox_guards, _execute_guard, _live_log) = engine
                         .clone()
                         .execute(rs.clone(), &addr, &spec, &def, &hashin, interactive, shell, no_scratch, false)
                         .await
@@ -8030,6 +8122,9 @@ mod tests {
         metadata: AtomicUsize,
         /// GETs of a blob object: real bytes moving.
         blobs: AtomicUsize,
+        /// Milliseconds each blob GET waits before answering, so concurrent
+        /// readers overlap.
+        blob_delay_ms: std::sync::atomic::AtomicU64,
     }
 
     impl CountingRemoteBackend {
@@ -8057,6 +8152,10 @@ mod tests {
                 self.metadata.fetch_add(1, Ordering::SeqCst);
             } else {
                 self.blobs.fetch_add(1, Ordering::SeqCst);
+                let delay = self.blob_delay_ms.load(Ordering::SeqCst);
+                if delay > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                }
             }
             match std::fs::read(self.root.join(key)) {
                 Ok(bytes) => Ok(Some(Box::pin(std::io::Cursor::new(bytes)))),
@@ -8192,6 +8291,63 @@ mod tests {
             backend.metadata(),
             after_run1,
             "a fully-cached second run must issue no metadata request at all"
+        );
+        Ok(())
+    }
+
+    /// Two readers open a remote hit's log at once (a `heph log` and the
+    /// TUI's pane): the blob is pulled once, and both read it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_opens_of_a_remote_log_fetch_its_blob_once() -> anyhow::Result<()> {
+        let remote = tempdir()?;
+        let remote_uri = format!("file://{}", remote.path().display());
+        let addr = hmodel::htaddr::parse_addr("//pkg:t")?;
+        let target = || pluginstatictarget::Target {
+            run: Some("echo a log line; echo hi > $OUT".to_string()),
+            ..out_target("//pkg:t")
+        };
+
+        let (seeder, _seeder_home) = engine_with_remote_bash(vec![target()], &remote_uri)?;
+        let seed_rs = seeder.new_state();
+        resolve(&seeder, &seed_rs, &addr, OutputMatcher::All).await?;
+        drain_bg(seed_rs).await;
+
+        let backend = Arc::new(CountingRemoteBackend::new(remote.path()));
+        let (engine, _home) = engine_with_remote_bash(vec![target()], &remote_uri)?;
+        let engine = with_counting_remote(engine, backend.clone());
+        // A remote hit for the hashout only: the manifest is mirrored, the
+        // log's blob stays remote.
+        let rs = engine.new_state();
+        resolve(&engine, &rs, &addr, OutputMatcher::None).await?;
+        drain_bg(rs).await;
+        // The mirrored manifest is a queued write until the writer commits
+        // it, and `list_target_entries`, which `open_log` finds entries by,
+        // does not wait on the queue (see
+        // `a_queued_revision_is_invisible_to_list_target_entries_and_awaited_by_exists`).
+        // A slow commit (linux/amd64 CI) left the entry unlisted.
+        engine.sqlite_writes.drain_queued_writes().await;
+
+        let before = backend.blobs();
+        backend.blob_delay_ms.store(200, Ordering::SeqCst);
+        let opts = crate::engine::log_api::LogOptions {
+            fetch_remote: true,
+            ..Default::default()
+        };
+        let (a, b) = tokio::join!(engine.open_log(&addr, &opts), engine.open_log(&addr, &opts));
+        for log in [a?, b?] {
+            let log = log.expect("a stored log");
+            assert_eq!(
+                log.info().source,
+                crate::engine::log_api::LogSource::Cache { remote: true }
+            );
+            let mut text = String::new();
+            std::io::Read::read_to_string(&mut log.reader()?, &mut text)?;
+            assert_eq!(text, "a log line\n");
+        }
+        assert_eq!(
+            backend.blobs() - before,
+            1,
+            "the second open waits for the first fetch instead of pulling again"
         );
         Ok(())
     }

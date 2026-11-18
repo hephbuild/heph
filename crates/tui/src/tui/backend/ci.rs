@@ -17,8 +17,10 @@ pub async fn run<A: App + 'static>(
     let session = slot.and_then(|s| s.open(view.session_header(), false));
     // One line, stderr only (never stdout, which may be a command's
     // document), naming the full id so it can be pasted (A12).
+    // Not for a private session (`HEPH_NO_SESSION`): nothing can attach to it.
     if let Some(s) = &session
         && s.fresh
+        && !s.private
     {
         sink.write_diagnostic(&format!(
             "heph: session {id} (heph session attach {id})\n",
