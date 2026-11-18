@@ -3744,12 +3744,12 @@ impl InScope {
     ///
     /// Each BFS frontier is processed concurrently via `try_join_all`. Each dep's
     /// `_golist` target is fetched via `executor.result` (engine pipeline with disk
-    /// cache), memoized in `pkg_cache` for the Provider lifetime so repeated calls
+    /// cache), memoized in `pkg_cache` for the cache scope so repeated calls
     /// for the same dep cost nothing after the first resolution.
     ///
     /// The full BFS result is itself memoized via `libs_cache`, deduping calls
     /// across `build_lib`/`build`/`build_test`/`build_test_lib` etc. for the same
-    /// root pkg + factors within a single Provider lifetime.
+    /// root pkg + factors within one cache scope.
     async fn collect_transitive_libs(
         self,
         executor: Arc<dyn ProviderExecutor>,
@@ -9075,5 +9075,319 @@ golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d h1:pE8b58s1HRDMi8RDc79m0H
         assert!(ty("test").matches(&test), "{}", ty("test").render());
         assert!(ty("link").matches(&m(vec![("flags", s("-s"))])));
         assert!(ty("go_embed_deps").matches(&s("//assets:bundle")));
+    }
+
+    // ---- cache scopes ----
+
+    mod scopes {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        fn scope(n: u64) -> Option<ScopeId> {
+            let id = ScopeId::new(n);
+            assert!(id.is_some(), "a non-zero scope id");
+            id
+        }
+
+        async fn scoped_get(
+            p: &Provider,
+            addr: Addr,
+            sc: Option<ScopeId>,
+        ) -> Result<GetResponse, GetError> {
+            let ctoken = StdCancellationToken::new();
+            let req = make_get_req(addr, &p.inner.workspace_root).with_decoded_scope(sc);
+            p.get(req, &ctoken).await
+        }
+
+        /// Answers every `_golist` with a package the test scripts: `Some(files)`
+        /// is a package with those Go files, `None` a `package.bin` that does
+        /// not decode. It is what the engine hands back for the same addr after
+        /// an edit (a variant's `goos`, a source file) re-ran `go list`.
+        struct ScriptedGolist {
+            go_files: parking_lot::Mutex<Option<Vec<String>>>,
+            results: AtomicUsize,
+        }
+
+        impl ScriptedGolist {
+            fn new(go_files: Option<&[&str]>) -> Arc<Self> {
+                Arc::new(Self {
+                    go_files: parking_lot::Mutex::new(Self::files(go_files)),
+                    results: AtomicUsize::new(0),
+                })
+            }
+
+            fn files(go_files: Option<&[&str]>) -> Option<Vec<String>> {
+                go_files.map(|f| f.iter().map(|s| (*s).to_string()).collect())
+            }
+
+            fn set(&self, go_files: Option<&[&str]>) {
+                *self.go_files.lock() = Self::files(go_files);
+            }
+        }
+
+        impl ProviderExecutor for ScriptedGolist {
+            fn result<'a>(
+                &'a self,
+                _addr: &'a Addr,
+            ) -> BoxFuture<'a, anyhow::Result<Arc<EResult>>> {
+                self.results.fetch_add(1, Ordering::SeqCst);
+                let go_files = self.go_files.lock().clone();
+                Box::pin(async move {
+                    let bytes = match go_files {
+                        Some(go_files) => {
+                            crate::plugingo::pkg_analysis::encode_go_package(&GoPackage {
+                                import_path: "example.com/dep".to_string(),
+                                go_files,
+                                ..Default::default()
+                            })?
+                        }
+                        None => b"not a package".to_vec(),
+                    };
+                    let artifact: Arc<dyn Content> = Arc::new(BinaryArtifact {
+                        path: PathBuf::from("package.bin"),
+                        bytes,
+                        hashout: "scripted".to_string(),
+                    });
+                    Ok(Arc::new(EResult {
+                        artifacts_meta: vec![ArtifactMeta {
+                            hashout: "scripted".to_string(),
+                        }],
+                        artifacts: vec![artifact],
+                        support_artifacts: vec![],
+                    }))
+                })
+            }
+
+            fn query<'a>(
+                &'a self,
+                _m: &'a hmodel::htmatcher::Matcher,
+                _extra_skip: &'a [String],
+            ) -> BoxFuture<'a, anyhow::Result<Vec<Addr>>> {
+                Box::pin(async { Ok(vec![]) })
+            }
+        }
+
+        /// A thirdparty `_golist` under a variant whose definition the test
+        /// edits between scopes: the addr stays `…:_golist@v=host`, its answer
+        /// does not.
+        fn thirdparty_golist() -> Addr {
+            make_addr("@heph/go/thirdparty/example.com/dep@v1.0.0", "_golist")
+        }
+
+        async fn read_files(
+            p: &Provider,
+            exec: &Arc<ScriptedGolist>,
+            sc: Option<ScopeId>,
+        ) -> anyhow::Result<Vec<String>> {
+            let executor: Arc<dyn ProviderExecutor> = Arc::<ScriptedGolist>::clone(exec);
+            let pkg = p
+                .inner
+                .in_scope(sc)
+                .read_golist_package(executor, &thirdparty_golist())
+                .await?;
+            Ok(pkg.go_files.clone())
+        }
+
+        /// A package that had no Go files is not found; once it gains one, the
+        /// scope that saw it empty keeps its snapshot and the next scope builds
+        /// it.
+        #[tokio::test]
+        async fn next_scope_sees_a_package_gain_go_files() {
+            require_go!();
+            let sandbox = copy_fixture("simple_lib");
+            std::fs::create_dir_all(sandbox.path().join("sub")).unwrap();
+            std::fs::write(sandbox.path().join("sub/README"), "no Go here\n").unwrap();
+            let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
+            let addr = || make_addr("sub", "build_lib");
+
+            let before = scoped_get(&p, addr(), scope(1)).await;
+            assert!(
+                matches!(before, Err(GetError::NotFound)),
+                "a package with no Go files is not found: {:?}",
+                before.map(|r| r.target_spec.driver.clone())
+            );
+
+            std::fs::write(
+                sandbox.path().join("sub/sub.go"),
+                "package sub\n\nfunc F() {}\n",
+            )
+            .unwrap();
+            assert!(
+                matches!(
+                    scoped_get(&p, addr(), scope(1)).await,
+                    Err(GetError::NotFound)
+                ),
+                "one scope is one snapshot"
+            );
+            let resp = scoped_get(&p, addr(), scope(2))
+                .await
+                .expect("the next scope reads the package again and finds sub.go");
+            assert_eq!(resp.target_spec.driver, "go.compile");
+        }
+
+        /// A `go.mod` added under a directory that had none: the negative
+        /// answer the resolver cached stays with the scope that asked.
+        #[tokio::test]
+        async fn first_party_decode_not_stale_across_scopes() {
+            require_go!();
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join("m")).unwrap();
+            std::fs::write(dir.path().join("m/m.go"), "package m\n").unwrap();
+            let p = Provider::new(dir.path().to_path_buf(), test_runtime()).unwrap();
+            let pkg = PkgBuf::from("m");
+            let decode = |n| p.inner.in_scope(scope(n)).sc.pkgs.decode(&pkg);
+
+            assert!(decode(1).is_none(), "no go.mod above m yet");
+            std::fs::write(
+                dir.path().join("m/go.mod"),
+                "module example.com/m\n\ngo 1.21\n",
+            )
+            .unwrap();
+            assert!(
+                decode(1).is_none(),
+                "the scope keeps its negative answer: one snapshot"
+            );
+            let kind = decode(2).expect("the next scope finds the new go.mod");
+            assert!(
+                matches!(&*kind, GoPackageKind::FirstParty { import_path, .. } if import_path == "example.com/m"),
+                "{kind:?}"
+            );
+        }
+
+        /// Editing a variant re-runs a thirdparty `_golist` under the same addr.
+        /// The scope that read it first keeps that listing; the next scope reads
+        /// the new one. (Thirdparty listings used to be cached for the
+        /// provider's lifetime, keyed by an addr that does not name the
+        /// variant's definition.)
+        #[tokio::test]
+        async fn variant_edit_refreshes_thirdparty_listing() {
+            require_go!();
+            let dir = tempfile::tempdir().unwrap();
+            let p = Provider::new(dir.path().to_path_buf(), test_runtime()).unwrap();
+            let exec = ScriptedGolist::new(Some(&["dep_linux.go"]));
+
+            assert_eq!(
+                read_files(&p, &exec, scope(1)).await.unwrap(),
+                ["dep_linux.go"]
+            );
+            exec.set(Some(&["dep_darwin.go"]));
+            assert_eq!(
+                read_files(&p, &exec, scope(1)).await.unwrap(),
+                ["dep_linux.go"],
+                "one scope is one snapshot"
+            );
+            assert_eq!(
+                read_files(&p, &exec, scope(2)).await.unwrap(),
+                ["dep_darwin.go"],
+                "the next scope reads the edited listing"
+            );
+        }
+
+        /// The Go half of `sticky_error_does_not_leak_to_next_scope`: a
+        /// `_golist` that failed to decode stays failed for its scope (callers
+        /// in one request agree), and the next scope reads it afresh.
+        #[tokio::test]
+        async fn sticky_error_does_not_leak_to_next_scope() {
+            require_go!();
+            let dir = tempfile::tempdir().unwrap();
+            let p = Provider::new(dir.path().to_path_buf(), test_runtime()).unwrap();
+            let exec = ScriptedGolist::new(None);
+
+            read_files(&p, &exec, scope(1))
+                .await
+                .expect_err("an undecodable package.bin fails");
+            exec.set(Some(&["dep.go"]));
+            read_files(&p, &exec, scope(1))
+                .await
+                .expect_err("the failure is sticky within its scope");
+            assert_eq!(
+                read_files(&p, &exec, scope(2)).await.unwrap(),
+                ["dep.go"],
+                "the next scope does not inherit the failure"
+            );
+        }
+
+        /// I8: nothing a scope's bucket keeps holds the request that filled it.
+        /// A `get` of a binary goes through `libs_cache` (whose computation
+        /// captures the executor); once the call returns and the request is
+        /// gone, the executor is freed while the bucket is still alive, so the
+        /// request's end (and with it the hook) cannot wait on the bucket.
+        #[tokio::test]
+        async fn scope_bucket_does_not_retain_its_request() {
+            require_go!();
+            let sandbox = copy_fixture("with_dep");
+            let p = Provider::new(sandbox.path().to_path_buf(), test_runtime()).unwrap();
+            let executor = test_executor(sandbox.path());
+            let request = Arc::downgrade(&executor);
+            let req = GetRequest::new(
+                "test",
+                make_addr("cmd", "build"),
+                vec![host_variant_state()],
+                executor,
+            )
+            .with_decoded_scope(scope(1));
+            let resp = p
+                .get(req, &StdCancellationToken::new())
+                .await
+                .expect("cmd build resolves through libs_cache");
+            drop(resp);
+
+            // A memoizer task drops its closure just after it hands the value
+            // over, so allow it a moment.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while request.upgrade().is_some() && std::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(
+                request.upgrade().is_none(),
+                "the scope's bucket kept its request's executor alive"
+            );
+            assert_eq!(
+                p.inner.scopes.live_scopes(),
+                1,
+                "the bucket is still live, so it was not its drop that freed the executor"
+            );
+
+            let ack = p
+                .scope_ended(ScopeEnded::new(scope(1).unwrap(), 0))
+                .await
+                .unwrap();
+            assert_eq!(ack, ScopeEndedAck::Released);
+            assert_eq!(p.inner.scopes.live_scopes(), 0);
+        }
+
+        /// The trait wrapper forwards `scope_ended` to the provider's buckets:
+        /// the ended scope's bucket goes, another scope's stays, and the call
+        /// answers `Released` (the trait default would answer `Unsupported`,
+        /// and the host would report the provider as keeping its caches).
+        #[tokio::test]
+        async fn go_wrapper_forwards_scope_ended() {
+            require_go!();
+            let dir = tempfile::tempdir().unwrap();
+            let p = Provider::new(dir.path().to_path_buf(), test_runtime()).unwrap();
+            let exec = ScriptedGolist::new(Some(&["dep.go"]));
+            read_files(&p, &exec, scope(1)).await.unwrap();
+            read_files(&p, &exec, scope(2)).await.unwrap();
+            assert_eq!(p.inner.scopes.live_scopes(), 2);
+
+            let ack = p
+                .scope_ended(ScopeEnded::new(scope(1).unwrap(), 0))
+                .await
+                .unwrap();
+            assert_eq!(ack, ScopeEndedAck::Released);
+            assert_eq!(p.inner.scopes.live_scopes(), 1, "scope 2 is still live");
+
+            // An ended scope is never recreated: a late call is answered from a
+            // throwaway bucket, so it reads the package as it is now, and
+            // nothing it read is kept.
+            exec.set(Some(&["late.go"]));
+            assert_eq!(read_files(&p, &exec, scope(1)).await.unwrap(), ["late.go"]);
+            assert_eq!(p.inner.scopes.live_scopes(), 1);
+            assert_eq!(
+                read_files(&p, &exec, scope(2)).await.unwrap(),
+                ["dep.go"],
+                "scope 2 keeps its own snapshot"
+            );
+        }
     }
 }
