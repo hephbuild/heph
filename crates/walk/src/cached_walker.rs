@@ -13,12 +13,23 @@
 //! stops shallow and one that recurses deep both reuse the dirs they share and
 //! independently cache the ones they don't.
 //!
-//! Validation is mtime/size based (a fast-path proxy for content identity, the
-//! same tradeoff accepted elsewhere): a directory's listing is reused while its
-//! mtime is unchanged (mtime bumps on any entry add/remove/rename); a file's
-//! hash is reused while its `(size, mtime)` is unchanged. Everything is
-//! correct-by-fallback — a missing/locked db, a decode error, or any mismatch
-//! just re-reads from disk.
+//! Validation is stat based (a fast-path proxy for content identity, the same
+//! tradeoff accepted elsewhere): a directory's listing is reused while its
+//! [`StatKey`] — mtime, ctime and inode — is unchanged (mtime bumps on any entry
+//! add/remove/rename); a file's hash is reused while its size and [`StatKey`]
+//! are. The ctime and inode catch what mtime alone misses: a writer that puts
+//! the old mtime back (`cp -p`, `rsync -a`, `tar -x`, a nix-store copy) still
+//! moves the ctime, or replaces the inode, and so does a `chmod` that flips the
+//! exec bit folded into the hash.
+//!
+//! A read is cached only once it is settled: when the clock, sampled before the
+//! stat, is at least [`RACY_WINDOW`] past the entry's mtime. A write landing in
+//! the same timestamp tick as the read can leave every stat field unchanged, so
+//! a read that recent is used but never stored — in-process or durably — and
+//! the next read takes it from disk again. Nothing promotes it later.
+//!
+//! Everything is correct-by-fallback — a missing/locked db, a decode error, or
+//! any mismatch just re-reads from disk.
 //!
 //! Entry names are UTF-8 by construction: a directory holding a name that is not
 //! valid UTF-8 fails [`read_dir`] rather than listing without it, so no
@@ -64,6 +75,28 @@ pub const DEFAULT_TTL: std::time::Duration = std::time::Duration::from_secs(14 *
 /// 14-day [`DEFAULT_TTL`] that is a row used within the last 13 days, always
 /// kept.
 pub const TOUCH_REFRESH: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// How far the clock must be past an entry's mtime for a read of it to be
+/// cached (see the module docs).
+///
+/// A write in the same timestamp tick as an earlier read can leave mtime, size
+/// and even ctime where the read saw them, so the read's result would be served
+/// for content it never saw. Two seconds is the coarsest mtime granularity heph
+/// can meet (FAT's 2 s; HFS+ and ext3 are 1 s; ext4 and APFS store
+/// nanoseconds but stamp from a clock that ticks in milliseconds). One constant
+/// on every platform: what a file's hash resolves to must not depend on which
+/// host read it. The cost is that a file or directory changed in the last two
+/// seconds is re-read on every call until it settles.
+const RACY_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Whether a read of an entry with `key`, whose stat came after the clock read
+/// `clock_ns`, may be cached: the clock is at least [`RACY_WINDOW`] past its
+/// mtime. An mtime ahead of the clock (a clock stepped back, a future stamp) is
+/// never settled.
+fn settled(key: &StatKey, clock_ns: i64) -> bool {
+    let window = i64::try_from(RACY_WINDOW.as_nanos()).unwrap_or(i64::MAX);
+    clock_ns.saturating_sub(key.mtime_ns) >= window
+}
 
 /// Whether a row last stamped at `accessed_ns` needs a refresh at `now_ns`. A
 /// stamp in the future (the clock stepped back) is refreshed, so it cannot hold
@@ -134,6 +167,8 @@ pub struct DirListing {
 pub struct FileHash {
     pub size: u64,
     pub mtime_ns: i64,
+    pub ctime_ns: i64,
+    pub ino: u64,
     pub exec: bool,
     /// xxh3 of the file content with the exec bit folded in (see [`file_hashout`]).
     pub hashout: String,
@@ -223,15 +258,86 @@ impl ContentHasher {
     }
 }
 
-#[cfg(unix)]
+impl FileHash {
+    /// A hash of a file stat'ed as `st`. Its stat fields are `-1`/`0` when the
+    /// stat had no [`StatKey`]; such a hash is never cached.
+    fn new(st: &Stat, hashout: String) -> Self {
+        Self {
+            size: st.size,
+            mtime_ns: st.key.map_or(-1, |k| k.mtime_ns),
+            ctime_ns: st.key.map_or(-1, |k| k.ctime_ns),
+            ino: st.key.map_or(0, |k| k.ino),
+            exec: st.exec,
+            hashout,
+        }
+    }
+
+    fn key(&self) -> StatKey {
+        StatKey {
+            mtime_ns: self.mtime_ns,
+            ctime_ns: self.ctime_ns,
+            ino: self.ino,
+        }
+    }
+}
+
+/// The stat fields a cached read is validated against: a change to any of them
+/// means the path may have changed since the read (see the module docs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StatKey {
+    mtime_ns: i64,
+    ctime_ns: i64,
+    ino: u64,
+}
+
+/// What [`CachedWalker`] reads from one stat of a path (following symlinks).
+#[derive(Clone, Copy, Debug)]
+struct Stat {
+    is_dir: bool,
+    size: u64,
+    exec: bool,
+    /// `None` when a timestamp is not representable in `i64` nanoseconds since
+    /// the epoch: the read is then served from disk and never cached.
+    key: Option<StatKey>,
+}
+
+impl Stat {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt as _;
+        let ctime_ns = meta
+            .ctime()
+            .checked_mul(1_000_000_000)
+            .and_then(|s| s.checked_add(meta.ctime_nsec()));
+        let key = match (mtime_ns(meta), ctime_ns) {
+            (Some(mtime_ns), Some(ctime_ns)) => Some(StatKey {
+                mtime_ns,
+                ctime_ns,
+                ino: meta.ino(),
+            }),
+            _ => None,
+        };
+        Self {
+            is_dir: meta.is_dir(),
+            size: meta.len(),
+            exec: is_exec(meta),
+            key,
+        }
+    }
+}
+
+/// The production stat: `stat(2)`, following symlinks.
+fn stat_path(path: &Path) -> std::io::Result<Stat> {
+    std::fs::metadata(path).map(|m| Stat::of(&m))
+}
+
+/// The clock a walker samples before each stat, in nanoseconds since the epoch.
+type ClockFn = Box<dyn Fn() -> i64 + Send + Sync>;
+/// The stat a walker validates against.
+type StatFn = Box<dyn Fn(&Path) -> std::io::Result<Stat> + Send + Sync>;
+
 fn is_exec(meta: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt;
     meta.permissions().mode() & 0o111 != 0
-}
-
-#[cfg(not(unix))]
-fn is_exec(_meta: &std::fs::Metadata) -> bool {
-    false
 }
 
 fn mtime_ns(meta: &std::fs::Metadata) -> Option<i64> {
@@ -271,17 +377,38 @@ pub struct CachedWalker {
     /// walker then degrades to re-reading from disk for the rest of its life,
     /// exactly as an eager open failure did.
     store: std::sync::OnceLock<Option<FsWalkStore>>,
-    /// In-process front for directory listings, validated against live mtime.
-    dirs: Mutex<FxHashMap<PathBuf, (i64, Arc<DirListing>)>>,
-    /// In-process front for file hashes, validated against live (size, mtime).
+    /// In-process front for directory listings, validated against the live
+    /// [`StatKey`].
+    dirs: Mutex<FxHashMap<PathBuf, (StatKey, Arc<DirListing>)>>,
+    /// In-process front for file hashes, validated against the live size and
+    /// [`StatKey`].
     files: Mutex<FxHashMap<PathBuf, Arc<FileHash>>>,
     /// Paths read-served from the durable store this process; their last-access
     /// stamps are refreshed in one batch on drop (so reads stay write-free).
     touched_dirs: Mutex<Vec<String>>,
     touched_files: Mutex<Vec<String>>,
+    /// The clock sampled before each stat, to decide whether the read is
+    /// settled (see [`RACY_WINDOW`]). The system clock outside tests.
+    clock: ClockFn,
+    /// The stat each read is validated against. `stat(2)` outside tests.
+    stat: StatFn,
 }
 
 impl CachedWalker {
+    fn new(bypass: bool, store_path: Option<PathBuf>) -> Self {
+        Self {
+            bypass,
+            store_path,
+            store: std::sync::OnceLock::new(),
+            dirs: Mutex::new(FxHashMap::default()),
+            files: Mutex::new(FxHashMap::default()),
+            touched_dirs: Mutex::new(Vec::new()),
+            touched_files: Mutex::new(Vec::new()),
+            clock: Box::new(now_ns),
+            stat: Box::new(stat_path),
+        }
+    }
+
     /// The walker backed by the sqlite db at `db_path`, opened (or created) on
     /// first use — a command that never walks a tree never opens it. On any
     /// db-open failure the walker still works — it just degrades to always
@@ -293,43 +420,36 @@ impl CachedWalker {
             );
             return Self::bypassing();
         }
-        Self {
-            bypass: false,
-            store_path: Some(db_path.to_path_buf()),
-            store: std::sync::OnceLock::new(),
-            dirs: Mutex::new(FxHashMap::default()),
-            files: Mutex::new(FxHashMap::default()),
-            touched_dirs: Mutex::new(Vec::new()),
-            touched_files: Mutex::new(Vec::new()),
-        }
+        Self::new(false, Some(db_path.to_path_buf()))
     }
 
     /// A disabled walker (no durable store, in-process front only) for tests /
     /// contexts without a db.
     pub fn disabled() -> Self {
-        Self {
-            bypass: false,
-            store_path: None,
-            store: std::sync::OnceLock::new(),
-            dirs: Mutex::new(FxHashMap::default()),
-            files: Mutex::new(FxHashMap::default()),
-            touched_dirs: Mutex::new(Vec::new()),
-            touched_files: Mutex::new(Vec::new()),
-        }
+        Self::new(false, None)
     }
 
     /// A fully bypassing walker: no in-process front, no durable store — every
     /// call reads straight from disk. Used when `HEPH_DEBUG_CACHED_WALKER=0`.
     pub fn bypassing() -> Self {
-        Self {
-            bypass: true,
-            store_path: None,
-            store: std::sync::OnceLock::new(),
-            dirs: Mutex::new(FxHashMap::default()),
-            files: Mutex::new(FxHashMap::default()),
-            touched_dirs: Mutex::new(Vec::new()),
-            touched_files: Mutex::new(Vec::new()),
-        }
+        Self::new(true, None)
+    }
+
+    /// This walker with `clock` in place of the system clock.
+    #[cfg(test)]
+    fn with_clock(mut self, clock: impl Fn() -> i64 + Send + Sync + 'static) -> Self {
+        self.clock = Box::new(clock);
+        self
+    }
+
+    /// This walker with `stat` in place of `stat(2)`.
+    #[cfg(test)]
+    fn with_stat(
+        mut self,
+        stat: impl Fn(&Path) -> std::io::Result<Stat> + Send + Sync + 'static,
+    ) -> Self {
+        self.stat = Box::new(stat);
+        self
     }
 
     /// The durable store, opened on the first call. `None` when this walker has
@@ -365,92 +485,92 @@ impl CachedWalker {
         if self.bypass {
             return Ok(Arc::new(read_dir_uncached(dir)?));
         }
-        let meta = match std::fs::metadata(dir) {
-            Ok(m) => m,
+        // Sampled before the stat: a write after this instant stamps an mtime at
+        // least this late, so it cannot share a tick with an mtime
+        // `RACY_WINDOW` older — the only kind of read that is cached.
+        let clock = (self.clock)();
+        let st = match (self.stat)(dir) {
+            Ok(st) => st,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(Arc::new(DirListing::default()));
             }
             Err(e) => return Err(e).with_context(|| format!("stat dir '{}'", dir.display())),
         };
-        if !meta.is_dir() {
+        if !st.is_dir {
             return Ok(Arc::new(DirListing::default()));
         }
-        let live_mtime = mtime_ns(&meta);
+        let Some(key) = st.key else {
+            return Ok(Arc::new(read_dir_uncached(dir)?));
+        };
 
-        // In-process front: reuse while the live mtime matches.
-        if let Some(mt) = live_mtime
-            && let Some((cached_mt, listing)) = self.dirs.lock().get(dir).cloned()
-            && cached_mt == mt
+        // In-process front: reuse while the live key matches.
+        if let Some((cached_key, listing)) = self.dirs.lock().get(dir).cloned()
+            && cached_key == key
         {
             return Ok(listing);
         }
 
-        // Durable store: reuse while the recorded mtime matches.
-        if let Some(mt) = live_mtime
-            && let Some(store) = self.store()
-            && let Some((stored_mtime, blob, accessed_ns)) = store.get_dir(dir)
-            && stored_mtime == mt
+        // Durable store: reuse while the recorded key matches.
+        if let Some(store) = self.store()
+            && let Some((stored_key, blob, accessed_ns)) = store.get_dir(dir)
+            && stored_key == key
             && let Ok(listing) = borsh::from_slice::<DirListing>(&blob)
         {
             let listing = Arc::new(listing);
             self.dirs
                 .lock()
-                .insert(dir.to_path_buf(), (mt, listing.clone()));
+                .insert(dir.to_path_buf(), (key, listing.clone()));
             if touch_is_stale(accessed_ns, now_ns()) {
                 self.touched_dirs.lock().push(path_key(dir));
             }
             return Ok(listing);
         }
 
-        // Miss: read the directory and cache it.
+        // Miss: read the directory, and cache it once it is settled.
         let listing = Arc::new(read_dir_uncached(dir)?);
-        if let (Some(mt), Some(store)) = (live_mtime, self.store()) {
+        if settled(&key, clock)
+            && let Some(store) = self.store()
+        {
             if let Ok(blob) = borsh::to_vec(&*listing) {
-                store.put_dir(dir, mt, &blob, now_ns());
+                store.put_dir(dir, &key, &blob, now_ns());
             }
             self.dirs
                 .lock()
-                .insert(dir.to_path_buf(), (mt, listing.clone()));
+                .insert(dir.to_path_buf(), (key, listing.clone()));
         }
         Ok(listing)
     }
 
     /// The cached content hash (and exec bit) of file `file` (absolute), following
-    /// symlinks. Validated by `(size, mtime)`; re-hashed on a mismatch.
+    /// symlinks. Validated by size and [`StatKey`]; re-hashed on a mismatch.
     pub fn file_hash(&self, file: &Path) -> Result<Arc<FileHash>> {
-        let meta =
-            std::fs::metadata(file).with_context(|| format!("stat file '{}'", file.display()))?;
+        // Sampled before the stat, as in `read_dir`.
+        let clock = (self.clock)();
+        let st = (self.stat)(file).with_context(|| format!("stat file '{}'", file.display()))?;
         // A directory (e.g. a symlink resolving to one) is not hashable — error so
         // the caller skips it rather than trying to read it.
-        anyhow::ensure!(!meta.is_dir(), "'{}' is a directory", file.display());
-        let size = meta.len();
-        let live_mtime = mtime_ns(&meta);
-        let exec = is_exec(&meta);
+        anyhow::ensure!(!st.is_dir, "'{}' is a directory", file.display());
 
         if self.bypass {
-            return Ok(Arc::new(FileHash {
-                size,
-                mtime_ns: live_mtime.unwrap_or(-1),
-                exec,
-                hashout: file_hashout(file, exec)?,
-            }));
+            return Ok(Arc::new(FileHash::new(&st, file_hashout(file, st.exec)?)));
         }
+        let Some(key) = st.key else {
+            return Ok(Arc::new(FileHash::new(&st, file_hashout(file, st.exec)?)));
+        };
 
         // In-process front.
-        if let Some(mt) = live_mtime
-            && let Some(found) = self.files.lock().get(file).cloned()
-            && found.size == size
-            && found.mtime_ns == mt
+        if let Some(found) = self.files.lock().get(file).cloned()
+            && found.size == st.size
+            && found.key() == key
         {
             return Ok(found);
         }
 
         // Durable store.
-        if let Some(mt) = live_mtime
-            && let Some(store) = self.store()
+        if let Some(store) = self.store()
             && let Some((fh, accessed_ns)) = store.get_file(file)
-            && fh.size == size
-            && fh.mtime_ns == mt
+            && fh.size == st.size
+            && fh.key() == key
         {
             let fh = Arc::new(fh);
             self.files.lock().insert(file.to_path_buf(), fh.clone());
@@ -460,15 +580,11 @@ impl CachedWalker {
             return Ok(fh);
         }
 
-        // Miss: hash the file and cache it.
-        let hashout = file_hashout(file, exec)?;
-        let fh = Arc::new(FileHash {
-            size,
-            mtime_ns: live_mtime.unwrap_or(-1),
-            exec,
-            hashout,
-        });
-        if let (Some(_mt), Some(store)) = (live_mtime, self.store()) {
+        // Miss: hash the file, and cache it once it is settled.
+        let fh = Arc::new(FileHash::new(&st, file_hashout(file, st.exec)?));
+        if settled(&key, clock)
+            && let Some(store) = self.store()
+        {
             store.put_file(file, &fh, now_ns());
             self.files.lock().insert(file.to_path_buf(), fh.clone());
         }
@@ -731,7 +847,15 @@ fn open_write_connection(db_path: &Path) -> Result<Connection> {
 /// below it (fresh, or from before the version existed) goes through
 /// [`migrate_fswalk_schema`]. Bump it, and extend the migration, with any schema
 /// change. Older heph ignores the value and re-runs its own idempotent DDL.
-const FSWALK_SCHEMA_VERSION: i64 = 1;
+///
+/// - 1: `user_version` stamped; both tables with `listing_version`.
+/// - 2: `ctime_ns` and `ino` on both tables, and rows are written only once
+///   settled ([`RACY_WINDOW`]). The migration deletes every row: one written
+///   before it was validated by mtime alone and may have been racy, so none of
+///   them can be trusted. The columns are nullable and a row with either one
+///   NULL never validates, so a row an older binary writes afterwards (its
+///   `INSERT` names neither) is not trusted either.
+const FSWALK_SCHEMA_VERSION: i64 = 2;
 
 /// How long a pooled fswalk read waits for a connection — see [`FsWalkStore::read_pool`].
 const FSWALK_POOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -771,7 +895,9 @@ fn migrate_fswalk_schema(db_path: &Path, write: &Connection) -> Result<()> {
                      mtime_ns    INTEGER NOT NULL,
                      entries     BLOB NOT NULL,
                      accessed_ns INTEGER NOT NULL,
-                     listing_version INTEGER NOT NULL DEFAULT 0
+                     listing_version INTEGER NOT NULL DEFAULT 0,
+                     ctime_ns    INTEGER,
+                     ino         INTEGER
                  );
                  CREATE TABLE IF NOT EXISTS files (
                      path        TEXT PRIMARY KEY,
@@ -779,32 +905,36 @@ fn migrate_fswalk_schema(db_path: &Path, write: &Connection) -> Result<()> {
                      mtime_ns    INTEGER NOT NULL,
                      exec        INTEGER NOT NULL,
                      hashout     TEXT NOT NULL,
-                     accessed_ns INTEGER NOT NULL
+                     accessed_ns INTEGER NOT NULL,
+                     ctime_ns    INTEGER,
+                     ino         INTEGER
                  );",
         )
         .context("initialising fswalk schema")?;
-    // Migration for a db created before `listing_version` existed. Probed
-    // rather than attempted-and-ignored: on a fresh db the `CREATE TABLE`
-    // above already declares the column, so an unconditional `ALTER` fails
-    // every time and swallowing that failure would also swallow a real one —
-    // and a real one leaves `get_dir`/`put_dir` unable to prepare, which
-    // disables the durable listing cache silently and forever.
-    let mut cols = write
-        .prepare("PRAGMA table_info(dirs)")
-        .context("inspecting the fswalk dirs schema")?;
-    let has_listing_version = cols
-        .query_map([], |r| r.get::<_, String>(1))
-        .context("reading the fswalk dirs columns")?
-        .filter_map(std::result::Result::ok)
-        .any(|name| name == "listing_version");
-    drop(cols);
-    if !has_listing_version {
-        write
-            .execute_batch(
-                "ALTER TABLE dirs ADD COLUMN listing_version INTEGER NOT NULL DEFAULT 0;",
-            )
-            .context("adding listing_version to the fswalk dirs table")?;
+    // Columns a db created by an older version lacks. Probed rather than
+    // attempted-and-ignored: on a fresh db the `CREATE TABLE` above already
+    // declares them, so an unconditional `ALTER` fails every time and
+    // swallowing that failure would also swallow a real one — and a real one
+    // leaves `get_*`/`put_*` unable to prepare, which disables the durable
+    // cache silently and forever.
+    for (table, column, decl) in [
+        ("dirs", "listing_version", "INTEGER NOT NULL DEFAULT 0"),
+        ("dirs", "ctime_ns", "INTEGER"),
+        ("dirs", "ino", "INTEGER"),
+        ("files", "ctime_ns", "INTEGER"),
+        ("files", "ino", "INTEGER"),
+    ] {
+        if !has_column(write, table, column)? {
+            write
+                .execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl};"))
+                .with_context(|| format!("adding {column} to the fswalk {table} table"))?;
+        }
     }
+    // Every row below version 2 was stored by mtime alone, racy or not: none
+    // can be trusted (see `FSWALK_SCHEMA_VERSION`). A one-time re-read.
+    write
+        .execute_batch("DELETE FROM dirs; DELETE FROM files;")
+        .context("dropping the fswalk rows written before schema version 2")?;
     write
         .execute_batch(&format!(
             "PRAGMA user_version = {FSWALK_SCHEMA_VERSION}; COMMIT;"
@@ -813,24 +943,49 @@ fn migrate_fswalk_schema(db_path: &Path, write: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Whether fswalk `table` has `column`.
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut cols = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .with_context(|| format!("inspecting the fswalk {table} schema"))?;
+    let found = cols
+        .query_map([], |r| r.get::<_, String>(1))
+        .with_context(|| format!("reading the fswalk {table} columns"))?
+        .filter_map(std::result::Result::ok)
+        .any(|name| name == column);
+    Ok(found)
+}
+
 impl FsWalkStore {
-    /// `(mtime_ns, entries, accessed_ns)` of a cached listing.
-    fn get_dir(&self, path: &Path) -> Option<(i64, Vec<u8>, i64)> {
+    /// `(key, entries, accessed_ns)` of a cached listing. A row with no
+    /// `ctime_ns` or `ino` (an older binary wrote it) is not one.
+    fn get_dir(&self, path: &Path) -> Option<(StatKey, Vec<u8>, i64)> {
         let conn = self.read_pool.get().ok()?;
         let mut stmt = conn
             .prepare_cached(
-                "SELECT mtime_ns, entries, accessed_ns FROM dirs \
-                 WHERE path = ?1 AND listing_version = ?2",
+                "SELECT mtime_ns, ctime_ns, ino, entries, accessed_ns FROM dirs \
+                 WHERE path = ?1 AND listing_version = ?2 \
+                 AND ctime_ns IS NOT NULL AND ino IS NOT NULL",
             )
             .ok()?;
         stmt.query_row(
             rusqlite::params![path_key(path), DIR_LISTING_VERSION],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| {
+                Ok((
+                    StatKey {
+                        mtime_ns: r.get(0)?,
+                        ctime_ns: r.get(1)?,
+                        ino: r.get::<_, i64>(2)?.cast_unsigned(),
+                    },
+                    r.get(3)?,
+                    r.get(4)?,
+                ))
+            },
         )
         .ok()
     }
 
-    fn put_dir(&self, path: &Path, mtime_ns: i64, entries: &[u8], now: i64) {
+    fn put_dir(&self, path: &Path, key: &StatKey, entries: &[u8], now: i64) {
         let Some(conn) = self.writer() else {
             return;
         };
@@ -841,26 +996,31 @@ impl FsWalkStore {
         // `synchronous = OFF`, so the implicit commit is a WAL append and it is
         // the parse, not the transaction, that is worth removing.
         let Ok(mut stmt) = conn.prepare_cached(
-            "INSERT OR REPLACE INTO dirs (path, mtime_ns, entries, accessed_ns, listing_version) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT OR REPLACE INTO dirs \
+             (path, mtime_ns, ctime_ns, ino, entries, accessed_ns, listing_version) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         ) else {
             return;
         };
         drop(stmt.execute(rusqlite::params![
             path_key(path),
-            mtime_ns,
+            key.mtime_ns,
+            key.ctime_ns,
+            key.ino.cast_signed(),
             entries,
             now,
             DIR_LISTING_VERSION
         ]));
     }
 
-    /// A cached file hash and its `accessed_ns`.
+    /// A cached file hash and its `accessed_ns`. A row with no `ctime_ns` or
+    /// `ino` (an older binary wrote it) is not one.
     fn get_file(&self, path: &Path) -> Option<(FileHash, i64)> {
         let conn = self.read_pool.get().ok()?;
         let mut stmt = conn
             .prepare_cached(
-                "SELECT size, mtime_ns, exec, hashout, accessed_ns FROM files WHERE path = ?1",
+                "SELECT size, mtime_ns, ctime_ns, ino, exec, hashout, accessed_ns FROM files \
+                 WHERE path = ?1 AND ctime_ns IS NOT NULL AND ino IS NOT NULL",
             )
             .ok()?;
         stmt.query_row([path_key(path)], |r| {
@@ -868,10 +1028,12 @@ impl FsWalkStore {
                 FileHash {
                     size: u64::try_from(r.get::<_, i64>(0)?).unwrap_or(0),
                     mtime_ns: r.get(1)?,
-                    exec: r.get::<_, i64>(2)? != 0,
-                    hashout: r.get(3)?,
+                    ctime_ns: r.get(2)?,
+                    ino: r.get::<_, i64>(3)?.cast_unsigned(),
+                    exec: r.get::<_, i64>(4)? != 0,
+                    hashout: r.get(5)?,
                 },
-                r.get(4)?,
+                r.get(6)?,
             ))
         })
         .ok()
@@ -884,8 +1046,9 @@ impl FsWalkStore {
         // Prepared for the same reason as `put_dir`, and more so: this runs once
         // per hashed file, not per directory.
         let Ok(mut stmt) = conn.prepare_cached(
-            "INSERT OR REPLACE INTO files (path, size, mtime_ns, exec, hashout, accessed_ns) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT OR REPLACE INTO files \
+             (path, size, mtime_ns, ctime_ns, ino, exec, hashout, accessed_ns) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         ) else {
             return;
         };
@@ -893,6 +1056,8 @@ impl FsWalkStore {
             path_key(path),
             i64::try_from(fh.size).unwrap_or(i64::MAX),
             fh.mtime_ns,
+            fh.ctime_ns,
+            fh.ino.cast_signed(),
             fh.exec as i64,
             fh.hashout,
             now
@@ -962,10 +1127,38 @@ impl FsWalkStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicI64, Ordering};
     use tempfile::tempdir;
 
+    /// A walker on `<dir>/fswalk.db` whose clock runs an hour ahead, so the
+    /// files a test has just written are settled and get cached — what most
+    /// tests here are about. The racy tests drive the clock themselves.
     fn walker(dir: &Path) -> CachedWalker {
-        CachedWalker::open(&dir.join("fswalk.db"))
+        CachedWalker::open(&dir.join("fswalk.db")).with_clock(|| now_ns() + 3_600_000_000_000)
+    }
+
+    fn racy_window_ns() -> i64 {
+        i64::try_from(RACY_WINDOW.as_nanos()).unwrap()
+    }
+
+    /// A fixed mtime well in the past: settled against the real clock.
+    fn old_mtime() -> SystemTime {
+        UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000)
+    }
+
+    fn set_mtime(path: &Path, at: SystemTime) {
+        std::fs::File::open(path).unwrap().set_modified(at).unwrap();
+    }
+
+    fn rows(db: &Path, table: &str) -> i64 {
+        Connection::open(db)
+            .unwrap()
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn names(listing: &DirListing) -> Vec<&str> {
+        listing.entries.iter().map(|e| e.name.as_str()).collect()
     }
 
     fn table_exists(db: &Path, name: &str) -> bool {
@@ -1503,21 +1696,25 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let w = CachedWalker::open(&db);
+        let w = walker(root);
         assert_eq!(w.read_dir(&pkg).unwrap().entries.len(), 1);
         drop(w);
 
         let conn = Connection::open(&db).unwrap();
-        let version: i64 = conn
+        let (version, ctime_ns, ino): (i64, Option<i64>, Option<i64>) = conn
             .query_row(
-                "SELECT listing_version FROM dirs WHERE path = ?1",
+                "SELECT listing_version, ctime_ns, ino FROM dirs WHERE path = ?1",
                 [pkg.to_str().unwrap()],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .expect("the migrated db must hold a row for the walked dir");
         assert_eq!(
             version, DIR_LISTING_VERSION,
             "the migrated column must be written with the current version"
+        );
+        assert!(
+            ctime_ns.is_some() && ino.is_some(),
+            "the migrated key columns must be written"
         );
     }
 
@@ -1535,25 +1732,30 @@ mod tests {
         let pkg = root.join("pkg");
         std::fs::create_dir(&pkg).unwrap();
         std::fs::write(pkg.join("a.txt"), b"a").unwrap();
-        let stamped = std::fs::metadata(&pkg).unwrap().modified().unwrap();
 
         let w = walker(root);
         assert_eq!(w.read_dir(&pkg).unwrap().entries.len(), 1);
         drop(w);
 
-        // Change the directory behind the cache's back and put its mtime back,
-        // so reuse is decided by the row alone. A walker that re-read from disk
-        // would see two entries.
-        std::fs::write(pkg.join("b.txt"), b"b").unwrap();
-        std::fs::File::open(&pkg)
+        // Empty the stored listing behind the cache's back, its key untouched,
+        // so only a walker that served the row sees no entries. (Changing the
+        // directory itself cannot do this: its ctime moves with any change.)
+        let updated = Connection::open(root.join("fswalk.db"))
             .unwrap()
-            .set_modified(stamped)
+            .execute(
+                "UPDATE dirs SET entries = ?1 WHERE path = ?2",
+                rusqlite::params![
+                    borsh::to_vec(&DirListing::default()).unwrap(),
+                    path_key(&pkg)
+                ],
+            )
             .unwrap();
+        assert_eq!(updated, 1);
 
         let w2 = walker(root);
         assert_eq!(
             w2.read_dir(&pkg).unwrap().entries.len(),
-            1,
+            0,
             "the durable listing was not reused — the dirs cache is not being hit at all"
         );
     }
@@ -1714,7 +1916,7 @@ mod tests {
             }
         }
 
-        let w = Arc::new(CachedWalker::open(&root.join("fswalk.db")));
+        let w = Arc::new(walker(root));
         // Overlapping, not disjoint: threads contend on the same rows.
         let pass = |w: &CachedWalker| {
             for i in 0..8 {
@@ -1740,5 +1942,361 @@ mod tests {
         });
         // Second pass now reads back what the concurrent writes stored.
         pass(&w);
+    }
+
+    #[test]
+    fn settled_boundaries() {
+        let key = StatKey {
+            mtime_ns: 1_000 * racy_window_ns(),
+            ctime_ns: 0,
+            ino: 1,
+        };
+        assert!(settled(&key, key.mtime_ns + racy_window_ns()));
+        assert!(!settled(&key, key.mtime_ns + racy_window_ns() - 1));
+        assert!(!settled(&key, key.mtime_ns));
+        // An mtime ahead of the clock is never settled.
+        assert!(!settled(&key, key.mtime_ns - 1));
+        assert!(!settled(&key, i64::MIN));
+    }
+
+    /// The key every path reports under [`fixed_key_walker`].
+    const FIXED_KEY: StatKey = StatKey {
+        mtime_ns: 1_700_000_000_000_000_000,
+        ctime_ns: 1_700_000_000_000_000_000,
+        ino: 7,
+    };
+
+    /// A walker on `<dir>/fswalk.db` whose stat reports [`FIXED_KEY`] for every
+    /// path, whatever happens to it on disk, and whose clock reads `clock`. A
+    /// change on disk is then invisible to validation, so whether a read sees
+    /// it says whether the earlier read was cached.
+    fn fixed_key_walker(dir: &Path, clock: &Arc<AtomicI64>) -> CachedWalker {
+        let clock = Arc::clone(clock);
+        CachedWalker::open(&dir.join("fswalk.db"))
+            .with_clock(move || clock.load(Ordering::Relaxed))
+            .with_stat(|p| {
+                let mut st = stat_path(p)?;
+                st.key = Some(FIXED_KEY);
+                Ok(st)
+            })
+    }
+
+    /// D30: a listing read less than `RACY_WINDOW` after its mtime is returned
+    /// but cached nowhere — the next read goes to disk again — and nothing
+    /// promotes it later: the first settled read re-reads and stores what it
+    /// read itself.
+    #[test]
+    fn racy_read_dir_is_not_stored() {
+        let tmp = tempdir().unwrap();
+        let db = tmp.path().join("fswalk.db");
+        let pkg = tmp.path().join("pkg");
+        std::fs::create_dir(&pkg).unwrap();
+        std::fs::write(pkg.join("a"), b"").unwrap();
+        let clock = Arc::new(AtomicI64::new(FIXED_KEY.mtime_ns + racy_window_ns() - 1));
+        let w = fixed_key_walker(tmp.path(), &clock);
+
+        assert_eq!(names(&w.read_dir(&pkg).unwrap()), ["a"]);
+        assert_eq!(rows(&db, "dirs"), 0, "a racy listing must not be stored");
+        assert!(w.dirs.lock().is_empty(), "nor kept in-process");
+
+        // Same key, new entry: only a re-read sees it.
+        std::fs::write(pkg.join("b"), b"").unwrap();
+        assert_eq!(names(&w.read_dir(&pkg).unwrap()), ["a", "b"]);
+        assert_eq!(
+            names(&fixed_key_walker(tmp.path(), &clock).read_dir(&pkg).unwrap()),
+            ["a", "b"]
+        );
+
+        // Settled: read from disk once more, then stored and served.
+        clock.store(FIXED_KEY.mtime_ns + racy_window_ns(), Ordering::Relaxed);
+        std::fs::write(pkg.join("c"), b"").unwrap();
+        assert_eq!(names(&w.read_dir(&pkg).unwrap()), ["a", "b", "c"]);
+        assert_eq!(rows(&db, "dirs"), 1, "a settled listing is stored");
+        std::fs::write(pkg.join("d"), b"").unwrap();
+        assert_eq!(
+            names(&w.read_dir(&pkg).unwrap()),
+            ["a", "b", "c"],
+            "a settled listing is served in-process"
+        );
+        assert_eq!(
+            names(&fixed_key_walker(tmp.path(), &clock).read_dir(&pkg).unwrap()),
+            ["a", "b", "c"],
+            "and from the durable store"
+        );
+    }
+
+    /// D30 for `file_hash`, which reaches input hashes: a same-size save within
+    /// the tick must not file the new content under the old hash.
+    #[test]
+    fn racy_file_hash_is_not_stored() {
+        let tmp = tempdir().unwrap();
+        let db = tmp.path().join("fswalk.db");
+        let f = tmp.path().join("f");
+        std::fs::write(&f, b"aaaa").unwrap();
+        let clock = Arc::new(AtomicI64::new(FIXED_KEY.mtime_ns + racy_window_ns() - 1));
+        let w = fixed_key_walker(tmp.path(), &clock);
+        let hash = |w: &CachedWalker| w.file_hash(&f).unwrap().hashout.clone();
+
+        assert_eq!(hash(&w), bytes_hashout(b"aaaa", false));
+        assert_eq!(rows(&db, "files"), 0, "a racy hash must not be stored");
+        assert!(w.files.lock().is_empty(), "nor kept in-process");
+
+        // Same size, same key, new bytes: only a re-hash sees them.
+        std::fs::write(&f, b"bbbb").unwrap();
+        assert_eq!(hash(&w), bytes_hashout(b"bbbb", false));
+        assert_eq!(
+            hash(&fixed_key_walker(tmp.path(), &clock)),
+            bytes_hashout(b"bbbb", false)
+        );
+
+        // Settled: hashed from disk once more, then stored and served.
+        clock.store(FIXED_KEY.mtime_ns + racy_window_ns(), Ordering::Relaxed);
+        std::fs::write(&f, b"cccc").unwrap();
+        assert_eq!(hash(&w), bytes_hashout(b"cccc", false));
+        assert_eq!(rows(&db, "files"), 1, "a settled hash is stored");
+        std::fs::write(&f, b"dddd").unwrap();
+        assert_eq!(
+            hash(&w),
+            bytes_hashout(b"cccc", false),
+            "a settled hash is served in-process"
+        );
+        assert_eq!(
+            hash(&fixed_key_walker(tmp.path(), &clock)),
+            bytes_hashout(b"cccc", false),
+            "and from the durable store"
+        );
+    }
+
+    /// A walker on `<dir>/fswalk.db` (clock an hour ahead) whose stat is the
+    /// real one except for the ctime, which reads `ctime`. A test moves the
+    /// ctime itself: a kernel that stamps ctime from a millisecond-tick clock
+    /// (Linux without multigrain timestamps) can leave it unchanged across two
+    /// operations a test makes back to back, and a test may not sleep.
+    fn pinned_ctime_walker(dir: &Path, ctime: &Arc<AtomicI64>) -> CachedWalker {
+        let ctime = Arc::clone(ctime);
+        walker(dir).with_stat(move |p| {
+            let mut st = stat_path(p)?;
+            if let Some(key) = &mut st.key {
+                key.ctime_ns = ctime.load(Ordering::Relaxed);
+            }
+            Ok(st)
+        })
+    }
+
+    /// D33: a rewrite that keeps size and mtime (`cp -p`, `rsync -a`, `tar -x`
+    /// in place) still moves the ctime, and that alone re-reads the file and
+    /// the directory, in-process and from the durable store.
+    #[test]
+    fn a_new_ctime_with_the_same_size_and_mtime_is_reread() {
+        let tmp = tempdir().unwrap();
+        let pkg = tmp.path().join("pkg");
+        std::fs::create_dir(&pkg).unwrap();
+        let f = pkg.join("f");
+        std::fs::write(&f, b"aaaa").unwrap();
+        set_mtime(&f, old_mtime());
+        set_mtime(&pkg, old_mtime());
+        let ctime = Arc::new(AtomicI64::new(1));
+        let w = pinned_ctime_walker(tmp.path(), &ctime);
+        assert_eq!(names(&w.read_dir(&pkg).unwrap()), ["f"]);
+        assert_eq!(
+            w.file_hash(&f).unwrap().hashout,
+            bytes_hashout(b"aaaa", false)
+        );
+
+        std::fs::write(&f, b"bbbb").unwrap();
+        std::fs::write(pkg.join("g"), b"").unwrap();
+        set_mtime(&f, old_mtime());
+        set_mtime(&pkg, old_mtime());
+        ctime.store(2, Ordering::Relaxed);
+
+        let fresh = pinned_ctime_walker(tmp.path(), &ctime);
+        for (what, w) in [("durable", &fresh), ("in-process", &w)] {
+            assert_eq!(names(&w.read_dir(&pkg).unwrap()), ["f", "g"], "{what}");
+            assert_eq!(
+                w.file_hash(&f).unwrap().hashout,
+                bytes_hashout(b"bbbb", false),
+                "{what}"
+            );
+        }
+    }
+
+    /// D33: a replacement with the same size, mtime and ctime but a new inode
+    /// (a file or directory renamed over the old one) is re-read.
+    #[test]
+    fn a_new_inode_with_the_same_size_and_mtime_is_reread() {
+        let tmp = tempdir().unwrap();
+        let pkg = tmp.path().join("pkg");
+        std::fs::create_dir(&pkg).unwrap();
+        let f = pkg.join("f");
+        std::fs::write(&f, b"aaaa").unwrap();
+        set_mtime(&f, old_mtime());
+        set_mtime(&pkg, old_mtime());
+        let ctime = Arc::new(AtomicI64::new(1));
+        let w = pinned_ctime_walker(tmp.path(), &ctime);
+        assert_eq!(names(&w.read_dir(&pkg).unwrap()), ["f"]);
+        assert_eq!(
+            w.file_hash(&f).unwrap().hashout,
+            bytes_hashout(b"aaaa", false)
+        );
+        let (old_file_ino, old_dir_ino) = (w.files.lock()[&f].ino, w.dirs.lock()[&pkg].0.ino);
+
+        // The new directory holds the new file; the old one moves aside so
+        // its inodes stay allocated and cannot be reused.
+        let next = tmp.path().join("next");
+        std::fs::create_dir(&next).unwrap();
+        std::fs::write(next.join("f"), b"bbbb").unwrap();
+        std::fs::write(next.join("g"), b"").unwrap();
+        set_mtime(&next.join("f"), old_mtime());
+        set_mtime(&next, old_mtime());
+        std::fs::rename(&pkg, tmp.path().join("old")).unwrap();
+        std::fs::rename(&next, &pkg).unwrap();
+        set_mtime(&pkg, old_mtime());
+
+        let fresh = pinned_ctime_walker(tmp.path(), &ctime);
+        for (what, w) in [("durable", &fresh), ("in-process", &w)] {
+            assert_eq!(names(&w.read_dir(&pkg).unwrap()), ["f", "g"], "{what}");
+            assert_eq!(
+                w.file_hash(&f).unwrap().hashout,
+                bytes_hashout(b"bbbb", false),
+                "{what}"
+            );
+        }
+        assert_ne!(w.files.lock()[&f].ino, old_file_ino);
+        assert_ne!(w.dirs.lock()[&pkg].0.ino, old_dir_ino);
+    }
+
+    /// D33: `chmod` leaves size and mtime alone but moves the ctime, so the
+    /// exec bit folded into the hash is refreshed rather than served stale.
+    #[test]
+    fn chmod_refreshes_the_exec_bit() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempdir().unwrap();
+        let f = tmp.path().join("tool");
+        std::fs::write(&f, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+        set_mtime(&f, old_mtime());
+        let ctime = Arc::new(AtomicI64::new(1));
+        let w = pinned_ctime_walker(tmp.path(), &ctime);
+        let before = w.file_hash(&f).unwrap();
+        assert!(!before.exec);
+
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        ctime.store(2, Ordering::Relaxed);
+
+        let fresh = pinned_ctime_walker(tmp.path(), &ctime);
+        for (what, w) in [("durable", &fresh), ("in-process", &w)] {
+            let after = w.file_hash(&f).unwrap();
+            assert!(after.exec, "{what}");
+            assert_eq!(after.hashout, file_hashout(&f, true).unwrap(), "{what}");
+            assert_ne!(after.hashout, before.hashout, "{what}");
+        }
+    }
+
+    /// The schema version 1 DDL, verbatim (`listing_version`, no key columns).
+    const V1_FSWALK_DDL: &str = "PRAGMA journal_mode = WAL;
+         CREATE TABLE dirs (
+             path        TEXT PRIMARY KEY,
+             mtime_ns    INTEGER NOT NULL,
+             entries     BLOB NOT NULL,
+             accessed_ns INTEGER NOT NULL,
+             listing_version INTEGER NOT NULL DEFAULT 0
+         );
+         CREATE TABLE files (
+             path        TEXT PRIMARY KEY,
+             size        INTEGER NOT NULL,
+             mtime_ns    INTEGER NOT NULL,
+             exec        INTEGER NOT NULL,
+             hashout     TEXT NOT NULL,
+             accessed_ns INTEGER NOT NULL
+         );
+         PRAGMA user_version = 1;";
+
+    /// Write rows the way a schema-1 binary does — its `INSERT`s verbatim —
+    /// for `dir` (listing nothing) and `file` (hashed as `stale`), each with
+    /// its live size and mtime, so the mtime guard alone would serve them.
+    fn put_v1_rows(db: &Path, dir: &Path, file: &Path) {
+        let conn = Connection::open(db).unwrap();
+        let dir_mtime = mtime_ns(&std::fs::metadata(dir).unwrap()).unwrap();
+        let file_meta = std::fs::metadata(file).unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO dirs (path, mtime_ns, entries, accessed_ns, listing_version) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                path_key(dir),
+                dir_mtime,
+                borsh::to_vec(&DirListing::default()).unwrap(),
+                now_ns(),
+                DIR_LISTING_VERSION
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO files (path, size, mtime_ns, exec, hashout, accessed_ns) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                path_key(file),
+                i64::try_from(file_meta.len()).unwrap(),
+                mtime_ns(&file_meta).unwrap(),
+                0,
+                "stale",
+                now_ns()
+            ],
+        )
+        .unwrap();
+    }
+
+    /// D34: opening a schema-1 db migrates it to 2 and drops every row it
+    /// held, since any of them may have been stored racy. A one-time re-read.
+    #[test]
+    fn fswalk_v1_rows_are_dropped_on_migration() {
+        let tmp = tempdir().unwrap();
+        let db = tmp.path().join("fswalk.db");
+        let pkg = tmp.path().join("pkg");
+        std::fs::create_dir(&pkg).unwrap();
+        let f = pkg.join("f");
+        std::fs::write(&f, b"aaaa").unwrap();
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(V1_FSWALK_DDL)
+            .unwrap();
+        put_v1_rows(&db, &pkg, &f);
+
+        let w = walker(tmp.path());
+        assert!(w.store().is_some());
+        assert_eq!(fswalk_version(&db), FSWALK_SCHEMA_VERSION);
+        assert_eq!((rows(&db, "dirs"), rows(&db, "files")), (0, 0));
+
+        assert_eq!(names(&w.read_dir(&pkg).unwrap()), ["f"]);
+        assert_eq!(
+            w.file_hash(&f).unwrap().hashout,
+            bytes_hashout(b"aaaa", false)
+        );
+        assert_eq!((rows(&db, "dirs"), rows(&db, "files")), (1, 1));
+    }
+
+    /// D34, the mixed fleet: a schema-1 binary keeps writing to a db at schema
+    /// 2 (it reads the version as current), and its `INSERT`s leave the key
+    /// columns NULL. Such a row is never served.
+    #[test]
+    fn old_fswalk_row_reads_unverified() {
+        let tmp = tempdir().unwrap();
+        let db = tmp.path().join("fswalk.db");
+        let pkg = tmp.path().join("pkg");
+        std::fs::create_dir(&pkg).unwrap();
+        let f = pkg.join("f");
+        std::fs::write(&f, b"aaaa").unwrap();
+        let w = walker(tmp.path());
+        w.read_dir(&pkg).unwrap();
+        w.file_hash(&f).unwrap();
+        drop(w);
+
+        put_v1_rows(&db, &pkg, &f);
+
+        let w = walker(tmp.path());
+        assert_eq!(names(&w.read_dir(&pkg).unwrap()), ["f"]);
+        assert_eq!(
+            w.file_hash(&f).unwrap().hashout,
+            bytes_hashout(b"aaaa", false)
+        );
     }
 }
