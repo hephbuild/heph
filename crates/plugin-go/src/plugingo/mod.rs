@@ -42,6 +42,6 @@ pub use provider::{Config, Provider};
 // nothing is not an error, it downloads the SDK unverified (the driver only
 // warns), so a drifted copy leaves the suite green while it tests an unverified
 // toolchain.
-pub use toolchain::{DEFAULT_GO_VERSION, GoToolchainDriver, HOST, checksum_key};
+pub use toolchain::{DEFAULT_GO_VERSION, GoToolchainDriver, HOST, HostGoCache, checksum_key};
 
 pub mod runner;

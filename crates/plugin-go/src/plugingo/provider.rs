@@ -19,7 +19,7 @@ use crate::plugingo::target_modfiles;
 use crate::plugingo::target_std;
 use crate::plugingo::target_test;
 use crate::plugingo::thirdparty;
-use crate::plugingo::toolchain;
+use crate::plugingo::toolchain::{self, HostGoCache};
 use crate::plugingo::variant;
 use anyhow::Context;
 use async_recursion::async_recursion;
@@ -163,6 +163,10 @@ pub(crate) struct ProviderInner {
     walker: Arc<CachedWalker>,
     /// See [`Config::foreign_name_guard`].
     foreign_name_guard: bool,
+    /// The host `go` the drivers probed, shared with them ([`Provider::host_go`])
+    /// and cleared whenever a scope ends. Not per-scope: the drivers' run
+    /// requests carry no scope to pick a bucket with.
+    host_go: Arc<HostGoCache>,
 }
 
 /// Everything the provider read of the workspace for one cache scope (one
@@ -445,8 +449,16 @@ impl Provider {
                 skip: config.skip,
                 walker: config.walker,
                 foreign_name_guard: config.foreign_name_guard,
+                host_go: Arc::default(),
             }),
         })
+    }
+
+    /// The host-toolchain cache the `golist`, `compile` and `download` drivers
+    /// must be built with, so this provider's `scope_ended` clears what they
+    /// probed. See [`HostGoCache`] for the lifetime.
+    pub fn host_go(&self) -> Arc<HostGoCache> {
+        Arc::clone(&self.inner.host_go)
     }
 }
 
@@ -1251,13 +1263,15 @@ impl ProviderInner {
         Box::pin(async move { Ok(ProbeResponse { states: vec![] }) })
     }
 
-    /// Drop the scope's bucket (and every bucket below the host's watermark).
+    /// Drop the scope's bucket (and every bucket below the host's watermark),
+    /// and forget the drivers' host-`go` probe, which is keyed on no scope.
     fn scope_ended<'a>(
         &'a self,
         ended: ScopeEnded,
     ) -> BoxFuture<'a, anyhow::Result<ScopeEndedAck>> {
         Box::pin(async move {
             let released = self.scopes.end(ended).await;
+            self.host_go.clear().await;
             tracing::debug!(
                 provider = "go",
                 scope = ended.scope.get(),

@@ -238,12 +238,42 @@ pub fn staged_goroot(version: &str) -> String {
 /// a 100% hit rate and cannot grow, and a key that does not match simply
 /// re-probes. The lock is held **across** the probe so concurrent targets at
 /// build start queue behind the first rather than each spawning their own.
+///
+/// **Lifetime: cleared when a cache scope ends.** The environment can change
+/// between two builds of a long-lived engine (the BUILD-file LSP) without its
+/// runner address changing — a `devenv.nix` edit swaps the `go` behind the same
+/// `//tools/devenv:runner` — so an answer must not outlive the request that
+/// probed it. The Go provider and its three drivers that run `go` (`golist`,
+/// `compile`, `download`) share **one** `Arc` of this cache, built by the
+/// provider ([`crate::plugingo::Provider::host_go`]); the drivers' run requests
+/// carry no scope, so the provider's `scope_ended` hook is what clears it.
+///
+/// - Sequential requests re-probe: each new scope pays one probe.
+/// - Overlapping scopes may share a probe: a request that starts while another
+///   is still running reads the slot the other filled, and the first of them to
+///   end clears it for both — the survivor's next target re-probes. Either way
+///   no answer survives every scope that could have seen it.
+///
+/// It holds paths only, never a request handle, so it cannot keep a scope alive.
 #[derive(Default)]
-pub(crate) struct HostGoCache {
+pub struct HostGoCache {
     slot: tokio::sync::Mutex<Option<(String, (std::path::PathBuf, std::path::PathBuf))>>,
 }
 
+impl std::fmt::Debug for HostGoCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostGoCache").finish_non_exhaustive()
+    }
+}
+
 impl HostGoCache {
+    /// Forget the probed toolchain, so the next `resolve` asks the environment
+    /// again. Waits for a probe in flight rather than racing it: that probe's
+    /// answer is dropped here too, instead of landing after the clear.
+    pub(crate) async fn clear(&self) {
+        *self.slot.lock().await = None;
+    }
+
     async fn resolve(
         &self,
         runner: hexecrunner::RunnerRef<'_>,
@@ -941,6 +971,54 @@ mod host_go_tests {
             .await
             .expect("two");
         assert_eq!(probes.load(Ordering::SeqCst), 2);
+    }
+
+    /// **The cache lives for a scope, not for the process.** The drivers hold
+    /// the provider's cache, and the provider's `scope_ended` clears it, so a
+    /// later request asks the environment again — a `devenv.nix` edit that
+    /// swapped the `go` behind the same runner address is seen at the next
+    /// build of a long-lived engine. Within the scope one probe still serves.
+    #[tokio::test]
+    async fn host_go_cache_is_cleared_on_scope_end() {
+        use hplugin::provider::{Provider as _, ScopeEnded, ScopeEndedAck, ScopeId};
+
+        const REQ: &str = "req-scope-end";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let probes = Arc::new(AtomicUsize::new(0));
+        hexecrunner::install_host(Arc::new(FakeEnv {
+            go: fake_go(dir.path(), "/env/goroot"),
+            probes: Arc::clone(&probes),
+            request_id: REQ.to_string(),
+        }));
+
+        let provider = crate::plugingo::Provider::new(
+            dir.path().to_path_buf(),
+            tokio::runtime::Handle::current(),
+        )
+        .expect("provider");
+        // What a driver holds: the provider's cache, not one of its own.
+        let cache = provider.host_go();
+
+        let ct = hcore::hasync::StdCancellationToken::new();
+        let a = addr();
+        let resolve = || cache.resolve(RunnerRef::target(REQ, &a), "go.golist", &ct);
+        resolve().await.expect("first");
+        resolve().await.expect("same scope");
+        assert_eq!(probes.load(Ordering::SeqCst), 1, "one probe per scope");
+
+        let scope = ScopeId::new(1).expect("scope id");
+        let ack = provider
+            .scope_ended(ScopeEnded::new(scope, 0))
+            .await
+            .expect("scope_ended");
+        assert!(matches!(ack, ScopeEndedAck::Released));
+
+        resolve().await.expect("next scope");
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            2,
+            "the next request after a scope ended must re-probe the environment"
+        );
     }
 }
 
