@@ -35,8 +35,14 @@
 //! samples. It does not hold on a workspace whose times are stamped by another
 //! machine — NFS or SMB, or a VM-shared mount such as a Docker Desktop bind
 //! mount — whose clock lags heph's by more than [`RACY_WINDOW`]: a read there
-//! can look settled while a write in the same tick is still possible. That is
-//! an accepted exemption, not a supported configuration.
+//! can look settled while a write in the same tick is still possible. Nor does
+//! it hold on a read-only image filesystem that reports stored times rather
+//! than stamping them — squashfs, erofs, iso9660 — where ctime is the image's
+//! mtime, and a reproducible image normalizes times and assigns inodes
+//! deterministically: mounting one image and then the next at the same path
+//! can leave a same-size edit with an identical key. Both are accepted
+//! exemptions for the same reason — the times are not stamped from heph's
+//! clock — not supported configurations.
 //!
 //! Upgrading to [`FSWALK_SCHEMA_VERSION`] 2 drops every stored row, so the first
 //! run after it re-reads every directory and re-hashes every input once. Target
@@ -345,8 +351,11 @@ impl FileHash {
 /// btrfs subvolumes, NFS, overlayfs and macOS external volumes can report a new
 /// one across remounts or reboots, which would turn every warm run there into
 /// a full re-read. What it would catch — another filesystem mounted over the
-/// path between runs — moves mtime or ctime anyway, and a reused loop device
-/// keeps its id, so the device would not catch it either.
+/// path between runs — moves ctime wherever the kernel stamps it, and a reused
+/// loop device keeps its id, so the device would not catch it either. Where the
+/// kernel does not stamp it (a read-only image filesystem, whose times come from
+/// the image), neither the device nor the key is a guarantee; see the module
+/// docs.
 ///
 /// The key, and [`settled`], assume the local kernel stamps file times from
 /// the clock heph samples; see the module docs for the mounts where it does
@@ -642,7 +651,8 @@ impl CachedWalker {
     pub fn file_hash(&self, file: &Path) -> Result<Arc<FileHash>> {
         // Sampled before the stat, as in `read_dir`.
         let clock = (self.clock)();
-        let st = (self.stat)(file).with_context(|| format!("stat file '{}'", file.display()))?; // A directory (e.g. a symlink resolving to one) is not hashable — error so
+        let st = (self.stat)(file).with_context(|| format!("stat file '{}'", file.display()))?;
+        // A directory (e.g. a symlink resolving to one) is not hashable — error so
         // the caller skips it rather than trying to read it.
         anyhow::ensure!(!st.is_dir, "'{}' is a directory", file.display());
 
