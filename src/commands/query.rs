@@ -92,9 +92,17 @@ impl App for QueryApp {
     }
 
     async fn run(self, ctx: AppContext) -> anyhow::Result<()> {
-        let rs = self
-            .engine
-            .new_state_with_events(self.fail_fast, ctx.event_sender());
+        // The renderer's background counter, not a private one: the providers'
+        // `scope_ended` hook for this request counts on it, and the renderer
+        // drains it before the process exits — a private counter would let
+        // `heph query` exit with the hook still in flight.
+        let rs = self.engine.new_state_full(
+            self.fail_fast,
+            ctx.event_sender(),
+            ctx.bg_pending(),
+            Engine::DEFAULT_LOG_TAIL_LINES,
+            None,
+        );
         // What matched goes to stdout as it is found; what the walk could not
         // resolve is reported on stderr at the end, and fails the command.
         let gaps = Gaps::new(crate::htquery::format(&self.matcher));
