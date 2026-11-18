@@ -73,7 +73,7 @@ whole point of the dispatch collapse — grow capability without breaking old
 plugins. Bump the **patch** to record the addition; `MIN_PLUGIN_ABI` stays, so
 every plugin in the minor keeps loading.
 
-0.21.1's `PROVIDER_METHOD_SCOPE_ENDED` (10) is the worked example: a new method
+0.21.2's `PROVIDER_METHOD_SCOPE_ENDED` (10) is the worked example: a new method
 id over the existing `invoke` slot, a new `Frame` body for its reply, and an
 optional `cache_scope` on every provider request. The host also gates the call
 on the plugin's reported ABI (`SCOPE_SINCE`, beside `CANCEL_KEY_SINCE`), so an
@@ -246,16 +246,16 @@ skipped in silence.
 
 ## History of breaks
 
-- **0.21.1** (additive patch) — per-request provider caches. `cache_scope`
+- **0.21.2** (additive patch) — per-request provider caches. `cache_scope`
   (`uint64`) on `ListRequest`/`GetRequest` (4), `ProbeRequest` and
   `ListPackagesRequest` (3), and `ListPackagesRequest.request_id` (2), all
   optional on decode; a present scope of 0 is refused.
   `PROVIDER_METHOD_SCOPE_ENDED` (10) carries `ScopeEndedRequest { scope,
   ended_below }` and answers `Frame.scope_ended_resp` (56). The host sends it
-  only to a plugin at `SCOPE_SINCE` (0.21.1) or later. A 0.21.0 plugin ignores
-  the scope and keeps its caches for its lifetime; a 0.21.1 plugin under a
-  0.21.0 host answers from one unscoped cache that never evicts, and warns once
-  per provider. No plugin must be rebuilt.
+  only to a plugin at `SCOPE_SINCE` (0.21.2) or later. A 0.21.0 or 0.21.1
+  plugin ignores the scope and keeps its caches for its lifetime; a 0.21.2
+  plugin under an older host answers from one unscoped cache that never
+  evicts, and warns once per provider. No plugin must be rebuilt.
 - **0.21.0** (break) — outputs from failed targets. `CODEGEN_MODE_IN_PLACE`
   (3) changes meaning: it now also asks the host to write back what a run that
   exited with a code from 1 to 127 left behind (`InPlace { write_on_failure:

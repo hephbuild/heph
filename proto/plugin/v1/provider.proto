@@ -29,7 +29,7 @@ enum ProviderMethod {
   PROVIDER_METHOD_PROBE = 4;
   PROVIDER_METHOD_STATE_SCHEMA = 7;
   PROVIDER_METHOD_CONFIG = 9; // sync metadata (StableMeta::meta)
-  // Since 0.21.1, unary over `invoke`: ScopeEndedRequest -> ScopeEndedResponse.
+  // Since 0.21.2, unary over `invoke`: ScopeEndedRequest -> ScopeEndedResponse.
   // Sent only to a plugin at SCOPE_SINCE or later; an older one is never asked.
   PROVIDER_METHOD_SCOPE_ENDED = 10;
 }
@@ -37,11 +37,11 @@ enum ProviderMethod {
 // The addressing fields (`package`, `prefix`, `addr`) are required, and so is
 // the `request_id` (what a cancel names) of `ListRequest`, `GetRequest` and
 // `ProbeRequest`; so is every response's payload. `ListPackagesRequest`'s
-// `request_id` is optional: a host before 0.21.1 sends none.
+// `request_id` is optional: a host before 0.21.2 sends none.
 //
-// `cache_scope` (since 0.21.1) is the engine cache scope the call belongs to:
+// `cache_scope` (since 0.21.2) is the engine cache scope the call belongs to:
 // minted from 1, so a present 0 is refused; absent means no scope, and the
-// provider answers from its one unscoped cache (a host before 0.21.1).
+// provider answers from its one unscoped cache (a host before 0.21.2).
 // Never hashed.
 message ListRequest {
   string request_id = 1;

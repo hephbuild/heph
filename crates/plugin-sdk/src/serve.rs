@@ -587,7 +587,7 @@ pub struct StableProviderImpl {
 
 impl StableProviderImpl {
     /// Report, once per provider, a request that carried no cache scope: the
-    /// host predates scopes (0.21.1), so the provider answers every call from
+    /// host predates scopes (0.21.2), so the provider answers every call from
     /// its one unscoped cache, which never evicts. Runs in the dispatch, on the
     /// calling thread, before the body is spawned.
     fn note_scope(&self, scope: Option<u64>, method: &'static str) {
@@ -595,7 +595,7 @@ impl StableProviderImpl {
             tracing::warn!(
                 provider = %self.name,
                 method,
-                "provider request carried no cache scope (host older than plugin ABI 0.21.1); \
+                "provider request carried no cache scope (host older than plugin ABI 0.21.2); \
                  its caches fall back to one unscoped bucket that is never released",
             );
         }
@@ -603,7 +603,7 @@ impl StableProviderImpl {
 }
 
 /// A request's `cache_scope` as the SDK decodes it: absent is no scope (a host
-/// before 0.21.1), and a present 0 is refused, since scopes are minted from 1.
+/// before 0.21.2), and a present 0 is refused, since scopes are minted from 1.
 fn decode_scope(raw: Option<u64>, field: &str) -> Result<Option<ScopeId>> {
     raw.map(|raw| {
         ScopeId::new(raw).with_context(|| format!("{field} is 0; cache scopes are minted from 1"))
@@ -680,7 +680,7 @@ async fn provider_list_packages_stream(
     let lreq = (|| -> Result<ListPackagesRequest> {
         let prefix = required(req.prefix, "ListPackagesRequest.prefix")?;
         let scope = decode_scope(req.cache_scope, "ListPackagesRequest.cache_scope")?;
-        // Optional: a host before 0.21.1 sends none.
+        // Optional: a host before 0.21.2 sends none.
         let request_id = req.request_id.unwrap_or_default();
         Ok(ListPackagesRequest::new(request_id, PkgBuf::from(prefix)).with_decoded_scope(scope))
     })();
@@ -5099,7 +5099,7 @@ mod tests {
         }
     }
 
-    // ---- Cache scopes (ABI 0.21.1) ----
+    // ---- Cache scopes (ABI 0.21.2) ----
 
     use hplugin::provider::CacheScope;
     use hplugin::provider::ScopeMap;
@@ -5256,7 +5256,7 @@ mod tests {
             .expect("body")
     }
 
-    /// A host before 0.21.1 sends no scope: every method decodes it as `None`,
+    /// A host before 0.21.2 sends no scope: every method decodes it as `None`,
     /// and those calls share the one unscoped bucket; a scoped call never
     /// answers from it.
     #[test]
@@ -5404,7 +5404,7 @@ mod tests {
         assert_eq!(p.buckets.live_scopes(), 0, "no late call recreated it");
     }
 
-    /// A host before 0.21.1 sends `ListPackagesRequest` with a prefix only: it
+    /// A host before 0.21.2 sends `ListPackagesRequest` with a prefix only: it
     /// decodes, with an empty request id and no scope.
     #[test]
     fn old_host_listpackages_without_request_id_decodes() {
@@ -5507,10 +5507,10 @@ mod tests {
         assert_eq!(seen, [None, ScopeId::new(9)], "refused calls never ran");
     }
 
-    /// The skew a 0.21.0 plugin sees: the new fields are ones it does not
-    /// know, and protobuf skips them. A 0.21.0 `ListPackagesRequest` was
+    /// The skew a plugin before 0.21.2 sees: the new fields are ones it does
+    /// not know, and protobuf skips them. Its `ListPackagesRequest` was
     /// `string prefix = 1` alone — the shape of `ListPackageResponse` — and
-    /// reads a 0.21.1 request as its prefix. This SDK in turn skips a field a
+    /// reads a 0.21.2 request as its prefix. This SDK in turn skips a field a
     /// later host adds.
     #[test]
     fn old_plugin_ignores_new_fields() {
@@ -5522,7 +5522,7 @@ mod tests {
         }
         .encode_to_vec();
         let as_old = pb::ListPackageResponse::decode_from_slice(&new_req)
-            .expect("a 0.21.0 decoder reads a 0.21.1 request");
+            .expect("a 0.21.1 decoder reads a 0.21.2 request");
         assert_eq!(as_old.pkg.as_deref(), Some("a/b"));
 
         let p = ScopedProvider::new();
@@ -5613,23 +5613,23 @@ mod tests {
         }
     }
 
-    /// A plugin that reports 0.21.1 but answers method 10 `Unimplemented` is
+    /// A plugin that reports 0.21.2 but answers method 10 `Unimplemented` is
     /// not an error: the scope's end is a no-op, read as `Unsupported`.
     #[test]
     fn scope_ended_unimplemented_is_a_no_op() {
         let dynp: hplugin_stabby::abi::DynProvider = dynify(stabby::boxed::Box::new(PreScopeSdk));
         let host = StableRemoteProvider::new(dynp, "pre-scope")
             .expect("load")
-            .with_plugin_abi(Some("0.21.1"));
+            .with_plugin_abi(Some("0.21.2"));
         let scope = ScopeId::new(3).expect("non-zero");
         let ack = futures::executor::block_on(host.scope_ended(ScopeEnded::new(scope, 1)))
             .expect("Unimplemented is ignored, not an error");
         assert_eq!(ack, ScopeEndedAck::Unsupported);
     }
 
-    /// A 0.21.0 plugin is never sent method 10; one at 0.21.1 is.
+    /// A 0.21.0 or 0.21.1 plugin is never sent method 10; one at 0.21.2 is.
     #[test]
-    fn scope_ended_not_sent_to_0_21_0_plugin() {
+    fn scope_ended_not_sent_before_0_21_2() {
         let ended = ScopeEnded::new(ScopeId::new(3).expect("non-zero"), 1);
         let ask = |abi: Option<&str>| {
             let p = ScopedProvider::new();
@@ -5638,7 +5638,8 @@ mod tests {
             (ack, p.ended.load(Ordering::Relaxed))
         };
         assert_eq!(ask(Some("0.21.0")), (ScopeEndedAck::Unsupported, 0));
+        assert_eq!(ask(Some("0.21.1")), (ScopeEndedAck::Unsupported, 0));
         assert_eq!(ask(None), (ScopeEndedAck::Unsupported, 0));
-        assert_eq!(ask(Some("0.21.1")), (ScopeEndedAck::Released, 1));
+        assert_eq!(ask(Some("0.21.2")), (ScopeEndedAck::Released, 1));
     }
 }
