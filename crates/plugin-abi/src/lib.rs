@@ -32,6 +32,26 @@ pub use hproto_gen::heph::plugin::v1 as pb;
 /// the new `x.y.0`. The 0.14.0 and 0.15.0 entries below predate it — they were
 /// additive minors, and there was no version check to read them.
 ///
+/// 0.21.2 (additive, a patch): per-request provider caches. Every provider
+/// request carries `cache_scope` (`uint64`: `ListRequest`/`GetRequest` 4,
+/// `ProbeRequest` 3, `ListPackagesRequest` 3), the engine cache scope the
+/// call belongs to — minted from 1, a present 0 refused, absent = no scope.
+/// `ListPackagesRequest` also gains `request_id` (2), optional on decode.
+/// `PROVIDER_METHOD_SCOPE_ENDED` (10, unary over `invoke`, `ScopeEndedRequest`
+/// → `ScopeEndedResponse`, `Frame.scope_ended_resp` 56) tells the plugin a
+/// scope ended, with the host's `ended_below` watermark, so its provider drops
+/// that scope's caches (`Provider::scope_ended`). Nothing about a scope is
+/// hashed.
+///
+/// The skew, both ways: a 0.21.0 or 0.21.1 plugin ignores `cache_scope` and is
+/// never sent method 10 (the host checks [`SCOPE_SINCE`]); if it were, it
+/// would answer `Unimplemented`, which the host ignores. Its caches stay what
+/// they were, provider-lifetime. A 0.21.2 plugin on a 0.21.0 or 0.21.1 host
+/// decodes every request as unscoped: one unscoped cache that never evicts
+/// (today's behaviour), and the SDK warns once per provider. No plugin must be
+/// rebuilt. A Rust source break for plugin authors: the four provider request
+/// structs are `#[non_exhaustive]` and are built with `new`.
+///
 /// 0.21.2 (a patch): stabby 72.1.8 → 72.1.16. stabby's ABI is unchanged
 /// (`abi=2.0.0` before and after) and no `#[stabby]` type, type report or
 /// layout differs between the two releases' `stabby-abi` / `stabby-macros`
@@ -366,6 +386,11 @@ pub const LOG_CAPTURE_SINCE: &str = "0.21.1";
 /// sends a key, and cancels a run by it, only to a plugin at this version or
 /// later; an older one is cancelled by `request_id`.
 pub const CANCEL_KEY_SINCE: &str = "0.19.1";
+
+/// The first plugin ABI that answers `PROVIDER_METHOD_SCOPE_ENDED`. The host
+/// sends a scope's end only to a plugin at this version or later; an older one
+/// is never told, and keeps its caches for the provider's lifetime.
+pub const SCOPE_SINCE: &str = "0.21.2";
 
 /// The prefix of every `ManagedRunRequest.cancel_key`. A plugin sees cancels
 /// for request ids and for run keys through the one `cancel` entry; one with

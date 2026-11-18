@@ -3,6 +3,8 @@
 //! plugins so neither needs to depend on the other's concrete types.
 //!
 //! - `provider` — `Provider`/`ProviderExecutor` traits, `TargetSpec`.
+//! - `scope` — cache scopes: `ScopeId`, the host's `CacheScope`, and the
+//!   provider-side `ScopeMap` (also re-exported from `provider`).
 //! - `function` — `PluginFn` (a BUILD-file `heph.<plugin>.<fn>`), its outcome,
 //!   and the engine's `FunctionRegistry` / `FunctionSlot`.
 //! - `driver` — `Driver` trait, `TargetAddr`, the `targetdef` target-def model,
@@ -27,6 +29,7 @@ pub mod hook;
 pub mod htspec;
 pub mod lsp;
 pub mod provider;
+pub mod scope;
 
 // The `htspec` derive macros (SpecEnum/SpecStruct/…) expand to code that
 // references `crate::htvalue`. Alias it here so those expansions resolve inside

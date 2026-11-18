@@ -23,9 +23,11 @@ itertools = "0.15.0"
 futures = "0.3.34"
 glob = "0.3"
 tokio = { version = "1.54.1", features = ["io-util", "sync"] }
+tracing = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1.54.1", features = ["io-util", "sync", "rt", "macros"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
 tempfile = "3"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
