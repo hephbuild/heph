@@ -808,7 +808,7 @@ impl GhaHook {
                 "annotations",
             ],
         )?;
-        tracing::info!("gha hook loaded");
+        tracing::debug!("gha hook loaded");
         let refresh_secs: u64 = decode_opt(opts, "gha hook", "refreshSecs")?
             .unwrap_or(30)
             .max(1);
@@ -1128,6 +1128,8 @@ mod tests {
         hook.on_event(&ev(
             5,
             BuildEventKind::ResultEnd {
+                left_behind: None,
+                cancelled: false,
                 timed_out: None,
                 addr: "//a:x".into(),
                 error: None,
@@ -1259,6 +1261,8 @@ mod tests {
         hook.on_event(&ev(
             1_000,
             BuildEventKind::ResultEnd {
+                left_behind: None,
+                cancelled: false,
                 timed_out: None,
                 addr: "//a:x".into(),
                 error: Some("target failed".into()),
@@ -1308,6 +1312,8 @@ mod tests {
         hook.on_event(&ev(
             10,
             BuildEventKind::ResultEnd {
+                left_behind: None,
+                cancelled: false,
                 timed_out: None,
                 addr: "//base:proto".into(),
                 error: Some("boom".into()),
@@ -1320,6 +1326,8 @@ mod tests {
             hook.on_event(&ev(
                 20,
                 BuildEventKind::ResultEnd {
+                    left_behind: None,
+                    cancelled: false,
                     timed_out: None,
                     addr: format!("//svc:t{i}"),
                     error: Some("dependency failed".into()),

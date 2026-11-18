@@ -85,7 +85,7 @@ impl Pty {
     /// neutral environment plus `env`. Cursor-position queries are answered as
     /// a terminal would (see `common::take_dsr_queries`).
     pub fn spawn(dist: &Dist, cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Self {
-        Self::spawn_program(dist, dist.heph().as_os_str(), cwd, args, env)
+        Self::spawn_program(dist, dist.heph().as_os_str(), cwd, args, env, Dsr::Origin)
     }
 
     /// An interactive bash on the PTY, with `$HEPH` naming the binary, at its
@@ -101,6 +101,7 @@ impl Pty {
             cwd,
             &["--norc", "--noprofile", "--noediting", "-i"],
             &env,
+            Dsr::Origin,
         );
         pty.prompt = 1;
         pty.wait_prompt();
@@ -117,6 +118,21 @@ impl Pty {
             cwd,
             &["--norc", "--noprofile", "-c", script],
             env,
+            Dsr::Origin,
+        )
+    }
+
+    /// [`Pty::script`] on a terminal that answers a cursor-position query
+    /// with where its cursor is, as a real one does — so an inline viewport
+    /// anchors below what the script printed before it, instead of over it.
+    pub fn script_at_cursor(dist: &Dist, cwd: &Path, script: &str, env: &[(&str, &str)]) -> Self {
+        Self::spawn_program(
+            dist,
+            OsStr::new("bash"),
+            cwd,
+            &["--norc", "--noprofile", "-c", script],
+            env,
+            Dsr::Cursor,
         )
     }
 
@@ -126,6 +142,7 @@ impl Pty {
         cwd: &Path,
         args: &[&str],
         env: &[(&str, &str)],
+        dsr: Dsr,
     ) -> Self {
         let pair = native_pty_system()
             .openpty(PtySize {
@@ -173,11 +190,12 @@ impl Pty {
             dsr_queries: 0,
         }));
         let closing = Arc::new(AtomicBool::new(false));
+        let dsr_mode = dsr;
         let reader = std::thread::spawn({
             let sink = Arc::clone(&shared);
             let dsr = Arc::clone(&writer);
             let closing = Arc::clone(&closing);
-            move || read_terminal(read_fd, &sink, &dsr, &closing)
+            move || read_terminal(read_fd, &sink, &dsr, &closing, dsr_mode)
         });
         Self {
             writer,
@@ -241,6 +259,37 @@ impl Pty {
             .parser
             .screen()
             .hide_cursor()
+    }
+
+    /// Read the emulator's screen as it is now.
+    pub fn with_screen<T>(&self, f: impl FnOnce(&vt100::Screen) -> T) -> T {
+        f(self.shared.lock().expect("screen lock").parser.screen())
+    }
+
+    /// Each row of the screen as it is now, trailing blanks dropped.
+    pub fn rows(&self) -> Vec<String> {
+        self.with_screen(|s| s.rows(0, s.size().1).collect())
+    }
+
+    /// Block until the screen as it is now satisfies `ok`, or panic naming
+    /// `what` with the screen. Unlike [`Pty::wait_for`], an earlier screen
+    /// never satisfies it: this waits for a state, not for text having been
+    /// painted at some point.
+    pub fn wait_screen(
+        &self,
+        what: &str,
+        timeout: Duration,
+        mut ok: impl FnMut(&vt100::Screen) -> bool,
+    ) {
+        let started = Instant::now();
+        while !self.with_screen(&mut ok) {
+            assert!(
+                started.elapsed() < timeout,
+                "the screen never showed {what} within {timeout:?}\n--- screen ---\n{}",
+                self.screen()
+            );
+            std::thread::sleep(POLL);
+        }
     }
 
     /// Whether the terminal is on its alternate screen now.
@@ -433,6 +482,7 @@ fn read_terminal(
     shared: &Mutex<Shared>,
     writer: &Mutex<Option<Box<dyn std::io::Write + Send>>>,
     closing: &AtomicBool,
+    dsr: Dsr,
 ) {
     let mut reader = std::fs::File::from(fd);
     let mut buf = [0u8; 8192];
@@ -448,21 +498,41 @@ fn read_terminal(
         let Some(chunk) = buf.get(..n) else { break };
         tail.extend_from_slice(chunk);
         let queries = super::take_dsr_queries(&mut tail);
+        // The chunk goes to the emulator first, so a reply that reports the
+        // cursor reports it where the bytes before the query left it.
+        let reply = {
+            let mut s = shared.lock().expect("screen lock");
+            s.dsr_queries += queries;
+            s.output.extend_from_slice(chunk);
+            s.parser.process(chunk);
+            let screen = s.parser.screen().contents();
+            s.seen.push_str(&screen);
+            s.seen.push('\n');
+            match dsr {
+                Dsr::Origin => super::DSR_REPLY.to_vec(),
+                Dsr::Cursor => {
+                    let (row, col) = s.parser.screen().cursor_position();
+                    format!("\x1b[{};{}R", row + 1, col + 1).into_bytes()
+                }
+            }
+        };
         for _ in 0..queries {
             let mut guard = writer.lock().expect("writer lock");
             let Some(w) = guard.as_mut() else { break };
-            if w.write_all(super::DSR_REPLY).is_err() || w.flush().is_err() {
+            if w.write_all(&reply).is_err() || w.flush().is_err() {
                 break;
             }
         }
-        let mut s = shared.lock().expect("screen lock");
-        s.dsr_queries += queries;
-        s.output.extend_from_slice(chunk);
-        s.parser.process(chunk);
-        let screen = s.parser.screen().contents();
-        s.seen.push_str(&screen);
-        s.seen.push('\n');
     }
+}
+
+/// How the terminal answers a cursor-position query.
+#[derive(Debug, Clone, Copy)]
+enum Dsr {
+    /// Always row 1, column 1 ([`super::DSR_REPLY`]).
+    Origin,
+    /// Where the emulator's cursor is.
+    Cursor,
 }
 
 /// `select`, not `poll`: macOS documents `poll` as not supporting devices.

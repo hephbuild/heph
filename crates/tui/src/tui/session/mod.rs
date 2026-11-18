@@ -56,18 +56,17 @@ use std::sync::{Mutex, PoisonError};
 
 pub use feed::{Routed, SessionFeed};
 pub use format::{
-    ApprovalPrompt, ApprovalPromptNotice, ApprovalStanding, CAPABILITY_INFLIGHT,
-    CAPABILITY_RUN_LOGS, HeaderKind, META_FORMAT, NoticeUnavailable, RunLogRecord,
-    SNAPSHOT_VERSION, STATUS_LIST_CAP, SessionHeader, SessionMeta, SessionRecord,
-    SessionRecordKind, SessionSnapshot, files,
+    ApprovalPrompt, ApprovalPromptNotice, ApprovalQueued, ApprovalStanding, CAPABILITY_INFLIGHT,
+    HeaderKind, META_FORMAT, NoticeUnavailable, RunLogRecord, SNAPSHOT_VERSION, STATUS_LIST_CAP,
+    SessionHeader, SessionMeta, SessionRecord, SessionRecordKind, SessionSnapshot, files,
 };
 pub use holder::{HolderNames, holder_session};
 pub use id::SessionId;
 pub use reader::RecordReader;
 pub use recorder::{FlushFailed, Recorder, SessionTap, StopNotice, TappedReceiver};
 pub use run_logs::{
-    FoundRunLog, RunLogLookup, SessionRunLog, SessionRunLogLocator, find_run_log, lookup_run_log,
-    session_run_log,
+    FeedRunLogLocator, FoundRunLog, RunLogLookup, SessionRunLog, SessionRunLogLocator,
+    find_run_log, lookup_run_log, session_run_log,
 };
 pub use source::{EntryMeta, FileSource, SessionEntry, SessionItem, SessionSource};
 
@@ -284,10 +283,7 @@ impl Session {
             label: start.header.label,
             header: start.header.kind,
             interactive: start.interactive,
-            capabilities: vec![
-                CAPABILITY_INFLIGHT.to_owned(),
-                CAPABILITY_RUN_LOGS.to_owned(),
-            ],
+            capabilities: vec![CAPABILITY_INFLIGHT.to_owned()],
         };
         recorder::write_atomically(&dir, files::META, &meta).context("writing meta.json")?;
         let events = OpenOptions::new()

@@ -153,7 +153,7 @@ decodes as `Unknown`. `session` is a `SessionRecordKind`: `Log {level, msg,
 seq}` (every line the terminal shows, at the terminal's own filter, so
 `debug!` lines under `-v` too, and diagnostics with an empty `level`; lossy
 UTF-8, stored verbatim and escaped by the viewer on output; `seq` numbers the
-sink's lines from 1, absent in records from before it), `End {exit_code,
+sink's lines from 1), `End {exit_code,
 panicked}`, `Truncated`, `InflightWritten`, and
 `Unknown` for anything newer. Both keys are optional; a line with neither is
 skipped.
@@ -163,8 +163,9 @@ so `attach` draws it (see [Attach](#attach)):
 
 - `Label {label}`: the TUI's bottom label changed (`meta.json` holds the first).
 - `Approval {prompt, standing}`: the approval banner changed; `prompt` is
-  `{addr, queued_behind, notices: [{name, sources: [{addr, origin}]}]}`, or
-  absent once nothing is pending. `origin` says where one artifact's bytes
+  `{queue: [{seq, addr, queued_at_unix_ms, notices: [{name, sources: [{addr,
+  origin}]}]}]}`, every pending request oldest first (the front one is what
+  the banner names), or absent once nothing is pending. `origin` says where one artifact's bytes
   are kept, tagged by `kind`: `cache {addr, revision, hashout}` (an entry of
   the local cache under the run's home), `file {path, out_path, x, hashout}`
   (a source file read in place, `path` relative to the workspace root), or
@@ -193,8 +194,9 @@ so `attach` draws it (see [Attach](#attach)):
 
 `RunLog {addr, hashin, file}` says where a running target's live log is:
 `file` is relative to `meta.json`'s home (`runs/<id>/<n>.log`), written when
-the run's first byte creates it, and past the cap. `meta.json` lists the
-`run_logs` capability. A reader (`tui::session::find_run_log`) trusts it
+the run's first byte creates it, and past the cap. A session with no
+`RunLog` of an addr (a heph from before them, say) simply has no live log
+of it. A reader (`tui::session::find_run_log`) trusts it
 only for a session whose `meta.json` names its own home, while that
 session's lock is held and no `ExecuteEnd` for the addr follows it; a file
 gone under such a record means the run ended. `file` must be

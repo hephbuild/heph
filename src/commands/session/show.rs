@@ -4,6 +4,8 @@
 //! The body comes from folding `events.ndjson` into the same view the TUI
 //! draws, up to what was recorded when the command ran (A18); an ended session
 //! is drawn at the time of its `End`, so its elapsed times stay what they were.
+//! It is the line, then the dashboard's All list capped at 15 rows, then what
+//! the run is stuck on and what to do next.
 
 use std::collections::HashSet;
 use std::io::Write;
@@ -17,8 +19,8 @@ use super::{
     list_all, recorded_by_newer, require_known, resolve,
 };
 use crate::tui::session::{
-    HeaderKind, SessionEntry, SessionItem, SessionMeta, SessionRecordKind, SessionSnapshot,
-    SessionSource, format::SessionEnd, holder_session,
+    ApprovalStanding, HeaderKind, SessionEntry, SessionItem, SessionMeta, SessionRecordKind,
+    SessionSnapshot, SessionSource, format::SessionEnd, holder_session,
 };
 use crate::tui::{self, TUIAppView as _};
 
@@ -33,11 +35,17 @@ const LONG_RUNNING_MS: u64 = 30_000;
 
 /// The view a session is drawn with: `gc`'s sweep header, or the build one.
 pub(crate) fn new_view(meta: &SessionMeta) -> tui::TuiProgressView {
-    match meta.header {
+    let view = match meta.header {
         HeaderKind::Gc => {
             tui::TuiProgressView::with_header(Box::new(tui::GcHeader::new(meta.label.clone())))
         }
         HeaderKind::Build | HeaderKind::Unknown => tui::TuiProgressView::new(meta.label.clone()),
+    };
+    // The paths in what the run drew are under the run's home, which may
+    // not be the one this terminal resolves: redact the one it recorded (I9).
+    match meta.home_dir.as_deref() {
+        Some(home) => view.with_redact(tui::text::Redact::heph_home(std::path::Path::new(home))),
+        None => view,
     }
 }
 
@@ -52,6 +60,9 @@ struct Folded {
     last_at: Option<u64>,
     skipped: u64,
     truncated: bool,
+    /// The standing approval decision (Y/N) in force at the fold's end: the
+    /// latest `Approval` record's, cleared when the TUI was torn down.
+    standing: Option<ApprovalStanding>,
 }
 
 async fn fold(
@@ -70,6 +81,7 @@ async fn fold(
         last_at: None,
         skipped: 0,
         truncated: false,
+        standing: None,
     };
     while let Some(item) = stream.next().await {
         match item.with_context(|| format!("reading session {}", entry.id))? {
@@ -91,6 +103,17 @@ async fn fold(
                         });
                     }
                     Some(SessionRecordKind::Truncated) => folded.truncated = true,
+                    Some(SessionRecordKind::Approval { standing, .. }) => {
+                        folded.standing = standing;
+                    }
+                    // The build a standing decision covered is over.
+                    Some(SessionRecordKind::Finished { stopped }) => {
+                        folded.standing = None;
+                        // The run's line said "stopped": so does this one.
+                        if stopped {
+                            folded.view.set_stopped();
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -115,6 +138,10 @@ struct ShowJson<'a> {
     /// really waiting for; `null` when no chain leads to a session.
     chain_root: Option<String>,
     next: Next,
+    /// The standing approval decision (`approve` after Y, `reject` after N)
+    /// acting on the running build; absent when none is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    approval_standing: Option<ApprovalStanding>,
     #[serde(flatten)]
     snapshot: &'a SessionSnapshot,
 }
@@ -176,7 +203,11 @@ pub(crate) async fn show(
         .context("the session's source went missing")?;
     let state = derive_state(&entry, opts.now_ms, opts.stall);
 
-    let folded = fold(source, &entry, meta).await?;
+    let mut folded = fold(source, &entry, meta).await?;
+    // An ended session's line reads as its finished line did.
+    if let Some(end) = &folded.end {
+        folded.view.set_finished(end.at_unix_ms);
+    }
     let snapshot = current_snapshot(&folded, entry.status.as_ref());
     let every = list_all(sources).await?;
     let every: Vec<&SessionEntry> = every.iter().map(|(_, e)| e).collect();
@@ -191,6 +222,14 @@ pub(crate) async fn show(
         None
     };
     let next = next_action(&entry, meta, state, &snapshot, chain_root);
+    // A Y/N still acting on the build: shown for as long as it acts, never
+    // for a run that is over.
+    let standing = folded.standing.filter(|_| {
+        matches!(
+            state,
+            SessionState::Running | SessionState::Waiting | SessionState::Quiet
+        )
+    });
 
     if json {
         serde_json::to_writer_pretty(
@@ -201,6 +240,7 @@ pub(crate) async fn show(
                 blocked_on: blocked_on(&snapshot, &entry, &every),
                 chain_root: chain_root.map(|r| r.id.encode()),
                 next,
+                approval_standing: standing,
                 snapshot: &snapshot,
             },
         )
@@ -265,6 +305,9 @@ pub(crate) async fn show(
         }
     }
 
+    if let Some(standing) = standing {
+        text.push_str(&standing_line(standing));
+    }
     text.push_str(&stuck);
     // The command alone on its line, so it can be copied; the reason below.
     text.push_str(&format!(
@@ -400,6 +443,16 @@ fn stuck_on<'a>(
         text.push_str(&block);
     }
     root
+}
+
+/// The standing decision's line: the indicator the run's line and title row
+/// show, and what it does.
+fn standing_line(standing: ApprovalStanding) -> String {
+    let does = match standing {
+        ApprovalStanding::Approve => "approval requests are approved without a prompt",
+        ApprovalStanding::Reject => "approval requests are rejected (their targets fail)",
+    };
+    format!("{} · {does} until the build ends\n", standing.indicator())
 }
 
 fn more(block: &mut String, total: usize) {

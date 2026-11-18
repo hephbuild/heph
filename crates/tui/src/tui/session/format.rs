@@ -19,7 +19,7 @@
 use std::fmt;
 
 use hcore::events::{BuildEvent, BuildEventKind};
-pub use hcore::session_record::{CAPABILITY_RUN_LOGS, RunLogRecord};
+pub use hcore::session_record::RunLogRecord;
 use serde::{Deserialize, Serialize};
 
 use super::id::SessionId;
@@ -207,10 +207,9 @@ pub enum SessionRecordKind {
         #[serde(default)]
         msg: String,
         /// The line's number in this process's log sink, from 1: what a
-        /// replay after a full screen selects by. Absent from a writer that
-        /// predates it.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        seq: Option<u64>,
+        /// replay after a full screen selects by.
+        #[serde(default)]
+        seq: u64,
     },
     /// The process is exiting. Written before the lock is released, so "lock
     /// free and no `End`" means exactly "crashed".
@@ -244,8 +243,7 @@ pub enum SessionRecordKind {
     Approval {
         #[serde(default)]
         prompt: Option<Box<ApprovalPrompt>>,
-        /// Absent from a writer that predates standing decisions, and while
-        /// none stands. A value this heph does not know reads as `None`
+        /// Absent while none stands. A value this heph does not know reads as `None`
         /// rather than dropping the whole record (and with it the prompt).
         #[serde(
             default,
@@ -257,7 +255,12 @@ pub enum SessionRecordKind {
     /// The TUI was torn down at `at_unix_ms`, the instant its final summary
     /// measured the elapsed time against. What follows (`Log`, `Output`) the
     /// terminal printed below that summary.
-    Finished,
+    Finished {
+        /// The user stopped the run, so its summary said `stopped`. Absent
+        /// (and so `false`) when not stopped.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        stopped: bool,
+    },
     /// Text the process wrote straight to its terminal rather than through
     /// the log: the rendered failure report. Stored verbatim, like `Log`, up
     /// to its first 1 MiB; past that, cut with a marker line.
@@ -279,12 +282,25 @@ pub enum SessionRecordKind {
 /// A pending approval prompt as [`SessionRecordKind::Approval`] records it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalPrompt {
+    /// Every pending request, oldest first: the front one is what the prompt
+    /// row names, and the whole queue is what an attached viewer's Approvals
+    /// tab and approval view show. Never empty in a written record: no
+    /// request pending is an absent prompt.
+    #[serde(default)]
+    pub queue: Vec<ApprovalQueued>,
+}
+
+/// One pending request of [`ApprovalPrompt::queue`]: its number, target and
+/// notices by where their text is kept, never the text itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalQueued {
+    #[serde(default)]
+    pub seq: u64,
     #[serde(default)]
     pub addr: String,
-    /// Prompts queued behind this one.
+    /// When the request was queued: the viewer measures its wait from it.
     #[serde(default)]
-    pub queued_behind: u64,
-    /// Each notice the target declares.
+    pub queued_at_unix_ms: u64,
     #[serde(default)]
     pub notices: Vec<ApprovalPromptNotice>,
 }
@@ -539,7 +555,8 @@ pub struct SnapshotCounts {
     /// Matched targets that finished.
     #[serde(default)]
     pub matched_done: u64,
-    /// Matched targets that were cache hits.
+    /// Matched targets that finished from the cache (a hit announced on a
+    /// target still running counts once it ends).
     #[serde(default)]
     pub matched_cached: u64,
     /// Every target that finished, matched or not.
@@ -551,6 +568,10 @@ pub struct SnapshotCounts {
     /// Targets whose driver ran to success.
     #[serde(default)]
     pub executed: u64,
+    /// Targets that failed. A target a stop ended (Ctrl-C, or fail-fast
+    /// after another target failed) is not one and is not in the snapshot's
+    /// `failed` list either; it counts only in `finished`. A writer before
+    /// the dashboard counted those here.
     #[serde(default)]
     pub failed: u64,
     /// Running targets that are in no lock or admission wait. Counted over the
@@ -716,32 +737,35 @@ mod tests {
     #[test]
     fn view_records_round_trip() {
         let prompt = ApprovalPrompt {
-            addr: "//a:gated".into(),
-            queued_behind: 2,
-            notices: vec![ApprovalPromptNotice {
-                name: "terms".into(),
-                sources: vec![
-                    hcore::approval_notice::NoticeSource {
-                        addr: "//a:terms".into(),
-                        origin: hcore::approval_notice::NoticeOrigin::Cache {
+            queue: vec![ApprovalQueued {
+                seq: 4,
+                addr: "//a:gated".into(),
+                queued_at_unix_ms: 1_700_000_000_000,
+                notices: vec![ApprovalPromptNotice {
+                    name: "terms".into(),
+                    sources: vec![
+                        hcore::approval_notice::NoticeSource {
                             addr: "//a:terms".into(),
-                            revision: "abc123_1700000000000000000".into(),
-                            hashout: "def456".into(),
+                            origin: hcore::approval_notice::NoticeOrigin::Cache {
+                                addr: "//a:terms".into(),
+                                revision: "abc123_1700000000000000000".into(),
+                                hashout: "def456".into(),
+                            },
                         },
-                    },
-                    hcore::approval_notice::NoticeSource {
-                        addr: "//@heph/fs:file@f=a/TERMS".into(),
-                        origin: hcore::approval_notice::NoticeOrigin::View {
-                            source: Box::new(hcore::approval_notice::NoticeOrigin::File {
-                                path: "a/TERMS".into(),
-                                out_path: "a/TERMS".into(),
-                                x: false,
-                                hashout: "0f0f".into(),
-                            }),
-                            paths: vec![("a/TERMS".into(), "TERMS".into())],
+                        hcore::approval_notice::NoticeSource {
+                            addr: "//@heph/fs:file@f=a/TERMS".into(),
+                            origin: hcore::approval_notice::NoticeOrigin::View {
+                                source: Box::new(hcore::approval_notice::NoticeOrigin::File {
+                                    path: "a/TERMS".into(),
+                                    out_path: "a/TERMS".into(),
+                                    x: false,
+                                    hashout: "0f0f".into(),
+                                }),
+                                paths: vec![("a/TERMS".into(), "TERMS".into())],
+                            },
                         },
-                    },
-                ],
+                    ],
+                }],
             }],
         };
         for (kind, ty) in [
@@ -765,7 +789,8 @@ mod tests {
                 },
                 "Approval",
             ),
-            (SessionRecordKind::Finished, "Finished"),
+            (SessionRecordKind::Finished { stopped: false }, "Finished"),
+            (SessionRecordKind::Finished { stopped: true }, "Finished"),
             (
                 SessionRecordKind::Output {
                     text: "× target failed\n\u{1b}[31mred\u{1b}[0m\n".into(),
@@ -794,6 +819,30 @@ mod tests {
         }
     }
 
+    /// `Finished` writes `stopped` only when set: unstopped it is a bare
+    /// `{"type":"Finished"}`, which reads back unstopped, and a stopped one
+    /// round-trips.
+    #[test]
+    fn finished_writes_stopped_only_when_set() {
+        let plain = SessionRecord::session(7, SessionRecordKind::Finished { stopped: false });
+        let json = serde_json::to_string(&plain).expect("encode");
+        assert!(
+            json.ends_with(r#""session":{"type":"Finished"}}"#),
+            "{json}"
+        );
+        let back: SessionRecord = serde_json::from_str(&json).expect("decode");
+        assert_eq!(
+            back.session,
+            Some(SessionRecordKind::Finished { stopped: false })
+        );
+
+        let stopped = SessionRecord::session(7, SessionRecordKind::Finished { stopped: true });
+        let json = serde_json::to_string(&stopped).expect("encode");
+        assert!(json.contains(r#""stopped":true"#), "{json}");
+        let back: SessionRecord = serde_json::from_str(&json).expect("decode");
+        assert_eq!(back.session, stopped.session);
+    }
+
     /// A notice whose record names no input — any record without `sources`
     /// decodes as one — reads as unavailable without asking the store, and
     /// one that names inputs is read from them.
@@ -817,12 +866,12 @@ mod tests {
         fn never(_: &NoticeRoots, _: &[NoticeSource]) -> Option<String> {
             None
         }
-        let json = r#"{"at_unix_ms":3,"session":{"type":"Approval","prompt":{"addr":"//a:b","queued_behind":0,"notices":[{"name":"plan"}]}}}"#;
+        let json = r#"{"at_unix_ms":3,"session":{"type":"Approval","prompt":{"queue":[{"seq":1,"addr":"//a:b","notices":[{"name":"plan"}]}]}}}"#;
         let rec: SessionRecord = serde_json::from_str(json).expect("decode");
         let Some(SessionRecordKind::Approval { prompt, .. }) = rec.session else {
             panic!("not an Approval: {rec:?}");
         };
-        let mut notice = prompt.expect("prompt").notices[0].clone();
+        let mut notice = prompt.expect("prompt").queue[0].notices[0].clone();
         let roots = NoticeRoots {
             home: "/nonexistent-heph-home".into(),
             root: "/nonexistent-heph-root".into(),
@@ -851,14 +900,14 @@ mod tests {
     fn approval_record_with_an_unknown_standing_keeps_its_prompt() {
         for standing in [r#""approve_once""#, r#"{"later":1}"#, "7"] {
             let json = format!(
-                r#"{{"at_unix_ms":3,"session":{{"type":"Approval","prompt":{{"addr":"//a:b","queued_behind":0,"notices":[]}},"standing":{standing}}}}}"#
+                r#"{{"at_unix_ms":3,"session":{{"type":"Approval","prompt":{{"queue":[{{"seq":1,"addr":"//a:b"}}]}},"standing":{standing}}}}}"#
             );
             let rec: SessionRecord = serde_json::from_str(&json).expect("decode");
             let Some(SessionRecordKind::Approval { prompt, standing }) = rec.session else {
                 panic!("not an Approval: {rec:?}");
             };
             assert_eq!(standing, None, "{json}");
-            assert_eq!(prompt.expect("the prompt survives").addr, "//a:b");
+            assert_eq!(prompt.expect("the prompt survives").queue[0].addr, "//a:b");
         }
         // A known value still decodes.
         let json =

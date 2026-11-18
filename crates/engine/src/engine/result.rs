@@ -2062,76 +2062,11 @@ fn classify_failure(
     interactive: bool,
     e: anyhow::Error,
 ) -> anyhow::Error {
-    // Cancellation: propagate unchanged, never record.
-    if downcast_chain_ref::<CancelledError>(&e).is_some() {
-        return e;
-    }
-
-    // Cyclic dependency: a structural error detected at potentially many nodes
-    // of the cycle, not a single target's own work failing. Propagate unchanged
-    // so the cycle surfaces directly to the caller (and never gets masked behind
-    // an `UpstreamFailed` marker or duplicated into the failure registry).
-    if downcast_chain_ref::<CycleError>(&e).is_some() {
-        return e;
-    }
-
-    // "This hash-only request may not build" is a property of the request, not a
-    // failure of the target. Nothing is wrong with the dep; we simply declined to
-    // build it. Propagate unchanged so the caller can recognise it — the fixpoint
-    // recompute treats it as "skip", and the in_place write-back guard needs to
-    // say "could not confirm", not "dependency failed".
-    if downcast_chain_ref::<HashUnknownError>(&e).is_some() {
-        return e;
-    }
-
-    // "--shell needs one target" is a property of the request, not a failure of
-    // the target that raised it — nothing ran. Propagate unchanged so a group
-    // nested inside a single-member group doesn't record the user's own input
-    // error as a failed target and render a failure box for something that never
-    // executed.
-    if downcast_chain_ref::<ShellNeedsSingleTarget>(&e).is_some() {
-        return e;
-    }
-
-    // Already a collateral marker: reuse the existing root, do not record.
-    if let Some(uf) = downcast_chain_ref::<UpstreamFailed>(&e) {
-        return UpstreamFailed {
-            root: uf.root.clone(),
-        }
-        .into();
-    }
-
-    // Aggregation of child failures. If *every* child is already a recorded
-    // collateral marker (or a cancellation), the real root causes live in the
-    // registry downstream — this target has no own work to blame, so collapse to
-    // a cheap marker without recording. But if any child is a genuine,
-    // unrecorded cause (e.g. a `TargetNotFound` raised while resolving an input's
-    // def in `link`/`meta`, which never passes through `result_addr`), fall
-    // through and record the whole aggregation against this target so the detail
-    // (every broken input) isn't lost.
-    if let Some(multi) = downcast_chain_ref::<MultiError>(&e) {
-        // A request-shape error aggregated with `fail_fast = false` is still a
-        // request error, not this target's failure. Surface it alone: every
-        // sibling raised the identical one.
-        for inner in &multi.0 {
-            if let Some(shell) = downcast_chain_ref::<ShellNeedsSingleTarget>(inner) {
-                return anyhow::Error::new(shell.clone());
-            }
-        }
-        let all_collateral = multi.0.iter().all(|inner| {
-            downcast_chain_ref::<UpstreamFailed>(inner).is_some()
-                || downcast_chain_ref::<CancelledError>(inner).is_some()
-        });
-        if all_collateral {
-            let root = multi
-                .0
-                .iter()
-                .find_map(|inner| {
-                    downcast_chain_ref::<UpstreamFailed>(inner).map(|u| u.root.clone())
-                })
-                .unwrap_or_else(|| addr.clone());
-            return UpstreamFailed { root }.into();
-        }
+    match failure_fate(addr, &e) {
+        FailureFate::Propagate => return e,
+        FailureFate::Upstream(root) => return UpstreamFailed { root }.into(),
+        FailureFate::Shell(shell) => return anyhow::Error::new(shell.clone()),
+        FailureFate::Own => {}
     }
 
     // This target's own failure (or an aggregation of unrecorded causes): record
@@ -2159,6 +2094,114 @@ fn classify_failure(
         ),
     );
     UpstreamFailed { root: addr.clone() }.into()
+}
+
+/// What [`classify_failure`] does with an error, decided on a borrow so the
+/// end of a target's scope can ask too (whether to learn if its log can be
+/// read) without taking the error.
+enum FailureFate<'a> {
+    /// Not a target's failure (a stop, a cycle, a request-shape error):
+    /// propagated unchanged, never recorded.
+    Propagate,
+    /// Collateral: a fresh marker naming the root, never recorded.
+    Upstream(Addr),
+    /// A request-shape error aggregated with its identical siblings,
+    /// surfaced alone.
+    Shell(&'a ShellNeedsSingleTarget),
+    /// This target's own failure: recorded.
+    Own,
+}
+
+fn failure_fate<'a>(addr: &Addr, e: &'a anyhow::Error) -> FailureFate<'a> {
+    // Cancellation: propagate unchanged, never record.
+    if downcast_chain_ref::<CancelledError>(e).is_some() {
+        return FailureFate::Propagate;
+    }
+
+    // Cyclic dependency: a structural error detected at potentially many nodes
+    // of the cycle, not a single target's own work failing. Propagate unchanged
+    // so the cycle surfaces directly to the caller (and never gets masked behind
+    // an `UpstreamFailed` marker or duplicated into the failure registry).
+    if downcast_chain_ref::<CycleError>(e).is_some() {
+        return FailureFate::Propagate;
+    }
+
+    // "This hash-only request may not build" is a property of the request, not a
+    // failure of the target. Nothing is wrong with the dep; we simply declined to
+    // build it. Propagate unchanged so the caller can recognise it — the fixpoint
+    // recompute treats it as "skip", and the in_place write-back guard needs to
+    // say "could not confirm", not "dependency failed".
+    if downcast_chain_ref::<HashUnknownError>(e).is_some() {
+        return FailureFate::Propagate;
+    }
+
+    // "--shell needs one target" is a property of the request, not a failure of
+    // the target that raised it — nothing ran. Propagate unchanged so a group
+    // nested inside a single-member group doesn't record the user's own input
+    // error as a failed target and render a failure box for something that never
+    // executed.
+    if downcast_chain_ref::<ShellNeedsSingleTarget>(e).is_some() {
+        return FailureFate::Propagate;
+    }
+
+    // Already a collateral marker: reuse the existing root, do not record.
+    if let Some(uf) = downcast_chain_ref::<UpstreamFailed>(e) {
+        return FailureFate::Upstream(uf.root.clone());
+    }
+
+    // Aggregation of child failures. If *every* child is already a recorded
+    // collateral marker (or a cancellation), the real root causes live in the
+    // registry downstream — this target has no own work to blame, so collapse to
+    // a cheap marker without recording. But if any child is a genuine,
+    // unrecorded cause (e.g. a `TargetNotFound` raised while resolving an input's
+    // def in `link`/`meta`, which never passes through `result_addr`), fall
+    // through and record the whole aggregation against this target so the detail
+    // (every broken input) isn't lost.
+    if let Some(multi) = downcast_chain_ref::<MultiError>(e) {
+        // A request-shape error aggregated with `fail_fast = false` is still a
+        // request error, not this target's failure. Surface it alone: every
+        // sibling raised the identical one.
+        for inner in &multi.0 {
+            if let Some(shell) = downcast_chain_ref::<ShellNeedsSingleTarget>(inner) {
+                return FailureFate::Shell(shell);
+            }
+        }
+        let all_collateral = multi.0.iter().all(|inner| {
+            downcast_chain_ref::<UpstreamFailed>(inner).is_some()
+                || downcast_chain_ref::<CancelledError>(inner).is_some()
+        });
+        if all_collateral {
+            let root = multi
+                .0
+                .iter()
+                .find_map(|inner| {
+                    downcast_chain_ref::<UpstreamFailed>(inner).map(|u| u.root.clone())
+                })
+                .unwrap_or_else(|| addr.clone());
+            return FailureFate::Upstream(root);
+        }
+    }
+
+    FailureFate::Own
+}
+
+/// `ResultEnd`'s `left_behind`: what the failure slot holds, plus whether the
+/// log can be read when that was asked. The log's path is left out for an
+/// interactive target, as [`classify_failure`] leaves it out of the box.
+fn left_behind(
+    slot: Option<hcore::events::LeftBehindData>,
+    log_readable: Option<bool>,
+    interactive: bool,
+) -> Option<Box<hcore::events::LeftBehindData>> {
+    if slot.is_none() && log_readable.is_none() {
+        return None;
+    }
+    let mut left = slot.unwrap_or_default();
+    if interactive {
+        left.log_path = None;
+    }
+    left.log_readable = log_readable;
+    Some(Box::new(left))
 }
 
 /// The log `execute` kept for this failure: its [`FailureSlot`] on the chain,
@@ -2952,7 +2995,16 @@ impl Engine {
     ) -> anyhow::Result<(MemoResult, Option<Arc<ResultReadGuard>>)> {
         let addr_str = addr.format();
         let interactive = opts.interactive.is_some();
-        crate::engine::event::emit_scope(
+        let end_rs = Arc::clone(&rs);
+        // Whether `heph log` would find this target's log, asked when its own
+        // failure ends the scope: `ResultEnd` carries the answer, so a
+        // consumer printing the failure as it happens points at the log on
+        // the answer the end-of-run box would have used. Never on success, and
+        // never for collateral (a marker, thousands of them).
+        let readable: Arc<std::sync::OnceLock<bool>> = Arc::default();
+        let end_readable = Arc::clone(&readable);
+        let log_engine = Arc::clone(&self);
+        crate::engine::event::emit_scope_with(
             &rs,
             crate::engine::event::BuildEventKind::ResultStart {
                 addr: addr_str.clone(),
@@ -2962,26 +3014,51 @@ impl Engine {
             // (root vs collateral), the exit status, the log tail and a timeout
             // belong.
             move |error| match error {
-                Some(d) => crate::engine::event::BuildEventKind::ResultEnd {
-                    addr: addr_str,
-                    error: Some(d.message),
-                    upstream_of: d.upstream_of,
-                    exit_status: d.exit_status,
-                    log_tail: crate::engine::event::ErrorDetail::result_log_tail(
-                        d.log_tail,
-                        d.log.as_ref(),
-                        interactive,
-                    ),
-                    timed_out: d.timed_out,
-                },
+                Some(d) => {
+                    let cancelled = end_rs.end_is_cancelled(&addr_str, &d);
+                    // The final report's `took down:` row reads the same
+                    // `upstream_of` the event carries.
+                    if let Some(root) = &d.upstream_of
+                        && !cancelled
+                    {
+                        end_rs.record_took_down(root, &addr_str);
+                    }
+                    crate::engine::event::BuildEventKind::ResultEnd {
+                        addr: addr_str,
+                        error: Some(d.message),
+                        upstream_of: d.upstream_of,
+                        exit_status: d.exit_status,
+                        log_tail: crate::engine::event::ErrorDetail::result_log_tail(
+                            d.log_tail,
+                            d.log.as_ref(),
+                            interactive,
+                        ),
+                        timed_out: d.timed_out,
+                        cancelled,
+                        left_behind: left_behind(
+                            d.left_behind,
+                            end_readable.get().copied(),
+                            interactive,
+                        ),
+                    }
+                }
                 None => crate::engine::event::BuildEventKind::ResultEnd {
+                    cancelled: false,
                     addr: addr_str,
                     error: None,
                     upstream_of: None,
                     exit_status: None,
                     log_tail: None,
                     timed_out: None,
+                    left_behind: None,
                 },
+            },
+            |e| {
+                matches!(failure_fate(addr, e), FailureFate::Own).then(|| async move {
+                    // Set once: this scope ends once.
+                    let _first: Result<(), bool> =
+                        readable.set(log_engine.log_readable(addr).await);
+                })
             },
             async {
                 // Use _no_track: result_addr set parent=addr before entering the memoizer,
@@ -8295,6 +8372,97 @@ mod tests {
         Ok(())
     }
 
+    /// An open right after a remote hit, while the mirrored manifest is still
+    /// a queued sqlite write: the listing misses it, so `open_log` lets the
+    /// queue commit and looks again instead of answering "no log".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn open_log_after_a_remote_hit_waits_for_the_queued_manifest() -> anyhow::Result<()> {
+        let remote = tempdir()?;
+        let remote_uri = format!("file://{}", remote.path().display());
+        let addr = hmodel::htaddr::parse_addr("//pkg:t")?;
+        let target = || pluginstatictarget::Target {
+            run: Some("echo a log line; echo hi > $OUT".to_string()),
+            ..out_target("//pkg:t")
+        };
+
+        let (seeder, _seeder_home) = engine_with_remote_bash(vec![target()], &remote_uri)?;
+        let seed_rs = seeder.new_state();
+        resolve(&seeder, &seed_rs, &addr, OutputMatcher::All).await?;
+        drain_bg(seed_rs).await;
+
+        let (engine, _home) = engine_with_remote_bash(vec![target()], &remote_uri)?;
+        // The writer stays shut through the hit, so the mirrored manifest is
+        // queued, not listed, when the open starts.
+        let hold = engine.hold_local_cache_writes();
+        let rs = engine.new_state();
+        resolve(&engine, &rs, &addr, OutputMatcher::None).await?;
+        drop(rs);
+
+        let opener = tokio::spawn({
+            let engine = Arc::clone(&engine);
+            let addr = addr.clone();
+            async move {
+                let opts = crate::engine::log_api::LogOptions {
+                    fetch_remote: true,
+                    ..Default::default()
+                };
+                engine.open_log(&addr, &opts).await
+            }
+        });
+        // Long enough for the open's first look to have missed.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        drop(hold);
+        let log = tokio::time::timeout(std::time::Duration::from_secs(30), opener)
+            .await
+            .context("open_log never returned")???
+            .expect("the hit's log, once the queued manifest committed");
+        assert_eq!(
+            log.info().source,
+            crate::engine::log_api::LogSource::Cache { remote: true }
+        );
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut log.reader()?, &mut text)?;
+        assert_eq!(text, "a log line\n");
+        Ok(())
+    }
+
+    /// The last-line column's open (no `fetch_remote`) never waits on the
+    /// sqlite write queue: with the writer shut and a remote hit's manifest
+    /// still queued, its miss answers at once instead of waiting for every
+    /// queued write to commit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn open_log_without_fetch_does_not_wait_on_queued_writes() -> anyhow::Result<()> {
+        let remote = tempdir()?;
+        let remote_uri = format!("file://{}", remote.path().display());
+        let addr = hmodel::htaddr::parse_addr("//pkg:t")?;
+        let target = || pluginstatictarget::Target {
+            run: Some("echo a log line; echo hi > $OUT".to_string()),
+            ..out_target("//pkg:t")
+        };
+
+        let (seeder, _seeder_home) = engine_with_remote_bash(vec![target()], &remote_uri)?;
+        let seed_rs = seeder.new_state();
+        resolve(&seeder, &seed_rs, &addr, OutputMatcher::All).await?;
+        drain_bg(seed_rs).await;
+
+        let (engine, _home) = engine_with_remote_bash(vec![target()], &remote_uri)?;
+        let hold = engine.hold_local_cache_writes();
+        let rs = engine.new_state();
+        resolve(&engine, &rs, &addr, OutputMatcher::None).await?;
+        drop(rs);
+
+        let opts = crate::engine::log_api::LogOptions::default();
+        let open = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            engine.open_log(&addr, &opts),
+        )
+        .await
+        .context("a no-fetch open waited on the queued writes")??;
+        assert!(open.is_none(), "the queued manifest is not listed yet");
+        drop(hold);
+        Ok(())
+    }
+
     /// Two readers open a remote hit's log at once (a `heph log` and the
     /// TUI's pane): the blob is pulled once, and both read it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -11743,6 +11911,92 @@ mod tests {
         for e in &events {
             assert!(e.at_unix_ms > 0, "event missing at_unix_ms stamp: {e:?}");
         }
+        Ok(())
+    }
+
+    /// `execute` decides once whether a failed run is a stop, before filling
+    /// its failure slot. A cancel landing after that decision — fail-fast
+    /// reaping another root while this one's slot fills — leaves it a
+    /// failure: `ResultEnd` says so, the request does not remember it as a
+    /// stop, and its failure is recorded. The hook cancels the request
+    /// synchronously on the failed `ExecuteEnd`, which is dispatched after
+    /// the decision and before `ResultEnd`: the race, every time.
+    #[tokio::test]
+    async fn a_failure_execute_kept_stays_one_when_the_request_is_cancelled_after()
+    -> anyhow::Result<()> {
+        use crate::engine::hook::Hook;
+        use hcore::hasync::StdCancellationToken;
+
+        /// Cancels the token it holds on `//pkg:a`'s failed `ExecuteEnd`.
+        #[derive(Default)]
+        struct CancelOnExecuteEnd(std::sync::OnceLock<StdCancellationToken>);
+        impl Hook for CancelOnExecuteEnd {
+            fn name(&self) -> String {
+                "cancel-on-execute-end".into()
+            }
+            fn on_event(&self, ev: &BuildEvent) {
+                if let BuildEventKind::ExecuteEnd {
+                    addr,
+                    error: Some(_),
+                } = &ev.kind
+                    && addr == "//pkg:a"
+                    && let Some(token) = self.0.get()
+                {
+                    token.cancel();
+                }
+            }
+            fn on_close(&self) {}
+        }
+
+        let root = tempdir()?;
+        let mut engine = Engine::new(Config {
+            parallelism: None,
+            ..Config::for_tests(root.path())
+        })?;
+        engine.register_managed_driver(|_| {
+            Box::new(hplugin_exec::pluginexec::Driver::new_exec().with_host_path())
+        })?;
+        let provider =
+            pluginstatictarget::Provider::new(vec![static_target_run("//pkg:a", "exit 1")])?;
+        engine.register_provider(move |_| Box::new(provider))?;
+        let hook = Arc::new(CancelOnExecuteEnd::default());
+        engine.register_hook(Arc::clone(&hook) as Arc<dyn Hook>)?;
+        let engine = Arc::new(engine);
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let rs = engine.new_state_with_events(true, Some(tx));
+        assert!(hook.0.set(rs.ctoken().clone()).is_ok(), "token set once");
+        let res = Arc::clone(&engine)
+            .result_addr(
+                rs.clone(),
+                &hmodel::htaddr::parse_addr("//pkg:a")?,
+                OutputMatcher::All,
+                &ResultOptions::default(),
+            )
+            .await;
+        assert!(res.is_err(), "exit 1 fails");
+        assert!(rs.ctoken().is_cancelled(), "the hook cancelled the request");
+
+        let mut ends = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let BuildEventKind::ResultEnd {
+                addr, cancelled, ..
+            } = ev.kind
+                && addr == "//pkg:a"
+            {
+                ends.push(cancelled);
+            }
+        }
+        assert_eq!(ends, vec![false], "one ResultEnd, and it is a failure");
+        assert!(!rs.was_cancelled("//pkg:a"), "not remembered as a stop");
+        assert_eq!(
+            rs.take_failures()
+                .iter()
+                .map(|f| f.addr.format())
+                .collect::<Vec<_>>(),
+            vec!["//pkg:a".to_owned()],
+            "the failure is recorded"
+        );
         Ok(())
     }
 

@@ -49,19 +49,29 @@ pub struct AppContext {
     /// the app builds. The backend owns the other clone and polls it on exit so
     /// the renderer stays up until fire-and-forget cleanups have drained.
     bg_pending: PendingCounter,
+    /// Asks the line backend which failures its view printed as they failed
+    /// ([`failures_printed`](Self::failures_printed)). `None` on the
+    /// interactive backend, whose view prints none.
+    printed: Option<mpsc::UnboundedSender<PrintedQuery>>,
 }
+
+/// A [`AppContext::failures_printed`] query: the backend folds what is queued,
+/// then answers with [`CIAppView::failures_printed`].
+pub(crate) type PrintedQuery = oneshot::Sender<std::collections::HashSet<String>>;
 
 impl AppContext {
     pub(crate) fn direct(
         sink: LogSink,
         events: Option<EventSender>,
         bg_pending: PendingCounter,
+        printed: mpsc::UnboundedSender<PrintedQuery>,
     ) -> Self {
         Self {
             sink,
             control: None,
             events,
             bg_pending,
+            printed: Some(printed),
         }
     }
 
@@ -76,7 +86,26 @@ impl AppContext {
             control: Some(control),
             events,
             bg_pending,
+            printed: None,
         }
+    }
+
+    /// The addrs whose failure the line backend's view printed the moment it
+    /// failed ([`CIAppView::failures_printed`]), answered once the view has
+    /// folded every event sent before this call: a failure recorded by then
+    /// had its `ResultEnd` sent first, so the answer covers it. What the end
+    /// of a CI run leaves out of its failure boxes — only what was printed,
+    /// never what was merely expected to be. Empty on the interactive backend
+    /// and when the backend cannot answer, so nothing is left out.
+    pub async fn failures_printed(&self) -> std::collections::HashSet<String> {
+        let Some(tx) = &self.printed else {
+            return std::collections::HashSet::new();
+        };
+        let (reply, answer) = oneshot::channel();
+        if tx.send(reply).is_err() {
+            return std::collections::HashSet::new();
+        }
+        answer.await.unwrap_or_default()
     }
 
     pub fn sink(&self) -> &LogSink {
@@ -189,6 +218,61 @@ fn resume_inner(control: &Option<mpsc::UnboundedSender<Control>>) {
     }
 }
 
+/// A key only a full screen binds (the target Log tab's).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScreenKey {
+    /// `f`: follow the log's end again.
+    Follow,
+    /// `g`, Home.
+    Top,
+    /// `G`, End: the end, following.
+    Bottom,
+    /// `w`: wrap long lines.
+    Wrap,
+    /// `n`: the next search match.
+    Next,
+    /// `N`: the previous one.
+    Prev,
+    PageUp,
+    PageDown,
+}
+
+/// A decision key in the approval view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decide {
+    /// `y`: approve the request on screen.
+    Approve,
+    /// `n`: reject it.
+    Reject,
+    /// `Y`: approve every request of its build, pending and later.
+    ApproveAll,
+    /// `N`: reject them all.
+    RejectAll,
+}
+
+impl Decide {
+    /// The decision `c` asks for, when it is a decision key.
+    pub fn of(c: char) -> Option<Self> {
+        Some(match c {
+            'y' => Self::Approve,
+            'n' => Self::Reject,
+            'Y' => Self::ApproveAll,
+            'N' => Self::RejectAll,
+            _ => return None,
+        })
+    }
+}
+
+/// A mouse event on a full screen, at a cell of the last frame drawn
+/// (column, row; 0-based). Only presses and the wheel are captured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseInput {
+    /// The left button went down.
+    Click { col: u16, row: u16 },
+    /// One wheel step, `down` (towards the end) or up.
+    Wheel { col: u16, row: u16, down: bool },
+}
+
 /// Aggregates the engine's build-event stream and renders progress in the
 /// interactive TUI. The renderer drives the terminal lifecycle and feeds events
 /// in; *what* gets drawn is entirely the view's call.
@@ -208,9 +292,53 @@ pub trait TUIAppView: Send {
     /// tick. No-op by default for views without a scrollable body.
     fn scroll(&mut self, _delta: i32) {}
 
-    /// Pan the body horizontally by `delta` columns (negative = left, positive =
-    /// right) for content wider than the viewport. No-op by default.
-    fn hscroll(&mut self, _delta: i32) {}
+    /// Whether a full screen (the dashboard) is up rather than the inline
+    /// rows. The backend draws it on the alternate screen with
+    /// [`Self::render_full`] and keeps the inline rows as they were.
+    /// `false` by default: a view with no full screen.
+    fn full_screen(&self) -> bool {
+        false
+    }
+
+    /// One frame of the full screen, exactly `rows` lines of at most `cols`
+    /// columns. Called every render tick while [`Self::full_screen`].
+    fn render_full(&mut self, _now_ms: u64, _cols: u16, _rows: u16) -> Vec<Line<'static>> {
+        Vec::new()
+    }
+
+    /// A ctrl-c key at `now_ms`: whether it stops (see
+    /// [`crate::tui::stop_arm`]). `finished` and `stopping` are the
+    /// backend's: the build has ended, a stop is already under way. One
+    /// press stops by default: a view with no full screen.
+    fn ctrl_c(
+        &mut self,
+        _now_ms: u64,
+        _finished: bool,
+        _stopping: bool,
+    ) -> crate::tui::stop_arm::CtrlC {
+        crate::tui::stop_arm::CtrlC::Stop
+    }
+
+    /// Any other key: an armed stop is off. No-op by default.
+    fn disarm_stop(&mut self) {}
+
+    /// `--dashboard`: open the dashboard before the first frame and hold the
+    /// finished run until `q`, on whichever screen is up. No-op by default,
+    /// and for a command with no dashboard (the line only).
+    fn pin_dashboard(&mut self) {}
+
+    /// Enter (`log` false) or `l` (`log` true) on a full screen's selected
+    /// row: open that target's screen. No-op by default.
+    fn open_selected(&mut self, _log: bool) {}
+
+    /// A full screen's own key (the target Log tab's `f g G w n N`, End,
+    /// Home, Page Up/Down). No-op by default.
+    fn screen_key(&mut self, _key: ScreenKey) {}
+
+    /// A click or a wheel step on the full screen, matched against what the
+    /// last [`Self::render_full`] drew. Everything a click does has a key;
+    /// no click decides an approval. No-op by default.
+    fn mouse(&mut self, _input: MouseInput) {}
 
     /// Cycle the body view (the `Tab` / `Shift+Tab` keys). `forward` advances to
     /// the next view, otherwise the previous. Called from the backend's key
@@ -250,6 +378,13 @@ pub trait TUIAppView: Send {
     /// on — a viewer never cancels anything.
     fn quit_while_running(&mut self) {}
 
+    /// Whether `q` leaves from every screen, not only the main view: a
+    /// session viewer, where `q` detaches from the dashboard and the target
+    /// screens too (I11). Default `false`: off the main view `q` goes back.
+    fn quits_from_any_screen(&self) -> bool {
+        false
+    }
+
     /// Whether the view is currently capturing keystrokes into a search query
     /// (the `/` filter). While `true` the backend routes printable keys, Backspace,
     /// Enter and Esc to the search methods below instead of the normal shortcuts.
@@ -275,21 +410,27 @@ pub trait TUIAppView: Send {
     /// can be scrolled (the `Enter` key). No-op by default.
     fn search_confirm(&mut self) {}
 
-    /// Whether an approval-gated target is currently awaiting a decision. While
-    /// `true` the backend routes `y`/`n`/Enter to the approval methods below so
-    /// the user can resolve the prompt. Default `false` for views without an
-    /// approval gate.
-    fn approval_active(&self) -> bool {
+    /// Open the approval view on the oldest pending request (Enter on the
+    /// line's prompt row, `v` on a full screen). `false`: nothing pending,
+    /// or a view that decides nothing (an attached one). Default `false`.
+    fn approval_open(&mut self) -> bool {
         false
     }
 
-    /// Resolve the active approval prompt: `approve = true` runs the target,
-    /// `false` rejects it (failing the target). No-op by default.
-    fn approval_respond(&mut self, _approve: bool) {}
+    /// Whether the approval view is up: the only screen whose `y`/`n`/`Y`/`N`
+    /// decide. Default `false`.
+    fn in_approval_view(&self) -> bool {
+        false
+    }
 
-    /// Expand/collapse the active prompt's notice body (the Enter key). No-op by
-    /// default.
-    fn approval_toggle_notice(&mut self) {}
+    /// A decision key in the approval view, pressed at `now_ms`. Dropped
+    /// while the request on screen is locked out. No-op by default.
+    fn approval_decide(&mut self, _decide: Decide, _now_ms: u64) {}
+
+    /// Move the view's state on to `now_ms` (the approval view's decision
+    /// flash, a request that left the queue). Called each tick, before the
+    /// backend checks [`Self::full_screen`]. No-op by default.
+    fn advance(&mut self, _now_ms: u64) {}
 
     /// The lines for the pinned viewport, including the spinner row built from
     /// `spinner`. Called every render tick. `width` is the current terminal
@@ -311,6 +452,19 @@ pub trait TUIAppView: Send {
     /// notice) and again at teardown, before [`Self::last_render`]. No-op by
     /// default.
     fn set_finished(&mut self, _at_ms: u64) {}
+
+    /// The user stopped the run before it finished — a ctrl-c key that
+    /// stopped it, or SIGINT/SIGTERM/SIGHUP — so the final summary says
+    /// "stopped". Not called for fail-fast cancellation, which also cancels
+    /// targets but is the build's own doing. Called before
+    /// [`Self::last_render`]. No-op by default.
+    fn set_stopped(&mut self) {}
+
+    /// Whether [`Self::set_stopped`] was called (or, for a viewer, the run
+    /// it follows recorded a stop): what `Finished` records.
+    fn stopped(&self) -> bool {
+        false
+    }
 
     /// The approval prompt this view shows now, as a session records it.
     /// `None` by default (no approval gate).
@@ -354,6 +508,9 @@ pub trait CIAppView: Send {
     /// Print the final summary once the event stream ends.
     fn finish(&self) {}
 
+    /// See [`TUIAppView::set_stopped`]; called before [`Self::finish`].
+    fn set_stopped(&mut self) {}
+
     /// See [`TUIAppView::session_header`].
     fn session_header(&self) -> SessionHeader {
         SessionHeader::default()
@@ -361,6 +518,13 @@ pub trait CIAppView: Send {
 
     /// See [`TUIAppView::name_lock_holders`].
     fn name_lock_holders(&mut self, _names: HolderNames) {}
+
+    /// The addrs whose failure this view has printed as it failed, with the
+    /// rows the end-of-run box would have carried: the box leaves them out
+    /// ([`AppContext::failures_printed`]). A view that prints none says so.
+    fn failures_printed(&self) -> std::collections::HashSet<String> {
+        std::collections::HashSet::new()
+    }
 }
 
 #[async_trait]

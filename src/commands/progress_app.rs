@@ -21,6 +21,23 @@ use crate::engine::Engine;
 use crate::engine::request_state::RequestState;
 use crate::tui::{self, App, AppContext, LogSink};
 
+/// `-D` / `--dashboard`, flattened into the args of every command that shows
+/// per-target build progress (`run`, `query`, `validate`, `inspect …`, the
+/// `tool` commands that resolve targets, `auth`). A command whose header has no
+/// dashboard (`tool gc`, `tool clean`) does not take it: its dashboard would be
+/// an empty list.
+#[derive(clap::Args, Clone, Copy, Debug, Default)]
+pub struct DashboardArgs {
+    /// Open the dashboard from the start, and hold the finished build until q
+    ///
+    /// The command starts on the dashboard instead of the line. When it ends,
+    /// whichever screen is up stays until you press q (Esc still steps back
+    /// to the line, which holds too); the exit code is the command's. Without
+    /// a terminal it prints one warning and runs with the plain output.
+    #[arg(short = 'D', long = "dashboard")]
+    pub dashboard: bool,
+}
+
 /// An [`App`] whose whole body is a closure, with the stock progress views
 /// labelled `label`. For commands that have no bespoke UI.
 pub(crate) struct ProgressApp<F> {
@@ -53,11 +70,13 @@ where
 
 /// Run `body` under the TUI (on a terminal, unless `no_tui`) or the line
 /// backend, and return what it returns — the exit code is the body's.
+/// `dashboard` is the command's `-D` ([`DashboardArgs`]).
 pub(crate) async fn run_with_progress<F, Fut>(
     label: impl Into<String>,
     sink: LogSink,
     session: &Arc<SessionSlot>,
     no_tui: bool,
+    dashboard: bool,
     shutdown: hcore::shutdown::ShutdownTrigger,
     body: F,
 ) -> anyhow::Result<()>
@@ -69,7 +88,8 @@ where
         label: label.into(),
         body,
     };
-    tui::run_app(app, sink, session, tui::should_use_tui(no_tui), shutdown).await
+    let interactive = tui::should_use_tui(no_tui);
+    tui::run_app_with(app, sink, session, interactive, dashboard, shutdown).await
 }
 
 /// A request whose build events reach `ctx`'s view, and whose sandbox cleanups
@@ -100,7 +120,7 @@ mod tests {
         let session = Arc::new(SessionSlot::new());
         let sink = || LogSink::new_direct_with(Arc::clone(&session));
         let (shutdown, _rx) = hcore::shutdown::ShutdownTrigger::new();
-        let err = run_with_progress("t", sink(), &session, true, shutdown, |_ctx| async {
+        let err = run_with_progress("t", sink(), &session, true, false, shutdown, |_ctx| async {
             anyhow::bail!("2 of 3 credentials are not available here")
         })
         .await
@@ -108,11 +128,104 @@ mod tests {
         assert!(err.to_string().contains("2 of 3"), "{err:#}");
 
         let (shutdown, _rx) = hcore::shutdown::ShutdownTrigger::new();
-        run_with_progress("t", sink(), &session, true, shutdown, |ctx| async move {
-            assert!(!ctx.interactive(), "no_tui means the line backend");
-            Ok(())
-        })
+        run_with_progress(
+            "t",
+            sink(),
+            &session,
+            true,
+            false,
+            shutdown,
+            |ctx| async move {
+                assert!(!ctx.interactive(), "no_tui means the line backend");
+                Ok(())
+            },
+        )
         .await
         .expect("a passing body passes");
+    }
+
+    /// The whole command line, as `main` parses it.
+    #[derive(clap::Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        _global: crate::commands::global::GlobalOptions,
+        #[command(subcommand)]
+        _cmd: crate::commands::Commands,
+    }
+
+    /// The leaf subcommand's `--dashboard`, or clap's refusal.
+    fn dashboard_flag(argv: &[&str]) -> Result<bool, clap::Error> {
+        use clap::CommandFactory as _;
+        let mut m = TestCli::command().try_get_matches_from(argv)?;
+        while let Some((_, sub)) = m.remove_subcommand() {
+            m = sub;
+        }
+        Ok(m.get_flag("dashboard"))
+    }
+
+    /// Every command that shows per-target build progress takes `-D` and
+    /// `--dashboard`, off unless given; a command whose header has no dashboard
+    /// (`tool gc`, `tool clean`) refuses it, as clap refuses any unknown flag.
+    #[test]
+    fn dashboard_flag_on_every_progress_command() {
+        let progress: &[&[&str]] = &[
+            &["run", "//p:t"],
+            &["query", "//..."],
+            &["validate"],
+            &["inspect", "packages"],
+            &["inspect", "labels"],
+            &["inspect", "hashin", "//p:t"],
+            &["inspect", "hashout", "//p:t"],
+            &["inspect", "outputs", "//p:t"],
+            &["inspect", "spec", "//p:t"],
+            &["inspect", "def", "//p:t"],
+            &["inspect", "deps", "//p:t"],
+            &["inspect", "revdeps", "//p:t"],
+            &["inspect", "path", "//p:a", "//p:b"],
+            &["inspect", "states"],
+            &["auth", "status"],
+            &["auth", "explain", "//p:c"],
+            &["auth", "login"],
+            &["tool", "build-fmt"],
+            &["tool", "codegen", "gitignore"],
+            &["tool", "codegen", "status"],
+            &["tool", "codegen", "keep", "p/f.go"],
+            &["tool", "codegen", "discard", "--all"],
+            &["tool", "codegen", "why", "p/f.go"],
+            &["tool", "codegen", "import"],
+            &["tool", "scratch", "head", "//c:go"],
+            &["tool", "scratch", "pull", "//c:go"],
+        ];
+        for cmd in progress {
+            let argv = |flag: Option<&'static str>| -> Vec<&str> {
+                std::iter::once("heph")
+                    .chain(cmd.iter().copied())
+                    .chain(flag)
+                    .collect()
+            };
+            for flag in ["-D", "--dashboard"] {
+                let got = dashboard_flag(&argv(Some(flag)));
+                assert!(matches!(got, Ok(true)), "{cmd:?} {flag}: {got:?}");
+            }
+            let got = dashboard_flag(&argv(None));
+            assert!(matches!(got, Ok(false)), "{cmd:?}: {got:?}");
+        }
+
+        for cmd in [
+            &["tool", "gc"][..],
+            &["tool", "clean"],
+            &["tool", "scratch", "ls"],
+        ] {
+            let argv: Vec<&str> = std::iter::once("heph")
+                .chain(cmd.iter().copied())
+                .chain(["-D"])
+                .collect();
+            let err = dashboard_flag(&argv).expect_err("no dashboard, no -D");
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::UnknownArgument,
+                "{cmd:?}: {err}"
+            );
+        }
     }
 }

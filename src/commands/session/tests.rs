@@ -508,6 +508,8 @@ async fn commands_run_against_any_source() {
                         record(
                             T0 + 5_500,
                             BuildEventKind::ResultEnd {
+                                left_behind: None,
+                                cancelled: false,
                                 addr: "//x:y".into(),
                                 error: None,
                                 upstream_of: None,
@@ -721,6 +723,8 @@ async fn next_is_structured_for_every_state() {
             record(
                 T0 + 2,
                 BuildEventKind::ResultEnd {
+                    left_behind: None,
+                    cancelled: false,
                     addr: addr.into(),
                     error: Some("boom".to_owned()),
                     upstream_of: None,
@@ -1105,6 +1109,87 @@ async fn empty_events_say_no_events_recorded() {
     assert!(out.contains("\nno events recorded\n"), "{out}");
 }
 
+/// The `heph session show` clause of `standing_yes_covers_later_requests`:
+/// a Y (or N) the run's terminal set is printed, and in `--json`, for as
+/// long as it acts; a build with none, and a build that is over, print none.
+#[tokio::test]
+async fn show_prints_the_standing_decision() {
+    use crate::tui::session::ApprovalStanding;
+    let approval = |at: u64, standing| {
+        SessionRecord::session(
+            at,
+            SessionRecordKind::Approval {
+                prompt: None,
+                standing,
+            },
+        )
+    };
+    let running = SessionSnapshot {
+        last_event_unix_ms: Some(NOW - 1_000),
+        ..SessionSnapshot::default()
+    };
+    for (standing, line, json) in [
+        (
+            Some(ApprovalStanding::Approve),
+            Some("auto-approving (Y) · approval requests are approved without a prompt"),
+            Some("\"approval_standing\": \"approve\""),
+        ),
+        (
+            Some(ApprovalStanding::Reject),
+            Some("auto-rejecting (N) · approval requests are rejected (their targets fail)"),
+            Some("\"approval_standing\": \"reject\""),
+        ),
+        (None, None, None),
+    ] {
+        let id = SessionId::new(T0, 1);
+        let mut records = build_records("//a:gated", T0, None);
+        records.push(approval(T0 + 20, standing));
+        let source = FakeSource {
+            sessions: vec![(
+                entry(
+                    meta(id, 1, &["heph", "run", "//a:gated"]),
+                    true,
+                    Some(running.clone()),
+                ),
+                records.clone(),
+            )],
+        };
+        let sources: [&dyn SessionSource; 1] = [&source];
+        let out = run_show(&sources, &id.encode(), false).await.expect("show");
+        let out_json = run_show(&sources, &id.encode(), true).await.expect("show");
+        match (line, json) {
+            (Some(line), Some(json)) => {
+                assert!(out.contains(line), "{standing:?}: {out}");
+                assert!(out_json.contains(json), "{standing:?}: {out_json}");
+            }
+            _ => {
+                assert!(!out.contains("auto-"), "{out}");
+                assert!(!out_json.contains("approval_standing"), "{out_json}");
+            }
+        }
+
+        // The build ended: the decision acts on nothing any more.
+        records.push(SessionRecord::session(
+            T0 + 50,
+            SessionRecordKind::Finished { stopped: false },
+        ));
+        records.extend(build_records("//a:gated", T0 + 60, Some(0)).pop());
+        let source = FakeSource {
+            sessions: vec![(
+                entry(
+                    meta(id, 1, &["heph", "run", "//a:gated"]),
+                    false,
+                    Some(ended(Some(0), T0 + 1_060)),
+                ),
+                records,
+            )],
+        };
+        let sources: [&dyn SessionSource; 1] = [&source];
+        let out = run_show(&sources, &id.encode(), false).await.expect("show");
+        assert!(!out.contains("auto-"), "{standing:?}, ended: {out}");
+    }
+}
+
 /// U3: `status.json` keeps the first entries of each list, with the full count;
 /// `show` folds the event log and has them all.
 #[tokio::test]
@@ -1122,6 +1207,8 @@ async fn status_lists_are_capped_and_show_has_them_all() {
         records.push(record(
             T0 + 2,
             BuildEventKind::ResultEnd {
+                left_behind: None,
+                cancelled: false,
                 addr,
                 error: Some("boom".to_owned()),
                 upstream_of: None,
@@ -1302,7 +1389,7 @@ async fn attach_mirrors_the_session_exit() {
             SessionRecordKind::Log {
                 level: "INFO".to_owned(),
                 msg: "hello \u{1b}[2J".to_owned(),
-                seq: None,
+                seq: 0,
             },
         ),
     );
@@ -1327,7 +1414,10 @@ async fn attach_mirrors_the_session_exit() {
                 &id.encode(),
                 crate::tui::LogSink::new_direct_with(std::sync::Arc::clone(slot)),
                 slot,
-                true,
+                &crate::commands::GlobalOptions {
+                    no_tui: true,
+                    ..Default::default()
+                },
             )
             .await
         }
@@ -1359,6 +1449,121 @@ async fn detach_listener_is_armed_before_its_task_runs() {
         .expect("the signal raised before the task ran still pulls the trigger")
         .expect("trigger alive");
     task.abort();
+}
+
+/// Attach's own wiring of the approval view: a recorded session with a
+/// pending request, followed from its directory into the viewer's feed, and
+/// the viewer built as `attach` builds it. With the run's home recorded, the
+/// view reads the notice from the run's store (here a workspace source file)
+/// by the sources the session recorded, through the engine's reader; with
+/// another home recorded, the readers are unavailable and the notice reads
+/// "notice unavailable", never its text.
+#[tokio::test(flavor = "multi_thread")]
+async fn attach_reads_a_pending_notice_from_the_run_home() {
+    use crate::tui::session::{ApprovalPrompt, ApprovalPromptNotice, ApprovalQueued, FileSource};
+    use crate::tui::{App as _, TUIAppView as _};
+
+    const NOTICE: &str = "drop the table";
+    let ws = tempfile::tempdir().expect("tempdir");
+    std::fs::write(ws.path().join(".hephconfig"), "").expect("write .hephconfig");
+    let global = crate::commands::GlobalOptions::default();
+    let (_engine, home) =
+        crate::commands::bootstrap::new_reader_engine(&global, ws.path()).expect("reader engine");
+    std::fs::write(ws.path().join("PLAN"), NOTICE).expect("write the notice source");
+    let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+    hasher.update(NOTICE.as_bytes());
+    hasher.update(&[0]);
+    let sources = vec![hcore::approval_notice::NoticeSource {
+        addr: "//a:plan".to_owned(),
+        origin: hcore::approval_notice::NoticeOrigin::File {
+            path: "PLAN".to_owned(),
+            out_path: "PLAN".to_owned(),
+            x: false,
+            hashout: format!("{:x}", hasher.digest()),
+        },
+    }];
+    let elsewhere = tempfile::tempdir().expect("tempdir");
+    let sessions = tempfile::tempdir().expect("tempdir");
+
+    for (pid, recorded_home, shows) in [
+        (1_u32, home.as_path(), NOTICE),
+        (2, elsewhere.path(), "notice unavailable"),
+    ] {
+        let id = SessionId::new(T0 + u64::from(pid), 7);
+        let mut m = meta(id, pid, &["heph", "run"]);
+        m.interactive = true;
+        m.workspace_root = Some(ws.path().display().to_string());
+        m.home_dir = Some(recorded_home.display().to_string());
+        let prompt = ApprovalPrompt {
+            queue: vec![ApprovalQueued {
+                seq: 1,
+                addr: "//a:gate".to_owned(),
+                queued_at_unix_ms: T0,
+                notices: vec![ApprovalPromptNotice {
+                    name: "plan".to_owned(),
+                    sources: sources.clone(),
+                }],
+            }],
+        };
+        let records = [SessionRecord::session(
+            T0,
+            SessionRecordKind::Approval {
+                prompt: Some(Box::new(prompt)),
+                standing: None,
+            },
+        )];
+        let dir = write_session(sessions.path(), &m, &records, None);
+        let _live = hold_lock(&dir);
+
+        let source = FileSource::new(sessions.path());
+        let (_detach_tx, detach_rx) = tokio::sync::mpsc::unbounded_channel();
+        let app = attach::AttachApp::new(
+            &global,
+            m,
+            true,
+            source.holder_names(id),
+            futures::stream::empty().boxed(),
+            detach_rx,
+            true,
+        );
+        // What `run` does with each record, up to the end of what is recorded.
+        let mut follow = source.subscribe(id).await.expect("subscribe");
+        while let Some(item) = follow.next().await {
+            match item.expect("item") {
+                SessionItem::Record(r) => drop(app.feed().route(*r)),
+                SessionItem::CaughtUp { .. } => break,
+                SessionItem::Ended { .. } => panic!("the session is live"),
+            }
+        }
+
+        let mut view = app.tui_view();
+        assert!(view.approval_open(), "a pending request opens");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let frame: String = view
+                .render_full(NOW, 120, 40)
+                .iter()
+                .map(|l| {
+                    let mut row: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+                    row.push('\n');
+                    row
+                })
+                .collect();
+            if frame.contains(shows) {
+                assert!(
+                    pid == 1 || !frame.contains(NOTICE),
+                    "another home never shows the notice:\n{frame}"
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{shows:?} never showed (home {}):\n{frame}",
+                recorded_home.display()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
 }
 
 #[test]
@@ -1809,4 +2014,53 @@ async fn list_shows_newer_format_placeholder() {
         msg.contains("format 999") && msg.contains("format 1"),
         "{msg}"
     );
+}
+
+/// The whole command line, as `main` parses it.
+#[derive(clap::Parser)]
+struct TestCli {
+    #[command(flatten)]
+    _global: crate::commands::global::GlobalOptions,
+    #[command(subcommand)]
+    cmd: crate::commands::Commands,
+}
+
+/// `-D` belongs to `run`: on `session attach` it parses only to be refused
+/// with the reason, before anything is opened; elsewhere clap refuses it.
+#[test]
+fn attach_refuses_dashboard() {
+    use clap::Parser as _;
+    let attach = |argv: &[&str]| -> AttachArgs {
+        let cli = TestCli::try_parse_from(argv).expect("parse");
+        match cli.cmd {
+            crate::commands::Commands::Session(SessionArgs {
+                command: SessionCommands::Attach(a),
+            }) => a,
+            _ => panic!("not `session attach`"),
+        }
+    };
+    for argv in [
+        &["heph", "session", "attach", "-D", "02kf5"][..],
+        &["heph", "session", "attach", "02kf5", "--dashboard"],
+    ] {
+        let err = attach(argv)
+            .refuse_dashboard()
+            .expect_err("attach -D is refused");
+        assert!(
+            format!("{err:#}").contains("--dashboard does not apply to `session attach`"),
+            "{argv:?}: {err:#}"
+        );
+    }
+    attach(&["heph", "session", "attach", "02kf5"])
+        .refuse_dashboard()
+        .expect("attach without -D");
+    for argv in [
+        &["heph", "session", "list", "-D"][..],
+        &["heph", "-D", "run", "//p:t"],
+    ] {
+        assert!(
+            TestCli::try_parse_from(argv).is_err(),
+            "{argv:?}: -D is no global flag"
+        );
+    }
 }

@@ -61,45 +61,71 @@ unlinked. A plugin built before log streaming returns a log file instead: the
 engine imports it, scrubbed the same way, provided it is a regular file inside
 the run's sandbox, and the returned file wins over anything streamed.
 
-The failure box prints where each part is:
+A non-interactive run (CI, a pipe) prints a root failure's block the moment
+it fails, with the last `--log-lines` lines of its log, then where each part
+is:
+
+```
+ERROR ✗ //web:e2e · exit status: 1
+  │ …
+  │ 3 failed, 41 passed
+  full log: /ws/.heph/failures/web_e2e-…/log.txt
+  outputs: /ws/.heph/failures/web_e2e-…/out
+  log: heph log //web:e2e
+```
+
+The end of the run does not say it again. A failure that printed no block as
+it failed — one that never reached its run, such as a dependency that does
+not exist — gets the failure box at the end instead, with the same rows:
 
 ```
 × target failed: //web:e2e
-╰─▶ process exited with status: exit status: 1
-    ╭─[log]
-    …
-    ╰────
-  full log: /ws/.heph/failures/web_e2e-…/log.txt
-  sandbox: removed (rerun with --keep-failed-sandboxes to keep it)
-  outputs: /ws/.heph/failures/web_e2e-…/out
+╰─▶ get_def: //web:e2e: get spec: //web:nope: target not found: //web:nope
+  log: none kept
 ```
+
+A box also frames the log's tail, when there is one. Either way the last row
+is the
+command that prints the log without naming where it lives, printed whenever
+heph can open a log for the target — on disk or not, a remote hit's log it
+would fetch included — and `log: none kept` when it cannot. An interactive run
+prints the failure report instead: one block per root failure, naming no path
+into heph's home, each ending with the same answer as `full log: heph log
+<addr>` or `full log: none kept`.
+
+A script reading either shape can rely on the order of the rows and on their
+labels (`full log:`, `outputs:`, `took down:`, `fixes written:`, …): those
+are stable. The whitespace is not. A report's labels are padded to line up
+with each other, so the indentation and the gap after a label change with
+which rows a failure prints. Match a label with its colon and trim what
+follows it.
 
 ### The failed sandbox
 
 The slot is what outlives a failure; the sandbox the run failed in does not.
 Once the slot is filled (and an `in_place` write-back is done), the sandbox is
-removed, like a passing run's, and the box says so. Rerun with
+removed, like a passing run's, and the box says nothing of it. Rerun with
 `--keep-failed-sandboxes` to keep it on disk for inspection instead: it then
 stays until the target's next run, and it is outside the `sandbox` pool's cap
 (see [RESOURCES.md](RESOURCES.md)). A target whose outputs are credential
 material has its failed sandbox removed even under the flag.
 
-The box's `sandbox:` line, after `full log:`, says which:
+The box's `sandbox:` line, after `full log:`, appears only when the sandbox's
+fate is out of the ordinary:
 
 | Line | When |
 |---|---|
-| `sandbox: removed (rerun with --keep-failed-sandboxes to keep it)` | the default |
 | `sandbox: <path> (kept)` | under `--keep-failed-sandboxes` |
 | `sandbox: removed (credential material)` | material, under the flag |
 | `sandbox: left (run abandoned after timeout)` | the run outlived its timeout's grace (see [TIMEOUTS.md](TIMEOUTS.md)) |
 
-There is no line when the run had no sandbox (a plain driver such as
-`template` or `fs`, or a failure before the driver ran), nor for material
-without the flag. `heph inspect failure` (and its `--json`) never reports the
+There is no line for the default removal, nor when the run had no sandbox (a
+plain driver such as `template` or `fs`, or a failure before the driver ran),
+nor for material without the flag. `heph inspect failure` (and its `--json`) never reports the
 sandbox: it reads the slot, and the sandbox is not part of it.
 
 When the slot's fill itself fails (an unwritable failures directory, a log
-outside the sandbox), the box falls back to the log's tail in memory, and the
+outside the sandbox), the tail shown falls back to the log's tail in memory, and the
 full log is gone with the sandbox unless `--keep-failed-sandboxes` kept it.
 
 ## `failure_out`

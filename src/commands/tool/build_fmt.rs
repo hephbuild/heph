@@ -33,6 +33,8 @@ pub struct Args {
     /// Check mode: exit non-zero if any file is not formatted; do not write.
     #[arg(long)]
     pub check: bool,
+    #[command(flatten)]
+    pub dashboard: crate::commands::progress_app::DashboardArgs,
 }
 
 pub fn execute(
@@ -209,5 +211,13 @@ async fn execute_async(
         fail_fast: global.fail_fast,
     };
     let interactive = tui::should_use_tui(global.no_tui);
-    tui::run_app(app, sink, session, interactive, shutdown).await
+    tui::run_app_with(
+        app,
+        sink,
+        session,
+        interactive,
+        args.dashboard.dashboard,
+        shutdown,
+    )
+    .await
 }

@@ -281,12 +281,7 @@ fn read_lines(
     let mut last = mark.last_printed;
     let mut line = Vec::new();
     while let Some(record) = reader.next_containing(&needle)? {
-        let Some(SessionRecordKind::Log {
-            msg,
-            seq: Some(seq),
-            ..
-        }) = record.session
-        else {
+        let Some(SessionRecordKind::Log { msg, seq, .. }) = record.session else {
             continue;
         };
         // Numbers only grow in the file; a smaller one was printed already.
@@ -370,7 +365,7 @@ mod tests {
             SessionRecordKind::Log {
                 level: "INFO".into(),
                 msg: msg.into(),
-                seq: Some(seq),
+                seq,
             },
         ))
         .expect("encode");

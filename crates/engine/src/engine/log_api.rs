@@ -103,7 +103,8 @@ pub struct LogOptions {
     /// Finds runs going on in other hephs on this workspace.
     pub locator: Option<Arc<dyn LiveRunLogLocator>>,
     /// Fetch a remote hit's log into the local entry. Only a reader that
-    /// shows a log asks for it; a list's last-line column never does.
+    /// shows a log asks for it; a list's last-line column never does. Only
+    /// such a reader waits, on a miss, for queued cache writes to commit.
     pub fetch_remote: bool,
     /// Only the log of the run at this input hash (`heph log --current`):
     /// every source at another hash is passed over, however new.
@@ -177,15 +178,6 @@ impl OpenLog {
         (&mut self.src).take(n).read_to_end(&mut out)?;
         Ok(out)
     }
-}
-
-/// No log of the address is held, and a live session of this workspace runs
-/// a heph that records no live logs: it may be running the address unseen.
-/// The UI says "records no live logs".
-#[derive(Debug, thiserror::Error)]
-#[error("no log; session {session} runs a heph that records no live logs")]
-pub struct NoLiveLogs {
-    pub session: String,
 }
 
 /// The address is running and has written nothing yet: there is no log to
@@ -270,9 +262,6 @@ enum Latest {
     /// Running, in this engine or another session, nothing written yet.
     Started(NoOutputYet),
     Stored(Stored),
-    /// Nothing, and the locator named a live session that records no live
-    /// logs.
-    Unsupported(String),
     None,
 }
 
@@ -282,21 +271,39 @@ impl Engine {
     ///
     /// Never builds. A remote hit's log is fetched only when `fetch_remote`
     /// is set, and then once: the next open reads the local copy.
+    /// Whether `heph log <addr>` would find a log for `addr`: the log API
+    /// over local sources, never fetching, with a remote hit's log (which
+    /// `heph log` fetches) counted. What a failure's `log:` row is decided on.
+    pub async fn log_readable(self: &Arc<Self>, addr: &Addr) -> bool {
+        match self.open_log(addr, &LogOptions::default()).await {
+            Ok(found) => found.is_some(),
+            Err(e) => e
+                .downcast_ref::<LogUnavailable>()
+                .is_some_and(|u| u.info.source == LogSource::Cache { remote: true }),
+        }
+    }
+
     pub async fn open_log(
         self: &Arc<Self>,
         addr: &Addr,
         opts: &LogOptions,
     ) -> anyhow::Result<Option<OpenLog>> {
-        let engine = Arc::clone(self);
-        let (a, locator, hashin) = (addr.clone(), opts.locator.clone(), opts.hashin.clone());
-        let latest = hcore::blocking::run(move || {
-            engine.latest_log(&a, locator.as_deref(), hashin.as_deref())
-        })
-        .await?;
+        let mut latest = self.latest_log_blocking(addr, opts).await?;
+        if matches!(latest, Latest::None) && opts.fetch_remote {
+            // A remote hit's mirrored manifest is a queued write until the
+            // sqlite writer commits it, and the cache listing does not wait
+            // on that queue: an open right after the hit found nothing. On
+            // the miss path only, let what is queued commit and look again.
+            // Only for a reader that shows a log (`fetch_remote`): the
+            // last-line column opens every visible row with no log, and
+            // waiting there on every queued write in a busy build stalls it;
+            // it looks again on its next pass anyway.
+            self.sqlite_writes.drain_queued_writes().await;
+            latest = self.latest_log_blocking(addr, opts).await?;
+        }
         match latest {
             Latest::None => Ok(None),
             Latest::Started(started) => Err(started.into()),
-            Latest::Unsupported(session) => Err(NoLiveLogs { session }.into()),
             Latest::Running(run) => Ok(Some(OpenLog::plain(
                 LogInfo {
                     source: LogSource::Live {
@@ -322,21 +329,14 @@ impl Engine {
     /// end. When none is going on, `wait_for_start` waits for the next one
     /// (or for a newer finished log to appear); otherwise the newest
     /// finished log is read through once. `Ok(None)` when there is nothing
-    /// to read and nothing to wait for; [`NoLiveLogs`] when there is nothing
-    /// and a heph that records no live logs is running on this workspace,
-    /// waiting or not, since a run there would never be seen.
+    /// to read and nothing to wait for.
     pub async fn follow_log(
         self: &Arc<Self>,
         addr: &Addr,
         opts: &LogOptions,
         wait_for_start: bool,
     ) -> anyhow::Result<Option<LogFollower>> {
-        let engine = Arc::clone(self);
-        let (a, locator, hashin) = (addr.clone(), opts.locator.clone(), opts.hashin.clone());
-        let latest = hcore::blocking::run(move || {
-            engine.latest_log(&a, locator.as_deref(), hashin.as_deref())
-        })
-        .await?;
+        let latest = self.latest_log_blocking(addr, opts).await?;
         let state = match latest {
             Latest::Running(run) => Follow::Live(run),
             // A run going on that has written nothing: wait for its first
@@ -346,7 +346,6 @@ impl Engine {
                 baseline: Some(started.at_unix_ms),
                 started: Some(started),
             },
-            Latest::Unsupported(session) => return Err(NoLiveLogs { session }.into()),
             Latest::Stored(stored) if wait_for_start => Follow::Waiting {
                 baseline: Some(stored.at_unix_ms()),
                 started: None,
@@ -371,6 +370,18 @@ impl Engine {
             checked: None,
             replaced_by: None,
         }))
+    }
+
+    /// [`latest_log`](Self::latest_log), off the runtime's workers.
+    async fn latest_log_blocking(
+        self: &Arc<Self>,
+        addr: &Addr,
+        opts: &LogOptions,
+    ) -> anyhow::Result<Latest> {
+        let engine = Arc::clone(self);
+        let (a, locator, hashin) = (addr.clone(), opts.locator.clone(), opts.hashin.clone());
+        hcore::blocking::run(move || engine.latest_log(&a, locator.as_deref(), hashin.as_deref()))
+            .await
     }
 
     /// The newest of `addr`'s logs, or of its logs at `hashin` when given.
@@ -421,7 +432,6 @@ impl Engine {
                 at_unix_ms: run.at_unix_ms,
             }));
         }
-        let mut unsupported = None;
         if let Some(locator) = locator {
             match locator
                 .locate(&self.home, &addr.format())
@@ -459,7 +469,6 @@ impl Engine {
                         at_unix_ms,
                     }));
                 }
-                Some(LocatedRunLog::Unsupported { session }) => unsupported = Some(session),
                 // Ended: what replaced it is among the stored sources.
                 _ => {}
             }
@@ -479,11 +488,7 @@ impl Engine {
         if let Some(entry) = self.newest_cached_log(addr, hashin)? {
             consider(entry);
         }
-        Ok(match (newest, unsupported) {
-            (Some(stored), _) => Latest::Stored(stored),
-            (None, Some(session)) => Latest::Unsupported(session),
-            (None, None) => Latest::None,
-        })
+        Ok(newest.map_or(Latest::None, Latest::Stored))
     }
 
     /// The newest local cache entry of `addr` that keeps a `Log`, or the one

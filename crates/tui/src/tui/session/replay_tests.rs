@@ -40,11 +40,7 @@ fn log_records(slot: &SessionSlot) -> Vec<(u64, String, String)> {
         .0
         .into_iter()
         .filter_map(|r| match r.session {
-            Some(SessionRecordKind::Log {
-                level,
-                msg,
-                seq: Some(seq),
-            }) => Some((seq, level, msg)),
+            Some(SessionRecordKind::Log { level, msg, seq }) => Some((seq, level, msg)),
             _ => None,
         })
         .collect()

@@ -34,10 +34,6 @@ const ALLOWED: &[(&str, &str)] = &[
         "an explicit no-op match arm; never counts them",
     ),
     (
-        "crates/tui/src/tui/progress.rs",
-        "an explicit no-op match arm",
-    ),
-    (
         "crates/telemetry/src/telemetry/collector.rs",
         "the deprecated tier counters, documented as tier events",
     ),

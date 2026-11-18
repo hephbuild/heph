@@ -1,11 +1,17 @@
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use ansi_to_tui::IntoText;
 use anyhow::Context;
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use crossterm::event::{
+    Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
 use futures::StreamExt;
 use ratatui::backend::{Backend, ClearType};
 use ratatui::buffer::Buffer;
@@ -16,12 +22,12 @@ use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::{Terminal, TerminalOptions, Viewport};
 use tokio::sync::mpsc;
 
-use crate::tui::app::{App, AppContext, Control, TUIAppView};
-use crate::tui::log_sink::{LogSink, SinkLine};
-use crate::tui::progress::HSCROLL_STEP;
+use crate::tui::app::{App, AppContext, Control, Decide, MouseInput, ScreenKey, TUIAppView};
+use crate::tui::log_sink::{LogSink, REPLAY_FLUSH_TIMEOUT, ReplayMark, Replayed, SinkLine};
 use crate::tui::session::recorder::ViewTap;
 use crate::tui::session::{SessionSlot, TappedReceiver};
 use crate::tui::stderr_backend::StderrBackend;
+use crate::tui::stop_arm::{self, CtrlC};
 use hcore::events::now_unix_ms;
 use hcore::shutdown::ShutdownTrigger;
 
@@ -35,16 +41,259 @@ const LOG_DRAIN_TICK_BUDGET: Duration = Duration::from_millis(20);
 
 type StderrTerminal = Terminal<StderrBackend>;
 
+/// Whether heph has the terminal on its alternate screen. Stored with
+/// `Release` on each switch, read with `Acquire` by the hard abort's restore
+/// closure ([`record_raw_mode_restore`]), which runs on whatever thread calls
+/// `process::exit` and has no other way to know the screen is up.
+static ALT_SCREEN_UP: AtomicBool = AtomicBool::new(false);
+
+/// CSI ?1049l: back to the main screen, cursor restored to where `?1049h`
+/// saved it. The byte string the hard abort writes with `libc::write`.
+const LEAVE_ALT_SCREEN: &[u8] = b"\x1b[?1049l";
+
+/// Whether heph has the mouse captured, as [`ALT_SCREEN_UP`] is for the
+/// screen: set (Release) before the capture is written, cleared (Release)
+/// after it is turned off, read (Acquire) by the hard abort. A race costs
+/// at worst one extra "off", never a capture left on.
+static MOUSE_UP: AtomicBool = AtomicBool::new(false);
+
+/// Button presses (1000) reported in SGR encoding (1006). Not crossterm's
+/// `EnableMouseCapture`, which also turns on any-motion reporting (1003): an
+/// event for every cell the pointer crosses.
+///
+/// Then alternate scroll (1007) off: a terminal with it on turns the wheel
+/// into ↑/↓ on the alternate screen, which would move the selection instead
+/// of scrolling the view. Most terminals already send wheel reports once
+/// 1000 is on; this is for the ones that let 1007 win. Nothing turns it back
+/// on at leave: whether it was on is learnt only by a query (DECRQM), and the
+/// input stream is live by then. Mode 1007 only acts on the alternate
+/// screen, so leaving it off changes nothing on the main screen; the cost
+/// is a later full-screen program without mouse reporting (`less`) whose
+/// wheel no longer scrolls in a terminal that had 1007 on.
+const MOUSE_ON: &[u8] = b"\x1b[?1000h\x1b[?1006h\x1b[?1007l";
+/// Both capture modes off; also what the hard abort writes.
+const MOUSE_OFF: &[u8] = b"\x1b[?1000l\x1b[?1006l";
+
+/// Whether the full screens capture the mouse: yes, unless `HEPH_NO_MOUSE`
+/// is set to anything but `0` or nothing. No config key (spec decision).
+fn mouse_wanted() -> bool {
+    std::env::var_os("HEPH_NO_MOUSE").is_none_or(|v| v.is_empty() || v == "0")
+}
+
+fn write_stderr(bytes: &[u8]) -> io::Result<()> {
+    let mut e = io::stderr().lock();
+    e.write_all(bytes)?;
+    e.flush()
+}
+
+/// A full screen while it is up: the alternate screen, and a full-screen
+/// terminal drawing on it.
+///
+/// It is the restore guard. Dropping it leaves the alternate screen, so every
+/// way out of [`run`] that unwinds its stack — `q`, the end of the run, `?`,
+/// and the `resume_unwind` of an app panic — hands the user back the main
+/// screen and the scrollback on it as they were. The panic hook never touches
+/// the alternate screen: it also fires for panics that are caught, under a
+/// screen that stays up. The one exit with no destructors, the hard abort,
+/// reads [`ALT_SCREEN_UP`] instead.
+///
+/// The inline terminal is kept, untouched, while this is up: rebuilding it
+/// costs a cursor query, which must not run while the input stream is live.
+struct FullScreen {
+    terminal: StderrTerminal,
+}
+
+impl FullScreen {
+    /// Switch to the alternate screen, and capture the mouse on it when
+    /// `mouse`. A full-screen viewport asks the terminal nothing (its size
+    /// is an ioctl), so this sends no query.
+    fn enter(mouse: bool) -> anyhow::Result<Self> {
+        let terminal = Terminal::with_options(
+            StderrBackend::new(io::stderr()),
+            TerminalOptions {
+                viewport: Viewport::Fullscreen,
+            },
+        )
+        .context("building the full-screen terminal")?;
+        // Each flag goes up before its write, so a hard abort in between
+        // undoes a mode that may not be on yet rather than miss one that is.
+        ALT_SCREEN_UP.store(true, Ordering::Release);
+        // Built before the write: from here on dropping it is the restore,
+        // the `?` below included.
+        let screen = Self { terminal };
+        crossterm::execute!(io::stderr(), EnterAlternateScreen)
+            .context("entering the alternate screen")?;
+        if mouse {
+            MOUSE_UP.store(true, Ordering::Release);
+            write_stderr(MOUSE_ON).context("capturing the mouse")?;
+        }
+        Ok(screen)
+    }
+}
+
+impl Drop for FullScreen {
+    fn drop(&mut self) {
+        // The mouse off before the screen is left, both written whether or
+        // not they were turned on (harmless when off). Each flag is cleared
+        // after its write, so a hard abort racing this drop writes a second
+        // "off" at worst and never exits with either mode on.
+        drop(write_stderr(MOUSE_OFF));
+        MOUSE_UP.store(false, Ordering::Release);
+        drop(crossterm::execute!(io::stderr(), LeaveAlternateScreen));
+        ALT_SCREEN_UP.store(false, Ordering::Release);
+        // A panic unwinding [`run`] on this thread: the hook printed it onto
+        // the screen just left, so print it again where the user sees it.
+        if std::thread::panicking()
+            && let Some(text) = crate::tui::panic::take_for_current_thread()
+        {
+            print_panic_report(&text);
+        }
+    }
+}
+
+/// What a panic unwinding [`run`] must undo besides the alternate screen:
+/// raw mode, the hidden cursor, and the sink holding heph's lines for a
+/// terminal nobody draws any more. The panic hook used to do this, for every
+/// panic, so a panic caught elsewhere (a tokio task's) left a live dashboard
+/// reading keys line-buffered. Only an unwind reaches here; every other exit
+/// tears the terminal down in order at the end of [`run`], and the hard abort
+/// through `hcore::shutdown`'s restore closure.
+struct UnwindRestore {
+    sink: LogSink,
+}
+
+impl Drop for UnwindRestore {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            drop(disable_raw_mode());
+            drop(crossterm::execute!(io::stderr(), crossterm::cursor::Show));
+            self.sink.switch_to_direct();
+        }
+    }
+}
+
+/// Print a panic's report on the main screen, below the cursor the alternate
+/// screen gave back. The line under it is stale now, so it is cleared. Raw
+/// mode may still be on, so every line ends in an explicit carriage return.
+fn print_panic_report(text: &str) {
+    let mut out = String::with_capacity(text.len() + 16);
+    out.push_str("\r\x1b[J");
+    for line in text.lines() {
+        out.push_str(line);
+        out.push_str("\r\n");
+    }
+    let mut stderr = io::stderr().lock();
+    drop(stderr.write_all(out.as_bytes()));
+    drop(stderr.flush());
+}
+
+/// `HEPH_DEBUG_TUI_LOG=<file>`: while `<file>` exists, a thread writes one
+/// numbered heph line every 40 ms — an `INFO`, a `DEBUG` under the
+/// `heph_debug_tui_log` target, and a diagnostic, in turn — for the PTY test
+/// that checks lines written under a full screen print once each, in order,
+/// on return (`crates/bin-e2e`'s `tui_pty.rs`). In the shipped binary for the
+/// same reason as [`DebugPanic`]; unset, it costs one environment read.
+struct DebugLog {
+    stop: std::sync::Arc<AtomicBool>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl DebugLog {
+    fn from_env(sink: &LogSink) -> Option<Self> {
+        let file = std::path::PathBuf::from(std::env::var_os("HEPH_DEBUG_TUI_LOG")?);
+        tracing::warn!(
+            var = "HEPH_DEBUG_TUI_LOG",
+            "a test-only knob is set: this run writes test lines; unset it"
+        );
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let thread = std::thread::Builder::new()
+            .name("heph-debug-tui-log".into())
+            .spawn({
+                let (stop, sink) = (std::sync::Arc::clone(&stop), sink.clone());
+                move || {
+                    let mut n = 0u64;
+                    while !stop.load(Ordering::Acquire) {
+                        if file.exists() {
+                            n += 1;
+                            match n % 3 {
+                                0 => sink
+                                    .write_diagnostic(&format!("heph-debug-log {n} diagnostic\n")),
+                                1 => tracing::info!("heph-debug-log {n} info"),
+                                _ => tracing::debug!(
+                                    target: "heph_debug_tui_log",
+                                    "heph-debug-log {n} debug"
+                                ),
+                            }
+                        }
+                        std::thread::sleep(Duration::from_millis(40));
+                    }
+                }
+            })
+            .ok()?;
+        Some(Self { stop, thread })
+    }
+
+    fn stop(self) {
+        self.stop.store(true, Ordering::Release);
+        drop(self.thread.join());
+    }
+}
+
+/// `HEPH_DEBUG_TUI_PANIC`: make the run panic once it ends, for the PTY tests
+/// that check the terminal comes back from a panic (`crates/bin-e2e`'s
+/// `tui_pty.rs`). Those test the shipped binary, so the knob is in it; unset,
+/// it costs one environment read per run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DebugPanic {
+    /// The app task panics a second after it returns: the `resume_unwind`
+    /// path.
+    App,
+    /// The backend panics once the finished run has been held under the
+    /// dashboard for half a second: the unwind path.
+    Backend,
+    /// A task of its own panics, once, as the first full screen goes up, and
+    /// tokio catches it: the run goes on, and so must the screen and raw mode.
+    Caught,
+}
+
+impl DebugPanic {
+    fn from_env() -> Option<Self> {
+        let knob = match std::env::var_os("HEPH_DEBUG_TUI_PANIC")?.to_str()? {
+            "app" => Self::App,
+            "backend" => Self::Backend,
+            "caught" => Self::Caught,
+            _ => return None,
+        };
+        tracing::warn!(
+            var = "HEPH_DEBUG_TUI_PANIC",
+            ?knob,
+            "a test-only knob is set: this run panics on purpose; unset it"
+        );
+        Some(knob)
+    }
+
+    #[expect(clippy::panic, reason = "a deliberate panic is the knob's whole job")]
+    fn fire(self) -> ! {
+        panic!("HEPH_DEBUG_TUI_PANIC={self:?}: a deliberate panic")
+    }
+}
+
 pub async fn run<A: App + 'static>(
     app: A,
     sink: LogSink,
     shutdown: ShutdownTrigger,
     slot: Option<&SessionSlot>,
+    dashboard: bool,
 ) -> anyhow::Result<A::Output> {
     // The app owns its view: aggregation + rendering. It lives on the loop
     // stack so it survives pause/resume (only the terminal is rebuilt across a
     // pause cycle, not the view's aggregated state).
     let mut view = app.tui_view();
+    if dashboard {
+        // Up before the first frame: the first tick enters the full screen
+        // before anything is drawn on the line.
+        view.pin_dashboard();
+    }
     // No start line here: the terminal is the TUI's. `heph session list` finds it.
     let session_tap = slot
         .and_then(|s| s.open(view.session_header(), true))
@@ -58,7 +307,8 @@ pub async fn run<A: App + 'static>(
     // Size the inline viewport to ~1/3 of the terminal height. Queried before the
     // viewport is built (so the first frame is already sized); the column count is
     // re-derived from the backend below.
-    let term_height = crossterm::terminal::size()
+    // Kept current from resize events: the view's row count depends on it.
+    let mut term_height = crossterm::terminal::size()
         .map(|(_, h)| h)
         .unwrap_or(24)
         .max(1);
@@ -73,11 +323,12 @@ pub async fn run<A: App + 'static>(
     let mut view_tap = session_tap.clone().map(|tap| ViewTap::new(tap, &view));
     let mut build_events: Option<TappedReceiver> =
         Some(TappedReceiver::new(event_rx, session_tap, holders));
-    // The instant a held viewport froze its clock at; the summary uses it too.
-    let mut held_at: Option<u64> = None;
 
     record_raw_mode_restore();
     enable_raw_mode().context("enabling raw mode")?;
+    // Declared before the full screen's guard, so it drops after it: the
+    // alternate screen is left first, in raw mode, as on every other exit.
+    let _unwind = UnwindRestore { sink: sink.clone() };
     // StderrBackend wraps CrosstermBackend<Stderr> and overrides
     // get_cursor_position so the DSR query goes to stderr instead of
     // crossterm's hardcoded `io::stdout()`. Otherwise `cmd | wc -l`
@@ -90,6 +341,11 @@ pub async fn run<A: App + 'static>(
     )
     .context("building inline terminal")?;
     terminal.autoresize()?;
+    // The dashboard's screen while it is up; dropping it is the restore.
+    let mut full: Option<FullScreen> = None;
+    // Read once: whether the full screens capture the mouse.
+    let mouse = mouse_wanted();
+    let mut replay = Replay::default();
 
     let mut events: Option<EventStream> = Some(EventStream::new());
     let suppression = shutdown.suppression();
@@ -110,7 +366,19 @@ pub async fn run<A: App + 'static>(
     // (e.g. `block_in_place` for filesystem scans, Starlark eval) does
     // not block this task's ticker — the renderer task is re-polled
     // on another worker and the spinner keeps ticking.
-    let mut app_handle = tokio::spawn(app.run(ctx));
+    let debug_panic = DebugPanic::from_env();
+    let mut caught_fired = false;
+    let debug_log = DebugLog::from_env(&sink);
+    let mut app_handle = tokio::spawn(async move {
+        let out = app.run(ctx).await;
+        if debug_panic == Some(DebugPanic::App) {
+            // Long enough for the resume after the named target to put the
+            // dashboard back: the panic is to land under a full screen.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            DebugPanic::App.fire();
+        }
+        out
+    });
 
     let mut ticker = tokio::time::interval(TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -128,49 +396,34 @@ pub async fn run<A: App + 'static>(
     // blocking DSR query per event.
     let mut needs_resize = false;
 
-    // Holds the app's result once its future resolves. We don't break the loop
-    // here: the TUI stays up, rendering, until background cleanups drain too.
-    let mut app_result: Option<anyhow::Result<A::Output>> = None;
-    // Latched once the finished run is held open on a non-main view: the viewport
-    // keeps rendering until the user quits explicitly (`q` / Ctrl-C).
-    let mut held = false;
-    // Set by `q` / Ctrl-C to break out of a held viewport.
-    let mut quit = false;
+    // The app's result once its future resolves. We don't break the loop
+    // there: the TUI stays up, rendering, until background cleanups drain too.
+    let mut end: RunEnd<anyhow::Result<A::Output>> = RunEnd::new();
     let result: anyhow::Result<A::Output> = loop {
-        // App finished and the background queue is empty — decide whether to exit.
-        if let Some(r) = app_result.take() {
-            if bg_drained(&bg_pending) {
-                if held {
-                    // Held open after finish — exit only on explicit quit.
-                    if quit {
-                        break r;
-                    }
-                    app_result = Some(r);
-                } else if view.hold_after_finish() {
-                    // User navigated off the main view: hold the viewport up and
-                    // surface a "press q to quit" notice instead of auto-exiting.
-                    held = true;
-                    let at = now_unix_ms();
-                    held_at = Some(at);
-                    view.set_finished(at);
-                    app_result = Some(r);
-                } else {
-                    break r;
-                }
-            } else {
-                // Background cleanups still draining — keep the result, keep rendering.
-                app_result = Some(r);
-            }
+        // App finished and the background queue is empty — decide whether to
+        // exit. A stop under way (a ctrl-c that stopped, or a signal: INT,
+        // TERM, HUP) is never held: it ends the run on any screen.
+        if let Some(r) = end.exit(bg_drained(&bg_pending), shutdown.fired(), &view) {
+            break r;
         }
         tokio::select! {
-            res = &mut app_handle, if app_result.is_none() => {
-                app_result = Some(match res {
+            res = &mut app_handle, if !end.app_finished() => {
+                let stopped = shutdown.fired();
+                let res = match res {
                     Ok(inner) => inner,
                     Err(join_err) if join_err.is_panic() => {
-                        std::panic::resume_unwind(join_err.into_panic())
+                        let payload = join_err.into_panic();
+                        // The hook printed this panic, on its own thread,
+                        // onto the full screen if one is up: leave it, then
+                        // print the panic again on the main screen.
+                        if full.take().is_some() {
+                            print_panic_report(&crate::tui::panic::take_for_payload(&*payload));
+                        }
+                        std::panic::resume_unwind(payload)
                     }
                     Err(join_err) => Err(anyhow::Error::new(join_err).context("app task")),
-                });
+                };
+                end.app_done(res, now_unix_ms(), stopped, &mut view);
             }
             ctrl = control_rx.recv() => {
                 match ctrl {
@@ -195,6 +448,16 @@ pub async fn run<A: App + 'static>(
                         suppression.set(kind.owns_input());
                         resume_pending = false;
                         if !paused {
+                            // Leave the alternate screen first, with raw mode
+                            // still on: the target gets the main screen, and
+                            // the next tick after the resume puts the
+                            // dashboard back, since the view still has it up.
+                            // What it kept off the terminal is printed before
+                            // the target writes anything.
+                            if full.take().is_some() {
+                                replay.start(&sink);
+                            }
+                            replay.finish(&mut terminal, cols).await;
                             // Drop the EventStream *before* `clear()`. `clear()`
                             // issues a cursor DSR query (`get_cursor_position`),
                             // which reads its reply through crossterm's single
@@ -207,7 +470,7 @@ pub async fn run<A: App + 'static>(
                             // deferred like a tick-path budget would be — it's
                             // orphaned when the old `rx` is dropped. Every byte must
                             // come out now.
-                            drain_logs_to_terminal(&mut terminal, &mut rx, cols, None);
+                            drain_logs_to_terminal(&mut terminal, &mut rx, cols, None, replay.through);
                             // Collapse to the viewport origin (not `terminal.clear()`,
                             // which restores the live bottom-of-box cursor): the
                             // cooked-mode stdout write below must land at the box's
@@ -216,7 +479,7 @@ pub async fn run<A: App + 'static>(
                             collapse_inline_viewport(&mut terminal);
                             drop(terminal.show_cursor());
                             drop(disable_raw_mode());
-                            flip_sink_to_direct_draining_the_gap(&sink, &mut rx);
+                            flip_sink_to_direct_draining_the_gap(&sink, &mut rx, replay.through);
                             paused = true;
                         }
                         if ack.send(()).is_err() {
@@ -239,16 +502,21 @@ pub async fn run<A: App + 'static>(
                     None => std::future::pending().await,
                 }
             }, if !paused => {
+                if let Some(Ok(ev)) = &maybe_evt
+                    && stop_arm::disarms(ev)
+                {
+                    view.disarm_stop();
+                }
                 match maybe_evt {
-                    Some(Ok(Event::Key(KeyEvent {
-                        code: KeyCode::Char('c'),
-                        modifiers,
-                        kind: KeyEventKind::Press,
-                        ..
-                    }))) if modifiers.contains(KeyModifiers::CONTROL) => {
-                        shutdown.trigger();
-                        // Also quits a viewport held open after the run finished.
-                        quit = true;
+                    Some(Ok(ev)) if stop_arm::is_ctrl_c(&ev) => {
+                        // On a full screen the first press only arms; the
+                        // view says which (`stop_arm`'s one rule).
+                        let finished = end.app_finished();
+                        if view.ctrl_c(now_unix_ms(), finished, shutdown.fired()) == CtrlC::Stop {
+                            shutdown.trigger();
+                            // Also quits a viewport held open after the run finished.
+                            end.quit = true;
+                        }
                     }
                     // `q` off the main view returns to it (like Esc); on the main
                     // view it quits a held (finished) viewport. Ignored mid-search
@@ -258,36 +526,56 @@ pub async fn run<A: App + 'static>(
                         kind: KeyEventKind::Press,
                         ..
                     }))) if !view.is_searching() => {
-                        if view.is_on_main_view() {
-                            if held {
-                                quit = true;
-                            } else if app_result.is_none() {
+                        if end.holds(&view) {
+                            // The run ended under an open dashboard: `q`
+                            // leaves, from whichever screen is up, once
+                            // background work has drained.
+                            end.quit = true;
+                        } else if view.is_on_main_view() || view.quits_from_any_screen() {
+                            if !end.app_finished() {
                                 view.quit_while_running();
                             }
                         } else {
                             view.back_to_main();
                         }
                     }
-                    // Approval prompt active: `y`/`n` resolve the gated target and
-                    // Enter expands/collapses its notice. These precede the normal
-                    // shortcuts so a gated run is resolvable without other keys
-                    // (e.g. `n`/`a`) being intercepted first.
+                    // The approval view is the only place that decides:
+                    // `y`/`n`/`Y`/`N` there, nowhere else (a `y` typed for
+                    // something else never approves; `n` stays search's).
+                    // These precede every other arm while it is up.
+                    Some(Ok(Event::Key(key)))
+                        if decision_key(&key, view.in_approval_view()).is_some() =>
+                    {
+                        if let Some(decide) = decision_key(&key, true) {
+                            view.approval_decide(decide, now_unix_ms());
+                        }
+                    }
+                    // ←/→ switch notices; Enter decides nothing there.
                     Some(Ok(Event::Key(KeyEvent {
-                        code: KeyCode::Char('y'),
+                        code: code @ (KeyCode::Left | KeyCode::Right),
                         kind: KeyEventKind::Press,
                         ..
-                    }))) if view.approval_active() => view.approval_respond(true),
-                    Some(Ok(Event::Key(KeyEvent {
-                        code: KeyCode::Char('n'),
-                        kind: KeyEventKind::Press,
-                        ..
-                    }))) if view.approval_active() => view.approval_respond(false),
+                    }))) if view.in_approval_view() => view.tab(code == KeyCode::Right),
                     Some(Ok(Event::Key(KeyEvent {
                         code: KeyCode::Enter,
                         kind: KeyEventKind::Press,
                         ..
-                    }))) if view.approval_active() && !view.is_searching() => {
-                        view.approval_toggle_notice()
+                    }))) if view.in_approval_view() => {}
+                    // Enter on the line's prompt row, and `v` on any full
+                    // screen, open the oldest pending request.
+                    Some(Ok(Event::Key(KeyEvent {
+                        code: KeyCode::Enter,
+                        kind: KeyEventKind::Press,
+                        ..
+                    }))) if !view.full_screen() && !view.is_searching() => {
+                        let _opened = view.approval_open();
+                    }
+                    Some(Ok(Event::Key(KeyEvent {
+                        code: KeyCode::Char('v'),
+                        kind: KeyEventKind::Press,
+                        ..
+                    }))) if view.full_screen() && !view.is_searching() => {
+                        let _opened = view.approval_open();
                     }
                     // While the `/` filter captures input, printable keys, Backspace
                     // and Enter edit the query instead of firing the shortcuts
@@ -310,6 +598,27 @@ pub async fn run<A: App + 'static>(
                         kind: KeyEventKind::Press,
                         ..
                     }))) if view.is_searching() => view.search_confirm(),
+                    // Enter / `l` on a full screen's row: open that target.
+                    Some(Ok(Event::Key(KeyEvent {
+                        code: KeyCode::Enter,
+                        kind: KeyEventKind::Press,
+                        ..
+                    }))) if view.full_screen() => view.open_selected(false),
+                    Some(Ok(Event::Key(KeyEvent {
+                        code: KeyCode::Char('l'),
+                        kind: KeyEventKind::Press,
+                        ..
+                    }))) if view.full_screen() => view.open_selected(true),
+                    // A full screen's own keys (the target Log tab's).
+                    Some(Ok(Event::Key(KeyEvent {
+                        code,
+                        kind: KeyEventKind::Press,
+                        ..
+                    }))) if view.full_screen() && screen_key(code).is_some() => {
+                        if let Some(key) = screen_key(code) {
+                            view.screen_key(key);
+                        }
+                    }
                     Some(Ok(Event::Key(KeyEvent {
                         code: KeyCode::Up,
                         kind: KeyEventKind::Press,
@@ -320,16 +629,6 @@ pub async fn run<A: App + 'static>(
                         kind: KeyEventKind::Press,
                         ..
                     }))) => view.scroll(1),
-                    Some(Ok(Event::Key(KeyEvent {
-                        code: KeyCode::Left,
-                        kind: KeyEventKind::Press,
-                        ..
-                    }))) => view.hscroll(-(HSCROLL_STEP as i32)),
-                    Some(Ok(Event::Key(KeyEvent {
-                        code: KeyCode::Right,
-                        kind: KeyEventKind::Press,
-                        ..
-                    }))) => view.hscroll(HSCROLL_STEP as i32),
                     Some(Ok(Event::Key(KeyEvent {
                         code: KeyCode::Tab,
                         kind: KeyEventKind::Press,
@@ -365,11 +664,20 @@ pub async fn run<A: App + 'static>(
                             view.back_to_main();
                         }
                     }
-                    Some(Ok(Event::Resize(w, _))) => {
+                    // The mouse, captured only while a full screen is up: a
+                    // report still in flight as it closed lands here with
+                    // the line up, and is dropped.
+                    Some(Ok(Event::Mouse(m))) if full.is_some() => {
+                        if let Some(input) = mouse_input(m) {
+                            view.mouse(input);
+                        }
+                    }
+                    Some(Ok(Event::Resize(w, h))) => {
                         // Cheap: just record. The terminal re-anchor (which does a
                         // DSR cursor query that must not race the EventStream) is
                         // deferred to the tick arm below.
                         cols = w.max(1);
+                        term_height = h.max(1);
                         needs_resize = true;
                     }
                     _ => {}
@@ -393,7 +701,7 @@ pub async fn run<A: App + 'static>(
             }
             // The app is done and only background work is holding the exit:
             // wake on the last decrement instead of the next `TICK`.
-            () = exit_drain_wake(app_result.is_some(), &bg_pending) => {}
+            () = exit_drain_wake(end.app_finished(), &bg_pending) => {}
             _ = ticker.tick() => {
                 // Deliberately NOT gated on `!paused`. While paused, the tick
                 // draws nothing — the terminal belongs to the interactive
@@ -431,19 +739,96 @@ pub async fn run<A: App + 'static>(
                     // the terminal so `with_options`+`compute_inline_size`
                     // re-queries the cursor and positions the viewport below
                     // the printed output instead of clobbering it.
+                    // The view may have changed shape while paused (an
+                    // approval prompt came or went): rebuild at today's size.
+                    let resumed_rows = view.rows(term_height);
                     if let Ok(new_term) = Terminal::with_options(
                         StderrBackend::new(io::stderr()),
                         TerminalOptions {
-                            viewport: Viewport::Inline(rows),
+                            viewport: Viewport::Inline(resumed_rows),
                         },
                     ) {
                         terminal = new_term;
+                        rows = resumed_rows;
                     }
                     events = Some(EventStream::new());
                     rx = sink.switch_to_buffered();
                     cols = terminal_cols(&terminal);
                     paused = false;
                     resume_pending = false;
+                }
+                // The approval view's flash, and a request that left the
+                // queue: either can close it, so before the check below.
+                view.advance(now_unix_ms());
+                // The view opened or closed its full screen.
+                if view.full_screen() != full.is_some() {
+                    if full.take().is_some() {
+                        // Back on the main screen, as the terminal saved it.
+                        // The full screen's terminal showed the cursor as it
+                        // dropped; the line keeps it hidden.
+                        drop(terminal.hide_cursor());
+                        replay.start(&sink);
+                    } else if !replay.pending() {
+                        // Opened again before the last replay printed: it
+                        // opens once that has, so the mark below starts
+                        // after it.
+                        //
+                        // Every line queued until now is printed before the
+                        // screen goes up; from here on each is dropped as it
+                        // arrives, and the replay brings it back.
+                        let (queued, mark) = sink.replay_mark(&mut rx);
+                        for line in queued.iter().filter(|l| l.seq > replay.through) {
+                            print_log_bytes(&mut terminal, &line.bytes, cols);
+                        }
+                        match FullScreen::enter(mouse) {
+                            Ok(f) => {
+                                full = Some(f);
+                                replay.mark = Some(mark);
+                            }
+                            Err(e) => {
+                                tracing::debug!(error = %e, "full screen unavailable");
+                                view.back_to_main();
+                            }
+                        }
+                    }
+                }
+                spinner_idx = (spinner_idx + 1) % SPINNER_FRAMES.len();
+                let frame = SPINNER_FRAMES.get(spinner_idx).copied().unwrap_or("");
+                if let Some(f) = full.as_mut() {
+                    // heph's lines are not printed under a full screen, nor
+                    // held: the sink numbered and recorded each one as it was
+                    // sent, and the replay reads them back on return.
+                    while rx.try_recv().is_ok() {}
+                    // A resize while the full screen is up re-anchors the
+                    // inline rows once back on the line: `needs_resize`
+                    // stays set. The full-screen terminal sizes itself from
+                    // the ioctl as it draws.
+                    let now = now_unix_ms();
+                    drop(f.terminal.draw(|fr| {
+                        let area = fr.area();
+                        let lines = view.render_full(now, area.width, area.height);
+                        fr.render_widget(Paragraph::new(Text::from(lines)), area);
+                    }));
+                    // Under the held dashboard, once it has been up a while
+                    // (so a test sees it before the panic takes it down).
+                    if debug_panic == Some(DebugPanic::Backend)
+                        && end.held
+                        && end.at.is_some_and(|at| now.saturating_sub(at) >= 500)
+                    {
+                        DebugPanic::Backend.fire();
+                    }
+                    if debug_panic == Some(DebugPanic::Caught) && !caught_fired {
+                        caught_fired = true;
+                        // The handle is dropped: nobody resumes the panic.
+                        drop(tokio::spawn(async { DebugPanic::Caught.fire() }));
+                    }
+                    continue;
+                }
+                // The view changed shape (a prompt came or went): re-anchor
+                // through the same path a resize takes, which tears the event
+                // stream down across the cursor query.
+                if view.rows(term_height) != rows {
+                    needs_resize = true;
                 }
                 if needs_resize {
                     // Re-anchor the inline viewport at the new size before drawing.
@@ -457,10 +842,20 @@ pub async fn run<A: App + 'static>(
                 }
                 // Budgeted: `rx` persists across ticks (only pause/resume ever
                 // replace it), so anything left over after the budget trips just
-                // renders on the next tick — deferred, never dropped.
-                drain_logs_to_terminal(&mut terminal, &mut rx, cols, Some(LOG_DRAIN_TICK_BUDGET));
-                spinner_idx = (spinner_idx + 1) % SPINNER_FRAMES.len();
-                let frame = SPINNER_FRAMES.get(spinner_idx).copied().unwrap_or("");
+                // renders on the next tick — deferred, never dropped. A replay
+                // still running holds live lines back, so they print after it.
+                if replay.ready() {
+                    replay.finish(&mut terminal, cols).await;
+                }
+                if !replay.pending() {
+                    drain_logs_to_terminal(
+                        &mut terminal,
+                        &mut rx,
+                        cols,
+                        Some(LOG_DRAIN_TICK_BUDGET),
+                        replay.through,
+                    );
+                }
                 let lines = view.render(frame, now_unix_ms(), cols, rows);
                 drop(terminal.draw(|f| {
                     let area = f.area();
@@ -479,13 +874,25 @@ pub async fn run<A: App + 'static>(
     // terminal here only to tear it down again cost a cursor query at exit:
     // one terminal round-trip on every `heph r //pkg:target`, up to its
     // 2s timeout on a terminal that never answers.
+    //
+    // Back to the main screen first (a pause already left it), so the
+    // teardown and the summary below land in the scrollback.
+    if let Some(d) = debug_log {
+        d.stop();
+    }
+    if full.take().is_some() {
+        drop(terminal.hide_cursor());
+        replay.start(&sink);
+    }
     if !paused {
+        // What the screen kept off the terminal, before the lines after it.
+        replay.finish(&mut terminal, cols).await;
         // Flush any still-buffered build-event logs into the terminal scrollback
         // *above* the viewport. This must stay on the terminal path (`insert_before`):
         // it wraps to the viewport width and skips blank lines. The post-teardown
         // `drain_logs_to_stderr` fallback writes raw bytes, so letting empties fall
         // through to it dumps stray newlines after the box.
-        drain_logs_to_terminal(&mut terminal, &mut rx, cols, None);
+        drain_logs_to_terminal(&mut terminal, &mut rx, cols, None, replay.through);
         // Collapse the viewport to its origin so the final summary (printed below)
         // lands where the box started, not below it.
         collapse_inline_viewport(&mut terminal);
@@ -498,7 +905,7 @@ pub async fn run<A: App + 'static>(
     }
     hcore::shutdown::clear_terminal_restore();
     sink.switch_to_direct();
-    drain_logs_to_stderr(&mut rx);
+    drain_logs_to_stderr(&mut rx, replay.through);
 
     // The app completing breaks the loop, but build events emitted just before
     // it returned may still be buffered (the sender closes only once the
@@ -510,10 +917,13 @@ pub async fn run<A: App + 'static>(
 
     // Persistent final summary, printed straight to stderr below the
     // torn-down inline viewport (interactive mode only). Measured at the
-    // instant a held viewport froze at, else now; recorded as `Finished` so a
-    // viewer prints the same line, and so it knows what follows was printed
-    // below it.
-    let at = held_at.unwrap_or_else(now_unix_ms);
+    // instant the app ended, the clock the screens froze at; recorded as
+    // `Finished` so a viewer prints the same line, and so it knows what
+    // follows was printed below it.
+    let at = end.at.unwrap_or_else(now_unix_ms);
+    if end.stopped {
+        view.set_stopped();
+    }
     view.set_finished(at);
     if let Some(t) = view_tap.as_mut() {
         t.finished(&view, at);
@@ -523,17 +933,60 @@ pub async fn run<A: App + 'static>(
     result
 }
 
-/// Capture stderr's pre-raw-mode `termios` and register a restore closure
-/// with `hcore::shutdown` before raw mode mutates it. The closure is the
-/// only thing that still runs if the run ends via `bootstrap`'s hard abort
-/// on the second Ctrl-C (`std::process::exit`, which skips destructors) — it
-/// restores cooked mode and re-shows the cursor with direct syscalls only,
-/// never crossterm: the abort path must not risk contending crossterm's own
-/// raw-mode mutex, which a concurrently-aborting thread could already hold.
-///
-/// A failed `tcgetattr` (stderr is not a tty — output redirected) records
-/// nothing, so a non-interactive run's hard abort stays a no-op: no stray
-/// escape bytes land in redirected output.
+/// What a captured mouse event means to a full screen: a left press or a
+/// wheel step. Releases (mode 1000 reports them), other buttons and
+/// modified presses mean nothing.
+fn mouse_input(m: MouseEvent) -> Option<MouseInput> {
+    let (col, row) = (m.column, m.row);
+    match m.kind {
+        MouseEventKind::Down(MouseButton::Left) if m.modifiers.is_empty() => {
+            Some(MouseInput::Click { col, row })
+        }
+        MouseEventKind::ScrollUp => Some(MouseInput::Wheel {
+            col,
+            row,
+            down: false,
+        }),
+        MouseEventKind::ScrollDown => Some(MouseInput::Wheel {
+            col,
+            row,
+            down: true,
+        }),
+        _ => None,
+    }
+}
+
+/// The decision `key` asks for: `y`/`n`/`Y`/`N` pressed (without ctrl)
+/// while the approval view is up. Anywhere else no key decides, so `n`
+/// stays a log search's next match.
+pub(crate) fn decision_key(key: &KeyEvent, in_approval_view: bool) -> Option<Decide> {
+    if !in_approval_view
+        || key.kind != KeyEventKind::Press
+        || key.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char(c) => Decide::of(c),
+        _ => None,
+    }
+}
+
+/// The full-screen key `code` stands for, if any.
+pub(crate) fn screen_key(code: KeyCode) -> Option<ScreenKey> {
+    Some(match code {
+        KeyCode::Char('f') => ScreenKey::Follow,
+        KeyCode::Char('g') | KeyCode::Home => ScreenKey::Top,
+        KeyCode::Char('G') | KeyCode::End => ScreenKey::Bottom,
+        KeyCode::Char('w') => ScreenKey::Wrap,
+        KeyCode::Char('n') => ScreenKey::Next,
+        KeyCode::Char('N') => ScreenKey::Prev,
+        KeyCode::PageUp => ScreenKey::PageUp,
+        KeyCode::PageDown => ScreenKey::PageDown,
+        _ => return None,
+    })
+}
+
 /// Whether background work no longer holds the exit: the loop's break
 /// predicate once the app has finished.
 fn bg_drained(bg_pending: &hcore::pending::Pending) -> bool {
@@ -553,6 +1006,96 @@ async fn exit_drain_wake(app_done: bool, bg_pending: &hcore::pending::Pending) {
     }
 }
 
+/// The run's end, as the loop sees it: the app's result once its future
+/// resolved, and whether the finished run is held on screen.
+struct RunEnd<R> {
+    /// The app's result, from the moment its future resolved until the
+    /// loop leaves with it.
+    result: Option<R>,
+    /// When the app's future resolved: the instant the run ended.
+    at: Option<u64>,
+    /// A stop (a ctrl-c that stopped, or a signal: INT, TERM, HUP) had
+    /// reached the run when the app ended: the final line says "stopped".
+    /// Read at that instant, so the ctrl-c that quits a held, finished run
+    /// is not one.
+    stopped: bool,
+    /// Latched once the finished run is held open on a full screen: the
+    /// viewport keeps rendering until the user quits explicitly.
+    held: bool,
+    /// Set by `q` / Ctrl-C to break out of a held viewport.
+    quit: bool,
+}
+
+impl<R> RunEnd<R> {
+    fn new() -> Self {
+        Self {
+            result: None,
+            at: None,
+            stopped: false,
+            held: false,
+            quit: false,
+        }
+    }
+
+    /// The app's future resolved at `at` with `result`: the run is over,
+    /// whatever background work (sandbox removal, cache uploads) is still
+    /// draining. The view says so now: the dashboard's title takes the
+    /// verdict and every clock on screen stops at `at`, rather than counting
+    /// on, verdict-less, until the drain lets the loop leave.
+    fn app_done(&mut self, result: R, at: u64, stopped: bool, view: &mut impl TUIAppView) {
+        if stopped {
+            view.set_stopped();
+        }
+        view.set_finished(at);
+        self.result = Some(result);
+        self.at = Some(at);
+        self.stopped = stopped;
+    }
+
+    /// Whether the app has finished: its result is in hand.
+    fn app_finished(&self) -> bool {
+        self.result.is_some()
+    }
+
+    /// Whether the finished run is, or will be once background work
+    /// drains, held on screen: `q` then leaves from whichever screen is up.
+    fn holds(&self, view: &impl TUIAppView) -> bool {
+        self.held || (self.app_finished() && view.hold_after_finish())
+    }
+
+    /// The app's result once the loop is to leave with it: background work
+    /// drained (`drained`), and the run not held on screen. A run ended on
+    /// a full screen is held until an explicit quit, a stop under way
+    /// (`stopping`), or the user closing the dashboard back to the line.
+    fn exit(&mut self, drained: bool, stopping: bool, view: &impl TUIAppView) -> Option<R> {
+        if !drained || self.result.is_none() {
+            return None;
+        }
+        if self.held {
+            if self.quit || stopping || !view.hold_after_finish() {
+                return self.result.take();
+            }
+            return None;
+        }
+        if view.hold_after_finish() && !stopping && !self.quit {
+            self.held = true;
+            return None;
+        }
+        self.result.take()
+    }
+}
+
+/// Capture stderr's pre-raw-mode `termios` and register a restore closure
+/// with `hcore::shutdown` before raw mode mutates it. The closure is the
+/// only thing that still runs if the run ends via `bootstrap`'s hard abort
+/// on the second Ctrl-C (`std::process::exit`, which skips destructors) — it
+/// restores cooked mode and re-shows the cursor with direct syscalls only,
+/// never crossterm: the abort path must not risk contending crossterm's own
+/// raw-mode mutex, which a concurrently-aborting thread could already hold.
+///
+/// A failed `tcgetattr` (stderr is not a tty — output redirected) records
+/// nothing, so a non-interactive run's hard abort stays a no-op: no stray
+/// escape bytes land in redirected output.
 fn record_raw_mode_restore() {
     let fd = io::stderr().as_raw_fd();
     let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
@@ -566,6 +1109,34 @@ fn record_raw_mode_restore() {
     // SAFETY: `tcgetattr` returned success above, so `termios` is initialized.
     let termios = unsafe { termios.assume_init() };
     hcore::shutdown::set_terminal_restore(move || {
+        // Nothing else reaches the terminal from here to `process::exit`:
+        // the render loop keeps drawing on its own thread until then, and a
+        // frame flushed after the bytes below hides the cursor again (and
+        // can draw the dashboard over the main screen). Every frame goes
+        // through `io::Stderr`, so holding its lock, never released, stops
+        // them; a frame being written finishes first. The writes below are
+        // `libc::write`s, which do not take it. (A task, not a signal
+        // handler: allocating here is fine.)
+        let _held: &'static mut io::StderrLock<'static> = Box::leak(Box::new(io::stderr().lock()));
+        // The dashboard's mouse capture and alternate screen first:
+        // `process::exit` runs no destructor, so [`FullScreen`]'s drop never
+        // will. A capture left on would turn every click in the user's
+        // shell into escape codes; leaving the screen puts the main screen
+        // and its scrollback back before the notice below.
+        if MOUSE_UP.load(Ordering::Acquire) {
+            // SAFETY: as for the notice below — a valid pointer for exactly
+            // its own length, and a short write is ignored.
+            unsafe {
+                libc::write(fd, MOUSE_OFF.as_ptr().cast(), MOUSE_OFF.len());
+            }
+        }
+        if ALT_SCREEN_UP.load(Ordering::Acquire) {
+            // SAFETY: as for the notice below — a valid pointer for exactly
+            // its own length, and a short write is ignored.
+            unsafe {
+                libc::write(fd, LEAVE_ALT_SCREEN.as_ptr().cast(), LEAVE_ALT_SCREEN.len());
+            }
+        }
         // SAFETY: `fd` was a valid, open tty when captured above; `tcsetattr`
         // on an already-closed fd fails harmlessly (EBADF), not UB.
         unsafe {
@@ -703,34 +1274,45 @@ fn collapse_inline_viewport<B: Backend>(terminal: &mut Terminal<B>) {
 /// The budget is checked between messages, never mid-message: a message already
 /// taken off the channel is always rendered in full, so a call never abandons
 /// partially-processed data.
+///
+/// A line numbered at most `through` is dropped: a replay printed it already.
 fn drain_logs_to_terminal<B: Backend>(
     terminal: &mut Terminal<B>,
     rx: &mut mpsc::UnboundedReceiver<SinkLine>,
     cols: u16,
     budget: Option<Duration>,
+    through: u64,
 ) {
-    let cols = cols.max(1);
     let deadline = budget.map(|d| Instant::now() + d);
-    while let Ok(SinkLine { bytes, .. }) = rx.try_recv() {
-        let text = bytes
-            .into_text()
-            .unwrap_or_else(|_| Text::raw(String::from_utf8_lossy(&bytes).into_owned()));
-        for line in text.lines {
-            let width = u16::try_from(line.width()).unwrap_or(u16::MAX);
-            if width == 0 {
-                continue;
-            }
-            let rows = rows_needed(width, cols);
-            drop(terminal.insert_before(rows, move |buf: &mut Buffer| {
-                let area = buf.area;
-                Paragraph::new(line)
-                    .wrap(Wrap { trim: false })
-                    .render(area, buf);
-            }));
+    while let Ok(SinkLine { seq, bytes }) = rx.try_recv() {
+        if seq > through {
+            print_log_bytes(terminal, &bytes, cols);
         }
         if deadline.is_some_and(|d| Instant::now() >= d) {
             break;
         }
+    }
+}
+
+/// One of heph's lines into the scrollback above the inline viewport,
+/// wrapped to `cols`; blank lines are skipped.
+fn print_log_bytes<B: Backend>(terminal: &mut Terminal<B>, bytes: &[u8], cols: u16) {
+    let cols = cols.max(1);
+    let text = bytes
+        .into_text()
+        .unwrap_or_else(|_| Text::raw(String::from_utf8_lossy(bytes).into_owned()));
+    for line in text.lines {
+        let width = u16::try_from(line.width()).unwrap_or(u16::MAX);
+        if width == 0 {
+            continue;
+        }
+        let rows = rows_needed(width, cols);
+        drop(terminal.insert_before(rows, move |buf: &mut Buffer| {
+            let area = buf.area;
+            Paragraph::new(line)
+                .wrap(Wrap { trim: false })
+                .render(area, buf);
+        }));
     }
 }
 
@@ -743,10 +1325,13 @@ fn rows_needed(width: u16, cols: u16) -> u16 {
     u16::try_from(rows).unwrap_or(u16::MAX).max(1)
 }
 
-fn drain_logs_to_stderr(rx: &mut mpsc::UnboundedReceiver<SinkLine>) {
+/// Like [`drain_logs_to_terminal`], raw onto stderr.
+fn drain_logs_to_stderr(rx: &mut mpsc::UnboundedReceiver<SinkLine>, through: u64) {
     let mut stderr = io::stderr().lock();
-    while let Ok(SinkLine { bytes, .. }) = rx.try_recv() {
-        drop(stderr.write_all(&bytes));
+    while let Ok(SinkLine { seq, bytes }) = rx.try_recv() {
+        if seq > through {
+            drop(stderr.write_all(&bytes));
+        }
     }
 }
 
@@ -762,14 +1347,73 @@ fn drain_logs_to_stderr(rx: &mut mpsc::UnboundedReceiver<SinkLine>) {
 fn flip_sink_to_direct_draining_the_gap(
     sink: &LogSink,
     rx: &mut mpsc::UnboundedReceiver<SinkLine>,
+    through: u64,
 ) {
     sink.switch_to_direct();
-    drain_logs_to_stderr(rx);
+    drain_logs_to_stderr(rx, through);
+}
+
+/// heph's lines a full screen kept off the terminal, printed again when it
+/// closes (I3). While a screen is up the backend holds only `mark`, never a
+/// line's text; the lines come back from the session's `events.ndjson`.
+#[derive(Default)]
+struct Replay {
+    /// Where the full screen that is up took the terminal over.
+    mark: Option<ReplayMark>,
+    /// The replay of the screen last closed, running off the render task:
+    /// it waits for the recorder's flush and reads the file.
+    running: Option<tokio::task::JoinHandle<(Vec<Vec<u8>>, Replayed)>>,
+    /// The last line a replay printed. A live line numbered at most this
+    /// was printed by it, and is dropped.
+    through: u64,
+}
+
+impl Replay {
+    /// The screen closed: replay what it kept off the terminal.
+    fn start(&mut self, sink: &LogSink) {
+        if let Some(mark) = self.mark.take() {
+            let sink = sink.clone();
+            self.running = Some(tokio::task::spawn_blocking(move || {
+                let mut lines = Vec::new();
+                let replayed = sink.replay(mark, REPLAY_FLUSH_TIMEOUT, |bytes| {
+                    lines.push(bytes.to_vec())
+                });
+                (lines, replayed)
+            }));
+        }
+    }
+
+    /// A replay is still running: live lines wait behind it, and no screen
+    /// opens until it is done.
+    fn pending(&self) -> bool {
+        self.running.is_some()
+    }
+
+    fn ready(&self) -> bool {
+        self.running.as_ref().is_some_and(|h| h.is_finished())
+    }
+
+    /// Wait for the running replay, if any, and print its lines.
+    async fn finish<B: Backend>(&mut self, terminal: &mut Terminal<B>, cols: u16) {
+        let Some(handle) = self.running.take() else {
+            return;
+        };
+        match handle.await {
+            Ok((lines, replayed)) => {
+                for bytes in &lines {
+                    print_log_bytes(terminal, bytes, cols);
+                }
+                self.through = self.through.max(replayed.through);
+            }
+            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+            Err(e) => tracing::debug!(error = %e, "log replay task"),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{IntoText, TICK, bg_drained, exit_drain_wake, rows_needed};
+    use super::{IntoText, RunEnd, TICK, bg_drained, exit_drain_wake, rows_needed};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -1173,6 +1817,56 @@ mod tests {
         );
     }
 
+    /// The run ends when the app does, not when its background work (sandbox
+    /// removal, cache uploads) has drained: from that instant the dashboard's
+    /// title carries the verdict and every clock on screen stops, the line's
+    /// included. Regression: both waited for the drain, so a run whose
+    /// targets were all done kept counting, verdict-less, for as long as its
+    /// sandboxes took to remove.
+    #[test]
+    fn the_run_ends_on_screen_when_the_app_does_not_when_background_work_drains() {
+        use crate::tui::app::TUIAppView;
+        use crate::tui::progress::TuiProgressView;
+        use crate::tui::progress::test_events::{T0, at, end, exec, start};
+
+        for (error, verdict) in [(None, "✓ done"), (Some("exit 3"), "✗ 1 failed")] {
+            let mut view = TuiProgressView::new("Running //p:t");
+            view.apply(&at(0, start("//p:t")));
+            view.apply(&at(0, exec("//p:t")));
+            view.apply(&at(2_000, end("//p:t", error, None)));
+            view.open_dashboard();
+            let title =
+                |v: &mut TuiProgressView, now: u64| v.render_full(now, 100, 14)[0].to_string();
+            let line = |v: &TuiProgressView, now: u64| v.render("⠋", now, 100, 1)[0].to_string();
+
+            let mut run = RunEnd::new();
+            run.app_done((), T0 + 2_000, false, &mut view);
+            // Background work outstanding: the loop stays up.
+            assert_eq!(run.exit(false, false, &view), None);
+            let shown = title(&mut view, T0 + 7_000);
+            assert!(shown.contains(verdict), "no {verdict:?} in {shown:?}");
+            assert!(shown.contains(" 2s "), "clock not frozen at 2s: {shown:?}");
+            assert_eq!(
+                title(&mut view, T0 + 60_000),
+                shown,
+                "the clock kept counting"
+            );
+            assert_eq!(
+                line(&view, T0 + 7_000),
+                line(&view, T0 + 60_000),
+                "the line's clock kept counting"
+            );
+            // `q` leaves even before the drain: the run is over.
+            assert!(run.holds(&view));
+
+            // Drained: held on the dashboard, as it was, until `q`.
+            assert_eq!(run.exit(true, false, &view), None);
+            assert_eq!(title(&mut view, T0 + 90_000), shown);
+            run.quit = true;
+            assert_eq!(run.exit(true, false, &view), Some(()));
+        }
+    }
+
     /// Regression: resizing the terminal broke inline-viewport rendering. The
     /// `Event::Resize` arm only updated the local width; the viewport itself was
     /// never re-anchored in a window where the DSR cursor query could run safely,
@@ -1188,8 +1882,6 @@ mod tests {
     #[test]
     fn resize_reanchors_inline_viewport_and_reflows() {
         use super::reanchor_terminal;
-        use crate::tui::app::TUIAppView;
-        use crate::tui::progress::{MIN_PROGRESS_ROWS, TuiProgressView};
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
         use ratatui::buffer::Buffer;
@@ -1205,9 +1897,9 @@ mod tests {
                 .collect()
         }
 
-        fn draw_view(terminal: &mut Terminal<TestBackend>, view: &TuiProgressView) {
+        fn draw_view(terminal: &mut Terminal<TestBackend>) {
             let cols = terminal.size().expect("size").width;
-            let lines = view.render("⠋", 10_000, cols, MIN_PROGRESS_ROWS);
+            let lines = box_lines(cols, MIN_ROWS);
             terminal
                 .draw(|f| {
                     f.render_widget(Paragraph::new(Text::from(lines)), f.area());
@@ -1218,13 +1910,12 @@ mod tests {
         let mut terminal = Terminal::with_options(
             TestBackend::new(80, 24),
             TerminalOptions {
-                viewport: Viewport::Inline(MIN_PROGRESS_ROWS),
+                viewport: Viewport::Inline(MIN_ROWS),
             },
         )
         .expect("terminal");
 
-        let view = TuiProgressView::new("Running //a:b");
-        draw_view(&mut terminal, &view);
+        draw_view(&mut terminal);
 
         // Shrink the terminal, then re-anchor (the load-bearing call the fix runs
         // inside the EventStream-down window).
@@ -1232,7 +1923,7 @@ mod tests {
         // header that overflows has no closing corner to look for.
         terminal.backend_mut().resize(56, 24);
         reanchor_terminal(&mut terminal);
-        draw_view(&mut terminal, &view);
+        draw_view(&mut terminal);
 
         let buf = terminal.backend().buffer();
         // Buffers re-anchored to the new width, not stale 80.
@@ -1263,6 +1954,37 @@ mod tests {
         );
     }
 
+    /// The fewest rows [`box_lines`] draws a box in: top, one body row, bottom,
+    /// and a row under it.
+    const MIN_ROWS: u16 = 4;
+
+    /// A view's rows for a terminal height, for the re-anchor tests: a third of
+    /// the terminal, at least [`MIN_ROWS`], so 24 and 60 rows differ.
+    fn rows_for_height(term_height: u16) -> u16 {
+        (term_height / 3).max(MIN_ROWS)
+    }
+
+    /// A `cols` × `rows` box: `╭─…─╮`, `│ … │` rows, `╰─…─╯`. A stand-in for an
+    /// inline view taller than one row, every row of it painted, its right
+    /// edge on the last column.
+    fn box_lines(cols: u16, rows: u16) -> Vec<ratatui::text::Line<'static>> {
+        let inner = usize::from(cols.saturating_sub(2));
+        let edge = |l: char, fill: char, r: char| {
+            let mut s = String::with_capacity((inner + 2) * 3);
+            s.push(l);
+            s.extend(std::iter::repeat_n(fill, inner));
+            s.push(r);
+            ratatui::text::Line::from(s)
+        };
+        (0..rows)
+            .map(|i| match i {
+                0 => edge('╭', '─', '╮'),
+                i if i + 1 == rows => edge('╰', '─', '╯'),
+                _ => edge('│', ' ', '│'),
+            })
+            .collect()
+    }
+
     /// Rows carrying at least one non-blank cell. The box is the only thing ever
     /// drawn in these tests, so this is "where the box is" — and, more usefully,
     /// "where anything the box left behind is".
@@ -1282,8 +2004,6 @@ mod tests {
         origin_row: u16,
         rows: u16,
     ) -> ratatui::Terminal<ratatui::backend::TestBackend> {
-        use crate::tui::app::TUIAppView;
-        use crate::tui::progress::TuiProgressView;
         use ratatui::backend::{Backend, TestBackend};
         use ratatui::layout::Position;
         use ratatui::text::Text;
@@ -1304,8 +2024,7 @@ mod tests {
         )
         .expect("terminal");
 
-        let view = TuiProgressView::new("Running //a:b");
-        let lines = view.render("⠋", 10_000, width, rows);
+        let lines = box_lines(width, rows);
         terminal
             .draw(|f| f.render_widget(Paragraph::new(Text::from(lines)), f.area()))
             .expect("draw");
@@ -1329,8 +2048,6 @@ mod tests {
     #[test]
     fn resize_rebuild_anchors_at_the_old_origin_not_the_live_cursor() {
         use super::reanchor_inline;
-        use crate::tui::app::TUIAppView;
-        use crate::tui::progress::{TuiProgressView, rows_for_height};
         use ratatui::Terminal;
         use ratatui::backend::{Backend, TestBackend};
         use ratatui::layout::Position;
@@ -1398,8 +2115,7 @@ mod tests {
              live cursor walks it down the screen instead"
         );
 
-        let view = TuiProgressView::new("Running //a:b");
-        let lines = view.render("⠋", 10_000, WIDTH, rows);
+        let lines = box_lines(WIDTH, rows);
         terminal
             .draw(|f| f.render_widget(Paragraph::new(Text::from(lines)), f.area()))
             .expect("redraw");
@@ -1416,8 +2132,6 @@ mod tests {
     #[test]
     fn width_only_resize_reflows_without_rebuilding() {
         use super::reanchor_inline;
-        use crate::tui::app::TUIAppView;
-        use crate::tui::progress::{TuiProgressView, rows_for_height};
         use ratatui::backend::Backend;
         use ratatui::text::Text;
         use ratatui::widgets::Paragraph;
@@ -1441,8 +2155,7 @@ mod tests {
         assert_eq!(rebuilds, 0, "no row-count change, no rebuild");
         assert_eq!(rows, start_rows);
 
-        let view = TuiProgressView::new("Running //a:b");
-        let lines = view.render("⠋", 10_000, 50, rows);
+        let lines = box_lines(50, rows);
         terminal
             .draw(|f| f.render_widget(Paragraph::new(Text::from(lines)), f.area()))
             .expect("redraw");
@@ -1460,8 +2173,6 @@ mod tests {
     #[test]
     fn failed_rebuild_keeps_the_old_terminal_usable() {
         use super::reanchor_inline;
-        use crate::tui::app::TUIAppView;
-        use crate::tui::progress::{TuiProgressView, rows_for_height};
         use ratatui::backend::Backend;
         use ratatui::text::Text;
         use ratatui::widgets::Paragraph;
@@ -1487,8 +2198,7 @@ mod tests {
             "a failed rebuild leaves the viewport where the collapse parked it"
         );
 
-        let view = TuiProgressView::new("Running //a:b");
-        let lines = view.render("⠋", 10_000, WIDTH, rows);
+        let lines = box_lines(WIDTH, rows);
         terminal
             .draw(|f| f.render_widget(Paragraph::new(Text::from(lines)), f.area()))
             .expect("redraw");
@@ -1559,7 +2269,7 @@ mod tests {
         // fully rendered (`terminal.insert_before`, never instantaneous), so the
         // very first check is guaranteed to trip: this deterministically drains
         // exactly one message and stops, on any of the three supported targets.
-        drain_logs_to_terminal(&mut terminal, &mut rx, 80, Some(Duration::ZERO));
+        drain_logs_to_terminal(&mut terminal, &mut rx, 80, Some(Duration::ZERO), 0);
 
         let mut remaining = Vec::new();
         while let Ok(line) = rx.try_recv() {
@@ -1609,7 +2319,7 @@ mod tests {
         // each — plus one extra call to prove the channel is empty afterward,
         // not just down to one leftover message.
         for _ in 0..messages.len() {
-            drain_logs_to_terminal(&mut terminal, &mut rx, 80, Some(Duration::ZERO));
+            drain_logs_to_terminal(&mut terminal, &mut rx, 80, Some(Duration::ZERO), 0);
         }
 
         assert!(
@@ -1669,7 +2379,7 @@ mod tests {
         // Steady-state log line, drained the way the pause handler drains before
         // collapsing the viewport.
         writer.write_all(b"before pause\n").expect("write");
-        drain_logs_to_terminal(&mut terminal, &mut rx, 80, None);
+        drain_logs_to_terminal(&mut terminal, &mut rx, 80, None, 0);
         assert!(
             rx.try_recv().is_err(),
             "precondition: the steady-state drain leaves nothing behind"
@@ -1681,7 +2391,7 @@ mod tests {
         writer.write_all(b"during the gap\n").expect("write");
 
         // The fix under test: the real function `run`'s pause arm calls.
-        flip_sink_to_direct_draining_the_gap(&sink, &mut rx);
+        flip_sink_to_direct_draining_the_gap(&sink, &mut rx, 0);
 
         assert!(
             rx.try_recv().is_err(),

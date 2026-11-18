@@ -7,8 +7,8 @@
 //!
 //! - **Only this workspace.** Sessions are per user, across checkouts: a
 //!   session counts only when its `meta.json` names the reader's own home,
-//!   exactly, and lists [`CAPABILITY_RUN_LOGS`]. A build of the same address
-//!   in another checkout never answers.
+//!   exactly. A build of the same address in another checkout never
+//!   answers.
 //! - **Only a live session.** A record is trusted only while the session's
 //!   lock is held (probed before anything is read, as `list` does): a
 //!   crashed or ended heph's records read as absent.
@@ -38,7 +38,7 @@ use anyhow::Context as _;
 use hcore::events::BuildEventKind;
 use hcore::session_record::{LiveRunLogLocator, LocatedRunLog};
 
-use super::format::{CAPABILITY_RUN_LOGS, RunLogRecord, SessionMeta, SessionRecordKind, files};
+use super::format::{RunLogRecord, SessionMeta, SessionRecordKind, files};
 use super::{RecordReader, SessionId, SessionRoot, lockfile};
 
 /// What a live session says about an addr's newest run log.
@@ -92,17 +92,12 @@ pub enum RunLogLookup {
     /// The newest trusted record of the addr, and its session.
     Found(FoundRunLog),
     /// The addr is running in `session`, which records run logs, and has
-    /// written nothing yet. Answered over an older [`Self::Found`], and
-    /// always over [`Self::Unsupported`].
+    /// written nothing yet. Answered over an older [`Self::Found`].
     Started {
         session: SessionId,
         /// When its `ExecuteStart` was recorded.
         at_unix_ms: u64,
     },
-    /// No session recorded a log of the addr or is running it, but a live
-    /// session of this workspace runs a heph that records no live logs: it
-    /// may be running the addr unseen. The newest such session is named.
-    Unsupported { session: SessionId },
     /// Nothing: no live session of this workspace, or none that recorded
     /// the addr.
     None,
@@ -122,16 +117,12 @@ pub fn find_run_log(
 ) -> anyhow::Result<Option<FoundRunLog>> {
     Ok(match lookup_run_log(root, home, addr)? {
         RunLogLookup::Found(found) => Some(found),
-        RunLogLookup::Started { .. } | RunLogLookup::Unsupported { .. } | RunLogLookup::None => {
-            None
-        }
+        RunLogLookup::Started { .. } | RunLogLookup::None => None,
     })
 }
 
-/// [`find_run_log`], also saying when nothing was found but a live session
-/// of `home` cannot record run logs ([`RunLogLookup::Unsupported`]). The
-/// trust rules are the same: such a session counts only while its lock is
-/// held and its `meta.json` names `home`.
+/// [`find_run_log`], also saying when the addr is running and has written
+/// nothing yet ([`RunLogLookup::Started`]). The trust rules are the same.
 pub fn lookup_run_log(root: &SessionRoot, home: &Path, addr: &str) -> anyhow::Result<RunLogLookup> {
     let root = root.path();
     let entries = match std::fs::read_dir(root) {
@@ -141,7 +132,6 @@ pub fn lookup_run_log(root: &SessionRoot, home: &Path, addr: &str) -> anyhow::Re
     };
     let mut newest: Option<FoundRunLog> = None;
     let mut started: Option<(u64, SessionId)> = None;
-    let mut unsupported: Option<SessionId> = None;
     for entry in entries.filter_map(Result::ok) {
         let Some(id) = entry
             .file_name()
@@ -152,12 +142,6 @@ pub fn lookup_run_log(root: &SessionRoot, home: &Path, addr: &str) -> anyhow::Re
         };
         let log = match session_lookup(&entry.path(), home, addr) {
             Ok(SessionLookup::Log(log)) => log,
-            Ok(SessionLookup::NoRunLogs) => {
-                if unsupported.is_none_or(|u| id.encode() > u.encode()) {
-                    unsupported = Some(id);
-                }
-                continue;
-            }
             Ok(SessionLookup::Started(at)) => {
                 if started.is_none_or(|(t, s)| (at, id.encode()) > (t, s.encode())) {
                     started = Some((at, id));
@@ -177,10 +161,10 @@ pub fn lookup_run_log(root: &SessionRoot, home: &Path, addr: &str) -> anyhow::Re
             newest = Some(FoundRunLog { session: id, log });
         }
     }
-    Ok(match (newest, started, unsupported) {
+    Ok(match (newest, started) {
         // A run that started after the newest record is going on, with
         // nothing written yet.
-        (found, Some((at_unix_ms, session)), _)
+        (found, Some((at_unix_ms, session)))
             if found
                 .as_ref()
                 .is_none_or(|f| at_unix_ms > f.log.at_unix_ms()) =>
@@ -190,9 +174,8 @@ pub fn lookup_run_log(root: &SessionRoot, home: &Path, addr: &str) -> anyhow::Re
                 at_unix_ms,
             }
         }
-        (Some(found), _, _) => RunLogLookup::Found(found),
-        (None, _, Some(session)) => RunLogLookup::Unsupported { session },
-        (None, _, None) => RunLogLookup::None,
+        (Some(found), _) => RunLogLookup::Found(found),
+        (None, _) => RunLogLookup::None,
     })
 }
 
@@ -201,13 +184,11 @@ enum SessionLookup {
     Log(SessionRunLog),
     /// Running here since the `ExecuteStart` at this time, nothing written.
     Started(u64),
-    /// Live, of this home, from a heph that records no run logs.
-    NoRunLogs,
     Nothing,
 }
 
 /// What the session in `dir` says about `addr`'s newest run log, when it is
-/// live, was recorded for `home` and records run logs. See the module docs
+/// live and was recorded for `home`. See the module docs
 /// for every rule; `None` is "this session has no trusted log of `addr`".
 pub fn session_run_log(
     dir: &Path,
@@ -216,7 +197,7 @@ pub fn session_run_log(
 ) -> anyhow::Result<Option<SessionRunLog>> {
     Ok(match session_lookup(dir, home, addr)? {
         SessionLookup::Log(log) => Some(log),
-        SessionLookup::Started(_) | SessionLookup::NoRunLogs | SessionLookup::Nothing => None,
+        SessionLookup::Started(_) | SessionLookup::Nothing => None,
     })
 }
 
@@ -237,9 +218,6 @@ fn session_lookup(dir: &Path, home: &Path, addr: &str) -> anyhow::Result<Session
     };
     if meta.home_dir.as_deref().map(Path::new) != Some(home) {
         return Ok(SessionLookup::Nothing);
-    }
-    if !meta.has_capability(CAPABILITY_RUN_LOGS) {
-        return Ok(SessionLookup::NoRunLogs);
     }
     let events = match File::open(dir.join(files::EVENTS)) {
         Ok(f) => f,
@@ -323,11 +301,6 @@ impl LiveRunLogLocator for SessionRunLogLocator {
                     session: session.encode(),
                 }));
             }
-            RunLogLookup::Unsupported { session } => {
-                return Ok(Some(LocatedRunLog::Unsupported {
-                    session: session.encode(),
-                }));
-            }
             RunLogLookup::None => return Ok(None),
         };
         let session = found.session.encode();
@@ -349,6 +322,94 @@ impl LiveRunLogLocator for SessionRunLogLocator {
                 session,
             },
         }))
+    }
+}
+
+/// The log API's [`LiveRunLogLocator`] for `heph session attach`: the one
+/// session it follows, answered from the `RunLog` records its stream already
+/// carried ([`SessionFeed::run_log`]) instead of rescanning `events.ndjson`,
+/// so the LAST LINE column can ask for every visible row each batch.
+///
+/// The rules are this module's, applied to that one session: only for the
+/// home its `meta.json` names, only a live session, the newest record wins,
+/// an `ExecuteEnd` after it or a file gone means ended, and `file` is opened
+/// as [`find_run_log`] opens it.
+///
+/// "Live" is the lock probe the viewer made before it read the session
+/// (`SessionEntry::live`), taken once: a session live then is followed until
+/// it ends, and the viewer ends with it. One that was already over (crashed,
+/// or ended) answers nothing, as [`lookup_run_log`] would: its replayed
+/// records may name a file a crashed heph left behind, and that file is no
+/// run's live log.
+///
+/// [`SessionFeed::run_log`]: super::SessionFeed::run_log
+#[derive(Debug, Clone)]
+pub struct FeedRunLogLocator {
+    feed: super::SessionFeed,
+    id: SessionId,
+    /// The session's home, from its `meta.json`.
+    home: PathBuf,
+    /// Its lock was held when the viewer probed it, before reading it.
+    live: bool,
+}
+
+impl FeedRunLogLocator {
+    pub fn new(
+        feed: super::SessionFeed,
+        id: SessionId,
+        meta: &SessionMeta,
+        live: bool,
+    ) -> Option<Self> {
+        Some(Self {
+            feed,
+            id,
+            home: PathBuf::from(meta.home_dir.as_deref()?),
+            live,
+        })
+    }
+}
+
+impl LiveRunLogLocator for FeedRunLogLocator {
+    fn locate(&self, home: &Path, addr: &str) -> anyhow::Result<Option<LocatedRunLog>> {
+        if !self.live || home != self.home {
+            return Ok(None);
+        }
+        let session = self.id.encode();
+        // A record not ended is the run going on, whichever of its record
+        // and its start came first; a start with no record after it, or
+        // after an ended one, has written nothing yet.
+        let run = self.feed.run_log(addr);
+        if run.as_ref().is_none_or(|r| r.ended)
+            && let Some(at_unix_ms) = self.feed.started_at(addr)
+        {
+            return Ok(Some(LocatedRunLog::Started {
+                at_unix_ms,
+                session,
+            }));
+        }
+        let Some(run) = run else {
+            return Ok(None);
+        };
+        let ended = LocatedRunLog::Ended {
+            record: run.record.clone(),
+            at_unix_ms: run.at_unix_ms,
+            session: session.clone(),
+        };
+        if run.ended {
+            return Ok(Some(ended));
+        }
+        Ok(
+            match open_live(home, &run.record).context("opening a live run log")? {
+                Opened::File(_, file) => Some(LocatedRunLog::Live {
+                    record: run.record,
+                    at_unix_ms: run.at_unix_ms,
+                    session,
+                    file,
+                }),
+                Opened::Gone => Some(ended),
+                Opened::Refused => None,
+            },
+        )
     }
 }
 
@@ -415,20 +476,20 @@ mod tests {
     const ADDR: &str = "//p:t";
 
     /// A session directory as a recording heph leaves it: `meta.json` for
-    /// `home` with `caps`, `events.ndjson` holding `records`, and its lock,
-    /// held while the returned file is.
-    fn session(
-        root: &Path,
-        n: u8,
-        home: &Path,
-        caps: &[&str],
-        records: &[SessionRecord],
-    ) -> (PathBuf, File) {
+    /// `home`, `events.ndjson` holding `records`, and its lock, held while
+    /// the returned file is.
+    fn session(root: &Path, n: u8, home: &Path, records: &[SessionRecord]) -> (PathBuf, File) {
         let id = SessionId::new(1_800_000_000_000 + u64::from(n), n);
         let dir = root.join(id.encode());
         std::fs::create_dir_all(&dir).expect("session dir");
         let lock = lockfile::acquire_owner_lock(&dir.join(files::LOCK)).expect("lock");
-        let meta = SessionMeta {
+        recorder::write_atomically(&dir, files::META, &meta(id, home)).expect("meta");
+        append(&dir, records);
+        (dir, lock)
+    }
+
+    fn meta(id: SessionId, home: &Path) -> SessionMeta {
+        SessionMeta {
             format: META_FORMAT,
             id,
             owner_pid: std::process::id(),
@@ -441,11 +502,8 @@ mod tests {
             label: String::new(),
             header: super::super::HeaderKind::Build,
             interactive: false,
-            capabilities: caps.iter().map(|&c| c.to_owned()).collect(),
-        };
-        recorder::write_atomically(&dir, files::META, &meta).expect("meta");
-        append(&dir, records);
-        (dir, lock)
+            capabilities: Vec::new(),
+        }
     }
 
     fn append(dir: &Path, records: &[SessionRecord]) {
@@ -528,7 +586,6 @@ mod tests {
             &root,
             1,
             &home,
-            &[CAPABILITY_RUN_LOGS],
             &[
                 run_log(10, ADDR, "h0", "runs/e/0.log"),
                 execute_end(11, ADDR),
@@ -574,8 +631,8 @@ mod tests {
     }
 
     /// I4: a record is trusted only while the session's lock is held; a
-    /// session of another home (another checkout), or one whose heph does not
-    /// record run logs, never answers.
+    /// session of another home (another checkout) never answers, and a live
+    /// session of this home with no `RunLog` of the addr says nothing.
     #[test]
     fn run_log_reader_trusts_only_live_sessions_of_this_home() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -585,7 +642,7 @@ mod tests {
         live_file(&home, "runs/e/0.log", b"x");
         let records = [run_log(10, ADDR, "h0", "runs/e/0.log")];
 
-        let (dir, lock) = session(&root, 1, &home, &[CAPABILITY_RUN_LOGS], &records);
+        let (dir, lock) = session(&root, 1, &home, &records);
         assert!(session_run_log(&dir, &home, ADDR).expect("read").is_some());
         assert!(
             session_run_log(&dir, &other, ADDR).expect("read").is_none(),
@@ -597,66 +654,39 @@ mod tests {
             "a session whose lock is free (crashed or ended)"
         );
 
-        let (dir, lock) = session(&root, 2, &home, &["inflight"], &records);
-        assert!(
-            session_run_log(&dir, &home, ADDR).expect("read").is_none(),
-            "a heph that does not advertise run_logs"
-        );
+        // Live, of this home, with no record of the addr: nothing.
+        let (_dir2, _lock2) = session(&root, 2, &home, &[]);
         let sessions = SessionRoot::new(&root);
-        assert!(
-            find_run_log(&sessions, &home, ADDR)
-                .expect("find")
-                .is_none()
-        );
-        // ... but it is live and of this home: "records no live logs".
-        let lookup = lookup_run_log(&sessions, &home, ADDR).expect("lookup");
-        assert!(
-            matches!(&lookup, RunLogLookup::Unsupported { session } if *session == SessionId::new(1_800_000_000_002, 2)),
-            "{lookup:?}"
-        );
+        assert!(matches!(
+            lookup_run_log(&sessions, &home, ADDR).expect("lookup"),
+            RunLogLookup::None
+        ));
+        // A trusted record of the addr is found beside it.
+        let (_dir3, _lock3) = session(&root, 3, &home, &records);
+        assert!(matches!(
+            lookup_run_log(&sessions, &home, ADDR).expect("lookup"),
+            RunLogLookup::Found(_)
+        ));
         assert!(
             matches!(
                 lookup_run_log(&sessions, &other, ADDR).expect("lookup"),
                 RunLogLookup::None
             ),
-            "another checkout's old heph says nothing"
-        );
-        // A trusted record of the addr wins over it.
-        let (_dir3, lock3) = session(&root, 3, &home, &[CAPABILITY_RUN_LOGS], &records);
-        assert!(matches!(
-            lookup_run_log(&sessions, &home, ADDR).expect("lookup"),
-            RunLogLookup::Found(_)
-        ));
-        drop(lock3);
-        drop(lock);
-        assert!(
-            matches!(
-                lookup_run_log(&sessions, &home, ADDR).expect("lookup"),
-                RunLogLookup::None
-            ),
-            "an ended old heph says nothing"
+            "another checkout's sessions say nothing"
         );
     }
 
-    /// A run going on in a session that records run logs, before its first
-    /// byte (no file, no `RunLog` record yet), is "running, nothing written":
-    /// never "records no live logs" because some other live session of the
-    /// workspace runs an older heph.
+    /// A run going on, before its first byte (no file, no `RunLog` record
+    /// yet), is "running, nothing written".
     #[test]
-    fn a_started_run_that_wrote_nothing_is_not_unsupported() {
+    fn a_started_run_that_wrote_nothing_reads_as_started() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let home = tmp.path().join("home");
         let root = tmp.path().join("sessions");
         let sessions = SessionRoot::new(&root);
-        // An older heph, live on the same workspace.
-        let (_old, _old_lock) = session(&root, 1, &home, &["inflight"], &[]);
-        let (dir, _lock) = session(
-            &root,
-            2,
-            &home,
-            &[CAPABILITY_RUN_LOGS],
-            &[execute_start(10, ADDR)],
-        );
+        // Another live session on the same workspace, with nothing of the addr.
+        let (_old, _old_lock) = session(&root, 1, &home, &[]);
+        let (dir, _lock) = session(&root, 2, &home, &[execute_start(10, ADDR)]);
         let lookup = lookup_run_log(&sessions, &home, ADDR).expect("lookup");
         let ours = SessionId::new(1_800_000_000_002, 2);
         assert!(
@@ -666,7 +696,7 @@ mod tests {
         // Not another addr's start, nor a near miss.
         assert!(matches!(
             lookup_run_log(&sessions, &home, "//p:").expect("lookup"),
-            RunLogLookup::Unsupported { .. }
+            RunLogLookup::None
         ));
 
         // Its first byte: the record makes it live.
@@ -707,6 +737,80 @@ mod tests {
         ));
     }
 
+    /// Attached to a session that was already over when the viewer probed
+    /// it, the LAST LINE locator names no live file: the replayed record's
+    /// file is still on disk (a crashed heph leaves it), and it is no run's
+    /// live log. The same records for a live session answer `Live`; another
+    /// home never answers.
+    #[test]
+    fn attached_dead_session_logs_read_as_absent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        live_file(&home, "runs/e/0.log", b"left behind\n");
+        let id = SessionId::new(1_800_000_000_001, 1);
+        let meta = meta(id, &home);
+        let feed = super::super::SessionFeed::default();
+        drop(feed.route(run_log(10, ADDR, "h0", "runs/e/0.log")));
+        let locate = |live: bool, home: &Path| {
+            FeedRunLogLocator::new(feed.clone(), id, &meta, live)
+                .expect("meta names a home")
+                .locate(home, ADDR)
+                .expect("locate")
+        };
+
+        let found = locate(true, &home);
+        assert!(
+            matches!(&found, Some(LocatedRunLog::Live { record, .. }) if record.hashin == "h0"),
+            "{found:?}"
+        );
+        assert!(locate(true, &tmp.path().join("other")).is_none());
+        let dead = locate(false, &home);
+        assert!(dead.is_none(), "a dead session named a log: {dead:?}");
+    }
+
+    /// Attached, a run that has written nothing yet is `Started`, as the
+    /// session lookup answers it: never nothing, so the LAST LINE and Log
+    /// tab read "no output yet". Its record makes it live, its end ends it,
+    /// and a new start over the ended record is started again.
+    #[test]
+    fn attached_started_run_reads_as_started() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        live_file(&home, "runs/e/0.log", b"x");
+        let id = SessionId::new(1_800_000_000_001, 1);
+        let meta = meta(id, &home);
+        let feed = super::super::SessionFeed::default();
+        let locate = |live: bool| {
+            FeedRunLogLocator::new(feed.clone(), id, &meta, live)
+                .expect("meta names a home")
+                .locate(&home, ADDR)
+                .expect("locate")
+        };
+        let started = |at: u64| {
+            move |l: &Option<LocatedRunLog>| {
+                matches!(l, Some(LocatedRunLog::Started { at_unix_ms, session })
+                    if *at_unix_ms == at && *session == id.encode())
+            }
+        };
+
+        drop(feed.route(execute_start(10, ADDR)));
+        let got = locate(true);
+        assert!(started(10)(&got), "{got:?}");
+        assert!(locate(false).is_none(), "a dead session started nothing");
+        drop(feed.route(execute_start(11, "//p:other")));
+        assert!(started(10)(&locate(true)), "another addr's start");
+
+        drop(feed.route(run_log(12, ADDR, "h0", "runs/e/0.log")));
+        assert!(matches!(locate(true), Some(LocatedRunLog::Live { .. })));
+        drop(feed.route(execute_end(13, ADDR)));
+        assert!(matches!(locate(true), Some(LocatedRunLog::Ended { .. })));
+        drop(feed.route(execute_start(14, ADDR)));
+        let got = locate(true);
+        assert!(started(14)(&got), "{got:?}");
+        drop(feed.route(execute_end(15, ADDR)));
+        assert!(matches!(locate(true), Some(LocatedRunLog::Ended { .. })));
+    }
+
     /// Across sessions, the newest record wins, and the session that recorded
     /// it is named.
     #[test]
@@ -720,14 +824,12 @@ mod tests {
             &root,
             1,
             &home,
-            &[CAPABILITY_RUN_LOGS],
             &[run_log(20, ADDR, "h-new", "runs/b/0.log")],
         );
         let (_d2, _l2) = session(
             &root,
             2,
             &home,
-            &[CAPABILITY_RUN_LOGS],
             &[run_log(10, ADDR, "h-old", "runs/a/0.log")],
         );
         let found = find_run_log(&SessionRoot::new(&root), &home, ADDR)
@@ -754,13 +856,7 @@ mod tests {
         live_file(&outside, "e/0.log", b"secret");
 
         let absent = |n: u8, home: &Path, file: &str| {
-            let (dir, _lock) = session(
-                &root,
-                n,
-                home,
-                &[CAPABILITY_RUN_LOGS],
-                &[run_log(10, ADDR, "h", file)],
-            );
+            let (dir, _lock) = session(&root, n, home, &[run_log(10, ADDR, "h", file)]);
             let log = session_run_log(&dir, home, ADDR).expect("read");
             assert!(log.is_none(), "{file:?} under {}: {log:?}", home.display());
         };
@@ -847,11 +943,14 @@ mod tests {
             2,
             SessionRecordKind::Approval {
                 prompt: Some(Box::new(super::super::ApprovalPrompt {
-                    addr: ADDR.into(),
-                    queued_behind: 0,
-                    notices: vec![super::super::ApprovalPromptNotice {
-                        name: "plan".into(),
-                        sources: sources.clone(),
+                    queue: vec![super::super::ApprovalQueued {
+                        seq: 1,
+                        addr: ADDR.into(),
+                        queued_at_unix_ms: 0,
+                        notices: vec![super::super::ApprovalPromptNotice {
+                            name: "plan".into(),
+                            sources: sources.clone(),
+                        }],
                     }],
                 })),
                 standing: None,
@@ -896,7 +995,7 @@ mod tests {
             panic!("{kinds:?}");
         };
         assert_eq!(
-            prompt.notices[0].sources, sources,
+            prompt.queue[0].notices[0].sources, sources,
             "the notice's sources are recorded past the cap"
         );
 

@@ -11,7 +11,7 @@
 use crate::tui::session::SessionSlot;
 use std::sync::Arc;
 
-use crate::commands::progress_app::{request_state, run_with_progress};
+use crate::commands::progress_app::{DashboardArgs, request_state, run_with_progress};
 use crate::commands::{GlobalOptions, bootstrap};
 use crate::engine::Engine;
 use crate::engine::request_state::RequestState;
@@ -45,6 +45,8 @@ pub enum ScratchCommands {
     Head {
         /// Address of the `scratch` target.
         addr: String,
+        #[command(flatten)]
+        dashboard: DashboardArgs,
     },
     /// Print the on-disk path of a scratch cache
     ///
@@ -93,6 +95,8 @@ pub enum ScratchCommands {
         /// Fetch every cache declared `remote = True`.
         #[arg(long)]
         all: bool,
+        #[command(flatten)]
+        dashboard: DashboardArgs,
     },
     /// Delete scratch cache directories
     ///
@@ -136,9 +140,13 @@ impl ScratchArgs {
     ) -> anyhow::Result<()> {
         match &self.command {
             ScratchCommands::Ls => bootstrap::block_on(ls(session, global))?,
-            ScratchCommands::Head { addr } => {
-                bootstrap::block_on(head(addr.clone(), sink, session, global.clone()))?
-            }
+            ScratchCommands::Head { addr, dashboard } => bootstrap::block_on(head(
+                addr.clone(),
+                dashboard.dashboard,
+                sink,
+                session,
+                global.clone(),
+            ))?,
             ScratchCommands::Path { addr } => bootstrap::block_on(path(addr, session, global))?,
             ScratchCommands::Rm { addr, all } => {
                 bootstrap::block_on(rm(addr.as_deref(), *all, session, global))?
@@ -156,11 +164,21 @@ impl ScratchArgs {
                 session,
                 global,
             ))?,
-            ScratchCommands::Pull { addr, all } => {
+            ScratchCommands::Pull {
+                addr,
+                all,
+                dashboard,
+            } => {
                 if *all == addr.is_some() {
                     anyhow::bail!("pass either an address or --all, not both or neither");
                 }
-                bootstrap::block_on(pull(addr.clone(), sink, session, global.clone()))?
+                bootstrap::block_on(pull(
+                    addr.clone(),
+                    dashboard.dashboard,
+                    sink,
+                    session,
+                    global.clone(),
+                ))?
             }
         }
     }
@@ -284,6 +302,7 @@ fn local_trace(
 
 async fn head(
     addr: String,
+    dashboard: bool,
     sink: LogSink,
     session: &Arc<SessionSlot>,
     global: GlobalOptions,
@@ -295,6 +314,7 @@ async fn head(
         sink,
         session,
         global.no_tui,
+        dashboard,
         shutdown,
         move |ctx| async move {
             let rs = request_state(&engine, &ctx);
@@ -639,6 +659,7 @@ async fn declared_scratches(
 /// The caller has checked that exactly one of `addr` and `--all` was given.
 async fn pull(
     addr: Option<String>,
+    dashboard: bool,
     sink: LogSink,
     session: &Arc<SessionSlot>,
     global: GlobalOptions,
@@ -653,6 +674,7 @@ async fn pull(
         sink,
         session,
         global.no_tui,
+        dashboard,
         shutdown,
         move |ctx| async move {
             let rs = request_state(&engine, &ctx);
@@ -1002,6 +1024,7 @@ mod tests {
                 sink(),
                 &session,
                 true,
+                false,
                 shutdown,
                 move |ctx| async move {
                     let rs = request_state(&engine, &ctx);
@@ -1028,6 +1051,7 @@ mod tests {
                 sink(),
                 &session,
                 true,
+                false,
                 shutdown,
                 move |ctx| async move {
                     let rs = request_state(&engine, &ctx);

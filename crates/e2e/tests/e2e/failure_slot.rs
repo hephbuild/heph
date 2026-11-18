@@ -119,7 +119,7 @@ async fn failure_box_shows_exec_log_from_slot() -> anyhow::Result<()> {
 
 /// A failed target's sandbox is removed once the failure arm has read it, by
 /// default: its log is in the slot, the recorded failure still carries the
-/// tail, and the box says where the sandbox went and how to keep it.
+/// tail, and the box says nothing of the sandbox: removing it is the default.
 #[tokio::test]
 async fn a_failed_targets_sandbox_is_removed() -> anyhow::Result<()> {
     let ws = Workspace::new();
@@ -140,10 +140,8 @@ async fn a_failed_targets_sandbox_is_removed() -> anyhow::Result<()> {
     assert_eq!(tail.text, "removed-marker");
     let out = render(&f);
     assert!(out.contains("│ removed-marker"), "{out}");
-    assert!(
-        out.contains("  sandbox: removed (rerun with --keep-failed-sandboxes to keep it)\n"),
-        "{out}"
-    );
+    // The default goes unsaid.
+    assert!(!out.contains("sandbox:"), "{out}");
     Ok(())
 }
 

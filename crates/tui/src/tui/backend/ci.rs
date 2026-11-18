@@ -1,6 +1,6 @@
 use tokio::sync::mpsc;
 
-use crate::tui::app::{App, AppContext, CIAppView};
+use crate::tui::app::{App, AppContext, CIAppView, PrintedQuery};
 use crate::tui::log_sink::LogSink;
 use crate::tui::session::{SessionSlot, TappedReceiver};
 use hcore::shutdown::ShutdownTrigger;
@@ -8,7 +8,7 @@ use hcore::shutdown::ShutdownTrigger;
 pub async fn run<A: App + 'static>(
     app: A,
     sink: LogSink,
-    _shutdown: ShutdownTrigger,
+    shutdown: ShutdownTrigger,
     slot: Option<&SessionSlot>,
 ) -> anyhow::Result<A::Output> {
     // The app owns its non-TUI rendering too: the backend only drives the
@@ -47,7 +47,15 @@ pub async fn run<A: App + 'static>(
     // sandbox cleanups to drain before returning (and tearing down the runtime /
     // exiting the process out from under the cleaner thread).
     let bg_pending = hcore::pending::Pending::new_counter();
-    let ctx = AppContext::direct(sink, Some(event_tx), std::sync::Arc::clone(&bg_pending));
+    // Which failures the view printed live, asked by the app at its end; an
+    // arm of the loop below answers.
+    let (printed_tx, mut printed_rx) = mpsc::unbounded_channel::<PrintedQuery>();
+    let ctx = AppContext::direct(
+        sink,
+        Some(event_tx),
+        std::sync::Arc::clone(&bg_pending),
+        printed_tx,
+    );
     // App runs on its own task, as on the interactive backend. Sharing one task
     // with the loop below means every synchronous stretch inside the app — a
     // filesystem walk, Starlark eval, a cache-warm `result_addr` descent — stalls
@@ -68,7 +76,10 @@ pub async fn run<A: App + 'static>(
     // teardown but cannot deadlock. Same as the interactive backend already does.
     let mut app_handle = tokio::spawn(app.run(ctx));
 
-    let result = loop {
+    // Whether a stop had reached the run when the app ended, read then: a
+    // signal during the background drain below does not relabel a build that
+    // finished.
+    let (stopped_before_finish, result) = loop {
         tokio::select! {
             // Events keep being folded until the app task resolves; whatever the
             // app queued before finishing is picked up by the drain below.
@@ -81,7 +92,7 @@ pub async fn run<A: App + 'static>(
             // across that window and does fold them, so the two backends differ.
             // Changing it means changing what a CI run prints, which is a separate
             // call from this one.
-            out = &mut app_handle => break match out {
+            out = &mut app_handle => break (shutdown.fired(), match out {
                 Ok(inner) => inner,
                 // Preserve the pre-spawn behaviour: an app panic unwound straight
                 // out of `run`. Re-raise it here rather than turning it into an
@@ -92,7 +103,7 @@ pub async fn run<A: App + 'static>(
                 Err(join_err) => {
                     Err(anyhow::Error::new(join_err).context("joining the app task"))
                 }
-            },
+            }),
             maybe_evt = async {
                 match events.as_mut() {
                     Some(r) => r.recv(|ev| view.apply(ev)).await,
@@ -105,6 +116,16 @@ pub async fn run<A: App + 'static>(
                     events = None;
                 }
             }
+            // Fold everything queued first: an event sent before the query
+            // is in the channel by now, and the answer has to cover it.
+            // `None` (the app's context gone) disables the arm.
+            Some(reply) = printed_rx.recv() => {
+                if let Some(r) = events.as_mut() {
+                    while r.try_recv(|ev| view.apply(ev)).is_ok() {}
+                }
+                // The app stopped waiting: nothing to tell.
+                drop(reply.send(view.failures_printed()));
+            }
         }
     };
 
@@ -114,6 +135,11 @@ pub async fn run<A: App + 'static>(
         while r.try_recv(|ev| view.apply(ev)).is_ok() {}
     }
 
+    // A signal (INT, TERM, HUP) that reached the run before it ended stopped
+    // it: the summary says so.
+    if stopped_before_finish {
+        view.set_stopped();
+    }
     view.finish();
 
     // Block return until background work has drained: sandbox cleanups (the
@@ -277,9 +303,14 @@ mod tests {
         folded: Arc<AtomicUsize>,
         begun: Arc<AtomicUsize>,
         finished: Arc<AtomicUsize>,
+        stopped: Arc<AtomicUsize>,
     }
 
     impl CIAppView for RecordingView {
+        fn set_stopped(&mut self) {
+            self.stopped.fetch_add(1, Ordering::SeqCst);
+        }
+
         fn begin(&self) {
             self.begun.fetch_add(1, Ordering::SeqCst);
         }
@@ -531,6 +562,31 @@ mod tests {
             1,
             "the summary must be printed on a failed run, not skipped"
         );
+        assert_eq!(
+            view.stopped.load(Ordering::SeqCst),
+            0,
+            "a failure nobody stopped is not a stop"
+        );
+    }
+
+    /// A signal that reached the run before it ended makes the summary say
+    /// "stopped".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_signal_before_the_end_marks_the_summary_stopped() {
+        let view = RecordingView::default();
+        let (shutdown, _shutdown_rx) = ShutdownTrigger::new();
+        shutdown.trigger();
+        run(
+            TestApp::new(view.clone(), Behavior::Emit(1)),
+            LogSink::new_direct_with(Default::default()),
+            shutdown,
+            None,
+        )
+        .await
+        .expect("backend must return the app's output");
+
+        assert_eq!(view.stopped.load(Ordering::SeqCst), 1);
+        assert_eq!(view.finished.load(Ordering::SeqCst), 1);
     }
 
     /// `run` must not return while background work is outstanding: the process

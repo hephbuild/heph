@@ -156,6 +156,7 @@ fn raw_refused_with_shell() {
         output: Vec::new(),
         frozen: false,
         log_lines: 10,
+        dashboard: Default::default(),
         raw: true,
         args: Vec::new(),
     };

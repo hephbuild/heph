@@ -23,6 +23,8 @@ pub struct Args {
     /// Show the direct def only, without applying transitive deps
     #[arg(long)]
     pub no_transitive: bool,
+    #[command(flatten)]
+    pub dashboard: crate::commands::progress_app::DashboardArgs,
 }
 
 #[derive(Serialize)]
@@ -118,7 +120,15 @@ async fn execute_async(
         fail_fast: global.fail_fast,
     };
     let interactive = tui::should_use_tui(global.no_tui);
-    tui::run_app(app, sink, session, interactive, shutdown).await
+    tui::run_app_with(
+        app,
+        sink,
+        session,
+        interactive,
+        args.dashboard.dashboard,
+        shutdown,
+    )
+    .await
 }
 
 #[cfg(test)]

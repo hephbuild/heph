@@ -70,6 +70,8 @@ fn events() -> Vec<BuildEvent> {
         ev(
             5,
             BuildEventKind::ResultEnd {
+                left_behind: None,
+                cancelled: false,
                 addr: "//a:bad".into(),
                 error: Some("boom".into()),
                 upstream_of: None,
@@ -86,6 +88,8 @@ fn big_event() -> BuildEvent {
     BuildEvent {
         at_unix_ms: 1,
         kind: BuildEventKind::ResultEnd {
+            left_behind: None,
+            cancelled: false,
             addr: "//a:big".into(),
             error: Some("x".repeat(1024 * 1024)),
             upstream_of: None,
@@ -141,7 +145,7 @@ fn recorder_round_trip_matches_live_view() {
         == Some(SessionRecordKind::Log {
             level: "INFO".into(),
             msg: "hello\u{1b}[31m".into(),
-            seq: Some(1),
+            seq: 1,
         })));
     assert_eq!(
         records.last().and_then(|r| r.session.clone()),
@@ -556,8 +560,11 @@ fn events_cap_keeps_the_ending_view_records() {
     let kept = [
         SessionRecordKind::Approval {
             prompt: Some(Box::new(ApprovalPrompt {
-                addr: "//a:gate".into(),
-                ..ApprovalPrompt::default()
+                queue: vec![crate::tui::session::ApprovalQueued {
+                    seq: 1,
+                    addr: "//a:gate".into(),
+                    ..Default::default()
+                }],
             })),
             standing: None,
         },
@@ -568,7 +575,7 @@ fn events_cap_keeps_the_ending_view_records() {
             prompt: None,
             standing: Some(ApprovalStanding::Approve),
         },
-        SessionRecordKind::Finished,
+        SessionRecordKind::Finished { stopped: true },
         SessionRecordKind::Output {
             text: "failed: //a:bad\n".into(),
         },
@@ -595,7 +602,7 @@ fn events_cap_keeps_the_ending_view_records() {
     want.push(SessionRecordKind::Log {
         level: "INFO".into(),
         msg: "after the cap".into(),
-        seq: Some(1),
+        seq: 1,
     });
     want.push(SessionRecordKind::End {
         exit_code: Some(1),

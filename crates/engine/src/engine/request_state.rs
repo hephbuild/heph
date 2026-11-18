@@ -272,6 +272,19 @@ impl DepDag {
     }
 }
 
+/// The targets one root failure took down: the first few by name, in the
+/// order they failed, and how many in all.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TookDown {
+    pub named: Vec<String>,
+    pub total: usize,
+}
+
+impl TookDown {
+    /// How many a root keeps by name; the report says `+N more` past them.
+    pub const NAMED: usize = 5;
+}
+
 /// Shared mutable state for a request — common across all child RequestStates.
 pub struct RequestStateData {
     pub engine: Weak<Engine>,
@@ -414,6 +427,14 @@ pub struct RequestStateData {
     /// at the end of execution for rendering. Shared via `Arc<RequestStateData>`,
     /// so `with_parent` / `with_skip_provider` children record into the same map.
     pub failures: Mutex<indexmap::IndexMap<Addr, Arc<TargetFailure>>>,
+    /// What each root failure took down, keyed by the root's formatted addr:
+    /// the targets whose `ResultEnd` named it as `upstream_of`. Read by the
+    /// interactive failure report's `took down:` row.
+    took_down: Mutex<FxHashMap<String, TookDown>>,
+    /// The targets whose failing `ResultEnd` was a stop, not a failure
+    /// ([`RequestState::end_is_cancelled`]), by formatted addr: roots and
+    /// what they took down. The report leaves them out.
+    cancelled: Mutex<FxHashSet<String>>,
     /// Decision maker for `approval`-gated targets. `None` in non-interactive
     /// contexts that never set one (gc, tests) — a target requiring approval then
     /// fails with a clear error. Shared via `Arc<RequestStateData>`, so child
@@ -939,11 +960,118 @@ impl RequestState {
             .collect()
     }
 
+    /// [`take_failures`](Self::take_failures), each failure saying whether
+    /// the engine can open its log ([`TargetFailure::log_readable`]): the
+    /// log API over local sources, never fetching (a remote hit's log it
+    /// would fetch counts: `heph log` does). What the report and the
+    /// CI box decide `heph log <addr>` against, so neither points at a log
+    /// `heph log` would not find, nor leaves out one it would. Without the
+    /// engine (gone), the failures are returned unasked.
+    pub async fn take_failures_with_logs(&self) -> Vec<Arc<TargetFailure>> {
+        self.take_failures_with_logs_where(|_| true).await
+    }
+
+    /// [`take_failures_with_logs`](Self::take_failures_with_logs), asking
+    /// only for the failures `wanted` picks; the rest are returned unasked.
+    /// The CI end of run asks only for the failures it is about to print:
+    /// those printed as they failed carried the answer then.
+    pub async fn take_failures_with_logs_where(
+        &self,
+        wanted: impl Fn(&TargetFailure) -> bool,
+    ) -> Vec<Arc<TargetFailure>> {
+        use futures::StreamExt as _;
+        let failures = self.take_failures();
+        let Some(engine) = self.data.engine.upgrade() else {
+            return failures;
+        };
+        futures::stream::iter(failures)
+            .map(|f| {
+                let (engine, wanted) = (&engine, &wanted);
+                async move {
+                    if !wanted(&f) {
+                        return f;
+                    }
+                    let readable = engine.log_readable(&f.addr).await;
+                    Arc::new(f.as_ref().clone().with_log_readable(readable))
+                }
+            })
+            .buffered(crate::engine::fanout::discovery_concurrency())
+            .collect()
+            .await
+    }
+
     /// Non-draining lookup of a single recorded failure by addr. Used by the
     /// outermost `result_addr` frame to surface the rich root-cause diagnostic
     /// to its direct caller in place of the `UpstreamFailed` marker.
     pub fn get_failure(&self, addr: &Addr) -> Option<Arc<TargetFailure>> {
         self.data.failures.lock().get(addr).cloned()
+    }
+
+    /// Note that `addr` failed only because `root` did. Bounded per root: the
+    /// first [`TookDown::NAMED`] addrs and a count, so a root that takes
+    /// down thousands costs no more than one that takes down a few.
+    pub fn record_took_down(&self, root: &str, addr: &str) {
+        let mut map = self.data.took_down.lock();
+        let entry = map.entry(root.to_owned()).or_default();
+        entry.total = entry.total.saturating_add(1);
+        if entry.named.len() < TookDown::NAMED {
+            entry.named.push(addr.to_owned());
+        }
+    }
+
+    /// What `root` took down, as [`record_took_down`](Self::record_took_down)
+    /// noted it; empty when it took down nothing.
+    pub fn took_down(&self, root: &str) -> TookDown {
+        self.data
+            .took_down
+            .lock()
+            .get(root)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Whether `addr`'s failing end, described by `d`, is a stop rather than
+    /// a failure, and remember it if so. Decided once per end, here, so the
+    /// event, the line and the report agree.
+    ///
+    /// A root is a stop when a [`CancelledError`](hplugin::error::CancelledError)
+    /// is on its chain. Otherwise `execute` decided, once, before filling a
+    /// failure slot: a run it kept ([`ErrorDetail::kept`]) failed, whatever
+    /// the token says now — fail-fast may cancel it between that decision and
+    /// this end. Only an error that never reached that decision falls back to
+    /// the same rule `execute` applies: the request's token is cancelled and
+    /// the run did not time out (a driver may report a stop as a bare
+    /// `cancelled` of its own).
+    ///
+    /// [`ErrorDetail::kept`]: crate::engine::event::ErrorDetail::kept
+    ///
+    /// One that failed only because a dependency did is a stop when that
+    /// root was one; a root that genuinely failed before the stop keeps what
+    /// it took down. A root's end always precedes its dependents' (they end
+    /// on its result), so the set is filled before they ask.
+    pub fn end_is_cancelled(&self, addr: &str, d: &crate::engine::event::ErrorDetail) -> bool {
+        let mut set = self.data.cancelled.lock();
+        let cancelled = match &d.upstream_of {
+            Some(root) => set.contains(root),
+            None => {
+                d.cancelled || (!d.kept && self.ctoken().is_cancelled() && d.timed_out.is_none())
+            }
+        };
+        if cancelled {
+            set.insert(addr.to_owned());
+        }
+        cancelled
+    }
+
+    /// Whether `addr`'s failure was a stop ([`end_is_cancelled`](Self::end_is_cancelled)).
+    pub fn was_cancelled(&self, addr: &str) -> bool {
+        self.data.cancelled.lock().contains(addr)
+    }
+
+    /// heph's home, while the engine is alive: what no screen or report
+    /// shows (sandboxes live under it).
+    pub fn heph_home(&self) -> Option<std::path::PathBuf> {
+        self.data.engine.upgrade().map(|e| e.home.to_path_buf())
     }
 
     /// The first recorded failure in insertion order, if any. Fallback for
@@ -1505,6 +1633,8 @@ impl Engine {
             bg_pending: Arc::clone(&bg_pending),
             sandbox_removals: crate::engine::sandbox_cleaner::PendingCounter::default(),
             failures: Mutex::new(indexmap::IndexMap::new()),
+            took_down: Mutex::new(FxHashMap::default()),
+            cancelled: Mutex::new(FxHashSet::default()),
             approval,
             hash_only,
             selection: std::sync::OnceLock::new(),
@@ -2133,6 +2263,63 @@ mod tests {
         Ok(())
     }
 
+    /// A failing end is a stop when Ctrl-C cancelled the request (a driver's
+    /// bare `cancelled` included) and it did not time out; a dependent is one
+    /// only when its root was; a root that failed before the stop keeps what
+    /// it took down.
+    #[tokio::test]
+    async fn end_is_cancelled_tells_a_stop_from_a_failure() -> anyhow::Result<()> {
+        use crate::engine::event::ErrorDetail;
+        let (_tmp, engine) = test_engine()?;
+        let rs = engine.new_state();
+        let detail = |upstream_of: Option<&str>| ErrorDetail {
+            message: "boom".into(),
+            upstream_of: upstream_of.map(str::to_owned),
+            ..ErrorDetail::default()
+        };
+
+        assert!(!rs.end_is_cancelled("//p:early", &detail(None)));
+        assert!(
+            rs.end_is_cancelled(
+                "//p:typed",
+                &ErrorDetail::from_error(&anyhow::Error::new(hplugin::error::CancelledError)),
+            ),
+            "a CancelledError is a stop whatever the token says"
+        );
+
+        engine.cancel_all_requests();
+        let timed_out = ErrorDetail {
+            timed_out: Some(hcore::events::TimedOutData {
+                timeout_ms: 1,
+                abandoned: false,
+            }),
+            ..detail(None)
+        };
+        assert!(
+            !rs.end_is_cancelled("//p:slow", &timed_out),
+            "a timeout fails"
+        );
+        assert!(
+            !rs.end_is_cancelled(
+                "//p:kept",
+                &ErrorDetail {
+                    kept: true,
+                    ..detail(None)
+                }
+            ),
+            "execute kept it as a failure before the cancel: it stays one"
+        );
+        assert!(rs.end_is_cancelled("//p:bare", &detail(None)));
+        assert!(rs.end_is_cancelled("//p:behind", &detail(Some("//p:bare"))));
+        assert!(
+            !rs.end_is_cancelled("//p:down", &detail(Some("//p:early"))),
+            "collateral of a real root stays collateral"
+        );
+        assert!(rs.was_cancelled("//p:bare") && rs.was_cancelled("//p:behind"));
+        assert!(!rs.was_cancelled("//p:early") && !rs.was_cancelled("//p:down"));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn fail_fast_defaults_true_overridable() -> anyhow::Result<()> {
         let (_tmp, engine) = test_engine()?;
@@ -2264,6 +2451,8 @@ mod tests {
                 addr: "//a:b".into(),
             },
             |error: Option<crate::engine::event::ErrorDetail>| BuildEventKind::ResultEnd {
+                left_behind: None,
+                cancelled: false,
                 addr: "//a:b".into(),
                 error: error.map(crate::engine::event::ErrorDetail::into_message),
                 upstream_of: None,

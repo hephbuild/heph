@@ -137,6 +137,22 @@ pub struct AttachArgs {
     /// Session id, its last 4–5 characters, or a live session's pid (any
     /// unique prefix or suffix of an id works).
     pub id: String,
+    /// Accepted only to be refused with a reason: `-D` belongs to `run`, and
+    /// a viewer has no build of its own to open the dashboard on or hold.
+    #[arg(short = 'D', long = "dashboard", hide = true)]
+    pub dashboard: bool,
+}
+
+impl AttachArgs {
+    /// A viewer draws another process's build: there is nothing for it to
+    /// open from the start or hold at the end.
+    fn refuse_dashboard(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.dashboard,
+            "--dashboard does not apply to `session attach`: Tab opens the dashboard once attached"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Args, Clone, Debug)]
@@ -217,15 +233,9 @@ fn execute(
             bootstrap::block_on(inflight(&sources, opts, &a.id, a.json, &mut stdout))?
         }
         SessionCommands::Attach(a) => {
+            a.refuse_dashboard()?;
             drop(stdout);
-            bootstrap::block_on(attach::attach(
-                &sources,
-                opts,
-                &a.id,
-                sink,
-                session,
-                global.no_tui,
-            ))?
+            bootstrap::block_on(attach::attach(&sources, opts, &a.id, sink, session, global))?
         }
     }
 }

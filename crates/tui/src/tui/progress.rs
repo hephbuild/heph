@@ -6,278 +6,31 @@
 //! receipt clock — so elapsed times stay correct across a future client/server
 //! process split. Rendering callers pass their own `now_ms` wall clock.
 
-use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use ratatui::style::{Color, Modifier, Style, Stylize};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::tui::app::{CIAppView, TUIAppView};
 use crate::tui::session::{HolderNames, SessionId};
 use hcore::capacity::Unit;
-use hcore::events::{BuildEvent, BuildEventKind, CacheCounts, CacheOutcomeKind};
+use hcore::events::{BuildEvent, BuildEventKind, CacheCounts};
 
-/// Floor on the pinned viewport row count. The viewport targets one third of the
-/// terminal height (see [`rows_for_height`]) but never shrinks below this, which
-/// is the minimum that fits the box: top border + 1 body row + bottom border +
-/// help row.
-pub const MIN_PROGRESS_ROWS: u16 = 4;
+#[cfg(test)]
+mod approval_tests;
+mod line;
+mod spotlight;
+#[cfg(test)]
+pub(crate) mod test_events;
 
-/// Pinned viewport rows for a given terminal height: one third of the terminal,
-/// clamped up to [`MIN_PROGRESS_ROWS`]. The box grows the body (slow/lock rows)
-/// to fill whatever rows it is given.
-pub fn rows_for_height(term_height: u16) -> u16 {
-    (term_height / 3).max(MIN_PROGRESS_ROWS)
-}
+pub use spotlight::{HOLD_MS, Spot};
 
-/// Slice `lines` to a `rows`-tall window starting at `scroll`, returning the
-/// window and the clamped scroll offset. Scroll is clamped so the window never
-/// runs off the end. The scroll indicator in the bottom border conveys overflow.
-fn windowed(
-    mut lines: Vec<Line<'static>>,
-    rows: usize,
-    scroll: usize,
-) -> (Vec<Line<'static>>, usize) {
-    let total = lines.len();
-    if rows == 0 {
-        return (Vec::new(), 0);
-    }
-    if total <= rows {
-        return (lines, 0);
-    }
-    let max_scroll = total - rows;
-    let scroll = scroll.min(max_scroll);
-    let window: Vec<Line<'static>> = lines.drain(scroll..scroll + rows).collect();
-    (window, scroll)
-}
+/// The dashboard's key hints once the build has ended and the dashboard
+/// holds it on screen: nothing is left to stop, and `q` leaves.
+/// The most list rows `heph session show` prints.
+pub const SNAPSHOT_ROWS: u16 = 15;
 
-/// One row of a list-view body before it is rendered: the addr, the colour it
-/// paints in, and an optional dim trailing detail (a failure message).
-///
-/// Rows borrow out of [`BuildState`], so a list can be counted, measured and
-/// windowed without building a `Line` for every entry. The viewport shows ~20
-/// rows; at 100k targets the other 99,980 `format!`s were pure waste.
-#[derive(Debug, Clone, Copy)]
-struct BodyRow<'a> {
-    addr: &'a str,
-    color: Color,
-    /// Rendered dim after the addr. `None` for the addr-only lists.
-    detail: Option<&'a str>,
-}
-
-impl BodyRow<'_> {
-    /// Visible column count of this row's line, without rendering it. Must track
-    /// [`BodyRow::render`] exactly: the horizontal pan clamps against the widest
-    /// row in the whole list, so a mismatch would shift the viewport.
-    fn width(&self) -> usize {
-        // The leading indent, plus the same two-space gap before any detail.
-        2 + self.addr.chars().count() + self.detail.map_or(0, |d| 2 + d.chars().count())
-    }
-
-    fn render(&self) -> Line<'static> {
-        let addr = Span::styled(format!("  {}", self.addr), Style::default().fg(self.color));
-        match self.detail {
-            None => Line::from(addr),
-            Some(detail) => Line::from(vec![
-                addr,
-                Span::styled(
-                    format!("  {detail}"),
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::DIM),
-                ),
-            ]),
-        }
-    }
-}
-
-/// The rows of one list view, plus whether they still need ordering. Building
-/// one costs a single allocation whatever the list length; only the rows the
-/// viewport actually shows become `Line`s.
-struct BodyRows<'a> {
-    rows: Vec<BodyRow<'a>>,
-    /// Set when the rows came out of a `HashSet` and must be ordered by addr
-    /// before windowing. The arrival-ordered lists leave it clear — they already
-    /// render in the order they were folded.
-    sort_by_addr: bool,
-}
-
-impl<'a> BodyRows<'a> {
-    /// Rows that render in the order given.
-    fn in_order(rows: Vec<BodyRow<'a>>) -> Self {
-        Self {
-            rows,
-            sort_by_addr: false,
-        }
-    }
-
-    /// Rows that render ordered by addr. Only the visible window is ever
-    /// actually ordered — see [`BodyRows::window`].
-    fn by_addr(rows: Vec<BodyRow<'a>>) -> Self {
-        Self {
-            rows,
-            sort_by_addr: true,
-        }
-    }
-
-    fn len(&self) -> usize {
-        self.rows.len()
-    }
-
-    /// The widest row in visible columns — the clamp for the horizontal pan.
-    fn max_width(&self) -> usize {
-        self.rows.iter().map(BodyRow::width).max().unwrap_or(0)
-    }
-
-    /// Render the `rows`-tall window at `scroll`, returning it and the clamped
-    /// offset. Clamps like [`windowed`]: the window never runs off the end. An
-    /// addr-ordered list is placed by [`place_window`], never sorted whole.
-    fn window(mut self, rows: usize, scroll: usize) -> (Vec<Line<'static>>, usize) {
-        let total = self.rows.len();
-        if rows == 0 {
-            return (Vec::new(), 0);
-        }
-        let start = if total <= rows {
-            0
-        } else {
-            scroll.min(total - rows)
-        };
-        let end = start.saturating_add(rows).min(total);
-        if self.sort_by_addr {
-            // Addrs are unique within every list `by_addr` backs — they come out
-            // of `BuildState`'s `matched` / `cache_hit`, both keyed by addr — so
-            // the order is total and the unstable partition is unambiguous.
-            place_window(&mut self.rows, start, end, |a, b| a.addr.cmp(b.addr));
-        }
-        let window = self
-            .rows
-            .get(start..end)
-            .unwrap_or_default()
-            .iter()
-            .map(BodyRow::render)
-            .collect();
-        (window, start)
-    }
-}
-
-/// A row buffer sized for a list of `len` rows that `filter` will thin out.
-///
-/// Unfiltered, the whole list lands in it, so one reservation beats `collect`'s
-/// geometric growth and its repeated copies. Filtered, the match count is not
-/// known ahead and can be a handful out of 100k, so reserving the full length
-/// every frame would ask the allocator for megabytes to hold three rows.
-fn row_buffer<T>(len: usize, filter: &str) -> Vec<T> {
-    if filter.is_empty() {
-        Vec::with_capacity(len)
-    } else {
-        Vec::new()
-    }
-}
-
-/// Move the elements that belong at `[start, end)` in `cmp` order into that
-/// range, leaving the rest of `rows` in no particular order.
-///
-/// This is the sort the viewport does *not* do. Two `select_nth_unstable_by`
-/// partitions place the range in `O(n)` — first splitting off everything that
-/// sorts after the window, then everything before it — and only the window
-/// itself, `end - start` long, is sorted. A full sort would be `O(n log n)`
-/// to then throw all but a screenful away.
-///
-/// `start <= end <= rows.len()`. Callers must order on a key that is unique
-/// across `rows`: the partitions are unstable, so with duplicate keys the
-/// window could hold a different pick than a stable full sort would.
-fn place_window<T>(
-    rows: &mut [T],
-    start: usize,
-    end: usize,
-    mut cmp: impl FnMut(&T, &T) -> std::cmp::Ordering,
-) {
-    if end < rows.len() {
-        // Ranks `[0, end)` move to the front; the tail is left unordered.
-        rows.select_nth_unstable_by(end, &mut cmp);
-    }
-    // `end <= rows.len()`, so the split is in bounds.
-    let (head, _) = rows.split_at_mut(end);
-    if start > 0 {
-        // Ranks `[0, start)` move to the front of that prefix, leaving exactly
-        // the window's elements behind them.
-        head.select_nth_unstable_by(start, &mut cmp);
-    }
-    // `start <= end == head.len()`, so this split is in bounds too.
-    let (_, window) = head.split_at_mut(start);
-    window.sort_unstable_by(&mut cmp);
-}
-
-/// One frame's body: the live view's already-rendered lines, or a list tab's
-/// deferred rows. The live body is bounded by what is in flight; a list tab is
-/// bounded only by the run, which is why it defers.
-enum Body<'a> {
-    Lines(Vec<Line<'static>>),
-    Rows(BodyRows<'a>),
-}
-
-impl Body<'_> {
-    fn len(&self) -> usize {
-        match self {
-            Self::Lines(lines) => lines.len(),
-            Self::Rows(rows) => rows.len(),
-        }
-    }
-
-    /// The widest row in visible columns — the clamp for the horizontal pan.
-    fn max_width(&self) -> usize {
-        match self {
-            Self::Lines(lines) => lines
-                .iter()
-                .map(|l| spans_width(&l.spans))
-                .max()
-                .unwrap_or(0),
-            Self::Rows(rows) => rows.max_width(),
-        }
-    }
-
-    /// The `rows`-tall window at `scroll`, plus the clamped offset.
-    fn window(self, rows: usize, scroll: usize) -> (Vec<Line<'static>>, usize) {
-        match self {
-            Self::Lines(lines) => windowed(lines, rows, scroll),
-            Self::Rows(r) => r.window(rows, scroll),
-        }
-    }
-}
-
-/// Columns shifted per Left/Right key press when panning a wide body.
-pub const HSCROLL_STEP: usize = 4;
-
-/// Minimum columns the bottom border must reserve when the scroll indicator is
-/// active. The shortest possible indicator `↑ 1–1 of 1 ↓` is 14 columns; this
-/// leaves room for the label to remain visible on narrow-but-not-tiny terminals.
-const SCROLL_INDICATOR_MIN_WIDTH: usize = 20;
-
-/// Drop the first `offset` visible columns from a line, preserving each span's
-/// styling. Every glyph this module emits is single-width, so a char count is an
-/// exact column count. `offset == 0` returns the line untouched.
-fn hscroll_line(line: Line<'static>, offset: usize) -> Line<'static> {
-    if offset == 0 {
-        return line;
-    }
-    let mut remaining = offset;
-    let mut spans: Vec<Span<'static>> = Vec::with_capacity(line.spans.len());
-    for span in line.spans {
-        let chars = span.content.chars().count();
-        if remaining >= chars {
-            remaining -= chars;
-            continue;
-        }
-        if remaining > 0 {
-            let kept: String = span.content.chars().skip(remaining).collect();
-            spans.push(Span::styled(kept, span.style));
-            remaining = 0;
-        } else {
-            spans.push(span);
-        }
-    }
-    Line::from(spans)
-}
+const FINISHED_DASHBOARD_HINTS: &str = "↑/↓ select · enter details · l log · tab/⇧tab list · / filter · a all targets · q or esc leave";
 
 /// A target is considered "taking long" once its execute span exceeds this.
 pub const LONG_RUNNING_THRESHOLD_MS: u64 = 5_000;
@@ -295,24 +48,6 @@ const WORKERS_PER_CELL: usize = 8;
 /// empty/idle cell (the caller paints it grey); the lit progression follows the
 /// pinned UI rule `⠁ ⠃ ⠇ ⠧ ⠷ ⠿ … ⣿` with the 7-dot step filled in.
 const BRAILLE_FILL: [char; WORKERS_PER_CELL + 1] = ['⣿', '⠁', '⠃', '⠇', '⡇', '⣇', '⣧', '⣷', '⣿'];
-
-/// Banner scroll cadence: advance one column every this many milliseconds.
-const SCROLL_MS: u64 = 150;
-
-/// Below this width the box-drawing math has no room; we clamp up to it.
-const MIN_BOX_WIDTH: usize = 16;
-
-/// Visible column count of a span run. Every glyph we emit (box-drawing,
-/// braille, ASCII, `·`) is single-width, so a char count is exact.
-fn spans_width(spans: &[Span<'_>]) -> usize {
-    spans.iter().map(|s| s.content.chars().count()).sum()
-}
-
-/// Paint a header span as the active tab: a blue background with white text so
-/// the selected view reads as highlighted in the status line.
-fn highlight_span(s: &Span<'static>) -> Span<'static> {
-    Span::styled(s.content.clone(), s.style.bg(Color::Blue).fg(Color::White))
-}
 
 /// One braille cell per group of [`WORKERS_PER_CELL`] worker slots. Busy slots
 /// fill left-to-right across cells; an all-idle cell is dim grey, any-busy cell
@@ -371,61 +106,6 @@ fn human_elapsed_ms(ms: u64) -> String {
     human_elapsed(ms)
 }
 
-/// A `window`-wide view of `label` scrolled like a banner: the text plus a
-/// 3-space gap, cycled, sampled at a time-derived offset. Wraps seamlessly.
-fn banner_slice(label: &str, window: usize, now_ms: u64) -> String {
-    let cycle: Vec<char> = label.chars().chain("   ".chars()).collect();
-    let cyc_len = cycle.len().max(1);
-    let offset = (now_ms / SCROLL_MS) as usize % cyc_len;
-    (0..window)
-        .map(|i| cycle.get((offset + i) % cyc_len).copied().unwrap_or(' '))
-        .collect()
-}
-
-/// Wall-clock → animation phase divisor (ms). Larger = slower drift.
-const ART_PERIOD_MS: f64 = 1400.0;
-
-/// Plasma density ramp, low → high. Classic ASCII-plasma glyphs; rendered dim so
-/// the whole field stays discreet despite full coverage.
-const ART_RAMP: [char; 8] = ['.', ':', '-', '=', '+', '*', '#', '%'];
-
-/// `rows` body lines of a dim, slowly-drifting plasma field: overlaid sine waves
-/// (including a radial term) sampled into [`ART_RAMP`]. Pure function of `now_ms`
-/// and cell position; one uniform dim style per line keeps spans cheap. A 1-space
-/// gutter is kept on the left and right so the field never touches the box edges.
-fn art_lines(now_ms: u64, width: usize, rows: usize) -> Vec<Line<'static>> {
-    let style = Style::default()
-        .fg(Color::DarkGray)
-        .add_modifier(Modifier::DIM);
-    let t = now_ms as f64 / ART_PERIOD_MS;
-    let inner = width.saturating_sub(2);
-    let cx = inner as f64 / 2.0;
-    let cy = rows as f64 / 2.0;
-    let n = ART_RAMP.len();
-    let mut lines = Vec::with_capacity(rows);
-    for y in 0..rows {
-        let fy = y as f64;
-        let mut s = String::with_capacity(width);
-        s.push(' ');
-        for x in 0..inner {
-            let fx = x as f64;
-            let dx = fx - cx;
-            let dy = (fy - cy) * 2.0; // cells are ~2× taller than wide
-            let v = (fx * 0.16 + t).sin()
-                + (fy * 0.55 - t * 0.7).sin()
-                + ((fx + fy) * 0.11 + t * 0.5).sin()
-                + (dx.hypot(dy) * 0.14 - t).sin();
-            // v ∈ [-4, 4] → [0, n] via threshold count (avoids a float→int cast).
-            let level = (v + 4.0) / 8.0 * n as f64;
-            let idx = (1..n).filter(|&i| level >= i as f64).count();
-            s.push(ART_RAMP.get(idx).copied().unwrap_or(' '));
-        }
-        s.push(' ');
-        lines.push(Line::from(Span::styled(s, style)));
-    }
-    lines
-}
-
 /// Which body the TUI viewport is showing. The default view is the live
 /// slow-target / lock-wait breakdown; the list views each mirror one header
 /// counter — [`ViewMode::Done`] the completed count, [`ViewMode::Matched`] the
@@ -459,7 +139,7 @@ pub enum ViewMode {
 /// Compares in place. Lower-casing both sides allocated two `String`s per row,
 /// and the filter has to be tried against *every* row to know how many matched —
 /// so at 100k targets that was 200k allocations on every frame.
-fn addr_matches(addr: &str, filter: &str) -> bool {
+pub(crate) fn addr_matches(addr: &str, filter: &str) -> bool {
     if filter.is_empty() {
         return true;
     }
@@ -508,23 +188,13 @@ pub enum HeaderItem {
 /// view. `Some(mode)` makes the part a tab — selectable via `Tab` and
 /// highlighted while `mode` is the active view; `None` is inert connective text.
 pub struct HeaderPart {
-    mode: Option<ViewMode>,
     spans: Vec<Span<'static>>,
 }
 
 impl HeaderPart {
-    /// An inert (non-selectable) text part.
+    /// A text part.
     fn text(s: impl Into<String>) -> Self {
         HeaderPart {
-            mode: None,
-            spans: vec![Span::raw(s.into())],
-        }
-    }
-
-    /// A text part bound to a body view.
-    fn tab(mode: ViewMode, s: impl Into<String>) -> Self {
-        HeaderPart {
-            mode: Some(mode),
             spans: vec![Span::raw(s.into())],
         }
     }
@@ -563,7 +233,7 @@ impl HeaderItem {
 /// (plus a mapping arm) when a new typed span event should appear in the
 /// breakdown — e.g. remote read/write once their events land.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum Op {
+pub(crate) enum Op {
     RemoteCacheRead,
     /// Warming a scratch directory — seeding a lineage from a fallback scope, or
     /// pulling a snapshot from the remote.
@@ -577,7 +247,7 @@ impl Op {
     /// Single glyph shown before the op's elapsed time. Must stay **BMP
     /// single-width** (plain-text rows; a double-width glyph would clip). Remote
     /// ops use `↓`/`↑` (U+2193/2191), never the emoji `⬇`/`⬆`.
-    fn icon(self) -> char {
+    pub(crate) fn icon(self) -> char {
         match self {
             Op::RemoteCacheRead => '↓',
             Op::ScratchPrepare => '↺',
@@ -603,13 +273,33 @@ impl Op {
     /// remote download → scratch warm → execute → local-cache write → remote
     /// upload. This is the order the engine runs them in, so a row reads
     /// left-to-right as the target's own history.
-    fn order(self) -> u8 {
+    pub(crate) fn order(self) -> u8 {
         match self {
             Op::RemoteCacheRead => 0,
             Op::ScratchPrepare => 1,
             Op::Execute => 2,
             Op::LocalCacheWrite => 3,
             Op::RemoteCacheWrite => 4,
+        }
+    }
+
+    /// Every op, indexed by [`Op::order`].
+    pub(crate) const BY_ORDER: [Op; 5] = [
+        Op::RemoteCacheRead,
+        Op::ScratchPrepare,
+        Op::Execute,
+        Op::LocalCacheWrite,
+        Op::RemoteCacheWrite,
+    ];
+
+    /// The dashboard's PHASE words for a target in this op.
+    pub(crate) fn phase(self) -> &'static str {
+        match self {
+            Op::RemoteCacheRead => "download",
+            Op::ScratchPrepare => "scratch",
+            Op::Execute => "execute",
+            Op::LocalCacheWrite => "cache write",
+            Op::RemoteCacheWrite => "upload",
         }
     }
 }
@@ -621,27 +311,15 @@ type SlowTarget = (String, u64, Vec<(Op, u64)>);
 
 /// Which edge of an [`Op`] span an event represents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Boundary {
+pub(crate) enum Boundary {
     Start,
     End,
-}
-
-/// The per-target operation timeline: how long each [`Op`] has taken (completed
-/// runs summed) plus the currently-open op and its start timestamp. This is the
-/// paved road — every op a target passes through folds in here, and the slow-row
-/// renderer reads the breakdown straight off it.
-#[derive(Debug, Default)]
-struct OpTimeline {
-    /// op → summed elapsed (ms) of its finished runs on this target.
-    completed: HashMap<Op, u64>,
-    /// the currently-open op and its server start timestamp, if any.
-    active: Option<(Op, u64)>,
 }
 
 /// Map an individually-typed engine event to the op-timeline boundary it
 /// represents, if any. This is where the well-defined engine events are collapsed
 /// into the shared per-target timeline; a new op needs one arm here.
-fn event_op_boundary(kind: &BuildEventKind) -> Option<(&str, Op, Boundary)> {
+pub(crate) fn event_op_boundary(kind: &BuildEventKind) -> Option<(&str, Op, Boundary)> {
     match kind {
         BuildEventKind::ExecuteStart { addr, .. } => Some((addr, Op::Execute, Boundary::Start)),
         BuildEventKind::ExecuteEnd { addr, .. } => Some((addr, Op::Execute, Boundary::End)),
@@ -675,58 +353,21 @@ fn event_op_boundary(kind: &BuildEventKind) -> Option<(&str, Op, Boundary)> {
 
 /// Folds the engine's build-progress event stream into renderable state.
 #[derive(Debug, Default)]
+///
+/// Per target it keeps nothing of its own: every target's state, op times,
+/// matched and cached bits live in [`Self::dash`]'s fixed-size records,
+/// named by an interned id. What is keyed by address here is bounded by
+/// what is waiting or running right now (the wait maps, the clamps, the
+/// spotlight's orderings), or by the caches a build declares.
 pub struct BuildState {
-    /// Addrs between `ResultStart` and `ResultEnd` — the "running" set.
-    in_flight_results: HashSet<String>,
-    /// addr → per-target operation timeline. Drives the worker braille (count of
-    /// targets whose active op is `Execute`) and the slow-target breakdown rows.
-    /// An entry persists only while its target can still be "slow": completed
-    /// durations are kept alongside a later active op so the breakdown stays
-    /// right, but the whole entry is dropped once the target's `ResultEnd`
-    /// arrives (see the `ResultEnd` arm of [`BuildState::apply`]) — by then every
-    /// op has closed and nothing will ever read it again, so keeping it would be
-    /// a per-target allocation for the rest of the request at 100k-target scale.
-    ops: HashMap<String, OpTimeline>,
-    /// The addrs in `ops` whose timeline has an op open right now — the live
-    /// subset the render path cares about.
-    ///
-    /// Walking all of `ops` to find the few with an open op cost ~2 ms in the
-    /// worker braille and ~3 ms in the slow rows on *every* frame at 100k
-    /// targets. This set is bounded by what is in flight instead. Maintained at
-    /// the one place `OpTimeline::active` changes, so it cannot drift from it.
-    open_ops: HashSet<String>,
-    /// The matched top-level target set, accumulated as the matcher streams.
-    matched: HashSet<String>,
-    /// Whether any `Matched` event has been seen (gates display of the line).
-    matched_seen: bool,
-    /// Whether the matched set is final (matcher fully resolved). While false
-    /// the total is provisional and rendered with a `~` prefix.
-    matched_complete: bool,
-    /// Every addr that reached `ResultEnd` (deduped). Matched progress is
-    /// `matched ∩ finished` — order-independent, since `Matched` events can
-    /// arrive after some matched results already finished.
-    finished: HashSet<String>,
-    /// `|matched ∩ finished|`, folded incrementally by [`BuildState::apply`].
-    ///
-    /// The header reads this on every frame, and rescanning `matched` there cost
-    /// ~21-24 ms at 100k targets. Maintained at **both** edges of the
-    /// intersection — a `Matched` event that names an already-finished addr, and
-    /// a `ResultEnd` for an already-matched addr — because neither event is
-    /// guaranteed to arrive first. Each edge fires only when its `HashSet::insert`
-    /// reports the addr was new, so duplicate events cannot double-count.
-    matched_finished: usize,
-    /// `|matched ∩ cache_hit|`, folded on the same two-edge rule as
-    /// [`BuildState::matched_finished`].
-    matched_cached: usize,
+    /// `ResultEnd`s of targets that had started, by outcome: no error,
+    /// an error, a stop. Counted once each, as the model's in-flight bit
+    /// says.
     completed: usize,
     errored: usize,
-    /// Failed targets in failure order, each with its error message (if the
-    /// `ResultEnd` carried one). Drives the [`ViewMode::Failed`] body.
-    failed: Vec<(String, Option<String>)>,
-    /// Successfully completed targets in completion order (cache hits included —
-    /// any `ResultEnd` with no error). Drives the [`ViewMode::Done`] body; the
-    /// `Matched` scope filters this against `matched`.
-    done: Vec<String>,
+    /// Targets a stop ended (`ResultEnd.cancelled`): not `errored`, not
+    /// `completed`.
+    cancelled: usize,
     /// Targets whose driver actually ran to success (`ExecuteEnd` with no error).
     /// Distinct from `completed`, which includes cache hits that never executed.
     executed: usize,
@@ -734,16 +375,6 @@ pub struct BuildState {
     /// `CacheHitRebuilt` — the same fold the GHA report and telemetry use, so
     /// the summary line agrees with them. The tier events are not counted.
     cache: CacheCounts,
-    /// Addrs whose cache outcome was a hit that still stands. The header's
-    /// "cached" count is `matched ∩ cache_hit` so it tracks matched targets
-    /// only, not the transitive deps that also hit cache.
-    ///
-    /// A hit can be **retracted**: the engine decides a hit from the revision's
-    /// manifest, and a manifest can outlive its blobs (a local GC, an
-    /// object-store lifecycle rule, or simply a revision whose blobs were never
-    /// pulled on a run that is now offline). The engine then rebuilds the target
-    /// and says so with `CacheHitRebuilt`.
-    cache_hit: HashSet<String>,
     /// Worker capacity announced by the engine via `RequestConfig`. `None` until
     /// the event lands (no worker indicator rendered before then).
     max_workers: Option<usize>,
@@ -779,17 +410,10 @@ pub struct BuildState {
     /// blocked for three minutes between them is the whole reason the build was
     /// slow, and by the time anyone reads the summary every wait has ended.
     scratch_wait_totals: HashMap<String, (u64, u64)>,
-    /// Every pool: its unit and capacity as `RequestConfig` announced them,
-    /// and what the running targets hold of it. `held` is the sum of
-    /// `running_reserved`, kept at Start/End so the header reads it without
-    /// walking the targets. A pool a target reserves that was never announced
-    /// (a host that announces no pools) is added with its default unit and no
-    /// capacity.
-    pools: BTreeMap<String, PoolView>,
-    /// What each running target reserved, by addr, between its
-    /// `ExecuteStart` and `ExecuteEnd`: the key that makes a repeated Start
-    /// count once and an unpaired End subtract nothing.
-    running_reserved: HashMap<String, BTreeMap<String, u64>>,
+    /// Every pool's unit as `RequestConfig` announced it, for the words of a
+    /// clamp and an admission wait. What a pool holds is its own report
+    /// (`PoolUsage`, in [`Self::dash`]), never a sum of reservations.
+    units: BTreeMap<String, Unit>,
     /// Targets whose admission has waited past the notice threshold, by
     /// addr. Added on `AdmissionWaitStart`, removed on `AdmissionWaitEnd`.
     admission_waits: HashMap<String, AdmissionWait>,
@@ -797,49 +421,61 @@ pub struct BuildState {
     /// `cpu 16→4` their row shows. Set at `ExecuteStart`, cleared at
     /// `ExecuteEnd`; a target that got what it asked for is not here.
     clamped: HashMap<String, String>,
+    /// The line's spotlight: the waits and runs ordered by start, the root
+    /// failure on show, and the hold. See [`spotlight`].
+    spot: spotlight::SpotIndex,
+    /// Failures with no `upstream_of`: the roots. `errored` less this is
+    /// what they took down, as the finished line splits it.
+    root_failed: usize,
+    /// heph's home, redacted from every error text this state keeps (I9).
+    redact: crate::tui::text::Redact,
+    /// The dashboard's fold: one record per target in per-state buckets,
+    /// and each bounded pool's latest `PoolUsage`. The one source of the
+    /// line's and the box's counts and gauges.
+    dash: crate::tui::dashboard::Model,
 }
 
-/// One pool as the header shows it.
+/// A root failure's reason, as the line's spotlight and the dashboard's
+/// PHASE column show it: `exit 101`, `timed out 10m`, or the error's first
+/// line, cleaned and redacted.
+pub(crate) fn failure_reason(
+    error: &str,
+    exit_status: Option<&str>,
+    timed_out: Option<&hcore::events::TimedOutData>,
+    redact: &crate::tui::text::Redact,
+) -> String {
+    spotlight::RootFailure::reason(error, exit_status, timed_out, redact)
+}
+
+/// How a finished run ended: the final line's mark and the dashboard title
+/// row's verdict both say this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PoolView {
-    unit: Unit,
-    /// `None`: unbounded, or never announced.
-    capacity: Option<u64>,
-    /// What the running targets hold, in the unit's base.
-    held: u64,
-    /// How many announced admission waits name this pool: the count of
-    /// `admission_waits` on it, kept at Start/End. It is how a pool no
-    /// running target reports holding shows at all: `sandbox`, whose slot is
-    /// the engine's and never in `reserved`.
-    waiting: u64,
-    /// The `removals_pending` of the latest `AdmissionWaitStart` on this
-    /// pool that carried one (`sandbox` only): finished runs whose sandbox
-    /// was not removed yet, the cause of a `sandbox` wait. Shown beside
-    /// `waiting` while that is above 0.
-    removals_pending: u64,
+enum Outcome {
+    Done,
+    Failed,
+    /// A user stop, whatever finished before it.
+    Stopped,
 }
 
-impl PoolView {
-    fn of(pool: &str) -> Self {
-        Self {
-            unit: Unit::default_for(pool),
-            capacity: None,
-            held: 0,
-            waiting: 0,
-            removals_pending: 0,
-        }
-    }
-}
-
-/// What an `ExecuteStart` reserved; a frame without `reserved` (an older
-/// host) counts as one CPU, which is what such a host reserved.
-fn reserved_of(reserved: Option<&BTreeMap<String, u64>>) -> BTreeMap<String, u64> {
-    match reserved {
-        None => BTreeMap::from([(
-            hcore::capacity::CPU.to_owned(),
-            hcore::capacity::MICROS_PER_CPU,
-        )]),
-        Some(r) => r.clone(),
+/// The finished line's split of the failed count, from
+/// [`BuildState::failure_split`]: ` (1 root, 2 because of it)`, ` (2 roots)`;
+/// empty when nothing failed.
+fn failure_split_text((roots, took_down): (usize, usize)) -> String {
+    let named = match roots {
+        0 => None,
+        1 => Some("1 root".to_owned()),
+        n => Some(format!("{n} roots")),
+    };
+    let blame = match roots {
+        0 => "a dependency",
+        1 => "it",
+        _ => "them",
+    };
+    match (named, took_down) {
+        (None, 0) => String::new(),
+        (Some(named), 0) => format!(" ({named})"),
+        (Some(named), n) => format!(" ({named}, {n} because of {blame})"),
+        (None, n) => format!(" ({n} because of {blame})"),
     }
 }
 
@@ -922,6 +558,25 @@ impl BuildState {
         Self::default()
     }
 
+    /// Redact `redact`'s paths from every error text kept from here on.
+    pub fn set_redact(&mut self, redact: crate::tui::text::Redact) {
+        self.redact = redact;
+    }
+
+    /// `(roots, took down)`: the failures that are their own, and those
+    /// that failed only because a dependency did.
+    pub fn failure_split(&self) -> (usize, usize) {
+        (
+            self.root_failed,
+            self.errored.saturating_sub(self.root_failed),
+        )
+    }
+
+    /// Something failed, or a stop ended a target: the finished line's `✗`.
+    pub fn unsuccessful(&self) -> bool {
+        self.errored > 0 || self.cancelled > 0
+    }
+
     /// How to name the session behind a lock holder's pid. See
     /// [`HolderNames`].
     pub fn name_lock_holders(&mut self, names: HolderNames) {
@@ -951,53 +606,28 @@ impl BuildState {
             self.last_event_ms
                 .map_or(ev.at_unix_ms, |t| t.max(ev.at_unix_ms)),
         );
-        // Generic op timeline: any event that is an op boundary folds here,
-        // independent of the counter side effects handled in the match below.
-        if let Some((addr, op, boundary)) = event_op_boundary(&ev.kind) {
-            let tl = self.ops.entry(addr.to_string()).or_default();
-            match boundary {
-                Boundary::Start => {
-                    // Overlap guard: if an op is somehow still open (a missing or
-                    // reordered end), fold it into completed before opening the new
-                    // one so durations stay bounded and `active` reflects reality.
-                    if let Some((prev_op, prev_start)) = tl.active.take() {
-                        *tl.completed.entry(prev_op).or_insert(0) +=
-                            ev.at_unix_ms.saturating_sub(prev_start);
-                    }
-                    tl.active = Some((op, ev.at_unix_ms));
+        // The op timeline is the model's (one record per target); what this
+        // state keeps of it is the spotlight's run order, which follows the
+        // record's open op across the fold. A `ResultEnd` closes it too.
+        let op_addr = match &ev.kind {
+            BuildEventKind::ResultEnd { addr, .. } => Some(addr.as_str()),
+            kind => event_op_boundary(kind).map(|(addr, ..)| addr),
+        };
+        let open_before = op_addr.and_then(|addr| self.dash.open_since(addr));
+        // Counted once per started target: the model clears the bit below.
+        let was_in_flight = match &ev.kind {
+            BuildEventKind::ResultEnd { addr, .. } => self.dash.in_flight(addr),
+            _ => false,
+        };
+        self.dash.apply(ev, &self.redact);
+        if let Some(addr) = op_addr {
+            let open_after = self.dash.open_since(addr);
+            if open_before != open_after {
+                if let Some(at) = open_before {
+                    self.spot.running.remove(&(at, addr.to_owned()));
                 }
-                Boundary::End => {
-                    // Ignore a mismatched/duplicate close: only the currently-open
-                    // op can end.
-                    if let Some((active_op, start)) = tl.active
-                        && active_op == op
-                    {
-                        *tl.completed.entry(op).or_insert(0) += ev.at_unix_ms.saturating_sub(start);
-                        tl.active = None;
-                    }
-                }
-            }
-            // Mirror the transition into the live index the frame path walks. Kept
-            // here, at the sole writer of `active`, so the two cannot disagree.
-            let open = tl.active.is_some();
-            if open {
-                if !self.open_ops.contains(addr) {
-                    self.open_ops.insert(addr.to_string());
-                }
-            } else {
-                self.open_ops.remove(addr);
-                // Retention tail: `RemoteCacheWrite` is pushed from a detached
-                // background task (`Engine::spawn_remote_upload`), which the
-                // engine deliberately does not await inside the `ResultEnd` scope
-                // (see its doc comment in `remote_cache.rs`) — so its Start/End
-                // can arrive for an addr *after* that addr's `ResultEnd` already
-                // fired and removed the entry below. When that happens this Start
-                // recreates the entry (`entry().or_default()` above); nothing
-                // would ever remove it again unless caught here. Whichever
-                // closing edge is actually last — `ResultEnd` or this trailing
-                // End — is the one that reclaims it.
-                if self.finished.contains(addr) {
-                    self.ops.remove(addr);
+                if let Some(at) = open_after {
+                    self.spot.running.insert((at, addr.to_owned()));
                 }
             }
         }
@@ -1009,75 +639,59 @@ impl BuildState {
                 ..
             } => {
                 self.max_workers = Some(*count);
-                for (pool, &capacity) in resources {
-                    let view = self.pool_mut(pool);
-                    view.unit = hcore::events::unit_of(units, pool);
-                    // An unbounded pool has no capacity to show a share of.
-                    view.capacity = capacity;
+                for pool in resources.keys() {
+                    self.units
+                        .insert(pool.clone(), hcore::events::unit_of(units, pool));
                 }
             }
-            BuildEventKind::Matched { addrs, complete } => {
-                self.matched_seen = true;
-                // The loop below replaced an `extend`, which reserved off the
-                // iterator's size hint; keep that so a wide `Matched` batch does
-                // not rehash its way up.
-                self.matched.reserve(addrs.len());
-                for addr in addrs {
-                    // The matched-set edge of both intersections: an addr can be
-                    // named here *after* it finished or hit cache, so fold those
-                    // in now. `insert` guards against a repeated addr.
-                    if self.matched.insert(addr.clone()) {
-                        if self.finished.contains(addr) {
-                            self.matched_finished += 1;
-                        }
-                        if self.cache_hit.contains(addr) {
-                            self.matched_cached += 1;
-                        }
-                    }
+            // Folded by `dash`: the matched bit and the in-flight bit.
+            BuildEventKind::Matched { .. } | BuildEventKind::ResultStart { .. } => {}
+            BuildEventKind::ResultEnd {
+                addr,
+                error,
+                upstream_of,
+                exit_status,
+                timed_out,
+                cancelled,
+                ..
+            } => {
+                // A root failure — one no dependency caused — takes the
+                // spotlight until a newer one does. Collateral ones never do,
+                // nor a stop: Ctrl-C is not a failure to explain.
+                if let Some(err) = error
+                    && upstream_of.is_none()
+                    && !cancelled
+                    && self
+                        .spot
+                        .root_failure
+                        .as_ref()
+                        .is_none_or(|f| f.is_replaced_by(ev.at_unix_ms, addr))
+                {
+                    self.spot.root_failure = Some(spotlight::RootFailure {
+                        at_ms: ev.at_unix_ms,
+                        addr: addr.clone(),
+                        reason: spotlight::RootFailure::reason(
+                            err,
+                            exit_status.as_deref(),
+                            timed_out.as_ref(),
+                            &self.redact,
+                        ),
+                    });
                 }
-                if *complete {
-                    self.matched_complete = true;
-                }
-            }
-            BuildEventKind::ResultStart { addr } => {
-                self.in_flight_results.insert(addr.clone());
-            }
-            BuildEventKind::ResultEnd { addr, error, .. } => {
-                if self.in_flight_results.remove(addr) {
-                    if let Some(err) = error {
+                if was_in_flight {
+                    if error.is_some() && *cancelled {
+                        // Stopped, not failed: in neither count, and not
+                        // a row of the Failed tab.
+                        self.cancelled += 1;
+                    } else if error.is_some() {
                         self.errored += 1;
-                        self.failed.push((addr.clone(), Some(err.clone())));
+                        if upstream_of.is_none() {
+                            self.root_failed += 1;
+                        }
                     } else {
                         self.completed += 1;
-                        self.done.push(addr.clone());
                     }
                 }
-                // Record every terminal addr. This is the result edge of
-                // `matched ∩ finished`; the `Matched` arm covers the other one,
-                // so the count is right whichever event arrives first.
-                if self.finished.insert(addr.clone()) && self.matched.contains(addr) {
-                    self.matched_finished += 1;
-                }
-                // Retention: `ResultEnd` is emitted by the drop guard wrapping the
-                // whole `inner_result_addr` scope, so by the time it fires,
-                // Execute/LocalCacheWrite/RemoteCacheRead have all closed for this
-                // addr (they run awaited inside that scope) and neither reader
-                // walks a closed entry — keeping it around would be unbounded
-                // per-target memory for the rest of the run. `open_ops.remove` is
-                // normally a no-op here (the entry left it already) but guards
-                // against a dangling index entry if `active` were somehow still
-                // open at this point.
-                //
-                // `RemoteCacheWrite` is the one op this does NOT catch:
-                // `Engine::spawn_remote_upload` pushes it from a detached
-                // background task the engine deliberately does not await inside
-                // this scope, so its Start/End can arrive after this removal has
-                // already run. The `Boundary::End` arm above closes that tail —
-                // it checks `self.finished` and reclaims the (re-created) entry
-                // itself once that trailing op closes, so whichever event is
-                // actually last is the one that frees it.
-                self.ops.remove(addr);
-                self.open_ops.remove(addr);
             }
             // The op timeline (folded above) tracks Execute's duration; here we
             // keep only the `executed` counter side effect on a successful end.
@@ -1102,24 +716,10 @@ impl BuildState {
                         self.clamped.remove(addr);
                     }
                 }
-                let held = reserved_of(reserved.as_ref());
-                for (pool, &amount) in &held {
-                    let view = self.pool_mut(pool);
-                    view.held = view.held.saturating_add(amount);
-                }
-                // A repeated Start replaces, rather than adds to, what the
-                // addr holds.
-                if let Some(prev) = self.running_reserved.insert(addr.clone(), held) {
-                    self.release(&prev);
-                }
             }
             BuildEventKind::ExecuteEnd { addr, error } => {
                 if error.is_none() {
                     self.executed += 1;
-                }
-                // An End with no Start releases nothing.
-                if let Some(held) = self.running_reserved.remove(addr) {
-                    self.release(&held);
                 }
                 self.clamped.remove(addr);
             }
@@ -1134,11 +734,6 @@ impl BuildState {
             } => {
                 // A repeated Start replaces the wait, so it counts once.
                 self.end_admission_wait(addr);
-                let view = self.pool_mut(pool);
-                view.waiting = view.waiting.saturating_add(1);
-                if let Some(n) = *removals_pending {
-                    view.removals_pending = n;
-                }
                 self.admission_waits.insert(
                     addr.clone(),
                     AdmissionWait {
@@ -1161,21 +756,15 @@ impl BuildState {
             | BuildEventKind::LocalCacheMiss { .. }
             | BuildEventKind::RemoteCacheHit { .. }
             | BuildEventKind::RemoteCacheMiss { .. } => {}
-            BuildEventKind::CacheOutcome { addr, outcome } => {
+            // The per-target hit bit is the model's; a retracted hit clears it.
+            BuildEventKind::CacheOutcome { .. } => {
                 self.cache.apply(&ev.kind);
-                if matches!(
-                    outcome,
-                    CacheOutcomeKind::LocalHit | CacheOutcomeKind::RemoteHit
-                ) {
-                    self.note_cache_hit(addr);
-                }
             }
-            BuildEventKind::CacheHitRebuilt { addr, .. } => {
+            BuildEventKind::CacheHitRebuilt { .. } => {
                 // A rebuild whose `was` this build does not know moves nothing
-                // in the fold, so it must not move the header's set either.
+                // in the fold.
                 if CacheCounts::delta(&ev.kind).is_some() {
                     self.cache.apply(&ev.kind);
-                    self.retract_cache_hit(addr);
                 }
             }
             BuildEventKind::ResultLockWaitStart {
@@ -1183,16 +772,21 @@ impl BuildState {
                 holder_pid,
                 in_use_by_readers,
             } => {
-                self.lock_waits.insert(
+                if let Some((_, since)) = self.lock_waits.insert(
                     addr.clone(),
                     (
                         LockHolder::of(*holder_pid, *in_use_by_readers),
                         ev.at_unix_ms,
                     ),
-                );
+                ) {
+                    self.spot.lock.remove(&(since, addr.clone()));
+                }
+                self.spot.lock.insert((ev.at_unix_ms, addr.clone()));
             }
             BuildEventKind::ResultLockWaitEnd { addr } => {
-                self.lock_waits.remove(addr);
+                if let Some((_, since)) = self.lock_waits.remove(addr) {
+                    self.spot.lock.remove(&(since, addr.clone()));
+                }
             }
             BuildEventKind::ScratchLockWaitStart {
                 addr,
@@ -1200,7 +794,7 @@ impl BuildState {
                 access,
                 holder_pid,
             } => {
-                self.scratch_waits.insert(
+                if let Some(prev) = self.scratch_waits.insert(
                     addr.clone(),
                     ScratchWait {
                         scratch: scratch.clone(),
@@ -1208,7 +802,15 @@ impl BuildState {
                         holder_pid: *holder_pid,
                         since_ms: ev.at_unix_ms,
                     },
-                );
+                ) {
+                    self.unindex_scratch_wait(addr, &prev);
+                }
+                self.spot.scratch.insert((ev.at_unix_ms, addr.clone()));
+                self.spot
+                    .by_cache
+                    .entry(scratch.clone())
+                    .or_default()
+                    .insert((ev.at_unix_ms, addr.clone()));
             }
             // The prepare span is folded into the op timeline above, and its
             // outcome is reported by the CI view rather than counted here — a
@@ -1218,6 +820,7 @@ impl BuildState {
             | BuildEventKind::ScratchPrepareEnd { .. } => {}
             BuildEventKind::ScratchLockWaitEnd { addr, .. } => {
                 if let Some(w) = self.scratch_waits.remove(addr) {
+                    self.unindex_scratch_wait(addr, &w);
                     let e = self.scratch_wait_totals.entry(w.scratch).or_insert((0, 0));
                     e.0 += 1;
                     e.1 += ev.at_unix_ms.saturating_sub(w.since_ms);
@@ -1243,8 +846,7 @@ impl BuildState {
             BuildEventKind::SelectionIncomplete { .. } => {}
             // Codegen index diagnostics are log lines, not build counters.
             BuildEventKind::CodegenExcluded { .. } | BuildEventKind::CodegenImported { .. } => {}
-            // The header's gauges still sum `ExecuteStart.reserved`; nothing
-            // draws the pool's own report yet.
+            // Folded by `dash`: the gauges are the pool's own report.
             BuildEventKind::PoolUsage { .. } => {}
             // The Outputs tab's groups; nothing draws the tab yet.
             BuildEventKind::ResultOutputs { .. } => {}
@@ -1252,29 +854,7 @@ impl BuildState {
             // than fatal — see `BuildEventKind::Unknown`.
             BuildEventKind::Unknown => {}
         }
-    }
-
-    /// Record a hit outcome (local or remote). This is the cache edge of
-    /// `matched ∩ cache_hit`; the `Matched` arm of [`BuildState::apply`] covers
-    /// the other one, so the count is right whichever event arrives first. A
-    /// repeat hit on an addr already in the set does not re-count.
-    fn note_cache_hit(&mut self, addr: &str) {
-        if self.cache_hit.insert(addr.to_string()) && self.matched.contains(addr) {
-            self.matched_cached += 1;
-        }
-    }
-
-    /// Undo [`note_cache_hit`](Self::note_cache_hit) on a `CacheHitRebuilt`:
-    /// the target is about to build after all. The counts themselves moved in
-    /// [`CacheCounts`]; this is the header's set and its folded intersection.
-    ///
-    /// Dropping the addr from `cache_hit` alone is not enough: `matched_cached`
-    /// is folded, not rescanned, so it has to be decremented in the same breath
-    /// or the header keeps reporting a target as cached while it builds.
-    fn retract_cache_hit(&mut self, addr: &str) {
-        if self.cache_hit.remove(addr) && self.matched.contains(addr) {
-            self.matched_cached = self.matched_cached.saturating_sub(1);
-        }
+        self.fold_spotlight(ev.at_unix_ms);
     }
 
     /// Targets whose *currently-active* op has run longer than `threshold_ms`,
@@ -1285,26 +865,27 @@ impl BuildState {
     /// with no active op is never slow (it dropped off when its last op ended).
     fn long_running(&self, now_ms: u64, threshold_ms: u64) -> Vec<SlowTarget> {
         // Walks only the targets with an op open, not every target the run has
-        // touched — see [`BuildState::open_ops`]. This runs on every frame of the
-        // live view.
+        // touched. This runs on every frame of the live view.
         let mut out: Vec<SlowTarget> = self
-            .open_ops
-            .iter()
-            .filter_map(|addr| {
-                let tl = self.ops.get(addr)?;
-                let (active_op, active_start) = tl.active?;
-                let active_elapsed = now_ms.saturating_sub(active_start);
+            .dash
+            .open_ops()
+            .filter_map(|(id, r)| {
+                let active_op = r.op()?;
+                let active_elapsed = now_ms.saturating_sub(r.op_since_ms);
                 if active_elapsed <= threshold_ms {
                     return None;
                 }
-                // Merge completed durations with the live active op, drop sub-second
-                // ops, and order the breakdown by pipeline position.
-                let mut durs = tl.completed.clone();
-                *durs.entry(active_op).or_insert(0) += active_elapsed;
-                let mut breakdown: Vec<(Op, u64)> =
-                    durs.into_iter().filter(|&(_, ms)| ms >= 1000).collect();
-                breakdown.sort_by_key(|&(op, _)| op.order());
-                Some((addr.clone(), active_elapsed, breakdown))
+                // The finished runs plus the live one, sub-second ops dropped,
+                // in pipeline order.
+                let breakdown: Vec<(Op, u64)> = Op::BY_ORDER
+                    .iter()
+                    .map(|&op| {
+                        let live = if op == active_op { active_elapsed } else { 0 };
+                        (op, r.op_ms(op) + live)
+                    })
+                    .filter(|&(_, ms)| ms >= 1000)
+                    .collect();
+                Some((self.dash.addr(id).to_owned(), active_elapsed, breakdown))
             })
             .collect();
         out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
@@ -1314,7 +895,7 @@ impl BuildState {
     /// Number of matched top-level targets seen so far (provisional until the
     /// matcher fully resolves). `None` if no `Matched` event has arrived.
     pub fn matched_total(&self) -> Option<usize> {
-        self.matched_seen.then_some(self.matched.len())
+        self.dash.matched_total()
     }
 
     /// Matched-target progress as `(done, total, complete)`: how many matched
@@ -1322,55 +903,47 @@ impl BuildState {
     /// matcher fully resolved (`false` ⇒ the total is provisional). `None` until
     /// a `Matched` event arrives (e.g. a single-target `result_addr` entry).
     ///
-    /// `O(1)` — the intersection is folded in [`BuildState::apply`], not scanned
-    /// here. This runs on every frame.
+    /// `O(1)`: bucket lengths in the model.
     pub fn matched_progress(&self) -> Option<(usize, usize, bool)> {
-        if !self.matched_seen {
+        if !self.dash.matched_seen() {
             return None;
         }
-        // A subset-count that has drifted above the set it counts into is the
-        // observable symptom of a missed fold edge. Free in release; turns a
-        // desync into a failure across the whole suite, not just one test.
-        debug_assert!(
-            self.matched_finished <= self.matched.len(),
-            "matched_finished {} exceeds matched {}",
-            self.matched_finished,
-            self.matched.len(),
-        );
-        Some((
-            self.matched_finished,
-            self.matched.len(),
-            self.matched_complete,
-        ))
+        let tabs = self.dash.counts(CountScope::Matched);
+        Some((tabs.ended(), tabs.all(), self.dash.matched_complete()))
     }
 
-    /// The count fields for one frame — see [`Counts`]. `O(1)`: every field is
-    /// either a `len()` or a counter folded in [`BuildState::apply`], so this is
-    /// four reads and the `format!`s, with no walk of any target set.
+    /// The count fields for one frame — see [`Counts`]. `O(1)`: every field
+    /// is a bucket length in the dashboard's fold, the one source of the
+    /// line's, the box's and the tabs' counts.
     pub fn counts(&self, scope: CountScope) -> Counts {
-        let (done, total) = match scope {
-            // All-targets scope: every observed target (`finished ∪ in_flight`),
-            // with the finished count over that running total. No `~` — the total
-            // grows as deps stream rather than resolving to a fixed matched set.
-            CountScope::All => {
-                let done = self.finished.len();
-                let total = done + self.in_flight_results.len();
-                (done.to_string(), Some(total.to_string()))
+        self.counts_of(&self.dash.counts(scope), scope)
+    }
+
+    /// [`Counts`] from the tabs' counts. Done is Done + Cached (a failure is
+    /// not done); the total is every target in scope, `~`-prefixed while
+    /// the matcher streams. Before any `Matched` event the matched scope has
+    /// no total: `{done} done`.
+    fn counts_of(&self, tabs: &crate::tui::dashboard::TabCounts, scope: CountScope) -> Counts {
+        let total = match scope {
+            // Every observed target: it grows as deps stream rather than
+            // resolving to a fixed set, so it is never provisional.
+            CountScope::All => Some(tabs.all().to_string()),
+            CountScope::Matched if self.dash.matched_seen() => {
+                let tilde = if self.dash.matched_complete() {
+                    ""
+                } else {
+                    "~"
+                };
+                Some(format!("{tilde}{}", tabs.all()))
             }
-            CountScope::Matched => match self.matched_progress() {
-                Some((done, total, complete)) => {
-                    let tilde = if complete { "" } else { "~" };
-                    (done.to_string(), Some(format!("{tilde}{total}")))
-                }
-                None => (self.executed.to_string(), None),
-            },
+            CountScope::Matched => None,
         };
         Counts {
-            done,
+            done: tabs.finished_ok().to_string(),
             total,
-            cached: format!("{} cached", self.cached_count(scope)),
-            waiting: format!("{} waiting", self.admission_waits.len()),
-            failed: format!("{} failed", self.errored),
+            cached: format!("{} cached", tabs.cached),
+            waiting: format!("{} waiting", tabs.blocked),
+            failed: format!("{} failed", tabs.failed_total()),
         }
     }
 
@@ -1384,152 +957,28 @@ impl BuildState {
         (counts.done_segment(), counts.cached, counts.failed)
     }
 
-    /// The textual count segment shared by the live header and the final
-    /// summary: `D / ~N done · C cached · F failed`. No elapsed clock, no worker
+    /// The final summary's count segment: `D / ~N done · C cached · F
+    /// failed`, the failures split into roots and what they took down
+    /// (`3 failed (1 root, 2 because of it)`). No elapsed clock, no worker
     /// braille — callers prepend the elapsed field themselves.
     pub fn counts_segment(&self, scope: CountScope) -> String {
         let (done, cached, failed) = self.count_fields(scope);
-        format!("{done} · {cached} · {failed}")
-    }
-
-    /// Body rows for the [`ViewMode::Failed`] view: one row per failed target,
-    /// addr in red followed by its error message (when one was reported), in
-    /// failure order. Empty when nothing has failed.
-    fn failed_rows(&self, filter: &str) -> BodyRows<'_> {
-        let mut rows = row_buffer(self.failed.len(), filter);
-        rows.extend(
-            self.failed
-                .iter()
-                .filter(|(addr, _)| addr_matches(addr, filter))
-                .map(|(addr, err)| BodyRow {
-                    addr,
-                    color: Color::Red,
-                    // Keep the message on one line; the viewport clips overflow.
-                    detail: err.as_deref().map(|e| e.lines().next().unwrap_or(e)),
-                }),
-        );
-        BodyRows::in_order(rows)
-    }
-
-    /// Body rows for the [`ViewMode::Done`] view: one row per completed target,
-    /// addr in green, in completion order. Scoped by `scope`: `Matched` keeps only
-    /// addrs in the matched top-level set, `All` lists every completed target
-    /// (transitive deps included). Empty when nothing has finished.
-    fn done_rows(&self, scope: CountScope, filter: &str) -> BodyRows<'_> {
-        let mut rows = row_buffer(self.done.len(), filter);
-        rows.extend(
-            self.done
-                .iter()
-                .filter(|addr| match scope {
-                    CountScope::All => true,
-                    CountScope::Matched => self.matched.contains(*addr),
-                })
-                .filter(|addr| addr_matches(addr, filter))
-                .map(|addr| BodyRow {
-                    addr,
-                    color: Color::Green,
-                    detail: None,
-                }),
-        );
-        BodyRows::in_order(rows)
-    }
-
-    /// Body rows for the [`ViewMode::Matched`] view: every matched top-level
-    /// target, ordered by addr for a stable list (the matched set is a
-    /// `HashSet`). Finished targets render green, still-pending ones
-    /// default-white. Empty before any `Matched` event arrives.
-    fn matched_rows(&self, filter: &str) -> BodyRows<'_> {
-        let mut rows = row_buffer(self.matched.len(), filter);
-        rows.extend(
-            self.matched
-                .iter()
-                .filter(|a| addr_matches(a, filter))
-                .map(|addr| BodyRow {
-                    addr,
-                    color: if self.finished.contains(addr) {
-                        Color::Green
-                    } else {
-                        Color::White
-                    },
-                    detail: None,
-                }),
-        );
-        BodyRows::by_addr(rows)
-    }
-
-    /// Body rows for the [`ViewMode::Cached`] view: every target that hit cache
-    /// (local or remote), scoped like the header's cached count — `Matched` keeps
-    /// only matched top-level targets (all cache hits before any `Matched` event),
-    /// `All` lists every cached target. Ordered by addr for a stable list (cache
-    /// hits are keyed by addr). Empty when nothing has hit cache.
-    fn cached_rows(&self, scope: CountScope, filter: &str) -> BodyRows<'_> {
-        let mut rows = row_buffer(self.cache_hit.len(), filter);
-        rows.extend(
-            self.cache_hit
-                .iter()
-                .filter(|a| match scope {
-                    CountScope::All => true,
-                    CountScope::Matched if self.matched_seen => self.matched.contains(*a),
-                    CountScope::Matched => true,
-                })
-                .filter(|a| addr_matches(a, filter))
-                .map(|addr| BodyRow {
-                    addr,
-                    color: Color::Cyan,
-                    detail: None,
-                }),
-        );
-        BodyRows::by_addr(rows)
-    }
-
-    /// The header's cached count: matched targets that hit cache
-    /// (`matched ∩ cache_hit`), falling back to all cache hits before any
-    /// `Matched` event arrives, or to every cached addr under
-    /// [`CountScope::All`].
-    ///
-    /// `O(1)` — the intersection is folded in [`BuildState::apply`], not scanned
-    /// here. This runs on every frame.
-    pub fn cached_count(&self, scope: CountScope) -> usize {
-        match scope {
-            // All-targets scope: every addr that hit cache (deduped), deps included.
-            CountScope::All => self.cache_hit.len(),
-            CountScope::Matched if self.matched_seen => {
-                debug_assert!(
-                    self.matched_cached <= self.matched.len(),
-                    "matched_cached {} exceeds matched {}",
-                    self.matched_cached,
-                    self.matched.len(),
-                );
-                self.matched_cached
-            }
-            CountScope::Matched => usize::try_from(self.cache.hits()).unwrap_or(usize::MAX),
-        }
+        // Split in the same scope as the count it splits.
+        let tabs = self.dash.counts(scope);
+        let split = failure_split_text((tabs.failed, tabs.dep_failed));
+        format!("{done} · {cached} · {failed}{split}")
     }
 
     /// Workers currently holding an execute slot (targets whose active op is
     /// `Execute`). This is the semaphore-bound busy count, not `running` (which
     /// includes targets blocked on deps without a permit).
     ///
-    /// Bounded by what is in flight, not by the run: it walks [`Self::open_ops`],
-    /// not every target that has ever run an op. The header calls this on every
-    /// frame in every view.
+    /// Bounded by what is in flight, not by the run: it walks the model's
+    /// open ops, not every target that has ever run an op.
     pub fn busy_workers(&self) -> usize {
-        // A stale entry here would be silently skipped by this filter and by
-        // `long_running`'s `?`, under-reporting the worker count rather than
-        // failing. `O(in-flight)`, and free in release.
-        debug_assert!(
-            self.open_ops
-                .iter()
-                .all(|addr| self.ops.get(addr).is_some_and(|tl| tl.active.is_some())),
-            "open_ops holds an addr whose timeline has no op open",
-        );
-        self.open_ops
-            .iter()
-            .filter(|addr| {
-                self.ops
-                    .get(*addr)
-                    .is_some_and(|tl| matches!(tl.active, Some((Op::Execute, _))))
-            })
+        self.dash
+            .open_ops()
+            .filter(|(_, r)| r.op() == Some(Op::Execute))
             .count()
     }
 
@@ -1538,78 +987,71 @@ impl BuildState {
         self.max_workers
     }
 
-    /// Take a finished target's reservation off the running sums. Saturating:
-    /// a sum can never go below zero, whatever order the events came in.
-    fn release(&mut self, held: &BTreeMap<String, u64>) {
-        for (pool, &amount) in held {
-            if let Some(view) = self.pools.get_mut(pool) {
-                view.held = view.held.saturating_sub(amount);
+    /// Drop `addr`'s announced admission wait, if any.
+    fn end_admission_wait(&mut self, addr: &str) {
+        self.admission_waits.remove(addr);
+    }
+
+    /// Take a scratch wait that ended or was replaced out of the spotlight's
+    /// order, dropping its cache's group once the last waiter leaves it.
+    fn unindex_scratch_wait(&mut self, addr: &str, w: &ScratchWait) {
+        let key = (w.since_ms, addr.to_owned());
+        self.spot.scratch.remove(&key);
+        if let Some(group) = self.spot.by_cache.get_mut(&w.scratch) {
+            group.remove(&key);
+            if group.is_empty() {
+                self.spot.by_cache.remove(&w.scratch);
             }
         }
     }
 
-    /// Drop `addr`'s announced admission wait, if any, and its count on the
-    /// pool it named. Saturating, like [`release`](Self::release).
-    fn end_admission_wait(&mut self, addr: &str) {
-        if let Some(w) = self.admission_waits.remove(addr)
-            && let Some(view) = self.pools.get_mut(&w.pool)
-        {
-            view.waiting = view.waiting.saturating_sub(1);
-        }
-    }
-
-    /// Pool `pool`'s entry, added with its default unit and no capacity when
-    /// it was never announced.
-    fn pool_mut(&mut self, pool: &str) -> &mut PoolView {
-        self.pools
-            .entry(pool.to_owned())
-            .or_insert_with(|| PoolView::of(pool))
-    }
-
     /// Pool `pool`'s unit: as announced, else its default.
     fn unit_of(&self, pool: &str) -> Unit {
-        self.pools
+        self.units
             .get(pool)
-            .map_or_else(|| Unit::default_for(pool), |v| v.unit)
+            .copied()
+            .unwrap_or_else(|| Unit::default_for(pool))
     }
 
-    /// The cpu the running targets hold, in CPUs (rounded up). Kept at
-    /// `ExecuteStart`/`ExecuteEnd`; reading it walks nothing.
+    /// The dashboard's fold: records, buckets and gauges.
+    pub fn dashboard(&self) -> &crate::tui::dashboard::Model {
+        &self.dash
+    }
+
+    /// The cpu pool holds, in CPUs (rounded up), as its latest `PoolUsage`
+    /// reported it. Reading it walks nothing.
     pub fn busy_cpus(&self) -> usize {
-        let held = self.pools.get(hcore::capacity::CPU).map_or(0, |v| v.held);
+        let held = self.dash.pool(hcore::capacity::CPU).map_or(0, |g| g.held);
         usize::try_from(held.div_ceil(hcore::capacity::MICROS_PER_CPU)).unwrap_or(usize::MAX)
     }
 
-    /// One `<pool> <held>/<capacity>` segment per pool other than `cpu`
-    /// (which the worker cells show) that a running target holds some of,
-    /// in name order and in the pool's unit: `memory 2.0 GiB/16.0 GiB`,
-    /// `gpu 1/2`. An unbounded pool has no capacity: `tokens 5`. A pool that
-    /// announced admission waits name adds how many: `gpu 2/2, 3 waiting`;
-    /// one no running target reports holding shows by its waits alone:
-    /// `sandbox: 3 waiting` (its slots are the engine's, in no `reserved`).
-    /// Walks the pools, never the targets.
+    /// One `<pool> <held>/<capacity>` segment per bounded pool other than
+    /// `cpu` (which the worker cells show) that holds some of itself or has
+    /// waiters, from the pool's own `PoolUsage`, in the gauges' fixed order
+    /// (memory, sandbox, then declared pools by name) and the pool's unit:
+    /// `memory 2.0 GiB/16.0 GiB`, `gpu 2/2, 3 waiting`, `sandbox: 3 waiting
+    /// (2 removals pending)`. Walks the pools, never the targets.
     pub fn pool_segments(&self) -> impl Iterator<Item = String> + '_ {
-        self.pools
-            .iter()
-            .filter(|(pool, v)| {
-                pool.as_str() != hcore::capacity::CPU && (v.held > 0 || v.waiting > 0)
-            })
-            .map(|(pool, v)| {
-                let held = hcore::events::display_amount(v.unit, v.held);
-                let base = match (v.held, v.capacity) {
-                    (0, _) => format!("{pool}:"),
-                    (_, Some(cap)) => format!(
-                        "{pool} {held}/{}",
-                        hcore::events::display_amount(v.unit, cap)
+        self.dash
+            .gauges()
+            .into_iter()
+            .filter(|g| g.pool != hcore::capacity::CPU && (g.held > 0 || g.waiting > 0))
+            .map(|g| {
+                let pool = &g.pool;
+                let base = match g.held {
+                    0 => format!("{pool}:"),
+                    held => format!(
+                        "{pool} {}/{}",
+                        hcore::events::display_amount(g.unit, held),
+                        hcore::events::display_amount(g.unit, g.capacity)
                     ),
-                    (_, None) => format!("{pool} {held}"),
                 };
-                let waiting = match v.waiting {
+                let waiting = match g.waiting {
                     0 => return base,
-                    n if v.held == 0 => format!("{base} {n} waiting"),
+                    n if g.held == 0 => format!("{base} {n} waiting"),
                     n => format!("{base}, {n} waiting"),
                 };
-                match v.removals_pending {
+                match g.removals_pending {
                     0 => waiting,
                     1 => format!("{waiting} (1 removal pending)"),
                     n => format!("{waiting} ({n} removals pending)"),
@@ -1666,10 +1108,11 @@ impl BuildState {
     /// Whether any build activity was observed. Used to suppress an all-zero
     /// final summary for commands that emit no build events (inspect/query).
     pub fn has_activity(&self) -> bool {
-        self.matched_seen
+        self.dash.matched_seen()
             || self.completed > 0
             || self.errored > 0
-            || !self.in_flight_results.is_empty()
+            || self.cancelled > 0
+            || self.dash.in_flight_count() > 0
             || self.cache.consulted() > 0
     }
 
@@ -1692,7 +1135,7 @@ impl BuildState {
             "{matched}done {}, err {}, running {}, cache {} hit / {} miss",
             self.completed,
             self.errored,
-            self.in_flight_results.len(),
+            self.dash.in_flight_count(),
             hits,
             misses,
         )
@@ -1843,13 +1286,10 @@ impl BuildState {
             SessionSnapshot, SnapshotCounts,
         };
         let count = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
-        let mut running: Vec<(&String, _, u64)> = self
-            .open_ops
-            .iter()
-            .filter_map(|addr| {
-                let (op, since) = self.ops.get(addr)?.active?;
-                Some((addr, op, since))
-            })
+        let mut running: Vec<(&str, Op, u64)> = self
+            .dash
+            .open_ops()
+            .filter_map(|(id, r)| Some((self.dash.addr(id), r.op()?, r.op_since_ms)))
             .collect();
         running.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(b.0)));
         let running_unblocked = running
@@ -1858,6 +1298,11 @@ impl BuildState {
                 !self.lock_waits.contains_key(*addr) && !self.admission_waits.contains_key(*addr)
             })
             .count();
+        let all = self.dash.counts(CountScope::All);
+        let matched = self
+            .dash
+            .matched_seen()
+            .then(|| self.dash.counts(CountScope::Matched));
         let mut lock_waits: Vec<(&String, &(LockHolder, u64))> = self.lock_waits.iter().collect();
         lock_waits.sort_by(|a, b| a.0.cmp(b.0));
         let mut admission_waits: Vec<(&String, &AdmissionWait)> =
@@ -1873,7 +1318,7 @@ impl BuildState {
         let totals = ListTotals {
             running: ListTotal::of(running.len(), cap),
             waiting: ListTotal::of(waiting.len(), cap),
-            failed: ListTotal::of(self.failed.len(), cap),
+            failed: ListTotal::of(all.failed_total(), cap),
             lock_waits: ListTotal::of(lock_waits.len(), cap),
             admission_waits: ListTotal::of(admission_waits.len(), cap),
         };
@@ -1881,7 +1326,7 @@ impl BuildState {
             .into_iter()
             .take(cap)
             .map(|(addr, op, since)| RunningTarget {
-                addr: addr.clone(),
+                addr: addr.to_owned(),
                 op: op.name().to_owned(),
                 since_unix_ms: since,
             })
@@ -1916,12 +1361,12 @@ impl BuildState {
             first_event_unix_ms: self.started_at_ms,
             last_event_unix_ms: self.last_event_ms,
             counts: SnapshotCounts {
-                matched: self.matched_seen.then(|| count(self.matched.len())),
-                matched_complete: self.matched_complete,
-                matched_done: count(self.matched_finished),
-                matched_cached: count(self.matched_cached),
-                finished: count(self.finished.len()),
-                in_flight: count(self.in_flight_results.len()),
+                matched: matched.map(|m| count(m.all())),
+                matched_complete: self.dash.matched_complete(),
+                matched_done: count(matched.map_or(0, |m| m.ended())),
+                matched_cached: count(matched.map_or(0, |m| m.cached)),
+                finished: count(all.ended()),
+                in_flight: count(self.dash.in_flight_count()),
                 executed: count(self.executed),
                 failed: count(self.errored),
                 running_unblocked: Some(count(running_unblocked)),
@@ -1929,10 +1374,10 @@ impl BuildState {
             running,
             waiting,
             failed: self
-                .failed
-                .iter()
+                .dash
+                .failures()
                 .take(cap)
-                .map(|(addr, _)| addr.clone())
+                .map(|id| self.dash.addr(id).to_owned())
                 .collect(),
             lock_waits,
             admission_waits,
@@ -2015,6 +1460,12 @@ pub trait ProgressHeader: Send {
     fn header(&self, core: &BuildState, scope: CountScope) -> Vec<HeaderItem>;
     /// The bottom-border label.
     fn label(&self) -> String;
+    /// Whether the line keeps [`label`](Self::label) up once the matcher has
+    /// completed, not only while it streams: an entrypoint's "Invoking …",
+    /// which names what is about to take the terminal.
+    fn label_stands(&self) -> bool {
+        false
+    }
     /// Final summary segment printed after the run (after the elapsed clock).
     /// Empty ⇒ nothing is printed. `scope` is the count scope the view was left
     /// on (the `a` toggle), so the printed summary matches the header the user
@@ -2024,6 +1475,12 @@ pub trait ProgressHeader: Send {
     /// the build counts.
     fn session_kind(&self) -> crate::tui::session::HeaderKind {
         crate::tui::session::HeaderKind::Build
+    }
+    /// Whether `tab` opens a dashboard over the line. `false` for a command
+    /// with no per-target progress (`heph gc`): its line is its own segment,
+    /// with no hint, and `tab` does nothing.
+    fn has_dashboard(&self) -> bool {
+        true
     }
 }
 
@@ -2059,11 +1516,11 @@ impl ProgressHeader for BuildHeader {
         // view). The connective ` / ` and trailing ` done` are inert text. Before
         // any `Matched` event there is no denominator, so it reads `{executed} done`
         // with only the Done tab.
-        let mut done_parts = vec![HeaderPart::tab(ViewMode::Done, done)];
+        let mut done_parts = vec![HeaderPart::text(done)];
         match total {
             Some(total) => {
                 done_parts.push(HeaderPart::text(" / "));
-                done_parts.push(HeaderPart::tab(ViewMode::Matched, total));
+                done_parts.push(HeaderPart::text(total));
                 done_parts.push(HeaderPart::text(" done"));
             }
             None => done_parts.push(HeaderPart::text(" done")),
@@ -2263,6 +1720,10 @@ impl ProgressHeader for GcHeader {
         crate::tui::session::HeaderKind::Gc
     }
 
+    fn has_dashboard(&self) -> bool {
+        false
+    }
+
     fn last_render(&self, _core: &BuildState, _scope: CountScope) -> String {
         if self.targets > 0
             || self.failure_logs.is_some_and(|(n, _)| n > 0)
@@ -2283,41 +1744,58 @@ pub struct TuiProgressView {
     state: BuildState,
     /// Per-command header content (build counts vs gc sweep stats).
     model: Box<dyn ProgressHeader>,
-    /// Body scroll offset (rows from the top of the combined body list). Held in
-    /// a `Cell` so `render` can clamp it against the live row count while staying
-    /// `&self`; `scroll()` mutates it from key events.
-    scroll: Cell<usize>,
-    /// Body horizontal pan offset in columns, for lines wider than the viewport.
-    /// Clamped in `render` against the widest body line; `hscroll()` mutates it.
-    hscroll: Cell<usize>,
-    /// The active body view. `Tab` cycles it through [`ViewMode::Default`] plus
-    /// every tab the header model exposes.
-    view: Cell<ViewMode>,
-    /// Which target set the header counters cover. `a` toggles matched ⇄ all.
-    /// Held in a `Cell` so `render`/`header_item_spans` read it through `&self`.
-    scope: Cell<CountScope>,
     /// Server-wall timestamp captured when the run finished and the viewport was
-    /// held open (user navigated off the main view). `Some` drives the green
-    /// "press q to quit" notice and freezes the elapsed clock at this instant.
+    /// held open (the dashboard was up). `Some` freezes the elapsed clock at
+    /// this instant.
     finished_at_ms: Option<u64>,
-    /// Whether the `/` filter is capturing keystrokes. While `true` printable keys
-    /// edit [`Self::search_query`] instead of triggering the normal shortcuts.
-    /// Only meaningful on the `Done`/`Failed` tabs.
-    search_active: Cell<bool>,
-    /// The active filter for the `Done`/`Failed` bodies: a case-insensitive
-    /// substring matched against the target addr. Empty means no filtering.
-    /// Persists after `Enter` confirms so the filtered list stays scrollable.
-    search_query: RefCell<String>,
+    /// The user stopped the run ([`TUIAppView::set_stopped`]): the final line
+    /// reads `✗ stopped · …`.
+    stopped: bool,
+    /// Whether the dashboard is up (full screen, on the alternate screen)
+    /// rather than the line. A run starts on the line; `Tab` opens the
+    /// dashboard and `Esc` with no filter closes it.
+    dashboard_open: bool,
+    /// The dashboard list's tab, selection, scroll, filter and scope. Kept
+    /// while the dashboard is closed, so `Tab` reopens it where it was.
+    list: crate::tui::dashboard::ListState,
+    /// The LAST LINE column's text per visible row, as `tails` last found it.
+    last_lines: crate::tui::dashboard::LastLines,
+    /// The background reader that fills `last_lines`: the run's own logs
+    /// for a live view ([`Self::with_log_reader`]). `None`: the column shows
+    /// wait and failure text only (an attached view, until it has a reader).
+    tails: Option<crate::tui::dashboard::TailReader>,
+    /// The reader [`Self::tails`] starts on, held until the first dashboard
+    /// frame: a run nobody presses Tab on starts no thread.
+    tail_source: Option<std::sync::Arc<dyn crate::tui::dashboard::LogReader>>,
+    /// The target screen open over the dashboard (Enter / `l` on a row);
+    /// Esc closes it back to the list, its selection kept.
+    target: Option<crate::tui::dashboard::TargetScreen>,
+    /// Where a target screen reads its log and outputs
+    /// ([`Self::with_target_reader`]). `None`: Overview only.
+    target_reader: Option<std::sync::Arc<dyn crate::tui::dashboard::TargetReader>>,
     /// Whose view this is: the run's own, or a session viewer's. The one seam
     /// between the two; everything not behind it renders identically.
     role: Role,
+    /// The first of two ctrl-c on a full screen.
+    stop_arm: crate::tui::stop_arm::StopArm,
+    /// `--dashboard`: the finished run holds until `q` on any screen.
+    pinned: bool,
+    /// The approval view, over whichever screen opened it (the line, the
+    /// dashboard or a target screen); closing it returns there.
+    approval: Option<crate::tui::dashboard::approval::ApprovalScreen>,
+    /// Where the approval view reads notices: the run's store
+    /// ([`Self::with_notices`]).
+    notices: Option<crate::tui::dashboard::approval::NoticeStore>,
+    /// Whether the approval glyph flashes (`✦`/`❖`). Off under reduced
+    /// motion, which is `NO_COLOR` alone: there is no config key for it.
+    motion: bool,
 }
 
 /// Whose terminal a [`TuiProgressView`] draws on.
 ///
 /// `heph session attach` draws the run's own view, so the only things that
-/// differ are here: what acts on the run (cancel, approval `y`/`n`/Enter)
-/// exists only in [`Role::Live`], and an attached view reads what the run's
+/// differ are here: what acts on the run (cancel, the approval view's
+/// decisions) exists only in [`Role::Live`], and an attached view reads what the run's
 /// terminal showed besides build events (its label changes, the approval
 /// prompt, the instant its summary was measured) from the recorded
 /// [`SessionFeed`].
@@ -2327,9 +1805,9 @@ enum Role {
     /// The run of this process.
     Live {
         /// Pending approval prompts shared with the engine's approval handler.
-        /// `None` for commands without an approval gate. When a prompt is
-        /// active it is rendered at the top of the live body and
-        /// `y`/`n`/Enter resolve it.
+        /// `None` for commands without an approval gate. While one is
+        /// pending the line shows its prompt row, and the approval view
+        /// decides it.
         approval: Option<crate::tui::approval::ApprovalCenter>,
     },
     /// A viewer of the recorded session `id`.
@@ -2342,55 +1820,93 @@ enum Role {
     },
 }
 
-/// The keys an approval banner offers, when it offers any.
-struct ApprovalKeys {
-    /// Whether the notice body is expanded (`enter hide` vs `enter view`).
-    expanded: bool,
-}
-
-/// The approval banner and its notice links. Both roles draw through this, so
-/// an attached viewer shows the run's prompt as the run did, without `keys`.
-fn approval_banner<'a>(
-    addr: &str,
-    queued_behind: u64,
-    notices: impl ExactSizeIterator<Item = &'a str>,
-    keys: Option<ApprovalKeys>,
-) -> Vec<Line<'static>> {
-    let mut lines = Vec::with_capacity(1 + notices.len());
-    // When more than one target is awaiting approval, show the total count so
-    // the user knows further prompts follow this one.
-    let total_pending = queued_behind.saturating_add(1);
-    let queued = if total_pending > 1 {
-        format!(" · {total_pending} pending")
+/// The prompt row above the line while a request is pending:
+/// `✦ approval required: //x · 2 pending · enter to review`. Both roles draw
+/// through this; a viewer (`live` false) says where the decision is made
+/// instead of offering a key (I11). Never a notice's path.
+fn approval_prompt_row(glyph: &'static str, addr: &str, pending: u64, live: bool) -> Line<'static> {
+    let queued = if pending > 1 {
+        format!(" · {pending} pending")
     } else {
         String::new()
     };
-    let keys = match keys {
-        None => String::new(),
-        // Only offer the notice-view toggle when there is a notice to view.
-        Some(_) if notices.len() == 0 => APPROVAL_KEYS.to_owned(),
-        Some(ApprovalKeys { expanded: true }) => format!("{APPROVAL_KEYS} · enter hide"),
-        Some(ApprovalKeys { expanded: false }) => format!("{APPROVAL_KEYS} · enter view"),
+    let tail = if live {
+        APPROVAL_REVIEW
+    } else {
+        APPROVAL_ELSEWHERE
     };
-    lines.push(Line::from(Span::styled(
-        format!("  ⚠ approval required: {addr}{keys}{queued}"),
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
-    )));
-    // Name every notice the target declares; the text itself is the inline
-    // preview's (no notice is written to a file to open).
-    for name in notices {
-        lines.push(Line::from(Span::styled(
-            format!("    → notice: {name}"),
-            Style::default().fg(Color::Cyan),
-        )));
-    }
-    lines
+    // As the spec's mockup: the request yellow bold, the rest yellow.
+    let yellow = Style::default().fg(Color::Yellow);
+    let style = yellow.add_modifier(Modifier::BOLD);
+    Line::from(vec![
+        Span::styled(glyph, style),
+        Span::styled(
+            format!(
+                " approval required: {}",
+                crate::tui::text::clean_inline(addr)
+            ),
+            style,
+        ),
+        Span::styled(format!("{queued}{tail}"), yellow),
+    ])
 }
 
-/// The approval banner's keys, which act on the run: a live view only.
-const APPROVAL_KEYS: &str = "  [y] approve · [n] reject";
+/// The pending requests a session recorded, as an attached viewer's queue,
+/// their waits measured at `now_unix_ms`.
+fn recorded_queue(
+    prompt: crate::tui::session::ApprovalPrompt,
+    now_unix_ms: u64,
+) -> Vec<crate::tui::approval::QueuedApproval> {
+    use crate::tui::approval::{NoticeRef, QueuedApproval};
+    let notices = |ns: Vec<crate::tui::session::ApprovalPromptNotice>| {
+        ns.into_iter()
+            .map(|n| NoticeRef {
+                name: n.name,
+                sources: n.sources,
+            })
+            .collect()
+    };
+    prompt
+        .queue
+        .into_iter()
+        .map(|q| QueuedApproval {
+            seq: q.seq,
+            addr: q.addr,
+            notices: notices(q.notices),
+            waited: std::time::Duration::from_millis(
+                now_unix_ms.saturating_sub(q.queued_at_unix_ms),
+            ),
+        })
+        .collect()
+}
+
+/// The prompt row's key, in the run's own view: Enter opens the approval
+/// view, the only place that decides.
+const APPROVAL_REVIEW: &str = " · enter to review";
+
+/// The dashboard's hint for the approval view while a request is pending.
+const APPROVAL_OPEN_HINT: &str = "v review approval";
+
+/// What an attached viewer's prompt row says in place of the key (I11).
+const APPROVAL_ELSEWHERE: &str = " · decide in the terminal that runs it";
+
+/// A header's items as plain text, joined as the box joins them.
+fn header_text(items: Vec<HeaderItem>) -> String {
+    let mut out = String::new();
+    for (i, item) in items.into_iter().enumerate() {
+        if i > 0 {
+            out.push_str(" · ");
+        }
+        let spans = match item {
+            HeaderItem::Text(spans) | HeaderItem::Tab { spans, .. } => spans,
+            HeaderItem::Split(parts) => parts.into_iter().flat_map(|p| p.spans).collect(),
+        };
+        for span in spans {
+            out.push_str(&span.content);
+        }
+    }
+    out
+}
 
 impl TuiProgressView {
     /// Build-counts header (run/query/inspect). The label rides the bottom border.
@@ -2403,15 +1919,118 @@ impl TuiProgressView {
         Self {
             state: BuildState::new(),
             model,
-            scroll: Cell::new(0),
-            hscroll: Cell::new(0),
-            view: Cell::new(ViewMode::Default),
-            scope: Cell::new(CountScope::Matched),
             finished_at_ms: None,
-            search_active: Cell::new(false),
-            search_query: RefCell::new(String::new()),
+            stopped: false,
+            dashboard_open: false,
+            list: crate::tui::dashboard::ListState::default(),
+            last_lines: crate::tui::dashboard::LastLines::default(),
+            tails: None,
+            tail_source: None,
+            target: None,
+            target_reader: None,
             role: Role::Live { approval: None },
+            stop_arm: crate::tui::stop_arm::StopArm::default(),
+            pinned: false,
+            approval: None,
+            notices: None,
+            motion: std::env::var_os("NO_COLOR").is_none(),
         }
+    }
+
+    /// Read the approval view's notices from the store under `roots` (heph's
+    /// home and the workspace root) through `read`, the engine's capped
+    /// `read_notice_from_store`. Without it every notice reads "notice
+    /// unavailable".
+    pub fn with_notices(
+        mut self,
+        roots: hcore::approval_notice::NoticeRoots,
+        read: hcore::approval_notice::ReadNotice,
+    ) -> Self {
+        self.notices = Some(crate::tui::dashboard::approval::NoticeStore::new(
+            roots, read,
+        ));
+        self
+    }
+
+    /// The approval glyph at `now_ms`, flashing unless motion is reduced.
+    fn glyph(&self, now_ms: u64) -> &'static str {
+        crate::tui::dashboard::model::approval_glyph(now_ms, self.motion)
+    }
+
+    /// The pending requests, oldest first: a live view's queue; a viewer's
+    /// as the run last recorded it, by number and notice sources (it reads, and
+    /// decides nothing).
+    fn approval_queue(&self) -> Vec<crate::tui::approval::QueuedApproval> {
+        match &self.role {
+            Role::Live { approval } => approval
+                .as_ref()
+                .map(crate::tui::approval::ApprovalCenter::queue)
+                .unwrap_or_default(),
+            Role::Attached { feed, .. } => feed
+                .approval()
+                .map(|p| recorded_queue(p, hcore::events::now_unix_ms()))
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Hand the list this frame's (or key's) pending requests, so its
+    /// Approvals tab and ✦ rows match the queue. Before every use of the
+    /// list. `glyph`: this frame's, or `None` to keep the last frame's.
+    fn sync_approvals(&mut self, glyph: Option<&'static str>) {
+        let queue = self.approval_queue();
+        self.sync_approvals_with(&queue, glyph);
+    }
+
+    /// [`Self::sync_approvals`] from a `queue` the caller already read.
+    fn sync_approvals_with(
+        &mut self,
+        queue: &[crate::tui::approval::QueuedApproval],
+        glyph: Option<&'static str>,
+    ) {
+        use crate::tui::dashboard::list::ApprovalRow;
+        let glyph = glyph.unwrap_or_else(|| self.list.approval_glyph());
+        let rows = queue
+            .iter()
+            .filter_map(|q| {
+                let id = self.state.dash.id(&q.addr)?;
+                let names: Vec<&str> = q.notices.iter().map(|n| n.name.as_str()).collect();
+                Some(ApprovalRow {
+                    id,
+                    seq: q.seq,
+                    waited_ms: u64::try_from(q.waited.as_millis()).unwrap_or(u64::MAX),
+                    notices: if names.is_empty() {
+                        String::new()
+                    } else {
+                        format!("notices: {}", names.join(", "))
+                    },
+                })
+            })
+            .collect();
+        self.list.set_approvals(&self.state.dash, rows, glyph);
+    }
+
+    /// Open the approval view on request `seq`, when it is still pending
+    /// (or on the oldest, for `None`). `false`: nothing to open.
+    fn open_approval(&mut self, seq: Option<u64>) -> bool {
+        let queue = self.approval_queue();
+        let req = match seq {
+            Some(seq) => queue.into_iter().find(|q| q.seq == seq),
+            None => queue.into_iter().next(),
+        };
+        let Some(req) = req else {
+            return false;
+        };
+        let screen = crate::tui::dashboard::approval::ApprovalScreen::open(
+            req,
+            self.notices.clone(),
+            &self.state.redact,
+        );
+        // A viewer reads the notices; the terminal that runs it decides (I11).
+        self.approval = Some(match self.role {
+            Role::Live { .. } => screen,
+            Role::Attached { .. } => screen.read_only(),
+        });
+        true
     }
 
     /// This view, as `heph session attach` draws session `id`: the same view
@@ -2457,18 +2076,35 @@ impl TuiProgressView {
     }
 
     /// One frame as plain lines, for printing once (`heph session show`): the
-    /// header, the default body (lock waits, scratch waits, long-running
-    /// targets) and the admission waits the TUI keeps on its own tab. No bottom
-    /// border, no key help, no idle art; nothing windowed. `ratatui`'s `Line`
+    /// line, then the dashboard's All list, at most [`SNAPSHOT_ROWS`] rows,
+    /// with its column titles and position. No key hints. `ratatui`'s `Line`
     /// prints its text with `Display`, styles dropped.
     ///
     /// `now_ms` is the clock the elapsed time and wait ages are measured
     /// against: the viewer's now for a live session, the `End` record's time
-    /// for an ended one.
+    /// for an ended one ([`TUIAppView::set_finished`] it first, so the line
+    /// reads as finished).
     pub fn snapshot_lines(&self, now_ms: u64, width: u16) -> Vec<Line<'static>> {
-        let mut lines = vec![self.header_line(now_ms, width)];
-        lines.extend(self.state.body_lines(now_ms));
-        lines.extend(self.state.admission_wait_lines(now_ms, ""));
+        use crate::tui::dashboard::{LastLines, ListInputs, ListState, list::list_lines};
+        let mut lines = vec![self.line("▶", now_ms, width, false)];
+        if self.model.has_dashboard() {
+            let mut list = ListState::default();
+            list.scope = self.list.scope;
+            let inputs = ListInputs {
+                model: &self.state.dash,
+                waits: &self.state,
+                lines: &LastLines::default(),
+                now_ms,
+                redact: &self.state.redact,
+            };
+            // The titles, the rows and the position; not the rows the list
+            // pads its window with, which a print has no window for.
+            lines.extend(
+                list_lines(&inputs, &mut list, width, SNAPSHOT_ROWS + 3)
+                    .into_iter()
+                    .filter(|l| l.spans.iter().any(|s| !s.content.trim().is_empty())),
+            );
+        }
         lines
     }
 
@@ -2477,7 +2113,7 @@ impl TuiProgressView {
     /// teardown. Split out from [`TUIAppView::last_render`], which writes it
     /// straight to stderr and so cannot be asserted on.
     fn final_summary_segment(&self) -> String {
-        self.model.last_render(&self.state, self.scope.get())
+        self.model.last_render(&self.state, self.list.scope)
     }
 
     /// The final summary line [`TUIAppView::last_render`] prints, `None` when
@@ -2485,15 +2121,319 @@ impl TuiProgressView {
     /// ([`TUIAppView::set_finished`]), matching the frozen header, so a viewer
     /// prints the line the run printed.
     pub fn final_line(&self) -> Option<String> {
+        self.final_line_in(false)
+    }
+
+    /// [`final_line`](Self::final_line), painted as the spec's mockup when
+    /// `color`: the ✓ green bold or the ✗ (and `stopped`) red bold, the clock
+    /// bold, a non-zero failed count red bold and its split dim. Without
+    /// colour it is `final_line`, byte for byte; only the terminal gets the
+    /// paint, never a session viewer.
+    fn final_line_in(&self, color: bool) -> Option<String> {
+        use crossterm::style::Stylize;
+        let paint = |s: &str, f: fn(String) -> crossterm::style::StyledContent<String>| {
+            if color {
+                f(s.to_owned()).to_string()
+            } else {
+                s.to_owned()
+            }
+        };
+        let red_bold = |s: String| s.red().bold();
         let segment = self.final_summary_segment();
-        if segment.is_empty() {
+        // The failed count and its split, as `counts_segment` wrote them.
+        let segment = {
+            let (_, _, failed) = self.state.count_fields(self.list.scope);
+            let tabs = self.state.dash.counts(self.list.scope);
+            let split = failure_split_text((tabs.failed, tabs.dep_failed));
+            let whole = format!("{failed}{split}");
+            match segment.split_once(&whole) {
+                Some((before, after)) if color && !failed.starts_with("0 ") => {
+                    format!(
+                        "{before}{}{}{after}",
+                        paint(&failed, red_bold),
+                        paint(&split, |s| s.dim())
+                    )
+                }
+                _ => segment,
+            }
+        };
+        // A stop always says so, even before anything matched.
+        if segment.is_empty() && !self.stopped {
             return None;
         }
         let clock = self
             .finished_at_ms
             .unwrap_or_else(hcore::events::now_unix_ms);
         let elapsed = human_elapsed_ms(self.state.elapsed_ms(clock));
-        Some(format!("{} · {segment}", elapsed.trim_start()))
+        let elapsed = paint(elapsed.trim_start(), |s| s.bold());
+        let mark = match self.outcome() {
+            // A user stop is never a success, whatever finished before it;
+            // the word says why the counts stop short.
+            Outcome::Stopped => {
+                let stopped = paint("✗ stopped", red_bold);
+                if segment.is_empty() {
+                    return Some(format!("{stopped} · {elapsed}"));
+                }
+                return Some(format!("{stopped} · {elapsed} · {segment}"));
+            }
+            Outcome::Failed => paint("✗", red_bold),
+            Outcome::Done => paint("✓", |s| s.green().bold()),
+        };
+        Some(format!("{mark} {elapsed} · {segment}"))
+    }
+
+    /// How the run ended, as the final line's mark says it.
+    fn outcome(&self) -> Outcome {
+        if self.stopped {
+            Outcome::Stopped
+        } else if self.state.unsuccessful() {
+            Outcome::Failed
+        } else {
+            Outcome::Done
+        }
+    }
+
+    /// The dashboard title row's verdict once the run has finished, worded
+    /// as the final line is: `✓ done`, `✗ 2 failed` (the line's failed
+    /// count; `✗ cancelled` when nothing failed outright) or `✗ stopped`.
+    /// `None` while it runs.
+    fn verdict(&self) -> Option<crate::tui::dashboard::Verdict> {
+        self.finished_at_ms?;
+        let (text, ok) = match self.outcome() {
+            Outcome::Stopped => ("✗ stopped".to_owned(), false),
+            Outcome::Failed => {
+                let (_, _, failed) = self.state.count_fields(self.list.scope);
+                if failed.starts_with("0 ") {
+                    ("✗ cancelled".to_owned(), false)
+                } else {
+                    (format!("✗ {failed}"), false)
+                }
+            }
+            Outcome::Done => ("✓ done".to_owned(), true),
+        };
+        Some(crate::tui::dashboard::Verdict { text, ok })
+    }
+
+    /// Open the dashboard, as `Tab` from the line does.
+    #[cfg(test)]
+    pub(crate) fn open_dashboard(&mut self) {
+        self.tab(true);
+    }
+
+    /// The clock and the header model's items, as the box's top border
+    /// carried them: what the header tests read since the box went.
+    #[cfg(test)]
+    fn header_line(&self, now_ms: u64, _width: u16) -> String {
+        let clock = self.finished_at_ms.unwrap_or(now_ms);
+        format!(
+            "{} · {}",
+            human_elapsed(self.state.elapsed_ms(clock)),
+            header_text(self.model.header(&self.state, self.list.scope))
+        )
+    }
+
+    /// The instant the run's times are measured to: `now_ms` while it runs,
+    /// the finish once it has ended, so every clock on screen stops there
+    /// (a target still open when the run ended included).
+    fn clock_at(&self, now_ms: u64) -> u64 {
+        self.finished_at_ms.unwrap_or(now_ms)
+    }
+
+    /// The dashboard's title row: the command, the clock and how far along
+    /// the run is, in the line's own figures.
+    fn dashboard_title_parts(&self, now_ms: u64) -> (String, Option<String>, String) {
+        let clock_at = self.clock_at(now_ms);
+        let clock = hcore::units::human_duration(std::time::Duration::from_millis(
+            self.state.elapsed_ms(clock_at),
+        ));
+        let session = match &self.role {
+            Role::Attached { id, .. } => Some(id.to_string()),
+            Role::Live { .. } => None,
+        };
+        (self.label(), session, clock)
+    }
+
+    /// One dashboard frame, `cols` × `rows`:
+    /// [`crate::tui::dashboard::dashboard_frame`], its pending requests
+    /// leading All and on the Approvals tab.
+    fn dashboard_lines(&mut self, now_ms: u64, cols: u16, rows: u16) -> Vec<Line<'static>> {
+        use crate::tui::dashboard::{DASHBOARD_HINTS, ListInputs, Title, dashboard_frame};
+        self.sync_approvals(Some(self.glyph(now_ms)));
+        let (command, session, clock) = self.dashboard_title_parts(now_ms);
+        let scope = self.list.scope;
+        let tabs = self.state.dash.counts(scope);
+        let title = Title {
+            command: &command,
+            session: session.as_deref(),
+            clock: &clock,
+            done: tabs.finished_ok(),
+            total: (scope == CountScope::All || self.state.dash.matched_seen()).then(|| tabs.all()),
+            provisional: scope == CountScope::Matched && !self.state.dash.matched_complete(),
+            standing: self.approval_standing().map(|s| s.indicator()),
+            verdict: self.verdict(),
+        };
+        // The filter, while one is typed or kept, replaces the key hints.
+        let filter = self.list.filter();
+        let hints: std::borrow::Cow<'_, str> = if self.list.is_editing() {
+            format!("/{filter}▏  enter keep · esc clear").into()
+        } else if !filter.is_empty() {
+            format!("filter: {filter} · / edit · esc clear").into()
+        } else {
+            let keys = if self.finished_at_ms.is_some() {
+                FINISHED_DASHBOARD_HINTS
+            } else {
+                DASHBOARD_HINTS
+            };
+            match &self.role {
+                // A viewer leaves with `q`, and stops nothing.
+                Role::Attached { .. } => {
+                    let keys = keys.trim_end_matches(" · ctrl-c stop");
+                    if self.list.approvals().is_empty() {
+                        format!("{keys} · q detach").into()
+                    } else {
+                        // Read-only there: its own hint says so.
+                        format!("{APPROVAL_OPEN_HINT} · {keys} · q detach").into()
+                    }
+                }
+                Role::Live { .. } if !self.list.approvals().is_empty() => {
+                    format!("{APPROVAL_OPEN_HINT} · {keys}").into()
+                }
+                Role::Live { .. } => keys.into(),
+            }
+        };
+        // The reader's thread starts with the first frame that shows the
+        // column.
+        if let Some(reader) = self.tail_source.take() {
+            self.tails = crate::tui::dashboard::TailReader::spawn(reader);
+        }
+        // What the background reader found since the last frame, for the
+        // rows that frame showed.
+        if let Some(updates) = self.tails.as_mut().and_then(|t| t.poll()) {
+            self.last_lines.apply(updates, self.list.visible());
+        }
+        let inputs = ListInputs {
+            model: &self.state.dash,
+            waits: &self.state,
+            lines: &self.last_lines,
+            now_ms: self.clock_at(now_ms),
+            redact: &self.state.redact,
+        };
+        let out = dashboard_frame(&title, &inputs, &mut self.list, &hints, cols, rows);
+        // The rows this frame shows, for the reader to (re)read off this task.
+        if let Some(tails) = self.tails.as_mut().filter(|t| t.wants(now_ms)) {
+            tails.send(
+                self.last_lines
+                    .requests(&self.state.dash, self.list.visible()),
+                now_ms,
+            );
+        }
+        out
+    }
+
+    /// The spotlight's rule 1: the pending approval on show, with how many
+    /// are pending. The run's from its queue, a viewer's from the feed. Its
+    /// ✦ flashes with the frame's glyph at `now_ms`.
+    fn approval_spot(&self, now_ms: u64) -> Option<Spot> {
+        let (addr, pending) = self.approval_pending()?;
+        let mut spot = Spot::approval(&addr, pending);
+        spot.icon = self.glyph(now_ms);
+        Some(spot)
+    }
+
+    /// The request the prompt row names (the oldest pending) and how many
+    /// are pending: the run's from its queue, a viewer's from the feed.
+    fn approval_pending(&self) -> Option<(String, u64)> {
+        match &self.role {
+            Role::Live { approval } => {
+                let (addr, pending) = approval.as_ref()?.front()?;
+                Some((addr, u64::try_from(pending).unwrap_or(u64::MAX)))
+            }
+            Role::Attached { feed, .. } => {
+                let queue = feed.approval()?.queue;
+                let pending = u64::try_from(queue.len()).unwrap_or(u64::MAX);
+                let front = queue.into_iter().next()?;
+                Some((front.addr, pending))
+            }
+        }
+    }
+
+    /// What the cpu pool holds, of its capacity, as its latest `PoolUsage`
+    /// reported it: `cpu 11/12`. `None` before the first report, and before
+    /// anything ran: a pool not in play has no gauge here either.
+    fn cpu_segment(&self) -> Option<String> {
+        let dash = &self.state.dash;
+        let g = dash
+            .pool(hcore::capacity::CPU)
+            .filter(|_| dash.in_play(hcore::capacity::CPU))?;
+        Some(format!(
+            "cpu {}/{}",
+            hcore::events::display_amount(g.unit, g.held),
+            hcore::events::display_amount(g.unit, g.capacity)
+        ))
+    }
+
+    /// The line at `now_ms`, `width` columns wide.
+    /// The line. `live`: drawn on a terminal heph reads keys from, so it
+    /// carries their hints (`tab ⇥`, and `q to quit` while `--dashboard`
+    /// holds the finished run); a printed one (`heph session show`) has none.
+    fn line(&self, spinner: &str, now_ms: u64, width: u16, live: bool) -> Line<'static> {
+        use std::borrow::Cow;
+        let clock_at = self.clock_at(now_ms);
+        let clock = hcore::units::human_duration(std::time::Duration::from_millis(
+            self.state.elapsed_ms(clock_at),
+        ));
+        let status = match self.finished_at_ms {
+            Some(_) => line::Status::Finished {
+                failed: self.state.unsuccessful(),
+                stopped: self.stopped,
+            },
+            None => line::Status::Running(spinner),
+        };
+        let dashboard = self.model.has_dashboard();
+        let scope = self.list.scope;
+        let body = if dashboard {
+            // The same `TabCounts` the dashboard's tabs read, so the line
+            // and the tabs cannot disagree.
+            let tabs = self.state.dash.counts(scope);
+            let Counts { done, total, .. } = self.state.counts_of(&tabs, scope);
+            line::Body::Build(line::BuildCounts {
+                done,
+                total,
+                cached: tabs.cached,
+                waiting: tabs.blocked,
+                failed: tabs.failed_total(),
+                cpu: self.cpu_segment(),
+            })
+        } else {
+            line::Body::Text(Cow::Owned(header_text(
+                self.model.header(&self.state, scope),
+            )))
+        };
+        // Until the run ends, a label the header keeps up ("Invoking …": what
+        // is about to take the terminal, on the line while its dependencies
+        // build). The view's own label ("Running //…") is not repeated: the
+        // command it names is on the row above.
+        let stands = self.finished_at_ms.is_none()
+            && matches!(self.role, Role::Live { .. })
+            && self.model.label_stands();
+        let label = (dashboard && stands)
+            .then(|| self.label())
+            .filter(|l| !l.is_empty())
+            .map(Cow::Owned);
+        let model = line::LineModel {
+            status,
+            clock,
+            label,
+            body,
+            standing: self.approval_standing(),
+            spot: self
+                .approval_spot(now_ms)
+                .or_else(|| self.state.spotlight(clock_at)),
+            hint: dashboard && live,
+            detach: matches!(self.role, Role::Attached { .. }),
+            held: live && self.pinned && self.finished_at_ms.is_some(),
+        };
+        line::render(&model, width)
     }
 
     /// Attach the shared approval queue so this view renders pending prompts and
@@ -2506,273 +2446,107 @@ impl TuiProgressView {
         self
     }
 
-    /// Body rows for the active approval prompt, or empty when idle. The banner
-    /// carries the keys; when the target declares notices, each is named below
-    /// it, and `enter` toggles an inline (scrollable) preview of the contents. An attached view draws the
-    /// run's recorded prompt through the same banner, without keys or preview.
-    fn approval_lines(&self) -> Vec<Line<'static>> {
-        let center = match &self.role {
-            Role::Live { approval } => approval.as_ref(),
-            Role::Attached { feed, .. } => {
-                let Some(prompt) = feed.approval() else {
-                    return Vec::new();
-                };
-                return approval_banner(
-                    &prompt.addr,
-                    prompt.queued_behind,
-                    prompt.notices.iter().map(|n| n.name.as_str()),
-                    None,
-                );
-            }
-        };
-        let Some(view) = center.and_then(|c| c.current()) else {
-            return Vec::new();
-        };
-        let mut lines = approval_banner(
-            &view.addr,
-            u64::try_from(view.queued_behind).unwrap_or(u64::MAX),
-            view.notices.iter().map(|n| n.name.as_str()),
-            Some(ApprovalKeys {
-                expanded: view.expanded,
-            }),
-        );
-        if view.expanded {
-            for notice in &view.notices {
-                lines.push(Line::from(Span::styled(
-                    format!("  ── {} ──", notice.name),
-                    Style::default().fg(Color::Cyan),
-                )));
-                // The handler's capped read from the store (truncation line
-                // included), or "notice unavailable".
-                for raw in notice.content.lines() {
-                    lines.push(Line::from(format!("  {raw}")));
-                }
-            }
-        }
-        lines
+    /// Fill the dashboard's LAST LINE column from `reader`, on a thread of
+    /// its own started by the first dashboard frame: a frame only hands it
+    /// the visible rows and takes what it found (I4, I7). The seam an
+    /// attached view's reader plugs into too.
+    pub fn with_log_reader(
+        mut self,
+        reader: std::sync::Arc<dyn crate::tui::dashboard::LogReader>,
+    ) -> Self {
+        self.tails = None;
+        self.tail_source = Some(reader);
+        self
     }
 
-    /// The selectable body views in cycle order: [`ViewMode::Default`] first,
-    /// then one entry per [`HeaderItem::Tab`] the header model exposes, in header
-    /// order. `Tab` walks this list.
-    fn view_modes(&self) -> Vec<ViewMode> {
-        let mut modes = vec![ViewMode::Default];
-        for item in self.model.header(&self.state, self.scope.get()) {
-            match item {
-                HeaderItem::Tab { mode, .. } => modes.push(mode),
-                // A split segment contributes each of its tab-bound parts, in
-                // order — so `X / Y done` yields Done then Matched.
-                HeaderItem::Split(parts) => {
-                    modes.extend(parts.into_iter().filter_map(|p| p.mode));
-                }
-                HeaderItem::Text(_) => {}
-            }
-        }
-        modes
+    /// Serve the target screens' Log and Outputs tabs from `reader`, on a
+    /// thread per open screen (I4, I7).
+    pub fn with_target_reader(
+        mut self,
+        reader: std::sync::Arc<dyn crate::tui::dashboard::TargetReader>,
+    ) -> Self {
+        self.target_reader = Some(reader);
+        self
     }
 
-    /// The help row pinned under the box. While held open after the run finishes
-    /// it turns into a green "press q to quit" notice; otherwise it lists the keys
-    /// the viewport responds to.
-    fn help_line(&self) -> Line<'static> {
-        // While typing a filter the help row becomes the search prompt with a
-        // block cursor; Enter keeps it, Esc clears it.
-        if self.search_active.get() {
-            let query = self.search_query.borrow();
-            return Line::from(vec![
-                Span::styled(format!("  /{query}▏"), Style::default().fg(Color::Yellow)),
-                Span::styled(
-                    "  enter keep · esc clear",
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::DIM),
-                ),
-            ]);
-        }
-        // A confirmed (but still applied) filter: show it with the clear hint.
-        {
-            let query = self.search_query.borrow();
-            if !query.is_empty() {
-                return Line::from(vec![
-                    Span::styled(
-                        format!("  filter: {query}"),
-                        Style::default().fg(Color::Yellow),
-                    ),
-                    Span::styled(
-                        "  ↑/↓ scroll · / edit · esc clear",
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::DIM),
-                    ),
-                ]);
-            }
-        }
-        if self.finished_at_ms.is_some() {
-            // Off the main view `q`/esc step back to it (which then auto-exits);
-            // on the main view they quit. Reflect that in the notice.
-            let notice = if self.view.get() == ViewMode::Default {
-                "  ✓ finished — press q or Ctrl-C to quit"
-            } else {
-                "  ✓ finished — esc/q back to main · Ctrl-C to quit"
-            };
-            return Line::from(Span::styled(
-                notice,
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        }
-        // The `a` hint reads as the *action*: it names the scope you switch to.
-        let scope_key = match self.scope.get() {
-            CountScope::Matched => "a all",
-            CountScope::All => "a matched",
+    /// The open target screen's frame, under the dashboard's header.
+    fn target_lines(&mut self, now_ms: u64, cols: u16, rows: u16) -> Option<Vec<Line<'static>>> {
+        let (command, session, clock) = self.dashboard_title_parts(now_ms);
+        let scope = self.list.scope;
+        let tabs = self.state.dash.counts(scope);
+        let title = crate::tui::dashboard::Title {
+            command: &command,
+            session: session.as_deref(),
+            clock: &clock,
+            done: tabs.finished_ok(),
+            total: (scope == CountScope::All || self.state.dash.matched_seen()).then(|| tabs.all()),
+            provisional: scope == CountScope::Matched && !self.state.dash.matched_complete(),
+            standing: self.approval_standing().map(|s| s.indicator()),
+            verdict: self.verdict(),
         };
-        // `/` filters and `esc` steps back — both only apply off the live view.
-        let (search_hint, back_hint) = if self.view.get() == ViewMode::Default {
-            ("", "")
-        } else {
-            (" · / search", " · esc back")
+        let inputs = crate::tui::dashboard::TargetInputs {
+            model: &self.state.dash,
+            waits: &self.state,
+            redact: &self.state.redact,
+            now_ms: self.clock_at(now_ms),
+            scope,
+            detach: matches!(self.role, Role::Attached { .. }),
         };
-        // A viewer names the session it shows and how to leave it.
-        let attach_hint = match &self.role {
-            Role::Attached { id, .. } => format!(" · session {id} · q detach"),
-            Role::Live { .. } => String::new(),
-        };
-        Line::from(Span::styled(
-            format!(
-                "  ↑/↓ scroll · ←/→ pan · tab/⇧tab switch view · {scope_key}{search_hint}{back_hint}{attach_hint}"
-            ),
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::DIM),
+        let target = self.target.as_mut()?;
+        Some(target.frame(&title, &inputs, cols, rows))
+    }
+
+    /// Redact `redact`'s paths (heph's home) from the error text this view
+    /// draws (I9).
+    pub fn with_redact(mut self, redact: crate::tui::text::Redact) -> Self {
+        self.state.set_redact(redact);
+        self
+    }
+
+    /// The prompt row above the line while a request is pending, `None`
+    /// when none is.
+    fn approval_prompt(&self, now_ms: u64) -> Option<Line<'static>> {
+        let (addr, pending) = self.approval_pending()?;
+        Some(approval_prompt_row(
+            self.glyph(now_ms),
+            &addr,
+            pending,
+            matches!(self.role, Role::Live { .. }),
         ))
     }
 
-    /// Render the header model's items into a flat span run: items joined by
-    /// ` · `, with the [`HeaderItem::Tab`] matching the active view highlighted
-    /// (reversed background). This is the one place the ` · ` separator lives.
-    fn header_item_spans(&self) -> Vec<Span<'static>> {
-        let active = self.view.get();
-        let items = self.model.header(&self.state, self.scope.get());
-        let mut spans: Vec<Span<'static>> = Vec::with_capacity(items.len() * 2);
-        for (i, item) in items.iter().enumerate() {
-            if i > 0 {
-                spans.push(Span::raw(" · "));
-            }
-            match item {
-                HeaderItem::Text(item_spans) => spans.extend(item_spans.iter().cloned()),
-                HeaderItem::Tab {
-                    mode,
-                    spans: item_spans,
-                } if *mode == active => {
-                    // Active tab: paint a background so the selected view reads
-                    // as highlighted in the header.
-                    spans.extend(item_spans.iter().map(highlight_span));
-                }
-                HeaderItem::Tab {
-                    spans: item_spans, ..
-                } => spans.extend(item_spans.iter().cloned()),
-                // A split segment renders its parts back-to-back with no ` · `
-                // between them; each tab-bound part highlights independently when
-                // its own view is active.
-                HeaderItem::Split(parts) => {
-                    for part in parts {
-                        if part.mode == Some(active) {
-                            spans.extend(part.spans.iter().map(highlight_span));
-                        } else {
-                            spans.extend(part.spans.iter().cloned());
-                        }
-                    }
-                }
-            }
-        }
-        spans
-    }
-
-    /// The rounded top border:
-    /// `╭─ 1m05s · D / N done · N cached · N waiting · N failed · <workers> ──╮`.
-    /// The leading field is the elapsed-time clock. "done" shows matched progress
-    /// `done / total` (total prefixed `~` while the matcher is still resolving),
-    /// falling back to the executed count before any match streams. The "running"
-    /// count is omitted — the worker braille (flush right) conveys concurrency.
-    fn header_line(&self, now_ms: u64, width: u16) -> Line<'static> {
-        let width = usize::from(width).max(MIN_BOX_WIDTH);
-        // Once finished, the clock is frozen at the finish instant rather than
-        // advancing with the live render wall clock.
-        let clock = self.finished_at_ms.unwrap_or(now_ms);
-        let elapsed = human_elapsed(self.state.elapsed_ms(clock));
-
-        let mut left: Vec<Span<'static>> = Vec::with_capacity(5);
-        left.push(Span::raw("╭─ "));
-        left.push(Span::from(elapsed).bold());
-        // The status segment (counts + worker braille, or gc sweep stats) is
-        // supplied by the header model; the view owns only the leading clock.
-        left.push(Span::raw(" · "));
-        left.extend(self.header_item_spans());
-        // Space between the segment and the dash fill.
-        left.push(Span::raw(" "));
-
-        let left_w = spans_width(&left);
-        // Trailing "─╮" closes the border.
-        let fill = width.saturating_sub(left_w + 2);
-
-        let mut spans = left;
-        spans.push(Span::raw("─".repeat(fill)));
-        spans.push(Span::raw("─╮"));
-        Line::from(spans)
-    }
-
-    /// The rounded bottom border: `╰─── <label> ────…────╯`. The label is left
-    /// after a `─── ` lead-in; if it overruns the available span it scrolls like
-    /// a banner. Total visible width always equals `width`. When the body has
-    /// more lines than the viewport, a scroll indicator like
-    /// `↑ 3–43 of 75 ↓` replaces the trailing dash fill.
-    fn bottom_line(
-        &self,
-        now_ms: u64,
-        width: u16,
-        scroll: usize,
-        total: usize,
-        body_rows: usize,
-    ) -> Line<'static> {
-        let width = usize::from(width).max(MIN_BOX_WIDTH);
-        // "╰─── " (5) + window + "─╯" (2) == width  ⇒  window = width - 7.
-        let mut window = width.saturating_sub(7);
-        let label = self.label();
-        let label_len = label.chars().count();
-
-        // When the body overflows the viewport, show a scroll position indicator
-        // in the bottom-right: `↑ 1–20 of 75 ↓`. The label shrinks to make room.
-        let scrollable = total > body_rows && body_rows > 0;
-        let show_indicator = scrollable && window > SCROLL_INDICATOR_MIN_WIDTH;
-        let indicator = if show_indicator {
-            let vis_start = scroll + 1;
-            let vis_end = (scroll + body_rows).min(total);
-            format!(" ↑ {vis_start}–{vis_end} of {total} ↓")
-        } else {
-            String::new()
+    /// The open approval view's frame, under the dashboard's header.
+    fn approval_lines(&mut self, now_ms: u64, cols: u16, rows: u16) -> Option<Vec<Line<'static>>> {
+        self.approval.as_ref()?;
+        let glyph = self.glyph(now_ms);
+        let queue = self.approval_queue();
+        self.sync_approvals_with(&queue, Some(glyph));
+        let (command, session, clock) = self.dashboard_title_parts(now_ms);
+        let scope = self.list.scope;
+        let mut counts = self.state.dash.counts(scope);
+        counts.approvals = queue.len();
+        counts.approval_glyph = glyph;
+        let title = crate::tui::dashboard::Title {
+            command: &command,
+            session: session.as_deref(),
+            clock: &clock,
+            done: counts.finished_ok(),
+            total: (scope == CountScope::All || self.state.dash.matched_seen())
+                .then(|| counts.all()),
+            provisional: scope == CountScope::Matched && !self.state.dash.matched_complete(),
+            standing: self.approval_standing().map(|s| s.indicator()),
+            verdict: self.verdict(),
         };
-        if show_indicator {
-            window = window.saturating_sub(indicator.chars().count());
-        }
-
-        let mut spans: Vec<Span<'static>> = Vec::with_capacity(4);
-        spans.push(Span::raw("╰─── "));
-        if label_len <= window {
-            spans.push(Span::raw(label.clone()));
-            let pad = window - label_len;
-            if pad >= 1 {
-                spans.push(Span::raw(" "));
-                spans.push(Span::raw("─".repeat(pad - 1)));
-            }
-        } else if window > 0 {
-            spans.push(Span::raw(banner_slice(&label, window, now_ms)));
-        }
-        if show_indicator {
-            spans.push(Span::raw(indicator));
-        }
-        spans.push(Span::raw("─╯"));
-        Line::from(spans)
+        let gauges = self.state.dash.gauges();
+        let inputs = crate::tui::dashboard::approval::ApprovalInputs {
+            title: &title,
+            gauges: &gauges,
+            counts: &counts,
+            queue: &queue,
+            glyph,
+            now_ms,
+        };
+        Some(self.approval.as_mut()?.frame(&inputs, cols, rows))
     }
 }
 
@@ -2801,6 +2575,10 @@ impl TUIAppView for TuiProgressView {
         }
     }
 
+    fn quits_from_any_screen(&self) -> bool {
+        matches!(self.role, Role::Attached { .. })
+    }
+
     fn pending_approval(&self) -> Option<crate::tui::session::ApprovalPrompt> {
         self.approval_center()
             .and_then(crate::tui::approval::ApprovalCenter::prompt)
@@ -2813,286 +2591,385 @@ impl TUIAppView for TuiProgressView {
         }
     }
 
-    fn rows(&self, term_height: u16) -> u16 {
-        rows_for_height(term_height)
+    fn rows(&self, _term_height: u16) -> u16 {
+        // The line, and the approval prompt above it while one is pending.
+        // The dashboard is drawn on the alternate screen, never here.
+        1 + u16::from(self.approval_pending().is_some())
+    }
+
+    fn full_screen(&self) -> bool {
+        self.dashboard_open || self.approval.is_some()
+    }
+
+    fn render_full(&mut self, now_ms: u64, cols: u16, rows: u16) -> Vec<Line<'static>> {
+        // The approval view overlays whichever screen opened it.
+        let mut lines = match self.approval_lines(now_ms, cols, rows) {
+            Some(lines) => lines,
+            None => match self.target_lines(now_ms, cols, rows) {
+                Some(lines) => lines,
+                None => self.dashboard_lines(now_ms, cols, rows),
+            },
+        };
+        // An armed stop takes the hint row, the last on every full screen.
+        if let Some(prompt) = self.stop_arm.prompt(now_ms)
+            && let Some(last) = lines.last_mut()
+        {
+            let prompt = crate::tui::text::cut_right(&prompt, usize::from(cols).saturating_sub(2));
+            *last = Line::styled(
+                format!("  {prompt}"),
+                ratatui::style::Style::default().fg(ratatui::style::Color::Yellow),
+            );
+        }
+        lines
+    }
+
+    fn ctrl_c(
+        &mut self,
+        now_ms: u64,
+        finished: bool,
+        stopping: bool,
+    ) -> crate::tui::stop_arm::CtrlC {
+        let at = crate::tui::stop_arm::Press {
+            full_screen: self.full_screen(),
+            attached: matches!(self.role, Role::Attached { .. }),
+            finished: finished || self.finished_at_ms.is_some(),
+            stopping,
+        };
+        self.stop_arm.press(at, now_ms)
+    }
+
+    fn disarm_stop(&mut self) {
+        self.stop_arm.disarm();
+    }
+
+    fn pin_dashboard(&mut self) {
+        if self.model.has_dashboard() {
+            self.dashboard_open = true;
+            self.pinned = true;
+        }
+    }
+
+    fn screen_key(&mut self, key: crate::tui::app::ScreenKey) {
+        use crate::tui::app::ScreenKey;
+        if let Some(a) = self.approval.as_mut() {
+            // The notice's own movement; `n`/`N` decide here, upstream.
+            match key {
+                ScreenKey::PageUp => a.scroll(-a.page()),
+                ScreenKey::PageDown => a.scroll(a.page()),
+                ScreenKey::Top => a.scroll(isize::MIN),
+                ScreenKey::Bottom => a.scroll(isize::MAX),
+                ScreenKey::Follow | ScreenKey::Wrap | ScreenKey::Next | ScreenKey::Prev => {}
+            }
+            return;
+        }
+        if let Some(t) = self.target.as_mut() {
+            let _bound = t.key(key, &self.state.redact);
+        }
+    }
+
+    fn mouse(&mut self, input: crate::tui::app::MouseInput) {
+        use crate::tui::app::MouseInput;
+        use crate::tui::dashboard::approval::ApprovalClick;
+        use crate::tui::dashboard::{ListHit, TargetClick, WHEEL_ROWS};
+        // The approval view: its breadcrumb and notice tabs. No click
+        // decides.
+        if let Some(a) = self.approval.as_mut() {
+            match input {
+                MouseInput::Click { col, row } => {
+                    if a.click(col, row) == ApprovalClick::Back {
+                        self.approval = None;
+                    }
+                }
+                MouseInput::Wheel { down, .. } => a.wheel(down),
+            }
+            return;
+        }
+        if !self.dashboard_open {
+            return;
+        }
+        self.sync_approvals(None);
+        match (input, self.target.as_mut()) {
+            (MouseInput::Click { col, row }, Some(t)) => {
+                if t.click(col, row) == TargetClick::Back {
+                    self.back_to_main();
+                }
+            }
+            (MouseInput::Wheel { down, .. }, Some(t)) => t.wheel(down),
+            // A ✦ row opens its approval view, as Enter does; it never
+            // decides.
+            (MouseInput::Click { col, row }, None) => {
+                match self.list.hit(col, row) {
+                    Some(ListHit::Tab(tab)) => self.list.set_tab(tab),
+                    // A second click on the selected row opens it, like
+                    // enter: no double-click timing.
+                    Some(ListHit::Row(id)) if self.list.selected() == Some(id) => {
+                        self.open_selected(false);
+                    }
+                    Some(ListHit::Row(id)) => self.list.select(id),
+                    None => {}
+                }
+            }
+            (MouseInput::Wheel { down, .. }, None) => {
+                let delta = if down { WHEEL_ROWS } else { -WHEEL_ROWS };
+                self.list.wheel(&self.state.dash, delta);
+            }
+        }
     }
 
     fn scroll(&mut self, delta: i32) {
-        let cur = self.scroll.get();
-        let mag = delta.unsigned_abs() as usize;
-        let next = if delta >= 0 {
-            cur.saturating_add(mag)
-        } else {
-            cur.saturating_sub(mag)
-        };
-        self.scroll.set(next);
-    }
-
-    fn hscroll(&mut self, delta: i32) {
-        let cur = self.hscroll.get();
-        let mag = delta.unsigned_abs() as usize;
-        let next = if delta >= 0 {
-            cur.saturating_add(mag)
-        } else {
-            cur.saturating_sub(mag)
-        };
-        self.hscroll.set(next);
+        if let Some(a) = self.approval.as_mut() {
+            a.scroll(isize::try_from(delta).unwrap_or(0));
+        } else if let Some(t) = self.target.as_mut() {
+            t.scroll(isize::try_from(delta).unwrap_or(0));
+        } else if self.dashboard_open {
+            let delta = isize::try_from(delta).unwrap_or(0);
+            self.sync_approvals(None);
+            self.list.select_move(&self.state.dash, delta);
+        }
     }
 
     fn tab(&mut self, forward: bool) {
-        let modes = self.view_modes();
-        let len = modes.len().max(1);
-        let cur = self.view.get();
-        let idx = modes.iter().position(|&m| m == cur).unwrap_or(0);
-        // Step forward or backward with wrap. `modes` always holds at least
-        // `Default`, so the index is in-bounds; the `.get`/fallback keeps it
-        // panic-free regardless.
-        let step = if forward { 1 } else { len - 1 };
-        let next = modes
-            .get((idx + step) % len)
-            .copied()
-            .unwrap_or(ViewMode::Default);
-        self.view.set(next);
-        // Switching views resets the scroll so the new body starts at the
-        // top-left, and drops any active filter (it was scoped to the old tab).
-        self.scroll.set(0);
-        self.hscroll.set(0);
-        self.search_active.set(false);
-        self.search_query.borrow_mut().clear();
+        if let Some(a) = self.approval.as_mut() {
+            a.cycle_notice(forward);
+        } else if let Some(t) = self.target.as_mut() {
+            t.cycle_tab(forward);
+        } else if self.dashboard_open {
+            self.sync_approvals(None);
+            self.list.cycle_tab(forward);
+        } else if self.model.has_dashboard() {
+            // From the line, either direction opens the dashboard; a command
+            // with no dashboard has nothing to open.
+            self.dashboard_open = true;
+        }
     }
 
     fn toggle_scope(&mut self) {
-        let next = match self.scope.get() {
+        if self.target.is_some() || self.approval.is_some() {
+            return;
+        }
+        self.list.scope = match self.list.scope {
             CountScope::Matched => CountScope::All,
             CountScope::All => CountScope::Matched,
         };
-        self.scope.set(next);
     }
 
     fn is_on_main_view(&self) -> bool {
-        self.view.get() == ViewMode::Default
+        !self.full_screen()
     }
 
     fn has_active_filter(&self) -> bool {
-        self.search_active.get() || !self.search_query.borrow().is_empty()
+        if self.approval.is_some() {
+            return false;
+        }
+        match &self.target {
+            Some(t) => t.has_search(),
+            None => self.list.is_editing() || !self.list.filter().is_empty(),
+        }
     }
 
     fn back_to_main(&mut self) {
-        self.view.set(ViewMode::Default);
-        // Reset the same per-tab state a `Tab` switch does: scroll, pan, and any
-        // filter scoped to the tab we are leaving.
-        self.scroll.set(0);
-        self.hscroll.set(0);
-        self.search_active.set(false);
-        self.search_query.borrow_mut().clear();
+        // From the approval view, back to the screen that opened it (the
+        // request stays pending); from a target screen, the list; from the
+        // list, the line.
+        if self.approval.take().is_some() {
+            return;
+        }
+        if self.target.take().is_none() {
+            self.dashboard_open = false;
+        }
     }
 
-    // The approval keys act on the run: inert in an attached view, which has
-    // no queue (its prompt is drawn from the feed).
-    fn approval_active(&self) -> bool {
-        self.approval_center().is_some_and(|c| c.is_active())
+    fn open_selected(&mut self, log: bool) {
+        if !self.dashboard_open || self.approval.is_some() {
+            return;
+        }
+        if let Some(t) = &mut self.target {
+            // Enter on an open target screen: expand a folded output group.
+            if !log {
+                t.enter();
+            }
+            return;
+        }
+        self.sync_approvals(None);
+        if let Some(id) = self.list.selected() {
+            // A ✦ row: Enter opens its approval view, on that request.
+            if !log && let Some(seq) = self.list.approval_of(id).map(|a| a.seq) {
+                let _opened = self.open_approval(Some(seq));
+                return;
+            }
+            self.target = Some(crate::tui::dashboard::TargetScreen::open(
+                &self.state.dash,
+                id,
+                log,
+                self.target_reader.clone(),
+            ));
+        }
     }
 
-    fn approval_respond(&mut self, approve: bool) {
-        let Some(center) = self.approval_center() else {
-            return;
-        };
-        // The prompt on screen is the front of the queue; an expanded one had
-        // its notices read inline.
-        let Some(view) = center.current() else {
-            return;
-        };
-        let read = if view.expanded {
-            view.notices.into_iter().map(|n| n.name).collect()
-        } else {
-            Vec::new()
-        };
-        let _decided = center.respond(view.seq, approve, read);
-        // A resolved prompt shrinks the body; reset scroll so the live rows show.
-        self.scroll.set(0);
+    // The approval view acts on the run only in a live view: an attached
+    // view opens it read-only on the recorded queue, and decides nothing.
+    fn approval_open(&mut self) -> bool {
+        self.approval.is_none() && self.open_approval(None)
     }
 
-    fn approval_toggle_notice(&mut self) {
-        let Some(center) = self.approval_center() else {
+    fn in_approval_view(&self) -> bool {
+        self.approval.is_some()
+    }
+
+    fn approval_decide(&mut self, decide: crate::tui::app::Decide, now_ms: u64) {
+        use crate::tui::app::Decide;
+        use crate::tui::session::ApprovalStanding;
+        let Some(screen) = self.approval.as_mut() else {
             return;
         };
-        center.toggle_expanded();
-        self.scroll.set(0);
+        let Some(center) = (match &self.role {
+            Role::Live { approval } => approval.as_ref(),
+            Role::Attached { .. } => None,
+        }) else {
+            return;
+        };
+        // Locked out: dropped, never queued for when it arms.
+        if !screen.armed(now_ms) {
+            return;
+        }
+        let seq = screen.seq();
+        // The center prints each decision's scrollback line; the view only
+        // shows it in its header.
+        let approved = match decide {
+            Decide::Approve | Decide::Reject => {
+                let approve = decide == Decide::Approve;
+                center
+                    .respond(seq, approve, screen.read_names())
+                    .map(|d| d.approved)
+            }
+            Decide::ApproveAll | Decide::RejectAll => {
+                let standing = if decide == Decide::ApproveAll {
+                    ApprovalStanding::Approve
+                } else {
+                    ApprovalStanding::Reject
+                };
+                center
+                    .set_standing(seq, standing)
+                    .into_iter()
+                    .find(|d| d.seq == seq)
+                    .map(|d| d.approved)
+            }
+        };
+        if let Some(approved) = approved {
+            screen.decided(approved, now_ms);
+        }
+    }
+
+    fn advance(&mut self, now_ms: u64) {
+        if self.approval.is_none() {
+            return;
+        }
+        // A viewer's request leaves the queue when the run's terminal
+        // decides it: the view moves on as a live one does.
+        let queue = self.approval_queue();
+        let Some(screen) = self.approval.as_mut() else {
+            return;
+        };
+        if !screen.advance(now_ms, &queue) {
+            self.approval = None;
+        }
     }
 
     fn is_searching(&self) -> bool {
-        self.search_active.get()
+        if self.approval.is_some() {
+            return false;
+        }
+        match &self.target {
+            Some(t) => t.is_searching(),
+            None => self.list.is_editing(),
+        }
     }
 
     fn search_start(&mut self) {
-        // Search only filters the list tabs; ignore `/` on the live Default view.
-        if self.view.get() == ViewMode::Default {
+        // A target screen searches its log; the dashboard filters its list;
+        // the line and the approval view have neither.
+        if self.approval.is_some() {
             return;
         }
-        // Re-entering search keeps any confirmed query so `/` resumes editing.
-        self.search_active.set(true);
-        self.scroll.set(0);
-        self.hscroll.set(0);
+        if let Some(t) = self.target.as_mut() {
+            t.search_start();
+        } else if self.dashboard_open {
+            self.list.filter_start();
+        }
     }
 
     fn search_input(&mut self, c: char) {
-        self.search_query.borrow_mut().push(c);
-        // A changed filter reshapes the list; restart from the top.
-        self.scroll.set(0);
+        match self.target.as_mut() {
+            Some(t) => t.search_input(c),
+            None => self.list.filter_input(c),
+        }
     }
 
     fn search_backspace(&mut self) {
-        self.search_query.borrow_mut().pop();
-        self.scroll.set(0);
+        match self.target.as_mut() {
+            Some(t) => t.search_backspace(),
+            None => self.list.filter_backspace(),
+        }
     }
 
     fn search_cancel(&mut self) {
-        self.search_active.set(false);
-        self.search_query.borrow_mut().clear();
-        self.scroll.set(0);
-        self.hscroll.set(0);
+        match self.target.as_mut() {
+            Some(t) => t.search_cancel(),
+            None => {
+                let _had = self.list.escape();
+            }
+        }
     }
 
     fn search_confirm(&mut self) {
-        // Leave input mode but keep the filter so the list stays scrollable.
-        self.search_active.set(false);
+        // Leave input mode but keep the filter (or the search).
+        match self.target.as_mut() {
+            Some(t) => t.search_confirm(&self.state.redact),
+            None => self.list.filter_confirm(),
+        }
     }
 
-    /// Layout (top to bottom), a rounded box sized to `height` rows (one third of
-    /// the terminal, see [`rows_for_height`]), with a dim help row pinned beneath:
-    /// ```text
-    /// ╭─ 1m05s · D / N done · N cached · N waiting · N failed ── <workers> ─╮
-    ///   <slow rows + lock waits, scrollable>
-    /// ╰─── <label> ───────────────────────────────────────────────────────╯
-    ///   ↑/↓ scroll
-    /// ```
-    /// The body grows to fill the available rows; when it overflows it scrolls and
-    /// the last visible row collapses the remainder. When nothing is slow the body
-    /// shows a dim, slowly-drifting abstract field instead of blank rows. The
-    /// `spinner` is unused — liveness is conveyed by the worker braille, the
-    /// scrolling label, and the idle art.
-    fn render(&self, _spinner: &str, now_ms: u64, width: u16, height: u16) -> Vec<Line<'static>> {
-        let height = usize::from(height.max(MIN_PROGRESS_ROWS));
-        // height = 1 header + body_rows + 1 bottom border + 1 help row.
-        let body_rows = height - 3;
-        let mut lines = Vec::with_capacity(height);
-        lines.push(self.header_line(now_ms, width));
-        let view = self.view.get();
-        // The `/` filter only applies to the list tabs; the Default body ignores it.
-        let query = self.search_query.borrow();
-        let filter: &str = query.as_str();
-        let body = match view {
-            // Pending approval prompts ride at the very top of the live body so a
-            // gated run is impossible to miss; the slow/lock rows follow.
-            ViewMode::Default => {
-                let mut b = self.approval_lines();
-                b.extend(self.state.body_lines(now_ms));
-                Body::Lines(b)
-            }
-            ViewMode::Done => Body::Rows(self.state.done_rows(self.scope.get(), filter)),
-            ViewMode::Matched => Body::Rows(self.state.matched_rows(filter)),
-            ViewMode::Cached => Body::Rows(self.state.cached_rows(self.scope.get(), filter)),
-            // Bounded by what is queued right now, like the live body.
-            ViewMode::Waiting => Body::Lines(self.state.admission_wait_lines(now_ms, filter)),
-            ViewMode::Failed => Body::Rows(self.state.failed_rows(filter)),
-        };
-        let total = body.len();
-        let filtering = !filter.is_empty();
-        if total == 0 {
-            self.scroll.set(0);
-            self.hscroll.set(0);
-            match view {
-                // Default view: the dim drifting idle field.
-                ViewMode::Default => {
-                    lines.extend(art_lines(now_ms, usize::from(width.max(1)), body_rows))
-                }
-                // List tabs with an active filter that matched nothing.
-                _ if filtering => lines.push(Line::from(Span::styled(
-                    format!("  no targets match \"{filter}\""),
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::DIM),
-                ))),
-                // Done view with nothing completed: a single dim placeholder.
-                ViewMode::Done => lines.push(Line::from(Span::styled(
-                    "  no completed targets",
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::DIM),
-                ))),
-                // Matched view before any match streamed: a dim placeholder.
-                ViewMode::Matched => lines.push(Line::from(Span::styled(
-                    "  no matched targets",
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::DIM),
-                ))),
-                // Cached view with nothing cached: a dim placeholder.
-                ViewMode::Cached => lines.push(Line::from(Span::styled(
-                    "  no cached targets",
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::DIM),
-                ))),
-                // Waiting view with nothing held at admission: a dim placeholder.
-                ViewMode::Waiting => lines.push(Line::from(Span::styled(
-                    "  no waiting targets",
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::DIM),
-                ))),
-                // Failed view with nothing failed: a single dim placeholder.
-                ViewMode::Failed => lines.push(Line::from(Span::styled(
-                    "  no failed targets",
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::DIM),
-                ))),
-            }
-        } else {
-            // Clamp the horizontal pan against the widest body line so panning
-            // stops once the longest line's tail reaches the right edge. Measured
-            // over the whole list, not just the window, so the clamp does not
-            // shift as you scroll — which means measuring every row. An unpanned
-            // body clamps to 0 whatever the widest row is, so skip the walk
-            // entirely in that case; it is every frame the user has not panned.
-            let hscroll = match self.hscroll.get() {
-                0 => 0,
-                pan => {
-                    let avail = usize::from(width.max(1));
-                    pan.min(body.max_width().saturating_sub(avail))
-                }
-            };
-            self.hscroll.set(hscroll);
-
-            let (window, scroll) = body.window(body_rows, self.scroll.get());
-            self.scroll.set(scroll);
-            lines.extend(window.into_iter().map(|l| hscroll_line(l, hscroll)));
-        }
-        // Pad the body so the bottom border always pins to the same row.
-        while lines.len() < body_rows + 1 {
-            lines.push(Line::from(""));
-        }
-        lines.push(self.bottom_line(now_ms, width, self.scroll.get(), total, body_rows));
-        lines.push(self.help_line());
+    /// The line, and above it the approval prompt row while a request is
+    /// pending. `height` is the rows [`Self::rows`] asked for.
+    fn render(&self, spinner: &str, now_ms: u64, width: u16, _height: u16) -> Vec<Line<'static>> {
+        let mut lines: Vec<Line<'static>> = Vec::with_capacity(2);
+        lines.extend(self.approval_prompt(now_ms));
+        lines.push(self.line(spinner, now_ms, width, true));
         lines
     }
 
     fn hold_after_finish(&self) -> bool {
-        // Auto-exit only from the main view; if the user is reading another tab
-        // (e.g. the failed list), keep the viewport up until they quit.
-        self.view.get() != ViewMode::Default
+        // Auto-exit only from the line; while the dashboard is up, keep it
+        // until the user leaves (I: closing it under their cursor loses
+        // their place). `--dashboard` holds on every screen. A viewer never
+        // holds: the session's end prints its summary and report, and attach
+        // exits with its code (I11).
+        !matches!(self.role, Role::Attached { .. }) && (self.full_screen() || self.pinned)
+    }
+
+    fn set_stopped(&mut self) {
+        self.stopped = true;
+    }
+
+    fn stopped(&self) -> bool {
+        self.stopped
     }
 
     fn set_finished(&mut self, at_ms: u64) {
         // Freeze the elapsed clock at the finish instant; the viewport keeps
         // rendering while held but the time must stop counting. A viewer
-        // freezes it where the run's own summary did, once it was recorded.
+        // freezes it where the run's own summary did, once it was recorded,
+        // and says "stopped" if the run's did.
         let at = match &self.role {
-            Role::Attached { feed, .. } => feed.finished_at_ms().unwrap_or(at_ms),
+            Role::Attached { feed, .. } => {
+                self.stopped |= feed.stopped();
+                feed.finished_at_ms().unwrap_or(at_ms)
+            }
             Role::Live { .. } => at_ms,
         };
         self.finished_at_ms = Some(at);
+        // Nothing is left to stop: an armed prompt would ask for nothing.
+        self.stop_arm.disarm();
     }
 
     /// Final report — the elapsed clock plus the header model's summary segment,
@@ -3102,7 +2979,7 @@ impl TUIAppView for TuiProgressView {
     /// when there was nothing to report (e.g. inspect/query, or a no-op gc), in
     /// which case nothing is printed.
     fn last_render(&self) {
-        if let Some(line) = self.final_line() {
+        if let Some(line) = self.final_line_in(crate::tui::color::stderr_color_enabled()) {
             use std::io::Write;
             drop(writeln!(std::io::stderr().lock(), "{line}"));
         }
@@ -3145,8 +3022,9 @@ pub(crate) fn prepare_note(
             format!("scratch {scratch}: could not prepare ({err})"),
             true,
         ),
-        // The common case, and the whole point of staying quiet.
-        (None, "" | "warm") => return None,
+        // The common case, and the whole point of staying quiet. A cold cache
+        // is the normal first run, nothing to act on: also silent.
+        (None, "" | "warm" | "cold") => return None,
         (None, "pulled") => (
             format!(
                 "scratch {scratch}: pulled {} from the remote",
@@ -3162,10 +3040,6 @@ pub(crate) fn prepare_note(
             format!("scratch {scratch}: over its max_size — dropped whole, this build runs cold"),
             true,
         ),
-        (None, "cold") => (
-            format!("scratch {scratch}: cold, nothing to restore from"),
-            false,
-        ),
         (None, "audit") => (
             format!("scratch {scratch}: --no-scratch, running against an empty cache"),
             false,
@@ -3178,9 +3052,91 @@ pub(crate) fn prepare_note(
     Some(Note { text, warn })
 }
 
-/// The paved-road [`CIAppView`]: a one-line label header, a concise per-execute
-/// line, and a final one-line summary plus per-error lines — all through the
-/// log sink. Used by every command's `ci_view`.
+/// A root failure's block in the CI log, printed the moment it fails, in the
+/// failure report's words (`src/commands/errors/report.rs`):
+///
+/// ```text
+/// ✗ //web:lint · exit status: 1
+///   │ web/a.ts:14:3  error  'useState' is defined but never used
+///   full log: /home/u/.heph/failures/…/log.txt
+///   log: heph log //web:lint
+/// ```
+///
+/// The header names the exit status or the timeout as the report's block
+/// header does; a failure with neither shows its error as a body row, as the
+/// report's body does. Then the last `log_lines` lines of the tail the event
+/// carries (never a file read on the event path), sanitized, redacted and
+/// plain. Then the CI box's last rows ([`left_behind_rows`]) from what the
+/// event says the run left behind: the block stands in for the box, which the
+/// end of the run leaves out for it. No trailing newline: the log line adds
+/// one.
+///
+/// [`left_behind_rows`]: crate::tui::failure_rows::left_behind_rows
+fn live_failure_block(
+    addr: &str,
+    error: &str,
+    exit_status: Option<&str>,
+    timed_out: Option<&hcore::events::TimedOutData>,
+    tail: Option<&str>,
+    log_lines: usize,
+    redact: &crate::tui::text::Redact,
+) -> String {
+    use crate::tui::text::{clean_inline, expand_tabs, sanitize_log};
+    let row = |line: &str| expand_tabs(&redact.apply(line)).into_owned();
+
+    let mut out = format!("✗ {}", clean_inline(addr));
+    let mut body: Vec<String> = Vec::new();
+    if let Some(t) = timed_out {
+        out.push_str(" · timed out after ");
+        out.push_str(&hcore::units::format_duration(
+            std::time::Duration::from_millis(t.timeout_ms),
+        ));
+        out.push_str(" (its timeout)");
+    } else if let Some(status) = exit_status {
+        out.push_str(" · ");
+        out.push_str(clean_inline(status).trim_end());
+    } else {
+        body.extend(sanitize_log(error.as_bytes()).lines().map(row));
+    }
+    if log_lines > 0
+        && let Some(text) = tail
+    {
+        if text.trim().is_empty() {
+            body.push("empty log".to_owned());
+        } else {
+            let clean = sanitize_log(text.as_bytes());
+            let n = clean.lines().count();
+            body.extend(clean.lines().skip(n.saturating_sub(log_lines)).map(row));
+        }
+    }
+    for line in &body {
+        out.push_str("\n  │ ");
+        out.push_str(line);
+    }
+    out
+}
+
+/// `block` followed by the box's last rows, so the end of the run need not
+/// print the box. Not redacted: they are paths to open and commands to run,
+/// which the box prints whole too.
+fn with_left_behind(
+    mut block: String,
+    addr: &str,
+    left_behind: Option<&hcore::events::LeftBehindData>,
+) -> String {
+    if let Some(left) = left_behind {
+        let rows = crate::tui::failure_rows::left_behind_rows(addr, left);
+        if !rows.is_empty() {
+            block.push('\n');
+            block.push_str(rows.trim_end_matches('\n'));
+        }
+    }
+    block
+}
+
+/// The paved-road [`CIAppView`]: no header line, a concise per-execute line,
+/// and a final one-line summary plus per-error lines — all through the log
+/// sink. Used by every command's `ci_view`.
 pub struct CiProgressView {
     core: ProgressCore,
     /// Caches whose contention has already been announced.
@@ -3190,13 +3146,53 @@ pub struct CiProgressView {
     /// first names the problem, and [`finish`](CIAppView::finish) reports the
     /// total it cost.
     scratch_wait_announced: HashSet<String>,
+    /// The user stopped the run ([`CIAppView::set_stopped`]): the summary
+    /// line starts `stopped · `, as the TUI's final line does.
+    stopped: bool,
+    /// How many of a root failure's last log lines it prints the moment it
+    /// fails (`--log-lines`).
+    log_lines: usize,
+    /// Root failures already printed: a same-addr `ResultEnd` double-fire
+    /// prints one block, not two.
+    failures_printed: HashSet<String>,
 }
+
+/// `heph run --log-lines`' default: how many tail lines a failure prints live
+/// when the command has no such flag.
+const DEFAULT_LOG_LINES: usize = 10;
 
 impl CiProgressView {
     pub fn new(label: impl Into<String>) -> Self {
         Self {
             core: ProgressCore::new(label),
             scratch_wait_announced: HashSet::new(),
+            stopped: false,
+            log_lines: DEFAULT_LOG_LINES,
+            failures_printed: HashSet::new(),
+        }
+    }
+
+    /// Print `n` tail lines per root failure instead of [`DEFAULT_LOG_LINES`].
+    #[must_use]
+    pub fn with_log_lines(mut self, n: usize) -> Self {
+        self.log_lines = n;
+        self
+    }
+
+    /// Redact `redact` (heph's home) from every error text and log line.
+    #[must_use]
+    pub fn with_redact(mut self, redact: crate::tui::text::Redact) -> Self {
+        self.core.state.set_redact(redact);
+        self
+    }
+
+    /// The summary line [`CIAppView::finish`] logs last.
+    fn summary_line(&self) -> String {
+        let summary = self.core.state.summary();
+        if self.stopped {
+            format!("stopped · {summary}")
+        } else {
+            summary
         }
     }
 }
@@ -3213,28 +3209,20 @@ impl CIAppView for CiProgressView {
         self.core.state.name_lock_holders(names);
     }
 
-    fn begin(&self) {
-        tracing::info!("{}", self.core.label);
+    fn failures_printed(&self) -> HashSet<String> {
+        self.failures_printed.clone()
     }
 
-    /// "Not chatty" policy: one line only for cacheable executes (the 1:1
-    /// replacement for the old `tracing::info!(… "run")` — cache hits
-    /// short-circuit before execute, so they stay silent).
+    // No `begin`: the run opens with no "Running …" header line. The command
+    // that names it is the line above in any log; the label lives on as the
+    // session's.
+
+    /// "Not chatty" policy: an execute starting logs nothing — a line per
+    /// target is noise on a busy build, and the summary counts them. Only
+    /// what the reader must act on or explain (lock waits, scratch notices)
+    /// gets a line.
     fn apply(&mut self, ev: &BuildEvent) {
         match &ev.kind {
-            BuildEventKind::ExecuteStart {
-                addr,
-                driver,
-                cache: true,
-                declared,
-                reserved,
-                ..
-            } => match hcore::events::clamp_text(declared.as_ref(), reserved.as_ref(), |p| {
-                self.core.state.unit_of(p)
-            }) {
-                Some(clamp) => tracing::info!("running {addr} [{driver}] ({clamp})"),
-                None => tracing::info!("running {addr} [{driver}]"),
-            },
             // Admission waits stay off the CI log: a line per wait is noise
             // on a busy build, and the live views (the TUI's waiting tab, the
             // GHA live report) show them as they happen.
@@ -3287,6 +3275,36 @@ impl CIAppView for CiProgressView {
                     }
                 }
             }
+            // A root failure's block, the moment it fails: a CI log otherwise
+            // says why only once the whole build is over. A collateral
+            // failure and a stop print nothing — the root's block explains
+            // them, and Ctrl-C is not a failure.
+            BuildEventKind::ResultEnd {
+                addr,
+                error: Some(error),
+                upstream_of: None,
+                exit_status,
+                log_tail,
+                timed_out,
+                cancelled: false,
+                left_behind,
+            } if !self.failures_printed.contains(addr) => {
+                self.failures_printed.insert(addr.clone());
+                let block = with_left_behind(
+                    live_failure_block(
+                        addr,
+                        error,
+                        exit_status.as_deref(),
+                        timed_out.as_ref(),
+                        log_tail.as_ref().map(|t| t.text.as_str()),
+                        self.log_lines,
+                        &self.core.state.redact,
+                    ),
+                    addr,
+                    left_behind.as_deref(),
+                );
+                tracing::error!("{block}");
+            }
             _ => {}
         }
         self.core.fold(ev);
@@ -3302,7 +3320,11 @@ impl CIAppView for CiProgressView {
             let total = human_elapsed(total_ms);
             tracing::info!("scratch {scratch} serialized {waiters} targets, {total} of total wait");
         }
-        tracing::info!("{}", self.core.state.summary());
+        tracing::info!("{}", self.summary_line());
+    }
+
+    fn set_stopped(&mut self) {
+        self.stopped = true;
     }
 }
 
@@ -3346,16 +3368,10 @@ impl CIAppView for GcCiView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hcore::events::CacheOutcomeKind;
 
     fn ev(at_unix_ms: u64, kind: BuildEventKind) -> BuildEvent {
         BuildEvent { at_unix_ms, kind }
-    }
-
-    /// Every row of a list body, rendered in order — what the viewport would
-    /// show if it had unlimited rows. The reference the windowed renders are
-    /// checked against.
-    fn all_lines(rows: BodyRows<'_>) -> Vec<Line<'static>> {
-        rows.window(usize::MAX, 0).0
     }
 
     /// Flatten a header model's items into their concatenated text.
@@ -3560,6 +3576,8 @@ mod tests {
     }
     fn result_end(addr: &str, error: Option<String>) -> BuildEventKind {
         BuildEventKind::ResultEnd {
+            left_behind: None,
+            cancelled: false,
             addr: addr.into(),
             error,
             upstream_of: None,
@@ -3672,227 +3690,153 @@ mod tests {
         );
     }
 
-    #[test]
-    fn busy_cpu_tracks_start_and_end() {
-        let mut s = BuildState::new();
-        s.apply(&ev(
-            0,
-            execute_start_reserving("//a:x", &[("cpu", 3 * CPU)]),
-        ));
-        s.apply(&ev(
-            0,
-            execute_start_reserving("//a:y", &[("cpu", CPU / 2)]),
-        ));
-        assert_eq!(s.busy_cpus(), 4, "3 + 0.5 rounds up");
-        s.apply(&ev(1, execute_end("//a:x")));
-        assert_eq!(s.busy_cpus(), 1);
-        s.apply(&ev(2, execute_end("//a:y")));
-        assert_eq!(s.busy_cpus(), 0);
-    }
-
-    #[test]
-    fn an_unpaired_end_saturates() {
-        let mut s = BuildState::new();
-        s.apply(&ev(0, execute_start_reserving("//a:x", &[("cpu", CPU)])));
-        s.apply(&ev(1, execute_end("//a:never-started")));
-        assert_eq!(s.busy_cpus(), 1, "an End with no Start releases nothing");
-        s.apply(&ev(2, execute_end("//a:x")));
-        s.apply(&ev(3, execute_end("//a:x")));
-        assert_eq!(s.busy_cpus(), 0);
-    }
-
-    #[test]
-    fn a_double_start_counts_once() {
-        let mut s = BuildState::new();
-        s.apply(&ev(
-            0,
-            execute_start_reserving("//a:x", &[("cpu", 2 * CPU)]),
-        ));
-        s.apply(&ev(
-            1,
-            execute_start_reserving("//a:x", &[("cpu", 2 * CPU)]),
-        ));
-        assert_eq!(s.busy_cpus(), 2);
-        s.apply(&ev(2, execute_end("//a:x")));
-        assert_eq!(s.busy_cpus(), 0);
-    }
-
-    #[test]
-    fn frames_without_reserved_count_as_one() {
-        let mut s = BuildState::new();
-        s.apply(&ev(0, execute_start("//a:x")));
-        s.apply(&ev(0, execute_start("//a:y")));
-        assert_eq!(s.busy_cpus(), 2);
-    }
-
-    /// Every pool but `cpu` shows only while some running target holds it,
-    /// in its announced unit; an unbounded pool shows no capacity; a pool
-    /// that was never announced still shows what is held of it.
-    #[test]
-    fn pool_segments_show_each_held_pool_in_its_unit() {
-        let mut s = BuildState::new();
-        s.apply(&ev(
-            0,
-            BuildEventKind::RequestConfig {
-                max_workers: 4,
-                fail_fast: false,
-                scratch_disabled: false,
-                resources: [
-                    ("cpu".into(), Some(4 * CPU)),
-                    ("gpu".into(), Some(2)),
-                    ("memory".into(), Some(16 << 30)),
-                    ("tokens".into(), None),
-                ]
-                .into(),
-                units: [
-                    ("cpu".into(), "cpu".into()),
-                    ("gpu".into(), "count".into()),
-                    ("memory".into(), "bytes".into()),
-                    ("tokens".into(), "count".into()),
-                ]
-                .into(),
-            },
-        ));
-        let segments = |s: &BuildState| s.pool_segments().collect::<Vec<_>>();
-        s.apply(&ev(0, execute_start("//a:x")));
-        assert!(segments(&s).is_empty(), "cpu is the worker cells");
-        s.apply(&ev(
-            0,
-            execute_start_reserving("//a:y", &[("cpu", CPU), ("memory", 2 << 30)]),
-        ));
-        assert_eq!(segments(&s), ["memory 2.0 GiB/16.0 GiB"]);
-        s.apply(&ev(
-            0,
-            execute_start_reserving("//a:z", &[("cpu", CPU), ("gpu", 1), ("tokens", 5)]),
-        ));
-        assert_eq!(
-            segments(&s),
-            ["gpu 1/2", "memory 2.0 GiB/16.0 GiB", "tokens 5"]
-        );
-        s.apply(&ev(1, execute_end("//a:y")));
-        assert_eq!(segments(&s), ["gpu 1/2", "tokens 5"]);
-        s.apply(&ev(
-            1,
-            execute_start_reserving("//a:w", &[("cpu", CPU), ("licenses", 3)]),
-        ));
-        assert_eq!(segments(&s), ["gpu 1/2", "licenses 3", "tokens 5"]);
-        s.apply(&ev(2, execute_end("//a:z")));
-        s.apply(&ev(2, execute_end("//a:w")));
-        assert!(segments(&s).is_empty(), "{:?}", segments(&s));
-    }
-
-    /// The per-pool sum holds under what an event stream can do: two holders
-    /// of one non-cpu pool add up and release separately, a repeated Start
-    /// replaces what the addr held instead of adding to it, and an End with
-    /// no Start (or a second End) releases nothing.
-    #[test]
-    fn pool_sums_survive_shared_holders_repeats_and_unpaired_ends() {
-        let mut s = BuildState::new();
-        s.apply(&ev(
-            0,
-            BuildEventKind::RequestConfig {
-                max_workers: 4,
-                fail_fast: false,
-                scratch_disabled: false,
-                resources: [("cpu".into(), Some(4 * CPU)), ("gpu".into(), Some(4))].into(),
-                units: [("cpu".into(), "cpu".into()), ("gpu".into(), "count".into())].into(),
-            },
-        ));
-        let segments = |s: &BuildState| s.pool_segments().collect::<Vec<_>>();
-        let gpu = |n: u64| [("cpu", CPU), ("gpu", n)];
-
-        // Two holders of gpu.
-        s.apply(&ev(0, execute_start_reserving("//a:x", &gpu(1))));
-        s.apply(&ev(0, execute_start_reserving("//a:y", &gpu(2))));
-        assert_eq!(segments(&s), ["gpu 3/4"]);
-        assert_eq!(s.busy_cpus(), 2);
-
-        // A repeated Start for //a:x replaces its 1 with 1, not 2.
-        s.apply(&ev(1, execute_start_reserving("//a:x", &gpu(1))));
-        assert_eq!(segments(&s), ["gpu 3/4"], "a repeated Start replaces");
-        assert_eq!(s.busy_cpus(), 2);
-
-        // An End for an addr that never started releases nothing.
-        s.apply(&ev(1, execute_end("//a:never")));
-        assert_eq!(segments(&s), ["gpu 3/4"], "an unpaired End");
-
-        s.apply(&ev(2, execute_end("//a:y")));
-        assert_eq!(segments(&s), ["gpu 1/4"]);
-        // A second End for //a:y is unpaired too.
-        s.apply(&ev(2, execute_end("//a:y")));
-        assert_eq!(segments(&s), ["gpu 1/4"], "a second End");
-
-        s.apply(&ev(3, execute_end("//a:x")));
-        assert!(segments(&s).is_empty(), "{:?}", segments(&s));
-        assert_eq!(s.busy_cpus(), 0);
-    }
-
-    /// The `sandbox` slot is in no `ExecuteStart.reserved`, so the pool shows
-    /// by its announced waits: `sandbox: N waiting` while runs wait for
-    /// cleanup, gone once they are admitted. A held pool adds its waits to
-    /// its usual segment. A repeated Start counts once, and an End or the
-    /// waiter's own `ExecuteStart` takes it off.
-    #[test]
-    fn pool_segments_show_runs_waiting_on_a_pool() {
-        let mut s = BuildState::new();
-        s.apply(&ev(
-            0,
-            BuildEventKind::RequestConfig {
-                max_workers: 4,
-                fail_fast: false,
-                scratch_disabled: false,
-                resources: [
-                    ("cpu".into(), Some(4 * CPU)),
-                    ("gpu".into(), Some(1)),
-                    ("sandbox".into(), Some(16)),
-                ]
-                .into(),
-                units: [
-                    ("cpu".into(), "cpu".into()),
-                    ("gpu".into(), "count".into()),
-                    ("sandbox".into(), "count".into()),
-                ]
-                .into(),
-            },
-        ));
-        let segments = |s: &BuildState| s.pool_segments().collect::<Vec<_>>();
-        let wait = |addr: &str, pool: &str| BuildEventKind::AdmissionWaitStart {
-            addr: addr.into(),
+    /// A pool's report, as the engine sends it on every change.
+    fn pool_usage(pool: &str, held: u64, capacity: u64, waiting: u64) -> BuildEventKind {
+        BuildEventKind::PoolUsage {
             pool: pool.into(),
-            need: 1,
-            free: 0,
-            ahead: 0,
-            removals_pending: None,
-            yielding_to: None,
-        };
-        let end = |addr: &str| BuildEventKind::AdmissionWaitEnd { addr: addr.into() };
+            held,
+            capacity,
+            waiting,
+            removals_pending: 0,
+        }
+    }
 
-        s.apply(&ev(0, execute_start("//a:running")));
-        assert!(segments(&s).is_empty(), "a running slot is not shown");
-        s.apply(&ev(1, wait("//a:x", "sandbox")));
-        s.apply(&ev(1, wait("//a:y", "sandbox")));
-        assert_eq!(segments(&s), ["sandbox: 2 waiting"]);
-        s.apply(&ev(2, wait("//a:y", "sandbox")));
-        assert_eq!(segments(&s), ["sandbox: 2 waiting"], "a repeated Start");
-
+    /// Every gauge — the line's `cpu`, the box's cells and pool segments,
+    /// the dashboard's header — is the pool's own latest `PoolUsage`:
+    /// sandbox draws like any pool, a pool with waiters turns yellow and
+    /// shows `⧗N`, and an `ExecuteStart.reserved` moves nothing.
+    #[test]
+    fn gauges_follow_pool_usage() {
+        let mut s = BuildState::new();
         s.apply(&ev(
-            2,
-            execute_start_reserving("//a:g", &[("cpu", CPU), ("gpu", 1)]),
+            0,
+            BuildEventKind::RequestConfig {
+                max_workers: 4,
+                fail_fast: false,
+                scratch_disabled: false,
+                resources: [
+                    ("cpu".into(), Some(12 * CPU)),
+                    ("memory".into(), Some(16 << 30)),
+                    ("sandbox".into(), Some(48)),
+                    ("docker".into(), Some(2)),
+                    ("gpu".into(), Some(4)),
+                ]
+                .into(),
+                units: [
+                    ("cpu".into(), "cpu".into()),
+                    ("memory".into(), "bytes".into()),
+                    ("sandbox".into(), "count".into()),
+                    ("docker".into(), "count".into()),
+                    ("gpu".into(), "count".into()),
+                ]
+                .into(),
+            },
         ));
-        s.apply(&ev(2, wait("//a:z", "gpu")));
-        assert_eq!(segments(&s), ["gpu 1/1, 1 waiting", "sandbox: 2 waiting"]);
+        // Idle reports before anything ran draw nothing: no pool is in play.
+        s.apply(&ev(1, pool_usage("cpu", 0, 12 * CPU, 0)));
+        s.apply(&ev(1, pool_usage("gpu", 0, 4, 0)));
+        assert!(s.dashboard().gauges().is_empty());
+        // A run puts what it reserved in play; a reservation moves no
+        // gauge, and a pool that has not reported has none.
+        s.apply(&ev(
+            1,
+            execute_start_reserving("//a:x", &[("cpu", 3 * CPU), ("docker", 1)]),
+        ));
+        assert_eq!(s.busy_cpus(), 0, "nothing derived from reserved");
+        let pools = |s: &BuildState| {
+            s.dashboard()
+                .gauges()
+                .iter()
+                .map(|g| g.pool.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(pools(&s), ["cpu"]);
+        assert!(s.pool_segments().next().is_none());
 
-        s.apply(&ev(3, end("//a:x")));
-        // A lost End: the waiter's ExecuteStart takes the wait off.
-        s.apply(&ev(3, execute_start("//a:y")));
-        s.apply(&ev(3, end("//a:never")));
-        assert_eq!(segments(&s), ["gpu 1/1, 1 waiting"]);
-        s.apply(&ev(4, end("//a:z")));
-        assert_eq!(segments(&s), ["gpu 1/1"]);
+        s.apply(&ev(2, pool_usage("cpu", 11 * CPU + CPU / 2, 12 * CPU, 0)));
+        s.apply(&ev(2, pool_usage("memory", 9 << 30, 16 << 30, 0)));
+        s.apply(&ev(2, pool_usage("sandbox", 9, 48, 0)));
+        s.apply(&ev(2, pool_usage("docker", 2, 2, 1)));
+        s.apply(&ev(2, pool_usage("gpu", 0, 4, 0)));
+        assert_eq!(s.busy_cpus(), 12, "11.5 rounds up");
+        assert_eq!(
+            s.pool_segments().collect::<Vec<_>>(),
+            [
+                "memory 9.0 GiB/16.0 GiB",
+                "sandbox 9/48",
+                "docker 2/2, 1 waiting"
+            ]
+        );
+        let gauges = s.dashboard().gauges();
+        assert_eq!(
+            gauges.iter().map(|g| g.pool.as_str()).collect::<Vec<_>>(),
+            ["cpu", "memory", "sandbox", "docker"],
+            "one gauge per pool in play, in the fixed order; never gpu"
+        );
+        let title = crate::tui::dashboard::Title {
+            command: "heph r build //...",
+            session: None,
+            clock: "1m05s",
+            done: 0,
+            total: None,
+            provisional: false,
+            standing: None,
+            verdict: None,
+        };
+        let (rows, _) = crate::tui::dashboard::header_lines(
+            &title,
+            &gauges,
+            &s.dashboard().counts(CountScope::Matched),
+            crate::tui::dashboard::Tab::All,
+            200,
+        );
+        let text = |l: &Line<'_>| {
+            l.spans
+                .iter()
+                .map(|sp| sp.content.as_ref())
+                .collect::<String>()
+        };
+        let header = rows.iter().map(text).collect::<Vec<_>>().join("\n");
+        for want in ["11.5/12", "mem ██▎░ 9/16G", "sandbox ▊░░░ 9/48", "2/2 ⧗1"] {
+            assert!(header.contains(want), "{want} in\n{header}");
+        }
+        let docker = rows
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|sp| sp.content.contains("⧗1"))
+            .expect("docker's waiters");
+        assert_eq!(docker.style.fg, Some(Color::Yellow), "{docker:?}");
+
+        // The next report replaces the last; a run's end moves nothing.
+        s.apply(&ev(3, execute_end("//a:x")));
+        assert_eq!(s.busy_cpus(), 12);
+        s.apply(&ev(4, pool_usage("cpu", 0, 12 * CPU, 0)));
+        s.apply(&ev(4, pool_usage("docker", 1, 2, 0)));
+        assert_eq!(s.busy_cpus(), 0);
+        assert_eq!(
+            s.pool_segments().collect::<Vec<_>>(),
+            ["memory 9.0 GiB/16.0 GiB", "sandbox 9/48", "docker 1/2"]
+        );
+
+        // A pool in play stays, idle or not; one never touched stays out.
+        s.apply(&ev(5, pool_usage("memory", 0, 16 << 30, 0)));
+        s.apply(&ev(5, pool_usage("docker", 0, 2, 0)));
+        assert_eq!(pools(&s), ["cpu", "memory", "sandbox", "docker"]);
+    }
+
+    /// The line's `cpu` segment, like the header's gauge, waits for
+    /// something to run: an idle report alone draws nothing.
+    #[test]
+    fn the_line_shows_cpu_once_anything_runs() {
+        let mut v = TuiProgressView::new("L");
+        v.apply(&ev(1, pool_usage("cpu", 0, 12 * CPU, 0)));
+        assert_eq!(v.cpu_segment(), None);
+        v.apply(&ev(2, execute_start_reserving("//a:x", &[("cpu", 0)])));
+        assert_eq!(v.cpu_segment().as_deref(), Some("cpu 0/12"));
     }
 
     /// A `sandbox` wait names its cause in the header: how many finished
-    /// runs' sandboxes were still being removed, as of the latest notice.
+    /// runs' sandboxes were still being removed, as the pool reports it.
     #[test]
     fn pool_segments_show_removals_pending_on_a_sandbox_wait() {
         let mut s = BuildState::new();
@@ -3906,11 +3850,21 @@ mod tests {
             removals_pending: Some(pending),
             yielding_to: None,
         };
+        let usage = |waiting, removals_pending| BuildEventKind::PoolUsage {
+            pool: "sandbox".into(),
+            held: 0,
+            capacity: 16,
+            waiting,
+            removals_pending,
+        };
         s.apply(&ev(1, wait("//a:x", 0)));
+        s.apply(&ev(1, usage(1, 0)));
         assert_eq!(segments(&s), ["sandbox: 1 waiting"], "none pending");
         s.apply(&ev(1, wait("//a:y", 1)));
+        s.apply(&ev(1, usage(2, 1)));
         assert_eq!(segments(&s), ["sandbox: 2 waiting (1 removal pending)"]);
         s.apply(&ev(2, wait("//a:z", 3)));
+        s.apply(&ev(2, usage(3, 3)));
         assert_eq!(segments(&s), ["sandbox: 3 waiting (3 removals pending)"]);
         let row: String = s.admission_wait_lines(2, "")[2]
             .spans
@@ -3927,6 +3881,7 @@ mod tests {
                 BuildEventKind::AdmissionWaitEnd { addr: addr.into() },
             ));
         }
+        s.apply(&ev(3, usage(0, 0)));
         assert!(segments(&s).is_empty(), "{:?}", segments(&s));
     }
 
@@ -4006,41 +3961,41 @@ mod tests {
         }
     }
 
-    /// The rendered frame as one string per line.
-    fn frame(v: &TuiProgressView, now_ms: u64) -> Vec<String> {
-        v.render("⠋", now_ms, 100, 10)
+    /// One 100×14 dashboard frame as one string per line.
+    fn dash_frame(v: &mut TuiProgressView, now_ms: u64) -> Vec<String> {
+        v.render_full(now_ms, 100, 14)
             .iter()
-            .map(|l| format!("{l}"))
+            .map(ToString::to_string)
             .collect()
     }
 
     #[test]
-    fn a_waiting_target_moves_to_the_waiting_tab_and_back() {
+    fn a_waiting_target_moves_to_the_pending_tab_and_back() {
+        use crate::tui::dashboard::Tab;
         let mut v = TuiProgressView::new("L");
         v.apply(&ev(1_000, admission_wait_start("//a:b")));
 
-        // The live body no longer carries the row…
-        assert_eq!(v.view.get(), ViewMode::Default);
-        let live = frame(&v, 42_000).join("\n");
-        assert!(!live.contains("//a:b"), "{live}");
-        assert!(live.contains("1 waiting"), "{live}");
-
-        // …the Waiting tab does, with pool, need, free and elapsed.
-        v.view.set(ViewMode::Waiting);
-        let waiting = frame(&v, 42_000);
-        assert!(
-            waiting
+        // The line counts it…
+        let line = |v: &TuiProgressView, now| -> String {
+            v.render("⠋", now, 200, 1)
                 .iter()
-                .any(|l| l == "  ⧗ //a:b waits for cpu 4 (2 free, 41s)"),
-            "{waiting:#?}"
+                .map(ToString::to_string)
+                .collect()
+        };
+        assert!(
+            line(&v, 42_000).contains("1 waiting"),
+            "{}",
+            line(&v, 42_000)
         );
-        // The `/` filter thins it like the other list tabs.
-        "zzz".clone_into(&mut v.search_query.borrow_mut());
-        let filtered = frame(&v, 42_000).join("\n");
-        assert!(filtered.contains("no targets match \"zzz\""), "{filtered}");
-        v.search_query.borrow_mut().clear();
 
-        // Granted: it leaves Waiting and shows where a running target shows.
+        // …the Pending tab lists it, with the pool it waits on.
+        v.open_dashboard();
+        v.list.set_tab(Tab::Pending);
+        let pending = dash_frame(&mut v, 42_000).join("\n");
+        assert!(pending.contains("//a:b"), "{pending}");
+        assert!(pending.contains("waits cpu"), "{pending}");
+
+        // Granted: it leaves Pending for Running, and the line stops counting it.
         v.apply(&ev(
             43_000,
             BuildEventKind::AdmissionWaitEnd {
@@ -4048,13 +4003,16 @@ mod tests {
             },
         ));
         v.apply(&ev(43_000, execute_start("//a:b")));
-        let waiting = frame(&v, 50_000).join("\n");
-        assert!(!waiting.contains("//a:b"), "{waiting}");
-        assert!(waiting.contains("no waiting targets"), "{waiting}");
-        assert!(waiting.contains("0 waiting"), "{waiting}");
-        v.view.set(ViewMode::Default);
-        let live = frame(&v, 50_000).join("\n");
-        assert!(live.contains("//a:b (▶ 7s)"), "{live}");
+        let pending = dash_frame(&mut v, 50_000).join("\n");
+        assert!(!pending.contains("//a:b"), "{pending}");
+        v.list.set_tab(Tab::Running);
+        let running = dash_frame(&mut v, 50_000).join("\n");
+        assert!(running.contains("//a:b"), "{running}");
+        assert!(
+            !line(&v, 50_000).contains("1 waiting"),
+            "{}",
+            line(&v, 50_000)
+        );
     }
 
     #[test]
@@ -4075,13 +4033,9 @@ mod tests {
     }
 
     #[test]
-    fn the_waiting_tab_sits_left_of_failed() {
+    fn the_session_header_counts_waiting_between_cached_and_failed() {
         let v = TuiProgressView::new("L");
-        let modes = v.view_modes();
-        let at = |m: ViewMode| modes.iter().position(|&x| x == m).expect("mode present");
-        assert_eq!(at(ViewMode::Waiting) + 1, at(ViewMode::Failed), "{modes:?}");
-        assert_eq!(at(ViewMode::Cached) + 1, at(ViewMode::Waiting), "{modes:?}");
-        let header = format!("{}", v.header_line(0, 100));
+        let header = v.header_line(0, 100);
         assert!(
             header.contains("0 cached · 0 waiting · 0 failed"),
             "{header}"
@@ -4153,9 +4107,10 @@ mod tests {
         s.apply(&ev(0, execute_start("//a:b")));
         s.apply(&ev(3_000, local_write_start("//a:b")));
 
-        let tl = s.ops.get("//a:b").expect("timeline");
-        assert_eq!(tl.completed.get(&Op::Execute).copied(), Some(3_000));
-        assert_eq!(tl.active, Some((Op::LocalCacheWrite, 3_000)));
+        let r = rec(&s, "//a:b");
+        assert_eq!(r.op_ms(Op::Execute), 3_000);
+        assert_eq!((r.op(), r.op_open()), (Some(Op::LocalCacheWrite), true));
+        assert_eq!(r.op_since_ms, 3_000);
     }
 
     #[test]
@@ -4165,109 +4120,60 @@ mod tests {
         s.apply(&ev(0, execute_start("//a:b")));
         s.apply(&ev(1_000, local_write_end("//a:b")));
 
-        let tl = s.ops.get("//a:b").expect("timeline");
-        assert_eq!(tl.active, Some((Op::Execute, 0)));
-        assert!(tl.completed.is_empty());
+        let r = rec(&s, "//a:b");
+        assert_eq!(
+            (r.op(), r.op_open(), r.op_since_ms),
+            (Some(Op::Execute), true, 0)
+        );
+        assert_eq!(r.total_ms(), 0);
+    }
+
+    /// `addr`'s record in the model.
+    fn rec<'a>(s: &'a BuildState, addr: &str) -> &'a crate::tui::dashboard::Record {
+        s.dash
+            .id(addr)
+            .and_then(|id| s.dash.record(id))
+            .expect("a record")
+    }
+
+    /// The addrs the open-op index holds, sorted.
+    fn open_addrs(s: &BuildState) -> Vec<&str> {
+        let mut v: Vec<&str> = s.dash.open_ops().map(|(id, _)| s.dash.addr(id)).collect();
+        v.sort_unstable();
+        v
     }
 
     #[test]
-    fn op_timeline_dropped_from_ops_once_result_ends() {
-        // `ops` must not retain a finished target's timeline forever — that is
-        // unbounded per-target memory over the life of a run. By the time
-        // `ResultEnd` fires, Execute (and any local-cache-write) has already
-        // closed for the addr, so the entry is dead weight: neither
-        // `long_running` nor `busy_workers` reads a closed-op entry (both walk
-        // `open_ops`, and `long_running`'s `?` already skips an addr with no
-        // active op). Retention should reclaim it here.
-        let mut s = BuildState::new();
-        s.apply(&ev(0, execute_start("//a:b")));
-        s.apply(&ev(1_000, execute_end("//a:b")));
-        assert!(s.ops.contains_key("//a:b"));
-
-        s.apply(&ev(2_000, result_end("//a:b", None)));
-        assert!(
-            !s.ops.contains_key("//a:b"),
-            "ops must drop a target's timeline once its ResultEnd arrives"
-        );
-        assert!(
-            !s.open_ops.contains("//a:b"),
-            "open_ops must not disagree with ops once the entry is gone"
-        );
+    fn a_result_end_closes_its_open_op_even_a_failing_one() {
+        // A `ResultEnd` with an op still open (a lost End) must not leave the
+        // target in the index the slow rows and busy count walk.
+        for error in [None, Some("boom".to_owned())] {
+            let mut s = BuildState::new();
+            s.apply(&ev(0, execute_start("//a:b")));
+            assert_eq!(open_addrs(&s), ["//a:b"]);
+            s.apply(&ev(2_000, result_end("//a:b", error)));
+            assert!(open_addrs(&s).is_empty());
+            assert!(s.long_running(99_000, 0).is_empty());
+        }
     }
 
     #[test]
-    fn op_timeline_reclaimed_when_remote_cache_write_trails_result_end() {
+    fn a_remote_cache_write_that_trails_result_end_opens_and_closes() {
         // `RemoteCacheWrite` is pushed from a detached background task
         // (`Engine::spawn_remote_upload`) that the engine does not await inside
         // the `ResultEnd` scope, so its Start/End can legitimately arrive after
-        // `ResultEnd` already removed the entry. The Start recreates it
-        // (`ops.entry(..).or_default()`); if nothing then reclaimed it, every
-        // remote-cache-uploading target would leak one `OpTimeline` forever —
-        // the exact unbounded growth this retention is meant to fix, just gated
-        // on remote caching instead of run size. The trailing End must be the
-        // one that frees it this time.
+        // `ResultEnd`. It shows while open and leaves the index at its End.
         let mut s = BuildState::new();
         s.apply(&ev(0, execute_start("//a:b")));
         s.apply(&ev(1_000, execute_end("//a:b")));
         s.apply(&ev(2_000, result_end("//a:b", None)));
-        assert!(!s.ops.contains_key("//a:b"), "gone after ResultEnd");
+        assert!(open_addrs(&s).is_empty());
 
-        // The background upload starts after ResultEnd already fired.
         s.apply(&ev(3_000, remote_write_start("//a:b")));
-        assert!(
-            s.ops.contains_key("//a:b"),
-            "the trailing op legitimately recreates the entry"
-        );
-        assert!(s.open_ops.contains("//a:b"));
+        assert_eq!(open_addrs(&s), ["//a:b"]);
 
         s.apply(&ev(4_000, remote_write_end("//a:b")));
-        assert!(
-            !s.ops.contains_key("//a:b"),
-            "the trailing RemoteCacheWriteEnd must reclaim it since ResultEnd already fired"
-        );
-        assert!(!s.open_ops.contains("//a:b"));
-    }
-
-    #[test]
-    fn op_timeline_dropped_from_ops_on_a_failing_result_end_too() {
-        // The removal in the `ResultEnd` arm runs unconditionally, before the
-        // success/error branch is even inspected — a failed target must not keep
-        // its timeline around any more than a successful one does.
-        let mut s = BuildState::new();
-        s.apply(&ev(0, execute_start("//a:b")));
-        s.apply(&ev(1_000, execute_end("//a:b")));
-
-        s.apply(&ev(2_000, result_end("//a:b", Some("boom".into()))));
-        assert!(
-            !s.ops.contains_key("//a:b"),
-            "a failing ResultEnd must drop the timeline too"
-        );
-    }
-
-    #[test]
-    fn ops_map_does_not_grow_unbounded_over_a_large_run() {
-        // The retention regression guard at the scale the field doc calls out:
-        // before this fix `ops` gained one `OpTimeline` per target for the life
-        // of the request, so a 100k-target run held 100k never-freed entries
-        // (each carrying its own `completed: HashMap<Op, u64>`). A wall-clock
-        // measurement of that is noisy under load on this box; the retained
-        // entry count is not — every target below fully completes, so the
-        // post-run count is the deterministic before/after number: unbounded
-        // (100_000) without the fix, 0 with it.
-        let mut s = BuildState::new();
-        for i in 0..100_000 {
-            let addr = format!("//pkg{i}:t");
-            s.apply(&ev(0, result_start(&addr)));
-            s.apply(&ev(0, execute_start(&addr)));
-            s.apply(&ev(1, execute_end(&addr)));
-            s.apply(&ev(1, result_end(&addr, None)));
-        }
-        assert_eq!(s.completed, 100_000);
-        assert_eq!(
-            s.ops.len(),
-            0,
-            "ops retained every finished target instead of freeing them"
-        );
+        assert!(open_addrs(&s).is_empty());
     }
 
     #[test]
@@ -4295,11 +4201,19 @@ mod tests {
     fn result_start_then_ok_end_completes_and_clears_in_flight() {
         let mut s = BuildState::new();
         s.apply(&ev(1, result_start("//a:b")));
-        assert_eq!(s.in_flight_results.len(), 1);
+        assert_eq!(s.dash.in_flight_count(), 1);
         s.apply(&ev(2, result_end("//a:b", None)));
         assert_eq!(s.completed, 1);
         assert_eq!(s.errored, 0);
-        assert_eq!(s.in_flight_results.len(), 0);
+        assert_eq!(s.dash.in_flight_count(), 0);
+    }
+
+    #[test]
+    fn a_result_end_with_no_start_is_not_counted() {
+        let mut s = BuildState::new();
+        s.apply(&ev(2, result_end("//a:b", None)));
+        assert_eq!((s.completed, s.errored), (0, 0));
+        assert_eq!(s.dash.in_flight_count(), 0);
     }
 
     #[test]
@@ -4309,7 +4223,7 @@ mod tests {
         s.apply(&ev(2, result_end("//a:b", Some("boom".into()))));
         assert_eq!(s.errored, 1);
         assert_eq!(s.completed, 0);
-        assert_eq!(s.in_flight_results.len(), 0);
+        assert_eq!(s.dash.in_flight_count(), 0);
     }
 
     #[test]
@@ -4317,13 +4231,15 @@ mod tests {
         let mut s = BuildState::new();
         s.apply(&ev(1, result_start("//a:b")));
         s.apply(&ev(1, result_start("//a:b")));
-        assert_eq!(s.in_flight_results.len(), 1);
+        assert_eq!(s.dash.in_flight_count(), 1);
         s.apply(&ev(2, result_end("//a:b", None)));
         // Second ResultEnd for an already-removed addr must not double-count.
         s.apply(&ev(3, result_end("//a:b", Some("late".into()))));
+        // Nor does a start after the end reopen it.
+        s.apply(&ev(4, result_start("//a:b")));
         assert_eq!(s.completed, 1);
         assert_eq!(s.errored, 0);
-        assert_eq!(s.in_flight_results.len(), 0);
+        assert_eq!(s.dash.in_flight_count(), 0);
     }
 
     #[test]
@@ -4387,20 +4303,6 @@ mod tests {
             "{}",
             s.summary()
         );
-        assert_eq!(
-            s.cached_count(CountScope::All),
-            usize::try_from(l + r).expect("small"),
-            "the rebuilt hits are no longer listed as cached"
-        );
-    }
-
-    /// Before any `Matched` event the header falls back to the fold's hits,
-    /// and a remote hit is one of them.
-    #[test]
-    fn cached_count_falls_back_to_the_fold_before_matched() {
-        let mut s = BuildState::new();
-        s.apply(&ev(1, remote_cache_hit("//a:r")));
-        assert_eq!(s.cached_count(CountScope::Matched), 1);
     }
 
     /// A cache hit the engine later has to rebuild must stop counting as a hit.
@@ -4415,21 +4317,16 @@ mod tests {
     #[test]
     fn a_hit_that_rebuilds_stops_counting_as_a_hit() {
         let mut s = BuildState::new();
-        // `matched_cached` is folded at both edges — a hit can be announced
-        // before or after its addr is matched — so retraction has to survive
-        // both orders. `//a:local` and `//a:stands` are matched first and hit
-        // after; `//a:remote` hits first and is matched after.
+        // A hit can be announced before or after its addr is matched, so
+        // retraction has to survive both orders. `//a:local` and `//a:stands`
+        // are matched first and hit after; `//a:remote` hits first and is
+        // matched after.
         s.apply(&ev(1, matched(&["//a:local", "//a:stands"], false)));
         s.apply(&ev(2, local_cache_hit("//a:local")));
         s.apply(&ev(3, remote_cache_hit("//a:remote")));
         s.apply(&ev(4, local_cache_hit("//a:stands")));
         s.apply(&ev(5, matched(&["//a:remote"], true)));
         assert_eq!(cache3(&s), (2, 1, 0));
-        assert_eq!(
-            s.cached_count(CountScope::Matched),
-            3,
-            "all three matched targets are announced cached to begin with"
-        );
 
         // Two of the three revisions turn out to be unreadable and get rebuilt.
         use hcore::events::CacheHitKind;
@@ -4451,29 +4348,23 @@ mod tests {
             s.summary()
         );
         assert_eq!(s.executed, 2);
-        // Through the header's own accessors, not the raw counters: these are the
-        // numbers the user reads, and the point is that `executed + cached` (2 + 1)
-        // does not exceed the three targets seen.
+        for addr in ["//a:local", "//a:remote", "//a:stands"] {
+            s.apply(&ev(10, result_end(addr, None)));
+        }
+        // Through the counts the user reads: `executed + cached` (2 + 1) does
+        // not exceed the three targets seen, in either scope.
+        for scope in [CountScope::All, CountScope::Matched] {
+            let tabs = s.dash.counts(scope);
+            assert_eq!(
+                (tabs.done, tabs.cached),
+                (2, 1),
+                "{scope:?}: only the hit that stood may still be reported as cached"
+            );
+        }
+        assert_eq!(s.counts(CountScope::Matched).cached, "1 cached");
         assert_eq!(
-            s.cached_count(CountScope::All),
-            1,
-            "only the hit that stood may still be reported as cached"
-        );
-        assert_eq!(
-            s.cached_count(CountScope::Matched),
-            1,
-            "the folded `matched ∩ cache_hit` counter must be decremented too — \
-             dropping the addr from the set alone leaves the count stale"
-        );
-        assert_eq!(
-            s.cached_count(CountScope::Matched),
-            scan_matched(&s).1,
-            "the folded counter must still agree with the set it stands in for"
-        );
-        assert!(
-            !s.cache_hit.contains("//a:local") && s.cache_hit.contains("//a:stands"),
-            "only the rebuilt addrs are retracted: {:?}",
-            s.cache_hit
+            rec(&s, "//a:stands").state,
+            crate::tui::dashboard::RowState::Cached
         );
     }
 
@@ -4693,13 +4584,15 @@ mod tests {
         );
     }
 
-    /// The contract that keeps a CI log readable: a warm cache says nothing.
+    /// The contract that keeps a CI log readable: a warm cache says nothing,
+    /// and neither does a cold one — the normal first run.
     ///
     /// Every target that uses a cache emits a prepare span, so a regression here
     /// puts one line per target into a GitHub log — thousands on a real build.
     #[test]
-    fn a_warm_prepare_logs_nothing() {
+    fn a_warm_or_cold_prepare_logs_nothing() {
         assert_eq!(prepare_note("//build:c", "warm", 0, None), None);
+        assert_eq!(prepare_note("//build:c", "cold", 0, None), None);
         assert_eq!(
             prepare_note("//build:c", "", 0, None),
             None,
@@ -4718,7 +4611,6 @@ mod tests {
         );
         assert!(!note("pulled").warn);
         assert!(note("seeded").text.contains("seeded"));
-        assert!(note("cold").text.contains("cold"));
         assert!(note("audit").text.contains("--no-scratch"));
         assert!(
             note("dropped_over_max").warn,
@@ -4816,61 +4708,25 @@ mod tests {
     }
 
     #[test]
-    fn tui_view_box_layout_header_body_label() {
-        let mut v = TuiProgressView::new("Running //a:b");
-        v.apply(&ev(0, execute_start("//slow:x")));
-        let height = 8u16;
-        let lines = v.render("⠋", 10_000, 80, height);
-
-        // The box fills exactly the rows it was given.
-        assert_eq!(lines.len(), usize::from(height));
-
-        // Top border: rounded corners + title, not the label.
-        let header = format!("{}", lines.first().expect("header line"));
-        assert!(header.starts_with("╭─"), "header: {header}");
-        assert!(header.ends_with('╮'), "header: {header}");
-        // Leading field is the elapsed clock (10s after the start anchor at t=0).
-        assert!(header.contains("10s"), "header: {header}");
-        assert!(!header.contains("Running //a:b"), "header: {header}");
-
-        // Help row is pinned last, below the box.
-        let help = format!("{}", lines.last().expect("help line"));
-        assert!(help.contains("scroll"), "help: {help}");
-
-        // Bottom border (second-to-last row): rounded corners + the label.
-        let footer = format!("{}", lines[lines.len() - 2]);
-        assert!(footer.starts_with("╰─"), "footer: {footer}");
-        assert!(footer.ends_with('╯'), "footer: {footer}");
-        assert!(footer.contains("Running //a:b"), "footer: {footer}");
-
-        // The slow row sits in the body between the header and the bottom border.
-        assert!(
-            lines[1..lines.len() - 2]
-                .iter()
-                .any(|l| format!("{l}").contains("//slow:x")),
-            "expected slow row in body, got {lines:?}"
-        );
-    }
-
-    #[test]
     fn header_shows_built_cached_failed_counts_no_running() {
         let mut v = TuiProgressView::new("L");
         // One real build (execute end ok), one cache hit, one running, one failed.
         v.apply(&ev(0, execute_start("//a:built")));
         v.apply(&ev(1, execute_end("//a:built")));
+        v.apply(&ev(1, result_end("//a:built", None)));
         v.apply(&ev(2, local_cache_hit("//a:cached")));
+        v.apply(&ev(2, result_end("//a:cached", None)));
         v.apply(&ev(3, result_start("//a:running")));
         v.apply(&ev(4, result_start("//a:failed")));
         v.apply(&ev(5, result_end("//a:failed", Some("boom".into()))));
 
-        let header = format!("{}", v.render("⠋", 100, 120, 8).first().expect("header"));
-        assert!(header.contains("1 done"), "{header}");
+        let header = v.header_line(100, 120).to_string();
+        // Done is Done + Cached, as the line and the tabs count it.
+        assert!(header.contains("2 done"), "{header}");
         assert!(header.contains("1 cached"), "{header}");
         assert!(header.contains("1 failed"), "{header}");
         // The "running" count was dropped in favour of the worker braille.
         assert!(!header.contains("running"), "{header}");
-        // A space separates the counts from the dash fill.
-        assert!(header.contains("failed "), "{header}");
     }
 
     #[test]
@@ -4880,12 +4736,12 @@ mod tests {
         v.apply(&ev(0, matched(&["//a:x", "//a:y", "//a:z"], false)));
         v.apply(&ev(1, result_start("//a:x")));
         v.apply(&ev(2, result_end("//a:x", None)));
-        let header = format!("{}", v.render("⠋", 100, 120, 8).first().expect("header"));
+        let header = v.header_line(100, 120).to_string();
         assert!(header.contains("1 / ~3 done"), "{header}");
 
         // Matcher resolves: the `~` drops.
         v.apply(&ev(3, matched(&[], true)));
-        let header = format!("{}", v.render("⠋", 100, 120, 8).first().expect("header"));
+        let header = v.header_line(100, 120).to_string();
         assert!(header.contains("1 / 3 done"), "{header}");
         assert!(!header.contains('~'), "{header}");
     }
@@ -4895,7 +4751,8 @@ mod tests {
         let mut v = TuiProgressView::new("L");
         v.apply(&ev(0, max_workers(8)));
         v.apply(&ev(1, execute_start("//a:b")));
-        let header = format!("{}", v.render("⠋", 100, 120, 8).first().expect("header"));
+        v.apply(&ev(1, pool_usage("cpu", CPU, 8 * CPU, 0)));
+        let header = v.header_line(100, 120).to_string();
         // " · ⠁" appears after "failed".
         let failed_at = header.find("failed").expect("failed in header");
         let braille_at = header.find('⠁').expect("braille in header");
@@ -4915,14 +4772,15 @@ mod tests {
         v.apply(&ev(0, max_workers(8)));
         // One busy worker → first cell shows the 1-dot glyph, in the header.
         v.apply(&ev(1, execute_start("//a:b")));
-        let header = format!("{}", v.render("⠋", 120, 120, 8).first().expect("header"));
+        v.apply(&ev(1, pool_usage("cpu", CPU, 8 * CPU, 0)));
+        let header = v.header_line(120, 120).to_string();
         assert!(header.contains('⠁'), "expected 1-busy braille: {header}");
     }
 
     #[test]
     fn no_worker_braille_before_max_workers_event() {
         let v = TuiProgressView::new("L");
-        let header = format!("{}", v.render("⠋", 0, 120, 8).first().expect("header"));
+        let header = v.header_line(0, 120).to_string();
         for g in ['⠁', '⠃', '⠇', '⠧', '⠷', '⠿', '⡿', '⣿'] {
             assert!(!header.contains(g), "no braille expected: {header}");
         }
@@ -4945,6 +4803,11 @@ mod tests {
 
     /// [`ci_view_log`], naming lock holders with `names`.
     fn ci_view_log_with(names: HolderNames, events: &[BuildEvent]) -> String {
+        ci_view_log_of(CiProgressView::new("Running"), names, events)
+    }
+
+    /// [`ci_view_log`] of a view built by the test.
+    fn ci_view_log_of(mut v: CiProgressView, names: HolderNames, events: &[BuildEvent]) -> String {
         #[derive(Clone, Default)]
         struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
         impl std::io::Write for Buf {
@@ -4964,10 +4827,12 @@ mod tests {
         let subscriber = tracing_subscriber::fmt()
             .with_writer(move || sink.clone())
             .with_ansi(false)
+            .with_target(false)
             .without_time()
             .finish();
         tracing::subscriber::with_default(subscriber, || {
-            let mut v = CiProgressView::new("Running");
+            // As the backend does, before any event.
+            v.begin();
             v.name_lock_holders(names.clone());
             for e in events {
                 // As the backend's receiver does, before the fold.
@@ -4979,6 +4844,22 @@ mod tests {
         });
         let bytes = buf.0.lock().expect("log buffer").clone();
         String::from_utf8(bytes).expect("utf-8 log")
+    }
+
+    /// The CI view opens with no header line: its label ("Running //p:chatty")
+    /// is not logged, and a run whose targets start and pass logs nothing
+    /// before its summary.
+    #[test]
+    fn ci_view_prints_no_label_header() {
+        let log = ci_view_log_of(
+            CiProgressView::new("Running //p:chatty"),
+            HolderNames::default(),
+            &[
+                ev(1, result_start("//p:chatty")),
+                ev(2, result_end("//p:chatty", None)),
+            ],
+        );
+        assert_eq!(log, "", "{log}");
     }
 
     /// The line backend's lock and scratch notices name the live session
@@ -5023,8 +4904,8 @@ mod tests {
         );
     }
 
-    /// Admission waits stay off the CI log; the execute that follows still
-    /// logs, which also proves the capture sees the view's lines.
+    /// Admission waits stay off the CI log, and so does the execute that
+    /// follows: no per-target "running" line.
     #[test]
     fn ci_view_logs_nothing_for_an_admission_wait() {
         let log = ci_view_log(&[
@@ -5042,8 +4923,192 @@ mod tests {
             ev(1_000, admission_wait_start("//a:b")),
             ev(2_000, execute_start("//a:b")),
         ]);
-        assert!(!log.contains('⧗'), "{log}");
-        assert!(log.contains("running //a:b [exec]"), "{log}");
+        assert_eq!(log, "", "an execute start logged: {log}");
+    }
+
+    /// A failing `ResultEnd` with a status and a log tail.
+    fn failed_end(
+        addr: &str,
+        upstream_of: Option<&str>,
+        cancelled: bool,
+        tail: Option<&str>,
+    ) -> BuildEventKind {
+        BuildEventKind::ResultEnd {
+            left_behind: None,
+            addr: addr.into(),
+            error: Some(format!("{addr}: exit status: 1")),
+            upstream_of: upstream_of.map(Into::into),
+            exit_status: Some("exit status: 1".into()),
+            log_tail: tail.map(|text| hcore::events::LogTailData {
+                text: text.into(),
+                start_line: 1,
+            }),
+            timed_out: None,
+            cancelled,
+        }
+    }
+
+    /// What the CI view logs for `events` with `--log-lines n`.
+    fn ci_live_log(n: usize, events: &[BuildEventKind]) -> String {
+        let events: Vec<BuildEvent> = events.iter().cloned().map(|k| ev(1_000, k)).collect();
+        ci_view_log_of(
+            CiProgressView::new("Running").with_log_lines(n),
+            HolderNames::default(),
+            &events,
+        )
+    }
+
+    const TAIL: &str = "one\ntwo\nthree\nfour\nfive\n";
+
+    /// A root failure prints its block the moment it fails: the report's
+    /// header, then exactly the last `--log-lines` lines of its tail.
+    #[test]
+    fn ci_view_prints_a_root_failures_tail_as_it_fails() {
+        let end = failed_end("//a:b", None, false, Some(TAIL));
+        assert_eq!(
+            ci_live_log(3, &[result_start("//a:b"), end.clone()]),
+            "ERROR ✗ //a:b · exit status: 1\
+             \n  │ three\
+             \n  │ four\
+             \n  │ five\n",
+        );
+        // A tail shorter than --log-lines: what the event carried.
+        let log = ci_live_log(50, std::slice::from_ref(&end));
+        assert_eq!(log.matches("  │ ").count(), 5, "{log}");
+        // --log-lines 0: the header alone.
+        assert_eq!(ci_live_log(0, &[end]), "ERROR ✗ //a:b · exit status: 1\n");
+    }
+
+    /// The block ends with the rows the end-of-run box would have carried,
+    /// after the tail and in the box's order, and the view says it printed
+    /// it: the end of the run then leaves the box out. A collateral failure
+    /// and a stop print nothing, so the box stays theirs.
+    #[test]
+    fn ci_view_live_block_carries_the_box_rows() {
+        let end = BuildEventKind::ResultEnd {
+            addr: "//a:b".into(),
+            error: Some("//a:b: exit status: 1".into()),
+            upstream_of: None,
+            exit_status: Some("exit status: 1".into()),
+            log_tail: Some(hcore::events::LogTailData {
+                text: TAIL.into(),
+                start_line: 1,
+            }),
+            timed_out: None,
+            cancelled: false,
+            left_behind: Some(Box::new(hcore::events::LeftBehindData {
+                log_path: Some("/h/failures/a_b/log.txt".into()),
+                sandbox: None,
+                outputs: Some("/h/failures/a_b/out".into()),
+                fixes: None,
+                log_readable: Some(true),
+            })),
+        };
+        assert_eq!(
+            ci_live_log(2, std::slice::from_ref(&end)),
+            "ERROR ✗ //a:b · exit status: 1\
+             \n  │ four\
+             \n  │ five\
+             \n  full log: /h/failures/a_b/log.txt\
+             \n  outputs: /h/failures/a_b/out\
+             \n  log: heph log //a:b\n",
+        );
+
+        let mut view = CiProgressView::new("Running");
+        for kind in [
+            end,
+            failed_end("//a:c", Some("//a:b"), false, Some(TAIL)),
+            failed_end("//a:d", None, true, Some(TAIL)),
+        ] {
+            view.apply(&ev(1_000, kind));
+        }
+        assert_eq!(view.failures_printed(), HashSet::from(["//a:b".to_owned()]));
+    }
+
+    /// A same-addr `ResultEnd` double-fire prints one block.
+    #[test]
+    fn ci_view_prints_a_root_failure_once() {
+        let end = failed_end("//a:b", None, false, Some(TAIL));
+        let log = ci_live_log(1, &[end.clone(), end]);
+        assert_eq!(log.matches('✗').count(), 1, "{log}");
+    }
+
+    /// Collateral failures and stops print nothing live: the root's block
+    /// explains the first, and a stop is not a failure.
+    #[test]
+    fn ci_view_prints_nothing_for_an_upstream_failure_or_a_stop() {
+        let upstream = failed_end("//a:c", Some("//a:b"), false, Some(TAIL));
+        let stopped = failed_end("//a:d", None, true, Some(TAIL));
+        assert_eq!(ci_live_log(10, &[upstream, stopped]), "");
+    }
+
+    /// A timeout names its limit as the report does; a failure with no
+    /// status shows its error; control bytes in the tail, the address and
+    /// the error never reach the log.
+    #[test]
+    fn ci_view_live_block_words_and_sanitizing() {
+        let timed_out = BuildEventKind::ResultEnd {
+            left_behind: None,
+            addr: "//e2e:it".into(),
+            error: Some("timed out".into()),
+            upstream_of: None,
+            exit_status: None,
+            log_tail: Some(hcore::events::LogTailData {
+                text: "a\x1b[31mred\x1b[0m\r\nb\x07ell\n10%\r20%\n".into(),
+                start_line: 1,
+            }),
+            timed_out: Some(hcore::events::TimedOutData {
+                timeout_ms: 600_000,
+                abandoned: false,
+            }),
+            cancelled: false,
+        };
+        assert_eq!(
+            ci_live_log(10, std::slice::from_ref(&timed_out)),
+            "ERROR ✗ //e2e:it · timed out after 10m (its timeout)\
+             \n  │ ared\
+             \n  │ bell\
+             \n  │ 20%\n",
+        );
+        // A timeout's tail is held to --log-lines like any failure's.
+        assert_eq!(
+            ci_live_log(2, &[timed_out]),
+            "ERROR ✗ //e2e:it · timed out after 10m (its timeout)\
+             \n  │ bell\
+             \n  │ 20%\n",
+        );
+
+        let no_status = BuildEventKind::ResultEnd {
+            left_behind: None,
+            addr: "//a:\x1b[2Jb".into(),
+            error: Some("staging\x1b[2J failed".into()),
+            upstream_of: None,
+            exit_status: None,
+            log_tail: Some(hcore::events::LogTailData {
+                text: "\n\n".into(),
+                start_line: 1,
+            }),
+            timed_out: None,
+            cancelled: false,
+        };
+        assert_eq!(
+            ci_live_log(10, &[no_status]),
+            "ERROR ✗ //a:b\
+             \n  │ staging failed\
+             \n  │ empty log\n",
+        );
+    }
+
+    /// A stop reads first on the CI summary line, as on the TUI's final
+    /// line; without one the summary is unchanged.
+    #[test]
+    fn ci_summary_says_stopped_after_a_stop() {
+        let mut v = CiProgressView::new("Running");
+        v.apply(&ev(1_000, execute_start("//a:b")));
+        let plain = v.summary_line();
+        assert!(plain.starts_with("done "), "{plain}");
+        v.set_stopped();
+        assert_eq!(v.summary_line(), format!("stopped · {plain}"));
     }
 
     #[test]
@@ -5242,6 +5307,7 @@ mod tests {
         let mut core = BuildState::new();
         core.apply(&ev(0, max_workers(8)));
         core.apply(&ev(1, execute_start("//a:b")));
+        core.apply(&ev(1, pool_usage("cpu", CPU, 8 * CPU, 0)));
         // A gc event must not perturb the build counters.
         core.apply(&ev(2, gc_swept(9, 9)));
 
@@ -5268,6 +5334,51 @@ mod tests {
         BuildEventKind::Matched {
             addrs: addrs.iter().map(|s| (*s).to_string()).collect(),
             complete,
+        }
+    }
+
+    /// An entrypoint's "Invoking …" is on the line while the matcher streams
+    /// and after it completed, while its dependencies build and up to the
+    /// pause that hands it the terminal, and leaves with the run's end. An
+    /// ordinary label ("Running //…") is never on the line: the command
+    /// above already names it.
+    #[test]
+    fn a_standing_label_outlives_the_matcher() {
+        struct Invoking(bool);
+        impl ProgressHeader for Invoking {
+            fn header(&self, core: &BuildState, scope: CountScope) -> Vec<HeaderItem> {
+                BuildHeader::new(String::new()).header(core, scope)
+            }
+            fn label(&self) -> String {
+                "Invoking //app:tty".to_owned()
+            }
+            fn label_stands(&self) -> bool {
+                self.0
+            }
+            fn last_render(&self, core: &BuildState, scope: CountScope) -> String {
+                BuildHeader::new(String::new()).last_render(core, scope)
+            }
+        }
+        let text = |v: &TuiProgressView| line_text(&v.line("⠋", 1, 200, true));
+        for stands in [true, false] {
+            let mut v = TuiProgressView::with_header(Box::new(Invoking(stands)));
+            v.apply(&ev(0, matched(&["//app:tty"], false)));
+            assert_eq!(
+                text(&v).contains("Invoking //app:tty"),
+                stands,
+                "streaming, stands={stands}: {}",
+                text(&v)
+            );
+            v.apply(&ev(1, matched(&[], true)));
+            v.apply(&ev(2, result_start("//dep:slow")));
+            assert_eq!(
+                text(&v).contains("Invoking //app:tty"),
+                stands,
+                "stands={stands}: {}",
+                text(&v)
+            );
+            v.set_finished(3);
+            assert!(!text(&v).contains("Invoking"), "{}", text(&v));
         }
     }
 
@@ -5356,32 +5467,37 @@ mod tests {
         )
     }
 
-    /// The two matched intersections computed the slow way, straight off the
-    /// sets. The oracle for the counters folded in `apply`.
+    /// The two matched intersections (finished, finished from the cache)
+    /// computed the slow way, over every record. The oracle for the bucket
+    /// counts the model keeps.
     fn scan_matched(s: &BuildState) -> (usize, usize) {
+        use crate::tui::dashboard::RowState as S;
+        let recs: Vec<_> = (0..s.dash.id_count())
+            .filter_map(|id| s.dash.record(u32::try_from(id).ok()?))
+            .filter(|r| r.matched())
+            .collect();
         (
-            s.matched.iter().filter(|a| s.finished.contains(*a)).count(),
-            s.matched
-                .iter()
-                .filter(|a| s.cache_hit.contains(*a))
+            recs.iter()
+                .filter(|r| !matches!(r.state, S::Queued | S::Blocked | S::Running))
                 .count(),
+            recs.iter().filter(|r| r.state == S::Cached).count(),
         )
     }
 
     /// The same two intersections as the render path reports them.
     fn rendered_matched(s: &BuildState) -> (usize, usize) {
         let (done, _, _) = s.matched_progress().expect("a Matched event has landed");
-        (done, s.cached_count(CountScope::Matched))
+        (done, s.dash.counts(CountScope::Matched).cached)
     }
 
     #[test]
     fn matched_counters_track_the_full_scan_under_out_of_order_events() {
-        // `matched ∩ finished` and `matched ∩ cache_hit` are folded incrementally
-        // rather than rescanned every frame, so they have to be maintained at
-        // *both* edges of each intersection. `Engine::result` really does emit a
-        // target's `ResultEnd` before the `Matched` event that names it, so a
-        // counter folded only on the result edge undercounts. Pin both against a
-        // full scan of the same sets, after every interleaving.
+        // `matched ∩ finished` and `matched ∩ cached` are bucket counts kept
+        // as events fold rather than rescanned every frame, so they have to
+        // move at *both* edges of each intersection. `Engine::result` really
+        // does emit a target's `ResultEnd` before the `Matched` event that
+        // names it, so a count kept only on the result edge undercounts. Pin
+        // both against a full scan of the records, after every interleaving.
         let mut s = BuildState::new();
         let mut clock = 0u64;
         let mut apply = |s: &mut BuildState, kind| {
@@ -5426,25 +5542,24 @@ mod tests {
         );
         assert_eq!(rendered_matched(&s), (3, 2));
 
-        // A cache hit on a matched target that has not finished: the cached
-        // counter moves, the done counter does not.
+        // A cache hit on a matched target that has not finished moves
+        // neither: cached is a target finished from the cache.
         apply(&mut s, local_cache_hit("//late:d"));
         assert_eq!(
             rendered_matched(&s),
             scan_matched(&s),
             "cache hit, no result"
         );
-        assert_eq!(rendered_matched(&s), (3, 3));
+        assert_eq!(rendered_matched(&s), (3, 2));
 
         // A matched target that *fails* still advances the done count — the
-        // header reads `4 / 5 done · … · 1 failed`, and `finished` is recorded
-        // outside the success branch precisely so it does. The scan oracle cannot
-        // see a regression here (it reads the same `finished` set), so this one
+        // header reads `4 / 5 done · … · 1 failed`. The scan oracle cannot
+        // see a regression here (it reads the same states), so this one
         // needs the literal.
         apply(&mut s, result_start("//late:e"));
         apply(&mut s, result_end("//late:e", Some("boom".into())));
         assert_eq!(rendered_matched(&s), scan_matched(&s), "matched failure");
-        assert_eq!(rendered_matched(&s), (4, 3));
+        assert_eq!(rendered_matched(&s), (4, 2));
 
         // Repeats on every path are idempotent: a duplicate `ResultEnd`, a second
         // cache hit on an already-cached addr, and a `Matched` event re-naming an
@@ -5453,7 +5568,7 @@ mod tests {
         apply(&mut s, remote_cache_hit("//early:a"));
         apply(&mut s, matched(&["//early:a", "//late:c"], true));
         assert_eq!(rendered_matched(&s), scan_matched(&s), "duplicate events");
-        assert_eq!(rendered_matched(&s), (4, 3));
+        assert_eq!(rendered_matched(&s), (4, 2));
     }
 
     #[test]
@@ -5504,11 +5619,13 @@ mod tests {
         // frame precisely so the header does not re-derive them.
         let mut s = BuildState::new();
 
-        // Before any Matched event: the done segment falls back to `{executed} done`
-        // with no denominator, and cached falls back to raw hit counts.
+        // Before any Matched event: the done segment has no denominator, and
+        // done is Done + Cached of every target.
         s.apply(&ev(0, execute_start("//a:built")));
         s.apply(&ev(1, execute_end("//a:built")));
+        s.apply(&ev(1, result_end("//a:built", None)));
         s.apply(&ev(2, local_cache_hit("//a:cached")));
+        s.apply(&ev(2, result_end("//a:cached", None)));
         s.apply(&ev(3, result_start("//a:failed")));
         s.apply(&ev(4, result_end("//a:failed", Some("boom".into()))));
         for scope in [CountScope::Matched, CountScope::All] {
@@ -5518,16 +5635,16 @@ mod tests {
         // pin it to a literal rather than only cross-checking it.
         assert_eq!(
             header_count_fields(&s, CountScope::Matched),
-            fields("1 done", "1 cached", "1 failed"),
+            fields("2 done", "1 cached", "1 failed"),
         );
         assert_eq!(
             header_count_fields(&s, CountScope::All),
-            fields("1 / 1 done", "1 cached", "1 failed"),
+            fields("2 / 3 done", "1 cached", "1 failed"),
         );
 
-        // Provisional matched total (`~`): three matched, one finished, two of
-        // them cached. The distinct cached/failed counts keep a transposition of
-        // the two fields visible.
+        // Provisional matched total (`~`): three matched, one finished from
+        // cache, one with a hit still running. A hit counts once its target
+        // ends; the unmatched failure is out of the matched scope.
         s.apply(&ev(5, matched(&["//m:x", "//m:y", "//m:z"], false)));
         s.apply(&ev(6, result_start("//m:x")));
         s.apply(&ev(7, local_cache_hit("//m:x")));
@@ -5539,7 +5656,11 @@ mod tests {
         }
         assert_eq!(
             header_count_fields(&s, CountScope::Matched),
-            fields("1 / ~3 done", "2 cached", "1 failed"),
+            fields("1 / ~3 done", "1 cached", "0 failed"),
+        );
+        assert_eq!(
+            header_count_fields(&s, CountScope::All),
+            fields("3 / 6 done", "2 cached", "1 failed"),
         );
 
         // Matcher resolves: the `~` drops on both paths.
@@ -5549,18 +5670,18 @@ mod tests {
         }
         assert_eq!(
             header_count_fields(&s, CountScope::Matched),
-            fields("1 / 3 done", "2 cached", "1 failed"),
+            fields("1 / 3 done", "1 cached", "0 failed"),
         );
     }
 
     #[test]
     fn toggle_scope_flips_view_count_scope() {
         let mut v = TuiProgressView::new("L");
-        assert_eq!(v.scope.get(), CountScope::Matched);
+        assert_eq!(v.list.scope, CountScope::Matched);
         v.toggle_scope();
-        assert_eq!(v.scope.get(), CountScope::All);
+        assert_eq!(v.list.scope, CountScope::All);
         v.toggle_scope();
-        assert_eq!(v.scope.get(), CountScope::Matched);
+        assert_eq!(v.list.scope, CountScope::Matched);
     }
 
     #[test]
@@ -5592,27 +5713,6 @@ mod tests {
         s.apply(&ev(3, matched(&[], true)));
         assert!(s.summary().contains("matched 0 / 2"), "{}", s.summary());
         assert!(!s.summary().contains('~'), "{}", s.summary());
-    }
-
-    #[test]
-    fn render_fits_within_progress_rows_and_shows_scroll_indicator() {
-        let mut v = TuiProgressView::new("Running //x:y");
-        // 20 long-running targets, all started at 0.
-        for i in 0..20 {
-            v.apply(&ev(0, execute_start(&format!("//pkg:t{i}"))));
-        }
-        let height = 8u16;
-        let lines = v.render("⠋", 10_000, 100, height);
-        // The box fills exactly the rows it was given.
-        assert_eq!(lines.len(), usize::from(height));
-        // The bottom border (second-to-last row) carries the label and scroll indicator.
-        let footer = format!("{}", lines[lines.len() - 2]);
-        assert!(footer.contains("Running //x:y"), "{footer}");
-        // 20 slow rows can't fit the small body, so the scroll indicator appears.
-        assert!(
-            footer.contains("↑ 1–5 of 20 ↓"),
-            "expected scroll indicator in footer, got {footer}"
-        );
     }
 
     #[test]
@@ -5653,18 +5753,6 @@ mod tests {
         // Later events do not move the anchor backward or forward.
         s.apply(&ev(4_000, result_end("//a:b", None)));
         assert_eq!(s.elapsed_ms(9_000), 7_000);
-    }
-
-    #[test]
-    fn slow_targets_replace_idle_field_in_body() {
-        let mut v = TuiProgressView::new("L");
-        v.apply(&ev(0, execute_start("//slow:x")));
-        let lines = v.render("⠋", 10_000, 80, 8);
-        let body: String = lines[1..lines.len() - 2]
-            .iter()
-            .map(|l| format!("{l}"))
-            .collect();
-        assert!(body.contains("//slow:x"), "{body}");
     }
 
     #[test]
@@ -5718,75 +5806,9 @@ mod tests {
         assert_eq!(active[1].style.fg, Some(Color::DarkGray));
     }
 
-    #[test]
-    fn banner_scrolls_when_label_overflows_window() {
-        let label = "a-really-long-label-that-will-not-fit-in-a-narrow-window";
-        // Narrow box forces scrolling; window = width - 7.
-        let window = 80usize - 7;
-        let a = banner_slice(label, window, 0);
-        let b = banner_slice(label, window, SCROLL_MS); // one column later
-        assert_eq!(a.chars().count(), window);
-        assert_eq!(b.chars().count(), window);
-        assert_ne!(a, b, "banner must advance over time");
-    }
-
-    #[test]
-    fn bottom_line_total_width_matches_terminal_width() {
-        // Short label (padded with dashes) and long label (scrolled) both fill W.
-        let short = TuiProgressView::new("ok");
-        let long =
-            TuiProgressView::new("a-really-long-label-that-overflows-the-available-window-area");
-        for w in [40u16, 80, 120] {
-            // No scroll: total=0, body_rows=0 → indicator never triggers.
-            let s = format!("{}", short.bottom_line(0, w, 0, 0, 0));
-            let l = format!("{}", long.bottom_line(0, w, 0, 0, 0));
-            assert_eq!(s.chars().count(), usize::from(w), "short @ {w}: {s}");
-            assert_eq!(l.chars().count(), usize::from(w), "long @ {w}: {l}");
-        }
-        // With scroll active: the indicator replaces trailing dashes and the
-        // total width still matches.
-        for w in [40u16, 80, 120] {
-            let s = format!("{}", short.bottom_line(0, w, 0, 75, 20));
-            let l = format!("{}", long.bottom_line(0, w, 55, 100, 20));
-            assert_eq!(s.chars().count(), usize::from(w), "short scroll @ {w}: {s}");
-            assert_eq!(l.chars().count(), usize::from(w), "long scroll @ {w}: {l}");
-        }
-    }
-
-    #[test]
-    fn rows_for_height_is_one_third_clamped_to_min() {
-        assert_eq!(rows_for_height(30), 10);
-        assert_eq!(rows_for_height(24), 8);
-        // Tiny terminals clamp up to the minimum box height.
-        assert_eq!(rows_for_height(3), MIN_PROGRESS_ROWS);
-        assert_eq!(rows_for_height(0), MIN_PROGRESS_ROWS);
-    }
-
-    #[test]
-    fn render_fills_exactly_the_given_height() {
-        let v = TuiProgressView::new("L");
-        for h in [MIN_PROGRESS_ROWS, 8, 20] {
-            let lines = v.render("⠋", 0, 80, h);
-            assert_eq!(lines.len(), usize::from(h), "height {h}");
-        }
-        // Below the minimum the height is clamped up, never fewer rows.
-        let lines = v.render("⠋", 0, 80, 1);
-        assert_eq!(lines.len(), usize::from(MIN_PROGRESS_ROWS));
-    }
-
-    #[test]
-    fn help_row_is_pinned_last_and_dim() {
-        let v = TuiProgressView::new("L");
-        let lines = v.render("⠋", 0, 80, 8);
-        let help = lines.last().expect("help line");
-        let text: String = help.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.contains("scroll"), "{text}");
-        assert_eq!(help.spans[0].style.fg, Some(Color::DarkGray));
-    }
-
-    /// A18: one frame as plain text — the header box line, then the lock wait
-    /// and the long-running target — with no bottom border, help row or idle
-    /// art, measured against the clock it is given.
+    /// `heph session show`'s frame: the line, then the dashboard's All list
+    /// with its titles, capped at 15 rows, no key hints, measured against
+    /// the clock it is given.
     #[test]
     fn snapshot_lines_render_one_plain_frame() {
         let mut v = TuiProgressView::new("L");
@@ -5801,51 +5823,46 @@ mod tests {
             },
         ));
         let text: Vec<String> = v
-            .snapshot_lines(65_000, 60)
+            .snapshot_lines(65_000, 100)
             .iter()
             .map(ToString::to_string)
             .collect();
-        let header = text.first().expect("header");
+        let line = text.first().expect("the line");
+        assert!(line.contains("1m05s · 0 / 2 done"), "{line}");
+        assert!(!line.contains('⇥'), "no key hint on a print: {line}");
         assert!(
-            header.starts_with("╭─ ") && header.contains("1m05s · 0 / 2 done"),
-            "{header}"
-        );
-        assert!(header.ends_with("─╮"), "{header}");
-        assert_eq!(header.chars().count(), 60, "{header}");
-        assert_eq!(
-            text.get(1).map(String::as_str),
-            Some("  🔒 //a:locked (locked by pid 4242)"),
+            text.get(1).is_some_and(|t| t.contains("TARGET")),
             "{text:?}"
+        );
+        for addr in ["//a:slow", "//a:locked"] {
+            assert_eq!(
+                text.iter().skip(1).filter(|l| l.contains(addr)).count(),
+                1,
+                "{addr} listed once: {text:?}"
+            );
+        }
+        assert!(
+            text.iter().all(|l| !l.trim().is_empty()),
+            "no padding rows: {text:?}"
         );
         assert!(
             !text
                 .iter()
-                .any(|l| l.starts_with("╰") || l.contains("scroll")),
-            "no bottom border or help row: {text:?}"
+                .any(|l| l.contains("esc") || l.contains("ctrl-c")),
+            "no hint row: {text:?}"
         );
-        // An empty view is just its header: nothing invented to fill rows.
-        assert_eq!(TuiProgressView::new("L").snapshot_lines(0, 60).len(), 1);
-    }
 
-    #[test]
-    fn help_advertises_search_only_on_list_tabs() {
-        let mut v = TuiProgressView::new("L");
-        v.apply(&ev(0, matched(&["//a:ok"], true)));
-        v.apply(&ev(1, result_start("//a:ok")));
-        v.apply(&ev(2, result_end("//a:ok", None)));
-
-        let help = |v: &TuiProgressView| -> String {
-            format!("{}", v.render("⠋", 10_000, 80, 8).last().expect("help"))
-        };
-
-        // Default (live) view: `/` has no list to filter, so it isn't advertised.
-        assert_eq!(v.view.get(), ViewMode::Default);
-        assert!(!help(&v).contains("/ search"), "{}", help(&v));
-
-        // Done tab: search is available, so the hint appears.
-        v.tab(true);
-        assert_eq!(v.view.get(), ViewMode::Done);
-        assert!(help(&v).contains("/ search"), "{}", help(&v));
+        // Capped at 15 rows, whatever the build's size.
+        let mut big = TuiProgressView::new("L");
+        let addrs: Vec<String> = (0..40).map(|i| format!("//b:t{i:02}")).collect();
+        let refs: Vec<&str> = addrs.iter().map(String::as_str).collect();
+        big.apply(&ev(0, matched(&refs, true)));
+        let rows = big
+            .snapshot_lines(1_000, 100)
+            .iter()
+            .filter(|l| l.to_string().contains("//b:t"))
+            .count();
+        assert_eq!(rows, usize::from(SNAPSHOT_ROWS));
     }
 
     fn lock_wait_start(addr: &str, pid: u32) -> BuildEventKind {
@@ -5854,46 +5871,6 @@ mod tests {
             holder_pid: Some(pid),
             in_use_by_readers: false,
         }
-    }
-
-    #[test]
-    fn scroll_indicator_covers_locks_and_slow_together() {
-        // 2 lock waits + 4 slow targets = 6 body rows. The scroll indicator
-        // must reflect the combined total, not just slow overflow.
-        let mut v = TuiProgressView::new("L");
-        v.apply(&ev(0, lock_wait_start("//l:1", 1)));
-        v.apply(&ev(0, lock_wait_start("//l:2", 2)));
-        for i in 0..4 {
-            v.apply(&ev(0, execute_start(&format!("//s:{i}"))));
-        }
-        // height 7 → body_rows = 4. 6 items > 4 ⇒ scroll indicator shows 1–4 of 6.
-        let lines = v.render("⠋", 10_000, 80, 7);
-        let footer = format!("{}", lines[lines.len() - 2]);
-        assert!(
-            footer.contains("↑ 1–4 of 6 ↓"),
-            "expected scroll indicator, got {footer}"
-        );
-    }
-
-    #[test]
-    fn failed_lines_list_failed_targets_with_error() {
-        let mut s = BuildState::new();
-        s.apply(&ev(0, result_start("//a:ok")));
-        s.apply(&ev(1, result_end("//a:ok", None)));
-        s.apply(&ev(2, result_start("//a:bad")));
-        s.apply(&ev(3, result_end("//a:bad", Some("boom".into()))));
-        s.apply(&ev(4, result_start("//a:bad2")));
-        s.apply(&ev(5, result_end("//a:bad2", Some("kaput".into()))));
-
-        let lines = all_lines(s.failed_rows(""));
-        // Only the two errored targets appear, in failure order.
-        assert_eq!(lines.len(), 2);
-        let l0 = format!("{}", lines[0]);
-        assert!(l0.contains("//a:bad"), "{l0}");
-        assert!(l0.contains("boom"), "{l0}");
-        let l1 = format!("{}", lines[1]);
-        assert!(l1.contains("//a:bad2"), "{l1}");
-        assert!(!format!("{}{}", l0, l1).contains("//a:ok"));
     }
 
     #[test]
@@ -5910,228 +5887,51 @@ mod tests {
     }
 
     #[test]
-    fn tab_cycles_default_done_matched_cached_waiting_failed_and_back() {
-        let mut v = TuiProgressView::new("L");
-        v.apply(&ev(0, execute_start("//slow:x")));
-        v.apply(&ev(0, admission_wait_start("//a:queued")));
-        v.apply(&ev(1, matched(&["//a:ok", "//a:pending"], true)));
-        v.apply(&ev(2, result_start("//a:ok")));
-        v.apply(&ev(3, local_cache_hit("//a:ok")));
-        v.apply(&ev(4, result_end("//a:ok", None)));
-        v.apply(&ev(5, result_start("//a:bad")));
-        v.apply(&ev(6, result_end("//a:bad", Some("boom".into()))));
-
-        // Default view shows the slow row, not the list targets.
-        let body = |v: &TuiProgressView| -> String {
-            v.render("⠋", 10_000, 80, 8)
-                .iter()
-                .map(|l| format!("{l}"))
-                .collect()
-        };
-        assert_eq!(v.view.get(), ViewMode::Default);
-        assert!(body(&v).contains("//slow:x"));
-
-        // Tab → done view: shows the completed target.
-        v.tab(true);
-        assert_eq!(v.view.get(), ViewMode::Done);
-        let done_body = body(&v);
-        assert!(done_body.contains("//a:ok"), "{done_body}");
-        assert!(!done_body.contains("//slow:x"), "{done_body}");
-
-        // Tab → matched view: shows every matched target (done + pending).
-        v.tab(true);
-        assert_eq!(v.view.get(), ViewMode::Matched);
-        let matched_body = body(&v);
-        assert!(matched_body.contains("//a:ok"), "{matched_body}");
-        assert!(matched_body.contains("//a:pending"), "{matched_body}");
-
-        // Tab → cached view: shows the cache-hit target only.
-        v.tab(true);
-        assert_eq!(v.view.get(), ViewMode::Cached);
-        let cached_body = body(&v);
-        assert!(cached_body.contains("//a:ok"), "{cached_body}");
-        assert!(!cached_body.contains("//a:pending"), "{cached_body}");
-
-        // Tab → waiting view: shows the target held at admission.
-        v.tab(true);
-        assert_eq!(v.view.get(), ViewMode::Waiting);
-        let waiting_body = body(&v);
-        assert!(waiting_body.contains("⧗ //a:queued"), "{waiting_body}");
-        assert!(!waiting_body.contains("//slow:x"), "{waiting_body}");
-
-        // Tab → failed view: shows the failed target.
-        v.tab(true);
-        assert_eq!(v.view.get(), ViewMode::Failed);
-        let failed_body = body(&v);
-        assert!(failed_body.contains("//a:bad"), "{failed_body}");
-        assert!(!failed_body.contains("//slow:x"), "{failed_body}");
-
-        // Tab again wraps back to default.
-        v.tab(true);
-        assert_eq!(v.view.get(), ViewMode::Default);
-        assert!(body(&v).contains("//slow:x"));
-    }
-
-    #[test]
-    fn done_and_failed_lines_filter_by_addr_substring() {
-        let mut s = BuildState::new();
-        s.apply(&ev(0, result_start("//web:server")));
-        s.apply(&ev(1, result_end("//web:server", None)));
-        s.apply(&ev(2, result_start("//api:server")));
-        s.apply(&ev(3, result_end("//api:server", None)));
-        s.apply(&ev(4, result_start("//web:bad")));
-        s.apply(&ev(5, result_end("//web:bad", Some("boom".into()))));
-        s.apply(&ev(6, result_start("//api:bad")));
-        s.apply(&ev(7, result_end("//api:bad", Some("kaput".into()))));
-
-        let join =
-            |ls: Vec<Line<'static>>| -> String { ls.iter().map(|l| format!("{l}")).collect() };
-
-        // Empty filter keeps everything.
-        assert_eq!(all_lines(s.done_rows(CountScope::All, "")).len(), 2);
-        assert_eq!(all_lines(s.failed_rows("")).len(), 2);
-
-        // Substring filter, case-insensitive, matches only the package prefix.
-        let done = join(all_lines(s.done_rows(CountScope::All, "WEB")));
-        assert!(done.contains("//web:server"), "{done}");
-        assert!(!done.contains("//api:server"), "{done}");
-
-        let failed = join(all_lines(s.failed_rows("api")));
-        assert!(failed.contains("//api:bad"), "{failed}");
-        assert!(!failed.contains("//web:bad"), "{failed}");
-    }
-
-    #[test]
-    fn slash_filters_done_tab_enter_keeps_esc_clears() {
+    fn slash_filters_the_dashboard_list_enter_keeps_esc_clears() {
         let mut v = TuiProgressView::new("L");
         v.apply(&ev(0, matched(&["//web:server", "//api:server"], true)));
-        v.apply(&ev(1, result_start("//web:server")));
-        v.apply(&ev(2, result_end("//web:server", None)));
-        v.apply(&ev(3, result_start("//api:server")));
-        v.apply(&ev(4, result_end("//api:server", None)));
+        for (t, addr) in [(1, "//web:server"), (3, "//api:server")] {
+            v.apply(&ev(t, result_start(addr)));
+            v.apply(&ev(t + 1, result_end(addr, None)));
+        }
 
-        let body = |v: &TuiProgressView| -> String {
-            v.render("⠋", 10_000, 80, 8)
-                .iter()
-                .map(|l| format!("{l}"))
-                .collect()
-        };
-
-        // `/` on the Default view is a no-op (search has no list to filter).
+        // `/` on the line is a no-op: the line has no list to filter.
         v.search_start();
         assert!(!v.is_searching());
 
-        // Move to Done, then open the filter and type "web".
-        v.tab(true);
-        assert_eq!(v.view.get(), ViewMode::Done);
+        v.open_dashboard();
         v.search_start();
         assert!(v.is_searching());
-        v.search_input('w');
-        v.search_input('e');
-        v.search_input('b');
-        let filtered = body(&v);
-        assert!(filtered.contains("//web:server"), "{filtered}");
-        assert!(!filtered.contains("//api:server"), "{filtered}");
+        for c in "apz".chars() {
+            v.search_input(c);
+        }
+        let typo = dash_frame(&mut v, 10).join("\n");
+        assert!(!typo.contains("//api:server"), "{typo}");
+        assert!(
+            typo.contains("/apz"),
+            "the prompt replaces the hints: {typo}"
+        );
+        v.search_backspace(); // "ap"
+        let fixed = dash_frame(&mut v, 10).join("\n");
+        assert!(fixed.contains("//api:server"), "{fixed}");
+        assert!(!fixed.contains("//web:server"), "{fixed}");
 
         // Enter confirms: input mode ends but the filter stays applied.
         v.search_confirm();
         assert!(!v.is_searching());
-        let still = body(&v);
-        assert!(still.contains("//web:server"), "{still}");
-        assert!(!still.contains("//api:server"), "{still}");
+        assert!(v.has_active_filter());
+        let kept = dash_frame(&mut v, 10).join("\n");
+        assert!(!kept.contains("//web:server"), "{kept}");
 
-        // Esc clears the filter; the full list returns.
+        // Esc clears the filter, and the dashboard stays open.
         v.search_cancel();
-        let cleared = body(&v);
-        assert!(cleared.contains("//web:server"), "{cleared}");
-        assert!(cleared.contains("//api:server"), "{cleared}");
-    }
-
-    #[test]
-    fn backspace_edits_query_and_tab_switch_drops_filter() {
-        let mut v = TuiProgressView::new("L");
-        v.apply(&ev(0, matched(&["//web:server", "//api:server"], true)));
-        v.apply(&ev(1, result_start("//web:server")));
-        v.apply(&ev(2, result_end("//web:server", None)));
-        v.apply(&ev(3, result_start("//api:server")));
-        v.apply(&ev(4, result_end("//api:server", None)));
-
-        let body = |v: &TuiProgressView| -> String {
-            v.render("⠋", 10_000, 80, 8)
-                .iter()
-                .map(|l| format!("{l}"))
-                .collect()
-        };
-
-        v.tab(true); // Done
-        v.search_start();
-        v.search_input('a');
-        v.search_input('p');
-        v.search_input('z'); // typo: matches nothing
-        assert!(body(&v).contains("no targets match"));
-        v.search_backspace(); // drop the 'z' → "ap"
-        let fixed = body(&v);
-        assert!(fixed.contains("//api:server"), "{fixed}");
-        assert!(!fixed.contains("//web:server"), "{fixed}");
-
-        // Switching tabs drops the filter and exits search input.
-        v.tab(true); // → Matched
-        assert!(!v.is_searching());
-        // Return to the Done tab (Default → Done) and confirm the full list.
-        v.back_to_main();
-        v.tab(true); // Done again — full list, no filter
-        let full = body(&v);
-        assert!(full.contains("//web:server"), "{full}");
-        assert!(full.contains("//api:server"), "{full}");
-    }
-
-    #[test]
-    fn hscroll_pans_wide_body_lines_and_clamps() {
-        let mut v = TuiProgressView::new("L");
-        // A slow target whose addr is far wider than the viewport.
-        let long = format!("//pkg:{}", "x".repeat(200));
-        v.apply(&ev(0, execute_start(&long)));
-
-        let body_at = |v: &TuiProgressView, w: u16| -> String {
-            v.render("⠋", 10_000, w, 8)[1..]
-                .iter()
-                .take(1)
-                .map(|l| format!("{l}"))
-                .collect()
-        };
-
-        let width = 40u16;
-        // At pan 0 the row starts with the indent + addr head.
-        let row0 = body_at(&v, width);
-        assert!(row0.contains("//pkg:xxx"), "{row0}");
-
-        // Pan right: the head columns are dropped.
-        v.hscroll(20);
-        let row1 = body_at(&v, width);
-        assert!(!row1.contains("//pkg:xxx"), "{row1}");
-        assert!(row1.contains('x'), "{row1}");
-
-        // Pan back left to the origin restores the head.
-        v.hscroll(-1000);
-        assert!(body_at(&v, width).contains("//pkg:xxx"));
-
-        // Pan far right clamps so the tail never scrolls off the right edge:
-        // the rendered row stays non-empty (the addr's tail is still visible).
-        v.hscroll(100_000);
-        let clamped = body_at(&v, width);
-        // The row's tail is the op breakdown group, e.g. `(▶ 10s)`.
-        assert!(clamped.trim().ends_with(')'), "{clamped}");
-        assert!(!clamped.trim().is_empty(), "{clamped}");
-    }
-
-    #[test]
-    fn switching_view_resets_horizontal_pan() {
-        let mut v = TuiProgressView::new("L");
-        v.apply(&ev(0, result_start("//a:bad")));
-        v.apply(&ev(1, result_end("//a:bad", Some("boom".into()))));
-        v.hscroll(50);
-        v.tab(true);
-        assert_eq!(v.hscroll.get(), 0);
+        assert!(!v.has_active_filter());
+        assert!(!v.is_on_main_view());
+        let cleared = dash_frame(&mut v, 10).join("\n");
+        assert!(
+            cleared.contains("//web:server") && cleared.contains("//api:server"),
+            "{cleared}"
+        );
     }
 
     #[test]
@@ -6145,22 +5945,27 @@ mod tests {
     }
 
     #[test]
-    fn finished_shows_green_quit_notice() {
+    fn finished_dashboard_hints_say_how_to_leave() {
         use crate::tui::app::TUIAppView;
+        // Wide enough for the whole hint row: at 100 columns it is cut before
+        // `ctrl-c stop`.
+        fn hints(v: &mut TuiProgressView) -> String {
+            v.render_full(0, 140, 14)
+                .last()
+                .map(ToString::to_string)
+                .unwrap_or_default()
+        }
         let mut v = TuiProgressView::new("L");
-        // Before finishing, the help row lists the key bindings.
-        let help = format!("{}", v.render("⠋", 0, 80, 8).last().expect("help"));
-        assert!(help.contains("scroll"), "{help}");
-        assert!(!help.contains("quit"), "{help}");
+        v.open_dashboard();
+        // While the run is live, the hint row offers to stop it.
+        let live = hints(&mut v);
+        assert!(live.contains("ctrl-c stop"), "{live}");
 
+        // Once it has ended there is nothing to stop: `q` leaves.
         v.set_finished(0);
-        let lines = v.render("⠋", 0, 80, 8);
-        let help = lines.last().expect("help");
-        let text: String = help.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.contains("finished"), "{text}");
-        assert!(text.contains('q'), "{text}");
-        // The notice is green so it stands out.
-        assert_eq!(help.spans[0].style.fg, Some(Color::Green));
+        let hints = hints(&mut v);
+        assert!(hints.contains("q or esc leave"), "{hints}");
+        assert!(!hints.contains("ctrl-c"), "{hints}");
     }
 
     #[test]
@@ -6168,307 +5973,151 @@ mod tests {
         use crate::tui::app::TUIAppView;
         let mut v = TuiProgressView::new("L");
         v.apply(&ev(0, execute_start("//a:b"))); // anchor the clock at t=0
+        v.open_dashboard();
 
-        // Live: two renders at different wall clocks show different elapsed.
-        let h = |v: &TuiProgressView, now: u64| format!("{}", v.render("⠋", now, 80, 8)[0]);
-        assert_ne!(h(&v, 5_000), h(&v, 9_000));
+        // Live: two frames at different wall clocks show different elapsed —
+        // on the dashboard's title and on `heph session show`'s header.
+        let title = |v: &mut TuiProgressView, now: u64| dash_frame(v, now)[0].clone();
+        let header = |v: &TuiProgressView, now: u64| v.header_line(now, 80).to_string();
+        assert_ne!(title(&mut v, 5_000), title(&mut v, 9_000));
+        assert_ne!(header(&v, 5_000), header(&v, 9_000));
 
-        // Frozen: after finish the header is identical regardless of `now_ms`.
+        // Frozen: after finish both are identical regardless of `now_ms`.
         v.set_finished(50_000);
-        assert_eq!(h(&v, 100_000), h(&v, 999_000));
+        assert_eq!(title(&mut v, 100_000), title(&mut v, 999_000));
+        assert_eq!(header(&v, 100_000), header(&v, 999_000));
     }
 
+    /// A target still open when the run ended (a stopped run) stops counting
+    /// with the run's clock: on the dashboard's rows, on its target screen,
+    /// and on the line's spotlight.
     #[test]
-    fn shift_tab_cycles_backwards() {
+    fn an_open_target_stops_counting_when_the_run_ends() {
+        use crate::tui::app::TUIAppView;
         let mut v = TuiProgressView::new("L");
-        // A matched event gives the `X / Y done` denominator, so the Matched tab
-        // is present and all six modes exist.
-        v.apply(&ev(0, matched(&["//a:ok"], true)));
-        v.apply(&ev(1, result_start("//a:bad")));
-        v.apply(&ev(2, result_end("//a:bad", Some("boom".into()))));
-
-        // Six modes (Default, Done, Matched, Cached, Waiting, Failed): backward
-        // from Default wraps to the last (Failed), then steps back to Default.
-        assert_eq!(v.view.get(), ViewMode::Default);
-        v.tab(false);
-        assert_eq!(v.view.get(), ViewMode::Failed);
-        v.tab(false);
-        assert_eq!(v.view.get(), ViewMode::Waiting);
-        v.tab(false);
-        assert_eq!(v.view.get(), ViewMode::Cached);
-        v.tab(false);
-        assert_eq!(v.view.get(), ViewMode::Matched);
-        v.tab(false);
-        assert_eq!(v.view.get(), ViewMode::Done);
-        v.tab(false);
-        assert_eq!(v.view.get(), ViewMode::Default);
-    }
-
-    #[test]
-    fn failed_tab_is_highlighted_when_active() {
-        let mut v = TuiProgressView::new("L");
-        v.apply(&ev(0, result_start("//a:bad")));
-        v.apply(&ev(1, result_end("//a:bad", Some("boom".into()))));
-
-        // Inactive: the "failed" segment carries no background.
-        let header = v.render("⠋", 100, 120, 8);
-        let plain = header[0]
-            .spans
-            .iter()
-            .find(|s| s.content.contains("failed"))
-            .expect("failed span");
-        assert_eq!(plain.style.bg, None);
-
-        // Active (failed view): the segment is highlighted with a background.
-        // Failed is the last tab; a single shift-tab lands on it regardless of
-        // how many middle tabs the current state exposes.
-        v.tab(false); // → Failed
-        let header = v.render("⠋", 100, 120, 8);
-        let hl = header[0]
-            .spans
-            .iter()
-            .find(|s| s.content.contains("failed"))
-            .expect("failed span");
-        assert_eq!(hl.style.bg, Some(Color::Blue));
-    }
-
-    #[test]
-    fn failed_view_with_no_failures_shows_placeholder() {
-        let mut v = TuiProgressView::new("L");
-        v.tab(false); // → Failed (last tab), but nothing has failed
-        let body: String = v
-            .render("⠋", 10_000, 80, 8)
-            .iter()
-            .map(|l| format!("{l}"))
-            .collect();
-        assert!(body.contains("no failed targets"), "{body}");
-    }
-
-    #[test]
-    fn done_view_with_nothing_done_shows_placeholder() {
-        let mut v = TuiProgressView::new("L");
-        v.tab(true); // → Done, but nothing has completed
-        assert_eq!(v.view.get(), ViewMode::Done);
-        let body: String = v
-            .render("⠋", 10_000, 80, 8)
-            .iter()
-            .map(|l| format!("{l}"))
-            .collect();
-        assert!(body.contains("no completed targets"), "{body}");
-    }
-
-    #[test]
-    fn done_lines_respect_matched_and_all_scope() {
-        let mut s = BuildState::new();
-        // Two matched top-level targets; one transitive dep finishes too.
-        s.apply(&ev(0, matched(&["//a:top"], false)));
-        s.apply(&ev(1, result_start("//a:top")));
-        s.apply(&ev(2, result_end("//a:top", None)));
-        s.apply(&ev(3, result_start("//dep:lib")));
-        s.apply(&ev(4, result_end("//dep:lib", None)));
-        // A failed target must never appear in the done list.
-        s.apply(&ev(5, result_start("//a:bad")));
-        s.apply(&ev(6, result_end("//a:bad", Some("boom".into()))));
-
-        // Matched scope: only the matched top-level target.
-        let matched_scope: String = all_lines(s.done_rows(CountScope::Matched, ""))
-            .iter()
-            .map(|l| format!("{l}"))
-            .collect();
-        assert!(matched_scope.contains("//a:top"), "{matched_scope}");
-        assert!(!matched_scope.contains("//dep:lib"), "{matched_scope}");
-        assert!(!matched_scope.contains("//a:bad"), "{matched_scope}");
-
-        // All scope: every completed target, deps included, still no failures.
-        let all_scope: String = all_lines(s.done_rows(CountScope::All, ""))
-            .iter()
-            .map(|l| format!("{l}"))
-            .collect();
-        assert!(all_scope.contains("//a:top"), "{all_scope}");
-        assert!(all_scope.contains("//dep:lib"), "{all_scope}");
-        assert!(!all_scope.contains("//a:bad"), "{all_scope}");
-    }
-
-    #[test]
-    fn scroll_advances_the_body_window_and_clamps() {
-        let mut v = TuiProgressView::new("L");
-        for i in 0..6 {
-            v.apply(&ev(0, execute_start(&format!("//s:{i}"))));
-        }
-        // body_rows = 4, 6 slow rows, max_scroll = 2.
-        // Scroll past the end; render clamps to the bottom ⇒ indicator shows 3–6.
-        v.scroll(10);
-        let lines = v.render("⠋", 10_000, 80, 7);
-        let bottom = format!("{}", lines[lines.len() - 2]);
-        assert!(
-            bottom.contains("↑ 3–6 of 6 ↓"),
-            "indicator at bottom: {bottom}"
+        v.apply(&ev(0, execute_start("//a:b")));
+        v.set_stopped();
+        v.set_finished(20_000);
+        let line = |v: &TuiProgressView, now: u64| v.render("⠋", now, 120, 1)[0].to_string();
+        assert_eq!(line(&v, 30_000), line(&v, 90_000), "the line's spotlight");
+        v.open_dashboard();
+        assert_eq!(
+            dash_frame(&mut v, 30_000),
+            dash_frame(&mut v, 90_000),
+            "the list"
         );
-        // Back to the top: indicator shows 1–4.
-        v.scroll(-10);
-        let lines = v.render("⠋", 10_000, 80, 7);
-        let bottom = format!("{}", lines[lines.len() - 2]);
-        assert!(
-            bottom.contains("↑ 1–4 of 6 ↓"),
-            "indicator at top: {bottom}"
+        v.open_selected(false);
+        assert_eq!(
+            dash_frame(&mut v, 30_000),
+            dash_frame(&mut v, 90_000),
+            "the target screen"
         );
     }
 
+    /// The prompt row names the oldest request and how many are pending,
+    /// and offers Enter; its ✦ flashes once a second unless motion is
+    /// reduced.
     #[test]
-    fn approval_banner_shows_pending_count() {
+    fn approval_prompt_row_names_the_oldest_and_counts() {
         let center = crate::tui::approval::ApprovalCenter::new();
-        // Two targets awaiting approval: the banner shows the active one plus the
-        // total pending count.
         let build = center.build();
-        let _r1 = center.request(&build, "//a:1".to_string(), vec![]);
+        let r1 = center.request(&build, "//a:1".to_string(), vec![]);
         let _r2 = center.request(&build, "//a:2".to_string(), vec![]);
-        let view = TuiProgressView::new("run").with_approval(center);
-        let lines = view.approval_lines();
-        let banner: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(banner.contains("//a:1"), "active prompt: {banner}");
-        assert!(banner.contains("2 pending"), "count: {banner}");
+        let mut view = TuiProgressView::new("run").with_approval(center.clone());
+        view.motion = true;
+        let row = |v: &TuiProgressView, now: u64| v.render("⠋", now, 200, 2)[0].to_string();
+        assert_eq!(
+            row(&view, 0),
+            "✦ approval required: //a:1 · 2 pending · enter to review"
+        );
+        // Yellow throughout; bold up to the address, as the mockup.
+        let spans = &view.render("⠋", 0, 200, 2)[0].spans;
+        let bold = Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD);
+        let styled: Vec<(&str, Style)> = spans
+            .iter()
+            .filter(|s| !s.content.is_empty())
+            .map(|s| (s.content.as_ref(), s.style))
+            .collect();
+        assert_eq!(
+            styled.get(..3),
+            Some(
+                &[
+                    ("✦", bold),
+                    (" approval required: //a:1", bold),
+                    (
+                        " · 2 pending · enter to review",
+                        Style::default().fg(Color::Yellow)
+                    ),
+                ][..]
+            ),
+            "{styled:?}"
+        );
+        assert!(row(&view, 1_000).starts_with("❖ "), "{}", row(&view, 1_000));
+        view.motion = false;
+        assert!(
+            row(&view, 1_000).starts_with("✦ "),
+            "reduced motion: static"
+        );
+        let _decided = center.respond(r1.seq, true, Vec::new());
+        assert_eq!(
+            row(&view, 0),
+            "✦ approval required: //a:2 · enter to review",
+            "no count for one"
+        );
     }
 
+    /// The Done and Cached tabs list matched targets only, until `a` widens
+    /// them to every target the run touched; a failure is in neither.
     #[test]
-    fn approval_banner_single_has_no_pending_count() {
-        let center = crate::tui::approval::ApprovalCenter::new();
-        let _r = center.request(&center.build(), "//a:1".to_string(), vec![]);
-        let view = TuiProgressView::new("run").with_approval(center);
-        let lines = view.approval_lines();
-        let banner: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(!banner.contains("pending"), "no count for one: {banner}");
-    }
-
-    /// The `X / Y done` header splits into two independent tabs: the Done view
-    /// highlights `X` (finished count), the Matched view highlights `Y` (total).
-    #[test]
-    fn done_segment_highlights_x_on_done_and_y_on_matched() {
+    fn done_and_cached_tabs_follow_the_count_scope() {
+        use crate::tui::dashboard::Tab;
         let mut v = TuiProgressView::new("L");
-        v.apply(&ev(0, matched(&["//a:x", "//a:y", "//a:z"], true)));
-        v.apply(&ev(1, result_start("//a:x")));
-        v.apply(&ev(2, result_end("//a:x", None)));
-
-        // Background colour of the header span whose content is exactly `content`.
-        let bg_of = |v: &TuiProgressView, content: &str| -> Option<Color> {
-            v.render("⠋", 100, 120, 8)[0]
-                .spans
-                .iter()
-                .find(|s| s.content == content)
-                .and_then(|s| s.style.bg)
+        v.apply(&ev(0, matched(&["//a:top", "//a:hit", "//a:bad"], true)));
+        for (addr, hit, error) in [
+            ("//a:top", false, None),
+            ("//dep:lib", false, None),
+            ("//a:hit", true, None),
+            ("//dep:hit", true, None),
+            ("//a:bad", false, Some("boom".to_owned())),
+        ] {
+            v.apply(&ev(1, result_start(addr)));
+            if hit {
+                v.apply(&ev(2, local_cache_hit(addr)));
+            }
+            v.apply(&ev(3, result_end(addr, error)));
+        }
+        v.open_dashboard();
+        let list = |v: &mut TuiProgressView, tab: Tab| {
+            v.list.set_tab(tab);
+            dash_frame(v, 10).join("\n")
         };
 
-        // Default view: neither the count nor the total is highlighted.
-        assert_eq!(bg_of(&v, "1"), None);
-        assert_eq!(bg_of(&v, "3"), None);
+        let done = list(&mut v, Tab::Done);
+        assert!(done.contains("//a:top"), "{done}");
+        assert!(
+            !done.contains("//dep:lib") && !done.contains("//a:bad"),
+            "{done}"
+        );
+        let cached = list(&mut v, Tab::Cached);
+        assert!(
+            cached.contains("//a:hit") && !cached.contains("//dep:hit"),
+            "{cached}"
+        );
 
-        // Done view highlights `X` (the "1"), leaving `Y` plain.
-        v.tab(true);
-        assert_eq!(v.view.get(), ViewMode::Done);
-        assert_eq!(bg_of(&v, "1"), Some(Color::Blue));
-        assert_eq!(bg_of(&v, "3"), None);
-
-        // Matched view highlights `Y` (the "3"), leaving `X` plain.
-        v.tab(true);
-        assert_eq!(v.view.get(), ViewMode::Matched);
-        assert_eq!(bg_of(&v, "3"), Some(Color::Blue));
-        assert_eq!(bg_of(&v, "1"), None);
-    }
-
-    #[test]
-    fn matched_view_lists_all_matched_targets_and_filters() {
-        let mut s = BuildState::new();
-        s.apply(&ev(0, matched(&["//a:done", "//a:pending"], true)));
-        s.apply(&ev(1, result_start("//a:done")));
-        s.apply(&ev(2, result_end("//a:done", None)));
-
-        // Both the finished and the still-pending matched target are listed.
-        let lines = all_lines(s.matched_rows(""));
-        assert_eq!(lines.len(), 2);
-        let joined: String = lines.iter().map(|l| format!("{l}")).collect();
-        assert!(joined.contains("//a:done"), "{joined}");
-        assert!(joined.contains("//a:pending"), "{joined}");
-
-        // Filter narrows to the matching addr.
-        let filtered = all_lines(s.matched_rows("pending"));
-        assert_eq!(filtered.len(), 1);
-        assert!(format!("{}", filtered[0]).contains("//a:pending"));
-    }
-
-    #[test]
-    fn cached_tab_highlights_and_lists_cache_hits_by_scope() {
-        let mut v = TuiProgressView::new("L");
-        v.apply(&ev(0, matched(&["//a:hit"], true)));
-        v.apply(&ev(1, local_cache_hit("//a:hit")));
-        v.apply(&ev(2, result_end("//a:hit", None)));
-        // A transitive dep also hits cache — only in the `All` scope.
-        v.apply(&ev(3, local_cache_hit("//dep:hit")));
-
-        v.tab(true); // Done
-        v.tab(true); // Matched
-        v.tab(true); // Cached
-        assert_eq!(v.view.get(), ViewMode::Cached);
-
-        // The cached segment is highlighted while its view is active.
-        let header = v.render("⠋", 100, 120, 8);
-        let hl = header[0]
-            .spans
-            .iter()
-            .find(|s| s.content.contains("cached"))
-            .expect("cached span");
-        assert_eq!(hl.style.bg, Some(Color::Blue));
-
-        // Matched scope (default) lists only the matched hit.
-        let body: String = v
-            .render("⠋", 10_000, 80, 8)
-            .iter()
-            .map(|l| format!("{l}"))
-            .collect();
-        assert!(body.contains("//a:hit"), "{body}");
-        assert!(!body.contains("//dep:hit"), "{body}");
-    }
-
-    #[test]
-    fn cached_lines_respect_matched_and_all_scope() {
-        let mut s = BuildState::new();
-        s.apply(&ev(0, matched(&["//a:top"], true)));
-        s.apply(&ev(1, local_cache_hit("//a:top")));
-        s.apply(&ev(2, local_cache_hit("//dep:lib")));
-
-        let m: String = all_lines(s.cached_rows(CountScope::Matched, ""))
-            .iter()
-            .map(|l| format!("{l}"))
-            .collect();
-        assert!(m.contains("//a:top"), "{m}");
-        assert!(!m.contains("//dep:lib"), "{m}");
-
-        let a: String = all_lines(s.cached_rows(CountScope::All, ""))
-            .iter()
-            .map(|l| format!("{l}"))
-            .collect();
-        assert!(a.contains("//a:top"), "{a}");
-        assert!(a.contains("//dep:lib"), "{a}");
-    }
-
-    #[test]
-    fn back_to_main_returns_from_list_tab_and_resets_filter() {
-        let mut v = TuiProgressView::new("L");
-        v.apply(&ev(0, matched(&["//web:server", "//api:server"], true)));
-        v.apply(&ev(1, result_start("//web:server")));
-        v.apply(&ev(2, result_end("//web:server", None)));
-
-        v.tab(true); // Done
-        assert!(!v.is_on_main_view());
-        v.search_start();
-        v.search_input('w');
-        assert!(v.has_active_filter());
-
-        // Esc/q off the main view route here: back to Default, filter cleared.
-        v.back_to_main();
-        assert!(v.is_on_main_view());
-        assert_eq!(v.view.get(), ViewMode::Default);
-        assert!(!v.has_active_filter());
-        assert!(!v.is_searching());
-        assert_eq!(v.scroll.get(), 0);
+        v.toggle_scope();
+        let done = list(&mut v, Tab::Done);
+        assert!(
+            done.contains("//a:top") && done.contains("//dep:lib"),
+            "{done}"
+        );
+        assert!(!done.contains("//a:bad"), "{done}");
+        let cached = list(&mut v, Tab::Cached);
+        assert!(
+            cached.contains("//a:hit") && cached.contains("//dep:hit"),
+            "{cached}"
+        );
     }
 
     #[test]
@@ -6487,247 +6136,119 @@ mod tests {
     }
 
     #[test]
-    fn body_row_width_matches_the_rendered_line() {
-        // `width` drives the horizontal-pan clamp, `render` drives the pixels.
-        // They are computed two different ways and must not drift.
-        for row in [
-            BodyRow {
-                addr: "//a:b",
-                color: Color::Green,
-                detail: None,
-            },
-            BodyRow {
-                addr: "//pkg/ünïcødé:tgt",
-                color: Color::White,
-                detail: None,
-            },
-            BodyRow {
-                addr: "//a:b",
-                color: Color::Red,
-                detail: Some("boom: exit status 1"),
-            },
-            // An empty message still renders its (empty) detail span.
-            BodyRow {
-                addr: "//a:b",
-                color: Color::Red,
-                detail: Some(""),
-            },
-        ] {
-            assert_eq!(row.width(), spans_width(&row.render().spans), "{row:?}");
-        }
-    }
-
-    /// `n` matched targets that all finished and hit cache, plus `n` failed
-    /// ones — so every list tab has exactly `n` rows. Addrs are zero-padded so
-    /// their sort order is not their insertion order, which is what makes the
-    /// partial selection observable.
-    fn list_state(n: usize) -> BuildState {
-        let mut s = BuildState::new();
-        let ok: Vec<String> = (0..n).map(|i| format!("//ok/p{i:06}:t{i}")).collect();
-        s.apply(&ev(
-            0,
-            BuildEventKind::Matched {
-                addrs: ok.clone(),
-                complete: true,
-            },
-        ));
-        for addr in &ok {
-            s.apply(&ev(1, result_start(addr)));
-            s.apply(&ev(2, result_end(addr, None)));
-            s.apply(&ev(3, local_cache_hit(addr)));
-        }
-        for i in 0..n {
-            let addr = format!("//bad/p{i:06}:t{i}");
-            s.apply(&ev(4, result_start(&addr)));
-            s.apply(&ev(5, result_end(&addr, Some(format!("boom {i}")))));
-        }
-        s
-    }
-
-    /// Builds one list tab's rows off a state. A fn pointer so each tab can be
-    /// called twice — once for the reference list, once for the windowed one.
-    type TabRows = for<'a> fn(&'a BuildState) -> BodyRows<'a>;
-
-    const LIST_TABS: [(&str, TabRows); 4] = [
-        ("done", |s| s.done_rows(CountScope::All, "")),
-        ("matched", |s| s.matched_rows("")),
-        ("cached", |s| s.cached_rows(CountScope::All, "")),
-        ("failed", |s| s.failed_rows("")),
-    ];
-
-    #[test]
-    fn windowing_a_list_matches_the_fully_ordered_list_at_every_offset() {
-        // The correctness bar for clipping before rendering: at any viewport
-        // position, the rows shown must be exactly the ones the full-list build
-        // would have put there, and the clamped scroll offset must agree.
-        // Empty and single-row lists are in here because they are the sizes the
-        // two partitions have to decline to run at all.
-        for n in [0usize, 1, 137] {
-            let s = list_state(n);
-            for (name, build) in LIST_TABS {
-                let reference = all_lines(build(&s));
-                assert_eq!(reference.len(), n, "{name}");
-                for rows in [0usize, 1, 7, 20, 136, 137, 200] {
-                    for scroll in 0..=(reference.len() + 5) {
-                        let (want, want_off) = windowed(reference.clone(), rows, scroll);
-                        let (got, got_off) = build(&s).window(rows, scroll);
-                        assert_eq!(
-                            got_off, want_off,
-                            "{name} n={n} rows={rows} scroll={scroll}"
-                        );
-                        assert_eq!(got, want, "{name} n={n} rows={rows} scroll={scroll}");
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn placing_a_window_selects_rather_than_sorting_the_whole_list() {
-        // The headline of this change is that the ordered tabs stop sorting a
-        // list they are about to throw away. That is invisible in the rendered
-        // output and allocates nothing, so nothing else here would notice it
-        // being undone — count the comparisons instead. A full sort of n
-        // elements costs about n·log2(n); the two partitions plus a 20-row sort
-        // are linear. At n = 50k that is ~780k against ~150k, so a bound of 8n
-        // separates them with room to spare and never needs a clock.
-        let n = 50_000usize;
-        // Scrambled, not reversed: pdqsort spots a reversed run and flips it in
-        // O(n), which would let a full sort slip under the bound.
-        let mut rows: Vec<u32> = (0..n as u32)
-            .map(|i| i.wrapping_mul(2_654_435_761))
-            .collect();
-        let mut want = rows.clone();
-        want.sort_unstable();
-
-        let calls = Cell::new(0usize);
-        place_window(&mut rows, 25_000, 25_020, |a, b| {
-            calls.set(calls.get() + 1);
-            a.cmp(b)
-        });
-
-        assert_eq!(
-            &rows[25_000..25_020],
-            &want[25_000..25_020],
-            "the window must hold the same rows a full sort would put there",
-        );
-        assert!(
-            calls.get() < 8 * n,
-            "{} comparisons to place a 20-row window in {n} rows — that is a \
-             full sort, not a selection",
-            calls.get(),
-        );
-    }
-
-    #[test]
-    fn panning_a_list_tab_clamps_against_the_whole_list() {
-        // The pan clamp is deliberately measured over every row, not just the
-        // visible ones, so it does not shift as you scroll. This is also the
-        // only path that reads `Body::max_width` on a list tab.
-        let mut v = TuiProgressView::new("L");
-        // One row far wider than the viewport, then a screenful of short ones.
-        let wide = format!("//wide:{}", "x".repeat(300));
-        v.apply(&ev(0, result_start(&wide)));
-        v.apply(&ev(1, result_end(&wide, Some("boom".into()))));
-        for i in 0..50 {
-            let addr = format!("//s:{i:02}");
-            v.apply(&ev(2, result_start(&addr)));
-            v.apply(&ev(3, result_end(&addr, Some("boom".into()))));
-        }
-        v.view.set(ViewMode::Failed);
-
-        // Pan far right: it clamps at the widest row's tail, not at zero.
-        v.hscroll(100_000);
-        let lines = v.render("⠋", 0, 40, 9);
-        let pan = v.hscroll.get();
-        assert!(pan > 0, "a list tab must be pannable");
-        let row0 = format!("{}", lines[1]);
-        assert!(
-            !row0.contains("//wide"),
-            "pan did not drop the head: {row0}"
-        );
-
-        // Scroll the wide row out of the window. The clamp must not move — if it
-        // were measured over the visible rows it would collapse to zero here.
-        v.scroll(20);
-        drop(v.render("⠋", 0, 40, 9));
-        assert_eq!(
-            v.hscroll.get(),
-            pan,
-            "the pan clamp shifted when the widest row scrolled out of view",
-        );
-    }
-
-    #[test]
     fn a_failed_row_keeps_its_error_on_one_line() {
-        // A `\n` inside a `Span` does not wrap in ratatui, it corrupts the box
-        // the whole viewport is laid out in — and multi-line stderr is exactly
-        // what lands on this tab.
+        // A `\n` inside a `Span` does not wrap in ratatui, it corrupts the
+        // screen the dashboard is laid out on — and multi-line stderr is
+        // exactly what lands on the Failed tab.
+        use crate::tui::dashboard::Tab;
         let mut v = TuiProgressView::new("L");
         v.apply(&ev(0, result_start("//a:bad")));
         v.apply(&ev(
             1,
             result_end("//a:bad", Some("first line\nsecond line".into())),
         ));
-        v.view.set(ViewMode::Failed);
+        v.open_dashboard();
+        v.list.set_tab(Tab::Failed);
 
-        let lines = v.render("⠋", 0, 120, 8);
-        assert_eq!(lines.len(), 8, "a multi-line error must not grow the box");
-        let row = format!("{}", lines[1]);
-        assert!(row.contains("first line"), "{row}");
-        assert!(!row.contains("second line"), "{row}");
+        let lines = dash_frame(&mut v, 0);
+        assert_eq!(
+            lines.len(),
+            14,
+            "a multi-line error must not grow the frame"
+        );
+        let text = lines.join("\n");
+        assert!(text.contains("//a:bad"), "{text}");
+        assert!(!text.contains("second line"), "{text}");
     }
 
+    /// `frame_does_no_io`, through the view: the LAST LINE column shows a
+    /// running target's latest line, read by the view's background reader —
+    /// every call to the log reader is made off the thread drawing frames —
+    /// and read again once the log grew.
     #[test]
-    fn list_max_width_matches_the_widest_rendered_row() {
-        // The pan clamp is measured off the whole list without rendering it.
-        let s = list_state(50);
-        for (name, build) in LIST_TABS {
-            let want = all_lines(build(&s))
-                .iter()
-                .map(|l| spans_width(&l.spans))
-                .max()
-                .unwrap_or(0);
-            assert_eq!(build(&s).max_width(), want, "{name}");
+    fn last_line_column_reads_off_the_frame_thread() {
+        use std::sync::Mutex;
+        use std::time::{Duration, Instant};
+
+        #[derive(Default)]
+        struct Reader {
+            log: Mutex<Vec<u8>>,
+            threads: Mutex<Vec<std::thread::ThreadId>>,
         }
-    }
+        impl crate::tui::dashboard::LogReader for Reader {
+            fn size(&self, addr: &str) -> Option<u64> {
+                self.threads
+                    .lock()
+                    .expect("threads")
+                    .push(std::thread::current().id());
+                (addr == "//a:run").then(|| self.log.lock().expect("log").len() as u64)
+            }
+            fn tail(&self, addr: &str, max: usize) -> Option<Vec<u8>> {
+                self.threads
+                    .lock()
+                    .expect("threads")
+                    .push(std::thread::current().id());
+                let log = self.log.lock().expect("log");
+                (addr == "//a:run").then(|| log[log.len().saturating_sub(max)..].to_vec())
+            }
+        }
 
-    #[test]
-    fn scrolled_matched_tab_renders_the_ordered_slice() {
-        // End to end through `render`: a scrolled sorted list shows the addrs a
-        // full sort would have placed at those rows, and the border indicator
-        // agrees with them.
-        let mut v = TuiProgressView::new("L");
-        let addrs: Vec<String> = (0..40).map(|i| format!("//p:t{i:02}")).collect();
-        v.apply(&ev(
-            0,
-            BuildEventKind::Matched {
-                addrs: addrs.clone(),
-                complete: true,
-            },
-        ));
-        v.view.set(ViewMode::Matched);
-        v.scroll(12);
+        let reader = std::sync::Arc::new(Reader::default());
+        reader
+            .log
+            .lock()
+            .expect("log")
+            .extend_from_slice(b"Compiling a\n");
+        let mut v = TuiProgressView::new("L").with_log_reader(reader.clone());
+        v.apply(&ev(0, result_start("//a:run")));
+        v.apply(&ev(1, execute_start("//a:run")));
+        // The line alone starts no reader thread; the first dashboard frame does.
+        let _line = v.render("⠋", 0, 120, 4);
+        assert!(
+            v.tails.is_none(),
+            "a reader thread before any dashboard frame"
+        );
+        v.open_dashboard();
 
-        // height 9 ⇒ 1 header + 6 body rows + border + help.
-        let lines = v.render("⠋", 0, 80, 9);
-        let body: Vec<String> = lines[1..7]
-            .iter()
-            .map(|l| format!("{l}").trim().to_string())
-            .collect();
-        let mut sorted = addrs.clone();
-        sorted.sort();
-        assert_eq!(body, sorted[12..18], "rows 13–18 of the ordered list");
+        // Frames a reader's interval apart, until the row shows `want`.
+        let mut now = 1_000;
+        let mut until = |v: &mut TuiProgressView, want: &str| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                now += 300;
+                let text = dash_frame(v, now).join("\n");
+                if text
+                    .lines()
+                    .any(|r| r.contains("//a:run") && r.trim_end().ends_with(want))
+                {
+                    return;
+                }
+                assert!(Instant::now() < deadline, "never showed {want:?}\n{text}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        until(&mut v, "Compiling a");
+        reader
+            .log
+            .lock()
+            .expect("log")
+            .extend_from_slice(b"Compiling b\n");
+        until(&mut v, "Compiling b");
 
-        let bottom = format!("{}", lines[lines.len() - 2]);
-        assert!(bottom.contains("↑ 13–18 of 40 ↓"), "{bottom}");
+        let me = std::thread::current().id();
+        let threads = reader.threads.lock().expect("threads");
+        assert!(!threads.is_empty());
+        assert!(
+            threads.iter().all(|t| *t != me),
+            "a frame called the log reader"
+        );
     }
 
     #[test]
     fn the_live_op_index_holds_only_open_ops_not_the_whole_run() {
-        // `ops` keeps a target's timeline until its `ResultEnd` (none of these
-        // 2,000 targets get one here); the frame path used to walk `ops` itself
-        // on every frame. The index it walks instead stays in-flight-sized.
+        // The model keeps every target's record (none of these 2,000 get a
+        // `ResultEnd` here, so all stay Running); the frame path walks the
+        // open-op index instead, which stays in-flight-sized.
         let mut s = BuildState::new();
         for i in 0..2_000 {
             let addr = format!("//pkg{i}:t");
@@ -6739,14 +6260,10 @@ mod tests {
         s.apply(&ev(2, execute_start("//live:b")));
         s.apply(&ev(2, local_write_start("//live:c")));
 
+        assert_eq!(s.dash.counts(CountScope::All).running, 2_003);
         assert_eq!(
-            s.ops.len(),
-            2_003,
-            "no ResultEnd fired, so nothing is retired"
-        );
-        assert_eq!(
-            s.open_ops.len(),
-            3,
+            open_addrs(&s),
+            ["//live:a", "//live:b", "//live:c"],
             "the frame path only walks the live ops"
         );
         assert_eq!(s.busy_workers(), 2, "only Execute holds a worker slot");
@@ -6756,12 +6273,23 @@ mod tests {
 
     #[test]
     fn open_op_index_survives_duplicate_and_mismatched_boundaries() {
-        // The index is maintained beside `OpTimeline::active`; every event order
-        // the fold tolerates must leave the two agreeing.
+        // The index is maintained beside each record's open-op bit; every
+        // event order the fold tolerates must leave the two agreeing.
+        let open_recs = |s: &BuildState| -> Vec<(u32, Option<Op>)> {
+            let mut v: Vec<_> = (0..s.dash.id_count())
+                .filter_map(|id| {
+                    let id = u32::try_from(id).ok()?;
+                    let r = s.dash.record(id)?;
+                    r.op_open().then(|| (id, r.op()))
+                })
+                .collect();
+            v.sort_unstable_by_key(|&(id, _)| id);
+            v
+        };
         let rescan = |s: &BuildState| {
-            s.ops
-                .values()
-                .filter(|tl| matches!(tl.active, Some((Op::Execute, _))))
+            open_recs(s)
+                .iter()
+                .filter(|(_, op)| *op == Some(Op::Execute))
                 .count()
         };
         let mut s = BuildState::new();
@@ -6784,43 +6312,75 @@ mod tests {
         for (i, kind) in steps.into_iter().enumerate() {
             s.apply(&ev(i as u64, kind));
             assert_eq!(s.busy_workers(), rescan(&s), "after step {i}");
+            let mut index: Vec<(u32, Option<Op>)> =
+                s.dash.open_ops().map(|(id, r)| (id, r.op())).collect();
+            index.sort_unstable_by_key(|&(id, _)| id);
             assert_eq!(
-                s.open_ops.len(),
-                s.ops.values().filter(|tl| tl.active.is_some()).count(),
-                "index drifted from the timelines after step {i}",
+                index,
+                open_recs(&s),
+                "index drifted from the records after step {i}"
             );
         }
         assert_eq!(s.busy_workers(), 0);
-        assert!(s.open_ops.is_empty(), "nothing left open");
-        assert_eq!(s.ops.len(), 2, "both targets stay in the history");
+        assert!(open_addrs(&s).is_empty(), "nothing left open");
+        assert_eq!(s.dash.id_count(), 2, "both targets stay in the history");
     }
 
     /// `System` with a per-thread allocation counter. Test binary only — the
     /// shipped allocator is untouched.
     struct CountingAlloc;
 
+    use std::cell::Cell;
+
     thread_local! {
         /// Allocations made by this thread. A `Cell` with a const initializer:
         /// no allocation and no destructor, so the allocator can bump it without
         /// re-entering itself.
         static ALLOCS: Cell<usize> = const { Cell::new(0) };
+        /// Bytes this thread allocated minus the bytes it freed. Signed: a
+        /// block freed here may have been allocated on another thread.
+        static LIVE: Cell<isize> = const { Cell::new(0) };
+        /// The most `LIVE` has been since [`live_bytes_during`] last reset it.
+        static PEAK: Cell<isize> = const { Cell::new(0) };
+    }
+
+    /// Moves this thread's live-byte count by `delta`.
+    fn live_add(delta: isize) {
+        let live = LIVE.with(|c| {
+            let live = c.get().wrapping_add(delta);
+            c.set(live);
+            live
+        });
+        PEAK.with(|p| p.set(p.get().max(live)));
+    }
+
+    fn signed(n: usize) -> isize {
+        isize::try_from(n).unwrap_or(isize::MAX)
     }
 
     // SAFETY: every method forwards to `System`, which upholds the `GlobalAlloc`
-    // contract; the wrapper adds no assumptions of its own. The counter is a
-    // const-initialised thread-local `Cell<usize>` — it never allocates and has
-    // no destructor, so bumping it cannot re-enter the allocator.
+    // contract; the wrapper adds no assumptions of its own. The counters are
+    // const-initialised thread-local `Cell`s — they never allocate and have
+    // no destructor, so bumping them cannot re-enter the allocator.
     unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
         unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
             ALLOCS.with(|c| c.set(c.get() + 1));
             // SAFETY: `layout` is forwarded unchanged from the caller.
-            unsafe { std::alloc::System.alloc(layout) }
+            let p = unsafe { std::alloc::System.alloc(layout) };
+            if !p.is_null() {
+                live_add(signed(layout.size()));
+            }
+            p
         }
 
         unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
             ALLOCS.with(|c| c.set(c.get() + 1));
             // SAFETY: `layout` is forwarded unchanged from the caller.
-            unsafe { std::alloc::System.alloc_zeroed(layout) }
+            let p = unsafe { std::alloc::System.alloc_zeroed(layout) };
+            if !p.is_null() {
+                live_add(signed(layout.size()));
+            }
+            p
         }
 
         unsafe fn realloc(
@@ -6831,12 +6391,17 @@ mod tests {
         ) -> *mut u8 {
             ALLOCS.with(|c| c.set(c.get() + 1));
             // SAFETY: `ptr`, `layout` and `new_size` are forwarded unchanged.
-            unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
+            let p = unsafe { std::alloc::System.realloc(ptr, layout, new_size) };
+            if !p.is_null() {
+                live_add(signed(new_size).wrapping_sub(signed(layout.size())));
+            }
+            p
         }
 
         unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
             // SAFETY: `ptr` and `layout` are forwarded unchanged from the caller.
-            unsafe { std::alloc::System.dealloc(ptr, layout) }
+            unsafe { std::alloc::System.dealloc(ptr, layout) };
+            live_add(-signed(layout.size()));
         }
     }
 
@@ -6850,55 +6415,179 @@ mod tests {
         ALLOCS.with(Cell::get).saturating_sub(before)
     }
 
-    #[test]
-    fn a_list_frame_allocates_the_same_at_1k_and_20k_targets() {
-        // The viewport shows ~20 rows, so one frame must allocate the same
-        // whether the list behind it holds 1k or 20k targets: every row used to
-        // be formatted into a `Line` (two allocations) that the window then
-        // discarded, and a filter lower-cased two `String`s per row on top.
-        //
-        // Allocation *count*, not bytes — the row buffer is still one
-        // allocation of `O(n)` bytes, and the selection still touches all of it.
-        // What must not come back is a heap allocation per row.
-        let mut small_view = TuiProgressView::new("bench");
-        small_view.state = list_state(1_000);
-        let mut big_view = TuiProgressView::new("bench");
-        big_view.state = list_state(20_000);
+    /// What `f` returns, the heap bytes this thread still holds once it has
+    /// returned (what `f` built and kept, net of what it freed), and the most
+    /// it held at any point while it ran.
+    fn live_bytes_during<T>(f: impl FnOnce() -> T) -> (T, isize, isize) {
+        let before = LIVE.with(Cell::get);
+        PEAK.with(|p| p.set(before));
+        let out = f();
+        (
+            out,
+            LIVE.with(Cell::get).wrapping_sub(before),
+            PEAK.with(Cell::get).wrapping_sub(before),
+        )
+    }
 
-        let frame_allocs = |v: &TuiProgressView, mode: ViewMode, filter: &str| -> usize {
-            v.view.set(mode);
-            v.scroll.set(0);
-            v.hscroll.set(0);
-            filter.clone_into(&mut v.search_query.borrow_mut());
-            // The first frame settles the scroll/pan clamps; measure a steady one.
-            let settled = v.render("⠋", 0, 120, 24);
-            // Guard against measuring the "nothing here" placeholder: the border
-            // only carries a scroll indicator when the list overflows the
-            // viewport, which is the whole premise of the measurement.
-            let border = format!("{}", settled[settled.len() - 2]);
-            assert!(
-                border.contains(" of "),
-                "the measured frame does not overflow its viewport: {border}",
-            );
-            drop(settled);
-            allocs_during(|| drop(v.render("⠋", 0, 120, 24)))
+    /// A scripted 100k-target build, folded: the matcher streams the
+    /// addresses in batches, then each target starts, and a tenth come from
+    /// the cache while the rest run.
+    fn fold_100k(state: &mut impl FnMut(&BuildEvent)) {
+        const N: usize = 100_000;
+        const BATCH: usize = 1_000;
+        let addr = |i: usize| format!("//pkg/sub{}/dir{}:target_{i}", i % 997, i % 31);
+        let mut t = 0;
+        let mut ev = |kind: BuildEventKind| {
+            t += 1;
+            state(&BuildEvent {
+                at_unix_ms: 1_700_000_000_000 + t,
+                kind,
+            });
         };
+        for b in 0..N / BATCH {
+            ev(BuildEventKind::Matched {
+                addrs: (b * BATCH..(b + 1) * BATCH).map(addr).collect(),
+                complete: b + 1 == N / BATCH,
+            });
+        }
+        // Every target's result starts before any runs, as the engine starts
+        // a dependent's while it waits on its deps: the peak in flight is the
+        // whole build.
+        for i in 0..N {
+            ev(BuildEventKind::ResultStart { addr: addr(i) });
+        }
+        for i in 0..N {
+            let a = addr(i);
+            if i % 10 == 0 {
+                ev(BuildEventKind::CacheOutcome {
+                    addr: a.clone(),
+                    outcome: hcore::events::CacheOutcomeKind::LocalHit,
+                });
+            } else {
+                ev(BuildEventKind::ExecuteStart {
+                    output_groups: Vec::new(),
+                    addr: a.clone(),
+                    driver: "exec".into(),
+                    cache: true,
+                    declared: None,
+                    reserved: None,
+                    queued_ms: None,
+                    admitted: None,
+                });
+                ev(BuildEventKind::ExecuteEnd {
+                    addr: a.clone(),
+                    error: None,
+                });
+            }
+            ev(BuildEventKind::ResultEnd {
+                left_behind: None,
+                cancelled: false,
+                addr: a,
+                error: None,
+                upstream_of: None,
+                exit_status: None,
+                log_tail: None,
+                timed_out: None,
+            });
+        }
+    }
 
-        for (name, mode) in [
-            ("done", ViewMode::Done),
-            ("matched", ViewMode::Matched),
-            ("cached", ViewMode::Cached),
-            ("failed", ViewMode::Failed),
-        ] {
+    /// The spec's memory budget: folding a 100k-target build keeps the
+    /// view's whole heap under 25 MB — counted by the allocator, not
+    /// `size_of` the record. The whole [`BuildState`], the dashboard's model
+    /// in it, at the end of the build and at its peak (every result in
+    /// flight). 15.5 MB at the end and 16.2 MB at the peak when written
+    /// (35 MB at the end while the box's String-keyed sets were still here).
+    #[test]
+    fn heap_at_100k_targets() {
+        const BUDGET: isize = 25 * 1024 * 1024;
+        let (state, end, peak) = live_bytes_during(|| {
+            let mut s = BuildState::new();
+            fold_100k(&mut |e| s.apply(e));
+            s
+        });
+        assert_eq!(state.dash.id_count(), 100_000);
+        assert_eq!(
+            state.dash.counts(CountScope::All).finished_ok(),
+            100_000,
+            "the scripted build ran to the end",
+        );
+        assert_eq!(state.completed, 100_000);
+        for (when, bytes) in [("at the end", end), ("at the peak", peak)] {
+            assert!(
+                bytes < BUDGET,
+                "the view holds {bytes} B {when} of a 100k-target build (budget {BUDGET})",
+            );
+        }
+        drop(state);
+    }
+
+    #[test]
+    fn a_dashboard_frame_allocates_the_same_at_1k_and_20k_targets() {
+        // The list shows ~20 rows, so one frame must allocate the same whether
+        // the tab behind it holds 1k or 20k targets: a heap allocation per
+        // row, formatted and then thrown away by the window, must not come
+        // back. Allocation *count*, not bytes — the filter's match buffer is
+        // one allocation of `O(n)` bytes.
+        use crate::tui::dashboard::Tab;
+        fn run_of(n: usize) -> TuiProgressView {
+            let mut v = TuiProgressView::new("bench");
+            let addrs: Vec<String> = (0..n)
+                .map(|i| format!("//p{:05}:t{i}", (i * 7919) % n))
+                .collect();
+            v.apply(&ev(
+                0,
+                matched(&addrs.iter().map(String::as_str).collect::<Vec<_>>(), true),
+            ));
+            for (i, a) in addrs.iter().enumerate() {
+                v.apply(&ev(1, result_start(a)));
+                if i % 3 == 0 {
+                    v.apply(&ev(2, local_cache_hit(a)));
+                }
+                let error = (i % 3 == 1).then(|| "boom".to_owned());
+                v.apply(&ev(3, result_end(a, error)));
+            }
+            v.open_dashboard();
+            v
+        }
+        fn frame_allocs(v: &mut TuiProgressView, tab: Tab, filter: &str) -> usize {
+            v.list.set_tab(tab);
+            let _kept = v.list.escape();
+            if !filter.is_empty() {
+                v.list.filter_start();
+                filter.chars().for_each(|c| v.list.filter_input(c));
+                v.list.filter_confirm();
+            }
+            // The first frame settles the filter cache and the selection;
+            // measure a steady one.
+            let settled: Vec<String> = v
+                .render_full(0, 120, 30)
+                .iter()
+                .map(ToString::to_string)
+                .collect();
+            // Guard against measuring an empty tab: the footer counts rows
+            // only when the list overflows the screen.
+            assert!(
+                settled
+                    .iter()
+                    .any(|l| l.contains(" of ") || l.contains(" match")),
+                "the measured frame does not overflow its list: {settled:#?}",
+            );
+            allocs_during(|| drop(v.render_full(0, 120, 30)))
+        }
+
+        let mut small = run_of(1_000);
+        let mut big = run_of(20_000);
+        for tab in [Tab::All, Tab::Done, Tab::Cached, Tab::Failed] {
             // Unfiltered, then filtered — the filter has to be tried against
             // every row, so it is its own scaling risk.
             for filter in ["", "t7"] {
-                let small = frame_allocs(&small_view, mode, filter);
-                let big = frame_allocs(&big_view, mode, filter);
+                let s = frame_allocs(&mut small, tab, filter);
+                let b = frame_allocs(&mut big, tab, filter);
                 assert!(
-                    big <= small + 64,
-                    "{name} tab (filter {filter:?}): {small} allocations for a frame \
-                     over 1k targets but {big} over 20k — per-frame cost still \
+                    b <= s + 64,
+                    "{tab:?} tab (filter {filter:?}): {s} allocations for a frame \
+                     over 1k targets but {b} over 20k — per-frame cost still \
                      scales with the list length",
                 );
             }

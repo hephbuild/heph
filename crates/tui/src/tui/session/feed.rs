@@ -14,7 +14,11 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use hcore::events::BuildEvent;
 
-use super::format::{ApprovalPrompt, ApprovalStanding, SessionRecord, SessionRecordKind};
+use hcore::events::BuildEventKind;
+
+use super::format::{
+    ApprovalPrompt, ApprovalStanding, RunLogRecord, SessionRecord, SessionRecordKind,
+};
 
 /// The recorded view state an attached [`TuiProgressView`] reads while it
 /// renders. Cloned between the app that routes records and the view.
@@ -33,9 +37,30 @@ struct FeedState {
     standing: Option<ApprovalStanding>,
     /// `Finished`'s time: the clock the run's final summary used.
     finished_at_ms: Option<u64>,
+    /// `Finished` said the user stopped the run.
+    stopped: bool,
     /// `End`'s time: the fallback clock when no `Finished` was recorded (a
     /// line-backend run, or a heph from before `Finished`).
     ended_at_ms: Option<u64>,
+    /// Each addr's newest `RunLog`, for the viewer's log readers: the same
+    /// records `heph log` finds the run's live file through, read off the
+    /// stream the viewer follows anyway instead of rescanning the session's
+    /// `events.ndjson` per lookup. One entry per target that ran.
+    run_logs: std::collections::HashMap<String, FeedRunLog>,
+    /// Each running addr's `ExecuteStart` time, until its `ExecuteEnd`: a
+    /// run that has written nothing yet is "started", not absent. One entry
+    /// per target running now.
+    started: std::collections::HashMap<String, u64>,
+}
+
+/// An addr's newest `RunLog` in the followed session.
+#[derive(Debug, Clone)]
+pub struct FeedRunLog {
+    pub record: RunLogRecord,
+    /// When the record was written.
+    pub at_unix_ms: u64,
+    /// An `ExecuteEnd` for the addr followed the record.
+    pub ended: bool,
 }
 
 /// What to do with one record.
@@ -62,6 +87,21 @@ impl SessionFeed {
     pub fn route(&self, record: SessionRecord) -> Routed {
         let at = record.at_unix_ms;
         if let Some(kind) = record.kind {
+            match &kind {
+                BuildEventKind::ExecuteStart { addr, .. } => {
+                    self.lock().started.insert(addr.clone(), at);
+                }
+                // The run whose log was announced is over (`run_logs.rs`'s
+                // rule).
+                BuildEventKind::ExecuteEnd { addr, .. } => {
+                    let mut s = self.lock();
+                    s.started.remove(addr);
+                    if let Some(run) = s.run_logs.get_mut(addr) {
+                        run.ended = true;
+                    }
+                }
+                _ => {}
+            }
             return Routed::Event(BuildEvent {
                 at_unix_ms: at,
                 kind,
@@ -87,8 +127,9 @@ impl SessionFeed {
                 s.standing = standing;
                 return Routed::Nothing;
             }
-            SessionRecordKind::Finished => {
+            SessionRecordKind::Finished { stopped } => {
                 s.finished_at_ms = Some(at);
+                s.stopped = stopped;
                 // Torn down: no prompt is on screen any more, and the build
                 // a standing decision covered is over.
                 s.approval = None;
@@ -100,8 +141,21 @@ impl SessionFeed {
                 return Routed::Nothing;
             }
             // Where a run's log is, for a log reader; nothing a TUI prints.
-            SessionRecordKind::RunLog(_)
-            | SessionRecordKind::Truncated
+            SessionRecordKind::RunLog(run) => {
+                // A path that could leave `<home>/runs/` is never kept.
+                if run.relative_file().is_some() {
+                    s.run_logs.insert(
+                        run.addr.clone(),
+                        FeedRunLog {
+                            record: *run,
+                            at_unix_ms: at,
+                            ended: false,
+                        },
+                    );
+                }
+                return Routed::Nothing;
+            }
+            SessionRecordKind::Truncated
             | SessionRecordKind::InflightWritten
             | SessionRecordKind::Unknown => return Routed::Nothing,
         };
@@ -129,11 +183,27 @@ impl SessionFeed {
         self.lock().standing
     }
 
+    /// `addr`'s newest announced run log, as far as the stream has been read.
+    pub fn run_log(&self, addr: &str) -> Option<FeedRunLog> {
+        self.lock().run_logs.get(addr).cloned()
+    }
+
+    /// When `addr`'s run going on started, as far as the stream has been
+    /// read; `None` once it ended.
+    pub fn started_at(&self, addr: &str) -> Option<u64> {
+        self.lock().started.get(addr).copied()
+    }
+
     /// The instant the run's final summary was measured against: its
     /// `Finished`, else its `End`. `None` while the run goes on.
     pub fn finished_at_ms(&self) -> Option<u64> {
         let s = self.lock();
         s.finished_at_ms.or(s.ended_at_ms)
+    }
+
+    /// Whether the run's `Finished` recorded a user stop.
+    pub fn stopped(&self) -> bool {
+        self.lock().stopped
     }
 }
 
@@ -147,7 +217,7 @@ mod tests {
             SessionRecordKind::Log {
                 level: "INFO".into(),
                 msg: msg.into(),
-                seq: None,
+                seq: 0,
             },
         )
     }
@@ -168,8 +238,11 @@ mod tests {
     fn routes_by_teardown_order() {
         let feed = SessionFeed::default();
         let prompt = ApprovalPrompt {
-            addr: "//a:gated".into(),
-            ..ApprovalPrompt::default()
+            queue: vec![crate::tui::session::ApprovalQueued {
+                seq: 1,
+                addr: "//a:gated".into(),
+                ..Default::default()
+            }],
         };
         let label = SessionRecordKind::Label {
             label: "Invoking //a:b".into(),
@@ -203,7 +276,7 @@ mod tests {
             text: "× target failed\n".into(),
         };
         let routed: Vec<Routed> = [
-            SessionRecord::session(10, SessionRecordKind::Finished),
+            SessionRecord::session(10, SessionRecordKind::Finished { stopped: true }),
             log(11, "late"),
             SessionRecord::session(12, output),
             SessionRecord::session(13, end),
@@ -218,6 +291,7 @@ mod tests {
         assert_eq!(feed.approval(), None, "torn down: no prompt on screen");
         assert_eq!(feed.approval_standing(), None, "the build is over");
         assert_eq!(feed.finished_at_ms(), Some(10), "Finished, not End");
+        assert!(feed.stopped(), "the run's stop, as Finished recorded it");
     }
 
     /// A run with no `Finished` (the line backend, or an older heph) is

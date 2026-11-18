@@ -42,6 +42,8 @@ pub struct Args {
     /// Faster, but the output may include targets that do not exist.
     #[arg(long)]
     pub candidates: bool,
+    #[command(flatten)]
+    pub dashboard: crate::commands::progress_app::DashboardArgs,
 }
 
 struct QueryApp {
@@ -148,5 +150,13 @@ async fn execute_async(
         candidates: args.candidates,
     };
     let interactive = tui::should_use_tui(global.no_tui);
-    tui::run_app(app, sink, session, interactive, shutdown).await
+    tui::run_app_with(
+        app,
+        sink,
+        session,
+        interactive,
+        args.dashboard.dashboard,
+        shutdown,
+    )
+    .await
 }

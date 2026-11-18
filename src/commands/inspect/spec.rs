@@ -17,6 +17,8 @@ pub struct Args {
     /// Target address (e.g. //pkg:name)
     #[arg(add = ArgValueCompleter::new(complete_target_addr))]
     pub addr: String,
+    #[command(flatten)]
+    pub dashboard: crate::commands::progress_app::DashboardArgs,
 }
 
 struct SpecApp {
@@ -79,5 +81,13 @@ async fn execute_async(
         fail_fast: global.fail_fast,
     };
     let interactive = tui::should_use_tui(global.no_tui);
-    tui::run_app(app, sink, session, interactive, shutdown).await
+    tui::run_app_with(
+        app,
+        sink,
+        session,
+        interactive,
+        args.dashboard.dashboard,
+        shutdown,
+    )
+    .await
 }

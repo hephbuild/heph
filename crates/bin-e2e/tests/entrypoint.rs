@@ -504,7 +504,13 @@ target(name = "noargs", driver = "exec", entrypoint = True, run = ["/bin/true"])
             "{args:?}\n{}",
             describe(&out)
         );
-        assert!(stderr.contains('×'), "{args:?}: no box\n{}", describe(&out));
+        // A failure is reported once: live as `✗ <addr>` when its block
+        // printed as it failed, otherwise in the end-of-run `×` box.
+        assert!(
+            stderr.contains('×') || stderr.contains('✗'),
+            "{args:?}: no failure report\n{}",
+            describe(&out)
+        );
         assert!(
             stderr.contains(says),
             "{args:?}: {says:?}\n{}",

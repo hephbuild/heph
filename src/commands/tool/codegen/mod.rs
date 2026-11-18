@@ -278,6 +278,7 @@ impl<R: Report> App for CodegenApp<R> {
 fn run_cli<R, F, Fut>(
     title: &'static str,
     json: bool,
+    dashboard: bool,
     sink: LogSink,
     session: &Arc<SessionSlot>,
     global: &GlobalOptions,
@@ -299,7 +300,7 @@ where
             job: Box::new(move |e, rs| Box::pin(job(e, rs))),
         };
         let interactive = tui::should_use_tui(global.no_tui) && !json;
-        tui::run_app(app, sink, session, interactive, shutdown).await
+        tui::run_app_with(app, sink, session, interactive, dashboard, shutdown).await
     })
     .and_then(|r| r);
     // The app has ended (and `--json` never takes the TUI), so stdout is

@@ -377,6 +377,12 @@ impl Tally {
                 // The message already says it timed out; the report has no
                 // separate place for it.
                 timed_out: _,
+                // CI output is unchanged (two-mode TUI I8): a stop still
+                // reports as the failure it did before the field existed.
+                cancelled: _,
+                // The job summary names the failure; where its log is
+                // stays in the step's own output.
+                left_behind: _,
             } => {
                 self.finish(
                     addr,
@@ -963,6 +969,8 @@ mod tests {
         t.apply(&ev(
             end,
             BuildEventKind::ResultEnd {
+                left_behind: None,
+                cancelled: false,
                 timed_out: None,
                 addr: addr.into(),
                 error: None,
@@ -981,6 +989,8 @@ mod tests {
         t.apply(&ev(
             10,
             BuildEventKind::ResultEnd {
+                left_behind: None,
+                cancelled: false,
                 timed_out: None,
                 addr: "//base:proto".into(),
                 error: Some("execute //base:proto: process exited with status 1".into()),
@@ -993,6 +1003,8 @@ mod tests {
             t.apply(&ev(
                 20,
                 BuildEventKind::ResultEnd {
+                    left_behind: None,
+                    cancelled: false,
                     timed_out: None,
                     addr: format!("//services/api:t{i}"),
                     error: Some("dependency failed".into()),
@@ -1027,6 +1039,8 @@ mod tests {
             t.apply(&ev(
                 5,
                 BuildEventKind::ResultEnd {
+                    left_behind: None,
+                    cancelled: false,
                     timed_out: None,
                     addr: "//a:x".into(),
                     error: Some("boom".into()),
@@ -1609,6 +1623,8 @@ mod tests {
         t.apply(&ev(
             5,
             BuildEventKind::ResultEnd {
+                left_behind: None,
+                cancelled: false,
                 timed_out: None,
                 addr: "//a:x".into(),
                 error: Some("boom".into()),
@@ -1627,6 +1643,8 @@ mod tests {
             t.apply(&ev(
                 0,
                 BuildEventKind::ResultEnd {
+                    left_behind: None,
+                    cancelled: false,
                     timed_out: None,
                     addr: format!("//a:t{i}"),
                     error: Some("boom".into()),
@@ -1649,6 +1667,8 @@ mod tests {
             t.apply(&ev(
                 0,
                 BuildEventKind::ResultEnd {
+                    left_behind: None,
+                    cancelled: false,
                     timed_out: None,
                     addr: addr.into(),
                     error: Some("boom".into()),
@@ -1670,6 +1690,8 @@ mod tests {
         t.apply(&ev(
             10,
             BuildEventKind::ResultEnd {
+                left_behind: None,
+                cancelled: false,
                 timed_out: None,
                 addr: "//services/api:test".into(),
                 error: Some("target failed: //services/api:test".into()),
@@ -1715,6 +1737,8 @@ mod tests {
         t.apply(&ev(
             5_000,
             BuildEventKind::ResultEnd {
+                left_behind: None,
+                cancelled: false,
                 timed_out: None,
                 addr: "//a:x".into(),
                 error: None,

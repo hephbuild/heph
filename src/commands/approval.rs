@@ -44,14 +44,13 @@ impl ApprovalHandler for TuiApprovalHandler {
         if self.auto_approve {
             return Ok(true);
         }
-        let texts = notice_texts(&req).await;
+        // Sources only: the approval view reads each notice from the store
+        // when it is on screen, through the one capped reader.
         let notices = req
             .notices
             .into_iter()
-            .zip(texts)
-            .map(|(n, content)| ApprovalNoticeView {
+            .map(|n| ApprovalNoticeView {
                 name: n.name,
-                content,
                 sources: n.sources,
             })
             .collect();
@@ -106,6 +105,9 @@ impl ApprovalHandler for CliApprovalHandler {
 /// silently skipped. The target addr is carried by the auto-approved /
 /// requires-approval line, so no separate header is logged here.
 async fn log_notice(req: &ApprovalRequest) {
+    if req.notices.is_empty() {
+        return;
+    }
     for (notice, text) in req.notices.iter().zip(notice_texts(req).await) {
         tracing::info!("notice {}:\n{}", notice.name, text);
     }
@@ -116,9 +118,6 @@ async fn log_notice(req: &ApprovalRequest) {
 /// ([`read_notice_from_store`]); one that cannot be read is
 /// [`NOTICE_UNAVAILABLE`].
 async fn notice_texts(req: &ApprovalRequest) -> Vec<String> {
-    if req.notices.is_empty() {
-        return Vec::new();
-    }
     let roots = req.roots.clone();
     let sources: Vec<_> = req.notices.iter().map(|n| n.sources.clone()).collect();
     hcore::blocking::run(move || {
@@ -160,11 +159,11 @@ mod tests {
         assert!(!center.is_active());
     }
 
-    /// The live view shows what the store reader returns: a notice whose
-    /// source is not in the store — or that names none — reads as
-    /// "notice unavailable" on the prompt rather than as an empty notice.
+    /// The TUI handler reads no notice: it hands the view each notice's
+    /// sources, in order, for the approval view to read from the store when
+    /// it is on screen (`tui::dashboard::approval::NoticeStore`).
     #[tokio::test]
-    async fn tui_shows_an_unreadable_notice_as_unavailable() {
+    async fn tui_hands_the_view_each_notice_by_its_sources() {
         let center = ApprovalCenter::new();
         let handler = TuiApprovalHandler::new(center.clone(), false);
         let ctoken = StdCancellationToken::new();
@@ -186,18 +185,20 @@ mod tests {
                 sources: Vec::new(),
             },
         ];
+        let expected: Vec<_> = r
+            .notices
+            .iter()
+            .map(|n| (n.name.clone(), n.sources.clone()))
+            .collect();
         let (decided, ()) = tokio::join!(handler.request_approval(r, &ctoken), async {
             loop {
                 if let Some(view) = center.current() {
                     let shown: Vec<_> = view
                         .notices
                         .iter()
-                        .map(|n| (n.name.as_str(), n.content.as_str()))
+                        .map(|n| (n.name.clone(), n.sources.clone()))
                         .collect();
-                    assert_eq!(
-                        shown,
-                        [("plan", NOTICE_UNAVAILABLE), ("none", NOTICE_UNAVAILABLE)]
-                    );
+                    assert_eq!(shown, expected);
                     center.respond(view.seq, false, Vec::new());
                     break;
                 }

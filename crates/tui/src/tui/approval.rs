@@ -29,19 +29,18 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::oneshot;
 
+use crate::tui::LogSink;
+
 pub use crate::tui::session::ApprovalStanding;
 
-/// One rendered notice for display: the input group name, its text, and the
-/// sources it was read from (`hcore::approval_notice`), which is what a
-/// session records for a viewer in another process to read it again.
+/// One notice of a request: the input group name and the sources its text is
+/// kept in (`hcore::approval_notice`). Never the text: the approval view
+/// reads it from the store when it is on screen, through the one capped
+/// reader every viewer uses, and a session records the same sources for a
+/// viewer in another process.
 #[derive(Clone, Debug)]
 pub struct ApprovalNoticeView {
     pub name: String,
-    /// The text as the handler read it from the store, through the same
-    /// capped reader every viewer uses (`engine::read_notice_from_store`):
-    /// at most `NOTICE_READ_CAP` bytes plus the truncation line, or
-    /// "notice unavailable". Never written anywhere.
-    pub content: String,
     pub sources: Vec<hcore::approval_notice::NoticeSource>,
 }
 
@@ -50,6 +49,11 @@ struct Pending {
     build: u64,
     /// When the build started, for the decision line's `at`.
     started: Instant,
+    /// When the request was queued: how long it has waited.
+    queued: Instant,
+    /// The same instant on the wall clock, for the session record: an
+    /// attached viewer measures the wait from it.
+    queued_unix_ms: u64,
     addr: String,
     notices: Vec<ApprovalNoticeView>,
     responder: oneshot::Sender<bool>,
@@ -59,13 +63,12 @@ struct Pending {
 struct Inner {
     /// Gated targets awaiting a decision, oldest first.
     queue: VecDeque<Pending>,
-    /// The request whose notice body is expanded (Enter toggles), by number:
-    /// the next request at the front starts collapsed.
-    expanded: Option<u64>,
     /// The last sequence number handed out; numbers start at 1.
     last_seq: u64,
     /// The last build number handed out.
     last_build: u64,
+    /// Where decision lines go in the interactive TUI; `None`: `tracing`.
+    log: Option<LogSink>,
     /// Standing decisions by build. A center serves one build in practice,
     /// so a list beats a map.
     standing: Vec<(u64, ApprovalStanding)>,
@@ -158,10 +161,18 @@ impl ApprovalDecision {
     /// `✓ approved //x · by standing approval (Y) after 2m16s · notices not
     /// read`. The duration is how long the prompt waited for the decision.
     pub fn line(&self) -> String {
-        let (mark, verb) = if self.approved {
-            ("✓", "approved")
+        self.line_in(false)
+    }
+
+    /// [`line`](Self::line), painted as the spec's mockup when `color`: `✓
+    /// approved` green bold or `✗ rejected` red bold, the address plain, the
+    /// details after it dim.
+    pub fn line_in(&self, color: bool) -> String {
+        use crossterm::style::Stylize;
+        let decided = if self.approved {
+            "✓ approved"
         } else {
-            ("✗", "rejected")
+            "✗ rejected"
         };
         let by = match (self.by, self.approved) {
             (DecidedBy::Key, true) => "key (y)",
@@ -169,20 +180,24 @@ impl ApprovalDecision {
             (DecidedBy::Standing, true) => "standing approval (Y)",
             (DecidedBy::Standing, false) => "standing rejection (N)",
         };
-        let mut line = format!(
-            "{mark} {verb} {} · by {by} after {}",
-            self.addr,
-            hcore::units::human_duration(self.at)
-        );
+        let mut details = format!(" · by {by} after {}", hcore::units::human_duration(self.at));
         if self.notices > 0 {
             if self.read.is_empty() {
-                line.push_str(" · notices not read");
+                details.push_str(" · notices not read");
             } else {
-                line.push_str(" · read ");
-                line.push_str(&self.read.join(", "));
+                details.push_str(" · read ");
+                details.push_str(&self.read.join(", "));
             }
         }
-        line
+        if !color {
+            return format!("{decided} {}{details}", self.addr);
+        }
+        let decided = if self.approved {
+            decided.green().bold()
+        } else {
+            decided.red().bold()
+        };
+        format!("{decided} {}{}", self.addr, details.dim())
     }
 
     fn of(p: &Pending, approved: bool, by: DecidedBy, read: Vec<String>) -> Self {
@@ -198,10 +213,19 @@ impl ApprovalDecision {
     }
 }
 
-/// Log each decision's line. Called with the center's lock released.
-fn record(decisions: &[ApprovalDecision]) {
+/// Put each decision's line in the scrollback. Called with the center's lock
+/// released.
+///
+/// With a sink (the interactive TUI, [`ApprovalCenter::set_log_sink`]) the
+/// line goes to it as written, painted when the sink has colour: `tracing`
+/// would escape the paint and prefix a level. Without one it is an INFO
+/// event, as it always was.
+fn record(sink: Option<&LogSink>, decisions: &[ApprovalDecision]) {
     for d in decisions {
-        tracing::info!("{}", d.line());
+        match sink {
+            Some(sink) => sink.write_diagnostic(&format!("{}\n", d.line_in(sink.color_enabled()))),
+            None => tracing::info!("{}", d.line()),
+        }
     }
 }
 
@@ -211,14 +235,44 @@ pub struct ApprovalView {
     pub seq: u64,
     pub addr: String,
     pub notices: Vec<ApprovalNoticeView>,
-    pub expanded: bool,
     /// How many further targets are queued behind this one.
     pub queued_behind: usize,
+}
+
+/// One pending request as a frame reads it: its number, target, notices by
+/// name and sources, and how long it has waited.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueuedApproval {
+    pub seq: u64,
+    pub addr: String,
+    pub notices: Vec<NoticeRef>,
+    pub waited: Duration,
+}
+
+/// A notice by name and the sources its text is kept in. None: it reads
+/// "notice unavailable".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NoticeRef {
+    pub name: String,
+    pub sources: Vec<hcore::approval_notice::NoticeSource>,
 }
 
 impl ApprovalCenter {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Write decision lines to `sink`, the interactive TUI's, instead of
+    /// through `tracing`: the line is the spec's, painted when the sink has
+    /// colour, with no level in front.
+    pub fn set_log_sink(&self, sink: LogSink) {
+        self.lock().log = Some(sink);
+    }
+
+    /// Record `decisions`' lines; the lock is taken only to read the sink.
+    fn record(&self, decisions: &[ApprovalDecision]) {
+        let sink = self.lock().log.clone();
+        record(sink.as_ref(), decisions);
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -268,6 +322,8 @@ impl ApprovalCenter {
                 seq,
                 build: build.id,
                 started: build.started,
+                queued: Instant::now(),
+                queued_unix_ms: hcore::events::now_unix_ms(),
                 addr,
                 notices,
                 responder: tx,
@@ -289,7 +345,7 @@ impl ApprovalCenter {
             (seq, decided)
         };
         if let Some(d) = decided {
-            record(std::slice::from_ref(&d));
+            self.record(std::slice::from_ref(&d));
         }
         ApprovalTicket { seq, rx }
     }
@@ -307,7 +363,6 @@ impl ApprovalCenter {
             seq: front.seq,
             addr: front.addr.clone(),
             notices: front.notices.clone(),
-            expanded: inner.expanded == Some(front.seq),
             queued_behind: inner.queue.len().saturating_sub(1),
         })
     }
@@ -324,8 +379,42 @@ impl ApprovalCenter {
                 seq: p.seq,
                 addr: p.addr.clone(),
                 notices: p.notices.clone(),
-                expanded: inner.expanded == Some(p.seq),
                 queued_behind: len - i - 1,
+            })
+            .collect()
+    }
+
+    /// The oldest pending request's address and how many are pending: what
+    /// the prompt row and the spotlight read, several times a frame, without
+    /// copying the queue.
+    pub fn front(&self) -> Option<(String, usize)> {
+        let inner = self.lock_pruned();
+        inner
+            .queue
+            .front()
+            .map(|p| (p.addr.clone(), inner.queue.len()))
+    }
+
+    /// Every pending request, oldest first, without its notices' text: what
+    /// the approval view reads (it reads a notice from the store by its
+    /// sources, off the render task).
+    pub fn queue(&self) -> Vec<QueuedApproval> {
+        let inner = self.lock_pruned();
+        inner
+            .queue
+            .iter()
+            .map(|p| QueuedApproval {
+                seq: p.seq,
+                addr: p.addr.clone(),
+                notices: p
+                    .notices
+                    .iter()
+                    .map(|n| NoticeRef {
+                        name: n.name.clone(),
+                        sources: n.sources.clone(),
+                    })
+                    .collect(),
+                waited: p.queued.elapsed(),
             })
             .collect()
     }
@@ -335,36 +424,34 @@ impl ApprovalCenter {
         self.lock().standing.first().map(|&(_, s)| s)
     }
 
-    /// The front request as a session records it: no notice content, no
-    /// responder. `None` when idle, without allocating.
+    /// Every pending request as a session records it, by number and notice
+    /// sources (what an attached viewer's approval view reads): no notice
+    /// content, no responder. `None` when idle, without allocating.
     pub fn prompt(&self) -> Option<crate::tui::session::ApprovalPrompt> {
+        use crate::tui::session::{ApprovalPromptNotice, ApprovalQueued};
         let inner = self.lock_pruned();
-        let front = inner.queue.front()?;
+        if inner.queue.is_empty() {
+            return None;
+        }
         Some(crate::tui::session::ApprovalPrompt {
-            addr: front.addr.clone(),
-            queued_behind: u64::try_from(inner.queue.len().saturating_sub(1)).unwrap_or(u64::MAX),
-            notices: front
-                .notices
+            queue: inner
+                .queue
                 .iter()
-                .map(|n| crate::tui::session::ApprovalPromptNotice {
-                    name: n.name.clone(),
-                    sources: n.sources.clone(),
+                .map(|p| ApprovalQueued {
+                    seq: p.seq,
+                    addr: p.addr.clone(),
+                    queued_at_unix_ms: p.queued_unix_ms,
+                    notices: p
+                        .notices
+                        .iter()
+                        .map(|n| ApprovalPromptNotice {
+                            name: n.name.clone(),
+                            sources: n.sources.clone(),
+                        })
+                        .collect(),
                 })
                 .collect(),
         })
-    }
-
-    /// Expand/collapse the front request's notice body (Enter).
-    pub fn toggle_expanded(&self) {
-        let mut inner = self.lock_pruned();
-        let Some(front) = inner.queue.front().map(|p| p.seq) else {
-            return;
-        };
-        inner.expanded = if inner.expanded == Some(front) {
-            None
-        } else {
-            Some(front)
-        };
     }
 
     /// Decide request `seq`, having read the notices named in `read`, and log
@@ -380,7 +467,7 @@ impl ApprovalCenter {
             pending.responder.send(approve).ok()?;
             decision
         };
-        record(std::slice::from_ref(&decision));
+        self.record(std::slice::from_ref(&decision));
         Some(decision)
     }
 
@@ -415,7 +502,7 @@ impl ApprovalCenter {
             inner.queue = kept;
             decided
         };
-        record(&decided);
+        self.record(&decided);
         decided
     }
 }
@@ -427,7 +514,6 @@ mod tests {
     fn notice(name: &str) -> ApprovalNoticeView {
         ApprovalNoticeView {
             name: name.to_string(),
-            content: format!("{name} body"),
             sources: Vec::new(),
         }
     }
@@ -442,10 +528,6 @@ mod tests {
         assert_eq!(view.addr, "//a:b");
         assert_eq!(view.seq, t.seq);
         assert_eq!(view.notices.len(), 1);
-        assert!(!view.expanded);
-
-        center.toggle_expanded();
-        assert!(center.current().expect("active").expanded);
 
         let d = center
             .respond(t.seq, true, vec!["plan".into()])
@@ -460,6 +542,62 @@ mod tests {
         assert!(d.line().ends_with(" · read plan"), "{}", d.line());
     }
 
+    /// With a sink (the interactive TUI) a decision's line goes to it as
+    /// written, one line, with no log level in front.
+    #[tokio::test]
+    async fn decision_line_goes_to_the_sink() {
+        let sink = LogSink::new_direct_with(Arc::new(crate::tui::session::SessionSlot::new()));
+        let mut rx = sink.switch_to_buffered();
+        let center = ApprovalCenter::new();
+        center.set_log_sink(sink.clone());
+        let build = center.build();
+        let t = center.request(&build, "//a:b".to_string(), vec![]);
+        let d = center.respond(t.seq, true, Vec::new()).expect("decided");
+        let got = rx.try_recv().expect("a line");
+        // Colour follows the test's stderr; the paint taken off, the line.
+        let text = String::from_utf8(got.bytes).expect("utf-8");
+        assert_eq!(
+            crate::tui::text::clean_inline(text.trim_end_matches('\n')),
+            d.line()
+        );
+        assert!(text.ends_with('\n'), "{text:?}");
+    }
+
+    /// With colour the decision line is painted as the spec's mockup — the
+    /// verdict green or red bold, the details dim — and without it is the
+    /// plain line, which CI and the log record keep.
+    #[test]
+    fn decision_line_colours() {
+        use crossterm::style::Stylize;
+        let d = ApprovalDecision {
+            seq: 1,
+            addr: "//a:b".into(),
+            approved: true,
+            by: DecidedBy::Key,
+            at: Duration::from_secs(3),
+            notices: 1,
+            read: vec!["plan".into()],
+        };
+        assert_eq!(d.line_in(false), d.line());
+        assert!(!d.line().contains('\x1b'), "{:?}", d.line());
+        let details = d.line().replacen("✓ approved //a:b", "", 1);
+        assert_eq!(
+            d.line_in(true),
+            format!("{} //a:b{}", "✓ approved".green().bold(), details.dim())
+        );
+        let rejected = ApprovalDecision {
+            approved: false,
+            ..d
+        };
+        assert!(
+            rejected
+                .line_in(true)
+                .starts_with(&format!("{} //a:b", "✗ rejected".red().bold())),
+            "{:?}",
+            rejected.line_in(true)
+        );
+    }
+
     #[tokio::test]
     async fn reject_sends_false_and_queue_advances() {
         let center = ApprovalCenter::new();
@@ -467,14 +605,17 @@ mod tests {
         let t1 = center.request(&build, "//a:1".to_string(), vec![]);
         let t2 = center.request(&build, "//a:2".to_string(), vec![]);
         assert_eq!(center.current().expect("active").queued_behind, 1);
+        assert_eq!(center.front(), Some(("//a:1".to_owned(), 2)));
 
         center.respond(t1.seq, false, Vec::new());
         assert!(!t1.rx.await.expect("decision"));
         // Second prompt is now active.
         assert_eq!(center.current().expect("active").addr, "//a:2");
+        assert_eq!(center.front(), Some(("//a:2".to_owned(), 1)));
         center.respond(t2.seq, true, Vec::new());
         assert!(t2.rx.await.expect("decision"));
         assert!(!center.is_active());
+        assert_eq!(center.front(), None);
     }
 
     /// Feed-level half of the spec's `y_decides_the_request_on_screen`: with

@@ -131,6 +131,8 @@ pub struct RunArgs {
     /// diagnostic box. The full log is always saved as the `log.txt` artifact.
     #[arg(long = "log-lines", value_name = "N", default_value_t = 10)]
     pub log_lines: usize,
+    #[command(flatten)]
+    pub dashboard: crate::commands::progress_app::DashboardArgs,
     /// Print only what the target prints: no TUI, no progress, stderr only for failures
     ///
     /// On an entrypoint, the program runs on your terminal's own fds rather than
@@ -456,19 +458,29 @@ impl std::error::Error for InvokeFailed {}
 /// The header label, shared with the TUI view so it can change once the run
 /// learns it is invoking an entrypoint rather than building (R20).
 #[derive(Clone)]
-struct SharedLabel(Arc<std::sync::Mutex<String>>);
+struct SharedLabel(Arc<std::sync::Mutex<(String, bool)>>);
 
 impl SharedLabel {
     fn new(label: String) -> Self {
-        Self(Arc::new(std::sync::Mutex::new(label)))
+        Self(Arc::new(std::sync::Mutex::new((label, false))))
     }
 
+    /// A label shown only while the matcher streams.
     fn set(&self, label: String) {
-        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = label;
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = (label, false);
+    }
+
+    /// A label the line keeps up until the run ends ("Invoking …").
+    fn set_standing(&self, label: String) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = (label, true);
     }
 
     fn get(&self) -> String {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).0.clone()
+    }
+
+    fn stands(&self) -> bool {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).1
     }
 }
 
@@ -485,6 +497,10 @@ impl tui::ProgressHeader for RunHeader {
 
     fn label(&self) -> String {
         self.label.get()
+    }
+
+    fn label_stands(&self) -> bool {
+        self.label.stands()
     }
 
     fn last_render(&self, core: &tui::BuildState, scope: tui::CountScope) -> String {
@@ -552,7 +568,8 @@ impl RunApp {
         rs: Arc<crate::engine::request_state::RequestState>,
         addr: crate::htaddr::Addr,
     ) -> anyhow::Result<Option<hcore::process::Exit>> {
-        self.label.set(format!("Invoking {}", addr.format()));
+        self.label
+            .set_standing(format!("Invoking {}", addr.format()));
         let engine = Arc::downgrade(&self.engine);
         let (relay, signals) = bootstrap::signal_relay(move || {
             if let Some(e) = engine.upgrade() {
@@ -689,10 +706,28 @@ impl App for RunApp {
             label: self.label.clone(),
         }))
         .with_approval(self.approval.clone())
+        .with_notices(
+            hcore::approval_notice::NoticeRoots {
+                home: self.engine.home.to_path_buf(),
+                root: self.engine.root().to_path_buf(),
+            },
+            crate::engine::approval::read_notice_from_store,
+        )
+        .with_redact(tui::text::Redact::heph_home(&self.engine.home))
+        .with_log_reader(Arc::new(crate::commands::log::EngineTails::new(
+            Arc::clone(&self.engine),
+            tokio::runtime::Handle::current(),
+        )))
+        .with_target_reader(Arc::new(crate::commands::log::EngineTargetReader::new(
+            Arc::clone(&self.engine),
+            tokio::runtime::Handle::current(),
+        )))
     }
 
     fn ci_view(&self) -> Self::CiView {
         tui::CiProgressView::new(self.progress_label())
+            .with_log_lines(self.args.log_lines)
+            .with_redact(tui::text::Redact::heph_home(&self.engine.home))
     }
 
     async fn run(self, ctx: AppContext) -> anyhow::Result<Option<hcore::process::Exit>> {
@@ -786,6 +821,9 @@ impl App for RunApp {
         // resolve it; otherwise the notice prints to stderr and the decision is
         // read from the terminal (or auto-approved).
         let approval: Arc<dyn crate::engine::approval::ApprovalHandler> = if ctx.interactive() {
+            // Decision lines straight to the TUI's sink, so they keep their
+            // colour and carry no log level.
+            self.approval.set_log_sink(ctx.sink().clone());
             Arc::new(crate::commands::approval::TuiApprovalHandler::new(
                 self.approval.clone(),
                 self.auto_approve,
@@ -988,6 +1026,7 @@ async fn execute_async(
     let m = resolve_matcher(&args.expr, &args.arg1, &args.arg2, &base_pkg, false)?;
     let (engine, shutdown) = bootstrap::new_engine(&global, session)?;
     let raw = args.raw;
+    let dashboard = args.dashboard.dashboard;
     let app = RunApp {
         args,
         engine: std::sync::Arc::clone(&engine),
@@ -1058,7 +1097,7 @@ async fn execute_async(
         )
     });
 
-    let result = tui::run_app(app, sink, session, interactive, shutdown).await;
+    let result = tui::run_app_with(app, sink, session, interactive, dashboard, shutdown).await;
     // Stop before teardown so no paragraph races the final summary.
     if let Some(w) = &watchdog {
         w.stop();
@@ -1090,6 +1129,28 @@ mod tests {
         Cli::try_parse_from(std::iter::once("run").chain(argv.iter().copied()))
             .expect("parse")
             .run
+    }
+
+    /// `-D` is the run's own flag, in either place on the label form
+    /// (`r build -D //...`) and the address form; off unless given.
+    #[test]
+    fn dashboard_flag_parses_on_run() {
+        for argv in [
+            &["build", "-D", "//..."][..],
+            &["build", "//...", "-D"],
+            &["-D", "//p:t"],
+            &["--dashboard", "//p:t"],
+        ] {
+            assert!(parse(argv).dashboard.dashboard, "{argv:?}");
+        }
+        let args = parse(&["build", "-D", "//..."]);
+        assert_eq!(args.arg1.as_deref(), Some("build"));
+        assert_eq!(args.arg2.as_deref(), Some("//..."));
+        assert!(!parse(&["//p:t"]).dashboard.dashboard);
+        assert!(
+            parse(&["//t:go", "--", "-D"]).args == [OsString::from("-D")],
+            "after `--`, -D is the program's"
+        );
     }
 
     /// Everything after `--` is the program's, in order and verbatim — heph's

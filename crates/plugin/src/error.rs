@@ -638,6 +638,11 @@ pub struct TargetFailure {
     /// driver, a failure before its tree existed), or its removal was not a
     /// choice (credential material without `--keep-failed-sandboxes`).
     pub sandbox: Option<SandboxFate>,
+    /// Whether the engine can open a log for this target without fetching
+    /// (its log API over local sources), asked once when the run ends: what
+    /// decides between `heph log <addr>` and "none kept". `None` when nobody
+    /// asked; a renderer then falls back to whether `log` has a path.
+    pub log_readable: Option<bool>,
     pub source: std::sync::Arc<anyhow::Error>,
 }
 
@@ -645,7 +650,8 @@ pub struct TargetFailure {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SandboxFate {
     /// Removed once the failure slot was filled: the default, which
-    /// `--keep-failed-sandboxes` would have changed.
+    /// `--keep-failed-sandboxes` would have changed. Neither the box nor the
+    /// report says anything about it.
     Removed,
     /// Left on disk under `--keep-failed-sandboxes`, at this path, until the
     /// target's next run.
@@ -662,7 +668,7 @@ pub enum SandboxFate {
 impl fmt::Display for SandboxFate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Removed => f.write_str("removed (rerun with --keep-failed-sandboxes to keep it)"),
+            Self::Removed => f.write_str("removed"),
             Self::Kept(path) => write!(f, "{} (kept)", path.display()),
             Self::RemovedMaterial => f.write_str("removed (credential material)"),
             Self::LeftAbandoned => f.write_str("left (run abandoned after timeout)"),
@@ -705,6 +711,18 @@ pub enum FixesNotWritten {
     Frozen,
 }
 
+/// Why nothing was written, as the box and the report say it.
+impl fmt::Display for FixesNotWritten {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Signal(sig) => write!(f, "killed by signal {sig}"),
+            Self::HighExit(code) => write!(f, "exit {code} (128+, treated as a signal)"),
+            Self::MovedSource => f.write_str("an in_place source changed while the target ran"),
+            Self::Frozen => f.write_str("--frozen checks the tree, it never writes it"),
+        }
+    }
+}
+
 impl TargetFailure {
     pub fn new(addr: Addr, log_tail: Option<LogTail>, source: anyhow::Error) -> Self {
         Self {
@@ -714,8 +732,22 @@ impl TargetFailure {
             outputs: None,
             fixes: None,
             sandbox: None,
+            log_readable: None,
             source: std::sync::Arc::new(source),
         }
+    }
+
+    /// The same failure, saying whether the engine can open its log.
+    pub fn with_log_readable(mut self, readable: bool) -> Self {
+        self.log_readable = Some(readable);
+        self
+    }
+
+    /// Whether to point at `heph log <addr>`: the engine's answer when it
+    /// gave one, else whether the slot kept the log on disk.
+    pub fn points_at_log(&self) -> bool {
+        self.log_readable
+            .unwrap_or_else(|| self.log.as_ref().and_then(|l| l.path()).is_some())
     }
 
     /// The same failure, saying what became of its sandbox.
@@ -740,6 +772,52 @@ impl TargetFailure {
     pub fn with_outputs(mut self, outputs: Option<std::path::PathBuf>) -> Self {
         self.outputs = outputs;
         self
+    }
+
+    /// What this failure left behind, as the failure box's last rows read it.
+    pub fn left_behind(&self) -> hcore::events::LeftBehindData {
+        left_behind(
+            self.log.as_ref(),
+            self.sandbox.as_ref(),
+            self.outputs.as_deref(),
+            self.fixes.as_ref(),
+            self.log_readable,
+        )
+    }
+}
+
+/// What a failed run left behind, in the event's terms: the one conversion
+/// both the recorded failure ([`TargetFailure::left_behind`]) and the
+/// engine's `ResultEnd` (from the failure slot) go through, so the box and a
+/// live printer say the same thing.
+pub fn left_behind(
+    log: Option<&FailureLog>,
+    sandbox: Option<&SandboxFate>,
+    outputs: Option<&std::path::Path>,
+    fixes: Option<&FailureFixes>,
+    log_readable: Option<bool>,
+) -> hcore::events::LeftBehindData {
+    hcore::events::LeftBehindData {
+        log_path: log
+            .and_then(FailureLog::path)
+            .map(|p| p.display().to_string()),
+        sandbox: sandbox.and_then(|s| match s {
+            // The default: neither the box nor the report says anything.
+            SandboxFate::Removed => None,
+            other => Some(other.to_string()),
+        }),
+        outputs: outputs.map(|p| p.display().to_string()),
+        fixes: fixes.map(|f| match f {
+            FailureFixes::Written { root, paths, list } => hcore::events::FixesData::Written {
+                root: root.to_string_lossy().into_owned(),
+                paths: paths.clone(),
+                list: list.as_ref().map(|l| l.to_string_lossy().into_owned()),
+            },
+            FailureFixes::NotWritten(reason) => hcore::events::FixesData::NotWritten {
+                reason: reason.to_string(),
+            },
+        }),
+        log_readable,
     }
 }
 
