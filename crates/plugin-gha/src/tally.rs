@@ -35,6 +35,10 @@ use rustc_hash::{FxHashMap, FxHashSet};
 /// capped at this, so the memory is constant regardless of graph size.
 pub(crate) const SLOWEST_KEPT: usize = 20;
 
+/// A completed target shorter than this is left out of the "slowest" table: a
+/// build of quick targets would otherwise fill it with rows nobody can act on.
+pub(crate) const SLOWEST_MIN_MS: u64 = 1_000;
+
 /// Root failures retained with full detail. Beyond this only the count is kept —
 /// a build with 200 independent breakages is a catastrophe whose report is the
 /// count, not the list.
@@ -85,13 +89,17 @@ impl Phase {
 /// State for a target that is currently in flight. Dropped at `ResultEnd`.
 #[derive(Debug, Default)]
 struct TargetRec {
-    /// First event seen for this target, used as its duration origin.
+    /// First event seen for this target: its `ResultStart`, before its deps
+    /// resolve. Only a root failure's duration counts from here.
     started_ms: u64,
     /// The active phase and when it began, or `None` between phases.
     phase: Option<(Phase, u64)>,
     driver: Option<Box<str>>,
-    /// Whether this target actually ran.
-    executed: bool,
+    /// When this target's first `ExecuteStart` arrived, or `None` if it never
+    /// ran. The slowest table counts from here, never from `started_ms`: a
+    /// target is requested before its deps resolve, so `started_ms` would
+    /// bill a millisecond `group` for the 47s Go link it waited on.
+    exec_started_ms: Option<u64>,
 }
 
 /// A completed target retained for the "slowest" table.
@@ -407,7 +415,7 @@ impl Tally {
                 // nothing to infer here.
                 if let Some(rec) = self.live.get_mut(addr.as_str()) {
                     rec.phase = Some((Phase::Execute, at));
-                    rec.executed = true;
+                    rec.exec_started_ms.get_or_insert(at);
                     if rec.driver.is_none() {
                         rec.driver = Some(driver.as_str().into());
                     }
@@ -627,11 +635,13 @@ impl Tally {
             self.matched_done = self.matched_done.saturating_add(1);
         }
 
+        // From its own `ExecuteStart` to its `ResultEnd`: the run and its cache
+        // write, none of the wait for its deps or for admission.
         if let Some(rec) = &rec
             && error.is_none()
-            && rec.executed
+            && let Some(exec_started_ms) = rec.exec_started_ms
         {
-            let duration_ms = at.saturating_sub(rec.started_ms);
+            let duration_ms = at.saturating_sub(exec_started_ms);
             self.push_slowest(Completed {
                 duration_ms,
                 addr: addr.to_string(),
@@ -649,6 +659,9 @@ impl Tally {
     }
 
     fn push_slowest(&mut self, c: Completed) {
+        if c.duration_ms < SLOWEST_MIN_MS {
+            return;
+        }
         if self.slowest.len() < SLOWEST_KEPT {
             self.slowest.push(Reverse(c));
             return;
@@ -1227,18 +1240,18 @@ mod tests {
         let mut t = Tally::default();
         // 1000 completions of increasing duration; only the top 20 are retained.
         for i in 0..1_000u64 {
-            exec(&mut t, &format!("//a:t{i}"), 0, i);
+            exec(&mut t, &format!("//a:t{i}"), 0, SLOWEST_MIN_MS + i);
         }
         let slowest = t.slowest();
         assert_eq!(slowest.len(), SLOWEST_KEPT, "heap bounded");
         assert_eq!(
             slowest.first().map(|c| c.duration_ms),
-            Some(999),
+            Some(SLOWEST_MIN_MS + 999),
             "longest first"
         );
         assert_eq!(
             slowest.last().map(|c| c.duration_ms),
-            Some(980),
+            Some(SLOWEST_MIN_MS + 980),
             "keeps the longest, not the first seen"
         );
         assert!(
@@ -1247,6 +1260,49 @@ mod tests {
                 .all(|w| w[0].duration_ms >= w[1].duration_ms),
             "ordered"
         );
+    }
+
+    /// A target is requested (`ResultStart`) before its deps resolve, so its
+    /// wait on them must not count toward its duration. The production case: a
+    /// relocating `group` over a Go binary was listed at 47s, the time the Go
+    /// link took, while its own run took milliseconds.
+    #[test]
+    fn slowest_counts_from_execute_start_not_from_the_wait_on_deps() {
+        let mut t = Tally::default();
+        let start = |t: &mut Tally, addr: &str, at: u64| {
+            t.apply(&ev(at, BuildEventKind::ResultStart { addr: addr.into() }));
+        };
+        // Both requested at 0; the group waits on the binary for 47s.
+        start(&mut t, "//svc:image_bin", 0);
+        start(&mut t, "//svc:bin", 0);
+        exec(&mut t, "//svc:bin", 100, 47_000);
+        exec(&mut t, "//svc:image_bin", 47_000, 47_005);
+        // A target that waited 40s on its deps, then ran for 3s.
+        start(&mut t, "//svc:test", 0);
+        exec(&mut t, "//svc:test", 40_000, 43_000);
+
+        let rows: Vec<(String, u64)> = t
+            .slowest()
+            .into_iter()
+            .map(|c| (c.addr, c.duration_ms))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("//svc:bin".to_string(), 46_900),
+                ("//svc:test".to_string(), 3_000),
+            ],
+            "own run only; the 5ms group is not a slow target"
+        );
+    }
+
+    #[test]
+    fn slowest_leaves_out_targets_under_a_second() {
+        let mut t = Tally::default();
+        exec(&mut t, "//a:quick", 0, SLOWEST_MIN_MS - 1);
+        exec(&mut t, "//a:second", 0, SLOWEST_MIN_MS);
+        let addrs: Vec<String> = t.slowest().into_iter().map(|c| c.addr).collect();
+        assert_eq!(addrs, vec!["//a:second".to_string()]);
     }
 
     #[test]
