@@ -516,6 +516,13 @@ impl ProviderTrait for Provider {
         self.inner.probe(req, ctoken)
     }
 
+    fn scope_ended<'a>(
+        &'a self,
+        ended: hplugin::scope::ScopeEnded,
+    ) -> BoxFuture<'a, anyhow::Result<hplugin::scope::ScopeEndedAck>> {
+        self.inner.scope_ended(ended)
+    }
+
     fn state_schema(&self) -> Option<hplugin::provider::StateSchema> {
         self.go_state_schema()
     }
@@ -1164,6 +1171,15 @@ impl ProviderInner {
         _ctoken: &'a (dyn Cancellable + Send + Sync),
     ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
         Box::pin(async move { Ok(ProbeResponse { states: vec![] }) })
+    }
+
+    /// The scope's caches are released here. The go caches are not per scope
+    /// yet, so there is nothing to release: answered as the trait's default.
+    fn scope_ended<'a>(
+        &'a self,
+        _ended: hplugin::scope::ScopeEnded,
+    ) -> BoxFuture<'a, anyhow::Result<hplugin::scope::ScopeEndedAck>> {
+        Box::pin(async { Ok(hplugin::scope::ScopeEndedAck::Unsupported) })
     }
 }
 

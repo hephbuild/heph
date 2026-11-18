@@ -276,7 +276,8 @@ impl Engine {
                             .cloned()
                             .collect(),
                         Arc::clone(&executor),
-                    ),
+                    )
+                    .with_cache_scope(rs.cache_scope()),
                     rs.ctoken(),
                 )
                 .await?;

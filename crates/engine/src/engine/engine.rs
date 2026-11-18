@@ -689,6 +689,9 @@ fn sweep_stale_sandboxfuse_dirs(home: &Path) {
 pub struct Provider {
     pub name: String,
     pub provider: Box<dyn SDKProvider>,
+    /// This engine has reported that the provider answers `scope_ended` with
+    /// `Unsupported` — once per provider per engine, not once per scope.
+    pub(crate) scope_ended_unsupported_reported: std::sync::atomic::AtomicBool,
 }
 
 pub struct Driver {
@@ -1297,6 +1300,7 @@ impl Engine {
                 Some(Arc::new(Provider {
                     name: resolve_component_name(name, &local, "provider")?,
                     provider,
+                    scope_ended_unsupported_reported: std::sync::atomic::AtomicBool::new(false),
                 }))
             }
             None => None,

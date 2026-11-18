@@ -373,7 +373,7 @@ impl Engine {
                                 .cloned()
                                 .collect(),
                             Arc::clone(&executor),
-                        ), rs.ctoken()).await
+                        ).with_cache_scope(rs.cache_scope()), rs.ctoken()).await
                             // Drained before the next await.
                             .and_then(|it| it.collect::<anyhow::Result<Vec<_>>>());
                         let raw = match listed {

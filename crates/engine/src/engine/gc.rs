@@ -775,13 +775,7 @@ impl Engine {
         self: Arc<Self>,
         rs: &Arc<RequestState>,
     ) -> Vec<(Addr, Decision)> {
-        let resolve_rs = self.new_state_full(
-            false,
-            rs.events_sender(),
-            rs.bg_pending(),
-            Self::DEFAULT_LOG_TAIL_LINES,
-            None,
-        );
+        let resolve_rs = self.new_nested_state(rs);
         // Phase 1 resolves, and resolving executes shared cacheable deps — each
         // of which would otherwise record a post-write trim that fires when this
         // state drops, i.e. concurrently with phase 2's write locks. This sweep

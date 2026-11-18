@@ -464,6 +464,18 @@ pub struct RequestStateData {
     /// request sees it, and a [`hash_only`](Self::hash_only) request — which is
     /// a separate `RequestStateData` — never does.
     selection: std::sync::OnceLock<Selection>,
+    /// The provider cache scope this request's provider calls run in.
+    ///
+    /// Minted by a root request; every state derived from it shares it — the
+    /// `with_parent` / `speculative` children through this `RequestStateData`,
+    /// the nested hash-only and gc/clean/failure-gc states by inheriting it
+    /// ([`ScopeSource::Inherit`]). Dropping the last holder ends the scope, and
+    /// the engine then tells every provider (`Engine::mint_cache_scope`).
+    ///
+    /// Inheriting shares the scope, never the `request_id`: fs keys its glob
+    /// caches by request id, and the in_place write-back guard depends on a
+    /// fresh one to re-stat the tree.
+    cache_scope: hplugin::scope::CacheScope,
     /// Post-write `cache.history` trims held back until this request's cache
     /// read guards are gone.
     ///
@@ -824,6 +836,12 @@ impl RequestState {
 
     pub fn ctoken(&self) -> &StdCancellationToken {
         &self.data.ctoken
+    }
+
+    /// The provider cache scope this request runs in: every provider request
+    /// the engine builds carries it (`with_cache_scope`).
+    pub fn cache_scope(&self) -> &hplugin::scope::CacheScope {
+        &self.data.cache_scope
     }
 
     pub fn fail_fast(&self) -> bool {
@@ -1472,13 +1490,25 @@ impl hbuiltins::pluginfs::CodegenReport for EngineCodegenReport {
     }
 }
 
+/// Where a new request's provider cache scope comes from.
+#[derive(Clone, Copy)]
+enum ScopeSource<'a> {
+    /// A root request: a scope of its own.
+    Mint,
+    /// A request nested inside another (the in_place re-read, gc's phase 1,
+    /// clean's selection walk, failure-gc's resolution): the enclosing
+    /// request's scope, so providers answer it from the same snapshot.
+    Inherit(&'a RequestState),
+}
+
 /// How a request built by `Engine::new_state_inner` behaves beyond its
 /// front-end options.
-#[derive(Debug, Clone, Copy)]
-struct RequestMode {
+#[derive(Clone, Copy)]
+struct RequestMode<'a> {
     /// See [`RequestStateData::hash_only`].
     hash_only: bool,
     listed_facts_trust: crate::engine::listed::ListedFactsTrust,
+    scope: ScopeSource<'a>,
 }
 
 impl Engine {
@@ -1530,6 +1560,30 @@ impl Engine {
             RequestMode {
                 hash_only: false,
                 listed_facts_trust: self.cfg.listed_facts_trust,
+                scope: ScopeSource::Mint,
+            },
+        )
+    }
+
+    /// A request nested inside `outer` that resolves under a state of its
+    /// own — gc's phase 1, clean's selection walk, failure-gc's resolution —
+    /// so the read locks it takes drop with it, before the caller's deletes.
+    ///
+    /// It shares `outer`'s event stream, background counter and provider
+    /// cache scope (providers answer it from `outer`'s snapshot), not its
+    /// request id or memoizers. Not fail-fast: one target failing to resolve
+    /// must not abort the sweep.
+    pub(crate) fn new_nested_state(self: &Arc<Self>, outer: &RequestState) -> Arc<RequestState> {
+        self.new_state_inner(
+            false,
+            outer.events_sender(),
+            outer.bg_pending(),
+            Self::DEFAULT_LOG_TAIL_LINES,
+            None,
+            RequestMode {
+                hash_only: false,
+                listed_facts_trust: self.cfg.listed_facts_trust,
+                scope: ScopeSource::Inherit(outer),
             },
         )
     }
@@ -1549,6 +1603,7 @@ impl Engine {
             RequestMode {
                 hash_only: false,
                 listed_facts_trust: trust,
+                scope: ScopeSource::Mint,
             },
         )
     }
@@ -1567,8 +1622,14 @@ impl Engine {
     ///
     /// `listed_facts_trust` is the enclosing request's: a query target the
     /// nested request re-resolves must see the dep set the outer one did.
+    ///
+    /// `root` is the request it is nested inside. The new request inherits its
+    /// provider cache scope, so BUILD files and package listings are not
+    /// re-evaluated per in_place target; it gets a request id of its own, so
+    /// `@heph/fs` (whose glob caches key by request id) re-stats the tree.
     pub fn new_hash_only_state(
         self: &Arc<Self>,
+        root: &RequestState,
         parent: Addr,
         listed_facts_trust: crate::engine::listed::ListedFactsTrust,
     ) -> Arc<RequestState> {
@@ -1581,6 +1642,7 @@ impl Engine {
             RequestMode {
                 hash_only: true,
                 listed_facts_trust,
+                scope: ScopeSource::Inherit(root),
             },
         )
         .with_parent(parent)
@@ -1596,19 +1658,27 @@ impl Engine {
         RequestMode {
             hash_only,
             listed_facts_trust,
-        }: RequestMode,
+            scope,
+        }: RequestMode<'_>,
     ) -> Arc<RequestState> {
         // A request is past registration by construction (the engine is
         // shared), so every request starts with the function registry sealed —
         // whichever provider path it takes to a BUILD evaluation.
         self.seal_functions();
-        // Unique per top-level request. `with_parent`/`with_skip_provider`
-        // children share this `RequestStateData` (and thus this id), so a request
-        // subtree keys into one bucket of any per-request cache (e.g. pluginfs's
-        // exclude-`Any` cache, pruned in `Drop`).
+        // Unique per request, nested ones included. `with_parent` /
+        // `with_skip_provider` children share this `RequestStateData` (and thus
+        // this id), so a request subtree keys into one bucket of any
+        // per-request cache — pluginfs's exclude-`Any` and glob-result caches.
+        // Nothing prunes those buckets when the request drops yet; that is the
+        // fs plugin's sweep against `Engine::requests` (per-request provider
+        // caches, D15/D28), not anything this `Drop` does.
         static NEXT_REQUEST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = NEXT_REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let request_id = format!("req-{n}");
+        let cache_scope = match scope {
+            ScopeSource::Mint => self.mint_cache_scope(&bg_pending),
+            ScopeSource::Inherit(outer) => outer.cache_scope().clone(),
+        };
         let data = Arc::new(RequestStateData {
             engine: Arc::downgrade(self),
             request_id: request_id.clone(),
@@ -1646,6 +1716,7 @@ impl Engine {
             approval,
             hash_only,
             selection: std::sync::OnceLock::new(),
+            cache_scope,
             deferred_trims: DeferredTrims {
                 engine: Arc::downgrade(self),
                 bg_pending,
