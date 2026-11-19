@@ -1503,15 +1503,6 @@ impl Engine {
         self.hooks.clone()
     }
 
-    /// Await every hook's in-flight delivery/flush. Called at command teardown,
-    /// after the request state (and thus its `on_close`) has dropped, so an
-    /// out-of-process hook's final write completes before the process exits.
-    pub async fn await_hooks(&self) {
-        for h in &self.hooks {
-            h.drain().await;
-        }
-    }
-
     /// Registers a YAML-selected builtin: `factory` runs only when a
     /// `plugins: - { builtin: <name> }` entry selects it (see
     /// [`Self::apply_builtin`]), with that entry's `options:`.

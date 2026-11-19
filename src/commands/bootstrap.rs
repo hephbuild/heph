@@ -37,7 +37,8 @@ pub fn build_runtime() -> std::io::Result<Runtime> {
 /// Every command entry point funnels through here so the blocking-pool sizing
 /// in `build_runtime` applies uniformly (the plain `#[tokio::main]` attribute
 /// can't express `max_blocking_threads`). Builds the tuned runtime, drives
-/// `fut` to completion, and lets the runtime drop normally at end of scope.
+/// `fut` to completion, drains the hooks of every engine the command built
+/// ([`HookDrain`]), and lets the runtime drop normally at end of scope.
 ///
 /// Critical teardown — FUSE unmount, SQLite flush, sandbox rmdir (all in
 /// `Engine::drop`), plus the sandbox-cleanup queue the renderer waits on — has
@@ -45,9 +46,76 @@ pub fn build_runtime() -> std::io::Result<Runtime> {
 /// its drop completes before `fut` resolves. The runtime drop only joins idle
 /// worker/blocking threads after that.
 pub fn block_on<F: Future>(fut: F) -> anyhow::Result<F::Output> {
-    Ok(build_runtime()
-        .context("build tokio runtime")?
-        .block_on(fut))
+    block_on_draining(fut, &HOOKS)
+}
+
+/// [`block_on`] over a given [`HookDrain`], so a test can use its own.
+fn block_on_draining<F: Future>(fut: F, hooks: &HookDrain) -> anyhow::Result<F::Output> {
+    let runtime = build_runtime().context("build tokio runtime")?;
+    let out = runtime.block_on(fut);
+    // On this runtime, not after it: a cdylib hook's delivery task was
+    // spawned here, and dropping the runtime would cancel it.
+    runtime.block_on(hooks.drain(HOOK_DRAIN_BUDGET));
+    Ok(out)
+}
+
+/// The hooks of every engine [`new_engine`] built in this process.
+static HOOKS: HookDrain = HookDrain::new();
+
+/// How long a command's exit waits on its hooks' final writes.
+///
+/// The gha hook bounds its own close-time sync to 10s; this is the ceiling for
+/// a hook that bounds nothing, so a hung plugin delays the exit rather than
+/// holding it forever.
+const HOOK_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Hooks to drain when the command ends.
+///
+/// A request's end only *signals* its hooks (`on_close`); an out-of-process
+/// hook's final write — the gha plugin's last comment edit — lands after that,
+/// and only [`Hook::drain`](engine::hook::Hook::drain) waits for it. Every
+/// command used to exit without that wait except `heph run`, so the comment of
+/// a `heph query` or `heph inspect` kept whatever it said before its last edit
+/// was cut off.
+///
+/// Held here rather than reached through the engine: the engine has dropped by
+/// the time the command's future resolves. Holding a hook past its engine is
+/// safe because a plugin's library is never unloaded (`load_stable` leaks it).
+pub(crate) struct HookDrain(std::sync::Mutex<Vec<Arc<dyn engine::hook::Hook>>>);
+
+impl HookDrain {
+    const fn new() -> Self {
+        Self(std::sync::Mutex::new(Vec::new()))
+    }
+
+    fn add(&self, hooks: impl IntoIterator<Item = Arc<dyn engine::hook::Hook>>) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(hooks);
+    }
+
+    /// Await every added hook's drain, within `budget` overall. Each hook is
+    /// drained once: they are taken out as they are drained.
+    async fn drain(&self, budget: std::time::Duration) {
+        let hooks = std::mem::take(
+            &mut *self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        if hooks.is_empty() {
+            return;
+        }
+        let all = futures::future::join_all(hooks.iter().map(|h| h.drain()));
+        if tokio::time::timeout(budget, all).await.is_err() {
+            tracing::warn!(
+                budget_s = budget.as_secs(),
+                hooks = ?hooks.iter().map(|h| h.name()).collect::<Vec<_>>(),
+                "a hook did not finish its final write in time; exiting without it"
+            );
+        }
+    }
 }
 
 /// Producer-side handle for the in-process shutdown signal. Both the SIGINT
@@ -405,6 +473,9 @@ fn new_engine_with(
         remote_cache_backends,
     );
 
+    // Drained when the command ends, whichever command it is.
+    HOOKS.add(engine.hooks());
+
     let (trigger, rx) = ShutdownTrigger::new();
     spawn_sigint_producer(trigger.clone());
     spawn_shutdown_handler(Arc::downgrade(&engine), rx);
@@ -597,6 +668,85 @@ fn hard_abort(exit: impl FnOnce(i32)) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A hook whose final write is a task on the command's runtime, as a cdylib
+    /// hook's delivery task is: `drain` waits for it.
+    #[derive(Default)]
+    struct SlowFlush {
+        task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+        written: std::sync::atomic::AtomicBool,
+        drains: std::sync::atomic::AtomicUsize,
+    }
+
+    impl engine::hook::Hook for SlowFlush {
+        fn name(&self) -> String {
+            "slow".to_string()
+        }
+        fn on_event(&self, _: &hcore::events::BuildEvent) {}
+        fn on_close(&self) {}
+        fn drain(&self) -> futures::future::BoxFuture<'_, ()> {
+            Box::pin(async move {
+                self.drains
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let task = self.task.lock().expect("lock").take();
+                if let Some(t) = task {
+                    t.await.expect("flush task");
+                }
+            })
+        }
+    }
+
+    #[test]
+    fn a_command_exits_only_after_its_hooks_final_write() {
+        // Every command but `heph run` used to return without draining, so the
+        // process could exit with a hook's last write still in flight: the gha
+        // comment of a `heph query` kept its stale state.
+        let hooks = HookDrain::new();
+        let hook = Arc::new(SlowFlush::default());
+        hooks.add([Arc::clone(&hook) as Arc<dyn engine::hook::Hook>]);
+        let h = Arc::clone(&hook);
+        block_on_draining(
+            async move {
+                // The request ends, its hook starts the final write, and the
+                // command returns without waiting for it.
+                let h2 = Arc::clone(&h);
+                let task = tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    h2.written.store(true, std::sync::atomic::Ordering::SeqCst);
+                });
+                *h.task.lock().expect("lock") = Some(task);
+            },
+            &hooks,
+        )
+        .expect("runtime");
+        assert!(hook.written.load(std::sync::atomic::Ordering::SeqCst));
+
+        // Drained once: a second command in the same process does not wait on
+        // the first one's hooks again.
+        block_on_draining(async {}, &hooks).expect("runtime");
+        assert_eq!(hook.drains.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_hook_that_never_finishes_does_not_hold_the_exit() {
+        struct Hung;
+        impl engine::hook::Hook for Hung {
+            fn name(&self) -> String {
+                "hung".to_string()
+            }
+            fn on_event(&self, _: &hcore::events::BuildEvent) {}
+            fn on_close(&self) {}
+            fn drain(&self) -> futures::future::BoxFuture<'_, ()> {
+                Box::pin(futures::future::pending())
+            }
+        }
+        let hooks = HookDrain::new();
+        hooks.add([Arc::new(Hung) as Arc<dyn engine::hook::Hook>]);
+        let runtime = build_runtime().expect("runtime");
+        let started = std::time::Instant::now();
+        runtime.block_on(hooks.drain(std::time::Duration::from_millis(100)));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
 
     /// `--keep-failed-sandboxes` reaches the engine's config through the one
     /// function every command builds it with; without it, a failed target's

@@ -1102,12 +1102,9 @@ async fn execute_async(
     if let Some(w) = &watchdog {
         w.stop();
     }
-    // The app's request state has dropped now (firing each hook's `on_close`);
-    // await any hook's final out-of-process flush before returning so a process
-    // exit never races it.
-    engine.await_hooks().await;
-    // An entrypoint's tool ended: heph exits as it did, now that the TUI has
-    // torn down.
+    // Hooks' final writes are awaited by `bootstrap::block_on`, as for every
+    // command. An entrypoint's tool ended: heph exits as it did, now that the
+    // TUI has torn down.
     match result? {
         None | Some(hcore::process::Exit::Code(0)) => Ok(()),
         Some(exit) => Err(ToolExit(exit).into()),
