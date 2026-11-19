@@ -1543,4 +1543,114 @@ mod tests {
         );
         drop(held);
     }
+
+    /// Where a [`WedgedRemote`] stops answering.
+    #[derive(Clone, Copy, Debug)]
+    enum WedgeAt {
+        /// Listing the lineage's heads.
+        List,
+        /// Reading a head's `.meta`.
+        Meta,
+        /// Opening the snapshot itself.
+        Snapshot,
+    }
+
+    /// A remote that accepts requests and, from `at` on, never answers them —
+    /// the shape of a cache behind a dead VPN, where a request is neither
+    /// refused nor served.
+    struct WedgedRemote {
+        at: WedgeAt,
+        meta: Vec<u8>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::engine::remote_cache::RemoteCacheBackend for WedgedRemote {
+        async fn open_read(
+            &self,
+            key: &str,
+        ) -> anyhow::Result<Option<std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>>> {
+            match self.at {
+                WedgeAt::Snapshot if key.ends_with(".meta") => {
+                    Ok(Some(Box::pin(std::io::Cursor::new(self.meta.clone()))))
+                }
+                _ => std::future::pending().await,
+            }
+        }
+        async fn open_write(
+            &self,
+            _key: &str,
+        ) -> anyhow::Result<std::pin::Pin<Box<dyn tokio::io::AsyncWrite + Send>>> {
+            anyhow::bail!("read-only")
+        }
+        async fn exists(&self, _key: &str) -> anyhow::Result<bool> {
+            std::future::pending().await
+        }
+        async fn list_names(&self, _prefix: &str) -> anyhow::Result<Vec<String>> {
+            match self.at {
+                WedgeAt::List => std::future::pending().await,
+                WedgeAt::Meta | WedgeAt::Snapshot => Ok(vec!["1.abc.meta".to_string()]),
+            }
+        }
+    }
+
+    /// A remote that has stopped answering costs a cold scratch, after a bounded
+    /// wait — never a prepare that hangs while holding the slot.
+    ///
+    /// The prepare runs under the slot's lock, so a hung remote read here wedges
+    /// every target sharing the cache and everything downstream of them. In the
+    /// field that was a 45-minute stall with every worker idle, behind a cache
+    /// whose artifact reads had already timed out and tripped the breaker: the
+    /// scratch path went around both.
+    ///
+    /// Paused time, so the bound is checked without waiting it out: the clock
+    /// jumps to the next timer whenever the runtime is idle. Without a bound on
+    /// the remote read the only timer left is the guard's, and the test fails
+    /// on it instead of hanging.
+    #[tokio::test(start_paused = true)]
+    async fn a_wedged_remote_starts_the_scratch_cold_instead_of_hanging() {
+        for at in [WedgeAt::List, WedgeAt::Meta, WedgeAt::Snapshot] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let (mut engine, _rec) = recording_engine(tmp.path());
+            let meta = borsh::to_vec(&crate::engine::scratch_remote::SnapshotMeta {
+                format: crate::engine::scratch_remote::SNAPSHOT_FORMAT,
+                scope: String::new(),
+                generation: 1,
+                parent_scope: String::new(),
+                parent_generation: 0,
+                bytes: 1,
+                heph_version: "test".into(),
+                producer: String::new(),
+                content_hash: "abc".into(),
+                produced_at: "/elsewhere".into(),
+            })
+            .expect("encode meta");
+            let home = engine.home.to_path_buf();
+            Arc::get_mut(&mut engine)
+                .expect("engine is not shared yet")
+                .remote_caches = crate::engine::RemoteCacheSet::with_backend(
+                Arc::new(WedgedRemote { at, meta }),
+                home,
+            );
+            let rs = engine.new_state_with_events(true, None);
+            let mut r = resolved(Access::Exclusive);
+            r.def.remote = true;
+
+            let started = tokio::time::Instant::now();
+            let (dir, prepared) = tokio::time::timeout(
+                std::time::Duration::from_secs(30 * 60),
+                engine.prepare_scratch_dir(&rs, "//app:a", &r.slot(), &r, false),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("wedged at {at:?}: the prepare must not hang"))
+            .expect("a dead remote is a cold cache, not a failed build");
+
+            assert_eq!(prepared, Prepared::Cold, "wedged at {at:?}");
+            assert!(dir.is_dir(), "wedged at {at:?}: the mount point must exist");
+            let waited = started.elapsed();
+            assert!(
+                waited <= std::time::Duration::from_secs(2 * 60),
+                "wedged at {at:?}: one wedged request is one metadata timeout, waited {waited:?}",
+            );
+        }
+    }
 }

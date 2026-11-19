@@ -1004,6 +1004,123 @@ impl RemoteRevision {
     }
 }
 
+/// One readable cache as the scratch lineage reads it, handed out by
+/// [`RemoteCacheSet::scratch_sources`].
+///
+/// Each read is bounded the way the matching artifact read is — a listing or a
+/// `.meta` read as a metadata request, a snapshot as a blob — and its outcome
+/// feeds the cache's breaker, so scratch and artifact reads see one health
+/// record: either path's failures pause the cache for both.
+pub struct ScratchSource<'a> {
+    cache: &'a ConfiguredCache,
+}
+
+impl std::fmt::Debug for ScratchSource<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScratchSource")
+            .field("cache", &self.cache.def.name)
+            .finish()
+    }
+}
+
+impl ScratchSource<'_> {
+    /// The cache's configured name.
+    pub fn name(&self) -> &str {
+        &self.cache.def.name
+    }
+
+    /// Every object name under `prefix`.
+    pub async fn list_names(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+        let what = format!("list remote scratch heads under {prefix}");
+        self.checked(
+            "scratch list",
+            self.cache
+                .meta_op(&what, self.cache.backend.list_names(prefix)),
+        )
+        .await
+    }
+
+    /// A small object, whole — a snapshot's `.meta`. `None` when it is absent.
+    ///
+    /// Open and body share one [`METADATA_TIMEOUT`]: the object is a few
+    /// hundred bytes, so a body that outlasts the bound is a wedged connection,
+    /// not a large transfer.
+    pub async fn read_small(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        let what = format!("read remote scratch meta {key}");
+        let read = async {
+            let Some(mut r) = self.cache.backend.open_read(key).await? else {
+                return Ok(None);
+            };
+            let mut buf = Vec::new();
+            tokio::io::AsyncReadExt::read_to_end(&mut r, &mut buf)
+                .await
+                .with_context(|| format!("read remote object {key}"))?;
+            Ok(Some(buf))
+        };
+        self.checked("scratch meta read", self.cache.meta_op(&what, read))
+            .await
+    }
+
+    /// A snapshot, whole. `None` when it is absent.
+    ///
+    /// Read as a blob is: a bulk slot held for the stream, the open under
+    /// [`METADATA_TIMEOUT`] (it is a round trip with no body yet), and the body
+    /// under the backend's inactivity bound, which a large snapshot on a slow
+    /// link can outlast legitimately and a stalled one cannot.
+    pub async fn read_snapshot(&self, key: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        let read = async {
+            observe_transfer_slots(self.cache);
+            let _slot = self
+                .cache
+                .shared_slots
+                .acquire()
+                .await
+                .with_context(|| format!("acquire remote cache blob slot for {key}"))?;
+            let opened = tokio::time::timeout(METADATA_TIMEOUT, self.cache.backend.open_read(key))
+                .await
+                .with_context(|| {
+                    format!(
+                        "open remote scratch snapshot {key} timed out after {METADATA_TIMEOUT:?}"
+                    )
+                })??;
+            let Some(mut r) = opened else {
+                return Ok(None);
+            };
+            let mut buf = Vec::new();
+            tokio::io::AsyncReadExt::read_to_end(&mut r, &mut buf)
+                .await
+                .with_context(|| format!("download remote scratch snapshot {key}"))?;
+            Ok(Some(buf))
+        };
+        self.checked("scratch pull", read).await
+    }
+
+    /// Run `fut` unless the breaker opened since this source was handed out,
+    /// and record its outcome on the breaker.
+    ///
+    /// Rechecked per read because a head walk makes several in a row — a list
+    /// and a `.meta` per entry, for each scope — and a cache that trips partway
+    /// through must stop costing a timeout per remaining request.
+    async fn checked<T>(
+        &self,
+        op: &str,
+        fut: impl Future<Output = anyhow::Result<T>>,
+    ) -> anyhow::Result<T> {
+        if self.cache.broken() {
+            anyhow::bail!(
+                "remote cache `{}` is paused after repeated failures",
+                self.cache.def.name
+            );
+        }
+        let res = fut.await;
+        match &res {
+            Ok(_) => self.cache.note_ok(),
+            Err(e) => self.cache.note_err(op, e),
+        }
+        res
+    }
+}
+
 /// The ordered set of remote caches. Empty when no `caches:` are configured, in
 /// which case every method is a cheap no-op and the engine behaves exactly as
 /// before.
@@ -1106,12 +1223,20 @@ impl RemoteCacheSet {
     /// (`scratch/v1/…`) and cannot go through the revision/manifest paths above —
     /// a scratch is keyed by a declaration and a branch, not by an input hash, so
     /// none of the addr/hashin plumbing applies to it.
-    pub async fn readable_backends(&self) -> Vec<(String, Arc<dyn RemoteCacheBackend>)> {
+    ///
+    /// A [`ScratchSource`], not the bare backend: every read through it takes
+    /// the same breaker, metadata bound and request budget as an artifact read.
+    /// Handing out the backend let a scratch pull go around all three, so a
+    /// cache whose artifact reads had already timed out and tripped the breaker
+    /// still held a scratch prepare — and the slot lock under it — for as long
+    /// as object_store kept retrying.
+    pub async fn scratch_sources(&self) -> Vec<ScratchSource<'_>> {
         let order = self.read_order().await;
         order
             .iter()
             .filter_map(|&i| self.caches.get(i))
-            .map(|c| (c.def.name.clone(), Arc::clone(&c.backend)))
+            .filter(|c| !c.broken())
+            .map(|cache| ScratchSource { cache })
             .collect()
     }
 
@@ -2526,6 +2651,74 @@ mod tests {
         async fn list_names(&self, _prefix: &str) -> anyhow::Result<Vec<String>> {
             anyhow::bail!("auth failed")
         }
+    }
+
+    /// Backend whose listings fail, counting how many it was asked for.
+    #[derive(Default)]
+    struct CountingFailBackend {
+        lists: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl RemoteCacheBackend for CountingFailBackend {
+        async fn open_read(
+            &self,
+            _key: &str,
+        ) -> anyhow::Result<Option<Pin<Box<dyn AsyncRead + Send>>>> {
+            anyhow::bail!("unreachable")
+        }
+        async fn open_write(&self, _key: &str) -> anyhow::Result<Pin<Box<dyn AsyncWrite + Send>>> {
+            anyhow::bail!("unreachable")
+        }
+        async fn exists(&self, _key: &str) -> anyhow::Result<bool> {
+            anyhow::bail!("unreachable")
+        }
+        async fn list_names(&self, _prefix: &str) -> anyhow::Result<Vec<String>> {
+            self.lists.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("unreachable")
+        }
+    }
+
+    /// Scratch reads share the cache's breaker in both directions: their
+    /// failures count towards pausing it, and a paused cache is not handed to
+    /// the scratch lineage at all — not even by a source taken out before the
+    /// breaker opened.
+    ///
+    /// Without both halves a dead cache costs every scratch prepare its full
+    /// timeout, under the slot lock, after the artifact path has already given
+    /// up on it.
+    #[tokio::test]
+    async fn scratch_reads_share_the_breaker() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let backend = Arc::new(CountingFailBackend::default());
+        let set = RemoteCacheSet::with_backend(backend.clone(), dir.path().to_path_buf());
+
+        let early = set.scratch_sources().await;
+        assert_eq!(early.len(), 1, "a healthy cache is a scratch source");
+        for _ in 0..FAILURE_THRESHOLD {
+            early[0]
+                .list_names("scratch/v1/")
+                .await
+                .expect_err("the backend fails every listing");
+        }
+
+        assert!(
+            set.scratch_sources().await.is_empty(),
+            "scratch failures must pause the cache for scratch reads",
+        );
+        let late = early[0]
+            .list_names("scratch/v1/")
+            .await
+            .expect_err("a paused cache must refuse without asking the backend");
+        assert!(
+            format!("{late:#}").contains("paused"),
+            "the refusal names the pause: {late:#}",
+        );
+        assert_eq!(
+            backend.lists.load(Ordering::SeqCst),
+            FAILURE_THRESHOLD,
+            "no request reaches a paused cache",
+        );
     }
 
     fn failing_set(home: PathBuf) -> Arc<RemoteCacheSet> {
