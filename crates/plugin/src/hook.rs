@@ -37,9 +37,11 @@ pub trait Hook: Send + Sync {
 
     /// Await any in-flight delivery/flush this hook still owes (e.g. an
     /// out-of-process hook waiting on the plugin to acknowledge it consumed the
-    /// full stream and wrote its final summary). The engine awaits this at
-    /// teardown, after [`on_close`](Hook::on_close), so a process exit never
-    /// races a hook's final write. Default: nothing to await.
+    /// full stream and wrote its final summary). The host awaits this once, when
+    /// the command ends — every command, after its requests' [`on_close`](Hook::on_close)
+    /// — so a process exit never races a hook's final write. The wait is bounded;
+    /// a drain that never finishes delays the exit, it does not hold it. Default:
+    /// nothing to await.
     fn drain(&self) -> BoxFuture<'_, ()> {
         Box::pin(async {})
     }

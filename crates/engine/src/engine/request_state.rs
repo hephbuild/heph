@@ -1397,7 +1397,8 @@ impl Drop for RequestStateData {
         }
         self.ctoken.cancel();
         // Signal end-of-stream to each hook so it can flush its final state. The
-        // host awaits the actual flush separately via `Engine::await_hooks`.
+        // host awaits the actual flush separately, at command teardown
+        // (`Hook::drain`, from `bootstrap::block_on`).
         for hook in &self.hooks {
             hook.on_close();
         }
