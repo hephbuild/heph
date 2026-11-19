@@ -275,8 +275,15 @@ pub(crate) fn render_live(t: &Tally, ctx: &RenderCtx<'_>, budget: usize) -> Stri
     let elapsed = t.elapsed_ms(ctx.now_ms);
 
     let status = if c.roots_total > 0 {
+        // The comment's last write comes after the stream closes, through this
+        // same renderer: it must not say the build is still going.
+        let when = if t.is_closed() {
+            format!("finished in {}", fmt_duration(elapsed))
+        } else {
+            format!("still running ({})", fmt_duration(elapsed))
+        };
         format!(
-            "## ❌ {} · **{} failed**{} · still running ({})\n\n",
+            "## ❌ {} · **{} failed**{} · {when}\n\n",
             ctx.heading,
             fmt_count(c.roots_total),
             if c.blocked > 0 {
@@ -284,7 +291,6 @@ pub(crate) fn render_live(t: &Tally, ctx: &RenderCtx<'_>, budget: usize) -> Stri
             } else {
                 String::new()
             },
-            fmt_duration(elapsed),
         )
     } else {
         format!(
@@ -348,7 +354,7 @@ pub(crate) fn render_live(t: &Tally, ctx: &RenderCtx<'_>, budget: usize) -> Stri
     push_admission_waits(&mut b, t, ctx);
     push_running_longest(&mut b, t, ctx);
 
-    if c.roots_total > 0 {
+    if c.roots_total > 0 && !t.is_closed() {
         b.push("\n_Build continues — remaining targets still running._\n");
     }
 
@@ -1541,6 +1547,20 @@ mod tests {
             md.contains("error in root0") && md.contains("error in root1"),
             "{md}"
         );
+    }
+
+    #[test]
+    fn a_failed_build_stops_saying_it_is_running_once_closed() {
+        // The comment's last write renders the live view of a closed tally. A
+        // failure used to keep "still running" in it forever.
+        let mut t = roots_with_tails(1, |_| "boom".to_string());
+        let open = render_live(&t, &ctx("heph run //...", 9_000), LIVE_SECTION_BUDGET);
+        assert!(open.contains("still running"), "{open}");
+        t.set_closed();
+        let md = render_live(&t, &ctx("heph run //...", 9_000), LIVE_SECTION_BUDGET);
+        assert!(!md.contains("still running"), "{md}");
+        assert!(!md.contains("Build continues"), "{md}");
+        assert!(md.contains("· finished in "), "{md}");
     }
 
     /// Prints the rendered views for eyeballing against the mockups in

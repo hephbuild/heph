@@ -920,8 +920,11 @@ seam. Do not put summary-content assertions there.
   fallback render at `progress.rs:1092`, and the stale doc comment at `progress.rs:2050` that
   advertises a header the code no longer produces).
 - Counts are **graph-wide**, not matched-only.
-- The comment is **always posted**, from job start. An earlier draft gated it behind a
+- The comment is **always posted**, from the build's first event. An earlier draft gated it behind a
   `comment: onFailureOrSlow` policy to avoid posting for short green steps; that was reversed —
   a comment that is always present is findable and predictable, which beats saving two API writes.
+  It waits for the first event rather than the hook's load because the hook loads for every
+  command: one that runs no build (`heph tool cache measure-latency`) emits nothing and, from a
+  cdylib, never gets `on_close`, so a comment posted at load read "⏳ heph tool" forever.
 - Diagrams: **one gantt, step summary only.** No SVG, no badges, no cone flowchart.
 - The hook **never** influences `fail_fast`; it reports the mode.

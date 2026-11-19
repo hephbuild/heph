@@ -723,6 +723,11 @@ impl Tally {
         self.closed = true;
     }
 
+    /// The event stream has ended: the build is over.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed
+    }
+
     pub(crate) fn counters(&self) -> Counters {
         Counters {
             cache: self.cache,
