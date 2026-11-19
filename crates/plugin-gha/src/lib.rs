@@ -112,34 +112,82 @@ const MAX_COMMAND_LABEL: usize = 120;
 /// `std::env::args()` publishes every flag — including any `--define`/`--env`
 /// carrying a secret.
 ///
-/// This is an **allowlist, not a blocklist**: only the subcommand and things
-/// that look like target selectors (`//…`, `:…`, `…`) are kept. A blocklist that
-/// tried to pair flags with their values would have to know which flags are
-/// boolean — get that wrong in one direction and a selector is dropped, wrong in
-/// the other and a secret is published. Recognising the two shapes worth showing
-/// cannot leak a `--define` value, because a secret does not look like a target.
+/// This is an **allowlist, not a blocklist**. Kept:
+///
+/// - target selectors (`//…`, `:…`, `…/...`, `...`), wherever they appear;
+/// - the `-e`/`--expr` query expression, which is a selector too;
+/// - a bare word (the subcommand path, `run`'s label) — but only when the
+///   argument before it is not a flag written without `=value`. The plugin
+///   cannot tell a boolean flag from one taking a value, so a word after
+///   `--flag` may be that flag's value and is dropped. That errs towards
+///   dropping a label (`heph run --force build //...` shows `run //...`), never
+///   towards publishing a `--token hunter2`.
+///
+/// Everything after `--` is an entrypoint's own arguments and is never shown.
 fn command_label() -> String {
     command_label_from(std::env::args().skip(1))
+}
+
+/// A target selector: always safe to show, since a secret does not look like
+/// a target.
+fn is_selector(arg: &str) -> bool {
+    arg.starts_with("//") || arg.starts_with(':') || arg.ends_with("...")
+}
+
+/// A subcommand name or a label: an identifier, short.
+fn is_word(arg: &str) -> bool {
+    const MAX_WORD: usize = 64;
+    let mut chars = arg.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        && arg.len() <= MAX_WORD
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
+/// A query expression as a code span. Backticks and angle brackets are
+/// dropped: the first could close the span, the second open an HTML comment
+/// inside a body whose sections are delimited by HTML comments.
+fn expr_part(expr: &str) -> String {
+    let clean: String = expr
+        .chars()
+        .filter(|c| !matches!(c, '`' | '<' | '>') && !c.is_control())
+        .collect();
+    format!("-e `{}`", clean.trim())
 }
 
 /// The filtering behind [`command_label`], over a supplied argument list so it
 /// can be tested without depending on how the test harness was invoked.
 fn command_label_from(args: impl Iterator<Item = String>) -> String {
     let mut parts: Vec<String> = Vec::new();
-    let mut have_subcommand = false;
+    // The previous argument was a flag with no `=value`: this one may be its
+    // value, so it is shown only if it is a selector.
+    let mut after_flag = false;
+    // The previous argument was `-e`/`--expr`: this one is the expression.
+    let mut expr_next = false;
     for arg in args {
+        if arg == "--" {
+            break;
+        }
+        if std::mem::take(&mut expr_next) {
+            parts.push(expr_part(&arg));
+            continue;
+        }
+        if arg == "-e" || arg == "--expr" {
+            expr_next = true;
+            continue;
+        }
+        if let Some(expr) = arg.strip_prefix("--expr=") {
+            parts.push(expr_part(expr));
+            after_flag = false;
+            continue;
+        }
         if arg.starts_with('-') {
+            after_flag = !arg.contains('=');
             continue;
         }
-        let is_selector = arg.starts_with("//") || arg.starts_with(':') || arg == "...";
-        if is_selector {
-            parts.push(arg);
-            continue;
-        }
-        // The first bare word is the subcommand (`run`, `query`, …). Later bare
-        // words are flag values and are dropped.
-        if !have_subcommand {
-            have_subcommand = true;
+        let maybe_flag_value = std::mem::take(&mut after_flag);
+        if is_selector(&arg) || (!maybe_flag_value && is_word(&arg)) {
             parts.push(arg);
         }
     }
@@ -559,6 +607,12 @@ struct Inner {
     comment: Option<CommentClient>,
     /// Set by `on_close` so the live-update thread exits.
     stop: AtomicBool,
+    /// Set by the first event. Nothing is posted before it: a command that runs
+    /// no build (`heph tool …`) emits no event and never closes the stream, so
+    /// a comment posted at startup would read "⏳" forever.
+    started: AtomicBool,
+    /// Live PATCH interval.
+    refresh: Duration,
     /// Threshold for "running longest" rows and lock-wait notices.
     slow_after_ms: u64,
     /// Link to the workflow run, when the Actions env provides one.
@@ -706,9 +760,9 @@ impl Inner {
 
     /// Write the live comment.
     ///
-    /// Unconditional: the comment is created at job start and kept current for
-    /// the whole run, so it is present and findable from the moment the job
-    /// begins rather than appearing partway through.
+    /// Unconditional once the build starts: the comment is created on its first
+    /// event and kept current for the whole run, so it is present and findable
+    /// from the moment the build begins rather than appearing partway through.
     fn sync_comment(&self, deadline: Option<Instant>) {
         let Some(c) = &self.comment else { return };
         c.sync(|| self.render_live(), deadline);
@@ -862,6 +916,8 @@ impl GhaHook {
             summary_path,
             comment,
             stop: AtomicBool::new(false),
+            started: AtomicBool::new(false),
+            refresh: Duration::from_secs(refresh_secs),
             slow_after_ms: slow_after_secs.saturating_mul(1000),
             run_url,
             json_path,
@@ -870,25 +926,35 @@ impl GhaHook {
             last_flush: Mutex::new(None),
         });
 
-        // Live updates run only when a comment is configured. A plain thread (no
-        // async runtime) keeps the hook free of runtime entanglement; it creates
-        // the comment up front so it is present from job start, then PATCHes it
-        // every `refreshSecs` until `on_close` sets `stop`.
-        if inner.comment.is_some() {
-            let t = Arc::clone(&inner);
-            std::thread::spawn(move || {
-                t.sync_comment(None);
-                while !t.stop.load(Ordering::Acquire) {
-                    std::thread::sleep(Duration::from_secs(refresh_secs));
-                    if t.stop.load(Ordering::Acquire) {
-                        break;
-                    }
-                    t.sync_comment(None);
-                }
-            });
-        }
-
         Ok(Self { inner })
+    }
+}
+
+impl Inner {
+    /// Start live updates, once, on the build's first event.
+    ///
+    /// Not at construction: the hook is loaded for every command, and one that
+    /// runs no build emits no event and gets no `on_close`, so a comment posted
+    /// up front stays "⏳" forever. A plain thread (no async runtime) keeps the
+    /// hook free of runtime entanglement; it posts the comment, then PATCHes it
+    /// every `refreshSecs` until `on_close` sets `stop`.
+    fn start(self: &Arc<Self>) {
+        // A load first: this runs on every event, and the swap is a write.
+        if self.started.load(Ordering::Acquire) || self.started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if self.comment.is_none() {
+            return;
+        }
+        let t = Arc::clone(self);
+        std::thread::spawn(move || {
+            while !t.stop.load(Ordering::Acquire) {
+                // Rendered under the comment lock, so a sync that loses the
+                // race with `on_close` still renders the closed tally.
+                t.sync_comment(None);
+                std::thread::sleep(t.refresh);
+            }
+        });
     }
 }
 
@@ -898,6 +964,7 @@ impl Hook for GhaHook {
     }
 
     fn on_event(&self, ev: &BuildEvent) {
+        self.inner.start();
         let newly_failed = {
             let mut t = self.inner.tally.lock().unwrap_or_else(|e| e.into_inner());
             let before = t.counters().roots_total;
@@ -922,10 +989,12 @@ impl Hook for GhaHook {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .set_closed();
-        self.inner
-            .sync_comment(Some(Instant::now() + CLOSE_SYNC_BUDGET));
+        // No event, no build: nothing was posted, and nothing should be now.
+        if self.inner.started.load(Ordering::Acquire) {
+            self.inner
+                .sync_comment(Some(Instant::now() + CLOSE_SYNC_BUDGET));
+        }
         // The summary is the durable report; the comment is only a notification.
-        // durable report, the comment is only a notification.
         self.inner.write_summary();
         self.inner.write_machine_surfaces();
     }
@@ -1214,6 +1283,55 @@ mod tests {
             "run //a:b"
         );
         assert_eq!(label_from(&["query", "..."]), "query ...");
+        // A flag's value that happens to look like a word is not taken for a
+        // label, even when the flag is boolean and it really is one.
+        assert_eq!(
+            label_from(&["run", "--force", "build", "//..."]),
+            "run //..."
+        );
+        // Entrypoint arguments are never shown.
+        assert_eq!(
+            label_from(&["run", "//t:go", "--", "//x:y", "secret"]),
+            "run //t:go"
+        );
+    }
+
+    #[test]
+    fn command_label_names_what_is_run() {
+        // `heph run <LABEL> <MATCHER>`: the label is what is run.
+        assert_eq!(label_from(&["run", "test", "//..."]), "run test //...");
+        // Global flags before the subcommand, with and without `=`.
+        assert_eq!(
+            label_from(&["-j", "4", "run", "--no-tui", "//a:b"]),
+            "run //a:b"
+        );
+        assert_eq!(label_from(&["-j=4", "run", "//a:b"]), "run //a:b");
+        // `-e EXPR`, in every spelling clap accepts that the label handles.
+        let expr = "//a/... && !label(slow)";
+        assert_eq!(
+            label_from(&["run", "-e", expr]),
+            "run -e `//a/... && !label(slow)`"
+        );
+        assert_eq!(
+            label_from(&["run", "--expr", expr]),
+            "run -e `//a/... && !label(slow)`"
+        );
+        assert_eq!(
+            label_from(&["run", &format!("--expr={expr}")]),
+            "run -e `//a/... && !label(slow)`"
+        );
+        // An expression cannot break out of its code span or open an HTML
+        // comment in the body.
+        assert_eq!(
+            label_from(&["run", "-e", "//a` <!-- x -->\n"]),
+            "run -e `//a !-- x --`"
+        );
+        // Relative matchers and subcommand paths.
+        assert_eq!(label_from(&["run", "build", "./..."]), "run build ./...");
+        assert_eq!(
+            label_from(&["tool", "cache", "measure-latency"]),
+            "tool cache measure-latency"
+        );
         // Over-long labels are capped rather than published whole.
         let long: Vec<String> = (0..100).map(|i| format!("//pkg{i}:target")).collect();
         let refs: Vec<&str> = long.iter().map(String::as_str).collect();

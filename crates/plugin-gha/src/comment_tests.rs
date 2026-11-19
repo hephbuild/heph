@@ -364,3 +364,67 @@ fn two_matrix_legs_do_not_share_a_comment() {
         "matrix legs must not share a comment"
     );
 }
+
+/// A hook whose comment goes to `c`, with no summary, JSON or annotations.
+fn hook_commenting_to(c: CommentClient) -> GhaHook {
+    GhaHook {
+        inner: Arc::new(Inner {
+            tally: Mutex::new(Tally::default()),
+            title: "heph run //...".to_string(),
+            summary_path: None,
+            comment: Some(c),
+            stop: AtomicBool::new(false),
+            started: AtomicBool::new(false),
+            // Long enough that the live thread writes once, at start.
+            refresh: Duration::from_secs(3600),
+            slow_after_ms: 30_000,
+            run_url: None,
+            json_path: None,
+            annotations: false,
+            annotated: Mutex::new(std::collections::HashSet::new()),
+            last_flush: Mutex::new(None),
+        }),
+    }
+}
+
+#[test]
+fn a_command_that_runs_no_build_posts_no_comment() {
+    // The hook loads for every command. `heph tool cache measure-latency` runs
+    // no build: no event, and from a cdylib not even an `on_close`. The comment
+    // used to be posted at load, so it said "⏳ heph tool" forever.
+    let gh = FakeGitHub::start(create_flow());
+    let hook = hook_commenting_to(CommentClient::new(config(&gh.url, "sec", "1-1")));
+    std::thread::sleep(Duration::from_millis(200));
+    hook.on_close();
+    assert_eq!(gh.hits(), 0, "no request at all: {:#?}", gh.requests());
+}
+
+#[test]
+fn a_failed_build_s_last_comment_is_final() {
+    // The comment's last write is the live view of the closed tally. With a
+    // failure it used to keep saying "still running" after heph had exited.
+    let gh = FakeGitHub::start(create_flow());
+    let hook = hook_commenting_to(CommentClient::new(config(&gh.url, "sec", "1-1")));
+    let ev = |at, kind| BuildEvent {
+        at_unix_ms: at,
+        kind,
+    };
+    hook.on_event(&ev(
+        1_000,
+        hcore::events::BuildEventKind::ResultEnd {
+            left_behind: None,
+            cancelled: false,
+            timed_out: None,
+            addr: "//a:broken".into(),
+            error: Some("target failed".into()),
+            upstream_of: None,
+            exit_status: Some("exit status: 1".into()),
+            log_tail: None,
+        },
+    ));
+    hook.on_close();
+    let body = gh.last_written_body().expect("the comment was written");
+    assert!(body.contains("//a:broken"), "{body}");
+    assert!(!body.contains("still running"), "{body}");
+    assert!(body.contains("finished in"), "{body}");
+}

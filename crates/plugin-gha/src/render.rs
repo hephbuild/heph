@@ -275,8 +275,15 @@ pub(crate) fn render_live(t: &Tally, ctx: &RenderCtx<'_>, budget: usize) -> Stri
     let elapsed = t.elapsed_ms(ctx.now_ms);
 
     let status = if c.roots_total > 0 {
+        // The comment's last write comes after the stream closes, through this
+        // same renderer: it must not say the build is still going.
+        let when = if t.is_closed() {
+            format!("finished in {}", fmt_duration(elapsed))
+        } else {
+            format!("still running ({})", fmt_duration(elapsed))
+        };
         format!(
-            "## ❌ {} · **{} failed**{} · still running ({})\n\n",
+            "## ❌ {} · **{} failed**{} · {when}\n\n",
             ctx.heading,
             fmt_count(c.roots_total),
             if c.blocked > 0 {
@@ -284,7 +291,6 @@ pub(crate) fn render_live(t: &Tally, ctx: &RenderCtx<'_>, budget: usize) -> Stri
             } else {
                 String::new()
             },
-            fmt_duration(elapsed),
         )
     } else {
         format!(
@@ -301,8 +307,37 @@ pub(crate) fn render_live(t: &Tally, ctx: &RenderCtx<'_>, budget: usize) -> Stri
         push_live_failures(&mut b, t, &c);
     }
 
-    // Counts + the freshness clock.
     b.push(&counts_line(t, &c));
+
+    if t.fail_fast() && c.roots_total > 0 {
+        b.push(
+            "\n> [!WARNING]\n> Stopped at the first failure (`--fail-fast`) — \
+             remaining targets were not attempted.\n",
+        );
+    }
+    push_scratch(&mut b, t);
+
+    // The comment's last write renders the closed tally. Everything below
+    // describes work in progress — the bar, busy workers, the freshness clock,
+    // uploads, waits, what is running — and is stale the moment the build ends,
+    // failed or not.
+    if t.is_closed() {
+        return b.finish();
+    }
+    push_progress(&mut b, t, ctx);
+    push_lock_waits(&mut b, t, ctx);
+    push_admission_waits(&mut b, t, ctx);
+    push_running_longest(&mut b, t, ctx);
+
+    if c.roots_total > 0 {
+        b.push("\n_Build continues — remaining targets still running._\n");
+    }
+
+    b.finish()
+}
+
+/// The progress bar, busy workers, the freshness clock and background uploads.
+fn push_progress(b: &mut Budgeted, t: &Tally, ctx: &RenderCtx<'_>) {
     let (done, total, _) = t.progress();
     let workers = if t.max_workers() > 0 {
         format!(
@@ -335,24 +370,6 @@ pub(crate) fn render_live(t: &Tally, ctx: &RenderCtx<'_>, budget: usize) -> Stri
             fmt_count(t.background_ops())
         ));
     }
-
-    if t.fail_fast() && c.roots_total > 0 {
-        b.push(
-            "\n> [!WARNING]\n> Stopped at the first failure (`--fail-fast`) — \
-             remaining targets were not attempted.\n",
-        );
-    }
-
-    push_scratch(&mut b, t);
-    push_lock_waits(&mut b, t, ctx);
-    push_admission_waits(&mut b, t, ctx);
-    push_running_longest(&mut b, t, ctx);
-
-    if c.roots_total > 0 {
-        b.push("\n_Build continues — remaining targets still running._\n");
-    }
-
-    b.finish()
 }
 
 fn push_live_failures(b: &mut Budgeted, t: &Tally, c: &Counters) {
@@ -1541,6 +1558,57 @@ mod tests {
             md.contains("error in root0") && md.contains("error in root1"),
             "{md}"
         );
+    }
+
+    #[test]
+    fn a_closed_build_drops_everything_that_describes_work_in_progress() {
+        // The comment's last write renders the live view of a closed tally. A
+        // failure used to keep "still running" in it forever, and the progress
+        // bar, busy workers, the freshness clock and the running rows stayed
+        // whether the build failed or not.
+        let in_progress = [
+            "still running",
+            "Build continues",
+            "% · ",
+            "workers busy",
+            "updated ",
+            "cache uploads in flight",
+            "Running longest",
+            "slow:running",
+        ];
+        for failing in [0, 1] {
+            let mut t = build(100, failing, 0);
+            t.apply(&ev(
+                0,
+                BuildEventKind::ExecuteStart {
+                    output_groups: Vec::new(),
+                    log_not_streamed: false,
+                    addr: "//slow:running".into(),
+                    driver: "exec".into(),
+                    cache: false,
+                    declared: None,
+                    reserved: None,
+                    queued_ms: None,
+                    admitted: None,
+                },
+            ));
+            let open = render_live(&t, &ctx("heph run //...", 600_000), LIVE_SECTION_BUDGET);
+            assert!(open.contains("workers busy"), "{open}");
+            assert!(open.contains("slow:running"), "{open}");
+            t.set_closed();
+            let md = render_live(&t, &ctx("heph run //...", 600_000), LIVE_SECTION_BUDGET);
+            for gone in in_progress {
+                assert!(!md.contains(gone), "{gone:?} with {failing} failing: {md}");
+            }
+            // What happened stays.
+            assert!(md.contains("done ·"), "{md}");
+            if failing > 0 {
+                assert!(md.contains("· finished in "), "{md}");
+                assert!(md.contains("//root0:broken"), "{md}");
+            } else {
+                assert!(md.starts_with("## ✅"), "{md}");
+            }
+        }
     }
 
     /// Prints the rendered views for eyeballing against the mockups in
