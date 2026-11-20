@@ -39,7 +39,7 @@ use crate::engine::Engine;
 use crate::engine::cache_db_space::{CompactAction, CompactReport};
 use crate::engine::error::TargetNotFoundError;
 use crate::engine::event::BuildEventKind;
-use crate::engine::local_cache::{Existence, MANIFEST_V2};
+use crate::engine::local_cache::{Existence, MANIFEST_CURRENT};
 use crate::engine::request_state::RequestState;
 use crate::engine::result_lock::TargetGuard;
 use anyhow::{Context, Result};
@@ -203,7 +203,7 @@ impl Engine {
     /// then the manifests. Returns the bytes freed: the stored size of every
     /// blob actually deleted, which for a compressed blob is less than the
     /// manifest's decoded `size`. Best-effort if no manifest is found (still
-    /// removes the [`MANIFEST_V2`] key in case of a partial write; reports 0
+    /// removes the [`MANIFEST_CURRENT`] key in case of a partial write; reports 0
     /// bytes).
     ///
     /// Shared with [`Engine::clean`]: both commands delete revisions, and only
@@ -230,13 +230,13 @@ impl Engine {
                 bytes = bytes.saturating_add(stored.unwrap_or(0));
             }
         }
-        // The manifests found, plus `MANIFEST_V2` always: the one this version
-        // writes, so the one a partial write of this version can have left
-        // behind unread. A v1 manifest is only ever written whole by an older
-        // heph, so an absent one costs no delete.
+        // The manifests found, plus `MANIFEST_CURRENT` always: the one this
+        // version writes, so the one a partial write of this version can have
+        // left behind unread. A v1 or v2 manifest is only ever written whole by
+        // an older heph, so an absent one costs no delete.
         let found = manifests.iter().map(|(name, _)| *name);
-        let hedge =
-            (!manifests.iter().any(|(name, _)| *name == MANIFEST_V2)).then_some(MANIFEST_V2);
+        let hedge = (!manifests.iter().any(|(name, _)| *name == MANIFEST_CURRENT))
+            .then_some(MANIFEST_CURRENT);
         for name in found.chain(hedge) {
             self.local_cache
                 .delete(addr, hashin, name)
@@ -417,7 +417,7 @@ impl Engine {
         } else {
             match self
                 .local_cache
-                .existence(addr, written_hashin, MANIFEST_V2)
+                .existence(addr, written_hashin, MANIFEST_CURRENT)
             {
                 // Queued or committed, the revision exists as far as a budget
                 // decision is concerned. `Queued` is dropped without awaiting: it
@@ -459,7 +459,10 @@ impl Engine {
                 // mem tier cannot answer from a stale resident entry. Each of those
                 // three is pinned by its own test; without them this is not a
                 // barrier at all, and the failure is silent.
-                if let Err(e) = self.local_cache.exists(addr, written_hashin, MANIFEST_V2) {
+                if let Err(e) = self
+                    .local_cache
+                    .exists(addr, written_hashin, MANIFEST_CURRENT)
+                {
                     tracing::debug!(error = %format!("{e:#}"), %addr, "post-write gc barrier");
                     return TrimOutcome::Failed;
                 }
@@ -1091,9 +1094,10 @@ mod tests {
     use crate::engine::Config;
     use crate::engine::cache_test_support::{addr, present, test_engine, wlock, write_revision};
     use crate::engine::local_cache::{
-        EntryWriter, Existence, LocalCache, MANIFEST_V1, MANIFEST_V2, Manifest, ManifestArtifact,
-        ManifestArtifactContentType, ManifestArtifactEncoding, ManifestArtifactType, PendingWrite,
-        SizedReader, TargetStream, is_manifest_name,
+        EntryWriter, Existence, LocalCache, MANIFEST_V1, MANIFEST_V2, MANIFEST_V3, Manifest,
+        ManifestArtifact, ManifestArtifactContentType, ManifestArtifactEncoding,
+        ManifestArtifactType, ManifestV2, PendingWrite, SizedReader, TargetStream,
+        is_manifest_name,
     };
     use crate::engine::local_cache_test_double::ForwardingCache;
     use hcore::hasync::StdCancellationToken;
@@ -1192,9 +1196,9 @@ mod tests {
             self.inner.writer(addr, hashin, name)
         }
         // The in-flight revision is one this version wrote, so its manifest —
-        // and the post-write barrier's key — is `MANIFEST_V2`.
+        // and the post-write barrier's key — is `MANIFEST_CURRENT`.
         fn exists(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<bool> {
-            if name == MANIFEST_V2 {
+            if name == MANIFEST_CURRENT {
                 self.barrier_reads.fetch_add(1, Ordering::SeqCst);
                 // The wait: once this returns, the write has landed and every
                 // later enumeration sees it.
@@ -1205,7 +1209,7 @@ mod tests {
         fn existence(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<Existence> {
             // Reports the queue, never waits on it, and never clears it — the
             // whole point of `existence` is that it settles nothing.
-            if name == MANIFEST_V2 && self.is_queued(addr, hashin) {
+            if name == MANIFEST_CURRENT && self.is_queued(addr, hashin) {
                 return Ok(Existence::Queued(PendingWrite::new(std::future::ready(()))));
             }
             self.inner.existence(addr, hashin, name)
@@ -1218,7 +1222,7 @@ mod tests {
         /// and `existence`. Committed-only, so no `land` and no
         /// `barrier_reads`: this settles nothing and waits for nothing.
         fn exists_committed(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<bool> {
-            if name == MANIFEST_V2 && self.is_queued(addr, hashin) {
+            if name == MANIFEST_CURRENT && self.is_queued(addr, hashin) {
                 return Ok(false);
             }
             self.inner.exists_committed(addr, hashin, name)
@@ -1301,7 +1305,7 @@ mod tests {
         //
         // Reads count every manifest name, misses included: a probe of a v1
         // manifest that is not there is still a round-trip. The barrier is on
-        // `MANIFEST_V2`, the name of the revision this version just wrote.
+        // `MANIFEST_CURRENT`, the name of the revision this version just wrote.
         engine.local_cache = Arc::new(
             ForwardingCache::new(Arc::clone(&engine.local_cache))
                 .on_reader({
@@ -1315,7 +1319,7 @@ mod tests {
                 .on_exists({
                     let barrier_reads = Arc::clone(&barrier_reads);
                     move |_, _, name| {
-                        if name == MANIFEST_V2 {
+                        if name == MANIFEST_CURRENT {
                             barrier_reads.fetch_add(1, Ordering::SeqCst);
                         }
                     }
@@ -1533,10 +1537,10 @@ mod tests {
         );
         assert_eq!(
             manifest_reads.load(Ordering::SeqCst),
-            4,
+            5,
             "over budget: one recency read per revision, plus the artifact lists \
-             of the one revision actually deleted (its v2 manifest, and the probe \
-             for a v1 one an older heph may have left beside it)"
+             of the one revision actually deleted (its v3 manifest, and the probes \
+             for the v2 and v1 ones an older heph may have left beside it)"
         );
         assert!(!present(&engine, &a, "h1"), "stale revision trimmed");
     }
@@ -2259,7 +2263,7 @@ mod tests {
             w.write_all(&big).expect("write blob");
             w.commit().expect("commit blob");
         }
-        let manifest = Manifest {
+        let manifest = ManifestV2 {
             version: "1.0.0".to_string(),
             target: a.format(),
             created_at_nanos: 100,
@@ -2397,7 +2401,8 @@ mod tests {
         }
     }
 
-    /// One manifest, `manifest_name`, naming `artifact` alone.
+    /// One manifest, `manifest_name`, naming `artifact` alone, in that name's
+    /// layout. A v3 one records a host path.
     fn write_manifest(
         engine: &Engine,
         a: &Addr,
@@ -2406,7 +2411,7 @@ mod tests {
         version: &str,
         artifact: ManifestArtifact,
     ) {
-        let manifest = Manifest {
+        let manifest = ManifestV2 {
             version: version.to_string(),
             target: a.format(),
             created_at_nanos: 100,
@@ -2417,7 +2422,15 @@ mod tests {
             .local_cache
             .writer(a, hashin, manifest_name)
             .expect("manifest writer");
-        borsh::to_writer(&mut w, &manifest).expect("write manifest");
+        if manifest_name == MANIFEST_V3 {
+            let v3 = Manifest {
+                host_paths: vec!["/nix/store/x".to_string()],
+                ..Manifest::from(manifest)
+            };
+            borsh::to_writer(&mut w, &v3).expect("write manifest");
+        } else {
+            borsh::to_writer(&mut w, &manifest).expect("write manifest");
+        }
         w.commit().expect("commit manifest");
     }
 
@@ -2526,6 +2539,117 @@ mod tests {
                 "{name} must be deleted"
             );
         }
+    }
+
+    /// GC knows v3: a key holding a v1, a v2 and a v3 manifest, each naming its
+    /// own blob, loses all six; the post-write barrier waits on the v3 manifest,
+    /// the one this version writes; and a v3 write that left only its blob
+    /// still has its manifest key deleted by the hedge.
+    #[test]
+    fn gc_handles_v3_and_barrier() {
+        let (engine, _dir) = test_engine();
+        let a = addr("t");
+        let blobs = [
+            (
+                MANIFEST_V1,
+                "1.0.0",
+                "a.tar",
+                ManifestArtifactEncoding::None,
+            ),
+            (
+                MANIFEST_V2,
+                crate::engine::local_cache::MANIFEST_V2_VERSION,
+                "a.tar.zst",
+                ManifestArtifactEncoding::Zstd,
+            ),
+            (
+                MANIFEST_V3,
+                crate::engine::local_cache::MANIFEST_V3_VERSION,
+                "v3.a.tar.zst",
+                ManifestArtifactEncoding::Zstd,
+            ),
+        ];
+        for (manifest, version, blob, encoding) in &blobs {
+            write_encoded(&engine, &a, "h1", blob, encoding, b"payload");
+            write_manifest(
+                &engine,
+                &a,
+                "h1",
+                manifest,
+                version,
+                tar_artifact(blob, 7, encoding.clone()),
+            );
+        }
+        let read = engine
+            .read_manifest(&a, "h1")
+            .expect("read manifest")
+            .expect("manifest present");
+        assert_eq!(read.artifacts[0].name, "v3.a.tar.zst", "v3 is read first");
+        assert!(!read.host_paths.is_empty(), "the v3 layout was decoded");
+
+        engine.gc_entry(&a, "h1").expect("gc_entry");
+        for (manifest, _, blob, _) in &blobs {
+            for name in [*manifest, *blob] {
+                assert!(
+                    !engine.local_cache.exists(&a, "h1", name).expect("exists"),
+                    "{name} must be deleted"
+                );
+            }
+        }
+
+        // The barrier key is the name this version writes.
+        assert_eq!(MANIFEST_CURRENT, MANIFEST_V3);
+        let (counting, barrier_reads, _manifest_reads, _cdir) = test_engine_counting();
+        write_revision(&counting, &a, "h1", 100, &["o.tar"]);
+        write_revision(&counting, &a, "h2", 200, &["o.tar"]);
+        assert!(
+            counting
+                .local_cache
+                .exists(&a, "h2", MANIFEST_V3)
+                .expect("exists"),
+            "a revision this version writes is a v3 one"
+        );
+        barrier_reads.store(0, Ordering::SeqCst);
+        counting.try_trim_after_write(&a, 1, "h2");
+        assert_eq!(barrier_reads.load(Ordering::SeqCst), 1);
+        assert!(!present(&counting, &a, "h1"), "stale revision trimmed");
+
+        // A v3 write cut short after its blob: no manifest is found, and the
+        // hedge deletes the v3 manifest key anyway.
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let hdir = tempfile::tempdir().expect("tempdir");
+        let mut hedged = {
+            let _rt = crate::engine::test_rt_enter();
+            Engine::new(Config {
+                parallelism: None,
+                ..Config::for_tests(hdir.path())
+            })
+            .expect("engine")
+        };
+        hedged.local_cache = Arc::new(
+            ForwardingCache::new(Arc::clone(&hedged.local_cache)).on_delete({
+                let deleted = Arc::clone(&deleted);
+                move |_, hashin, name| {
+                    if hashin == "h3" {
+                        deleted.lock().expect("lock").push(name.to_owned());
+                    }
+                }
+            }),
+        );
+        write_encoded(
+            &hedged,
+            &a,
+            "h3",
+            "v3.o.tar.zst",
+            &ManifestArtifactEncoding::Zstd,
+            b"partial",
+        );
+        hedged.gc_entry(&a, "h3").expect("gc_entry");
+        assert_eq!(
+            *deleted.lock().expect("lock"),
+            vec![MANIFEST_V3.to_owned()],
+            "the hedge deletes the v3 manifest key, and only that"
+        );
     }
 
     // --- cache.db conversion and vacuum -----------------------------------

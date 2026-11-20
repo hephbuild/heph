@@ -25,11 +25,13 @@ type ExistsHook = Box<dyn Fn(&Addr, &str, &str) + Send + Sync>;
 type ListTargetEntriesHook = Box<dyn Fn(&Addr) + Send + Sync>;
 type WriterHook = Arc<dyn Fn(&Addr, &str, &str) + Send + Sync>;
 type ListTargetsItemHook = Arc<dyn Fn(&str) + Send + Sync>;
+type DeleteHook = Box<dyn Fn(&Addr, &str, &str) + Send + Sync>;
 
 pub(crate) struct ForwardingCache {
     inner: Arc<dyn LocalCache>,
     on_reader: ReaderHook,
     on_exists: ExistsHook,
+    on_delete: DeleteHook,
     on_list_target_entries: ListTargetEntriesHook,
     on_list_targets_item: Option<ListTargetsItemHook>,
     on_writer: WriterHook,
@@ -42,6 +44,7 @@ impl ForwardingCache {
             inner,
             on_reader: Box::new(|_, _, _| {}),
             on_exists: Box::new(|_, _, _| {}),
+            on_delete: Box::new(|_, _, _| {}),
             on_list_target_entries: Box::new(|_| {}),
             on_list_targets_item: None,
             on_writer: Arc::new(|_, _, _| {}),
@@ -66,6 +69,16 @@ impl ForwardingCache {
         f: impl Fn(&Addr, &str, &str) + Send + Sync + 'static,
     ) -> Self {
         self.on_exists = Box::new(f);
+        self
+    }
+
+    /// Run `f` before every `delete` call, then forward regardless of what it
+    /// does.
+    pub(crate) fn on_delete(
+        mut self,
+        f: impl Fn(&Addr, &str, &str) + Send + Sync + 'static,
+    ) -> Self {
+        self.on_delete = Box::new(f);
         self
     }
 
@@ -208,6 +221,7 @@ impl LocalCache for ForwardingCache {
     }
 
     fn delete(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<()> {
+        (self.on_delete)(addr, hashin, name);
         self.inner.delete(addr, hashin, name)
     }
 

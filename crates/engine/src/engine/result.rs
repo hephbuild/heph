@@ -5158,11 +5158,12 @@ impl Engine {
                                     error: error.map(crate::engine::event::ErrorDetail::into_message),
                                 }
                             },
-                            engine.cache_locally(
+                            engine.cache_locally_with_host_paths(
                                 rs.ctoken(),
                                 &addr,
                                 &hashin,
                                 to_cache,
+                                &[],
                                 use_tmp_cache,
                             ),
                         )
