@@ -428,6 +428,23 @@ fn pick_mut(buckets: &mut [Bucket; STATES], s: RowState) -> &mut Bucket {
     }
 }
 
+/// The most of one root failure's error the model keeps: a Starlark trace or
+/// an aggregate of every broken input fits; a runaway message is cut.
+const ERROR_MAX: usize = 16 * 1024;
+
+/// `error`, cut at a character boundary to [`ERROR_MAX`] bytes, with an
+/// ellipsis when cut.
+fn capped_error(error: &str) -> Box<str> {
+    if error.len() <= ERROR_MAX {
+        return error.into();
+    }
+    let mut end = ERROR_MAX;
+    while !error.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", error.get(..end).unwrap_or_default()).into_boxed_str()
+}
+
 /// The dashboard's state, folded from the event stream.
 #[derive(Debug, Default)]
 pub struct Model {
@@ -437,6 +454,10 @@ pub struct Model {
     recent: Bucket,
     /// A root failure's PHASE text, by root.
     reasons: HashMap<Id, Box<str>>,
+    /// A root failure's whole error, redacted, by root: kept when no exit
+    /// status or timeout says it all, so the Log tab can show what the
+    /// reason cuts short. At most [`ERROR_MAX`] bytes each.
+    errors: HashMap<Id, Box<str>>,
     /// The latest report of each bounded pool.
     pools: BTreeMap<String, Gauge>,
     /// The pools in play this build: one an `ExecuteStart` declared or
@@ -601,6 +622,9 @@ impl Model {
                         let reason =
                             failure_reason(err, exit_status.as_deref(), timed_out.as_ref(), redact);
                         self.reasons.insert(id, reason.into_boxed_str());
+                        if exit_status.is_none() && timed_out.is_none() {
+                            self.errors.insert(id, capped_error(&redact.apply(err)));
+                        }
                         RowState::Failed
                     }
                     (None, _) if cached => RowState::Cached,
@@ -740,6 +764,12 @@ impl Model {
     /// A root failure's PHASE text.
     pub fn reason(&self, id: Id) -> Option<&str> {
         self.reasons.get(&id).map(|r| &**r)
+    }
+
+    /// A root failure's whole error, redacted: `None` when its exit status
+    /// or timeout is the whole story.
+    pub fn error(&self, id: Id) -> Option<&str> {
+        self.errors.get(&id).map(|e| &**e)
     }
 
     /// The root a dependency failure names.

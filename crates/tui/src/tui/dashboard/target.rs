@@ -406,8 +406,26 @@ impl TargetScreen {
                     ));
                     body.push(Line::default());
                 }
+                // The failure's whole error, which the line above cuts to its
+                // reason: a failure no exit status explains (a `meta:`, a def
+                // that did not resolve, an output the run never wrote) is
+                // otherwise told only by the end-of-run report.
+                let error = (r.state == RowState::Failed)
+                    .then(|| m.error(self.id))
+                    .flatten();
+                if let Some(error) = error {
+                    body.extend(error_lines(error, c, body_rows / 2));
+                    body.push(Line::default());
+                }
                 let left = body_rows.saturating_sub(body.len());
-                body.extend(self.pane.body(c, left, inp.redact));
+                match &self.pane.state {
+                    // Asked once the target ended: no log is not "not run
+                    // yet" for a target that failed.
+                    PaneState::Nothing(_) if error.is_some() => {
+                        body.push(Line::styled(" log: none kept", dim()));
+                    }
+                    _ => body.extend(self.pane.body(c, left, inp.redact)),
+                }
                 let hints = self
                     .pane
                     .search_hint()
@@ -604,6 +622,44 @@ fn took_down_text(m: &Model, id: Id) -> Option<String> {
     })
 }
 
+/// `error` wrapped to `cols`, in red, each of its lines cleaned of control
+/// bytes: at most `max_rows` rows, the last saying how many were left out
+/// and where the rest is.
+fn error_lines(error: &str, cols: usize, max_rows: usize) -> Vec<Line<'static>> {
+    let red = Style::default().fg(Color::Red);
+    let text_cols = cols.saturating_sub(2).max(1);
+    let mut rows: Vec<String> = Vec::new();
+    for line in error.lines() {
+        let clean = clean_inline(line);
+        let mut rest = clean.as_ref();
+        if rest.is_empty() {
+            rows.push(String::new());
+        }
+        while !rest.is_empty() {
+            let mut piece = crate::tui::text::take_width(rest, text_cols);
+            if piece.is_empty() {
+                // A character wider than the column: take it whole.
+                piece = rest
+                    .get(..rest.chars().next().map_or(0, char::len_utf8))
+                    .unwrap_or(rest);
+            }
+            rows.push(piece.to_owned());
+            rest = rest.get(piece.len()..).unwrap_or("");
+        }
+    }
+    let max_rows = max_rows.max(1);
+    if rows.len() > max_rows {
+        let left_out = rows.len() - (max_rows - 1);
+        rows.truncate(max_rows - 1);
+        rows.push(format!(
+            "… {left_out} more rows: the end-of-run report has the whole error"
+        ));
+    }
+    rows.into_iter()
+        .map(|r| Line::styled(cut_right(&format!(" {r}"), cols).into_owned(), red))
+        .collect()
+}
+
 /// A label column and its value.
 fn row(label: &str, value: &str, cols: usize) -> Line<'static> {
     let value = cut_right(&clean_inline(value), cols.saturating_sub(13)).into_owned();
@@ -734,6 +790,11 @@ fn overview(
         PaneState::Live(_) => format!("log · live · {} · tab to open", pane.status()),
         PaneState::Ended(_) | PaneState::Read(_) => {
             format!("log · {} · tab to open", pane.status())
+        }
+        // A failure the Log tab shows the error of: no log is not "not run
+        // yet" for a target that failed.
+        PaneState::Nothing(_) if r.state == RowState::Failed && m.error(id).is_some() => {
+            "log · none kept · tab shows the error".to_owned()
         }
         PaneState::Nothing(why) | PaneState::Unavailable(why) => {
             format!("log · {}", inp.redact.apply(&clean_inline(why)))
