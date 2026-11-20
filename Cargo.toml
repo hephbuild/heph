@@ -240,4 +240,14 @@ hengine = { package = "engine", path = "crates/engine", features = ["test-suppor
 #   `^[[35;1R`.
 [patch.crates-io]
 crossterm = { git = "https://github.com/hephbuild/crossterm.git", branch = "fix-eventstream-wake-loss" }
+# starlark 0.14.2 plus one fix: the static typechecker infers the return type of
+# a top-level `def` without a return annotation, where it used `Any`. Return
+# annotations stay optional under the buildfile plugin's
+# `requireTypeAnnotations`, and calls are still checked against what such a
+# `def` returns. Only the AST typechecker heph uses infers; the one evaluation
+# runs (`enable_static_typechecking`) still sees `Any`. The branch keeps
+# starlark's own dependencies on crates.io, so heph links one starlark_syntax.
+# To be proposed to meta/starlark-rust; drop this once a release carries it.
+# `crates/plugin-buildfile/src/pluginbuildfile/starlark_patch.rs` fails without it.
+starlark = { git = "https://github.com/hephbuild/starlark-rust.git", branch = "heph/v0.14.2" }
 

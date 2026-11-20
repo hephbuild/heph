@@ -7156,8 +7156,7 @@ dependencies = [
 [[package]]
 name = "starlark"
 version = "0.14.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9062e866918dc4c9701c98ac99f7f4fa9e4b3b4edce306e147393bc75458c4fc"
+source = "git+https://github.com/hephbuild/starlark-rust.git?branch=heph%2Fv0.14.2#a24ea81cf8852add4a37ad77b7b4ef338d40b6cc"
 dependencies = [
  "allocative",
  "anyhow",
