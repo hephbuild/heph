@@ -13,6 +13,34 @@ use enclose::enclose;
 use hmodel::htaddr::Addr;
 use std::sync::Arc;
 
+/// How [`Engine::execute`] runs a target, beyond the target itself.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ExecuteFlags {
+    /// An interactive `--shell` in the target's sandbox, not its command.
+    pub shell: bool,
+    /// Run without the target's scratch slots (`--no-scratch`).
+    pub no_scratch: bool,
+    /// This target's outputs are credential material. The one thing it
+    /// changes is the failure path — see the `Err` arm in `execute`.
+    pub outputs_are_material: bool,
+}
+
+/// What one run of [`Engine::execute`] produced, and the guards its caller
+/// holds until the outputs are cached.
+pub(crate) struct Executed {
+    pub artifacts: Vec<OutputArtifact>,
+    /// The host paths the driver declared, as it returned them: not yet
+    /// deduplicated, capped or checked to exist. The caller checks them
+    /// before it writes the entry (I6, I8).
+    pub host_paths: Vec<hplugin::driver::HostPath>,
+    pub teardown: crate::engine::sandbox_cleaner::SandboxTeardown,
+    pub sandbox_guards: Vec<hplugin::driver::SandboxGuard>,
+    pub execute_guard: crate::engine::result_lock::ExecuteGuard,
+    /// The live log's guard: held until the entry that replaces it is
+    /// written, then dropped to unlink it.
+    pub live_log: Option<crate::engine::run_log::LiveGuard>,
+}
+
 impl Engine {
     #[async_recursion]
     #[expect(
@@ -27,20 +55,13 @@ impl Engine {
         def: &LinkedTargetDef,
         hashin: &str,
         exec_wrapper: Option<InteractiveWrapper>,
-        shell: bool,
-        no_scratch: bool,
-        // `outputs_are_material`: this target's outputs are credential material.
-        // The one thing it changes is the failure path — see the `Err` arm below.
-        outputs_are_material: bool,
-    ) -> anyhow::Result<(
-        Vec<OutputArtifact>,
-        crate::engine::sandbox_cleaner::SandboxTeardown,
-        Vec<hplugin::driver::SandboxGuard>,
-        crate::engine::result_lock::ExecuteGuard,
-        // The live log's guard: held until the entry that replaces it is
-        // written, then dropped to unlink it.
-        Option<crate::engine::run_log::LiveGuard>,
-    )> {
+        flags: ExecuteFlags,
+    ) -> anyhow::Result<Executed> {
+        let ExecuteFlags {
+            shell,
+            no_scratch,
+            outputs_are_material,
+        } = flags;
         let driver = self
             .drivers_by_name
             .get(&spec.driver)
@@ -456,14 +477,27 @@ impl Engine {
                     }
                     None => None,
                 };
-                Ok((artifacts, sandbox_teardown, res.sandbox_guards, live))
+                Ok((
+                    artifacts,
+                    res.host_paths,
+                    sandbox_teardown,
+                    res.sandbox_guards,
+                    live,
+                ))
             },
         )
         .await;
         htelemetry::telemetry::record_execute_ms(exec_started.elapsed().as_millis() as u64);
-        res.map(|(artifacts, teardown, guards, live)| {
-            (artifacts, teardown, guards, execute_guard, live)
-        })
+        res.map(
+            |(artifacts, host_paths, teardown, sandbox_guards, live_log)| Executed {
+                artifacts,
+                host_paths,
+                teardown,
+                sandbox_guards,
+                execute_guard,
+                live_log,
+            },
+        )
     }
 
     /// End a run's live log, once its driver returned and while its sandbox

@@ -98,6 +98,7 @@ pub use hdriver_support::driver_managed_os;
 mod execute;
 pub mod failure_gc;
 pub mod failure_slot;
+mod host_paths;
 pub mod invoke;
 pub mod log_api;
 pub use log_api::{

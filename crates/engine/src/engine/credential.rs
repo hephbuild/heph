@@ -1022,16 +1022,24 @@ impl Engine {
                 &linked,
                 &meta.hashin,
                 None,
-                false,
-                false,
-                // The outputs are material: a failure removes the sandbox
-                // even under `--keep-failed-sandboxes`.
-                true,
+                crate::engine::execute::ExecuteFlags {
+                    // The outputs are material: a failure removes the sandbox
+                    // even under `--keep-failed-sandboxes`.
+                    outputs_are_material: true,
+                    ..Default::default()
+                },
             )
             .await;
 
-        // A credential source has no live log (its output is material).
-        let (artifacts, teardown, guards, _execute_guard, _live_log) = match run {
+        // A credential source has no live log (its output is material), and
+        // is never cached, so its host paths have no entry to ride.
+        let crate::engine::execute::Executed {
+            artifacts,
+            teardown,
+            sandbox_guards: guards,
+            execute_guard: _execute_guard,
+            ..
+        } = match run {
             Ok(v) => v,
             Err(e) => {
                 return Err(e).with_context(|| format!("run credential source {target}"));

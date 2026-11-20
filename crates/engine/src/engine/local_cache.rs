@@ -1327,6 +1327,27 @@ impl Engine {
         hcore::blocking::run(move || Self::read_manifest_from(&local_cache, &addr, &hashin)).await
     }
 
+    /// [`read_manifest_blocking`](Self::read_manifest_blocking), plus whether
+    /// every host path the manifest declares still exists, in the same
+    /// blocking job (I4): the read that decides a local hit. An empty list
+    /// costs nothing past the read.
+    pub(crate) async fn probe_manifest_blocking(
+        &self,
+        addr: &Addr,
+        hashin: &str,
+    ) -> anyhow::Result<Option<(Manifest, crate::engine::host_paths::Liveness)>> {
+        let (local_cache, addr, hashin) =
+            (self.local_cache.clone(), addr.clone(), hashin.to_string());
+        hcore::blocking::run(move || {
+            let Some(manifest) = Self::read_manifest_from(&local_cache, &addr, &hashin)? else {
+                return Ok(None);
+            };
+            let live = crate::engine::host_paths::liveness(&addr, &manifest.host_paths)?;
+            Ok(Some((manifest, live)))
+        })
+        .await
+    }
+
     /// The blobs a caller asking for `outputs` will actually read: its Output
     /// groups plus — **when it asked for at least one group** — every SupportFile
     /// (which travels with the target wherever its outputs are referenced), and

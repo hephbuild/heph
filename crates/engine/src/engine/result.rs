@@ -1690,6 +1690,60 @@ struct ExecuteOptions<'a> {
     no_scratch: bool,
 }
 
+/// What [`Engine::probe_cache_manifest`] found for `(addr, hashin)` locally.
+pub(crate) enum Probe {
+    /// No manifest.
+    Absent,
+    /// A manifest whose declared host paths all exist: a local hit.
+    Live(Arc<Manifest>),
+    /// A manifest with a declared host path gone (I3, I5): a miss with a
+    /// reason. The manifest rides along so a re-run can tell whether its
+    /// outputs differ from the entry it replaces.
+    Stale {
+        path: String,
+        manifest: Arc<Manifest>,
+    },
+}
+
+/// I5, Decision 12: a stale entry's re-run whose outputs differ from those of
+/// the entry it replaced is logged at `info` and named in the run summary
+/// (`StaleOutputChanged`). Its dependents rebuild; a nix re-run of a pinned
+/// ref is expected to come back unchanged, while one of an unlocked ref may
+/// resolve it again and differ.
+fn report_stale_rebuild(
+    rs: &RequestState,
+    addr: String,
+    path: &str,
+    old: &Manifest,
+    new: &[ArtifactMeta],
+) {
+    let mut was: Vec<&str> = old
+        .artifacts
+        .iter()
+        .filter(|a| {
+            matches!(
+                a.r#type,
+                ManifestArtifactType::Output | ManifestArtifactType::SupportFile
+            )
+        })
+        .map(|a| a.hashout.as_str())
+        .collect();
+    let mut now: Vec<&str> = new.iter().map(|m| m.hashout.as_str()).collect();
+    was.sort_unstable();
+    now.sort_unstable();
+    if was == now {
+        return;
+    }
+    tracing::info!(
+        addr = %addr,
+        path,
+        was = ?was,
+        now = ?now,
+        "rebuilt a stale cache entry and its output changed: its dependents rebuild too"
+    );
+    rs.emit(crate::engine::event::BuildEventKind::StaleOutputChanged { addr });
+}
+
 /// Output-independent result of the per-addr lock dance, single-flighted by
 /// `mem_locked_result` (keyed by `Addr` alone). Every `(outputs, is_top)`
 /// memoizer cell of one addr awaits the same cell and shares its single riding
@@ -4231,7 +4285,10 @@ impl Engine {
                 self.result_lock().read(addr, hashin, ctoken),
             )
             .await?;
-        if let Some(manifest) = self.probe_cache_manifest(&rs, addr, hashin).await? {
+        // A stale entry falls through as a miss: a hash-only request answers
+        // "unknown" below, running nothing and leaving the entry alone (I3),
+        // and anything else re-probes under the write lock and rebuilds.
+        if let Probe::Live(manifest) = self.probe_cache_manifest(&rs, addr, hashin).await? {
             // A. Hit — share this read; each caller reads its own outputs under
             // it and offers the codegen write-back / fixpoint in
             // `execute_and_cache` (once per addr, under this riding read). The
@@ -4292,8 +4349,10 @@ impl Engine {
                                 .await
                                 .with_context(|| format!("probing the local cache for {addr}"))
                             {
-                                Ok(Some(manifest)) => Some(Ok((manifest, read))),
-                                Ok(None) => None,
+                                Ok(Probe::Live(manifest)) => Some(Ok((manifest, read))),
+                                // Stale: still a miss, so keep contending; the
+                                // winner's re-check rebuilds it.
+                                Ok(Probe::Absent | Probe::Stale { .. }) => None,
                                 Err(e) => Some(Err(e)),
                             },
                         )
@@ -4323,13 +4382,21 @@ impl Engine {
             match self.probe_cache_manifest(&rs, addr, hashin).await? {
                 // Same as branch A: where the blobs live stays unresolved until a
                 // caller needs them.
-                Some(manifest) => (
+                Probe::Live(manifest) => (
                     None,
                     Some(manifest),
                     RemoteCell::new(),
                     (!rs.hash_only()).then_some(hcore::events::CacheHitKind::Local),
                 ),
-                None => {
+                probe @ (Probe::Absent | Probe::Stale { .. }) => {
+                    // A stale entry (I5) is a miss with a reason. It is not
+                    // deleted: the re-run below overwrites it under this write
+                    // lock, and a failed re-run leaves it to be found stale
+                    // again.
+                    let stale = match probe {
+                        Probe::Stale { path, manifest } => Some((path, manifest)),
+                        _ => None,
+                    };
                     // The settled local miss: both probes came back empty under the
                     // write lock, so this fires exactly once per cold target — the
                     // probe itself stays silent on a miss (see
@@ -4360,8 +4427,14 @@ impl Engine {
                     // `/nix/store/...` wrapper paths) set it false so a wrapper built
                     // on one machine is never pulled onto another that lacks that
                     // store path — which would `exec` a missing path (status 127).
-                    let remote_attempted =
-                        def.target.cache.remote_enabled && self.remote_caches.has_readable();
+                    //
+                    // After a stale miss the remote is skipped for this run
+                    // (I6): what it holds names no host path, so it is either
+                    // a revision built on another machine or the same stale
+                    // output, and neither is checked here.
+                    let remote_attempted = stale.is_none()
+                        && def.target.cache.remote_enabled
+                        && self.remote_caches.has_readable();
                     let located = if remote_attempted {
                         let span_addr = addr_s.clone();
                         // Every blob a caller of this addr could read must still be on
@@ -4424,14 +4497,19 @@ impl Engine {
                             // The target's outcome, remote or not, and before the
                             // build: a build that then fails still had to build.
                             rs.emit(crate::engine::event::BuildEventKind::CacheOutcome {
-                                addr: addr_s,
+                                addr: addr_s.clone(),
                                 outcome: hcore::events::CacheOutcomeKind::Miss,
-                                reason: None,
+                                reason: stale
+                                    .as_ref()
+                                    .map(|(path, _)| crate::engine::host_paths::stale_reason(path)),
                             });
                             let (cached, meta) = self
                                 .clone()
                                 .execute_and_cache_inner(rs.clone(), opts)
                                 .await?;
+                            if let Some((path, old)) = &stale {
+                                report_stale_rebuild(&rs, addr_s, path, old, &meta);
+                            }
                             (
                                 Some(Arc::new(ExecutedArtifacts { cached, meta })),
                                 None,
@@ -5311,13 +5389,32 @@ impl Engine {
                     // `cache_locally`, which reads the outputs out of the sandbox
                     // — and `_live_log` too, since it reads the run's live log,
                     // which is unlinked once the entry holds it.
-                    let (artifacts, sandbox_teardown, sandbox_guards, _execute_guard, _live_log) = engine
+                    let crate::engine::execute::Executed {
+                        artifacts,
+                        host_paths,
+                        teardown: sandbox_teardown,
+                        sandbox_guards,
+                        execute_guard: _execute_guard,
+                        live_log: _live_log,
+                    } = engine
                         .clone()
-                        .execute(rs.clone(), &addr, &spec, &def, &hashin, interactive, shell, no_scratch, false)
+                        .execute(
+                            rs.clone(),
+                            &addr,
+                            &spec,
+                            &def,
+                            &hashin,
+                            interactive,
+                            crate::engine::execute::ExecuteFlags {
+                                shell,
+                                no_scratch,
+                                outputs_are_material: false,
+                            },
+                        )
                         .await
                         .with_context(|| format!("execute {addr}"))?;
 
-                    let artifacts_meta = match artifacts
+                    let checked = match artifacts
                         .iter()
                         .filter(|a| matches!(
                             a.r#type,
@@ -5327,7 +5424,22 @@ impl Engine {
                         .collect::<anyhow::Result<Vec<_>>>()
                         .with_context(|| format!("read artifact metas for {addr}"))
                     {
-                        Ok(metas) => metas,
+                        // A run that writes no durable entry (caching off, a
+                        // shell) has nowhere to keep its host paths: ignored.
+                        Ok(metas) if use_tmp_cache => Ok((metas, Vec::new())),
+                        // I6 and I8, before anything is written: a refused
+                        // list leaves no manifest behind.
+                        Ok(metas) => crate::engine::host_paths::checked_for_entry(
+                            &addr,
+                            def.target.cache.remote_enabled,
+                            host_paths,
+                        )
+                        .await
+                        .map(|host_paths| (metas, host_paths)),
+                        Err(err) => Err(err),
+                    };
+                    let (artifacts_meta, host_paths) = match checked {
+                        Ok(checked) => checked,
                         Err(err) => {
                             // A target failure, like any `Err` leaving the
                             // execute: nothing reads the sandbox past this
@@ -5335,9 +5447,10 @@ impl Engine {
                             // as on the completion path below; under
                             // `--keep-failed-sandboxes` it stays on disk for
                             // a post-mortem of the artifacts it failed to
-                            // hash. A bare `?` here would fall into the drop
-                            // path, which reclaims — that path must mean
-                            // cancellation only.
+                            // hash, or of the host paths it declared. A bare
+                            // `?` here would fall into the drop path, which
+                            // reclaims — that path must mean cancellation
+                            // only.
                             drop(sandbox_guards);
                             let fate = if engine.cfg.keep_failed_sandboxes {
                                 let kept = engine.sandbox_on_disk(sandbox_teardown.dir());
@@ -5409,7 +5522,7 @@ impl Engine {
                                 &addr,
                                 &hashin,
                                 to_cache,
-                                &[],
+                                &host_paths,
                                 use_tmp_cache,
                             ),
                         )
@@ -5973,18 +6086,33 @@ impl Engine {
     /// Only *absence* is fail-soft. A transfer that starts and then errors, or a
     /// temp-dir failure, propagates out of `pull_missing_blobs` and fails the run;
     /// it is not turned into a rebuild.
+    ///
+    /// **Liveness (I3, I4).** This is the one place a local hit is decided, so
+    /// it is where the host paths an entry declares are checked: one `stat`
+    /// each, in the manifest read's blocking job. An entry with a path gone is
+    /// [`Probe::Stale`], never a hit — before `LocalCacheHit` and before any
+    /// dependent folds its `hashout`. A stat error other than "gone" fails the
+    /// target.
     async fn probe_cache_manifest(
         &self,
         rs: &Arc<RequestState>,
         addr: &Addr,
         hashin: &str,
-    ) -> anyhow::Result<Option<Arc<Manifest>>> {
-        let hit = self
-            .read_manifest_blocking(rs.ctoken(), addr, hashin)
-            .await?
-            .map(Arc::new);
-        if hit.is_some() && !rs.hash_only() {
-            // Every `Some` returned here settles the cell as a local hit — the
+    ) -> anyhow::Result<Probe> {
+        use crate::engine::host_paths::Liveness;
+        let probe = match self.probe_manifest_blocking(addr, hashin).await? {
+            None => Probe::Absent,
+            Some((manifest, Liveness::Live)) => Probe::Live(Arc::new(manifest)),
+            Some((manifest, Liveness::Stale { path })) => {
+                tracing::debug!(%addr, hashin, path, "local cache entry is stale: a host path it declares is gone");
+                Probe::Stale {
+                    path,
+                    manifest: Arc::new(manifest),
+                }
+            }
+        };
+        if matches!(probe, Probe::Live(_)) && !rs.hash_only() {
+            // Every `Live` returned here settles the cell as a local hit — the
             // optimistic probe, the contended late hit and the write-lock
             // re-check all return it straight away — so the target's outcome
             // goes out with the tier event, once.
@@ -5998,7 +6126,7 @@ impl Engine {
                 reason: None,
             });
         }
-        Ok(hit)
+        Ok(probe)
     }
 
     /// Public, tracked. Records `parent → addr` in `dep_dag` and updates `parent`
