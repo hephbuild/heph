@@ -41,7 +41,7 @@ pub const COREUTILS_VERSION: u32 = 7;
 
 /// Where the applets come from, for `heph tool coreutils list`.
 pub const UPSTREAM: &str =
-    "uutils/coreutils 0.12, uutils/findutils 0.10, ripgrep's grep-* crates, tar/flate2/zstd, which";
+    "uutils/coreutils 0.13, uutils/findutils 0.11, ripgrep's grep-* crates, tar/flate2/zstd, which";
 
 /// One utility, and the entry point that runs it.
 #[derive(Debug)]
